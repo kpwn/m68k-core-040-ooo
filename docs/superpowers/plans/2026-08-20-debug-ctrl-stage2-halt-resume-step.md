@@ -16,7 +16,7 @@
 - **No new `Global.scala` key** (spec §0.9, restated from Stage 0/1's own constraint — still binding).
 - **No new socket port.** Every Stage-2 register lives inside the existing `dbg_axi` CSR address space; `cpu_socket.vh`'s port list is unchanged by this plan.
 - **The whole feature must be optional and gated** (explicit user directive, 2026-08-20): `DebugCtrlPlugin` currently has NO `enable` parameter and is instantiated unconditionally at `FullCoreSynth.scala:580`. Task 1 retrofits an `enable: Boolean = true` constructor parameter mirroring `VioProbePlugin`'s exact disable pattern (`src/main/scala/m68k040/debug/VioProbePlugin.scala:37-81`): every declared IO stays present and named identically regardless of `enable` (so the socket contract never moves), but with `enable=false` every register is tied to its Stage-1-shell RAZ/WI behavior (or, if simplest, the plugin's `logic` degenerates to exactly today's Stage-1-only behavior) and **zero** Stage-2 RTL (the halt FSM, the `DebugCommitService` consumer wiring in `RobPlugin`/`BackendWiringPlugin`) is instantiated. Every new sibling wire this plan adds to `RobPlugin` (`debugStopRequest`, `debugStepRequest`, `haltAfterTarget`) follows the SAME `allowOverride`-plus-idle-default convention already used for `coreHaltedIn`/`completion`/`branchCompletion` (`RobPlugin.scala:184-217, 384-398`), so `RobPlugin` itself elaborates correctly whether or not `BackendWiringPlugin` drives them from a live `DebugCtrlPlugin`.
-- **Macro-boundary detection reuses `RobPayload.first`, no new per-uop field.** Confirmed by direct grep (2026-08-20): `firstOfInstr` is set at ~20 independent call sites across `MicroOpAssembler.scala`; `MicroOp.scala:12`'s `lastUop` field exists but is dead (zero consumers) and threading an equally-independent "last" bit through the same ~20 sites would be large and error-prone for no benefit — the retiring entry's own `RobPayload.first` (macroFirst) plus the NEXT entry's `RobPayload.first` (already read every cycle as `p1`, `RobPlugin.scala:594`) together give the exact spec-required "explicit macroFirst and macroLast **or an equivalent boundary event from the ROB**" (spec §6.2) with no new decode-side plumbing. Task 4 makes this precise.
+- **Macro-boundary detection REQUIRES a new per-uop field — RETRACTED 2026-08-20.** The original claim here (reuse `RobPayload.first` + ring occupancy, no new field needed) was dispatched as Task 4 and came back NEEDS_CONTEXT with a confirmed, structurally-reachable counterexample: `MicroOpQueue` (`decode/MicroOpQueue.scala:66,75`) pops at most 2 uops/cycle and `DispatchPlugin` (`dispatch/DispatchPlugin.scala:24-31`) gates 2-wide dispatch on ROB/IQ backpressure, so a 3+-uop crack (e.g. a memory-destination RMW: load/op/store, `MicroOpAssembler.scala:1249,1320,1326`) can reach `count==1` with `h0` = a MIDDLE uop mid-macro, before its real last uop is even allocated — the `(count<=1)||p1.first` derivation reads True there, incorrectly, which would silently drop the store on a debug stop at that instant. Task 4 (see its own now-revised text below) instead threads a real `lastOfInstr` field through `DecodedUop`→`RenamedUop`→`RobPayload`, mirroring `firstOfInstr`'s own ~20-site threading exactly — the cost this bullet originally tried to avoid, now confirmed necessary. `MicroOp.scala:12`'s dead `lastUop` field is a DIFFERENT bundle (post-rename issue scheduling, not decode/rename) and is not reused.
 - **Effective halt does NOT require the store queue or D-cache to be idle** (spec §6.3, verbatim: "Effective halt deliberately does not require the store queue or D-cache to be idle... If a bus is wedged, requiring global memory quiescence here would make the debugger unable to stop at the exact moment it is needed most"). Do not gate the halt FSM's `HALTED` transition on any SQ/D-cache busy signal. `DebugMemoryQuiesceService` (a SEPARATE, later concern for cache-maintenance/arch-apply launch) is explicitly OUT of scope for this plan — Stage 2 has no cache-maintenance or arch-apply command to gate.
 - **Fatal halt (`coreHalted`) is non-resumable and takes priority over debug halt** (spec §6.3, §13: "a resume request cannot release a fatal halt"). Every task touching resume must preserve this.
 - **`ExecuteLockStepSpec` baseline is 399/400** (1 known pre-existing failure: `CMP2.W (d8,An,Xn) indexed bounds pointer` (task #257, already tracked) -- CORRECTED 2026-08-20 during Task 1 execution, the STOP/ITLB-failures baseline this plan originally cited was stale project-memory, not the actual current HEAD baseline) — verify against this exact baseline, not a fresh count, at every task's gate. Re-read the CURRENT actual failing-test names before the first task (they may have drifted since this plan was written) rather than trusting this list blindly.
@@ -359,83 +359,122 @@ git commit -m "rob: free-running macro-retire counter + last-committed-PC (Stage
 
 ---
 
-## Task 4: Macro-boundary detection (`macroLast` via `p1.first`) + retire1 suppression at a debug-stop boundary
+## Task 4: Macro-boundary detection — thread a real `lastOfInstr` field (REVISED 2026-08-20, see below)
+
+**REVISION NOTICE:** this task's ORIGINAL text (a ring-occupancy-derived `h0IsMacroLast = (count <= 1) || p1.first`, explicitly justified by this plan's own Global Constraints as avoiding "threading a new per-uop field through ~20 crack sites") was dispatched to an implementer and came back **NEEDS_CONTEXT with a confirmed, independently-reproduced counterexample**, per this plan's own Step 3 instruction to escalate rather than proceed if the underlying atomicity assumption was false. It is false, on two independent grounds, both directly verified against the current codebase (not inferred):
+
+1. **`MicroOpQueue` (`src/main/scala/m68k040/decode/MicroOpQueue.scala:66,75`) pops at most 2 uops/cycle** (`io.pop.valid := count > 0`, `io.pop1Valid := count > 1`), with zero macro-boundary awareness. A 3-uop crack — e.g. a memory-destination RMW (`ADD.L D0,(A0)`: LOAD `firstOfInstr=True` at `MicroOpAssembler.scala:1249`, OP-uop `first=False`, `rmwStUop`/STORE `first=False`, explicitly commented "a trailing µop" — genuinely 3 distinct uops) **cannot** be pushed to the ROB in one cycle even under zero backpressure, since the queue physically cannot pop 3 at once.
+2. **`DispatchPlugin` (`src/main/scala/m68k040/dispatch/DispatchPlugin.scala:24-31`) gates its whole 2-wide `fire` on `rob.allocReady && iq.push.ready`** — ordinary ROB/IQ backpressure (routine under real program load) can delay a macro's remaining uop(s) an arbitrary number of cycles after its earlier uop(s) already retired-eligible.
+
+Concretely: for the RMW example above, if LOAD+OP dispatch together but STORE's own dispatch stalls behind backpressure, and LOAD completes and retires alone before STORE is even allocated, the ROB reaches `count==1` with `h0 = OP` (not the macro's real last uop, STORE) — `h0IsMacroLast = (count<=1) || p1.first` reads **True**, incorrectly. A debug stop pending at that exact moment would RECOVER right there, and the STORE — the RMW's actual memory write — **would never execute**. This is exactly the silent-corruption failure mode spec §6.2 exists to prevent, now reproduced as a structurally-reachable scenario rather than a hypothetical.
+
+**Corrected approach (this section replaces the original Task 4 in full):** thread a real, decode-time-known `lastOfInstr: Bool` field through the SAME path `firstOfInstr` already takes — `DecodedUop` → `RenamedUop` → `RobPayload` — set at every one of `firstOfInstr`'s own ~20 assignment sites (grep confirms these live in `src/main/scala/m68k040/decode/MicroOpAssembler.scala` and 2 sites in `src/main/scala/m68k040/decode/Microcode.scala:2987,3511`; the dead `lastUop: Bool` field at `src/main/scala/m68k040/types/MicroOp.scala:12` is a DIFFERENT bundle — the post-rename issue-scheduling `MicroOp`, not `DecodedUop`/`RenamedUop` — and is NOT the right place to add this; it stays dead). This is the exact scope this plan's Global Constraints originally tried to avoid — it turns out to be necessary, not optional, and the "large and error-prone for no benefit" framing was wrong on the "no benefit" half specifically (the benefit is correctness; the "large" half was correct, hence this task is now bigger than originally scoped). Once `p0.last`/`p1.last` exist as real, alloc-time-captured facts, `h0IsMacroLast` becomes a TRIVIAL `p0.last` (no ring-occupancy trick, no `count<=1` special case, no correctness risk from partial-macro dispatch).
 
 **Files:**
-- Modify: `src/main/scala/m68k040/rob/RobPlugin.scala`
-- Test: `src/test/scala/m68k040/rob/RobPluginSpec.scala`
+- Modify: `src/main/scala/m68k040/decode/DecodedUop.scala` (new field, alongside `firstOfInstr` at line 593)
+- Modify: `src/main/scala/m68k040/rename/RenamedUop.scala` (new field, alongside `firstOfInstr` at line 114)
+- Modify: `src/main/scala/m68k040/rename/RenameStage.scala` (thread it, alongside the existing `r.firstOfInstr := dec.firstOfInstr` at line 221)
+- Modify: `src/main/scala/m68k040/decode/MicroOpAssembler.scala` (set `lastOfInstr` at every one of the ~20 sites that currently sets `firstOfInstr` — NOT a mechanical "last = !first": some cracks have 3+ uops with a MIDDLE uop that is neither first nor last, e.g. the RMW example above where the OP-uop is `first=False, last=False`. Each site needs its own deliberate determination of which uop in that specific crack pattern is genuinely LAST, mirroring the care already visible in each site's own `firstOfInstr` comment.)
+- Modify: `src/main/scala/m68k040/decode/Microcode.scala` (the 2 direct `u.firstOfInstr := ...` sites at lines 2987, 3511)
+- Check: `src/main/scala/m68k040/decode/DecodeStage.scala` (the MOVEM multi-cycle FSM at lines 314-323 and its own An-update trailing uop at `MicroOpAssembler.scala:112-115`, explicitly commented "the macro instruction's last µop (NOT first)" — confirm whether this FSM sets `firstOfInstr` directly or goes through `MicroOpAssembler`'s helpers; wire `lastOfInstr` through whichever it is)
+- Modify: `src/main/scala/m68k040/rob/RobPlugin.scala` (`RobPayload.last` field alongside `RobPayload.first`; `p.last := u.lastOfInstr` in `payloadFrom`, alongside `p.first := u.firstOfInstr`; `h0IsMacroLast := p0.last`)
+- Test: `src/test/scala/m68k040/rob/RobPluginSpec.scala`, plus any decode-level spec that already tests `firstOfInstr` threading (grep for one — mirror its structure for `lastOfInstr`)
 
 **Interfaces:**
-- Consumes: `p0.first`/`p1.first`, `count` (existing).
-- Produces: `h0IsMacroLast: Bool` — internal signal (not exposed via the service; Task 5's FSM consumes it directly in the same `logic` scope) meaning "the entry about to retire at h0 this cycle is the LAST uop of its macro."
+- Consumes: nothing new at the ROB level beyond what already exists; the new field rides the EXACT SAME bundles/threading `firstOfInstr` already uses.
+- Produces: `RobPayload.last: Bool` (alloc-time captured, mirroring `RobPayload.first`); `h0IsMacroLast: Bool` in `RobPlugin.logic`, now simply `p0.last` — same name/meaning Task 5 already expects to consume, so Task 5's own text does NOT need to change.
 
-- [ ] **Step 1: Read spec §6.2 in full before writing this task** (`docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md:426-444`) — this task implements exactly its four bullet points and the closing "Debug code must not infer them from PC equality" warning, which this derivation deliberately does NOT do (it uses the rename-produced `first` marker, never PC comparison).
+- [ ] **Step 1: Read spec §6.2 in full** (`docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md:426-444`) — this section's own text ALREADY calls for "explicit `macroFirst` and either `macroLast` or an equivalent boundary event from the ROB," which is exactly what this revised task now does literally, rather than the equivalent-event shortcut the original text tried first.
 
-- [ ] **Step 2: Derive `h0IsMacroLast`**
+- [ ] **Step 2: Enumerate every `firstOfInstr` assignment site and determine "last" for each**
 
-Place near `h0TraceArmed`'s own definition (search for it — the explore pass for this plan found it forward-declared around line 709 and driven later; add this new signal the same way, forward-declared here, driven where `h0TraceArmed` is driven, for the identical reason: both need `p1`/`count` which are in scope earlier than where the exception unit exposes the values `h0TraceArmed` actually depends on — check whether `h0IsMacroLast` needs any exception-unit input; if not, as this derivation only needs `p1.first`/`count`, it can be a single non-forward-declared `val` right where `p0`/`p1` are defined, simpler than `h0TraceArmed`'s split):
+Grep `firstOfInstr\s*:=` across `src/main/scala/m68k040/decode/` and `src/main/scala/m68k040/rename/` to get the authoritative, current site list (do not trust a pre-enumerated list in this plan text — it may drift). For EACH site, read its surrounding crack-construction code and its own comment (every existing `firstOfInstr` site has one explaining which uop it marks and why) to determine which uop(s) in that same crack pattern are genuinely last. Build a companion table (in your own working notes, not necessarily committed) of {site, uop count in this crack, which uop is first, which is last, any middle uops that are neither}. Known patterns already established during this task's investigation:
+- Plain single-uop instruction: that one uop is both first AND last.
+- memSimple-source crack (load, op): 2 uops — load=first, op=last.
+- Memory-destination RMW crack (load, op, store): 3 uops — load=first, op=neither, store=last (`MicroOpAssembler.scala:1249,1320,1326`).
+- MOVEM: N transfer uops + a trailing An-update uop — the LAST transfer uop is NOT last if an An-update uop follows it; the An-update uop is last (`MicroOpAssembler.scala:112-115`'s own comment already says this explicitly).
+- mem-to-mem MOVE / immediate-materialize-to-mem MOVE: check `stUop.firstOfInstr := !crackMemMem && !immToMemCase` (`MicroOpAssembler.scala:1320`) for the FIRST-side logic already worked out for these cases; determine the mirror-image LAST logic (is the store always last in these forms, or can an auto-update uop trail it too?).
+
+Do this investigation for real, per-site — do not guess or bulk-assume a pattern holds everywhere just because it held for the 2 examples above.
+
+- [ ] **Step 3: Add the field to `DecodedUop`/`RenamedUop`, thread through `RenameStage`, set at every crack site**
+
+Mirror `firstOfInstr`'s exact declaration/threading shape at each of the 3 layers. Default value at declaration should make an UNCRACKED (single-uop) instruction correct with the LEAST code change — check what `firstOfInstr`'s own default/general-case assignment convention is (its doc comment at `DecodedUop.scala:591-593` says "Default True for every single-uop instruction" — determine whether that's a literal Scala default or set explicitly at a general assignment site, and mirror whichever it is for `lastOfInstr`, which should default True the same way for the identical reason).
+
+- [ ] **Step 4: `RobPlugin.scala` — add `RobPayload.last`, wire `payloadFrom`, derive `h0IsMacroLast`**
+
+```scala
+// in RobPayload, alongside `val first = Bool()`:
+val last = Bool()
+
+// in payloadFrom, alongside `p.first := u.firstOfInstr`:
+p.last := u.lastOfInstr
+```
 
 ```scala
 // ── Macro-boundary detection for debug stop (Stage 2) ───────────────────────
-// "Is the entry retiring at h0 THIS cycle the LAST uop of its macro?" -- exactly
-// spec section 6.2's macroFirst/macroLast pair, derived from the ALREADY-EXISTING
-// per-entry `payload.first` (macroFirst) rather than a new per-uop field (see this
-// plan's own Global Constraints note on why). True iff:
-//   (a) the ROB will be empty after this retire (count <= the number retiring this
-//       cycle) -- nothing behind h0 to be a trailing uop of the SAME macro, OR
-//   (b) the NEXT entry (h1/p1) is itself a macro's first uop (p1.first) -- h0 was
-//       the last uop of ITS macro.
-// Deliberately independent of retire0/retire1/flushing: this is a property of the
-// RING CONTENTS, not of whether h0 is retiring this cycle at all (Task 5 gates its
-// USE on headReady/retire0 itself).
-val h0IsMacroLast = (count <= 1) || p1.first
+// "Is the entry retiring at h0 THIS cycle the LAST uop of its macro?" -- spec
+// section 6.2's macroLast, now a real alloc-time-captured per-entry fact
+// (RobPayload.last, threaded from DecodedUop/RenamedUop.lastOfInstr through
+// every MicroOpAssembler/Microcode crack site -- see this task's own revision
+// history for why the earlier ring-occupancy-derived shortcut was wrong).
+val h0IsMacroLast = p0.last
 h0IsMacroLast.simPublic()
 ```
 
-- [ ] **Step 3: Directed test — matches real MicroOpAssembler crack shapes**
+Place this in `RobPlugin.scala` at the same location the original Task 4 text specified (near `p0`/`p1`'s own definitions, or near `h0TraceArmed` if it needs to be forward-declared for the same reason — re-evaluate whether forward-declaration is still needed now that this is a trivial `p0.last` read with no `count`/`p1` dependency; it very likely does NOT need forward declaration anymore, since `p0` is already in scope wherever this is placed).
 
-This is the highest-risk correctness claim in this plan (a wrong derivation silently mis-stops mid-crack, which is exactly the failure mode spec §6.2 warns about). Test against REAL decode output, not hand-built `RenamedUop`s:
+- [ ] **Step 5: Directed tests — matches real MicroOpAssembler crack shapes, PLUS the specific counterexample that invalidated the original approach**
 
 ```scala
 test("h0IsMacroLast is True on the trailing uop of a real cracked MOVEM, False on its leading uops") {
-  // Use the FULL decode pipeline (DecodeStage + MicroOpAssembler via the existing
-  // ExecuteLockStepSpec-style harness, or RobPluginSpec's own pokeRu if it already
-  // threads firstOfInstr correctly for a hand-built 3-uop sequence) to allocate a
-  // real MOVEM.L D0-D2,-(A7) (3 target registers -> 3 uops: first=True/False/False),
-  // retire single-wide across 3 cycles, and assert h0IsMacroLast reads False, False,
-  // True on the 3 respective retiring cycles.
+  // Same as originally specified: real MOVEM.L D0-D2,-(A7) (or the actual real
+  // decode path for it), retire single-wide across N cycles, assert
+  // h0IsMacroLast reads False on every uop except the true last one (the
+  // An-update uop if MOVEM emits one, per Step 2's investigation -- not
+  // necessarily the last DATA transfer uop).
 }
 test("h0IsMacroLast is True for every single-uop macro") {
-  // Single NOP-shaped uop, first=True, alone in the ROB (count==1 after alloc).
-  // Assert h0IsMacroLast == True.
+  // Single NOP-shaped uop. Assert h0IsMacroLast == True.
 }
-test("h0IsMacroLast is True when h0 is the newest allocated entry and nothing follows it yet (count==1, no h1)") {
-  // Alloc exactly one uop (first=True), do NOT alloc a second one behind it.
-  // Assert h0IsMacroLast == True even though, in principle, more uops of the
-  // SAME macro could still be dispatched later -- confirm this is IMPOSSIBLE by
-  // checking DispatchPlugin.scala/MicroOpAssembler.scala allocate a whole crack
-  // sequence atomically (same cycle or a contiguous burst with no OTHER macro's
-  // uop interleaved) -- if that atomicity does NOT hold, this whole task's
-  // derivation is wrong and must escalate to the human rather than silently
-  // proceeding with a new per-uop macroLast field instead. Confirm before writing
-  // Step 2's code, not after -- this is a NEEDS_CONTEXT-worthy question, not a
-  // judgment call, if the atomicity assumption turns out false.
+test("h0IsMacroLast is False on OP mid-crack even when STORE has not yet been allocated -- the exact counterexample that invalidated the original derivation") {
+  // Reproduce the RMW scenario directly: allocate LOAD (first=True,last=False)
+  // and OP (first=False,last=False) in one 2-wide dispatch cycle; complete and
+  // retire LOAD alone (single-wide) so the ROB reaches count==1 with h0=OP;
+  // DO NOT allocate STORE yet. Assert h0IsMacroLast == False at this point --
+  // this is the exact scenario where the ORIGINAL (count<=1)||p1.first
+  // derivation incorrectly read True. Then allocate+complete+retire STORE
+  // (first=False,last=True) and assert h0IsMacroLast == True on ITS retiring
+  // cycle.
 }
 ```
 
-- [ ] **Step 4: Compile + lock-step regression**
+- [ ] **Step 6: Compile + full lock-step regression + a broader ported-corpus sanity pass**
+
+This task touches decode-side bundles consumed by every instruction in the machine, unlike the ROB-only plumbing of Tasks 1-3 — run a wider check than the other tasks' bare lock-step gate:
 
 ```
 ~/sbt/bin/sbt compile
 ~/sbt/bin/sbt "testOnly m68k040.rob.RobPluginSpec"
-~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, unchanged (h0IsMacroLast is unused by anything yet)
+~/sbt/bin/sbt "testOnly m68k040.lockstep.ExecuteLockStepSpec"   # expect 399/400, exactly the CMP2.W indexed-bounds-pointer failure -- h0IsMacroLast/RobPayload.last are unused by anything outside this task's own tests, so this should be a behavioral no-op, but VERIFY given the wide blast radius of the DecodedUop/RenamedUop change
 ```
 
-- [ ] **Step 5: Commit**
+If any DIFFERENT lock-step test starts failing, that is a real regression in the new field's threading (a crack site got the wrong "last" value, or a site was missed and defaults wrong) — do not treat it as unrelated flakiness.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/main/scala/m68k040/rob/RobPlugin.scala src/test/scala/m68k040/rob/RobPluginSpec.scala
-git commit -m "rob: h0IsMacroLast macro-boundary derivation for debug stop (Stage 2 task 4)"
+git add src/main/scala/m68k040/decode/DecodedUop.scala src/main/scala/m68k040/rename/RenamedUop.scala src/main/scala/m68k040/rename/RenameStage.scala src/main/scala/m68k040/decode/MicroOpAssembler.scala src/main/scala/m68k040/decode/Microcode.scala src/main/scala/m68k040/rob/RobPlugin.scala src/test/scala/m68k040/rob/RobPluginSpec.scala
+git commit -m "decode+rename+rob: thread real lastOfInstr field for macro-boundary detection (Stage 2 task 4, revised)
+
+Original ring-occupancy-derived h0IsMacroLast = (count<=1)||p1.first was
+proven wrong: MicroOpQueue pops at most 2 uops/cycle and DispatchPlugin
+gates 2-wide dispatch on ROB/IQ backpressure, so a 3+-uop crack (e.g. a
+memory-destination RMW: load/op/store) can reach count==1 with h0 =
+a MIDDLE uop, mid-macro, before its true last uop is even allocated --
+a debug stop at that instant would silently drop the store. Threads a
+real lastOfInstr field through the same DecodedUop/RenamedUop/RobPayload
+path firstOfInstr already uses, set per-crack-site at decode time."
 ```
 
 ---
