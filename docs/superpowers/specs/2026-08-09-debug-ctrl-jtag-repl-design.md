@@ -425,10 +425,18 @@ preconditions cannot be weakened.
 
 ### 6.2 Macro-boundary rules
 
-- If a stop is sampled while the head is already at a new macro, that macro does not
-  retire. Its PC becomes the saved restart/stop PC.
+- Ordinary manual and halt-after stops are post-commit stop-the-world operations, not
+  pre-effect break/watch hits. The macro occupying the commit head when such a stop is
+  sampled is allowed to complete in full (including all remaining uops if it was
+  already partially retired); no following macro may retire. The halt materializes
+  only after recovery has flushed all younger in-flight work, so architectural state
+  and JTAG register readback present one consistent committed view.
 - If retirement is partway through a cracked macro, the remaining uops of that macro
   may complete/retire, but the next macro must not start.
+- A fault, interrupt, RTE, or serializing system macro reaches this boundary only when
+  its sequencer has installed the final architectural state and redirect PC. A pending
+  ordinary halt then parks at that redirect PC; it must not deadlock waiting for the
+  normal `retire0` event those paths deliberately do not produce.
 - Retire slot 1 is suppressed whenever it belongs to a different macro than slot 0 and
   a stop/step boundary is being taken.
 - A faulting instruction completes for step purposes when exception entry has fully
@@ -479,6 +487,9 @@ already clear before an automatic halt.
 Automatic stops park independently of sticky reason bits. Clearing reason latches
 cannot briefly release the core. Resume clears the parked state only after any required
 breakpoint skip-once state is armed.
+
+Manual halt is intentionally post-commit. Breakpoints/watchpoints retain the distinct
+pre-effect rule in section 6.7: their matching macro does not commit.
 
 ### 6.5 Single-step
 
@@ -676,6 +687,15 @@ PC trace and exception rings use synchronous BRAM with a registered AXI read res
 Depths are reported by `OFF_CAP_TRACE`; host code never assumes the RTL default. Trace
 is optional by constructor parameter and must compile out cleanly.
 
+The initial PC-retirement trace depth is 32 entries. It records architectural macro
+completion, not uop activity: push the macro's raw PC only when a retiring ROB entry
+has `lastOfInstr=True`. If two independently complete macros retire in one cycle,
+push slot 0 then slot 1 so ring order remains program order. `OFF_PC_TRACE_HEAD`
+identifies the next write position; after wrap, the preceding 32 ring positions are
+the 32 most recently completed macros. The ring remains live while RUNNING and freezes
+naturally once effective halt is reached, giving JTAG a stable history alongside the
+stable architectural snapshot.
+
 Performance feature bit 12 remains zero until every advertised counter has a real
 producer. Cycle count, macro count, exception count, flush count, predictor
 mispredictions, and cache hit/miss events should be exposed by typed observation
@@ -825,7 +845,8 @@ implemented tranche.
 
 ### Stage 7 — trace and truthful telemetry
 
-- Add optional BRAM trace/rings and real event producers.
+- Add the optional 32-entry macro-retirement PC ring described in section 9.3, plus
+  optional exception rings and real event producers.
 - Validate wrap/head semantics, build-time depths, synchronous-read latency, simultaneous
   dual-retire events, and no fabricated counters.
 

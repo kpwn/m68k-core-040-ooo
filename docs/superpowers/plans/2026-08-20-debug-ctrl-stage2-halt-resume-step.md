@@ -490,6 +490,11 @@ path firstOfInstr already uses, set per-crack-site at decode time."
 - Consumes: `h0IsMacroLast` (Task 4), `headReady`/`doFlushReg`/`flushPcReg`/`coreHalted` (existing).
 - Produces: `_debugEffectiveHalt` now real; `headReady` gains a debug-halt term; `doFlushReg`/`flushPcReg` gain a RECOVER-to-restart-PC arm; a new sibling-driven input pair `debugStopRequestIn: Bool` / `debugResumeRequestIn: Bool` (same `allowOverride` + idle-default convention as `coreHaltedIn`).
 
+`DebugCommitService.request(stop, resume)` is the public command boundary. The two
+idle-default wires above are its ROB-local implementation detail and remain public only
+for standalone simulation pokes; Task 6 must call the service method and must not reach
+into `RobPlugin.logic` from another plugin.
+
 - [ ] **Step 1: Add the sibling-driven command inputs**
 
 Alongside `coreHaltedIn` (`RobPlugin.scala:384-398`), same pattern:
@@ -524,19 +529,22 @@ debugHaltState.simPublic()
 val debugStopBoundaryHit = headReady && retire0 && h0IsMacroLast
 // STOP_PENDING -> RECOVER the cycle the CURRENTLY-retiring macro finishes (its
 // LAST uop retires); RUNNING -> STOP_PENDING the cycle a stop is requested.
-// A stop sampled while the head is ALREADY at a fresh macro (h0.first == True,
-// nothing yet retired of it) still waits for h0IsMacroLast on THAT SAME macro --
-// spec 6.2's "If a stop is sampled while the head is already at a new macro,
-// that macro does not retire" is satisfied because STOP_PENDING blocks retire0
-// itself (see headReady's new term below) BEFORE the boundary check ever runs
-// on a fresh macro that hasn't started retiring -- i.e. debugStopBoundaryHit can
-// only fire for a macro that was ALREADY mid-retirement (multi-uop) when the
-// stop was sampled; a fresh macro is blocked outright, never partially retired.
+// Ordinary manual/halt-after stops are post-commit: the macro occupying the commit
+// head when the request is sampled is allowed to finish in full, whether it is fresh
+// or already partially retired. No following macro may retire. Break/watch hits use
+// the separate pre-effect rule from spec section 6.7.
+// Fault/interrupt/RTE/serializing-system macros do not produce normal retire0.
+// Their boundary is the exception/system sequencer's completed redirect pulse;
+// STOP_PENDING must recognize it and save that redirect PC rather than deadlocking
+// with frontend admission already quiesced.
 val restartPcCapture = UInt(32 bits)
 restartPcCapture := p0.predNextPc   // the macro AFTER the one that just finished
 switch(debugHaltState) {
   is(DebugHaltState.RUNNING) {
-    when(debugStopRequestIn) { debugHaltState := DebugHaltState.STOP_PENDING }
+    when(debugStopRequestIn) {
+      debugHaltState := Mux(debugStopBoundaryHit, DebugHaltState.RECOVER,
+                            DebugHaltState.STOP_PENDING)
+    }
   }
   is(DebugHaltState.STOP_PENDING) {
     when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
@@ -556,6 +564,12 @@ val debugHalted = debugHaltState === DebugHaltState.HALTED
 _debugEffectiveHalt := debugHalted
 ```
 
+Drive `FrontendQuiesceService.active/next` from every non-RUNNING debug state in
+this task as well. `next` must assert on the stop-sampling edge and deassert on the
+resume edge, preserving FetchAlign's localized-register timing. This is part of the
+effective-halt contract: JTAG-visible `HALTED` promises no new frontend admission,
+not merely a blocked ROB retire port.
+
 - [ ] **Step 3: Gate retire on `STOP_PENDING`/`HALTED`, suppress the boundary macro itself, extend `headReady`**
 
 `headReady` (existing, `RobPlugin.scala:622`) becomes:
@@ -573,7 +587,8 @@ Retire-1 suppression across the boundary (spec 6.2 "Retire slot 1 is suppressed 
 val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp && !h0TraceArmed &&
   !h0PreciseCompletedSticky && sysAuxRdy1 &&
-  !(debugStopRequestIn && h0IsMacroLast)   // NEW: don't let h1 (a DIFFERENT macro,
+  !((debugStopRequestIn || debugHaltState === DebugHaltState.STOP_PENDING) &&
+    h0IsMacroLast)                         // NEW: don't let h1 (a DIFFERENT macro,
                                            // since h0IsMacroLast means h0 is its
                                            // macro's last uop) start while a stop
                                            // is pending and h0 is about to close
@@ -585,11 +600,11 @@ val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.
 Locate the existing driving site (explore pass: `RobPlugin.scala:1592-1594`, `doFlushReg := branchRedirect || exc.redirectValid`). Add a third disjunct, elaborated in the SAME `when` block (this file's own documented "last assignment wins" discipline — place this arm so it does not silently lose priority to the other two on a same-cycle coincidence; since a debug stop boundary and a mispredict/exception redirect firing on the EXACT same cycle is a real, if rare, possibility, decide priority explicitly rather than by accidental elaboration order — recommended: exception/mispredict redirect wins, since spec 6.1's RECOVER is itself just "the next unexecuted macro's PC", and if an exception is ALSO redirecting this cycle, the debug stop should re-observe the exception's own landing PC on ITS next boundary rather than racing it):
 
 ```scala
-val debugRecoverEnter = debugHaltState === DebugHaltState.STOP_PENDING && debugStopBoundaryHit
+val debugRecoverEnter = debugStopBoundaryHit
 doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter
 when(branchRedirect)        { flushPcReg := nextPcRd0 }
 when(exc.redirectValid)     { flushPcReg := exc.redirectPc }
-when(debugRecoverEnter && !exc.redirectValid) { flushPcReg := restartPcCapture }
+when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) { flushPcReg := restartPcCapture }
 ```
 
 (The final `when` deliberately excludes the `branchRedirect` case too — if `debugRecoverEnter` and `branchRedirect` land on the identical head the identical cycle, `restartPcCapture` (`p0.predNextPc`) and `nextPcRd0` are very likely the SAME value already, since both derive from the same retiring head's predicted-next-PC; but do not assume this without checking — if `RobPluginSpec` reveals they can differ, add an explicit priority note rather than silently trusting equality.)
@@ -600,7 +615,10 @@ Task 2's placeholder (`_debugLivePc := p0.pc`) is wrong once halted — while `H
 
 ```scala
 val debugLivePcReg = Reg(UInt(32 bits)) init 0
-when(debugRecoverEnter) { debugLivePcReg := flushPcReg }   // captures the SAME value just latched into flushPcReg this cycle
+when(debugRecoverEnter) {
+  debugLivePcReg := Mux(exc.redirectValid, exc.redirectPc,
+                    Mux(branchRedirect, nextPcRd0, restartPcCapture))
+}
 _debugLivePc := debugLivePcReg
 ```
 
@@ -609,7 +627,7 @@ _debugLivePc := debugLivePcReg
 ```scala
 test("stop request during a single-uop macro halts after exactly that macro, HALTED asserts effectiveHalt") {}
 test("stop request during a 3-uop cracked macro (MOVEM-shaped) lets all 3 uops retire, then halts before the NEXT macro") {}
-test("stop request sampled while head is already a fresh macro's first uop still waits for THAT macro to fully retire before halting") {}
+test("stop request sampled on a fresh macro commits that whole macro, then halts before its successor") {}
 test("resume clears HALTED, retire resumes, debugLivePc matches the macro that actually executes next") {}
 test("headReady/retire0/retire1 never fire while debugHaltState==HALTED, across 1000 cycles with completes(h0)/(h1) forced True") {}
 test("repeated halt/continue (10 cycles) leaves the ROB in a consistent state each time, no stuck STOP_PENDING") {}
@@ -640,7 +658,8 @@ git commit -m "rob: debug halt state machine RUNNING/STOP_PENDING/RECOVER/HALTED
 - Test: `src/test/scala/m68k040/debug/DebugCtrlPluginSpec.scala`, a new full-core-level directed test (find where `M68kFullCoreSynth`-shaped tests wire the whole plugin set together, e.g. a lock-step-adjacent harness, and add ONE directed "halt via dbg_axi actually stops the CPU" test there — the exact file to extend depends on what full-core-with-debug-ctrl test infrastructure exists after Task 1; locate it before writing this step, do not create a parallel one if one already exists)
 
 **Interfaces:**
-- Consumes: Task 5's `DebugCommitService.effectiveHalt` / the new `debugStopRequestIn`/`debugResumeRequestIn` RobPlugin inputs (not part of the service trait — they are plain sibling wires like `coreHaltedIn`, resolved via `host[RobPlugin].logic.debugStopRequestIn` the SAME way `BackendWiringPlugin` already reaches into `RobPlugin`'s other sibling inputs — check the exact idiom `BackendWiringPlugin` uses today for `coreHaltedIn` if it's driven from anywhere, or for `preciseDrainBusyIn`, and mirror it).
+- Consumes: Task 5's `DebugCommitService`, including `effectiveHalt` readback and
+  `request(stop, resume)`. The ROB-local request wires are not a cross-plugin API.
 - Produces: `OFF_CONTROL` bit 0 is real (no longer RAZ/WI); a write with bit 0 set requests stop, an accepted write with bit 0 clear requests resume (spec §6.4, verbatim — implement exactly this, not a toggle).
 
 - [ ] **Step 1: `DebugCtrlPlugin` — make `OFF_CONTROL` bit 0 real**
@@ -682,8 +701,9 @@ Find `BackendWiringPlugin`'s constructor/`during build` in `FullCoreSynth.scala`
 // logic" -- mirror that same optionality here rather than hard-requiring it).
 host.get[m68k040.debug.DebugCtrlPlugin] match {
   case Some(dbg) =>
-    rob.logic.debugStopRequestIn   := dbg.logic.debugStopRequestOut
-    rob.logic.debugResumeRequestIn := dbg.logic.debugResumeRequestOut
+    host[DebugCommitService].request(
+      stop   = dbg.logic.debugStopRequestOut,
+      resume = dbg.logic.debugResumeRequestOut)
   case None => // rob's own defaults (False/False) already apply
 }
 ```
@@ -1129,7 +1149,10 @@ GenerationFlags.simulation {
 }
 ```
 
-Also add the frontend-admission half of "effective halt implies no frontend/dispatch admission" — this requires extending `_frontendQuiesceActive`'s own driving line (`_frontendQuiesceActive := stopped || coreHalted`) to also OR in `_debugEffectiveHalt`, which is itself a REAL BEHAVIORAL change this task must make (not just an assertion) — without it, a debug-halted core would still let the frontend admit new fetch/decode work, silently violating spec §6.1's "forbid retire from crossing into a new macro... stop new frontend admission" the moment `debugHaltState` reaches `STOP_PENDING`, not just `HALTED`:
+Verify the frontend-admission half of "effective halt implies no frontend/dispatch
+admission" implemented by Task 5. Do not add a second driver: Task 5 already extends
+`_frontendQuiesceActive` and `_frontendQuiesceNext` across STOP_PENDING/RECOVER/HALTED
+and releases them on resume with the exact next-state timing FetchAlign requires:
 
 ```scala
 _frontendQuiesceActive := stopped || coreHalted || (debugHaltState =/= DebugHaltState.RUNNING)

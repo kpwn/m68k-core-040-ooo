@@ -8,6 +8,11 @@ import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
+/** Commit-owned debug stop state (debug/control Stage 2, design spec section 6). */
+object DebugHaltState extends SpinalEnum {
+  val RUNNING, STOP_PENDING, RECOVER, HALTED = newElement()
+}
+
 /** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
   *
   * - Alloc: PASSIVE RobAllocService — DispatchPlugin takes robIds and drives the
@@ -418,6 +423,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // meaningfully service).
     val coreHaltedIn = Bool(); coreHaltedIn.allowOverride; coreHaltedIn := False
     coreHaltedIn.simPublic()   // pokable from a standalone DUT, same convention as preciseDrainBusyIn
+    // Registered commands are driven by BackendWiringPlugin in Task 6. Idle defaults
+    // keep a standalone/no-debug RobPlugin behaviorally identical to Stage 1.
+    val debugStopRequestIn = Bool(); debugStopRequestIn.allowOverride; debugStopRequestIn := False
+    debugStopRequestIn.simPublic()
+    val debugResumeRequestIn = Bool(); debugResumeRequestIn.allowOverride; debugResumeRequestIn := False
+    debugResumeRequestIn.simPublic()
     // D28 (axi-socket adapter spec section 6.4): the halt seam carries a KIND alongside the
     // Bool. "Halts" is only half a diagnostic; an operator staring at a wedged core has to
     // know why. Deliberately an OBSERVATION, not a control path -- `coreHalted`'s three
@@ -651,6 +662,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // redirect pulse; it drives ONLY pointer/reg resets (no combinational fanout).
     val doFlushReg = RegInit(False); doFlushReg.simPublic()
     val flushPcReg = Reg(UInt(32 bits)); flushPcReg.simPublic()
+    val debugHaltState = Reg(DebugHaltState()) init DebugHaltState.RUNNING
+    debugHaltState.simPublic()
+    val debugHalted = debugHaltState === DebugHaltState.HALTED
+    debugHalted.simPublic()
+    val debugQuiesceActive = debugHaltState =/= DebugHaltState.RUNNING
+    // Exact next-state truth for FetchAlign's localized quiesce register: begin
+    // quiescing on the stop-sampling edge and release on the resume edge.
+    val debugQuiesceNext = Mux(debugHaltState === DebugHaltState.RUNNING,
+      debugStopRequestIn,
+      Mux(debugHaltState === DebugHaltState.HALTED, !debugResumeRequestIn, True))
+    val debugLivePcReg = Reg(UInt(32 bits)) init 0
+    debugLivePcReg.simPublic()
     // Exception squash: high on the entry/RTE trigger cycle AND while the FSM runs
     // (serializing — keep younger work squashed + block alloc/retire). Driven after
     // the exc unit is built; forward-declared so `flushing` can gate on it.
@@ -668,7 +691,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
     // the exc unit is built.
     val committedS = _supervisor; committedS.simPublic()
-    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted
+    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted && !debugHalted
     // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
     // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
     // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
@@ -835,8 +858,39 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
-                  !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1
+                  !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
+                  !((debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)) &&
+                    h0IsMacroLast)
 
+    // Ordinary manual/halt-after stops are post-commit. The macro at the head when
+    // the request is sampled completes in full; the slot-1 guard above prevents the
+    // same retire cycle from crossing into its successor. HALTED is not observable
+    // until the following RECOVER cycle has driven the registered flush.
+    val debugStopActive = debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)
+    val debugSequencerBoundaryHit = Bool() // driven below from the completed redirect
+    val debugNormalBoundaryHit = retire0 && h0IsMacroLast
+    val debugStopBoundaryHit = debugStopActive &&
+      (debugNormalBoundaryHit || debugSequencerBoundaryHit)
+    debugStopBoundaryHit.simPublic()
+    val debugRecoverEnter = debugStopBoundaryHit
+    debugRecoverEnter.simPublic()
+    switch(debugHaltState) {
+      is(DebugHaltState.RUNNING) {
+        when(debugStopRequestIn) {
+          when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
+            .otherwise             { debugHaltState := DebugHaltState.STOP_PENDING }
+        }
+      }
+      is(DebugHaltState.STOP_PENDING) {
+        when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
+      }
+      is(DebugHaltState.RECOVER) {
+        debugHaltState := DebugHaltState.HALTED
+      }
+      is(DebugHaltState.HALTED) {
+        when(debugResumeRequestIn) { debugHaltState := DebugHaltState.RUNNING }
+      }
+    }
     // ── Debug macro-retire counter (Stage 2, feature bit 22 macro_retire_count) ────
     // Counts MACRO-INSTRUCTIONS retired, not micro-ops: increments once per retiring
     // entry whose payload.first is True (the macro's own first uop -- payload.first
@@ -1598,18 +1652,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // remote ROB registers into the live fetch command cone.
     val stoppedNext = (stopped || stopEnter) && !interruptPending
     val coreHaltedNext = coreHalted || coreHaltedIn
-    _frontendQuiesceActive := stopped || coreHalted
-    _frontendQuiesceNext := stoppedNext || coreHaltedNext
+    _frontendQuiesceActive := stopped || coreHalted || debugQuiesceActive
+    _frontendQuiesceNext := stoppedNext || coreHaltedNext || debugQuiesceNext
     _frontendQuiesceActive.simPublic()
     _frontendQuiesceNext.simPublic()
 
-    // ── DebugCommitService inert defaults (Stage 2 task 2 -- pure plumbing) ─────
-    // Every field driven to an inert default here; no real producer yet. Tasks 3+
-    // give these real values (macro-retire counter, last-committed PC, halt FSM).
-    _debugEffectiveHalt    := False
+    // ── DebugCommitService readback ─────────────────────────────────────────────
+    _debugEffectiveHalt    := debugHalted
     _debugAutoHaltLatched  := False
     _debugHaltReason       := U(0, 3 bits)
-    _debugLivePc           := p0.pc          // best available "next" PC today; Task 6 refines
+    _debugLivePc           := debugLivePcReg
     _debugLastPc           := debugLastPcReg   // Task 3: real producer
     _debugMacroCount       := debugMacroCountReg // Task 3: real producer
     _debugHaltHitInstCount := U(0, 64 bits)
@@ -1678,9 +1730,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // The exc unit pulses redirectValid (one cycle) at the end of an entry/RTE
     // sequence with the target (vector / restored PC). doFlushReg is the registered
     // fan-out pulse; it drives the IQ/skid/fetch redirect for both cases.
-    doFlushReg := branchRedirect || exc.redirectValid
+    // A debug recovery shares the existing registered global flush. A coincident
+    // resolved branch owns the restart PC (actual target/fall-through); exception
+    // redirect remains highest priority. Capture the same selected value directly
+    // into debugLivePcReg -- reading flushPcReg here would capture its OLD value.
+    // Exception, RTE, interrupt, and serializing-system macros complete only when
+    // their sequencer installs its redirect PC; treating that pulse as a boundary
+    // prevents STOP_PENDING from parking halfway through architectural state update.
+    debugSequencerBoundaryHit := exc.redirectValid
+    val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
+                         Mux(branchRedirect, nextPcRd0, p0.predNextPc))
+    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
+    when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) {
+      flushPcReg := p0.predNextPc
+    }
+    when(debugRecoverEnter) { debugLivePcReg := debugRestartPc }
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.
@@ -1778,6 +1844,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
   override def doFlush = logic.doFlushReg
   override def flushPc = logic.flushPcReg
+  override def request(stop: Bool, resume: Bool): Unit = {
+    logic.debugStopRequestIn := stop
+    logic.debugResumeRequestIn := resume
+  }
 
   override def btbUpdate = logic.btbUpdateFlow
   override def gshareUpdate = logic.gshareUpdateFlow

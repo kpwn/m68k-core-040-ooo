@@ -80,6 +80,8 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.completion(0).valid #= false
     dut.rob.logic.completion(1).valid #= false
     dut.rob.logic.flush.valid #= false
+    dut.rob.logic.debugStopRequestIn #= false
+    dut.rob.logic.debugResumeRequestIn #= false
     cd.waitSampling()
   }
 
@@ -1586,6 +1588,104 @@ class RobPluginSpec extends AnyFunSuite {
       // 5. Retire the OP, then the STORE; only the STORE's retiring cycle is a boundary.
       assert(!retireAndSampleLast(dut, cd, opId), "the OP's own retiring cycle is not a macro boundary")
       assert(retireAndSampleLast(dut, cd, stId), "the STORE IS the RMW macro's last uop")
+    }
+  }
+
+  test("debug stop commits the request-cycle macro, flushes younger work, then exposes a stable halt") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x600, firstOfInstr = true, lastOfInstr = true)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x700, firstOfInstr = true, lastOfInstr = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+
+      markComplete(dut, 1); cd.waitSampling()
+      dut.rob.logic.completion(0).payload #= 0; cd.waitSampling()
+      clearComplete(dut)
+      dut.rob.logic.debugStopRequestIn #= true
+
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(!dut.tsink.logic.fireOut(1).toBoolean,
+        "a stop boundary must suppress the following macro in retire slot 1")
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean,
+        "effective halt must wait until recovery has flushed younger work")
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      assert(dut.rob.logic.doFlushReg.toBoolean, "RECOVER must issue the registered global flush")
+      assert(dut.dsink.logic.livePcOut.toLong == 0x602L,
+        f"saved live PC must be the committed macro successor, got 0x${dut.dsink.logic.livePcOut.toLong}%x")
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean, "halt becomes effective only after recovery")
+      assert(dut.rob.logic.count.toInt == 0, "recovery must flush all younger ROB work")
+      for (_ <- 0 until 20) {
+        assert(!dut.tsink.logic.fireOut(0).toBoolean && !dut.tsink.logic.fireOut(1).toBoolean)
+        assert(dut.dsink.logic.livePcOut.toLong == 0x602L, "JTAG-visible live PC must remain stable")
+        cd.waitSampling()
+      }
+    }
+  }
+
+  test("debug stop lets every remaining uop of the current cracked macro commit") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      val ids = Seq(
+        allocOneFL(dut, cd, 0x800, first = true,  last = false),
+        allocOneFL(dut, cd, 0x800, first = false, last = false),
+        allocOneFL(dut, cd, 0x800, first = false, last = true),
+        allocOneFL(dut, cd, 0x900, first = true,  last = true))
+
+      dut.rob.logic.debugStopRequestIn #= true
+      var retired = 0
+      ids.take(3).foreach { id =>
+        markComplete(dut, id); cd.waitSampling(); clearComplete(dut)
+        waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+        retired += 1
+        if (retired < 3) assert(!dut.rob.logic.debugRecoverEnter.toBoolean)
+        if (retired == 3) assert(dut.rob.logic.debugRecoverEnter.toBoolean)
+        cd.waitSampling()
+        if (retired == 1) dut.rob.logic.debugStopRequestIn #= false
+      }
+      assert(retired == 3, "all three uops of the request-cycle macro must retire")
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.rob.logic.count.toInt == 0, "the following macro must be flushed, not committed")
+      assert(dut.dsink.logic.lastPcOut.toLong == 0x800L)
+    }
+  }
+
+  test("debug resume releases a stable halt and retirement can continue") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      val id = allocOneFL(dut, cd, 0xa00, first = true, last = true)
+      dut.rob.logic.debugStopRequestIn #= true
+      markComplete(dut, id); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.rob.logic.debugRecoverEnter.toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+
+      dut.rob.logic.debugResumeRequestIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugResumeRequestIn #= false
+      cd.waitSampling()
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean, "resume must leave HALTED")
+
+      val next = allocOneFL(dut, cd, 0xa02, first = true, last = true)
+      markComplete(dut, next); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      cd.waitSampling()
+      assert(dut.dsink.logic.lastPcOut.toLong == 0xa02L, "retirement resumes after continue")
     }
   }
 }
