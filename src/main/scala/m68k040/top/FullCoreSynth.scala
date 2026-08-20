@@ -579,11 +579,10 @@ object GenFullCoreSynthVerilog {
           new RegFilePluginFpcc(),
           new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
           ,
-          // Stage 1 of the debug/control slave. Placed LAST because it consumes nothing
-          // from any other plugin -- it declares its own socket IO and reads no Global
-          // key, so its position in the list is free. Later stages that consume
-          // DebugCommitService will need to sit after RobPlugin.
-          new m68k040.debug.DebugCtrlPlugin(buildId = dbgBuildId, stage = 1, enable = debugEnable)
+          // Stage 2 debug/control slave. Placed after RobPlugin because halt, step,
+          // macro-count and reason reporting communicate exclusively through the
+          // ROB-owned DebugCommitService.
+          new m68k040.debug.DebugCtrlPlugin(buildId = dbgBuildId, stage = 2, enable = debugEnable)
           ,
           // Vivado VIO integration (design spec 2026-08-18-vio-jtag-debug-design.md, V4).
           // enable=false here -- M68kFullCoreSynth is the OOC/FMax gate target and its port

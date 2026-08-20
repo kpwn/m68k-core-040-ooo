@@ -376,7 +376,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                      automaticHalt ##    // bit 4  auto-halt latched
                      !effectiveHalt ##   // bit 3  running (inverse of halted)
                      initDoneLatched ##  // bit 2  init-done seen
-                     False ##            // bit 1  exception pending    (Stage 2)
+                     False ##            // bit 1  exception pending (Stage 5 halt_exc_mask)
                      effectiveHalt       // bit 0  effective coherent halt
           }
           is(DebugRegMap.OFF_RAM_WINDOW_LG2) { rData := ramWindowWord }
