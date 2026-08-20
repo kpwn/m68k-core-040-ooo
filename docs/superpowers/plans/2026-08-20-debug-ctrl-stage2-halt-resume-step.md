@@ -4,7 +4,7 @@
 
 **Goal:** Make the `dbg_axi` JTAG debug interface actually functional on cpu040: real manual halt/resume, single-step, halt-after (macro-count target), and a live/last committed PC readback — the minimum needed for a host (`tools/jtag_repl.tcl`'s `halt-status`/`pc`/`sweep`/manual-halt commands) to tell a genuine CPU hang from a live core, and to stop it precisely at a known point. Gate the whole feature behind a real, mirror-of-`VioProbePlugin` `enable` flag so it can be compiled out of area/FMax-reference builds.
 
-**Architecture:** `RobPlugin` already owns two halt-shaped mechanisms (`stopped`/STOP and `coreHalted`/fatal) and a registered flush/redirect pulse (`doFlushReg`/`flushPcReg`, `RedirectService`) that every speculative structure (IQ, RAT, frontend, D/I-TLB, store queue) already reacts to via `BackendWiringPlugin`. Stage 2 adds a third halt kind — debug-requested — that reuses both: a new `DebugCommitService` trait (mirroring the existing `FrontendQuiesceService` setup-allocated-wire pattern to dodge the same Icache→Rob→Rename→Decode→FetchAlign→Icache Fiber cycle) exposes live/last PC, macro count, and halt state from `RobPlugin`; `DebugCtrlPlugin` drives a new `debugStopRequest`/`debugStepRequest`/`haltAfterTarget` sibling-wire group into `RobPlugin`, wired centrally in `BackendWiringPlugin` exactly like every other cross-plugin signal in this codebase. Macro-boundary detection (the spec's `macroFirst`/`macroLast` pair) reuses the ALREADY-EXISTING `RobPayload.first` (`macroFirst`) for the retiring entry and adds the one new piece: `RobPayload.first` of the NEXT entry (`p1`, already read every cycle) tells the ROB whether the entry about to retire is the last uop of its macro — no new per-uop field needs threading through `MicroOpAssembler.scala`'s ~20 crack sites.
+**Architecture:** `RobPlugin` already owns two halt-shaped mechanisms (`stopped`/STOP and `coreHalted`/fatal) and a registered flush/redirect pulse (`doFlushReg`/`flushPcReg`, `RedirectService`) that every speculative structure (IQ, RAT, frontend, D/I-TLB, store queue) already reacts to. Stage 2 adds a third halt kind — debug-requested — that reuses those mechanisms. `RobPlugin` is the sole provider of `DebugCommitService`, which exposes halt commands plus live/last PC, macro count, and halt state; `DebugCtrlPlugin` communicates with the ROB only through that service. The ROB-local request wires remain implementation details and are never reached through another plugin's internals or routed as sibling IO. Macro-boundary detection uses the real `lastOfInstr` field threaded through decode, rename, and ROB payload by revised Task 4.
 
 **Tech Stack:** SpinalHDL 1.14.1, Scala 2.13.16, ScalaTest 3.2.19, SpinalSim/Verilator, Vivado for the post-route gate. Same as the Stage 0/1 plan (`docs/superpowers/plans/2026-08-17-debug-ctrl-stage0-stage1.md`) — read that plan's own Global Constraints section for anything not repeated here; this plan does not restate Stage 0/1's contract, only Stage 2's additions to it.
 
@@ -15,7 +15,7 @@
 - **`tools/debug/debug_regmap.def` is the frozen, machine-readable source of truth for every register offset and feature bit used in this plan — do NOT invent a new offset or bit.** Everything Stage 2 needs is ALREADY reserved at `STAGE=2` in that file (verified 2026-08-20): `OFF_CONTROL` bits 0/1/7 (`0x00008`, per spec §15.2's table — manual halt / single-step / step-arm, currently RAZ/WI), `OFF_STATUS` bits 0/1/4 (`0x0000C` — halted / exception-pending / auto-halt-latched), `OFF_PC` (`0x00010`, "Next live PC"), `OFF_LAST_PC` (`0x00014`, "Last committed PC"), `OFF_HALT_AFTER_LO/HI` (`0x00030`/`0x00034`), `OFF_HALT_CTL` (`0x0003C`, bit 2 = clear sticky reason/report latches), `OFF_HALT_REASON` (`0x00040`), `OFF_HALT_HIT_INST_LO/HI` (`0x00048`/`0x0004C`, macro count at the stop), `OFF_INST_LO/HI` (`0x01008`/`0x0100C`, free-running macro count), and feature bits 22 (`macro_retire_count`) / 23 (`stop_status_v2`), both already scoped to stage 2. `OFF_HALT_HIT_PC` (`0x00044`) is deliberately **stage 5** (breakpoint-hit reporting) — do not wire it in this plan; a manual/halt-after stop reports its location via `OFF_PC`/`OFF_LAST_PC` instead. `OFF_EXC_VEC`/`OFF_EXC_PC`/`OFF_HALT_EXC_MASK*`/`OFF_BREAK_PC*` are stage 5/9 — leave them RAZ/WI.
 - **No new `Global.scala` key** (spec §0.9, restated from Stage 0/1's own constraint — still binding).
 - **No new socket port.** Every Stage-2 register lives inside the existing `dbg_axi` CSR address space; `cpu_socket.vh`'s port list is unchanged by this plan.
-- **The whole feature must be optional and gated** (explicit user directive, 2026-08-20): `DebugCtrlPlugin` currently has NO `enable` parameter and is instantiated unconditionally at `FullCoreSynth.scala:580`. Task 1 retrofits an `enable: Boolean = true` constructor parameter mirroring `VioProbePlugin`'s exact disable pattern (`src/main/scala/m68k040/debug/VioProbePlugin.scala:37-81`): every declared IO stays present and named identically regardless of `enable` (so the socket contract never moves), but with `enable=false` every register is tied to its Stage-1-shell RAZ/WI behavior (or, if simplest, the plugin's `logic` degenerates to exactly today's Stage-1-only behavior) and **zero** Stage-2 RTL (the halt FSM, the `DebugCommitService` consumer wiring in `RobPlugin`/`BackendWiringPlugin`) is instantiated. Every new sibling wire this plan adds to `RobPlugin` (`debugStopRequest`, `debugStepRequest`, `haltAfterTarget`) follows the SAME `allowOverride`-plus-idle-default convention already used for `coreHaltedIn`/`completion`/`branchCompletion` (`RobPlugin.scala:184-217, 384-398`), so `RobPlugin` itself elaborates correctly whether or not `BackendWiringPlugin` drives them from a live `DebugCtrlPlugin`.
+- **The whole feature must be optional and gated** (explicit user directive, 2026-08-20): `DebugCtrlPlugin` currently has NO `enable` parameter and is instantiated unconditionally at `FullCoreSynth.scala:580`. Task 1 retrofits an `enable: Boolean = true` constructor parameter mirroring `VioProbePlugin`'s exact disable pattern (`src/main/scala/m68k040/debug/VioProbePlugin.scala:37-81`): every declared IO stays present and named identically regardless of `enable` (so the socket contract never moves), but with `enable=false` every register is tied to its Stage-1-shell RAZ/WI behavior (or, if simplest, the plugin's `logic` degenerates to exactly today's Stage-1-only behavior) and **zero** Stage-2 RTL is instantiated in `DebugCtrlPlugin`. Optional service resolution must preserve standalone and disabled builds. The ROB-local request wires (`debugStopRequestIn`, `debugStepRequestIn`, `haltAfterTargetIn`) follow the same `allowOverride`-plus-idle-default convention already used for `coreHaltedIn`/`completion`/`branchCompletion`; they are driven only by `DebugCommitService.request(...)`, never by sibling-plugin access.
 - **Macro-boundary detection REQUIRES a new per-uop field — RETRACTED 2026-08-20.** The original claim here (reuse `RobPayload.first` + ring occupancy, no new field needed) was dispatched as Task 4 and came back NEEDS_CONTEXT with a confirmed, structurally-reachable counterexample: `MicroOpQueue` (`decode/MicroOpQueue.scala:66,75`) pops at most 2 uops/cycle and `DispatchPlugin` (`dispatch/DispatchPlugin.scala:24-31`) gates 2-wide dispatch on ROB/IQ backpressure, so a 3+-uop crack (e.g. a memory-destination RMW: load/op/store, `MicroOpAssembler.scala:1249,1320,1326`) can reach `count==1` with `h0` = a MIDDLE uop mid-macro, before its real last uop is even allocated — the `(count<=1)||p1.first` derivation reads True there, incorrectly, which would silently drop the store on a debug stop at that instant. Task 4 (see its own now-revised text below) instead threads a real `lastOfInstr` field through `DecodedUop`→`RenamedUop`→`RobPayload`, mirroring `firstOfInstr`'s own ~20-site threading exactly — the cost this bullet originally tried to avoid, now confirmed necessary. `MicroOp.scala:12`'s dead `lastUop` field is a DIFFERENT bundle (post-rename issue scheduling, not decode/rename) and is not reused.
 - **Effective halt does NOT require the store queue or D-cache to be idle** (spec §6.3, verbatim: "Effective halt deliberately does not require the store queue or D-cache to be idle... If a bus is wedged, requiring global memory quiescence here would make the debugger unable to stop at the exact moment it is needed most"). Do not gate the halt FSM's `HALTED` transition on any SQ/D-cache busy signal. `DebugMemoryQuiesceService` (a SEPARATE, later concern for cache-maintenance/arch-apply launch) is explicitly OUT of scope for this plan — Stage 2 has no cache-maintenance or arch-apply command to gate.
 - **Fatal halt (`coreHalted`) is non-resumable and takes priority over debug halt** (spec §6.3, §13: "a resume request cannot release a fatal halt"). Every task touching resume must preserve this.
@@ -35,7 +35,7 @@
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `DebugCtrlPlugin(buildId: BigInt, porCycles: Int, stage: Int, enable: Boolean = true)` — every later task in this plan places its new logic inside the `if (enable) { ... }` branch this task creates. Every later task's `RobPlugin`/`BackendWiringPlugin` wiring must be written so that `enable=false` produces IDENTICAL RTL (module-for-module) to the current `main` branch's `M68kFullCoreSynth.v` for everything outside `DebugCtrlPlugin` itself.
+- Produces: `DebugCtrlPlugin(buildId: BigInt, porCycles: Int, stage: Int, enable: Boolean = true)` — every later task in this plan places its new logic inside the `if (enable) { ... }` branch this task creates. Every later service connection must be optional so that `enable=false` produces IDENTICAL RTL (module-for-module) to the current `main` branch's `M68kFullCoreSynth.v` for everything outside `DebugCtrlPlugin` itself.
 
 - [ ] **Step 1: Read the exact disable pattern to mirror**
 
@@ -168,8 +168,8 @@ Place it immediately after `FrontendQuiesceService` (line 49-54), following that
 ```scala
 /** ROB-owned debug halt/resume/step state (design spec
   * `docs/superpowers/specs/2026-08-09-debug-ctrl-jtag-repl-design.md` section 6, Stage 2).
-  * Read-side only in this task; `DebugCtrlPlugin` is the sole consumer, wired centrally
-  * in `BackendWiringPlugin` like every other cross-plugin signal in this codebase. */
+  * Read-side only in this task; `DebugCtrlPlugin` is the sole consumer and resolves
+  * this service directly. */
 trait DebugCommitService {
   def effectiveHalt:    Bool
   def autoHaltLatched:  Bool
@@ -479,7 +479,7 @@ path firstOfInstr already uses, set per-crack-site at decode time."
 
 ---
 
-## Task 5: The halt state machine — `debugStopRequest`/`debugResumeRequest` sibling wires, `RUNNING`/`STOP_PENDING`/`RECOVER`/`HALTED`
+## Task 5: The halt state machine — service-owned `debugStopRequest`/`debugResumeRequest`, `RUNNING`/`STOP_PENDING`/`RECOVER`/`HALTED`
 
 **Files:**
 - Modify: `src/main/scala/m68k040/rob/RobPlugin.scala`
@@ -488,20 +488,20 @@ path firstOfInstr already uses, set per-crack-site at decode time."
 
 **Interfaces:**
 - Consumes: `h0IsMacroLast` (Task 4), `headReady`/`doFlushReg`/`flushPcReg`/`coreHalted` (existing).
-- Produces: `_debugEffectiveHalt` now real; `headReady` gains a debug-halt term; `doFlushReg`/`flushPcReg` gain a RECOVER-to-restart-PC arm; a new sibling-driven input pair `debugStopRequestIn: Bool` / `debugResumeRequestIn: Bool` (same `allowOverride` + idle-default convention as `coreHaltedIn`).
+- Produces: `_debugEffectiveHalt` now real; `headReady` gains a debug-halt term; `doFlushReg`/`flushPcReg` gain a RECOVER-to-restart-PC arm; a ROB-local input pair `debugStopRequestIn: Bool` / `debugResumeRequestIn: Bool` driven only by `DebugCommitService.request` (same `allowOverride` + idle-default convention as `coreHaltedIn`).
 
 `DebugCommitService.request(stop, resume)` is the public command boundary. The two
 idle-default wires above are its ROB-local implementation detail and remain public only
 for standalone simulation pokes; Task 6 must call the service method and must not reach
 into `RobPlugin.logic` from another plugin.
 
-- [ ] **Step 1: Add the sibling-driven command inputs**
+- [ ] **Step 1: Add the service-driven ROB-local command inputs**
 
 Alongside `coreHaltedIn` (`RobPlugin.scala:384-398`), same pattern:
 
 ```scala
-// ── Debug stop/resume request (Stage 2, sibling-driven from DebugCtrlPlugin via
-// BackendWiringPlugin -- Task 6). allowOverride + idle-False default so RobPlugin
+// ── Debug stop/resume request (Stage 2, driven by DebugCommitService.request in
+// Task 6). allowOverride + idle-False default so RobPlugin
 // elaborates standalone (no DebugCtrlPlugin instantiated, or enable=false) with
 // this permanently False, matching coreHaltedIn's own convention exactly.
 val debugStopRequestIn = Bool(); debugStopRequestIn.allowOverride; debugStopRequestIn := False
@@ -813,14 +813,15 @@ is(DebugRegMap.OFF_HALT_CTL) {
 
 Read `OFF_HALT_AFTER_LO/HI` back from `haltAfterTarget`'s two halves (mirror the existing `is(DebugRegMap.OFF_RAM_WINDOW_LG2)`-shaped read arms).
 
-- [ ] **Step 3: Export target+epoch+armed to `RobPlugin`**
+- [ ] **Step 3: Extend `DebugCommitService` with target+epoch+armed**
 
-Same `out(Bool())`/`out(UInt(...))` pattern as `debugStopRequestOut` (Task 6 Step 1):
+Extend the service command method (or add a focused configuration method) so these
+values cross the public service boundary without sibling IO. `DebugCtrlPlugin` calls it
+with the three CSR-held values; `RobPlugin` assigns only its ROB-local inputs:
 
 ```scala
-val haltAfterTargetOut = out(UInt(64 bits)); haltAfterTargetOut := haltAfterTarget
-val haltAfterEpochOut  = out(UInt(8 bits));  haltAfterEpochOut  := haltAfterEpoch
-val haltAfterArmedOut  = out(Bool());        haltAfterArmedOut  := haltAfterArmed
+def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool): Unit
+dbgCommit.foreach(_.configureHaltAfter(haltAfterTarget, haltAfterEpoch, haltAfterArmed))
 ```
 
 - [ ] **Step 4: `RobPlugin` — the comparator**
@@ -841,18 +842,10 @@ val haltAfterTargetReg = RegNext(haltAfterTargetIn) init 0
 val haltAfterEpochReg  = RegNext(haltAfterEpochIn)  init 0
 val haltAfterArmedReg  = RegNext(haltAfterArmedIn && (haltAfterEpochIn === haltAfterEpochReg)) init False
 val haltAfterHit = haltAfterArmedReg && (debugMacroCountReg >= haltAfterTargetReg)
-when(haltAfterHit) { debugStopRequestIn := True }   // NOTE: this OVERRIDES the allowOverride
-                                                     // default set by BackendWiringPlugin's
-                                                     // Task-6 wiring -- confirm SpinalHDL's
-                                                     // last-assignment-wins applies correctly
-                                                     // here too (both are `:=` into the same
-                                                     // signal from within the SAME Area/build
-                                                     // scope now, not two different plugins
-                                                     // racing an allowOverride -- if this causes
-                                                     // an "already driven" elaboration error,
-                                                     // OR debugStopRequestIn with the
-                                                     // BackendWiringPlugin-driven level instead
-                                                     // of assigning twice).
+// Feed the internal trigger into the halt FSM alongside the manual request. Do not
+// assign a second driver to debugStopRequestIn; form an OR term local to RobPlugin.
+val debugStopActive = debugStopRequestIn || haltAfterHit ||
+  (debugHaltState === DebugHaltState.STOP_PENDING)
 ```
 
 (Flag the last comment's uncertainty explicitly to the implementer — this is exactly the kind of thing the task reviewer should double-check by actually compiling it, not by trusting the plan's prose.)
@@ -951,6 +944,8 @@ val stepPulse = RegInit(False); stepPulse.simPublic()
 stepPulse := False   // self-clearing default, same convention as coldPulse
 // in write decode:
 when(m(1)) { stepPulse := True }
+// Extend DebugCommitService.request with a step command (or add requestStep) and pass
+// stepPulse through that service. Do not expose a DebugCtrlPlugin sibling output.
 ```
 
 Bit 7 (legacy step-arm OBSERVATION) — check spec §3.3's exact bit-7 semantics before deciding whether Stage 2 needs to implement it or can leave it RAZ/WI; the spec text this plan already read (§15.2) marks it "RAZ/WI (Stage 2)" ambiguously (the parenthetical could mean "implemented in Stage 2" OR "still RAZ/WI as of Stage 2, deferred further" — re-read spec §3.3's own bit-7 description, not just §15.2's table, to resolve this before writing Step 3's code; if genuinely ambiguous even after re-reading, leave bit 7 RAZ/WI and note the deferral explicitly in the commit message rather than guessing).
@@ -1057,12 +1052,12 @@ Task 7 left a TODO here. Implement it:
 is(DebugRegMap.OFF_HALT_CTL) {
   when(wStrb(0)) {
     when(wData(0)) { haltAfterArmed := True }
-    when(wData(2)) { /* signal RobPlugin to clear debugHaltReasonReg + debugStepRejected via a new pulse output, mirroring debugStopRequestOut's shape */ }
+    when(wData(2)) { /* issue a one-cycle clear-sticky command through DebugCommitService */ }
   }
 }
 ```
 
-Add `haltCtlClearOut: Bool` (pulse) mirroring `debugStopRequestOut`; in `RobPlugin`, `when(haltCtlClearIn) { debugHaltReasonReg := 0; debugStepRejected := False }` — but NOT while still `HALTED`/`STEP_RUNNING` with an ACTIVE (not yet acknowledged) stop, only the STICKY LATCHES per spec's own wording ("clears sticky reason/report latches" — a report of a PAST event, not the live state); confirm against spec text whether clearing while still halted is even meaningful/expected, and if the spec is silent, the safe choice is: allow the clear unconditionally (it only clears the REASON CODE display and the rejected-sticky bit, neither of which gates retire/halt behavior itself, so clearing them while halted cannot cause a live-state corruption — verify this claim against the actual consumers before shipping it, don't just assert it).
+Extend `DebugCommitService` with a clear-sticky command and consume it in `RobPlugin` as `haltCtlClearIn`; do not add a `DebugCtrlPlugin` output. In `RobPlugin`, `when(haltCtlClearIn) { debugHaltReasonReg := 0; debugStepRejected := False }` — but NOT while still `HALTED`/`STEP_RUNNING` with an ACTIVE (not yet acknowledged) stop, only the STICKY LATCHES per spec's own wording ("clears sticky reason/report latches" — a report of a PAST event, not the live state); confirm against spec text whether clearing while still halted is even meaningful/expected, and if the spec is silent, the safe choice is: allow the clear unconditionally (it only clears the REASON CODE display and the rejected-sticky bit, neither of which gates retire/halt behavior itself, so clearing them while halted cannot cause a live-state corruption — verify this claim against the actual consumers before shipping it, don't just assert it).
 
 - [ ] **Step 7: Directed tests**
 
