@@ -122,4 +122,36 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       assert((status & 1L) == 0, "consumed halt-after target retriggered after resume")
     }
   }
+
+  test("deployed HALT, HALT|STEP, zero sequence accepts exactly one step") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      dut.rob.logic.completion(0).valid #= false
+      dut.rob.logic.completion(1).valid #= false
+      dut.rob.logic.flush.valid #= false
+      cd.waitSampling(20)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL.toLong, 1)
+      var waited = 0
+      while (!dut.rob.logic.debugHalted.toBoolean && waited < 100) {
+        cd.waitSampling(); waited += 1
+      }
+      assert(dut.rob.logic.debugHalted.toBoolean)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL.toLong, 3)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL.toLong, 0)
+      waited = 0
+      while (dut.rob.logic.debugHaltState.toEnum != m68k040.rob.DebugHaltState.STEP_RUNNING && waited < 100) {
+        cd.waitSampling(); waited += 1
+      }
+      assert(dut.rob.logic.debugHaltState.toEnum == m68k040.rob.DebugHaltState.STEP_RUNNING,
+        "the trailing zero write must not cancel an accepted step")
+      assert(!dut.rob.logic.debugStepRejected.toBoolean)
+    }
+  }
 }

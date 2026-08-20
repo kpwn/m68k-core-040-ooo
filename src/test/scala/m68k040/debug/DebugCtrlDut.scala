@@ -38,6 +38,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   private var autoHaltWire: Bool = null
   private var stopWire: Bool = null
   private var resumeWire: Bool = null
+  private var stepWire: Bool = null
   private var haltAfterTargetWire: UInt = null
   private var haltAfterEpochWire: UInt = null
   private var haltAfterArmedWire: Bool = null
@@ -57,6 +58,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     autoHaltWire = Bool()
     stopWire = Bool(); stopWire.allowOverride; stopWire := False
     resumeWire = Bool(); resumeWire.allowOverride; resumeWire := False
+    stepWire = Bool(); stepWire.allowOverride; stepWire := False
     haltAfterTargetWire = UInt(64 bits); haltAfterTargetWire.allowOverride
     haltAfterTargetWire := U(0, 64 bits)
     haltAfterEpochWire = UInt(8 bits); haltAfterEpochWire.allowOverride
@@ -86,21 +88,24 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
 
     val stopRequest = out(Bool())
     val resumeRequest = out(Bool())
+    val stepRequest = out(Bool())
     val haltAfterTarget = out(UInt(64 bits))
     val haltAfterEpoch = out(UInt(8 bits))
     val haltAfterArmed = out(Bool())
     val haltAfterInvalidate = out(Bool())
     stopRequest := stopWire
     resumeRequest := resumeWire
+    stepRequest := stepWire
     haltAfterTarget := haltAfterTargetWire
     haltAfterEpoch := haltAfterEpochWire
     haltAfterArmed := haltAfterArmedWire
     haltAfterInvalidate := haltAfterInvalidateWire
   }
 
-  override def request(stop: Bool, resume: Bool): Unit = {
+  override def request(stop: Bool, resume: Bool, step: Bool): Unit = {
     stopWire := stop
     resumeWire := resume
+    stepWire := step
   }
   override def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool,
                                   invalidate: Bool): Unit = {

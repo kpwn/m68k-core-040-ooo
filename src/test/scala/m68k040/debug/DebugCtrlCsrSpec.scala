@@ -212,11 +212,13 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
 
       var stopPulses = 0
       var resumePulses = 0
+      var stepPulses = 0
       val watcher = fork {
         while (true) {
           dut.clockDomain.waitSampling()
           if (dut.commitStub.logic.stopRequest.toBoolean) stopPulses += 1
           if (dut.commitStub.logic.resumeRequest.toBoolean) resumePulses += 1
+          if (dut.commitStub.logic.stepRequest.toBoolean) stepPulses += 1
         }
       }
 
@@ -239,12 +241,23 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       assert(stopPulses == 1 && resumePulses == 2,
         s"two explicit clear writes produced stop=$stopPulses resume=$resumePulses pulses")
 
+      // The deployed step write keeps HALT set and adds the self-clearing bit-1
+      // command. Bit 7 remains the legacy observation and is deliberately RAZ/WI.
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong,
+        CTRL_HALT | CTRL_STEP | CTRL_STEP_ARM)
+      dut.clockDomain.waitSampling(3)
+      val steppedControl = DbgAxiDriver.read(
+        dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong)
+      assert(stepPulses == 1, s"step write produced $stepPulses command pulses")
+      assert((steppedControl & CTRL_STEP) == 0, "CONTROL.step must self-clear")
+      assert((steppedControl & CTRL_STEP_ARM) == 0, "legacy CONTROL bit 7 remains RAZ/WI")
+
       // Byte 0 carries CONTROL bit 0. A write that does not strobe it changes neither
       // the readback level nor the command stream.
       DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong,
         CTRL_HALT, strb = 0xE)
       dut.clockDomain.waitSampling(3)
-      assert(stopPulses == 1 && resumePulses == 2,
+      assert(stopPulses == 2 && resumePulses == 2 && stepPulses == 1,
         "an unstrobed CONTROL byte 0 emitted a halt/resume command")
       watcher.terminate()
     }

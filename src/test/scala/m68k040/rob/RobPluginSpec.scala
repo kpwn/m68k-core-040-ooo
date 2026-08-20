@@ -82,6 +82,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.flush.valid #= false
     dut.rob.logic.debugStopRequestIn #= false
     dut.rob.logic.debugResumeRequestIn #= false
+    dut.rob.logic.debugStepRequestIn #= false
     dut.rob.logic.haltAfterTargetIn #= 0
     dut.rob.logic.haltAfterEpochIn #= 0
     dut.rob.logic.haltAfterArmedIn #= false
@@ -1692,6 +1693,117 @@ class RobPluginSpec extends AnyFunSuite {
       waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
       cd.waitSampling()
       assert(dut.dsink.logic.lastPcOut.toLong == 0xa02L, "retirement resumes after continue")
+    }
+  }
+
+  test("single-step retires one single-uop macro, blocks its dual-retire successor, and re-halts") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Park at an empty, already-clean boundary.
+      dut.rob.logic.debugStopRequestIn #= true
+      waitUntil(cd, dut.rob.logic.debugRecoverEnter.toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+
+      // Accept a one-cycle step command, then model the frontend delivering two
+      // independently complete macros together. Only the first may retire.
+      dut.rob.logic.debugStepRequestIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugStepRequestIn #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.STEP_RUNNING)
+
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0xc00, firstOfInstr = true, lastOfInstr = true)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0xd00, firstOfInstr = true, lastOfInstr = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+
+      dut.rob.logic.completion(0).valid #= true
+      dut.rob.logic.completion(0).payload #= 0
+      dut.rob.logic.completion(1).valid #= true
+      dut.rob.logic.completion(1).payload #= 1
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+      dut.rob.logic.completion(1).valid #= false
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(!dut.tsink.logic.fireOut(1).toBoolean,
+        "step must not retire the first uop of the following macro in slot 1")
+      assert(dut.rob.logic.debugStepBoundaryHit.toBoolean)
+      cd.waitSampling(2)
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.rob.logic.count.toInt == 0, "the unexecuted successor must be flushed")
+      assert(dut.dsink.logic.lastPcOut.toLong == 0xc00L)
+      assert(dut.dsink.logic.livePcOut.toLong == 0xc02L)
+    }
+  }
+
+  test("single-step completes a cracked macro including a same-macro slot-1 tail") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      dut.rob.logic.debugStopRequestIn #= true
+      waitUntil(cd, dut.rob.logic.debugRecoverEnter.toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      cd.waitSampling()
+      dut.rob.logic.debugStepRequestIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugStepRequestIn #= false
+
+      // Both entries are uops of ONE macro. Slot 1 is therefore required to retire:
+      // suppressing it unconditionally would stop halfway through the macro.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0xe00, firstOfInstr = true, lastOfInstr = false)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0xe00, firstOfInstr = false, lastOfInstr = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= true
+      dut.rob.logic.completion(0).payload #= 0
+      dut.rob.logic.completion(1).valid #= true
+      dut.rob.logic.completion(1).payload #= 1
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+      dut.rob.logic.completion(1).valid #= false
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.fireOut(1).toBoolean,
+        "same-macro tail must be allowed in slot 1 during a step")
+      assert(dut.rob.logic.debugStepBoundaryHit.toBoolean)
+      cd.waitSampling(2)
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
+      assert(dut.dsink.logic.livePcOut.toLong == 0xe02L)
+    }
+  }
+
+  test("single-step request while running is rejected without disturbing execution") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.debugStepRequestIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugStepRequestIn #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.debugStepRejected.toBoolean)
+      assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.RUNNING)
+
+      val id = allocOneFL(dut, cd, 0xf00, first = true, last = true)
+      markComplete(dut, id); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(!dut.rob.logic.debugStepBoundaryHit.toBoolean)
+      cd.waitSampling()
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean)
     }
   }
 

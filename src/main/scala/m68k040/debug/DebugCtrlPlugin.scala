@@ -249,11 +249,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val manualHaltLevel = if (stage >= 2) RegInit(False) else False
       val debugStopRequest = if (stage >= 2) RegInit(False) else False
       val debugResumeRequest = if (stage >= 2) RegInit(False) else False
+      val debugStepRequest = if (stage >= 2) RegInit(False) else False
       if (stage >= 2) {
         manualHaltLevel.simPublic()
-        debugStopRequest.simPublic(); debugResumeRequest.simPublic()
+        debugStopRequest.simPublic(); debugResumeRequest.simPublic(); debugStepRequest.simPublic()
         debugStopRequest := False
         debugResumeRequest := False
+        debugStepRequest := False
       }
 
       // Halt-after configuration is debug-owned and therefore survives CPU reset.
@@ -299,7 +301,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         ctrlColdHold ##     // bit 4  cold-reset hold level
         ctrlInitDoneOvr ##  // bit 3  init-done override level
         coldPulse ##        // bit 2  deprecated pulse alias of bit 5
-        False ##            // bit 1  single-step pulse    -- RAZ/WI until Stage 2
+        debugStepRequest ## // bit 1  single-step pulse (self-clearing command)
         manualHaltLevel     // bit 0  manual halt request level (RAZ/WI in Stage 1)
 
       // ── SoC-fabric configuration, debug reset domain ────────────────────────────
@@ -399,6 +401,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                 manualHaltLevel := m(0)
                 when(m(0)) { debugStopRequest := True }
                   .otherwise { debugResumeRequest := True }
+                when(m(1)) { debugStepRequest := True }
               }
             }
           }
@@ -565,7 +568,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // completed. Never let a transient/reset value acquire halt ownership; this is
       // the command-side counterpart of AXI READY being held low while dbgRst is active.
       dbgCommit.foreach(_.request(csr.debugStopRequest && !dbgRst,
-        csr.debugResumeRequest && !dbgRst))
+        csr.debugResumeRequest && !dbgRst, csr.debugStepRequest && !dbgRst))
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
     }
