@@ -814,6 +814,35 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1
 
+    // ── Debug macro-retire counter (Stage 2, feature bit 22 macro_retire_count) ────
+    // Counts MACRO-INSTRUCTIONS retired, not micro-ops: increments once per retiring
+    // entry whose payload.first is True (the macro's own first uop -- payload.first
+    // is already threaded through every MicroOpAssembler crack site as the retire-time
+    // macro-boundary marker; see RobPayload.first / u.firstOfInstr). A macro's
+    // trailing uops (first=False) do not increment it, so a 5-uop MOVEM retiring
+    // across 5 cycles increments this exactly once, on the cycle its FIRST uop
+    // retires -- matching the spec's "OFF_INST_* ... count macro-instructions, not
+    // uops" (debug_regmap.def FEAT macro_retire_count). Free-running: never cleared
+    // except by CPU reset (it lives in RobPlugin's own logic, which IS the CPU-reset
+    // domain -- unlike DebugCtrlPlugin's surviving debug-domain registers).
+    val debugMacroCountReg = Reg(UInt(64 bits)) init 0
+    debugMacroCountReg.simPublic()
+    val debugMacroCountInc =
+      (retire0 && p0.first).asUInt.resize(2) +
+      (retire1 && p1.first).asUInt.resize(2)
+    when(debugMacroCountInc =/= 0) { debugMacroCountReg := debugMacroCountReg + debugMacroCountInc.resized }
+
+    // ── Debug last-committed-PC (Stage 2, OFF_LAST_PC) ──────────────────────────
+    // The PC of the most recently retired MACRO (not every uop -- a trailing uop of
+    // a cracked macro shares its leading uop's PC by construction, per payload.pc's
+    // own doc comment, so capturing on EVERY retire vs only on first=True retires is
+    // observationally identical for this field; captured unconditionally on any
+    // retire for simplicity, matching that equivalence).
+    val debugLastPcReg = Reg(UInt(32 bits)) init 0
+    debugLastPcReg.simPublic()
+    when(retire1)      { debugLastPcReg := p1.pc }
+      .elsewhen(retire0) { debugLastPcReg := p0.pc }
+
     // Task 9b: the capture itself. Slot = destination temp - T0 (the transfer's position
     // in the register list). Both retire slots are handled, and the two writes can never
     // target the same slot:
@@ -1558,8 +1587,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugAutoHaltLatched  := False
     _debugHaltReason       := U(0, 3 bits)
     _debugLivePc           := p0.pc          // best available "next" PC today; Task 6 refines
-    _debugLastPc           := U(0, 32 bits)  // Task 3 gives this a real producer
-    _debugMacroCount       := U(0, 64 bits)  // Task 3 gives this a real producer
+    _debugLastPc           := debugLastPcReg   // Task 3: real producer
+    _debugMacroCount       := debugMacroCountReg // Task 3: real producer
     _debugHaltHitInstCount := U(0, 64 bits)
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────

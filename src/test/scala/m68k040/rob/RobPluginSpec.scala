@@ -42,7 +42,8 @@ class RobPluginSpec extends AnyFunSuite {
       pdst: Int = 0, pdstValid: Boolean = false, pdstOld: Int = 0,
       writesNzvc: Boolean = false, pNzvcDst: Int = 0, pNzvcOld: Int = 0,
       writesX: Boolean = false, pXDst: Int = 0, pXOld: Int = 0,
-      isBranch: Boolean = false
+      isBranch: Boolean = false,
+      firstOfInstr: Boolean = false
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
@@ -65,6 +66,7 @@ class RobPluginSpec extends AnyFunSuite {
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
     u.needsSupervisor #= false   // Track C field (privViolation): inert, else garbage spuriously blocks retire
+    u.firstOfInstr #= firstOfInstr   // macro boundary marker (Stage 2 task 3: real debugMacroCount consumer)
   }
 
   def initSimple(dut: SimpleDut, cd: ClockDomain): Unit = {
@@ -1352,6 +1354,99 @@ class RobPluginSpec extends AnyFunSuite {
         cd.waitSampling()
         assertInert("post-retire settle")
       }
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Stage 2 task 3: free-running macro-retire counter -- counts macros, not uops.
+  test("debugMacroCount increments once per retiring macro, not once per retired uop") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      /** Single-wide alloc of one uop, then complete + retire it alone (single-wide
+        * retire, no dual-retire pairing -- keeps the sequencing simple per the
+        * plan's own directed-test text). */
+      def allocOne(pc: Long, first: Boolean): Int = {
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = pc, firstOfInstr = first)
+        dut.rsrc.logic.src.valid #= true
+        dut.rsrc.logic.u1v #= false
+        val id = dut.rob.logic.tail.toInt
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false
+        cd.waitSampling()
+        id
+      }
+      def completeAndRetire(id: Int): Unit = {
+        markComplete(dut, id)
+        cd.waitSampling()
+        clearComplete(dut)
+        cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+        cd.waitSampling() // debugMacroCountReg is a Reg: settles one edge after the retire pulse
+      }
+
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 0, "macroCount starts at 0")
+
+      // 3-uop cracked macro: first=True, False, False -- retired single-wide across
+      // 3 separate cycles.
+      val id0 = allocOne(0x100, first = true)
+      completeAndRetire(id0)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
+        s"macroCount must be 1 immediately after the FIRST uop of the 3-uop macro retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+
+      val id1 = allocOne(0x102, first = false)
+      completeAndRetire(id1)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
+        s"macroCount must stay 1 after a trailing (first=False) uop retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+
+      val id2 = allocOne(0x104, first = false)
+      completeAndRetire(id2)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
+        s"macroCount must stay 1 after the LAST trailing uop of the 3-uop macro retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+
+      // A second, 1-uop macro.
+      val id3 = allocOne(0x200, first = true)
+      completeAndRetire(id3)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 2,
+        s"macroCount must be 2 after both macros (3-uop + 1-uop) have fully retired, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Stage 2 task 3: last-committed-PC capture, dual-retire slot-1 priority.
+  test("debugLastPc tracks the most recently retired entry's PC, single- and dual-retire") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Two independent single-uop macros at DIFFERENT PCs, dispatched together and
+      // retiring in the SAME cycle (retire0 && retire1 both true).
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3, firstOfInstr = true)
+      pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x200, dstArch = 5, pdst = 21, pdstValid = true, pdstOld = 5, firstOfInstr = true)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= true
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      dut.rsrc.logic.u1v #= false
+      cd.waitSampling()
+
+      markComplete(dut, 1)
+      cd.waitSampling()
+      dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      clearComplete(dut)
+
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.fireOut(1).toBoolean, "test precondition: genuine dual (2-wide) retire this cycle")
+      cd.waitSampling() // debugLastPcReg settles one edge after the retire pulse
+
+      // debugLastPcReg captures p1.pc/p0.pc -- the macro's OWN (raw) PC field, not the
+      // commit/predNextPc value tracked by CommitTrace (that distinction is deliberate
+      // in Task 3's own spec text: OFF_LAST_PC is "the most recently retired macro's
+      // PC", the instruction's own address).
+      assert(dut.dsink.logic.lastPcOut.toLong == 0x200L,
+        s"debugLastPc must be slot-1's (p1) raw PC (0x200), not slot-0's (0x100), got 0x${dut.dsink.logic.lastPcOut.toLong.toHexString}")
       assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
     }
   }
