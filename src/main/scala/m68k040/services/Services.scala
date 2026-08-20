@@ -19,6 +19,18 @@ trait RenameCommitService {
   def flushPort:   Bool
 }
 
+/** Rename-owned committed architectural mappings for coherent debug access.
+  *
+  * These are the committed RAT entries only; speculative location/bypass state is
+  * deliberately absent. `DebugCtrlPlugin` selects one mapping at a time and feeds it
+  * to its single shared PRF read/write port while the ROB reports effective halt.
+  * PRODUCER: `RenameStage` (exactly one). */
+trait CommittedMapService {
+  def intPhys:  Vec[UInt] // D0-D7, A0-A7, then internal temps; debug uses 0..15
+  def nzvcPhys: UInt      // singleton committed NZVC mapping
+  def xPhys:    UInt      // singleton committed X mapping
+}
+
 /** ROB exposes; lock-step harness / sinks consume. Up to 2 retired instr/cycle. */
 trait CommitTraceService {
   def trace:     Vec[CommitTrace]   // length 2
@@ -68,6 +80,47 @@ trait DebugCommitService {
   /** Surviving debug-domain halt-after configuration. `invalidate` is the accepted
     * target-write pulse; it cancels a stale pipelined comparison on that same edge. */
   def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool, invalidate: Bool): Unit
+}
+
+/** One atomic commit-owner update used by the halted architectural-apply FSM.
+  * D/A and split-CCR PRF writes travel through their shared regfile ports; this
+  * bundle contains only the non-renamed state whose sole owner is the ROB (or the
+  * ROB-routed MMU service), plus the saved restart PC. */
+case class DebugSystemApply() extends Bundle {
+  val srValid, pcValid, vbrValid = Bool()
+  val uspValid, mspValid, ispValid = Bool()
+  val cacrValid, sfcValid, dfcValid = Bool()
+  val tcValid, itt0Valid, itt1Valid, dtt0Valid, dtt1Valid = Bool()
+  val urpValid, srpValid = Bool()
+  val sr = UInt(16 bits)
+  val pc, vbr, usp, msp, isp, cacr = UInt(32 bits)
+  val sfc, dfc = UInt(3 bits)
+  val tc, itt0, itt1, dtt0, dtt1, urp, srp = UInt(32 bits)
+}
+
+/** ROB-owned coherent committed system-state debug seam.
+  *
+  * PRODUCER: `RobPlugin` (exactly one). `DebugCtrlPlugin` is the sole consumer.
+  * The write command is accepted only as part of that plugin's halted apply FSM;
+  * ordinary architectural writes continue to flow through ExceptionUnit. */
+trait DebugSystemStateService {
+  def sr: UInt
+  def vbr: UInt
+  def usp: UInt
+  def msp: UInt
+  def isp: UInt
+  def cacr: UInt
+  def sfc: UInt
+  def dfc: UInt
+  def tc: UInt
+  def itt0: UInt
+  def itt1: UInt
+  def dtt0: UInt
+  def dtt1: UInt
+  def urp: UInt
+  def srp: UInt
+  def mmusr: UInt
+  def requestApply(cmd: Flow[DebugSystemApply]): Unit
 }
 
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */

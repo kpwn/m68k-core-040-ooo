@@ -1,6 +1,6 @@
 package m68k040.rename
 
-import m68k040.services.{DecodeUopService, RenameUopService, RenameCommitService}
+import m68k040.services.{CommittedMapService, DecodeUopService, RenameUopService, RenameCommitService}
 import m68k040.rob.CommitSlot
 import spinal.core._
 import spinal.core.sim._
@@ -20,7 +20,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * - flush: rollback all RATs + flush all freelists.
   * - commit: minimal int-RAT commit port (updates committed mapping).
   */
-class RenameStage extends FiberPlugin with RenameUopService with RenameCommitService {
+class RenameStage extends FiberPlugin with RenameUopService with RenameCommitService
+    with CommittedMapService {
 
   val logic = during build new Area {
     val du = host[DecodeUopService]
@@ -470,6 +471,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     *    confirmed silent-corruption regression that rules the rename-allocation approach
     *    out for a serializing-FSM writer. */
   def committedPhysFpcc: UInt = logic.fpccRat.committedPhys(0)
+
+  // CommittedMapService: the only cross-plugin path to committed integer/CCR maps.
+  // Exposing the Vec does not create a second producer; RatTable's commReg remains the
+  // sole storage and all consumers receive read-only signals.
+  override def intPhys: Vec[UInt] = logic.intRat.io.committedPhys
+  override def nzvcPhys: UInt = logic.nzvcRat.committedPhys(0)
+  override def xPhys: UInt = logic.xRat.committedPhys(0)
 
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush

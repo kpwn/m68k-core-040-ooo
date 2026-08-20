@@ -84,6 +84,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.debugResumeRequestIn #= false
     dut.rob.logic.debugStepRequestIn #= false
     dut.rob.logic.debugClearStickyIn #= false
+    dut.rob.logic.debugSystemApplyIn.valid #= false
     dut.rob.logic.haltAfterTargetIn #= 0
     dut.rob.logic.haltAfterEpochIn #= 0
     dut.rob.logic.haltAfterArmedIn #= false

@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService, DebugSystemApply, DebugSystemStateService}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -34,7 +34,7 @@ object DebugHaltReasonCode {
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -446,6 +446,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugStepRequestIn.simPublic()
     val debugClearStickyIn = Bool(); debugClearStickyIn.allowOverride; debugClearStickyIn := False
     debugClearStickyIn.simPublic()
+    // DebugSystemStateService command. The DebugCtrl apply FSM emits one pulse after
+    // all shared-PRF writes have completed. A standalone/no-Stage-3 ROB sees an inert
+    // command, preserving the existing exception/system-state behavior.
+    val debugSystemApplyIn = Flow(DebugSystemApply())
+    debugSystemApplyIn.valid.allowOverride; debugSystemApplyIn.valid := False
+    debugSystemApplyIn.payload.allowOverride; debugSystemApplyIn.payload.assignDontCare()
+    debugSystemApplyIn.simPublic()
     // DebugCommitService-owned halt-after configuration. These are ROB-local wires,
     // not sibling-plugin IO; idle defaults preserve standalone elaboration.
     val haltAfterTargetIn = UInt(64 bits); haltAfterTargetIn.allowOverride
@@ -1799,6 +1806,44 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugHaltHitInstCount := debugHaltHitInstCountReg
     _debugHaltAfterConsumed := (debugHaltState === DebugHaltState.RUNNING) && haltAfterDue
 
+    // ── DebugSystemStateService live readback + halted apply sink ──────────────
+    // The command producer accepts it only at effective halt. Keep that policy
+    // assertion here too, at the architectural owner boundary.
+    val debugSystemSr = (exc.ss.srSys.asBits ## B(0, 3 bits) ## committedCcr.asBits).asUInt
+    val debugSystemTc = (B(0, 16 bits) ## mmuCtrl.mmuEnable.asBits ##
+      mmuCtrl.pageSize8K.asBits ## B(0, 14 bits)).asUInt
+    debugSystemSr.simPublic(); debugSystemTc.simPublic()
+    when(debugSystemApplyIn.valid) {
+      val c = debugSystemApplyIn.payload
+      when(c.srValid) {
+        exc.ss.setSrSys.valid := True
+        exc.ss.setSrSys.payload := c.sr(15 downto 8)
+        committedCcr := c.sr(4 downto 0)
+      }
+      when(c.vbrValid)  { exc.ss.setVbr.valid := True;  exc.ss.setVbr.payload := c.vbr }
+      when(c.uspValid)  { exc.ss.setUsp.valid := True;  exc.ss.setUsp.payload := c.usp }
+      when(c.mspValid)  { exc.ss.setMsp.valid := True;  exc.ss.setMsp.payload := c.msp }
+      when(c.ispValid)  { exc.ss.setIsp.valid := True;  exc.ss.setIsp.payload := c.isp }
+      when(c.cacrValid) { exc.ss.setCacr.valid := True; exc.ss.setCacr.payload := c.cacr }
+      when(c.sfcValid)  { exc.ss.setSfc.valid := True;  exc.ss.setSfc.payload := c.sfc }
+      when(c.dfcValid)  { exc.ss.setDfc.valid := True;  exc.ss.setDfc.payload := c.dfc }
+      when(c.tcValid) {
+        mmuCtrl.setEnable.valid := True; mmuCtrl.setEnable.payload := c.tc(15)
+        mmuCtrl.setPageSize.valid := True; mmuCtrl.setPageSize.payload := c.tc(14)
+      }
+      when(c.itt0Valid) { mmuCtrl.setItt0.valid := True; mmuCtrl.setItt0.payload := c.itt0 }
+      when(c.itt1Valid) { mmuCtrl.setItt1.valid := True; mmuCtrl.setItt1.payload := c.itt1 }
+      when(c.dtt0Valid) { mmuCtrl.setDtt0.valid := True; mmuCtrl.setDtt0.payload := c.dtt0 }
+      when(c.dtt1Valid) { mmuCtrl.setDtt1.valid := True; mmuCtrl.setDtt1.payload := c.dtt1 }
+      when(c.urpValid)  { mmuCtrl.setUrp.valid := True; mmuCtrl.setUrp.payload := c.urp }
+      when(c.srpValid)  { mmuCtrl.setSrp.valid := True; mmuCtrl.setSrp.payload := c.srp }
+      when(c.pcValid)   { debugLivePcReg := c.pc }
+    }
+    GenerationFlags.simulation {
+      assert(!(debugSystemApplyIn.valid && !(debugHalted || coreHalted)),
+        "RobPlugin: debug architectural apply reached commit owner while running", FAILURE)
+    }
+
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see
     // SystemState's class doc). Read COMBINATIONALLY here: any SAME-cycle SR write
@@ -1994,6 +2039,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     logic.haltAfterEpochIn := epoch
     logic.haltAfterArmedIn := armed
     logic.haltAfterInvalidateIn := invalidate
+  }
+
+  override def sr: UInt = logic.debugSystemSr
+  override def vbr: UInt = logic.exc.ss.vbr
+  override def usp: UInt = logic.exc.ss.usp
+  override def msp: UInt = logic.exc.ss.msp
+  override def isp: UInt = logic.exc.ss.isp
+  override def cacr: UInt = logic.exc.ss.cacr
+  override def sfc: UInt = logic.exc.ss.sfc
+  override def dfc: UInt = logic.exc.ss.dfc
+  override def tc: UInt = logic.debugSystemTc
+  override def itt0: UInt = logic.mmuCtrl.itt0
+  override def itt1: UInt = logic.mmuCtrl.itt1
+  override def dtt0: UInt = logic.mmuCtrl.dtt0
+  override def dtt1: UInt = logic.mmuCtrl.dtt1
+  override def urp: UInt = logic.mmuCtrl.urp
+  override def srp: UInt = logic.mmuCtrl.srp
+  override def mmusr: UInt = logic.mmuCtrl.mmusr
+  override def requestApply(cmd: Flow[DebugSystemApply]): Unit = {
+    logic.debugSystemApplyIn.valid := cmd.valid
+    logic.debugSystemApplyIn.payload := cmd.payload
   }
 
   override def btbUpdate = logic.btbUpdateFlow
