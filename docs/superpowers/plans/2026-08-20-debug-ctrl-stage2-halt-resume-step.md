@@ -650,12 +650,14 @@ git commit -m "rob: debug halt state machine RUNNING/STOP_PENDING/RECOVER/HALTED
 
 ---
 
-## Task 6: Wire `DebugCtrlPlugin`'s `OFF_CONTROL` bits 0 (manual halt) into `RobPlugin` via `BackendWiringPlugin`
+## Task 6: Wire `DebugCtrlPlugin`'s `OFF_CONTROL` bit 0 (manual halt) through `DebugCommitService`
 
 **Files:**
 - Modify: `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`
-- Modify: `src/main/scala/m68k040/top/FullCoreSynth.scala` (the `BackendWiringPlugin` class)
-- Test: `src/test/scala/m68k040/debug/DebugCtrlPluginSpec.scala`, a new full-core-level directed test (find where `M68kFullCoreSynth`-shaped tests wire the whole plugin set together, e.g. a lock-step-adjacent harness, and add ONE directed "halt via dbg_axi actually stops the CPU" test there — the exact file to extend depends on what full-core-with-debug-ctrl test infrastructure exists after Task 1; locate it before writing this step, do not create a parallel one if one already exists)
+- Modify: `src/main/scala/m68k040/rob/RobPlugin.scala` (empty-ROB stop boundary/live-PC correctness)
+- Modify: `src/test/scala/m68k040/debug/DebugCtrlDut.scala`
+- Modify: `src/test/scala/m68k040/debug/DebugCtrlCsrSpec.scala`
+- Test: `src/test/scala/m68k040/debug/DebugCtrlRobIntegrationSpec.scala`
 
 **Interfaces:**
 - Consumes: Task 5's `DebugCommitService`, including `effectiveHalt` readback and
@@ -671,41 +673,37 @@ In the `controlWord`/write-decode logic (inside the Task-1 `if (enable)` block),
 manualHaltLevel ##  // bit 0  manual halt request (Stage 2: real)
 ```
 
-Add the register and its own edge-detected request/resume outputs (a level readback per spec §6.4 "Manual halt is a level in OFF_CONTROL for readback compatibility, but the commit owner receives registered COMMANDS" — so `manualHaltLevel` is the readback level, but the OUTPUT to RobPlugin is a ONE-CYCLE PULSE on each 0->1 and 1->0 transition, matching how `coldPulse` is already a pulse derived from a CONTROL write in this same file):
+Add the level register and registered request/resume commands. Commands are decoded from
+every accepted byte-0 write, not from level edges: writing zero must issue resume even when
+the readback level was already zero, because it also resumes an automatic halt.
 
 ```scala
-val manualHaltLevel = RegInit(False); manualHaltLevel.simPublic()
-// (in the write decode, alongside ctrlInitDoneOvr/ctrlColdHold/coldPulse)
-manualHaltLevel := m(0)
-val manualHaltLevelPrev = RegNext(manualHaltLevel) init False
-val debugStopRequest   = manualHaltLevel && !manualHaltLevelPrev
-val debugResumeRequest = !manualHaltLevel && manualHaltLevelPrev
-debugStopRequest.simPublic(); debugResumeRequest.simPublic()
-```
-
-Expose these as new socket-INTERNAL (not `dbg_axi`-facing — no new socket port, per this plan's Global Constraints) outputs the same way `coldResetPulse`/`coldResetHold` are exposed, but WITHOUT `.setName(...)` (those two are real `cpu_socket.vh` ports; these are new, purely-internal cross-plugin wires with no socket contract):
-
-```scala
-val debugStopRequestOut   = out(Bool()); debugStopRequestOut := debugStopRequest
-val debugResumeRequestOut = out(Bool()); debugResumeRequestOut := debugResumeRequest
-```
-
-- [ ] **Step 2: `BackendWiringPlugin` — the actual connection**
-
-Find `BackendWiringPlugin`'s constructor/`during build` in `FullCoreSynth.scala` (the explore pass located `doFlush`'s own resolution at line 59, `host[RedirectService].doFlush`) and add, guarded on the plugin actually existing (this wiring plugin ALREADY sits after `DebugCtrlPlugin` in the plugin list — no, wait, `DebugCtrlPlugin` is instantiated AFTER `BackendWiringPlugin` at line 574 vs 580; check whether `BackendWiringPlugin`'s `during build` runs late enough in the Fiber schedule to safely resolve `host[DebugCtrlPlugin]` regardless of list order — SpinalHDL FiberPlugin ordering is by `during setup`/`during build` dependency, not list position, but confirm this before assuming; if there's a genuine ordering hazard, this wiring may need to move OUT of `BackendWiringPlugin` into a new, small, LATER-only wiring plugin instantiated after `DebugCtrlPlugin` in the list — decide based on what you find, do not guess):
-
-```scala
-// Debug halt/resume request, Stage 2. host.get (not host[...]) because
-// DebugCtrlPlugin may be absent from a leaner build variant in the future
-// (today it is always instantiated, but enable=false already means "no debug
-// logic" -- mirror that same optionality here rather than hard-requiring it).
-host.get[m68k040.debug.DebugCtrlPlugin] match {
-  case Some(dbg) =>
-    host[DebugCommitService].request(
-      stop   = dbg.logic.debugStopRequestOut,
-      resume = dbg.logic.debugResumeRequestOut)
-  case None => // rob's own defaults (False/False) already apply
+val manualHaltLevel   = RegInit(False)
+val debugStopRequest  = RegInit(False)
+val debugResumeRequest = RegInit(False)
+debugStopRequest := False
+debugResumeRequest := False
+when(controlWriteAccepted && byteStrobe(0)) {
+  manualHaltLevel := controlWriteData(0)
+  debugStopRequest := controlWriteData(0)
+  debugResumeRequest := !controlWriteData(0)
 }
+```
+
+Pass the commands through the service boundary from inside `DebugCtrlPlugin`; do not add
+cross-plugin IO and do not reach into `RobPlugin` internals:
+
+```scala
+dbgCommit.foreach(_.request(debugStopRequest, debugResumeRequest))
+```
+
+- [ ] **Step 2: resolve the optional service in `DebugCtrlPlugin`**
+
+Resolve `DebugCommitService` only when debug is enabled and Stage 2 is selected. An absent
+service preserves the Stage-1 RAZ/WI behavior and permits the standalone CSR DUT:
+
+```scala
+val dbgCommit = if (enable && stage >= 2) host.get[DebugCommitService] else None
 ```
 
 - [ ] **Step 3: `OFF_STATUS` bits 0/4 become real**

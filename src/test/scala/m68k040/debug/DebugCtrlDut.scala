@@ -1,5 +1,6 @@
 package m68k040.debug
 
+import m68k040.services.DebugCommitService
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.database.Database
@@ -15,14 +16,66 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 class DebugCtrlDut(buildIdArg:   BigInt  = BigInt(0x12345678L),
                    porCyclesArg: Int     = 4,
                    stageArg:     Int     = 1,
-                   enableArg:    Boolean = true) extends Component {
+                   enableArg:    Boolean = true,
+                   withCommitStubArg: Boolean = false) extends Component {
   val db   = new Database
   val host = db on (new PluginHost)
+  val commitStub: DebugCommitStubPlugin =
+    if (withCommitStubArg) new DebugCommitStubPlugin else null
   val dbg  = new DebugCtrlPlugin(buildId = buildIdArg, porCycles = porCyclesArg, stage = stageArg,
                                  enable = enableArg)
-  db.on { host.asHostOf(Seq[FiberPlugin](dbg)) }
+  val plugins: Seq[FiberPlugin] =
+    if (withCommitStubArg) Seq(commitStub, dbg) else Seq(dbg)
+  db.on { host.asHostOf(plugins) }
 
   def axi: DbgAxiLite = dbg.logic.dbgAxi
+}
+
+/** Minimal test provider for DebugCtrlPlugin's real service boundary. Readback values
+  * are pokeable registers; command outputs expose exactly what `request` receives. */
+class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
+  private var effectiveHaltWire: Bool = null
+  private var autoHaltWire: Bool = null
+  private var stopWire: Bool = null
+  private var resumeWire: Bool = null
+
+  override def effectiveHalt: Bool = effectiveHaltWire
+  override def autoHaltLatched: Bool = autoHaltWire
+  override def haltReasonDebug: UInt = U(0, 3 bits)
+  override def livePc: UInt = logic.livePcDrive
+  override def lastPc: UInt = logic.lastPcDrive
+  override def macroCount: UInt = U(0, 64 bits)
+  override def haltHitInstCount: UInt = U(0, 64 bits)
+
+  during setup {
+    effectiveHaltWire = Bool()
+    autoHaltWire = Bool()
+    stopWire = Bool(); stopWire.allowOverride; stopWire := False
+    resumeWire = Bool(); resumeWire.allowOverride; resumeWire := False
+  }
+
+  val logic = during build new Area {
+    val effectiveHaltDrive = RegInit(False); effectiveHaltDrive.simPublic()
+    val autoHaltDrive = RegInit(False); autoHaltDrive.simPublic()
+    val livePcDrive = Reg(UInt(32 bits)) init 0; livePcDrive.simPublic()
+    val lastPcDrive = Reg(UInt(32 bits)) init 0; lastPcDrive.simPublic()
+    effectiveHaltDrive := effectiveHaltDrive
+    autoHaltDrive := autoHaltDrive
+    livePcDrive := livePcDrive
+    lastPcDrive := lastPcDrive
+    effectiveHaltWire := effectiveHaltDrive
+    autoHaltWire := autoHaltDrive
+
+    val stopRequest = out(Bool())
+    val resumeRequest = out(Bool())
+    stopRequest := stopWire
+    resumeRequest := resumeWire
+  }
+
+  override def request(stop: Bool, resume: Bool): Unit = {
+    stopWire := stop
+    resumeWire := resume
+  }
 }
 
 /** Minimal AXI4-Lite master stimulus for `DbgAxiLite`. Every method leaves the bus idle

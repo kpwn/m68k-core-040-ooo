@@ -203,6 +203,78 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
     }
   }
 
+  test("Stage 2 CONTROL bit 0 sends registered stop/resume commands through DebugCommitService") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.clockDomain.waitSampling(20)
+
+      var stopPulses = 0
+      var resumePulses = 0
+      val watcher = fork {
+        while (true) {
+          dut.clockDomain.waitSampling()
+          if (dut.commitStub.logic.stopRequest.toBoolean) stopPulses += 1
+          if (dut.commitStub.logic.resumeRequest.toBoolean) resumePulses += 1
+        }
+      }
+
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong, CTRL_HALT)
+      dut.clockDomain.waitSampling(3)
+      val haltedControl = DbgAxiDriver.read(
+        dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong)
+      assert((haltedControl & CTRL_HALT) != 0,
+        f"Stage-2 CONTROL readback 0x$haltedControl%08X lost the manual halt level")
+      assert(stopPulses == 1 && resumePulses == 0,
+        s"halt write produced stop=$stopPulses resume=$resumePulses pulses")
+
+      // A clear write is a command, not merely a falling-edge detector. Repeating it
+      // must still request resume so an automatic halt can be released while the stored
+      // manual level was already zero (spec section 6.4).
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong, 0)
+      dut.clockDomain.waitSampling(3)
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong, 0)
+      dut.clockDomain.waitSampling(3)
+      assert(stopPulses == 1 && resumePulses == 2,
+        s"two explicit clear writes produced stop=$stopPulses resume=$resumePulses pulses")
+
+      // Byte 0 carries CONTROL bit 0. A write that does not strobe it changes neither
+      // the readback level nor the command stream.
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_CONTROL.toLong,
+        CTRL_HALT, strb = 0xE)
+      dut.clockDomain.waitSampling(3)
+      assert(stopPulses == 1 && resumePulses == 2,
+        "an unstrobed CONTROL byte 0 emitted a halt/resume command")
+      watcher.terminate()
+    }
+  }
+
+  test("Stage 2 STATUS and PC readback are owned by DebugCommitService") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.clockDomain.waitSampling(20)
+
+      dut.commitStub.logic.livePcDrive #= 0x40801234L
+      dut.commitStub.logic.lastPcDrive #= 0x4080122CL
+      dut.commitStub.logic.effectiveHaltDrive #= true
+      dut.commitStub.logic.autoHaltDrive #= true
+      dut.clockDomain.waitSampling(2)
+
+      val status = DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_STATUS.toLong)
+      assert((status & STAT_HALTED) != 0 && (status & STAT_RUNNING) == 0,
+        f"STATUS 0x$status%08X does not report the service's effective halt")
+      assert((status & STAT_AUTO_HALT) != 0,
+        f"STATUS 0x$status%08X lost the service's automatic-halt latch")
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_PC.toLong) == 0x40801234L)
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_LAST_PC.toLong) == 0x4080122CL)
+    }
+  }
+
   test("STATUS halted and running are mutually exclusive") {
     M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
       dut.clockDomain.forkStimulus(10)

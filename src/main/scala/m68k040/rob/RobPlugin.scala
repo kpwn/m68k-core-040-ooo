@@ -869,8 +869,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val debugStopActive = debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)
     val debugSequencerBoundaryHit = Bool() // driven below from the completed redirect
     val debugNormalBoundaryHit = retire0 && h0IsMacroLast
+    // With no ROB work and no exception/system sequencer active, the core is already at
+    // a clean macro boundary. Without this arm a manual request sampled between fetch
+    // bursts entered STOP_PENDING forever waiting for a retirement that quiescing had
+    // deliberately prevented from ever arriving.
+    val debugIdleBoundaryHit = (count === 0) && excIdle && !flushing
     val debugStopBoundaryHit = debugStopActive &&
-      (debugNormalBoundaryHit || debugSequencerBoundaryHit)
+      (debugNormalBoundaryHit || debugSequencerBoundaryHit || debugIdleBoundaryHit)
     debugStopBoundaryHit.simPublic()
     val debugRecoverEnter = debugStopBoundaryHit
     debugRecoverEnter.simPublic()
@@ -1013,6 +1018,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     commitPc0.simPublic(); commitPc1.simPublic()
     when(retire0) { driveCommit(0, p0, commitPc0) }
     when(retire1) { driveCommit(1, p1, commitPc1) }
+    // Keep a meaningful restart point even when the ROB drains completely before a
+    // later debug request arrives. Slot 1 is younger and therefore wins when it closes
+    // a second macro in the same cycle.
+    when(retire0 && p0.last) { debugLivePcReg := commitPc0 }
+    when(retire1 && p1.last) { debugLivePcReg := commitPc1 }
     // (A commit-time SYSTEM op READ commits its dst arch->pdst mapping at the trigger —
     // driven AFTER the exc unit is built, see `sysReadCommit` below, since the S=1
     // decision needs exc.ss.s.)
@@ -1739,7 +1749,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // prevents STOP_PENDING from parking halfway through architectural state update.
     debugSequencerBoundaryHit := exc.redirectValid
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
-                         Mux(branchRedirect, nextPcRd0, p0.predNextPc))
+                         Mux(branchRedirect, nextPcRd0,
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))
     doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
