@@ -1,6 +1,8 @@
 package m68k040.debug
 
-import m68k040.services.DebugCommitService
+import m68k040.services.{DebugCommitService, DebugSystemStateService}
+import m68k040.services.CommittedMapService
+import m68k040.execute.regfile.{IntRegFileService, RegFileReadPort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.slave
@@ -61,6 +63,19 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
   require(buildId >= 0 && buildId < (BigInt(1) << DebugRegMap.DBG_DW),
     s"DebugCtrlPlugin: buildId must fit ${DebugRegMap.DBG_DW} bits (got $buildId)")
 
+  // Stage 3 uses exactly one shared integer-PRF read port. It is allocated during
+  // setup, as required by RegfileService, and addressed from the captured AXI read
+  // offset through the committed-map service. Optional lookup preserves the small
+  // standalone CSR fixtures; the shipped Stage-3 full core provides both services.
+  private var debugIntRead: RegFileReadPort = null
+  during setup {
+    if (enable && stage >= 3) {
+      host.get[IntRegFileService].foreach { rf =>
+        debugIntRead = rf.newRead(forceNoBypass = true)
+      }
+    }
+  }
+
   val logic = during build new Area {
     // ── Socket surface (cpu_socket.vh section 4) ────────────────────────────────────
     // setName forces the socket's exact Verilog names so macqd700-soc binds them with no
@@ -118,6 +133,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     // compiled only when both the plugin and tranche are enabled; the shipped top stays
     // at Stage 1 until the complete Stage-2 register set is truthful (Task 12).
     val dbgCommit = if (enable && stage >= 2) host.get[DebugCommitService] else None
+    val dbgSystem = if (enable && stage >= 3) host.get[DebugSystemStateService] else None
+    val committedMap = if (enable && stage >= 3) host.get[CommittedMapService] else None
 
     // A NAMED (not anonymous) local class, so its type stays visible OUTSIDE the
     // `enable` gate below: Stage-1 whitebox tests (`DebugCtrlCsrSpec`, `DebugCtrlResetSpec`,
@@ -296,6 +313,24 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         if (stage >= 2) dbgCommit.map(_.autoHaltLatched).getOrElse(False) else False
       def livePc: UInt =
         if (stage >= 2) dbgCommit.map(_.livePc).getOrElse(U(0, 32 bits)) else U(0, 32 bits)
+
+      val liveIntArch = UInt(4 bits)
+      liveIntArch := 0
+      when(arAddr >= DebugRegMap.OFF_LIVE_DREG0 && arAddr <= DebugRegMap.OFF_LIVE_DREG7) {
+        liveIntArch := ((arAddr - DebugRegMap.OFF_LIVE_DREG0) >> 2).resized
+      }
+      when(arAddr >= DebugRegMap.OFF_LIVE_AREG0 && arAddr <= DebugRegMap.OFF_LIVE_AREG7) {
+        liveIntArch := (((arAddr - DebugRegMap.OFF_LIVE_AREG0) >> 2) + 8).resized
+      }
+      when(arAddr === DebugRegMap.OFF_LIVE_A7) { liveIntArch := 15 }
+      if (debugIntRead != null) {
+        debugIntRead.addr := committedMap.map { map =>
+          map.intPhys(liveIntArch.resize(log2Up(map.intPhys.length))).resized
+        }
+          .getOrElse(U(0, debugIntRead.addr.getWidth bits))
+      }
+      def liveIntWord: Bits =
+        if (debugIntRead != null) debugIntRead.data else B(0, 32 bits)
       def lastPc: UInt =
         if (stage >= 2) dbgCommit.map(_.lastPc).getOrElse(U(0, 32 bits)) else U(0, 32 bits)
       def macroCount: UInt =
@@ -397,6 +432,28 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_DBG_RESET_CTL) {
             // Deployed layout (debug_ctrl.v:1411): {cpu_reset_count_r, 16'd0}.
             rData := cpuResetCount.asBits ## B(0, 16 bits)
+          }
+          is(DebugRegMap.OFF_LIVE_VBR)   { rData := dbgSystem.map(_.vbr.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_SR)    { rData := dbgSystem.map(s => s.sr.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_A7)    { rData := liveIntWord }
+          is(DebugRegMap.OFF_LIVE_USP)   { rData := dbgSystem.map(_.usp.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_TC)   { rData := dbgSystem.map(_.tc.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_DTT0) { rData := dbgSystem.map(_.dtt0.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_DTT1) { rData := dbgSystem.map(_.dtt1.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_ITT0) { rData := dbgSystem.map(_.itt0.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_ITT1) { rData := dbgSystem.map(_.itt1.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_SRP)  { rData := dbgSystem.map(_.srp.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_MMU_URP)  { rData := dbgSystem.map(_.urp.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_SSP)   { rData := dbgSystem.map(_.msp.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_ISP)   { rData := dbgSystem.map(_.isp.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_CACR)  { rData := dbgSystem.map(_.cacr.asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_SFC)   { rData := dbgSystem.map(s => s.sfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_DFC)   { rData := dbgSystem.map(s => s.dfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+          is(DebugRegMap.OFF_LIVE_PC)    { rData := livePc.asBits }
+          is(DebugRegMap.OFF_LIVE_MMUSR) { rData := dbgSystem.map(_.mmusr.asBits).getOrElse(B(0, 32 bits)) }
+          for (i <- 0 until 8) {
+            is(DebugRegMap.OFF_LIVE_DREG0 + i * 4) { rData := liveIntWord }
+            is(DebugRegMap.OFF_LIVE_AREG0 + i * 4) { rData := liveIntWord }
           }
           for (i <- 0 until 8) {
             is(DebugRegMap.OFF_ARCH_D0 + i * 4) { rData := archWord(i) }
