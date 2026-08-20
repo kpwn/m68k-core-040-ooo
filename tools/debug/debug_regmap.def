@@ -53,7 +53,7 @@ REG OFF_RESET_CAUSE       0x0002C RO    9 0x00000000 Legacy reset cause; reserve
 REG OFF_HALT_AFTER_LO     0x00030 RW    2 0x00000000 Absolute macro-count halt-after target, low word.
 REG OFF_HALT_AFTER_HI     0x00034 RW    2 0x00000000 Absolute macro-count halt-after target, high word.
 REG OFF_BREAK_PC0         0x00038 RW    5 0x00000000 PC breakpoint slot 0.
-REG OFF_HALT_CTL          0x0003C MIXED 2 0x00000000 Halt control; bit 2 clears sticky reason/report latches.
+REG OFF_HALT_CTL          0x0003C MIXED 2 0x00000000 Halt control; bit 0 arms halt-after and reads armed state, bit 2 clears sticky reason/report latches.
 REG OFF_HALT_REASON       0x00040 RO    2 0x00000000 Sticky halt reason bits.
 REG OFF_HALT_HIT_PC       0x00044 RO    5 0x00000000 PC of the macro that caused the stop.
 REG OFF_HALT_HIT_INST_LO  0x00048 RO    2 0x00000000 Macro count at the stop, low word.

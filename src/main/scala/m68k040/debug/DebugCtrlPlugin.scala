@@ -256,6 +256,22 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         debugResumeRequest := False
       }
 
+      // Halt-after configuration is debug-owned and therefore survives CPU reset.
+      // A target write disarms and advances the epoch; OFF_HALT_CTL bit 0 explicitly
+      // arms the complete 64-bit value. The ROB consumes an automatic hit once.
+      val haltAfterTarget = if (stage >= 2) Reg(UInt(64 bits)) init 0 else U(0, 64 bits)
+      val haltAfterEpoch = if (stage >= 2) Reg(UInt(8 bits)) init 0 else U(0, 8 bits)
+      val haltAfterArmed = if (stage >= 2) RegInit(False) else False
+      if (stage >= 2) {
+        haltAfterTarget.simPublic(); haltAfterEpoch.simPublic(); haltAfterArmed.simPublic()
+      }
+      val haltAfterInvalidate = if (stage >= 2) {
+        doWrite && wStrb.orR &&
+          ((awAddr === DebugRegMap.OFF_HALT_AFTER_LO) ||
+           (awAddr === DebugRegMap.OFF_HALT_AFTER_HI))
+      } else False
+      if (stage >= 2) haltAfterInvalidate.simPublic()
+
       def effectiveHalt: Bool =
         if (stage >= 2) dbgCommit.map(_.effectiveHalt).getOrElse(False) else False
       def automaticHalt: Bool =
@@ -264,6 +280,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         if (stage >= 2) dbgCommit.map(_.livePc).getOrElse(U(0, 32 bits)) else U(0, 32 bits)
       def lastPc: UInt =
         if (stage >= 2) dbgCommit.map(_.lastPc).getOrElse(U(0, 32 bits)) else U(0, 32 bits)
+      def macroCount: UInt =
+        if (stage >= 2) dbgCommit.map(_.macroCount).getOrElse(U(0, 64 bits)) else U(0, 64 bits)
+      def haltHitInstCount: UInt =
+        if (stage >= 2) dbgCommit.map(_.haltHitInstCount).getOrElse(U(0, 64 bits))
+        else U(0, 64 bits)
+      def haltAfterConsumed: Bool =
+        if (stage >= 2) dbgCommit.map(_.haltAfterConsumed).getOrElse(False) else False
 
       /** The CONTROL word exactly as the host reads it back. Defined ONCE and used by
         * both the read mux and the write-side byte-strobe merge, so the two can never
@@ -326,6 +349,19 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           }
           is(DebugRegMap.OFF_PC)      { rData := livePc.asBits }
           is(DebugRegMap.OFF_LAST_PC) { rData := lastPc.asBits }
+          is(DebugRegMap.OFF_HALT_AFTER_LO) { rData := haltAfterTarget(31 downto 0).asBits }
+          is(DebugRegMap.OFF_HALT_AFTER_HI) { rData := haltAfterTarget(63 downto 32).asBits }
+          is(DebugRegMap.OFF_HALT_CTL) {
+            rData := B(0, 31 bits) ## haltAfterArmed
+          }
+          is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
+          is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
+          is(DebugRegMap.OFF_HALT_HIT_INST_LO) {
+            rData := haltHitInstCount(31 downto 0).asBits
+          }
+          is(DebugRegMap.OFF_HALT_HIT_INST_HI) {
+            rData := haltHitInstCount(63 downto 32).asBits
+          }
           is(DebugRegMap.OFF_STATUS) {
             rData := B(0, 27 bits) ##
                      automaticHalt ##    // bit 4  auto-halt latched
@@ -366,6 +402,28 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               }
             }
           }
+          is(DebugRegMap.OFF_HALT_AFTER_LO) {
+            if (stage >= 2) when(wStrb.orR) {
+              haltAfterTarget(31 downto 0) :=
+                merged(haltAfterTarget(31 downto 0).asBits).asUInt
+              haltAfterEpoch := haltAfterEpoch + 1
+              haltAfterArmed := False
+            }
+          }
+          is(DebugRegMap.OFF_HALT_AFTER_HI) {
+            if (stage >= 2) when(wStrb.orR) {
+              haltAfterTarget(63 downto 32) :=
+                merged(haltAfterTarget(63 downto 32).asBits).asUInt
+              haltAfterEpoch := haltAfterEpoch + 1
+              haltAfterArmed := False
+            }
+          }
+          is(DebugRegMap.OFF_HALT_CTL) {
+            if (stage >= 2) when(wStrb(0) && wData(0)) {
+              haltAfterArmed := True
+            }
+            // Bit 2 clear-sticky is implemented by Stage 2 Task 9.
+          }
           is(DebugRegMap.OFF_RAM_WINDOW_LG2) {
             val req = merged(ramWindowWord)(5 downto 0).asUInt
             ramWindow := Mux(req < U(DebugRegMap.RAM_WINDOW_LG2_MIN, 6 bits),
@@ -387,6 +445,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           }
         }
       }
+
+      // An automatic stop is one-shot. Clear the arm after the ROB acknowledges the
+      // hit; resume cannot immediately retrigger against the same absolute target.
+      if (stage >= 2) when(haltAfterConsumed) { haltAfterArmed := False }
 
       // ── SoC-fabric configuration wipe (spec 15.3) ────────────────────────────────
       // Applied after the write decode on purpose: in SpinalHDL a later `when` wins, which
@@ -499,7 +561,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     // The service is the entire cross-plugin seam. In particular, do not expose
     // sibling wires from this plugin or reach into RobPlugin.logic from a wiring area.
     if (enable && stage >= 2) {
-      dbgCommit.foreach(_.request(csr.debugStopRequest, csr.debugResumeRequest))
+      // The CPU domain can leave reset before this reset-less debug POR generator has
+      // completed. Never let a transient/reset value acquire halt ownership; this is
+      // the command-side counterpart of AXI READY being held low while dbgRst is active.
+      dbgCommit.foreach(_.request(csr.debugStopRequest && !dbgRst,
+        csr.debugResumeRequest && !dbgRst))
+      dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
+        csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
     }
 
     if (!enable) {

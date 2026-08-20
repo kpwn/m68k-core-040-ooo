@@ -408,4 +408,79 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
         "byte 0 not strobed must leave the CONTROL bits untouched")
     }
   }
+
+  test("Stage 2 halt-after target is byte-strobed, epoch-tagged, explicitly armed, and one-shot") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      cd.waitSampling(20)
+
+      var invalidations = 0
+      val watcher = fork {
+        while (true) {
+          if (dut.commitStub.logic.haltAfterInvalidate.toBoolean) invalidations += 1
+          cd.waitSampling()
+        }
+      }
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_LO.toLong, 0x11223344L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_HI.toLong, 0x55667788L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_LO.toLong) == 0x11223344L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_HI.toLong) == 0x55667788L)
+      assert(dut.commitStub.logic.haltAfterEpoch.toInt == 2,
+        "each accepted target-word write must advance the stale-result epoch")
+      assert(!dut.commitStub.logic.haltAfterArmed.toBoolean,
+        "programming either target half must leave halt-after disarmed")
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong, 1)
+      assert((DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong) & 1L) != 0)
+      assert(dut.commitStub.logic.haltAfterArmed.toBoolean)
+      assert(dut.commitStub.logic.haltAfterTarget.toBigInt == BigInt("5566778811223344", 16))
+
+      // Byte lanes 0 and 2 only: 0x11223344 -> 0x11BB33DD. Reprogramming consumes
+      // the arm and advances the epoch; a zero-strobe write does neither.
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_LO.toLong,
+        0xAABBCCDDL, strb = 0x5)
+      assert(DbgAxiDriver.read(dut.axi, cd,
+        DebugRegMap.OFF_HALT_AFTER_LO.toLong) == 0x11BB33DDL)
+      assert(dut.commitStub.logic.haltAfterEpoch.toInt == 3)
+      assert(!dut.commitStub.logic.haltAfterArmed.toBoolean)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_AFTER_LO.toLong,
+        0xFFFFFFFFL, strb = 0)
+      assert(dut.commitStub.logic.haltAfterEpoch.toInt == 3)
+      assert(DbgAxiDriver.read(dut.axi, cd,
+        DebugRegMap.OFF_HALT_AFTER_LO.toLong) == 0x11BB33DDL)
+
+      // The ROB's automatic-halt acknowledgement consumes the arm. This prevents a
+      // continue from immediately retriggering against the same absolute target.
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong, 1)
+      dut.commitStub.logic.haltAfterConsumedDrive #= true
+      cd.waitSampling()
+      dut.commitStub.logic.haltAfterConsumedDrive #= false
+      cd.waitSampling()
+      assert(!dut.commitStub.logic.haltAfterArmed.toBoolean)
+      assert(invalidations == 3,
+        s"expected one invalidate pulse per non-empty target write, got $invalidations")
+      watcher.terminate()
+    }
+  }
+
+  test("Stage 2 OFF_INST_LO/HI expose the ROB-owned completed-macro count") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      cd.waitSampling(20)
+      dut.commitStub.logic.macroCountDrive #= BigInt("FEDCBA9876543210", 16)
+      dut.commitStub.logic.haltHitInstCountDrive #= BigInt("0123456789ABCDEF", 16)
+      cd.waitSampling(2)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_INST_LO.toLong) == 0x76543210L)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_INST_HI.toLong) == 0xFEDCBA98L)
+      assert(DbgAxiDriver.read(dut.axi, cd,
+        DebugRegMap.OFF_HALT_HIT_INST_LO.toLong) == 0x89ABCDEFL)
+      assert(DbgAxiDriver.read(dut.axi, cd,
+        DebugRegMap.OFF_HALT_HIT_INST_HI.toLong) == 0x01234567L)
+    }
+  }
 }

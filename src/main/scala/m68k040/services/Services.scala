@@ -63,7 +63,11 @@ trait DebugCommitService {
   def lastPc:           UInt
   def macroCount:       UInt
   def haltHitInstCount: UInt
+  def haltAfterConsumed: Bool
   def request(stop: Bool, resume: Bool): Unit
+  /** Surviving debug-domain halt-after configuration. `invalidate` is the accepted
+    * target-write pulse; it cancels a stale pipelined comparison on that same edge. */
+  def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool, invalidate: Bool): Unit
 }
 
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */

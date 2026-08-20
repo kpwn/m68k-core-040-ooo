@@ -63,6 +63,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   private var _debugLastPc:           UInt = null
   private var _debugMacroCount:       UInt = null
   private var _debugHaltHitInstCount: UInt = null
+  private var _debugHaltAfterConsumed: Bool = null
   override def effectiveHalt:    Bool = _debugEffectiveHalt
   override def autoHaltLatched:  Bool = _debugAutoHaltLatched
   override def haltReasonDebug:  UInt = _debugHaltReason
@@ -70,6 +71,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def lastPc:           UInt = _debugLastPc
   override def macroCount:       UInt = _debugMacroCount
   override def haltHitInstCount: UInt = _debugHaltHitInstCount
+  override def haltAfterConsumed: Bool = _debugHaltAfterConsumed
   during setup {
     _supervisor             = Bool()
     _dcacheEnabled          = Bool()
@@ -82,6 +84,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugLastPc            = UInt(32 bits)
     _debugMacroCount        = UInt(64 bits)
     _debugHaltHitInstCount  = UInt(64 bits)
+    _debugHaltAfterConsumed = Bool()
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -429,6 +432,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugStopRequestIn.simPublic()
     val debugResumeRequestIn = Bool(); debugResumeRequestIn.allowOverride; debugResumeRequestIn := False
     debugResumeRequestIn.simPublic()
+    // DebugCommitService-owned halt-after configuration. These are ROB-local wires,
+    // not sibling-plugin IO; idle defaults preserve standalone elaboration.
+    val haltAfterTargetIn = UInt(64 bits); haltAfterTargetIn.allowOverride
+    haltAfterTargetIn := U(0, 64 bits); haltAfterTargetIn.simPublic()
+    val haltAfterEpochIn = UInt(8 bits); haltAfterEpochIn.allowOverride
+    haltAfterEpochIn := U(0, 8 bits); haltAfterEpochIn.simPublic()
+    val haltAfterArmedIn = Bool(); haltAfterArmedIn.allowOverride
+    haltAfterArmedIn := False; haltAfterArmedIn.simPublic()
+    val haltAfterInvalidateIn = Bool(); haltAfterInvalidateIn.allowOverride
+    haltAfterInvalidateIn := False; haltAfterInvalidateIn.simPublic()
     // D28 (axi-socket adapter spec section 6.4): the halt seam carries a KIND alongside the
     // Bool. "Halts" is only half a diagnostic; an operator staring at a wedged core has to
     // know why. Deliberately an OBSERVATION, not a control path -- `coreHalted`'s three
@@ -669,8 +682,30 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val debugQuiesceActive = debugHaltState =/= DebugHaltState.RUNNING
     // Exact next-state truth for FetchAlign's localized quiesce register: begin
     // quiescing on the stop-sampling edge and release on the resume edge.
+    // Declared before retire so the pipelined halt-after result can gate the following
+    // macro without putting its 64-bit compare on the commit hot path.
+    val debugMacroCountReg = Reg(UInt(64 bits)) init 0
+    debugMacroCountReg.simPublic()
+    val haltAfterCmpCountReg = RegNext(debugMacroCountReg) init 0
+    val haltAfterCmpEpochReg = RegNext(haltAfterEpochIn) init 0
+    val haltAfterCmpArmedReg = RegNext(haltAfterArmedIn && !haltAfterInvalidateIn) init False
+    val haltAfterCmpHitReg = RegNext(debugMacroCountReg >= haltAfterTargetIn) init False
+    haltAfterCmpCountReg.simPublic(); haltAfterCmpEpochReg.simPublic()
+    haltAfterCmpArmedReg.simPublic(); haltAfterCmpHitReg.simPublic()
+    val haltAfterComparePending = RegInit(False); haltAfterComparePending.simPublic()
+    val haltAfterArmedPrev = RegNext(haltAfterArmedIn) init False
+    val haltAfterArmRise = haltAfterArmedIn && !haltAfterArmedPrev
+    val haltAfterDue = haltAfterArmedIn && haltAfterCmpArmedReg &&
+      !haltAfterComparePending && !haltAfterInvalidateIn &&
+      (haltAfterCmpEpochReg === haltAfterEpochIn) && haltAfterCmpHitReg
+    haltAfterDue.simPublic()
+    // On arm and after every completed macro, hold the next macro for the single cycle
+    // needed to sample the new count and register the wide comparison result.
+    val haltAfterRetireBlock = haltAfterArmedIn &&
+      (!haltAfterCmpArmedReg || haltAfterComparePending)
+
     val debugQuiesceNext = Mux(debugHaltState === DebugHaltState.RUNNING,
-      debugStopRequestIn,
+      debugStopRequestIn || haltAfterDue,
       Mux(debugHaltState === DebugHaltState.HALTED, !debugResumeRequestIn, True))
     val debugLivePcReg = Reg(UInt(32 bits)) init 0
     debugLivePcReg.simPublic()
@@ -807,7 +842,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val sysAuxRdy1 = (p1.sysKind =/= sysAuxCapKind) || sysValRdyStore(h1)
     val retire0 = headReady && !faultedStore(h0) && !p0.isRte && !p0.sysOp &&
                   !interruptPending && !privViolation && !stopped && !tracePendingFire &&
-                  sysAuxRdy0
+                  sysAuxRdy0 && !haltAfterDue && !haltAfterRetireBlock
     // Root-cause fix (post-Task-P2.5 lock-step investigation): completion port 4
     // (the SQ precise-path at-head drain) fires ASYNCHRONOUSLY, many cycles after
     // its store's issue -- unlike every other completion source, which settles
@@ -859,14 +894,20 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
+                  !(haltAfterArmedIn && h0IsMacroLast) &&
                   !((debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)) &&
                     h0IsMacroLast)
+    val debugMacroCountInc =
+      (retire0 && p0.last).asUInt.resize(2) +
+      (retire1 && p1.last).asUInt.resize(2)
 
     // Ordinary manual/halt-after stops are post-commit. The macro at the head when
     // the request is sampled completes in full; the slot-1 guard above prevents the
     // same retire cycle from crossing into its successor. HALTED is not observable
     // until the following RECOVER cycle has driven the registered flush.
-    val debugStopActive = debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)
+    val debugAutoHaltLatchedReg = RegInit(False); debugAutoHaltLatchedReg.simPublic()
+    val debugStopActive = debugStopRequestIn || haltAfterDue ||
+      (debugHaltState === DebugHaltState.STOP_PENDING)
     val debugSequencerBoundaryHit = Bool() // driven below from the completed redirect
     val debugNormalBoundaryHit = retire0 && h0IsMacroLast
     // With no ROB work and no exception/system sequencer active, the core is already at
@@ -874,14 +915,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // bursts entered STOP_PENDING forever waiting for a retirement that quiescing had
     // deliberately prevented from ever arriving.
     val debugIdleBoundaryHit = (count === 0) && excIdle && !flushing
+    // A valid halt-after result describes the boundary AFTER an already-completed
+    // target macro. retire0 is held above, so any current h0 is its untouched successor.
+    val debugAutomaticBoundaryHit = haltAfterDue && excIdle && !flushing
     val debugStopBoundaryHit = debugStopActive &&
-      (debugNormalBoundaryHit || debugSequencerBoundaryHit || debugIdleBoundaryHit)
+      (debugNormalBoundaryHit || debugSequencerBoundaryHit || debugIdleBoundaryHit ||
+       debugAutomaticBoundaryHit)
     debugStopBoundaryHit.simPublic()
     val debugRecoverEnter = debugStopBoundaryHit
     debugRecoverEnter.simPublic()
+    val debugHaltHitInstCountReg = Reg(UInt(64 bits)) init 0
+    debugHaltHitInstCountReg.simPublic()
+    when(debugStopBoundaryHit) {
+      // Automatic results carry the sampled count as well as the epoch. Manual stops
+      // capture the post-commit count of the boundary macro on this same edge.
+      debugHaltHitInstCountReg := Mux(haltAfterDue || debugAutoHaltLatchedReg,
+        haltAfterCmpCountReg, debugMacroCountReg + debugMacroCountInc.resized)
+    }
     switch(debugHaltState) {
       is(DebugHaltState.RUNNING) {
-        when(debugStopRequestIn) {
+        when(debugStopRequestIn || haltAfterDue) {
           when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
             .otherwise             { debugHaltState := DebugHaltState.STOP_PENDING }
         }
@@ -896,23 +949,32 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         when(debugResumeRequestIn) { debugHaltState := DebugHaltState.RUNNING }
       }
     }
+    when((debugHaltState === DebugHaltState.RUNNING) && haltAfterDue) {
+      debugAutoHaltLatchedReg := True
+    }
+    // Clear provenance only when the FSM actually accepts resume. A command racing
+    // RECOVER is not accepted by the state machine and must not erase the reason before
+    // HALTED becomes observable.
+    when(debugResumeRequestIn && (debugHaltState === DebugHaltState.HALTED)) {
+      debugAutoHaltLatchedReg := False
+    }
     // ── Debug macro-retire counter (Stage 2, feature bit 22 macro_retire_count) ────
-    // Counts MACRO-INSTRUCTIONS retired, not micro-ops: increments once per retiring
-    // entry whose payload.first is True (the macro's own first uop -- payload.first
-    // is already threaded through every MicroOpAssembler crack site as the retire-time
-    // macro-boundary marker; see RobPayload.first / u.firstOfInstr). A macro's
-    // trailing uops (first=False) do not increment it, so a 5-uop MOVEM retiring
-    // across 5 cycles increments this exactly once, on the cycle its FIRST uop
-    // retires -- matching the spec's "OFF_INST_* ... count macro-instructions, not
-    // uops" (debug_regmap.def FEAT macro_retire_count). Free-running: never cleared
+    // Counts COMPLETED macro-instructions, not micro-ops: increments once per retiring
+    // entry whose payload.last is True. A 5-uop MOVEM retiring across 5 cycles increments
+    // exactly once, on its final uop. This timing is load-bearing for halt-after: count N
+    // means macro N is wholly committed and the following macro is still untouched.
+    // Free-running: never cleared
     // except by CPU reset (it lives in RobPlugin's own logic, which IS the CPU-reset
     // domain -- unlike DebugCtrlPlugin's surviving debug-domain registers).
-    val debugMacroCountReg = Reg(UInt(64 bits)) init 0
-    debugMacroCountReg.simPublic()
-    val debugMacroCountInc =
-      (retire0 && p0.first).asUInt.resize(2) +
-      (retire1 && p1.first).asUInt.resize(2)
     when(debugMacroCountInc =/= 0) { debugMacroCountReg := debugMacroCountReg + debugMacroCountInc.resized }
+    val haltAfterMacroCompleted = (retire0 && p0.last) || (retire1 && p1.last)
+    when(!haltAfterArmedIn || haltAfterInvalidateIn) {
+      haltAfterComparePending := False
+    }.elsewhen(haltAfterArmRise || haltAfterMacroCompleted) {
+      haltAfterComparePending := True
+    }.elsewhen(haltAfterComparePending) {
+      haltAfterComparePending := False
+    }
 
     // ── Debug last-committed-PC (Stage 2, OFF_LAST_PC) ──────────────────────────
     // The PC of the most recently retired MACRO (not every uop -- a trailing uop of
@@ -1669,12 +1731,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
     // ── DebugCommitService readback ─────────────────────────────────────────────
     _debugEffectiveHalt    := debugHalted
-    _debugAutoHaltLatched  := False
+    _debugAutoHaltLatched  := debugAutoHaltLatchedReg
     _debugHaltReason       := U(0, 3 bits)
     _debugLivePc           := debugLivePcReg
     _debugLastPc           := debugLastPcReg   // Task 3: real producer
     _debugMacroCount       := debugMacroCountReg // Task 3: real producer
-    _debugHaltHitInstCount := U(0, 64 bits)
+    _debugHaltHitInstCount := debugHaltHitInstCountReg
+    _debugHaltAfterConsumed := (debugHaltState === DebugHaltState.RUNNING) && haltAfterDue
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see
@@ -1750,7 +1813,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugSequencerBoundaryHit := exc.redirectValid
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
-                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))
+                         Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc))))
     doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
@@ -1858,6 +1922,13 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def request(stop: Bool, resume: Bool): Unit = {
     logic.debugStopRequestIn := stop
     logic.debugResumeRequestIn := resume
+  }
+  override def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool,
+                                  invalidate: Bool): Unit = {
+    logic.haltAfterTargetIn := target
+    logic.haltAfterEpochIn := epoch
+    logic.haltAfterArmedIn := armed
+    logic.haltAfterInvalidateIn := invalidate
   }
 
   override def btbUpdate = logic.btbUpdateFlow

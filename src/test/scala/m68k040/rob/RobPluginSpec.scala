@@ -82,6 +82,10 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.flush.valid #= false
     dut.rob.logic.debugStopRequestIn #= false
     dut.rob.logic.debugResumeRequestIn #= false
+    dut.rob.logic.haltAfterTargetIn #= 0
+    dut.rob.logic.haltAfterEpochIn #= 0
+    dut.rob.logic.haltAfterArmedIn #= false
+    dut.rob.logic.haltAfterInvalidateIn #= false
     cd.waitSampling()
   }
 
@@ -1319,25 +1323,27 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // Stage 2 task 2: DebugCommitService skeleton -- pure plumbing, zero behavior.
-  test("DebugCommitService resolves and every field is inert (False/0) with no debug driver wired") {
+  // Stage 2 service defaults: halt state remains inert with no command/config driver;
+  // the read-only retirement observations are nevertheless real.
+  test("DebugCommitService resolves and halt controls stay inert with no debug driver") {
     M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initSimple(dut, cd)
 
-      def assertInert(msg: String): Unit = {
+      def assertInert(msg: String, expectedMacroCount: BigInt = 0): Unit = {
         assert(!dut.dsink.logic.effectiveHaltOut.toBoolean, s"effectiveHalt must stay False ($msg)")
         assert(!dut.dsink.logic.autoHaltLatchedOut.toBoolean, s"autoHaltLatched must stay False ($msg)")
         assert(dut.dsink.logic.haltReasonDebugOut.toInt == 0, s"haltReasonDebug must stay 0 ($msg)")
-        assert(dut.dsink.logic.macroCountOut.toBigInt == 0, s"macroCount must stay 0 ($msg)")
+        assert(dut.dsink.logic.macroCountOut.toBigInt == expectedMacroCount,
+          s"macroCount must be $expectedMacroCount ($msg)")
         assert(dut.dsink.logic.haltHitInstCountOut.toBigInt == 0, s"haltHitInstCount must stay 0 ($msg)")
+        assert(!dut.dsink.logic.haltAfterConsumedOut.toBoolean,
+          s"haltAfterConsumed must stay False ($msg)")
       }
 
       assertInert("before any traffic")
 
-      // Drive normal alloc + 2-wide retire traffic (mirrors "alloc + 2-wide retire"
-      // above) and confirm the service stays inert throughout -- proves this task
-      // adds zero observable behavior change, only plumbing.
+      // Drive normal alloc + 2-wide retire traffic and confirm no halt state appears.
       pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, dstArch = 3, pdst = 20, pdstValid = true, pdstOld = 3)
       pokeRu(dut.rsrc.logic.src.payload(1), pc = 0x200, dstArch = 5, pdst = 21, pdstValid = true, pdstOld = 5)
       dut.rsrc.logic.src.valid #= true
@@ -1360,7 +1366,7 @@ class RobPluginSpec extends AnyFunSuite {
 
       for (_ <- 0 until 20) {
         cd.waitSampling()
-        assertInert("post-retire settle")
+        assertInert("post-retire settle", expectedMacroCount = 2)
       }
       assert(dut.rob.logic.count.toInt == 0, "ROB drained (test precondition sanity)")
     }
@@ -1376,8 +1382,9 @@ class RobPluginSpec extends AnyFunSuite {
       /** Single-wide alloc of one uop, then complete + retire it alone (single-wide
         * retire, no dual-retire pairing -- keeps the sequencing simple per the
         * plan's own directed-test text). */
-      def allocOne(pc: Long, first: Boolean): Int = {
-        pokeRu(dut.rsrc.logic.src.payload(0), pc = pc, firstOfInstr = first)
+      def allocOne(pc: Long, first: Boolean, last: Boolean): Int = {
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = pc,
+          firstOfInstr = first, lastOfInstr = last)
         dut.rsrc.logic.src.valid #= true
         dut.rsrc.logic.u1v #= false
         val id = dut.rob.logic.tail.toInt
@@ -1396,25 +1403,24 @@ class RobPluginSpec extends AnyFunSuite {
 
       assert(dut.dsink.logic.macroCountOut.toBigInt == 0, "macroCount starts at 0")
 
-      // 3-uop cracked macro: first=True, False, False -- retired single-wide across
-      // 3 separate cycles.
-      val id0 = allocOne(0x100, first = true)
+      // 3-uop cracked macro: only its final uop completes the architectural macro.
+      val id0 = allocOne(0x100, first = true, last = false)
       completeAndRetire(id0)
-      assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
-        s"macroCount must be 1 immediately after the FIRST uop of the 3-uop macro retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 0,
+        s"macroCount must stay 0 after the FIRST uop of an incomplete macro, got ${dut.dsink.logic.macroCountOut.toBigInt}")
 
-      val id1 = allocOne(0x102, first = false)
+      val id1 = allocOne(0x102, first = false, last = false)
       completeAndRetire(id1)
-      assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
-        s"macroCount must stay 1 after a trailing (first=False) uop retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 0,
+        s"macroCount must stay 0 after the middle uop retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
 
-      val id2 = allocOne(0x104, first = false)
+      val id2 = allocOne(0x104, first = false, last = true)
       completeAndRetire(id2)
       assert(dut.dsink.logic.macroCountOut.toBigInt == 1,
-        s"macroCount must stay 1 after the LAST trailing uop of the 3-uop macro retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
+        s"macroCount must become 1 only after the LAST uop retires, got ${dut.dsink.logic.macroCountOut.toBigInt}")
 
       // A second, 1-uop macro.
-      val id3 = allocOne(0x200, first = true)
+      val id3 = allocOne(0x200, first = true, last = true)
       completeAndRetire(id3)
       assert(dut.dsink.logic.macroCountOut.toBigInt == 2,
         s"macroCount must be 2 after both macros (3-uop + 1-uop) have fully retired, got ${dut.dsink.logic.macroCountOut.toBigInt}")
@@ -1686,6 +1692,94 @@ class RobPluginSpec extends AnyFunSuite {
       waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
       cd.waitSampling()
       assert(dut.dsink.logic.lastPcOut.toLong == 0xa02L, "retirement resumes after continue")
+    }
+  }
+
+  test("halt-after stops after the exact completed macro target and before its successor") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      val ids = Seq(
+        allocOneFL(dut, cd, 0xb00, first = true, last = true),
+        allocOneFL(dut, cd, 0xb02, first = true, last = true),
+        allocOneFL(dut, cd, 0xb04, first = true, last = true))
+      dut.rob.logic.haltAfterTargetIn #= 2
+      dut.rob.logic.haltAfterEpochIn #= 1
+      dut.rob.logic.haltAfterArmedIn #= true
+      cd.waitSampling(4) // arm snapshot + registered wide comparison
+
+      markComplete(dut, ids(0)); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      cd.waitSampling()
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean)
+
+      markComplete(dut, ids(1)); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      cd.waitSampling()
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 2)
+
+      // Make the successor ready while the registered comparison catches up. It must
+      // remain architecturally untouched and be discarded by recovery.
+      markComplete(dut, ids(2)); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 2,
+        "halt-after retired a macro beyond the absolute target")
+      assert(dut.dsink.logic.haltHitInstCountOut.toBigInt == 2,
+        "halt descriptor did not carry the comparator's completed-macro count")
+      assert(dut.dsink.logic.lastPcOut.toLong == 0xb02L,
+        "the successor after the target macro committed")
+      assert(dut.dsink.logic.livePcOut.toLong == 0xb04L,
+        "halt-after resume PC must name the untouched successor, not skip past it")
+      assert(dut.rob.logic.count.toInt == 0, "recovery did not flush the ready successor")
+      assert(dut.dsink.logic.autoHaltLatchedOut.toBoolean)
+    }
+  }
+
+  test("target reprogramming invalidates an in-flight halt-after comparison") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      val id = allocOneFL(dut, cd, 0xc00, first = true, last = true)
+      dut.rob.logic.haltAfterTargetIn #= 1
+      dut.rob.logic.haltAfterEpochIn #= 1
+      dut.rob.logic.haltAfterArmedIn #= true
+      cd.waitSampling(4)
+      markComplete(dut, id); cd.waitSampling(); clearComplete(dut)
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      cd.waitSampling() // count becomes 1; old-target compare is now pending
+
+      // Model the accepted target write exactly: invalidate is visible on the write
+      // edge, the new epoch/target and disarmed state are visible immediately after it.
+      dut.rob.logic.haltAfterInvalidateIn #= true
+      dut.rob.logic.haltAfterArmedIn #= false
+      dut.rob.logic.haltAfterEpochIn #= 2
+      dut.rob.logic.haltAfterTargetIn #= 10
+      cd.waitSampling()
+      dut.rob.logic.haltAfterInvalidateIn #= false
+      cd.waitSampling(6)
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean,
+        "a comparison from the superseded epoch stopped the core")
+      assert(!dut.dsink.logic.autoHaltLatchedOut.toBoolean)
+
+      // Re-arming the new, higher target is live but does not stop at count 1.
+      dut.rob.logic.haltAfterArmedIn #= true
+      cd.waitSampling(5)
+      assert(!dut.dsink.logic.effectiveHaltOut.toBoolean)
+
+      // A deliberately lower replacement target is not stale: after re-arm it must
+      // stop at the next clean boundary because the absolute count already exceeds it.
+      dut.rob.logic.haltAfterInvalidateIn #= true
+      dut.rob.logic.haltAfterArmedIn #= false
+      dut.rob.logic.haltAfterEpochIn #= 3
+      dut.rob.logic.haltAfterTargetIn #= 0
+      cd.waitSampling()
+      dut.rob.logic.haltAfterInvalidateIn #= false
+      dut.rob.logic.haltAfterArmedIn #= true
+      waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
     }
   }
 }

@@ -38,20 +38,32 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   private var autoHaltWire: Bool = null
   private var stopWire: Bool = null
   private var resumeWire: Bool = null
+  private var haltAfterTargetWire: UInt = null
+  private var haltAfterEpochWire: UInt = null
+  private var haltAfterArmedWire: Bool = null
+  private var haltAfterInvalidateWire: Bool = null
 
   override def effectiveHalt: Bool = effectiveHaltWire
   override def autoHaltLatched: Bool = autoHaltWire
   override def haltReasonDebug: UInt = U(0, 3 bits)
   override def livePc: UInt = logic.livePcDrive
   override def lastPc: UInt = logic.lastPcDrive
-  override def macroCount: UInt = U(0, 64 bits)
-  override def haltHitInstCount: UInt = U(0, 64 bits)
+  override def macroCount: UInt = logic.macroCountDrive
+  override def haltHitInstCount: UInt = logic.haltHitInstCountDrive
+  override def haltAfterConsumed: Bool = logic.haltAfterConsumedDrive
 
   during setup {
     effectiveHaltWire = Bool()
     autoHaltWire = Bool()
     stopWire = Bool(); stopWire.allowOverride; stopWire := False
     resumeWire = Bool(); resumeWire.allowOverride; resumeWire := False
+    haltAfterTargetWire = UInt(64 bits); haltAfterTargetWire.allowOverride
+    haltAfterTargetWire := U(0, 64 bits)
+    haltAfterEpochWire = UInt(8 bits); haltAfterEpochWire.allowOverride
+    haltAfterEpochWire := U(0, 8 bits)
+    haltAfterArmedWire = Bool(); haltAfterArmedWire.allowOverride; haltAfterArmedWire := False
+    haltAfterInvalidateWire = Bool(); haltAfterInvalidateWire.allowOverride
+    haltAfterInvalidateWire := False
   }
 
   val logic = during build new Area {
@@ -59,22 +71,43 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val autoHaltDrive = RegInit(False); autoHaltDrive.simPublic()
     val livePcDrive = Reg(UInt(32 bits)) init 0; livePcDrive.simPublic()
     val lastPcDrive = Reg(UInt(32 bits)) init 0; lastPcDrive.simPublic()
+    val macroCountDrive = Reg(UInt(64 bits)) init 0; macroCountDrive.simPublic()
+    val haltHitInstCountDrive = Reg(UInt(64 bits)) init 0; haltHitInstCountDrive.simPublic()
+    val haltAfterConsumedDrive = RegInit(False); haltAfterConsumedDrive.simPublic()
     effectiveHaltDrive := effectiveHaltDrive
     autoHaltDrive := autoHaltDrive
     livePcDrive := livePcDrive
     lastPcDrive := lastPcDrive
+    macroCountDrive := macroCountDrive
+    haltHitInstCountDrive := haltHitInstCountDrive
+    haltAfterConsumedDrive := haltAfterConsumedDrive
     effectiveHaltWire := effectiveHaltDrive
     autoHaltWire := autoHaltDrive
 
     val stopRequest = out(Bool())
     val resumeRequest = out(Bool())
+    val haltAfterTarget = out(UInt(64 bits))
+    val haltAfterEpoch = out(UInt(8 bits))
+    val haltAfterArmed = out(Bool())
+    val haltAfterInvalidate = out(Bool())
     stopRequest := stopWire
     resumeRequest := resumeWire
+    haltAfterTarget := haltAfterTargetWire
+    haltAfterEpoch := haltAfterEpochWire
+    haltAfterArmed := haltAfterArmedWire
+    haltAfterInvalidate := haltAfterInvalidateWire
   }
 
   override def request(stop: Bool, resume: Bool): Unit = {
     stopWire := stop
     resumeWire := resume
+  }
+  override def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool,
+                                  invalidate: Bool): Unit = {
+    haltAfterTargetWire := target
+    haltAfterEpochWire := epoch
+    haltAfterArmedWire := armed
+    haltAfterInvalidateWire := invalidate
   }
 }
 

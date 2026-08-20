@@ -152,6 +152,8 @@ git commit -m "debug: gate DebugCtrlPlugin behind a real enable flag (Stage 2 ta
     def lastPc: UInt               // OFF_LAST_PC — most recently retired macro's PC
     def macroCount: UInt           // 64 bits (host reads as OFF_INST_LO/HI, two 32-bit halves)
     def haltHitInstCount: UInt     // 64 bits — macroCount latched at the stop (OFF_HALT_HIT_INST_LO/HI)
+    // Task 7 adds haltAfterConsumed plus configureHaltAfter(...); the pulse lets the
+    // debug-domain owner consume one arm without conflating it with sticky status.
     // Debug -> ROB commands, consumed here for symmetry with the setup-allocated-wire
     // pattern's existing "same trait carries both directions" precedent (none currently
     // does — RedirectService/FrontendQuiesceService are one-directional — so this is a
@@ -271,7 +273,7 @@ git commit -m "rob: DebugCommitService skeleton, setup-allocated-wire pattern (S
 - Test: `src/test/scala/m68k040/rob/RobPluginSpec.scala`
 
 **Interfaces:**
-- Consumes: `retire0`/`retire1` (existing, `RobPlugin.scala:736-738`/`787-789`), `p0.first`/`p1.first` (existing `RobPayload` field).
+- Consumes: `retire0`/`retire1` and the real `p0.last`/`p1.last` macro-completion markers.
 - Produces: `_debugMacroCount` (Task 2's wire) now has a real value; `_debugLastPc` gets a real producer too (same task, since both are trivial retire-time captures).
 
 - [ ] **Step 1: Add the counter register**
@@ -280,21 +282,17 @@ Near the other retire-time Regs (alongside `stoppedPc`/`coreHalted`, not inside 
 
 ```scala
 // ── Debug macro-retire counter (Stage 2, feature bit 22 macro_retire_count) ────
-// Counts MACRO-INSTRUCTIONS retired, not micro-ops: increments once per retiring
-// entry whose payload.first is True (the macro's own first uop -- payload.first
-// is already threaded through every MicroOpAssembler crack site as the retire-time
-// macro-boundary marker; see RobPayload.first / u.firstOfInstr). A macro's
-// trailing uops (first=False) do not increment it, so a 5-uop MOVEM retiring
-// across 5 cycles increments this exactly once, on the cycle its FIRST uop
-// retires -- matching the spec's "OFF_INST_* ... count macro-instructions, not
-// uops" (debug_regmap.def FEAT macro_retire_count). Free-running: never cleared
+// Counts COMPLETED macro-instructions, not micro-ops: increments once per retiring
+// entry whose payload.last is True. A 5-uop MOVEM increments on its final uop, so
+// count N means macro N is wholly committed -- required by halt-after's boundary rule.
+// Free-running: never cleared
 // except by CPU reset (it lives in RobPlugin's own logic, which IS the CPU-reset
 // domain -- unlike DebugCtrlPlugin's surviving debug-domain registers).
 val debugMacroCountReg = Reg(UInt(64 bits)) init 0
 debugMacroCountReg.simPublic()
 val debugMacroCountInc =
-  (retire0 && p0.first).asUInt.resize(2) +
-  (retire1 && p1.first).asUInt.resize(2)
+  (retire0 && p0.last).asUInt.resize(2) +
+  (retire1 && p1.last).asUInt.resize(2)
 when(debugMacroCountInc =/= 0) { debugMacroCountReg := debugMacroCountReg + debugMacroCountInc.resized }
 ```
 
@@ -333,7 +331,7 @@ test("debugMacroCount increments once per retiring macro, not once per retired u
   // Drive a 3-uop cracked "macro" (first=True, False, False) through alloc/complete/retire
   // across 3 separate cycles (single-wide retire each cycle to keep the sequencing simple),
   // then a 1-uop macro. Assert dsink.logic.macroCountOut == 2 after both have retired, and
-  // == 1 immediately after the FIRST uop of the 3-uop macro retires (not 0, not 3).
+  // == 0 until the LAST uop of the 3-uop macro retires, then == 1 (not 3).
 }
 test("debugLastPc tracks the most recently retired entry's PC, single- and dual-retire") {
   // Retire two independent single-uop macros at DIFFERENT PCs in the SAME cycle
@@ -775,12 +773,13 @@ git commit -m "debug: wire OFF_CONTROL bit 0 manual halt/resume end-to-end (Stag
 **Files:**
 - Modify: `src/main/scala/m68k040/debug/DebugCtrlPlugin.scala`
 - Modify: `src/main/scala/m68k040/rob/RobPlugin.scala`
-- Modify: `src/main/scala/m68k040/top/FullCoreSynth.scala`
-- Test: `src/test/scala/m68k040/rob/RobPluginSpec.scala`, `src/test/scala/m68k040/debug/DebugCtrlPluginSpec.scala`
+- Modify: `src/main/scala/m68k040/services/Services.scala`
+- Modify: `tools/debug/debug_regmap.def` and the design spec (bit-0 arm semantics)
+- Test: `src/test/scala/m68k040/rob/RobPluginSpec.scala`, `src/test/scala/m68k040/debug/DebugCtrlCsrSpec.scala`, `src/test/scala/m68k040/debug/DebugCtrlRobIntegrationSpec.scala`
 
 **Interfaces:**
 - Consumes: Task 3's `debugMacroCountReg`, Task 5's halt FSM.
-- Produces: writing `OFF_HALT_AFTER_LO/HI` then a trigger (reuse `OFF_HALT_CTL`'s currently-undocumented bits — check `debug_regmap.def`'s comment again: `OFF_HALT_CTL` says only "bit 2 clears sticky reason/report latches"; mint bit 0 = "arm halt-after" as this task's own addition to that register's semantics, documented here and in the `.def` file's own comment text, NOT a new offset) arms a pipelined macro-count comparator that halts the core (via the SAME `debugStopRequestIn` mechanism Task 5/6 built) once `debugMacroCountReg` reaches the target.
+- Produces: target writes advance an epoch and disarm; `OFF_HALT_CTL` bit 0 arms and reads the armed state. A registered comparator stops after the exact completed-macro target, consumes the arm, and cannot fire from a superseded epoch.
 
 - [ ] **Step 1: Read spec §6.6 again** (lines 497-506) — "Count comparison may be pipelined; a pending result must carry the count/epoch so it cannot stop on a stale target after host reprogramming." This is the one subtlety in this task: a target write must invalidate any in-flight comparison from a STALE target.
 
@@ -815,14 +814,19 @@ Read `OFF_HALT_AFTER_LO/HI` back from `haltAfterTarget`'s two halves (mirror the
 
 - [ ] **Step 3: Extend `DebugCommitService` with target+epoch+armed**
 
-Extend the service command method (or add a focused configuration method) so these
+Add a focused configuration method so these
 values cross the public service boundary without sibling IO. `DebugCtrlPlugin` calls it
 with the three CSR-held values; `RobPlugin` assigns only its ROB-local inputs:
 
 ```scala
-def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool): Unit
-dbgCommit.foreach(_.configureHaltAfter(haltAfterTarget, haltAfterEpoch, haltAfterArmed))
+def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool, invalidate: Bool): Unit
+dbgCommit.foreach(_.configureHaltAfter(haltAfterTarget, haltAfterEpoch,
+  haltAfterArmed, haltAfterInvalidate))
 ```
+
+`invalidate` is combinational from the accepted, non-zero-strobe target write. This is
+intentional: it cancels an old registered result on the same edge that reprograms the
+debug-domain target and epoch.
 
 - [ ] **Step 4: `RobPlugin` — the comparator**
 
@@ -832,20 +836,12 @@ val haltAfterEpochIn  = UInt(8 bits);  haltAfterEpochIn.allowOverride;  haltAfte
 val haltAfterArmedIn  = Bool();        haltAfterArmedIn.allowOverride;  haltAfterArmedIn  := False
 haltAfterTargetIn.simPublic(); haltAfterEpochIn.simPublic(); haltAfterArmedIn.simPublic()
 
-// Pipelined: register the target/epoch/armed the cycle they're sampled, so the
-// actual comparison is against a STABLE snapshot even if the host writes a new
-// target the same cycle the comparison is evaluated. The epoch check is what
-// spec 6.6 requires: a comparison result computed against epoch E must never be
-// allowed to fire once the live epoch has moved past E (a stale in-flight
-// compare from a superseded target).
-val haltAfterTargetReg = RegNext(haltAfterTargetIn) init 0
-val haltAfterEpochReg  = RegNext(haltAfterEpochIn)  init 0
-val haltAfterArmedReg  = RegNext(haltAfterArmedIn && (haltAfterEpochIn === haltAfterEpochReg)) init False
-val haltAfterHit = haltAfterArmedReg && (debugMacroCountReg >= haltAfterTargetReg)
-// Feed the internal trigger into the halt FSM alongside the manual request. Do not
-// assign a second driver to debugStopRequestIn; form an OR term local to RobPlugin.
-val debugStopActive = debugStopRequestIn || haltAfterHit ||
-  (debugHaltState === DebugHaltState.STOP_PENDING)
+// Register count/epoch/armed and the wide comparison. After each last-uop retirement,
+// assert a one-cycle compare-pending hold before admitting the following macro. While
+// armed, suppress dual-retire crossing when h0 is macro-last. The halt event is valid
+// only when the registered epoch still equals the live epoch and invalidate is low.
+// This keeps the 64-bit >= comparator off the commit hot path while guaranteeing that
+// target macro N is wholly committed and macro N+1 remains untouched.
 ```
 
 (Flag the last comment's uncertainty explicitly to the implementer — this is exactly the kind of thing the task reviewer should double-check by actually compiling it, not by trusting the plan's prose.)
@@ -854,7 +850,7 @@ val debugStopActive = debugStopRequestIn || haltAfterHit ||
 
 ```scala
 test("halt-after fires exactly at the target macro count, not before, not one late") {}
-test("halt-after re-armed with a NEW lower target after the OLD target was already exceeded does not immediately fire on stale epoch") {}
+test("a superseded in-flight result cannot fire; a deliberately re-armed lower target can") {}
 test("halt-after target write while a comparison is in flight does not fire against the old target") {}
 ```
 

@@ -266,6 +266,13 @@ not cancel the step already accepted.
 an accepted `OFF_CONTROL` write with bit 0 clear performs resume. This preserves the
 deployed `continue` sequence and avoids a one-cycle halt-ownership hole.
 
+`OFF_HALT_CTL` bit 0 is the halt-after arm command and reads back the current armed
+state. Writing either half of `OFF_HALT_AFTER_LO/HI` advances the configuration epoch
+and disarms the comparator; the host arms only after programming the complete 64-bit
+absolute target. An automatic hit consumes the arm before the core can be resumed, so
+continue cannot immediately retrigger against the same target. A zero-strobe write is
+not a programming event and changes neither target, epoch, nor arm state.
+
 ### 3.4 Feature discovery
 
 Bits 0-18 retain their deployed meanings and are never renumbered:
@@ -513,6 +520,13 @@ fatally halted, applying architectural state, or performing cache maintenance.
 an absolute target. Halt-after triggers after the target macro completes and stops
 before the following macro. Count comparison may be pipelined; a pending result must
 carry the count/epoch so it cannot stop on a stale target after host reprogramming.
+
+The count advances only when the last uOp of a macro retires. The implemented registered
+comparator holds retirement at the intervening clean macro boundary while a new count is
+sampled; its 64-bit comparison therefore does not enter the live commit path. While
+halt-after is armed, dual retirement may not cross from a completed macro into its
+successor. A target-write invalidation is observed on the accepted write edge, before a
+result from the superseded epoch can acquire halt ownership.
 
 Halt-on-exception uses the 256-bit deployed mask and stops at completed handler entry.
 The exception descriptor (vector, fault PC, fault address) is captured atomically with

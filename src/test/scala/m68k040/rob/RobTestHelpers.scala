@@ -119,6 +119,7 @@ class DebugCommitSinkPlugin extends FiberPlugin {
     val lastPcOut           = out(UInt(32 bits))
     val macroCountOut       = out(UInt(64 bits))
     val haltHitInstCountOut = out(UInt(64 bits))
+    val haltAfterConsumedOut = out(Bool())
     effectiveHaltOut    := d.effectiveHalt
     autoHaltLatchedOut  := d.autoHaltLatched
     haltReasonDebugOut  := d.haltReasonDebug
@@ -126,5 +127,6 @@ class DebugCommitSinkPlugin extends FiberPlugin {
     lastPcOut           := d.lastPc
     macroCountOut       := d.macroCount
     haltHitInstCountOut := d.haltHitInstCount
+    haltAfterConsumedOut := d.haltAfterConsumed
   }
 }
