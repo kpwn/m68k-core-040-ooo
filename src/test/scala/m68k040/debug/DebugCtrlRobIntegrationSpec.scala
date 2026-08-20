@@ -49,6 +49,14 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       }
       assert((status & 1L) != 0, f"ROB did not reach effective halt; STATUS=0x$status%08X")
       assert((status & (1L << 3)) == 0, f"halted STATUS still reports running: 0x$status%08X")
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_REASON.toLong) == 1,
+        "plain stop did not report MANUAL")
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong, 1L << 2)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_REASON.toLong) == 0,
+        "HALT_CTL.clear-sticky did not clear the reason")
+      status = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS.toLong)
+      assert((status & 1L) != 0, "clearing reports must not release an active halt")
 
       DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL.toLong, 0)
       waited = 0

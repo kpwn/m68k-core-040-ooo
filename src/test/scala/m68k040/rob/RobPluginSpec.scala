@@ -83,6 +83,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.debugStopRequestIn #= false
     dut.rob.logic.debugResumeRequestIn #= false
     dut.rob.logic.debugStepRequestIn #= false
+    dut.rob.logic.debugClearStickyIn #= false
     dut.rob.logic.haltAfterTargetIn #= 0
     dut.rob.logic.haltAfterEpochIn #= 0
     dut.rob.logic.haltAfterArmedIn #= false
@@ -1629,6 +1630,7 @@ class RobPluginSpec extends AnyFunSuite {
         f"saved live PC must be the committed macro successor, got 0x${dut.dsink.logic.livePcOut.toLong}%x")
       cd.waitSampling()
       assert(dut.dsink.logic.effectiveHaltOut.toBoolean, "halt becomes effective only after recovery")
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.MANUAL)
       assert(dut.rob.logic.count.toInt == 0, "recovery must flush all younger ROB work")
       for (_ <- 0 until 20) {
         assert(!dut.tsink.logic.fireOut(0).toBoolean && !dut.tsink.logic.fireOut(1).toBoolean)
@@ -1665,6 +1667,7 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
       assert(dut.rob.logic.count.toInt == 0, "the following macro must be flushed, not committed")
       assert(dut.dsink.logic.lastPcOut.toLong == 0x800L)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.MANUAL)
     }
   }
 
@@ -1742,6 +1745,7 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.rob.logic.count.toInt == 0, "the unexecuted successor must be flushed")
       assert(dut.dsink.logic.lastPcOut.toLong == 0xc00L)
       assert(dut.dsink.logic.livePcOut.toLong == 0xc02L)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.STEP)
     }
   }
 
@@ -1784,6 +1788,7 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
       assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
       assert(dut.dsink.logic.livePcOut.toLong == 0xe02L)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.STEP)
     }
   }
 
@@ -1804,6 +1809,59 @@ class RobPluginSpec extends AnyFunSuite {
       assert(!dut.rob.logic.debugStepBoundaryHit.toBoolean)
       cd.waitSampling()
       assert(!dut.dsink.logic.effectiveHaltOut.toBoolean)
+    }
+  }
+
+  test("fatal halt is effective, distinctly reported, and rejects resume and step") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      dut.rob.logic.debugStopRequestIn #= true
+      waitUntil(cd, dut.rob.logic.debugRecoverEnter.toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.HALTED)
+
+      dut.rob.logic.coreHaltedIn #= true
+      cd.waitSampling()
+      dut.rob.logic.coreHaltedIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.FATAL)
+
+      dut.rob.logic.debugResumeRequestIn #= true
+      dut.rob.logic.debugStepRequestIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugResumeRequestIn #= false
+      dut.rob.logic.debugStepRequestIn #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.HALTED)
+      assert(dut.rob.logic.debugStepRejected.toBoolean)
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.FATAL)
+    }
+  }
+
+  test("clear-sticky clears the displayed reason without releasing an active halt") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.debugStopRequestIn #= true
+      waitUntil(cd, dut.rob.logic.debugRecoverEnter.toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.MANUAL)
+
+      dut.rob.logic.debugClearStickyIn #= true
+      cd.waitSampling()
+      dut.rob.logic.debugClearStickyIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.NONE)
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.HALTED)
     }
   }
 
@@ -1846,6 +1904,7 @@ class RobPluginSpec extends AnyFunSuite {
         "halt-after resume PC must name the untouched successor, not skip past it")
       assert(dut.rob.logic.count.toInt == 0, "recovery did not flush the ready successor")
       assert(dut.dsink.logic.autoHaltLatchedOut.toBoolean)
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.HALT_AFTER)
     }
   }
 

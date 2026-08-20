@@ -13,6 +13,16 @@ object DebugHaltState extends SpinalEnum {
   val RUNNING, STOP_PENDING, RECOVER, HALTED, STEP_RUNNING = newElement()
 }
 
+/** JTAG-visible stop classification, distinct from socket.HaltReason's fatal
+  * subsystem classification. */
+object DebugHaltReasonCode {
+  val NONE = 0
+  val MANUAL = 1
+  val STEP = 2
+  val HALT_AFTER = 3
+  val FATAL = 4
+}
+
 /** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
   *
   * - Alloc: PASSIVE RobAllocService — DispatchPlugin takes robIds and drives the
@@ -434,6 +444,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugResumeRequestIn.simPublic()
     val debugStepRequestIn = Bool(); debugStepRequestIn.allowOverride; debugStepRequestIn := False
     debugStepRequestIn.simPublic()
+    val debugClearStickyIn = Bool(); debugClearStickyIn.allowOverride; debugClearStickyIn := False
+    debugClearStickyIn.simPublic()
     // DebugCommitService-owned halt-after configuration. These are ROB-local wires,
     // not sibling-plugin IO; idle defaults preserve standalone elaboration.
     val haltAfterTargetIn = UInt(64 bits); haltAfterTargetIn.allowOverride
@@ -960,7 +972,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       is(DebugHaltState.HALTED) {
         when(debugStepRequestIn && !coreHalted) {
           debugHaltState := DebugHaltState.STEP_RUNNING
-        }.elsewhen(debugResumeRequestIn) {
+        }.elsewhen(debugResumeRequestIn && !coreHalted) {
           debugHaltState := DebugHaltState.RUNNING
         }
       }
@@ -969,11 +981,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       }
     }
     val debugStepRejected = RegInit(False); debugStepRejected.simPublic()
+    val debugHaltReasonReg = Reg(UInt(3 bits)) init DebugHaltReasonCode.NONE
+    debugHaltReasonReg.simPublic()
+    when(debugClearStickyIn) {
+      debugStepRejected := False
+      debugHaltReasonReg := DebugHaltReasonCode.NONE
+    }
     when(debugStepRequestIn && ((debugHaltState =/= DebugHaltState.HALTED) || coreHalted)) {
       debugStepRejected := True
     }
+    // A newly-entering fatal condition wins a same-cycle clear or debug recovery.
+    when(coreHaltedIn && !coreHalted) {
+      debugHaltReasonReg := DebugHaltReasonCode.FATAL
+    }.elsewhen(debugRecoverEnter) {
+      debugHaltReasonReg := Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
+        U(DebugHaltReasonCode.STEP, 3 bits),
+        Mux(haltAfterDue || debugAutoHaltLatchedReg,
+          U(DebugHaltReasonCode.HALT_AFTER, 3 bits),
+          U(DebugHaltReasonCode.MANUAL, 3 bits)))
+    }
     GenerationFlags.simulation {
-      assert(!(debugHalted && (retire0 || retire1)),
+      assert(!((debugHalted || coreHalted) && (retire0 || retire1)),
         "RobPlugin: architectural retirement occurred during effective debug halt", FAILURE)
       assert(!((debugHaltState === DebugHaltState.STEP_RUNNING) && retire1 && p0.last),
         "RobPlugin: single-step dual-retired across a macro boundary", FAILURE)
@@ -986,7 +1014,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Clear provenance only when the FSM actually accepts resume. A command racing
     // RECOVER is not accepted by the state machine and must not erase the reason before
     // HALTED becomes observable.
-    when(debugResumeRequestIn && (debugHaltState === DebugHaltState.HALTED)) {
+    when(debugResumeRequestIn && (debugHaltState === DebugHaltState.HALTED) && !coreHalted) {
       debugAutoHaltLatchedReg := False
     }
     // ── Debug macro-retire counter (Stage 2, feature bit 22 macro_retire_count) ────
@@ -1761,9 +1789,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _frontendQuiesceNext.simPublic()
 
     // ── DebugCommitService readback ─────────────────────────────────────────────
-    _debugEffectiveHalt    := debugHalted
+    _debugEffectiveHalt    := debugHalted || coreHalted
     _debugAutoHaltLatched  := debugAutoHaltLatchedReg
-    _debugHaltReason       := U(0, 3 bits)
+    _debugHaltReason       := Mux(coreHalted, U(DebugHaltReasonCode.FATAL, 3 bits),
+      debugHaltReasonReg)
     _debugLivePc           := debugLivePcReg
     _debugLastPc           := debugLastPcReg   // Task 3: real producer
     _debugMacroCount       := debugMacroCountReg // Task 3: real producer
@@ -1953,10 +1982,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
 
   override def doFlush = logic.doFlushReg
   override def flushPc = logic.flushPcReg
-  override def request(stop: Bool, resume: Bool, step: Bool): Unit = {
+  override def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit = {
     logic.debugStopRequestIn := stop
     logic.debugResumeRequestIn := resume
     logic.debugStepRequestIn := step
+    logic.debugClearStickyIn := clearSticky
   }
   override def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool,
                                   invalidate: Bool): Unit = {

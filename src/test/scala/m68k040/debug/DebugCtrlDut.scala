@@ -39,6 +39,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   private var stopWire: Bool = null
   private var resumeWire: Bool = null
   private var stepWire: Bool = null
+  private var clearStickyWire: Bool = null
   private var haltAfterTargetWire: UInt = null
   private var haltAfterEpochWire: UInt = null
   private var haltAfterArmedWire: Bool = null
@@ -46,7 +47,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
 
   override def effectiveHalt: Bool = effectiveHaltWire
   override def autoHaltLatched: Bool = autoHaltWire
-  override def haltReasonDebug: UInt = U(0, 3 bits)
+  override def haltReasonDebug: UInt = logic.haltReasonDrive
   override def livePc: UInt = logic.livePcDrive
   override def lastPc: UInt = logic.lastPcDrive
   override def macroCount: UInt = logic.macroCountDrive
@@ -59,6 +60,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     stopWire = Bool(); stopWire.allowOverride; stopWire := False
     resumeWire = Bool(); resumeWire.allowOverride; resumeWire := False
     stepWire = Bool(); stepWire.allowOverride; stepWire := False
+    clearStickyWire = Bool(); clearStickyWire.allowOverride; clearStickyWire := False
     haltAfterTargetWire = UInt(64 bits); haltAfterTargetWire.allowOverride
     haltAfterTargetWire := U(0, 64 bits)
     haltAfterEpochWire = UInt(8 bits); haltAfterEpochWire.allowOverride
@@ -71,6 +73,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   val logic = during build new Area {
     val effectiveHaltDrive = RegInit(False); effectiveHaltDrive.simPublic()
     val autoHaltDrive = RegInit(False); autoHaltDrive.simPublic()
+    val haltReasonDrive = Reg(UInt(3 bits)) init 0; haltReasonDrive.simPublic()
     val livePcDrive = Reg(UInt(32 bits)) init 0; livePcDrive.simPublic()
     val lastPcDrive = Reg(UInt(32 bits)) init 0; lastPcDrive.simPublic()
     val macroCountDrive = Reg(UInt(64 bits)) init 0; macroCountDrive.simPublic()
@@ -78,6 +81,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val haltAfterConsumedDrive = RegInit(False); haltAfterConsumedDrive.simPublic()
     effectiveHaltDrive := effectiveHaltDrive
     autoHaltDrive := autoHaltDrive
+    haltReasonDrive := haltReasonDrive
     livePcDrive := livePcDrive
     lastPcDrive := lastPcDrive
     macroCountDrive := macroCountDrive
@@ -89,6 +93,7 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val stopRequest = out(Bool())
     val resumeRequest = out(Bool())
     val stepRequest = out(Bool())
+    val clearStickyRequest = out(Bool())
     val haltAfterTarget = out(UInt(64 bits))
     val haltAfterEpoch = out(UInt(8 bits))
     val haltAfterArmed = out(Bool())
@@ -96,16 +101,18 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     stopRequest := stopWire
     resumeRequest := resumeWire
     stepRequest := stepWire
+    clearStickyRequest := clearStickyWire
     haltAfterTarget := haltAfterTargetWire
     haltAfterEpoch := haltAfterEpochWire
     haltAfterArmed := haltAfterArmedWire
     haltAfterInvalidate := haltAfterInvalidateWire
   }
 
-  override def request(stop: Bool, resume: Bool, step: Bool): Unit = {
+  override def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit = {
     stopWire := stop
     resumeWire := resume
     stepWire := step
+    clearStickyWire := clearSticky
   }
   override def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool,
                                   invalidate: Bool): Unit = {

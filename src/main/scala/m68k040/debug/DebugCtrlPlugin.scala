@@ -250,12 +250,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val debugStopRequest = if (stage >= 2) RegInit(False) else False
       val debugResumeRequest = if (stage >= 2) RegInit(False) else False
       val debugStepRequest = if (stage >= 2) RegInit(False) else False
+      val debugClearStickyRequest = if (stage >= 2) RegInit(False) else False
       if (stage >= 2) {
         manualHaltLevel.simPublic()
         debugStopRequest.simPublic(); debugResumeRequest.simPublic(); debugStepRequest.simPublic()
+        debugClearStickyRequest.simPublic()
         debugStopRequest := False
         debugResumeRequest := False
         debugStepRequest := False
+        debugClearStickyRequest := False
       }
 
       // Halt-after configuration is debug-owned and therefore survives CPU reset.
@@ -295,7 +298,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * disagree about a bit's position or its RAZ/WI status. */
       def controlWord: Bits =
         B(0, 24 bits) ##
-        False ##            // bit 7  legacy step-arm      -- RAZ/WI until Stage 2
+        False ##            // bit 7  legacy step-arm observation -- retained RAZ/WI
         False ##            // bit 6  reserved             -- always 0 (spec 3.3)
         coldPulse ##        // bit 5  cold-reset pulse
         ctrlColdHold ##     // bit 4  cold-reset hold level
@@ -356,6 +359,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_HALT_CTL) {
             rData := B(0, 31 bits) ## haltAfterArmed
           }
+          is(DebugRegMap.OFF_HALT_REASON) {
+            rData := B(0, 29 bits) ##
+              dbgCommit.map(_.haltReasonDebug).getOrElse(U(0, 3 bits)).asBits
+          }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
           is(DebugRegMap.OFF_HALT_HIT_INST_LO) {
@@ -388,9 +395,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         switch(awAddr) {
           is(DebugRegMap.OFF_CONTROL) {
             // Read-modify-write through the byte-strobe merge against the SAME word the
-            // host reads back, so an unstrobed byte provably cannot change a bit. Bits 1
-            // (step) and 7 (step-arm) remain absent/RAZ-WI until their later Stage-2
-            // tasks. Bit 0 is real only in a stage>=2 build.
+            // host reads back, so an unstrobed byte provably cannot change a bit. Bit 1
+            // is the Stage-2 step pulse; legacy observation bit 7 remains RAZ/WI. Bit 0
+            // is real only in a stage>=2 build.
             val m = merged(controlWord)
             ctrlInitDoneOvr := m(3)
             ctrlColdHold    := m(4)
@@ -422,10 +429,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             }
           }
           is(DebugRegMap.OFF_HALT_CTL) {
-            if (stage >= 2) when(wStrb(0) && wData(0)) {
-              haltAfterArmed := True
+            if (stage >= 2) when(wStrb(0)) {
+              when(wData(0)) { haltAfterArmed := True }
+              when(wData(2)) { debugClearStickyRequest := True }
             }
-            // Bit 2 clear-sticky is implemented by Stage 2 Task 9.
           }
           is(DebugRegMap.OFF_RAM_WINDOW_LG2) {
             val req = merged(ramWindowWord)(5 downto 0).asUInt
@@ -568,7 +575,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // completed. Never let a transient/reset value acquire halt ownership; this is
       // the command-side counterpart of AXI READY being held low while dbgRst is active.
       dbgCommit.foreach(_.request(csr.debugStopRequest && !dbgRst,
-        csr.debugResumeRequest && !dbgRst, csr.debugStepRequest && !dbgRst))
+        csr.debugResumeRequest && !dbgRst, csr.debugStepRequest && !dbgRst,
+        csr.debugClearStickyRequest && !dbgRst))
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
     }

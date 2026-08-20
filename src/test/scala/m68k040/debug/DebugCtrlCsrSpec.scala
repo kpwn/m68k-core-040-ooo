@@ -274,6 +274,7 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       dut.commitStub.logic.lastPcDrive #= 0x4080122CL
       dut.commitStub.logic.effectiveHaltDrive #= true
       dut.commitStub.logic.autoHaltDrive #= true
+      dut.commitStub.logic.haltReasonDrive #= 4
       dut.clockDomain.waitSampling(2)
 
       val status = DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_STATUS.toLong)
@@ -285,6 +286,30 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
         DebugRegMap.OFF_PC.toLong) == 0x40801234L)
       assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
         DebugRegMap.OFF_LAST_PC.toLong) == 0x4080122CL)
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_HALT_REASON.toLong) == 4)
+    }
+  }
+
+  test("Stage 2 HALT_CTL bit 2 emits one clear-sticky command and is not state") {
+    M68kSim().compile(new DebugCtrlDut(stageArg = 2, withCommitStubArg = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      cd.waitSampling(20)
+      var clears = 0
+      val watcher = fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.commitStub.logic.clearStickyRequest.toBoolean) clears += 1
+        }
+      }
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong, 1L << 2)
+      cd.waitSampling(4)
+      watcher.terminate()
+      assert(clears == 1, s"clear-sticky produced $clears command pulses")
+      assert((DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_HALT_CTL.toLong) & (1L << 2)) == 0,
+        "clear-sticky command must not read back as state")
     }
   }
 
