@@ -51,14 +51,13 @@ ARCH_BUSY = 1 << 0
 ARCH_DONE = 1 << 1
 ARCH_REJECTED = 1 << 2
 
-# OFF_DCACHE_OP / OFF_ICACHE_OP status, spec 8.2: "read bit 0 BUSY, bit 1 DONE,
-# bits 3:2 selected cache(s)". The append-only location of REJECTED/ERROR is
-# spec section 14 item 4 and is STILL OPEN, so nothing here invents a bit for
-# them; the rule pinned instead is the one spec 8.2 states outright -- a rejected
-# command "must not silently leave BUSY=0/DONE=0".
+# OFF_DCACHE_OP / OFF_ICACHE_OP shared status, spec 8.2: BUSY=0, DONE=1,
+# selected cache(s)=3:2, REJECTED=4, ERROR=5.
 CACHE_BUSY = 1 << 0
 CACHE_DONE = 1 << 1
 CACHE_SEL_MASK = 0b1100
+CACHE_REJECTED = 1 << 4
+CACHE_ERROR = 1 << 5
 
 
 def _indexed_offsets(prefix, base, count):
@@ -224,15 +223,21 @@ def arch_apply_poll(samples):
 
 
 def cache_op_poll(samples):
-    """Reduce a sequence of OFF_DCACHE_OP/OFF_ICACHE_OP reads to DONE.
+    """Reduce OFF_DCACHE_OP/OFF_ICACHE_OP reads to a successful DONE.
 
-    Spec 8.2: a rejected command "must not silently leave BUSY=0/DONE=0", and
-    "DONE is set only after the real walk and all writeback responses finish"."""
+    REJECTED means the operation was never accepted. ERROR means an accepted
+    operation completed with a failed maintenance response. Neither establishes
+    a coherent debugger view, so both are protocol errors to the caller."""
     if not samples:
         raise ProtocolError("no cache-op status samples")
     for word in samples:
-        if (word & CACHE_BUSY) and (word & CACHE_DONE):
-            raise ProtocolError("cache status 0x%X asserts BUSY and DONE together" % word)
+        terminal = word & (CACHE_DONE | CACHE_REJECTED | CACHE_ERROR)
+        if (word & CACHE_BUSY) and terminal:
+            raise ProtocolError("cache status 0x%X asserts BUSY with terminal status" % word)
+        if word & CACHE_REJECTED:
+            raise ProtocolError("cache operation rejected (status 0x%X)" % word)
+        if word & CACHE_ERROR:
+            raise ProtocolError("cache operation failed (status 0x%X)" % word)
         if word & CACHE_DONE:
             return "DONE"
         if not (word & CACHE_BUSY):

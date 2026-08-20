@@ -49,8 +49,8 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       dut.rob.logic.flush.valid #= false
       dut.memory.logic.quiescedDrive #= true
       dut.memory.logic.doneDrive #= false
+      dut.memory.logic.errorDrive #= false
       cd.waitSampling(20)
-
       // Seed a deliberately non-identity system snapshot. S=1,M=1 selects MSP as A7.
       dut.rob.logic.exc.ss.srSys #= 0x30
       dut.rob.logic.committedCcr #= 0x15
@@ -100,6 +100,7 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       dut.rob.logic.flush.valid #= false
       dut.memory.logic.quiescedDrive #= true
       dut.memory.logic.doneDrive #= false
+      dut.memory.logic.errorDrive #= false
       dut.maps.logic.intMap(0) #= 20
       dut.maps.logic.intMap(8) #= 21
       dut.maps.logic.nzvcMap #= 7
@@ -122,7 +123,7 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
         }
       }
       fork {
-        while (!dut.memory.logic.start.toBoolean) cd.waitSampling()
+        while (!dut.memory.logic.command.valid.toBoolean) cd.waitSampling()
         maintenanceStarts += 1
         cd.waitSampling(5)
         dut.memory.logic.doneDrive #= true
@@ -172,6 +173,74 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       coreStatus = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS)
       assert((coreStatus & 1L) != 0 && (coreStatus & 8L) == 0,
         f"architectural apply released halt: STATUS=0x$coreStatus%x")
+    }
+  }
+
+  test("Stage 4 cache maintenance waits for quiescence and reports reject, done, and error") {
+    M68kSim().compile(new Dut(stageArg = 4)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+      dut.rob.logic.completion(0).valid #= false; dut.rob.logic.completion(1).valid #= false
+      dut.rob.logic.flush.valid #= false
+      dut.memory.logic.quiescedDrive #= false
+      dut.memory.logic.doneDrive #= false
+      dut.memory.logic.errorDrive #= false
+      cd.waitSampling(20)
+      val commands = ArrayBuffer[(Int, Boolean, Boolean)]()
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.memory.logic.command.valid.toBoolean) {
+            commands += ((dut.memory.logic.command.payload.sel.toInt,
+              dut.memory.logic.command.payload.push.toBoolean,
+              dut.memory.logic.command.payload.invalidate.toBoolean))
+          }
+        }
+      }
+
+      val features = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_FEATURES)
+      assert((features & (1L << 21)) != 0, f"cache-maint-only not advertised: 0x$features%x")
+      assert((features & (1L << 11)) == 0, f"unimplemented D-cache probe advertised: 0x$features%x")
+
+      // Running requests fail visibly and never reach the shared maintenance owner.
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_DCACHE_OP, 3)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_DCACHE_OP) == 0x10)
+      assert(!dut.memory.logic.command.valid.toBoolean)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL, 1)
+      var status = 0L; var waited = 0
+      while ((status & 1L) == 0 && waited < 100) {
+        status = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS); waited += 1
+      }
+      assert((status & 1L) != 0)
+
+      // D push is accepted at halt but cannot launch until SQ/cache quiescence.
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_DCACHE_OP, 3)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ICACHE_OP) == 0x5)
+      cd.waitSampling(4)
+      assert(!dut.memory.logic.command.valid.toBoolean)
+      dut.memory.logic.quiescedDrive #= true
+      waited = 0
+      while (commands.isEmpty && waited < 20) { cd.waitSampling(); waited += 1 }
+      assert(commands.head == ((1, true, false)))
+      cd.waitSampling()
+      dut.memory.logic.errorDrive #= true; dut.memory.logic.doneDrive #= true
+      cd.waitSampling()
+      dut.memory.logic.errorDrive #= false; dut.memory.logic.doneDrive #= false
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_DCACHE_OP) == 0x26)
+
+      // A subsequent I invalidate clears the prior error and uses the same status.
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ICACHE_OP, 1)
+      waited = 0
+      while (commands.size < 2 && waited < 20) { cd.waitSampling(); waited += 1 }
+      assert(commands(1) == ((2, false, true)))
+      cd.waitSampling()
+      dut.memory.logic.doneDrive #= true
+      cd.waitSampling()
+      dut.memory.logic.doneDrive #= false
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ICACHE_OP) == 0x0a)
     }
   }
 

@@ -142,9 +142,13 @@ def main():
           p.cache_op_poll([p.CACHE_BUSY, p.CACHE_BUSY, p.CACHE_DONE]) == "DONE")
     check("the selected-cache field is preserved alongside DONE",
           p.cache_op_poll([p.CACHE_BUSY, p.CACHE_DONE | 0b0100]) == "DONE")
+    raises("an immediate rejected request is reported", p.ProtocolError,
+           p.cache_op_poll, [p.CACHE_REJECTED | 0b0100])
+    raises("a failed writeback is not reported as coherent", p.ProtocolError,
+           p.cache_op_poll, [p.CACHE_BUSY, p.CACHE_DONE | p.CACHE_ERROR | 0b0100])
     raises("a command that goes idle with neither BUSY nor DONE is rejected-in-silence",
            p.ProtocolError, p.cache_op_poll, [p.CACHE_BUSY, 0])
-    raises("BUSY and DONE together is an illegal encoding", p.ProtocolError,
+    raises("BUSY and terminal status together is an illegal encoding", p.ProtocolError,
            p.cache_op_poll, [p.CACHE_BUSY | p.CACHE_DONE])
     raises("polling an empty sample list is a harness error", p.ProtocolError,
            p.cache_op_poll, [])

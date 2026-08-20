@@ -108,8 +108,8 @@ REG OFF_DCACHE_PROBE_SEL   0x00200 RW    4 0x00000000 D-cache probe way/set sele
 REG OFF_DCACHE_PROBE_TAG   0x00204 RO    4 0x00000000 D-cache probe tag readback.
 REG OFF_DCACHE_PROBE_FLAGS 0x00208 RO    4 0x00000000 D-cache probe valid/dirty flags.
 REG OFF_DCACHE_PROBE_DATA  0x0020C RO    4 0x00000000 D-cache probe data word.
-REG OFF_DCACHE_OP          0x00210 MIXED 4 0x00000000 Write bit0 START, bit1 push-vs-invalidate; read bit0 BUSY, bit1 DONE, bits[3:2] cache select.
-REG OFF_ICACHE_OP          0x00214 MIXED 4 0x00000000 I-cache invalidate command/status; shares status with OFF_DCACHE_OP.
+REG OFF_DCACHE_OP          0x00210 MIXED 4 0x00000000 Write bit0 START, bit1 push-vs-invalidate; read bit0 BUSY, bit1 DONE, bits[3:2] cache select, bit4 REJECTED, bit5 ERROR.
+REG OFF_ICACHE_OP          0x00214 MIXED 4 0x00000000 I-cache invalidate command/status; shares BUSY/DONE/select/REJECTED/ERROR status with OFF_DCACHE_OP.
 
 # ------------------------------------------------------------- telemetry --
 REG OFF_CYCLE_LO          0x01000 RO    7 0x00000000 Free-running cycle count, low word.

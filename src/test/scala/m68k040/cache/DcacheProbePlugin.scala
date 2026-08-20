@@ -25,6 +25,7 @@ class DcacheProbePlugin extends FiberPlugin {
     // P5.5, so this overrides it rather than using `<<`.
     val maintCmdIn      = slave(Flow(CacheMaintCmd()))
     val maintDoneOut    = out(Bool())
+    val maintErrorOut   = out(Bool())
     val maintQuiescedOut = out(Bool())
 
     ds.loadProbe << loadProbeIn
@@ -36,6 +37,7 @@ class DcacheProbePlugin extends FiberPlugin {
     ds.maintCmd.valid   := maintCmdIn.valid
     ds.maintCmd.payload := maintCmdIn.payload
     maintDoneOut        := ds.maintDone
+    maintErrorOut       := ds.maintError
     maintQuiescedOut    := ds.maintQuiesced
 
     // Dcache consumes only resolved commands; keep the otherwise-unused identity

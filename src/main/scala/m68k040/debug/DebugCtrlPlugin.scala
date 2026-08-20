@@ -1,7 +1,7 @@
 package m68k040.debug
 
 import m68k040.services.{DebugCommitService, DebugSystemStateService, DebugMemoryService,
-  DebugHistoryService}
+  DebugHistoryService, DebugMemoryCommand}
 import m68k040.services.CommittedMapService
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
   RegFileReadPort, RegFileWritePort}
@@ -154,12 +154,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val historyEnabled = enable && stage >= 3 && historyDepth > 0
     val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
     val historyBuilt = historyEnabled && debugHistory.nonEmpty
-    val historyFeatureNames = Set("pc_trace", "exc_ring", "branch_ring")
-    val advertisedFeatures =
-      if (historyBuilt) DebugRegMap.featuresForStage(stage)
-      else DebugRegMap.features
-        .filter(f => f._3 <= stage && !historyFeatureNames.contains(f._1))
-        .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
+    val unavailableFeatures = Set("dcache_probe") ++
+      (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
+      (if (debugMemory.nonEmpty) Set.empty[String] else Set("cache_maint_only"))
+    val advertisedFeatures = DebugRegMap.features
+      .filter(f => f._3 <= stage && !unavailableFeatures.contains(f._1))
+      .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
 
     // A NAMED (not anonymous) local class, so its type stays visible OUTSIDE the
     // `enable` gate below: Stage-1 whitebox tests (`DebugCtrlCsrSpec`, `DebugCtrlResetSpec`,
@@ -466,9 +466,20 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       }
 
       val systemApply = if (stage >= 3) spinal.lib.Flow(m68k040.services.DebugSystemApply()) else null
-      val debugMaintStart = if (stage >= 3) Bool() else False
+      val debugMaintCmd = if (stage >= 3) spinal.lib.Flow(DebugMemoryCommand()) else null
+      val cacheOpBusy = if (stage >= 4) RegInit(False) else False
+      val cacheOpDone = if (stage >= 4) RegInit(False) else False
+      val cacheOpRejected = if (stage >= 4) RegInit(False) else False
+      val cacheOpError = if (stage >= 4) RegInit(False) else False
+      val cacheOpLaunched = if (stage >= 4) RegInit(False) else False
+      val cacheOpSel = if (stage >= 4) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
+      val cacheOpPush = if (stage >= 4) RegInit(False) else False
+      val cacheOpInvalidate = if (stage >= 4) RegInit(False) else False
       if (stage >= 3) {
-        debugMaintStart := False
+        debugMaintCmd.valid := False
+        debugMaintCmd.payload.push := False
+        debugMaintCmd.payload.invalidate := False
+        debugMaintCmd.payload.sel := 0
         systemApply.valid := False
         systemApply.payload.srValid := False; systemApply.payload.pcValid := False
         systemApply.payload.vbrValid := False; systemApply.payload.uspValid := False
@@ -530,6 +541,52 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       def haltAfterConsumed: Bool =
         if (stage >= 2) dbgCommit.map(_.haltAfterConsumed).getOrElse(False) else False
 
+      if (stage >= 4) {
+        cacheOpBusy.simPublic(); cacheOpDone.simPublic(); cacheOpRejected.simPublic()
+        cacheOpError.simPublic(); cacheOpLaunched.simPublic(); cacheOpSel.simPublic()
+        val dcacheStart = doWrite && awAddr === DebugRegMap.OFF_DCACHE_OP &&
+          wStrb(0) && wData(0)
+        val icacheStart = doWrite && awAddr === DebugRegMap.OFF_ICACHE_OP &&
+          wStrb(0) && wData(0)
+        val cacheStart = dcacheStart || icacheStart
+        val memoryCapable = Bool(debugMemory.nonEmpty)
+        val memoryQuiesced = debugMemory.map(_.quiesced).getOrElse(False)
+        val memoryDone = debugMemory.map(_.done).getOrElse(False)
+        val memoryError = debugMemory.map(_.error).getOrElse(False)
+
+        when(cacheStart) {
+          cacheOpDone := False
+          cacheOpRejected := False
+          cacheOpError := False
+          when(cacheOpBusy || archApplyBusy || !effectiveHalt || !memoryCapable) {
+            cacheOpRejected := True
+          }.otherwise {
+            cacheOpBusy := True
+            cacheOpLaunched := False
+            cacheOpSel := Mux(dcacheStart, U(1, 2 bits), U(2, 2 bits))
+            cacheOpPush := dcacheStart && wData(1)
+            cacheOpInvalidate := icacheStart || (dcacheStart && !wData(1))
+          }
+        }.elsewhen(cacheOpBusy) {
+          when(!effectiveHalt) {
+            cacheOpBusy := False
+            cacheOpLaunched := False
+            cacheOpRejected := True
+          }.elsewhen(!cacheOpLaunched && memoryQuiesced) {
+            debugMaintCmd.valid := True
+            debugMaintCmd.payload.push := cacheOpPush
+            debugMaintCmd.payload.invalidate := cacheOpInvalidate
+            debugMaintCmd.payload.sel := cacheOpSel
+            cacheOpLaunched := True
+          }.elsewhen(cacheOpLaunched && memoryDone) {
+            cacheOpBusy := False
+            cacheOpLaunched := False
+            cacheOpDone := True
+            cacheOpError := memoryError
+          }
+        }
+      }
+
       if (stage >= 3) {
         val applyStart = doWrite && (awAddr === DebugRegMap.OFF_ARCH_APPLY) &&
           wStrb(0) && wData(0)
@@ -547,7 +604,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         }
         when(applyStart) {
           archApplyDone := False
-          when(archApplyBusy || !effectiveHalt || !applyCapable || requestedNeedsMemoryService) {
+          when(archApplyBusy || cacheOpBusy || !effectiveHalt || !applyCapable || requestedNeedsMemoryService) {
             archApplyRejected := True
           }.otherwise {
             archApplyBusy := True
@@ -570,7 +627,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             is(U(0, 2 bits)) {
               when(memoryQuiesced) {
                 when(archApplyDirty(21)) {
-                  debugMaintStart := True
+                  debugMaintCmd.valid := True
+                  debugMaintCmd.payload.push := True
+                  debugMaintCmd.payload.invalidate := True
+                  debugMaintCmd.payload.sel := 3
                   archApplyPhase := 3
                 }.otherwise {
                   archApplyPhase := 1
@@ -636,7 +696,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               archApplyComplete := True
             }
             is(U(3, 2 bits)) {
-              when(memoryMaintDone) { archApplyPhase := 1 }
+              when(memoryMaintDone) {
+                when(debugMemory.map(_.error).getOrElse(False)) {
+                  archApplyBusy := False
+                  archApplyRejected := True
+                }.otherwise {
+                  archApplyPhase := 1
+                }
+              }
             }
             }
           }
@@ -788,6 +855,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_ARCH_STATUS) {
             rData := B(0, 29 bits) ## archApplyRejected ## archApplyDone ## archApplyBusy
           }
+          is(DebugRegMap.OFF_DCACHE_OP) {
+            rData := B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
+              cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
+          }
+          is(DebugRegMap.OFF_ICACHE_OP) {
+            rData := B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
+              cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
+          }
           is(DebugRegMap.OFF_PC_TRACE_HEAD) {
             rData := pcTraceHead.resize(32).asBits
           }
@@ -913,6 +988,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           archDirty := B(0, 32 bits)
           archApplyRewrite := B(0, 32 bits)
         }
+        if (stage >= 4) {
+          cacheOpBusy := False
+          cacheOpDone := False
+          cacheOpRejected := False
+          cacheOpError := False
+          cacheOpLaunched := False
+          cacheOpSel := 0
+        }
       }
 
       // ── The spec-15.1 wipe, and the sticky latch it overrides ────────────────────
@@ -946,6 +1029,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // those two blocks is free.
       when(cpuRstEvent) {
         ctrlInitDoneOvr := False
+        if (stage >= 4) {
+          cacheOpBusy := False
+          cacheOpDone := False
+          cacheOpRejected := True
+          cacheOpError := True
+          cacheOpLaunched := False
+        }
         initDoneSticky  := False
         when(cpuResetCount =/= U(0xFFFF, 16 bits)) {
           cpuResetCount := cpuResetCount + 1
@@ -1018,15 +1108,20 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // completed. Never let a transient/reset value acquire halt ownership; this is
       // the command-side counterpart of AXI READY being held low while dbgRst is active.
       dbgCommit.foreach(_.request(csr.debugStopRequest && !dbgRst,
-        csr.debugResumeRequest && !dbgRst && !csr.archApplyBusy,
-        csr.debugStepRequest && !dbgRst && !csr.archApplyBusy,
+        csr.debugResumeRequest && !dbgRst && !csr.archApplyBusy && !csr.cacheOpBusy,
+        csr.debugStepRequest && !dbgRst && !csr.archApplyBusy && !csr.cacheOpBusy,
         csr.debugClearStickyRequest && !dbgRst))
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
     }
     if (enable && stage >= 3) {
       dbgSystem.foreach(_.requestApply(csr.systemApply))
-      debugMemory.foreach(_.requestPushInvalidateAll(csr.debugMaintStart && !dbgRst))
+      debugMemory.foreach { service =>
+        val cmd = spinal.lib.Flow(DebugMemoryCommand())
+        cmd.valid := csr.debugMaintCmd.valid && !dbgRst
+        cmd.payload := csr.debugMaintCmd.payload
+        service.request(cmd)
+      }
     }
 
     if (!enable) {

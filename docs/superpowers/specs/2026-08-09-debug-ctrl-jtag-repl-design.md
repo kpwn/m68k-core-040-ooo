@@ -648,9 +648,10 @@ The `OFF_DCACHE_OP`/`OFF_ICACHE_OP` encodings and status remain:
 - D-cache write bit 1 selects push versus invalidate;
 - read bit 0 BUSY, bit 1 DONE, bits 3:2 selected cache(s).
 
-The new implementation additionally records REJECTED and ERROR at append-only status
-locations or capability-defined high bits; it must not silently leave BUSY=0/DONE=0
-for a rejected command.
+The implementation records REJECTED in bit 4 and ERROR in bit 5 of both operation
+registers. The two addresses expose the same shared status word. A new START clears
+the previous DONE/REJECTED/ERROR result before accepting or rejecting that request; it
+must not silently leave BUSY=0/DONE=0 for a rejected command.
 
 A cache command is accepted only at effective halt. The shared maintenance owner
 reserves it atomically, sets BUSY, and waits for `DebugMemoryQuiesceService` before

@@ -146,6 +146,9 @@ trait DcacheService {
   def maintCmd: spinal.lib.Flow[CacheMaintCmd]
   /** 1-cycle pulse: the walk started by `maintCmd` has fully completed. */
   def maintDone: Bool
+  /** 1-cycle pulse, coincident with or before `maintDone`: at least one dirty-line
+    * writeback in the current walk completed with a non-OKAY AXI response. */
+  def maintError: Bool
   /** REQUIRED PRECONDITION for `maintCmd`, and the reason it exists: the whole
     * D-cache datapath (load FSM, refill/eviction engine, the store S0..S3 pipe and
     * BOTH sets of AXI write completion flags) is genuinely idle RIGHT NOW, so the

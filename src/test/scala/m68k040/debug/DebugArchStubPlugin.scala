@@ -2,7 +2,7 @@ package m68k040.debug
 
 import m68k040.execute.regfile._
 import m68k040.services.{CommittedMapService, DebugMemoryService, DebugHistoryService,
-  DebugBranchEvent, DebugExceptionEvent}
+  DebugBranchEvent, DebugExceptionEvent, DebugMemoryCommand}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -72,19 +72,24 @@ class DebugCommittedMapStubPlugin extends FiberPlugin with CommittedMapService {
 }
 
 class DebugMemoryStubPlugin extends FiberPlugin with DebugMemoryService {
-  private var startWire: Bool = null
+  private var cmdWire: spinal.lib.Flow[DebugMemoryCommand] = null
   during setup {
-    startWire = Bool(); startWire.allowOverride; startWire := False
+    cmdWire = spinal.lib.Flow(DebugMemoryCommand())
+    cmdWire.valid.allowOverride; cmdWire.valid := False
+    cmdWire.payload.flatten.foreach(_.allowOverride)
+    cmdWire.payload.push := False; cmdWire.payload.invalidate := False; cmdWire.payload.sel := 0
   }
   val logic = during build new Area {
     val quiescedDrive = in(Bool())
     val doneDrive = in(Bool())
-    val start = out(Bool())
-    start := startWire
+    val errorDrive = in(Bool())
+    val command = out(spinal.lib.Flow(DebugMemoryCommand()))
+    command := cmdWire
   }
   override def quiesced: Bool = logic.quiescedDrive
   override def done: Bool = logic.doneDrive
-  override def requestPushInvalidateAll(start: Bool): Unit = startWire := start
+  override def error: Bool = logic.errorDrive
+  override def request(cmd: spinal.lib.Flow[DebugMemoryCommand]): Unit = cmdWire := cmd
 }
 
 class DebugHistoryStubPlugin extends FiberPlugin with DebugHistoryService {

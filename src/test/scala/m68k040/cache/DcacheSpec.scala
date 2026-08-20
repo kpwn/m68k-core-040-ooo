@@ -1283,6 +1283,51 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
+  test("a failed CPUSH reports maintError and preserves the dirty line for retry",
+       VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4100L
+      preload(mem, base, 16)
+      load(dut, cd, base, Size.LONG, CacheMode.WRITETHROUGH)
+      doStore(dut, cd, base + 4, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.COPYBACK)
+      assert(anyDirtyIn(dut, base), "precondition: line must be dirty")
+
+      dut.dcache.logic.diagFaultExpected #= true
+      mem.armWriteFault(base)
+      var sawMaintError = false
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.probe.logic.maintErrorOut.toBoolean) sawMaintError = true
+        }
+      }
+
+      maintPulse(dut, cd, push = true, invalidate = true, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd)
+      cd.waitSampling(2)
+
+      assert(sawMaintError, "the failed writeback must pulse maintError")
+      assert(anyDirtyIn(dut, base),
+        "a failed push must retain dirty state so the only current copy is retryable")
+      assert(mem.peekByte(base + 4) == memByte(base + 4),
+        "the injected failed writeback must not have updated memory")
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("DEADBEEF", 16),
+        "a failed push+invalidate must leave the dirty line resident and intact")
+
+      // The fault is one-shot. A retry must now establish memory truth and invalidate.
+      dut.dcache.logic.diagFaultExpected #= false
+      maintPulse(dut, cd, push = true, invalidate = true, SCOPE_LINE, SEL_DC, base)
+      maintWait(dut, cd)
+      cd.waitSampling(2)
+      assert(!anyDirtyIn(dut, base), "the successful retry must clear dirty state")
+      assert(mem.peekByte(base + 4) == 0xDE && mem.peekByte(base + 7) == 0xEF,
+        "the successful retry must write the retained line to memory")
+      assert(load(dut, cd, base + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("DEADBEEF", 16),
+        "the retry's invalidation must refill the now-current memory value")
+    }
+  }
+
   // (P5.4-b) CINV, Line scope: drops the line with NO writeback -- the dirty data is
   // deliberately discarded (that is what CINV means), so memory keeps the old value
   // and the next load refills from memory.

@@ -1871,6 +1871,9 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val maintDoneReg = RegInit(False)
     maintDoneReg := False
     maintDoneReg.simPublic()
+    val maintErrorReg = RegInit(False)
+    maintErrorReg := False
+    maintErrorReg.simPublic()
 
     val maint = new Area {
       val cmd     = Reg(CacheMaintCmd())
@@ -2027,7 +2030,9 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             // `storeBAck`'s `=== 1` comment below): ignore anything else and keep
             // waiting. `axi.b.ready` is held True globally.
             when(axi.b.valid && axi.b.payload.id === U(AxiIds.D_EVICT, AxiIds.ID_W bits)) {
-              when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
+              val writebackOk = axi.b.payload.resp === Axi4.resp.OKAY
+              when(!writebackOk) {
+                maintErrorReg       := True
                 // Imprecise DIAGNOSTIC only, per the design's locked decision that a
                 // writeback error is a diagnostic crash and not an architectural trap.
                 diagFaultPulse     := True
@@ -2035,18 +2040,21 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                 diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
                 diagFaultPulseKind := U(3, 3 bits)   // kind=3: CPUSH maintenance writeback
               }
-              // The line is now clean in memory. CPUSH-without-invalidate keeps it
-              // resident-and-clean; the invalidating form drops it.
-              for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
-                dirtysWrEn(w)   := True
-                dirtysWrSet(w)  := walkSet
-                dirtysWrData(w) := False
-                dirtysVoteD4(w) := True   // Task #255 exclusivity tripwire (D4)
-                when(cmd.invalidate) {
-                  validsWrEn(w)   := True
-                  validsWrSet(w)  := walkSet
-                  validsWrData(w) := False
-                  validsVoteW3(w) := True   // Task #255 exclusivity tripwire (W3)
+              // Only a successful response makes memory authoritative. On an error,
+              // preserve the valid+dirty line so a debugger can report failure and
+              // retry without having silently discarded the only current copy.
+              when(writebackOk) {
+                for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
+                  dirtysWrEn(w)   := True
+                  dirtysWrSet(w)  := walkSet
+                  dirtysWrData(w) := False
+                  dirtysVoteD4(w) := True   // Task #255 exclusivity tripwire (D4)
+                  when(cmd.invalidate) {
+                    validsWrEn(w)   := True
+                    validsWrSet(w)  := walkSet
+                    validsWrData(w) := False
+                    validsVoteW3(w) := True   // Task #255 exclusivity tripwire (W3)
+                  }
                 }
               }
               goto(NEXTW)
@@ -2618,6 +2626,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
   override def diagFault = logic.diagFaultValid
   override def maintCmd  = logic.maintCmdPort
   override def maintDone = logic.maintDoneReg
+  override def maintError = logic.maintErrorReg
   // Exported precondition (see DcacheService.maintQuiesced's contract): the whole
   // D-cache datapath is idle AND no walk is already running.
   override def maintQuiesced = logic.dcIdleForMaint && !logic.maintBusyReg

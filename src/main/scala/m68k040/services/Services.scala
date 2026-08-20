@@ -131,10 +131,16 @@ trait DebugSystemStateService {
   * or predictors. A completed request has pushed every dirty D-cache line, invalidated
   * both L1s and the fetch predictors, and left memory as the debugger-visible truth.
   * PRODUCER: `BackendWiringPlugin` (exactly one). */
+case class DebugMemoryCommand() extends Bundle {
+  val push, invalidate = Bool()
+  val sel = UInt(2 bits) // CacheMaintCmd encoding: DC=1, IC=2, both=3.
+}
+
 trait DebugMemoryService {
   def quiesced: Bool
   def done: Bool
-  def requestPushInvalidateAll(start: Bool): Unit
+  def error: Bool
+  def request(cmd: Flow[DebugMemoryCommand]): Unit
 }
 
 case class DebugBranchEvent() extends Bundle {

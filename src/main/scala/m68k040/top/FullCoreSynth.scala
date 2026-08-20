@@ -14,7 +14,8 @@ import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, LsEuService, Di
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginFp, RegFilePluginFpcc, RegFilePluginInt,
   RegFilePluginNzvc, RegFilePluginX}
-import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService, DebugMemoryService}
+import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService,
+  DebugMemoryService, DebugMemoryCommand}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -44,13 +45,20 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   // FPSR write. See RenameStage.committedPhysFpcc's doc comment.
   var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
-  private var debugMaintStartIn: Bool = null
+  private var debugMaintCmdIn: Flow[DebugMemoryCommand] = null
   private var debugQuiescedOut: Bool = null
   private var debugMaintDoneOut: Bool = null
+  private var debugMaintErrorOut: Bool = null
   during setup {
-    debugMaintStartIn = Bool(); debugMaintStartIn.allowOverride; debugMaintStartIn := False
+    debugMaintCmdIn = Flow(DebugMemoryCommand())
+    debugMaintCmdIn.valid.allowOverride; debugMaintCmdIn.valid := False
+    debugMaintCmdIn.payload.flatten.foreach(_.allowOverride)
+    debugMaintCmdIn.payload.push := False
+    debugMaintCmdIn.payload.invalidate := False
+    debugMaintCmdIn.payload.sel := 0
     debugQuiescedOut = Bool()
     debugMaintDoneOut = Bool()
+    debugMaintErrorOut = Bool()
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -433,27 +441,39 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     dc.maintCmd.payload := exc.maintCmdOut.payload
     if (debugStage >= 3) {
       val debugMaintActive = RegInit(False)
+      val debugMaintFailed = RegInit(False)
+      val debugMaintSel = Reg(UInt(2 bits)) init 0
       val debugMaintDone = debugMaintActive && dc.maintDone
-      when(debugMaintStartIn) { debugMaintActive := True }
-      when(debugMaintDone) { debugMaintActive := False }
-      debugMaintDonePulse := debugMaintDone
+      when(debugMaintCmdIn.valid) {
+        debugMaintActive := True
+        debugMaintFailed := False
+        debugMaintSel := debugMaintCmdIn.payload.sel
+      }
+      when(debugMaintActive && dc.maintError) { debugMaintFailed := True }
+      when(debugMaintDone) {
+        debugMaintActive := False
+        debugMaintFailed := False
+      }
+      debugMaintDonePulse := debugMaintDone && debugMaintSel(1)
       debugQuiescedOut := host[LsEuService].sqDrained && dc.maintQuiesced && !debugMaintActive
       debugMaintDoneOut := debugMaintDone
-      when(debugMaintStartIn) {
+      debugMaintErrorOut := debugMaintDone && (debugMaintFailed || dc.maintError)
+      when(debugMaintCmdIn.valid) {
         dc.maintCmd.valid := True
-        dc.maintCmd.payload.push := True
-        dc.maintCmd.payload.invalidate := True
-        dc.maintCmd.payload.scope := 0 // all
-        dc.maintCmd.payload.sel := 3   // both D-cache and I-cache
+        dc.maintCmd.payload.push := debugMaintCmdIn.payload.push
+        dc.maintCmd.payload.invalidate := debugMaintCmdIn.payload.invalidate
+        dc.maintCmd.payload.scope := 3 // all
+        dc.maintCmd.payload.sel := debugMaintCmdIn.payload.sel
         dc.maintCmd.payload.addr := 0
       }
     } else {
       debugQuiescedOut := True
       debugMaintDoneOut := False
+      debugMaintErrorOut := False
     }
     exc.maintDoneIn         := dc.maintDone
     GenerationFlags.simulation {
-      assert(!(debugMaintStartIn && exc.maintCmdOut.valid),
+      assert(!(debugMaintCmdIn.valid && exc.maintCmdOut.valid),
         "BackendWiringPlugin: debug and architectural cache maintenance collided", FAILURE)
     }
     // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
@@ -541,9 +561,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
 
   override def quiesced: Bool = debugQuiescedOut
   override def done: Bool = debugMaintDoneOut
-  override def requestPushInvalidateAll(start: Bool): Unit = {
-    debugMaintStartIn := start
-  }
+  override def error: Bool = debugMaintErrorOut
+  override def request(cmd: Flow[DebugMemoryCommand]): Unit = debugMaintCmdIn := cmd
 }
 
 /** Full integrated execute core (slice 3c) for OOC synthesis: frontend → rename →
@@ -649,6 +668,14 @@ object GenFullCoreSynthStage3Verilog {
     GenFullCoreSynthVerilog.buildWith(
       GenFullCoreSynthVerilog.readDbgBuildIdEnv(), vioEnable = false,
       outputName = "M68kFullCoreSynthStage3", debugStage = 3)
+  }
+}
+
+object GenFullCoreSynthStage4Verilog {
+  def main(args: Array[String]): Unit = {
+    GenFullCoreSynthVerilog.buildWith(
+      GenFullCoreSynthVerilog.readDbgBuildIdEnv(), vioEnable = false,
+      outputName = "M68kFullCoreSynthStage4", debugStage = 4)
   }
 }
 
