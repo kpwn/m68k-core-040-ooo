@@ -21,6 +21,7 @@ trait LsEuService {
   def sqCommitB: Flow[UInt]    // retire slot 1 — a store CAN dual-retire at h1 (behind
                                // a long-latency head); missing this slot loses the store
   def sqFlush: Bool            // mispredict squash
+  def sqDrained: Bool          // no committed/speculative store remains in the SQ
   // Dynamic load-wakeup broadcast: valid (with the produced pdst) the cycle a LOAD
   // completes and its data is in the PRF. Registered alongside the completion stage
   // so consumers do not have to reach into the (now-pipelined) internal s1 context.
@@ -105,6 +106,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   override def sqCommit: Flow[UInt]     = sqCommitPort
   override def sqCommitB: Flow[UInt]    = sqCommitBPort
   override def sqFlush: Bool            = sqFlushSig
+  override def sqDrained: Bool          = sqEmptySig
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort

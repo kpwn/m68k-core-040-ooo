@@ -1,8 +1,10 @@
 package m68k040.debug
 
-import m68k040.services.{DebugCommitService, DebugSystemStateService}
+import m68k040.services.{DebugCommitService, DebugSystemStateService, DebugMemoryService,
+  DebugHistoryService}
 import m68k040.services.CommittedMapService
-import m68k040.execute.regfile.{IntRegFileService, RegFileReadPort}
+import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService,
+  RegFileReadPort, RegFileWritePort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.slave
@@ -57,9 +59,12 @@ import spinal.lib.misc.plugin.FiberPlugin
 class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                       val porCycles: Int     = DebugRegMap.POR_CYCLES_DEFAULT,
                       val stage:     Int     = 1,
-                      val enable:    Boolean = true) extends FiberPlugin {
+                      val enable:    Boolean = true,
+                      val historyDepth: Int  = 32) extends FiberPlugin {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
+  require(historyDepth == 0 || historyDepth == 32,
+    s"DebugCtrlPlugin: initial forensic history is either disabled or depth 32 (got $historyDepth)")
   require(buildId >= 0 && buildId < (BigInt(1) << DebugRegMap.DBG_DW),
     s"DebugCtrlPlugin: buildId must fit ${DebugRegMap.DBG_DW} bits (got $buildId)")
 
@@ -68,10 +73,20 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
   // offset through the committed-map service. Optional lookup preserves the small
   // standalone CSR fixtures; the shipped Stage-3 full core provides both services.
   private var debugIntRead: RegFileReadPort = null
+  private var debugIntWrite: RegFileWritePort = null
+  private var debugNzvcWrite: RegFileWritePort = null
+  private var debugXWrite: RegFileWritePort = null
   during setup {
     if (enable && stage >= 3) {
       host.get[IntRegFileService].foreach { rf =>
         debugIntRead = rf.newRead(forceNoBypass = true)
+        debugIntWrite = rf.newWrite(latency = 1, sharingKey = "excA7", priority = 2)
+      }
+      host.get[NzvcRegFileService].foreach { rf =>
+        debugNzvcWrite = rf.newWrite(latency = 1, sharingKey = "rteNzvc", priority = 2)
+      }
+      host.get[XRegFileService].foreach { rf =>
+        debugXWrite = rf.newWrite(latency = 1, sharingKey = "rteX", priority = 2)
       }
     }
   }
@@ -135,6 +150,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val dbgCommit = if (enable && stage >= 2) host.get[DebugCommitService] else None
     val dbgSystem = if (enable && stage >= 3) host.get[DebugSystemStateService] else None
     val committedMap = if (enable && stage >= 3) host.get[CommittedMapService] else None
+    val debugMemory = if (enable && stage >= 3) host.get[DebugMemoryService] else None
+    val historyEnabled = enable && stage >= 3 && historyDepth > 0
+    val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
+    val historyBuilt = historyEnabled && debugHistory.nonEmpty
+    val historyFeatureNames = Set("pc_trace", "exc_ring", "branch_ring")
+    val advertisedFeatures =
+      if (historyBuilt) DebugRegMap.featuresForStage(stage)
+      else DebugRegMap.features
+        .filter(f => f._3 <= stage && !historyFeatureNames.contains(f._1))
+        .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
 
     // A NAMED (not anonymous) local class, so its type stays visible OUTSIDE the
     // `enable` gate below: Stage-1 whitebox tests (`DebugCtrlCsrSpec`, `DebugCtrlResetSpec`,
@@ -163,9 +188,104 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val rPend  = RegInit(False);                                   rPend.simPublic()
       val rData  = Reg(Bits(DebugRegMap.DBG_DW bits)) init 0;        rData.simPublic()
 
+      // ── 32-entry committed forensic histories ───────────────────────────────
+      // PC storage is split even/odd so a dual-macro retire writes each synchronous
+      // memory at most once while preserving program order. Branch and exception
+      // families are architecturally single-event-per-cycle and use one 128-bit word.
+      val pcTraceHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      val branchRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      val excRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      val pcTraceEven = if (historyBuilt)
+        (Mem(Bits(32 bits), 16) init Vector.fill(16)(B(0, 32 bits))) else null
+      val pcTraceOdd = if (historyBuilt)
+        (Mem(Bits(32 bits), 16) init Vector.fill(16)(B(0, 32 bits))) else null
+      val branchRing = if (historyBuilt)
+        (Mem(Bits(128 bits), 32) init Vector.fill(32)(B(0, 128 bits))) else null
+      val excRing = if (historyBuilt)
+        (Mem(Bits(128 bits), 32) init Vector.fill(32)(B(0, 128 bits))) else null
+      if (historyBuilt) {
+        pcTraceEven.addAttribute("ram_style", "block")
+        pcTraceOdd.addAttribute("ram_style", "block")
+        branchRing.addAttribute("ram_style", "block")
+        excRing.addAttribute("ram_style", "block")
+
+        val h = debugHistory.get
+        val pc0 = h.macroRetirePc(0)
+        val pc1 = h.macroRetirePc(1)
+        val pcCount = pc0.valid.asUInt.resize(2) + pc1.valid.asUInt.resize(2)
+        val firstPc = Mux(pc0.valid, pc0.payload, pc1.payload).asBits
+        val secondPc = pc1.payload.asBits
+        val nextPcIndex = (pcTraceHead + 1).resized
+        val evenWrite = Bool(); val oddWrite = Bool()
+        val evenAddr = UInt(4 bits); val oddAddr = UInt(4 bits)
+        val evenData = Bits(32 bits); val oddData = Bits(32 bits)
+        evenWrite := False; oddWrite := False
+        evenAddr := pcTraceHead(4 downto 1); oddAddr := pcTraceHead(4 downto 1)
+        evenData := firstPc; oddData := firstPc
+        when(pcCount === 1) {
+          when(pcTraceHead(0)) { oddWrite := True }.otherwise { evenWrite := True }
+        }.elsewhen(pcCount === 2) {
+          when(pcTraceHead(0)) {
+            oddWrite := True; oddData := firstPc
+            evenWrite := True; evenAddr := nextPcIndex(4 downto 1); evenData := secondPc
+          }.otherwise {
+            evenWrite := True; evenData := firstPc
+            oddWrite := True; oddAddr := nextPcIndex(4 downto 1); oddData := secondPc
+          }
+        }
+        pcTraceEven.write(evenAddr, evenData, evenWrite)
+        pcTraceOdd.write(oddAddr, oddData, oddWrite)
+        when(pcCount =/= 0) { pcTraceHead := pcTraceHead + pcCount.resized }
+
+        val br = h.branchRetire
+        val brMeta = B(0, 28 bits) ## br.payload.branchType.asBits ##
+          br.payload.mispredicted ## br.payload.taken
+        branchRing.write(branchRingHead,
+          B(0, 32 bits) ## brMeta ## br.payload.nextPc.asBits ## br.payload.pc.asBits,
+          br.valid)
+        when(br.valid) { branchRingHead := branchRingHead + 1 }
+
+        val ex = h.exceptionEntry
+        val exMeta = B(0, 24 bits) ## ex.payload.vector.asBits
+        excRing.write(excRingHead,
+          ex.payload.handlerPc.asBits ## ex.payload.faultAddress.asBits ##
+            ex.payload.exceptionPc.asBits ## exMeta,
+          ex.valid)
+        when(ex.valid) { excRingHead := excRingHead + 1 }
+      }
+
+      val pcBodyRead = if (historyBuilt)
+        arAddr >= DebugRegMap.OFF_PC_TRACE_BODY &&
+          arAddr < DebugRegMap.OFF_PC_TRACE_BODY + historyDepth * 4 else False
+      val excBodyRead = if (historyBuilt)
+        arAddr >= DebugRegMap.OFF_EXC_RING_BODY &&
+          arAddr < DebugRegMap.OFF_EXC_RING_BODY + historyDepth * 16 else False
+      val branchBodyRead = if (historyBuilt)
+        arAddr >= DebugRegMap.OFF_BRANCH_RING_BODY &&
+          arAddr < DebugRegMap.OFF_BRANCH_RING_BODY + historyDepth * 16 else False
+      val historyBodyRead = pcBodyRead || excBodyRead || branchBodyRead
+      val historyReadIssue = Bool()
+      val historyReadPending = RegNext(historyReadIssue) init False
+      val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
+      val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
+      val historyReadPcOdd = if (historyBuilt) RegInit(False) else False
+      val pcReadIndex = ((arAddr - DebugRegMap.OFF_PC_TRACE_BODY) >> 2).resize(5)
+      val excReadIndex = ((arAddr - DebugRegMap.OFF_EXC_RING_BODY) >> 4).resize(5)
+      val branchReadIndex = ((arAddr - DebugRegMap.OFF_BRANCH_RING_BODY) >> 4).resize(5)
+      val pcEvenRead = if (historyBuilt)
+        pcTraceEven.readSync(pcReadIndex(4 downto 1), historyReadIssue && pcBodyRead && !pcReadIndex(0))
+        else B(0, 32 bits)
+      val pcOddRead = if (historyBuilt)
+        pcTraceOdd.readSync(pcReadIndex(4 downto 1), historyReadIssue && pcBodyRead && pcReadIndex(0))
+        else B(0, 32 bits)
+      val excBodyWord = if (historyBuilt)
+        excRing.readSync(excReadIndex, historyReadIssue && excBodyRead) else B(0, 128 bits)
+      val branchBodyWord = if (historyBuilt)
+        branchRing.readSync(branchReadIndex, historyReadIssue && branchBodyRead) else B(0, 128 bits)
+
       dbgAxi.awready := !awPend && !bPend && !dbgRst
       dbgAxi.wready  := !wPend  && !bPend && !dbgRst
-      dbgAxi.arready := !arPend && !rPend && !dbgRst
+      dbgAxi.arready := !arPend && !rPend && !historyReadPending && !dbgRst
       dbgAxi.bvalid  := bPend
       dbgAxi.bresp   := DbgAxiLite.RESP_OKAY
       dbgAxi.rvalid  := rPend
@@ -189,7 +309,24 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * the implementation from the legacy fixed two-cycle latency. */
       val doRead = arPend && !rPend
       doRead.simPublic()
-      when(doRead)                  { arPend := False; rPend := True }
+      historyReadIssue := doRead && historyBodyRead
+      when(doRead) {
+        arPend := False
+        when(!historyBodyRead) { rPend := True }
+        if (historyBuilt) when(historyBodyRead) {
+          historyReadKind := Mux(pcBodyRead, U(0, 2 bits), Mux(excBodyRead, U(1, 2 bits), U(2, 2 bits)))
+          historyReadWord := arAddr(3 downto 2)
+          historyReadPcOdd := pcReadIndex(0)
+        }
+      }
+      when(historyReadPending) {
+        rPend := True
+        switch(historyReadKind) {
+          is(U(0, 2 bits)) { rData := Mux(historyReadPcOdd, pcOddRead, pcEvenRead) }
+          is(U(1, 2 bits)) { rData := excBodyWord.subdivideIn(32 bits)(historyReadWord) }
+          is(U(2, 2 bits)) { rData := branchBodyWord.subdivideIn(32 bits)(historyReadWord) }
+        }
+      }
       when(rPend && dbgAxi.rready)  { rPend := False }
 
       /** Apply the captured byte strobes to `cur` (spec 3.1: "honor `WSTRB` per byte for
@@ -301,10 +438,62 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val archShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
       val archDirty  = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       if (stage >= 3) { archShadow.simPublic(); archDirty.simPublic() }
+      val archWriteMask = if (stage >= 3) Bits(32 bits) else null
+      if (stage >= 3) archWriteMask := B(0, 32 bits)
       def archWord(index: Int): Bits = if (stage >= 3) archShadow(index) else B(0, 32 bits)
       def writeArch(index: Int): Unit = if (stage >= 3) when(wStrb.orR) {
         archShadow(index) := merged(archShadow(index))
         archDirty(index) := True
+        archWriteMask(index) := True
+      }
+
+      // Halted architectural apply. The transaction snapshots both values and dirty
+      // bits, then uses one shared direct-write port per renamed register class. A host
+      // may continue staging the next transaction while this one is busy; rewriteMask
+      // preserves those later dirty bits when the snapshotted transaction completes.
+      val archApplyBusy = if (stage >= 3) RegInit(False) else False
+      val archApplyDone = if (stage >= 3) RegInit(False) else False
+      val archApplyRejected = if (stage >= 3) RegInit(False) else False
+      val archApplyPhase = if (stage >= 3) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
+      val archApplyIndex = if (stage >= 3) Reg(UInt(4 bits)) init 0 else U(0, 4 bits)
+      val archApplyDirty = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
+      val archApplyRewrite = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
+      val archApplyShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
+      val archApplyComplete = if (stage >= 3) Bool() else False
+      if (stage >= 3) {
+        archApplyBusy.simPublic(); archApplyDone.simPublic(); archApplyRejected.simPublic()
+        archApplyDirty.simPublic(); archApplyComplete := False
+      }
+
+      val systemApply = if (stage >= 3) spinal.lib.Flow(m68k040.services.DebugSystemApply()) else null
+      val debugMaintStart = if (stage >= 3) Bool() else False
+      if (stage >= 3) {
+        debugMaintStart := False
+        systemApply.valid := False
+        systemApply.payload.srValid := False; systemApply.payload.pcValid := False
+        systemApply.payload.vbrValid := False; systemApply.payload.uspValid := False
+        systemApply.payload.mspValid := False; systemApply.payload.ispValid := False
+        systemApply.payload.cacrValid := False; systemApply.payload.sfcValid := False
+        systemApply.payload.dfcValid := False; systemApply.payload.tcValid := False
+        systemApply.payload.itt0Valid := False; systemApply.payload.itt1Valid := False
+        systemApply.payload.dtt0Valid := False; systemApply.payload.dtt1Valid := False
+        systemApply.payload.urpValid := False; systemApply.payload.srpValid := False
+        systemApply.payload.sr := 0; systemApply.payload.pc := 0; systemApply.payload.vbr := 0
+        systemApply.payload.usp := 0; systemApply.payload.msp := 0; systemApply.payload.isp := 0
+        systemApply.payload.cacr := 0; systemApply.payload.sfc := 0; systemApply.payload.dfc := 0
+        systemApply.payload.tc := 0; systemApply.payload.itt0 := 0; systemApply.payload.itt1 := 0
+        systemApply.payload.dtt0 := 0; systemApply.payload.dtt1 := 0
+        systemApply.payload.urp := 0; systemApply.payload.srp := 0
+      }
+
+      if (debugIntWrite != null) {
+        debugIntWrite.valid := False; debugIntWrite.address := 0; debugIntWrite.data := 0
+      }
+      if (debugNzvcWrite != null) {
+        debugNzvcWrite.valid := False; debugNzvcWrite.address := 0; debugNzvcWrite.data := 0
+      }
+      if (debugXWrite != null) {
+        debugXWrite.valid := False; debugXWrite.address := 0; debugXWrite.data := 0
       }
 
       def effectiveHalt: Bool =
@@ -340,6 +529,119 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         else U(0, 64 bits)
       def haltAfterConsumed: Bool =
         if (stage >= 2) dbgCommit.map(_.haltAfterConsumed).getOrElse(False) else False
+
+      if (stage >= 3) {
+        val applyStart = doWrite && (awAddr === DebugRegMap.OFF_ARCH_APPLY) &&
+          wStrb(0) && wData(0)
+        val applyClear = doWrite && (awAddr === DebugRegMap.OFF_ARCH_APPLY) &&
+          wStrb(0) && wData(1)
+        val applyCapable = Bool(debugIntWrite != null && debugNzvcWrite != null &&
+          debugXWrite != null && committedMap.nonEmpty && dbgSystem.nonEmpty)
+        val memoryQuiesced = debugMemory.map(_.quiesced).getOrElse(True)
+        val memoryMaintDone = debugMemory.map(_.done).getOrElse(False)
+        val requestedNeedsMemoryService = archDirty(21) && !Bool(debugMemory.nonEmpty)
+
+        when(applyClear) {
+          archApplyDone := False
+          archApplyRejected := False
+        }
+        when(applyStart) {
+          archApplyDone := False
+          when(archApplyBusy || !effectiveHalt || !applyCapable || requestedNeedsMemoryService) {
+            archApplyRejected := True
+          }.otherwise {
+            archApplyBusy := True
+            archApplyRejected := False
+            archApplyPhase := 0
+            archApplyIndex := 0
+            archApplyDirty := archDirty
+            archApplyRewrite := 0
+            for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
+          }
+        }.elsewhen(archApplyBusy) {
+          when(!effectiveHalt) {
+            // Defensive domain-startup/resume-race guard: no direct architectural
+            // write is ever allowed without the commit owner's live halt grant.
+            archApplyBusy := False
+            archApplyRejected := True
+          }.otherwise {
+            when(archWriteMask.orR) { archApplyRewrite := archApplyRewrite | archWriteMask }
+            switch(archApplyPhase) {
+            is(U(0, 2 bits)) {
+              when(memoryQuiesced) {
+                when(archApplyDirty(21)) {
+                  debugMaintStart := True
+                  archApplyPhase := 3
+                }.otherwise {
+                  archApplyPhase := 1
+                }
+              }
+            }
+            is(U(1, 2 bits)) {
+              if (debugIntWrite != null) {
+                debugIntWrite.valid := archApplyDirty(archApplyIndex)
+                debugIntWrite.address := committedMap.get.intPhys(
+                  archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
+                debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+              }
+              when(archApplyIndex === 15) { archApplyPhase := 2 }
+                .otherwise { archApplyIndex := archApplyIndex + 1 }
+            }
+            is(U(2, 2 bits)) {
+              systemApply.valid := True
+              systemApply.payload.uspValid := archApplyDirty(16)
+              systemApply.payload.mspValid := archApplyDirty(17)
+              systemApply.payload.ispValid := archApplyDirty(18)
+              systemApply.payload.srValid := archApplyDirty(19)
+              systemApply.payload.vbrValid := archApplyDirty(20)
+              systemApply.payload.cacrValid := archApplyDirty(21)
+              systemApply.payload.tcValid := archApplyDirty(22)
+              systemApply.payload.itt0Valid := archApplyDirty(23)
+              systemApply.payload.itt1Valid := archApplyDirty(24)
+              systemApply.payload.dtt0Valid := archApplyDirty(25)
+              systemApply.payload.dtt1Valid := archApplyDirty(26)
+              systemApply.payload.urpValid := archApplyDirty(27)
+              systemApply.payload.srpValid := archApplyDirty(28)
+              systemApply.payload.pcValid := archApplyDirty(29)
+              systemApply.payload.sfcValid := archApplyDirty(30)
+              systemApply.payload.dfcValid := archApplyDirty(31)
+              systemApply.payload.usp := archApplyShadow(16).asUInt
+              systemApply.payload.msp := archApplyShadow(17).asUInt
+              systemApply.payload.isp := archApplyShadow(18).asUInt
+              systemApply.payload.sr := archApplyShadow(19)(15 downto 0).asUInt
+              systemApply.payload.vbr := archApplyShadow(20).asUInt
+              systemApply.payload.cacr := archApplyShadow(21).asUInt
+              systemApply.payload.tc := archApplyShadow(22).asUInt
+              systemApply.payload.itt0 := archApplyShadow(23).asUInt
+              systemApply.payload.itt1 := archApplyShadow(24).asUInt
+              systemApply.payload.dtt0 := archApplyShadow(25).asUInt
+              systemApply.payload.dtt1 := archApplyShadow(26).asUInt
+              systemApply.payload.urp := archApplyShadow(27).asUInt
+              systemApply.payload.srp := archApplyShadow(28).asUInt
+              systemApply.payload.pc := archApplyShadow(29).asUInt
+              systemApply.payload.sfc := archApplyShadow(30)(2 downto 0).asUInt
+              systemApply.payload.dfc := archApplyShadow(31)(2 downto 0).asUInt
+              if (debugNzvcWrite != null) {
+                debugNzvcWrite.valid := archApplyDirty(19)
+                debugNzvcWrite.address := committedMap.get.nzvcPhys.resized
+                debugNzvcWrite.data := archApplyShadow(19)(3 downto 0)
+              }
+              if (debugXWrite != null) {
+                debugXWrite.valid := archApplyDirty(19)
+                debugXWrite.address := committedMap.get.xPhys.resized
+                debugXWrite.data := archApplyShadow(19)(4 downto 4)
+              }
+              archApplyBusy := False
+              archApplyDone := True
+              archApplyComplete := True
+            }
+            is(U(3, 2 bits)) {
+              when(memoryMaintDone) { archApplyPhase := 1 }
+            }
+            }
+          }
+        }
+      }
 
       /** The CONTROL word exactly as the host reads it back. Defined ONCE and used by
         * both the read mux and the write-side byte-strobe merge, so the two can never
@@ -392,11 +694,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_FEATURES) {
             // NOT a literal: computed from the STAGE column of debug_regmap.def, so a
             // build cannot advertise a bit whose behaviour it has not built (spec 3.4).
-            rData := B(DebugRegMap.featuresForStage(stage), DebugRegMap.DBG_DW bits)
+            rData := B(advertisedFeatures, DebugRegMap.DBG_DW bits)
           }
-          // OFF_CAP_TRACE is deliberately absent: Stage 1 has no trace memories, so it
-          // reads the reserved zero above, which is exactly what feature bits 4/5 being
-          // clear promises (spec section 9.3).
+          is(DebugRegMap.OFF_CAP_TRACE) {
+            val depth = if (historyBuilt) historyDepth else 0
+            rData := B(depth, 16 bits) ## B(depth, 16 bits)
+          }
+          is(DebugRegMap.OFF_CAP_TRACE2) {
+            val depth = if (historyBuilt) historyDepth else 0
+            rData := B(0, 16 bits) ## B(depth, 16 bits)
+          }
           is(DebugRegMap.OFF_CONTROL) {
             rData := controlWord
           }
@@ -475,6 +782,21 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_ARCH_PC)   { rData := archWord(29) }
           is(DebugRegMap.OFF_ARCH_SFC)  { rData := archWord(30) }
           is(DebugRegMap.OFF_ARCH_DFC)  { rData := archWord(31) }
+          is(DebugRegMap.OFF_ARCH_APPLY) {
+            rData := B(0, 31 bits) ## archApplyBusy
+          }
+          is(DebugRegMap.OFF_ARCH_STATUS) {
+            rData := B(0, 29 bits) ## archApplyRejected ## archApplyDone ## archApplyBusy
+          }
+          is(DebugRegMap.OFF_PC_TRACE_HEAD) {
+            rData := pcTraceHead.resize(32).asBits
+          }
+          is(DebugRegMap.OFF_EXC_RING_HEAD) {
+            rData := excRingHead.resize(32).asBits
+          }
+          is(DebugRegMap.OFF_BRANCH_RING_HEAD) {
+            rData := branchRingHead.resize(32).asBits
+          }
         }
       }
 
@@ -566,6 +888,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         }
       }
 
+      // Clear only the snapshotted dirty set. Writes staged after START, including a
+      // write on this exact completion cycle, survive as the next transaction's work.
+      if (stage >= 3) when(archApplyComplete) {
+        archDirty := (archDirty & ~archApplyDirty) | archApplyRewrite | archWriteMask
+      }
+
       // An automatic stop is one-shot. Clear the arm after the ROB acknowledges the
       // hit; resume cannot immediately retrigger against the same absolute target.
       if (stage >= 2) when(haltAfterConsumed) { haltAfterArmed := False }
@@ -583,6 +911,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         if (stage >= 3) {
           for (i <- 0 until 32) archShadow(i) := B(0, 32 bits)
           archDirty := B(0, 32 bits)
+          archApplyRewrite := B(0, 32 bits)
         }
       }
 
@@ -689,10 +1018,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // completed. Never let a transient/reset value acquire halt ownership; this is
       // the command-side counterpart of AXI READY being held low while dbgRst is active.
       dbgCommit.foreach(_.request(csr.debugStopRequest && !dbgRst,
-        csr.debugResumeRequest && !dbgRst, csr.debugStepRequest && !dbgRst,
+        csr.debugResumeRequest && !dbgRst && !csr.archApplyBusy,
+        csr.debugStepRequest && !dbgRst && !csr.archApplyBusy,
         csr.debugClearStickyRequest && !dbgRst))
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
+    }
+    if (enable && stage >= 3) {
+      dbgSystem.foreach(_.requestApply(csr.systemApply))
+      debugMemory.foreach(_.requestPushInvalidateAll(csr.debugMaintStart && !dbgRst))
     }
 
     if (!enable) {

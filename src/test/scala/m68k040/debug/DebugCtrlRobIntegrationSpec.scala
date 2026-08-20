@@ -2,12 +2,14 @@ package m68k040.debug
 
 import m68k040.{M68kParams, M68kSim}
 import m68k040.core.ParamPlugin
+import m68k040.mmu.MmuControlPlugin
 import m68k040.rob.{RenameCommitSinkPlugin, RenameUopSourcePlugin, RobAllocDriverPlugin, RobPlugin}
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib.misc.database.Database
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
+import scala.collection.mutable.ArrayBuffer
 
 /** End-to-end service-boundary check: real dbg_axi CSR bank driving the real ROB halt
   * owner. The ROB's detailed macro-boundary behavior remains covered by RobPluginSpec. */
@@ -19,13 +21,20 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
     val rsrc = new RenameUopSourcePlugin
     val alloc = new RobAllocDriverPlugin
     val rob = new RobPlugin
+    val mmu: MmuControlPlugin = if (stageArg >= 3) new MmuControlPlugin else null
     val commit = new RenameCommitSinkPlugin
     val intRf: DebugIntRfStubPlugin = if (stageArg >= 3) new DebugIntRfStubPlugin else null
+    val nzvcRf: DebugNzvcRfStubPlugin = if (stageArg >= 3) new DebugNzvcRfStubPlugin else null
+    val xRf: DebugXRfStubPlugin = if (stageArg >= 3) new DebugXRfStubPlugin else null
     val maps: DebugCommittedMapStubPlugin = if (stageArg >= 3) new DebugCommittedMapStubPlugin else null
+    val memory: DebugMemoryStubPlugin = if (stageArg >= 3) new DebugMemoryStubPlugin else null
     val dbg = new DebugCtrlPlugin(porCycles = 4, stage = stageArg)
-    val stage3Plugins = if (stageArg >= 3) Seq[FiberPlugin](intRf, maps) else Seq.empty
-    db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, alloc, rob, commit) ++ stage3Plugins ++ Seq(dbg)) }
+    val stage3Plugins = if (stageArg >= 3)
+      Seq[FiberPlugin](intRf, nzvcRf, xRf, maps, memory) else Seq.empty
+    val corePlugins = Seq[FiberPlugin](new ParamPlugin(M68kParams())) ++
+      (if (stageArg >= 3) Seq[FiberPlugin](mmu) else Seq.empty) ++
+      Seq[FiberPlugin](rsrc, alloc, rob, commit)
+    db.on { host.asHostOf(corePlugins ++ stage3Plugins ++ Seq(dbg)) }
 
     def axi: DbgAxiLite = dbg.logic.dbgAxi
   }
@@ -38,6 +47,8 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
       dut.rob.logic.completion(0).valid #= false; dut.rob.logic.completion(1).valid #= false
       dut.rob.logic.flush.valid #= false
+      dut.memory.logic.quiescedDrive #= true
+      dut.memory.logic.doneDrive #= false
       cd.waitSampling(20)
 
       // Seed a deliberately non-identity system snapshot. S=1,M=1 selects MSP as A7.
@@ -76,6 +87,91 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_LIVE_SFC) == 5L)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_LIVE_DFC) == 6L)
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_LIVE_PC) == 0x12345678L)
+    }
+  }
+
+  test("Stage 3 dirty apply rejects while running, updates only staged state, and stays halted") {
+    M68kSim().compile(new Dut(stageArg = 3)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+      dut.rob.logic.completion(0).valid #= false; dut.rob.logic.completion(1).valid #= false
+      dut.rob.logic.flush.valid #= false
+      dut.memory.logic.quiescedDrive #= true
+      dut.memory.logic.doneDrive #= false
+      dut.maps.logic.intMap(0) #= 20
+      dut.maps.logic.intMap(8) #= 21
+      dut.maps.logic.nzvcMap #= 7
+      dut.maps.logic.xMap #= 9
+      cd.waitSampling(20)
+
+      val intWrites = ArrayBuffer[(BigInt, BigInt)]()
+      val nzvcWrites = ArrayBuffer[(BigInt, BigInt)]()
+      val xWrites = ArrayBuffer[(BigInt, BigInt)]()
+      var maintenanceStarts = 0
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.intRf.logic.write.valid.toBoolean)
+            intWrites += ((dut.intRf.logic.write.address.toBigInt, dut.intRf.logic.write.data.toBigInt))
+          if (dut.nzvcRf.logic.writePort.valid.toBoolean)
+            nzvcWrites += ((dut.nzvcRf.logic.writePort.address.toBigInt, dut.nzvcRf.logic.writePort.data.toBigInt))
+          if (dut.xRf.logic.writePort.valid.toBoolean)
+            xWrites += ((dut.xRf.logic.writePort.address.toBigInt, dut.xRf.logic.writePort.data.toBigInt))
+        }
+      }
+      fork {
+        while (!dut.memory.logic.start.toBoolean) cd.waitSampling()
+        maintenanceStarts += 1
+        cd.waitSampling(5)
+        dut.memory.logic.doneDrive #= true
+        cd.waitSampling()
+        dut.memory.logic.doneDrive #= false
+      }
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_APPLY, 2)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_D0, 0xd0d0d0d0L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_SR, 0x0000a71dL)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_VBR, 0x00fed000L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_CACR, 0x80008000L)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_PC, 0x12340000L)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_APPLY, 1)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_STATUS) == 4,
+        "running apply was not rejected distinctly")
+      assert(dut.dbg.logic.csr.archDirty.toBigInt.bitCount == 5)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_APPLY, 2)
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_CONTROL, 1)
+      var coreStatus = 0L; var waited = 0
+      while ((coreStatus & 1L) == 0 && waited < 100) {
+        coreStatus = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS); waited += 1
+      }
+      assert((coreStatus & 1L) != 0)
+
+      DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_ARCH_APPLY, 1)
+      var applyStatus = 0L; waited = 0
+      while ((applyStatus & 6L) == 0 && waited < 100) {
+        applyStatus = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_ARCH_STATUS); waited += 1
+      }
+      assert(applyStatus == 2, f"apply terminal status 0x$applyStatus%x")
+      cd.waitSampling(2)
+
+      assert(intWrites.toSeq == Seq((BigInt(20), BigInt("d0d0d0d0", 16))),
+        s"dirty apply touched unexpected integer mappings: $intWrites")
+      assert(nzvcWrites.toSeq == Seq((BigInt(7), BigInt(0xd))))
+      assert(xWrites.toSeq == Seq((BigInt(9), BigInt(1))))
+      assert(dut.rob.logic.exc.ss.srSys.toBigInt == 0xa7)
+      assert(dut.rob.logic.committedCcr.toBigInt == 0x1d)
+      assert(dut.rob.logic.exc.ss.vbr.toBigInt == 0x00fed000L)
+      assert(dut.rob.logic.exc.ss.cacr.toBigInt == 0x80008000L)
+      assert(dut.rob.logic.debugLivePcReg.toBigInt == 0x12340000L)
+      assert(maintenanceStarts == 1)
+      assert(dut.dbg.logic.csr.archDirty.toBigInt == 0)
+      coreStatus = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_STATUS)
+      assert((coreStatus & 1L) != 0 && (coreStatus & 8L) == 0,
+        f"architectural apply released halt: STATUS=0x$coreStatus%x")
     }
   }
 

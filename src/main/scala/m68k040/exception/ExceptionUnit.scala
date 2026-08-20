@@ -571,6 +571,12 @@ class ExceptionUnit(
   // True when this obs is an exception/trap ENTRY (vs an RTE). The ROB uses it to
   // apply a faulting-instruction CCR fold (CHK) only to the entry step, not RTE.
   val obsIsEntry = Bool();        obsIsEntry := False
+  // Committed exception-history payload, qualified by obsFire && obsIsEntry. These
+  // describe the completed entry transaction, never the earlier speculative fault.
+  val obsVector = UInt(8 bits);        obsVector := 0
+  val obsExceptionPc = UInt(32 bits);  obsExceptionPc := 0
+  val obsFaultAddress = UInt(32 bits); obsFaultAddress := 0
+  val obsHandlerPc = UInt(32 bits);    obsHandlerPc := 0
 
   // ── Architectural A7 (int reg 15) write-back. The committed A7 lives in BOTH the
   // SystemState bank (ss.isp/ss.msp/ss.usp) AND the int register file (arch reg 15) the
@@ -639,7 +645,8 @@ class ExceptionUnit(
   // the existing `umFlush` top-level fan-out — see FullCoreSynth.scala/the test DUTs).
   // Only PFLUSHA drives this (S_APPLY's SysKind.PFLUSHA arm); every other sysKind —
   // CPUSH/CINV included — leaves it False.
-  val sysFlushAllValid = Bool();        sysFlushAllValid := False;        sysFlushAllValid.simPublic()
+  val sysFlushAllValid = Bool();        sysFlushAllValid.allowOverride
+  sysFlushAllValid := False;             sysFlushAllValid.simPublic()
 
   // ── RTE CCR restore -> REAL flags PRF (task #176, redesigned task-176-regression) ──
   // Fires exactly at RTE's REAL frame pop (R_REDIR, non-throwaway branch — the SAME
@@ -1284,7 +1291,10 @@ class ExceptionUnit(
         curIsInt  := entryIsInterrupt
         curLevel  := entryIplLevel
         curPpc    := ppcOrTarget.resized
-        curFault  := entryFaultAddr
+        // Only access/address faults architecturally carry a fault address. Other
+        // exception sources are allowed to leave entryFaultAddr unspecified, so do
+        // not leak an unrelated combinational value into committed debug history.
+        curFault  := Mux(is7 || entryVector === 3, entryFaultAddr, U(0, 32 bits))
         // ── Task 11: capture the unimplemented-instruction state ─────────────────
         // A RECOGNIZED-but-unsupported FP op is being handed to FPSP via vector 11.
         // Latch what a subsequent FSAVE needs to build the 52-byte unimplemented-
@@ -1570,6 +1580,10 @@ class ExceptionUnit(
       obsSysByte := newSys
       obsA7      := Mux(curThrowaway, frameBase2, frameBase)
       obsIsInterrupt := curIsInt
+      obsVector := curVec
+      obsExceptionPc := curPc
+      obsFaultAddress := curFault
+      obsHandlerPc := vecTarget
       goto(IDLE)
     }
 

@@ -185,11 +185,21 @@ class ExceptionEntrySpec extends AnyFunSuite {
 
       // Wait for the exception redirect (fetch retarget to the handler).
       var n = 0; var redirPc = -1L
+      var historySeen = false
       while (redirPc < 0 && n < 400) {
+        if (dut.rob.logic.debugExceptionEntry.valid.toBoolean) {
+          val event = dut.rob.logic.debugExceptionEntry.payload
+          assert(event.vector.toInt == 4)
+          assert((event.exceptionPc.toLong & 0xffffffffL) == faultPc)
+          assert((event.faultAddress.toLong & 0xffffffffL) == 0L)
+          assert((event.handlerPc.toLong & 0xffffffffL) == handler)
+          historySeen = true
+        }
         if (dut.rob.logic.doFlushReg.toBoolean) redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
         n += 1; cd.waitSampling()
       }
       assert(redirPc == handler, f"redirect pc=0x$redirPc%x expected handler 0x$handler%x")
+      assert(historySeen, "completed exception entry must emit committed debug history")
       assert(acceptedStores == 4,
         s"format-$$0 entry must accept exactly four frame words, saw $acceptedStores")
 

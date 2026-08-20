@@ -65,7 +65,7 @@ def main():
           p.expect_read(1, m.OFF_ARCH_D0) == 0)
     check("a Stage-1 offset has no constant expectation (it is stateful)",
           p.expect_read(1, m.OFF_STATUS) is None)
-    check("CAP_TRACE reads 0 in a Stage-1 build (trace is Stage 7)",
+    check("CAP_TRACE reads 0 before the Stage-3 history tranche",
           p.expect_read(1, m.OFF_CAP_TRACE) == 0)
     check("an out-of-window address is rejected outright",
           p.expect_read(1, 1 << 20) == 0)
@@ -148,6 +148,58 @@ def main():
            p.cache_op_poll, [p.CACHE_BUSY | p.CACHE_DONE])
     raises("polling an empty sample list is a harness error", p.ProtocolError,
            p.cache_op_poll, [])
+
+    # ---- Stage-3 architectural and history host operations --------------------
+    regs = {m.OFF_STATUS: p.STAT_HALTED}
+    regs.update({off: 0xA0000000 + n
+                 for n, off in enumerate(p.ARCH_LIVE_REGISTERS.values())})
+    dump = p.arch_dump(lambda off: regs.get(off, 0))
+    check("architectural dump reads the complete live register window",
+          len(dump) == 33 and dump["D0"] == 0xA0000000 and "MMUSR" in dump)
+    raises("architectural dump rejects a running core", p.ProtocolError,
+           p.arch_dump, lambda _off: 0)
+
+    writes = []
+    status_samples = iter([p.ARCH_BUSY, p.ARCH_DONE])
+    def apply_read(off):
+        if off == m.OFF_STATUS:
+            return p.STAT_HALTED
+        if off == m.OFF_ARCH_STATUS:
+            return next(status_samples)
+        return 0
+    p.arch_set(apply_read, lambda off, value: writes.append((off, value)),
+               {"d0": 0x11223344, "PC": 0x55667788})
+    check("architectural set writes shadows then starts one atomic apply",
+          writes == [(m.OFF_ARCH_D0, 0x11223344),
+                     (m.OFF_ARCH_PC, 0x55667788),
+                     (m.OFF_ARCH_APPLY, 1)])
+    raises("architectural set rejects read-only MMUSR", p.ProtocolError,
+           p.arch_set, lambda _off: p.STAT_HALTED, lambda _off, _value: None,
+           {"MMUSR": 1})
+
+    ring = {m.OFF_CAP_TRACE: (4 << 16) | 2, m.OFF_CAP_TRACE2: 2,
+            m.OFF_PC_TRACE_HEAD: 1, m.OFF_BRANCH_RING_HEAD: 1,
+            m.OFF_EXC_RING_HEAD: 0}
+    for i in range(4):
+        ring[m.OFF_PC_TRACE_BODY + 4 * i] = 0x1000 + i
+    for i in range(2):
+        base = m.OFF_BRANCH_RING_BODY + 16 * i
+        ring.update({base: 0x2000 + i, base + 4: 0x3000 + i,
+                     base + 8: 0xF0 | i, base + 12: 0})
+        base = m.OFF_EXC_RING_BODY + 16 * i
+        ring.update({base: 4 + i, base + 4: 0x4000 + i,
+                     base + 8: 0x5000 + i, base + 12: 0x6000 + i})
+    ring_read = lambda off: ring.get(off, 0)
+    check("PC history walks preceding head slots oldest to newest",
+          p.read_pc_history(ring_read) == [0x1001, 0x1002, 0x1003, 0x1000])
+    branches = p.read_branch_history(ring_read)
+    check("branch history decodes committed flow metadata",
+          [x["pc"] for x in branches] == [0x2001, 0x2000]
+          and branches[1]["branch_type"] == 0 and branches[1]["taken"] is False)
+    exceptions = p.read_exception_history(ring_read)
+    check("exception history decodes vector, PC, fault, and handler",
+          exceptions[1] == {"vector": 5, "exception_pc": 0x4001,
+                            "fault_address": 0x5001, "handler_pc": 0x6001})
 
     # ---- CONTROL / STATUS bit layout (spec 3.3) --------------------------------
     check("CONTROL bit numbering matches spec 3.3",

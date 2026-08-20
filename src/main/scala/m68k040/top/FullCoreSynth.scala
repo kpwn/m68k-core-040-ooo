@@ -10,11 +10,11 @@ import m68k040.decode.DecodeStage
 import m68k040.rename.RenameStage
 import m68k040.dispatch.DispatchPlugin
 import m68k040.rob.RobPlugin
-import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, DivEuPlugin}
+import m68k040.execute.{AluEuPlugin, BranchEuPlugin, LsEuPlugin, LsEuService, DivEuPlugin}
 import m68k040.execute.iq.{IssueQueuePlugin, IssueQueueService}
 import m68k040.execute.regfile.{RegFilePluginFp, RegFilePluginFpcc, RegFilePluginInt,
   RegFilePluginNzvc, RegFilePluginX}
-import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService}
+import m68k040.services.{CommitTraceService, DecodeUopService, RedirectService, DebugMemoryService}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -24,7 +24,9 @@ import spinal.lib.misc.plugin.FiberPlugin
   * anchors the pipeline to top IO so nothing is pruned: the EU int-write results
   * (anchors the ALU+PRF datapath, since a PRF read value is then observed) and
   * the CommitTrace (anchors the ROB retire/control path). */
-class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
+class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin,
+                          lsEu: LsEuPlugin, divEu: DivEuPlugin, debugStage: Int = 2)
+    extends FiberPlugin with DebugMemoryService {
   // Int PRF write port for the exception unit's A7 (reg 15) write-back.
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
   // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
@@ -42,7 +44,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   // FPSR write. See RenameStage.committedPhysFpcc's doc comment.
   var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
+  private var debugMaintStartIn: Bool = null
+  private var debugQuiescedOut: Bool = null
+  private var debugMaintDoneOut: Bool = null
   during setup {
+    debugMaintStartIn = Bool(); debugMaintStartIn.allowOverride; debugMaintStartIn := False
+    debugQuiescedOut = Bool()
+    debugMaintDoneOut = Bool()
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -59,6 +67,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val doFlush = host[RedirectService].doFlush
     val flushPc = host[RedirectService].flushPc
     val excActive = rob.logic.excActive
+    val debugMaintDonePulse = Bool()
+    debugMaintDonePulse.allowOverride
+    debugMaintDonePulse := False
     // IQ/skid flush held high while the commit-side exception sequencer runs
     // (serializing) so wrong-path uops fetched during the sequence are squashed.
     val pipeFlush = doFlush || excActive
@@ -105,7 +116,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // is cross-checked at resolve). See IcachePlugin's `maintInvalidateAll` declaration
     // for the recorded rationale. Pulses only AFTER the D-side maintenance walk
     // completes (ExceptionUnit's S_MAINTWAIT), so the BTB clear inherits that timing.
-    host[IcachePlugin].logic.maintInvalidateAll := rob.logic.exc.icMaintPulse
+    host[IcachePlugin].logic.maintInvalidateAll := rob.logic.exc.icMaintPulse || debugMaintDonePulse
     // Two per-instruction combinational BTB lookups (the aligner's slot0/slot1 PCs);
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
     btb.logic.queryPc     := fa.logic.btbQueryPc0
@@ -418,8 +429,33 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // `maintCmdOut` for one cycle (having already waited on S_DRAIN's
     // sqDrained && dcQuiesced), then holds in S_MAINTWAIT until `maintDone` reports the
     // walk finished.
-    dc.maintCmd             := exc.maintCmdOut
+    dc.maintCmd.valid := exc.maintCmdOut.valid
+    dc.maintCmd.payload := exc.maintCmdOut.payload
+    if (debugStage >= 3) {
+      val debugMaintActive = RegInit(False)
+      val debugMaintDone = debugMaintActive && dc.maintDone
+      when(debugMaintStartIn) { debugMaintActive := True }
+      when(debugMaintDone) { debugMaintActive := False }
+      debugMaintDonePulse := debugMaintDone
+      debugQuiescedOut := host[LsEuService].sqDrained && dc.maintQuiesced && !debugMaintActive
+      debugMaintDoneOut := debugMaintDone
+      when(debugMaintStartIn) {
+        dc.maintCmd.valid := True
+        dc.maintCmd.payload.push := True
+        dc.maintCmd.payload.invalidate := True
+        dc.maintCmd.payload.scope := 0 // all
+        dc.maintCmd.payload.sel := 3   // both D-cache and I-cache
+        dc.maintCmd.payload.addr := 0
+      }
+    } else {
+      debugQuiescedOut := True
+      debugMaintDoneOut := False
+    }
     exc.maintDoneIn         := dc.maintDone
+    GenerationFlags.simulation {
+      assert(!(debugMaintStartIn && exc.maintCmdOut.valid),
+        "BackendWiringPlugin: debug and architectural cache maintenance collided", FAILURE)
+    }
     // A7 (arch-15) write on exc/RTE A7 change; the SAME port also serves a commit-time
     // SYSTEM op's READ direction (MOVE-USP/MOVEC Rc->Rn writes an arbitrary arch-Rn).
     // sysRegWrite fires in S_APPLY, a7Write in S_REDIR (consecutive -> no port collision).
@@ -502,6 +538,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       fireOut(k)  := RegNext(ct.traceFire(k)) init False
     }
   }
+
+  override def quiesced: Bool = debugQuiescedOut
+  override def done: Bool = debugMaintDoneOut
+  override def requestPushInvalidateAll(start: Bool): Unit = {
+    debugMaintStartIn := start
+  }
 }
 
 /** Full integrated execute core (slice 3c) for OOC synthesis: frontend → rename →
@@ -535,7 +577,7 @@ object GenFullCoreSynthVerilog {
     * below, before this parameter existed) is unaffected -- `GenFullCoreSynth`'s own output
     * is a byte-for-byte no-op of this change. */
   def buildWith(dbgBuildId: BigInt, vioEnable: Boolean, outputName: String,
-                debugEnable: Boolean = true): Unit = {
+                debugEnable: Boolean = true, debugStage: Int = 2): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -577,12 +619,13 @@ object GenFullCoreSynthVerilog {
           // ports); the CPLX EU's FP writeback lane is that writer.
           new RegFilePluginFp(),
           new RegFilePluginFpcc(),
-          new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
+          new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu, debugStage = debugStage)
           ,
           // Stage 2 debug/control slave. Placed after RobPlugin because halt, step,
           // macro-count and reason reporting communicate exclusively through the
           // ROB-owned DebugCommitService.
-          new m68k040.debug.DebugCtrlPlugin(buildId = dbgBuildId, stage = 2, enable = debugEnable)
+          new m68k040.debug.DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage,
+            enable = debugEnable)
           ,
           // Vivado VIO integration (design spec 2026-08-18-vio-jtag-debug-design.md, V4).
           // enable=false here -- M68kFullCoreSynth is the OOC/FMax gate target and its port
@@ -595,6 +638,17 @@ object GenFullCoreSynthVerilog {
 
   def main(args: Array[String]): Unit = {
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth")
+  }
+}
+
+/** Elaboration/synthesis gate for the next debug tranche. The default shipped target
+  * remains Stage 2 until this Stage 3 configuration passes its complete functional and
+  * timing gates. */
+object GenFullCoreSynthStage3Verilog {
+  def main(args: Array[String]): Unit = {
+    GenFullCoreSynthVerilog.buildWith(
+      GenFullCoreSynthVerilog.readDbgBuildIdEnv(), vioEnable = false,
+      outputName = "M68kFullCoreSynthStage3", debugStage = 3)
   }
 }
 

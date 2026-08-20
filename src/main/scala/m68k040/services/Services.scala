@@ -123,6 +123,41 @@ trait DebugSystemStateService {
   def requestApply(cmd: Flow[DebugSystemApply]): Unit
 }
 
+/** Halted-debug memory-coherence sequencer.
+  *
+  * The backend wiring layer is the sole producer because it already owns arbitration
+  * of the ExceptionUnit and debug requests onto the D-cache maintenance port. Debug
+  * control sees only this service: it never reaches into the LS queue, caches, TLBs,
+  * or predictors. A completed request has pushed every dirty D-cache line, invalidated
+  * both L1s and the fetch predictors, and left memory as the debugger-visible truth.
+  * PRODUCER: `BackendWiringPlugin` (exactly one). */
+trait DebugMemoryService {
+  def quiesced: Bool
+  def done: Bool
+  def requestPushInvalidateAll(start: Bool): Unit
+}
+
+case class DebugBranchEvent() extends Bundle {
+  val pc, nextPc = UInt(32 bits)
+  val taken, mispredicted = Bool()
+  val branchType = UInt(2 bits)
+}
+
+case class DebugExceptionEvent() extends Bundle {
+  val vector = UInt(8 bits)
+  val exceptionPc, faultAddress, handlerPc = UInt(32 bits)
+}
+
+/** Committed-only forensic-history events. None of these signals expose speculative
+  * execute state: macro PCs and branches pulse at retirement; exceptions pulse only
+  * after the entry sequencer has installed the handler PC and final architectural state.
+  * PRODUCER: `RobPlugin` (exactly one). */
+trait DebugHistoryService {
+  def macroRetirePc: Vec[Flow[UInt]] // two program-ordered retire slots
+  def branchRetire: Flow[DebugBranchEvent]
+  def exceptionEntry: Flow[DebugExceptionEvent]
+}
+
 /** Produced by the I-cache; consumed by the fetch/align stage (later). */
 trait FetchService {
   def cmd: Stream[FetchCmd]

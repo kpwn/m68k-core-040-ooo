@@ -52,11 +52,12 @@ import spinal.lib.misc.plugin.FiberPlugin
   * scope. Leaving it out entirely -- rather than guessing at `enable=true`'s wiring, or
   * even including it `enable=false` -- is the safer reading of "diff the two lists": the
   * addition is real, but it is not one of the "everything from Tasks 1, 3, 4, 5, 9, 10, 12"
-  * this task is chartered to assemble. `DebugCtrlPlugin` (Stage 1 of the SEPARATE, already-
-  * merged debug-ctrl plan that predates this task's brief) is still wired below, exactly as
+  * this task is chartered to assemble. `DebugCtrlPlugin` (now through Stage 3 of the
+  * separate debug-ctrl plan) is still wired below, exactly as
   * the brief's own sketch has it -- only the newer `VioProbePlugin` addition is excluded. */
 class M68kSocketTop(p: M68kParams = M68kParams(),
-                    dbgBuildId: BigInt = 0) extends Component {
+                    dbgBuildId: BigInt = 0,
+                    debugStage: Int = 3) extends Component {
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
 
@@ -88,7 +89,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val iplAck = new IplAckPlugin(enable = true)
     val periph = new PeripheralResetPlugin(enable = true,
                                            gateDispatch = SocketTopConfig.OPEN1_GATE_DISPATCH)
-    val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = 1)
+    val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage)
 
     val core = new M68kCore(Seq[FiberPlugin](
       new ParamPlugin(p),
@@ -119,7 +120,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new ResetVectorPlugin(enable = true),
       iplAck,
       periph,
-      new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu),
+      new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu, debugStage = debugStage),
       dbgCtrl
     ))
   }

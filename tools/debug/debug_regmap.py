@@ -378,8 +378,8 @@ FEATURES = {
     "axi_ready_gated": (1, 1),
     "cfg_wipe": (2, 1),
     "cpu_reset_count": (3, 1),
-    "pc_trace": (4, 7),
-    "exc_ring": (5, 7),
+    "pc_trace": (4, 3),
+    "exc_ring": (5, 3),
     "break_pc_multi": (6, 5),
     "halt_exc_mask": (7, 5),
     "fault_snap": (8, 9),
@@ -398,7 +398,7 @@ FEATURES = {
     "cache_maint_only": (21, 4),
     "macro_retire_count": (22, 2),
     "stop_status_v2": (23, 2),
-    "branch_ring": (24, 7),
+    "branch_ring": (24, 3),
 }
 
 # -- socket ports: name -> (direction from the CPU, width) ----------------

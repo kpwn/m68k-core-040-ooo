@@ -451,6 +451,13 @@ class RobPluginSpec extends AnyFunSuite {
         val upd = dut.rob.logic.btbUpdateFlow.payload
         assert(upd.pc.toLong == pc, s"training PC association lost across retire/wrap")
         assert(upd.len.toInt == len, s"training len=${upd.len.toInt}, expected $len")
+        val hist = dut.rob.logic.debugBranchRetire
+        assert(hist.valid.toBoolean, "retired branch must emit committed debug history")
+        assert((hist.payload.pc.toLong & 0xffffffffL) == pc)
+        assert((hist.payload.nextPc.toLong & 0xffffffffL) == 0x8000L)
+        assert(hist.payload.taken.toBoolean)
+        assert(!hist.payload.mispredicted.toBoolean)
+        assert(hist.payload.branchType.toInt == 1)
         cd.waitSampling()
       }
 

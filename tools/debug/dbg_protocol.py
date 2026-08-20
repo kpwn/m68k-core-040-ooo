@@ -60,6 +60,42 @@ CACHE_BUSY = 1 << 0
 CACHE_DONE = 1 << 1
 CACHE_SEL_MASK = 0b1100
 
+
+def _indexed_offsets(prefix, base, count):
+    return [("%s%d" % (prefix, i), base + 4 * i) for i in range(count)]
+
+
+# The live window is the coherent read source. Writes go through the separate
+# shadow window and become architectural only after OFF_ARCH_APPLY completes.
+ARCH_LIVE_REGISTERS = dict(
+    _indexed_offsets("D", _m.OFF_LIVE_DREG0, 8)
+    + _indexed_offsets("A", _m.OFF_LIVE_AREG0, 8)
+    + [
+        ("USP", _m.OFF_LIVE_USP), ("SSP", _m.OFF_LIVE_SSP),
+        ("ISP", _m.OFF_LIVE_ISP), ("SR", _m.OFF_LIVE_SR),
+        ("VBR", _m.OFF_LIVE_VBR), ("CACR", _m.OFF_LIVE_CACR),
+        ("TC", _m.OFF_LIVE_MMU_TC), ("ITT0", _m.OFF_LIVE_MMU_ITT0),
+        ("ITT1", _m.OFF_LIVE_MMU_ITT1), ("DTT0", _m.OFF_LIVE_MMU_DTT0),
+        ("DTT1", _m.OFF_LIVE_MMU_DTT1), ("URP", _m.OFF_LIVE_MMU_URP),
+        ("SRP", _m.OFF_LIVE_MMU_SRP), ("PC", _m.OFF_LIVE_PC),
+        ("SFC", _m.OFF_LIVE_SFC), ("DFC", _m.OFF_LIVE_DFC),
+        ("MMUSR", _m.OFF_LIVE_MMUSR),
+    ])
+
+ARCH_SHADOW_REGISTERS = dict(
+    _indexed_offsets("D", _m.OFF_ARCH_D0, 8)
+    + _indexed_offsets("A", _m.OFF_ARCH_A0, 8)
+    + [
+        ("USP", _m.OFF_ARCH_USP), ("SSP", _m.OFF_ARCH_SSP),
+        ("ISP", _m.OFF_ARCH_ISP), ("SR", _m.OFF_ARCH_SR),
+        ("VBR", _m.OFF_ARCH_VBR), ("CACR", _m.OFF_ARCH_CACR),
+        ("TC", _m.OFF_ARCH_TC), ("ITT0", _m.OFF_ARCH_ITT0),
+        ("ITT1", _m.OFF_ARCH_ITT1), ("DTT0", _m.OFF_ARCH_DTT0),
+        ("DTT1", _m.OFF_ARCH_DTT1), ("URP", _m.OFF_ARCH_URP),
+        ("SRP", _m.OFF_ARCH_SRP), ("PC", _m.OFF_ARCH_PC),
+        ("SFC", _m.OFF_ARCH_SFC), ("DFC", _m.OFF_ARCH_DFC),
+    ])
+
 _RM = _regmap.load()
 
 
@@ -204,6 +240,90 @@ def cache_op_poll(samples):
                 "cache status went idle (0x%X) with neither BUSY nor DONE -- a rejected "
                 "command must be reported, not left silent" % word)
     raise ProtocolError("cache operation never left BUSY")
+
+
+def arch_dump(read32):
+    """Return the complete coherent architectural register view.
+
+    ``read32(offset)`` is supplied by the JTAG/AXI transport. The core must be
+    effectively halted; accepting a dump while merely halt-requested would mix
+    values from different architectural instants.
+    """
+    if not (read32(_m.OFF_STATUS) & STAT_HALTED):
+        raise ProtocolError("architectural dump requires effective HALTED")
+    return {name: read32(off) & 0xFFFFFFFF
+            for name, off in ARCH_LIVE_REGISTERS.items()}
+
+
+def arch_set(read32, write32, updates, max_polls=10000):
+    """Stage named register writes, atomically apply them, and stay halted."""
+    if not (read32(_m.OFF_STATUS) & STAT_HALTED):
+        raise ProtocolError("architectural set requires effective HALTED")
+    normalized = {name.upper(): value for name, value in updates.items()}
+    unknown = sorted(set(normalized) - set(ARCH_SHADOW_REGISTERS))
+    if unknown:
+        raise ProtocolError("register is not writable: %s" % ", ".join(unknown))
+    for name, value in normalized.items():
+        if value < 0 or value > 0xFFFFFFFF:
+            raise ProtocolError("%s value is not 32 bits" % name)
+        write32(ARCH_SHADOW_REGISTERS[name], value)
+    write32(_m.OFF_ARCH_APPLY, 1)
+    samples = []
+    for _ in range(max_polls):
+        sample = read32(_m.OFF_ARCH_STATUS) & 0xFFFFFFFF
+        samples.append(sample)
+        if sample & (ARCH_DONE | ARCH_REJECTED):
+            result = arch_apply_poll(samples)
+            if result != "DONE":
+                raise ProtocolError("architectural apply was rejected")
+            if not (read32(_m.OFF_STATUS) & STAT_HALTED):
+                raise ProtocolError("architectural apply unexpectedly resumed the core")
+            return
+    raise ProtocolError("architectural apply timed out")
+
+
+def _ring_indices(head, depth):
+    """Physical slots ordered oldest to newest for a next-write head."""
+    if depth <= 0:
+        return []
+    return [((head + i) % depth) for i in range(depth)]
+
+
+def read_pc_history(read32):
+    """Read the advertised last-macro-PC ring, oldest to newest."""
+    depth = (read32(_m.OFF_CAP_TRACE) >> 16) & 0xFFFF
+    head = read32(_m.OFF_PC_TRACE_HEAD) & 0xFFFF
+    return [read32(_m.OFF_PC_TRACE_BODY + 4 * i) & 0xFFFFFFFF
+            for i in _ring_indices(head, depth)]
+
+
+def read_branch_history(read32):
+    """Read committed branch records, oldest to newest."""
+    depth = read32(_m.OFF_CAP_TRACE2) & 0xFFFF
+    head = read32(_m.OFF_BRANCH_RING_HEAD) & 0xFFFF
+    out = []
+    for i in _ring_indices(head, depth):
+        base = _m.OFF_BRANCH_RING_BODY + 16 * i
+        words = [read32(base + 4 * n) & 0xFFFFFFFF for n in range(4)]
+        meta = words[2]
+        out.append({"pc": words[0], "next_pc": words[1],
+                    "taken": bool(meta & 1),
+                    "mispredicted": bool(meta & 2),
+                    "branch_type": (meta >> 2) & 3})
+    return out
+
+
+def read_exception_history(read32):
+    """Read completed exception-entry records, oldest to newest."""
+    depth = read32(_m.OFF_CAP_TRACE) & 0xFFFF
+    head = read32(_m.OFF_EXC_RING_HEAD) & 0xFFFF
+    out = []
+    for i in _ring_indices(head, depth):
+        base = _m.OFF_EXC_RING_BODY + 16 * i
+        words = [read32(base + 4 * n) & 0xFFFFFFFF for n in range(4)]
+        out.append({"vector": words[0] & 0xFF, "exception_pc": words[1],
+                    "fault_address": words[2], "handler_pc": words[3]})
+    return out
 
 
 def control_word(halt=False, step=False, soft_rst=False, init_done_override=False,

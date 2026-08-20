@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService, DebugSystemApply, DebugSystemStateService}
+import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService, DebugSystemApply, DebugSystemStateService, DebugHistoryService, DebugBranchEvent, DebugExceptionEvent}
 import m68k040.rename.RenamedUop
 import m68k040.types.CommitTrace
 import spinal.core._
@@ -34,7 +34,7 @@ object DebugHaltReasonCode {
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -1136,6 +1136,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val nextPcRd1 = nextPcMem.readAsync(h1)
     val commitPc0 = Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)
     val commitPc1 = Mux(p1.retireAlone, nextPcRd1, p1.predNextPc)
+    val debugMacroRetirePc = Vec.fill(2)(Flow(UInt(32 bits)))
+    debugMacroRetirePc(0).valid := retire0 && p0.last
+    debugMacroRetirePc(0).payload := p0.pc
+    debugMacroRetirePc(1).valid := retire1 && p1.last
+    debugMacroRetirePc(1).payload := p1.pc
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
     // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
@@ -1415,6 +1420,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     btbUpdateFlow.payload.len    := branchTrainRd.len
     gshareUpdateFlow.payload.index := branchTrainRd.phtIndex
     gshareUpdateFlow.payload.taken := branchTrainRd.taken
+    val debugBranchRetire = Flow(DebugBranchEvent())
+    debugBranchRetire.valid.simPublic()
+    debugBranchRetire.payload.pc.simPublic()
+    debugBranchRetire.payload.nextPc.simPublic()
+    debugBranchRetire.payload.taken.simPublic()
+    debugBranchRetire.payload.mispredicted.simPublic()
+    debugBranchRetire.payload.branchType.simPublic()
+    val debugBranchMispredict = RegNextWhen(mispredictStore(h0), btbUpdateValidComb) init False
+    val debugBranchFallthrough = (btbUpdateFlow.payload.pc +
+      (btbUpdateFlow.payload.len.resize(32) << 1)).resized
+    debugBranchRetire.valid := btbUpdateFlow.valid
+    debugBranchRetire.payload.pc := btbUpdateFlow.payload.pc
+    debugBranchRetire.payload.nextPc := Mux(btbUpdateFlow.payload.taken,
+      btbUpdateFlow.payload.target, debugBranchFallthrough)
+    debugBranchRetire.payload.taken := btbUpdateFlow.payload.taken
+    debugBranchRetire.payload.mispredicted := debugBranchMispredict
+    debugBranchRetire.payload.branchType := btbUpdateFlow.payload.brType
 
     // ── Retire-time BTB update (fetch-time predictor, slice 1) ──────────────────
     // When a BTB-eligible branch retires at the head (retire0 — branches are
@@ -1838,11 +1860,30 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       when(c.urpValid)  { mmuCtrl.setUrp.valid := True; mmuCtrl.setUrp.payload := c.urp }
       when(c.srpValid)  { mmuCtrl.setSrp.valid := True; mmuCtrl.setSrp.payload := c.srp }
       when(c.pcValid)   { debugLivePcReg := c.pc }
+      when(c.tcValid || c.itt0Valid || c.itt1Valid || c.dtt0Valid || c.dtt1Valid ||
+           c.urpValid || c.srpValid) {
+        // Any address-translation edit invalidates both ATCs on the same architectural
+        // apply edge. The full-core wiring already fans this sole-owner pulse to ITLB
+        // and DTLB; no debug plugin reaches into either TLB.
+        exc.sysFlushAllValid := True
+      }
     }
     GenerationFlags.simulation {
       assert(!(debugSystemApplyIn.valid && !(debugHalted || coreHalted)),
         "RobPlugin: debug architectural apply reached commit owner while running", FAILURE)
     }
+
+    val debugExceptionEntry = Flow(DebugExceptionEvent())
+    debugExceptionEntry.valid.simPublic()
+    debugExceptionEntry.payload.vector.simPublic()
+    debugExceptionEntry.payload.exceptionPc.simPublic()
+    debugExceptionEntry.payload.faultAddress.simPublic()
+    debugExceptionEntry.payload.handlerPc.simPublic()
+    debugExceptionEntry.valid := exc.obsFire && exc.obsIsEntry
+    debugExceptionEntry.payload.vector := exc.obsVector
+    debugExceptionEntry.payload.exceptionPc := exc.obsExceptionPc
+    debugExceptionEntry.payload.faultAddress := exc.obsFaultAddress
+    debugExceptionEntry.payload.handlerPc := exc.obsHandlerPc
 
     // ── Drive trace-exception (T0/T1) recognition (task #193) ───────────────────
     // T1/T0 are bits 7/6 of the SR SYSTEM byte (srSys(7)=T1, srSys(6)=T0 — see
@@ -1922,7 +1963,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
                          Mux(debugHaltState === DebugHaltState.STEP_RUNNING, debugStepRestartPc,
                          Mux(count === 0, debugLivePcReg, p0.predNextPc)))))
-    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter
+    // A halted PC edit must update the frontend's registered restart point as well as
+    // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
+    // consumer empty and does not release the debug halt.
+    val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid
+    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
+    when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
     when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) {
@@ -2061,6 +2107,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     logic.debugSystemApplyIn.valid := cmd.valid
     logic.debugSystemApplyIn.payload := cmd.payload
   }
+
+  override def macroRetirePc: Vec[Flow[UInt]] = logic.debugMacroRetirePc
+  override def branchRetire: Flow[DebugBranchEvent] = logic.debugBranchRetire
+  override def exceptionEntry: Flow[DebugExceptionEvent] = logic.debugExceptionEntry
 
   override def btbUpdate = logic.btbUpdateFlow
   override def gshareUpdate = logic.gshareUpdateFlow

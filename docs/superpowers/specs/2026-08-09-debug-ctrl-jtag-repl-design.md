@@ -865,6 +865,12 @@ implemented tranche.
 - Prove one-register dirty apply leaves every other register unchanged.
 - Assert no direct-write physical-port collision and no retirement while apply BUSY.
 - Run the Python GDB register-packet tests, including register-write then exact step.
+- Add the initial 32-entry committed macro-PC, retired-branch, and completed-exception
+  histories described in section 9.3. These are part of the boot-debug surface: they
+  share the coherent halted view and do not imply that Stage 7 performance telemetry
+  is present.
+- Validate wrap/head semantics, synchronous-read latency, simultaneous dual-retire
+  events, and committed-only branch/exception producers.
 
 ### Stage 4 — cache maintenance and SoC memory truth
 
@@ -895,10 +901,9 @@ implemented tranche.
 
 ### Stage 7 — trace and truthful telemetry
 
-- Add the optional 32-entry macro-retirement PC ring described in section 9.3, plus
-  the optional 32-entry retired-branch and exception rings and real event producers.
-- Validate wrap/head semantics, build-time depths, synchronous-read latency, simultaneous
-  dual-retire events, and no fabricated counters.
+- Add only telemetry with real event producers, beginning with the optional performance
+  counters described in section 9.3. Do not advertise counters or enhanced trace
+  controls until every reported value is backed by implemented hardware.
 
 ### Gates for every RTL stage
 

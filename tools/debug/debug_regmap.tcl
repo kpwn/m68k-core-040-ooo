@@ -202,9 +202,9 @@ set ::dbg::FEAT_STAGE(cfg_wipe) 1
 set ::dbg::FEAT_BIT(cpu_reset_count) 3
 set ::dbg::FEAT_STAGE(cpu_reset_count) 1
 set ::dbg::FEAT_BIT(pc_trace) 4
-set ::dbg::FEAT_STAGE(pc_trace) 7
+set ::dbg::FEAT_STAGE(pc_trace) 3
 set ::dbg::FEAT_BIT(exc_ring) 5
-set ::dbg::FEAT_STAGE(exc_ring) 7
+set ::dbg::FEAT_STAGE(exc_ring) 3
 set ::dbg::FEAT_BIT(break_pc_multi) 6
 set ::dbg::FEAT_STAGE(break_pc_multi) 5
 set ::dbg::FEAT_BIT(halt_exc_mask) 7
@@ -242,7 +242,7 @@ set ::dbg::FEAT_STAGE(macro_retire_count) 2
 set ::dbg::FEAT_BIT(stop_status_v2) 23
 set ::dbg::FEAT_STAGE(stop_status_v2) 2
 set ::dbg::FEAT_BIT(branch_ring) 24
-set ::dbg::FEAT_STAGE(branch_ring) 7
+set ::dbg::FEAT_STAGE(branch_ring) 3
 
 set ::dbg::PORT_DIR(dbg_axi_awaddr) IN
 set ::dbg::PORT_WIDTH(dbg_axi_awaddr) 20
