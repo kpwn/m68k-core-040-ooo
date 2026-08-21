@@ -54,11 +54,16 @@ is_reserved() {
   return 0
 }
 
-require_clean() {
+is_clean() {
   local path="$1"
   local status
   status="$(git -C "$path" status --porcelain | grep -vE '^.. \.agent-reservation$' || true)"
-  if [[ -n "$status" ]]; then
+  [[ -z "$status" ]]
+}
+
+require_clean() {
+  local path="$1"
+  if ! is_clean "$path"; then
     echo "worktree is dirty: $path" >&2
     git -C "$path" status --short | grep -vE '^.. \.agent-reservation$' >&2 || true
     exit 1
@@ -78,7 +83,7 @@ init_pool() {
     name="$(slot_name "$idx")"
     path="$(slot_path "$name")"
     if [[ -d "$path/.git" || -f "$path/.git" ]]; then
-      if ! is_reserved "$path"; then
+      if ! is_reserved "$path" && is_clean "$path"; then
         sync_slot "$path"
       fi
     else
@@ -100,6 +105,9 @@ status_pool() {
     if is_reserved "$path"; then
       state="reserved"
       note="$(tr '\n' ' ' < "$(reservation_file "$path")")"
+    elif ! is_clean "$path"; then
+      state="free-dirty"
+      note="preserved; not eligible for reuse"
     else
       state="free"
       note=""
@@ -122,7 +130,7 @@ reserve_slot() {
     local name path
     name="$(slot_name "$idx")"
     path="$(slot_path "$name")"
-    if ! is_reserved "$path"; then
+    if ! is_reserved "$path" && is_clean "$path"; then
       sync_slot "$path"
       {
         printf "agent=%s\n" "$agent"
@@ -135,7 +143,7 @@ reserve_slot() {
     fi
   done
 
-  echo "no free worktree slots" >&2
+  echo "no clean free worktree slots" >&2
   exit 1
 }
 
