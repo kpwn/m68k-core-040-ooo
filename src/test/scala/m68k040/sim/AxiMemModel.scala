@@ -688,32 +688,21 @@ object AxiMemModel {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // *** TWO INCOMPATIBLE PROGRAM-IMAGE CONVENTIONS EXIST IN THIS TREE. ***
-  // Do NOT "unify" them -- both are load-bearing and every passing test depends on
-  // the one it uses. Documented at `PortedTestRunner.scala:109-115`.
+  // *** PROGRAM IMAGES USE ARCHITECTURAL BYTE-AT-ADDRESS ORDER. ***
   //
-  //  - I-SIDE (instruction fetch): each 16-bit big-endian opword is stored
-  //    LOW-BYTE-FIRST, i.e. BYTE-SWAPPED per word relative to the raw image.
-  //    `attachProgramIFetch` is the single full-core loader;
-  //    `IcacheSim.attachMemoryWithWords` uses the same convention for raw words.
-  //  - D-SIDE (data): PLAIN byte-at-address, no swap. `BehavioralMemAgent` and every
-  //    store/load ported test use this.
+  // I-side and D-side memories both store the assembled m68k big-endian byte stream
+  // unchanged. The RTL I-cache retains raw byte-address-invariant data and its opcode
+  // consumers perform the architectural 16-bit assembly.
   //
-  // `PortedTestRunner` deliberately seeds the SAME image into BOTH views, each in its
-  // own convention, so a PC-relative literal-pool read sees the same bytes the
-  // I-cache fetched as code.
+  // `PortedTestRunner` seeds the same image into both separate memory objects, so a
+  // PC-relative literal-pool read sees the same bytes the I-cache fetched as code.
   // ─────────────────────────────────────────────────────────────────────────────
 
-  /** I-side convention: byte-swapped per 16-bit word. */
+  /** I-side program image in architectural byte-at-address order. */
   def loadProgramIFetch(mem: SparseMemory, loadAddr: Long, bytes: Vector[Int]): Unit = {
     require((bytes.length & 1) == 0,
       s"instruction image must contain whole 16-bit words (got ${bytes.length} bytes)")
-    val nWords = bytes.length / 2
-    for (i <- 0 until nWords) {
-      val w = ((bytes(2 * i) & 0xff) << 8) | (bytes(2 * i + 1) & 0xff)   // big-endian word
-      mem.write(loadAddr + 2 * i,     (w & 0xff).toByte)
-      mem.write(loadAddr + 2 * i + 1, ((w >> 8) & 0xff).toByte)
-    }
+    for (i <- bytes.indices) mem.write(loadAddr + i, bytes(i).toByte)
   }
 
   /** `BRA.S -2`, used as a side-effect-free fence after finite lock-step images.
@@ -722,12 +711,12 @@ object AxiMemModel {
   val RunAheadGuardOpword = 0x60fe
   val LockStepRunAheadGuardWords = 2048
 
-  /** Append `words` of the run-ahead fence using the I-side byte convention. */
+  /** Append `words` of the run-ahead fence in architectural big-endian order. */
   def fillIFetchRunAheadGuard(mem: SparseMemory, endAddr: Long, words: Int): Unit = {
     require(words >= 0, s"run-ahead guard length must be non-negative (got $words)")
     for (i <- 0 until words) {
-      mem.write(endAddr + 2L * i,     (RunAheadGuardOpword & 0xff).toByte)
-      mem.write(endAddr + 2L * i + 1, ((RunAheadGuardOpword >> 8) & 0xff).toByte)
+      mem.write(endAddr + 2L * i,     ((RunAheadGuardOpword >> 8) & 0xff).toByte)
+      mem.write(endAddr + 2L * i + 1, (RunAheadGuardOpword & 0xff).toByte)
     }
   }
 

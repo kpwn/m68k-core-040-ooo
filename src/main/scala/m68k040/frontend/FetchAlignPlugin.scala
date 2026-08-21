@@ -1,6 +1,6 @@
 package m68k040.frontend
 
-import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp}
+import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp, IcacheInstructionOrder}
 import m68k040.services.{DecodeFeedService, FetchService, FrontendQuiesceService,
   FtbLookupCmd, FtbLookupRsp, FtbLookupService, GshareWindowRsp, GshareWindowService}
 import spinal.core._
@@ -642,8 +642,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // same cycle in steady state: one in, one out -> count unchanged).
 
     // ---- Enqueue: handle I-cache responses ----
-    // Extract the 4 words from the 64-bit response data (LE: bits[15:0] = word 0 = lowest addr)
-    val rspWords = ic.rsp.payload.data.subdivideIn(16 bits)
+    // The response is raw byte-at-address data (bits[7:0] = byte at pc). Assemble
+    // each pair as a numeric big-endian 68k opword before it enters the instruction
+    // buffer and reaches decode. Refill predecode performs the identical conversion.
+    val rawRspWords = ic.rsp.payload.data.subdivideIn(16 bits)
+    val rspWords = Vec((0 until 4).map(i => IcacheInstructionOrder.opword(rawRspWords(i))))
     val rspPreds = ic.rsp.payload.pred
 
     // The response belongs to the HEAD ring entry (in-order pipeline). Its OWN

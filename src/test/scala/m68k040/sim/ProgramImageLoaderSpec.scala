@@ -4,20 +4,20 @@ import org.scalatest.funsuite.AnyFunSuite
 import spinal.lib.sim.SparseMemory
 
 class ProgramImageLoaderSpec extends AnyFunSuite {
-  test("I-fetch loader swaps each big-endian opword and appends an exact guard") {
+  test("I-fetch loader preserves big-endian bytes and appends an exact guard") {
     val mem = SparseMemory(0L, 0L)
     val base = 0x40800000L
 
     AxiMemModel.loadProgramIFetch(mem, base, Vector(0x12, 0x34, 0xab, 0xcd))
     AxiMemModel.fillIFetchRunAheadGuard(mem, base + 4, words = 3)
 
-    assert((mem.read(base) & 0xff) == 0x34)
-    assert((mem.read(base + 1) & 0xff) == 0x12)
-    assert((mem.read(base + 2) & 0xff) == 0xcd)
-    assert((mem.read(base + 3) & 0xff) == 0xab)
+    assert((mem.read(base) & 0xff) == 0x12)
+    assert((mem.read(base + 1) & 0xff) == 0x34)
+    assert((mem.read(base + 2) & 0xff) == 0xab)
+    assert((mem.read(base + 3) & 0xff) == 0xcd)
     for (i <- 0 until 3) {
-      assert((mem.read(base + 4 + 2L * i) & 0xff) == 0xfe)
-      assert((mem.read(base + 5 + 2L * i) & 0xff) == 0x60)
+      assert((mem.read(base + 4 + 2L * i) & 0xff) == 0x60)
+      assert((mem.read(base + 5 + 2L * i) & 0xff) == 0xfe)
     }
   }
 

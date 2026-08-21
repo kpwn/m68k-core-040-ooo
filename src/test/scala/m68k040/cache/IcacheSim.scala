@@ -62,8 +62,9 @@ object IcacheSim {
                             words: Seq[Int]): AxiMemModel = {
     val mem = SparseMemory()
     words.zipWithIndex.foreach { case (w, i) =>
-      mem.write(base + 2*i,     (w & 0xff).toByte)
-      mem.write(base + 2*i + 1, ((w >> 8) & 0xff).toByte)
+      // Real 68k memory order: most-significant opcode byte at the lower address.
+      mem.write(base + 2*i,     ((w >> 8) & 0xff).toByte)
+      mem.write(base + 2*i + 1, (w & 0xff).toByte)
     }
     AxiMemModel.attachReadOnly(axi, cd, AxiMemModelConfig(), sharedMem = mem)
   }

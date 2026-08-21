@@ -459,12 +459,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * The assembled `image.bytes` are the m68k big-endian byte stream: instruction
     * word w is stored high-byte-first (`bytes[2i]=w>>8`, `bytes[2i+1]=w&0xff`).
     *
-    * The I-cache forms its 64-bit little-endian window from memory bytes such that
-    * window-word j = `mem[base+2j+1]<<8 | mem[base+2j]` (low byte at the lower
-    * address) and hands that to the aligner/decoder as the instruction opcode. So
-    * to present opcode w to the decoder we must store the bytes byte-SWAPPED
-    * relative to the big-endian image: low byte first. This matches the proven
-    * `IcacheSim.attachMemoryWithWords` convention.
+    * The I-cache preserves those bytes in byte-address-invariant order. Its predecode
+    * and fetch/align opcode consumers assemble each pair as a big-endian 68k word, so
+    * the harness stores the image unchanged.
     *
     * HARNESS HARDENING (2026-08-09, see `.superpowers/sdd/task-a3-sentinel-confirmation-report.md`):
     * the doc-comment used to claim "bytes outside the image read as 0 (decode into
@@ -5827,8 +5824,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   }
 
   // ── ITLB lock-step helpers ──────────────────────────────────────────────────
-  /** Place a code image at an ARBITRARY base in an I-cache SparseMemory (low-byte
-    * first, matching the I-cache window convention — same swap as attachProgram). */
+  /** Place a code image at an arbitrary base in architectural byte order. */
   private def writeCodeAt(mem: SparseMemory, base: Long, bytes: Vector[Int]): Unit = {
     m68k040.sim.AxiMemModel.loadProgramIFetch(mem, base, bytes)
     // Same run-ahead guard as `attachProgram` — see its comment. The ITLB lock-step

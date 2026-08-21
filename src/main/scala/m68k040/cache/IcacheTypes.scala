@@ -2,6 +2,18 @@ package m68k040.cache
 
 import spinal.core._
 
+/** Convert one raw byte-address-invariant instruction word into the numeric 68k
+  * opword consumed by predecode/decode.  In raw cache data, bits[7:0] are the byte
+  * at the lower address; a 68k instruction word is big-endian, so that byte is the
+  * opword's most-significant byte.  Keep this conversion at opcode consumers: the
+  * I-cache data arrays and FetchRsp retain their documented raw-byte convention. */
+object IcacheInstructionOrder {
+  def opword(raw: Bits): Bits = {
+    require(raw.getWidth == 16, s"IcacheInstructionOrder.opword needs 16 bits (got ${raw.getWidth})")
+    raw(7 downto 0) ## raw(15 downto 8)
+  }
+}
+
 /** Per-16-bit-word predecode result (one per chunk; 32 per 64-byte line).
   * `lenWords` (1..10 words = 2..20 bytes) is meaningful only when `simple`. Widened
   * 3->4 bits (2026-07-11, deep-audit F2/F1/F3): a MOVE with a full-format-indexed

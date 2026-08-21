@@ -145,29 +145,23 @@ object PortedTestRunner {
                                                    sharedMem = dsideMem, injectBusErrors = true)
       // SELF-MODIFYING CODE: mirror every runtime D-side store byte into the I-side's
       // SEPARATE program image. The I and D views are two different `SparseMemory`
-      // objects holding the SAME image in two DELIBERATELY INCOMPATIBLE byte
-      // conventions (see the big warning block in AxiMemModel.scala): the D side is
-      // plain byte-at-address, the I side stores each 16-bit big-endian opword
-      // LOW-BYTE-FIRST. Seeding both at setup (below) is enough for ordinary tests, but
+      // objects holding the same architectural byte-at-address image. Seeding both at
+      // setup (below) is enough for ordinary tests, but
       // a RUNTIME store -- an SMC test patching its own code, or a test staging code in
       // RAM and jumping to it -- only ever landed in the D-side memory, so instruction
       // fetch could never observe it no matter how correct the RTL's D-cache/I-cache/
       // CPUSH/CINV coherency handling was.
       //
-      // The address transform is DERIVED from `AxiMemModel.loadProgramIFetch`'s own swap
-      // loop, not guessed: it writes the byte from plain offset 2i+1 to `loadAddr+2i`
-      // and the byte from plain offset 2i to `loadAddr+2i+1`, i.e. plain offset X lands
-      // at I-side offset X^1. `loadAddr` (0x40800000) is even, so this lifts to absolute
-      // addresses unchanged: plain address A <-> I-side address A^1. It holds per byte,
-      // needs no word alignment and no range restriction (mirroring a store to a stack
-      // or MMIO address just writes a byte the I-cache never reads).
+      // Both memories now use the same address convention, so runtime stores mirror
+      // directly by byte address. This also makes staged code and self-modifying code
+      // match real 68k memory instead of relying on a harness-only word swap.
       //
       // Only `dmem` gets the observer. The two MMU table-walker agents below SHARE
       // `dmem.mem` but have their own independent write engines, and the only thing they
       // ever write is a U/M-bit descriptor update into a page table the test built in a
       // data region -- never code. Mirroring those would add a way to corrupt the I-side
       // image for no benefit, so they are deliberately left unhooked.
-      dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr ^ 1L, byte))
+      dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr, byte))
       // Task #194: SHARE dmem's backing SparseMemory with both MMU table-walker AXI
       // ports. Architecturally the page table lives in ordinary RAM — a directed
       // ported test builds it with REAL `move.l #imm,addr` instructions through the

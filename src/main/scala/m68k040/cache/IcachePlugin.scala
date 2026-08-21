@@ -899,8 +899,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
       * three validity FLAGS the whole-line scheme did. Only the final 3 words of the
       * line see `valid = false`, which is exactly the case that already existed. */
     def classifyBeat(beat: Bits, nextLo: Bits, nextValid: Bool): Bits = {
-      val w  = beat.subdivideIn(16 bits)      // WORDS_PER_BEAT words, index 0 = lowest addr
-      val nx = nextLo.subdivideIn(16 bits)    // 3 words of the next beat
+      val rawW  = beat.subdivideIn(16 bits)   // raw bytes, index 0 = lowest addr
+      val rawNx = nextLo.subdivideIn(16 bits) // 3 raw words of the next beat
+      // Predecode consumes numeric big-endian 68k opwords, while the cache arrays
+      // deliberately retain byte-address-invariant memory data.
+      val w  = Vec((0 until WORDS_PER_BEAT).map(i => IcacheInstructionOrder.opword(rawW(i))))
+      val nx = Vec((0 until 3).map(i => IcacheInstructionOrder.opword(rawNx(i))))
       def word(i: Int): Bits =
         if (i < WORDS_PER_BEAT) w(i) else Mux(nextValid, nx(i - WORDS_PER_BEAT), B(0, 16 bits))
       def wordValid(i: Int): Bool =
