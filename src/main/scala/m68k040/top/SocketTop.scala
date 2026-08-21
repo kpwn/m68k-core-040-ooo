@@ -99,7 +99,10 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new ItlbPlugin(socketMerged = true),
       new DtlbPlugin(socketMerged = true),
       icache,
-      new DcachePlugin(socketMerged = true),
+      // Keep the optional early VIPT snapshot path out of the FPGA socket while
+      // isolating the live-board wrong-set response observed during ROM boot.
+      // Resolved loads retain the ordinary translated D-cache path.
+      new DcachePlugin(socketMerged = true, earlyViptEnabled = false),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
       new m68k040.frontend.RasPlugin(),

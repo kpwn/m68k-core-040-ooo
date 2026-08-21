@@ -38,7 +38,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   DETECTION and the whole EVICT_WR/REFILL/REPLAY machinery are unchanged (they
   *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
-class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with DcacheService {
+class DcachePlugin(val socketMerged: Boolean = false,
+                   val earlyViptEnabled: Boolean = true) extends FiberPlugin with DcacheService {
 
   private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
@@ -1171,9 +1172,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             probeReadTag    := loadProbePort.payload.paddr(31 downto offBits + setBits)
             probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
             probeReadSize   := loadProbePort.payload.size
-            probeReadUsable := loadProbePort.payload.resolved &&
-                               !loadProbePort.payload.needsLine &&
-                               (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+            probeReadUsable := (if (earlyViptEnabled) {
+              loadProbePort.payload.resolved &&
+                !loadProbePort.payload.needsLine &&
+                (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+            } else False)
             probeReadNeedsLine := loadProbePort.payload.needsLine
           }
         }
