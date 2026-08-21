@@ -329,6 +329,65 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     }
   }
 
+  test("inhibited device read waits for an older write at a different MMIO port", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val writePort = 0x1800L
+      val readPort  = 0x2800L
+      val storeRob  = 5
+      val loadRob   = 6
+      seed(dut, cd, preg = 10, value = writePort)
+      seed(dut, cd, preg = 11, value = 0x000000f5L)
+      seed(dut, cd, preg = 12, value = readPort)
+      Seq(0x02, 0xEE, 0x00, 0xEC).zipWithIndex.foreach {
+        case (b, i) => mem.pokeByte(readPort + i, b)
+      }
+
+      // These stand in for a device's command and status/data ports: distinct
+      // addresses and cache lines, but one architecturally serialized device.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11,
+                 Size.BYTE, robId = storeRob)
+      val (idx, completed) = waitAlloc(dut, cd, robId = storeRob)
+      assert(idx >= 0 && !completed, "inhibited device write must remain precise")
+      issueLoad(dut, cd, basePreg = 12, disp = 0, pdst = 20, robId = loadRob)
+
+      var readIssuedEarly = false
+      var serialStallSeen = false
+      for (_ <- 0 until 30) {
+        if (dut.eu.logic.p4Valid.toBoolean &&
+            dut.eu.logic.p4Ctx.xlate.front.robId.toInt == loadRob)
+          serialStallSeen = true
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == readPort)
+          readIssuedEarly = true
+        cd.waitSampling()
+      }
+      assert(serialStallSeen,
+        "different-address device read must remain parked behind the older write")
+      assert(!readIssuedEarly,
+        "different-address device read must not launch before the older write drains")
+
+      dut.wire.logic.iRobHeadIn      #= storeRob
+      dut.wire.logic.iRobHeadValidIn #= true
+      var readIssued = false
+      var loadCompleted = false
+      var cycles = 0
+      while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == readPort)
+          readIssued = true
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompleted = true
+        cd.waitSampling()
+        cycles += 1
+      }
+      assert(readIssued, "device read must launch after the older write is acknowledged")
+      assert(loadCompleted, "device read must complete after its bus response")
+    }
+  }
+
   test("MMU-on WRITETHROUGH-page store with DE=1 allocates precise=False and completes at alloc, as before", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem, ptmem) = initDut(dut)

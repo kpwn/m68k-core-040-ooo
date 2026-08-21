@@ -73,6 +73,7 @@ class StoreQueueSplitSpec extends AnyFunSuite {
 
   def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type]): Unit = {
     dut.io.fwd.query.robId #= robId; dut.io.fwd.query.paddr #= paddr; dut.io.fwd.query.size #= size
+    dut.io.fwd.query.inhibited #= false
   }
 
   def initDut(dut: StoreQueue): ClockDomain = {

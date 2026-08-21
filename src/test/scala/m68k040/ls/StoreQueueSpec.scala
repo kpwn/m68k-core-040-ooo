@@ -41,10 +41,35 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.commit.valid #= false
   }
 
-  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type]): Unit = {
+  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type],
+               inhibited: Boolean = false): Unit = {
     dut.io.fwd.query.robId #= robId
     dut.io.fwd.query.paddr #= paddr
     dut.io.fwd.query.size #= size
+    dut.io.fwd.query.inhibited #= inhibited
+  }
+
+  test("inhibited accesses serialize across non-overlapping device ports", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+
+      // A device write and its readback/status port need not overlap or share a
+      // cache line.  The younger inhibited load must still wait.
+      alloc(dut, cd, robId = 4, paddr = 0x50f1e800L, data = 0xf5, Size.BYTE,
+        cacheMode = m68k040.cache.CacheMode.INHIBITED, precise = true)
+      setQuery(dut, robId = 6, paddr = 0x50f1f800L, Size.BYTE, inhibited = true)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "device load must never SQ-forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "different-address device read must wait for the older device write")
+
+      // Total ordering is bidirectional at the boundary: an ordinary younger
+      // load also cannot pass an older inhibited store.
+      setQuery(dut, robId = 6, paddr = 0x3000L, Size.LONG, inhibited = false)
+      sleep(1)
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "ordinary load must not pass an older inhibited store")
+    }
   }
 
   def initDut(dut: StoreQueue): ClockDomain = {

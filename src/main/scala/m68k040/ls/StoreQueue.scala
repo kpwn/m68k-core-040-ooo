@@ -38,6 +38,10 @@ case class SqFwdQuery() extends Bundle {
   val robId = UInt(6 bits)
   val paddr = UInt(32 bits)
   val size  = Size()
+  // Cache-inhibited accesses are serialized device operations.  They order
+  // against every older store, even when the addresses do not overlap (device
+  // command/data and register ports commonly occupy different addresses).
+  val inhibited = Bool()
 }
 
 case class SqFwdRsp() extends Bundle {
@@ -341,6 +345,9 @@ class StoreQueue(depth: Int = 8) extends Component {
     // full overlap = exact addr+size against slot A of a NON-split store.
     val full     = overlapA && !validBs(i) && (aLo === qLo) && (nbytesAs(i) === qBytes)
     val partial  = overlap && !full
+    val inhibitedStore = ent &&
+      ((cacheModes(i) === CacheMode.INHIBITED) ||
+       (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))
     // SAME-CACHE-LINE hazard (16-byte line; offBits=4). A younger load that MISSES the
     // L1D refills the WHOLE line from memory. If an OLDER store to the SAME line is still
     // in the SQ (not yet written through to memory), that refill would cache a STALE line
@@ -415,9 +422,21 @@ class StoreQueue(depth: Int = 8) extends Component {
   // (then we have the data and never touch the cache). A byte-partial overlap already
   // stalls via anyPartial; sameLine extends that to line-overlap-only stores too.
   val anySameLine = perEntry.map(_.sameLine).orR
-  io.fwd.rsp.hit   := fullValid
+  // INHIBITED is a total-order boundary (architecture design §7.1; MSHR design
+  // §4.2/§5.5), not merely a cache-bypass hint.  Therefore:
+  //   * an inhibited load waits for every older resident store; and
+  //   * every load waits for an older inhibited store.
+  // This deliberately covers different addresses: many MMIO devices expose a
+  // write port and readback/status port at distinct addresses.  Suppress a
+  // nominal full-overlap forward while the serial barrier is present so the LS
+  // EU cannot take its fullForward arm ahead of rsp.stall.
+  val anyOlder = perEntry.map(_.ent).orR
+  val anyOlderInhibitedStore = perEntry.map(_.inhibitedStore).orR
+  val serialStall = (q.inhibited && anyOlder) || anyOlderInhibitedStore
+  io.fwd.rsp.hit   := fullValid && !serialStall
   io.fwd.rsp.data  := best.data
-  io.fwd.rsp.stall := (anyPartial || anySameLine) && !fullValid   // a clean full forward resolves the load
+  io.fwd.rsp.stall := serialStall ||
+                      ((anyPartial || anySameLine) && !fullValid)
 
   // ---- commit: mark the matching valid entry committed (either retire slot) ----
   when(io.commit.valid) {

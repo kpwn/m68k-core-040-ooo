@@ -853,6 +853,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.fwd.query.robId := fwdQueryCtx.front.robId
     sq.io.fwd.query.paddr := fwdQueryCtx.paddr
     sq.io.fwd.query.size  := fwdQueryCtx.front.size
+    sq.io.fwd.query.inhibited :=
+      (fwdQueryCtx.cmode === m68k040.cache.CacheMode.INHIBITED) ||
+      (fwdQueryCtx.front.twoAccess &&
+       (fwdQueryCtx.cmodeB === m68k040.cache.CacheMode.INHIBITED))
 
     val isLoad  = u1.memOp === MemOp.LOAD
     val isStore = u1.memOp === MemOp.STORE
