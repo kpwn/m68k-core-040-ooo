@@ -39,16 +39,28 @@ reservation_file() {
 }
 
 is_reserved() {
-  [[ -f "$(reservation_file "$1")" ]]
+  local path="$1"
+  local file
+  file="$(reservation_file "$path")"
+  [[ -f "$file" ]] || return 1
+
+  # Older revisions accidentally committed this runtime marker.  A released
+  # tracked marker can therefore be inherited by every newly-created slot; it
+  # is metadata from the source worktree, not a reservation of this slot.
+  if git -C "$path" ls-files --error-unmatch -- .agent-reservation >/dev/null 2>&1 \
+      && grep -q '^released_at=' "$file"; then
+    return 1
+  fi
+  return 0
 }
 
 require_clean() {
   local path="$1"
   local status
-  status="$(git -C "$path" status --porcelain | grep -v '^[?][?] .agent-reservation$' || true)"
+  status="$(git -C "$path" status --porcelain | grep -vE '^.. \.agent-reservation$' || true)"
   if [[ -n "$status" ]]; then
     echo "worktree is dirty: $path" >&2
-    git -C "$path" status --short | grep -v '^[?][?] .agent-reservation$' >&2 || true
+    git -C "$path" status --short | grep -vE '^.. \.agent-reservation$' >&2 || true
     exit 1
   fi
 }
@@ -147,7 +159,17 @@ free_slot() {
     exit 1
   fi
   require_clean "$path"
-  rm -f "$(reservation_file "$path")"
+  local file
+  file="$(reservation_file "$path")"
+  if git -C "$path" ls-files --error-unmatch -- .agent-reservation >/dev/null 2>&1; then
+    # Migration path for reservations made while the marker was tracked.  A
+    # later init/reserve sync will check out a revision where it is untracked.
+    if ! grep -q '^released_at=' "$file"; then
+      printf "released_at=%s\n" "$(date -Is)" >> "$file"
+    fi
+  else
+    rm -f "$file"
+  fi
 }
 
 cmd="${1:-}"
