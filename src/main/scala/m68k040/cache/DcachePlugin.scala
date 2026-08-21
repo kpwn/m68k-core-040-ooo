@@ -132,16 +132,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // for every call site during this task), so no new read-port arbitration logic
     // is needed at all.
     //
-    // Mem.init(all False) replaces RegInit(False)'s per-bit reset -- real 68040
-    // semantics (cache contents undefined/INVALID at reset) are preserved exactly
-    // (all-False == all-invalid), and unlike a flop array this needs no reset
-    // fan-in: Vivado synthesizes the `initial` content directly into the LUTRAM
-    // primitive's INIT parameter (same mechanism as `ucRomMem` in DecodeStage.scala,
-    // just RAM instead of ROM), and the SpinalHDL simulator honors Mem.init as the
-    // sim-time reset content from cycle 0, so no boot-pulse invalidate walk is
-    // needed here (`Mem.init` already IS a clean, structurally-reset value -- see
-    // this task's report for why the report's speculative boot-walk turned out to
-    // be unnecessary).
+    // Mem.init(all False) supplies the FPGA CONFIGURATION-time contents, but it does
+    // not make these inferred RAMs respond to a later CPU/JTAG runtime reset.  A
+    // same-bitstream reset therefore needs the explicit set walk below; otherwise
+    // old valid+dirty lines survive while all surrounding control and replacement
+    // registers reset, letting a new boot hit data from the previous one.
     val validsMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
     val dirtysMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
     // test-visibility only (DcacheSpec/DcacheDrainRefillRaceSpec peek dirtysMem(w)
@@ -155,6 +150,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // UNACCESSIBLE SIGNAL at sim time, not a silent no-op.
     for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
+    // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
+    // merely at FPGA configuration); one set is invalidated per cycle after reset
+    // releases. Request acceptance and maintenance quiescence are gated below until
+    // all sets are clean. Data/tag RAM need not be cleared: valid=False makes their
+    // payload architecturally unreachable, exactly as a normal invalidate does.
+    val resetSweepBusy = RegInit(True)
+    val resetSweepSet  = Reg(UInt(setBits bits)) init 0
+    resetSweepBusy.simPublic(); resetSweepSet.simPublic()
 
     // ---- single muxed data/tag write port per way (refill + store-write) ----
     val wrEn    = Vec.fill(ways)(False)
@@ -198,13 +201,32 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // fanout outside the simulation-only assert below, so Vivado's own dead-code
     // elimination removes it entirely from a non-simulation netlist.
     val validsVoteW1 = Vec.fill(ways)(False)   // W1: REFILL-allocate
+    val validsVoteW0 = Vec.fill(ways)(False)   // W0: runtime-reset invalidate
     val validsVoteW2 = Vec.fill(ways)(False)   // W2: maint CHECK-invalidate
     val validsVoteW3 = Vec.fill(ways)(False)   // W3: maint WRB-invalidate
     val dirtysVoteD1 = Vec.fill(ways)(False)   // D1: REFILL-allocate
+    val dirtysVoteD0 = Vec.fill(ways)(False)   // D0: runtime-reset clear
     val dirtysVoteD2 = Vec.fill(ways)(False)   // D2: REPLAY-merge write-allocate
     val dirtysVoteD3 = Vec.fill(ways)(False)   // D3: maint CHECK-invalidate
     val dirtysVoteD4 = Vec.fill(ways)(False)   // D4: maint WRB-clean
     val dirtysVoteD5 = Vec.fill(ways)(False)   // D5: store-S3-copyback
+    when(resetSweepBusy) {
+      for (w <- 0 until ways) {
+        validsWrEn(w)   := True
+        validsWrSet(w)  := resetSweepSet
+        validsWrData(w) := False
+        dirtysWrEn(w)   := True
+        dirtysWrSet(w)  := resetSweepSet
+        dirtysWrData(w) := False
+        validsVoteW0(w) := True
+        dirtysVoteD0(w) := True
+      }
+      when(resetSweepSet === U(sets - 1, setBits bits)) {
+        resetSweepBusy := False
+      } otherwise {
+        resetSweepSet := resetSweepSet + 1
+      }
+    }
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
@@ -439,7 +461,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     axi.b.ready  := True
 
     val busy = Reg(Bool()) init False
-    loadBusyReg := busy
+    loadBusyReg := busy || resetSweepBusy
 
     // ---- load index/tag from cmd vaddr + PRE-TRANSLATED paddr ----
     // FMax: the physical tag comes from the requester's REGISTERED `loadCmd.paddr`
@@ -1139,7 +1161,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // single BRAM read port; a command consuming a queued hit needs no read, so
         // the next probe may launch on the same edge. The four-entry result queue
         // absorbs the fixed probe->command distance at one launch per cycle.
-        loadProbePort.ready := !loadShadowValid && !pendingStoreMiss && !maintBusyReg &&
+        loadProbePort.ready := !resetSweepBusy && !loadShadowValid &&
+                               !pendingStoreMiss && !maintBusyReg &&
                                earlyProbeHasAllocSlot &&
                                (!loadCmdPort.valid || useEarlyProbe) &&
                                !(ldS1Valid && !ldS1Hit) &&
@@ -1207,7 +1230,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // WAIT phase must let it drain. New commands remain blocked for the entire
         // maintenance interval. `maintWalking` is false only during that quiesce wait.
         val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
-        loadCmdPort.ready := !loadShadowValid && !pendingStoreMiss &&
+        loadCmdPort.ready := !resetSweepBusy && !loadShadowValid && !pendingStoreMiss &&
                              (!maintBusyReg || resolveOldProbeDuringMaint) &&
                              (!earlyProbeTokenPresent || earlyProbeOwnsCmd) &&
                              (!(storeReadOwed && stS1Valid) || useEarlyProbe)
@@ -1871,7 +1894,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * while a load response is still resolving, even though that response's DATA
       * cannot itself be corrupted by the walk. Costs at most one extra cycle of
       * walk-start delay on an already-rare, ROB-serialized event. */
-    val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
+    val dcIdleForMaint = !resetSweepBusy && !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
                          !earlyProbeValid &&
                          !pendingStoreMiss && !pendingWtKickoff &&
                          !s0Valid && !stS1Valid && !stS2Valid && !stS3Valid &&
@@ -2143,10 +2166,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // comment for why).
     GenerationFlags.simulation {
       for (w <- 0 until ways) {
-        assert(CountOne(Seq(validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
+        assert(CountOne(Seq(validsVoteW0(w), validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
           "DcachePlugin: multiple writers targeted validsMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
           FAILURE)
-        assert(CountOne(Seq(dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
+        assert(CountOne(Seq(dirtysVoteD0(w), dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
           "DcachePlugin: multiple writers targeted dirtysMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
           FAILURE)
       }
@@ -2219,7 +2242,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Admission is purely stage-credit based for COPYBACK. Serial/precise classes
     // require an empty accepted stream; a discovered miss and a waiting refill stop
     // new input while the already-resident shallow pipe drains/holds safely.
-    storePort.ready := s0Ready && !storePipeHeld && !serialStoreInFlight &&
+    storePort.ready := !resetSweepBusy && s0Ready && !storePipeHeld && !serialStoreInFlight &&
       !maintBusyReg && !refillNeedsStoreDrain &&
       (!inputStoreSerial || (storeOutstanding === 0))
 

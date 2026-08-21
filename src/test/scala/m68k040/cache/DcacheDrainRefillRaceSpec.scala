@@ -102,6 +102,36 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   val base = SET * 16L
   def addrK(k: Long): Long = base + k * 0x800L
 
+  test("runtime reset invalidates resident D-cache lines", VerilatorTest) {
+    compiled.doSim("runtimeResetInvalidatesDcache", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val line = 0x0017fdc0L
+      preload(mem, line, 16)
+      val before = load(dut, cd, line + 8, Size.LONG)
+
+      // A board-level CPU/JTAG reset does not reconfigure FPGA RAM INIT bits.
+      // Change backing memory while reset is asserted to model the next boot's
+      // world, then prove the old resident tag cannot survive the runtime reset.
+      cd.assertReset()
+      sleep(40)
+      for (i <- 0 until 4) mem.pokeByte(line + 8 + i, 0xA0 + i)
+      cd.deassertReset()
+      cd.waitSampling(140)
+
+      val after = load(dut, cd, line + 8, Size.LONG)
+      assert(before != BigInt("A0A1A2A3", 16),
+        "test setup accidentally used the post-reset backing value")
+      assert(after == BigInt("A0A1A2A3", 16),
+        f"runtime reset resurrected a stale resident D-cache line: 0x$after%08x")
+    }
+  }
+
   test("PRE-EXISTING BUG (design doc §5 item 11): same-set different-line refill " +
        "racing a store drain's S1 read must not corrupt the refilled line",
        VerilatorTest) {
