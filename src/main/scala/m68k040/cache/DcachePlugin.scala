@@ -866,6 +866,28 @@ class DcachePlugin(val socketMerged: Boolean = false,
       stS3NewBytes(i) := Mux(stS3MergeStrb(i), stS3MrgBytes(i), stS3OldBytes(i))
     val stS3MergedLine = stS3NewBytes.asBits
     val stS3ArrayWrite = stS3Valid && stS3Hit && !stS3Inhibited
+    // A miss may launch the shared synchronous victim read on the same cycle this
+    // S3 store writes that exact set/way.  The miss resolves one cycle later, when
+    // the live S3 signals are already gone, while both the generated simulation
+    // RAM and FPGA block RAM are allowed to return the pre-write line/dirty bit for
+    // that read-during-write collision.  Carry the completed write across that one
+    // cycle so both load- and store-miss victim snapshots can bypass the stale RAM
+    // result.  This complements (and does not replace) their existing live-S3
+    // bypass, which covers a write coincident with the resolution cycle itself.
+    val stS3WriteD1     = RegNext(stS3ArrayWrite) init False
+    val stS3WriteSetD1  = Reg(UInt(setBits bits))
+    val stS3WriteWayD1  = Reg(UInt(wayBits bits))
+    val stS3WriteTagD1  = Reg(UInt(tagBits bits))
+    val stS3WriteLineD1 = Reg(Bits(128 bits))
+    val stS3WriteCopybackD1 = Reg(Bool())
+    stS3WriteD1.simPublic()
+    when(stS3ArrayWrite) {
+      stS3WriteSetD1      := stS3Set
+      stS3WriteWayD1      := stS3Way
+      stS3WriteTagD1      := stS3Tag
+      stS3WriteLineD1     := stS3MergedLine
+      stS3WriteCopybackD1 := stS3Copyback
+    }
     stS3OldLine.simPublic(); stS3MergedLine.simPublic()   // DEBUG (pea-cache-evict-2026-08-19), temporary
 
     stS3Valid.simPublic(); stS3Payload.simPublic(); stS3Hit.simPublic()
@@ -1325,12 +1347,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // chosen" and "a victim is evicted" consistent.
           val victimFromS3 = stS3ArrayWrite && (stS3Set === ldS1Set) &&
             (stS3Way === vw)
-          loadVictimFromS3Dbg := victimFromS3
+          val victimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === ldS1Set) &&
+            (stS3WriteWayD1 === vw)
+          loadVictimFromS3Dbg := victimFromS3 || victimFromS3D1
           val victimDirtyNow = rdDirty(vw) ||
-            (victimFromS3 && stS3Copyback)
+            (victimFromS3 && stS3Copyback) ||
+            (victimFromS3D1 && stS3WriteCopybackD1)
           val evictThis = victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
-          victimEvictTag  := Mux(victimFromS3, stS3Tag, rdTag(vw))
-          victimEvictLine := Mux(victimFromS3, stS3MergedLine, rdData(vw))
+          victimEvictTag  := Mux(victimFromS3, stS3Tag,
+            Mux(victimFromS3D1, stS3WriteTagD1, rdTag(vw)))
+          victimEvictLine := Mux(victimFromS3, stS3MergedLine,
+            Mux(victimFromS3D1, stS3WriteLineD1, rdData(vw)))
           loadMissStoreBarrier := True
           GenerationFlags.simulation {
             assert(!stS2Valid,
@@ -2242,12 +2269,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
         val pVw = victim(stS2Set)
         val pVictimFromS3 = stS3ArrayWrite && (stS3Set === stS2Set) &&
           (stS3Way === pVw)
-        storeVictimFromS3Dbg := pVictimFromS3
+        val pVictimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) &&
+          (stS3WriteWayD1 === pVw)
+        storeVictimFromS3Dbg := pVictimFromS3 || pVictimFromS3D1
         pendingVictimWay   := pVw
         pendingVictimDirty := rdDirty(pVw) ||
-          (pVictimFromS3 && stS3Copyback)
-        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag, rdTag(pVw))
-        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine, rdData(pVw))
+          (pVictimFromS3 && stS3Copyback) ||
+          (pVictimFromS3D1 && stS3WriteCopybackD1)
+        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
+          Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))
+        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine,
+          Mux(pVictimFromS3D1, stS3WriteLineD1, rdData(pVw)))
       } otherwise {
         stS3Valid   := True
         stS3Payload := stS2Payload
