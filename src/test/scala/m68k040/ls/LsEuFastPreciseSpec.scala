@@ -263,6 +263,72 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     }
   }
 
+  test("inhibited load waits for an overlapping precise store then performs a real bus read", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base     = 0x1800L
+      val storeRob = 5
+      val loadRob  = 6
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0x11223344L)
+      Seq(0xDE, 0xAD, 0xBE, 0xEF).zipWithIndex.foreach {
+        case (b, i) => mem.pokeByte(base + i, b)
+      }
+
+      // MMU and D-cache remain disabled, making both accesses INHIBITED.  Hold the
+      // older precise store away from the ROB head so it remains in the SQ while
+      // the younger same-address load reaches the forwarding query.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11,
+                 Size.LONG, robId = storeRob)
+      val (idx, completed) = waitAlloc(dut, cd, robId = storeRob)
+      assert(idx >= 0 && !completed, "inhibited store must remain resident and precise")
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = loadRob)
+
+      var loadCompletedEarly = false
+      var overlapStallSeen = false
+      var readIssuedEarly = false
+      for (_ <- 0 until 30) {
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompletedEarly = true
+        if (dut.eu.logic.p4Valid.toBoolean &&
+            dut.eu.logic.p4Ctx.xlate.front.robId.toInt == loadRob)
+          overlapStallSeen = true
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == base)
+          readIssuedEarly = true
+        cd.waitSampling()
+      }
+      assert(overlapStallSeen,
+        "inhibited load must convert an exact SQ forwarding hit into an ordering stall")
+      assert(!loadCompletedEarly,
+        "inhibited load must not complete from an older store's forwarded data")
+      assert(!readIssuedEarly,
+        "inhibited load must not reach the device before the older store drains")
+
+      // Retire the store.  After its acknowledged drain removes the SQ overlap, the
+      // load must leave P4 through the ordinary inhibited-load path and issue AR.
+      dut.wire.logic.iRobHeadIn      #= storeRob
+      dut.wire.logic.iRobHeadValidIn #= true
+      var readIssued = false
+      var loadCompleted = false
+      var cycles = 0
+      while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == base)
+          readIssued = true
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompleted = true
+        cd.waitSampling()
+        cycles += 1
+      }
+      assert(readIssued,
+        "load must perform a real bus read after the overlapping inhibited store drains")
+      assert(loadCompleted, "load must complete after its device read response")
+    }
+  }
+
   test("MMU-on WRITETHROUGH-page store with DE=1 allocates precise=False and completes at alloc, as before", VerilatorTest) {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem, ptmem) = initDut(dut)

@@ -832,6 +832,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // conditional `captureCompletion` call for readability (same value, harmless
     // last-assignment-wins restatement).
     sq.io.alloc.payload.precise    := !fastStore
+    // Store-to-load forwarding is only an architectural optimization for ordinary
+    // cacheable memory.  An INHIBITED access denotes serialized/device memory: an
+    // overlapping older store must reach the device first, then the younger load
+    // must perform a real read so it can observe device state (rather than echoing
+    // the store data out of the SQ).  Keep re-querying while such an overlap is
+    // resident; when it drains, the normal no-hit path emits the inhibited D-cache
+    // command.  For a split access, require both halves to be cacheable.
+    val p3SqForwardAllowed =
+      (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
+      (!p3Ctx.front.twoAccess ||
+       (p3Ctx.cmodeB =/= m68k040.cache.CacheMode.INHIBITED))
+    val p4SqForwardAllowed =
+      (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
+      (!p4Ctx.xlate.front.twoAccess ||
+       (p4Ctx.xlate.cmodeB =/= m68k040.cache.CacheMode.INHIBITED))
     val p4RetryQuery = p4Valid &&
       (p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Ctx.xlate.front.twoAccess))
     val fwdQueryCtx = Mux(p4RetryQuery, p4Ctx.xlate, p3Ctx)
@@ -1636,8 +1651,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
           p4CanLeave       := True
         }
       } elsewhen(mustRetry) {
-        p4Ctx.fwdHit   := sq.io.fwd.rsp.hit
-        p4Ctx.fwdStall := sq.io.fwd.rsp.stall
+        p4Ctx.fwdHit   := sq.io.fwd.rsp.hit && p4SqForwardAllowed
+        p4Ctx.fwdStall := sq.io.fwd.rsp.stall ||
+                          (sq.io.fwd.rsp.hit && !p4SqForwardAllowed)
         p4Ctx.fwdData  := sq.io.fwd.rsp.data
       } otherwise {
         when(!p4Front.twoAccess) {
@@ -1847,8 +1863,9 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(p3ToP4) {
       p4Valid          := True
       p4Ctx.xlate      := p3Ctx
-      p4Ctx.fwdHit     := sq.io.fwd.rsp.hit
-      p4Ctx.fwdStall   := sq.io.fwd.rsp.stall
+      p4Ctx.fwdHit     := sq.io.fwd.rsp.hit && p3SqForwardAllowed
+      p4Ctx.fwdStall   := sq.io.fwd.rsp.stall ||
+                          (sq.io.fwd.rsp.hit && !p3SqForwardAllowed)
       p4Ctx.fwdData    := sq.io.fwd.rsp.data
     }
     when(txToP3) {
