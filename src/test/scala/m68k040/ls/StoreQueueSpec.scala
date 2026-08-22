@@ -47,6 +47,7 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.fwd.query.paddr #= paddr
     dut.io.fwd.query.size #= size
     dut.io.fwd.query.inhibited #= inhibited
+    dut.io.barrier.robId #= robId
   }
 
   test("inhibited accesses serialize across non-overlapping device ports", VerilatorTest) {
@@ -60,15 +61,30 @@ class StoreQueueSpec extends AnyFunSuite {
       setQuery(dut, robId = 6, paddr = 0x50f1f800L, Size.BYTE, inhibited = true)
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean, "device load must never SQ-forward")
-      assert(dut.io.fwd.rsp.stall.toBoolean,
-        "different-address device read must wait for the older device write")
 
-      // Total ordering is bidirectional at the boundary: an ordinary younger
-      // load also cannot pass an older inhibited store.
+      // Total ordering is bidirectional at the boundary: an ordinary younger load
+      // also cannot pass an older inhibited store, and neither may forward across it.
       setQuery(dut, robId = 6, paddr = 0x3000L, Size.LONG, inhibited = false)
       sleep(1)
-      assert(dut.io.fwd.rsp.stall.toBoolean,
-        "ordinary load must not pass an older inhibited store")
+      assert(!dut.io.fwd.rsp.hit.toBoolean,
+        "ordinary load must not forward across an older inhibited store")
+
+      // WHERE THE ORDERING NOW LIVES.  It is deliberately NOT expressed as a
+      // forwarding stall here.  Driving it as `rsp.stall` made the LS-EU re-query
+      // from P4 every cycle until the store drained -- a wait that is not
+      // self-resolving, because the spinning load holds resources the drain can
+      // need, and the core hung on real hardware (2026-08-22, `TST.B` of a VIA
+      // register).  The barrier is instead published as a whole-ring property that
+      // the LS-EU consumes ONCE at its load-launch gate; see `p4LaunchOk` in
+      // LsEuPlugin and the two device-ordering tests in LsEuFastPreciseSpec.
+      assert(dut.io.barrier.olderInhibitedStore.toBoolean,
+        "an OLDER resident device store must raise the barrier for this load")
+      // And the age qualifier is real: a store that is YOUNGER than the querying load
+      // must NOT gate it, or a younger store could hold an older load forever.
+      dut.io.barrier.robId #= 1
+      sleep(1)
+      assert(!dut.io.barrier.olderInhibitedStore.toBoolean,
+        "a YOUNGER device store must not raise the barrier for an older load")
     }
   }
 

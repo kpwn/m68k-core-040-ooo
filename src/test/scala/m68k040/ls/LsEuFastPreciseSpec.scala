@@ -149,6 +149,13 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     dut.cacheCtrl.logic.dcacheEnabled #= false
     dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
     cd.waitSampling(80) // PRF init sweep
+    // The D-cache re-invalidates every set after a reset -- one set per cycle, 128
+    // sets -- and refuses ALL load/store admission for the whole walk (see
+    // `resetSweepBusy` in DcachePlugin, added by c6e3ad4).  A test that issues
+    // inside that window sees an LS pipeline that simply never starts, which is
+    // indistinguishable from an ordering bug at the assertion site.  Wait it out
+    // once, here, so no individual test has to know about it.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem, ptmem)
   }
 
@@ -300,7 +307,7 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         cd.waitSampling()
       }
       assert(overlapStallSeen,
-        "inhibited load must convert an exact SQ forwarding hit into an ordering stall")
+        "inhibited load must be held in P4 rather than taking the forwarded data")
       assert(!loadCompletedEarly,
         "inhibited load must not complete from an older store's forwarded data")
       assert(!readIssuedEarly,
@@ -313,7 +320,15 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       var readIssued = false
       var loadCompleted = false
       var cycles = 0
+      // An inhibited load is PRECISE: it may not launch until it is itself the ROB
+      // head with the ring drained.  Model the real ROB -- once the store's entry is
+      // gone, the head advances to the load.
+      var headAdvanced = false
       while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (!headAdvanced && dut.eu.logic.sq.io.empty.toBoolean) {
+          dut.wire.logic.iRobHeadIn #= loadRob
+          headAdvanced = true
+        }
         if (dut.dcache.logic.axi.ar.valid.toBoolean &&
             dut.dcache.logic.axi.ar.ready.toBoolean &&
             dut.dcache.logic.axi.ar.payload.addr.toBigInt == base)
@@ -373,7 +388,14 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       var readIssued = false
       var loadCompleted = false
       var cycles = 0
+      // See the sibling test: the device read is precise and launches only once it
+      // is the ROB head with the ring drained.
+      var headAdvanced = false
       while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (!headAdvanced && dut.eu.logic.sq.io.empty.toBoolean) {
+          dut.wire.logic.iRobHeadIn #= loadRob
+          headAdvanced = true
+        }
         if (dut.dcache.logic.axi.ar.valid.toBoolean &&
             dut.dcache.logic.axi.ar.ready.toBoolean &&
             dut.dcache.logic.axi.ar.payload.addr.toBigInt == readPort)

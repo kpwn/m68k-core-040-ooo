@@ -130,6 +130,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     sq.io.fwd.query.paddr := fwdAddrIn
     sq.io.fwd.query.size  := fwdSizeIn
     sq.io.fwd.query.inhibited := False
+    sq.io.barrier.robId := 0
     fwdHitOut   := sq.io.fwd.rsp.hit
     fwdStallOut := sq.io.fwd.rsp.stall
     fwdDataOut  := sq.io.fwd.rsp.data

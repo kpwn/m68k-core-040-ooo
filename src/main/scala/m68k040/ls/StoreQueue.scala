@@ -89,6 +89,15 @@ class StoreQueue(depth: Int = 8) extends Component {
     // precise/AXI path; COPYBACK hit/allocation acks are clean local terminals.
     val drainErr = in(Bool())
     val empty    = out(Bool())   // no valid entry AND no drain in flight
+    // ---- barrier query: age-qualified residency for the LS-EU's launch gate ----
+    // Driven from the LS-EU's P4 context, INDEPENDENTLY of the forwarding query
+    // (which is muxed between P3 and P4), so the gate is always answered for the
+    // load it is actually gating.
+    val barrier = new Bundle {
+      val robId               = in(UInt(6 bits))
+      val olderStore          = out(Bool())   // ANY older resident store
+      val olderInhibitedStore = out(Bool())   // an older resident DEVICE store
+    }
     // Back-pressure to the LS-EU: high when the ring is FULL (all `depth` entries
     // resident). The LS-EU reads this ONLY in its execute/alloc FSM (a `WAIT_SQ`
     // stall, off the IQ issue-select cone) and holds a store's alloc until an entry
@@ -433,10 +442,21 @@ class StoreQueue(depth: Int = 8) extends Component {
   val anyOlder = perEntry.map(_.ent).orR
   val anyOlderInhibitedStore = perEntry.map(_.inhibitedStore).orR
   val serialStall = (q.inhibited && anyOlder) || anyOlderInhibitedStore
+  // Suppress the forward across a serialization boundary: a device read must reach
+  // the DEVICE, never echo an older store's data out of this ring.
   io.fwd.rsp.hit   := fullValid && !serialStall
   io.fwd.rsp.data  := best.data
-  io.fwd.rsp.stall := serialStall ||
-                      ((anyPartial || anySameLine) && !fullValid)
+  // DELIBERATELY NOT `|| serialStall`.  Driving the boundary as a forwarding STALL
+  // made the LS-EU re-query from p4 every cycle until the older store drained --
+  // a wait whose release condition is not self-resolving, because the spinning load
+  // holds LS-EU/D-cache resources that the very drain it waits for can need.  That
+  // is a real hardware hang: 2026-08-22 the CPU wedged permanently on `TST.B` of a
+  // VIA register with a healthy bus, zero exceptions, and a debug halt (which stops
+  // the retry) released it.  The ordering is instead enforced ONCE, at the LS-EU's
+  // load-launch gate, as "do not launch until this load is the ROB head and the ring
+  // has drained" -- a condition the in-order ROB is guaranteed to reach.  Only the
+  // ordinary address hazards remain a stall here.
+  io.fwd.rsp.stall := (anyPartial || anySameLine) && !fullValid
 
   // ---- commit: mark the matching valid entry committed (either retire slot) ----
   when(io.commit.valid) {
@@ -631,6 +651,23 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // ---- empty: no resident entry AND no drain in flight ----
   io.empty := !valids.reduce(_ || _) && !drainBusy
+
+  // ---- barrier residency, AGE-QUALIFIED ----
+  // The age qualifier is load-bearing, not a refinement.  A YOUNGER store can allocate
+  // while an older load is parked at the LS-EU's launch gate: the IQ issues the oldest
+  // LS uop (`ohLoldest`) but that uop has already LEFT its slot by the time it parks,
+  // so the next LS uop is free to issue behind it.  Gating on whole-ring occupancy
+  // would therefore let a younger store hold an older load forever -- the store cannot
+  // commit until the load retires, and the load would not launch until the ring drains.
+  // Only OLDER entries may gate.  `ent`'s `committed(i) ||` arm is what makes this
+  // exact across a robId wrap (see `olderThan`'s header).
+  val barrierEnt = (0 until depth).map(i =>
+    valids(i) && (committed(i) || olderThan(robIds(i), io.barrier.robId)))
+  io.barrier.olderStore := barrierEnt.reduce(_ || _)
+  io.barrier.olderInhibitedStore := (0 until depth).map(i =>
+    barrierEnt(i) && ((cacheModes(i) === CacheMode.INHIBITED) ||
+                      (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))).reduce(_ || _)
+  io.barrier.olderStore.simPublic(); io.barrier.olderInhibitedStore.simPublic()
 
   // ---- debug-only observability (task #139 finding #1 investigation) ----
   // Zero synth impact (sim tap only, not referenced by any RTL logic).

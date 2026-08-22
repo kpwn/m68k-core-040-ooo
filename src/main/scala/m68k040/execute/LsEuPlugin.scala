@@ -1642,6 +1642,55 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val p4CanLeave       = Bool(); p4CanLeave := False
     val p4CompletionFire = Bool(); p4CompletionFire := False
     val p4Front          = p4Ctx.xlate.front
+
+    // ── Cache-inhibited accesses are PRECISE, in both directions ────────────────
+    //
+    // INHIBITED denotes a serialized DEVICE access, not merely an uncacheable one.
+    // Two architectural rules follow, and both are enforced HERE -- at the single
+    // point where a load actually launches a bus transaction (stores terminate at
+    // p3, so this gate is load-only by construction):
+    //
+    //   1. A device READ has an architecturally visible side effect at the device,
+    //      so it must never be performed speculatively, and it must observe every
+    //      older store that has already been performed.  It therefore waits until
+    //      this load IS the ROB head -- every program-older instruction retired --
+    //      and the store queue has fully drained.
+    //   2. A device WRITE is a FULL MEMORY BARRIER.  No younger memory access of
+    //      any kind may pass it, so ANY load waits for the ring to drain while an
+    //      inhibited store is resident (`sq.io.hasInhibitedStore`), regardless of
+    //      address -- device command and status ports routinely differ.
+    //
+    // WHY EXPRESSED AS "WAIT UNTIL I AM THE HEAD" AND NOT "WAIT UNTIL THAT STORE
+    // DRAINS".  The latter is not self-resolving: a load spinning in p4 holds
+    // LS-EU/D-cache resources that the very drain it waits on can require, so the
+    // two deadlock.  That is not hypothetical -- on 2026-08-22 this core wedged
+    // permanently on `TST.B` of a VIA register (bus healthy, slave answering an
+    // independent master, zero exceptions), and a debug halt, which is precisely
+    // what stops the retry, released it.  Reaching the ROB head CANNOT deadlock:
+    // the ROB retires strictly in order, a younger stalled load never prevents an
+    // older instruction from retiring, and the SQ's own at-head drain is likewise
+    // guaranteed to progress.  So the release condition is inevitable.
+    val p4Inhibited = (p4Ctx.xlate.cmode === m68k040.cache.CacheMode.INHIBITED) ||
+                      (p4Front.twoAccess &&
+                       (p4Ctx.xlate.cmodeB === m68k040.cache.CacheMode.INHIBITED))
+    val p4AtRobHead = robHeadValidIn && (p4Front.robId === robHeadIn)
+    // AGE-QUALIFIED, and that is load-bearing -- see StoreQueue's `barrierEnt`.  A
+    // younger store CAN allocate behind a load parked here, so gating on whole-ring
+    // occupancy would deadlock: the younger store cannot commit until this load
+    // retires, and this load would never launch.  Only OLDER entries gate.
+    //
+    // TERMINATION, both arms:
+    //   * inhibited: at the ROB head every program-older instruction has retired, so
+    //     every older store is COMMITTED, and committed entries drain unconditionally
+    //     at the ring head -- no ROB dependency at all.  `olderStore` therefore clears.
+    //   * ordinary:  an older inhibited store is precise and drains when IT is the ROB
+    //     head, which it reaches because a younger parked load never prevents an older
+    //     instruction from retiring.  `olderInhibitedStore` therefore clears.
+    sq.io.barrier.robId := p4Front.robId
+    val p4LaunchOk  = Mux(p4Inhibited,
+                          p4AtRobHead && !sq.io.barrier.olderStore,
+                          !sq.io.barrier.olderInhibitedStore)
+    p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
     when(p4Valid && !sqFlushSig && !excActive) {
       val fullForward = p4Ctx.fwdHit && !p4Front.twoAccess
       val mustRetry    = p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Front.twoAccess)
@@ -1656,10 +1705,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         }
       } elsewhen(mustRetry) {
         p4Ctx.fwdHit   := sq.io.fwd.rsp.hit && p4SqForwardAllowed
-        p4Ctx.fwdStall := sq.io.fwd.rsp.stall ||
-                          (sq.io.fwd.rsp.hit && !p4SqForwardAllowed)
+        // NOT `|| (hit && !allowed)`: a suppressed forward must fall through to the
+        // launch gate below, not spin here.  See `p4LaunchOk`.
+        p4Ctx.fwdStall := sq.io.fwd.rsp.stall
         p4Ctx.fwdData  := sq.io.fwd.rsp.data
       } otherwise {
+        when(p4LaunchOk) {
         when(!p4Front.twoAccess) {
           when(alignedCanEnq) {
             alignedEnq := True
@@ -1687,6 +1738,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             bkStart    := True
             p4CanLeave := True
           }
+        }
         }
       }
     }
@@ -1868,8 +1920,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       p4Valid          := True
       p4Ctx.xlate      := p3Ctx
       p4Ctx.fwdHit     := sq.io.fwd.rsp.hit && p3SqForwardAllowed
-      p4Ctx.fwdStall   := sq.io.fwd.rsp.stall ||
-                          (sq.io.fwd.rsp.hit && !p3SqForwardAllowed)
+      p4Ctx.fwdStall   := sq.io.fwd.rsp.stall
       p4Ctx.fwdData    := sq.io.fwd.rsp.data
     }
     when(txToP3) {
