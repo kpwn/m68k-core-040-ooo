@@ -327,7 +327,37 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         rspPayload.token     := walkToken
         rspVpn               := walkVpn
       }
-      when(!walker.io.rsp.fault && !walkFlushPoison && !flushAll) {
+      // Task (C1 fix): `walkUmPoison` means the deferred U/M descriptor WRITE for
+      // this walk was correctly suppressed (see the umq.io.alloc.valid gate below)
+      // because a backend flush landed on this walk while it was still in flight.
+      // `fe.modified` above is `walker.io.rsp.modified` -- the walker's own computed
+      // "M should now read as" value, which is True for ANY write-triggered walk
+      // regardless of whether its memory write-back actually happened. Filling the
+      // TLB with that value here, unconditionally, would cache "M already set" for
+      // this entry while the real descriptor in memory still has M=0 (the write-back
+      // that would have set it was correctly suppressed by walkUmPoison) -- the next
+      // write to this page then takes the fast `tlbHit && !needsMRefresh` path and
+      // never re-walks, permanently losing the M update for the life of this ATC
+      // entry. The identical shape silently loses U on an ordinary cold-miss walk
+      // that gets flushed: TlbEntry has no separate U field (Tlb.scala) -- once a
+      // resident fill happens at all, no future access ever re-triggers a walk for
+      // U's sake, so a poisoned cold miss's U-write, once suppressed, can never be
+      // recovered by any consumer of this ATC entry.
+      //
+      // The correct fix is to gate the fill itself, not just narrow `fe.modified`'s
+      // value with `&& !walkUmPoison`: that narrower alternative fixes the M-loss
+      // case (a poisoned write walk would then cache modified=false, correctly
+      // forcing a re-walk on the next write-hit's M-refresh check) but does NOTHING
+      // for the U-loss case on a poisoned READ walk, where `walker.io.rsp.modified`
+      // is already False and always was -- there is no "wrong" modified value to
+      // correct there, yet the TLB would still get filled and the page's real U
+      // bit would still be permanently stuck at 0 in memory with no other trigger
+      // ever able to re-walk and repair it. Suppressing the fill entirely instead
+      // forces a genuine, clean re-walk on the very next access to this page --
+      // exactly the same real 3-level table search a first-time cold miss pays --
+      // and that re-walk (assuming no second flush collision) will correctly queue
+      // and, once its own instruction commits, drain BOTH U and M.
+      when(!walker.io.rsp.fault && !walkFlushPoison && !flushAll && !walkUmPoison) {
         tlb.io.fillValid := True
       }
     }
