@@ -833,6 +833,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Observability for the arbitration tests: True the cycle a FRONT completion was
     // suppressed and held because the BACK claimed the shared comp* stage.
     val frontCompHeld = Bool(); frontCompHeld := False; frontCompHeld.simPublic()
+    // True the cycle a FRONT stage (P2/P3/P4) actually WROTE the shared comp* stage --
+    // set at the single pair of sites that can do so (`captureCompletionFront` /
+    // `captureFaultFront`), so it cannot drift from them. Used ONLY by the
+    // `preciseReplayClaimsComp` tripwire below (a `GenerationFlags.simulation` block),
+    // so it is pruned out of every synthesised netlist.
+    val frontCompFires = Bool(); frontCompFires := False; frontCompFires.simPublic()
     // A later flush poisons whatever is draining in the back. Plain component statement:
     // SpinalHDL elaborates StateMachine bodies from a pre-pop task, i.e. AFTER every
     // plain statement, so the FRONT FSM's handoff assignment below correctly WINS on the
@@ -1184,6 +1190,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // crack µop); so the An write is selected ONLY for an eaAuto STORE.
     def captureCompletionFront(ctx: FrontPipeCtx, result: Bits): Unit = {
       liveCompletionFires := True
+      frontCompFires := True
       compValid     := True
       compRobId     := ctx.robId
       // MOVEM.W LOAD sign-extends the loaded word to the full 32-bit register (Musashi
@@ -1250,6 +1257,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     def captureFaultFront(ctx: FrontPipeCtx, faultAddr: UInt,
                           atc: Boolean = true): Unit = {
       liveCompletionFires := True
+      frontCompFires := True
       compValid     := True
       compRobId     := ctx.robId
       compPdstValid := False
@@ -1835,8 +1843,96 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val applyFast           = (pendApply === pendReady) && sq.io.sqCompletion.valid
     val applyBacklog        = pendApply =/= pendReady
     val preciseReplayWants  = applyFast || applyBacklog
-    val preciseReplayClaimsComp = preciseReplayWants && !backCompFires
+    // ── FMax (the register cut): the front-gating claim is `applyBacklog` ALONE ──
+    //
+    // THE PROBLEM. `preciseReplayClaimsComp` used to be `preciseReplayWants &&
+    // !backCompFires`, i.e. it included `applyFast`, and `applyFast` carries
+    // `sq.io.sqCompletion.valid` -- which is a LIVE, same-cycle function of
+    // `io.drainAck`, which is `dcache.storeAck`. Every front stage reads
+    // `preciseReplayClaimsComp` through `olderThanTComp`/`olderThanTxComp`/
+    // `olderThanP3Comp`, and the front stages' ready chain runs
+    // p4Ready -> p3Ready -> txCanConsumeRsp -> txReady -> tReady -> s1Ready ->
+    // `issuePort.ready` -> the IQ's `selPorts(3).fire`/`events` -> the per-slot
+    // `triggers` clock enables. So the D-cache store pipe, the StoreQueue drain
+    // handshake, the LS EU completion arbitration and the IssueQueue's slot
+    // bookkeeping were ONE uncut combinational chain, four plugins wide.
+    //
+    // Measured on the standing 5.000ns OOC gate (xcku5p-ffvb676-2-e), that chain WAS
+    // the core's worst path AND its dominant failing family -- 5402 of 5664 failing
+    // endpoints rooted at `DcachePlugin_logic_stS3Valid`, worst -0.744ns:
+    //
+    //   stS3Valid -(fo=220)-> cbHitAckReg/storeMissBarrier -> the store FSM decode
+    //     -> storeAckReg -> sq.io.drainAck (1.297ns) -> drainAckFire (1.554ns)
+    //     -> terminalAck/sqCompletion.valid (1.837ns) -> preciseReplayWants (2.067ns)
+    //     -> preciseReplayClaimsComp -> olderThanTxComp -> txCanConsumeRsp (3.309ns)
+    //     -> txCanLeave -> txReady -> normalReqArm -> tCanLeave -> tReady
+    //     -> s1Ready/issuePort.ready -> (IQ) selPorts(3).fire -> events (5.445ns)
+    //     -> IssueQueuePlugin_logic_lines_7_ways_1_triggers[0]/D (5.755ns)
+    //
+    // 22 logic levels, 82.7% route delay. The SECOND family (`stS3Valid` ->
+    // `sq/acceptedHalves`/`sq/sendPtr`, -0.679ns) traverses the SAME first eight hops
+    // and only then diverges (via `txCanConsumeRsp` -> the LS EU's load-port drive ->
+    // the D-cache's `s0Advance`/`stS1Advance` store-pipe arbitration -> `drain.ready`).
+    // Both families are cut by cutting this ONE node.
+    //
+    // THE CUT. `applyBacklog` (`pendApply =/= pendReady`) is a comparison of two plain
+    // REGISTERS; `applyFast` is the only live term. Claiming the stage on `applyBacklog`
+    // alone makes `preciseReplayClaimsComp` -- and therefore the entire front ready
+    // chain and the whole IQ `triggers`/`events` cone -- a function of registers plus
+    // `backCompFires` only. The eight hops above (2.067ns of the 5.755ns path) are gone
+    // from every path that reads it.
+    //
+    // WHY THIS IS SAFE (mutual exclusion is NOT what this signal provides). The
+    // "at most one writer of comp* per cycle" invariant has never depended on
+    // `preciseReplayClaimsComp`: the replay's own apply gate is
+    // `(applyFast || applyBacklog) && !liveCompletionFires`, and BOTH front capture
+    // sites (`captureCompletionFront`, `captureFaultFront`) and BOTH back capture sites
+    // (`captureCompletionDesc`, `captureFaultDesc`) set `liveCompletionFires`. The
+    // replay already yields to whoever actually took the stage, unconditionally.
+    // `preciseReplayClaimsComp` is purely a PRIORITY/anti-starvation signal: it makes
+    // younger front producers stand down so an older precise store's replay cannot be
+    // starved forever by an II=1 stream of LEAs or forwarded loads.
+    //
+    // WHY IPC IS PRESERVED -- the shared stage still retires exactly one completion per
+    // cycle, in BOTH schemes; only the ORDER changes in a tie:
+    //   * NO collision (the overwhelmingly common case: a precise drain-ack lands with
+    //     no front completion due the same cycle) -- `liveCompletionFires` is False, so
+    //     the fast path applies THAT SAME CYCLE, bit-identically to before. The
+    //     same-cycle fast path that `irq-nmi`'s one-extra-register-stage timing is
+    //     calibrated against is fully retained on the uncontended path.
+    //   * COLLISION (a front completion is due the same cycle a fast-path replay is) --
+    //     before: the FRONT stalls one cycle and the replay goes first. After: the
+    //     FRONT goes first and the replay slips to the next cycle. Either way ONE
+    //     completion is produced this cycle and the other the next; no cycle is wasted,
+    //     no stage idles, and the LS front pipe is strictly LESS backpressured than
+    //     before (the P2/P3/P4 hold is gone).
+    // So this is not a one-cycle tax on every transaction -- on the uncongested path it
+    // costs literally nothing, and on the genuinely contended path it swaps the order of
+    // two completions that were always going to be serialized against each other anyway.
+    //
+    // BOUNDED DEFERRAL (no new starvation). `pendReady` is advanced by an UNCONDITIONAL
+    // `when(sq.io.sqCompletion.valid)` below -- it does not depend on the entry being
+    // applied. So a fast-path replay that loses a collision is, on the VERY NEXT cycle,
+    // `pendApply =/= pendReady`, i.e. `applyBacklog`, i.e. it claims the stage with full
+    // priority over the front. The deferral is at most one cycle, once, per entry. And
+    // `applyFast` requires `pendApply === pendReady`, so `applyFast` and `applyBacklog`
+    // are mutually exclusive -- dropping `applyFast` here removes no backlog coverage.
+    val preciseReplayClaimsComp = applyBacklog && !backCompFires
     preciseReplayWants.simPublic(); preciseReplayClaimsComp.simPublic()
+    // Tripwire (simulation only, pruned from every netlist): the priority contract this
+    // signal exists to enforce. If a future edit drops `preciseReplayClaimsComp` from
+    // one of the `olderThan*Comp` terms -- or adds a sixth front capture site that does
+    // not consult them -- an older precise replay could be starved by a younger front
+    // producer, silently, with no functional failure until a device store wedges. Rather
+    // than trust the four call sites to stay in sync, machine-check the invariant every
+    // cycle (same pattern as `DcachePlugin`'s `stSubLastReg` drift check and this file's
+    // own `txRspFire` identity check).
+    GenerationFlags.simulation {
+      assert(!(preciseReplayClaimsComp && frontCompFires),
+        "LsEuPlugin: a younger FRONT completion took the shared comp* stage while an " +
+        "older precise-store replay claimed it (preciseReplayClaimsComp priority violated)",
+        FAILURE)
+    }
 
     // ── D1 ELASTIC FRONT: P1 AGU -> P2 DTLB/VIPT -> P3 SQ -> P4 resolve ──
     // Each registered cut owns its context. Backpressure propagates only while a
