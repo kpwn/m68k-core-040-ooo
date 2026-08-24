@@ -1162,51 +1162,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stS3Inhibited = stS3Payload.cacheMode === CacheMode.INHIBITED
     val stS3Copyback  = stS3Payload.cacheMode === CacheMode.COPYBACK
     stS3Valid := False
-    // ── FMax: `cbHitAckReg` is the load-side mirror of task d0e617a4's `stSubLastReg` ──
-    // `cbHitAckReg` ("this COPYBACK store hit in S3, so it is locally complete and the
-    // StoreQueue may pop it now") is declared far below as
-    //
-    //     stS3Valid && stS3Copyback && stS3Hit
-    //
-    // -- a PURE FUNCTION of three registers, recomputed combinationally every cycle. It
-    // immediately qualifies `storeAckReg`, which despite its name is a plain `Bool()`,
-    // not a register:
-    //
-    //     storeAckReg := (storeBAck && stSubLast) || cbHitAckReg || storeAllocAckReg
-    //
-    // and `storeAck` then fans out, still combinationally, clear across the core --
-    // exactly the arc `d0e617a4` documented when it retimed `stSubLast` off the OTHER
-    // input of that same OR:
-    //
-    //   stS3Valid -> cbHitAckReg -> storeAckReg -> (LsEuPlugin) sq.io.drainAck
-    //     -> (StoreQueue) drainAckFire -> terminalAck/preciseFinalAck
-    //     -> (LsEuPlugin) preciseReplayWants -> preciseReplayClaimsComp
-    //     -> olderThanTxComp -> txCanConsumeRsp -> txValid -> tValid
-    //     -> issuePort.ready -> (IssueQueue) sbClearFire(3) -> events
-    //     -> the per-slot `triggers` clock enables.
-    //
-    // A full failing-endpoint census of the OOC gate netlist at `ff438195`
-    // (`synth/census_ooc_fullcore.tcl`) found only FOUR distinct startpoint registers
-    // across all 5664 failing endpoints, and `stS3Valid` alone owned 5402 of them, with
-    // the worst slack (-0.744ns, 22 logic levels). It is one root, not a population --
-    // and ~1.19ns of that 5.744ns path is spent purely getting from `stS3Valid` to
-    // `sq.io.drainAck` through four LUT levels, before the real cross-plugin work starts.
-    //
-    // Retimed exactly the way `d0e617a4` retimed `stSubLast`, which is unusually easy
-    // here because the S3 stage has EXACTLY ONE capture site: `stS3Valid`/`stS3Payload`/
-    // `stS3Hit` are written together, in one place, and `stS3Valid` otherwise self-clears
-    // from the default immediately above. So this register needs precisely the two writes
-    // `stS3Valid` itself has -- the default clear here, and the capture below computed
-    // from the NEW values that site installs (never the stale pre-edge registers).
-    // `init False` matches `stS3Valid init False`. A simulation tripwire at the original
-    // declaration site machine-checks the equivalence every cycle.
-    val cbHitAckRegR = RegInit(False)
-    // The single definition of `cbHitAckReg` in terms of a (possibly not-yet-committed)
-    // set of S3 values. Shared by the register update and the tripwire so the two can
-    // never drift apart.
-    def cbHitAckOf(valid: Bool, cmode: CacheMode.C, hit: Bool): Bool =
-      valid && (cmode === CacheMode.COPYBACK) && hit
-    cbHitAckRegR := False
 
     val stS3MergeData = Mux(stS3Payload.useStrb,
       stS3Payload.lineData,
@@ -2786,13 +2741,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
         stS3Valid   := True
         stS3Payload := stS2Payload
         stS3Hit     := stS2HitAny
-        // FMax retime (see `cbHitAckRegR`'s declaration): recomputed here from the SAME
-        // new values this site installs -- `stS3Valid`'s new value is a literal True,
-        // `stS3Copyback`'s is decoded from `stS2Payload.cacheMode` (not the stale
-        // `stS3Payload`), and `stS3Hit`'s is `stS2HitAny`. This is the ONLY site that
-        // writes any of the three, so together with the default clear above it is the
-        // complete writer set.
-        cbHitAckRegR := cbHitAckOf(True, stS2Payload.cacheMode, stS2HitAny)
         stS3Way     := stS2HitWay
         stS3OldLine := stS2CapturedLine
       }
@@ -2939,17 +2887,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
     // S3 is itself the registered local-result stage, so COPYBACK hit write and ack
     // occur together without a further result register.
-    // FMax retime: a plain register read now (see `cbHitAckRegR`'s declaration for the
-    // full cone this used to sit at the head of). The tripwire below is what actually
-    // PINS the equivalence -- it re-evaluates the original combinational definition every
-    // cycle and fails loudly on any drift, so a future change to the S3 capture site that
-    // forgets to update `cbHitAckRegR` alongside it cannot land silently.
-    val cbHitAckReg = cbHitAckRegR
-    GenerationFlags.simulation {
-      assert(cbHitAckRegR === cbHitAckOf(stS3Valid, stS3Payload.cacheMode, stS3Hit),
-        "DcachePlugin: cbHitAckRegR drifted from its combinational definition",
-        FAILURE)
-    }
+    val cbHitAckReg = stS3Valid && stS3Copyback && stS3Hit
 
     // AXI write-through driver -- the registered store result path's OWN, EXCLUSIVE
     // driver (id fixed at 1). EVICT_WR (Task P4.3) never touches these registers or
