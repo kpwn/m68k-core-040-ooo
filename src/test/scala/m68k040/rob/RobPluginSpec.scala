@@ -902,6 +902,7 @@ class RobPluginSpec extends AnyFunSuite {
     for (c <- dut.rob.logic.completion) { c.valid #= false; c.payload #= 0 }
     dut.rob.logic.branchCompletion.valid #= false
     dut.rob.logic.preciseDrainBusyIn #= false
+    dut.rob.logic.inhibitedLoadBusyIn #= false
     dut.intCtrl.logic.iplIn #= 0
     dut.intCtrl.logic.iackAvec #= false
     dut.intCtrl.logic.iackVector #= 0
@@ -984,6 +985,78 @@ class RobPluginSpec extends AnyFunSuite {
         n += 1; cd.waitSampling()
       }
       assert(seen, "tracePendingFire must fire once preciseDrainBusyIn drops (sanity)")
+    }
+  }
+
+  // ── `inhibitedLoadBusyIn` gates normalIrqGate/traceNormalGate (the ROB-side half
+  // of the inhibited-LOAD preemption interlock -- LsEuPlugin's `inhibitedLoadBusySig`
+  // drives this in the real core). Exact mirror of the `preciseDrainBusyIn` pair
+  // immediately above: a cache-inhibited LOAD's already-launched device read is a
+  // real, possibly clear-on-read/pop side effect, so an interrupt/trace must not be
+  // newly recognized at the head while it is still in flight -- otherwise the
+  // subsequent flush silently discards the response and the SAME instruction
+  // re-issues a SECOND real device read after RTE (see LsEuPlugin.scala's
+  // `inhibitedLoadBusySig` doc comment for the full mechanism).
+  test("inhibitedLoadBusyIn blocks interruptPending even when ipl>mask at a first-uop head") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      setGateMask(dut, cd, 2)
+      allocGateOne(dut, cd, pc = 0xB10)
+      dut.rob.logic.inhibitedLoadBusyIn #= true
+      dut.intCtrl.logic.iplIn #= 5   // > mask -- would normally recognize immediately
+      dut.intCtrl.logic.iackAvec #= true
+      for (_ <- 0 until 10) {
+        assert(!dut.rob.logic.interruptPending.toBoolean, "inhibitedLoadBusyIn must block interruptPending")
+        cd.waitSampling()
+      }
+      // Sanity: dropping the gate lets the SAME still-pending condition fire.
+      dut.rob.logic.inhibitedLoadBusyIn #= false
+      var seen = false; var n = 0
+      while (!seen && n < 10) {
+        if (dut.rob.logic.interruptPending.toBoolean) seen = true
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "interruptPending must fire once inhibitedLoadBusyIn drops (sanity)")
+    }
+  }
+
+  test("inhibitedLoadBusyIn blocks tracePendingFire even with an armed T1 trace at a first-uop head") {
+    M68kSim().compile(new GateDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initGate(dut, cd)
+      // S=1, T1=1 (srSys bit 7) -- every retiring instruction arms a pending trace.
+      dut.rob.logic.exc.ss.srSys #= 0xA0
+      cd.waitSampling()
+      dut.rob.logic.inhibitedLoadBusyIn #= true
+
+      // Alloc + retire ONE instruction (via completion port 0) to ARM tracePendingReg
+      // (retire0 && h0TraceArmed, h0TraceArmed = t1Armed here).
+      allocGateOne(dut, cd, pc = 0xC10)
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 0
+      cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+      dut.rob.logic.completion(0).valid #= false
+      cd.waitSampling()   // let tracePendingReg's write (registered) land
+      assert(dut.rob.logic.tracePendingReg.toBoolean, "trace must be armed after the T1-active retire")
+
+      // A second instruction is now the head, eligible (firstStore, non-faulted/RTE/
+      // sysOp) -- traceNormalGate does NOT wait on completes(h0), so WITHOUT the gate
+      // this fires immediately. With inhibitedLoadBusyIn held, it must never fire.
+      allocGateOne(dut, cd, pc = 0xC12)
+      for (_ <- 0 until 10) {
+        assert(!dut.rob.logic.tracePendingFire.toBoolean, "inhibitedLoadBusyIn must block tracePendingFire")
+        cd.waitSampling()
+      }
+      assert(dut.rob.logic.tracePendingReg.toBoolean, "the armed trace must still be pending (never consumed)")
+
+      // Sanity: dropping the gate lets the still-armed trace fire.
+      dut.rob.logic.inhibitedLoadBusyIn #= false
+      var seen = false; var n = 0
+      while (!seen && n < 10) {
+        if (dut.rob.logic.tracePendingFire.toBoolean) seen = true
+        n += 1; cd.waitSampling()
+      }
+      assert(seen, "tracePendingFire must fire once inhibitedLoadBusyIn drops (sanity)")
     }
   }
 

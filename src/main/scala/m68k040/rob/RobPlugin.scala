@@ -596,6 +596,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // P2.5 wires it to the real SQ.
     val preciseDrainBusyIn = Bool(); preciseDrainBusyIn.allowOverride; preciseDrainBusyIn := False
     preciseDrainBusyIn.simPublic()
+    // Load-side sibling of `preciseDrainBusyIn`: an INHIBITED load's bus read is
+    // genuinely outstanding (launched, response not yet consumed -- LsEuPlugin's
+    // `inhibitedLoadBusySig`). Kept as a SEPARATE input rather than folded into
+    // `preciseDrainBusyIn` -- that name/comment is store-drain-specific, and the
+    // two conditions have independent launch/clear events (a store drains from the
+    // SQ at head; a load launches from LsEuPlugin's P4 once it IS head). Same
+    // rationale as `preciseDrainBusyIn`: while a device read is in flight, the head
+    // must not be preempted by a newly-recognized interrupt/trace, or the AXI
+    // response (a real, possibly clear-on-read/pop device side effect) gets
+    // silently poisoned/discarded and the SAME instruction re-issues a SECOND real
+    // device read after RTE.
+    val inhibitedLoadBusyIn = Bool(); inhibitedLoadBusyIn.allowOverride; inhibitedLoadBusyIn := False
+    inhibitedLoadBusyIn.simPublic()
     // Execute-time conditional fault completion (generalized; driven by the branch EU
     // for TRAPV and the div EU for CHK/DIV0). When an execute-time check raises a
     // synchronous group-2 trap the EU drives this with {robId, vector}; the ROB marks
@@ -1830,22 +1843,26 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // with no head present, so OR in `stopped` as a recognition gate.
     val normalIrqGate = (count > 0) && p0.first && !faultedStore(h0) &&
                         !p0.isRte && !privViolation && !p0.sysOp &&
-                        !preciseDrainBusyIn
+                        !preciseDrainBusyIn && !inhibitedLoadBusyIn
     // A halted core (Task P4.5) recognizes no interrupt -- deliberately NOT
     // wakeable, matching the design doc's decision (unlike `stopped`, which IS
     // interrupt-wakeable).
     interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive && !coreHalted
     // Priority-rule invariant (design doc §4.1/§5 item 8): interruptPending can only
-    // go true when normalIrqGate held (which now requires !preciseDrainBusyIn), so a
-    // LAUNCHED precise drain must never coexist with a newly-recognized interrupt at
-    // the SAME head. This assert exists purely to catch a future edit that loosens
-    // normalIrqGate's preciseDrainBusyIn term.
+    // go true when normalIrqGate held (which now requires !preciseDrainBusyIn AND
+    // !inhibitedLoadBusyIn), so a LAUNCHED precise store drain -- or an outstanding
+    // inhibited-load device read -- must never coexist with a newly-recognized
+    // interrupt at the SAME head. These asserts exist purely to catch a future edit
+    // that loosens normalIrqGate's busy terms.
     // Explicit `FAILURE` severity -- see M68kSim.scala for why `.includeSimulation`
     // must also be set on the enclosing SpinalConfig for this block to elaborate at
     // all (without it, `GenerationFlags.simulation { ... }` is silently skipped).
     GenerationFlags.simulation {
       assert(!(interruptPending && preciseDrainBusyIn),
         "RobPlugin: interruptPending recognized while a precise SQ drain was in flight",
+        FAILURE)
+      assert(!(interruptPending && inhibitedLoadBusyIn),
+        "RobPlugin: interruptPending recognized while an inhibited load's device read was in flight",
         FAILURE)
     }
     // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
@@ -2022,7 +2039,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // never itself be mistaken for "a new macro boundary" and cause an early fire).
     val traceNormalGate = (count > 0) && p0.first && !faultedStore(h0) &&
                           !p0.isRte && !privViolation && !p0.sysOp &&
-                          !preciseDrainBusyIn
+                          !preciseDrainBusyIn && !inhibitedLoadBusyIn
     tracePendingFire := tracePendingReg && traceNormalGate && !flushing && excIdle
     when(tracePendingFire) { tracePendingReg := False }
 

@@ -235,9 +235,24 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
     rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
     rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+    // Load-side sibling of preciseDrainBusyIn (see RobPlugin.scala's doc comment on
+    // `inhibitedLoadBusyIn`): an inhibited load's device read is genuinely
+    // outstanding -> block the ROB from recognizing a NEW interrupt/trace at the
+    // head until it resolves, mirroring the store-drain interlock exactly.
+    rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
     lsEu.robHeadIn           := rob.logic.h0
     lsEu.robHeadValidIn      := rob.logic.count > 0
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
+    // A debug automatic-halt (halt-after-N-macros) about to apply to the CURRENT
+    // ROB head must ALSO stop an inhibited load at that head from launching its
+    // device read -- the exact pair (`haltAfterDue || haltAfterRetireBlock`)
+    // already gating RobPlugin's own `retire0` for this same successor. Without
+    // this, the successor could launch its device read up to one cycle before
+    // `haltAfterDue` itself becomes true (a RegNext-delayed comparison against the
+    // macro-retire counter), then get discarded by the debug-recover flush that
+    // follows -- the same silent double-device-read hazard as an interrupt
+    // preempting an in-flight load, just triggered by the debug session instead.
+    lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
 
     // ---- CPLX (DivEu) wiring: issue port 4 -> DivEu; completion (port 3) + dynamic
     // wakeup + euFault (CHK vec6 / DIV0 vec5). ----

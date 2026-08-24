@@ -145,6 +145,23 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   var sqCompletionPort: Flow[UInt] = null
   var sqFaultCompletionPort: Flow[LsFault] = null
   var preciseDrainBusySig: Bool = null
+  // ── Inhibited-load preemption interlock (task: interrupt/trace/debug-auto-halt
+  // preempting an already-bus-active inhibited LOAD) ──
+  // `debugHaltImminentIn`: True the cycle a debug automatic-halt boundary (halt-
+  // after-N-macros) is about to apply to the CURRENT ROB head -- i.e. RobPlugin's
+  // own `haltAfterDue || haltAfterRetireBlock`, the EXACT pair already gating
+  // `retire0`. Mirrors `irqPreemptPendingIn` (an async external event) but for a
+  // fully PREDICTABLE internal one: the debug session's own retire-count target.
+  var debugHaltImminentIn: Bool = null
+  // `inhibitedLoadBusySig`: True from the cycle an INHIBITED load's bus command
+  // launches until its response is actually consumed, +1 cycle -- mirrors
+  // StoreQueue's `preciseDrainBusyReg`/`io.preciseDrainBusy` exactly, but tracks
+  // the LOAD-launch half of the same "a precise device transaction is in flight"
+  // concept instead of the STORE-drain half. Fed to the ROB as a sibling of
+  // `preciseDrainBusyIn` (kept separate, not folded in: that name is store-
+  // specific, and the two conditions have independent, non-overlapping launch/
+  // clear events).
+  var inhibitedLoadBusySig: Bool = null
 
   during setup {
     excActive       = Bool()
@@ -162,6 +179,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqCompletionPort       = Flow(UInt(6 bits))
     sqFaultCompletionPort  = Flow(LsFault())
     preciseDrainBusySig    = Bool()
+    debugHaltImminentIn    = Bool()
+    inhibitedLoadBusySig   = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     completionPort = Flow(UInt(6 bits))
@@ -252,11 +271,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     robHeadIn.allowOverride;           robHeadIn := U(0, 6 bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
+    // A DUT with no RobPlugin (most standalone LS tests) never has a debug-auto-
+    // halt session armed -- idle-default False, matching `irqPreemptPendingIn`.
+    debugHaltImminentIn.allowOverride; debugHaltImminentIn := False
     // Debug-only taps (zero synth impact, matches every other tap in this file):
     // a standalone LS-EU-only DUT (no real RobPlugin) needs to sim-poke these
     // directly to exercise the precise-drain path (e.g. the `liveCompletionFires`
     // collision-retry directed test in LsEuFastPreciseSpec).
     robHeadIn.simPublic(); robHeadValidIn.simPublic(); irqPreemptPendingIn.simPublic()
+    debugHaltImminentIn.simPublic()
 
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
@@ -1687,8 +1710,36 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     //     head, which it reaches because a younger parked load never prevents an older
     //     instruction from retiring.  `olderInhibitedStore` therefore clears.
     sq.io.barrier.robId := p4Front.robId
+    // ── Preemption interlock (post-f5f9fe13 hardening) ──────────────────────────
+    // Reaching the ROB head is necessary but not SUFFICIENT for a device read to be
+    // safe to launch: two more sources can still discard this exact head on a LATER
+    // cycle, after it has already fired the bus command, silently costing the
+    // device a real clear-on-read/pop side effect on re-execution:
+    //
+    //   * `irqPreemptPendingIn` -- an interrupt or trace exception is ALREADY known
+    //     pending this cycle (mirrors StoreQueue's own `headPreciseReady` term
+    //     exactly -- see StoreQueue.scala:270). Covers the case where preemption is
+    //     recognized BEFORE this load would otherwise launch.
+    //   * `debugHaltImminentIn` -- a debug automatic-halt (`haltAfterDue ||
+    //     haltAfterRetireBlock`) is due for the CURRENT head. This is the EXACT
+    //     pair already gating RobPlugin's own `retire0` for the halt-after
+    //     successor; without it here, the successor could still launch its device
+    //     read one cycle before `haltAfterDue` itself becomes true (a RegNext-
+    //     delayed comparison), then get discarded by the debug-recover flush that
+    //     follows -- same double-read hazard, different trigger.
+    //
+    // An interrupt/trace that becomes pending only AFTER this load has ALREADY
+    // launched (irqPreemptPendingIn was False the launch cycle) is a separate,
+    // narrower race -- closed by `inhibitedLoadBusySig` gating the ROB's own
+    // interrupt/trace RECOGNITION below, not by anything here (this gate guards
+    // only the LAUNCH decision itself). No such after-the-fact race exists
+    // for the debug-auto-halt source: `debugHaltImminentIn` cannot even light up
+    // for THIS head before the head itself becomes valid, so there is no earlier-
+    // launch window to protect against — see the class-level doc comment on
+    // `debugHaltImminentIn`.
+    val p4PreemptSafe = !irqPreemptPendingIn && !debugHaltImminentIn
     val p4LaunchOk  = Mux(p4Inhibited,
-                          p4AtRobHead && !sq.io.barrier.olderStore,
+                          p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe,
                           !sq.io.barrier.olderInhibitedStore)
     p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
     when(p4Valid && !sqFlushSig && !excActive) {
@@ -1743,6 +1794,53 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       }
     }
     val p4Ready = !p4Valid || p4CanLeave
+
+    // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
+    // busy for an INHIBITED load's bus transaction -- the load-side mirror of
+    // StoreQueue's `preciseDrainBusyReg` (StoreQueue.scala:584-590). Fed to the ROB
+    // as a sibling of `preciseDrainBusyIn` so `normalIrqGate`/`traceNormalGate`
+    // never recognize a NEW interrupt/trace while this load's device read is
+    // genuinely outstanding -- closing the race `p4PreemptSafe` above cannot: an
+    // interrupt/trace that only becomes pending AFTER this exact cycle (once the
+    // load has already launched) is invisible to a launch-time gate by
+    // construction.
+    //
+    // Launch: `alignedEnq` (single-access) or `bkStart` (two-access split), each
+    // ONLY when `p4Inhibited` -- both events also fire for ORDINARY loads sharing
+    // the same aligned-ring/bk-FSM hardware, and busy must never latch for those
+    // (that would silently reintroduce a one-at-a-time chokepoint on the ordinary
+    // hot path, serializing every load behind a phantom "precise" wait it never
+    // needed).
+    //
+    // Consume: the FIRST `alignedRspFire`/`bkCompletes` observed while busy. The
+    // aligned and bk paths are mutually exclusive in time by construction
+    // (`alignedSendValid`/`alignedCanEnq`/`alignedRspValid` all require `!bkBusy`,
+    // and a bk launch itself requires `alignedEmpty`), and within the aligned
+    // path responses drain STRICTLY in enqueue (FIFO) order -- so an inhibited
+    // load, having enqueued no later than any load behind it (p4Inhibited only
+    // launches once this load IS the ROB head, i.e. every OLDER access, aligned-
+    // ring entry included, has already retired and therefore already drained),
+    // can never be overtaken by a younger entry's response. The first consume
+    // event observed after this launch is therefore always the SAME transaction
+    // -- no robId tag needed, exactly like `preciseDrainBusyReg` needs none.
+    //
+    // Deliberately does NOT distinguish poisoned-and-discarded from a genuine
+    // successful completion: "the AXI response is actually consumed" (the
+    // transaction resolves on the bus) is what makes it safe for a NEW inhibited
+    // load or a NEW interrupt/trace recognition to proceed -- not whether this
+    // particular instruction's result was kept.
+    val loadBusyReg = RegInit(False); loadBusyReg.simPublic()
+    val inhibitedLoadLaunch = (alignedEnq && p4Inhibited && !p4Front.twoAccess) ||
+                              (bkStart && p4Inhibited)
+    val inhibitedLoadConsume = loadBusyReg && (alignedRspFire || bkCompletes)
+    // +1 cycle past resolution (mirrors StoreQueue's `preciseFinalAckD`): keeps the
+    // ROB's gate from racing a same-cycle preempt against a drain that just
+    // resolved.
+    val inhibitedLoadConsumeD = RegNext(inhibitedLoadConsume, init = False)
+    when(inhibitedLoadLaunch) { loadBusyReg := True }
+      .elsewhen(inhibitedLoadConsumeD) { loadBusyReg := False }
+    inhibitedLoadBusySig := loadBusyReg
+    inhibitedLoadLaunch.simPublic(); inhibitedLoadConsume.simPublic()
 
     // P3 performs the registered-PA SQ operation. Stores terminate here; loads capture
     // the registered forwarding result into P4. An older P4/front-back completion wins
