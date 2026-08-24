@@ -2407,7 +2407,73 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // request valids (NOT excActive) so the SQ drain / a quiescing LS access keeps
     // the port on cycles the exc isn't using it (the exception is serializing, so
     // any older LS store has already committed/drained by the time the exc stores).
-    when(excActive && excLoadCmdValid) {
+    //
+    // ── FMax: the D-cache load-command override selects on `excLoadCmdValid` ALONE ──
+    // This `when`'s condition is the select of the ENTIRE `dcache.loadCmd` payload mux
+    // (valid + 32-bit vaddr + 32-bit paddr + size + cacheMode + token): one node with
+    // ~104-way fanout. `excLoadCmdValid` is a plain register (`ExceptionUnit.ldoValidReg`),
+    // but `excActive` is a raw, live decode of the commit-side exception FSM's state
+    // register (`RobPlugin.logic.excActive` = `ExceptionUnit.active` =
+    // `!fsm.isActive(IDLE)`). ANDing the two put that raw FSM-state decode -- itself a
+    // fanout-113 net -- at the HEAD of the core's longest cone, one full LUT level and
+    // one long high-fanout route ahead of the vaddr mux it selects:
+    //
+    //   exc_fsm_stateReg[2] -> (LUT6) excActive && excLoadCmdValid -> (LUT3) loadCmd.vaddr
+    //     -> DcachePlugin's 4-entry early-probe VA CAM -> earlyProbeHit
+    //     -> loadProbePort.ready -> (LsEu) normalReqArm -> tCanLeave -> tReady
+    //     -> s1Ready -> issuePort.ready -> (IQ) selPorts(3).fire -> the slot-compaction
+    //     select cone -> the per-slot `triggers` clock enables.
+    //
+    // A measured OOC synth of this exact netlist had that family as the SOLE remaining
+    // blocker: 23 logic levels, WNS -1.109ns, and all but 7 of the 421 failing endpoints
+    // rooted at `exc_fsm_stateReg[2]`.
+    //
+    // `excActive` is REDUNDANT here, because `excLoadCmdValid => excActive` holds by
+    // construction. Proof, from `ExceptionUnit.scala`:
+    //   (1) `excLoadCmdValid` is `dcLoadCmd.valid`, which is exactly `ldoValidReg`.
+    //   (2) `ldoValidReg` is set ONLY by `when(ldoVld && !ldoValidReg)`, and `ldoVld` is
+    //       driven True at exactly six sites, every one of them inside the
+    //       `whenIsActive` body of a non-IDLE state: E_VECREQ, R_SRREQ, R_PCREQ,
+    //       R_PCREQ2, R_FMTREQ, F_HDRREQ.
+    //   (3) Each of those six states has EXACTLY ONE exit, `when(dcLoadCmd.fire) { goto
+    //       (<its own>WAIT) }`. On the cycle `ldoValidReg` is being set it is still
+    //       False, so `dcLoadCmd.valid` is low, so `fire` is low -- the FSM cannot leave
+    //       that state on the setting edge. The state therefore still holds the cycle
+    //       `ldoValidReg` first reads True.
+    //   (4) `ldoValidReg` is cleared by `when(dcLoadCmd.fire) { ldoValidReg := False }`,
+    //       the SAME condition that advances the FSM to the WAIT state -- so it falls on
+    //       the exact edge the state leaves, never later.
+    //   (5) Hence `ldoValidReg` is True only while the FSM is in one of those six *REQ
+    //       states, all of which are != IDLE, i.e. `active` (== `excActive`) is True.
+    //   (6) The only three `goto(IDLE)` sites in the whole FSM are in E_REDIR, R_REDIR
+    //       and S_REDIR; none of the three raises `ldoVld`, and every path into them
+    //       passes through a *WAIT state entered on the `fire` that already cleared
+    //       `ldoValidReg`. IDLE itself never raises `ldoVld`, and `ldoValidReg` is
+    //       `RegInit(False)`.
+    //
+    // This is not a new assumption: the invariant is ALREADY load-bearing today, on the
+    // ready side of this very handshake. `excLoadCmdReady := dcache.loadCmd.ready` at the
+    // bottom of this block is NOT gated on `excActive`, so `dcLoadCmd.fire` is
+    // `ldoValidReg && dcache.loadCmd.ready`. If `ldoValidReg` could ever be True with
+    // `excActive` False, the command would be "accepted" and retired without this mux
+    // ever presenting it to the cache -- the sequencer would then wait forever in its
+    // WAIT state for a response that was never requested. The core already depends on
+    // (5) holding; this only stops paying a critical-path LUT level to re-check it.
+    //
+    // The tripwire below machine-checks (5) every cycle in simulation rather than asking
+    // the reader to trust the derivation, exactly as `DcachePlugin`'s `stSubLastReg`
+    // drift check does for its own retime. It is vacuous in the standalone LS EU tests
+    // (both signals default False there, see their `allowOverride` defaults above) and
+    // live in every integrated DUT -- FullCoreSynth, FuzzDut, ExecuteLockStepSpec and
+    // IpcBenchSpec all wire `excLoadCmdValid := exc.dcLoadCmd.valid` against the same
+    // `excActive := rob.logic.excActive`.
+    GenerationFlags.simulation {
+      assert(!excLoadCmdValid || excActive,
+        "LsEuPlugin: exception load command valid while the exception FSM is IDLE " +
+        "(excLoadCmdValid => excActive violated)",
+        FAILURE)
+    }
+    when(excLoadCmdValid) {
       dcache.loadCmd.valid         := True
       dcache.loadCmd.payload.vaddr := excLoadCmdVaddr
       // Task 11: the PHYSICAL address now comes across explicitly instead of being

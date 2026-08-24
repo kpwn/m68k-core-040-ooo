@@ -629,9 +629,63 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
     val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
     val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
-    val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
-                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
-                                 !earlyProbeStale(earlyProbeMatchIdx)
+    // ── FMax: `earlyProbeHit` as a per-entry OR, not an index-then-select ──
+    // The original form was
+    //
+    //   earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+    //     !earlyProbeSetWriteVec(earlyProbeMatchIdx) && !earlyProbeStale(earlyProbeMatchIdx)
+    //
+    // which SERIALISES the CAM behind three separate 4:1 selects: the compare vector has
+    // to be reduced to `earlyProbeMatchIdx` (an OHToUInt) before any of the three
+    // per-entry qualifiers can even be looked up, and only then does the final AND with
+    // `earlyProbeOwnsCmd` run. Measured from `earlyProbeMatchVec` that is four LUT levels
+    // (matchVec -> OHToUInt -> 4:1 mux -> AND), and it sits in the middle of the core's
+    // longest cone -- `loadCmd.vaddr` -> this CAM -> `earlyProbeHit` -> `useEarlyProbe`
+    // -> `loadProbePort.ready` -> the LS EU's `normalReqArm`/`issuePort.ready` ready chain
+    // -> the IssueQueue's slot-compaction `triggers` clock enables (23 levels, WNS
+    // -1.109ns, the sole remaining failing family on the standing 5.000ns OOC gate).
+    //
+    // Distributing the qualifiers over the vector collapses that to TWO levels: each
+    // entry's five terms fold into one LUT (`matchVec(i)` is itself `presentVec(i) &&
+    // readies(i)`, so this is `presentVec & readies & hits & !setWrite & !stale`, five
+    // inputs), and the four results OR together in one more.
+    //
+    // EQUIVALENCE. `earlyProbeOwnsCmd` is `earlyProbeMatchVec.orR`, and `OHToUInt`
+    // requires -- as its name says -- a one-hot input:
+    //   - `earlyProbeMatchVec` all zero: `earlyProbeOwnsCmd` is False so the old form is
+    //     False, and an OR of `matchVec(i) && ...` over an all-zero vector is False too.
+    //   - `earlyProbeMatchVec` one-hot at `i`: `earlyProbeMatchIdx` is exactly `i`, so the
+    //     old form is `hits(i) && !setWrite(i) && !stale(i)` and the OR collapses to its
+    //     single non-masked term, the identical expression.
+    // Those are the only two cases the surrounding design admits. A multi-hot
+    // `earlyProbeMatchVec` is already outside this block's contract and was ALREADY
+    // mis-handled before this change, not newly so: `OHToUInt` on a multi-hot input ORs
+    // the set indices together, which can name an entry that does not match the command
+    // at all (e.g. `0b0110` yields index 3), and `earlyProbeHitData` -- unchanged here --
+    // would then serve that unrelated entry's data. The design requires one-hotness for
+    // the data path regardless of how the hit qualifier is written.
+    //
+    // Multi-hotness needs two simultaneously-valid entries carrying the SAME token AND
+    // the same VA. Probe tokens are `(False ## False ## tCtx.robId)` (LsEuPlugin), i.e.
+    // one per in-flight ROB id, and an entry is invalidated both when its command
+    // consumes it and by the token/`all` cancel port. The tripwire below pins that
+    // one-hot premise directly instead of leaving it as an unchecked comment.
+    val earlyProbeHitVec       = Vec(Bool(), earlyProbeDepth)
+    for (i <- 0 until earlyProbeDepth) {
+      earlyProbeHitVec(i) := earlyProbeMatchVec(i) && earlyProbeHits(i) &&
+                             !earlyProbeSetWriteVec(i) && !earlyProbeStale(i)
+    }
+    val earlyProbeHit          = earlyProbeHitVec.asBits.orR
+    GenerationFlags.simulation {
+      assert(CountOne(earlyProbeMatchVec.asBits) <= U(1),
+        "DcachePlugin: early-probe match vector is multi-hot (duplicate token+VA entries)",
+        FAILURE)
+      assert(earlyProbeHit === (earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+                                !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
+                                !earlyProbeStale(earlyProbeMatchIdx)),
+        "DcachePlugin: earlyProbeHit drifted from its original index-then-select definition",
+        FAILURE)
+    }
     val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
     // `!ldS1Valid` is a REAL structural conflict, not a conservative gate: the
     // useEarlyProbe consume arm below (`elsewhen(loadCmdPort.fire && useEarlyProbe)`)
@@ -671,7 +725,36 @@ class DcachePlugin(val socketMerged: Boolean = false,
     for (i <- 0 until earlyProbeDepth) earlyProbeFreeVec(i) := !earlyProbeValids(i)
     val earlyProbeHasFree      = earlyProbeFreeVec.asBits.orR
     val earlyProbeReusesConsume = !earlyProbeHasFree && loadCmdPort.valid && useEarlyProbe
-    val earlyProbeHasAllocSlot = earlyProbeHasFree || earlyProbeReusesConsume
+    // ── FMax: the two CAM-dependent terms of `loadProbePort.ready`, folded into one ──
+    // `loadProbePort.ready` (in the load FSM's IDLE arm below) used to AND together two
+    // SEPARATE `useEarlyProbe`-dependent terms:
+    //
+    //   earlyProbeHasAllocSlot  ==  F || (!F && V && U)       -- "a queue slot exists"
+    //   (!loadCmdPort.valid || useEarlyProbe)  ==  !V || U    -- "the shared read port
+    //                                                            is free this cycle"
+    //
+    // with F = `earlyProbeHasFree`, V = `loadCmdPort.valid`, U = `useEarlyProbe`. Those
+    // two are redundant with each other, and the redundancy cost two LUT levels on the
+    // longest cone in the core (U -> earlyProbeReusesConsume -> earlyProbeHasAllocSlot ->
+    // the ready AND-tree). Their conjunction simplifies EXACTLY, by cases on V:
+    //
+    //   (F || (!F && V && U)) && (!V || U)
+    //     = (F || (V && U)) && (!V || U)            [absorption on the first term]
+    //   V = 0 :  (F || 0) && (1)      =  F
+    //   V = 1 :  (F || U) && (U)      =  U          [absorption: U && (F || U) == U]
+    //     = Mux(V, U, F)
+    //
+    // so ONE 3-input select replaces both, and `useEarlyProbe` now reaches
+    // `loadProbePort.ready` through a single LUT instead of three. This is a pure
+    // Boolean identity -- every (F, V, U) assignment gives the same result as before --
+    // not a policy change: a command that is present and does NOT consume a queued hit
+    // still blocks the probe launch (V=1, U=0 -> False), and a cycle with no command
+    // still needs a genuinely free slot (V=0 -> F).
+    //
+    // `earlyProbeReusesConsume` is deliberately left as its own signal: the
+    // consume-and-replace guard at the `loadCmdPort.fire && earlyProbeOwnsCmd` block
+    // below still reads it, and it is NOT the same expression as this one.
+    val earlyProbeSlotAndPortFree = Mux(loadCmdPort.valid, useEarlyProbe, earlyProbeHasFree)
     // `OHToUInt` requires a one-hot input. The free vector is normally multi-hot;
     // mask it first or simultaneous residents can alias the same physical entry.
     val earlyProbeAllocIdx     = Mux(
@@ -1295,12 +1378,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // single BRAM read port; a command consuming a queued hit needs no read, so
         // the next probe may launch on the same edge. The four-entry result queue
         // absorbs the fixed probe->command distance at one launch per cycle.
-        loadProbePort.ready := !resetSweepBusy && !loadShadowValid &&
-                               !pendingStoreMiss && !maintBusyReg &&
-                               earlyProbeHasAllocSlot &&
-                               (!loadCmdPort.valid || useEarlyProbe) &&
-                               !(ldS1Valid && !ldS1Hit) &&
-                               !(storeReadOwed && stS1Valid)
+        // FMax: the six CAM-INDEPENDENT admission terms are grouped first and the single
+        // folded CAM-dependent term (`earlyProbeSlotAndPortFree`, see its declaration for
+        // the case-by-case proof that it is exactly the old `earlyProbeHasAllocSlot &&
+        // (!loadCmdPort.valid || useEarlyProbe)`) is ANDed in last, so `useEarlyProbe`
+        // reaches this net through one LUT rather than three.
+        val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
+                             !pendingStoreMiss && !maintBusyReg &&
+                             !(ldS1Valid && !ldS1Hit) &&
+                             !(storeReadOwed && stS1Valid)
+        loadProbePort.ready := probeAdmitBase && earlyProbeSlotAndPortFree
         when(loadProbePort.fire) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
                                  (loadProbeCancelPort.payload.all ||
