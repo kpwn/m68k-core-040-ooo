@@ -633,7 +633,40 @@ class DcachePlugin(val socketMerged: Boolean = false,
                                  !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
                                  !earlyProbeStale(earlyProbeMatchIdx)
     val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
+    // `!ldS1Valid` is a REAL structural conflict, not a conservative gate: the
+    // useEarlyProbe consume arm below (`elsewhen(loadCmdPort.fire && useEarlyProbe)`)
+    // writes ldS2Valid/ldS2Hit/ldS2Direct/ldS2DirectData/ldS2Line directly, and so
+    // does the unconditional `ldS2Valid := ldS1Valid; ldS2Hit := ldS1Hit; ldS2Line :=
+    // ldS1Line` a few lines above (LOAD S2) -- both target the SAME registers for the
+    // SAME next cycle. If ldS1Valid is true THIS cycle (an ordinary S1 read launched
+    // last cycle is resolving into ldS2 THIS cycle), letting a probe-hit bypass fire
+    // too would have the later-in-program-order assignment silently clobber the real
+    // S1 resolution one cycle later -- dropping a genuine load response. That
+    // conflict window is exactly ONE cycle (the cycle ldS1Valid reads true), never
+    // longer.
+    //
+    // Task pea-early-probe-absorbing-2026-08-24 (P4, review-found absorbing state):
+    // the bug was NOT this one-cycle gate itself -- it was what used to happen to a
+    // command caught by it. `useEarlyProbe` going false on a conflict cycle used to
+    // fall all the way through the elsewhen chain below to the PLAIN
+    // `elsewhen(loadCmdPort.fire)` ordinary-read arm (queued probe entry silently
+    // discarded, see the invalidate block below), which itself sets `ldS1Valid :=
+    // True` for the FOLLOWING cycle -- so the very next command hits the identical
+    // conflict again, forever, under a saturated back-to-back load stream. One
+    // disruption (a miss, a split load, a same-set store, a full probe queue -- any
+    // one cycle that fails to take the probe fast path) was therefore never
+    // recoverable without a multi-cycle bubble in `loadCmdPort.valid`.
+    //
+    // Fix: `earlyProbeConflict` below withholds `loadCmdPort.ready` for exactly the
+    // conflicting cycle instead of admitting the command down the ordinary-read arm.
+    // The queued probe entry survives untouched (nothing consumes/invalidates it
+    // when the command does not fire), `ldS1Valid` is NOT re-armed (no ordinary read
+    // is launched), and it naturally clears the very next cycle -- so the held
+    // command fires via the fast path one cycle later instead of falling back for
+    // the rest of the burst. Cost of a disruption: one stall cycle for the ONE
+    // command caught on the conflicting edge, not a lasting mode change.
     val useEarlyProbe          = earlyProbeHit && !ldS1Valid
+    val earlyProbeConflict     = earlyProbeHit && ldS1Valid
     val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) earlyProbeFreeVec(i) := !earlyProbeValids(i)
     val earlyProbeHasFree      = earlyProbeFreeVec.asBits.orR
@@ -645,7 +678,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       earlyProbeHasFree,
       OHToUInt(OHMasking.first(earlyProbeFreeVec.asBits)),
       earlyProbeMatchIdx)
-    earlyProbeOwnsCmd.simPublic(); useEarlyProbe.simPublic()
+    earlyProbeOwnsCmd.simPublic(); useEarlyProbe.simPublic(); earlyProbeConflict.simPublic()
     // Respond ONLY on a HIT. A MISS falls through to REFILL below. Translation
     // faults never enter this pipe: the resolved-command contract requires the LS
     // producer to consume them before issuing loadCmd.
@@ -1297,10 +1330,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // WAIT phase must let it drain. New commands remain blocked for the entire
         // maintenance interval. `maintWalking` is false only during that quiesce wait.
         val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
+        // `!earlyProbeConflict`: task pea-early-probe-absorbing-2026-08-24 (P4). Hold
+        // this exact command for the one cycle its owned, ready probe hit collides
+        // with an in-flight ordinary S1 resolution (see `earlyProbeConflict`'s own
+        // comment above `useEarlyProbe`) instead of admitting it down the
+        // ordinary-read arm, which used to re-arm `ldS1Valid` and perpetuate the
+        // conflict for every following command in a saturated stream.
         loadCmdPort.ready := !resetSweepBusy && !loadShadowValid && !pendingStoreMiss &&
                              (!maintBusyReg || resolveOldProbeDuringMaint) &&
                              (!earlyProbeTokenPresent || earlyProbeOwnsCmd) &&
-                             (!(storeReadOwed && stS1Valid) || useEarlyProbe)
+                             (!(storeReadOwed && stS1Valid) || useEarlyProbe) &&
+                             !earlyProbeConflict
 
         when(loadCmdPort.fire && earlyProbeOwnsCmd) {
           // Full-queue consume-and-replace reuses this physical entry for the new
