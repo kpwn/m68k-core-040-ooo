@@ -38,7 +38,36 @@ object AxiIds {
   /** Read ID of D-cache load-refill MSHR `k`. Reserved range 0..3 (room for
     * N_MSHR = 4); only 0 is used while N_MSHR == 1. */
   def dRefill(k: Int): Int = { require(k >= 0 && k < 4, s"D refill MSHR index $k out of 0..3"); k }
-  /** D-side write-through / store-drain write. */
+  /** D-side write-through / store-drain write. A SINGLE constant id, reused for
+    * every WRITETHROUGH/INHIBITED store beat (unlike the read side's per-MSHR
+    * `dRefill`/`iRefill` pools) -- this is safe for pipelined (overlapping)
+    * back-to-back writes ONLY because AXI4 guarantees in-order completion for
+    * transactions sharing one id, and because this id's traffic is cache-path
+    * (cacheable RAM), never the bypass window: the SoC L2's `id_busy_c` front-door
+    * CAM (the mechanism this file's own header comment warns "gets ZERO benefit
+    * from the L2's 8 internal MSHRs" for a constant-ID READ master) was rescoped
+    * in the L2's 2026-08-19/20 pipeline rework (`l2c_ctrl.v`, "SINCE THE PIPELINE
+    * this applies at the door only to a beat bound for the BYPASS ENGINE; a
+    * cache-path beat is ordered at the resolve stage instead"
+    * (`ord_now_block_c`/`ord_merge_block_c`) -- so a constant-ID WRITE on the
+    * cache path is NOT id-busy-blocked the way a constant-ID READ still would be.
+    * Do not read the header comment above as still describing the write side.
+    *
+    * CAVEAT (task: pipeline WRITETHROUGH stores) -- the L2 is not the binding
+    * constraint for same-master write overlap; `macqd700-soc/rtl/soc/axi_xbar.v`
+    * is: its `sw_owned` mechanism locks a slave's whole AW->B sequence to ONE
+    * master (1 outstanding write per master port), and a 2026-07-21 investigation
+    * recorded in that file explicitly analyzed "same-master pipelining (the case
+    * that would actually help the CPU store stream)" and deliberately did NOT
+    * implement it (a real same-ID B-ordering risk if done carelessly, "a
+    * substantial, risk-bearing redesign", SoC-side, out of scope here). This
+    * CPU-side id reuse is still correct and worth doing -- the crossbar's
+    * `mw_awready` simply won't assert for a second AW until the first's B is
+    * consumed, so a second kickoff issued early just backpressures cleanly on
+    * ordinary `axi.aw.ready` -- but the REAL, currently-deployed throughput gain
+    * from that reuse is bounded to "hide this core's own S0-S3 admission latency
+    * behind an in-flight write's round trip", not "fully overlap two round
+    * trips", until/unless the crossbar itself is reworked. */
   val D_STORE = 1
   /** D-side cache-maintenance (CPUSH) writeback write. */
   val D_PUSH = 2

@@ -285,7 +285,22 @@ class StoreQueue(depth: Int = 8) extends Component {
   val sendCommitted = valids(sendPtr) && committed(sendPtr) && !io.flush
   val sendAtHead = sendPtr === head
   val noAccepted = acceptedHalves === 0
-  val sendPipelined = !sendPrecise && (sendMode === CacheMode.COPYBACK)
+  // Task (WT-pipelining): WRITETHROUGH joins COPYBACK here. Both share the exact
+  // same precondition -- `!sendPrecise`, i.e. this is a `fastStore` (LsEuPlugin's
+  // `!fastStore` classification) that already completed its ROB bookkeeping
+  // decoupled from the physical write, so presenting it as soon as it is
+  // COMMITTED (not gated on `sendAtHead`/`noAccepted`, i.e. not required to be the
+  // sole occupant of DcachePlugin's drain pipe) carries no NEW precision cost --
+  // see DcachePlugin.scala's `inputStoreSerial`/`wtOutstanding` for the admission
+  // side of this change and its own doc comment for the full argument (a
+  // non-precise WT store's bus error was ALREADY diagnostic-only/async before this
+  // change, exactly like COPYBACK's kind=1/2/3 sites -- pipelining does not touch
+  // that). `sendMode` still gates OUT `INHIBITED`, which can never reach here
+  // anyway: `fastStore` (LsEuPlugin.scala) requires `cmode =/= INHIBITED`, so an
+  // INHIBITED access is unconditionally `precise` and never observes
+  // `sendPipelined` regardless of this term.
+  val sendPipelined = !sendPrecise &&
+    (sendMode === CacheMode.COPYBACK || sendMode === CacheMode.WRITETHROUGH)
   val sendPreciseReady = sendAtHead && headPreciseReady && noAccepted
   val sendSerialReady = sendCommitted && sendAtHead && noAccepted
   io.drain.valid := Mux(sendPipelined, sendCommitted,

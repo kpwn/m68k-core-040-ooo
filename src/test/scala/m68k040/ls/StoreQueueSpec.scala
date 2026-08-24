@@ -304,6 +304,104 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
+  // WT-pipelining task: `sendPipelined` (StoreQueue.scala) now covers non-precise
+  // WRITETHROUGH the same way it already covered COPYBACK -- `io.drain.valid`
+  // presents a committed entry off `sendCommitted` alone (no `sendAtHead`/
+  // `noAccepted`), so a SECOND committed WT entry can be PRESENTED for drain while
+  // the FIRST is still "accepted" (drained but not yet acked). This is the SQ-side
+  // half of the pipelining change; DcachePluginSpec-adjacent coverage (DcacheSpec)
+  // proves the DcachePlugin-side admission/AXI-overlap half.
+  test("WT-pipelining: a second committed non-precise WRITETHROUGH entry presents " +
+       "for drain while the first is still accepted (not yet acked) -- was sendAtHead-gated before this task",
+       VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)   // io.drain.ready held True throughout (initDut's default)
+      alloc(dut, cd, robId = 4, paddr = 0x200, data = 0x1111L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      alloc(dut, cd, robId = 5, paddr = 0x300, data = 0x2222L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      // drainAck stays LOW (initDut's default) throughout this phase -- nothing
+      // pops, so any entry that gets SENT (drain.fire, which `io.drain.ready`
+      // held True lets happen the moment it presents) stays counted in
+      // `acceptedHalves` until explicitly acked below.
+      commit(dut, cd, robId = 4)
+      commit(dut, cd, robId = 5)
+      cd.waitSampling(4)   // let both committed entries clear the send cursor
+
+      // Before this task, `sendSerialReady` required `sendAtHead && noAccepted` --
+      // the SECOND WT entry could not even be PRESENTED (let alone sent) until the
+      // FIRST was fully acked, so `acceptedHalves` could never exceed 1 for a
+      // WRITETHROUGH stream. After this task (`sendPipelined` covers WRITETHROUGH
+      // exactly like COPYBACK), both commited entries are sent back-to-back and
+      // BOTH sit "accepted" (sent, unacked) simultaneously -- the direct SQ-side
+      // proof of pipelining.
+      assert(dut.acceptedHalves.toBigInt == 2,
+        s"both committed WT entries must be simultaneously accepted (sent, unacked): got ${dut.acceptedHalves.toBigInt}")
+      assert(dut.head.toBigInt == 0, "nothing has been acked yet -- robId=4 (index 0) is still the oldest resident entry")
+      assert(dut.robIds(0).toBigInt == 4 && dut.robIds(1).toBigInt == 5,
+        "both entries remain resident, in their original ring slots, until acked")
+
+      // The SQ's own `drainAck` contract is "always the oldest accepted half"
+      // (StoreQueue.scala doc comment) -- acking now must pop robId=4 first, even
+      // though robId=5 was ALSO already sent, proving send order == ack order
+      // (program order preserved under pipelining).
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      assert(dut.head.toBigInt == 1, "first ack pops the OLDEST accepted half (robId=4), not robId=5")
+      assert(dut.acceptedHalves.toBigInt == 1)
+
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      assert(dut.io.empty.toBoolean, "both entries popped, strictly in program (send/ack) order")
+    }
+  }
+
+  // WT-pipelining task (point 3c of the design brief): the `sameLine` load-forward
+  // hazard StoreQueue.scala already proved mode-agnostic for COPYBACK (the test
+  // immediately above this one) holds identically for a pipelined, non-precise
+  // WRITETHROUGH store -- the hazard is driven purely by SQ residency (`valids`/
+  // `committed`/age), never by drain/AXI timing, so a WT entry that has ALREADY
+  // been sent to DcachePlugin (and may have an AXI write in flight) still
+  // correctly stalls a same-line younger load until its OWN terminal ack pops it.
+  test("same-line stall still holds an older undrained entry under a pipelined " +
+       "(non-precise) WRITETHROUGH store, even after it has been sent/accepted",
+       VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // An OLDER non-precise WRITETHROUGH store at 0x102..0x103 (line 0x100..0x10F).
+      alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      commit(dut, cd, robId = 4)
+      cd.waitSampling()
+      assert(dut.io.drain.valid.toBoolean, "committed WT entry must present for drain")
+      cd.waitSampling()   // accept it -- now "accepted, unacked" (an AXI write would be in flight here)
+
+      // A younger load, same cache line, no byte overlap -- must still stall even
+      // though the store has ALREADY been sent to DcachePlugin (pipelined) and is
+      // sitting in the "accepted, unacked" window a real outstanding AXI write
+      // occupies.
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "same-cache-line older WT entry, sent but still unacked -> must stall")
+
+      // Only the TERMINAL ack (matching a real AXI B) clears it.
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "once acked, the same-line hazard must clear")
+      cd.waitSampling(2)
+    }
+  }
+
   test("io.full asserts at depth; a drain frees a slot so a further alloc succeeds", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)

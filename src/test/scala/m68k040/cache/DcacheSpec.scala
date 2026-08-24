@@ -5,6 +5,7 @@ import m68k040.core.ParamPlugin
 import m68k040.isa.Size
 import m68k040.ls.BehavioralMemAgent
 import m68k040.mmu.DIdentityTranslationPlugin
+import m68k040.sim.{AxiMemModel, AxiMemModelConfig, L2LatencyModel}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -143,6 +144,63 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.storeIn.valid #= false
     // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
     // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
+    dut.probe.logic.maintCmdIn.valid #= false
+    dut.probe.logic.maintCmdIn.payload.push #= false
+    dut.probe.logic.maintCmdIn.payload.invalidate #= false
+    dut.probe.logic.maintCmdIn.payload.scope #= 0
+    dut.probe.logic.maintCmdIn.payload.sel #= 0
+    dut.probe.logic.maintCmdIn.payload.addr #= 0
+    cd.waitSampling(4)
+    (cd, mem)
+  }
+
+  /** WT-pipelining task: `BehavioralMemAgent` wraps `AxiMemModel` with a HARDCODED
+    * `AxiMemModelConfig()` (near-zero AXI B latency), which is exactly the wrong
+    * shape to demonstrate overlap -- with a fast B, a serialized and a pipelined
+    * store stream look almost identical. This attaches `AxiMemModel` directly with
+    * an explicit, REALISTIC `L2LatencyModel` (`hitCycles`, `docs/l2c_spec.md:668-
+    * 679`'s measured L2 hit round trip) so a store's AXI write takes long enough,
+    * relative to DcachePlugin's own S0-S3 admission latency, that "does the second
+    * store's AW fire before the first store's B arrives" is unambiguous. Both
+    * `idBusyBlock` and `crossbarSingleOutstanding` stay at their (false) defaults
+    * here -- the SoC L2's OWN id_busy_c no longer gates a cache-path beat at all
+    * (see `AxiIds.scala`'s `D_STORE` doc comment); the REAL binding constraint on
+    * same-master AXI write overlap is `macqd700-soc/rtl/soc/axi_xbar.v`'s
+    * `sw_owned` (1 outstanding write per master port, deliberately not pipelined
+    * SoC-side -- also documented on `D_STORE`). A caller that wants to measure
+    * against THAT realistic ceiling instead passes `crossbarSingleOutstanding =
+    * true` explicitly; the default here measures this core's OWN, CPU-internal
+    * admission-latency-hiding gain in isolation, which is what this task's RTL
+    * change actually controls.
+    *
+    * `checkIdUnique` is turned OFF here (the model's own default is `true`).
+    * That checker's doc comment names it as modeling the L2's `id_busy_c` CAM
+    * "already outstanding" rule for BOTH AR and AW, UNCONDITIONALLY -- i.e. it
+    * still encodes the L2's PRE-2026-08-19/20-rework behavior, before the L2
+    * became a real pipeline and rescoped `id_busy_c` to the bypass path only
+    * (`ord_now_block_c`/`ord_merge_block_c` order same-ID cache-path beats at the
+    * resolve stage instead -- see `AxiIds.scala`'s `D_STORE` comment for the full
+    * citation). Two WRITETHROUGH stores presenting AW with the SAME id (`D_STORE`
+    * is a single constant id, by design -- see that same comment) while the first
+    * is still outstanding is exactly this task's INTENDED behavior, not a
+    * protocol violation: AXI4 permits multiple outstanding same-ID transactions
+    * outright, PROVIDED responses complete in issue order, which is a SEPARATE
+    * property this test suite proves directly (program-order landing, ordering
+    * test below) rather than via this blanket checker. */
+  def initDutLatency(dut: Dut, hitCycles: Int = 15,
+                      crossbarSingleOutstanding: Boolean = false): (ClockDomain, AxiMemModel) = {
+    val cd = dut.clockDomain
+    cd.forkStimulus(period = 10)
+    val cfg = AxiMemModelConfig(
+      latency = L2LatencyModel(enabled = true, hitCycles = hitCycles),
+      crossbarSingleOutstanding = crossbarSingleOutstanding,
+      checkIdUnique = false)
+    val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, cfg)
+    dut.probe.logic.loadCmdIn.valid #= false
+    dut.probe.logic.loadProbeIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.payload.all #= false
+    dut.probe.logic.storeIn.valid #= false
     dut.probe.logic.maintCmdIn.valid #= false
     dut.probe.logic.maintCmdIn.payload.push #= false
     dut.probe.logic.maintCmdIn.payload.invalidate #= false
@@ -501,6 +559,156 @@ class DcacheSpec extends AnyFunSuite {
 
       val got = load(dut, cd, base + 4, Size.LONG, CacheMode.WRITETHROUGH)
       assert(got == BigInt("11223344", 16), s"cached line updated as before: got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // ── WT-pipelining task: DcachePlugin-side proof (points 2/3 of the design brief) ──
+
+  // (l2) Point 3a: back-to-back non-precise WRITETHROUGH stores now OVERLAP their
+  // AXI writes. Before this task, `storeOutstanding === 0`/`serialStoreInFlight`
+  // blocked admission of the second store until the FIRST's AXI B had already
+  // landed, so the second store's AW could only ever fire AFTER the first's B.
+  // With a realistic (`hitCycles = 15`) AXI B latency, this is now unambiguous:
+  // the second store is admitted and kicks off its OWN AW/W while the first's B
+  // is still outstanding.
+  test("WT-pipelining: a second non-precise WRITETHROUGH store's AW fires before " +
+       "the first store's B arrives (genuine overlap, not just fast admission)",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutLatency(dut, hitCycles = 15)
+
+      val events = scala.collection.mutable.ListBuffer[String]()
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean)
+            events += s"AW(${dut.dcache.logic.axi.aw.payload.addr.toBigInt.toString(16)})"
+          if (dut.dcache.logic.axi.b.valid.toBoolean && dut.dcache.logic.axi.b.ready.toBoolean)
+            events += "B"
+        }
+      }
+
+      // Present store #1, wait for admission (storePort.fire), then IMMEDIATELY
+      // present store #2 to a DIFFERENT line -- no manual delay, exactly the
+      // back-to-back stream the design brief's motivating case describes.
+      fireStore(dut, cd, 0x5000L, BigInt("11111111", 16), Size.LONG, CacheMode.WRITETHROUGH)
+      fireStore(dut, cd, 0x6000L, BigInt("22222222", 16), Size.LONG, CacheMode.WRITETHROUGH)
+
+      // `wtOutstanding` (simPublic) is the direct, unambiguous proof: BOTH stores
+      // must be simultaneously AXI-pending at some point before either's B lands --
+      // impossible under the old single-outstanding admission gate.
+      var sawTwoOutstanding = false
+      var cyc = 0
+      while (!sawTwoOutstanding && cyc < 30) {
+        cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.wtOutstanding.toBigInt == 2) sawTwoOutstanding = true
+      }
+      assert(sawTwoOutstanding, "both pipelined WT stores must be simultaneously AXI-pending (wtOutstanding == 2) at some point")
+
+      // Drain until both have acked.
+      cd.waitSampling(40)
+
+      // Event-order proof, mirroring what a black-box AXI observer would see:
+      // both AWs must have fired before EITHER B -- i.e. the second store's AW is
+      // not gated behind the first store's B at all.
+      val awIdx = events.zipWithIndex.filter(_._1.startsWith("AW")).map(_._2)
+      val bIdx  = events.zipWithIndex.filter(_._1 == "B").map(_._2)
+      assert(awIdx.size == 2, s"expected exactly 2 AW beats, got ${events.filter(_.startsWith("AW"))}")
+      assert(bIdx.size == 2, s"expected exactly 2 B beats, got $events")
+      assert(awIdx.max < bIdx.min,
+        s"both AWs must fire before either B (overlap) -- got event trace: ${events.mkString(",")}")
+
+      assert(mem.peekByte(0x5000L) == 0x11, "store #1 landed correctly despite overlap")
+      assert(mem.peekByte(0x6000L) == 0x22, "store #2 landed correctly despite overlap")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (l3) Point 3b: ordering is preserved under pipelining. Two non-precise
+  // WRITETHROUGH stores to the SAME address, presented back-to-back (the second
+  // admitted while the first is still AXI-pending), must still land at memory in
+  // PROGRAM order -- the final value must be the YOUNGER store's, never the older
+  // one's (which would mean the AXI writes completed out of order).
+  test("WT-pipelining: two pipelined WRITETHROUGH stores to the SAME address land " +
+       "at memory in program order", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutLatency(dut, hitCycles = 15)
+      val addr = 0x7000L
+
+      fireStore(dut, cd, addr, BigInt("11111111", 16), Size.LONG, CacheMode.WRITETHROUGH)
+      fireStore(dut, cd, addr, BigInt("22222222", 16), Size.LONG, CacheMode.WRITETHROUGH)
+
+      // Confirm they really did overlap (both AXI-pending at once) before checking
+      // the result -- otherwise this test would not actually be exercising the
+      // pipelined path at all.
+      var sawTwoOutstanding = false
+      var cyc = 0
+      while (!sawTwoOutstanding && cyc < 30) {
+        cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.wtOutstanding.toBigInt == 2) sawTwoOutstanding = true
+      }
+      assert(sawTwoOutstanding, "both same-address pipelined WT stores must overlap for this test to be meaningful")
+
+      cd.waitSampling(40)
+      val got = mem.peek128(addr) & 0xffffffffL
+      assert(got == 0x22222222L,
+        s"the YOUNGER store's value must win (program order preserved under pipelining): got ${got.toString(16)}")
+      cd.waitSampling(4)
+    }
+  }
+
+  // (l4) Point 3d: bus-error precision under pipelining, made explicit. A
+  // non-precise WRITETHROUGH store's bus error was ALREADY diagnostic-only/async
+  // BEFORE this task (kind=0, `storeErrReg && !stPreciseReg` -> `diagFaultPulse`) --
+  // `fastStore` (LsEuPlugin) already decouples ROB completion from the physical
+  // write for exactly this class, so pipelining changes nothing about precision,
+  // only how many such already-async writes can be concurrently in flight. This
+  // proves it directly: store #1 (which will bus-error) is immediately followed by
+  // store #2 (a normal, distinct-address store) admitted WHILE #1 is still
+  // AXI-pending -- #1's fault must surface on the async diagnostic channel (kind=0)
+  // and must NOT block or corrupt #2's own clean completion.
+  test("WT-pipelining: a pipelined WRITETHROUGH store's bus error stays diagnostic-only " +
+       "and does not block a younger, already-admitted pipelined WT store",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDutLatency(dut, hitCycles = 15)
+      dut.dcache.logic.diagFaultExpected #= true
+
+      val faultAddr = 0x8000L
+      val okAddr    = 0x9000L
+      mem.armWriteFault(faultAddr)   // one-shot DECERR on the NEXT write to this exact address
+
+      fireStore(dut, cd, faultAddr, BigInt("DEADBEEF", 16), Size.LONG, CacheMode.WRITETHROUGH)
+      fireStore(dut, cd, okAddr, BigInt("CAFEF00D", 16), Size.LONG, CacheMode.WRITETHROUGH)
+
+      // Both pending at once -- #2 was genuinely admitted while #1's (about to
+      // fail) write was still outstanding, not serialized behind its error.
+      var sawTwoOutstanding = false
+      var cyc = 0
+      while (!sawTwoOutstanding && cyc < 30) {
+        cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.wtOutstanding.toBigInt == 2) sawTwoOutstanding = true
+      }
+      assert(sawTwoOutstanding, "the OK store must be admitted while the faulting store is still AXI-pending")
+
+      cd.waitSampling(40)
+
+      // #1's fault landed on the async diagnostic channel, never architectural.
+      assert(dut.dcache.logic.diagFaultValid.toBoolean, "the bus error must reach the diagnostic-fault latch")
+      assert(dut.dcache.logic.diagFaultKind.toInt == 0, "kind=0: WT-beat / INHIBITED-drain")
+      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(faultAddr),
+        "the diagnostic fault must name the FAULTING store's address")
+
+      // #2 completed cleanly regardless -- its data landed, unaffected by #1's error.
+      // Big-endian byte order (matching this file's other WT tests, e.g.
+      // "WRITETHROUGH hit drain is unchanged"): peekByte(okAddr) is the MSB.
+      assert(mem.peekByte(okAddr)     == 0xCA, "the younger, already-admitted store must still complete cleanly")
+      assert(mem.peekByte(okAddr + 1) == 0xFE, "the younger store's full value must be intact")
+      assert(mem.peekByte(okAddr + 2) == 0xF0, "the younger store's full value must be intact")
+      assert(mem.peekByte(okAddr + 3) == 0x0D, "the younger store's full value must be intact")
+
+      dut.dcache.logic.diagFaultExpected #= false
       cd.waitSampling(4)
     }
   }

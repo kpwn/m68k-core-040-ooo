@@ -103,6 +103,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
                                // AXI B to observe on that path); no-op for synthesis
     val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
     storeErrReg.simPublic()
+    // WT-pipelining task: the pipelined-WT-specific slice of `storeAckReg` (see
+    // that signal's own drive site for the exact expression and the reasoning for
+    // why `!stPreciseReg` at a `storeBAck` instant is an exact classifier). Forward-
+    // declared here, same pattern as `storeAckReg` itself, since `wtOutstanding`'s
+    // accounting (declared far above the AXI B site) needs to reference it.
+    val wtStoreAckReg = Bool()
+    wtStoreAckReg.simPublic()
     // `socketMerged` (axi-socket adapter plan, Task 5): when this plugin's AXI is merged
     // onto the single socket `axi_d` by AxiDMergePlugin, the bundle must be DIRECTIONLESS
     // so a sibling plugin in the same Component can drive its response side --
@@ -815,7 +822,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Ordered store-drain admission. COPYBACK hits may occupy the existing
     // S0/S1/S2/S3 boundaries concurrently; variable-latency classes remain a
     // single-owner barrier and a discovered COPYBACK miss freezes younger stages.
-    val storeOutstanding = RegInit(U(0, 3 bits)) // max: S0 + S1 + S2 + S3
+    //
+    // WT-pipelining (this task): `storeOutstanding` used to be a pure "S0..S3
+    // stage occupancy" counter (max 4) because the only class that could remain
+    // admitted-but-unacked BEYOND S3 was a fully-serial one, and admission itself
+    // capped that at exactly one. A non-precise (fastStore) WRITETHROUGH store now
+    // pipelines its AXI write the same way a COPYBACK hit's on-chip resolve always
+    // has -- its `storeAckReg` no longer fires until the real AXI B, which can lag
+    // admission by a full round trip, so several such descriptors can be
+    // concurrently "outstanding" (admitted, kicked off, awaiting B) well past S3.
+    // Widened 3->4 bits with real headroom (see the assert below for the proven
+    // bound) instead of guessing a wider width.
+    val storeOutstanding = RegInit(U(0, 4 bits))
     val serialStoreInFlight = RegInit(False)
     val storeMissBarrier = RegInit(False)
     // A load miss snapshots its dirty victim when ldS1 resolves. Any older store
@@ -827,8 +845,57 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val refillNeedsStoreDrain = Bool(); refillNeedsStoreDrain := False
     storeOutstanding.simPublic(); serialStoreInFlight.simPublic(); storeMissBarrier.simPublic()
     loadMissStoreBarrier.simPublic()
+
+    // ---- WT-pipelining admission classification -------------------------------
+    // A store is fully-serial when it is `precise` (LsEuPlugin's `!fastStore`
+    // classification, `sq.io.alloc.payload.precise := !fastStore`) OR when it is
+    // INHIBITED. In REAL CPU traffic these two are the same set: `fastStore`
+    // (LsEuPlugin.scala:612) requires `cmode =/= INHIBITED` unconditionally, so an
+    // INHIBITED descriptor is ALWAYS `precise` already and the `=== INHIBITED`
+    // term never actually changes admission for anything LsEuPlugin sends. It is
+    // kept anyway, explicitly, as defense-in-depth rather than trusting that
+    // external invariant here: DcachePlugin has no way to verify what produced
+    // `storePort.payload`, and a directed whitebox test (or a future bug upstream)
+    // presenting an INHIBITED descriptor with `precise` cleared must still get the
+    // ORIGINAL, fully-serial treatment INHIBITED always had (pre-this-task,
+    // `cacheMode =/= COPYBACK` covered it unconditionally) -- fail closed, not
+    // open. The counter symmetry itself does not depend on this term (see
+    // `stIsPipelinedWtReg`'s own decl comment for why the wtOutstanding
+    // increment/decrement pair is self-consistent regardless), but admission
+    // policy for a mis-tagged INHIBITED descriptor should not silently change too.
+    //
+    // The only descriptor whose ADMISSION treatment actually changes from before
+    // this task is a WRITETHROUGH store that IS `fastStore` (MMU on, page not
+    // inhibited, real traffic only ever reaches this via LsEuPlugin) -- exactly
+    // the "ordinary hot path" this task targets.
+    //
+    // Why this doesn't touch bus-error precision (see this task's design note,
+    // also recorded in the commit message): a `!fastStore` store already
+    // completes its ROB bookkeeping BEFORE its physical write happens
+    // (LsEuPlugin's `captureCompletion`/precise-drain split) -- a bus error on
+    // its beat was ALREADY async/diagnostic-only, not synchronous, before this
+    // change (see the `storeErrReg && !stPreciseReg` -> `diagFaultPulse` kind=0
+    // site far below, which existed unconditionally beforehand and covered this
+    // exact case already, one store at a time). Pipelining only changes how many
+    // such already-async writes can be concurrently in flight, never whether a
+    // given one's fault is precise.
     val inputStoreSerial = storePort.payload.precise ||
-      (storePort.payload.cacheMode =/= CacheMode.COPYBACK)
+      (storePort.payload.cacheMode === CacheMode.INHIBITED)
+    val inputPipelinedWt = !inputStoreSerial &&
+      (storePort.payload.cacheMode === CacheMode.WRITETHROUGH)
+    val inputCopyback = !inputStoreSerial &&
+      (storePort.payload.cacheMode === CacheMode.COPYBACK)
+    inputPipelinedWt.simPublic(); inputCopyback.simPublic()
+
+    // Count of admitted, non-precise WRITETHROUGH descriptors whose AXI write has
+    // not yet B-acked (a STRICT SUBSET of `storeOutstanding`, tracked separately
+    // so admission can cap concurrent AXI-pending WT writes independently of
+    // COPYBACK's own, much shorter, S0..S3-bounded residency). Capped at
+    // `MAX_WT_OUTSTANDING` below by the admission gate -- 3 bits (max 7) is ample
+    // headroom over that cap.
+    val MAX_WT_OUTSTANDING = 4
+    val wtOutstanding = RegInit(U(0, 3 bits))
+    wtOutstanding.simPublic()
 
     // ---- store-S0: elastic payload latch (the cache-boundary flop) ----
     val s0Valid   = RegInit(False)
@@ -2189,8 +2256,44 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // but nothing told this arbiter, so the store advanced to S2 and RMW-merged
     // against the walk's set (wrong old data AND wrong hit-detect). Same hold-and-
     // retry response as against the load: delay, never corrupt.
+    // WT-pipelining (this task): `stAddrReg`/`stMergeReg`/`stStrbReg`/`stPreciseReg`
+    // are SINGLE registers -- the one physical "kickoff in flight" snapshot the AXI
+    // aw/w drive reads from (below). Before this task exactly one WRITETHROUGH/
+    // INHIBITED descriptor could ever be admitted at a time (the old
+    // `storeOutstanding === 0` gate), so a second descriptor reaching S3 and
+    // overwriting these registers WHILE the first's aw/w handshake was still
+    // outstanding was unreachable. Now that several non-precise WRITETHROUGH
+    // descriptors can be concurrently admitted (see `wtOutstanding`), that window
+    // is live: hold S0->S1->S2 promotion (this term) while an OLDER kickoff still
+    // owns (or is about to own) the registers.
+    //
+    // REVIEW-CAUGHT BUG (directed-test-caught, `DcacheSpec` "a second non-precise
+    // WRITETHROUGH store's AW fires before the first store's B arrives"): the
+    // FIRST version of this gate was just `storeWantsAxi || pendingWtKickoff`.
+    // That is NOT enough, because `storeWantsAxi` only reads True the cycle AFTER
+    // an older entry's OWN S3 resolution (`stAwDone := False` is a registered
+    // write, visible starting the next cycle) -- but S2->S3 promotion
+    // (`when(stS2Valid) {...}`) is completely UNGATED (by design, a 1-cycle
+    // pass-through stage) and a TRAILING entry's S1->S2 promotion decision is made
+    // ONE CYCLE BEFORE that, off the CURRENT (still-stale, pre-edge) value of
+    // `storeWantsAxi`. Concretely, with two WT entries advancing in lockstep one
+    // stage apart: while the leader occupies S2 (about to resolve into S3 next
+    // cycle), `storeWantsAxi` is STILL False (the leader hasn't reached S3 yet) --
+    // so the trailing entry's S1->S2 promotion was NOT held, and it lands in S2
+    // exactly when the leader lands in S3, then unconditionally promotes into S3
+    // itself the very next cycle -- exactly the cycle after the leader's kickoff
+    // registers first became live, silently OVERWRITING `stAddrReg`/`stMergeReg`/
+    // `stAwDone`/`stWDone` with the trailing entry's own payload before the
+    // leader's aw/w had any guaranteed chance to be accepted. The fix closes the
+    // gap by ALSO holding while an older non-COPYBACK entry is CURRENTLY resolving
+    // S2 or S3 (`stS2Copyback`/`stS3Copyback` already exist for exactly this
+    // classification) -- i.e. the hold now covers the older entry's ENTIRE
+    // S2-through-accepted-kickoff window, with no one-cycle seam.
+    val wtKickoffBusy = storeWantsAxi || pendingWtKickoff ||
+      (stS2Valid && !stS2Copyback) || (stS3Valid && !stS3Copyback)
+
     val storePipeHeld = storeMissBarrier || storeMissDiscovered ||
-      loadMissStoreBarrier || loadMissDiscovered
+      loadMissStoreBarrier || loadMissDiscovered || wtKickoffBusy
 
     // Task pea-cache-evict-2026-08-19 fix: a store parked in S1 whose read is about
     // to launch THIS cycle, targeting the SAME line (set+tag) an OLDER store is
@@ -2239,12 +2342,35 @@ class DcachePlugin(val socketMerged: Boolean = false,
     when(stS1Advance) { storeReadOwed := False }
     when(freshLoadUsesPort && stS1Valid) { storeReadOwed := True }
 
-    // Admission is purely stage-credit based for COPYBACK. Serial/precise classes
-    // require an empty accepted stream; a discovered miss and a waiting refill stop
-    // new input while the already-resident shallow pipe drains/holds safely.
+    // Admission, per class (WT-pipelining task):
+    //   - precise (fully serial): needs a totally empty pipe -- unchanged,
+    //     `storeOutstanding === 0`. `storeOutstanding` counts EVERY admitted-
+    //     unacked descriptor of every class (see its own decl comment), so this
+    //     transitively also requires `wtOutstanding === 0` -- a precise store
+    //     cannot be admitted while a pipelined WT write is still AXI-pending.
+    //   - COPYBACK: stage-credit based as before (no `storeOutstanding` gate at
+    //     all), PLUS a new `wtOutstanding === 0` term. This is the one new
+    //     restriction COPYBACK picks up from this task: it must not race ahead of
+    //     an OLDER, still AXI-pending WT write. A WT write's completion
+    //     (`storeAckReg`/the SQ's blind "ack pops the oldest accepted half"
+    //     contract, StoreQueue.scala's `drainAckFire`) can lag admission by a full
+    //     AXI round trip, while COPYBACK's own completion is near-immediate (S3,
+    //     no AXI at all on a hit) -- letting a COPYBACK ack overtake an older,
+    //     still-open WT beat would surface an OUT-OF-ORDER ack to the StoreQueue.
+    //     The reverse direction (WT admitted behind an outstanding COPYBACK) needs
+    //     no such gate: the single-lane S0-S3 pipe is strictly FIFO by
+    //     construction (S2/S3 are one-descriptor-at-a-time stages, no overtaking),
+    //     so an older COPYBACK always resolves (fast) before a younger WT even
+    //     reaches S2, let alone kicks off its own AXI leg.
+    //   - pipelined WT (non-precise WRITETHROUGH): stage-credit based too, capped
+    //     at `MAX_WT_OUTSTANDING` (a real, chosen resource bound -- see
+    //     `wtOutstanding`'s own decl comment) instead of the old "admit only when
+    //     the pipe is totally empty" restriction.
     storePort.ready := !resetSweepBusy && s0Ready && !storePipeHeld && !serialStoreInFlight &&
       !maintBusyReg && !refillNeedsStoreDrain &&
-      (!inputStoreSerial || (storeOutstanding === 0))
+      (!inputStoreSerial || (storeOutstanding === 0)) &&
+      (!inputCopyback || (wtOutstanding === 0)) &&
+      (!inputPipelinedWt || (wtOutstanding =/= U(MAX_WT_OUTSTANDING, wtOutstanding.getWidth bits)))
 
     when(stS1Advance) { stS1Valid := False }
     when(s0Advance) {
@@ -2269,9 +2395,85 @@ class DcachePlugin(val socketMerged: Boolean = false,
       storeOutstanding := storeOutstanding - 1
     }
 
+    // wtOutstanding: same net +1/-1/no-op-on-same-cycle-cancel shape as
+    // `storeOutstanding` above, scoped to the pipelined-WT subset. `wtStoreAckReg`
+    // is forward-declared (SpinalHDL wire, driven below at the same site as
+    // `storeAckReg`'s own drive -- see that site's comment for why `!stPreciseReg`
+    // at a `storeBAck` instant can ONLY ever mean "a non-precise WRITETHROUGH
+    // store's beat": COPYBACK never reaches the AXI B path (hit resolves on-chip,
+    // miss's write-allocate acks via `storeAllocAckReg`) and INHIBITED is always
+    // `precise`, so this is an exact, not merely conservative, classifier).
+    val wtStoreFire = storePort.fire && inputPipelinedWt
+    when(wtStoreFire && !wtStoreAckReg) {
+      wtOutstanding := wtOutstanding + 1
+    } elsewhen(!wtStoreFire && wtStoreAckReg) {
+      wtOutstanding := wtOutstanding - 1
+    }
+
     // Registered latch of the drain's identity, needed a cycle later by the AXI
     // B-ack site (Task P4.5's diagnostic-channel gate) and by the WT/beat drive.
     val stPreciseReg = Reg(Bool())
+    // WT-pipelining task: an EXPLICIT, self-contained classifier for "the AXI leg
+    // this S3 kickoff is about to drive belongs to a pipelined (non-precise
+    // WRITETHROUGH) store" -- captured the same way and at the same site as
+    // `stPreciseReg`, consumed by `wtStoreAckReg` at the B-ack site so
+    // `wtOutstanding`'s increment (admission, gated on `inputPipelinedWt`) and
+    // decrement (ack) are driven by the EXACT SAME classification, rather than by
+    // `!stPreciseReg` inferring it indirectly. `!stPreciseReg` alone would silently
+    // assume the external invariant "INHIBITED implies precise"
+    // (LsEuPlugin.scala's `fastStore` does enforce this for real CPU traffic, via
+    // `cmode =/= INHIBITED`) -- correct for real traffic, but NOT something
+    // DcachePlugin can verify about its own `storePort` input, and a directed
+    // whitebox test (or a future bug upstream) presenting a non-precise INHIBITED
+    // store would then decrement `wtOutstanding` on its ack despite never having
+    // incremented it on admission (`inputPipelinedWt` requires `cacheMode ===
+    // WRITETHROUGH`, INHIBITED never qualifies) -- an increment/decrement mismatch
+    // that eventually underflows the counter. Caught exactly this way by
+    // DcacheSpec's pre-existing "inhibited store skips the line write" test, which
+    // pokes `precise=false` on an INHIBITED store directly (that combination is
+    // architecturally unreachable from real LsEuPlugin traffic, but the counter
+    // must not depend on that being true).
+    val stIsPipelinedWtReg = Reg(Bool())
+
+    // WT-pipelining task -- REVIEW-CAUGHT BUG #2 (directed-test-caught, DcacheSpec
+    // "a pipelined WRITETHROUGH store's bus error stays diagnostic-only..."):
+    // `diagFaultPulseAddr` (the async diagnostic-fault channel's kind=0 site,
+    // below) used to read `stAddrReg` directly at the exact cycle `storeErrReg`
+    // pulses (i.e. at B-arrival time). That is correct ONLY when at most one
+    // WT/INHIBITED kickoff can ever be outstanding -- true before this task. Once
+    // several pipelined WT kickoffs can be outstanding concurrently, `stAddrReg`
+    // is reused by each LATER kickoff the moment the CURRENT one's aw/w are both
+    // accepted (see `wtKickoffBusy`) -- which happens WELL BEFORE the earlier
+    // kickoff's B (and therefore its possible fault) actually arrives, since aw/w
+    // acceptance is fast and B is a full round trip later. By the time an OLDER
+    // kickoff's B lands, `stAddrReg` may already hold a NEWER store's address,
+    // silently misattributing the fault.
+    //
+    // Fix: a small FIFO of addresses, pushed in STRICT KICKOFF-CAPTURE order (the
+    // same site `stAddrReg` itself is written, scoped to the non-COPYBACK branch
+    // that actually goes on to produce an AXI B -- see the push site below) and
+    // popped in STRICT B-ARRIVAL order (`storeBAck && stSubLast`, the same event
+    // that terminates each descriptor). These two orders are PROVABLY identical:
+    // kickoffs are issued strictly one-at-a-time (`wtKickoffBusy` gate) and AXI4
+    // guarantees same-ID (`D_STORE` is a single constant id) B responses complete
+    // in issue order -- so the Nth push always corresponds to the Nth pop,
+    // regardless of how many are concurrently in flight. Depth ==
+    // `MAX_WT_OUTSTANDING`: the proven bound on how many non-COPYBACK descriptors
+    // can be simultaneously B-pending (a precise/INHIBITED descriptor can never
+    // overlap with anything else, including itself, so it never pushes this
+    // counter past that same bound).
+    // Pointers are ONE BIT WIDER than `log2Up(depth)` (the classic ring-buffer
+    // full/empty disambiguation): true occupancy can legitimately reach
+    // `MAX_WT_OUTSTANDING` exactly (that is the whole point of the cap), and a
+    // bare `log2Up(depth)`-bit pointer pair cannot distinguish that from empty
+    // (push == pop, mod depth, in both cases). The extra bit makes `push - pop`
+    // (unsigned wraparound) a genuine 0..depth occupancy count; only the low
+    // `log2Up(depth)` bits are used to INDEX the storage array.
+    val wtFaultFifoIdxW = log2Up(MAX_WT_OUTSTANDING)
+    val wtFaultFifoAddr = Vec.fill(MAX_WT_OUTSTANDING)(Reg(UInt(32 bits)))
+    val wtFaultFifoPush = RegInit(U(0, wtFaultFifoIdxW + 1 bits))
+    val wtFaultFifoPop  = RegInit(U(0, wtFaultFifoIdxW + 1 bits))
+    wtFaultFifoPush.simPublic(); wtFaultFifoPop.simPublic()
 
     // S2 either discovers the variable-latency COPYBACK miss or captures a fixed
     // resident/serial result into S3.  `storeMissDiscovered` already freezes the
@@ -2335,6 +2537,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       stStrbReg    := stS3MergeStrb
       stAddrReg    := (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
       stPreciseReg := stS3Payload.precise
+      stIsPipelinedWtReg := !stS3Payload.precise &&
+        (stS3Payload.cacheMode === CacheMode.WRITETHROUGH)
 
       // ── D5/D26/D30: the store's byte range, derived on the CORE-SIDE strobe ──────────
       // D5: reversal within a nibble preserves popcount and contiguity but NOT the offset a
@@ -2394,6 +2598,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
         } otherwise {
           pendingWtKickoff := True
         }
+        // WT-pipelining task: push this descriptor's address for correct B-time
+        // fault attribution -- see `wtFaultFifoAddr`'s own decl comment. Pushed
+        // HERE (unconditional on the immediate-vs-deferred kickoff split above)
+        // because either way this descriptor WILL eventually produce exactly one
+        // AXI B, whether its aw/w fire this cycle or later via `pendingWtKickoff`.
+        wtFaultFifoAddr(wtFaultFifoPush(wtFaultFifoIdxW - 1 downto 0)) :=
+          (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+        wtFaultFifoPush := wtFaultFifoPush + 1
       }
     }
 
@@ -2553,8 +2765,24 @@ class DcachePlugin(val socketMerged: Boolean = false,
       stSubErr := stSubErr || storeBErr
     }
     when(storeBAck && stSubLast) { stSubActive := False }
+    // WT-pipelining task: pop `wtFaultFifoAddr` on the SAME terminal-B event that
+    // ends every non-COPYBACK descriptor's AXI leg (`storeBAck && stSubLast`),
+    // one-for-one with the push at S3 -- see that FIFO's own decl comment for the
+    // ordering proof. Popped unconditionally (error or not): every push WILL
+    // produce exactly one terminal B, and a stale/unpopped entry would silently
+    // desync the FIFO for every descriptor after it.
+    when(storeBAck && stSubLast) { wtFaultFifoPop := wtFaultFifoPop + 1 }
     storeErrReg := (storeBAck && stSubLast) && (stSubErr || storeBErr)
     storeAckReg := (storeBAck && stSubLast) || cbHitAckReg || storeAllocAckReg
+    // WT-pipelining task: the pipelined-WT slice of the AXI-B ack source above,
+    // driven from `stIsPipelinedWtReg` (captured at S3 alongside `stPreciseReg`,
+    // see its own decl comment for why this must be an explicit classifier rather
+    // than inferred from `!stPreciseReg`) so it exactly mirrors `inputPipelinedWt`,
+    // the admission-side condition that incremented `wtOutstanding` for this same
+    // descriptor -- the increment and decrement are provably symmetric regardless
+    // of what any caller (real LsEuPlugin traffic or a directed test poking
+    // DcachePlugin's `storePort` directly) presents.
+    wtStoreAckReg := (storeBAck && stSubLast) && stIsPipelinedWtReg
 
     // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
     // storeAckReg has three sources (write-through AXI B, registered copyback-hit
@@ -2584,8 +2812,39 @@ class DcachePlugin(val socketMerged: Boolean = false,
       assert(!(storePort.fire && inputStoreSerial && (storeOutstanding =/= 0)),
         "DcachePlugin: serial/precise store accepted before older descriptors drained",
         FAILURE)
-      assert(storeOutstanding <= U(4, 3 bits),
-        "DcachePlugin: store descriptor occupancy exceeded S0/S1/S2/S3 capacity",
+      // WT-pipelining task: this bound is no longer "S0/S1/S2/S3 capacity" alone.
+      // `storeOutstanding` now also counts pipelined WT descriptors that have
+      // fully exited the shallow pipe and are purely AXI-B-pending. Proven bound:
+      // at most 4 descriptors can be simultaneously RESIDENT in S0..S3 (one
+      // occupant per stage, structurally unchanged by this task) PLUS at most
+      // `MAX_WT_OUTSTANDING` (4) pipelined-WT descriptors already past S3 and
+      // purely AXI-pending (capped by the `wtOutstanding` admission gate) -- 8
+      // total. (A COPYBACK descriptor can only be resident concurrently with a
+      // nonzero `wtOutstanding` if it was admitted BEFORE that WT ramp started --
+      // see `storePort.ready`'s per-class comment -- so this bound is not
+      // additionally inflated by COPYBACK/WT combinations beyond that.)
+      assert(storeOutstanding <= U(8, 4 bits),
+        "DcachePlugin: store descriptor occupancy exceeded the proven S0-S3 + pipelined-WT bound",
+        FAILURE)
+      assert(wtOutstanding <= U(MAX_WT_OUTSTANDING, wtOutstanding.getWidth bits),
+        "DcachePlugin: wtOutstanding exceeded its own admission cap",
+        FAILURE)
+      assert(wtOutstanding <= storeOutstanding,
+        "DcachePlugin: wtOutstanding must be a subset of storeOutstanding",
+        FAILURE)
+      // The ordering invariant this whole task rests on: a COPYBACK/precise
+      // descriptor is never admitted while an older pipelined-WT write is still
+      // AXI-pending, so its (fast, near-immediate) ack can never race ahead of an
+      // older WT's still-open AXI beat and surface an out-of-order ack to the
+      // StoreQueue (whose `drainAck` blindly pops its oldest accepted half).
+      assert(!(storePort.fire && inputCopyback && (wtOutstanding =/= 0)),
+        "DcachePlugin: a COPYBACK descriptor was admitted while an older pipelined WT write was still AXI-pending",
+        FAILURE)
+      // wtFaultFifo occupancy (push - pop, unsigned wraparound over the
+      // one-bit-wider pointers) must never exceed its own depth -- see the
+      // pointer decl comment for the full disambiguation argument.
+      assert((wtFaultFifoPush - wtFaultFifoPop) <= U(MAX_WT_OUTSTANDING, wtFaultFifoIdxW + 1 bits),
+        "DcachePlugin: wtFaultFifo occupancy exceeded MAX_WT_OUTSTANDING",
         FAILURE)
     }
 
@@ -2595,7 +2854,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // sqFaultCompletion path (Task P2.4); routing it here TOO would be a double-report.
     when(storeErrReg && !stPreciseReg) {
       diagFaultPulse     := True
-      diagFaultPulseAddr := stAddrReg
+      // WT-pipelining task: read the FRONT of `wtFaultFifoAddr`, NOT `stAddrReg`
+      // directly -- see that FIFO's own decl comment. `storeErrReg` and the pop
+      // above (`when(storeBAck && stSubLast) { wtFaultFifoPop := ... }`) fire off
+      // the SAME `storeBAck && stSubLast` event this same cycle, so the FIFO's
+      // CURRENT (pre-pop-edge) front entry is still exactly this descriptor's own
+      // address.
+      diagFaultPulseAddr := wtFaultFifoAddr(wtFaultFifoPop(wtFaultFifoIdxW - 1 downto 0))
       diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
       diagFaultPulseKind := U(0, 3 bits)   // kind=0: WT-beat / INHIBITED-drain
       diagFaultKind0Fires := True          // review-added collision detector
