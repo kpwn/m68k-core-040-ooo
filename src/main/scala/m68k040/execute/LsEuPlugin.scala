@@ -2096,8 +2096,54 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // slot. A live matching response is backpressured until P3/completion can take it.
     xlate.rsp.ready := !txValid || !txWaitingRsp || !txTokenMatch ||
                        sqFlushSig || excActive || txCanConsumeRsp
-    val txRspFire = xlate.rsp.fire && txValid && txWaitingRsp && txTokenMatch &&
-                    !sqFlushSig && !excActive
+    // ── FMax: `txRspFire` IS `txCanConsumeRsp` -- do not re-derive it through
+    //          `xlate.rsp.ready` ──
+    // This used to be
+    //
+    //   xlate.rsp.fire && txValid && txWaitingRsp && txTokenMatch && !sqFlushSig &&
+    //     !excActive
+    //
+    // i.e. it re-entered `xlate.rsp.ready`'s six-way OR (through `fire`) and then ANDed
+    // five of that OR's own disjuncts back on top of it. That put two extra LUT levels
+    // between `txCanConsumeRsp` and `dcache.loadProbeResolve.valid` -- and
+    // `txCanConsumeRsp` is fed by the completion arbitration
+    // (`olderThanTxComp` -> `preciseReplayClaimsComp` -> the ROB retire-side signals),
+    // while `loadProbeResolve.valid` heads straight into the D-cache's early-VIPT
+    // way-tag compare and the 128-bit way mux that lands in `probeLineLine`. Measured
+    // on the standing 5.000ns OOC gate, that is the core's worst path:
+    // `RobPlugin_logic_head_reg[0]` -> the ROB payload Mem's async retire read -> the
+    // retire-side exception/trace decode -> this arbitration -> `loadProbeResolve.valid`
+    // -> `probeResolvedTag` -> `probeReadHitVec` -> `probeReadHitWay` -> `probeLineLine`
+    // (24 logic levels, 6.090ns, WNS -1.109ns, replicated over all 128 bits).
+    //
+    // The two are EXACTLY the same signal. Let
+    //   C = txValid && txWaitingRsp && txTokenMatch && !sqFlushSig && !excActive
+    // Under C, every one of `xlate.rsp.ready`'s first five disjuncts is False
+    // (`!txValid`, `!txWaitingRsp`, `!txTokenMatch`, `sqFlushSig`, `excActive`), so
+    // `xlate.rsp.ready` degenerates to `txCanConsumeRsp` and
+    //
+    //   txRspFire = xlate.rsp.valid && C && txCanConsumeRsp
+    //             = (txMatchedRsp && !sqFlushSig && !excActive) && txCanConsumeRsp
+    //
+    // because `txMatchedRsp` is by definition `txValid && txWaitingRsp &&
+    // xlate.rsp.valid && txTokenMatch`. And `txCanConsumeRsp` defaults False and is
+    // assigned ONLY inside `when(txMatchedRsp && !sqFlushSig && !excActive)` just above,
+    // so `txCanConsumeRsp` already implies that entire guard. The left factor is
+    // therefore redundant and
+    //
+    //   txRspFire == txCanConsumeRsp.                                              ∎
+    //
+    // `xlate.rsp.ready` itself is UNCHANGED (it is a real output to the DTLB and still
+    // has to report readiness in the flush/quiesce/stale-response cases this expression
+    // drops); only this internal consumer stops taking the long way round to a value it
+    // already has. The tripwire pins the identity against the original expression.
+    val txRspFire = txCanConsumeRsp
+    GenerationFlags.simulation {
+      assert(txRspFire === (xlate.rsp.fire && txValid && txWaitingRsp && txTokenMatch &&
+                            !sqFlushSig && !excActive),
+        "LsEuPlugin: txRspFire drifted from its original xlate.rsp.fire-derived definition",
+        FAILURE)
+    }
 
     // The registered DTLB response and the synchronous virtual-set RAM output meet
     // here on the aligned all-hit path. Qualify that exact read by token/physical

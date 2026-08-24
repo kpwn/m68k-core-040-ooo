@@ -541,22 +541,93 @@ class DcachePlugin(val socketMerged: Boolean = false,
       earlyProbeValids(probeReadSlot) &&
       (earlyProbeTokens(probeReadSlot) === loadProbeResolvePort.payload.token) &&
       !probeResolveCanceled
-    val probeResolvedTag = Mux(probeResolveMatchesRead,
-      loadProbeResolvePort.payload.paddr(31 downto offBits + setBits), probeReadTag)
-    val probeResolvedUsable = probeReadUsable ||
-      (probeResolveMatchesRead && !probeReadNeedsLine &&
-       (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+    // ── FMax: compare the ways against BOTH candidate tags, then select ──
+    // The original form selected the tag first and compared second:
+    //
+    //   probeResolvedTag    = Mux(probeResolveMatchesRead, resolvePort.paddr(tag),
+    //                             probeReadTag)
+    //   probeResolvedUsable = probeReadUsable || (probeResolveMatchesRead && ...)
+    //   probeReadHitVec(w)  = probeResolvedUsable && rdValid(w) &&
+    //                           (rdTag(w) === probeResolvedTag)
+    //
+    // so `probeResolveMatchesRead` had to traverse a tag mux AND the full way-tag
+    // comparator (a CARRY8) before `probeReadHitVec` existed -- three logic levels,
+    // at the far end of the core's longest cone. `probeResolveMatchesRead` is fed by
+    // `loadProbeResolvePort.valid`, which the LS EU derives from the completion
+    // arbitration, which the ROB retire pointer feeds through its payload Mem's async
+    // read: measured on the standing 5.000ns OOC gate, `RobPlugin_logic_head_reg[0]`
+    // -> ... -> `probeResolvedTag` -> `probeReadHitVec` -> `probeReadHitWay` ->
+    // `probeLineLine_reg[*]` was 24 logic levels / 6.090ns / WNS -1.109ns, and the
+    // dominant failing family (replicated across all 128 bits of `probeLineLine`).
+    //
+    // BOTH candidate tags are available at the top of the cycle -- `probeReadTag` is a
+    // plain register, and the resolve port's paddr does not depend on
+    // `probeResolveMatchesRead` -- so both comparisons can run in parallel with the
+    // arbitration and only the SELECT stays behind it. `probeResolveMatchesRead` now
+    // reaches `probeReadHitVec` through a single LUT.
+    //
+    // EQUIVALENCE, by cases on `probeResolveMatchesRead` (the only variable shared
+    // between the two forms; `rdValid`/`rdTag`/`probeReadTag`/`probeReadUsable`/
+    // `probeReadNeedsLine` and the resolve port's payload are identical in both):
+    //   - True : old tag is the resolve paddr's tag and old usable is
+    //            `probeReadUsable || (!probeReadNeedsLine && cmode =/= INHIBITED)` ==
+    //            `probeUsableIfResolved`, giving
+    //            `probeUsableIfResolved && rdValid(w) && (rdTag(w) === resolveTag)`.
+    //   - False: old tag is `probeReadTag` and old usable collapses to
+    //            `probeReadUsable`, giving
+    //            `probeReadUsable && rdValid(w) && (rdTag(w) === probeReadTag)`.
+    // Those are exactly the two arms below. Cost: one extra ways-wide tag comparator
+    // (4 x tagBits); the tripwire re-evaluates the original expression every cycle.
+    val probeResolveTagIn = loadProbeResolvePort.payload.paddr(31 downto offBits + setBits)
+    val probeUsableIfResolved = probeReadUsable ||
+      (!probeReadNeedsLine && (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+    val probeWayMatchResolved = Vec(Bool(), ways)
+    val probeWayMatchRead     = Vec(Bool(), ways)
+    for (w <- 0 until ways) {
+      probeWayMatchResolved(w) := rdValid(w) && (rdTag(w) === probeResolveTagIn)
+      probeWayMatchRead(w)     := rdValid(w) && (rdTag(w) === probeReadTag)
+    }
     val probeReadHitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      probeReadHitVec(w) := probeResolvedUsable && rdValid(w) &&
-                            (rdTag(w) === probeResolvedTag)
-    val probeReadHitWay = OHToUInt(probeReadHitVec)
+      probeReadHitVec(w) := Mux(probeResolveMatchesRead,
+                                probeUsableIfResolved && probeWayMatchResolved(w),
+                                probeReadUsable       && probeWayMatchRead(w))
+    GenerationFlags.simulation {
+      val probeResolvedTagRef = Mux(probeResolveMatchesRead, probeResolveTagIn, probeReadTag)
+      val probeResolvedUsableRef = probeReadUsable ||
+        (probeResolveMatchesRead && !probeReadNeedsLine &&
+         (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+      for (w <- 0 until ways)
+        assert(probeReadHitVec(w) === (probeResolvedUsableRef && rdValid(w) &&
+                                       (rdTag(w) === probeResolvedTagRef)),
+          "DcachePlugin: probeReadHitVec drifted from its original select-then-compare definition",
+          FAILURE)
+    }
+    // (`probeReadHitWay = OHToUInt(probeReadHitVec)` used to live here. Its only consumer
+    //  was the `probeLineLine` way mux below, which is now a `MuxOH` off the hit vector
+    //  itself -- see there for why the binary round trip cost a critical-path level.)
     probeReadValid := False
     probeLineValid := probeReadValid
     when(probeReadValid) {
       probeLineSlot := probeReadSlot
       probeLineHit  := probeReadHitVec.asBits.orR
-      probeLineLine := rdData(probeReadHitWay)
+      // FMax: one-hot way mux instead of `rdData(OHToUInt(probeReadHitVec))`. The binary
+      // round trip costs a level -- Vivado builds it as an `OHToUInt` reduction, then a
+      // shared select decode broadcast to all 128 bits, then the per-bit mux -- and this
+      // is the LAST hop of the core's worst path, so the level lands directly on WNS.
+      // `MuxOH` consumes the already-one-hot vector directly (`probeReadHitVec` is a
+      // way-tag hit vector: at most one way of a set may hold a given tag, which is the
+      // same premise `OHToUInt` was already asserting).
+      //
+      // The ONE input for which the two forms differ is the all-zero vector, and there
+      // the result is a proven don't-care: `MuxOH` yields 0 where `rdData(OHToUInt(0))`
+      // yielded way 0's line. An all-zero `probeReadHitVec` sets `probeLineHit := False`
+      // on the same edge, so next cycle `earlyProbeHits(probeLineSlot) := False`, and
+      // `earlyProbeData`'s content for that entry can never be read: `earlyProbeHitData`
+      // is consumed only under `useEarlyProbe`, which requires `earlyProbeHit`, which
+      // requires `earlyProbeHits(i)`. A probe that missed always falls back to the
+      // ordinary S1 read path and never serves this register's value.
+      probeLineLine := MuxOH(probeReadHitVec, rdData)
       probeLineOff  := probeReadOff
       probeLineSize := probeReadSize
     }
