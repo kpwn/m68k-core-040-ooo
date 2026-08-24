@@ -656,16 +656,23 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // cmdSet); the AGU adder ends at the llReg flop. The handoff captures every source
     // before s1* may advance, and the independent front hides this +1 launch cycle when
     // useful. All RegInit / Reg (no uninit fanout).
+    // Task (ring-drain fix): split loads no longer launch through this register --
+    // see the class-level comment on `AlignedLoadCtx` further down. Nothing writes
+    // `vaddr`/`paddr`/`addrB`/`paddrB`/`size`/`cmode`/`cmodeB`/`robId` any more (their
+    // only writer was the P4 split-launch arm this task removed), so each now needs
+    // its own `init` -- otherwise SpinalHDL rejects the register as never-assigned.
+    // Kept, rather than deleted, as harmless dead infrastructure alongside `bkFsm`
+    // (see that comment for why).
     val llReg = new Area {
       val valid     = RegInit(False)
-      val vaddr     = Reg(UInt(32 bits))
-      val paddr     = Reg(UInt(32 bits))
-      val addrB     = Reg(UInt(32 bits))
-      val paddrB    = Reg(UInt(32 bits))
-      val size      = Reg(m68k040.isa.Size())
-      val cmode     = Reg(m68k040.cache.CacheMode())
-      val cmodeB    = Reg(m68k040.cache.CacheMode())
-      val robId     = Reg(UInt(6 bits))
+      val vaddr     = Reg(UInt(32 bits)) init 0
+      val paddr     = Reg(UInt(32 bits)) init 0
+      val addrB     = Reg(UInt(32 bits)) init 0
+      val paddrB    = Reg(UInt(32 bits)) init 0
+      val size      = Reg(m68k040.isa.Size()) init m68k040.isa.Size.BYTE
+      val cmode     = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
+      val cmodeB    = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
+      val robId     = Reg(UInt(6 bits)) init 0
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -709,7 +716,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // here is not a refactor detail: it is a correctness requirement of the split.
       val xlateSup        = Bool()
     }
-    val bkCtx      = Reg(BkCtx())
+    // Same reasoning as `llReg` above: its only writer (`captureBkCtx(bkCtx, ...)`
+    // from the P4 split-launch arm) was removed by this task, so it needs an
+    // explicit zero init to remain a legal (if now permanently-idle) register.
+    val bkCtx      = RegInit(BkCtx().getZero)
     // Rare split replay occupied. Aligned requests never set this bit; their untagged
     // response association is owned by the ordered descriptor ring below.
     val bkBusy     = RegInit(False); bkBusy.simPublic()
@@ -734,15 +744,39 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // them, but cannot reorder either pointer (the cache's miss-shadow contract is
     // also in order).
     //
-    // Split accesses remain on the small BK LAUNCH/WAIT_A/WAIT_B replay FSM and are
-    // mutually exclusive with this queue.  They are rare and inherently two-pass;
-    // the aligned hot path no longer enters a one-at-a-time state machine.
+    // Split (misaligned / line-or-page-crossing) accesses ALSO use this ring now
+    // (task: close the P3 ring-drain-then-serialize gap). A split load pushes TWO
+    // contiguous descriptors in the SAME cycle -- slot A (`twoAccess=True,
+    // splitSecond=False`, the low half) immediately followed by slot B
+    // (`twoAccess=True, splitSecond=True`, the high half that performs the merge
+    // and completes the instruction). Both halves of one pair are ALWAYS pushed
+    // atomically at `alignedPushPtr`/`alignedPushPtr+1`, so they are always
+    // physically contiguous in ring order -- nothing can ever be pushed between
+    // them. That invariant is what the send-side hold (`alignedSendHeld` below)
+    // and the response-side pairing (`alignedRspIsSplitA`/abort logic below) both
+    // lean on: slot B's own predecessor-by-index is PROVABLY always its own slot A,
+    // never an unrelated entry (see the long design comment in the task's commit
+    // message for the full proof). This replaces the old design where a split
+    // access first drained the ENTIRE ring (`alignedEmpty`), then ran a completely
+    // separate serial `bkFsm` (LAUNCH -> WAIT_A -> WAIT_B) outside the ring
+    // entirely. `bkFsm`/`llReg`/`bkCtx`/`bkBusy` (declared above) are kept as
+    // structurally-present but now-electrically-dead infrastructure -- nothing
+    // drives `bkStart` any more -- rather than ripped out, since several other
+    // signals (`useSplitCmd`, debug taps, `inhibitedLoadBusySig`'s sibling terms)
+    // already degrade safely to their idle default once `bkBusy` never asserts.
     case class AlignedLoadCtx() extends Bundle {
       val bk        = BkCtx()
       val vaddr     = UInt(32 bits)
       val paddr     = UInt(32 bits)
       val size      = m68k040.isa.Size()
       val cmode     = m68k040.cache.CacheMode()
+      val twoAccess   = Bool()   // this entry is one half of a split-load pair
+      val splitSecond = Bool()   // False = slot A (low half); True = slot B (high half, merges+completes)
+      // Slot B only: slot A's OWN byte offset within its line (its vaddr(3:0)).
+      // Slot B's own `vaddr` is line-aligned (offset 0 by construction -- it is
+      // literally the next line/page base), so the original access offset needed
+      // by `DcacheByteLane.extractCross` at merge time would otherwise be lost.
+      val mergeOff    = UInt(4 bits)
     }
     private val alignedDepth = 4
     private val alignedPtrW  = log2Up(alignedDepth)
@@ -754,17 +788,48 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val alignedSendPtr  = Reg(UInt(alignedPtrW bits)) init 0
     val alignedRspPtr   = Reg(UInt(alignedPtrW bits)) init 0
     val alignedCount    = Reg(UInt(log2Up(alignedDepth + 1) bits)) init 0
-    val alignedEnq      = Bool(); alignedEnq := False
+    val alignedEnq      = Bool(); alignedEnq := False        // single-descriptor push (ordinary aligned load)
+    val alignedEnqSplit = Bool(); alignedEnqSplit := False   // two-descriptor push (split-load pair)
     val alignedFull     = alignedCount === alignedDepth
     val alignedEmpty    = alignedCount === 0
+    // Slot B may not be SENT until its own slot A (provably the entry immediately
+    // behind it in ring order -- see the class-level comment above) has actually
+    // been popped from the ring. This is the ONLY thing that still serializes a
+    // split access's two sub-transactions -- both for a real architectural reason
+    // (a genuine bus fault on slot A must abort the whole access before slot B's
+    // read is ever issued -- mirrors the old bkFsm's WAIT_A fault arm exactly, and
+    // matters most for an INHIBITED device access, which must never issue two
+    // reads for one aborted instruction) and because slot B's merge needs slot A's
+    // captured line, which does not exist until slot A resolves. Ordinary
+    // (non-split) entries are completely unaffected -- they pipeline normally, and
+    // so does slot A of any pair (only slot B is ever held).
+    val alignedSendPrevValid = alignedValid(alignedSendPtr - 1)
+    // `alignedValid(alignedSendPtr)` is REQUIRED here, not redundant with
+    // `alignedSendValid`'s own check below: this val is read unconditionally, and an
+    // empty/never-yet-pushed ring slot's `AlignedLoadCtx` fields are an uninitialized
+    // register (X in sim, don't-care in synthesis) until its first push -- reading
+    // `.twoAccess`/`.splitSecond` off an invalid slot without this guard let simulator
+    // register randomization spuriously hold even an ORDINARY (non-split) send.
+    val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
+                          alignedMem(alignedSendPtr).splitSecond && alignedSendPrevValid
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
-                           !alignedSent(alignedSendPtr) && !bkBusy && !excActive
+                           !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
+                           !alignedSendHeld
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
     val alignedRspFire  = alignedRspValid && dcache.loadRsp.valid
     val alignedCanEnq   = !bkBusy && (!alignedFull || alignedRspFire)
+    // A split pair needs TWO free slots this cycle (accounting for a same-cycle
+    // pop exactly like `alignedCanEnq` does for one). This is the actual fix for
+    // the ring-drain stall: previously a split load needed the ring FULLY EMPTY
+    // (up to a 4-cycle wait); now it needs at most 2 free slots, and often 0 extra
+    // cycles at all if the ring already has room.
+    val alignedCanEnqSplit = !bkBusy &&
+      ((alignedCount <= U(alignedDepth - 2, alignedCount.getWidth bits)) ||
+       ((alignedCount === U(alignedDepth - 1, alignedCount.getWidth bits)) && alignedRspFire))
     alignedCount.simPublic(); alignedFull.simPublic(); alignedEnq.simPublic()
-    alignedSendValid.simPublic(); alignedRspFire.simPublic()
+    alignedSendValid.simPublic(); alignedRspFire.simPublic(); alignedEnqSplit.simPublic()
+    alignedCanEnqSplit.simPublic(); alignedSendHeld.simPublic()
     // Observability for the arbitration tests: True the cycle a FRONT completion was
     // suppressed and held because the BACK claimed the shared comp* stage.
     val frontCompHeld = Bool(); frontCompHeld := False; frontCompHeld.simPublic()
@@ -784,11 +849,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // cache is ever launched for either slot).
     val xlateBArm = txValid && txSecond && !txWaitingRsp
 
-    // ---- dcache load cmd: registered aligned queue or split replay register ----
-    // Aligned commands come from `alignedSendPtr`; the rare split path retains llReg
-    // and selects slot B after slot A returns.  The two sources are mutually exclusive
-    // by construction (a split waits for alignedEmpty; aligned enqueue waits !bkBusy).
-    // Both addresses are therefore registered at this boundary and preserve FMax #1.
+    // ---- dcache load cmd: registered aligned queue (covers ordinary AND split loads) ----
+    // Every command -- ordinary aligned, or either half of a split pair -- now comes
+    // from `alignedSendPtr` uniformly. `llReg`/`bkFsm` are kept as dead infrastructure
+    // (see the class-level comment on `AlignedLoadCtx`) but nothing drives `bkStart`
+    // any more, so `useSplitCmd` (= `bkBusy`) is permanently False and this mux
+    // always selects the aligned-ring branch. Left in place rather than deleted: it
+    // costs nothing once `bkBusy` is a constant (synthesis removes the dead mux arm),
+    // and keeps this diff from having to touch every downstream reference of
+    // `loadVaddr`/`loadPaddr` for no functional gain.
     val alignedCmd = alignedMem(alignedSendPtr)
     val useSplitCmd = bkBusy
     val loadVaddr = UInt(32 bits)
@@ -1297,7 +1366,56 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Aligned descriptor ring bookkeeping.  Response retirement is emitted before
     // enqueue so a full-ring pop+push to the same physical slot leaves the new entry
     // valid (accept-last, matching the house elastic-stage convention).
-    when(alignedRspFire) {
+    //
+    // `alignedRspEntry`/`alignedRspIsPoison` are declared HERE (rather than only at
+    // the capture site further below, where the pre-split version of this code
+    // declared them) because the split-abort case below needs them to decide
+    // whether to skip an extra ring slot; the later capture logic reuses these same
+    // vals rather than re-declaring them.
+    val alignedRspEntry    = alignedMem(alignedRspPtr)
+    val alignedRspIsPoison = alignedPoisoned(alignedRspPtr) || sqFlushSig
+    // True when this response is slot A of a split pair. A non-poisoned FAULT on
+    // slot A aborts the whole instruction right here -- mirroring the old bkFsm's
+    // WAIT_A fault arm exactly -- and slot B (provably the very next ring entry,
+    // still unsent because of `alignedSendHeld`) must be cancelled outright rather
+    // than ever being sent: a real fault must not trigger a second, phantom bus
+    // transaction for the other half of the same instruction (this matters most
+    // for an INHIBITED device access, where a second read would be a genuine
+    // architectural side-effect bug, not just wasted bus bandwidth). A poisoned
+    // slot A (flush in flight) is deliberately NOT special-cased here: it drains
+    // through the real hardware exactly like every other poisoned entry (see
+    // `alignedSendValid`, which never gates on poison either), so slot B simply
+    // becomes sendable the ordinary way once slot A pops and is discarded the
+    // ordinary way (poisoned) once its own response arrives.
+    val alignedRspIsSplitA = alignedRspEntry.twoAccess && !alignedRspEntry.splitSecond
+    val alignedRspAbortsPair = alignedRspFire && alignedRspIsSplitA &&
+                               dcache.loadRsp.payload.fault && !alignedRspIsPoison
+    alignedRspAbortsPair.simPublic()
+    // True iff this response CONCLUDES the whole instruction's cache activity: an
+    // ordinary (non-split) entry always concludes on its one response; a split
+    // slot A only concludes on a fault (the abort case above); slot B always
+    // concludes (merge success, or its own fault). Used both to gate the shared
+    // comp* stage (an in-flight slot A capturing its line for later merge must NOT
+    // claim the stage) and to clear `inhibitedLoadBusySig`'s busy flag only once
+    // the FULL split instruction -- not just its first half -- has resolved.
+    val alignedRspTerminal = !alignedRspEntry.twoAccess || alignedRspEntry.splitSecond ||
+                             dcache.loadRsp.payload.fault
+    alignedRspTerminal.simPublic()
+    when(alignedRspAbortsPair) {
+      // At this exact cycle `alignedSendPtr` is guaranteed to equal
+      // `alignedRspPtr + 1` (slot B's own index): slot B is architecturally
+      // contiguous with slot A (both pushed atomically the same cycle by
+      // `alignedEnqSplit` below) and, held by `alignedSendHeld`, cannot have been
+      // sent yet. Retire it directly (never sent, so no dangling command) and
+      // advance BOTH the send and response pointers past it, instead of the
+      // ordinary single-entry advance.
+      alignedValid(alignedRspPtr)     := False
+      alignedSent(alignedRspPtr)      := False
+      alignedPoisoned(alignedRspPtr)  := False
+      alignedValid(alignedRspPtr + 1) := False
+      alignedRspPtr                    := alignedRspPtr + 2
+      alignedSendPtr                   := alignedRspPtr + 2
+    } elsewhen(alignedRspFire) {
       alignedValid(alignedRspPtr)    := False
       alignedSent(alignedRspPtr)     := False
       alignedPoisoned(alignedRspPtr) := False
@@ -1319,14 +1437,53 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       dst.paddr := p4Ctx.xlate.paddr
       dst.size  := p4Ctx.xlate.front.size
       dst.cmode := p4Ctx.xlate.cmode
+      dst.twoAccess   := False
+      dst.splitSecond := False
+      dst.mergeOff    := U(0, 4 bits)
       alignedValid(alignedPushPtr)    := True
       alignedSent(alignedPushPtr)     := False
       alignedPoisoned(alignedPushPtr) := sqFlushSig
       alignedPushPtr                  := alignedPushPtr + 1
     }
-    switch(alignedEnq ## alignedRspFire) {
-      is(B"10") { alignedCount := alignedCount + 1 }
-      is(B"01") { alignedCount := alignedCount - 1 }
+    // Split-load pair push: slot A at `alignedPushPtr`, slot B immediately behind
+    // it at `alignedPushPtr+1` -- ALWAYS pushed together, in the SAME cycle, which
+    // is the structural invariant every other piece of split-pairing logic in this
+    // file (`alignedSendHeld`, `alignedRspAbortsPair`) relies on.
+    when(alignedEnqSplit) {
+      val idxA = alignedPushPtr
+      val idxB = alignedPushPtr + 1
+      val dstA = alignedMem(idxA)
+      val dstB = alignedMem(idxB)
+      captureBkCtx(dstA.bk, p4Ctx.xlate.front)
+      dstA.vaddr := p4Ctx.xlate.front.vaddr
+      dstA.paddr := p4Ctx.xlate.paddr
+      dstA.size  := p4Ctx.xlate.front.size
+      dstA.cmode := p4Ctx.xlate.cmode
+      dstA.twoAccess   := True
+      dstA.splitSecond := False
+      dstA.mergeOff    := U(0, 4 bits)
+      captureBkCtx(dstB.bk, p4Ctx.xlate.front)
+      dstB.vaddr := p4Ctx.xlate.front.addrB
+      dstB.paddr := p4Ctx.xlate.paddrB
+      dstB.size  := p4Ctx.xlate.front.size
+      dstB.cmode := p4Ctx.xlate.cmodeB
+      dstB.twoAccess   := True
+      dstB.splitSecond := True
+      dstB.mergeOff    := p4Ctx.xlate.front.vaddr(3 downto 0)
+      alignedValid(idxA)    := True; alignedValid(idxB)    := True
+      alignedSent(idxA)     := False; alignedSent(idxB)     := False
+      alignedPoisoned(idxA) := sqFlushSig; alignedPoisoned(idxB) := sqFlushSig
+      alignedPushPtr         := alignedPushPtr + 2
+    }
+    switch(alignedEnq ## alignedEnqSplit ## alignedRspFire) {
+      is(B"100") { alignedCount := alignedCount + 1 }         // ordinary push only
+      is(B"001") {                                             // response only
+        alignedCount := Mux(alignedRspAbortsPair, alignedCount - 2, alignedCount - 1)
+      }
+      is(B"010") { alignedCount := alignedCount + 2 }         // split-pair push only
+      is(B"011") {                                             // split-pair push + response
+        alignedCount := Mux(alignedRspAbortsPair, alignedCount, alignedCount + 1)
+      }
     }
 
     // ── Precise-store deferred-completion replay (root-cause fix, post-P2.5
@@ -1525,17 +1682,45 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // `backCompFires` below and yields; a precise-store replay observes the resulting
     // liveCompletionFires and retries.  A same-cycle flush poisons immediately even
     // though alignedPoisoned itself is registered.
-    val alignedRspEntry    = alignedMem(alignedRspPtr)
-    val alignedRspIsPoison = alignedPoisoned(alignedRspPtr) || sqFlushSig
+    //
+    // `alignedRspEntry`/`alignedRspIsPoison`/`alignedRspIsSplitA` are declared up at
+    // the ring-bookkeeping site above (the abort-pointer-skip logic needs them too);
+    // reused here unchanged.
+    //
+    // Split slot A holds the raw line for slot B's merge -- captured into
+    // `splitMergeLine` below rather than into a per-descriptor field, because
+    // strict ring FIFO order (send order == response order, and a pair's two
+    // halves are always contiguous -- see the class-level comment on
+    // `AlignedLoadCtx`) guarantees at most ONE pair can ever be in this
+    // "slot A resolved, slot B not yet resolved" window at a time: slot B is
+    // always the very next thing sent (once `alignedSendHeld` clears) and the very
+    // next response processed, so nothing else can land in between. A genuine
+    // fault on slot A is handled by `alignedRspAbortsPair` above (ring bookkeeping)
+    // and completes the instruction as a fault HERE, exactly like the aligned
+    // (non-split) fault arm; slot B is never sent for that case, so it can never
+    // reach this block at all.
+    val splitMergeLine = Reg(Bits(128 bits))
     when(alignedRspFire && !alignedRspIsPoison) {
-      val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
-                                      !alignedRspEntry.bk.xlateSup
-      when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) {
-        captureFaultDesc(alignedRspEntry.bk, alignedRspEntry.vaddr,
-                         alignedRspEntry.size, atc = false)
+      when(alignedRspIsSplitA && !dcache.loadRsp.payload.fault) {
+        splitMergeLine := dcache.loadRsp.payload.line
       } otherwise {
-        captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
-                              alignedRspEntry.size)
+        val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
+                                        !alignedRspEntry.bk.xlateSup
+        when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) {
+          captureFaultDesc(alignedRspEntry.bk, alignedRspEntry.vaddr,
+                           alignedRspEntry.size, atc = false)
+        } elsewhen(alignedRspEntry.twoAccess && alignedRspEntry.splitSecond) {
+          // Slot B: merge slot A's captured line with this cycle's own line using
+          // the ORIGINAL access offset/size (mirrors the old bkFsm WAIT_B arm's
+          // `extractCross(lineA, loadRsp.line, llReg.vaddr(3:0), llReg.size)`).
+          val merged = m68k040.cache.DcacheByteLane.extractCross(
+            splitMergeLine, dcache.loadRsp.payload.line,
+            alignedRspEntry.mergeOff, alignedRspEntry.size)
+          captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
+        } otherwise {
+          captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
+                                alignedRspEntry.size)
+        }
       }
     }
 
@@ -1632,9 +1817,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                         (bkInWaitA && dcache.loadRsp.valid && dcache.loadRsp.payload.fault)
     bkCompletes.simPublic()
     // The back actually WRITES comp* this cycle (a poisoned back load writes nothing,
-    // so the front is free to use the stage).
+    // so the front is free to use the stage). A split slot A's own successful
+    // (non-terminal) response does NOT write comp* -- it only stashes a line for
+    // slot B's later merge -- so it must NOT claim the stage either, or an
+    // unrelated front completion due the same cycle would be wrongly held for a
+    // cycle that never actually produced a completion.
     val backCompFires = (bkCompletes && !bkPoisoned) ||
-                        (alignedRspFire && !alignedRspIsPoison)
+                        (alignedRspFire && !alignedRspIsPoison && alignedRspTerminal)
     backCompFires.simPublic()
 
     // A precise store only enters this replay stream once it has reached the ROB
@@ -1768,26 +1957,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
             p4CanLeave := True
           }
         } otherwise {
-          // Rare split replay drains the aligned response ring first, preserving the
-          // D-cache's untagged response order without putting common aligned hits in
-          // a one-at-a-time FSM.
-          when(!bkBusy && alignedEmpty) {
-            llReg.valid     := True
-            llReg.vaddr     := p4Front.vaddr
-            llReg.paddr     := p4Ctx.xlate.paddr
-            llReg.addrB     := p4Front.addrB
-            llReg.paddrB    := p4Ctx.xlate.paddrB
-            llReg.size      := p4Front.size
-            llReg.cmode     := p4Ctx.xlate.cmode
-            llReg.cmodeB    := p4Ctx.xlate.cmodeB
-            llReg.robId     := p4Front.robId
-            llReg.twoAccess := True
-            llReg.bDone     := False
-            captureBkCtx(bkCtx, p4Front)
-            bkBusy     := True
-            bkPoisoned := False
-            bkStart    := True
-            p4CanLeave := True
+          // Split (misaligned / line-or-page-crossing) load: push slot A + slot B
+          // as a contiguous pair into the SAME aligned descriptor ring ordinary
+          // loads use, instead of draining the ring empty and running the separate
+          // serial `bkFsm`. This needs only `alignedCanEnqSplit` (>= 2 free ring
+          // slots, accounting for a same-cycle pop) rather than `alignedEmpty` (the
+          // whole ring drained) -- the actual fix for the ring-drain stall. See the
+          // long design comment on `AlignedLoadCtx` / `alignedEnqSplit` above for
+          // the full mechanism (send-side hold, response-side merge, fault-abort).
+          when(alignedCanEnqSplit) {
+            alignedEnqSplit := True
+            p4CanLeave      := True
           }
         }
         }
@@ -1805,23 +1985,25 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // load has already launched) is invisible to a launch-time gate by
     // construction.
     //
-    // Launch: `alignedEnq` (single-access) or `bkStart` (two-access split), each
-    // ONLY when `p4Inhibited` -- both events also fire for ORDINARY loads sharing
-    // the same aligned-ring/bk-FSM hardware, and busy must never latch for those
-    // (that would silently reintroduce a one-at-a-time chokepoint on the ordinary
-    // hot path, serializing every load behind a phantom "precise" wait it never
-    // needed).
+    // Launch: `alignedEnq` (single aligned access) or `alignedEnqSplit` (split
+    // pair -- both halves now push through the SAME ring; see the class-level
+    // comment on `AlignedLoadCtx`), each ONLY when `p4Inhibited` -- both events
+    // also fire for ORDINARY loads sharing the same ring hardware, and busy must
+    // never latch for those (that would silently reintroduce a one-at-a-time
+    // chokepoint on the ordinary hot path, serializing every load behind a
+    // phantom "precise" wait it never needed).
     //
-    // Consume: the FIRST `alignedRspFire`/`bkCompletes` observed while busy. The
-    // aligned and bk paths are mutually exclusive in time by construction
-    // (`alignedSendValid`/`alignedCanEnq`/`alignedRspValid` all require `!bkBusy`,
-    // and a bk launch itself requires `alignedEmpty`), and within the aligned
-    // path responses drain STRICTLY in enqueue (FIFO) order -- so an inhibited
-    // load, having enqueued no later than any load behind it (p4Inhibited only
-    // launches once this load IS the ROB head, i.e. every OLDER access, aligned-
-    // ring entry included, has already retired and therefore already drained),
-    // can never be overtaken by a younger entry's response. The first consume
-    // event observed after this launch is therefore always the SAME transaction
+    // Consume: the FIRST TERMINAL response (`alignedRspFire && alignedRspTerminal`)
+    // observed while busy -- deliberately NOT plain `alignedRspFire`, which would
+    // also fire on a split slot A's own non-terminal (merge-only) response and
+    // clear busy one whole sub-access too early, reopening exactly the race
+    // `435e9efb` closed (an interrupt/trace becoming recognizable between a split
+    // inhibited load's two sub-reads). Responses drain STRICTLY in enqueue (FIFO)
+    // order, and an inhibited load's pair enqueues no later than any load behind
+    // it (`p4Inhibited` only launches once this load IS the ROB head, i.e. every
+    // OLDER access has already retired and therefore already drained) -- so the
+    // first terminal-consume event observed after launch is always THIS
+    // instruction's own terminal response (slot B's, or slot A's own fault-abort)
     // -- no robId tag needed, exactly like `preciseDrainBusyReg` needs none.
     //
     // Deliberately does NOT distinguish poisoned-and-discarded from a genuine
@@ -1831,8 +2013,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // particular instruction's result was kept.
     val loadBusyReg = RegInit(False); loadBusyReg.simPublic()
     val inhibitedLoadLaunch = (alignedEnq && p4Inhibited && !p4Front.twoAccess) ||
-                              (bkStart && p4Inhibited)
-    val inhibitedLoadConsume = loadBusyReg && (alignedRspFire || bkCompletes)
+                              (alignedEnqSplit && p4Inhibited)
+    val inhibitedLoadConsume = loadBusyReg && alignedRspFire && alignedRspTerminal
     // +1 cycle past resolution (mirrors StoreQueue's `preciseFinalAckD`): keeps the
     // ROB's gate from racing a same-cycle preempt against a drain that just
     // resolved.
