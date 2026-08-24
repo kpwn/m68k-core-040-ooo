@@ -786,6 +786,40 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // `MmioCover.stepLog2`'s adder/comparator tree every single cycle regardless of
     // activity. Registered at the same two sites `stSubP`/`stSubEnd` are ever written.
     val stSubLog2Reg = Reg(UInt(2 bits)) init 0
+    // ── FMax: `stSubLast` is the store-side mirror of task #236's `stSubLog2Reg` ──
+    // `stSubLast` ("this is the FINAL sub-transaction of the covered sequence") is a
+    // PURE FUNCTION of four registers -- `stSubActive`, `stSubP`, `stSubEnd` and
+    // `stSubLog2Reg` -- yet it used to be recomputed combinationally every cycle
+    // (`!stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)`, a 4-bit shifter + a
+    // 5-bit adder + a 5-bit equality). That put `stSubP` at the HEAD of the single
+    // longest combinational cone in the whole core, because `stSubLast` immediately
+    // qualifies `storeAckReg` (`(storeBAck && stSubLast) || ...`) -- which is NOT a
+    // register despite its name -- and `storeAck` then fans out, still
+    // combinationally, through `sq.io.drainAck` -> `drainAckFire` -> `terminalAck`
+    // -> the SQ head pop / `sqCompletion` -> LsEuPlugin's `preciseReplayClaimsComp`
+    // -> `olderThanTxComp` -> `xlate.rsp.ready` -> `txRspFire` ->
+    // `dcache.loadProbeResolve.valid` -> `probeResolveMatchesRead` ->
+    // `probeResolvedTag` -> the early-VIPT probe's way-hit compare -> the 128-bit
+    // `rdData(probeReadHitWay)` way mux -> `probeLineLine`. A measured OOC synth of
+    // this exact netlist had EVERY failing endpoint family but one rooted at
+    // `stSubP_reg` (116 of 121 families, worst -0.761ns at `probeLineLine_reg`),
+    // with ~1.1ns of that 5.742ns path spent just getting from `stSubP` to
+    // `storeAck` through the four LUT levels of this expression.
+    //
+    // Retimed exactly the way task #236 retimed `stSubLog2`: registered at the SAME
+    // three sites that are the only writers of the four inputs, always computed from
+    // the NEW values those sites are installing (never from the stale pre-edge
+    // registers), so the register is bit-identical to the combinational form in
+    // every cycle. `init True` matches the reset state (`stSubActive init False`
+    // => `stSubLast` = True). A simulation-only tripwire below (`stSubLast`'s own
+    // declaration site) machine-checks that equivalence every cycle rather than
+    // trusting this argument.
+    val stSubLastReg = RegInit(True)
+    // The single definition of `stSubLast` in terms of a (possibly not-yet-committed)
+    // set of sequencer values. Used both for the register updates below and for the
+    // simulation tripwire, so the two can never drift apart.
+    def stSubLastOf(active: Bool, p: UInt, e: UInt, log2: UInt): Bool =
+      !active || ((p +^ (U(1, 4 bits) |<< log2).resize(4 bits)) === e)
     // Task P4.3 AXI-hazard fix -- REVISION 3, the actual landed design. Two
     // earlier revisions were tried and BOTH proven unsafe by DcacheSpec's own new
     // AXI-hazard regression test (recorded here because the failure mode is
@@ -2606,10 +2640,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // from stSubP/stSubEnd read directly here, which would see the pre-edge (stale) value.
       val newStSubP   = Mux(stS3Payload.useStrb, stStartSt, stStartSz)
       val newStSubEnd = Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      val newStSubLog2 = m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
       stSubP       := newStSubP
       stSubEnd     := newStSubEnd
-      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
+      stSubLog2Reg := newStSubLog2
       stSubActive := stS3Inhibited
+      // FMax retime (see `stSubLastReg`'s declaration): recomputed here from the
+      // SAME new values this site installs -- `stSubActive`'s new value is
+      // `stS3Inhibited`, not the stale register, exactly as `stSubLog2Reg` above
+      // uses `newStSubP`/`newStSubEnd` and not the stale `stSubP`/`stSubEnd`.
+      stSubLastReg := stSubLastOf(stS3Inhibited, newStSubP, newStSubEnd, newStSubLog2)
       stSubErr    := False
 
       GenerationFlags.simulation {
@@ -2705,7 +2745,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // `stSubLog2Reg`'s own declaration comment.
     val stSubLog2  = stSubLog2Reg
     val stSubBytes = (U(1, 4 bits) |<< stSubLog2).resize(4 bits)
-    val stSubLast  = !stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)
+    // FMax retime: a plain register read now (see `stSubLastReg`'s declaration for
+    // the full cone this used to sit at the head of). The tripwire below is what
+    // actually PINS the equivalence -- it re-evaluates the original combinational
+    // definition every cycle and fails loudly on any drift, so a future change to
+    // any of the three `stSubP`/`stSubEnd`/`stSubActive` write sites that forgets to
+    // update `stSubLastReg` alongside them cannot land silently.
+    val stSubLast  = stSubLastReg
+    GenerationFlags.simulation {
+      assert(stSubLastReg === stSubLastOf(stSubActive, stSubP, stSubEnd, stSubLog2Reg),
+        "DcachePlugin: stSubLastReg drifted from its combinational definition",
+        FAILURE)
+    }
     // Mask the merged 16-bit strobe down to THIS sub-transaction's own bytes. Every
     // asserted WSTRB bit therefore lies inside the addressed transfer -- the AXI4 rule v1
     // violates at axi_narrow_to_wide.v:43, where strobe 0110 is paired with awsize=1 at an
@@ -2798,13 +2849,21 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // Task #236 fix: register the NEXT sub-transaction's stSubLog2 here too, from the same
       // newStSubP this cycle computes for stSubP -- stSubEnd doesn't change on an advance.
       val newStSubP = (stSubP +^ stSubBytes).resize(offBits bits)
+      val newStSubLog2 = m68k040.socket.MmioCover.stepLog2(newStSubP, stSubEnd)
       stSubP       := newStSubP
-      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, stSubEnd)
+      stSubLog2Reg := newStSubLog2
+      // FMax retime (see `stSubLastReg`'s declaration): `stSubActive` is necessarily
+      // True inside this arm (`!stSubLast` implies it, by `stSubLast`'s definition)
+      // and this site does not write it, so the new value is a literal True.
+      stSubLastReg := stSubLastOf(True, newStSubP, stSubEnd, newStSubLog2)
       stAwDone := False
       stWDone  := False
       stSubErr := stSubErr || storeBErr
     }
-    when(storeBAck && stSubLast) { stSubActive := False }
+    // FMax retime: `stSubActive := False` forces `stSubLast` True by definition, and
+    // this arm is source-ordered AFTER both other writers, so the same last-assignment-
+    // wins precedence the original combinational form got for free is preserved here.
+    when(storeBAck && stSubLast) { stSubActive := False; stSubLastReg := True }
     // WT-pipelining task: pop `wtFaultFifoAddr` on the SAME terminal-B event that
     // ends every non-COPYBACK descriptor's AXI leg (`storeBAck && stSubLast`),
     // one-for-one with the push at S3 -- see that FIFO's own decl comment for the
