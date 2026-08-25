@@ -139,7 +139,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.psrcC #= 0; u.psrcCValid #= false
     u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
     u.toCcr #= false; u.isCondTrap #= false
-    u.faultAddr #= 0; u.sswInstr #= false
+    u.sswInstr #= false
     u.divSigned #= false; u.divIsRem #= false
     u.isChk2 #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false

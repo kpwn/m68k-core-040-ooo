@@ -888,7 +888,6 @@ class RobPluginSpec extends AnyFunSuite {
     u.needsSupervisor #= false
     u.isCondTrap #= false
     u.sswInstr #= false
-    u.faultAddr #= 0
     u.firstOfInstr #= firstOfInstr
     u.lastOfInstr #= true    // single-µop macros; keeps the gate DUT's pokes deterministic
     u.debugBreakValid #= false

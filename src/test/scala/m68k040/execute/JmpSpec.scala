@@ -62,7 +62,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.readsNzvc    := False
     uop.isCondTrap   := False; uop.isScc := False; uop.isDbcc := False
     uop.faulted      := False; uop.faultVector := 0; uop.faultUsesNextPc := False
-    uop.faultAddr    := 0; uop.sswInstr := False; uop.isRte := False
+    uop.sswInstr := False; uop.isRte := False
     uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
     uop.isChk2 := False
     // Task #191-adjacent fix: RenamedUop.indexLong/indexScale (AGU indexed-EA fields,

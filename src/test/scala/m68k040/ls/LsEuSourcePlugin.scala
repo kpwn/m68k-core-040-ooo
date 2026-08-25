@@ -91,7 +91,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.isScc        := False; uop.isDbcc := False
     uop.firstOfInstr := True
     uop.faulted      := False; uop.faultVector := U(0); uop.faultUsesNextPc := False
-    uop.faultAddr    := U(0); uop.sswInstr := False
+    uop.sswInstr := False
     uop.isRte        := False; uop.isCondTrap := False
     uop.predTaken    := False; uop.predTarget := 0
     ctx.robId := iRobId

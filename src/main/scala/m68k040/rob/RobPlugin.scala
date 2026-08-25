@@ -1424,7 +1424,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // (fault PC: payload.faultUsesNextPc selects pc/nextPc at the read site — Slice A.)
       faultWrStore(tail)  := False; faultSupStore(tail) := False
       // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
-      faultAddrStore(tail)  := allocUopVec(0).faultAddr
+      // (ROB-fold Slice A-2 / faultAddr dead-field deletion: the deleted
+      // `RenamedUop.faultAddr` field was, at every decode write site with zero
+      // exceptions, bit-identical to this same µop's own `pc` — see
+      // DecodedUop.scala's faultAddr-deletion comment. Source `.pc` directly; the
+      // captured value at this index is unchanged.)
+      faultAddrStore(tail)  := allocUopVec(0).pc
       faultInstrStore(tail) := allocUopVec(0).sswInstr
       // Task #211: explicit per-alloc write (mirrors faultInstrStore) so a REUSED
       // index never inherits a stale ATC bit left behind by an earlier LS bus-fault
@@ -1448,7 +1453,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultedStore(tail + 1)  := allocUopVec(1).faulted
       faultVecStore(tail + 1) := allocUopVec(1).faultVector
       faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
-      faultAddrStore(tail + 1)  := allocUopVec(1).faultAddr
+      // (ROB-fold Slice A-2: sources `.pc` directly, same as the alloc0 port above.)
+      faultAddrStore(tail + 1)  := allocUopVec(1).pc
       faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
       faultAtcStore(tail + 1)   := allocUopVec(1).faultAtc
       // (Task 11 fpuUnimp/fpuCmd: written by payloadFrom above — ROB-fold task #249.)

@@ -102,7 +102,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.nextPc       := 0
       u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.isRte        := False; u.isCondTrap := False; u.isScc := False; u.isDbcc := False
-      u.faultAddr    := 0; u.sswInstr := False
+      u.sswInstr := False
       u.firstOfInstr := True
       u.predTaken    := False; u.predTarget := 0
       // Fields added to RenamedUop after this stub was first written (shifts/BCD/bit-ops/

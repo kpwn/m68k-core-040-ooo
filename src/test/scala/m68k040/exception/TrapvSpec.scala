@@ -44,7 +44,7 @@ class TrapvSpec extends AnyFunSuite {
       uop.pNzvcDst := 0; uop.writesNzvc := False; uop.pNzvcOld := 0
       uop.readsX := False; uop.pXSrc := 0; uop.pXDst := 0; uop.writesX := False; uop.pXOld := 0
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
-      uop.faultAddr := 0; uop.sswInstr := False
+      uop.sswInstr := False
       // TRAPV cond-trap µop: a branch-class uop reading NZVC, marked isCondTrap.
       // cond = 9 (VS): the EU evaluates taken=v -> trapvFault if V=1. Redirect is
       // suppressed by the `isCondTrap` gate regardless of `taken`.

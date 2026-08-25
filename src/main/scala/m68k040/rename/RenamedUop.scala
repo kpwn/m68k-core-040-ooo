@@ -56,9 +56,12 @@ case class RenamedUop() extends Bundle {
   // evaluates `cond` (via `taken`); if taken drives a trapvFault (vector 7). Threaded.
   // TRAPV uses cond=9 (VS); TRAPcc uses cond=cccc. Never causes a redirect.
   val isCondTrap   = Bool()
-  // Instruction-fetch access-fault extras (format-$7): faultAddr = fetch PC stacked
-  // as the EA; sswInstr = 1 => program-space SSW (vs data). Threaded from decode.
-  val faultAddr    = UInt(32 bits); val sswInstr = Bool()
+  // Instruction-fetch access-fault extra (format-$7): sswInstr = 1 => program-space
+  // SSW (vs data). Threaded from decode. (ROB-fold Slice A: the standalone
+  // `faultAddr` field that used to ride alongside this is deleted — it was always
+  // bit-identical to this bundle's own `pc` field at every decode write site; the
+  // fetch PC stacked as the EA is now read from `pc` directly at the ROB alloc write.)
+  val sswInstr = Bool()
   // Task #211: I-fetch fault cause (True=ATC/MMU, False=bus error). Threaded from
   // decode; meaningful only when sswInstr is set.
   val faultAtc     = Bool()

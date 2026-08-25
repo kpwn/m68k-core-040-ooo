@@ -80,7 +80,7 @@ class DispatchSpec extends AnyFunSuite {
     u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
     u.isScc #= false; u.isDbcc #= false; u.isCondTrap #= false
     u.divSigned #= false; u.div64 #= false; u.divIsRem #= false; u.isChk2 #= false
-    u.faultAddr #= 0; u.sswInstr #= false
+    u.sswInstr #= false
     u.eaAuto #= m68k040.decode.EaAuto.NONE; u.eaDelta #= 0
     u.toCcr #= false; u.shiftOp #= 0; u.shiftDir #= false; u.bcdSub #= false; u.bitOp #= 0
     u.bfOp #= 0; u.bfDynamic #= false; u.bfMem #= false; u.bfStoreForm #= 0

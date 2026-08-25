@@ -56,7 +56,7 @@ class ChkSpec extends AnyFunSuite {
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
       uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
-      uop.faultAddr := 0; uop.sswInstr := False
+      uop.sswInstr := False
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
       uop.isCondTrap := False; uop.faultUsesNextPc := True; uop.isScc := False; uop.isDbcc := False
       uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
