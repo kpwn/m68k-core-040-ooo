@@ -1,5 +1,15 @@
 set source_md5 "UNKNOWN"
 catch { set source_md5 [lindex [exec md5sum generated/M68kFullCoreSynth.v] 0] }
+# Sign-off period is a CONSTANT: 5.000ns / 200MHz is the real deployment spec and the
+# SIGNOFF_200MHZ_* verdict at the bottom of this file is always computed against it.
+# probe_period is the (optionally tighter) period the placer/router actually optimises
+# for; see the IMPL_PROBE_PERIOD_NS block below. Hoisted here so both the fresh-synth
+# and the REUSE_SYNTH_DCP paths see them.
+set signoff_period 5.000
+set probe_period $signoff_period
+if {[info exists ::env(IMPL_PROBE_PERIOD_NS)]} {
+  set probe_period $::env(IMPL_PROBE_PERIOD_NS)
+}
 set checkpoint_md5_file synth/fullcore_synth.md5
 set gate_netlist_md5 $source_md5
 set reuse_synth 0
@@ -8,6 +18,14 @@ if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
   set reuse_synth 1
   open_checkpoint synth/fullcore_synth.dcp
   puts "REUSE_SYNTH_DCP synth/fullcore_synth.dcp"
+  # A reused checkpoint carries whatever period it was synthesised under, so the probe
+  # has to be re-applied here as well -- otherwise IMPL_PROBE_PERIOD_NS would silently
+  # do nothing on the reuse path (place/route would optimise for the checkpoint's own
+  # period) while still relabelling the output as a probe run.
+  if {$probe_period ne $signoff_period} {
+    create_clock -name clk -period $probe_period [get_ports clk]
+    puts "IMPL_PROBE_PERIOD_NS $probe_period (signoff stays $signoff_period, reused DCP)"
+  }
   if {[file exists $checkpoint_md5_file]} {
     set fp [open $checkpoint_md5_file r]
     set gate_netlist_md5 [string trim [read $fp]]
@@ -19,7 +37,62 @@ if {[info exists ::env(REUSE_SYNTH_DCP)] && $::env(REUSE_SYNTH_DCP) eq "1" &&
   }
 } else {
   read_verilog generated/M68kFullCoreSynth.v
-  read_xdc synth/clk.xdc
+  # IMPL_PROBE_PERIOD_NS -- deliberate OVER-CONSTRAINT probe (see the "Historical note"
+  # block at the bottom of this file, which explicitly prescribes restoring this
+  # mechanism "if a future build ever reintroduces a tighter probe period").
+  #
+  # WHY THIS EXISTS AGAIN (2026-08-25). The 5.000ns-primary gate on `9c1f87e3` routed to
+  # WNS -0.015ns / 199.402 MHz and then PLATEAUED for six consecutive postroute rounds
+  # (rounds 4-9 all -0.015). Total TNS across the whole design was -0.277ns over just 32
+  # failing endpoints, all inside a 0.015ns band. That is not a design that has run out
+  # of physical headroom -- it is an optimiser that has run out of OBJECTIVE PRESSURE:
+  # once `phys_opt_design` has driven WNS to within a hair of the 5.000ns target and TNS
+  # is effectively zero, it has nothing left to push against and stops improving. Ledger
+  # sec 39 recorded exactly this effect from the other direction: targeting 4.000ns made
+  # phys_opt/route converge to a BETTER 200MHz-equivalent result than targeting 5.000ns
+  # directly, and the last time this design ever MET 200MHz post-route (commit `2ca0974`,
+  # SIGNOFF_200MHZ_WNS_NS +0.009) it was under precisely that flow.
+  #
+  # MEASURED RESULT (2026-08-25, `9c1f87e3`, same netlist md5 872c3dc5f666463f9842f5cb2a4b4d0c
+  # for both arms, uncontended machine, POSTROUTE_ROUNDS=9, floorplan `decode+fetch`).
+  # The two arms differ ONLY in this period; identical RTL, identical netlist, identical
+  # floorplan, identical strategy:
+  #
+  #   arm                  postroute plateau        re-analysed at real 5.000ns
+  #   5.000ns primary      -0.015ns @5ns (r4-r9)    WNS -0.015  FAILED_AT_200  199.402 MHz
+  #   4.000ns probe        -0.958ns @4ns (r4-r9)    WNS +0.042  MET_200        201.694 MHz
+  #
+  # +0.057ns of real, routed setup slack for a constraint change alone. The mechanism is
+  # the one predicted above: under the 5.000ns target phys_opt reached TNS -0.277ns over
+  # 32 endpoints spanning a 0.015ns band and stopped -- it had essentially satisfied its
+  # objective. Under the 4.000ns target every one of those paths is ~1ns short, so
+  # phys_opt keeps working all of them, and the netlist it leaves behind has real margin
+  # at 5.000ns. Ledger sec 39's finding therefore REPRODUCES on the current, much-changed
+  # netlist; the 2026-08-19 directive's re-validation question is answered YES.
+  #
+  # Leaving this unset reproduces the current 5.000ns-primary flow BYTE-IDENTICALLY --
+  # no probe XDC is generated, so the user directive of 2026-08-19 remains the default
+  # and every number published under it regenerates unchanged. It is a measurement knob,
+  # not a spec change: SIGNOFF_200MHZ_* below is ALWAYS re-derived at a real 5.000ns
+  # constraint against the finished routed netlist, never extrapolated from the probe.
+  #
+  # The probe has to be delivered as an XDC, NOT as a bare `create_clock` here: in
+  # non-project mode `read_verilog`/`read_xdc` only QUEUE their inputs, and the design
+  # does not exist until `synth_design` runs, so `create_clock ... [get_ports clk]` at
+  # this point dies with "No open design". Swapping the constraint file is also what
+  # makes the probe apply to SYNTHESIS as well as place/route, which is what the
+  # historical 4.000ns flow did.
+  if {$probe_period ne $signoff_period} {
+    set probe_xdc synth/clk_probe.xdc
+    set pf [open $probe_xdc w]
+    puts $pf "# GENERATED by impl_FullCore.tcl for IMPL_PROBE_PERIOD_NS=$probe_period -- do not edit, do not commit."
+    puts $pf "create_clock -name clk -period $probe_period \[get_ports clk\]"
+    close $pf
+    read_xdc $probe_xdc
+    puts "IMPL_PROBE_PERIOD_NS $probe_period (signoff stays $signoff_period) via $probe_xdc"
+  } else {
+    read_xdc synth/clk.xdc
+  }
   # SYNTH_DIRECTIVE / SYNTH_FLATTEN / SYNTH_RETIMING are the SYNTHESIS axis of the
   # implementation-recipe lever.  Handoff section 18 step 6 lever 4 and section 19
   # step 8 both name a fresh `synth_design` under a non-default recipe as the ONE
@@ -317,10 +390,15 @@ catch { file copy -force iter_100_CongestedCLBsAndNets.txt synth/fullcore_conges
 catch { write_checkpoint -force synth/fullcore_routed.dcp }
 set paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
 set wns [get_property SLACK $paths]
-puts "########### FULLCORE POST-ROUTE @ 200MHz (xcku5p-ffvb676-2) ###########"
+puts "########### FULLCORE POST-ROUTE @ ${probe_period}ns (xcku5p-ffvb676-2) ###########"
 puts "POSTROUTE_FULLCORE_WNS_NS $wns"
-set achieved [expr {1000.0/(5.000 - $wns)}]
-if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_200  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_200  FMAX_MHZ $achieved" }
+# Achieved FMax is derived from the period actually being optimised for, NOT from a
+# hardcoded 5.000 -- mixing those is how `impl_FullCore_perf.tcl` ended up reporting a
+# 4.000ns-derived FMax under a 5.000ns clock. Under the default (no probe) this is
+# byte-identical to the old `1000.0/(5.000 - $wns)`.
+set achieved [expr {1000.0/($probe_period - $wns)}]
+set target_mhz [expr {int(1000.0/$probe_period + 0.5)}]
+if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_${target_mhz}  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_${target_mhz}  FMAX_MHZ $achieved" }
 puts "######################################################################"
 
 # Historical note (2026-08-18/19): from ~2026-08-14 through this build, the
@@ -340,5 +418,30 @@ puts "######################################################################"
 # If a future build ever reintroduces a tighter probe period, restore an
 # analogous post-route re-check block rather than trusting the probe number
 # as sign-off.
+#
+# 2026-08-25: IMPL_PROBE_PERIOD_NS reintroduces exactly that, as an opt-in
+# measurement knob, so the prescribed re-check block is restored below. It is
+# a pure re-analysis of the ALREADY-ROUTED netlist at the real 5.000ns spec --
+# no second place/route/phys-opt pass runs, so the probe cannot flatter the
+# sign-off number: the routed netlist is frozen before the clock is relaxed.
+# With no probe set, probe_period == signoff_period and this block is skipped,
+# leaving `$wns` exactly as the 2026-08-19 directive produced it.
+if {$probe_period ne $signoff_period} {
+  create_clock -name clk -period $signoff_period [get_ports clk]
+  report_timing_summary -max_paths 10 -file synth/fullcore_signoff_timing.rpt
+  set signoff_paths [get_timing_paths -max_paths 1 -nworst 1 -setup]
+  set wns [get_property SLACK $signoff_paths]
+  puts "SIGNOFF_RECHECK re-analysed the routed netlist at ${signoff_period}ns (probe was ${probe_period}ns)"
+  # Re-emit the family census at the sign-off constraint too -- the probe-period
+  # top-100 is not the same set of paths that actually limit the 200MHz verdict.
+  catch {
+    set fp [open synth/fullcore_signoff_slack_matrix.rpt w]
+    foreach p [get_timing_paths -max_paths 100 -nworst 1 -setup] {
+      puts $fp [format "%.3f  %s -> %s" [get_property SLACK $p] \
+        [get_property STARTPOINT_PIN $p] [get_property ENDPOINT_PIN $p]]
+    }
+    close $fp
+  }
+}
 puts "SIGNOFF_200MHZ_WNS_NS $wns"
 if {$wns >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
