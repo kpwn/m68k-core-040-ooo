@@ -443,6 +443,43 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // NEVER read anywhere, so it was deleted outright rather than folded.
     // `sysValStore` = the captured source VALUE (wbObs.result) for a write direction —
     // written at COMPLETION (ccrCompletion), not at alloc, so it stays a Reg Vec.
+    //
+    // ── DO NOT try to fold this into `intPrf[payload.intNew]` (ROB restructure Slice E) ──
+    // A post-Slice-C recon proposed deleting this array (64x32 = 2048 FF, and the
+    // measured post-route #1 limiter `sysValStore_38_reg[18]/D`) on the theory that its
+    // contents are pure duplication: the completing EU that drove `ccrCompletion.result`
+    // also wrote that same value into the integer PRF at `payload.intNew`, so the ROB copy
+    // could be replaced by a PRF read. That is FALSE, and failing in the direction of
+    // SILENT CORRUPTION — the physical-register-lifetime hazard class of tasks
+    // #176/#194/#200. Two independent reasons, both verified against the RTL:
+    //
+    // (1) A write-direction sysOp HAS NO PHYSICAL DESTINATION AT ALL. Every one of them —
+    //     MOVE-to-SR, ANDI/ORI/EORI-to-SR, STOP, MOVEC Rn->Rc, MOVE An->USP, CPUSH, CINV,
+    //     PTEST, FMOVE Rn->FPcr — is assembled with `opUop.dstValid := False` (see
+    //     MicroOpAssembler's sysOp block; the destination is a SYSTEM register, not a
+    //     renamed GPR). So `payload.intWrite` is False, no freelist pop happens, and NO
+    //     PRF WRITE EVER OCCURS. The value exists ONLY here. These are exactly the entries
+    //     the `sysVal` read site below (-> ExceptionUnit `sysCapVal`) serves.
+    //
+    // (2) Worse, `payload.intNew` for such an entry is not merely stale — it ALIASES A
+    //     LIVE YOUNGER REGISTER. RenameStage gates only the freelist *take*
+    //     (`intFree.io.pop(s).take := slotEn && dec.dstValid`) while driving
+    //     `r.pdst := intFree.io.pop(s).id` UNCONDITIONALLY, and Freelist drives
+    //     `io.pop(k).id := ram.readAsync(head + ...)` regardless of `take` ("Non-asserted
+    //     ports' id outputs are don't-care"). So a non-allocating uop's `pdst` carries the
+    //     CURRENT FREELIST HEAD = the physical register handed to the very NEXT allocating
+    //     instruction. Reading `intPrf[payload.intNew]` here would return a strictly
+    //     YOUNGER instruction's data. Pinned as an executable fact by
+    //     RenameStageSpec's "pdst is don't-care when pdstValid=False" tripwire.
+    //
+    // Note `CcrCompletion.intWrite` is wired by every top level but read NOWHERE in this
+    // file — do not read it as evidence that a PRF write accompanied the capture.
+    //
+    // Separately, even where a PRF value DOES exist (the FPCTRL_CAP loads feeding the
+    // `sysAux` read site DO carry a real renamed temp dst), converting only that site
+    // frees nothing — the array must stay for (1) — while ADDING a PRF read port whose
+    // index comes from `payload.readAsync(h0)`, i.e. serialising a Mem read into a PRF
+    // read inside the retire path. Strictly negative.
     val sysValStore     = Vec.fill(depth)(Reg(Bits(32 bits)))
     // The EU's `completion` port (marks `completes`) fires ONE cycle BEFORE its `wbObs`
     // (the value, captured into sysValStore via ccrCompletion). So a write-direction
@@ -748,6 +785,24 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Per-entry committed-CCR VALUE capture (set at completion from the EU writeback
     // values via ccrCompletion). Folded into committedCcr at retire (for the stacked
     // exception frame). RegInit False so an unwired entry contributes nothing.
+    // Slice E ALSO assessed folding these two into `nzvcPrf[p.nzvcNew]` / `xPrf[p.xNew]`.
+    // Unlike `sysValStore` (see its declaration above — that fold is unsound), the SAFETY
+    // argument here does hold: every read below is gated on `nzvcWrStore`/`xWrStore`,
+    // which the EUs drive from the SAME rename-time `writesNzvc`/`writesX` flag that gates
+    // both the freelist pop and the real PRF write (`nzvcW.valid := fastFire &&
+    // u1.writesNzvc; nzvcW.address := u1.pNzvcDst`), so whenever a read fires the phys reg
+    // is genuinely allocated; and every read is a single-cycle read at the entry's OWN
+    // retire/fault cycle, at which point no younger entry can have committed a redefinition
+    // (in-order commit) and no flush can have recycled the tag (every flush in this design
+    // is head-relative — `branchRedirect = retire0 && ...`, and the exception FSM triggers
+    // off the head — so any earlier flush would have squashed this entry rather than let it
+    // reach retire).
+    //
+    // It was NOT done anyway: the prize is only 64*4 + 64*1 = 320 FF, while the cost is a
+    // read index that moves from `head` (a plain register, available at cycle start) to
+    // `payload.readAsync(h0).nzvcNew` — serialising a Mem read into a PRF read inside the
+    // retire path, on a netlist sitting 0.069ns from its 200MHz target. Bad trade; revisit
+    // only if the retire path stops being the binding constraint.
     val nzvcValStore = Vec.fill(depth)(Reg(UInt(4 bits)))
     val nzvcWrStore  = Vec.fill(depth)(RegInit(False))
     val xValStore    = Vec.fill(depth)(RegInit(False))
