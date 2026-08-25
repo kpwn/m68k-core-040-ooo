@@ -456,8 +456,8 @@ object PortedTestRunner {
           }
           val waiting = dut.iq.logic.slots.zipWithIndex.filter { case (s, _) => s.sel.toBoolean && s.cplxNzvcWait.toBoolean }
           waiting.foreach { case (s, i) =>
-            println(f"[iqnzvc] cyc=$trCyc%6d slot=$i%2d WAIT robId=${s.context.robId.toInt} " +
-              f"readsNzvc=${s.context.uop.readsNzvc.toBoolean} pNzvcSrc=${s.context.uop.pNzvcSrc.toInt}")
+            println(f"[iqnzvc] cyc=$trCyc%6d slot=$i%2d WAIT robId=${s.hot.robId.toInt} " +
+              f"readsNzvc=${s.hot.readsNzvc.toBoolean} pNzvcSrc=${s.hot.pNzvcSrc.toInt}")
           }
         }
       }
@@ -586,9 +586,9 @@ object PortedTestRunner {
           if (trCyc >= lo && trCyc <= hi) {
             println(f"[iqdbg] cyc=$trCyc%6d sbIntBusy=0x${iql.sbInt.busy.toBigInt.toString(16)}")
             for ((s, i) <- iql.slots.zipWithIndex) if (s.sel.toBoolean) {
-              println(f"[iqdbg] cyc=$trCyc%6d   slot$i%2d robId=${s.context.robId.toInt}%2d op=${s.context.uop.op.toEnum}%-12s " +
-                f"trig=0x${s.triggers.toBigInt.toString(16)} psrcA=${s.context.uop.psrcA.toInt}%2d/${s.context.uop.psrcAValid.toBoolean} " +
-                f"psrcB=${s.context.uop.psrcB.toInt}%2d/${s.context.uop.psrcBValid.toBoolean} " +
+              println(f"[iqdbg] cyc=$trCyc%6d   slot$i%2d robId=${s.hot.robId.toInt}%2d op=${s.hot.op.toEnum}%-12s " +
+                f"trig=0x${s.triggers.toBigInt.toString(16)} psrcA=${s.hot.psrcA.toInt}%2d/${s.hot.psrcAValid.toBoolean} " +
+                f"psrcB=${s.hot.psrcB.toInt}%2d/${s.hot.psrcBValid.toBoolean} " +
                 f"lsW=${s.lsWait.toBoolean} cxW=${s.cplxWait.toBoolean}")
             }
           }
