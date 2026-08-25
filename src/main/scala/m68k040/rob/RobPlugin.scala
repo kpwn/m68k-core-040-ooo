@@ -188,6 +188,28 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // (`exceptionPc`) is bit-identical: same sources, same alloc write, same
     // headReady/count>0 read gating as every other B1 field (see SAFETY above).
     val faultUsesNextPc = Bool()
+    // ── LUT-reduction ROB-fold Slice C (fault-completion 4->1 arbitration) ──────
+    // The ALLOC-TIME half of the per-entry fault record. Slice C splits the old
+    // `fault*Store` Reg-Vec family into two disjoint halves by WRITER:
+    //   * alloc-time (a decode/I-fetch-sourced static fault)  -> HERE, in `payload`,
+    //     which is already written by exactly these two alloc ports;
+    //   * completion-time (ls/sq/eu/fp)                        -> `faultDynMem`, a
+    //     single-write-port async-read Mem fed by an age-arbitrated write bus.
+    // `faultDynStore` (an alloc-reset 1-bit Reg-Vec gate, the same discipline
+    // `btbIsBranchStore`/`phtValidStore` already use for `branchTrainMem`) selects
+    // which half a read at h0 sees.
+    //
+    // Only THREE alloc-time fault fields need storing:
+    //   * the fault ADDRESS is `pc` (Slice A proved `RenamedUop.faultAddr` was
+    //     bit-identical to `.pc` at every decode write site) -- already stored above;
+    //   * `faultWr`/`faultSup` were written to a CONSTANT False by both alloc ports --
+    //     re-derived as a constant at the read site, no storage;
+    //   * `faultSize` had NO alloc write at all (the task #257-era bug Slice D tracked)
+    //     -- now a constant U(2) ("LONG") at the read site, which is exactly the
+    //     RegInit the old Vec declared and the pre-task-189 SSW SIZE=00 behaviour.
+    val faultVector = UInt(8 bits)
+    val sswInstr    = Bool()
+    val faultAtc    = Bool()
     // ── LUT-reduction ROB-fold (task #249) ──────────────────────────────────────
     // Replaces the deleted `fpuUnimpStore`/`fpuCmdStore` (Vec.fill(depth)(...)):
     // Task 11's per-entry FP unimplemented-instruction marker + its command word,
@@ -199,6 +221,28 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // headReady/count>0 discipline as every other B1 field (see SAFETY above).
     val fpuUnimp = Bool()
     val fpuCmd   = Bits(16 bits)
+  }
+
+  /** COMPLETION-TIME per-entry fault record (ROB-fold Slice C).
+    *
+    * The union of every field the four fault-completion ports (ls / sq / eu / fp)
+    * used to write into their own `Vec.fill(depth)(Reg)` arrays. Stored in ONE
+    * single-write-port async-read `Mem` fed by the age-arbitrated write bus below
+    * -- the same 1W/1R shape as `nextPcMem`/`branchTrainMem`, which
+    * `MultiPortWritesSymplifier` leaves alone entirely (`writes.size <= 1` is its
+    * early return), so there is no LVT/XOR bank machinery and no same-cycle
+    * multi-writer collision to arbitrate inside the RAM.
+    */
+  case class RobFaultDyn() extends Bundle {
+    val addr = UInt(32 bits)   // was faultAddrStore
+    val vec  = UInt(8 bits)    // was faultVecStore
+    val size = UInt(2 bits)    // was faultSizeStore  (LsFault.sizeBits encoding)
+    val wr   = Bool()          // was faultWrStore
+    val sup  = Bool()          // was faultSupStore
+    val atc  = Bool()          // was faultAtcStore
+    // (faultInstrStore is NOT here: all four completion ports wrote a CONSTANT
+    //  False into it, so the completion-side value is re-derived as a constant at
+    //  the read site. Only the alloc side carries a real value -- payload.sswInstr.)
   }
 
   /** BTB/gshare retire-time training payload (task #129, area). Written ONLY by
@@ -380,8 +424,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // mispredictStore). RegInit(False) guarantees a never-allocated / re-allocated
     // entry reads "not faulted / not RTE" deterministically (no uninit-Mem flake).
     val faultedStore  = Vec.fill(depth)(RegInit(False))
+    // Whitebox observability for the ROB-fold Slice C arbitration tests (a directed
+    // test has to be able to see that a DROPPED younger fault really left no mark at
+    // its own robId, which no derived signal exposes). Debug-only, same convention
+    // and zero synthesis impact as `completes.foreach(_.simPublic())` above.
+    faultedStore.foreach(_.simPublic())
     // (`isRteStore` folded into `payload.isRte` — LUT-reduction B1.)
-    val faultVecStore = Vec.fill(depth)(RegInit(U(0, 8 bits)))
+    // (`faultVecStore` split by ROB-fold Slice C: the alloc-time vector is
+    //  `payload.faultVector`, the completion-time vector is `faultDynMem`'s `vec`,
+    //  selected by the `faultDynStore` gate — see the Slice C note below.)
     // Commit-time PRIVILEGED SYSTEM ops (MOVE-to-SR / MOVE-USP / MOVEC): captured at
     // alloc. `payload.sysOp` = this entry is a serializing system op;
     // `payload.sysKind` selects which; `payload.sysReadDir` = read SYSTEM->Rn vs write
@@ -517,23 +568,78 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // + the SSW access attrs {write, sizeBits, supervisor}; the exception FSM stacks
     // the format-$7 frame from these. RegInit Vecs, reset per-alloc (mirrors
     // faultedStore) so a re-used index never carries a stale MMU fault.
-    val faultAddrStore = Vec.fill(depth)(RegInit(U(0, 32 bits)))
-    val faultWrStore   = Vec.fill(depth)(RegInit(False))
-    // RegInit(2) = our LsFault.sizeBits "LONG" encoding, which ExceptionUnit's SSW
-    // builder translates to SSW.SIZE=00 ("long") — the SAME bit pattern the SSW's
-    // SIZE field always read before task #189 wired it up (it was simply never
-    // populated, always reading 0b00). Keeps any vector-2 fault that DOESN'T flow
-    // through LsEuPlugin's captureFault() (i.e. never writes this Vec) — e.g. a
-    // static alloc-time / ITLB-sourced vector-2 fault — byte-for-byte unchanged
-    // from pre-task-189 behavior instead of picking up a new SIZE value nobody
-    // ever computed for it.
-    val faultSizeStore = Vec.fill(depth)(RegInit(U(2, 2 bits)))
-    val faultSupStore  = Vec.fill(depth)(RegInit(False))
-    // Task #189: True = MMU/ATC-detected (DTLB) fault, False = plain physical bus
-    // error (SLVERR/DECERR). RegInit(True) so a re-used index defaults to the
-    // pre-existing (MMU) behavior unless a NEW fault explicitly clears it — see
-    // LsFault.atc / LsEuPlugin's captureFault(atc=...).
-    val faultAtcStore  = Vec.fill(depth)(RegInit(True))
+    //
+    // ── LUT-reduction ROB-fold Slice C ─────────────────────────────────────────
+    // WAS seven separate `Vec.fill(64)(Reg)` arrays — faultAddrStore (64x32),
+    // faultVecStore (64x8), faultSizeStore (64x2), faultWrStore / faultSupStore /
+    // faultAtcStore / faultInstrStore (64x1 each) = 2944 FF — each with SIX
+    // independent write ports (ls, sq, eu, fp, alloc0, alloc1) and a 64:1 read mux
+    // per bit at h0. `faultAddrStore` alone contributed 2019 of the 2083 loads on
+    // the routed netlist's worst fanout net (see the write-select hoist note below).
+    //
+    // Now split by WRITER into two disjoint halves plus a 1-bit selector:
+    //
+    //   faultDynMem   — the completion-time half {addr,vec,size,wr,sup,atc}, ONE
+    //                   write port fed by the age-arbitrated ls/sq/eu/fp bus.
+    //   payload       — the alloc-time half {pc, faultVector, sswInstr, faultAtc}
+    //                   (already a 2-alloc-write-port Mem; wr/sup/size were
+    //                   constants at alloc and are re-derived, not stored).
+    //   faultDynStore — 1-bit alloc-reset gate: "this entry's fault record is the
+    //                   COMPLETION-time one". Set ONLY by the arbitration winner
+    //                   (the same cycle, and only for the index, whose Mem row that
+    //                   write freshens); cleared by alloc0/alloc1 (alloc keeps its
+    //                   existing priority over a same-cycle completion on a re-used
+    //                   index). This is the identical staleness discipline
+    //                   btbIsBranchStore/phtValidStore already provide for
+    //                   branchTrainMem and mispredictStore/retireAlone for nextPcMem:
+    //                   an uninitialised Mem row is UNREACHABLE because the only
+    //                   thing that opens the gate is the write that fills the row.
+    //
+    // `ram_style`=distributed (NOT block): the read must be ASYNCHRONOUS (it feeds
+    // the same-cycle retire/exception decode), which BRAM cannot serve — mirrors
+    // nextPcMem/DcachePlugin's explicit-attribute idiom.
+    val faultDynMem   = Mem(RobFaultDyn(), depth)
+    faultDynMem.addAttribute("ram_style", "distributed")
+    val faultDynStore = Vec.fill(depth)(RegInit(False))
+    faultDynStore.foreach(_.simPublic())   // debug-only, see faultedStore above
+    // The retired constants, kept as named vals so the read sites below read as the
+    // documented "what the alloc port used to write" rather than as magic numbers:
+    //   - alloc wrote faultWrStore/faultSupStore := False unconditionally;
+    //   - alloc wrote faultSizeStore NOT AT ALL (Slice D's bug — a re-used index
+    //     inherited the previous occupant's LsFault.sizeBits, which a static
+    //     alloc-time / I-fetch-sourced vector-2 fault then stacked into its
+    //     format-$7 SSW SIZE field). U(2) is our LsFault.sizeBits "LONG" encoding,
+    //     which ExceptionUnit's SSW builder translates to SSW.SIZE=00 ("long") —
+    //     the SAME bit pattern the old array's RegInit(2) declared and the same one
+    //     the SSW SIZE field always read before task #189 wired it up.
+    val faultAllocWr   = False
+    val faultAllocSup  = False
+    val faultAllocSize = U(2, 2 bits)
+    // ── Slice C tripwire: a SIM-ONLY shadow of the OLD seven-array structure ─────
+    // These reproduce, bit for bit, what the DELETED `fault*Store` Reg-Vecs would
+    // hold: the same six write ports (ls, sq, eu, fp, alloc0, alloc1), unarbitrated,
+    // resolved by the same last-assign priority, with eu/fp still leaving
+    // {size,wr,sup,atc} untouched. The read-site assertions below then pin the new
+    // arbitrated derivation against them at every point the values are actually
+    // CONSUMED — which is the direct executable form of the drop-is-unobservable
+    // proof (a fired assert means a dropped younger fault reached the head).
+    //
+    // ONE deliberate deviation: `fsSize` DOES get an alloc-time write here. That is
+    // Slice D's bug fix (the old array had none, so a re-used index stacked a
+    // previous occupant's LsFault.sizeBits into its format-$7 SSW SIZE field), and
+    // shadowing the bug would just make the tripwire assert the bug back.
+    //
+    // Elaborated only under `includeSimulation` (see M68kSim.scala) => zero synthesis
+    // cost. Like `pcStore`, every one of these vals is null in a synth/GenVerilog
+    // build and must never be referenced outside a `GenerationFlags.simulation` block.
+    val fsFaulted = GenerationFlags.simulation { Vec.fill(depth)(RegInit(False)) }
+    val fsVec     = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(0, 8 bits))) }
+    val fsAddr    = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(0, 32 bits))) }
+    val fsSize    = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(2, 2 bits))) }
+    val fsWr      = GenerationFlags.simulation { Vec.fill(depth)(RegInit(False)) }
+    val fsSup     = GenerationFlags.simulation { Vec.fill(depth)(RegInit(False)) }
+    val fsAtc     = GenerationFlags.simulation { Vec.fill(depth)(RegInit(True)) }
+    val fsInstr   = GenerationFlags.simulation { Vec.fill(depth)(RegInit(False)) }
     // Task 11: per-entry FP unimplemented-instruction marker + its command word, written
     // ONLY at alloc (same discipline as the fault* family above) from Task 10's decode
     // fields. Read by ExceptionUnit at vector-11 delivery to latch the state a later
@@ -542,8 +648,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // RobPayload. No standalone Vec anymore.)
     // Instruction-fetch access-fault: set at ALLOC for a faulted (vector-2) µop whose
     // fault came from the I-cache (sswInstr). Selects a program-space SSW in the $7
-    // frame. RegInit(False), reset per-alloc (mirrors faultedStore).
-    val faultInstrStore = Vec.fill(depth)(RegInit(False))
+    // frame. (ROB-fold Slice C: this is an ALLOC-ONLY value — all four completion
+    // ports wrote a constant False into the old array — so it folds into
+    // `payload.sswInstr` and the completion-side constant is re-derived at the read
+    // site as `!faultDynStore(h0)`.)
     // Interrupt-recognition per-entry capture — now `payload.first` / `payload.pc`
     // (LUT-reduction B1). `payload.first` = the µop is the FIRST of a macro-instruction
     // (an interrupt may be taken only at such a head). `payload.pc` = the head
@@ -700,6 +808,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       p.sysRc      := u.imm(11 downto 0).asUInt
       // ROB-fold Slice A: the 1-bit fault-PC selector (replaces faultPcStore).
       p.faultUsesNextPc := u.faultUsesNextPc
+      // ROB-fold Slice C: the ALLOC-TIME half of the per-entry fault record
+      // (replaces the alloc write ports of faultVecStore / faultInstrStore /
+      // faultAtcStore — same sources, same alloc cycle, same address).
+      p.faultVector := u.faultVector
+      p.sswInstr    := u.sswInstr
+      p.faultAtc    := u.faultAtc
       // ROB-fold (task #249): FSAVE's route-to-FPSP source state (replaces
       // fpuUnimpStore/fpuCmdStore -- Task 10's decode fields, same as before).
       p.fpuUnimp := u.fpuSoftwareComplete
@@ -1304,114 +1418,168 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // race). An intWrite-only capture qualifies (a sysOp µop always writes via its EU).
       sysValRdyStore(c.payload.robId) := True
     }
-    // LS MMU access-fault completion: mark the entry FAULTED (vector 2) + record the
-    // faulting VA + SSW attrs. The faulting instruction's PC is already captured per
-    // entry at alloc (payload.pc/predNextPc + the faultUsesNextPc selector — Slice A),
-    // so the $7 frame's PC field is available. Placed
-    // with the other completion marks (BEFORE the alloc-reset) so alloc wins on a
-    // re-used index. completes is set by the LS EU's normal completion port too (the
-    // faulted access still completes so the entry can retire + trigger the exception).
-    // ── FMax "LS/ROB Lever C": per-entry write-select hoist ──────────────────
-    // (docs/superpowers/specs/2026-08-08-fmax-lsrob-leverc-writeenable-flatten-design.md,
-    //  docs/superpowers/plans/2026-08-08-fmax-lsrob-leverc-writeenable-flatten-plan.md)
+    // ══════════════════════════════════════════════════════════════════════════════
+    // ROB-fold Slice C — the FOUR fault-completion ports, age-arbitrated into ONE
+    // write bus over a single-write-port Mem.
+    // ══════════════════════════════════════════════════════════════════════════════
     //
-    // SpinalHDL ALREADY elaborates `when(p.valid){ store(p.robId) := d }` into
-    // exactly `for i: if(p.valid && oneHot(p.robId)(i)) store(i) <= d` (the emitted
-    // `_zz_ = 1 <<< robId` + per-entry `if(_zz[i])` bodies). Writing that form out
-    // by hand is therefore BIT-IDENTICAL — same boolean function, same signals,
-    // same cycle, same last-assign priority. Nothing is registered; no latency
-    // changes; ports #1/#2 keep INDEPENDENT selects so two different robIds can
-    // still be written the same cycle (the reason the two ports exist at all, see
-    // the port-declaration comment at the top of this plugin).
+    // WAS: four independent per-entry write ports (ls / sq / eu / fp), each writing
+    // its own copy of the same logical record {addr, vector, size, wr, sup, atc,
+    // instr} into seven separate `Vec.fill(64)(Reg)` arrays, resolved by SpinalHDL's
+    // last-assign priority. 2944 FF, six write ports each, a 64:1 read mux per bit —
+    // and, via `faultAddrStore`'s 64x32 per-bit data muxes, 2019 of the 2083 loads on
+    // the routed netlist's worst fanout net (the reason "LS/ROB Lever C", the kept
+    // per-entry write-select hoist that used to live here, existed at all).
     //
-    // The point of writing it out is the `keep` attribute. Without it the tool
-    // absorbs `p.valid` directly into every per-bit data mux, so the single LATE
-    // node ends up with fanout 2084 on the routed netlist. Load decomposition of
-    // that net: 2019 of 2083 loads are `faultAddrStore` (64x32) per-bit DATA
-    // muxes, only 64 are the per-entry write-ENABLE decode that sits on the
-    // critical path — i.e. the enable path pays a 0.671 ns route hop it does not
-    // cause, because it shares a driver with a 2019-load data-mux array. The
-    // named+kept per-entry select gives the data muxes a LOCAL (fanout ~33) node
-    // to consume instead.
+    // NOW: one arbitrated write into `faultDynMem` (1W/1R-async, so
+    // MultiPortWritesSymplifier's `writes.size <= 1` early return leaves it a plain
+    // distributed RAM — no LVT/XOR banks, no in-RAM collision arbitration) plus the
+    // 1-bit `faultDynStore` gate. The Lever C hoist is DELETED, not ported: the data
+    // muxes whose fanout it was working around no longer exist, and the winner's
+    // robId now decodes to exactly 2 one-bit Reg-Vecs + the RAM's own address pins
+    // (~128 loads, down from ~2084), which is the same fix by construction.
     //
-    // Textual order is load-bearing: the ls loop must stay before the sq loop, and
-    // both before euFaultCompletion / alloc0 / alloc1, so SpinalHDL's last-assign
-    // priority (alloc1 > alloc0 > eu > sq > ls) is bit-for-bit unchanged.
-    val lsFaultOh  = UIntToOh(lsFaultCompletion.payload.robId, depth)
-    val sqFaultOh  = UIntToOh(sqFaultCompletion.payload.robId, depth)
-    val lsFaultSel = Vec(Bool(), depth)
-    val sqFaultSel = Vec(Bool(), depth)
-    for (i <- 0 until depth) {
-      lsFaultSel(i) := lsFaultCompletion.valid && lsFaultOh(i)
-      sqFaultSel(i) := sqFaultCompletion.valid && sqFaultOh(i)
-      lsFaultSel(i).setName(s"lsFaultSel_$i").addAttribute("keep", "true")
-      sqFaultSel(i).setName(s"sqFaultSel_$i").addAttribute("keep", "true")
+    // ── ARBITRATION ──────────────────────────────────────────────────────────────
+    // Age of a valid port = `robId - head`, evaluated in robIdW(=6)-bit UInt
+    // arithmetic, i.e. EXACTLY (robId - head) mod 64. It is a true, total, unambiguous
+    // age order across the 0/63 wrap because every in-flight entry lies in
+    // [head, head+count) and `count <= depth-2 = 62` is enforced by allocReadySig —
+    // so every port's age is in [0, 62], distinct entries have distinct ages, and the
+    // minimum age is the OLDEST entry. Naive `robId < robId` comparison would be wrong
+    // here; this is not.
+    //
+    // The winner is the minimum age; TIES (which can only mean the same robId) go to
+    // the LATER port in the ls -> sq -> eu -> fp fold order, which is precisely the
+    // last-assign priority the four `when` blocks used to have (alloc > fp > eu > sq >
+    // ls). Alloc's priority over all four is preserved separately, by the alloc ports
+    // clearing `faultDynStore` AFTER this block (see `when(alloc0)` below).
+    //
+    // ── CORRECTNESS PROOF: dropping the younger of two same-cycle faults is sound ──
+    //
+    // CLAIM. If two or more of the four ports fire in the same cycle at DIFFERENT
+    // robIds, keeping only the oldest one's write — and silently dropping the others,
+    // including their `faultedStore` marks — is architecturally unobservable.
+    //
+    // Let W be the winner (oldest) and L any loser (strictly younger, since ages are
+    // distinct for distinct entries, per the age argument above).
+    //
+    // (1) L's fault record can only ever be OBSERVED through a read at the ROB head.
+    //     Every read of this family is at h0 (`exceptionVector` / `exceptionFaultAddr`
+    //     / `exceptionFault{Wr,Size,Sup,Instr,Atc}` and the ExceptionUnit's
+    //     entryFault* arguments — all `...Store(h0)`), and `faultedStore` is read at
+    //     h0 and at h1 (retire1's gate) and nowhere else. There is no read at an
+    //     arbitrary robId anywhere in the design.
+    //
+    // (2) For L to reach h0 or h1, `head` must advance past W. `head` advances ONLY
+    //     via retire0/retire1 (the single `head := head + Mux(retire1,2,Mux(retire0,1,0))`
+    //     statement) — a flush does NOT advance it (`when(flushing){ tail := head;
+    //     count := 0 }`, pointer-only).
+    //
+    // (3) W cannot retire. `retire0` is gated on `!faultedStore(h0)` and `retire1` on
+    //     `!faultedStore(h1)`; W IS marked faulted (it won the arbitration, so its
+    //     mark landed). A faulted head therefore has exactly one exit:
+    //     `faultRetire = headReady && (faultedStore(h0) || privViolation) && excIdle`.
+    //
+    // (4) `faultRetire` drives `exceptionPending` -> the exception FSM -> `excSquash`
+    //     / `exc.redirectValid` -> `doFlushReg` -> `flushing`, and `when(flushing){
+    //     tail := head; count := 0 }` squashes the ENTIRE ROB — not merely everything
+    //     younger. L is destroyed without ever having been at the head.
+    //
+    // (5) The interval between the two completions and W's retirement is irrelevant:
+    //     the invariant is a program-order property of the ring (L is behind W and
+    //     the ring only ever drains in order), not a timing coincidence. Nothing can
+    //     reorder them, and nothing else can retire W out from under the fault —
+    //     `normalIrqGate` and `traceNormalGate` are both gated on `!faultedStore(h0)`,
+    //     and `privOnly` only ADDS a vector-8 path for a NON-faulted head.
+    //
+    // (6) The only other way W leaves without delivering is an UNRELATED earlier flush
+    //     (an older mispredict, a debug recover). That flush is also a whole-ROB squash
+    //     by (4)'s statement, so it takes L with it. Symmetric, still unobservable.
+    //
+    // Therefore L's mark is unreachable in every case. QED.
+    //
+    // Two deliberate design choices follow from the proof:
+    //   * The loser's `faultedStore` mark is dropped TOO (not kept). Keeping it while
+    //     dropping its record would leave L in a self-inconsistent "faulted, but the
+    //     fault payload is the alloc-time one (usually vector 0)" state — strictly
+    //     worse than not marking it, if the proof were ever violated by a future
+    //     change. Gate and Mem row are always written by the same statement, so
+    //     `faultDynStore(i)` True ALWAYS implies row i is fresh.
+    //   * A same-robId, same-cycle collision resolves to the WINNING PORT'S WHOLE
+    //     record, where the old code produced a per-field HYBRID (e.g. an ls+eu
+    //     collision took eu's vector/addr but kept ls's size/wr/sup/atc, because eu
+    //     never assigned those fields). That case is unreachable by construction — an
+    //     entry is issued to exactly one EU pipeline, and ls (translate/access) and sq
+    //     (at-head drain) are sequential PHASES of one store, never simultaneous — and
+    //     the hybrid was meaningless anyway. Priority is preserved regardless.
+    //
+    // ── WHAT EACH PORT DRIVES ON THE UNIFIED BUS ─────────────────────────────────
+    // ls / sq carry a real {addr, size, wr, sup, atc} and a hard vector 2. eu / fp
+    // used to write only {faulted, vector, addr, instr}, leaving {size, wr, sup, atc}
+    // holding whatever the slot already had; they now drive the unified bus with the
+    // same values that yielded, byte for byte:
+    //   wr  = False, sup = False  — exactly what BOTH alloc ports wrote, so identical.
+    //   atc = True                — `MicroOpAssembler` sets `u.faultAtc := True` for
+    //                               every µop except the I-fetch-fault path, and the
+    //                               old Vec's RegInit was True, so this is the value
+    //                               an eu/fp fault always read.
+    //   size = faultAllocSize (LONG) — the old array had NO alloc write (Slice D's
+    //                               bug), so an eu/fp fault read a STALE size from a
+    //                               previous occupant. LONG is the declared RegInit
+    //                               and the pre-task-189 SSW SIZE=00 behaviour.
+    // All four of those fields are architecturally READ only through the format-$7
+    // SSW, which ExceptionUnit builds only for `is7 = !interrupt && vector === 2`
+    // (`curSsw` is stacked at frame step 6, a $7-only step). eu vectors are 3/5/6/7,
+    // fp vectors are 49..54 — never 2 — so none of these are observable for eu/fp at
+    // all. `instr` is not on the bus: all four ports wrote a constant False, which the
+    // read site re-derives as `!faultDynStore(h0)`.
+    //
+    // Textual position is still load-bearing, for the same reason as before: this
+    // block must stay BEFORE `when(alloc0)`/`when(alloc1)` so alloc's `faultedStore`/
+    // `faultDynStore` writes keep winning on a re-used index.
+    case class RobFaultPort() extends Bundle {
+      val valid = Bool()
+      val robId = UInt(robIdW bits)
+      val age   = UInt(robIdW bits)
+      val d     = RobFaultDyn()
     }
-    for (i <- 0 until depth) {
-      when(lsFaultSel(i)) {
-        faultedStore(i)   := True
-        faultVecStore(i)  := U(2, 8 bits)  // access fault
-        faultAddrStore(i) := lsFaultCompletion.payload.faultAddr
-        faultWrStore(i)   := lsFaultCompletion.payload.write
-        faultSizeStore(i) := lsFaultCompletion.payload.sizeBits
-        faultSupStore(i)  := lsFaultCompletion.payload.supervisor
-        faultAtcStore(i)  := lsFaultCompletion.payload.atc
-        // A DATA (LS) access fault is data-space, NEVER an instruction fetch — clear the
-        // SSW-instr bit explicitly so it does not inherit the alloc'd µop's sswInstr
-        // (which is only meaningful for I-fetch-fault µops). Without this the SSW
-        // data/program bit was seed-flaky (the µop's unset sswInstr randomized).
-        faultInstrStore(i) := False
-      }
+    def faultPortOf(v: Bool, id: UInt, addr: UInt, vec: UInt,
+                    size: UInt, wr: Bool, sup: Bool, atc: Bool): RobFaultPort = {
+      val p = RobFaultPort()
+      p.valid  := v
+      p.robId  := id
+      p.age    := id - head   // (robId - head) mod 64 — see the ARBITRATION note above
+      p.d.addr := addr; p.d.vec := vec; p.d.size := size
+      p.d.wr   := wr;   p.d.sup := sup; p.d.atc  := atc
+      p
     }
-    // SQ precise-path drain fault (Task P2.4): identical treatment to lsFaultCompletion
-    // above, a second independent port so an older drained store's bus error and a
-    // younger in-flight access's translate-time MMU fault can both land the same
-    // cycle. Placed BEFORE the alloc-reset (alloc wins on a re-used index).
-    for (i <- 0 until depth) {
-      when(sqFaultSel(i)) {
-        faultedStore(i)   := True
-        faultVecStore(i)  := U(2, 8 bits)
-        faultAddrStore(i) := sqFaultCompletion.payload.faultAddr
-        faultWrStore(i)   := sqFaultCompletion.payload.write
-        faultSizeStore(i) := sqFaultCompletion.payload.sizeBits
-        faultSupStore(i)  := sqFaultCompletion.payload.supervisor
-        faultAtcStore(i)  := sqFaultCompletion.payload.atc
-        faultInstrStore(i):= False
-      }
+    // Fold order == the old textual order == the old last-assign priority.
+    val faultPorts = Seq(
+      faultPortOf(lsFaultCompletion.valid, lsFaultCompletion.payload.robId,
+                  lsFaultCompletion.payload.faultAddr, U(2, 8 bits),
+                  lsFaultCompletion.payload.sizeBits, lsFaultCompletion.payload.write,
+                  lsFaultCompletion.payload.supervisor, lsFaultCompletion.payload.atc),
+      faultPortOf(sqFaultCompletion.valid, sqFaultCompletion.payload.robId,
+                  sqFaultCompletion.payload.faultAddr, U(2, 8 bits),
+                  sqFaultCompletion.payload.sizeBits, sqFaultCompletion.payload.write,
+                  sqFaultCompletion.payload.supervisor, sqFaultCompletion.payload.atc),
+      faultPortOf(euFaultCompletion.valid, euFaultCompletion.payload.robId,
+                  euFaultCompletion.payload.faultAddr, euFaultCompletion.payload.vector,
+                  faultAllocSize, faultAllocWr, faultAllocSup, True),
+      faultPortOf(fpFaultCompletion.valid, fpFaultCompletion.payload.robId,
+                  fpFaultCompletion.payload.faultAddr, fpFaultCompletion.payload.vector,
+                  faultAllocSize, faultAllocWr, faultAllocSup, True))
+    // `b` (the later, higher-priority port) wins on an age TIE — see ARBITRATION.
+    val faultWin = faultPorts.reduceLeft { (a, b) =>
+      Mux(b.valid && (!a.valid || (b.age <= a.age)), b, a)
     }
-    // Execute-time conditional fault (TRAPV / CHK / DIV0 / address-error task #189):
-    // flip the entry FAULTED + the CARRIED vector. faultPc is already the µop's own
-    // pc or nextPc (selected at the exceptionPc read site via payload.faultUsesNextPc,
-    // captured at alloc, per-op — see MicroOpAssembler), so the format-$2 frame stacks
-    // the right PC; the PPC/
-    // ADDRESS field is payload.pc for the PPC-style traps (TRAPV/CHK/DIV0) OR the
-    // execute-time faultAddr (odd target) for address error — see faultAddrStore
-    // below + ExceptionUnit's `entryVector === 3` mux. The entry also completes via
-    // its normal completion port (so it can retire + trigger the exception). Placed
-    // BEFORE alloc-reset (alloc wins on a re-used index). NOT an instruction-fetch
-    // fault -> clear the SSW-instr bit.
-    when(euFaultCompletion.valid) {
-      faultedStore(euFaultCompletion.payload.robId)    := True
-      faultVecStore(euFaultCompletion.payload.robId)   := euFaultCompletion.payload.vector
-      faultInstrStore(euFaultCompletion.payload.robId) := False
-      // Only meaningful for vector 3 (address error) — ExceptionUnit only reads
-      // entryFaultAddr for the is2 frame when entryVector===3. Harmless (unused) 0
-      // for TRAPV/CHK/DIV0.
-      faultAddrStore(euFaultCompletion.payload.robId)  := euFaultCompletion.payload.faultAddr
-      // The fault PC is already the µop's own pc/nextPc (payload capture at alloc +
-      // the faultUsesNextPc read-site mux, Slice A) — no write.
+    faultWin.valid.setName("faultWinValid"); faultWin.robId.setName("faultWinRobId")
+    faultWin.valid.simPublic(); faultWin.robId.simPublic()
+    faultDynMem.write(faultWin.robId, faultWin.d, faultWin.valid)
+    when(faultWin.valid) {
+      faultedStore(faultWin.robId)  := True
+      faultDynStore(faultWin.robId) := True
     }
-    // FP enabled-trap escalation (vectors 49-54): identical treatment to euFaultCompletion
-    // above, on its own port. Also placed BEFORE alloc-reset so alloc wins on a re-used
-    // index. faultAddr is unused for these (the vector-3 address-error case is the only
-    // entryFaultAddr reader) and the EU drives 0.
-    when(fpFaultCompletion.valid) {
-      faultedStore(fpFaultCompletion.payload.robId)    := True
-      faultVecStore(fpFaultCompletion.payload.robId)   := fpFaultCompletion.payload.vector
-      faultInstrStore(fpFaultCompletion.payload.robId) := False
-      faultAddrStore(fpFaultCompletion.payload.robId)  := fpFaultCompletion.payload.faultAddr
-    }
-
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
@@ -1420,22 +1588,18 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       btbIsBranchStore(tail) := False
       phtValidStore(tail)   := False
       faultedStore(tail)  := allocUopVec(0).faulted
-      faultVecStore(tail) := allocUopVec(0).faultVector
-      // (fault PC: payload.faultUsesNextPc selects pc/nextPc at the read site — Slice A.)
-      faultWrStore(tail)  := False; faultSupStore(tail) := False
-      // Instruction-fetch fault: capture the fetch PC as the EA + the SSW-instr bit.
-      // (ROB-fold Slice A-2 / faultAddr dead-field deletion: the deleted
-      // `RenamedUop.faultAddr` field was, at every decode write site with zero
-      // exceptions, bit-identical to this same µop's own `pc` — see
-      // DecodedUop.scala's faultAddr-deletion comment. Source `.pc` directly; the
-      // captured value at this index is unchanged.)
-      faultAddrStore(tail)  := allocUopVec(0).pc
-      faultInstrStore(tail) := allocUopVec(0).sswInstr
-      // Task #211: explicit per-alloc write (mirrors faultInstrStore) so a REUSED
-      // index never inherits a stale ATC bit left behind by an earlier LS bus-fault
-      // occupant of this same slot — the RegInit(True) default alone only covered a
-      // never-yet-written slot, not a reused one.
-      faultAtcStore(tail)   := allocUopVec(0).faultAtc
+      // ROB-fold Slice C: the alloc-time fault RECORD (vector / sswInstr / faultAtc,
+      // plus `pc` as the fault EA — Slice A-2 proved `RenamedUop.faultAddr` was
+      // bit-identical to `.pc` at every decode write site, see DecodedUop.scala's
+      // faultAddr-deletion comment) is written by `payloadFrom` above. Clearing
+      // `faultDynStore` here is what makes alloc WIN over a same-cycle completion on
+      // a re-used index — the exact priority the old six-writer Vecs got from
+      // SpinalHDL's last-assign rule, and the reason this block must stay textually
+      // AFTER the fault-arbitration block above. It also subsumes task #211's
+      // explicit per-alloc ATC write and Slice D's missing per-alloc SIZE write: a
+      // re-used index can no longer inherit ANY completion-time field from a previous
+      // occupant, because the gate that would let it be read is cleared right here.
+      faultDynStore(tail) := False
       // (Task 11 fpuUnimp/fpuCmd: written by payloadFrom above — ROB-fold task #249.)
       nzvcWrStore(tail) := False; xWrStore(tail) := False
       sysValRdyStore(tail)  := False
@@ -1451,16 +1615,73 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       btbIsBranchStore(tail + 1) := False
       phtValidStore(tail + 1)   := False
       faultedStore(tail + 1)  := allocUopVec(1).faulted
-      faultVecStore(tail + 1) := allocUopVec(1).faultVector
-      faultWrStore(tail + 1)  := False; faultSupStore(tail + 1) := False
-      // (ROB-fold Slice A-2: sources `.pc` directly, same as the alloc0 port above.)
-      faultAddrStore(tail + 1)  := allocUopVec(1).pc
-      faultInstrStore(tail + 1) := allocUopVec(1).sswInstr
-      faultAtcStore(tail + 1)   := allocUopVec(1).faultAtc
+      // ROB-fold Slice C: same treatment as the alloc0 port above.
+      faultDynStore(tail + 1) := False
       // (Task 11 fpuUnimp/fpuCmd: written by payloadFrom above — ROB-fold task #249.)
       nzvcWrStore(tail + 1) := False; xWrStore(tail + 1) := False
       sysValRdyStore(tail + 1)  := False
       GenerationFlags.simulation { pcStore(tail + 1) := allocUopVec(1).pc }
+    }
+    // ── Slice C tripwire: drive the sim-only shadow of the OLD structure ─────────
+    // Deliberately written HERE, after both alloc ports, in the OLD textual order —
+    // ls, sq, eu, fp, alloc0, alloc1 — so SpinalHDL's last-assign priority reproduces
+    // the deleted code's resolution exactly (alloc1 > alloc0 > fp > eu > sq > ls),
+    // including the per-FIELD retain behaviour for eu/fp (which never wrote
+    // size/wr/sup/atc). See the shadow declarations above for the one deliberate
+    // deviation (fsSize gets the alloc write the old array was missing).
+    GenerationFlags.simulation {
+      when(lsFaultCompletion.valid) {
+        val i = lsFaultCompletion.payload.robId
+        fsFaulted(i) := True;  fsVec(i)  := U(2, 8 bits)
+        fsAddr(i)    := lsFaultCompletion.payload.faultAddr
+        fsWr(i)      := lsFaultCompletion.payload.write
+        fsSize(i)    := lsFaultCompletion.payload.sizeBits
+        fsSup(i)     := lsFaultCompletion.payload.supervisor
+        fsAtc(i)     := lsFaultCompletion.payload.atc
+        fsInstr(i)   := False
+      }
+      when(sqFaultCompletion.valid) {
+        val i = sqFaultCompletion.payload.robId
+        fsFaulted(i) := True;  fsVec(i)  := U(2, 8 bits)
+        fsAddr(i)    := sqFaultCompletion.payload.faultAddr
+        fsWr(i)      := sqFaultCompletion.payload.write
+        fsSize(i)    := sqFaultCompletion.payload.sizeBits
+        fsSup(i)     := sqFaultCompletion.payload.supervisor
+        fsAtc(i)     := sqFaultCompletion.payload.atc
+        fsInstr(i)   := False
+      }
+      when(euFaultCompletion.valid) {
+        val i = euFaultCompletion.payload.robId
+        fsFaulted(i) := True
+        fsVec(i)     := euFaultCompletion.payload.vector
+        fsInstr(i)   := False
+        fsAddr(i)    := euFaultCompletion.payload.faultAddr
+      }
+      when(fpFaultCompletion.valid) {
+        val i = fpFaultCompletion.payload.robId
+        fsFaulted(i) := True
+        fsVec(i)     := fpFaultCompletion.payload.vector
+        fsInstr(i)   := False
+        fsAddr(i)    := fpFaultCompletion.payload.faultAddr
+      }
+      when(alloc0) {
+        fsFaulted(tail) := allocUopVec(0).faulted
+        fsVec(tail)     := allocUopVec(0).faultVector
+        fsWr(tail)      := False; fsSup(tail) := False
+        fsAddr(tail)    := allocUopVec(0).pc
+        fsInstr(tail)   := allocUopVec(0).sswInstr
+        fsAtc(tail)     := allocUopVec(0).faultAtc
+        fsSize(tail)    := faultAllocSize   // <- Slice D's missing alloc write
+      }
+      when(alloc1) {
+        fsFaulted(tail + 1) := allocUopVec(1).faulted
+        fsVec(tail + 1)     := allocUopVec(1).faultVector
+        fsWr(tail + 1)      := False; fsSup(tail + 1) := False
+        fsAddr(tail + 1)    := allocUopVec(1).pc
+        fsInstr(tail + 1)   := allocUopVec(1).sswInstr
+        fsAtc(tail + 1)     := allocUopVec(1).faultAtc
+        fsSize(tail + 1)    := faultAllocSize
+      }
     }
     when(allocFireSig) {
       tail := tail + Mux(allocSlot1Sig, U(2, robIdW bits), U(1, robIdW bits))
@@ -1555,7 +1776,33 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val privOnly = privViolation && !faultedStore(h0)
     val privVec8 = privOnly || sysPrivFault
     val exceptionPending = Bool();    exceptionPending := faultRetire || sysPrivFault || privOnly; exceptionPending.simPublic()
-    val exceptionVector  = UInt(8 bits);  exceptionVector := Mux(privVec8, U(8, 8 bits),  faultVecStore(h0)); exceptionVector.simPublic()
+    // ── ROB-fold Slice C: the single h0 read of the per-entry fault record ───────
+    // `faultDynStore(h0)` selects between the COMPLETION-time record (faultDynMem,
+    // written by the age-arbitrated ls/sq/eu/fp bus) and the ALLOC-time one
+    // (`payload`, written by alloc0/alloc1). Reading the Mem is safe despite it
+    // having no `init`: the gate is RegInit(False), cleared by both alloc ports, and
+    // set ONLY by the very statement that writes the row — so `faultDyn0` True always
+    // implies row h0 is fresh. Identical discipline to branchTrainMem's
+    // btbIsBranchStore/phtValidStore gates and nextPcMem's retireAlone/mispredictStore
+    // gates. The alloc-side halves that used to be CONSTANTS in the old Vec writes
+    // (`wr`/`sup` := False, `size` := LONG) are re-derived here rather than stored.
+    //
+    // This is the ONLY read of the family. Both former read sites (`exception*` here
+    // and the ExceptionUnit's `entryFault*` arguments below) consume these same
+    // signals, so the fold costs one read port, not two.
+    val faultDyn0  = faultDynStore(h0); faultDyn0.simPublic()
+    val faultRec0  = faultDynMem.readAsync(h0)
+    val faultVec0  = UInt(8 bits);  faultVec0  := Mux(faultDyn0, faultRec0.vec,  p0.faultVector)
+    val faultAddr0 = UInt(32 bits); faultAddr0 := Mux(faultDyn0, faultRec0.addr, p0.pc)
+    val faultSize0 = UInt(2 bits);  faultSize0 := Mux(faultDyn0, faultRec0.size, faultAllocSize)
+    val faultWr0   = Bool();        faultWr0   := Mux(faultDyn0, faultRec0.wr,   faultAllocWr)
+    val faultSup0  = Bool();        faultSup0  := Mux(faultDyn0, faultRec0.sup,  faultAllocSup)
+    val faultAtc0  = Bool();        faultAtc0  := Mux(faultDyn0, faultRec0.atc,  p0.faultAtc)
+    // All four completion ports wrote a constant False into the old faultInstrStore
+    // (a DATA/execute fault is never an instruction fetch), so the completion-side
+    // value is the gate itself.
+    val faultInstr0 = Bool();       faultInstr0 := !faultDyn0 && p0.sswInstr
+    val exceptionVector  = UInt(8 bits);  exceptionVector := Mux(privVec8, U(8, 8 bits),  faultVec0); exceptionVector.simPublic()
     // Fault PC (ROB-fold Slice A): re-derive the old faultPcStore content from the
     // payload Mem — Mux(faultUsesNextPc, predNextPc, pc), the exact expression the
     // deleted array captured at alloc (same sources, same cycle, same address).
@@ -1563,15 +1810,62 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Access-fault (vector 2) extras for the format-$7 frame: the faulting VA + the
     // SSW access attrs {write, sizeBits, supervisor}. Meaningful only when the head's
     // vector is 2; the exception FSM selects the $7 path on the vector.
-    val exceptionFaultAddr = UInt(32 bits); exceptionFaultAddr := faultAddrStore(h0); exceptionFaultAddr.simPublic()
-    val exceptionFaultWr   = Bool();        exceptionFaultWr   := faultWrStore(h0);   exceptionFaultWr.simPublic()
-    val exceptionFaultSize = UInt(2 bits);  exceptionFaultSize := faultSizeStore(h0); exceptionFaultSize.simPublic()
-    val exceptionFaultSup  = Bool();        exceptionFaultSup  := faultSupStore(h0);  exceptionFaultSup.simPublic()
-    val exceptionFaultInstr= Bool();        exceptionFaultInstr:= faultInstrStore(h0);exceptionFaultInstr.simPublic()
+    val exceptionFaultAddr = UInt(32 bits); exceptionFaultAddr := faultAddr0;  exceptionFaultAddr.simPublic()
+    val exceptionFaultWr   = Bool();        exceptionFaultWr   := faultWr0;    exceptionFaultWr.simPublic()
+    val exceptionFaultSize = UInt(2 bits);  exceptionFaultSize := faultSize0;  exceptionFaultSize.simPublic()
+    val exceptionFaultSup  = Bool();        exceptionFaultSup  := faultSup0;   exceptionFaultSup.simPublic()
+    val exceptionFaultInstr= Bool();        exceptionFaultInstr:= faultInstr0; exceptionFaultInstr.simPublic()
     // Task #189: ATC bit source (True=MMU/ATC fault, False=plain bus error) — was
     // previously hardcoded True unconditionally in ExceptionUnit (see its SSW-
     // builder comment); now genuinely per-fault.
-    val exceptionFaultAtc  = Bool();        exceptionFaultAtc  := faultAtcStore(h0); exceptionFaultAtc.simPublic()
+    val exceptionFaultAtc  = Bool();        exceptionFaultAtc  := faultAtc0;   exceptionFaultAtc.simPublic()
+
+    // ── Slice C tripwire: the arbitrated bus must be INDISTINGUISHABLE at the head ─
+    // Compare the new derivation against the sim-only shadow of the old seven-array
+    // structure (declared/driven above) at exactly the points the values are read.
+    //
+    // The `faultedStore` check is the sharp one: a DROPPED younger fault is the only
+    // way the two can ever disagree, so this assert firing is precisely the event the
+    // correctness proof says is impossible. It is checked on `headReady` (which
+    // implies count>0, i.e. h0 really is an allocated entry) rather than only on
+    // faultRetire, so a wrongly-UNmarked head is caught on the cycle it would have
+    // retired normally instead of faulting.
+    //
+    // {size, wr, sup, atc, instr} are gated on `exceptionVector === 2`: that is the
+    // only vector for which ExceptionUnit builds a format-$7 frame (`is7 =
+    // !interrupt && vector === 2`) and therefore the only place these five are
+    // architecturally read. eu/fp faults (vectors 3/5/6/7 and 49..54) intentionally
+    // drive the unified bus with the constants documented at the arbitration block
+    // instead of the old array's retained values, and the shadow deliberately keeps
+    // the old retain behaviour — so an ungated compare would flag a difference that
+    // provably cannot reach an architectural frame. Under vector 2 the fault is
+    // always ls/sq-sourced (which write every field) or alloc-sourced (which now
+    // writes every field too), and the two must agree exactly.
+    GenerationFlags.simulation {
+      when(headReady) {
+        assert(faultedStore(h0) === fsFaulted(h0),
+          "RobPlugin Slice C: arbitrated fault mark at h0 disagrees with the " +
+          "unarbitrated shadow -- a dropped younger fault reached the ROB head", FAILURE)
+      }
+      when(faultRetire) {
+        assert(faultVec0  === fsVec(h0),
+          "RobPlugin Slice C: fault vector at h0 drifted from the old-structure shadow", FAILURE)
+        assert(faultAddr0 === fsAddr(h0),
+          "RobPlugin Slice C: fault address at h0 drifted from the old-structure shadow", FAILURE)
+        when(exceptionVector === 2) {
+          assert(faultSize0  === fsSize(h0),
+            "RobPlugin Slice C: $7 SSW size at h0 drifted from the old-structure shadow", FAILURE)
+          assert(faultWr0    === fsWr(h0),
+            "RobPlugin Slice C: $7 SSW write bit at h0 drifted from the old-structure shadow", FAILURE)
+          assert(faultSup0   === fsSup(h0),
+            "RobPlugin Slice C: $7 SSW supervisor bit at h0 drifted from the old-structure shadow", FAILURE)
+          assert(faultAtc0   === fsAtc(h0),
+            "RobPlugin Slice C: $7 SSW ATC bit at h0 drifted from the old-structure shadow", FAILURE)
+          assert(faultInstr0 === fsInstr(h0),
+            "RobPlugin Slice C: $7 SSW instr bit at h0 drifted from the old-structure shadow", FAILURE)
+        }
+      }
+    }
 
     // ── Committed CCR (X N Z V C, bits 4..0) — VALUE, folded at retire ───────────
     // The ROB has no CCR value on its payload (only phys IDs), so the EU writeback
@@ -1716,15 +2010,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       rteTrigger   = rteRetire,        rtePc        = p0.pc,
       committedCcr = ccrForException,
       // Access-fault (vector 2) extras for the format-$7 frame.
-      entryFaultAddr = faultAddrStore(h0),
-      entryFaultWr   = faultWrStore(h0),
-      entryFaultSup  = faultSupStore(h0),
-      entryFaultInstr= faultInstrStore(h0),
+      entryFaultAddr = faultAddr0,
+      entryFaultWr   = faultWr0,
+      entryFaultSup  = faultSup0,
+      entryFaultInstr= faultInstr0,
       // Task #189: SIZE field + ATC bit — both now genuinely threaded (were
       // previously computed here but the SIZE one was never passed at all, and
       // ATC was hardcoded true in ExceptionUnit; see that file's SSW-builder).
-      entryFaultSize = faultSizeStore(h0),
-      entryFaultAtc  = faultAtcStore(h0),
+      entryFaultSize = faultSize0,
+      entryFaultAtc  = faultAtc0,
       entryIsInterrupt = interruptPending,
       entryIplLevel    = interruptLevel,
       // ── Commit-time SYSTEM op (supervisor): drive the S_APPLY FSM ──────────────
