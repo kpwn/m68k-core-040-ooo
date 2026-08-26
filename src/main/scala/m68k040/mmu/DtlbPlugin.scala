@@ -11,9 +11,12 @@ import spinal.lib.misc.plugin.FiberPlugin
 /** D-side MMU plugin: a banked DTLB + a hardware 3-level table walker behind
   * `DTranslationService`, replacing the identity stub.
   *
-  *  - `mmuEnable` (sim-pokeable AND commit-time MOVEC-writable, task #131): when LOW the plugin is a pure
-  *    identity passthrough (ppn=vpn, cacheable, no fault, always ready) — every
-  *    existing MMU-disabled test/lock-step is unchanged.
+  *  - `mmuEnable` (sim-pokeable AND commit-time MOVEC-writable, task #131): when LOW the plugin is an
+  *    identity passthrough (ppn=vpn, no fault, always ready) UNLESS a TTR
+  *    (DTT0/DTT1) matches, in which case its own cache-mode wins (WRITETHROUGH
+  *    otherwise) — TTRs are gated only by their own E bit and apply
+  *    independently of `mmuEnable`, matching real 68040 semantics (see the
+  *    `ttHit` comment below for why this changed).
   *  - When HIGH: every accepted tagged command looks up the TLB. A HIT produces a
   *    held registered response one cycle later, with the access-class permission
   *    fault captured alongside the same token. A MISS blocks further commands and
@@ -129,13 +132,35 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- DTT0/DTT1 transparent-translation match (task #194) ----
     // A hit bypasses the walker/TLB entirely: PA=VA, no fault, no page table
-    // consulted. Only consulted while the MMU is enabled (mmuEnable=False is
-    // ALREADY pure identity below — TTRs add no observable difference there, and
-    // gating this way keeps every pre-existing MMU-disabled test bit-for-bit
-    // unchanged). DTT0 has priority over DTT1 when both match (checked first).
+    // consulted.
+    //
+    // CORRECTED (bug found via live-hardware boot investigation, see
+    // docs/BUG_video_driver_selection.md in the parent macqd700-soc repo,
+    // commit 4339fa7): this used to be additionally gated with `mmuEnable &&`
+    // on top of each TTR's own E bit, on the claim that mmuEnable=False was
+    // "already pure identity below" so TTRs added no observable difference.
+    // That claim was ARCHITECTURALLY WRONG. On real 68040 hardware DTT0/DTT1
+    // (and ITT0/ITT1) are gated ONLY by their own E bit (TTR bit 15) --
+    // exactly like TtMatch.hit already checks internally (MmuTypes.scala) --
+    // and apply regardless of whether paged translation (TC.E / mmuEnable) is
+    // on. That is the entire point of TTRs: firmware marks address ranges
+    // transparent/non-cacheable BEFORE paging is enabled. The Mac ROM does
+    // exactly this at boot (TC=0): DTT1 covers the VIA/SCC/DAFB MMIO window
+    // cache-inhibited. With the old `mmuEnable &&` gating, a TC=0 MMIO probe
+    // fell through to the unconditional `!mmuEnable` WRITETHROUGH branch
+    // below instead of honoring DTT1's INHIBITED setting -- the D-cache then
+    // allocated a line and issued a burst refill against an AXI-lite-only
+    // slave, which SLVERRs every beat since it never expects a burst there.
+    // Fixed by dropping the `mmuEnable &&` here (each TTR's own E bit is
+    // still enforced inside TtMatch.hit, so this is not "always transparent
+    // when TTRs are configured" -- it's "transparent exactly when a TTR's
+    // own E bit + base/mask/supervisor match", the real hardware condition)
+    // and by re-priority-ordering the response mux below so a TTR hit is
+    // checked before the mmuEnable-off fallback, not after.
+    // DTT0 has priority over DTT1 when both match (checked first).
     val vaHi8   = _req.payload.vpn(19 downto 12)   // == va[31:24] (vpn is va[31:12])
-    val dtt0Hit = mmuEnable && TtMatch.hit(dtt0, vaHi8, _req.payload.supervisor)
-    val dtt1Hit = mmuEnable && !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.payload.supervisor)
+    val dtt0Hit = TtMatch.hit(dtt0, vaHi8, _req.payload.supervisor)
+    val dtt1Hit = !dtt0Hit && TtMatch.hit(dtt1, vaHi8, _req.payload.supervisor)
     val ttHit   = dtt0Hit || dtt1Hit
 
     // ---- TLB lookup (combinational) ----
@@ -243,17 +268,23 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // existing single walker context. Accept-last ordering lets an old response
     // fire while the next direct hit is captured in the same cycle.
     when(_req.fire) {
-      when(!mmuEnable) {
-        rspValid             := True
-        rspPayload.ppn       := _req.payload.vpn
-        rspPayload.cacheMode := CacheMode.WRITETHROUGH
-        rspPayload.fault     := False
-        rspPayload.token     := _req.payload.token
-        rspVpn               := _req.payload.vpn
-      } elsewhen(ttHit) {
+      // TTR hit is checked FIRST regardless of mmuEnable: on real hardware a
+      // TTR match bypasses the walker/TLB entirely, whether or not paging is
+      // on (see the comment above ttHit's definition). The mmuEnable=False
+      // fallback below is now only reached when the MMU is off AND no TTR
+      // matched -- identity-map with WRITETHROUGH remains the correct default
+      // for that "not specially marked" case.
+      when(ttHit) {
         rspValid             := True
         rspPayload.ppn       := _req.payload.vpn
         rspPayload.cacheMode := TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1))
+        rspPayload.fault     := False
+        rspPayload.token     := _req.payload.token
+        rspVpn               := _req.payload.vpn
+      } elsewhen(!mmuEnable) {
+        rspValid             := True
+        rspPayload.ppn       := _req.payload.vpn
+        rspPayload.cacheMode := CacheMode.WRITETHROUGH
         rspPayload.fault     := False
         rspPayload.token     := _req.payload.token
         rspVpn               := _req.payload.vpn

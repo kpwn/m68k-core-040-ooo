@@ -13,8 +13,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   * but reads the shared `MmuControlService` (the ONE 68040 MMU enable + root — I and
   * D translation share it) and is instruction-fetch only.
   *
-  *  - `mmuEnable` LOW => pure identity passthrough (ppn=vpn, cacheable, no fault,
-  *    always ready): every MMU-disabled test / lock-step is unchanged.
+  *  - `mmuEnable` LOW => identity passthrough (ppn=vpn, no fault, always ready)
+  *    UNLESS a TTR (ITT0/ITT1) matches, in which case its own cache-mode wins
+  *    (WRITETHROUGH otherwise) — TTRs are gated only by their own E bit and
+  *    apply independently of `mmuEnable`, matching real 68040 semantics (see
+  *    the `ttHit` comment below for why this changed).
   *  - When HIGH: a fetch demand (`req.valid`) looks up the ITLB. A HIT returns
   *    ppn/perms/cacheMode in 1 cycle; a supervisor page accessed in user mode flags
   *    a perm fault. A MISS drops `rsp.ready` (the I-cache stalls on its existing
@@ -118,11 +121,21 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- ITT0/ITT1 transparent-translation match (task #194) — mirrors DtlbPlugin's
     // DTT0/DTT1 treatment exactly, on the I-side. A hit bypasses the walker/TLB
-    // entirely: PA=VA, no fault. Only consulted while the MMU is enabled. ITT0 has
-    // priority over ITT1 when both match. ---- ----
+    // entirely: PA=VA, no fault.
+    //
+    // CORRECTED (same bug/fix as DtlbPlugin.scala, see its comment for the full
+    // real-hardware trace): this used to be additionally gated with
+    // `mmuEnable &&` on top of each TTR's own E bit, on the claim that this was
+    // an observable no-op since mmuEnable=False was already pure identity. That
+    // was architecturally wrong -- ITT0/ITT1 are gated ONLY by their own E bit on
+    // real 68040 hardware (already checked inside TtMatch.hit) and apply
+    // independently of paged translation, exactly like the D-side DTT0/DTT1.
+    // Fixed by dropping `mmuEnable &&` here and by re-priority-ordering the
+    // response mux below so a TTR hit is checked before the mmuEnable-off
+    // fallback. ITT0 has priority over ITT1 when both match. ---- ----
     val vaHi8   = _req.vpn(19 downto 12)   // == va[31:24]
-    val itt0Hit = mmuEnable && TtMatch.hit(itt0, vaHi8, _req.supervisor)
-    val itt1Hit = mmuEnable && !itt0Hit && TtMatch.hit(itt1, vaHi8, _req.supervisor)
+    val itt0Hit = TtMatch.hit(itt0, vaHi8, _req.supervisor)
+    val itt1Hit = !itt0Hit && TtMatch.hit(itt1, vaHi8, _req.supervisor)
     val ttHit   = itt0Hit || itt1Hit
     val ttInhibited = Mux(itt0Hit, TtMatch.inhibited(itt0), TtMatch.inhibited(itt1))
 
@@ -389,12 +402,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // is never a write, so write-protect never applies.)
     def permFault(sup: Bool): Bool = sup && !_req.supervisor
 
-    when(!mmuEnable) {
-      _rsp.ready     := True
-      _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.WRITETHROUGH
-      _rsp.fault     := False
-    } elsewhen(ttHit) {
+    // TTR hit is checked FIRST regardless of mmuEnable (matches DtlbPlugin's fix
+    // and real hardware priority: a TTR match bypasses the walker/TLB entirely,
+    // whether or not paging is on). The mmuEnable=False fallback is now only
+    // reached when the MMU is off AND no TTR matched.
+    when(ttHit) {
       // ITT0/ITT1 transparent-translation hit (task #194): bypasses the walker/TLB
       // entirely — PA=VA, never faults. The I-side never inspects WRITETHROUGH vs
       // COPYBACK (no I-side stores), so collapsing the cacheable case to a fixed
@@ -404,6 +416,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.WRITETHROUGH)
+      _rsp.fault     := False
+    } elsewhen(!mmuEnable) {
+      _rsp.ready     := True
+      _rsp.ppn       := _req.vpn
+      _rsp.cacheMode := CacheMode.WRITETHROUGH
       _rsp.fault     := False
     } elsewhen(tlbHit) {
       _rsp.ready     := True
