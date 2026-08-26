@@ -1,12 +1,18 @@
 # BUG: `FMOVEM.X <ea>,<list>` (data-register-list LOAD) corrupts the ROB commit-PC
 
-**Status**: OPEN, root-caused to a specific mechanism (`RobPlugin.commitPc0`'s
-`retireAlone` mux) but NOT pinned to a single faulty line. Sim-only finding; not run
-on hardware. Found 2026-08-26 while building a directed test for a *different*,
-unrelated scenario (`campaign/fmovem-postinc-ring`'s aligned-load split-ring
-rotating-phase stress) — this bug blocks that scenario's own test from ever reaching
-the ring behavior it was written to exercise, so it is reported first, separately, and
-ahead of that scenario's own (still-unresolved) verification.
+**Status**: OPEN. Sim-only finding; not run on hardware. Found 2026-08-26 while
+building a directed test for a *different*, unrelated scenario
+(`campaign/fmovem-postinc-ring`'s aligned-load split-ring rotating-phase stress) —
+this bug blocks that scenario's own test from ever reaching the ring behavior it was
+written to exercise, so it is reported first, separately, and ahead of that
+scenario's own (still-unresolved) verification. **UPDATE (same day, follow-up
+session)**: the originally-suspected mechanism (`RobPlugin.commitPc0`'s
+`retireAlone` mux) has been isolated with two whitebox tests and **EXONERATED** —
+it retires this uop shape correctly in every case tested, including under
+back-to-back retire pressure. The real defect is confirmed to live upstream of the
+ROB (predecode length computation / the `fmovemxActive` FSM's interaction with
+rename allocation / `DivEuPlugin`'s FP-completion robId tracking — none pinned yet).
+See "Root-cause leads" below for the full detail.
 
 **Severity**: HIGH for correctness (any real program using `FMOVEM.X <ea>,<list>` — the
 FPSP register-save/restore idiom is exactly this — would corrupt its own following
@@ -123,60 +129,113 @@ multi-element drain (repro C) but is fine for the trivial 1-element case (repro 
 Whether these are the same underlying defect surfacing differently, or two separate
 defects, was **not resolved** — see "Not yet done" below.
 
-## Root-cause leads (not confirmed to a single line)
+## Root-cause leads
 
-`RobPlugin.scala`'s commit-pc mux:
-```scala
-val commitPc0 = Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)
-```
-- `p0.predNextPc` is populated straight from the allocated uop's own `.nextPc` field
-  (`p.predNextPc := u.nextPc`, line ~830) — for FMOVEM.X's issue-row uop this is
-  `fmovemxNextPc`, which is provably computed correctly (matches oracle exactly at
-  entry — see repro C's idx25).
-- `p0.retireAlone` is set `:= u.isBranch` at allocation (line ~851). FMOVEM.X's
-  issue-row uop explicitly sets `u.isBranch := False`
-  (`MicroOpAssembler.fmovemxIssueUop`), so `retireAlone` should be `False`, which
-  selects `predNextPc` (the correct path) — NOT `nextPcRd0`.
-- `nextPcRd0` reads `nextPcMem`, a `Mem` with **exactly one writer**
-  (`branchCompletion`, per its own doc comment: "Single write port into nextPcMem
-  (ROB-fold Slice B) — the ONLY writer"). Any ROB row that is read via this path
-  without ever having been written by a branch completion reads **garbage** (an
-  uninitialised `Mem` row in simulation) — which matches repro A's symptom exactly
-  (wholesale garbage, multiple fields, not a clean off-by-N).
+### UPDATE 2026-08-26: `RobPlugin.scala`'s `commitPc0`/`retireAlone` mux is EXONERATED
 
-**The open question this doc does NOT answer**: why would `p0.retireAlone` (or
-whatever gates the `nextPcRd0` read) ever evaluate `True`/select the wrong source for
-an `isBranch=False` FMOVEM.X issue-row uop, especially only for `(An)` mode and not
-`(d16,An)`? Candidates not yet checked:
-- A rename/allocation-time field getting mixed up specifically for the "direct push,
-  bypassing `AssembledUops`" path the `fmovemxActive` FSM uses (shared with `movemActive`
-  and the µcode sequencer, all three of which DO have their own passing lock-step
-  coverage — so the shared mechanism itself is not obviously broken; something about
-  the FP-specific combination — `dstValid=False` + FP-lane-only completion port
-  `divEu.fpCompletion`/`rob.logic.completion(5)`, which no OTHER "direct push" FSM's
-  kept-commit µop combines — is the more likely differentiator).
-- Whether `(An)`'s zero `fxBaseDisp` (vs. `(d16,An)`'s real displacement) interacts
-  with some SHARED register/mux keyed off EA mode elsewhere in the allocation or
-  ROB-write path (not found by this session's search).
-- Repro C's "next instruction inherits the just-retired commit-pc" shape suggests a
-  possible one-cycle-stale read of SOME register (not necessarily `nextPcMem`/
-  `retireAlone` — could be a completely separate mechanism from repro A's) that only
-  manifests after a genuinely multi-cycle FSM drain, not a single-shot one.
+A follow-up session added two `RobPlugin`-level whitebox tests to
+`RobPluginSpec.scala` (search `"ROB ISOLATION"`) per this doc's own "Suggested next
+steps" §1, and they **both pass**, not just as static reasoning but as an actually-run
+sim result:
+
+1. `"ROB ISOLATION (bug doc): FMOVEM.X-issue-row-shaped uop ... retires with
+   commitPc0 == predNextPc"` — allocates a synthetic `RenamedUop` shaped exactly like
+   `fmovemxIssueUop` (`isBranch=False`, `pdstValid=False`, i.e. no int dest) and
+   completes it via completion **port 5** (the real full-core FP lane,
+   `rob.logic.completion(5).valid := divEu.fpCompletion.valid` in
+   `FullCoreSynth.scala`) in total isolation. `commitPc0` correctly resolves to
+   `predNextPc`. PASSES.
+2. `"ROB ISOLATION (bug doc, repro-C shape): the instruction retiring immediately
+   after an FMOVEM.X-issue-row-shaped entry gets its OWN predNextPc"` — allocates
+   TWO entries (an FMOVEM.X-issue-row-shaped one at robId0, then an ordinary
+   int-writing MOVE at robId1), completes robId0 via port 5 and confirms its commit
+   pc, THEN completes robId1 via port 0 (the ordinary int lane) and confirms its
+   commit pc is its own `predNextPc`, not the just-retired FP entry's. This directly
+   targets repro C's symptom ("the VERY NEXT retiring instruction's commit-pc ...
+   suspiciously identical to the FMOVEM's own just-retired commit-pc"). PASSES.
+
+This means, confirmed (not reasoned) by direct sim evidence:
+- `p0.retireAlone := u.isBranch` DOES correctly evaluate `False` for this exact uop
+  shape and completion-port combination — it never reads `nextPcRd0`/`nextPcMem`.
+- `p.predNextPc := u.nextPc` (alloc-time, unconditional — no gating on
+  `dstValid`/`pdstValid`/`cluster`/completion-port-index of any kind) is written and
+  read back correctly, per-entry, with no cross-entry bleed even under immediate
+  back-to-back retire pressure (robId1 never reads robId0's stale `predNextPc`).
+- Completing via completion port 5 specifically vs. any other port makes no
+  observable difference to `commitPc0`/`retireAlone`/`predNextPc` — `completes(robId)
+  := True` is set identically by every one of the 6 ports
+  (`for (c <- completion) when(c.valid) { completes(c.payload) := True }`), and none
+  of `commitPc0`'s inputs read which port fired.
+
+**Conclusion: `RobPlugin.scala`'s retire/commit-pc logic itself is NOT the bug.** The
+original suspicion (this section, pre-2026-08-26) was a plausible but WRONG lead —
+the mux reads correctly for this uop shape in every case this isolated harness can
+construct. The defect must be upstream of the ROB: either (a) the value written into
+`predNextPc`/`pc` at allocation is ALREADY wrong by the time it reaches the ROB's
+alloc-write (i.e. `fmovemxNextPc`/`fxNextPc` itself, or something corrupting it
+between `DecodeStage` and the ROB's alloc port), or (b) the uop lands in the WRONG
+physical ROB row (an allocation-index/aliasing bug upstream of `payload.write`, not
+inside `RobPlugin`'s own retire-read logic), or (c) — given repro A's "a7 is ALSO
+wrong despite nothing in the program touching A7" observation — genuinely wrong
+EXECUTION for `(An)` mode specifically (a real control-flow/redirect defect, not a
+pure observability/framing bug). On point (c): the lock-step harness's `a7` field
+(`ExecuteLockStepSpec`'s `c.a7`) is sourced from `RobPlugin`'s `exc.ss.a7` (the live
+architectural A7 tracked by the exception/supervisor-state unit), a COMPLETELY
+SEPARATE piece of state from `commitPc0`/`predNextPc` — they do not share storage or
+a read path. Two unrelated fields being simultaneously wrong is therefore NOT
+explained by a single mis-read inside `RobPlugin`; it is much more consistent with
+the CPU genuinely having executed something other than the intended instruction
+stream after (or around) the FMOVEM.X `(An)` macro — i.e. a real frontend/decode/
+rename-level defect specific to `(An)`'s zero `fxBaseDisp`, not a retire-time
+observability artifact. This also means `commitPc0` is very unlikely to be what
+drives the CPU's actual next-fetch address for a non-`retireAlone` (non-branch) entry
+like FMOVEM.X's issue row — `commitPc0` only feeds `debugLivePcReg`/the commit TRACE,
+not a real redirect, since `flushPcReg`/`branchRedirect` are gated on
+`p0.retireAlone` (False here) — so a wrong `commitPc0` for this uop, by itself,
+cannot be *causing* real wrong execution; at most it would be a downstream SYMPTOM of
+the same upstream corruption that produces the a7 corruption.
+
+**Genuinely still open** (not reached by this or the prior session):
+- What actually corrupts `predNextPc`/`pc` (or misroutes the ROB row) for FMOVEM.X's
+  issue-row uop specifically under `(An)` mode — candidates, none checked yet:
+  - `fxNextPc = fxPc + (fxEntryPkt.lenWords << 1)` (`DecodeStage.scala`, FMOVEM.X
+    entry-detection block) depends on `fxEntryPkt.lenWords`, the GENERIC
+    predecode-computed instruction length. Confirm predecode's EA-length table
+    entry for FMOVEM.X's two admitted modes (010/101) actually reports the right
+    word count for `(An)` (2 words: opword+ext1, no disp16) vs `(d16,An)` (3 words) —
+    this session did NOT verify predecode's own length computation for this specific
+    opcode class, only that `RobPlugin` correctly threads through whatever length it
+    is given.
+  - Whether the `fmovemxActive` FSM's push (`pushProduced` in `elsewhen(fmovemxActive)`,
+    `DecodeStage.scala`) can, specifically for `(An)`'s 1-element/4-cycle-total case,
+    interact badly with `RenameStage`'s allocation-index bookkeeping (a genuine
+    robId mis-assignment upstream of `RobPlugin.payload.write`, not inside it).
+  - `DivEuPlugin`'s FP completion-robId capture (`fpCompRobId := ctx.robId`,
+    `DivEuPlugin.scala` ~line 1185) and whether the fixed CPLX issue pipe can
+    associate a stale/wrong `robId` with the FMOVEM.X issue-row's completion —
+    unverified this session; would explain "reads garbage" without needing
+    `RobPlugin` itself to be at fault, since `completion(5).payload` (the robId
+    completing) comes from here, not from `RobPlugin`.
+  - Whether `(An)`'s zero `fxBaseDisp` interacts with a SHARED signal/mux keyed off
+    EA mode somewhere in `LsEuPlugin`'s AGU for the 3 chunk loads, in a way that
+    could cause a genuine wrong-path flush/redirect (which WOULD explain real
+    execution divergence + a7 corruption) that this session did not trace.
 
 ## Why this was flagged, not fixed
 
-`RobPlugin.scala` is large, deeply pipelined, and explicitly documented elsewhere in
-this codebase as FMax-critical (retire/commit-PC framing sits on the same shared
-`nextPcMem`/`branchTrainMem`/`mispredictStore` LUT-reduction fold as branch
-prediction training). Patching the `retireAlone`/`commitPc0` mux based on the
-correlational evidence above — without having actually traced why `retireAlone`
-selects the wrong path only for these specific FMOVEM.X cases — risks either not
-fixing it, or silently breaking branch-family retire (which shares the exact same mux
-and depends on `retireAlone` reading `nextPcRd0` correctly for **branches**). This is
-exactly the kind of fix that needs a proper trace-driven investigation (waveform or a
-dedicated `RobPlugin`-level whitebox test isolating `retireAlone`/`commitPc0` for a
-synthetic non-branch, no-int-write, FP-lane-completion uop), not a one-line guess
-under time pressure.
+Two whitebox tests (above) successfully isolated and EXONERATED the originally-
+suspected mechanism (`RobPlugin.scala`'s `retireAlone`/`commitPc0` mux) — a genuine,
+confirmed narrowing of the bug, not just more correlation. But that isolation also
+means the actual defect lives somewhere upstream of the ROB (predecode length
+computation, the `fmovemxActive` FSM's allocation-index interaction with
+`RenameStage`, or `DivEuPlugin`'s FP completion robId tracking — see the open list
+above), each of which is its own substantial subsystem this session did not have
+budget to trace to a confirmed mechanism. Guessing a fix in any of those areas without
+first repeating this session's isolation discipline (a targeted whitebox test that
+pins the exact wrong value/index BEFORE writing a fix) risks the same wrong-guess
+outcome this doc originally warned against for `RobPlugin.scala` — except now in
+several candidate subsystems instead of one, with less prior narrowing work done in
+any of them. Still flagged, not fixed.
 
 ## Impact on the `campaign/fmovem-postinc-ring` scenario
 
@@ -192,19 +251,26 @@ a result of the divergence firing first).
 
 ## Suggested next steps
 
-1. Add a `RobPlugin`-level whitebox test (mirroring `RobFaultSpec.scala`/
-   `RobPluginSpec.scala`'s own low-level harness style, not a full lock-step) that
-   allocates a synthetic uop shaped exactly like FMOVEM.X's issue row (`isBranch=False`,
-   `dstValid=False`, completes via a **non-integer** completion port) and directly
-   inspects `retireAlone`/`commitPc0` at retire — this isolates the mechanism without
-   the full FullCoreDut/Musashi machinery each iteration currently costs (~15-50s
-   compile+sim per run in this investigation).
-2. Once isolated, re-run repro A and repro C's underlying programs to confirm the fix
+1. ~~Add a `RobPlugin`-level whitebox test...~~ **DONE 2026-08-26** — see the "UPDATE"
+   section above. Result: `RobPlugin.scala` EXONERATED, not confirmed as the bug.
+2. Next isolation target: predecode's length computation for FMOVEM.X's two admitted
+   EA modes (`fxEntryPkt.lenWords`, consumed by `DecodeStage.scala`'s `fxNextPc`).
+   A cheap, targeted test would decode both `(An)` and `(d16,An)` FMOVEM.X opwords
+   through predecode ALONE (no ROB, no rename — mirrors `FmovemxDataListDecodeSpec`'s
+   own existing harness style) and assert the emitted length in words for each,
+   independent of everything downstream. If this comes back correct too, move to
+   `DivEuPlugin`'s `fpCompRobId` capture and the `fmovemxActive` FSM's interaction
+   with `RenameStage`'s allocation index (see the open bullet list above) — likely
+   needs a waveform trace of a real repro-A run (`(An)` single-element) rather than
+   another synthetic whitebox, since the defect (if in FSM/rename interaction) may
+   depend on exact multi-cycle timing this style of isolated test cannot easily
+   reproduce without re-modeling the FSM.
+3. Once isolated, re-run repro A and repro C's underlying programs to confirm the fix
    closes BOTH (they may turn out to be the same root cause manifesting two ways, or
    two separate bugs needing two fixes — do not assume either without re-testing both).
-3. Re-enable the two `ignore`d tests in `FpuLockStepSpec.scala`
+4. Re-enable the two `ignore`d tests in `FpuLockStepSpec.scala`
    (`"[KNOWN BUG...] FMOVEM.X (An),FP0 single-element..."` and `"[BLOCKED...] lock-step:
    FMOVEM.X (d16,An),FP0-FP7 -- misaligned base..."`) and confirm both go green.
-4. Re-run the full `ExecuteLockStepSpec`/`FpuLockStepSpec` suite (not just `test-fast`,
+5. Re-run the full `ExecuteLockStepSpec`/`FpuLockStepSpec` suite (not just `test-fast`,
    which excludes every `VerilatorTest`-tagged suite including these) to confirm no
    collateral regression in the branch-retire path the fix will necessarily touch.
