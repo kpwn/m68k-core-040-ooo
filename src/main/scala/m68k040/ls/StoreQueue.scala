@@ -120,8 +120,9 @@ class StoreQueue(depth: Int = 8) extends Component {
   val paddrs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val datas     = Vec.fill(depth)(RegInit(B(0, 32 bits)))
   val sizes     = Vec.fill(depth)(RegInit(Size.BYTE()))
-  // slot-A explicit-strobe drain (split stores) + covered byte count (overlap)
-  val nbytesAs  = Vec.fill(depth)(RegInit(U(1, 3 bits)))
+  // slot-A explicit-strobe drain (split stores). The covered byte count that used to
+  // live alongside it is gone -- the forward overlap test is byte-lane masks now, and
+  // `nbytesA/B` had no other consumer (see the geometry block below).
   val useStrbAs = Vec.fill(depth)(RegInit(False))
   // ── SQ drain-payload elimination (task #252, 2026-08-19) ──
   // The prior LUT-reduction pass (2026-08-15) folded strbA/lineDataA/strbB/lineDataB
@@ -142,24 +143,76 @@ class StoreQueue(depth: Int = 8) extends Component {
   // at offset 0 for a split, so slot B's bytes are derived from slot A's offset too,
   // exactly as before), `sizes(sendPtr)`, `datas(sendPtr)`. Same stability: sendPtr and
   // the source registers are exactly as stable as the old Mem's own read address was.
-  // FMax (P1): PRE-REGISTERED slot-A upper byte-range bound, computed at ALLOC as
-  // paddr + nbytesA. The forward overlap test then compares the load range against
-  // this stored bound (a COMPARE) instead of recomputing paddr+nbytes in the
-  // forward cone (which placed a per-entry CARRY8 adder in the binding
-  // s2Paddr->fwdData post-route path). Stored at 32 bits — EXACTLY the width of the
-  // old combinational `paddrs(i) + nbytesAs(i)` (SpinalHDL `+` yields a 32-bit
-  // result, carry-out dropped), so the (qLo < aHi) compare is bit-identical to
-  // before. paddrLo is just paddrs(i) (no adder needed).
-  val paddrHiAs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  // ── Forward-overlap geometry: PRE-REGISTERED byte-lane masks (this task) ──────
+  // The forward cone used to answer "does this entry overlap the query?" with a pair
+  // of 32-bit MAGNITUDE comparisons per slot against a pre-registered upper bound
+  // (`paddrHiA/B = paddr + nbytes`, the previous FMax pass). That still left the
+  // QUERY-side `qHi = q.paddr + qBytes` 32-bit adder (3 CARRY8 levels, fanout 32)
+  // directly on the design's worst post-route path
+  // (`p4Ctx_fwdHit -> p4Ctx_fwdData[7]`, -0.420ns, 13 levels -- see `b8346d1b`).
+  //
+  // Both SQ slots are provably confined to ONE 16-byte cache line (proof + the
+  // permanent alloc-time sim assert below), so the whole magnitude comparison is more
+  // than the question needs: overlap == "same line AND the byte-lane masks intersect".
+  // The masks are computed HERE, at alloc, once per cycle, off the forward cone; the
+  // per-query cost is then a 28-bit line EQUALITY (which `sameLine` below already
+  // computed anyway, so it is shared) plus a bitwise mask AND -- zero carry chains,
+  // zero arithmetic, in the whole cone.
+  //
+  //   maskAs(i)     16-bit byte-lane mask of slot A within line `paddrs(i)(31:4)`
+  //   maskBs(i)     ditto for slot B within line `paddrBs(i)(31:4)` (0 when !validB)
+  //   linePrevAs(i) `paddrs(i)(31:4) - 1`   -- see below
+  //   linePrevBs(i) `paddrBs(i)(31:4) - 1`
+  //
+  // The `linePrev` registers exist because the QUERY, unlike an entry, is NOT
+  // line-confined: a misaligned load at line offset 13..15 spans its own line AND the
+  // next one (LsEuPlugin's `s1CrossLine`). The query therefore carries a 19-bit span
+  // -- 16 lanes of its own line plus up to 3 lanes of the FOLLOWING line -- and the
+  // second half has to be tested against line `qLine + 1`. Storing `line - 1` per
+  // entry turns that into `linePrev === qLine`, i.e. the +1 is pre-registered at
+  // alloc too and the cone keeps its zero-arithmetic property. (Both are 28-bit
+  // modular values, so the identity holds across the 2^32 address wrap as well.)
+  //
+  // These four REPLACE `paddrHiAs`/`paddrHiBs`/`nbytesAs`/`nbytesBs` outright. The FF
+  // trade is deliberate and small: -560 removed (2x32 + 2x3 bits/entry) vs +704 added
+  // (2x16 + 2x28 bits/entry) = +144 FF, ~+0.4% of the design's registers, bought to
+  // take an entire carry chain off the design's WORST path. `nbytesA/B` are no longer
+  // needed at ALL, because `full` (exact addr+size match) is now `maskA === qSpan`,
+  // which is equivalent: both masks are a contiguous run starting at the access
+  // offset, so mask equality IS offset-plus-length equality.
+  //
+  // A sim-only shadow of all four deleted registers, plus a per-entry equivalence
+  // assert re-evaluating the ORIGINAL magnitude-comparator test against them every
+  // cycle, is declared immediately below and checked after `perEntry`. That is the
+  // permanent, executable proof of everything claimed in this comment.
+  val maskAs     = Vec.fill(depth)(RegInit(B(1, 16 bits)))
+  val linePrevAs = Vec.fill(depth)(RegInit(U(0, 28 bits)))
   // optional slot B (second half of a split store)
   val validBs   = Vec.fill(depth)(RegInit(False))
   val paddrBs   = Vec.fill(depth)(RegInit(U(0, 32 bits)))
-  val nbytesBs  = Vec.fill(depth)(RegInit(U(0, 3 bits)))
   // (strbB/lineDataB are DERIVED at drain time -- see the drain-present mux below;
   // no per-entry storage needed at all now, task #252.)
-  // PRE-REGISTERED slot-B upper byte-range bound (= paddrB + nbytesB), same rationale
-  // and same 32-bit width (bit-identical to the old `paddrBs(i) + nbytesBs(i)`).
-  val paddrHiBs = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  val maskBs     = Vec.fill(depth)(RegInit(B(0, 16 bits)))
+  val linePrevBs = Vec.fill(depth)(RegInit(U(0, 28 bits)))
+
+  // ── Forward-overlap equivalence tripwire: SIM-ONLY shadow of the OLD structure ──
+  // These four reproduce, bit for bit, the `nbytesAs`/`nbytesBs`/`paddrHiAs`/
+  // `paddrHiBs` Reg-Vecs the mask scheme above replaced, written from the identical
+  // alloc payload with the identical `+` semantics (32-bit, carry-out dropped). The
+  // per-entry assertions further down then re-evaluate the ORIGINAL magnitude-
+  // comparator overlap test against them and pin the new derivation to it on EVERY
+  // cycle, for EVERY resident entry -- which is the executable form of the equivalence
+  // proof for a piece of logic whose failure mode is silent data corruption, not a
+  // crash. It stays permanently, so the two can never drift apart.
+  //
+  // Elaborated only under `includeSimulation` (see M68kSim.scala) => zero synthesis
+  // cost: like RobPlugin's `fs*` Slice-C shadows, every one of these vals is null in a
+  // synth/GenVerilog build and must never be referenced outside a
+  // `GenerationFlags.simulation` block.
+  val fsNbytesA  = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(1, 3 bits))) }
+  val fsNbytesB  = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(0, 3 bits))) }
+  val fsPaddrHiA = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(0, 32 bits))) }
+  val fsPaddrHiB = GenerationFlags.simulation { Vec.fill(depth)(RegInit(U(0, 32 bits))) }
   // Presentation and acknowledgement are independent ordered cursors. A split store
   // contributes two accepted halves but exactly one architectural entry/pop.
   val sendPtr    = RegInit(U(0, ptrW bits))
@@ -193,6 +246,45 @@ class StoreQueue(depth: Int = 8) extends Component {
     val n = UInt(3 bits); n := 1
     switch(s) { is(Size.BYTE) { n := 1 }; is(Size.WORD) { n := 2 }; is(Size.LONG) { n := 4 } }
     n
+  }
+
+  // ---- byte-lane span mask: the forward-overlap primitive -------------------
+  // A 19-bit span over the byte lanes of ONE 16-byte cache line PLUS a 3-lane spill
+  // into the following line:
+  //     bit j      (j <  16)  = "this access covers byte j of line (addr >> 4)"
+  //     bit 16 + k (k <   3)  = "this access covers byte k of line (addr >> 4) + 1"
+  // `off` is the line offset (addr(3 downto 0)); the covered byte count is given as
+  // four thermometer predicates (n>=1, n>=2, n>=3, n>=4) rather than as a number, so a
+  // caller holding a `Size` enum can supply them directly without first decoding a
+  // byte count. Only counts 1..4 are representable, which is all this design ever
+  // produces (BYTE/WORD/LONG, and a split slot is at most 3 bytes -- see the alloc
+  // assert). 3 spill lanes suffice for the same reason: a 4-byte access at the worst
+  // offset (13) spills exactly 1..3 bytes.
+  //
+  // Written as an explicit per-lane expression, NOT as `(mask << off)`: a barrel
+  // shifter is log2(16) = 4 mux levels deep, whereas this is a 4->16 one-hot decode
+  // (one LUT4 per lane) followed by one 6-input term per lane
+  // {oh(j), oh(j-1), oh(j-2), oh(j-3), ge2, ge4} -- i.e. exactly two LUT levels,
+  // which matters because the query-side instance sits on the critical path.
+  def spanMask(off: UInt, nz: Bool, ge2: Bool, ge3: Bool, ge4: Bool): Bits = {
+    val oh = UIntToOh(off, 16)
+    val m  = Bits(19 bits)
+    def lane(k: Int): Bool = if (k >= 0 && k < 16) oh(k) else False
+    for (j <- 0 until 19)
+      m(j) := (lane(j) && nz) || (lane(j - 1) && ge2) ||
+              (lane(j - 2) && ge3) || (lane(j - 3) && ge4)
+    m
+  }
+
+  /** spanMask for an entry, whose covered byte count is a real 1..4 number. */
+  def spanMaskOfCount(off: UInt, n: UInt): Bits =
+    spanMask(off, n =/= 0, n >= 2, n >= 3, n >= 4)
+
+  /** spanMask for the query, whose count comes straight from the size enum
+    * (1 / 2 / 4 -- never 3, so `ge3` collapses onto `ge4`). */
+  def spanMaskOfSize(off: UInt, s: Size.C): Bits = {
+    val isLong = s === Size.LONG
+    spanMask(off, True, s =/= Size.BYTE, isLong, isLong)
   }
 
   // ---- SSW-encoded access size (00=byte,01=word,10=long), mirrors LsEuPlugin's
@@ -348,26 +440,51 @@ class StoreQueue(depth: Int = 8) extends Component {
   // aligned fast path, unchanged). Any overlap with slot B, or a partial overlap,
   // STALLS (the cross load waits for the store to drain to memory then re-reads).
   val q          = io.fwd.query
-  val qBytes     = sizeBytes(q.size)
+  // ── Query-side geometry: line + 19-bit byte-lane span. NO ARITHMETIC. ─────────
+  // `qLine` is a pure wire slice; `qSpan` is the two-LUT-level decode documented at
+  // `spanMask`. This is what replaces the old `qHi = q.paddr + qBytes` 32-bit adder
+  // that `b8346d1b` measured at 3 CARRY8 levels / 0.487ns of route at fanout 32 on
+  // the design's worst post-route path.
+  val qLine      = q.paddr(31 downto 4)
+  val qSpan      = spanMaskOfSize(q.paddr(3 downto 0), q.size)
+  val qMaskThis  = qSpan(15 downto 0)    // lanes the query covers in its OWN line
+  val qMaskNext  = qSpan(18 downto 16)   // lanes it spills into the FOLLOWING line
   val perEntry   = for (i <- 0 until depth) yield new Area {
     // committed(i): the ROB already retired this store -- unconditionally older
     // than any live query (see olderThan's comment above, case 1). Otherwise
     // fall back to the head-anchored compare (case 2).
     val ent      = valids(i) && (committed(i) || olderThan(robIds(i), q.robId))
-    val qLo      = q.paddr
-    val qHi      = q.paddr + qBytes
-    // slot A range. paddrHi is PRE-REGISTERED at alloc (= paddr + nbytesA), so the
-    // overlap test is a pure COMPARE here — no per-entry adder in the forward cone.
-    val aLo      = paddrs(i)
-    val aHi      = paddrHiAs(i)
-    val overlapA = ent && (qLo < aHi) && (aLo < qHi)
-    // slot B range (only when this entry is a split store); bHi pre-registered too.
-    val bLo      = paddrBs(i)
-    val bHi      = paddrHiBs(i)
-    val overlapB = ent && validBs(i) && (qLo < bHi) && (bLo < qHi)
+    // Slot lines. `lineA`/`lineB` are ALSO the operands of the `sameLine` term at the
+    // bottom of this Area, so the two 28-bit equality comparators below are shared
+    // with it rather than being new logic.
+    val lineA    = paddrs(i)(31 downto 4)
+    val lineB    = paddrBs(i)(31 downto 4)
+    val sameLineA = lineA === qLine
+    val sameLineB = lineB === qLine
+    // ── Overlap by line-equality + byte-lane mask intersection ────────────────
+    // An entry slot is confined to ONE line (invariant asserted at alloc), so it can
+    // meet the query in exactly two ways: inside the query's own line, or inside the
+    // NEXT line when the query spills across the boundary. `linePrev === qLine` is
+    // `line === qLine + 1` with the increment pre-registered at alloc.
+    // `maskA(2 downto 0)` is the only part that can meet a spill: the spill lands on
+    // lanes 0..2 of the next line by construction.
+    val geomA    = (sameLineA && (maskAs(i) & qMaskThis).orR) ||
+                   ((linePrevAs(i) === qLine) && (maskAs(i)(2 downto 0) & qMaskNext).orR)
+    val overlapA = ent && geomA
+    val geomB    = (sameLineB && (maskBs(i) & qMaskThis).orR) ||
+                   ((linePrevBs(i) === qLine) && (maskBs(i)(2 downto 0) & qMaskNext).orR)
+    val overlapB = ent && validBs(i) && geomB
     val overlap  = overlapA || overlapB
-    // full overlap = exact addr+size against slot A of a NON-split store.
-    val full     = overlapA && !validBs(i) && (aLo === qLo) && (nbytesAs(i) === qBytes)
+    // full overlap = exact addr+size against slot A of a NON-split store. Both masks
+    // are a CONTIGUOUS run starting at the access offset, so mask equality is exactly
+    // "same offset AND same length"; combined with line equality that is `aLo === qLo
+    // && nbytesA === qBytes`. Comparing the FULL 19-bit span (the entry mask
+    // zero-extended, since an entry never spills) additionally forces `qMaskNext === 0`
+    // -- i.e. a line-crossing query can never be a full forward, which is exactly what
+    // the old form gave too (an entry at the same address with the same length would
+    // itself have been split, hence `validB`, hence excluded).
+    val geomFull = !validBs(i) && sameLineA && (maskAs(i).resize(19) === qSpan)
+    val full     = ent && geomFull
     val partial  = overlap && !full
     val inhibitedStore = ent &&
       ((cacheModes(i) === CacheMode.INHIBITED) ||
@@ -452,14 +569,74 @@ class StoreQueue(depth: Int = 8) extends Component {
     // them, and the routed netlist shows the shared `perEntry_0_qHi` net at fanout 32).
     // Corollary for future A/Bs on this design: attribute area by cell-name localisation,
     // not by the design total -- a ~12-LUT change measured as +2.3% of the whole device.
-    val lineA    = paddrs(i)(31 downto 4)
-    val lineB    = paddrBs(i)(31 downto 4)
-    val qLine    = q.paddr(31 downto 4)
+    // (HISTORICAL from here up: the `qHi` adder that paragraph discusses no longer
+    // exists at all -- the byte-lane-mask rework above deleted it, which was exactly
+    // the follow-up `b8346d1b` left standing. The hoisting experiment's conclusion
+    // still holds for the remaining duplicated query-side terms.)
+    //
+    // (`lineA`/`lineB`/`sameLineA`/`sameLineB`/`qLine` are declared at the top of this
+    // Area now -- the overlap test shares the very same equality comparators.)
     val sameLine = ent && (
-      ((lineA === qLine) && (cacheModes(i) =/= CacheMode.COPYBACK)) ||
-      (validBs(i) && (lineB === qLine) && (cacheModesB(i) =/= CacheMode.COPYBACK))
+      (sameLineA && (cacheModes(i) =/= CacheMode.COPYBACK)) ||
+      (validBs(i) && sameLineB && (cacheModesB(i) =/= CacheMode.COPYBACK))
     )
   }
+  // ── Forward-overlap equivalence tripwire: pin the mask scheme to the OLD test ───
+  // Re-evaluates the ORIGINAL magnitude-comparator forms
+  //     overlapA = (qLo < aHi) && (aLo < qHi)     aHi = paddr  + nbytesA
+  //     overlapB = (qLo < bHi) && (bLo < qHi)     bHi = paddrB + nbytesB
+  //     full     = overlapA && !validB && (aLo === qLo) && (nbytesA === qBytes)
+  // against the sim-only shadow registers, and asserts the new line+mask derivation
+  // agrees, for every RESIDENT entry, every cycle -- not only when a query is actually
+  // live, since `io.fwd.query` is driven unconditionally from the LS-EU and the extra
+  // coverage is free. The `ent` age qualifier is deliberately NOT applied: it is
+  // untouched by this task and excluding it makes the check strictly sharper.
+  //
+  // ONE DELIBERATE, DOCUMENTED DEVIATION, hence the `noWrap` guard. The old form
+  // computed `aHi`/`qHi` with SpinalHDL's 32-bit `+` (carry-out dropped), so an access
+  // touching the last bytes of the 32-bit address space wrapped its upper bound to a
+  // SMALL value and the `<` test then reported NO overlap -- a missed forward/hazard
+  // for e.g. a byte store at 0xFFFFFFFF. The mask form is modular in the line number
+  // and has no such hole: it reports the overlap correctly. That is strictly safer
+  // (an extra detected hazard is a stall or an exact full forward, never wrong data),
+  // but it IS a difference, so the assert excludes the wrapping case rather than
+  // pretending it does not exist. Nothing in this design places memory there; if a
+  // future test does, this comment is the reason the tripwire stays quiet.
+  GenerationFlags.simulation {
+    val qBytesRef = sizeBytes(q.size)
+    val qHiRef    = q.paddr + qBytesRef
+    val qWrap     = (q.paddr +^ qBytesRef).msb
+    for (i <- 0 until depth) {
+      val e       = perEntry(i)
+      val aLoRef  = paddrs(i)
+      val bLoRef  = paddrBs(i)
+      val aWrap   = (aLoRef +^ fsNbytesA(i)).msb
+      val bWrap   = (bLoRef +^ fsNbytesB(i)).msb
+      val ovARef  = (q.paddr < fsPaddrHiA(i)) && (aLoRef < qHiRef)
+      val ovBRef  = (q.paddr < fsPaddrHiB(i)) && (bLoRef < qHiRef)
+      val fullRef = ovARef && !validBs(i) && (aLoRef === q.paddr) &&
+                    (fsNbytesA(i) === qBytesRef)
+      when(valids(i) && !qWrap) {
+        when(!aWrap) {
+          assert(e.geomA === ovARef,
+            "StoreQueue: slot-A line+mask overlap disagrees with the magnitude-comparator " +
+            "shadow -- store-to-load forwarding geometry has drifted",
+            FAILURE)
+          assert(e.geomFull === fullRef,
+            "StoreQueue: slot-A full-forward line+mask test disagrees with the " +
+            "magnitude-comparator shadow -- a forward would return the wrong bytes",
+            FAILURE)
+        }
+        when(validBs(i) && !bWrap) {
+          assert(e.geomB === ovBRef,
+            "StoreQueue: slot-B line+mask overlap disagrees with the magnitude-comparator " +
+            "shadow -- split-store forwarding geometry has drifted",
+            FAILURE)
+        }
+      }
+    }
+  }
+
   // youngest older overlapping entry: among ALL overlapping matches (full OR
   // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
   // whether that youngest-overlapping entry is a FULL overlap. A clean forward is
@@ -540,18 +717,27 @@ class StoreQueue(depth: Int = 8) extends Component {
     paddrs(tail)    := io.alloc.payload.paddr
     datas(tail)     := io.alloc.payload.data
     sizes(tail)     := io.alloc.payload.size
-    nbytesAs(tail)  := io.alloc.payload.nbytesA
-    // PRE-REGISTER the slot-A upper byte-range bound (= paddr + nbytesA). This `+`
-    // yields a 32-bit result (carry-out dropped), bit-identical to the old forward-
-    // path `paddrs(i) + nbytesAs(i)` — the adder now lives at alloc (once/cycle, off
-    // the forward cone) instead of per-entry in the binding s2Paddr->fwdData path.
-    paddrHiAs(tail) := io.alloc.payload.paddr + io.alloc.payload.nbytesA
     useStrbAs(tail) := io.alloc.payload.useStrbA
     validBs(tail)   := io.alloc.payload.validB
     paddrBs(tail)   := io.alloc.payload.paddrB
-    nbytesBs(tail)  := io.alloc.payload.nbytesB
-    // PRE-REGISTER the slot-B upper byte-range bound (= paddrB + nbytesB), same as A.
-    paddrHiBs(tail) := io.alloc.payload.paddrB + io.alloc.payload.nbytesB
+    // PRE-REGISTER the forward-overlap geometry (this task): the byte-lane mask of
+    // each slot within its resident line, and that line MINUS ONE (so the query's
+    // cross-boundary spill test needs no incrementer in the forward cone). All of it
+    // is a pure function of the alloc payload, evaluated once per cycle here instead
+    // of 8x per query in the binding p4Ctx_fwdHit -> p4Ctx_fwdData path.
+    // Slot A: `nbytesA` is 1..4 and never crosses the line (asserted below).
+    maskAs(tail)     := spanMaskOfCount(io.alloc.payload.paddr(3 downto 0),
+                                        io.alloc.payload.nbytesA)(15 downto 0)
+    linePrevAs(tail) := io.alloc.payload.paddr(31 downto 4) - 1
+    // Slot B: line-aligned by construction (LsEuPlugin's `addrB = (va & ~15) + 16`,
+    // whose page offset survives translation verbatim), 1..3 bytes. Forced to an
+    // empty mask when this is not a split store, so the mask alone can never claim
+    // an overlap for a slot that does not exist.
+    maskBs(tail)     := Mux(io.alloc.payload.validB,
+                            spanMaskOfCount(io.alloc.payload.paddrB(3 downto 0),
+                                            io.alloc.payload.nbytesB)(15 downto 0),
+                            B(0, 16 bits))
+    linePrevBs(tail) := io.alloc.payload.paddrB(31 downto 4) - 1
     // (strbA/lineDataA/strbB/lineDataB no longer stored -- derived at drain, task #252.)
     vaddrAs(tail)     := io.alloc.payload.vaddr
     vaddrBs(tail)     := io.alloc.payload.vaddrB
@@ -559,7 +745,46 @@ class StoreQueue(depth: Int = 8) extends Component {
     cacheModesB(tail) := io.alloc.payload.cacheModeB
     supervisors(tail) := io.alloc.payload.supervisor
     precises(tail)    := io.alloc.payload.precise
+    // Drive the sim-only shadow of the deleted magnitude-comparator geometry, in the
+    // deleted code's exact form (`paddr + nbytes`, 32-bit, carry-out dropped).
+    GenerationFlags.simulation {
+      fsNbytesA(tail)  := io.alloc.payload.nbytesA
+      fsNbytesB(tail)  := io.alloc.payload.nbytesB
+      fsPaddrHiA(tail) := io.alloc.payload.paddr  + io.alloc.payload.nbytesA
+      fsPaddrHiB(tail) := io.alloc.payload.paddrB + io.alloc.payload.nbytesB
+    }
     tail := tail + 1
+  }
+
+  // ── The "each slot lives inside ONE 16-byte cache line" invariant, MACHINE-CHECKED ──
+  // The whole line-equality + mask-intersection scheme rests on this, so it is asserted
+  // at the boundary it enters the design rather than argued in a comment. It holds by
+  // construction in LsEuPlugin: `nbytesA = twoAccess ? (16 - stOff) : sizeBytes`, and
+  // `twoAccess` itself requires `stOff + sizeBytes > 16` with sizeBytes <= 4, i.e.
+  // stOff >= 13, so `16 - stOff` is 1..3 and never exceeds 3 bits; slot B is the
+  // line-aligned `addrB = (va & ~15) + 16` whose page offset survives translation
+  // verbatim, carrying the 1..3 spilled bytes. A future EA/size change that broke
+  // either property would silently under-detect forwarding hazards, so this fires
+  // loudly instead.
+  GenerationFlags.simulation {
+    when(io.alloc.valid && !io.flush) {
+      assert(io.alloc.payload.nbytesA =/= 0 && io.alloc.payload.nbytesA <= 4,
+        "StoreQueue: slot-A byte count outside 1..4 -- byte-lane mask cannot represent it",
+        FAILURE)
+      assert((io.alloc.payload.paddr(3 downto 0) +^ io.alloc.payload.nbytesA) <= 16,
+        "StoreQueue: slot A crosses a 16-byte cache line -- the forward byte-lane mask " +
+        "assumes each SQ slot is line-confined",
+        FAILURE)
+      when(io.alloc.payload.validB) {
+        assert(io.alloc.payload.nbytesB =/= 0 && io.alloc.payload.nbytesB <= 4,
+          "StoreQueue: slot-B byte count outside 1..4 -- byte-lane mask cannot represent it",
+          FAILURE)
+        assert((io.alloc.payload.paddrB(3 downto 0) +^ io.alloc.payload.nbytesB) <= 16,
+          "StoreQueue: slot B crosses a 16-byte cache line -- the forward byte-lane mask " +
+          "assumes each SQ slot is line-confined",
+          FAILURE)
+      }
+    }
   }
 
   // ---- drain handshake: accepted send cursor + in-order ack cursor -----------

@@ -223,4 +223,100 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       cd.waitSampling(2)
     }
   }
+
+  // ── Exhaustive byte-level forward-geometry sweep ────────────────────────────
+  // The forward overlap test is a line-equality + byte-lane mask intersection (the
+  // masks pre-registered at alloc), replacing the 32-bit magnitude comparators that
+  // used to put a `q.paddr + qBytes` CARRY8 adder on the design's worst post-route
+  // path. Store-to-load forwarding fails SILENTLY when it is wrong (wrong bytes, not
+  // a crash), so the replacement is proven two ways at once:
+  //
+  //   1. StoreQueue's own permanent `GenerationFlags.simulation` tripwire re-evaluates
+  //      the ORIGINAL magnitude-comparator form against sim-only shadow registers and
+  //      asserts agreement on every cycle for every resident entry. It is armed
+  //      throughout this sweep (M68kSim sets `includeSimulation`), so every one of the
+  //      cases below is ALSO an internal-equivalence check, not only an I/O check.
+  //   2. This test independently re-derives the EXPECTED hit/stall/data from an
+  //      interval model in Scala and checks the module's real outputs against it.
+  //
+  // The sweep is exhaustive over the whole geometry space rather than a hand-picked
+  // list, so it contains by construction every class this replacement could plausibly
+  // break: byte-level partial overlaps at a line boundary; adjacent-but-disjoint
+  // same-line accesses; exact full overlap (the only forwarding case); a line-crossing
+  // QUERY meeting slot A, slot B, or neither (the query is the one operand that is NOT
+  // line-confined -- it is what forces the 19-bit two-line span mask); and a
+  // line-crossing STORE's two slots against every query in the neighbourhood.
+  private def sweepOverlap(aLo: Long, n: Int, qLo: Long, nq: Int): Boolean =
+    n > 0 && (qLo < aLo + n) && (aLo < qLo + nq)
+
+  test("forward geometry: exhaustive byte-level sweep vs an interval model", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false          // nothing may drain out from under the sweep
+      dut.io.robHeadIn #= 0
+      val stLine  = 0x1000L                // line 0x100, far from the 2^32 wrap
+      val stData  = 0xCAFEBABEL
+      val sizes   = Seq((Size.BYTE, 1), (Size.WORD, 2), (Size.LONG, 4))
+      var checked = 0
+
+      for ((stSize, stN) <- sizes; stOff <- 0 until 16) {
+        val paddrA  = stLine + stOff
+        val split   = stOff + stN > 16
+        val nbytesA = if (split) 16 - stOff else stN
+        val paddrB  = stLine + 16
+        val nbytesB = if (split) stN - nbytesA else 0
+
+        // Uncommitted store at robId 4; every query below uses robId 6, so `ent` comes
+        // from the head-anchored age compare (robHeadIn = 0) with no drain exposure.
+        val a = dut.io.alloc
+        a.valid #= true
+        a.payload.robId #= 4
+        a.payload.paddr #= paddrA;  a.payload.vaddr #= paddrA
+        a.payload.data #= stData;   a.payload.size #= stSize
+        a.payload.nbytesA #= nbytesA
+        a.payload.useStrbA #= split
+        a.payload.validB #= split
+        a.payload.paddrB #= (if (split) paddrB else 0L)
+        a.payload.vaddrB #= (if (split) paddrB else 0L)
+        a.payload.nbytesB #= nbytesB
+        a.payload.cacheMode  #= m68k040.cache.CacheMode.WRITETHROUGH
+        a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
+        a.payload.supervisor #= false
+        a.payload.precise #= false
+        cd.waitSampling()
+        a.valid #= false
+
+        for (qDeltaLine <- Seq(-1, 0, 1); (qSize, qN) <- sizes; qOff <- 0 until 16) {
+          val qPaddr = stLine + qDeltaLine * 16 + qOff
+          setQuery(dut, robId = 6, paddr = qPaddr, size = qSize)
+          cd.waitSampling(); sleep(1)
+
+          val ovA      = sweepOverlap(paddrA, nbytesA, qPaddr, qN)
+          val ovB      = split && sweepOverlap(paddrB, nbytesB, qPaddr, qN)
+          val full     = ovA && !split && paddrA == qPaddr && nbytesA == qN
+          val partial  = (ovA || ovB) && !full
+          // WRITETHROUGH on both halves here, so the sameLine stall is NOT scoped out
+          // (the COPYBACK narrowing of `9130a0b2` is exercised by its own tests).
+          val sameLine = ((paddrA >> 4) == (qPaddr >> 4)) ||
+                         (split && ((paddrB >> 4) == (qPaddr >> 4)))
+          val expHit   = full
+          val expStall = (partial || sameLine) && !full
+
+          val what = f"store ${if (split) "SPLIT" else "aligned"} $stSize%s @+$stOff%d " +
+                     f"(A=$paddrA%x/$nbytesA%d B=$paddrB%x/$nbytesB%d) vs load $qSize%s @$qPaddr%x"
+          assert(dut.io.fwd.rsp.hit.toBoolean == expHit,   s"hit mismatch: $what")
+          assert(dut.io.fwd.rsp.stall.toBoolean == expStall, s"stall mismatch: $what")
+          if (expHit)
+            assert(dut.io.fwd.rsp.data.toLong == stData, s"forward data mismatch: $what")
+          checked += 1
+        }
+
+        // Squash the uncommitted entry and move to the next store geometry.
+        dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false
+        cd.waitSampling()
+      }
+      assert(checked == 48 * 144, s"sweep coverage regressed: only $checked cases run")
+      cd.waitSampling(2)
+    }
+  }
 }
