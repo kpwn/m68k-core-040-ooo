@@ -52,4 +52,53 @@ class FreelistSpec extends AnyFunSuite {
       assert(seen, "pushed id 5 should become poppable")
     }
   }
+
+  // freelist-flush-invariant campaign: this component's push-consumption block is
+  // gated `when(initDone && !io.flush)` (see Freelist.scala), so a push offered on
+  // the SAME cycle io.flush is high is silently dropped -- the pushed id never
+  // enters the ring. At the raw Freelist IO level nothing stops a caller from
+  // driving push+flush concurrently (Freelist has no notion of "legitimate
+  // commit"), so this test documents that CURRENT, EXPECTED raw behavior directly
+  // rather than asserting it can never be poked.
+  //
+  // This combination is NOT reachable from real commit traffic in the integrated
+  // core: RenameStage wires Freelist.io.push(k).valid directly from
+  // `commitPorts(k).valid && commitPorts(k).<x>Write`, and RobPlugin.scala's
+  // `headReady` (which gates EVERY producer of commitPorts(k).valid -- both the
+  // driveCommit/retire0/retire1 path and the sysOp-read/sysTriggerSig path) ANDs
+  // in `!flushing` directly. `flushing` is the exact same wire RenameStage forwards
+  // to Freelist.io.flush (`rc.flushPort := flushing`), so `commitPorts(k).valid &&
+  // flushing` is architecturally unreachable by construction, not merely by a
+  // retire-ordering convention (branch-mispredict commit landing the cycle before
+  // doFlushReg asserts, excSquash occupying the ROB head for its whole run). See
+  // RobPlugin.scala's `headReady` definition and the `GenerationFlags.simulation {
+  // assert(...) }` immediately after `rc.flushPort := flushing`, which pins that
+  // upstream guarantee so a future commit path that bypasses `headReady` trips
+  // there instead of silently leaking a physreg here.
+  test("push concurrent with flush is dropped at the raw component level (documents the invariant)", VerilatorTest) {
+    M68kSim().withVerilator.compile(mk).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      dut.io.flush #= false; dut.io.pop.foreach(_.take #= false); dut.io.push.foreach(_.valid #= false)
+      dut.clockDomain.waitSamplingWhere(dut.io.popReady.toBoolean)   // wait for init to finish
+      val countBefore = dut.count.toInt
+      // Drive a push (id 5, never yet freed) on the SAME cycle flush is asserted.
+      dut.io.push(0).valid #= true; dut.io.push(0).payload #= 5
+      dut.io.flush #= true
+      dut.clockDomain.waitSampling()
+      dut.io.push(0).valid #= false; dut.io.flush #= false; sleep(1)
+      // count is unchanged (the push never landed) -- the raw component silently
+      // dropped it, exactly as Freelist.scala's push-gate comment documents.
+      assert(dut.count.toInt == countBefore,
+        s"push concurrent with flush should be dropped at the raw component level: " +
+        s"count before=$countBefore after=${dut.count.toInt}")
+      // id 5 never becomes poppable (it was never actually returned to the pool).
+      var seen = false; var i = 0
+      while (!seen && i < 60) {
+        if (dut.io.pop(0).id.toInt == 5) seen = true
+        else { dut.io.pop(0).take #= true; dut.clockDomain.waitSampling(); dut.io.pop(0).take #= false; sleep(1) }
+        i += 1
+      }
+      assert(!seen, "dropped push must NOT have silently entered the ring")
+    }
+  }
 }
