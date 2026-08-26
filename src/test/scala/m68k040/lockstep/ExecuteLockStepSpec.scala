@@ -895,6 +895,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         if (sys.env.contains("CR_STALL") && guard > cap - 40) {
           println(f"[$name] STALL g=$guard committed=${handle.result.size} ucAct=${dut.dec.logic.ucActive.toBoolean} ucPend=${dut.dec.logic.ucPendValid.toBoolean} ucPc=${dut.dec.logic.ucPc.toInt} robHead=${dut.rob.logic.head.toInt} robCount=${dut.rob.logic.count.toInt} exc=${dut.rob.logic.excActive.toBoolean} vec=${dut.rob.logic.exc.curVec.toInt} excPc=0x${dut.rob.logic.exc.curPc.toLong & 0xffffffffL}%08x")
           if (guard == cap) {
+            // Aligned load descriptor ring — the split-load (misaligned) path lives
+            // here, and a SEND-side hold that never releases wedges the whole core
+            // (the misaligned-MOVEM deadlock). Dumps enough to tell "waiting on the
+            // bus" from "the send-hold latched onto the wrong entry". Printed BEFORE
+            // the SQ dump below, which reads `sq.count` — a signal that is NOT
+            // simPublic, so it throws UNACCESSIBLE SIGNAL and would otherwise abort
+            // the whole stall dump before anything useful was printed.
+            val l = dut.lsEu.logic
+            println(f"[$name] LDRING push=${l.alignedPushPtr.toInt} send=${l.alignedSendPtr.toInt} rsp=${l.alignedRspPtr.toInt} count=${l.alignedCount.toInt} sendHeld=${l.alignedSendHeld.toBoolean} sendValid=${l.alignedSendValid.toBoolean} rspFire=${l.alignedRspFire.toBoolean}")
+            for (i <- 0 until 4) {
+              println(f"[$name] LDRING[$i] v=${l.alignedValid(i).toBoolean} sent=${l.alignedSent(i).toBoolean} two=${l.alignedMem(i).twoAccess.toBoolean} second=${l.alignedMem(i).splitSecond.toBoolean}")
+            }
             val q = dut.lsEu.logic.sq
             println(f"[$name] SQ head=${q.head.toInt} tail=${q.tail.toInt} count=${q.count.toInt}")
             for (i <- 0 until 8) {
@@ -6392,6 +6404,96 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x300c,%a0 ; movem.l %d0/%d1/%d2,-(%a0) ; movem.l (%a0)+,%d3/%d4/%d5 ; move.l %a0,%d6 ; " +
       "add.l %d4,%d3 ; add.l %d5,%d3 ; " +
       ".stop: bra .stop", nInstr = 9, checkMem = Seq(0x3000L, 0x3004L, 0x3008L))   // A0=D6=0x300C
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // MISALIGNED-BASE MOVEM.L — the HARDWARE-CONFIRMED DEADLOCK class (2026-08-26).
+  //
+  // On real silicon `MOVEM.L (SP)+,<7 regs>` at PC 0x40815646 with ISP = 0x0017FFBA
+  // (2 mod 4) wedged the core permanently — zero retirement, zero bus traffic —
+  // while the SAME instruction at the SAME PC with ISP forced to 0x0017FFB8
+  // (4-aligned) ran fine. Reproduced 6x over 5 boots. See
+  // docs/BUG_movem_misaligned_postinc_deadlock.md in the SoC repo.
+  //
+  // WHY IT WAS NEVER CAUGHT: every pre-existing MOVEM case above uses a
+  // 4-byte-aligned literal base, and `LsEuSplitRingSpec` drives split loads
+  // DIRECTLY rather than through the MOVEM FSM's back-to-back uop stream. A MOVEM.L
+  // walking a 2-mod-4 base produces exactly the mix nothing else generates: line
+  // offsets 10,14,2,6,10,14,2 — i.e. a MIXTURE of ordinary loads and split (line-
+  // crossing, offset 13/14/15) loads pushed back to back into the 4-deep aligned
+  // descriptor ring. That mixture is what wraps the ring's push pointer onto a
+  // split pair's own slot-A index while slot B is still unsent.
+  //
+  // ARCHITECTURALLY these are all legal: the 68020+ (and therefore the 68040)
+  // removed the 68000/68010 address error for misaligned DATA accesses entirely —
+  // an address error on a 68040 comes only from an odd INSTRUCTION address. So a
+  // MOVEM.L at ANY of the four mod-4 residues must simply execute, taking the
+  // core's own split-transfer path for the halves that cross a line. Musashi (the
+  // oracle) agrees, which is exactly why lock-step is the right gate for this.
+  //
+  // Program shape (identical across the four residues, only the base changes):
+  // seed D0-D6 with 7 distinct values, MOVEM.L predec-STORE them (which also
+  // exercises the misaligned STORE direction), zero D0-D6, MOVEM.L postinc-LOAD
+  // them back, then ADD-fold every reloaded register into D0 — the reloads are
+  // dropped crack µops, so the folds are what actually compare them vs Musashi.
+  // `move.l %a1,%d7` is the kept An-update step. checkMem verifies the whole
+  // 28-byte misaligned store image.
+  // ══════════════════════════════════════════════════════════════════════════════
+  private val movemMisalignedSeed =
+    "move.l #0x00010000,%d0 ; move.l #0x00020001,%d1 ; move.l #0x00030002,%d2 ; move.l #0x00040003,%d3 ; " +
+    "move.l #0x00050004,%d4 ; move.l #0x00060005,%d5 ; move.l #0x00070006,%d6 ; "
+  private val movemMisalignedTail =
+    "moveq #0,%d0 ; moveq #0,%d1 ; moveq #0,%d2 ; moveq #0,%d3 ; moveq #0,%d4 ; moveq #0,%d5 ; moveq #0,%d6 ; " +
+    "movem.l (%a1)+,%d0-%d6 ; " +
+    "add.l %d1,%d0 ; add.l %d2,%d0 ; add.l %d3,%d0 ; add.l %d4,%d0 ; add.l %d5,%d0 ; add.l %d6,%d0 ; " +
+    "move.l %a1,%d7 ; " +
+    ".stop: bra .stop"
+
+  /** 7-register MOVEM.L predec-store + postinc-load round trip at `loadBase`
+    * (== `predecBase - 28`). 24 retired instructions, 28-byte memory image check. */
+  private def movemMisalignedRoundTrip(name: String, predecBase: Long): Unit =
+    runLockStep(name,
+      movemMisalignedSeed +
+      f"move.l #0x$predecBase%04x,%%a1 ; movem.l %%d0-%%d6,-(%%a1) ; " +
+      movemMisalignedTail,
+      nInstr = 24, checkMem = Seq(predecBase - 28), checkSpan = 28)
+
+  // mod 0 CONTROL arm: base 0x300C, line offsets 12,0,4,8,12,0,4 -> no load ever
+  // crosses a line, so nothing takes the split path. Must pass before AND after the
+  // fix; if this one ever fails the problem is not the split ring.
+  test("lock-step: MOVEM.L round trip, base 0 mod 4 (aligned control)", VerilatorTest) {
+    movemMisalignedRoundTrip("movem-l-misaligned-mod0", 0x3028L)   // load base 0x300C
+  }
+
+  // mod 1: base 0x3009, line offsets 9,13,1,5,9,13,1 -> the offset-13 loads split.
+  test("lock-step: MOVEM.L round trip, base 1 mod 4 (odd, splits at offset 13)", VerilatorTest) {
+    movemMisalignedRoundTrip("movem-l-misaligned-mod1", 0x3025L)   // load base 0x3009
+  }
+
+  // mod 2: base 0x300A, line offsets 10,14,2,6,10,14,2 -> the offset-14 loads split.
+  // THIS IS THE EXACT HARDWARE-WEDGE SHAPE (ISP 0x0017FFBA is 10 mod 16, 7 registers).
+  test("lock-step: MOVEM.L round trip, base 2 mod 4 (the HW-wedge shape)", VerilatorTest) {
+    movemMisalignedRoundTrip("movem-l-misaligned-mod2", 0x3026L)   // load base 0x300A
+  }
+
+  // mod 3: base 0x300B, line offsets 11,15,3,7,11,15,3 -> the offset-15 loads split.
+  test("lock-step: MOVEM.L round trip, base 3 mod 4 (odd, splits at offset 15)", VerilatorTest) {
+    movemMisalignedRoundTrip("movem-l-misaligned-mod3", 0x3027L)   // load base 0x300B
+  }
+
+  // SHORT register list at a misaligned base — the bug investigation's own suggested
+  // minimal repro (`movem.l (%a0)+,%d3/%d4/%d5` off a 2-mod-4 base), and the small-list
+  // corner of the residue matrix above (which uses 7 registers). The base is chosen so
+  // the VERY FIRST transfer splits (line offset 14), rather than the 3rd as above:
+  // predec store from 0x301A leaves A0 = 0x300E, loads run 0x300E(14, split), 0x3012(2),
+  // 0x3016(6). Same shape as `movem-l-postinc-load` otherwise, so a diff against that
+  // test isolates the alignment variable alone.
+  test("lock-step: MOVEM.L (An)+ 3-register load, base 2 mod 4, first transfer splits", VerilatorTest) {
+    runLockStep("movem-l-postinc-load-misaligned",
+      "move.l #0x0a0a0a0a,%d0 ; move.l #0x0b0b0b0b,%d1 ; move.l #0x0c0c0c0c,%d2 ; " +
+      "move.l #0x301a,%a0 ; movem.l %d0/%d1/%d2,-(%a0) ; movem.l (%a0)+,%d3/%d4/%d5 ; move.l %a0,%d6 ; " +
+      "add.l %d4,%d3 ; add.l %d5,%d3 ; " +
+      ".stop: bra .stop", nInstr = 9, checkMem = Seq(0x300eL, 0x3012L, 0x3016L))   // A0=D6=0x301A
   }
 
   // MOVEM.W load SIGN-EXTENDS the loaded word to the full 32-bit register (Musashi

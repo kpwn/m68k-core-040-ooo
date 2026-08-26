@@ -286,4 +286,81 @@ class LsEuSplitRingSpec extends AnyFunSuite {
         s"inhibited split load merged result: got ${readInt(dut, 24).toString(16)} exp ${expected(addr, 4).toString(16)}")
     }
   }
+
+  /** REGRESSION (hardware-confirmed deadlock, 2026-08-26): a split pair followed by a
+    * BURST of ordinary loads must not wedge the send-side hold.
+    *
+    * `alignedSendHeld` used to ask "is the slot physically behind me still valid?" as a
+    * proxy for "is my own slot A still pending?". Once slot A pops, its INDEX is free,
+    * and with the ring full `alignedPushPtr === alignedRspPtr`, so the very push that
+    * `alignedCanEnq`'s `|| alignedRspFire` term permits on the pop cycle lands a NEW,
+    * unrelated ordinary descriptor on slot A's index -- re-asserting the proxy and
+    * holding slot B forever. Sends are in order (blocked at slot B) and responses are in
+    * order (blocked on the unsent slot B), so the ring wedges FULL and the core stops
+    * retiring entirely.
+    *
+    * This test builds that state directly: one split load, then eight ordinary loads
+    * issued back to back with no waiting, which keeps the ring saturated across slot A's
+    * response. On the broken RTL nothing ever completes past the split; on the fixed RTL
+    * all nine complete with correct data.
+    *
+    * `ExecuteLockStepSpec`'s "MOVEM.L round trip, base N mod 4" matrix covers the same
+    * defect end to end (a MOVEM.L off a non-longword-aligned base generates exactly this
+    * split/ordinary mixture); this one pins the mechanism at the ring itself so a future
+    * regression is localised immediately instead of surfacing as "the core stopped".
+    */
+  test("split load + ordinary-load burst: a ring wrap onto slot A's index must not wedge the send-hold", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val nOrdinary = 8
+      val splitBase = 0x2000L + 14        // LONG spans 0x200E..0x2011 -> cross-line -> split pair
+      preload(mem, 0x2000L, 32)
+      val ordBases = (0 until nOrdinary).map(i => 0x4000L + i * 0x100L)
+      ordBases.foreach(b => preload(mem, b, 16))
+      seed(dut, cd, preg = 10, value = splitBase)
+      ordBases.zipWithIndex.foreach { case (b, i) => seed(dut, cd, preg = 11 + i, value = b) }
+
+      var completed = Set.empty[Int]
+      val watching = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork {
+        while (watching.get()) {
+          if (dut.src.logic.cValid.toBoolean) completed += dut.src.logic.cRob.toInt
+          cd.waitSampling()
+        }
+      }
+      // The issuer runs in its OWN thread on purpose: `issueLoad` blocks on
+      // `waitSamplingWhere(iReady)`, so on the broken RTL it would block forever and the
+      // test would HANG instead of failing with a usable diagnosis.
+      fork {
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 1)
+        for (i <- 0 until nOrdinary)
+          issueLoad(dut, cd, basePreg = 11 + i, disp = 0, Size.LONG, pdst = 21 + i, robId = 2 + i)
+      }
+
+      val expectAll = nOrdinary + 1
+      var n = 0
+      while (completed.size < expectAll && n < 3000) { cd.waitSampling(); n += 1 }
+      watching.set(false)
+      cd.waitSampling(2)
+
+      val l = dut.eu.logic
+      val ring = (0 until 4).map(i =>
+        s"[$i] v=${l.alignedValid(i).toBoolean} sent=${l.alignedSent(i).toBoolean} " +
+        s"two=${l.alignedMem(i).twoAccess.toBoolean} second=${l.alignedMem(i).splitSecond.toBoolean}").mkString(" ")
+      assert(completed.size == expectAll,
+        s"only ${completed.size}/$expectAll loads completed in $n cycles (missing " +
+        s"${(1 to expectAll).filterNot(completed).mkString(",")}) -- the aligned ring wedged. " +
+        s"push=${l.alignedPushPtr.toInt} send=${l.alignedSendPtr.toInt} rsp=${l.alignedRspPtr.toInt} " +
+        s"count=${l.alignedCount.toInt} sendHeld=${l.alignedSendHeld.toBoolean} " +
+        s"sendValid=${l.alignedSendValid.toBoolean} ring: $ring")
+
+      cd.waitSampling(4)
+      assert(readInt(dut, 20) == expected(splitBase, 4),
+        s"split load merged result: got ${readInt(dut, 20).toString(16)} exp ${expected(splitBase, 4).toString(16)}")
+      ordBases.zipWithIndex.foreach { case (b, i) =>
+        assert(readInt(dut, 21 + i) == expected(b, 4),
+          f"ordinary load $i (0x$b%x): got ${readInt(dut, 21 + i).toString(16)} exp ${expected(b, 4).toString(16)}")
+      }
+    }
+  }
 }

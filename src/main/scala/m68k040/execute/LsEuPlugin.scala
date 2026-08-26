@@ -752,11 +752,19 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // and completes the instruction). Both halves of one pair are ALWAYS pushed
     // atomically at `alignedPushPtr`/`alignedPushPtr+1`, so they are always
     // physically contiguous in ring order -- nothing can ever be pushed between
-    // them. That invariant is what the send-side hold (`alignedSendHeld` below)
-    // and the response-side pairing (`alignedRspIsSplitA`/abort logic below) both
-    // lean on: slot B's own predecessor-by-index is PROVABLY always its own slot A,
-    // never an unrelated entry (see the long design comment in the task's commit
-    // message for the full proof). This replaces the old design where a split
+    // them. That invariant is what the response-side pairing
+    // (`alignedRspIsSplitA` / the `alignedRspAbortsPair` cancel, which reaches slot B
+    // as `alignedRspPtr + 1`) leans on, and it is sound there because slot B provably
+    // cannot have popped before its own slot A, so index `rspPtr + 1` is still slot B.
+    //
+    // It is NOT, however, sound in the other direction: "the entry at slot B's index
+    // MINUS one is its slot A" is FALSE, because once slot A pops its index is free
+    // and a newer, unrelated descriptor can be pushed onto it while slot B is still
+    // unsent. The send-side hold (`alignedSendHeld` below) originally made exactly
+    // that mistake and deadlocked the core on real hardware; it now tests the
+    // POINTERS (`alignedRspPtr =/= alignedSendPtr`) instead. See the full proof and
+    // the hardware repro in the comment on `alignedSlotAPending` below.
+    // This replaces the old design where a split
     // access first drained the ENTIRE ring (`alignedEmpty`), then ran a completely
     // separate serial `bkFsm` (LAUNCH -> WAIT_A -> WAIT_B) outside the ring
     // entirely. `bkFsm`/`llReg`/`bkCtx`/`bkBusy` (declared above) are kept as
@@ -803,7 +811,52 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // captured line, which does not exist until slot A resolves. Ordinary
     // (non-split) entries are completely unaffected -- they pipeline normally, and
     // so does slot A of any pair (only slot B is ever held).
-    val alignedSendPrevValid = alignedValid(alignedSendPtr - 1)
+    //
+    // "Slot A has not been popped yet" is expressed as `alignedRspPtr =/= alignedSendPtr`,
+    // NOT as "the slot physically behind slot B is still valid".
+    //
+    // PROOF that the pointer form is exact. We are deciding whether to SEND the entry
+    // at `alignedSendPtr`, so that entry is by definition unsent. `alignedSendPtr`
+    // only ever advances past an entry that handshaked a command (`alignedCmdFire`),
+    // so slot A -- strictly older than slot B -- has necessarily been SENT. Responses
+    // are strict FIFO (the D-cache's in-order contract, stated above), and
+    // `alignedRspPtr` walks ring order monotonically, so `alignedRspPtr` reaches slot
+    // B's index if and only if every strictly-older entry, slot A included, has
+    // already popped. Hence: A pending <=> rspPtr =/= sendPtr. (The one place that
+    // moves `alignedSendPtr` non-monotonically, `alignedRspAbortsPair`, retires slot A
+    // and slot B TOGETHER, so `alignedSendPtr` can never land on a slot B whose slot A
+    // was skipped.)
+    //
+    // ---- WHY NOT THE POSITIONAL FORM (the bug this replaces) ----
+    // This used to read `alignedValid(alignedSendPtr - 1)`, i.e. "is the slot behind me
+    // still occupied". That is only a proxy for "my slot A is still pending", and the
+    // proxy BREAKS as soon as the ring wraps: once slot A pops, its INDEX is free and
+    // the very next push can land a brand-new, completely unrelated descriptor there --
+    // re-asserting `alignedValid(alignedSendPtr - 1)` and holding slot B forever.
+    // Nothing then ever sends (sends are in-order and blocked at slot B) and nothing
+    // ever responds (`alignedRspPtr` points at the unsent slot B), so the ring wedges
+    // FULL and the whole core stops retiring.
+    //
+    // The window is a single cycle wide and trivially reachable: with the ring full,
+    // `alignedPushPtr === alignedRspPtr`, and `alignedCanEnq` deliberately allows a
+    // push on a cycle where a response pops (`!alignedFull || alignedRspFire`). So on
+    // the exact cycle slot A's response fires, an ordinary load pushes onto slot A's
+    // own index -- and because the `alignedEnq` write comes AFTER the pop's
+    // `alignedValid(alignedRspPtr) := False` in this file, the push's `True` wins.
+    // Slot B, still held that same cycle (it reads the OLD `alignedValid`), never gets
+    // another chance.
+    //
+    // OBSERVED ON REAL HARDWARE: `MOVEM.L (SP)+,D1/D2/D4/D5/A0/A2/A3` at PC 0x40815646
+    // with ISP = 0x0017FFBA (2 mod 4) wedged a Q700 board permanently -- zero macro
+    // retirement, zero bus traffic -- while the same instruction with ISP forced to
+    // 0x0017FFB8 ran fine. A MOVEM.L walking a non-longword-aligned base is exactly the
+    // access stream that produces the required MIXTURE of split and ordinary loads:
+    // successive longwords land at line offsets 10,14,2,6,10,14,2..., so only every
+    // fourth one crosses a line. Reproduced in `ExecuteLockStepSpec`'s
+    // "MOVEM.L round trip, base N mod 4" matrix; the captured ring state at the wedge
+    // was push=send=rsp=1, count=4, entry[1] = an unsent slot B, entry[0] = an ORDINARY
+    // (twoAccess=False) descriptor sitting on the popped slot A's index.
+    val alignedSlotAPending = alignedRspPtr =/= alignedSendPtr
     // `alignedValid(alignedSendPtr)` is REQUIRED here, not redundant with
     // `alignedSendValid`'s own check below: this val is read unconditionally, and an
     // empty/never-yet-pushed ring slot's `AlignedLoadCtx` fields are an uninitialized
@@ -811,7 +864,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // `.twoAccess`/`.splitSecond` off an invalid slot without this guard let simulator
     // register randomization spuriously hold even an ORDINARY (non-split) send.
     val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
-                          alignedMem(alignedSendPtr).splitSecond && alignedSendPrevValid
+                          alignedMem(alignedSendPtr).splitSecond && alignedSlotAPending
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
                            !alignedSendHeld
@@ -830,6 +883,36 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     alignedCount.simPublic(); alignedFull.simPublic(); alignedEnq.simPublic()
     alignedSendValid.simPublic(); alignedRspFire.simPublic(); alignedEnqSplit.simPublic()
     alignedCanEnqSplit.simPublic(); alignedSendHeld.simPublic()
+    // Ring bookkeeping observability: needed to diagnose a SEND-side stall from a
+    // testbench (which entry is at the send/response head, and whether the slot
+    // physically behind slot B is still resident). Added when the misaligned-MOVEM
+    // ring-wrap deadlock was root-caused -- `ExecuteLockStepSpec`'s CR_STALL dump
+    // reads all of these. simPublic is name-preservation only, no hardware cost.
+    alignedSendPtr.simPublic(); alignedRspPtr.simPublic(); alignedPushPtr.simPublic()
+    alignedValid.foreach(_.simPublic()); alignedSent.foreach(_.simPublic())
+    alignedMem.foreach { e => e.twoAccess.simPublic(); e.splitSecond.simPublic() }
+    // ── DEADLOCK TRIPWIRE for the split-load send-hold ────────────────────────────
+    // Holding slot B is a WAIT ON SLOT A'S RESPONSE, so it is only ever legitimate
+    // while a command is genuinely outstanding on the bus. `alignedRspPtr` names the
+    // oldest un-popped entry; when slot B is held it is strictly older than slot B in
+    // ring order, and `alignedSendPtr` only advances past entries that handshaked a
+    // command -- so that entry MUST be both valid and already sent. If it is ever
+    // held while the response head is unsent, no command can complete (responses are
+    // in order) and no command can be issued (sends are in order and blocked at slot
+    // B): the ring is wedged, combinationally provable, with no timeout needed.
+    //
+    // This fires INSTANTLY on the exact hardware bug this replaced -- the captured
+    // wedge state was send=rsp=1 with `alignedSent(1) = False` -- so any future
+    // regression of the same class is caught by the first directed test that hits it
+    // rather than by a board that stops retiring. Simulation-only: pruned from every
+    // synthesised netlist.
+    GenerationFlags.simulation {
+      assert(!(alignedSendHeld && !(alignedValid(alignedRspPtr) && alignedSent(alignedRspPtr))),
+        "LsEuPlugin: split-load slot B is send-held while the aligned-ring response head " +
+        "is not an outstanding (valid+sent) entry -- the hold has latched onto something " +
+        "that can never resolve; the ring is deadlocked",
+        FAILURE)
+    }
     // Observability for the arbitration tests: True the cycle a FRONT completion was
     // suppressed and held because the BACK claimed the shared comp* stage.
     val frontCompHeld = Bool(); frontCompHeld := False; frontCompHeld.simPublic()
@@ -1417,6 +1500,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // sent yet. Retire it directly (never sent, so no dangling command) and
       // advance BOTH the send and response pointers past it, instead of the
       // ordinary single-entry advance.
+      //
+      // This FORWARD index reach (`alignedRspPtr + 1`) is sound in a way the send
+      // side's old BACKWARD reach (`alignedSendPtr - 1`) was not, and the asymmetry
+      // is worth stating because the backward one deadlocked real hardware: an index
+      // can only be REUSED by a later push once its occupant has popped, and slot B
+      // provably cannot pop before slot A (responses are strict FIFO and slot B is
+      // still unsent here). So `alignedRspPtr + 1` is always still slot B. Slot A,
+      // by contrast, pops FIRST -- freeing its index for reuse while slot B is still
+      // resident -- which is exactly why "the entry behind me" was never a valid
+      // stand-in for "my slot A". See `alignedSlotAPending` above.
       alignedValid(alignedRspPtr)     := False
       alignedSent(alignedRspPtr)      := False
       alignedPoisoned(alignedRspPtr)  := False
