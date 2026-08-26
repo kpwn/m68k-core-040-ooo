@@ -363,4 +363,102 @@ class LsEuSplitRingSpec extends AnyFunSuite {
       }
     }
   }
+
+  /** CAS2-style STRESS: two independent split (misaligned, line-crossing) loads from
+    * the SAME instruction, issued back-to-back with no wait between them.
+    *
+    * CAS2's own microcode (`Microcode.scala` CAS2_ENTRY rows d0/d1) issues exactly this
+    * shape unconditionally: `LOAD.sz (Rn1) -> T0` immediately followed by
+    * `LOAD.sz (Rn2) -> T1`, with no dependency between them, before either compare runs
+    * (see the class doc on CAS2's 10-uop crack). If Rn1 and Rn2 are BOTH misaligned to a
+    * cross-line offset, each load consumes 2 of the aligned ring's 4 slots -- so the two
+    * loads together can fully exhaust the ring's entire depth with TWO CONCURRENT split
+    * pairs resident at once. This is a stress condition the other tests in this file
+    * never reach (they only ever have one split pair in flight, alongside at most
+    * ordinary single-slot entries).
+    *
+    * The ring's own class-level design comment (`splitMergeLine`, `LsEuPlugin.scala`)
+    * argues this is safe: the single shared `splitMergeLine` register that carries slot
+    * A's raw line to slot B's merge can only ever be live for ONE pair at a time, because
+    * `alignedSendPtr`/`alignedRspPtr` are single pointers that walk the ring in STRICT
+    * index order on both the send side and the response side -- so pair 2's slot A cannot
+    * even be SENT until pair 1's slot B has been sent (send order can't skip a held
+    * entry), and pair 2's slot A response cannot arrive before pair 1's slot B response
+    * (responses are strict FIFO matching send order). This test builds the two-pair-
+    * resident state directly and proves BOTH operands merge to the correct, distinct
+    * value -- i.e. no aliasing between the two concurrent pairs' merge state, and no
+    * pointer confusion between their ring slots.
+    */
+  test("two concurrent CAS2-style split-load pairs fully exhaust the ring without cross-corrupting operands", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      // Two distinct 16-byte lines, far apart (not aliasing), each individually
+      // misaligned to the exact LONG cross-line offset the other tests in this file
+      // already proved split-eligible (base+14 -> spans ...E..11).
+      val rn1Base = 0x5000L + 14   // "Rn1" operand address: spans 0x500E..0x5011
+      val rn2Base = 0x9000L + 14   // "Rn2" operand address: spans 0x900E..0x9011 (different line entirely)
+      preload(mem, 0x5000L, 32); preload(mem, 0x9000L, 32)
+      seed(dut, cd, preg = 10, value = rn1Base)   // stands in for CAS2's Rn1
+      seed(dut, cd, preg = 11, value = rn2Base)   // stands in for CAS2's Rn2
+
+      // Track ring occupancy every cycle so we can PROVE (not just assume) that both
+      // split pairs were simultaneously resident -- all 4 slots valid, all 4 flagged
+      // twoAccess, 2 of them slot-A (splitSecond=false) and 2 slot-B (splitSecond=true)
+      // -- at some point, rather than trusting the instruction sequence "should" do it.
+      var sawFullRingBothPairs = false
+      var maxValidCount = 0
+      val tracking = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork {
+        while (tracking.get()) {
+          val l = dut.eu.logic
+          val validFlags = (0 until 4).map(i => l.alignedValid(i).toBoolean)
+          val twoAccFlags = (0 until 4).map(i => l.alignedMem(i).twoAccess.toBoolean)
+          val splitSecondFlags = (0 until 4).map(i => l.alignedMem(i).splitSecond.toBoolean)
+          val nValid = validFlags.count(identity)
+          maxValidCount = math.max(maxValidCount, nValid)
+          val allValidAreSplit = validFlags.zip(twoAccFlags).forall { case (v, t) => !v || t }
+          val nSlotA = validFlags.zip(splitSecondFlags).count { case (v, s) => v && !s }
+          val nSlotB = validFlags.zip(splitSecondFlags).count { case (v, s) => v && s }
+          if (nValid == 4 && allValidAreSplit && nSlotA == 2 && nSlotB == 2) {
+            sawFullRingBothPairs = true
+          }
+          cd.waitSampling()
+        }
+      }
+
+      // Issue Rn1's load then Rn2's load back-to-back (no wait between, mirroring
+      // CAS2's unconditional d0/d1 microcode issue order) -- distinct pdst AND robId
+      // so a wrong-operand corruption (wrong value landing on the wrong destination,
+      // or a stale/aliased merge line) is directly observable.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 30, robId = 1)  // "T0" <- (Rn1)
+      issueLoad(dut, cd, basePreg = 11, disp = 0, Size.LONG, pdst = 31, robId = 2)  // "T1" <- (Rn2)
+
+      assert(waitCompletion(dut, cd, robId = 1), "Rn1 split load completes")
+      assert(waitCompletion(dut, cd, robId = 2), "Rn2 split load completes")
+      tracking.set(false)
+      cd.waitSampling(4)
+
+      assert(maxValidCount == 4,
+        s"expected the ring to reach full occupancy (4 valid entries), got max=$maxValidCount " +
+        "-- the two split pairs never actually overlapped, so this test did not exercise the " +
+        "intended concurrent-pairs stress condition")
+      assert(sawFullRingBothPairs,
+        "expected a cycle where all 4 ring slots were valid, all flagged twoAccess, with " +
+        "exactly 2 slot-A and 2 slot-B entries -- i.e. BOTH split pairs concurrently resident " +
+        "-- but never observed it; the two loads did not truly overlap in the ring")
+
+      val gotRn1 = readInt(dut, 30)
+      val gotRn2 = readInt(dut, 31)
+      val expRn1 = expected(rn1Base, 4)
+      val expRn2 = expected(rn2Base, 4)
+      assert(gotRn1 == expRn1,
+        s"Rn1 operand: got ${gotRn1.toString(16)} exp ${expRn1.toString(16)} " +
+        s"(exp-Rn2 was ${expRn2.toString(16)} -- a match against THAT would mean operand " +
+        "aliasing between the two concurrent split pairs)")
+      assert(gotRn2 == expRn2,
+        s"Rn2 operand: got ${gotRn2.toString(16)} exp ${expRn2.toString(16)} " +
+        s"(exp-Rn1 was ${expRn1.toString(16)} -- a match against THAT would mean operand " +
+        "aliasing between the two concurrent split pairs)")
+    }
+  }
 }
