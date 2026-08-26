@@ -2450,6 +2450,29 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     rc.flushPort := flushing
 
+    // ── Invariant: a commit must never be presented on a flushing cycle ─────────
+    // RenameStage's freelists gate their push-consumption on `!io.flush` (see
+    // Freelist.scala) — a push offered on a flushing cycle would be SILENTLY
+    // DROPPED (the old pdst never returns to the pool -> a permanent physreg
+    // leak). That is safe ONLY because every producer of `rc.commitPorts(_).valid`
+    // (driveCommit's retire0/retire1 call sites above, AND the sysOp-read commit
+    // block gated by sysTriggerSig/sysRetire) is itself gated through `headReady`,
+    // which ANDs in `!flushing` directly (see headReady's definition above) — so
+    // commitPorts(k).valid is architecturally UNREACHABLE while `flushing` (=
+    // `rc.flushPort`, the exact same wire Freelist reads as `io.flush`) is high.
+    // This is not merely a retire-ordering convention (branch-mispredict commit
+    // landing the cycle before doFlushReg asserts, excSquash occupying the ROB
+    // head for its whole run) — it is tautological given `headReady`'s own gate.
+    // This assert pins that guarantee so a FUTURE commit path that bypasses
+    // `headReady` (a new sysOp variant, a new FSM-driven commit, etc.) trips
+    // immediately here instead of silently leaking a physical register.
+    GenerationFlags.simulation {
+      assert(!(flushing && (rc.commitPorts(0).valid || rc.commitPorts(1).valid)),
+        "RobPlugin: a commitPorts.valid was presented while flushing was asserted -- " +
+        "the corresponding Freelist push would be silently dropped by its !io.flush gate",
+        FAILURE)
+    }
+
     // ── Sim-only commit observation (lock-step harness consumes this) ───────────
     // Carries the POST-instruction SR (full 16-bit) + A7 so the lock-step can
     // compare them against Musashi's OracleStep.sr / a(7) through an exception.
