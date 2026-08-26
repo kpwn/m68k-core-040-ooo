@@ -478,6 +478,63 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val s1AddrB     = (s1Va & ~U(15, 32 bits)) + 16
     s1CrossLine.simPublic(); s1CrossPage.simPublic(); s1TwoAccess.simPublic(); s1AddrB.simPublic()
 
+    // ── MOVEM far-page probe (task movem-translate-ahead) ──────────────────────
+    // Closes docs/BUG_movem_midlist_load_fault_no_rollback.md: a LOAD-direction
+    // MOVEM whose register-list span crosses a page boundary must not let ANY
+    // element commit if the far (second) page is going to fault -- otherwise an
+    // earlier element's per-uop retire (already irrevocable the instant it
+    // happens; see the bug doc's root-cause section) leaves it visibly loaded even
+    // though a later element in the SAME macro then faults. `u1.faultVector`
+    // carries the macro's total element count (repurposed; see
+    // MicroOpAssembler.movemMoveUop's doc comment) on ONLY the first emitted
+    // element of a LOAD MOVEM macro; 0 on every other uop (every non-MOVEM access,
+    // every non-first MOVEM element, and every STORE-direction MOVEM element --
+    // STORE deliberately does NOT get this treatment, see the doc comment there).
+    val movemProbeCount  = u1.faultVector.resize(5 bits)             // 0..16; 0 = not a probe carrier
+    val movemProbeActive = (u1.memOp === MemOp.LOAD) && (movemProbeCount =/= 0)
+    val movemElemLong    = u1.size === m68k040.isa.Size.LONG
+    // Elements are packed contiguously at s1Va + k*elemSize (k = 0..count-1, in
+    // MASK order -- i.e. emission order -- not architectural register-number
+    // order; true regardless of a sparse mask, since MOVEM always packs the
+    // transferred registers back-to-back in memory by list position). The count-1
+    // scale-by-elemSize is a compile-time-constant shift (2 or 4), never a real
+    // multiplier: `<<2`/`<<1` selected by size, mirroring `movemCycleDelta`'s own
+    // shift-not-multiply comment in DecodeStage.scala.
+    val movemCnt1 = Mux(movemProbeCount === 0, U(0, 8 bits),
+      (movemProbeCount.resize(8 bits) - U(1, 8 bits)))                 // elements AFTER the first: 0..15
+    val movemSpanFromFirst = Mux(movemElemLong, (movemCnt1 << 2), (movemCnt1 << 1)).resize(32)
+    val movemAddrHi        = s1Va + movemSpanFromFirst                 // the LAST element's own address
+    // Page-crossing check: a FIXED 4K boundary (mirrors `s1CrossPage`'s own
+    // existing 4K-only check just above -- same file, same established pattern).
+    // Task #195's TCR.P (8K pages) does NOT need to be threaded through here: a
+    // real 8K boundary is ALWAYS also a 4K boundary (8192 is a multiple of 4096),
+    // so this check never MISSES a genuine crossing or computes a wrong crossing
+    // address for one; in 8K mode it can only ever fire on a 4K sub-boundary that
+    // isn't a true page edge, costing one harmless extra DTLB round trip on an
+    // already-rare page-crossing MOVEM (never a false fault: a VPN slice that maps
+    // into the SAME real 8K page as the first element resolves identically to it).
+    // Skipped entirely when `s1TwoAccess` is ALREADY true for the FIRST element's
+    // OWN reasons (its single 2/4-byte access itself straddles a page): in that
+    // (astronomically rare) case the macro's total span still can't exceed 2
+    // pages (<=64 bytes < any real page size), and the EXISTING per-access split
+    // already translates both of them, so nothing new is needed.
+    val movemCrosses = movemProbeActive && !s1TwoAccess &&
+                        (s1Va(31 downto 12) =/= movemAddrHi(31 downto 12))
+    // The exact address of the FIRST element landing on the far page -- NOT
+    // `movemAddrHi` (the LAST element), which would report the WRONG fault EA
+    // whenever more than one element lands on the far page (e.g. the pinned
+    // lock-step test: D0@0x2ff8/D1@0x2ffc resident, D2@0x3000/D3@0x3004 non-
+    // resident -- the correct faultAddr is D2's 0x3000, not D3's 0x3004). Musashi
+    // (and this core's own per-uop translate, were it allowed to run) would fault
+    // AT that first far-page element, so this is the exact value a genuine
+    // per-element translate of it would also produce -- not an approximation.
+    val movemFarPageStart = (movemAddrHi(31 downto 12) ## U(0, 12 bits)).asUInt
+    val movemDiff         = (movemFarPageStart - s1Va).resize(8 bits)      // 1..63 whenever movemCrosses
+    val movemDiffRounded  = Mux(movemElemLong,
+      (movemDiff + 3) & ~U(3, 8 bits), (movemDiff + 1) & ~U(1, 8 bits))    // round UP to the next elemSize multiple
+    val movemCrossAddr    = s1Va + movemDiffRounded.resize(32)
+    movemCrosses.simPublic(); movemCrossAddr.simPublic()
+
     // ── D1 elastic-front context ─────────────────────────────────────────────
     // Carry only fields which remain live after the AGU/register-file boundary.
     // The full 300+ bit RenamedUop stays in P1; P2/P3/P4 replicate this pruned token
@@ -508,6 +565,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       val keepCommit      = Bool()
       val needsSupervisor = Bool()
       val supervisor      = Bool()
+      // MOVEM far-page probe (task movem-translate-ahead): True iff `twoAccess`/
+      // `addrB` on THIS entry were set for a translate-ONLY probe of the macro's
+      // far boundary page, not a genuine second data access. Read exactly once, at
+      // `txOut` construction below, to suppress `twoAccess` before it ever reaches
+      // P3/P4 (the real split-access dispatch: `alignedEnqSplit`, the SQ split-
+      // store alloc, the split-forward query, ...) — none of those must ever see a
+      // MOVEM probe as a real access. The DTLB round-trip itself (the ONLY thing
+      // that must happen for a probe) is already complete by the time `txOut` is
+      // built: it reuses the SAME `txSecond`/`xlateBArm` second-round-trip FSM a
+      // genuine split uses, and a fault found in it is delivered via the SAME
+      // `captureFaultFront(txCtx, txCtx.addrB)` call a genuine split's B-side fault
+      // already uses (see the `xlateFault` branch below) — unmodified in both
+      // cases. Only the NON-fault, "let the access continue" branch needs this
+      // extra bit, to stop a probe-only success from turning into a real 2nd access.
+      val probeOnlyB      = Bool()
     }
     case class XlatePipeCtx() extends Bundle {
       val front  = FrontPipeCtx()
@@ -1245,13 +1317,22 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     def captureFrontCtx(dst: FrontPipeCtx): Unit = {
       dst.robId           := s1Ctx.robId
       dst.vaddr           := s1Va
-      dst.addrB           := s1AddrB
+      // MOVEM far-page probe (task movem-translate-ahead): when this uop is the
+      // macro's first LOAD element AND its span crosses a page, addrB carries the
+      // exact crossing address (not the ordinary next-line addrB) and twoAccess is
+      // forced True to drive the SAME xlateBArm/txSecond second-round-trip FSM a
+      // genuine split reuses -- see the s1AddrB-adjacent comment block above for
+      // the full derivation. `probeOnlyB` is the ONLY new piece of state: it tells
+      // `txOut` (far downstream) to suppress `twoAccess` again before P3, so a
+      // successful (non-faulting) probe never turns into a real second access.
+      dst.addrB           := Mux(movemCrosses, movemCrossAddr, s1AddrB)
       dst.storeData       := s1StoreData
       dst.anWb            := s1AnWb
       dst.storeNzvc       := storeNzvc
       dst.size            := u1.size
       dst.memOp           := u1.memOp
-      dst.twoAccess       := s1TwoAccess
+      dst.twoAccess       := s1TwoAccess || movemCrosses
+      dst.probeOnlyB      := movemCrosses
       dst.pdst            := u1.pdst
       dst.pdstValid       := u1.pdstValid
       dst.dstArch         := u1.dstArch
@@ -2355,7 +2436,28 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     dcache.loadProbeResolve.payload.cacheMode := txEffectiveCmode
 
     val txOut = XlatePipeCtx()
+    // MOVEM far-page probe (task movem-translate-ahead): `front.twoAccess` is set
+    // by the bulk `txOut.front := txCtx` copy below and then PATCHED here for the
+    // probe-only case -- `allowOverride` (same idiom this file already uses for
+    // every other "default then override" field, e.g. `excActive` above) is
+    // required for SpinalHDL to accept the second, narrower assignment instead of
+    // reporting an ASSIGNMENT OVERLAP elaboration error.
+    //
+    // A probe-only twoAccess that reaches here NEVER faulted (the fault branch
+    // below raises the exception straight from `txCtx` and sets `txCanLeave`
+    // WITHOUT `txToP3`, so it never reaches `txOut`/P3 at all -- see the
+    // `xlateFault` branch). So this is always the "confirmed clean" case: the
+    // far-page round trip already did its ONLY job (the DTLB lookup + ATC fill,
+    // same side effects an ordinary translation already has), and its result
+    // (paddrB/cmodeB) is now discarded -- clear `twoAccess` before it reaches
+    // P3/P4, so NONE of the real second-access consumers downstream
+    // (`alignedEnqSplit`'s real cache dispatch, the SQ split-store alloc, the SQ
+    // forward split-query) ever see this as a genuine 2nd access. The first
+    // element's OWN access (paddr/cmode, computed off slot A exactly as for any
+    // ordinary non-split access) is completely unaffected.
+    txOut.front.twoAccess.allowOverride
     txOut.front  := txCtx
+    txOut.front.twoAccess := txCtx.twoAccess && !txCtx.probeOnlyB
     txOut.paddr  := Mux(txSecond, txPaddrA, s1Paddr)
     txOut.paddrB := Mux(txSecond, s1PaddrB, txCtx.addrB)
     txOut.cmode  := Mux(txSecond, txCmodeA, txEffectiveCmode)

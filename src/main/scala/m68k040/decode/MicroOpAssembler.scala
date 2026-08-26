@@ -52,7 +52,8 @@ object MicroOpAssembler {
     */
   def movemMoveUop(reg: UInt, base: UInt, baseValid: Bool, disp: Bits, sizeLong: Bool,
                    isLoad: Bool, first: Bool, last: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
-                   idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
+                   idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt,
+                   probeCount: UInt = U(0, 5 bits)): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
@@ -81,7 +82,23 @@ object MicroOpAssembler {
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0
     u.cond        := 0; u.branchDisp := 0
     u.unimplemented := False
-    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.faulted     := False
+    // `faultVector` REPURPOSED (task movem-translate-ahead; see DecodeStage.scala's
+    // `movemProbeCount` comment for the producer side): 0 for every ordinary MOVEM
+    // move (unchanged from before this task), or the macro's total element count
+    // (1..16) on ONLY the very first LOAD-direction element. Safe to repurpose here
+    // because `faultVector` is read downstream (RobPlugin) ONLY as the STATIC
+    // fallback vector when an entry's `faulted` bit is set at alloc time (this
+    // builder always sets `faulted := False`) AND no dynamic completion-time fault
+    // record exists for it -- exactly the same "dead when not faulted" property
+    // this codebase already relies on for other repurposed per-µop-context fields
+    // (`isMovea` as the .W-load sign-extend marker, `divIsRem` as the generic
+    // crack-drop marker, both documented at their own use sites in this file). A
+    // MOVEM move that genuinely DOES fault (a real DTLB translate fault) is
+    // delivered through the dynamic `faultCompletionPort`/`faultDynMem` path in
+    // LsEuPlugin, which never reads this field — so a nonzero `faultVector` here
+    // never collides with real fault-vector delivery.
+    u.faultVector := probeCount.resize(8 bits); u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
     u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned   := False; u.div64 := False

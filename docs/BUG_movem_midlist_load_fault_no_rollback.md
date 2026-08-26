@@ -1,6 +1,9 @@
 # BUG: `MOVEM.L (An)+` mid-list LOAD fault does not roll back already-loaded registers
 
-**Status**: OPEN, root-caused, NOT fixed (judged architectural — see below).
+**Status**: **FIXED** (task `movem-translate-ahead`, 2026-08-27) via the
+translate-ahead design described below. The original "judged architectural,
+not a quick fix" conclusion (kept below for the historical record) has been
+superseded — see "The fix (translate-ahead)" section.
 **Severity**: Low-to-moderate correctness gap in a genuinely rare precise-exception
 corner (a MOVEM whose register list spans a page/permission boundary and faults
 partway through). Does not affect any currently-passing regression or the boot
@@ -9,9 +12,8 @@ by a real-hardware or fuzz repro.
 **Found**: 2026-08-26, task `campaign/movem-midlist-fault`.
 **Test**: `ExecuteLockStepSpec.scala`, `"lock-step: MOVEM.L (An)+,D0-D3 LOAD
 faults on the 3rd register -- full register rollback (Musashi ground truth)"`
-(marked `pendingUntilFixed` — real regression coverage of the gap, kept green
-in the suite by ScalaTest's own pending-test convention since this project has
-no other expected-failure marker).
+— was `pendingUntilFixed`, now **un-pended and genuinely passing** (full
+D0-D3 poison rollback, byte-exact fault frame, matches Musashi exactly).
 
 ## One-line summary
 
@@ -189,7 +191,110 @@ RTL bug — the STORE test accepts either `ea` or `ea+2` for this one field and
 documents why, rather than asserting a match to a quirk that may itself be
 wrong for this CPU type. Flagging for awareness; not acted on.
 
-## Suggested next steps
+## The fix (translate-ahead, task `movem-translate-ahead`, 2026-08-27)
+
+The original "suggested next steps" below (group-commit / fault-time-undo, a
+new ROB feature) turned out to be avoidable entirely. The actual fix needs
+**zero** changes to the ROB's retire/free-list path — the single most
+timing-sensitive area this doc's own analysis flagged as too risky for a
+casual patch.
+
+**Core idea**: MOVEM's per-element addresses are pure arithmetic on the base
+register + the (statically known) register-list mask — nothing about a LATER
+element's address depends on data an EARLIER element loaded. A LOAD.L's
+64-byte-max register-list span (16 registers x 4 bytes) can straddle **at
+most 2 pages** (any real page size is >= 4096 bytes). So the FIRST element's
+own translate step can ALSO probe the far boundary page (if the span crosses
+one) BEFORE letting itself (and therefore, transitively, every later element
+— see below) become irrevocable:
+
+1. **Decode** (`DecodeStage.scala`): the MOVEM sequencer already latches the
+   whole 16-bit register mask at FSM entry — `movemTotalCount` (a new
+   registered popcount of that mask) is computed once there, alongside it.
+   The FIRST emitted move µop of a LOAD-direction macro (only) carries this
+   count, repurposing the otherwise-dead-when-`faulted=False` `faultVector`
+   field as a scratch channel (see `MicroOpAssembler.movemMoveUop`'s doc
+   comment for why that repurposing is safe) — avoiding a new field on the
+   ~35-call-site `DecodedUop` bundle entirely.
+2. **Execute** (`LsEuPlugin.scala`): once the first element's base is read
+   from the PRF (S1), a small combinational block computes the LAST
+   element's address from `count`, checks whether it lands on a different 4K
+   page than the FIRST element's own address, and — if so — computes the
+   EXACT address of the first element that would land on that far page (not
+   simply the last element's address, which would report the wrong fault EA
+   whenever more than one element lands on the far page).
+3. If a crossing is detected, the FIRST element's own translate is extended
+   to ALSO probe that far-page address, reusing the EXISTING `txSecond`/
+   `xlateBArm` second-round-trip machinery `LsEuPlugin.scala` already has for
+   a genuine misaligned/cross-page SPLIT access (the same mechanism
+   `SqFwdQuery.splitB` reuses for the cross-page store-forward fix). A new
+   `FrontPipeCtx.probeOnlyB` bit distinguishes "this second round trip is a
+   translate-only probe" from "a real second data access", suppressing the
+   real split-dispatch machinery (`alignedEnqSplit`, the SQ split-store
+   alloc) once the probe confirms no fault — the first element's OWN access
+   proceeds completely normally, on the ordinary single-access path.
+4. If the probe DOES fault, the FIRST element's completion is captured as a
+   FAULT (`captureFaultFront`, the exact function+call-site pattern already
+   used for a genuine split's B-half fault) with `faultAddr` = the computed
+   far-page crossing address — this delivers a byte-exact PC/EA/SSW/faultAddr
+   frame identical to what the naturally-faulting element's OWN translate
+   would have produced, without ever letting it (or anything before it in
+   the macro) execute.
+5. Because the FIRST element is first in program order, and the ROB retires
+   strictly in order, NOTHING later in the macro can retire before it —
+   so if it faults, the ROB's ALREADY-EXISTING generic flush-recovers-
+   not-yet-committed-entries machinery discards every later element's
+   speculative (never-committed) writes automatically. No new "was this
+   uop part of a still-in-flight macro" bookkeeping was needed anywhere.
+6. In the common (non-crossing, or crossing-but-clean) case, this is a
+   complete no-op: `movemCrosses` (the new gating condition) is False, and
+   every existing per-uop mechanism runs byte-for-byte unchanged.
+
+**STORE direction deliberately does NOT get this treatment.** Verified against
+the exact addresses of this doc's own pinned STORE test (D3@0x3004/D2@0x3000
+resident, D1@0x2ffc faulting): applying a whole-span pre-check to STORE would
+have PREVENTED D3/D2's legitimate stores from ever landing (the probe would
+find D1's page bad and refuse the whole macro before any store), which
+directly regresses the ALREADY-Musashi-correct "landed stores stay landed"
+behavior this doc's own STORE section documents — Musashi itself does not
+prevent early stores just because a later one in the same macro will fault,
+and this RTL already (and independently of this fix) matches that. STORE's
+existing per-uop mechanism is untouched and re-verified passing.
+
+**Accepted residual gap (unchanged from the "not needing to be perfect"
+scoping already implicit in the original bug)**: the probe only catches
+TRANSLATION-class faults (page not present / protection / supervisor
+violation) via the DTLB — it cannot catch a genuine BUS error (SLVERR/
+timeout) on the subsequent real access, since that depends on the real bus
+transaction, not the page table. Scoped down as follows, same reasoning
+verified against the real `CacheMode`/DTLB code:
+- A cache HIT never touches the bus — nothing to bus-error on.
+- A cache MISS on a translation-confirmed page targets genuinely-backed
+  memory; a legitimate access through this SoC does not SLVERR on backed
+  DRAM (the earlier DTT/TTR bug, `ceebdee7`, was a case of a page being
+  WRONGLY marked cacheable/non-inhibited, a decode bug — not a property of
+  genuinely-backed memory).
+- `CacheMode.INHIBITED` (confirmed from `IcacheTypes.scala`/`MmuTypes.scala`)
+  is a pure caching-policy attribute (page-descriptor bits[6:5]), completely
+  orthogonal to residency (bits[1:0]) — i.e. exactly "MMIO/device, as opposed
+  to demand-paged-but-currently-absent RAM", matching the assumption this
+  scoping relies on.
+- The only residual imprecision: an EARLIER element already retired before a
+  LATER element's genuine bus error becomes known on an INHIBITED (MMIO)
+  page — and MOVEM against MMIO is architecturally close to nonexistent in
+  real 68k software (MOVEM is bulk register save/restore; MMIO is poked one
+  register at a time with plain MOVE). Real-world exposure is effectively
+  zero for this project's classic-Mac-OS-era target workloads.
+
+**A separately-discovered, PRE-EXISTING, unrelated finding**: stress-testing
+this fix's own no-fault regression test surfaced an intermittent AXI protocol
+assertion in the D-cache's store-issue path, confirmed via A/B testing to be
+present on UNMODIFIED RTL too (and even in a program with zero store
+instructions) — i.e. NOT caused by this fix. See
+`docs/BUG_dstore_axi_id_overlap_race.md` for the full writeup; out of scope
+for this task, flagged for separate follow-up.
+
+## Suggested next steps (historical — superseded by "The fix" above)
 
 1. If/when this gap is prioritized: design a MOVEM-macro group-commit or
    fault-time-undo mechanism as a dedicated ROB feature (not a quick patch),
