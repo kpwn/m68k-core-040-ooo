@@ -26,13 +26,14 @@ class StoreQueueSplitSpec extends AnyFunSuite {
                  paddrA: Long, nbytesA: Int,
                  paddrB: Long, nbytesB: Int,
                  cacheModeA: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH,
-                 cacheModeB: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH): Unit = {
+                 cacheModeB: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH,
+                 data: Long = 0): Unit = {
     val a = dut.io.alloc
     a.valid #= true
     a.payload.robId #= robId
     a.payload.paddr #= paddrA
     a.payload.vaddr #= paddrA   // identity for this test (no vaddr-specific case here)
-    a.payload.data #= 0
+    a.payload.data #= data
     a.payload.size #= Size.LONG
     a.payload.nbytesA #= nbytesA
     a.payload.useStrbA #= true
@@ -317,6 +318,263 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       }
       assert(checked == 48 * 144, s"sweep coverage regressed: only $checked cases run")
       cd.waitSampling(2)
+    }
+  }
+
+  // ── Split-store slot-reuse aliasing stress (campaign/fmovem-predec-store) ──────────
+  //
+  // BACKGROUND / WHY THIS TEST EXISTS IN THIS FORM (not as an FMOVEM.X lock-step test):
+  // the campaign brief for this scenario asked for `FMOVEM.X FP0-FP7,-(An)` (the
+  // store-direction data-register-list form) driven end-to-end through
+  // ExecuteLockStepSpec, to stress StoreQueue's split-store mechanism with a burst of
+  // ~24 chunk stores at a rotating cache-line phase, mirroring the sibling agent's
+  // load-ring investigation. That instruction is NOT buildable on this branch:
+  // `DecodeStage.scala`'s `slot0IsFmovemx` gate (`s0FpOpClass === B"3'b110"` only) and
+  // the existing `FpMemLoadSpec` test "FMOVEM.X list,(A0) (opclass 111, store -- task
+  // #242, still unowned): still traps" both confirm FMOVEM.X's STORE direction
+  // (opclass 111, task #242) is unimplemented — it decodes and traps (vector 11)
+  // before ever reaching rename/dispatch/the LS EU/StoreQueue. `-(An)`/`(An)+`
+  // auto-update addressing for the data-list form is *also* unimplemented for either
+  // direction (only `(An)`/`(d16,An)` are admitted today, `s0FpGenEaMode`). See this
+  // task's final report for the full trace; not re-litigated here.
+  //
+  // So this test drives StoreQueue directly (the same component + the same
+  // `useStrbA`/`validB`/slot-A/B mechanism FMOVEM.X store would have gone through),
+  // reproducing the SPECIFIC boundary condition the brief asked to scrutinize: "a
+  // fresh unrelated store landing in the exact cycle an old split store's second half
+  // drains/retires and its StoreQueue slot gets reused." The rotating byte-offset
+  // list below (14,10,6,2 repeating) is not arbitrary -- it is the exact line-offset
+  // sequence produced by an 8-element FMOVEM-style burst from a base misaligned by 2
+  // with a 4-byte access stride (worked by hand: `An=base+2`, addr(3:0) cycles
+  // 14,10,6,2,14,10,6,2), so it reproduces the SAME split/non-split shape (2 of 8
+  // cross a line) the original scenario would have, even though the vehicle here is
+  // a bare StoreQueue-unit burst instead of the (unbuildable) real instruction.
+  //
+  // ARCHITECTURAL FINDING (established by reading StoreQueue.scala before writing this
+  // test, not assumed): unlike the load-ring bug this campaign is modeled on -- which
+  // tracked "is slot A's response still pending" via a POSITIONAL proxy instead of a
+  // real pointer compare -- a split store's two halves live as FIELDS of ONE ring
+  // entry (`validB`/`paddrB`/`maskBs`/`cacheModesB`, all indexed by the SAME `i` as
+  // slot A), not as separate entries in a parallel ring. Residency (`valids(i)`) is
+  // real per-entry state cleared ONLY by the real ack cursor (`head`/`ackPhaseB`) once
+  // BOTH halves have acked (`terminalAck`'s `!validBs(head)` / `ackPhaseB` gate) --
+  // never derived from a counter or index relationship. A fresh alloc can only ever
+  // target `tail`, and `io.full` (the LS-EU's sole allocation gate) is computed from
+  // the LIVE (unregistered) `valids` popcount, so a same-cycle pop-then-realloc can
+  // never race: the popped entry's register write does not take effect until the
+  // NEXT edge, so `io.full` for the pop's own cycle still reflects the pre-pop
+  // occupancy. This test is the executable form of that architectural read: it
+  // manufactures the exact adjacency (alloc lands in the ring slot a split entry
+  // JUST vacated) and checks for data corruption/misattribution, not merely that the
+  // module doesn't hang.
+  test("split-store slot reuse: a fresh alloc landing in the ring slot an old SPLIT " +
+       "entry's second half just vacated does not alias/corrupt data, under a " +
+       "sustained multi-store backlog (8-store full-ring burst, ack-delayed drain)",
+       VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      val depth = 8
+
+      // Rotating line-offset sequence -- see header comment for the by-hand derivation.
+      // Only offset 14 crosses the 16-byte line (14+4=18>16); 10/6/2 stay within one
+      // line (10+4=14, 6+4=10, 2+4=6, all <=16). So entries 0 and 4 are SPLIT.
+      val offsets  = Seq(14, 10, 6, 2, 14, 10, 6, 2)
+      // Each entry gets its OWN pair of lines (32 bytes apart) so no two of the 8
+      // original entries -- nor the later-injected 9th store -- can legitimately
+      // overlap; any observed cross-contamination is therefore unambiguously a real
+      // aliasing bug, never a legitimate forward/overlap.
+      val lineBase = (i: Int) => 0x00005000L + i * 0x20L
+      val pattern  = (i: Int) => 0xA0000000L + i         // distinct, recognizable per entry
+      def isSplit(off: Int) = off + 4 > 16
+
+      case class Half(paddr: Long, useStrb: Boolean, expStrb: Long, expData: BigInt)
+      val expected = scala.collection.mutable.ListBuffer[Half]()
+
+      def strbAOf(off: Int, n: Int): Long = { var s = 0L; for (k <- 0 until n) { val p = off + k; if (p < 16) s |= (1L << p) }; s }
+      def strbBOf(off: Int, n: Int): Long = { var s = 0L; for (k <- 0 until n) { val p = off + k; if (p >= 16) s |= (1L << (p - 16)) }; s }
+      // Reconstruct the 128-bit line word (as a BigInt) that storeDataA/B would
+      // produce: byte i of the value (big-endian, k=0=MSB) lands at line-byte
+      // position (off+k); byte i of the 128-bit line occupies bits [i*8 +: 8].
+      def lineDataOf(off: Int, n: Int, data: Long, sideIsA: Boolean): BigInt = {
+        val bytes = Array.fill(16)(0)
+        for (k <- 0 until n) {
+          val pos  = off + k
+          val inA  = pos < 16
+          if (inA == sideIsA) {
+            val idx   = if (inA) pos else pos - 16
+            val shift = (n - 1 - k) * 8
+            bytes(idx) = ((data >> shift) & 0xff).toInt
+          }
+        }
+        var v = BigInt(0)
+        for (i <- 0 until 16) v = v | (BigInt(bytes(i)) << (i * 8))
+        v
+      }
+      // Expand a 16-bit byte-strobe into a 128-bit byte-granular mask, so the
+      // (non-strobed, don't-care) lanes drop out of the content comparison above.
+      def strb2mask(strb: Long): BigInt = {
+        var m = BigInt(0)
+        for (i <- 0 until 16) if (((strb >> i) & 1) != 0) m = m | (BigInt(0xff) << (i * 8))
+        m
+      }
+
+      // ---- allocate exactly `depth` entries, uncommitted, so occupancy hits FULL
+      // deterministically before anything can drain. ----
+      for (i <- 0 until depth) {
+        val off    = offsets(i)
+        val paddrA = lineBase(i) + off
+        val data   = pattern(i)
+        if (isSplit(off)) {
+          val nbytesA = 16 - off
+          val nbytesB = 4 - nbytesA
+          val paddrB  = lineBase(i) + 16
+          allocSplit(dut, cd, robId = i, paddrA = paddrA, nbytesA = nbytesA,
+                     paddrB = paddrB, nbytesB = nbytesB, data = data)
+          expected += Half(paddrA, useStrb = true, strbAOf(off, 4), lineDataOf(off, 4, data, sideIsA = true))
+          expected += Half(paddrB, useStrb = true, strbBOf(off, 4), lineDataOf(off, 4, data, sideIsA = false))
+        } else {
+          allocAligned(dut, cd, robId = i, paddr = paddrA, data = data, size = Size.LONG)
+          expected += Half(paddrA, useStrb = false, 0, BigInt(data))
+        }
+      }
+      sleep(1)
+      assert(dut.io.full.toBoolean, "ring must read exactly FULL after 8 back-to-back allocations")
+      assert(dut.head.toInt == 0 && dut.tail.toInt == 0,
+        s"expected head=tail=0 (wrapped) after exactly 8 allocs into a depth-8 ring; " +
+        s"got head=${dut.head.toInt} tail=${dut.tail.toInt}")
+
+      // ---- record every drained half + drive an ACK-DELAYED (not same-cycle) ack,
+      // so accepted halves genuinely BACK UP (multiple outstanding halves in flight)
+      // instead of a trivial 1-outstanding pipeline. ----
+      val ackLatency = 3
+      var t = 0
+      val due = scala.collection.mutable.Queue[Int]()
+      val drainedA = scala.collection.mutable.ListBuffer[(Long, Boolean, Long, BigInt)]()
+      dut.io.drainAck #= false
+      fork {
+        while (true) {
+          cd.waitSampling()
+          t += 1
+          if (dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean) {
+            val p = dut.io.drain.payload
+            drainedA += ((p.paddr.toLong, p.useStrb.toBoolean, p.strb.toLong,
+              if (p.useStrb.toBoolean) p.lineData.toBigInt else BigInt(p.data.toLong)))
+            due.enqueue(t + ackLatency)
+          }
+          if (due.nonEmpty && due.front <= t) { due.dequeue(); dut.io.drainAck #= true }
+          else dut.io.drainAck #= false
+        }
+      }
+
+      // ---- commit all 8 in program order, from a BACKGROUND fork (one robId/cycle),
+      // concurrently with the poll loop below -- entry 0 (the split store, at the
+      // ring head) can pop in as few as ~6-8 cycles (2 sends + ack-latency-3 twice),
+      // which is well within the 8 cycles the commit loop itself would otherwise
+      // take run sequentially on the main thread. Committing sequentially on the main
+      // thread BEFORE polling (the first version of this test) let 2-3 entries pop
+      // before polling ever started, silently testing a LATER, less-precise reuse
+      // event than the one asked for -- this fork is what makes the poll loop below
+      // actually catch entry 0's OWN pop, not a downstream one. ----
+      fork {
+        for (i <- 0 until depth) {
+          dut.io.commit.valid #= true; dut.io.commit.payload #= i
+          cd.waitSampling()
+        }
+        dut.io.commit.valid #= false
+      }
+
+      // ---- poll for the ring's FIRST freed slot (entry 0, the oldest, a SPLIT store)
+      // and inject a brand-new, unrelated store the moment it's observed -- the exact
+      // adjacency the brief asked to scrutinize. Polling starts THIS cycle, concurrent
+      // with the commit fork above, so it observes the very first full->!full edge. ----
+      var guard = 0
+      var injected = false
+      var tailAtInject = -1
+      var headAtInject = -1
+      val injRobId = 40   // robId is only 6 bits (0..63); 40 is far from the 0..7 range used above
+      val injPaddr = 0x00009000L
+      val injData  = 0xFEEDFACEL
+      while (!injected && guard < 400) {
+        cd.waitSampling(); sleep(1); guard += 1
+        if (!dut.io.full.toBoolean) {
+          tailAtInject = dut.tail.toInt
+          headAtInject = dut.head.toInt
+          val a = dut.io.alloc
+          a.valid #= true
+          a.payload.robId #= injRobId
+          a.payload.paddr #= injPaddr; a.payload.vaddr #= injPaddr
+          a.payload.data #= injData; a.payload.size #= Size.LONG
+          a.payload.nbytesA #= 4; a.payload.useStrbA #= false
+          a.payload.validB #= false; a.payload.paddrB #= 0; a.payload.vaddrB #= 0; a.payload.nbytesB #= 0
+          a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+          a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
+          a.payload.supervisor #= false; a.payload.precise #= false
+          cd.waitSampling()
+          a.valid #= false
+          injected = true
+        }
+      }
+      assert(injected, "ring never freed a slot within the guard window -- test setup is broken " +
+        "(entry 0 should pop well before this)")
+      // ── THE aliasing proof: the new store's alloc index (tail, unmoved since the
+      // ring filled) must equal the ring slot entry 0 (the split store) JUST vacated
+      // (its OLD head index = new head - 1 mod depth). If StoreQueue tracked slot-B
+      // pendingness via anything positional instead of the real `valids`/ack-cursor
+      // state, this is exactly where it would show up as a wrong index or a stale
+      // read of the about-to-be-overwritten fields. ──
+      val freedIdx = (headAtInject - 1 + depth) % depth
+      assert(tailAtInject == freedIdx,
+        s"the injected alloc's write index (tail=$tailAtInject) must equal the just-freed " +
+        s"slot (head-1=$freedIdx) -- if these differ the reuse this test targets never " +
+        s"actually happened, so the test proves nothing")
+      expected += Half(injPaddr, useStrb = false, 0, BigInt(injData))
+      commit(dut, cd, robId = injRobId)
+
+      // ---- drain everything to empty; a wedge under this backlog shape (several
+      // split entries + sustained multi-outstanding acks + a same-slot-reuse alloc)
+      // would show up as a timeout here. ----
+      guard = 0
+      while (!dut.io.empty.toBoolean && guard < 4000) { cd.waitSampling(); guard += 1 }
+      assert(dut.io.empty.toBoolean,
+        s"StoreQueue never drained to empty within $guard cycles -- possible wedge under " +
+        s"split-store burst + slot-reuse backlog")
+      cd.waitSampling(4)
+
+      // ---- content verification: every expected half appears EXACTLY once, with the
+      // exact strobe (split halves) or exact data (aligned halves incl. the injected
+      // store), and nothing else drained that wasn't expected (no phantom/duplicate
+      // halves, no cross-entry data bleed). ----
+      assert(drainedA.length == expected.length,
+        s"expected exactly ${expected.length} drained halves (6 aligned + 2*2 split-halves " +
+        s"+ 1 injected), got ${drainedA.length}: $drainedA")
+      for (e <- expected) {
+        val matches = drainedA.filter(d => d._1 == e.paddr && d._2 == e.useStrb)
+        assert(matches.length == 1,
+          s"expected exactly one drained half at paddr=0x${e.paddr.toHexString} useStrb=${e.useStrb}, " +
+          s"got ${matches.length}: $matches")
+        val (_, _, strb, data) = matches.head
+        if (e.useStrb) {
+          assert(strb == e.expStrb,
+            s"split half at 0x${e.paddr.toHexString}: strobe mismatch, expected 0x${e.expStrb.toHexString} got 0x${strb.toHexString}")
+          assert((data & (strb2mask(e.expStrb))) == (e.expData & strb2mask(e.expStrb)),
+            s"split half at 0x${e.paddr.toHexString}: strobed byte content mismatch, expected 0x${e.expData.toString(16)} " +
+            s"got 0x${data.toString(16)} (strb=0x${e.expStrb.toHexString})")
+        } else {
+          assert(data == e.expData,
+            s"aligned half at 0x${e.paddr.toHexString}: data mismatch, expected 0x${e.expData.toString(16)} got 0x${data.toString(16)} " +
+            s"-- if this is the injected store (0x${injPaddr.toHexString}) reading back stale/foreign bytes, " +
+            s"or an original entry reading back the injected store's 0x${injData.toHexString}, that is the " +
+            s"exact aliasing corruption this test targets")
+        }
+      }
+      // Explicit negative check: the injected store's unique pattern must not appear
+      // on any OTHER address, and no original entry's pattern must appear on the
+      // injected store's address.
+      for (d <- drainedA if d._1 != injPaddr) {
+        assert(d._4 != BigInt(injData) || d._2,
+          s"the injected store's unique pattern 0x${injData.toHexString} leaked onto an " +
+          s"unrelated address 0x${d._1.toHexString}")
+      }
     }
   }
 }
