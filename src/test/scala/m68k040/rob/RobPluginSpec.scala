@@ -235,6 +235,142 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // ISOLATION test for docs/BUG_fmovemx_dataload_rob_commit_corruption.md. Allocates a
+  // synthetic uop shaped EXACTLY like FMOVEM.X's issue-row µop
+  // (`MicroOpAssembler.fmovemxIssueUop`): isBranch=False (so retireAlone must clear),
+  // NO integer destination (pdstValid=False -- dstValid=False in the real decoded
+  // uop, the FP PRF is the only destination), completing via completion PORT 5 (the
+  // real full-core wiring's FP lane, `rob.logic.completion(5).valid := divEu.fpCompletion.valid`
+  // in FullCoreSynth.scala) rather than port 0/1 (int) or port 2 (LS).
+  //
+  // FINDING (this session): at the RobPlugin level in ISOLATION, this uop shape
+  // retires with a CORRECT commit-pc. `retireAlone := u.isBranch` (line ~851) reads
+  // False exactly as expected, so `commitPc0 = Mux(p0.retireAlone, nextPcRd0,
+  // p0.predNextPc)` selects `predNextPc`, which was written UNCONDITIONALLY at alloc
+  // (`p.predNextPc := u.nextPc`, line ~830 -- no dstValid/pdstValid/cluster gating of
+  // any kind). Completing via port 5 specifically (as opposed to ports 0/1/2/3/4)
+  // makes no observable difference: `completes(robId) := True` is set identically by
+  // ANY of the 6 completion ports (`for (c <- completion) when(c.valid) {
+  // completes(c.payload) := True }`), and `commitPc0`/`predNextPc` never read which
+  // port fired.
+  //
+  // This EXONERATES `RobPlugin.scala`'s `retireAlone`/`commitPc0` mux and its
+  // `payload` Mem alloc-write as the root cause, for at least this single-entry,
+  // no-adjacent-pressure case: the bug the doc chases must live upstream of the ROB
+  // (DecodeStage's `fmovemxActive` FSM / the push->MicroOpQueue->RenameStage path /
+  // DivEuPlugin's FP completion robId-tracking, `fpCompRobId`), NOT in this mux
+  // itself. See the bug doc's "Root-cause leads" section (updated alongside this
+  // test) for what remains open.
+  test("ROB ISOLATION (bug doc): FMOVEM.X-issue-row-shaped uop (isBranch=False, no int " +
+       "dst, completes via completion(5) FP lane) retires with commitPc0 == predNextPc, " +
+       "NOT the branch-only nextPcRd0/nextPcMem path") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.completion(5).valid #= false
+
+      // Mirror fmovemxIssueUop's real shape as closely as pokeRu allows: isBranch=False,
+      // no int dst (pdstValid=False -- dstValid=False in the real DecodedUop), pc/nextPc
+      // as a real (An) FMOVEM.X would carry (4-byte macro: opword + ext1, no EA ext word).
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x40800018, dstArch = 0, pdstValid = false,
+             isBranch = false)
+      dut.rsrc.logic.src.payload(0).nextPc #= 0x4080001c   // fmovemxNextPc: pc+4, not pc+2
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 1, "one entry allocated")
+
+      // Complete via port 5 ONLY (the FP lane) -- ports 0-4 stay idle throughout.
+      dut.rob.logic.completion(5).valid #= true
+      dut.rob.logic.completion(5).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(5).valid #= false
+
+      // check-first (`waitUntil`, not `cd.waitSamplingWhere`): the retire pulse may
+      // already be live in this same settled instant (see `waitUntil`'s own doc comment
+      // above -- `waitSamplingWhere` waits one edge BEFORE checking and would consume it).
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.fireOut(0).toBoolean, "FP-lane-completed entry retires")
+      assert(dut.tsink.logic.traceOut(0).pc.toLong == 0x4080001cL,
+        f"commitPc0 must equal predNextPc (0x4080001c), got 0x${dut.tsink.logic.traceOut(0).pc.toLong}%x " +
+        "-- if this ever reads garbage or the branch-path nextPcRd0 value, the bug IS in " +
+        "RobPlugin.scala's commitPc0/retireAlone mux after all")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained")
+    }
+  }
+
+  // Companion to the isolation test above: a FOLLOWING normal instruction, allocated and
+  // completed via the ordinary int lane (port 0) the cycle AFTER an FMOVEM.X-issue-row-
+  // shaped entry retires, must get ITS OWN predNextPc -- not the just-retired FP entry's.
+  // This directly targets repro C's symptom ("the VERY NEXT retiring instruction's
+  // commit-pc is short by exactly one word... suspiciously identical to the FMOVEM's own
+  // just-retired commit-pc"). FINDING (confirmed by this test, not just reasoned): at
+  // the RobPlugin level, this also comes back correct -- each entry's `predNextPc` is
+  // independently stored (own alloc-time write,
+  // own Mem row) and there is no shared/latched-across-retires register in the read path
+  // (`p0 = payload.readAsync(h0)` re-reads fresh every cycle off the CURRENT head). So
+  // repro C's "next instruction inherits" symptom, like repro A, is NOT reproducible
+  // purely from RobPlugin's own retire logic -- it needs some upstream corruption (of
+  // EITHER the allocated predNextPc itself, or of which physical ROB row the follow-on
+  // instruction's uop actually got allocated into) that this isolated harness cannot
+  // by itself recreate without also modeling the real FSM's multi-cycle drain.
+  test("ROB ISOLATION (bug doc, repro-C shape): the instruction retiring immediately " +
+       "after an FMOVEM.X-issue-row-shaped entry gets its OWN predNextPc, not the " +
+       "just-retired FP entry's") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.completion(5).valid #= false
+
+      // robId 0: FMOVEM.X-issue-row shape, FP-lane completion.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x408000cc, dstArch = 0, pdstValid = false,
+             isBranch = false)
+      dut.rsrc.logic.src.payload(0).nextPc #= 0x408000cc   // degenerate 0-length, matches repro C's idx25/26 values
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+
+      // robId 1: the trailing `move.l %a1,%d7` -- ordinary int-lane MOVE, completes port 0.
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x408000cc, dstArch = 15, pdst = 20,
+             pdstValid = true, pdstOld = 15, isBranch = false)
+      dut.rsrc.logic.src.payload(0).nextPc #= 0x408000ceL   // real: pc + 2 (a MOVE.L Ax,Dx is a 2-byte opword)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 2, "both entries allocated")
+
+      // Complete robId 0 (FP lane) first, then robId 1 (int lane), each its own cycle so
+      // they retire as two SEPARATE single-wide retires (mirrors the FSM's real 1-wide
+      // pushes and keeps the two commits temporally distinct, like the real repro).
+      dut.rob.logic.completion(5).valid #= true; dut.rob.logic.completion(5).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(5).valid #= false
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.traceOut(0).pc.toLong == 0x408000ccL, "FMOVEM entry's own commit")
+      cd.waitSampling()
+
+      dut.rob.logic.completion(0).valid #= true; dut.rob.logic.completion(0).payload #= 1
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      assert(dut.tsink.logic.traceOut(0).pc.toLong == 0x408000ceL,
+        f"the FOLLOWING instruction's commit-pc must be its OWN predNextPc (0x408000ce), " +
+        f"got 0x${dut.tsink.logic.traceOut(0).pc.toLong}%x -- a value equal to the just-" +
+        "retired FMOVEM's own commit-pc (0x408000cc) here would reproduce repro C inside " +
+        "RobPlugin itself")
+      cd.waitSampling()
+      assert(dut.rob.logic.count.toInt == 0, "ROB drained")
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   test("flush squashes in-flight entries") {
     M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)

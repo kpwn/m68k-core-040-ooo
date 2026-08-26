@@ -363,4 +363,179 @@ class LsEuSplitRingSpec extends AnyFunSuite {
       }
     }
   }
+
+  /** CAS2-style STRESS: two independent split (misaligned, line-crossing) loads from
+    * the SAME instruction, issued back-to-back with no wait between them.
+    *
+    * CAS2's own microcode (`Microcode.scala` CAS2_ENTRY rows d0/d1) issues exactly this
+    * shape unconditionally: `LOAD.sz (Rn1) -> T0` immediately followed by
+    * `LOAD.sz (Rn2) -> T1`, with no dependency between them, before either compare runs
+    * (see the class doc on CAS2's 10-uop crack). If Rn1 and Rn2 are BOTH misaligned to a
+    * cross-line offset, each load consumes 2 of the aligned ring's 4 slots -- so the two
+    * loads together can fully exhaust the ring's entire depth with TWO CONCURRENT split
+    * pairs resident at once. This is a stress condition the other tests in this file
+    * never reach (they only ever have one split pair in flight, alongside at most
+    * ordinary single-slot entries).
+    *
+    * The ring's own class-level design comment (`splitMergeLine`, `LsEuPlugin.scala`)
+    * argues this is safe: the single shared `splitMergeLine` register that carries slot
+    * A's raw line to slot B's merge can only ever be live for ONE pair at a time, because
+    * `alignedSendPtr`/`alignedRspPtr` are single pointers that walk the ring in STRICT
+    * index order on both the send side and the response side -- so pair 2's slot A cannot
+    * even be SENT until pair 1's slot B has been sent (send order can't skip a held
+    * entry), and pair 2's slot A response cannot arrive before pair 1's slot B response
+    * (responses are strict FIFO matching send order). This test builds the two-pair-
+    * resident state directly and proves BOTH operands merge to the correct, distinct
+    * value -- i.e. no aliasing between the two concurrent pairs' merge state, and no
+    * pointer confusion between their ring slots.
+    */
+  test("two concurrent CAS2-style split-load pairs fully exhaust the ring without cross-corrupting operands", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      // Two distinct 16-byte lines, far apart (not aliasing), each individually
+      // misaligned to the exact LONG cross-line offset the other tests in this file
+      // already proved split-eligible (base+14 -> spans ...E..11).
+      val rn1Base = 0x5000L + 14   // "Rn1" operand address: spans 0x500E..0x5011
+      val rn2Base = 0x9000L + 14   // "Rn2" operand address: spans 0x900E..0x9011 (different line entirely)
+      preload(mem, 0x5000L, 32); preload(mem, 0x9000L, 32)
+      seed(dut, cd, preg = 10, value = rn1Base)   // stands in for CAS2's Rn1
+      seed(dut, cd, preg = 11, value = rn2Base)   // stands in for CAS2's Rn2
+
+      // Track ring occupancy every cycle so we can PROVE (not just assume) that both
+      // split pairs were simultaneously resident -- all 4 slots valid, all 4 flagged
+      // twoAccess, 2 of them slot-A (splitSecond=false) and 2 slot-B (splitSecond=true)
+      // -- at some point, rather than trusting the instruction sequence "should" do it.
+      var sawFullRingBothPairs = false
+      var maxValidCount = 0
+      val tracking = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork {
+        while (tracking.get()) {
+          val l = dut.eu.logic
+          val validFlags = (0 until 4).map(i => l.alignedValid(i).toBoolean)
+          val twoAccFlags = (0 until 4).map(i => l.alignedMem(i).twoAccess.toBoolean)
+          val splitSecondFlags = (0 until 4).map(i => l.alignedMem(i).splitSecond.toBoolean)
+          val nValid = validFlags.count(identity)
+          maxValidCount = math.max(maxValidCount, nValid)
+          val allValidAreSplit = validFlags.zip(twoAccFlags).forall { case (v, t) => !v || t }
+          val nSlotA = validFlags.zip(splitSecondFlags).count { case (v, s) => v && !s }
+          val nSlotB = validFlags.zip(splitSecondFlags).count { case (v, s) => v && s }
+          if (nValid == 4 && allValidAreSplit && nSlotA == 2 && nSlotB == 2) {
+            sawFullRingBothPairs = true
+          }
+          cd.waitSampling()
+        }
+      }
+
+      // Issue Rn1's load then Rn2's load back-to-back (no wait between, mirroring
+      // CAS2's unconditional d0/d1 microcode issue order) -- distinct pdst AND robId
+      // so a wrong-operand corruption (wrong value landing on the wrong destination,
+      // or a stale/aliased merge line) is directly observable.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 30, robId = 1)  // "T0" <- (Rn1)
+      issueLoad(dut, cd, basePreg = 11, disp = 0, Size.LONG, pdst = 31, robId = 2)  // "T1" <- (Rn2)
+
+      assert(waitCompletion(dut, cd, robId = 1), "Rn1 split load completes")
+      assert(waitCompletion(dut, cd, robId = 2), "Rn2 split load completes")
+      tracking.set(false)
+      cd.waitSampling(4)
+
+      assert(maxValidCount == 4,
+        s"expected the ring to reach full occupancy (4 valid entries), got max=$maxValidCount " +
+        "-- the two split pairs never actually overlapped, so this test did not exercise the " +
+        "intended concurrent-pairs stress condition")
+      assert(sawFullRingBothPairs,
+        "expected a cycle where all 4 ring slots were valid, all flagged twoAccess, with " +
+        "exactly 2 slot-A and 2 slot-B entries -- i.e. BOTH split pairs concurrently resident " +
+        "-- but never observed it; the two loads did not truly overlap in the ring")
+
+      val gotRn1 = readInt(dut, 30)
+      val gotRn2 = readInt(dut, 31)
+      val expRn1 = expected(rn1Base, 4)
+      val expRn2 = expected(rn2Base, 4)
+      assert(gotRn1 == expRn1,
+        s"Rn1 operand: got ${gotRn1.toString(16)} exp ${expRn1.toString(16)} " +
+        s"(exp-Rn2 was ${expRn2.toString(16)} -- a match against THAT would mean operand " +
+        "aliasing between the two concurrent split pairs)")
+      assert(gotRn2 == expRn2,
+        s"Rn2 operand: got ${gotRn2.toString(16)} exp ${expRn2.toString(16)} " +
+        s"(exp-Rn1 was ${expRn1.toString(16)} -- a match against THAT would mean operand " +
+        "aliasing between the two concurrent split pairs)")
+    }
+  }
+
+  /** campaign/fmovem-postinc-ring: the EXACT 24-chunk address pattern
+    * `FMOVEM.X (d16,An),FP0-FP7` generates off a misaligned base (base+2, 8 elements x
+    * 3 four-byte chunks, 12-byte element stride) -- driven DIRECTLY at the LS EU as raw
+    * back-to-back LONG loads, bypassing the DecodeStage `fmovemxActive` FSM entirely.
+    *
+    * Why this exists ALONGSIDE (not instead of) the `FpuLockStepSpec` lock-step test:
+    * that test is BLOCKED by a real, separately-filed bug
+    * (docs/BUG_fmovemx_dataload_rob_commit_corruption.md) in the ROB's commit-PC
+    * framing for the FSM's FP-lane-completion kept-commit µop -- unrelated to the
+    * aligned-load split ring itself, but it stops the lock-step program from ever
+    * reaching a compared FPn value. This test proves the RING mechanism the campaign
+    * actually cares about -- genuine back-to-back multi-split pressure at a ROTATING
+    * phase, and correct, non-aliased merged results for every chunk -- completely
+    * independently of that bug, since it drives the LS EU directly and never goes
+    * through decode/rename/ROB at all.
+    *
+    * Address table (hand-verified against `LsEuPlugin.s1CrossLine`, same arithmetic as
+    * the lock-step test's own header comment): 8 elements x 3 chunks, chunk i of
+    * element k at byte offset `2 + 12*k + 4*i` from the 16-byte line-grid origin.
+    * Exactly 6 of 24 chunks cross a line (elements k in {1,2,3,5,6,7}, one chunk each,
+    * ROTATING chunk0->chunk1->chunk2->chunk0... every element since gcd(12,16)=4);
+    * k=0 and k=4 never split. */
+  test("FMOVEM.X-shaped rotating-phase address pattern: >=6 genuine back-to-back splits, every chunk correct", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5000L
+      preload(mem, base, 128)   // covers offset 2..97 (last chunk ends at 2+84+4+3=97)
+      seed(dut, cd, preg = 10, value = base)
+
+      val disps = for (k <- 0 until 8; i <- 0 until 3) yield (2L + 12L * k + 4L * i)
+      var splitCount = 0
+      var completed = Set.empty[Int]
+      val watching = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork {
+        while (watching.get()) {
+          if (dut.eu.logic.alignedEnqSplit.toBoolean) splitCount += 1
+          if (dut.src.logic.cValid.toBoolean) completed += dut.src.logic.cRob.toInt
+          cd.waitSampling()
+        }
+      }
+      // Issuer on its own thread (mirrors the burst test above): back-to-back, no
+      // waiting between chunks, so the ring genuinely sees them overlap in flight --
+      // the actual stress this test exists to apply.
+      fork {
+        for ((disp, idx) <- disps.zipWithIndex)
+          issueLoad(dut, cd, basePreg = 10, disp = disp, Size.LONG, pdst = 20 + idx, robId = 1 + idx)
+      }
+
+      var n = 0
+      while (completed.size < disps.size && n < 4000) { cd.waitSampling(); n += 1 }
+      watching.set(false)
+      cd.waitSampling(4)
+
+      val l = dut.eu.logic
+      assert(completed.size == disps.size,
+        s"only ${completed.size}/${disps.size} chunk loads completed in $n cycles (missing " +
+        s"${(1 to disps.size).filterNot(completed).mkString(",")}) -- push=${l.alignedPushPtr.toInt} " +
+        s"send=${l.alignedSendPtr.toInt} rsp=${l.alignedRspPtr.toInt} count=${l.alignedCount.toInt} " +
+        s"sendHeld=${l.alignedSendHeld.toBoolean}")
+
+      // (1) genuine multi-split pressure, not a theoretical claim.
+      assert(splitCount >= 6,
+        s"expected >= 6 aligned-ring split-pair pushes (elements k in {1,2,3,5,6,7}) -- " +
+        s"only saw $splitCount")
+
+      // (2) every chunk's merged value is correct -- catches any aliasing/cross-talk
+      // between concurrently in-flight split pairs.
+      for ((disp, idx) <- disps.zipWithIndex) {
+        val addr = base + disp
+        val got  = readInt(dut, 20 + idx)
+        val exp  = expected(addr, 4)
+        assert(got == exp,
+          f"chunk $idx (addr 0x$addr%x, disp=$disp): got 0x${got.toString(16)} exp 0x${exp.toString(16)}")
+      }
+    }
+  }
 }

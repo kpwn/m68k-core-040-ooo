@@ -581,7 +581,24 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // which cannot go through LockStep.compare (Long-based end to end).
                   // Runs as the LAST statement of the doSim body, i.e. only after the
                   // integer/PC/SR lock-step comparison above has already passed.
-                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => ()): Unit = {
+                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => (),
+                  // Per-cycle whitebox hook, default no-op (every existing call site
+                  // unchanged). Runs INSIDE the same `cd.onSamplings` block as the
+                  // existing writeback/commit capture, i.e. once per clock, for the
+                  // WHOLE run -- unlike `afterRun` (once, at the end). Added for the
+                  // FMOVEM.X postinc-ring rotating-phase-split campaign scenario: proving
+                  // the aligned-load split ring actually took MULTIPLE splits over the
+                  // course of one macro-instruction needs a live per-cycle tap
+                  // (`alignedEnqSplit`), not just a final-state check.
+                  perCycle: FullCoreDut => Unit = _ => (),
+                  // Pre-run whitebox hook, default no-op => every existing call site is
+                  // unchanged. Invoked immediately after `cd.forkStimulus`, i.e. BEFORE
+                  // any instruction retires, so a caller can register its own
+                  // `cd.onSamplings` probe (e.g. counting `lsEu.logic.alignedEnqSplit`
+                  // pulses) that observes the WHOLE run — registering it in `afterRun`
+                  // would be too late, since commits/retirement have already finished
+                  // by the time `afterRun` runs.
+                  duringRun: (FullCoreDut, ClockDomain) => Unit = (_, _) => ()): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -622,6 +639,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      duringRun(dut, cd)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
 
@@ -726,6 +744,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
+        perCycle(dut)
       }
 
       // Attach the program to the I-cache AXI.
@@ -2179,6 +2198,90 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0xCAFEBABE,%d2",
       "move.l %d2,(%a0)"                                // cross-line STORE to 0x3FFE
     )).mkString(" ; "), checkMem = Seq(0x3FFEL), checkSpan = 4)
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // STACKED HAZARD (campaign/bfins-splitring): a bit-field 5-byte-span chain
+  // (needHi=True -- offset+width>32, see BitfieldDecodeSpec's "BFEXTU mem 5-byte
+  // span (offset 7, width 28)" test) whose own b0/b1 LOAD.L/LOAD.B (BF_RMW_5B_ENTRY
+  // row a0, Microcode.scala) lands the LOAD.L at a byte-base that is ITSELF
+  // split-eligible through the aligned-load RING this session fixed
+  // (`alignedSlotAPending = alignedRspPtr =/= alignedSendPtr`, LsEuPlugin.scala) --
+  // the exact "LONG@14" cross-line offset LsEuSplitRingSpec proves split-eligible
+  // for an ordinary load. This is a genuinely NEW combination: `bfMemSeedLine`
+  // already has a precedent test just above ("BFSET mem misaligned LONG store
+  // crossing a cache line") pairing a bit-field RMW with a cross-line STORE, but
+  // that store split goes through a COMPLETELY DIFFERENT, unrelated mechanism --
+  // the StoreQueue's own single-entry twoAccess/paddrB/nbytesA/nbytesB byte-lane
+  // split (see the "store split (byte-lane) for the SQ entry" block in
+  // LsEuPlugin.scala) -- NOT the aligned ring `alignedEnqSplit` targets here, and
+  // that precedent test's width (24) never spills into a 5th byte (needHi=False),
+  // so it never combines with the bit-field engine's lo/hi funnel either. Here:
+  // width 28 forces needHi (bitOff 7 + width 28 = 35 > 32), so the chain ALSO
+  // runs the b1/b6 LOAD.B/STORE.B spill-byte pair at byteAddr+4 = 0x4002 (an
+  // ordinary, non-split single-byte access) alongside the split LOAD.L/STORE.L at
+  // 0x3FFE -- both mechanisms, stacked on one instruction, for the first time.
+  //
+  // `duringRun` counts real `alignedEnqSplit` ring-push pulses directly off the
+  // FullCoreDut's simPublic LsEuPlugin signals -- direct mechanism proof, not just
+  // address-table inference. The program deliberately runs the same split-eligible
+  // 5-byte LOAD.L TWICE (BFINS's own b0 read, then a following BFEXTU readback),
+  // so `splitEnqCount == 2` also confirms the ring cleanly re-enters and re-drains
+  // a SECOND split pair right after the first (no ring-pointer aliasing/stale-state
+  // handoff issue between the two 5-byte chains) -- see item (d) of the campaign
+  // scenario. `checkMem` independently proves full memory correctness: the RMW
+  // must change ONLY the #7:#28 field's bits and preserve every other bit in both
+  // the 4-byte long AND the 5th spill byte (classic RMW correctness), verified
+  // byte-for-byte against Musashi's own oracle memory image, not a hand-derived
+  // expectation.
+  //
+  // ROOT CAUSE (found by this test, RED before the StoreQueue.scala fix below it in
+  // the same commit): NOT the aligned ring itself -- `splitEnqCount` and the LO4/LO5
+  // long-store bytes were always correct. The real bug lived in `StoreQueue.scala`'s
+  // same-line WRITETHROUGH-refill hazard (`sameLine`/`perEntry`): it compared an
+  // older store's line only against the query's OWN starting line (`qLine`), never
+  // against the line a CROSS-LINE query spills into (`qLine + 1`) -- so a same-line,
+  // non-overlapping older store sitting in the SPILLED line (here: `bfMemSeedLine`'s
+  // own "move.l %d1,4(%a0)" store at 0x4002, in slot B's line) never triggered the
+  // stall, letting the split LOAD.L's slot-B miss refill race that store and cache a
+  // permanently-stale line -- silently corrupting the LATER b1/b6 spill-byte access
+  // at 0x4002. See the minimal (bit-field-free) regression right below this test.
+  // ════════════════════════════════════════════════════════════════════════════
+  test("lock-step: BFINS mem 5-byte span (offset 7 width 28) crossing a split-eligible cache line", VerilatorTest) {
+    var splitEnqCount = 0
+    runLockStep("bfins-span5-splitring", (bfMemSeedLine ++ Seq(
+      "ori #0x10,%ccr",                                     // X=1 sentinel (BFINS leaves X untouched)
+      "move.l #0x0abcdef1,%d1",                             // a non-trivial partial pattern (not 0/-1)
+      "bfins %d1,(%a0){#7:#28}",                             // byteAddr = %a0+0 = 0x3FFE (split LOAD.L/STORE.L)
+      "bfextu (%a0){#7:#28},%d2"                             // readback: a SECOND split LOAD.L right after
+    )).mkString(" ; "), checkMem = Seq(0x3FFEL, 0x4002L), checkSpan = 4,
+      duringRun = (dut, cd) => cd.onSamplings {
+        if (dut.lsEu.logic.alignedEnqSplit.toBoolean) splitEnqCount += 1
+      })
+    assert(splitEnqCount == 2,
+      s"expected exactly 2 aligned-ring split-pair pushes (BFINS's own b0 LOAD.L, then " +
+      s"BFEXTU's readback LOAD.L) -- got $splitEnqCount. 0 would mean the address choice " +
+      s"silently missed the split-eligible offset (degrading this test to the already-" +
+      s"covered non-split case); any other count means the ring saw an unexpected extra " +
+      s"or missing split push for this exact instruction sequence.")
+  }
+
+  // Minimal, bit-field-engine-free regression for the StoreQueue same-line-hazard
+  // fix above: an ordinary CROSS-LINE LOAD.L (splits: slot A 3FFE-3FFF, slot B
+  // 4000-4003) whose spill lands on the SAME line as an older, not-yet-drained
+  // WRITETHROUGH store at a DIFFERENT (non-overlapping) byte offset within that
+  // line, immediately followed by an ordinary same-line LOAD.B at that store's own
+  // address. Pre-fix, the split LOAD.L's slot-B miss refill raced that store and
+  // cached a stale line, so the immediately-following LOAD.B silently read back the
+  // WRONG (pre-store) byte -- reproduced here via full lock-step register/CCR
+  // comparison against Musashi (a plain MOVE.B sets N/Z from the loaded byte, so a
+  // wrong byte shows up as a flag divergence even without checking the register
+  // value directly).
+  test("lock-step: cross-line split LOAD.L then same-line LOAD.B (StoreQueue same-line-hazard spill-line gap)", VerilatorTest) {
+    runLockStep("splitload-then-sameline-load", (bfMemSeedLine ++ Seq(
+      "move.l (%a0),%d2",                                   // split LOAD.L: slot A 3FFE-3FFF, slot B 4000-4003
+      "move.b 4(%a0),%d3"                                    // ordinary LOAD.B at 0x4002 (within slot B's line)
+    )).mkString(" ; "))
   }
 
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
@@ -7258,6 +7361,489 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // is delivered through the ordinary LS/DTLB path (NOT special-cased) -> faultVa == 0x2000.
       assert(faultAddr == 0x2000L,
         f"[fx-mi-fault] the faulting access EA must be the pointer-load addr 0x2000 (got 0x$faultAddr%08x)")
+    }
+  }
+
+  // ── MOVEM mid-list fault (task: campaign/movem-midlist-fault) ────────────────
+  // `MOVEM.L (An)+,D0-D3` where the 3rd register's (D2's) load faults (its target page
+  // is non-resident). Ground truth was pulled EMPIRICALLY from this project's own Musashi
+  // oracle (`musashi_run` / `m68kcpu.c`), NOT assumed from general 680x0 lore -- and the
+  // empirical result is the OPPOSITE of the naive "68040 leaves already-loaded registers
+  // intact" assumption:
+  //
+  //   `m68k_execute`'s main loop snapshots ALL 16 D/A registers into `REG_DA_SAVE` before
+  //   EVERY instruction (m68kcpu.c ~line 1040: "Record previous D/A register state (in
+  //   case of bus error)"), and `m68ki_exception_bus_error` (m68kcpu.h ~line 2032, the SAME
+  //   path this project's 68040 access-fault format-$7 delivery reuses) unconditionally
+  //   restores `REG_DA[i] = REG_DA_SAVE[i]` for ALL 16 registers on ANY bus/access error --
+  //   this is stock Musashi's address-error-recovery mechanism, generalized by this
+  //   project's 68040 MMU patch to page faults too. So a MOVEM LOAD that faults mid-list
+  //   rolls back EVERY register the instruction touched, not just the ones from-the-fault-
+  //   point-onward: D0/D1 (loaded successfully BEFORE the fault, in program order) are
+  //   ALSO restored to their pre-instruction (poison) values, and An is left completely
+  //   UNCHANGED (not even partially incremented). Verified directly via a step-by-step
+  //   Musashi trace during this task's investigation (D0-D3 all read back as the poison
+  //   seed, A0 unchanged, at the trace step immediately after the fault).
+  //
+  //   This makes total sense once you see the mechanism: LOAD register writes are pure
+  //   internal CPU state (never observable outside the core) until the instruction retires,
+  //   so they're trivially revocable; a STORE's memory write, once issued to the bus, is
+  //   NOT revocable -- see the STORE-direction mirror test below, which confirms already-
+  //   landed stores stay landed even though the address register ITSELF still rolls back.
+  //
+  // Per-uop ROB commit semantics (RobPluginSpec's "h0IsMacroLast" test) predict this SHOULD
+  // just fall out for free on this RTL: D0/D1's move-uops retire (write PRF) BEFORE D2's
+  // move-uop reaches the ROB head; D2's fault triggers `exceptionPending` at ROB-head, which
+  // flushes the REST of the ROB (D2's own move-uop -- never committed a write since the LS EU
+  // reports "no reg write" on a fault -- D3's move-uop, and the trailing An-update uop). The
+  // question this test resolves is whether "already committed" for D0/D1 leaves them
+  // ARCHITECTURALLY VISIBLE post-fault. Per the Musashi ground truth above, on THIS project's
+  // reference model the answer is actually "no" for MOVEM specifically -- OoO commit ordering
+  // doesn't matter here because ALL of MOVEM's register-list transfers are cracked from ONE
+  // macro-instruction that maps to ONE oracle step; Musashi's own instruction boundary is the
+  // WHOLE MOVEM, so its "before this instruction" register snapshot predates D0's transfer
+  // too. If the RTL's D0/D1 commits are independently, individually retired/architecturally
+  // visible (each freeing its own old phys-reg mapping) BEFORE the fault flush, that is a
+  // REAL DIVERGENCE from the oracle worth finding -- rename-checkpoint granularity for a
+  // macro-instruction's INTERNAL crack uops is exactly the kind of thing this test is
+  // designed to catch.
+  //
+  // CONFIRMED DIVERGENCE (task campaign/movem-midlist-fault, 2026-08-26): this RTL does
+  // NOT roll back D0/D1. The frame (PC/fmtVec/EA/SSW/faultAddr) matches Musashi EXACTLY --
+  // precise fault delivery for the individual D2 move-uop is correct -- but D0/D1 are
+  // architecturally VISIBLE with their loaded values (0x11112222/0x33334444) instead of
+  // being restored to poison. Root cause: this ROB retires/frees old phys-reg mappings for
+  // each move-uop INDEPENDENTLY and IMMEDIATELY as it reaches the ROB head (confirmed via
+  // RobPlugin.scala's own debugMacroCountInc comment: "a 5-uop MOVEM retiring across 5
+  // cycles increments exactly once, on its final uop" -- i.e. the INTERMEDIATE uops retire
+  // individually, every cycle, same as any other instruction). Matching Musashi's whole-
+  // macro register rollback would need a genuinely NEW mechanism -- a MOVEM-wide register
+  // snapshot-and-restore (mirroring Musashi's own REG_DA_SAVE) spanning however many uops
+  // the macro cracks into, deferring "irrevocable" old-phys-reg free-list release for the
+  // macro's INTERNAL uops until the macro's LAST uop commits (or an explicit fault-time
+  // undo). This is NOT covered by ordinary per-uop precise-exception recovery (which only
+  // needs to flush NOT-YET-COMMITTED entries) and touches the ROB's shared retire/free-list
+  // path used by every instruction in the machine, which this project's own docs flag as an
+  // FMax-sensitive area. Genuinely architectural -- see `docs/BUG_movem_midlist_load_fault_no_rollback.md`.
+  // Marked pending (not deleted): this is real, valuable regression coverage of the GAP.
+  test("lock-step: MOVEM.L (An)+,D0-D3 LOAD faults on the 3rd register -- full register rollback (Musashi ground truth)", VerilatorTest) {
+    pendingUntilFixed {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L
+    val PAGA = 0x00082000L
+    val PAGD = 0x00084000L
+    // A0 = 0x2ff8 (postinc base): D0@0x2ff8, D1@0x2ffc (VPN2, resident) ; D2@0x3000 FAULTS
+    // (VPN3, non-resident) ; D3@0x3004 (VPN3, never reached). Scratch dump page @ 0x5000
+    // (VPN5, resident) -- the handler dumps D0-D3/A0 there via non-D0-D3 scratch regs
+    // (A1/D7) so we can inspect the LIVE architectural values at the fault instant without
+    // relying on MOVEM's own (dropped-for-lockstep) per-register commit stream.
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +                       // vector 2 @ 0x8
+      "move.l #0x11112222,%d4 ; move.l %d4,0x2ff8 ; " +                 // D0's WOULD-BE loaded value
+      "move.l #0x33334444,%d4 ; move.l %d4,0x2ffc ; " +                 // D1's WOULD-BE loaded value
+      "move.l #0xDEAD0000,%d0 ; move.l #0xDEAD1111,%d1 ; " +            // poison seed
+      "move.l #0xDEAD2222,%d2 ; move.l #0xDEAD3333,%d3 ; " +
+      "move.l #0x2ff8,%a0 ; " +                                          // base
+      "movem.l (%a0)+,%d0-%d3 ; " +                                      // FAULTS on D2 (3rd of 4)
+      "loop: bra loop ; " +
+      "handler: move.l #0x5000,%a1 ; movem.l %d0-%d3,(%a1) ; move.l %a0,0x5010 ; " +
+      "hloop: bra hloop"
+    val preFault = 11   // the 11 setup instructions before the MOVEM (see the numbered list above)
+
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),        // root[0] -> ptr
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L),        // ptr[0]  -> pageA
+      (PAGA + 0 * 4) -> ((0x0L << 12) | 0x1L),          // pageA[0] identity VPN0 (vectors), resident
+      (PAGA + 2 * 4) -> ((0x2L << 12) | 0x1L),          // pageA[2] identity VPN2 (D0/D1), resident
+      (PAGA + 3 * 4) -> 0x0L,                           // pageA[3] NON-resident (D2/D3 -- the fault)
+      (PAGA + 5 * 4) -> ((0x5L << 12) | 0x1L))          // pageA[5] identity VPN5 (scratch), resident
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x6000L, ptPreload = oraclePt))
+
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[movem-load-fault] oracle trace failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= preFault, s"[movem-load-fault] oracle produced ${oracleSteps.size} steps, expected >= $preFault")
+    val oracle = oracleSteps.take(preFault)
+
+    // Ground truth for the POST-FAULT architectural state + frame (empirically pulled, not
+    // assumed -- see the comment block above the test). The spin-forever handler variant
+    // (never touches D0-D3/A0) lets us read the settled final register/memory state directly.
+    val groundTruthSrc = src.replace(
+      "handler: move.l #0x5000,%a1 ; movem.l %d0-%d3,(%a1) ; move.l %a0,0x5010 ; hloop: bra hloop",
+      "handler: bra handler")
+    val gt = Musashi.assembleAndRun(groundTruthSrc, mmu = mmu, maxCycles = 5000) match {
+      case Right(s)  => s
+      case Left(err) => fail(s"[movem-load-fault] oracle ground-truth run failed: ${err.reason}")
+    }
+    val gtFrameBase = 0x00100000L - 60
+    def gtB(off: Long): Int = gt.finalRam.getOrElse(gtFrameBase + off, -1)
+    def gtW(off: Long): Int = ((gtB(off) << 8) | gtB(off + 1)) & 0xffff
+    def gtL(off: Long): Long = ((gtW(off).toLong << 16) | gtW(off + 2)) & 0xffffffffL
+    val gtFaultPc = gtL(2); val gtFmtVec = gtW(6); val gtEA = gtL(8); val gtSsw = gtW(0xc); val gtFaultAddr = gtL(0x14)
+    info(f"[movem-load-fault] Musashi ground truth: D0=0x${gt.d(0)}%08x D1=0x${gt.d(1)}%08x D2=0x${gt.d(2)}%08x D3=0x${gt.d(3)}%08x A0=0x${gt.a(0)}%08x " +
+      f"frame PC=0x$gtFaultPc%08x fmtVec=0x$gtFmtVec%04x EA=0x$gtEA%08x SSW=0x$gtSsw%04x faultAddr=0x$gtFaultAddr%08x")
+    // Sanity-check the ground truth itself against the documented mechanism above: FULL
+    // rollback (not the naive "D0/D1 survive" assumption).
+    assert(gt.d(0) == 0xDEAD0000L && gt.d(1) == 0xDEAD1111L && gt.d(2) == 0xDEAD2222L && gt.d(3) == 0xDEAD3333L,
+      f"[movem-load-fault] Musashi ground truth expected FULL poison rollback, got D0=0x${gt.d(0)}%08x D1=0x${gt.d(1)}%08x D2=0x${gt.d(2)}%08x D3=0x${gt.d(3)}%08x")
+    assert(gt.a(0) == 0x2ff8L, f"[movem-load-fault] Musashi ground truth expected A0 unchanged (0x2ff8), got 0x${gt.a(0)}%08x")
+    assert(gtFmtVec == 0x7008 && gtEA == 0x3000L && gtFaultAddr == 0x3000L,
+      f"[movem-load-fault] Musashi ground truth frame unexpected: fmtVec=0x$gtFmtVec%04x EA=0x$gtEA%08x faultAddr=0x$gtFaultAddr%08x")
+
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[movem-load-fault] assemble failed: ${err.reason}")
+    }
+
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+      }
+      def captureBranch(): Unit = {
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureSq(): Unit = {
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureExc(): Unit = {
+        val c = dut.rob.logic.commitObs(2)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureBranch()
+        captureSq()
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+        }
+        captureExc()
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
+      pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
+      pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)           // pageA[0] identity VPN 0 (vectors)
+      pokeLE(PAGA + 2 * 4,    (0x2L << 12) | 0x1L)           // pageA[2] identity VPN 2 (D0/D1), resident
+      pokeLE(PAGA + 3 * 4,    0x0L)                          // pageA[3] NON-RESIDENT (D2/D3 -- the fault)
+      pokeLE(PAGA + 5 * 4,    (0x5L << 12) | 0x1L)           // pageA[5] identity VPN 5 (scratch dump), resident
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] identity VPN 0xFF (supervisor stack; frame push bypasses translation, kept defensively)
+      // Identity-map the code region (I-fetch also translates).
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling()
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      var sawFault = false; var faultAddr = -1L
+      while (handle.result.size < preFault + 4 && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean && !sawFault) {
+          sawFault = true
+          faultAddr = dut.dtlb.logic.faultVa.toLong & 0xffffffffL
+        }
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[movem-load-fault] the D2 load to the non-resident page must flag a DTLB fault")
+      assert(handle.result.size >= preFault,
+        s"[movem-load-fault] only ${handle.result.size}/$preFault pre-fault instrs committed")
+      val res = LockStep.compare(handle.result.take(preFault), oracle.take(preFault))
+      assert(res.ok,
+        s"[movem-load-fault] pre-fault lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")}")
+      // PRECISION: the faulting access is D2's load (3rd of 4), at the 3rd element's address.
+      assert(faultAddr == 0x3000L,
+        f"[movem-load-fault] the faulting access EA must be D2's target addr 0x3000 (got 0x$faultAddr%08x)")
+
+      // Let the handler run its dump instructions (move.l #0x5000,%a1 ; movem.l %d0-%d3,(%a1) ;
+      // move.l %a0,0x5010) and settle into its self-loop before reading the scratch dump.
+      cd.waitSampling(400)
+
+      // The stacked format-$7 frame must match the Musashi ground truth byte-for-byte.
+      val fb = 0x00100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      val dutFmtVec = pk16(fb + 6); val dutEA = pk32(fb + 8); val dutSsw = pk16(fb + 0xc); val dutFaultAddr = pk32(fb + 0x14)
+      val dutFramePc = pk32(fb + 2)
+      info(f"[movem-load-fault] DUT frame: PC=0x$dutFramePc%08x fmtVec=0x$dutFmtVec%04x EA=0x$dutEA%08x SSW=0x$dutSsw%04x faultAddr=0x$dutFaultAddr%08x")
+      assert(dutFmtVec == gtFmtVec, f"[movem-load-fault] frame fmt/vec: dut=0x$dutFmtVec%04x oracle=0x$gtFmtVec%04x")
+      assert(dutEA == gtEA, f"[movem-load-fault] frame EA: dut=0x$dutEA%08x oracle=0x$gtEA%08x")
+      assert(dutSsw == gtSsw, f"[movem-load-fault] frame SSW: dut=0x$dutSsw%04x oracle=0x$gtSsw%04x")
+      assert(dutFaultAddr == gtFaultAddr, f"[movem-load-fault] frame faultAddr: dut=0x$dutFaultAddr%08x oracle=0x$gtFaultAddr%08x")
+      // The stacked PC must point at the START of the MOVEM instruction (not mid-list),
+      // matching Musashi's own REG_PPC-based frame exactly.
+      assert(dutFramePc == gtFaultPc, f"[movem-load-fault] frame PC: dut=0x$dutFramePc%08x oracle=0x$gtFaultPc%08x (expected the MOVEM's own start PC)")
+
+      // The handler's scratch dump: D0-D3/A0 as the RTL actually left them at the fault
+      // instant, compared against the Musashi ground truth (FULL rollback: D0-D3 all still
+      // poison, A0 unchanged -- NOT the naive "D0/D1 already loaded" assumption).
+      def pk32u(a: Long): Long = pk32(a) & 0xffffffffL
+      val dutD0 = pk32u(0x5000L); val dutD1 = pk32u(0x5004L); val dutD2 = pk32u(0x5008L); val dutD3 = pk32u(0x500cL)
+      val dutA0 = pk32u(0x5010L)
+      info(f"[movem-load-fault] DUT scratch dump: D0=0x$dutD0%08x D1=0x$dutD1%08x D2=0x$dutD2%08x D3=0x$dutD3%08x A0=0x$dutA0%08x")
+      assert(dutD0 == (gt.d(0) & 0xffffffffL), f"[movem-load-fault] D0: dut=0x$dutD0%08x oracle=0x${gt.d(0)}%08x")
+      assert(dutD1 == (gt.d(1) & 0xffffffffL), f"[movem-load-fault] D1: dut=0x$dutD1%08x oracle=0x${gt.d(1)}%08x")
+      assert(dutD2 == (gt.d(2) & 0xffffffffL), f"[movem-load-fault] D2: dut=0x$dutD2%08x oracle=0x${gt.d(2)}%08x")
+      assert(dutD3 == (gt.d(3) & 0xffffffffL), f"[movem-load-fault] D3: dut=0x$dutD3%08x oracle=0x${gt.d(3)}%08x")
+      assert(dutA0 == (gt.a(0) & 0xffffffffL), f"[movem-load-fault] A0: dut=0x$dutA0%08x oracle=0x${gt.a(0)}%08x")
+    }
+    }   // pendingUntilFixed
+  }
+
+  // ── MOVEM mid-list fault, STORE-direction mirror ──────────────────────────────
+  // `MOVEM.L D0-D3,-(An)`: predecrement store order (reversed bit encoding) processes
+  // D3,D2,D1,D0 in that order. Base An=0x3008 places D3@0x3004/D2@0x3000 on a resident
+  // page and D1@0x2ffc/D0@0x2ff8 on a non-resident page, so the 3rd processed store (D1)
+  // faults. UNLIKE the LOAD direction above, a completed STORE is an irrevocable bus
+  // write -- confirmed via the SAME Musashi mechanism audit: `REG_DA_SAVE` restore-on-
+  // fault rolls back REGISTERS (including An -- verified empirically: An is left fully
+  // UNCHANGED, not partially predecremented, even though it was used internally to
+  // compute the already-landed D3/D2 store addresses) but Musashi's memory model has no
+  // equivalent "undo" for `cb_write8`'s `mem_[a]=b` -- once issued, a byte write stays
+  // written. So the EXPECTED (and, per this project's per-uop ROB commit reasoning,
+  // ACHIEVABLE-without-new-hardware) result is: D3/D2 land in memory and STAY landed, D1
+  // (faulting) and D0 (never reached) do not write memory, and An rolls back to its
+  // original value exactly like the LOAD case. This does NOT need the "undo a completed
+  // register write" mechanism the LOAD-direction gap above needs -- memory writes are
+  // already-irrevocable EU-external effects the ROB never has to "un-commit", and An's own
+  // rollback is an ordinary flush-recovers-the-not-yet-retired-An-update-uop story (the
+  // SAME mechanism already proven correct by the LOAD test's A0 assertion).
+  test("lock-step: MOVEM.L D0-D3,-(An) STORE faults on the 3rd store (D1) -- landed stores stay landed, An rolls back", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L
+    val PAGA = 0x00082000L
+    val PAGD = 0x00084000L
+    // -(An) processing order: D3 first (An=0x3008-4=0x3004), D2 (0x3000), D1 (0x2ffc FAULT),
+    // D0 (0x2ff8, never reached). VPN3 (0x3000-0x3fff) resident; VPN2 (0x2000-0x2fff) not.
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +                 // vector 2 @ 0x8
+      "move.l #0xDEAD0000,%d0 ; move.l #0xDEAD1111,%d1 ; " +      // NOTE: re-poisoned after clobbering d1 below
+      "move.l #0xDEAD2222,%d2 ; move.l #0xDEAD3333,%d3 ; " +
+      "move.l #0xDEAD1111,%d1 ; " +                                // re-poison D1 (vector install clobbered it)
+      "move.l #0x3008,%a1 ; " +                                    // base
+      "movem.l %d0-%d3,-(%a1) ; " +                                // FAULTS on D1's store (3rd processed)
+      "loop: bra loop ; " +
+      "handler: move.l %a1,0x5010 ; " +                            // dump A1 (using scratch mem, not D0-D3/A1 regs)
+      "hloop: bra hloop"
+    val preFault = 8   // the 8 setup instructions before the MOVEM
+
+    val oraclePt = Seq(
+      0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L),
+      (PAGA + 0 * 4) -> ((0x0L << 12) | 0x1L),          // pageA[0] identity VPN0 (vectors), resident
+      (PAGA + 2 * 4) -> 0x0L,                            // pageA[2] NON-resident (D1/D0 -- the fault)
+      (PAGA + 3 * 4) -> ((0x3L << 12) | 0x1L),          // pageA[3] identity VPN3 (D3/D2), resident
+      (PAGA + 5 * 4) -> ((0x5L << 12) | 0x1L))          // pageA[5] identity VPN5 (scratch dump), resident
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x6000L, ptPreload = oraclePt))
+
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[movem-store-fault] oracle trace failed: ${err.reason}")
+    }
+    assert(oracleSteps.size >= preFault, s"[movem-store-fault] oracle produced ${oracleSteps.size} steps, expected >= $preFault")
+    val oracle = oracleSteps.take(preFault)
+
+    val groundTruthSrc = src.replace(
+      "handler: move.l %a1,0x5010 ; hloop: bra hloop", "handler: bra handler")
+    val gt = Musashi.assembleAndRun(groundTruthSrc, mmu = mmu, maxCycles = 5000) match {
+      case Right(s)  => s
+      case Left(err) => fail(s"[movem-store-fault] oracle ground-truth run failed: ${err.reason}")
+    }
+    def gtMemB(a: Long): Int = gt.finalRam.getOrElse(a, -1)
+    def gtMemL(a: Long): Long = ((gtMemB(a).toLong<<24)|(gtMemB(a+1).toLong<<16)|(gtMemB(a+2).toLong<<8)|gtMemB(a+3).toLong) & 0xffffffffL
+    val gtFrameBase = 0x00100000L - 60
+    def gtB(off: Long): Int = gt.finalRam.getOrElse(gtFrameBase + off, -1)
+    def gtW(off: Long): Int = ((gtB(off) << 8) | gtB(off + 1)) & 0xffff
+    def gtL(off: Long): Long = ((gtW(off).toLong << 16) | gtW(off + 2)) & 0xffffffffL
+    val gtFaultPc = gtL(2); val gtFmtVec = gtW(6); val gtEA = gtL(8); val gtSsw = gtW(0xc); val gtFaultAddr = gtL(0x14)
+    info(f"[movem-store-fault] Musashi ground truth: mem[0x3004](D3)=0x${gtMemL(0x3004)}%08x mem[0x3000](D2)=0x${gtMemL(0x3000)}%08x " +
+      f"mem[0x2ffc](D1)=0x${gtMemL(0x2ffc)}%08x mem[0x2ff8](D0)=0x${gtMemL(0x2ff8)}%08x A1=0x${gt.a(1)}%08x " +
+      f"frame PC=0x$gtFaultPc%08x fmtVec=0x$gtFmtVec%04x EA=0x$gtEA%08x SSW=0x$gtSsw%04x faultAddr=0x$gtFaultAddr%08x")
+    // Sanity-check the ground truth against the documented mechanism: landed stores STAY landed.
+    assert(gtMemL(0x3004) == 0xDEAD3333L && gtMemL(0x3000) == 0xDEAD2222L,
+      f"[movem-store-fault] Musashi ground truth expected D3/D2 already landed, got mem[0x3004]=0x${gtMemL(0x3004)}%08x mem[0x3000]=0x${gtMemL(0x3000)}%08x")
+    assert(gt.a(1) == 0x3008L, f"[movem-store-fault] Musashi ground truth expected A1 unchanged (0x3008), got 0x${gt.a(1)}%08x")
+
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[movem-store-fault] assemble failed: ${err.reason}")
+    }
+
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+      }
+      def captureBranch(): Unit = {
+        val bw = dut.branchEu.logic.wbObs
+        if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureSq(): Unit = {
+        val sc = dut.lsEu.sqCompletionPort
+        if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
+      }
+      def captureExc(): Unit = {
+        val c = dut.rob.logic.commitObs(2)
+        if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+          if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+          msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureBranch()
+        captureSq()
+        for (k <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+        }
+        captureExc()
+      }
+
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
+      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)
+      pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)
+      pokeLE(PAGA + 2 * 4,    0x0L)                          // NON-RESIDENT (D1/D0 -- the fault)
+      pokeLE(PAGA + 3 * 4,    (0x3L << 12) | 0x1L)           // resident (D3/D2)
+      pokeLE(PAGA + 5 * 4,    (0x5L << 12) | 0x1L)           // resident (scratch dump)
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp   #= 0x80000L
+      dut.ctrl.logic.srp   #= 0x80000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling()
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var guard = 0; val cap = 6000
+      var sawFault = false; var faultAddr = -1L
+      while (handle.result.size < preFault + 4 && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean && !sawFault) {
+          sawFault = true
+          faultAddr = dut.dtlb.logic.faultVa.toLong & 0xffffffffL
+        }
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, "[movem-store-fault] the D1 store to the non-resident page must flag a DTLB fault")
+      assert(handle.result.size >= preFault,
+        s"[movem-store-fault] only ${handle.result.size}/$preFault pre-fault instrs committed")
+      val res = LockStep.compare(handle.result.take(preFault), oracle.take(preFault))
+      assert(res.ok,
+        s"[movem-store-fault] pre-fault lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")}")
+
+      cd.waitSampling(400)
+
+      val fb = 0x00100000L - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      val dutFmtVec = pk16(fb + 6); val dutEA = pk32(fb + 8); val dutSsw = pk16(fb + 0xc); val dutFaultAddr = pk32(fb + 0x14)
+      val dutFramePc = pk32(fb + 2)
+      info(f"[movem-store-fault] DUT frame: PC=0x$dutFramePc%08x fmtVec=0x$dutFmtVec%04x EA=0x$dutEA%08x SSW=0x$dutSsw%04x faultAddr=0x$dutFaultAddr%08x")
+      assert(dutFmtVec == gtFmtVec, f"[movem-store-fault] frame fmt/vec: dut=0x$dutFmtVec%04x oracle=0x$gtFmtVec%04x")
+      // EA/faultAddr: Musashi's generic (shared across ALL cpu types, incl. 68040)
+      // `movem,32,re,pd` C template writes each register's LOW 16-bit half at `ea+2`
+      // BEFORE the HIGH half at `ea` (`m68k_in.c`'s re/pd handler literally calls
+      // `m68ki_write_16(ea+2,...)` before `m68ki_write_16(ea,...)`) -- a 68000-16-bit-
+      // bus-era artifact never updated for the 68020+'s 32-bit bus, NOT gated by
+      // `CPU_TYPE_IS_040_PLUS`. So Musashi reports the fault 2 bytes INTO the access
+      // (`ea+2`) for a predecrement MOVEM.L store, whereas this RTL performs the
+      // store as one atomic 32-bit transaction and reports the access's own base
+      // address (`ea`) -- which is the architecturally sensible answer for a real
+      // 68040's 32-bit bus. This is judged an ORACLE MODELING GAP (a legacy 16-bit-
+      // bus quirk Musashi's generic template never updated for 68020+), not an RTL
+      // bug -- do NOT force the RTL to match it. Accept either exact offset here
+      // (both land in the SAME faulting page/access; the architecturally load-
+      // bearing facts -- fmtVec/SSW/PC/which-stores-landed/An-rollback -- are
+      // asserted strictly above and below).
+      assert(dutEA == gtEA || dutEA == (gtEA - 2),
+        f"[movem-store-fault] frame EA: dut=0x$dutEA%08x oracle=0x$gtEA%08x (neither exact nor the documented ea/ea+2 Musashi quirk)")
+      assert(dutSsw == gtSsw, f"[movem-store-fault] frame SSW: dut=0x$dutSsw%04x oracle=0x$gtSsw%04x")
+      assert(dutFaultAddr == gtFaultAddr || dutFaultAddr == (gtFaultAddr - 2),
+        f"[movem-store-fault] frame faultAddr: dut=0x$dutFaultAddr%08x oracle=0x$gtFaultAddr%08x (neither exact nor the documented ea/ea+2 Musashi quirk)")
+      assert(dutFramePc == gtFaultPc, f"[movem-store-fault] frame PC: dut=0x$dutFramePc%08x oracle=0x$gtFaultPc%08x (expected the MOVEM's own start PC)")
+
+      def pk32u(a: Long): Long = pk32(a) & 0xffffffffL
+      val dutD3 = pk32u(0x3004L); val dutD2 = pk32u(0x3000L)
+      val dutA1 = pk32u(0x5010L)
+      info(f"[movem-store-fault] DUT memory: mem[0x3004](D3)=0x$dutD3%08x mem[0x3000](D2)=0x$dutD2%08x A1(dumped)=0x$dutA1%08x")
+      assert(dutD3 == (gtMemL(0x3004) & 0xffffffffL), f"[movem-store-fault] mem[0x3004] (D3, should stay landed): dut=0x$dutD3%08x oracle=0x${gtMemL(0x3004)}%08x")
+      assert(dutD2 == (gtMemL(0x3000) & 0xffffffffL), f"[movem-store-fault] mem[0x3000] (D2, should stay landed): dut=0x$dutD2%08x oracle=0x${gtMemL(0x3000)}%08x")
+      assert(dutA1 == (gt.a(1) & 0xffffffffL), f"[movem-store-fault] A1: dut=0x$dutA1%08x oracle=0x${gt.a(1)}%08x")
     }
   }
 
