@@ -94,6 +94,42 @@ class ItlbSpec extends AnyFunSuite {
     (dut.probe.logic.rspOut.ready.toBoolean, dut.probe.logic.rspOut.ppn.toLong, dut.probe.logic.rspOut.fault.toBoolean)
   }
 
+  // Task #TTR-off-gating fix: like `lookup`, but also returns the resolved cacheMode
+  // -- needed to distinguish "TTR-transparent INHIBITED" from the mmuEnable=False
+  // fallback's fixed WRITETHROUGH, which the plain 3-tuple `lookup` can't see.
+  // Returns cacheMode as a String (rather than the raw SpinalEnumCraft), read
+  // immediately at capture time -- matching TlbSpec.lookup's established pattern
+  // of resolving the enum comparison/representation AT THE READ POINT, not passing
+  // the live simulation-backed enum handle across a function-return boundary.
+  def lookupWithMode(dut: Dut, cd: ClockDomain, vpn: Long, supervisor: Boolean = false): (Boolean, Long, Boolean, String) = {
+    dut.probe.logic.reqIn.valid #= true
+    dut.probe.logic.reqIn.vpn   #= vpn
+    dut.probe.logic.reqIn.write #= false
+    dut.probe.logic.reqIn.supervisor #= supervisor
+    cd.waitSampling()
+    var guard = 0
+    while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+    sleep(1)
+    val ready = dut.probe.logic.rspOut.ready.toBoolean
+    val ppn   = dut.probe.logic.rspOut.ppn.toLong
+    val fault = dut.probe.logic.rspOut.fault.toBoolean
+    val mode  = dut.probe.logic.rspOut.cacheMode.toEnum.toString
+    (ready, ppn, fault, mode)
+  }
+
+  // Builds an ITT register value per MC68040 UM S3.1.2 / TtMatch's field layout:
+  //   [31:24] base  [23:16] mask (1=don't-care)  [15] E  [14:13] S  [6:5] CM
+  // `sBits`: 0="00" user-only, 1="01" supervisor-only, 2/3="1x" match either mode.
+  def buildTtr(base: Int, mask: Int, enable: Boolean, sBits: Int, inhibited: Boolean): Long = {
+    var v = 0L
+    v |= (base.toLong & 0xff) << 24
+    v |= (mask.toLong & 0xff) << 16
+    if (enable) v |= (1L << 15)
+    v |= (sBits.toLong & 0x3) << 13
+    if (inhibited) v |= (1L << 6)   // CM[1] (bit 6) = non-cacheable/inhibited
+    v
+  }
+
   test("ITLB: MMU disabled -> identity passthrough", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
@@ -308,6 +344,71 @@ class ItlbSpec extends AnyFunSuite {
       while (mem.peekByte(pageAddr + 3) != 0x09 && guard < 300) { cd.waitSampling(); guard += 1 }
       assert(mem.peekByte(pageAddr + 3) == 0x09,
         f"post-re-walk commit must set U (0x09); got 0x${mem.peekByte(pageAddr + 3)}%x")
+    }
+  }
+
+  // Fix for the TTR/mmuEnable gating bug (found via live-hardware boot investigation,
+  // docs/BUG_video_driver_selection.md, commit 4339fa7; same fix as DtlbPlugin's
+  // DTT0/DTT1, applied here to ITT0/ITT1): ITT0/ITT1 must apply regardless of
+  // mmuEnable -- gated only by their own E bit, per real 68040 semantics. This pins
+  // the case the bug fixes: MMU OFF, ITT0 configured (E=1) and matching the fetch
+  // VA -- the response must reflect ITT0's OWN cacheMode (INHIBITED here), NOT the
+  // mmuEnable=False fallback's fixed WRITETHROUGH.
+  test("ITLB: MMU disabled + ITT0 match -> TTR cacheMode wins, not the disabled-MMU WRITETHROUGH default", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      new BehavioralMemAgent(dut.walkerAxi, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
+      dut.probe.logic.accessRobId #= 0
+      dut.probe.logic.commitValid #= false; dut.probe.logic.commitId #= 0
+      dut.probe.logic.flush #= false
+      dut.probe.logic.pflusha #= false
+      cd.waitSampling(4)
+
+      // mmuEnable stays False (default) -- this is the whole point: ITT0 must still
+      // apply. VA 0x5000_1000 mirrors the real VIA/SCC/DAFB MMIO window (base 0x50,
+      // mask=0x00 -> exact top-byte match), S="1x" (match either mode), CM=inhibited.
+      val va = 0x50001000L
+      dut.ctrl.logic.itt0 #= buildTtr(base = 0x50, mask = 0x00, enable = true, sBits = 2, inhibited = true)
+      cd.waitSampling(2)
+
+      val (ready, ppn, fault, mode) = lookupWithMode(dut, cd, vpnOf(va))
+      assert(ready, "ITT0-transparent fetch must be ready (bypasses walker/TLB)")
+      assert(!fault, "a TTR-transparent access never faults")
+      assert(ppn == vpnOf(va), f"TTR hit is PA=VA (identity): got 0x$ppn%x expected 0x${vpnOf(va)}%x")
+      assert(mode == "INHIBITED",
+        s"ITT0's own cacheMode (INHIBITED) must win over the mmuEnable=False default (WRITETHROUGH); got $mode")
+    }
+  }
+
+  // Mirror negative case: MMU still off, ITT0 configured but its OWN E bit clear ->
+  // must fall back to the pre-existing identity/WRITETHROUGH behavior unchanged.
+  test("ITLB: MMU disabled + ITT0 configured but E bit clear -> unchanged WRITETHROUGH identity fallback", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      new BehavioralMemAgent(dut.walkerAxi, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
+      dut.probe.logic.accessRobId #= 0
+      dut.probe.logic.commitValid #= false; dut.probe.logic.commitId #= 0
+      dut.probe.logic.flush #= false
+      dut.probe.logic.pflusha #= false
+      cd.waitSampling(4)
+
+      val va = 0x50001000L
+      // Same base/mask/CM as the positive case, but E=0 (disabled) -- must NOT match.
+      dut.ctrl.logic.itt0 #= buildTtr(base = 0x50, mask = 0x00, enable = false, sBits = 2, inhibited = true)
+      cd.waitSampling(2)
+
+      val (ready, ppn, fault, mode) = lookupWithMode(dut, cd, vpnOf(va))
+      assert(ready, "disabled MMU (no TTR match) must still be ready")
+      assert(!fault, "no fault when disabled and no TTR matched")
+      assert(ppn == vpnOf(va), "identity ppn unchanged")
+      assert(mode == "WRITETHROUGH",
+        s"an E=0 TTR must not match -- fallback must remain WRITETHROUGH; got $mode")
     }
   }
 }
