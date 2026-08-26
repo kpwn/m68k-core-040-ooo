@@ -420,6 +420,38 @@ class StoreQueue(depth: Int = 8) extends Component {
     // `SqAlloc.cacheModeB`) so a COPYBACK entry no longer forces this stall for a
     // same-line-but-non-overlapping query; WRITETHROUGH (and INHIBITED, already covered
     // separately by `serialStall` below) keep it exactly as conservative as before.
+    //
+    // AREA-COST FOLLOW-UP (the "+2,287 LUT" concern `9130a0b2` flagged against itself and
+    // asked to be root-caused): that number is a MISATTRIBUTION. Measured, not argued:
+    //   * It reproduces exactly -- OOC synth of the parent vs this commit, same machine,
+    //     same tool: CLB LUTs 98,018 -> 100,305 (+2,287), raw LUT cells 97,124 -> 98,971
+    //     (+1,847), FF +18, WNS -1.156ns -> -0.867ns (timing IMPROVED).
+    //   * But normalising SpinalHDL's line-number-derived signal names and diffing the two
+    //     20MB netlists shows the ONLY logic difference in the WHOLE design is the eight
+    //     `perEntry_i_sameLine` assigns below -- 16 two-bit enum compares folded into
+    //     already-present 28-bit comparators. Everything else in that diff is signal
+    //     RENAMING caused by the DcachePlugin.scala comment edits shifting line numbers.
+    //     Re-synthesising the post-commit netlist with ONLY those eight assigns reverted
+    //     (renaming kept) reproduces the parent's numbers BIT-IDENTICALLY on every metric,
+    //     so the renaming contributes exactly zero and the delta is causally this change.
+    //   * It is NOT timing-driven: at a relaxed 20ns clock (13-14ns of slack, no timing
+    //     pressure at all) the raw LUT delta is the SAME +1,847, with identical F7 (-50),
+    //     F8 (-91) and CARRY8 (-6) deltas.
+    //   * Localising the delta by driven-signal name settles it: `LsEuPlugin*` -- which is
+    //     where this StoreQueue and every changed gate LIVES -- moves by +12 LUTs, and this
+    //     forward cone itself (`perEntry`/`sameLine`/`fwd`/`cands`/`ageDist`) gets 290 LUTs
+    //     SMALLER. +1,960 of the delta lands in `DecodeStage_logic_pushReg_payload_uops_*`.
+    //   * DecodeStage cannot possibly be a consequence of this term: `io.fwd.rsp.stall` has
+    //     exactly TWO loads in the entire emitted netlist, both the same `p4Ctx_fwdStall`
+    //     flip-flop D-input (LsEuPlugin.scala) -- this whole cone's combinational fanout
+    //     terminates at ONE register, so there is no path from here to decode at all.
+    // CONCLUSION: this fix's real area cost is ~12 LUTs; the rest is Vivado's global
+    // optimiser landing in a different local optimum in an unrelated cone. Nothing here is
+    // restructurable to recover it (hoisting the cone's duplicated query-side `qHi` adder /
+    // `robId` age subtract was tried and measured BIT-IDENTICAL -- Vivado already CSEs
+    // them, and the routed netlist shows the shared `perEntry_0_qHi` net at fanout 32).
+    // Corollary for future A/Bs on this design: attribute area by cell-name localisation,
+    // not by the design total -- a ~12-LUT change measured as +2.3% of the whole device.
     val lineA    = paddrs(i)(31 downto 4)
     val lineB    = paddrBs(i)(31 downto 4)
     val qLine    = q.paddr(31 downto 4)
