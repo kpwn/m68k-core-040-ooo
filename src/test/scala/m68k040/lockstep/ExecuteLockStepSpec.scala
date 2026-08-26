@@ -581,7 +581,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // which cannot go through LockStep.compare (Long-based end to end).
                   // Runs as the LAST statement of the doSim body, i.e. only after the
                   // integer/PC/SR lock-step comparison above has already passed.
-                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => ()): Unit = {
+                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => (),
+                  // Per-cycle whitebox hook, default no-op (every existing call site
+                  // unchanged). Runs INSIDE the same `cd.onSamplings` block as the
+                  // existing writeback/commit capture, i.e. once per clock, for the
+                  // WHOLE run -- unlike `afterRun` (once, at the end). Added for the
+                  // FMOVEM.X postinc-ring rotating-phase-split campaign scenario: proving
+                  // the aligned-load split ring actually took MULTIPLE splits over the
+                  // course of one macro-instruction needs a live per-cycle tap
+                  // (`alignedEnqSplit`), not just a final-state check.
+                  perCycle: FullCoreDut => Unit = _ => ()): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -726,6 +735,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
           }
         }
+        perCycle(dut)
       }
 
       // Attach the program to the I-cache AXI.
