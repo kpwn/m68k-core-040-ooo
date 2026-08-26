@@ -481,4 +481,163 @@ class FpuLockStepSpec extends AnyFunSuite {
     h.runLockStep("fp-st-b2b", prog(instrs), nInstr = instrs.size,
       checkMem = Seq(Scr, Scr + 4, Scr + 8, Scr + 12), checkSpan = 4)
   }
+
+  // ══════════════════════════════════════════════════════════════════════════════════
+  // FMOVEM.X data-register-list LOAD -- ROB COMMIT-PC CORRUPTION (campaign/fmovem-
+  // postinc-ring). See docs/BUG_fmovemx_dataload_rob_commit_corruption.md for the full
+  // writeup. SUMMARY: task #241/#246 ("shared register-list-walk skeleton + FMOVEM.X
+  // data-list FSM") was previously verified ONLY at decode/µop-shape level
+  // (`FmovemxDataListDecodeSpec`/`FpMemLoadSpec`) -- NO test ever drove it through a
+  // real ROB retire + lock-step PC comparison before this session. Doing so for the
+  // first time (below) found the ROB's commit-PC framing (`RobPlugin.commitPc0 =
+  // Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)`) is WRONG for this FSM's "kept
+  // commit" µop (the last element's FP-issue row -- writes the FP PRF only, no integer
+  // register, `u.isBranch=False`), in at least two distinct ways depending on EA mode:
+  //   - `(An)` (mode 010), even a trivial 1-register list: the commit reads WHOLESALE
+  //     GARBAGE -- not just `pc` but `a7` too (a completely untouched register),
+  //     matching uninitialised-simulation-state readback, not a simple off-by-N.
+  //   - `(d16,An)` (mode 101): the FMOVEM macro's OWN commit is fine, but the VERY NEXT
+  //     retiring instruction's commit-pc is short by exactly one word (2 bytes) -- ONLY
+  //     when the FMOVEM FSM actually ran a real multi-element/multi-cycle drain (an
+  //     8-element list); a `(d16,An)` SINGLE-element list (below) round-trips clean.
+  // Both are reproducible, deterministic, 100% NOT related to the aligned-load split
+  // ring this campaign was scoped to stress -- they block ever reaching that stress
+  // test with a real oracle-compared FPn value. Root cause not pinned to a single line
+  // (`RobPlugin.scala`'s retire/commit-PC path is large and FMax-critical); flagged
+  // architectural per this session's own decision rule rather than guess-patched.
+  // ══════════════════════════════════════════════════════════════════════════════════
+
+  // Minimal repro #1: `(An)` mode, single-register list -- the SHORTEST possible
+  // FMOVEM.X data-list load (4 bytes, one element, 4 sub-phase cycles), no ring
+  // pressure, aligned base. Still fails, with WHOLESALE garbage on the FMOVEM's own
+  // commit (`a7` corrupted too, not just `pc`) -- rules out "only misaligned/multi-
+  // element cases are affected."
+  ignore("[KNOWN BUG, see docs/BUG_fmovemx_dataload_rob_commit_corruption.md] " +
+         "FMOVEM.X (An),FP0 single-element -- ROB commit-pc reads garbage") {
+    val instrs = Seq(
+      "movea.l #0x3000,%a1",
+      "move.l #0x3fff0000,(%a1)", "move.l #0x11223344,(4,%a1)", "move.l #0xaabbccdd,(8,%a1)",
+      "fmovem.x (%a1),%fp0",
+      "move.l %a1,%d7")
+    h.runLockStep("fmovemx-an-min", prog(instrs), nInstr = instrs.size)
+  }
+
+  // Minimal repro #2 (POSITIVE control, GREEN): `(d16,An)` mode, single-register list.
+  // Same shape as repro #1 but the OTHER admitted EA mode -- passes clean. Narrows the
+  // trigger: NOT every FMOVEM.X data-list load is broken, specifically `(An)` (any
+  // element count) and `(d16,An)` with a REAL multi-cycle multi-element drain are.
+  test("lock-step: FMOVEM.X (d16,An),FP0 single-element then a trailing kept instruction", VerilatorTest) {
+    val instrs = Seq(
+      "movea.l #0x3000,%a1",
+      "move.l #0x3fff0000,(2,%a1)", "move.l #0x11223344,(6,%a1)", "move.l #0xaabbccdd,(10,%a1)",
+      "fmovem.x (2,%a1),%fp0",
+      "move.l %a1,%d7")
+    h.runLockStep("fmovemx-d16an-min", prog(instrs), nInstr = instrs.size)
+  }
+
+  // ══ FMOVEM.X (d16,An),<list> LOAD -- data-register-list ROTATING-PHASE multi-split ══
+  // ══ aligned-load-ring stress (campaign/fmovem-postinc-ring)                       ══
+  //
+  // SCOPE CORRECTION vs. the campaign's original brief. The brief's premise -- that
+  // `FMOVEM.X (An)+,<list>` is already implemented (design doc
+  // docs/superpowers/specs/2026-08-19-fmovem-data-list-design.md §1's table) -- does NOT
+  // hold at this task's HEAD: only task #241/#246 (the FSM skeleton, LOAD direction,
+  // EA modes `(An)`/`(d16,An)` only) has landed. Postincrement/predecrement/indexed/
+  // PC-relative and the STORE direction are still design-doc §7 items 2-4, unimplemented
+  // -- confirmed both by static read of `DecodeStage.scala`'s `slot0IsFmovemx` gate (EA
+  // mode restricted to 010/101) and empirically by
+  // `FmovemxDataListDecodeSpec`'s new "(An)+ ... still traps" / "-(An) ... still traps"
+  // regressions (vector 11, FP_MEM_TRAP_ENTRY). See docs/BUG_fmovemx_postinc_unimplemented.md.
+  //
+  // The RING-STRESS MECHANISM the campaign actually cares about is orthogonal to
+  // auto-update, though: `DecodeStage.scala`'s `fmovemxOff` increments by 12 bytes per
+  // element regardless of EA mode (`(An)`/`(d16,An)`/a hypothetical `(An)+` would all
+  // step identically), so a MISALIGNED `(d16,An)` base drives the EXACT SAME
+  // rotating-phase-across-elements multi-split pattern the brief was chasing. This test
+  // substitutes `(d16,An)` for the unavailable `(An)+` -- a genuine, in-scope,
+  // oracle-valid stand-in for the mechanism under test, not a weaker one.
+  //
+  // Also load-bearing: this project's OWN vendored Musashi
+  // (tools/musashi/musashi/m68kfpu.c `READ_EA_FPE`) does NOT advance the address for EA
+  // mode `(An)` (imode==2) across a multi-register list -- every listed FPn would read
+  // the SAME 12 bytes at An (confirmed by direct source read; matches the analogous note
+  // in the ported v1 corpus's `fpu_fmovem_x_an_indirect.s`). `(d16,An)` (imode==5) DOES
+  // advance correctly (Musashi's own `fmovem()` dispatcher pre-computes `di_mode_ea` once
+  // and increments it by 12 per listed register, exactly like this core's `fmovemxOff`),
+  // so it is the only one of this task's two admitted EA modes that is BOTH in-scope and
+  // a valid oracle for a multi-register list -- another reason to use it here.
+  //
+  // ALSO BLOCKED (see the bug-doc block above): this exact test used to fail on its own
+  // account with a clean +2-byte commit-pc shortfall on the trailing `move.l %a1,%d7`
+  // step -- the ROB commit-corruption bug, NOT a ring defect (the FMOVEM macro's own
+  // commit, and every FPn value, were already confirmed byte-exact when this was found).
+  // `ignore`d pending that fix; re-enable once the bug doc's fix lands.
+  //
+  // Base = A1(0x3000) + d16(2) = 0x3002: 2 mod 16, 2 mod 4 (NOT a multiple of 4), so the
+  // 12-byte-per-element Extended stride keeps SHIFTING PHASE relative to the 16-byte
+  // D-cache line, unlike plain MOVEM.L's fixed-phase mod-4 case (every element there
+  // crosses at the SAME chunk position, if it crosses at all). Hand-verified against the
+  // RTL's own split criterion (`LsEuPlugin.s1CrossLine = (vaddr(3:0) + size) > 16`, size=4
+  // for these Long LOAD chunks, i.e. crosses iff `vaddr mod 16 >= 13`): of the 24 chunks
+  // (8 elements x 3), exactly 6 cross a line -- one per element k in {1,2,3,5,6,7} (k=0
+  // and k=4 land on offsets {2,6,10}/{50,54,58} mod 16, none >=13, so neither ever
+  // splits) -- and the crossing chunk ROTATES chunk0->chunk1->chunk2->chunk0... every
+  // element (period 4, since gcd(12,16)=4). Table (offset = raw byte offset from the
+  // 0x3000 line-grid origin, i.e. 2 + 12*k + 4*i):
+  //   k=0(FP7): 2,6,10        no split      k=4(FP3): 50,54,58      no split
+  //   k=1(FP6): 14,18,22      chunk0 SPLITS k=5(FP2): 62,66,70      chunk0 SPLITS
+  //   k=2(FP5): 26,30,34      chunk1 SPLITS k=6(FP1): 74,78,82      chunk1 SPLITS
+  //   k=3(FP4): 38,42,46      chunk2 SPLITS k=7(FP0): 86,90,94      chunk2 SPLITS
+  // (register column: reverse map, `FMOVEM.X` control/postinc list format -- bit index k
+  // extracted low-to-high from the full 0xFF mask maps to FP(7-k), so element k's memory
+  // slot lands in FP(7-k), highest-numbered register at the lowest address per the ISA.)
+  ignore("[BLOCKED on docs/BUG_fmovemx_dataload_rob_commit_corruption.md] lock-step: FMOVEM.X (d16,An),FP0-FP7 -- misaligned base drives rotating-phase multi-split ring pressure") {
+    val d16 = 2
+    // 8 distinct, recognizable 80-bit patterns (real hardware Extended format: word0
+    // upper-16 = sign+exp, lower-16 = reserved/0; word1 = mantissa hi32; word2 = mantissa
+    // lo32). Diverge in OPPOSITE directions per k so no two elements' bytes can alias by
+    // coincidence, and any cross-talk between concurrently in-flight split pairs shows up
+    // immediately as a wrong FPn.
+    val elems = (0 until 8).map { k =>
+      val hi16   = (0x3ff0 + k) & 0xffff
+      val mantHi = (0x11223344L + k * 0x01010101L) & 0xffffffffL
+      val mantLo = (0xaabbccddL - k * 0x01010101L) & 0xffffffffL
+      (hi16, mantHi, mantLo)
+    }
+    val storeInstrs = (0 until 8).flatMap { k =>
+      val (hi16, mantHi, mantLo) = elems(k)
+      val off = d16 + 12 * k
+      val w0  = (hi16.toLong << 16) & 0xffffffffL   // reserved lower 16 bits = 0
+      Seq(f"move.l #0x$w0%08x,($off,%%a1)",
+          f"move.l #0x$mantHi%08x,(${off + 4},%%a1)",
+          f"move.l #0x$mantLo%08x,(${off + 8},%%a1)")
+    }
+    val instrs = Seq("movea.l #0x3000,%a1") ++ storeInstrs ++
+      Seq("fmovem.x (2,%a1),%fp0-%fp7", "move.l %a1,%d7")
+    var splitCount = 0
+    h.runLockStep("fmovemx-ring-rotate", prog(instrs), nInstr = instrs.size,
+      perCycle = { dut => if (dut.lsEu.logic.alignedEnqSplit.toBoolean) splitCount += 1 },
+      afterRun = { (dut, oracle) =>
+        // (1) genuine multi-split pressure, not a theoretical claim: >=6 aligned-ring
+        // split-pair pushes over the course of this ONE macro-instruction (one per
+        // element in the table above) -- the rotating-phase stress this test exists
+        // for. `>=` rather than `==`: a store-side split (if this core's StoreQueue
+        // ever grows one sharing the same counter) or an incidental extra push would
+        // not falsely fail this; only TOO FEW would.
+        assert(splitCount >= 6,
+          s"fmovemx-ring-rotate: expected >= 6 aligned-load-ring split-pair pushes " +
+          s"(elements k in {1,2,3,5,6,7} per the hand-verified table above) -- only " +
+          s"saw $splitCount. Either the base/d16 line-crossing arithmetic drifted from " +
+          s"the RTL's own s1CrossLine criterion, or the ring stopped taking the split " +
+          s"path for this pattern.")
+        // (2) every FPn round-tripped byte-exact despite the concurrent back-to-back
+        // splits -- catches any aliasing/cross-talk between split pairs in flight.
+        for (k <- 0 until 8) {
+          val (hi16, mantHi, mantLo) = elems(k)
+          val reg      = 7 - k   // reverse map: element k -> FP(7-k)
+          val expected = FpCompare.fp80(hi16, (BigInt(mantHi) << 32) | BigInt(mantLo))
+          FpCompare.assertFpEqual(dutFp(dut, reg), expected, s"fmovemx-ring-rotate FP$reg (element k=$k)")
+        }
+      })
+  }
 }

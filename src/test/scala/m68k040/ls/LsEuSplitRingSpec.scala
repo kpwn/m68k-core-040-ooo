@@ -461,4 +461,81 @@ class LsEuSplitRingSpec extends AnyFunSuite {
         "aliasing between the two concurrent split pairs)")
     }
   }
+
+  /** campaign/fmovem-postinc-ring: the EXACT 24-chunk address pattern
+    * `FMOVEM.X (d16,An),FP0-FP7` generates off a misaligned base (base+2, 8 elements x
+    * 3 four-byte chunks, 12-byte element stride) -- driven DIRECTLY at the LS EU as raw
+    * back-to-back LONG loads, bypassing the DecodeStage `fmovemxActive` FSM entirely.
+    *
+    * Why this exists ALONGSIDE (not instead of) the `FpuLockStepSpec` lock-step test:
+    * that test is BLOCKED by a real, separately-filed bug
+    * (docs/BUG_fmovemx_dataload_rob_commit_corruption.md) in the ROB's commit-PC
+    * framing for the FSM's FP-lane-completion kept-commit µop -- unrelated to the
+    * aligned-load split ring itself, but it stops the lock-step program from ever
+    * reaching a compared FPn value. This test proves the RING mechanism the campaign
+    * actually cares about -- genuine back-to-back multi-split pressure at a ROTATING
+    * phase, and correct, non-aliased merged results for every chunk -- completely
+    * independently of that bug, since it drives the LS EU directly and never goes
+    * through decode/rename/ROB at all.
+    *
+    * Address table (hand-verified against `LsEuPlugin.s1CrossLine`, same arithmetic as
+    * the lock-step test's own header comment): 8 elements x 3 chunks, chunk i of
+    * element k at byte offset `2 + 12*k + 4*i` from the 16-byte line-grid origin.
+    * Exactly 6 of 24 chunks cross a line (elements k in {1,2,3,5,6,7}, one chunk each,
+    * ROTATING chunk0->chunk1->chunk2->chunk0... every element since gcd(12,16)=4);
+    * k=0 and k=4 never split. */
+  test("FMOVEM.X-shaped rotating-phase address pattern: >=6 genuine back-to-back splits, every chunk correct", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x5000L
+      preload(mem, base, 128)   // covers offset 2..97 (last chunk ends at 2+84+4+3=97)
+      seed(dut, cd, preg = 10, value = base)
+
+      val disps = for (k <- 0 until 8; i <- 0 until 3) yield (2L + 12L * k + 4L * i)
+      var splitCount = 0
+      var completed = Set.empty[Int]
+      val watching = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork {
+        while (watching.get()) {
+          if (dut.eu.logic.alignedEnqSplit.toBoolean) splitCount += 1
+          if (dut.src.logic.cValid.toBoolean) completed += dut.src.logic.cRob.toInt
+          cd.waitSampling()
+        }
+      }
+      // Issuer on its own thread (mirrors the burst test above): back-to-back, no
+      // waiting between chunks, so the ring genuinely sees them overlap in flight --
+      // the actual stress this test exists to apply.
+      fork {
+        for ((disp, idx) <- disps.zipWithIndex)
+          issueLoad(dut, cd, basePreg = 10, disp = disp, Size.LONG, pdst = 20 + idx, robId = 1 + idx)
+      }
+
+      var n = 0
+      while (completed.size < disps.size && n < 4000) { cd.waitSampling(); n += 1 }
+      watching.set(false)
+      cd.waitSampling(4)
+
+      val l = dut.eu.logic
+      assert(completed.size == disps.size,
+        s"only ${completed.size}/${disps.size} chunk loads completed in $n cycles (missing " +
+        s"${(1 to disps.size).filterNot(completed).mkString(",")}) -- push=${l.alignedPushPtr.toInt} " +
+        s"send=${l.alignedSendPtr.toInt} rsp=${l.alignedRspPtr.toInt} count=${l.alignedCount.toInt} " +
+        s"sendHeld=${l.alignedSendHeld.toBoolean}")
+
+      // (1) genuine multi-split pressure, not a theoretical claim.
+      assert(splitCount >= 6,
+        s"expected >= 6 aligned-ring split-pair pushes (elements k in {1,2,3,5,6,7}) -- " +
+        s"only saw $splitCount")
+
+      // (2) every chunk's merged value is correct -- catches any aliasing/cross-talk
+      // between concurrently in-flight split pairs.
+      for ((disp, idx) <- disps.zipWithIndex) {
+        val addr = base + disp
+        val got  = readInt(dut, 20 + idx)
+        val exp  = expected(addr, 4)
+        assert(got == exp,
+          f"chunk $idx (addr 0x$addr%x, disp=$disp): got 0x${got.toString(16)} exp 0x${exp.toString(16)}")
+      }
+    }
+  }
 }
