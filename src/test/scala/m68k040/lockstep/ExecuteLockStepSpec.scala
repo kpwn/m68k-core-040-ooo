@@ -581,7 +581,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // which cannot go through LockStep.compare (Long-based end to end).
                   // Runs as the LAST statement of the doSim body, i.e. only after the
                   // integer/PC/SR lock-step comparison above has already passed.
-                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => ()): Unit = {
+                  afterRun: (FullCoreDut, Vector[OracleStep]) => Unit = (_, _) => (),
+                  // Pre-run whitebox hook, default no-op => every existing call site is
+                  // unchanged. Invoked immediately after `cd.forkStimulus`, i.e. BEFORE
+                  // any instruction retires, so a caller can register its own
+                  // `cd.onSamplings` probe (e.g. counting `lsEu.logic.alignedEnqSplit`
+                  // pulses) that observes the WHOLE run — registering it in `afterRun`
+                  // would be too late, since commits/retirement have already finished
+                  // by the time `afterRun` runs.
+                  duringRun: (FullCoreDut, ClockDomain) => Unit = (_, _) => ()): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -622,6 +630,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      duringRun(dut, cd)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
 
@@ -2179,6 +2188,90 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0xCAFEBABE,%d2",
       "move.l %d2,(%a0)"                                // cross-line STORE to 0x3FFE
     )).mkString(" ; "), checkMem = Seq(0x3FFEL), checkSpan = 4)
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // STACKED HAZARD (campaign/bfins-splitring): a bit-field 5-byte-span chain
+  // (needHi=True -- offset+width>32, see BitfieldDecodeSpec's "BFEXTU mem 5-byte
+  // span (offset 7, width 28)" test) whose own b0/b1 LOAD.L/LOAD.B (BF_RMW_5B_ENTRY
+  // row a0, Microcode.scala) lands the LOAD.L at a byte-base that is ITSELF
+  // split-eligible through the aligned-load RING this session fixed
+  // (`alignedSlotAPending = alignedRspPtr =/= alignedSendPtr`, LsEuPlugin.scala) --
+  // the exact "LONG@14" cross-line offset LsEuSplitRingSpec proves split-eligible
+  // for an ordinary load. This is a genuinely NEW combination: `bfMemSeedLine`
+  // already has a precedent test just above ("BFSET mem misaligned LONG store
+  // crossing a cache line") pairing a bit-field RMW with a cross-line STORE, but
+  // that store split goes through a COMPLETELY DIFFERENT, unrelated mechanism --
+  // the StoreQueue's own single-entry twoAccess/paddrB/nbytesA/nbytesB byte-lane
+  // split (see the "store split (byte-lane) for the SQ entry" block in
+  // LsEuPlugin.scala) -- NOT the aligned ring `alignedEnqSplit` targets here, and
+  // that precedent test's width (24) never spills into a 5th byte (needHi=False),
+  // so it never combines with the bit-field engine's lo/hi funnel either. Here:
+  // width 28 forces needHi (bitOff 7 + width 28 = 35 > 32), so the chain ALSO
+  // runs the b1/b6 LOAD.B/STORE.B spill-byte pair at byteAddr+4 = 0x4002 (an
+  // ordinary, non-split single-byte access) alongside the split LOAD.L/STORE.L at
+  // 0x3FFE -- both mechanisms, stacked on one instruction, for the first time.
+  //
+  // `duringRun` counts real `alignedEnqSplit` ring-push pulses directly off the
+  // FullCoreDut's simPublic LsEuPlugin signals -- direct mechanism proof, not just
+  // address-table inference. The program deliberately runs the same split-eligible
+  // 5-byte LOAD.L TWICE (BFINS's own b0 read, then a following BFEXTU readback),
+  // so `splitEnqCount == 2` also confirms the ring cleanly re-enters and re-drains
+  // a SECOND split pair right after the first (no ring-pointer aliasing/stale-state
+  // handoff issue between the two 5-byte chains) -- see item (d) of the campaign
+  // scenario. `checkMem` independently proves full memory correctness: the RMW
+  // must change ONLY the #7:#28 field's bits and preserve every other bit in both
+  // the 4-byte long AND the 5th spill byte (classic RMW correctness), verified
+  // byte-for-byte against Musashi's own oracle memory image, not a hand-derived
+  // expectation.
+  //
+  // ROOT CAUSE (found by this test, RED before the StoreQueue.scala fix below it in
+  // the same commit): NOT the aligned ring itself -- `splitEnqCount` and the LO4/LO5
+  // long-store bytes were always correct. The real bug lived in `StoreQueue.scala`'s
+  // same-line WRITETHROUGH-refill hazard (`sameLine`/`perEntry`): it compared an
+  // older store's line only against the query's OWN starting line (`qLine`), never
+  // against the line a CROSS-LINE query spills into (`qLine + 1`) -- so a same-line,
+  // non-overlapping older store sitting in the SPILLED line (here: `bfMemSeedLine`'s
+  // own "move.l %d1,4(%a0)" store at 0x4002, in slot B's line) never triggered the
+  // stall, letting the split LOAD.L's slot-B miss refill race that store and cache a
+  // permanently-stale line -- silently corrupting the LATER b1/b6 spill-byte access
+  // at 0x4002. See the minimal (bit-field-free) regression right below this test.
+  // ════════════════════════════════════════════════════════════════════════════
+  test("lock-step: BFINS mem 5-byte span (offset 7 width 28) crossing a split-eligible cache line", VerilatorTest) {
+    var splitEnqCount = 0
+    runLockStep("bfins-span5-splitring", (bfMemSeedLine ++ Seq(
+      "ori #0x10,%ccr",                                     // X=1 sentinel (BFINS leaves X untouched)
+      "move.l #0x0abcdef1,%d1",                             // a non-trivial partial pattern (not 0/-1)
+      "bfins %d1,(%a0){#7:#28}",                             // byteAddr = %a0+0 = 0x3FFE (split LOAD.L/STORE.L)
+      "bfextu (%a0){#7:#28},%d2"                             // readback: a SECOND split LOAD.L right after
+    )).mkString(" ; "), checkMem = Seq(0x3FFEL, 0x4002L), checkSpan = 4,
+      duringRun = (dut, cd) => cd.onSamplings {
+        if (dut.lsEu.logic.alignedEnqSplit.toBoolean) splitEnqCount += 1
+      })
+    assert(splitEnqCount == 2,
+      s"expected exactly 2 aligned-ring split-pair pushes (BFINS's own b0 LOAD.L, then " +
+      s"BFEXTU's readback LOAD.L) -- got $splitEnqCount. 0 would mean the address choice " +
+      s"silently missed the split-eligible offset (degrading this test to the already-" +
+      s"covered non-split case); any other count means the ring saw an unexpected extra " +
+      s"or missing split push for this exact instruction sequence.")
+  }
+
+  // Minimal, bit-field-engine-free regression for the StoreQueue same-line-hazard
+  // fix above: an ordinary CROSS-LINE LOAD.L (splits: slot A 3FFE-3FFF, slot B
+  // 4000-4003) whose spill lands on the SAME line as an older, not-yet-drained
+  // WRITETHROUGH store at a DIFFERENT (non-overlapping) byte offset within that
+  // line, immediately followed by an ordinary same-line LOAD.B at that store's own
+  // address. Pre-fix, the split LOAD.L's slot-B miss refill raced that store and
+  // cached a stale line, so the immediately-following LOAD.B silently read back the
+  // WRONG (pre-store) byte -- reproduced here via full lock-step register/CCR
+  // comparison against Musashi (a plain MOVE.B sets N/Z from the loaded byte, so a
+  // wrong byte shows up as a flag divergence even without checking the register
+  // value directly).
+  test("lock-step: cross-line split LOAD.L then same-line LOAD.B (StoreQueue same-line-hazard spill-line gap)", VerilatorTest) {
+    runLockStep("splitload-then-sameline-load", (bfMemSeedLine ++ Seq(
+      "move.l (%a0),%d2",                                   // split LOAD.L: slot A 3FFE-3FFF, slot B 4000-4003
+      "move.b 4(%a0),%d3"                                    // ordinary LOAD.B at 0x4002 (within slot B's line)
+    )).mkString(" ; "))
   }
 
   // ── ANDI/ORI/EORI #imm,CCR (NOT privileged — CCR only) lock-step ────────────
