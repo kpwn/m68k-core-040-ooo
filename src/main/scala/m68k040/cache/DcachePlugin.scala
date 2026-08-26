@@ -1279,9 +1279,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // A store drain's S1 tag-read (registers stS1Set) through its S2 write (stS2Set)
     // is a 2-cycle window during which the store's OWN hit-detect is against a
     // REGISTERED tag-read. A concurrent load-refill/write-allocate array write into
-    // the SAME set (a DIFFERENT line — same-line overlaps are already covered by the
-    // SQ's own `sameLine` stall, see StoreQueue.scala) landing inside that window
-    // would go unnoticed by the store's stale registered tag-read: S2 would then
+    // the SAME set (a DIFFERENT line) landing inside that window would go unnoticed
+    // by the store's stale registered tag-read: S2 would then
     // merge into a way the refill just re-tagged (write-through: cached-line
     // corruption; copyback: a lost store — refill-priority silently discards the
     // store's only write). Hold (delay, NEVER drop) the refill/eviction side's
@@ -1322,6 +1321,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // pipe drains. Parked younger descriptors are excluded from this hold while a
     // miss barrier owns the arrays, so they cannot deadlock the refill that will
     // eventually release them.
+    //
+    // LS-cluster review finding P5 note: `stS1Set`/`stS2Set`/`missSet` below are raw
+    // SET-INDEX compares (`paddr(offBits+setBits-1 downto offBits)`), not tag-aware --
+    // "same set" is a strict SUPERSET of "same line" (same line implies same set index
+    // trivially). This hold therefore ALREADY covers an exact-same-line collision
+    // unconditionally, independent of whatever the SQ's `sameLine` stall does or does
+    // not exclude. That generality used to be incidental (the SQ's old mode-agnostic
+    // `sameLine` stall meant a load could never even reach here while an older
+    // same-line store was mid-drain, so this term's same-line coverage was never
+    // exercised in practice); since StoreQueue.scala's `sameLine` no longer stalls a
+    // same-line, non-overlapping load behind an older undrained COPYBACK store, this
+    // term's same-line generality is now the ACTUAL, load-bearing protection for that
+    // exact race (a same-line load-refill landing during a COPYBACK store's S1/S2
+    // hit-write window) -- verified directly against this RTL, not assumed.
     val refillWriteHold = (stS1Valid && !storeMissBarrier && !loadMissStoreBarrier &&
                            (stS1Set === missSet)) ||
                           (stS2Valid && (stS2Set === missSet)) ||

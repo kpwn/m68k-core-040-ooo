@@ -373,46 +373,61 @@ class StoreQueue(depth: Int = 8) extends Component {
       ((cacheModes(i) === CacheMode.INHIBITED) ||
        (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))
     // SAME-CACHE-LINE hazard (16-byte line; offBits=4). A younger load that MISSES the
-    // L1D refills the WHOLE line from memory. If an OLDER store to the SAME line is still
-    // in the SQ (not yet written through to memory), that refill would cache a STALE line
-    // (the store's bytes not yet in memory, and the store — write-no-allocate — won't
-    // update the now-cached line). A subsequent load to OTHER bytes of that line then HITS
-    // the stale cached copy. So a load that line-overlaps an older in-flight store must
-    // STALL until the store drains, even with NO byte overlap. (A clean FULL forward is
-    // still safe — we already have the data — so it is excluded by the consumer below.)
+    // L1D refills the WHOLE line from memory. If an OLDER WRITETHROUGH store to the SAME
+    // line is still in the SQ (not yet written through to memory), that refill would cache
+    // a STALE line (the store's bytes not yet in memory, and the store — write-no-allocate
+    // -- won't update the now-cached line). A subsequent load to OTHER bytes of that line
+    // then HITS the stale cached copy. So a load that line-overlaps an older in-flight
+    // WRITETHROUGH store must STALL until the store drains, even with NO byte overlap.
+    // (A clean FULL forward is still safe -- we already have the data -- so it is excluded
+    // by the consumer below.)
+    //
+    // LS-cluster review finding P5 (this task): this hazard is WRITETHROUGH-specific, not
+    // mode-agnostic. It exists only because WT-miss is write-no-allocate -- the store's
+    // bytes never touch the cache array, so a stale line cached by a racing refill is
+    // PERMANENTLY wrong (nothing ever corrects it). Under COPYBACK there is no equivalent
+    // hole: whenever this store finally reaches drain admission (DcachePlugin store-S1/S2),
+    // it performs a FRESH tag/hit check against the array's CURRENT state -- `stS2HitAny`,
+    // computed live, not cached from alloc time (DcachePlugin.scala ~2710). If the line is
+    // resident (e.g. a same-line load's refill populated it in the interim, clean, without
+    // this store's bytes) the store takes the COPYBACK-hit arm: an on-chip RMW that merges
+    // its bytes into the array and sets the dirty bit (DcachePlugin.scala ~2744, Task P4.1).
+    // If the line is NOT resident (e.g. it was evicted again before the store drained) the
+    // store takes the write-allocate arm (DcachePlugin.scala ~2716, Task P4.2), fetching a
+    // fresh copy and merging in the same way. Either arm leaves the array holding the
+    // store's bytes once the store drains -- the array self-heals, there is no window where
+    // staleness becomes permanent. Three further races were checked and are independently
+    // closed by existing, address-agnostic pipeline interlocks (not by this SQ-level stall):
+    //   1. Store tries to drain WHILE a same-line load's refill is still in flight: SQ
+    //      drain admission (S0) is held off by `storePipeHeld` (`loadMissDiscovered` /
+    //      `loadMissStoreBarrier`, DcachePlugin.scala ~2527) for the ENTIRE duration of any
+    //      in-flight load miss, regardless of address -- the store cannot even begin its own
+    //      tag check until the refill completes, and then sees the line as resident (hit).
+    //   2. A same-line load's miss is discovered WHILE this store is already admitted
+    //      (S1/S2/S3): `loadMissStoreBarrier` snapshots/parks exactly this race (again
+    //      address-agnostic -- protects the eviction-snapshot mechanism generally).
+    //   3. A same-line load's refill lands DURING this store's own S1->S2 hit-write window
+    //      (registered tag-read stale for 2 cycles): `DcachePlugin.refillWriteHold` holds the
+    //      refill's array write off whenever `stS1Set`/`stS2Set` match the refill's set --
+    //      a RAW SET-INDEX compare (`paddr(offBits+setBits-1 downto offBits)`), a strict
+    //      SUPERSET of same-LINE, so this hold already covers the exact-same-line case
+    //      unconditionally, independent of this file's `sameLine` term (verified directly
+    //      against that RTL, not assumed -- see the note at `refillWriteHold`'s declaration).
+    // Genuine byte-level overlap (a real RAW hazard) is NOT this term's job either way --
+    // that is `overlap`/`full`/`partial` above, entirely untouched by cache mode.
+    // CONCLUSION: gate this stall's line terms on `cacheModes(i)`/`cacheModesB(i)` (each
+    // half of a split store may carry an independently-translated cache mode -- see
+    // `SqAlloc.cacheModeB`) so a COPYBACK entry no longer forces this stall for a
+    // same-line-but-non-overlapping query; WRITETHROUGH (and INHIBITED, already covered
+    // separately by `serialStall` below) keep it exactly as conservative as before.
     val lineA    = paddrs(i)(31 downto 4)
     val lineB    = paddrBs(i)(31 downto 4)
     val qLine    = q.paddr(31 downto 4)
-    val sameLine = ent && ((lineA === qLine) || (validBs(i) && (lineB === qLine)))
+    val sameLine = ent && (
+      ((lineA === qLine) && (cacheModes(i) =/= CacheMode.COPYBACK)) ||
+      (validBs(i) && (lineB === qLine) && (cacheModesB(i) =/= CacheMode.COPYBACK))
+    )
   }
-  // Task P4.4 Step 6 (design doc §5 item 6): re-audit under COPYBACK. This logic
-  // predates copyback and was built for a "a store not yet in MEMORY" window
-  // (write-through: the only point of truth is memory once acked). Under
-  // copyback the CACHE itself becomes the point of truth for a hit. REVIEWED,
-  // CONCLUSION: still conservative-correct, no fix needed -- `sameLine`/`stall`
-  // (the `perEntry`/`fwd.rsp` block above) is entirely mode-agnostic: this file
-  // DOES carry a per-entry `cacheModes` array (used only for `io.drain.payload
-  // .cacheMode`, the drain-side handoff to DcachePlugin), but the forward/stall
-  // compare logic itself never reads it. LsEuPlugin's own load pipeline
-  // (`RESOLVE.whenIsActive`,
-  // `execute/LsEuPlugin.scala`) NEVER lets a load reach the cache's own hit-
-  // detect (`dcache.loadCmd` only fires from the LAUNCH state, only reachable
-  // via RESOLVE's `otherwise` arm) while `fwdStall` is asserted for that load --
-  // i.e. while ANY older, same-line, un-drained SQ entry exists. So by the time
-  // a load's `dcache.loadCmd` actually launches, no older same-line SQ entry can
-  // remain: the cache's own hit-detect (a dirty COPYBACK hit included) is then
-  // authoritative and entirely independent of SQ forwarding, exactly as it was
-  // for a write-through hit before this task. A load that MISSES a copyback
-  // line can only do so because no dirty resident copy exists (same as before);
-  // an older, still-undrained SAME-line SQ entry in that situation is still
-  // caught by this file's existing `sameLine` stall (Task P4.4's own drain-vs-
-  // refill same-set array-write interlock, `DcachePlugin.refillWriteHold`, is
-  // exactly what keeps this reasoning sound now that a refill can race a drain
-  // at the array level -- see that file). Re-run
-  // `StoreQueueSpec -- -z "forward partial-overlap boundary cases"` (the
-  // existing same-line-family test) plus the new
-  // "same-line stall still holds an older undrained entry (copyback-relevant)"
-  // case below -- both green, no RTL change needed here.
   // youngest older overlapping entry: among ALL overlapping matches (full OR
   // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
   // whether that youngest-overlapping entry is a FULL overlap. A clean forward is
@@ -441,10 +456,12 @@ class StoreQueue(depth: Int = 8) extends Component {
     o
   }
   val fullValid = best.valid && best.full
-  // Same-line hazard: any older in-flight store to the load's cache line forces a stall
-  // (the refill-stale-line hole above), UNLESS we can cleanly FULL-forward the exact bytes
-  // (then we have the data and never touch the cache). A byte-partial overlap already
-  // stalls via anyPartial; sameLine extends that to line-overlap-only stores too.
+  // Same-line hazard: any older in-flight WRITETHROUGH store to the load's cache line
+  // forces a stall (the refill-stale-line hole above), UNLESS we can cleanly FULL-forward
+  // the exact bytes (then we have the data and never touch the cache). A byte-partial
+  // overlap already stalls via anyPartial; sameLine extends that to line-overlap-only WT
+  // stores too (COPYBACK entries are excluded from this term -- see the `sameLine` decl
+  // comment in `perEntry` above for the hazard-coverage argument).
   val anySameLine = perEntry.map(_.sameLine).orR
   // INHIBITED is a total-order boundary (architecture design §7.1; MSHR design
   // §4.2/§5.5), not merely a cache-bypass hint.  Therefore:

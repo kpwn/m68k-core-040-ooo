@@ -24,7 +24,9 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     * the strobe depends only on (offset, size), never data. */
   def allocSplit(dut: StoreQueue, cd: ClockDomain, robId: Int,
                  paddrA: Long, nbytesA: Int,
-                 paddrB: Long, nbytesB: Int): Unit = {
+                 paddrB: Long, nbytesB: Int,
+                 cacheModeA: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH,
+                 cacheModeB: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH): Unit = {
     val a = dut.io.alloc
     a.valid #= true
     a.payload.robId #= robId
@@ -38,7 +40,8 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     a.payload.paddrB #= paddrB
     a.payload.vaddrB #= paddrB   // identity for this test
     a.payload.nbytesB #= nbytesB
-    a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+    a.payload.cacheMode #= cacheModeA
+    a.payload.cacheModeB #= cacheModeB
     a.payload.supervisor #= false
     a.payload.precise #= false
     cd.waitSampling()
@@ -116,6 +119,43 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       setQuery(dut, robId = 6, paddr = 0x200, Size.LONG)
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean, "no overlap -> idle")
+      cd.waitSampling(2)
+    }
+  }
+
+  // LS-cluster review finding P5 (this task): `SqAlloc.cacheModeB` is genuinely
+  // independent of `cacheMode` (a cross-line/page split store's two halves can be
+  // translated under different page attributes), so the `sameLine` fix must gate EACH
+  // half's line term on ITS OWN cache mode, not a single per-entry mode. This directed
+  // case proves both halves independently: slot A is COPYBACK, slot B is WRITETHROUGH,
+  // in two DIFFERENT cache lines -- a same-line-as-A, non-overlapping query must NOT
+  // stall (P5 narrowing applies to A's line), while a same-line-as-B, non-overlapping
+  // query on the SAME still-undrained entry must STILL stall (WT conservatism on B's
+  // line is untouched).
+  test("split store: per-half cache mode independently gates the sameLine stall " +
+       "(COPYBACK slot A does not stall, WRITETHROUGH slot B still does)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // split LONG, slot A at 0x10E (line 0x100, COPYBACK), slot B at 0x110 (line 0x110, WRITETHROUGH).
+      allocSplit(dut, cd, robId = 4,
+        paddrA = 0x10E, nbytesA = 2,
+        paddrB = 0x110, nbytesB = 2,
+        cacheModeA = m68k040.cache.CacheMode.COPYBACK,
+        cacheModeB = m68k040.cache.CacheMode.WRITETHROUGH)
+      // Same line as slot A (0x100..0x10F), no byte overlap with EITHER slot -> must NOT
+      // stall: slot A's line term is excluded because slot A is COPYBACK.
+      setQuery(dut, robId = 6, paddr = 0x108, Size.WORD)
+      cd.waitSampling(); sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
+      assert(!dut.io.fwd.rsp.stall.toBoolean,
+        "same line as COPYBACK slot A, no byte overlap -> must NOT stall (P5 fix)")
+      // Same line as slot B (0x110..0x11F), no byte overlap with EITHER slot -> must
+      // STILL stall: slot B's line term is untouched because slot B is WRITETHROUGH.
+      setQuery(dut, robId = 6, paddr = 0x118, Size.WORD)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "same line as WRITETHROUGH slot B, no byte overlap -> must still stall")
       cd.waitSampling(2)
     }
   }

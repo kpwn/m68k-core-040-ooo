@@ -895,6 +895,35 @@ class IpcBenchSpec extends AnyFunSuite {
       copybackDtt = true, expectedStoreDrains = iters * stores.size)
   }
 
+  // 5c-2. same-line-copyback: directed kernel for the LS-cluster review finding P5
+  // (StoreQueue.scala `sameLine` COPYBACK narrowing). Store LONG at 0x4300 (bytes
+  // 0..3), load LONG at 0x4308 (bytes 8..11) -- SAME 16-byte cache line (0x4300..
+  // 0x430F), ZERO byte overlap, both under COPYBACK (match-all transparent DTT,
+  // like store-stream). Before the P5 fix, EVERY loop-body load stalled behind the
+  // immediately-preceding same-line store until that store's full drain-ack came
+  // back (the `sameLine` refill hazard applied mode-agnostically); after the fix,
+  // COPYBACK is excluded from that term, so the load may launch as soon as the LS
+  // EU is free. Both addresses are pre-warmed resident (setup loads, mirroring
+  // store-stream's own pattern) so every loop-body store is a COPYBACK-HIT RMW --
+  // steady-state throughput, not one-time miss/refill latency. Per iter: store +
+  // load + subq + bne = 4 macros.
+  // NOTE: deliberately NOT setting `expectedStoreDrains` here (unlike store-stream).
+  // Those strict assertions include `maxSqAccepted >= 2 && maxDcOutstanding >= 2`
+  // (pipeline overlap) -- which this kernel is EXPECTED to violate pre-fix (the
+  // whole point: the pre-fix `sameLine` stall serializes each store fully behind
+  // the load that follows it, so overlap never happens) and only satisfies post-fix.
+  // Gating a hard assert on that would make the "before" A/B measurement itself
+  // fail to run rather than produce a comparable number. The `[store-path]`
+  // diagnostic printout (`k.copybackDtt`-gated, unconditional) still reports real
+  // hit/miss/overlap counts for both runs.
+  def kSameLineCopyback: Kernel = {
+    val iters = 60
+    val setup = Seq("moveq #55,%d0", "moveq #60,%d7", "move.l 0x4300,%d1", "move.l 0x4308,%d2")
+    val body  = ".Lslcb: move.l %d0,0x4300 ; move.l 0x4308,%d2 ; subq.l #1,%d7 ; bne.s .Lslcb"
+    val src   = setup.mkString(" ; ") + " ; " + body
+    Kernel("same-line-copyback", src, setup.size + iters * 4, copybackDtt = true)
+  }
+
   // 5d. shift-stream: ALU SLOW-PATH (SHIFT) THROUGHPUT. This kernel exists to close a
   //     real BENCHMARK-COVERAGE GAP found by the 2026-08-09 EU-wide one-at-a-time-FSM
   //     audit: EVERY other kernel in this suite is shift-free and bit-field-free (see
@@ -994,7 +1023,7 @@ class IpcBenchSpec extends AnyFunSuite {
 
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
-      kStoreStream, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
+      kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
