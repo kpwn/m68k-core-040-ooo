@@ -188,13 +188,14 @@ class DcacheSpec extends AnyFunSuite {
     * property this test suite proves directly (program-order landing, ordering
     * test below) rather than via this blanket checker. */
   def initDutLatency(dut: Dut, hitCycles: Int = 15,
-                      crossbarSingleOutstanding: Boolean = false): (ClockDomain, AxiMemModel) = {
+                      crossbarSingleOutstanding: Boolean = false,
+                      checkIdUnique: Boolean = false): (ClockDomain, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
     val cfg = AxiMemModelConfig(
       latency = L2LatencyModel(enabled = true, hitCycles = hitCycles),
       crossbarSingleOutstanding = crossbarSingleOutstanding,
-      checkIdUnique = false)
+      checkIdUnique = checkIdUnique)
     val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, cfg)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
@@ -621,6 +622,56 @@ class DcacheSpec extends AnyFunSuite {
 
       assert(mem.peekByte(0x5000L) == 0x11, "store #1 landed correctly despite overlap")
       assert(mem.peekByte(0x6000L) == 0x22, "store #2 landed correctly despite overlap")
+      cd.waitSampling(4)
+    }
+  }
+
+  // ── axi-id-overlap-race investigation (2026-08-26/27) regression ──
+  // `docs/BUG_dstore_axi_id_overlap_race.md`: root-caused as a STALE test-harness
+  // checker, not an RTL bug -- `AxiProtocolChecker`'s AW "already outstanding" rule
+  // modeled the L2's PRE-2026-08-19/20-rework `id_busy_c` CAM (which, post-rework,
+  // no longer gates a cache-path write at all -- see `AxiIds.scala`'s `D_STORE` doc
+  // comment). The test directly above proves the overlap this test's own `D_STORE`
+  // (id=1) traffic produces is genuine and INTENDED; this test proves that overlap,
+  // observed with `checkIdUnique` ACTUALLY ON (unlike every other WT-pipelining test
+  // in this file, which disables it via `initDutLatency`'s default), does NOT trip
+  // the checker -- i.e. it proves `AxiMemModelConfig.writeIdsAllowedOutstanding`'s
+  // default (`Set(1)` = `AxiIds.D_STORE`) does its job. Deterministic (no seed
+  // dependence): `hitCycles = 15` makes the overlap unconditional, exactly as the
+  // test above already established -- this is not a flaky repro of the ORIGINAL
+  // bug report (that was seed-dependent only because `BehavioralMemAgent`'s
+  // near-zero-latency default makes overlap RARE, not because the underlying
+  // mechanism is probabilistic).
+  test("WT-pipelining: overlapping same-id AWs do NOT trip AxiProtocolChecker's " +
+       "checkIdUnique rule (axi-id-overlap-race regression)", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      // `checkIdUnique = true` (unlike every sibling WT-pipelining test above/below,
+      // which relies on `initDutLatency`'s default-off) -- this IS the thing under
+      // test. If `writeIdsAllowedOutstanding` regresses (goes back to `Set()`, or the
+      // checker's exemption logic breaks), `AxiProtocolChecker.fail` calls Scala's
+      // `assert(false, ...)` directly (see its own decl comment: "raised as a hard
+      // assert so a violation cannot be silently ignored"), which surfaces as this
+      // sim thread throwing -- ScalaTest fails the test with that exception, no
+      // extra plumbing needed here to "detect" a regression.
+      val (cd, mem) = initDutLatency(dut, hitCycles = 15, checkIdUnique = true)
+
+      fireStore(dut, cd, 0x5100L, BigInt("AAAAAAAA", 16), Size.LONG, CacheMode.WRITETHROUGH)
+      fireStore(dut, cd, 0x6100L, BigInt("BBBBBBBB", 16), Size.LONG, CacheMode.WRITETHROUGH)
+
+      // Confirm the overlap this test exists to exercise actually happened (same
+      // "both AXI-pending at once" proof the sibling tests use) -- otherwise a
+      // passing run would prove nothing.
+      var sawTwoOutstanding = false
+      var cyc = 0
+      while (!sawTwoOutstanding && cyc < 30) {
+        cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.wtOutstanding.toBigInt == 2) sawTwoOutstanding = true
+      }
+      assert(sawTwoOutstanding, "both pipelined WT stores must be simultaneously AXI-pending for this regression test to be meaningful")
+
+      cd.waitSampling(40)
+      assert(mem.peekByte(0x5100L) == 0xAA, "store #1 landed correctly despite overlap")
+      assert(mem.peekByte(0x6100L) == 0xBB, "store #2 landed correctly despite overlap")
       cd.waitSampling(4)
     }
   }

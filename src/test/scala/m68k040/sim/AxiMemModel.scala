@@ -93,8 +93,48 @@ case class L2LatencyModel(
   *                                  comment was written. This is the configuration
   *                                  against which slice D1's benefit must be shown to
   *                                  be REAL rather than asserted.
-  *  - `checkIdUnique`             : assert if the DUT presents an AR/AW whose ID is
-  *                                  already outstanding. Leave TRUE from slice V2 on.
+  *  - `checkIdUnique`             : assert if the DUT presents an AR whose ID is
+  *                                  already outstanding, or an AW whose ID is already
+  *                                  outstanding AND is not listed in
+  *                                  `writeIdsAllowedOutstanding`. Leave TRUE from
+  *                                  slice V2 on.
+  *  - `writeIdsAllowedOutstanding`: AW ids EXEMPT from the "already outstanding"
+  *                                  rule `checkIdUnique` otherwise enforces on the
+  *                                  write channel. Investigation
+  *                                  `axi-id-overlap-race` (2026-08-26/27) root-caused
+  *                                  a real, seed-dependent false positive: this rule
+  *                                  models the L2's `id_busy_c` CAM, but that CAM was
+  *                                  rescoped in the L2's 2026-08-19/20 pipeline rework
+  *                                  to gate only the BYPASS path -- a cache-path write
+  *                                  is ordered at the resolve stage instead
+  *                                  (`ord_now_block_c`/`ord_merge_block_c`, see
+  *                                  `AxiIds.scala`'s `D_STORE` doc comment for the full
+  *                                  citation). The WT-pipelining task's `D_STORE`
+  *                                  (id=1) write-through backend legitimately presents
+  *                                  several overlapping same-ID AWs by design (up to
+  *                                  `MAX_WT_OUTSTANDING`, `DcachePlugin.scala`) --
+  *                                  AXI4 permits multiple outstanding same-ID
+  *                                  transactions outright, provided responses complete
+  *                                  in issue order, a property this model's own
+  *                                  per-id `bQueue` (a FIFO) already guarantees
+  *                                  structurally and `DcacheSpec`'s dedicated
+  *                                  ordering test proves against the DUT. Defaults to
+  *                                  `Set(1)` (`AxiIds.D_STORE`) -- the ONLY write id
+  *                                  in this codebase any master ever legitimately
+  *                                  double-issues; every other write id (`D_PUSH`=2,
+  *                                  `WALK_WRITE`=3, `D_EVICT`=4) stays single-flight by
+  *                                  RTL construction (`evictAxiPairOpen`/
+  *                                  `maintAxiPairOpen`), so exempting only id=1 loses
+  *                                  no real bug-catching power today. A caller
+  *                                  modeling `crossbarSingleOutstanding = true` (the
+  *                                  real SoC crossbar's 1-outstanding-write-per-master
+  *                                  limit) never needs this exemption in the first
+  *                                  place: `awAcceptable()` already refuses to accept
+  *                                  a second same-ID AW in that mode, so the "already
+  *                                  outstanding" state this field exempts can never be
+  *                                  observed there. See
+  *                                  `docs/BUG_dstore_axi_id_overlap_race.md` for the
+  *                                  full investigation.
   *  - `injectBusErrors`           : task #189/#211 behaviour, unchanged semantics --
   *                                  DECERR for an address outside `AxiMemModel.decoded`. */
 case class AxiMemModelConfig(
@@ -106,6 +146,7 @@ case class AxiMemModelConfig(
   incrOnly: Boolean = true,
   checkProtocol: Boolean = true,
   checkIdUnique: Boolean = true,
+  writeIdsAllowedOutstanding: Set[Int] = Set(1),   // AxiIds.D_STORE -- see doc comment above
   injectBusErrors: Boolean = false,
   maxPendingBeats: Int = 8,
   bQueueDepth: Int = 4
@@ -146,8 +187,12 @@ class AxiMemStats(idWidth: Int) {
   * silently ignored by a test that forgets to look).
   *
   * Checks (design doc §8.1 item 5, §7.1 "Mandatory assertions"):
-  *   - an AR/AW ID that is ALREADY outstanding (the ID-uniqueness rule that makes
-  *     per-ID routing sound; also exactly what the L2's id_busy_c CAM enforces);
+  *   - an AR ID that is ALREADY outstanding (the ID-uniqueness rule that makes per-ID
+  *     routing sound; also exactly what the L2's id_busy_c CAM enforces for reads,
+  *     unconditionally, even post-2026-08-19/20 rework); an AW ID that is ALREADY
+  *     outstanding is the SAME rule, EXCEPT for ids in
+  *     `cfg.writeIdsAllowedOutstanding` -- see that field's doc comment
+  *     (`AxiMemModelConfig`) for why the write side is NOT unconditional post-rework;
   *   - burst type: INCR only (the L2 SLVERRs FIXED/WRAP, l2c_ctrl.v:26-37,136-139);
   *   - `len` within the configured maximum;
   *   - an R beat driven for an ID with NO outstanding transaction (a model self-check
@@ -194,7 +239,11 @@ class AxiProtocolChecker(cfg: AxiMemModelConfig, busConfig: Axi4Config) {
 
   def onAw(id: Int, addr: BigInt, size: Int, len: Int, burst: Int,
            idAlreadyLive: Boolean, cycle: Long): Unit = {
-    if (cfg.checkIdUnique && idAlreadyLive)
+    // `writeIdsAllowedOutstanding` exemption: see that field's doc comment
+    // (`AxiMemModelConfig`) -- a same-id overlapping AW is legitimate, intended
+    // WT-pipelining behaviour for an exempted id (today, only `D_STORE`=1), not a
+    // protocol violation.
+    if (cfg.checkIdUnique && idAlreadyLive && !cfg.writeIdsAllowedOutstanding.contains(id))
       fail(f"AW id=$id presented while ALREADY outstanding (addr=0x${addr}%x)", cycle)
     if (cfg.incrOnly && burst != 1)
       fail(s"AW id=$id burst=$burst is not INCR", cycle)

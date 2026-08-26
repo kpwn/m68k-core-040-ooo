@@ -1,7 +1,42 @@
 # BUG: intermittent "AW id=1 presented while ALREADY outstanding" AXI protocol
 # assertion, seed-dependent, PRE-EXISTING (independent of task movem-translate-ahead)
 
-**Status**: OPEN, NOT root-caused, NOT fixed. Discovered as a side effect of
+**Status**: FIXED (2026-08-26/27, investigation `axi-id-overlap-race`). Root
+cause: **a stale test-harness checker, NOT an RTL bug**. `AxiProtocolChecker`'s
+AW "already outstanding" rule modeled the L2's `id_busy_c` CAM as it worked
+*before* the L2's 2026-08-19/20 pipeline rework; post-rework, `id_busy_c` no
+longer gates a cache-path write at all (only the bypass path), and the
+WT-pipelining task's `D_STORE` (id=1) write-through backend legitimately,
+intentionally presents several overlapping same-id AWs (up to
+`MAX_WT_OUTSTANDING`) — AXI4 permits this outright (same-ID transactions just
+have to complete in issue order, which this design already guarantees and
+separately tests). The checker was simply never updated for that later,
+correct RTL behaviour. **This finding is REASSURING for the live-board
+bus-error/nondeterminism investigation this was suspected of maybe explaining
+— it does not: the corresponding scenario cannot occur on real hardware in
+the first place** (the real SoC crossbar's `sw_owned`/`ws_state` mechanism
+structurally limits each master to one outstanding write; an "early" second
+AW just sees `aw.ready` held low, it never actually collides). Fix: added
+`AxiMemModelConfig.writeIdsAllowedOutstanding` (default `Set(1)` =
+`AxiIds.D_STORE`, the only write id any master in this codebase ever
+legitimately double-issues) and made `AxiProtocolChecker.onAw` respect it.
+`DcacheSpec.scala` had already independently root-caused and worked around
+this exact issue for its own bespoke config (`initDutLatency`'s
+`checkIdUnique = false`); this fix generalizes that same understanding to the
+shared `BehavioralMemAgent` compatibility shim (~50+ test sites), which is
+what the originally-reported `ExecuteLockStepSpec` test actually uses. See
+`src/test/scala/m68k040/sim/AxiMemModel.scala`'s `writeIdsAllowedOutstanding`
+doc comment for the full citation trail, and the new regression test
+`DcacheSpec.scala`, "WT-pipelining: overlapping same-id AWs do NOT trip
+AxiProtocolChecker's checkIdUnique rule (axi-id-overlap-race regression)",
+which deterministically (not seed-dependently) proves both the overlap and
+the fix. Full investigation report:
+`/home/qwertyoruiop/tmp/claude-1000/-home-qwertyoruiop-m68k-core-040-ooo/374c5f2c-f0cd-4208-8a9e-23690599d409/scratchpad/axi-id-overlap-race-report.md`.
+
+---
+
+**Original status (superseded below, kept for history)**: OPEN, NOT
+root-caused, NOT fixed. Discovered as a side effect of
 directed testing for task `movem-translate-ahead`, but confirmed via rigorous
 A/B testing (below) to be completely independent of that task's changes.
 **Severity**: Unknown but potentially serious — an AXI protocol violation
