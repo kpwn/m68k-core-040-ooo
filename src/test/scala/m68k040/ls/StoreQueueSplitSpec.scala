@@ -74,8 +74,10 @@ class StoreQueueSplitSpec extends AnyFunSuite {
     cd.waitSampling(); dut.io.commit.valid #= false
   }
 
-  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type]): Unit = {
+  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type],
+               splitB: Boolean = false, paddrB: Long = 0): Unit = {
     dut.io.fwd.query.robId #= robId; dut.io.fwd.query.paddr #= paddr; dut.io.fwd.query.size #= size
+    dut.io.fwd.query.splitB #= splitB; dut.io.fwd.query.paddrB #= paddrB
     dut.io.fwd.query.inhibited #= false
   }
 
@@ -119,6 +121,59 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       setQuery(dut, robId = 6, paddr = 0x200, Size.LONG)
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean, "no overlap -> idle")
+      cd.waitSampling(2)
+    }
+  }
+
+  // Cross-page forward-hazard fix. Found by the agent that landed `9e0af36f` while
+  // proving that commit's own line+mask fold correct: `9e0af36f` preserved the
+  // PRE-EXISTING query-side assumption bit for bit -- a query's spilled bytes were
+  // always tested against `qLine + 1`, correct for a same-page line-crossing load
+  // (the page offset survives translation verbatim, so the second half really is
+  // physically `qLine + 1` there -- exercised by the exhaustive sweep above) but
+  // silently WRONG for a genuine page-crossing load, whose second half is
+  // independently DTLB-translated and can land on ANY physical line. This directed
+  // test is exactly that: an older store sitting where the load's REAL second half
+  // is (`paddrB`), physically nowhere near `paddr`'s line or `paddr`'s line + 1 (the
+  // old assumed target, which this test also proves is genuinely empty).
+  test("cross-page split load: forward-hazard against an older store detected via " +
+       "the REAL translated paddrB, not an assumed qLine+1", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // Older store: aligned WORD at 0x50000 (line 0x5000) -- physically nowhere near
+      // the load's first-half line (0x1000) OR "0x1000's line + 1" (0x1010, the OLD
+      // buggy assumption's target). Uncommitted (age via robHeadIn=0 / robId compare).
+      allocAligned(dut, cd, robId = 4, paddr = 0x50000, data = 0xDEADBEEFL, Size.WORD)
+
+      // Younger load (robId 6): a WORD at line 0x1000, offset 15 -- spills its LAST
+      // byte into a second, independently-translated half. In real hardware that
+      // second half is the genuinely page-crossing `p3Ctx.paddrB` / `LsEuPlugin`'s
+      // `s1PaddrB`; here it is poked directly as 0x50000 -- where the store above
+      // actually lives, NOT at 0x1010 (`paddr`'s line + 1).
+      setQuery(dut, robId = 6, paddr = 0x1000FL, size = Size.WORD,
+               splitB = true, paddrB = 0x50000L)
+      cd.waitSampling(); sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean,
+        "byte-partial cross-page overlap must not full-forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "cross-page split load's second half genuinely overlaps an older store -- " +
+        "must stall (THIS is the bug: pre-fix, this silently missed the hazard)")
+
+      // Negative control: same split query geometry, but `paddrB` now points
+      // somewhere that does NOT overlap the store -> no hit, no stall.
+      setQuery(dut, robId = 6, paddr = 0x1000FL, size = Size.WORD,
+               splitB = true, paddrB = 0x60000L)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
+        "paddrB not overlapping the store -> idle")
+
+      // Negative control: the OLD assumed location (`qLine + 1` = 0x1010) is
+      // genuinely empty -- confirms the hazard above is found via the REAL paddrB,
+      // not by some accidental match on the old (unrelated) line.
+      setQuery(dut, robId = 6, paddr = 0x1010L, size = Size.LONG)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
+        "the old assumed qLine+1 location is genuinely empty")
       cd.waitSampling(2)
     }
   }
@@ -288,7 +343,15 @@ class StoreQueueSplitSpec extends AnyFunSuite {
 
         for (qDeltaLine <- Seq(-1, 0, 1); (qSize, qN) <- sizes; qOff <- 0 until 16) {
           val qPaddr = stLine + qDeltaLine * 16 + qOff
-          setQuery(dut, robId = 6, paddr = qPaddr, size = qSize)
+          // A query that itself spills past its own line (qOff + qN > 16) is a split
+          // access -- its second half lands, by construction (both here and in real
+          // hardware: LsEuPlugin's `addrB = (va & ~15) + 16`), at the line-aligned base
+          // of the NEXT line. This sweep only ever exercises the same-page relationship
+          // (`qPaddrB` is a deterministic function of `qPaddr`'s own line); the DEDICATED
+          // cross-page test below exercises a `paddrB` that is NOT `qLine + 1`.
+          val qSplitB = (qOff + qN) > 16
+          val qPaddrB = stLine + (qDeltaLine + 1) * 16
+          setQuery(dut, robId = 6, paddr = qPaddr, size = qSize, splitB = qSplitB, paddrB = qPaddrB)
           cd.waitSampling(); sleep(1)
 
           val ovA      = sweepOverlap(paddrA, nbytesA, qPaddr, qN)
@@ -296,9 +359,14 @@ class StoreQueueSplitSpec extends AnyFunSuite {
           val full     = ovA && !split && paddrA == qPaddr && nbytesA == qN
           val partial  = (ovA || ovB) && !full
           // WRITETHROUGH on both halves here, so the sameLine stall is NOT scoped out
-          // (the COPYBACK narrowing of `9130a0b2` is exercised by its own tests).
+          // (the COPYBACK narrowing of `9130a0b2` is exercised by its own tests). The
+          // query's SECOND half (when it itself spills, `qSplitB`) triggers the exact
+          // same refill-stale-line hazard against either store slot -- this task's
+          // `sameLineA2`/`sameLineB2` extension.
           val sameLine = ((paddrA >> 4) == (qPaddr >> 4)) ||
-                         (split && ((paddrB >> 4) == (qPaddr >> 4)))
+                         (split && ((paddrB >> 4) == (qPaddr >> 4))) ||
+                         (qSplitB && ((paddrA >> 4) == (qPaddrB >> 4))) ||
+                         (qSplitB && split && ((paddrB >> 4) == (qPaddrB >> 4)))
           val expHit   = full
           val expStall = (partial || sameLine) && !full
 
