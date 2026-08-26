@@ -42,10 +42,12 @@ class StoreQueueSpec extends AnyFunSuite {
   }
 
   def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type],
-               inhibited: Boolean = false): Unit = {
+               inhibited: Boolean = false, splitB: Boolean = false, paddrB: Long = 0): Unit = {
     dut.io.fwd.query.robId #= robId
     dut.io.fwd.query.paddr #= paddr
     dut.io.fwd.query.size #= size
+    dut.io.fwd.query.splitB #= splitB
+    dut.io.fwd.query.paddrB #= paddrB
     dut.io.fwd.query.inhibited #= inhibited
     dut.io.barrier.robId #= robId
   }

@@ -1034,6 +1034,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sq.io.fwd.query.robId := fwdQueryCtx.front.robId
     sq.io.fwd.query.paddr := fwdQueryCtx.paddr
     sq.io.fwd.query.size  := fwdQueryCtx.front.size
+    // Cross-page forward-hazard fix: carry the query's own independently-translated
+    // second half (`paddrB`), gated by `front.twoAccess`, exactly mirroring how
+    // `SqAlloc.validB`/`paddrB` are populated a few lines above for a split STORE's
+    // own alloc. `fwdQueryCtx.paddrB` is already computed by the same XLATE_B FSM
+    // state as `p3Ctx.paddrB` regardless of memOp (a split LOAD's slot B is
+    // translated the same way a split STORE's is) -- see `s1PaddrB`'s declaration.
+    sq.io.fwd.query.splitB := fwdQueryCtx.front.twoAccess
+    sq.io.fwd.query.paddrB := fwdQueryCtx.paddrB
     sq.io.fwd.query.inhibited :=
       (fwdQueryCtx.cmode === m68k040.cache.CacheMode.INHIBITED) ||
       (fwdQueryCtx.front.twoAccess &&
