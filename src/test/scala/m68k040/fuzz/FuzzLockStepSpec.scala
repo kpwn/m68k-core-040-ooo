@@ -231,7 +231,7 @@ object FuzzRunner {
           val deR = dut.divEu.issuePort.ready.toBoolean
           val deBusy = dut.divEu.logic.busy.toBoolean
           val iqSlots = dut.iq.logic.slots.zipWithIndex.filter(_._1.sel.toBoolean).map { case (s, i) =>
-            f"s$i(rid=${s.context.robId.toInt},op=${s.context.uop.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},trig=0x${s.triggers.toBigInt.toString(16)},pA=${s.context.uop.psrcA.toInt}(v=${s.context.uop.psrcAValid.toBoolean}),pB=${s.context.uop.psrcB.toInt}(v=${s.context.uop.psrcBValid.toBoolean}),pC=${s.context.uop.psrcC.toInt}(v=${s.context.uop.psrcCValid.toBoolean}),readsNzvc=${s.context.uop.readsNzvc.toBoolean},pNzvcSrc=${s.context.uop.pNzvcSrc.toInt})"
+            f"s$i(rid=${s.hot.robId.toInt},op=${s.hot.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},trig=0x${s.triggers.toBigInt.toString(16)},pA=${s.hot.psrcA.toInt}(v=${s.hot.psrcAValid.toBoolean}),pB=${s.hot.psrcB.toInt}(v=${s.hot.psrcBValid.toBoolean}),pC=${s.hot.psrcC.toInt}(v=${s.hot.psrcCValid.toBoolean}),readsNzvc=${s.hot.readsNzvc.toBoolean},pNzvcSrc=${s.hot.pNzvcSrc.toInt})"
           }.mkString(" ")
           val lsBusyHex = dut.iq.logic.lsBusy.toBigInt.toString(16)
           val sbXBusyHex = dut.iq.logic.sbX.busy.toBigInt.toString(16)

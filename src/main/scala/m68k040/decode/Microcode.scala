@@ -2773,7 +2773,7 @@ object Microcode {
     // introduces no live corruption path today.
     u.fpuSoftwareComplete := Bool(d.fpMemTrap)
     u.fpuCmdWord          := (if (d.fpMemTrap) ctx.fpTrapCmd else B(0, 16 bits))
-    u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later
@@ -3339,7 +3339,7 @@ object Microcode {
     // would care -- ExceptionUnit's `fpuSrcArch`/`committedFpSrcIn` -- is unwired today).
     u.fpuSoftwareComplete := d.fpMemTrap
     u.fpuCmdWord          := Mux(d.fpMemTrap, ctx.fpTrapCmd, B(0, 16 bits))
-    u.faultAddr := ctx.pc; u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
     u.divSigned := False; u.div64 := False
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later

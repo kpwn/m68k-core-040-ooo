@@ -103,7 +103,7 @@ class MiHangTraceSpec extends AnyFunSuite {
           val sqFlushNow = sq0.io.flush.toBoolean
           val iqFlush = dut.iq.flushSignal.toBoolean
           val iqSlots = dut.iq.logic.slots.zipWithIndex.filter(_._1.sel.toBoolean).map { case (s, i) =>
-            f"s$i(rid=${s.context.robId.toInt})"
+            f"s$i(rid=${s.hot.robId.toInt})"
           }.mkString(" ")
           val lsBusy = dut.lsEu.logic.busy.toBoolean
           val lsS1V  = dut.lsEu.logic.s1Valid.toBoolean

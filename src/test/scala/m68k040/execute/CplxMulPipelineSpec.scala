@@ -131,7 +131,6 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       uop.isRte := False
       uop.faultUsesNextPc := False
       uop.isCondTrap := False
-      uop.faultAddr := 0
       uop.sswInstr := False
       uop.faultAtc := True
       uop.divSigned := iSigned

@@ -129,6 +129,11 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     sq.io.fwd.query.robId := fwdRobIn
     sq.io.fwd.query.paddr := fwdAddrIn
     sq.io.fwd.query.size  := fwdSizeIn
+    // This harness never exercises a split (cross-line/page) query.
+    sq.io.fwd.query.splitB := False
+    sq.io.fwd.query.paddrB := U(0, 32 bits)
+    sq.io.fwd.query.inhibited := False
+    sq.io.barrier.robId := 0
     fwdHitOut   := sq.io.fwd.rsp.hit
     fwdStallOut := sq.io.fwd.rsp.stall
     fwdDataOut  := sq.io.fwd.rsp.data

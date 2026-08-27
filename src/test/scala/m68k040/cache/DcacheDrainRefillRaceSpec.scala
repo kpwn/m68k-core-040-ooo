@@ -102,6 +102,36 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   val base = SET * 16L
   def addrK(k: Long): Long = base + k * 0x800L
 
+  test("runtime reset invalidates resident D-cache lines", VerilatorTest) {
+    compiled.doSim("runtimeResetInvalidatesDcache", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val line = 0x0017fdc0L
+      preload(mem, line, 16)
+      val before = load(dut, cd, line + 8, Size.LONG)
+
+      // A board-level CPU/JTAG reset does not reconfigure FPGA RAM INIT bits.
+      // Change backing memory while reset is asserted to model the next boot's
+      // world, then prove the old resident tag cannot survive the runtime reset.
+      cd.assertReset()
+      sleep(40)
+      for (i <- 0 until 4) mem.pokeByte(line + 8 + i, 0xA0 + i)
+      cd.deassertReset()
+      cd.waitSampling(140)
+
+      val after = load(dut, cd, line + 8, Size.LONG)
+      assert(before != BigInt("A0A1A2A3", 16),
+        "test setup accidentally used the post-reset backing value")
+      assert(after == BigInt("A0A1A2A3", 16),
+        f"runtime reset resurrected a stale resident D-cache line: 0x$after%08x")
+    }
+  }
+
   test("PRE-EXISTING BUG (design doc §5 item 11): same-set different-line refill " +
        "racing a store drain's S1 read must not corrupt the refilled line",
        VerilatorTest) {
@@ -621,6 +651,83 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     }
   }
 
+  test("load dirty-victim read launch forwards the prior-cycle S3 store result",
+       VerilatorTest) {
+    compiled.doSim("loadVictimFromS3Launch", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val set = 55L
+      def line(k: Long): Long = set * 16L + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, line(k), 16)
+      for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
+
+      var sawLaunchCollision = false
+      var sawForward = false
+      var storeAcks = 0
+      var refillArs = 0
+      var victimAws = 0
+      var monitor = true
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.dcache.logic.loadMissDiscovered.toBoolean &&
+              dut.dcache.logic.stS3WriteD1.toBoolean) sawLaunchCollision = true
+          if (dut.dcache.logic.loadVictimFromS3Dbg.toBoolean) sawForward = true
+          if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean &&
+              dut.dcache.logic.axi.aw.ready.toBoolean &&
+              ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
+            victimAws += 1
+        }
+      }
+
+      // This is the Q700 boot signature: a LONG at +2 within a resident line.
+      // Present the fifth-tag load while the store is in S2. On the acceptance
+      // cycle the store advances to S3 and writes the exact set/way whose sync
+      // victim read the load launches. The miss decision is one cycle later,
+      // after the live S3 bypass has disappeared.
+      fireCopyback(dut, cd, line(0) + 2, BigInt("000088B0", 16))
+      cd.waitSamplingWhere(dut.dcache.logic.stS2Valid.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadCmdIn.payload.vaddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.paddr #= line(4)
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= 9
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(line(4), 4),
+        "racing target load returned corrupt refill data")
+      cd.waitSampling(8)
+      monitor = false
+      cd.waitSampling()
+
+      assert(sawLaunchCollision,
+        "test never aligned the victim read launch with the preceding S3 write")
+      assert(sawForward,
+        "the one-cycle S3 write snapshot did not bypass the stale victim RAM read")
+      assert(storeAcks == 1, s"racing S3 store acknowledged $storeAcks times")
+      assert(refillArs == 1, s"target load issued $refillArs refill reads")
+      assert(victimAws == 1, s"newly dirtied victim issued $victimAws eviction writes")
+      val evicted = (0 until 4).foldLeft(BigInt(0)) { (acc, i) =>
+        (acc << 8) | BigInt(mem.peekByte(line(0) + 2 + i))
+      }
+      assert(evicted == BigInt("000088B0", 16),
+        f"launch-cycle collision lost the unaligned link store: 0x$evicted%08x")
+      assert(load(dut, cd, line(0) + 2, Size.LONG) == BigInt("000088B0", 16),
+        "unaligned link store was lost across dirty victim eviction/reload")
+    }
+  }
+
   test("COPYBACK miss victim snapshot forwards the preceding S3 store result",
        VerilatorTest) {
     compiled.doSim("storeVictimFromS3", 1) { dut =>
@@ -676,6 +783,71 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       }
       assert(evicted == BigInt("CAFEBABE", 16),
         f"store-miss victim snapshot lost the preceding S3 update: 0x$evicted%08x")
+      assert(load(dut, cd, line(4) + 4, Size.LONG) == BigInt("11223344", 16),
+        "younger COPYBACK miss did not merge into its allocated line")
+    }
+  }
+
+  test("COPYBACK miss victim read launch forwards the prior-cycle S3 store result",
+       VerilatorTest) {
+    compiled.doSim("storeVictimFromS3Launch", 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.probe.logic.loadCmdIn.valid #= false
+      dut.probe.logic.storeIn.valid #= false
+      cd.waitSampling(5)
+
+      val set = 56L
+      def line(k: Long): Long = set * 16L + k * 0x800L
+      for (k <- 0L until 5L) preload(mem, line(k), 16)
+      for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
+
+      var sawLaunchCollision = false
+      var sawForward = false
+      var storeAcks = 0
+      var refillArs = 0
+      var victimAws = 0
+      var monitor = true
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.dcache.logic.storeMissDiscovered.toBoolean &&
+              dut.dcache.logic.stS3WriteD1.toBoolean) sawLaunchCollision = true
+          if (dut.dcache.logic.storeVictimFromS3Dbg.toBoolean) sawForward = true
+          if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (dut.dcache.logic.axi.aw.valid.toBoolean &&
+              dut.dcache.logic.axi.aw.ready.toBoolean &&
+              ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
+            victimAws += 1
+        }
+      }
+
+      fireCopyback(dut, cd, line(0) + 2, BigInt("000088B0", 16))
+      // One bubble relative to the existing resolution-cycle test shifts the
+      // younger store's sync victim-read launch onto the older store's S3 write.
+      cd.waitSampling(1)
+      fireCopyback(dut, cd, line(4) + 4, BigInt("11223344", 16))
+      var waitAcks = 0
+      while (storeAcks < 2 && waitAcks < 300) { cd.waitSampling(); waitAcks += 1 }
+      cd.waitSampling(6)
+      monitor = false
+      cd.waitSampling()
+
+      assert(sawLaunchCollision,
+        "test never aligned the store-miss victim read launch with the prior S3 write")
+      assert(sawForward,
+        "store-miss victim capture did not use the one-cycle S3 write snapshot")
+      assert(storeAcks == 2, s"expected two ordered store acks, saw $storeAcks")
+      assert(refillArs == 1, s"younger COPYBACK miss issued $refillArs refill reads")
+      assert(victimAws == 1, s"newly dirtied victim issued $victimAws eviction writes")
+      val evicted = (0 until 4).foldLeft(BigInt(0)) { (acc, i) =>
+        (acc << 8) | BigInt(mem.peekByte(line(0) + 2 + i))
+      }
+      assert(evicted == BigInt("000088B0", 16),
+        f"store-miss launch collision lost the unaligned link store: 0x$evicted%08x")
       assert(load(dut, cd, line(4) + 4, Size.LONG) == BigInt("11223344", 16),
         "younger COPYBACK miss did not merge into its allocated line")
     }

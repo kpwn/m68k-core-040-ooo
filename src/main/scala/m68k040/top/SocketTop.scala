@@ -8,6 +8,7 @@ import m68k040.mmu.{DtlbPlugin, ItlbPlugin, MmuControlPlugin}
 import m68k040.socket._
 import spinal.core._
 import spinal.core.fiber.Fiber
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -71,6 +72,15 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
                                resetKind        = ASYNC,
                                resetActiveLevel = HIGH))
 
+  // ── A domain `rst` CANNOT clear (see the AXI read absorber inside Fiber.build) ──
+  // `resetKind = BOOT` means "no reset wire; the init value is the boot value" -- it
+  // survives every CPU/JTAG reset and is cleared only by FPGA configuration.  Same
+  // mechanism DebugCtrlPlugin uses for its debug POR domain.
+  val axiPorCd = ClockDomain(clock  = clk,
+                             config = ClockDomainConfig(clockEdge = RISING,
+                                                        resetKind = BOOT))
+  axiPorCd.setSynchronousWith(coreCd)
+
   val socket = coreCd on new Area {
     // ── Plugin list: GenFullCoreSynthVerilog's, plus the socket-only ones ────────────
     // ORDERING IS LOAD-BEARING and each constraint is stated at its own plugin:
@@ -99,7 +109,10 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new ItlbPlugin(socketMerged = true),
       new DtlbPlugin(socketMerged = true),
       icache,
-      new DcachePlugin(socketMerged = true),
+      // Keep the optional early VIPT snapshot path out of the FPGA socket while
+      // isolating the live-board wrong-set response observed during ROM boot.
+      // Resolved loads retain the ordinary translated D-cache path.
+      new DcachePlugin(socketMerged = true, earlyViptEnabled = false),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
       new m68k040.frontend.RasPlugin(),
@@ -164,6 +177,45 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   // any of this wiring (pure Bits/UInt renaming plus `SocketByteOrder`'s zero-depth
   // permutation), so the active ClockDomain is irrelevant to it in any case.
   Fiber.build {
+    // ── Post-reset AXI read-response absorber ───────────────────────────────────────
+    //
+    // A CPU reset must be able to RECOVER A HUNG MACHINE -- that is the whole purpose
+    // of the debug reset.  But `rst` resets the entire core, including every
+    // outstanding-transaction tracker, while the SoC side (L2C / crossbar / MIG) keeps
+    // its state and still owes responses for reads issued BEFORE the reset.  Those
+    // responses then have nobody willing to accept them: the I-cache raises `r.ready`
+    // only for an id matching a LIVE MSHR (IcachePlugin: `axi.r.ready := demandRspMatch
+    // || pfRspMatch`) and the D-cache only inside REFILL (`axi.r.ready :=
+    // !refillWriteHold`) -- and the reset cleared both.  AXI R is in-order per id, so a
+    // single un-acked stale beat blocks the read channel FOREVER: the reset-vector fetch
+    // never receives data and the CPU never executes a single instruction.  (`b.ready`
+    // is already held True globally in the D-cache, so the write channel was never
+    // exposed to this; reads were the hole.)
+    //
+    // Fix: count live reads in `axiPorCd`, which `rst` cannot clear; arm on every reset;
+    // and until the count returns to zero, accept-and-discard every read beat while
+    // refusing to issue any new address.  Bounded by construction -- no new AR can be
+    // added while absorbing, so the count is monotonically non-increasing and reaches
+    // zero.  Steady-state cost is nil: with nothing outstanding, `absorbing` drops the
+    // cycle after reset releases.
+    val axiAbsorb = axiPorCd on new Area {
+      // Instantiated HERE, in `axiPorCd`, on purpose: putting these in the core's own
+      // reset domain would zero the very counters whose values are the thing `rst`
+      // destroyed -- which is the bug being fixed.  See AxiReadResetAbsorber's header.
+      val i = new AxiReadResetAbsorber()
+      val d = new AxiReadResetAbsorber()
+      i.setName("axi_i_reset_absorber")
+      d.setName("axi_d_reset_absorber")
+      i.io.rstObserved := rst
+      i.io.arFire      := axi_i.arvalid && axi_i.arready
+      i.io.rLastFire   := axi_i.rvalid && axi_i.rready && axi_i.rlast
+      d.io.rstObserved := rst
+      d.io.arFire      := axi_d.arvalid && axi_d.arready
+      d.io.rLastFire   := axi_d.rvalid && axi_d.rready && axi_d.rlast
+    }
+    val absorbI = axiAbsorb.i.io.absorbing
+    val absorbD = axiAbsorb.d.io.absorbing
+
     // ── axi_i: the I-cache, permuted on r.data only (D3, D11) ───────────────────────
     val ic = socket.icache.logic.axi
     axi_i.arid    := ic.ar.payload.id
@@ -171,9 +223,9 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     axi_i.arlen   := ic.ar.payload.len
     axi_i.arsize  := ic.ar.payload.size
     axi_i.arburst := ic.ar.payload.burst
-    axi_i.arvalid := ic.ar.valid
-    ic.ar.ready   := axi_i.arready
-    ic.r.valid          := axi_i.rvalid
+    axi_i.arvalid := ic.ar.valid && !absorbI
+    ic.ar.ready   := axi_i.arready && !absorbI
+    ic.r.valid          := axi_i.rvalid && !absorbI
     ic.r.payload.id     := axi_i.rid
     // THE ONLY permuted signal on this master. Applying it to an address would be a bug;
     // applying it twice would be a no-op that looks like a fix (SocketByteOrder is an
@@ -181,7 +233,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     ic.r.payload.data   := SocketByteOrder.permuteData(axi_i.rdata)
     ic.r.payload.resp   := axi_i.rresp
     ic.r.payload.last   := axi_i.rlast
-    axi_i.rready  := ic.r.ready
+    axi_i.rready  := ic.r.ready || absorbI   // absorb-and-discard stale beats
 
     // ── axi_d: the merged master, permuted on w.data / w.strb / r.data (D3) ─────────
     val dm = socket.merge.logic.axi
@@ -210,14 +262,14 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     axi_d.arlen   := dm.ar.payload.len
     axi_d.arsize  := dm.ar.payload.size
     axi_d.arburst := dm.ar.payload.burst
-    axi_d.arvalid := dm.ar.valid
-    dm.ar.ready   := axi_d.arready
-    dm.r.valid        := axi_d.rvalid
+    axi_d.arvalid := dm.ar.valid && !absorbD
+    dm.ar.ready   := axi_d.arready && !absorbD
+    dm.r.valid        := axi_d.rvalid && !absorbD
     dm.r.payload.id   := axi_d.rid
     dm.r.payload.data := SocketByteOrder.permuteData(axi_d.rdata)   // permuted (3 of 3)
     dm.r.payload.resp := axi_d.rresp
     dm.r.payload.last := axi_d.rlast
-    axi_d.rready  := dm.r.ready
+    axi_d.rready  := dm.r.ready || absorbD   // absorb-and-discard stale beats
 
     // ── Interrupt seam (D18) ─────────────────────────────────────────────────────────
     val bw = socket.core.plugins.collectFirst { case b: BackendWiringPlugin => b }.get

@@ -38,7 +38,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   DETECTION and the whole EVICT_WR/REFILL/REPLAY machinery are unchanged (they
   *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
-class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with DcacheService {
+class DcachePlugin(val socketMerged: Boolean = false,
+                   val earlyViptEnabled: Boolean = true) extends FiberPlugin with DcacheService {
 
   private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
@@ -102,6 +103,13 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
                                // AXI B to observe on that path); no-op for synthesis
     val storeErrReg = Bool()   // Task P1.4: 1-cycle pulse, non-OKAY B alongside storeAckReg
     storeErrReg.simPublic()
+    // WT-pipelining task: the pipelined-WT-specific slice of `storeAckReg` (see
+    // that signal's own drive site for the exact expression and the reasoning for
+    // why `!stPreciseReg` at a `storeBAck` instant is an exact classifier). Forward-
+    // declared here, same pattern as `storeAckReg` itself, since `wtOutstanding`'s
+    // accounting (declared far above the AXI B site) needs to reference it.
+    val wtStoreAckReg = Bool()
+    wtStoreAckReg.simPublic()
     // `socketMerged` (axi-socket adapter plan, Task 5): when this plugin's AXI is merged
     // onto the single socket `axi_d` by AxiDMergePlugin, the bundle must be DIRECTIONLESS
     // so a sibling plugin in the same Component can drive its response side --
@@ -131,16 +139,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // for every call site during this task), so no new read-port arbitration logic
     // is needed at all.
     //
-    // Mem.init(all False) replaces RegInit(False)'s per-bit reset -- real 68040
-    // semantics (cache contents undefined/INVALID at reset) are preserved exactly
-    // (all-False == all-invalid), and unlike a flop array this needs no reset
-    // fan-in: Vivado synthesizes the `initial` content directly into the LUTRAM
-    // primitive's INIT parameter (same mechanism as `ucRomMem` in DecodeStage.scala,
-    // just RAM instead of ROM), and the SpinalHDL simulator honors Mem.init as the
-    // sim-time reset content from cycle 0, so no boot-pulse invalidate walk is
-    // needed here (`Mem.init` already IS a clean, structurally-reset value -- see
-    // this task's report for why the report's speculative boot-walk turned out to
-    // be unnecessary).
+    // Mem.init(all False) supplies the FPGA CONFIGURATION-time contents, but it does
+    // not make these inferred RAMs respond to a later CPU/JTAG runtime reset.  A
+    // same-bitstream reset therefore needs the explicit set walk below; otherwise
+    // old valid+dirty lines survive while all surrounding control and replacement
+    // registers reset, letting a new boot hit data from the previous one.
     val validsMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
     val dirtysMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
     // test-visibility only (DcacheSpec/DcacheDrainRefillRaceSpec peek dirtysMem(w)
@@ -154,6 +157,14 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // UNACCESSIBLE SIGNAL at sim time, not a silent no-op.
     for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
+    // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
+    // merely at FPGA configuration); one set is invalidated per cycle after reset
+    // releases. Request acceptance and maintenance quiescence are gated below until
+    // all sets are clean. Data/tag RAM need not be cleared: valid=False makes their
+    // payload architecturally unreachable, exactly as a normal invalidate does.
+    val resetSweepBusy = RegInit(True)
+    val resetSweepSet  = Reg(UInt(setBits bits)) init 0
+    resetSweepBusy.simPublic(); resetSweepSet.simPublic()
 
     // ---- single muxed data/tag write port per way (refill + store-write) ----
     val wrEn    = Vec.fill(ways)(False)
@@ -197,13 +208,32 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // fanout outside the simulation-only assert below, so Vivado's own dead-code
     // elimination removes it entirely from a non-simulation netlist.
     val validsVoteW1 = Vec.fill(ways)(False)   // W1: REFILL-allocate
+    val validsVoteW0 = Vec.fill(ways)(False)   // W0: runtime-reset invalidate
     val validsVoteW2 = Vec.fill(ways)(False)   // W2: maint CHECK-invalidate
     val validsVoteW3 = Vec.fill(ways)(False)   // W3: maint WRB-invalidate
     val dirtysVoteD1 = Vec.fill(ways)(False)   // D1: REFILL-allocate
+    val dirtysVoteD0 = Vec.fill(ways)(False)   // D0: runtime-reset clear
     val dirtysVoteD2 = Vec.fill(ways)(False)   // D2: REPLAY-merge write-allocate
     val dirtysVoteD3 = Vec.fill(ways)(False)   // D3: maint CHECK-invalidate
     val dirtysVoteD4 = Vec.fill(ways)(False)   // D4: maint WRB-clean
     val dirtysVoteD5 = Vec.fill(ways)(False)   // D5: store-S3-copyback
+    when(resetSweepBusy) {
+      for (w <- 0 until ways) {
+        validsWrEn(w)   := True
+        validsWrSet(w)  := resetSweepSet
+        validsWrData(w) := False
+        dirtysWrEn(w)   := True
+        dirtysWrSet(w)  := resetSweepSet
+        dirtysWrData(w) := False
+        validsVoteW0(w) := True
+        dirtysVoteD0(w) := True
+      }
+      when(resetSweepSet === U(sets - 1, setBits bits)) {
+        resetSweepBusy := False
+      } otherwise {
+        resetSweepSet := resetSweepSet + 1
+      }
+    }
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
@@ -438,7 +468,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     axi.b.ready  := True
 
     val busy = Reg(Bool()) init False
-    loadBusyReg := busy
+    loadBusyReg := busy || resetSweepBusy
 
     // ---- load index/tag from cmd vaddr + PRE-TRANSLATED paddr ----
     // FMax: the physical tag comes from the requester's REGISTERED `loadCmd.paddr`
@@ -511,22 +541,93 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       earlyProbeValids(probeReadSlot) &&
       (earlyProbeTokens(probeReadSlot) === loadProbeResolvePort.payload.token) &&
       !probeResolveCanceled
-    val probeResolvedTag = Mux(probeResolveMatchesRead,
-      loadProbeResolvePort.payload.paddr(31 downto offBits + setBits), probeReadTag)
-    val probeResolvedUsable = probeReadUsable ||
-      (probeResolveMatchesRead && !probeReadNeedsLine &&
-       (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+    // ── FMax: compare the ways against BOTH candidate tags, then select ──
+    // The original form selected the tag first and compared second:
+    //
+    //   probeResolvedTag    = Mux(probeResolveMatchesRead, resolvePort.paddr(tag),
+    //                             probeReadTag)
+    //   probeResolvedUsable = probeReadUsable || (probeResolveMatchesRead && ...)
+    //   probeReadHitVec(w)  = probeResolvedUsable && rdValid(w) &&
+    //                           (rdTag(w) === probeResolvedTag)
+    //
+    // so `probeResolveMatchesRead` had to traverse a tag mux AND the full way-tag
+    // comparator (a CARRY8) before `probeReadHitVec` existed -- three logic levels,
+    // at the far end of the core's longest cone. `probeResolveMatchesRead` is fed by
+    // `loadProbeResolvePort.valid`, which the LS EU derives from the completion
+    // arbitration, which the ROB retire pointer feeds through its payload Mem's async
+    // read: measured on the standing 5.000ns OOC gate, `RobPlugin_logic_head_reg[0]`
+    // -> ... -> `probeResolvedTag` -> `probeReadHitVec` -> `probeReadHitWay` ->
+    // `probeLineLine_reg[*]` was 24 logic levels / 6.090ns / WNS -1.109ns, and the
+    // dominant failing family (replicated across all 128 bits of `probeLineLine`).
+    //
+    // BOTH candidate tags are available at the top of the cycle -- `probeReadTag` is a
+    // plain register, and the resolve port's paddr does not depend on
+    // `probeResolveMatchesRead` -- so both comparisons can run in parallel with the
+    // arbitration and only the SELECT stays behind it. `probeResolveMatchesRead` now
+    // reaches `probeReadHitVec` through a single LUT.
+    //
+    // EQUIVALENCE, by cases on `probeResolveMatchesRead` (the only variable shared
+    // between the two forms; `rdValid`/`rdTag`/`probeReadTag`/`probeReadUsable`/
+    // `probeReadNeedsLine` and the resolve port's payload are identical in both):
+    //   - True : old tag is the resolve paddr's tag and old usable is
+    //            `probeReadUsable || (!probeReadNeedsLine && cmode =/= INHIBITED)` ==
+    //            `probeUsableIfResolved`, giving
+    //            `probeUsableIfResolved && rdValid(w) && (rdTag(w) === resolveTag)`.
+    //   - False: old tag is `probeReadTag` and old usable collapses to
+    //            `probeReadUsable`, giving
+    //            `probeReadUsable && rdValid(w) && (rdTag(w) === probeReadTag)`.
+    // Those are exactly the two arms below. Cost: one extra ways-wide tag comparator
+    // (4 x tagBits); the tripwire re-evaluates the original expression every cycle.
+    val probeResolveTagIn = loadProbeResolvePort.payload.paddr(31 downto offBits + setBits)
+    val probeUsableIfResolved = probeReadUsable ||
+      (!probeReadNeedsLine && (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+    val probeWayMatchResolved = Vec(Bool(), ways)
+    val probeWayMatchRead     = Vec(Bool(), ways)
+    for (w <- 0 until ways) {
+      probeWayMatchResolved(w) := rdValid(w) && (rdTag(w) === probeResolveTagIn)
+      probeWayMatchRead(w)     := rdValid(w) && (rdTag(w) === probeReadTag)
+    }
     val probeReadHitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
-      probeReadHitVec(w) := probeResolvedUsable && rdValid(w) &&
-                            (rdTag(w) === probeResolvedTag)
-    val probeReadHitWay = OHToUInt(probeReadHitVec)
+      probeReadHitVec(w) := Mux(probeResolveMatchesRead,
+                                probeUsableIfResolved && probeWayMatchResolved(w),
+                                probeReadUsable       && probeWayMatchRead(w))
+    GenerationFlags.simulation {
+      val probeResolvedTagRef = Mux(probeResolveMatchesRead, probeResolveTagIn, probeReadTag)
+      val probeResolvedUsableRef = probeReadUsable ||
+        (probeResolveMatchesRead && !probeReadNeedsLine &&
+         (loadProbeResolvePort.payload.cacheMode =/= CacheMode.INHIBITED))
+      for (w <- 0 until ways)
+        assert(probeReadHitVec(w) === (probeResolvedUsableRef && rdValid(w) &&
+                                       (rdTag(w) === probeResolvedTagRef)),
+          "DcachePlugin: probeReadHitVec drifted from its original select-then-compare definition",
+          FAILURE)
+    }
+    // (`probeReadHitWay = OHToUInt(probeReadHitVec)` used to live here. Its only consumer
+    //  was the `probeLineLine` way mux below, which is now a `MuxOH` off the hit vector
+    //  itself -- see there for why the binary round trip cost a critical-path level.)
     probeReadValid := False
     probeLineValid := probeReadValid
     when(probeReadValid) {
       probeLineSlot := probeReadSlot
       probeLineHit  := probeReadHitVec.asBits.orR
-      probeLineLine := rdData(probeReadHitWay)
+      // FMax: one-hot way mux instead of `rdData(OHToUInt(probeReadHitVec))`. The binary
+      // round trip costs a level -- Vivado builds it as an `OHToUInt` reduction, then a
+      // shared select decode broadcast to all 128 bits, then the per-bit mux -- and this
+      // is the LAST hop of the core's worst path, so the level lands directly on WNS.
+      // `MuxOH` consumes the already-one-hot vector directly (`probeReadHitVec` is a
+      // way-tag hit vector: at most one way of a set may hold a given tag, which is the
+      // same premise `OHToUInt` was already asserting).
+      //
+      // The ONE input for which the two forms differ is the all-zero vector, and there
+      // the result is a proven don't-care: `MuxOH` yields 0 where `rdData(OHToUInt(0))`
+      // yielded way 0's line. An all-zero `probeReadHitVec` sets `probeLineHit := False`
+      // on the same edge, so next cycle `earlyProbeHits(probeLineSlot) := False`, and
+      // `earlyProbeData`'s content for that entry can never be read: `earlyProbeHitData`
+      // is consumed only under `useEarlyProbe`, which requires `earlyProbeHit`, which
+      // requires `earlyProbeHits(i)`. A probe that missed always falls back to the
+      // ordinary S1 read path and never serves this register's value.
+      probeLineLine := MuxOH(probeReadHitVec, rdData)
       probeLineOff  := probeReadOff
       probeLineSize := probeReadSize
     }
@@ -599,23 +700,139 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
     val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
     val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
-    val earlyProbeHit          = earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
-                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
-                                 !earlyProbeStale(earlyProbeMatchIdx)
+    // ── FMax: `earlyProbeHit` as a per-entry OR, not an index-then-select ──
+    // The original form was
+    //
+    //   earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+    //     !earlyProbeSetWriteVec(earlyProbeMatchIdx) && !earlyProbeStale(earlyProbeMatchIdx)
+    //
+    // which SERIALISES the CAM behind three separate 4:1 selects: the compare vector has
+    // to be reduced to `earlyProbeMatchIdx` (an OHToUInt) before any of the three
+    // per-entry qualifiers can even be looked up, and only then does the final AND with
+    // `earlyProbeOwnsCmd` run. Measured from `earlyProbeMatchVec` that is four LUT levels
+    // (matchVec -> OHToUInt -> 4:1 mux -> AND), and it sits in the middle of the core's
+    // longest cone -- `loadCmd.vaddr` -> this CAM -> `earlyProbeHit` -> `useEarlyProbe`
+    // -> `loadProbePort.ready` -> the LS EU's `normalReqArm`/`issuePort.ready` ready chain
+    // -> the IssueQueue's slot-compaction `triggers` clock enables (23 levels, WNS
+    // -1.109ns, the sole remaining failing family on the standing 5.000ns OOC gate).
+    //
+    // Distributing the qualifiers over the vector collapses that to TWO levels: each
+    // entry's five terms fold into one LUT (`matchVec(i)` is itself `presentVec(i) &&
+    // readies(i)`, so this is `presentVec & readies & hits & !setWrite & !stale`, five
+    // inputs), and the four results OR together in one more.
+    //
+    // EQUIVALENCE. `earlyProbeOwnsCmd` is `earlyProbeMatchVec.orR`, and `OHToUInt`
+    // requires -- as its name says -- a one-hot input:
+    //   - `earlyProbeMatchVec` all zero: `earlyProbeOwnsCmd` is False so the old form is
+    //     False, and an OR of `matchVec(i) && ...` over an all-zero vector is False too.
+    //   - `earlyProbeMatchVec` one-hot at `i`: `earlyProbeMatchIdx` is exactly `i`, so the
+    //     old form is `hits(i) && !setWrite(i) && !stale(i)` and the OR collapses to its
+    //     single non-masked term, the identical expression.
+    // Those are the only two cases the surrounding design admits. A multi-hot
+    // `earlyProbeMatchVec` is already outside this block's contract and was ALREADY
+    // mis-handled before this change, not newly so: `OHToUInt` on a multi-hot input ORs
+    // the set indices together, which can name an entry that does not match the command
+    // at all (e.g. `0b0110` yields index 3), and `earlyProbeHitData` -- unchanged here --
+    // would then serve that unrelated entry's data. The design requires one-hotness for
+    // the data path regardless of how the hit qualifier is written.
+    //
+    // Multi-hotness needs two simultaneously-valid entries carrying the SAME token AND
+    // the same VA. Probe tokens are `(False ## False ## tCtx.robId)` (LsEuPlugin), i.e.
+    // one per in-flight ROB id, and an entry is invalidated both when its command
+    // consumes it and by the token/`all` cancel port. The tripwire below pins that
+    // one-hot premise directly instead of leaving it as an unchecked comment.
+    val earlyProbeHitVec       = Vec(Bool(), earlyProbeDepth)
+    for (i <- 0 until earlyProbeDepth) {
+      earlyProbeHitVec(i) := earlyProbeMatchVec(i) && earlyProbeHits(i) &&
+                             !earlyProbeSetWriteVec(i) && !earlyProbeStale(i)
+    }
+    val earlyProbeHit          = earlyProbeHitVec.asBits.orR
+    GenerationFlags.simulation {
+      assert(CountOne(earlyProbeMatchVec.asBits) <= U(1),
+        "DcachePlugin: early-probe match vector is multi-hot (duplicate token+VA entries)",
+        FAILURE)
+      assert(earlyProbeHit === (earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+                                !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
+                                !earlyProbeStale(earlyProbeMatchIdx)),
+        "DcachePlugin: earlyProbeHit drifted from its original index-then-select definition",
+        FAILURE)
+    }
     val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
+    // `!ldS1Valid` is a REAL structural conflict, not a conservative gate: the
+    // useEarlyProbe consume arm below (`elsewhen(loadCmdPort.fire && useEarlyProbe)`)
+    // writes ldS2Valid/ldS2Hit/ldS2Direct/ldS2DirectData/ldS2Line directly, and so
+    // does the unconditional `ldS2Valid := ldS1Valid; ldS2Hit := ldS1Hit; ldS2Line :=
+    // ldS1Line` a few lines above (LOAD S2) -- both target the SAME registers for the
+    // SAME next cycle. If ldS1Valid is true THIS cycle (an ordinary S1 read launched
+    // last cycle is resolving into ldS2 THIS cycle), letting a probe-hit bypass fire
+    // too would have the later-in-program-order assignment silently clobber the real
+    // S1 resolution one cycle later -- dropping a genuine load response. That
+    // conflict window is exactly ONE cycle (the cycle ldS1Valid reads true), never
+    // longer.
+    //
+    // Task pea-early-probe-absorbing-2026-08-24 (P4, review-found absorbing state):
+    // the bug was NOT this one-cycle gate itself -- it was what used to happen to a
+    // command caught by it. `useEarlyProbe` going false on a conflict cycle used to
+    // fall all the way through the elsewhen chain below to the PLAIN
+    // `elsewhen(loadCmdPort.fire)` ordinary-read arm (queued probe entry silently
+    // discarded, see the invalidate block below), which itself sets `ldS1Valid :=
+    // True` for the FOLLOWING cycle -- so the very next command hits the identical
+    // conflict again, forever, under a saturated back-to-back load stream. One
+    // disruption (a miss, a split load, a same-set store, a full probe queue -- any
+    // one cycle that fails to take the probe fast path) was therefore never
+    // recoverable without a multi-cycle bubble in `loadCmdPort.valid`.
+    //
+    // Fix: `earlyProbeConflict` below withholds `loadCmdPort.ready` for exactly the
+    // conflicting cycle instead of admitting the command down the ordinary-read arm.
+    // The queued probe entry survives untouched (nothing consumes/invalidates it
+    // when the command does not fire), `ldS1Valid` is NOT re-armed (no ordinary read
+    // is launched), and it naturally clears the very next cycle -- so the held
+    // command fires via the fast path one cycle later instead of falling back for
+    // the rest of the burst. Cost of a disruption: one stall cycle for the ONE
+    // command caught on the conflicting edge, not a lasting mode change.
     val useEarlyProbe          = earlyProbeHit && !ldS1Valid
+    val earlyProbeConflict     = earlyProbeHit && ldS1Valid
     val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) earlyProbeFreeVec(i) := !earlyProbeValids(i)
     val earlyProbeHasFree      = earlyProbeFreeVec.asBits.orR
     val earlyProbeReusesConsume = !earlyProbeHasFree && loadCmdPort.valid && useEarlyProbe
-    val earlyProbeHasAllocSlot = earlyProbeHasFree || earlyProbeReusesConsume
+    // ── FMax: the two CAM-dependent terms of `loadProbePort.ready`, folded into one ──
+    // `loadProbePort.ready` (in the load FSM's IDLE arm below) used to AND together two
+    // SEPARATE `useEarlyProbe`-dependent terms:
+    //
+    //   earlyProbeHasAllocSlot  ==  F || (!F && V && U)       -- "a queue slot exists"
+    //   (!loadCmdPort.valid || useEarlyProbe)  ==  !V || U    -- "the shared read port
+    //                                                            is free this cycle"
+    //
+    // with F = `earlyProbeHasFree`, V = `loadCmdPort.valid`, U = `useEarlyProbe`. Those
+    // two are redundant with each other, and the redundancy cost two LUT levels on the
+    // longest cone in the core (U -> earlyProbeReusesConsume -> earlyProbeHasAllocSlot ->
+    // the ready AND-tree). Their conjunction simplifies EXACTLY, by cases on V:
+    //
+    //   (F || (!F && V && U)) && (!V || U)
+    //     = (F || (V && U)) && (!V || U)            [absorption on the first term]
+    //   V = 0 :  (F || 0) && (1)      =  F
+    //   V = 1 :  (F || U) && (U)      =  U          [absorption: U && (F || U) == U]
+    //     = Mux(V, U, F)
+    //
+    // so ONE 3-input select replaces both, and `useEarlyProbe` now reaches
+    // `loadProbePort.ready` through a single LUT instead of three. This is a pure
+    // Boolean identity -- every (F, V, U) assignment gives the same result as before --
+    // not a policy change: a command that is present and does NOT consume a queued hit
+    // still blocks the probe launch (V=1, U=0 -> False), and a cycle with no command
+    // still needs a genuinely free slot (V=0 -> F).
+    //
+    // `earlyProbeReusesConsume` is deliberately left as its own signal: the
+    // consume-and-replace guard at the `loadCmdPort.fire && earlyProbeOwnsCmd` block
+    // below still reads it, and it is NOT the same expression as this one.
+    val earlyProbeSlotAndPortFree = Mux(loadCmdPort.valid, useEarlyProbe, earlyProbeHasFree)
     // `OHToUInt` requires a one-hot input. The free vector is normally multi-hot;
     // mask it first or simultaneous residents can alias the same physical entry.
     val earlyProbeAllocIdx     = Mux(
       earlyProbeHasFree,
       OHToUInt(OHMasking.first(earlyProbeFreeVec.asBits)),
       earlyProbeMatchIdx)
-    earlyProbeOwnsCmd.simPublic(); useEarlyProbe.simPublic()
+    earlyProbeOwnsCmd.simPublic(); useEarlyProbe.simPublic(); earlyProbeConflict.simPublic()
     // Respond ONLY on a HIT. A MISS falls through to REFILL below. Translation
     // faults never enter this pipe: the resolved-command contract requires the LS
     // producer to consume them before issuing loadCmd.
@@ -723,6 +940,40 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // `MmioCover.stepLog2`'s adder/comparator tree every single cycle regardless of
     // activity. Registered at the same two sites `stSubP`/`stSubEnd` are ever written.
     val stSubLog2Reg = Reg(UInt(2 bits)) init 0
+    // ── FMax: `stSubLast` is the store-side mirror of task #236's `stSubLog2Reg` ──
+    // `stSubLast` ("this is the FINAL sub-transaction of the covered sequence") is a
+    // PURE FUNCTION of four registers -- `stSubActive`, `stSubP`, `stSubEnd` and
+    // `stSubLog2Reg` -- yet it used to be recomputed combinationally every cycle
+    // (`!stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)`, a 4-bit shifter + a
+    // 5-bit adder + a 5-bit equality). That put `stSubP` at the HEAD of the single
+    // longest combinational cone in the whole core, because `stSubLast` immediately
+    // qualifies `storeAckReg` (`(storeBAck && stSubLast) || ...`) -- which is NOT a
+    // register despite its name -- and `storeAck` then fans out, still
+    // combinationally, through `sq.io.drainAck` -> `drainAckFire` -> `terminalAck`
+    // -> the SQ head pop / `sqCompletion` -> LsEuPlugin's `preciseReplayClaimsComp`
+    // -> `olderThanTxComp` -> `xlate.rsp.ready` -> `txRspFire` ->
+    // `dcache.loadProbeResolve.valid` -> `probeResolveMatchesRead` ->
+    // `probeResolvedTag` -> the early-VIPT probe's way-hit compare -> the 128-bit
+    // `rdData(probeReadHitWay)` way mux -> `probeLineLine`. A measured OOC synth of
+    // this exact netlist had EVERY failing endpoint family but one rooted at
+    // `stSubP_reg` (116 of 121 families, worst -0.761ns at `probeLineLine_reg`),
+    // with ~1.1ns of that 5.742ns path spent just getting from `stSubP` to
+    // `storeAck` through the four LUT levels of this expression.
+    //
+    // Retimed exactly the way task #236 retimed `stSubLog2`: registered at the SAME
+    // three sites that are the only writers of the four inputs, always computed from
+    // the NEW values those sites are installing (never from the stale pre-edge
+    // registers), so the register is bit-identical to the combinational form in
+    // every cycle. `init True` matches the reset state (`stSubActive init False`
+    // => `stSubLast` = True). A simulation-only tripwire below (`stSubLast`'s own
+    // declaration site) machine-checks that equivalence every cycle rather than
+    // trusting this argument.
+    val stSubLastReg = RegInit(True)
+    // The single definition of `stSubLast` in terms of a (possibly not-yet-committed)
+    // set of sequencer values. Used both for the register updates below and for the
+    // simulation tripwire, so the two can never drift apart.
+    def stSubLastOf(active: Bool, p: UInt, e: UInt, log2: UInt): Bool =
+      !active || ((p +^ (U(1, 4 bits) |<< log2).resize(4 bits)) === e)
     // Task P4.3 AXI-hazard fix -- REVISION 3, the actual landed design. Two
     // earlier revisions were tried and BOTH proven unsafe by DcacheSpec's own new
     // AXI-hazard regression test (recorded here because the failure mode is
@@ -792,7 +1043,18 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // Ordered store-drain admission. COPYBACK hits may occupy the existing
     // S0/S1/S2/S3 boundaries concurrently; variable-latency classes remain a
     // single-owner barrier and a discovered COPYBACK miss freezes younger stages.
-    val storeOutstanding = RegInit(U(0, 3 bits)) // max: S0 + S1 + S2 + S3
+    //
+    // WT-pipelining (this task): `storeOutstanding` used to be a pure "S0..S3
+    // stage occupancy" counter (max 4) because the only class that could remain
+    // admitted-but-unacked BEYOND S3 was a fully-serial one, and admission itself
+    // capped that at exactly one. A non-precise (fastStore) WRITETHROUGH store now
+    // pipelines its AXI write the same way a COPYBACK hit's on-chip resolve always
+    // has -- its `storeAckReg` no longer fires until the real AXI B, which can lag
+    // admission by a full round trip, so several such descriptors can be
+    // concurrently "outstanding" (admitted, kicked off, awaiting B) well past S3.
+    // Widened 3->4 bits with real headroom (see the assert below for the proven
+    // bound) instead of guessing a wider width.
+    val storeOutstanding = RegInit(U(0, 4 bits))
     val serialStoreInFlight = RegInit(False)
     val storeMissBarrier = RegInit(False)
     // A load miss snapshots its dirty victim when ldS1 resolves. Any older store
@@ -804,8 +1066,57 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     val refillNeedsStoreDrain = Bool(); refillNeedsStoreDrain := False
     storeOutstanding.simPublic(); serialStoreInFlight.simPublic(); storeMissBarrier.simPublic()
     loadMissStoreBarrier.simPublic()
+
+    // ---- WT-pipelining admission classification -------------------------------
+    // A store is fully-serial when it is `precise` (LsEuPlugin's `!fastStore`
+    // classification, `sq.io.alloc.payload.precise := !fastStore`) OR when it is
+    // INHIBITED. In REAL CPU traffic these two are the same set: `fastStore`
+    // (LsEuPlugin.scala:612) requires `cmode =/= INHIBITED` unconditionally, so an
+    // INHIBITED descriptor is ALWAYS `precise` already and the `=== INHIBITED`
+    // term never actually changes admission for anything LsEuPlugin sends. It is
+    // kept anyway, explicitly, as defense-in-depth rather than trusting that
+    // external invariant here: DcachePlugin has no way to verify what produced
+    // `storePort.payload`, and a directed whitebox test (or a future bug upstream)
+    // presenting an INHIBITED descriptor with `precise` cleared must still get the
+    // ORIGINAL, fully-serial treatment INHIBITED always had (pre-this-task,
+    // `cacheMode =/= COPYBACK` covered it unconditionally) -- fail closed, not
+    // open. The counter symmetry itself does not depend on this term (see
+    // `stIsPipelinedWtReg`'s own decl comment for why the wtOutstanding
+    // increment/decrement pair is self-consistent regardless), but admission
+    // policy for a mis-tagged INHIBITED descriptor should not silently change too.
+    //
+    // The only descriptor whose ADMISSION treatment actually changes from before
+    // this task is a WRITETHROUGH store that IS `fastStore` (MMU on, page not
+    // inhibited, real traffic only ever reaches this via LsEuPlugin) -- exactly
+    // the "ordinary hot path" this task targets.
+    //
+    // Why this doesn't touch bus-error precision (see this task's design note,
+    // also recorded in the commit message): a `!fastStore` store already
+    // completes its ROB bookkeeping BEFORE its physical write happens
+    // (LsEuPlugin's `captureCompletion`/precise-drain split) -- a bus error on
+    // its beat was ALREADY async/diagnostic-only, not synchronous, before this
+    // change (see the `storeErrReg && !stPreciseReg` -> `diagFaultPulse` kind=0
+    // site far below, which existed unconditionally beforehand and covered this
+    // exact case already, one store at a time). Pipelining only changes how many
+    // such already-async writes can be concurrently in flight, never whether a
+    // given one's fault is precise.
     val inputStoreSerial = storePort.payload.precise ||
-      (storePort.payload.cacheMode =/= CacheMode.COPYBACK)
+      (storePort.payload.cacheMode === CacheMode.INHIBITED)
+    val inputPipelinedWt = !inputStoreSerial &&
+      (storePort.payload.cacheMode === CacheMode.WRITETHROUGH)
+    val inputCopyback = !inputStoreSerial &&
+      (storePort.payload.cacheMode === CacheMode.COPYBACK)
+    inputPipelinedWt.simPublic(); inputCopyback.simPublic()
+
+    // Count of admitted, non-precise WRITETHROUGH descriptors whose AXI write has
+    // not yet B-acked (a STRICT SUBSET of `storeOutstanding`, tracked separately
+    // so admission can cap concurrent AXI-pending WT writes independently of
+    // COPYBACK's own, much shorter, S0..S3-bounded residency). Capped at
+    // `MAX_WT_OUTSTANDING` below by the admission gate -- 3 bits (max 7) is ample
+    // headroom over that cap.
+    val MAX_WT_OUTSTANDING = 4
+    val wtOutstanding = RegInit(U(0, 3 bits))
+    wtOutstanding.simPublic()
 
     // ---- store-S0: elastic payload latch (the cache-boundary flop) ----
     val s0Valid   = RegInit(False)
@@ -865,6 +1176,28 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       stS3NewBytes(i) := Mux(stS3MergeStrb(i), stS3MrgBytes(i), stS3OldBytes(i))
     val stS3MergedLine = stS3NewBytes.asBits
     val stS3ArrayWrite = stS3Valid && stS3Hit && !stS3Inhibited
+    // A miss may launch the shared synchronous victim read on the same cycle this
+    // S3 store writes that exact set/way.  The miss resolves one cycle later, when
+    // the live S3 signals are already gone, while both the generated simulation
+    // RAM and FPGA block RAM are allowed to return the pre-write line/dirty bit for
+    // that read-during-write collision.  Carry the completed write across that one
+    // cycle so both load- and store-miss victim snapshots can bypass the stale RAM
+    // result.  This complements (and does not replace) their existing live-S3
+    // bypass, which covers a write coincident with the resolution cycle itself.
+    val stS3WriteD1     = RegNext(stS3ArrayWrite) init False
+    val stS3WriteSetD1  = Reg(UInt(setBits bits))
+    val stS3WriteWayD1  = Reg(UInt(wayBits bits))
+    val stS3WriteTagD1  = Reg(UInt(tagBits bits))
+    val stS3WriteLineD1 = Reg(Bits(128 bits))
+    val stS3WriteCopybackD1 = Reg(Bool())
+    stS3WriteD1.simPublic()
+    when(stS3ArrayWrite) {
+      stS3WriteSetD1      := stS3Set
+      stS3WriteWayD1      := stS3Way
+      stS3WriteTagD1      := stS3Tag
+      stS3WriteLineD1     := stS3MergedLine
+      stS3WriteCopybackD1 := stS3Copyback
+    }
     stS3OldLine.simPublic(); stS3MergedLine.simPublic()   // DEBUG (pea-cache-evict-2026-08-19), temporary
 
     stS3Valid.simPublic(); stS3Payload.simPublic(); stS3Hit.simPublic()
@@ -946,9 +1279,8 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // A store drain's S1 tag-read (registers stS1Set) through its S2 write (stS2Set)
     // is a 2-cycle window during which the store's OWN hit-detect is against a
     // REGISTERED tag-read. A concurrent load-refill/write-allocate array write into
-    // the SAME set (a DIFFERENT line — same-line overlaps are already covered by the
-    // SQ's own `sameLine` stall, see StoreQueue.scala) landing inside that window
-    // would go unnoticed by the store's stale registered tag-read: S2 would then
+    // the SAME set (a DIFFERENT line) landing inside that window would go unnoticed
+    // by the store's stale registered tag-read: S2 would then
     // merge into a way the refill just re-tagged (write-through: cached-line
     // corruption; copyback: a lost store — refill-priority silently discards the
     // store's only write). Hold (delay, NEVER drop) the refill/eviction side's
@@ -989,6 +1321,20 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // pipe drains. Parked younger descriptors are excluded from this hold while a
     // miss barrier owns the arrays, so they cannot deadlock the refill that will
     // eventually release them.
+    //
+    // LS-cluster review finding P5 note: `stS1Set`/`stS2Set`/`missSet` below are raw
+    // SET-INDEX compares (`paddr(offBits+setBits-1 downto offBits)`), not tag-aware --
+    // "same set" is a strict SUPERSET of "same line" (same line implies same set index
+    // trivially). This hold therefore ALREADY covers an exact-same-line collision
+    // unconditionally, independent of whatever the SQ's `sameLine` stall does or does
+    // not exclude. That generality used to be incidental (the SQ's old mode-agnostic
+    // `sameLine` stall meant a load could never even reach here while an older
+    // same-line store was mid-drain, so this term's same-line coverage was never
+    // exercised in practice); since StoreQueue.scala's `sameLine` no longer stalls a
+    // same-line, non-overlapping load behind an older undrained COPYBACK store, this
+    // term's same-line generality is now the ACTUAL, load-bearing protection for that
+    // exact race (a same-line load-refill landing during a COPYBACK store's S1/S2
+    // hit-write window) -- verified directly against this RTL, not assumed.
     val refillWriteHold = (stS1Valid && !storeMissBarrier && !loadMissStoreBarrier &&
                            (stS1Set === missSet)) ||
                           (stS2Valid && (stS2Set === missSet)) ||
@@ -1116,11 +1462,16 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         // single BRAM read port; a command consuming a queued hit needs no read, so
         // the next probe may launch on the same edge. The four-entry result queue
         // absorbs the fixed probe->command distance at one launch per cycle.
-        loadProbePort.ready := !loadShadowValid && !pendingStoreMiss && !maintBusyReg &&
-                               earlyProbeHasAllocSlot &&
-                               (!loadCmdPort.valid || useEarlyProbe) &&
-                               !(ldS1Valid && !ldS1Hit) &&
-                               !(storeReadOwed && stS1Valid)
+        // FMax: the six CAM-INDEPENDENT admission terms are grouped first and the single
+        // folded CAM-dependent term (`earlyProbeSlotAndPortFree`, see its declaration for
+        // the case-by-case proof that it is exactly the old `earlyProbeHasAllocSlot &&
+        // (!loadCmdPort.valid || useEarlyProbe)`) is ANDed in last, so `useEarlyProbe`
+        // reaches this net through one LUT rather than three.
+        val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
+                             !pendingStoreMiss && !maintBusyReg &&
+                             !(ldS1Valid && !ldS1Hit) &&
+                             !(storeReadOwed && stS1Valid)
+        loadProbePort.ready := probeAdmitBase && earlyProbeSlotAndPortFree
         when(loadProbePort.fire) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
                                  (loadProbeCancelPort.payload.all ||
@@ -1171,9 +1522,11 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
             probeReadTag    := loadProbePort.payload.paddr(31 downto offBits + setBits)
             probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
             probeReadSize   := loadProbePort.payload.size
-            probeReadUsable := loadProbePort.payload.resolved &&
-                               !loadProbePort.payload.needsLine &&
-                               (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+            probeReadUsable := (if (earlyViptEnabled) {
+              loadProbePort.payload.resolved &&
+                !loadProbePort.payload.needsLine &&
+                (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+            } else False)
             probeReadNeedsLine := loadProbePort.payload.needsLine
           }
         }
@@ -1182,10 +1535,17 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         // WAIT phase must let it drain. New commands remain blocked for the entire
         // maintenance interval. `maintWalking` is false only during that quiesce wait.
         val resolveOldProbeDuringMaint = earlyProbeOwnsCmd && !maintWalking
-        loadCmdPort.ready := !loadShadowValid && !pendingStoreMiss &&
+        // `!earlyProbeConflict`: task pea-early-probe-absorbing-2026-08-24 (P4). Hold
+        // this exact command for the one cycle its owned, ready probe hit collides
+        // with an in-flight ordinary S1 resolution (see `earlyProbeConflict`'s own
+        // comment above `useEarlyProbe`) instead of admitting it down the
+        // ordinary-read arm, which used to re-arm `ldS1Valid` and perpetuate the
+        // conflict for every following command in a saturated stream.
+        loadCmdPort.ready := !resetSweepBusy && !loadShadowValid && !pendingStoreMiss &&
                              (!maintBusyReg || resolveOldProbeDuringMaint) &&
                              (!earlyProbeTokenPresent || earlyProbeOwnsCmd) &&
-                             (!(storeReadOwed && stS1Valid) || useEarlyProbe)
+                             (!(storeReadOwed && stS1Valid) || useEarlyProbe) &&
+                             !earlyProbeConflict
 
         when(loadCmdPort.fire && earlyProbeOwnsCmd) {
           // Full-queue consume-and-replace reuses this physical entry for the new
@@ -1322,12 +1682,17 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
           // chosen" and "a victim is evicted" consistent.
           val victimFromS3 = stS3ArrayWrite && (stS3Set === ldS1Set) &&
             (stS3Way === vw)
-          loadVictimFromS3Dbg := victimFromS3
+          val victimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === ldS1Set) &&
+            (stS3WriteWayD1 === vw)
+          loadVictimFromS3Dbg := victimFromS3 || victimFromS3D1
           val victimDirtyNow = rdDirty(vw) ||
-            (victimFromS3 && stS3Copyback)
+            (victimFromS3 && stS3Copyback) ||
+            (victimFromS3D1 && stS3WriteCopybackD1)
           val evictThis = victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
-          victimEvictTag  := Mux(victimFromS3, stS3Tag, rdTag(vw))
-          victimEvictLine := Mux(victimFromS3, stS3MergedLine, rdData(vw))
+          victimEvictTag  := Mux(victimFromS3, stS3Tag,
+            Mux(victimFromS3D1, stS3WriteTagD1, rdTag(vw)))
+          victimEvictLine := Mux(victimFromS3, stS3MergedLine,
+            Mux(victimFromS3D1, stS3WriteLineD1, rdData(vw)))
           loadMissStoreBarrier := True
           GenerationFlags.simulation {
             assert(!stS2Valid,
@@ -1841,7 +2206,7 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       * while a load response is still resolving, even though that response's DATA
       * cannot itself be corrupted by the walk. Costs at most one extra cycle of
       * walk-start delay on an already-rare, ROB-serialized event. */
-    val dcIdleForMaint = !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
+    val dcIdleForMaint = !resetSweepBusy && !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
                          !earlyProbeValid &&
                          !pendingStoreMiss && !pendingWtKickoff &&
                          !s0Valid && !stS1Valid && !stS2Valid && !stS3Valid &&
@@ -2113,10 +2478,10 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // comment for why).
     GenerationFlags.simulation {
       for (w <- 0 until ways) {
-        assert(CountOne(Seq(validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
+        assert(CountOne(Seq(validsVoteW0(w), validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
           "DcachePlugin: multiple writers targeted validsMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
           FAILURE)
-        assert(CountOne(Seq(dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
+        assert(CountOne(Seq(dirtysVoteD0(w), dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
           "DcachePlugin: multiple writers targeted dirtysMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
           FAILURE)
       }
@@ -2136,8 +2501,44 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // but nothing told this arbiter, so the store advanced to S2 and RMW-merged
     // against the walk's set (wrong old data AND wrong hit-detect). Same hold-and-
     // retry response as against the load: delay, never corrupt.
+    // WT-pipelining (this task): `stAddrReg`/`stMergeReg`/`stStrbReg`/`stPreciseReg`
+    // are SINGLE registers -- the one physical "kickoff in flight" snapshot the AXI
+    // aw/w drive reads from (below). Before this task exactly one WRITETHROUGH/
+    // INHIBITED descriptor could ever be admitted at a time (the old
+    // `storeOutstanding === 0` gate), so a second descriptor reaching S3 and
+    // overwriting these registers WHILE the first's aw/w handshake was still
+    // outstanding was unreachable. Now that several non-precise WRITETHROUGH
+    // descriptors can be concurrently admitted (see `wtOutstanding`), that window
+    // is live: hold S0->S1->S2 promotion (this term) while an OLDER kickoff still
+    // owns (or is about to own) the registers.
+    //
+    // REVIEW-CAUGHT BUG (directed-test-caught, `DcacheSpec` "a second non-precise
+    // WRITETHROUGH store's AW fires before the first store's B arrives"): the
+    // FIRST version of this gate was just `storeWantsAxi || pendingWtKickoff`.
+    // That is NOT enough, because `storeWantsAxi` only reads True the cycle AFTER
+    // an older entry's OWN S3 resolution (`stAwDone := False` is a registered
+    // write, visible starting the next cycle) -- but S2->S3 promotion
+    // (`when(stS2Valid) {...}`) is completely UNGATED (by design, a 1-cycle
+    // pass-through stage) and a TRAILING entry's S1->S2 promotion decision is made
+    // ONE CYCLE BEFORE that, off the CURRENT (still-stale, pre-edge) value of
+    // `storeWantsAxi`. Concretely, with two WT entries advancing in lockstep one
+    // stage apart: while the leader occupies S2 (about to resolve into S3 next
+    // cycle), `storeWantsAxi` is STILL False (the leader hasn't reached S3 yet) --
+    // so the trailing entry's S1->S2 promotion was NOT held, and it lands in S2
+    // exactly when the leader lands in S3, then unconditionally promotes into S3
+    // itself the very next cycle -- exactly the cycle after the leader's kickoff
+    // registers first became live, silently OVERWRITING `stAddrReg`/`stMergeReg`/
+    // `stAwDone`/`stWDone` with the trailing entry's own payload before the
+    // leader's aw/w had any guaranteed chance to be accepted. The fix closes the
+    // gap by ALSO holding while an older non-COPYBACK entry is CURRENTLY resolving
+    // S2 or S3 (`stS2Copyback`/`stS3Copyback` already exist for exactly this
+    // classification) -- i.e. the hold now covers the older entry's ENTIRE
+    // S2-through-accepted-kickoff window, with no one-cycle seam.
+    val wtKickoffBusy = storeWantsAxi || pendingWtKickoff ||
+      (stS2Valid && !stS2Copyback) || (stS3Valid && !stS3Copyback)
+
     val storePipeHeld = storeMissBarrier || storeMissDiscovered ||
-      loadMissStoreBarrier || loadMissDiscovered
+      loadMissStoreBarrier || loadMissDiscovered || wtKickoffBusy
 
     // Task pea-cache-evict-2026-08-19 fix: a store parked in S1 whose read is about
     // to launch THIS cycle, targeting the SAME line (set+tag) an OLDER store is
@@ -2186,12 +2587,35 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     when(stS1Advance) { storeReadOwed := False }
     when(freshLoadUsesPort && stS1Valid) { storeReadOwed := True }
 
-    // Admission is purely stage-credit based for COPYBACK. Serial/precise classes
-    // require an empty accepted stream; a discovered miss and a waiting refill stop
-    // new input while the already-resident shallow pipe drains/holds safely.
-    storePort.ready := s0Ready && !storePipeHeld && !serialStoreInFlight &&
+    // Admission, per class (WT-pipelining task):
+    //   - precise (fully serial): needs a totally empty pipe -- unchanged,
+    //     `storeOutstanding === 0`. `storeOutstanding` counts EVERY admitted-
+    //     unacked descriptor of every class (see its own decl comment), so this
+    //     transitively also requires `wtOutstanding === 0` -- a precise store
+    //     cannot be admitted while a pipelined WT write is still AXI-pending.
+    //   - COPYBACK: stage-credit based as before (no `storeOutstanding` gate at
+    //     all), PLUS a new `wtOutstanding === 0` term. This is the one new
+    //     restriction COPYBACK picks up from this task: it must not race ahead of
+    //     an OLDER, still AXI-pending WT write. A WT write's completion
+    //     (`storeAckReg`/the SQ's blind "ack pops the oldest accepted half"
+    //     contract, StoreQueue.scala's `drainAckFire`) can lag admission by a full
+    //     AXI round trip, while COPYBACK's own completion is near-immediate (S3,
+    //     no AXI at all on a hit) -- letting a COPYBACK ack overtake an older,
+    //     still-open WT beat would surface an OUT-OF-ORDER ack to the StoreQueue.
+    //     The reverse direction (WT admitted behind an outstanding COPYBACK) needs
+    //     no such gate: the single-lane S0-S3 pipe is strictly FIFO by
+    //     construction (S2/S3 are one-descriptor-at-a-time stages, no overtaking),
+    //     so an older COPYBACK always resolves (fast) before a younger WT even
+    //     reaches S2, let alone kicks off its own AXI leg.
+    //   - pipelined WT (non-precise WRITETHROUGH): stage-credit based too, capped
+    //     at `MAX_WT_OUTSTANDING` (a real, chosen resource bound -- see
+    //     `wtOutstanding`'s own decl comment) instead of the old "admit only when
+    //     the pipe is totally empty" restriction.
+    storePort.ready := !resetSweepBusy && s0Ready && !storePipeHeld && !serialStoreInFlight &&
       !maintBusyReg && !refillNeedsStoreDrain &&
-      (!inputStoreSerial || (storeOutstanding === 0))
+      (!inputStoreSerial || (storeOutstanding === 0)) &&
+      (!inputCopyback || (wtOutstanding === 0)) &&
+      (!inputPipelinedWt || (wtOutstanding =/= U(MAX_WT_OUTSTANDING, wtOutstanding.getWidth bits)))
 
     when(stS1Advance) { stS1Valid := False }
     when(s0Advance) {
@@ -2216,9 +2640,85 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       storeOutstanding := storeOutstanding - 1
     }
 
+    // wtOutstanding: same net +1/-1/no-op-on-same-cycle-cancel shape as
+    // `storeOutstanding` above, scoped to the pipelined-WT subset. `wtStoreAckReg`
+    // is forward-declared (SpinalHDL wire, driven below at the same site as
+    // `storeAckReg`'s own drive -- see that site's comment for why `!stPreciseReg`
+    // at a `storeBAck` instant can ONLY ever mean "a non-precise WRITETHROUGH
+    // store's beat": COPYBACK never reaches the AXI B path (hit resolves on-chip,
+    // miss's write-allocate acks via `storeAllocAckReg`) and INHIBITED is always
+    // `precise`, so this is an exact, not merely conservative, classifier).
+    val wtStoreFire = storePort.fire && inputPipelinedWt
+    when(wtStoreFire && !wtStoreAckReg) {
+      wtOutstanding := wtOutstanding + 1
+    } elsewhen(!wtStoreFire && wtStoreAckReg) {
+      wtOutstanding := wtOutstanding - 1
+    }
+
     // Registered latch of the drain's identity, needed a cycle later by the AXI
     // B-ack site (Task P4.5's diagnostic-channel gate) and by the WT/beat drive.
     val stPreciseReg = Reg(Bool())
+    // WT-pipelining task: an EXPLICIT, self-contained classifier for "the AXI leg
+    // this S3 kickoff is about to drive belongs to a pipelined (non-precise
+    // WRITETHROUGH) store" -- captured the same way and at the same site as
+    // `stPreciseReg`, consumed by `wtStoreAckReg` at the B-ack site so
+    // `wtOutstanding`'s increment (admission, gated on `inputPipelinedWt`) and
+    // decrement (ack) are driven by the EXACT SAME classification, rather than by
+    // `!stPreciseReg` inferring it indirectly. `!stPreciseReg` alone would silently
+    // assume the external invariant "INHIBITED implies precise"
+    // (LsEuPlugin.scala's `fastStore` does enforce this for real CPU traffic, via
+    // `cmode =/= INHIBITED`) -- correct for real traffic, but NOT something
+    // DcachePlugin can verify about its own `storePort` input, and a directed
+    // whitebox test (or a future bug upstream) presenting a non-precise INHIBITED
+    // store would then decrement `wtOutstanding` on its ack despite never having
+    // incremented it on admission (`inputPipelinedWt` requires `cacheMode ===
+    // WRITETHROUGH`, INHIBITED never qualifies) -- an increment/decrement mismatch
+    // that eventually underflows the counter. Caught exactly this way by
+    // DcacheSpec's pre-existing "inhibited store skips the line write" test, which
+    // pokes `precise=false` on an INHIBITED store directly (that combination is
+    // architecturally unreachable from real LsEuPlugin traffic, but the counter
+    // must not depend on that being true).
+    val stIsPipelinedWtReg = Reg(Bool())
+
+    // WT-pipelining task -- REVIEW-CAUGHT BUG #2 (directed-test-caught, DcacheSpec
+    // "a pipelined WRITETHROUGH store's bus error stays diagnostic-only..."):
+    // `diagFaultPulseAddr` (the async diagnostic-fault channel's kind=0 site,
+    // below) used to read `stAddrReg` directly at the exact cycle `storeErrReg`
+    // pulses (i.e. at B-arrival time). That is correct ONLY when at most one
+    // WT/INHIBITED kickoff can ever be outstanding -- true before this task. Once
+    // several pipelined WT kickoffs can be outstanding concurrently, `stAddrReg`
+    // is reused by each LATER kickoff the moment the CURRENT one's aw/w are both
+    // accepted (see `wtKickoffBusy`) -- which happens WELL BEFORE the earlier
+    // kickoff's B (and therefore its possible fault) actually arrives, since aw/w
+    // acceptance is fast and B is a full round trip later. By the time an OLDER
+    // kickoff's B lands, `stAddrReg` may already hold a NEWER store's address,
+    // silently misattributing the fault.
+    //
+    // Fix: a small FIFO of addresses, pushed in STRICT KICKOFF-CAPTURE order (the
+    // same site `stAddrReg` itself is written, scoped to the non-COPYBACK branch
+    // that actually goes on to produce an AXI B -- see the push site below) and
+    // popped in STRICT B-ARRIVAL order (`storeBAck && stSubLast`, the same event
+    // that terminates each descriptor). These two orders are PROVABLY identical:
+    // kickoffs are issued strictly one-at-a-time (`wtKickoffBusy` gate) and AXI4
+    // guarantees same-ID (`D_STORE` is a single constant id) B responses complete
+    // in issue order -- so the Nth push always corresponds to the Nth pop,
+    // regardless of how many are concurrently in flight. Depth ==
+    // `MAX_WT_OUTSTANDING`: the proven bound on how many non-COPYBACK descriptors
+    // can be simultaneously B-pending (a precise/INHIBITED descriptor can never
+    // overlap with anything else, including itself, so it never pushes this
+    // counter past that same bound).
+    // Pointers are ONE BIT WIDER than `log2Up(depth)` (the classic ring-buffer
+    // full/empty disambiguation): true occupancy can legitimately reach
+    // `MAX_WT_OUTSTANDING` exactly (that is the whole point of the cap), and a
+    // bare `log2Up(depth)`-bit pointer pair cannot distinguish that from empty
+    // (push == pop, mod depth, in both cases). The extra bit makes `push - pop`
+    // (unsigned wraparound) a genuine 0..depth occupancy count; only the low
+    // `log2Up(depth)` bits are used to INDEX the storage array.
+    val wtFaultFifoIdxW = log2Up(MAX_WT_OUTSTANDING)
+    val wtFaultFifoAddr = Vec.fill(MAX_WT_OUTSTANDING)(Reg(UInt(32 bits)))
+    val wtFaultFifoPush = RegInit(U(0, wtFaultFifoIdxW + 1 bits))
+    val wtFaultFifoPop  = RegInit(U(0, wtFaultFifoIdxW + 1 bits))
+    wtFaultFifoPush.simPublic(); wtFaultFifoPop.simPublic()
 
     // S2 either discovers the variable-latency COPYBACK miss or captures a fixed
     // resident/serial result into S3.  `storeMissDiscovered` already freezes the
@@ -2239,12 +2739,17 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         val pVw = victim(stS2Set)
         val pVictimFromS3 = stS3ArrayWrite && (stS3Set === stS2Set) &&
           (stS3Way === pVw)
-        storeVictimFromS3Dbg := pVictimFromS3
+        val pVictimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) &&
+          (stS3WriteWayD1 === pVw)
+        storeVictimFromS3Dbg := pVictimFromS3 || pVictimFromS3D1
         pendingVictimWay   := pVw
         pendingVictimDirty := rdDirty(pVw) ||
-          (pVictimFromS3 && stS3Copyback)
-        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag, rdTag(pVw))
-        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine, rdData(pVw))
+          (pVictimFromS3 && stS3Copyback) ||
+          (pVictimFromS3D1 && stS3WriteCopybackD1)
+        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
+          Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))
+        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine,
+          Mux(pVictimFromS3D1, stS3WriteLineD1, rdData(pVw)))
       } otherwise {
         stS3Valid   := True
         stS3Payload := stS2Payload
@@ -2277,6 +2782,8 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       stStrbReg    := stS3MergeStrb
       stAddrReg    := (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
       stPreciseReg := stS3Payload.precise
+      stIsPipelinedWtReg := !stS3Payload.precise &&
+        (stS3Payload.cacheMode === CacheMode.WRITETHROUGH)
 
       // ── D5/D26/D30: the store's byte range, derived on the CORE-SIDE strobe ──────────
       // D5: reversal within a nibble preserves popcount and contiguity but NOT the offset a
@@ -2304,10 +2811,16 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       // from stSubP/stSubEnd read directly here, which would see the pre-edge (stale) value.
       val newStSubP   = Mux(stS3Payload.useStrb, stStartSt, stStartSz)
       val newStSubEnd = Mux(stS3Payload.useStrb, stEndSt,   stEndSz)
+      val newStSubLog2 = m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
       stSubP       := newStSubP
       stSubEnd     := newStSubEnd
-      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, newStSubEnd)
+      stSubLog2Reg := newStSubLog2
       stSubActive := stS3Inhibited
+      // FMax retime (see `stSubLastReg`'s declaration): recomputed here from the
+      // SAME new values this site installs -- `stSubActive`'s new value is
+      // `stS3Inhibited`, not the stale register, exactly as `stSubLog2Reg` above
+      // uses `newStSubP`/`newStSubEnd` and not the stale `stSubP`/`stSubEnd`.
+      stSubLastReg := stSubLastOf(stS3Inhibited, newStSubP, newStSubEnd, newStSubLog2)
       stSubErr    := False
 
       GenerationFlags.simulation {
@@ -2336,6 +2849,14 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
         } otherwise {
           pendingWtKickoff := True
         }
+        // WT-pipelining task: push this descriptor's address for correct B-time
+        // fault attribution -- see `wtFaultFifoAddr`'s own decl comment. Pushed
+        // HERE (unconditional on the immediate-vs-deferred kickoff split above)
+        // because either way this descriptor WILL eventually produce exactly one
+        // AXI B, whether its aw/w fire this cycle or later via `pendingWtKickoff`.
+        wtFaultFifoAddr(wtFaultFifoPush(wtFaultFifoIdxW - 1 downto 0)) :=
+          (stS3Payload.paddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+        wtFaultFifoPush := wtFaultFifoPush + 1
       }
     }
 
@@ -2395,7 +2916,18 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // `stSubLog2Reg`'s own declaration comment.
     val stSubLog2  = stSubLog2Reg
     val stSubBytes = (U(1, 4 bits) |<< stSubLog2).resize(4 bits)
-    val stSubLast  = !stSubActive || ((stSubP +^ stSubBytes) === stSubEnd)
+    // FMax retime: a plain register read now (see `stSubLastReg`'s declaration for
+    // the full cone this used to sit at the head of). The tripwire below is what
+    // actually PINS the equivalence -- it re-evaluates the original combinational
+    // definition every cycle and fails loudly on any drift, so a future change to
+    // any of the three `stSubP`/`stSubEnd`/`stSubActive` write sites that forgets to
+    // update `stSubLastReg` alongside them cannot land silently.
+    val stSubLast  = stSubLastReg
+    GenerationFlags.simulation {
+      assert(stSubLastReg === stSubLastOf(stSubActive, stSubP, stSubEnd, stSubLog2Reg),
+        "DcachePlugin: stSubLastReg drifted from its combinational definition",
+        FAILURE)
+    }
     // Mask the merged 16-bit strobe down to THIS sub-transaction's own bytes. Every
     // asserted WSTRB bit therefore lies inside the addressed transfer -- the AXI4 rule v1
     // violates at axi_narrow_to_wide.v:43, where strobe 0110 is paired with awsize=1 at an
@@ -2488,15 +3020,39 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       // Task #236 fix: register the NEXT sub-transaction's stSubLog2 here too, from the same
       // newStSubP this cycle computes for stSubP -- stSubEnd doesn't change on an advance.
       val newStSubP = (stSubP +^ stSubBytes).resize(offBits bits)
+      val newStSubLog2 = m68k040.socket.MmioCover.stepLog2(newStSubP, stSubEnd)
       stSubP       := newStSubP
-      stSubLog2Reg := m68k040.socket.MmioCover.stepLog2(newStSubP, stSubEnd)
+      stSubLog2Reg := newStSubLog2
+      // FMax retime (see `stSubLastReg`'s declaration): `stSubActive` is necessarily
+      // True inside this arm (`!stSubLast` implies it, by `stSubLast`'s definition)
+      // and this site does not write it, so the new value is a literal True.
+      stSubLastReg := stSubLastOf(True, newStSubP, stSubEnd, newStSubLog2)
       stAwDone := False
       stWDone  := False
       stSubErr := stSubErr || storeBErr
     }
-    when(storeBAck && stSubLast) { stSubActive := False }
+    // FMax retime: `stSubActive := False` forces `stSubLast` True by definition, and
+    // this arm is source-ordered AFTER both other writers, so the same last-assignment-
+    // wins precedence the original combinational form got for free is preserved here.
+    when(storeBAck && stSubLast) { stSubActive := False; stSubLastReg := True }
+    // WT-pipelining task: pop `wtFaultFifoAddr` on the SAME terminal-B event that
+    // ends every non-COPYBACK descriptor's AXI leg (`storeBAck && stSubLast`),
+    // one-for-one with the push at S3 -- see that FIFO's own decl comment for the
+    // ordering proof. Popped unconditionally (error or not): every push WILL
+    // produce exactly one terminal B, and a stale/unpopped entry would silently
+    // desync the FIFO for every descriptor after it.
+    when(storeBAck && stSubLast) { wtFaultFifoPop := wtFaultFifoPop + 1 }
     storeErrReg := (storeBAck && stSubLast) && (stSubErr || storeBErr)
     storeAckReg := (storeBAck && stSubLast) || cbHitAckReg || storeAllocAckReg
+    // WT-pipelining task: the pipelined-WT slice of the AXI-B ack source above,
+    // driven from `stIsPipelinedWtReg` (captured at S3 alongside `stPreciseReg`,
+    // see its own decl comment for why this must be an explicit classifier rather
+    // than inferred from `!stPreciseReg`) so it exactly mirrors `inputPipelinedWt`,
+    // the admission-side condition that incremented `wtOutstanding` for this same
+    // descriptor -- the increment and decrement are provably symmetric regardless
+    // of what any caller (real LsEuPlugin traffic or a directed test poking
+    // DcachePlugin's `storePort` directly) presents.
+    wtStoreAckReg := (storeBAck && stSubLast) && stIsPipelinedWtReg
 
     // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
     // storeAckReg has three sources (write-through AXI B, registered copyback-hit
@@ -2526,8 +3082,39 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
       assert(!(storePort.fire && inputStoreSerial && (storeOutstanding =/= 0)),
         "DcachePlugin: serial/precise store accepted before older descriptors drained",
         FAILURE)
-      assert(storeOutstanding <= U(4, 3 bits),
-        "DcachePlugin: store descriptor occupancy exceeded S0/S1/S2/S3 capacity",
+      // WT-pipelining task: this bound is no longer "S0/S1/S2/S3 capacity" alone.
+      // `storeOutstanding` now also counts pipelined WT descriptors that have
+      // fully exited the shallow pipe and are purely AXI-B-pending. Proven bound:
+      // at most 4 descriptors can be simultaneously RESIDENT in S0..S3 (one
+      // occupant per stage, structurally unchanged by this task) PLUS at most
+      // `MAX_WT_OUTSTANDING` (4) pipelined-WT descriptors already past S3 and
+      // purely AXI-pending (capped by the `wtOutstanding` admission gate) -- 8
+      // total. (A COPYBACK descriptor can only be resident concurrently with a
+      // nonzero `wtOutstanding` if it was admitted BEFORE that WT ramp started --
+      // see `storePort.ready`'s per-class comment -- so this bound is not
+      // additionally inflated by COPYBACK/WT combinations beyond that.)
+      assert(storeOutstanding <= U(8, 4 bits),
+        "DcachePlugin: store descriptor occupancy exceeded the proven S0-S3 + pipelined-WT bound",
+        FAILURE)
+      assert(wtOutstanding <= U(MAX_WT_OUTSTANDING, wtOutstanding.getWidth bits),
+        "DcachePlugin: wtOutstanding exceeded its own admission cap",
+        FAILURE)
+      assert(wtOutstanding <= storeOutstanding,
+        "DcachePlugin: wtOutstanding must be a subset of storeOutstanding",
+        FAILURE)
+      // The ordering invariant this whole task rests on: a COPYBACK/precise
+      // descriptor is never admitted while an older pipelined-WT write is still
+      // AXI-pending, so its (fast, near-immediate) ack can never race ahead of an
+      // older WT's still-open AXI beat and surface an out-of-order ack to the
+      // StoreQueue (whose `drainAck` blindly pops its oldest accepted half).
+      assert(!(storePort.fire && inputCopyback && (wtOutstanding =/= 0)),
+        "DcachePlugin: a COPYBACK descriptor was admitted while an older pipelined WT write was still AXI-pending",
+        FAILURE)
+      // wtFaultFifo occupancy (push - pop, unsigned wraparound over the
+      // one-bit-wider pointers) must never exceed its own depth -- see the
+      // pointer decl comment for the full disambiguation argument.
+      assert((wtFaultFifoPush - wtFaultFifoPop) <= U(MAX_WT_OUTSTANDING, wtFaultFifoIdxW + 1 bits),
+        "DcachePlugin: wtFaultFifo occupancy exceeded MAX_WT_OUTSTANDING",
         FAILURE)
     }
 
@@ -2537,7 +3124,13 @@ class DcachePlugin(val socketMerged: Boolean = false) extends FiberPlugin with D
     // sqFaultCompletion path (Task P2.4); routing it here TOO would be a double-report.
     when(storeErrReg && !stPreciseReg) {
       diagFaultPulse     := True
-      diagFaultPulseAddr := stAddrReg
+      // WT-pipelining task: read the FRONT of `wtFaultFifoAddr`, NOT `stAddrReg`
+      // directly -- see that FIFO's own decl comment. `storeErrReg` and the pop
+      // above (`when(storeBAck && stSubLast) { wtFaultFifoPop := ... }`) fire off
+      // the SAME `storeBAck && stSubLast` event this same cycle, so the FIFO's
+      // CURRENT (pre-pop-edge) front entry is still exactly this descriptor's own
+      // address.
+      diagFaultPulseAddr := wtFaultFifoAddr(wtFaultFifoPop(wtFaultFifoIdxW - 1 downto 0))
       diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
       diagFaultPulseKind := U(0, 3 bits)   // kind=0: WT-beat / INHIBITED-drain
       diagFaultKind0Fires := True          // review-added collision detector

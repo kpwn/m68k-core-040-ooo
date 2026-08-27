@@ -46,7 +46,7 @@ class Cmp2HangTraceSpec extends AnyFunSuite {
           val deRid  = dut.divEu.issuePort.payload.robId.toInt
           val deOp   = dut.divEu.issuePort.payload.uop.op.toEnum.toString
           val iqSlots = dut.iq.logic.slots.zipWithIndex.filter(_._1.sel.toBoolean).map { case (s, i) =>
-            f"s$i(rid=${s.context.robId.toInt},op=${s.context.uop.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},pA=${s.context.uop.psrcA.toInt}(v=${s.context.uop.psrcAValid.toBoolean}),pB=${s.context.uop.psrcB.toInt}(v=${s.context.uop.psrcBValid.toBoolean}))"
+            f"s$i(rid=${s.hot.robId.toInt},op=${s.hot.op.toEnum},lsWait=${s.lsWait.toBoolean},cplxWait=${s.cplxWait.toBoolean},pA=${s.hot.psrcA.toInt}(v=${s.hot.psrcAValid.toBoolean}),pB=${s.hot.psrcB.toInt}(v=${s.hot.psrcBValid.toBoolean}))"
           }.mkString(" ")
           val robH = dut.rob.logic.head.toInt
           val robT = dut.rob.logic.tail.toInt

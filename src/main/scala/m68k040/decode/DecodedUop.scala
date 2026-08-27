@@ -437,11 +437,17 @@ case class DecodedUop() extends Bundle {
   // (SRC, valid as a register number only when R/M=0).
   val fpuCmdWord = Bits(16 bits)
   // Access-fault (vector 2) extras for the format-$7 frame, used for an
-  // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `faultAddr` is
-  // the faulting fetch PC (the EA stacked in the $7 frame); `sswInstr` set => the
-  // fault was an instruction fetch (the exception FSM stacks a program-space SSW
-  // instead of data-space). Both default to 0/False (data faults / no fault).
-  val faultAddr    = UInt(32 bits)
+  // INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault). `sswInstr` set
+  // => the fault was an instruction fetch (the exception FSM stacks a program-space
+  // SSW instead of data-space); default False (data faults / no fault).
+  // (ROB-fold Slice A (faultAddr dead-field deletion): the standalone `faultAddr`
+  // field that used to ride alongside `sswInstr` here is deleted — every write site in
+  // MicroOpAssembler/Microcode assigned it the macro's own `pc`/`pkt.pc`/`ctx.pc`
+  // with zero exceptions (grep-verified exhaustively), making it a pure duplicate of
+  // this same bundle's `pc` field. RobPlugin's alloc-time `faultAddrStore` write now
+  // sources `u.pc` directly instead of the deleted field — bit-identical, since the
+  // deleted field WAS always `u.pc`. The instruction-fetch-fault EA stacked in the
+  // $7 frame is still exactly the faulting fetch PC; it's just read from `pc` now.)
   val sswInstr     = Bool()
   // Task #211: which cause raised an INSTRUCTION-FETCH fault — True (default) for
   // the pre-existing ITLB/MMU-detected translation fault (non-resident / supervisor

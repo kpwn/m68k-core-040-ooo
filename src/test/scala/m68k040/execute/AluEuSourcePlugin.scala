@@ -83,7 +83,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.faulted      := False; uop.faultVector := U(0); uop.isRte := False
     uop.faultUsesNextPc := False
     uop.isCondTrap   := False
-    uop.faultAddr    := U(0); uop.sswInstr := False
+    uop.sswInstr := False
     uop.divSigned    := False; uop.div64 := False; uop.divIsRem := False
     uop.isChk2 := False
     uop.extByte      := False

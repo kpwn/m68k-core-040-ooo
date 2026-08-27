@@ -48,13 +48,27 @@ class IqSourcePlugin extends FiberPlugin {
       val u = c.uop
       // Safe defaults for unused fields so the bundle is fully driven.
       u.valid        := True
-      u.pc           := 0
+      // `pc` is a COLD field (it lives only in the cold payload Mem, never in the narrow
+      // IqHot record), so a test that checks it has genuinely checked the Mem read. Derived
+      // from robId rather than taken as a NEW INPUT PORT, deliberately: every pre-existing
+      // spec in this directory has its own `idle()` and would leave a new port undriven,
+      // and SpinalSim gives an undriven input a per-seed RANDOM value, not 0. That is not
+      // hypothetical -- an earlier revision of this file did add `pc`/`isBranch` as inputs
+      // and turned IqLsSpec/IqCplxSpec/IssueQueueSpec into ~40%-pass seed lotteries (a
+      // randomly-True `isBranch` re-routes an LS uop onto the branch port, so the LS port
+      // never fires). Deriving from an input every spec already drives makes that whole
+      // failure class unreachable.
+      u.pc           := io.robId.resized
       u.op      := Mux(io.isShift, m68k040.decode.DecOp.SHIFT, m68k040.decode.DecOp.MOVE)
       u.cluster := io.cluster
       u.memOp   := io.memOp
       u.size    := m68k040.isa.Size.LONG
       u.imm          := 0
-      u.isBranch     := False
+      // Branch-class marker for the standalone harness, encoded as cluster === EA. `EA` is
+      // read by NO IQ predicate (isLs wants LS, isCplx wants CPLX) and is driven by no spec
+      // in this directory, so it is a free encoding slot -- and, unlike a new input port, it
+      // is a value every spec already drives. Lets a test exercise issue port 2.
+      u.isBranch     := (io.cluster === m68k040.isa.Cluster.EA)
       u.cond         := 0
       u.branchDisp   := 0
       u.unimplemented := False
@@ -102,8 +116,22 @@ class IqSourcePlugin extends FiberPlugin {
       u.nextPc       := 0
       u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.isRte        := False; u.isCondTrap := False; u.isScc := False; u.isDbcc := False
-      u.faultAddr    := 0; u.sswInstr := False
+      u.sswInstr := False
       u.firstOfInstr := True
+      // SAME "fields added after this stub was written" gap as the fpuOp/fpSrcKind block
+      // below, found the same way: six fields landed by the FPU (Task 10/11) and debug-
+      // halt work were never back-filled here. They stayed dormant only because nothing
+      // in the standalone IQ harness read them, so SpinalHDL dead-code-eliminated the
+      // whole per-bit chain before the latch check ran. The IQ cold-payload split ends
+      // that: a `Mem` write port is a single object with a full-width data input, so
+      // every bit must have a driver whether or not any reader survives -- which is
+      // precisely why this latent harness gap surfaced now rather than staying buried.
+      // (Confirmed harness-only: GenFullCoreSynthVerilog elaborates clean, because the
+      // real decode/rename path drives all six.)
+      u.fpuSoftwareComplete := False; u.fpuCmdWord := 0
+      u.faultAtc            := True   // MicroOpAssembler's universal default
+      u.lastOfInstr         := True
+      u.debugBreakValid     := False; u.debugBreakSlot := 0
       u.predTaken    := False; u.predTarget := 0
       // Fields added to RenamedUop after this stub was first written (shifts/BCD/bit-ops/
       // bit-field/MOVEA/LEA/MOVE-from-CCR-SR/system-ops/indexed-EA/gshare). None feed the

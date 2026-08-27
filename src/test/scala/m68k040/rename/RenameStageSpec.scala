@@ -185,4 +185,62 @@ class RenameStageSpec extends AnyFunSuite {
       assert(srcA == p0, s"after commit+flush, D0 should map to committed P0=$p0 but got $srcA")
     }
   }
+
+  // ── TRIPWIRE: `pdst` is DON'T-CARE when `pdstValid` is False ──────────────────
+  // Load-bearing negative property, recorded here because a ROB area-reduction recon
+  // (ROB restructure "Slice E") proposed deleting `RobPlugin.sysValStore` — the 64x32
+  // per-entry capture of a completing sysOp's EU writeback value — on the theory that
+  // the same value is redundantly available as `intPrf[payload.intNew]`, since
+  // `RobPayload.intNew := RenamedUop.pdst`.
+  //
+  // That is FALSE for exactly the µops sysValStore exists to serve. Every WRITE-direction
+  // sysOp (MOVE-to-SR, ANDI/ORI/EORI-to-SR, STOP, MOVEC Rn->Rc, MOVE An->USP, CPUSH,
+  // CINV, PTEST, FMOVE Rn->FPcr) is assembled with `dstValid := False` — the destination
+  // is a SYSTEM register, not a renamed GPR — so no physical register is allocated and
+  // no PRF write ever happens. `payload.intNew` for such an entry is not "a stale
+  // physreg"; per RenameStage `intFree.io.pop(s).take := slotEn && dec.dstValid` but
+  // `r.pdst := intFree.io.pop(s).id` UNCONDITIONALLY, and Freelist drives
+  // `io.pop(k).id := ram.readAsync(head + ...)` regardless of `take` ("Non-asserted
+  // ports' id outputs are don't-care").
+  //
+  // So a non-allocating µop's `pdst` field carries the CURRENT FREELIST HEAD — i.e. the
+  // physical register the very NEXT allocating instruction is handed. Reading
+  // `intPrf[payload.intNew]` for a write-direction sysOp would therefore return a
+  // strictly-younger instruction's data: silent corruption, and precisely the
+  // physical-register-lifetime hazard class of tasks #176/#194/#200.
+  //
+  // This test pins that aliasing as an observable fact so the "it's redundant" argument
+  // cannot be re-derived from the field name alone.
+  test("pdst is don't-care when pdstValid=False: it ALIASES the next allocation") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      dut.sink.logic.out.ready #= true
+      dut.dsrc.logic.src.valid #= false
+      dut.cdrv.logic.flushIn #= false
+      dut.cdrv.logic.cmd.foreach(_.valid #= false)
+      cd.waitSampling()
+      waitInit(dut, cd)
+
+      // slot0 = the write-direction sysOp shape: op=MOVE, source register on srcB,
+      //         NO rename destination (dstValid=False) -- verbatim MicroOpAssembler's
+      //         `opUop.srcBReg := rnId; opUop.srcBValid := True; opUop.dstValid := False`.
+      // slot1 = any ordinary instruction that DOES allocate an int destination.
+      pokeUop(dut.dsrc.logic.src.payload(0), op = DecOp.MOVE, srcBReg = 1, srcBValid = true, dstValid = false)
+      pokeUop(dut.dsrc.logic.src.payload(1), op = DecOp.MOVE, useImm = true, dstReg = 2, dstValid = true)
+      dut.dsrc.logic.src.valid #= true
+      dut.dsrc.logic.s1v       #= true
+      cd.waitSamplingWhere(dut.sink.logic.out.valid.toBoolean && dut.sink.logic.out.ready.toBoolean)
+      val sysPdst      = dut.sink.logic.out.payload(0).pdst.toInt
+      val sysPdstValid = dut.sink.logic.out.payload(0).pdstValid.toBoolean
+      val nextPdst     = dut.sink.logic.out.payload(1).pdst.toInt
+      dut.dsrc.logic.src.valid #= false
+
+      assert(!sysPdstValid, "a write-direction sysOp shape must NOT allocate an int dst")
+      // THE POINT: the non-allocating uop's pdst is not merely stale, it is the physical
+      // register the NEXT allocating uop actually receives and writes.
+      assert(sysPdst == nextPdst,
+        s"pdst of a pdstValid=False uop ($sysPdst) must alias the next real allocation " +
+        s"($nextPdst) -- if this ever stops holding, re-read the sysValStore-fold comment above")
+    }
+  }
 }

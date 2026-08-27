@@ -207,6 +207,125 @@ class UmWriteSpec extends AnyFunSuite {
     }
   }
 
+  // C1 regression (fmax-closure-fanout MMU-walker review): a backend flush landing
+  // on an in-flight DTLB walk must not just suppress the walk's deferred U/M
+  // descriptor WRITE (already covered by the test above) but must also stop that
+  // walk's result from being cached into the ATC. `walkUmPoison`'s ONLY job used
+  // to be gating `umq.io.alloc.valid`; `tlb.io.fillValid` was ungated, so the
+  // poisoned walk's `fe.modified` (True for a write-triggered walk, unconditionally
+  // -- see DtlbPlugin's `fe.modified := walker.io.rsp.modified`) still landed in a
+  // fresh ATC entry. The very next write to the SAME page then read that cached
+  // modified=true and took the fast `tlbHit && !needsMRefresh` path, never
+  // re-walking -- M was lost for the life of the entry. Same shape silently loses
+  // U on a poisoned READ (cold-miss) walk: TlbEntry has no separate U field, so
+  // once ANY fill happens for a page, nothing ever re-triggers a walk for U's own
+  // sake.
+  //
+  // This test proves BOTH shapes are now closed: after a poisoned walk, the VERY
+  // NEXT access to that same page must perform a genuine, fresh 3-level re-walk
+  // (not a cached hit) and, once that access's OWN instruction commits, correctly
+  // land the real U/M bits in memory.
+  test("C1: flush during an in-flight walk must not cache a stale ATC entry (M-loss on write, U-loss on read)",
+       VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+
+      def flushMidWalk(va: Long, write: Boolean, robId: Int, arCountNow: () => Int): Unit = {
+        dut.probe.logic.accessRobId #= robId
+        dut.probe.logic.reqIn.valid #= true
+        dut.probe.logic.reqIn.vpn #= vpnOf(va)
+        dut.probe.logic.reqIn.write #= write
+        dut.probe.logic.reqIn.supervisor #= false
+        var guard = 0
+        while (!(dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) && guard < 100) {
+          cd.waitSampling(); guard += 1
+        }
+        assert(guard < 100, s"walk (robId=$robId) never launched before the flush")
+        dut.probe.logic.flush #= true
+        cd.waitSampling()
+        dut.probe.logic.flush #= false
+        guard = 0
+        while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+        assert(dut.probe.logic.rspOut.ready.toBoolean, s"poisoned walk (robId=$robId) still returns its tagged result")
+        dut.probe.logic.reqIn.valid #= false
+        cd.waitSampling(2)
+        // Committing the poisoned walk's own robId must still drain nothing
+        // (already covered by the sibling test above; re-checked here as a sanity
+        // anchor before probing the ATC-fill side-effect).
+        dut.probe.logic.commitValid #= true
+        dut.probe.logic.commitId #= robId
+        cd.waitSampling()
+        dut.probe.logic.commitValid #= false
+        cd.waitSampling(10)
+      }
+
+      var arCount = 0
+      fork { while (true) { cd.waitSampling()
+        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+      } }
+
+      // ---- M-loss shape: a poisoned WRITE walk ----
+      val vaW = 0x02001000L
+      val pageAddrW = buildTable(mem, vaW, ppn = 0x11111L)
+      flushMidWalk(vaW, write = true, robId = 30, () => arCount)
+      assert(mem.peekByte(pageAddrW + 3) == 0x01, "poisoned write walk must not have drained U/M")
+
+      val beforeSecondW = arCount
+      dut.probe.logic.accessRobId #= 31
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(vaW)
+      dut.probe.logic.reqIn.write #= true
+      dut.probe.logic.reqIn.supervisor #= false
+      var guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "second write to the same page must eventually resolve")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+      assert(arCount > beforeSecondW,
+        s"a write immediately after a poisoned walk to the SAME page must re-walk (M must not be cached as " +
+        s"already-set): ARs $beforeSecondW -> $arCount")
+
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 31
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      guard = 0
+      while (mem.peekByte(pageAddrW + 3) != 0x19 && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(mem.peekByte(pageAddrW + 3) == 0x19,
+        f"post-re-walk commit must set U+M (0x19); got 0x${mem.peekByte(pageAddrW + 3)}%x")
+
+      // ---- U-loss shape: a poisoned READ (cold-miss) walk ----
+      val vaR = 0x02002000L
+      val pageAddrR = buildTable(mem, vaR, ppn = 0x22222L)
+      flushMidWalk(vaR, write = false, robId = 32, () => arCount)
+      assert(mem.peekByte(pageAddrR + 3) == 0x01, "poisoned read walk must not have drained U")
+
+      val beforeSecondR = arCount
+      dut.probe.logic.accessRobId #= 33
+      dut.probe.logic.reqIn.valid #= true
+      dut.probe.logic.reqIn.vpn #= vpnOf(vaR)
+      dut.probe.logic.reqIn.write #= false
+      dut.probe.logic.reqIn.supervisor #= false
+      guard = 0
+      while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(dut.probe.logic.rspOut.ready.toBoolean, "second read of the same page must eventually resolve")
+      dut.probe.logic.reqIn.valid #= false
+      cd.waitSampling(2)
+      assert(arCount > beforeSecondR,
+        s"a read immediately after a poisoned walk to the SAME page must re-walk (the page must not be cached " +
+        s"as already-resident with U silently lost): ARs $beforeSecondR -> $arCount")
+
+      dut.probe.logic.commitValid #= true
+      dut.probe.logic.commitId #= 33
+      cd.waitSampling()
+      dut.probe.logic.commitValid #= false
+      guard = 0
+      while (mem.peekByte(pageAddrR + 3) != 0x09 && guard < 300) { cd.waitSampling(); guard += 1 }
+      assert(mem.peekByte(pageAddrR + 3) == 0x09,
+        f"post-re-walk commit must set U only (0x09); got 0x${mem.peekByte(pageAddrR + 3)}%x")
+    }
+  }
+
   test("a full four-entry U/M queue stalls the fifth walker without overwrite", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val (cd, mem) = init(dut)

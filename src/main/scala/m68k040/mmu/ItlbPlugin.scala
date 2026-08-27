@@ -13,8 +13,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   * but reads the shared `MmuControlService` (the ONE 68040 MMU enable + root — I and
   * D translation share it) and is instruction-fetch only.
   *
-  *  - `mmuEnable` LOW => pure identity passthrough (ppn=vpn, cacheable, no fault,
-  *    always ready): every MMU-disabled test / lock-step is unchanged.
+  *  - `mmuEnable` LOW => identity passthrough (ppn=vpn, no fault, always ready)
+  *    UNLESS a TTR (ITT0/ITT1) matches, in which case its own cache-mode wins
+  *    (WRITETHROUGH otherwise) — TTRs are gated only by their own E bit and
+  *    apply independently of `mmuEnable`, matching real 68040 semantics (see
+  *    the `ttHit` comment below for why this changed).
   *  - When HIGH: a fetch demand (`req.valid`) looks up the ITLB. A HIT returns
   *    ppn/perms/cacheMode in 1 cycle; a supervisor page accessed in user mode flags
   *    a perm fault. A MISS drops `rsp.ready` (the I-cache stalls on its existing
@@ -118,11 +121,21 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- ITT0/ITT1 transparent-translation match (task #194) — mirrors DtlbPlugin's
     // DTT0/DTT1 treatment exactly, on the I-side. A hit bypasses the walker/TLB
-    // entirely: PA=VA, no fault. Only consulted while the MMU is enabled. ITT0 has
-    // priority over ITT1 when both match. ---- ----
+    // entirely: PA=VA, no fault.
+    //
+    // CORRECTED (same bug/fix as DtlbPlugin.scala, see its comment for the full
+    // real-hardware trace): this used to be additionally gated with
+    // `mmuEnable &&` on top of each TTR's own E bit, on the claim that this was
+    // an observable no-op since mmuEnable=False was already pure identity. That
+    // was architecturally wrong -- ITT0/ITT1 are gated ONLY by their own E bit on
+    // real 68040 hardware (already checked inside TtMatch.hit) and apply
+    // independently of paged translation, exactly like the D-side DTT0/DTT1.
+    // Fixed by dropping `mmuEnable &&` here and by re-priority-ordering the
+    // response mux below so a TTR hit is checked before the mmuEnable-off
+    // fallback. ITT0 has priority over ITT1 when both match. ---- ----
     val vaHi8   = _req.vpn(19 downto 12)   // == va[31:24]
-    val itt0Hit = mmuEnable && TtMatch.hit(itt0, vaHi8, _req.supervisor)
-    val itt1Hit = mmuEnable && !itt0Hit && TtMatch.hit(itt1, vaHi8, _req.supervisor)
+    val itt0Hit = TtMatch.hit(itt0, vaHi8, _req.supervisor)
+    val itt1Hit = !itt0Hit && TtMatch.hit(itt1, vaHi8, _req.supervisor)
     val ttHit   = itt0Hit || itt1Hit
     val ttInhibited = Mux(itt0Hit, TtMatch.inhibited(itt0), TtMatch.inhibited(itt1))
 
@@ -183,6 +196,35 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val is8K  = Reg(Bool())
       val robId = Reg(UInt(6 bits))
     }
+    // C6 fix: mirrors DtlbPlugin's `missPending`/`walkUmPoison` pair exactly, adapted
+    // to this plugin's own walk-in-progress tracking (ItlbPlugin has no `missPending`
+    // register of its own -- DtlbPlugin's equivalent single-outstanding window is
+    // "captured but not yet resolved", which here spans from the SAME capture cycle
+    // through `walker.io.done` inclusive; unlike DtlbPlugin's `missReqReg.valid`
+    // -- which stays high across cycles until the walker actually launches --
+    // this plugin's `missReqReg.valid` is a bare one-cycle pulse (`walker.io.start`
+    // reads it directly the very next cycle with no additional gating), so a
+    // dedicated sticky register is needed to span the whole walk, exactly like the
+    // D-side `missPending`).
+    //
+    // Before this fix `ItlbPlugin` had NO poison of any kind on its walk-completion
+    // path: a walk that was still in flight when a backend flush (`umFlush`) landed
+    // still unconditionally (a) filled the TLB and (b) allocated a real deferred U
+    // -write queue entry tagged with the now-squashed access's robId. (b) is C6's
+    // named bug -- `UmWriteQueue.commit` only marks an entry committed if it is
+    // ALREADY allocated at the exact cycle a commit pulse for its robId arrives; a
+    // late allocation just sits invalid-but-unflushed (the earlier `io.flush` pulse
+    // already passed) until the ROB *recycles* that same robId (<=64 retires later),
+    // at which point an unrelated, later instruction's OWN commit pulse drains it --
+    // a real architectural memory write performed on behalf of a wrong-path fetch.
+    // (a) is the ITLB-side mirror of C1: once filled, a resident TLB hit never
+    // re-triggers a walk (there is no I-side write-hit/M-refresh re-walk path at
+    // all), so a poisoned cold-miss fill would otherwise permanently lose the page's
+    // U bit with nothing left to ever repair it -- exactly the failure mode this fix
+    // closes on the D-side.
+    val missPending  = RegInit(False)
+    val walkUmPoison = RegInit(False)
+    missPending.simPublic()
     missReqReg.valid := False
     when(needWalk && !missReqReg.valid && !umQueueFull) {
       missReqReg.valid := True
@@ -190,7 +232,14 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       missReqReg.sup   := _req.supervisor
       missReqReg.is8K  := is8K
       missReqReg.robId := umAccessRobId
+      missPending      := True
+      walkUmPoison     := False
     }
+    // A speculative resident translation may still fill after a backend squash, but
+    // its architectural deferred U write belongs to the killed ROB entry and must
+    // never be allocated after the one-cycle flush pulse has passed (mirrors
+    // DtlbPlugin's identical `when(umFlush && missPending)` gate verbatim).
+    when(umFlush && missPending) { walkUmPoison := True }
 
     // Real 68040 semantics: a supervisor-space fetch walks SRP, a user-space fetch
     // walks URP (task #131 — see DtlbPlugin's identical treatment).
@@ -225,16 +274,45 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     tlb.io.fillVpn   := walkVpn
     tlb.io.fillEntry := fe
     when(walker.io.done) {
+      missPending := False
       latchValid := True
       latchVpn   := walkVpn
       latchPpn   := walker.io.rsp.ppn
       latchSup   := walker.io.rsp.supervisor
       latchCmode := walker.io.rsp.cacheMode
       latchFault := walker.io.rsp.fault
-      when(!walker.io.rsp.fault) {
+      // C6/C1-mirror fix: a poisoned walk (backend flush landed while it was still
+      // in flight) must not cache its result into the ATC either -- see the long
+      // comment at `walkUmPoison`'s declaration above. `!flushAll` additionally
+      // covers the exact-same-cycle PFLUSHA/done collision (DtlbPlugin's own
+      // `walkFlushPoison` latch exists to ALSO cover a PFLUSHA that landed several
+      // cycles before completion; this plugin has no such latch and none is added
+      // here -- that residual gap is pre-existing on this walk-completion path
+      // (the sibling `latchValid` handling below has the identical same-cycle-only
+      // limitation already) and is out of scope for this fix).
+      when(!walker.io.rsp.fault && !walkUmPoison && !flushAll) {
         tlb.io.fillValid := True
       }
     }
+    // C6-mirror, latch layer: `ItlbPlugin` has a SECOND caching layer DtlbPlugin
+    // has no equivalent of -- this 1-entry walk-result latch is STICKY (it
+    // persists until explicitly invalidated by umFlush/flushAll or overwritten by
+    // a later walk), unlike DtlbPlugin's elastic 1-cycle `rspValid` (naturally
+    // self-clearing via `_rsp.fire`). Gating `tlb.io.fillValid` alone is NOT
+    // sufficient here: a poisoned walk still sets `latchValid`/`latchVpn` above
+    // (deliberately -- the already-squashed triggering access still needs ITS OWN
+    // response the cycle after `walker.io.done`, exactly mirroring the D-side's
+    // choice to still deliver `rspValid` for a poisoned walk), and without this
+    // guard that entry would persist and silently serve a LATER, UNRELATED access
+    // to the SAME page via `latchMatch` without ever re-walking -- the identical
+    // U-loss shape C1 closes on the TLB fill, just reachable through this second
+    // cache instead. Force the latch back invalid exactly one cycle after a
+    // poisoned completion: enough for the one immediate response (`needWalk`
+    // itself reads `latchMatch` and stays suppressed that same cycle, so no
+    // redundant walk is attempted while the response is being served), never long
+    // enough to be observed as a real cache hit by anything else.
+    val poisonedLatchExpire = RegNext(walker.io.done && walkUmPoison, init = False)
+    when(poisonedLatchExpire) { latchValid := False }
     // On a flush (the commit-time access-fault squash), invalidate the latch so a
     // re-fetch after the handler maps the page RE-WALKS (sees the now-resident
     // descriptor) instead of re-reading the stale non-resident fault. Harmless on a
@@ -259,7 +337,15 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // wired but deliberately NOT consulted -- keeps ItlbPlugin's own behavior
     // byte-for-byte unchanged.
     umq.io.pageQuery := _req.vpn
-    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid && !walker.io.rsp.fault
+    // C6 fix: previously UNCONDITIONAL -- no poison of any kind, not even a
+    // `flushAll` (PFLUSHA) gate (DtlbPlugin's equivalent line gates on
+    // `!walkUmPoison && !walkFlushPoison && !flushAll`). A walk that completed
+    // after a flush landed on it mid-walk would still allocate a real deferred
+    // U-write entry tagged with an already-squashed robId -- see the long comment
+    // at `walkUmPoison`'s declaration above for the full spurious-write mechanism
+    // this was producing.
+    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
+                                  !walker.io.rsp.fault && !walkUmPoison && !flushAll
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
@@ -316,12 +402,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // is never a write, so write-protect never applies.)
     def permFault(sup: Bool): Bool = sup && !_req.supervisor
 
-    when(!mmuEnable) {
-      _rsp.ready     := True
-      _rsp.ppn       := _req.vpn
-      _rsp.cacheMode := CacheMode.WRITETHROUGH
-      _rsp.fault     := False
-    } elsewhen(ttHit) {
+    // TTR hit is checked FIRST regardless of mmuEnable (matches DtlbPlugin's fix
+    // and real hardware priority: a TTR match bypasses the walker/TLB entirely,
+    // whether or not paging is on). The mmuEnable=False fallback is now only
+    // reached when the MMU is off AND no TTR matched.
+    when(ttHit) {
       // ITT0/ITT1 transparent-translation hit (task #194): bypasses the walker/TLB
       // entirely — PA=VA, never faults. The I-side never inspects WRITETHROUGH vs
       // COPYBACK (no I-side stores), so collapsing the cacheable case to a fixed
@@ -331,6 +416,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ready     := True
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := Mux(ttInhibited, CacheMode.INHIBITED, CacheMode.WRITETHROUGH)
+      _rsp.fault     := False
+    } elsewhen(!mmuEnable) {
+      _rsp.ready     := True
+      _rsp.ppn       := _req.vpn
+      _rsp.cacheMode := CacheMode.WRITETHROUGH
       _rsp.fault     := False
     } elsewhen(tlbHit) {
       _rsp.ready     := True

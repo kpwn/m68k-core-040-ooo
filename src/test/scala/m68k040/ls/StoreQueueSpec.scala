@@ -41,10 +41,53 @@ class StoreQueueSpec extends AnyFunSuite {
     dut.io.commit.valid #= false
   }
 
-  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type]): Unit = {
+  def setQuery(dut: StoreQueue, robId: Int, paddr: Long, size: SpinalEnumElement[Size.type],
+               inhibited: Boolean = false, splitB: Boolean = false, paddrB: Long = 0): Unit = {
     dut.io.fwd.query.robId #= robId
     dut.io.fwd.query.paddr #= paddr
     dut.io.fwd.query.size #= size
+    dut.io.fwd.query.splitB #= splitB
+    dut.io.fwd.query.paddrB #= paddrB
+    dut.io.fwd.query.inhibited #= inhibited
+    dut.io.barrier.robId #= robId
+  }
+
+  test("inhibited accesses serialize across non-overlapping device ports", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+
+      // A device write and its readback/status port need not overlap or share a
+      // cache line.  The younger inhibited load must still wait.
+      alloc(dut, cd, robId = 4, paddr = 0x50f1e800L, data = 0xf5, Size.BYTE,
+        cacheMode = m68k040.cache.CacheMode.INHIBITED, precise = true)
+      setQuery(dut, robId = 6, paddr = 0x50f1f800L, Size.BYTE, inhibited = true)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "device load must never SQ-forward")
+
+      // Total ordering is bidirectional at the boundary: an ordinary younger load
+      // also cannot pass an older inhibited store, and neither may forward across it.
+      setQuery(dut, robId = 6, paddr = 0x3000L, Size.LONG, inhibited = false)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean,
+        "ordinary load must not forward across an older inhibited store")
+
+      // WHERE THE ORDERING NOW LIVES.  It is deliberately NOT expressed as a
+      // forwarding stall here.  Driving it as `rsp.stall` made the LS-EU re-query
+      // from P4 every cycle until the store drained -- a wait that is not
+      // self-resolving, because the spinning load holds resources the drain can
+      // need, and the core hung on real hardware (2026-08-22, `TST.B` of a VIA
+      // register).  The barrier is instead published as a whole-ring property that
+      // the LS-EU consumes ONCE at its load-launch gate; see `p4LaunchOk` in
+      // LsEuPlugin and the two device-ordering tests in LsEuFastPreciseSpec.
+      assert(dut.io.barrier.olderInhibitedStore.toBoolean,
+        "an OLDER resident device store must raise the barrier for this load")
+      // And the age qualifier is real: a store that is YOUNGER than the querying load
+      // must NOT gate it, or a younger store could hold an older load forever.
+      dut.io.barrier.robId #= 1
+      sleep(1)
+      assert(!dut.io.barrier.olderInhibitedStore.toBoolean,
+        "a YOUNGER device store must not raise the barrier for an older load")
+    }
   }
 
   def initDut(dut: StoreQueue): ClockDomain = {
@@ -221,34 +264,37 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
-  // Task P4.4 Step 6 (design doc §5 item 6, copyback re-audit -- see the
-  // `sameLine` decl comment in StoreQueue.scala for the full review): `sameLine`
-  // is entirely cache-mode-agnostic (this DUT/queue carries no cacheMode field
-  // consulted by the forward/stall logic at all) -- an older, still-undrained,
-  // SAME-cache-line SQ entry must stall a younger load's query regardless of
-  // what cache mode that store will eventually drain under, exactly as it did
-  // before this task. This directed case names COPYBACK explicitly (allocating
-  // the older entry with cacheMode=COPYBACK) to make that mode-independence
-  // explicit in the regression, rather than relying on the pre-existing
-  // same-line test (which uses the WRITETHROUGH default) to imply it.
-  test("same-line stall still holds an older undrained entry under COPYBACK " +
-       "(Task P4.4 Step 6 copyback re-audit)", VerilatorTest) {
+  // LS-cluster review finding P5 (this task -- supersedes the old "Task P4.4 Step 6
+  // copyback re-audit" test that used to live here and asserted the OPPOSITE of what
+  // this test now proves; see the `sameLine` decl comment in StoreQueue.scala for the
+  // full hazard-coverage argument for why the old conclusion was safe-but-unnecessarily
+  // conservative). A same-line, NON-overlapping younger load must NOT stall behind an
+  // older, still-undrained COPYBACK store: COPYBACK's own eventual drain (RMW-on-hit or
+  // write-allocate-on-miss) always self-heals the array, so the WRITETHROUGH-specific
+  // "permanently stale line" hole this stall exists for does not apply.
+  test("same-line, non-overlapping younger load does NOT stall behind an older " +
+       "undrained COPYBACK store (LS-cluster review finding P5)", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)
       // An OLDER COPYBACK store at 0x102..0x103 (cache line 0x100..0x10F).
       alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD,
         cacheMode = m68k040.cache.CacheMode.COPYBACK)
-      // A younger load at 0x108 -- no BYTE overlap with the store's own range at
-      // all (so it would MISS any byte-forward), but the SAME cache line -- must
-      // still stall (the sameLine refill hazard) regardless of the older store's
-      // cache mode.
+      // A younger load at 0x108 -- no BYTE overlap with the store's own range at all
+      // (so it would MISS any byte-forward), same cache line -- must NOT stall, since
+      // this is exactly the case the P5 finding narrows: COPYBACK's own drain (whichever
+      // arm it takes) always leaves the array holding the store's bytes, so there is no
+      // "cache a permanently stale line" hole for a racing load-refill to fall into.
       setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
       cd.waitSampling()
       sleep(1)
       assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
-      assert(dut.io.fwd.rsp.stall.toBoolean,
-        "same-cache-line older COPYBACK entry, still undrained -> must stall")
-      // Drain the store (commit + drain + drainAck) -- the hazard must then clear.
+      assert(!dut.io.fwd.rsp.stall.toBoolean,
+        "same-cache-line, non-overlapping, older COPYBACK entry -> must NOT stall (P5 fix)")
+      // Still un-drained: prove the entry is genuinely still resident (not merely
+      // vacuously absent), so the negative assertion above is actually exercising the
+      // narrowed condition and not just an empty queue.
+      assert(!dut.io.empty.toBoolean, "the COPYBACK store must still be resident/undrained here")
+      // Drain the store (commit + drain + drainAck) and confirm nothing regresses post-drain.
       commit(dut, cd, robId = 4)
       cd.waitSampling()
       assert(dut.io.drain.valid.toBoolean, "committed COPYBACK entry must present for drain")
@@ -258,7 +304,143 @@ class StoreQueueSpec extends AnyFunSuite {
       cd.waitSampling(2)
       setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
       sleep(1)
-      assert(!dut.io.fwd.rsp.stall.toBoolean, "once drained, the same-line hazard must clear")
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "post-drain, still no stall")
+      cd.waitSampling(2)
+    }
+  }
+
+  // Companion case to the one above: a GENUINE byte-level overlap against an older
+  // undrained COPYBACK store must still stall -- via the untouched `anyPartial`/`overlap`
+  // RAW-hazard mechanism, NOT via `sameLine` (which the P5 fix now excludes for COPYBACK).
+  // This is the case that would silently break if the P5 fix had accidentally gated the
+  // wrong condition (e.g. the overlap/full/partial terms instead of only the line terms).
+  test("genuine byte-overlap against an older undrained COPYBACK store still stalls " +
+       "(via anyPartial, unaffected by the P5 sameLine fix)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // An OLDER COPYBACK store at 0x102..0x103 (WORD).
+      alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      // A younger load at 0x103 -- a genuine sub-range BYTE overlap with the store's own
+      // range -- must still stall (this is a real RAW hazard, not the refill-stale-line
+      // hazard `sameLine` used to (over-)cover).
+      setQuery(dut, robId = 6, paddr = 0x103, Size.BYTE)
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "sub-range byte is not a full forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "genuine byte overlap against an older undrained COPYBACK store -> must still stall")
+      // Drain and confirm the hazard clears once the store is gone.
+      commit(dut, cd, robId = 4)
+      cd.waitSampling()
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      setQuery(dut, robId = 6, paddr = 0x103, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "once drained, the overlap hazard must clear")
+      cd.waitSampling(2)
+    }
+  }
+
+  // WT-pipelining task: `sendPipelined` (StoreQueue.scala) now covers non-precise
+  // WRITETHROUGH the same way it already covered COPYBACK -- `io.drain.valid`
+  // presents a committed entry off `sendCommitted` alone (no `sendAtHead`/
+  // `noAccepted`), so a SECOND committed WT entry can be PRESENTED for drain while
+  // the FIRST is still "accepted" (drained but not yet acked). This is the SQ-side
+  // half of the pipelining change; DcachePluginSpec-adjacent coverage (DcacheSpec)
+  // proves the DcachePlugin-side admission/AXI-overlap half.
+  test("WT-pipelining: a second committed non-precise WRITETHROUGH entry presents " +
+       "for drain while the first is still accepted (not yet acked) -- was sendAtHead-gated before this task",
+       VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)   // io.drain.ready held True throughout (initDut's default)
+      alloc(dut, cd, robId = 4, paddr = 0x200, data = 0x1111L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      alloc(dut, cd, robId = 5, paddr = 0x300, data = 0x2222L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      // drainAck stays LOW (initDut's default) throughout this phase -- nothing
+      // pops, so any entry that gets SENT (drain.fire, which `io.drain.ready`
+      // held True lets happen the moment it presents) stays counted in
+      // `acceptedHalves` until explicitly acked below.
+      commit(dut, cd, robId = 4)
+      commit(dut, cd, robId = 5)
+      cd.waitSampling(4)   // let both committed entries clear the send cursor
+
+      // Before this task, `sendSerialReady` required `sendAtHead && noAccepted` --
+      // the SECOND WT entry could not even be PRESENTED (let alone sent) until the
+      // FIRST was fully acked, so `acceptedHalves` could never exceed 1 for a
+      // WRITETHROUGH stream. After this task (`sendPipelined` covers WRITETHROUGH
+      // exactly like COPYBACK), both commited entries are sent back-to-back and
+      // BOTH sit "accepted" (sent, unacked) simultaneously -- the direct SQ-side
+      // proof of pipelining.
+      assert(dut.acceptedHalves.toBigInt == 2,
+        s"both committed WT entries must be simultaneously accepted (sent, unacked): got ${dut.acceptedHalves.toBigInt}")
+      assert(dut.head.toBigInt == 0, "nothing has been acked yet -- robId=4 (index 0) is still the oldest resident entry")
+      assert(dut.robIds(0).toBigInt == 4 && dut.robIds(1).toBigInt == 5,
+        "both entries remain resident, in their original ring slots, until acked")
+
+      // The SQ's own `drainAck` contract is "always the oldest accepted half"
+      // (StoreQueue.scala doc comment) -- acking now must pop robId=4 first, even
+      // though robId=5 was ALSO already sent, proving send order == ack order
+      // (program order preserved under pipelining).
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      assert(dut.head.toBigInt == 1, "first ack pops the OLDEST accepted half (robId=4), not robId=5")
+      assert(dut.acceptedHalves.toBigInt == 1)
+
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      assert(dut.io.empty.toBoolean, "both entries popped, strictly in program (send/ack) order")
+    }
+  }
+
+  // WT-pipelining task (point 3c of the design brief): the `sameLine` load-forward
+  // hazard holds for a pipelined, non-precise WRITETHROUGH store exactly as
+  // conservatively as it always has (WRITETHROUGH is NOT affected by the LS-cluster
+  // review finding P5 fix two tests above, which narrows this stall for COPYBACK
+  // only) -- the hazard is driven purely by SQ residency (`valids`/`committed`/age),
+  // never by drain/AXI timing, so a WT entry that has ALREADY been sent to
+  // DcachePlugin (and may have an AXI write in flight) still correctly stalls a
+  // same-line younger load until its OWN terminal ack pops it. This test's body is
+  // UNCHANGED by the P5 fix -- only this comment was updated to stop pointing at the
+  // old (now-superseded) COPYBACK test's conclusion.
+  test("same-line stall still holds an older undrained entry under a pipelined " +
+       "(non-precise) WRITETHROUGH store, even after it has been sent/accepted",
+       VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // An OLDER non-precise WRITETHROUGH store at 0x102..0x103 (line 0x100..0x10F).
+      alloc(dut, cd, robId = 4, paddr = 0x102, data = 0xBEEFL, Size.WORD,
+        cacheMode = m68k040.cache.CacheMode.WRITETHROUGH, precise = false)
+      commit(dut, cd, robId = 4)
+      cd.waitSampling()
+      assert(dut.io.drain.valid.toBoolean, "committed WT entry must present for drain")
+      cd.waitSampling()   // accept it -- now "accepted, unacked" (an AXI write would be in flight here)
+
+      // A younger load, same cache line, no byte overlap -- must still stall even
+      // though the store has ALREADY been sent to DcachePlugin (pipelined) and is
+      // sitting in the "accepted, unacked" window a real outstanding AXI write
+      // occupies.
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean, "no byte overlap -> not a forward")
+      assert(dut.io.fwd.rsp.stall.toBoolean,
+        "same-cache-line older WT entry, sent but still unacked -> must stall")
+
+      // Only the TERMINAL ack (matching a real AXI B) clears it.
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      cd.waitSampling(2)
+      setQuery(dut, robId = 6, paddr = 0x108, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.stall.toBoolean, "once acked, the same-line hazard must clear")
       cd.waitSampling(2)
     }
   }

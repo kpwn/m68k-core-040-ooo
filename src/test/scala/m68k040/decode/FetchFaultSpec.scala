@@ -8,9 +8,16 @@ import spinal.lib._
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Task 3: a DecodePacket with `fault` (the I-cache raised it from the ITLB) decodes
-  * into a single faulted µop: vector 2 (access fault), faultAddr = the fetch PC,
-  * sswInstr = 1 (program-space SSW). The op is don't-care (it only delivers the
-  * exception at retire). A non-faulting packet is UNCHANGED. */
+  * into a single faulted µop: vector 2 (access fault), pc = the fetch PC (the EA
+  * that RobPlugin's alloc-time `faultAddrStore` write stacks in the format-$7
+  * frame), sswInstr = 1 (program-space SSW). The op is don't-care (it only
+  * delivers the exception at retire). A non-faulting packet is UNCHANGED.
+  *
+  * (ROB-fold Slice A / faultAddr dead-field deletion: this test used to read the
+  * now-deleted `faultAddr` field directly; it read `pc` at every decode write
+  * site with zero exceptions (grep-verified), so this asserts the exact same
+  * fact — the fetch PC IS the stacked fault EA — via the field that actually
+  * survives to RobPlugin's alloc write.) */
 class FetchFaultSpec extends AnyFunSuite {
 
   class Dut extends Component {
@@ -23,12 +30,12 @@ class FetchFaultSpec extends AnyFunSuite {
     val a = MicroOpAssembler.assemble(pktIn)
     outFaulted := a.uops(0).faulted
     outVec     := a.uops(0).faultVector
-    outAddr    := a.uops(0).faultAddr
+    outAddr    := a.uops(0).pc
     outSsw     := a.uops(0).sswInstr
     outCount   := a.count
   }
 
-  test("DecodePacket.fault -> faulted vector-2 uop (faultAddr=PC, sswInstr)", VerilatorTest) {
+  test("DecodePacket.fault -> faulted vector-2 uop (pc=fetch PC=stacked fault EA, sswInstr)", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       // A faulting fetch: bytes are garbage; only `fault` + pc matter.
       dut.pktIn.valid     #= true

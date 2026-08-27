@@ -405,6 +405,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movemNextPc   = Reg(UInt(32 bits))
     val movemAnUpdPhase = RegInit(False)       // mask drained -> drive the single final An update
     when(pipeFlush) { movemActive := False; movemAnUpdPhase := False }
+    // Total element count (task movem-translate-ahead): popcount of the WHOLE mask,
+    // latched ONCE at entry (movemBegin) alongside movemMask -- unlike movemEmitted
+    // (a running per-cycle counter that starts at 0 and only reaches the total once
+    // the mask is fully drained), this is the up-front total, needed by the FIRST
+    // move µop's far-page probe (see movemProbeCount below) BEFORE any element has
+    // been emitted. 0..16 fits UInt(5 bits). Computed off the raw 16-bit extension
+    // word (a decode-time-only constant per macro, not a per-cycle repeated cone).
+    val movemTotalCount = Reg(UInt(5 bits))
 
     val movemSizeBytes = Mux(movemSizeLong, S(4, 32 bits), S(2, 32 bits))
     val movemStep      = Mux(movemRev, -movemSizeBytes, movemSizeBytes)
@@ -472,15 +480,31 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     def movemLoadDst(reg: UInt): UInt =
       Mux(movemIsLoad && movemDoAnUpd && movemBaseValid && (reg === movemBaseReg),
           U(MicroOpAssembler.T0, 5 bits), reg)
+    // Far-page probe carrier (task movem-translate-ahead, closes the mid-list LOAD-
+    // fault register-rollback gap documented in
+    // docs/BUG_movem_midlist_load_fault_no_rollback.md): the macro's total element
+    // count rides ONLY the very first emitted element (`movemEmitted === 0`,
+    // deliberately NOT `movemFirst0` -- this must fire regardless of whether a
+    // base/index snapshot µop already claimed the firstOfInstr/interrupt-boundary
+    // marker, since the address-span probe is a SEPARATE concern from that
+    // bookkeeping), and ONLY for the LOAD direction (STORE keeps its existing,
+    // already Musashi-correct "landed stores stay landed" behavior unmodified --
+    // see the bug doc's STORE section: a whole-span pre-check would WRONGLY block
+    // already-resident-page stores that land before the faulting one, regressing a
+    // passing test). 0 = "not a probe carrier" (every non-MOVEM uop and every
+    // MOVEM uop except this one) -- LsEuPlugin.movemMoveUop reads this back off the
+    // repurposed `faultVector` field (see its own doc comment for why that field is
+    // safe to repurpose here).
+    val movemProbeCount = Mux((movemEmitted === 0) && movemIsLoad, movemTotalCount, U(0, 5 bits))
     val movemUop0 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg0), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm0,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = movemFirst0, last = movemLast0, drop = movemHasFinal,
-      valid = True, pc = movemPc, nextPc = movemNextPc,
+      valid = True, pc = movemPc, nextPc = movemNextPc, probeCount = movemProbeCount,
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     val movemUop1 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg1), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm1,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = False, last = movemLast1, drop = movemHasFinal,
-      valid = True, pc = movemPc, nextPc = movemNextPc,
+      valid = True, pc = movemPc, nextPc = movemNextPc, probeCount = U(0, 5 bits),
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     // The final An update (kept macro commit): An := An + emitted*step for (An)+/-(An)
     // (movemStep carries the sign), or An := An + 0 for the control (An)/(d16,An) modes
@@ -2558,6 +2582,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       movemActive   := True
       movemAnUpdPhase := False
       movemMask     := eMask
+      // Total element count for the far-page probe (task movem-translate-ahead):
+      // popcount of the raw mask, latched once here (a small 16-input reduction
+      // adder tree over a decode-time-only constant, not a hot repeated cone).
+      // SpinalHDL has no built-in popcount primitive -- reduceBalancedTree over the
+      // 16 individual mask bits (each widened to 5 bits so the running sum never
+      // overflows; max value 16 fits exactly).
+      movemTotalCount := eMask.asBools.map(b => b.asUInt.resize(5)).reduceBalancedTree(_ + _)
       movemBaseReg  := eBaseRegV
       movemBaseValid:= eBaseValidV(0)
       movemBaseDisp := eBaseDispV

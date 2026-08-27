@@ -149,6 +149,13 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     dut.cacheCtrl.logic.dcacheEnabled #= false
     dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
     cd.waitSampling(80) // PRF init sweep
+    // The D-cache re-invalidates every set after a reset -- one set per cycle, 128
+    // sets -- and refuses ALL load/store admission for the whole walk (see
+    // `resetSweepBusy` in DcachePlugin, added by c6e3ad4).  A test that issues
+    // inside that window sees an LS pipeline that simply never starts, which is
+    // indistinguishable from an ordering bug at the assertion site.  Wait it out
+    // once, here, so no individual test has to know about it.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem, ptmem)
   }
 
@@ -260,6 +267,146 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         cd.waitSampling()
       }
       assert(!completedLater, "precise-path store completion must stay withheld (no drain trigger built yet — Task P2.4)")
+    }
+  }
+
+  test("inhibited load waits for an overlapping precise store then performs a real bus read", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val base     = 0x1800L
+      val storeRob = 5
+      val loadRob  = 6
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0x11223344L)
+      Seq(0xDE, 0xAD, 0xBE, 0xEF).zipWithIndex.foreach {
+        case (b, i) => mem.pokeByte(base + i, b)
+      }
+
+      // MMU and D-cache remain disabled, making both accesses INHIBITED.  Hold the
+      // older precise store away from the ROB head so it remains in the SQ while
+      // the younger same-address load reaches the forwarding query.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11,
+                 Size.LONG, robId = storeRob)
+      val (idx, completed) = waitAlloc(dut, cd, robId = storeRob)
+      assert(idx >= 0 && !completed, "inhibited store must remain resident and precise")
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 20, robId = loadRob)
+
+      var loadCompletedEarly = false
+      var overlapStallSeen = false
+      var readIssuedEarly = false
+      for (_ <- 0 until 30) {
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompletedEarly = true
+        if (dut.eu.logic.p4Valid.toBoolean &&
+            dut.eu.logic.p4Ctx.xlate.front.robId.toInt == loadRob)
+          overlapStallSeen = true
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == base)
+          readIssuedEarly = true
+        cd.waitSampling()
+      }
+      assert(overlapStallSeen,
+        "inhibited load must be held in P4 rather than taking the forwarded data")
+      assert(!loadCompletedEarly,
+        "inhibited load must not complete from an older store's forwarded data")
+      assert(!readIssuedEarly,
+        "inhibited load must not reach the device before the older store drains")
+
+      // Retire the store.  After its acknowledged drain removes the SQ overlap, the
+      // load must leave P4 through the ordinary inhibited-load path and issue AR.
+      dut.wire.logic.iRobHeadIn      #= storeRob
+      dut.wire.logic.iRobHeadValidIn #= true
+      var readIssued = false
+      var loadCompleted = false
+      var cycles = 0
+      // An inhibited load is PRECISE: it may not launch until it is itself the ROB
+      // head with the ring drained.  Model the real ROB -- once the store's entry is
+      // gone, the head advances to the load.
+      var headAdvanced = false
+      while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (!headAdvanced && dut.eu.logic.sq.io.empty.toBoolean) {
+          dut.wire.logic.iRobHeadIn #= loadRob
+          headAdvanced = true
+        }
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == base)
+          readIssued = true
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompleted = true
+        cd.waitSampling()
+        cycles += 1
+      }
+      assert(readIssued,
+        "load must perform a real bus read after the overlapping inhibited store drains")
+      assert(loadCompleted, "load must complete after its device read response")
+    }
+  }
+
+  test("inhibited device read waits for an older write at a different MMIO port", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut)
+      val writePort = 0x1800L
+      val readPort  = 0x2800L
+      val storeRob  = 5
+      val loadRob   = 6
+      seed(dut, cd, preg = 10, value = writePort)
+      seed(dut, cd, preg = 11, value = 0x000000f5L)
+      seed(dut, cd, preg = 12, value = readPort)
+      Seq(0x02, 0xEE, 0x00, 0xEC).zipWithIndex.foreach {
+        case (b, i) => mem.pokeByte(readPort + i, b)
+      }
+
+      // These stand in for a device's command and status/data ports: distinct
+      // addresses and cache lines, but one architecturally serialized device.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11,
+                 Size.BYTE, robId = storeRob)
+      val (idx, completed) = waitAlloc(dut, cd, robId = storeRob)
+      assert(idx >= 0 && !completed, "inhibited device write must remain precise")
+      issueLoad(dut, cd, basePreg = 12, disp = 0, pdst = 20, robId = loadRob)
+
+      var readIssuedEarly = false
+      var serialStallSeen = false
+      for (_ <- 0 until 30) {
+        if (dut.eu.logic.p4Valid.toBoolean &&
+            dut.eu.logic.p4Ctx.xlate.front.robId.toInt == loadRob)
+          serialStallSeen = true
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == readPort)
+          readIssuedEarly = true
+        cd.waitSampling()
+      }
+      assert(serialStallSeen,
+        "different-address device read must remain parked behind the older write")
+      assert(!readIssuedEarly,
+        "different-address device read must not launch before the older write drains")
+
+      dut.wire.logic.iRobHeadIn      #= storeRob
+      dut.wire.logic.iRobHeadValidIn #= true
+      var readIssued = false
+      var loadCompleted = false
+      var cycles = 0
+      // See the sibling test: the device read is precise and launches only once it
+      // is the ROB head with the ring drained.
+      var headAdvanced = false
+      while ((!readIssued || !loadCompleted) && cycles < 500) {
+        if (!headAdvanced && dut.eu.logic.sq.io.empty.toBoolean) {
+          dut.wire.logic.iRobHeadIn #= loadRob
+          headAdvanced = true
+        }
+        if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+            dut.dcache.logic.axi.ar.ready.toBoolean &&
+            dut.dcache.logic.axi.ar.payload.addr.toBigInt == readPort)
+          readIssued = true
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == loadRob)
+          loadCompleted = true
+        cd.waitSampling()
+        cycles += 1
+      }
+      assert(readIssued, "device read must launch after the older write is acknowledged")
+      assert(loadCompleted, "device read must complete after its bus response")
     }
   }
 

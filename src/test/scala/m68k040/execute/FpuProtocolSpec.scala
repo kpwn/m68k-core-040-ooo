@@ -170,7 +170,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       uop.ccrRestore := False; uop.toCcr := False; uop.unimplemented := False
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.faultUsesNextPc := False; uop.isCondTrap := False
-      uop.faultAddr := 0; uop.sswInstr := False; uop.faultAtc := True
+      uop.sswInstr := False; uop.faultAtc := True
       uop.divSigned := False; uop.div64 := False; uop.divIsRem := False
       uop.isChk2 := False
       uop.shiftOp := 0; uop.shiftDir := False; uop.bcdSub := False

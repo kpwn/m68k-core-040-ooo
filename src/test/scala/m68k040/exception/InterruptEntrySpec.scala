@@ -83,7 +83,7 @@ class InterruptEntrySpec extends AnyFunSuite {
     u.pXDst #= 0; u.writesX #= false; u.pXOld #= 0
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.debugBreakValid #= false; u.debugBreakSlot #= 0
-    u.isCondTrap #= false; u.sswInstr #= false; u.faultAddr #= 0
+    u.isCondTrap #= false; u.sswInstr #= false
     // Line-4 ops added needsSupervisor (Track C privViolation) + sysOp/sysKind/sysReadDir
     // (Track D serializing system ops) to RenamedUop — drive inert here, else they read
     // garbage and spuriously assert privViolation/sysOpStore, blocking interruptPending.

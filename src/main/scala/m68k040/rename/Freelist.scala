@@ -145,6 +145,20 @@ case class Freelist(
   }
 
   // ── Pop / push updates (only when init done and not flushing) ─────────────
+  // NOTE (freelist-flush-invariant campaign): a push offered while `io.flush` is
+  // high is SILENTLY DROPPED here — `io.push(k).valid` is simply never sampled in
+  // this scope, so a legitimate commit's freed old-pdst would never return to the
+  // pool (a permanent physreg leak) if it ever coincided with a flush cycle. This
+  // component alone cannot enforce "commits never land on a flush cycle" (it only
+  // sees `io.push`/`io.flush` as opaque IO, with no notion of "legitimate commit"),
+  // so that invariant is owned and enforced upstream, in RobPlugin: every producer
+  // of the `RenameCommitService.commitPorts` port that eventually drives `io.push`
+  // here is gated through `headReady`, which ANDs in `!flushing` directly — making
+  // `commitPorts(k).valid && flushing` architecturally unreachable by construction
+  // (not merely by retire-ordering convention). See RobPlugin.scala's `headReady`
+  // definition and the `GenerationFlags.simulation { assert(...) }` right after
+  // `rc.flushPort := flushing`, which pins that guarantee so a future commit path
+  // added upstream that bypasses `headReady` trips loudly instead of leaking here.
   when(initDone && !io.flush) {
     val pcW = log2Up(pushPorts + 1)
     val takeCount = io.pop.map(p => p.take.asUInt.resize(log2Up(popPorts + 1))).reduceLeft(_ + _)

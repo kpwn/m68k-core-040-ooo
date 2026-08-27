@@ -67,9 +67,11 @@ class LsBackendInjectSpec extends AnyFunSuite {
       rob.logic.sqFaultCompletion.valid   := lsEu.sqFaultCompletionPort.valid
       rob.logic.sqFaultCompletion.payload := lsEu.sqFaultCompletionPort.payload
       rob.logic.preciseDrainBusyIn        := lsEu.preciseDrainBusySig
+      rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
       lsEu.robHeadIn           := rob.logic.h0
       lsEu.robHeadValidIn      := rob.logic.count > 0
       lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
+      lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
       iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
@@ -137,7 +139,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.psrcC #= 0; u.psrcCValid #= false
     u.ibranch #= false; u.anInc #= 0; u.stkPush #= false; u.ccrRestore #= false
     u.toCcr #= false; u.isCondTrap #= false
-    u.faultAddr #= 0; u.sswInstr #= false
+    u.sswInstr #= false
     u.divSigned #= false; u.divIsRem #= false
     u.isChk2 #= false
     u.shiftOp #= 0; u.shiftDir #= false; u.extByte #= false

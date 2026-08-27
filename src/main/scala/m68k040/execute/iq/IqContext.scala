@@ -9,6 +9,98 @@ case class IqContext() extends Bundle {
   val robId = UInt(6 bits)
 }
 
+/** The NARROW per-slot record: exactly the `IqContext` fields the issue queue's OWN
+  * combinational logic reads, plus the address of the cold (dispatch-only) remainder.
+  *
+  * WHY THIS EXISTS (see IssueQueuePlugin's "cold payload store" block for the full
+  * argument). The IQ is a NaxRiscv-style COMPACTING queue: on every `push.fire` each
+  * slot is rewritten from the line above, so the slot array is a 16-deep SHIFT REGISTER
+  * over whatever it stores. Storing the whole `IqContext` there cost 16 x 418 = 6,688 FF
+  * in the routed netlist, and connecting all 16 slots to all 5 select ports with 16:1
+  * `MuxOH`s over that full width cost ~6,875 LUT -- the structure the 2026-08-25 census
+  * named as the reason the IQ cluster spans 68 x 111 slices (family #17, section 4.5).
+  *
+  * But only a small minority of the context is actually READ by the IQ. Everything here
+  * is read EVERY CYCLE by the per-slot wakeup CAM, the class/select masks, or the
+  * retimed C+1 scoreboard clear. Everything NOT here is pure dispatch payload: written
+  * once at push, read once at issue, and otherwise just shifted. That half now lives in
+  * a robId-addressed `Mem` (LUTRAM) instead of a shift register, and only `robId` +
+  * `coldWay` (7 bits) travel through the select cone to fetch it.
+  *
+  * THE PARTITION IS COMPILE-TIME CHECKED IN THE SAFE DIRECTION. If a field belongs in
+  * the hot set and is missing here, the IQ's own logic fails to compile (there is no
+  * such member). If a field is here that need not be, the only cost is area. There is NO
+  * silent-wrong-data failure mode from getting the split wrong, which is exactly why the
+  * issue-side payload is reassembled as a WHOLE-uop `Mem` read rather than by
+  * re-merging hot fields over cold ones. */
+case class IqHot() extends Bundle {
+  val intW  = 6
+  val flagW = 4
+  val fpW   = 4
+
+  // ---- Wakeup-CAM sources. Compared against every wakeup broadcast, for every slot,
+  // every cycle (lsWakeMatch / cplxWakeMatch / aluSlowWakeMatch / the *NzvcWakeMatch /
+  // cplxFpWakeMatch / cplxFpccWakeMatch loops, and their `*Remaining` re-evaluations). ----
+  val psrcA    = UInt(intW bits);  val psrcAValid    = Bool()
+  val psrcB    = UInt(intW bits);  val psrcBValid    = Bool()
+  val psrcC    = UInt(intW bits);  val psrcCValid    = Bool()
+  val pNzvcSrc = UInt(flagW bits); val readsNzvc     = Bool()
+  val pXSrc    = UInt(flagW bits); val readsX        = Bool()
+  val pFpSrcA  = UInt(fpW bits);   val psrcAFpValid  = Bool()
+  val pFpSrcB  = UInt(fpW bits);   val psrcBFpValid  = Bool()
+  val pFpccSrc = UInt(fpW bits);   val readsFpcc     = Bool()
+
+  // ---- Class / select-mask fields. `op` is needed by `srcBIsReg`'s PACK/UNPK/BITFIELD/
+  // BFRESOLVE exceptions (which decide whether psrcB is a live register dependency at
+  // all) and by `isAluSlowProducer`; cluster/memOp/leaAddr are `isLs`/`isCplx`. ----
+  val op       = m68k040.decode.DecOp()
+  val cluster  = m68k040.isa.Cluster()
+  val memOp    = m68k040.isa.MemOp()
+  val leaAddr  = Bool()
+  val isBranch = Bool()
+  val useImm   = Bool()
+
+  // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
+  // off the registered select-port payload. Keeping these in the hot record is what
+  // preserves task #219 Fix 2 exactly: that clear still reads a plain flop, never a
+  // memory, so no LUTRAM level is added to the sb*_busy cone it was created to shorten. ----
+  val pdst     = UInt(intW bits);  val pdstValid   = Bool()
+  val pNzvcDst = UInt(flagW bits); val writesNzvc  = Bool()
+  val pXDst    = UInt(flagW bits); val writesX     = Bool()
+  val pFpDst   = UInt(fpW bits);   val pFpDstValid = Bool()
+  val pFpccDst = UInt(fpW bits);   val writesFpcc  = Bool()
+
+  // ---- Cold-payload address. `robId` is the Mem index; `coldWay` selects which of the
+  // two single-write-port banks holds it (see IssueQueuePlugin for why the banking is by
+  // PUSH WAY and not by robId parity). ----
+  val robId    = UInt(6 bits)
+  val coldWay  = Bool()
+
+  /** Project the wide dispatch record onto the hot fields. The ONLY writer of an IqHot,
+    * so the hot copy and the cold Mem row are written from the same source in the same
+    * cycle and can never disagree. */
+  def assignFrom(ctx: IqContext, way: Bool): Unit = {
+    val u = ctx.uop
+    psrcA := u.psrcA; psrcAValid := u.psrcAValid
+    psrcB := u.psrcB; psrcBValid := u.psrcBValid
+    psrcC := u.psrcC; psrcCValid := u.psrcCValid
+    pNzvcSrc := u.pNzvcSrc; readsNzvc := u.readsNzvc
+    pXSrc    := u.pXSrc;    readsX    := u.readsX
+    pFpSrcA  := u.pFpSrcA;  psrcAFpValid := u.psrcAFpValid
+    pFpSrcB  := u.pFpSrcB;  psrcBFpValid := u.psrcBFpValid
+    pFpccSrc := u.pFpccSrc; readsFpcc := u.readsFpcc
+    op := u.op; cluster := u.cluster; memOp := u.memOp
+    leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm
+    pdst     := u.pdst;     pdstValid   := u.pdstValid
+    pNzvcDst := u.pNzvcDst; writesNzvc  := u.writesNzvc
+    pXDst    := u.pXDst;    writesX     := u.writesX
+    pFpDst   := u.pFpDst;   pFpDstValid := u.pFpDstValid
+    pFpccDst := u.pFpccDst; writesFpcc  := u.writesFpcc
+    robId := ctx.robId
+    coldWay := way
+  }
+}
+
 /** Dynamic-completion wakeup for the six-stage SLOW ALU path. A SHIFT/BITFIELD
   * produces its destinations atomically at S3, so the broadcast carries all
   * three physreg dsts (with per-class valid). The IQ clears its per-class slow-busy
