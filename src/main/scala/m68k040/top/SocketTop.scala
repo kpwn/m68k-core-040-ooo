@@ -101,7 +101,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
                                            gateDispatch = SocketTopConfig.OPEN1_GATE_DISPATCH)
     val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage)
 
-    val core = new M68kCore(Seq[FiberPlugin](
+    val core = new M68kCore(exposeDebugPorts = true, plugins = Seq[FiberPlugin](
       new ParamPlugin(p),
       new MmuControlPlugin(),
       new m68k040.execute.FpuControlPlugin(),
@@ -164,6 +164,33 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val cpu_ram_window_lg2   = out UInt (6 bits)
   val cpu_mon_sense        = out UInt (7 bits)
   val init_done_seen       = in Bool ()
+
+  // ── 2026-08-27 boot-investigation ILA taps (task: interrupt-recognition-
+  // during-tight-loop bug) ──────────────────────────────────────────────
+  // Deliberate, narrowly-scoped exception to D23's "only cpu_socket.vh ports"
+  // rule, same class as the dbg_axi/debug-ctrl group above: cpu_socket.vh's
+  // "group 7" (ILA-only debug-export, see rtl/soc/cpu_socket.vh) exists for
+  // exactly this purpose but was never implemented on the CPU_M68K040 side
+  // (rtl/soc/fpga_top_debug_ctrl.vh's CPU_M68K040 branch has no ILA
+  // port-connection block -- confirmed absent). Rather than extend
+  // synth/debug_ila.tcl's probe map (a wider, riskier change touching IP
+  // regen), these 9 Bool + 1 PC port reuse 9 already-existing, currently-
+  // unconnected-for-cpu040 1-bit `dbg_ila_*_w` slots plus `dbg_ila_rob_pc_w`
+  // on the SoC side -- zero probe-map changes needed there, only new
+  // `.dbg_ila_*_w(...)` connections in fpga_top_debug_ctrl.vh's
+  // CPU_M68K040 branch. Always emitted (10 wires, no logic) rather than
+  // gated on a constructor flag -- cheap enough not to need one, and the
+  // SoC side decides via its own `ILA_ENABLE` ifdef whether to consume them.
+  val dbg040_normalIrqGate      = out Bool ()
+  val dbg040_flushing           = out Bool ()
+  val dbg040_excIdle            = out Bool ()
+  val dbg040_iplActive          = out Bool ()
+  val dbg040_branchRedirect     = out Bool ()
+  val dbg040_p0First            = out Bool ()
+  val dbg040_preciseDrainBusyIn = out Bool ()
+  val dbg040_inhibitedLoadBusyIn = out Bool ()
+  val dbg040_interruptPending   = out Bool ()
+  val dbg040_headPc             = out UInt (32 bits)
 
   // ── Deferred wiring: everything that reads a plugin's `.logic` Handle ─────────────
   // Registered as a `spinal.core.fiber.Fiber.build` task -- the SAME generic async-fiber
@@ -297,6 +324,24 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     socket.icache.logic.invalidateAll := False
     socket.core.plugins.collectFirst { case r: m68k040.rob.RobPlugin => r }
       .get.logic.flush.valid := False
+
+    // ── 2026-08-27 boot-investigation ILA taps ──────────────────────────────────────
+    // socket.core.dbg040.* are real OUTPUT PORTS of the M68kCore child component
+    // (see M68kCore.scala's exposeDebugPorts doc comment) -- unlike a direct
+    // `.plugins.collectFirst{...}.get.logic.X` read (which works for `flush.valid`
+    // just above only because that's a WRITE into an already-declared `slave(...)`
+    // port, not a read of a directionless internal signal), reading an internal
+    // RobPlugin wire from OUT HERE would be a hierarchy violation.
+    dbg040_normalIrqGate       := socket.core.dbg040.normalIrqGate
+    dbg040_flushing            := socket.core.dbg040.flushing
+    dbg040_excIdle             := socket.core.dbg040.excIdle
+    dbg040_iplActive           := socket.core.dbg040.iplActive
+    dbg040_branchRedirect      := socket.core.dbg040.branchRedirect
+    dbg040_p0First             := socket.core.dbg040.p0First
+    dbg040_preciseDrainBusyIn  := socket.core.dbg040.preciseDrainBusyIn
+    dbg040_inhibitedLoadBusyIn := socket.core.dbg040.inhibitedLoadBusyIn
+    dbg040_interruptPending    := socket.core.dbg040.interruptPending
+    dbg040_headPc              := socket.core.dbg040.headPc
 
     // ── dbg_axi and the SoC-fabric control group pass straight through ─────────────
     // Socket groups 4 and 6. They are DEBUG-CTRL-OWNED (spec section 10) and this task adds,
