@@ -1299,6 +1299,151 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       irqEvents = Seq((0x40800004L, 3)), avec = true, initialSr = 0x2700)
   }
 
+  // Real-hardware repro (2026-08-27 boot investigation): VIA1 Timer2's IFR/IER
+  // were confirmed asserted (interrupt genuinely pending) well BEFORE the ROM's
+  // own `andiw #-1793,%sr` unmask instruction, with several cache-inhibited MMIO
+  // polls (BTST/TST-style reads, MMU off) executing in between. On real hardware
+  // the interrupt was then NEVER recognized -- the CPU ran a `dbf` loop to its
+  // full natural exhaustion with SR unmasked (IPL=0) the whole time, never
+  // reaching the handler. Reproduce the same SHAPE here: raise iplIn from the
+  // very first instruction (so it is unambiguously pending well before the
+  // in-program unmask, mirroring "IFR already set before the ANDI"), run 3
+  // inhibited byte reads (MMU is off by default in this harness -- see
+  // `dut.ctrl.logic.mmuEnable #= false` in runIrqLockStep's initDut, so every
+  // load here is already cache-inhibited, matching the real device-poll shape),
+  // THEN unmask via a real in-program `move.w`, then a plain non-memory
+  // instruction. If `inhibitedLoadBusyIn`/`preciseDrainBusyIn` (or anything else
+  // gating `RobPlugin.normalIrqGate`) is left wedged by the preceding inhibited
+  // traffic, the DUT will diverge from Musashi here (oracle takes the interrupt,
+  // DUT runs straight past it) -- exactly the real-hardware symptom.
+  test("lock-step IRQ: already-pending interrupt survives inhibited MMIO polls, taken after unmask", VerilatorTest) {
+    val src =
+      "move.l #0x11223344,%d0 ; move.l %d0,0x90 ; " +   // seed [0x90..0x93]
+      "move.l #handler,%d0 ; move.l %d0,0x74 ; " +      // install vector 29 (level 5 avec) @ 0x74
+      "tst.b 0x90 ; tst.b 0x91 ; tst.b 0x92 ; " +        // 3 inhibited byte polls (MMU off -> inhibited)
+      "move.w #0x2000,%sr ; " +                          // real in-program unmask (mask 7 -> 0)
+      "moveq #2,%d2 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; rte"
+    // event @ the FIRST instruction's PC (0x40800000): iplIn=5 is asserted before
+    // anything else retires, well before the unmask -- matches "already pending".
+    runIrqLockStep("irq-already-pending-through-inhibited-polls", src, nInstr = 20,
+      irqEvents = Seq((0x40800000L, 5)), avec = true, initialSr = 0x2700)
+  }
+
+  // Direct signal-level probe (2026-08-27 boot investigation, real-hardware-confirmed
+  // per docs/BUG_calibration_word_misplaced_0d00.md Part 8 in the SoC repo): a
+  // genuinely pending+unmasked+enabled interrupt was NOT recognized on real hardware
+  // for the ENTIRE natural duration of a tight `dbf` loop, then recognized instantly
+  // the moment the loop was broken externally. This is not a lock-step comparison
+  // (Musashi's own interrupt-check timing isn't the question) -- it directly samples
+  // RobPlugin's interruptPending/normalIrqGate/flushing/excIdle/branchRedirect every
+  // cycle across a real dbf loop with iplIn held continuously high from before the
+  // loop starts, to see whether/when recognition ever fires and what blocks it.
+  test("probe: does a real dbf loop ever recognize an always-pending unmasked interrupt", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // Closest match yet to the real ROM's exact shape: interrupt pending WHILE
+    // MASKED (boot default mask=7, matches the ROM's own state before its
+    // `andiw #-1793,%sr` unmask), a real in-program unmask instruction retires
+    // FIRST, immediately followed by loop entry -- not "already unmasked the
+    // whole time" (prior 3 attempts, all recognized promptly, none reproduced
+    // the real bug) and not "masked forever" (never recognized, uninteresting).
+    val src = "movew #0x2000,%sr ; moveq #-1,%d0 ; loop: dbf %d0,loop ; nop ; nop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      var recognizedAt = -1
+      var cyc = 0
+      val ringCap = 40
+      val ring = scala.collection.mutable.Queue[String]()
+      var nigTrueCount = 0L; var nigFalseWhileP0f = 0L
+      cd.onSamplings {
+        if (recognizedAt < 0) {
+          val ip  = dut.rob.logic.interruptPending.toBoolean
+          val nig = dut.rob.logic.normalIrqGate.toBoolean
+          val fl  = dut.rob.logic.flushing.toBoolean
+          val ei  = dut.rob.logic.excIdle.toBoolean
+          val ia  = dut.rob.logic.iplActive.toBoolean
+          val br  = dut.rob.logic.branchRedirect.toBoolean
+          val p0f = dut.rob.logic.p0.first.toBoolean
+          val pdb = dut.rob.logic.preciseDrainBusyIn.toBoolean
+          val ilb = dut.rob.logic.inhibitedLoadBusyIn.toBoolean
+          if (nig) nigTrueCount += 1
+          if (p0f && !nig) nigFalseWhileP0f += 1
+          ring.enqueue(f"cyc=$cyc%7d ip=$ip nig=$nig fl=$fl ei=$ei ia=$ia br=$br p0f=$p0f pdb=$pdb ilb=$ilb")
+          if (ring.size > ringCap) ring.dequeue()
+          if (ip) recognizedAt = cyc
+        }
+        cyc += 1
+      }
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.msp #= 0
+      dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff  // boot default: MASKED (mask=7)
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+      // Assert iplIn NOW, while still MASKED -- exactly the real repro's shape:
+      // pending well before the unmask instruction retires. correctly NOT
+      // recognized yet (masked); the interesting question is whether it gets
+      // recognized once the in-program `movew #0x2000,%sr` unmasks and the dbf
+      // loop immediately starts.
+      dut.intCtrl.logic.iplIn #= 5
+      val rightAfterAssert = scala.collection.mutable.ArrayBuffer[String]()
+      for (_ <- 0 until 80) {
+        cd.waitSampling()
+        rightAfterAssert += f"nig=${dut.rob.logic.normalIrqGate.toBoolean} " +
+          f"fl=${dut.rob.logic.flushing.toBoolean} ei=${dut.rob.logic.excIdle.toBoolean} " +
+          f"ia=${dut.rob.logic.iplActive.toBoolean} p0f=${dut.rob.logic.p0.first.toBoolean} " +
+          f"ip=${dut.rob.logic.interruptPending.toBoolean}"
+      }
+      System.err.println("[probe] 30 cycles right after iplIn asserted (still masked, before the in-program unmask):")
+      rightAfterAssert.foreach(System.err.println)
+      var waited = 0
+      val capCycles = 1500000
+      while (recognizedAt < 0 && waited < capCycles) { cd.waitSampling(2000); waited += 2000 }
+      if (recognizedAt < 0) {
+        System.err.println(s"[probe] interruptPending NEVER fired across $capCycles cycles " +
+          s"(nigTrueCount=$nigTrueCount nigFalseWhileP0f=$nigFalseWhileP0f). Last $ringCap samples:")
+        ring.foreach(System.err.println)
+      } else {
+        System.err.println(s"[probe] interruptPending first fired at cyc=$recognizedAt " +
+          s"(nigTrueCount=$nigTrueCount nigFalseWhileP0f=$nigFalseWhileP0f). Last $ringCap samples before it:")
+        ring.foreach(System.err.println)
+      }
+      assert(recognizedAt >= 0 && recognizedAt < capCycles,
+        s"interruptPending never recognized an always-pending unmasked level-5 interrupt within $capCycles cycles of a dbf loop")
+    }
+  }
+
   // NMI: level 7 is ALWAYS taken regardless of the mask (boot 7). Vector 31 @ 0x7C.
   test("lock-step IRQ: NMI (level 7) through mask 7", VerilatorTest) {
     val src =

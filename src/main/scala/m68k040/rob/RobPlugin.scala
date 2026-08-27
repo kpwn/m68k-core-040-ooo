@@ -950,6 +950,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // the exc unit is built; forward-declared so `flushing` can gate on it.
     val excSquash = Bool()
     val flushing   = flush.valid || doFlushReg || excSquash
+    flushing.simPublic() // 2026-08-27 boot-investigation debug tap, see interruptPending's
 
     // The head is a faulted µop ready to retire -> take the exception INSTEAD of a
     // normal commit (precise: the faulting instruction does not commit its result).
@@ -957,6 +958,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // NOT drive a normal int/flag commit. The exception FSM (exc) gates these so a
     // trigger fires once per event (excIdle).
     val excIdle = Bool()   // driven below from exc.active
+    excIdle.simPublic() // 2026-08-27 boot-investigation debug tap
     // Committed S (supervisor) bit — the SAME wire as the PrivilegeService `_supervisor`
     // pre-allocated in `setup` (see the class-level comment above); FORWARD-DECLARED
     // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
@@ -1762,6 +1764,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // The exception FSM's final redirect (vector target / RTE restored PC) is ORed
     // into it below (after the exc unit is built).
     val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
+    branchRedirect.simPublic() // 2026-08-27 boot-investigation debug tap
 
     // ── branchTrainMem retire-time read (task #129, area) ───────────────────────
     // A single readSync port, enabled on every retire0 (regardless of which consumer
@@ -2193,12 +2196,23 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
     val iplActive = (iplIn > maskI) || nmiPending
+    iplActive.simPublic()
     // Normal recognition: a first-µop non-faulted/non-RTE/non-sysOp head is present. When
     // STOPPED the ROB is empty (count==0, no head) and the IRQ must wake the halted core
     // with no head present, so OR in `stopped` as a recognition gate.
     val normalIrqGate = (count > 0) && p0.first && !faultedStore(h0) &&
                         !p0.isRte && !privViolation && !p0.sysOp &&
                         !preciseDrainBusyIn && !inhibitedLoadBusyIn
+    // 2026-08-27 boot-investigation debug taps (zero synth impact): localize why a
+    // genuinely pending+unmasked+enabled interrupt is not recognized while the ROB
+    // is retiring a tight self-looping branch (dbf), despite being recognized
+    // instantly once that loop is broken externally -- real-hardware-confirmed,
+    // see docs/BUG_calibration_word_misplaced_0d00.md Part 8 in the SoC repo.
+    normalIrqGate.simPublic()
+    p0.first.simPublic()
+    faultedStore(h0).simPublic()
+    preciseDrainBusyIn.simPublic()
+    inhibitedLoadBusyIn.simPublic()
     // A halted core (Task P4.5) recognizes no interrupt -- deliberately NOT
     // wakeable, matching the design doc's decision (unlike `stopped`, which IS
     // interrupt-wakeable).
