@@ -203,6 +203,22 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val dbg040_inhibitedLoadBusyIn = out Bool ()
   val dbg040_interruptPending   = out Bool ()
   val dbg040_headPc             = out UInt (32 bits)
+  // 2026-08-28 boot-investigation ILA taps (RAS occupancy / BTB+FTB training
+  // payload — see M68kCore.scala's dbg040 Area and
+  // docs/BUG_calibration_word_misplaced_0d00.md Part 24). Same "always
+  // emitted, no logic, SoC decides via ILA_ENABLE" convention as above.
+  val dbg040_rasPredValid       = out Bool ()
+  val dbg040_rasPredTarget      = out UInt (32 bits)
+  val dbg040_rasCount           = out UInt (7 bits)
+  val dbg040_btbPredHitComb     = out Bool ()
+  val dbg040_btbPredTargetComb  = out UInt (32 bits)
+  val dbg040_btbUpdValid        = out Bool ()
+  val dbg040_btbUpdPc           = out UInt (32 bits)
+  val dbg040_btbUpdTarget       = out UInt (32 bits)
+  val dbg040_ftbRspValid        = out Bool ()
+  val dbg040_ftbRspHit          = out Bool ()
+  val dbg040_ftbRspFramedOk     = out Bool ()
+  val dbg040_ftbRspTarget       = out UInt (32 bits)
 
   // ── Deferred wiring: everything that reads a plugin's `.logic` Handle ─────────────
   // Registered as a `spinal.core.fiber.Fiber.build` task -- the SAME generic async-fiber
@@ -365,6 +381,18 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     dbg040_inhibitedLoadBusyIn := socket.core.dbg040.inhibitedLoadBusyIn
     dbg040_interruptPending    := socket.core.dbg040.interruptPending
     dbg040_headPc              := socket.core.dbg040.headPc
+    dbg040_rasPredValid        := socket.core.dbg040.rasPredValid
+    dbg040_rasPredTarget       := socket.core.dbg040.rasPredTarget
+    dbg040_rasCount            := socket.core.dbg040.rasCount
+    dbg040_btbPredHitComb      := socket.core.dbg040.btbPredHitComb
+    dbg040_btbPredTargetComb   := socket.core.dbg040.btbPredTargetComb
+    dbg040_btbUpdValid         := socket.core.dbg040.btbUpdValid
+    dbg040_btbUpdPc            := socket.core.dbg040.btbUpdPc
+    dbg040_btbUpdTarget        := socket.core.dbg040.btbUpdTarget
+    dbg040_ftbRspValid         := socket.core.dbg040.ftbRspValid
+    dbg040_ftbRspHit           := socket.core.dbg040.ftbRspHit
+    dbg040_ftbRspFramedOk      := socket.core.dbg040.ftbRspFramedOk
+    dbg040_ftbRspTarget        := socket.core.dbg040.ftbRspTarget
 
     // ── dbg_axi and the SoC-fabric control group pass straight through ─────────────
     // Socket groups 4 and 6. They are DEBUG-CTRL-OWNED (spec section 10) and this task adds,

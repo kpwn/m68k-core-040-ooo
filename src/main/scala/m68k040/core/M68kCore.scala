@@ -42,6 +42,27 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
     val inhibitedLoadBusyIn = out Bool ()
     val interruptPending    = out Bool ()
     val headPc              = out UInt (32 bits)
+    // 2026-08-28 boot-investigation ILA taps (RAS occupancy / BTB+FTB
+    // training payload — see docs/BUG_calibration_word_misplaced_0d00.md
+    // Part 24): same structural pattern as the block above (a plain wiring
+    // Area built INSIDE M68kCore's own scope so the `host[...]` reads never
+    // cross a component boundary), added to directly observe, on real
+    // hardware, whether a RAS-resident value or a stale BTB/FTB training
+    // write is the source of the `0x40800284` cold-`bsrw` wrong-target bug
+    // (Parts 19/22/23: the wrong target is reproducibly the fall-through/
+    // return address of an earlier, unrelated, already-completed call).
+    val rasPredValid        = out Bool ()
+    val rasPredTarget       = out UInt (32 bits)
+    val rasCount            = out UInt (7 bits) // RAS_ENTRIES=16 -> cntBits=5; zero-extended
+    val btbPredHitComb      = out Bool ()
+    val btbPredTargetComb   = out UInt (32 bits)
+    val btbUpdValid         = out Bool ()
+    val btbUpdPc            = out UInt (32 bits)
+    val btbUpdTarget        = out UInt (32 bits)
+    val ftbRspValid         = out Bool ()
+    val ftbRspHit           = out Bool ()
+    val ftbRspFramedOk      = out Bool ()
+    val ftbRspTarget        = out UInt (32 bits)
     Fiber.build {
       val rob = host[m68k040.rob.RobPlugin]
       normalIrqGate      := rob.logic.normalIrqGate
@@ -54,6 +75,31 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
       inhibitedLoadBusyIn := rob.logic.inhibitedLoadBusyIn
       interruptPending    := rob.logic.interruptPending
       headPc              := rob.logic.p0.pc
+
+      val ras = host[m68k040.frontend.RasPlugin]
+      rasPredValid  := ras.logic.predValid
+      rasPredTarget := ras.logic.predTarget
+      rasCount      := ras.logic.count.resized
+
+      val btb = host[m68k040.frontend.BtbPlugin]
+      btbPredHitComb    := btb.logic.predHitComb
+      btbPredTargetComb := btb.logic.predTargetComb
+
+      // Shared BTB+FTB retire-time training bus (RobPlugin's own output,
+      // both BtbPlugin and FtbPlugin consume THIS SAME Flow — see
+      // BtbUpdateService). One tap covers both consumers' write inputs.
+      btbUpdValid  := rob.logic.btbUpdateFlow.valid
+      btbUpdPc     := rob.logic.btbUpdateFlow.payload.pc
+      btbUpdTarget := rob.logic.btbUpdateFlow.payload.target
+
+      // FTB's own registered lookup response (the C+1 token/ring-matched
+      // path FetchAlignPlugin applies — a SEPARATE speculative path from
+      // the BTB's per-instruction combinational lookup above).
+      val ftb = host[m68k040.frontend.FtbPlugin]
+      ftbRspValid    := ftb.logic.rsp.valid
+      ftbRspHit      := ftb.logic.rsp.payload.hit
+      ftbRspFramedOk := ftb.logic.rsp.payload.framedOk
+      ftbRspTarget   := ftb.logic.rsp.payload.target
     }
   } else null
 }
