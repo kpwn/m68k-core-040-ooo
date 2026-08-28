@@ -219,6 +219,18 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val dbg040_ftbRspHit          = out Bool ()
   val dbg040_ftbRspFramedOk     = out Bool ()
   val dbg040_ftbRspTarget       = out UInt (32 bits)
+  // 2026-08-28 boot-investigation ILA taps, round 3 (FTQ lookup-command
+  // window PC + registered FTQ head-entry fields — see M68kCore.scala's
+  // dbg040 Area and docs/BUG_calibration_word_misplaced_0d00.md Part 24's
+  // "Recommended next steps" #1/#2). Same convention as above.
+  val dbg040_ftbCmdValid        = out Bool ()
+  val dbg040_ftbCmdWindowPc     = out UInt (32 bits)
+  val dbg040_decodePc           = out UInt (32 bits)
+  val dbg040_ftqHeadBrPc        = out UInt (32 bits)
+  val dbg040_ftqHeadTarget      = out UInt (32 bits)
+  val dbg040_ftqHeadBrLen       = out UInt (4 bits)
+  val dbg040_ftqConfirm         = out Bool ()
+  val dbg040_ftqCount           = out UInt (6 bits)
 
   // ── Deferred wiring: everything that reads a plugin's `.logic` Handle ─────────────
   // Registered as a `spinal.core.fiber.Fiber.build` task -- the SAME generic async-fiber
@@ -393,6 +405,14 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     dbg040_ftbRspHit           := socket.core.dbg040.ftbRspHit
     dbg040_ftbRspFramedOk      := socket.core.dbg040.ftbRspFramedOk
     dbg040_ftbRspTarget        := socket.core.dbg040.ftbRspTarget
+    dbg040_ftbCmdValid         := socket.core.dbg040.ftbCmdValid
+    dbg040_ftbCmdWindowPc      := socket.core.dbg040.ftbCmdWindowPc
+    dbg040_decodePc            := socket.core.dbg040.decodePc
+    dbg040_ftqHeadBrPc         := socket.core.dbg040.ftqHeadBrPc
+    dbg040_ftqHeadTarget       := socket.core.dbg040.ftqHeadTarget
+    dbg040_ftqHeadBrLen        := socket.core.dbg040.ftqHeadBrLen
+    dbg040_ftqConfirm          := socket.core.dbg040.ftqConfirm
+    dbg040_ftqCount            := socket.core.dbg040.ftqCount
 
     // ── dbg_axi and the SoC-fabric control group pass straight through ─────────────
     // Socket groups 4 and 6. They are DEBUG-CTRL-OWNED (spec section 10) and this task adds,

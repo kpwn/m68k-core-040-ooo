@@ -63,6 +63,37 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
     val ftbRspHit           = out Bool ()
     val ftbRspFramedOk      = out Bool ()
     val ftbRspTarget        = out UInt (32 bits)
+    // 2026-08-28 boot-investigation ILA taps, round 3 (FTQ lookup-COMMAND
+    // side + registered FTQ head-entry fields — see
+    // docs/BUG_calibration_word_misplaced_0d00.md Part 24's own "Recommended
+    // next steps" #1/#2). Part 24 instrumented the FTB's registered
+    // lookup RESPONSE (ftbRsp*, above) but never the COMMAND side (the
+    // actual live query address, `FtbLookupCmd.windowPc`), so it could not
+    // confirm whether its one suggestive `ftbRspHit` coincidence
+    // (Capture 1, sample 52) was answering a query for the PC under
+    // investigation or an unrelated one. This round adds that command-side
+    // tap, plus the FTQ's own registered head-entry fields (`ftqHeadE`:
+    // brPc/brLen/target) and `ftqConfirm` itself — the exact decode-time
+    // gate `docs/BUG_calibration_word_misplaced_0d00.md`'s Part
+    // 24/coordinator hypothesis (a) names: `ftqConfirm` at
+    // `FetchAlignPlugin.scala:952` matches an FTQ head entry to ANY simple
+    // instruction of the same LENGTH as `ftqHeadE.brLen`, with no check that
+    // the current instruction is actually the same branch (or a branch at
+    // all) that trained that entry. Also taps `decodePc` itself (the
+    // frontend's own live fetch/decode PC) and `ftqCount` (occupancy), since
+    // Part 25's re-analysis showed the existing `dbg_ila_rob_pc_w` ROB-head
+    // probe is stale-artifact-prone (`payload.readAsync` with no
+    // occupancy gate) — `decodePc` is a genuinely live, ungated frontend
+    // signal that lets a fresh capture distinguish "the front-end's own PC"
+    // from "whatever the ROB happens to display".
+    val ftbCmdValid       = out Bool ()
+    val ftbCmdWindowPc    = out UInt (32 bits)
+    val decodePc          = out UInt (32 bits)
+    val ftqHeadBrPc       = out UInt (32 bits)
+    val ftqHeadTarget     = out UInt (32 bits)
+    val ftqHeadBrLen      = out UInt (4 bits)
+    val ftqConfirm        = out Bool ()
+    val ftqCount          = out UInt (6 bits) // ftqDepth=32 -> log2Up(33)=6
     Fiber.build {
       val rob = host[m68k040.rob.RobPlugin]
       normalIrqGate      := rob.logic.normalIrqGate
@@ -100,6 +131,23 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
       ftbRspHit      := ftb.logic.rsp.payload.hit
       ftbRspFramedOk := ftb.logic.rsp.payload.framedOk
       ftbRspTarget   := ftb.logic.rsp.payload.target
+
+      // Round 3 taps: the FTB lookup COMMAND (query address, at the
+      // provider's own registered `cmd` — the same directionless Flow
+      // FetchAlignPlugin drives via the FtbLookupService, so reading it
+      // here at the FtbPlugin host stays inside this component the same
+      // way the rsp taps above do) plus FetchAlignPlugin's own FTQ head/
+      // decode-PC state.
+      ftbCmdValid    := ftb.logic.cmd.valid
+      ftbCmdWindowPc := ftb.logic.cmd.payload.windowPc
+
+      val fap = host[m68k040.frontend.FetchAlignPlugin]
+      decodePc      := fap.logic.decodePc
+      ftqHeadBrPc   := fap.logic.ftqHeadE.brPc
+      ftqHeadTarget := fap.logic.ftqHeadE.target
+      ftqHeadBrLen  := fap.logic.ftqHeadE.brLen
+      ftqConfirm    := fap.logic.ftqConfirm
+      ftqCount      := fap.logic.ftqCount.resized
     }
   } else null
 }
