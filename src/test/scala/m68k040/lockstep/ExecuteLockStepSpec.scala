@@ -502,10 +502,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * were real regressions and were fixed, rather than weakened or hidden in this
     * harness; the prior four-case STOP/ITLB exception list was separately eliminated
     * by making each bespoke test seed architectural A7 as the shared harness does. */
+  // `cfg` defaults to `AxiMemModelConfig()` (== `L2Sweeps.zeroLatency`), matching
+  // every pre-existing call site's behavior unchanged. Callers that want a
+  // realistic-latency repro (task: real-hardware Part 19 bsrw divergence) pass one
+  // of the `L2Sweeps` presets explicitly -- see `runLockStep`'s own `cfg` parameter.
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long,
-                    bytes: Vector[Int]): m68k040.sim.AxiMemModel =
+                    bytes: Vector[Int],
+                    cfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig()): m68k040.sim.AxiMemModel =
     m68k040.sim.AxiMemModel.attachProgramIFetch(
-      axi, cd, loadAddr, bytes,
+      axi, cd, loadAddr, bytes, cfg = cfg,
       runAheadGuardWords = m68k040.sim.AxiMemModel.LockStepRunAheadGuardWords)
 
   /** Run one program through the full core and lock-step it.
@@ -598,7 +603,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // pulses) that observes the WHOLE run — registering it in `afterRun`
                   // would be too late, since commits/retirement have already finished
                   // by the time `afterRun` runs.
-                  duringRun: (FullCoreDut, ClockDomain) => Unit = (_, _) => ()): Unit = {
+                  duringRun: (FullCoreDut, ClockDomain) => Unit = (_, _) => (),
+                  // AXI memory-model timing for the I-fetch attach (D-side/walker
+                  // memories stay the existing `BehavioralMemAgent`, unaffected).
+                  // Default `AxiMemModelConfig()` (== `L2Sweeps.zeroLatency`) keeps
+                  // every existing call site byte-for-byte unchanged; pass one of the
+                  // `L2Sweeps` presets (e.g. `todaysCrossbar`, `l2DramSlow`,
+                  // `chaosDram`) to lock-step under realistic-vs-idealized AXI timing.
+                  cfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig()): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -748,7 +760,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       // Attach the program to the I-cache AXI.
-      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes, cfg)
 
       // Attach a behavioral read/write memory to the D-cache AXI (separate image,
       // zeroed; the programs store before they load, so no data preload needed).
@@ -3817,6 +3829,91 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".org 0x9490 ; moveq #5,%d5 ; rts ; " +      // 0x40800280 jsr's real target
       ".org 0x999e ; moveq #6,%d6 ; rts",          // 0x40800276 jsr's real target
       nInstr = 13)
+  }
+
+  // ── REALISTIC-LATENCY re-runs of the two REAL-ROM-bytes repros above
+  // (2026-08-28, same-session follow-up) ────────────────────────────────────────
+  //
+  // Both tests above PASS under the harness's DEFAULT `AxiMemModelConfig()` (==
+  // `L2Sweeps.zeroLatency`): zero DRAM/AXI latency, no backpressure, no crossbar
+  // arbitration -- nothing like the real SoC's I-fetch timing. Every negative
+  // result in this file's Part-19 investigation so far shares that same blind
+  // spot. Re-running the most direct repro (the exact-PCs test) under
+  // successively more realistic `L2Sweeps` presets to check whether the
+  // divergence is timing-sensitive in a way the idealized model can't expose.
+  //
+  // `todaysCrossbar` first (per `AxiMemModel.scala`'s own comment, the closest
+  // match to today's actual `macqd700-soc/rtl/soc/axi_xbar.v` behavior:
+  // dramCycles=20 + `idBusyBlock` + `crossbarSingleOutstanding`), then
+  // `l2DramSlow` (60-cycle DRAM, more aggressive), then `chaosDram`
+  // (`AxiRspMode.Chaos` -- randomized response timing) if still no repro.
+  test("lock-step: REAL ROM bytes -- JSR+BSRW exact PCs under todaysCrossbar latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-exact-pcs-todayscrossbar",
+      ".org 0 ; movel #0x9216,%a0 ; jmp 0x40800280 ; " +
+      ".org 0x280 ; .short 0x4ebb, 0x88f8 ; .short 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts",
+      nInstr = 9, cfg = m68k040.sim.L2Sweeps.todaysCrossbar)
+  }
+
+  test("lock-step: REAL ROM bytes -- JSR+BSRW exact PCs under l2DramSlow latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-exact-pcs-l2dramslow",
+      ".org 0 ; movel #0x9216,%a0 ; jmp 0x40800280 ; " +
+      ".org 0x280 ; .short 0x4ebb, 0x88f8 ; .short 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts",
+      nInstr = 9, cfg = m68k040.sim.L2Sweeps.l2DramSlow)
+  }
+
+  test("lock-step: REAL ROM bytes -- JSR+BSRW exact PCs under chaosDram latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-exact-pcs-chaosdram",
+      ".org 0 ; movel #0x9216,%a0 ; jmp 0x40800280 ; " +
+      ".org 0x280 ; .short 0x4ebb, 0x88f8 ; .short 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts",
+      nInstr = 9, cfg = m68k040.sim.L2Sweeps.chaosDram)
+  }
+
+  // Same latency sweep against the MORE-REALISTIC-prefix variant (extra real
+  // preceding JSR of the same brief-encoded shape) -- in case the divergence
+  // needs that extra decode-stream context AND realistic timing together.
+  test("lock-step: REAL ROM bytes -- extended real prefix under todaysCrossbar latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-extended-prefix-todayscrossbar",
+      ".org 0 ; jmp 0x4080026c ; " +
+      ".org 0x26c ; .short 0x43f8, 0x0308, 0x41f9, 0x0000, 0x972e, 0x4ebb, 0x88f8, " +
+      "0x41f9, 0x0000, 0x9216, 0x4ebb, 0x88f8, 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts ; " +
+      ".org 0x999e ; moveq #6,%d6 ; rts",
+      nInstr = 13, cfg = m68k040.sim.L2Sweeps.todaysCrossbar)
+  }
+
+  test("lock-step: REAL ROM bytes -- extended real prefix under l2DramSlow latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-extended-prefix-l2dramslow",
+      ".org 0 ; jmp 0x4080026c ; " +
+      ".org 0x26c ; .short 0x43f8, 0x0308, 0x41f9, 0x0000, 0x972e, 0x4ebb, 0x88f8, " +
+      "0x41f9, 0x0000, 0x9216, 0x4ebb, 0x88f8, 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts ; " +
+      ".org 0x999e ; moveq #6,%d6 ; rts",
+      nInstr = 13, cfg = m68k040.sim.L2Sweeps.l2DramSlow)
+  }
+
+  test("lock-step: REAL ROM bytes -- extended real prefix under chaosDram latency (Part 19 latency-sweep follow-up)", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-extended-prefix-chaosdram",
+      ".org 0 ; jmp 0x4080026c ; " +
+      ".org 0x26c ; .short 0x43f8, 0x0308, 0x41f9, 0x0000, 0x972e, 0x4ebb, 0x88f8, " +
+      "0x41f9, 0x0000, 0x9216, 0x4ebb, 0x88f8, 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +
+      ".org 0x9490 ; moveq #5,%d5 ; rts ; " +
+      ".org 0x999e ; moveq #6,%d6 ; rts",
+      nInstr = 13, cfg = m68k040.sim.L2Sweeps.chaosDram)
   }
 
   // ── RTD (RTS with a stack-deallocation displacement) ───────────────────────
