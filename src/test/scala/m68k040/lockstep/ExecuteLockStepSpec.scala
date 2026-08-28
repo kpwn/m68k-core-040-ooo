@@ -3734,6 +3734,91 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 5)
   }
 
+  // ── real-ROM-bytes repro (Part 19 follow-up, 2026-08-28): the EXACT byte-for-byte
+  // ROM encoding of the fault-site JSR+BSRW pair at their REAL absolute PCs, per the
+  // task recommendation "build a directed sim repro using the ACTUAL real ROM bytes
+  // around this fault site, not a synthetic minimal instruction sequence". Two
+  // corrections vs. the FULL-FORMAT test immediately above and the shared-FTB-window
+  // tests earlier in this file (both from the ea957d9 investigation, which ruled out
+  // only a SYNTHETIC version of this shape):
+  //
+  //   1. The real ROM instruction at 0x40800280 (`objdump`-disassembled fresh from
+  //      `files/420dbff3.rom` in the SoC repo) is `4ebb 88f8` — a BRIEF-format
+  //      (d8,PC,Xn) extension word (bit8=0, disp8=0xF8=-8), NOT the full-format the
+  //      earlier test's comment assumed the real site would need. (That assumption
+  //      was a paraphrase error working from the disassembler's own resolved-base
+  //      notation `%pc@(0x4080027a,%a0:l)`, not from the actual extension word bits —
+  //      corrected here by decoding the real word directly.) Brief- and full-format
+  //      extension words are DIFFERENT predecode/µcode paths in this core (see task
+  //      #187's mode-6 JMP/JSR framing fix), so the real site's exact encoding was
+  //      never actually isolated by the prior tests.
+  //   2. This test loads the program at the REAL absolute addresses (0x40800280,
+  //      0x40800284, and the two call targets), not small offsets from
+  //      `ProgramAssembler.DefaultLoadAddress` (which happens to equal the ROM's own
+  //      0x40800000 base, but the earlier synthetic tests still used different
+  //      low-order PC bits than the real site) — in case BTB/FTB index/tag hashing on
+  //      the literal PC value itself is part of the picture.
+  //
+  // Register context (a0=0x00009216 feeding the JSR's own indexed EA) is REAL,
+  // hardware-verified: captured via a MAME `macqd700` breakpoint dump at PC=0x40800280
+  // against the same `files/420dbff3.rom` (`tools/mame_pc_sp_log.py`,
+  // `A0=00009216 ... PC=40800280`), and independently confirmed as compile-time
+  // constant since it is set immediately before by `lea 0x9216,%a0` (`41f9 0000 9216`,
+  // absolute-long addressing — not data-dependent on any prior runtime state). MAME's
+  // own architecturally-correct model reaches PC=0x408010f0 correctly on this exact
+  // ROM (confirmed via a second breakpoint at 0x408010f0, `STK0=40800288` proving the
+  // return address is the bsrw's own fall-through) — this is a real, hardware-genuine
+  // JSR+BSRW pair sharing one 8-byte FTB window that a real 68k reference model
+  // executes correctly, exactly the shape hardware-captured as diverging on cpu040.
+  //
+  // The actual callees at 0x40809490 (the JSR's real target) and 0x408010f0 (the
+  // BSRW's real, architecturally-correct target) are NOT replayed verbatim beyond
+  // their real entry point: both real subroutines dive into further real ROM code
+  // that unconditionally executes a Line-A ("unimplemented instruction", vector 10)
+  // opcode within a handful of instructions (`0x408010f0`'s very first instruction is
+  // itself `bsrw 0x40805218`, whose every code path hits `a71e`/`a746`), which would
+  // need this test to also stand up a working exception-vector table and trap handler
+  // to go any deeper — out of scope for isolating THIS bug. A synthetic
+  // `moveq`+`rts` marker is planted at each real target's real address instead, so the
+  // test can assert exactly what matters: does fetch/decode/rename/commit actually
+  // reach 0x408010f0 (retiring its marker), or does it — as on real silicon — end up
+  // somewhere else and never retire it.
+  test("lock-step: REAL ROM bytes (files/420dbff3.rom) -- JSR+BSRW pair at their exact real absolute PCs, Part 19 repro", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-exact-pcs",
+      ".org 0 ; movel #0x9216,%a0 ; jmp 0x40800280 ; " +
+      // real ROM bytes @ 0x40800280: jsr %pc@(0x4080027a,%a0:l) (brief PC,Xn-indexed)
+      // real ROM bytes @ 0x40800284: bsrw 0x408010f0
+      ".org 0x280 ; .short 0x4ebb, 0x88f8 ; .short 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +   // BSRW's real, architecturally-correct target
+      ".org 0x9490 ; moveq #5,%d5 ; rts",       // JSR's real target
+      nInstr = 9)
+  }
+
+  // Same idea, with more REAL preceding ROM context: the 24 bytes immediately before
+  // the JSR+BSRW pair (0x4080026c-0x40800283 — `lea 0x308,%a1 ; lea 0x972e,%a0 ; jsr
+  // %pc@(0x40800270,%a0:l) ; lea 0x9216,%a0`), also byte-exact from `files/420dbff3.rom`,
+  // so decode/the FTB see a REALISTIC preceding instruction/branch stream (an extra
+  // real indexed JSR of the exact same brief-encoded shape) instead of a bare
+  // 2-instruction synthetic prologue. Deliberately starts at 0x4080026c, not
+  // 0x40800268: the real instruction immediately before that (`moveb %sp@+,0x1efc`) is
+  // a genuine memory-to-memory MOVE, a DIFFERENT known, already-documented µcode gap
+  // (see this file's `pcOnly` doc comment above — `MI_MOVE_SRC_ENTRY`/`MI_MOVE_DST_ENTRY`
+  // only support EA<->register, not EA<->EA) that would confound this test's result
+  // with an unrelated bug.
+  test("lock-step: REAL ROM bytes -- extended real prefix (0x4080026c-0x40800284) into the JSR+BSRW pair, Part 19 repro", VerilatorTest) {
+    runLockStep("real-rom-jsr-bsrw-extended-prefix",
+      ".org 0 ; jmp 0x4080026c ; " +
+      // real ROM bytes @ 0x4080026c..0x40800287, verbatim (see comment above)
+      ".org 0x26c ; .short 0x43f8, 0x0308, 0x41f9, 0x0000, 0x972e, 0x4ebb, 0x88f8, " +
+      "0x41f9, 0x0000, 0x9216, 0x4ebb, 0x88f8, 0x6100, 0x0e6a ; " +
+      "moveq #0x77,%d3 ; stop2: bra stop2 ; " +
+      ".org 0x10f0 ; moveq #9,%d1 ; rts ; " +      // bsrw's real, architecturally-correct target
+      ".org 0x9490 ; moveq #5,%d5 ; rts ; " +      // 0x40800280 jsr's real target
+      ".org 0x999e ; moveq #6,%d6 ; rts",          // 0x40800276 jsr's real target
+      nInstr = 13)
+  }
+
   // ── RTD (RTS with a stack-deallocation displacement) ───────────────────────
   test("lock-step: bsr ... rtd #4 (pop PC + dealloc the pushed arg)", VerilatorTest) {
     // The caller pushes a 4-byte arg, then BSRs. The callee returns with `rtd #4`,
