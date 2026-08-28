@@ -3666,6 +3666,74 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 6)
   }
 
+  // ── real-hardware ILA bug repro (Part 19, 2026-08-28): a call and a following
+  // word-form bsr SHARE the SAME 8-byte-aligned fetch window (the FTB/FTQ's window
+  // granularity, `Ftb.scala`'s idxLo=3), and the call's callee RTS-returns directly
+  // into the bsr's own bytes. `move.l #sub,%a0` (6 bytes) after `moveq #1,%d0`
+  // (2 bytes) lands `jsr (%a0)` exactly on an 8-byte boundary (word-offset 0 of its
+  // window); the following `bsr.w target` (4 bytes) occupies word-offset 1-2 of the
+  // SAME window. The JSR retires (training the FTB's one-entry-per-window slot with
+  // ITS OWN word-offset/target/brType) long before `sub`'s RTS returns to word-offset
+  // 1 -- exactly the "call, then immediately-following bsr in the same window, callee
+  // returns right into it" shape hardware-captured at cpu040 PC 0x40800284
+  // (`docs/BUG_calibration_word_misplaced_0d00.md` Part 19 in the SoC repo): a JSR at
+  // 0x40800280 (word-offset 0 of window 0x40800280) trains the window, and the
+  // following `bsrw 0x408010f0` at 0x40800284 (word-offset 2) never reached its own
+  // target on real silicon. This directed test asks the identical structural
+  // question in SpinalSim: does the FTB's single-entry-per-window training
+  // (`Ftb.scala`), combined with the RTS-predicted/mispredict-redirected return, ever
+  // let decode confirm the BSR against the CALL's stale window entry (`ftqConfirm` in
+  // `FetchAlignPlugin.scala`) instead of its own architectural pc+2+disp target? If
+  // the RTL is correct, this is architecturally indistinguishable from
+  // "jsr (An) ... rts" above plus an extra bsr and must lock-step Musashi exactly.
+  test("lock-step: jsr+bsr share one FTB window, RTS returns straight into the bsr — Part 19 ILA-bug repro", VerilatorTest) {
+    // moveq#1,d0 (2B) ; move.l #sub,a0 (6B) => 8B prefix, so jsr(a0) starts a fresh
+    // 8-byte-aligned FTB window at word-offset 0. bsr.w target (4B) follows immediately
+    // at word-offset 1-2 of THAT SAME window. jsr's retPC == bsr.w's own address.
+    // Executed to sentinel: moveq#1, move.l#sub a0, jsr(a0), [sub: moveq5,6,7, rts],
+    // bsr.w(now executed for the first time, returned into), moveq#9 = 9.
+    runLockStep("jsr-bsr-shared-ftb-window",
+      "moveq #1,%d0 ; move.l #sub,%a0 ; jsr (%a0) ; bsr.w target ; .stop: bra .stop ; " +
+      "sub: moveq #5,%d5 ; moveq #6,%d6 ; moveq #7,%d7 ; rts ; " +
+      "target: moveq #9,%d1 ; .stop2: bra .stop2",
+      nInstr = 9)
+  }
+
+  // Same idea, but with the CALL at exactly the real-hardware word offsets: `jsr
+  // 0(%a0)` ((d16,An), disp16=0) is 4 bytes (2 words), same as the real ROM's
+  // `jsr %pc@(0x4080027a,%a0:l)` at 0x40800280 -- so the following `bsr.w target`
+  // lands at word-offset 2 and its own length (2 words) makes `brWordOff+brLen == 4`,
+  // the EXACT boundary of `Ftb.scala`'s `qEnd <= 4` in-window-framing check (both the
+  // JSR's own training write -- `installable`'s `uEnd <= U(4,5 bits)` -- and any
+  // later lookup's `qFramed`). A boundary/off-by-one in either check would show up
+  // here even if the interior-offset case above (word-offset 1) does not.
+  test("lock-step: jsr(d16,An)+bsr share one FTB window at the exact qEnd==4 boundary", VerilatorTest) {
+    runLockStep("jsr-bsr-shared-ftb-window-boundary",
+      "moveq #1,%d0 ; move.l #sub,%a0 ; jsr 0(%a0) ; bsr.w target ; .stop: bra .stop ; " +
+      "sub: moveq #5,%d5 ; moveq #6,%d6 ; moveq #7,%d7 ; rts ; " +
+      "target: moveq #9,%d1 ; .stop2: bra .stop2",
+      nInstr = 9)
+  }
+
+  // ── FULL-FORMAT indexed control EA for JSR (isolated correctness) ────────────
+  // The real ROM's Part-19 divergence instruction is preceded by `jsr
+  // %pc@(0x4080027a,%a0:l)` -- a (d8,PC,Xn) EA whose base displacement (0x4080027a-
+  // scale, i.e. far larger than +-127) forces the 68020+ FULL-FORMAT extension word
+  // (bit8=1, an extra base-displacement word/longword beyond the brief format's
+  // single ext word), not the brief form every OTHER jsr/bsr test above uses. task
+  // #187 (cited in PredecodeWord.scala ~line 770) already fixed one predecode-
+  // framing bug specific to mode-6 JMP/JSR; this checks whether the FULL-FORMAT
+  // sub-case (as opposed to brief) is itself correct end-to-end (predecode length,
+  // the assembler's folded-PC-relative imm, and BranchEuPlugin's indTarget add) in
+  // isolation, before combining it with the window-sharing shape above. GNU as
+  // auto-promotes to full-format because `tgt` is >127 bytes from the ext word.
+  test("lock-step: jsr (d8,PC,Xn) FULL-FORMAT (forced by a >127-byte displacement) ... rts", VerilatorTest) {
+    runLockStep("jsr-pc-indexed-full-format",
+      "moveq #1,%d0 ; move.l #0,%a0 ; jsr tgt(%pc,%a0.l) ; moveq #7,%d2 ; .stop: bra .stop ; " +
+      ".space 0x1000 ; tgt: moveq #3,%d1 ; rts",
+      nInstr = 5)
+  }
+
   // ── RTD (RTS with a stack-deallocation displacement) ───────────────────────
   test("lock-step: bsr ... rtd #4 (pop PC + dealloc the pushed arg)", VerilatorTest) {
     // The caller pushes a 4-byte arg, then BSRs. The callee returns with `rtd #4`,
