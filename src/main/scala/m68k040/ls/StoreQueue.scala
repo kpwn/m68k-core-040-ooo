@@ -71,9 +71,14 @@ case class SqFwdRsp() extends Bundle {
   *  - commit : ROB retired this robId -> mark the matching entry committed.
   *  - drain  : committed halves stream in program order into the L1D. COPYBACK
   *             hits may be accepted ahead; an entry pops only on its final ack.
-  *  - flush  : mispredict -> roll the tail back to the youngest COMMITTED entry
-  *             (speculative entries are squashed and never drain -> memory
-  *             untouched). Same pointer discipline as the ROB/freelist.
+  *  - flush  : mispredict/exception/debug redirect -> roll the tail back to the
+  *             youngest entry that must survive: every COMMITTED entry, PLUS the
+  *             head entry if it is a precise drain already ACCEPTED by DcachePlugin
+  *             (its physical bus write already left the CPU and cannot be
+  *             un-issued -- see `headDrainInFlight` below, BUG_calibration_word_
+  *             misplaced_0d00.md Part 37). Every other (truly still-speculative,
+  *             never-launched) entry is squashed and never drains -> memory
+  *             untouched. Same pointer discipline as the ROB/freelist.
   *  - fwd    : load forward check. Among entries OLDER than query.robId (ROB
   *             circular order), address-overlapping: full same-size overlap ->
   *             hit+data (youngest such); partial/ambiguous -> stall.
@@ -956,6 +961,46 @@ class StoreQueue(depth: Int = 8) extends Component {
 
   // ---- flush: squash speculative (uncommitted) entries. Roll tail back to just
   // past the youngest COMMITTED entry. Walk from head over committed entries. ----
+  //
+  // Real-hardware hang (BUG_calibration_word_misplaced_0d00.md Part 37, task
+  // following Part 36's S_DRAIN/sqDrained investigation): a SECOND, DIFFERENT
+  // trigger for the exact same "phantom entry never drains -> empty stays false
+  // forever" failure mode the `popsHead` fix below already closed one instance of.
+  //
+  // `committed(i)` alone is NOT a complete "must not squash" test. This file's own
+  // §4.1 doc comments elsewhere argue a flush can never race an in-flight PRECISE
+  // drain because a branch-mispredict/exception flush can only originate from a
+  // RETIRING head, and an uncommitted precise entry blocks retire of everything at
+  // or behind it — true for `branchRedirect`/`exc.redirectValid`, but
+  // `RobPlugin.doFlushReg` (the source `sqFlush`/`io.flush` is wired from,
+  // FullCoreSynth.scala) ALSO fires from `debugRecoverEnter`/`debugPcApply` — a
+  // JTAG-driven halt/step/PC-apply — neither of which is retire-gated the same way.
+  // Those CAN land on any cycle, including mid-drain of a precise (split) store
+  // whose slot-A half has ALREADY been ACCEPTED by DcachePlugin (`io.drain.fire`
+  // already fired) — an irrevocable, already-in-flight physical bus write. Squashing
+  // `valids(head)` at that moment does not (cannot) cancel that write; it only
+  // orphans the SQ's own bookkeeping: the eventual real drainAck for that already-
+  // accepted half does not pop the entry (validBs(head)/ackPhaseB drive it into the
+  // "advance to slot B" arm instead, since neither was told the entry died), so
+  // `head`/`sendPtr`/`ackPhaseB` never resolve — the ring is permanently wedged on
+  // that now-dead index, and NOTHING (not even a brand-new, ordinary committed
+  // store) can ever drain again, matching the real-hardware `sqDrained`-stuck-false
+  // symptom exactly. Directed repro: `StoreQueueSpec`'s "BUG_calibration_word Part
+  // 37" test.
+  //
+  // Fix: extend "must keep" with "the head entry has an outstanding drain already
+  // ACCEPTED by DcachePlugin" — `drainBusy` (an accepted half awaiting its ack) OR
+  // `ackPhaseB` (slot A already acked, slot B not yet presented/acked) — which by
+  // construction can only ever be true of the CURRENT head (a precise drain's
+  // `noAccepted`/`sendAtHead` launch gates make it the sole occupant of the drain
+  // pipe; a non-precise/pipelined send can only start once ALREADY committed, so it
+  // is always covered by the plain `committed(i)` term and never needs this). This
+  // lets an in-flight precise drain that a non-retire-gated flush caught mid-way
+  // run to its natural completion — its physical effect already left the CPU, so
+  // there is nothing left to squash; the SQ's own ring bookkeeping (`head`/
+  // `sendPtr`/`ackPhaseB`) simply needs to be allowed to unwind normally instead of
+  // being abandoned mid-sequence.
+  val headDrainInFlight = valids(head) && !committed(head) && (drainBusy || ackPhaseB)
   when(io.flush) {
     // A drainAck this same cycle pops the head entry (single-slot, or slot B of a
     // split). That popped entry must NOT be counted as kept — otherwise the flush's
@@ -964,8 +1009,10 @@ class StoreQueue(depth: Int = 8) extends Component {
     // commit-side exception FSM hangs at E_DRAIN). Exclude the popped head here.
     val popsHead = terminalAck
     val keep = Vec(Bool(), depth)
-    for (i <- 0 until depth)
-      keep(i) := valids(i) && committed(i) && !(popsHead && (U(i, log2Up(depth) bits) === head))
+    for (i <- 0 until depth) {
+      val isHead = U(i, log2Up(depth) bits) === head
+      keep(i) := valids(i) && (committed(i) || (isHead && headDrainInFlight)) && !(popsHead && isHead)
+    }
     for (i <- 0 until depth) when(!keep(i)) { valids(i) := False }
     // new tail = head' + (number of committed-live entries), where head' accounts for
     // the coincident pop (head advances by 1 if popsHead). Committed entries are the

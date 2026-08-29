@@ -766,6 +766,128 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
+  // ── CPUSHL/S_DRAIN real-hardware hang investigation (BUG_calibration_word_
+  // misplaced_0d00.md Part 37) ──────────────────────────────────────────────
+  // Part 36 narrowed a genuine, permanent real-hardware boot stall at ROM PC
+  // 0x40887126 (a CPUSHL/dbf cache-flush loop) to ExceptionUnit's S_DRAIN state's
+  // `sqDrained` (== StoreQueue `io.empty`) never becoming true, and flagged this
+  // exact file's OWN "phantom entry never drains" bug class (the `popsHead` fix
+  // just above, for a DIFFERENT race) as the most likely explanation, asking
+  // whether EVERY flush source is handled uniformly -- the same review that found
+  // the RAS checkpoint gap (`683355d`) needed BOTH `RedirectService.doFlush` and
+  // `FetchAlignPlugin.ftqMismatch` as restore triggers, because only one of them
+  // is retire-gated.
+  //
+  // The `keep()` computation above squashes ANY uncommitted entry unconditionally,
+  // reasoning (per this file's own §4.1 doc comments elsewhere) that a flush can
+  // never race an in-flight PRECISE drain because branch-mispredict/exception
+  // flushes can only originate from a RETIRING head, and an uncommitted precise
+  // entry blocks retire of everything at/behind it. That argument is airtight for
+  // `branchRedirect`/`exc.redirectValid` -- but `RobPlugin`'s `doFlushReg` ALSO
+  // fires from `debugRecoverEnter`/`debugPcApply` (RobPlugin.scala:2444), neither
+  // of which is retire-gated the same way (a JTAG-driven halt/step/PC-apply can
+  // land on ANY cycle, including mid-drain of a precise split store that has
+  // ALREADY had its slot-A half ACCEPTED by DcachePlugin -- an irrevocable,
+  // already-in-flight physical bus write that cannot be un-issued).
+  //
+  // This test reproduces exactly that race directly against StoreQueue (no debug/
+  // ROB plumbing needed -- `io.flush` is the same signal regardless of source):
+  // launch a precise SPLIT store's drain, let slot A's half be ACCEPTED
+  // (`io.drain.fire`) but NOT yet acked, then flush. The flush squashes
+  // `valids(head)` (uncommitted), but nothing else advances `head`/`sendPtr` or
+  // resets `ackPhaseB`/`acceptedHalves` -- those only change on a REAL drainAck.
+  // When DcachePlugin's already-in-flight slot-A write eventually acks (it WILL --
+  // the transaction was already accepted, it is not cancellable), the entry does
+  // NOT pop (validBs(head) is still true, ackPhaseB was false -> the "slot A acked,
+  // advance to slot B" arm fires instead), leaving `ackPhaseB` stuck True and
+  // `head`/`sendPtr` PERMANENTLY parked on the now-dead, squashed index: every
+  // future `sendPreciseReady`/`sendCommitted`/`sendSerialReady` check requires
+  // `sendAtHead` (`sendPtr === head`) AND per-index state at that SAME dead index
+  // (`valids(head)`/`precises(sendPtr)`, both now False/stale) -- so NOTHING, not
+  // even a brand-new committed fast WRITETHROUGH store allocated afterward, can
+  // ever drain again. `io.empty` reads true in the narrow window right after the
+  // orphaned ack resolves (valids all clear, drainBusy clear) -- masking the wedge
+  // -- until the NEXT store allocates and can never leave, at which point
+  // `io.empty` (== `sqDrained`) is stuck false FOREVER, exactly matching the real-
+  // hardware S_DRAIN hang.
+  test("BUG_calibration_word Part 37: a flush racing an in-flight (accepted, unacked) " +
+       "precise split-store drain half must NOT wedge the ring -- the in-flight entry " +
+       "is kept and allowed to complete, same class as the popsHead fix above but a " +
+       "DIFFERENT trigger", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      val a = dut.io.alloc
+      a.valid #= true
+      a.payload.robId #= 21
+      a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
+      a.payload.data #= 0; a.payload.size #= Size.LONG
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true
+      a.payload.validB #= true
+      a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
+      a.payload.nbytesB #= 2
+      a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.supervisor #= false
+      a.payload.precise #= true
+      cd.waitSampling()
+      a.valid #= false
+
+      dut.io.robHeadIn #= 21
+      dut.io.robHeadValidIn #= true
+      // slot A is presented and ACCEPTED (io.drain.ready is tied true by initDut) --
+      // an irrevocable bus write from DcachePlugin's point of view.
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      cd.waitSampling()   // drainIssue registers: acceptedHalves=1, sendPhaseB=true
+      sleep(1)
+      assert(dut.drainBusy.toBoolean, "slot A's accepted half is outstanding (unacked)")
+
+      // A debug-recover-class flush (or any other non-retire-gated redirect source)
+      // lands HERE -- before slot A's own drainAck arrives.
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false
+      sleep(1)
+      // THE FIX: the in-flight entry must be KEPT (not squashed) -- its slot-A write
+      // already left the CPU and cannot be un-issued; the ring must be allowed to
+      // unwind normally instead of being abandoned mid-sequence.
+      assert(dut.valids(0).toBoolean,
+        "an in-flight (already-accepted) precise drain half must survive a flush -- " +
+        "squashing it here is exactly what wedges the ring permanently")
+
+      // Slot A's already-in-flight ack now arrives -- normal "advance to slot B" path.
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(!dut.io.empty.toBoolean, "slot B has not drained yet -- queue is not empty")
+
+      // Slot B is presented and acked normally -- the entry pops via the ordinary
+      // terminal-ack path, exactly like an unflushed precise split drain.
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next")
+      cd.waitSampling()
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "both slots drained -- queue empty, entry popped cleanly")
+
+      // Now a brand-new, ordinary committed fast store allocates and drains normally --
+      // proving `head`/`sendPtr` were NOT left wedged on a dead index.
+      forkDrainAck(dut, cd)
+      alloc(dut, cd, robId = 22, paddr = 0x3000, data = 0x33333333L, Size.LONG)
+      commit(dut, cd, robId = 22)
+      cd.waitSampling(10)
+      sleep(1)
+      assert(dut.io.empty.toBoolean,
+        "a new committed store must drain normally after the race -- the ring must " +
+        "not be permanently wedged (this is exactly the real-hardware S_DRAIN/" +
+        "sqDrained-stuck-forever hang)")
+      cd.waitSampling(2)
+    }
+  }
+
   test("P2.4 (Step 5 regression): a flushed, never-drained precise entry does not linger (keep logic unchanged)", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)
