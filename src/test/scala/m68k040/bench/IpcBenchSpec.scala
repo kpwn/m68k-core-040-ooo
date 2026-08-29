@@ -225,6 +225,12 @@ class IpcBenchSpec extends AnyFunSuite {
       rasP.logic.popValid      := fa.logic.rasPopValid
       fa.logic.rasPredValid    := rasP.logic.predValid
       fa.logic.rasPredTarget   := rasP.logic.predTarget
+      // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
+      // see Ras.scala's doc comment for the design).
+      val rasCheckpointRestore = doFlush || fa.logic.ftqMismatch
+      rasP.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
+                                       !rasCheckpointRestore
+      rasP.logic.checkpointRestore := rasCheckpointRestore
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at

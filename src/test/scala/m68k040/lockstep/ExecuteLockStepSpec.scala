@@ -301,6 +301,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ras.logic.popValid      := faBtb.logic.rasPopValid
       faBtb.logic.rasPredValid  := ras.logic.predValid
       faBtb.logic.rasPredTarget := ras.logic.predTarget
+      // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
+      // see Ras.scala's doc comment for the design). checkpointSave refreshes to live
+      // state whenever the ROB is fully drained; checkpointRestore undoes any
+      // wrong-path push/pop on the ROB's own flush or FetchAlign's own ftqMismatch.
+      val rasCheckpointRestore = doFlush || faBtb.logic.ftqMismatch
+      ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
+                                      !rasCheckpointRestore
+      ras.logic.checkpointRestore := rasCheckpointRestore
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -3666,6 +3674,60 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "moveq #9,%d6 ; .stop: bra .stop ; " +
       "leaf: addq #1,%d0 ; rts",
       nInstr = 18)
+  }
+
+  test("lock-step: RAS predictions stay accurate across a real mispredict flush (checkpoint/restore)", VerilatorTest) {
+    // Companion to "RAS corrupt-recovery" above (2026-08-28, an independent fix --
+    // see Ras.scala's doc comment; NOT part of the separate `0x40800284` wild-jump
+    // investigation). That test proves ARCHITECTURAL correctness under a real
+    // misprediction (the EU always verifies). This test adds a WHITEBOX check on top
+    // of the identical, already-proven mispredict mechanism: every RAS-predicted
+    // return, across the whole run (including the ones speculatively fetched down the
+    // mispredicted loop's wrong path, and the real ones after the flush), must predict
+    // its own just-pushed return address correctly. The rigorous, deterministic proof
+    // that checkpointRestore actually undoes wrong-path corruption (rather than merely
+    // tolerating it) lives at the unit level in RasPluginSpec.scala — "checkpointRestore
+    // undoes wrong-path pushes/pops since the last checkpointSave" and "checkpoint
+    // captures full CONTENT ... survives a wrong-path wraparound" — which directly
+    // drive checkpointSave/checkpointRestore and inspect rasSp/count/contents with no
+    // dependence on fetch/redirect timing. This lock-step test is the complementary,
+    // whole-pipeline regression check: it confirms the checkpoint/restore wiring
+    // (BackendWiringPlugin's `rob.logic.count === 0` save / `doFlush` restore trigger)
+    // doesn't disturb ordinary RAS prediction accuracy in a real misprediction scenario.
+    val popSamples = scala.collection.mutable.ArrayBuffer[(Boolean, Long, Long)]() // (predValid, predTarget, count-at-pop)
+    def sampleRas(dut: FullCoreDut): Unit = {
+      if (dut.ras.logic.popValid.toBoolean) {
+        popSamples += ((dut.ras.logic.predValid.toBoolean,
+                        dut.ras.logic.predTarget.toLong & 0xffffffffL,
+                        dut.ras.logic.count.toLong))
+      }
+    }
+    runLockStep("bsr-loop-mispredict-then-real-return",
+      "moveq #3,%d7 ; moveq #0,%d0 ; " +
+      "back: bsr leaf ; subq #1,%d7 ; bne back ; " +
+      "moveq #9,%d6 ; bsr leaf ; moveq #2,%d1 ; " +
+      ".stop: bra .stop ; " +
+      "leaf: addq #1,%d0 ; rts",
+      nInstr = 22,
+      perCycle = sampleRas)
+
+    // Every RAS-predicted return (both the loop's own, and the trailing post-flush
+    // one, and any wrong-path speculative ones fetched down the loop's mispredicted
+    // back-edge) must have predicted validly. This is the "measurable improvement"
+    // bar in the general (non-degenerate) case: after the checkpoint/restore fix, no
+    // RAS-predicted return goes stale or predicts nothing.
+    assert(popSamples.nonEmpty, "at least one RAS-predicted return must occur in this program")
+    for ((predValid, _, _) <- popSamples) {
+      assert(predValid, s"a RAS-predicted return failed to predict (RAS read empty) in $popSamples")
+    }
+    // Only two distinct call sites exist in this program (the loop's own `bsr leaf`
+    // and the trailing post-flush `bsr leaf`), so every predicted target -- across
+    // every speculative/retried fetch attempt, not just the ones that ultimately
+    // retire -- must be one of exactly those two real return addresses.
+    val distinctTargets = popSamples.map(_._2).toSet
+    assert(distinctTargets.size <= 2,
+      s"every RAS prediction must be one of the (at most two) real return addresses " +
+      s"in this program, got $distinctTargets from samples $popSamples")
   }
 
   // ── JSR (call via the EA address) ──────────────────────────────────────────

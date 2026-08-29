@@ -209,6 +209,12 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     ras.logic.popValid      := faBtb.logic.rasPopValid
     faBtb.logic.rasPredValid  := ras.logic.predValid
     faBtb.logic.rasPredTarget := ras.logic.predTarget
+    // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
+    // see Ras.scala's doc comment for the design).
+    val rasCheckpointRestore = doFlush || faBtb.logic.ftqMismatch
+    ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
+                                    !rasCheckpointRestore
+    ras.logic.checkpointRestore := rasCheckpointRestore
 
     val gsh   = host[m68k040.frontend.GsharePlugin]
     gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll

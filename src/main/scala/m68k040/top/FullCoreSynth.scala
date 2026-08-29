@@ -144,6 +144,21 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     ras.logic.popValid      := fa.logic.rasPopValid
     fa.logic.rasPredValid   := ras.logic.predValid
     fa.logic.rasPredTarget  := ras.logic.predTarget
+    // Rollback-on-flush (see Ras.scala's doc comment for the full design/soundness
+    // argument -- independent fix, NOT part of the `0x40800284` wild-jump
+    // investigation that surfaced this gap as a side effect). `checkpointSave`
+    // refreshes the checkpoint to the live RAS state every cycle the ROB is fully
+    // drained (`rob.logic.count === 0`): at that instant nothing is outstanding, so
+    // the live state is architecturally correct by construction (mod a few cycles of
+    // fetch->dispatch pipeline latency). `checkpointRestore` undoes any wrong-path
+    // push/pop since that save on either flush-class event that can follow a bad
+    // speculative excursion: the ROB's own commit-time correction (`doFlush`, already
+    // in scope above) and FetchAlign's own `ftqMismatch` re-framing recovery (a
+    // frontend-only correction that never touches the ROB, so it needs its own term).
+    val rasCheckpointRestore = doFlush || fa.logic.ftqMismatch
+    ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
+                                    !rasCheckpointRestore
+    ras.logic.checkpointRestore := rasCheckpointRestore
     // ── gshare direction predictor (slice 3) ────────────────────────────────────
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
     // + brType into FetchAlign so it can form condBtbHit and source the conditional
