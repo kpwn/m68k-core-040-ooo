@@ -25,6 +25,10 @@ case class RenamedUop() extends Bundle {
   // Stack-pop postincrement folded into the trailing ibranch (RTS=4/RTR=6): when the
   // ibranch has an int dst, the branch EU writes dst := psrcB + anInc. Threaded.
   val anInc        = UInt(3 bits)
+  // Architectural-return classification (RTD-btb-training-fix): True for RTS/RTR/
+  // RTD, independent of anInc (RTD's anInc is always 0, see DecodedUop.isReturn's
+  // doc). Consumed by BranchEuPlugin's BTB/FTB training-exclusion. Threaded.
+  val isReturn     = Bool()
   // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
   // := the predecremented address. Threaded from decode.
   val stkPush      = Bool()

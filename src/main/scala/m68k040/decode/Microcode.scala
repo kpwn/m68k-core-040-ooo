@@ -2741,6 +2741,7 @@ object Microcode {
     // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
     u.isBranch := Bool(d.uop == UMiBranchFinal); u.ibranch := Bool(d.uop == UMiBranchFinal)
     u.stkPush  := Bool(d.uop == UMiPushFinal);   u.anInc   := 0
+    u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
     u.cond := 0; u.branchDisp := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
@@ -3321,6 +3322,7 @@ object Microcode {
     // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
     u.isBranch := d.uop === UOpHw.UMiBranchFinal; u.ibranch := d.uop === UOpHw.UMiBranchFinal
     u.stkPush  := d.uop === UOpHw.UMiPushFinal;   u.anInc   := 0
+    u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
     u.cond := 0; u.branchDisp := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).

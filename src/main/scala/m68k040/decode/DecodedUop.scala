@@ -384,8 +384,21 @@ case class DecodedUop() extends Bundle {
   // Stack-pop postincrement folded into the trailing ibranch (RTS/RTR): when the
   // ibranch has an int dst (dstReg = A7), the branch EU writes A7 := psrcB + anInc
   // (psrcB = the pre-pop A7). anInc = 4 (RTS) / 6 (RTR: word CCR + long PC). 0 = no
-  // postinc (JSR/JMP — no An write). 3 bits hold 0/4/6. Default 0.
+  // postinc (JSR/JMP/RTD — no An write folded into THIS µop). 3 bits hold 0/4/6.
+  // Default 0. NOTE: this does NOT double as a "this ibranch is architecturally a
+  // return" flag -- see isReturn below (RTD's A7 update is a separate, un-fused ADD
+  // µop since its displacement can't fit in 3 bits, so its ibranch keeps anInc=0
+  // despite being a real return).
   val anInc        = UInt(3 bits)
+  // Architectural-return classification (RTD-btb-training-fix), independent of
+  // anInc: True for every RTS/RTR/RTD ibranch. Consumed ONLY by BranchEuPlugin's
+  // BTB/FTB training-exclusion (`isBtbBranch`) -- a last-target BTB/FTB entry is a
+  // poor return predictor (correct for the call that trained it, wrong for every
+  // other call to the same subroutine); the RAS is the dedicated return predictor
+  // instead. Was previously (wrongly) derived as `ibranch && anInc =/= 0`, which
+  // missed RTD (whose anInc is always 0, see above) and let RTD illegitimately
+  // train the BTB/FTB with the popped return address. Default False.
+  val isReturn     = Bool()
   val cond         = Bits(4 bits)
   val branchDisp   = Bits(32 bits)
   val unimplemented= Bool()

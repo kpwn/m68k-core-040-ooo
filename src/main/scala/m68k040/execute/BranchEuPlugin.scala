@@ -252,13 +252,19 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // ── BTB-update classification (which branches the BTB learns) ────────────────
     // In scope (slice 1): Bcc/BRA/BSR (relative) + JMP/JSR (ibranch, anInc==0). OUT:
     //  - Scc (not a control transfer) and isCondTrap (TRAPV/TRAPcc, a fault) — never learned.
-    //  - RTS/RTR returns (ibranch with anInc != 0) — a last-target BTB is a poor return
-    //    predictor; the return-address stack is slice 2. Excluded here so the BTB never
-    //    learns a return and mis-predicts the next call site.
+    //  - RTS/RTR/RTD returns (ibranch with isReturn) — a last-target BTB is a poor
+    //    return predictor; the return-address stack is slice 2. Excluded here so the
+    //    BTB never learns a return and mis-predicts the next call site.
     // addrErr is ALSO excluded from BTB training (task #189) — a faulting branch
     // never actually executed a control transfer, so learning its (invalid, odd)
     // target would poison a future correctly-encoded taken prediction at the same PC.
-    val isReturn   = u1.ibranch && (u1.anInc =/= U(0, 3 bits))
+    // isReturn is a dedicated DecodedUop/RenamedUop field (RTD-btb-training-fix), NOT
+    // derived from anInc: RTD is a genuine return but folds its A7 deallocation into
+    // a SEPARATE, un-fused ADD µop (its 4+disp16 amount can't fit anInc's 3 bits), so
+    // its ibranch always carries anInc=0 -- an `anInc =/= 0` proxy would (and
+    // previously did) misclassify it as a plain ibranch and let it train the BTB/FTB
+    // with the popped return address.
+    val isReturn   = u1.ibranch && u1.isReturn
     val isBtbBranch = s1Valid && !u1.isScc && !u1.isCondTrap && !isReturn && !addrErr &&
                       (u1.ibranch || u1.isBranch)
     // brType: uncond (1) = ibranch (JMP/JSR) OR an always-taken relative branch
