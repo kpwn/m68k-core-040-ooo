@@ -1173,8 +1173,44 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugStepBoundaryHit := (debugHaltState === DebugHaltState.STEP_RUNNING) &&
       (debugStepNormalBoundaryHit || debugSequencerBoundaryHit)
     debugStepBoundaryHit.simPublic()
-    val debugRecoverEnter = debugExceptionBoundaryHit || debugBreakpointBoundaryHit ||
+    // Hold the debug recover trigger (and, symmetrically, `debugPcApply` further
+    // below) while a PRECISE store's drain is genuinely in flight
+    // (`preciseDrainBusyIn` -- an already-ACCEPTED, irrevocable bus write; same
+    // gate `normalIrqGate`/`traceNormalGate` already use to keep an
+    // interrupt/trace from preempting this identical hazard, see that doc comment
+    // above). `debugRecoverEnter`/`debugPcApply` are the only two of `doFlushReg`'s
+    // four disjuncts that are NOT retire-gated -- `branchRedirect`/
+    // `exc.redirectValid` can only ever land on a RETIRING head, and an
+    // uncommitted precise entry blocks retire of everything at/behind it (see
+    // StoreQueue.scala's own flush doc comment) -- but a JTAG-driven
+    // halt/step/breakpoint/PC-apply can land on ANY cycle, including mid-drain of
+    // a precise store whose bus write has already left the CPU and cannot be
+    // un-issued. `efcd953` fixed the SYMPTOM (StoreQueue's flush `keep()` logic,
+    // `headDrainInFlight`) so a squash here can no longer permanently wedge the SQ
+    // ring -- this closes the gap at the SOURCE instead: hold the debug halt/
+    // PC-apply trigger itself back until the drain resolves (its one AXI
+    // transaction, typically a handful of cycles) rather than letting it fire and
+    // squash the in-flight half at all. `headDrainInFlight` stays in StoreQueue.scala
+    // as defense-in-depth (e.g. the separate, NOT retire-gated `coreHalted`/
+    // D-cache-fatal path -- see `coreHaltedIn`'s doc comment -- is not covered by
+    // this ROB-side gate either).
+    //
+    // A plain combinational AND (not a latch) is correct: `debugBreakpointBoundaryHit`
+    // is LEVEL-held against the unchanging ROB head while `preciseDrainBusyIn` keeps
+    // `retire0` (hence `h0`) frozen, so it simply re-observes true the first cycle the
+    // gate opens. The other three disjuncts are retire0-synchronized pulses that, by
+    // construction, cannot themselves occur while a drain is genuinely UNRESOLVED
+    // (retire0 requires `completes(h0)`, which requires the SQ's own completion for
+    // that entry, which only fires once the drain has already resolved) -- the only
+    // window where they can coincide with `preciseDrainBusyIn` is StoreQueue's
+    // deliberate one-cycle-past-resolution pad (its own doc comment: "so the ROB's
+    // normalIrqGate/traceNormalGate never race a same-cycle preempt against a drain
+    // that just resolved"), which self-heals via `debugIdleBoundaryHit`/
+    // `debugAutomaticBoundaryHit`/the next macro's own boundary if that exact pulse
+    // is missed -- identical, already-shipped tradeoff to `interruptPending`'s.
+    val debugRecoverEnterCond = debugExceptionBoundaryHit || debugBreakpointBoundaryHit ||
       debugStopBoundaryHit || debugStepBoundaryHit
+    val debugRecoverEnter = debugRecoverEnterCond && !preciseDrainBusyIn
     debugRecoverEnter.simPublic()
     val debugHaltHitInstCountReg = Reg(UInt(64 bits)) init 0
     debugHaltHitInstCountReg.simPublic()
@@ -1197,17 +1233,25 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugHaltExceptionPcReg.simPublic(); debugHaltExceptionFaultAddressReg.simPublic()
     when(debugClearStickyIn) { debugHaltHitPcReg := 0 }
     when(debugBreakpointBoundaryHit) { debugHaltHitPcReg := p0.pc }
+    // Every transition into RECOVER below is ANDed with `!preciseDrainBusyIn` --
+    // the FSM must stay put (RUNNING/STOP_PENDING/STEP_RUNNING) for as long as a
+    // precise SQ drain is in flight, exactly mirroring `debugRecoverEnter`'s own
+    // gate above (these raw disjuncts are its constituents; see that doc comment
+    // for the full rationale/timing argument). A STOP_PENDING park is unaffected
+    // (`debugStopBoundaryHit` cannot itself be true while a drain is genuinely
+    // UNRESOLVED -- see above -- so the `.otherwise` arm below already handles it).
     switch(debugHaltState) {
       is(DebugHaltState.RUNNING) {
-        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit) {
+        when((debugExceptionBoundaryHit || debugBreakpointBoundaryHit) && !preciseDrainBusyIn) {
           debugHaltState := DebugHaltState.RECOVER
         }.elsewhen(debugStopRequestIn || haltAfterDue) {
-          when(debugStopBoundaryHit) { debugHaltState := DebugHaltState.RECOVER }
-            .otherwise             { debugHaltState := DebugHaltState.STOP_PENDING }
+          when(debugStopBoundaryHit && !preciseDrainBusyIn) { debugHaltState := DebugHaltState.RECOVER }
+            .otherwise                                      { debugHaltState := DebugHaltState.STOP_PENDING }
         }
       }
       is(DebugHaltState.STOP_PENDING) {
-        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStopBoundaryHit) {
+        when((debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStopBoundaryHit) &&
+             !preciseDrainBusyIn) {
           debugHaltState := DebugHaltState.RECOVER
         }
       }
@@ -1222,7 +1266,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
         }
       }
       is(DebugHaltState.STEP_RUNNING) {
-        when(debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStepBoundaryHit) {
+        when((debugExceptionBoundaryHit || debugBreakpointBoundaryHit || debugStepBoundaryHit) &&
+             !preciseDrainBusyIn) {
           debugHaltState := DebugHaltState.RECOVER
         }
       }
@@ -2440,7 +2485,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
     // consumer empty and does not release the debug halt.
-    val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid
+    // Gated the same way as `debugRecoverEnter` above (see that doc comment):
+    // `debugSystemApplyIn.valid` is only ever issued once `debugHalted ||
+    // coreHalted` already holds (RobPlugin's own assert just above enforces the
+    // precondition), and with `debugRecoverEnter` now gated, entry into
+    // `debugHalted` itself cannot happen while `preciseDrainBusyIn` is asserted --
+    // so this term is structurally unreachable via that path and is here purely
+    // as defense-in-depth for the OTHER, non-retire-gated `coreHalted` (D-cache
+    // fatal) path, which this gate does not otherwise cover.
+    val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid &&
+      !preciseDrainBusyIn
     doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port

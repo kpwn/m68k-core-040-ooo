@@ -2212,4 +2212,124 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.rob.logic.count.toInt == 0, "breakpoint recovery must flush all in-flight work")
     }
   }
+
+  // ── `preciseDrainBusyIn` gates `debugRecoverEnter`/`debugPcApply` ──────────────
+  // Closes the gap `efcd953` (StoreQueue.scala) left open: that fix stopped a
+  // debug-triggered flush from permanently WEDGING the SQ ring when it squashed an
+  // in-flight precise drain half's ROB-side bookkeeping, but it did not stop the
+  // squash attempt from happening in the first place. This gates the trigger
+  // itself at the SOURCE -- see `debugRecoverEnter`'s doc comment in RobPlugin.scala.
+  // Same idiom/mirrors as the "preciseDrainBusyIn blocks interruptPending/
+  // tracePendingFire" pair above, exercised against the debug-halt path with a
+  // real SimpleDut macro standing in for the precise store's own ROB entry.
+  test("preciseDrainBusyIn holds a manual debug stop off an in-flight precise drain, " +
+       "then lets it commit that macro and halt cleanly once the drain resolves") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      // Allocate ONE macro standing in for the precise store's own ROB entry --
+      // deliberately left INCOMPLETE, matching a genuinely UNRESOLVED drain
+      // (retire0 cannot fire without `completes(h0)`, which the real StoreQueue
+      // only sets once the bus write's own ack has actually arrived).
+      val id = allocOneFL(dut, cd, 0x1200, first = true, last = true)
+      dut.rob.logic.preciseDrainBusyIn #= true
+      dut.rob.logic.debugStopRequestIn #= true
+
+      // While busy+unresolved, the halt must be held OFF entirely -- doFlushReg
+      // must never fire (that would squash the in-flight entry, `efcd953`'s exact
+      // bug class), the FSM must never reach RECOVER/HALTED, and the entry must
+      // survive unsquashed (count stays 1).
+      for (_ <- 0 until 15) {
+        assert(!dut.rob.logic.debugRecoverEnter.toBoolean,
+          "debugRecoverEnter must not fire while a precise drain is in flight")
+        assert(!dut.rob.logic.doFlushReg.toBoolean,
+          "doFlushReg must not fire (would squash the in-flight entry) while busy")
+        assert(dut.rob.logic.debugHaltState.toEnum != DebugHaltState.RECOVER &&
+               dut.rob.logic.debugHaltState.toEnum != DebugHaltState.HALTED,
+          "the FSM must not reach RECOVER/HALTED while a precise drain is in flight")
+        assert(dut.rob.logic.count.toInt == 1, "the in-flight entry must not be squashed")
+        cd.waitSampling()
+      }
+
+      // The drain resolves: the completion pulse lands and `preciseDrainBusyIn`
+      // clears together (real StoreQueue timing: busy clears no earlier than the
+      // completion that first makes retire0 possible -- see debugRecoverEnter's
+      // doc comment on the deliberate one-cycle-past-resolution pad).
+      markComplete(dut, id)
+      dut.rob.logic.preciseDrainBusyIn #= false
+      cd.waitSampling()
+      clearComplete(dut)
+
+      // The macro retires normally (its own commit, exactly like a clean precise-
+      // store retire), and the held stop request takes effect right after it --
+      // not squashed, and not indefinitely blocked either.
+      waitUntil(cd, dut.tsink.logic.fireOut(0).toBoolean)
+      cd.waitSampling()
+      dut.rob.logic.debugStopRequestIn #= false
+      assert(dut.rob.logic.doFlushReg.toBoolean,
+        "the held stop must take effect (RECOVER's registered flush) once the drain resolves")
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean, "halt becomes effective after recovery")
+      assert(dut.rob.logic.count.toInt == 0, "recovery flushes younger work as usual")
+      assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.MANUAL)
+    }
+  }
+
+  /** Poke `debugSystemApplyIn` for a PC-only apply: every other *Valid bit false,
+    * pcValid true, target `pc`. Mirrors the real DebugCtrlPlugin producer's phase-2
+    * pulse shape but held as a level here (see the test's own doc comment for why
+    * that is the right thing to drive from this harness). */
+  def pokeSystemApplyPcOnly(dut: SimpleDut, pc: Long): Unit = {
+    val c = dut.rob.logic.debugSystemApplyIn
+    c.valid #= true
+    c.payload.pcValid #= true; c.payload.pc #= pc
+    c.payload.srValid #= false; c.payload.vbrValid #= false
+    c.payload.uspValid #= false; c.payload.mspValid #= false; c.payload.ispValid #= false
+    c.payload.cacrValid #= false; c.payload.sfcValid #= false; c.payload.dfcValid #= false
+    c.payload.tcValid #= false; c.payload.itt0Valid #= false; c.payload.itt1Valid #= false
+    c.payload.dtt0Valid #= false; c.payload.dtt1Valid #= false
+    c.payload.urpValid #= false; c.payload.srpValid #= false
+    c.payload.sr #= 0; c.payload.vbr #= 0; c.payload.usp #= 0; c.payload.msp #= 0
+    c.payload.isp #= 0; c.payload.cacr #= 0; c.payload.sfc #= 0; c.payload.dfc #= 0
+    c.payload.tc #= 0; c.payload.itt0 #= 0; c.payload.itt1 #= 0
+    c.payload.dtt0 #= 0; c.payload.dtt1 #= 0; c.payload.urp #= 0; c.payload.srp #= 0
+  }
+
+  // debugSystemApplyIn.valid's own precondition (RobPlugin's assert) is
+  // `debugHalted || coreHalted`. With debugRecoverEnter now gated, the
+  // `debugHalted` path structurally cannot coincide with `preciseDrainBusyIn`
+  // (entry into HALTED itself waits it out) -- so this test reaches the
+  // precondition via `coreHaltedIn` (the separate, NOT retire-gated D-cache-fatal
+  // path -- see `coreHaltedIn`'s doc comment) to exercise `debugPcApply`'s gate on
+  // its own merits, confirming it is held while busy and takes effect once clear.
+  test("preciseDrainBusyIn holds a debugPcApply off an in-flight precise drain, " +
+       "then applies the new PC cleanly once the drain resolves") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+
+      dut.rob.logic.coreHaltedIn #= true
+      cd.waitSampling()
+      dut.rob.logic.coreHaltedIn #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.effectiveHaltOut.toBoolean, "precondition: effectively halted")
+
+      dut.rob.logic.preciseDrainBusyIn #= true
+      pokeSystemApplyPcOnly(dut, pc = 0x3000)
+      for (_ <- 0 until 10) {
+        assert(!dut.rob.logic.doFlushReg.toBoolean,
+          "debugPcApply's flush must not fire while a precise drain is in flight")
+        cd.waitSampling()
+      }
+
+      dut.rob.logic.preciseDrainBusyIn #= false
+      waitUntil(cd, dut.rob.logic.doFlushReg.toBoolean)
+      assert(dut.rob.logic.flushPcReg.toLong == 0x3000L,
+        "the held PC-apply must land the correct target once the drain resolves")
+      dut.rob.logic.debugSystemApplyIn.valid #= false
+      cd.waitSampling()
+      assert(dut.dsink.logic.livePcOut.toLong == 0x3000L, "the applied PC must be observable afterward")
+    }
+  }
 }
