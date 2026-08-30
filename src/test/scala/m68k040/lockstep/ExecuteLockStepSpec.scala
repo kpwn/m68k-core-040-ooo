@@ -3676,58 +3676,81 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 18)
   }
 
-  test("lock-step: RAS predictions stay accurate across a real mispredict flush (checkpoint/restore)", VerilatorTest) {
+  test("lock-step: mispredicted branch with a wrong-path UNMATCHED bsr does not leak a phantom RAS entry — rollback-on-flush fix", VerilatorTest) {
     // Companion to "RAS corrupt-recovery" above (2026-08-28, an independent fix --
     // see Ras.scala's doc comment; NOT part of the separate `0x40800284` wild-jump
-    // investigation). That test proves ARCHITECTURAL correctness under a real
-    // misprediction (the EU always verifies). This test adds a WHITEBOX check on top
-    // of the identical, already-proven mispredict mechanism: every RAS-predicted
-    // return, across the whole run (including the ones speculatively fetched down the
-    // mispredicted loop's wrong path, and the real ones after the flush), must predict
-    // its own just-pushed return address correctly. The rigorous, deterministic proof
-    // that checkpointRestore actually undoes wrong-path corruption (rather than merely
-    // tolerating it) lives at the unit level in RasPluginSpec.scala — "checkpointRestore
-    // undoes wrong-path pushes/pops since the last checkpointSave" and "checkpoint
-    // captures full CONTENT ... survives a wrong-path wraparound" — which directly
-    // drive checkpointSave/checkpointRestore and inspect rasSp/count/contents with no
-    // dependence on fetch/redirect timing. This lock-step test is the complementary,
-    // whole-pipeline regression check: it confirms the checkpoint/restore wiring
-    // (BackendWiringPlugin's `rob.logic.count === 0` save / `doFlush` restore trigger)
-    // doesn't disturb ordinary RAS prediction accuracy in a real misprediction scenario.
+    // investigation). That test's wrong-path excursion is a perfectly self-balanced
+    // phantom bsr+rts pair (net-zero rasSp/count drift), which the RAS's LIFO
+    // push-then-immediately-matching-pop self-reference makes architecturally
+    // INVISIBLE even under the OLD "accept corruption" design: a push immediately
+    // followed by its own matching pop always reads back exactly what it just wrote
+    // (`ras(rasSp-1)` after the push's `rasSp++`), regardless of what garbage sits
+    // underneath. It is a real, valid test of ARCHITECTURAL correctness (the EU
+    // always verifies), but it cannot by itself distinguish "corruption accepted" from
+    // "corruption rolled back" — both pass it identically.
+    //
+    // This test instead constructs a wrong-path excursion with an UNMATCHED call (no
+    // corresponding return is ever reached before the flush retires), which DOES leave
+    // a permanent net +1 drift in rasSp/count under the old design. That drift is
+    // observable ONLY via internal RAS occupancy (count/predValid), not via any single
+    // later return's own predTarget (a LIFO top always self-references its own most
+    // recent push, correct or not) -- so this test inspects `ras.logic.count` directly
+    // via a per-cycle whitebox hook, at the exact cycle of each push/pop, rather than
+    // only checking the final architectural result.
+    //
+    // Program: `moveq #0,%d0 ; cmp.b #0,%d0` sets Z, so `beq skip` is ALWAYS taken
+    // architecturally. The BTB/FTB start fully invalid (`RegInit(False)` on every
+    // `valids` entry, per Btb.scala/Ftb.scala) -- a cold PC has no hit, so the
+    // predictor's default is not-taken -- guaranteeing a misprediction on this beq's
+    // one and only execution, with no warm-up loop needed. Fetch, having predicted
+    // not-taken, walks the WRONG-PATH fall-through straight-line bytes: `bsr wrongcall`
+    // (pushes a return PC) followed by filler that never reaches `wrongcall`'s body,
+    // let alone a return from it, before `beq` retires and the commit-time redirect
+    // flushes everything younger. After the flush, `skip:`'s `bsr leaf ... rts` is the
+    // ONLY architecturally-executed call/return pair in the whole program.
+    val pushCounts = scala.collection.mutable.ArrayBuffer[Long]()
     val popSamples = scala.collection.mutable.ArrayBuffer[(Boolean, Long, Long)]() // (predValid, predTarget, count-at-pop)
     def sampleRas(dut: FullCoreDut): Unit = {
+      if (dut.ras.logic.pushValid.toBoolean) {
+        pushCounts += dut.ras.logic.count.toLong
+      }
       if (dut.ras.logic.popValid.toBoolean) {
         popSamples += ((dut.ras.logic.predValid.toBoolean,
                         dut.ras.logic.predTarget.toLong & 0xffffffffL,
                         dut.ras.logic.count.toLong))
       }
     }
-    runLockStep("bsr-loop-mispredict-then-real-return",
-      "moveq #3,%d7 ; moveq #0,%d0 ; " +
-      "back: bsr leaf ; subq #1,%d7 ; bne back ; " +
-      "moveq #9,%d6 ; bsr leaf ; moveq #2,%d1 ; " +
+    runLockStep("ras-rollback-no-phantom-leak",
+      "moveq #0,%d0 ; cmp.b #0,%d0 ; beq skip ; " +
+      "bsr wrongcall ; moveq #99,%d5 ; moveq #98,%d5 ; moveq #97,%d5 ; " +
+      "skip: bsr leaf ; moveq #2,%d1 ; " +
       ".stop: bra .stop ; " +
-      "leaf: addq #1,%d0 ; rts",
-      nInstr = 22,
+      "leaf: addq #1,%d0 ; rts ; " +
+      "wrongcall: bra wrongcall",
+      nInstr = 7,
       perCycle = sampleRas)
 
-    // Every RAS-predicted return (both the loop's own, and the trailing post-flush
-    // one, and any wrong-path speculative ones fetched down the loop's mispredicted
-    // back-edge) must have predicted validly. This is the "measurable improvement"
-    // bar in the general (non-degenerate) case: after the checkpoint/restore fix, no
-    // RAS-predicted return goes stale or predicts nothing.
-    assert(popSamples.nonEmpty, "at least one RAS-predicted return must occur in this program")
-    for ((predValid, _, _) <- popSamples) {
-      assert(predValid, s"a RAS-predicted return failed to predict (RAS read empty) in $popSamples")
-    }
-    // Only two distinct call sites exist in this program (the loop's own `bsr leaf`
-    // and the trailing post-flush `bsr leaf`), so every predicted target -- across
-    // every speculative/retried fetch attempt, not just the ones that ultimately
-    // retire -- must be one of exactly those two real return addresses.
-    val distinctTargets = popSamples.map(_._2).toSet
-    assert(distinctTargets.size <= 2,
-      s"every RAS prediction must be one of the (at most two) real return addresses " +
-      s"in this program, got $distinctTargets from samples $popSamples")
+    assert(pushCounts.size == 2,
+      s"expected exactly 2 pushes (the wrong-path `bsr wrongcall` + the real `bsr leaf`), " +
+      s"got ${pushCounts.size}: $pushCounts")
+    assert(pushCounts(0) == 0,
+      s"the first push (wrong-path `bsr wrongcall`) must see an empty RAS, got count=${pushCounts(0)}")
+    // THE assertion: the real `bsr leaf` push (post-flush) must ALSO see an empty RAS
+    // (count==0), proving the wrong-path push's phantom entry was rolled back by the
+    // flush. Under the old "accept corruption" design this reads 1 (the never-popped,
+    // permanently-leaked phantom entry) -- a real, measurable prediction-quality
+    // regression that would otherwise persist for the rest of the run.
+    assert(pushCounts(1) == 0,
+      s"the real `bsr leaf` push must see an empty RAS post-flush (no leaked wrong-path " +
+      s"phantom entry), got count=${pushCounts(1)}")
+
+    assert(popSamples.size == 1,
+      s"expected exactly 1 pop (leaf's rts), got ${popSamples.size}: $popSamples")
+    val (predValid, predTarget, countBeforePop) = popSamples(0)
+    assert(predValid, "leaf's rts must get a RAS prediction")
+    assert(countBeforePop == 1,
+      s"leaf's rts must see exactly 1 entry on the RAS (its own push only), got " +
+      s"count=$countBeforePop -- a leaked phantom would show 2")
   }
 
   // ── JSR (call via the EA address) ──────────────────────────────────────────
