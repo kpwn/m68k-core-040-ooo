@@ -1888,6 +1888,95 @@ class DcacheSpec extends AnyFunSuite {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // Real-hardware boot blocker investigation (BUG_calibration_word_misplaced_0d00.md
+  // Part 36-38/52): the CPU permanently stalls at ROM PC 0x40887126, a real 68040
+  // "flush a range of memory" routine's tail loop:
+  //     40887126: cpushl  bc,(a1)      <- observed static here on real hardware
+  //     40887128: lea     16(a1),a1
+  //     4088712c: dbf     d2,0x40887126
+  // Prior sessions narrowed this to ExceptionUnit's S_DRAIN state (`sqDrained` ==
+  // StoreQueue.io.empty never becoming true) but explicitly could NOT isolate the
+  // natural (non-debug-flush) trigger -- Part 37's StoreQueue flush-vs-drain fix
+  // (`efcd953`) targets a DIFFERENT trigger class (debugRecoverEnter/debugPcApply,
+  // which an undisturbed boot never exercises) and Part 38 confirmed on real
+  // hardware that it does NOT clear this stall.
+  //
+  // TWO gaps in the prior sessions' own methodology, found this session by reading
+  // the RTL directly rather than re-deriving from the external symptom:
+  //   (1) Part 36/38's own "debug maintenance push" discriminator (`coherent-dump`,
+  //       used to rule DcachePlugin's walk *engine* itself in/out) ALWAYS drives
+  //       `scope := 3` ("all") -- see `top/FullCoreSynth.scala:495`. It therefore
+  //       NEVER exercises the `scopeHit`/`lineMatch` tag-compare branch
+  //       (`cmd.scope === U(1,2 bits)`) a real architectural CPUSHL LINE actually
+  //       takes (`DcachePlugin.scala` CHECK state). "Every debug push completed
+  //       cleanly" is real evidence the ALL-scope walk works; it is NOT evidence
+  //       the LINE-scope walk (what the ROM's own loop uses) does.
+  //   (2) NO existing directed test (this file's own P5.4 suite, nor the ported
+  //       `cpush_line_basic`/`cpush_all_basic` corpus) exercises LINE scope
+  //       together with the BC (both-caches) selector, which is exactly what the
+  //       real ROM instruction uses (`cpushl bc,(a1)`, opword 0xF4E9 -> sel=11).
+  //       `cpush_line_basic.s` uses `%dc` only; `SysOpApplySpec`'s only BC-selector
+  //       coverage (`cpusha %bc`) is ALL scope, not LINE.
+  //   (3) The ROM's own loop issues FOUR back-to-back CPUSHL/dbf iterations against
+  //       CONSECUTIVE 16-byte lines with no intervening CINV, and real-hardware
+  //       `pc-trace` evidence (Part 36 S2.2/Part 38 S4) shows the first THREE
+  //       iterations' `lea`/`dbf` pairs retire normally -- only the FOURTH (final)
+  //       `cpushl` never completes. No existing test drives more than a single
+  //       maintenance command per test.
+  //
+  // This test closes gaps (2) and (3) at the DcachePlugin-engine level (bypassing
+  // ExceptionUnit/decode, exactly like this file's other P5.4 tests): four
+  // consecutive dirty COPYBACK lines, each pushed with LINE scope + BC selector,
+  // fired back-to-back the moment the previous one's `maintDone` pulses -- the
+  // tightest natural cadence ExceptionUnit's serializing S_APPLY->S_MAINTWAIT->
+  // S_REDIR->IDLE->S_APPLY sequence could ever produce for four real committed
+  // CPUSHL instructions in a row. `maintWait`'s own bounded budget means a genuine
+  // engine-level hang FAILS LOUDLY here instead of wedging the whole suite.
+  test("CPUSH Line-scope + BC selector, FOUR back-to-back dirty lines (mirrors the " +
+       "real ROM's CPUSHL/dbf loop at 0x40887126 exactly: scope=LINE, sel=BC, no " +
+       "intervening CINV) all complete without ever hanging", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x6800L
+      val lines = (0 until 4).map(i => base + i * 16)
+
+      // Dirty all four lines FIRST (matches the ROM's caller having already written
+      // real data into this range before the flush loop ever runs), each with a
+      // distinct value so a mix-up between lines is directly observable.
+      lines.zipWithIndex.foreach { case (addr, i) =>
+        preload(mem, addr, 16)
+        load(dut, cd, addr, Size.LONG, CacheMode.WRITETHROUGH)   // warm, clean
+        doStore(dut, cd, addr + 4, BigInt(f"CAFE00${i}%02X", 16), Size.LONG, CacheMode.COPYBACK)
+        assert(anyDirtyIn(dut, addr), s"precondition: line $i (0x${addr.toHexString}) must be dirty")
+      }
+
+      // Fire all four CPUSHL LINE,BC pushes back-to-back -- the next one issues the
+      // instant the previous one's maintDone pulses, no extra settle cycles, exactly
+      // as tight as ExceptionUnit's own serializing sysOp sequencer can go.
+      lines.zipWithIndex.foreach { case (addr, i) =>
+        maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_BC, addr)
+        maintWait(dut, cd, budget = 2000)
+      }
+      cd.waitSampling(4)
+
+      lines.zipWithIndex.foreach { case (addr, i) =>
+        val expectedByte = 0xCA
+        assert(mem.peekByte(addr + 4) == 0xCA,
+          f"line $i (0x${addr}%x): CPUSHL did not write back its dirty data (mem[+4]=" +
+          f"0x${mem.peekByte(addr + 4)}%02x)")
+        assert(mem.peekByte(addr + 7) == i,
+          f"line $i (0x${addr}%x): wrong line's data landed here -- mem[+7]=" +
+          f"0x${mem.peekByte(addr + 7)}%02x, expected 0x$i%02x (a cross-line mix-up)")
+        assert(!anyDirtyIn(dut, addr), s"line $i (0x${addr.toHexString}) still dirty after its own CPUSHL")
+      }
+      // The engine must still be fully usable afterwards -- no stuck latch/FSM left
+      // behind by the fourth (final) push, mirroring the real hang's exact position.
+      assert(load(dut, cd, lines(3) + 4, Size.LONG, CacheMode.COPYBACK) == BigInt("CAFE0003", 16),
+        "the D-cache did not survive four back-to-back LINE+BC CPUSHL pushes")
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // FMax closure Slice 2 (2026-08-07): LOAD S1a/S1b split -- directed timing pins.
   //
   // The load hit RESPONSE build (way-select -> byte-lane extract -> loadRsp) moved

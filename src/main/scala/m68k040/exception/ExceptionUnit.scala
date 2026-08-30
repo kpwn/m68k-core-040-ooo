@@ -2433,4 +2433,19 @@ class ExceptionUnit(
   val dbgFsmIsEVecReq = fsm.isActive(fsm.E_VECREQ);  dbgFsmIsEVecReq.simPublic()
   val dbgFsmIsEVecWait= fsm.isActive(fsm.E_VECWAIT); dbgFsmIsEVecWait.simPublic()
   val dbgFsmIsERedir  = fsm.isActive(fsm.E_REDIR);   dbgFsmIsERedir.simPublic()
+  // BUG_calibration_word_misplaced_0d00.md Part 36-38/52: whitebox taps for the
+  // commit-time sysOp sequencer (S_DRAIN/S_APPLY/S_MAINTWAIT/S_REDIR), added so a
+  // directed lock-step/whitebox test can observe DIRECTLY which state a real,
+  // naturally-committed CPUSH/CINV/MOVEC/etc. sysOp is stuck in, rather than only
+  // inferring it from external symptoms (pc_live/exc-ring on real hardware). Sim-only,
+  // zero synth cost (mirrors dbgFsmIsIdle/dbgFsmIsEDrain/etc. immediately above).
+  val dbgFsmIsSDrain    = fsm.isActive(fsm.S_DRAIN);    dbgFsmIsSDrain.simPublic()
+  val dbgFsmIsSApply    = fsm.isActive(fsm.S_APPLY);    dbgFsmIsSApply.simPublic()
+  val dbgFsmIsSMaintWait= fsm.isActive(fsm.S_MAINTWAIT);dbgFsmIsSMaintWait.simPublic()
+  val dbgFsmIsSRedir    = fsm.isActive(fsm.S_REDIR);    dbgFsmIsSRedir.simPublic()
+  val dbgSqDrained      = sqDrained;                    dbgSqDrained.simPublic()
+  val dbgDcQuiesced     = dcQuiesced;                   dbgDcQuiesced.simPublic()
+  val dbgMaintCmdValid  = maintCmdOut.valid;             dbgMaintCmdValid.simPublic()
+  val dbgMaintCmdAddr   = maintCmdOut.payload.addr;      dbgMaintCmdAddr.simPublic()
+  val dbgSysCapVal      = sysCapVal;                     dbgSysCapVal.simPublic()
 }

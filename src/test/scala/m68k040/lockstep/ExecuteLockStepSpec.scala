@@ -4454,6 +4454,253 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     (sawPriv, vec)
   }
 
+  // ── Real-hardware boot blocker (BUG_calibration_word_misplaced_0d00.md Part
+  // 36-38/52): the CPU permanently stalls at ROM PC 0x40887126, whose disassembly is
+  // exactly a bounded (<=16 line) "flush a range" tail loop:
+  //     40887126: cpushl  bc,(a1)
+  //     40887128: lea     16(a1),a1
+  //     4088712c: dbf     d2,0x40887126
+  // Prior sessions narrowed this to ExceptionUnit's S_DRAIN state (`sqDrained` ==
+  // StoreQueue.io.empty never becoming true) but could not isolate a NATURAL trigger
+  // distinct from the debug-flush-source class Part 37's `efcd953` fix already
+  // targets (and Part 38 confirmed on real hardware that fix does NOT clear this
+  // stall). This test drives the REAL decode/rename/issue/ROB-commit path (not a
+  // stubbed sysOp port, unlike SysOpApplySpec) through the closest replica of the
+  // ROM's own instruction sequence this harness can produce: four ordinary
+  // COMMITTED stores (so the StoreQueue has real, natural occupancy to drain --
+  // exactly the shape the caller of a real "flush this range" routine would leave
+  // behind) immediately followed by FOUR back-to-back CPUSHL bc,(a1)/lea/dbf
+  // iterations, no debug flush/halt/breakpoint of any kind involved anywhere. CPUSH
+  // is architecturally a no-op on this cache-model-less-to-Musashi core (see this
+  // file's own top-of-file GUARD NOTE) so this is a whitebox test, not a lock-step
+  // one -- it watches the new `dbgFsmIsSDrain`/`dbgFsmIsSApply`/`dbgFsmIsSMaintWait`/
+  // `dbgFsmIsSRedir`/`dbgSqDrained`/`dbgDcQuiesced` taps (added this session,
+  // `ExceptionUnit.scala`) directly rather than inferring FSM state from PC/exception
+  // symptoms the way the real-hardware sessions had to.
+  test("whitebox: FOUR back-to-back real CPUSHL bc,(a1)/lea/dbf commits, immediately " +
+       "after real committed stores give the StoreQueue natural occupancy, all drain " +
+       "and commit -- sqDrained never gets stuck (BUG_calibration_word_misplaced_0d00 " +
+       "0x40887126 natural-trigger probe)", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val dataBase = 0x00001000L
+    val src =
+      f"move.l #0x$dataBase%x,%%a1 ; " +
+      "move.l #0x11111111,(%a1) ; move.l #0x22222222,4(%a1) ; " +
+      "move.l #0x33333333,8(%a1) ; move.l #0x44444444,12(%a1) ; " +
+      "moveq #3,%d2 ; " +
+      "loop: cpushl %bc,(%a1) ; lea 16(%a1),%a1 ; dbf %d2,loop ; " +
+      "done: bra.s done"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE, per this file's established convention
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x27          // supervisor -- CPUSH is privileged
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      var sApplyEntries = 0
+      var prevSApply = false
+      var maxConsecSDrain = 0
+      var maxConsecSMaintWait = 0
+      var curSDrain = 0
+      var curSMaintWait = 0
+      var sawExceptionPending = false
+      val guardBudget = 20000
+      var guard = 0
+      var stuckReport = ""
+      while (sApplyEntries < 4 && guard < guardBudget) {
+        val isSApply = dut.rob.logic.exc.dbgFsmIsSApply.toBoolean
+        if (isSApply && !prevSApply) sApplyEntries += 1
+        prevSApply = isSApply
+        if (dut.rob.logic.exc.dbgFsmIsSDrain.toBoolean) { curSDrain += 1; maxConsecSDrain = scala.math.max(maxConsecSDrain, curSDrain) }
+        else curSDrain = 0
+        if (dut.rob.logic.exc.dbgFsmIsSMaintWait.toBoolean) { curSMaintWait += 1; maxConsecSMaintWait = scala.math.max(maxConsecSMaintWait, curSMaintWait) }
+        else curSMaintWait = 0
+        if (dut.rob.logic.exceptionPending.toBoolean) sawExceptionPending = true
+        if (guard == guardBudget - 1) {
+          stuckReport = s"final state: SDrain=${dut.rob.logic.exc.dbgFsmIsSDrain.toBoolean} " +
+            s"SApply=${dut.rob.logic.exc.dbgFsmIsSApply.toBoolean} " +
+            s"SMaintWait=${dut.rob.logic.exc.dbgFsmIsSMaintWait.toBoolean} " +
+            s"SRedir=${dut.rob.logic.exc.dbgFsmIsSRedir.toBoolean} " +
+            s"Idle=${dut.rob.logic.exc.dbgFsmIsIdle.toBoolean} " +
+            s"sqDrained=${dut.rob.logic.exc.dbgSqDrained.toBoolean} " +
+            s"dcQuiesced=${dut.rob.logic.exc.dbgDcQuiesced.toBoolean}"
+        }
+        cd.waitSampling(); guard += 1
+      }
+
+      assert(!sawExceptionPending,
+        "unexpected exception during the store+CPUSHL sequence (privilege/access fault) " +
+        "-- setup bug, not the hang under investigation")
+      assert(sApplyEntries == 4,
+        s"expected exactly 4 CPUSHL commits (S_APPLY entries) to complete within " +
+        s"$guardBudget cycles, got $sApplyEntries -- THE HANG REPRODUCED if this is < 4. " +
+        s"maxConsecSDrain=$maxConsecSDrain maxConsecSMaintWait=$maxConsecSMaintWait $stuckReport")
+      // Drain the last commit's S_MAINTWAIT (a full LINE-scope walk over every way,
+      // ~13+ cycles even with nothing to push) + S_REDIR/IDLE settle, and confirm the
+      // FSM is genuinely back at rest, not merely mid-way through its 4th cycle when
+      // the loop above happened to sample sApplyEntries==4. Bounded + polled (not a
+      // fixed short sleep) so a genuine stuck-forever case still fails loudly here
+      // rather than needing a second, separately-tuned magic constant.
+      var settleGuard = 0
+      while (!dut.rob.logic.exc.dbgFsmIsIdle.toBoolean && settleGuard < 2000) {
+        cd.waitSampling(); settleGuard += 1
+      }
+      assert(dut.rob.logic.exc.dbgFsmIsIdle.toBoolean,
+        s"the exception-unit sysOp sequencer did not settle back to IDLE after the 4th " +
+        s"CPUSHL within $settleGuard extra cycles -- final state: " +
+        s"SDrain=${dut.rob.logic.exc.dbgFsmIsSDrain.toBoolean} " +
+        s"SApply=${dut.rob.logic.exc.dbgFsmIsSApply.toBoolean} " +
+        s"SMaintWait=${dut.rob.logic.exc.dbgFsmIsSMaintWait.toBoolean} " +
+        s"SRedir=${dut.rob.logic.exc.dbgFsmIsSRedir.toBoolean} " +
+        s"sqDrained=${dut.rob.logic.exc.dbgSqDrained.toBoolean} " +
+        s"dcQuiesced=${dut.rob.logic.exc.dbgDcQuiesced.toBoolean}")
+    }
+  }
+
+  // ── Same probe as immediately above, but with a REAL MMU-enabled, COPYBACK-cacheable
+  // setup (mirrors `cpush_line_basic.s`'s own real DTT0/ITT0/TC.E movec sequence --
+  // "without TT setup the dcache forces cache_inh=1 and CPUSH has nothing to operate
+  // on") so the four CPUSHL commits ALSO each find a genuinely DIRTY resident line and
+  // drive a real AXI writeback (the `WRB` state / `maintCmdOut` push path), not just an
+  // empty-cache no-op walk. This is the fullest natural replica of the real ROM
+  // sequence this harness can build: real MMU-translated, real-COPYBACK-dirtied
+  // stores, immediately followed by four back-to-back real committed CPUSHL bc
+  // pushes, all through the genuine decode/rename/ROB-commit/StoreQueue/DcachePlugin
+  // path with zero debug/JTAG involvement anywhere.
+  test("whitebox: FOUR back-to-back real CPUSHL bc,(a1)/lea/dbf commits against REAL " +
+       "MMU-translated COPYBACK-dirty lines (real AXI writebacks, not a no-op walk) " +
+       "still all drain and commit -- sqDrained never gets stuck " +
+       "(BUG_calibration_word_misplaced_0d00 0x40887126 natural-trigger probe, MMU variant)",
+       VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val dataBase = 0x00001000L
+    val src =
+      "move.l #0x000FE020,%d7 ; movec %d7,%dtt0 ; " +   // DTT0: 0x00xxxxxx, cacheable copyback
+      "move.l #0x400FE020,%d7 ; movec %d7,%itt0 ; " +   // ITT0: 0x4xxxxxxx, cacheable copyback (code)
+      "move.l #0x8000,%d7 ; movec %d7,%tc ; " +          // TC.E=1, MMU on, 4K pages
+      f"move.l #0x$dataBase%x,%%a1 ; " +
+      "move.l #0x11111111,(%a1) ; move.l #0x22222222,16(%a1) ; " +
+      "move.l #0x33333333,32(%a1) ; move.l #0x44444444,48(%a1) ; " +
+      "moveq #3,%d2 ; " +
+      "loop: cpushl %bc,(%a1) ; lea 16(%a1),%a1 ; dbf %d2,loop ; " +
+      "done: bra.s done"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i) => i
+      case Left(e)  => fail(s"assemble failed: ${e.reason}")
+    }
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // Seed real memory at the data range so a re-fill (e.g. the post-CPUSH residency
+      // check, or an incidental refill) sees deterministic bytes rather than X/undef.
+      for (i <- 0 until 64) dmem.pokeByte(dataBase + i, 0)   // all FOUR lines, not just the first
+      // Initial-poke only (SpinalSim "uninit Reg randomizes per seed" gotcha) -- the
+      // program's own real `movec` writes to TC/DTT0/ITT0 take over once fetch starts.
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.usp #= 0x00200000L
+      dut.rob.logic.exc.ss.srSys #= 0x27
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      // NOTE: the program's own three `movec` (DTT0/ITT0/TC) ALSO go through this
+      // same S_APPLY state before the loop's four CPUSHLs ever run -- count REAL
+      // maintCmdOut pulses (a CPUSH/CINV-specific signal), not raw S_APPLY entries,
+      // or the 3 MOVECs get miscounted as CPUSHLs and the loop exits 3 commits early.
+      var sawExceptionPending = false
+      val guardBudget = 20000
+      var guard = 0
+      val maintAddrs = scala.collection.mutable.ArrayBuffer[Long]()
+      var prevMaintValid = false
+      while (maintAddrs.size < 4 && guard < guardBudget) {
+        val isMaintValid = dut.rob.logic.exc.dbgMaintCmdValid.toBoolean
+        if (isMaintValid && !prevMaintValid) {
+          maintAddrs += (dut.rob.logic.exc.dbgMaintCmdAddr.toLong & 0xffffffffL)
+        }
+        prevMaintValid = isMaintValid
+        if (dut.rob.logic.exceptionPending.toBoolean) sawExceptionPending = true
+        cd.waitSampling(); guard += 1
+      }
+      println(s"[cpushl-mmu-probe] maintCmdOut addresses seen, in order: " +
+        maintAddrs.map(a => f"0x$a%08x").mkString(", "))
+
+      assert(!sawExceptionPending,
+        "unexpected exception during the MMU-setup+store+CPUSHL sequence -- setup bug, " +
+        "not the hang under investigation")
+      assert(maintAddrs.size == 4,
+        s"expected exactly 4 real CPUSHL maintCmdOut pulses within $guardBudget cycles, " +
+        s"got ${maintAddrs.size}: ${maintAddrs.map(a => f"0x$a%08x").mkString(", ")} -- " +
+        s"THE HANG REPRODUCED if this is < 4. " +
+        s"sqDrained=${dut.rob.logic.exc.dbgSqDrained.toBoolean} " +
+        s"dcQuiesced=${dut.rob.logic.exc.dbgDcQuiesced.toBoolean} " +
+        s"SDrain=${dut.rob.logic.exc.dbgFsmIsSDrain.toBoolean} " +
+        s"SMaintWait=${dut.rob.logic.exc.dbgFsmIsSMaintWait.toBoolean}")
+      val expectedAddrs = (0 until 4).map(i => dataBase + i * 16)
+      assert(maintAddrs.toSeq == expectedAddrs,
+        s"the 4 CPUSHL commits targeted the wrong addresses -- got " +
+        s"${maintAddrs.map(a => f"0x$a%08x").mkString(", ")}, expected " +
+        s"${expectedAddrs.map(a => f"0x$a%08x").mkString(", ")} (a stale/repeated-address " +
+        s"bug would show duplicates here instead of 4 distinct, correctly-incrementing values)")
+
+      var settleGuard = 0
+      while (!dut.rob.logic.exc.dbgFsmIsIdle.toBoolean && settleGuard < 2000) {
+        cd.waitSampling(); settleGuard += 1
+      }
+      assert(dut.rob.logic.exc.dbgFsmIsIdle.toBoolean,
+        s"the exception-unit sysOp sequencer did not settle back to IDLE after the 4th " +
+        s"CPUSHL within $settleGuard extra cycles -- sqDrained=" +
+        s"${dut.rob.logic.exc.dbgSqDrained.toBoolean} dcQuiesced=" +
+        s"${dut.rob.logic.exc.dbgDcQuiesced.toBoolean}")
+
+      // Correctness, not just liveness: all four lines must have been genuinely
+      // pushed back to real memory (proves the dirty-line/WRB path actually engaged,
+      // not merely a fast no-op walk over clean/non-resident lines).
+      cd.waitSampling(4)
+      val expectedWords = Seq(0x11111111L, 0x22222222L, 0x33333333L, 0x44444444L)
+      for (i <- 0 until 4) {
+        val addr = dataBase + i * 16
+        val got = (0 until 4).foldLeft(0L)((acc, b) => (acc << 8) | dmem.peekByte(addr + b))
+        assert(got == expectedWords(i),
+          f"line $i (0x$addr%x) was not pushed to real memory by its CPUSHL: got 0x$got%08x, expected 0x${expectedWords(i)}%08x")
+      }
+    }
+  }
+
   // ── Task 9: FMOVE.L Dn,FPcr / FPcr,Dn end-to-end, in USER mode ────────────────
   // Proves three things the decode-level specs cannot: (a) the whole path really works
   // (decode -> rename -> IQ -> ALU EU -> ROB -> the serializing S_APPLY -> FpuControlPlugin
