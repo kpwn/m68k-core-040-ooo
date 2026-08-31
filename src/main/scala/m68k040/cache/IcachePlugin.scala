@@ -109,7 +109,20 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // any testbench via `simPublic`, and in synthesis it is a register whose only
     // driver is itself, so it constant-folds to True and costs nothing. Default ON, so
     // no DUT anywhere needs a wiring change.
-    val prefetchEnable = RegInit(True)
+    // Round-11 diagnostic (BUG_calibration_word_misplaced_0d00.md Part 57
+    // recommendation #1): a build-time-only override so a SEPARATE
+    // diagnostic bitstream can start this register False -- demand-fetch
+    // -only, zero speculative MSHR allocations ever -- without touching
+    // the sim-poke contract above (no new port; unset in every existing
+    // testbench/build, so behavior there is bit-identical to before).
+    // Read once at elaboration time, same `sys.env` pattern as
+    // `SocketTop.scala`'s `DBG_BUILD_ID` / `FullCoreSynth.scala`'s
+    // `readDbgBuildIdEnv`.
+    val icPrefetchDefaultOn: Boolean = sys.env.get("DBG_IC_PREFETCH_DISABLE") match {
+      case Some("1") => false
+      case _         => true
+    }
+    val prefetchEnable = RegInit(if (icPrefetchDefaultOn) True else False)
     prefetchEnable.simPublic()
     prefetchEnable := prefetchEnable
 
