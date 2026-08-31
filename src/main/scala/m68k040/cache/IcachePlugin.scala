@@ -552,6 +552,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
     mshrArSent.simPublic()
     mshrComplete.simPublic()
     mshrSet.simPublic()
+    // Round-13 whitebox ID-reuse mechanism test (IcacheIdReuseWhiteboxSpec):
+    // `mshrPa` is the per-slot address the R-channel accept gate (`pfRspMatch`,
+    // below) does NOT check -- it gates purely on RID (`rIdx`) + `mshrValid` +
+    // `mshrArSent` + `!mshrComplete`. Exposing the address register lets that test
+    // construct the worst case directly (poke a slot's `mshrPa` to a DIFFERENT
+    // address than the one its outstanding AR was actually sent for, mirroring the
+    // real boot's suspected "reallocated out from under an in-flight AXI ID"
+    // race) and prove the gate accepts the mismatched beat anyway. `fillLo`/
+    // `fillHi` are exposed the same way (each `Mem` instance needs its own call,
+    // per the `tagMem`/`lineMem` precedent above) so the test can read back
+    // exactly what landed in the slot's fill data after the accept.
+    fillLo.simPublic()
+    fillHi.simPublic()
+    mshrPa.simPublic()
+    mshrTag.simPublic()
 
     // ---- shared unified-array read port (synchronous; BRAM) ----
     // Address+enable are driven by the FSM (IDLE hit accept, or REPLAY), from
