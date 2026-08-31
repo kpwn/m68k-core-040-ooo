@@ -36,7 +36,27 @@ import org.scalatest.funsuite.AnyFunSuite
   * slot's fill complete with no complaint. If a real 68040-SoC race can ever
   * reallocate a slot before its own outstanding response truly lands (the open
   * hardware question rounds 53-59 have been chasing), THIS is the gate that would
-  * silently swallow it. */
+  * silently swallow it.
+  *
+  * Part 61 ADDENDUM: `IcachePlugin.scala` now carries the fix this mechanism proof
+  * motivated -- a per-slot generation counter (`mshrGen`/`mshrArSentGen`) that closes
+  * `pfRspMatch`/`demandRspMatch` against exactly this class of mismatch, plus a
+  * `staleDrain` path that accepts-and-discards (rather than permanently ignores) any
+  * response that fails the tightened gate, breaking the real, hardware-proven circular
+  * deadlock (Part 56 S8) this whole campaign exists to close. The MECHANISM test above
+  * is kept UNCHANGED and still passes post-fix: it pokes `mshrTag`/`mshrPa` directly
+  * WITHOUT touching `mshrGen`, so `genMatch` reads True throughout (identity and
+  * generation only ever change together at a real allocate site in this RTL) and the
+  * gate still accepts the beat by RID alone -- this documents, honestly, that the fix
+  * closes the GENERATION-REUSE-ACROSS-AN-OUTSTANDING-TRANSACTION class of bug (the one
+  * Part 57's real hardware capture actually exhibits), not a hypothetical same-
+  * generation address-corruption bug that Part 56 S2's static proof already shows this
+  * RTL cannot construct on its own (identity and generation are co-written at every
+  * real write site). The new "FIX" test below constructs the generation-mismatch shape
+  * directly (poking `mshrGen` the same way this file already established as this test
+  * class's own methodology for reaching otherwise-unreachable states) and proves the
+  * gate now drains-but-does-not-credit it, while the slot's own real, current request
+  * still completes normally afterward. */
 class IcacheIdReuseWhiteboxSpec extends AnyFunSuite {
 
   class Dut(xlateFactory: => FiberPlugin with TranslationService = new IdentityTranslationPlugin) extends Component {
@@ -222,6 +242,149 @@ class IcacheIdReuseWhiteboxSpec extends AnyFunSuite {
         "mshrTag drifted during the R beats -- re-derive rather than assume")
       assert(realAddress != fakeAddress, "sanity: the constructed addresses must differ")
       assert(realTag != fakeTag, "sanity: the constructed tags must differ")
+
+      simSuccess()
+    }
+  }
+
+  test("FIX: a stale-generation response is drained (unblocking the bus) but NOT " +
+       "credited to the current occupant, and the slot's own real, current request " +
+       "still completes normally afterward",
+       VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val axi = dut.icache.logic.axi
+
+      case class Ar(id: Int, address: Long)
+      val arLog = scala.collection.mutable.ArrayBuffer[Ar]()
+      axi.ar.ready #= true
+      axi.r.valid  #= false
+      axi.r.payload.data #= 0
+      axi.r.payload.id   #= 0
+      axi.r.payload.last #= false
+      axi.r.payload.resp #= 0
+      cd.onSamplings {
+        if (axi.ar.valid.toBoolean && axi.ar.ready.toBoolean) {
+          arLog += Ar(axi.ar.payload.id.toInt, axi.ar.payload.addr.toLong)
+        }
+      }
+
+      dut.probe.logic.cmdIn.valid #= false
+      dut.probe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      dut.icache.logic.prefetchEnable #= true
+      cd.waitSampling(2)
+
+      // ---- Same setup as the MECHANISM test above: get a real speculative slot
+      // ---- live+ARsent for a real address. ----
+      val base = 0x5000L
+      issueDemandNoWait(dut, cd, base)
+
+      val pfIdx = AxiIds.I_SPEC_BASE
+      waitUntilBounded(cd, "speculative slot's own AR to fire")(arLog.exists(_.id == pfIdx))
+      cd.waitSampling(2)
+
+      assert(IcacheArrayProbe.mshrValid(dut.icache, pfIdx), "setup failed: slot never went live")
+      assert(IcacheArrayProbe.mshrArSent(dut.icache, pfIdx), "setup failed: AR never registered as sent")
+      assert(!IcacheArrayProbe.mshrComplete(dut.icache, pfIdx), "setup failed: slot already complete")
+
+      // ---- Happy-path plumbing check: the generation the AR was actually sent under
+      // ---- must equal the slot's current generation (this is the ordinary,
+      // ---- non-poked case -- `genMatch` must be transparently True here, or every
+      // ---- existing I-cache test would already be failing). ----
+      val genAtArm = dut.icache.logic.mshrGen(pfIdx).toBigInt
+      assert(dut.icache.logic.mshrArSentGen(pfIdx).toBigInt == genAtArm,
+        "setup failed: mshrArSentGen did not latch the AR's own generation at AR-fire " +
+        "-- the fix's happy-path plumbing is broken, not just its stale-case behavior")
+
+      val staleDrainCount0 = dut.icache.logic.staleDrainCount.toBigInt
+
+      // ---- THE CONSTRUCTED WORST CASE (Part 57 S7's real hardware-inferred shape):
+      // ---- the slot's generation advances (as it would if a future bug -- or the
+      // ---- still-unattributed real SoC race -- let a reallocation happen without the
+      // ---- normal mshrArSent reset tracking it) while `mshrArSentGen` still holds the
+      // ---- OLD generation the outstanding AR truly belongs to. Constructed the same
+      // ---- way the MECHANISM test constructs its own worst case: poke state the
+      // ---- natural allocator provably cannot reach on its own (Part 56 S2), standing
+      // ---- in for the hypothesized race. ----
+      dut.icache.logic.mshrGen(pfIdx) #= (genAtArm + 1) % 16
+      cd.waitSampling()
+      assert(dut.icache.logic.mshrGen(pfIdx).toBigInt == (genAtArm + 1) % 16,
+        "poke of mshrGen did not hold")
+      assert(dut.icache.logic.mshrArSentGen(pfIdx).toBigInt == genAtArm,
+        "sanity: mshrArSentGen must still read the OLD generation")
+
+      val staleLo = BigInt("DEADBEEF" * 8, 16)
+      val staleHi = BigInt("CAFEBABE" * 8, 16)
+
+      def sendBeat(data: BigInt, last: Boolean): Boolean = {
+        axi.r.valid #= true
+        axi.r.payload.id #= pfIdx
+        axi.r.payload.data #= data
+        axi.r.payload.resp #= 0
+        axi.r.payload.last #= last
+        cd.waitSampling()
+        val accepted = axi.r.ready.toBoolean
+        axi.r.valid #= false
+        accepted
+      }
+
+      // The whole point of the fix: this must be accepted (drained) essentially
+      // immediately -- a real orphan must NEVER be left stuck on the bus, or the exact
+      // deadlock this fix exists to close (Part 56 S8) reappears.
+      assert(sendBeat(staleLo, last = false),
+        "stale-generation beat 0 was NOT drained -- axi.r.ready stayed low, which is " +
+        "the exact permanent-block condition (Part 56 S8 step 1) this fix exists to close")
+      assert(sendBeat(staleHi, last = true),
+        "stale-generation beat 1 (last) was NOT drained")
+
+      cd.waitSampling(2)
+
+      // ---- THE PROOF: drained, but NOT credited. ----
+      assert(!IcacheArrayProbe.mshrComplete(dut.icache, pfIdx),
+        "stale-generation beats were wrongly CREDITED -- mshrComplete went True for a " +
+        "response that did not belong to the current generation; the fix's genMatch " +
+        "term is not doing its job")
+      assert(!dut.icache.logic.mshrBeat(pfIdx).toBoolean,
+        "stale-generation beats perturbed mshrBeat -- the current occupant's own " +
+        "in-flight burst tracking must be untouched by a drained orphan")
+      assert(IcacheArrayProbe.mshrValid(dut.icache, pfIdx) && IcacheArrayProbe.mshrArSent(dut.icache, pfIdx),
+        "the slot's own live/ARsent bookkeeping was disturbed by draining an orphan " +
+        "-- it must stay exactly as it was, still waiting for its REAL response")
+      val gotLoAfterStale = dut.icache.logic.fillLo.getBigInt(pfIdx)
+      val gotHiAfterStale = dut.icache.logic.fillHi.getBigInt(pfIdx)
+      assert(gotLoAfterStale != staleLo && gotHiAfterStale != staleHi,
+        "the drained stale beats' data leaked into fillLo/fillHi anyway -- staleDrain " +
+        "must not write the line file")
+      assert(dut.icache.logic.staleDrainCount.toBigInt == (staleDrainCount0 + 2) % 256,
+        "staleDrainCount did not advance by exactly 2 for the two drained beats")
+
+      // ---- THE OTHER HALF OF THE PROOF (explicitly required by this task): the
+      // ---- slot's real, CURRENT request must still be able to complete normally
+      // ---- afterward -- draining the orphan must not have broken the happy path.
+      // ---- Stand-in for "the real AR for the new generation gets (re)sent": latch
+      // ---- `mshrArSentGen` up to the current generation, exactly what the real
+      // ---- `axi.ar.fire` handler does the moment the slot's OWN AR is actually
+      // ---- accepted. ----
+      dut.icache.logic.mshrArSentGen(pfIdx) #= dut.icache.logic.mshrGen(pfIdx).toBigInt
+      cd.waitSampling()
+
+      val realLo = BigInt("11111111" * 8, 16)
+      val realHi = BigInt("22222222" * 8, 16)
+      assert(sendBeat(realLo, last = false), "the slot's real beat 0 was not accepted after re-arming")
+      assert(sendBeat(realHi, last = true), "the slot's real beat 1 (last) was not accepted after re-arming")
+      cd.waitSampling(2)
+
+      assert(IcacheArrayProbe.mshrComplete(dut.icache, pfIdx),
+        "the slot's own real, current response was not credited even after its " +
+        "generation matched again -- the fix broke the happy path")
+      val gotLoReal = dut.icache.logic.fillLo.getBigInt(pfIdx)
+      val gotHiReal = dut.icache.logic.fillHi.getBigInt(pfIdx)
+      assert(gotLoReal == realLo && gotHiReal == realHi,
+        f"the slot's real fill data is wrong -- got lo=0x$gotLoReal%x hi=0x$gotHiReal%x, " +
+        f"expected lo=0x$realLo%x hi=0x$realHi%x")
 
       simSuccess()
     }

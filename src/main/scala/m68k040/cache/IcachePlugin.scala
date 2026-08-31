@@ -499,6 +499,43 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val mshrTag      = Vec.fill(MSHR_N)(Reg(UInt(tagBits bits)))
     val mshrWay      = Vec.fill(MSHR_N)(Reg(UInt(wayBits bits)))
 
+    // ---- deadlock defense: per-slot generation counter (BUG_calibration_word_
+    // misplaced_0d00.md, macqd700-soc repo, Parts 53-60) --------------------------
+    // Parts 53-60's real-hardware ILA campaign structurally proved (Part 56 S8) that
+    // `pfRspMatch`/`demandRspMatch` below are ID-INDEXED, not transaction-indexed: once
+    // an AXI RID is reused for a NEW occupant while an OLDER transaction under that same
+    // ID is still outstanding on the bus, the gate has no way to tell the two apart, and
+    // a hardware capture (Part 57) found exactly this signature -- three live speculative
+    // slots each one generation ahead of the last AR they actually got to send, with the
+    // orphaned older response permanently jamming L2C's single shared output register and
+    // deadlocking the whole speculative fetch path forever (Part 56 S8's closed circular-
+    // wait proof). `IcacheIdReuseWhiteboxSpec` independently proved the gate accepts a
+    // same-RID beat with NO cross-check against the slot's own current identity at all.
+    //
+    // `mshrGen(i)` -- a per-slot generation counter, incremented (wrapping) on EVERY
+    // fresh allocation of slot `i` (the two `mshr*(idx) := ...` allocate write sites
+    // below -- the demand miss-detect arm and the speculative `pfFreeMshr` arm -- are the
+    // ONLY writers, mirroring exactly the two sites that (re)write `mshrTag`/`mshrPa`, so
+    // a generation bump is inseparable from an identity change in real RTL).
+    // `mshrArSentGen(i)` -- latched to `mshrGen(i)`'s value at the exact cycle `axi.ar.
+    // fire` sends slot `i`'s AR (the single `mshrArSent(...) := True` site below).
+    // Deliberately NOT reset at allocation, so it always holds the generation the LAST
+    // AR actually put on the real bus for that slot belonged to, surviving any later
+    // reallocation -- exactly Part 57's own debug-tap design, now load-bearing rather
+    // than observation-only.
+    //
+    // `genMatch` below (built from these two) closes the gate against a response whose
+    // RID is live but whose armed AR belongs to an OLDER generation than the slot's
+    // CURRENT occupant -- and anything that fails it is drained-but-not-credited by the
+    // `staleDrain` path (see the R-channel handler below), which is what actually breaks
+    // the proven circular wait: an orphaned response can now ALWAYS be accepted off the
+    // bus (unblocking L2C's shared register) without ever being misattributed to the
+    // wrong occupant's fill.
+    val mshrGen       = Vec.fill(MSHR_N)(RegInit(U(0, 4 bits)))
+    val mshrArSentGen = Vec.fill(MSHR_N)(RegInit(U(0, 4 bits)))
+    mshrGen.simPublic()
+    mshrArSentGen.simPublic()
+
     // The install target, registered one cycle AHEAD of the dwell so the file read is
     // synchronous. Set in INSTALL_ARM's two entry arms (REFILL's clean completion and
     // IDLE's speculative install); stable for the whole PREDECODE dwell.
@@ -552,6 +589,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
     mshrArSent.simPublic()
     mshrComplete.simPublic()
     mshrSet.simPublic()
+    // Part 61 fix-side verification (IcacheIdReuseWhiteboxSpec): lets a directed test
+    // confirm a drained stale-generation beat left the per-slot beat-toggle bookkeeping
+    // (and therefore the CURRENT occupant's own in-flight burst) completely untouched.
+    mshrBeat.simPublic()
     // Round-13 whitebox ID-reuse mechanism test (IcacheIdReuseWhiteboxSpec):
     // `mshrPa` is the per-slot address the R-channel accept gate (`pfRspMatch`,
     // below) does NOT check -- it gates purely on RID (`rIdx`) + `mshrValid` +
@@ -1880,6 +1921,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         mshrBeat(DEMAND_IDX)     := False
         mshrErr(DEMAND_IDX)      := False
         mshrPoison(DEMAND_IDX)   := False
+        mshrGen(DEMAND_IDX)      := mshrGen(DEMAND_IDX) + 1  // deadlock defense: fresh allocation
         // Identical to the deleted `lookupPaddr` capture: `s0Ppn` IS `lookupPaddr(31:12)`
         // and `s0Pc(11:0)` IS `lookupPc(11:0)` = `lookupPaddr(11:0)` (VIPT: the page
         // offset is untranslated).
@@ -2119,6 +2161,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
         mshrBeat(pfFreeMshr)     := False
         mshrErr(pfFreeMshr)      := False
         mshrPoison(pfFreeMshr)   := False
+        mshrGen(pfFreeMshr)      := mshrGen(pfFreeMshr) + 1  // deadlock defense: fresh allocation
         mshrPa(pfFreeMshr)       := pfNextPa
         mshrSet(pfFreeMshr)      := pfCandSet
         mshrTag(pfFreeMshr)      := pfCandTag
@@ -2277,6 +2320,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     when(axi.ar.fire) {
       arHoldValid := False
       mshrArSent(arHoldId.resize(mshrIdxBits)) := True
+      // deadlock defense: record which generation THIS AR belongs to.
+      mshrArSentGen(arHoldId.resize(mshrIdxBits)) := mshrGen(arHoldId.resize(mshrIdxBits))
     }
 
     // Route every R beat solely by RID -- and after M2c the RID IS the MSHR index, so
@@ -2290,12 +2335,65 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // dwell and REPLAY, whereas an R beat is only legal in REFILL. Reading mshrValid
     // here would widen the accept window by four states and silence the assertion below
     // for exactly the beats it exists to catch.
-    val demandRspMatch = ridIsDemand && refillActive && mshrArSent(DEMAND_IDX)
-    val pfRspMatch = ridIsPf && mshrValid(rIdx) && mshrArSent(rIdx) && !mshrComplete(rIdx)
-    axi.r.ready := demandRspMatch || pfRspMatch
+    // deadlock defense (BUG_calibration_word_misplaced_0d00.md Parts 53-61): the
+    // response's armed AR must belong to the SAME generation the slot is CURRENTLY on.
+    // See `mshrGen`/`mshrArSentGen`'s declaration above for the full rationale. In the
+    // natural (non-poked) RTL this is exactly redundant with `mshrArSent` -- both flip
+    // together at allocate (gen bumps, arSent clears) and together at AR-fire (arSentGen
+    // latches, arSent sets) -- so this term changes NOTHING on any path this design can
+    // reach today; it only starts discriminating if some future bug (or an as-yet-
+    // unattributed real SoC race) ever lets a slot's generation advance without its
+    // `mshrArSent` bookkeeping tracking it, which is exactly the shape Part 57's
+    // hardware capture inferred (three live slots each one generation ahead of the
+    // last AR they actually sent).
+    val genMatch = mshrArSentGen(rIdx) === mshrGen(rIdx)
+    val demandRspMatch = ridIsDemand && refillActive && mshrArSent(DEMAND_IDX) && genMatch
+    val pfRspMatch = ridIsPf && mshrValid(rIdx) && mshrArSent(rIdx) && !mshrComplete(rIdx) && genMatch
+
+    // deadlock defense, THE actual fix for the proven circular wait (Part 56 S8): a
+    // response landing on a RID this port itself owns (`ridIsDemand || ridIsPf` -- this
+    // is the I-cache's own dedicated AXI master port, so every legal `axi.r.valid` beat
+    // is one of these two ranges by construction) that is NOT a genuine match for the
+    // CURRENTLY-armed occupant is, by elimination, a beat belonging to some OLDER,
+    // already-superseded generation of that same slot -- an orphan the fabric still owes
+    // a response for. Before this fix `axi.r.ready` could NEVER assert for such a beat
+    // (Part 56 S8 step 1): it would sit at L2C's single shared output register forever,
+    // jamming L2C's front door and permanently blocking the CURRENT occupant's own AR
+    // from ever being accepted (steps 2-5 of that same proof) -- a real, hardware-
+    // reproduced deadlock (13 investigation rounds, Parts 53-60).
+    //
+    // Precedent: `AxiReadResetAbsorber` already establishes this project's pattern for
+    // "accept and discard a response nobody has a live claim on, so the bus does not
+    // wedge" -- there, scoped to the window after a debug reset; here, scoped
+    // continuously, per-ID, off the exact same-shaped "is there a live owner" gate this
+    // file already computes. `staleDrain` asserts `axi.r.ready` for exactly this case
+    // WITHOUT touching `rOwned`/`rFire` below, so the beat is consumed off the wire
+    // (unblocking the fabric) but never written into `fillLo`/`fillHi` and never
+    // credited toward `mshrBeat`/`mshrComplete` for the current occupant -- the slot's
+    // real, current request is completely unaffected and can still complete normally
+    // once its own AR is actually accepted and its own response actually arrives.
+    val demandStaleRsp = ridIsDemand && !demandRspMatch
+    val pfStaleRsp      = ridIsPf && !pfRspMatch
+    val staleDrain = demandStaleRsp || pfStaleRsp
+    axi.r.ready := demandRspMatch || pfRspMatch || staleDrain
+
+    // Debug/verification-only: count drained stale beats (never read by any
+    // synthesizable logic -- simPublic() for `IcacheIdReuseWhiteboxSpec`'s fix-side
+    // assertions and any future dbg040 tap in the SoC-side port of this fix).
+    val staleDrainCount = Reg(UInt(8 bits)) init 0
+    when(axi.r.valid && axi.r.ready && staleDrain && staleDrainCount =/= U(255, 8 bits)) {
+      staleDrainCount := staleDrainCount + 1
+    }
+    staleDrainCount.simPublic()
 
     when(axi.r.valid) {
-      assert(demandRspMatch || pfRspMatch, "I-cache R beat has no live RID owner")
+      // Widened from "must be a live-owned beat" to "must be a RECOGNIZED-ID beat" now
+      // that `staleDrain` legitimately accepts a recognized-but-stale-generation one --
+      // a beat on neither range would still be a genuine "no live RID owner" protocol
+      // violation (this port's own AXI ID space is exhaustively `ridIsDemand ||
+      // ridIsPf`), so the assertion keeps exactly its original fault-catching power for
+      // that case.
+      assert(ridIsDemand || ridIsPf, "I-cache R beat has no live RID owner")
     }
 
     // ---- M2b: uniform R-channel write. NO demand/speculative asymmetry. ----
