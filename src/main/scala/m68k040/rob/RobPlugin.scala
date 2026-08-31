@@ -1808,6 +1808,45 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // it drives only pointer/reg resets (FMax: no combinational execute->flush path).
     // The exception FSM's final redirect (vector target / RTE restored PC) is ORed
     // into it below (after the exc unit is built).
+    //
+    // ── INVESTIGATED AND REJECTED: a "registered early-flush" fast path ─────────
+    // (2026-08-31, boot-investigation follow-up, see the companion SoC repo's
+    // docs/BUG_calibration_word_misplaced_0d00.md Part 61). The obvious textbook
+    // fix for "flush latency scales with how long the branch takes to reach head"
+    // is to register `branchCompletion`'s {robId, mispredict, nextPc} at EU
+    // resolution (S1) and fire a NARROW squash — tail := robId+1, preserving
+    // [head, robId] so older still-in-flight work survives — one cycle later,
+    // instead of waiting for full in-order retire. This was investigated in depth
+    // and found UNSAFE to bolt onto this codebase's rollback machinery as scoped:
+    //
+    // `RatTable.io.rollback` / `Freelist.io.flush` (RenameStage.scala) are each a
+    // SINGLE GLOBAL "restore to the committed shadow" operation — `location := 0`
+    // reverting EVERY arch register to `commReg`, `head := commHead` returning
+    // EVERY in-flight speculative pop — with no per-branch or per-robId
+    // granularity. There is no existing hook to roll back "only what's younger
+    // than robId X" while leaving [head, X) untouched. Firing today's `flushing`
+    // (doFlushReg) EARLY, before the branch reaches head, therefore ALSO discards
+    // every not-yet-retired OLDER entry between the current head and the branch —
+    // and if `flushPc` is set to the branch's resolved target (the natural choice
+    // for a "narrow" squash), fetch resumes PAST those older instructions without
+    // ever re-executing them: a silent, permanent loss of their architectural
+    // effects. Redirecting instead to the current committed PC avoids that
+    // corruption but degenerates into "eagerly squash everything in flight the
+    // instant ANY branch anywhere resolves mispredicted" — safe, but strictly
+    // MORE aggressive than today's design (discards legitimate older in-flight
+    // work too) and does not deliver the intended narrow/fast recovery at all.
+    // A real fix needs actual per-branch (or small-N) RAT/Freelist checkpoint+
+    // restore, mirroring RasPlugin's checkpointSave/checkpointRestore (Ras.scala,
+    // landed 2026-08-28 from this SAME investigation) — but RAS's own doc comment
+    // explicitly notes a precise per-branch version needs "real ROB-side plumbing,
+    // out of scope" for that narrower fix; the INT/NZVC/X side is the same size
+    // of lift, properly scoped as its own follow-up, not a 1-cycle timing tweak.
+    // Today's retire-gated `branchRedirect` below is CORRECT (re-verified via
+    // deep_mispredict/unstable_branch/mispredict/adv_a7_spec_flush/
+    // adv_store_squash_mispredict/adv_flush_restart_store, all green) precisely
+    // BECAUSE it only fires once the branch IS head — at that instant "restore to
+    // committed" and "restore to just-after-the-branch" are the same state by
+    // construction. Do not re-derive this from scratch; read Part 61 first.
     val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
     branchRedirect.simPublic() // 2026-08-27 boot-investigation debug tap
 
