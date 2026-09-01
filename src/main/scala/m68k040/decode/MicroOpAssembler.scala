@@ -1620,8 +1620,25 @@ object MicroOpAssembler {
     // srcC/indexLong/indexScale from `srcEa` below and the branch EU's target adder folds
     // in the scaled index. Full-format MEMORY-INDIRECT (EaClass.MEMINDIRECT, a genuinely
     // different EA class requiring a memory load of the pointer) is NOT in scope here —
-    // `srcIsMem` already excludes it (only MEMSIMPLE), so it stays illegal/unimplemented
-    // until a future µcode-sequencer extension gives JMP/JSR/LEA/PEA memory-indirect support.
+    // `srcIsMem` already excludes it (only MEMSIMPLE) -- STALE COMMENT UPDATE (2026-09-01,
+    // BUG_calibration_word_misplaced_0d00.md Part 70): task #201 (commit 8c1f0cd, merged
+    // 2026-07-22) DID land that "future µcode-sequencer extension" — MI_LEA_ENTRY/MI_PEA_
+    // ENTRY/MI_JMP_ENTRY/MI_JSR_ENTRY in Microcode.scala, routed via DecodeStage.scala's
+    // s0IsLea/s0IsPea/s0IsJmp/s0IsJsr + s1mi_isLea/... + ucLeaMi/ucPeaMi/ucJmpMi/ucJsrMi
+    // early-gate classifiers, ALL keyed off the raw opword bits (mirroring isLeaOp/isPeaOp/
+    // isJmpOp/isJsrOp below) since this fast-path assembler carries no usable identity
+    // signal for them either way. A MEMINDIRECT JMP/JSR/LEA/PEA is diverted to that engine
+    // BEFORE `ctrlEaOk`/`jmpBad`/`jsrBad`/`leaPeaEaOk` below ever see it — this gate (and
+    // this assembler's `bad` output generally) stays live only for the genuinely-illegal
+    // shapes (An-direct/imm/predec/postinc source), exactly like the pre-existing MOVEM/
+    // microcoded-op precedent. Directed regression: jsr_mem_indexed.s / jsr_preindexed_
+    // memind_atrap_table.s / lea_memind_an.s / pea_memind.s / control_full_memind_
+    // siblings.s (src/test/resources/m68kooo-ported-tests/asm/), all PASS as of this date,
+    // including a byte-exact replica of real ROM `0x40809A04`
+    // (`jsr @($400,D2.w*4)@(0)` / `4eb0 25a1 0400`). Do not re-derive "illegal/
+    // unimplemented" from this comment/gate alone without also checking DecodeStage.scala's
+    // early-routing gates — that is what Part 69 of the doc above did, and it produced a
+    // false-positive "real cpu040 bug" finding for a case actually fixed 6 weeks earlier.
     val ctrlEaOk = srcIsMem
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
     val isRtsBad = (op === B"16'h4E75")
