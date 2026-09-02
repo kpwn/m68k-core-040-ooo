@@ -1464,6 +1464,128 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
   }
 
+  // 2026-09-02 follow-up session (BUG_calibration_word_misplaced_0d00.md Part 8
+  // root-cause pursuit): the probe above asserts iplIn at t=0, before the loop's
+  // FIRST iteration has even retired -- recognition there (cyc=193, immediately
+  // after the SR-write's own fetch-refill bubble drains the ROB) does not
+  // directly test "an interrupt that becomes pending while the loop is
+  // DEFINITELY already deep in steady-state retirement", which is the exact
+  // shape Part 8's real-hardware finding described. This test closes that gap:
+  // let the SAME `dbf` loop retire for >=300 iterations UNOBSERVED first (no
+  // iplIn poke at all), confirmed via a live retire-PC counter watching for the
+  // loop-body PC, THEN assert iplIn mid-loop (a real ~299 iterations still
+  // remain of the natural 65536-iteration run -- nowhere near the loop's own
+  // exit), and measure the recognition latency from that exact cycle. A
+  // multi-hundred-cycle (many-iteration) gap here -- recognition only near the
+  // loop's natural end rather than within a handful of cycles of the poke --
+  // would be Part 8's stall, decisively (no "was it really pending during the
+  // loop" ambiguity: this harness pokes iplIn combinationally, so `iplActive`
+  // and `normalIrqGate`'s other terms are known-true the SAME cycle the poke
+  // lands, same convention as the probe above).
+  test("probe: interrupt asserted 300+ iterations INTO a dbf loop's steady-state retirement", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "movew #0x2000,%sr ; moveq #-1,%d0 ; loop: dbf %d0,loop ; nop ; nop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    val loopPc = loadAddr + 6L // movew(4) + moveq(2) -> dbf's own PC
+    compiledDut.doSim(freshSimName("case")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      var loopRetires = 0L
+      var pokeCyc = -1L
+      var recognizedAt = -1L
+      var cyc = 0L
+      val ringCap = 40
+      val ring = scala.collection.mutable.Queue[String]()
+      cd.onSamplings {
+        // Count every retirement of the dbf instruction's own PC (raw retire0/1,
+        // same low-latency tap runIrqLockStep itself uses) to know when we are
+        // genuinely deep in the loop's steady state.
+        val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
+        val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
+        if (dut.rob.logic.retire0.toBoolean && rawPc0 == loopPc) loopRetires += 1
+        if (dut.rob.logic.retire1.toBoolean && rawPc1 == loopPc) loopRetires += 1
+        if (pokeCyc < 0 && loopRetires >= 300) {
+          // Poke NOW: iplIn was 0 (masked-irrelevant, mask already 0 from the
+          // earlier movew) the entire time up to this cycle -- this is the
+          // FIRST cycle iplActive/normalIrqGate's iplIn term can possibly go
+          // true, and it lands well inside the loop's steady-state run.
+          dut.intCtrl.logic.iplIn      #= 5
+          dut.intCtrl.logic.iackAvec   #= true
+          dut.intCtrl.logic.iackVector #= 0
+          pokeCyc = cyc
+        }
+        if (pokeCyc >= 0 && recognizedAt < 0) {
+          val ip  = dut.rob.logic.interruptPending.toBoolean
+          val nig = dut.rob.logic.normalIrqGate.toBoolean
+          val fl  = dut.rob.logic.flushing.toBoolean
+          val ei  = dut.rob.logic.excIdle.toBoolean
+          val ia  = dut.rob.logic.iplActive.toBoolean
+          val br  = dut.rob.logic.branchRedirect.toBoolean
+          val p0f = dut.rob.logic.p0.first.toBoolean
+          val p0pc = dut.rob.logic.p0.pc.toLong & 0xffffffffL
+          ring.enqueue(f"cyc=$cyc%7d (poke+${cyc - pokeCyc}%5d) ip=$ip nig=$nig fl=$fl ei=$ei ia=$ia br=$br p0f=$p0f p0pc=0x$p0pc%08x")
+          if (ring.size > ringCap) ring.dequeue()
+          if (ip) recognizedAt = cyc
+        }
+        cyc += 1
+      }
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp   #= 0
+      dut.ctrl.logic.srp   #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.msp #= 0
+      dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff  // boot default: MASKED (mask=7)
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var waited = 0
+      val capCycles = 200000
+      while (recognizedAt < 0 && waited < capCycles) { cd.waitSampling(2000); waited += 2000 }
+      System.err.println(s"[probe-midloop] loopRetires-at-poke=300 pokeCyc=$pokeCyc " +
+        s"recognizedAt=$recognizedAt (latency=${if (recognizedAt >= 0) recognizedAt - pokeCyc else -1} cycles). " +
+        s"Last $ringCap samples:")
+      ring.foreach(System.err.println)
+      assert(pokeCyc >= 0, "loop never reached 300 retirements of its own PC -- test setup broken")
+      assert(recognizedAt >= 0 && recognizedAt < capCycles,
+        s"interruptPending never recognized an interrupt asserted 300 iterations into a dbf loop's steady-state retirement")
+      // Decisive bound: a healthy recognition path preempts within a handful of
+      // cycles of the poke (this loop's own body is ~2 cycles/iteration, so even
+      // a few iterations of slack is generous). Part 8's stall claimed ~1950
+      // retirements of latency in a SoC-level repro -- 100 cycles here is well
+      // under that and well above any legitimate one-iteration-boundary slop.
+      assert(recognizedAt - pokeCyc < 100,
+        s"[DECISIVE] interrupt asserted well inside the loop's steady-state retirement was recognized " +
+          s"${recognizedAt - pokeCyc} cycles later, not within a handful of cycles -- this IS Part 8's " +
+          s"tight-loop interrupt-recognition stall, reproduced under fully controlled conditions")
+    }
+  }
+
   // NMI: level 7 is ALWAYS taken regardless of the mask (boot 7). Vector 31 @ 0x7C.
   test("lock-step IRQ: NMI (level 7) through mask 7", VerilatorTest) {
     val src =
