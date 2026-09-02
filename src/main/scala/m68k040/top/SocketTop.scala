@@ -165,18 +165,6 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val cpu_mon_sense        = out UInt (7 bits)
   val init_done_seen       = in Bool ()
 
-  // Bounded early-boot execution throttle (2026-08-27) — real functional
-  // input, D23-conformant (unlike the ILA taps just below this is NOT a
-  // debug-only tap). See DispatchPlugin.scala's `cpuBootThrottleEn` doc
-  // comment and docs/BUG_calibration_word_misplaced_0d00.md Part 7
-  // (companion SoC repo) for the full rationale. The SoC side only
-  // asserts this while VIA1 Timer 2 has a real countdown in flight AND a
-  // bounded (~200ms) early-boot window hasn't yet elapsed — both self-
-  // bounding, so this is provably inert (tie low is always safe) outside
-  // that narrow window, including for any non-m68k040 CPU stub that
-  // simply never drives it meaningfully.
-  val cpu_boot_throttle_en = in Bool ()
-
   // ── 2026-08-27 boot-investigation ILA taps (task: interrupt-recognition-
   // during-tight-loop bug) ──────────────────────────────────────────────
   // Deliberate, narrowly-scoped exception to D23's "only cpu_socket.vh ports"
@@ -398,17 +386,6 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     socket.icache.logic.invalidateAll := False
     socket.core.plugins.collectFirst { case r: m68k040.rob.RobPlugin => r }
       .get.logic.flush.valid := False
-
-    // ── Bounded early-boot execution throttle (2026-08-27) ──────────────────────────
-    // Real functional input (D23-conformant — NOT a debug tap, unlike the ILA taps
-    // below), same treatment as `cpu_ipl`/`iplInPort` just above: an `in Bool()`
-    // declared inside DispatchPlugin's own Area auto-promotes to a real M68kCore
-    // port, assigned here exactly like `bw.logic.iplInPort := cpu_ipl`. See
-    // DispatchPlugin.scala's `cpuBootThrottleEn` doc comment and
-    // docs/BUG_calibration_word_misplaced_0d00.md Part 7 (companion SoC repo).
-    val dp = socket.core.plugins.collectFirst {
-      case d: m68k040.dispatch.DispatchPlugin => d }.get
-    dp.logic.cpuBootThrottleEn := cpu_boot_throttle_en
 
     // ── 2026-08-27 boot-investigation ILA taps ──────────────────────────────────────
     // socket.core.dbg040.* are real OUTPUT PORTS of the M68kCore child component
