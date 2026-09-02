@@ -283,8 +283,42 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val absorbI = axiAbsorb.i.io.absorbing
     val absorbD = axiAbsorb.d.io.absorbing
 
+    // ── AXI boundary register slice (2026-09-02, follow-up session) ──────────────────
+    // Full-duplex register stage (`StreamPipe.FULL` = `s2mPipe().m2sPipe()`, SpinalHDL's
+    // own `amba4.axi` `Axi4[ReadOnly].pipelined(...)` helper -- no hand-rolled skid buffer,
+    // reusing proven first-party library code) inserted on every channel of BOTH `axi_i`
+    // and `axi_d`, right at the CPU's own outermost socket port boundary. See
+    // docs/BUG_calibration_word_misplaced_0d00.md (SoC repo) Part 86 / Part 87: Part 86
+    // found the SoC's fabric (`u_xbar`/`u_l2c`) -> core worst timing paths are raw
+    // combinational crossings with ZERO register at the AXI interface itself, reaching 30+
+    // logic levels deep straight into `RobPlugin`'s fault-capture registers. This stage
+    // guarantees no fabric-side combinational logic can reach a CPU-internal register (or
+    // vice versa) without first passing through a flop physically inside this component,
+    // immediately behind the port -- on ALL 5 channels of both masters for a clean,
+    // symmetric boundary rather than a one-channel patch (`b`/`w`-ready are exactly as
+    // structurally exposed as `r`/`b`-valid, per Part 86's own `ws_slv_reg`/`b_lock_reg`
+    // findings on the fabric side).
+    //
+    // Placed in `coreCd` EXPLICITLY -- NOT the ambient `ClockDomain` `Fiber.build` would
+    // otherwise capture at its own ambient call-site scope (which is `M68kSocketTop`'s own
+    // default domain, not `coreCd`: the `coreCd on {}` wrap around `socket` above has
+    // already closed by this point in the constructor) -- same reason `axiAbsorb` a few
+    // lines up needed an explicit `on` wrap. Unlike `axiAbsorb`, though, this stage belongs
+    // in `coreCd` ON PURPOSE, not `axiPorCd`: it must reset (and drop any in-flight beat)
+    // exactly when the rest of the core's AXI consumer state does, so the read-reset-
+    // absorber's port-level fire counting just above (which taps `axi_i`/`axi_d` UPSTREAM
+    // of this stage) sees no new class of stuck state -- the reset-domain mismatch the
+    // absorber exists to paper over is still exactly at the `axi_i`/`axi_d` pins, unmoved
+    // by this purely-internal, purely-`coreCd` buffering stage.
+    val axiRegSlice = coreCd on new Area {
+      val ic = socket.icache.logic.axi.pipelined(ar = StreamPipe.FULL, r = StreamPipe.FULL)
+      val dm = socket.merge.logic.axi.pipelined(
+        aw = StreamPipe.FULL, w = StreamPipe.FULL, b = StreamPipe.FULL,
+        ar = StreamPipe.FULL, r = StreamPipe.FULL)
+    }
+
     // ── axi_i: the I-cache, permuted on r.data only (D3, D11) ───────────────────────
-    val ic = socket.icache.logic.axi
+    val ic = axiRegSlice.ic
     axi_i.arid    := ic.ar.payload.id
     axi_i.araddr  := ic.ar.payload.addr
     axi_i.arlen   := ic.ar.payload.len
@@ -303,7 +337,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     axi_i.rready  := ic.r.ready || absorbI   // absorb-and-discard stale beats
 
     // ── axi_d: the merged master, permuted on w.data / w.strb / r.data (D3) ─────────
-    val dm = socket.merge.logic.axi
+    val dm = axiRegSlice.dm
     axi_d.awid    := dm.aw.payload.id
     axi_d.awaddr  := dm.aw.payload.addr
     axi_d.awlen   := dm.aw.payload.len
