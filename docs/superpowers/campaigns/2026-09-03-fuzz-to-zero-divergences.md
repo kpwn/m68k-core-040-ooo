@@ -1057,3 +1057,78 @@ groups built against an empty clock object. **Every FMax number in this document
 self-consistent only within that set. Any future measurement must **re-baseline** — i.e.
 re-run the branch point under the new constraints — before a delta is attributed to a code
 change. Otherwise their constraint fix will be misread as this branch's regression or win.
+
+---
+
+## Round 6 — cluster E ISOLATED by measurement (no theorising this time)
+
+Per the standing correction against myself, I did not name a mechanism. I ran a probe that
+makes the DUT *report its own computed address*, then a second that varies one thing.
+
+### Probe 1 — does the EA computation itself work?
+
+```
+	move.l #0xffff3ff0,%a3
+	move.l #0xffffffff,%d6
+	lea    (0x10036,%a3,%d6.l*4),%a0
+	move.l %a0,(0x4000).l              <- publish the DUT's OWN computed EA
+	move.w #0x80,(0x10036,%a3,%d6.l*4) <- the failing store, same EA
+```
+
+Result: the only divergences are `mem[0x4022]`/`[0x4023]`. **`mem[0x4000..0x4003]` does NOT
+diverge**, so the DUT's `lea` of that exact full-format indexed EA produced **`0x00004022`,
+the architecturally correct address**, and wrote it correctly.
+
+**Therefore: long base-displacement framing is NOT broken.** That hypothesis is dead — the
+same `bd`, index, scale and wraparound resolve correctly through `lea`.
+
+### Probe 2 — is it the immediate source?
+
+Same destination EA shape, two stores, two distinct target addresses:
+
+```
+	move.w #0x80,(0x10036,%a3,%d6.l*4)   -> 0x4022   (immediate source)
+	move.w %d1,(0x10036,%a4,%d6.l*4)     -> 0x402a   (register source)
+```
+
+Result: `0x4022` diverges, **`0x402a` does not**.
+
+| Form | full-format indexed dst | outcome |
+|------|------------------------|---------|
+| `lea` of the EA | computes `0x4022` | correct |
+| `move.w %d1,<ea>` (register source) | stores at `0x402a` | correct |
+| `move.w #imm,<ea>` (immediate source) | — | **wrong address** |
+
+### Established fact
+
+**`MOVE #imm,<full-format indexed destination>` computes the wrong destination address.**
+Not the EA arithmetic, not the wraparound, not the long `bd` — those all work. It is
+specific to the **immediate-source** form.
+
+This is the exact shape of the **task #178** precedent, which needed a dedicated
+`MI_MOVE_DST_IMM_ENTRY` because the plain `MI_MOVE_DST_ENTRY` *"reads the 'other' side as
+a REGISTER (wrong for an immediate source)"* (`DecodeStage.scala`, `ucMoveDstMiImmEarly`).
+Task #178 fixed that for the **memory-indirect** destination. **Cluster E is the same
+defect one class over: the `MEMSIMPLE` full-format indexed destination**, which never went
+through the µcode engine and so never got the equivalent treatment.
+
+The mechanism is almost certainly extension-word framing: with an immediate source the
+immediate words precede the destination EA's extension words, so the dst EA must be decoded
+from a shifted window, and a full-format EA (long `bd` = 2 extra words) shifts differently
+from the brief form. **Stated as the leading candidate, not as established** — what is
+established is the three-way table above.
+
+### Testable prediction linking cluster E and seed 57
+
+Seed 57 is `ori.w #0x254a,(20,%a0,%a2.l*2)` — also **immediate source + indexed
+destination**, and its failure signature was independently traced to a suspected
+brief↔full extension-word mis-shift (bit 8 of the word being read as the EA extension).
+Cluster E is now measured to be immediate-source-specific with an indexed destination.
+
+**Prediction:** these two share a root cause (immediate-source destination-EA framing),
+differing only in decode site — line-3 `MOVE` for seed 21, line-0 immediate for seed 57.
+**Test it** by re-running seed 57's shape with a register source (`or.w %d1,(20,%a0,%a2.l*2)`):
+if that passes while the `ori.w` form fails, the same discriminator holds and one fix
+plausibly closes both (2 of the remaining 5). Unlike this campaign's earlier bad
+shape-matches, this prediction comes with a measured discriminator and an explicit way to
+falsify it — but it is **not yet confirmed**.
