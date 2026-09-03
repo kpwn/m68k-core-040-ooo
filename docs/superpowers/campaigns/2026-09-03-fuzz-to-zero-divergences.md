@@ -1132,3 +1132,36 @@ if that passes while the `ori.w` form fails, the same discriminator holds and on
 plausibly closes both (2 of the remaining 5). Unlike this campaign's earlier bad
 shape-matches, this prediction comes with a measured discriminator and an explicit way to
 falsify it — but it is **not yet confirmed**.
+
+### Prediction TESTED and CONFIRMED — seeds 21 and 57 share a class
+
+```
+	move.l #0x2,%a2
+	move.l #0x4006,%a1
+	move.w #0x3333,%d1
+	or.w   %d1,(20,%a1,%a2.l*2)        idx 6  <- REGISTER source   -> PASSES
+	move.l #0x3ffe,%a0
+	ori.w  #0x254a,(20,%a0,%a2.l*2)    idx 8  <- IMMEDIATE source  -> idx=8 pc: dut=0xc6e7d967
+```
+
+The register-source store at idx 6 retires cleanly; the immediate-source form at idx 8
+faults to a wild PC. Same discriminator as cluster E, one decode family over.
+
+**Combined result — the same class, two decode sites:**
+
+| Seed | Instruction | Dst EA | Symptom |
+|------|-------------|--------|---------|
+| 21 | `move.w #imm,<ea>` (line 3) | full-format indexed | silent **wrong address** |
+| 57 | `ori.w #imm,<ea>` (line 0) | brief indexed | **fault** → wild PC |
+
+Both are *immediate operand followed by an indexed destination EA*; in both, the
+register-operand counterpart works. **One fix plausibly closes both — 2 of the remaining 5.**
+
+**Caveat, stated because it weakens the second test.** Seed 21's probe was clean: both
+stores were `MOVE.W` with the same destination shape, and *only the source type* varied —
+a true single-variable experiment. Seed 57's probe crosses instruction families (`ORI`
+line-0 vs `OR` line-8), so it establishes "the immediate FORM fails where the register form
+works" but does not isolate the difference to the source operand alone as tightly. The
+shared-class conclusion rests mainly on seed 21's clean result plus the matching signature;
+treat "one fix closes both" as **likely, not proven**, until the fix is actually attempted
+and both are re-run.
