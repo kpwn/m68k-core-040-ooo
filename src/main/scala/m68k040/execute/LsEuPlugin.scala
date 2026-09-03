@@ -438,6 +438,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // pc+2+d8) for an indexed µop and s1Index adds the scaled Xn. All three are flops/
     // uop-derived (no ALU-result bypass) -> a single shallow adder, not on the ALU cone.
     val s1Va   = (s1Base.asSInt + s1Disp + s1Index.asSInt).asUInt
+    // Debug-only address-capture taps (fuzz cluster E investigation). Naming/observability
+    // only -- no hardware, same pattern as s1Ctx.robId/s1AddrB above.
+    s1Valid.simPublic(); s1Va.simPublic(); s1Base.simPublic(); s1Disp.simPublic()
+    s1Index.simPublic(); s1Data.simPublic(); s1Ctx.uop.pc.simPublic()
+    s1Ctx.uop.imm.simPublic(); s1Ctx.uop.useImm.simPublic()
     // The An write-back value for an auto-update µop (when it carries an int dst):
     //   PREDEC  -> s1Va (= base - eaDelta, the decremented An)
     //   POSTINC -> base + eaDelta

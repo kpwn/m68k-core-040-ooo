@@ -639,17 +639,53 @@ object MicroOpAssembler {
     }
     out
   }
-  // Shifted words view for an IMMEDIATE-SOURCE re-decode (the line-0 `immEa` and the
-  // MOVE-#imm `immDstEa`): the EA's own extension words start AFTER the immediate, i.e.
-  // at op+2 for a .B/.W immediate and op+3 for a .L one.
+  // ── Immediate-shifted EA view ───────────────────────────────────────────────────
+  // MERGED (Part 123): this helper was written INDEPENDENTLY and IDENTICALLY on two
+  // branches -- `fuzz/zero-divergence-campaign` (fuzz cluster E, seed 21) and
+  // `fix/line0-fullformat-ea` (Part 122, the Quadra 700 boot blocker). The bodies were
+  // byte-identical; only the surrounding rationale differed, so both rationales are kept
+  // below. Two independent measurements, one helper.
   //
-  // FOUR entries, not three. `EaDecoder` reads a full-format 32-bit base displacement as
-  // `wAt(words,2) ## wAt(words,3)`, and `wAt` returns a hardwired 0 for an index past the
-  // Vec's end -- so a 3-entry view silently dropped the LOW half-word of every long `bd`
-  // (0x00010036 -> 0x00010000), a wrong address with no trap. A full-format OUTER
-  // displacement would need a 5th/6th entry, but an EA that has one is EaClass.MEMINDIRECT,
-  // which this fast path never executes (`lineImmBad` rejects it / the µcode engine owns
-  // it). Same helper shape as the sibling fix on `fuzz/zero-divergence-campaign`.
+  // For a line-0 immediate (`ADDI/ORI/.../CMPI #imm,<ea>`) and for `MOVE #imm,<mem>`,
+  // the immediate's own extension word(s) PRECEDE the EA's, so the EA must be decoded
+  // from a view shifted by the immediate word count (1 for .B/.W, 2 for .L). Both call
+  // sites used to hand-build a THREE-entry Vec — `Vec(words(0), words(2), words(3))` —
+  // which is one word too short: `EaDecoder`'s full-format path reads `words(2)##words(3)`
+  // for a LONG base displacement, and `wAt` returns a hard 0 for any index past the Vec
+  // length. So a long `bd` silently lost its LOW half-word (measured: `0x00010036` decoded
+  // as `0x00010000`, sending `move.w #0x80,(0x10036,%a3,%d6.l*4)` to 0x00003fec instead of
+  // 0x00004022 — silently, no fault).
+  //
+  // FOUR entries, which is the MINIMUM that is correct and also exactly what
+  // `DecodeStage.scala`'s already-correct copies of this same re-decode (`s0ImmEaVec`,
+  // `s1mi_immVec`) use: index 1 = the ext word, indices 2..3 = a LONG `bd`. That is
+  // everything these two call sites can legitimately need, because the only EA class they
+  // resolve here is MEMSIMPLE (full-format `I/IS=000`), and `I/IS=000` forces
+  // `fOdPresent = extW(1) = 0` -- so the outer displacement is never read. A MEMINDIRECT
+  // EA is re-decoded from the full packet by the µcode engine, so its `od` does not come
+  // from here either.
+  //
+  // WIDTH IS LOAD-BEARING, MEASURED: a first attempt used SIX entries (enough to also cover
+  // a LONG outer displacement at 4..5). That is dead logic per the paragraph above, and it
+  // cost **13.1 MHz** of full-core OOC FMax (178.35 -> 165.23, A/B against the same branch
+  // point under the same constraints) -- widening the Vec turns `EaDecoder`'s dynamically-
+  // indexed `fOdWordAt` into a live 4-way select at BOTH call sites, on the decode cone that
+  // FMax "Lever B" already identified as the design's WNS path. Do not widen this past 4
+  // without re-running the gate.
+  //
+  // Built as an explicit 2-way `Mux` per element rather than through `shiftedWordsFor`'s
+  // dynamic index: the shift is one of exactly two constants, so this keeps the same
+  // 2:1-mux-per-word cost as the 3-entry Vecs it replaces (one more word, same structure)
+  // instead of introducing a 10:1 dynamic select. Index 0 is preserved verbatim
+  // (`EaDecoder.decode` never reads it -- see `shiftedWordsFor` -- but keeping it makes
+  // this a strict widening of the code it replaces).
+  //
+  // The Part 122 (boot-blocker) branch's independent statement of the same defect, kept
+  // because it names the real-hardware repro: the Quadra 700 ROM's RAM-sizing routine at
+  // 0x000098E2, `0CB0 316D 6567 8170 000F EFFC` = `cmpi.l #imm,%a0@(0xFEFFC)`, bd=LONG.
+  // A full-format OUTER displacement would need a 5th/6th entry, but an EA that has one is
+  // EaClass.MEMINDIRECT, which this fast path never executes (`lineImmBad` rejects it / the
+  // µcode engine owns it) -- the same conclusion the paragraph above reaches.
   private def immShiftedWords(words: Vec[Bits], immIsLong: Bool): Vec[Bits] =
     Vec.tabulate(4) { i =>
       if (i == 0) words(0)
@@ -776,12 +812,23 @@ object MicroOpAssembler {
     // operand CLASS is NOT offset-independent for the indexed modes -- see the
     // `srcEaIsMemSimpleEff` block below, which is what makes this correct.
     val immIsLong = spec.size === Size.LONG
-    // BUG_calibration_word_misplaced_0d00.md Part 122: this view is FOUR words wide, not
-    // three -- see `immShiftedWords` for why (a long base displacement lost its low
-    // half-word). Real-hardware repro: the Quadra 700 ROM's RAM-sizing routine at
-    // 0x000098E2, `0CB0 316D 6567 8170 000F EFFC` = `cmpi.l #imm,%a0@(0xFEFFC)`, bd=long.
-    val immEa = EaDecoder.decode(
-      op(5 downto 0), spec.size, immShiftedWords(pkt.words, immIsLong))
+    // .L: imm = words(1..2) -> shift 2; .B/.W: imm = words(1) -> shift 1. See
+    // `immShiftedWords` for why this is 4 entries and not 3 (a LONG base displacement
+    // needs words(2) AND words(3) of the shifted view).
+    //
+    // ONE shared instance for BOTH consumers (`immEa` here and `immDstEa` further down).
+    // They are bit-identical by construction -- same `pkt.words`, same `immIsLong` -- so
+    // two separate calls emitted two identical mux trees and left it to synthesis to
+    // notice. Hoisting is semantically a no-op and strictly removes logic; it is also the
+    // first thing to re-gate, because this change's measured 13.1 MHz OOC cost has NO
+    // logical path to the endpoint it degrades (see `immShiftedWords`), i.e. it looks like
+    // synthesis restructuring rather than a lengthened cone.
+    //
+    // Part 122's real-hardware repro for the SAME 3-vs-4 defect, kept from the merged
+    // branch: the Quadra 700 ROM's RAM-sizing routine at 0x000098E2,
+    // `0CB0 316D 6567 8170 000F EFFC` = `cmpi.l #imm,%a0@(0xFEFFC)`, bd=LONG.
+    val immShiftedView = immShiftedWords(pkt.words, immIsLong)
+    val immEa = EaDecoder.decode(op(5 downto 0), spec.size, immShiftedView)
     // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
     // (its ext follows the imm), srcEa otherwise.
     val opIsLineImm = spec.srcB.kind === OperandKind.IMMEXT
@@ -1386,10 +1433,12 @@ object MicroOpAssembler {
     // opword mode/reg bits, independent of word content) so they are byte-identical
     // either way; only `disp`/index need the shift.
     val immDstEaField = op(8 downto 6) ## op(11 downto 9)
-    // FOUR shifted words, not three -- identical rationale to `immEa` above (Part 122's
-    // long-base-displacement truncation); this is the MOVE #imm,<mem> sibling.
-    val immDstEa = EaDecoder.decode(
-      immDstEaField, spec.size, immShiftedWords(pkt.words, immIsLong))
+    // The SAME shifted view instance as `immEa` above (see its hoist comment), and the
+    // same 3-vs-4-entry correction: this is the call site fuzz seed 21 caught
+    // (`move.w #0x80,(0x10036,%a3,%d6.l*4)` storing to 0x00003fec because the long `bd`'s
+    // low half-word decoded as 0). This is the MOVE #imm,<mem> sibling of `immEa`'s
+    // line-0 case, and Part 122's long-base-displacement truncation is the same defect.
+    val immDstEa = EaDecoder.decode(immDstEaField, spec.size, immShiftedView)
     val stDstEa = Mux(immToMemCase, immDstEa, dstEa)
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────

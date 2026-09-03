@@ -119,7 +119,11 @@ object FuzzRunner {
                 nzvc      = 0,
                 nzvcWrite = false,
                 x         = 0,
-                xWrite    = false))
+                xWrite    = false,
+                // Scc <ea> memory-dest: the branch EU's op µop writes only T1 but IS the
+                // instruction's single kept oracle step. Without this the whole Scc-mem
+                // instruction vanished from the retire stream (fuzz cluster A, 40/57).
+                keepCommit = bw.keepCommit.toBoolean))
           }
         }
         for (k <- 0 until 2) {

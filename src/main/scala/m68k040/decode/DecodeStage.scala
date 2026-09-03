@@ -88,6 +88,80 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
   }
 
   val logic = during build new Area {
+    // ═══ SINGLE SOURCE OF TRUTH: memory-indirect routing family predicates ═══════
+    //
+    // ┌─ RULE FOR ANYONE ADDING A FAMILY HERE ─────────────────────────────────────┐
+    // │ Match the RAW OPWORD, never `spec.op`, unless you have measured otherwise. │
+    // │                                                                            │
+    // │ `spec` is the registered/OFFLOADED decoded spec and arrives LATE; the      │
+    // │ opword is available earlier. This is not a style preference — it was       │
+    // │ measured on the full-core OOC gate (5 ns primary), 2026-09-03:             │
+    // │                                                                            │
+    // │    baseline (no TAS)                        WNS -0.706   175.25 MHz        │
+    // │    TAS via `spec.op === DecOp.TAS`          WNS -1.447   155.11 MHz        │
+    // │    TAS via `opw(15 downto 6) === ...`       WNS -0.607   178.35 MHz        │
+    // │                                                                            │
+    // │ One term off `spec` cost 20.14 MHz (-11.5%). The identical condition off   │
+    // │ the opword cost nothing. That is why s0IsLea/s0IsPea/s0IsJmp/s0IsJsr       │
+    // │ (~line 760) are written against the opword — now you know the price.       │
+    // │                                                                            │
+    // │ The EA-class check at each call site (=== MEMINDIRECT) already excludes    │
+    // │ register-direct and other non-memory modes, so an opword match that is      │
+    // │ broader than the real instruction (e.g. TAS bits 15:6 also matching TAS Dn │
+    // │ and the illegal 0x4AFC) cannot misfire.                                    │
+    // └────────────────────────────────────────────────────────────────────────────┘
+    // Routing a MEMINDIRECT EA into the µcode engine requires the instruction family to
+    // be named in THREE parallel gates that must agree:
+    //   slot0IsMemInd       (slot-0 entry)     ~line 745
+    //   slot1IsMemIndEarly  (slot-1 entry)     ~line 285
+    //   ucIsMemInd          (engine re-decode) ~line 1975
+    // Historically each gate carried its OWN inline copy of the family list, and the
+    // copies DRIFTED. Every drift has the same failure mode: the family silently falls
+    // through to the ordinary non-microcoded fast path, whose EA machinery cannot walk a
+    // pointer chain, so it computes a GARBAGE address -> access fault -> wild PC (or, for
+    // Scc, a wrong-register write). That has now happened FOUR times:
+    //   task #144/#145  MOVE / ADDA-SUBA-CMPA src
+    //   task #150       ALU Dn,<ea> RMW dst (opmode 4/5/6) + ADDQ/SUBQ
+    //   task #152       static bit-op (tt vs ss field collision)
+    //   2026-09-03      TAS  <- fuzz clusters B/D, this change
+    // Adding one more inline entry would leave the trap armed for the fifth family, so
+    // the family predicates now live HERE, once, and all three gates call them. A future
+    // family is added in exactly one place and cannot drift.
+    //
+    // NOTE (deliberately NOT yet routed, see the campaign doc): the line-E MEMORY
+    // shift/rotate form and Scc <ea> are ALSO missing, but neither fits the existing
+    // MI_RMW_ENTRY shape without new machinery -- Microcode.scala hardcodes
+    // `u.shiftOp`/`u.shiftDir` (:2818, :3386) so a memory shift cannot carry its
+    // tt/dr through ctx, and Scc needs a CONDITION evaluation (branch EU) rather than
+    // an ALU host-op. Both need their own µcode entry; tracked as follow-ups.
+    def miSingleEaFamily(spec: OpSpec, opw: Bits): Bool =
+      (spec.op === DecOp.CLR) || (spec.op === DecOp.NEG) || (spec.op === DecOp.NEGX) ||
+      (spec.op === DecOp.NOT) || (spec.op === DecOp.TST) ||
+      // TAS <ea> (2026-09-03): a genuine byte RMW (read, set bit 7, write back) that maps
+      // onto MI_RMW_ENTRY's ptr-load / host-load->T1 / op->T1 / host-store shape with no
+      // new context fields -- `ctx.miOp` already carries the unary family. Its absence
+      // here is fuzz cluster B (8 of 11 seeds: 3, 4, 21, 22, 41, 74, 103, 126).
+      //
+      // Matched from the RAW OPWORD, not from `spec.op`, and that is load-bearing for
+      // TIMING, not style. The first version of this line was `spec.op === DecOp.TAS`,
+      // and the OOC gate isolated a -20.14 MHz FMax regression (175.25 -> 155.11) to
+      // that single term: `spec` is the registered/offloaded DECODED spec and arrives
+      // late, so hanging a new term off it lengthened the decode critical path. The four
+      // control families in this same file (s0IsLea/s0IsPea/s0IsJmp/s0IsJsr, ~line 760)
+      // already decode straight from the opword for exactly this reason. TAS is
+      // `0100 1010 11 mmmrrr`, so bits 15:6 identify it outright. Mode 0 (TAS Dn) and
+      // mode 7 reg 4 (the ILLEGAL 0x4AFC) also match these bits but can never classify
+      // as MEMINDIRECT, so the EA-class check at each call site excludes them -- this
+      // predicate cannot misfire onto them.
+      (opw(15 downto 6) === B"10'b0100101011")
+    def miAddqSubqFamily(spec: OpSpec): Bool = spec.srcB.kind === OperandKind.IMMQ3
+    def miLineImmFamily(spec: OpSpec):  Bool = spec.srcB.kind === OperandKind.IMMEXT
+    def miDynBitFamily(spec: OpSpec):   Bool =
+      (spec.op === DecOp.BITOP) && (spec.srcB.kind === OperandKind.REGFIELD)
+    def miAnArithFamily(spec: OpSpec): Bool =
+      (spec.dst.kind === OperandKind.REGFIELD) && spec.dst.isAddr &&
+      ((spec.op === DecOp.ADD) || (spec.op === DecOp.SUB) || (spec.op === DecOp.CMP))
+
     for (i <- 0 until 4) {
       _debugBreakPcs(i).allowOverride
       _debugBreakPcs(i) := 0
@@ -231,8 +305,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic) mirror s0AnArith/ucAnArith below —
     // see the s0AnArith comment (task #144 follow-up) for why this is needed and why it
     // does not affect DIVU/DIVS (line 8) / MULU/MULS (line C).
-    val s1mi_anArith = (slot1Spec0.dst.kind === OperandKind.REGFIELD) && slot1Spec0.dst.isAddr &&
-                       ((slot1Spec0.op === DecOp.ADD) || (slot1Spec0.op === DecOp.SUB) || (slot1Spec0.op === DecOp.CMP))
+    val s1mi_anArith = miAnArithFamily(slot1Spec0)
     val s1mi_isAluLine = (s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
                          (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))
     val s1mi_isAlu = s1mi_isAluLine &&
@@ -241,15 +314,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ALU Dn,<ea> RMW dst-EA (task #150, mirrors s0AluDstMode/ucAluDstMi): opmode 4/5/6.
     val s1mi_isAluDst = s1mi_isAluLine &&
                         ((s1mi_opmode === U(4, 3 bits)) || (s1mi_opmode === U(5, 3 bits)) || (s1mi_opmode === U(6, 3 bits)))
-    val s1mi_isSingle = (slot1Spec0.op === DecOp.CLR) || (slot1Spec0.op === DecOp.NEG) || (slot1Spec0.op === DecOp.NEGX) ||
-                        (slot1Spec0.op === DecOp.NOT) || (slot1Spec0.op === DecOp.TST)
+    val s1mi_isSingle = miSingleEaFamily(slot1Spec0, s1mi_opw)   // shared predicate (see logic's header)
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
-    val s1mi_isAddqSubq = slot1Spec0.srcB.kind === OperandKind.IMMQ3
-    val s1mi_isImm = slot1Spec0.srcB.kind === OperandKind.IMMEXT
+    val s1mi_isAddqSubq = miAddqSubqFamily(slot1Spec0)
+    val s1mi_isImm = miLineImmFamily(slot1Spec0)
     // DYNAMIC bit-op mirror of s0IsDynBitOp above (see its doc comment for the full
     // root-cause story, bit_dyn_indexed_memind.s cases 5/6): slot1's own copy of the
     // same missing classifier.
-    val s1mi_isDynBitOp = (slot1Spec0.op === DecOp.BITOP) && (slot1Spec0.srcB.kind === OperandKind.REGFIELD)
+    val s1mi_isDynBitOp = miDynBitFamily(slot1Spec0)
     // task #152: exclude the bit-op tt/.L-size field collision (see ucImmIsL's comment).
     val s1mi_immL  = (slot1Spec0.op =/= DecOp.BITOP) && (s1mi_opw(7 downto 6) === B"10")
     val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
@@ -574,8 +646,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // a garbage EA/wild PC). DIVU/DIVS (line 8) and MULU/MULS (line C) also use opmode
     // 3/7 but resolve to a different DecOp (not ADD/SUB/CMP), so s0AnArith naturally
     // excludes them — this does NOT change their routing.
-    val s0AnArith = (spec0.dst.kind === OperandKind.REGFIELD) && spec0.dst.isAddr &&
-                    ((spec0.op === DecOp.ADD) || (spec0.op === DecOp.SUB) || (spec0.op === DecOp.CMP))
+    val s0AnArith = miAnArithFamily(spec0)
     val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits)) ||
                        (s0AnArith && ((s0opmode === U(3, 3 bits)) || (s0opmode === U(7, 3 bits))))
     // ALU Dn,<ea> RMW dst-EA (task #150, mirrors ucAluDstMi below): opmode 4/5/6 on the
@@ -586,10 +657,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0AluDstMode = (s0opmode === U(4, 3 bits)) || (s0opmode === U(5, 3 bits)) || (s0opmode === U(6, 3 bits))
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors ucAddqSubqMi below): another
     // dst-EA RMW form, srcB.kind=IMMQ3 (distinct from the line-0 IMMEXT immediate).
-    val s0IsAddqSubq = spec0.srcB.kind === OperandKind.IMMQ3
-    val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) || (spec0.op === DecOp.NEGX) ||
-                       (spec0.op === DecOp.NOT) || (spec0.op === DecOp.TST)
-    val s0IsLineImm  = spec0.srcB.kind === OperandKind.IMMEXT
+    val s0IsAddqSubq = miAddqSubqFamily(spec0)
+    val s0IsSingleEa = miSingleEaFamily(spec0, s0opw)          // shared predicate (see logic's header)
+    val s0IsLineImm  = miLineImmFamily(spec0)
     // DYNAMIC bit-op (BTST/BCHG/BCLR/BSET Dn,<ea>): OperationDecoder gives its srcB a
     // REGISTER (dnField, the bit-number Dn -- see OperationDecoder.scala's
     // `o.srcB := Mux(isDynBit, dnField, immext)`), NOT an IMMEXT immediate like the
@@ -606,7 +676,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // at op+1 for the dynamic form (no preceding bit-number word, unlike static), so
     // this uses the SAME unshifted `s0srcEa` an ordinary ALU-src-EA op already uses --
     // not the shifted `s0ImmEa` the static form needs.
-    val s0IsDynBitOp = (spec0.op === DecOp.BITOP) && (spec0.srcB.kind === OperandKind.REGFIELD)
+    val s0IsDynBitOp = miDynBitFamily(spec0)
     // task #152: op[7:6] doubles as the bit-op tt sub-kind (BCLR=10 collides with the .L
     // size encoding) -- see ucImmIsL's comment below for the full explanation. Excluded
     // here too (this early gate is what decides engine entry in the first place).
@@ -1859,8 +1929,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // see s0AnArith's comment (task #144 follow-up) for why this is needed and why it does
     // not affect DIVU/DIVS (line 8) / MULU/MULS (line C), whose opmode 3/7 resolve to a
     // different DecOp (not ADD/SUB/CMP).
-    val ucAnArith = (ucEntrySpec.dst.kind === OperandKind.REGFIELD) && ucEntrySpec.dst.isAddr &&
-                    ((ucEntrySpec.op === DecOp.ADD) || (ucEntrySpec.op === DecOp.SUB) || (ucEntrySpec.op === DecOp.CMP))
+    val ucAnArith = miAnArithFamily(ucEntrySpec)
     val ucAluSrcMode   = (ucOpmode === U(0, 3 bits)) || (ucOpmode === U(1, 3 bits)) || (ucOpmode === U(2, 3 bits)) ||
                          (ucAnArith && ((ucOpmode === U(3, 3 bits)) || (ucOpmode === U(7, 3 bits))))
     val ucAluSrcMi = ucIsAluSrcLine && ucAluSrcMode && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
@@ -1888,7 +1957,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // line-0 immediate family already uses (SMiOther resolves to the imm when
     // miOtherIsImm is set), just with a different immediate SOURCE (opword bits, not an
     // ext word).
-    val ucIsAddqSubq = ucEntrySpec.srcB.kind === OperandKind.IMMQ3
+    val ucIsAddqSubq = miAddqSubqFamily(ucEntrySpec)
     val ucAddqSubqMi = ucIsAddqSubq && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     val ucAddqSubqQuick = ucEopw(11 downto 9).asUInt
     val ucAddqSubqImm = Mux(ucAddqSubqQuick === U(0, 3 bits), U(8, 32 bits), ucAddqSubqQuick.resize(32 bits)).asBits
@@ -1906,7 +1975,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucImmEaVec = Mux(ucImmIsL, Vec(ucEopw, ucEntryPkt.words(3), ucEntryPkt.words(4), ucEntryPkt.words(5)),
                                    Vec(ucEopw, ucEntryPkt.words(2), ucEntryPkt.words(3), ucEntryPkt.words(4)))
     val ucImmEa    = EaDecoder.decode(ucEopw(5 downto 0), ucEntrySpec.size, ucImmEaVec)
-    val ucIsLineImm= ucEntrySpec.srcB.kind === OperandKind.IMMEXT
+    val ucIsLineImm= miLineImmFamily(ucEntrySpec)
     val ucImmDstMi = ucIsLineImm && (ucImmEa.klass === EaClass.MEMINDIRECT)
     // DYNAMIC bit-op mirror of s0IsDynBitOp/s1mi_isDynBitOp above (see s0IsDynBitOp's
     // doc comment for the full root-cause story, bit_dyn_indexed_memind.s cases 5/6):
@@ -1914,12 +1983,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // slot0/slot1 gates that route the op INTO the engine in the first place. Uses the
     // default-fallback `ucMiSrcEa` (see `ucMiEa`'s Mux chain below, whose final `else`
     // arm already resolves to `ucMiSrcEa` for this case -- no new branch needed there).
-    val ucIsDynBitOp = (ucEntrySpec.op === DecOp.BITOP) && (ucEntrySpec.srcB.kind === OperandKind.REGFIELD)
+    val ucIsDynBitOp = miDynBitFamily(ucEntrySpec)
     val ucDynBitMi   = ucIsDynBitOp && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // single-EA op (CLR/NEG/NEGX/NOT/TST): the EA is op[5:0], the host op is spec.op.
-    val ucIsSingleEa = (ucEntrySpec.op === DecOp.CLR) || (ucEntrySpec.op === DecOp.NEG) ||
-                       (ucEntrySpec.op === DecOp.NEGX) || (ucEntrySpec.op === DecOp.NOT) ||
-                       (ucEntrySpec.op === DecOp.TST)
+    val ucIsSingleEa = miSingleEaFamily(ucEntrySpec, ucEopw)    // shared predicate (see logic's header)
     val ucSingleMi = ucIsSingleEa && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // ── LEA/PEA/JMP/JSR full-format mem-indirect (task #201) ────────────────────────────
     // Architecturally the SIMPLEST possible mem-indirect consumers: they need only the

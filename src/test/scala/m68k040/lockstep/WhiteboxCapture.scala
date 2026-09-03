@@ -95,25 +95,78 @@ object WhiteboxCapture {
       // MOVE-to-A7) — the synthesizable ss.a7 only tracks EXCEPTION A7 changes, so the
       // OoO A7 must be reconstructed from the whitebox writes here.
       var a7Run: Long = -1L
-      // The committed ss.a7 (a7Static) tracks ONLY exception/RTE/boot A7 changes (the
-      // exc unit writes it + PRF arch-15). OoO arch-15 writes (call/return, MOVE-to-A7)
-      // are NOT in ss.a7; they are reconstructed from the whitebox arch-15 wb. So:
-      // resync a7Run to a7Static whenever a7Static CHANGES (exc/boot moved A7), and
-      // otherwise fold OoO arch-15 wb writes. (An OoO write leaves ss.a7 unchanged, so
-      // it never triggers a spurious resync.)
-      var lastA7Static: Long = -2L
+      // ── a7Static resync: EVENT-TRIGGERED, never on a bare value edge ────────────
+      // The comment that used to live here claimed "ss.a7 tracks ONLY exception/RTE/boot
+      // A7 changes ... an OoO write leaves ss.a7 unchanged, so it never triggers a
+      // spurious resync". That premise is FALSE in the current RTL and was the direct
+      // cause of fuzz cluster C (8/200 seeds). Verified against the RTL, not comments:
+      //   ExceptionUnit.scala:734  `ss.writeA7.valid := True`  -- UNCONDITIONAL, every
+      //                            cycle, from committedA7In (the int-PRF readback at
+      //                            committedPhysA7, forceNoBypass).
+      //   ExceptionUnit.scala:727  documents the consequence inline: "the ACTIVE bank
+      //                            tracks A7 with ~1-2 cycle lag".
+      //   SystemState.scala:70     `val a7 = Mux(s, supBank, usp)` -- a mux of those
+      //                            continuously-written, lagging banks.
+      //   RobPlugin.scala:2629     `obs(0).a7 := RegNext(exc.ss.a7)` -- one more cycle.
+      // So ss.a7 mirrors EVERY A7 write (MOVEM/LINK/BSR/RTS included) and lags by >=2
+      // commit cycles. Resyncing on a VALUE EDGE therefore replays the A7 history ~2
+      // retirements late, on top of the correctly-folded live value. Because the resync
+      // ran BEFORE the OoO fold below, a record carrying its own arch-15 writeback was
+      // immune, and only a record that does NOT write A7 was exposed -- so two adjacent
+      // A7-changing retirements (e.g. `movem -(%sp)` then `movem (%sp)+`) followed by any
+      // ordinary instruction made that instruction report the STALE pre-pop A7 and then
+      // self-correct one step later. Exactly the observed cluster-C signature.
+      //
+      // The fold below is authoritative for every ORDINARY A7 change (they are all real
+      // arch-15 writebacks). a7Static is needed only for A7 movement that does NOT appear
+      // as an arch-15 writeback, which is exactly:
+      //   (1) exception entry / RTE  -> ExcRec resyncs directly;
+      //   (2) an EXCEPTION FRAME PUSH -> the exc unit writes A7 straight into the PRF at
+      //       committedPhysA7 (ExceptionUnit.scala:588) WITHOUT going through an EU, so it
+      //       produces no wbObs and the fold structurally cannot see it. a7Static is the
+      //       only witness. (A first attempt at this fix resynced only on a (S,M) bank
+      //       switch and broke exactly here -- an IRQ taken while already supervisor
+      //       changes A7 by -8 with S and M unchanged: 7 ExecuteLockStepSpec failures,
+      //       all IRQ/STOP/RTE. Kept as a comment because the narrow rule looks correct.)
+      //   (3) a (S,M) BANK SWITCH -> `ss.a7` selects usp/isp/msp, so changing S or M
+      //       changes architectural A7 with no writeback at all;
+      //   (4) seeding the very first value (the boot SSP).
+      //
+      // So a7Static IS still needed on a value edge -- the bug was resyncing on EVERY
+      // edge, including the LAG REPLAY of a value the fold already applied correctly.
+      // Discriminator: the lag is bounded (~2 commits), so a replayed edge is always a
+      // value a7Run held very recently, whereas a genuine exception push is a value
+      // a7Run has NEVER held. Suppress the resync iff a7Static is in the recent a7Run
+      // history; otherwise it carries information the fold does not have -> resync.
+      // MOVEM push/pop: a7Static replays 0x000ffffc, which a7Run held one step earlier
+      //   -> suppressed (this is cluster C).
+      // IRQ frame push:  a7Static becomes 0x000ffff8, never held by a7Run -> resync.
+      val a7Recent = mutable.Queue[Long]()          // bounded a7Run history (lag window)
+      def a7Seen(v: Long): Boolean = a7Recent.contains(v)
+      def a7Note(v: Long): Unit = { a7Recent.enqueue(v); if (a7Recent.size > 4) a7Recent.dequeue() }
+      var lastSysSm: Int = -1
       // Built into a buffer (not a flatMap) so a DROPPED crack-tail record can be folded
       // BACK into the step it belongs to -- see the archReg2* block below.
       val out = mutable.ArrayBuffer[CommitObservation]()
       commits.toSeq.foreach {
         case NormRec(pc, sysByte, a7Static, wb, emit, msp, isp) =>
-          if (a7Static >= 0 && a7Static != lastA7Static) { a7Run = a7Static & 0xffffffffL; lastA7Static = a7Static }
-          if (a7Run < 0 && a7Static >= 0) a7Run = a7Static & 0xffffffffL
+          // (2) bank switch: the (S,M) selector changed -> ss.a7 now names a different
+          //     bank, a change no arch-15 writeback can express. (3) seed the first value.
+          val sysSm = ((sysByte >> 5) & 1) * 2 + ((sysByte >> 4) & 1)   // S,M selector
+          val a7S   = if (a7Static >= 0) a7Static & 0xffffffffL else -1L
+          val bankSwitched = lastSysSm >= 0 && sysSm != lastSysSm
+          // Resync only on NEW information: a bank switch, or a value the fold has never
+          // produced (an exception push). A value a7Run held recently is the lagged
+          // shadow replaying what the fold already applied -> ignore it.
+          if (a7S >= 0 && a7S != a7Run && (bankSwitched || !a7Seen(a7S))) a7Run = a7S
+          if (a7Run < 0 && a7S >= 0) a7Run = a7S
+          lastSysSm = sysSm
+          if (a7Run >= 0) a7Note(a7Run)
           if (wb.nzvcWrite) ccr = (ccr & 0x10) | (wb.nzvc & 0xf)
           if (wb.xWrite)    ccr = (ccr & 0x0f) | ((wb.x & 1) << 4)
           // Fold an arch-15 (A7) int write into the running A7 (even for a dropped
           // crack µop like the stack-push store).
-          if (wb.intWrite && wb.dstArch == 15) a7Run = wb.result & 0xffffffffL
+          if (wb.intWrite && wb.dstArch == 15) { a7Run = wb.result & 0xffffffffL; a7Note(a7Run) }
           // A TEMP destination (arch >= 16, e.g. the mem-dest RMW op µop -> T1) is NOT
           // architectural: emit the step (it carries the instruction PC + the folded
           // CCR — the RMW's flags), but force archRegValid=False so the comparator does
@@ -154,9 +207,13 @@ object WhiteboxCapture {
             sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = mspOut, isp = ispOut)
         case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp) =>
           // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
-          // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
-          // carries the SAME ss.a7, does not re-resync over a subsequent OoO write).
-          if (a7 >= 0) { a7Run = a7 & 0xffffffffL; lastA7Static = a7 }
+          // A7); resync the running A7 to it. This is resync EVENT (1) -- see a7Run's
+          // header. An exception moves A7 with no arch-15 writeback, so ss.a7 is the only
+          // source, and the exception path is serializing so the sample has settled.
+          if (a7 >= 0) { a7Run = a7 & 0xffffffffL; a7Note(a7Run) }
+          // Keep the bank selector in step so the NEXT NormRec does not see this event's
+          // (S,M) change as a fresh bank switch and resync a second time off a stale sample.
+          lastSysSm = ((sysByte >> 5) & 1) * 2 + ((sysByte >> 4) & 1)
           // Fold the faulting instruction's own NZVC (CHK) onto the running CCR before
           // the entry step; -1 => no fold (the running CCR already reflects the
           // architectural state for TRAPV/DIV0/access-fault/interrupt/RTE).

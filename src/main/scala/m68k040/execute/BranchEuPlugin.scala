@@ -61,6 +61,18 @@ case class BrWbObs() extends Bundle {
   val anWrite = Bool()
   val anData  = Bits(32 bits)
   val anArch  = UInt(5 bits)
+  // KEEP this commit as its own oracle step even though it writes only a TEMP and no
+  // flags — the SAME field AluEuPlugin.WbObs/LsEuPlugin/DivEuPlugin already carry, and
+  // for the SAME reason. The `Scc <ea>` memory-destination crack (MicroOpAssembler's
+  // `sccIsMem`) is a branch-EU µop whose op µop writes the condition byte to T1 with
+  // keepCommit=True, its trailing rmwStore being the dropped µop. Without this field the
+  // whitebox `emit` rule (WhiteboxCapture.onCommit: temp-write + no flags => drop) threw
+  // the ENTIRE `Scc <mem>` instruction out of the lock-step retire stream, shifting every
+  // subsequent index by one and producing a spurious "dut PC is ahead of oracle by the
+  // length of the next instruction" divergence. That accounted for 40 of the fuzz
+  // campaign's 57 divergences (see docs/superpowers/campaigns/2026-09-03-fuzz-to-zero-
+  // divergences.md, cluster A). BrWbObs was the ONLY EU observation bundle missing it.
+  val keepCommit = Bool()
 }
 
 /** Plain-wire ports: producer (IQ/test) drives `issue`; consumer (ROB/test) reads `completion`. */
@@ -340,6 +352,8 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     wbObs.anWrite := RegNext(anWrite) init False
     wbObs.anData  := RegNext(intData)
     wbObs.anArch  := RegNext(u1.dstArch)
+    // Mirrors AluEuPlugin's `wbObs.keepCommit := RegNext(...u1.keepCommit) init False`.
+    wbObs.keepCommit := RegNext(u1.keepCommit) init False
     wbObs.simPublic()
   }
 }
