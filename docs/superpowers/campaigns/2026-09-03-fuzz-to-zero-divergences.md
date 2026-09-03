@@ -1235,3 +1235,70 @@ probe.** That is the next step; further candidate-guessing is explicitly the wro
 `MOVE #imm,<full-format indexed destination>` is wrong; the same discriminator holds for
 seed 57's `ori.w` (line-0) form. **Not established:** where the store actually goes, and
 therefore the mechanism.
+
+---
+
+## TASK SCOPE: `MI_SCC_ENTRY` — `Scc <memory-indirect EA>` (fuzz seed 80, cluster D)
+
+Written to be picked up by someone else; this will likely outlive the current session.
+**Priority: highest of the remaining set after cluster E** — it is the only *silent*
+failure left. Everything else announces itself with a fault, a hang or a wild PC.
+
+### The bug
+
+`Scc <ea>` with a full-format memory-indirect EA writes the condition byte into
+**`D<op[2:0]>`** — `op[2:0]` being the EA's *base-register* field, not a destination at all.
+Seed 80's `scs ([0x11,%a5],%d1.l*4,0x0)` silently clobbers `D5`. No trap, no hang.
+
+Mechanism (established, `MicroOpAssembler.scala`):
+`sccIsMem = isSccOp && srcIsMem && !srcEa.pcRel` with `srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)`
+(`:781`, `:2553`). `MEMINDIRECT` is not `MEMSIMPLE`, so the crack falls into the `Scc Dn`
+arm at `:2586`. `isSccOp` also suppresses the illegal fallback (`:1890`), so nothing
+downstream catches it.
+
+### Why it needs a new µcode entry
+
+`Scc` cannot ride `MI_RMW_ENTRY` (rows 24-27: ptr-load / host-load→T1 / **host-op**→T1 /
+host-store). That entry's op row is `UMiHostOp`, which does `u.op := ctx.miOp` — an
+**ALU/unary** op. `Scc`'s result is a *condition evaluation*, which lives in the **branch
+EU**, and the µcode host-op model has no path to it. This is why the family was never
+routed and why it needs its own entry, in the manner of task #201's dedicated
+`MI_LEA_ENTRY`/`MI_PEA_ENTRY`/`MI_JMP_ENTRY`/`MI_JSR_ENTRY` (each of which sits *outside*
+the §7 host-op chain for the same reason). **Calibration: comparable in size to task #201.**
+
+### Work items
+
+1. **`Microcode.scala`** — add `MI_SCC_ENTRY` with rows: ptr-load → T0; evaluate `cond`
+   (`cccc` from the opword) → condition byte → T1; host-store T1.B → `T0 + od (+ post-index)`.
+   The condition source is the new part: either give the entry a branch-class row, or carry
+   the evaluated condition into the context. Reuse `MI_RMW_ENTRY`'s ptr-load and host-store
+   rows verbatim; only the middle row is new.
+2. **`DecodeStage.scala`** — add an `ucSccMi` classifier and add it to all **three** gates
+   (`slot0IsMemInd`, `slot1IsMemIndEarly`, `ucIsMemInd`) via the existing shared-predicate
+   header, plus an arm in the `ucMiEntry` Mux chain.
+3. **`MicroOpAssembler.scala`** — no change expected: routing into the engine happens
+   *before* the fast-path assembler sees the instruction (the documented LEA/PEA/JMP/JSR
+   precedent at `:1630`). Verify rather than assume.
+4. **Test** — `scc_memind.s`, in the style of the existing `scc_*.s` set, covering
+   no-index / pre-indexed / post-indexed and a non-zero outer displacement. Must FAIL before
+   the fix (check it in a pre-fix worktree — a decode-gate omission can pass for the wrong
+   reason).
+5. **Re-measure** the full 200 seeds; seed 80 should clear.
+
+### Constraints that shape the fix (learned expensively, rounds 3-5)
+
+- **Do NOT add a term to the global `bad` expression** in `MicroOpAssembler`. Measured cost
+  of one predicate there: **−50 MHz**. In a local block override: **−25 MHz**. Off the raw
+  opword into a narrow gate: **0 MHz**.
+- **Match predicates off the RAW OPWORD, not `spec.op`.** `isSccOp` already is
+  (`isLine5 && ss5===3 && ...`), so reuse it rather than introducing a `spec`-derived test.
+- Route through the µcode engine; that is now the only permitted path anyway.
+- **Do not attempt the "make it trap instead" stopgap** — it was built, measured and
+  reverted in round 4 (−25 MHz for zero correctness movement, since both behaviours are
+  architecturally wrong). See that section before re-proposing it.
+
+### Definition of done
+
+Seed 80 passes; `scc_memind.s` fails before and passes after; all nine existing `scc_*.s`
+still pass; `make test-fast` clean; `ExecuteLockStepSpec` no worse than the 2 known
+pre-existing failures; OOC synth gate re-baselined post-`1cc57891` and reported honestly.
