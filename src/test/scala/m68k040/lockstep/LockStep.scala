@@ -52,6 +52,18 @@ object LockStep {
           val expected = if (id < 8) s.d(id) else s.a(id - 8)
           val name = if (id < 8) s"D$id" else s"A${id - 8}"
           Some(f"reg $name: dut=0x${c.archRegWrite & 0xffffffffL}%08x oracle=0x${expected & 0xffffffffL}%08x")
+        } else if (c.archReg2Valid && {
+                   val id = c.archReg2Id
+                   val expected = if (id < 8) s.d(id) else s.a(id - 8)
+                   (c.archReg2Write & 0xffffffffL) != (expected & 0xffffffffL)
+                 }) {
+          // SECOND destination of a cracked two-destination instruction: DIVU.L/DIVS.L's
+          // remainder (Dr) and 64-bit MULU.L/MULS.L's high product (Dh). See
+          // CommitObservation.archReg2Id for why this was previously never compared.
+          val id = c.archReg2Id
+          val expected = if (id < 8) s.d(id) else s.a(id - 8)
+          val name = if (id < 8) s"D$id" else s"A${id - 8}"
+          Some(f"reg2 $name: dut=0x${c.archReg2Write & 0xffffffffL}%08x oracle=0x${expected & 0xffffffffL}%08x")
         } else None
       diff match {
         case Some(d) => return LockStepResult(ok = false, Some(Divergence(i.toLong, d)), matched = i.toLong)

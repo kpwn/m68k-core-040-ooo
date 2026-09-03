@@ -664,7 +664,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       var wbCount = 0; var commitCount = 0
 
       // Capture one EU's writeback-obs into the whitebox (shared by ALU0/ALU1/LS).
-      def captureWb(w: m68k040.execute.WbObs): Unit = {
+      // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
+      // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
+      // WhiteboxCapture.Wb.secondDst for why only the CPLX lane may set it.
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = {
         if (w.valid.toBoolean) {
           wbCount += 1
           handle.onWb(
@@ -677,7 +680,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               nzvcWrite = w.nzvcWrite.toBoolean,
               x         = if (w.x.toBoolean) 1 else 0,
               xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
-              keepCommit = w.keepCommit.toBoolean))
+              keepCommit = w.keepCommit.toBoolean, secondDst = secondDst))
         }
       }
 
@@ -688,7 +691,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         // LS EU writeback-obs (loads write an int reg incl. the T0/T1 temp; stores
         // write none). Same join key (robId) as the ALU EUs. Temp-only commits are
         // dropped in WhiteboxCapture.onCommit (decode-matrix §4.5).
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true);
         // Branch EU writeback-obs: a branch writes NO int/flag reg and leaves CCR
         // unchanged. Map it to a no-write Wb (the commit pc comes from the ROB
         // commitObs = resolved nextPc). dstArch=0 is harmless since intWrite=false.
@@ -1078,7 +1081,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Pending IRQ to assert + a one-shot guard so we drive a single edge per event.
       val firedEvents = scala.collection.mutable.Set[Long]()
 
-      def captureWb(w: m68k040.execute.WbObs): Unit = {
+      // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
+      // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
+      // WhiteboxCapture.Wb.secondDst for why only the CPLX lane may set it.
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = {
         if (w.valid.toBoolean) {
           wbCount += 1
           handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
@@ -1086,14 +1092,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt,
             nzvcWrite = w.nzvcWrite.toBoolean, x = if (w.x.toBoolean) 1 else 0,
             xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
-            keepCommit = w.keepCommit.toBoolean))
+            keepCommit = w.keepCommit.toBoolean, secondDst = secondDst))
         }
       }
 
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true);
         {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
@@ -4283,17 +4289,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val handle = new WhiteboxCapture.Handle
       var irqRaised = false
 
-      def captureWb(w: m68k040.execute.WbObs): Unit = {
+      // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
+      // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
+      // WhiteboxCapture.Wb.secondDst for why only the CPLX lane may set it.
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = {
         if (w.valid.toBoolean) handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
           x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
-          keepCommit = w.keepCommit.toBoolean))
+          keepCommit = w.keepCommit.toBoolean, secondDst = secondDst))
       }
 
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         val bw = dut.branchEu.logic.wbObs
         if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
         // Precise-path store completion (Task P2.5): see the captureSq comment
@@ -6170,6 +6179,76 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "loop: bra loop", nInstr = 8)
   }
 
+  // ── DIVREM remainder OWNERSHIP (Part 117 regression) ─────────────────────────────
+  // The DIV.L remainder does NOT travel on a renamed physical register: the DIV µop
+  // stashes it in DivEuPlugin's `remLatch` and the trailing DIVREM crack µop moves that
+  // latch into Dr. Before the fix, `IssueQueuePlugin`'s CPLX port selected the oldest
+  // READY slot with no divide-family ordering, and a DIVREM has NO dependence on its own
+  // DIV (Dr and Dq are different registers in every remainder-producing form) -- so
+  // whenever the DIV was still waiting on its dividend producer, the DIVREM issued FIRST
+  // and returned the PREVIOUS divide's remainder. Quotient right, remainder wrong.
+  //
+  // Reproduced on real MC68040 hardware in the ROM's `_SlotManager $2C` / `SCalcsPointer`
+  // (docs/BUG_calibration_word_misplaced_0d00.md Part 116/117): 2 of 14 remainders wrong,
+  // including two divides with IDENTICAL operands returning different remainders. Both
+  // magic constants below are that capture's: `-42767 / 4` (correct q=-10691 r=-3, the
+  // hardware once returned r=+1) and a seeding divide whose remainder is +2 (the value
+  // the hardware's stale reads actually produced).
+  //
+  // The reproducer needs the DIV's dividend to arrive LATE while the DIVREM is already
+  // ready. `asr.l #1,%d5` is a line-E SHIFT, i.e. a SLOW-ALU producer on the six-stage
+  // path with a DYNAMIC completion wakeup (IssueQueuePlugin.isAluSlowProducer), so the
+  // DIV sits in `aluSlowWait` for several cycles with its DIVREM ready beside it -- the
+  // widest, most deterministic form of the same window the ROM's one-cycle
+  // `move.l %d4,%d5 ; divsl.l %d2,%d6:%d5` hits intermittently.
+  // Two conditions have to hold together for the DIVREM to actually win the race, and
+  // both are load-bearing in the program below -- get either wrong and the test passes on
+  // the broken RTL:
+  //   1. the racing DIVREM's OWN source (Dr's old value) must NOT be produced by a CPLX
+  //      op, or IssueQueuePlugin's `cplxWait` holds it and serializes the whole family
+  //      by accident (Dr is re-used across divides in the obvious way of writing this
+  //      test, which silently hides the bug);
+  //   2. the racing DIV's dividend must only become ready AFTER the previous divide has
+  //      released the EU -- otherwise the ~40-cycle iteration of the previous divide
+  //      covers the producer's latency and the DIV is already ready when the port frees.
+  // Hence the chain: the SEED divide's own quotient feeds `asr.l #1` (a slow-ALU op with
+  // a dynamic wakeup), whose result is the racing divide's dividend. The instant the seed
+  // divide releases the CPLX port, the racing DIVREM is ready and the racing DIV is not.
+  //
+  // Arithmetic (all divisor 4, signed):
+  //   seed   -342134 / 4 = q -85533  r -2        (-85533 asr 1 = -42767)
+  //   racing  -42767 / 4 = q -10691  r -3        <- a stale latch yields -2, not -3
+  test("lock-step: DIVREM remainder belongs to its OWN divide (late dividend)", VerilatorTest) {
+    runLockStep("div-l32-rem-ownership",
+      "moveq #4,%d2 ; moveq #0,%d6 ; moveq #0,%d1 ; moveq #0,%d3 ; " +
+      "move.l #-342134,%d5 ; divsll %d2,%d7,%d5 ; " +   // seed: d5 = -85533, d7 = -2
+      "asr.l #1,%d5 ; " +                               // slow ALU, post-divide -> d5 = -42767
+      "divsll %d2,%d6,%d5 ; move.l %d6,%d0 ; " +        // racing: d6 must be -3 (stale -> -2)
+      "move.l #-342134,%d5 ; divsll %d2,%d7,%d5 ; " +
+      "asr.l #1,%d5 ; " +
+      "divsll %d2,%d1,%d5 ; " +                         // IDENTICAL operands -> IDENTICAL result
+      "move.l #-342134,%d5 ; divsll %d2,%d7,%d5 ; " +
+      "asr.l #1,%d5 ; " +
+      "divsll %d2,%d3,%d5 ; " +                         // and a third time
+      "loop: bra loop", nInstr = 16)
+  }
+
+  // Same hazard, interleaved and across MISPREDICT FLUSHES. The alternating `beq` is
+  // unpredictable, so the guarded divide is repeatedly fetched and started down the WRONG
+  // path: before the fix a wrong-path DIV still iterated to completion and still wrote the
+  // (untagged, un-flush-cleared) remainder latch, poisoning a later correct-path DIVREM --
+  // the second, independent half of the same defect. Two different divides alternate so a
+  // stale remainder is always a WRONG remainder, never accidentally the right one.
+  test("lock-step: DIVREM remainder survives mispredict flushes (interleaved divides)", VerilatorTest) {
+    runLockStep("div-l32-rem-flush",
+      "moveq #4,%d2 ; moveq #7,%d4 ; moveq #0,%d7 ; " +
+      "lp: eori.l #1,%d7 ; tst.l %d7 ; beq sk ; " +
+      "move.l #-85534,%d5 ; asr.l #1,%d5 ; divsll %d2,%d6,%d5 ; " + // -42767/4 -> r = -3
+      "sk: move.l #1250,%d5 ; divsll %d2,%d1,%d5 ; " +              // 1250/4    -> r = +2
+      "dbra %d4,lp ; " +
+      "loop: bra loop", nInstr = 55)
+  }
+
   // DIVU.L 32/32 DIV0 -> vector 5 -> handler -> RTE.
   test("lock-step: DIVU.L 32/32 DIV0 -> handler -> RTE", VerilatorTest) {
     runLockStep("div-l32-div0",
@@ -6480,11 +6559,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
-      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -6508,7 +6587,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
         for (k <- 0 until 2) {
@@ -6668,11 +6747,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
-      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -6696,7 +6775,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
         for (k <- 0 until 2) {
@@ -6802,14 +6881,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   /** Wire the full whitebox commit capture (incl. the exception commit channel) used
     * by the ITLB lock-step tests. */
   private def wireWhitebox(dut: FullCoreDut, handle: WhiteboxCapture.Handle): Unit = {
-    def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+    def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
       handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
         dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
         intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+        x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
     }
     dut.clockDomain.onSamplings {
-      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+      captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
       val bw = dut.branchEu.logic.wbObs
       if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
       // Precise-path store completion (Task P2.5): see the captureSq comment above
@@ -8083,11 +8162,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
-      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -8111,7 +8190,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
         for (k <- 0 until 2) {
@@ -8347,11 +8426,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
-      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -8369,7 +8448,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
         for (k <- 0 until 2) {
@@ -8560,11 +8639,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
-      def captureWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
         handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
           dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
           intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
-          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean))
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
       }
       def captureBranch(): Unit = {
         val bw = dut.branchEu.logic.wbObs
@@ -8582,7 +8661,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
       }
       cd.onSamplings {
-        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
         for (k <- 0 until 2) {
@@ -8788,11 +8867,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // MOVEM ever touches them again in this program) is exactly the loaded
       // value; architectural id 9 = A1 (8 + reg 1), the postinc base.
       val lastWb = scala.collection.mutable.Map[Int, Long]()
-      def captureWb(w: m68k040.execute.WbObs): Unit =
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit =
         if (w.valid.toBoolean && w.intWrite.toBoolean) lastWb(w.dstArch.toInt) = w.result.toLong & 0xffffffffL
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs)
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)

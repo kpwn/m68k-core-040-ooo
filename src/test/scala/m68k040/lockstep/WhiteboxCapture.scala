@@ -16,9 +16,19 @@ object WhiteboxCapture {
     * `divRem` marks the trailing DIVREM crack µop -> its commit is DROPPED (the 2-µop
     * DIVU.L/DIVS.L maps to ONE oracle instruction step; the Dr write still lands in the
     * PRF and is verified by a later instruction that reads Dr). */
+  /** `secondDst` marks a dropped crack µop that is the SECOND ARCHITECTURAL DESTINATION
+    * of its macro-instruction, so its value must still be compared -- it is folded into
+    * the preceding kept step's `archReg2*`. Set ONLY for the CPLX/DivEu writeback lane,
+    * where `divRem` means exactly {DIVREM -> Dr, MULHI -> Dh}. It is deliberately NOT
+    * derived from `divRem` alone: LsEuPlugin:2732 reuses that same bit as a GENERIC
+    * "drop this commit record" marker (stack pushes, CCR restores, RMW stores, EA
+    * auto-update drops) and AluEuPlugin:849 passes through `divIsRem` for its own cracked
+    * µops (EXG's halves). Those carry MID-INSTRUCTION values, not second destinations, and
+    * folding them produces spurious divergences (measured: 63 of 429 lock-step tests). */
   final case class Wb(dstArch: Int, result: Long, intWrite: Boolean,
                       nzvc: Int, nzvcWrite: Boolean, x: Int, xWrite: Boolean,
-                      divRem: Boolean = false, keepCommit: Boolean = false)
+                      divRem: Boolean = false, keepCommit: Boolean = false,
+                      secondDst: Boolean = false)
 
   /** Stateful reconstruction handle. Drive `onWb` for every cycle an EU's wbObs
     * is valid, and `onCommit` for every fired ROB commit-obs (in retire order).
@@ -92,7 +102,10 @@ object WhiteboxCapture {
       // otherwise fold OoO arch-15 wb writes. (An OoO write leaves ss.a7 unchanged, so
       // it never triggers a spurious resync.)
       var lastA7Static: Long = -2L
-      commits.toSeq.flatMap {
+      // Built into a buffer (not a flatMap) so a DROPPED crack-tail record can be folded
+      // BACK into the step it belongs to -- see the archReg2* block below.
+      val out = mutable.ArrayBuffer[CommitObservation]()
+      commits.toSeq.foreach {
         case NormRec(pc, sysByte, a7Static, wb, emit, msp, isp) =>
           if (a7Static >= 0 && a7Static != lastA7Static) { a7Run = a7Static & 0xffffffffL; lastA7Static = a7Static }
           if (a7Run < 0 && a7Static >= 0) a7Run = a7Static & 0xffffffffL
@@ -115,12 +128,30 @@ object WhiteboxCapture {
           val mBitN  = (sysByte >> 4) & 1
           val mspOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 1) a7Run else msp
           val ispOut = if (a7Run >= 0 && sBitN == 1 && mBitN == 0) a7Run else isp
-          if (!emit) Nil
-          else Seq(CommitObservation(
+          if (!emit) {
+            // ---- CRACK TAIL -> SECOND architectural destination of the kept step ------
+            // `divRem` marks the trailing µop of a two-destination macro-instruction:
+            // DIVU.L/DIVS.L's `DIVREM` (-> Dr, the REMAINDER) and 64-bit MULU.L/MULS.L's
+            // `MULHI` (-> Dh, the HIGH product). Dropping the record is correct for
+            // step ALIGNMENT (one oracle step per instruction), but dropping the VALUE
+            // meant lock-step never compared either register: the old comment here
+            // asserted the write was "verified by a later instruction that reads Dr",
+            // which is true only if such an instruction happens to exist -- and in the
+            // ported corpus, the fuzz corpus and most lock-step programs it does not.
+            // A real wrong-remainder RTL bug (BUG_calibration_word_misplaced_0d00.md
+            // Part 116/117) survived every one of those suites through this hole.
+            // Fold the tail's write into the step it belongs to instead, so the
+            // comparator checks BOTH destinations of the macro-instruction.
+            if (wb.secondDst && wb.intWrite && wb.dstArch < 16 && out.nonEmpty) {
+              val prev = out(out.size - 1)
+              out(out.size - 1) = prev.copy(
+                archReg2Id = wb.dstArch, archReg2Write = wb.result, archReg2Valid = true)
+            }
+          } else out += CommitObservation(
             pc = pc, archRegId = if (isTemp) 0 else wb.dstArch,
             archRegWrite = if (isTemp) 0L else wb.result, archRegValid = wb.intWrite && !isTemp,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = mspOut, isp = ispOut))
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7Run, msp = mspOut, isp = ispOut)
         case ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp) =>
           // An exception/RTE step uses the ROB-surfaced ss.a7 (the exc unit's banked
           // A7); resync the running A7 to it (+ lastA7Static so the next NormRec, which
@@ -139,11 +170,12 @@ object WhiteboxCapture {
           val mBitE  = (sysByte >> 4) & 1
           val mspOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 1) a7 & 0xffffffffL else msp
           val ispOutE = if (a7 >= 0 && sBitE == 1 && mBitE == 0) a7 & 0xffffffffL else isp
-          Seq(CommitObservation(
+          out += CommitObservation(
             pc = pc, archRegId = 0, archRegWrite = 0, archRegValid = false,
             ccr = ccr, memAddr = 0, memData = 0, memWrite = false,
-            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7, msp = mspOutE, isp = ispOutE))
+            sr = ((sysByte & 0xff) << 8) | (ccr & 0x1f), a7 = a7, msp = mspOutE, isp = ispOutE)
       }
+      out.toSeq
     }
   }
 }

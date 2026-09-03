@@ -83,7 +83,10 @@ object FuzzRunner {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
-      def captureWb(w: m68k040.execute.WbObs): Unit = {
+      // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
+      // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
+      // WhiteboxCapture.Wb.secondDst for why only the CPLX lane may set it.
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = {
         if (w.valid.toBoolean) {
           handle.onWb(
             w.robId.toInt,
@@ -95,14 +98,14 @@ object FuzzRunner {
               nzvcWrite = w.nzvcWrite.toBoolean,
               x         = if (w.x.toBoolean) 1 else 0,
               xWrite    = w.xWrite.toBoolean, divRem = w.divRem.toBoolean,
-              keepCommit = w.keepCommit.toBoolean))
+              keepCommit = w.keepCommit.toBoolean, secondDst = secondDst))
         }
       }
 
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs);
+        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true);
         {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
