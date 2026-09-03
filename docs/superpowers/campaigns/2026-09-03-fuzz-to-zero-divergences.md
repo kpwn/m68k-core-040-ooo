@@ -821,3 +821,54 @@ adjudicated** — I have not re-run that case.
 4. Cluster B (10 divergences): confirm the vector number, then decide route-vs-trap.
 5. Re-run the campaign after each fix; never claim a count that has not survived a fresh
    full 200-seed run.
+
+---
+
+## Synth gate (round 2) — MEASURED, with a real regression, fully isolated
+
+Full-core OOC synth (`synth/ooc_M68kFullCoreSynth.tcl`, 5 ns primary constraint), run on
+four variants of the same tree so the delta is attributable rather than asserted:
+
+| Variant | WNS (ns) | FMax (MHz) | Delta vs base |
+|---------|----------|------------|---------------|
+| `a5199bc` — branch point, none of my changes | −0.706 | **175.25** | — |
+| `3eacf56` — + round-1 `BrWbObs.keepCommit` | −0.706 | **175.25** | **0.00** |
+| `db86a83` with the TAS entry **removed** (gate unification only) | −0.706 | **175.25** | **0.00** |
+| `db86a83` — full round-2 fix | −1.447 | **155.11** | **−20.14** |
+
+### What this establishes
+
+1. **Round 1's `BrWbObs.keepCommit` is exactly free** — bit-identical WNS. The prediction
+   that a sim-only observation field costs nothing is now measured, not assumed.
+2. **The gate unification refactor is exactly free** — also bit-identical. A Scala `def`
+   inlines to the same hardware at each call site, so the structural fix (the thing that
+   disarms the drift trap) carries **zero** timing cost. That is worth knowing: this class
+   of cleanup can be applied elsewhere without a timing argument.
+3. **The entire −20.14 MHz comes from one line**: `|| (spec.op === DecOp.TAS)`. The cost is
+   *functional*, not stylistic — it is the price of actually letting TAS enter the µcode
+   engine, which adds real logic and fanout on the decode critical path.
+
+### Assessment — flagged, not chased
+
+−20.14 MHz (−11.5%) against a project goal of ≥200 MHz is **not** a modest regression, so
+per the campaign's standing guidance this is flagged for the owner rather than optimised
+away. The trade currently on the table is: **8 wild-PC divergences (a real, silent-until-it-
+crashes correctness bug) in exchange for 11.5% FMax.** Note the baseline itself (175.25)
+is already below the 200 MHz goal on this OOC gate, so this change is not what breaks the
+goal — but it does move it materially further away.
+
+### Concrete optimisation hypothesis for whoever takes this (untested)
+
+`spec0.op === DecOp.TAS` reads the **decoded, offloaded** spec, which arrives late. The
+same file already decodes four families straight from the **raw opword** instead —
+`s0IsLea`, `s0IsPea`, `s0IsJmp`, `s0IsJsr` (`DecodeStage.scala:~740`) — precisely because
+the opword is available earlier. TAS has a trivially decodable encoding:
+
+```
+TAS <ea> = 0100 1010 11 mmm rrr     -> opw(15 downto 6) === B"0100101011"
+```
+
+So replacing the `spec.op` comparison with a raw-opword match, in the style of the existing
+`s0IsJmp`, is a plausible way to recover most or all of the 20 MHz **without giving up the
+fix**. This is a hypothesis with a named mechanism and an in-file precedent — it has not
+been measured, and should not be claimed until it is.
