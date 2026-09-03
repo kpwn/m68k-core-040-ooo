@@ -799,10 +799,18 @@ object MicroOpAssembler {
     // independent) and every non-immediate path.
     val immIsLong = spec.size === Size.LONG
     // .L: imm = words(1..2) -> shift 2; .B/.W: imm = words(1) -> shift 1. See
-    // `immShiftedWords` for why this is 6 entries and not 3 (a LONG base displacement
+    // `immShiftedWords` for why this is 4 entries and not 3 (a LONG base displacement
     // needs words(2) AND words(3) of the shifted view).
-    val immEa = EaDecoder.decode(
-      op(5 downto 0), spec.size, immShiftedWords(pkt.words, immIsLong))
+    //
+    // ONE shared instance for BOTH consumers (`immEa` here and `immDstEa` further down).
+    // They are bit-identical by construction -- same `pkt.words`, same `immIsLong` -- so
+    // two separate calls emitted two identical mux trees and left it to synthesis to
+    // notice. Hoisting is semantically a no-op and strictly removes logic; it is also the
+    // first thing to re-gate, because this change's measured 13.1 MHz OOC cost has NO
+    // logical path to the endpoint it degrades (see `immShiftedWords`), i.e. it looks like
+    // synthesis restructuring rather than a lengthened cone.
+    val immShiftedView = immShiftedWords(pkt.words, immIsLong)
+    val immEa = EaDecoder.decode(op(5 downto 0), spec.size, immShiftedView)
     // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
     // (its ext follows the imm), srcEa otherwise. (klass/base/baseValid/pcRel are
     // offset-independent and identical; only `disp` differs.)
@@ -1353,11 +1361,11 @@ object MicroOpAssembler {
     // opword mode/reg bits, independent of word content) so they are byte-identical
     // either way; only `disp`/index need the shift.
     val immDstEaField = op(8 downto 6) ## op(11 downto 9)
-    // Same shifted view as `immEa` above, and the same 3-vs-6-entry correction: this is
-    // the call site fuzz seed 21 caught (`move.w #0x80,(0x10036,%a3,%d6.l*4)` storing to
-    // 0x00003fec because the long `bd`'s low half-word decoded as 0).
-    val immDstEa = EaDecoder.decode(
-      immDstEaField, spec.size, immShiftedWords(pkt.words, immIsLong))
+    // The SAME shifted view instance as `immEa` above (see its hoist comment), and the
+    // same 3-vs-4-entry correction: this is the call site fuzz seed 21 caught
+    // (`move.w #0x80,(0x10036,%a3,%d6.l*4)` storing to 0x00003fec because the long `bd`'s
+    // low half-word decoded as 0).
+    val immDstEa = EaDecoder.decode(immDstEaField, spec.size, immShiftedView)
     val stDstEa = Mux(immToMemCase, immDstEa, dstEa)
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
