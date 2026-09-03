@@ -2623,8 +2623,43 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // flush-races-a-completion never regresses `pendPush` below the true
     // (post-this-cycle) ready count.
     val pendReadyAfterThisCycle = pendReady + (sq.io.sqCompletion.valid ? U(1, pendPtrW bits) | U(0, pendPtrW bits))
+    // (BUG_calibration_word_misplaced_0d00.md Part 111 fix, 2026-09-03) A SECOND
+    // desync source, found by chasing the `adv_flush_restart_store` chained-early-
+    // flush hang: StoreQueue's OWN flush-time `headDrainInFlight` term (Part 37) can
+    // KEEP an uncommitted head entry that is already mid-drain (its physical write
+    // already left the CPU, irrevocable) instead of squashing it -- letting it run to
+    // its natural completion. This rollback must ALSO preserve that entry's `pendMem`
+    // companion slot, exactly mirroring the SQ's own decision, or the two lock-step
+    // rings desynchronize by one FOREVER (the identical failure class the comment
+    // above already documents for the same-cycle-completion case, just triggered by a
+    // DIFFERENT source): `pendPush` collapses to `pendReadyAfterThisCycle` even though
+    // a genuinely-kept, not-yet-confirmed entry still legitimately owns that slot; the
+    // VERY NEXT precise-store alloc (in the observed repro, the redirected refetch of
+    // the SAME store the flush just bounced off of) then silently reuses that slot for
+    // ITS OWN `deferCompletion` push. `pendPush`/`pendReady`/`pendApply` re-converge to
+    // the SAME numeric value soon after (so nothing looks obviously wrong from the
+    // pointers alone), but the entry now sitting at that shared index belongs to the
+    // WRONG dynamic instance -- proven by a direct cycle trace
+    // (`PORTED_TRACE_EARLYFLUSH`): the kept entry's REAL drain-ack later fires
+    // `sq.io.sqCompletion` for its own (correct) robId, but the replay reads a STALE,
+    // unrelated `pendMem` slot and fires `sqCompletionPort`/ROB completion port 4 for
+    // a COMPLETELY DIFFERENT robId (observed: SQ says robId=6, replay said robId=17 --
+    // some earlier, already-retired precise store's leftover slot content). The
+    // genuinely-current ROB head never gets marked complete -> `headReady`'s
+    // `completes(h0)` never returns -> retire stops permanently, matching the
+    // documented hang exactly.
+    //
+    // Fix: mirror the SQ's own `keep()` input verbatim -- `headDrainInFlight` reads
+    // the identical registers (`valids(head)`, `committed(head)`, `drainBusy`,
+    // `ackPhaseB`) on the SAME cycle the SQ's own flush logic consults them, so this
+    // is exact, not an approximation. Add one extra preserved slot whenever the head
+    // is being kept AND is not ALSO completing (popping) this exact same cycle -- the
+    // same-cycle-pop case is already covered by `pendReadyAfterThisCycle`'s own `+1`
+    // above, so ANDing in `!sq.io.sqCompletion.valid` here avoids double-reserving.
+    val pendHeadKeptUnconfirmed = sq.io.headDrainInFlightOut && !sq.io.sqCompletion.valid
     when(sqFlushSig) {
-      pendPush := pendReadyAfterThisCycle
+      pendPush := pendReadyAfterThisCycle +
+        (pendHeadKeptUnconfirmed ? U(1, pendPtrW bits) | U(0, pendPtrW bits))
     }
     // Replay the oldest ready-but-not-yet-applied entry's effects into the SHARED
     // comp*/completion stage. The arbitration above makes younger P2/P3/P4
