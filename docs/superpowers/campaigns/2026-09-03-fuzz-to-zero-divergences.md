@@ -971,3 +971,89 @@ ALU host-op. That routes the instruction correctly (removing the silent corrupti
 side effect) and, because it adds no term to `bad` or to any late `spec`-derived
 expression, should be timing-neutral. **Until it lands, seed 80's silent D-register
 corruption remains open and known** — recorded here rather than papered over.
+
+---
+
+## Round 5 — two negative results (one of them against my own earlier claim)
+
+### 1. CMP2 (task #257) and cluster E do NOT share a root cause
+
+**Checked by computing the addresses, not by matching shapes.** They do not overlap, and
+fixing cluster E will **not** close task #257.
+
+The failing test is `cmp2.w (-4,%a0,%d2.l),%d1` with `A0=0x3000`, `D2=4`
+(`ExecuteLockStepSpec.scala:6400`). Its EA is:
+
+```
+0x3000 + (-4) + 4*1 = 0x3000      -- no overflow anywhere, every term small and positive
+```
+
+So the 2^32 wrap that defines cluster E is simply **not present** in the CMP2 case. The
+shape match ("indexed EA → wild PC") was misleading, exactly as warned.
+
+The actual mechanism is a **deliberate, documented fail-safe**, not a bug:
+
+```scala
+// MicroOpAssembler.scala:3233-3235, 3332
+val c2IndexedShape = (c2Mode === B"110") || ((c2Mode === B"111") && (c2Reg === B"011"))
+val c2EaOk  = (c2SrcEa.klass === EaClass.MEMSIMPLE) && (c2SrcEa.autoMode === EaAuto.NONE) &&
+              !c2IndexedShape
+val c2Bad = isCmp2Chk2Op && !c2EaOk
+```
+
+with the in-code rationale: the CMP2/CHK2 2-load+compare crack *"only forms a straight
+base+disp address (it never reads an index register, walks a full-format bd/od chain, or
+follows memory-indirection)"*, so indexed shapes are **forced illegal on purpose** —
+*"Force them illegal here as a fail-safe until the crack actually implements index/
+full-format EA compute"*. Mode 6 is `c2IndexedShape`, so the test's EA is rejected →
+vector 4 → and because the lock-step harness leaves the vector table uninitialised, the
+handler PC is garbage: the observed `dut=0x990f1a31`.
+
+**So task #257 is an UNIMPLEMENTED FEATURE with an explicit in-code TODO, not a mystery
+and not an address-arithmetic defect.** Closing it means implementing index/full-format EA
+computation in the CMP2/CHK2 crack — self-contained, well-marked work, unrelated to
+cluster E. The paired test `chk2_cmp2_illegal_ea_traps.s` documents the current
+fail-safe behaviour, so that test's expectations must move with any fix.
+
+### 2. RETRACTION: cluster E is not "the DUT doesn't truncate"
+
+I characterised cluster E as *"the 68k EA sum is mod 2^32; the DUT appears not to
+truncate"*. **That was an inference from the symptom, and the code contradicts it.** The
+LS-EU address adder is:
+
+```scala
+// LsEuPlugin.scala:440
+val s1Va = (s1Base.asSInt + s1Disp + s1Index.asSInt).asUInt
+```
+
+Three 32-bit terms summed as `SInt(32 bits)`. SpinalHDL truncates that by construction —
+there is no widening and no carry-out to lose. **The AGU already computes mod 2^32**, so
+"fails to truncate" cannot be the mechanism.
+
+What is actually established about seed 21 is only this: the DUT's
+`move.w #0x80,(0x10036,%a3,%d6.l*4)` did **not** land at `0x4022` (the oracle's, and the
+architecturally correct, address), because the stale prologue bytes survive there. **Where
+it did land is unknown.** Plausible remaining candidates — none verified — are the framing
+or sign/zero-extension of the **long base displacement** (`0x10036` needs BD SIZE=11, a
+full 32-bit `bd`), or the routing of a MOVE with an *immediate source* and a *full-format
+indexed destination* (a shape with prior history here: task #178 needed a dedicated
+`MI_MOVE_DST_IMM_ENTRY` for its memory-indirect sibling). Note `limmFullFmtDstBad` is
+**not** it — that gate is `opIsLineImm && immIsLong`, and seed 21's instruction is line-3
+`MOVE.W`, not a line-0 immediate.
+
+**Next step for cluster E is a trace, not a patch**: run seed 21 under `FUZZ_PROG` and
+capture the actual store address. Fixing the truncation that already exists would be
+fixing nothing.
+
+**Third self-retraction of this campaign, same failure mode each time**: reasoning from an
+instruction's appearance instead of from what the hardware computes. Logged again.
+
+### FMax baseline is now STALE — do not compare across it
+
+Commit `1cc57891` (another agent) fixed four real defects in `synth/vivado.tcl`'s
+constraint handling, including a `set_bus_skew` matching 0 of 30 instances and clock
+groups built against an empty clock object. **Every FMax number in this document
+(175.25 / 155.11 / 178.35 / 128.01 / 153.37) was measured BEFORE that landed** and is
+self-consistent only within that set. Any future measurement must **re-baseline** — i.e.
+re-run the branch point under the new constraints — before a delta is attributed to a code
+change. Otherwise their constraint fix will be misread as this branch's regression or win.
