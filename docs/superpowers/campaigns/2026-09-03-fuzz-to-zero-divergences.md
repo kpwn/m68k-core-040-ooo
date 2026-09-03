@@ -467,6 +467,117 @@ wrong-intermediate-value theory cannot produce a clean single-record deletion wi
 surviving record correct and self-consistent. So this does **not** collapse into "wrong
 values seen late" — it collapses into one missing bundle field, already fixed.
 
+---
+
+## Round 2 — clusters B and D ROOT-CAUSED (they are ONE bug)
+
+**Result: B and D are the same defect, and it is a known, recurring, previously-fixed
+defect class — a missing `ucIsMemInd` classifier.** Not a new bug class; the fourth
+instance of one this project has already fixed three times.
+
+### The mechanism
+
+Routing a memory-indirect (`EaClass.MEMINDIRECT`) EA into the microcode engine requires
+the instruction family to be named in **three parallel gate lists**, which must agree:
+
+| Gate | File:line | Role |
+|------|-----------|------|
+| `slot0IsMemInd` | `DecodeStage.scala:729-746` | routes slot 0 into the engine |
+| `slot1IsMemIndEarly` | `DecodeStage.scala:269-280` | routes slot 1 into the engine |
+| `ucIsMemInd` | `DecodeStage.scala:1959` | the engine's own entry re-decode |
+
+Each enumerates the same families: MOVE src/dst, ALU src (opmode 0/1/2), ALU dst
+(opmode 4/5/6), ADDQ/SUBQ, line-0 immediate (`IMMEXT`), dynamic bit-op, single-EA, and
+LEA/PEA/JMP/JSR. The single-EA member is:
+
+```scala
+// DecodeStage.scala:590 (and :244, :1919) — identical in all three
+val s0IsSingleEa = (spec0.op === DecOp.CLR) || (spec0.op === DecOp.NEG) ||
+                   (spec0.op === DecOp.NEGX) || (spec0.op === DecOp.NOT) ||
+                   (spec0.op === DecOp.TST)
+```
+
+**`DecOp.TAS` is absent. `DecOp.SHIFT` (the line-E memory shift/rotate form) is absent.
+`Scc <mem>` is absent.** Those are exactly — and only — the three families in clusters B
+and D. When a family is unlisted, `ucIsMemInd` is false and the instruction falls through
+to the ordinary non-microcoded fast-path assembler, whose EA machinery cannot walk a
+memory-indirect pointer chain.
+
+The consequence is already documented verbatim in this very file, for the family that was
+missing *last* time (`DecodeStage.scala:1868-1873`, task #150, `add_l_dn_memind_dst`):
+
+> "this shape had NO classifier reaching ucIsMemInd at all … so a full-format mem-indirect
+> RMW dst-EA (opmode 4/5/6) fell all the way through to the ordinary non-microcoded fast
+> path **with a garbage EA, producing a wild PC** (same class of bug as #144/#145)."
+
+That is cluster B's symptom word for word. The garbage EA drives an access to an unmapped
+address → bus-error/access-fault exception → 8-byte format-$0 frame (**explaining the
+observed `a7 = 0x00100000 - 8`**) → vector fetched from the fuzz sandbox's *uninitialised*
+vector page → **wild, often odd PC**. Every element of the observed signature is accounted
+for.
+
+### Why cluster D's symptom differs (and why it is the cleaner probe)
+
+The coordinator predicted this exactly. `Scc` misses the classifier like the others, but
+its fast-path fallback is *not* a garbage EA — the assembler has a dedicated Scc arm:
+
+```scala
+// MicroOpAssembler.scala:781 / :2553
+val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)      // MEMINDIRECT is NOT MEMSIMPLE
+val sccIsMem = isSccOp && srcIsMem && !srcEa.pcRel
+```
+
+With `sccIsMem` false, the crack takes the `otherwise` arm — the **`Scc Dn` register form**
+— and writes `D<op[2:0]>`. For seed 80's `scs ([0x11,%a5],%d1.l*4,0x0)`, `op[2:0]` is the
+EA's *base-register* field (`%a5` → 5), so the condition byte lands in **D5**. This is
+precisely "the EA/destination-form decode collapses a memory destination to a register
+one". It also makes D the **most dangerous** finding: silent wrong-register corruption
+with no trap, versus B's loud crash.
+
+`isSccOp` additionally suppresses the illegal-instruction fallback that would otherwise
+catch it (`MicroOpAssembler.scala:1890` ANDs in `!isSccOp`), so nothing downstream rescues it.
+
+### Mapping to the 11 cluster-B seeds
+
+| Instruction family | Seeds | Missing classifier |
+|---|---|---|
+| `tas ([...])` | 3, 4, 21, 22, 41, 74, 103, 126 | `DecOp.TAS` |
+| `lsr.w`/`rol.w` `([...])` | 109, 127 | `DecOp.SHIFT` mem-form |
+| `scs ([...])` (cluster D) | 80 | `Scc` mem-form |
+
+### Seed 57 does NOT belong to cluster B — and may be task #223
+
+Seed 57 is `ori.w #0x254a,(20,%a0,%a2.l*2)`: a **brief-indexed** EA, which `EaDecoder`
+classifies `MEMSIMPLE`, **not** `MEMINDIRECT`. The classifier gap above cannot reach it,
+and its family (line-0 immediate, `IMMEXT`) *is* already listed in all three gates. So it
+is a genuinely separate defect.
+
+Its shape — a memory-**destination** with a **brief-indexed** EA taking a spurious
+exception — is the same shape as the long-open **task #223 `move_idx_idx`**
+("context-dependent spurious illegal trap"), whose reproducer is
+`move.b (0xa,A2,D1.w*8),(0,A3,D0.w)` — brief-indexed on both sides, also `MEMSIMPLE`.
+**Recommend treating seed 57 as a candidate reproducer for task #223.** It is far smaller
+than the existing one (4-instruction body vs a full matrix test) and it is deterministic.
+
+**Negative result, stated plainly: cluster B proper is NOT task #223.** The coordinator's
+lead was worth checking and it does not hold for the 10 memory-indirect seeds — those are
+the classifier gap, a different mechanism from #223's brief-indexed/`MEMSIMPLE` shape. The
+lead does appear to pay off for the one outlier.
+
+### Proposed fix (NOT YET LANDED — no executed repro yet)
+
+Add the three missing families to all **three** gate lists (`:590`+`:738`, `:244`+`:269`,
+`:1919`+`:1959`) — they must stay in lockstep or the engine mis-routes, which is the exact
+trap task #144 documents. `TAS` and `SHIFT`-mem extend the single-EA list; `Scc` needs a
+raw-opword classifier in the style of `s0IsLea`/`s0IsJmp`, because `Scc` is a branch-class
+µop whose `spec.op` does not identify it.
+
+Per this project's standing rule I have **not** landed this against a static-only
+hypothesis. Verification plan, once a JVM is free: seed 80 (6-instruction body, cluster D,
+cleanest) and seed 3 (6-instruction body, cluster B) must fail before and pass after, then
+a full 200-seed re-sweep. Expect **20 → ~9** if the analysis is right (11 B/D seeds minus
+seed 57 which stays).
+
 ## Round 2 plan
 
 0. **BS-3 is DEFERRED, deliberately — collision risk, not deprioritisation.** The obvious
