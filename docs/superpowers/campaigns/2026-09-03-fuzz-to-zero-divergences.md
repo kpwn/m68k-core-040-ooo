@@ -11,6 +11,24 @@ every real RTL bug it exposes.
 | 0 (baseline) | 2026-09-01 | **57** | — | `fuzz_logs/*.log`, 8 batches of 25 seeds |
 | 1 | 2026-09-03 | **20** | **−37** | MEASURED, full 200-seed sweep, 180 PASS. `fuzz_logs_round1/*.log` on this branch |
 | 2 | 2026-09-03 | **13** | **−7** | MEASURED, full 200-seed sweep, 187 PASS. `fuzz_logs_round2/*.log`. TAS memory-indirect routing fixed + gate unification |
+| 3 | 2026-09-03 | **5** | **−8** | MEASURED, full 200-seed sweep, 195 PASS. `fuzz_logs_round3/*.log`. Cluster C (A7 resync) fixed |
+
+### Round 3 measured result — every remaining divergence is a named RTL bug
+
+**13 → 5.** Surviving: 21, 57, 80, 109, 127. **All 8 cluster-C seeds fixed; zero harness
+defects remain.**
+
+| Seed | Cluster | Mechanism |
+|------|---------|-----------|
+| 80 | D | `Scc` memind writes `D<op[2:0]>` — **silent** wrong-register corruption |
+| 109, 127 | B | line-E memory shift/rotate memind — needs `shiftOp`/`shiftDir` in µcode ctx |
+| 21 | E | full-format indexed EA, `An + bd` overflows 2^32, DUT does not truncate |
+| 57 | — | extension-word framing mis-shift (brief↔full, bit 8); candidate task #223 repro |
+
+Campaign trajectory: **57 → 20 → 13 → 5**, every step attributed. Of the original 57,
+**46 were harness defects** (clusters A and C) and **11 were RTL**; 6 RTL are now fixed
+(all 8 TAS seeds mapped onto them) and 5 remain.
+
 
 ### Round 2 measured result
 
