@@ -559,6 +559,43 @@ exception — is the same shape as the long-open **task #223 `move_idx_idx`**
 **Recommend treating seed 57 as a candidate reproducer for task #223.** It is far smaller
 than the existing one (4-instruction body vs a full matrix test) and it is deterministic.
 
+#### Sharpened seed-57 hypothesis: an extension-word FRAMING mis-shift
+
+Seed 57's body is 4 instructions and its signature is unchanged from baseline:
+
+```
+	move.l #0x2,%a2
+	move.l #0x3ffe,%a0
+	ori.w #0x254a,(20,%a0,%a2.l*2)
+```
+
+The intended EA is `A0 + A2.l*2 + 20` = `0x3ffe + 4 + 20` = **`0x4016`** — even, word-aligned,
+inside the sandbox. Nothing about the intended access can fault. Yet the DUT takes an
+exception (`a7 = 0x100000 - 8`) and vectors to a wild PC.
+
+`ORI.w #imm,<ea>` is a line-0 immediate: the **immediate word precedes the EA extension
+word**, so the EA must be re-decoded from a window shifted by `immWords` (the mechanism
+`ucImmEaVec`/`ucImmWords` implements at `DecodeStage.scala:1904-1907`). Now compare the
+two candidate words:
+
+| Word | Value | bit 8 | Interpreted as |
+|------|-------|-------|----------------|
+| true brief ext for `(20,%a0,%a2.l*2)` | `0xAA14` | **0** | brief format, disp `0x14` |
+| the immediate `#0x254a` | `0x254a` | **1** | **FULL format** (bd/od, possibly memory-indirect) |
+
+Bit 8 is the brief/full-format selector. **If the EA re-decode is off by one word here, it
+reads the immediate as the extension word, and bit 8 = 1 flips it from brief to
+full-format** — a completely different EA shape with a bd/od chain, yielding a garbage
+address → access fault → format-$0 frame → wild PC. That reproduces the observed signature
+exactly, and it explains why the fuzzer found it with this specific immediate: most random
+immediates with bit 8 clear would decode as a *brief* EA and merely produce a wrong (but
+non-faulting) address, which the memory compare might or might not catch.
+
+This is the same defect *class* as the documented task #152 bug in this very code path
+("an unguarded check here misfired … mis-shifting its EA re-decode"). It is a concrete,
+statically checkable lead: audit the `immWords` shift for the **brief-indexed** (mode 6)
+destination case specifically.
+
 **Negative result, stated plainly: cluster B proper is NOT task #223.** The coordinator's
 lead was worth checking and it does not hold for the 10 memory-indirect seeds — those are
 the classifier gap, a different mechanism from #223's brief-indexed/`MEMSIMPLE` shape. The
