@@ -12,6 +12,84 @@ every real RTL bug it exposes.
 | 1 | 2026-09-03 | **20** | **−37** | MEASURED, full 200-seed sweep, 180 PASS. `fuzz_logs_round1/*.log` on this branch |
 | 2 | 2026-09-03 | **13** | **−7** | MEASURED, full 200-seed sweep, 187 PASS. `fuzz_logs_round2/*.log`. TAS memory-indirect routing fixed + gate unification |
 | 3 | 2026-09-03 | **5** | **−8** | MEASURED, full 200-seed sweep, 195 PASS. `fuzz_logs_round3/*.log`. Cluster C (A7 resync) fixed |
+| 7 | 2026-09-03 | **4** | **−1** | MEASURED, full 200-seed sweep, 196 PASS. `fuzz_logs_round7/*.log`. Cluster E (seed 21) fixed |
+
+### Round 7 measured result — cluster E CAPTURED, fixed, and one prediction retracted
+
+**5 → 4.** Surviving: 57, 80, 109, 127. Seed 21 is gone.
+
+The address was **captured, not inferred**. Rounds 4–6 established by program-level probing
+that the EA arithmetic was fine and that only the immediate-source form failed, but also
+established that a sandbox-only compare *structurally cannot* locate the store once
+`An + bd` overflows 2^32 — every candidate address lands outside the compared region. So
+this round tapped `LsEuPlugin`'s `s1Va` and its three input terms directly
+(`ClusterEAddrCaptureSpec`), running both source forms in one program so only the source
+operand varied:
+
+```
+imm source  pc=0x4080000c base=0xffff3ff0 disp=0x00010000 index=0xfffffffc -> s1Va=0x00003fec
+reg source  pc=0x40800016 base=0xffff3ff0 disp=0x00010036 index=0xfffffffc -> s1Va=0x00004022
+```
+
+**The actual store address is `0x00003fec`.** It is neither of the two candidates round 6
+had (invalidly) "refuted" — not `bd` ignored (`0xffff3fec`), not `bd` truncated to 16 bits
+(`0xffff4022`). The long base displacement `0x00010036` decodes as `0x00010000`: it loses
+its **low half-word**, and the correct high half proves the wraparound was never involved.
+
+### Mechanism
+
+`MicroOpAssembler`'s two immediate-shifted EA re-decodes — `immEa` (the line-0 immediate
+mem-dest RMW address) and `immDstEa` (the `MOVE #imm,<mem>` destination) — hand-built a
+**three-entry** words `Vec`. `EaDecoder`'s full-format path reads `words(2) ## words(3)` for
+a LONG base displacement, and `EaDecoder.wAt` returns a hard `B(0,16)` for any index past
+the `Vec` length — so `words(3)` read as constant zero.
+
+The register-source form was always correct because it uses the unshifted `dstEa`, built
+from the full 10-word window via `shiftedWordsFor`. And `DecodeStage.scala`'s own copies of
+the same re-decode (`s0ImmEaVec`, `s1mi_immVec`) were **already four entries** and already
+correct. The two `MicroOpAssembler` copies had silently drifted one word short — a
+duplicated-logic divergence, not a design gap.
+
+Fix (`85ff14e`): one shared `immShiftedWords` helper, six entries (ext word at 1, a LONG
+`bd` at 2..3, a LONG outer displacement out to 5). Built as an explicit 2-way `Mux` per
+element rather than through `shiftedWordsFor`'s dynamic index — the shift is one of exactly
+two constants, so it keeps the same 2:1-mux-per-word cost as the `Vec`s it replaces instead
+of putting a 10:1 dynamic select on the decode cone. No new predicate; nothing added to
+`bad`.
+
+Regression: `imm_src_fullfmt_long_bd_dst.s`, four cases (no wrap; seed 21's exact 2^32 wrap;
+a line-0 `ORI.W` RMW exercising the *other* call site; a LONG immediate for the shift-2 leg),
+each asserting both that the intended address WAS written and that the mis-decoded address
+was NOT. Verified genuinely fail-before/pass-after — on unmodified RTL it fails at
+`0xDEAD00A1`, case A's target never written.
+
+### RETRACTION (fifth) — "seeds 21 and 57 share a root cause" is refuted
+
+Round 6 predicted one fix would close both. **Measured: seed 57 diverges identically after
+the fix** (`idx=35 pc: dut=0xeb3fe087 oracle=0x408000b4`). The doc had already flagged that
+seed 57's probe crossed instruction families (`ORI` line-0 vs `OR` line-8) and was therefore
+the weaker leg; it was. The mechanism now says so outright: seed 57's
+`ori.w #0x254a,(20,%a0,%a2.l*2)` uses a **brief-format** extension word — one word — for
+which a 3-entry `Vec` was always sufficient. Cluster E was never about "immediate source" as
+such. It is specifically **a LONG base displacement behind an immediate**. Seed 57 is a
+separate defect and stays open.
+
+Worth naming as a pattern: the shared discriminator ("immediate form fails, register form
+passes") was real and correctly measured at both sites, and it still did not imply a shared
+cause. A discriminator localises; it does not identify.
+
+### Same class, NOT fixed — carried forward
+
+Five more call sites still pass 3-entry `Vec`s and would lose a long `bd` the same way for a
+full-format source EA. None has a reproducer yet, so none was touched:
+
+| Site | File |
+|------|------|
+| `divlSrcEa` | `MicroOpAssembler.scala` |
+| `mullSrcEa` | `MicroOpAssembler.scala` |
+| `bfmEaDec`  | `MicroOpAssembler.scala` |
+| `c2SrcEa`   | `MicroOpAssembler.scala` |
+| `ucCasEaDec`| `DecodeStage.scala` |
 
 ### Round 3 measured result — every remaining divergence is a named RTL bug
 
