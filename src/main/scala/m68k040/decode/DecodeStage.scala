@@ -113,14 +113,26 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // `u.shiftOp`/`u.shiftDir` (:2818, :3386) so a memory shift cannot carry its
     // tt/dr through ctx, and Scc needs a CONDITION evaluation (branch EU) rather than
     // an ALU host-op. Both need their own µcode entry; tracked as follow-ups.
-    def miSingleEaFamily(spec: OpSpec): Bool =
+    def miSingleEaFamily(spec: OpSpec, opw: Bits): Bool =
       (spec.op === DecOp.CLR) || (spec.op === DecOp.NEG) || (spec.op === DecOp.NEGX) ||
       (spec.op === DecOp.NOT) || (spec.op === DecOp.TST) ||
       // TAS <ea> (2026-09-03): a genuine byte RMW (read, set bit 7, write back) that maps
       // onto MI_RMW_ENTRY's ptr-load / host-load->T1 / op->T1 / host-store shape with no
       // new context fields -- `ctx.miOp` already carries the unary family. Its absence
       // here is fuzz cluster B (8 of 11 seeds: 3, 4, 21, 22, 41, 74, 103, 126).
-      (spec.op === DecOp.TAS)
+      //
+      // Matched from the RAW OPWORD, not from `spec.op`, and that is load-bearing for
+      // TIMING, not style. The first version of this line was `spec.op === DecOp.TAS`,
+      // and the OOC gate isolated a -20.14 MHz FMax regression (175.25 -> 155.11) to
+      // that single term: `spec` is the registered/offloaded DECODED spec and arrives
+      // late, so hanging a new term off it lengthened the decode critical path. The four
+      // control families in this same file (s0IsLea/s0IsPea/s0IsJmp/s0IsJsr, ~line 760)
+      // already decode straight from the opword for exactly this reason. TAS is
+      // `0100 1010 11 mmmrrr`, so bits 15:6 identify it outright. Mode 0 (TAS Dn) and
+      // mode 7 reg 4 (the ILLEGAL 0x4AFC) also match these bits but can never classify
+      // as MEMINDIRECT, so the EA-class check at each call site excludes them -- this
+      // predicate cannot misfire onto them.
+      (opw(15 downto 6) === B"10'b0100101011")
     def miAddqSubqFamily(spec: OpSpec): Bool = spec.srcB.kind === OperandKind.IMMQ3
     def miLineImmFamily(spec: OpSpec):  Bool = spec.srcB.kind === OperandKind.IMMEXT
     def miDynBitFamily(spec: OpSpec):   Bool =
@@ -281,7 +293,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ALU Dn,<ea> RMW dst-EA (task #150, mirrors s0AluDstMode/ucAluDstMi): opmode 4/5/6.
     val s1mi_isAluDst = s1mi_isAluLine &&
                         ((s1mi_opmode === U(4, 3 bits)) || (s1mi_opmode === U(5, 3 bits)) || (s1mi_opmode === U(6, 3 bits)))
-    val s1mi_isSingle = miSingleEaFamily(slot1Spec0)   // shared predicate (see logic's header)
+    val s1mi_isSingle = miSingleEaFamily(slot1Spec0, s1mi_opw)   // shared predicate (see logic's header)
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
     val s1mi_isAddqSubq = miAddqSubqFamily(slot1Spec0)
     val s1mi_isImm = miLineImmFamily(slot1Spec0)
@@ -625,7 +637,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors ucAddqSubqMi below): another
     // dst-EA RMW form, srcB.kind=IMMQ3 (distinct from the line-0 IMMEXT immediate).
     val s0IsAddqSubq = miAddqSubqFamily(spec0)
-    val s0IsSingleEa = miSingleEaFamily(spec0)          // shared predicate (see logic's header)
+    val s0IsSingleEa = miSingleEaFamily(spec0, s0opw)          // shared predicate (see logic's header)
     val s0IsLineImm  = miLineImmFamily(spec0)
     // DYNAMIC bit-op (BTST/BCHG/BCLR/BSET Dn,<ea>): OperationDecoder gives its srcB a
     // REGISTER (dnField, the bit-number Dn -- see OperationDecoder.scala's
@@ -1952,7 +1964,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucIsDynBitOp = miDynBitFamily(ucEntrySpec)
     val ucDynBitMi   = ucIsDynBitOp && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // single-EA op (CLR/NEG/NEGX/NOT/TST): the EA is op[5:0], the host op is spec.op.
-    val ucIsSingleEa = miSingleEaFamily(ucEntrySpec)    // shared predicate (see logic's header)
+    val ucIsSingleEa = miSingleEaFamily(ucEntrySpec, ucEopw)    // shared predicate (see logic's header)
     val ucSingleMi = ucIsSingleEa && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
     // ── LEA/PEA/JMP/JSR full-format mem-indirect (task #201) ────────────────────────────
     // Architecturally the SIMPLEST possible mem-indirect consumers: they need only the

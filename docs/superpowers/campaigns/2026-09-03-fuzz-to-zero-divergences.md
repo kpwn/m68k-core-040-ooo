@@ -853,6 +853,7 @@ four variants of the same tree so the delta is attributable rather than asserted
 | `3eacf56` — + round-1 `BrWbObs.keepCommit` | −0.706 | **175.25** | **0.00** |
 | `db86a83` with the TAS entry **removed** (gate unification only) | −0.706 | **175.25** | **0.00** |
 | `db86a83` — full round-2 fix | −1.447 | **155.11** | **−20.14** |
+| round-3: TAS matched from the **raw opword** instead | **−0.607** | **178.35** | **+3.10** |
 
 ### What this establishes
 
@@ -888,5 +889,19 @@ TAS <ea> = 0100 1010 11 mmm rrr     -> opw(15 downto 6) === B"0100101011"
 
 So replacing the `spec.op` comparison with a raw-opword match, in the style of the existing
 `s0IsJmp`, is a plausible way to recover most or all of the 20 MHz **without giving up the
-fix**. This is a hypothesis with a named mechanism and an in-file precedent — it has not
-been measured, and should not be claimed until it is.
+fix**. **MEASURED (round 3): the hypothesis held.** Replacing `spec.op === DecOp.TAS` with
+`opw(15 downto 6) === B"10'b0100101011"` recovered the entire regression:
+**155.11 → 178.35 MHz**, i.e. **+23.24 MHz**, landing **3.10 MHz above the original
+baseline** — with the TAS fix fully intact (`tas_memind.s` PASS, seeds 3/4 PASS,
+`make test-fast` 337/337).
+
+Honest caveat on the +3.10: this should **not** be read as "adding TAS made the core
+faster". Vivado is deterministic for identical input (three separate runs all returned
+exactly −0.706), but a netlist perturbation can shift which path is critical and how
+optimisation proceeds. The defensible claim is **"no timing regression; measured slightly
+above baseline"** — not a speedup attributable to this change.
+
+The transferable lesson: **in this decode stage, hanging a new term off the registered/
+offloaded `spec` costs real FMax, while matching the same condition from the raw opword is
+free.** That is why `s0IsLea`/`s0IsPea`/`s0IsJmp`/`s0IsJsr` are written the way they are,
+and it is the pattern to follow when the remaining families (SHIFT-mem, Scc) are added.
