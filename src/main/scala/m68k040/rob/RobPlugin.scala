@@ -1423,7 +1423,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // ROB-fold Slice B: exactly TWO hoisted readAsync ports (each call allocates a
     // physical port) — nextPcRd0 serves BOTH commitPc0 and flushPcReg (same h0
     // address, same mux the old Reg-Vec read shared), nextPcRd1 serves commitPc1.
-    val nextPcRd0 = nextPcMem.readAsync(h0)
+    val nextPcRd0 = nextPcMem.readAsync(h0); nextPcRd0.simPublic() // 2026-09-03 early-flush debug tap
     val nextPcRd1 = nextPcMem.readAsync(h1)
     val commitPc0 = Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)
     val commitPc1 = Mux(p1.retireAlone, nextPcRd1, p1.predNextPc)
@@ -1850,6 +1850,160 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val branchRedirect = retire0 && p0.retireAlone && mispredictStore(h0)
     branchRedirect.simPublic() // 2026-08-27 boot-investigation debug tap
 
+    // ── EARLY (EU-resolution-time) mispredict flush (2026-09-03, boot-fix follow-up) ──
+    // Implements the DEGENERATE-BUT-SAFE variant Part 61 itself identified and set
+    // aside for being "strictly MORE aggressive than today's design" — not the narrow
+    // per-branch squash Part 61 correctly ruled out. Landed now because the current
+    // priority is functional correctness / boot progress over IPC (see this session's
+    // brief); the aggressiveness cost (discarding legitimate older in-flight work too)
+    // is accepted, not optimized away.
+    //
+    // Fires directly off BranchEuPlugin's S1 completion (`branchCompletion`), NOT
+    // retire-gated, so recovery from Part 29's collateral-flush livelock no longer has
+    // to wait for however many older, still-in-flight instructions sit ahead of the
+    // mispredicting branch. Target: the CURRENT COMMITTED PC, never the branch's own
+    // resolved target — because `flushing` drives RatTable/Freelist's single GLOBAL
+    // "restore to committed shadow" rollback (RenameStage.scala:106-115) with no
+    // per-robId selectivity, so any restart point other than the actual committed
+    // point would be inconsistent with what gets rolled back.
+    //
+    // Two races were investigated and closed before landing this (see the companion
+    // SoC doc's new Part for the full writeup):
+    //
+    // (1) commHead/commReg read-vs-write race: DOES NOT EXIST. `flushing` already
+    //     makes `commitPorts(k).valid && flushing` architecturally unreachable (see
+    //     the assert right after `rc.flushPort := flushing` below), so on the exact
+    //     cycle the rollback reads commHead/commReg (the cycle `flushing` is high),
+    //     no commit is landing — frozen, single well-defined value. Applies to every
+    //     flush trigger, old or new, for free.
+    //
+    // (2) Same-cycle forwarding: this trigger's target PC must fold in a retire
+    //     landing on the SAME cycle it fires, because commHead/commReg themselves
+    //     fold in that same-cycle commit before the rollback reads them next cycle.
+    //     `committedResumePc` below does this (mirrors `commitPc0`/`allocReadySig`'s
+    //     existing same-cycle-forwarding idiom in this file).
+    //
+    // (3) Mid-macro partial-commit hazard (the sharper one, NOT in the original
+    //     brief — found by cross-checking against `driveCommit`'s actual commit
+    //     granularity): `driveCommit` commits EVERY retiring micro-op into
+    //     commReg/commHead, not just a macro-instruction's LAST one, but the only
+    //     existing "resume PC" register (`debugLivePcReg`) only advances at `.last`.
+    //     Firing this trigger while a multi-micro-op macro is PARTIALLY retired
+    //     (some micro-ops already committed, `.last` not yet reached) would redirect
+    //     fetch to BEFORE that macro while the rollback target already includes the
+    //     partial commit — refetching would re-execute the already-committed
+    //     micro-ops a second time (double store, double autoincrement, ...). This
+    //     codebase already treats "mid-cracked-instruction" as unsafe to redirect at
+    //     elsewhere (`interruptPending`/`tracePendingFire` both gate on `p0.first`,
+    //     see their own comments above: "never mid-cracked-instruction"/"never
+    //     mid-crack") — `safeEarlyFlushBoundary` below reuses that exact precedent:
+    //     count===0 (nothing in flight to be mid-macro) or p0.first (the current
+    //     head has not yet started retiring its own macro, so nothing of ITS macro
+    //     is partially committed either). No new state needed.
+    //
+    //     A second, narrower instance of the SAME hazard: THIS cycle's own retire
+    //     can itself CREATE a fresh partial-macro state even when `p0.first` held
+    //     coming in — e.g. a cracked BSR/JSR's store-half (first micro-op, NOT
+    //     last) retiring the exact cycle an unrelated branch elsewhere resolves
+    //     mispredicted. `committedResumePc` would (correctly, by its own Mux)
+    //     still report the OLD boundary (before the whole BSR), but commReg/
+    //     commHead have ALREADY absorbed the store-half's commit — refetching
+    //     from the old boundary would re-crack and re-execute the store-half a
+    //     second time. `macroSafeThisRetire` below closes this: block whenever
+    //     this cycle's own retire completes a NON-final micro-op. (Deliberately
+    //     conservative on the dual-retire p0-non-last/p1-last-same-macro case —
+    //     that one IS actually safe since `committedResumePc` picks `commitPc1`
+    //     there, but it costs nothing to fall back to the always-correct
+    //     retire-gated path on that one narrow sub-case rather than special-case
+    //     it; simple and correct beats clever.)
+    //
+    // Double-flush / redundant-retrigger (design question 2 of the brief): NOT
+    // possible by construction, no extra latch needed. `headReady` requires
+    // `!flushing`, so retire (and therefore `branchRedirect`) cannot fire on the
+    // cycle `flushing` is asserted. After the flush, `tail := head` / `count := 0`
+    // logically empties the ROB; the flushed branch's stale `mispredictStore` bit
+    // sits at a physical index that is unreachable as a NEW h0 until it is
+    // reallocated by a genuinely new instruction — whose alloc unconditionally
+    // resets `mispredictStore(tail) := False` (same reuse-safety invariant the
+    // EXISTING retire-gated mechanism already depends on for ROB circular reuse).
+    // So the old branch's `branchRedirect` can never re-fire for the same
+    // (now-stale) entry.
+    //
+    // Priority (design question 3): ordered so `exc.redirectValid`'s later
+    // `when` block below wins on any coincidence (last-assignment-wins), matching
+    // this file's existing exc-redirect-is-highest-priority convention.
+    //
+    // (4) Cold-boot bogus-PC hazard (found empirically, by the directed regression
+    //     corpus below catching a real hang before this was reasoned out statically):
+    //     `debugLivePcReg` inits to 0 -- a placeholder, not a real PC (the actual reset PC
+    // comes from the vector table, never address 0) -- and only ever gets a REAL value
+    // once the first `.last` micro-op retires. If a branch resolves in the EU before
+    // that has happened even once (very plausible early in a cold pipeline fill, where
+    // execute can outrun in-order retire), `committedResumePc` would fall through to
+    // that bogus 0 and redirect fetch into garbage — a real hang this exact scenario
+    // triggered (`adv_a7_spec_flush`/`adv_flush_restart_store`, found by the directed
+    // regression corpus below). `everRetiredOnce` closes it: no early trigger before
+    // `debugLivePcReg` holds a real value. Costs nothing but the first few boot cycles
+    // (falls back to the always-correct retire-gated `branchRedirect` until then).
+    val everRetiredOnce = RegInit(False)
+    when((retire0 && p0.last) || (retire1 && p1.last)) { everRetiredOnce := True }
+
+    // (5) KNOWN OPEN GAP, NOT FIXED THIS SESSION: chained-early-flush StoreQueue
+    //     wedge. `adv_flush_restart_store` (one of the six mandatory regression
+    //     tests) STILL HANGS with this mechanism enabled, even after fixes (1)-(4)
+    //     above. Cycle-trace root cause: once a SECOND early flush lands shortly
+    //     after a first one (both redirecting through the same store-adjacent PC
+    //     region), retire STOPS PERMANENTLY -- `headReady`'s `completes(h0)` never
+    //     returns again -- even though fetch/execute keeps looping correctly
+    //     through an already-trained branch downstream. This matches, in symptom
+    //     and even in the exact code region, an ALREADY-DOCUMENTED StoreQueue bug
+    //     class: see `StoreQueue.scala`'s own `headDrainInFlight`/`keep` comment
+    //     block ("BUG_calibration_word Part 37" -- "a flush landing NOT
+    //     retire-gated ... CAN land mid-drain of an already-accepted store write
+    //     ... the ring is permanently wedged ... NOTHING can ever drain again").
+    //     That fix explicitly scopes itself to PRECISE stores only ("a non-
+    //     precise/pipelined send can only start once ALREADY COMMITTED ... never
+    //     needs this") -- but `adv_flush_restart_store` uses an ORDINARY
+    //     (non-precise) store, so either that scoping assumption doesn't hold once
+    //     a NON-retire-gated flush can arrive at HIGHER FREQUENCY than this
+    //     mechanism was designed for, or a related-but-distinct SQ wedge exists for
+    //     the ordinary-store path. Two mitigations were tried and both ruled OUT
+    //     "insufficient settle time" as the mechanism (proven via direct cycle
+    //     trace, not just retest): (a) `retiredSinceLastFlush` below (require one
+    //     real retire since the last flush) delays but does not prevent the wedge;
+    //     (b) a ~20-cycle flush cooldown (tried, then reverted -- see git history)
+    //     also only delays it. This is a PERMANENT state wedge, not a timing race
+    //     -- no amount of additional waiting un-wedges it once triggered. `(a)` is
+    //     kept below anyway (real, if insufficient, correctness improvement, zero
+    //     cost) but does NOT make this test pass. A real fix requires a
+    //     StoreQueue-side investigation (extending `headDrainInFlight`'s protected
+    //     class, or finding the ordinary-store-path equivalent) -- out of scope for
+    //     this session; flagged rather than papered over, per this project's own
+    //     standing discipline. See the companion SoC doc's Part for the full
+    //     writeup and this session's explicit verdict.
+    val retiredSinceLastFlush = RegInit(True)
+    when(flushing) { retiredSinceLastFlush := False }
+    when(retire0 || retire1) { retiredSinceLastFlush := True }
+    // NOTE: a cycle-based cooldown variant of this gate was ALSO tried (requiring
+    // ~20 settled cycles since the last flush, not just one retire) and traced
+    // empirically -- it does NOT fix `adv_flush_restart_store` either, just delays
+    // which specific robId eventually re-triggers the same failure. That rules out
+    // "insufficient settle time between flushes" as the mechanism: this is a
+    // PERMANENT state wedge (once triggered, no amount of additional waiting
+    // un-wedges it), not a timing race a cooldown could close. See this trigger's
+    // own KNOWN OPEN GAP note below and the companion SoC doc's write-up.
+    val macroSafeBefore     = (count === 0) || p0.first
+    val macroSafeThisRetire = !((retire0 && !p0.last) || (retire1 && !p1.last))
+    val safeEarlyFlushBoundary = macroSafeBefore && macroSafeThisRetire &&
+      everRetiredOnce && retiredSinceLastFlush
+    val committedResumePc = Mux(retire1 && p1.last, commitPc1,
+                            Mux(retire0 && p0.last, commitPc0,
+                            debugLivePcReg))
+    val earlyBranchMispredict = branchCompletion.valid && branchCompletion.payload.mispredict &&
+      !flushing && !coreHalted && !debugHalted && safeEarlyFlushBoundary
+    earlyBranchMispredict.simPublic() // 2026-09-03 early-flush debug tap
+    committedResumePc.simPublic()
+
     // ── branchTrainMem retire-time read (task #129, area) ───────────────────────
     // A single readSync port, enabled on every retire0 (regardless of which consumer
     // below needs it — cheaper than two separately-gated read ports, and harmless when
@@ -1857,13 +2011,119 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // register: its output lands the cycle AFTER retire0, exactly matching the old
     // RegNext(*Comb.payload) timing, so BtbPlugin/GsharePlugin see no timing change.
     val branchTrainRd = branchTrainMem.readSync(h0, retire0)
-    btbUpdateFlow.payload.pc     := branchTrainRd.pc
-    btbUpdateFlow.payload.taken  := branchTrainRd.taken
-    btbUpdateFlow.payload.target := branchTrainRd.target
-    btbUpdateFlow.payload.brType := branchTrainRd.brType
-    btbUpdateFlow.payload.len    := branchTrainRd.len
-    gshareUpdateFlow.payload.index := branchTrainRd.phtIndex
-    gshareUpdateFlow.payload.taken := branchTrainRd.taken
+
+    // ── Retire-time BTB update (fetch-time predictor, slice 1) ──────────────────
+    // When a BTB-eligible branch retires at the head (retire0 — branches are
+    // retireAlone, so they always retire in slot 0), drive the BtbPlugin write port
+    // with its captured PC/target/brType + resolved direction. ONLY at retire => no
+    // wrong-path pollution (a squashed wrong-path branch never reaches retire).
+    val retireBtbTrainValid    = retire0 && btbIsBranchStore(h0)
+    // ── Retire-time gshare PHT update (slice 3) ─────────────────────────────────
+    // When a CONDITIONAL gshare-predicted branch retires at the head (retire0 — branches
+    // are retireAlone → always slot 0), train pht[carried-index] toward its RESOLVED
+    // direction (branchTrainRd.taken == actualTaken). ONLY at retire ⇒ no wrong-path
+    // pollution. The carried fetch-time index (branchTrainRd.phtIndex) — not a
+    // retire-time recompute — is mandatory (the speculative GHR has shifted by retire).
+    val retireGshareTrainValid = retire0 && phtValidStore(h0)
+
+    // ── Early-flush BTB/gshare training (2026-09-03) — CLOSES A REAL LIVELOCK ───
+    // found by this session's own directed regression (adv_a7_spec_flush went from
+    // "PASS" to "HANG", confirmed via a cycle trace: the SAME robId's early flush
+    // re-fired every ~12 cycles forever, always redirecting to the SAME PC). Root
+    // cause: BTB/gshare training was deliberately retire-only ("no wrong-path
+    // pollution" — see the two comments above), but `earlyBranchMispredict` now
+    // discards the mispredicting branch's ROB entry BEFORE it ever reaches retire
+    // — so it never trains, the predictor is never corrected, and a refetch of the
+    // exact same PC mispredicts the exact same way, forever. This is a strictly
+    // WORSE failure mode than Part 29's bug (that one eventually resolved at
+    // retire; this one never resolved at all).
+    //
+    // Fix: train directly off `branchCompletion.payload` (live this cycle — no
+    // branchTrainMem readback exists yet for this robId) whenever the early
+    // trigger fires. This is NOT the wrong-path pollution the retire-only
+    // discipline guards against: the early-flushed branch itself is genuine,
+    // real, correct-path architectural information (it really executed, with a
+    // real resolved outcome) — only what comes AFTER it in program order is
+    // being unwound. Priority: given both fire the same cycle (early path for
+    // this robId vs. an unrelated, older branch's ordinary retire-time train),
+    // the early path wins (Mux below) — losing the rare retire-time coincidence
+    // once is a minor, self-correcting prediction-quality cost; losing the early
+    // path even once reopens the livelock for that PC.
+    //
+    // Known, accepted, narrow residual (documented, not fixed): if the
+    // triggering branch is ITSELF wrong-path relative to a not-yet-detected
+    // OLDER misprediction still resolving out of program order in the EU, this
+    // trains on genuinely wrong-path data — a predictor-QUALITY cost only (a
+    // mispredicted branch is always architecturally safe to recover from), not
+    // a correctness bug, and far narrower than the livelock it replaces.
+    //
+    // `debugBranchMispredict`/`debugBranchRetire` below are DELIBERATELY left
+    // retire-only (reading `retireBtbTrainValid`/`branchTrainRd` directly, not
+    // the unioned `btbUpdateValidComb`/`btbUpdateFlow.payload`) — other
+    // consumers (lock-step observability) correlate these with genuine ROB
+    // retire events; mixing in early-flush events (no retire0 pulse at all)
+    // would desync that correlation for no benefit.
+    // TIMING (found via a cycle trace after the naive version below trained the
+    // predictor with GARBAGE and the livelock persisted unchanged): `branchTrainRd`
+    // is a REGISTERED read (`branchTrainMem.readSync(h0, retire0)`), so its value —
+    // and `btbUpdateFlow.valid := RegNext(btbUpdateValidComb)` — both land ONE CYCLE
+    // AFTER the retire0 trigger, already matched to when `btbUpdateFlow.payload` is
+    // actually consumed downstream. `branchCompletion`/`earlyBtbTrainValid` are raw,
+    // undelayed combinational signals for the trigger cycle — reading them directly
+    // in the SAME Mux as `branchTrainRd` reads them ONE CYCLE LATE, by which point
+    // the one-shot `branchCompletion` pulse has already moved on to whatever
+    // (don't-care) payload happens to be present, and `earlyBtbTrainValid` itself
+    // has gone back False, so the Mux silently fell through to `branchTrainRd` —
+    // itself stale/never-written for this robId (retire0 never fires for an
+    // early-flushed branch) — training the predictor with garbage every time and
+    // NOT fixing the livelock at all. Fix: register the early path's valid flag
+    // and payload snapshot by exactly one cycle too, so both sides of every Mux
+    // below are sampled on the SAME (correct, downstream-consumption) cycle.
+    // `earlyBtbTrainValid`/`earlyGshareTrainValid` drive `btbUpdateValidComb`/
+    // `gshareUpdateValidComb` DIRECTLY (SAME cycle, no extra register), exactly
+    // mirroring `retireBtbTrainValid`/`retireGshareTrainValid`'s own direct,
+    // same-cycle driving above -- `btbUpdateFlow.valid := RegNext(btbUpdateValidComb)`
+    // supplies the (single) cycle of delay for BOTH sources uniformly. The `D1`
+    // (one-cycle-delayed) copies below are ONLY for the PAYLOAD mux selectors,
+    // whose values must align with when `btbUpdateFlow.payload`/`gshareUpdateFlow.
+    // payload` are actually READ (the SAME cycle `.valid` is high, i.e. one cycle
+    // after the trigger) -- exactly mirroring `branchTrainRd`'s own natural
+    // one-cycle-later registered-read availability. Using the SAME (D1) signal for
+    // both the valid-gate AND the payload-select (an earlier, wrong version of this
+    // fix) added a SECOND, spurious cycle of delay only on the early path, so the
+    // payload mux read `earlyTrain*` one cycle too late (already stale/holding
+    // garbage from nothing having fired) and silently fell through to
+    // `branchTrainRd` (itself never validly written for an early-flushed robId) --
+    // caught by re-tracing after the first attempt's fix visibly failed to change
+    // the observed livelock at all.
+    val earlyBtbTrainValid    = earlyBranchMispredict && branchCompletion.payload.isBranch
+    val earlyGshareTrainValid = earlyBranchMispredict && branchCompletion.payload.phtValid
+    val earlyBtbTrainValidD1    = RegNext(earlyBtbTrainValid) init False
+    val earlyGshareTrainValidD1 = RegNext(earlyGshareTrainValid) init False
+    // Explicit inits on all six (matching this file's own universal convention --
+    // every other Reg here carries one): their VALUE is always gated by
+    // earlyBtbTrainValidD1/earlyGshareTrainValidD1 before being consumed, so an
+    // uninitialized reset value could never be FUNCTIONALLY selected -- but a
+    // random-content-on-reset sim policy (this codebase's own documented "PRNG
+    // stream position" hazard class) still shifts elaboration-order random draws
+    // for every OTHER randomized decision later in the same test, which is exactly
+    // the kind of harness-only artifact this project has been burned by before.
+    val earlyTrainPc     = RegNextWhen(branchCompletion.payload.btbPc,     earlyBtbTrainValid) init 0
+    val earlyTrainTaken  = RegNextWhen(branchCompletion.payload.btbTaken,  earlyBtbTrainValid) init False
+    val earlyTrainTarget = RegNextWhen(branchCompletion.payload.btbTarget, earlyBtbTrainValid) init 0
+    val earlyTrainBrType = RegNextWhen(branchCompletion.payload.brType,    earlyBtbTrainValid) init 0
+    val earlyTrainLen    = RegNextWhen(branchCompletion.payload.btbLen,    earlyBtbTrainValid) init 0
+    val earlyTrainIndex  = RegNextWhen(branchCompletion.payload.phtIndex,  earlyGshareTrainValid) init 0
+    when(retireBtbTrainValid || earlyBtbTrainValid) { btbUpdateValidComb := True }
+    when(retireGshareTrainValid || earlyGshareTrainValid) { gshareUpdateValidComb := True }
+    btbUpdateFlow.payload.pc     := Mux(earlyBtbTrainValidD1, earlyTrainPc,     branchTrainRd.pc)
+    btbUpdateFlow.payload.taken  := Mux(earlyBtbTrainValidD1, earlyTrainTaken,  branchTrainRd.taken)
+    btbUpdateFlow.payload.target := Mux(earlyBtbTrainValidD1, earlyTrainTarget, branchTrainRd.target)
+    btbUpdateFlow.payload.brType := Mux(earlyBtbTrainValidD1, earlyTrainBrType, branchTrainRd.brType)
+    btbUpdateFlow.payload.len    := Mux(earlyBtbTrainValidD1, earlyTrainLen,    branchTrainRd.len)
+    gshareUpdateFlow.payload.index := Mux(earlyGshareTrainValidD1, earlyTrainIndex, branchTrainRd.phtIndex)
+    gshareUpdateFlow.payload.taken := Mux(earlyGshareTrainValidD1, earlyTrainTaken, branchTrainRd.taken)
+
     val debugBranchRetire = Flow(DebugBranchEvent())
     debugBranchRetire.valid.simPublic()
     debugBranchRetire.payload.pc.simPublic()
@@ -1871,34 +2131,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugBranchRetire.payload.taken.simPublic()
     debugBranchRetire.payload.mispredicted.simPublic()
     debugBranchRetire.payload.branchType.simPublic()
-    val debugBranchMispredict = RegNextWhen(mispredictStore(h0), btbUpdateValidComb) init False
-    val debugBranchFallthrough = (btbUpdateFlow.payload.pc +
-      (btbUpdateFlow.payload.len.resize(32) << 1)).resized
-    debugBranchRetire.valid := btbUpdateFlow.valid
-    debugBranchRetire.payload.pc := btbUpdateFlow.payload.pc
-    debugBranchRetire.payload.nextPc := Mux(btbUpdateFlow.payload.taken,
-      btbUpdateFlow.payload.target, debugBranchFallthrough)
-    debugBranchRetire.payload.taken := btbUpdateFlow.payload.taken
+    val debugBranchMispredict = RegNextWhen(mispredictStore(h0), retireBtbTrainValid) init False
+    val debugBranchFallthrough = (branchTrainRd.pc +
+      (branchTrainRd.len.resize(32) << 1)).resized
+    debugBranchRetire.valid := RegNext(retireBtbTrainValid) init False
+    debugBranchRetire.payload.pc := branchTrainRd.pc
+    debugBranchRetire.payload.nextPc := Mux(branchTrainRd.taken,
+      branchTrainRd.target, debugBranchFallthrough)
+    debugBranchRetire.payload.taken := branchTrainRd.taken
     debugBranchRetire.payload.mispredicted := debugBranchMispredict
-    debugBranchRetire.payload.branchType := btbUpdateFlow.payload.brType
-
-    // ── Retire-time BTB update (fetch-time predictor, slice 1) ──────────────────
-    // When a BTB-eligible branch retires at the head (retire0 — branches are
-    // retireAlone, so they always retire in slot 0), drive the BtbPlugin write port
-    // with its captured PC/target/brType + resolved direction. ONLY at retire => no
-    // wrong-path pollution (a squashed wrong-path branch never reaches retire).
-    when(retire0 && btbIsBranchStore(h0)) {
-      btbUpdateValidComb := True
-    }
-    // ── Retire-time gshare PHT update (slice 3) ─────────────────────────────────
-    // When a CONDITIONAL gshare-predicted branch retires at the head (retire0 — branches
-    // are retireAlone → always slot 0), train pht[carried-index] toward its RESOLVED
-    // direction (branchTrainRd.taken == actualTaken). ONLY at retire ⇒ no wrong-path
-    // pollution. The carried fetch-time index (branchTrainRd.phtIndex) — not a
-    // retire-time recompute — is mandatory (the speculative GHR has shifted by retire).
-    when(retire0 && phtValidStore(h0)) {
-      gshareUpdateValidComb := True
-    }
+    debugBranchRetire.payload.branchType := branchTrainRd.brType
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
     // When the head is a faulted µop ready to retire, signal an exception with its
@@ -2534,11 +2776,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // fatal) path, which this gate does not otherwise cover.
     val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid &&
       !preciseDrainBusyIn
-    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
+    doFlushReg := branchRedirect || earlyBranchMispredict || exc.redirectValid ||
+                  debugRecoverEnter || debugPcApply
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
+    // Early trigger (see its declaration above for the full race-safety writeup):
+    // target is the CURRENT COMMITTED PC, not this branch's own resolved target —
+    // listed AFTER branchRedirect (harmless either way: when both coincide, algebra
+    // shows committedResumePc === nextPcRd0 exactly, see the declaration comment)
+    // and BEFORE exc.redirectValid so the exception redirect still wins on any
+    // coincidence (last-assignment-wins).
+    when(earlyBranchMispredict) { flushPcReg := committedResumePc }
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
-    when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) {
+    when(debugRecoverEnter && !branchRedirect && !earlyBranchMispredict && !exc.redirectValid) {
       flushPcReg := Mux(debugBreakpointBoundaryHit, p0.pc,
         Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
           debugStepRestartPc, p0.predNextPc))
