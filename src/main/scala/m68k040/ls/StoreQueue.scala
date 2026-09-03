@@ -131,6 +131,15 @@ class StoreQueue(depth: Int = 8) extends Component {
     val sqCompletion        = master(Flow(UInt(6 bits)))
     val sqFaultCompletion   = master(Flow(m68k040.execute.LsFault()))
     val preciseDrainBusy    = out(Bool())
+    // Real (not merely sim-tap) export of `headDrainInFlight` (declared below, see
+    // its own doc comment): "the head entry is uncommitted but already mid-drain,
+    // so a flush must KEEP it rather than squash it" (BUG_calibration_word Part 37).
+    // A cross-component consumer (LsEuPlugin's `pendMem` flush rollback, Part 111
+    // fix) needs the EXACT same live combinational condition the SQ's own `keep()`
+    // computation consults on the SAME cycle -- a `simPublic()` sim tap cannot cross
+    // a real hardware component boundary, so this is a genuine (tiny, single-bit,
+    // zero-logic-cost re-export) IO port, not a debug-only addition.
+    val headDrainInFlightOut = out(Bool())
   }
 
   // ---- ring storage (all RegInit) ----
@@ -1001,6 +1010,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   // `sendPtr`/`ackPhaseB`) simply needs to be allowed to unwind normally instead of
   // being abandoned mid-sequence.
   val headDrainInFlight = valids(head) && !committed(head) && (drainBusy || ackPhaseB)
+  io.headDrainInFlightOut := headDrainInFlight
   when(io.flush) {
     // A drainAck this same cycle pops the head entry (single-slot, or slot B of a
     // split). That popped entry must NOT be counted as kept — otherwise the flush's
@@ -1080,6 +1090,16 @@ class StoreQueue(depth: Int = 8) extends Component {
   cacheModes.foreach(_.simPublic()); cacheModesB.foreach(_.simPublic())
   supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
   io.drain.valid.simPublic(); io.drain.ready.simPublic(); io.drainAck.simPublic(); io.flush.simPublic()
+  // 2026-09-03 chained-early-flush StoreQueue-wedge investigation (BUG_calibration_word
+  // Part 110/111 handoff): additional debug taps for PortedTestRunner's PORTED_TRACE_
+  // EARLYFLUSH SQ-side tracer. Zero synth cost (simPublic is a sim-visibility flag only).
+  io.commit.valid.simPublic(); io.commit.payload.simPublic()
+  io.commitB.valid.simPublic(); io.commitB.payload.simPublic()
+  io.alloc.payload.precise.simPublic()
+  io.drain.payload.paddr.simPublic()
+  io.drainErr.simPublic()
+  validBs.foreach(_.simPublic())
+  headDrainInFlight.simPublic()
   // Task #139 mechanism #2: catch the ORIGINATING alloc of any SQ entry, so a
   // later-observed stuck head can be traced back to the actual allocating PC
   // even after the ROB has reused that robId number for a newer instruction.
