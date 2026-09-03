@@ -274,3 +274,66 @@ a result of the divergence firing first).
 5. Re-run the full `ExecuteLockStepSpec`/`FpuLockStepSpec` suite (not just `test-fast`,
    which excludes every `VerilatorTest`-tagged suite including these) to confirm no
    collateral regression in the branch-retire path the fix will necessarily touch.
+
+---
+
+## CORRECTION NOTE (2026-09-03) — root-cause lead (c) rests on a premise that is FALSE
+
+**Status: NEEDS RE-DERIVATION. Not adjudicated — this note does not overturn the bug, it
+invalidates one argument used to characterise it.**
+
+Added by the fuzz-to-zero-divergences campaign
+(`docs/superpowers/campaigns/2026-09-03-fuzz-to-zero-divergences.md`, "Round 2 — cluster C").
+
+### What is wrong
+
+The "Root-cause leads" section, point **(c)** (≈lines 179-190), argues that repro A's
+*"`a7` is ALSO wrong despite nothing in the program touching A7"* observation points at
+**genuinely wrong execution** rather than an observability artifact. The stated reasoning is:
+
+> "the lock-step harness's `a7` field (`ExecuteLockStepSpec`'s `c.a7`) is sourced from
+> `RobPlugin`'s `exc.ss.a7` (the live architectural A7 …), a COMPLETELY SEPARATE piece of
+> state from `commitPc0`/`predNextPc` — they do not share storage or a read path. Two
+> unrelated fields being simultaneously wrong is therefore NOT explained by a single
+> mis-read inside `RobPlugin`."
+
+**"Separate storage" is true. "Live architectural A7" is not.** `exc.ss.a7` is a
+**≥2-commit-cycle-lagged shadow**, and the lock-step harness replays that lag through a
+buggy resync, which can make `a7` read wrong on an instruction that never touches A7 —
+with no wrong execution whatsoever. Verified against current RTL (not comments):
+
+- `ExceptionUnit.scala:734` — `ss.writeA7.valid := True` is driven **unconditionally, every
+  cycle**, from `committedA7In` (the int-PRF readback at `committedPhysA7`,
+  `forceNoBypass`). So `ss.a7` mirrors **every** A7 write, not just exception/RTE/boot.
+- `ExceptionUnit.scala:727-733` documents the lag inline: *"the ACTIVE bank tracks A7 with
+  ~1-2 cycle lag."*
+- `SystemState.scala:70` — `val a7 = Mux(s, supBank, usp)`, a mux of those lagging banks.
+- `RobPlugin.scala:2629` — `obs(0).a7 := RegNext(exc.ss.a7)` adds another cycle.
+- `WhiteboxCapture.scala:110` force-resyncs the reconstructed A7 on any **value edge** of
+  that lagged sample, and does so **before** the OoO writeback fold at `:116` — so a
+  commit record that carries its own arch-15 writeback is immune, while any instruction
+  that does **not** write A7 is exposed to a late replay of an older A7 value.
+
+Net effect: after **two A7-changing retirements in close succession**, the *next*
+non-A7-writing instruction can report a stale A7 and then self-correct one step later.
+That is exactly the shape of the "a7 is also wrong" observation.
+
+### Why this matters for this bug
+
+FMOVEM.X `(An)` sits directly downstream of stack/`A7` traffic in the campaign scenario. If
+repro A's instruction stream moves A7 twice near the failure point, the `a7` half of the
+"two unrelated fields are simultaneously wrong" argument is **fully explained by the
+harness artifact**, and lead (c) loses its principal supporting evidence. The `commitPc0`
+half of the observation is untouched by this note and still stands on its own.
+
+### What to do before relying on lead (c)
+
+Re-derive the `a7` evidence with a source independent of `ss.a7`. The cheapest way needs no
+instrumentation: add an A7-**reading** instruction (`move.l %sp,%d0`) near the failure
+point. `D0` is compared through the `archReg` path, sourced from the EU writeback
+observation (`WhiteboxCapture.onWb`), which does not touch `ss.a7` at all. If `D0` holds the
+correct A7 while the `a7` field reads wrong, the architectural A7 was never wrong and lead
+(c)'s premise is void.
+
+*Filed by cross-check, not by re-running this bug's reproducer. Someone owning this bug
+should confirm before acting either way.*
