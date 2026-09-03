@@ -650,16 +650,31 @@ object MicroOpAssembler {
   // as `0x00010000`, sending `move.w #0x80,(0x10036,%a3,%d6.l*4)` to 0x00003fec instead of
   // 0x00004022 — silently, no fault).
   //
-  // SIX entries covers everything `EaDecoder` can read off a full-format extension word:
-  // index 1 = the ext word, 2..3 = a LONG `bd`, up to 5 = a LONG outer displacement
-  // (`fOdWordAt` spans 2..5). Deliberately built as an explicit 2-way `Mux` per element
-  // rather than through `shiftedWordsFor`'s dynamic index: the shift here is one of exactly
-  // two constants, so this keeps the identical 2:1-mux-per-word cost as the 3-entry Vecs it
-  // replaces (three more words, same structure) instead of introducing a 10:1 dynamic
-  // select on the decode critical path. Index 0 is preserved verbatim (`EaDecoder.decode`
-  // never reads it — see `shiftedWordsFor` — but keeping it makes this a strict widening).
+  // FOUR entries, which is the MINIMUM that is correct and also exactly what
+  // `DecodeStage.scala`'s already-correct copies of this same re-decode (`s0ImmEaVec`,
+  // `s1mi_immVec`) use: index 1 = the ext word, indices 2..3 = a LONG `bd`. That is
+  // everything these two call sites can legitimately need, because the only EA class they
+  // resolve here is MEMSIMPLE (full-format `I/IS=000`), and `I/IS=000` forces
+  // `fOdPresent = extW(1) = 0` -- so the outer displacement is never read. A MEMINDIRECT
+  // EA is re-decoded from the full packet by the µcode engine, so its `od` does not come
+  // from here either.
+  //
+  // WIDTH IS LOAD-BEARING, MEASURED: a first attempt used SIX entries (enough to also cover
+  // a LONG outer displacement at 4..5). That is dead logic per the paragraph above, and it
+  // cost **13.1 MHz** of full-core OOC FMax (178.35 -> 165.23, A/B against the same branch
+  // point under the same constraints) -- widening the Vec turns `EaDecoder`'s dynamically-
+  // indexed `fOdWordAt` into a live 4-way select at BOTH call sites, on the decode cone that
+  // FMax "Lever B" already identified as the design's WNS path. Do not widen this past 4
+  // without re-running the gate.
+  //
+  // Built as an explicit 2-way `Mux` per element rather than through `shiftedWordsFor`'s
+  // dynamic index: the shift is one of exactly two constants, so this keeps the same
+  // 2:1-mux-per-word cost as the 3-entry Vecs it replaces (one more word, same structure)
+  // instead of introducing a 10:1 dynamic select. Index 0 is preserved verbatim
+  // (`EaDecoder.decode` never reads it -- see `shiftedWordsFor` -- but keeping it makes
+  // this a strict widening of the code it replaces).
   private def immShiftedWords(words: Vec[Bits], immIsLong: Bool): Vec[Bits] =
-    Vec.tabulate(6) { i =>
+    Vec.tabulate(4) { i =>
       if (i == 0) words(0)
       else Mux(immIsLong, words(i + 2), words(i + 1))
     }

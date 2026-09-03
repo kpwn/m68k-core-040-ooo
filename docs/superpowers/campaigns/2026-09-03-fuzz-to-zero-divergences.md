@@ -78,6 +78,116 @@ Worth naming as a pattern: the shared discriminator ("immediate form fails, regi
 passes") was real and correctly measured at both sites, and it still did not imply a shared
 cause. A discriminator localises; it does not identify.
 
+### Round 7 verification
+
+| Gate | Result |
+|------|--------|
+| Directed test, unmodified RTL | **FAILS** at `0xDEAD00A1` (case A's target never written) |
+| Directed test, with fix | PASSES |
+| `make test-fast` / `sbt fastTest` | **337 succeeded, 0 failed**, 2 ignored, 214 suites |
+| `BsrFlushSkipSpec` | 17/17 |
+| `flush_younger_*` (4 tests) | 4/4 |
+| fuzz seed 21 | PASS |
+| fuzz seed 57 | still DIVERGED (prediction refuted, see above) |
+| Full 200-seed fuzz sweep | **196 PASS / 4 DIVERGED** — `fuzz_logs_round7/` |
+| Ported corpus (partial) | **472 of 905 run, 19 failed, ALL in the FPU/FPSP/FSAVE families — zero non-FPU failures** |
+
+The ported sweep was stopped at 472/905, not completed: four concurrent shards drove the
+host ~17 GB into swap and three of them stalled on long-timeout tests (one carries a
+3,000,000-cycle `.timeout`). It is reported as a partial, because that is what it is. Its
+signal is still worth having — across 472 tests the failure set is *entirely* FPU/FPSP,
+matching the documented pre-existing FMOVEM/FPU gap (task #229; the FPU corpus stands at
+20/48), with **no** integer, decode, EA or exception test failing. A decode change is
+exactly the kind that would show up there, and it did not. Someone re-running it should use
+fewer shards, or `tools/fuzz/ported-sweep.sh` serially.
+
+### SYNTH GATE — the fix is CORRECT but costs 13.1 MHz. DO NOT MERGE AS-IS.
+
+Full-core OOC (`synth/ooc_M68kFullCoreSynth.tcl`, 5 ns primary), A/B against this branch's
+own base under the *same current* constraints, so the stale-baseline problem does not apply:
+
+| Netlist | WNS | FMax |
+|---------|-----|------|
+| `01e0682` branch base | **-0.607** | **178.35 MHz** |
+| + cluster-E fix | **-1.052** | **165.23 MHz** (**-13.1**) |
+
+Both sides are reproducible: the base measured -0.607 on two independent runs, and the fix
+measured -1.052 on two *different* netlists (a first 6-entry attempt and the final 4-entry
+one). The 6-vs-4 pair is itself informative — **bit-identical WNS**, i.e. Vivado prunes the
+outer-displacement words, confirming they are dead logic and that Vec *width* is not the
+cost. What costs is making `words(3)` of the shifted view LIVE at all.
+
+Per-endpoint attribution (a second synth pass reporting the two families by name) shows the
+change is **not** a simple regression — it moves two near-tied families in opposite
+directions:
+
+| Endpoint | base | fix | delta |
+|----------|------|-----|-------|
+| `LsEuPlugin_logic_s1Index_reg/R` | -0.607 | **+0.001** | **+0.608 (now MEETS)** |
+| `RobPlugin_logic_faultDynMem_reg/RAMD` | -0.374 | **-1.052** | **-0.678** |
+
+So the fix *retires* the family that was the base's WNS — plausibly causally, since
+`immEa`/`immDstEa` feed `ldIdxEa`/`rmwIdxEa` and hence `s1Index` — and a previously-slack
+family becomes the new critical path. `faultDynMem` is the ROB fault-capture Mem, i.e. the
+**6-writer array of task #127**, already on record as the one remaining `Vec.fill(depth)(Reg)`
+shape that fits none of the three proven fold patterns. Its 0.678 ns move has no logical
+path to this change (`immEa`/`immDstEa` feed only `.disp` and the index descriptor — they do
+**not** feed `bad`; that was checked, not assumed), so it is most likely a
+resource-sharing/fanout shift rather than a lengthened cone.
+
+**Consequence for landing:** this campaign has already measured-and-reverted a *correct* fix
+for a 20 MHz cost once (`784b27b`), then recovered the whole regression by rematching the
+predicate off the raw opword (`a9e0e6d`). The same play is the right next step here, and
+this fix should **not** merge until it is either reformulated or task #127 is folded.
+Recorded as measured, not as a blocker to the correctness result: seed 21 is genuinely fixed.
+
+### CROSS-THREAD: the SoC boot blocker is a DIFFERENT bug — measured, not assumed
+
+The boot-blocker thread (Part 121, SoC `3cd977fb`) proposed that its spurious `vec=0x04`
+on `cmpi.l #$316D6567,%a0@(0xFEFFC)` (opword `0x0CB0`, ext `0x8170`), fuzz seed 57, and
+cluster E were plausibly one immediate-source decode family — which would have meant one
+fix closing all three. **Tested. They are not.**
+
+1. The boot blocker **reproduces in this repo as a unit test** —
+   `docs/superpowers/repros/cmpi_l_fullfmt_long_bd.s`, which installs a vector-4 handler so
+   an illegal trap reports as itself. It fails with sentinel `0xDEAD0004`.
+2. **The cluster-E fix does not fix it.** Sentinel unchanged with the fix applied.
+3. Isolation (`docs/superpowers/repros/limm_long_fullfmt_illegal_probe.s`), single-variable,
+   same opcode / same EA / same extension word, only the immediate size differing:
+
+   | Case | Result |
+   |------|--------|
+   | `ORI.W #imm,(bd32,An,D0.L)` full format | **PASSES** |
+   | `ORI.L #imm,(bd32,An,D0.L)` full format | **ILLEGAL** |
+
+   So it is not `CMPI`-specific and not index-suppression-specific — it is **any line-0
+   `.L` immediate with a full-format destination EA**.
+
+4. That discriminator names the gate exactly. `MicroOpAssembler.scala:1575`:
+
+   ```scala
+   val limmFullFmtDstBad = opIsLineImm && immIsLong && !isBitOp && !isToCcr &&
+                           limmDstIsFullEa && pkt.words(3)(8)
+   ```
+
+   `immIsLong` **is** the measured `.W`-passes/`.L`-traps discriminator. This is a blanket
+   ILLEGAL gate feeding the global `bad`, not — as `DecodeStage.scala:695` claims — a
+   "residual, much narrower edge case where extW3 itself is unavailable". Whatever made that
+   comment true has stopped being true, or was never true for the MEMSIMPLE (`I/IS=000`)
+   case. Note the gate's own doc comment (line 1559ff) says the .L form was gated
+   deliberately because predecode framed it BRIEF and mis-fetched the following instruction
+   — so the fix is not simply deleting the term; the framing has to be correct first.
+
+**Relationship between the two bugs: sequential, not shared.** `limmFullFmtDstBad` rejects
+the encoding before any address is computed. Cluster E's fix repairs the *address* for that
+same encoding family. So this fix is **necessary but not sufficient** for the boot blocker:
+relax the legality gate and the long-`bd` address bug fixed here is what would otherwise
+have been waiting behind it. Whoever takes the gate should re-run the two repros above.
+
+**Warning for that work:** `limmFullFmtDstBad` is a term *in* the global `bad` expression
+(`MicroOpAssembler.scala:1935`). This campaign has measured `bad` at **50 MHz** for an added
+term. Narrowing an existing term is not the same as adding one, but it must be re-gated.
+
 ### Same class, NOT fixed — carried forward
 
 Five more call sites still pass 3-entry `Vec`s and would lose a long `bd` the same way for a

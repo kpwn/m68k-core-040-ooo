@@ -18,7 +18,21 @@ import org.scalatest.funsuite.AnyFunSuite
   *
   * Two stores to the SAME destination EA shape, differing ONLY in source operand type. */
 class ClusterEAddrCaptureSpec extends AnyFunSuite {
-  test("capture: LS-EU s1Va for MOVE #imm vs MOVE Dn to an indexed dst (cluster E)", VerilatorTest) {
+  // The two stores are identified by their STORE DATA, not by PC: `s1Data` is the one
+  // field that distinguishes them unambiguously, and it does not move if the assembler's
+  // instruction lengths or the prologue ever change.
+  private val ImmStoreData = 0x00000080L   // move.w #0x80,<ea>   -- the failing form
+  private val RegStoreData = 0x00001234L   // move.w %d1,<ea>     -- the control
+  // A3 + 0x10036 = 0x1_00004026, truncated to 0x00004026, + (-1 * 4) = 0x00004022.
+  private val CorrectEa  = 0x00004022L
+  private val CorrectBd  = 0x00010036L
+  // What the DUT computed before the fix, measured off this exact tap: the long base
+  // displacement lost its LOW half-word (0x00010036 -> 0x00010000), sending the store
+  // 0x36 bytes low. Named here so a regression is recognised, not merely reported.
+  private val BuggyEa    = 0x00003fecL
+  private val BuggyBd    = 0x00010000L
+
+  test("whitebox: MOVE #imm and MOVE Dn compute the SAME s1Va for a long-bd indexed dst (cluster E)", VerilatorTest) {
     val src =
       """	move.l #0xffffffff,%d6
         |	move.l #0xffff3ff0,%a3
@@ -45,6 +59,8 @@ class ClusterEAddrCaptureSpec extends AnyFunSuite {
 
       var cyc = 0
       var lastKey = ""
+      // store data -> (s1Va, s1Disp) for the two stores under test.
+      val seen = scala.collection.mutable.LinkedHashMap[Long, (Long, Long)]()
       cd.onSamplings {
         cyc += 1
         if (dut.lsEu.logic.s1Valid.toBoolean) {
@@ -64,6 +80,10 @@ class ClusterEAddrCaptureSpec extends AnyFunSuite {
                     f"disp=0x${disp & 0xffffffffL}%08x(${disp}) index=0x$index%08x " +
                     f"=> s1Va=0x$va%08x  data=0x$data%08x imm=0x$imm%08x useImm=$uImm")
           }
+          // Record the FIRST S1 sample per store (the address is settled at S1;
+          // s1Base/s1Ctx are held stable while the FSM is busy, so later cycles repeat it).
+          if ((data == ImmStoreData || data == RegStoreData) && !seen.contains(data))
+            seen(data) = (va, disp & 0xffffffffL)
         }
       }
 
@@ -102,6 +122,23 @@ class ClusterEAddrCaptureSpec extends AnyFunSuite {
 
       cd.waitSampling(400)
       println(f"[clusterE] DONE cyc=$cyc")
+
+      def check(label: String, storeData: Long): Unit = {
+        val (va, disp) = seen.getOrElse(storeData,
+          fail(f"$label store (data=0x$storeData%08x) never reached LS-EU S1 -- the program " +
+               f"changed, or it no longer routes through the AGU. Re-read the capture log " +
+               f"above before touching these expectations."))
+        assert(disp == CorrectBd,
+          f"$label: base displacement decoded as 0x$disp%08x, expected 0x$CorrectBd%08x" +
+          (if (disp == BuggyBd) " -- the long bd lost its LOW half-word (fuzz cluster E)" else ""))
+        assert(va == CorrectEa,
+          f"$label: s1Va = 0x$va%08x, expected 0x$CorrectEa%08x" +
+          (if (va == BuggyEa) " -- this is cluster E's exact pre-fix address" else ""))
+      }
+      // The control first: if the REGISTER-source form ever regresses, the immediate-source
+      // assertion below would otherwise be misread as cluster E returning.
+      check("register-source", RegStoreData)
+      check("immediate-source", ImmStoreData)
     }
   }
 }
