@@ -9,7 +9,59 @@ every real RTL bug it exposes.
 | Round | Date | Divergences / 200 | Delta | Notes |
 |-------|------|-------------------|-------|-------|
 | 0 (baseline) | 2026-09-01 | **57** | — | `fuzz_logs/*.log`, 8 batches of 25 seeds |
-| 1 | 2026-09-03 | **not yet re-measured** | — | cluster A fix landed; measurement blocked on Vivado (see "Verification status") |
+| 1 | 2026-09-03 | **20** | **−37** | MEASURED, full 200-seed sweep, 180 PASS. `fuzz_logs_round1/*.log` on this branch |
+
+Round-1 measurement provenance: `LOGDIR=fuzz_logs_round1 tools/fuzz/sweep.sh 0 200 25 20`,
+8 batches of 25 seeds, one JVM per batch, run serially. 200 seeds run, 180 PASS,
+20 DIVERGED. Predicted 17; actual 20, and the 3-seed difference is fully explained below
+(it is unmasking, not regression).
+
+### Post-round-1 cluster distribution (measured)
+
+| # | Cluster | Baseline | Now | Change |
+|---|---------|----------|-----|--------|
+| A | `Scc <mem>` dropped from retire stream | 40 | **0** | **eliminated** |
+| B | mem-dest RMW + memory-indirect EA → spurious exception | 10 | **11** | +1 unmasked (seed 22) |
+| C | committed A7 transiently regresses after `movem` push/pop | 6 | **8** | +1 unmasked (seed 64), +1 newly exposed (seed 82) |
+| D | `Scc ([bd,An],Xn,od)` writes `Dn` | 1 | **1** | unchanged |
+| | **total** | **57** | **20** | **−37** |
+
+Surviving seeds: 3, 4, 8, 13, 18, 21, 22, 41, 54, 57, 60, 64, 74, 80, 82, 103, 109, 126,
+127, 139.
+
+**38 of the 40 cluster-A seeds now pass outright.** The other two were carrying a *second*
+bug that the index shift had been hiding, exactly as predicted — an index shift aborts the
+comparison at the first mismatch, so everything downstream was unmeasured:
+
+- **seed 22**: was `PC+2` (cluster A), now `idx=92 pc: dut=0x211cbad1 oracle=0x408001a8`
+  (wild PC, cluster B). Its minimized program always contained
+  `tas ([0x1f,%a2,%d1.l*2],0x4)` alongside the `sle (%a2)`.
+- **seed 64**: was `PC+2` (cluster A), now `a7: dut=0x000ffffc oracle=0x00100000`
+  (cluster C).
+
+**seed 82 — newly diverging, and NOT a regression from this fix.** It passed at baseline
+and now reports cluster C's exact signature (`idx 32` push clean, `idx 33` pop clean,
+`idx 34` A7 regresses to the pre-pop value on an unrelated instruction). The decisive
+evidence is its minimized body:
+
+```
+	movem.w %a2/%d2,-(%sp)
+	movem.w (%sp)+,%a2/%d2
+	lea (0xb0a3).l,%a5
+```
+
+**There is no `Scc` in it at all**, so the index-shift path this commit touches cannot
+reach it; and this commit's RTL delta is a single observation register with no functional
+feedback. The likely exposure mechanism is the project's documented sim gotcha that
+*uninitialised Regs randomise per-seed* — adding a register perturbs the sim's
+register-init stream, and cluster C is timing/state-sensitive.
+
+The real conclusion is about cluster C, not about the fix: **cluster C's exposed-seed set
+is not stable under benign perturbation, so 6 was an undercount and the true incidence is
+≥ 8.** A purely deterministic reconstruction bug (like cluster A) would not behave this
+way. That does not by itself prove cluster C is RTL rather than harness — a racy `ss.a7`
+*sample* is also timing-sensitive — but it raises its priority and means any future count
+for it should be treated as a lower bound.
 
 Baseline is deterministic: a 30-seed re-run at current HEAD reproduced the identical
 diverging seed set byte-for-byte.
@@ -292,7 +344,36 @@ EA. Expect the true incidence to be higher than 1/200 in real code.
 
 ---
 
-## Verification status (round 1) — READ THIS BEFORE TRUSTING ANY NUMBER
+## Verification status (round 1) — UPDATED after the measurement
+
+**DONE:**
+- **Directed before/after for cluster A**: seed 108 (`FUZZ_SEED_START=108 FUZZ_SEED_COUNT=1
+  FUZZ_BLOCKS=20`) **DIVERGED at baseline** (`fuzz_logs/fuzz_100_125.log`) and **PASSes**
+  on this commit (37.5s). This is a genuine fail-before/pass-after, on a deterministic
+  byte-reproducible repro, not a merely-passing test.
+- **Full 200-seed sweep**: 57 → **20**, recorded above.
+
+**STILL OUTSTANDING** (blocked again — the divider agent started its full-core OOC synth
+gate at ~17:33, so there are now 2 real `vivado -mode batch` builds and the
+"never a heavy JVM during Vivado" rule applies again):
+- `make fastTest`
+- `make test-fast`
+- `BsrFlushSkipSpec` + the four `flush_younger_*.s` corpus tests
+- the standing full-core OOC synth gate for the 1-bit `BrWbObs` field
+
+**Correct way to check whether the machine is clear** (a naive `pgrep -f vivado`
+self-matches your own `bash -c` wrapper, because the wrapper's command line contains the
+string, and will block forever):
+
+```bash
+ps -eo comm,args | awk '$1=="vivado" && /-mode batch/ && !/task_worker/' | wc -l   # 0 == clear
+```
+
+`comm` is the process's own binary name, so a shell wrapper can never satisfy `$1=="vivado"`.
+`jtag_repl.tcl` sessions (`-mode tcl`), `hw_server` and `cs_server` are **not** build gates —
+this project has an explicit documented correction on that point.
+
+## Original pre-measurement verification notes (kept for the record)
 
 The cluster-A fix is **written but NOT executed**. A Vivado build was holding the machine
 for the entire round (`pgrep -f vivado` → 15 processes, ~1GB RSS and climbing), and the
@@ -345,7 +426,7 @@ invisible. `WhiteboxCapture.onCommit`'s `emit` gate then *deletes* records:
 
 | ID | Blind spot | Status | Effect on count when closed |
 |----|-----------|--------|------------------------------|
-| BS-1 | **DIVREM (`Dr`) never compared at its own step.** `MicroOpAssembler.scala:2839` sets `divremUop.divIsRem := True`; `DivEuPlugin.scala:1503-1504` sets `divRem := compDivRem`, `keepCommit := False`. A long divide's remainder is only ever checked if a later instruction happens to read `Dr`. | **OPEN** | may increase |
+| BS-1 | **DIVREM (`Dr`) never compared at its own step.** `MicroOpAssembler.scala:2839` sets `divremUop.divIsRem := True`; `DivEuPlugin.scala:1503-1504` sets `divRem := compDivRem`, `keepCommit := False`. A long divide's remainder is only ever checked if a later instruction happens to read `Dr`. | **BEING CLOSED BY THE DIVIDER AGENT** — not mine, do not duplicate. As of 2026-09-03 their work is *uncommitted* in the shared tree (`git status`: modified `WhiteboxCapture.scala`, `LockStep.scala`, `CommitObservation.scala`, `ExecuteLockStepSpec.scala`, `DivEuPlugin.scala`, `IssueQueuePlugin.scala`), adding an `archReg2Id/archReg2Write/archReg2Valid` "second architectural destination" fold that folds the dropped `divRem` tail's value into the kept step — covering BOTH `Dr` and the 64-bit MUL `Dh`. | may increase |
 | BS-2 | Branch-EU `keepCommit` missing from `BrWbObs` → `Scc <mem>` deleted entirely (cluster A). | **CLOSED this round** (unverified) | −40 predicted |
 | BS-3 | **No final architectural register-file compare.** The end-of-program check is memory-only. Any wrong register that is never subsequently read, and never steers control flow, is invisible forever. | **OPEN** | may increase |
 | BS-4 | `divIsRem` is reused as a *generic* crack-drop marker far beyond divide — `LsEuPlugin.scala:2732` (`compStkPush ‖ compCcrRestore ‖ compRmwStore ‖ compEaAutoDrop ‖ compCrackDrop`) and throughout the microcode/CPLX cracks. Only `A7` and `CCR` writes of a dropped µop are folded into running state (`WhiteboxCapture.scala:88-100`); a dropped µop writing **`An` where n≠7** (e.g. a source-EA `(An)+`/`-(An)` auto-update) is neither folded nor compared. | **OPEN, unquantified** | unknown |
@@ -388,9 +469,18 @@ values seen late" — it collapses into one missing bundle field, already fixed.
 
 ## Round 2 plan
 
-0. Close **BS-3** (end-of-program register-file compare) FIRST — harness-only, no RTL
-   risk, and it converts BS-1/BS-4 from silent to visible. Expect the count to RISE.
-   Record the blind-spot ledger state next to any count so the number stays interpretable.
+0. **BS-3 is DEFERRED, deliberately — collision risk, not deprioritisation.** The obvious
+   implementation (fold all 16 arch int registers in `WhiteboxCapture.result`, compare
+   against `oracleSteps.last.d`/`.a` — the oracle already carries the full register vectors
+   per step, so no RTL change is needed) edits `WhiteboxCapture.scala` and
+   `FuzzLockStepSpec.scala`. The divider agent has **uncommitted** work in the shared tree
+   in exactly `WhiteboxCapture.scala` + `LockStep.scala` + `CommitObservation.scala` +
+   `ExecuteLockStepSpec.scala`. Landing BS-3 now would conflict with unversioned work and
+   risk destroying it. **Sequence: let them commit first, then rebase and do BS-3.**
+   Note their `archReg2` fold already covers the divRem-tail subset; BS-3 remains valuable
+   for the broader case (any register written by a dropped µop, or never read again).
+   Also flag: this branch edits `ExecuteLockStepSpec.scala` too, so expect a small merge
+   conflict there with the divider agent's branch — trivial, different regions.
 1. Execute the round-1 verification above; record the honest number in the table.
 2. Cluster C first (6 divergences, and it is the only one that could be a *serious*
    silent RTL bug): trace `rob.logic.exc.ss.a7` on seed 60 to settle harness-vs-RTL.
