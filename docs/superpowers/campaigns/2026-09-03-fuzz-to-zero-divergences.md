@@ -22,7 +22,7 @@ Round-1 measurement provenance: `LOGDIR=fuzz_logs_round1 tools/fuzz/sweep.sh 0 2
 |---|---------|----------|-----|--------|
 | A | `Scc <mem>` dropped from retire stream | 40 | **0** | **eliminated** |
 | B | mem-dest RMW + memory-indirect EA → spurious exception | 10 | **11** | +1 unmasked (seed 22) |
-| C | committed A7 transiently regresses after `movem` push/pop | 6 | **8** | +1 unmasked (seed 64), +1 newly exposed (seed 82) |
+| C | committed A7 transiently regresses after `movem` push/pop | 6 | **8** | +1 unmasked (seed 64), +1 newly exposed (seed 82) — **root-caused round 2: HARNESS** |
 | D | `Scc ([bd,An],Xn,od)` writes `Dn` | 1 | **1** | unchanged |
 | | **total** | **57** | **20** | **−37** |
 
@@ -98,9 +98,9 @@ instruction followed, because the DUT retire stream is short by exactly one reco
 | # | Cluster | Count | Class | Status |
 |---|---|-------|-------|--------|
 | A | `Scc <mem>` commit dropped from the lock-step retire stream | **40** | **HARNESS** | fix written, unverified |
-| B | memory-destination RMW with a memory-indirect / full-format EA takes a spurious exception | **10** | **RTL** | open |
-| C | committed A7 transiently regresses one index after a `movem` `-(%sp)`/`(%sp)+` pair | **6** | undetermined (harness-observation vs real A7-shadow lag) | open |
-| D | `Scc ([bd,An],Xn,od)` writes `Dn` instead of memory | **1** | **RTL** | open |
+| B | memory-destination RMW with a memory-indirect / full-format EA takes a spurious exception | **11** | **RTL** | root-caused round 2: missing `ucIsMemInd` classifier (same bug as D) |
+| C | committed A7 transiently regresses one index after a `movem` `-(%sp)`/`(%sp)+` pair | **8** | **HARNESS** (round 2: `a7Static` resync replays a >=2-commit-lagged shadow) | root-caused, fix pending one executed test |
+| D | `Scc ([bd,An],Xn,od)` writes `Dn` instead of memory | **1** | **RTL** | root-caused round 2: SAME bug as B |
 
 Totals: 57. RTL = 11, harness = 40, undetermined = 6, oracle-limitation = 0.
 
@@ -642,6 +642,108 @@ hypothesis. Verification plan, once a JVM is free: seed 80 (6-instruction body, 
 cleanest) and seed 3 (6-instruction body, cluster B) must fail before and pass after, then
 a full 200-seed re-sweep. Expect **20 → ~9** if the analysis is right (11 B/D seeds minus
 seed 57 which stays).
+
+---
+
+## Round 2 — cluster C ROOT-CAUSED: a harness artifact (high confidence, one test from certain)
+
+**Verdict: (a) harness reconstruction artifact**, not an RTL A7 rollback. The premise the
+harness's resync rests on is **factually false in this RTL, and the harness file says so
+itself two paragraphs later.**
+
+### The false premise
+
+`WhiteboxCapture.scala:98-103` asserts:
+
+> "The committed ss.a7 (a7Static) tracks ONLY exception/RTE/boot A7 changes … (An OoO write
+> leaves ss.a7 unchanged, so it never triggers a spurious resync.)"
+
+That is obsolete. I verified the current RTL directly (not from comments — this repo has a
+documented history of stale-comment-driven false positives):
+
+```scala
+// ExceptionUnit.scala:734 — UNCONDITIONAL, every cycle
+ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
+```
+```scala
+// SystemState.scala:70 — ss.a7 is just a mux of those continuously-written banks
+val a7 = Mux(s, supBank, usp)
+```
+```scala
+// RobPlugin.scala:2629 — plus one more cycle of delay into the observation
+obs(0).a7 := RegNext(exc.ss.a7)
+```
+
+`committedA7In` is the int-PRF readback at `committedPhysA7` (`FullCoreSynth.scala:541`,
+`FuzzDut.scala:283`), allocated `forceNoBypass`. So `ss.a7` mirrors **every** A7 write
+including MOVEM's — and lags by **≥2 commit cycles**. The lag is even documented inline at
+`ExceptionUnit.scala:727-733` ("SETTLE CAVEAT … the ACTIVE bank tracks A7 with ~1-2 cycle
+lag"), and `WhiteboxCapture.scala:123-126` — *in the same method as the false premise* —
+already acknowledges it and papers over it **for `msp`/`isp` only** (`:129-130`), leaving
+`a7Run` itself still driven by the stale path.
+
+### Why it produces exactly this signature
+
+`WhiteboxCapture.scala:110` force-resyncs `a7Run` on any **value edge** of the lagging
+sample, and does so **before** the OoO fold at `:116`. So a record that carries its own
+arch-15 writeback is immune (its fold overwrites the resync); only a record with **no** A7
+write exposes the stale value. Replaying seed 82 with a 2-step lag:
+
+| idx | insn | `a7Static` (lagged) | resync? | arch-15 fold | emitted a7 |
+|-----|------|--------------------|---------|--------------|------------|
+| 32 | movem push | 0x00100000 (stale) | no | 0x000ffffc | 0x000ffffc ✓ |
+| 33 | movem pop | 0x00100000 (stale) | no | 0x00100000 | 0x00100000 ✓ |
+| 34 | **lea** | **0x000ffffc** (push value, late) | **yes** | none | **0x000ffffc ✗** |
+| 35 | next | 0x00100000 (pop value, late) | yes | – | 0x00100000 ✓ |
+
+This reproduces the observed record exactly — including the one-step regression, the
+self-correction, and the requirement for **two adjacent A7-changing retirements followed by
+a non-A7 instruction**. That last condition is why it is rare (8/200) and why its seed set
+moves under benign perturbation: it depends on commit *spacing* relative to the settle
+window. My round-1 observation that C is timing-fragile is explained, and it points at the
+harness, not the RTL.
+
+### Negative result on the rename-exposure lead
+
+**Cluster C is NOT the tasks #176/#194/#200 phys-reg-reuse hazard class.** MOVEM does not
+use the `committedPhysA7` bypass at all — its A7 update is an ordinary rename-allocated INT
+`ADD` emitted as the macro's last µop (`MicroOpAssembler.scala:140-181`,
+`DecodeStage.scala:2702`). Freelist hygiene is sound: commit pushes the *old* phys while
+`commReg(15)` takes `intNew`, and `commReg` is never rolled back on flush. The one
+documented exposure window is exception-path-only and already mitigated by the
+`sysOwnA7Valid` latch (`ExceptionUnit.scala:625-643`); the reproducer contains no
+exception. The lead was worth checking and it does not hold.
+
+### The discriminating test (zero instrumentation, no RTL change)
+
+Append one A7-reading instruction to the reproducer:
+
+```
+	movem.w %a2/%d2,-(%sp)
+	movem.w (%sp)+,%a2/%d2
+	lea (0xb0a3).l,%a5
+	move.l %sp,%d0
+```
+
+`D0` is compared through the `archReg` path, sourced from the **EU writeback observation**
+(`WhiteboxCapture.onWb`), which is completely independent of `ss.a7`. If `D0 == 0x00100000`
+while idx 34's `a7` field still reads `0x000ffffc`, the architectural A7 is provably intact
+and only the harness regressed → confirmed (a). If `D0` is also wrong → genuine RTL → (b).
+
+**Not fixed yet** — standing rule. The resync is load-bearing for the exception path, so
+the fix must make it fire on an *event* (an `a7StaticValid`/`ExcRec` trigger) rather than on
+a value edge, not simply be deleted.
+
+### Spillover: an existing bug doc may rest on the same false premise
+
+`docs/BUG_fmovemx_dataload_rob_commit_corruption.md:182-190` argues that a wrong `a7` on an
+instruction that does not touch A7 proves genuinely wrong execution, on the grounds that the
+harness's `a7` is "the live architectural A7 … a COMPLETELY SEPARATE piece of state". Separate
+storage is true; *reliable per-step observation* is not — it is the same 2-commit-lagged
+shadow replayed through the same resync. If that reproducer moves A7 twice in close
+succession, its "untouched a7 is also wrong" evidence is explained by this artifact and
+should be re-derived before being used to conclude wrong execution. **Flagged, not
+adjudicated** — I have not re-run that case.
 
 ## Round 2 plan
 
