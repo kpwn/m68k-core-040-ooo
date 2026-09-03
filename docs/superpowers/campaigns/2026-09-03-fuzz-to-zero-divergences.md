@@ -905,3 +905,69 @@ The transferable lesson: **in this decode stage, hanging a new term off the regi
 offloaded `spec` costs real FMax, while matching the same condition from the raw opword is
 free.** That is why `s0IsLea`/`s0IsPea`/`s0IsJmp`/`s0IsJsr` are written the way they are,
 and it is the pattern to follow when the remaining families (SHIFT-mem, Scc) are added.
+
+---
+
+## Round 4 — cluster D "fault loudly" stopgap: BUILT, MEASURED, REVERTED
+
+**Negative result. The stopgap works functionally and costs too much to keep.**
+
+### What was built
+
+Divert `Scc <memory-indirect EA>` to the illegal path (vector 4) so it traps instead of
+silently writing `D<op[2:0]>`. Functionally it did exactly what was intended — seed 80's
+signature changed from
+
+```
+idx=79 reg D5: dut=0x00000000 oracle=0x0000007e      <- SILENT register corruption
+```
+to
+```
+idx=79 pc: dut=0x76ab2465 ... a7=0x000ffff8          <- loud vector-4 trap, format-$0 frame
+```
+
+and all nine working `Scc` forms kept passing (`scc_abs_long`, `scc_basic`,
+`scc_d16_an_disp`, `scc_mem_an_indirect`, `scc_mem_byte`, `scc_mem_forms`,
+`scc_mem_incdec`, `scc_mem_indexed`, `scc_predec`) plus `tas_memind`, and
+`make test-fast` stayed 337/337.
+
+### Why it was reverted — two measurements
+
+| Formulation | WNS | FMax | vs 178.35 |
+|---|---|---|---|
+| term added to the global `bad` expression | −2.812 | **128.01** | **−50.34** |
+| confined to a local override inside the `Scc` block | −1.520 | **153.37** | **−25.0** |
+
+The first formulation put `srcEa.klass === MEMINDIRECT` into `bad` — a very wide AND/OR
+tree feeding the illegal path — and cost **50 MHz**. Confining the same test to a small
+local override at the tail of the `when(isSccOp)` block recovered half of it, but **25 MHz
+(−14%) remained**.
+
+**The trade was rejected**: the stopgap does **not** fix the bug. Both the old and new
+behaviours are architecturally wrong (a real 68040 executes `Scc` with a memory-indirect
+EA); it only converts a silent wrong answer into a loud one. Paying 14% FMax for a change
+with no correctness benefit, when the real fix is a µcode entry that would not touch these
+paths at all, is a bad deal — and hunting a third formulation would be exactly the
+design-contortion this campaign has been told to avoid. Reverted; `MicroOpAssembler.scala`
+is back to unmodified.
+
+### The transferable finding (this is the part worth keeping)
+
+Round 3 established *match the raw opword, not `spec.op`*. Round 4 generalises it:
+
+> **In this decode stage, WHERE a term is added matters more than what it tests.**
+> The identical predicate cost 50 MHz in the global `bad` expression, 25 MHz in a local
+> block override, and (as the TAS case showed) 0 MHz when derived from the raw opword and
+> consumed by a narrow gate.
+
+`bad` is now known to be timing-critical and should be treated as closed to new terms.
+
+### Recommendation
+
+Go **straight to the real fix** — a dedicated µcode entry for `Scc` memory-indirect that
+evaluates the condition in the branch EU and stores the byte through the engine's
+`host-store` row, in the style of `MI_RMW_ENTRY` but with a condition source instead of an
+ALU host-op. That routes the instruction correctly (removing the silent corruption as a
+side effect) and, because it adds no term to `bad` or to any late `spec`-derived
+expression, should be timing-neutral. **Until it lands, seed 80's silent D-register
+corruption remains open and known** — recorded here rather than papered over.

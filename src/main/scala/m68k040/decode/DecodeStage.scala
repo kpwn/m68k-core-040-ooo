@@ -89,6 +89,27 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
 
   val logic = during build new Area {
     // ═══ SINGLE SOURCE OF TRUTH: memory-indirect routing family predicates ═══════
+    //
+    // ┌─ RULE FOR ANYONE ADDING A FAMILY HERE ─────────────────────────────────────┐
+    // │ Match the RAW OPWORD, never `spec.op`, unless you have measured otherwise. │
+    // │                                                                            │
+    // │ `spec` is the registered/OFFLOADED decoded spec and arrives LATE; the      │
+    // │ opword is available earlier. This is not a style preference — it was       │
+    // │ measured on the full-core OOC gate (5 ns primary), 2026-09-03:             │
+    // │                                                                            │
+    // │    baseline (no TAS)                        WNS -0.706   175.25 MHz        │
+    // │    TAS via `spec.op === DecOp.TAS`          WNS -1.447   155.11 MHz        │
+    // │    TAS via `opw(15 downto 6) === ...`       WNS -0.607   178.35 MHz        │
+    // │                                                                            │
+    // │ One term off `spec` cost 20.14 MHz (-11.5%). The identical condition off   │
+    // │ the opword cost nothing. That is why s0IsLea/s0IsPea/s0IsJmp/s0IsJsr       │
+    // │ (~line 760) are written against the opword — now you know the price.       │
+    // │                                                                            │
+    // │ The EA-class check at each call site (=== MEMINDIRECT) already excludes    │
+    // │ register-direct and other non-memory modes, so an opword match that is      │
+    // │ broader than the real instruction (e.g. TAS bits 15:6 also matching TAS Dn │
+    // │ and the illegal 0x4AFC) cannot misfire.                                    │
+    // └────────────────────────────────────────────────────────────────────────────┘
     // Routing a MEMINDIRECT EA into the µcode engine requires the instruction family to
     // be named in THREE parallel gates that must agree:
     //   slot0IsMemInd       (slot-0 entry)     ~line 745
