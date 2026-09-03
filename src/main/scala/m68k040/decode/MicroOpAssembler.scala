@@ -639,6 +639,31 @@ object MicroOpAssembler {
     }
     out
   }
+  // ── Immediate-shifted EA view (fuzz cluster E, seed 21) ─────────────────────────
+  // For a line-0 immediate (`ADDI/ORI/.../CMPI #imm,<ea>`) and for `MOVE #imm,<mem>`,
+  // the immediate's own extension word(s) PRECEDE the EA's, so the EA must be decoded
+  // from a view shifted by the immediate word count (1 for .B/.W, 2 for .L). Both call
+  // sites used to hand-build a THREE-entry Vec — `Vec(words(0), words(2), words(3))` —
+  // which is one word too short: `EaDecoder`'s full-format path reads `words(2)##words(3)`
+  // for a LONG base displacement, and `wAt` returns a hard 0 for any index past the Vec
+  // length. So a long `bd` silently lost its LOW half-word (measured: `0x00010036` decoded
+  // as `0x00010000`, sending `move.w #0x80,(0x10036,%a3,%d6.l*4)` to 0x00003fec instead of
+  // 0x00004022 — silently, no fault).
+  //
+  // SIX entries covers everything `EaDecoder` can read off a full-format extension word:
+  // index 1 = the ext word, 2..3 = a LONG `bd`, up to 5 = a LONG outer displacement
+  // (`fOdWordAt` spans 2..5). Deliberately built as an explicit 2-way `Mux` per element
+  // rather than through `shiftedWordsFor`'s dynamic index: the shift here is one of exactly
+  // two constants, so this keeps the identical 2:1-mux-per-word cost as the 3-entry Vecs it
+  // replaces (three more words, same structure) instead of introducing a 10:1 dynamic
+  // select on the decode critical path. Index 0 is preserved verbatim (`EaDecoder.decode`
+  // never reads it — see `shiftedWordsFor` — but keeping it makes this a strict widening).
+  private def immShiftedWords(words: Vec[Bits], immIsLong: Bool): Vec[Bits] =
+    Vec.tabulate(6) { i =>
+      if (i == 0) words(0)
+      else Mux(immIsLong, words(i + 2), words(i + 1))
+    }
+
   // Shifted view for the dst-EA decode: index 0 unused (EaDecoder.decode never reads
   // it), indices 1.. = words(1+shift, 2+shift, ...).
   private def shiftedWordsFor(words: Vec[Bits], shift: UInt): Vec[Bits] =
@@ -758,10 +783,11 @@ object MicroOpAssembler {
     // `srcEa` (words(1)-based) still drives the operand CLASS (mode/reg are offset-
     // independent) and every non-immediate path.
     val immIsLong = spec.size === Size.LONG
+    // .L: imm = words(1..2) -> shift 2; .B/.W: imm = words(1) -> shift 1. See
+    // `immShiftedWords` for why this is 6 entries and not 3 (a LONG base displacement
+    // needs words(2) AND words(3) of the shifted view).
     val immEa = EaDecoder.decode(
-      op(5 downto 0), spec.size,
-      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),    // .L: imm = words(1..2)
-                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))   // .B/.W: imm = words(1)
+      op(5 downto 0), spec.size, immShiftedWords(pkt.words, immIsLong))
     // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
     // (its ext follows the imm), srcEa otherwise. (klass/base/baseValid/pcRel are
     // offset-independent and identical; only `disp` differs.)
@@ -1312,10 +1338,11 @@ object MicroOpAssembler {
     // opword mode/reg bits, independent of word content) so they are byte-identical
     // either way; only `disp`/index need the shift.
     val immDstEaField = op(8 downto 6) ## op(11 downto 9)
+    // Same shifted view as `immEa` above, and the same 3-vs-6-entry correction: this is
+    // the call site fuzz seed 21 caught (`move.w #0x80,(0x10036,%a3,%d6.l*4)` storing to
+    // 0x00003fec because the long `bd`'s low half-word decoded as 0).
     val immDstEa = EaDecoder.decode(
-      immDstEaField, spec.size,
-      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),
-                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))
+      immDstEaField, spec.size, immShiftedWords(pkt.words, immIsLong))
     val stDstEa = Mux(immToMemCase, immDstEa, dstEa)
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
