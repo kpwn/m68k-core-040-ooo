@@ -135,11 +135,51 @@ path to this change (`immEa`/`immDstEa` feed only `.disp` and the index descript
 **not** feed `bad`; that was checked, not assumed), so it is most likely a
 resource-sharing/fanout shift rather than a lengthened cone.
 
-**Consequence for landing:** this campaign has already measured-and-reverted a *correct* fix
-for a 20 MHz cost once (`784b27b`), then recovered the whole regression by rematching the
-predicate off the raw opword (`a9e0e6d`). The same play is the right next step here, and
-this fix should **not** merge until it is either reformulated or task #127 is folded.
+#### CAUSATION, not exposure — the decisive number is baseline `faultDynMem` = −0.374
+
+It was proposed that the fix might merely be the *messenger*: that retiring `s1Index` simply
+promoted a pre-existing near-critical family (task #127), in which case the fix would be
+mergeable and #127 would be named the new binding constraint. **The measurement refutes
+that.** At baseline `faultDynMem` sat at −0.374, i.e. **0.233 ns clear** of the −0.607
+critical path — comfortably back, not near-tied. Had the change only retired `s1Index`, WNS
+would have become **−0.374 = 188.6 MHz, a +10.3 MHz WIN**. It is 165.2 instead, so the
+0.678 ns `faultDynMem` movement both erased that win and produced the loss. The change
+causes it; it does not merely reveal it.
+
+#### …but the causation has NO logical path, which changes the remedy
+
+The raw-opword precedent (`784b27b` → `a9e0e6d`) does **not** transfer here: those were new
+*predicate terms* in a hot tree. This is a data-path `Vec` widened from 3 to 4 entries so a
+long `bd` keeps its low half-word — there is no cheaper *logic*, and hunting one would be
+exactly the contortion this campaign warns against.
+
+What the evidence actually points at: `immEa`/`immDstEa` feed only `.disp` and the index
+descriptor — never `bad` (checked, not assumed) — and the degraded path's source is the
+D-cache FSM, so the cost is **not** a lengthened cone. OOC `synth_design` does no placement,
+so it is not congestion either. That leaves **synthesis restructuring** (resource sharing /
+fanout redistribution). A cost not attached to the logic's *depth* may simply not survive a
+different *encoding* of the identical view — and re-encoding changes no semantics, so it is
+not concealment.
+
+First candidate, staged in `9963866` and **not yet re-gated**: the two call sites were
+emitting two bit-identical mux trees from the same `pkt.words`/`immIsLong`; they now share
+one instance. Strictly less logic, semantically a no-op.
+
+**Untested upside worth measuring at the same time:** the fix permanently retires the family
+that was the *baseline's* binding constraint (`s1Index`, +0.608). So if task #127 is ever
+folded, the fix netlist's ceiling is set by whatever family is third — plausibly well above
+178. That makes #127 worth materially more than the 0.233 ns of headroom it appeared to be
+worth. The third family has **not** been measured; stated as a hypothesis, not a result.
+
+**Landing position:** do **not** merge as-is. Do **not** weaken the fix. Re-gate the hoist;
+if it does not recover, hold the fix behind #127 rather than reverting the correctness.
 Recorded as measured, not as a blocker to the correctness result: seed 21 is genuinely fixed.
+
+**Constraint-staleness check (`1cc57891`):** not applicable. That commit is in the **SoC**
+repo and touches `synth/vivado.tcl`, the *implementation* flow; this gate reads only the
+netlist plus a one-line `synth/clk.xdc` (`create_clock -period 5.000`). Corroborated
+empirically — the baseline reproduced **178.35 MHz exactly**, matching this document's
+pre-`1cc57891` figure for the same netlist. The meaning of these OOC numbers has not shifted.
 
 ### CROSS-THREAD: the SoC boot blocker is a DIFFERENT bug — measured, not assumed
 
@@ -1355,6 +1395,35 @@ treat "one fix closes both" as **likely, not proven**, until the fix is actually
 and both are re-run.
 
 ---
+
+## METHOD (2): a discriminator localises; it does not identify
+
+The general form of all five of this campaign's retractions, and the companion rule to the
+probe below. A **discriminator** is a single-variable experiment that splits pass from fail
+("immediate source fails, register source passes"). It tells you *where to look*. It does
+**not** tell you *what is wrong*, and it does not license merging two sites that share it.
+
+Every retraction here is the same error at a different altitude:
+
+| # | What was over-read |
+|---|--------------------|
+| 1-2 | An instruction's *appearance* matched a known bug's shape → assumed the same cause |
+| 3 | A symptom ("lands at the wrong address") → assumed the mechanism ("does not truncate") |
+| 4 | A probe passed → assumed refutation, having silently removed the load-bearing 2^32 wrap |
+| 5 | A discriminator held at two sites → assumed one shared cause |
+
+Retraction 5 is the subtle one, and worth stating separately because the first four are all
+"did not measure" while this one is **"measured the right thing and over-read it."** The
+immediate-vs-register discriminator was real, correctly measured, and reproducible at *both*
+seed 21 and seed 57. It was still not a shared cause: seed 21 is a LONG base displacement
+behind an immediate; seed 57 is brief-format, where the short `Vec` was always sufficient.
+The same discriminator, two unrelated defects.
+
+The check that catches it: **before claiming two sites share a cause, name the mechanism and
+verify it is present at both.** A discriminator that both sites satisfy is necessary, never
+sufficient. Corollary, exercised twice in round 7 — after a fix lands, *re-run the other
+site*. Seed 57 and the SoC boot blocker were both predicted to fall out of cluster E's fix;
+both were measured afterwards, and neither did.
 
 ## METHOD: the "make the DUT publish" probe
 
