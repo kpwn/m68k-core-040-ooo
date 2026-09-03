@@ -7878,6 +7878,70 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // These cases assert BOTH legality and FRAMING: the lock-step compares the retired
   // PC of every instruction, so the `moveq` AFTER the compare only matches Musashi if
   // the 12-byte (6-word) instruction length was framed exactly right.
+  // ── Part 123 discriminators: which (An)+ postincrement is dropped? ─────────────
+  test("lock-step p123d: CLR.L (%a0)+ postincrement (NON-A7 address register)", VerilatorTest) {
+    runLockStep("p123d-clr-l-a0-postinc",
+      "move.l #0x3000,%a0 ; clr.l (%a0)+ ; clr.l (%a0)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 5)
+  }
+  test("lock-step p123d: CLR.L (%sp)+ postincrement (A7, single, no loop)", VerilatorTest) {
+    runLockStep("p123d-clr-l-a7-postinc",
+      "move.l #0x3000,%a0 ; move.l %a0,%sp ; clr.l (%sp)+ ; clr.l (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step p123d: TST.L (%sp)+ postincrement (A7, non-writing single-EA)", VerilatorTest) {
+    runLockStep("p123d-tst-l-a7-postinc",
+      "move.l #0x3000,%a0 ; move.l %a0,%sp ; tst.l (%sp)+ ; tst.l (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step p123d: NOT.L (%sp)+ postincrement (A7, RMW single-EA)", VerilatorTest) {
+    runLockStep("p123d-not-l-a7-postinc",
+      "move.l #0x3000,%a0 ; move.l %a0,%sp ; not.l (%sp)+ ; not.l (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step p123d: MOVE.L #0,(%sp)+ postincrement (A7, via the MOVE path)", VerilatorTest) {
+    runLockStep("p123d-move-l-a7-postinc",
+      "move.l #0x3000,%a0 ; move.l %a0,%sp ; move.l #0,(%sp)+ ; move.l #0,(%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step p123d: CLR.W (%sp)+ and CLR.B (%sp)+ (A7 byte delta is 2)", VerilatorTest) {
+    runLockStep("p123d-clr-wb-a7-postinc",
+      "move.l #0x3000,%a0 ; move.l %a0,%sp ; clr.w (%sp)+ ; clr.b (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  // ── Part 123: the ROM's 0x4084BECE stack-clear loop ────────────────────────────
+  // The Quadra 700 ROM's RAM-bank sizing routine ends with
+  //     4084bece:  clrl %sp@+          ; 429F
+  //     4084bed0:  movew %sp,%d0       ; 300F   <-- MOVE.W A7,D0 : MUST set N/Z
+  //     4084bed2:  bnes 0x4084bece     ; 66FA
+  // i.e. zero-fill until SP reaches a 64 KiB boundary.  The loop's ONLY exit is the
+  // Z flag from `MOVE.W A7,D0`.  MOVE (unlike MOVEA) sets NZVC even when the SOURCE is
+  // an address register, and A7 is additionally BANKED (ISP/MSP/USP).  Part 123 measured
+  // cpu040 spinning in this exact loop on real silicon, 72 of 72 pc_live samples.
+  test("lock-step p123: MOVE.W An,Dn sets N/Z (address-register SOURCE)", VerilatorTest) {
+    runLockStep("p123-movew-an-dn-flags",
+      "move.l #0x00010000,%a5 ; move.w %a5,%d0 ; " +   // low word 0 -> Z must be SET
+      "move.l #0x0001FFFC,%a4 ; move.w %a4,%d1 ; " +   // low word != 0 -> Z must be CLEAR
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  test("lock-step p123: MOVE.W A7,Dn sets N/Z (BANKED stack pointer source)", VerilatorTest) {
+    runLockStep("p123-movew-a7-dn-flags",
+      "move.l #0x00020000,%a0 ; move.l %a0,%sp ; move.w %sp,%d0 ; " +  // Z must be SET
+      "move.l #0x0002FFFC,%a0 ; move.l %a0,%sp ; move.w %sp,%d1 ; " +  // Z must be CLEAR
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 8)
+  }
+  test("lock-step p123: the ROM 0x4084BECE clr.l (sp)+ / move.w sp,d0 / bne loop", VerilatorTest) {
+    // Same shape as the ROM, shrunk: start SP 0x40 below a 0x1000 boundary so the loop
+    // runs 16 iterations and MUST exit.  If MOVE.W A7,D0 does not set Z the DUT spins and
+    // the retired-PC comparison diverges immediately.
+    runLockStep("p123-rom-stackclear-loop",
+      "move.l #0x2FC0,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+      ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 55)
+  }
   test("lock-step fullext: CMPI.L #imm,(bd.L,An) IS=1 -- the ROM 0x0CB0/0x8170 shape", VerilatorTest) {
     // a0=0x3000, bd=0x10000 (forces BD-SIZE=long), index suppressed -> EA = 0x13000.
     runLockStep("fx-limm-cmpi-l-bdl-is",
