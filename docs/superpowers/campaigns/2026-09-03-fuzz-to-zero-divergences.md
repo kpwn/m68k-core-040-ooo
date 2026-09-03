@@ -1165,3 +1165,73 @@ works" but does not isolate the difference to the source operand alone as tightl
 shared-class conclusion rests mainly on seed 21's clean result plus the matching signature;
 treat "one fix closes both" as **likely, not proven**, until the fix is actually attempted
 and both are re-run.
+
+---
+
+## METHOD: the "make the DUT publish" probe
+
+Named here because it is the technique that finally located cluster E after three rounds
+of reasoning-from-shape had mislocated it (twice by me, once in review), and because this
+campaign has established that **unobservable intermediates are its dominant failure mode**:
+
+- lock-step never compared `Dr` (a real wrong-remainder bug survived every suite);
+- the harness silently *deleted* every `Scc <mem>` retire record (40 of 57 divergences);
+- the committed A7 was a ≥2-commit-lagged shadow replayed as if live (8 more);
+- a CDC `set_bus_skew` check was matching 0 of 30 instances.
+
+Four separate cases of "the thing was never actually looked at". The general antidote:
+
+> **Force the DUT to write its own intermediate value into architectural state the
+> comparator already checks, then vary exactly one input.**
+
+For an address bug: compute the same EA with `lea` and store the result somewhere compared.
+The oracle computes the architecturally correct address, so the comparator does the
+diffing for you — no new instrumentation, no waveform, no RTL change.
+
+```
+	lea    (0x10036,%a3,%d6.l*4),%a0
+	move.l %a0,(0x4000).l                <- the DUT publishes its OWN computed EA
+	move.w #0x80,(0x10036,%a3,%d6.l*4)   <- the failing store, identical EA
+```
+
+`mem[0x4000..0x4003]` matching while the store missed is what proved the EA *arithmetic*
+was fine and moved the search to the immediate-source path. Then one further single-variable
+step (register source vs immediate source, same instruction, same destination shape) closed
+it. Generalises to any wrong-value divergence whose intermediate is otherwise invisible.
+
+### Its limit, learned the hard way in this same round
+
+The probe only sees what the comparator covers — here, the sandbox `0x4000..0x403f`. I then
+tried to locate the DUT's *actual* store address by choosing `A3` so that a candidate
+mis-computation would land inside the sandbox, and recorded two "refutations":
+
+| Candidate | Predicted address | Probe result |
+|-----------|-------------------|--------------|
+| `bd` truncated to 16 bits | `0x4020` | passed → "refuted" |
+| `bd` ignored entirely | `0x4020` | passed → "refuted" |
+
+**Both refutations are INVALID and are retracted here.** To bring each candidate inside the
+sandbox I set `A3` to a small value (`0x3fee`, `0x4024`) — which **removes the 2^32
+overflow** (`A3 + bd` wrapping) that is the defining feature of the failing case. Those runs
+exercised a *different, probably-working* configuration; their passing says nothing about
+the bug. Same failure mode as the three earlier retractions, one level up: I varied a term
+that I had already established was load-bearing.
+
+With the overflow present, every candidate is unreachable by a sandbox-only compare:
+
+```
+A3=0xffff3ff0, bd=0x10036, index=-4
+  correct EA         = 0x00004022   (in sandbox)
+  bd ignored         = 0xffff3fec   (outside — invisible)
+  bd truncated to 16 = 0xffff4022   (outside — invisible)
+```
+
+**Therefore: locating cluster E's actual store address requires a direct capture of the
+store address (D-cache AXI write channel or the LS-EU `s1Va`), not another program-level
+probe.** That is the next step; further candidate-guessing is explicitly the wrong move.
+
+**Established about cluster E (unchanged, all measured):** the EA arithmetic is correct via
+`lea`; a register-source store to the same destination shape is correct; only
+`MOVE #imm,<full-format indexed destination>` is wrong; the same discriminator holds for
+seed 57's `ori.w` (line-0) form. **Not established:** where the store actually goes, and
+therefore the mechanism.
