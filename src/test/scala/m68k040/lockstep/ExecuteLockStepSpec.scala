@@ -7854,6 +7854,94 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".stop: bra .stop", nInstr = 7)   // d2 = 3 + 5 = 8
   }
 
+  // ── LINE-0 IMMEDIATE with a FULL-FORMAT (no-mem-indirect) DESTINATION EA ─────
+  // The real-hardware boot blocker (BUG_calibration_word_misplaced_0d00.md Part 121/122):
+  // the Quadra 700 ROM's RAM-sizing routine, relocated into low RAM, executes
+  //   0x000098E2: 0CB0 316D 6567 8170 000F EFFC
+  //             = cmpi.l #$316D6567,%a0@(0xFEFFC)
+  // i.e. a line-0 .L immediate whose DESTINATION is a 68020+ FULL-format EA
+  // (ext word 0x8170: bit8=1, BS=0, IS=1 index suppressed, BD-SIZE=11 long,
+  // I/IS=000 no memory indirect => MEMSIMPLE, single AGU pass). cpu040 raised a
+  // spurious vector-4 Illegal Instruction on it while MAME/Musashi retire the
+  // identical encoding without trapping. Two independent decode-side defects:
+  //   (1) MicroOpAssembler's `limmFullFmtDstBad` gate illegalised EVERY .L-immediate
+  //       with a full-format dst EA, including the single-pass I/IS=000 form the fast
+  //       path can execute (the gate predated PredecodeWord's extW3 lookahead, which
+  //       now frames these correctly -- see PredecodeWord.classify's extW3 comment);
+  //   (2) `immEa`/`immDstEa` re-decoded the shifted EA from a 3-entry word Vec, so a
+  //       LONG base displacement (bd-size=11, which needs words(2)##words(3) of the
+  //       shifted vector) silently read its low half as 0 -> wrong address.
+  // These cases assert BOTH legality and FRAMING: the lock-step compares the retired
+  // PC of every instruction, so the `moveq` AFTER the compare only matches Musashi if
+  // the 12-byte (6-word) instruction length was framed exactly right.
+  test("lock-step fullext: CMPI.L #imm,(bd.L,An) IS=1 -- the ROM 0x0CB0/0x8170 shape", VerilatorTest) {
+    // a0=0x3000, bd=0x10000 (forces BD-SIZE=long), index suppressed -> EA = 0x13000.
+    runLockStep("fx-limm-cmpi-l-bdl-is",
+      "move.l #0x316D6567,%d0 ; move.l #0x13000,%a1 ; move.l %d0,(%a1) ; " +
+      "move.l #0x3000,%a0 ; moveq #2,%d2 ; " +
+      "cmpi.l #0x316D6567,(0x10000,%a0,%za0.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 8)
+  }
+  test("lock-step fullext: CMPI.L #imm,(bd.W,An,Xn*4) full-format, live index", VerilatorTest) {
+    // word bd 0x100 forces full-format; a0=0x3000, d1=2 (*4=8) -> EA = 0x3108.
+    runLockStep("fx-limm-cmpi-l-bdw-idx",
+      "move.l #0x0BADF00D,%d0 ; move.l #0x3000,%a0 ; move.l %d0,0x108(%a0) ; " +
+      "move.l #2,%d1 ; cmpi.l #0x0BADF00D,(0x100,%a0,%d1.l*4) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 7)
+  }
+  test("lock-step fullext: ADDI.L #imm,(bd.L,An) IS=1 -- RMW writeback", VerilatorTest) {
+    // Same EA shape as the ROM case, but a WRITING line-0 immediate (load-op-store).
+    runLockStep("fx-limm-addi-l-bdl-is",
+      "move.l #0x00000005,%d0 ; move.l #0x13000,%a1 ; move.l %d0,(%a1) ; " +
+      "move.l #0x3000,%a0 ; " +
+      "addi.l #0x00000007,(0x10000,%a0,%za0.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 7, checkMem = Seq(0x13000L))
+  }
+  test("lock-step fullext: CMPI.W #imm,(bd.L,An) IS=1 -- .W immediate, long bd", VerilatorTest) {
+    // .W immediate => the dst EA ext word sits at op+2 (not op+3); bd long still needs
+    // two shifted words. Exercises the OTHER arm of the immEa word-vector select.
+    runLockStep("fx-limm-cmpi-w-bdl-is",
+      "move.l #0x00001234,%d0 ; move.l #0x13000,%a1 ; move.l %d0,(%a1) ; " +
+      "move.l #0x3000,%a0 ; " +
+      "cmpi.w #0x1234,(0x10002,%a0,%za0.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 6)
+  }
+  // The SAME root cause with a BRIEF (not full-format) indexed destination: what decided
+  // the instruction's legality was the IMMEDIATE's own high word, read as if it were the
+  // EA extension word. Any line-0 .W/.L immediate whose bits [8] and [2:0] happen to look
+  // like a memory-indirect full-format extension word (bit8=1, I/IS=/=000) was classified
+  // MEMINDIRECT and illegalised. 0x0105 is the minimal such value: bit8=1, I/IS=0b101.
+  // The .B forms could never trigger it (their immediate word is 0x00xx, bit8=0). This is
+  // a pure VALUE dependency -- the identical instruction with a different immediate ran.
+  test("lock-step fullext: ORI.W #0x0105,(d8,An,Xn) -- immediate must not decide legality", VerilatorTest) {
+    runLockStep("fx-limm-ori-w-brief-immbits",
+      "move.l #0x00002200,%d0 ; move.l #0x3000,%a0 ; move.l %d0,4(%a0) ; " +
+      "move.l #0,%d1 ; ori.w #0x0105,(4,%a0,%d1.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 7, checkMem = Seq(0x3004L))
+  }
+  test("lock-step fullext: CMPI.L #imm,(d8,An,Xn) brief, ROM immediate 0x316D6567", VerilatorTest) {
+    runLockStep("fx-limm-cmpi-l-brief-immbits",
+      "move.l #0x316D6567,%d0 ; move.l #0x3000,%a0 ; move.l %d0,4(%a0) ; " +
+      "move.l #0,%d1 ; cmpi.l #0x316D6567,(4,%a0,%d1.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 7)
+  }
+  // MOVE #imm,<full-format indexed mem> -- the line-3 sibling shape. Its destination EA
+  // already goes through the `dstShift`/`immDstEa` re-decode, so this is a guard that the
+  // Part 122 word-vector widening did not disturb it, and a direct check of the third
+  // reported case in the same family (fuzz cluster E).
+  test("lock-step fullext: MOVE.W #imm,(bd.L,An) IS=1 full-format destination", VerilatorTest) {
+    runLockStep("fx-limm-move-w-bdl-is",
+      "move.l #0x3000,%a0 ; move.w #0x0105,(0x10000,%a0,%za0.w) ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x13000L), checkSpan = 2)
+  }
+
   // ── FULL-format MEMORY-INDIRECT (68020+, pre/post-index) lock-step ───────────
   // Pre `([bd,An,Xn],od)`: pointer = mem[base+bd+index], EA = pointer + od.
   // Post `([bd,An],Xn,od)`: pointer = mem[base+bd],      EA = pointer + index + od.

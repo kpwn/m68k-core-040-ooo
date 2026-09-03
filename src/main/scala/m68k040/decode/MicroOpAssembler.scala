@@ -639,6 +639,23 @@ object MicroOpAssembler {
     }
     out
   }
+  // Shifted words view for an IMMEDIATE-SOURCE re-decode (the line-0 `immEa` and the
+  // MOVE-#imm `immDstEa`): the EA's own extension words start AFTER the immediate, i.e.
+  // at op+2 for a .B/.W immediate and op+3 for a .L one.
+  //
+  // FOUR entries, not three. `EaDecoder` reads a full-format 32-bit base displacement as
+  // `wAt(words,2) ## wAt(words,3)`, and `wAt` returns a hardwired 0 for an index past the
+  // Vec's end -- so a 3-entry view silently dropped the LOW half-word of every long `bd`
+  // (0x00010036 -> 0x00010000), a wrong address with no trap. A full-format OUTER
+  // displacement would need a 5th/6th entry, but an EA that has one is EaClass.MEMINDIRECT,
+  // which this fast path never executes (`lineImmBad` rejects it / the µcode engine owns
+  // it). Same helper shape as the sibling fix on `fuzz/zero-divergence-campaign`.
+  private def immShiftedWords(words: Vec[Bits], immIsLong: Bool): Vec[Bits] =
+    Vec.tabulate(4) { i =>
+      if (i == 0) words(0)
+      else Mux(immIsLong, words(i + 2), words(i + 1))
+    }
+
   // Shifted view for the dst-EA decode: index 0 unused (EaDecoder.decode never reads
   // it), indices 1.. = words(1+shift, 2+shift, ...).
   private def shiftedWordsFor(words: Vec[Bits], shift: UInt): Vec[Bits] =
@@ -753,20 +770,77 @@ object MicroOpAssembler {
     // Line-0 immediate mem-dest RMW (ADDI/.../EORI/CMPI #imm,<ea>): the EA's OWN
     // extension words follow the immediate (1 word for .B/.W, 2 for .L), NOT at
     // words(1). Re-decode the EA from a SHIFTED words vector so its disp/abs come from
-    // the right offset (same shape as the DIV.L/MUL.L re-decode). `immEa` is used ONLY
-    // for the RMW load/store ADDRESS when the op is a line-0 immediate; the plain
-    // `srcEa` (words(1)-based) still drives the operand CLASS (mode/reg are offset-
-    // independent) and every non-immediate path.
+    // the right offset (same shape as the DIV.L/MUL.L re-decode). `immEa` supplies the RMW
+    // load/store ADDRESS + index descriptor when the op is a line-0 immediate; the plain
+    // `srcEa` (words(1)-based) still drives every non-immediate path. NOTE (Part 122): the
+    // operand CLASS is NOT offset-independent for the indexed modes -- see the
+    // `srcEaIsMemSimpleEff` block below, which is what makes this correct.
     val immIsLong = spec.size === Size.LONG
+    // BUG_calibration_word_misplaced_0d00.md Part 122: this view is FOUR words wide, not
+    // three -- see `immShiftedWords` for why (a long base displacement lost its low
+    // half-word). Real-hardware repro: the Quadra 700 ROM's RAM-sizing routine at
+    // 0x000098E2, `0CB0 316D 6567 8170 000F EFFC` = `cmpi.l #imm,%a0@(0xFEFFC)`, bd=long.
     val immEa = EaDecoder.decode(
-      op(5 downto 0), spec.size,
-      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),    // .L: imm = words(1..2)
-                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))   // .B/.W: imm = words(1)
+      op(5 downto 0), spec.size, immShiftedWords(pkt.words, immIsLong))
     // The EA descriptor for the RMW load/store ADDRESS: immEa for a line-0 immediate
-    // (its ext follows the imm), srcEa otherwise. (klass/base/baseValid/pcRel are
-    // offset-independent and identical; only `disp` differs.)
+    // (its ext follows the imm), srcEa otherwise.
     val opIsLineImm = spec.srcB.kind === OperandKind.IMMEXT
     val rmwEaDisp = Mux(opIsLineImm, immEa.disp, srcEa.disp)
+    // ── LEGALITY must not depend on the IMMEDIATE's VALUE (Part 122 root cause) ──
+    // The comment that used to sit above `opIsLineImm` claimed "klass/base/baseValid/pcRel
+    // are offset-independent and identical; only `disp` differs". That is FALSE for the two
+    // extension-word-CONTENT-dependent EA modes, 6 `(bd,An,Xn)` and 7-reg3 `(bd,PC,Xn)`:
+    // `EaDecoder` reads `words(1)(8)` to pick brief-vs-FULL format, and out of that same
+    // word it reads BS (base suppress) and I/IS (the memory-indirect selector that decides
+    // MEMSIMPLE vs MEMINDIRECT). For a line-0 immediate, `words(1)` is NOT the EA's
+    // extension word -- it is the IMMEDIATE's first word. So `srcEa.klass` was being
+    // decided from the immediate's own bits: the instruction's LEGALITY was a function of
+    // its OPERAND VALUE.
+    //
+    // Measured on real hardware (Part 121/122): the Quadra 700 ROM's RAM-sizing routine,
+    // relocated into low RAM, executes
+    //   0x000098E2: 0CB0 316D 6567 8170 000F EFFC = cmpi.l #$316D6567,%a0@(0xFEFFC)
+    // The immediate's high word is 0x316D. Bit 8 of 0x316D is 1 -> "full format"; bits
+    // [2:0] are 0b101 -> I/IS =/= 000 -> EaClass.MEMINDIRECT -> `lineImmBad` -> a spurious
+    // vector-4 Illegal Instruction. The REAL extension word (0x8170, at op+3) has I/IS=000,
+    // an ordinary single-pass MEMSIMPLE this fast path executes fine; MAME retires the
+    // identical encoding 1985 times in 20 emulated seconds. That trap was the machine's
+    // boot blocker (-> ROM MicroBug monitor -> failed `$0DB0` magic test -> ROM restart ->
+    // vector table rebuilt on an odd stack -> odd VBR -> unrecoverable bus-error storm).
+    // It is NOT specific to CMPI or to a .L immediate: any line-0 immediate (.W or .L; a
+    // .B immediate word is 0x00xx so bit 8 is always clear) with an indexed destination and
+    // an immediate whose bits [8] and [2:0] happen to look memory-indirect was rejected.
+    // `move.l #imm,%a0@(0x17EFFC)` at 0x98C4/0x98D2 -- same EA, same 0x8170 word, same
+    // cache line -- retires because a MOVE's destination goes through `offloadBody`'s
+    // `dstShift`, which already accounts for the source immediate. Only the line-0
+    // (EA-is-destination) family read the wrong word.
+    //
+    // The correction is deliberately NOT `Mux(opIsLineImm, immEa.klass, srcEa.klass)`.
+    // `srcIsMem` feeds `srcEaOk`/`lineImmBad`/`bitOpMemBad`, i.e. the global `bad` tree --
+    // this campaign has measured the same predicate at 50 MHz in `bad`, 25 MHz in a local
+    // block override, and 0 MHz when matched off the RAW OPWORD into a narrow gate. So the
+    // fixup is exactly that: a 2:1 select between two REGISTERED packet words, three bit
+    // tests, and an opword compare. No new EaDecoder in `bad`'s cone, and no new term in
+    // `bad` -- the existing `lineImmBad`/`bitOpMemBad`/`srcEaOk` terms simply get a correct
+    // input. (`base` = 8+reg and `autoMode`/`autoDelta` (modes 3/4, no extension word) are
+    // genuinely content-independent and are left alone, as is `pcRel`.)
+    //
+    // Scoped to EA mode 6 ONLY. The other content-dependent mode, 7-reg3 `(bd,PC,Xn)`, is
+    // not reachable here for a line-0 immediate: `PredecodeWord`'s `memDestExt` rejects
+    // every mode-7 register except 0/1, so such an instruction never arrives `pkt.simple`
+    // and is already illegal via the `!pkt.simple` arm of `bad` (which also disables
+    // cracking). Leaving it out keeps this fixup exactly as wide as the shapes it is
+    // proven correct for -- in particular it must not force `baseValid` true for a
+    // PC-relative EA, which has no An base at all.
+    val l0EaIsIdx  = op(5 downto 3) === B"3'b110"
+    val l0ExtW     = Mux(immIsLong, pkt.words(3), pkt.words(2))   // the EA's REAL ext word
+    val l0IsMemInd = l0ExtW(8) && (l0ExtW(2 downto 0) =/= B"3'b000")
+    val l0Fixup    = opIsLineImm && l0EaIsIdx
+    // For mode 6 `EaDecoder` yields MEMSIMPLE or MEMINDIRECT and nothing else, so
+    // "is MEMSIMPLE" is exactly "is not memory-indirect".
+    val srcEaIsMemSimpleEff = Mux(l0Fixup, !l0IsMemInd, srcEa.klass === EaClass.MEMSIMPLE)
+    // Full-format BS=1 suppresses the An base; brief format always has one.
+    val srcEaBaseValidEff   = Mux(l0Fixup, !(l0ExtW(8) && l0ExtW(7)), srcEa.baseValid)
     // Task #199 (btst_pcrel_src static-bit-number sub-case): the (d16,PC)/(d8,PC,Xn)
     // PC-relative reference point is the ADDRESS OF THE EA's OWN EXTENSION WORD, not
     // unconditionally op+2 — for an `opIsLineImm` shape (static BTST/BCHG/BCLR/BSET
@@ -778,7 +852,7 @@ object MicroOpAssembler {
 
     // ── Operand classification ───────────────────────────────────────────────
     val srcIsReg = (srcEa.klass === EaClass.DATAREG) || (srcEa.klass === EaClass.ADDRREG)
-    val srcIsMem = (srcEa.klass === EaClass.MEMSIMPLE)
+    val srcIsMem = srcEaIsMemSimpleEff
     val srcEaOk  = srcIsReg || (srcEa.klass === EaClass.IMM) || srcIsMem
     val dstEaOk  = (dstEa.klass === EaClass.DATAREG) || (dstEa.klass === EaClass.ADDRREG)
     val usesSrcEa = (spec.srcA.kind === OperandKind.EASRC) || (spec.srcB.kind === OperandKind.EASRC)
@@ -1218,7 +1292,7 @@ object MicroOpAssembler {
     // else the op size. (BITOP left spec.size at the WORD default; resolve to BYTE.)
     ldUop.size          := Mux(isBitOp, Size.BYTE, spec.size)
     ldUop.memOp         := MemOp.LOAD
-    ldUop.srcAReg       := srcEa.base; ldUop.srcAValid := srcEa.baseValid
+    ldUop.srcAReg       := srcEa.base; ldUop.srcAValid := srcEaBaseValidEff
     ldUop.srcBReg       := 0;          ldUop.srcBValid := False
     // Indexed EA: the index register rides srcC; the AGU sizes+scales it. For a line-0
     // immediate mem-dest the index descriptor lives on immEa (its ext = the brief word,
@@ -1312,10 +1386,10 @@ object MicroOpAssembler {
     // opword mode/reg bits, independent of word content) so they are byte-identical
     // either way; only `disp`/index need the shift.
     val immDstEaField = op(8 downto 6) ## op(11 downto 9)
+    // FOUR shifted words, not three -- identical rationale to `immEa` above (Part 122's
+    // long-base-displacement truncation); this is the MOVE #imm,<mem> sibling.
     val immDstEa = EaDecoder.decode(
-      immDstEaField, spec.size,
-      Mux(immIsLong, Vec(pkt.words(0), pkt.words(3), pkt.words(4)),
-                     Vec(pkt.words(0), pkt.words(2), pkt.words(3))))
+      immDstEaField, spec.size, immShiftedWords(pkt.words, immIsLong))
     val stDstEa = Mux(immToMemCase, immDstEa, dstEa)
 
     // ── stUop = the STORE (used only when crackStore) ──────────────────────────
@@ -1389,7 +1463,7 @@ object MicroOpAssembler {
     rmwStUop.cluster       := Cluster.LS
     rmwStUop.size          := Mux(isBitOp, Size.BYTE, spec.size)   // bit-op store is byte
     rmwStUop.memOp         := MemOp.STORE
-    rmwStUop.srcAReg       := srcEa.base; rmwStUop.srcAValid := srcEa.baseValid
+    rmwStUop.srcAReg       := srcEa.base; rmwStUop.srcAValid := srcEaBaseValidEff
     rmwStUop.srcBReg       := U(T1, 5 bits); rmwStUop.srcBValid := True       // store data = T1
     // Indexed RMW: load + store share ONE EA; the index reg rides srcC on BOTH so they
     // compute the SAME indexed address (mirrors how eaAuto is on both).
@@ -1513,32 +1587,48 @@ object MicroOpAssembler {
     // OR a MEMSIMPLE EA (the RMW crack); An / #imm / MEMCOMPLEX stay illegal. The to-CCR
     // form is the one exception.
     val lineImmBad = isLineImm && !isBitOp && (srcEa.klass =/= EaClass.DATAREG) &&
-                     (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr && !isToSr
-    // ── .L-immediate + FULL-FORMAT dst EA: gated ILLEGAL (silent-corruption hole) ──
-    // A line-0 immediate op with size .L AND a FULL-FORMAT indexed dst EA (mode 6 or
-    // 7-3, ext bit8=1) places the EA's first extension word at op+3 (after the 2-word
-    // .L immediate). The per-word PREDECODE window only reaches op+1/op+2, so it frames
-    // the instruction as BRIEF (too short) -> nextPc is short by the bd/od words and the
-    // FOLLOWING instruction mis-fetches (silent corruption). The .B/.W forms are FINE
-    // (their EA ext sits at op+2 = visible to predecode). Since predecode fundamentally
-    // cannot see op+3 for a .L immediate, the safe + honest resolution is an EXPLICIT
-    // illegal-instruction trap (vector 4) for this rare mode — NOT silent mis-execution.
-    // This covers BOTH classifications: the no-memory-indirect full-format (MEMSIMPLE-
-    // with-full-fields, which lineImmBad does NOT catch) AND the memory-indirect form.
-    // The ext word at op+3 (the .L imm consumes words(1)##words(2)) is pkt.words(3).
-    val limmDstMode       = op(5 downto 3)
-    val limmDstReg        = op(2 downto 0)
-    val limmDstIsFullEa   = (limmDstMode === B"3'b110") ||
-                            ((limmDstMode === B"3'b111") && (limmDstReg === B"3'b011"))
-    val limmFullFmtDstBad = opIsLineImm && immIsLong && !isBitOp && !isToCcr &&
-                            limmDstIsFullEa && pkt.words(3)(8)
+                     !srcEaIsMemSimpleEff && !isToCcr && !isToSr
+    // ── .L-immediate + FULL-FORMAT dst EA: the `limmFullFmtDstBad` gate, REMOVED ──
+    // Historical: a line-0 .L-immediate op with a FULL-FORMAT indexed dst EA (mode 6 or
+    // 7-3, ext bit8=1) places the EA's first extension word at op+3 (after the 2-word .L
+    // immediate). When this gate was written, PredecodeWord.classify's window only reached
+    // op+1/op+2, so it framed the instruction as BRIEF (too short) -> nextPc short by the
+    // bd/od words -> the FOLLOWING instruction mis-fetched. A forced vector-4 was the
+    // honest resolution THEN, because predecode could not see op+3.
+    //
+    // That premise is gone. Task #153 threads a 3rd lookahead word (extW3 = op+3) into
+    // classify(), and the line-0 mem-dest arm passes it to `memDestExt`, which frames the
+    // full-format length EXACTLY (`fullExtLen`). When op+3 genuinely is not resident
+    // (I-cache-line boundary), memDestExt's fallback frames brief AND raises
+    // `ambiguousLine`, which Aligner.align turns into a STALL for slot 0 (re-resolved by
+    // FetchAlignPlugin's `p0LiveReg` live re-classify over the 10-word head window) and a
+    // pack-refusal for slot 1 (`slot1Ok` requires `!p1.ambiguousLine`). So a line-0
+    // immediate can no longer reach decode with a guessed length: framing is exact by
+    // construction, and the gate now only manufactures spurious vector-4 traps.
+    //
+    // Measured consequence of leaving it in (BUG_calibration_word_misplaced_0d00.md
+    // Part 121/122): the Quadra 700 ROM's RAM-sizing routine, relocated to low RAM, runs
+    //   0x000098E2: 0CB0 316D 6567 8170 000F EFFC = cmpi.l #$316D6567,%a0@(0xFEFFC)
+    // (full-format, IS=1, BD-SIZE=long, I/IS=000 -> single-pass MEMSIMPLE). Real silicon
+    // and MAME retire it (MAME: 1985 times in 20 emulated seconds); cpu040 raised vec=0x04
+    // on its first execution, which cascaded into the ROM MicroBug monitor, the `$0DB0`
+    // magic-test failure, a ROM restart, a vector table rebuilt on an odd stack, and an
+    // odd VBR the machine could not recover from. This was the boot blocker.
+    //
+    // Nothing here weakens the illegal classification for the shapes the fast path really
+    // cannot execute: a full-format MEMORY-INDIRECT dst (I/IS =/= 000) decodes to
+    // EaClass.MEMINDIRECT, which `lineImmBad` (just above) still rejects whenever
+    // DecodeStage has not routed it into the µcode engine; and a mode-7/reg-3 (PC-relative)
+    // dst is not alterable, so `memDestExt` never frames it simple at all -> `!pkt.simple`.
+    // Removing this term also removes a term from the global `bad` expression, which is a
+    // strictly FMax-positive direction for that (deliberately closed) predicate.
     // Bit op (BTST/BCHG/BCLR/BSET, static or dynamic): the EA (op[5:0]) is the dest
     // (tested + written, except BTST). In scope: DATA-register (LONG, mod-32) OR a
     // MEMSIMPLE EA (BYTE, mod-8; BTST load-only, others mem-RMW crack). An / #imm /
     // MEMCOMPLEX (incl. predec/postinc/indexed) stay illegal -> defer. (Note: a static
     // bit-op has srcB=IMMEXT, so `isLineImm` is also true for it — `lineImmBad` excludes
     // bit-ops via `!isBitOp` so this gate is the single bit-op EA check, static+dynamic.)
-    val bitOpMemBad = isBitOp && (srcEa.klass =/= EaClass.DATAREG) && (srcEa.klass =/= EaClass.MEMSIMPLE)
+    val bitOpMemBad = isBitOp && (srcEa.klass =/= EaClass.DATAREG) && !srcEaIsMemSimpleEff
     // PC-relative EA used as a DESTINATION (op[5:0] = the written EA, i.e. spec.dst.kind
     // == EASRC): ISA-illegal (PC-space is not alterable). The mem-dest gates above only
     // reject `=/= MEMSIMPLE`; a pcRel MEMSIMPLE (d16,PC)/(d8,PC,Xn) would otherwise slip
@@ -1890,7 +1980,7 @@ object MicroOpAssembler {
               !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
-              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || limmFullFmtDstBad || addqMemBad || sccMemBad ||
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad || fpGenBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
