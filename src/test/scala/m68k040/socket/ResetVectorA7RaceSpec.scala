@@ -49,6 +49,38 @@ class ResetVectorA7RaceSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](dsrc, ren, sink, cdrv, rf, drv)) }
   }
 
+  /** Fix-verification DUT (Part 100/101 follow-up): the SAME real `RegFilePluginInt` +
+    * `RenameStage` + scaffolding as `Dut` above, but driving the SSP write through a REAL
+    * `ResetVectorFsm` (`FsmA7DriverPlugin`) instead of a raw manual poke -- so these tests
+    * exercise the ACTUAL fixed production code path, not a re-implementation of its gate. */
+  class DutFsm extends Component {
+    val db   = new Database
+    val host = db on (new PluginHost)
+    val dsrc = new DecodeUopSourcePlugin
+    val ren  = new RenameStage
+    val sink = new RenameUopSinkPlugin
+    val cdrv = new RenameCommitDriverPlugin
+    val rf   = new RegFilePluginInt
+    val fdrv = new FsmA7DriverPlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](dsrc, ren, sink, cdrv, rf, fdrv)) }
+  }
+
+  private def idleFsm(dut: DutFsm): Unit = {
+    dut.dsrc.logic.src.valid #= false
+    dut.sink.logic.out.ready #= true
+    dut.cdrv.logic.flushIn #= false
+    dut.cdrv.logic.cmd.foreach(_.valid #= false)
+    dut.fdrv.logic.arReady #= false
+    dut.fdrv.logic.rValid  #= false
+    dut.fdrv.logic.rData   #= 0
+    dut.fdrv.logic.rResp   #= 0
+  }
+
+  /** A 16-byte AXI line in the FSM's own convention (matches `ResetVectorSpec.line`/
+    * `ResetVectorIntegrationSpec.line`): byte i at bits [8i +: 8]. */
+  private def fsmLine(bytes: Seq[Int]): BigInt =
+    bytes.zipWithIndex.foldLeft(BigInt(0)) { case (a, (b, i)) => a | (BigInt(b & 0xff) << (8 * i)) }
+
   private def idle(dut: Dut): Unit = {
     dut.dsrc.logic.src.valid #= false
     dut.sink.logic.out.ready #= true
@@ -209,10 +241,22 @@ class ResetVectorA7RaceSpec extends AnyFunSuite {
     }
   }
 
-  test("end-to-end: a reset-vector-style SSP write racing both windows, addressed the " +
-       "SAME way FullCoreSynth's real a7Wr/a7Rd are (via committedPhysA7, not a fixed " +
-       "constant), leaves A7 reading exactly 0x00000000 -- matching the real-hardware " +
-       "20-for-20 anomaly", VerilatorTest) {
+  // NOTE (Part 100/101 follow-up, fix landed): this test's driver is a RAW manual poke of
+  // A7RaceDriverPlugin.wr -- it does NOT go through ResetVectorFsm, so it does NOT exercise
+  // the Part 101 fix (which lives entirely inside ResetVectorFsm's own SWEEP_WAIT gate, not
+  // in RegFilePlugin). It is kept, UNCHANGED, as a regression guard documenting that
+  // RegFilePlugin's zero-sweep still silently drops an early write that bypasses the FSM's
+  // gate -- deliberately, per the Part 100/101 fix-shape decision (option 1: gate the FSM,
+  // not the shared regfile every other write port also depends on). The REAL, FIXED,
+  // end-to-end production path -- driven through an actual `ResetVectorFsm` gated on the
+  // real `RegFilePlugin.initDone` -- is the new test below this one, which now passes with
+  // A7 correctly holding the SSP value instead of 0x00000000.
+  test("end-to-end (PRE-FIX MECHANISM, regression guard): a reset-vector-style SSP write " +
+       "racing both windows via a RAW manual poke that bypasses ResetVectorFsm's gate, " +
+       "addressed the SAME way FullCoreSynth's real a7Wr/a7Rd are (via committedPhysA7, " +
+       "not a fixed constant), leaves A7 reading exactly 0x00000000 -- matching the real-" +
+       "hardware 20-for-20 anomaly's underlying mechanism (still real; NOT what the fix " +
+       "touches -- see the FIXED end-to-end test below)", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       idle(dut) // useFixedAddr/rdUseFixedAddr both False: address tracks committedPhysA7 live
@@ -237,6 +281,78 @@ class ResetVectorA7RaceSpec extends AnyFunSuite {
       assert(a7 == 0,
         f"A7 readback should be exactly 0x00000000 (Mechanism A dropped the SSP write) " +
         f"matching the real-hardware 20-for-20 anomaly, but got 0x$a7%08X")
+    }
+  }
+
+  test("Part 100/101 FIX VERIFIED, end-to-end: driven through a REAL ResetVectorFsm " +
+       "(SWEEP_WAIT gate) wired to a REAL RegFilePlugin.initDone -- an early AXI response " +
+       "no longer loses the SSP write; A7 correctly holds the reset vector's SSP value, " +
+       "NOT 0x00000000, once both the FSM and the zero-sweep have settled", VerilatorTest) {
+    M68kSim().compile(new DutFsm).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      idleFsm(dut)
+      cd.waitSampling(2)
+
+      assert(!dut.fdrv.logic.regInitDone.toBoolean,
+        "test-setup invariant violated: the zero-sweep must still be running at this point")
+
+      // Present the reset-vector AXI response EARLY -- deep inside the 50-cycle sweep
+      // window, the same "plausible fast AXI round trip" premise Part 98/100's own tests
+      // probe (real AXI latency being an unverified premise either way -- this exercises
+      // the race window itself, not a specific measured hardware latency).
+      dut.fdrv.logic.arReady #= true
+      cd.waitSamplingWhere(dut.fdrv.logic.arValid.toBoolean)
+      cd.waitSampling()
+      dut.fdrv.logic.arReady #= false
+
+      val bytes = Seq(0x00, 0x04, 0x20, 0x00,  0x00, 0x00, 0x40, 0x00) ++ Seq.fill(8)(0xEE)
+      dut.fdrv.logic.rValid #= true
+      dut.fdrv.logic.rData  #= fsmLine(bytes)
+      dut.fdrv.logic.rResp  #= 0
+      cd.waitSamplingWhere(dut.fdrv.logic.rReady.toBoolean)
+      cd.waitSampling()
+      dut.fdrv.logic.rValid #= false
+
+      assert(!dut.fdrv.logic.regInitDone.toBoolean,
+        "test-setup invariant violated: the AXI response landed AFTER the sweep finished " +
+        "-- the race window this test targets was never actually open")
+
+      // Track, cycle-by-cycle, when the sweep completes, when the SSP write fires, and
+      // when the redirect fires -- the DECISIVE property is that the write cannot fire
+      // before the sweep completes (that is the whole fix), and D14's write-then-redirect
+      // ordering must still hold once it does.
+      var doneCycle = -1; var writeCycle = -1; var redirCycle = -1; var writeVal = BigInt(0)
+      var n = 0
+      while ((doneCycle < 0 || writeCycle < 0 || redirCycle < 0) && n < 120) {
+        if (doneCycle < 0 && dut.fdrv.logic.regInitDone.toBoolean) doneCycle = n
+        if (writeCycle < 0 && dut.fdrv.logic.sspWriteValid.toBoolean) {
+          writeCycle = n; writeVal = dut.fdrv.logic.sspDataOut.toBigInt
+        }
+        if (redirCycle < 0 && dut.fdrv.logic.redirectValid.toBoolean) redirCycle = n
+        cd.waitSampling(); n += 1
+      }
+      assert(doneCycle >= 0, "the zero-sweep never completed within 120 cycles")
+      assert(writeCycle >= 0, "the SSP write never fired -- the FSM never left SWEEP_WAIT")
+      assert(redirCycle >= 0, "the redirect never fired")
+      assert(writeCycle >= doneCycle,
+        s"FIX VIOLATED: the SSP write fired at cycle $writeCycle, BEFORE the sweep " +
+        s"completed at cycle $doneCycle -- ResetVectorFsm issued its write while the " +
+        s"zero-sweep could still silently drop it")
+      assert(redirCycle == writeCycle + 1,
+        s"D14 ordering broken by the fix: redirect at $redirCycle, SSP write at " +
+        s"$writeCycle -- want exactly +1")
+      assert(writeVal == sspVal, f"SSP write carried 0x$writeVal%08X, wanted 0x$sspVal%08X")
+
+      // Let the write's own 1-cycle latency land, then read A7 back through the SAME
+      // committedPhysA7-addressed read path FullCoreSynth's real a7Rd uses.
+      cd.waitSampling(5)
+      assert(dut.fdrv.logic.committedPhysA7Out.toBigInt == 15,
+        "sanity: once both sweeps are done, A7 should be back to identity")
+      val a7 = dut.fdrv.logic.rdData.toBigInt
+      assert(a7 == sspVal,
+        f"FIX VERIFICATION FAILED: A7 should hold the reset vector's SSP value " +
+        f"(0x$sspVal%08X) now that the write is correctly held until after the sweep, " +
+        f"but got 0x$a7%08X")
     }
   }
 }

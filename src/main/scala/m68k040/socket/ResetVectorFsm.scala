@@ -48,7 +48,30 @@ import spinal.lib.fsm._
   * exactly the value that just failed to arrive and the vector table itself is unreadable,
   * so a vector-2 entry would write a frame through a garbage stack pointer and immediately
   * fault again; (3) it matches this project's established policy for un-actionable bus
-  * errors with no architectural recipient (`DcachePlugin.scala:1680-1683`). */
+  * errors with no architectural recipient (`DcachePlugin.scala:1680-1683`).
+  *
+  * ==SWEEP_WAIT: the `io.regInitDone` gate (docs/BUG_calibration_word_misplaced_0d00.md
+  * Part 100/101)==
+  * `RegFilePlugin`'s int register file runs a 50-cycle post-reset zero-sweep
+  * (`RegFilePlugin.scala`'s `initCounter`/`initDone`) that unconditionally blocks every
+  * external write issued before `initDone` -- INCLUDING this FSM's own SSP write, which
+  * silently vanishes if `APPLY0` fires while the sweep is still running. Part 100
+  * sim-proved this end to end (real hardware: A7/MSP/ISP reads 0x00000000 after reset,
+  * 20-for-20). Fixed here, not in `RegFilePlugin`, per Part 100/101's own recommendation
+  * (option 1): a new `SWEEP_WAIT` state sits between the AXI response landing and
+  * `APPLY0`, and simply never lets `APPLY0` (hence `io.sspWriteValid`) fire until
+  * `io.regInitDone` is observed True. This means the write is never ISSUED early rather
+  * than issued-and-dropped -- no new state needs to survive across the sweep, no replay
+  * logic, and `RegFilePlugin`'s shared init-sweep code (which every OTHER write port on
+  * every regfile instance also depends on) is untouched. D14's "SSP write in cycle N,
+  * redirect in cycle N+1" ordering is preserved unchanged, just both cycles are now
+  * pushed out to wherever `regInitDone` allows; it also closes Part 100's Mechanism B
+  * window for free, since by the time `initDone` (cycle 50) can be true, the RAT's own
+  * identity walk (cycle 19) is long finished. In the ordinary case where the real AXI
+  * round trip takes longer than the sweep (Part 98's "unverified premise" that a fast
+  * AXI response could plausibly land inside the window), `regInitDone` is already True
+  * when `SWEEP_WAIT` is entered and the FSM falls straight through to `APPLY0` the same
+  * cycle -- zero-cost when the race was never live. */
 class ResetVectorFsm(dataWidth: Int = 128) extends Component {
   require(dataWidth >= 64, "the reset vector line must carry at least 8 bytes")
 
@@ -60,6 +83,11 @@ class ResetVectorFsm(dataWidth: Int = 128) extends Component {
     val rData   = in  Bits (dataWidth bits)
     val rResp   = in  Bits (2 bits)
     val rReady  = out Bool ()
+    // Gate input (Part 100/101 fix): true once RegFilePlugin's post-reset zero-sweep has
+    // finished. Held low, this FSM parks in SWEEP_WAIT after the AXI response lands and
+    // never issues the SSP write -- see the class header for why this is the chosen fix
+    // shape (gate the FSM, not the regfile).
+    val regInitDone   = in  Bool ()
     val sspWriteValid = out Bool ()
     val sspData       = out UInt (32 bits)
     val redirectValid = out Bool ()
@@ -80,11 +108,12 @@ class ResetVectorFsm(dataWidth: Int = 128) extends Component {
   io.haltPulse     := False
 
   val fsm = new StateMachine {
-    val REQ    = new State with EntryPoint
-    val WAIT   = new State
-    val APPLY0 = new State
-    val APPLY1 = new State
-    val DONE   = new State
+    val REQ        = new State with EntryPoint
+    val WAIT       = new State
+    val SWEEP_WAIT = new State
+    val APPLY0     = new State
+    val APPLY1     = new State
+    val DONE       = new State
 
     REQ.whenIsActive {
       io.arValid := True
@@ -99,13 +128,20 @@ class ResetVectorFsm(dataWidth: Int = 128) extends Component {
           // definition (DcacheByteLane.extract), never by hand-slicing.
           sspReg := DcacheByteLane.extract(io.rData.resize(128 bits), U(0, 4 bits), Size.LONG).asUInt
           pcReg  := DcacheByteLane.extract(io.rData.resize(128 bits), U(4, 4 bits), Size.LONG).asUInt
-          goto(APPLY0)
+          goto(SWEEP_WAIT)
         } otherwise {
           // D15. No frame, no redirect, no SSP write -- the core stops.
           io.haltPulse := True
           goto(DONE)
         }
       }
+    }
+
+    // Part 100/101 fix: park here (SSP write NOT yet issued) until RegFilePlugin's
+    // zero-sweep is done. sspReg/pcReg are already latched, so nothing is lost while
+    // parked -- APPLY0 only fires once the write is guaranteed to land.
+    SWEEP_WAIT.whenIsActive {
+      when(io.regInitDone) { goto(APPLY0) }
     }
 
     APPLY0.whenIsActive { io.sspWriteValid := True; goto(APPLY1) }   // cycle N

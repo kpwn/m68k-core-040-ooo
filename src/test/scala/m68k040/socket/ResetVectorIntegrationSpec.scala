@@ -54,6 +54,12 @@ class ResetVectorIntegrationSpec extends AnyFunSuite {
       val rResp   = in(Bits(2 bits));   fsm.io.rResp   := rResp
       val rReady  = out(Bool());        rReady  := fsm.io.rReady
 
+      // Part 100/101 fix: RegFilePlugin.initDone gate. This DUT has no RegFilePlugin/PRF
+      // at all (that interaction is ResetVectorA7RaceSpec's job) -- exposed as a pokeable
+      // input, driven True throughout by the test below, so this spec keeps exercising
+      // exactly what it always has (the fetch/redirect chain), not the sweep race.
+      val regInitDone = in(Bool()); fsm.io.regInitDone := regInitDone
+
       fa.logic.resetRedirect.valid   := fsm.io.redirectValid
       fa.logic.resetRedirect.payload := fsm.io.redirectPc
 
@@ -111,6 +117,7 @@ class ResetVectorIntegrationSpec extends AnyFunSuite {
       dut.trv.logic.rValid  #= false
       dut.trv.logic.rData   #= 0
       dut.trv.logic.rResp   #= 0
+      dut.trv.logic.regInitDone #= true // gate open: no RegFilePlugin in this DUT to race against
       cd.waitSampling(3)
 
       // 1) Does the FSM's AR request appear at all, at physical address 0, unprompted --
