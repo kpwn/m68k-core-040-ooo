@@ -680,10 +680,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // On overflow: V=1 (N/Z/C preserved), NO result write (Dn unchanged). On DIV0:
     // euFault vec5, no write.
 
-    // ---- DIVREM (remainder-move) support: latch the just-finished DIV's REMAINDER
-    // (and whether it overflowed) so the trailing DIVREM µop writes Dr. The DIVREM is
-    // the next CPLX µop in age order (single-outstanding), so the latch is valid. On a
-    // DIV overflow NEITHER dest is written -> the DIVREM must also skip its write.
+    // ---- DIVREM (remainder-move) support: stash the just-finished DIV's REMAINDER
+    // (and whether it overflowed) so the trailing DIVREM µop writes Dr. On a DIV
+    // overflow NEITHER dest is written -> the DIVREM writes Dr's own old value through.
+    // (This block used to claim "the DIVREM is the next CPLX µop in age order
+    // (single-outstanding), so the latch is valid". That was an ASSUMPTION, not an
+    // invariant, and it was false -- see the ROB-keyed stash below, Part 117.)
     // ── Task 9b: FMOVEM control-register LIST form, STORE direction ─────────────────
     // `DecOp.FPCTRLRD`: read the `pos`-th SELECTED control register into an int temp.
     // See the FSM arm below for the full rationale; this is just the datapath.
@@ -775,8 +777,88 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpCvtFlushing = flushed || flushSig
 
     val isDivRem = u1.divIsRem
-    val remLatch = Reg(Bits(32 bits))
-    val ovLatch  = RegInit(False)
+    // ── DIV -> DIVREM remainder hand-off: ROB-KEYED STASH (Part 117) ────────────────
+    // WHAT THIS REPLACES, AND WHY. The remainder used to live in a plugin-GLOBAL pair of
+    // registers (`remLatch`/`ovLatch`) with no identity, no `init` and no flush clear,
+    // handed to "the next CPLX µop in age order". The comment three blocks up stated that
+    // as an invariant; it was an ASSUMPTION about IssueQueuePlugin's CPLX port, and it was
+    // false. That port selects the oldest READY CPLX slot, and a DIVREM has no dependence
+    // on its own DIV (Dr and Dq are different registers in every remainder-producing
+    // form), so whenever the DIV was still waiting on its dividend producer the DIVREM
+    // issued FIRST and moved the PREVIOUS divide's remainder into Dr. Quotient correct,
+    // remainder wrong. Measured on real MC68040 hardware
+    // (docs/BUG_calibration_word_misplaced_0d00.md Part 116/117): 2 of 14 remainders
+    // wrong, two divides with IDENTICAL operands returning different remainders, and the
+    // ROM's `_SlotManager $2C` -- which selects step-forward vs step-backward from the
+    // SIGN of this remainder -- walking an sResource list 4 bytes off and aborting the
+    // Slot Resource Table enumeration.
+    //
+    // THE STRUCTURE IS THE MULHI STASH'S IDEA -- a stash that carries the ROB IDENTITY of
+    // the producer, plus a valid bit cleared on flush -- SIZED FOR ONE ENTRY. The high
+    // half of a 64-bit multiply has always been carried that way (`mulHiMem`/`mulHiValid`,
+    // ~80 lines above, keyed `robId + 1`) and is provably immune to this defect: an early
+    // MULHI reads ITS OWN robId's slot, finds it invalid, and waits. The remainder is now
+    // equally SELF-IDENTIFYING: a DIVREM checks that the stashed value carries ITS OWN
+    // producer's robId, so it can never move a different division's remainder into Dr.
+    //
+    // WHY ONE ENTRY AND NOT MULHI'S 64-DEEP `Mem`. MUL is a PIPELINED lane with up to
+    // `MulCore.Latency + 2` products in flight, so several MULHI hand-offs can be live at
+    // once and a per-robId array is genuinely required. The divider is SINGLE-OUTSTANDING,
+    // and IssueQueuePlugin now selects the divide family (DIV/DIVREM) strictly in age
+    // order (`divFamBlocked`), so the sequence is exactly DIV -> its DIVREM -> next DIV:
+    // AT MOST ONE hand-off can ever be live. A 64x33 LUTRAM plus a 64-bit valid vector,
+    // its address decoder and its 64:1 read mux would be 63 unreachable entries -- and it
+    // measured as such (OOC A/B, Part 117: the Mem form cost +1218 LUT and 0.53ns of WNS
+    // against this form's +30 LUT and 0.00ns, on a design whose worst-path families are
+    // near-tied). The single tagged entry gives the identical guarantee at the identical
+    // detection point, because the tag comparison -- not the array indexing -- is what
+    // makes the value self-identifying.
+    //   * `remStashRobId` is the PRODUCING DIV's robId. Its DIVREM is always the
+    //     immediately following ROB entry: decode emits DIV then DIVREM as consecutive
+    //     µops of one bundle (MicroOpAssembler `out.uops(n)/uops(n+1)`), the same
+    //     adjacency `mulHiMem`'s `robId + 1` keying already relies on.
+    //   * `remStashValid` is cleared on FLUSH and on consumption, and is only SET by a DIV
+    //     that was not flushed in flight -- which also closes the second, independent half
+    //     of the defect: a WRONG-PATH divide keeps iterating after a flush (only its
+    //     completion is suppressed, not its arithmetic) and used to overwrite the global
+    //     latch for a later correct-path DIVREM.
+    // The IQ ordering is also what lets the DIVREM keep using the ordinary S1 arm rather
+    // than needing MULHI's pending FIFO: a DIVREM cannot even be ACCEPTED while the
+    // iterative lane is busy, so parking one would need a FIFO deep enough (>= the 16 IQ
+    // slots, worst case) to guarantee the registered issue Stream never wedges holding a
+    // DIVREM in front of its own un-issued DIV. The ordering constraint itself costs
+    // nothing measurable -- divides were already serialized against each other by the
+    // single-outstanding iterative lane.
+    val remLatch      = Reg(Bits(32 bits)) init 0
+    val ovLatch       = RegInit(False)
+    val remStashRobId = Reg(UInt(6 bits)) init 0
+    val remStashValid = RegInit(False)
+    /** Publish this DIV's remainder/overflow under its OWN robId. Guarded on the flush
+      * latch so a wrong-path divide that finishes AFTER the flush cannot hand its
+      * remainder to a correct-path DIVREM that has since been dispatched into the
+      * (reused) neighbouring ROB slot. */
+    def stashRemainder(rem: Bits, ov: Bool): Unit = {
+      when(!(flushed || flushSig)) {
+        remLatch      := rem
+        ovLatch       := ov
+        remStashRobId := s1Ctx.robId
+        remStashValid := True
+      }
+    }
+    when(flushSig) { remStashValid := False }
+    /** True when the stashed remainder was published by THIS DIVREM's own DIV. 6-bit
+      * compare, so ROB-id wraparound is handled by construction. */
+    val remIsMine = remStashValid && ((remStashRobId + 1).resized === s1Ctx.robId)
+    val remOv     = ovLatch
+    val remValue  = remLatch
+    /** Invariant monitor: a DIVREM about to consume a stash entry its own DIV did not
+      * publish. Unreachable with the IQ's divide-family in-order select in place;
+      * REACHABLE (and observed, on both hardware and in simulation) without it.
+      * Sim-visible so a directed regression can watch the mechanism, not only the
+      * architectural symptom. */
+    val divRemStale = Bool()
+    divRemStale := False
+    divRemStale.simPublic()
 
     // ─────────────────────────────────────────────────────────────────────────
     // MUL integration: a fixed seven-stage DSP datapath, pruned descriptor pipe,
@@ -1334,11 +1416,29 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
             // (writeInt=False), which left the pdst permanently not-ready and
             // deadlocked any later reader of Dr. writeInt is now unconditionally True;
             // only the DATA differs (old Dr on overflow, the fresh remainder otherwise).
-            captureComplete(Mux(ovLatch, s1A, remLatch), B(0, 4 bits), False, True)
+            //
+            // Part 117: the latch is now ROB-TAGGED. `divRemStale` is the invariant
+            // monitor -- it can only assert if a DIVREM reached S1 whose own DIV did not
+            // publish the stash immediately before it, i.e. exactly the wrong-remainder
+            // bug this fix closes. It is unreachable with IssueQueuePlugin's
+            // divide-family in-order select (`divFamBlocked`) in place, and it FIRES on
+            // the pre-fix RTL, which is what makes the directed regression meaningful.
+            // The stash is CONSUMED here so a second DIVREM can never re-read it.
+            divRemStale := !remIsMine && !flushed && !flushSig
+            assert(remIsMine || flushed || flushSig,
+              "DIVREM consumed a remainder that was not published by its own DIV")
+            remStashValid := False                // consume: no second reader of this entry
+            captureComplete(Mux(remOv, s1A, remValue), B(0, 4 bits), False, True)
             s1Valid := False
           } elsewhen(isDiv) {
             when(divisor32 === 0) {
               // DIV0 -> euFault vector 5, no write, no flag change (Musashi leaves CCR).
+              // The trailing DIVREM is squashed by this fault at retirement, but it may
+              // still ISSUE first (the fault is only taken at the ROB head), so the stash
+              // is published here too -- tagged, and with ov=True so the doomed DIVREM
+              // writes Dr's own OLD value through rather than a foreign remainder. That
+              // keeps the tag invariant exact instead of carving a DIV0 hole in it.
+              stashRemainder(B(0, 32 bits), True)
               captureFault(U(5, 8 bits), B(0, 4 bits), False)
               s1Valid := False
             } otherwise {
@@ -1360,9 +1460,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
         when(divUnit.io.done) {
           // Latch the remainder (signed) + overflow for the trailing DIVREM µop. For
           // the .W form the remainder is packed into the quotient result (no DIVREM);
-          // for the .L forms the DIVREM writes Dr from this latch.
-          remLatch := resR.asBits
-          ovLatch  := divUnit.io.overflow
+          // for the .L forms the DIVREM writes Dr from this latch. Part 117: published
+          // under THIS DIV's robId, and suppressed entirely when this divide was
+          // flushed in flight (a wrong-path divide still iterates to completion here --
+          // only its `captureComplete` is discarded -- so an unguarded write handed its
+          // remainder to whatever correct-path DIVREM later occupied robId+1).
+          stashRemainder(resR.asBits, divUnit.io.overflow)
           // Overflow -> V=1, Dq ARCHITECTURALLY unchanged. Normal -> write quotient + N/Z (V=0).
           // On overflow this WRITES s1A (Dq's own OLD/pre-divide value, already read as the
           // dividend source -- same register, so s1A IS "the old Dq") back through to the
@@ -1446,6 +1549,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       legacyValid := False
       compValid := False
       mulHiValid := 0
+      // Part 117: the divide remainder stash is cleared exactly like the MULHI stash --
+      // any pending {DIV -> DIVREM} hand-off belongs to a squashed path, and the robId it
+      // is tagged with is about to be reused by a correct-path µop. (Also cleared at the
+      // stash declaration; both are needed -- that one covers the cycle-ordering, this one
+      // keeps the clear next to its MULHI sibling.)
+      remStashValid := False
     }
 
     // ---- drive ports from the registered completion stage ----
