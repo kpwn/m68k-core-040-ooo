@@ -10,6 +10,31 @@ every real RTL bug it exposes.
 |-------|------|-------------------|-------|-------|
 | 0 (baseline) | 2026-09-01 | **57** | — | `fuzz_logs/*.log`, 8 batches of 25 seeds |
 | 1 | 2026-09-03 | **20** | **−37** | MEASURED, full 200-seed sweep, 180 PASS. `fuzz_logs_round1/*.log` on this branch |
+| 2 | 2026-09-03 | **13** | **−7** | MEASURED, full 200-seed sweep, 187 PASS. `fuzz_logs_round2/*.log`. TAS memory-indirect routing fixed + gate unification |
+
+### Round 2 measured result
+
+**20 → 13.** Surviving: 8, 13, 18, 21, 54, 57, 60, 64, 80, 82, 109, 127, 139.
+
+| Cluster | Now | Note |
+|---|-----|------|
+| C (A7 harness artifact) | 8 | 8, 13, 18, 54, 60, 64, 82, 139 — untouched, harness fix deferred behind the divider agent |
+| B — TAS memind | **1** (was 8) | 7 fixed; **seed 21 changed STEP→MEM**, see below |
+| B — SHIFT-mem memind | 2 | 109, 127 — deliberately out of scope (needs new µcode ctx fields) |
+| B — seed 57 framing | 1 | separate defect, candidate #223 reproducer |
+| D — Scc memind | 1 | 80 — deliberately out of scope (needs condition eval in the engine) |
+
+**Seed 21 is a partial result and must be reported as such.** It was
+`WILDPC` (`dut=0x4ad9b710`); it is now
+`DIVERGED[MEM] mem[0x00004022]: dut=0xbd oracle=0x00`. The routing fix removed the
+wild-PC crash, but the TAS now writes a **wrong value/address**. Seed 21's shape is
+`tas ([0x17,%a0,%d1.l*4],0x4)` — **pre-indexed with a non-zero outer displacement**,
+which `tas_memind.s` does **not** cover (its three cases are all no-index, zero outer
+displacement). So the basic memind TAS path is fixed and proven; the
+**indexed + outer-displacement** TAS path has a further, narrower bug still open.
+Honest characterisation: 7 of 8 TAS seeds fixed, 1 converted from a loud crash into a
+precise value mismatch — better, not done.
+
 
 Round-1 measurement provenance: `LOGDIR=fuzz_logs_round1 tools/fuzz/sweep.sh 0 200 25 20`,
 8 batches of 25 seeds, one JVM per batch, run serially. 200 seeds run, 180 PASS,
