@@ -165,15 +165,60 @@ First candidate, staged in `9963866` and **not yet re-gated**: the two call site
 emitting two bit-identical mux trees from the same `pkt.words`/`immIsLong`; they now share
 one instance. Strictly less logic, semantically a no-op.
 
-**Untested upside worth measuring at the same time:** the fix permanently retires the family
-that was the *baseline's* binding constraint (`s1Index`, +0.608). So if task #127 is ever
-folded, the fix netlist's ceiling is set by whatever family is third — plausibly well above
-178. That makes #127 worth materially more than the 0.233 ns of headroom it appeared to be
-worth. The third family has **not** been measured; stated as a hypothesis, not a result.
+#### RE-GATED — the hoist does NOT recover, and my own upside hypothesis is REFUTED
 
-**Landing position:** do **not** merge as-is. Do **not** weaken the fix. Re-gate the hoist;
-if it does not recover, hold the fix behind #127 rather than reverting the correctness.
-Recorded as measured, not as a blocker to the correctness result: seed 21 is genuinely fixed.
+The hoist (`9963866`) was gated. **WNS -1.052 / 165.23 MHz — bit-identical to the un-hoisted
+version.** Three encodings of the same 4-word view (6-entry, 4-entry, 4-entry-shared) all
+produce *exactly* -1.052. The cost is therefore attached to the **function** — `words(3)`
+being live in that cone — and not to the structure. There is no cheaper encoding to find,
+and looking for a fourth would be the contortion this campaign warns against. Encoding
+avenue: closed by measurement.
+
+The same run dumped a distinct-endpoint ladder, which answers the standing hypothesis and
+**refutes it**:
+
+| rank | slack | endpoint family |
+|------|-------|-----------------|
+| 1-7 | -1.052 … -1.050 | `RobPlugin faultDynMem` (task #127) |
+| 8 | **-0.935** | `IssueQueuePlugin readyReg` |
+| 9-12 | -0.930 … -0.922 | `IssueQueuePlugin lines_ways_triggers` |
+
+I had proposed that because the fix retires `s1Index` (+0.608), folding task #127 would let
+this netlist reach "plausibly well above 178", making #127 newly valuable. **Measured: it
+would reach the IQ family at -0.935 = 168.49 MHz — still 9.9 MHz BELOW the 178.35 baseline.**
+Folding #127 recovers only ~3.3 of the 13.1 MHz. The hypothesis was wrong; it was labelled a
+hypothesis precisely so this could happen, and it did.
+
+Worse for the fix, and the real shape of the problem: the IQ family sits at -0.935 in the fix
+netlist, but *must* be at ≥ -0.607 in the baseline (nothing there is worse than the -0.607
+WNS). So the change degrades **at least two mutually unrelated families**, neither of which
+contains its logic. This is a diffuse, global synthesis effect, not one lengthened path —
+which is also why no single fold recovers it.
+
+#### Confound ruled out: the `simPublic` taps are NOT responsible
+
+The fix tree also carries five debug `simPublic` taps on 32-bit LS-EU signals
+(`s1Va`/`s1Base`/`s1Disp`/`s1Index`/`s1Data`) that the baseline lacks — and `s1Index` is
+*literally the baseline's critical endpoint*, so this was a live alternative explanation for
+the whole 13.1 MHz. **Controlled and eliminated:** regenerating with the taps disabled but
+the source line count preserved (so the generated `_lNNNN` names cannot shift) produces a
+**byte-identical** netlist. `simPublic` has zero effect on the synthesis path — this file's
+long-standing "zero synth impact" comments are now verified rather than asserted. The A/B
+was clean and the 13.1 MHz belongs to the fix.
+
+*(A first attempt at this control simply deleted the 5 lines and produced 496 diffs — every
+one an auto-generated name embedding a source line number. Those were an artifact of
+removing lines, not of `simPublic`; the line-count-neutral rerun is the valid one.)*
+
+**Landing position (final for this round):** the fix costs ~13 MHz, no encoding dodges it,
+and no identified single fold recovers it. Per the owner's standing
+correctness-over-FMax priority, and since we are managing a known shortfall rather than
+defending a met target: **hold the fix on this branch — do not revert the correctness, and
+do not merge it into an FMax-gated path yet.** Cluster E is a real, measured, silent
+wrong-address bug with a genuine fail-before/pass-after; parking it pending an FMax
+resolution is a defensible state, dropping it is not. Whoever picks this up should treat
+"why does one live 16-bit word in the decode cone cost two unrelated families 0.3-0.7 ns"
+as the actual open question — it is a synthesis-behaviour question, not a logic question.
 
 **Constraint-staleness check (`1cc57891`):** not applicable. That commit is in the **SoC**
 repo and touches `synth/vivado.tcl`, the *implementation* flow; this gate reads only the
