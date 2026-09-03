@@ -19,21 +19,45 @@ every real RTL bug it exposes.
 | Cluster | Now | Note |
 |---|-----|------|
 | C (A7 harness artifact) | 8 | 8, 13, 18, 54, 60, 64, 82, 139 — untouched, harness fix deferred behind the divider agent |
-| B — TAS memind | **1** (was 8) | 7 fixed; **seed 21 changed STEP→MEM**, see below |
+| B — TAS memind | **0** (was 8) | all 8 fixed; seed 21's residual is a DIFFERENT bug (cluster E) |
 | B — SHIFT-mem memind | 2 | 109, 127 — deliberately out of scope (needs new µcode ctx fields) |
 | B — seed 57 framing | 1 | separate defect, candidate #223 reproducer |
 | D — Scc memind | 1 | 80 — deliberately out of scope (needs condition eval in the engine) |
+| E — 32-bit-wrapping full-format indexed EA | 1 | 21 — NEW, unmasked by the TAS fix |
 
-**Seed 21 is a partial result and must be reported as such.** It was
-`WILDPC` (`dut=0x4ad9b710`); it is now
-`DIVERGED[MEM] mem[0x00004022]: dut=0xbd oracle=0x00`. The routing fix removed the
-wild-PC crash, but the TAS now writes a **wrong value/address**. Seed 21's shape is
-`tas ([0x17,%a0,%d1.l*4],0x4)` — **pre-indexed with a non-zero outer displacement**,
-which `tas_memind.s` does **not** cover (its three cases are all no-index, zero outer
-displacement). So the basic memind TAS path is fixed and proven; the
-**indexed + outer-displacement** TAS path has a further, narrower bug still open.
-Honest characterisation: 7 of 8 TAS seeds fixed, 1 converted from a loud crash into a
-precise value mismatch — better, not done.
+**CORRECTION (self-caught, supersedes this doc's first characterisation of seed 21).**
+I initially reported seed 21 as "TAS still writes a wrong value, so 7 of 8 TAS seeds
+fixed". **That was wrong — I inferred it from the seed's shape instead of computing the
+addresses.** Having now done the arithmetic:
+
+- Seed 21's TAS is `tas ([0x17,%a0,%d1.l*4],0x4)` with `A0=0x4011`, `D1=0xffffffff`.
+  Intermediate = `0x4011 + 0x17 + (-1*4)` = **`0x4024`**; `[0x4024] = 0x4015` (written by
+  the program); final EA = `0x4015 + 0x4` = **`0x4019`**. **`0x4019` is NOT among the
+  mismatching bytes** — the only mismatches are `0x4022`/`0x4023`. **The TAS is correct.**
+- The mismatching bytes belong to a *different* instruction later in the same program:
+  `move.w #0x80,(0x10036,%a3,%d6.l*4)` with `A3=0xffff3ff0`, `D6=0xffffffff`.
+  `A3 + 0x10036` = `0x1_0000_4026` — **it overflows 32 bits** — then `+(-4)` truncates to
+  **`0x00004022`**, storing word `0x0080` → `[0x4022]=0x00`, `[0x4023]=0x80`. **That is
+  exactly what the oracle has.** The DUT left the stale prologue bytes (`0xbd`, `0x85`)
+  there, so the DUT's store landed somewhere else.
+
+**So all 8 TAS seeds are fully fixed, not 7.** Seed 21's residual is a **distinct,
+pre-existing bug that the TAS wild-PC had been masking** — the third instance of the
+unmasking pattern in this campaign.
+
+### New cluster E — full-format indexed EA whose base displacement overflows 32 bits
+
+**Seed 21** (1 divergence). `move.w #0x80,(0x10036,%a3,%d6.l*4)`: a full-format indexed EA
+(the `0x10036` displacement needs a LONG base displacement, so bit8=1 with BD SIZE=11) in
+which `An + bd` wraps past `2^32`. The 68k EA sum is modulo 2^32; the DUT appears not to
+truncate (or mis-sizes the long `bd`), so the store lands at the wrong address —
+**silently**, with no fault. Classified **RTL**, distinct from clusters B/D (this EA is
+`MEMSIMPLE`, not `MEMINDIRECT`, so the classifier gap cannot reach it) and distinct from
+seed 57 (brief format, no wraparound).
+
+Lesson recorded against myself: *shape-matching a reproducer is not root-causing it.*
+Both of this campaign's wrong calls so far came from inferring a mechanism from an
+instruction's appearance rather than computing what it actually does.
 
 
 Round-1 measurement provenance: `LOGDIR=fuzz_logs_round1 tools/fuzz/sweep.sh 0 200 25 20`,
