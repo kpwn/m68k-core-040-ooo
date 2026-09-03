@@ -50,16 +50,6 @@ object PortedTestRunner {
   lazy val compiled = M68kSim().withVerilator.compile(new FuzzCoreDut)
   private var runIdx = 0
 
-  // 2026-09-03 early-flush (RobPlugin's `earlyBranchMispredict`) mechanism-firing
-  // proof: counts pulses of the NEW EU-resolution-time flush trigger during the
-  // MOST RECENT `run()` call. A directed test can call `run()` then check this to
-  // prove the early path genuinely engaged (not merely that the always-correct,
-  // slower retire-gated `branchRedirect` silently carried the test to PASS).
-  // Reset at the start of every `run()`, so only reflects the most recent call --
-  // callers needing per-test isolation should not run tests concurrently (the
-  // existing harness already runs one `doSim` at a time per JVM).
-  @volatile var lastEarlyFlushPulseCount: Int = 0
-
   def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1,
         cachePosture: CachePosture = CachePosture.AsWritten): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
@@ -89,109 +79,9 @@ object PortedTestRunner {
     }
 
     runIdx += 1
-    lastEarlyFlushPulseCount = 0
     var outcome: PortedOutcome = PortedHang(0)
     compiled.doSim(s"ported_$runIdx", simSeed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-
-      // Always-on (cheap: one Bool sample per cycle, no allocation on the
-      // common non-firing case) counter for RobPlugin's early-flush trigger --
-      // see `lastEarlyFlushPulseCount`'s doc comment above.
-      cd.onSamplings {
-        if (dut.rob.logic.earlyBranchMispredict.toBoolean) lastEarlyFlushPulseCount += 1
-      }
-      if (sys.env.contains("PORTED_TRACE_EARLYFLUSH")) {
-        var trCyc = 0
-        cd.onSamplings {
-          trCyc += 1
-          if (dut.rob.logic.earlyBranchMispredict.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d FIRE committedResumePc=0x${dut.rob.logic.committedResumePc.toLong & 0xffffffffL}%08x " +
-              f"robId=${dut.rob.logic.branchCompletion.payload.robId.toInt} p0pc=0x${dut.rob.logic.p0.pc.toLong & 0xffffffffL}%08x " +
-              f"p0first=${dut.rob.logic.p0.first.toBoolean} p0last=${dut.rob.logic.p0.last.toBoolean} " +
-              f"count=${dut.rob.logic.count.toInt} head=${dut.rob.logic.head.toInt} tail=${dut.rob.logic.tail.toInt}")
-          }
-          if (dut.rob.logic.doFlushReg.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d DOFLUSH flushPcReg=0x${dut.rob.logic.flushPcReg.toLong & 0xffffffffL}%08x")
-          }
-          if (dut.rob.logic.branchRedirect.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d BRANCHREDIRECT nextPcRd0=0x${dut.rob.logic.nextPcRd0.toLong & 0xffffffffL}%08x")
-          }
-          if (dut.rob.logic.btbUpdateFlow.valid.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d BTBTRAIN pc=0x${dut.rob.logic.btbUpdateFlow.payload.pc.toLong & 0xffffffffL}%08x " +
-              f"taken=${dut.rob.logic.btbUpdateFlow.payload.taken.toBoolean} target=0x${dut.rob.logic.btbUpdateFlow.payload.target.toLong & 0xffffffffL}%08x " +
-              f"brType=${dut.rob.logic.btbUpdateFlow.payload.brType.toInt} len=${dut.rob.logic.btbUpdateFlow.payload.len.toInt}")
-          }
-          if (dut.rob.logic.gshareUpdateFlow.valid.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d GSHARETRAIN idx=${dut.rob.logic.gshareUpdateFlow.payload.index.toInt} " +
-              f"taken=${dut.rob.logic.gshareUpdateFlow.payload.taken.toBoolean}")
-          }
-          for (k <- 0 until 2) {
-            val c = dut.rob.logic.commitObs(k)
-            if (c.fire.toBoolean) {
-              println(f"[earlyflush] cyc=$trCyc%6d COMMIT port=$k robId=${c.robId.toInt} pc=0x${c.pc.toLong & 0xffffffffL}%08x")
-            }
-          }
-          if (dut.rob.logic.branchCompletion.valid.toBoolean) {
-            println(f"[earlyflush] cyc=$trCyc%6d BCOMPLETE robId=${dut.rob.logic.branchCompletion.payload.robId.toInt} " +
-              f"mispredict=${dut.rob.logic.branchCompletion.payload.mispredict.toBoolean} " +
-              f"isBranch=${dut.rob.logic.branchCompletion.payload.isBranch.toBoolean} " +
-              f"phtValid=${dut.rob.logic.branchCompletion.payload.phtValid.toBoolean} " +
-              f"btbPc=0x${dut.rob.logic.branchCompletion.payload.btbPc.toLong & 0xffffffffL}%08x " +
-              f"btbTaken=${dut.rob.logic.branchCompletion.payload.btbTaken.toBoolean} " +
-              f"btbTarget=0x${dut.rob.logic.branchCompletion.payload.btbTarget.toLong & 0xffffffffL}%08x")
-          }
-          // StoreQueue-side tracing (BUG_calibration_word Part 110/111 handoff):
-          // dump the ring's cursor state on every event that can move it, so a
-          // chained-early-flush wedge shows up as "head/sendPtr stop moving after
-          // event X" directly in the log instead of needing a second repro pass.
-          val sq = dut.lsEu.logic.sq
-          if (sq.io.alloc.valid.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d ALLOC robId=${sq.io.alloc.payload.robId.toInt} " +
-              f"paddr=0x${sq.io.alloc.payload.paddr.toLong & 0xffffffffL}%08x " +
-              f"precise=${sq.io.alloc.payload.precise.toBoolean} tail=${sq.tail.toInt} flush=${sq.io.flush.toBoolean}")
-          }
-          if (sq.io.commit.valid.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d SQCOMMIT robId=${sq.io.commit.payload.toInt}")
-          }
-          if (sq.io.commitB.valid.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d SQCOMMITB robId=${sq.io.commitB.payload.toInt}")
-          }
-          if (sq.io.flush.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d SQFLUSH head=${sq.head.toInt} tail=${sq.tail.toInt} " +
-              f"sendPtr=${sq.sendPtr.toInt} ackPhaseB=${sq.ackPhaseB.toBoolean} " +
-              f"acceptedHalves=${sq.acceptedHalves.toInt} drainBusy=${sq.drainBusy.toBoolean} " +
-              f"headDrainInFlight=${sq.headDrainInFlight.toBoolean} " +
-              f"validHead=${sq.valids(sq.head.toInt).toBoolean} committedHead=${sq.committed(sq.head.toInt).toBoolean} " +
-              f"robIdHead=${sq.robIds(sq.head.toInt).toInt}")
-          }
-          if (sq.io.drain.valid.toBoolean && sq.io.drain.ready.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d DRAINFIRE sendPtr=${sq.sendPtr.toInt} sendPhaseB=${sq.sendPhaseB.toBoolean} " +
-              f"paddr=0x${sq.io.drain.payload.paddr.toLong & 0xffffffffL}%08x")
-          }
-          if (sq.io.drainAck.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d DRAINACK head=${sq.head.toInt} ackPhaseB=${sq.ackPhaseB.toBoolean} " +
-              f"validBHead=${sq.validBs(sq.head.toInt).toBoolean} drainErr=${sq.io.drainErr.toBoolean} " +
-              f"acceptedHalves=${sq.acceptedHalves.toInt}")
-          }
-          if (sq.io.sqCompletion.valid.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d SQCOMPLETION robId=${sq.io.sqCompletion.payload.toInt}")
-          }
-          // LsEuPlugin's pendMem/pendPush/pendReady/pendApply lock-step companion FIFO
-          // (deferred precise-store completion replay -- see LsEuPlugin.scala's
-          // `deferCompletion`/P2.7 doc comments). Tracks whether the flush-time
-          // `pendPush` rollback stays consistent with the SQ's OWN `headDrainInFlight`
-          // survivor when a chained early flush lands mid-drain.
-          val le = dut.lsEu.logic
-          if (sq.io.flush.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d PENDFLUSH pendPush=${le.pendPush.toInt} " +
-              f"pendReady=${le.pendReady.toInt} pendApply=${le.pendApply.toInt}")
-          }
-          if (dut.lsEu.sqCompletionPort.valid.toBoolean) {
-            println(f"[sqtrace] cyc=$trCyc%6d SQCOMPLETIONPORT robId=${dut.lsEu.sqCompletionPort.payload.toInt} " +
-              f"pendPush=${le.pendPush.toInt} pendReady=${le.pendReady.toInt} pendApply=${le.pendApply.toInt}")
-          }
-        }
-      }
 
       // Task #211: use the DECERR-capable read agent (mirrors `dmem` below) so an
       // instruction fetch to genuinely-unmapped space (e.g. exc_ifetch_bus_error.s's
