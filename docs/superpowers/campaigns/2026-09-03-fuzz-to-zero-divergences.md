@@ -273,6 +273,64 @@ have been waiting behind it. Whoever takes the gate should re-run the two repros
 (`MicroOpAssembler.scala:1935`). This campaign has measured `bad` at **50 MHz** for an added
 term. Narrowing an existing term is not the same as adding one, but it must be re-gated.
 
+### SEED 57 — ROOT-CAUSED (not fixed). `srcEa` decodes the IMMEDIATE as an extension word
+
+Isolated from scratch, assuming no family membership, per METHOD (2).
+
+Seed 57 minimizes to `ori.w #0x254a,(20,%a0,%a2.l*2)`, which takes a spurious exception and
+vectors to a wild PC (`a7` drops by 8 at the diverging step — a frame really is pushed).
+Its destination EA is **brief** format, so it was never cluster E.
+
+**Mechanism.** `MicroOpAssembler`'s `srcEa` is decoded from `pkt.words(1)`. For a line-0
+immediate, `words(1)` **is the immediate**, not the EA's extension word. `EaDecoder`'s mode-6
+path then reads that immediate as if it were one:
+
+```
+briefIsFull = extW(8)           -> bit 8 of the IMMEDIATE
+fIis        = extW(2 downto 0)  -> bits 2:0 of the IMMEDIATE
+```
+
+`0x254a` has bit8=1 and I/IS=010, so `srcEa.klass` comes out **MEMINDIRECT**, and
+`lineImmBad` (`MicroOpAssembler.scala:1557`) rejects the instruction into the global `bad`
+→ vector 4:
+
+```scala
+val lineImmBad = isLineImm && !isBitOp && (srcEa.klass =/= EaClass.DATAREG) &&
+                 (srcEa.klass =/= EaClass.MEMSIMPLE) && !isToCcr && !isToSr
+```
+
+**Confirmed by single-variable measurement** (`docs/superpowers/repros/seed57_lineimm_srcea_misclass_probe.s`).
+Three cases, byte-identical destination EA — same opword, same extension word, same base,
+index and scale — varying **only the immediate**, with the prediction written down and
+committed *before* the run:
+
+| immediate | bit8 | I/IS | `srcEa.klass` under the hypothesis | predicted | measured |
+|-----------|------|------|-----------------------------------|-----------|----------|
+| `#0x244a` | 0 | — | MEMSIMPLE (misread as brief) | legal | **PASS** |
+| `#0x2548` | 1 | 000 | MEMSIMPLE (full, no indirection) | legal | **PASS** |
+| `#0x254a` | 1 | 010 | **MEMINDIRECT** | **illegal** | **TRAPPED** (`0xAAAA0C0C`) |
+
+Legality tracks the **immediate's bit pattern** while the EA is held constant. That is the
+mechanism, not a correlation.
+
+**The defect is an assumption stated in the code.** The `immEa` re-decode's own comment says
+the plain words(1)-based `srcEa` *"still drives the operand CLASS (mode/reg are
+offset-independent)"*. True for modes 0-5 and 7-0/7-1/7-2, whose class depends only on the
+opword. **False for mode 6 and mode 7-3**, whose class depends on bit8 and I/IS **of the
+extension word**. `immEa` — the correctly-shifted decode — is already computed a few lines
+above and is what the class check should consult.
+
+**Why this is nasty:** it is *data-dependent*. It fires only when an immediate happens to
+look like a full-format memory-indirect extension word (bit8 set, I/IS ≠ 000) — roughly 7 in
+16 random immediates with an indexed destination — so it is intermittent by operand value,
+which is exactly why a fuzzer found it and directed tests did not.
+
+**Not fixed here, deliberately.** The one-line shape is to consult `immEa.klass` for a line-0
+immediate, but `lineImmBad` is a term *in* the global `bad` expression, which this campaign
+has measured at 50 MHz, and round 7 has just shown this file's decode cone to be unusually
+FMax-sensitive. It needs its own synth gate, and the machine is currently held by the
+boot-blocker agent. Scoped and ready for pickup.
+
 ### Same class, NOT fixed — carried forward
 
 Five more call sites still pass 3-entry `Vec`s and would lose a long `bd` the same way for a
