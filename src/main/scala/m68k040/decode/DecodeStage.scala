@@ -618,16 +618,17 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // FULL-FORMAT dst EA (mem-indirect here) places the EA's first ext word at op+3, one
     // word beyond the ORIGINAL 2-word predecode lookahead (op+1/op+2 only) -- it used to
     // frame BRIEF (too short), mis-fetching the FOLLOWING instruction, and was never routed
-    // to the engine (fell through to the normal head, gated ILLEGAL by
-    // MicroOpAssembler's `limmFullFmtDstBad`, vector 4). PredecodeWord.classify/
-    // IcachePlugin now thread a 3rd lookahead word (extW3, op+3) so this frames correctly
-    // (see PredecodeWord.scala's extW3 doc comment) and routes here exactly like the
-    // .B/.W imm-dst mem-indirect forms below. `s0LimmFullDstBad` now only fires for the
-    // residual, much narrower edge case where extW3 itself is unavailable (this exact
-    // opword landing at the very end of a fetched cache line) — predecode's F5-precedent
-    // fallback there still frames BRIEF, so this op still correctly stays ungated/illegal
-    // rather than silently mis-executing. (Declared for documentation/future diagnostic
-    // use; not currently read elsewhere.)
+    // to the engine (fell through to the normal head, gated ILLEGAL by MicroOpAssembler's
+    // `limmFullFmtDstBad`, vector 4). PredecodeWord.classify/IcachePlugin now thread a 3rd
+    // lookahead word (extW3, op+3) so this frames correctly (see PredecodeWord.scala's
+    // extW3 doc comment) and routes here exactly like the .B/.W imm-dst mem-indirect forms
+    // below. `limmFullFmtDstBad` itself was REMOVED in Part 122 of
+    // BUG_calibration_word_misplaced_0d00.md: with the extW3 lookahead plus Aligner's
+    // `ambiguousLine` stall/pack-refusal, a line-0 immediate can no longer reach decode
+    // with a guessed length, so that blanket gate only manufactured spurious vector-4
+    // traps -- it was the reason the Quadra 700 ROM's `cmpi.l #imm,%a0@(0xFEFFC)` at
+    // 0x000098E2 (full-format, I/IS=000) trapped on real silicon. (`s0LimmFullDstBad`
+    // below is declared for documentation/future diagnostic use; not read elsewhere.)
     val s0LimmFullDstBad = s0IsLineImm && s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)
     // ported-tests triage (move_l_abs_memind_dst): the OFFLOADED s0dstEa (Offload /
     // computeOffload in MicroOpAssembler.scala) reads the MOVE dst's own ext word at a
