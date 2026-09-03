@@ -564,6 +564,34 @@ lead was worth checking and it does not hold for the 10 memory-indirect seeds �
 the classifier gap, a different mechanism from #223's brief-indexed/`MEMSIMPLE` shape. The
 lead does appear to pay off for the one outlier.
 
+### Corroboration: the test corpus correlates perfectly with the classifier list
+
+I tried to *falsify* the hypothesis by looking for an existing passing memory-indirect
+test covering TAS, shift-mem or Scc-mem. There is none — and the wider pattern is a
+perfect one-to-one correlation. Every family **with** a classifier has a directed
+memory-indirect test:
+
+`clr_l_memind.s` (CLR) · `add_l_dn_memind_dst.s` (ALU dst, task #150) ·
+`add_l_memind_src_dn.s` (ALU src) · `andi_l_memind_dst.s` (line-0 imm) ·
+`b2_addq_subq_memind_null_od.s` (ADDQ/SUBQ) · `bit_ops_full_memind.s`,
+`bit_dyn_indexed_memind.s` (bit ops) · `lea_memind_an.s`, `pea_memind.s`,
+`jsr_mem_indexed.s`, `control_full_memind_siblings.s` (LEA/PEA/JMP/JSR)
+
+Every family **without** a classifier has **no** memory-indirect test:
+
+- no `tas_memind.s` — TAS memind is untested
+- no shift/rotate memind test — `shift_mem_word.s` is the plain (`MEMSIMPLE`) memory form
+- no Scc memind test — all six Scc tests (`scc_abs_long`, `scc_mem_an_indirect`,
+  `scc_mem_indexed`, `scc_predec`, `scc_mem_incdec`, `scc_d16_an_disp`) are `MEMSIMPLE`
+  forms, i.e. exactly the forms that already work
+
+The corpus grew a test each time a classifier gap was found and fixed. The three families
+with no test are precisely the three with no classifier — which is why six weeks of
+regression runs never caught this, and why the fuzzer did.
+
+**The fix must therefore ship with three new directed tests** — `tas_memind.s`,
+`shift_mem_memind.s`, `scc_memind.s` — or the corpus keeps the same hole.
+
 ### Proposed fix (NOT YET LANDED — no executed repro yet)
 
 Add the three missing families to all **three** gate lists (`:590`+`:738`, `:244`+`:269`,
