@@ -2823,6 +2823,25 @@ object MicroOpAssembler {
     // didn't have time to fully characterize), so the safe fix is to add the barrier
     // ONLY where it's actually needed (the new memSimple-divisor path, which has no
     // prior working behavior to regress).
+    //
+    // 2026-09-03 (Part 117) -- THE GAP THIS COMMENT LEFT OPEN WAS REAL, AND IT REACHED
+    // HARDWARE. The reg/imm case it deliberately left unprotected is precisely the ROM's
+    // `divsl.l %d2,%d6:%d5` in `_SlotManager $2C` (`SCalcsPointer`), and on a real board
+    // the DIVREM did race ahead: 2 of 14 remainders wrong, two divides with IDENTICAL
+    // operands returning different remainders, an sResource pointer moved by 4, and the
+    // Slot Resource Table enumeration aborted -- a boot hang
+    // (docs/BUG_calibration_word_misplaced_0d00.md Part 116/117). The stated assumption
+    // ("with reg/imm divisors DIV becomes ready fast enough") fails whenever the
+    // dividend's own producer is still in flight when the pair is dispatched.
+    // The fix did NOT go here: this barrier is left exactly as it is (widening it is the
+    // change known to regress those 5 tests, and the root cause of that regression is
+    // still not understood). It went where the hazard actually lives -- DivEuPlugin's
+    // remainder is now carried in a robId-KEYED stash with a per-robId valid bit cleared
+    // on flush (the same structure the multiplier's high product already used), and
+    // IssueQueuePlugin selects the divide family (DIV/DIVREM) IN AGE ORDER so a DIVREM
+    // can never overtake its own DIV. This `srcBValid` dependency is therefore no longer
+    // load-bearing for correctness in either case; it is retained only because removing
+    // it is churn on a path with a known-fragile regression history.
     divremUop.srcBReg       := divlDq; divremUop.srcBValid := divlDivisorIsMem
     divremUop.srcCReg       := 0; divremUop.srcCValid := False
     divremUop.useImm        := False; divremUop.imm := 0
@@ -2936,32 +2955,28 @@ object MicroOpAssembler {
     mullUop.firstOfInstr  := !mullMulIsMem
     mullUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
-    // MULHI (high-product move) µop (.L64 only): CPLX, writes the EU's LATCHED high
-    // product to Dh. The high product itself is an internal EU latch (no real source
-    // for the VALUE) -- but srcA reads Dl (mullUop's OWN destination) purely as a
-    // rename/scoreboard ORDERING BARRIER, task #180 (ported-tests triage
-    // cluster13/muldiv_indexed_mem_src): this used to rely SOLELY on "age-ordered
-    // single-outstanding CPLX issue" (an assumed invariant) -- but IssueQueuePlugin's
-    // CPLX port picks the OLDEST *READY* op each cycle, not a hard "older-blocks-
-    // younger" barrier. With a reg/imm multiplier, MUL became ready fast enough that
-    // deps-free MULHI (pushed one cycle later) never actually got a chance to race
-    // ahead -- but a memSimple multiplier (task #180's new leading-LOAD crack) gives
-    // MUL real latency, and MULHI raced ahead and read `mulHiLatch` before MUL ever
-    // ran, confirmed via PORTED_TRACE_DIV (a stale/garbage writeback landed BEFORE
-    // the MUL's own writeback in the trace). Reading Dl forces the rename scoreboard
-    // to hold MULHI not-ready until MUL's own completion writes it, which is correct
-    // EVERY time regardless of the leading op's latency.
-    // GATED to the memSimple-multiplier case only (srcAValid := mullMulIsMem, not
-    // unconditional True): an earlier version of this fix made the dependency
-    // unconditional and it REGRESSED a previously-PASSING reg/imm ported test
-    // (mull_sz1_64bit_product went from PASS to a different FAIL — actually already
-    // failing on baseline for THIS specific test but the same class of divl_*
-    // regressions was confirmed via a stash-and-rerun bisection for DIVREM's
-    // analogous case) — root cause not fully chased down (something about the extra
-    // same-cycle intra-bundle rename read tripping a scoreboard/free-list
-    // interaction for the reg/imm path this session didn't have time to fully
-    // characterize), so the barrier is added ONLY where it's actually needed (the
-    // new memSimple-multiplier path, which has no prior working behavior to regress).
+    // MULHI (high-product move) µop (.L64 only): CPLX, writes the high product to Dh.
+    // The value has no real source operand -- it comes from DivEuPlugin's high-product
+    // stash. srcA reads Dl (mullUop's OWN destination) purely as a rename/scoreboard
+    // ORDERING nudge, task #180 (ported-tests triage cluster13/muldiv_indexed_mem_src),
+    // gated to the memSimple-multiplier case (`srcAValid := mullMulIsMem`) because an
+    // unconditional version regressed reg/imm behaviour and the root cause was never
+    // chased down (something about the extra same-cycle intra-bundle rename read
+    // tripping a scoreboard/free-list interaction on that path).
+    //
+    // HISTORICAL NOTE, corrected 2026-09-03 (Part 117). This comment used to describe
+    // the barrier as load-bearing against a `mulHiLatch` race. There is no `mulHiLatch`
+    // and there has not been for some time: DivEuPlugin carries the high product in a
+    // robId-KEYED `Mem` with a per-robId valid bit cleared on flush (`mulHiMem` /
+    // `mulHiValid`), and MULHI is parked in `mulHiPendingQ` until ITS OWN robId's bit is
+    // set. An early-issued MULHI therefore WAITS; it cannot read another multiply's
+    // product, with or without this barrier. The divide side had no such structure --
+    // it used a single anonymous global `remLatch` -- which is exactly why the same
+    // race was real there and produced a hardware boot failure
+    // (docs/BUG_calibration_word_misplaced_0d00.md Part 116/117). DivEuPlugin's
+    // remainder now uses the multiplier's structure too. The barrier below is retained
+    // as-is (it is harmless and this is not the place to re-open the reg/imm
+    // regression), but it is NOT what makes MULHI correct.
     // Writes Dh; sets no flags (the MUL set N/Z; V=0).
     val mulhiUop = DecodedUop()
     mulhiUop.debugBreakValid := False; mulhiUop.debugBreakSlot := 0
