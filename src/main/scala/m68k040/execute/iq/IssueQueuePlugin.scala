@@ -495,7 +495,41 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val lsPresent = B(slots.map(s => s.sel && isLs(s.hot)))
     val ohLoldest = OHMasking.first(lsPresent)         // oldest occupied LS slot (ready or not)
     val ohL = ohLoldest & lsReady                      // issue it ONLY if it is ready
-    val ohC = OHMasking.first(cplxReady)
+    // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
+    // DIV.L's remainder does not travel on a renamed physical register: the DIV µop
+    // writes only the quotient and hands the remainder to its trailing DIVREM crack µop
+    // through DivEuPlugin's stash, which the DIVREM moves into Dr. `ohC` picks the
+    // oldest READY CPLX slot, not the oldest slot, and a DIVREM has no dependence on
+    // its DIV's quotient (Dr and Dq are different registers in every remainder-producing
+    // form) -- so it goes ready FIRST whenever the DIV is still waiting on its
+    // dividend/divisor producer, e.g. `move.l %d4,%d5 ; divsl.l %d2,%d6:%d5`, the
+    // MC68040 ROM's `SCalcsPointer` shape. When the stash was a single anonymous global
+    // latch that meant the DIVREM moved a DIFFERENT division's remainder into Dr:
+    // measured on real hardware (BUG_calibration_word_misplaced_0d00.md Part 116/117),
+    // 2 of 14 remainders wrong, quotients correct 14/14, two divides with IDENTICAL
+    // operands returning different remainders, and a boot hang downstream of it.
+    //
+    // DivEuPlugin's stash is now robId-keyed with a per-robId valid bit (the structure
+    // the multiplier's high product already used), so a mis-ordered DIVREM can no longer
+    // read another divide's value -- it would find its OWN entry invalid. This mask
+    // supplies the other half: it makes that case UNREACHABLE, so the DIVREM never has
+    // to wait and needs no pending queue. Mirroring the LS port's in-order discipline
+    // immediately above, but restricted to the divide family: only the OLDEST occupied
+    // DIV/DIVREM slot may be selected, so a DIVREM cannot overtake its own DIV and no
+    // younger DIV can slip between a DIV and its DIVREM. Everything else on the CPLX
+    // port (MUL/MULHI, CHK/CMP2/CHK2, the whole FP family) keeps full out-of-order
+    // selection, and divides were already serialized against each other by the EU's
+    // single-outstanding iterative lane, so the IPC cost is nil.
+    //
+    // Deadlock-freedom is the LS port's argument verbatim: the oldest occupied
+    // divide-family slot is never blocked by this mask, so the family always drains.
+    // OCCUPIED slots only -- an empty slot's `hot.op` is stale and must not be mistaken
+    // for the oldest divide.
+    val divFamPresent = B(slots.map(s => s.sel &&
+      (s.hot.op === m68k040.decode.DecOp.DIV || s.hot.op === m68k040.decode.DecOp.DIVREM)))
+    val divFamOldest  = OHMasking.first(divFamPresent)
+    val divFamBlocked = divFamPresent & ~divFamOldest  // every divide-family slot but the oldest
+    val ohC = OHMasking.first(cplxReady & ~divFamBlocked)
 
     // ---- FMax: REGISTERED issue->operand-read boundary ----
     // The combinational select (above) + MuxOH(contexts) feeding each EU's S0
