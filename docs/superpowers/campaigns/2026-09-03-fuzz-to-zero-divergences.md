@@ -102,7 +102,11 @@ instruction followed, because the DUT retire stream is short by exactly one reco
 | C | committed A7 transiently regresses one index after a `movem` `-(%sp)`/`(%sp)+` pair | **8** | **HARNESS** (round 2: `a7Static` resync replays a >=2-commit-lagged shadow) | root-caused, fix pending one executed test |
 | D | `Scc ([bd,An],Xn,od)` writes `Dn` instead of memory | **1** | **RTL** | root-caused round 2: SAME bug as B |
 
-Totals: 57. RTL = 11, harness = 40, undetermined = 6, oracle-limitation = 0.
+Totals: 57. **As classified in round 1**: RTL = 11, harness = 40, undetermined = 6,
+oracle-limitation = 0. **Superseded by round 2**, which root-caused cluster C as a
+harness artifact too: **RTL = 11 (clusters B + D, one bug), harness = 46 (clusters A + C,
+two separate bugs), oracle-limitation = 0, undetermined = 0.** So 46 of the original 57 —
+81% — were defects in the measuring instrument, not the CPU.
 
 **None of the 57 involve `DIVU`/`DIVS`/`DIVSL`/`DIVUL` remainder behaviour.** The
 `DivEuPlugin` remainder-latch bug being fixed concurrently (`BUG_calibration_word_
