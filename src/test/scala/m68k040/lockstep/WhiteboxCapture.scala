@@ -41,7 +41,14 @@ object WhiteboxCapture {
   // STILL folds into the running architectural state (A7 + CCR) so the NEXT kept
   // record carries it. `a7Static` is the ROB-surfaced ss.a7 (used only for exception
   // steps / when no OoO A7 write has been seen).
-  private final case class NormRec(pc: Long, sysByte: Int, a7Static: Long, wb: Wb, emit: Boolean, msp: Long = -1L, isp: Long = -1L) extends Rec
+  // `macroLast` = the RETIRING µop is its macro-instruction's LAST µop (RobPayload.last
+  // / DecodedUop.lastOfInstr, surfaced on the ROB commit-obs). It matters only for a
+  // DROPPED record: a dropped LEADING µop (BSR/JSR/LINK push, cracked leading load,
+  // source-EA anUpd ADD) folds FORWARD onto its own macro's kept record, which is
+  // emitted later -- correct as-is; a dropped TRAILING µop folds forward onto the NEXT
+  // macro's record, which is one instruction too late. See the `!emit` block in
+  // `result` for the backward fold that fixes it.
+  private final case class NormRec(pc: Long, sysByte: Int, a7Static: Long, wb: Wb, emit: Boolean, msp: Long = -1L, isp: Long = -1L, macroLast: Boolean = false) extends Rec
   // ExcRec: an exception/trap ENTRY or RTE step. `foldNzvc` (>=0) folds the FAULTING
   // instruction's own NZVC write onto the running CCR before this step — needed for
   // CHK, which sets N as it traps but never retires normally (so its Wb is never
@@ -65,7 +72,8 @@ object WhiteboxCapture {
     /** Record a retired NORMAL commit (robId + post-instruction pc + the committed
       * SR system byte + A7), snapshotting the committing instruction's writeback. A
       * cracked-load temp µop (arch ≥ 16, no flags) is DROPPED (decode §4.5). */
-    def onCommit(robId: Int, pc: Long, sysByte: Int = 0x27, a7: Long = -1L, msp: Long = -1L, isp: Long = -1L): Unit = {
+    def onCommit(robId: Int, pc: Long, sysByte: Int = 0x27, a7: Long = -1L, msp: Long = -1L, isp: Long = -1L,
+                 macroLast: Boolean = false): Unit = {
       val wb = wbMap.getOrElse(robId,
         sys.error(s"commit robId=$robId with no writeback observed"))
       val isTempOnly = wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
@@ -77,7 +85,7 @@ object WhiteboxCapture {
       // macro instruction's single kept oracle step (its trailing store is an rmwStore
       // drop), so keep it even though it writes only a temp.
       val emit = (!isTempOnly && !wb.divRem) || wb.keepCommit
-      commits += NormRec(pc, sysByte, a7, wb, emit, msp, isp)
+      commits += NormRec(pc, sysByte, a7, wb, emit, msp, isp, macroLast)
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
@@ -141,15 +149,24 @@ object WhiteboxCapture {
       // MOVEM push/pop: a7Static replays 0x000ffffc, which a7Run held one step earlier
       //   -> suppressed (this is cluster C).
       // IRQ frame push:  a7Static becomes 0x000ffff8, never held by a7Run -> resync.
+      // WINDOW DEPTH (Part 124): this queue is indexed in RECORDS -- i.e. RETIRED µops --
+      // but the lag it has to span is measured in COMMIT CYCLES, and one macro can
+      // contribute several µops (a mem-dest RMW is 3, a MOVEM many more). A 4-deep window
+      // was therefore too tight the moment a couple of multi-µop macros sat between an
+      // A7 write and the lagging `ss.a7` shadow catching up: MEASURED, adding three plain
+      // seeding MOVEs ahead of `tst.l (%sp)+` pushed the pre-write value out of a 4-deep
+      // window and the shadow then "resynced" A7 backwards to the boot SSP. 16 keeps the
+      // discriminator's intent (a replayed lag value is one a7Run held VERY recently; a
+      // genuine exception push is a value it has NEVER held) with room for µop density.
       val a7Recent = mutable.Queue[Long]()          // bounded a7Run history (lag window)
       def a7Seen(v: Long): Boolean = a7Recent.contains(v)
-      def a7Note(v: Long): Unit = { a7Recent.enqueue(v); if (a7Recent.size > 4) a7Recent.dequeue() }
+      def a7Note(v: Long): Unit = { a7Recent.enqueue(v); if (a7Recent.size > 16) a7Recent.dequeue() }
       var lastSysSm: Int = -1
       // Built into a buffer (not a flatMap) so a DROPPED crack-tail record can be folded
       // BACK into the step it belongs to -- see the archReg2* block below.
       val out = mutable.ArrayBuffer[CommitObservation]()
       commits.toSeq.foreach {
-        case NormRec(pc, sysByte, a7Static, wb, emit, msp, isp) =>
+        case NormRec(pc, sysByte, a7Static, wb, emit, msp, isp, macroLast) =>
           // (2) bank switch: the (S,M) selector changed -> ss.a7 now names a different
           //     bank, a change no arch-15 writeback can express. (3) seed the first value.
           val sysSm = ((sysByte >> 5) & 1) * 2 + ((sysByte >> 4) & 1)   // S,M selector
@@ -199,6 +216,47 @@ object WhiteboxCapture {
               val prev = out(out.size - 1)
               out(out.size - 1) = prev.copy(
                 archReg2Id = wb.dstArch, archReg2Write = wb.result, archReg2Valid = true)
+            }
+            // ---- TRAILING dropped µop -> fold BACKWARD into its own macro's record ----
+            // Part 124. The forward-fold contract documented on `NormRec.emit` ("its
+            // arch-reg write STILL folds into the running state so the NEXT kept record
+            // carries it") is correct ONLY for a dropped µop that LEADS its macro -- a
+            // BSR/JSR/LINK stack push, a cracked leading load, a source-EA `anUpdUop`.
+            // For those the next kept record IS the same macro's.
+            //
+            // It is WRONG for a dropped µop that TRAILS its macro, which is exactly the
+            // `(An)+`/`-(An)` auto-update folded onto the STORE of a memory-destination
+            // RMW: `CLR/NEG/NEGX/NOT/TAS <ea>` (crackClr/crackRmw), `Scc <ea>`, `CAS`.
+            // There the macro's kept record is the OP µop (it owns NZVC) and the An
+            // write lands one µop later, so the forward fold attributed the new An to
+            // the NEXT INSTRUCTION's step -- a measured one-instruction lag.
+            //
+            // For An != A7 that was invisible (the dropped store's arch write was never
+            // compared at all -- the same coverage hole `secondDst` above was added to
+            // close). For An == A7 the harness compares `a7` on EVERY step, so it
+            // surfaced as a hard divergence: `CLR.L (%sp)+ -> a7: dut=0x3000
+            // oracle=0x3004`. MEASURED, not inferred: the DUT's architectural A7 is
+            // correct and the very next instruction reads the post-incremented value
+            // (`clr.l (%sp)+ ; move.l %sp,%d1` yields D1=0x3004, and the ROM's
+            // `clr.l (%sp)+ / move.w %sp,%d0 / bne` loop exits with a PC sequence
+            // byte-identical to Musashi's).
+            //
+            // `pc` guard: every µop of one macro carries the same post-instruction pc
+            // (the macro's nextPc), so a mismatch means this is not the record's macro
+            // and the fold is skipped rather than corrupting a neighbour.
+            else if (macroLast && wb.intWrite && wb.dstArch < 16 && out.nonEmpty &&
+                     out(out.size - 1).pc == pc) {
+              val prev  = out(out.size - 1)
+              val isA7  = wb.dstArch == 15
+              out(out.size - 1) = prev.copy(
+                a7  = if (isA7) a7Run else prev.a7,
+                msp = if (isA7 && sBitN == 1 && mBitN == 1) a7Run else prev.msp,
+                isp = if (isA7 && sBitN == 1 && mBitN == 0) a7Run else prev.isp,
+                // Also CLOSE the coverage hole for a NON-A7 base: the auto-updated An of
+                // a mem-dest RMW was never compared against the oracle before this.
+                archReg2Id    = if (prev.archReg2Valid) prev.archReg2Id    else wb.dstArch,
+                archReg2Write = if (prev.archReg2Valid) prev.archReg2Write else wb.result,
+                archReg2Valid = true)
             }
           } else out += CommitObservation(
             pc = pc, archRegId = if (isTemp) 0 else wb.dstArch,

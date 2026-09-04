@@ -2609,6 +2609,17 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // invalid (every fault/RTE/interrupt obs leaves the running CCR via the fold path).
       val setCcr5      = UInt(5 bits)
       val setCcr5Valid = Bool()
+      // Macro-boundary LAST marker of the RETIRING entry (`RobPayload.last`, i.e.
+      // `DecodedUop.lastOfInstr`). The lock-step whitebox needs it to tell a DROPPED
+      // crack µop that LEADS its macro (a BSR/JSR/LINK stack push, a cracked leading
+      // load) from one that TRAILS it (the (An)+/-(An) auto-update folded onto a
+      // mem-dest RMW/CLR/Scc store). Both are dropped for step alignment and both may
+      // carry a real architectural An write, but only the TRAILING one lands AFTER its
+      // macro's kept commit record -- so only that one has to be folded BACKWARD into
+      // the record already emitted. Without this bit the whitebox folded it FORWARD
+      // onto the NEXT instruction's record instead, reporting A7 one instruction late
+      // for `CLR/NEG/NEGX/NOT/TAS/Scc <ea>` with an (A7)+/-(A7) EA (Part 124).
+      val macroLast = Bool()
     }
     // Task #249: sim-only like every other tap in this section (pcStore above,
     // faultedStore.simPublic, etc.), but unlike its sibling `pcStore` this whole
@@ -2629,10 +2640,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       obs(0).sysByte := RegNext(exc.ss.srSys); obs(0).a7 := RegNext(exc.ss.a7); obs(0).isInterrupt := False
       obs(0).ccrFold := 0; obs(0).ccrFoldValid := False
       obs(0).setCcr5 := 0; obs(0).setCcr5Valid := False
+      obs(0).macroLast := RegNext(p0.last) init False
       obs(1).fire := RegNext(retire1) init False; obs(1).robId := RegNext(h1); obs(1).pc := RegNext(commitPc1)
       obs(1).sysByte := RegNext(exc.ss.srSys); obs(1).a7 := RegNext(exc.ss.a7); obs(1).isInterrupt := False
       obs(1).ccrFold := 0; obs(1).ccrFoldValid := False
       obs(1).setCcr5 := 0; obs(1).setCcr5Valid := False
+      obs(1).macroLast := RegNext(p1.last) init False
       // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
       // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
       // so the whitebox folds it (the faulting µop's Wb never retires normally).
@@ -2648,6 +2661,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // MOVE-to-SR's absolute CCR write (registered alongside the obs pulse).
       obs(2).setCcr5      := RegNext(exc.obsSetCcr5)
       obs(2).setCcr5Valid := RegNext(exc.obsFire && exc.obsSetCcr5Valid) init False
+      // Channel 2 is the exception/RTE pseudo-instruction step (ExcRec), which is never
+      // a cracked macro's trailing µop -- the whitebox never consults macroLast there.
+      obs(2).macroLast := True
       obs
     }
   }

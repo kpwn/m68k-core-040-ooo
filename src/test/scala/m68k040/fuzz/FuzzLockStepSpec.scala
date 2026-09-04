@@ -132,7 +132,7 @@ object FuzzRunner {
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
               sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
             // Task #144: directly map robId -> the lock-step comparator's own "idx"
             // (handle.result.size right after this commit is processed), sidestepping
             // ALL manual PC-arithmetic/instruction-length correlation -- the previous

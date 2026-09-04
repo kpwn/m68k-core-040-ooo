@@ -157,7 +157,7 @@ class MiHangTraceSpec extends AnyFunSuite {
             handle.onCommit(c.robId.toInt, pc,
               sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
           }
         }
         if (firedThisCycle == 2) println(f"[mihang] *** DUAL-RETIRE this cycle (both ports fired) ***")

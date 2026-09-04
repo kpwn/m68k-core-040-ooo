@@ -756,7 +756,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
               sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
           }
         }
         // Exception / RTE commit channel (handler-entry / restored PC + sysByte/A7).
@@ -964,6 +964,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(handle.result.size >= n,
         s"[$name] only ${handle.result.size}/$n instructions committed within $cap cycles")
 
+      // Macro-boundary DRAIN (Part 124). The loop above stops the instant the n-th
+      // oracle-aligned record appears, which is the n-th macro's KEPT commit -- not
+      // necessarily its LAST µop. A macro whose trailing µop is DROPPED but still
+      // carries an architectural write (the `(An)+`/`-(An)` auto-update folded onto a
+      // mem-dest RMW/CLR/Scc store) has that write fold BACKWARD into the n-th record
+      // (WhiteboxCapture's `macroLast` branch), so cutting the sim off at the kept
+      // commit leaves the LAST compared step -- and only the last -- reporting the
+      // pre-update An/A7. Let the tail µops retire before reading `handle.result`.
+      // Extra records beyond n are discarded by `take(n)`; every lock-step program ends
+      // in a `bra .stop` self-loop, so the extra cycles retire nothing else of interest.
+      cd.waitSampling(24)
+
       if (pcOnly) {
         // See the `pcOnly` doc comment above: verify ONLY that the committed PC sequence
         // (front-end framing / nextPc) matches the oracle for all `n` steps — the exact
@@ -1163,7 +1175,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             }
             handle.onCommit(c.robId.toInt, pc, sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
           }
         }
         {
@@ -4319,7 +4331,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean)
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+              isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         val ce = dut.rob.logic.commitObs(2)
         if (ce.fire.toBoolean) {
@@ -6599,7 +6611,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         captureExc()
       }
@@ -6787,7 +6799,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         captureExc()
       }
@@ -6905,7 +6917,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
           sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
           msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+          isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
       }
       val ce = dut.rob.logic.commitObs(2)
       if (ce.fire.toBoolean) handle.onExcCommit(ce.pc.toLong & 0xffffffffL, ce.sysByte.toInt & 0xff, ce.a7.toLong & 0xffffffffL,
@@ -7889,15 +7901,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x3000,%a0 ; move.l %a0,%sp ; clr.l (%sp)+ ; clr.l (%sp)+ ; moveq #7,%d3 ; " +
       ".stop: bra .stop", nInstr = 6)
   }
+  // TST/NOT READ memory, so both operands must be SEEDED first: the DUT's SparseMemory
+  // fills unwritten bytes with a PRNG pattern while Musashi's does not, so a lock-step
+  // program that reads never-written memory diverges on flags for a reason that has
+  // nothing to do with the instruction under test (Part 124 -- as originally written
+  // these two failed on `ccr`, not on `a7`, and that CCR mismatch was the fill, not the
+  // DUT).
   test("lock-step p123d: TST.L (%sp)+ postincrement (A7, non-writing single-EA)", VerilatorTest) {
     runLockStep("p123d-tst-l-a7-postinc",
-      "move.l #0x3000,%a0 ; move.l %a0,%sp ; tst.l (%sp)+ ; tst.l (%sp)+ ; moveq #7,%d3 ; " +
-      ".stop: bra .stop", nInstr = 6)
+      "move.l #0x3000,%a0 ; move.l #0x80000000,(%a0) ; move.l #0x00000000,4(%a0) ; " +
+      "move.l %a0,%sp ; tst.l (%sp)+ ; tst.l (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 8)
   }
   test("lock-step p123d: NOT.L (%sp)+ postincrement (A7, RMW single-EA)", VerilatorTest) {
     runLockStep("p123d-not-l-a7-postinc",
-      "move.l #0x3000,%a0 ; move.l %a0,%sp ; not.l (%sp)+ ; not.l (%sp)+ ; moveq #7,%d3 ; " +
-      ".stop: bra .stop", nInstr = 6)
+      "move.l #0x3000,%a0 ; move.l #0xFFFFFFFF,(%a0) ; move.l #0x0F0F0F0F,4(%a0) ; " +
+      "move.l %a0,%sp ; not.l (%sp)+ ; not.l (%sp)+ ; moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 8)
   }
   test("lock-step p123d: MOVE.L #0,(%sp)+ postincrement (A7, via the MOVE path)", VerilatorTest) {
     runLockStep("p123d-move-l-a7-postinc",
@@ -7941,6 +7961,55 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
       "moveq #7,%d3 ; " +
       ".stop: bra .stop", nInstr = 55)
+  }
+  // ── Part 124: the FULL single-EA (An)+/-(An) auto-update matrix ────────────────
+  // Every CLR/NEG/NEGX/NOT/TST x B/W/L x {A7, non-A7} x {postincrement, predecrement}.
+  // A7 is the interesting column: a BYTE access on A7 must move the stack pointer by 2,
+  // not 1, and word/long must still move 2/4.  Each case ALSO reads the updated pointer
+  // back into a data register (`move.l %a0,%d4` ...), so the auto-update is verified
+  // through an ordinary architectural register compare and not only through the `a7`
+  // field -- the two are independent oracles and Part 124 needed both.
+  // The 8 scratch bytes at 0x3000 are SEEDED first: the DUT's SparseMemory fills
+  // unwritten bytes with a PRNG pattern that Musashi does not reproduce, so any
+  // lock-step program that READS never-written memory diverges on flags for reasons
+  // unrelated to the instruction under test.
+  for (mnem <- Seq("clr", "neg", "negx", "not", "tst"); sz <- Seq("b", "w", "l")) {
+    test(s"lock-step p124: ${mnem.toUpperCase}.${sz.toUpperCase} (An)+/-(An) auto-update, A7 and non-A7", VerilatorTest) {
+      runLockStep(s"p124-$mnem-$sz-autoupd",
+        "move.l #0x3000,%a1 ; move.l #0x81234567,(%a1) ; move.l #0x0F0F0F0F,4(%a1) ; " +
+        "move.l %a1,%a0 ; move.l %a1,%sp ; " +
+        s"$mnem.$sz (%a0)+ ; move.l %a0,%d4 ; " +
+        s"$mnem.$sz (%sp)+ ; move.l %sp,%d5 ; " +
+        s"$mnem.$sz -(%a0) ; move.l %a0,%d6 ; " +
+        s"$mnem.$sz -(%sp) ; move.l %sp,%d7 ; " +
+        "moveq #7,%d3 ; .stop: bra .stop", nInstr = 15)
+    }
+  }
+  test("lock-step p124: the ROM stack-clear entry at the REAL low SP (0 -> 4 -> 8)", VerilatorTest) {
+    // The hardware wedge sits at SP = 0x00000004, not at a comfortable scratch address:
+    // the ROM does `moveal %a1@,%sp` (-> 0), `movel %d5,%sp@+` (-> 4), then the CLR loop.
+    // Reproduced here verbatim so the low-address / vector-table region is exercised by
+    // the same MOVE-store-then-CLR-store sequence. It PASSES -- i.e. the low address is
+    // not the discriminator either, which is part of why Part 124 concludes the
+    // remaining hardware wedge is not in the auto-update path.
+    runLockStep("p124hw-lowsp",
+      "move.l #0x3000,%a1 ; move.l #0,(%a1) ; move.l #0xFFFFFFFF,%d5 ; moveq #0,%d0 ; " +
+      "move.l (%a1),%sp ; move.l %d5,(%sp)+ ; " +
+      "clr.l (%sp)+ ; move.l %sp,%d1 ; clr.l (%sp)+ ; move.l %sp,%d2 ; " +
+      "moveq #7,%d3 ; .stop: bra .stop", nInstr = 12)
+  }
+  test("lock-step p124: the ROM stack-clear loop MUST EXIT at the 64 KiB boundary", VerilatorTest) {
+    // The real exit condition of the ROM's 0x4084BECE loop is `MOVE.W A7,D0` setting Z,
+    // i.e. SP reaching a 64 KiB boundary -- NOT a 0x1000 boundary as the Part 123 test
+    // above assumed, which is why that test never actually exercised the exit. Start SP
+    // 16 bytes below 0x10000 so the loop runs exactly 4 iterations and must terminate;
+    // `pcOnly` compares the retired PC sequence against Musashi's, so a DUT that never
+    // advances SP (the Part 123 hypothesis) diverges instead of matching all 22 steps.
+    runLockStep("p124-rom-stackclear-exit",
+      "move.l #0x0000FFF0,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+      ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 22, pcOnly = true)
   }
   test("lock-step fullext: CMPI.L #imm,(bd.L,An) IS=1 -- the ROM 0x0CB0/0x8170 shape", VerilatorTest) {
     // a0=0x3000, bd=0x10000 (forces BD-SIZE=long), index suppressed -> EA = 0x13000.
@@ -8354,7 +8423,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         captureExc()
       }
@@ -8612,7 +8681,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         captureExc()
       }
@@ -8825,7 +8894,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
-            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
         }
         captureExc()
       }
