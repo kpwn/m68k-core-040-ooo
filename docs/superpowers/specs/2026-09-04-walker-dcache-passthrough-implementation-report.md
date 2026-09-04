@@ -1,7 +1,9 @@
 # Walker → D-cache passthrough — implementation report
 
 **Status:** IMPLEMENTED. RTL landed, directed acceptance test fails-before / passes-after,
-regression sweeps reconciled. Synth gate queued behind a committed launcher (§8).
+every regression sweep run and reconciled (§5), 200-seed fuzz **unchanged at 3**. The
+postroute synth gate is **LAUNCHED and IN FLIGHT** via a committed launcher (§8); its
+result is the one thing this document does not contain. Do not merge without it.
 **Date:** 2026-09-04
 **Branch:** `feat/walker-dcache-passthrough`, worktree
 `/home/qwertyoruiop/m68k-core-040-ooo-worktrees/walker-dcache`
