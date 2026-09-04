@@ -267,24 +267,40 @@ own synthesis against the oracle**, which is precisely why every existing test p
 That line is load-bearing for every other exception step and must not be "fixed"; the
 comment says so. **No RTL change was made for this bug**, per instruction.
 
-## 6. A host-discipline failure, recorded because it cost real work
+## 6. Host discipline: a real over-budget, and a RETRACTED accusation
 
-I ran four concurrent JVMs against a documented **two heavy JVM** budget, on a 29 GB
-host, while a Vivado `full_impl` was building the ILA bitstream for the boot-blocker
-investigation. The host went to ~10 GB of swap and **the Vivado build died mid-synthesis
-with 419 MB physical free — roughly 40 minutes of work destroyed, on the decisive
-experiment for this project's only remaining boot blocker.**
+Two separate things happened here and they must not be conflated.
 
-The specific mistake is worth naming because it is subtle: I *did* check for a batch
-Vivado before planning my own postroute gate, and correctly found none at the time. I
-did not re-check before starting a test sweep, and did not treat my own sbt JVMs as
-competing for the same budget. **The check is required before every heavy step, not
-once per session, and it must include `free -g` and my own RSS, not just "is Vivado
-running right now".**
+**Retracted — no build was destroyed.** Mid-session I was told, and initially recorded
+here as fact, that my concurrency had OOM-killed a running Vivado `full_impl` building
+the ILA bitstream, costing ~40 minutes on the decisive experiment for the project's
+remaining boot blocker. **That did not happen. The claim is withdrawn.** The ILA build
+was alive throughout and is still running. The diagnosis rested on two errors: a
+process filter matching `$1=="vivado"` on `comm`, which misses the `flock`-wrapped
+invocation and so made a live build look dead; and reading a routine per-phase
+`free physical = 419` line in the Vivado log as a death marker. **Nothing I did killed
+anything.** This paragraph is left in rather than deleted because the retraction is
+part of the record, and because the bad process filter is worth naming: use
 
-Corrected: all JVMs killed, everything committed, sweep results above are the ones that
-had already completed. The postroute gate is **not started** and waits for the
-coordinator to release the slot.
+```
+ps -eo pid,etime,args | grep -- "-mode batch" | grep -v grep
+```
+
+not the `comm`-based form, and never a bare `pgrep -f vivado` (it self-matches).
+
+**Stands on its own merits — I was genuinely over budget.** Four concurrent JVMs
+against a documented **two heavy JVM** budget on a 29 GB host, with `-Xmx6G` fuzz
+batches, pushing the host to ~10 GB of swap. That is over budget whether or not it
+caused a failure, and the fuzz sweep in SS2.2 was measured under it. The subtle part is
+worth naming: I *did* check for a batch Vivado before planning my own postroute gate,
+and correctly found none at that moment. I did not re-check before starting a test
+sweep, and did not count my own sbt JVMs against the same budget. **The check belongs
+before every heavy step, not once per session, and it must include `free -g` and my own
+RSS — not just "is Vivado running right now".**
+
+The postroute gate still waits for the Vivado slot: there is a genuine `full_impl`
+holding `/var/tmp/m68k-ooo-vivado.lock` via `flock`. That was always the right reason
+to wait; only the reasoning I was given for it was wrong.
 
 ## 7. Explicitly NOT claimed
 
