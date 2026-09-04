@@ -707,3 +707,47 @@ silent-corruption bugs.
    change. Size it on the remaining throughput/area grounds alone.
 5. **`W27`'s split-leg rows and `WalkerSplitLoadRaceSpec`** should be formally struck from
    the plan, not left as unexecuted tasks: the logic they cover is unreachable at this HEAD.
+
+---
+
+## 11. Reproducing every number in this document
+
+All branches are in `/home/qwertyoruiop/m68k-core-040-ooo` and its worktrees. None is
+merged.
+
+| Branch | What it is |
+|---|---|
+| `feat/walker-dcache-passthrough` | the change |
+| `measure/walker-dcache-failbefore` | `bb3bca1` + the acceptance test adapted to the pre-change DUT surface — the fail-before arm, reproducible rather than only quoted |
+| `measure/walker-dcache-netname-control` | the change with the walker legs tied off at identical line numbers — the FMax net-renaming control (§8) |
+| `measure/walker-dcache-walkcost` | the change + the latency-microbenchmark suite, harness adapted |
+| `bench/walk-kernel-premise-fix` | the sibling suite's `kTlbChase` premise fix (§5.5), off its own branch |
+
+```bash
+# ── the acceptance test, both directions ──────────────────────────────────────
+sbt 'testOnly m68k040.mmu.WalkerDescriptorCoherencySpec'      # on the change: 2/2 pass
+#   ... and on measure/walker-dcache-failbefore:                              2/2 FAIL
+
+# ── regression sweeps (run the same two on bb3bca1 for the baseline column) ──
+make test-fast
+sbt 'testOnly m68k040.mmu.* m68k040.ls.* m68k040.cache.*'
+sbt 'testOnly m68k040.lockstep.ExecuteLockStepSpec'
+tools/fuzz/sweep.sh 0 200 25 20        # 3 divergences: seeds 80, 109, 127
+
+# ── the walk-cost measurement, on measure/walker-dcache-walkcost and on
+#    bench/walk-kernel-premise-fix for the baseline column ─────────────────────
+MB_ONLY=mmu MB_SEEDS=5            sbt 'testOnly m68k040.bench.MicrobenchSpec -- -z "68040 OoO latency"'
+MB_ONLY=mmu MB_SEEDS=3 IPC_MEM=l2 sbt 'testOnly m68k040.bench.MicrobenchSpec -- -z "68040 OoO latency"'
+# the bimodality diagnostic itself, on bench/walk-kernel-premise-fix:
+MB_WALKDIAG=1 MB_SEEDS=5 sbt 'testOnly m68k040.bench.MicrobenchSpec -- -z "DIAG"'
+
+# ── the postroute gate (§8). Queues on the mutex; waits for JVMs to drain. ────
+synth/run_walker_dcache_gate.sh bb3bca1 baseline HEAD walker-dcache
+synth/run_walker_dcache_gate.sh measure/walker-dcache-netname-control control  # if needed
+```
+
+**Two host rules the numbers depend on**, both learned the hard way on this machine:
+never start a Vivado build while another agent's JVMs are resident (a KU5P `full_impl`
+peaks at 12–15 GB against 29 GB total), and probe the mutex with
+`flock -n /var/tmp/m68k-ooo-vivado.lock -c true` — **never** with
+`pgrep -af 'vivado.*-mode batch'`, which self-matches. The launcher does both.
