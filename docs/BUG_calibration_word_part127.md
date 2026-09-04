@@ -36,7 +36,11 @@
   runs exactly 8 iterations and exits at `0x4084BED4`, from the board's own
   `A5 = 0x03FFFFD4` / post-push `SP = 0x03FFFFE0`, with the posture measured (not
   assumed): `mmuEn = 1` in **0 of 130,133** cycles, `fastSt = 1` in **0** — every store
-  precise — and ~25 cycles per iteration of real AXI round trip. SS6.
+  precise — and ~25 cycles per iteration of real AXI round trip. **The obvious
+  objection — "the fast-boot ROM patches removed the trigger" — was closed by
+  measurement, not argument**: a `chime-skip`-ONLY boot (nothing bounded but the
+  startup chime) reaches the routine at retire 3,152,146 and behaves identically.
+  SS6.
 * **Part 126 SS6(e)'s "the trigger requires microarchitectural state accumulated by a
   real boot" is now doubtful.** The ROM's RAM diagnostics run **after** `0x4084BEA8`
   (first entry at retire ≈ 6,436), proven by a `checksum-fast,chime-skip` arm being
@@ -382,7 +386,8 @@ The `clr.l (%sp)+` loop at `0x4084BECE` runs **exactly 8 iterations and exits at
 `0x4084BED4`** — the arithmetically correct count for `SP: 0x03FFFFE0 → 0x04000000`,
 matching MAME and Part 126 SS6(e)'s verbatim stub. Observed on both entries to the
 routine (retires 6471–6499 → exit 6503, and 8256–8284 → exit 8288) and reproduced
-byte-identically by three independent processes.
+byte-identically by four independent processes (md5 `634daa045d218e15246463a6c8cb3083`
+of the retire stream through retire 6520).
 
 `+watch_pa` confirms board-exact state: bank base `0x00000000` at `0x03FFFFD4`, size
 `0x04000000` at `0x03FFFFD8`, terminator `0xFFFFFFFF` at `0x03FFFFDC` — hence
@@ -424,17 +429,32 @@ full boot on that basis. Two measurements weaken that:
 * **The wedge routine runs EARLY.** First entry at retire ≈ 6,436 / cycle ≈ 105,563.
 * **The ROM's RAM diagnostics run AFTER it.** A `checksum-fast,chime-skip` arm with
   the RAM diagnostics **fully unbounded** is byte-identical — same retire indices *and*
-  same `sim_time` stamps — through the whole wedge routine (md5 of the retire stream
-  through retire 6520 matches). So execution through this routine is deterministic and
-  **independent of `meminit-fast`**, and the residue delta versus a stock boot at first
-  entry reduces to the ROM self-checksum sweep plus a delay loop.
+  same `sim_time` stamps — through the whole wedge routine. So execution through this
+  routine is deterministic and **independent of `meminit-fast`**, and the residue delta
+  versus a stock boot at first entry reduces to the ROM self-checksum sweep plus a
+  delay loop.
+* **And that last delta was closed too, by measurement rather than argument.** The
+  honest objection to any fast-boot result is that the patches removed the trigger, and
+  `clean-fastdiag` is *not* residue-neutral. So a control was run with **`chime-skip`
+  alone** — nothing bounded except the startup chime, i.e. the ROM self-checksum sweep
+  runs in full. It reached `0x4084BEA8` at **retire 3,152,146 / cycle 10,200,364**, ran
+  **exactly 8** `CLR`s, and exited at `0x4084BED4`, with **zero writes to address 0 in
+  3.15 M retires**. The only remaining difference from a stock boot is idle time in a
+  two-instruction chime loop that touches no data memory.
 
 So there is much less accumulated residue in front of the wedge routine than Part 126
 assumed, Part 126's own six lock-step cases and three stubs were closer to the real
 entry conditions than it credited them for, and **a very long checkpointed boot is a
-much weaker bet than it looked**. For scale: a plain unpatched boot runs at ~9,450
-cycles/s, so the board's ~2.5e9 cycles to the wedge is ~66 hours of simulation; the
-same routine is reached in ~12 s with `clean-fastdiag,chime-skip`.
+much weaker bet than it looked** — Part 126's "suggested next step, in priority order"
+should be considered superseded.
+
+For scale: a plain unpatched boot runs at **~9,450 cycles/s**, so the board's ~2.5e9
+cycles to the wedge is **~66 hours** of simulation and is not reachable; the same
+routine is reached in ~12 s with `clean-fastdiag,chime-skip`, and in a few minutes with
+`chime-skip` alone. A plain `calibration-fix` boot spent 10.2 M cycles in the ROM
+checksum loop and then 22.8 M more in the ASC chime `DBF` loop at `0x40807118`, never
+touching `0x4084BE` in 33,162,057 cycles / 4,558,084 retires — which is where the 66
+hours goes, and why `chime-skip` alone is the right control rather than a longer wait.
 
 > **A caution about `mame-fastdiag`, deliberately NOT used:** its
 > `alias-probe-mame-state` blob-patches ROM `0x4bb74` and jumps to `0x4084bc38` with
@@ -563,7 +583,9 @@ Both should be copied into a comment block next to the plusarg parsing in
 Companion artefacts (under `macqd700-soc-worktrees/m68k040ooo-integration/build/`, and
 therefore sweepable): `wedge_hunt/RESULTS.md`, `wedge_hunt/INSTRUMENT-TRAPS.md`,
 `wedge_hunt/pipe_trace_clrloop.txt` (the 401-cycle correct-behaviour baseline a silicon
-capture should be diffed against), and the `run_*.sh` scripts.
+capture should be diffed against), `wedge_hunt/pipe_trace.txt` (64 MB),
+`wedge_hunt_chimeonly/pcdump.txt` (the decisive `chime-skip`-only control), the
+`pcdump*.txt` files, and six `run_*.sh` scripts.
 
 ---
 
