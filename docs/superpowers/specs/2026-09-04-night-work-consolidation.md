@@ -41,12 +41,18 @@ coordinator; SS8 states exactly what is being proposed.
   fixed** (correctly — each needs its own test and gate): the RAS `checkpointSave`
   proxy is unsound against frontend run-ahead, and slot-1 CALLS never push the RAS at
   all. SS4.
-* **Postroute gate: NOT RUN — pending the Vivado slot.** A genuine `full_impl` (the
-  ILA bitstream for the boot-blocker investigation) holds
-  `/var/tmp/m68k-ooo-vivado.lock` via `flock`. The netlist for the gate is generated
-  and pinned (SS2.5) so the gate itself needs no JVM. **No WNS/TNS is claimed.** SS6
-  also records a host-budget violation of mine, and retracts an accusation built on
-  top of it that turned out to be unfounded.
+* **Postroute: the merge COSTS 5.107 MHz, and it is not noise.** Postroute WNS
+  **-0.037 → -0.170 ns**, FMax **198.531 → 193.424 MHz**, TNS **-1.293 → -77.060 ns**,
+  failing endpoints **73 → 1 136**, LUTs **+2 197**. Both arms ran back-to-back holding
+  the project's own `flock`, uncontended. A third arm (two-tier only) splits it:
+  **two-tier -0.060 ns / -2.34 MHz** (87 % of the added LUTs), **Part 127 and the rest
+  -0.073 ns / -2.77 MHz** (13 % of the LUTs — deep, not wide). SS4b-4d. This is the
+  two-tier reschedule's first postroute measurement; its IPC gains were reported
+  without it.
+* **One inference RETRACTED inside this document:** I first read `earlySuppressFe`
+  appearing on the 5th-worst path as evidence that `earlyHit`'s PC compare costs. The
+  two-tier-only arm shows that term in the violated set **zero** times, so it is a
+  symptom of combined congestion, not a demonstrated independent cost. SS4d.
 
 ---
 
@@ -149,8 +155,23 @@ Evidence that it is a flake and not a merge regression, in order of strength:
    before Part 127.
 4. Every `ExecuteLockStepSpec` case runs under a fresh SpinalSim seed
    (`Start FullCoreDut case-N simulation with seed …`), and uninitialised registers
-   randomise per seed — the same mechanism that makes the RAS test fail two different
-   ways (SS4).
+   randomise per seed.
+5. **It fits a seed-flake class independently established elsewhere in this campaign
+   the same day.** A sibling agent found `AguCrossSpec` passing at clean HEAD under seed
+   `646783385` and failing under `2008931150`, and `RobPluginSpec`'s `debugPcApply`
+   timing out at exactly 200/200 under `1996078524` while passing 44/44 standalone.
+   The mechanism named there applies here directly and explains the one thing my own
+   first three points did not: **adding tests shifts SpinalSim's seed sequence.** The
+   merged tree carries +39 `ExecuteLockStepSpec` cases over mainline, so every
+   downstream case runs under a *different* seed than it does on mainline — which is
+   exactly why a latent seed-sensitive assertion would fire on the merged tree and never
+   on the baseline, with no behavioural difference between them at all.
+
+I followed the protocol that class prescribes: re-run standalone (passed 2/2), and
+re-run a pristine baseline **in the same session** so the seed sequence is comparable
+(three runs, 466/2 each). The counts reconcile arithmetically —
+`468 mainline + 39 new − 1 removed − 1 parked = 505 run + 1 ignored`, which is what the
+final post-edit run reports.
 
 What is **not** claimed: that it is harmless. An AR-ID reuse violation is the same
 class as `72f0cbc fix(icache): close AXI-ID-reuse deadlock`, so a rare surviving path
@@ -280,6 +301,106 @@ Both that and the sound RTL fix (a retire-driven committed shadow, mirroring
 retire) are **scoped and not started**. They are retire-path plumbing and need their
 own design pass, test and gate.
 
+## 4b. The postroute gate: the merge costs 5.1 MHz, and it is not noise
+
+`synth/impl_FullCore.tcl`, stock flow, `POSTROUTE_ROUNDS` default 9, 5.000 ns sign-off.
+**Both arms ran back-to-back on the same machine, each holding
+`/var/tmp/m68k-ooo-vivado.lock` exclusively via `flock`**, so neither overlapped the
+other, the ILA build, or any JVM. This is the A/B the brief asked for, on postroute and
+not on OOC.
+
+| | baseline `afbabdd` | + two-tier ONLY | full merge (3 branches) |
+|---|---|---|---|
+| **postroute WNS** | **-0.037 ns** | **-0.097 ns** | **-0.170 ns** |
+| **achieved FMax** | **198.531 MHz** | **196.194 MHz** | **193.424 MHz** |
+| **TNS** | **-1.293 ns** | **-16.907 ns** | **-77.060 ns** |
+| failing endpoints | 73 / 168 004 | 395 / 168 112 | 1 136 / 168 204 |
+| CLB LUTs | 97 778 (45.07 %) | 99 681 (45.94 %) | 99 975 (46.08 %) |
+| post-synth WNS | -0.989 ns | -1.559 ns | -2.108 ns |
+| hold (WHS / THS) | +0.010 / 0.000 | +0.012 / 0.000 | +0.023 / 0.000 |
+| verdict | `FAILED_AT_200` | `FAILED_AT_200` | `FAILED_AT_200` |
+
+**The merge costs 5.107 MHz (-0.133 ns WNS). That is a real regression, not noise, and
+it should not be waved away with the 0.919 ns figure** — that noise floor is for the
+*OOC* gate, and this is postroute. Four independent things say so:
+
+1. **TNS moved 60x and the failing-endpoint count 15.6x.** Noise moves WNS on one path;
+   it does not take 73 failing endpoints to 1 136.
+2. **The convergence shapes differ.** Baseline plateaus at -0.037 from round 4 and holds
+   flat to round 9; the two-tier arm plateaus at -0.097 from round 3. The full merge is
+   *still improving at round 9* (-0.639 → -0.332 → … → -0.183 → -0.170) — a netlist the
+   router never finished fighting.
+3. **The worst-path families are disjoint between arms** (below).
+4. **+2 197 LUTs** is real added logic.
+
+### 4c. Attribution: it splits roughly in half, and NOT the way the area does
+
+The two-tier-only arm was built (`consolidate/twotier-only` = `afbabdd` + that branch
+alone) and gated identically, so the decomposition is measured rather than argued:
+
+| | ΔWNS vs baseline | ΔFMax | ΔLUTs |
+|---|---|---|---|
+| two-tier reschedule | **-0.060 ns** (45 %) | -2.337 MHz | **+1 903** (87 %) |
+| Part 127 + `ArchLockStep` (by subtraction) | **-0.073 ns** (55 %) | -2.770 MHz | +294 (13 %) |
+
+**The two contributions are inverted between area and timing.** The two-tier reschedule
+brings 87 % of the added logic but only 45 % of the timing loss — it is *wide*. Part 127
+(plus the `ArchLockStep` branch, whose only `src/main` delta is `simPublic`
+name-preservation, so it is almost certainly all Part 127) adds barely 294 LUTs and
+costs *more* timing — it is *deep*, i.e. it lands on a path that was already close.
+
+This also means **the two-tier reschedule's postroute cost, measured here for the first
+time, is -2.34 MHz** — the number that was missing when its IPC gains (+10.23 % on
+`deep-backlog`, +1.24 % aggregate) were reported. At 196.194 vs 198.531 MHz the clock
+loss is 1.18 %, so on aggregate IPC the branch is very slightly net-positive and on
+`deep-backlog` clearly so. That trade is the coordinator's call, not mine, but it is now
+a trade with both numbers on the table.
+
+### 4d. The two named arcs — one correction
+
+The brief and the two-tier document named two arcs for this gate to examine.
+
+**`earlyHit`'s 32-bit PC compare on the retire cone.** In the **full merge** the routed
+report puts `RobPlugin_logic_earlySuppressFe_i_5/O` inside the 5th-worst path
+(-0.167 ns, 0.003 ns off the worst):
+
+```
+  Source:      RobPlugin_logic_completes_45_reg/C
+  Destination: RobPlugin_logic_debugLivePcReg_reg[6]/D
+  Logic Levels: 20  (LUT3=1 LUT4=2 LUT5=4 LUT6=13)
+```
+
+**I initially read that as evidence the compare costs, and I am retracting that
+reading.** In the **two-tier-only** arm — same logic, same flow — `earlySuppressFe`,
+`earlyPend` and `allocHalt` appear in the violated set **zero** times, and the worst
+paths are entirely different (`RobPlugin exc.fsStep → Dtlb rspPayload.fault`,
+`FetchAlign stalled → Icache mshrPa`). The Tier-2 term only surfaces once the *combined*
+netlist is congested. So it is a **symptom of the congestion, not a demonstrated
+independent cost**. It remains the cheapest thing to try — dropping it leaves the robId
+match and the no-other-flush-source guard, which are already fail-safe — but this gate
+did not prove it is the lever.
+
+**The `!allocHalt` term on the rename ready chain** does not appear in the violated set
+in either arm. The nearest rename paths (`_zz_RenameStage_logic_uopsStaged_payload_* →
+IssueQueuePlugin coldWay*`) are **MET** at +0.034 to +0.037 ns — near-tied, but passing.
+
+Worst-path families, for the record:
+
+* **baseline**: `DivEu fpNarrow f64SigR`; `DcachePlugin fsm.stateReg → RobPlugin
+  faultDynStore/faultedStore` (the known `faultDynMem` family).
+* **two-tier only**: `RobPlugin exc.fsStep → Dtlb rspPayload.fault`; `FetchAlign stalled
+  → Icache mshrPa`.
+* **full merge**: `DecodeStage ucPendValid → ucComplexResumeTargetReg`; `AluEu
+  s1Ctx.uop.op → RobPlugin sysValStore`; `Gshare pht → FetchAlign fetchPc`; `RobPlugin
+  completes → debugLivePcReg`.
+
+Three arms, three disjoint sets, all several-way near-tied — the "5-6 near-tied
+worst-path families, not one outlier" shape the FMax resilience postmortem describes.
+There is no single arc to cut here.
+
+**No design was contorted for this number.** Correctness outranks FMax by standing
+instruction; the numbers are reported as they came out.
+
 ## 5. Housekeeping
 
 **Part 127 moved to the campaign document.** It was written in a core-repo worktree as
@@ -338,11 +459,20 @@ to wait; only the reasoning I was given for it was wrong.
 
 ## 7. Explicitly NOT claimed
 
-* **No postroute number.** `full_impl` was not run. Nothing is claimed about the
-  merge's WNS/TNS, about the `!allocHalt` term on the rename ready chain, or about
-  `earlyHit`'s 32-bit PC compare on the retire cone. The two-tier document's IPC
-  numbers are **inherited, not re-measured** — this session re-measured correctness,
-  not performance.
+* **The IPC side is inherited, not re-measured.** This session measured correctness
+  and postroute timing. The two-tier document's IPC numbers (+10.23 % `deep-backlog`,
+  +1.24 % aggregate, the two ~3.5 % kernel regressions) were not re-run, so the
+  IPC-versus-clock trade in SS4c rests on their numbers and my clock numbers, taken on
+  different days.
+* **The attribution in SS4c is two arms, not three.** Part 127 and the `ArchLockStep`
+  branch were not separated from each other; their -0.073 ns is a joint figure obtained
+  by subtraction. It is *probably* all Part 127 (the other branch's only `src/main`
+  delta is `simPublic` name-preservation), but that is an argument, not a measurement.
+* Not claimed that a single Vivado run per arm is a distribution. Each arm was gated
+  **once**. Place-and-route is seeded, and this design has a recorded history of
+  arm-to-arm differences that did not survive re-measurement — the -0.133 ns total is
+  well outside anything that has been seen as run-to-run variance here, but the
+  per-arm split (-0.060 / -0.073) is closer in and would be firmer with a repeat.
 * The merged tree is green on the whole simulation bar (SS2.4), but "green" is not
   "clean": the AXI-protocol flake of SS2.3 fired once and remains **unexplained**, and
   a single non-reproduction is weak evidence — it was seen once in roughly six
@@ -364,6 +494,16 @@ to wait; only the reasoning I was given for it was wrong.
 * the three merges (three merge commits, one hand-resolved parameter-list conflict),
 * `395ffba` — the two test dispositions, the new RAS bug document, and the CHK
   cross-references.
+
+**One item of external evidence, obtained by a sibling agent, bears directly on
+whether to land this.** Part 127's store-queue fixes are now independently confirmed to
+resolve the `S_DRAIN` stall: a new `StoreQueueSpec` reproduction asserting `io.empty`
+directly **fails on `afbabdd` and passes on `bc943d8`**, with a drain-ack responder
+forked so a slow drain cannot masquerade as a wedge. That is a real *permanent hang*
+(JTAG-halt-provokable, and with `CACR.DE = 0` every store is precise, so the exposed
+path is the one the board actually runs) removed by one of the branches being merged.
+It strengthens the case for landing. **It does not fix the boot, and nothing here claims
+it does** — Part 127 SS0 is explicit that the wedge is not fixed.
 
 The whole simulation bar is green on it (SS2.4). **Merging is a coordinator decision
 and the only thing still outstanding is the postroute gate**, which waits for the
