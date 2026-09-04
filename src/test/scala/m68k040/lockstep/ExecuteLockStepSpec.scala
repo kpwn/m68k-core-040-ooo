@@ -212,6 +212,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
       lsEu.robHeadIn           := rob.logic.h0
       lsEu.robHeadValidIn      := rob.logic.count > 0
+      // I-side cache-inhibited speculation gate — the fetch-side counterpart of
+      // `robHeadValidIn`/`p4LaunchOk` above (mirrors top/FullCoreSynth.scala's
+      // BackendWiringPlugin). See m68k040.top.SpeculativeFetchGate.
+      m68k040.top.SpeculativeFetchGate.wire(host)
       lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
       lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
       // The dynamic wakeup must fire ONLY for a completing LOAD (it produces a
@@ -10279,5 +10283,314 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           s"real bug candidate #2 (misprediction redirect target wrong/one-shot, not sticky): " +
           excursions.take(20).map { case ((cyc, _, pc), i) => f"idx=$i cyc=$cyc%6d pc=0x$pc%08x" }.mkString("; "))
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SPECULATIVE ACCESS TO CACHE-INHIBITED (DEVICE) SPACE — I-SIDE
+  //
+  // MC68040 UM §3.1.2 / §4: a cache-inhibited page denotes a DEVICE, and a device
+  // read has an architecturally visible side effect at the device (read-to-clear
+  // status, FIFO pop, interrupt acknowledge). Such an access may therefore NEVER be
+  // performed speculatively: an access that is later squashed cannot be un-done at
+  // the device. The D-side enforces this at `LsEuPlugin.p4LaunchOk` ("wait until I
+  // am the ROB head"). The question these three tests answer is whether the I-SIDE
+  // honours the same rule.
+  //
+  // Shape of the probe: the program sits immediately below a 16 MiB boundary and
+  // ends in a `BRA.S -2` self-loop, so the ARCHITECTURAL PC never crosses the
+  // boundary. ITT0 marks everything at-or-above the boundary cache-inhibited
+  // (CM=10). The frontend's documented sequential run-ahead (see `attachProgram`'s
+  // own doc comment: "the front-end fetches past the last program word", which is
+  // exactly why `LockStepRunAheadGuardWords` exists) crosses the boundary as pure
+  // WRONG-PATH fetch. The assertion is on the BUS, not on architectural state,
+  // because a device side effect leaves no architectural trace by construction.
+  //
+  // The three tests are a calibrated set, and are meant to be read together:
+  //   (1) CONTROL-NEGATIVE  — same program at the default load address, far from the
+  //       inhibited window: the detector must stay SILENT. Rules out a detector that
+  //       fires unconditionally.
+  //   (2) CONTROL-POSITIVE  — program at the boundary, ITT0 DISABLED (window is
+  //       ordinary cacheable memory): the detector must FIRE. Proves the detector can
+  //       see a read in that window at all, and independently proves the frontend
+  //       really does run ahead across the boundary.
+  //   (3) THE RULE          — program at the boundary, ITT0 marking the window
+  //       cache-inhibited: the detector must stay silent. This is the architectural
+  //       requirement, and it is the one under test.
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  /** VA[31:24] base 0x50, mask 0x00 (exactly 0x50000000..0x50FFFFFF), E=1, S=1x
+    * (match supervisor AND user), CM=10 (bit6=1, bit5=0) == cache-inhibited,
+    * serialized. Field positions per `TtMatch.hit` / `TtMatch.cacheMode`. */
+  private val SpecMmioItt0Inhibited: Long = 0x5000C040L
+  private val SpecMmioWindowLo: Long = 0x50000000L
+  private val SpecMmioWindowHi: Long = 0x51000000L
+
+  /** Runs the boundary probe and returns (AR addresses seen in the inhibited window,
+    * retired PCs seen in the window, total AR count anywhere).
+    *
+    * `itt0` = 0 leaves the window ordinary cacheable memory (control-positive). */
+  private def runSpecMmioFetchProbe(tag: String, loadAddr: Long, itt0: Long,
+                                    cycles: Int = 6000)
+      : (Vector[Long], Vector[Long], Int) = {
+    // 3 NOPs then a 2-byte `BRA.S -2` self-loop == 8 bytes total. At
+    // loadAddr = 0x4FFFFFF0 the last architectural PC is 0x4FFFFFF6, so every fetch
+    // at or above 0x50000000 is wrong-path by construction.
+    val src = "nop ; nop ; nop ; loop: bra.s loop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    val arHits  = scala.collection.mutable.ArrayBuffer[Long]()
+    val pcHits  = scala.collection.mutable.ArrayBuffer[Long]()
+    var arTotal = 0
+
+    compiledDut.doSim(freshSimName(tag)) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+
+      // Zero-fill sparse memory: answers a read at ANY address (so the run-ahead
+      // fetch past the image is serviced rather than hanging the sim), and decodes
+      // to `ORI.B #0,%d0` -- legal, non-branching, side-effect-bounded -- so
+      // run-ahead keeps climbing instead of parking in an accidental self-branch.
+      // Deliberately NOT `LockStepRunAheadGuardWords`, which fills the region with
+      // more `BRA.S -2` and would suppress the very run-ahead under test.
+      val zeroMem = new m68k040.sim.ConstFillSparseMemory(0)
+      m68k040.sim.AxiMemModel.attachProgramIFetch(
+        dut.icache.logic.axi, cd, loadAddr, image.bytes,
+        sharedMem = zeroMem, runAheadGuardWords = 0)
+
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+
+      dut.rob.logic.exc.ss.isp  #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.usp  #= BigInt(0x00200000L)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0
+      dut.ctrl.logic.srp #= 0
+      // ITT0 is consulted BEFORE the mmuEnable=False fallback (ItlbPlugin.scala:409),
+      // so this marks the window inhibited with paging still off.
+      dut.ctrl.logic.itt0 #= BigInt(itt0)
+      dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= 0
+      dut.ctrl.logic.dtt1 #= 0
+
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var cyc = 0
+      while (cyc < cycles) {
+        cd.waitSampling(); cyc += 1
+        // THE BUS-LEVEL DETECTOR. An I-side AR is a 64-byte INCR burst at the
+        // 64-byte line base (IcachePlugin.scala:2313-2318 hardwires len=1/size=5),
+        // so a single accepted AR anywhere in the window touches SIXTEEN longword
+        // device registers -- for the Quadra 53C96 at 0x50F0F000 (registers spaced
+        // 0x10 apart) one burst spans four of them, and 0x50F0F040 and the
+        // read-to-clear Interrupt Status at 0x50F0F050 fall in the SAME burst.
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) {
+          arTotal += 1
+          val a = dut.icache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+          if (a >= SpecMmioWindowLo && a < SpecMmioWindowHi) arHits += a
+        }
+        // Independently confirm the fetch really was WRONG-PATH: no retired
+        // (architectural) PC may ever land in the window.
+        for (k <- 0 until 3) {
+          val c = dut.rob.logic.commitObs(k)
+          if (c.fire.toBoolean) {
+            val pc = c.pc.toLong & 0xffffffffL
+            if (pc >= SpecMmioWindowLo && pc < SpecMmioWindowHi) pcHits += pc
+          }
+        }
+      }
+    }
+    (arHits.toVector, pcHits.toVector, arTotal)
+  }
+
+  test("spec-mmio I-side CONTROL-NEGATIVE: detector is silent when the program is far from the window", VerilatorTest) {
+    val (arHits, _, arTotal) = runSpecMmioFetchProbe(
+      "spec-mmio-ctl-neg", ProgramAssembler.DefaultLoadAddress, SpecMmioItt0Inhibited)
+    println(f"[spec-mmio-ctl-neg] total I-side ARs=$arTotal, ARs in 0x50000000..0x50FFFFFF=${arHits.size}")
+    assert(arTotal > 0, "[spec-mmio-ctl-neg] harness broken: the I-side issued NO AXI reads at all")
+    assert(arHits.isEmpty,
+      s"[spec-mmio-ctl-neg] detector is a false-positive machine: it reported " +
+        s"${arHits.size} window ARs for a program that never goes near the window: " +
+        arHits.take(8).map(a => f"0x$a%08x").mkString(", "))
+  }
+
+  test("spec-mmio I-side CONTROL-POSITIVE: detector fires on run-ahead across the boundary when the window is CACHEABLE", VerilatorTest) {
+    val (arHits, pcHits, arTotal) = runSpecMmioFetchProbe(
+      "spec-mmio-ctl-pos", 0x4FFFFFF0L, itt0 = 0L)
+    println(f"[spec-mmio-ctl-pos] total I-side ARs=$arTotal, ARs in window=${arHits.size}" +
+      (if (arHits.nonEmpty) ", first=" + arHits.take(8).map(a => f"0x$a%08x").mkString(", ") else ""))
+    assert(pcHits.isEmpty,
+      s"[spec-mmio-ctl-pos] the fetch was ARCHITECTURAL, not wrong-path: retired PCs " +
+        s"entered the window: " + pcHits.take(8).map(a => f"0x$a%08x").mkString(", "))
+    assert(arHits.nonEmpty,
+      "[spec-mmio-ctl-pos] DETECTOR NOT PROVEN: the frontend never ran ahead across the " +
+        "boundary at all, so the inhibited-window test below would pass vacuously. " +
+        s"(total ARs anywhere = $arTotal)")
+  }
+
+  test("spec-mmio I-side THE RULE: no speculative/wrong-path AXI read may reach a CACHE-INHIBITED page", VerilatorTest) {
+    val (arHits, pcHits, arTotal) = runSpecMmioFetchProbe(
+      "spec-mmio-rule", 0x4FFFFFF0L, SpecMmioItt0Inhibited)
+    println(f"[spec-mmio-rule] total I-side ARs=$arTotal, ARs into the INHIBITED window=${arHits.size}" +
+      (if (arHits.nonEmpty) ", addrs=" + arHits.distinct.take(8).map(a => f"0x$a%08x").mkString(", ") else ""))
+    assert(pcHits.isEmpty,
+      s"[spec-mmio-rule] test setup invalid -- retired PCs entered the window, so these " +
+        s"fetches were architectural rather than wrong-path: " +
+        pcHits.take(8).map(a => f"0x$a%08x").mkString(", "))
+    // A read-to-clear device model: any read anywhere in the window destroys state.
+    // Asserting on the BUS is the whole point -- the side effect leaves no
+    // architectural trace, so no register/memory check could ever detect it.
+    assert(arHits.isEmpty,
+      s"[spec-mmio-rule] SPECULATIVE DEVICE READ: ${arHits.size} wrong-path 64-byte AXI " +
+        s"burst read(s) were issued to CACHE-INHIBITED (CM=10) space that the architectural " +
+        s"program never entered. Distinct line bases: " +
+        arHits.distinct.take(8).map(a => f"0x$a%08x").mkString(", ") +
+        ". Each burst is 64 bytes (IcachePlugin.scala:2316-2317 hardwires len=1/size=5), " +
+        "so it reads every device register in that line, firing read-to-clear side effects " +
+        "on registers the program never named.")
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // SPECULATIVE ACCESS TO CACHE-INHIBITED (DEVICE) SPACE — D-SIDE
+  //
+  // The D-side counterpart of the three tests above. Here the guard EXISTS
+  // (`LsEuPlugin.p4LaunchOk`'s inhibited arm: `p4AtRobHead && !olderStore &&
+  // p4PreemptSafe`), so the expected result is a NEGATIVE — and a negative is only
+  // worth anything if the probe is non-vacuous and the detector is proven.
+  //
+  // Non-vacuity is asserted IN-BAND, not assumed: the test fails unless the whitebox
+  // signals show the wrong-path inhibited load actually REACHED the launch gate
+  // (`p4Valid && p4Inhibited` observed at least once). A negative from a probe whose
+  // load never got that far would be meaningless.
+  //
+  // Detector proof: temporarily replace `p4LaunchOk`'s inhibited arm with `True` in
+  // LsEuPlugin.scala and re-run — the test must FAIL with a D-side AR at the device
+  // address. That control was run and is recorded in
+  // docs/superpowers/specs/2026-09-04-speculative-inhibited-mmio-audit.md.
+  //
+  // Program shape: an untrained conditional branch is predicted FALL-THROUGH, and
+  // its architectural direction is TAKEN, so the fall-through path is wrong-path by
+  // construction. The branch's condition is made to depend on a DIVU so it resolves
+  // late, giving the wrong-path load the widest possible window to launch.
+  // ═══════════════════════════════════════════════════════════════════════════════
+
+  private val SpecMmioDeviceVa: Long = 0x50F0F040L   // Quadra 53C96 Status, A3+0x40
+
+  private def runSpecMmioLoadProbe(tag: String, dtt0: Long, cycles: Int = 8000)
+      : (Vector[Long], Int, Boolean, Int) = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src =
+      "move.l #0x50F0F040,%a0 ; " +
+      "moveq #0,%d0 ; " +
+      "moveq #7,%d2 ; " +
+      "divu.w %d2,%d0 ; " +          // long-latency producer of the branch condition
+      "tst.w %d0 ; " +
+      "beq.s done ; " +              // ARCHITECTURALLY TAKEN; untrained -> predicted fall-through
+      "move.b (%a0),%d1 ; " +        // <-- WRONG-PATH load to cache-inhibited device space
+      "nop ; nop ; " +
+      "done: loop: bra.s loop"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    val arHits = scala.collection.mutable.ArrayBuffer[Long]()
+    var arTotal = 0
+    var sawInhibitedAtGate = false
+    var commits = 0
+
+    compiledDut.doSim(freshSimName(tag)) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+
+      dut.rob.logic.exc.ss.isp  #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.usp  #= BigInt(0x00200000L)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0
+      dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0
+      dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= BigInt(dtt0)   // marks 0x50xxxxxx cache-inhibited on the D side
+      dut.ctrl.logic.dtt1 #= 0
+
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      var cyc = 0
+      while (cyc < cycles) {
+        cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
+          arTotal += 1
+          val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+          if (a >= SpecMmioWindowLo && a < SpecMmioWindowHi) arHits += a
+        }
+        // NON-VACUITY: the wrong-path inhibited load must actually reach the launch gate.
+        if (dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Inhibited.toBoolean)
+          sawInhibitedAtGate = true
+        for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) commits += 1
+      }
+    }
+    (arHits.toVector, arTotal, sawInhibitedAtGate, commits)
+  }
+
+  test("spec-mmio D-side THE RULE: p4LaunchOk holds a wrong-path load off cache-inhibited space", VerilatorTest) {
+    val (arHits, arTotal, sawGate, commits) = runSpecMmioLoadProbe(
+      "spec-mmio-dside", SpecMmioItt0Inhibited)
+    println(f"[spec-mmio-dside] total D-side ARs=$arTotal, ARs into the INHIBITED window=${arHits.size}, " +
+      f"wrong-path inhibited load reached p4 gate=$sawGate, commits=$commits" +
+      (if (arHits.nonEmpty) ", addrs=" + arHits.distinct.take(8).map(a => f"0x$a%08x").mkString(", ") else ""))
+    assert(commits > 0, "[spec-mmio-dside] harness broken: nothing retired at all")
+    assert(sawGate,
+      "[spec-mmio-dside] VACUOUS PROBE: the wrong-path load to cache-inhibited space never " +
+        "reached `p4Valid && p4Inhibited`, so a clean result proves nothing about the guard. " +
+        "Widen the mispredict window or check the branch really is predicted fall-through.")
+    assert(arHits.isEmpty,
+      s"[spec-mmio-dside] SPECULATIVE DEVICE READ on the D side: ${arHits.size} AXI read(s) " +
+        s"reached cache-inhibited space from a wrong-path load: " +
+        arHits.distinct.take(8).map(a => f"0x$a%08x").mkString(", "))
   }
 }

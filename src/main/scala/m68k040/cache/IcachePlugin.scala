@@ -257,6 +257,55 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val lookupCmode     = xlate.rsp.cacheMode
     val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED
 
+    // ══ SPECULATIVE ACCESS TO CACHE-INHIBITED (DEVICE) SPACE — THE I-SIDE GATE ═══
+    // MC68040 UM §3.1.2/§4: a cache-inhibited page denotes a DEVICE. A device READ has
+    // an architecturally visible side effect (read-to-clear status, FIFO pop, interrupt
+    // acknowledge), so it may not be performed speculatively — a squash cannot un-do it
+    // at the device. `LsEuPlugin.p4LaunchOk` states and enforces exactly this rule for
+    // D-side loads ("wait until I am the ROB head"). Until this signal existed nothing
+    // enforced it on the I side, and the consequence was NOT theoretical: cache mode
+    // reappeared only at `doAllocate` in the predecode dwell, i.e. AFTER both R beats
+    // had already returned, so INHIBITED suppressed the ARRAY INSTALL and nothing else.
+    // A wrong-path run-ahead fetch into a CM=10 page issued a real 64-byte INCR burst,
+    // demonstrated on unmodified RTL by ExecuteLockStepSpec's "spec-mmio I-side THE
+    // RULE" probe (see docs/superpowers/specs/2026-09-04-speculative-inhibited-mmio-
+    // audit.md). One such burst spans four Quadra 53C96 registers, including the
+    // read-to-clear Interrupt Status at +0x50.
+    //
+    // WHY THIS IS AN ACCEPT-SIDE GATE AND NOT AN S1 HOLD, which is the shape a reader
+    // coming from the D side would expect. An S1 hold (the `s1Unresolved` `otherwise`
+    // arm below) keeps a command that has ALREADY FIRED, so the plugin owes FetchAlign
+    // a response for it forever: FetchAlign retires ring slots on responses and merely
+    // marks them `ringStale` on a redirect, it never abandons them. A held wrong-path
+    // inhibited fetch would therefore have to be either (a) launched anyway once the
+    // machine drained — which is the very bus transaction this gate exists to prevent,
+    // just later — or (b) abandoned with a synthesised response, which is silent
+    // instruction-byte corruption the moment the staleness reasoning behind it is
+    // wrong. Refusing the command at the Stream boundary has neither problem: nothing
+    // has fired, no response is owed, and a redirect simply changes `cmdWindowPc`
+    // underneath the un-accepted command (FetchAlign re-evaluates `ic.cmd.payload.pc`
+    // combinationally every cycle and already tolerates a low `ready` for arbitrarily
+    // long — `setBlocked` and `!s1Unresolved` both do it today).
+    //
+    // COST, stated honestly: this is the one place the M3b campaign's "cmdPort.ready
+    // FROM REGISTERED STATE ONLY" property is deliberately relaxed. `lookupCacheable`
+    // is a live `xlate.rsp.cacheMode` read, so the ITLB entry mux is back in the accept
+    // cone — but only through an OR with a registered term, and only for the term that
+    // makes a device access architecturally legal. There is no registered substitute:
+    // the whole defect is that the cache mode was consulted one stage too late.
+    val nonSpecFetch = Bool()
+    nonSpecFetch.allowOverride
+    // Default TRUE = "assume the fetch is architectural". Every standalone I-cache DUT
+    // drives `cmdPort` from a directed probe rather than from a speculative frontend,
+    // so for them the default is the TRUTH, not a weakening; only a DUT that actually
+    // contains a speculating frontend (FullCoreSynth, SocketTop, and the three full-core
+    // test DUTs) overrides it. A default of False would instead HANG every standalone
+    // test that fetches an inhibited line.
+    nonSpecFetch := True
+    nonSpecFetch.simPublic()
+    val inhibitedSpecBlock = !lookupCacheable && !nonSpecFetch
+    inhibitedSpecBlock.simPublic()
+
     // ---- install-context latches (M2c: NOT part of the MSHR control file) ----
     // M2c splits what used to be one undifferentiated `miss*` pile into two things
     // with genuinely different lifetimes:
@@ -1596,8 +1645,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // "M3b: no younger command is accepted behind an unresolved miss", and its
         // opposite direction (the gate must be LOW on a hit, or every straight-line
         // fetch loses an issue slot) by "M3b: sustained II=1 on hits".
+        //   `!inhibitedSpecBlock` the CM=10 speculation gate. See its declaration for
+        //                      the full rationale, and for the one deliberate exception
+        //                      it makes to the "registered state only" property above.
         pfAcceptOk := !pfLookupSetBusy
-        cmdPort.ready := xlate.rsp.ready && !setBlocked && !s1Unresolved && pfAcceptOk
+        cmdPort.ready := xlate.rsp.ready && !setBlocked && !s1Unresolved && pfAcceptOk &&
+                         !inhibitedSpecBlock
 
         when(cmdPort.fire) {
           // ══ M3a S0 CAPTURE ═════════════════════════════════════════════════════
@@ -2313,6 +2366,30 @@ class IcachePlugin extends FiberPlugin with FetchService {
     axi.ar.valid         := arHoldValid
     axi.ar.payload.addr  := arHoldAddr
     axi.ar.payload.id    := arHoldId
+    // ── BURST WIDTH: DELIBERATELY UNCHANGED, INCLUDING FOR AN INHIBITED FETCH ─────
+    // The D side has an exact byte cover for INHIBITED accesses (`MmioCover`) because a
+    // load names a specific 1/2/4-byte operand and an AXI4 READ carries no byte enable,
+    // so any byte the read covers is a byte the device sees read. An earlier revision of
+    // this fix mirrored that here, narrowing an inhibited demand fill to a single 32-byte
+    // beat. That was REMOVED on purpose, and this comment exists so the next reader does
+    // not helpfully re-add it:
+    //
+    //   - Instruction fetch is inherently bursty and stays bursty. There is no "named
+    //     operand" to cover exactly: the architectural unit of a fetch is a stream, and
+    //     `FetchRsp` delivers a fixed 64-bit window plus a predecode that needs the three
+    //     words FOLLOWING each word it classifies. Narrowing below a whole beat leaves
+    //     those lookahead words undefined INSIDE the beat, where nothing detects it
+    //     (unlike the beat-END case, which `classify` marks `ambiguousLine` for
+    //     `Aligner.scala:63-65` to redo) — silent instruction mis-framing.
+    //   - The core cannot tell MMIO from any other cache-inhibited memory; it has only
+    //     the page attribute. And no real program executes from MMIO. So a NON-speculative
+    //     inhibited fetch is a pathological case that does not need to be made safe: once
+    //     the speculation gate above is in place, any inhibited fetch that still reaches
+    //     the bus was architecturally demanded by the program, and the burst is then the
+    //     program's problem rather than the core's.
+    //   - Equivalently: the I-cache does not honour INHIBITED as a CACHING policy, and
+    //     that is intended. It honours it as a SPECULATION policy, which is the property
+    //     that actually protects devices.
     axi.ar.payload.len   := U(1, 8 bits)
     axi.ar.payload.size  := U(5, 3 bits)
     axi.ar.payload.burst := Axi4.burst.INCR
@@ -2452,7 +2529,9 @@ class IcachePlugin extends FiberPlugin with FetchService {
 
     when(rFire) {
       val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
-      // Generalised from the two identical per-path assertions M2b carried.
+      // Generalised from the two identical per-path assertions M2b carried. Every I-side
+      // fill is two beats, INHIBITED included — see the AR payload comment for why the
+      // burst is deliberately not narrowed for a cache-inhibited fetch.
       assert(axi.r.payload.last === mshrBeat(rIdx),
         "I-cache refill must be exactly two beats")
       when(respErr) { mshrErr(rIdx) := True }

@@ -134,6 +134,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
     lsEu.robHeadIn           := rob.logic.h0
     lsEu.robHeadValidIn      := rob.logic.count > 0
+    // I-side cache-inhibited speculation gate — the fetch-side counterpart of
+    // `robHeadValidIn`/`p4LaunchOk` above (mirrors top/FullCoreSynth.scala's
+    // BackendWiringPlugin). See m68k040.top.SpeculativeFetchGate.
+    m68k040.top.SpeculativeFetchGate.wire(host)
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
     lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
     iq.lsWakeup.valid   := lsEu.wakeup.valid
