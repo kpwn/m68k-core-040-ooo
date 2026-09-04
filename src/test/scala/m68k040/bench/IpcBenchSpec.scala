@@ -480,6 +480,17 @@ class IpcBenchSpec extends AnyFunSuite {
       var maxDcOutstanding  = 0
       // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
       // simPublic ROB signals; they do not perturb the DUT.
+      // THE instrument for a two-tier reschedule, and it is deliberately NOT the
+      // 2026-09-03 "ROB entries ahead of the branch" histogram — backlog DEPTH is
+      // the wrong quantity (see 2026-09-04-naxriscv-architecture-comparison.md §4.3).
+      // What an early PC redirect can recover is exactly the number of cycles
+      // between the branch RESOLVING in the EU and its retire-gated redirect
+      // firing at the ROB head. Measured off signals that are simPublic on BOTH
+      // arms (`branchCompletion`, `branchRedirect`, `head`), so the same code runs
+      // unchanged against a baseline netlist.
+      val misResolveCycle = scala.collection.mutable.HashMap[Int, Long]()
+      val resolveToRetire = ArrayBuffer.empty[Int]
+      var telemCycle        = 0L
       var t1EarlyFires      = 0   // Tier-1 early PC redirect pulses
       var t1PendCycles      = 0   // cycles rename was frozen by Tier 1
       var t1Suppressed      = 0   // Tier-2 flushes that KEPT the refetched frontend
@@ -511,6 +522,13 @@ class IpcBenchSpec extends AnyFunSuite {
       }
 
       cd.onSamplings {
+        telemCycle += 1
+        if (dut.rob.logic.branchCompletion.valid.toBoolean &&
+            dut.rob.logic.branchCompletion.payload.mispredict.toBoolean)
+          misResolveCycle(dut.rob.logic.branchCompletion.payload.robId.toInt) = telemCycle
+        if (dut.rob.logic.branchRedirect.toBoolean)
+          misResolveCycle.remove(dut.rob.logic.head.toInt)
+            .foreach(c => resolveToRetire += (telemCycle - c).toInt)
         if (dut.rob.logic.earlyFire.toBoolean) t1EarlyFires += 1
         if (dut.rob.logic.earlyPend.toBoolean) t1PendCycles += 1
         if (dut.rob.logic.earlySuppressFe.toBoolean) t1Suppressed += 1
@@ -700,8 +718,13 @@ class IpcBenchSpec extends AnyFunSuite {
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines)
-      println(s"[tier1] ${k.name} earlyFire=$t1EarlyFires pendCyc=$t1PendCycles " +
-        s"suppressed=$t1Suppressed doFlush=$t2Flushes branchRedirect=$t2BranchRedirects")
+      val r2rN   = resolveToRetire.size
+      val r2rAvg = if (r2rN == 0) 0.0 else resolveToRetire.sum.toDouble / r2rN
+      val r2rHis = resolveToRetire.groupBy(identity).toVector.sortBy(_._1)
+        .map { case (d, xs) => s"$d:${xs.size}" }.mkString(", ")
+      println(f"[tier1] ${k.name} earlyFire=$t1EarlyFires pendCyc=$t1PendCycles " +
+        f"suppressed=$t1Suppressed doFlush=$t2Flushes branchRedirect=$t2BranchRedirects")
+      println(f"[resolve2retire] ${k.name} n=$r2rN avg=$r2rAvg%.2f  histogram{$r2rHis}")
       if (k.copybackDtt) {
         println(s"[store-path] lsIssue=$lsIssueFires sqAlloc=$sqAllocFires fastAlloc=$fastSqAllocs " +
           s"sqDrainFire=$sqDrainFires dcStoreFire=$dcStoreFires ack=$dcStoreAcks " +
@@ -801,6 +824,41 @@ class IpcBenchSpec extends AnyFunSuite {
       ".Lskip: sub.l %d1,%d7 ; bne.s .Lbr"
     val src = setup.mkString(" ; ") + " ; " + body
     Kernel("branchy", src, setup.size + 220)
+  }
+
+  // 4a. deep-backlog: SYNTHETIC. Built for the two-tier-reschedule measurement
+  //     (2026-09-04), reconstructed from the description in
+  //     docs/superpowers/specs/2026-09-03-early-flush-ipc-ab-measurement.md §2.3.
+  //     `branchy`'s mispredicting branch reaches the ROB head almost immediately
+  //     (measured resolve->retire delay ~1 cycle), so it CANNOT resolve any
+  //     mechanism whose whole benefit is "start refetching before the branch
+  //     retires". This kernel deliberately pins the ROB head far behind the
+  //     branch so that delay is large:
+  //       * 5 dependent slow-path shifts on d2 hold the head for tens of cycles
+  //         (the ALU slow path is a multi-cycle dependent chain);
+  //       * 12 independent `add.l %d1,%aN` complete in a cycle each and then just
+  //         SIT in the ROB, completed-but-unretired (ADDA writes no NZVC, so they
+  //         neither depend on nor disturb the branch's flag producer);
+  //       * the branch's own flag producer depends on nothing in that chain, so
+  //         the Bcc resolves in the EU almost immediately -- while the head is
+  //         still stuck ~15 entries behind it.
+  //     Read it as an UPPER BOUND on the mechanism, not as representative code.
+  def kDeepBacklog: Kernel = {
+    val iters = 20
+    val setup = Seq("moveq #20,%d7", "moveq #1,%d1", "moveq #0,%d6", "moveq #1,%d4",
+                    "moveq #0,%d0", "moveq #17,%d2", "moveq #3,%d3")
+    // 5 dependent slow-path shifts on d2 (each depends on the previous result).
+    val shifts = (0 until 5).map(_ => "lsl.l %d3,%d2")
+    // 12 independent ADDA (no NZVC write, no dependency on the shift chain).
+    val addas  = (0 until 12).map(i => f"add.l %%d1,%%a${i % 6}%d")
+    val body =
+      ".Ldb: " + (shifts ++ addas).mkString(" ; ") +
+      " ; add.l %d1,%d6 ; and.l %d4,%d6 ; beq.s .Ldbskip ; add.l %d1,%d0 ; " +
+      ".Ldbskip: sub.l %d1,%d7 ; bne.s .Ldb"
+    val src = setup.mkString(" ; ") + " ; " + body
+    // Per iter: 5 shifts + 12 addas + add + and + beq + (add on odd iters) + sub + bne
+    //   = 22 always + 1 on half the iterations.
+    Kernel("deep-backlog", src, setup.size + iters * 22 + iters / 2)
   }
 
   // 4b. hot-loop: a TIGHT backward `bne.s` loop with a tiny independent-ALU body. The
@@ -1043,7 +1101,8 @@ class IpcBenchSpec extends AnyFunSuite {
 
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
-      kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kHotLoop, kMixed, kCallReturn)
+      kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kDeepBacklog,
+      kHotLoop, kMixed, kCallReturn)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
