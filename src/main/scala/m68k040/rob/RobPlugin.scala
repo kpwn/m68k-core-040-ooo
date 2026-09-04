@@ -2545,6 +2545,119 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     when(debugRecoverEnter) { debugLivePcReg := debugRestartPc }
 
+    // ── TIER 1: EU-resolution-time PC redirect + rename halt (2026-09-04) ────────
+    // Design: docs/superpowers/specs/2026-09-04-two-tier-reschedule-design.md
+    // Source of the idea: NaxRiscv's two-tier reschedule
+    // (`misc/CommitPlugin.scala:118-157`, `frontend/FrontendPlugin.scala:66-67`),
+    // analysed in `2026-09-04-naxriscv-architecture-comparison.md` §4.
+    //
+    // THIS IS NOT THE REVERTED 2026-09-03 EARLY FLUSH. Read the "INVESTIGATED AND
+    // REJECTED" block above `branchRedirect` before touching this. That attempt
+    // performed the TIER-2 action (the global `flushing` rollback: RAT restore,
+    // freelist restore, `tail := head`, SQ squash, TLB U/M-queue flush) at TIER-1
+    // time, which is why it had to resume at the committed PC, why mispredicts
+    // more than doubled, and why it produced 69 `DIVERGED[HANG]` StoreQueue wedges.
+    //
+    // What Tier 1 changes, exhaustively — TWO things, and NEITHER is a flush:
+    //   (1) `earlyFire` — a one-cycle pulse that drives ONLY the frontend fetch
+    //       redirect (`FetchAlignPlugin.mispredictRedirect`) to the branch's OWN
+    //       resolved `nextPc`, plus the purely-frontend `DecodeUopService.pipeFlush`
+    //       (FetchAlign→decode skid, MicroOpQueue, decode-side µcode sequencers) and
+    //       the RAS predictor checkpoint restore. Every one of those consumers holds
+    //       PRE-RENAME state only: no architectural register, no ROB entry, no
+    //       physical-register allocation, no store.
+    //   (2) `earlyPend` — a sticky "rename is halted" flag consumed by
+    //       `RenameStage.logic.allocHalt`. It FREEZES speculative state (no freelist
+    //       pop, no RAT write, no ROB allocation) rather than rolling it back.
+    //
+    // What Tier 1 explicitly does NOT touch, and MUST NEVER touch:
+    //   `doFlushReg` / `flushing` / `rc.flushPort` / `tail := head` / `count := 0` /
+    //   `IssueQueueService.flushPort` / `RenameStage.pipeFlush` / `LsEuPlugin.sqFlush`
+    //   (StoreQueue) / `DtlbPlugin.umFlush` / `ItlbPlugin.umFlush` (`UmWriteQueue`) /
+    //   `DivEuPlugin.cplxFlush`.
+    //
+    //   The TLB one is a hard safety constraint, not a preference. `UmWriteQueue`
+    //   discards uncommitted entries on `io.flush` (`UmWriteQueue.scala:111-118`);
+    //   that is conservative-safe ONLY because today's `io.flush` is retire-gated,
+    //   so a needed M (modified) descriptor write is already marked `committed` and
+    //   survives. Firing it earlier could drop an M write for an instruction that
+    //   still retires — a dirty page later evicted as clean, i.e. SILENT DATA LOSS
+    //   (M is a correctness bit; U is only a hint). Tier 1 asserts NO flush, so
+    //   `umFlush` keeps its sole driver `doFlushReg` and that direction stays closed.
+    //   See `2026-09-04-naxriscv-architecture-comparison.md` §7.5(2).
+    //
+    // Tier 2 is UNCHANGED: `branchRedirect` still fires only at the ROB head and
+    // still drives the entire global rollback, where "restore to committed" and
+    // "restore to just-after-the-branch" are the same state by construction. The
+    // mispredicting branch is never discarded early, so BTB/gshare training stays
+    // retire-gated exactly as before (the reverted attempt had to add early
+    // training because it threw the branch away; this one does not).
+    //
+    // The BENEFIT is refetch latency: fetch/align/decode of the correct path runs
+    // during the shadow of waiting for the branch to reach the head, instead of
+    // starting from scratch afterwards. To collect it, Tier 2 SUPPRESSES its own
+    // frontend redirect + frontend skid flush when — and only when — it is the
+    // retirement of the exact branch Tier 1 already redirected for (`earlySuppressFe`
+    // below). Any other flush source, any robId mismatch, and any PC mismatch falls
+    // back to today's full frontend flush.
+    //
+    // DEADLOCK ARGUMENT for the rename halt. `earlyPend` is set only for a branch
+    // that is resident in the ROB with `mispredictStore` set. Retire is in-order and
+    // needs nothing from rename, so that branch necessarily reaches the head and
+    // fires `branchRedirect` (or an older exception/debug event fires first); either
+    // way `flushing` asserts and clears `earlyPend`. The halt is implemented as an
+    // extra term on the SAME `du.uops.ready`/`uopsPort.valid` gate that already
+    // carries `freeReady` (`RenameStage.scala:138-139`), i.e. an already-proven
+    // backpressure path that handles mid-macro stalls.
+    //
+    // `earlyPend` deliberately stays asserted THROUGH the `flushing` cycle (it is
+    // cleared by a registered assignment, so it reads True during that cycle). That
+    // is load-bearing: with the frontend skid flush suppressed, `du.uops.valid` can
+    // be high on the rollback cycle, and renaming against a RAT/freelist that is
+    // being restored the same cycle would corrupt the mapping.
+    val earlyPend  = RegInit(False);            earlyPend.simPublic()
+    val earlyFire  = RegInit(False);            earlyFire.simPublic()
+    val earlyRobId = Reg(UInt(robIdW bits)) init 0
+    val earlyPcReg = Reg(UInt(32 bits))     init 0
+    earlyRobId.simPublic(); earlyPcReg.simPublic()
+
+    // Oldest-wins arbitration, NaxRiscv `CommitPlugin.scala:118-144`. Age is
+    // `robId - head` mod 64, the same wraparound-safe idiom `faultWin` uses at the
+    // completion ports. `bcInFlight` additionally rejects a completion whose robId
+    // is not currently resident — the branch EU has no flush input, so a wrong-path
+    // branch already squashed by an earlier Tier-2 flush can still report one or two
+    // cycles later; today that is harmless (alloc-reset overrides), but it must not
+    // be allowed to steer the fetch PC.
+    val bcAge  = (branchCompletion.payload.robId - head).resize(count.getWidth)
+    val curAge = (earlyRobId - head).resize(count.getWidth)
+    val bcInFlight = bcAge < count
+    val earlyArm = branchCompletion.valid && branchCompletion.payload.mispredict &&
+      bcInFlight && !flushing && !excActive && !coreHalted && !debugQuiesceActive &&
+      (!earlyPend || (bcAge < curAge))
+    earlyFire := earlyArm
+    when(earlyArm) {
+      earlyPend  := True
+      earlyRobId := branchCompletion.payload.robId
+      earlyPcReg := branchCompletion.payload.nextPc
+    }
+    // Tier 2 releases the halt. Registered assignment => `earlyPend` still reads
+    // True on the `flushing` cycle itself (see the note above). Placed AFTER the
+    // `when(earlyArm)` block so the clear wins on any coincidence — `earlyArm`
+    // already gates on `!flushing`, so this is defence in depth against a future
+    // edit, not a live case (SpinalHDL last-assignment-wins).
+    when(flushing) { earlyPend := False }
+
+    // Tier 2 frontend-flush suppression. True for exactly one cycle, aligned with
+    // `doFlushReg`, when this flush IS the retirement of the branch Tier 1 already
+    // redirected for. Fail-safe by construction: the robId must match, the resolved
+    // PC must match, and no other flush source may be active — otherwise the
+    // frontend takes today's full flush + redirect.
+    val earlyHit = branchRedirect && earlyPend && (h0 === earlyRobId) &&
+      (nextPcRd0 === earlyPcReg) &&
+      !exc.redirectValid && !debugRecoverEnter && !debugPcApply
+    val earlySuppressFe = RegNext(earlyHit) init False
+    earlySuppressFe.simPublic()
+
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.
     when(flushing) {

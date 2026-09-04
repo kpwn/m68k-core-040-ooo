@@ -82,9 +82,32 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // (serializing) so wrong-path uops fetched during the sequence are squashed.
     val pipeFlush = doFlush || excActive
     val decodeUop = host[DecodeUopService]
-    iq.flushPort := pipeFlush                  // IQ clear
-    decodeUop.pipeFlush := pipeFlush           // FE skid (decode->rename)
+    // ── Two-tier reschedule wiring (2026-09-04) ─────────────────────────────────
+    // See RobPlugin's `earlyPend` doc comment and
+    // docs/superpowers/specs/2026-09-04-two-tier-reschedule-design.md.
+    //
+    // TIER 1 (`earlyFire`, `earlyPend`) touches ONLY the two frontend signals below
+    // plus the RAS predictor checkpoint. It is deliberately absent from every
+    // state-rollback consumer: `iq.flushPort`, `RenameStage.pipeFlush`,
+    // `divEu.cplxFlush`, `lsEu.sqFlush` (StoreQueue) and `dtlb/itlb.umFlush`
+    // (`UmWriteQueue`) all keep `doFlush` (the retire-gated `doFlushReg`) as their
+    // sole ROB-side source. The TLB one is a data-loss constraint, not a style
+    // choice — an early `umFlush` could discard a still-needed M (modified)
+    // descriptor write and let a dirty page be evicted as clean.
+    //
+    // TIER 2 suppression (`feSuppress`): when this flush IS the retirement of the
+    // branch Tier 1 already redirected for, the frontend keeps what it has already
+    // fetched and decoded down the CORRECT path — that is the entire IPC benefit.
+    // `earlySuppressFe` is registered inside the ROB and already requires a robId
+    // match, a resolved-PC match and no other flush source; `!excActive` here is
+    // belt-and-braces for the multi-cycle exception sequencer.
+    val earlyFire  = rob.logic.earlyFire
+    val feSuppress = rob.logic.earlySuppressFe && !excActive
+    val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
+    iq.flushPort := pipeFlush                  // IQ clear (Tier 2 only)
+    decodeUop.pipeFlush := feFlush             // FE skid (decode->rename)
     host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
+    host[RenameStage].logic.allocHalt := rob.logic.earlyPend  // Tier-1 rename freeze
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
     // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
@@ -96,10 +119,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // beside the frontend: this cuts the measured decode-pblock -> ITLB/cache/ring route
     // at the cost of one additional cold-path cycle. Priority: a real doFlush wins over
     // a same-cycle resume.
-    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
+    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, feFlush)
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush || frontendResume.valid
-    faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
+    // Priority: a real (non-suppressed) Tier-2 flush > a Tier-1 early redirect > a
+    // complex-packet resume. Tier 1 and a non-suppressed Tier 2 can only coincide
+    // when the Tier-2 event belongs to a DIFFERENT (older) entry, in which case the
+    // older one must win — which the mux order below gives.
+    faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
+    faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
+                       Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
 
     // ── Decode fallback BTB + fetch-directed FTB wiring ──────────────────────────
     // The retained BTB ports query the aligned decode packets combinationally. The FTB
@@ -155,7 +183,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // speculative excursion: the ROB's own commit-time correction (`doFlush`, already
     // in scope above) and FetchAlign's own `ftqMismatch` re-framing recovery (a
     // frontend-only correction that never touches the ROB, so it needs its own term).
-    val rasCheckpointRestore = doFlush || fa.logic.ftqMismatch
+    // Two-tier reschedule: the RAS is a pure predictor (no architectural state), so
+    // its restore belongs at the same instant the wrong-path frontend is discarded —
+    // Tier 1 when Tier 1 owns the redirect, Tier 2 otherwise. Restoring again at
+    // Tier 2 under `feSuppress` would undo the LEGITIMATE correct-path pushes made
+    // while rename was frozen, which is the same undo-too-much mistake in miniature.
+    val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
     ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
                                     !rasCheckpointRestore
     ras.logic.checkpointRestore := rasCheckpointRestore

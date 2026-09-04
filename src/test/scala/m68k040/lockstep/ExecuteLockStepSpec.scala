@@ -266,16 +266,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val pipeFlush = doFlush || excActive
       val decodeUop = host[m68k040.services.DecodeUopService]
       iq.flushPort := pipeFlush                     // IQ clear
-      decodeUop.pipeFlush := pipeFlush
+      // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
+      // top/FullCoreSynth.scala's BackendWiringPlugin. Tier 1 drives ONLY the
+      // frontend redirect, the pre-rename skid flush and the RAS checkpoint; it
+      // never reaches iq.flushPort / RenameStage.pipeFlush / sqFlush / umFlush.
+      val earlyFire  = rob.logic.earlyFire
+      val feSuppress = rob.logic.earlySuppressFe && !excActive
+      val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
+      decodeUop.pipeFlush := feFlush
       host[RenameStage].logic.pipeFlush := doFlush || excActive
+      host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
       // (rc.flushPort := flushing). Fetch redirect to the resolved target:
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
       // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
-      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
+      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, feFlush)
       val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-      faRedir.valid   := doFlush || frontendResume.valid
-      faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
+      faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
+      faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
+                         Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.
@@ -305,7 +314,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // see Ras.scala's doc comment for the design). checkpointSave refreshes to live
       // state whenever the ROB is fully drained; checkpointRestore undoes any
       // wrong-path push/pop on the ROB's own flush or FetchAlign's own ftqMismatch.
-      val rasCheckpointRestore = doFlush || faBtb.logic.ftqMismatch
+      val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || faBtb.logic.ftqMismatch
       ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
                                       !rasCheckpointRestore
       ras.logic.checkpointRestore := rasCheckpointRestore
