@@ -1522,12 +1522,6 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val arHoldValid = RegInit(False)
     val arHoldId    = Reg(UInt(AxiIds.ID_W bits))
     val arHoldAddr  = Reg(UInt(32 bits))
-    // The I-side's (partial) `MmioCover` analogue: True for a demand fill whose access
-    // was CACHE-INHIBITED, which narrows the burst from 2 x 32 B to 1 x 32 B and moves
-    // the address from the 64-byte LINE base to the 32-byte HALF-LINE base. See the AR
-    // payload assignment below for the exact argument, including why this stops at 32
-    // bytes rather than reaching the D side's exact byte cover.
-    val arHoldNarrow = RegInit(False)
 
     // ---- FSM ----
     val fsm = new StateMachine {
@@ -2351,10 +2345,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       when(refillActive && !mshrArSent(DEMAND_IDX)) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
-        // INHIBITED demand fill: half-line base + single beat (see `arHoldNarrow`).
-        arHoldAddr  := Mux(missCacheable, mshrPa(DEMAND_IDX) & ~U(63, 32 bits),
-                                          mshrPa(DEMAND_IDX) & ~U(31, 32 bits))
-        arHoldNarrow := !missCacheable
+        arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
       // M4: `demandStuck` -> `demandStuckQ`, and the `pfBlockingArAny` escape hatch is
       // now QUALIFIED by `heldOnSetBusyQ`. Task 11 left it unqualified, so under case (a)
       // the hatch could be opened by a blocking-owner match computed against a younger,
@@ -2369,41 +2360,37 @@ class IcachePlugin extends FiberPlugin with FetchService {
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
         arHoldAddr  := mshrPa(pfChosenArMshr) & ~U(63, 32 bits)
-        // A speculative (prefetch) fill is CACHEABLE by construction — rule P1, "an
-        // INHIBITED page is never prefetched" (see `missCacheable`'s declaration) —
-        // so this arm can never want the narrow shape.
-        arHoldNarrow := False
       }
     }
 
     axi.ar.valid         := arHoldValid
     axi.ar.payload.addr  := arHoldAddr
     axi.ar.payload.id    := arHoldId
-    // ── BURST WIDTH FOR A LEGITIMATE (non-speculative) INHIBITED FETCH ────────────
-    // `MmioCover`'s doc comment states the hazard this narrowing answers: byte-
-    // addressed I/O registers are selected by ADDRESS, not by strobe, and an AXI4 READ
-    // carries no byte-enable at all, so every byte a read COVERS is a byte the device
-    // sees read. A 64-byte line read therefore fires read-to-clear side effects on
-    // every register in that line, and the gate above only stops the SPECULATIVE case;
-    // an architecturally-required fetch from a device page still has to go to the bus.
+    // ── BURST WIDTH: DELIBERATELY UNCHANGED, INCLUDING FOR AN INHIBITED FETCH ─────
+    // The D side has an exact byte cover for INHIBITED accesses (`MmioCover`) because a
+    // load names a specific 1/2/4-byte operand and an AXI4 READ carries no byte enable,
+    // so any byte the read covers is a byte the device sees read. An earlier revision of
+    // this fix mirrored that here, narrowing an inhibited demand fill to a single 32-byte
+    // beat. That was REMOVED on purpose, and this comment exists so the next reader does
+    // not helpfully re-add it:
     //
-    // WHAT THIS DOES: one beat instead of two, at the 32-byte half-line containing the
-    // fetch, i.e. exactly the half the response can possibly deliver (`bypWindow` is
-    // selected by `missPC(5)` = which half, `missPC(4:3)` = which 8-byte window inside
-    // it). 64 -> 32 bytes, and the read can no longer cross a 32-byte boundary.
-    //
-    // WHAT THIS DOES NOT DO, stated plainly rather than left to be discovered: this is
-    // NOT the D side's exact byte cover, and a legitimate inhibited fetch still reads
-    // 24 bytes it did not name. Going further is a FRONT-END GRANULE change, not an AR
-    // payload change: `FetchRsp` delivers a fixed 64-bit window plus its predecode, and
-    // the predecode classifier (`classifyBeat`) needs the three words FOLLOWING each
-    // word it classifies. Fetching less than a whole beat leaves those lookahead words
-    // undefined INSIDE the beat, where -- unlike the beat-end case, which `classify`
-    // already refuses to guess at and marks `ambiguousLine` for `Aligner.scala:63-65`
-    // to redo -- nothing detects it and the result is silent instruction mis-framing.
-    // A true I-side `MmioCover` therefore needs the 64-bit fetch window and the 2-beat
-    // predecode dwell contract to change together. Not attempted here.
-    axi.ar.payload.len   := Mux(arHoldNarrow, U(0, 8 bits), U(1, 8 bits))
+    //   - Instruction fetch is inherently bursty and stays bursty. There is no "named
+    //     operand" to cover exactly: the architectural unit of a fetch is a stream, and
+    //     `FetchRsp` delivers a fixed 64-bit window plus a predecode that needs the three
+    //     words FOLLOWING each word it classifies. Narrowing below a whole beat leaves
+    //     those lookahead words undefined INSIDE the beat, where nothing detects it
+    //     (unlike the beat-END case, which `classify` marks `ambiguousLine` for
+    //     `Aligner.scala:63-65` to redo) — silent instruction mis-framing.
+    //   - The core cannot tell MMIO from any other cache-inhibited memory; it has only
+    //     the page attribute. And no real program executes from MMIO. So a NON-speculative
+    //     inhibited fetch is a pathological case that does not need to be made safe: once
+    //     the speculation gate above is in place, any inhibited fetch that still reaches
+    //     the bus was architecturally demanded by the program, and the burst is then the
+    //     program's problem rather than the core's.
+    //   - Equivalently: the I-cache does not honour INHIBITED as a CACHING policy, and
+    //     that is intended. It honours it as a SPECULATION policy, which is the property
+    //     that actually protects devices.
+    axi.ar.payload.len   := U(1, 8 bits)
     axi.ar.payload.size  := U(5, 3 bits)
     axi.ar.payload.burst := Axi4.burst.INCR
     // M2c: the AR id IS the MSHR index, so the demand/speculative branch is gone.
@@ -2540,16 +2527,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !mshrBeat(rIdx))
     fillHi.write(rIdx, axi.r.payload.data, enable = rFire &&  mshrBeat(rIdx))
 
-    // A narrowed INHIBITED demand fill is ONE beat, so its `last` arrives on beat 0.
-    // `missCacheable` is the install-context scalar and a demand R beat requires
-    // `refillActive` (`demandRspMatch`), so it is the cacheability of exactly the fill
-    // this beat belongs to. Speculative slots are cacheable by construction (rule P1).
-    val rSingleBeat = ridIsDemand && !missCacheable
     when(rFire) {
       val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
-      // Generalised from the two identical per-path assertions M2b carried.
-      assert(axi.r.payload.last === (mshrBeat(rIdx) || rSingleBeat),
-        "I-cache refill must be exactly two beats (one for a narrowed INHIBITED fill)")
+      // Generalised from the two identical per-path assertions M2b carried. Every I-side
+      // fill is two beats, INHIBITED included — see the AR payload comment for why the
+      // burst is deliberately not narrowed for a cache-inhibited fetch.
+      assert(axi.r.payload.last === mshrBeat(rIdx),
+        "I-cache refill must be exactly two beats")
       when(respErr) { mshrErr(rIdx) := True }
       mshrBeat(rIdx) := !mshrBeat(rIdx)
       when(axi.r.payload.last) {
@@ -2581,22 +2565,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // mis-framing, `ambiguousLine` marks it, and `Aligner.scala:63-65` re-classifies
     // live from the instruction buffer's own already-fetched words.
     val isLoBeat  = commitBeat === U(0, 1 bits)
-    // A narrowed INHIBITED demand fill delivered ONE beat, into `fillLo` (the R handler
-    // writes beat 0 there), and that beat is the 32-byte HALF-LINE the AR named — the
-    // half `missPC(5)` selects — not the low half of a 64-byte line. Two consequences,
-    // both of which are bugs if they are left out:
-    //   - `fillHi` holds the PREVIOUS fill's data, so the low beat's cross-beat
-    //     lookahead must not read it. Forcing `beatNext3` to zero puts words 13/14/15
-    //     on the same F5 `extWValid = false` boundary path the HIGH beat always takes:
-    //     `classify` refuses to guess brief-vs-full, rejects as COMPLEX, marks
-    //     `ambiguousLine`, and `Aligner.scala:63-65` re-classifies live from the
-    //     instruction buffer. Conservative, and already exercised for every
-    //     `missPC(5) = 1` fetch in the design today.
-    //   - the bypass capture below must fire on commitBeat 0 regardless of `missPC(5)`,
-    //     because the requested half arrived as beat 0 (see the `bypWindow` capture).
-    val narrowInstall = !missCacheable
     val beatSrc   = Mux(isLoBeat, fillLoQ, fillHiQ)
-    val beatNext3 = Mux(isLoBeat && !narrowInstall, fillHiQ(47 downto 0), B(0, 48 bits))
+    val beatNext3 = Mux(isLoBeat, fillHiQ(47 downto 0), B(0, 48 bits))
     val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
 
     when(predActive) {
@@ -2623,10 +2593,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // declaration for the full equivalence, write/read-ordering and missPC-
       // immutability arguments (they cover `bypWindow` identically -- same predicate,
       // same lane index, same cycle).
-      // `narrowInstall` (see above): the requested half-line arrived as beat 0, so the
-      // capture cycle is commitBeat 0 and NOT `missPC(5)` — reading `missPC(5) = 1`
-      // there would capture the previous fill's stale `fillHi`.
-      when(commitBeat === Mux(narrowInstall, U(0, 1 bits), missPC(5).asUInt)) {
+      when(commitBeat === missPC(5).asUInt) {
         bypWindow := beatSrc.subdivideIn(64 bits)(missPC(4 downto 3))
         bypPred   := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
       }

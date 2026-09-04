@@ -15,6 +15,27 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class IcacheSpec extends AnyFunSuite {
 
+  /** Drives `IcachePlugin.logic.nonSpecFetch` from a poke-able register, so this
+    * standalone DUT can exercise BOTH sides of the cache-inhibited speculation gate.
+    *
+    * `nonSpecFetch` defaults to True inside the plugin, which is the TRUTH for a DUT like
+    * this one — `cmdIn` is driven by a directed probe, so every fetch it makes really is
+    * architectural. That default is what keeps the other ~50 tests in this file unchanged.
+    * To test the gate we need to be able to say "this fetch is speculative", and there is
+    * no speculating frontend here to say it, so it is poked.
+    *
+    * A `RegInit(True)` with no other driver, deliberately, and for the reason spelled out
+    * at `prefetchEnable`'s poke site below: a poke onto a combinational default would be
+    * overwritten by its own driver on the next delta, whereas a register with no `:=`
+    * holds whatever it was last given. */
+  class SpecGateProbePlugin extends FiberPlugin {
+    val logic = during build new Area {
+      val nonSpec = RegInit(True)
+      nonSpec.simPublic()
+      host[IcachePlugin].logic.nonSpecFetch := nonSpec
+    }
+  }
+
   // ---- Dut: host plugins; IcachePlugin's during-build ports become top-level IO automatically ----
   // `xlateFactory` defaults to the plain identity stub (every existing test below is
   // unaffected); the cacheMode-directed tests pass `new ICacheModeTranslationPlugin`
@@ -28,8 +49,11 @@ class IcacheSpec extends AnyFunSuite {
     val xlate  = xlateFactory
     val icache = new IcachePlugin
     val probe  = new FetchProbePlugin   // exposes cmdIn/rspOut top-level IO
+    // Last in the list: its `during build` reads `icache.logic`, so `icache`'s own Area
+    // must already exist (the same ordering FullCoreSynth's BackendWiringPlugin relies on).
+    val specGate = new SpecGateProbePlugin
 
-    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache, probe)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache, probe, specGate)) }
     // The I-cache's cmd/rsp are plain (directionless) service Streams. The probe
     // plugin's during-build wires them to its own slave/master IO, which become
     // top-level IO of this Component for the sim to drive/observe.
@@ -824,39 +848,39 @@ class IcacheSpec extends AnyFunSuite {
       assert(gotInhibited == lineWindow64(0x14),
         "inhibited fetch itself must still return correct (distinguishable) data")
       val arAfterInhibited = arCount
-      // ── DELIBERATE BEHAVIOUR CHANGE, 2026-09-04 (speculative-inhibited-mmio fix) ──
+      // ── DELIBERATE BEHAVIOUR CHANGE, 2026-09-04 (speculative-inhibited-fetch fix) ──
       // This assertion used to read, in full:
       //
       //     assert(arAfterInhibited == arAfterWarm + 1, "inhibited fetch must refill once")
       //
-      // and nothing else. As written it pinned the DEFECT rather than the behaviour: it
-      // asserted only that a bus transaction HAPPENED, and was silent on the two
-      // questions that actually matter for a CM=10 page, which by definition names a
-      // DEVICE whose reads have side effects:
-      //   (1) was that transaction ALLOWED to happen at all -- i.e. was the fetch
-      //       architectural, or was it a wrong-path run-ahead? The old form could not
-      //       tell, and so the I-side had no speculation gate at all until now; a
-      //       wrong-path fetch into device space issued a real burst read. That half is
-      //       pinned in ExecuteLockStepSpec's "spec-mmio I-side" suite, which needs a
-      //       speculating frontend and cannot live in this standalone DUT.
-      //   (2) HOW WIDE was it? The old form accepted a 64-byte INCR burst -- sixteen
-      //       longwords, spanning four Quadra 53C96 registers including the read-to-
-      //       clear Interrupt Status -- as indistinguishable from a correct single
-      //       device read. That half is pinned HERE, below.
-      // The `arAfterWarm + 1` count is kept (this DUT drives `cmdIn` from a directed
-      // probe, so the fetch really is architectural and really must reach the bus), and
-      // the shape check is added to it.
+      // and nothing else. As written it pinned the DEFECT rather than the behaviour. A
+      // CM=10 page by definition names a DEVICE whose reads have architecturally visible
+      // side effects (read-to-clear status, FIFO pop, interrupt acknowledge), and the old
+      // assertion said only that a bus transaction HAPPENED. It was silent on the one
+      // question that decides whether that transaction is legitimate: WAS THE FETCH
+      // ARCHITECTURAL, or was it a wrong-path run-ahead a redirect is about to squash?
+      //
+      // It could not have said, because until this change the I-side had no answer to
+      // give: `s0Cacheable` was folded into the HIT expression, so INHIBITED forced a
+      // miss and therefore forced a fill, and cache mode did not reappear until
+      // `doAllocate` in the predecode dwell -- after both R beats had already returned.
+      // INHIBITED suppressed the ARRAY INSTALL and nothing else. A speculative fetch into
+      // device space issued a real burst read and the squash arrived far too late.
+      //
+      // The count assertion is KEPT and is now the positive control: a fetch this DUT
+      // makes with `nonSpec = True` really is architectural (`cmdIn` is a directed probe),
+      // so it really must reach the bus. What is ADDED is the negative control below --
+      // the same inhibited fetch, declared speculative, must issue NO AR at all.
       assert(arAfterInhibited == arAfterWarm + 1, s"inhibited fetch must refill once: $arAfterWarm -> $arAfterInhibited")
+      // Burst SHAPE is asserted unchanged, on purpose. Narrowing an inhibited fetch was
+      // tried and removed: instruction fetch is inherently bursty, the core cannot tell
+      // MMIO from any other cache-inhibited memory, and no real program executes from
+      // MMIO -- so the protection that matters is the speculation gate, not the width.
+      // This also keeps the check below non-vacuous by pinning what "unchanged" means.
       val (inhAddr, inhLen, inhSize) = arLog.last
-      assert(inhLen == 0 && inhSize == 5,
-        f"INHIBITED (device) fetch must be a SINGLE 32-byte beat, not a 64-byte burst: " +
-          f"got addr=0x$inhAddr%08x len=$inhLen size=$inhSize (len=1 size=5 is the old " +
-          f"64-byte line burst, which reads every device register in the line)")
-      assert(inhAddr == (inhibitedBase & ~31L),
-        f"INHIBITED fetch must address the 32-byte HALF-LINE it needs, not the 64-byte " +
-          f"line base: got 0x$inhAddr%08x, want 0x${inhibitedBase & ~31L}%08x")
-      // Control that the shape check is not vacuous: an ordinary CACHEABLE line fill in
-      // this very run is still the full 64-byte 2-beat burst.
+      assert(inhLen == 1 && inhSize == 5 && inhAddr == (inhibitedBase & ~63L),
+        f"INHIBITED fetch must still be an ordinary 2 x 32 B line burst at the line base: " +
+          f"got addr=0x$inhAddr%08x len=$inhLen size=$inhSize")
       assert(arLog.take(4).forall { case (_, l, s) => l == 1 && s == 5 },
         s"cacheable line fills must still be 2 x 32 B bursts: ${arLog.take(4)}")
 
@@ -873,6 +897,42 @@ class IcacheSpec extends AnyFunSuite {
         s"way-0 address must still return correct (unpoisoned) data after the INHIBITED alias: got 0x${got0.toString(16)}")
       assert(arCount == arBeforeRefetch,
         s"way-0 address must still HIT (no new AR): $arBeforeRefetch -> $arCount")
+
+      // ── THE NEW INVARIANT: no AR for an inhibited address on a squashable path ────
+      // Deliberately LAST in this test, after every array/hit regression check above, so
+      // that holding a command open and toggling the gate cannot perturb them.
+      //
+      // Same address and same cache mode as the fetch at the top of this test -- the ONLY
+      // thing that changes is whether the fetch is declared architectural. No invalidate
+      // is needed as a premise: an INHIBITED access never allocated (which is exactly what
+      // the `way0After` check above just established), so nothing at `inhibitedBase` is
+      // resident and the miss is guaranteed for reasons independent of the code under test.
+      setInhibited(dut, inhibitedBase >> 12)
+      val arBeforeSpec = arCount
+      dut.specGate.logic.nonSpec #= false
+      cd.waitSampling()
+      dut.probe.logic.cmdIn.valid #= true
+      dut.probe.logic.cmdIn.payload.pc #= inhibitedBase
+      // 200 cycles is several times the modelled memory latency, so a fill that was going
+      // to be launched has had every opportunity to launch.
+      cd.waitSampling(200)
+      assert(!dut.probe.logic.cmdIn.ready.toBoolean,
+        "a SPECULATIVE fetch of an INHIBITED page must not even be accepted at cmdPort")
+      assert(arCount == arBeforeSpec,
+        s"a SPECULATIVE fetch of an INHIBITED page must issue NO AR: " +
+          s"$arBeforeSpec -> $arCount, addrs=${arLog.drop(arBeforeSpec).map(t => f"0x${t._1}%08x")}")
+      // Positive control on the same held command: releasing the gate -- and nothing else
+      // -- lets exactly that fetch through. Without this the assertion above would pass
+      // just as happily if the DUT had simply wedged.
+      dut.specGate.logic.nonSpec #= true
+      cd.waitSamplingWhere(dut.probe.logic.cmdIn.ready.toBoolean && dut.probe.logic.cmdIn.valid.toBoolean)
+      dut.probe.logic.cmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.rspOut.valid.toBoolean)
+      assert(dut.probe.logic.rspOut.payload.data.toBigInt == lineWindow64(0x14),
+        "the held inhibited fetch must return correct data once it is non-speculative")
+      assert(arCount == arBeforeSpec + 1,
+        s"releasing the gate must launch exactly the one held fill: $arBeforeSpec -> $arCount")
+      clearCmodeOverride(dut)
 
       cd.waitSampling(4)
     }
