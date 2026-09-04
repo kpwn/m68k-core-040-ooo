@@ -3279,8 +3279,6 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                                     (ldOwner === U(OWNER_DTLB, 2 bits)) && !ldFifoFull
     walkerStoreAdmit(walkIdxItlb) := walkStReq(walkIdxItlb) && (stOwner === U(OWNER_ITLB, 2 bits))
     walkerStoreAdmit(walkIdxDtlb) := walkStReq(walkIdxDtlb) && (stOwner === U(OWNER_DTLB, 2 bits))
-    val walkerLoadAdmitAny  = walkerLoadAdmit(walkIdxItlb) || walkerLoadAdmit(walkIdxDtlb)
-    val walkerStoreAdmitAny = walkerStoreAdmit(walkIdxItlb) || walkerStoreAdmit(walkIdxDtlb)
 
     // ── Load leg ───────────────────────────────────────────────────────────────────
     when(walkerOwnsLoad) {
