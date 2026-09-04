@@ -647,6 +647,54 @@ The general lesson is the one this campaign keeps re-learning: **a long wait fol
 silent failure is indistinguishable from success unless something asserts on the artefact.**
 Both gate wrappers written for this change failed the same way, independently.
 
+### Netlist forensics: renaming churn outnumbers real logic 10:1
+
+Prompted by a sibling discovering that the standard net-renaming control can measure
+*nothing* (theirs neutralised its change with a constant, which constant-folded the logic
+away, so CTRL was BASE after propagation and matched it to the digit — an identity that
+was then misread as proof the delta was real logic), the control here was checked
+empirically rather than trusted. Both netlists already existed, so the check was free.
+
+**SpinalHDL derives net names from SOURCE LINE NUMBERS.** The generated Verilog is full of
+`when_ExceptionUnit_l2417`-style names. Diffing the BASE and FIX netlists
+(20,389,564 vs 20,389,811 bytes):
+
+| component of the 146-line netlist diff | count |
+|---|---|
+| net renames — **every one a `+38` shift** | **69** |
+| the actual logic (the two `obsSetCcr5` assignments, gated `!popIs1`) | **6** |
+| the git-hash header comment | 1 |
+
+and `+38` is exactly the Scala line delta of this change (41 insertions − 3 deletions).
+So **renaming churn outnumbers real logic 10:1 in the netlist**, which independently
+corroborates the "86% of that apparent 8.3 MHz regression was line-number churn" result
+found elsewhere today, and is why this gate has a control arm at all.
+
+**This control is NOT the folding failure mode, and the usual test for it would misfire.**
+The suggested check — "if CTRL and BASE have identical flop/LUT counts, the control folded
+and its verdict is void" — is correct for a control built by *neutralising logic with a
+constant*. It is wrong for this one. This control carries **FIX's line count (hence FIX's
+net names) with BASE's logic**, so identical flop/LUT counts versus BASE are *expected and
+required*: the variable being controlled for is NET NAMING, not the presence of logic.
+The correct validity test is three assertions, now encoded in the gate script:
+
+* CTRL vs BASE must show a **non-zero** rename-line count (else the control is
+  netlist-identical to BASE in naming and measures nothing — the folded failure mode);
+* CTRL vs FIX must show a **zero** rename-line count (else it is not carrying FIX's names);
+* CTRL must contain **no** `obsSetCcr5` logic lines versus BASE, and must differ from FIX
+  by exactly those lines.
+
+### On the missing noise baseline
+
+The observation that BASE's worst six post-route paths all sit at exactly `+0.001 ns` is
+better read as **perturbation sensitivity than as run-to-run noise**. Vivado is
+deterministic for a fixed netlist and settings — re-running the same netlist reproduces the
+same numbers — so there is no statistical noise floor to measure that way. What the
+clustered paths show is that the design is packed so tightly at the margin that *any*
+netlist perturbation reshuffles which path wins. That is precisely what the BASE→CTRL arm
+measures, and it is the missing baseline: **BASE→CTRL is the cost of perturbation alone,
+CTRL→FIX is the cost of the logic.** Neither number exists yet.
+
 ### The postroute gate is QUEUED, not skipped
 
 `synth/p135_gate.sh` (committed on this branch, corrected after the false green above) was
