@@ -353,7 +353,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       exc.dcLoadRsp.valid   := dc.loadRsp.valid
       exc.dcLoadRsp.payload := dc.loadRsp.payload
       exc.dcLoadBusy        := dc.loadBusy
-      exc.dcStoreAck        := dc.storeAck
+      // W13: the walker is a THIRD store client and the terminal ack is untagged, so it
+    // must be demultiplexed before the exception sequencer consumes it. See
+    // `LsEuPlugin.logic.excStoreAckOut`.
+    exc.dcStoreAck        := lsEu.logic.excStoreAckOut
       // route the exc's cache requests through the LS EU's arbiter
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
@@ -843,10 +846,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      // The ITLB has its OWN dedicated walker AXI port: attach a second behavioral
-      // memory holding the SAME page table (one shared page table, two read ports).
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Build the page table (whitebox pokes into the walker's own memory) up front —
       // harmless before the MMU is even enabled. The actual `ctrl.logic.mmuEnable`/
       // `urp`/`srp` ENABLE pokes are issued LATER (see the task #194 comment further
@@ -1284,8 +1289,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp   #= 0
       dut.ctrl.logic.srp   #= 0
@@ -1503,8 +1508,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp   #= 0
       dut.ctrl.logic.srp   #= 0
@@ -1635,8 +1640,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp   #= 0
       dut.ctrl.logic.srp   #= 0
@@ -1732,8 +1737,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
@@ -2805,8 +2810,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -2882,8 +2887,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -4471,8 +4476,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp   #= 0
       dut.ctrl.logic.srp   #= 0
@@ -4696,8 +4701,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -4774,8 +4779,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -4889,8 +4894,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       // Seed real memory at the data range so a re-fill (e.g. the post-CPUSH residency
       // check, or an incidental refill) sees deterministic bytes rather than X/undef.
       for (i <- 0 until 64) dmem.pokeByte(dataBase + i, 0)   // all FOUR lines, not just the first
@@ -5024,8 +5029,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -5137,8 +5142,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -5267,8 +5272,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -5371,8 +5376,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
+      // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
@@ -5872,9 +5877,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Build a table whose root/pointer are resident but the PAGE descriptor is
       // NON-RESIDENT (PDT=00) for the data page VA 0x2000. Code is IDENTITY-mapped
       // (resident) in BOTH walker memories so instruction fetch through the ITLB does
@@ -5971,9 +5980,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       buildSupervisorCodeTable(ptmem, loadAddr)
       buildSupervisorCodeTable(itlbPtmem, loadAddr)
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
@@ -6777,10 +6790,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // The D-cache and the MMU walker SHARE one physical memory: the page table the
       // handler writes via a D-cache store must be visible to the walker on re-walk.
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      // The ITLB walker shares the SAME backing memory (one physical page table), so a
-      // handler PT write is visible to the I-side re-walk too.
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Build the nested page table (little-endian) in the shared memory.
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
@@ -6963,8 +6978,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
@@ -7114,10 +7133,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       writeCodeAt(icmem, codePA, image.bytes)
       m68k040.sim.AxiMemModel.attachReadOnly(
         dut.icache.logic.axi, cd, sharedMem = icmem)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      // Page table (in both walker memories): map VA loadAddr -> PPN 0x50000 (resident).
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Page table: map VA loadAddr -> PPN 0x50000 (resident).
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       def build(mem: m68k040.ls.BehavioralMemAgent): Unit = {
         for (i <- 0 until 8) mapPage(mem, loadAddr + i * 0x1000L, codePPN + i, MMU_PAGT2)
       }
@@ -7231,8 +7254,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // D-cache + walker memories share one backing store (the handler's PT write must
       // be visible to the ITLB re-walk).
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
@@ -7360,8 +7387,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       m68k040.sim.AxiMemModel.attachReadOnly(
         dut.icache.logic.axi, cd, sharedMem = icmem)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
@@ -8784,8 +8815,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
@@ -9042,8 +9077,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
@@ -9255,8 +9294,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)
@@ -9454,8 +9497,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       // Preload every element's marker value at its own target address (the values
       // the MOVEM.L LOAD must transfer into the registers).
@@ -10193,8 +10240,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         sharedMem = zeroMem, runAheadGuardWords = 0)
 
       val dmem      = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      val ptmem     = new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      val itlbPtmem = new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // The walkers no longer have their own AXI memories: their descriptor reads and
+      // U/M writebacks go through the D-cache, so the page table has to live in the
+      // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
+      // poke/peek call site below working, now against the memory the walk really reads.
+      val ptmem = dmem
+      val itlbPtmem = dmem
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false

@@ -1,0 +1,193 @@
+===== walker/D-cache postroute gate: arm 'baseline' =====
+ref            : bb3bca1 (bb3bca1)
+netlist md5    : 1f2b74c3f814a6b0f043415bb6ff6617
+POSTROUTE_ROUNDS: 9
+finished       : 2026-09-04T16:55:29+02:00
+--- verdict lines (clk domain; SIGNOFF_* is re-derived at a real 5.000 ns) ---
+#   # (rounds 4-9 all -0.015). Total TNS across the whole design was -0.277ns over just 32
+#   # failing endpoints, all inside a 0.015ns band. That is not a design that has run out
+#   # once `phys_opt_design` has driven WNS to within a hair of the 5.000ns target and TNS
+#   # SIGNOFF_200MHZ_WNS_NS +0.009) it was under precisely that flow.
+#   # the one predicted above: under the 5.000ns target phys_opt reached TNS -0.277ns over
+#   puts "POSTROUTE_ROUND 0 WNS [get_property SLACK $rp]"
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.594 | TNS=-109.030 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.167 | TNS=-18.987 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.167 | TNS=-18.987 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.167 | TNS=-18.987 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.167 | TNS=-18.987 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.152 | TNS=-16.020 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.137 | TNS=-13.196 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.137 | TNS=-13.196 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.134 | TNS=-12.896 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.127 | TNS=-12.650 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.116 | TNS=-12.288 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.114 | TNS=-11.222 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.110 | TNS=-11.238 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.106 | TNS=-10.591 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.106 | TNS=-10.508 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.104 | TNS=-10.525 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.103 | TNS=-9.752 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.101 | TNS=-8.635 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.101 | TNS=-8.588 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.099 | TNS=-8.553 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.097 | TNS=-8.473 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.096 | TNS=-8.376 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.096 | TNS=-8.376 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.096 | TNS=-8.376 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.096 | TNS=-8.170 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.095 | TNS=-8.083 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.095 | TNS=-7.988 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.095 | TNS=-7.892 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.094 | TNS=-7.803 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.093 | TNS=-7.709 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.092 | TNS=-7.615 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.092 | TNS=-6.997 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.091 | TNS=-6.958 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.091 | TNS=-6.988 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.091 | TNS=-6.988 |
+INFO: [Physopt 32-603] Post Physical Optimization Timing Summary | WNS=-0.091 | TNS=-6.988 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=0.186  | TNS=0.000  | WHS=-0.003 | THS=-0.072 |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.794 | TNS=-576.045| WHS=0.006  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.352 | TNS=-133.796| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.397 | TNS=-83.648| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.352 | TNS=-133.796| WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.352 | TNS=-133.796| WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.352 | TNS=-125.940| WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.352 | TNS=-125.940| WHS=0.021  | THS=0.000  |
+INFO: [Route 35-57] Estimated Timing Summary | WNS=-0.352 | TNS=-125.940| WHS=0.021  | THS=0.000  |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+POSTROUTE_ROUND 0 WNS -0.337
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.337 | TNS=-110.763 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.165 | TNS=-47.833 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.165 | TNS=-47.833 | WHS=0.022 | THS=0.000 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.200 | TNS=-64.613| WHS=0.000  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.194 | TNS=-23.940| WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.133 | TNS=-7.903 | WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.125 | TNS=-0.920 | WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.065 | TNS=-1.281 | WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.066 | TNS=-1.323 | WHS=N/A    | THS=N/A    |
+Phase 6.1 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+Phase 6.1 TNS Cleanup | Checksum: 33dd4d28c
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-57] Estimated Timing Summary | WNS=-0.052 | TNS=-1.175 | WHS=0.021  | THS=0.000  |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+POSTROUTE_ROUND 1 WNS -0.041
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.041 | TNS=-0.661 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=0.001 | TNS=0.000 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=0.001 | TNS=0.000 | WHS=0.022 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=0.001 | TNS=0.000 | WHS=0.022 | THS=0.000 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 2 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 3 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 4 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 5 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 6 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 7 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 8 WNS 0.001
+INFO: [Vivado_Tcl 4-2279] Estimated Timing Summary | WNS= 0.001 | TNS= 0.000 | 
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.029 | TNS=-0.112 | WHS=0.021  | THS=0.000  |
+INFO: [Route 35-554] Router failed to improve TNS. Reverted to previous best routing.
+Phase 3 TNS Cleanup | Checksum: 27e9e2b6d
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=0.001  | TNS=0.000  | WHS=0.022  | THS=0.000  |
+POSTROUTE_ROUND 9 WNS 0.001
+# puts "SOURCE_MD5 $source_md5"
+SOURCE_MD5 1f2b74c3f814a6b0f043415bb6ff6617
+# puts "NETLIST_MD5 $gate_netlist_md5"
+NETLIST_MD5 1f2b74c3f814a6b0f043415bb6ff6617
+# puts "POSTROUTE_FULLCORE_WNS_NS $wns"
+POSTROUTE_FULLCORE_WNS_NS 0.001
+# if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_${target_mhz}  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_${target_mhz}  FMAX_MHZ $achieved" }
+POSTROUTE_FULLCORE_RESULT MET_200  FMAX_MHZ 200.04000800160034
+# puts "SIGNOFF_200MHZ_WNS_NS $wns"
+SIGNOFF_200MHZ_WNS_NS 0.001
+# if {$wns >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
+SIGNOFF_200MHZ_RESULT MET_200

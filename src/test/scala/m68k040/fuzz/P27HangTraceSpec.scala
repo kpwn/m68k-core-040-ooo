@@ -49,8 +49,11 @@ class P27HangTraceSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, PortedTestRunner.loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
       for (i <- image.bytes.indices) dmem.mem.write(PortedTestRunner.loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 4) dmem.mem.write(PortedTestRunner.SentinelAddr + i, 0.toByte)
 

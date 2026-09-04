@@ -63,8 +63,11 @@ class FpuControlWiringSpec extends AnyFunSuite {
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = zmem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
 
       // Every FP arithmetic vector points at a self-looping handler, so an ESCALATED test
       // lands somewhere defined instead of vectoring through a zero table to a wild PC.

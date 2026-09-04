@@ -75,8 +75,11 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       // makes "the frame body is zero where it should be" a meaningful assertion.
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = zmem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
 
       // Vector 8 (privilege violation) -> a self-looping handler, so the user-mode test
       // has somewhere defined to land.
@@ -413,8 +416,11 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = zmem)
-      new BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = zmem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
       dut.ctrl.logic.mmuEnable #= false
       dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
       dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0

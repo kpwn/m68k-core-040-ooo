@@ -48,8 +48,11 @@ class PreciseDrainIrqRaceSpec extends AnyFunSuite {
       // P27HangTraceSpec, ...) still attaches a behavioral slave to them so their
       // `in` ports (ar.ready/r.*) are driven rather than left floating -- match
       // that established idiom defensively.
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
 
       // Count every AW fire that targets the aligned target line -- a double-

@@ -75,7 +75,28 @@ case class LsFault() extends Bundle {
   * An aligned non-forwarded load enters a four-entry in-order descriptor ring, so
   * multiple cache operations can remain resident while untagged responses preserve
   * acceptance order. Split-line/page loads use a mutually-exclusive two-pass replay. */
-class LsEuPlugin extends FiberPlugin with LsEuService {
+/** @param walkerAgeLimit  W8's fairness bound: after this many un-granted cycles a table
+  *                        walker's `force` bit outranks the ordinary LS pipe for the
+  *                        D-cache load port (never the exception sequencer's own
+  *                        presented command). A constructor parameter, not a `Global`
+  *                        key, so directed tests can shorten it.
+  * @param walkerWedgeLimit W26's observability bound: cycles a walker may hold either
+  *                        D-cache port with NO progress on any channel before the sticky
+  *                        `walkerPortWedge` report rises.
+  *
+  *                        Sized so that NO legitimate bounded operation can reach it, not
+  *                        merely so that it is large. The binding case is a CPUSH/CINV
+  *                        maintenance walk: `DcachePlugin` refuses both client directions
+  *                        for its whole duration, which is `sets*ways = 512` iterations
+  *                        each of which may write a dirty victim back at DDR latency --
+  *                        order 10^4-10^5 cycles, and none of it produces any of the
+  *                        progress events this counter resets on. (`quiesceHold` now also
+  *                        covers `S_MAINTWAIT`, so a walker should not be holding a grant
+  *                        across one at all; this bound is the second line of defence, and
+  *                        a false halt would be far worse than a late report.) 2^20 cycles
+  *                        is ~5 ms at 200 MHz. */
+class LsEuPlugin(val walkerAgeLimit: Int = 64,
+                 val walkerWedgeLimit: Int = 1 << 20) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -162,6 +183,26 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
   // specific, and the two conditions have independent, non-overlapping launch/
   // clear events).
   var inhibitedLoadBusySig: Bool = null
+  // `quiesceHold` (W19): asserted by the commit-time exception sequencer across its
+  // maintenance-quiesce window (`S_DRAIN || S_APPLY`), and it closes TABLE-WALKER
+  // admission to the D-cache ports only -- never the CORE's own.
+  //
+  // WHY IT HAS TO EXIST. `ExceptionUnit`'s own written deadlock analysis for `S_DRAIN`
+  // ends "With the LS EU flushed, nothing re-arms them" -- i.e. once the LS pipe is
+  // flushed, the D-cache's in-flight-transaction terms are all self-clearing and
+  // `dcQuiesced` is guaranteed to settle. A table walker on the same ports makes that
+  // sentence FALSE: it is not flushed, it is not part of the LS pipe, and it can start
+  // a fresh D-cache access at any time. `S_APPLY` is included as well as `S_DRAIN`
+  // because `maintCmdOut` pulses in `S_APPLY` while the D-cache's own `maintBusyReg`
+  // only rises a cycle later, leaving a one-cycle fully-open window.
+  //
+  // The hold is at COMMAND granularity: a walk already in flight simply stalls between
+  // descriptor reads, which is bounded by the maintenance walk's own completion. The
+  // dependency graph stays `walker -> maintenance`, never the reverse.
+  //
+  // Default-idle (`allowOverride`, False) so every DUT that does not wire it still
+  // elaborates with today's behaviour.
+  var quiesceHold: Bool = null
 
   during setup {
     excActive       = Bool()
@@ -181,6 +222,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     preciseDrainBusySig    = Bool()
     debugHaltImminentIn    = Bool()
     inhibitedLoadBusySig   = Bool()
+    quiesceHold            = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     completionPort = Flow(UInt(6 bits))
@@ -264,6 +306,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     excXlateWrite.allowOverride;        excXlateWrite := False
     excXlateToken.allowOverride;        excXlateToken := U(0, DTranslationToken.Width bits)
     excXlateReady.allowOverride;        excXlateReady := False
+    quiesceHold.allowOverride;          quiesceHold := False
 
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
     // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
@@ -281,6 +324,183 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     robHeadIn.simPublic(); robHeadValidIn.simPublic(); irqPreemptPendingIn.simPublic()
     debugHaltImminentIn.simPublic()
 
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // TABLE-WALK ↔ D-CACHE PORT ARBITRATION
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //
+    // The ITLB and DTLB table walkers used to own private 128-bit AXI masters straight
+    // to physical memory. They no longer do: their three dependent descriptor READS and
+    // their deferred U/M descriptor WRITEBACK are ordinary `DcacheService` client
+    // traffic, and this block is what merges them onto the D-cache's single load port
+    // and single store port alongside the LS pipe and the exception sequencer.
+    //
+    // WHY (correctness, not performance). A page-table entry the supervisor wrote with
+    // an ordinary `move.l` sits DIRTY in the copyback L1D and is invisible in backing
+    // memory until that line is evicted. A walker reading memory behind the cache's back
+    // therefore reads the STALE descriptor and installs a wrong translation; and a
+    // walker U/M writeback that goes only to memory is later overwritten wholesale by
+    // the eviction of that same dirty line, losing the update. Losing an M means a dirty
+    // page is later evicted as clean -- silent data loss. Both directions are closed by
+    // putting the traffic through the cache that owns the line, which is also what a
+    // real 68040 does (table searches go through the data cache).
+    //
+    // WHERE THE ARBITRATION LIVES, AND WHY HERE. `DcachePlugin.scala` receives ZERO
+    // edits and gains no port and no client awareness: this file already owns a
+    // two-source override mux for the exception sequencer, and extending that mux is a
+    // far smaller change than adding a second requester tier inside a 3200-line cache.
+    // (NaxRiscv puts the equivalent mux inside its `DataCachePlugin` via a public
+    // `newLoadPort`; both placements are one layer above the raw cache, and the
+    // difference is which file absorbs the risk.)
+    //
+    // DEADLOCK. There is no circular dependency, and the reason is structural rather
+    // than argued: `DcachePlugin` contains zero references to any translation service.
+    // It never invokes the MMU and operates purely on a pre-translated `paddr` supplied
+    // by its caller. A table search computes its descriptor addresses arithmetically
+    // from the root pointer and VA index slices, so a WALK'S D-CACHE ACCESS REQUIRES NO
+    // TRANSLATION. The dependency graph is `access -> walk -> cache`: a chain, not a
+    // cycle. The two waits this block does create are both bounded and are argued at
+    // their own sites: the early-VIPT probe hand-over (see `probeCancelAll` below) and
+    // the maintenance quiesce (`quiesceHold`).
+    //
+    // RESPONSE IDENTITY. `DLoadRsp` carries no token -- responses are matched
+    // POSITIONALLY today, by the aligned ring's own pointer. Adding a second concurrent
+    // load client therefore needs an out-of-band identity, which is the `ldFifo` below:
+    // a tag pushed on every accepted `loadCmd` and popped in lockstep with every
+    // `loadRsp`, exploiting the D-cache's in-order response contract that the aligned
+    // ring already depends on. That is what lets a walker's descriptor read be
+    // outstanding at the same time as ordinary LS loads instead of serialising them.
+    val walkIdxItlb = 0
+    val walkIdxDtlb = 1
+    val walkClients: Seq[Option[m68k040.services.WalkerDcacheClient]] =
+      Seq(host.get[m68k040.services.ItlbWalkerDcacheClient],
+          host.get[m68k040.services.DtlbWalkerDcacheClient])
+    val walkPresent = walkClients.map(_.isDefined)
+    val anyWalkerPresent = walkPresent.exists(identity)
+
+    // Per-walker request views. A DUT that hosts no TLB plugin (the standalone LS-EU
+    // tests) sees these permanently idle, every admission predicate below folds to
+    // False, `ldOwner` never leaves CORE, and the whole block constant-folds away.
+    val walkLdReq = Vec(Bool(), 2)
+    val walkStReq = Vec(Bool(), 2)
+    val walkLdPayload = Vec(m68k040.cache.DLoadCmd(), 2)
+    val walkStPayload = Vec(m68k040.cache.DStoreCmd(), 2)
+    for (i <- 0 until 2) {
+      walkClients(i) match {
+        case Some(c) =>
+          walkLdReq(i)     := c.walkLoadCmd.valid
+          walkLdPayload(i) := c.walkLoadCmd.payload
+          walkStReq(i)     := c.walkStore.valid
+          walkStPayload(i) := c.walkStore.payload
+        case None =>
+          walkLdReq(i) := False
+          walkStReq(i) := False
+          walkLdPayload(i).assignDontCare()
+          walkStPayload(i).assignDontCare()
+      }
+    }
+
+    // ── Owner codes. THREE-valued (the ordinary LS pipe and the exception sequencer
+    // are ONE arbiter owner, `CORE`, because their mutual exclusion is already proven
+    // and already implemented by the exception override mux at the bottom of this
+    // file). Deliberately DISTINCT from the FOUR-valued response tag below: CORE-LS
+    // and CORE-EXC are one owner but two response identities, and the two encodings
+    // must never be used interchangeably.
+    val OWNER_CORE = 0
+    val OWNER_ITLB = 1
+    val OWNER_DTLB = 2
+    val ldOwner = RegInit(U(OWNER_CORE, 2 bits))
+    val stOwner = RegInit(U(OWNER_CORE, 2 bits))
+    ldOwner.simPublic(); stOwner.simPublic()
+    val walkerOwnsLoad  = ldOwner =/= U(OWNER_CORE, 2 bits)
+    val walkerOwnsStore = stOwner =/= U(OWNER_CORE, 2 bits)
+    // `ldOwner`/`stOwner` are REGISTERS, and every use below -- the payload mux select,
+    // the `valid` gate and every owner qualification -- reads the SAME register on the
+    // SAME cycle. That is the same-cycle owner-coherence invariant: a mux selecting off
+    // a combinational grant while a qualification reads a registered owner would
+    // reintroduce exactly the silent-corruption class this arbitration exists to avoid,
+    // through a one-cycle timing gap instead of a missing site.
+    val ldWalkSelDtlb = ldOwner === U(OWNER_DTLB, 2 bits)
+    val stWalkSelDtlb = stOwner === U(OWNER_DTLB, 2 bits)
+
+    // ── FMax: PRE-MUX the two walker legs before the boundary mux ──────────────────
+    // `dcache.loadCmd.payload.vaddr` feeds `DcachePlugin`'s `cmdSet` -> `rdSet`, the
+    // BRAM read-address net that this design's own post-route reports have repeatedly
+    // named as the critical arc. Letting both walkers reach that mux directly would
+    // widen it from 3-way to 5-way on a 32-bit bus in a route-dominated netlist. The
+    // two walker payloads are register-sourced at their producers (`TableWalker.descAddr`,
+    // the TLB plugins' `drainAddrReg`) and the select here is a REGISTER, so collapsing
+    // them to one leg first is a short flop-to-flop 2:1 and returns the boundary mux to
+    // 4-way -- one leg more than today, not two. It also means adding a third walker
+    // later would not widen the boundary at all.
+    val walkLdSel = Mux(ldWalkSelDtlb, walkLdPayload(walkIdxDtlb), walkLdPayload(walkIdxItlb))
+    val walkLdSelValid = Mux(ldWalkSelDtlb, walkLdReq(walkIdxDtlb), walkLdReq(walkIdxItlb))
+    val walkStSel = Mux(stWalkSelDtlb, walkStPayload(walkIdxDtlb), walkStPayload(walkIdxItlb))
+    val walkStSelValid = Mux(stWalkSelDtlb, walkStReq(walkIdxDtlb), walkStReq(walkIdxItlb))
+
+    // ── The FIXED architectural cache mode for table-walk traffic (W1/W2/W3) ───────
+    // `CACR.DE ? WRITETHROUGH : INHIBITED`, stamped HERE by the mux, never derived from
+    // an address and never carried on the walk request.
+    //
+    //   * It is not derived from a descriptor because that would be CIRCULAR -- the
+    //     descriptor fetch is the thing that resolves attributes. Real 68040 table
+    //     searches are physical-only for the same reason. This is also why it does not
+    //     violate the standing "never assume a static SoC address decode map" rule:
+    //     there is no page attribute in existence to consult, for anyone, ever. The
+    //     MAPPED PAGE's cache mode is still read from its descriptor and is untouched
+    //     by any of this.
+    //   * WRITETHROUGH specifically, not merely "cacheable": under WRITETHROUGH the U/M
+    //     update lands in BOTH the array and memory in all three residency states, with
+    //     no dependence on the eviction path. COPYBACK would be correct but would trade
+    //     a proof for a dependency on exactly the eviction path that created the bug.
+    //   * INHIBITED when `CACR.DE = 0` because the whole D-cache is off then: an
+    //     INHIBITED store never touches the array, so the array cannot go stale.
+    //   * The read half and the write half use the SAME expression from the SAME
+    //     signal. A per-half mode would let a read hit an array copy the write never
+    //     updated.
+    val walkCacheMode = Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
+                            m68k040.cache.CacheMode.WRITETHROUGH,
+                            m68k040.cache.CacheMode.INHIBITED)
+
+    // ── Load-response ownership FIFO ───────────────────────────────────────────────
+    // Depth 8, which is the real bound and not a round number: the aligned ring is 4
+    // deep so CORE-LS can have 4 loads outstanding, and a walker's descriptor read can
+    // be outstanding concurrently with all of them, so 5 entries are reachable. 8 is the
+    // next power of two. Every admission predicate carries `!ldFifoFull` so a push can
+    // never overrun.
+    val LDTAG_CORE_LS  = 0
+    val LDTAG_CORE_EXC = 1
+    val LDTAG_ITLB     = 2
+    val LDTAG_DTLB     = 3
+    val ldFifoDepth = 8
+    val ldFifoTags  = Vec.fill(ldFifoDepth)(Reg(UInt(2 bits)) init U(LDTAG_CORE_LS, 2 bits))
+    val ldFifoPushPtr = RegInit(U(0, log2Up(ldFifoDepth) + 1 bits))
+    val ldFifoPopPtr  = RegInit(U(0, log2Up(ldFifoDepth) + 1 bits))
+    val ldFifoOcc   = ldFifoPushPtr - ldFifoPopPtr
+    val ldFifoEmpty = ldFifoOcc === 0
+    val ldFifoFull  = ldFifoOcc === U(ldFifoDepth, ldFifoOcc.getWidth bits)
+    ldFifoOcc.simPublic()
+    // The PRE-POP head: it identifies THIS cycle's response, so it must be read before
+    // the pop below advances the pointer.
+    val ldRspTag = ldFifoTags(ldFifoPopPtr(log2Up(ldFifoDepth) - 1 downto 0))
+    ldRspTag.simPublic()
+    val coreLsRspValid  = dcache.loadRsp.valid && (ldRspTag === U(LDTAG_CORE_LS, 2 bits))
+    val coreExcRspValid = dcache.loadRsp.valid && (ldRspTag === U(LDTAG_CORE_EXC, 2 bits))
+
+    // ── Exception-sequencer load bookkeeping ───────────────────────────────────────
+    // `exc.dcLoadRsp` is wired at the top level STRAIGHT off `dcache.loadRsp`, with no
+    // qualification -- deliberately, so no DUT has to be re-wired on the response side.
+    // What makes that safe is DRAIN-TO-ZERO at the CORE-EXC boundary, and it must hold
+    // against EVERY other client, not only walkers: an exception load is admitted only
+    // when the ownership FIFO is completely empty, and no other client is admitted while
+    // one is presented or outstanding. So while the exception sequencer is waiting, the
+    // only response that can arrive is its own.
+    val excLoadOutstanding = RegInit(False)
+    excLoadOutstanding.simPublic()
+    val ldBusyExc = excLoadOutstanding || excLoadCmdValid
+    val excLoadAdmit = excLoadCmdValid && (ldOwner === U(OWNER_CORE, 2 bits)) &&
+                       ldFifoEmpty && !ldFifoFull
+
     // ---- store queue instance ----
     val sq = new StoreQueue(8)
     sq.io.commit  << sqCommitPort
@@ -297,8 +517,23 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // excActive is already high while E_DRAIN still lets ordinary SQ stores finish.
     val excStoreOutstanding = RegInit(False)
     excStoreOutstanding.simPublic()
-    sq.io.drainAck := dcache.storeAck && !excStoreOutstanding
-    sq.io.drainErr := dcache.storeErr && !excStoreOutstanding
+    // ── W13: the terminal store ack is UNTAGGED, so it must be demultiplexed by the
+    // latched store owner. `StoreQueue` already ASSERTS on a stray ack, so mis-routing
+    // a walker's U/M-store ack into the SQ is a hard failure, not a silent one -- which
+    // is exactly why this qualification is mandatory rather than prudent.
+    //
+    // Only one of the three can be outstanding at a time on the store direction (the
+    // store side is drain-to-zero: see the grant machine at the bottom of this file), so
+    // these three terms are mutually exclusive by construction.
+    val walkStOutstanding = RegInit(False)
+    walkStOutstanding.simPublic()
+    sq.io.drainAck := dcache.storeAck && !excStoreOutstanding && !walkStOutstanding
+    sq.io.drainErr := dcache.storeErr && !excStoreOutstanding && !walkStOutstanding
+    // CORE store credits: SQ drains AND exception-sequencer stores, minus CORE acks.
+    // The store port is handed to a walker only at zero, so a walker's U/M store can
+    // never interleave with a core store the untagged ack could then be attributed to.
+    val coreStOutstanding = Reg(UInt(3 bits)) init 0
+    coreStOutstanding.simPublic()
     sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
     // Simulation-only visibility for the full-path exception/SQ arbitration proof.
     // These are existing queue signals, not a second producer or a cross-plugin API.
@@ -953,7 +1188,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                            !alignedSendHeld
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
-    val alignedRspFire  = alignedRspValid && dcache.loadRsp.valid
+    val alignedRspFire  = alignedRspValid && coreLsRspValid
     val alignedCanEnq   = !bkBusy && (!alignedFull || alignedRspFire)
     // A split pair needs TWO free slots this cycle (accounting for a same-cycle
     // pop exactly like `alignedCanEnq` does for one). This is the actual fix for
@@ -1038,7 +1273,16 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
                      Mux(llReg.bDone, llReg.addrB, llReg.vaddr), alignedCmd.vaddr)
     loadPaddr := Mux(useSplitCmd,
                      Mux(llReg.bDone, llReg.paddrB, llReg.paddr), alignedCmd.paddr)
-    dcache.loadCmd.valid         := Mux(useSplitCmd, llReg.valid, alignedSendValid)
+    // ── Owner qualification of the CORE-LS load command (see the arbitration block
+    // near the top of `logic`). `coreLsGrant` is a conjunction of two REGISTERED nets,
+    // and it is what stops the LS pipe issuing while the port has been handed to a
+    // walker. `alignedCmdFire` below MUST carry the same term: `dcache.loadCmd.ready`
+    // never references `valid`, so an unqualified `alignedSendValid && ready` would
+    // advance the ring past an entry whose command was never actually presented.
+    val coreLsGrant     = (ldOwner === U(OWNER_CORE, 2 bits)) && !excLoadCmdValid
+    val coreLsLoadReq   = Mux(useSplitCmd, llReg.valid, alignedSendValid)
+    val coreLsLoadAdmit = coreLsLoadReq && coreLsGrant && !ldFifoFull
+    dcache.loadCmd.valid         := coreLsLoadAdmit
     dcache.loadCmd.payload.vaddr := loadVaddr
     dcache.loadCmd.payload.paddr := loadPaddr
     dcache.loadCmd.payload.size  := Mux(useSplitCmd, llReg.size, alignedCmd.size)
@@ -1048,7 +1292,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       useSplitCmd,
       (False ## llReg.bDone ## llReg.robId.asBits).asUInt,
       (False ## False ## alignedCmd.bk.robId.asBits).asUInt)
-    val alignedCmdFire = alignedSendValid && dcache.loadCmd.ready
+    val alignedCmdFire = alignedSendValid && coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
     alignedCmdFire.simPublic()
 
     // ---- store split (byte-lane) for the SQ entry ----
@@ -1166,7 +1410,29 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // Forward/fault cancels by token; squash/exception cancels the whole queue.
     val probeWanted      = normalReqArm && tIsLoad
     val probeCancel      = Bool()
-    val probeCancelAll   = sqFlushSig || excActive
+    // ── W11: handing the load port to a walker MUST also cancel every resident
+    // early-VIPT probe, and this is a CORRECTNESS requirement, not an optimisation.
+    //
+    // `DcachePlugin`'s `loadCmdPort.ready` carries `(!earlyProbeTokenPresent ||
+    // earlyProbeOwnsCmd)`: a resident probe token blocks any load command that does not
+    // own it. Without this term the sequence is (1) the mux hands the load port to a
+    // walker and deasserts CORE's `loadCmd.valid`; (2) `loadProbePort.ready` is gated on
+    // `(!loadCmdPort.valid || useEarlyProbe)`, so with CORE's valid now low the LS EU
+    // keeps launching probes; (3) all four probe slots fill with tokens whose matching
+    // load commands the mux will never let through; (4) the walker's command matches no
+    // token, so `loadCmdPort.ready` is false FOREVER. Neither side advances.
+    //
+    // The fix reuses machinery that already exists for exactly this hand-over: the
+    // design already cancels every resident probe when the port goes to the exception
+    // sequencer. Cancelling a probe is functionally free -- an absent probe
+    // qualification simply makes the later resolved command take the ordinary path --
+    // so this is a performance event, never a correctness one.
+    //
+    // NaxRiscv is immune to this whole class for a nameable reason: it has no
+    // allocating structure that outlives one pass through the cache port. Our
+    // early-probe token array is exactly such a structure, so this term is the price of
+    // a feature NaxRiscv does not have, and it has no outside precedent to lean on.
+    val probeCancelAll   = sqFlushSig || excActive || walkerOwnsLoad
     val probeCancelToken = UInt(m68k040.cache.DLoadToken.Width bits)
     probeCancel := False
     probeCancelToken := U(0, m68k040.cache.DLoadToken.Width bits)
@@ -1956,7 +2222,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       }
 
       LAUNCH.whenIsActive {
-        when(dcache.loadCmd.fire) {
+        when(coreLsLoadAdmit && dcache.loadCmd.ready) {
           // Slot A accepted -> drop loadCmd.valid (do NOT re-issue slot A while WAIT/
           // WAIT_A awaits its response). For a cross access WAIT_A re-asserts the launch
           // for slot B (bDone) once slot A's line lands.
@@ -1968,7 +2234,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       }
 
       WAIT_A.whenIsActive {
-        when(dcache.loadRsp.valid && !aDone) {
+        when(coreLsRspValid && !aDone) {
           when(dcache.loadRsp.payload.fault) {
             when(!bkPoisoned) {
               captureFaultDesc(bkCtx, llReg.vaddr, llReg.size, atc = false)
@@ -1984,12 +2250,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         }
         when(aDone) {
           llReg.valid := True
-          when(dcache.loadCmd.fire) { llReg.valid := False; goto(WAIT_B) }
+          when(coreLsLoadAdmit && dcache.loadCmd.ready) { llReg.valid := False; goto(WAIT_B) }
         }
       }
 
       WAIT_B.whenIsActive {
-        when(dcache.loadRsp.valid) {
+        when(coreLsRspValid) {
           // `lineOff`/`u1.size` are back-carried as llReg.vaddr(3 downto 0)/llReg.size
           // (spec §3.2(c)) — reading the live s1Va/u1 here would be the same class of
           // staleness bug as the supervisor read above.
@@ -2022,8 +2288,8 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     val bkInWaitB     = bkFsm.isActive(bkFsm.WAIT_B)
     // The back RELEASES this cycle (poisoned or not) — the front's Slice-1 WAIT_BK
     // uses this to free S1 on exactly the pre-split cycle.
-    val bkCompletes   = (bkInWaitB && dcache.loadRsp.valid) ||
-                        (bkInWaitA && dcache.loadRsp.valid && dcache.loadRsp.payload.fault)
+    val bkCompletes   = (bkInWaitB && coreLsRspValid) ||
+                        (bkInWaitA && coreLsRspValid && dcache.loadRsp.payload.fault)
     bkCompletes.simPublic()
     // The back actually WRITES comp* this cycle (a poisoned back load writes nothing,
     // so the front is free to use the stage). A split slot A's own successful
@@ -2518,9 +2784,14 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // A split's second translation reuses P2T and has priority over a younger P2
     // command. Ordinary P2 loads reserve both the translation response slot and the
     // virtual-probe queue before asserting either valid, making the two fires atomic.
-    splitReqArm := txValid && txSecond && !txWaitingRsp && !sqFlushSig && !excActive
+    // W11's second half: suppress NEW probe launches for as long as a walker owns the
+    // load port, so the cancel above cannot race a same-cycle launch. `dcLoadHeldByOther`
+    // folds the walker-owner bit into the existing `!excActive` conjunction rather than
+    // adding a separate gate, so the two hand-overs stay one mechanism.
+    val dcLoadHeldByOther = excActive || walkerOwnsLoad
+    splitReqArm := txValid && txSecond && !txWaitingRsp && !sqFlushSig && !dcLoadHeldByOther
     normalReqArm := tValid && tIsMem && txReady && !splitReqArm &&
-                    !sqFlushSig && !excActive && (!tIsLoad || dcache.loadProbe.ready)
+                    !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
     val normalReqFire = xlate.req.fire && !reqFromSplit && !excActive
     val splitReqFire  = xlate.req.fire && reqFromSplit && !excActive
 
@@ -2884,7 +3155,17 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         FAILURE)
     }
     when(excLoadCmdValid) {
-      dcache.loadCmd.valid         := True
+      // W23: `valid` -- NOT this `when`'s condition -- carries the admission predicate.
+      // Keeping the header at the single registered `excLoadCmdValid` net preserves the
+      // FMax property the long comment above establishes (that node is the select of the
+      // whole ~104-bit payload mux); the extra conjunction rides on the 1-bit `valid`
+      // instead, where it costs one LUT on a net that is not the payload mux select.
+      //
+      // The admission predicate is `excLoadAdmit` -- the SAME expression that gates the
+      // FIFO push tag and `excLoadCmdReady` at the bottom of this block. A weaker
+      // predicate here would reopen the very hole it closes, because
+      // `dcache.loadCmd.ready` never references `valid`.
+      dcache.loadCmd.valid         := excLoadAdmit
       dcache.loadCmd.payload.vaddr := excLoadCmdVaddr
       // Task 11: the PHYSICAL address now comes across explicitly instead of being
       // regenerated as the vaddr here. Every pre-existing exception-sequencer load is
@@ -2932,7 +3213,11 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     when(dcache.storeAck && excStoreOutstanding) {
       excStoreOutstanding := False
     }
-    when(dcache.store.fire && excActive && excStoreValid) {
+    // W23's store-side twin: qualified by the store owner for the same reason the load
+    // side is. With a walker owning the store port `dcache.store.fire` is the WALKER's
+    // handshake, and setting `excStoreOutstanding` off it would both hijack the walker's
+    // ack and leave the exception sequencer's own store permanently unacked.
+    when(dcache.store.fire && excActive && excStoreValid && !walkerOwnsStore) {
       excStoreOutstanding := True
     }
     // The ordinary LS P2/P2T pipe fully relinquishes this translation stream for the
@@ -2971,6 +3256,266 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // already-retired) instruction.
     xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, 6 bits))
 
-    excLoadCmdReady := dcache.loadCmd.ready
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // WALKER LEGS OF THE D-CACHE PORT MUX  (last drivers -- they override both the
+    // ordinary LS pipe's base drives and the exception sequencer's overrides above)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //
+    // Placed after the exception block deliberately. `excLoadAdmit`/`excStoreAdmit`
+    // already require `ldOwner`/`stOwner` to be CORE, so the two overrides are mutually
+    // exclusive by construction; being last simply makes that structurally obvious
+    // instead of relying on the reader to re-derive it.
+
+    // ── Admission predicates ───────────────────────────────────────────────────────
+    // Provably pairwise exclusive with `coreLsLoadAdmit` and `excLoadAdmit`: those two
+    // both require `ldOwner === CORE` and differ on `excLoadCmdValid`, while these two
+    // require `ldOwner` to name their own walker. The sim assertion at the bottom of
+    // this block machine-checks it every cycle rather than asking the reader to trust it.
+    val walkerLoadAdmit = Vec(Bool(), 2)
+    val walkerStoreAdmit = Vec(Bool(), 2)
+    walkerLoadAdmit(walkIdxItlb) := walkLdReq(walkIdxItlb) &&
+                                    (ldOwner === U(OWNER_ITLB, 2 bits)) && !ldFifoFull
+    walkerLoadAdmit(walkIdxDtlb) := walkLdReq(walkIdxDtlb) &&
+                                    (ldOwner === U(OWNER_DTLB, 2 bits)) && !ldFifoFull
+    walkerStoreAdmit(walkIdxItlb) := walkStReq(walkIdxItlb) && (stOwner === U(OWNER_ITLB, 2 bits))
+    walkerStoreAdmit(walkIdxDtlb) := walkStReq(walkIdxDtlb) && (stOwner === U(OWNER_DTLB, 2 bits))
+
+    // ── Load leg ───────────────────────────────────────────────────────────────────
+    when(walkerOwnsLoad) {
+      dcache.loadCmd.valid   := walkLdSelValid && !ldFifoFull
+      // Field-by-field rather than a whole-bundle assign followed by two overrides:
+      // SpinalHDL's no-latch/no-override check rejects a same-scope field override of a
+      // just-assigned bundle as a complete assignment overlap.
+      dcache.loadCmd.payload.vaddr := walkLdSel.vaddr
+      dcache.loadCmd.payload.paddr := walkLdSel.paddr
+      dcache.loadCmd.payload.size  := walkLdSel.size
+      // W1/W2/W3: the FIXED architectural policy, stamped here and nowhere else. The
+      // walker's own drive of this field is an inert default that never reaches the cache.
+      dcache.loadCmd.payload.cacheMode := walkCacheMode
+      // W25: a RESERVED token per walker, never a don't-care. A don't-care token could
+      // match a live early-probe entry on token AND vaddr and silently answer this
+      // descriptor read out of that probe's captured data.
+      dcache.loadCmd.payload.token := Mux(ldWalkSelDtlb,
+        U(m68k040.cache.DLoadToken.WALK_DTLB, m68k040.cache.DLoadToken.Width bits),
+        U(m68k040.cache.DLoadToken.WALK_ITLB, m68k040.cache.DLoadToken.Width bits))
+    }
+
+    // ── Store leg ──────────────────────────────────────────────────────────────────
+    when(walkerOwnsStore) {
+      // W24: `sq.io.drain.ready := dcache.store.ready` is UNCONDITIONAL at its own site.
+      // Without this hold a walker's U/M store silently consumes the SQ drain's `ready`
+      // and a core store is permanently lost. The exception override already closes
+      // exactly this hole for its own case; this is the same hold for the walker case.
+      sq.io.drain.ready := False
+      excStoreReady     := False
+      dcache.store.valid   := walkStSelValid
+      dcache.store.payload.paddr    := walkStSel.paddr
+      dcache.store.payload.data     := walkStSel.data
+      dcache.store.payload.size     := walkStSel.size
+      dcache.store.payload.useStrb  := walkStSel.useStrb
+      dcache.store.payload.strb     := walkStSel.strb
+      dcache.store.payload.lineData := walkStSel.lineData
+      dcache.store.payload.precise  := walkStSel.precise
+      // W3: the SAME fixed policy expression the read half uses, from the same signal.
+      dcache.store.payload.cacheMode := walkCacheMode
+    }
+
+    // ── Grant machine, LOAD direction ──────────────────────────────────────────────
+    // Base priority is `CORE-EXC > CORE-LS > walkers`, i.e. TODAY'S behaviour exactly
+    // whenever no walker is pending. Fairness comes from a per-walker aging counter:
+    // after `walkerAgeLimit` un-granted cycles that walker's `force` bit outranks
+    // CORE-LS (never CORE-EXC's own presented command).
+    //
+    // A grant covers exactly ONE command and is released as soon as that command is
+    // accepted, so CORE-LS is never held off for longer than it takes the cache to
+    // accept one load -- and, because of the ownership FIFO, a walker's descriptor read
+    // may be OUTSTANDING at the same time as up to four ordinary LS loads. Only the
+    // command port is exclusive, not the pipeline.
+    //
+    // STARVATION, both directions. A walker cannot starve: `force` bounds the wait at
+    // `walkerAgeLimit`. CORE-LS cannot starve either: a walker requests only while it
+    // has an un-issued descriptor read, which is at most one command per memory round
+    // trip, and the grant is released on acceptance.
+    val ldWalkRr = RegInit(False)   // False => ITLB wins the tie-break next
+    val ldAge = Vec.fill(2)(Reg(UInt(log2Up(walkerAgeLimit + 1) bits)) init 0)
+    val ldForce = Vec(Bool(), 2)
+    for (i <- 0 until 2) {
+      ldForce(i) := ldAge(i) === U(walkerAgeLimit, ldAge(i).getWidth bits)
+      when(!walkLdReq(i) || walkerOwnsLoad) {
+        ldAge(i) := 0
+      } elsewhen (!ldForce(i)) {
+        ldAge(i) := ldAge(i) + 1
+      }
+    }
+    val ldCand = Vec(Bool(), 2)
+    for (i <- 0 until 2) ldCand(i) := walkLdReq(i) && (!coreLsLoadReq || ldForce(i))
+    val ldPickDtlb = ldCand(walkIdxDtlb) && (!ldCand(walkIdxItlb) || ldWalkRr)
+    val ldGrantOk = (ldOwner === U(OWNER_CORE, 2 bits)) && !ldBusyExc && !quiesceHold &&
+                    !ldFifoFull && (ldCand(walkIdxItlb) || ldCand(walkIdxDtlb))
+    when(ldGrantOk) {
+      ldOwner  := Mux(ldPickDtlb, U(OWNER_DTLB, 2 bits), U(OWNER_ITLB, 2 bits))
+      ldWalkRr := !ldPickDtlb
+    }
+    when(walkerOwnsLoad) {
+      // Release on acceptance, or immediately if the granted walker stopped asking (it
+      // was flushed, or its walk resolved between the grant decision and this cycle).
+      when(!walkLdSelValid || (dcache.loadCmd.valid && dcache.loadCmd.ready)) {
+        ldOwner := U(OWNER_CORE, 2 bits)
+      }
+    }
+
+    // ── Grant machine, STORE direction (drain-to-zero) ─────────────────────────────
+    // The store direction keeps drain-to-zero rather than borrowing the load side's
+    // FIFO, because `storeAck` is a single untagged terminal pulse and `StoreQueue`
+    // asserts on a stray one: identifying a store response positionally would need the
+    // same FIFO on a direction that has no throughput case for it. A walker U/M store
+    // is one store, issued once per walk that actually changes a descriptor byte.
+    //
+    // Note the deliberate ASYMMETRY with the load side: the store grant is NOT gated on
+    // `!sq.io.drain.valid`. Handing the port over at the first genuinely idle cycle
+    // costs the SQ at most one store's latency and removes any need for a store-side
+    // starvation argument at all.
+    val stWalkRr = RegInit(False)
+    val stCandItlb = walkStReq(walkIdxItlb)
+    val stCandDtlb = walkStReq(walkIdxDtlb)
+    val stPickDtlb = stCandDtlb && (!stCandItlb || stWalkRr)
+    val stGrantOk = (stOwner === U(OWNER_CORE, 2 bits)) && (coreStOutstanding === 0) &&
+                    !dcache.store.fire && !excStoreValid && !excStoreOutstanding &&
+                    !quiesceHold && (stCandItlb || stCandDtlb)
+    when(stGrantOk) {
+      stOwner  := Mux(stPickDtlb, U(OWNER_DTLB, 2 bits), U(OWNER_ITLB, 2 bits))
+      stWalkRr := !stPickDtlb
+    }
+    when(walkerOwnsStore) {
+      when(!walkStOutstanding && !walkStSelValid) { stOwner := U(OWNER_CORE, 2 bits) }
+    }
+
+    // ── Outstanding-transaction bookkeeping ────────────────────────────────────────
+    val walkStFire = walkerOwnsStore && dcache.store.valid && dcache.store.ready
+    when(walkStOutstanding && dcache.storeAck) { walkStOutstanding := False }
+    when(walkStFire) { walkStOutstanding := True }
+
+    val coreStFire = dcache.store.fire && !walkerOwnsStore
+    val coreStAck  = dcache.storeAck && !walkStOutstanding
+    // ── W13, THIRD consumer: the exception sequencer's own terminal ack ────────────
+    // `ExceptionUnit.dcStoreAck` is wired STRAIGHT off `DcacheService.storeAck` by every
+    // integrated DUT, unqualified. With two store clients that was safe: the sequencer
+    // only stores after `E_DRAIN` has waited on `sqDrained`, so no SQ store can be
+    // outstanding to ack in its place. A TABLE WALKER is a third client and breaks that,
+    // and it is NOT enough that `stGrantOk` refuses a NEW grant while the sequencer has a
+    // store presented -- a walker store granted EARLIER can still be outstanding when the
+    // sequencer reaches `E_STORE`, and its ack then advances `E_STWAIT` while
+    // `stoValidReg` is still set. The next `E_STORE` trips ExceptionUnit's own
+    // "attempted to overwrite an unaccepted frame-store command" assertion.
+    //
+    // Found exactly that way: this fired in `ExecuteLockStepSpec`'s MOVEM store-fault
+    // case before this term existed. Consume THIS signal rather than the raw `storeAck`.
+    //
+    // Deliberately NOT also qualified against the SQ's acks: that is pre-existing
+    // behaviour protected by the sequencer's own `sqDrained` discipline, and narrowing it
+    // here would be an unrelated change smuggled into this one.
+    val excStoreAckOut = dcache.storeAck && !walkStOutstanding
+    excStoreAckOut.simPublic()
+    when(coreStFire && !coreStAck) { coreStOutstanding := coreStOutstanding + 1 }
+    when(!coreStFire && coreStAck && (coreStOutstanding =/= 0)) {
+      coreStOutstanding := coreStOutstanding - 1
+    }
+
+    // W30: `excLoadOutstanding`'s CLEAR is the TAGGED term, not an unqualified
+    // `dcache.loadRsp.valid`. The store side's untagged mirror is safe only because
+    // `E_DRAIN`/`R_DRAIN` wait on `sqDrained`; there is no load-side analogue of that
+    // invariant, so the clear has to be qualified rather than justified.
+    when(coreExcRspValid) { excLoadOutstanding := False }
+    when(excLoadAdmit && dcache.loadCmd.ready) { excLoadOutstanding := True }
+
+    // ── Ownership FIFO push/pop ────────────────────────────────────────────────────
+    // The pushed tag is encoded COMBINATIONALLY, on the cycle of the command handshake,
+    // from the four admission predicates that actually gate the mux legs -- never read
+    // from a separately-clocked owner register. Reading a register here would reopen the
+    // same-cycle coherence hole from the other side: the mux would select off one value
+    // and the tag record the other.
+    val ldPushTag = UInt(2 bits)
+    ldPushTag := U(LDTAG_CORE_LS, 2 bits)
+    when(excLoadAdmit)                     { ldPushTag := U(LDTAG_CORE_EXC, 2 bits) }
+    when(walkerLoadAdmit(walkIdxItlb))     { ldPushTag := U(LDTAG_ITLB, 2 bits) }
+    when(walkerLoadAdmit(walkIdxDtlb))     { ldPushTag := U(LDTAG_DTLB, 2 bits) }
+    when(dcache.loadCmd.valid && dcache.loadCmd.ready) {
+      ldFifoTags(ldFifoPushPtr(log2Up(ldFifoDepth) - 1 downto 0)) := ldPushTag
+      ldFifoPushPtr := ldFifoPushPtr + 1
+    }
+    when(dcache.loadRsp.valid) { ldFifoPopPtr := ldFifoPopPtr + 1 }
+
+    // ── Route the responses back to the walkers ────────────────────────────────────
+    for (i <- 0 until 2) {
+      val tagI = if (i == walkIdxItlb) LDTAG_ITLB else LDTAG_DTLB
+      val ownerI = if (i == walkIdxItlb) OWNER_ITLB else OWNER_DTLB
+      walkClients(i).foreach { c =>
+        c.walkLoadCmd.ready   := dcache.loadCmd.ready && walkerLoadAdmit(i)
+        c.walkLoadRsp.valid   := dcache.loadRsp.valid && (ldRspTag === U(tagI, 2 bits))
+        c.walkLoadRsp.payload := dcache.loadRsp.payload
+        c.walkStore.ready     := dcache.store.ready && walkerStoreAdmit(i)
+        c.walkStoreAck        := dcache.storeAck && walkStOutstanding &&
+                                 (stOwner === U(ownerI, 2 bits))
+        c.walkStoreErr        := dcache.storeErr && walkStOutstanding &&
+                                 (stOwner === U(ownerI, 2 bits))
+      }
+    }
+
+    // ── W26: PRODUCTION wedge report for this new merge point ──────────────────────
+    // A wedge here produces NO AXI grant to time out, so it is invisible to every
+    // existing watchdog (the AXI D-merge's bounded-grant timer, the D-cache's own
+    // diagnostic fault, and the halt-reason channel). Held grant with no progress on
+    // either direction for `walkerWedgeLimit` cycles raises a sticky report which the
+    // top level folds into the halt-reason channel.
+    val walkGrantHeld = walkerOwnsLoad || walkerOwnsStore
+    val walkGrantProgress = (dcache.loadCmd.valid && dcache.loadCmd.ready) ||
+                            dcache.loadRsp.valid ||
+                            (dcache.store.valid && dcache.store.ready) || dcache.storeAck
+    val walkWedgeCnt = Reg(UInt(log2Up(walkerWedgeLimit + 1) bits)) init 0
+    when(!walkGrantHeld || walkGrantProgress) {
+      walkWedgeCnt := 0
+    } elsewhen (walkWedgeCnt =/= U(walkerWedgeLimit, walkWedgeCnt.getWidth bits)) {
+      walkWedgeCnt := walkWedgeCnt + 1
+    }
+    val walkerPortWedge = RegInit(False)
+    when(walkGrantHeld && (walkWedgeCnt === U(walkerWedgeLimit, walkWedgeCnt.getWidth bits))) {
+      walkerPortWedge := True
+    }
+    walkerPortWedge.simPublic()
+
+    // ── Structural tripwires (simulation only; pruned from every synthesised netlist) ──
+    GenerationFlags.simulation {
+      val admitCount = coreLsLoadAdmit.asUInt +^ excLoadAdmit.asUInt +^
+                       walkerLoadAdmit(walkIdxItlb).asUInt +^ walkerLoadAdmit(walkIdxDtlb).asUInt
+      assert(admitCount <= U(1),
+        "LsEuPlugin: more than one D-cache LOAD client was admitted in the same cycle -- " +
+        "the ownership-FIFO push tag is no longer a well-defined one-hot", FAILURE)
+      val stAdmitCount = walkerStoreAdmit(walkIdxItlb).asUInt +^ walkerStoreAdmit(walkIdxDtlb).asUInt
+      assert(stAdmitCount <= U(1),
+        "LsEuPlugin: both walkers were admitted to the D-cache STORE port in the same cycle",
+        FAILURE)
+      assert(!(dcache.loadRsp.valid && ldFifoEmpty),
+        "LsEuPlugin: a D-cache load response arrived with an EMPTY ownership FIFO -- the " +
+        "push/pop lockstep has desynchronised and every response after this one is " +
+        "attributed to the wrong client", FAILURE)
+      assert(!(walkStOutstanding && excStoreOutstanding),
+        "LsEuPlugin: a walker U/M store and an exception-sequencer store were outstanding " +
+        "at the same time -- the untagged storeAck cannot be demultiplexed", FAILURE)
+      assert(!(walkStOutstanding && (coreStOutstanding =/= 0)),
+        "LsEuPlugin: a walker U/M store was outstanding alongside a CORE store -- the " +
+        "store direction's drain-to-zero hand-over has been violated", FAILURE)
+      // W19's own tripwire: a walker must never be granted inside the maintenance
+      // quiesce window, or `ExceptionUnit`'s written "nothing re-arms them" deadlock
+      // proof for `S_DRAIN` becomes false.
+      assert(!(quiesceHold && (ldGrantOk || stGrantOk)),
+        "LsEuPlugin: a table walker was granted a D-cache port during the exception " +
+        "sequencer's maintenance quiesce window", FAILURE)
+    }
+
+    // W23: `excLoadCmdReady` was UNCONDITIONAL. `ExceptionUnit` computes
+    // `dcLoadCmd.fire` as `ldoValidReg && ready`, so an unqualified ready would retire
+    // the sequencer's command on a cycle this mux never presented it -- the sequencer
+    // would then wait forever in its WAIT state for a response that was never requested.
+    excLoadCmdReady := dcache.loadCmd.ready && excLoadAdmit
   }
 }

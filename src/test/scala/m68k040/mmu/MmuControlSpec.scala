@@ -4,7 +4,7 @@ import m68k040.{M68kParams, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.cache.{CacheMode, TranslationReq, TranslationRsp}
 import m68k040.services.{DTranslationService, MmuControlService}
-import m68k040.ls.BehavioralMemAgent
+import m68k040.sim.{DcacheClientMemAgent, WalkerDcacheSimIo}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -23,8 +23,12 @@ class MmuControlSpec extends AnyFunSuite {
     val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new DtlbProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
-    def walkerAxi = dtlb.walkerAxi
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort)) }
+    // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
+    // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
+    // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
+    // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
   }
 
   val ROOT = 0x10000L
@@ -33,13 +37,13 @@ class MmuControlSpec extends AnyFunSuite {
 
   // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
   // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
-  def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
+  def pokeWordLE(mem: DcacheClientMemAgent, addr: Long, w: Long): Unit =
     for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt
   def vpnOf(va: Long): Long  = (va >> 12) & 0xfffff
-  def buildTable(mem: BehavioralMemAgent, va: Long, ppn: Long): Unit = {
+  def buildTable(mem: DcacheClientMemAgent, va: Long, ppn: Long): Unit = {
     pokeWordLE(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
     pokeWordLE(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
     pokeWordLE(mem, PAGT + pageIdx(va) * 4, ((ppn << 12) & 0xfffff000L) | 0x1L)
@@ -60,7 +64,7 @@ class MmuControlSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      new BehavioralMemAgent(dut.walkerAxi, cd)
+      new DcacheClientMemAgent(dut.walkPort, cd)
       dut.probe.logic.reqIn.valid #= false
       dut.probe.logic.reqIn.vpn #= 0; dut.probe.logic.reqIn.write #= false; dut.probe.logic.reqIn.supervisor #= false
       cd.waitSampling(4)
@@ -73,7 +77,7 @@ class MmuControlSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      val mem = new DcacheClientMemAgent(dut.walkPort, cd)
       dut.probe.logic.reqIn.valid #= false
       cd.waitSampling(4)
       val va = 0x00802000L
@@ -92,7 +96,7 @@ class MmuControlSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      val mem = new DcacheClientMemAgent(dut.walkPort, cd)
       dut.probe.logic.reqIn.valid #= false
       cd.waitSampling(4)
       val va = 0x00802000L

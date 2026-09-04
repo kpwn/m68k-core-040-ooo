@@ -174,8 +174,11 @@ object PortedTestRunner {
       // exactly this (see its doc comment) — `ExecuteLockStepSpec`'s MMU tests never
       // needed it because they poke the walker's memory directly via a whitebox
       // `buildMmuTable` helper instead of running real architected store instructions.
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
 
       // Also seed the D-SIDE view of the program image (ported-tests triage, cluster 2
       // / PC-relative indexed): `FuzzDut.attachProgram` above writes the I-cache's own

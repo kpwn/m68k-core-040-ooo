@@ -20,6 +20,9 @@ synth/*.rpt
 synth/*.log
 synth/*.jou
 synth/*.dcp
+# Raw Vivado transcripts from synth/run_walker_dcache_gate.sh. The distilled
+# `*.summary` beside each one IS committed -- that is the gate evidence.
+synth/*.out
 # Archived gate evidence keeps its .rpt/.out files (they are the durable record) but
 # never its checkpoints: a synth+routed DCP pair is ~85 MB per arm, is regenerable from
 # the pinned netlist md5 recorded alongside it, and no .dcp has ever been tracked here.

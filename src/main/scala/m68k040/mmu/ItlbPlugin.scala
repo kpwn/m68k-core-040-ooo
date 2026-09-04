@@ -1,11 +1,10 @@
 package m68k040.mmu
 
-import m68k040.cache.{CacheMode, TranslationReq, TranslationRsp}
-import m68k040.services.{TranslationService, MmuControlService}
+import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp, DStoreCmd, TranslationReq, TranslationRsp}
+import m68k040.services.{TranslationService, ItlbWalkerDcacheClient, MmuControlService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
 import spinal.lib.misc.plugin.FiberPlugin
 
 /** I-side MMU plugin: a banked ITLB + a SEPARATE hardware 3-level table walker
@@ -21,8 +20,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - When HIGH: a fetch demand (`req.valid`) looks up the ITLB. A HIT returns
   *    ppn/perms/cacheMode in 1 cycle; a supervisor page accessed in user mode flags
   *    a perm fault. A MISS drops `rsp.ready` (the I-cache stalls on its existing
-  *    miss/back-pressure path) and launches this ITLB's OWN `TableWalker` (dedicated
-  *    AXI read port to the shared page table); on completion the ITLB is filled
+  *    miss/back-pressure path) and launches this ITLB's OWN `TableWalker`, whose
+  *    descriptor reads are `DcacheService` client traffic arbitrated onto the D-cache's
+  *    load port (68040 table searches are DATA accesses even for an instruction
+  *    translation); on completion the ITLB is filled
   *    (speculative fill OK) and a subsequent lookup hits. A walk that faults
   *    (non-resident / supervisor) is served from a result latch with `rsp.fault`
   *    (the I-cache raises DecodePacket.fault from it).
@@ -32,13 +33,29 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    DTLB). No write-protect fault on fetch (a fetch is never a write). */
 class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks,
-                 val socketMerged: Boolean = false) extends FiberPlugin with TranslationService {
+                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin
+    with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
 
   override def req: TranslationReq = _req
   override def rsp: TranslationRsp = _rsp
+
+  // ── Table-walk D-cache client port (see `WalkerDcacheClient`) ──────────────────
+  // 68040 table searches are DATA accesses even for an instruction translation, so
+  // the I-side walker is a client of the D-cache, not the I-cache. That is not a new
+  // cross-side path: this walker was already a D-side AXI master, because it issues
+  // the U-bit descriptor WRITE and `axi_i` is AR/R only.
+  var _walkLoadCmd:  Stream[DLoadCmd]  = null
+  var _walkLoadRsp:  Flow[DLoadRsp]    = null
+  var _walkStore:    Stream[DStoreCmd] = null
+  var _walkStoreAck: Bool = null
+  var _walkStoreErr: Bool = null
+  override def walkLoadCmd:  Stream[DLoadCmd]  = _walkLoadCmd
+  override def walkLoadRsp:  Flow[DLoadRsp]    = _walkLoadRsp
+  override def walkStore:    Stream[DStoreCmd] = _walkStore
+  override def walkStoreAck: Bool = _walkStoreAck
+  override def walkStoreErr: Bool = _walkStoreErr
 
   during setup {
     _req = TranslationReq()
@@ -52,6 +69,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
     flushAll      = Bool()
+    _walkLoadCmd  = Stream(DLoadCmd())
+    _walkLoadRsp  = Flow(DLoadRsp())
+    _walkStore    = Stream(DStoreCmd())
+    _walkStoreAck = Bool()
+    _walkStoreErr = Bool()
   }
 
   // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB;
@@ -64,36 +86,29 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var umFlush:       Bool = null
   // PFLUSHA: flush ALL TLB entries + the walk-result latch (task #136).
   var flushAll:      Bool = null
-  // Dedicated AXI port for THIS ITLB's walker + the U descriptor-write drain.
-  var walkerAxi: Axi4 = null
-  def axiCfg: Axi4Config = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
 
   val logic = during build new Area {
     val tlb    = new Tlb(entries, ways, banks)
     val walker = new TableWalker()
-    walkerAxi = (if (socketMerged) Axi4(axiCfg) else master(Axi4(axiCfg))).setName("itlbAxi")
-    walkerAxi.ar << walker.io.axi.ar
-    walkerAxi.r  >> walker.io.axi.r
-    walkerAxi.aw.valid := False; walkerAxi.aw.payload.assignDontCare()
-    walkerAxi.w.valid  := False; walkerAxi.w.payload.assignDontCare()
-    // D27 (axi-socket adapter spec section 4.3): FAIL-CLOSED on the response ID, matching
-    // the D-cache's own discipline verbatim (DcachePlugin.scala:1948-1956: "an
-    // unrecognized id simply not ack anything -- a hung drain, which is loud and
-    // debuggable, instead of a silent spurious ack").
-    //
-    // Today this walker is a physically separate master and the only responses reaching it
-    // are its own, so the unconditional `True` was safe. After the D8 merge it is the
-    // arbiter's owner latch, and NOTHING ELSE, that stands between this walker and a
-    // response belonging to the D-cache or the reset-vector reader. This guard is the
-    // second line of defence that makes the safety argument uniform across all three
-    // merged masters instead of resting on the arbiter alone.
-    //
-    // It does NOT disambiguate ITLB from DTLB -- they share AR=2/AW=3 (AxiIds.scala:67,69)
-    // and D8's owner latch is what separates them. It fail-closes the CLASS boundary
-    // between walker traffic and everything else. The drain ack at :271 is already gated on
-    // this handshake, so a rejected beat simply does not ack.
-    walkerAxi.b.ready  := walkerAxi.b.payload.id === U(m68k040.cache.AxiIds.WALK_WRITE,
-                                                       m68k040.cache.AxiIds.ID_W bits)
+
+    // ── Table-walk traffic now goes through the D-CACHE, not a private AXI master ──
+    // Mirrors `DtlbPlugin`'s identical block; see its comment for the full rationale.
+    // The arbiter-driven halves are default-idle with `allowOverride` so a standalone
+    // DUT still elaborates and can attach a sim-side `DcacheClientMemAgent`.
+    _walkLoadCmd.valid   := walker.io.loadCmd.valid
+    _walkLoadCmd.payload := walker.io.loadCmd.payload
+    _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
+    walker.io.loadCmd.ready := _walkLoadCmd.ready
+    _walkLoadRsp.valid.allowOverride;   _walkLoadRsp.valid := False
+    _walkLoadRsp.payload.allowOverride; _walkLoadRsp.payload.assignDontCare()
+    walker.io.loadRsp := _walkLoadRsp
+    _walkStoreAck.allowOverride; _walkStoreAck := False
+    _walkStoreErr.allowOverride; _walkStoreErr := False
+    _walkStore.ready.allowOverride; _walkStore.ready := False
+    _walkLoadCmd.valid.simPublic(); _walkLoadCmd.ready.simPublic()
+    _walkLoadCmd.payload.simPublic(); _walkLoadRsp.simPublic()
+    _walkStore.valid.simPublic(); _walkStore.ready.simPublic()
+    _walkStore.payload.simPublic(); _walkStoreAck.simPublic()
 
     // U queue hooks default-idle (allowOverride) so a standalone DUT elaborates.
     umAccessRobId.allowOverride; umAccessRobId := U(0, 6 bits)
@@ -355,9 +370,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.commitB.payload := umCommitBId
     umq.io.flush          := umFlush
 
-    // ---- U drain: single-byte RMW over the ITLB AXI write channel ----
-    val drainAwDone = RegInit(True)
-    val drainWDone  = RegInit(True)
+    // ---- U drain: single-byte RMW as ONE D-cache store ----
+    // Mirrors `DtlbPlugin`'s identical block; see its comment for why this is the
+    // correctness half of the change. The I-side sets only U (a fetch is never a write),
+    // but the lost-update mechanism is the same one.
+    val drainArmed   = RegInit(False)
+    val drainAckWait = RegInit(False)
     val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
     val drainBeat = Bits(128 bits)
     val drainStrb = Bits(16 bits)
@@ -372,30 +390,24 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainAddrReg = Reg(UInt(32 bits))
     val drainBeatReg = Reg(Bits(128 bits))
     val drainStrbReg = Reg(Bits(16 bits))
-    when(umq.io.drain.valid && drainAwDone && drainWDone) {
+    when(umq.io.drain.valid && !drainArmed && !drainAckWait) {
       drainAddrReg := (umq.io.drain.payload.addr(31 downto 4) ## U(0, 4 bits)).asUInt
       drainBeatReg := drainBeat
       drainStrbReg := drainStrb
-      drainAwDone  := False
-      drainWDone   := False
+      drainArmed   := True
     }
-    when(!drainAwDone) {
-      walkerAxi.aw.valid        := True
-      walkerAxi.aw.payload.addr := drainAddrReg
-      walkerAxi.aw.payload.id   := U(m68k040.cache.AxiIds.WALK_WRITE, m68k040.cache.AxiIds.ID_W bits)
-      walkerAxi.aw.payload.len  := U(0, 8 bits)
-      walkerAxi.aw.payload.size := U(4, 3 bits)
-      walkerAxi.aw.payload.burst := spinal.lib.bus.amba4.axi.Axi4.burst.INCR
-      when(walkerAxi.aw.ready) { drainAwDone := True }
-    }
-    when(!drainWDone) {
-      walkerAxi.w.valid        := True
-      walkerAxi.w.payload.data := drainBeatReg
-      walkerAxi.w.payload.strb := drainStrbReg
-      walkerAxi.w.payload.last := True
-      when(walkerAxi.w.ready) { drainWDone := True }
-    }
-    umq.io.drainAck := walkerAxi.b.valid && walkerAxi.b.ready
+    _walkStore.valid              := drainArmed
+    _walkStore.payload.paddr      := drainAddrReg
+    _walkStore.payload.data       := B(0, 32 bits)
+    _walkStore.payload.size       := m68k040.isa.Size.LONG
+    _walkStore.payload.useStrb    := True
+    _walkStore.payload.strb       := drainStrbReg
+    _walkStore.payload.lineData   := drainBeatReg
+    _walkStore.payload.cacheMode  := CacheMode.WRITETHROUGH   // stamped by the arbiter
+    _walkStore.payload.precise    := False
+    when(_walkStore.fire) { drainArmed := False; drainAckWait := True }
+    when(drainAckWait && _walkStoreAck) { drainAckWait := False }
+    umq.io.drainAck := drainAckWait && _walkStoreAck
 
     // ---- response mux ----
     // hit-class perm fault for a fetch: a user fetch of a supervisor page. (A fetch

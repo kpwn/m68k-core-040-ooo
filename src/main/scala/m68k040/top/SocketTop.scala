@@ -106,8 +106,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new MmuControlPlugin(),
       new m68k040.execute.FpuControlPlugin(),
       new m68k040.exception.InterruptControlPlugin(),
-      new ItlbPlugin(socketMerged = true),
-      new DtlbPlugin(socketMerged = true),
+      new ItlbPlugin(),
+      new DtlbPlugin(),
       icache,
       // Keep the optional early VIPT snapshot path out of the FPGA socket while
       // isolating the live-board wrong-set response observed during ROM boot.

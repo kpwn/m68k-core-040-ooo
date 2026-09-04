@@ -51,6 +51,12 @@ object HaltReason {
     * no progress on any channel of that direction. Something structural is wrong; the
     * arbiter never fabricates a response. */
   val ARBITER_WEDGE = 4
+  /** W26: a table walker held one of the D-cache client ports for its full bounded window
+    * with no progress on any channel. This code has to exist separately from
+    * `ARBITER_WEDGE` because a wedge at the walker/D-cache merge point produces NO AXI
+    * grant at all -- the `axi_d` arbiter sees nothing, the D-cache's own diagnostic
+    * channel sees nothing, and the failure would otherwise be completely unobservable. */
+  val WALKER_PORT_WEDGE = 5
 
   def name(code: Int): String = code match {
     case NONE          => "NONE"
@@ -58,6 +64,7 @@ object HaltReason {
     case FS_XLATE      => "FS_XLATE"
     case RESET_VECTOR  => "RESET_VECTOR"
     case ARBITER_WEDGE => "ARBITER_WEDGE"
+    case WALKER_PORT_WEDGE => "WALKER_PORT_WEDGE"
     case other         => s"UNKNOWN($other)"
   }
 }

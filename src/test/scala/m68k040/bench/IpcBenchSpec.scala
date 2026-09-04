@@ -270,7 +270,10 @@ class IpcBenchSpec extends AnyFunSuite {
       exc.dcLoadRsp.valid   := dc.loadRsp.valid
       exc.dcLoadRsp.payload := dc.loadRsp.payload
       exc.dcLoadBusy        := dc.loadBusy
-      exc.dcStoreAck        := dc.storeAck
+      // W13: the walker is a THIRD store client and the terminal ack is untagged, so it
+    // must be demultiplexed before the exception sequencer consumes it. See
+    // `LsEuPlugin.logic.excStoreAckOut`.
+    exc.dcStoreAck        := lsEu.logic.excStoreAckOut
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
       lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
@@ -654,11 +657,13 @@ class IpcBenchSpec extends AnyFunSuite {
         totalCycles += 1
       }
 
-      // Attach memories (I-cache program; zeroed D-cache + TLB walker memories).
+      // Attach memories (I-cache program; zeroed D-cache image). The two TLB-walker
+      // memories are gone: the walkers no longer emit AXI, so their descriptor reads
+      // and U/M writebacks reach memory through the D-cache and land in `dmem`.
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg)
-      val ptmem     = AxiMemModel.attachFull(dut.dtlb.walkerAxi, cd, memCfg)
-      val itlbPtmem = AxiMemModel.attachFull(dut.itlb.walkerAxi, cd, memCfg)
+      val ptmem     = dmem
+      val itlbPtmem = dmem
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false

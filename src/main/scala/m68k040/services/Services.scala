@@ -494,6 +494,48 @@ trait DTranslationService {
   def rsp: Stream[DTranslationRsp]
 }
 
+/** A table walker's D-cache client port pair, exposed by the owning TLB plugin and
+  * arbitrated onto `DcacheService`'s single load/store port pair by `LsEuPlugin`.
+  *
+  * WHY THIS IS A SERVICE RATHER THAN A TOP-LEVEL WIRE BUNDLE. The pre-existing
+  * `umCommitValid`/`umFlush`/`excLoadCmdValid` idiom is a plugin-level `var` wired by
+  * every DUT's own top level. Doing that here would mean editing ~20 DUTs to re-wire
+  * eight signals apiece for a change that is internal to the core. Resolving the ports
+  * through `PluginHost` instead means any DUT that already contains an `LsEuPlugin`,
+  * a `DcachePlugin` and the TLB plugins gets the arbitration for free, with no wiring
+  * edit at all. DUTs that host a TLB plugin but no D-cache attach a sim-side
+  * `DcacheClientMemAgent` to these same ports (they are `simPublic`).
+  *
+  * DIRECTION. The TLB plugin drives `loadCmd.valid`/`loadCmd.payload` and
+  * `store.valid`/`store.payload`; the arbiter drives `loadCmd.ready`, `store.ready`,
+  * `loadRsp`, `storeAck` and `storeErr`. Every arbiter-driven signal is declared with
+  * `allowOverride` and a default-idle drive inside the TLB plugin, so a DUT with no
+  * arbiter still elaborates (the walker then simply never makes progress unless a sim
+  * agent drives the ports).
+  *
+  * `cacheMode` and `token` on `loadCmd`/`store` are STAMPED BY THE ARBITER, not by the
+  * walker: the descriptor fetch's own cache mode is a fixed architectural policy
+  * (`CACR.DE ? WRITETHROUGH : INHIBITED`) that cannot be derived from a descriptor
+  * without circularity, and the walker has no access to CACR. The values the TLB
+  * plugin drives are inert defaults. */
+trait WalkerDcacheClient {
+  def walkLoadCmd:  Stream[m68k040.cache.DLoadCmd]
+  def walkLoadRsp:  Flow[m68k040.cache.DLoadRsp]
+  def walkStore:    Stream[m68k040.cache.DStoreCmd]
+  def walkStoreAck: Bool
+  def walkStoreErr: Bool
+}
+
+/** The I-side walker's client port (`ItlbPlugin`). A SEPARATE trait from the D-side
+  * one purely so `LsEuPlugin` can resolve the two walkers deterministically —
+  * `host.list[WalkerDcacheClient]` would give no stable ITLB/DTLB ordering, and the
+  * arbiter's round-robin, its response tag and its `WalkerIdx` vectors all depend on
+  * a fixed positional identity. */
+trait ItlbWalkerDcacheClient extends WalkerDcacheClient
+
+/** The D-side walker's client port (`DtlbPlugin`). See `ItlbWalkerDcacheClient`. */
+trait DtlbWalkerDcacheClient extends WalkerDcacheClient
+
 /** Produced by the fetch/align stage; consumed by the (future) decode stage.
   * Two packets/cycle; slot 0 valid when the stream fires, slot 1 on 2-wide cycles. */
 trait DecodeFeedService {

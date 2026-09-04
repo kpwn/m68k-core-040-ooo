@@ -438,8 +438,11 @@ object FuzzRunner {
 
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
       // Task #143: Musashi's oracle (m68k_ref.cpp cb_read8) returns a HARDCODED 0xFF
       // for any address it was never told about, deterministic and seed-independent.
       // The DUT's SparseMemory-backed dmem defaults unwritten bytes to a genuinely

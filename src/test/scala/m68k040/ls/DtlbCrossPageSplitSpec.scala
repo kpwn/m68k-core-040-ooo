@@ -87,11 +87,11 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
   private def ptrIdx(va: Long): Int  = ((va >>> 18) & 0x7f).toInt
   private def pageIdx(va: Long): Int = ((va >>> 12) & 0x3f).toInt
 
-  private def pokeDescriptor(mem: BehavioralMemAgent, addr: Long, word: Long): Unit =
+  private def pokeDescriptor(mem: AxiMemModel, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >>> (8 * (3 - i))) & 0xff).toInt)
 
-  private def buildPage(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  private def buildPage(mem: AxiMemModel, va: Long, ppn: Long,
                         resident: Boolean = true, modeBits: Int = 0): Unit = {
     require((modeBits & ~0x3) == 0)
     pokeDescriptor(mem, Root + rootIdx(va) * 4, (Ptrt & 0xfffffff0L) | 0x3L)
@@ -106,15 +106,24 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
   private case class Cmd(vaddr: Long, paddr: Long, token: Int, mode: String)
   private case class Fault(robId: Int, addr: Long, write: Boolean,
                            size: Int, supervisor: Boolean, atc: Boolean)
+  /** `cmds` holds only the LS pipe's own D-cache commands. Table-walk descriptor reads
+    * are D-cache load commands too now, so they are separated out into `walkCmds` by
+    * their reserved token (`DLoadToken.WALK_ITLB`/`WALK_DTLB`) -- that count is the
+    * direct replacement for the walker-AXI `totalAr` these tests used to assert on.
+    * `dcacheAr` likewise counts only AXI reads OUTSIDE the page-table region, so it keeps
+    * meaning "how many times did the DATA lines refill". */
   private case class Run(reqs: Vector[Req], rsps: Vector[Rsp], cmds: Vector[Cmd],
                          completions: Vector[Int], faults: Vector[Fault],
-                         cancelTokens: Vector[Int], dcacheAr: Int)
+                         cancelTokens: Vector[Int], dcacheAr: Int, walkCmds: Int)
 
-  private def initDut(dut: Dut): (ClockDomain, AxiMemModel, BehavioralMemAgent) = {
+  private def initDut(dut: Dut): (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
-    val pageMem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+    // The DTLB walker now reaches memory through the D-cache, so the page table must
+    // live in the D-SIDE memory rather than a private walker image. Aliasing the old
+    // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
+    val pageMem = dataMem
     val s = dut.src.logic
     s.iValid #= false
     s.iMemOp #= MemOp.LOAD
@@ -190,6 +199,7 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
     var faults = Vector.empty[Fault]
     var cancelTokens = Vector.empty[Int]
     var dcacheAr = 0
+    var walkCmds = 0
     var terminalAt = -1
     var cycle = 0
 
@@ -210,10 +220,14 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
       if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
           dut.dcache.logic.loadCmdPort.ready.toBoolean) {
         val cmd = dut.dcache.logic.loadCmdPort.payload
-        cmds :+= Cmd(cmd.vaddr.toLong & 0xffffffffL,
-                     cmd.paddr.toLong & 0xffffffffL,
-                     cmd.token.toInt,
-                     cmd.cacheMode.toEnum.toString)
+        val tok = cmd.token.toInt
+        if (tok == m68k040.cache.DLoadToken.WALK_ITLB ||
+            tok == m68k040.cache.DLoadToken.WALK_DTLB) walkCmds += 1
+        else
+          cmds :+= Cmd(cmd.vaddr.toLong & 0xffffffffL,
+                       cmd.paddr.toLong & 0xffffffffL,
+                       tok,
+                       cmd.cacheMode.toEnum.toString)
       }
       if (s.cValid.toBoolean && s.cRob.toInt == robId)
         completions :+= s.cRob.toInt
@@ -224,7 +238,12 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
       if (dut.trace.logic.cancelValid.toBoolean && !dut.trace.logic.cancelAll.toBoolean)
         cancelTokens :+= dut.trace.logic.cancelToken.toInt
       if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-          dut.dcache.logic.axi.ar.ready.toBoolean) dcacheAr += 1
+          dut.dcache.logic.axi.ar.ready.toBoolean) {
+        // Page-table traffic now shares this AXI port, so exclude the descriptor region
+        // to keep `dcacheAr` meaning what it meant before: DATA line refills.
+        val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+        if (a < Root || a >= Pagt + 0x1000L) dcacheAr += 1
+      }
 
       val terminal = completions.nonEmpty && (!expectFault || faults.nonEmpty)
       if (terminal && terminalAt < 0) terminalAt = cycle
@@ -235,10 +254,10 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
 
     assert(issued, s"rob=$robId load was never accepted")
     assert(terminalAt >= 0, s"rob=$robId did not reach its expected terminal event")
-    Run(reqs, rsps, cmds, completions, faults, cancelTokens, dcacheAr)
+    Run(reqs, rsps, cmds, completions, faults, cancelTokens, dcacheAr, walkCmds)
   }
 
-  private def prepareSplit(dut: Dut, cd: ClockDomain, pageMem: BehavioralMemAgent,
+  private def prepareSplit(dut: Dut, cd: ClockDomain, pageMem: AxiMemModel,
                            va: Long, ppnA: Long, ppnB: Long,
                            residentB: Boolean, modeA: Int, modeB: Int): Unit = {
     require((va & 0xfffL) == 0xffeL)
@@ -295,8 +314,9 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
         s"split cache commands: ${run.cmds}")
       assert(run.completions == Vector(7), s"split completion count/order: ${run.completions}")
       assert(run.faults.isEmpty, s"resident split unexpectedly faulted: ${run.faults}")
-      assert(pageMem.model.stats.totalAr == 6,
-        s"both cold DTLB halves must perform full walks, AR=${pageMem.model.stats.totalAr}")
+      assert(run.walkCmds == 6,
+        s"both cold DTLB halves must perform full walks (3 descriptor reads each), " +
+        s"walk load commands=${run.walkCmds}")
       assert(run.dcacheAr == 2, s"both cold physical lines must refill once, AR=${run.dcacheAr}")
       assert(readPreg(dut, 20) == expectedData(lineA, lineB),
         f"assembled split data=0x${readPreg(dut, 20)}%08x expected=0x${expectedData(lineA, lineB)}%08x")
@@ -337,8 +357,9 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
         s"slot-B ATC fault must not cause physical cache traffic, AR=${run.dcacheAr}")
       assert(run.cancelTokens == Vector(robId),
         s"fault must cancel slot A's speculative VIPT probe exactly once: ${run.cancelTokens}")
-      assert(pageMem.model.stats.totalAr == 6,
-        s"slot A and faulting slot B must each perform a real walk, AR=${pageMem.model.stats.totalAr}")
+      assert(run.walkCmds == 6,
+        s"slot A and faulting slot B must each perform a real walk, " +
+        s"walk load commands=${run.walkCmds}")
       assert(readPreg(dut, pdst) == BigInt(sentinel),
         "slot-B translation fault must not write its destination PRF")
     }
