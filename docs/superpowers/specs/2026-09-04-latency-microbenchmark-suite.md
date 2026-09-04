@@ -156,17 +156,19 @@ that core, which was not done.
 
 | Level | Marginal cost per dependent load | Method / cache control |
 |---|---|---|
-| **L1D hit** | **11.000** (confirmed by two methods, §3.2a) | 4 KiB footprint < 8 KiB L1D |
-| **L1D miss → L2 hit** | **20.139 ± 0.533** | 32 KiB footprint = 4× L1D → misses every access; L2-resident from prior pass |
-| **cold miss → model DRAM** | **98.242 ± 1.858** at `dramCycles=70`; **core-side fixed cost 28.5** (sweep intercept) | straight-line stride-64; a fresh 64 B line every step |
+| **L1D hit** | **9.844 ± 0.000** | 4 KiB footprint < 8 KiB L1D; raw with-load 859.0/pass, control 229.0/pass, /64 accesses |
+| **L1D miss → L2 hit** | **20.948 ± 0.034** | 32 KiB footprint = 4× L1D; raw 12277.5 vs 1552.0/pass, /512 accesses |
+| **cold miss → model DRAM** | **93.484 ± 0.062** at `dramCycles=70` | straight-line stride-64; a fresh 64 B line every step |
 
-These are **marginal** costs: the cost of adding one more dependent load to the chain, with
-the matched no-load control already subtracted. The control replaces the load with a
-register move, which itself costs 1 cycle, so **absolute load-to-use is these values +1**
-(L1D hit ≈ 12 cycles). The chain is a zero-load pointer chase — the D-side memory is
-zero-filled so the loaded value is 0 under any byte order, and the address register is made
-to depend on it (`adda.l %d1,%a0` with `d1==0`), giving a true serial load-to-use dependency
-without needing the memory model's endianness to be correct.
+All measured with `zeroFillData` and `assertChasePremise` in force (§3.2a), and the raw
+halves of every subtraction are printed so the control can be audited rather than trusted.
+
+**Cross-check against the un-subtracted method.** The L1D-hit row is 9.844, and the pure
+one-instruction chase that needs no control at all gives **11.000** (§3.2a). The difference
+is the control op's own latency: the control replaces the load with a register move that
+itself costs ~1 cycle, so a subtracted figure necessarily reads ~1 low. **9.844 + 1 ≈ 11.0**
+— the two methods agree. Where they differ, **prefer the 11.000**, which involves no
+subtraction at all.
 
 **The DRAM row is a model artefact and must not be quoted as this machine's DDR latency.**
 `dramCycles=70` is an unmeasured parameter; the 98.242 figure largely echoes it back.
@@ -181,6 +183,13 @@ model parameter can be separated from the core's own behaviour:
 | 20 | 48.360 ± 1.247 | 48.466 | −0.106 |
 | 40 | 68.582 ± 1.548 | 68.405 | +0.177 |
 | 70 | 98.242 ± 1.858 | 98.313 | −0.071 |
+
+> **CAVEAT — the sweep predates the premise fix.** All three points above were taken with
+> the PRNG-filled backing store (§3.2a), so the chase was walking scattered addresses. The
+> corrected `dramCycles=70` point is **93.484 ± 0.062**, not 98.242. Every access in this
+> kernel is a cold miss either way, so the **slope should be unaffected** and ~1.00 is
+> expected to survive — but the **intercept is not trustworthy until the sweep is re-run**
+> with `zeroFillData`. Re-running it is one command (`--dram-sweep`); I did not have budget.
 
 ```
 slope     = 0.997 cycles per dramCycle

@@ -630,6 +630,11 @@ class MicrobenchSpec extends CoreBenchHarness {
       println("        L2 hitCycles=5 is calibrated to the real L2; dramCycles is UNMEASURED.")
 
       def chaseLevel(tag: String, inner: Int, o1: Int, o2: Int, note: String): Unit = {
+        // PREMISE first: a stride-64 walk over `inner` steps must touch exactly the
+        // footprint it claims (inner*64 bytes = inner*4 sixteen-byte lines), not a
+        // scatter. Checked before the numbers are believed.
+        assertChasePremise(runKernel(compiled, kChaseLoop(inner, o1, load = true), seeds.head),
+          maxDistinctLines = inner * 4 + 8, what = s"$tag chase")
         val ld  = diffStat(compiled, s"$tag-ld",  o => kChaseLoop(inner, o, load = true),  o1, o2)
         val ctl = diffStat(compiled, s"$tag-ctl", o => kChaseLoop(inner, o, load = false), o1, o2)
         // per-pass cost -> per-access cost
@@ -688,6 +693,9 @@ class MicrobenchSpec extends CoreBenchHarness {
       // load-to-use apart. This is the same style of measurement that produced the
       // branch-recovery figure, and it shares NO arithmetic with Method 1.
       val probe = runKernel(compiled, kPureChase(200), seeds.head)
+      // PREMISE: the chase must collapse onto a couple of resident lines. If the
+      // loaded value were not zero the chain would scatter over hundreds.
+      assertChasePremise(probe, maxDistinctLines = 4, what = "pure-chase")
       def deltas(xs: Seq[Long]): Seq[Long] = xs.zip(xs.drop(1)).map { case (a, b) => b - a }
       def med(xs: Seq[Long]): Double =
         if (xs.isEmpty) 0.0 else { val s = xs.sorted; s(s.size / 2).toDouble }
