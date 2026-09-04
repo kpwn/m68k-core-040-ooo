@@ -370,7 +370,15 @@ subtraction mean only "the walk".
    12-cycle gap *is* the win, and it is why the win only appears once memory costs
    something.
 
-3. **The crossover is sharp and located.** 16.000 → 23.6 (zero-latency) / 31.2
+3. **The `bb3bca1` column is FLAT across the whole sweep** — 28.6 / 28.4 / 28.3 /
+   28.4 under `l2:5:70`, and 16.6 / 16.8 / 16.2 / 16.5 under zero-latency. Walk cost
+   at `bb3bca1` does not care how much page-table locality the program has, because
+   the private walker AXI bypassed the cache that would have exploited it. **All the
+   working-set sensitivity in these tables is created by the change.** That is the
+   cleanest available evidence that the win is the mechanism claimed and not some
+   incidental difference between the two builds.
+
+4. **The crossover is sharp and located.** 16.000 → 23.6 (zero-latency) / 31.2
    (`l2:5:70`) between 128 and 256 pages of working set. At 256 pages the descriptor
    footprint is 32 leaf tables × 8 lines = 256 lines plus 256 data lines, against an
    8 KiB / 16 B / 4-way L1D — 512 lines total. So the subtree stops fitting, and the
