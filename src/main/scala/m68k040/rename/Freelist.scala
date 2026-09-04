@@ -55,6 +55,12 @@ case class Freelist(
   val tail  = Reg(UInt(ptrW   bits)) init 0
   val count = Reg(UInt(countW bits)) init 0
   spinal.core.sim.SimPublic(head, tail, count)   // sim-only debug (bf3c bring-up)
+  // ALLOCATOR CHECKER (2026-09-04, NaxRiscv comparison item 4 / `NaxAllocatorChecker`,
+  // main.cpp:1312-1355): a sim-time shadow busy-vector needs the allocator's OWN
+  // alloc/free ports, not a downstream proxy. `io.*` of a child Component is not
+  // reachable from a Verilator sim without this. Sim-only name preservation, zero
+  // synthesis cost -- same convention as the head/tail/count line above.
+  spinal.core.sim.SimPublic(io.pop, io.push, io.flush, io.popReady)
   val dbgPushAddr = Vec(UInt(ptrW bits), pushPorts)   // sim-only debug (bf3c bring-up)
   dbgPushAddr.foreach(_ := 0)
   dbgPushAddr.allowOverride
@@ -64,6 +70,9 @@ case class Freelist(
   // After reset: fill ram[0..freeN-1] with ids archCount..physCount-1, one per cycle.
   val initDone    = Reg(Bool()) init False
   val initCounter = Reg(UInt(ptrW bits)) init 0   // index into ram (0..freeN-1)
+  // Sim-only (allocator checker): the shadow busy-vector must ignore every cycle before
+  // the power-on RAM fill completes, since pops/pushes are architecturally impossible then.
+  spinal.core.sim.SimPublic(initDone)
 
   // initHead/initTail/initCount are the pointer values after init completes.
   // They are constants derived from the parameters.

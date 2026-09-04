@@ -1,7 +1,8 @@
 package m68k040.fuzz
 
 import m68k040.{M68kSim, VerilatorTest}
-import m68k040.lockstep.{LockStep, WhiteboxCapture}
+import m68k040.lockstep.{AllocatorChecker, ArchLockStep, ArchSnapshot, ArchStateProbe,
+  LockStep, MemWriteCapture, StructuralCapture, WhiteboxCapture}
 import m68k040.oracle.{Musashi, OracleStep, ProgramAssembler}
 import spinal.core.sim._
 import org.scalatest.funsuite.AnyFunSuite
@@ -43,11 +44,32 @@ object FuzzRunner {
   final case class GenFail(reason: String) extends Outcome
   final case class Diverged(kind: String, detail: String, context: String) extends Outcome
 
+  /** Harness self-test knobs (`m68k040.lockstep.HarnessSelfTestSpec`). Defaults are the
+    * correct, current behaviour, so every production call site is unchanged.
+    *
+    *  - `dropSecondDst`  regresses defect 1/2: the CPLX lane stops marking its `divRem`
+    *    writebacks as SECOND architectural destinations, so a long divide's remainder
+    *    and a 64-bit multiply's high half go back to never being compared.
+    *  - `dropKeepCommit` regresses defect 3: the branch EU stops setting `keepCommit`, so
+    *    every `Scc <mem>` record is silently deleted from the retire stream.
+    *  - `wb` carries the two `WhiteboxCapture` regressions (defects 4 and 7).
+    *  - `corruptArch` = (afterEmitted, archReg, value): once `afterEmitted` oracle-aligned
+    *    records have been emitted, write `value` straight into the PHYSICAL register the
+    *    committed RAT names for `archReg`, through the existing boot seed port. This is
+    *    architectural-state corruption that leaves every EU writeback observation intact
+    *    -- i.e. exactly the shape of "a divide returned another divide's remainder", and
+    *    invisible to any comparator that only inspects what the DUT volunteered. */
+  final case class SelfTest(dropSecondDst: Boolean = false,
+                            dropKeepCommit: Boolean = false,
+                            wb: WhiteboxCapture.Regressions = WhiteboxCapture.NoRegressions,
+                            corruptArch: Option[(Int, Int, Long)] = None)
+  val NoSelfTest = SelfTest()
+
   lazy val compiled = M68kSim().withVerilator.compile(new FuzzCoreDut)
   private var runIdx = 0
 
   /** Assemble + trace the oracle + run the DUT + compare. Pure (no asserts). */
-  def run(src: String, simSeed: Int): Outcome = {
+  def run(src: String, simSeed: Int, st: SelfTest = NoSelfTest): Outcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return GenFail(s"assemble: ${err.reason}")
@@ -66,8 +88,11 @@ object FuzzRunner {
     val n      = oracleSteps.size
     val oracle = oracleSteps
 
-    val oracleMem: Map[Long, Int] = Musashi.assembleAndRun(src, stopPc = Some(endPc)) match {
-      case Right(st) => st.memoryWrites
+    val (oracleMem, oracleWriteEvents) = Musashi.assembleAndRun(src, stopPc = Some(endPc)) match {
+      // `memoryWriteTrace` is Musashi's ORDERED per-byte write log (`mem_event[...]`);
+      // `memoryWrites` is the final address->value map. Both are needed: the map for the
+      // pre-existing final-image check, the trace for the new ordered compare.
+      case Right(st) => (st.memoryWrites, st.memoryWriteTrace)
       case Left(err) => return GenFail(s"oracle run: ${err.reason}")
     }
 
@@ -81,7 +106,19 @@ object FuzzRunner {
     var outcome: Outcome = Pass
     compiled.doSim(s"fuzz_$runIdx", simSeed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
-      val handle = new WhiteboxCapture.Handle
+      val handle = new WhiteboxCapture.Handle(st.wb)
+      // ── Reference-driven structural lock-step (2026-09-04) ────────────────────
+      // `handle` above is the DUT-DRIVEN delta stream. These three are the inversion:
+      // a full 16-register + CCR compare read structurally out of the committed RAT +
+      // PRF, an ordered architectural store-stream compare, and a shadow busy-vector
+      // over all five rename freelists. All are sim-only reads; none changes the DUT.
+      val archProbe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      val archSnaps = scala.collection.mutable.ArrayBuffer[ArchSnapshot]()
+      val memCap    = new MemWriteCapture.Handle(dut.dcache)
+      val allocChk  = new AllocatorChecker(dut.ren)
+      var sampleCycle = 0L
+      var corruptState = 0   // harness self-test injector: 0=armed, 1=driving, 2=done
+      val structuralOff = sys.env.get("LOCKSTEP_STRUCTURAL").contains("0")
 
       // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
       // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
@@ -105,7 +142,8 @@ object FuzzRunner {
       cd.onSamplings {
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
-        captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true);
+        captureWb(dut.lsEu.logic.wbObs)
+        captureWb(dut.divEu.logic.wbObs, secondDst = !st.dropSecondDst);
         {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
@@ -123,7 +161,7 @@ object FuzzRunner {
                 // Scc <ea> memory-dest: the branch EU's op µop writes only T1 but IS the
                 // instruction's single kept oracle step. Without this the whole Scc-mem
                 // instruction vanished from the retire stream (fuzz cluster A, 40/57).
-                keepCommit = bw.keepCommit.toBoolean))
+                keepCommit = bw.keepCommit.toBoolean && !st.dropKeepCommit))
           }
         }
         for (k <- 0 until 2) {
@@ -150,6 +188,30 @@ object FuzzRunner {
               if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
               isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
+          }
+        }
+        // MUST run last in this callback: `StructuralCapture` reads `handle.emitted`,
+        // which has to already count this cycle's commit observations.
+        if (!structuralOff) {
+          sampleCycle += 1
+          memCap.onCycle()
+          allocChk.onCycle()
+          StructuralCapture.sampleCycle(dut.rob, handle, archProbe, archSnaps, sampleCycle)
+        }
+        // ── Harness self-test: architectural-state corruption ────────────────────
+        // Writes `value` into the PHYSICAL register the committed RAT names for
+        // `archReg`, through the boot seed port, once `afterEmitted` records exist. The
+        // DUT's writeback observations are untouched, so no delta comparator -- old or
+        // new -- can see it. Held for one cycle, then released.
+        st.corruptArch.foreach { case (afterEmitted, archReg, value) =>
+          if (corruptState == 0 && handle.emitted >= afterEmitted) {
+            dut.wire.logic.seedValid #= true
+            dut.wire.logic.seedAddr  #= archProbe.physOf(archReg)
+            dut.wire.logic.seedData  #= BigInt(value & 0xffffffffL)
+            corruptState = 1
+          } else if (corruptState == 1) {
+            dut.wire.logic.seedValid #= false
+            corruptState = 2
           }
         }
       }
@@ -443,6 +505,15 @@ object FuzzRunner {
           s"last commits: $tail")
       } else {
         val res = LockStep.compare(handle.result.take(n), oracle)
+        // Reference-driven structural result, computed unconditionally so its coverage
+        // number is available even on a pass (a number that is only printed when it is
+        // bad is a number nobody measures).
+        val archRes =
+          if (structuralOff) null
+          else ArchLockStep.compare(archSnaps.toSeq, oracle, n)
+        if (archRes != null && sys.env.contains("LOCKSTEP_STRUCTURAL_STATS"))
+          println(f"[arch] boundaries=${archSnaps.size} coverage=${archRes.covered}/${archRes.total} " +
+                  f"stores=${memCap.events.size} allocErrs=${allocChk.errors.size}")
         if (!res.ok) {
           val div = res.firstDivergence.get
           val i   = div.index.toInt
@@ -452,7 +523,23 @@ object FuzzRunner {
               f"reg${c.archRegId}=0x${c.archRegWrite & 0xffffffffL}%08x(v=${c.archRegValid})} " +
               f"orc{pc=0x${s.pc}%08x sr=0x${s.sr}%04x a7=0x${s.a(7) & 0xffffffffL}%08x}"
           }.mkString("\n")
-          outcome = Diverged("STEP", s"idx=$i ${div.detail}", ctx)
+          // Report what the OTHER comparator said about the same run. Without this a
+          // "STEP" outcome says nothing about whether the structural loop agreed, and the
+          // harness self-test's immunity claims would be unmeasured assertions.
+          val archStatus =
+            if (archRes == null) "structural=off"
+            else if (archRes.ok) f"structural=OK (coverage ${archRes.covered}/${archRes.total})"
+            else s"structural=ALSO-DIVERGED (${archRes.firstDetail})"
+          outcome = Diverged("STEP", s"idx=$i ${div.detail}", s"[$archStatus]\n" + ctx)
+        } else if (archRes != null && !archRes.ok) {
+          // ── REFERENCE-DRIVEN structural compare (the inversion). Every oracle step's
+          // full architectural state must be accounted for by the DUT; unlike
+          // `LockStep.compare` above, nothing here is gated on what the DUT volunteered.
+          val ctx = archRes.divergences.take(6).map(d => s"  ${d.kind} @idx=${d.oracleIdx}: ${d.detail}").mkString("\n") +
+            f"%n  [coverage ${archRes.covered}/${archRes.total} oracle steps had an observable retire boundary]"
+          outcome = Diverged("ARCH", archRes.firstDetail, ctx)
+        } else if (!structuralOff && allocChk.errors.nonEmpty) {
+          outcome = Diverged("ALLOC", allocChk.errors.head, allocChk.errors.mkString("\n  "))
         } else {
           // Final sandbox memory compare (every sandbox byte is prologue-seeded,
           // so the oracle write map covers the full window).
@@ -470,6 +557,39 @@ object FuzzRunner {
           }
           if (diffs.nonEmpty)
             outcome = Diverged("MEM", diffs.head, diffs.mkString("\n  "))
+          else if (!structuralOff) {
+            // ORDERED architectural store-stream compare (NaxRiscv comparison item 2,
+            // third bullet). Strictly stronger than the final-image check above, which
+            // iterates only ORACLE-written addresses and so cannot see a DUT store to an
+            // address the oracle never touched. Scoped to the data sandbox: the
+            // supervisor stack carries exception frames whose layout legitimately
+            // differs between a real 68040 and Musashi's model.
+            def inSandbox(a: Long) =
+              a >= ProgGen.SandboxBase && a < ProgGen.SandboxBase + ProgGen.SandboxSize
+            // The DUT's sandbox is pre-filled to 0xFF to match Musashi's cb_read8 default
+            // for never-written addresses -- so 0xFF is the shadow's initial byte too.
+            val mr = MemWriteCapture.compare(memCap.events.toSeq, oracleWriteEvents,
+                                             inSandbox, _ => 0xff)
+            if (sys.env.contains("LOCKSTEP_STRUCTURAL_STATS"))
+              println(s"[mem] dutWrites=${mr.dutWrites} oracleWrites=${mr.oracleWrites} " +
+                      s"silentRewrites=${mr.silentRewrites} reordered=${mr.reordered}" +
+                      (if (mr.silentSample.isEmpty) ""
+                       else mr.silentSample.map(w => f" 0x${w.addr}%x=${w.value}%02x").mkString(" silentAt:", "", "")))
+            // LOCKSTEP_MEM_STRICT=1 promotes value-preserving extra DUT writes from a
+            // reported statistic to a hard divergence. Off by default (the CAS/CAS2
+            // always-store simplification is documented and deliberate); on, it lets the
+            // fuzz minimizer shrink a program down to whichever instruction produced one.
+            if (sys.env.get("LOCKSTEP_MEM_STRICT").contains("1") && mr.silentRewrites > 0)
+              outcome = Diverged("MEMSILENT",
+                s"${mr.silentRewrites} value-preserving DUT writes with no reference write",
+                mr.silentSample.map(w => f"mem[0x${w.addr}%08x]=0x${w.value}%02x cycle=${w.cycle}").mkString("\n  "))
+            mr.error.foreach { m =>
+              outcome = Diverged("MEMORDER", m,
+                s"dut in-scope byte writes=${mr.dutWrites} oracle=${mr.oracleWrites} " +
+                s"silent (value-preserving) DUT rewrites=${mr.silentRewrites} " +
+                s"out-of-order matches=${mr.reordered}")
+            }
+          }
         }
       }
     }

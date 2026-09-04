@@ -59,9 +59,29 @@ object WhiteboxCapture {
   // is SET to it (vs the per-bit NZVC fold). -1 => no absolute CCR write.
   private final case class ExcRec(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int, setCcr5: Int = -1, msp: Long = -1L, isp: Long = -1L) extends Rec
 
-  final class Handle {
+  /** Deliberate REGRESSIONS of already-fixed harness defects, for the harness self-test
+    * (`HarnessSelfTestSpec`). Default = the correct, current behaviour, so no production
+    * call site changes. A verification layer that has never been shown to catch what it
+    * was built to catch is not verified -- that is precisely the failure mode that
+    * produced the 2026-09-03 list of seven.
+    *
+    * `legacyA7Resync`   -- defect 4: resync the running A7 on EVERY `ss.a7` value edge,
+    *                      replaying the >=2-cycle lagged shadow as if it were live.
+    * `dropTrailingFold` -- defect 7: drop the backward fold of a macro's TRAILING
+    *                      auto-update µop, so it lands on the NEXT instruction's step. */
+  final case class Regressions(legacyA7Resync: Boolean = false,
+                               dropTrailingFold: Boolean = false)
+  val NoRegressions = Regressions()
+
+  final class Handle(val regress: Regressions = NoRegressions) {
     private val wbMap   = mutable.HashMap[Int, Wb]()
     private val commits = mutable.ArrayBuffer[Rec]()
+    // Incremental count of records that `result` will EMIT (== result.size), maintained
+    // as commits arrive. `result` is a full O(n) refold of the whole buffer, so the
+    // structural comparator -- which needs this number once per retire cycle -- must not
+    // call `.result.size` to get it (that is O(n^2) over a run).
+    private var emittedCount = 0
+    def emitted: Int = emittedCount
 
     /** Record an EU writeback (keyed by robId). */
     def onWb(robId: Int, wb: Wb): Unit = { wbMap(robId) = wb }
@@ -86,12 +106,15 @@ object WhiteboxCapture {
       // drop), so keep it even though it writes only a temp.
       val emit = (!isTempOnly && !wb.divRem) || wb.keepCommit
       commits += NormRec(pc, sysByte, a7, wb, emit, msp, isp, macroLast)
+      if (emit) emittedCount += 1
     }
 
     /** Record an exception / RTE "instruction" commit: the handler-entry / restored
       * PC + the post-event SR system byte + A7. CCR is unchanged (carried over). */
-    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1, setCcr5: Int = -1, msp: Long = -1L, isp: Long = -1L): Unit =
+    def onExcCommit(pc: Long, sysByte: Int, a7: Long, foldNzvc: Int = -1, setCcr5: Int = -1, msp: Long = -1L, isp: Long = -1L): Unit = {
       commits += ExcRec(pc, sysByte, a7, foldNzvc, setCcr5, msp, isp)
+      emittedCount += 1   // an ExcRec always emits
+    }
 
     /** Reconstruct the CommitObservation stream AFTER the run: fold the CCR over Wb
       * snapshots and combine with the per-commit SR system byte + A7 into the full
@@ -175,7 +198,8 @@ object WhiteboxCapture {
           // Resync only on NEW information: a bank switch, or a value the fold has never
           // produced (an exception push). A value a7Run held recently is the lagged
           // shadow replaying what the fold already applied -> ignore it.
-          if (a7S >= 0 && a7S != a7Run && (bankSwitched || !a7Seen(a7S))) a7Run = a7S
+          if (a7S >= 0 && a7S != a7Run &&
+              (regress.legacyA7Resync || bankSwitched || !a7Seen(a7S))) a7Run = a7S
           if (a7Run < 0 && a7S >= 0) a7Run = a7S
           lastSysSm = sysSm
           if (a7Run >= 0) a7Note(a7Run)
@@ -244,7 +268,8 @@ object WhiteboxCapture {
             // `pc` guard: every µop of one macro carries the same post-instruction pc
             // (the macro's nextPc), so a mismatch means this is not the record's macro
             // and the fold is skipped rather than corrupting a neighbour.
-            else if (macroLast && wb.intWrite && wb.dstArch < 16 && out.nonEmpty &&
+            else if (!regress.dropTrailingFold &&
+                     macroLast && wb.intWrite && wb.dstArch < 16 && out.nonEmpty &&
                      out(out.size - 1).pc == pc) {
               val prev  = out(out.size - 1)
               val isA7  = wb.dstArch == 15

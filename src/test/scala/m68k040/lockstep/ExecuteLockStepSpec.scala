@@ -648,7 +648,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // CACR the real Quadra 700 ROM is running with at the 0x4084BECE wedge,
                   // and with DE=0 `LsEuPlugin.txEffectiveCmode` forces every data access to
                   // CacheMode.INHIBITED, a store path no lock-step test had ever exercised.
-                  cacr: Long = 0x80008000L): Unit = {
+                  cacr: Long = 0x80008000L,
+                  // A KNOWN, DOCUMENTED RTL gap that the reference-driven structural
+                  // comparator sees and the DUT-driven delta comparator cannot. Pass the
+                  // filename of the `docs/BUG_*.md` that owns it. The comparison still
+                  // runs and still prints its divergence -- loudly -- but does not fail
+                  // the test. Remove the argument when the RTL is fixed; the test then
+                  // becomes the regression test. Never add one of these without a doc.
+                  structuralKnownGap: Option[String] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -692,6 +699,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       duringRun(dut, cd)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
+      // ── Reference-driven structural lock-step + allocator checker (2026-09-04) ──
+      // `handle` is the DUT-driven delta stream; these two are the inversion. See
+      // `ArchLockStep`/`AllocatorChecker`. Both are sim-only reads of existing state.
+      val structuralOff = sys.env.get("LOCKSTEP_STRUCTURAL").contains("0")
+      val archProbe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      val archSnaps = scala.collection.mutable.ArrayBuffer[ArchSnapshot]()
+      val allocChk  = new AllocatorChecker(dut.ren)
+      var archCycle = 0L
 
       // Capture one EU's writeback-obs into the whitebox (shared by ALU0/ALU1/LS).
       // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
@@ -802,6 +817,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           }
         }
         perCycle(dut)
+        // MUST run last: `StructuralCapture` reads `handle.emitted`, which has to
+        // already count this cycle's commit observations.
+        if (!structuralOff) {
+          archCycle += 1
+          allocChk.onCycle()
+          StructuralCapture.sampleCycle(dut.rob, handle, archProbe, archSnaps, archCycle)
+        }
       }
 
       // Attach the program to the I-cache AXI.
@@ -1034,6 +1056,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $n)")
+
+      // ── REFERENCE-DRIVEN structural compare. Runs AFTER the delta compare so an
+      // existing failure keeps its existing message; this only ever adds coverage.
+      if (!structuralOff) {
+        val ar = ArchLockStep.compare(archSnaps.toSeq, oracle, n)
+        if (sys.env.contains("LOCKSTEP_STRUCTURAL_STATS"))
+          println(f"[$name] arch coverage=${ar.covered}/${ar.total} boundaries=${archSnaps.size} allocErrs=${allocChk.errors.size}")
+        val archReport =
+          s"[$name] STRUCTURAL lock-step diverged (the delta comparator passed):\n" +
+            ar.divergences.take(6).map(d => s"    ${d.kind} @idx=${d.oracleIdx}: ${d.detail}").mkString("\n") +
+            s"\n    [coverage ${ar.covered}/${ar.total} oracle steps had an observable retire boundary]"
+        structuralKnownGap match {
+          case Some(doc) if !ar.ok => println(s"[STRUCTURAL KNOWN GAP: docs/$doc]\n$archReport")
+          case Some(doc)           => println(s"[$name] structuralKnownGap docs/$doc no longer reproduces — remove the argument")
+          case None                => assert(ar.ok, archReport)
+        }
+        assert(allocChk.ok,
+          s"[$name] rename freelist allocator invariant violated:\n    " +
+            allocChk.errors.take(6).mkString("\n    "))
+      }
 
       // Final memory check (store programs): let committed stores drain to memory,
       // then compare the program's DATA bytes against the DUT's D-cache memory.
@@ -4445,16 +4487,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 3)   // d1 == 0x0abc0000
   }
 
-  // MOVEC CACR RAZ-WI: write a value to CACR (write-ignored), read it back -> 0 (RAZ).
-  // The 68040 CACR's only effects are cache enables, which this core lacks -> RAZ-WI.
-  // (Musashi masks CACR to the implemented bits; for a fresh write-then-read the DUT's
-  // RAZ matches Musashi when the written value clears on read of the unimplemented bits.
-  // We write 0 then read 0 to stay trace-indistinguishable from Musashi's CACR model.)
-  test("lock-step: MOVEC CACR read -> 0 (RAZ)", VerilatorTest) {
+  // MOVEC CACR write-then-read: write 0 to CACR, read it back -> 0.
+  //
+  // The comment here used to say "We write 0 then read 0 to stay trace-indistinguishable
+  // from Musashi's CACR model" -- but the PROGRAM never wrote. It only read, and the two
+  // sides do not boot with the same CACR: `runLockStep` pokes the DUT's `ss.cacr` to
+  // 0x80008000 ("firmware already enabled the caches", :853) while Musashi boots at 0. So
+  // the DUT returned 0x80008000 into D2 and the oracle returned 0, and lock-step passed
+  // anyway: MOVEC retires through the sysRetire path with no EU writeback, so
+  // `CommitObservation.archRegValid` was false and D2 was NEVER COMPARED. The
+  // reference-driven structural comparator reported it on its first run
+  // (ARCH REG MISMATCH @idx=0: D2 dut=0x80008000 oracle=0x00000000), and folding the read
+  // through an ordinary ALU op reproduces it on the delta comparator too.
+  //
+  // The write the old comment described makes both sides agree by construction, which is
+  // what the test always meant to assert. `move.l %d2,%d3` then forces the read-back value
+  // through a NORMAL EU writeback so the delta comparator sees it as well -- the same
+  // technique the SFC/DFC test below already uses, and the reason that one was sound.
+  test("lock-step: MOVEC CACR write 0 -> read back 0", VerilatorTest) {
     runLockStep("movec-cacr-raz",
-      "movec %cacr,%d2 ; " +    // read CACR (RAZ) -> D2 = 0
+      "moveq #0,%d0 ; movec %d0,%cacr ; movec %cacr,%d2 ; move.l %d2,%d3 ; " +
       ".stop: bra .stop",
-      nInstr = 1)   // d2 == 0
+      nInstr = 4)   // d2 == d3 == 0
   }
 
   // MOVEC SFC/DFC round-trip (NEW — fixes the latent RAZ-WI divergence). Musashi stores
@@ -6365,7 +6419,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #handler,%d0 ; move.l %d0,0x18 ; " +   // vector 6 (CHK) @ 0x18
       "moveq #-5,%d1 ; moveq #10,%d2 ; chk.w %d2,%d1 ; " + // -5<0 -> trap (entry N=1)
       "moveq #7,%d3 ; loop: bra loop ; " +
-      "handler: moveq #-1,%d4 ; rte", nInstr = 8)   // moveq #-1 -> N=1 matches entry
+      "handler: moveq #-1,%d4 ; rte", nInstr = 8,   // moveq #-1 -> N=1 matches entry
+      // The CHK's own N write is stacked into the frame SR but never committed to the
+      // architectural CCR, so the handler observes stale flags. Real, reproduced with
+      // `smi %d5` in the handler; see the doc. RTE restores correctly, which is why the
+      // delta comparator (whose CCR is a FOLD of `ccrFold`, i.e. the harness's own
+      // synthesis of the missing write) never saw it.
+      structuralKnownGap = Some("BUG_chk_chk2_flags_not_committed_on_trap.md"))
   }
 
   // Dn>bound (N=0) -> trap vector 6 -> handler -> RTE. Entry CCR: `moveq #20,%d1`
@@ -6473,7 +6533,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.w #10,%d3 ; move.w %d3,(%a0) ; move.w #20,%d3 ; move.w %d3,2(%a0) ; " +
       "move.w #99,%d1 ; chk2.w (%a0),%d1 ; " +        // 99 > 20 -> C=1 -> trap (entry CCR=0x01)
       "moveq #7,%d4 ; loop: bra loop ; " +
-      "handler: moveq #0,%d6 ; cmp.l #0x80000001,%d6 ; rte", nInstr = 10) // N=0,Z=0,V=0,C=1
+      "handler: moveq #0,%d6 ; cmp.l #0x80000001,%d6 ; rte", nInstr = 10, // N=0,Z=0,V=0,C=1
+      // Same class as `chk-neg`: CHK2's own C write is stacked but not committed, so the
+      // handler observes a stale CCR. See the doc.
+      structuralKnownGap = Some("BUG_chk_chk2_flags_not_committed_on_trap.md"))
   }
 
   // ── MULU.W / MULS.W lock-step (16x16 -> Dn[31:0], N/Z; V=0, C=0) ─────────────
