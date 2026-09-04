@@ -158,7 +158,7 @@ that core, which was not done.
 |---|---|---|
 | **L1D hit** | **11.000 ± 0.159** | 4 KiB footprint < 8 KiB L1D; differential over passes; /64 accesses; minus matched no-load control |
 | **L1D miss → L2 hit** | **20.139 ± 0.533** | 32 KiB footprint = 4× L1D → misses every access; L2-resident from prior pass |
-| **cold miss → model DRAM** | **98.242 ± 1.858** | straight-line stride-64; a fresh 64 B line every step |
+| **cold miss → model DRAM** | **98.242 ± 1.858** at `dramCycles=70`; **core-side fixed cost 28.5** (sweep intercept) | straight-line stride-64; a fresh 64 B line every step |
 
 These are **marginal** costs: the cost of adding one more dependent load to the chain, with
 the matched no-load control already subtracted. The control replaces the load with a
@@ -169,10 +169,39 @@ to depend on it (`adda.l %d1,%a0` with `d1==0`), giving a true serial load-to-us
 without needing the memory model's endianness to be correct.
 
 **The DRAM row is a model artefact and must not be quoted as this machine's DDR latency.**
-`dramCycles=70` is an unmeasured parameter; the 98.242 figure largely echoes it back. The
-`--dram-sweep` mode of the runner exists precisely to report the *slope* (how much memory
-latency the core fails to hide on a dependent chain) and the *intercept* (core-side fixed
-miss-handling cost) instead. **The sweep was not completed** — see §4.
+`dramCycles=70` is an unmeasured parameter; the 98.242 figure largely echoes it back.
+
+#### The DRAM sensitivity sweep — what is actually real here
+
+`tools/run_microbench.sh --dram-sweep` re-runs the memory group across `dramCycles` so the
+model parameter can be separated from the core's own behaviour:
+
+| `dramCycles` | measured cold-miss cost | linear fit | residual |
+|---|---|---|---|
+| 20 | 48.360 ± 1.247 | 48.466 | −0.106 |
+| 40 | 68.582 ± 1.548 | 68.405 | +0.177 |
+| 70 | 98.242 ± 1.858 | 98.313 | −0.071 |
+
+```
+slope     = 0.997 cycles per dramCycle
+intercept = 28.53 cycles
+```
+
+Residuals are within ±0.18 cycles over a 50-cycle sweep — an essentially perfect straight
+line. Two real results follow, neither of which depends on the unmeasured parameter:
+
+- **Slope ≈ 1.00.** On a serial dependent chain the core hides *essentially none* of the
+  memory latency — every extra DRAM cycle appears 1:1 in the dependent chain. That is the
+  correct and expected behaviour for a true load-to-use dependency (there is no independent
+  work to overlap), and it is the positive confirmation that this benchmark is genuinely
+  latency-bound rather than accidentally measuring throughput.
+- **Intercept ≈ 28.5 cycles.** This is the **core-side fixed cost** of a dependent load that
+  misses both L1D and L2 — miss detection, AXI request, refill, replay and load-to-use —
+  with the memory system's contribution removed. **This is a real property of this RTL and
+  is the number worth quoting.** The 98.242 figure is not.
+
+So: quote the L1D hit (11.0), the L2 hit (20.1), the slope (~1.0) and the intercept (28.5).
+Do not quote 98.242 as a DDR latency.
 
 ### 3.3 Branch misprediction
 
@@ -322,16 +351,7 @@ held constant so the backend never becomes the limiter, and the differential tak
 memory configurations rather than across chain length. I ran out of budget before building
 it. The D-side numbers in §3.2 say nothing about the I-side.
 
-### 4.4 DRAM sensitivity sweep — built but not run
-
-`tools/run_microbench.sh --dram-sweep` is committed and re-runs the memory group at
-`dramCycles ∈ {20, 40, 70}` so the slope and intercept can be extracted. **It did not run:**
-the script's own host guard correctly refused to start because two sibling agents' heavy
-JVMs were already up (the cap is 2 across all agents). Only the `dram=70` point exists.
-Until the sweep runs, §3.2's DRAM row remains a single point tracking an unmeasured
-parameter.
-
-### 4.5 Hardware
+### 4.4 Hardware
 
 Nothing was measured on silicon; that was the re-scope. §0 records what a port would need.
 
@@ -364,8 +384,11 @@ across with only the counter read replaced.
 
 ## 6. Standing cautions for anyone quoting these numbers
 
-1. **The DRAM row is a model input, not a measurement.** `dramCycles` is unmeasured in both
-   repos. Quote the L1D and L2 rows; qualify the DRAM row or run the sweep first.
+1. **The absolute DRAM figure is a model input, not a measurement.** `dramCycles` is
+   unmeasured in both repos. Quote the L1D hit (11.0), the L2 hit (20.1), and from the
+   sweep the slope (~1.00, the core hides none of a dependent miss) and the intercept
+   (**28.5 cycles**, the real core-side fixed miss cost). Do not quote 98.242 as a DDR
+   latency.
 2. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
    here always means *cold, first touch*.
 3. **Latency ≠ throughput on this core.** `mulu.w` is 12 cycles latency and 1.85 cycles
