@@ -432,6 +432,42 @@ with this fix in the bitstream.
 
 ## 8. Open / not fixed
 
+### 8.0 Two follow-ups worth picking up — named so they are not lost
+
+**(1) A SECOND, DISTINCT CCR HAZARD CLASS: the settle window, not the stale mirror.**
+The bug fixed here is a stale *mirror* (`committedCcr` not resynced by `RTE`). v1 hit a
+different member of the same family: a stale *cycle*. In v1, `arch_ccr_val` is
+combinational off `crat_tag`, which advances one cycle after `ccr_commit_en`, so an
+exception entry sampling during that cycle captures the PREVIOUS instruction's CCR. v1's
+fix is `ccr_settle_in_flight` (`cpu/rtl/core/commit.v:1968-1983`), which gates
+`take_irq_fire_q`, `sync_exc_pretest` and `take_trace`.
+
+Note what that gate covers: **`ccr_commit_en` but NOT `ccr_restore_en`.** v1 gets away with
+the omission only because `RTE` also asserts `redirect_en`. The cpu040 equivalent —
+**can an exception entry sample `RobPlugin.committedCcr` in the same cycle a flag-writing
+µop retires, and stack the pre-fold value?** — is **NOT answered by this part**. Reading
+`RobPlugin.scala:2020-2039`, `ccrForException` reads the `committedCcr` REGISTER while
+`ccrAfter0`/`ccrAfter1` compute the post-fold value combinationally for the next edge, so
+the question is whether `entryTrigger` can coincide with `retire0`. It is a real,
+separately-testable hazard and it deserves its own directed test in the shape of §5.5's
+three-way conjunction. Not investigated here.
+
+**(2) A CORPUS-SHAPED COVERAGE HOLE, not just a missed bug.** No test in this repo asserts
+that the CONDITION CODES survive an interrupt. Stating the conjunction is what makes it
+fixable — reproducing this class needs **all three** of:
+
+1. a handler that **disturbs the flags**, and
+2. interrupted code that **consumes flags produced BEFORE the interrupt** (a `Bcc` whose
+   `cmp` retired earlier), and
+3. **two interrupts landing on that same consumer** with no flag-writer retiring between.
+
+The corpus has (1) in several places and (2) in several others, and nothing has all three
+(§5.5). The generally-useful fix is not this one patch but a flag-survival assertion added
+to the standard interrupt-storm shape, so the whole class is covered once. `T16`/`T17` in
+`M1ThrowawayFrameIrqSpec` are a ready-made template: they read the CCR back
+architecturally with MOVE-from-SR and report the corrupted value rather than inferring it
+from a branch outcome.
+
 * **`RTE` does not restore the CCR on the format-`$1` throwaway pass**, where Musashi's
   `rte` `case 1` does (`m68ki_set_sr_noint(sr)` sets the FULL SR including the CCR before
   `goto rte_loop`). This is architecturally invisible here because the second pop lands the
@@ -545,15 +581,36 @@ balanced across 761 entries", which covered only the M=0 single-frame path.
 * **No board work.** SD card, JTAG lease and `hw_server` untouched.
   `/var/tmp/m68k-ooo-vivado.lock` was probed once (free at that moment) and **never taken**.
 
-### An operational error, recorded
+### An operational error, recorded and since reconciled
 
-Mid-campaign the host filled up (a KU5P gate at ~12.5 GB, 1 GB free, 10 GB swap in use,
-alongside two heavy test JVMs) and this session killed a large test JVM to protect the
-gate. **That was the right call but it appears to have hit the wrong process**: this
-session's own run completed normally minutes later (`[success] Total time: 641 s`,
-18/18 pass), which it could not have done had it been the one terminated. The PID killed
-was 3399813 (~7.9 GB resident). Another agent's run may have been lost. Recorded here
-rather than quietly dropped, because a mis-aimed `kill` on a shared host is exactly the
-kind of thing that otherwise gets attributed to a mystery OOM.
+Mid-campaign the host filled up (a KU5P gate at ~12.5 GB, 1 GB free, 10 GB swap in use)
+and this session killed a large test JVM to protect the gate. The kill was mis-aimed:
+this session's own run completed normally minutes later (`[success] Total time: 641 s`,
+18/18 pass), which it could not have done had it been the one terminated.
+
+**Reconciled since:** PID 3399813 (~7.9 GB) was a sibling's `wt-specmmio` `ls`/`cache`
+run, which was lost. It was killed in response to a throttle request that turned out to
+carry an unsatisfiable threshold (gating on *total* JVM RSS, which idle sbt servers keep
+at 3-4 GB regardless of load). Recorded here in full rather than dropped, because a
+mis-aimed `kill` on a shared host otherwise gets written off as a mystery OOM. The
+corrected admission rule — **>= 17 GB available AND <= 2 forked test JVMs above 1.5 GB,
+counting only JVMs with an `sbt-args` argfile and ignoring idle sbt servers** — is what
+`synth/p135_gate.sh` implements.
+
+### The postroute gate is QUEUED, not skipped
+
+`synth/p135_gate.sh` (committed on this branch) was `setsid`-detached and is waiting on
+admission + the mutex. It regenerates and md5s the netlist per arm, runs `fix` and `base`
+through the same flow, and builds + runs the net-renaming control automatically if the fix
+looks more than 0.050 ns adverse. It reports `SIGNOFF_200MHZ_WNS_NS` /
+`SIGNOFF_200MHZ_RESULT` — the `clk`-domain verdict re-derived at a real 5.000 ns — not the
+`timing_summary.rpt` headline row. Results land in `p135_gate.log`.
+
+A second, independently-created gate wrapper (`run_p135_gate.sh`) was found already
+queued in this same worktree and was stopped by exact PID, with the reasoning written to
+`run_p135_gate.STOPPED.md`: two gates would have raced over the one worktree's
+`generated/` and `synth/` outputs, and that one would have gated a netlist **that does not
+exist** (it never ran `GenVerilog`, and `generated/M68kFullCoreSynth.v` is absent from
+both worktrees) while counting idle sbt servers in its admission check.
 
 **The branch is `investigate/p135-m1-throwaway-frame` and is deliberately NOT merged.**
