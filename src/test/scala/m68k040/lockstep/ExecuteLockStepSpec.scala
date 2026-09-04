@@ -618,7 +618,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // every existing call site byte-for-byte unchanged; pass one of the
                   // `L2Sweeps` presets (e.g. `todaysCrossbar`, `l2DramSlow`,
                   // `chaosDram`) to lock-step under realistic-vs-idealized AXI timing.
-                  cfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig()): Unit = {
+                  cfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+                  // Committed CACR posture. The default 0x80008000 (DE|IE) is what EVERY
+                  // pre-existing call site has always used, so they are unchanged. Part 126
+                  // needs 0x00008000 -- I-cache ON, **D-cache OFF** -- because that is the
+                  // CACR the real Quadra 700 ROM is running with at the 0x4084BECE wedge,
+                  // and with DE=0 `LsEuPlugin.txEffectiveCmode` forces every data access to
+                  // CacheMode.INHIBITED, a store path no lock-step test had ever exercised.
+                  cacr: Long = 0x80008000L): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -835,7 +842,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // the init sweep (it resets committed state) so the surfaced A7 (== SSP, S=1)
       // matches OracleStep.a(7) for every program.
       dut.rob.logic.exc.ss.isp #= 0x00100000L
-      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
+      dut.rob.logic.exc.ss.cacr #= BigInt(cacr & 0xffffffffL)   // default DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Boot mode: default supervisor (SR boot 0x2700, S=1). When `initialSr` overrides it
       // (e.g. user mode S=0 for the privilege-violation test), seed the committed SR system
       // byte AND the USP bank; in user mode the surfaced A7 == USP, so the int PRF arch-15
@@ -8010,6 +8017,72 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
       "moveq #7,%d3 ; " +
       ".stop: bra .stop", nInstr = 22, pcOnly = true)
+  }
+  // ── Part 126: the SAME programs, but with the D-CACHE DISABLED ────────────────
+  // At the hardware wedge the CPU reports `CACR = 0x00008000`: I-cache ON, D-cache
+  // OFF.  Every lock-step test in this file (and the fuzz/ported runners) has always
+  // forced `CACR = 0x80008000`, so `LsEuPlugin.txEffectiveCmode`'s DE=0 leg -- which
+  // forces EVERY data access to `CacheMode.INHIBITED` -- has never been under an
+  // oracle.  Part 124 proved the auto-update works with DE=1; these re-run its two
+  // decisive programs in the posture the ROM is actually in.
+  test("lock-step p126: ROM stack-clear entry at the REAL low SP, D-CACHE DISABLED", VerilatorTest) {
+    runLockStep("p126-lowsp-dcache-off",
+      "move.l #0x3000,%a1 ; move.l #0,(%a1) ; move.l #0xFFFFFFFF,%d5 ; moveq #0,%d0 ; " +
+      "move.l (%a1),%sp ; move.l %d5,(%sp)+ ; " +
+      "clr.l (%sp)+ ; move.l %sp,%d1 ; clr.l (%sp)+ ; move.l %sp,%d2 ; " +
+      "moveq #7,%d3 ; .stop: bra .stop", nInstr = 12, cacr = 0x00008000L,
+      // POSITIVE proof the posture actually took: a poked value that had been
+      // silently reset would make this whole Part's negative result vacuous.
+      afterRun = (dut, _) => {
+        val c = dut.rob.logic.exc.ss.cacr.toBigInt
+        assert(c == BigInt(0x00008000L), s"p126: CACR did not hold the D-cache-OFF posture, read 0x${c.toString(16)}")
+      })
+  }
+  test("lock-step p126: ROM stack-clear loop MUST EXIT, D-CACHE DISABLED", VerilatorTest) {
+    runLockStep("p126-stackclear-exit-dcache-off",
+      "move.l #0x0000FFF0,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+      ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 22, pcOnly = true, cacr = 0x00008000L)
+  }
+  test("lock-step p126: CLR.L (An)+ auto-update matrix, D-CACHE DISABLED", VerilatorTest) {
+    runLockStep("p126-clr-l-autoupd-dcache-off",
+      "move.l #0x3000,%a1 ; move.l #0x81234567,(%a1) ; move.l #0x0F0F0F0F,4(%a1) ; " +
+      "move.l %a1,%a0 ; move.l %a1,%sp ; " +
+      "clr.l (%a0)+ ; move.l %a0,%d4 ; " +
+      "clr.l (%sp)+ ; move.l %sp,%d5 ; " +
+      "clr.l -(%a0) ; move.l %a0,%d6 ; " +
+      "clr.l -(%sp) ; move.l %sp,%d7 ; " +
+      "moveq #7,%d3 ; .stop: bra .stop", nInstr = 15, cacr = 0x00008000L)
+  }
+  test("lock-step p126: a long INHIBITED store burst, D-CACHE DISABLED", VerilatorTest) {
+    // Drives many back-to-back cache-inhibited stores so the store queue is under
+    // sustained pressure -- the condition the 3-instruction ROM loop creates on
+    // silicon and that a 2-store program never reaches.
+    runLockStep("p126-store-burst-dcache-off",
+      "move.l #0x00003F00,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+      ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; cmp.w #0x4000,%d0 ; bne .lp ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 260, pcOnly = true, cacr = 0x00008000L)
+  }
+  // Part 126: the ROM's ACTUAL 0x4084BEA8 sequence, which MAME says runs with SP
+  // near the TOP of RAM (`A5 = top-0x2C`), not at the RAM base.  The board reports
+  // A7 = 0x00000004 there, which is not reachable from A5 by this code -- so the
+  // suspect instruction is `moveal %a5,%sp` (MOVEA.L A5,A7, opword 0x2E4D) itself,
+  // or the A7-destination store auto-updates that follow it.  Every A7 value is
+  // witnessed through an ordinary data register as well as the `a7` field.
+  for ((tag, base) <- Seq(("scratch", "0x0000FFD4"), ("realtop", "0x03FFFFD4"))) {
+    test(s"lock-step p126: MOVEA.L A5,A7 then the ROM push/CLR chain ($tag), D-CACHE DISABLED", VerilatorTest) {
+      runLockStep(s"p126-movea-a5-a7-$tag",
+        s"move.l #$base,%a5 ; " +
+        "move.l #0,(%a5) ; move.l #0,4(%a5) ; move.l #0,8(%a5) ; move.l #0,12(%a5) ; " +
+        "move.l %a5,%sp ; move.l %sp,%d1 ; " +      // moveal %a5,%sp  (0x2E4D)
+        "moveq #-1,%d5 ; " +
+        "move.l %d5,(%sp)+ ; move.l %sp,%d2 ; " +   // movel %d5,%sp@+ (0x2EC5)
+        "clr.l (%sp)+ ; move.l %sp,%d3 ; " +        // clrl %sp@+      (0x429F)
+        "move.w %sp,%d0 ; " +
+        "moveq #7,%d4 ; .stop: bra .stop", nInstr = 14, cacr = 0x00008000L)
+    }
   }
   test("lock-step fullext: CMPI.L #imm,(bd.L,An) IS=1 -- the ROM 0x0CB0/0x8170 shape", VerilatorTest) {
     // a0=0x3000, bd=0x10000 (forces BD-SIZE=long), index suppressed -> EA = 0x13000.
