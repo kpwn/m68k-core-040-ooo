@@ -184,6 +184,47 @@ class MicrobenchSpec extends CoreBenchHarness {
       r.ldCmdAddrs.take(6).map(a => f"0x$a%08x").mkString(","))
   }
 
+  /** The address window the page tables live in (root 0x80000, pointer 0x81000, leaf
+    * tables bump-allocated from 0x82000). Well below `DataBase` and above nothing else
+    * the kernels touch. */
+  val TableLo = 0x00080000L
+  val TableHi = 0x00100000L
+
+  /** Split a run's D-side load addresses into DATA and PAGE-TABLE-DESCRIPTOR traffic.
+    *
+    * This split only became necessary at `2db5bd3`. Before it, the walkers owned
+    * private AXI masters and NOTHING they did appeared on `dcache.loadCmdPort`; after
+    * it they are arbitrated onto the very same port as the LS pipe, so every chase
+    * kernel running with the MMU on now sees three extra descriptor loads per walk
+    * mixed into `ldCmdAddrs`. A premise assertion written against the old behaviour
+    * would fire spuriously on HEAD -- so premises are checked against `data` only, and
+    * `desc` is reported as a measurement in its own right (it is a direct count of the
+    * walker traffic the change moved into the cache). */
+  def splitLoads(r: IpcResult): (Seq[Long], Seq[Long]) = {
+    val (desc, data) = r.ldCmdAddrs.partition(a => a >= TableLo && a < TableHi)
+    (data.toSeq, desc.toSeq)
+  }
+
+  /** PREMISE ASSERTION for the page-STRIDING chases (`kTlbChase`).
+    *
+    * `assertChasePremise`'s distinct-line bound is the right test for a chase that
+    * revisits a small footprint, but the TLB chases legitimately touch one new line
+    * per step, so a line-count bound cannot discriminate there. The premise those
+    * kernels rest on is stronger and exactly checkable: with the loaded value zero,
+    * the D-side load addresses must be EXACTLY `base + k*stride` for k = 0,1,2,...
+    * Anything else means `%d1` was not zero and the chain derailed -- the failure
+    * that produced §4.1's bogus {0.00, 0.00, 567.25, ...}. Checked, not assumed. */
+  def assertStridePremise(r: IpcResult, base: Long, stride: Long, what: String): Unit = {
+    val addrs = splitLoads(r)._1.distinct
+    assert(addrs.nonEmpty, s"[$what] PREMISE FAILED: no D-cache DATA loads observed at all.")
+    val bad = addrs.filter(a => a < base || ((a - base) % stride) != 0)
+    assert(bad.isEmpty,
+      f"[$what] PREMISE FAILED: ${bad.size} of ${addrs.size} D-side load addresses are not " +
+      f"0x$base%08x + k*0x$stride%x, so the loaded value was not zero and the address chain " +
+      f"derailed -- this measurement is meaningless. Offenders: " +
+      bad.take(6).map(a => f"0x$a%08x").mkString(","))
+  }
+
   // ── reporting ───────────────────────────────────────────────────────────────
 
   private val rows = scala.collection.mutable.ArrayBuffer.empty[(String, String, Stat, String)]
@@ -482,8 +523,18 @@ class MicrobenchSpec extends CoreBenchHarness {
     for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
 
   /** Identity-map `pages` 4 KiB pages starting at `vaBase`, stepping `stride`.
-    * Leaf tables are bump-allocated per distinct pointer-table slot. */
-  def buildIdentityTables(mem: AxiMemModel, vaBase: Long, stride: Long, pages: Int): Unit = {
+    * Leaf tables are bump-allocated per distinct pointer-table slot.
+    *
+    * `leafStride` is the spacing between successive leaf tables. The default 0x1000
+    * is what this suite has always used and is kept so existing kernels' numbers stay
+    * comparable -- but note it is 16x the tables' TRUE size (a leaf table here is 64
+    * entries x 4 B = 256 B), and 0x1000 spacing maps every leaf table base to the SAME
+    * L1D set (the D-cache is 8 KiB / 16 B lines / 4-way => index = addr[10:4], so
+    * anything 2 KiB apart aliases). Kernels that care whether leaf descriptors STAY
+    * RESIDENT must pass the realistic 0x100 instead, or they will measure a self-
+    * inflicted conflict-miss storm and call it a walker property. */
+  def buildIdentityTables(mem: AxiMemModel, vaBase: Long, stride: Long, pages: Int,
+                          leafStride: Long = 0x1000L): Unit = {
     var nextLeaf = MmuLeaf
     val leafFor = scala.collection.mutable.HashMap.empty[Int, Long]
     for (p <- 0 until pages) {
@@ -491,7 +542,7 @@ class MicrobenchSpec extends CoreBenchHarness {
       val rootIdx = ((va >> 25) & 0x7f).toInt
       val ptrIdx  = ((va >> 18) & 0x7f).toInt
       val pageIdx = ((va >> 12) & 0x3f).toInt
-      val leaf    = leafFor.getOrElseUpdate(ptrIdx, { val l = nextLeaf; nextLeaf += 0x1000L; l })
+      val leaf    = leafFor.getOrElseUpdate(ptrIdx, { val l = nextLeaf; nextLeaf += leafStride; l })
       // root -> pointer table, pointer -> leaf table: descriptor type 3 (table)
       pokeDescBE(mem, MmuRoot + rootIdx * 4, (MmuPtr & 0xfffffff0L) | 0x3L)
       pokeDescBE(mem, MmuPtr  + ptrIdx  * 4, (leaf   & 0xfffffff0L) | 0x3L)
@@ -535,19 +586,201 @@ class MicrobenchSpec extends CoreBenchHarness {
     * A 32 KiB (8-page) stride holds vpn[2:0] constant, so every access lands in the
     * SAME 4-way DTLB set; striding past 4 such pages evicts on every touch and
     * guarantees a fresh walk per access rather than a warm hit. */
-  def kTlbChase(n: Int, walk: Boolean): Kernel = {
+  def kTlbChase(n: Int, walk: Boolean, zeroData: Boolean = true): Kernel = {
     val strideBytes = 8 * 4096   // 32 KiB: constant vpn[2:0] -> one DTLB set
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0", "moveq #0,%d2")
     val body = (0 until n).flatMap(_ => chaseStep(strideBytes))
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"tlb-${if (walk) "walk" else "ttr"}-$n", src, stopAt(setup.size + n * 3),
-      mmu = Some(if (walk) mmuWalkD else mmuNoWalk), zeroFillData = true,
+    // ── THE PREMISE THIS KERNEL IS BUILT ON, MADE TRUE ──────────────────────────
+    // `chaseStep` is `move.l (%a0),%d1 ; adda.l %d1,%a0 ; adda.l #STRIDE,%a0`, and it
+    // only strides by STRIDE if the loaded value is ZERO. `prepMem` used to write the
+    // page TABLES and nothing else -- but an untouched `SparseMemory` page is
+    // PRNG-FILLED, not zeroed, so `%d1` was garbage, `a0` jumped somewhere arbitrary,
+    // and under `mmuWalkD` (deliberately no D-side TTR) that arbitrary address is
+    // unmapped and takes a translation fault. The kernel then never retired its macro
+    // count at all.
+    //
+    // That is the whole explanation of the bimodal `{0.00, 0.00, 567.25, 556.43, 0.00}`
+    // originally recorded in this suite's write-up §4.1: the short and long kernels
+    // share a byte-identical prefix, so they derailed at the SAME step and produced the
+    // SAME window -- a differential of exactly 0.00. The `mmuNoWalk` control never
+    // faulted (its match-all TTR translates anything), which is exactly why only the
+    // walk half looked unstable. Measured over five seeds before the fix:
+    //
+    //   walk, as committed : retired 66/174, 65/174, 158/174, 158/174, 69/174
+    //                        -- INCOMPLETE on every seed, short and long identical
+    //   walk, zeroed       : 176/174 on every seed; perStep stable
+    //
+    // So it was a kernel premise violation, NOT a table-walker wedge or fault path.
+    //
+    // MERGE NOTE: the two bench branches fixed this independently and differently --
+    // `hw-microbench-suite` with `zeroFillData = true` (zero-fill the WHOLE D-side
+    // backing store) and `walk-kernel-premise-fix` with an explicit 4-byte poke per
+    // strided page. `zeroFillData` is the strictly stronger of the two (it also covers
+    // any address the chase reaches that the poke loop did not enumerate), so it is what
+    // survives; the `zeroData` knob is kept from the other branch purely so the DIAG
+    // test below can still exhibit the OLD, broken behaviour side by side.
+    Kernel(s"tlb-${if (walk) "walk" else "ttr"}-$n${if (zeroData) "" else "-raw"}", src,
+      stopAt(setup.size + n * 3),
+      mmu = Some(if (walk) mmuWalkD else mmuNoWalk),
+      zeroFillData = zeroData,
       prepMem = h => buildIdentityTables(h.dWalkMem, DataBase, strideBytes.toLong, n + 4))
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PAGE-TABLE LOCALITY (the regime `kTlbChase` deliberately excludes)
+  // ════════════════════════════════════════════════════════════════════════════
+  //
+  // `kTlbChase` is a WORST CASE by construction: it strides forward forever, so no
+  // leaf descriptor is ever revisited and the only reuse is at the root and pointer
+  // levels. It bounds the DOWNSIDE of routing walks through L1D (an extra cache hop
+  // on the walk path) while structurally excluding the UPSIDE (descriptors that are
+  // already in L1D when the walk needs them). Reporting only that number understates
+  // the change, because real code does revisit pages.
+  //
+  // This kernel supplies the other half. It is the SAME chase -- same instruction
+  // mix, same 3 instructions per step, same differential method -- but the address
+  // sequence CYCLES over a bounded working set of `wsPages` pages instead of striding
+  // away forever. Sweeping `wsPages` walks the working set from "the whole page-table
+  // subtree is resident in L1D" out to "it is being evicted", and the crossover is
+  // itself the answer to 'how much locality does the change need before it pays'.
+  //
+  // GEOMETRY, and why each constant is what it is:
+  //   * PAGE stride is 8 pages (32 KiB). The DTLB is 32 entries, 4-way, 2 banks keyed
+  //     bank=vpn[0], set=vpn[2:1]; an 8-page stride holds vpn[2:0] CONSTANT so every
+  //     access lands in ONE 4-way set. With wsPages > 4 that set thrashes and EVERY
+  //     access takes a real 3-level walk -- which is the point: the working set is
+  //     resident in the L1D but never in the DTLB, so we measure walk cost with hot
+  //     descriptors rather than measuring DTLB hits.
+  //   * The byte stride is 32 KiB + 16 B, not 32 KiB. The L1D is 8 KiB / 16 B lines /
+  //     4-way, so index = addr[10:4] and a pure 32 KiB stride maps EVERY data line to
+  //     the SAME L1D set -- 4 ways for the whole working set. The extra 16 B per page
+  //     rotates the data across all 128 sets while leaving vpn[2:0] untouched (16 B x
+  //     255 < 4 KiB, so the page number is unaffected for wsPages <= 256).
+  //   * Leaf tables are allocated 0x100 apart (their true size), not the suite's
+  //     historical 0x1000. At 0x1000 every leaf table base aliases to L1D set 0 and
+  //     the descriptors would evict each other regardless of how much room the cache
+  //     has -- a property of the test's allocator, not of the core.
+  //
+  // The unrolled form emits a per-step displacement instead of one constant, which is
+  // what makes the cycle possible. `adda.l #imm,%an` is 6 bytes and one cycle for ANY
+  // immediate, so short and long runs stay byte-for-byte comparable and the
+  // differential remains exact.
+  val LocPageStride = 8L * 4096 + 16L
+
+  /** Address the k-th step of the locality chase must load from. */
+  def locAddr(k: Int, wsPages: Int): Long = DataBase + (k % wsPages).toLong * LocPageStride
+
+  /** DEP. Page-striding zero-load chase that CYCLES over `wsPages` pages.
+    *
+    * `walk = false` is the byte-identical control (match-all D-side TTR, so no walk
+    * can occur); `walk - noWalk` is therefore the table-walk cost under whatever
+    * page-table residency `wsPages` produces, and nothing else. */
+  def kTlbLocality(n: Int, walk: Boolean, wsPages: Int): Kernel = {
+    val setup = Seq(f"lea 0x${locAddr(0, wsPages)}%08x,%%a0", "moveq #0,%d2")
+    val body = (0 until n).flatMap { k =>
+      // d1 is 0 (premise, enforced by zeroFillData + assertStridePremise), so
+      // `adda.l %d1,%a0` is a no-op that keeps the LOADED VALUE in the dependency
+      // chain -- without it the address stream would not depend on the load and the
+      // core would run ahead, measuring issue bandwidth instead of latency.
+      val disp = locAddr(k + 1, wsPages) - locAddr(k, wsPages)
+      Seq("move.l (%a0),%d1", "adda.l %d1,%a0", s"adda.l #$disp,%a0")
+    }
+    val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
+    Kernel(s"tlbloc-${if (walk) "walk" else "ttr"}-ws$wsPages-$n", src,
+      stopAt(setup.size + n * 3),
+      mmu = Some(if (walk) mmuWalkD else mmuNoWalk),
+      zeroFillData = true,
+      prepMem = h => buildIdentityTables(h.dWalkMem, DataBase, LocPageStride, wsPages,
+                                         leafStride = 0x100L))
+  }
+
+  /** PREMISE ASSERTION for `kTlbLocality`: the load addresses must be EXACTLY the
+    * cycle the kernel claims. Stronger than the distinct-line bound (the footprint is
+    * known exactly here), and it is the check that would have caught the §4.1
+    * false-premise run immediately. */
+  def assertLocalityPremise(r: IpcResult, wsPages: Int, what: String): Unit = {
+    val want = (0 until wsPages).map(p => DataBase + p * LocPageStride).toSet
+    val got  = splitLoads(r)._1.distinct
+    assert(got.nonEmpty, s"[$what] PREMISE FAILED: no D-cache DATA loads observed at all.")
+    val bad = got.filterNot(want.contains)
+    assert(bad.isEmpty,
+      f"[$what] PREMISE FAILED: ${bad.size} of ${got.size} D-side load addresses are outside " +
+      f"the $wsPages-page working set, so the loaded value was not zero and the chain " +
+      f"derailed. Offenders: " + bad.take(6).map(a => f"0x$a%08x").mkString(","))
+    assert(got.size == math.min(wsPages, want.size),
+      f"[$what] PREMISE FAILED: the chase touched ${got.size} distinct addresses, not the " +
+      f"$wsPages the working set defines -- it did not complete its cycle.")
   }
 
   // ════════════════════════════════════════════════════════════════════════════
   // THE SUITE
   // ════════════════════════════════════════════════════════════════════════════
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // DIAGNOSTIC: why the DTLB-walk differential is bimodal (suite §4.1)
+  // ══════════════════════════════════════════════════════════════════════════════
+  //
+  // §4.1 recorded {0.00, 0.00, 567.25, 556.43, 0.00} over five seeds for the real-walk
+  // half and, correctly, refused to average it -- flagging "a run whose end point is
+  // independent of chain length points at the MMU-on / real-page-table configuration
+  // terminating on something other than the chase" as a possible RTL defect in the
+  // walker.
+  //
+  // HYPOTHESIS UNDER TEST: it is a KERNEL premise violation, not a walker defect.
+  // `chaseStep` is `move.l (%a0),%d1 ; adda.l %d1,%a0 ; adda.l #STRIDE,%a0`, and its
+  // whole design depends on the loaded value being ZERO so that `a0` advances by exactly
+  // STRIDE and stays inside the mapped pages. But `kTlbChase.prepMem` writes the page
+  // TABLES (into `dWalkMem`) and never writes the DATA pages, and an untouched
+  // `SparseMemory` page is PRNG-filled, not zeroed. So `%d1` is garbage, `a0` jumps
+  // somewhere arbitrary, and under `mmuWalkD` -- which deliberately has NO D-side TTR --
+  // that arbitrary address is unmapped and takes a translation fault. The short and long
+  // kernels share a byte-identical prefix, so they derail at the SAME step and produce
+  // the SAME window: differential exactly 0.00. The `mmuNoWalk` control never faults
+  // because its match-all TTR translates anything, which is exactly why only the walk
+  // half is unstable.
+  //
+  // PREDICTION: zeroing the chase's data words makes the walk half complete its full
+  // macro count on every seed and the differential become well-defined. If instead it
+  // stays degenerate with the data zeroed, the hypothesis is wrong and the walker really
+  // is wedging.
+  //
+  // Enable with MB_WALKDIAG=1 (it is a diagnostic, not part of the reported suite).
+  test("DIAG: the bimodal DTLB-walk differential", VerilatorTest) {
+    assume(sys.env.contains("MB_WALKDIAG"))
+    val compiled = M68kSim().withVerilator.compile(new FullCoreDut)
+    def probe(label: String, mk: Int => Kernel): Unit = {
+      println(s"\n---- $label ----")
+      seeds.foreach { sd =>
+        // The harness asserts when a kernel does not retire its full macro count; that
+        // incompleteness is exactly what is being diagnosed here, so catch it and report
+        // it as data instead of aborting the probe.
+        val lo = scala.util.Try(runKernel(compiled, mk(60), sd))
+        val hi = scala.util.Try(runKernel(compiled, mk(120), sd))
+        val loWant = mk(60).retiredInstrs
+        val hiWant = mk(120).retiredInstrs
+        (lo, hi) match {
+          case (scala.util.Success(l), scala.util.Success(h)) =>
+            val per = DiffSample(l.windowCycles, h.windowCycles, 60, 120).perStep
+            println(f"  seed=$sd%08x  short: retired=${l.retiredInstrs}%4d/$loWant%4d win=${l.windowCycles}%6d" +
+                    f"   long: retired=${h.retiredInstrs}%4d/$hiWant%4d win=${h.windowCycles}%6d" +
+                    f"   perStep=$per%8.2f")
+          case _ =>
+            def m(t: scala.util.Try[IpcResult]) = t match {
+              case scala.util.Success(r) => s"OK(retired=${r.retiredInstrs} win=${r.windowCycles})"
+              case scala.util.Failure(e)  => "INCOMPLETE: " + Option(e.getMessage).getOrElse("").take(90)
+            }
+            println(f"  seed=$sd%08x  short: ${m(lo)}   long: ${m(hi)}")
+        }
+      }
+    }
+    probe("walk, RAW (data pages never written -> PRNG-filled: the old behaviour)",
+          n => kTlbChase(n, walk = true, zeroData = false))
+    probe("ttr control, RAW", n => kTlbChase(n, walk = false, zeroData = false))
+    probe("walk, FIXED (data pages zeroed: the kernel's own premise made true)",
+          n => kTlbChase(n, walk = true))
+    probe("ttr control, FIXED", n => kTlbChase(n, walk = false))
+  }
 
   test("68040 OoO latency microbenchmark suite", VerilatorTest) {
     // Compile the core ONCE and reuse it for every kernel and every seed -- this
@@ -827,9 +1060,18 @@ class MicrobenchSpec extends CoreBenchHarness {
     // ── MMU / DTLB ────────────────────────────────────────────────────────────
     if (enabled("mmu")) {
       println("\n-- MMU: DTLB HIT vs TABLE WALK ---------------------------------------")
-      println("  BASELINE for the in-flight 'route table walks through L1D' change:")
-      println("  on THIS commit the walker has its own AXI port and bypasses the L1D.")
+      println("  POST-2db5bd3: the walker has NO AXI port of its own -- descriptor reads")
+      println("  and U/M writebacks are D-cache clients, so upper-level descriptors can hit L1D.")
       try {
+        // PREMISE FIRST: both halves of the matched pair must actually be striding by
+        // 32 KiB. The walk half is the one that derails silently (no D-side TTR, so a
+        // garbage address faults instead of just reading nonsense), and it derails at the
+        // same step in both the short and long kernel -- yielding a confident 0.00.
+        val strideBytes = 8L * 4096
+        assertStridePremise(runKernel(compiled, kTlbChase(120, walk = false), seeds.head),
+          DataBase, strideBytes, "tlb-ttr")
+        assertStridePremise(runKernel(compiled, kTlbChase(120, walk = true), seeds.head),
+          DataBase, strideBytes, "tlb-walk")
         // Matched pair: identical kernels, differing ONLY in whether a walk can occur.
         val ttr  = diffStat(compiled, "tlb-ttr",  n => kTlbChase(n, walk = false), 60, 120)
         val walk = diffStat(compiled, "tlb-walk", n => kTlbChase(n, walk = true),  60, 120)
@@ -840,11 +1082,63 @@ class MicrobenchSpec extends CoreBenchHarness {
         report("mmu", "DTLB miss: 3-level walk cost", Stat("walkcost",
           walk.samples.zip(ttr.samples).map { case (a, b) => a - b }),
           "DEP; (walk - TTR) on BYTE-IDENTICAL kernels; isolates the walker; " +
-          "BASELINE at this commit: walker has its own AXI port, bypasses L1D")
+          "POST-2db5bd3: walker is a D-cache client, upper-level descriptors can hit L1D")
       } catch {
         case e: Throwable =>
           println(s"  [mmu] NOT MEASURED: ${e.getClass.getSimpleName}: " +
             s"${Option(e.getMessage).getOrElse("").take(300)}")
+      }
+    }
+
+    // ── MMU / page-table LOCALITY ─────────────────────────────────────────────
+    // The group above is a worst case by construction (strides away forever, never
+    // revisits a leaf descriptor). It bounds the DOWNSIDE of routing walks through
+    // L1D. This group supplies the other half: the same chase CYCLING over a bounded
+    // working set, so the page-table subtree can stay resident and a walk degenerates
+    // to cache hits. Sweeping the working set crosses from "resident" to "evicted",
+    // and where it crosses is the answer to how much locality the change needs.
+    if (enabled("mmuloc")) {
+      println("\n-- MMU: TABLE-WALK COST WITH PAGE-TABLE LOCALITY ---------------------")
+      println("  Cyclic page-stride chase over a bounded working set. Every access still")
+      println("  MISSES the DTLB (8-page stride pins one 4-way set), so a real 3-level walk")
+      println("  runs every step -- but the descriptors it needs are revisited, which the")
+      println("  straight-line kernel above structurally prevents.")
+      println("  loads/step is split DATA vs page-table DESCRIPTOR: before 2db5bd3 the")
+      println("  descriptor column is 0 by construction (private walker AXI, invisible here).")
+      val wsSweep = sys.env.get("MB_WS").map(_.split(',').map(_.trim.toInt).toSeq)
+        .getOrElse(Seq(8, 32, 128, 256))
+      for (ws <- wsSweep) {
+        try {
+          // Both runs must be several full passes over the working set so the
+          // differential is taken entirely in the warm regime, not across first touch.
+          val nShort = math.max(120, 4 * ws)
+          val nLong  = 2 * nShort
+          // PREMISE FIRST, on both halves, on the LONG kernel (the one that matters).
+          val probeT = runKernel(compiled, kTlbLocality(nLong, walk = false, ws), seeds.head)
+          val probeW = runKernel(compiled, kTlbLocality(nLong, walk = true,  ws), seeds.head)
+          assertLocalityPremise(probeT, ws, s"tlbloc-ttr-ws$ws")
+          assertLocalityPremise(probeW, ws, s"tlbloc-walk-ws$ws")
+          val (dT, xT) = splitLoads(probeT)
+          val (dW, xW) = splitLoads(probeW)
+          println(f"  [ws=$ws%3d] retired ttr=${probeT.retiredInstrs}%5d/${kTlbLocality(nLong, walk = false, ws).retiredInstrs}%5d" +
+                  f"  walk=${probeW.retiredInstrs}%5d/${kTlbLocality(nLong, walk = true, ws).retiredInstrs}%5d" +
+                  f"   loads/step ttr=${dT.size.toDouble / nLong}%4.2f data +${xT.size.toDouble / nLong}%4.2f desc" +
+                  f"   walk=${dW.size.toDouble / nLong}%4.2f data +${xW.size.toDouble / nLong}%4.2f desc")
+
+          val ttr  = diffStat(compiled, s"tlbloc-ttr-ws$ws",  n => kTlbLocality(n, walk = false, ws), nShort, nLong)
+          val walk = diffStat(compiled, s"tlbloc-walk-ws$ws", n => kTlbLocality(n, walk = true,  ws), nShort, nLong)
+          report("mmuloc", f"ws=$ws%3d pages: access, TTR (no walk)", ttr,
+            f"DEP; differential $nShort->$nLong; cyclic ${ws} -page working set; no walk possible")
+          report("mmuloc", f"ws=$ws%3d pages: access, real walk", walk,
+            f"DEP; differential $nShort->$nLong; every access is a DTLB miss -> real 3-level walk")
+          report("mmuloc", f"ws=$ws%3d pages: WALK COST", Stat(s"walkcost-ws$ws",
+            walk.samples.zip(ttr.samples).map { case (a, b) => a - b }),
+            "DEP; (walk - TTR) on BYTE-IDENTICAL kernels; THE number for page-table locality")
+        } catch {
+          case e: Throwable =>
+            println(s"  [mmuloc] ws=$ws NOT MEASURED: ${e.getClass.getSimpleName}: " +
+              s"${Option(e.getMessage).getOrElse("").take(300)}")
+        }
       }
     }
 
