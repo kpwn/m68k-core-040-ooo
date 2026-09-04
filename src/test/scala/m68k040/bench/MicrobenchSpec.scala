@@ -453,19 +453,113 @@ class MicrobenchSpec extends CoreBenchHarness {
     * A 32 KiB (8-page) stride holds vpn[2:0] constant, so every access lands in the
     * SAME 4-way DTLB set; striding past 4 such pages evicts on every touch and
     * guarantees a fresh walk per access rather than a warm hit. */
-  def kTlbChase(n: Int, walk: Boolean): Kernel = {
+  def kTlbChase(n: Int, walk: Boolean, zeroData: Boolean = true): Kernel = {
     val strideBytes = 8 * 4096   // 32 KiB: constant vpn[2:0] -> one DTLB set
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0", "moveq #0,%d2")
     val body = (0 until n).flatMap(_ => chaseStep(strideBytes))
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"tlb-${if (walk) "walk" else "ttr"}-$n", src, stopAt(setup.size + n * 3),
+    Kernel(s"tlb-${if (walk) "walk" else "ttr"}-$n${if (zeroData) "" else "-raw"}", src,
+      stopAt(setup.size + n * 3),
       mmu = Some(if (walk) mmuWalkD else mmuNoWalk),
-      prepMem = h => buildIdentityTables(h.dWalkMem, DataBase, strideBytes.toLong, n + 4))
+      prepMem = h => {
+        buildIdentityTables(h.dWalkMem, DataBase, strideBytes.toLong, n + 4)
+        // ── THE PREMISE THIS KERNEL IS BUILT ON, MADE TRUE ────────────────────────
+        // `chaseStep` is `move.l (%a0),%d1 ; adda.l %d1,%a0 ; adda.l #STRIDE,%a0`, and
+        // it only strides by STRIDE if the loaded value is ZERO. `prepMem` used to write
+        // the page TABLES and nothing else -- but an untouched `SparseMemory` page is
+        // PRNG-FILLED, not zeroed, so `%d1` was garbage, `a0` jumped somewhere arbitrary,
+        // and under `mmuWalkD` (deliberately no D-side TTR) that arbitrary address is
+        // unmapped and takes a translation fault. The kernel then never retired its macro
+        // count at all.
+        //
+        // That is the whole explanation of the bimodal `{0.00, 0.00, 567.25, 556.43,
+        // 0.00}` recorded in this suite's write-up §4.1: the short and long kernels share
+        // a byte-identical prefix, so they derailed at the SAME step and produced the
+        // SAME window -- a differential of exactly 0.00. The `mmuNoWalk` control never
+        // faulted (its match-all TTR translates anything), which is exactly why only the
+        // walk half looked unstable. Measured over five seeds before this fix:
+        //
+        //   walk, as committed : retired 66/174, 65/174, 158/174, 158/174, 69/174
+        //                        -- INCOMPLETE on every seed, short and long identical
+        //   walk, zeroed       : 176/174 on every seed; perStep 34.70 34.80 34.93 34.65
+        //                        34.08  (stable)
+        //   ttr control, zeroed: perStep 19.47 18.73 18.87 19.12 18.87
+        //
+        // So it was a kernel premise violation, NOT a table-walker wedge or fault path.
+        if (zeroData)
+          for (p <- 0 to n + 4; b <- 0 until 4)
+            h.dmem.pokeByte(DataBase + p.toLong * strideBytes + b, 0)
+      })
   }
 
   // ════════════════════════════════════════════════════════════════════════════
   // THE SUITE
   // ════════════════════════════════════════════════════════════════════════════
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // DIAGNOSTIC: why the DTLB-walk differential is bimodal (suite §4.1)
+  // ══════════════════════════════════════════════════════════════════════════════
+  //
+  // §4.1 recorded {0.00, 0.00, 567.25, 556.43, 0.00} over five seeds for the real-walk
+  // half and, correctly, refused to average it -- flagging "a run whose end point is
+  // independent of chain length points at the MMU-on / real-page-table configuration
+  // terminating on something other than the chase" as a possible RTL defect in the
+  // walker.
+  //
+  // HYPOTHESIS UNDER TEST: it is a KERNEL premise violation, not a walker defect.
+  // `chaseStep` is `move.l (%a0),%d1 ; adda.l %d1,%a0 ; adda.l #STRIDE,%a0`, and its
+  // whole design depends on the loaded value being ZERO so that `a0` advances by exactly
+  // STRIDE and stays inside the mapped pages. But `kTlbChase.prepMem` writes the page
+  // TABLES (into `dWalkMem`) and never writes the DATA pages, and an untouched
+  // `SparseMemory` page is PRNG-filled, not zeroed. So `%d1` is garbage, `a0` jumps
+  // somewhere arbitrary, and under `mmuWalkD` -- which deliberately has NO D-side TTR --
+  // that arbitrary address is unmapped and takes a translation fault. The short and long
+  // kernels share a byte-identical prefix, so they derail at the SAME step and produce
+  // the SAME window: differential exactly 0.00. The `mmuNoWalk` control never faults
+  // because its match-all TTR translates anything, which is exactly why only the walk
+  // half is unstable.
+  //
+  // PREDICTION: zeroing the chase's data words makes the walk half complete its full
+  // macro count on every seed and the differential become well-defined. If instead it
+  // stays degenerate with the data zeroed, the hypothesis is wrong and the walker really
+  // is wedging.
+  //
+  // Enable with MB_WALKDIAG=1 (it is a diagnostic, not part of the reported suite).
+  test("DIAG: the bimodal DTLB-walk differential", VerilatorTest) {
+    assume(sys.env.contains("MB_WALKDIAG"))
+    val compiled = M68kSim().withVerilator.compile(new FullCoreDut)
+    def probe(label: String, mk: Int => Kernel): Unit = {
+      println(s"\n---- $label ----")
+      seeds.foreach { sd =>
+        // The harness asserts when a kernel does not retire its full macro count; that
+        // incompleteness is exactly what is being diagnosed here, so catch it and report
+        // it as data instead of aborting the probe.
+        val lo = scala.util.Try(runKernel(compiled, mk(60), sd))
+        val hi = scala.util.Try(runKernel(compiled, mk(120), sd))
+        val loWant = mk(60).retiredInstrs
+        val hiWant = mk(120).retiredInstrs
+        (lo, hi) match {
+          case (scala.util.Success(l), scala.util.Success(h)) =>
+            val per = DiffSample(l.windowCycles, h.windowCycles, 60, 120).perStep
+            println(f"  seed=$sd%08x  short: retired=${l.retiredInstrs}%4d/$loWant%4d win=${l.windowCycles}%6d" +
+                    f"   long: retired=${h.retiredInstrs}%4d/$hiWant%4d win=${h.windowCycles}%6d" +
+                    f"   perStep=$per%8.2f")
+          case _ =>
+            def m(t: scala.util.Try[IpcResult]) = t match {
+              case scala.util.Success(r) => s"OK(retired=${r.retiredInstrs} win=${r.windowCycles})"
+              case scala.util.Failure(e)  => "INCOMPLETE: " + Option(e.getMessage).getOrElse("").take(90)
+            }
+            println(f"  seed=$sd%08x  short: ${m(lo)}   long: ${m(hi)}")
+        }
+      }
+    }
+    probe("walk, RAW (data pages never written -> PRNG-filled: the old behaviour)",
+          n => kTlbChase(n, walk = true, zeroData = false))
+    probe("ttr control, RAW", n => kTlbChase(n, walk = false, zeroData = false))
+    probe("walk, FIXED (data pages zeroed: the kernel's own premise made true)",
+          n => kTlbChase(n, walk = true))
+    probe("ttr control, FIXED", n => kTlbChase(n, walk = false))
+  }
 
   test("68040 OoO latency microbenchmark suite", VerilatorTest) {
     // Compile the core ONCE and reuse it for every kernel and every seed -- this
