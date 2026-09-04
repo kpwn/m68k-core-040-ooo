@@ -479,12 +479,42 @@ guest-side checks and the final bank readback instead).
 
 | suite | arm | result |
 |---|---|---|
-| `M1ThrowawayFrameIrqSpec` T1-T15 | pristine `src/main` | T12, T13, T14, T9b **FAIL**; the rest pass (§6) |
+| `M1ThrowawayFrameIrqSpec` T1-T15 | pristine `src/main` | T9b, T12, T13, T14 **FAIL**; the rest pass (§6) |
 | `M1ThrowawayFrameIrqSpec`, all 18 | **with the fix** | **18 run, 18 passed, 0 failed** (`Total time: 641 s`) |
-| `ExecuteLockStepSpec` | with the fix | *see the results appendix* |
-| `make test-fast` | with the fix | *see the results appendix* |
-| `m68k040.ls.*` + `m68k040.cache.*` | with the fix | *see the results appendix* |
-| 200-seed fuzz | with the fix | *see the results appendix* |
+| `ExecuteLockStepSpec` | with the fix | **505 run, 505 passed, 0 failed, 1 ignored** — identical to the brief's baseline figure |
+| `make test-fast` (`sbt fastTest`) | with the fix | **341 run, 340 passed, 1 failed, 2 ignored** — the one failure is the documented `RobPluginSpec` `debugPcApply` seed flake, byte-for-byte the baseline figure |
+| `m68k040.ls.*` + `m68k040.cache.*` | with the fix | 300 run, 287 passed, **13 failed** |
+| `m68k040.ls.*` + `m68k040.cache.*` | **pristine, SAME session** | 300 run, 289 passed, **11 failed** |
+| 200-seed fuzz | with the fix | **200 seeds, 3 divergences, 0 generator failures** — seeds 80, 109, 127, identical signatures. **Unchanged.** |
+
+`ExecuteLockStepSpec` is the check that mattered most here and it is clean. The fix pulses
+`obsSetCcr5Valid` on `RTE`, which the lock-step whitebox consumes as "set the running CCR
+to this absolute value for this obs step"; 505 of 505 programs still agree with Musashi
+step for step, which is the direct confirmation that RTE's architectural semantics are what
+the change asserts them to be.
+
+### Reconciling the `ls`/`cache` +2 — it is ordering, not regression
+
+The 13-vs-11 delta was NOT waved away as "the documented `AguCrossSpec` flake". It was
+diffed by test name against a pristine run taken in the same session on the same host:
+
+* The **11 failures are common to both arms**, by name.
+* The 2 extra in the fixed arm are
+  `DcacheSpec: "store to a missing line is write-through with no allocate"` and
+  `AguCrossSpec: "word at page offset 0xFFF -> crossPage + twoAccess, addrB = next page"`.
+* Both of those **PASS when their suites are run in isolation** — and running
+  `testOnly m68k040.ls.AguCrossSpec m68k040.cache.DcacheSpec` gives **67 run, 66 passed,
+  1 failed on BOTH arms**, with the same single failure name (`VIPT D2: four distinct probe
+  results queue...`, one of the common 11).
+
+Structurally that is what it has to be: both DUTs are standalone plugin harnesses
+(`DcacheSpec.Dut` = Param/DIdentityTranslation/Dcache/DcacheProbe/MmuControl;
+`AguCrossSpec.Dut` = Param/RegFile*/DIdentityTranslation/Dcache/LsEu/LsEuSource). Neither
+instantiates `RobPlugin`, so neither contains an `ExceptionUnit` at all — **the changed
+logic is not present in either netlist**, and the only channel by which a `src/main` edit
+can reach them is SpinalSim's seed/uninitialised-Reg randomisation shifting with the
+generated netlist. That is exactly the documented `AguCrossSpec` seed-shift hazard, now
+measured on both arms rather than asserted about one.
 
 The M=1 dual-stack path accumulated **~1,750 interrupt entries** across the clean
 scenarios with both banks exact at every check — the direct counterpart of Part 134's "A7
@@ -492,21 +522,26 @@ balanced across 761 entries", which covered only the M=0 single-frame path.
 
 ### NOT RUN — stated plainly
 
-* **The postroute synth gate.** This IS a `src/main` change, so the standing rule requires
-  it, and it was not run: the host's Vivado mutex was occupied by another agent's KU5P
-  `full_impl` gate for the whole session. The change adds two combinational assignments to
-  two already-existing ports inside an already-existing FSM state (a third producer
-  alongside `S_REDIR`'s two), so the expected impact is a one-input widening of two small
-  muxes — but that is an argument, not a measurement, and the rule asks for a measurement.
+* **The postroute synth gate. THIS IS THE ONE OUTSTANDING GATE.** The change touches
+  `src/main`, so the standing rule requires it. It was not run because
+  `/var/tmp/m68k-ooo-vivado.lock` was **held for the entire session** by another agent's
+  KU5P `full_impl` gate; probed again at the end of this work and still
+  `LOCK_HELD`. Never taken, never contended.
+
+  What can be said without it: the change adds two combinational assignments to two ports
+  that already exist and are already driven (`obsSetCcr5Valid`/`obsSetCcr5`, driven today
+  from `S_REDIR` for MOVE-to-SR and STOP), from a third state of the SAME FSM. No new
+  register, no new port, no new fan-in to any datapath — the synthesised delta should be a
+  one-input widening of two small muxes inside an already-serializing, multi-cycle,
+  non-critical FSM. That is an argument about the shape of the edit, **not** a WNS number,
+  and it must not be read as one. The gate still owes a measurement before this merges.
 * **A baseline arm for T16/T17.** Those two were written *after* the pristine sweep, in
   response to T12/T13's failures, so they have a fixed-arm number only. T12/T13 carry the
   before/after; T16/T17 carry the diagnostic shape.
-* **A paired baseline for `test-fast` / `ExecuteLockStepSpec` / `ls`+`cache` in the same
-  session.** The fixed-arm numbers below are compared against the figures carried in the
-  brief (341 tests with 1 known `RobPluginSpec` `debugPcApply` seed flake; 505/505;
-  11 pre-existing `ls`/`cache` failures plus a possible `AguCrossSpec` seed-shift flake),
-  not against a same-session pristine run. That is weaker than the paired-arm discipline
-  Part 134 used and is flagged as such.
+* **A same-session pristine arm for `test-fast` and `ExecuteLockStepSpec`.** Those two are
+  compared against the figures carried in the brief (341 run / 1 known `debugPcApply` seed
+  flake; 505/505), and both match exactly — but they are not paired runs from this session
+  the way `ls`+`cache` is. `ls`+`cache` IS paired, because its delta needed reconciling.
 * **No board work.** SD card, JTAG lease and `hw_server` untouched.
   `/var/tmp/m68k-ooo-vivado.lock` was probed once (free at that moment) and **never taken**.
 
