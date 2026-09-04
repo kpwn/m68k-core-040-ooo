@@ -10409,9 +10409,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         dut.icache.logic.axi, cd, loadAddr, image.bytes,
         sharedMem = zeroMem, runAheadGuardWords = 0)
 
+      // Since `2db5bd3` the table walkers have no AXI master of their own -- their
+      // descriptor reads and U/M writebacks go through the D-cache -- so the D-side
+      // agent below is the only memory the walkers can reach.
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -10574,9 +10575,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      // Since `2db5bd3` the table walkers have no AXI master of their own -- their
+      // descriptor reads and U/M writebacks go through the D-cache -- so the D-side
+      // agent below is the only memory the walkers can reach.
       new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd)
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false

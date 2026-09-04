@@ -42,3 +42,4 @@ vivado*.log
 vivado*.jou
 cong/
 synth/vivado_*.log
+bench_logs/

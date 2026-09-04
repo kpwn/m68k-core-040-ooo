@@ -233,8 +233,10 @@ class M1ThrowawayFrameIrqSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new m68k040.ls.BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      new m68k040.ls.BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // The two walker AXI agents that used to be attached here are GONE: since
+      // `2db5bd3` the table walkers have no AXI master of their own and reach memory
+      // through the D-cache, so their traffic already lands in `dmem`. (These agents
+      // shared `dmem.mem` anyway, so removing them changes no observable behaviour.)
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 16) dmem.mem.write(ResultAddr + i, 0.toByte)
 
