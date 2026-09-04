@@ -179,61 +179,51 @@ that do contain a frontend (`FullCoreSynth`, `SocketTop`, `ExecuteLockStepSpec.F
 it. `GenSynthVerilog` does not, and does not need to: it uses `IdentityTranslationPlugin`,
 which never reports INHIBITED.
 
-### 2.5 Burst width — a partial `MmioCover`, honestly labelled
+### 2.5 Burst width — deliberately unchanged
 
-An AXI4 read carries **no byte enables**, so every byte a read *covers* is a byte the
-device sees read; `MmioCover.scala`'s own doc comment states this is why a downstream fix
-is impossible in principle. The gate stops the speculative case, but an architecturally
-required fetch from a device page still has to reach the bus, and at `ca4b901` it did so as
-a 64-byte line burst.
+An AXI4 read carries **no byte enables**, so every byte a read *covers* is a byte the device
+sees read; `MmioCover.scala`'s doc comment states this is why a downstream fix for reads is
+impossible in principle, and why the D side derives an exact byte cover for INHIBITED
+accesses. An earlier revision of this branch mirrored that here, narrowing an inhibited
+demand fill to a single 32-byte beat at the half-line base. **That was removed on purpose.**
 
-**What was changed:** an INHIBITED *demand* fill now issues **one 32-byte beat at the
-32-byte half-line it needs** (`len=0`, address `mshrPa & ~31`) instead of two beats at the
-64-byte line base. That is exactly the half the response can possibly deliver — `bypWindow`
-is selected by `missPC(5)` (which half) and `missPC(4:3)` (which 8-byte window inside it).
-64 → 32 bytes, and the read can no longer cross a 32-byte boundary. Speculative
-(prefetch) fills are unaffected: they are cacheable by construction (rule P1).
+The reason is that the two sides do not have the same problem. A D-side load names a
+specific 1/2/4-byte operand, so "exact" is well defined and the cover is the right answer.
+An instruction fetch names no operand: it is a stream, `FetchRsp` delivers a fixed 64-bit
+window plus a predecode, and `classifyBeat` needs the three words *following* each word it
+classifies. Fetching less than a whole beat leaves those lookahead words undefined *inside*
+the beat, where — unlike the beat-END case, which `classify` already refuses to guess at,
+marking `ambiguousLine` for `Aligner.scala:63-65` to redo — nothing detects it, and the
+result is silent instruction mis-framing.
 
-Three dependent details had to move with it, each of which would have been a real bug if
-missed:
+More decisive than the mechanics: **the core cannot tell MMIO from any other cache-inhibited
+memory.** All it has is the page attribute. And no real program executes from MMIO. So a
+*non-speculative* inhibited fetch is a pathological case that does not need to be made safe:
+once speculation is gated, any inhibited fetch that still reaches the bus was architecturally
+demanded by the program, and the burst is then the program's problem rather than the core's.
 
-1. `beatNext3` must be forced to zero for the narrowed fill — `fillHi` holds the *previous*
-   fill's data. This puts words 13/14/15 on the same F5 `extWValid = false` path the HIGH
-   beat always takes: `classify` refuses to guess brief-vs-full, rejects as COMPLEX, marks
-   `ambiguousLine`, and `Aligner.scala:63-65` re-classifies live from the instruction
-   buffer. Conservative, and already exercised by every `missPC(5) = 1` fetch today.
-2. The `bypWindow`/`bypPred` capture must fire on `commitBeat === 0` regardless of
-   `missPC(5)`, because the requested half arrived *as beat 0*.
-3. The `"I-cache refill must be exactly two beats"` assertion becomes
-   `last === (mshrBeat(rIdx) || rSingleBeat)`.
+Equivalently, and worth stating in one line because it is the load-bearing judgement: **the
+I-cache does not honour INHIBITED as a *caching* policy, and that is intended. It honours it
+as a *speculation* policy, which is the property that actually protects devices.**
 
-**What was NOT changed, stated plainly.** This is **not** the D side's exact byte cover. A
-legitimate inhibited fetch still reads 24 bytes it did not name, and on a device with
-4-byte register spacing that is still several registers. Going below one beat is a
-**front-end granule change, not an AR payload change**: `FetchRsp` delivers a fixed 64-bit
-window plus its predecode, and `classifyBeat` needs the three words *following* each word
-it classifies. Fetching less than a whole beat leaves those lookahead words undefined
-*inside* the beat, where — unlike the beat-end case, which `classify` already refuses to
-guess at — nothing detects it and the result is silent instruction mis-framing. A true
-I-side `MmioCover` needs the 64-bit fetch window and the 2-beat predecode dwell contract to
-change together. Not attempted.
+So an inhibited demand fill is still an ordinary 2 × 32-byte INCR burst at the 64-byte line
+base, identical to a cacheable one, and `IcacheSpec` now asserts that shape explicitly so
+that "unchanged" is pinned rather than merely unmentioned.
 
-### 2.5b Compliance against the absolute invariant, per requester
+### 2.5b Compliance against the invariant, per requester
 
-The governing rule for this work is stated as an absolute: **no speculative access to a
-cache-inhibited page, ever, by any requester.** That is stronger than "the I-side demand
-fetch is fixed", so every requester that can drive an AR is enumerated here with a verdict.
-Two of them do **not** comply and are deliberately left as separate, scoped work.
+The rule is: **no AR leaves the core for a cache-inhibited address on a path that may be
+squashed.** Every requester that can drive an AR is enumerated with a verdict.
 
 | Requester | Complies? | Evidence |
 |---|---|---|
 | **I-side demand fetch** | **YES (this change)** | `inhibitedSpecBlock` refuses the command at `cmdPort.ready` using the LIVE `xlate.rsp.cacheMode`, i.e. cacheability is resolved before anything is accepted, so no MSHR is allocated and no AR can be armed. Measured: `spec-mmio I-side THE RULE` 0 window ARs, and the revert control puts them back. |
 | **I-side prefetcher, steady state** | YES | Frontier seeded only from a resolved, non-faulting, **cacheable** demand (`IcachePlugin.scala:1457-1467`) and clamped to that demand line's own 4 KiB physical page (`:1294-1295`); rule P1, "an INHIBITED page is never prefetched". |
-| **I-side prefetcher, "cycle T" residual** | **NO — narrowed, not closed** | See below. |
+| **I-side prefetcher, "cycle T" residual** | **narrowed, not closed** | See below. |
 | **D-side loads** | YES | `LsEuPlugin.scala:2182-2229` `p4LaunchOk`; audited exhaustively on every path to `DcachePlugin.scala:1877`, and measured by the audit's `spec-mmio D-side` probe with a positive control. |
 | **D-side stores / SQ drain** | YES | Non-speculative by construction: drains at the SQ head with `committed(head)` (`StoreQueue.scala:426`); inhibited stores never allocate. |
 | **Exception-unit loads** | YES | `excLoadCmdValid => excActive` (`LsEuPlugin.scala:2881`); the exception is already committing. |
-| **MMU table walker** | **NO — structural, unfixable without new plumbing** | See §2.6. |
+| **MMU table walker** | out of scope — see §2.6 | Walk addresses land in page-table memory, not at a device. |
 
 **The prefetcher's cycle-T residual.** `IcachePlugin.scala:2153-2167` documents, and
 `IcachePrefetchSpec`'s "P1 residual (cycle T)" test *proves and bounds*, a one-cycle window
@@ -247,54 +237,32 @@ This change **narrows** that residual's INHIBITED arm without closing it: post-f
 inhibited command can only be accepted at all when `nonSpecFetch` holds, so cycle T now
 additionally requires a fully drained machine with a stale-but-valid frontier in the same
 page. **I did not prove it unreachable, and I am not claiming it is.** Closing it properly
-runs into the same three rejected closures the existing comment enumerates (all of which
-either put the live translation verdict back into the allocator enable cone — the exact arc
-M4 exists to delete — or kill the prefetcher outright), so it is a real scoping decision,
-not a detail, and it belongs in its own change.
+runs into the three rejected closures the existing comment enumerates (all of which either
+put the live translation verdict back into the allocator enable cone — the exact arc M4
+exists to delete — or kill the prefetcher outright), so it is a real scoping decision and
+belongs in its own change.
 
-### 2.6 The MMU table walker — a definite violation, deliberately not fixed here
+### 2.6 The MMU table walker — raised, considered, ruled out
 
-**Asked directly — can the walker violate the invariant? YES, and structurally so.** This
-is a firmer answer than the audit's "not demonstrated", and it comes from reading the
-walker's own AR path rather than from its launch conditions.
+The walker has the *shape* of a violation and it is worth recording why that shape does not
+matter, so the next reader does not re-derive it. `TableWalker.issueRead()`
+(`TableWalker.scala:107-118`) has no cacheability term and no input carrying one; its only
+`CacheMode` (`rCmode`, `:66`/`:209`/`:249`) is the mode extracted from the leaf descriptor
+for the *translated* page, not for the addresses the walker itself reads. It launches from a
+fully speculative point (`LsEuPlugin.scala:2522`, no ROB-head gate; `DtlbPlugin.scala:322`
+omits `umFlush`; `ItlbPlugin.scala:251` has no flush term), it has no abort port (`:40-47`),
+and it reads a fixed 16-byte line-aligned block.
 
-`TableWalker.issueRead()` (`TableWalker.scala:107-118`) is the walker's only AR driver:
+**None of that is a route to a side-effecting device.** A walk address is the root pointer
+(`SRP`/`URP`) plus VA bits, or a descriptor's next-level pointer — it therefore lands in
+**page-table memory**, which is normal cacheable memory. Speculating about *which* walk to
+start does not make the walk touch a device. The resting assumption, stated explicitly
+because it is the thing being relied on: **the page tables are well-formed**, i.e. every
+descriptor's next-level pointer addresses real memory. That is the OS's responsibility, and
+a core cannot defend against malformed tables in any case.
 
-```scala
-io.axi.ar.payload.addr := (descAddr(31 downto 4) ## U(0, 4 bits)).asUInt
-io.axi.ar.payload.len  := U(0, 8 bits)
-io.axi.ar.payload.size := U(4, 3 bits)   // 16 bytes
-```
-
-There is **no cacheability term on it, and no input carrying one.** The only `CacheMode` in
-the entire module is `rCmode` (`:66`, `:209`, `:249`) — the cache mode the walker *extracts
-from the leaf page descriptor and reports back to the TLB* for the translated page. The
-walker never consults, and cannot consult, the cacheability of the addresses **it itself
-reads**: descriptor addresses come from unmasked `urp`/`srp` (`MmuControl.scala:119-120`)
-and a raw 28-bit next-base field (`MmuTypes.scala:63`), are never themselves translated,
-and are subject to no region check anywhere.
-
-So all three properties the invariant forbids hold simultaneously, by construction:
-1. **Speculative** — the triggering DTLB miss is raised at P2 on pipeline validity alone
-   (`LsEuPlugin.scala:2522`), with no ROB-head gate; the D-side launch omits `umFlush`
-   (`DtlbPlugin.scala:322`) and the I-side launch has no flush term at all
-   (`ItlbPlugin.scala:251`).
-2. **Unabortable** — no abort port (`TableWalker.scala:40-47`); once `io.start` pulses the
-   FSM runs `RD_ROOT → RD_PTR → RD_PAGE → FINISH` to completion.
-3. **Over-covering** — a fixed 16-byte line-aligned read, which is precisely the shape
-   `MmioCover`'s own doc comment says "touches four registers at once and fires
-   read-to-clear side effects on three the access never named".
-
-Reaching a device still requires a root pointer or descriptor aimed at device space, which
-remains undemonstrated — but that is a statement about the *page tables*, not about the
-core. The core offers no guarantee here at all, which is what the invariant demands.
-
-**Deliberately NOT fixed in this change**, per explicit instruction not to fix it blind.
-It is a genuinely different change in a different module: the walker needs (a) an
-attribute source for its own descriptor addresses — which does not exist today and is the
-substantial part — (b) a flush term on both launch sites, and (c) an abort port. Bolting
-any of those on without the first would be the same category error this fix exists to
-correct. Recommend scoping it as its own task.
+Ruled out of scope by the project owner. Not investigated further, and no verdict is offered
+beyond the above.
 
 ---
 
@@ -307,22 +275,38 @@ assert(arAfterInhibited == arAfterWarm + 1, s"inhibited fetch must refill once: 
 ```
 
 and nothing else. **That assertion encoded the defect.** It asserted only that a bus
-transaction *happened*, and was silent on both of the questions that actually matter for a
-page that by definition names a device:
+transaction *happened*, and was silent on the question that decides whether that transaction
+is legitimate for a page which by definition names a device: **was the fetch architectural,
+or a wrong-path run-ahead a redirect is about to squash?**
 
-1. **Was the transaction allowed to happen at all** — was the fetch architectural, or a
-   wrong-path run-ahead? The old form could not tell, which is precisely why the I side had
-   no speculation gate for as long as it did.
-2. **How wide was it?** The old form accepted a 64-byte INCR burst — sixteen longwords,
-   four 53C96 registers, including read-to-clear Interrupt Status — as indistinguishable
-   from a correct single device read.
+It could not have asked, because until this change the I side had no answer to give.
+`s0Cacheable` was folded into the HIT expression, so INHIBITED forced a miss and therefore
+forced a fill, and cache mode did not reappear until `doAllocate` in the predecode dwell —
+after both R beats had already returned. INHIBITED suppressed the array install and nothing
+else.
 
-It was **not** quietly edited. The count assertion is *kept* (that DUT drives `cmdIn` from a
-directed probe, so the fetch really is architectural and really must reach the bus), and
-the shape check is added on top of it, with a same-run control that ordinary cacheable line
-fills are still 2 × 32 B bursts so the new assertion cannot pass vacuously. Question (1) is
-pinned by the audit's `spec-mmio I-side` suite, which needs a speculating frontend and
-therefore cannot live in that standalone DUT.
+It was **not** quietly edited. Three things now stand where one did:
+
+1. **The count assertion is kept**, and is now explicitly the *positive control*: a fetch
+   this DUT makes with `nonSpec = True` really is architectural (`cmdIn` is a directed
+   probe), so it really must reach the bus.
+2. **The burst shape is asserted unchanged** — `len=1`, `size=5`, at the 64-byte line base —
+   with a same-run check that ordinary cacheable fills have that shape too. This is what
+   pins §2.5's decision, so "unchanged" is a stated property rather than an omission.
+3. **A negative control is added**, which is the new invariant itself: the same inhibited
+   fetch, with `nonSpec` poked false, must not even be accepted at `cmdPort.ready` and must
+   issue **no AR at all** over 200 cycles; then releasing the gate — and changing nothing
+   else — must launch exactly that one held fill and return correct data. Without the second
+   half, the first would pass just as happily if the DUT had simply wedged.
+
+Making (3) possible needed a poke point, so the spec's `Dut` gained a small
+`SpecGateProbePlugin` that drives `nonSpecFetch` from a `RegInit(True)` — the same
+poke-a-register pattern the file already uses for `prefetchEnable`, and for the same stated
+reason. The default is `True`, so every other test in the file is unaffected.
+
+The full-machine half of the property — that a *genuinely* wrong-path fetch produces no AR —
+is pinned by the audit's `spec-mmio I-side` suite, which needs a speculating frontend and
+therefore cannot live in this standalone DUT.
 
 ---
 
@@ -361,9 +345,10 @@ constant-folds away):
 Both controls stayed correct in the same run (ctl-neg 0 window ARs, ctl-pos 5). Restored
 afterwards; `git status` clean.
 
-(The test's failure *message* still says "64-byte" — it is a static string written against
-`ca4b901`. Under the revert control the burst narrowing is still active, so those two reads
-were 32 bytes each. The count, the addresses and the verdict are what the control turns on.)
+(The control is exact: `nonSpecFetch := True` makes `inhibitedSpecBlock` constant-false, so
+the added `cmdPort.ready` term folds away and the netlist is the pre-fix one in behaviour.
+Every other line, net name and SpinalHDL line number is identical, which is also what makes
+it usable as the net-renaming control for the synth gate.)
 
 ### 4.3 Suites
 
@@ -418,9 +403,10 @@ committed as `run_fuzz200.sh`.
   experiment.
 - **This is a bug fix on its own merits regardless of the boot outcome.** The 68040
   requires that cache-inhibited accesses not be performed speculatively; they were.
-- A legitimate, non-speculative inhibited fetch **still issues a 32-byte read**, not an
-  exact byte cover. See §2.5.
-- The table walker is untouched. See §2.6.
+- A legitimate, non-speculative inhibited fetch **still issues an ordinary 64-byte line
+  burst**, and the I-cache still does not treat INHIBITED as a caching policy. Both are
+  deliberate. See §2.5.
+- The table walker is untouched, and no verdict on it is offered. See §2.6.
 - The prefetcher's documented same-page cacheability-transition residual
   (`IcachePlugin.scala:2094-2144`, pinned by `IcachePrefetchSpec.scala:866+`) is unchanged.
   It is bounded to one line and cannot cross a 4 KiB page, so it cannot reach a device page
