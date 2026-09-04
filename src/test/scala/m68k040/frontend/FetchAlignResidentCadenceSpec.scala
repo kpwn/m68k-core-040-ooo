@@ -51,13 +51,13 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
     val fa    = new FetchAlignPlugin
     val probe = new DecodeFeedProbePlugin
     val obs   = new FetchObservePlugin
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), ctrl, itlb, ic, fa, probe, obs)) }
+      new ParamPlugin(M68kParams()), ctrl, itlb, ic, fa, probe, obs, walkPort)) }
     // No DcachePlugin in this DUT: expose the ITLB walker's DcacheService client port
     // pair as DUT IO and let `DcacheClientMemAgent` answer it. 68040 table searches are
     // DATA accesses even for an instruction translation, which is why the I-side walker
     // is a D-cache client and not an I-cache one.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
   }
 
   private case class FetchEvent(cycle: Int, pc: Long)
@@ -140,9 +140,9 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         cycle += 1
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           iArCount += 1
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) {
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) {
           walkArCount += 1
-          walkArs += dut.walkPort.cmd.payload.paddr.toLong
+          walkArs += dut.walkPort.logic.cmd.payload.paddr.toLong
         }
         if (capture) {
           if (dut.obs.logic.cmdValid.toBoolean && dut.obs.logic.cmdReady.toBoolean)

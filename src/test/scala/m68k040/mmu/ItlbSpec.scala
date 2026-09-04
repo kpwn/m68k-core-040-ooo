@@ -59,12 +59,12 @@ class ItlbSpec extends AnyFunSuite {
     val ctrl = new MmuControlPlugin()
     val itlb = new ItlbPlugin()
     val probe = new ItlbProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, itlb, probe)) }
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, itlb, probe, walkPort)) }
     // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
     // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
     // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
     // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
   }
 
   val ROOT = 0x10000L
@@ -179,7 +179,7 @@ class ItlbSpec extends AnyFunSuite {
       // double-walk and no dropped miss.
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       // present the miss and HOLD it valid throughout (the registered trigger must
       // still pulse start exactly once even with the live req held high).
@@ -223,7 +223,7 @@ class ItlbSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       val (r1, p1, f1) = lookup(dut, cd, vpnOf(va))
       assert(r1 && !f1, "first lookup resolves without fault")
@@ -292,7 +292,7 @@ class ItlbSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       // Fetch (robId 40): wait until the walk is genuinely active, then squash
       // before completion -- the exact collision C6 describes.
@@ -302,7 +302,7 @@ class ItlbSpec extends AnyFunSuite {
       dut.probe.logic.reqIn.write #= false
       dut.probe.logic.reqIn.supervisor #= false
       var guard = 0
-      while (!(dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) && guard < 100) {
+      while (!(dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) && guard < 100) {
         cd.waitSampling(); guard += 1
       }
       assert(guard < 100, "fetch walk never launched before the flush")

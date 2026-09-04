@@ -42,13 +42,13 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     val itlb  = new ItlbPlugin()
     val ic    = new IcachePlugin
     val probe = new FetchProbePlugin
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), ctrl, priv, itlb, ic, probe)) }
+      new ParamPlugin(M68kParams()), ctrl, priv, itlb, ic, probe, walkPort)) }
     // No DcachePlugin in this DUT: expose the ITLB walker's DcacheService client port
     // pair as DUT IO and let `DcacheClientMemAgent` answer it. 68040 table searches are
     // DATA accesses even for an instruction translation, which is why the I-side walker
     // is a D-cache client and not an I-cache one.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
   }
 
   private val Root      = 0x00010000L
@@ -112,7 +112,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           arTrace += ((dut.ic.logic.axi.ar.payload.id.toInt,
             dut.ic.logic.axi.ar.payload.addr.toLong))
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean)
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean)
           walkArCount += 1
       }
 
@@ -167,7 +167,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         cycle += 1
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           iArCount += 1
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean)
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean)
           walkArCount += 1
         if (dut.probe.logic.rspOut.valid.toBoolean) rspCount += 1
         if (dut.probe.logic.cmdIn.valid.toBoolean && !dut.ic.logic.xlateReadyDbg.toBoolean) {

@@ -60,12 +60,12 @@ class UmWriteSpec extends AnyFunSuite {
     val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new UmProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort)) }
     // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
     // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
     // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
     // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
   }
 
   val ROOT = 0x10000L
@@ -183,7 +183,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       // Wait until the walk is genuinely active, then squash before completion.
       var guard = 0
-      while (!(dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) && guard < 100) {
+      while (!(dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) && guard < 100) {
         cd.waitSampling(); guard += 1
       }
       assert(guard < 100, "write walk never launched")
@@ -241,7 +241,7 @@ class UmWriteSpec extends AnyFunSuite {
         dut.probe.logic.reqIn.write #= write
         dut.probe.logic.reqIn.supervisor #= false
         var guard = 0
-        while (!(dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) && guard < 100) {
+        while (!(dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) && guard < 100) {
           cd.waitSampling(); guard += 1
         }
         assert(guard < 100, s"walk (robId=$robId) never launched before the flush")
@@ -265,7 +265,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
       // ---- M-loss shape: a poisoned WRITE walk ----
@@ -340,7 +340,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
       // Four uncommitted write walks consume every deferred-update slot.
@@ -410,7 +410,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
       dut.probe.logic.accessRobId #= 12
@@ -491,7 +491,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
       // READ (robId 1): cold miss -> walk -> fill (TLB entry modified=false); U-only
@@ -560,7 +560,7 @@ class UmWriteSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
       dut.probe.logic.accessRobId #= 20

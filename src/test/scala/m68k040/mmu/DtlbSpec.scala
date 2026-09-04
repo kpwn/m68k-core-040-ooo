@@ -50,12 +50,12 @@ class DtlbSpec extends AnyFunSuite {
     val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new DtlbProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort)) }
     // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
     // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
     // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
     // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
   }
 
   val ROOT = 0x10000L
@@ -173,7 +173,7 @@ class DtlbSpec extends AnyFunSuite {
       // double-walk and no dropped miss.
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       // present the miss and HOLD it valid throughout (the registered trigger must
       // still pulse start exactly once even with the live req held high).
@@ -215,7 +215,7 @@ class DtlbSpec extends AnyFunSuite {
       // count walker AR bursts to prove the second lookup is a TLB hit (no walk)
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       // first lookup: TLB miss -> walk -> fill -> ready with the translated PPN
       val (r1, p1, f1) = lookup(dut, cd, vpnOf(va))
@@ -268,7 +268,7 @@ class DtlbSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
 
       // first lookup: miss -> walk -> fill.
       val (r1, p1, f1) = lookup(dut, cd, vpnOf(va))

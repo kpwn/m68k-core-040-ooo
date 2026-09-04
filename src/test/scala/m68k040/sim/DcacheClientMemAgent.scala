@@ -5,6 +5,7 @@ import m68k040.services.WalkerDcacheClient
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
+import spinal.lib.misc.plugin.FiberPlugin
 import spinal.lib.sim.SparseMemory
 
 /** The byte-poke/peek surface shared by `BehavioralMemAgent`, `AxiMemModel` and
@@ -34,23 +35,32 @@ object SimMem {
   * out of a `SparseMemory`. That is the direct replacement for attaching a
   * `BehavioralMemAgent` to the old `walkerAxi` port.
   *
-  * Construct this INSIDE the DUT `Component`'s body, once per walker. The plugin-side
-  * defaults are `allowOverride`, so connecting them here replaces the idle drives rather
-  * than colliding with them.
+  * This is a `FiberPlugin`, not a plain `Area`, and that is load-bearing: the TLB
+  * plugin allocates its client ports in `during setup`, which has NOT run yet while the
+  * DUT `Component`'s own body executes. Constructing the ports straight in the DUT body
+  * dereferences a null. Being a plugin puts this in the same `build` phase the
+  * `AxiDMergePlugin`-reads-`walkerAxi` precedent relies on: every `setup` runs before
+  * any `build`, so by the time this elaborates the ports exist.
+  *
+  * Add it to the DUT's plugin list, once per walker. The plugin-side defaults are
+  * `allowOverride`, so connecting them here replaces the idle drives rather than
+  * colliding with them.
   *
   * DO NOT use this in a DUT that also hosts `LsEuPlugin` — there the arbiter is the
   * driver and this would be a second one. */
-class WalkerDcacheSimIo(c: WalkerDcacheClient, portName: String) extends Area {
-  val cmd = master(Stream(DLoadCmd())).setName(portName + "Cmd")
-  cmd << c.walkLoadCmd
-  val rsp = slave(Flow(DLoadRsp())).setName(portName + "Rsp")
-  c.walkLoadRsp << rsp
-  val st = master(Stream(DStoreCmd())).setName(portName + "St")
-  st << c.walkStore
-  val stAck = in Bool () setName (portName + "StAck")
-  c.walkStoreAck := stAck
-  val stErr = in Bool () setName (portName + "StErr")
-  c.walkStoreErr := stErr
+class WalkerDcacheSimIo(c: => WalkerDcacheClient, portName: String) extends FiberPlugin {
+  val logic = during build new Area {
+    val cmd = master(Stream(DLoadCmd())).setName(portName + "Cmd")
+    cmd << c.walkLoadCmd
+    val rsp = slave(Flow(DLoadRsp())).setName(portName + "Rsp")
+    c.walkLoadRsp << rsp
+    val st = master(Stream(DStoreCmd())).setName(portName + "St")
+    st << c.walkStore
+    val stAck = in Bool () setName (portName + "StAck")
+    c.walkStoreAck := stAck
+    val stErr = in Bool () setName (portName + "StErr")
+    c.walkStoreErr := stErr
+  }
 }
 
 /** Behavioural `DcacheService` client responder: the `Stream`/`Flow` analogue of
@@ -76,7 +86,8 @@ class DcacheClientMemAgent(cmdP: Stream[DLoadCmd], rspP: Flow[DLoadRsp],
   /** Convenience form for the common case: a whole `WalkerDcacheSimIo`. */
   def this(io: WalkerDcacheSimIo, cd: ClockDomain, sharedMem: SparseMemory,
            latency: Int, readyEveryCycle: Boolean) =
-    this(io.cmd, io.rsp, io.st, io.stAck, io.stErr, cd, sharedMem, latency, readyEveryCycle)
+    this(io.logic.cmd, io.logic.rsp, io.logic.st, io.logic.stAck, io.logic.stErr,
+         cd, sharedMem, latency, readyEveryCycle)
   def this(io: WalkerDcacheSimIo, cd: ClockDomain, sharedMem: SparseMemory) =
     this(io, cd, sharedMem, 1, true)
   def this(io: WalkerDcacheSimIo, cd: ClockDomain) = this(io, cd, null, 1, true)

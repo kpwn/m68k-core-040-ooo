@@ -320,7 +320,23 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       // cycles (see LsEuFastPreciseSpec's own II=1 burst test) -- a generous but
       // finite bound catches an accidental serialization regression without being
       // timing-fragile to unrelated pipeline-depth changes.
-      assert(n < 40, s"ordinary load took suspiciously long ($n cycles) -- possible accidental " +
+      //
+      // BOUND RAISED 40 -> 60 when table walks were routed through the D-cache, with the
+      // measurement rather than a guess. This `n` is the COLD first access: DTLB miss,
+      // three dependent descriptor reads, then the load itself. Those three reads used to
+      // be single-beat AXI reads on the walker's own private port into a zero-latency
+      // memory model; they are now ordinary D-cache accesses that MISS (each descriptor
+      // level is a different line and this test walks exactly once), so each pays a real
+      // refill plus one arbitration hand-over.
+      //
+      //   cold ordinary load : 34 (pre-change)  ->  41 / 44 / 45 / 47 over four seeds
+      //   warm 4-load burst  : 15 (pre-change)  ->  15 / 17 / 17
+      //
+      // The WARM path -- which is what this test is actually about, and the only path a
+      // mis-scoped preempt interlock could serialize -- is unchanged, and the burst
+      // assertion below now checks it explicitly so raising this bound does not blunt the
+      // regression this test exists to catch.
+      assert(n < 60, s"ordinary load took suspiciously long ($n cycles) -- possible accidental " +
         "serialization behind the new preempt interlock")
 
       // Burst sanity: four back-to-back resident hits must still complete without
@@ -342,6 +358,13 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
         cd.waitSampling(); m += 1
       }
       assert(seenAll, s"burst of ordinary loads did not all complete under sustained preempt-pending (seen=$seen)")
+      // The tight half of this test, added alongside the cold-path bound above: with the
+      // page already translated, four back-to-back resident hits are pure hot-path work
+      // and no table walk is involved at all. Measured 15 before the walker/D-cache
+      // change and 15-17 after, so 25 leaves room for ordinary jitter while still failing
+      // hard on a one-at-a-time chokepoint.
+      assert(m < 25, s"warm burst of four resident hits took $m cycles -- the ordinary " +
+        "hot path has been serialized")
     }
   }
 }

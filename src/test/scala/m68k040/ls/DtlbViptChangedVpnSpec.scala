@@ -416,7 +416,14 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
                              s.fWrite.toBoolean, s.fSize.toInt,
                              s.fSuper.toBoolean, s.fAtc.toBoolean))
         if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
-            dut.dcache.logic.loadCmdPort.ready.toBoolean) faultCacheCmds += 1
+            dut.dcache.logic.loadCmdPort.ready.toBoolean) {
+          // Table-walk descriptor reads are D-cache load commands now and are NOT the
+          // thing this assertion is about ("did a FAULTING ACCESS leak a command into
+          // L1D"). Exclude them by their reserved token; a faulting access still walks.
+          val tok = dut.dcache.logic.loadCmdPort.payload.token.toInt
+          if (tok != m68k040.cache.DLoadToken.WALK_ITLB &&
+              tok != m68k040.cache.DLoadToken.WALK_DTLB) faultCacheCmds += 1
+        }
         cd.waitSampling()
         if (issueFire) s.iValid #= false
         faultCycles += 1

@@ -23,12 +23,12 @@ class MmuControlSpec extends AnyFunSuite {
     val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new DtlbProbePlugin()
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort)) }
     // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
     // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
     // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
     // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
-    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
   }
 
   val ROOT = 0x10000L
