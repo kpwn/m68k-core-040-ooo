@@ -786,8 +786,16 @@ class IcacheSpec extends AnyFunSuite {
       pulseInvalidateAll(dut, cd)
 
       var arCount = 0
+      val arLog = scala.collection.mutable.ArrayBuffer[(Long, Int, Int)]()
       fork { while (true) { cd.waitSampling()
-        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+        if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) {
+          arCount += 1
+          // Record the SHAPE of every accepted AR, not just how many there were. See the
+          // INHIBITED assertion below for why the count alone is not a meaningful check.
+          arLog += ((dut.icache.logic.axi.ar.payload.addr.toLong & 0xffffffffL,
+                     dut.icache.logic.axi.ar.payload.len.toInt,
+                     dut.icache.logic.axi.ar.payload.size.toInt))
+        } } }
 
       // 4 distinct tags, SAME set index (bits[11:6]=0), stride 0x1000 (mirrors the
       // existing round-robin eviction test) -- warms ways 0,1,2,3 in order, leaving
@@ -816,7 +824,41 @@ class IcacheSpec extends AnyFunSuite {
       assert(gotInhibited == lineWindow64(0x14),
         "inhibited fetch itself must still return correct (distinguishable) data")
       val arAfterInhibited = arCount
+      // ── DELIBERATE BEHAVIOUR CHANGE, 2026-09-04 (speculative-inhibited-mmio fix) ──
+      // This assertion used to read, in full:
+      //
+      //     assert(arAfterInhibited == arAfterWarm + 1, "inhibited fetch must refill once")
+      //
+      // and nothing else. As written it pinned the DEFECT rather than the behaviour: it
+      // asserted only that a bus transaction HAPPENED, and was silent on the two
+      // questions that actually matter for a CM=10 page, which by definition names a
+      // DEVICE whose reads have side effects:
+      //   (1) was that transaction ALLOWED to happen at all -- i.e. was the fetch
+      //       architectural, or was it a wrong-path run-ahead? The old form could not
+      //       tell, and so the I-side had no speculation gate at all until now; a
+      //       wrong-path fetch into device space issued a real burst read. That half is
+      //       pinned in ExecuteLockStepSpec's "spec-mmio I-side" suite, which needs a
+      //       speculating frontend and cannot live in this standalone DUT.
+      //   (2) HOW WIDE was it? The old form accepted a 64-byte INCR burst -- sixteen
+      //       longwords, spanning four Quadra 53C96 registers including the read-to-
+      //       clear Interrupt Status -- as indistinguishable from a correct single
+      //       device read. That half is pinned HERE, below.
+      // The `arAfterWarm + 1` count is kept (this DUT drives `cmdIn` from a directed
+      // probe, so the fetch really is architectural and really must reach the bus), and
+      // the shape check is added to it.
       assert(arAfterInhibited == arAfterWarm + 1, s"inhibited fetch must refill once: $arAfterWarm -> $arAfterInhibited")
+      val (inhAddr, inhLen, inhSize) = arLog.last
+      assert(inhLen == 0 && inhSize == 5,
+        f"INHIBITED (device) fetch must be a SINGLE 32-byte beat, not a 64-byte burst: " +
+          f"got addr=0x$inhAddr%08x len=$inhLen size=$inhSize (len=1 size=5 is the old " +
+          f"64-byte line burst, which reads every device register in the line)")
+      assert(inhAddr == (inhibitedBase & ~31L),
+        f"INHIBITED fetch must address the 32-byte HALF-LINE it needs, not the 64-byte " +
+          f"line base: got 0x$inhAddr%08x, want 0x${inhibitedBase & ~31L}%08x")
+      // Control that the shape check is not vacuous: an ordinary CACHEABLE line fill in
+      // this very run is still the full 64-byte 2-beat burst.
+      assert(arLog.take(4).forall { case (_, l, s) => l == 1 && s == 5 },
+        s"cacheable line fills must still be 2 x 32 B bursts: ${arLog.take(4)}")
 
       // THE regression check: way 0's raw array content must be COMPLETELY UNCHANGED.
       val way0After = IcacheArrayProbe.snapshotWay(dut.icache, 0, 0)

@@ -291,6 +291,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.robHeadIn           := rob.logic.h0
     lsEu.robHeadValidIn      := rob.logic.count > 0
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
+    // The I-side counterpart of `robHeadValidIn`/`p4LaunchOk` above: an instruction
+    // fetch into a CACHE-INHIBITED (device) page may not be issued speculatively
+    // either. See SpeculativeFetchGate for the predicate and why it is the right
+    // re-expression of "at the ROB head" for something that has no ROB entry yet.
+    SpeculativeFetchGate.wire(host)
     // A debug automatic-halt (halt-after-N-macros) about to apply to the CURRENT
     // ROB head must ALSO stop an inhibited load at that head from launching its
     // device read -- the exact pair (`haltAfterDue || haltAfterRetireBlock`)

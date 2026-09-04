@@ -257,6 +257,55 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val lookupCmode     = xlate.rsp.cacheMode
     val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED
 
+    // ══ SPECULATIVE ACCESS TO CACHE-INHIBITED (DEVICE) SPACE — THE I-SIDE GATE ═══
+    // MC68040 UM §3.1.2/§4: a cache-inhibited page denotes a DEVICE. A device READ has
+    // an architecturally visible side effect (read-to-clear status, FIFO pop, interrupt
+    // acknowledge), so it may not be performed speculatively — a squash cannot un-do it
+    // at the device. `LsEuPlugin.p4LaunchOk` states and enforces exactly this rule for
+    // D-side loads ("wait until I am the ROB head"). Until this signal existed nothing
+    // enforced it on the I side, and the consequence was NOT theoretical: cache mode
+    // reappeared only at `doAllocate` in the predecode dwell, i.e. AFTER both R beats
+    // had already returned, so INHIBITED suppressed the ARRAY INSTALL and nothing else.
+    // A wrong-path run-ahead fetch into a CM=10 page issued a real 64-byte INCR burst,
+    // demonstrated on unmodified RTL by ExecuteLockStepSpec's "spec-mmio I-side THE
+    // RULE" probe (see docs/superpowers/specs/2026-09-04-speculative-inhibited-mmio-
+    // audit.md). One such burst spans four Quadra 53C96 registers, including the
+    // read-to-clear Interrupt Status at +0x50.
+    //
+    // WHY THIS IS AN ACCEPT-SIDE GATE AND NOT AN S1 HOLD, which is the shape a reader
+    // coming from the D side would expect. An S1 hold (the `s1Unresolved` `otherwise`
+    // arm below) keeps a command that has ALREADY FIRED, so the plugin owes FetchAlign
+    // a response for it forever: FetchAlign retires ring slots on responses and merely
+    // marks them `ringStale` on a redirect, it never abandons them. A held wrong-path
+    // inhibited fetch would therefore have to be either (a) launched anyway once the
+    // machine drained — which is the very bus transaction this gate exists to prevent,
+    // just later — or (b) abandoned with a synthesised response, which is silent
+    // instruction-byte corruption the moment the staleness reasoning behind it is
+    // wrong. Refusing the command at the Stream boundary has neither problem: nothing
+    // has fired, no response is owed, and a redirect simply changes `cmdWindowPc`
+    // underneath the un-accepted command (FetchAlign re-evaluates `ic.cmd.payload.pc`
+    // combinationally every cycle and already tolerates a low `ready` for arbitrarily
+    // long — `setBlocked` and `!s1Unresolved` both do it today).
+    //
+    // COST, stated honestly: this is the one place the M3b campaign's "cmdPort.ready
+    // FROM REGISTERED STATE ONLY" property is deliberately relaxed. `lookupCacheable`
+    // is a live `xlate.rsp.cacheMode` read, so the ITLB entry mux is back in the accept
+    // cone — but only through an OR with a registered term, and only for the term that
+    // makes a device access architecturally legal. There is no registered substitute:
+    // the whole defect is that the cache mode was consulted one stage too late.
+    val nonSpecFetch = Bool()
+    nonSpecFetch.allowOverride
+    // Default TRUE = "assume the fetch is architectural". Every standalone I-cache DUT
+    // drives `cmdPort` from a directed probe rather than from a speculative frontend,
+    // so for them the default is the TRUTH, not a weakening; only a DUT that actually
+    // contains a speculating frontend (FullCoreSynth, SocketTop, and the three full-core
+    // test DUTs) overrides it. A default of False would instead HANG every standalone
+    // test that fetches an inhibited line.
+    nonSpecFetch := True
+    nonSpecFetch.simPublic()
+    val inhibitedSpecBlock = !lookupCacheable && !nonSpecFetch
+    inhibitedSpecBlock.simPublic()
+
     // ---- install-context latches (M2c: NOT part of the MSHR control file) ----
     // M2c splits what used to be one undifferentiated `miss*` pile into two things
     // with genuinely different lifetimes:
@@ -1473,6 +1522,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val arHoldValid = RegInit(False)
     val arHoldId    = Reg(UInt(AxiIds.ID_W bits))
     val arHoldAddr  = Reg(UInt(32 bits))
+    // The I-side's (partial) `MmioCover` analogue: True for a demand fill whose access
+    // was CACHE-INHIBITED, which narrows the burst from 2 x 32 B to 1 x 32 B and moves
+    // the address from the 64-byte LINE base to the 32-byte HALF-LINE base. See the AR
+    // payload assignment below for the exact argument, including why this stops at 32
+    // bytes rather than reaching the D side's exact byte cover.
+    val arHoldNarrow = RegInit(False)
 
     // ---- FSM ----
     val fsm = new StateMachine {
@@ -1596,8 +1651,12 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // "M3b: no younger command is accepted behind an unresolved miss", and its
         // opposite direction (the gate must be LOW on a hit, or every straight-line
         // fetch loses an issue slot) by "M3b: sustained II=1 on hits".
+        //   `!inhibitedSpecBlock` the CM=10 speculation gate. See its declaration for
+        //                      the full rationale, and for the one deliberate exception
+        //                      it makes to the "registered state only" property above.
         pfAcceptOk := !pfLookupSetBusy
-        cmdPort.ready := xlate.rsp.ready && !setBlocked && !s1Unresolved && pfAcceptOk
+        cmdPort.ready := xlate.rsp.ready && !setBlocked && !s1Unresolved && pfAcceptOk &&
+                         !inhibitedSpecBlock
 
         when(cmdPort.fire) {
           // ══ M3a S0 CAPTURE ═════════════════════════════════════════════════════
@@ -2292,7 +2351,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
       when(refillActive && !mshrArSent(DEMAND_IDX)) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
-        arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
+        // INHIBITED demand fill: half-line base + single beat (see `arHoldNarrow`).
+        arHoldAddr  := Mux(missCacheable, mshrPa(DEMAND_IDX) & ~U(63, 32 bits),
+                                          mshrPa(DEMAND_IDX) & ~U(31, 32 bits))
+        arHoldNarrow := !missCacheable
       // M4: `demandStuck` -> `demandStuckQ`, and the `pfBlockingArAny` escape hatch is
       // now QUALIFIED by `heldOnSetBusyQ`. Task 11 left it unqualified, so under case (a)
       // the hatch could be opened by a blocking-owner match computed against a younger,
@@ -2307,13 +2369,41 @@ class IcachePlugin extends FiberPlugin with FetchService {
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
                         U(AxiIds.I_SPEC_BASE, AxiIds.ID_W bits)).resized
         arHoldAddr  := mshrPa(pfChosenArMshr) & ~U(63, 32 bits)
+        // A speculative (prefetch) fill is CACHEABLE by construction — rule P1, "an
+        // INHIBITED page is never prefetched" (see `missCacheable`'s declaration) —
+        // so this arm can never want the narrow shape.
+        arHoldNarrow := False
       }
     }
 
     axi.ar.valid         := arHoldValid
     axi.ar.payload.addr  := arHoldAddr
     axi.ar.payload.id    := arHoldId
-    axi.ar.payload.len   := U(1, 8 bits)
+    // ── BURST WIDTH FOR A LEGITIMATE (non-speculative) INHIBITED FETCH ────────────
+    // `MmioCover`'s doc comment states the hazard this narrowing answers: byte-
+    // addressed I/O registers are selected by ADDRESS, not by strobe, and an AXI4 READ
+    // carries no byte-enable at all, so every byte a read COVERS is a byte the device
+    // sees read. A 64-byte line read therefore fires read-to-clear side effects on
+    // every register in that line, and the gate above only stops the SPECULATIVE case;
+    // an architecturally-required fetch from a device page still has to go to the bus.
+    //
+    // WHAT THIS DOES: one beat instead of two, at the 32-byte half-line containing the
+    // fetch, i.e. exactly the half the response can possibly deliver (`bypWindow` is
+    // selected by `missPC(5)` = which half, `missPC(4:3)` = which 8-byte window inside
+    // it). 64 -> 32 bytes, and the read can no longer cross a 32-byte boundary.
+    //
+    // WHAT THIS DOES NOT DO, stated plainly rather than left to be discovered: this is
+    // NOT the D side's exact byte cover, and a legitimate inhibited fetch still reads
+    // 24 bytes it did not name. Going further is a FRONT-END GRANULE change, not an AR
+    // payload change: `FetchRsp` delivers a fixed 64-bit window plus its predecode, and
+    // the predecode classifier (`classifyBeat`) needs the three words FOLLOWING each
+    // word it classifies. Fetching less than a whole beat leaves those lookahead words
+    // undefined INSIDE the beat, where -- unlike the beat-end case, which `classify`
+    // already refuses to guess at and marks `ambiguousLine` for `Aligner.scala:63-65`
+    // to redo -- nothing detects it and the result is silent instruction mis-framing.
+    // A true I-side `MmioCover` therefore needs the 64-bit fetch window and the 2-beat
+    // predecode dwell contract to change together. Not attempted here.
+    axi.ar.payload.len   := Mux(arHoldNarrow, U(0, 8 bits), U(1, 8 bits))
     axi.ar.payload.size  := U(5, 3 bits)
     axi.ar.payload.burst := Axi4.burst.INCR
     // M2c: the AR id IS the MSHR index, so the demand/speculative branch is gone.
@@ -2450,11 +2540,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     fillLo.write(rIdx, axi.r.payload.data, enable = rFire && !mshrBeat(rIdx))
     fillHi.write(rIdx, axi.r.payload.data, enable = rFire &&  mshrBeat(rIdx))
 
+    // A narrowed INHIBITED demand fill is ONE beat, so its `last` arrives on beat 0.
+    // `missCacheable` is the install-context scalar and a demand R beat requires
+    // `refillActive` (`demandRspMatch`), so it is the cacheability of exactly the fill
+    // this beat belongs to. Speculative slots are cacheable by construction (rule P1).
+    val rSingleBeat = ridIsDemand && !missCacheable
     when(rFire) {
       val respErr = axi.r.payload.resp =/= Axi4.resp.OKAY
       // Generalised from the two identical per-path assertions M2b carried.
-      assert(axi.r.payload.last === mshrBeat(rIdx),
-        "I-cache refill must be exactly two beats")
+      assert(axi.r.payload.last === (mshrBeat(rIdx) || rSingleBeat),
+        "I-cache refill must be exactly two beats (one for a narrowed INHIBITED fill)")
       when(respErr) { mshrErr(rIdx) := True }
       mshrBeat(rIdx) := !mshrBeat(rIdx)
       when(axi.r.payload.last) {
@@ -2486,8 +2581,22 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // mis-framing, `ambiguousLine` marks it, and `Aligner.scala:63-65` re-classifies
     // live from the instruction buffer's own already-fetched words.
     val isLoBeat  = commitBeat === U(0, 1 bits)
+    // A narrowed INHIBITED demand fill delivered ONE beat, into `fillLo` (the R handler
+    // writes beat 0 there), and that beat is the 32-byte HALF-LINE the AR named — the
+    // half `missPC(5)` selects — not the low half of a 64-byte line. Two consequences,
+    // both of which are bugs if they are left out:
+    //   - `fillHi` holds the PREVIOUS fill's data, so the low beat's cross-beat
+    //     lookahead must not read it. Forcing `beatNext3` to zero puts words 13/14/15
+    //     on the same F5 `extWValid = false` boundary path the HIGH beat always takes:
+    //     `classify` refuses to guess brief-vs-full, rejects as COMPLEX, marks
+    //     `ambiguousLine`, and `Aligner.scala:63-65` re-classifies live from the
+    //     instruction buffer. Conservative, and already exercised for every
+    //     `missPC(5) = 1` fetch in the design today.
+    //   - the bypass capture below must fire on commitBeat 0 regardless of `missPC(5)`,
+    //     because the requested half arrived as beat 0 (see the `bypWindow` capture).
+    val narrowInstall = !missCacheable
     val beatSrc   = Mux(isLoBeat, fillLoQ, fillHiQ)
-    val beatNext3 = Mux(isLoBeat, fillHiQ(47 downto 0), B(0, 48 bits))
+    val beatNext3 = Mux(isLoBeat && !narrowInstall, fillHiQ(47 downto 0), B(0, 48 bits))
     val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
 
     when(predActive) {
@@ -2514,7 +2623,10 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // declaration for the full equivalence, write/read-ordering and missPC-
       // immutability arguments (they cover `bypWindow` identically -- same predicate,
       // same lane index, same cycle).
-      when(commitBeat === missPC(5).asUInt) {
+      // `narrowInstall` (see above): the requested half-line arrived as beat 0, so the
+      // capture cycle is commitBeat 0 and NOT `missPC(5)` — reading `missPC(5) = 1`
+      // there would capture the previous fill's stale `fillHi`.
+      when(commitBeat === Mux(narrowInstall, U(0, 1 bits), missPC(5).asUInt)) {
         bypWindow := beatSrc.subdivideIn(64 bits)(missPC(4 downto 3))
         bypPred   := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
       }
