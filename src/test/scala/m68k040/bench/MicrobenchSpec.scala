@@ -160,6 +160,30 @@ class MicrobenchSpec extends CoreBenchHarness {
                  k: Kernel, f: IpcResult => Double): Stat =
     Stat(name, seeds.map(s => f(runKernel(compiled, k, s))))
 
+  /** PREMISE ASSERTION for chase-style kernels.
+    *
+    * Every chase kernel here depends on the LOADED VALUE being zero, so that the
+    * address register advances by a known constant and the chain walks the
+    * footprint the kernel claims. That premise is not self-evidently true: the
+    * memory model's default backing store is PRNG-filled, and a kernel whose
+    * premise is false does not crash -- it walks garbage addresses (or faults
+    * under an MMU) and STILL produces a differential, i.e. a confident number
+    * from a run that never did what the kernel says it did.
+    *
+    * This is the same class of error as an unvalidated timing source, and it is
+    * caught the same way: by checking, not by assuming. A behaving chase touches
+    * a handful of distinct lines; a derailed one touches hundreds.
+    */
+  def assertChasePremise(r: IpcResult, maxDistinctLines: Int, what: String): Unit = {
+    val lines = r.ldCmdAddrs.map(_ & ~0xfL).distinct
+    assert(r.ldCmdAddrs.nonEmpty, s"[$what] PREMISE FAILED: no D-cache loads observed at all.")
+    assert(lines.size <= maxDistinctLines,
+      f"[$what] PREMISE FAILED: the chase touched ${lines.size} distinct 16-byte lines " +
+      f"(expected <= $maxDistinctLines). The loaded value is not zero, so the address " +
+      f"chain derailed and this measurement is meaningless. First addresses: " +
+      r.ldCmdAddrs.take(6).map(a => f"0x$a%08x").mkString(","))
+  }
+
   // ── reporting ───────────────────────────────────────────────────────────────
 
   private val rows = scala.collection.mutable.ArrayBuffer.empty[(String, String, Stat, String)]
@@ -289,7 +313,7 @@ class MicrobenchSpec extends CoreBenchHarness {
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
     val body  = (0 until n).map(_ => "move.l (%a0),%a0")
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"pure-chase-$n", src, stopAt(setup.size + n))
+    Kernel(s"pure-chase-$n", src, stopAt(setup.size + n), zeroFillData = true)
   }
 
   /** IND, and the diagnostic counterpart to `kPureChase`: mutually INDEPENDENT
@@ -321,7 +345,7 @@ class MicrobenchSpec extends CoreBenchHarness {
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
     val body  = (0 until n).map(_ => "move.l (%a0),%a0")
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"trace-chase-$n", src, setup.size + n - 2)
+    Kernel(s"trace-chase-$n", src, setup.size + n - 2, zeroFillData = true)
   }
 
   private def chaseStep(stride: Int) =
@@ -341,7 +365,8 @@ class MicrobenchSpec extends CoreBenchHarness {
     val body = (0 until n).flatMap(_ => step)
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0", "moveq #0,%d2")
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"chase-cold-${if (load) "ld" else "ctl"}-$n", src, stopAt(setup.size + n * 3))
+    Kernel(s"chase-cold-${if (load) "ld" else "ctl"}-$n", src, stopAt(setup.size + n * 3),
+      zeroFillData = true)
   }
 
   /** DEP, LOOPED. `inner` chase steps at stride 64 over a FIXED footprint, repeated
@@ -366,7 +391,7 @@ class MicrobenchSpec extends CoreBenchHarness {
       "subq.l #1,%d6 ; bne.s .Louter"
     val src = (setup ++ Seq(loop, ".Lend: bra.s .Lend")).mkString(" ; ")
     Kernel(s"chase-loop-$inner-${if (load) "ld" else "ctl"}-$outer", src,
-      stopAt(setup.size + outer * perOuter))
+      stopAt(setup.size + outer * perOuter), zeroFillData = true)
   }
 
   // ── branch misprediction ────────────────────────────────────────────────────
@@ -516,7 +541,7 @@ class MicrobenchSpec extends CoreBenchHarness {
     val body = (0 until n).flatMap(_ => chaseStep(strideBytes))
     val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
     Kernel(s"tlb-${if (walk) "walk" else "ttr"}-$n", src, stopAt(setup.size + n * 3),
-      mmu = Some(if (walk) mmuWalkD else mmuNoWalk),
+      mmu = Some(if (walk) mmuWalkD else mmuNoWalk), zeroFillData = true,
       prepMem = h => buildIdentityTables(h.dWalkMem, DataBase, strideBytes.toLong, n + 4))
   }
 

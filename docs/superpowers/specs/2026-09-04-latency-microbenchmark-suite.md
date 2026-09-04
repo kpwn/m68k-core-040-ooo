@@ -156,7 +156,7 @@ that core, which was not done.
 
 | Level | Marginal cost per dependent load | Method / cache control |
 |---|---|---|
-| **L1D hit** | ~~11.000 ± 0.159~~ **SUPERSEDED — see §3.2a; real load-to-use is 17–19** | control kernel not correctly matched; over-subtracts |
+| **L1D hit** | **11.000** (confirmed by two methods, §3.2a) | 4 KiB footprint < 8 KiB L1D |
 | **L1D miss → L2 hit** | **20.139 ± 0.533** | 32 KiB footprint = 4× L1D → misses every access; L2-resident from prior pass |
 | **cold miss → model DRAM** | **98.242 ± 1.858** at `dramCycles=70`; **core-side fixed cost 28.5** (sweep intercept) | straight-line stride-64; a fresh 64 B line every step |
 
@@ -203,240 +203,225 @@ line. Two real results follow, neither of which depends on the unmeasured parame
 So: quote the L1D hit (11.0), the L2 hit (20.1), the slope (~1.0) and the intercept (28.5).
 Do not quote 98.242 as a DDR latency.
 
-### 3.2a Load-to-use: correction, decomposition, and a cycle trace
+### 3.2a Load-to-use: a retraction, and the corrected measurement
 
-The §3.2 memory figures were challenged as implausibly high. Re-measuring settled it, and
-**one of my own numbers has to be corrected.**
+**I published two wrong numbers here before this section was rewritten. Both are retracted.**
 
-#### The correction
-
-§3.2's "L1D hit = 11.000" came from a 3-instruction chase minus a control kernel. **That
-control is not correctly matched.** Its `move.l %d2,%d1` reads a loop-*invariant* register,
-so it sits OFF the dependency chain — the subtraction removes the two address adds but
-leaves the AGU and the consumer wakeup inside the residue, and it over-subtracts. A
-purpose-built kernel with no control at all settles it:
-
-```
-move.l (%a0),%a0        # 1 macro/step, chain = address -> AGU -> D$ -> writeback -> address
-```
-
-| Method | Value | Notes |
+| Attempt | Value | Verdict |
 |---|---|---|
-| M1 differential, pure chase (DEP) | **18.737 ± 0.531** | 1 macro/step, no subtraction |
-| M2 per-event, D$ cmd→cmd (DEP) | **17.000 ± 0.000** | direct, shares no arithmetic with M1 |
+| §3.2 original, 3-op chase minus control | 11.000 | **correct**, but the method was under-justified |
+| "correction" via pure chase | 18.737 | **WRONG — broken kernel premise.** Retracted. |
+| corrected pure chase, premise enforced | **11.000** | **stands**, and now confirmed by a second method |
 
-Two independent methods agree at **17–19 cycles**, so **§3.2's 11.000 is superseded for
-load-to-use.** The relative structure of §3.2 (L1D < L2 < DRAM) and the DRAM *slope* (0.997,
-a difference-of-differences that is insensitive to the control) still stand; the absolute
-per-access values from that subtraction should be read as lower bounds.
+#### The premise bug — in my own kernel
 
-#### Latency or serialisation? — the decisive test
+Every chase kernel here depends on the **loaded value being zero**, so the address
+register advances by a known constant and walks the footprint the kernel claims.
+`AxiMemModel`'s default backing store is **`SparseMemory()`, whose freshly-allocated pages
+are PRNG-filled** — the file says so at `AxiMemModel.scala:684-685` ("`AxiMemModel`'s own
+default is still `SparseMemory()`"), which is exactly why the project ships an opt-in
+`ConstFillSparseMemory`. So `a0` jumped to garbage, the chase scattered across random
+addresses, and with MMU off it never faulted — it just quietly measured a **miss** path
+while claiming to measure an L1D hit.
 
-| | cycles/load | |
-|---|---|---|
-| **dependent** loads (pointer chase) | **18.74** | DEP |
-| **independent** loads (6 dests, 6 resident lines) | **1.50** | IND |
-| **ratio** | **12.5×** | |
+A kernel with a false premise does not crash. It still produces a differential, still
+reports tight variance, and still looks like a measurement. **This is the same failure
+class as an unvalidated timing source**, and it is why the suite now carries
+`assertChasePremise`: after each chase run it checks how many distinct 16-byte lines the
+load stream actually touched, and fails if the chain derailed. A behaving chase touches a
+handful; the broken one touched hundreds.
 
-**The load path is deeply pipelined, not serialised.** It sustains a load every 1.5 cycles
-given ILP — in fact *better* than the design docs' stated initiation interval of "1 load
-every 3 cycles at the D-cache port, 1 per 9 through the LS EU". So this is a pure latency
-property that the machine can hide, not a throughput defect. That distinction matters
-because the two diagnoses call for completely different fixes, and it rules out the more
-serious one.
+(The identical bug independently invalidated the DTLB-walk kernel — see §4.1. Same root
+cause, found by a different route.)
 
-#### Where the cycles go — cycle-by-cycle trace
+#### The corrected number, by two independent methods
 
-`MB_TRACE=trace-chase` dumps every load-path stage per cycle. One steady-state iteration
-(`#` = stage active), reproduced verbatim:
+| Method | Value |
+|---|---|
+| M1 differential over chain length, pure chase (DEP) | **11.000 ± 0.000** |
+| M2 direct per-event, D-cache cmd→cmd (DEP) | **11.000 ± 0.000** |
+
+The per-event interval histogram is `{11:189, 16:1, 19:1}` — **189 of 191 intervals are
+exactly 11 cycles**. Two methods sharing no arithmetic agree to three decimals with zero
+variance across seeds. **Dependent load-to-use is 11 cycles.**
+
+#### Latency or serialisation? — the question that had to be settled first
+
+| | cycles/load |
+|---|---|
+| **dependent** loads (pointer chase) | **11.00** |
+| **independent** loads (6 dests, 6 resident lines) | **1.50** |
+| **ratio** | **7.3×** |
+
+**The load path is pipelined, not serialised.** It sustains a load every 1.5 cycles given
+ILP — better than the design docs' stated initiation interval of 3 (cache port) / 9 (LS EU).
+Had independent loads also cost ~11, the path would be serialised and no hit-path
+restructuring would be the binding fix. They do not, so **hit-path latency is the binding
+constraint** and the budget below is the right thing to chase.
+
+### 3.2b Where the 11 cycles go — cycle-accurate trace
+
+`MB_TRACE=trace-chase` dumps every load-path stage per cycle. Steady state is an exact
+11-cycle period (P1 at 207, 218, 229 …), reproduced verbatim:
 
 ```
 cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB
-  144  #  .  .  .  .  .  .  .  .  .  .     P1  issue ctx + registered operands
-  145  .  #  .  .  .  .  .  .  .  .  .     P2  DTLB + VIPT probe launched
-  146  .  .  #  .  .  .  .  .  .  .  .     P2T translation response
-  147  .  .  .  #  .  .  .  .  .  .  .     P3  resolved PA -> SQ query
-  148  .  .  .  .  #  .  .  .  .  .  .     P4  SQ forward response -> resolve
-  149  .  .  .  .  .  #  .  .  .  .  .     C0  D$ accepts address (loadCmd fire)
-  150  .  .  .  .  .  .  #  .  .  .  .     C1  tag compare + way select
-  151  .  .  .  .  .  .  .  #  .  .  .     C2  byte-lane extract
-  152  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
-  153  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
-  154  .  .  .  .  .  .  #  .  .  .  .     C1 AGAIN
-  155  .  .  .  .  .  .  .  #  #  .  .     C2 AGAIN + loadRsp (data returns)
-  156  .  .  .  .  .  .  .  .  .  #  #     completion + writeback/wakeup
-  157  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
-  158  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
-  159  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
-  160  #  .  .  .  .  .  .  .  .  .  .     next dependent load starts
+  207  #  .  .  .  .  .  .  .  .  .  .    issue ctx + registered operands
+  208  .  #  .  .  .  .  .  .  .  .  .    DTLB request + L1D virtual-set probe launched
+  209  .  .  #  .  .  .  .  .  .  .  .    translation response captured
+  210  .  .  .  #  .  .  .  .  .  .  .    resolved PA -> store-queue query
+  211  .  .  .  .  #  .  .  .  .  .  .    SQ forward response -> resolve / cache launch
+  212  .  .  .  .  .  #  .  .  .  .  .    D-cache ACCEPTS the address
+  213  .  .  .  .  .  .  .  #  #  .  .    byte-lane extract + DATA RETURNED
+  214  .  .  .  .  .  .  .  .  .  #  #    completion + writeback / wakeup broadcast
+  215  .  .  .  .  .  .  .  .  .  .  .    <-- bubble
+  216  .  .  .  .  .  .  .  .  .  .  .    <-- bubble
+  217  .  .  .  .  .  .  .  .  .  .  .    <-- bubble
+  218  #  .  .  .  .  .  .  .  .  .  .    next dependent load issues
 ```
 
-**16 cycles per dependent load, of which 11 show stage activity and 5 are bubbles** —
-cycles where no observed load-path stage is active at all. The 11 active cycles match the
-design intent almost exactly (see §3.2b). The 5 bubbles are the excess, in two regions:
+Split into the two things that must not be conflated:
 
-- **Bubble A, cycles 152–153 (2 cycles), and a duplicated cache pass.** The D-cache load
-  stages `ldS1Valid`/`ldS2Valid` fire **twice** per load — at 150/151 and again at 154/155,
-  with the data only returning on the second pass. `DcacheSpec.scala:2241` asserts a load
-  hit responds **2 cycles after accept**; here accept is 149 and the response is 155, i.e.
-  **6 cycles**. Either this is not taking the plain-hit path, or the access is re-run.
-- **Bubble B, cycles 157–159 (3 cycles).** Writeback and wakeup broadcast at 156; the
-  dependent load's P1 is at 160. The design specifies the consumer becomes ready on the
-  registered `lsWait` clear and issues at **wakeup+1**; observed is **wakeup+4**.
-
-**Interpretation, held separate from the observation.** The trace above is fact. Two
-readings are possible for Bubble A: a genuine replay/re-issue, or a legitimate two-pass
-design (the docs describe a virtual-set probe launched in parallel with the DTLB, which
-could be the 150/151 pass, with 154/155 the tagged resolve). I did not confirm which. The
-follow-up that would settle it is narrow: check whether the D-cache load path takes its
-`DcacheSpec`-asserted 2-cycle hit route in this scenario, and whether `wakeupPort.valid` →
-dependent select really costs 4 cycles rather than the specified 1. **I am not claiming a
-bug; I am reporting 5 unattributed cycles per load and naming exactly where they sit.**
-
-#### Store-to-load forwarding, same treatment
-
-| | cycles |
-|---|---|
-| forwarded store→load→use **pair** (store + load) | **10.000** |
-| single dependent load served by the L1D | **18.737** |
-
-A forwarded pair containing *both* a store and a load costs ~8.7 cycles **less** than a
-single cache-served dependent load. So **the forward path really is short-circuiting the
-cache pipeline** rather than running through it — P4 resolves `fwdHit` without launching a
-cache access, exactly as intended. That is a genuine, measured vindication of the
-forwarding design. It remains true that no comparison against m68k-ooo was run, so the
-*relative* advantage over that core is still an unmeasured claim.
-
-### 3.2b Measurement versus design intent
-
-A review of the design docs and the RTL (citations below) establishes that **11–12 cycles
-of load-to-use is the designed number, not a regression** — and that the design says so
-only implicitly:
-
-- The intended depth is **9 stages issue→completion**
-  (`2026-08-09-ipc-ls-eu-full-pipeline-design.md:559`), plus a registered
-  completion/writeback stage, plus the IQ's +1 dynamic-wakeup hop. That counts to 11–12,
-  and the implemented register chain (P1, P2, P2T, P3, P4, ring, C0, C1, C2, comp\*,
-  wakeup) matches the trace above one-for-one.
-- It was deliberate. Goal G3 (`:212-216`) states the target pipeline should be *longer*
-  than the previous 9-cycle load latency "possibly by 1–2 cycles — and that is the intended
-  outcome, not a cost to be minimised", under an explicit user principle preferring depth
-  over a serial FSM.
-- **~6–7 of those cycles are FMax tax.** Six separate splits were added to the load path
-  for timing, each waved through in-source with the phrase "latency-agnostic; lock-step
-  absorbs the +1" — e.g. `DcachePlugin.scala:860-872` ("Costs one uniform extra cycle of
-  load-to-use latency on every D-cache load hit ... the 5th of this shape in this file").
-  That phrase is true of the *lock-step verification harness*; it is not true of IPC.
-- **Only one of the six had its IPC cost measured** (Slice 2: −0.8% aggregate IPC for
-  +8.35 MHz). **Nobody ever summed the six**, and no document states the resulting
-  end-to-end load-to-use figure.
-- **Nothing pins it.** `DcacheSpec.scala:2241` exact-asserts the *cache port's* 2-cycle hit
-  response (3 of ~16 cycles); the LS-EU front and completion stages are unpinned, and
-  `IpcBenchSpec.scala:973` states outright that its kernels measure "EU + D-cache
-  THROUGHPUT (initiation interval), **not load-use latency**". There was no
-  dependent-load kernel anywhere in the tree before this suite.
-
-**So the adjudication is: the design intends ~11–12, the machine delivers ~16–19, and the
-trace locates the ~5-cycle gap in two specific places.** The deep part is architectural and
-was chosen knowingly; the bubbles are the fixable part. Given 68k code is load-dense and
-independent loads pipeline at 1.5 cycles, dependent-load latency is a strong candidate for
-the dominant term in the 0.655 aggregate IPC — but I did **not** measure that attribution,
-so it stays a hypothesis.
+| Segment | Cycles | Count |
+|---|---|---|
+| Front: issue ctx + registered operands | 207 | 1 |
+| **HIT PATH: address formed → data returned** | **208 → 213** | **6** |
+| Completion + writeback / wakeup | 214 | 1 |
+| Wakeup → next dependent issue (bubble) | 215–217 | 3 |
+| **Total load-to-use** | 207 → 218 | **11** |
 
 ### 3.2c The hit path against the 1-cycle target / 2-cycle ceiling
 
 **Design target (project owner):** *"dcache hit path needs to be very fast; 1 cycle in the
 L1D hit and TLB hit case would be great; 2 is our maximum."*
 
-#### First: is the hit path even the binding constraint?
+**Hit path = 6 cycles, against a target of 1 and a ceiling of 2.** (Quoting the 11-cycle
+load-to-use against this budget would overstate it: 5 of the 11 are issue, writeback and
+wakeup, which the budget does not cover.)
 
-Yes. Independent loads sustain **1.50 cycles** each against **18.74** dependent (§3.2a).
-The path is **pipelined, not serialised**, so throughput is not the limiter and the
-**latency of the hit path is the binding constraint.** Had independent loads also cost ~11,
-the budget would have been the wrong thing to chase; it is not.
+#### The critical finding: the cache array is not the problem
 
-#### The hit path, isolated from the surrounding overhead
-
-The budget is on the *hit path*, so it must be reported separately from load-to-use.
-Splitting the 16-cycle trace at the two boundaries that matter — address formed, and data
-returned:
-
-| Segment | Cycles (trace) | Count |
+| Cycle | What it does | Verdict |
 |---|---|---|
-| Front-end: issue ctx + registered operands (P1) | 144 | 1 |
-| **HIT PATH: address formed → data returned** | **145 → 155** | **10** |
-| Completion + writeback/wakeup | 156 | 1 |
-| Wakeup → next dependent issue | 157–159 | 4 |
-| **Total load-to-use** | 144 → 160 | **16** |
+| 208 | DTLB request + virtual-set probe launched | TLB |
+| 209 | translation response captured | TLB |
+| 210 | resolved PA → store-queue query | **SQ disambiguation** |
+| 211 | SQ forward response → resolve / cache launch | **SQ disambiguation** |
+| 212 | D-cache accepts the address | cache-boundary accept |
+| 213 | extract + **data returned** | **array access** |
 
-**Hit path = 10 cycles against a target of 1 and a ceiling of 2 — 5× over the maximum.**
-(Reporting load-to-use's 16 against the budget would overstate the overrun; 6 of those 16
-cycles are issue/writeback/wakeup, which the budget does not cover.)
+**The D-cache array access is ONE cycle (212→213)** — accept to data. That is inside the
+2-cycle ceiling and better than the 2-cycle hit `DcacheSpec.scala:2241` pins. **The array,
+the tag compare and the way mux are not where the budget is being spent.**
 
-#### Every cycle in the hit path, and whether it is load-bearing
+The 6-cycle hit path is: **2 cycles of TLB + 2 cycles of store-queue disambiguation +
+1 cycle of cache-boundary accept + 1 cycle of array access.** Four of the six cycles are
+work *sequenced in front of* an array access that is already fast enough. Add the 3-cycle
+wakeup bubble at 215–217 and that is 7 of the 11 cycles spent outside the cache array.
 
-| Cycle | Stage | What it does | Load-bearing? |
-|---|---|---|---|
-| 145 | P2 | DTLB request + L1D virtual-set probe launched | work |
-| 146 | P2T | translation response captured | work (TLB) |
-| 147 | P3 | resolved PA → store-queue query | work (SQ disambiguation) — **FMax split #2** |
-| 148 | P4 | SQ forward response → resolve / cache launch | **FMax split #3** |
-| 149 | C0 | D-cache accepts the address | **FMax split #4** (EA registered at the cache boundary) |
-| 150 | C1 | tag compare + way select | **FMax split #5** (registered hit-detect) |
-| 151 | C2 | byte-lane extract | **FMax split #6** (S1→S1a/S1b) |
-| 152–153 | — | **nothing active** | **BUBBLE (2)** |
-| 154 | C1 | tag compare + way select **again** | duplicate pass |
-| 155 | C2 + RSP | extract again; **data returned** | duplicate pass |
+### 3.2d Framed against NaxRiscv — the reference design
 
-**The D-cache array access itself is not the problem.** `DcacheSpec.scala:2241` pins a load
-hit at 2 cycles after accept, and that 2-cycle array access **already meets the ceiling**.
-The 10-cycle hit path is: 2 cycles of TLB, 2 cycles of store-queue disambiguation, 1 cycle
-of cache-boundary accept, 2 cycles of array access, and **4 cycles of bubble + duplicated
-pass**.
+The owner's framing: *"NaxRiscv has a fast cache hit and tlb hit case; meets 200MHz."* So a
+fast hit path and 200 MHz closure are **not** in tension, and the earlier version of this
+section — which estimated an "FMax cost of collapsing to 2 cycles" — **presumed the wrong
+model and has been deleted.** The question is structural, not a trade.
 
-#### How many of the 10 are FMax-motivated stage boundaries
+**Sourcing discipline first.** The two commissioned comparison docs
+(`2026-09-04-naxriscv-architecture-comparison.md`, `…-walker-comparison-round2.md`) were
+read in full. They do **not** contain a NaxRiscv hit latency, stage list, D-side VIPT
+description, way-prediction mechanism, or FMax figure — they are a decode/rename/commit
+comparison and a walker-port comparison. **The 200 MHz claim is the owner's, not sourced
+from these docs, and nothing about NaxRiscv's hit-path timing is asserted below that the
+docs do not actually say.** Answering "what does their hit path do differently, stage by
+stage" requires reading the reference tree itself
+(`/home/qwertyoruiop/m68k-ooo-v2/thirdparty/NaxRiscv` @ `9f452d5`) — **that was not done
+here** and is the top follow-up.
 
-**Five of the ten cycles in the hit path are stage boundaries inserted to buy FMax**
-(splits #2–#6 in the table above; a sixth, the AGU base register, and a seventh, the
-completion register, sit outside the hit path). Each was accepted in-source with the same
-phrase — *"latency-agnostic; lock-step absorbs the +1"* — which is true of the lock-step
-verification harness and **not** of IPC. Only one of the six ever had its IPC cost measured.
+What the docs **do** establish is structural, and it lines up with the trace exactly:
 
-That gives the actionable sentence: **5 of the 10 hit-path cycles are FMax-motivated stage
-boundaries, and a further ~4 are a bubble plus an apparently duplicated cache pass. The
-irreducible work — TLB lookup plus tag/data/hit — is roughly 2–4 cycles.**
+1. **Their load pipe cannot back-pressure at all.** `io.load.cmd.ready := True`
+   (`DataCache.scala:1324`); readiness at the client boundary is purely the arbiter's
+   one-hot grant. *"Every condition that would otherwise require holding a command — miss,
+   way hazard, bank busy, refill-slot collision, line locked, unique-miss — is instead
+   answered as `REDO` in the fixed response window."* A command occupies the pipe for
+   exactly `loadRspAt` cycles; **"No client can ever hold a cache resource."**
+2. **Fixed latency, so tracking is positional** — a one-hot `History` shift register, not an
+   ownership FIFO. The docs state the causality directly: *"The positional `History`
+   register is not merely 'simpler'; it is only available because `DataCache`'s load pipe
+   is fixed-latency."*
+3. **Disambiguation is not in front of the cache access.** NaxRiscv's store→load ordering is
+   enforced in the LSU, and an LSU load enters the cache with `redoOnDataHazard = False`
+   (`LsuPlugin.scala:966`, `Lsu2Plugin.scala:987`) — *"the LSU enforces store→load ordering
+   for its own traffic through its disambiguation logic"*, so the cache access is not gated
+   behind a hazard check. **Our P3/P4 sit between translation and the cache access and cost
+   2 of our 6 hit-path cycles.** The docs do **not** say whether their check runs in
+   parallel with the access or elsewhere, so I claim only that it is not in this position.
+4. **No structure outlives one pass through the port.** The docs' own comparison table:
+   *"Early-VIPT probe tokens ⇒ W11 deadlock | No structure that outlives one port pass |
+   **Yes.** W11 is the price of a feature NaxRiscv lacks."*
+5. **The docs name our deepest divergence themselves:** *"Our shadow-accept variable-latency
+   pipe cannot use a static scheme"*, and *"Our shadow-accept pipe cannot copy the policy
+   without copying the pipe."*
 
-#### The tension, named but not resolved here
+**The synthesis.** Their hit path is short because there is no stall logic in it: ready is
+hardwired true, latency is fixed, hazards are resolved by re-issuing a fresh command rather
+than by holding or replaying in place, and nothing allocated survives a pass. Ours is a
+**variable-latency, shadow-accept pipe with an early-VIPT probe whose tokens outlive a
+pass**, and it pays for that in exactly the places the trace shows: 2 cycles of
+disambiguation sequenced ahead of the array, a cache-boundary accept cycle, and a 3-cycle
+wakeup turnaround that a fixed-latency pipe would not need (with fixed latency a consumer
+can be woken at a known offset; with variable latency it must wait for actual completion).
 
-A 1-cycle VIPT hit with the TLB in parallel is a classically tight timing path — that is
-precisely *why* these splits were taken. Collapsing them will cost FMax on a design
-currently near 198 MHz postroute. **This is the owner's call, and the number they need is:**
+So the honest conclusion is **not** "we must buy 2 cycles with 40 MHz". It is: **our
+hit-path cost is a consequence of a variable-latency pipe with hazard checks in front of the
+array, and the reference design avoids it by making the pipe fixed-latency and
+non-blocking.** Whether our pipe can be made fixed-latency is a design question that this
+measurement cannot answer — but it is the right question, and it is not an FMax trade.
 
-> **Estimate: collapsing the hit path toward the 2-cycle ceiling means undoing ~5 splits and
-> plausibly costs on the order of 30–40 MHz, returning the design to roughly 157–167 MHz.**
+**Two things to note before anyone touches FMax at all.** The array access is already
+1 cycle, so the tag/data/way-mux path — the usual place a 1-cycle VIPT hit is won or lost —
+is *not* the constraint here. And 3 of the 11 cycles are a wakeup bubble that is not a stage
+at all. Neither of those is bought with frequency.
 
-Basis, and its weakness: only one split has a measured delta — Slice 2 bought **+8.35 MHz**
-(167.029 → 175.377) for +1 cycle and −0.8% IPC. Scaling that single data point across five
-splits gives ~40 MHz. Independently, the "before" figures quoted in the split commentary
-cluster in the same place (FMax #3's path was *"the 25-level / 6.349 ns critical path
-(157 MHz)"*), which is a consistency check rather than a second measurement. **This is an
-estimate from design-doc deltas, not a build result — no Vivado build was run.** The two
-sources agreeing at ~157–167 MHz is encouraging but they are not independent.
+#### Store-to-load forwarding, same treatment
 
-Worth noting before anyone pays that price: **~4 of the 10 cycles (the bubble and the
-duplicated pass) are not FMax splits at all.** If those are recoverable they cost no
-frequency, and they alone would take the hit path from 10 to ~6. That is the cheap half of
-the problem and should be understood before trading away 40 MHz for the expensive half.
+| | cycles |
+|---|---|
+| forwarded store→load→use **pair** (store + load) | **10.000** |
+| single dependent load served by the L1D | **11.000** |
 
-**Caveat on the duplicated pass.** The design is named *vipt-**parallel**-dcache*, and the
-docs describe the DTLB request and the L1D virtual-set probe being launched **in parallel**
-at P1/P2. The trace does not obviously show that: the TLB resolves at 145–146 and the tag
-compare runs at 150, four cycles later, with a second pass at 154. Either my probes
-(`ldS1Valid`/`ldS2Valid`) are observing the tagged resolve rather than the parallel probe,
-or the TLB and tag accesses are not actually overlapping as designed. **I did not confirm
-which, and the distinction matters a great deal** — if the VIPT parallelism is not being
-realised, that is a larger and cheaper win than any stage collapse. It is the single most
-valuable follow-up from this whole exercise.
+A forwarded pair containing *both* a store and a load costs slightly **less** than a single
+cache-served dependent load, so the forward path genuinely resolves in P4 without launching
+a cache access, as designed. That is a measured vindication of the forwarding design. No
+comparison against m68k-ooo was run, so the *relative* advantage over that core remains an
+unmeasured claim.
+
+### 3.2e Measurement versus design intent
+
+Design review of the docs and RTL establishes that **11 cycles of load-to-use is close to
+the designed number, not a regression**:
+
+- Intended depth is **9 stages issue→completion**
+  (`2026-08-09-ipc-ls-eu-full-pipeline-design.md:559`), plus a registered completion stage
+  and the IQ's wakeup hop. The implemented chain in the trace (P1, P2, P2T, P3, P4, C0, C2,
+  comp/wb) matches one-for-one.
+- It was deliberate. Goal G3 (`:212-216`) states the target pipeline should be *longer* than
+  the previous 9-cycle load latency *"possibly by 1–2 cycles — and that is the intended
+  outcome, not a cost to be minimised"*.
+- **~6 of those cycles are FMax tax**: six separate splits were added to the load path for
+  timing, each waved through in-source as *"latency-agnostic; lock-step absorbs the +1"*
+  (e.g. `DcachePlugin.scala:860-872`, *"the 5th of this shape in this file"*). That is true
+  of the lock-step verification harness and **not** of IPC.
+- **Only one of the six had its IPC cost measured** (Slice 2: −0.8% aggregate IPC for
+  +8.35 MHz). Nobody ever summed the six, and no document states the end-to-end figure.
+- **Nothing pins it.** `DcacheSpec.scala:2241` pins the cache port's 2-cycle hit (1 of the
+  11 cycles as measured); `IpcBenchSpec.scala:973` states outright that its kernels measure
+  initiation interval, *"not load-use latency"*. **There was no dependent-load kernel
+  anywhere in the tree before this suite.**
+
+Given 68k code is load-dense and independent loads pipeline at 1.5 cycles, dependent-load
+latency is a strong candidate for the dominant term in the 0.655 aggregate IPC — but I did
+**not** measure that attribution, so it stays a hypothesis.
 
 ### 3.3 Branch misprediction
 
@@ -530,40 +515,39 @@ unchanged after the harness was split into a shared trait and `divEu` observatio
 
 Reported as plainly as the successes.
 
-### 4.1 DTLB / ITLB table-walk cost — attempted twice, both invalid
+### 4.1 DTLB table-walk cost — ROOT-CAUSED (my kernel, not the walker) and since closed
 
-**Attempt 1** (looped chase, differential over outer passes): unusable, spread larger than
-the mean — `342.365 ± 484.177`, range `[0.000 … 1027.094]`.
+I reported this as unmeasurable, with raw samples `{0.00, 0.00, 567.25, 556.43, 0.00}`, and
+refused to publish a mean. **Refusing was right, and the cause has since been found — it was
+my kernel, not a walker defect.**
 
-**Attempt 2** (rebuilt as a byte-identical matched pair differing *only* in whether a
-match-all D-side TTR is installed, so the difference isolates the walker): the no-walk half
-became stable (`104.567 ± 3.227`), but the walk half is **bimodal**, raw samples over 5
-seeds:
+`chaseStep` requires the loaded value to be zero. `prepMem` wrote the page tables but
+**never the data pages**, and an untouched `SparseMemory` page is **PRNG-filled**. So `a0`
+jumped to garbage and, under `mmuWalkD` (no D-side TTR), faulted. The short and long
+variants share a prefix and derail at the *same* step, which is exactly why the differential
+came out at precisely `0.00` rather than as noise.
 
-```
-page-stride access, real walk :  {0.00, 0.00, 567.25, 556.43, 0.00}
-```
+Measured on unmodified `bb3bca1`, the walk kernel retired **66/174, 65/174, 158/174,
+158/174, 69/174** — **incomplete on every seed**, including the two that produced non-zero
+numbers. So even the "successful" 567.25 and 556.43 samples were timing a truncated kernel.
 
-Three of five seeds return **exactly 0.00**, meaning the `n=60` and `n=120` runs terminated
-at the *same* cycle — the differential measured nothing. Two seeds return a consistent
-~560. Averaging these would produce a confident-looking number that is meaningless, so
-**no walk latency is reported.**
+**This is the same root cause that invalidated my own pure-chase kernel (§3.2a)** — found by
+a different route, in a different kernel, on the same day. That is what motivated
+`assertChasePremise`: a chase kernel that silently truncates produces confident numbers from
+a run that never happened, which is the same failure class as an unvalidated timing source.
+Both are now enforced rather than assumed.
 
-**This is itself a lead worth chasing.** A run whose end point is independent of chain
-length points at the MMU-on / real-page-table configuration terminating on something other
-than the chase — a wedge, or a fault path — in a majority of seeds. Given a sibling agent is
-actively changing this exact walker, that instability should be understood before the change
-lands, and it may be a real defect rather than a benchmark artefact. I did not have budget to
-root-cause it. The kernels and page-table builder are committed and ready
-(`kTlbChase`, `buildIdentityTables`), so reproducing it is one command.
+With the premise made true the kernel completes on every seed, and the walker agent closed
+the measurement (their numbers, on `bench/walk-kernel-premise-fix`):
 
-Consequently the requested **"before" baseline for the walker change is only partially
-delivered**: the structural baseline is documented (§3.5) and the no-walk control is
-measured, but the walk cost itself is not.
+| | baseline | walker→L1D branch | Δ |
+|---|---|---|---|
+| walk cost, zero-latency model | 15.623 ± 0.379 | 21.507 ± 0.050 | +37.7% |
+| walk cost, **L2-faithful (5/70 cyc)** | 63.528 ± 0.263 | 64.344 ± 0.173 | **+1.3%** |
 
-**ITLB was not attempted at all.** It needs a code image spanning tens of 4 KiB pages to
-force ITLB set eviction, which is a materially different kernel generator from anything
-here. No ITLB number exists in this suite.
+The penalty collapses once memory costs anything, because upper-level descriptors hit L1D.
+**ITLB was still not attempted** — it needs a code image spanning tens of 4 KiB pages, a
+materially different generator, and no ITLB number exists in this suite.
 
 ### 4.2 FPU — blocked by a harness limitation
 
@@ -619,18 +603,28 @@ across with only the counter read replaced.
 
 ## 6. Standing cautions for anyone quoting these numbers
 
-1. **The combined L1D-hit + TLB-hit path is ~10 cycles against a 1-cycle target and a
-   2-cycle ceiling** (§3.2c). The D-cache *array* access is 2 cycles and is within budget;
-   the overrun is everything wrapped around it.
-2. **Load-to-use is 17-19 cycles, not the 11.0 first reported** (§3.2a). Of a 16-cycle
-   dependent load, ~11 cycles are designed pipeline depth and **~5 are bubbles**.
+1. **The combined L1D-hit + TLB-hit path is 6 cycles against a 1-cycle target and a
+   2-cycle ceiling** (§3.2c). The D-cache **array access is 1 cycle and already meets the
+   budget**; the overrun is 2 cycles of TLB plus 2 cycles of store-queue disambiguation
+   sequenced *in front of* the array, plus a cache-boundary accept cycle.
+2. **Dependent load-to-use is 11.000 cycles**, confirmed by two independent methods with
+   zero variance (§3.2a). Earlier drafts of this doc reported 18.737 — that was a broken
+   kernel premise and is **retracted**.
 3. **Latency is the problem, not throughput.** Independent loads sustain **1.50 cycles**
-   each (12.5x better than dependent). The path is pipelined, not serialised.
-4. **The absolute DRAM figure is a model input, not a measurement.** `dramCycles` is
+   each (7.3x better than dependent). The path is pipelined, not serialised.
+4. **Do not quote an "FMax cost" for shortening the hit path.** An earlier draft estimated
+   30-40 MHz; that presumed fast-hit and high-FMax are in tension, which the NaxRiscv
+   reference disproves. The gap is structural (§3.2d), not a frequency trade.
+5. **Nothing about NaxRiscv's hit-path timing is sourced.** The two comparison docs contain
+   no NaxRiscv hit latency, stage list, VIPT description, way-prediction mechanism or FMax
+   number. Only the structural properties in §3.2d are quoted; anything more must come from
+   the reference tree, which was not read here.
+6. **Chase-style kernels need a premise assertion.** `AxiMemModel`'s default backing store
+   is PRNG-filled; a chase that assumes zero silently walks garbage and still produces a
+   confident differential. Use `zeroFillData = true` **and** `assertChasePremise`.
+7. **The absolute DRAM figure is a model input, not a measurement.** `dramCycles` is
    unmeasured in both repos. From the sweep, quote the slope (~1.00) and the intercept
-   (**28.5 cycles** core-side fixed miss cost). Do not quote 98.242 as a DDR latency.
-5. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
+   (**28.5 cycles** core-side fixed miss cost), not 98.242.
+8. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
    here always means *cold, first touch*.
-6. **Aggregate IPC 0.655 is not a like-for-like delta against the historical 0.53.**
-7. **There is no DTLB walk number.** If you need one, §4.1 has the reproduction and the
-   open question.
+9. **Aggregate IPC 0.655 is not a like-for-like delta against the historical 0.53.**

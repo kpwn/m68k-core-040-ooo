@@ -15,7 +15,7 @@ import m68k040.execute.regfile.{RegFilePluginFp, RegFilePluginFpcc, RegFilePlugi
 import m68k040.services.{RedirectService, DTranslationService}
 import m68k040.lockstep.WhiteboxCapture
 import m68k040.oracle.ProgramAssembler
-import m68k040.sim.{AxiMemModel, AxiMemModelConfig, L2LatencyModel}
+import m68k040.sim.{AxiMemModel, AxiMemModelConfig, ConstFillSparseMemory, L2LatencyModel}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -418,6 +418,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       // cmd->cmd interval is an INDEPENDENT per-event measurement of the same
       // quantity the differential method reports, so the two can be cross-checked.
       ldCmdCycles: Seq[Long] = Nil,
+      // Physical addresses of every accepted D-cache load. A chase kernel that is
+      // behaving touches only a handful of distinct lines; hundreds of distinct
+      // addresses means the chain derailed and the run measured nothing it claims.
+      ldCmdAddrs: Seq[Long] = Nil,
       ldRspCycles: Seq[Long] = Nil,
       lsWbCycles:  Seq[Long] = Nil
   ) {
@@ -462,7 +466,18 @@ trait CoreBenchHarness extends AnyFunSuite {
                           copybackDtt: Boolean = false,
                           expectedStoreDrains: Int = 0,
                           mmu: Option[MmuSetup] = None,
-                          prepMem: MemHandles => Unit = _ => ())
+                          prepMem: MemHandles => Unit = _ => (),
+                          // Back the D-side memory with ZERO-filled storage instead of
+                          // AxiMemModel's default `SparseMemory()`, whose freshly-allocated
+                          // pages are PRNG-FILLED. Any "chase" kernel whose dependency chain
+                          // assumes the loaded value is 0 has a PREMISE that is silently false
+                          // under the default memory: the address register jumps to garbage,
+                          // the chain walks random addresses (or faults, under an MMU), and
+                          // the differential reports a confident number for a run that never
+                          // did what the kernel claims. Kernels that depend on loaded values
+                          // MUST set this, and MUST additionally assert the premise held --
+                          // see `assertChasePremise`.
+                          zeroFillData: Boolean = false)
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
@@ -506,6 +521,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
       val traceLines = ArrayBuffer.empty[String]
+      val ldCmdAddrs  = ArrayBuffer.empty[Long]  // D$ load physical addresses (premise check)
       val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
       val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
@@ -728,7 +744,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         }
         if (dut.lsEu.logic.sq.io.fwd.rsp.hit.toBoolean) sqFwdHitCycles += 1
         if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
-            dut.dcache.logic.loadCmdPort.ready.toBoolean) ldCmdCycles += telemCycle
+            dut.dcache.logic.loadCmdPort.ready.toBoolean) {
+          ldCmdCycles += telemCycle
+          ldCmdAddrs  += (dut.dcache.logic.loadCmdPort.payload.paddr.toLong & 0xffffffffL)
+        }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
         histo += macrosThisCycle
@@ -737,7 +756,8 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       // Attach memories (I-cache program; zeroed D-cache + TLB walker memories).
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg)
+      val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg,
+        if (k.zeroFillData) new ConstFillSparseMemory(0.toByte) else null)
       val ptmem     = AxiMemModel.attachFull(dut.dtlb.walkerAxi, cd, memCfg)
       val itlbPtmem = AxiMemModel.attachFull(dut.itlb.walkerAxi, cd, memCfg)
 
@@ -847,7 +867,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,
         flushToCommit.toVector,
-        ldCmdCycles.toVector, ldRspCycles.toVector, lsWbCycles.toVector)
+        ldCmdCycles.toVector, ldCmdAddrs.toVector, ldRspCycles.toVector, lsWbCycles.toVector)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
