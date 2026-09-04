@@ -455,8 +455,21 @@ descriptor half is reported as a measurement in its own right (§6.3.1).
 | `MicrobenchSpec`, `l2:5:70`, memory+mmu+mmuloc, both arms | PASS |
 | `IpcBenchSpec`, both arms + both bisect points | PASS, sanity bounds hold |
 | timing-source validation V1/V2/V3 | PASS on both arms (zero-latency; see §2 caveat) |
+| `make test-fast` (`sbt fastTest`) | **PASS** — 339 succeeded, 0 failed, 2 ignored |
+| `ExecuteLockStepSpec` | **PASS** — 509 succeeded, 0 failed, 1 ignored |
 | `git diff 5e3fe4e..HEAD -- src/main` | **empty** |
 | synth gate | **not run, not required** (test-only change) |
+
+Both sanity suites are green — and note that **neither could be run on `5e3fe4e`
+at all** before §5.1, because the test tree did not compile. This is the first
+green `ExecuteLockStepSpec` on this branch since `2db5bd3` landed.
+
+### 8.1 Rebase note
+
+`fmax-closure-fanout` advanced to `ede358f` while this work was in flight. That
+commit is **docs-only** (`docs/superpowers/specs/2026-09-04-p137-three-fix-bitstream-boot-test.md`,
++344 lines, no other file), so this branch rebases onto it cleanly and none of the
+measurements are affected.
 
 ## 9. Reproducing
 
