@@ -2240,8 +2240,37 @@ class DcachePlugin(val socketMerged: Boolean = false,
     maintErrorReg := False
     maintErrorReg.simPublic()
 
+    // ── TCR.P (8 KB pages), task #195 follow-up / Part 131 ─────────────────────
+    // PAGE-scope CPUSHP/CINVP must cover the page as sized by TCR.P, not a fixed
+    // 4 KB block (MC68040UM §4: the page-scope operand is "the page containing the
+    // address", and the page size is a TC property). Task #195 threaded TCR.P
+    // through the table walker, both TLBs, LSU physical-address formation and
+    // PTEST, but DcachePlugin -- which had no MMU handle at all -- was missed, so
+    // on an 8 KB-page machine a CPUSHP covered only the 4 KB half containing the
+    // operand address. Measured live on the boot path (docs spec 2026-09-04
+    // "covering flush and page cache mode", §5.1): 3 of 20 consecutive ROM
+    // `cpushp bc,(a1)` invocations asked for a range that straddles the 4 KB
+    // boundary we stopped at, all in low RAM on CM=01 copyback pages.
+    //
+    // `host.get` (optional) mirrors IcachePlugin.scala:144-145 exactly: a standalone
+    // D-cache DUT with no MmuControlPlugin wired resolves to None -> `False` = 4 KB
+    // pages, i.e. bit-for-bit the pre-fix behaviour for every existing test. Reading
+    // the service through the `logic` Handle is what makes this safe against the
+    // cross-Fiber-task ordering race documented at MmuControl.scala:55-88 -- the
+    // getter BLOCKS this build body until MmuControlPlugin's own body has run, so
+    // `is8K` is never a Scala-null here. MmuControlPlugin's build body reads nothing
+    // from `host`, so this cannot deadlock.
+    val mmuCtrl = host.get[m68k040.services.MmuControlService]
+    val is8K    = mmuCtrl.map(_.pageSize8K).getOrElse(False)
+
     val maint = new Area {
       val cmd     = Reg(CacheMaintCmd())
+      // TCR.P sampled at command accept, so a walk that spans hundreds of cycles
+      // uses ONE consistent granule end-to-end (a MOVEC to TC cannot retire while
+      // the maintenance sysOp is in flight, but pinning it makes that independent of
+      // that argument) and so the CHECK-stage comparator sees a LOCAL register
+      // rather than a long cross-plugin route into its critical path.
+      val cmdIs8K = Reg(Bool()) init False; cmdIs8K.simPublic()
       val walkSet = Reg(UInt(setBits bits))
       val lastSet = Reg(UInt(setBits bits))
       val curWay  = Reg(UInt(wayBits bits))
@@ -2285,6 +2314,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             val tgtSet = p.addr(offBits + setBits - 1 downto offBits)
             val isLine = p.scope === U(1, 2 bits)
             cmd     := p
+            cmdIs8K := is8K
             walkSet := Mux(isLine, tgtSet, U(0, setBits bits))
             lastSet := Mux(isLine, tgtSet, U(sets - 1, setBits bits))
             curWay  := 0
@@ -2329,13 +2359,23 @@ class DcachePlugin(val socketMerged: Boolean = false,
           walking := True
           val target = cmd.addr
           // Line scope: this exact line (set already fixed to the target set, but
-          // compare it anyway so the predicate reads standalone). Page scope: the
-          // 4K page number == paddr[31:12]; with tag = paddr[31:11] that is
-          // tag[tagBits-1:1]. A 4K page spans every set (256 lines over 128 sets),
-          // so Page and All both walk the whole array. All scope: everything.
+          // compare it anyway so the predicate reads standalone).
+          //
+          // Page scope: the page number, sized by TCR.P (`cmdIs8K`, latched at accept).
+          // With lineBytes=16 and sets=128 the tag is paddr[31:11], so
+          //   4 KB page number == paddr[31:12] == tag[tagBits-1:1]
+          //   8 KB page number == paddr[31:13] == tag[tagBits-1:2]
+          // Expressed as one wide compare plus a conditional extra bit rather than a
+          // Mux of two comparators: `pageHiMatch` is the 8 KB predicate, and in 4 KB
+          // mode it is additionally qualified by paddr[12] (== tag[1]). A page of
+          // EITHER size spans every set (256 or 512 lines over 128 sets), so Page and
+          // All both walk the whole array; only the tag-prefix predicate differs.
+          // All scope: everything.
           val lineMatch = (walkSet === target(offBits + setBits - 1 downto offBits)) &&
                           (rdTag(curWay) === target(31 downto offBits + setBits))
-          val pageMatch = rdTag(curWay)(tagBits - 1 downto 1) === target(31 downto 12)
+          val pageHiMatch = rdTag(curWay)(tagBits - 1 downto 2) === target(31 downto 13)
+          val pageLoMatch = rdTag(curWay)(1) === target(12)
+          val pageMatch   = pageHiMatch && (cmdIs8K || pageLoMatch)
           val scopeHit  = Mux(cmd.scope === U(1, 2 bits), lineMatch,
                           Mux(cmd.scope === U(2, 2 bits), pageMatch, True))
           val resident  = rdValid(curWay)
