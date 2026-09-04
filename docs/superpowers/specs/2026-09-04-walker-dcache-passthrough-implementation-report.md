@@ -298,7 +298,7 @@ session. Nothing is inherited from a quoted figure.
 |---|---|---|---|
 | `make test-fast` (= `sbt fastTest`) | 341 run, **341 pass, 0 fail**, 2 ignored, 215 suites | 339 run, **338 pass, 1 fail**, 2 ignored, 215 suites | −2 tests, 1 known flake |
 | `m68k040.mmu.* m68k040.ls.* m68k040.cache.*` | 328 run, 317 pass, **11 fail**, 45 suites | 330 run, 319 pass, **11 fail**, 46 suites | +2 tests, **failure set byte-identical** |
-| `ExecuteLockStepSpec` (run separately — it is excluded from `test-fast`) | not re-run | **505 pass, 0 fail**, 1 ignored | green |
+| `ExecuteLockStepSpec` (run separately — it is excluded from `test-fast`) | full run not taken; the one test that mattered checked individually (§5.4) | **505 pass, 0 fail**, 1 ignored | fully green, hence no worse than any baseline |
 | 200-seed fuzz sweep (`tools/fuzz/sweep.sh 0 200 25 20`) | 3 (seeds 80, 109, 127) | **3 — seeds 80, 109, 127** | **unchanged; the bar was "must not rise"** |
 | `WalkerDescriptorCoherencySpec` | 0/2 by construction | **2/2** | the acceptance gate |
 
@@ -482,8 +482,12 @@ harness fix.
 
 ### Not run, and named as such
 
-- **The postroute synth gate.** §8 — a committed launcher, deliberately not a background
-  process. This is the one gate this work has not passed.
+- **A full baseline `ExecuteLockStepSpec` run.** Only the single test that regressed was
+  run on the baseline (§5.4). The branch is *fully* green (505/505), so it is no worse
+  than any baseline by construction, but the brief mentions a "known pre-existing pair"
+  in that suite and this session did not reproduce or characterise it.
+- **The postroute synth gate result.** §8 — launched, queueing on the mutex behind another
+  agent's JVMs at the time of writing. This is the one gate this work has not passed.
 - **Ported-corpus sweep.** Outside the stated scope.
 - **Any boot-impact claim.** None is made. Nothing here ran on hardware; the SD card, the
   JTAG lease and the board were not touched.
@@ -612,12 +616,29 @@ delta this change causes must be read against a fresh arm-A number rather than a
 the sign-off.
 
 **If the change appears to cost timing, the net-renaming control is mandatory before
-attributing it.** Measured on this very branch's parent: 86 % of one fix's apparent
-8.3 MHz regression was SpinalHDL line-number-derived net renaming that any edit to a file
-causes, and only 14 % was real logic. The control here is the same
-`LsEuPlugin.scala`/`TableWalker.scala`/TLB-plugin sources with the new logic neutralised —
-`ldOwner` tied to `CORE` and `walkLdReq` tied `False`, which constant-folds every walker
-leg away while leaving every `when_LsEuPlugin_lNNNN` net name byte-identical.
+attributing it — and it is already built and rebased onto the same HEAD, so it is one
+command away.** Measured on this very branch's parent: 86 % of one fix's apparent 8.3 MHz
+regression was SpinalHDL line-number-derived net renaming that any edit to a file causes,
+and only 14 % was real logic.
+
+The control is branch **`measure/walker-dcache-netname-control`**: the real change with
+`walkLdReq`/`walkStReq` tied `False` at **identical line numbers**, so every
+`when_LsEuPlugin_lNNNN` net name is byte-identical to the real arm while synthesis
+constant-propagates the tie-off — no walker ever requests, `ldOwner`/`stOwner` never leave
+`CORE`, and every walker mux leg plus the whole ownership FIFO folds away.
+
+```
+arm A = bb3bca1                                (baseline logic, baseline names)
+arm B = measure/walker-dcache-netname-control  (baseline logic, change   names)  <- control
+arm C = feat/walker-dcache-passthrough         (change   logic, change   names)
+```
+
+`(A → B)` is pure renaming; `(B → C)` is the real logic cost. Run it with the same
+launcher:
+
+```bash
+synth/run_walker_dcache_gate.sh measure/walker-dcache-netname-control control
+```
 
 **Honest prior.** The revalidation's R8 assessment stands and is if anything stronger now:
 the netlist is route-dominated with ten near-tied path families inside a 0.053 ns band, and
