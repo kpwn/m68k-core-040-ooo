@@ -343,6 +343,101 @@ independent loads pipeline at 1.5 cycles, dependent-load latency is a strong can
 the dominant term in the 0.655 aggregate IPC — but I did **not** measure that attribution,
 so it stays a hypothesis.
 
+### 3.2c The hit path against the 1-cycle target / 2-cycle ceiling
+
+**Design target (project owner):** *"dcache hit path needs to be very fast; 1 cycle in the
+L1D hit and TLB hit case would be great; 2 is our maximum."*
+
+#### First: is the hit path even the binding constraint?
+
+Yes. Independent loads sustain **1.50 cycles** each against **18.74** dependent (§3.2a).
+The path is **pipelined, not serialised**, so throughput is not the limiter and the
+**latency of the hit path is the binding constraint.** Had independent loads also cost ~11,
+the budget would have been the wrong thing to chase; it is not.
+
+#### The hit path, isolated from the surrounding overhead
+
+The budget is on the *hit path*, so it must be reported separately from load-to-use.
+Splitting the 16-cycle trace at the two boundaries that matter — address formed, and data
+returned:
+
+| Segment | Cycles (trace) | Count |
+|---|---|---|
+| Front-end: issue ctx + registered operands (P1) | 144 | 1 |
+| **HIT PATH: address formed → data returned** | **145 → 155** | **10** |
+| Completion + writeback/wakeup | 156 | 1 |
+| Wakeup → next dependent issue | 157–159 | 4 |
+| **Total load-to-use** | 144 → 160 | **16** |
+
+**Hit path = 10 cycles against a target of 1 and a ceiling of 2 — 5× over the maximum.**
+(Reporting load-to-use's 16 against the budget would overstate the overrun; 6 of those 16
+cycles are issue/writeback/wakeup, which the budget does not cover.)
+
+#### Every cycle in the hit path, and whether it is load-bearing
+
+| Cycle | Stage | What it does | Load-bearing? |
+|---|---|---|---|
+| 145 | P2 | DTLB request + L1D virtual-set probe launched | work |
+| 146 | P2T | translation response captured | work (TLB) |
+| 147 | P3 | resolved PA → store-queue query | work (SQ disambiguation) — **FMax split #2** |
+| 148 | P4 | SQ forward response → resolve / cache launch | **FMax split #3** |
+| 149 | C0 | D-cache accepts the address | **FMax split #4** (EA registered at the cache boundary) |
+| 150 | C1 | tag compare + way select | **FMax split #5** (registered hit-detect) |
+| 151 | C2 | byte-lane extract | **FMax split #6** (S1→S1a/S1b) |
+| 152–153 | — | **nothing active** | **BUBBLE (2)** |
+| 154 | C1 | tag compare + way select **again** | duplicate pass |
+| 155 | C2 + RSP | extract again; **data returned** | duplicate pass |
+
+**The D-cache array access itself is not the problem.** `DcacheSpec.scala:2241` pins a load
+hit at 2 cycles after accept, and that 2-cycle array access **already meets the ceiling**.
+The 10-cycle hit path is: 2 cycles of TLB, 2 cycles of store-queue disambiguation, 1 cycle
+of cache-boundary accept, 2 cycles of array access, and **4 cycles of bubble + duplicated
+pass**.
+
+#### How many of the 10 are FMax-motivated stage boundaries
+
+**Five of the ten cycles in the hit path are stage boundaries inserted to buy FMax**
+(splits #2–#6 in the table above; a sixth, the AGU base register, and a seventh, the
+completion register, sit outside the hit path). Each was accepted in-source with the same
+phrase — *"latency-agnostic; lock-step absorbs the +1"* — which is true of the lock-step
+verification harness and **not** of IPC. Only one of the six ever had its IPC cost measured.
+
+That gives the actionable sentence: **5 of the 10 hit-path cycles are FMax-motivated stage
+boundaries, and a further ~4 are a bubble plus an apparently duplicated cache pass. The
+irreducible work — TLB lookup plus tag/data/hit — is roughly 2–4 cycles.**
+
+#### The tension, named but not resolved here
+
+A 1-cycle VIPT hit with the TLB in parallel is a classically tight timing path — that is
+precisely *why* these splits were taken. Collapsing them will cost FMax on a design
+currently near 198 MHz postroute. **This is the owner's call, and the number they need is:**
+
+> **Estimate: collapsing the hit path toward the 2-cycle ceiling means undoing ~5 splits and
+> plausibly costs on the order of 30–40 MHz, returning the design to roughly 157–167 MHz.**
+
+Basis, and its weakness: only one split has a measured delta — Slice 2 bought **+8.35 MHz**
+(167.029 → 175.377) for +1 cycle and −0.8% IPC. Scaling that single data point across five
+splits gives ~40 MHz. Independently, the "before" figures quoted in the split commentary
+cluster in the same place (FMax #3's path was *"the 25-level / 6.349 ns critical path
+(157 MHz)"*), which is a consistency check rather than a second measurement. **This is an
+estimate from design-doc deltas, not a build result — no Vivado build was run.** The two
+sources agreeing at ~157–167 MHz is encouraging but they are not independent.
+
+Worth noting before anyone pays that price: **~4 of the 10 cycles (the bubble and the
+duplicated pass) are not FMax splits at all.** If those are recoverable they cost no
+frequency, and they alone would take the hit path from 10 to ~6. That is the cheap half of
+the problem and should be understood before trading away 40 MHz for the expensive half.
+
+**Caveat on the duplicated pass.** The design is named *vipt-**parallel**-dcache*, and the
+docs describe the DTLB request and the L1D virtual-set probe being launched **in parallel**
+at P1/P2. The trace does not obviously show that: the TLB resolves at 145–146 and the tag
+compare runs at 150, four cycles later, with a second pass at 154. Either my probes
+(`ldS1Valid`/`ldS2Valid`) are observing the tagged resolve rather than the parallel probe,
+or the TLB and tag accesses are not actually overlapping as designed. **I did not confirm
+which, and the distinction matters a great deal** — if the VIPT parallelism is not being
+realised, that is a larger and cheaper win than any stage collapse. It is the single most
+valuable follow-up from this whole exercise.
+
 ### 3.3 Branch misprediction
 
 | Measurement | Cycles | Method |
@@ -524,19 +619,18 @@ across with only the counter read replaced.
 
 ## 6. Standing cautions for anyone quoting these numbers
 
-1. **The absolute DRAM figure is a model input, not a measurement.** `dramCycles` is
-   unmeasured in both repos. Quote the L1D hit (11.0), the L2 hit (20.1), and from the
-   sweep the slope (~1.00, the core hides none of a dependent miss) and the intercept
-   (**28.5 cycles**, the real core-side fixed miss cost). Do not quote 98.242 as a DDR
-   latency.
-2. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
+1. **The combined L1D-hit + TLB-hit path is ~10 cycles against a 1-cycle target and a
+   2-cycle ceiling** (§3.2c). The D-cache *array* access is 2 cycles and is within budget;
+   the overrun is everything wrapped around it.
+2. **Load-to-use is 17-19 cycles, not the 11.0 first reported** (§3.2a). Of a 16-cycle
+   dependent load, ~11 cycles are designed pipeline depth and **~5 are bubbles**.
+3. **Latency is the problem, not throughput.** Independent loads sustain **1.50 cycles**
+   each (12.5x better than dependent). The path is pipelined, not serialised.
+4. **The absolute DRAM figure is a model input, not a measurement.** `dramCycles` is
+   unmeasured in both repos. From the sweep, quote the slope (~1.00) and the intercept
+   (**28.5 cycles** core-side fixed miss cost). Do not quote 98.242 as a DDR latency.
+5. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
    here always means *cold, first touch*.
-3. **Latency ≠ throughput on this core.** `mulu.w` is 12 cycles latency and 1.85 cycles
-   throughput; a **load is 18.7 dependent and 1.5 independent (12.5x)**. Always state
-   which a number is.
-6. **Load-to-use is 17-19 cycles, not the 11.0 first reported** (§3.2a). Of a 16-cycle
-   dependent load, ~11 cycles are designed pipeline depth and **~5 are bubbles** located
-   at two named points in the trace.
-4. **Aggregate IPC 0.655 is not a like-for-like delta against the historical 0.53.**
-5. **There is no DTLB walk number.** If you need one, §4.1 has the reproduction and the
+6. **Aggregate IPC 0.655 is not a like-for-like delta against the historical 0.53.**
+7. **There is no DTLB walk number.** If you need one, §4.1 has the reproduction and the
    open question.
