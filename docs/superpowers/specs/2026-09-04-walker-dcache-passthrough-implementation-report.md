@@ -617,6 +617,19 @@ below 2.5 GB, (3) checks the ref out into its own worktree, (4) regenerates
 `POSTROUTE_ROUNDS=9 vivado -mode batch -source synth/impl_FullCore.tcl` recipe for both
 arms, and (6) writes `synth/walker_dcache_gate_<label>.summary`.
 
+**Launched detached.** The run is `setsid`-detached (its own session leader), so it
+survives the session that started it — a plain `nohup` background job does not, and losing
+one to that has already cost this campaign an experiment. Results land in
+`synth/walker_dcache_gate_baseline.summary` and
+`synth/walker_dcache_gate_walker-dcache.summary`; the raw Vivado transcripts sit beside
+them as `*.out` and are gitignored. If the run is gone, the launcher is committed and one
+command restarts it from scratch.
+
+*(Operational note, second instance of a documented trap: `pkill -f run_walker_dcache_gate`
+**self-matches** — the pattern appears in the killing shell's own command line — and kills
+the shell issuing it. Use `pkill -f '[r]un_walker_dcache_gate'`. This is the same failure
+mode the brief records for `pgrep -af 'vivado.*-mode batch'`, and it bit here too.)*
+
 **When reporting the result, quote the `clk` domain explicitly.** `clk` is the only clock
 in this netlist and `SIGNOFF_200MHZ_*` is re-derived at a real 5.000 ns; the headline row
 of `timing_summary.rpt` is not the CPU clock and has misled this campaign twice.
