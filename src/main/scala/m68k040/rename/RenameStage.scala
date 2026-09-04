@@ -135,8 +135,22 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // includes freeReady) and re-present the SAME packet next cycle, dispatching it
     // twice (the duplicate-instruction bug). Tying valid to freeReady keeps the
     // upstream feed.fire and the downstream dispatch.fire in lock-step.
-    uopsPort.valid := du.uops.valid && initDone && freeReady
-    du.uops.ready  := initDone && uopsPort.ready && freeReady
+    // ── Tier-1 rename halt (two-tier reschedule, 2026-09-04) ───────────────────
+    // Default-driven False (allowOverride) so the wiring plugin can OVERRIDE it from
+    // `RobPlugin.logic.earlyPend` (full core); driving it from host[RobPlugin] here
+    // would create a Fiber build-order cycle, exactly like `pipeFlush` below.
+    //
+    // While an early (EU-resolution-time) branch reschedule is pending, rename must
+    // FREEZE — no freelist pop, no RAT write, no ROB allocation — while the frontend
+    // refills down the corrected path. This is deliberately expressed as one more
+    // term on the SAME gate as `freeReady`, and for the same reason that comment
+    // gives: it must gate the OUTPUT valid as well as the INPUT ready, or dispatch
+    // could fire on `uopsPort` while `du.uops` does not, dispatching the same packet
+    // twice. Nothing downstream needs rename to advance in order to retire, so this
+    // cannot deadlock; see RobPlugin's `earlyPend` doc comment for the full argument.
+    val allocHalt = Bool(); allocHalt.allowOverride; allocHalt := False
+    uopsPort.valid := du.uops.valid && initDone && freeReady && !allocHalt
+    du.uops.ready  := initDone && uopsPort.ready && freeReady && !allocHalt
     val fire = du.uops.fire
     val uop1Sig = du.uops.valid && du.uop1Valid
 

@@ -478,6 +478,13 @@ class IpcBenchSpec extends AnyFunSuite {
       var maxSqAccepted     = 0
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
+      // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
+      // simPublic ROB signals; they do not perturb the DUT.
+      var t1EarlyFires      = 0   // Tier-1 early PC redirect pulses
+      var t1PendCycles      = 0   // cycles rename was frozen by Tier 1
+      var t1Suppressed      = 0   // Tier-2 flushes that KEPT the refetched frontend
+      var t2Flushes         = 0   // doFlushReg pulses
+      var t2BranchRedirects = 0   // retire-gated branch mispredict redirects
       var ftbApplies        = 0
       var ftqConfirms       = 0
       var ftqMismatches     = 0
@@ -504,6 +511,11 @@ class IpcBenchSpec extends AnyFunSuite {
       }
 
       cd.onSamplings {
+        if (dut.rob.logic.earlyFire.toBoolean) t1EarlyFires += 1
+        if (dut.rob.logic.earlyPend.toBoolean) t1PendCycles += 1
+        if (dut.rob.logic.earlySuppressFe.toBoolean) t1Suppressed += 1
+        if (dut.rob.logic.doFlushReg.toBoolean) t2Flushes += 1
+        if (dut.rob.logic.branchRedirect.toBoolean) t2BranchRedirects += 1
         if (dut.fa.logic.applyNow.toBoolean) ftbApplies += 1
         if (dut.fa.logic.ftqConfirmFire.toBoolean) ftqConfirms += 1
         if (dut.fa.logic.ftqMismatch.toBoolean) ftqMismatches += 1
@@ -688,6 +700,8 @@ class IpcBenchSpec extends AnyFunSuite {
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines)
+      println(s"[tier1] ${k.name} earlyFire=$t1EarlyFires pendCyc=$t1PendCycles " +
+        s"suppressed=$t1Suppressed doFlush=$t2Flushes branchRedirect=$t2BranchRedirects")
       if (k.copybackDtt) {
         println(s"[store-path] lsIssue=$lsIssueFires sqAlloc=$sqAllocFires fastAlloc=$fastSqAllocs " +
           s"sqDrainFire=$sqDrainFires dcStoreFire=$dcStoreFires ack=$dcStoreAcks " +
