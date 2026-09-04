@@ -254,12 +254,18 @@ parameter only reached the I-fetch attach.
 `p127 CONTROL` measures the widest single precise-drain window (`preciseDrainBusy`,
 launch through one cycle past resolution) and asserts a floor **and** a ceiling:
 
-| D-side preset | widest precise-drain window |
+| D-side preset | widest precise-drain window (two independent runs) |
 |---|---|
-| `zeroLatency` (what the corpus has always run) | ~2 cycles |
-| `l2DramFast` | **14** cycles |
-| `storeSlow` | **71** cycles |
-| `storeVerySlow` | **128** cycles |
+| `zeroLatency` (what the corpus has always run) | **9 / 9** cycles |
+| `l2DramFast` | **14 / 13** cycles |
+| `storeSlow` | **71 / 72** cycles |
+| `storeVerySlow` | **128 / 130** cycles |
+
+(The ±1–2 spread between runs is why the assertion is a band, not an equality.)
+
+(The `zero` row's ceiling was initially guessed at 8 and the control **caught it** —
+the measured baseline is 9. That is the control behaving as intended: a bound that can
+only be satisfied by measuring, not by remembering.)
 
 The board runs ~68 cycles per loop iteration, so `storeSlow` brackets it. The ceiling
 on the `zero` row is what makes this a measurement rather than a claim: the
@@ -448,9 +454,11 @@ simulation), the surviving families are:
 
 1. **Implementation-level infidelity in the deployed bitstream.** The signal the
    evidence points at (`psrcAValid` / `psrcA`) is delivered to the LS EU from
-   `IssueQueuePlugin`'s cold-payload store — `Mem(RenamedUop(), 64) × 2` banks with
-   `ram_style = "distributed"`, i.e. a wide LUTRAM array read combinationally in the
-   issue path. A synthesis/timing/placement fault on that structure would be invisible
+   `IssueQueuePlugin`'s cold-payload store. Elaboration reports it as
+   **`IssueQueuePlugin_logic_coldWay0` / `coldWay1 : Mem[64 x 479 bits].readAsync`,
+   `ram_style = "distributed"`** — ~61 kbit of LUTRAM across two banks, read
+   **combinationally** in the issue path by five select ports, and SpinalHDL warns it
+   "can only be write first into Verilog". A synthesis/timing/placement fault on that structure would be invisible
    in every RTL simulation, deterministic for a given schedule, and would corrupt an
    operand while leaving scheduling (wakeups, ordering, retirement) perfect — which is
    exactly the observed symptom shape. **This is not established**; it is the family
@@ -505,10 +513,23 @@ against.
 | `StoreQueueSpec` "Part 127 (b1)" | **FAILS on unmodified RTL** (baseline worktree), passes with the fix |
 | `StoreQueueSpec` "Part 127 (b2)" | passes |
 | `LsEuFastPreciseSpec` "Part 127" | **FAILS on unmodified RTL** (`push=0 ready=0, expected exactly one outstanding`), passes with the fix |
-| `ExecuteLockStepSpec` (full suite: p124 / p126 / p127, the mispredict and RAS-recovery cases) | see the merge note below |
-| `BsrFlushSkipSpec` | see the merge note below |
-| ported `flush_younger_*` (4 cases) | see the merge note below |
-| 200-seed fuzz sweep | see the merge note below |
+| `ExecuteLockStepSpec` (full suite — 507 cases: p124 / p126 / the 30 new p127, the mispredict and RAS-recovery cases, the whole ISA corpus) | **504 passed / 3 failed.** All three failures reproduce on the **unmodified-RTL baseline worktree**, i.e. they are pre-existing on `fmax-closure-fanout` and are **not** regressions. See the note below. |
+| `BsrFlushSkipSpec` | **17 / 17** |
+| `RobPluginSpec` | 44 run, 1 failed — the flake row above |
+| ported `flush_younger_bsr_reexec` / `_bsr_exc_reexec` / `_bsr_tree_reexec` / `_rts_bsr_reexec` | **4 / 4** |
+| 200-seed fuzz sweep (`FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200`) | see the merge note below — the pre-existing count is **3** (seeds 80, 109, 127) and must not rise |
+| `GenFullCoreSynthVerilog` (synthesizable elaboration) | clean, 20.4 MB netlist emitted |
+
+**Two PRE-EXISTING `ExecuteLockStepSpec` failures on this branch**, found while
+running this bar and confirmed on unmodified RTL at the branch point (`afbabdd`).
+Neither is caused by this Part; both are reported here because the branch is not
+green and nobody appears to have recorded them:
+
+* *"lock-step: mispredicted branch with a wrong-path UNMATCHED bsr does not leak a
+  phantom RAS entry — rollback-on-flush fix"* — `got count=1`, i.e. the phantom RAS
+  entry the test's own name says was fixed **is leaking again**.
+* *"lock-step: CMP2.W (d8,An,Xn) indexed bounds pointer"* —
+  `Divergence(7, pc: dut=0x6a19e51c oracle=0x40800020)`, a wild committed PC.
 | FMax | **deliberately not gated.** Per standing instruction the OOC gate has a measured 0.919 ns noise floor, three times the deltas read off it, and two prior OOC "regressions" did not survive postroute. The RTL delta here is one extra `+1` term on a flush-cycle pointer assignment, one 8-entry 1-bit `Reg` vector, and two combinational outputs. |
 
 > Every "fails on unmodified RTL" above was verified in a **separate baseline
