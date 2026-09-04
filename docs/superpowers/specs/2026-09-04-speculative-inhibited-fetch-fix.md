@@ -218,16 +218,83 @@ guess at — nothing detects it and the result is silent instruction mis-framing
 I-side `MmioCover` needs the 64-bit fetch window and the 2-beat predecode dwell contract to
 change together. Not attempted.
 
-### 2.6 The MMU table walker — noted, not fixed
+### 2.5b Compliance against the absolute invariant, per requester
 
-The audit's secondary finding stands untouched, exactly as scoped: the walker launches
-from a fully speculative point (`LsEuPlugin.scala:2522`), its D-side launch omits `umFlush`
-(`DtlbPlugin.scala:322`) and its I-side launch has no flush term at all
-(`ItlbPlugin.scala:251`), `TableWalker.scala:40-47` has no abort port, and descriptor reads
-are fixed 16-byte line-aligned with no `MmioCover` arm (`TableWalker.scala:111,114`). It
-was never shown to reach MMIO and nothing here changes it. It did not fall out of this
-work naturally, and it is a different fix (a flush term plus an abort port) in a different
-module.
+The governing rule for this work is stated as an absolute: **no speculative access to a
+cache-inhibited page, ever, by any requester.** That is stronger than "the I-side demand
+fetch is fixed", so every requester that can drive an AR is enumerated here with a verdict.
+Two of them do **not** comply and are deliberately left as separate, scoped work.
+
+| Requester | Complies? | Evidence |
+|---|---|---|
+| **I-side demand fetch** | **YES (this change)** | `inhibitedSpecBlock` refuses the command at `cmdPort.ready` using the LIVE `xlate.rsp.cacheMode`, i.e. cacheability is resolved before anything is accepted, so no MSHR is allocated and no AR can be armed. Measured: `spec-mmio I-side THE RULE` 0 window ARs, and the revert control puts them back. |
+| **I-side prefetcher, steady state** | YES | Frontier seeded only from a resolved, non-faulting, **cacheable** demand (`IcachePlugin.scala:1457-1467`) and clamped to that demand line's own 4 KiB physical page (`:1294-1295`); rule P1, "an INHIBITED page is never prefetched". |
+| **I-side prefetcher, "cycle T" residual** | **NO — narrowed, not closed** | See below. |
+| **D-side loads** | YES | `LsEuPlugin.scala:2182-2229` `p4LaunchOk`; audited exhaustively on every path to `DcachePlugin.scala:1877`, and measured by the audit's `spec-mmio D-side` probe with a positive control. |
+| **D-side stores / SQ drain** | YES | Non-speculative by construction: drains at the SQ head with `committed(head)` (`StoreQueue.scala:426`); inhibited stores never allocate. |
+| **Exception-unit loads** | YES | `excLoadCmdValid => excActive` (`LsEuPlugin.scala:2881`); the exception is already committing. |
+| **MMU table walker** | **NO — structural, unfixable without new plumbing** | See §2.6. |
+
+**The prefetcher's cycle-T residual.** `IcachePlugin.scala:2153-2167` documents, and
+`IcachePrefetchSpec`'s "P1 residual (cycle T)" test *proves and bounds*, a one-cycle window
+in which an accepted command whose live verdict is FAULT **or INHIBITED** can allocate at
+most ONE speculative line — inside `pfDemandLine`'s own 4 KiB page — and read it over AXI.
+Because the window is seeded only from a cacheable demand, reaching a genuinely inhibited
+line requires a live same-page cacheability transition (an ATC flush or descriptor rewrite
+landing between the seed and the fetch).
+
+This change **narrows** that residual's INHIBITED arm without closing it: post-fix, an
+inhibited command can only be accepted at all when `nonSpecFetch` holds, so cycle T now
+additionally requires a fully drained machine with a stale-but-valid frontier in the same
+page. **I did not prove it unreachable, and I am not claiming it is.** Closing it properly
+runs into the same three rejected closures the existing comment enumerates (all of which
+either put the live translation verdict back into the allocator enable cone — the exact arc
+M4 exists to delete — or kill the prefetcher outright), so it is a real scoping decision,
+not a detail, and it belongs in its own change.
+
+### 2.6 The MMU table walker — a definite violation, deliberately not fixed here
+
+**Asked directly — can the walker violate the invariant? YES, and structurally so.** This
+is a firmer answer than the audit's "not demonstrated", and it comes from reading the
+walker's own AR path rather than from its launch conditions.
+
+`TableWalker.issueRead()` (`TableWalker.scala:107-118`) is the walker's only AR driver:
+
+```scala
+io.axi.ar.payload.addr := (descAddr(31 downto 4) ## U(0, 4 bits)).asUInt
+io.axi.ar.payload.len  := U(0, 8 bits)
+io.axi.ar.payload.size := U(4, 3 bits)   // 16 bytes
+```
+
+There is **no cacheability term on it, and no input carrying one.** The only `CacheMode` in
+the entire module is `rCmode` (`:66`, `:209`, `:249`) — the cache mode the walker *extracts
+from the leaf page descriptor and reports back to the TLB* for the translated page. The
+walker never consults, and cannot consult, the cacheability of the addresses **it itself
+reads**: descriptor addresses come from unmasked `urp`/`srp` (`MmuControl.scala:119-120`)
+and a raw 28-bit next-base field (`MmuTypes.scala:63`), are never themselves translated,
+and are subject to no region check anywhere.
+
+So all three properties the invariant forbids hold simultaneously, by construction:
+1. **Speculative** — the triggering DTLB miss is raised at P2 on pipeline validity alone
+   (`LsEuPlugin.scala:2522`), with no ROB-head gate; the D-side launch omits `umFlush`
+   (`DtlbPlugin.scala:322`) and the I-side launch has no flush term at all
+   (`ItlbPlugin.scala:251`).
+2. **Unabortable** — no abort port (`TableWalker.scala:40-47`); once `io.start` pulses the
+   FSM runs `RD_ROOT → RD_PTR → RD_PAGE → FINISH` to completion.
+3. **Over-covering** — a fixed 16-byte line-aligned read, which is precisely the shape
+   `MmioCover`'s own doc comment says "touches four registers at once and fires
+   read-to-clear side effects on three the access never named".
+
+Reaching a device still requires a root pointer or descriptor aimed at device space, which
+remains undemonstrated — but that is a statement about the *page tables*, not about the
+core. The core offers no guarantee here at all, which is what the invariant demands.
+
+**Deliberately NOT fixed in this change**, per explicit instruction not to fix it blind.
+It is a genuinely different change in a different module: the walker needs (a) an
+attribute source for its own descriptor addresses — which does not exist today and is the
+substantial part — (b) a flush term on both launch sites, and (c) an abort port. Bolting
+any of those on without the first would be the same category error this fix exists to
+correct. Recommend scoping it as its own task.
 
 ---
 
@@ -318,9 +385,23 @@ tests.
 
 ### 4.4 200-seed fuzz
 
-`src/main` changed, so this was actually run rather than argued.
+`src/main` changed, so this was actually run rather than argued — the standing count is not
+unchanged by construction here.
 
-<!-- FUZZ RESULT -->
+```
+FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200 FUZZ_MINIMIZE=0 \
+  sbt 'testOnly m68k040.fuzz.FuzzLockStepSpec'
+
+[fuzz] sweep done: 200 seeds, 3 divergences, 0 generator failures
+[fuzz]   seed=80  [STEP] idx=79 reg D5: dut=0x00000000 oracle=0x0000007e
+[fuzz]   seed=109 [STEP] idx=64 pc: dut=0x7bca4112 oracle=0x4080013e
+[fuzz]   seed=127 [STEP] idx=70 pc: dut=0x3d973c90 oracle=0x4080015e
+```
+
+**3 divergences, on exactly the standing seeds 80 / 109 / 127.** No new divergence, none
+fixed, no generator failures. (The suite reports `failed 1` because its assertion demands
+zero divergences; the count and the seed set are the measurement.) The launcher is
+committed as `run_fuzz200.sh`.
 
 ### 4.5 Post-route synth gate
 
