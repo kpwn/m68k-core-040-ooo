@@ -30,6 +30,16 @@ new input forced to 4 KB the three 8 KB tests fail and the two 4 KB controls pas
 the granule widened unconditionally the two 4 KB controls fail and the 8 KB tests pass.
 Only the real fix passes all five.
 
+**Postroute synth gate: three arms, and the honest headline is a regression that is
+mostly not the fix's.** On the `clk` domain (the only clock in this netlist), the fix
+measures **WNS −0.294 ns / 188.893 MHz / 870 failing endpoints** against a
+**re-verified-in-session** `afbabdd` baseline of **−0.037 ns / 198.531 MHz / 73**. A
+third control arm — the fix's own netlist with `cmdIs8K` tied false, so it carries the
+fix's net names but the baseline's logic — lands at **−0.257 ns**, attributing **86 %
+of the swing to SpinalHDL line-number-derived net renaming** (any edit to
+`DcachePlugin.scala` causes it) and **−0.037 ns to the fix's actual logic**. §5.5 has
+the full attribution and states what that does *not* let me claim away.
+
 **This does not claim to fix the boot.** It is a real defect with measured exposure on
 the boot path, but the livelock it might contribute to did not reproduce on any of
 Part 130's three boots (all wedged elsewhere, in a 53C96 status poll at `0x40899706`,
@@ -295,9 +305,74 @@ rise.** The signatures are also unchanged in kind: seed 80 is the silent `D5` cl
 [fuzz] seed=127 DIVERGED[STEP]: idx=70 pc: dut=0x3d973c90 oracle=0x4080015e
 ```
 
-### 5.5 Full-core postroute synth gate
+### 5.5 Full-core postroute synth gate — **THREE arms, and the headline number needs its attribution**
 
-**SYNTH_RESULT_PLACEHOLDER**
+Postroute, not OOC (the OOC gate's ~0.919 ns noise floor is larger than the whole
+margin in question). `synth/impl_FullCore.tcl`, `IMPL_STRATEGY=postrouteN`,
+`POSTROUTE_ROUNDS` default 9, 5.000 ns sign-off, `xcku5p-ffvb676-2`, each arm holding
+`/var/tmp/m68k-ooo-vivado.lock` exclusively via `flock` so none overlapped another or a
+JVM. **Clock domain: `clk`** — and this netlist's `Clock Summary` lists *exactly one*
+clock (`clk`, 5.000 ns / 200 MHz). There is no `dbg_hub` domain in the OOC full-core
+netlist at all, so the `dbg_hub`-vs-`clk` confusion that misled this campaign earlier
+cannot arise here; every number below is `clk`.
+
+| arm | RTL logic | netlist net names | WNS (`clk`) | FMax | TNS | failing EPs | CLB LUTs |
+|---|---|---|---|---|---|---|---|
+| **A** baseline `afbabdd` | 4 KB | baseline | **−0.037 ns** | 198.531 MHz | −1.293 | 73 | 97 778 |
+| **B** control: the fix arm's netlist with `cmdIs8K := False` | **4 KB — identical to A** | **fix-arm** | **−0.257 ns** | 190.223 MHz | −25.353 | 390 | 99 401 |
+| **C** the fix | `TC.P`-selected | fix-arm | **−0.294 ns** | 188.893 MHz | −81.997 | 870 | 98 494 |
+
+**Arm A re-derives the stated baseline exactly** — −0.037 ns / 198.531 MHz / **73**
+failing endpoints, plateauing at round 4, matching the sibling's earlier-today
+measurement to the digit. So the baseline is verified in this session, and C's −0.294 ns
+is a real measured difference, not a mis-read.
+
+**What arm B is for, and what it settles.** Arm C is 8.3 MHz down, which is not
+credible as the cost of one 2-input AND on a maintenance-FSM comparator that runs a few
+hundred cycles per `CPUSHP`. Two facts pointed elsewhere before B was run: the fix arm's
+**top-100 worst paths contain zero maintenance-cone endpoints** (`grep -ci maint
+fullcore_slack_matrix.rpt` → 0; no `cmdIs8K`, no `pageMatch`), and its dominant limiter
+(`RobPlugin_logic_exc_fsFrameBase_reg[0]`, **68 of 100** paths, fanning into D-cache
+array address pins and DTLB `missReq` CEs) does not appear in the baseline's top-100 at
+all.
+
+The mechanism is SpinalHDL's naming: `when_DcachePlugin_lNNNN` net names are derived
+from **source line numbers**, so *any* insertion into `DcachePlugin.scala` — comments
+included — renames every downstream net. The two netlists differ by 883 diff lines, of
+which essentially all are such renames (`when_DcachePlugin_l2588` → `l2628`, etc.), and
+that changes what Vivado's placer does with a design the FMax-resilience postmortem
+already characterises as having *5-6 near-tied worst-path families*.
+
+Arm B isolates that exactly: it is arm C's source file with the single line
+`cmdIs8K := is8K` changed to `cmdIs8K := False`. Line count is unchanged, so **every
+`when_DcachePlugin_lNNNN` name is byte-identical to arm C** (verified by diffing the
+extracted name sets), while synthesis constant-propagates `cmdIs8K` to 0 and the page
+predicate folds back to exactly arm A's 4 KB compare. Arm B therefore has **arm A's
+logic and arm C's net names**.
+
+**Attribution:**
+
+* netlist-naming / placement perturbation alone (**B − A**): **−0.220 ns**, i.e. **86 %**
+  of the total −0.257 ns swing. Arm B carries *no 8 KB logic whatsoever* and still
+  loses 8.3 MHz.
+* the PAGE-granule logic itself (**C − B**): **−0.037 ns**, i.e. 14 % — the same
+  magnitude as the baseline's own WNS, and comparable to this flow's round-to-round
+  movement.
+
+Two corroborating details: arms B and C share the same dominant limiter family
+(`exc_fsFrameBase_reg[0]`, 80/100 and 68/100) which is *absent* from arm A's top-100 —
+so the family switch tracks the netlist, not the logic; and arm B uses **907 more LUTs
+than arm C** despite containing strictly less logic, which is only possible if the
+difference is synthesis/placement variance.
+
+**Stated plainly, without spin.** The fix as it stands measures **−0.294 ns /
+188.893 MHz / 870 failing endpoints on the `clk` domain, against a re-verified
+198.531 MHz baseline — a real 8.3 MHz postroute regression that a merge decision must
+account for.** The measured attribution says ~1.3 MHz of that is the logic and ~7.0 MHz
+is a placement outcome that any edit to this file would provoke and that a re-place
+(e.g. the `PLACE_DIRECTIVE=Explore` reseed campaign already queued) is the appropriate
+remedy for — but that remedy is *not measured here*, so it is a prediction, not a
+result. I am not claiming the regression away.
 
 ---
 
@@ -314,9 +389,16 @@ rise.** The signatures are also unchanged in kind: seed 80 is the silent `D5` cl
   defect might have contributed to was not on the board to observe.
 * **The full `sbt test`** (every suite including `SlowTest`/`BoardTest`) — not run; the
   brief's bar named specific suites and those were run.
-* **A second synth arm.** The `afbabdd` baseline is taken from the measurement a
-  sibling agent made earlier today under the identical flow, not re-run here. One
-  Vivado run per arm is not a distribution.
+* **Any repetition of a synth arm.** Three arms were run, but **one Vivado run each** —
+  that is a comparison, not a distribution. In particular the −0.037 ns attributed to
+  the fix's own logic (C − B) is a single-sample difference and could easily be zero or
+  worse on a reseed.
+* **Whether a re-place recovers the −0.220 ns netlist-naming loss.** Predicted, on the
+  strength of the B-vs-A attribution and the disjoint limiter families; **not measured**.
+  A `PLACE_DIRECTIVE=Explore` arm on the fix netlist would settle it.
+* **Whether a different code placement inside `DcachePlugin.scala` avoids the rename.**
+  It cannot: `when_DcachePlugin_lNNNN` names come from source line numbers, so any
+  insertion shifts every downstream name. Not worth attempting, and not attempted.
 * **`FuzzLockStepSpec` beyond 200 seeds**, and the ported-test corpus — out of scope.
 
 ---
