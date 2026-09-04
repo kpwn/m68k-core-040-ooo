@@ -505,11 +505,28 @@ path is the one the board actually runs) removed by one of the branches being me
 It strengthens the case for landing. **It does not fix the boot, and nothing here claims
 it does** — Part 127 SS0 is explicit that the wedge is not fixed.
 
-The whole simulation bar is green on it (SS2.4). **Merging is a coordinator decision
-and the only thing still outstanding is the postroute gate**, which waits for the
-Vivado slot. Correctness outranks FMax by standing instruction, so the postroute number
-will be reported as it comes out and the design will not be contorted for it. What that
-gate should look at first, per the two-tier design document: the `!allocHalt` term on
-the rename ready chain (a recorded co-critical arc family), then `earlyHit`'s 32-bit PC
-compare on the retire cone — the latter is defence-in-depth and can be dropped if it
-costs.
+The whole simulation bar is green on it (SS2.4) and the postroute gate is done
+(SS4b-4d). **Nothing is outstanding; merging is a coordinator decision, and it is a
+real decision rather than a formality**, because the two sides point opposite ways:
+
+* **For landing:** the bar is green, the fuzz count held at 3, and Part 127 removes a
+  measured permanent hang on the exact path the board runs.
+* **Against landing as-is:** it costs **5.107 MHz** postroute (198.531 → 193.424), and
+  `FAILED_AT_200` gets worse rather than better. Correctness outranks FMax by standing
+  instruction, so this is not a veto — but it is a 2.6 % clock loss against a +1.24 %
+  aggregate IPC gain, which for most code is a wash, and it is a first measurement of a
+  cost that had not been measured at all.
+
+Three shapes are available and the choice is not mine: land all three; land Part 127 and
+the `ArchLockStep` branch and hold the two-tier reschedule until its -2.34 MHz has an
+FMax-recovery pass; or land all three and open a follow-up against the -0.133 ns. The
+per-arm numbers in SS4c are there so that choice can be made on data.
+
+Also on the branch, all documentation: `7b81899` / `2b397cd` / `5ea4109` / `3ce8cf8` —
+this write-up, its SS6 retraction, the verification-bar fill-in, and the postroute
+results.
+
+Two extra worktrees are left in place for whoever picks this up, both committed and
+clean: `consolidate/twotier-only` (`$SCRATCH/wt-tt`, the attribution arm, with its
+routed reports in `synth/`) and `$SCRATCH/wt-p2base` (detached at `afbabdd`, the
+baseline arm's reports). Delete them once the numbers above are trusted.
