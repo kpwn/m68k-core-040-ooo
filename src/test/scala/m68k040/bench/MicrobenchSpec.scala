@@ -267,6 +267,63 @@ class MicrobenchSpec extends CoreBenchHarness {
   //
   // 3 macros/step. The two adds are removed by the matched CONTROL below.
 
+  /** DEP, and the CLEANEST load-latency kernel in the suite: a pure pointer chase,
+    * ONE instruction per step, NO control subtraction, NO endianness dependence.
+    *
+    *     move.l (%a0),%a0
+    *
+    * The chain is exactly address -> AGU -> D-cache -> writeback -> address. This
+    * exists to adjudicate the 3-instruction `chaseStep` version, whose reported
+    * value depends on a control kernel being correctly matched. It is not, quite:
+    * that control's `move.l %d2,%d1` reads a loop-INVARIANT register, so it sits
+    * OFF the dependency chain, and the subtraction therefore removes the two
+    * address adds but leaves the AGU and consumer-wakeup inside the number. This
+    * kernel has no such ambiguity -- whatever it reports IS the serial
+    * address-to-address load-to-use latency.
+    *
+    * The D-side memory is zero-filled, so after the first load `a0` becomes 0 and
+    * every subsequent load targets address 0: one 16-byte line, guaranteed L1D
+    * resident, guaranteed hit. Endianness is irrelevant because the value is 0
+    * under any byte order. */
+  def kPureChase(n: Int): Kernel = {
+    val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
+    val body  = (0 until n).map(_ => "move.l (%a0),%a0")
+    val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
+    Kernel(s"pure-chase-$n", src, stopAt(setup.size + n))
+  }
+
+  /** IND, and the diagnostic counterpart to `kPureChase`: mutually INDEPENDENT
+    * loads, each into a different destination register, from a small set of
+    * L1D-resident addresses. No load depends on any other, so the OoO engine is
+    * free to pipeline them.
+    *
+    * This is the measurement that distinguishes the two very different diagnoses
+    * for an expensive load:
+    *   - IND ~= 1-3 cycles while DEP ~= 11-18  -> pure LATENCY. The pipeline is
+    *     deep but fully pipelined, and the machine hides it given enough ILP.
+    *     The fix, if any, is architectural (shorten the pipeline).
+    *   - IND ~= DEP                            -> the load path is SERIALISED.
+    *     That is a throughput defect, far more serious than depth, and would cap
+    *     every load-dense workload regardless of available ILP.
+    * The design docs claim an initiation interval of 1 load per 3 cycles at the
+    * D-cache port and 1 per 9 through the LS EU, so this also checks that claim. */
+  def kIndLoads(n: Int): Kernel = {
+    val regs  = Seq(0, 1, 2, 3, 4, 5)
+    // Six distinct 16-byte L1D lines, all resident after the first pass.
+    val addrs = (0 until 6).map(i => 0x4000 + i * 0x10)
+    val body = (0 until n).map(i => f"move.l 0x${addrs(i % 6)}%x,%%d${regs(i % 6)}")
+    val src = (body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
+    Kernel(s"ind-loads-$n", src, stopAt(n))
+  }
+
+  /** Short pure chase used only for cycle-by-cycle tracing (MB_TRACE=trace-chase). */
+  def kTraceChase(n: Int): Kernel = {
+    val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
+    val body  = (0 until n).map(_ => "move.l (%a0),%a0")
+    val src = (setup ++ body ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
+    Kernel(s"trace-chase-$n", src, setup.size + n - 2)
+  }
+
   private def chaseStep(stride: Int) =
     Seq("move.l (%a0),%d1", "adda.l %d1,%a0", s"adda.l #$stride,%a0")
   private def chaseControlStep(stride: Int) =
@@ -554,8 +611,15 @@ class MicrobenchSpec extends CoreBenchHarness {
         val perAccess = Stat(tag, ld.samples.zip(ctl.samples).map {
           case (a, b) => (a - b) / inner
         })
+        // Report the RAW halves, not just the difference. The subtraction is only
+        // meaningful if the control is genuinely the same chain minus the load, and
+        // printing both halves is what lets a reader check that rather than trust it.
+        report("memory", s"$tag RAW with-load per pass", Stat(s"$tag-ld", ld.samples),
+          s"raw, per pass of $inner accesses")
+        report("memory", s"$tag RAW control per pass", Stat(s"$tag-ctl", ctl.samples),
+          s"raw, per pass of $inner accesses; load replaced by reg-move")
         report("memory", s"$tag load-to-use (DEP)", perAccess,
-          s"DEP; differential over passes; /$inner accesses; minus matched no-load control; $note")
+          s"DEP; differential over passes; /$inner accesses; minus no-load control; $note")
       }
 
       // 64 steps * 64B = 4 KiB footprint  -> fits in the 8 KiB L1D  -> hits
@@ -571,6 +635,92 @@ class MicrobenchSpec extends CoreBenchHarness {
         "DEP; differential; minus matched control; COLD (first-touch) miss -- the model's " +
         "L2 never evicts so a CAPACITY miss cannot be produced; absolute value tracks the " +
         "UNMEASURED dramCycles parameter, see the sweep")
+    }
+
+    // ── load-to-use decomposition (adjudicates the ~11-cycle memory numbers) ──
+    if (enabled("loaddecomp")) {
+      println("\n-- LOAD-TO-USE: TWO INDEPENDENT METHODS + STAGE DECOMPOSITION -------")
+
+      // METHOD 1: differential over chain length on the pure 1-instruction chase.
+      val pure = diffStat(compiled, "pure-chase", n => kPureChase(n), 100, 200)
+      report("loaddecomp", "M1 differential, pure chase (DEP)", pure,
+        "DEP; 1 macro/step; NO control subtraction; address->AGU->D$->writeback->address")
+
+      // THE DECISIVE COMPARISON: dependent vs independent loads.
+      val indL = diffStat(compiled, "ind-loads", n => kIndLoads(n), 120, 240)
+      report("loaddecomp", "independent loads (IND)", indL,
+        "IND; 6 dests, 6 L1D-resident lines, no dependencies; initiation interval")
+      println(f"  DEP/IND RATIO = ${pure.mean / math.max(indL.mean, 0.001)}%.1fx  " +
+        f"(dependent ${pure.mean}%.2f vs independent ${indL.mean}%.2f cycles/load)")
+      println("  ratio >> 1 => deep but PIPELINED (latency, hideable with ILP);" +
+        "  ratio ~ 1 => SERIALISED load path (throughput defect).")
+
+      // Cycle-by-cycle trace of a short chase, for stage attribution / bubble hunt.
+      if (sys.env.contains("MB_TRACE")) runKernel(compiled, kTraceChase(10), seeds.head)
+
+      // METHOD 2: direct per-event. In a serial chain one load is in flight at a
+      // time, so consecutive D-cache load-command fires are exactly one full
+      // load-to-use apart. This is the same style of measurement that produced the
+      // branch-recovery figure, and it shares NO arithmetic with Method 1.
+      val probe = runKernel(compiled, kPureChase(200), seeds.head)
+      def deltas(xs: Seq[Long]): Seq[Long] = xs.zip(xs.drop(1)).map { case (a, b) => b - a }
+      def med(xs: Seq[Long]): Double =
+        if (xs.isEmpty) 0.0 else { val s = xs.sorted; s(s.size / 2).toDouble }
+      def histo(xs: Seq[Long]): String =
+        xs.groupBy(identity).toVector.sortBy(_._1).map { case (d, g) => s"$d:${g.size}" }
+          .mkString("{", ", ", "}")
+
+      val cmdToCmd = deltas(probe.ldCmdCycles)
+      val perEvent = Stat("cmd->cmd", seeds.map { s =>
+        med(deltas(runKernel(compiled, kPureChase(200), s).ldCmdCycles))
+      })
+      report("loaddecomp", "M2 per-event, D$ cmd->cmd (DEP)", perEvent,
+        s"DIRECT per-event; ${cmdToCmd.size} intervals/run; independent of Method 1")
+      println(s"  M2 interval histogram (seed ${seeds.head}): ${histo(cmdToCmd)}")
+
+      // STAGE DECOMPOSITION. Pair the three event streams positionally (valid only
+      // because the chain is strictly serial) and report where the cycles go.
+      // VALIDITY GATE. Positional pairing is only legitimate if the three streams
+      // observed the SAME events in the same order -- i.e. equal lengths and every
+      // paired difference non-negative and small. An earlier version of this block
+      // skipped the check and produced medians of 231 and -219 cycles, which is a
+      // progressive misalignment (the streams drift apart), not a measurement.
+      val nc = probe.ldCmdCycles.size; val nr = probe.ldRspCycles.size; val nw = probe.lsWbCycles.size
+      val n = math.min(nc, math.min(nr, nw))
+      val aligned = (nc == nr) && (nr == nw) &&
+        probe.ldCmdCycles.zip(probe.ldRspCycles).forall { case (a, b) => b >= a && b - a < 200 } &&
+        probe.ldRspCycles.zip(probe.lsWbCycles).forall { case (a, b) => b >= a && b - a < 200 }
+      if (!aligned) {
+        println(f"  STAGE BREAKDOWN INVALID -- event streams are not positionally " +
+          f"pairable (cmd=$nc rsp=$nr wb=$nw, monotonic-pairing check failed). " +
+          f"The three probes do not observe a 1:1:1 event sequence, so no stage " +
+          f"decomposition is reported. NOT a measurement.")
+      } else if (n >= 8) {
+        // Drop the first few events (cold line fill) and use the steady state.
+        val lo = 4
+        val cmd = probe.ldCmdCycles.slice(lo, n)
+        val rsp = probe.ldRspCycles.slice(lo, n)
+        val wb  = probe.lsWbCycles.slice(lo, n)
+        val cmdToRsp = cmd.zip(rsp).map { case (a, b) => b - a }
+        val rspToWb  = rsp.zip(wb).map  { case (a, b) => b - a }
+        val wbToCmd  = wb.zip(cmd.drop(1)).map { case (a, b) => b - a }
+        println(f"  STAGE BREAKDOWN of one serial load-to-use (median cycles):")
+        println(f"    D$$ cmd accepted -> data returned   : ${med(cmdToRsp)}%6.1f   ${histo(cmdToRsp)}")
+        println(f"    data returned   -> LsEu writeback  : ${med(rspToWb)}%6.1f   ${histo(rspToWb)}")
+        println(f"    writeback -> next load cmd accepted: ${med(wbToCmd)}%6.1f   ${histo(wbToCmd)}")
+        println(f"    (wakeup + select + AGU + TLB of the dependent load)")
+        println(f"    SUM                                 : " +
+          f"${med(cmdToRsp) + med(rspToWb) + med(wbToCmd)}%6.1f  vs M1 ${pure.mean}%.2f / M2 ${perEvent.mean}%.2f")
+      } else {
+        println(s"  STAGE BREAKDOWN unavailable: only $n paired load events captured.")
+      }
+
+      // Store-to-load forwarding, same treatment: is the forward path FASTER than
+      // an ordinary L1D hit, as its purpose implies?
+      val fwdPair = diffStat(compiled, "sqfwd-cmp", n => kSqForward(n), 100, 200)
+      println(f"  store->load->use forwarded pair = ${fwdPair.mean}%.3f cycles " +
+        f"vs pure L1D-hit load-to-use = ${pure.mean}%.3f cycles " +
+        f"(a forwarded pair contains a store AND a load)")
     }
 
     // ── branch misprediction ──────────────────────────────────────────────────

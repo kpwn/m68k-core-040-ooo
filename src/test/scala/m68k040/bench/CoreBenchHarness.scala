@@ -406,7 +406,20 @@ trait CoreBenchHarness extends AnyFunSuite {
       // macro-instruction. This is the measured misprediction recovery penalty --
       // it does not have to be inferred from pipeline depth. `flushToCommit` is
       // the raw per-event sample list so a caller can report mean AND spread.
-      flushToCommit: Seq[Int] = Nil
+      flushToCommit: Seq[Int] = Nil,
+      // ── load-pipeline event cycles, for STAGE DECOMPOSITION ──────────────────
+      // Cycle stamps for the three observable points on a load's path:
+      //   ldCmdCycles : D-cache loadCmdPort fire   (address accepted by the cache)
+      //   ldRspCycles : D-cache loadRspPort valid  (data returned by the cache)
+      //   lsWbCycles  : LsEu writeback observed    (result visible to consumers)
+      // In a STRICTLY SERIAL dependent load chain exactly one load is in flight at
+      // a time, so these three streams pair up positionally with no ID matching,
+      // and their successive differences decompose load-to-use into stages. The
+      // cmd->cmd interval is an INDEPENDENT per-event measurement of the same
+      // quantity the differential method reports, so the two can be cross-checked.
+      ldCmdCycles: Seq[Long] = Nil,
+      ldRspCycles: Seq[Long] = Nil,
+      lsWbCycles:  Seq[Long] = Nil
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -491,6 +504,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
+      val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
+      val traceLines = ArrayBuffer.empty[String]
+      val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
+      val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
+      val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
       var firstCommitCycle = -1L
       var lastCommitCycle  = -1L
       val wbMap = scala.collection.mutable.HashMap[Int, WhiteboxCapture.Wb]()
@@ -679,7 +697,40 @@ trait CoreBenchHarness extends AnyFunSuite {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
           lastCommitCycle = totalCycles
         }
+        // MB_TRACE=<kernel-name-prefix>: dump a per-cycle table of every LOAD-path
+        // pipeline stage, so the cost of a load can be attributed to named stages and
+        // BUBBLES (cycles where nothing advances) can be told apart from genuine
+        // pipeline depth. Stage names follow the LS EU / D-cache design docs:
+        //   P1  s1Valid   issue context + registered operands
+        //   P2  tValid    DTLB + VIPT probe launched
+        //   P2T txValid   translation response awaited
+        //   P3  p3Valid   resolved PA -> SQ query / store alloc
+        //   P4  p4Valid   SQ forward response -> resolve / cache launch
+        //   C0  loadCmd   D-cache accepts the address (valid&ready)
+        //   C1  ldS1Valid tag compare + way select
+        //   C2  ldS2Valid byte-lane extract
+        //   RSP loadRsp   data returned to the LS EU
+        //   CMP compValid registered completion
+        //   WB  wbObs     writeback visible / wakeup broadcast
+        if (traceOn) {
+          def b(x: Boolean) = if (x) "#" else "."
+          val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+                        dut.dcache.logic.loadCmdPort.ready.toBoolean
+          val line = Seq(
+            b(dut.lsEu.logic.s1Valid.toBoolean), b(dut.lsEu.logic.tValid.toBoolean),
+            b(dut.lsEu.logic.txValid.toBoolean), b(dut.lsEu.logic.p3Valid.toBoolean),
+            b(dut.lsEu.logic.p4Valid.toBoolean), b(cmdFire),
+            b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS2Valid.toBoolean),
+            b(dut.dcache.logic.loadRspPort.valid.toBoolean),
+            b(dut.lsEu.logic.compValid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
+          ).mkString(" ")
+          if (traceLines.size < 400) traceLines += f"$telemCycle%5d  $line  commits=$macrosThisCycle"
+        }
         if (dut.lsEu.logic.sq.io.fwd.rsp.hit.toBoolean) sqFwdHitCycles += 1
+        if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+            dut.dcache.logic.loadCmdPort.ready.toBoolean) ldCmdCycles += telemCycle
+        if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
+        if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -795,7 +846,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,
-        flushToCommit.toVector)
+        flushToCommit.toVector,
+        ldCmdCycles.toVector, ldRspCycles.toVector, lsWbCycles.toVector)
+      if (traceOn) {
+        println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
+        println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
+        traceLines.foreach(println)
+        println(s"=== end trace (${traceLines.size} cycles) ===")
+      }
       val r2rN   = resolveToRetire.size
       val r2rAvg = if (r2rN == 0) 0.0 else resolveToRetire.sum.toDouble / r2rN
       val r2rHis = resolveToRetire.groupBy(identity).toVector.sortBy(_._1)

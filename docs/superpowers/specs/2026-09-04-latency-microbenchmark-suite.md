@@ -156,7 +156,7 @@ that core, which was not done.
 
 | Level | Marginal cost per dependent load | Method / cache control |
 |---|---|---|
-| **L1D hit** | **11.000 ± 0.159** | 4 KiB footprint < 8 KiB L1D; differential over passes; /64 accesses; minus matched no-load control |
+| **L1D hit** | ~~11.000 ± 0.159~~ **SUPERSEDED — see §3.2a; real load-to-use is 17–19** | control kernel not correctly matched; over-subtracts |
 | **L1D miss → L2 hit** | **20.139 ± 0.533** | 32 KiB footprint = 4× L1D → misses every access; L2-resident from prior pass |
 | **cold miss → model DRAM** | **98.242 ± 1.858** at `dramCycles=70`; **core-side fixed cost 28.5** (sweep intercept) | straight-line stride-64; a fresh 64 B line every step |
 
@@ -202,6 +202,146 @@ line. Two real results follow, neither of which depends on the unmeasured parame
 
 So: quote the L1D hit (11.0), the L2 hit (20.1), the slope (~1.0) and the intercept (28.5).
 Do not quote 98.242 as a DDR latency.
+
+### 3.2a Load-to-use: correction, decomposition, and a cycle trace
+
+The §3.2 memory figures were challenged as implausibly high. Re-measuring settled it, and
+**one of my own numbers has to be corrected.**
+
+#### The correction
+
+§3.2's "L1D hit = 11.000" came from a 3-instruction chase minus a control kernel. **That
+control is not correctly matched.** Its `move.l %d2,%d1` reads a loop-*invariant* register,
+so it sits OFF the dependency chain — the subtraction removes the two address adds but
+leaves the AGU and the consumer wakeup inside the residue, and it over-subtracts. A
+purpose-built kernel with no control at all settles it:
+
+```
+move.l (%a0),%a0        # 1 macro/step, chain = address -> AGU -> D$ -> writeback -> address
+```
+
+| Method | Value | Notes |
+|---|---|---|
+| M1 differential, pure chase (DEP) | **18.737 ± 0.531** | 1 macro/step, no subtraction |
+| M2 per-event, D$ cmd→cmd (DEP) | **17.000 ± 0.000** | direct, shares no arithmetic with M1 |
+
+Two independent methods agree at **17–19 cycles**, so **§3.2's 11.000 is superseded for
+load-to-use.** The relative structure of §3.2 (L1D < L2 < DRAM) and the DRAM *slope* (0.997,
+a difference-of-differences that is insensitive to the control) still stand; the absolute
+per-access values from that subtraction should be read as lower bounds.
+
+#### Latency or serialisation? — the decisive test
+
+| | cycles/load | |
+|---|---|---|
+| **dependent** loads (pointer chase) | **18.74** | DEP |
+| **independent** loads (6 dests, 6 resident lines) | **1.50** | IND |
+| **ratio** | **12.5×** | |
+
+**The load path is deeply pipelined, not serialised.** It sustains a load every 1.5 cycles
+given ILP — in fact *better* than the design docs' stated initiation interval of "1 load
+every 3 cycles at the D-cache port, 1 per 9 through the LS EU". So this is a pure latency
+property that the machine can hide, not a throughput defect. That distinction matters
+because the two diagnoses call for completely different fixes, and it rules out the more
+serious one.
+
+#### Where the cycles go — cycle-by-cycle trace
+
+`MB_TRACE=trace-chase` dumps every load-path stage per cycle. One steady-state iteration
+(`#` = stage active), reproduced verbatim:
+
+```
+cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB
+  144  #  .  .  .  .  .  .  .  .  .  .     P1  issue ctx + registered operands
+  145  .  #  .  .  .  .  .  .  .  .  .     P2  DTLB + VIPT probe launched
+  146  .  .  #  .  .  .  .  .  .  .  .     P2T translation response
+  147  .  .  .  #  .  .  .  .  .  .  .     P3  resolved PA -> SQ query
+  148  .  .  .  .  #  .  .  .  .  .  .     P4  SQ forward response -> resolve
+  149  .  .  .  .  .  #  .  .  .  .  .     C0  D$ accepts address (loadCmd fire)
+  150  .  .  .  .  .  .  #  .  .  .  .     C1  tag compare + way select
+  151  .  .  .  .  .  .  .  #  .  .  .     C2  byte-lane extract
+  152  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
+  153  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
+  154  .  .  .  .  .  .  #  .  .  .  .     C1 AGAIN
+  155  .  .  .  .  .  .  .  #  #  .  .     C2 AGAIN + loadRsp (data returns)
+  156  .  .  .  .  .  .  .  .  .  #  #     completion + writeback/wakeup
+  157  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
+  158  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
+  159  .  .  .  .  .  .  .  .  .  .  .     <-- BUBBLE
+  160  #  .  .  .  .  .  .  .  .  .  .     next dependent load starts
+```
+
+**16 cycles per dependent load, of which 11 show stage activity and 5 are bubbles** —
+cycles where no observed load-path stage is active at all. The 11 active cycles match the
+design intent almost exactly (see §3.2b). The 5 bubbles are the excess, in two regions:
+
+- **Bubble A, cycles 152–153 (2 cycles), and a duplicated cache pass.** The D-cache load
+  stages `ldS1Valid`/`ldS2Valid` fire **twice** per load — at 150/151 and again at 154/155,
+  with the data only returning on the second pass. `DcacheSpec.scala:2241` asserts a load
+  hit responds **2 cycles after accept**; here accept is 149 and the response is 155, i.e.
+  **6 cycles**. Either this is not taking the plain-hit path, or the access is re-run.
+- **Bubble B, cycles 157–159 (3 cycles).** Writeback and wakeup broadcast at 156; the
+  dependent load's P1 is at 160. The design specifies the consumer becomes ready on the
+  registered `lsWait` clear and issues at **wakeup+1**; observed is **wakeup+4**.
+
+**Interpretation, held separate from the observation.** The trace above is fact. Two
+readings are possible for Bubble A: a genuine replay/re-issue, or a legitimate two-pass
+design (the docs describe a virtual-set probe launched in parallel with the DTLB, which
+could be the 150/151 pass, with 154/155 the tagged resolve). I did not confirm which. The
+follow-up that would settle it is narrow: check whether the D-cache load path takes its
+`DcacheSpec`-asserted 2-cycle hit route in this scenario, and whether `wakeupPort.valid` →
+dependent select really costs 4 cycles rather than the specified 1. **I am not claiming a
+bug; I am reporting 5 unattributed cycles per load and naming exactly where they sit.**
+
+#### Store-to-load forwarding, same treatment
+
+| | cycles |
+|---|---|
+| forwarded store→load→use **pair** (store + load) | **10.000** |
+| single dependent load served by the L1D | **18.737** |
+
+A forwarded pair containing *both* a store and a load costs ~8.7 cycles **less** than a
+single cache-served dependent load. So **the forward path really is short-circuiting the
+cache pipeline** rather than running through it — P4 resolves `fwdHit` without launching a
+cache access, exactly as intended. That is a genuine, measured vindication of the
+forwarding design. It remains true that no comparison against m68k-ooo was run, so the
+*relative* advantage over that core is still an unmeasured claim.
+
+### 3.2b Measurement versus design intent
+
+A review of the design docs and the RTL (citations below) establishes that **11–12 cycles
+of load-to-use is the designed number, not a regression** — and that the design says so
+only implicitly:
+
+- The intended depth is **9 stages issue→completion**
+  (`2026-08-09-ipc-ls-eu-full-pipeline-design.md:559`), plus a registered
+  completion/writeback stage, plus the IQ's +1 dynamic-wakeup hop. That counts to 11–12,
+  and the implemented register chain (P1, P2, P2T, P3, P4, ring, C0, C1, C2, comp\*,
+  wakeup) matches the trace above one-for-one.
+- It was deliberate. Goal G3 (`:212-216`) states the target pipeline should be *longer*
+  than the previous 9-cycle load latency "possibly by 1–2 cycles — and that is the intended
+  outcome, not a cost to be minimised", under an explicit user principle preferring depth
+  over a serial FSM.
+- **~6–7 of those cycles are FMax tax.** Six separate splits were added to the load path
+  for timing, each waved through in-source with the phrase "latency-agnostic; lock-step
+  absorbs the +1" — e.g. `DcachePlugin.scala:860-872` ("Costs one uniform extra cycle of
+  load-to-use latency on every D-cache load hit ... the 5th of this shape in this file").
+  That phrase is true of the *lock-step verification harness*; it is not true of IPC.
+- **Only one of the six had its IPC cost measured** (Slice 2: −0.8% aggregate IPC for
+  +8.35 MHz). **Nobody ever summed the six**, and no document states the resulting
+  end-to-end load-to-use figure.
+- **Nothing pins it.** `DcacheSpec.scala:2241` exact-asserts the *cache port's* 2-cycle hit
+  response (3 of ~16 cycles); the LS-EU front and completion stages are unpinned, and
+  `IpcBenchSpec.scala:973` states outright that its kernels measure "EU + D-cache
+  THROUGHPUT (initiation interval), **not load-use latency**". There was no
+  dependent-load kernel anywhere in the tree before this suite.
+
+**So the adjudication is: the design intends ~11–12, the machine delivers ~16–19, and the
+trace locates the ~5-cycle gap in two specific places.** The deep part is architectural and
+was chosen knowingly; the bubbles are the fixable part. Given 68k code is load-dense and
+independent loads pipeline at 1.5 cycles, dependent-load latency is a strong candidate for
+the dominant term in the 0.655 aggregate IPC — but I did **not** measure that attribution,
+so it stays a hypothesis.
 
 ### 3.3 Branch misprediction
 
@@ -392,7 +532,11 @@ across with only the counter read replaced.
 2. **No L2 capacity miss can be produced** by this model — its L2 never evicts. "L2 miss"
    here always means *cold, first touch*.
 3. **Latency ≠ throughput on this core.** `mulu.w` is 12 cycles latency and 1.85 cycles
-   throughput. Always state which a number is.
+   throughput; a **load is 18.7 dependent and 1.5 independent (12.5x)**. Always state
+   which a number is.
+6. **Load-to-use is 17-19 cycles, not the 11.0 first reported** (§3.2a). Of a 16-cycle
+   dependent load, ~11 cycles are designed pipeline depth and **~5 are bubbles** located
+   at two named points in the trace.
 4. **Aggregate IPC 0.655 is not a like-for-like delta against the historical 0.53.**
 5. **There is no DTLB walk number.** If you need one, §4.1 has the reproduction and the
    open question.
