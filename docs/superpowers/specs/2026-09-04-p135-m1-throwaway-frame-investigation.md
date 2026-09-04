@@ -420,7 +420,20 @@ with that only because `RTE` also asserts `redirect_en`. cpu040's equivalent que
 an exception entry sample `committedCcr` in the cycle a flag-writer retires?) is **not
 answered by this part** and is a reasonable next check.
 
-### 7.5 What would settle it
+### 7.4a CONFIRMED ON SILICON — the defect, not yet the boot
+
+Reported to this session by another agent, and recorded with that attribution rather than
+as a measurement taken here: on real hardware the **stacked CCR was measured going
+`0x00 -> 0x04`** at two distinct PCs, with both confounds eliminated. That is a direct
+observation of the defect this part reproduces in simulation — the exception frame
+carrying condition codes that are not the interrupted program's.
+
+Be precise about what that does and does not establish. It confirms **the defect is real
+on silicon**, which upgrades it from "reproduces in simulation" to "happens on the actual
+part". It does **not** by itself establish that this is the p133 boot blocker: that still
+requires showing the corrupted flags steer a branch around a stack adjustment in the
+failing window. §7.2's ROM disassembly shows the shape exists nearby; it does not show it
+fired.
 
 The measurement Part 134 §9 asked for is still the discriminating one and is **still not
 taken**: catch a drain-loop IRQ on silicon and read `A7` immediately before interrupt entry
@@ -597,9 +610,47 @@ corrected admission rule — **>= 17 GB available AND <= 2 forked test JVMs abov
 counting only JVMs with an `sbt-args` argfile and ignoring idle sbt servers** — is what
 `synth/p135_gate.sh` implements.
 
+### The gate's FIRST run was a FALSE GREEN — recorded, because it nearly shipped
+
+`synth/p135_gate.sh` run 1 finished in 12 seconds and wrote `P135_GATE_ALL_DONE` with
+`SUMMARY fix WNS=#ns base WNS=#ns` and "fix is NOT adverse vs base". **That is a
+confident-looking pass from a gate that never ran.** Preserved verbatim as
+`p135_gate_FALSEGREEN_run1.log`. Three defects compounded:
+
+1. **Wrong generator.** The gate tcl reads `generated/M68kFullCoreSynth.v`, emitted by
+   `GenFullCoreSynthVerilog`. The script ran `GenVerilog`, which emits `M68kCore.v`,
+   **succeeds in about a second and exits 0** — so the return-code check passed with no
+   netlist on disk and Vivado died at `read_verilog` with `rc=1`.
+   This is precisely the defect that got another agent's wrapper stopped
+   (`run_p135_gate.STOPPED.md`) — "it would have gated a netlist that does not exist" —
+   and then my own base arm walked straight into it. An exit code is not evidence that the
+   artefact you need exists.
+2. **The summariser scraped tcl comments.** Vivado echoes the sourced script, and
+   `impl_FullCore.tcl` mentions `SIGNOFF_200MHZ_*` inside `#` commentary, so an unanchored
+   `grep` matched the documentation. Verified against the real log: the old `wns_of`
+   returns `#`, hence `#ns`.
+3. **A verdict was emitted from unparsable inputs.** `#` was compared against `#`, found
+   not worse, and logged as a pass.
+
+Fixed with structural guards rather than a patched line, and each guard was **verified
+against the actual failing logs**, where both arms are now REFUSED rather than parsed:
+
+* the netlist must exist and exceed 1 MB **before the mutex is taken**, else the arm
+  aborts loudly;
+* a non-zero Vivado `rc` aborts the arm instead of falling through to the summariser;
+* the result grep is anchored to line start and validated as numeric, returning nothing
+  when there is no genuine result;
+* a missing or unparsable WNS is a **hard failure** that exits 1 and writes
+  `P135_GATE_FAILED_NO_RESULT`. A verdict can no longer be produced without numbers.
+
+The general lesson is the one this campaign keeps re-learning: **a long wait followed by a
+silent failure is indistinguishable from success unless something asserts on the artefact.**
+Both gate wrappers written for this change failed the same way, independently.
+
 ### The postroute gate is QUEUED, not skipped
 
-`synth/p135_gate.sh` (committed on this branch) was `setsid`-detached and is waiting on
+`synth/p135_gate.sh` (committed on this branch, corrected after the false green above) was
+`setsid`-detached and is waiting on
 admission + the mutex. It regenerates and md5s the netlist per arm, runs `fix` and `base`
 through the same flow, and builds + runs the net-renaming control automatically if the fix
 looks more than 0.050 ns adverse. It reports `SIGNOFF_200MHZ_WNS_NS` /
