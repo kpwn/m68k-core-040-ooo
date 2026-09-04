@@ -35,9 +35,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK=/var/tmp/m68k-ooo-vivado.lock
 POSTROUTE_ROUNDS="${POSTROUTE_ROUNDS:-9}"
-# A KU5P full_impl peaks around 12-15 GB on this 29 GB host, so this is the real
-# admission condition: enough FREE memory for the peak plus headroom.
-NEED_FREE_MB="${NEED_FREE_MB:-17000}"
+# MEASURED, not remembered. The 'a KU5P full_impl peaks at 12-15 GB' figure this script
+# first used was inherited from campaign lore and is wrong for THIS design: the baseline
+# arm's own log reports a Vivado peak of 5.6 GB
+#   grep -oE 'peak = [0-9.]+' synth/walker_dcache_gate_baseline.out | sort -g | tail -1
+# so 17 GB was ~3x the real requirement and stalled the gate on an idle-ish machine for
+# want of 47 MB. 10 GB is the measured peak plus ~1.8x headroom, which still leaves the
+# host room for the two heavy JVMs MAX_HEAVY_JVMS permits.
+#
+# The lesson is the same one this branch's own report names as a failure class: a guard
+# set from a belief rather than a measurement fails in whichever direction the belief was
+# wrong -- here, by never admitting the job at all.
+NEED_FREE_MB="${NEED_FREE_MB:-10000}"
 # Secondary guard on the project's "at most 2 heavy JVMs, none during Vivado" rule.
 # Deliberately NOT a hard "JVM RSS must be ~0": other agents keep idle sbt SERVERS
 # resident for hours at 3-4 GB, and gating on that livelocks the gate forever while
