@@ -908,4 +908,166 @@ class StoreQueueSpec extends AnyFunSuite {
       cd.waitSampling(2)
     }
   }
+
+  // ── Part 127: the two defects Part 126 SS8 found by INSPECTION and left unfixed ──
+  //
+  // WHY THE PART 37 TEST ABOVE CANNOT SEE EITHER OF THEM (Part 126 SS8's own point):
+  // it pins `io.robHeadIn` to the flushed store's own robId (21) for the whole test.
+  // In the real machine the flush that keeps the entry is `RobPlugin.doFlushReg`, and
+  // the ROB flush is POINTER-ONLY (`tail := head`, `head` untouched), so the entry's
+  // robId is immediately re-allocatable and `io.robHeadIn` moves on. Holding it still
+  // hands the kept entry the exact input it needs to finish, and hides the fact that
+  // its only launch gate is a comparison against a ROB entry that no longer exists.
+  //
+  // Both tests below use the identical Part 37 setup and change ONE input: what the
+  // ROB head does after the flush.
+
+  test("Part 127 (b1): a flush-kept precise SPLIT entry must still launch slot B once " +
+       "the ROB head has moved on -- its ROB entry is GONE, so gating slot B on " +
+       "robIds(head)===robHeadIn wedges the ring forever", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      val a = dut.io.alloc
+      a.valid #= true
+      a.payload.robId #= 21
+      a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
+      a.payload.data #= 0; a.payload.size #= Size.LONG
+      a.payload.nbytesA #= 2; a.payload.useStrbA #= true
+      a.payload.validB #= true
+      a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
+      a.payload.nbytesB #= 2
+      a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
+      a.payload.supervisor #= false
+      a.payload.precise #= true
+      cd.waitSampling()
+      a.valid #= false
+
+      dut.io.robHeadIn #= 21
+      dut.io.robHeadValidIn #= true
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      cd.waitSampling()          // drainIssue registers: acceptedHalves=1, sendPhaseB=true
+      sleep(1)
+      assert(dut.drainBusy.toBoolean, "slot A's accepted half is outstanding (unacked)")
+
+      // A non-retire-gated flush (debugRecoverEnter / debugPcApply -- a JTAG halt or
+      // step) lands on this cycle.
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false
+      // THE ONE CHANGED INPUT: the ROB flush destroyed robId 21's entry and the ROB
+      // moved on. Anything may now sit at the head -- including, later, a brand-new
+      // instruction that inherits id 21.
+      dut.io.robHeadIn #= 40
+      dut.io.robHeadValidIn #= true
+      sleep(1)
+      assert(dut.valids(0).toBoolean, "Part 37's keep rule still applies -- the entry survives")
+
+      // Slot A's already-in-flight ack arrives (advance-to-slot-B path).
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(!dut.io.empty.toBoolean, "slot B has not drained yet")
+
+      // Slot B MUST be presented. Before the Part 127 fix `headPreciseReady` required
+      // `robIds(head) === io.robHeadIn` (21 vs 40) and this wait never returns -- the
+      // ring is wedged on a dead index and NOTHING can drain again, which is the same
+      // permanent-hang class Part 37 fixed one instance of.
+      var waited = 0
+      while (!dut.io.drain.valid.toBoolean && waited < 200) { cd.waitSampling(); waited += 1 }
+      assert(dut.io.drain.valid.toBoolean,
+        s"slot B of a flush-kept precise split store was never presented within $waited " +
+        "cycles after the ROB head moved on -- the store queue is permanently wedged")
+      assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next")
+      cd.waitSampling()
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      dut.io.drainAck #= false
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "both slots drained -- entry popped cleanly")
+
+      // And the ring is genuinely usable afterwards.
+      forkDrainAck(dut, cd)
+      alloc(dut, cd, robId = 22, paddr = 0x3000, data = 0x33333333L, Size.LONG)
+      commit(dut, cd, robId = 22)
+      cd.waitSampling(10)
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "a new committed store must drain normally afterwards")
+      cd.waitSampling(2)
+    }
+  }
+
+  test("Part 127 (b2): a flush-kept precise entry's completion must be flagged ORPHAN " +
+       "so it is never applied to the instruction that inherited its robId", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      // Single-slot (non-split) precise entry this time: the mis-completion half of
+      // SS8(b) does not need a split, only a kept entry whose robId gets reused.
+      alloc(dut, cd, robId = 21, paddr = 0x1000, data = 0x11111111L, Size.LONG,
+        vaddr = 0x21000000L, precise = true)
+      dut.io.robHeadIn #= 21
+      dut.io.robHeadValidIn #= true
+      cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
+      cd.waitSampling()
+      sleep(1)
+      assert(dut.drainBusy.toBoolean, "the drain half is accepted and unacked")
+      assert(!dut.io.flushKeptPrecise.toBoolean, "not flushing yet")
+
+      dut.io.flush #= true
+      cd.waitSampling()
+      sleep(1)
+      // The SQ must TELL the LS EU it kept this entry -- LsEuPlugin's `pendMem` ring is
+      // a lock-step partner of this ring and rolls `pendPush` back to `pendReady` on a
+      // flush, which would DISCARD this entry's deferred-write-back record and put the
+      // two rings off by one forever (Part 126 SS8(a)).
+      assert(dut.io.flushKeptPrecise.toBoolean,
+        "the SQ kept an uncommitted precise head across this flush but did not signal it")
+      dut.io.flush #= false
+      // The ROB re-allocates id 21 to a brand-new instruction.
+      dut.io.robHeadIn #= 21
+      dut.io.robHeadValidIn #= true
+      sleep(1)
+      assert(dut.valids(0).toBoolean, "the in-flight entry survives the flush")
+      assert(dut.orphans(0).toBoolean, "and is marked ORPHAN -- its ROB entry is gone")
+
+      // Its ack arrives and pops it. `sqCompletion` still fires (the pendMem ring must
+      // consume its slot), but it MUST carry the orphan qualifier, or the LS EU will
+      // complete -- and write back onto -- the unrelated instruction now holding id 21.
+      // `sqCompletion.valid` is COMBINATIONAL and high only during the acking cycle, so
+      // it has to be sampled on the edge, not polled after it.
+      var sawComp = false; var sawOrphan = false; var compRob = -1
+      cd.onSamplings {
+        if (dut.io.sqCompletion.valid.toBoolean) {
+          sawComp = true
+          sawOrphan = dut.io.sqCompletionOrphan.toBoolean
+          compRob = dut.io.sqCompletion.payload.toInt
+        }
+      }
+      dut.io.drainAck #= true
+      cd.waitSampling()
+      sleep(1)
+      assert(sawComp, "the pop still announces itself on sqCompletion")
+      assert(compRob == 21, s"and it still names the dead store's robId (got $compRob)")
+      assert(sawOrphan,
+        "a flush-kept entry's completion MUST be flagged orphan -- otherwise robId 21's " +
+        "brand-new occupant is marked complete and retires without executing")
+      dut.io.drainAck #= false
+      cd.waitSampling()
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "entry popped")
+
+      // A fresh entry must NOT inherit the orphan mark.
+      forkDrainAck(dut, cd)
+      alloc(dut, cd, robId = 22, paddr = 0x3000, data = 0x33333333L, Size.LONG)
+      sleep(1)
+      assert(!dut.orphans(1).toBoolean, "a fresh alloc must clear the orphan mark")
+      commit(dut, cd, robId = 22)
+      cd.waitSampling(10)
+      sleep(1)
+      assert(dut.io.empty.toBoolean, "the ring is healthy afterwards")
+      cd.waitSampling(2)
+    }
+  }
 }
