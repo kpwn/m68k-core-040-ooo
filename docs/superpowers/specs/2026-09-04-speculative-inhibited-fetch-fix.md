@@ -404,30 +404,43 @@ row of `synth/fullcore_route_timing.rpt` — not the `timing_summary.rpt` headli
 |---|---|---|---|---|
 | BASE (`ca4b901`) | `506d3e0b8c39ca278bf3f90b18f030bd` | **+0.001** | `MET_200` | **+0.001** / 0.000 / **0 of 168088** |
 | FIX (`7f3a45f`) | `b2f6b052e51c98b9bc2d2e6c57fb0391` | **-0.171** | `FAILED_AT_200` | **-0.171** / -76.668 / **1176 of 168465** |
-| CTRL (`ba30f8a`, gate forced inactive) | `8319b19e8dc84e7b25eb29975728d471` | <!-- CTRL RESULT --> | | |
+| CTRL (`ba30f8a`, gate forced inactive) | `8319b19e8dc84e7b25eb29975728d471` | **+0.001** | `MET_200` | **+0.001** / 0.000 / **0 of 168088** |
 
-**The FIX arm does not meet 200 MHz.** Reported as measured, not explained away.
+**The FIX arm does not meet 200 MHz, and the control attributes the loss to this change.**
+Reported as measured, not explained away.
 
-What the report says about *where* it fails, which is the reason the CTRL arm exists:
+**What the CTRL arm settled.** CTRL is timing-*identical* to BASE — same WNS `+0.001`, same
+TNS `0.000`, the same **168088** total endpoints, and the same worst-path family
+(`LsEuPlugin_logic_sq/robIds_4_reg[0]/C` -> `IssueQueuePlugin_logic_lines_*_triggers_reg[10]/CE`).
+Forcing `nonSpecFetch := True` constant-folds the whole gate away, so CTRL *is* BASE in
+everything that matters to timing, despite a different netlist md5. **Therefore the
+FIX-vs-BASE delta is not SpinalHDL line-number churn and not placement luck between two
+different source trees: it is the cost of this change.**
 
-- **The gate's own logic does not appear in the timing report at all.** `grep -c` for
-  `nonSpecFetch` / `inhibitedSpecBlock` / `SpeculativeFetchGate` across
-  `fullcore_route_timing.rpt` returns **0**. The added `cmdPort.ready` term is not on any
-  reported failing path.
-- **The worst path is somewhere else entirely, and it is not the same family as BASE's.**
-  Every one of the FIX arm's top-10 failing paths is
-  `RobPlugin_logic_exc_fsFrameBase_reg[7]/C` → `DcachePlugin_logic_s0Payload_lineData_reg[*]/R`
-  (13 logic levels). BASE's worst path is a completely different family,
-  `LsEuPlugin_logic_sq/robIds_4_reg[0]/C` → `IssueQueuePlugin_logic_lines_*_triggers_reg[10]/CE`.
-  The two arms are not failing on the same arc.
+**Where the cost actually comes from — not the term I expected.** FIX has **168465**
+endpoints against CTRL's 168088: **+377**. Those are the `SpeculativeFetchGate` drain-
+detection registers (`drainedQ` plus the frontend/decode/rename/ROB quiet terms it samples),
+not the one-gate `cmdPort.ready` term. And the arc that fails is not in the added logic at
+all — `grep -c` for `nonSpecFetch` / `inhibitedSpecBlock` / `SpeculativeFetchGate` across
+`fullcore_route_timing.rpt` returns **0**, and every one of FIX's top-10 failing paths is a
+different family from BASE's/CTRL's:
+`RobPlugin_logic_exc_fsFrameBase_reg[7]/C` -> `DcachePlugin_logic_s0Payload_lineData_reg[*]/R`,
+13 logic levels.
 
-That pattern — the winner changing between several near-tied families rather than one arc
-degrading — is exactly what
-`docs/superpowers/memory/fmax-resilience-postmortem-2026-08-19.md` describes for this design
-at 5 ns, and it is why a bare FIX-vs-BASE delta cannot be attributed. Hence the CTRL arm:
-same tree, same net names, same SpinalHDL line numbers, gate expression forced to `True` so
-it constant-folds away. **CTRL-vs-BASE is placement/line-number churn; FIX-vs-CTRL is the
-real cost of the added term.**
+So the mechanism is **placement perturbation, not a slow path**: 377 extra endpoints spread
+across four plugins move the floorplan enough that a different, previously near-tied family
+becomes critical. That is precisely the failure mode
+`docs/superpowers/memory/fmax-resilience-postmortem-2026-08-19.md` documents for this design
+at 5 ns ("5-6 near-tied worst-path families, not one outlier"), and BASE sitting at exactly
+`+0.001` means there was no margin to absorb any perturbation at all.
+
+**Consequence, stated plainly: this change does not pass the standing >=200 MHz gate and is
+not mergeable as-is.** It is a correctness fix that costs 0.172 ns of slack the design does
+not have. The remedy is a floorplan/retime question about the `exc_fsFrameBase` ->
+`s0Payload_lineData` reset fanout rather than anything in the fetch path, or a cheaper way to
+compute "the machine is drained" than 377 new endpoints — for example deriving it from an
+existing ROB-empty/quiesce signal instead of re-deriving quiet terms per stage. **Not
+attempted here**; it is a separate piece of work and should be scoped as such.
 
 ---
 
