@@ -475,7 +475,7 @@ overhead half of the trade with the payoff half switched off.
 a worst case for the feature — it deliberately evicts the DTLB set on every access, so
 every access walks, and the leaf descriptors stride 32 bytes apart so they are cold every
 time. What it establishes is the honest bound: **the cost of the correctness fix, in the
-realistic regime, is about 1 %% of a walk.** The revalidation's §6.3 plan —
+realistic regime, is about 1 % of a walk.** The revalidation's §6.3 plan —
 `walkL1dHitRate` as the headline, on a boot trace rather than a microkernel — is still the
 measurement that would show an actual win, and is now much cheaper to run given the
 harness fix.
@@ -522,16 +522,25 @@ harness fix.
    from the aligned ring. The rows were implemented anyway (they cost nothing once
    `bkBusy` folds to a constant) but `WalkerSplitLoadRaceSpec` was **not** written: it
    would be a test of unreachable logic. Reported, not forced through.
-3. **The plan's "Plan-level risk" section is stale**, as R7 says: the spec §11.1 item 9
+3. **W13, as specified, is incomplete — it names two store-ack consumers and there are
+   three.** The spec qualifies `sq.io.drainAck` (and `StoreQueue`'s stray-ack assertion is
+   cited as what makes that mandatory) but says nothing about `ExceptionUnit.dcStoreAck`,
+   which every integrated DUT wires straight off `DcacheService.storeAck` with no
+   qualification at all. That third consumer is the one that actually broke (§5.4). The
+   W-item should be amended to "every consumer of the untagged terminal ack", not two named
+   ones — it is the same "the table is the unit of correctness, not any individual finding"
+   discipline W27 states for the load side, applied to the store side where the spec did
+   not apply it.
+4. **The plan's "Plan-level risk" section is stale**, as R7 says: the spec §11.1 item 9
    standalone fix landed as `072e97a`, an ancestor of this parent. Task 4's "lands BEFORE"
    branch applies; W30 was built on top of it and not weakened.
-4. **`LsEuPlugin.scala:2027`'s `when(excActive && excLoadCmdValid)` no longer exists** (R6);
+5. **`LsEuPlugin.scala:2027`'s `when(excActive && excLoadCmdValid)` no longer exists** (R6);
    the header is the one-term `when(excLoadCmdValid)`. The W23 qualification is therefore
    applied to the `valid` assignment *inside* that `when` rather than to the header — see
    §7 for why that is also the better FMax placement.
-5. **The revalidation's "205 → 127 ports" arithmetic was off by the golden file's own six
+6. **The revalidation's "205 → 127 ports" arithmetic was off by the golden file's own six
    comment lines.** The real count was **199 → 121**. Recorded in the golden's header.
-6. **`W18`'s "8 files / 8 DUT classes" undercounts the migration.** 28 test files touched:
+7. **`W18`'s "8 files / 8 DUT classes" undercounts the migration.** 28 test files touched:
    8 needing the new sim agent, 1 deleted, and 19 whose walker memory attachment is simply
    deleted or aliased onto the D-side image.
 
