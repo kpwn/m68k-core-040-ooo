@@ -18,16 +18,17 @@ coordinator; SS8 states exactly what is being proposed.
   `cacr`, the lock-step-inversion branch added `structuralKnownGap`. All are optional
   with defaults and mutually independent, so the resolution is the union of the two
   parameter lists. No behavioural resolution was needed anywhere. SS1.
-* **The merged bar, measured on the merge:** `fastTest` **341/341**, reconciling
-  exactly with the expected 337 → ~341; fuzz **200/200 seeds run, 3 divergences —
-  seeds 80, 109, 127, byte-for-byte the pre-existing set, IT DID NOT RISE**;
-  `ExecuteLockStepSpec` 507 run / 504 pass. SS2.
-* **The 3rd `ExecuteLockStepSpec` failure is a flake and is NOT attributable to the
-  merge**, but it is a real flake and is reported rather than hidden: an AXI-protocol
-  checker assertion on the **I-cache** attach (`AR id=1 presented while ALREADY
-  outstanding`). It did not reproduce on an isolated re-run, nor in three independent
-  full-suite runs on unmodified mainline. Part 127 did not touch
-  `AxiProtocolChecker`. SS2.3.
+* **The merged tree is GREEN on the whole bar**, measured on the merge, not inherited:
+  `fastTest` **341/341** (reconciling exactly with the expected 337 → ~341),
+  `ExecuteLockStepSpec` **505/505** + 1 parked, `BsrFlushSkipSpec` **17/17**,
+  `flush_younger_*` **4/4**, the six directed mispredict tests **6/6**, Part 127's two
+  directed tests **23/23 + 14/14**, and fuzz **200 seeds, 3 divergences — seeds 80,
+  109, 127, byte-for-byte the pre-existing set, IT DID NOT RISE**. SS2.
+* **One real flake was seen once and is reported rather than hidden**, and it is NOT
+  attributable to the merge: an AXI-protocol checker assertion on the **I-cache**
+  attach (`AR id=1 presented while ALREADY outstanding`). It did not reproduce on an
+  isolated re-run, in three independent full-suite runs on unmodified mainline, or in
+  the final post-edit run. Part 127 did not touch `AxiProtocolChecker`. SS2.3.
 * **Neither standing mainline failure is a regression.** Both are test expectations
   that contradict a deliberate design decision, and both are corrected. SS3, SS4.
   * The CMP2 one (task #257) is a **test that drifted**: `b9d0781` deliberately made
@@ -40,9 +41,12 @@ coordinator; SS8 states exactly what is being proposed.
   fixed** (correctly — each needs its own test and gate): the RAS `checkpointSave`
   proxy is unsound against frontend run-ahead, and slot-1 CALLS never push the RAS at
   all. SS4.
-* **Postroute gate: NOT RUN.** Deferred at the coordinator's instruction — the Vivado
-  slot belongs to the ILA bitstream build, which my own concurrency error had already
-  destroyed once. SS6 records that error in full.
+* **Postroute gate: NOT RUN — pending the Vivado slot.** A genuine `full_impl` (the
+  ILA bitstream for the boot-blocker investigation) holds
+  `/var/tmp/m68k-ooo-vivado.lock` via `flock`. The netlist for the gate is generated
+  and pinned (SS2.5) so the gate itself needs no JVM. **No WNS/TNS is claimed.** SS6
+  also records a host-budget violation of mine, and retracts an accusation built on
+  top of it that turned out to be unfounded.
 
 ---
 
@@ -154,13 +158,43 @@ is plausible and worth its own investigation. It is reported here rather than be
 dismissed as noise. It is not attributed to the merge because the evidence does not
 support attributing it there.
 
-### 2.4 Not yet re-run
+### 2.4 The full bar, re-run after this session's own test edits
 
-`BsrFlushSkipSpec`, the four `flush_younger_*`, the six directed mispredict tests, and
-a re-run of `fastTest`/`ExecuteLockStepSpec` **after** this session's own test edits
-(SS3, SS4) were still outstanding when the host had to be handed back to Vivado. They
-are single-JVM runs and are the first thing to do when the slot frees. **Their results
-are not claimed here.**
+Everything below was re-run on the merged tree **after** the SS3/SS4 edits, one sbt JVM
+at a time, each step preceded by a host pre-flight (`free -g` ≥ 5 GB; the batch-Vivado
+count reported, not fatal — one JVM alongside a Vivado build is within budget on this
+host with 11-15 GB genuinely free, four JVMs was not).
+
+| check | result |
+|---|---|
+| `make test-fast` / `fastTest` | **341 run, 341 pass**, 0 failed, 2 ignored |
+| `ExecuteLockStepSpec` | **505 run, 505 pass**, 0 failed, 1 ignored |
+| `Cmp2Chk2DecodeSpec` (incl. the 3 new cases) | **14/14** |
+| `StoreQueueSpec` (Part 127 b1, b2) | **23/23** |
+| `LsEuFastPreciseSpec` (Part 127) | **14/14** |
+| `BsrFlushSkipSpec` | **17/17** |
+| `flush_younger_{bsr,bsr_exc,bsr_tree,rts_bsr}_reexec` | **4/4** |
+| `mispredict`, `deep_mispredict`, `adv_store_squash_mispredict`, `adv_a7_spec_flush`, `adv_flush_restart_store`, `unstable_branch` | **6/6** |
+| 200-seed fuzz | **197/200, 3 divergences (80/109/127) — unchanged** (SS2.2) |
+
+**The lock-step count reconciles exactly**, which is the check that matters after a
+merge plus a test edit: mainline 468 → merged 507 (Part 127's and `ArchLockStep`'s new
+cases) → minus the removed `cmp2-idx` = 506 → minus the parked RAS test = **505 run + 1
+ignored**. No test went missing.
+
+The AXI-protocol flake of SS2.3 did not fire in this run either.
+
+**The merged tree is green.** Both standing mainline failures are gone, by correcting
+the tests rather than by changing behaviour: the only `src/main` edit in this entire
+session is a comment.
+
+### 2.5 Netlist for the gate
+
+`generated/M68kFullCoreSynth.v` regenerated from the merged tree
+(`sbt runMain m68k040.top.GenFullCoreSynthVerilog`), md5
+**`ca77655a84766c973839462883763472`**, so the postroute gate is a pure-Vivado step
+that can never overlap a JVM. Note `GenVerilog` is the wrong target — it emits
+`M68kCore.v`; `impl_FullCore.tcl` reads `M68kFullCoreSynth.v`.
 
 ## 3. Standing failure #1 — CMP2.W (d8,An,Xn): the test was wrong
 
@@ -309,9 +343,10 @@ to wait; only the reasoning I was given for it was wrong.
   `earlyHit`'s 32-bit PC compare on the retire cone. The two-tier document's IPC
   numbers are **inherited, not re-measured** — this session re-measured correctness,
   not performance.
-* Not claimed that the merged tree is fully green: SS2.4 lists checks that were not
-  re-run after this session's own test edits, and the AXI-protocol flake (SS2.3) is
-  unexplained.
+* The merged tree is green on the whole simulation bar (SS2.4), but "green" is not
+  "clean": the AXI-protocol flake of SS2.3 fired once and remains **unexplained**, and
+  a single non-reproduction is weak evidence — it was seen once in roughly six
+  full-suite runs, so a rate of a few percent is entirely consistent with the data.
 * Not claimed that the AXI-protocol flake is benign, only that the evidence does not
   attribute it to the merge.
 * Not claimed that either RAS gap costs measurable IPC. Neither was A/B'd; nor was the
@@ -330,6 +365,11 @@ to wait; only the reasoning I was given for it was wrong.
 * `395ffba` — the two test dispositions, the new RAS bug document, and the CHK
   cross-references.
 
-**Merging it is a coordinator decision and is gated on SS2.4 finishing and on the
-postroute gate.** Correctness outranks FMax by standing instruction, and the postroute
-number should be reported as it comes out.
+The whole simulation bar is green on it (SS2.4). **Merging is a coordinator decision
+and the only thing still outstanding is the postroute gate**, which waits for the
+Vivado slot. Correctness outranks FMax by standing instruction, so the postroute number
+will be reported as it comes out and the design will not be contorted for it. What that
+gate should look at first, per the two-tier design document: the `!allocHalt` term on
+the rename ready chain (a recorded co-critical arc family), then `earlyHit`'s 32-bit PC
+compare on the retire cone — the latter is defence-in-depth and can be dropped if it
+costs.
