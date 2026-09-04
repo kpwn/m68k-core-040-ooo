@@ -677,6 +677,12 @@ class MicrobenchSpec extends CoreBenchHarness {
     * can occur); `walk - noWalk` is therefore the table-walk cost under whatever
     * page-table residency `wsPages` produces, and nothing else. */
   def kTlbLocality(n: Int, walk: Boolean, wsPages: Int): Kernel = {
+    // 256 is a hard geometric limit, not a taste: the per-page +16 B data rotation
+    // accumulates, and at p = 256 it reaches 4 KiB and would spill into the next page,
+    // destroying the constant-vpn[2:0] property the whole kernel rests on.
+    require(wsPages >= 5 && wsPages <= 256,
+      s"kTlbLocality wsPages=$wsPages out of range: must be >4 (to thrash the 4-way " +
+      s"DTLB set and force a walk every step) and <=256 (data rotation must stay in-page)")
     val setup = Seq(f"lea 0x${locAddr(0, wsPages)}%08x,%%a0", "moveq #0,%d2")
     val body = (0 until n).flatMap { k =>
       // d1 is 0 (premise, enforced by zeroFillData + assertStridePremise), so
@@ -1109,10 +1115,19 @@ class MicrobenchSpec extends CoreBenchHarness {
         .getOrElse(Seq(8, 32, 128, 256))
       for (ws <- wsSweep) {
         try {
-          // Both runs must be several full passes over the working set so the
-          // differential is taken entirely in the warm regime, not across first touch.
-          val nShort = math.max(120, 4 * ws)
+          // Both runs must be a WHOLE NUMBER of full passes over the working set, and
+          // the short run must already be warm, so the differential is taken entirely
+          // in the steady state rather than across first touch. nShort = 2 passes,
+          // nLong = 4 passes => the difference is passes 3 and 4, fully warm.
+          //
+          // The cap matters: each step is 10 bytes of code (2+2+6) and the I-cache is
+          // 16 KiB. `kChaseLoop`'s notes record that under IPC_MEM=l2:5:70 a long
+          // straight-line unroll goes I-fetch-bound and swamps the D-side effect. At
+          // nLong = 1024 the body is 10 KiB and BOTH runs stay I-cache resident, so no
+          // I-fetch cliff falls between the short and the long run.
+          val nShort = math.max(120 / ws, 2) * ws
           val nLong  = 2 * nShort
+          require(nLong <= 1024, s"mmuloc ws=$ws: nLong=$nLong exceeds the I-cache-resident cap")
           // PREMISE FIRST, on both halves, on the LONG kernel (the one that matters).
           val probeT = runKernel(compiled, kTlbLocality(nLong, walk = false, ws), seeds.head)
           val probeW = runKernel(compiled, kTlbLocality(nLong, walk = true,  ws), seeds.head)

@@ -823,7 +823,17 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       val n = k.retiredInstrs
       var guard = 0
-      val cap   = if (memCfg.latency.enabled) 500000 else 20000
+      // The cycle budget must SCALE WITH THE KERNEL, not be a flat number. As
+      // committed this was a flat 20000 / 500000, which the suite's own largest kernel
+      // outgrew: `chase-loop-512-ld-4` needs 10250 macro-instructions and a dependent
+      // load chase retires roughly one macro every four cycles, so it was truncated at
+      // ~5270/10250 and the assertion below aborted the whole suite -- taking the
+      // branch, divmul, fpu and mmu groups with it -- on BOTH bb3bca1 and current HEAD.
+      // The loop exits the moment `n` macros have retired, so a generous per-macro
+      // budget costs nothing on a healthy kernel and still terminates a wedged one.
+      val perMacro = if (memCfg.latency.enabled) 300 else 30
+      // NB `math` alone resolves to spinal.lib.math inside this file.
+      val cap   = scala.math.max(if (memCfg.latency.enabled) 500000 else 20000, n * perMacro)
       val debug = sys.env.contains("IPC_DEBUG")
       var lastSize = -1; var stuck = 0
       while (handle.result.size < n && guard < cap) {
@@ -866,7 +876,9 @@ trait CoreBenchHarness extends AnyFunSuite {
           s"[${k.name}] pipeline never overlapped stores: sq=$maxSqAccepted dc=$maxDcOutstanding")
       }
       assert(handle.result.size >= n,
-        s"[${k.name}] only ${handle.result.size}/$n macro-instructions retired within $cap cycles")
+        f"[${k.name}] only ${handle.result.size}/$n macro-instructions retired within $cap cycles " +
+        f"(${cap.toDouble / scala.math.max(handle.result.size, 1)}%.1f cyc/macro achieved). A TRUNCATED run " +
+        f"still yields a plausible-looking differential, so this is a hard failure, not a warning.")
 
       // ── Build the steady-state window from the histogram ──────────────────────
       // Use the FIRST..LAST macro-commit span. The histogram is per-cycle; trim to
