@@ -82,9 +82,21 @@ case class LsFault() extends Bundle {
   *                        key, so directed tests can shorten it.
   * @param walkerWedgeLimit W26's observability bound: cycles a walker may hold either
   *                        D-cache port with NO progress on any channel before the sticky
-  *                        `walkerPortWedge` report rises. */
+  *                        `walkerPortWedge` report rises.
+  *
+  *                        Sized so that NO legitimate bounded operation can reach it, not
+  *                        merely so that it is large. The binding case is a CPUSH/CINV
+  *                        maintenance walk: `DcachePlugin` refuses both client directions
+  *                        for its whole duration, which is `sets*ways = 512` iterations
+  *                        each of which may write a dirty victim back at DDR latency --
+  *                        order 10^4-10^5 cycles, and none of it produces any of the
+  *                        progress events this counter resets on. (`quiesceHold` now also
+  *                        covers `S_MAINTWAIT`, so a walker should not be holding a grant
+  *                        across one at all; this bound is the second line of defence, and
+  *                        a false halt would be far worse than a late report.) 2^20 cycles
+  *                        is ~5 ms at 200 MHz. */
 class LsEuPlugin(val walkerAgeLimit: Int = 64,
-                 val walkerWedgeLimit: Int = 4096) extends FiberPlugin with LsEuService {
+                 val walkerWedgeLimit: Int = 1 << 20) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -3387,6 +3399,25 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
     val coreStFire = dcache.store.fire && !walkerOwnsStore
     val coreStAck  = dcache.storeAck && !walkStOutstanding
+    // ── W13, THIRD consumer: the exception sequencer's own terminal ack ────────────
+    // `ExceptionUnit.dcStoreAck` is wired STRAIGHT off `DcacheService.storeAck` by every
+    // integrated DUT, unqualified. With two store clients that was safe: the sequencer
+    // only stores after `E_DRAIN` has waited on `sqDrained`, so no SQ store can be
+    // outstanding to ack in its place. A TABLE WALKER is a third client and breaks that,
+    // and it is NOT enough that `stGrantOk` refuses a NEW grant while the sequencer has a
+    // store presented -- a walker store granted EARLIER can still be outstanding when the
+    // sequencer reaches `E_STORE`, and its ack then advances `E_STWAIT` while
+    // `stoValidReg` is still set. The next `E_STORE` trips ExceptionUnit's own
+    // "attempted to overwrite an unaccepted frame-store command" assertion.
+    //
+    // Found exactly that way: this fired in `ExecuteLockStepSpec`'s MOVEM store-fault
+    // case before this term existed. Consume THIS signal rather than the raw `storeAck`.
+    //
+    // Deliberately NOT also qualified against the SQ's acks: that is pre-existing
+    // behaviour protected by the sequencer's own `sqDrained` discipline, and narrowing it
+    // here would be an unrelated change smuggled into this one.
+    val excStoreAckOut = dcache.storeAck && !walkStOutstanding
+    excStoreAckOut.simPublic()
     when(coreStFire && !coreStAck) { coreStOutstanding := coreStOutstanding + 1 }
     when(!coreStFire && coreStAck && (coreStOutstanding =/= 0)) {
       coreStOutstanding := coreStOutstanding - 1

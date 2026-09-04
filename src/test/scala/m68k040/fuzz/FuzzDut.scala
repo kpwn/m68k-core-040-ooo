@@ -247,7 +247,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     exc.dcLoadRsp.valid   := dc.loadRsp.valid
     exc.dcLoadRsp.payload := dc.loadRsp.payload
     exc.dcLoadBusy        := dc.loadBusy
-    exc.dcStoreAck        := dc.storeAck
+    // W13: the walker is a THIRD store client and the terminal ack is untagged, so it
+    // must be demultiplexed before the exception sequencer consumes it. See
+    // `LsEuPlugin.logic.excStoreAckOut`.
+    exc.dcStoreAck        := lsEu.logic.excStoreAckOut
     lsEu.excActive            := excActive
     lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr

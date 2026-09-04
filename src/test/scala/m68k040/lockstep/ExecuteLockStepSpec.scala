@@ -349,7 +349,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       exc.dcLoadRsp.valid   := dc.loadRsp.valid
       exc.dcLoadRsp.payload := dc.loadRsp.payload
       exc.dcLoadBusy        := dc.loadBusy
-      exc.dcStoreAck        := dc.storeAck
+      // W13: the walker is a THIRD store client and the terminal ack is untagged, so it
+    // must be demultiplexed before the exception sequencer consumes it. See
+    // `LsEuPlugin.logic.excStoreAckOut`.
+    exc.dcStoreAck        := lsEu.logic.excStoreAckOut
       // route the exc's cache requests through the LS EU's arbiter
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid

@@ -425,7 +425,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     exc.dcLoadRsp.valid   := dc.loadRsp.valid
     exc.dcLoadRsp.payload := dc.loadRsp.payload
     exc.dcLoadBusy        := dc.loadBusy
-    exc.dcStoreAck        := dc.storeAck
+    // W13: the walker is a THIRD store client and the terminal ack is untagged, so it
+    // must be demultiplexed before the exception sequencer consumes it. See
+    // `LsEuPlugin.logic.excStoreAckOut`.
+    exc.dcStoreAck        := lsEu.logic.excStoreAckOut
     // Task P4.5: the D-cache's async diagnostic-fault channel (a non-OKAY AXI
     // response on a trusted-cacheable-path transaction) latches a sticky,
     // non-interrupt-wakeable CORE HALT.
