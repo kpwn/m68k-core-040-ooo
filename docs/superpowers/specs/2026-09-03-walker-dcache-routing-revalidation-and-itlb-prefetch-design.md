@@ -13,7 +13,8 @@ D-cache. That design already exists, is complete, and has been through seven rev
 | Scoping memo | `.superpowers/sdd/2026-08-18-walker-dcache-passthrough-scoping.md` | 478 ln | done |
 | Design spec | `docs/superpowers/specs/2026-08-18-walker-dcache-passthrough-design.md` | 3477 ln | 30 DECIDED (W1–W30), 4 non-decisions (N1–N4), signed off round 7 (`849f78a`) |
 | Implementation plan | `docs/superpowers/plans/2026-08-18-walker-dcache-passthrough-implementation-plan.md` | 3702 ln | 19 tasks, gated, **never executed** |
-| Comparison study | `.superpowers/sdd/naxriscv-walker-dcache-comparison-2026-08-19-report.md` | 300 ln | done |
+| Comparison study | `.superpowers/sdd/naxriscv-walker-dcache-comparison-2026-08-19-report.md` | 300 ln | done — **read path only; see round 2** |
+| Comparison study, round 2 | `docs/superpowers/specs/2026-09-04-naxriscv-walker-comparison-round2.md` | — | done (2026-09-04). Answers the questions round 1 did not ask: the I-side, A/D-vs-U/M, and the walk's exposure to the store queue. Three carry-forwards: (a) **W17/W13/W24 — the walker as a *store* client — have no NaxRiscv precedent**, because NaxRiscv's walker never writes (RISC-V Svade traps to software; the 68040 mandates hardware U/M, so `UmWriteQueue` is irreducible); (b) proposes a new non-decision **N5**, the walk-vs-StoreQueue ordering hazard, currently absent from the spec (pre-existing, PFLUSH-covered, cheap — NaxRiscv mitigates it with `DataCache.scala:53`'s `redoOnDataHazard`); (c) flags **single-walker unification** (NaxRiscv has one engine for both TLBs) as a real, separately-sized candidate that `cache/AxiIds.scala`'s own header already argues for on AR-id-collision grounds. Confirms §5.1's no-circular-dependency conclusion independently, and confirms W1–W4 and W11. Warns that NaxRiscv's static `ioRange`/`memRange` address decode must **not** be borrowed. |
 
 This document does the three things that were actually still missing:
 
