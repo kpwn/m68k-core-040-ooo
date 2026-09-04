@@ -44,6 +44,18 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
     // reader exists yet for FP/FPCC), so it would otherwise be pruned from the
     // isolated-RenameStage sim build.
     spinal.core.sim.SimPublic(fpRat.io.committedPhys, fpccRat.io.committedPhys)
+    // STRUCTURAL LOCK-STEP (2026-09-04, NaxRiscv comparison item 2): the committed
+    // int/NZVC/X mappings are what turns `CommittedMapService` into a full
+    // architectural-register read for the lock-step harness -- `intPhys(i)` names the
+    // physical register holding arch reg i, and RegFilePlugin's sim-only `shadow` Vec
+    // holds its value. Together they give a 16-register + CCR structural compare that
+    // does NOT depend on the DUT volunteering a writeback record (the hole
+    // `LockStep.scala:18-19` documents as "the trust model, not full coverage").
+    // `intRat.committedPhys(15)` already has a real RTL consumer (committedPhysA7); the
+    // rest are pruned from a Verilator build without this, exactly like the FP pair above.
+    // Sim-only name preservation: zero synthesis cost.
+    spinal.core.sim.SimPublic(intRat.io.committedPhys, nzvcRat.io.committedPhys,
+                              xRat.io.committedPhys)
 
     // ── Freelists ────────────────────────────────────────────────────────────
     val intFree  = Freelist(physCount = 50, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
