@@ -4,7 +4,7 @@ import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.isa.Size
 import m68k040.ls.BehavioralMemAgent
-import m68k040.mmu.DIdentityTranslationPlugin
+import m68k040.mmu.{DIdentityTranslationPlugin, MmuControlPlugin}
 import m68k040.sim.{AxiMemModel, AxiMemModelConfig, L2LatencyModel}
 import spinal.core._
 import spinal.core.sim._
@@ -22,7 +22,14 @@ class DcacheSpec extends AnyFunSuite {
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin()
     val probe  = new DcacheProbePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe)) }
+    // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
+    // DcachePlugin's PAGE-scope granule can be exercised at BOTH page sizes. It is
+    // fully self-contained (its build body reads nothing from `host`), so it adds no
+    // elaboration dependency beyond the one DcachePlugin now takes on it. `pageSize8K`
+    // is RegInit(False), so every pre-existing test in this file sees the identical
+    // 4 KB behaviour it saw before this plugin was added.
+    val mmuCtrl = new MmuControlPlugin
+    db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl)) }
   }
 
   def simConfig = M68kSim().withVerilator
@@ -1646,6 +1653,187 @@ class DcacheSpec extends AnyFunSuite {
         assert(!anyDirtyIn(dut, b), f"line 0x$b%x still dirty after CPUSH-All")
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Part 131: the PAGE-scope granule must follow TCR.P (4 KB vs 8 KB)
+  //
+  // THE DEFECT. `DcachePlugin`'s PAGE-scope `pageMatch` compared `paddr[31:12]` --
+  // a hardcoded 4 KB granule -- while task #195 gave the rest of the core a real
+  // TCR.P-selected page size. On an 8 KB-page machine (`TC = 0x0000c000`, P=1),
+  // which is what the ROM under test configures, a `CPUSHP`/`CINVP` therefore
+  // inspected only the 4 KB half containing the operand address.
+  //
+  // WHY THESE TESTS DID NOT EXIST BEFORE, AND WHY THAT IS NOT A "TEST AFTER FIX"
+  // SHORTCUT. Before this change `DcachePlugin` had NO page-size input at all, so
+  // "a CPUSHP covers 4 KB" was the only behaviour the RTL could be asked for -- and
+  // it is the CORRECT behaviour for a 4 KB machine. There was no signal a test could
+  // set to demand the other one, so the missing input and the missing test are the
+  // same defect. The bar these tests hold themselves to instead is DISCRIMINATION:
+  // `p131Coverage` is run with ONLY `is8K` changed, and the 4 KB run asserts the
+  // exact OPPOSITE outcome for the upper-half line that the 8 KB run asserts. The
+  // 8 KB tests fail on unfixed RTL; the 4 KB test fails if the granule were merely
+  // widened unconditionally. Both directions are pinned, by construction.
+  //
+  // GEOMETRY. Taken from the live capture (docs/superpowers/specs/
+  // 2026-09-04-covering-flush-and-page-cache-mode.md §5.1, invocation #10): an 8 KB
+  // page based at 0xE000, `A1 = 0xEFD0` in its LOWER 4 KB half, and a needed range
+  // running to 0xF0CF -- i.e. 13 lines into the UPPER half, past where the 4 KB
+  // match stopped. Cache geometry is 128 sets / 16 B lines, so set == paddr[10:4];
+  // the four addresses below land in four DISTINCT sets (0x7D, 0x0C, 0x70, 0x04),
+  // so there is no way pressure and no eviction to confound the result.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  val P131_LOW   = 0xEFD0L   // 8 KB page 0xE000..0xFFFF, LOWER 4 KB half -- set 0x7D
+  val P131_HIGH  = 0xF0C0L   // same 8 KB page,           UPPER 4 KB half -- set 0x0C
+  val P131_BELOW = 0xDF00L   // previous 8 KB page (0xC000..0xDFFF)       -- set 0x70
+  val P131_ABOVE = 0x10040L  // next 8 KB page (0x10000..0x11FFF)         -- set 0x04
+  val P131_LINES = Seq(P131_BELOW, P131_LOW, P131_HIGH, P131_ABOVE)
+
+  /** A per-line distinctive store value, so "did this line's data reach memory?" is a
+    * positive identification and not merely "the bytes changed". */
+  def p131Mark(base: Long): BigInt = BigInt(0xC0DE0000L | ((base >> 4) & 0xFFFFL))
+
+  def peekLong(mem: BehavioralMemAgent, addr: Long): BigInt =
+    (0 until 4).foldLeft(BigInt(0))((a, i) => (a << 8) | BigInt(mem.peekByte(addr + i)))
+
+  /** `pushed`: the line's dirty data was written back to memory by the walk.
+    * `dirty` : the line was still dirty in the array after the walk completed. */
+  case class P131Result(pushed: Map[Long, Boolean], dirty: Map[Long, Boolean],
+                        reloaded: Map[Long, BigInt])
+
+  /** Dirty one line in EACH 4 KB half of the 0xE000 8 KB page, plus one control line
+    * in each ADJACENT 8 KB page, then issue a SINGLE PAGE-scope maintenance command
+    * at `operand` and report what it actually touched.
+    *
+    * The ONLY difference between the 8 KB runs and the 4 KB control is `is8K`.
+    * Explicit sim seeds (rather than `doSim`'s default draw from the shared
+    * `scala.util.Random`) keep these tests deterministic AND keep them from shifting
+    * the seed sequence the rest of the suite consumes. */
+  def p131Coverage(name: String, seed: Int, is8K: Boolean, operand: Long,
+                   push: Boolean, invalidate: Boolean): P131Result = {
+    var out: P131Result = null
+    sharedCompiled.doSim(name, seed) { dut =>
+      val (cd, mem) = initDut(dut)
+      // Poke TCR.P only AFTER reset has released -- an early poke of a RegInit is just
+      // an ordinary register write that reset then overwrites (this project's task
+      // #194 precedent). The read-back below turns that gotcha into a hard assert
+      // rather than a silently-vacuous test.
+      cd.waitSampling(8)
+      dut.mmuCtrl.logic.pageSize8K #= is8K
+      cd.waitSampling(2)
+      assert(dut.mmuCtrl.logic.pageSize8K.toBoolean == is8K,
+        s"TCR.P poke did not stick (wanted $is8K) -- this test would be vacuous")
+
+      P131_LINES.foreach { b =>
+        preload(mem, b, 16)
+        load(dut, cd, b, Size.LONG, CacheMode.WRITETHROUGH)     // warm, clean
+        doStore(dut, cd, b + 4, p131Mark(b), Size.LONG, CacheMode.COPYBACK)
+        assert(anyDirtyIn(dut, b), f"precondition: line 0x$b%x must be dirty")
+        assert(peekLong(mem, b + 4) != p131Mark(b),
+          f"precondition: a COPYBACK hit at 0x$b%x must NOT have reached memory yet")
+      }
+
+      maintPulse(dut, cd, push = push, invalidate = invalidate, SCOPE_PAGE, SEL_DC, operand)
+      maintWait(dut, cd)
+      cd.waitSampling(8)
+
+      // Snapshot BEFORE any reload: a load would refill/allocate and perturb dirty state.
+      val pushed = P131_LINES.map(b => b -> (peekLong(mem, b + 4) == p131Mark(b))).toMap
+      val dirty  = P131_LINES.map(b => b -> anyDirtyIn(dut, b)).toMap
+      val reloaded = P131_LINES.map(b =>
+        b -> load(dut, cd, b + 4, Size.LONG, CacheMode.COPYBACK)).toMap
+      out = P131Result(pushed, dirty, reloaded)
+    }
+    assert(out != null, "the sim body never ran")
+    out
+  }
+
+  // (P131-a) THE MEASURED CASE. Operand in the LOWER 4 KB half of an 8 KB page; the
+  // dirty line in the UPPER half is the one the old 4 KB `pageMatch` never inspected.
+  // FAILS on unfixed RTL (and fails today if `is8K` is forced false -- see P131-c).
+  test("CPUSHP covers the WHOLE 8 KB page when TCR.P=1 (operand in the lower half)",
+       VerilatorTest) {
+    val r = p131Coverage("p131_8k_low", 131, is8K = true, operand = P131_LOW,
+                         push = true, invalidate = false)
+    assert(r.pushed(P131_LOW),
+      "CPUSHP must push the dirty line in the operand's own 4 KB half")
+    assert(r.pushed(P131_HIGH),
+      "THE DEFECT: with TCR.P=1 a CPUSHP must also push the dirty line in the UPPER " +
+      "4 KB half of the SAME 8 KB page. A 4 KB granule stops at 0xF000 and leaves it behind.")
+    assert(!r.dirty(P131_LOW) && !r.dirty(P131_HIGH),
+      "both pushed lines must be left CLEAN")
+    assert(!r.pushed(P131_BELOW) && !r.pushed(P131_ABOVE),
+      "CPUSHP must NOT reach into the ADJACENT 8 KB pages -- the granule is 8 KB, not 16 KB")
+    assert(r.dirty(P131_BELOW) && r.dirty(P131_ABOVE),
+      "lines outside the addressed 8 KB page must stay dirty")
+  }
+
+  // (P131-b) The symmetric straddle: operand in the UPPER half, dirty line in the LOWER.
+  test("CPUSHP from the UPPER half of an 8 KB page also covers the lower half",
+       VerilatorTest) {
+    val r = p131Coverage("p131_8k_high", 132, is8K = true, operand = P131_HIGH,
+                         push = true, invalidate = false)
+    assert(r.pushed(P131_HIGH), "CPUSHP must push the operand's own line")
+    assert(r.pushed(P131_LOW),
+      "with TCR.P=1 a CPUSHP issued from the upper half must also push the LOWER half")
+    assert(!r.pushed(P131_BELOW) && !r.pushed(P131_ABOVE),
+      "CPUSHP must not reach into the adjacent 8 KB pages")
+  }
+
+  // (P131-c) THE 4 KB POSITIVE CONTROL. Byte-identical body, `is8K = false`, and the
+  // OPPOSITE expectation for the upper-half line. This is what proves the fix is a
+  // TCR.P-selected granule and not an unconditional widening that would over-flush
+  // (and, for CINVP, over-INVALIDATE) on every 4 KB-page machine.
+  test("4 KB CONTROL: with TCR.P=0 a CPUSHP covers exactly 4 KB and no more",
+       VerilatorTest) {
+    val r = p131Coverage("p131_4k_ctl", 133, is8K = false, operand = P131_LOW,
+                         push = true, invalidate = false)
+    assert(r.pushed(P131_LOW),
+      "CPUSHP must still push the dirty line in the operand's own 4 KB page")
+    assert(!r.pushed(P131_HIGH),
+      "REGRESSION GUARD: with TCR.P=0 the granule is 4 KB, so the line at 0xF0C0 is in " +
+      "a DIFFERENT page and must NOT be pushed. If this fails the granule was widened " +
+      "unconditionally and every 4 KB-page machine now over-flushes.")
+    assert(r.dirty(P131_HIGH) && r.dirty(P131_BELOW) && r.dirty(P131_ABOVE),
+      "only the operand's own 4 KB page may be cleaned")
+  }
+
+  // (P131-d) CINVP shares the SAME `pageMatch` predicate, so it shared the defect.
+  // Invalidate discards dirty data: memory must be UNCHANGED and a reload must return
+  // the ORIGINAL preloaded bytes for BOTH halves.
+  test("CINVP shares the TCR.P granule: TCR.P=1 invalidates both 4 KB halves",
+       VerilatorTest) {
+    val r = p131Coverage("p131_8k_cinv", 134, is8K = true, operand = P131_LOW,
+                         push = false, invalidate = true)
+    assert(!r.pushed(P131_LOW) && !r.pushed(P131_HIGH),
+      "CINV must not write anything back")
+    assert(!r.dirty(P131_LOW) && !r.dirty(P131_HIGH),
+      "THE DEFECT (CINV side): with TCR.P=1 CINVP must drop the lines in BOTH 4 KB " +
+      "halves of the addressed 8 KB page")
+    P131_LINES.filter(b => b == P131_LOW || b == P131_HIGH).foreach { b =>
+      assert(r.reloaded(b) == expected(b + 4, 4),
+        f"after CINVP the line at 0x$b%x must be non-resident and reload the ORIGINAL memory")
+    }
+    assert(r.dirty(P131_BELOW) && r.dirty(P131_ABOVE),
+      "CINVP must not reach into the adjacent 8 KB pages")
+    assert(r.reloaded(P131_BELOW) == p131Mark(P131_BELOW) &&
+           r.reloaded(P131_ABOVE) == p131Mark(P131_ABOVE),
+      "lines outside the addressed page must still hold their (dirty, cached) values")
+  }
+
+  // (P131-e) CINVP 4 KB control -- the over-invalidation direction, which is strictly
+  // worse than over-flushing because it DISCARDS dirty data rather than writing it back.
+  test("4 KB CONTROL: with TCR.P=0 CINVP must NOT invalidate the neighbouring 4 KB block",
+       VerilatorTest) {
+    val r = p131Coverage("p131_4k_cinv", 135, is8K = false, operand = P131_LOW,
+                         push = false, invalidate = true)
+    assert(!r.dirty(P131_LOW), "CINVP must drop the operand's own 4 KB page")
+    assert(r.dirty(P131_HIGH),
+      "REGRESSION GUARD: with TCR.P=0 CINVP must leave the neighbouring 4 KB block alone. " +
+      "Over-invalidating here would silently DISCARD dirty data on every 4 KB machine.")
+    assert(r.reloaded(P131_HIGH) == p131Mark(P131_HIGH),
+      "the untouched neighbouring block must still hold its dirty cached value")
   }
 
   // (P5.4-d) An IC-only selector has no D-cache work: it completes without walking and
