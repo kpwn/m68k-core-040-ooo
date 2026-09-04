@@ -302,6 +302,18 @@ session. Nothing is inherited from a quoted figure.
 | 200-seed fuzz sweep (`tools/fuzz/sweep.sh 0 200 25 20`) | 3 (seeds 80, 109, 127) | **3 — seeds 80, 109, 127** | **unchanged; the bar was "must not rise"** |
 | `WalkerDescriptorCoherencySpec` | 0/2 by construction | **2/2** | the acceptance gate |
 
+### 5.0 Netlist and port-surface checks
+
+- `M68kFullCoreSynth` elaborates; `tools/socket/check_socket_netlist.py` is **green**
+  against the re-baselined golden (§6, the one intended port-surface change).
+- `M68kSocketTop` also elaborates — worth checking explicitly because
+  `AxiDMergePlugin`'s two walker slave ports are now tied idle rather than connected.
+  Its checker reports **exactly one** failure, `D23: the socket top exports ONLY
+  cpu_socket.vh ports`, listing 30 `dbg040_*` debug probes. Generating the same netlist on
+  the pristine `bb3bca1` worktree and running the same checker produces the
+  **byte-identical** list. Pre-existing, untouched, and **no `itlbAxi_*`/`dtlbAxi_*` port
+  appears in it** — which is the intended result reaching the socket boundary too.
+
 ### 5.1 `test-fast`, reconciled arithmetically
 
 The test-name diff between the two logs is exactly two entries removed and none added:
