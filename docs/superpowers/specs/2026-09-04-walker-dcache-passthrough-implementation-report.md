@@ -21,9 +21,13 @@ Three commits, each keeping the tree green:
 
 | Commit | Contents |
 |---|---|
+| `486744f` | A regression this change introduced, caught by `ExceptionUnit`'s own assertion and fixed: the sequencer's untagged store ack demultiplexed away from walker U/M stores (§5.4). Plus two hardening items from the same audit. |
+| `63d018a` | Reconciling the migrated LS/MMU specs. |
+| `a0e77a6` | The acceptance test. |
 | `8a6a431` | The RTL: `TableWalker` reads via `DcacheService`, the U/M writeback as one `DStoreCmd`, the four-source arbitration layer in `LsEuPlugin`, `quiesceHold`, W26's wedge report, `walkerAxi` deleted, `AxiDMerge`'s two walker owners tied off, port golden re-baselined, 28 test files migrated + a new sim agent. |
-| `a0e77a6` | `mmu/WalkerDescriptorCoherencySpec` — the acceptance test, both directions, with its pre-change failure text recorded. |
-| `63d018a` | Reconciling the migrated LS/MMU specs with walk traffic sharing the D-cache ports; two behavioural findings recorded rather than papered over. |
+
+Plus, on its own branch off the sibling benchmark work, `bench/walk-kernel-premise-fix`
+(`91eee43`) — §5.5.
 
 ---
 
@@ -287,17 +291,20 @@ never written at all, failing on both implementations for a reason unrelated to 
 
 ## 5. Verification
 
-Numbers are from this session, against a pristine `bb3bca1` baseline run in the same
+Every number is from this session, against a pristine `bb3bca1` baseline run in the same
 session. Nothing is inherited from a quoted figure.
 
-| Sweep | Baseline `bb3bca1` | This branch | Δ |
+| Sweep | Baseline `bb3bca1` | This branch (`486744f`) | Δ |
 |---|---|---|---|
-| `make test-fast` (= `sbt fastTest`) | 341 run, **341 pass, 0 fail**, 2 ignored, 215 suites | 339 run, **338 pass, 1 fail**, 2 ignored, 215 suites | see below |
-| `m68k040.mmu.* m68k040.ls.* m68k040.cache.*` | 328 run, 317 pass, **11 fail**, 45 suites | 330 run, 317 pass, **13 fail** → **11 fail after reconciliation**, 46 suites | +2 tests (the acceptance spec) |
-| `WalkerDescriptorCoherencySpec` | 0/2 (by construction) | **2/2** | the acceptance gate |
+| `make test-fast` (= `sbt fastTest`) | 341 run, **341 pass, 0 fail**, 2 ignored, 215 suites | 339 run, **338 pass, 1 fail**, 2 ignored, 215 suites | −2 tests, 1 known flake |
+| `m68k040.mmu.* m68k040.ls.* m68k040.cache.*` | 328 run, 317 pass, **11 fail**, 45 suites | 330 run, 319 pass, **11 fail**, 46 suites | +2 tests, **failure set byte-identical** |
+| `ExecuteLockStepSpec` (run separately — it is excluded from `test-fast`) | not re-run | **505 pass, 0 fail**, 1 ignored | green |
+| 200-seed fuzz sweep (`tools/fuzz/sweep.sh 0 200 25 20`) | 3 (seeds 80, 109, 127) | **3 — seeds 80, 109, 127** | **unchanged; the bar was "must not rise"** |
+| `WalkerDescriptorCoherencySpec` | 0/2 by construction | **2/2** | the acceptance gate |
 
-**`test-fast` reconciliation, arithmetically.** The test-name diff between the two logs is
-exactly two entries, both removed and none added:
+### 5.1 `test-fast`, reconciled arithmetically
+
+The test-name diff between the two logs is exactly two entries removed and none added:
 
 ```
 --- only in baseline ---
@@ -311,47 +318,175 @@ Those are `socket/WalkerIdGuardSpec`, deleted per W20 because its subject — th
 AXI master and its AR-id guard — ceases to exist. 341 − 2 = 339. ✓
 
 The two new coherency tests are **not** in `test-fast`: they carry the `VerilatorTest`
-tag, consistent with every other spec in the MMU cluster, and `fastTest` excludes that tag.
-They run in the `m68k040.mmu.*` sweep, which is why that sweep is 330 rather than 328.
+tag, consistent with every other spec in the MMU cluster, and `fastTest` excludes that
+tag. They run in the `m68k040.mmu.*` sweep, which is why that sweep is 330 rather than 328.
 
-**The one `test-fast` failure is a pre-existing flake, and this was measured rather than
-assumed.** `RobPluginSpec`'s *"sustained free-loop: real rename→rob keeps flowing past 48
-allocations"* failed. Its DUT (`E2EDut`) hosts no `LsEuPlugin`, no `DcachePlugin` and no
-`DtlbPlugin`, and `git diff bb3bca1 -- src/main/scala/m68k040/rob src/main/scala/m68k040/rename
-src/test/scala/m68k040/rob` is empty. Running it in isolation on the **untouched `bb3bca1`
-worktree** six times:
+**The one `test-fast` failure is `RobPluginSpec`'s `debugPcApply`** — one of the two
+seed-dependent flakes named in the brief. *(A third one exists: see §5.3.)*
+
+### 5.2 `mmu`/`ls`/`cache`, reconciled by name
+
+`comm` over the sorted failing-test names is **empty in both directions**: the 11 failures
+are the same 11. Getting there took two rounds and both are recorded rather than smoothed
+over —
+
+- the first post-change run showed **42** failures. 31 of them were one real defect in the
+  new sim helper (`WalkerDcacheSimIo` constructed in the DUT `Component` body, where the
+  TLB plugin's `during setup` has not run yet, so `c.walkLoadCmd` was null in eight DUTs).
+  Making it a `FiberPlugin` fixed all 31 at once;
+- the remaining **2** were genuine test-migration items (`DtlbViptChangedVpnSpec`'s
+  `faultCacheCmds` and `DtlbFlushReuseSpec`'s `cmdEvents`/`cancelAllCycles`/`dataMem` AR),
+  each re-qualified by the walker's reserved load token so the assertion keeps its old
+  meaning rather than being loosened.
+
+### 5.3 A retraction
+
+An earlier reading of these runs suspected `RobPluginSpec`'s *"sustained free-loop: real
+rename→rob keeps flowing past 48 allocations"* as a regression: it failed four times in a
+row on this branch. It is **not** a regression. Its DUT (`E2EDut`) hosts no `LsEuPlugin`,
+no `DcachePlugin` and no `DtlbPlugin`, and `git diff bb3bca1 -- src/main/scala/m68k040/rob
+src/main/scala/m68k040/rename src/test/scala/m68k040/rob` is empty. Run six times in
+isolation on the **untouched `bb3bca1` worktree**:
 
 ```
 pass, pass, FAIL (11 of 120 allocated), pass, FAIL (33 of 120), FAIL (18 of 120)
 ```
 
-3 failures in 6 runs on the baseline with no changes at all. **Self-retraction:** an earlier
-4-in-a-row failure streak on this branch led me to suspect a regression; it was
-unseeded-random bad luck. This is a *third* seed-dependent `RobPluginSpec` flake, alongside
-the `debugPcApply` one already known (which is what failed in the first `test-fast` run of
-this branch).
+3 failures in 6 runs on the baseline with no changes at all. The four-in-a-row streak was
+unseeded-random bad luck. This is a **third** seed-dependent `RobPluginSpec` flake,
+alongside `debugPcApply`.
 
-**`mmu`/`ls`/`cache` reconciliation.** The first post-change run showed 42 failures. 31 of
-those were a single real defect in the new sim helper — `WalkerDcacheSimIo` was constructed
-in the DUT `Component` body, where the TLB plugin's `during setup` has not run yet, so
-`c.walkLoadCmd` was null in eight DUTs. Making it a `FiberPlugin` fixed all 31. The
-remaining delta was **two** genuine test-migration items, both now closed, leaving the
-failure set **identical to the 11-failure baseline** (`comm` diff of the failing-test names
-is empty in both directions).
+### 5.4 One real regression, introduced and fixed
+
+`ExecuteLockStepSpec` caught it, through `ExceptionUnit`'s own assertion:
+
+```
+FAILURE ExceptionUnit: attempted to overwrite an unaccepted frame-store command
+[info] - lock-step: MOVEM.L D0-D3,-(An) STORE faults on the 3rd store (D1) ... *** FAILED ***
+```
+
+`ExceptionUnit.dcStoreAck` is wired straight off `DcacheService.storeAck` by every
+integrated DUT, unqualified. With two store clients that was safe — the sequencer only
+stores after `E_DRAIN` has waited on `sqDrained`, so no SQ store can be outstanding to ack
+in its place. **A table walker is a third store client and breaks that**, and W13's SQ-side
+demux did not cover it. It is also not enough that `stGrantOk` refuses a *new* grant while
+the sequencer has a store presented: a walker store granted earlier can still be
+outstanding when the sequencer reaches `E_STORE`, and its ack then advances `E_STWAIT`
+while `stoValidReg` is still set.
+
+Measured on the same single test:
+
+| | result |
+|---|---|
+| `bb3bca1` baseline | **PASS** |
+| this branch, before the fix | **FAILED** — the assertion above |
+| this branch, after the fix | **PASS** |
+
+`LsEuPlugin` now exposes `logic.excStoreAckOut = storeAck && !walkStOutstanding` and the
+four integrated DUTs consume that. Deliberately not also qualified against the SQ's own
+acks — that is pre-existing behaviour protected by the sequencer's `sqDrained` discipline.
+
+Two hardening items from the same audit went in alongside, both of which were latent
+false-halt / needless-stall risks rather than observed failures:
+
+- **`quiesceHold` now also covers `S_MAINTWAIT`**, not just `S_DRAIN`/`S_APPLY`. The
+  D-cache refuses both client directions for the whole maintenance walk, which is 512
+  iterations each of which may write a dirty victim back at DDR latency; a walker granted
+  a port just before the walk started would hold that grant, making no progress on any
+  channel, for tens of thousands of cycles.
+- **W26's wedge bound goes 4096 → 2²⁰ cycles** for the same reason: 4096 sits *inside* the
+  duration of a legitimate maintenance walk, so it could have raised a **false** sticky
+  core halt. A false halt is far worse than a late report.
+
+### 5.5 The sibling benchmark's bimodal walk measurement — chased, and it is the kernel
+
+The latency-microbenchmark suite recorded `{0.00, 0.00, 567.25, 556.43, 0.00}` for its
+real-walk half, correctly declined to average it, and flagged *"a run whose end point is
+independent of chain length points at the MMU-on / real-page-table configuration
+terminating on something other than the chase — a wedge, or a fault path"* as a possible
+defect in exactly this walker.
+
+**It is a kernel premise violation, not a walker defect, and the evidence is direct.**
+
+`chaseStep` is `move.l (%a0),%d1 ; adda.l %d1,%a0 ; adda.l #STRIDE,%a0` and only strides by
+`STRIDE` if the loaded value is **zero**. `kTlbChase.prepMem` wrote the page *tables* and
+never wrote the *data* pages — and an untouched `SparseMemory` page is PRNG-filled, not
+zeroed. So `%d1` was garbage, `a0` jumped somewhere arbitrary, and under `mmuWalkD`
+(deliberately no D-side TTR) that arbitrary address is unmapped and takes a translation
+fault. The short and long kernels share a byte-identical prefix, so they derailed at the
+**same** step and produced the **same** window — a differential of exactly 0.00. The
+`mmuNoWalk` control never faults, because its match-all TTR translates anything, which is
+precisely why only the walk half looked unstable.
+
+Measured on **unmodified `bb3bca1` + the bench suite**, five seeds, via a new `DIAG` test:
+
+```
+---- walk, RAW (data pages never written -> PRNG-filled) ----
+  seed=00006d68  short: INCOMPLETE 66/174    long: INCOMPLETE 66/354
+  seed=00008c57  short: INCOMPLETE 65/174    long: INCOMPLETE 65/354
+  seed=0000ab46  short: INCOMPLETE 158/174   long: INCOMPLETE 158/354
+  seed=0000ca35  short: INCOMPLETE 158/174   long: INCOMPLETE 158/354
+  seed=0000e924  short: INCOMPLETE 69/174    long: INCOMPLETE 69/354
+---- walk, FIXED (data pages zeroed) ----
+  seed=00006d68  short: 176/174 win=1983   long: 356/354 win=4065   perStep=34.70
+  seed=00008c57  short: 176/174 win=2070   long: 356/354 win=4158   perStep=34.80
+  seed=0000ab46  short: 176/174 win=2025   long: 356/354 win=4121   perStep=34.93
+  seed=0000ca35  short: 176/174 win=2027   long: 356/354 win=4106   perStep=34.65
+  seed=0000e924  short: 176/174 win=1969   long: 356/354 win=4014   perStep=34.08
+```
+
+The walk kernel never completed on **any** seed, and short and long stopped at the
+identical macro count — which *is* the 0.00 signature. With the premise made true it
+completes on every seed and the differential is stable. The fix is one `prepMem` addition,
+committed as `bench/walk-kernel-premise-fix` (`91eee43`) off that suite's own branch so it
+can be taken or left independently.
+
+**So §4.1's "NOT MEASURED" can be closed, and a real before/after exists.** Same harness,
+same seeds, both memory models. The choice of memory model turns out to be the whole story,
+which is exactly why the suite's own acceptance bar says a zero-latency reading is
+disqualifying for a memory-side claim.
+
+**Zero-latency memory model** (5 seeds) — memory is free, so the entire mechanism the
+design rests on is worth nothing here by construction:
+
+| | baseline `bb3bca1` | walker → D-cache | Δ |
+|---|---|---|---|
+| page-stride access, TTR (no walk) | 19.010 ± 0.260 | 18.913 ± 0.076 | −0.10 (noise) |
+| page-stride access, real walk | 34.633 ± 0.292 | 40.420 ± 0.092 | +5.79 |
+| **DTLB miss: 3-level walk cost** | **15.623 ± 0.379** | **21.507 ± 0.050** | **+5.88 cyc (+37.7 %)** |
+
+**L2-faithful memory model** (`IPC_MEM=l2`: L2 hit 5 cyc, DDR 70 cyc, 64 B line; 3 seeds) —
+the regime any real system is in:
+
+| | baseline `bb3bca1` | walker → D-cache | Δ |
+|---|---|---|---|
+| page-stride access, TTR (no walk) | 97.094 ± 0.143 | 96.978 ± 0.147 | −0.12 (noise) |
+| page-stride access, real walk | 160.622 ± 0.157 | 161.322 ± 0.282 | +0.70 |
+| **DTLB miss: 3-level walk cost** | **63.528 ± 0.263** | **64.344 ± 0.173** | **+0.82 cyc (+1.3 %)** |
+
+**The penalty collapses from +5.88 cycles (+37.7 %) to +0.82 cycles (+1.3 %) the moment
+memory costs anything.** That is the design's own predicted mechanism appearing where it
+should: this kernel's root and pointer descriptors are the *same two lines* on every
+access, so once routed through L1D they hit instead of paying memory latency, and that
+recovers almost all of the added pipeline overhead. The zero-latency figure is the pure
+overhead half of the trade with the payoff half switched off.
+
+**Still not a speedup, and none is claimed.** Even under L2-faithful memory this kernel is
+a worst case for the feature — it deliberately evicts the DTLB set on every access, so
+every access walks, and the leaf descriptors stride 32 bytes apart so they are cold every
+time. What it establishes is the honest bound: **the cost of the correctness fix, in the
+realistic regime, is about 1 %% of a walk.** The revalidation's §6.3 plan —
+`walkL1dHitRate` as the headline, on a boot trace rather than a microkernel — is still the
+measurement that would show an actual win, and is now much cheaper to run given the
+harness fix.
 
 ### Not run, and named as such
 
-- **200-seed fuzz sweep.** Queued; the host has been sitting at 8–15 GB of other agents'
-  JVMs for most of this session and `tools/fuzz/sweep.sh 0 200 25 20` needs a dedicated
-  ~10 GB JVM per batch. **The bar is: must not rise above 3 (seeds 80, 109, 127).**
-- **`ExecuteLockStepSpec` as a separate run.** Same reason.
 - **The postroute synth gate.** §8 — a committed launcher, deliberately not a background
-  process.
-- **Ported-corpus sweep.** Out of the stated scope.
-- **Any boot-impact claim.** None is made. Nothing here was run on hardware, and the SD
-  card, the JTAG lease and the board were not touched.
-
----
+  process. This is the one gate this work has not passed.
+- **Ported-corpus sweep.** Outside the stated scope.
+- **Any boot-impact claim.** None is made. Nothing here ran on hardware; the SD card, the
+  JTAG lease and the board were not touched.
 
 ## 6. Plan tasks: executed, and invalidated by the tree
 
@@ -492,15 +627,15 @@ silent-corruption bugs.
 - **N2 — L1D pollution.** Walker reads now allocate lines (WRITETHROUGH allocates;
   `doAllocate` excludes only INHIBITED). Page-table lines compete for capacity. Not
   measured here.
-- **Cold-walk latency is genuinely worse, and it is measured.** In a directed LS-cluster
-  DUT, the cold first access (DTLB miss + three dependent descriptor reads + the load)
-  went **34 → 41/44/45/47 cycles** across seeds: each descriptor read is now a D-cache miss
-  with a refill and an arbitration hand-over instead of a single-beat read on a private
-  port into a zero-latency memory model. The **warm** path is unchanged (15 → 15/17/17).
-  On a real workload repeat walks hit L1D and are much cheaper — that is the performance
-  thesis — but **no speedup is claimed and none was measured.** The revalidation's §6.3
-  measurement plan (`walkL1dHitRate` as the headline, a boot trace rather than a
-  microkernel, a non-zero-latency memory model) is untouched work.
+- **Walk latency is worse, and by how much depends entirely on the memory model** — see
+  §5.5 for the full table. Under a **zero-latency** model a 3-level walk goes
+  15.6 → 21.5 cycles (+37.7 %); under the **L2-faithful** model (L2 5 cyc / DDR 70 cyc)
+  the same measurement is 63.5 → 64.3 cycles (**+1.3 %**), because the upper-level
+  descriptors now hit L1D instead of paying memory latency. The directed LS-cluster test
+  agrees with the zero-latency arm: its cold first access went 34 → 41/44/45/47 cycles
+  across seeds, while its **warm** path was unchanged (15 → 15/17/17). **No speedup is
+  claimed and none was measured** — every kernel available is a worst case for this
+  feature.
 - **N4 — a new stall coupling.** Both walker directions are refused for the duration of a
   D-cache maintenance walk (bounded by `sets*ways = 512` iterations). The walker used to be
   immune. Bounded, not cyclic.
