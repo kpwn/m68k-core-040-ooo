@@ -300,6 +300,17 @@ object WhiteboxCapture {
           // Fold the faulting instruction's own NZVC (CHK) onto the running CCR before
           // the entry step; -1 => no fold (the running CCR already reflects the
           // architectural state for TRAPV/DIV0/access-fault/interrupt/RTE).
+          //
+          // ⚠ THIS FOLD HID A REAL RTL BUG FOR THE WHOLE LIFE OF THIS HARNESS. The DUT
+          // does NOT commit that NZVC write to the architectural CCR — it only reaches
+          // the stacked SR — so a CHK/CHK2 handler runs on stale flags. This line
+          // SYNTHESISES the flag the DUT never committed and then compares the harness's
+          // own synthesis against the oracle, which is why every existing test passed.
+          // See `docs/BUG_chk_chk2_flags_not_committed_on_trap.md` (OPEN, RTL fix
+          // scoped but not implemented); the reference-driven `ArchLockStep`
+          // comparator, which reads the committed NZVC physical register instead of
+          // reconstructing it, sees it immediately. Do NOT "fix" this line — it is
+          // load-bearing for every non-CHK exception step; fix the RTL instead.
           if (foldNzvc >= 0) ccr = (ccr & 0x10) | (foldNzvc & 0xf)
           // MOVE-to-SR's ABSOLUTE 5-bit CCR write SETS the running CCR (X N Z V C).
           if (setCcr5 >= 0) ccr = setCcr5 & 0x1f

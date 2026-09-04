@@ -3896,7 +3896,43 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 18)
   }
 
-  test("lock-step: mispredicted branch with a wrong-path UNMATCHED bsr does not leak a phantom RAS entry — rollback-on-flush fix", VerilatorTest) {
+  // PARKED 2026-09-04 (`ignore`, body kept verbatim so it can be revived). See
+  // `docs/BUG_ras_checkpoint_save_proxy_unsound.md` for the measurement.
+  //
+  // This test HAS NEVER PASSED. It fails at its own introducing commit `6962f72`,
+  // whose message records that it was "pre-existing uncommitted work found in this
+  // worktree" committed "rather than discarding it" — i.e. committed unrun. It is
+  // NOT a regression of previously-fixed behaviour, and `git bisect` on it is
+  // pointless (verified: `6962f72` reproduces the identical failure).
+  //
+  // Two things are wrong with it, both measured, neither fixable from the assembly:
+  //
+  // (1) It asserts a PER-BRANCH-PRECISE rollback guarantee the design deliberately
+  //     does not make. `checkpointSave` fires on `rob.count === 0` — a proxy whose
+  //     own doc comment concedes it is exact only "module the few cycles of
+  //     fetch->dispatch pipeline latency". In THIS program the mispredicting `beq`
+  //     is the third instruction, so the entire wrong-path excursion happens while
+  //     the ROB is still filling and that proxy holds. The save therefore captures
+  //     the speculative push AS IF architecturally correct, and the later restore
+  //     faithfully restores the phantom. There is no seed for which this program
+  //     takes a wrong-path push AND keeps a clean checkpoint.
+  //
+  // (2) Its named mechanism does not occur. `bsr wrongcall` is emitted in fetch
+  //     SLOT 1, and `rasPushValid` only fires for slot 0 (`s0IsCall`,
+  //     FetchAlignPlugin.scala:1225) — so the "UNMATCHED bsr" never pushes at all.
+  //     The push that IS observed is a wrong-path `bsr leaf` reached by
+  //     fall-through, which its own wrong-path `rts` pops two cycles later.
+  //
+  // Consequently it fails in two different ways depending on the SpinalSim seed
+  // ("got 1: ArrayBuffer(0)" when the flush beats the frontend, "got count=1" when
+  // it does not), which is why two different messages have been reported for it.
+  //
+  // Reviving it needs BOTH halves, and neither is a test-text edit: the ROB kept
+  // non-empty across the whole excursion (so no save can fire), and the unmatched
+  // call pinned into fetch slot 0 (so it pushes). Scoped, not started — together
+  // with the RTL fix that removes the proxy entirely (a retire-driven committed
+  // shadow, SS4 of the doc).
+  ignore("lock-step: mispredicted branch with a wrong-path UNMATCHED bsr does not leak a phantom RAS entry — rollback-on-flush fix", VerilatorTest) {
     // Companion to "RAS corrupt-recovery" above (2026-08-28, an independent fix --
     // see Ras.scala's doc comment; NOT part of the separate `0x40800284` wild-jump
     // investigation). That test's wrong-path excursion is a perfectly self-balanced
@@ -6502,14 +6538,34 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "loop: bra loop", nInstr = 7)
   }
 
-  // CMP2.W via (d8,An,Xn) indexed — the index reg rides srcC on both loads.
-  test("lock-step: CMP2.W (d8,An,Xn) indexed bounds pointer", VerilatorTest) {
-    runLockStep("cmp2-idx",
-      "move.l #0x3000,%a0 ; move.l #4,%d2 ; " +       // base+index+disp: 0x3000+4+(-4)=0x3000
-      "move.w #1,%d0 ; move.w %d0,(%a0) ; move.w #9,%d0 ; move.w %d0,2(%a0) ; " +
-      "move.w #5,%d1 ; cmp2.w (-4,%a0,%d2.l),%d1 ; " + // in-bounds
-      "loop: bra loop", nInstr = 8)
-  }
+  // CMP2.W via (d8,An,Xn) indexed — REMOVED as a lock-step case, deliberately.
+  //
+  // This test was written with the original CMP2/CHK2 crack (`3e16f31`), when an
+  // indexed bounds EA was admitted and executed. `b9d0781` (2026-08-19,
+  // "fix(decode): force CMP2/CHK2 indexed/full-format EA to illegal (fail-safe)")
+  // CHANGED THAT CONTRACT: `MicroOpAssembler`'s `c2IndexedShape` now forces mode 6
+  // ((d8,An,Xn), brief or full-format) and mode 7/reg 3 ((d8,PC,Xn)) to a clean
+  // vector-4 ILLEGAL, because the crack never walks a full-format bd/od chain and
+  // `EaDecoder` cannot tell the two sub-shapes apart at that point. That commit
+  // updated the ported corpus (`chk2_cmp2_illegal_ea_traps.s` case `_c6` asserts
+  // exactly this trap) but MISSED this lock-step case, leaving the tree with two
+  // tests demanding OPPOSITE behaviour from the same encoding. This one has failed
+  // ever since — it is task #257's `Divergence(7, pc: dut=0x6a19e51c
+  // oracle=0x40800020)`, whose wild DUT PC is just the harness's uninitialised
+  // vector table after the (correct, intended) vec-4 trap, not a decode defect.
+  //
+  // A lock-step case CANNOT express the current contract: Musashi executes the
+  // instruction, so any faithful oracle comparison must diverge. The contract is
+  // therefore asserted where it belongs — at decode level, in
+  // `Cmp2Chk2DecodeSpec` ("assembler: CMP2 with (d8,An,Xn) …"), added alongside
+  // this removal — and end-to-end by the ported `chk2_cmp2_illegal_ea_traps.s`.
+  //
+  // Restore a value-checking case here only when the crack actually implements
+  // indexed/full-format EA compute (task #257). NOTE for whoever does: the
+  // fail-safe's own in-code rationale is over-broad — `c2LoadUop` DOES wire
+  // `srcCReg`/`indexLong`/`indexScale` from the decoded EA, so the BRIEF-format
+  // sub-case looks implementable on its own; it is the full-format bd/od chain
+  // (and the 2-word `words(2..3)` window the crack re-decodes from) that is not.
 
   // CHK2.W in-bounds -> no trap (straight-line).
   test("lock-step: CHK2.W in-bounds (no trap)", VerilatorTest) {

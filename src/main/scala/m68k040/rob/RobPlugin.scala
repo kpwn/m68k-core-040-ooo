@@ -2712,6 +2712,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // own Wb never retires normally). `ccrFoldValid` qualifies it; for entries that
       // don't modify CCR (TRAPV/DIV0/access-fault) / interrupts / RTE it is False
       // (the whitebox's running CCR already reflects the architectural state).
+      //
+      // OPEN RTL BUG, tracked at `docs/BUG_chk_chk2_flags_not_committed_on_trap.md`:
+      // these bits reach the STACKED SR but are never committed to the architectural
+      // CCR, so a CHK/CHK2 handler executes on the PREVIOUS instruction's flags
+      // (`smi %d5` gives 0x00 on the DUT, 0xFF on Musashi). The scoped fix is an
+      // `entryNzvcWriteValid` into `RenameStage.committedPhysNzvc` driven from the
+      // same `heldCcrFold` the frame already uses — symmetric with the existing
+      // `rteNzvcWriteValid` path. NOT implemented; needs its own test and synth gate.
       val ccrFold      = UInt(4 bits)
       val ccrFoldValid = Bool()
       // True for an INTERRUPT-entry obs (channel 2 only). The lock-step harness drops
