@@ -20,8 +20,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - When HIGH: a fetch demand (`req.valid`) looks up the ITLB. A HIT returns
   *    ppn/perms/cacheMode in 1 cycle; a supervisor page accessed in user mode flags
   *    a perm fault. A MISS drops `rsp.ready` (the I-cache stalls on its existing
-  *    miss/back-pressure path) and launches this ITLB's OWN `TableWalker` (dedicated
-  *    AXI read port to the shared page table); on completion the ITLB is filled
+  *    miss/back-pressure path) and launches this ITLB's OWN `TableWalker`, whose
+  *    descriptor reads are `DcacheService` client traffic arbitrated onto the D-cache's
+  *    load port (68040 table searches are DATA accesses even for an instruction
+  *    translation); on completion the ITLB is filled
   *    (speculative fill OK) and a subsequent lookup hits. A walk that faults
   *    (non-resident / supervisor) is served from a result latch with `rsp.fault`
   *    (the I-cache raises DecodePacket.fault from it).

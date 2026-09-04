@@ -91,10 +91,21 @@ object AxiIds {
     * selects a particular slot must use `iRefill(k)` instead. */
   val I_PREFETCH = I_SPEC_BASE
 
-  // -- table walkers (their own masters today; folded in V2c) ------------------
-  /** Table-walker descriptor read. */
+  // -- table walkers: RESERVED-BUT-UNUSED since 2026-09-04 ---------------------
+  // The ITLB and DTLB table walkers no longer emit AXI at all: their descriptor reads
+  // and their U/M descriptor writebacks are ordinary `DcacheService` client traffic,
+  // arbitrated inside `LsEuPlugin` and issued (when they miss) as the D-cache's own
+  // refill / write-through under the D-cache's OWN ids. No `src/main` file references
+  // either constant any more; `socket/AxiDMergeSpec` still uses them to drive its own
+  // stimulus for the arbiter's now-idle walker ports.
+  //
+  // THE VALUES ARE DELIBERATELY KEPT AND MUST NOT BE RENUMBERED. Renumbering to "fix"
+  // the collision this header warns about below is explicitly forbidden by the socket
+  // plan's own Global Constraints, and the collision is in any case now DISSOLVED
+  // rather than mitigated: there is no walker master left to collide with anything.
+  /** Table-walker descriptor read. RESERVED; no longer emitted. */
   val WALK_READ = 2
-  /** Table-walker U/M descriptor write-back. */
+  /** Table-walker U/M descriptor write-back. RESERVED; no longer emitted. */
   val WALK_WRITE = 3
 
   // -- reset-vector reader (axi-socket adapter spec D12/D13, section 6.2) --------
