@@ -431,6 +431,16 @@ everything that matters to timing, despite a different netlist md5. **Therefore 
 FIX-vs-BASE delta is not SpinalHDL line-number churn and not placement luck between two
 different source trees: it is the cost of this change.**
 
+> **CORRECTION (same day, `2026-09-04-speculative-inhibited-fetch-gate-cost.md`).** The
+> attribution in the next paragraph is **wrong** and the remedy it proposes has no target.
+> The gate adds **one** flip-flop (`drainedQ`, `_zz_IcachePlugin_logic_nonSpecFetch_1`) and 13
+> wires at RTL; post-route it is **+7 registers and 1321 FEWER LUTs** than BASE. The +377 is
+> *setup*-endpoint churn on sequential control pins (`CE`/`R`) from a different mapping — the
+> **hold**-endpoint delta is +7, matching the register delta exactly. Two cheaper predicates
+> (ROB-head-equivalent; ROB+frontend) were then built and both proved **permissive**. See the
+> follow-up doc for the measurements and for the zero-margin finding (BASE's worst *six*
+> post-route paths are all at exactly `+0.001 ns`).
+
 **Where the cost actually comes from — not the term I expected.** FIX has **168465**
 endpoints against CTRL's 168088: **+377**. Those are the `SpeculativeFetchGate` drain-
 detection registers (`drainedQ` plus the frontend/decode/rename/ROB quiet terms it samples),
