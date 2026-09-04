@@ -513,11 +513,12 @@ against.
 | `StoreQueueSpec` "Part 127 (b1)" | **FAILS on unmodified RTL** (baseline worktree), passes with the fix |
 | `StoreQueueSpec` "Part 127 (b2)" | passes |
 | `LsEuFastPreciseSpec` "Part 127" | **FAILS on unmodified RTL** (`push=0 ready=0, expected exactly one outstanding`), passes with the fix |
-| `ExecuteLockStepSpec` (full suite — 507 cases: p124 / p126 / the 30 new p127, the mispredict and RAS-recovery cases, the whole ISA corpus) | **504 passed / 3 failed.** All three failures reproduce on the **unmodified-RTL baseline worktree**, i.e. they are pre-existing on `fmax-closure-fanout` and are **not** regressions. See the note below. |
+| `ExecuteLockStepSpec` (full suite — 507 cases: p124 / p126 / the 34 new p127, the mispredict and RAS-recovery cases, the whole ISA corpus) | **505 passed / 2 failed** (after correcting the control ceiling, which was the third). **Both** remaining failures reproduce on the **unmodified-RTL baseline worktree**, i.e. they are pre-existing on `fmax-closure-fanout` and are **not** regressions. See the note below. |
+| `p127 CONTROL` × 4 (the latency positive control) | **4 / 4**, windows 9 / 13 / 72 / 130 cycles |
 | `BsrFlushSkipSpec` | **17 / 17** |
 | `RobPluginSpec` | 44 run, 1 failed — the flake row above |
 | ported `flush_younger_bsr_reexec` / `_bsr_exc_reexec` / `_bsr_tree_reexec` / `_rts_bsr_reexec` | **4 / 4** |
-| 200-seed fuzz sweep (`FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200`) | see the merge note below — the pre-existing count is **3** (seeds 80, 109, 127) and must not rise |
+| 200-seed fuzz sweep (`FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200`) | **200 seeds, 3 divergences, 0 generator failures — seeds 80, 109, 127.** Exactly the pre-existing set; the count did **not** rise. |
 | `GenFullCoreSynthVerilog` (synthesizable elaboration) | clean, 20.4 MB netlist emitted |
 
 **Two PRE-EXISTING `ExecuteLockStepSpec` failures on this branch**, found while
