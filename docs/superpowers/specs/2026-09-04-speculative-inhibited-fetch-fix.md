@@ -359,29 +359,44 @@ net-renaming control for the synth gate: FIX-vs-CTRL is the real cost of the add
 
 | run | baseline (`ca4b901`, this session) | with the fix | verdict |
 |---|---|---|---|
-| `make test-fast` (`fastTest`) | 341 run / 341 pass (brief's number) | **341 run, 340 pass, 1 fail** | the known `RobPluginSpec debugPcApply` seed flake; `testOnly m68k040.rob.RobPluginSpec` re-run **44/44 pass**. Effectively 341/341. |
-| `ExecuteLockStepSpec` | 505 pass on a clean tree; 509 run / 508 pass / 1 fail with the audit tests added | **509 run, 509 pass, 0 fail** | **zero regressions**, and the one previously-failing test now passes |
-| `m68k040.ls.* m68k040.cache.*` | **300 run, 289 pass, 11 fail** (matches the brief's "11 by name") | 300 run, 288 pass, **12 fail** | see below |
+| `make test-fast` | 341 (brief's number) | **341 run, 340 pass, 1 fail** | the `RobPluginSpec debugPcApply` flake — see below |
+| `ExecuteLockStepSpec` | 505 clean; 509 with the audit tests added, 1 failing | **509 run, 509 pass, 0 fail** | **zero regressions**; the previously-failing RULE test now passes |
+| `m68k040.ls.*` | — | 92 run, 82 pass, **10 fail** | |
+| `m68k040.cache.*` | — | 208 run, 207 pass, **1 fail** | |
+| **`ls` + `cache` combined** | **300 run, 289 pass, 11 fail** | **300 run, 289 pass, 11 fail** | **identical count AND identical names** |
+| `IcacheSpec` + `IcachePrefetchSpec` | — | **43 run, 43 pass** | includes the rewritten §3 test |
 
-**The 12th ls/cache failure is a flake in a DUT this change cannot reach.** The 11 baseline
-failures reproduce by name exactly. The extra one is `LsEuSpec` "load miss refills then
-writes PRF + fires completion". `LsEuSpec`'s DUT contains **no `IcachePlugin` at all**
-(`src/test/scala/m68k040/ls/LsEuSpec.scala:27` — `LsEuPlugin` only), so no I-side change can
-structurally affect it. Re-running `testOnly m68k040.ls.LsEuSpec` on the fix tree fails a
-**different** test of that suite ("cross-line store after cross-line load drains BOTH
-slots", which appears in neither the baseline nor the first fix run) and passes "load miss
-refills" — i.e. the suite is seed/ordering-dependent, with one wandering failure among 7
-tests.
+The `ls`/`cache` failure sets match the baseline exactly: the 10 `ls` failures are the
+baseline's 10 ls-side names, and the single `cache` failure is the baseline's 11th,
+`VIPT D2: four distinct probe results queue without aliasing and cancel-all releases them`.
+Nothing new, nothing fixed.
+
+(The two suites were run separately rather than in one invocation. A combined run OOM-ed
+twice at `-Xmx6G` while a Vivado arm held ~16 GB — a host-memory artifact, not a test result;
+split, each half completes comfortably. Noted so the split is not mistaken for cherry-picking.)
+
+**The `test-fast` failure is `RobPluginSpec`'s `preciseDrainBusyIn holds a debugPcApply off
+an in-flight precise drain…`, and it fails on the PRISTINE BASELINE too.** The brief called
+it an intermittent seed flake; that is confirmed, and more strongly than "it passed on a
+re-run":
+
+| tree | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| FIX (`7f3a45f`) | 43/44 | 43/44 | 43/44 |
+| BASE (`ca4b901`) | 43/44 | **42/44** | 43/44 |
+
+The baseline fails it too, and on one run fails *two* tests — so the earlier `44/44` was the
+lucky draw, not the norm. Structurally it also cannot be this change: `RobPluginSpec`'s
+`SimpleDut` (`:22-33`) hosts `ParamPlugin`, `RenameUopSourcePlugin`, `RobAllocDriverPlugin`,
+`RobPlugin` and three sinks — **no `IcachePlugin`, no `SpeculativeFetchGate`** — so its
+netlist is unchanged by this commit.
 
 ### 4.4 200-seed fuzz
 
-`src/main` changed, so this was actually run rather than argued — the standing count is not
-unchanged by construction here.
+`src/main` changed, so this was actually run rather than argued. Launcher committed as
+`run_fuzz200.sh`; re-run on the final (gate-only) build:
 
 ```
-FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200 FUZZ_MINIMIZE=0 \
-  sbt 'testOnly m68k040.fuzz.FuzzLockStepSpec'
-
 [fuzz] sweep done: 200 seeds, 3 divergences, 0 generator failures
 [fuzz]   seed=80  [STEP] idx=79 reg D5: dut=0x00000000 oracle=0x0000007e
 [fuzz]   seed=109 [STEP] idx=64 pc: dut=0x7bca4112 oracle=0x4080013e
@@ -390,8 +405,7 @@ FUZZ_SEED_START=0 FUZZ_SEED_COUNT=200 FUZZ_MINIMIZE=0 \
 
 **3 divergences, on exactly the standing seeds 80 / 109 / 127.** No new divergence, none
 fixed, no generator failures. (The suite reports `failed 1` because its assertion demands
-zero divergences; the count and the seed set are the measurement.) The launcher is
-committed as `run_fuzz200.sh`.
+zero divergences; the count and the seed set are the measurement.)
 
 ### 4.5 Post-route synth gate
 
