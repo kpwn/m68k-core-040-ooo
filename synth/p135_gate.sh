@@ -65,12 +65,31 @@ run_arm() {
   wait_for_slot
   cd "$wt" || { log "ARM $name: worktree missing"; return 1; }
 
-  log "ARM $name: generating Verilog"
+  # The gate tcl does `read_verilog generated/M68kFullCoreSynth.v`. That file is
+  # emitted by GenFullCoreSynthVerilog -- NOT by GenVerilog, which emits M68kCore.v
+  # and exits 0 in about a second. The first run of this script used GenVerilog, so
+  # every arm sailed past a zero exit code with no netlist on disk and Vivado died at
+  # read_verilog. Hence the explicit target below and the hard assertion after it.
+  log "ARM $name: generating Verilog (GenFullCoreSynthVerilog)"
   SBT_OPTS="-Xmx8G -Djava.io.tmpdir=/home/qwertyoruiop/tmp" \
-    sbt -batch "runMain m68k040.top.GenVerilog" >> "$S/p135_gate_${name}_gen.log" 2>&1
+    sbt -batch "runMain m68k040.top.GenFullCoreSynthVerilog" \
+    >> "$S/p135_gate_${name}_gen.log" 2>&1
   local genrc=$?
-  if [ $genrc -ne 0 ]; then log "ARM $name: GEN FAILED rc=$genrc"; return 1; fi
-  log "ARM $name: netlist md5 $(md5sum generated/M68kFullCoreSynth.v | cut -d' ' -f1)"
+  if [ $genrc -ne 0 ]; then log "ARM $name: ABORT -- GEN FAILED rc=$genrc"; return 1; fi
+
+  # STRUCTURAL GUARD: never take the mutex on a netlist that is missing or stub-sized.
+  # A real M68kFullCoreSynth.v is tens of MB; anything under 1 MB is a failed build.
+  local nv=generated/M68kFullCoreSynth.v nbytes
+  if [ ! -s "$nv" ]; then
+    log "ARM $name: ABORT -- $nv is missing or empty after generation (mutex NOT taken)"
+    return 1
+  fi
+  nbytes=$(stat -c %s "$nv")
+  if [ "$nbytes" -lt 1000000 ]; then
+    log "ARM $name: ABORT -- $nv is only ${nbytes} bytes, that is not a full-core netlist"
+    return 1
+  fi
+  log "ARM $name: netlist ${nbytes} bytes, md5 $(md5sum "$nv" | cut -d' ' -f1)"
 
   # Re-check admission: the sbt JVM above may still be winding down.
   wait_for_slot
@@ -82,13 +101,36 @@ run_arm() {
     >> "$S/p135_gate_${name}_impl.log" 2>&1
   local rc=$?
   log "ARM $name: vivado rc=$rc"
-  grep -hE "SIGNOFF_200MHZ_|POSTROUTE_FULLCORE_|ACHIEVED_FMAX_MHZ|FMAX_MHZ|REUSE_SYNTH_DCP" \
+  if [ $rc -ne 0 ]; then
+    log "ARM $name: ABORT -- Vivado exited non-zero; this arm has NO usable result"
+    return 1
+  fi
+  # Anchor to line start: Vivado echoes the sourced tcl, and impl_FullCore.tcl mentions
+  # SIGNOFF_200MHZ_* inside `#` commentary. An unanchored grep matches the documentation
+  # as readily as the result -- that is where the first run's "#ns" came from.
+  grep -hE "^(SIGNOFF_200MHZ_|POSTROUTE_FULLCORE_|REUSE_SYNTH_DCP)" \
        "$S/p135_gate_${name}_impl.log" 2>/dev/null | sed "s/^/ARM $name  /" >> "$OUT"
   return 0
 }
 
-wns_of() {  # echo the arm's clk-domain sign-off WNS, or empty
-  grep -h "SIGNOFF_200MHZ_WNS_NS" "$S/p135_gate_${1}_impl.log" 2>/dev/null \
+# Echo the arm's clk-domain sign-off WNS, but ONLY if it is a real number.
+# Anchored to line start so commented mentions of SIGNOFF_200MHZ_* in the sourced tcl
+# cannot be scraped as a result, and validated as numeric so a non-number can never
+# reach the comparison below. Emits nothing at all when there is no genuine result.
+wns_of() {
+  local v
+  v=$(grep -hE "^SIGNOFF_200MHZ_WNS_NS[[:space:]]" "$S/p135_gate_${1}_impl.log" 2>/dev/null \
+      | tail -1 | awk '{print $2}')
+  case "$v" in
+    ''|*[!0-9.+-]*) return 1 ;;   # empty, or contains a non-numeric character
+  esac
+  awk -v x="$v" 'BEGIN{ if (x+0 == x || x ~ /^[+-]?[0-9]*\.?[0-9]+$/) exit 0; exit 1 }' \
+    || return 1
+  echo "$v"
+}
+
+verdict_of() {
+  grep -hE "^SIGNOFF_200MHZ_RESULT[[:space:]]" "$S/p135_gate_${1}_impl.log" 2>/dev/null \
     | tail -1 | awk '{print $2}'
 }
 
@@ -127,13 +169,28 @@ PY
 log "Part 135 postroute gate queued. Mutex: $LOCK"
 log "fix=$S/wt-p135  base=$S/wt-p135-base  ctl=$S/wt-p135-ctl"
 
-run_arm fix  "$S/wt-p135"
-run_arm base "$S/wt-p135-base"
+run_arm fix  "$S/wt-p135"; FIX_OK=$?
+run_arm base "$S/wt-p135-base"; BASE_OK=$?
 
-FIX=$(wns_of fix); BASE=$(wns_of base)
-log "SUMMARY fix WNS=${FIX:-?}ns  base WNS=${BASE:-?}ns"
+FIX=$(wns_of fix)   || FIX=""
+BASE=$(wns_of base) || BASE=""
 
-if [ -n "${FIX:-}" ] && [ -n "${BASE:-}" ]; then
+# NO VERDICT WITHOUT NUMBERS. The first run of this script compared "#" against "#",
+# found them equal, and logged "NOT adverse" -- a confident green from a run that never
+# happened. A missing or unparsable WNS is now a hard FAILURE, never a pass.
+if [ -z "$FIX" ] || [ -z "$BASE" ]; then
+  log "GATE FAILED -- no usable sign-off number."
+  log "  fix  arm rc=$FIX_OK  SIGNOFF_200MHZ_WNS_NS='${FIX:-<none parsed>}'"
+  log "  base arm rc=$BASE_OK SIGNOFF_200MHZ_WNS_NS='${BASE:-<none parsed>}'"
+  log "  DO NOT read this as a pass. Inspect p135_gate_{fix,base}_{gen,impl}.log."
+  log "Part 135 gate DONE (FAILED)"
+  echo "P135_GATE_FAILED_NO_RESULT" >> "$OUT"
+  exit 1
+fi
+
+log "SUMMARY fix WNS=${FIX}ns ($(verdict_of fix))  base WNS=${BASE}ns ($(verdict_of base))"
+
+if true; then
   ADVERSE=$(awk -v f="$FIX" -v b="$BASE" -v t="$ADVERSE_NS" \
               'BEGIN{print ((b-f) > t) ? 1 : 0}')
   if [ "$ADVERSE" = "1" ]; then
