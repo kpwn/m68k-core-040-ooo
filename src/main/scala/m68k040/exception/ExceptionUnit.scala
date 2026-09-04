@@ -2422,6 +2422,27 @@ class ExceptionUnit(
   // `active` high whenever the FSM is mid-sequence (not IDLE).
   active := !fsm.isActive(fsm.IDLE)
 
+  // ── W19: the maintenance-quiesce hold, exported to the D-cache port arbitration ──
+  // High across `S_DRAIN` and `S_APPLY`, and consumed by `LsEuPlugin` to close TABLE
+  // WALKER admission to the D-cache load/store ports (never the CORE's own).
+  //
+  // `S_DRAIN`'s deadlock analysis above ends with "With the LS EU flushed, nothing
+  // re-arms them" -- that is what guarantees `dcQuiesced` eventually settles. A table
+  // walker sharing those ports makes the sentence FALSE: it is not part of the LS pipe,
+  // it is not flushed, and it can start a fresh D-cache access at any time, re-arming
+  // exactly the in-flight terms `dcQuiesced` is waiting to see clear.
+  //
+  // `S_APPLY` is included as well as `S_DRAIN` because `maintCmdOut` pulses IN `S_APPLY`
+  // while the D-cache's own `maintBusyReg` only rises a cycle later: covering `S_DRAIN`
+  // alone would leave a one-cycle fully-open window between the two.
+  //
+  // Purely a COMMAND-granularity hold. A walk already in flight simply stalls between
+  // descriptor reads; the maintenance walk depends on nothing the walker holds and
+  // completes autonomously, so the dependency graph is `walker -> maintenance` and never
+  // the reverse.
+  val quiesceHoldOut = fsm.isActive(fsm.S_DRAIN) || fsm.isActive(fsm.S_APPLY)
+  quiesceHoldOut.simPublic()
+
   // ---- debug-only observability (task #139 wild-PC / a7-minus-8 investigation) ----
   // Zero synth impact (sim tap only, not referenced by any RTL logic).
   active.simPublic()

@@ -2,11 +2,11 @@ package m68k040.mmu
 
 import m68k040.VerilatorTest
 import m68k040.cache.CacheMode
-import m68k040.ls.BehavioralMemAgent
+import m68k040.cache.{DLoadCmd, DLoadRsp}
+import m68k040.sim.DcacheClientMemAgent
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4ReadOnly}
 import org.scalatest.funsuite.AnyFunSuite
 
 /** Directed tests for the 68040 hardware 3-level table walker.
@@ -42,7 +42,9 @@ class TableWalkerSpec extends AnyFunSuite {
     val umValid = out Bool ()
     val umAddr  = out UInt (32 bits)
     val umByte  = out Bits (8 bits)
-    val mAxi = master(Axi4(walker.axiCfg))
+    // The walker reads descriptors as `DcacheService` LOAD COMMANDS now, not AXI.
+    val wCmd = master(Stream(DLoadCmd()))
+    val wRsp = slave(Flow(DLoadRsp()))
 
     walker.io.start := start
     walker.io.req.vpn := vpn
@@ -61,12 +63,8 @@ class TableWalkerSpec extends AnyFunSuite {
     umValid := walker.io.rsp.umWrite.valid
     umAddr  := walker.io.rsp.umWrite.addr
     umByte  := walker.io.rsp.umWrite.newByte
-    // bridge the walker's read-only AXI to a full Axi4 master for the behavioral mem
-    mAxi.ar << walker.io.axi.ar
-    mAxi.r  >> walker.io.axi.r
-    mAxi.aw.valid := False; mAxi.aw.payload.assignDontCare()
-    mAxi.w.valid  := False; mAxi.w.payload.assignDontCare()
-    mAxi.b.ready  := True
+    wCmd << walker.io.loadCmd
+    walker.io.loadRsp << wRsp
   }
 
   // --- table layout constants ---
@@ -77,7 +75,7 @@ class TableWalkerSpec extends AnyFunSuite {
   // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
   // MSB) — matches TableWalker.selectWord's corrected convention (mirrors real 68k
   // memory / DcacheByteLane.extract's LONG case). Kept the name.
-  def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
+  def pokeWordLE(mem: DcacheClientMemAgent, addr: Long, w: Long): Unit =
     for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
 
   // VA fields for a 4 KB page: root(7)|ptr(7)|page(6)|offset(12)
@@ -92,7 +90,7 @@ class TableWalkerSpec extends AnyFunSuite {
 
   /** Build a resident 3-level table for `va` mapping to `ppn`, with the given page
     * descriptor low byte (PDT/W/U/M/...). Returns the page descriptor's byte address. */
-  def buildTable(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  def buildTable(mem: DcacheClientMemAgent, va: Long, ppn: Long,
                  pageWp: Boolean = false, pageSuper: Boolean = false,
                  pageInhibited: Boolean = false, pageResident: Boolean = true): Long = {
     // root entry -> pointer table
@@ -116,7 +114,7 @@ class TableWalkerSpec extends AnyFunSuite {
     * is placed at the 8K-mode page index (5-bit PGI, VA[17:13]) instead of the 4K
     * one — root/pointer levels are identical (index widths don't depend on page
     * size). Returns the page descriptor's byte address. */
-  def buildTable8K(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  def buildTable8K(mem: DcacheClientMemAgent, va: Long, ppn: Long,
                    pageWp: Boolean = false, pageSuper: Boolean = false,
                    pageInhibited: Boolean = false, pageResident: Boolean = true): Long = {
     val rootDesc = (PTRT & 0xfffffff0L) | 0x3L
@@ -153,7 +151,7 @@ class TableWalkerSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.mAxi, cd)
+      val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
       dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
       dut.vpn #= 0; dut.rootPtr #= 0
       cd.waitSampling(4)
@@ -230,7 +228,7 @@ class TableWalkerSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.mAxi, cd)
+      val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
       dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
       dut.vpn #= 0; dut.rootPtr #= 0
       cd.waitSampling(4)

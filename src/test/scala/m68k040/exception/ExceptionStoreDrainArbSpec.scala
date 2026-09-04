@@ -38,8 +38,11 @@ class ExceptionStoreDrainArbSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
-      new BehavioralMemAgent(dut.dtlb.walkerAxi, cd, sharedMem = dmem.mem)
-      new BehavioralMemAgent(dut.itlb.walkerAxi, cd, sharedMem = dmem.mem)
+      // (The two table-walker AXI memories that used to be attached here are gone:
+      // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
+      // writebacks are DcacheService client traffic now, so they reach memory
+      // through the D-cache above -- which is also the point: a page-table line
+      // sitting dirty in L1D is now visible to the walk.)
 
       // Physical vector 4 contains the handler PC in big-endian byte order.
       for (i <- 0 until 4)

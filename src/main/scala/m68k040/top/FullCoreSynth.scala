@@ -453,7 +453,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       case None    => null
     }
     val rvHalt = if (rv != null) rv.haltPulse else False
-    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge || rvHalt
+    // W26: the walker/D-cache merge point is a FIFTH halt producer. It has to be its own
+    // producer rather than folded into `arbWedge`, because a wedge there raises no AXI
+    // grant at all and is invisible to every other watchdog in the core.
+    val walkWedge = lsEu.logic.walkerPortWedge
+    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge || rvHalt ||
+                              walkWedge
     // D28: priority when several fire on the same cycle is stated here rather than left to
     // elaboration order. The D-cache's diagnostic fault wins because it is the one with a
     // sub-code (DcachePlugin's private diagFaultKind) that further localises the failure;
@@ -466,8 +471,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
           U(m68k040.socket.HaltReason.RESET_VECTOR, m68k040.socket.HaltReason.W bits),
           Mux(arbWedge,
             U(m68k040.socket.HaltReason.ARBITER_WEDGE, m68k040.socket.HaltReason.W bits),
-            U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))))
+            Mux(walkWedge,
+              U(m68k040.socket.HaltReason.WALKER_PORT_WEDGE, m68k040.socket.HaltReason.W bits),
+              U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))))))
     lsEu.excActive          := excActive
+    // W19: closes table-walker admission to the D-cache ports across the commit-time
+    // sysOp maintenance quiesce (`S_DRAIN`/`S_APPLY`). See `ExceptionUnit.quiesceHoldOut`.
+    lsEu.quiesceHold        := exc.quiesceHoldOut
     lsEu.excLoadCmdValid    := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr    := exc.dcLoadCmd.payload.vaddr
     lsEu.excLoadCmdPaddr    := exc.dcLoadCmd.payload.paddr

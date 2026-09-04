@@ -3,10 +3,31 @@ package m68k040.cache
 import m68k040.isa.Size
 import spinal.core._
 
+/** Load-command token layout.
+  *
+  * Bit [7] is the NON-LS-SOURCE flag. When it is 0 the token is an ordinary LS-pipe
+  * token: [6] is the split half and [5:0] the ROB id, so the LS EU's early-VIPT probe
+  * and its later resolved `DLoadCmd` carry the same value and the D-cache can match
+  * them (`DcachePlugin`'s `earlyProbeTokens` CAM).
+  *
+  * When bit [7] is 1 the command did NOT come from the LS pipe and can never own an
+  * early probe. Every such value is RESERVED and enumerated here — a don't-care token
+  * on a non-LS command could alias a live early-probe entry on token AND vaddr and be
+  * silently answered with that probe's captured data (`earlyProbeOwnsCmd`), which is a
+  * silent wrong-data bug rather than a hang. The three reserved values are:
+  *
+  *   0x80  EXC        the commit-side exception sequencer's frame/vector loads
+  *   0x81  WALK_ITLB  the ITLB table walker's descriptor reads
+  *   0x82  WALK_DTLB  the DTLB table walker's descriptor reads
+  */
 object DLoadToken {
-  // [7] source (0=LS ROB, 1=serializing exception unit), [6] split half,
-  // [5:0] ROB id. Kept as a plain UInt field in all public bundles.
   val Width = 8
+  /** Commit-side exception sequencer (`LsEuPlugin`'s exception override mux). */
+  val EXC       = 0x80
+  /** ITLB table-walk descriptor read. */
+  val WALK_ITLB = 0x81
+  /** DTLB table-walk descriptor read. */
+  val WALK_DTLB = 0x82
 }
 
 /** Early VIPT lookup request. `vaddr` selects the page-invariant set in parallel

@@ -2,7 +2,7 @@ package m68k040.cache
 
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.ls.BehavioralMemAgent
+import m68k040.sim.DcacheClientMemAgent
 import m68k040.mmu.{ItlbPlugin, MmuControlPlugin}
 import m68k040.services.PrivilegeService
 import org.scalatest.funsuite.AnyFunSuite
@@ -44,7 +44,11 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     val probe = new FetchProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), ctrl, priv, itlb, ic, probe)) }
-    def walkerAxi = itlb.walkerAxi
+    // No DcachePlugin in this DUT: expose the ITLB walker's DcacheService client port
+    // pair as DUT IO and let `DcacheClientMemAgent` answer it. 68040 table searches are
+    // DATA accesses even for an instruction translation, which is why the I-side walker
+    // is a D-cache client and not an I-cache one.
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
   }
 
   private val Root      = 0x00010000L
@@ -53,11 +57,11 @@ class IcacheParallelViptSpec extends AnyFunSuite {
   private val VirtPage  = 0x00402000L
   private val PhysPage  = 0x00800000L
 
-  private def pokeWordBe(mem: BehavioralMemAgent, addr: Long, word: Long): Unit =
+  private def pokeWordBe(mem: m68k040.sim.DcacheClientMemAgent, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >> (8 * (3 - i))) & 0xff).toInt)
 
-  private def installSupervisorMapping(mem: BehavioralMemAgent): Unit = {
+  private def installSupervisorMapping(mem: m68k040.sim.DcacheClientMemAgent): Unit = {
     val rootIdx = ((VirtPage >> 25) & 0x7f).toInt
     val ptrIdx  = ((VirtPage >> 18) & 0x7f).toInt
     val pageIdx = ((VirtPage >> 12) & 0x3f).toInt
@@ -94,7 +98,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val walkerMem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      val walkerMem = new m68k040.sim.DcacheClientMemAgent(dut.walkPort, cd)
       installSupervisorMapping(walkerMem)
       IcacheSim.attachMemory(dut.ic.logic.axi, cd, PhysPage, 0x1000)
 
@@ -108,7 +112,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           arTrace += ((dut.ic.logic.axi.ar.payload.id.toInt,
             dut.ic.logic.axi.ar.payload.addr.toLong))
-        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean)
+        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean)
           walkArCount += 1
       }
 
@@ -144,7 +148,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
 
-      val walkerMem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      val walkerMem = new m68k040.sim.DcacheClientMemAgent(dut.walkPort, cd)
       installSupervisorMapping(walkerMem)
       val words = Seq.tabulate(1024)(i => 0x7000 | (i & 7))
       IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, PhysPage, words)
@@ -163,7 +167,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         cycle += 1
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           iArCount += 1
-        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean)
+        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean)
           walkArCount += 1
         if (dut.probe.logic.rspOut.valid.toBoolean) rspCount += 1
         if (dut.probe.logic.cmdIn.valid.toBoolean && !dut.ic.logic.xlateReadyDbg.toBoolean) {

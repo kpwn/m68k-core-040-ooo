@@ -88,13 +88,13 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
   val PTRT = 0x31000L
   val PAGT = 0x32000L
 
-  def pokeWordLE(mem: BehavioralMemAgent, addr: Long, w: Long): Unit =
+  def pokeWordLE(mem: AxiMemModel, addr: Long, w: Long): Unit =
     for (i <- 0 until 4) mem.pokeByte(addr + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt
 
-  def buildResidentWritethroughPage(mem: BehavioralMemAgent, va: Long, ppn: Long): Unit = {
+  def buildResidentWritethroughPage(mem: AxiMemModel, va: Long, ppn: Long): Unit = {
     pokeWordLE(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
     pokeWordLE(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
     val pd = ((ppn << 12) & 0xfffff000L) | 0x1L   // resident, CM=00 (WRITETHROUGH), no write-protect
@@ -108,10 +108,13 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
     cd.waitSampling(2)
   }
 
-  def initDut(dut: Dut): (ClockDomain, AxiMemModel, BehavioralMemAgent) = {
+  def initDut(dut: Dut): (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
     val mem   = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, AxiMemModelConfig())
-    val ptmem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+    // The DTLB walker now reaches memory through the D-cache, so the page table must
+    // live in the D-SIDE memory rather than a private walker image. Aliasing the old
+    // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
+    val ptmem = mem
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.iStkPush #= false; s.iLeaAddr #= false

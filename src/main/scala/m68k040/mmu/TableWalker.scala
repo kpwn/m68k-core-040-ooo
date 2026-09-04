@@ -1,9 +1,8 @@
 package m68k040.mmu
 
-import m68k040.cache.CacheMode
+import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp}
 import spinal.core._
 import spinal.lib._
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config, Axi4ReadOnly}
 import spinal.lib.fsm._
 
 /** 68040 hardware 3-level table walker (4KB or 8KB pages per TCR.P, task #195;
@@ -19,41 +18,59 @@ import spinal.lib.fsm._
   * architectural memory writes, so they are NOT written here — they are returned in
   * `rsp.umWrite` for the owning plugin to QUEUE and drain at commit.
   *
-  * AXI: a dedicated 128-bit read-only port (same geometry as the D-cache / behavioral
-  * memory). A descriptor is a 32-bit longword; the read returns the 16-byte line and
-  * the walker selects the 4-byte lane by descAddr[3:2]. Descriptor bytes are read
-  * BIG-ENDIAN (task #194 fix — byte at the LOWEST address is the descriptor's MSB),
-  * mirroring `DcacheByteLane.extract`'s LONG case EXACTLY: this walker has its own
-  * dedicated AXI port straight to physical memory, so it must reconstruct a 32-bit
-  * value from raw AXI bytes the SAME way the D-cache's own load path does, or a page
-  * table built by REAL supervisor `move.l` stores (68k memory is big-endian
-  * architecturally) reads back completely byte-reversed. Was previously little-endian
-  * (byte at the lowest address = bit[7:0]) — silently correct only for whitebox tests
-  * that poke descriptor bytes directly in that same (wrong, relative to a real
-  * architected store) order via `pokeWordLE`; the first ported test to build a page
-  * table with real `move.l` instructions (the m68k-ooo MMU cluster) exposed it.
+  * MEMORY PORT: the three descriptor reads are ordinary `DcacheService` LOAD commands,
+  * arbitrated onto the D-cache's single load port by `LsEuPlugin` alongside the LS pipe
+  * and the exception sequencer. They are NOT a private AXI master any more.
+  *
+  * WHY (the bug this closes). A page-table entry the supervisor has just written with an
+  * ordinary `move.l` lands DIRTY in the copyback L1D and is invisible in backing memory
+  * until that line is evicted. A walker reading physical memory behind the cache's back
+  * therefore reads the STALE descriptor and installs a wrong translation; and the U/M
+  * writeback in the other direction lands in memory only, to be overwritten by the later
+  * eviction of the same (stale-U/M) dirty line. Both directions are closed by routing
+  * the traffic through the cache that owns the line. A real 68040 performs its table
+  * searches through the data cache for exactly this reason.
+  *
+  * A descriptor is a 32-bit longword at a naturally aligned address (every level is
+  * `base + idx*4` off an aligned table base), so the read is a plain `Size.LONG` load and
+  * the D-cache's own `DcacheByteLane.extract` does the big-endian lane select. That is
+  * why this component no longer carries its own `selectWord`: it was a hand copy of that
+  * exact function's LONG case, and having two copies of a big-endian lane select already
+  * produced one silent-corruption bug (task #194 — descriptors read byte-reversed
+  * relative to what a real supervisor `move.l` wrote).
+  *
+  * `loadCmd.cacheMode` and `loadCmd.token` are DON'T-CARE here and are overwritten by the
+  * arbiter: the descriptor fetch's own cache mode is a fixed architectural policy
+  * (`CACR.DE ? WRITETHROUGH : INHIBITED`) which this component cannot see, and the token
+  * is a reserved constant per walker (`DLoadToken.WALK_ITLB`/`WALK_DTLB`).
+  *
+  * A `loadRsp.fault` (the D-cache's physical bus-error response) TERMINATES the walk with
+  * a fault rather than decoding whatever data came back — the fail-closed replacement for
+  * the AXI-id guard the dedicated port used to carry.
   *
   * Bounded latency: three dependent reads. Single-outstanding (one walk at a time). */
 class TableWalker extends Component {
-  val axiCfg = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
-
   val io = new Bundle {
     val start = in Bool ()
     val req   = in(WalkReq())
     val busy  = out Bool ()
     val done  = out Bool ()      // 1-cycle pulse when the walk resolves
     val rsp   = out(WalkRsp())
-    val axi   = master(Axi4ReadOnly(axiCfg))
+    // D-cache client port pair (see the class comment). `loadRsp` is a Flow: the
+    // D-cache's load response has no back-pressure and must be consumed the cycle it
+    // is presented.
+    val loadCmd = master(Stream(DLoadCmd()))
+    val loadRsp = slave(Flow(DLoadRsp()))
   }
 
   // ---- latched request ----
   val reqReg = Reg(WalkReq())
 
   // ---- descriptor read helpers ----
-  // Present an AR for the 16-byte line containing `descAddr`; capture the 32-bit
-  // lane on R. `arSent`/`rGot` sequence one read.
+  // Present a LONG load command for `descAddr`; capture the extracted 32-bit
+  // descriptor on the response. `cmdSent` sequences one read.
   val descAddr = Reg(UInt(32 bits))      // byte address of the current descriptor
-  val arSent   = Reg(Bool()) init False
+  val cmdSent  = Reg(Bool()) init False
 
   // ---- accumulated walk state ----
   val accWriteProt = Reg(Bool())
@@ -74,28 +91,26 @@ class TableWalker extends Component {
   val rModified = Reg(Bool())
   val donePulse = RegInit(False)
 
-  // ---- AXI defaults ----
-  io.axi.ar.valid := False
-  io.axi.ar.payload.assignDontCare()
-  io.axi.r.ready  := False
+  // ---- D-cache client defaults ----
+  // A table search is PHYSICAL by architecture, so the virtual and physical addresses
+  // presented to the (VIPT) cache are the same value. That trivially satisfies
+  // `DLoadCmd`'s stated `paddr[11:0] == vaddr[11:0]` construction requirement.
+  io.loadCmd.valid           := False
+  io.loadCmd.payload.vaddr   := descAddr
+  io.loadCmd.payload.paddr   := descAddr
+  io.loadCmd.payload.size    := m68k040.isa.Size.LONG
+  // Overwritten by the arbiter (W1/W2): the descriptor fetch's own cache mode is a
+  // fixed architectural policy this component cannot see. WRITETHROUGH is the inert
+  // default so a standalone DUT with no arbiter still sees a well-defined value.
+  io.loadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+  // Likewise overwritten by the arbiter with this walker's RESERVED token
+  // (`DLoadToken.WALK_ITLB` / `WALK_DTLB`). Never a don't-care: a don't-care could
+  // alias a live early-VIPT probe entry on token AND vaddr and be answered with that
+  // probe's data.
+  io.loadCmd.payload.token   := U(m68k040.cache.DLoadToken.WALK_DTLB,
+                                  m68k040.cache.DLoadToken.Width bits)
 
   donePulse := False
-
-  // ---- 128-bit line -> selected 32-bit descriptor (BIG-ENDIAN lane, task #194) ----
-  // descAddr[3:2] selects the 4-byte word within the 16-byte line. Reconstructs the
-  // descriptor the SAME way DcacheByteLane.extract's LONG case does: the byte at the
-  // LOWEST address is the descriptor's MSB (real 68k memory is big-endian) — NOT a
-  // naive `subdivideIn(32 bits)` lane select, which would treat the raw AXI byte
-  // order as little-endian and byte-reverse every descriptor a real `move.l` wrote.
-  def selectWord(line: Bits, addr: UInt): Bits = {
-    val bytes = line.subdivideIn(8 bits)   // bytes(i) = the line's byte i (line-base + i)
-    val base  = (addr(3 downto 2) ## U(0, 2 bits)).asUInt   // descriptor's first byte offset within the line
-    val b0 = bytes(base)
-    val b1 = bytes(base + 1)
-    val b2 = bytes(base + 2)
-    val b3 = bytes(base + 3)
-    b0 ## b1 ## b2 ## b3
-  }
 
   val fsm = new StateMachine {
     val IDLE     = new State with EntryPoint
@@ -104,23 +119,26 @@ class TableWalker extends Component {
     val RD_PAGE  = new State
     val FINISH   = new State
 
-    // shared read micro-sequence: issue AR for descAddr's line, capture word.
+    // Shared read micro-sequence: present ONE `DLoadCmd` for `descAddr` and hold it
+    // until it is accepted. `cmdSent` makes the command single-shot, so a level-held
+    // `valid` cannot be double-accepted while the response is outstanding.
     def issueRead(): Unit = {
-      when(!arSent) {
-        io.axi.ar.valid        := True
-        io.axi.ar.payload.addr := (descAddr(31 downto 4) ## U(0, 4 bits)).asUInt
-        io.axi.ar.payload.id   := U(m68k040.cache.AxiIds.WALK_READ, m68k040.cache.AxiIds.ID_W bits)
-        io.axi.ar.payload.len  := U(0, 8 bits)
-        io.axi.ar.payload.size := U(4, 3 bits)   // 16 bytes
-        io.axi.ar.payload.burst := Axi4.burst.INCR
-        when(io.axi.ar.ready) { arSent := True }
+      when(!cmdSent) {
+        io.loadCmd.valid := True
+        when(io.loadCmd.ready) { cmdSent := True }
       }
-      // D27: fail-closed on the descriptor-read ID, for the same reason and with the same
-      // property as the ItlbPlugin/DtlbPlugin `b.ready` guards. A foreign beat is not
-      // consumed, so the walk hangs loudly instead of resolving a page-table descriptor
-      // out of somebody else's data. Cost is one 4-bit compare and no state.
-      io.axi.r.ready := io.axi.r.payload.id === U(m68k040.cache.AxiIds.WALK_READ,
-                                                  m68k040.cache.AxiIds.ID_W bits)
+    }
+    // FAIL-CLOSED replacement for the retired AXI-id guard (D19). The D-cache reports a
+    // physical bus error on the descriptor read as `loadRsp.fault`; the walk must NOT
+    // decode whatever data rode along with it. Terminate the walk as a fault instead.
+    // `NON_RESIDENT` is reused rather than adding a `BUS_ERROR` enumerant: it is the
+    // one reason the whole MMU path already handles end-to-end, and the alternative
+    // today is strictly worse (the old dedicated port never checked `rresp` at all and
+    // would install a translation decoded from error data).
+    def descFault(): Unit = {
+      rFault  := True
+      rReason := MmuFaultReason.NON_RESIDENT
+      rUmValid := False
     }
 
     IDLE.whenIsActive {
@@ -134,7 +152,7 @@ class TableWalker extends Component {
         val rootBase = io.req.rootPtr
         val rootOff  = (io.req.vpn(19 downto 13) ## U(0, 2 bits)).asUInt   // rootIdx(7)*4
         descAddr := rootBase + rootOff.resize(32)
-        arSent   := False
+        cmdSent  := False
         goto(RD_ROOT)
       }
     }
@@ -142,9 +160,12 @@ class TableWalker extends Component {
     // ---- ROOT level ----
     RD_ROOT.whenIsActive {
       issueRead()
-      when(io.axi.r.fire) {
-        val d = selectWord(io.axi.r.payload.data, descAddr)
-        when(!MmuDesc.tblResident(d)) {
+      when(io.loadRsp.valid) {
+        val d = io.loadRsp.payload.data
+        when(io.loadRsp.payload.fault) {
+          descFault()
+          goto(FINISH)
+        } elsewhen(!MmuDesc.tblResident(d)) {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
           goto(FINISH)
         } otherwise {
@@ -153,7 +174,7 @@ class TableWalker extends Component {
           val base = MmuDesc.tblNextBase(d)
           val off  = (reqReg.vpn(12 downto 6) ## U(0, 2 bits)).asUInt      // ptrIdx(7)*4
           descAddr := base + off.resize(32)
-          arSent := False
+          cmdSent := False
           goto(RD_PTR)
         }
       }
@@ -162,9 +183,12 @@ class TableWalker extends Component {
     // ---- POINTER level ----
     RD_PTR.whenIsActive {
       issueRead()
-      when(io.axi.r.fire) {
-        val d = selectWord(io.axi.r.payload.data, descAddr)
-        when(!MmuDesc.tblResident(d)) {
+      when(io.loadRsp.valid) {
+        val d = io.loadRsp.payload.data
+        when(io.loadRsp.payload.fault) {
+          descFault()
+          goto(FINISH)
+        } elsewhen(!MmuDesc.tblResident(d)) {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
           goto(FINISH)
         } otherwise {
@@ -179,7 +203,7 @@ class TableWalker extends Component {
           val off8k = (U(0, 1 bits) ## reqReg.vpn(5 downto 1) ## U(0, 2 bits)).asUInt // pageIdx(5)*4
           val off   = Mux(reqReg.is8K, off8k, off4k)
           descAddr := base + off.resize(32)
-          arSent := False
+          cmdSent := False
           goto(RD_PAGE)
         }
       }
@@ -188,8 +212,12 @@ class TableWalker extends Component {
     // ---- PAGE (leaf) level ----
     RD_PAGE.whenIsActive {
       issueRead()
-      when(io.axi.r.fire) {
-        val d = selectWord(io.axi.r.payload.data, descAddr)
+      when(io.loadRsp.valid && io.loadRsp.payload.fault) {
+        descFault()
+        goto(FINISH)
+      }
+      when(io.loadRsp.valid && !io.loadRsp.payload.fault) {
+        val d = io.loadRsp.payload.data
         pageDescAddr := descAddr
         val wp  = accWriteProt | MmuDesc.pgWriteProt(d)
         val sup = MmuDesc.pgSupervisor(d)

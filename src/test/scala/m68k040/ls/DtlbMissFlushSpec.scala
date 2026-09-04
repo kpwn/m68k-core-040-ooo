@@ -25,13 +25,13 @@ private object DtlbMissTestPages {
   private def ptrIdx(va: Long): Int  = ((va >>> 18) & 0x7f).toInt
   private def pageIdx(va: Long): Int = ((va >>> 12) & 0x3f).toInt
 
-  private def pokeDescriptor(mem: BehavioralMemAgent, addr: Long, word: Long): Unit =
+  private def pokeDescriptor(mem: m68k040.sim.SimMem.ByteMem, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >>> (8 * (3 - i))) & 0xff).toInt)
 
   /** U is pre-set so these protocol tests cannot stall on an unrelated deferred
     * U/M-queue credit. */
-  def buildResidentPage(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  def buildResidentPage(mem: m68k040.sim.SimMem.ByteMem, va: Long, ppn: Long,
                         copyback: Boolean = true): Unit = {
     pokeDescriptor(mem, Root + rootIdx(va) * 4, (Ptrt & 0xfffffff0L) | 0x3L)
     pokeDescriptor(mem, Ptrt + ptrIdx(va) * 4, (Pagt & 0xfffffff0L) | 0x3L)
@@ -102,12 +102,15 @@ class DtlbCleanMissSerializationSpec extends AnyFunSuite {
     val probe = new DtlbMissStreamProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
+    // No DcachePlugin in this DUT: expose the walker's DcacheService client port pair
+    // as DUT IO and let `DcacheClientMemAgent` answer it (see WalkerDcacheSimIo).
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
   }
 
-  private def init(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
+  private def init(dut: Dut): (ClockDomain, m68k040.sim.DcacheClientMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
-    val mem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+    val mem = new m68k040.sim.DcacheClientMemAgent(dut.walkPort, cd)
     val req = dut.probe.logic.reqIn
     req.valid #= false
     req.payload.vpn #= 0
@@ -181,7 +184,9 @@ class DtlbCleanMissSerializationSpec extends AnyFunSuite {
       request(dut, cd, vpn(hitVa), token = 2)
       assert(response(dut, cd) == ((2, hitPpn, false)))
       cd.waitSampling(3)
-      pageMem.model.stats.reset()
+      // The walker is a D-cache client now; `loadCount` counts its descriptor reads,
+      // one per read, exactly as one AR per read before.
+      val walkCmdsBefore = pageMem.loadCount
 
       val req = dut.probe.logic.reqIn
       val rsp = dut.probe.logic.rspOut
@@ -259,8 +264,9 @@ class DtlbCleanMissSerializationSpec extends AnyFunSuite {
         (heldToken, heldPpn, false), (missToken, missPpn, false), (hitToken, hitPpn, false)),
         s"response association/order: $rspEvents")
       assert(blockedBehindMiss > 0, "younger resident C was not actually held behind the walk")
-      assert(pageMem.model.stats.totalAr == 3,
-        s"exactly one three-level clean walk expected, AR=${pageMem.model.stats.totalAr}")
+      assert(pageMem.loadCount - walkCmdsBefore == 3,
+        s"exactly one three-level clean walk expected, descriptor reads=" +
+        s"${pageMem.loadCount - walkCmdsBefore}")
       val missRspCycle = rspEvents.find(_._2 == missToken).get._1
       val hitReqCycle  = reqEvents.find(_._2 == hitToken).get._1
       val hitRspCycle  = rspEvents.find(_._2 == hitToken).get._1
@@ -295,11 +301,14 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
       dcache, cacheCtrl, eu, src, wire, trace, flushWire, cacheTrace)) }
   }
 
-  private def init(dut: Dut): (ClockDomain, AxiMemModel, BehavioralMemAgent) = {
+  private def init(dut: Dut): (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
-    val pageMem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+    // The DTLB walker now reaches memory through the D-cache, so the page table must
+    // live in the D-SIDE memory rather than a private walker image. Aliasing the old
+    // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
+    val pageMem = dataMem
     val s = dut.src.logic
     s.iValid #= false
     s.iMemOp #= MemOp.LOAD
@@ -412,7 +421,8 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
       val pdst = 30
       val sentinel = 0x5aa55aa5L
       seed(dut, cd, pdst, sentinel)
-      pageMem.model.stats.reset()
+      // Walker descriptor reads are D-cache load commands now; `walkerArCycles` below
+      // counts them by owner, which is the same one-per-descriptor-read cadence.
       dataMem.stats.reset()
 
       val issueCycles = scala.collection.mutable.ArrayBuffer.empty[Int]
@@ -467,7 +477,11 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
             dut.eu.logic.wbObs.result.toBigInt, dut.eu.logic.wbObs.intWrite.toBoolean))
         if (s.fValid.toBoolean)
           faults += ((s.fRob.toInt, s.fAddr.toLong & 0xffffffffL))
-        if (dut.dtlb.walkerAxi.ar.valid.toBoolean && dut.dtlb.walkerAxi.ar.ready.toBoolean)
+        // The walker's descriptor reads are D-cache LOAD COMMANDS now, one per read,
+        // exactly as one AR per read before.
+        if (dut.eu.logic.walkerOwnsLoad.toBoolean &&
+            dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+            dut.dcache.logic.loadCmdPort.ready.toBoolean)
           walkerArCycles += cycle
         cd.waitSampling()
         cycle += 1
@@ -534,8 +548,8 @@ class DtlbFlushReuseSpec extends AnyFunSuite {
       assert(wbEvents.map(e => (e._2, e._3, e._4)).toSeq ==
         Seq((robId, word(newImage), true)), s"stale/reused wbObs stream: $wbEvents")
       assert(faults.isEmpty, s"flush/reuse path raised faults: $faults")
-      assert(pageMem.model.stats.totalAr == 3 && walkerArCycles.size == 3,
-        s"exactly one old-epoch three-level walk expected: stats=${pageMem.model.stats.totalAr} cycles=$walkerArCycles")
+      assert(walkerArCycles.size == 3,
+        s"exactly one old-epoch three-level walk expected: descriptor reads=$walkerArCycles")
       assert(dataMem.stats.totalAr == 0,
         s"old access or reused L1 hit unexpectedly reached data AXI: AR=${dataMem.stats.totalAr}")
       val oldReqCycle = reqEvents.find(_._3 == oldToken).get._1

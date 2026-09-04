@@ -4,6 +4,19 @@
 # it: no port added, none removed, none renamed, none resized.
 # Regenerate ONLY with an explicit, reviewed decision:
 #   python3 tools/socket/check_socket_netlist.py --regen
+#
+# RE-BASELINED 2026-09-04 by the walker/D-cache passthrough work -- the ONE
+# intended port-surface change of that design, and the only one it makes.
+# The 78 itlbAxi_*/dtlbAxi_* ports (39 each) were removed because the ITLB and
+# DTLB table walkers no longer emit AXI at all: their three dependent descriptor
+# reads and their U/M descriptor writeback are ordinary DcacheService client
+# traffic, arbitrated inside LsEuPlugin and issued (when they miss) as the
+# D-cache's own refill / write-through. That is 78 of the previous 205 ports --
+# 38% of the synthesised port surface -- and it retires two AXI masters, the
+# AR=2/AW=3 walker ID collision, and two AxiDMerge owner tiers along with them.
+# 199 -> 121 ports. (The 2026-09-03 revalidation predicted "205 -> 127"; that
+# arithmetic counted this file's own 6 comment lines as ports. The real port
+# count before this change was 199.)
 BackendWiringPlugin_logic_eu0Res output 32
 BackendWiringPlugin_logic_eu1Res output 32
 BackendWiringPlugin_logic_fireOut_0 output 1
@@ -123,83 +136,5 @@ dbg_axi_wdata input 32
 dbg_axi_wready output 1
 dbg_axi_wstrb input 4
 dbg_axi_wvalid input 1
-dtlbAxi_ar_payload_addr output 32
-dtlbAxi_ar_payload_burst output 2
-dtlbAxi_ar_payload_cache output 4
-dtlbAxi_ar_payload_id output 4
-dtlbAxi_ar_payload_len output 8
-dtlbAxi_ar_payload_lock output 1
-dtlbAxi_ar_payload_prot output 3
-dtlbAxi_ar_payload_qos output 4
-dtlbAxi_ar_payload_region output 4
-dtlbAxi_ar_payload_size output 3
-dtlbAxi_ar_ready input 1
-dtlbAxi_ar_valid output 1
-dtlbAxi_aw_payload_addr output 32
-dtlbAxi_aw_payload_burst output 2
-dtlbAxi_aw_payload_cache output 4
-dtlbAxi_aw_payload_id output 4
-dtlbAxi_aw_payload_len output 8
-dtlbAxi_aw_payload_lock output 1
-dtlbAxi_aw_payload_prot output 3
-dtlbAxi_aw_payload_qos output 4
-dtlbAxi_aw_payload_region output 4
-dtlbAxi_aw_payload_size output 3
-dtlbAxi_aw_ready input 1
-dtlbAxi_aw_valid output 1
-dtlbAxi_b_payload_id input 4
-dtlbAxi_b_payload_resp input 2
-dtlbAxi_b_ready output 1
-dtlbAxi_b_valid input 1
-dtlbAxi_r_payload_data input 128
-dtlbAxi_r_payload_id input 4
-dtlbAxi_r_payload_last input 1
-dtlbAxi_r_payload_resp input 2
-dtlbAxi_r_ready output 1
-dtlbAxi_r_valid input 1
-dtlbAxi_w_payload_data output 128
-dtlbAxi_w_payload_last output 1
-dtlbAxi_w_payload_strb output 16
-dtlbAxi_w_ready input 1
-dtlbAxi_w_valid output 1
 init_done_seen input 1
-itlbAxi_ar_payload_addr output 32
-itlbAxi_ar_payload_burst output 2
-itlbAxi_ar_payload_cache output 4
-itlbAxi_ar_payload_id output 4
-itlbAxi_ar_payload_len output 8
-itlbAxi_ar_payload_lock output 1
-itlbAxi_ar_payload_prot output 3
-itlbAxi_ar_payload_qos output 4
-itlbAxi_ar_payload_region output 4
-itlbAxi_ar_payload_size output 3
-itlbAxi_ar_ready input 1
-itlbAxi_ar_valid output 1
-itlbAxi_aw_payload_addr output 32
-itlbAxi_aw_payload_burst output 2
-itlbAxi_aw_payload_cache output 4
-itlbAxi_aw_payload_id output 4
-itlbAxi_aw_payload_len output 8
-itlbAxi_aw_payload_lock output 1
-itlbAxi_aw_payload_prot output 3
-itlbAxi_aw_payload_qos output 4
-itlbAxi_aw_payload_region output 4
-itlbAxi_aw_payload_size output 3
-itlbAxi_aw_ready input 1
-itlbAxi_aw_valid output 1
-itlbAxi_b_payload_id input 4
-itlbAxi_b_payload_resp input 2
-itlbAxi_b_ready output 1
-itlbAxi_b_valid input 1
-itlbAxi_r_payload_data input 128
-itlbAxi_r_payload_id input 4
-itlbAxi_r_payload_last input 1
-itlbAxi_r_payload_resp input 2
-itlbAxi_r_ready output 1
-itlbAxi_r_valid input 1
-itlbAxi_w_payload_data output 128
-itlbAxi_w_payload_last output 1
-itlbAxi_w_payload_strb output 16
-itlbAxi_w_ready input 1
-itlbAxi_w_valid output 1
 reset input 1

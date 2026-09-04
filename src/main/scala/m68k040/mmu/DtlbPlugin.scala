@@ -1,11 +1,10 @@
 package m68k040.mmu
 
-import m68k040.cache.{CacheMode, DTranslationCmd, DTranslationRsp}
-import m68k040.services.{DTranslationService, MmuControlService}
+import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp, DStoreCmd, DTranslationCmd, DTranslationRsp}
+import m68k040.services.{DTranslationService, DtlbWalkerDcacheClient, MmuControlService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
 import spinal.lib.misc.plugin.FiberPlugin
 
 /** D-side MMU plugin: a banked DTLB + a hardware 3-level table walker behind
@@ -29,13 +28,27 @@ import spinal.lib.misc.plugin.FiberPlugin
   * walk root is selected per-access from the request's own supervisor bit. */
 class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks,
-                 val socketMerged: Boolean = false) extends FiberPlugin with DTranslationService {
+                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin
+    with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
 
   override def req: Stream[DTranslationCmd] = _req
   override def rsp: Stream[DTranslationRsp] = _rsp
+
+  // ── Table-walk D-cache client port (see `WalkerDcacheClient`) ──────────────────
+  // Allocated in `setup` so `LsEuPlugin`'s own `during build` can reference them
+  // regardless of plugin build order, exactly like `umAccessRobId` below.
+  var _walkLoadCmd:  Stream[DLoadCmd]  = null
+  var _walkLoadRsp:  Flow[DLoadRsp]    = null
+  var _walkStore:    Stream[DStoreCmd] = null
+  var _walkStoreAck: Bool = null
+  var _walkStoreErr: Bool = null
+  override def walkLoadCmd:  Stream[DLoadCmd]  = _walkLoadCmd
+  override def walkLoadRsp:  Flow[DLoadRsp]    = _walkLoadRsp
+  override def walkStore:    Stream[DStoreCmd] = _walkStore
+  override def walkStoreAck: Bool = _walkStoreAck
+  override def walkStoreErr: Bool = _walkStoreErr
 
   during setup {
     // Allocate the service ports in the plugin's own scope (deterministic — avoids
@@ -51,6 +64,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umCommitBId    = UInt(6 bits)
     umFlush       = Bool()
     flushAll      = Bool()
+    _walkLoadCmd  = Stream(DLoadCmd())
+    _walkLoadRsp  = Flow(DLoadRsp())
+    _walkStore    = Stream(DStoreCmd())
+    _walkStoreAck = Bool()
+    _walkStoreErr = Bool()
   }
 
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
@@ -67,38 +85,34 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   // PFLUSHA: flush ALL TLB entries + the elastic result slot (task #136). Mirrors umFlush's
   // default-idle/allowOverride shape so a standalone DUT elaborates.
   var flushAll:      Bool = null
-  // AXI port for the walker + U/M descriptor write drain (full Axi4). Surfaces as
-  // top IO so the testbench / synth top attaches the page-table memory.
-  var walkerAxi: Axi4 = null
-  def axiCfg: Axi4Config = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
 
   val logic = during build new Area {
     val tlb    = new Tlb(entries, ways, banks)
     val walker = new TableWalker()
-    walkerAxi = (if (socketMerged) Axi4(axiCfg) else master(Axi4(axiCfg))).setName("dtlbAxi")
-    walkerAxi.ar << walker.io.axi.ar
-    walkerAxi.r  >> walker.io.axi.r
-    // aw/w are driven by the U/M descriptor-write drain below (default idle).
-    walkerAxi.aw.valid := False; walkerAxi.aw.payload.assignDontCare()
-    walkerAxi.w.valid  := False; walkerAxi.w.payload.assignDontCare()
-    // D27 (axi-socket adapter spec section 4.3): FAIL-CLOSED on the response ID, matching
-    // the D-cache's own discipline verbatim (DcachePlugin.scala:1948-1956: "an
-    // unrecognized id simply not ack anything -- a hung drain, which is loud and
-    // debuggable, instead of a silent spurious ack").
+
+    // ── Table-walk traffic now goes through the D-CACHE, not a private AXI master ──
+    // The walker's descriptor reads are `_walkLoadCmd`/`_walkLoadRsp`; the deferred U/M
+    // descriptor writeback is `_walkStore`/`_walkStoreAck` (see the drain below). Both
+    // pairs are arbitrated onto `DcacheService`'s single load/store ports by
+    // `LsEuPlugin`, which resolves this plugin through `DtlbWalkerDcacheClient`.
     //
-    // Today this walker is a physically separate master and the only responses reaching it
-    // are its own, so the unconditional `True` was safe. After the D8 merge it is the
-    // arbiter's owner latch, and NOTHING ELSE, that stands between this walker and a
-    // response belonging to the D-cache or the reset-vector reader. This guard is the
-    // second line of defence that makes the safety argument uniform across all three
-    // merged masters instead of resting on the arbiter alone.
-    //
-    // It does NOT disambiguate ITLB from DTLB -- they share AR=2/AW=3 (AxiIds.scala:67,69)
-    // and D8's owner latch is what separates them. It fail-closes the CLASS boundary
-    // between walker traffic and everything else. The drain ack at :340 is already gated on
-    // this handshake, so a rejected beat simply does not ack.
-    walkerAxi.b.ready  := walkerAxi.b.payload.id === U(m68k040.cache.AxiIds.WALK_WRITE,
-                                                       m68k040.cache.AxiIds.ID_W bits)
+    // The arbiter-driven halves are default-idle with `allowOverride` so a standalone
+    // DUT (one with no `LsEuPlugin`) still elaborates; such a DUT attaches a sim-side
+    // `DcacheClientMemAgent` to these ports instead, which is why they are simPublic.
+    _walkLoadCmd.valid   := walker.io.loadCmd.valid
+    _walkLoadCmd.payload := walker.io.loadCmd.payload
+    _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
+    walker.io.loadCmd.ready := _walkLoadCmd.ready
+    _walkLoadRsp.valid.allowOverride;   _walkLoadRsp.valid := False
+    _walkLoadRsp.payload.allowOverride; _walkLoadRsp.payload.assignDontCare()
+    walker.io.loadRsp := _walkLoadRsp
+    _walkStoreAck.allowOverride; _walkStoreAck := False
+    _walkStoreErr.allowOverride; _walkStoreErr := False
+    _walkStore.ready.allowOverride; _walkStore.ready := False
+    _walkLoadCmd.valid.simPublic(); _walkLoadCmd.ready.simPublic()
+    _walkLoadCmd.payload.simPublic(); _walkLoadRsp.simPublic()
+    _walkStore.valid.simPublic(); _walkStore.ready.simPublic()
+    _walkStore.payload.simPublic(); _walkStoreAck.simPublic()
 
     // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
     // the LS-cluster wiring OVERRIDES them.
@@ -442,12 +456,24 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.commitB.payload := umCommitBId
     umq.io.flush          := umFlush
 
-    // ---- U/M drain: single-byte RMW over the DTLB AXI write channel ----
+    // ---- U/M drain: single-byte RMW as ONE D-cache store ----
     // The descriptor lives at a physical byte address; write just that byte (16-byte
-    // beat with a one-hot strobe at addr[3:0]). Single-outstanding: present aw+w,
-    // hold until both handshake, ack on b. The queue holds the entry until `drainAck`.
-    val drainAwDone = RegInit(True)
-    val drainWDone  = RegInit(True)
+    // line-aligned beat with a one-hot strobe at addr[3:0]). `DStoreCmd.useStrb` is
+    // exactly this shape — the SQ already uses it to drain a split store whose byte
+    // count is not a clean 1/2/4 `Size` — so the whole AW/W/B handshake FSM this
+    // replaces collapses to a single elastic command plus its terminal ack.
+    //
+    // WHY THIS IS THE CORRECTNESS HALF OF THE CHANGE. The old path wrote the descriptor
+    // byte straight to physical memory. A copyback L1D holding that same descriptor line
+    // DIRTY (an ordinary supervisor `move.l` to a page-table entry) later evicts it and
+    // writes the whole line back INCLUDING the stale U/M byte, silently discarding the
+    // update. Losing an M means a dirty page is later evicted as clean — silent data
+    // loss. Routing the write through the cache that owns the line closes it.
+    //
+    // Single-outstanding: `drainArmed` holds one command presented until it is accepted,
+    // and the queue holds the entry until `drainAck` (the terminal `storeAck`).
+    val drainArmed  = RegInit(False)
+    val drainAckWait = RegInit(False)
     val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
     val drainBeat = Bits(128 bits)
     val drainStrb = Bits(16 bits)
@@ -462,31 +488,35 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainAddrReg = Reg(UInt(32 bits))
     val drainBeatReg = Reg(Bits(128 bits))
     val drainStrbReg = Reg(Bits(16 bits))
-    when(umq.io.drain.valid && drainAwDone && drainWDone) {
+    when(umq.io.drain.valid && !drainArmed && !drainAckWait) {
       drainAddrReg := (umq.io.drain.payload.addr(31 downto 4) ## U(0, 4 bits)).asUInt
       drainBeatReg := drainBeat
       drainStrbReg := drainStrb
-      drainAwDone  := False
-      drainWDone   := False
+      drainArmed   := True
     }
-    when(!drainAwDone) {
-      walkerAxi.aw.valid        := True
-      walkerAxi.aw.payload.addr := drainAddrReg
-      walkerAxi.aw.payload.id   := U(m68k040.cache.AxiIds.WALK_WRITE, m68k040.cache.AxiIds.ID_W bits)
-      walkerAxi.aw.payload.len  := U(0, 8 bits)
-      walkerAxi.aw.payload.size := U(4, 3 bits)
-      walkerAxi.aw.payload.burst := spinal.lib.bus.amba4.axi.Axi4.burst.INCR
-      when(walkerAxi.aw.ready) { drainAwDone := True }
-    }
-    when(!drainWDone) {
-      walkerAxi.w.valid        := True
-      walkerAxi.w.payload.data := drainBeatReg
-      walkerAxi.w.payload.strb := drainStrbReg
-      walkerAxi.w.payload.last := True
-      when(walkerAxi.w.ready) { drainWDone := True }
-    }
-    // ack the queue once the write lands (b handshake). drainAck pops the entry.
-    umq.io.drainAck := walkerAxi.b.valid && walkerAxi.b.ready
+    _walkStore.valid              := drainArmed
+    _walkStore.payload.paddr      := drainAddrReg
+    _walkStore.payload.data       := B(0, 32 bits)   // don't-care under useStrb
+    _walkStore.payload.size       := m68k040.isa.Size.LONG   // ditto
+    _walkStore.payload.useStrb    := True
+    _walkStore.payload.strb       := drainStrbReg
+    _walkStore.payload.lineData   := drainBeatReg
+    // Overwritten by the arbiter with the SAME fixed policy expression the walker's
+    // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
+    // forbidden: the read and the write halves of one table search must agree, or the
+    // read can hit an array copy the write never updated.
+    _walkStore.payload.cacheMode  := CacheMode.WRITETHROUGH
+    // NOT on the SQ's at-head precise path: this store belongs to no ROB entry's
+    // precise fault reporting, and marking it precise would route a bus error into the
+    // SQ's `sqFaultCompletion` against an unrelated robId.
+    _walkStore.payload.precise    := False
+    when(_walkStore.fire) { drainArmed := False; drainAckWait := True }
+    when(drainAckWait && _walkStoreAck) { drainAckWait := False }
+    // ack the queue once the store lands (the terminal `storeAck`). drainAck pops the
+    // entry. `_walkStoreErr` is deliberately not consulted: the pre-existing AXI path
+    // did not inspect `bresp` either, and inventing a fault report here would attribute
+    // a bus error to whatever instruction happens to be retiring.
+    umq.io.drainAck := drainAckWait && _walkStoreAck
 
     // Sim-only sticky fault observation: set whenever a translation resolves with a
     // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step

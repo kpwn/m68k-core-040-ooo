@@ -1,7 +1,6 @@
 package m68k040.socket
 
 import m68k040.cache.DcachePlugin
-import m68k040.mmu.{DtlbPlugin, ItlbPlugin}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -31,25 +30,35 @@ class AxiDMergePlugin(val grantTimeout: BigInt = AxiDMerge.V1_TIMEOUT_CYCLES)
 
   val logic = during build new Area {
     val dc = host[DcachePlugin]
-    val it = host[ItlbPlugin]
-    val dt = host[DtlbPlugin]
-    require(dc.socketMerged && it.socketMerged && dt.socketMerged,
-      "AxiDMergePlugin requires DcachePlugin/ItlbPlugin/DtlbPlugin to be constructed with " +
-      "socketMerged = true, otherwise their AXI bundles are top-level master ports the " +
-      "arbiter cannot drive the response side of")
+    require(dc.socketMerged,
+      "AxiDMergePlugin requires DcachePlugin to be constructed with socketMerged = true, " +
+      "otherwise its AXI bundle is a top-level master port the arbiter cannot drive the " +
+      "response side of")
 
     val merge = new AxiDMerge(dc.axiCfg, grantTimeout)
 
     merge.io.dc   <> dc.logic.axi
-    // it.walkerAxi/dt.walkerAxi are plugin-level `var`s assigned inside their own
-    // `during build` Area (not declared as members of that Area's structural type -- see
-    // ItlbPlugin.scala:64/DtlbPlugin.scala:68), so they are read off the plugin host
-    // directly rather than through `.logic`, matching this codebase's existing precedent
-    // for the same class of field (FullCoreSynth.scala:322's `dtlb.umAccessRobId`). This
-    // relies on the load-bearing ordering requirement above: by the time THIS plugin's
-    // `during build` runs, ItlbPlugin/DtlbPlugin have already built and assigned it.
-    merge.io.itlb <> it.walkerAxi
-    merge.io.dtlb <> dt.walkerAxi
+    // ── The two walker owners are RETIRED ────────────────────────────────────────
+    // The ITLB/DTLB table walkers no longer emit AXI at all: their descriptor reads and
+    // their U/M descriptor writebacks are ordinary `DcacheService` client traffic,
+    // arbitrated inside `LsEuPlugin` and issued (if they miss) as the D-cache's own
+    // refill/write-through. So the read side has two real owners (`DCACHE`,
+    // `RESETVEC`) and the write side one, and these two slave ports are tied idle.
+    //
+    // This also DISSOLVES, rather than works around, the AR=2/AW=3 ID collision
+    // `AxiIds.scala`'s header records between the two walkers: with no walker master
+    // there is no collision to separate by owner latch.
+    //
+    // The ports themselves are left on `AxiDMerge` for now so its directed suite
+    // (`socket/AxiDMergeSpec`) keeps exercising the 4-owner round-robin it was written
+    // against; removing them is a separate, self-contained shrink.
+    for (w <- Seq(merge.io.itlb, merge.io.dtlb)) {
+      w.ar.valid := False; w.ar.payload.assignDontCare()
+      w.aw.valid := False; w.aw.payload.assignDontCare()
+      w.w.valid  := False; w.w.payload.assignDontCare()
+      w.r.ready  := False
+      w.b.ready  := False
+    }
 
     /** The single merged D-side master. This is the bundle `M68kSocketTop` permutes and
       * presents as `axi_d`. */

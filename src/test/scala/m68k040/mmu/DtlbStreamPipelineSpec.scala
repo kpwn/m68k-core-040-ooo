@@ -3,7 +3,7 @@ package m68k040.mmu
 import m68k040.{M68kParams, VerilatorTest}
 import m68k040.cache.{DTranslationCmd, DTranslationRsp}
 import m68k040.core.ParamPlugin
-import m68k040.ls.BehavioralMemAgent
+import m68k040.sim.{DcacheClientMemAgent, WalkerDcacheSimIo}
 import m68k040.services.DTranslationService
 import org.scalatest.funsuite.AnyFunSuite
 import spinal.core._
@@ -35,21 +35,25 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
     val probe = new DtlbStreamProbePlugin()
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), ctrl, dtlb, probe)) }
-    def walkerAxi = dtlb.walkerAxi
+    // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
+    // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
+    // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
+    // attaching a DcacheClientMemAgent to the retired `walkerAxi`.
+    val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
   }
 
   val ROOT = 0x10000L
   val PTRT = 0x11000L
   val PAGT = 0x12000L
 
-  def pokeWord(mem: BehavioralMemAgent, addr: Long, value: Long): Unit =
+  def pokeWord(mem: DcacheClientMemAgent, addr: Long, value: Long): Unit =
     for (i <- 0 until 4) mem.pokeByte(addr + i, ((value >> (8 * (3 - i))) & 0xff).toInt)
   def rootIdx(va: Long): Int = ((va >> 25) & 0x7f).toInt
   def ptrIdx(va: Long): Int  = ((va >> 18) & 0x7f).toInt
   def pageIdx(va: Long): Int = ((va >> 12) & 0x3f).toInt
   def vpnOf(va: Long): Long  = (va >> 12) & 0xfffff
 
-  def buildPage(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  def buildPage(mem: DcacheClientMemAgent, va: Long, ppn: Long,
                 writeProtect: Boolean = false, supervisor: Boolean = false): Unit = {
     pokeWord(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
     pokeWord(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
@@ -91,7 +95,7 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.walkerAxi, cd)
+      val mem = new DcacheClientMemAgent(dut.walkPort, cd)
       val req = dut.probe.logic.reqIn
       val rsp = dut.probe.logic.rspOut
       req.valid #= false
@@ -115,7 +119,7 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkerAxi.ar.valid.toBoolean && dut.walkerAxi.ar.ready.toBoolean) arCount += 1
+        if (dut.walkPort.cmd.valid.toBoolean && dut.walkPort.cmd.ready.toBoolean) arCount += 1
       } }
 
       // Warm by legal accesses, then freeze the walker count. These are real cold

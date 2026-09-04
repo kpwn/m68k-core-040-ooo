@@ -87,11 +87,11 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
   private def ptrIdx(va: Long): Int  = ((va >>> 18) & 0x7f).toInt
   private def pageIdx(va: Long): Int = ((va >>> 12) & 0x3f).toInt
 
-  private def pokeDescriptor(mem: BehavioralMemAgent, addr: Long, word: Long): Unit =
+  private def pokeDescriptor(mem: AxiMemModel, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >>> (8 * (3 - i))) & 0xff).toInt)
 
-  private def buildPage(mem: BehavioralMemAgent, va: Long, ppn: Long,
+  private def buildPage(mem: AxiMemModel, va: Long, ppn: Long,
                         resident: Boolean, copyback: Boolean): Unit = {
     pokeDescriptor(mem, Root + rootIdx(va) * 4, (Ptrt & 0xfffffff0L) | 0x3L)
     pokeDescriptor(mem, Ptrt + ptrIdx(va) * 4, (Pagt & 0xfffffff0L) | 0x3L)
@@ -101,11 +101,14 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
       ((ppn << 12) & 0xfffff000L) | cm | residentBit)
   }
 
-  private def initDut(dut: Dut): (ClockDomain, AxiMemModel, BehavioralMemAgent) = {
+  private def initDut(dut: Dut): (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(10)
     val dataMem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd)
-    val pageMem = new BehavioralMemAgent(dut.dtlb.walkerAxi, cd)
+    // The DTLB walker now reaches memory through the D-cache, so the page table must
+    // live in the D-SIDE memory rather than a private walker image. Aliasing the old
+    // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.
+    val pageMem = dataMem
     val s = dut.src.logic
     s.iValid #= false
     s.iMemOp #= MemOp.LOAD
@@ -276,7 +279,9 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
       val completionRobs   = scala.collection.mutable.ArrayBuffer.empty[Int]
       val residentFaults   = scala.collection.mutable.ArrayBuffer.empty[(Int, Long)]
 
-      val walkerArBefore = pageMem.model.stats.totalAr
+      // The walker's descriptor reads are D-cache load commands now, so "did a walk
+      // happen" is counted by their reserved token instead of by walker-AXI AR beats.
+      var walkCmds = 0
       driveLoad(dut, loads.head.basePreg,
         (loads.head.va - vaLineA).toInt, loads.head.pdst, loads.head.robId)
       var nextIssue = 0
@@ -310,11 +315,17 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
                       dut.dcache.logic.loadCmdPort.ready.toBoolean
         if (cmdFire) {
-          cmdCycles += cycle
-          cmdVas += dut.dcache.logic.loadCmdPort.payload.vaddr.toLong & 0xffffffffL
-          cmdPas += dut.dcache.logic.loadCmdPort.payload.paddr.toLong & 0xffffffffL
-          cmdTokens += dut.dcache.logic.loadCmdPort.payload.token.toInt
-          if (dut.dcache.logic.useEarlyProbe.toBoolean) earlyUseCycles += cycle
+          val tok = dut.dcache.logic.loadCmdPort.payload.token.toInt
+          if (tok == m68k040.cache.DLoadToken.WALK_ITLB ||
+              tok == m68k040.cache.DLoadToken.WALK_DTLB) {
+            walkCmds += 1
+          } else {
+            cmdCycles += cycle
+            cmdVas += dut.dcache.logic.loadCmdPort.payload.vaddr.toLong & 0xffffffffL
+            cmdPas += dut.dcache.logic.loadCmdPort.payload.paddr.toLong & 0xffffffffL
+            cmdTokens += tok
+            if (dut.dcache.logic.useEarlyProbe.toBoolean) earlyUseCycles += cycle
+          }
         }
         if (s.fValid.toBoolean)
           residentFaults += ((s.fRob.toInt, s.fAddr.toLong & 0xffffffffL))
@@ -336,7 +347,6 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
           }
         }
       }
-      val walkerArAfter = pageMem.model.stats.totalAr
 
       // Establish non-vacuity and correctness before checking cadence.  On the old
       // held-VPN response scheme these all pass, then the final cadence assertion
@@ -366,8 +376,9 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
       assert(completionRobs.toSeq == expectedRobs,
         s"untagged L1 responses completed out of order: got=$completionRobs expected=$expectedRobs")
       assert(residentFaults.isEmpty, s"resident burst produced faults: $residentFaults")
-      assert(walkerArAfter == walkerArBefore,
-        s"measured accesses were not resident DTLB hits: walker AR $walkerArBefore->$walkerArAfter")
+      assert(walkCmds == 0,
+        s"measured accesses were not resident DTLB hits: $walkCmds table-walk descriptor " +
+        s"reads were issued during the measured window")
       cd.waitSampling(3)
       loads.foreach { l =>
         val got = readPreg(dut, l.pdst)
