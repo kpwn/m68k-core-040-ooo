@@ -1776,10 +1776,48 @@ class ExceptionUnit(
         rteNzvcWriteData  := popSr(3 downto 0).asBits
         rteXWriteValid    := True
         rteXWriteData     := popSr(4)
+        // ── Part 135: ALSO resync RobPlugin's `committedCcr` shadow to the popped CCR ──
+        //
+        // The two lines above put the frame's CCR back into the REAL flags PRF, which is
+        // what an ordinary Bcc reads. They do NOT touch `RobPlugin.committedCcr`, the
+        // separate committed-CCR shadow that `ccrForException` builds the STACKED SR's
+        // low byte from. That shadow is only advanced by `retire0`/`retire1`'s per-uop
+        // NZVC/X fold, so after an RTE it still holds THE HANDLER's condition codes.
+        //
+        // That is a real, measured corruption, not a bookkeeping nicety. Take a second
+        // interrupt at the SAME flag-consuming instruction the first one preempted --
+        // i.e. before any flag-WRITING instruction has retired since the RTE:
+        //
+        //   cmp.l #K,%d0        retires -> committedCcr = {Z=1}; PRF = {Z=1}
+        //   bne   ...           IRQ #1 preempts it; the frame stacks {Z=1}   (correct)
+        //   <handler disturbs the flags, e.g. moveq #-1,%dn>  -> committedCcr = {N=1,Z=0}
+        //   rte                 PRF := {Z=1} (correct)   committedCcr STILL {N=1,Z=0}
+        //   bne   ...           IRQ #2 preempts the SAME bne; the frame now stacks
+        //                       {N=1,Z=0} -- the HANDLER's flags, not the program's
+        //   <handler> rte       PRF := {N=1,Z=0}  -> the `bne` now branches the WRONG WAY
+        //
+        // Found by M1ThrowawayFrameIrqSpec's T12/T13 (Part 135), which reproduce it in
+        // BOTH supervisor banks in well under 100 interrupt entries. It is invisible to
+        // any test whose interrupt handler is a bare `RTE` (which cannot disturb the
+        // flags), which is why the whole existing interrupt corpus missed it -- and the
+        // comment this replaces stated the very assumption the bug violates ("RTE
+        // restores the same CCR the matching exception entry saved").
+        //
+        // `obsSetCcr5` is exactly the port for this: RobPlugin already applies it as
+        // `committedCcr := exc.obsSetCcr5` (last-wins over the retire fold), and the
+        // lock-step whitebox already treats it as "set the running CCR to this absolute
+        // value for this obs step" -- which is precisely RTE's architectural semantics.
+        // MOVE-to-SR / STOP (S_REDIR) already use it the same way; this is a THIRD
+        // producer in the same FSM, so they stay mutually exclusive by construction.
+        //
+        // The format-$1 throwaway pass deliberately does NOT pulse it: that pass fires no
+        // obs at all and is not an architectural completion, and the second (real) pop
+        // below lands the final value a few cycles later -- with `excIdle` low throughout,
+        // so no exception entry can read the shadow in between.
+        obsSetCcr5Valid := True
+        obsSetCcr5      := popSr(4 downto 0)
         // commit observation: RTE's trace step == restored PC + restored SR sysByte
-        // + A7. A7 after RTE = popped-SSP if S restored supervisor, else USP. The CCR
-        // is restored from the frame too, but the whitebox carries it (RTE restores
-        // the same CCR the matching exception entry saved -> reconstructed CCR holds).
+        // + A7 + the restored CCR (obsSetCcr5, just above).
         obsFire    := True
         obsPc      := popPc
         obsSysByte := popSr(15 downto 8)
