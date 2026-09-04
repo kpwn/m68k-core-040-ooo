@@ -25,9 +25,15 @@ object BehavioralMem {
 }
 
 class BehavioralMemAgent(axi: Axi4, cd: ClockDomain, sharedMem: SparseMemory = null,
-                         injectBusErrors: Boolean = false) {
+                         injectBusErrors: Boolean = false,
+                         // Part 127: full AxiMemModelConfig passthrough so a caller can
+                         // give this attach a REALISTIC latency instead of the implicit
+                         // zero-latency default. `injectBusErrors` still wins (it is the
+                         // pre-existing, widely-used knob); a caller that passes `dcfg`
+                         // gets that config with `injectBusErrors` ORed in.
+                         dcfg: AxiMemModelConfig = AxiMemModelConfig()) {
   val model = AxiMemModel.attachFull(axi, cd,
-    AxiMemModelConfig(injectBusErrors = injectBusErrors), sharedMem)
+    dcfg.copy(injectBusErrors = dcfg.injectBusErrors || injectBusErrors), sharedMem)
   val mem = model.mem
   def pokeByte(addr: Long, value: Int): Unit = model.pokeByte(addr, value)
   def peekByte(addr: Long): Int             = model.peekByte(addr)

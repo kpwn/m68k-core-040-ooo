@@ -1113,4 +1113,111 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
         "mis-attributed completion that hung 15 ported tests)")
     }
   }
+
+  // ── Part 127 (defect SS8(a) of BUG_calibration_word_misplaced_0d00.md Part 126) ──
+  //
+  // The P2.7 test above covers a flush landing on the ALLOC cycle: there, `pendMem` and
+  // the SQ must BOTH drop the entry. This is the OPPOSITE case, and it was never
+  // covered: a flush landing while a precise store's drain half has ALREADY been
+  // ACCEPTED by DcachePlugin. `StoreQueue.headDrainInFlight` deliberately KEEPS that
+  // entry (the Part 37 fix -- its physical write already left the CPU and cannot be
+  // un-issued), but `LsEuPlugin`'s rollback discarded its `pendMem` slot
+  // unconditionally. The two lock-step rings then run one apart FOREVER: every later
+  // precise drain replays the WRONG record, so completion port 4 fires for a stale
+  // robId while the real store's robId never completes (ROB head parks -> HANG), and
+  // the An/A7/NZVC write-back lands with the wrong data.
+  //
+  // `RobPlugin`'s `!preciseDrainBusyIn` retire gate closes most of this window, but
+  // `preciseDrainBusyReg` is REGISTERED one cycle after `preciseLaunch`, so a flush on
+  // the launch cycle still gets through -- and `doFlushReg` also fires from
+  // `debugRecoverEnter`/`debugPcApply`, which are not retire-gated at all. That made
+  // halting this machine over JTAG during a precise drain a guaranteed hang.
+  //
+  // A REAL D-SIDE LATENCY IS LOAD-BEARING HERE, not decoration: with the default
+  // zero-latency memory the accepted-but-unacked window is ~1 cycle wide and the race
+  // is barely reachable. `l2DramFast` widens it to tens of cycles, which is also the
+  // board's own posture (CACR.DE=0 => every store precise, real DDR behind the L2).
+  test("Part 127: a flush landing on an ALREADY-ACCEPTED precise drain must KEEP that " +
+       "store's pendMem slot, in lock-step with StoreQueue keeping its SQ entry", VerilatorTest) {
+    simConfig.compile(new Dut).doSim { dut =>
+      val (cd, mem, ptmem) = initDut(dut, dataMemCfg = m68k040.sim.L2Sweeps.l2DramFast)
+      seed(dut, cd, preg = 10, value = 0x6000L)
+      seed(dut, cd, preg = 11, value = 0xFEEDFACEL)
+
+      val depth = dut.eu.logic.pendDepth
+      assert(dut.eu.logic.pendPush.toInt == dut.eu.logic.pendReady.toInt,
+        "precondition: pend FIFO starts balanced")
+
+      // Store A: MMU off + DE=0 => precise. Park the ROB head on its robId so its
+      // at-head drain actually launches.
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 5)
+      var n = 0
+      while (!dut.eu.logic.sq.valids.exists(_.toBoolean) && n < 400) { cd.waitSampling(); n += 1 }
+      assert(n < 400, "store A never became resident in the SQ")
+      dut.wire.logic.iRobHeadIn      #= 5
+      dut.wire.logic.iRobHeadValidIn #= true
+
+      // Wait for the drain half to be ACCEPTED and still UNACKED. This is the exact
+      // state `headDrainInFlight` exists for.
+      var w = 0
+      while (!(dut.eu.logic.sq.drainBusy.toBoolean && !dut.eu.logic.sq.committed(dut.eu.logic.sq.head.toInt).toBoolean)
+             && w < 600) { cd.waitSampling(); w += 1 }
+      assert(w < 600,
+        "store A's precise drain half was never accepted-and-unacked; without that " +
+        "state this test would be vacuous")
+      val pushBefore  = dut.eu.logic.pendPush.toInt
+      val readyBefore = dut.eu.logic.pendReady.toInt
+      assert(((pushBefore - readyBefore + depth) % depth) == 1,
+        s"precondition: exactly one unconfirmed pendMem entry (push=$pushBefore ready=$readyBefore)")
+
+      // A non-retire-gated flush (JTAG halt / step / PC-apply) lands HERE.
+      dut.src.logic.iSqFlush #= true
+      sleep(1)
+      assert(dut.eu.logic.sq.io.flush.toBoolean, "the flush must reach the SQ this cycle")
+      assert(dut.eu.logic.sq.io.flushKeptPrecise.toBoolean,
+        "the SQ must report that it KEPT the in-flight precise head across this flush")
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+      sleep(1)
+
+      assert(dut.eu.logic.sq.valids.exists(_.toBoolean),
+        "Part 37's keep rule still applies -- the accepted-drain entry survives")
+      val pushAfter  = dut.eu.logic.pendPush.toInt
+      val readyAfter = dut.eu.logic.pendReady.toInt
+      assert(((pushAfter - readyAfter + depth) % depth) == 1,
+        s"THE DEFECT: the pendMem slot of the entry StoreQueue KEPT was discarded by the " +
+        s"flush rollback (push=$pushAfter ready=$readyAfter, expected exactly one " +
+        s"outstanding). From here the two rings are off by one forever: every later " +
+        s"precise drain replays the wrong record.")
+
+      // Let store A's own already-in-flight drain finish. Its ROB entry is gone, so its
+      // replay must be DISCARDED (orphan) -- but its pendMem slot must still be
+      // CONSUMED, or pendApply never catches pendReady again.
+      cd.waitSampling(200)
+      assert(dut.eu.logic.pendApply.toInt == dut.eu.logic.pendReady.toInt,
+        "the orphaned entry's pendMem slot must be consumed, not left in the ring")
+
+      // END-TO-END CONSEQUENCE. A brand-new precise store must complete its OWN robId.
+      // With the ring skewed it replays store A's stale record instead.
+      seed(dut, cd, preg = 12, value = 0x6100L)
+      issueStore(dut, cd, basePreg = 12, disp = 0, dataPreg = 11, Size.LONG, robId = 9)
+      var m = 0
+      while (!dut.eu.logic.sq.valids.exists(_.toBoolean) && m < 400) { cd.waitSampling(); m += 1 }
+      assert(m < 400, "store B never became resident in the SQ")
+      val h = dut.eu.logic.sq.head.toInt
+      dut.wire.logic.iRobHeadIn      #= dut.eu.logic.sq.robIds(h).toInt
+      dut.wire.logic.iRobHeadValidIn #= true
+
+      var seenRid = -1
+      var k = 0
+      while (seenRid < 0 && k < 800) {
+        if (dut.wire.logic.oSqCompValid.toBoolean) seenRid = dut.wire.logic.oSqCompPayload.toInt
+        cd.waitSampling(); k += 1
+      }
+      assert(seenRid == 9,
+        s"store B's drain must complete its OWN robId 9, got $seenRid -- a 5 is the " +
+        "flush-kept store A's record being replayed under B's drain, and a -1 means no " +
+        "completion ever arrived (the ROB head would park here forever: the HANG)")
+    }
+  }
 }

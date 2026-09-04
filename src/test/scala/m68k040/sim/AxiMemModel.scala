@@ -807,6 +807,19 @@ object L2Sweeps {
   val chaosDram = AxiMemModelConfig(
     rspMode = AxiRspMode.Chaos,
     latency = L2LatencyModel(enabled = true, dramCycles = 20), idBusyBlock = true)
+  /** Part 127. `dramCycles` only ever reaches the READ engine -- `AxiWriteEngine`'s B
+    * response is scheduled at `hitCycles` unconditionally (see its `val lat = ...
+    * cfg.latency.hitCycles` line), so `l2DramSlow` widens a LOAD's latency to ~60
+    * cycles but leaves a STORE's B at 5. That matters for exactly one thing: with
+    * `CACR.DE = 0` every store is `precise`, and a precise store's ROB completion, its
+    * `(An)+` An write-back and its consumer wakeup are all deferred until the AXI B
+    * arrives -- so the STORE-side latency is the whole width of the deferral window
+    * this Part exists to hold open. These two presets set `hitCycles` directly, which
+    * is the only knob that reaches the write path. Measured against
+    * `LsEuPlugin.preciseDrainBusySig`: zero-latency ~2 cycles, `l2DramFast` 15,
+    * `storeSlow` ~70. */
+  val storeSlow     = AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = 60, dramCycles = 60))
+  val storeVerySlow = AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = 120, dramCycles = 120))
 
   val standard: Seq[(String, AxiMemModelConfig)] = Seq(
     "zero-latency"       -> zeroLatency,

@@ -131,6 +131,17 @@ class StoreQueue(depth: Int = 8) extends Component {
     val sqCompletion        = master(Flow(UInt(6 bits)))
     val sqFaultCompletion   = master(Flow(m68k040.execute.LsFault()))
     val preciseDrainBusy    = out(Bool())
+    // ---- Part 127: flush/orphan handshake with LsEuPlugin's `pendMem` ring --------
+    // `pendMem` and this ring are a lock-step PAIR (see `LsEuPlugin.deferCompletion`).
+    // These two outputs are the only things that let the LS EU mirror the flush rule
+    // this component actually applies, instead of assuming it.
+    //   `flushKeptPrecise` : THIS flush cycle kept an uncommitted precise head (the
+    //                        `headDrainInFlight` arm). Its pendMem entry must be kept
+    //                        too, or the two rings desynchronize by one FOREVER.
+    //   `sqCompletionOrphan`: qualifies `sqCompletion` -- the popping entry has no live
+    //                        ROB entry, so its replay must be DISCARDED, not applied.
+    val flushKeptPrecise    = out(Bool())
+    val sqCompletionOrphan  = out(Bool())
   }
 
   // ---- ring storage (all RegInit) ----
@@ -261,6 +272,26 @@ class StoreQueue(depth: Int = 8) extends Component {
   val cacheModesB= Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
   val supervisors= Vec.fill(depth)(RegInit(False))
   val precises   = Vec.fill(depth)(RegInit(False))
+  // ---- ORPHANED entry (Part 127, defect SS8(b) of Part 126) ----------------------
+  // Set on the ONE entry a flush deliberately KEEPS via `headDrainInFlight` (see the
+  // flush block's doc comment): a precise, still-UNCOMMITTED head whose drain has
+  // already been accepted by DcachePlugin, so its physical write is irrevocably in
+  // flight and the ring bookkeeping must be allowed to unwind. What that comment did
+  // NOT account for is that the flush ALSO destroys the entry's ROB slot -- the ROB
+  // flush is pointer-only (`tail := head`), so its robId is immediately re-allocatable.
+  // Two consequences, both real:
+  //   1. LAUNCH. For a SPLIT entry, slot B has not been presented yet, and its only
+  //      launch gate is `robIds(head) === io.robHeadIn` -- which the dead ROB entry can
+  //      never satisfy. The entry can never finish, and (`empty` staying false) nothing
+  //      behind it can ever drain: the same permanent wedge Part 37 fixed one instance
+  //      of. `headPreciseReady` below therefore gives an orphan its own launch arm.
+  //   2. COMPLETION. `io.sqCompletion.payload := robIds(head)` would mark whatever
+  //      brand-new instruction inherited that robId as COMPLETE -- it would retire
+  //      without ever executing -- and the LS EU would replay this dead store's An/NZVC
+  //      write-back onto that instruction's rename. `io.sqCompletionOrphan` flags the
+  //      pop so LsEuPlugin's deferred-replay stage consumes the pendMem slot and drives
+  //      NOTHING to the ROB or the PRF.
+  val orphans    = Vec.fill(depth)(RegInit(False))
 
   val head = RegInit(U(0, ptrW bits))   // oldest
   val tail = RegInit(U(0, ptrW bits))   // next free
@@ -382,9 +413,19 @@ class StoreQueue(depth: Int = 8) extends Component {
   // only once every program-older store has already allocated and drained -- i.e.
   // `robIds(head) === io.robHeadIn` can only become true once this entry genuinely
   // IS the SQ ring head too. Nothing here needs an explicit reordering check.
+  // ORPHAN arm (Part 127): an entry the flush KEPT has no ROB entry left, so
+  // `robIds(head) === io.robHeadIn` can never be satisfied -- and, for the same
+  // reason, there is no ROB entry for an interrupt/trace to preempt in favour of, so
+  // `irqPreemptPendingIn` must not gate it either (the commit-side exception FSM
+  // WAITS for the SQ to go empty, so holding an orphan back for a pending preempt is
+  // a deadlock, not a precision measure). Its slot A has already hit memory; the only
+  // correct thing left to do is let it finish.
+  val headOrphan = valids(head) && orphans(head) && precises(head)
   val headPreciseReady = valids(head) && !committed(head) && precises(head) &&
-                         (robIds(head) === io.robHeadIn) && io.robHeadValidIn &&
-                         !io.flush && !io.irqPreemptPendingIn
+                         Mux(headOrphan, True,
+                             (robIds(head) === io.robHeadIn) && io.robHeadValidIn &&
+                             !io.irqPreemptPendingIn) &&
+                         !io.flush
 
   // Flush-source review (design doc §4.1, recorded here per the plan's Slice P3
   // hardening pass): a branch-mispredict flush (RobPlugin's doFlushReg) can only
@@ -812,6 +853,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     cacheModesB(tail) := io.alloc.payload.cacheModeB
     supervisors(tail) := io.alloc.payload.supervisor
     precises(tail)    := io.alloc.payload.precise
+    orphans(tail)     := False   // fresh entry: never inherit a prior occupant's orphan mark
     // Drive the sim-only shadow of the deleted magnitude-comparator geometry, in the
     // deleted code's exact form (`paddr + nbytes`, 32-bit, carry-out dropped).
     GenerationFlags.simulation {
@@ -868,6 +910,9 @@ class StoreQueue(depth: Int = 8) extends Component {
   // AXI B error.
   io.sqCompletion.valid   := False
   io.sqCompletion.payload := robIds(head)
+  // Qualifier for the pop that `sqCompletion` announces (Part 127). Combinational off
+  // `orphans(head)`, valid on exactly the cycles `sqCompletion.valid` is.
+  io.sqCompletionOrphan   := orphans(head)
   io.sqFaultCompletion.valid           := False
   io.sqFaultCompletion.payload.robId   := robIds(head)
   io.sqFaultCompletion.payload.faultAddr  := Mux(drainPhaseB, vaddrBs(head), vaddrAs(head))
@@ -1001,6 +1046,12 @@ class StoreQueue(depth: Int = 8) extends Component {
   // `sendPtr`/`ackPhaseB`) simply needs to be allowed to unwind normally instead of
   // being abandoned mid-sequence.
   val headDrainInFlight = valids(head) && !committed(head) && (drainBusy || ackPhaseB)
+  // An uncommitted entry can only ever have an accepted drain half if it is PRECISE:
+  // both non-precise launch arms (`sendPipelined`, `sendSerialReady`) require
+  // `sendCommitted`. Stated explicitly so the two Part-127 outputs below do not rest
+  // on that being re-derived at every read site.
+  val headKeptByFlush = io.flush && headDrainInFlight && precises(head) && !terminalAck
+  io.flushKeptPrecise := headKeptByFlush
   when(io.flush) {
     // A drainAck this same cycle pops the head entry (single-slot, or slot B of a
     // split). That popped entry must NOT be counted as kept — otherwise the flush's
@@ -1020,6 +1071,13 @@ class StoreQueue(depth: Int = 8) extends Component {
     val keepCount = CountOne(keep)
     val headAfter = Mux(popsHead, head + 1, head)
     tail := (headAfter + keepCount).resized
+    // Part 127: the entry kept by the `headDrainInFlight` arm (and ONLY that one --
+    // every other kept entry is `committed`, i.e. its instruction has already retired
+    // and its ROB slot legitimately no longer matters) loses its ROB entry to this
+    // same flush. Mark it so `headPreciseReady` can still launch its slot B and so its
+    // eventual completion is discarded instead of applied to whatever instruction
+    // inherits its robId.
+    when(headKeptByFlush) { orphans(head) := True }
   }
 
   // ---- count = hardware sum of valids (no Scala-var counters) ----
@@ -1079,6 +1137,11 @@ class StoreQueue(depth: Int = 8) extends Component {
   vaddrAs.foreach(_.simPublic()); vaddrBs.foreach(_.simPublic())
   cacheModes.foreach(_.simPublic()); cacheModesB.foreach(_.simPublic())
   supervisors.foreach(_.simPublic()); precises.foreach(_.simPublic())
+  orphans.foreach(_.simPublic())   // Part 127
+  // Part 127: these two are read by directed tests through a NESTED instance (the
+  // LS-EU DUT), where a bare IO port is not reachable -- same reason `io.flush` above
+  // carries one.
+  io.flushKeptPrecise.simPublic(); io.sqCompletionOrphan.simPublic()
   io.drain.valid.simPublic(); io.drain.ready.simPublic(); io.drainAck.simPublic(); io.flush.simPublic()
   // Task #139 mechanism #2: catch the ORIGINATING alloc of any SQ entry, so a
   // later-observed stuck head can be traced back to the actual allocating PC

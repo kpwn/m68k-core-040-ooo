@@ -619,6 +619,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // `L2Sweeps` presets (e.g. `todaysCrossbar`, `l2DramSlow`,
                   // `chaosDram`) to lock-step under realistic-vs-idealized AXI timing.
                   cfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+                  // AXI memory-model timing for the **D-side** (D-cache) attach. Part 127:
+                  // until now this attach was hard-wired to a zero-latency
+                  // `BehavioralMemAgent`, so a `precise` (cache-inhibited) store's AXI drain
+                  // completed in ~0 cycles and the whole `deferCompletion`/`pendMem`/replay
+                  // leg -- which is what defers an `(An)+` store's An write-back and its
+                  // consumer wakeup -- was never held open for a realistic number of cycles.
+                  // On the board (CACR.DE=0, MMU off, real DDR behind the L2) that window is
+                  // tens of cycles wide. Default `AxiMemModelConfig()` (== zeroLatency) keeps
+                  // every pre-existing call site byte-for-byte unchanged.
+                  dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+                  // Cycle budget for the run loop. 4000 has always been the (hard-coded)
+                  // value; a run with a REALISTIC D-side latency needs far more, because a
+                  // precise store now costs tens of cycles instead of ~2.
+                  maxCycles: Int = 4000,
                   // Committed CACR posture. The default 0x80008000 (DE|IE) is what EVERY
                   // pre-existing call site has always used, so they are unchanged. Part 126
                   // needs 0x00008000 -- I-cache ON, **D-cache OFF** -- because that is the
@@ -786,7 +800,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       // Attach a behavioral read/write memory to the D-cache AXI (separate image,
       // zeroed; the programs store before they load, so no data preload needed).
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Part 127: honours `dcfg` so a caller can give the D side a REALISTIC AXI
+      // latency. `BehavioralMemAgent` is itself just `AxiMemModel.attachFull` with
+      // a default config (see BehavioralMem.scala), so passing the default `dcfg`
+      // is byte-for-byte the previous behaviour.
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg)
       // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
@@ -903,7 +921,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       // Run until enough committed (or a generous cap).
       var guard = 0
-      val cap   = 4000
+      val cap   = maxCycles
       while (handle.result.size < n && guard < cap) {
         cd.waitSampling(); guard += 1
         if (sys.env.contains("CR_DECTRACE") && guard < 700) {
@@ -8083,6 +8101,137 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         "move.w %sp,%d0 ; " +
         "moveq #7,%d4 ; .stop: bra .stop", nInstr = 14, cacr = 0x00008000L)
     }
+  }
+  // ── Part 127: the SAME programs again, but with a REALISTIC D-side AXI latency ──
+  // Part 126 closed the CACR.DE=0 coverage hole; it left a SECOND one open, and said so:
+  // `runLockStep`'s D-cache attach was a zero-latency `BehavioralMemAgent`, and its `cfg`
+  // parameter only reached the I-FETCH attach. With DE=0 every store is `precise`
+  // (`LsEuPlugin.txEffectiveCmode` forces INHIBITED, `fastStore` is False), so its ROB
+  // completion, its `(An)+` An write-back AND the consumer wakeup for that An are all
+  // deferred into `pendMem` and replayed only when the SQ confirms the AXI drain
+  // (`LsEuPlugin.deferCompletion` / `:2666-2695`). With a zero-latency memory that
+  // deferral window is ~2 cycles wide; on the board it is tens of cycles. `dcfg` now
+  // plumbs an `AxiMemModelConfig` to the D side so the window can be held open.
+  //
+  // These are the wedge's own instruction shapes under `L2Sweeps.l2DramSlow`
+  // (dramCycles=60) and `l2DramFast` (20), at the board's CACR.
+  for ((dtag, dc) <- Seq(("dram20", m68k040.sim.L2Sweeps.l2DramFast),
+                         ("stslow", m68k040.sim.L2Sweeps.storeSlow),
+                         ("xbar",   m68k040.sim.L2Sweeps.todaysCrossbar))) {
+    test(s"lock-step p127: ROM push/CLR chain at the real top of RAM, D-cache OFF + D-side $dtag", VerilatorTest) {
+      runLockStep(s"p127-romchain-$dtag",
+        "move.l #0x03FFFFD4,%a5 ; " +
+        "move.l #0,(%a5) ; move.l #0,4(%a5) ; move.l #0,8(%a5) ; move.l #0,12(%a5) ; " +
+        "move.l %a5,%sp ; move.l %sp,%d1 ; " +      // moveal %a5,%sp  (0x2E4D)
+        "moveq #-1,%d5 ; " +
+        "move.l %d5,(%sp)+ ; move.l %sp,%d2 ; " +   // movel %d5,%sp@+ (0x2EC5)
+        "clr.l (%sp)+ ; move.l %sp,%d3 ; " +        // clrl %sp@+      (0x429F)
+        "move.w %sp,%d0 ; " +
+        "moveq #7,%d4 ; .stop: bra .stop",
+        nInstr = 14, cacr = 0x00008000L, dcfg = dc, maxCycles = 40000)
+    }
+    test(s"lock-step p127: the ROM stack-clear loop MUST EXIT, D-cache OFF + D-side $dtag", VerilatorTest) {
+      runLockStep(s"p127-stackclear-exit-$dtag",
+        "move.l #0x0000FFF0,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+        ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; bne .lp ; " +
+        "moveq #7,%d3 ; " +
+        ".stop: bra .stop", nInstr = 22, pcOnly = true, cacr = 0x00008000L,
+        dcfg = dc, maxCycles = 60000)
+    }
+  }
+  // The dependency chain the wedge actually runs, with the deferral window held OPEN:
+  // a `MOVE.L Dn,(A7)+` (crackStore -- folds its own A7 write, IS its macro's kept
+  // commit) feeding a `CLR.L (A7)+` (crackClr -- the A7 write rides a TRAILING store
+  // micro-op whose macro's kept commit is the op micro-op). Part 126 proposed that
+  // asymmetry as the discriminator; these run BOTH producer flavours back to back so a
+  // divergence localises which one is at fault. Every intermediate A7 is witnessed
+  // through an ordinary data register, so a wrong base cannot hide inside a fold.
+  for ((dtag, dc) <- Seq(("zero",   m68k040.sim.L2Sweeps.zeroLatency),
+                         ("dram20", m68k040.sim.L2Sweeps.l2DramFast),
+                         ("stslow", m68k040.sim.L2Sweeps.storeSlow),
+                         ("stvslow", m68k040.sim.L2Sweeps.storeVerySlow))) {
+    // POSITIVE CONTROL for this whole Part. Every p127 case is a NEGATIVE result, and a
+    // negative is worthless unless the axis it varies demonstrably moved. This case
+    // measures the LONGEST single precise-drain window the run actually observed
+    // (`StoreQueue.preciseDrainBusy`, asserted from drain launch to one cycle past its
+    // resolution) and requires it to be WIDE. With the old hard-wired zero-latency D
+    // attach that window is 2-3 cycles; a vacuous `dcfg` (silently ignored, wrong attach,
+    // config overwritten) would leave it there and this assert would fire.
+    test(s"lock-step p127 CONTROL: the D-side $dtag latency really widens the precise-drain window", VerilatorTest) {
+      var maxBusy = 0
+      var curBusy = 0
+      runLockStep(s"p127-drainwindow-control-$dtag",
+        "move.l #0x00004000,%a5 ; move.l %a5,%sp ; moveq #-1,%d5 ; " +
+        "move.l %d5,(%sp)+ ; move.l %sp,%d1 ; " +
+        "clr.l (%sp)+ ; move.l %sp,%d2 ; " +
+        "moveq #7,%d7 ; .stop: bra .stop",
+        nInstr = 8, cacr = 0x00008000L, dcfg = dc, maxCycles = 40000,
+        perCycle = dut => {
+          if (dut.lsEu.preciseDrainBusySig.toBoolean) {
+            curBusy += 1; if (curBusy > maxBusy) maxBusy = curBusy
+          } else curBusy = 0
+        },
+        afterRun = (_, _) => {
+          // Both bounds are asserted. The FLOOR catches "the latency silently did not
+          // take effect" (which would make every p127 negative vacuous); the CEILING on
+          // the `zero` row is what makes the contrast a MEASUREMENT rather than a claim
+          // -- it pins the pre-Part-127 baseline in the same suite, so the four rows
+          // together read as 2 -> 14 -> 71 -> 128 cycles of deferral window.
+          val (lo, hi) = dtag match {
+            // MEASURED, not assumed: the pre-Part-127 zero-latency baseline is 9
+            // cycles (the SQ launch/ack handshake plus the replay stage), so the
+            // ceiling is set just above it. This row exists to pin that baseline in
+            // the same suite as the widened ones -- 9 / 14 / 71 / 128.
+            case "zero"   => (1, 12)
+            case "dram20" => (12, 40)
+            case "stslow" => (55, 100)
+            case _        => (110, 200)
+          }
+          assert(maxBusy >= lo && maxBusy <= hi,
+            s"p127 CONTROL($dtag): widest precise-drain window was $maxBusy cycles, " +
+            s"expected [$lo, $hi]. If BELOW the floor, the dcfg D-side latency did NOT " +
+            s"take effect and every p127 negative result in this Part is vacuous.")
+          info(s"p127 CONTROL($dtag): widest precise-drain window = $maxBusy cycles")
+        })
+    }
+    test(s"lock-step p127: precise (A7)+ store -> dependent (A7)+ store chain, D-side $dtag", VerilatorTest) {
+      runLockStep(s"p127-a7-chain-$dtag",
+        "move.l #0x00004000,%a5 ; move.l %a5,%sp ; moveq #-1,%d5 ; " +
+        "move.l %d5,(%sp)+ ; move.l %sp,%d1 ; " +   // crackStore producer
+        "clr.l (%sp)+ ; move.l %sp,%d2 ; " +        // crackClr consumer + producer
+        "clr.l (%sp)+ ; move.l %sp,%d3 ; " +        // crackClr consumer of a crackClr
+        "move.l %d5,(%sp)+ ; move.l %sp,%d4 ; " +   // crackStore consumer of a crackClr
+        "clr.l (%sp)+ ; move.l %sp,%d6 ; " +
+        "moveq #7,%d7 ; .stop: bra .stop",
+        nInstr = 16, cacr = 0x00008000L, dcfg = dc, maxCycles = 40000)
+    }
+    // PHASE SWEEP. The board's wedge is not reproduced by any hand-written program at
+    // one alignment, and the surviving hypothesis is a scheduling race, so vary the one
+    // input that shifts the pipeline's phase relative to the drain: how many filler
+    // instructions precede the chain. `nop` is used because it retires without touching
+    // any renamed resource, so only the TIMING moves, not the register state.
+    for (phase <- 0 until 6) {
+      test(s"lock-step p127: (A7)+ store chain, D-side $dtag, phase=$phase", VerilatorTest) {
+        val fill = Seq.fill(phase)("nop").mkString(" ; ") + (if (phase > 0) " ; " else "")
+        runLockStep(s"p127-a7-chain-$dtag-p$phase",
+          "move.l #0x00004000,%a5 ; move.l %a5,%sp ; moveq #-1,%d5 ; " + fill +
+          "move.l %d5,(%sp)+ ; move.l %sp,%d1 ; " +
+          "clr.l (%sp)+ ; move.l %sp,%d2 ; " +
+          "clr.l (%sp)+ ; move.l %sp,%d3 ; " +
+          "move.l %d5,(%sp)+ ; move.l %sp,%d4 ; " +
+          "clr.l (%sp)+ ; move.l %sp,%d6 ; " +
+          "moveq #7,%d7 ; .stop: bra .stop",
+          nInstr = 16 + phase, cacr = 0x00008000L, dcfg = dc, maxCycles = 40000)
+      }
+    }
+  }
+  test("lock-step p127: a long INHIBITED store burst with a slow D side", VerilatorTest) {
+    runLockStep("p127-store-burst-dram60",
+      "move.l #0x00003FC0,%a0 ; move.l %a0,%sp ; moveq #0,%d0 ; " +
+      ".lp: clr.l (%sp)+ ; move.w %sp,%d0 ; cmp.w #0x4000,%d0 ; bne .lp ; " +
+      "moveq #7,%d3 ; " +
+      ".stop: bra .stop", nInstr = 68, pcOnly = true, cacr = 0x00008000L,
+      dcfg = m68k040.sim.L2Sweeps.l2DramSlow, maxCycles = 60000)
   }
   test("lock-step fullext: CMPI.L #imm,(bd.L,An) IS=1 -- the ROM 0x0CB0/0x8170 shape", VerilatorTest) {
     // a0=0x3000, bd=0x10000 (forces BD-SIZE=long), index suppressed -> EA = 0x13000.

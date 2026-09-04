@@ -328,6 +328,12 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     sqFaultCompletionPort.valid := False
     sqFaultCompletionPort.payload.assignDontCare()
     preciseDrainBusySig    := sq.io.preciseDrainBusy
+    // Sim-only tap (Part 127): the width of a precise store's drain window is the
+    // POSITIVE CONTROL for every D-side-latency lock-step result -- a `dcfg` that
+    // silently failed to take effect would leave this at the ~2-cycle zero-latency
+    // value and make those results vacuous. Zero synth impact, same convention as
+    // `sqCompletionPort.simPublic()` immediately below.
+    preciseDrainBusySig.simPublic()
     // Sim-only tap: the lock-step/fuzz/IPC-bench harnesses read sqCompletionPort
     // directly (to synthesize a placeholder Wb record for a precise store's
     // completion, since no lsEu.logic.wbObs pulse accompanies it) -- needs
@@ -1740,6 +1746,13 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // wbObs replay they must stay synchronized with (see the port-driving
     // comment above the `sqCompletionPort.valid := False` default).
     val pendFaultPayload = Vec.fill(pendDepth)(Reg(LsFault()))
+    // Part 127: this entry's SQ partner was ORPHANED by a flush (its ROB entry was
+    // destroyed while its physical write was already in flight -- see StoreQueue's
+    // `orphans`). Its slot must still be CONSUMED, so the two rings stay in lock step,
+    // but nothing may be driven from it: no ROB completion (the robId now belongs to a
+    // different instruction), no PRF/NZVC write-back (the rename it names was rolled
+    // back), no wakeup.
+    val pendOrphan = Vec.fill(pendDepth)(RegInit(False))
     val pendPtrW  = log2Up(pendDepth)
     val pendPush  = Reg(UInt(pendPtrW bits)) init 0   // next free slot to WRITE (alloc time)
     val pendReady = Reg(UInt(pendPtrW bits)) init 0   // SQ has confirmed the drain up to here
@@ -1804,6 +1817,7 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       when(!sqFlushSig) {
         pendMem(pendPush) := e
         pendFault(pendPush) := False   // fresh slot: clear any stale fault flag from a prior occupant
+        pendOrphan(pendPush) := False  // ditto for the orphan mark (Part 127)
         pendPush := pendPush + 1
       }
     }
@@ -2611,6 +2625,10 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
       // however much later that lands -- see `sqCompletionPort`'s port-driving
       // comment above the SQ instance for why it can no longer be a raw passthrough.
       pendFaultPayload(pendReady) := sq.io.sqFaultCompletion.payload
+      // Part 127: carry the SQ's own orphan verdict for THIS pop into the slot, exactly
+      // like `pendFault` above (the `sqCompletionOrphan` qualifier is only valid on the
+      // `sqCompletion` cycle). The apply stage below discards an orphaned entry.
+      pendOrphan(pendReady) := sq.io.sqCompletionOrphan
       pendReady := pendReady + 1
     }
     // Flush discards any NOT-YET-confirmed entries (mirrors StoreQueue's own
@@ -2628,8 +2646,35 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // flush-races-a-completion never regresses `pendPush` below the true
     // (post-this-cycle) ready count.
     val pendReadyAfterThisCycle = pendReady + (sq.io.sqCompletion.valid ? U(1, pendPtrW bits) | U(0, pendPtrW bits))
+    // Part 127 (defect SS8(a) of Part 126): this rollback was written as "discard every
+    // entry the SQ has not yet confirmed", mirroring StoreQueue's own
+    // squash-uncommitted-on-flush rule -- but StoreQueue's rule has an EXCEPTION that
+    // was never mirrored here. `StoreQueue.headDrainInFlight` deliberately KEEPS an
+    // uncommitted precise head whose drain half DcachePlugin has already accepted (the
+    // Part 37 fix: its physical write already left the CPU, so the ring must be allowed
+    // to unwind rather than be abandoned mid-sequence). That kept entry's `pendMem`
+    // slot sits AT `pendReady`, so collapsing `pendPush` onto `pendReady` discards it
+    // -- and the next precise alloc then overwrites the still-in-flight record. When
+    // the old drain finally acks, `pendReady` advances over an entry that is no longer
+    // the one that completed, and the two rings are off by one FOREVER: exactly the
+    // "ROB head parks on it permanently (HANG)" failure `deferCompletion`'s own comment
+    // describes, plus An/A7/NZVC write-backs applied with the wrong data.
+    //
+    // `RobPlugin.scala`'s `!preciseDrainBusyIn` retire gate closes most of this window,
+    // but `preciseDrainBusyReg` is REGISTERED one cycle after `preciseLaunch`
+    // (`StoreQueue.scala`), so a flush landing on the launch cycle itself still slips
+    // through -- and `doFlushReg` fires from `debugRecoverEnter`/`debugPcApply`, which
+    // are NOT retire-gated. That made halting this machine over JTAG during a precise
+    // drain a guaranteed hang.
+    //
+    // Fix: take the keep decision from the component that makes it, rather than
+    // re-deriving it. `io.flushKeptPrecise` is high on exactly the flush cycles where
+    // StoreQueue kept an uncommitted precise head, and at most ONE such entry can ever
+    // exist (a precise drain's `noAccepted`/`sendAtHead` gates make it the sole
+    // occupant of the drain pipe), so the correction is exactly +1.
     when(sqFlushSig) {
-      pendPush := pendReadyAfterThisCycle
+      pendPush := pendReadyAfterThisCycle +
+                  (sq.io.flushKeptPrecise ? U(1, pendPtrW bits) | U(0, pendPtrW bits))
     }
     // Replay the oldest ready-but-not-yet-applied entry's effects into the SHARED
     // comp*/completion stage. The arbitration above makes younger P2/P3/P4
@@ -2663,11 +2708,21 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
     // cache-response collision): apply from the REGISTERED
     // `pendFault`/`pendFaultPayload`, exactly as before.
     val applyFault   = Mux(applyFast, sq.io.sqFaultCompletion.valid, pendFault(pendApply))
+    // Part 127 (defect SS8(b) of Part 126): an ORPHANED entry -- one a flush kept
+    // mid-drain, whose ROB entry that same flush destroyed -- must be CONSUMED (so the
+    // pendMem and SQ rings stay in lock step) but must drive NOTHING. Its robId now
+    // belongs to whatever instruction the ROB allocated next, so `sqCompletionPort`
+    // would mark that instruction complete and retire it without executing; its `pdst`
+    // names a rename the flush already rolled back, so `intW`/`nzvcW`/`wakeupPort`
+    // would write a physical register that the freelist may have re-handed out.
+    val applyOrphan  = Mux(applyFast, sq.io.sqCompletionOrphan, pendOrphan(pendApply))
     when((applyFast || applyBacklog) && !liveCompletionFires) {
       val e = pendMem(pendApply)
-      sqCompletionPort.valid   := True
-      sqCompletionPort.payload := e.robId
-      when(!applyFault) {
+      when(!applyOrphan) {
+        sqCompletionPort.valid   := True
+        sqCompletionPort.payload := e.robId
+      }
+      when(!applyFault && !applyOrphan) {
         compValid      := True
         compRobId      := e.robId
         compData       := e.data
@@ -2688,10 +2743,15 @@ class LsEuPlugin extends FiberPlugin with LsEuService {
         compX          := False
         compXWrite     := False
         compIsFault    := False
-      } otherwise {
+      } elsewhen(!applyOrphan) {
+        // Fault branch. Also suppressed for an orphan: `sqFaultCompletionPort` targets
+        // the SAME dead robId as `sqCompletionPort`, so delivering it would raise a
+        // bus-error exception against an unrelated instruction.
         sqFaultCompletionPort.valid   := True
         sqFaultCompletionPort.payload := Mux(applyFast, sq.io.sqFaultCompletion.payload, pendFaultPayload(pendApply))
       }
+      // The slot is consumed either way -- that is the whole point: an orphan must not
+      // be left in the ring, or `pendApply` never catches `pendReady` again.
       pendApply := pendApply + 1
     }
 
