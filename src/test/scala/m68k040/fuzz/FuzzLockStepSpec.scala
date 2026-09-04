@@ -572,11 +572,22 @@ object FuzzRunner {
                                              inSandbox, _ => 0xff)
             if (sys.env.contains("LOCKSTEP_STRUCTURAL_STATS"))
               println(s"[mem] dutWrites=${mr.dutWrites} oracleWrites=${mr.oracleWrites} " +
-                      s"silentRewrites=${mr.silentRewrites}")
+                      s"silentRewrites=${mr.silentRewrites} reordered=${mr.reordered}" +
+                      (if (mr.silentSample.isEmpty) ""
+                       else mr.silentSample.map(w => f" 0x${w.addr}%x=${w.value}%02x").mkString(" silentAt:", "", "")))
+            // LOCKSTEP_MEM_STRICT=1 promotes value-preserving extra DUT writes from a
+            // reported statistic to a hard divergence. Off by default (the CAS/CAS2
+            // always-store simplification is documented and deliberate); on, it lets the
+            // fuzz minimizer shrink a program down to whichever instruction produced one.
+            if (sys.env.get("LOCKSTEP_MEM_STRICT").contains("1") && mr.silentRewrites > 0)
+              outcome = Diverged("MEMSILENT",
+                s"${mr.silentRewrites} value-preserving DUT writes with no reference write",
+                mr.silentSample.map(w => f"mem[0x${w.addr}%08x]=0x${w.value}%02x cycle=${w.cycle}").mkString("\n  "))
             mr.error.foreach { m =>
               outcome = Diverged("MEMORDER", m,
                 s"dut in-scope byte writes=${mr.dutWrites} oracle=${mr.oracleWrites} " +
-                s"silent (value-preserving) DUT rewrites=${mr.silentRewrites}")
+                s"silent (value-preserving) DUT rewrites=${mr.silentRewrites} " +
+                s"out-of-order matches=${mr.reordered}")
             }
           }
         }
