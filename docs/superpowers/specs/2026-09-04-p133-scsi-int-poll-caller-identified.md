@@ -20,7 +20,7 @@ FREE at session start; it was never taken.
 (**TRANSFER INFORMATION**) to the 53C96 Command register at `0x50F0F030` and is waiting for the
 completion interrupt so it can read **one byte** out of the FIFO at `0x50F0F020`.
 
-Three further results, each independently checkable:
+Four further results, each independently checkable:
 
 2. **There are 18 call sites to `0x40899704`, not 15.** The prior session's scan looked only for
    `bsr.w` and missed three `jsr %pc@(...)` sites — `0x40899224`, `0x40899246`, `0x40899276`. **The
@@ -31,7 +31,13 @@ Three further results, each independently checkable:
    `Ticks`-bounded, and its deadline had already passed by **~32,405 ticks (~9 minutes)** at the
    moment of capture. It can never fire, because the inner poll at `0x40899704` never returns.
 
-4. **A methodology trap that nearly produced a completely wrong answer (§6).** `CACR = 0x80008000`
+4. **The cacheable-MMIO hypothesis — that the 53C96 page is cacheable, freezing a cached
+   `INT=0` in the D-cache forever — is REFUTED (§9.2).** The ROM marks the page `CM=10`
+   (noncacheable, serialized), decoded straight from the raw descriptor `0x50F0E059` against the
+   manual; the core decodes `CM=10` as INHIBITED; and no TTR is enabled. Together with §9.1 this
+   **eliminates every CPU-side "malformed write / stale read" explanation.**
+
+5. **A methodology trap that nearly produced a completely wrong answer (§6).** `CACR = 0x80008000`
    (both caches on) and Mac RAM is copyback. A plain `dump-mem` of the stack returned **stale DDR**
    and decoded to garbage — no valid return address anywhere in a 560-byte window. After a D-cache
    push the *same addresses* returned a clean, fully-validated three-frame chain. `coherent-dump`
@@ -354,16 +360,67 @@ direction.
 captured architectural state (the chip reached DATA IN phase, which is unreachable if byte writes
 to this base are broken), and once by the RTL itself.
 
-**The one configuration-dependent failure mode that survives, and the cheapest next check.**
-The byte-granular path is taken **only when `cacheMode === INHIBITED`**
-(`LsEuPlugin.scala:2448-2449`). If the page covering `0x50F0F030` were ever seen as *cacheable*
-with the D-cache on, `stSubActive` would be 0 and the store would go out as a **line-base
-`AWSIZE=4`** write — the original D4 failure mode, arriving via MMU configuration rather than an
-RTL gap. This session did **not** rule that out: the MMU is on (`TC=0x0000C000`, 8K pages,
-`SRP=0x03FEEA00`), and the captured `MMUSR=0x00012001` describes some *other*, RAM address
-(`PA=0x00012000`, R=1) — it says nothing about the SCSI aperture. **Walking the ROM's page tables
-from `SRP=0x03FEEA00` for logical `0x50F0F030` and reading its CM bits is a pure, safe DDR read
-that takes minutes and would close this question outright.** Do it before any ILA work.
+### 9.2 The page-table walk: **the cacheable-MMIO hypothesis is REFUTED**
+
+Run on a fresh boot caught at `0x40899704` (`break-pc` armed, one reset), with a `dcache-op push`
+first — the page tables are CPU-written, so this walk would itself have read stale DDR without it.
+
+**Transparent translation: none.** `ITT0 = ITT1 = DTT0 = DTT1 = 0x00000000` on this boot (and on the
+original capture). The manual (§3.1.3, "E—Enable: 0 = Transparent translation disabled") makes an
+all-zero TTR unambiguously disabled. **No TTR covers `0x50F0Fxxx`**, so translation is entirely by
+table walk.
+
+**The walk**, from `SRP = 0x03FEEA00`, `TC = 0x0000C000` (E=1, P=1 → 8K pages). For
+`LA = 0x50F0F030`: root index `LA[31:25]` = 40, pointer index `LA[24:18]` = 60, page index
+`LA[17:13]` = 7, offset `LA[12:0]` = `0x1030`.
+
+| level | address | raw descriptor | decode |
+|---|---|---|---|
+| root | `0x03FEEAA0` | **`0x03FEE80A`** | UDT=`10` resident; pointer table @ `0x03FEE800` |
+| pointer | `0x03FEE8F0` | **`0x03FEAB0A`** | UDT=`10` resident; page table @ `0x03FEAB00` |
+| **page** | **`0x03FEAB1C`** | **`0x50F0E059`** | see below |
+
+**Independent decode of `0x50F0E059` against the MC68040 UM (Figure 3-12 + §3.2.2.3), not via our
+RTL:**
+
+```
+PA[31:13] = 0x50F0E000   identity mapped, correct
+bit12 UR=0  bit11 G=0  bit10 U1=0  bit9 U0=0  bit8 S=0
+bits[6:5] CM = 0b10  -> "10 = Noncachable, Serialized"
+bit4 M=1  bit3 U=1  bit2 W=0
+bits[1:0] PDT = 0b01 -> Resident
+```
+
+**`CM = 10` = NONCACHEABLE, SERIALIZED. The ROM marks the 53C96 page cache-inhibited, correctly.**
+All 32 entries of the table are `...059`, i.e. the whole `0x50F00000–0x50F3FFFF` aperture is
+inhibited. (Self-check on the walk arithmetic: the table ends exactly after 32 entries — `0x03FEAB80`
+onward is uninitialised `0xDB6DB6DB` DRAM — which is precisely the 128-byte page table an 8K-page
+configuration requires.)
+
+**And cpu040 decodes it correctly.** `TableWalker.scala:209` does
+`rCmode := CacheMode.decode(MmuDesc.pgCacheMode(d))`, `MmuTypes.scala:73` takes `d(6 downto 5)`,
+and `IcacheTypes.scala:76-86` maps `when(cm2(1)) { m := INHIBITED }` — bit 6 is set for `CM=10`, so
+it lands on **INHIBITED**. The enum deliberately collapses `10` and `11` to one `INHIBITED` value,
+with the reasoning and the manual citation recorded in the source comment (`:70-75`). This was the
+one plausible mis-decode — an `INHIBITED` test that matched only `CM=11` and missed the
+`CM=10` the ROM actually uses — and it is **not** what the code does.
+
+**So neither branch of the question holds:** the ROM did not fail to mark the page, and we do not
+mis-decode it. The page is inhibited, the byte-granular MMIO path *is* selected, the Status
+register is *not* cached, and the "frozen cached `INT=0` forever" mechanism does not occur.
+
+**A second, behavioural refutation of the same hypothesis, independent of the tables.** The helper
+is called many times per boot and **succeeds** — proven directly by the §5 control sample
+(`0x408993B8`, which completed and let the CPU run on) and by the boot reaching the Happy Mac at
+all. Every one of those successes requires observing `INT` transition 0→1 at `0x50F0F040`. A frozen
+cached line would have wedged the **first** call, not the late one. The poll demonstrably works
+until it doesn't.
+
+**The last configuration-dependent failure mode — now CLOSED by §9.2.** The byte-granular path is
+taken only when `cacheMode === INHIBITED` (`LsEuPlugin.scala:2448-2449`, which additionally fails
+*safe*, defaulting to INHIBITED). §9.2 establishes that the page is marked `CM=10` by the ROM and
+decoded as INHIBITED by the core, so `stSubActive` is 1 and the store goes out as `AWSIZE=0`. There
+is no surviving path by which a byte write to `0x50F0F030` is emitted wrong.
 
 Two caveats recorded by the audit, neither of which breaks this write:
 `SocketByteOrder.scala:41` claims `tools/socket/check_socket_netlist.py` machine-checks the
@@ -379,10 +436,12 @@ to byte order or sizing, but it means the port freeze is no longer green.
 
 ## 10. Recommended next steps
 
-0. **Walk the page tables for `0x50F0F030` and read its cache mode** (§9.1). `SRP = 0x03FEEA00`,
-   `TC = 0xC000` (8K pages). Pure DDR reads, no peripheral access, minutes of work, and it closes
-   the *only* surviving configuration-dependent path by which a byte write to the 53C96 could be
-   emitted wrong. Cheapest decisive check available — do this first.
+0. ~~Walk the page tables for `0x50F0F030`.~~ **DONE — see §9.2. Result: `CM=10` (noncacheable,
+   serialized), correctly set by the ROM and correctly decoded by the core. Hypothesis refuted.**
+   With this closed, **every CPU-side "the write is malformed / the read is stale" explanation has
+   now been eliminated**, from three directions: captured chip state, the socket RTL, and the MMU
+   page attributes. The remaining explanations all live in *timing/sequencing or the device model* —
+   which is exactly what step 1 measures.
 1. **Capture the MMIO transaction stream to `0x50F0F0xx` in the run-up to the hang** — offsets,
    sizes, values, in order. That is the evidence that decides §9, and it is the coordinator's
    step 2. The Happy-Mac hang is reproducible (~50% of boots, and the board sits in it
@@ -407,7 +466,8 @@ to byte order or sizing, but it means the port freeze is no longer green.
 * **No vector arming of any kind** — no vector 2, 3, 4 or 11. `halt-exc-mask` was left all-zero
   and untouched throughout.
 * **`reset-and-break-pc` was not used.** `vio-hard-reset` was not used. `load-bit` was not used.
-* **Only one reset was issued** (for §5's control). The primary result needed none.
+* **Two resets total** — one for §5's control, one to re-establish a halt for the §9.2 page-table
+  walk. The primary result (§3) needed none.
 * **No simulation, no MAME/Musashi cross-check, no lock-step run, no JVM/sbt work** (three sibling
   agents were running simulation work and host memory was at its ceiling).
 * **The MMIO transaction stream was NOT captured** — no ILA, no bus trace. §9's conclusions are
