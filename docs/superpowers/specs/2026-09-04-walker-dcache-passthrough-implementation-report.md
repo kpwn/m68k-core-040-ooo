@@ -494,6 +494,46 @@ realistic regime, is about 1 % of a walk.** The revalidation's §6.3 plan —
 measurement that would show an actual win, and is now much cheaper to run given the
 harness fix.
 
+### 5.6 A failure class worth naming: the false-premise kernel
+
+The §5.5 investigation is one instance of a class that bit **two separate measurements on
+this project today** — the second reported by a sibling session, which I have not
+independently verified; what follows is verified for the walk case only.
+
+`AxiMemModel`'s default `SparseMemory()` **PRNG-fills a fresh page on first touch**. It does
+not return zero. So any kernel whose correctness premise is "memory I never wrote reads as
+0" is silently running a different program than the one it describes.
+
+The dangerous property is not that it fails. It is **how** it fails:
+
+> **A false-premise kernel does not crash. It yields a tight, confident number from a run
+> that never happened.**
+
+In §5.5's case the walk kernel retired 66 of 174 macro-instructions and the harness still
+produced `567.25` and `556.43` for two of five seeds — figures with a plausible magnitude
+and a plausible spread, from runs that derailed at step 21. Only the *other three* seeds
+returning exactly `0.00` made it visibly wrong, and only because the short and long kernels
+share a prefix and therefore derailed identically. Had the PRNG happened to keep every seed
+inside the mapped region for a while longer, the suite would have reported a clean
+`mean ± sigma` for a measurement of nothing, and the sibling's own instinct — that this
+looked like a walker wedge or fault path — would have had no counter-evidence at all.
+
+Three defences, in order of value:
+
+1. **Assert the premise inside the kernel, not in prose.** The harness already had the
+   right check (`only N/M macro-instructions retired`); it was the *suite* that swallowed it
+   in a `try/catch` that printed "NOT MEASURED" for the whole group. A per-kernel
+   completion assertion that cannot be caught at group level would have caught this on the
+   first run.
+2. **Report the retired count next to every differential.** Two numbers — `176/174` versus
+   `66/174` — separate a real measurement from a derailed one at a glance, and cost nothing.
+3. **Never let an untouched `SparseMemory` be load-bearing.** If a kernel depends on a
+   value, write it. `prepMem` wrote the page tables and stopped there, and the gap between
+   "what the kernel needs" and "what `prepMem` writes" is exactly where this hid.
+
+The walk-cost numbers in §5.5 were taken **after** the premise was made true, on both arms
+with the same harness, so they are unaffected.
+
 ### Not run, and named as such
 
 - **A full baseline `ExecuteLockStepSpec` run.** Only the single test that regressed was
