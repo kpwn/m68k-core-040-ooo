@@ -333,22 +333,27 @@ pass is therefore a real negative, not a suppressed frontend.
 
 ### 4.2 Revert control — the fix proven by removing it
 
-`SpeculativeFetchGate`'s last line replaced with `ic.logic.nonSpecFetch := True` (every
-other line, every net name and every SpinalHDL line number identical; the gate
-constant-folds away):
+Worktree `wt-ictrl`, branch `measure/ispec-netname-control` (`ba30f8a`), rebased onto the
+final fix commit. `SpeculativeFetchGate`'s last line becomes `ic.logic.nonSpecFetch := True`
+and nothing else changes, so `inhibitedSpecBlock` is constant-false and the added
+`cmdPort.ready` term constant-folds away. Run on the SAME build as the numbers above:
 
 ```
-[spec-mmio-rule] total I-side ARs=3, ARs into the INHIBITED window=2, addrs=0x50000000
-*** FAILED *** SPECULATIVE DEVICE READ: 2 wrong-path AXI burst read(s) …
+[spec-mmio-ctl-neg] total I-side ARs=7, ARs in 0x50000000..0x50FFFFFF=0        PASS
+[spec-mmio-ctl-pos] total I-side ARs=6, ARs in window=5, first=0x50000000, 40, 80, c0, 100   PASS
+[spec-mmio-rule]    total I-side ARs=3, ARs into the INHIBITED window=2, addrs=0x50000000
+  *** FAILED *** SPECULATIVE DEVICE READ: 2 wrong-path 64-byte AXI burst read(s) …
+[spec-mmio-dside]   total D-side ARs=0, ARs into the INHIBITED window=0        PASS
 ```
 
-Both controls stayed correct in the same run (ctl-neg 0 window ARs, ctl-pos 5). Restored
-afterwards; `git status` clean.
+The defect returns on exactly the one test, with both controls still correct in the same
+run — so the RULE test's pass on the fix tree is a real negative, not a suppressed frontend.
+The failure message's "64-byte" is now literally accurate, the burst having deliberately
+been left alone (§2.5).
 
-(The control is exact: `nonSpecFetch := True` makes `inhibitedSpecBlock` constant-false, so
-the added `cmdPort.ready` term folds away and the netlist is the pre-fix one in behaviour.
-Every other line, net name and SpinalHDL line number is identical, which is also what makes
-it usable as the net-renaming control for the synth gate.)
+Because the two arms differ only in that one expression, this same worktree doubles as the
+net-renaming control for the synth gate: FIX-vs-CTRL is the real cost of the added
+`cmdPort.ready` term, CTRL-vs-BASE is SpinalHDL line-number churn.
 
 ### 4.3 Suites
 
