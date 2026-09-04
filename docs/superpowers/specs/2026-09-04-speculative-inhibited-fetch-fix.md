@@ -431,7 +431,84 @@ real cost of the added term.**
 
 ---
 
-## 5. Not claimed
+## 5. Finding (NOT part of this change): speculative bus errors are already deferred to commit
+
+Asked separately: does a speculative fetch that receives an AXI error response raise an
+exception before that fetch is architecturally committed? **No. This invariant already
+holds, and it holds by exactly the mechanism the project owner described as the intended
+design.** Reported as a clean negative; nothing here was changed.
+
+### 5.1 The mechanism that already exists
+
+The path is I-cache -> µop cracker -> ROB, and the exception is created as a **µop**, not as
+a fetch-path side effect:
+
+1. **The I-cache turns a bus error into fetch DATA, not an exception.** `FetchRsp` carries
+   `fault` plus `atc` (`IcacheTypes.scala:99-104`), and task #211 made `atc` distinguish the
+   two causes explicitly: `True` = ITLB/MMU translation fault, **`False` = a physical AXI
+   bus error (SLVERR/DECERR) on a refill**. So "this fetch failed" is already a data bit
+   travelling with the fetch, which is the crux of the proposed design.
+2. **The cracker emits an exception-throwing µop instead of decoded instructions.**
+   `MicroOpAssembler.scala:2768-2780`: `when(pkt.fault)` it emits **one** µop with
+   `faulted := True`, `faultVector := 2` (access fault, format-$7), `sswInstr := True`
+   (program-space SSW), and `faultAtc := pkt.faultAtc`. Its own comment states the intent:
+   "emit a single faulted op µop that DELIVERS the format-$7 access fault (vector 2) **at
+   retire**".
+3. **The exception materialises only at the ROB head.** `RobPlugin.scala:975`:
+   `faultRetire = headReady && (faultedStore(h0) || privViolation) && excIdle`, and every
+   fault field feeding the exception unit is read at `h0` (`:1935-1963`). A wrong-path
+   faulted µop is therefore squashed by the ordinary flush like any other wrong-path µop.
+
+So the fetch proceeds freely, the error is carried as data, and the exception enters the
+normal precise-exception machinery — no speculation term in the fetch path at all. There is
+nothing to build.
+
+### 5.2 `ringStale` suppresses ERROR delivery, not only data
+
+Asked specifically. `FetchAlignPlugin.scala:665`:
+
+```scala
+val rspFault = ic.rsp.valid && ic.rsp.payload.fault && !rspStaleHead && !faultHold
+```
+
+`rspStaleHead = ringStale(ringHead) || predictFire` (`:657`). The fault is gated on the same
+staleness term as the data, so a response for a fetch already known to be wrong-path
+delivers **neither** data nor fault. This is belt-and-braces on top of §5.1 — it drops the
+fault earlier, when the redirect has already resolved; §5.1 covers the case where it has not.
+
+### 5.3 Translation faults behave identically
+
+Same field, same µop, same retire gate: `pkt.fault` is raised for either cause and
+`pkt.faultAtc` only selects the SSW bit. A wrong-path fetch into an unmapped page produces a
+wrong-path faulted µop that is flushed. No separate path exists, so there is no separate gap.
+
+### 5.4 The three design questions, answered against what the code does today
+
+1. **Does the poison bit persist in the cached line?** There is no poison bit, because an
+   errored fill **never allocates**: `IcachePlugin.scala:1796` is
+   `when(refillErr) { goto(FAULT) }`, which bypasses INSTALL/PREDECODE entirely. So no stale
+   poison can outlive the condition and there is no `CINV`/`CPUSH` interaction to get wrong.
+   A later architectural fetch of the same address re-misses and re-raises naturally, which
+   is the desired behaviour, at the cost of re-issuing the failing transaction each time.
+2. **Allocate-with-poison, or don't allocate?** The design already chose "don't allocate",
+   and it is the simpler of the two: it needs no array bit, no maintenance-op semantics, and
+   no way for a poisoned line to be hit. Allocating with poison would only buy avoiding the
+   repeat bus transaction to an address that is failing anyway. **Recommend leaving it.**
+3. **Partially-poisoned line (error on one beat, not the other)?** Cannot arise as a
+   distinct case: `IcachePlugin.scala:2537` sets `mshrErr(rIdx)` on *any* errored beat and
+   `:2543` ORs it into `refillErr`, so one bad beat fails the whole fill and the FSM goes to
+   FAULT. The cracker never sees a partial line.
+
+### 5.5 One correction to the brief
+
+`EXC_UOP_INJECT` **does not exist in this repository** — `grep -rn EXC_UOP_INJECT` over
+`Makefile`, `build.sbt`, `synth/` and `src/` returns nothing. The injection machinery being
+looked for is not behind a define; it is the unconditional `when(pkt.fault)` arm in
+`MicroOpAssembler` described above.
+
+---
+
+## 6. Not claimed
 
 - **This does not fix the Mac boot.** The mechanism is proven to exist and to fire, and it
   is now prevented, but nobody has shown the frontend is actually steered into
