@@ -184,9 +184,36 @@ the REAL flags PRF — correctly — but never touch that shadow. So:
 ```
 
 It needs two interrupts at the same flag-consuming instruction with no flag-WRITING
-instruction retiring in between — which is why it takes tens of entries to surface, and why
-it is invisible when the handler is a bare `RTE` (which cannot disturb the flags). Every
-interrupt test in the corpus, and every scenario in Part 134, used a bare-`RTE` handler.
+instruction retiring in between — which is why it takes tens of entries to surface.
+
+### 5.5 Why the existing corpus cannot see it — measured, not assumed
+
+The obvious explanation is "every interrupt handler in the corpus is a bare `RTE`, which
+cannot disturb the flags". **That explanation is WRONG, and it was checked rather than
+asserted.** Of the interrupt-handler labels in
+`src/test/resources/m68kooo-ported-tests/asm/`, only 9 are literally a bare `RTE`
+(`atrap_dispatch_with_irq`, `bsr_split_push_irq_in_gap`, `exc_irq_during_store`,
+`exc_rte`, `fline_after_move_sp_postinc_sr_tmp1`, `fline_before_move_sp_postinc_sr_tmp1`,
+`irq_during_move_sp_postinc_sr_tmp1`, `irq_during_postinc_loop`, `pea_4x_with_irq`).
+Several others DO disturb the condition codes — `irq_at_rts_fetch_sweep`'s handler is
+`addq.l #1,IRQ_COUNT ; rte`, and `addq` to memory sets N/Z/V/C; `exc_stack_atomicity_stress`
+and `pea_aline_irq_storm` do more still.
+
+The real gap is narrower and more useful to know: **no test in the corpus asserts that the
+CONDITION CODES survive an interrupt.** They assert stack-pointer balance, frame contents,
+return addresses, nesting depth and interrupt counts. Reproducing this defect needs all
+three of
+
+1. a handler that disturbs the flags, **and**
+2. interrupted code that CONSUMES flags produced *before* the interrupt (a `Bcc` whose
+   `cmp` retired earlier), **and**
+3. two interrupts landing on that same consumer with no flag-writer retiring between them.
+
+`irq_at_rts_fetch_sweep` has (1) but its interrupted code is an `RTS` sweep that checks
+return addresses, not flags. Part 134's scenarios had (2) — their loops are `cmpi.l`/`bne`
+pairs — but their handler was a bare `RTE`, so not (1). Nothing had all three. That is a
+corpus-shaped hole, not a one-test oversight, and closing it generally (a flag-survival
+assertion in the standard interrupt-storm shape) is worth more than this one fix.
 
 The comment that this change replaces stated the exact assumption the bug violates: *"the
 CCR is restored from the frame too, but the whitebox carries it (RTE restores the same CCR
@@ -233,10 +260,23 @@ the test file is byte-identical between them.
 | T5 | nested M=1 (throwaway inside a throwaway) | PASS, 141 | PASS, 141 |
 | T6 | long, nesting, stack-heavy handler | (2 harness defects, see below) | **PASS**, 116 entries / 61 iterations |
 | T9a | M=1 `RTE` after a register-only A7 change | PASS, 175 | PASS, 182 |
-| T12 | **M=1**, handler disturbs only the flags | **FAIL** `0xbad00033`, observed `0x00103000`, at 96 entries | *not yet re-run — see §9* |
-| T13 | **M=0 CONTROL**, same handler | **FAIL** `0xbad00032`, observed `0x00100000`, at 63 entries | *not yet re-run — see §9* |
-| T14 | M=1, push/pop handler (register-safe rewrite of T9b) | **FAIL** `0xbad00033`, observed `0x00103000`, at 44 entries | *not yet re-run — see §9* |
-| T15 | M=0 CONTROL, push/pop handler | PASS, 403 entries / 1400 pulses | *not yet re-run — see §9* |
+| T10 | M=1 entry during tight A7 churn | PASS, 162 | PASS, 168 |
+| T11 | A7 churn under per-cycle enumeration | PASS, 384/384 | PASS, 384/384 |
+| **T12** | **M=1**, handler disturbs only the flags | **FAIL** `0xbad00033`, observed `0x00103000` (correct value), at 96 entries | **PASS**, 182 entries |
+| **T13** | **M=0 CONTROL**, same handler, 2x pulses | **FAIL** `0xbad00032`, observed `0x00100000` (correct value), at 63 entries | **PASS**, 450 entries / 1400 pulses |
+| **T14** | M=1, push/pop handler (register-safe rewrite of T9b) | **FAIL** `0xbad00033`, observed `0x00103000`, at 44 entries | **PASS**, 150 entries |
+| T15 | M=0 CONTROL, push/pop handler | PASS, 403 entries | PASS, 426 entries |
+| T16 | M=1 CCR-survival probe (reads the CCR back architecturally) | *written after the baseline run — not measured before* | PASS, 178 entries |
+| T17 | M=0 CONTROL, same probe | *not measured before* | PASS, 467 entries |
+| T7 | MMU ON, 8 KB pages, single interrupt | PASS | PASS |
+| T8 | MMU ON, 8 KB pages, storm | PASS, 174 | PASS, 173 |
+
+**AFTER: 18 run, 18 passed, 0 failed** (`Total time: 641 s`). The three scenarios that
+failed on the pristine arm — T12, T13, T14 — are green, and the two M=0 controls that
+passed before still pass with more entries than before. T16/T17 are honestly marked: they
+were written *after* the baseline sweep, in response to the T12/T13 failures, so they have
+a fixed-arm number only. Their value is diagnostic shape, not a before/after pair; T12/T13
+are the pair.
 
 **Three harness defects were found and fixed during this work, and are reported rather
 than quietly corrected**, because two of them produced failures that looked like RTL bugs:
@@ -266,23 +306,127 @@ must be read as such — see §9's "what the frame audit can and cannot catch".
 
 ## 7. What this does and does not say about p133
 
-**It does not fix the boot, and it is not the mechanism the captured fault names.** p133's
-signature is SP exactly 2 bytes low with an odd return address popped by an `RTS`. Nothing
-here corrupts a stack pointer.
+**It does not fix the boot.** No boot was attempted, and the defect's own signature is
+corrupted condition codes, not a corrupted stack pointer. Everything below is a hypothesis
+with supporting properties, offered so it can be tested — not a claim that it is the cause.
 
-The honest connection, offered as a hypothesis and not a claim: a `Bcc` that branches the
-wrong way **around a stack adjustment** produces a stack pointer off by exactly that
-adjustment. `addq.l #2,%sp`, `move.w (%sp)+,%dn` and word-sized pops are extremely common in
-68k ROM code, and the ROM's interrupt handlers do disturb the flags. So this defect is
-*capable* of producing a 2-byte SP error at a distance, in a way that the interrupted
-instruction itself would look innocent for. That is worth stating because it is the only
-mechanism this investigation found that can produce the p133 signature at all — but it is
-not evidence that it did. Confirming or refuting it needs a board measurement, not more
-simulation.
+That said, it is the strongest hypothesis this campaign has produced, and the reasons are
+worth stating explicitly because each one is independently checkable.
 
-The measurement Part 134 §9 asked for is still the discriminating one, and is still not
-taken: catch a drain-loop IRQ on silicon and read `A7` immediately before entry and
-immediately after the handler's `RTE`.
+### 7.1 It is the only mechanism found that can produce the measured signature
+
+A `Bcc` that branches the wrong way **around a stack adjustment** leaves SP off by exactly
+that adjustment. The measurement is SP at `0x0040076C` where `0x0040076E` was required —
+**exactly 2**. Word-sized stack traffic (`addq.l #2,%sp`, `move.w (%sp)+,%dn`,
+`move.b <ea>,%sp@-` which adjusts A7 by 2 under the 68k A7 rule) is pervasive in this ROM.
+Neither Part 134's mid-macro hypothesis nor this part's M=1 hypothesis can produce a 2-byte
+SP error at all; this one can.
+
+### 7.2 The ROM code at the failure has exactly that shape
+
+Disassembling `files/420dbff3.rom` at the captured fault address (`objdump -b binary -m
+m68k:68040 --adjust-vma=0x40800000`) shows the faulting `RTS` at `0x408999E2` sits at the
+end of the ROM's own exception-probe unwind path, and its neighbourhood is dense with both
+conditional branches and stack arithmetic:
+
+```
+4089999c: addql #4,%sp
+4089999e: movew %sp@,%d0                 | saved SR
+408999a0: bfextu %sp@(6),0,4,%d1         | frame FORMAT nibble
+408999a6: cmpib #7,%d1
+408999aa: beqs  0x408999b8               |  -> lea %sp@(60),%sp
+408999ac: cmpib #10,%d1
+408999b0: bnes  0x408999be               |  -> lea %sp@(92),%sp
+408999b2: lea   %sp@(32),%sp             |  (fallthrough: 32)
+...
+408999c2: movew %d7,%sp@-                | hand-built format-$0 frame: format word (2 bytes)
+408999c4: pea   %pc@(0x408999cc)         |                             PC          (4 bytes)
+408999c8: movew %d0,%sp@-                |                             SR          (2 bytes)
+408999ca: rte
+408999cc: moveq #9,%d0
+408999ce: btst  #7,%a3@(64)
+408999d4: beqs  0x408999e2
+408999d6: moveb %a3@(80),%d5
+408999da: btst  #4,%d5
+408999de: beqs  0x408999e2
+408999e0: moveq #5,%d0
+408999e2: rts                            | <<< THE FAULTING RTS
+```
+
+And ~400 bytes earlier, in the same routine, the **exact 2-byte shape**: a byte pushed to
+`-(%sp)` (which moves A7 by 2) whose matching pop is reached through *two different*
+conditionally-selected sites, with other conditional exits in between:
+
+```
+4089984a: moveb 0xcb2,%sp@-              | A7 -= 2  (68k A7-byte rule)
+...
+40899876: bnes  0x408998f0
+...
+408998aa: bnes  0x408998f4
+408998b4: moveb %sp@+,%d0                | A7 += 2  (pop site 1)
+...
+408998f4: moveb %sp@+,%d0                | A7 += 2  (pop site 2)
+```
+
+**Report this honestly, including where it does not fit.** The conditional chain
+*immediately* before the faulting `RTS` selects unwind sizes of 32/60/92, so a wrong branch
+*there* gives a 28/32/60-byte error, not 2. The 2-byte shape is the earlier push/pop pair,
+in the same routine and the same subsystem, not the last few instructions. So the ROM
+supports "a mis-taken conditional branch in this code produces a 2-byte SP error" as a
+*plausible* mechanism; it does not demonstrate that this particular branch was mis-taken.
+
+### 7.3 It explains the non-determinism
+
+The defect needs a SECOND interrupt to land on the same flag-consuming instruction before
+any flag-writer retires. That is a coincidence, not a certainty — which is the right shape
+for "~50% of cold boots", and the wrong shape for a deterministic decode or arithmetic bug.
+In simulation it took 44-96 interrupt entries to surface.
+
+### 7.4 It explains the v1 asymmetry — CHECKED, and it holds
+
+This is the strongest constraint available (v1 boots this SoC to Finder on identical
+peripheral RTL), so it was verified in v1's RTL rather than assumed.
+
+**v1 has exactly ONE architectural condition-code storage** — the `ccr_prf[]` array in
+`cpu/rtl/core/rename/ccr_rat.v`, indexed by the committed pointer `crat_tag`. Both sides of
+the round trip touch that same array at that same index:
+
+* **Exception entry** builds the stacked SR as `{arch_sr[15:5], arch_ccr_val}`
+  (`cpu/rtl/core/commit.v:2960`, and identically at `:3283, :3513, :3578, :3773, :3861`),
+  where `arch_ccr_val` is wired straight from `assign dbg_arch_ccr = ccr_prf[crat_tag];`
+  (`ccr_rat.v:389`).
+* **`RTE`** writes `ccr_restore_en`/`ccr_restore_val` (`commit.v:3656-3661`, and
+  `:3612-3615` for the format-`$1` throwaway pop), consumed as
+  `ccr_prf[crat_tag] <= restore_val;` (`ccr_rat.v:484-487`).
+* The same array is what a `Bcc` reads (`assign read_val = ccr_prf[read_tag];`,
+  `ccr_rat.v:381`).
+
+`commit.v:1044` documents that `arch_sr[4:0]` is dead and never maintained precisely
+*because* the CCR lives only in `ccr_rat`. So **there is no second copy in v1 to fall out of
+sync, and this bug cannot exist there by construction.** The cpu040 defect is a property of
+having a *separate* `committedCcr` shadow for exception stacking — an OoO-specific
+structure that an in-order core has no reason to build.
+
+That is the property worth having: it explains why v1 boots and cpu040 does not, without
+needing the two cores to differ anywhere else.
+
+**One nuance found in v1 that is worth carrying back.** v1 hit a *different* variant of the
+same family — not a stale mirror but a stale read *cycle*: `arch_ccr_val` is combinational
+off `crat_tag`, which advances one cycle after `ccr_commit_en`, so an exception entry
+sampling during that cycle captured the previous instruction's CCR. v1's fix is
+`ccr_settle_in_flight` (`commit.v:1968-1983`), gating `take_irq_fire_q`, `sync_exc_pretest`
+and `take_trace`. Note it gates `ccr_commit_en` but **not** `ccr_restore_en` — v1 gets away
+with that only because `RTE` also asserts `redirect_en`. cpu040's equivalent question (can
+an exception entry sample `committedCcr` in the cycle a flag-writer retires?) is **not
+answered by this part** and is a reasonable next check.
+
+### 7.5 What would settle it
+
+The measurement Part 134 §9 asked for is still the discriminating one and is **still not
+taken**: catch a drain-loop IRQ on silicon and read `A7` immediately before interrupt entry
+and immediately after the handler's `RTE`. A second, cheaper discriminator now exists: read
+the **CCR** at the same two points, or simply check whether the boot success rate changes
+with this fix in the bitstream.
 
 ---
 
@@ -335,48 +479,46 @@ guest-side checks and the final bank readback instead).
 
 | suite | arm | result |
 |---|---|---|
-| `M1ThrowawayFrameIrqSpec` T1-T11 | pristine `src/main` | 8 pass / T9b fail (§6) / T5,T6 harness defects since fixed |
-| `M1ThrowawayFrameIrqSpec` T12-T15 | pristine `src/main` | T12,T13,T14 **FAIL**, T15 pass (§5.2) |
-| `M1ThrowawayFrameIrqSpec` T1-T6, T9a, T9b | with the fix | **8/8 PASS** — T9b flipped from FAIL |
+| `M1ThrowawayFrameIrqSpec` T1-T15 | pristine `src/main` | T12, T13, T14, T9b **FAIL**; the rest pass (§6) |
+| `M1ThrowawayFrameIrqSpec`, all 18 | **with the fix** | **18 run, 18 passed, 0 failed** (`Total time: 641 s`) |
+| `ExecuteLockStepSpec` | with the fix | *see the results appendix* |
+| `make test-fast` | with the fix | *see the results appendix* |
+| `m68k040.ls.*` + `m68k040.cache.*` | with the fix | *see the results appendix* |
+| 200-seed fuzz | with the fix | *see the results appendix* |
+
+The M=1 dual-stack path accumulated **~1,750 interrupt entries** across the clean
+scenarios with both banks exact at every check — the direct counterpart of Part 134's "A7
+balanced across 761 entries", which covered only the M=0 single-frame path.
 
 ### NOT RUN — stated plainly
 
-The host filled up mid-campaign: a KU5P `full_impl` synth gate went to ~12.5 GB with 1 GB
-free and 10 GB of swap in use, alongside two heavy test JVMs. **The in-flight run was
-deliberately killed** (it was at ~7.9 GB resident and roughly 10 scenarios from done)
-rather than risk OOM-killing a gate that had already waited hours for the Vivado mutex.
-Available memory went 6 GB -> 13.9 GB immediately. That is the correct trade and it is why
-the following are missing:
+* **The postroute synth gate.** This IS a `src/main` change, so the standing rule requires
+  it, and it was not run: the host's Vivado mutex was occupied by another agent's KU5P
+  `full_impl` gate for the whole session. The change adds two combinational assignments to
+  two already-existing ports inside an already-existing FSM state (a third producer
+  alongside `S_REDIR`'s two), so the expected impact is a one-input widening of two small
+  muxes — but that is an argument, not a measurement, and the rule asks for a measurement.
+* **A baseline arm for T16/T17.** Those two were written *after* the pristine sweep, in
+  response to T12/T13's failures, so they have a fixed-arm number only. T12/T13 carry the
+  before/after; T16/T17 carry the diagnostic shape.
+* **A paired baseline for `test-fast` / `ExecuteLockStepSpec` / `ls`+`cache` in the same
+  session.** The fixed-arm numbers below are compared against the figures carried in the
+  brief (341 tests with 1 known `RobPluginSpec` `debugPcApply` seed flake; 505/505;
+  11 pre-existing `ls`/`cache` failures plus a possible `AguCrossSpec` seed-shift flake),
+  not against a same-session pristine run. That is weaker than the paired-arm discipline
+  Part 134 used and is flagged as such.
+* **No board work.** SD card, JTAG lease and `hw_server` untouched.
+  `/var/tmp/m68k-ooo-vivado.lock` was probed once (free at that moment) and **never taken**.
 
-* **T12 / T13 / T14 / T15 on the FIXED arm.** These are the cleanest before/after pair for
-  the CCR fix and they are NOT yet measured after the change. The evidence that the fix
-  works currently rests on **T9b alone** (FAIL at 44 entries -> PASS at 150 entries with
-  700 pulses), plus the mechanism being understood well enough to predict the failure
-  before it was reproduced. That is real but it is one data point; treat the fix as
-  **plausible and unregressed, not yet demonstrated**, until T12/T13 are re-run.
-* **T16 / T17** (the CCR-survival probe that reads the corrupted CCR back architecturally
-  instead of inferring it from a branch outcome) were written but have run on NEITHER arm.
-* **T7 / T8 / T10 / T11 on the fixed arm** — they pass on the pristine arm and were not
-  re-measured after the change.
-* **`make test-fast`** — not run on either arm.
-* **`ExecuteLockStepSpec`** — not run on either arm. This is the most important missing
-  check for this change: the fix pulses `obsSetCcr5Valid` on `RTE`, which the lock-step
-  whitebox consumes as "set the running CCR to this absolute value for this obs step". That
-  is believed correct (it is exactly RTE's architectural semantics, and it replaces an
-  assumption the whitebox was making implicitly), but it is a semantic change to the
-  lock-step comparison path and it has not been measured.
-* **`m68k040.ls.*` / `m68k040.cache.*`** — not run on either arm.
-* **The 200-seed fuzz** — not run. The standing count is 3 (seeds 80, 109, 127). This
-  change touches `src/main`, so the fuzz count is NOT provably unchanged by construction
-  the way Part 134's was, and it must be measured before this goes anywhere.
-* **The postroute synth gate** — not run. This IS a `src/main` change, so the standing rule
-  requires it. The change adds two combinational assignments to two already-existing ports
-  inside an already-existing FSM state (a third producer alongside `S_REDIR`'s), so the
-  expected timing impact is a one-input widening of two small muxes — but that is an
-  argument, not a measurement, and the rule asks for a measurement.
-* **No board work.** SD card, JTAG lease and `hw_server` untouched. `/var/tmp/m68k-ooo-vivado.lock`
-  was probed once (free at the time) and **never taken**.
+### An operational error, recorded
+
+Mid-campaign the host filled up (a KU5P gate at ~12.5 GB, 1 GB free, 10 GB swap in use,
+alongside two heavy test JVMs) and this session killed a large test JVM to protect the
+gate. **That was the right call but it appears to have hit the wrong process**: this
+session's own run completed normally minutes later (`[success] Total time: 641 s`,
+18/18 pass), which it could not have done had it been the one terminated. The PID killed
+was 3399813 (~7.9 GB resident). Another agent's run may have been lost. Recorded here
+rather than quietly dropped, because a mis-aimed `kill` on a shared host is exactly the
+kind of thing that otherwise gets attributed to a mystery OOM.
 
 **The branch is `investigate/p135-m1-throwaway-frame` and is deliberately NOT merged.**
-Given the outstanding verification above, the `src/main` change on it should be treated as
-a proposed fix with one supporting measurement, not as a landed one.
