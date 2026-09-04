@@ -192,14 +192,23 @@ class IpcBenchSpec extends AnyFunSuite {
       val pipeFlush = doFlush || excActive
       val decodeUop = host[m68k040.services.DecodeUopService]
       iq.flushPort := pipeFlush
-      decodeUop.pipeFlush := pipeFlush
+      // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
+      // top/FullCoreSynth.scala's BackendWiringPlugin. Tier 1 drives ONLY the
+      // frontend redirect, the pre-rename skid flush and the RAS checkpoint; it
+      // never reaches iq.flushPort / RenameStage.pipeFlush / sqFlush / umFlush.
+      val earlyFire  = rob.logic.earlyFire
+      val feSuppress = rob.logic.earlySuppressFe && !excActive
+      val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
+      decodeUop.pipeFlush := feFlush
       host[RenameStage].logic.pipeFlush := doFlush || excActive
+      host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
       // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
-      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
+      val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, feFlush)
       val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-      faRedir.valid   := doFlush || frontendResume.valid
-      faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
+      faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
+      faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
+                         Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.
@@ -227,7 +236,7 @@ class IpcBenchSpec extends AnyFunSuite {
       fa.logic.rasPredTarget   := rasP.logic.predTarget
       // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
       // see Ras.scala's doc comment for the design).
-      val rasCheckpointRestore = doFlush || fa.logic.ftqMismatch
+      val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
       rasP.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
                                        !rasCheckpointRestore
       rasP.logic.checkpointRestore := rasCheckpointRestore
@@ -490,7 +499,13 @@ class IpcBenchSpec extends AnyFunSuite {
       // unchanged against a baseline netlist.
       val misResolveCycle = scala.collection.mutable.HashMap[Int, Long]()
       val resolveToRetire = ArrayBuffer.empty[Int]
+      val flushToCommit   = ArrayBuffer.empty[Int]
+      var flushPendingCycle = -1L
+      var feedFires         = 0
       var telemCycle        = 0L
+      var t1PendFeedValid   = 0
+      var t1PendFeedReady   = 0
+      var t1PendFeedFire    = 0
       var t1EarlyFires      = 0   // Tier-1 early PC redirect pulses
       var t1PendCycles      = 0   // cycles rename was frozen by Tier 1
       var t1Suppressed      = 0   // Tier-2 flushes that KEPT the refetched frontend
@@ -529,8 +544,20 @@ class IpcBenchSpec extends AnyFunSuite {
         if (dut.rob.logic.branchRedirect.toBoolean)
           misResolveCycle.remove(dut.rob.logic.head.toInt)
             .foreach(c => resolveToRetire += (telemCycle - c).toInt)
+        // Recovery latency: cycles from the retire-gated flush pulse to the next
+        // macro commit. THIS is the term an early PC redirect is supposed to
+        // shorten; it is what an aggregate IPC delta is made of, one flush at a
+        // time, and it is readable identically on a baseline netlist.
+        if (dut.rob.logic.doFlushReg.toBoolean) flushPendingCycle = telemCycle
+        if (dut.fa.logic.feed.valid.toBoolean && dut.fa.logic.feed.ready.toBoolean)
+          feedFires += 1
         if (dut.rob.logic.earlyFire.toBoolean) t1EarlyFires += 1
-        if (dut.rob.logic.earlyPend.toBoolean) t1PendCycles += 1
+        if (dut.rob.logic.earlyPend.toBoolean) {
+          t1PendCycles += 1
+          if (dut.fa.logic.feed.valid.toBoolean) t1PendFeedValid += 1
+          if (dut.fa.logic.feed.ready.toBoolean) t1PendFeedReady += 1
+          if (dut.fa.logic.feed.valid.toBoolean && dut.fa.logic.feed.ready.toBoolean) t1PendFeedFire += 1
+        }
         if (dut.rob.logic.earlySuppressFe.toBoolean) t1Suppressed += 1
         if (dut.rob.logic.doFlushReg.toBoolean) t2Flushes += 1
         if (dut.rob.logic.branchRedirect.toBoolean) t2BranchRedirects += 1
@@ -591,6 +618,11 @@ class IpcBenchSpec extends AnyFunSuite {
         }
 
         // Count MACRO commits this cycle from the two normal commit ports.
+        if (flushPendingCycle >= 0 && telemCycle > flushPendingCycle &&
+            (0 until 2).exists(dut.rob.logic.commitObs(_).fire.toBoolean)) {
+          flushToCommit += (telemCycle - flushPendingCycle).toInt
+          flushPendingCycle = -1L
+        }
         var macrosThisCycle = 0
         for (kk <- 0 until 2) {
           val c = dut.rob.logic.commitObs(kk)
@@ -723,8 +755,14 @@ class IpcBenchSpec extends AnyFunSuite {
       val r2rHis = resolveToRetire.groupBy(identity).toVector.sortBy(_._1)
         .map { case (d, xs) => s"$d:${xs.size}" }.mkString(", ")
       println(f"[tier1] ${k.name} earlyFire=$t1EarlyFires pendCyc=$t1PendCycles " +
-        f"suppressed=$t1Suppressed doFlush=$t2Flushes branchRedirect=$t2BranchRedirects")
+        f"suppressed=$t1Suppressed doFlush=$t2Flushes branchRedirect=$t2BranchRedirects " +
+        f"pendFeedV=$t1PendFeedValid pendFeedR=$t1PendFeedReady pendFeedFire=$t1PendFeedFire")
       println(f"[resolve2retire] ${k.name} n=$r2rN avg=$r2rAvg%.2f  histogram{$r2rHis}")
+      val f2cN   = flushToCommit.size
+      val f2cAvg = if (f2cN == 0) 0.0 else flushToCommit.sum.toDouble / f2cN
+      val f2cHis = flushToCommit.groupBy(identity).toVector.sortBy(_._1)
+        .map { case (d, xs) => s"$d:${xs.size}" }.mkString(", ")
+      println(f"[flush2commit] ${k.name} n=$f2cN avg=$f2cAvg%.2f feedFires=$feedFires  histogram{$f2cHis}")
       if (k.copybackDtt) {
         println(s"[store-path] lsIssue=$lsIssueFires sqAlloc=$sqAllocFires fastAlloc=$fastSqAllocs " +
           s"sqDrainFire=$sqDrainFires dcStoreFire=$dcStoreFires ack=$dcStoreAcks " +

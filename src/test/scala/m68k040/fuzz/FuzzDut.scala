@@ -170,8 +170,16 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val pipeFlush = doFlush || excActive
     val decodeUop = host[m68k040.services.DecodeUopService]
     iq.flushPort := pipeFlush
-    decodeUop.pipeFlush := pipeFlush
+    // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
+    // top/FullCoreSynth.scala's BackendWiringPlugin. Tier 1 drives ONLY the
+    // frontend redirect, the pre-rename skid flush and the RAS checkpoint; it
+    // never reaches iq.flushPort / RenameStage.pipeFlush / sqFlush / umFlush.
+    val earlyFire  = rob.logic.earlyFire
+    val feSuppress = rob.logic.earlySuppressFe && !excActive
+    val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
+    decodeUop.pipeFlush := feFlush
     host[RenameStage].logic.pipeFlush := doFlush || excActive
+    host[RenameStage].logic.allocHalt := rob.logic.earlyPend
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
     // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
     // port fires, but `resume` is a TEST-BOOT-ONLY external port (poked directly by the
@@ -183,10 +191,11 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // correctly keeps running -- only the front-end fetch pointer is unstuck. Priority:
     // a real doFlush (branch mispredict / exception) wins over a same-cycle resume (should
     // never coincide in practice; doFlush is the architecturally "real" redirect).
-    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, pipeFlush)
+    val frontendResume = ComplexResumeActionPipe(decodeUop.complexResume, feFlush)
     val faRedir = host[FetchAlignPlugin].logic.mispredictRedirect
-    faRedir.valid   := doFlush || frontendResume.valid
-    faRedir.payload := Mux(doFlush, flushPc, frontendResume.payload)
+    faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
+    faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
+                       Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
 
     val faBtb = host[FetchAlignPlugin]
     val btb   = host[m68k040.frontend.BtbPlugin]
@@ -211,7 +220,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     faBtb.logic.rasPredTarget := ras.logic.predTarget
     // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
     // see Ras.scala's doc comment for the design).
-    val rasCheckpointRestore = doFlush || faBtb.logic.ftqMismatch
+    val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || faBtb.logic.ftqMismatch
     ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
                                     !rasCheckpointRestore
     ras.logic.checkpointRestore := rasCheckpointRestore
