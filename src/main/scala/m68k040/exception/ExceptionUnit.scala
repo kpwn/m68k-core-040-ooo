@@ -1071,6 +1071,13 @@ class ExceptionUnit(
   // re-request only when it changes. At most 2 translation requests per frame, never 26,
   // and every word still gets a real, current translation.
   val fsPpn      = Reg(UInt(20 bits)) init 0
+  // TCR.P, for the FSAVE/FRESTORE physical-address assembly further down (see F_STORE).
+  // Read through the `MmuControlService` getter, which resolves via MmuControlPlugin's
+  // `logic` Handle and therefore blocks this Fiber task until that plugin's build body
+  // has run -- the synchronisation MmuControl.scala:55-88 documents. The same class
+  // already reads `mmuCtrl.pageSize8K` for the MOVEC-from-TC path, so this adds no new
+  // cross-plugin dependency, only a second use of an existing one.
+  val fsIs8K     = mmuCtrl.pageSize8K
   val fsLastVpn  = Reg(UInt(20 bits)) init 0
   val fsVpnValid = RegInit(False)
   /** Sticky: a DTLB translation for an FSAVE/FRESTORE frame access FAULTED. Drives
@@ -2287,7 +2294,20 @@ class ExceptionUnit(
         goto(F_XREQ)
       } otherwise {
         val data = fsFrameWordData(fsStep)
-        val pa   = (fsPpn ## fsCurVa(11 downto 0)).asUInt
+        // Task #195 page size. PA = PPN ## page-offset, and the offset is 12 bits at
+        // 4 KiB but 13 at 8 KiB -- VA[12] moves from "the PPN's LSB" to "the top bit of
+        // the page offset" when TCR.P=1, so the 8 KiB PPN slice drops `fsPpn(0)` (the
+        // raw page descriptor's bit 12, architecturally UNDEFINED for 8 KiB pages per the
+        // MC68040 UM) and PA[12] comes straight from the untranslated VA.
+        //
+        // This mux was MISSING here while `LsEuPlugin.s1Paddr` and
+        // `IcachePlugin.lookupPaddr` -- the other two places a translated PA is
+        // assembled -- both had it. With TCR.P=1 an FSAVE frame at a VA with bit 12 set
+        // was therefore pushed to the wrong physical address, silently, taking PA[12]
+        // from a descriptor bit the architecture does not define.
+        val pa   = Mux(fsIs8K,
+          (fsPpn(19 downto 1) ## fsCurVa(12 downto 0)).asUInt,
+          (fsPpn ## fsCurVa(11 downto 0)).asUInt)
         // NOTE: the ADDRESS is now genuinely translated, but the CACHE MODE deliberately
         // still comes from `excCacheMode` (the CACR.DE fold every other exception-path
         // store uses) rather than from `dxRspCacheMode`. Honouring the page's own cache
@@ -2343,7 +2363,11 @@ class ExceptionUnit(
     F_HDRREQ.whenIsActive {
       ldoVld   := True
       ldoVaddr := fsFrameBase
-      ldoPaddr := (fsPpn ## fsFrameBase(11 downto 0)).asUInt
+      // Same page-size mux as F_STORE above (see the comment there) -- FRESTORE's header
+      // read had the identical hardcoded 4 KiB assembly.
+      ldoPaddr := Mux(fsIs8K,
+        (fsPpn(19 downto 1) ## fsFrameBase(12 downto 0)).asUInt,
+        (fsPpn ## fsFrameBase(11 downto 0)).asUInt)
       ldoSize  := Size.WORD
       // WORD granularity, not LONG, for the same reason task #189 split RTE's PC read:
       // `DcacheByteLane.extract` has no cross-line awareness. The residual exposure is

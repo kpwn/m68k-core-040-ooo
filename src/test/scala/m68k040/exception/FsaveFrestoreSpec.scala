@@ -491,4 +491,110 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     assert(r.coreHalted,
       "a faulting DTLB translation for the FRESTORE header read must drive coreHaltedIn")
   }
+
+  /** 8 KiB PAGES: the FSAVE frame store must take PA[12] from the untranslated VA.
+    *
+    * `ExceptionUnit`'s F_STORE assembled `PA = fsPpn ## fsCurVa(11 downto 0)` with NO
+    * `is8K` mux, while the only other two places a translated PA is assembled --
+    * `LsEuPlugin.s1Paddr` and `IcachePlugin.lookupPaddr` -- both had one. With `TCR.P=1`
+    * the page offset is 13 bits: VA[12] moves from "the PPN's LSB" to "the top bit of the
+    * page offset", so `fsPpn(0)` (the raw descriptor's bit 12) is architecturally
+    * UNDEFINED and PA[12] must come from the VA.
+    *
+    * EVERY OTHER TEST IN THIS FILE IS BLIND TO THIS, structurally, for two independent
+    * reasons: none of them sets `TCR.P`, and all of them translate through a match-all
+    * TTR, whose response PPN is the request's own VPN -- so both the old and the new
+    * expression collapse to `PA == VA` and no descriptor bit is ever consulted. This test
+    * therefore has to build a real 3-level table and POISON the one bit involved.
+    *
+    * The construction, chosen so old and new differ by exactly one address bit:
+    *   - A7 = 0x0002E100, so the 52-byte frame occupies 0x0002E0CC..0x0002E0FF -- one
+    *     8 KiB page (0x0002E000..0x0002FFFF), and every frame byte has VA[12] = 0.
+    *   - The leaf descriptor's address field is 0x0002F000: the true 8 KiB page base
+    *     0x0002E000 with bit 12 deliberately set to 1, i.e. disagreeing with VA[12].
+    *   - PDT=01 resident, CM=00 writethrough, U=M=0.
+    * so
+    *   correct (PA[12] from the VA)          -> 0x0002E0CC
+    *   the bug (PA[12] from the descriptor)  -> 0x0002F0CC
+    * and the assertion checks BOTH: the frame is at the right address AND the wrong
+    * address is untouched. Verified to FAIL on the pre-fix RTL (frame at 0x0002F0CC,
+    * 0x0002E0CC all zero) and pass after. */
+  test("FSAVE with TCR.P=1 takes PA[12] from the VA, not the page descriptor",
+       VerilatorTest) {
+    val Root = 0x00080000L; val Ptr = 0x00081000L; val Leaf = 0x00082000L
+    val A7   = 0x0002E100L
+    val Good = A7 - 52          // 0x0002E0CC -- PA[12] taken from VA[12] = 0
+    val Bad  = Good + 0x1000L   // 0x0002F0CC -- PA[12] taken from the descriptor's bit 12
+    val src80 = (BigInt(0x4001) << 64) | BigInt(0x5555)
+    val image = ProgramAssembler.assemble(
+      f"lea 0x$A7%08x,%%a7 ; $fsaveA7 ; done: bra.s done", loadAddr)
+      .getOrElse(fail("assemble failed"))
+    var got = 0
+    var wrong = 0
+    var a7 = 0L
+    compiled.doSim(simName("fsave-8k-pa12"), 1) { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val zmem = new m68k040.sim.ConstFillSparseMemory(0.toByte)
+      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = zmem)
+      def pokeLong(addr: Long, v: Long): Unit =
+        for (i <- 0 until 4) dmem.pokeByte(addr + i, ((v >> (8 * (3 - i))) & 0xff).toInt)
+      // VA 0x0002E0CC: root idx = VA[31:25] = 0, ptr idx = VA[24:18] = 0,
+      // leaf idx (8 KiB) = VA[17:13] = 23. UDT=10 resident on the two table levels.
+      pokeLong(Root, Ptr | 0x2L)
+      pokeLong(Ptr, Leaf | 0x2L)
+      pokeLong(Leaf + 23 * 4, 0x0002F000L | 0x1L)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.pageSize8K #= false
+      dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= 0; dut.ctrl.logic.dtt1 #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iackVector #= 0
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      // Instructions transparently translated (the code image is elsewhere and is not
+      // what is under test); DATA gets NO TTR, so the frame store runs a real walk.
+      dut.ctrl.logic.itt0 #= IttMatchAllWt
+      dut.ctrl.logic.dtt0 #= 0
+      dut.ctrl.logic.srp #= Root; dut.ctrl.logic.urp #= Root
+      dut.ctrl.logic.pageSize8K #= true
+      dut.ctrl.logic.mmuEnable #= true
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.isp #= StackTop
+      dut.rob.logic.exc.ss.usp #= StackTop
+      dut.rob.logic.exc.ss.srSys #= 0x27
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(StackTop)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fpuCtl.logic.everExecuted #= true
+      dut.fpuCtl.logic.uiValid #= true
+      dut.fpuCtl.logic.uiCmdReg1B #= BigInt(0xBEEF)
+      dut.fpuCtl.logic.uiSrcOperand #= src80
+      dut.fpuCtl.logic.uiDstOperand #= BigInt(0)
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      cd.waitSampling(6000)
+      a7 = dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL
+      got   = (dmem.peekByte(Good) << 8) | dmem.peekByte(Good + 1)
+      wrong = (dmem.peekByte(Bad) << 8) | dmem.peekByte(Bad + 1)
+    }
+    assert(a7 == Good, f"sanity: the 52-byte frame was emitted; A7 = 0x$a7%08X")
+    assert(got == 0x4130,
+      f"the frame header must land at the 8 KiB-correct PA 0x$Good%08X (PA[12] from " +
+      f"VA[12]=0); found 0x$got%04X there and 0x$wrong%04X at 0x$Bad%08X, which is the " +
+      f"address you get by taking PA[12] from the page descriptor's architecturally " +
+      f"undefined bit 12")
+    assert(wrong == 0x0000,
+      f"nothing may be written at 0x$Bad%08X -- that address only exists if PA[12] came " +
+      f"from the descriptor instead of the VA; found 0x$wrong%04X")
+  }
 }
