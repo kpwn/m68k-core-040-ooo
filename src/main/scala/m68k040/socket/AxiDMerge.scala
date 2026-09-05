@@ -187,23 +187,37 @@ class AxiDMerge(axiCfg: Axi4Config,
     // overrides the fields it actually drives. Zero functional change -- these fields were
     // always X on every path that reaches a real socket boundary; this just makes the X
     // explicit early enough that SpinalHDL's checker accepts it as intentional.
+    //
+    // `!arTaken`: the read-side half of the write side's one-transaction-per-grant rule
+    // (see `wr.awTaken` below for the full argument and the boot wedge it comes from).
+    // The read side has never been observed to issue a second AR inside one grant -- the
+    // D-cache's refill engine is single-outstanding by construction -- but the failure
+    // shape would be identical and equally silent: `io.<owner>.r.valid` is gated on
+    // `busy`, so an R for a transaction whose grant has already been retired by an
+    // earlier `r.last` is simply never presented to anyone. Enforce the invariant here
+    // rather than depend on a property of a different file.
+    val arTaken = RegInit(False)
+    when(!busy) { arTaken := False }
+    when(io.out.ar.fire) { arTaken := True }
+    val arOpen = open && !arTaken
+
     io.out.ar.payload.assignDontCare()
-    io.out.ar.valid := open && io.dc.ar.valid
+    io.out.ar.valid := arOpen && io.dc.ar.valid
     io.out.ar.payload.addr  := io.dc.ar.payload.addr
     io.out.ar.payload.id    := io.dc.ar.payload.id
     io.out.ar.payload.len   := io.dc.ar.payload.len
     io.out.ar.payload.size  := io.dc.ar.payload.size
     io.out.ar.payload.burst := io.dc.ar.payload.burst
     when(sel === U(Owner.ITLB, 2 bits)) {
-      io.out.ar.valid   := open && io.itlb.ar.valid
+      io.out.ar.valid   := arOpen && io.itlb.ar.valid
       io.out.ar.payload := io.itlb.ar.payload
     }
     when(sel === U(Owner.DTLB, 2 bits)) {
-      io.out.ar.valid   := open && io.dtlb.ar.valid
+      io.out.ar.valid   := arOpen && io.dtlb.ar.valid
       io.out.ar.payload := io.dtlb.ar.payload
     }
     when(sel === U(Owner.RESETVEC, 2 bits)) {
-      io.out.ar.valid   := open && io.rvArValid
+      io.out.ar.valid   := arOpen && io.rvArValid
       io.out.ar.payload.addr  := io.rvArAddr
       io.out.ar.payload.id    := U(AxiIds.RESET_VEC, axiCfg.idWidth bits)
       io.out.ar.payload.len   := U(0, 8 bits)
@@ -211,10 +225,10 @@ class AxiDMerge(axiCfg: Axi4Config,
       io.out.ar.payload.burst := Axi4.burst.INCR
     }
 
-    io.dc.ar.ready   := open && (sel === U(Owner.DCACHE,   2 bits)) && io.out.ar.ready
-    io.itlb.ar.ready := open && (sel === U(Owner.ITLB,     2 bits)) && io.out.ar.ready
-    io.dtlb.ar.ready := open && (sel === U(Owner.DTLB,     2 bits)) && io.out.ar.ready
-    io.rvArReady     := open && (sel === U(Owner.RESETVEC, 2 bits)) && io.out.ar.ready
+    io.dc.ar.ready   := arOpen && (sel === U(Owner.DCACHE,   2 bits)) && io.out.ar.ready
+    io.itlb.ar.ready := arOpen && (sel === U(Owner.ITLB,     2 bits)) && io.out.ar.ready
+    io.dtlb.ar.ready := arOpen && (sel === U(Owner.DTLB,     2 bits)) && io.out.ar.ready
+    io.rvArReady     := arOpen && (sel === U(Owner.RESETVEC, 2 bits)) && io.out.ar.ready
 
     when(grant) { owner := pick; busy := True; rr := pick + 1 }
 
@@ -276,29 +290,68 @@ class AxiDMerge(axiCfg: Axi4Config,
     val sel   = Mux(busy, owner, pick)
     val open  = busy || grant
 
-    io.out.aw.valid   := open && io.dc.aw.valid
+    // ── ONE AW->B transaction per grant (2026-09-05, the p141 `0x40806b68` boot wedge) ──
+    //
+    // `busy` covers AW..B, but until this gate existed nothing stopped a SECOND AW being
+    // forwarded inside that window: `io.out.aw.valid` was `open && <owner>.aw.valid`, and
+    // `open` stays true for the whole grant. `busy` then cleared on the FIRST
+    // `io.out.b.fire` (below), so the second write's B arrived with no grant open at all
+    // -- `io.<owner>.b.valid` never presented it and `io.out.b.ready` never accepted it.
+    // The response was lost in BOTH directions at once: the issuer waits forever for an
+    // ack that cannot come, and the fabric is left holding BVALID. Nothing detected it,
+    // because `wr.wedge` is gated on `busy`, which by then is low -- the exact reason the
+    // board wedged with `coreHalted` CLEAR.
+    //
+    // This is reachable from `DcachePlugin`, not hypothetical. Its three write issuers
+    // are mutually excluded over the AW/W HANDSHAKES only, never over the B:
+    // `storeWantsAxi = !stAwDone || !stWDone` (`DcachePlugin.scala:1031`) and
+    // `evictAxiPairOpen = !evictAwDone || !evictWDone` (:1035) both go False the moment a
+    // writer's aw and w are ACCEPTED. So EVICT_WR's kickoff (:1811/:1820) fires while a
+    // store's B is still in flight, the store-S3 kickoff (:2933) does the mirror image,
+    // and `MAX_WT_OUTSTANDING = 4` (:1117) makes the store path overlap up to four writes
+    // by design. `AxiMemModel`'s claim that "D_PUSH/WALK_WRITE/D_EVICT stay single-flight
+    // by RTL construction (`evictAxiPairOpen`/`maintAxiPairOpen`)" reads those two signals
+    // as B-scoped; they are not, and that premise is what let a 2026-08-27 investigation
+    // exonerate the overlap as a stale test-harness check.
+    //
+    // Holding the second AW here is not a new restriction on the fabric side: it is
+    // exactly what the SoC crossbar's own per-master `ws_state` already does
+    // (`AxiMemModel`'s `crossbarSingleOutstanding`, modelling `axi_xbar.v`). What changes
+    // is that the arbiter now enforces it at its own boundary instead of assuming it, so
+    // no B can ever be produced for a transaction whose grant has already been retired.
+    // Deadlock-free by inspection: the held owner keeps `req` asserted, `busy` still
+    // clears on its own B, and the next cycle re-grants it.
+    val awTaken = RegInit(False)
+    val wTaken  = RegInit(False)
+    when(!busy) { awTaken := False; wTaken := False }
+    when(io.out.aw.fire) { awTaken := True }
+    when(io.out.w.fire && io.out.w.payload.last) { wTaken := True }
+    val awOpen = open && !awTaken
+    val wOpen  = open && !wTaken
+
+    io.out.aw.valid   := awOpen && io.dc.aw.valid
     io.out.aw.payload := io.dc.aw.payload
-    io.out.w.valid    := open && io.dc.w.valid
+    io.out.w.valid    := wOpen && io.dc.w.valid
     io.out.w.payload  := io.dc.w.payload
     when(sel === U(Owner.ITLB, 2 bits)) {
-      io.out.aw.valid   := open && io.itlb.aw.valid
+      io.out.aw.valid   := awOpen && io.itlb.aw.valid
       io.out.aw.payload := io.itlb.aw.payload
-      io.out.w.valid    := open && io.itlb.w.valid
+      io.out.w.valid    := wOpen && io.itlb.w.valid
       io.out.w.payload  := io.itlb.w.payload
     }
     when(sel === U(Owner.DTLB, 2 bits)) {
-      io.out.aw.valid   := open && io.dtlb.aw.valid
+      io.out.aw.valid   := awOpen && io.dtlb.aw.valid
       io.out.aw.payload := io.dtlb.aw.payload
-      io.out.w.valid    := open && io.dtlb.w.valid
+      io.out.w.valid    := wOpen && io.dtlb.w.valid
       io.out.w.payload  := io.dtlb.w.payload
     }
 
-    io.dc.aw.ready   := open && (sel === U(Owner.DCACHE, 2 bits)) && io.out.aw.ready
-    io.itlb.aw.ready := open && (sel === U(Owner.ITLB,   2 bits)) && io.out.aw.ready
-    io.dtlb.aw.ready := open && (sel === U(Owner.DTLB,   2 bits)) && io.out.aw.ready
-    io.dc.w.ready    := open && (sel === U(Owner.DCACHE, 2 bits)) && io.out.w.ready
-    io.itlb.w.ready  := open && (sel === U(Owner.ITLB,   2 bits)) && io.out.w.ready
-    io.dtlb.w.ready  := open && (sel === U(Owner.DTLB,   2 bits)) && io.out.w.ready
+    io.dc.aw.ready   := awOpen && (sel === U(Owner.DCACHE, 2 bits)) && io.out.aw.ready
+    io.itlb.aw.ready := awOpen && (sel === U(Owner.ITLB,   2 bits)) && io.out.aw.ready
+    io.dtlb.aw.ready := awOpen && (sel === U(Owner.DTLB,   2 bits)) && io.out.aw.ready
+    io.dc.w.ready    := wOpen && (sel === U(Owner.DCACHE, 2 bits)) && io.out.w.ready
+    io.itlb.w.ready  := wOpen && (sel === U(Owner.ITLB,   2 bits)) && io.out.w.ready
+    io.dtlb.w.ready  := wOpen && (sel === U(Owner.DTLB,   2 bits)) && io.out.w.ready
 
     when(grant) { owner := pick; busy := True; rr := pick + 1 }
 

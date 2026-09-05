@@ -230,6 +230,191 @@ class AxiDMergeSpec extends AnyFunSuite {
     }
   }
 
+  /** Hand-rolled `io.out` slave. The `AxiMemModel` cannot express this case: every
+    * existing test above attaches it with `crossbarSingleOutstanding = true`, which
+    * refuses the second AW outright and so hides the arbiter behaviour under test. Here
+    * the B response is withheld under explicit testbench control instead. */
+  private def idleOutSlave(dut: MergeDut): Unit = {
+    dut.io.out.ar.ready #= true
+    dut.io.out.aw.ready #= true
+    dut.io.out.w.ready  #= true
+    dut.io.out.r.valid  #= false
+    dut.io.out.b.valid  #= false
+    dut.io.out.b.payload.id   #= 0
+    dut.io.out.b.payload.resp #= 0
+  }
+
+  /** Present one D-side write (aw + w together, the shape both `DcachePlugin` write
+    * issuers use) and return once BOTH legs have handshaked with the arbiter. */
+  private def dcWriteKickoff(dut: MergeDut, addr: Long, id: Int): Unit = {
+    dut.io.dc.aw.payload.addr #= addr
+    dut.io.dc.aw.payload.id   #= id
+    dut.io.dc.w.payload.data  #= id
+    dut.io.dc.aw.valid #= true
+    dut.io.dc.w.valid  #= true
+    var awDone = false
+    var wDone  = false
+    var g = 0
+    while (!(awDone && wDone) && g < 200) {
+      val awFire = dut.io.dc.aw.valid.toBoolean && dut.io.dc.aw.ready.toBoolean
+      val wFire  = dut.io.dc.w.valid.toBoolean && dut.io.dc.w.ready.toBoolean
+      dut.clockDomain.waitSampling()
+      if (awFire) { awDone = true; dut.io.dc.aw.valid #= false }
+      if (wFire)  { wDone  = true; dut.io.dc.w.valid  #= false }
+      g += 1
+    }
+    assert(g < 200, f"the D-side write id $id at 0x$addr%08X was never accepted by the arbiter")
+    dut.io.dc.aw.valid #= false
+    dut.io.dc.w.valid  #= false
+  }
+
+  /** Return one B beat on `io.out` and wait for the arbiter to consume it. Returns false
+    * if the arbiter never asserts `out.b.ready` -- i.e. the response is stranded. */
+  private def returnB(dut: MergeDut, id: Int, bound: Int = 200): Boolean = {
+    dut.io.out.b.payload.id   #= id
+    dut.io.out.b.payload.resp #= 0
+    dut.io.out.b.valid #= true
+    var g = 0
+    while (!dut.io.out.b.ready.toBoolean && g < bound) { dut.clockDomain.waitSampling(); g += 1 }
+    val taken = dut.io.out.b.ready.toBoolean
+    if (taken) dut.clockDomain.waitSampling()
+    dut.io.out.b.valid #= false
+    taken
+  }
+
+  test("a second D-side write issued while an earlier B is outstanding still gets its B") {
+    // THE p141 BOOT WEDGE (`0x40806b68`), reduced to its arbiter-level primitive.
+    //
+    // `DcachePlugin` has three write issuers whose mutual exclusion is expressed purely
+    // over the AW/W HANDSHAKES, never over the B: `storeWantsAxi = !stAwDone || !stWDone`
+    // (:1031) and `evictAxiPairOpen = !evictAwDone || !evictWDone` (:1035) both go False
+    // the moment a writer's aw and w are ACCEPTED, with its B still in flight. So the
+    // store-S3 kickoff (:2933) and EVICT_WR (:1811/:1820) each legitimately present a
+    // SECOND AW while the first write's B is outstanding -- and `MAX_WT_OUTSTANDING = 4`
+    // (:1117) makes the store path do it by design.
+    //
+    // `AxiDMerge.wr` assumed the opposite. It latches `busy` on GRANT, forwards any
+    // `io.dc.aw.valid` for as long as `busy` holds (:279-282), and clears `busy` on the
+    // FIRST `io.out.b.fire` (:315). A second write accepted under the same grant
+    // therefore has its B arrive with `busy` already low, where
+    // `io.dc.b.valid := io.out.b.valid && busy && ...` (:308) never presents it and
+    // `io.out.b.ready` (:311) never accepts it. The response is lost in BOTH directions:
+    // the issuer waits for an ack that can never come, and the fabric holds BVALID
+    // forever. No watchdog covers it -- `wr.wedge` is gated on `busy`, which is low.
+    //
+    // On the board that is EVICT_WR waiting for its `id == D_PUSH` B (:1828) while
+    // `busy` stays high forever, which is the measured p141 stall word exactly: of the
+    // 17 `dcIdleForMaint` terms only `busy` blocks, with `storeOutstanding == 0` and all
+    // four AW/W done-flags set.
+    M68kSim().compile(new MergeDut()).doSim("write-grant-second-b", seed = 6) { dut =>
+      dut.clockDomain.forkStimulus(10)
+      idleAll(dut)
+      idleOutSlave(dut)
+      dut.clockDomain.waitSampling(4)
+
+      // Write 1: the store-S3 write-through kickoff. Its aw+w are accepted; its B is
+      // deliberately withheld, exactly as a real fabric round trip withholds it.
+      dcWriteKickoff(dut, 0x1000, AxiIds.D_STORE)
+
+      // Write 2: EVICT_WR's dirty-victim writeback, PRESENTED (not required to be
+      // accepted) while write 1's B is still outstanding. `storeWantsAxi` is already
+      // False -- write 1's aw and w are done -- so the RTL genuinely presents it here.
+      // Whether the arbiter admits it now or back-pressures it until write 1's B lands
+      // is its own choice; what is NOT negotiable is that whichever it does, write 2
+      // still receives its own B.
+      dut.io.dc.aw.payload.addr #= 0x2000
+      dut.io.dc.aw.payload.id   #= AxiIds.D_PUSH
+      dut.io.dc.w.payload.data  #= 0xEE
+      dut.io.dc.aw.valid #= true
+      dut.io.dc.w.valid  #= true
+      // Advance one cycle at a time, RETIRING each leg the moment it handshakes. A real
+      // master drops VALID after its handshake; leaving it high would let the arbiter
+      // re-forward the same AW on a later grant and mask the very drop under test.
+      def stepRetiring(): Unit = {
+        val awFire = dut.io.dc.aw.valid.toBoolean && dut.io.dc.aw.ready.toBoolean
+        val wFire  = dut.io.dc.w.valid.toBoolean  && dut.io.dc.w.ready.toBoolean
+        dut.clockDomain.waitSampling()
+        if (awFire) dut.io.dc.aw.valid #= false
+        if (wFire)  dut.io.dc.w.valid  #= false
+      }
+      for (_ <- 0 until 4) stepRetiring()
+
+      // Write 1's B. Fine both before and after the fix. `returnB` must not let the
+      // second write's legs re-fire while it waits, so retire them here too.
+      dut.io.out.b.payload.id   #= AxiIds.D_STORE
+      dut.io.out.b.payload.resp #= 0
+      dut.io.out.b.valid #= true
+      var g = 0
+      while (!dut.io.out.b.ready.toBoolean && g < 200) { stepRetiring(); g += 1 }
+      assert(dut.io.out.b.ready.toBoolean, "the arbiter never accepted the first B")
+      stepRetiring()
+      dut.io.out.b.valid #= false
+
+      // Let write 2's aw/w complete on whatever schedule the arbiter chose.
+      g = 0
+      while ((dut.io.dc.aw.valid.toBoolean || dut.io.dc.w.valid.toBoolean) && g < 200) {
+        stepRetiring(); g += 1
+      }
+      assert(g < 200, "the second write's aw/w never completed")
+
+      // THE REGRESSION: write 2's B must be both ACCEPTED on `out.b` and PRESENTED on
+      // `dc.b`. Before the fix the arbiter admitted write 2 under write 1's grant and
+      // then retired that grant on write 1's B, so `out.b.ready` stays low forever and
+      // `dc.b.valid` never rises -- the response is lost in both directions at once.
+      dut.io.out.b.payload.id   #= AxiIds.D_PUSH
+      dut.io.out.b.payload.resp #= 0
+      dut.io.out.b.valid #= true
+      g = 0
+      var seen = false
+      while (!seen && g < 200) {
+        seen = dut.io.dc.b.valid.toBoolean &&
+               dut.io.dc.b.payload.id.toInt == AxiIds.D_PUSH
+        if (!seen) { dut.clockDomain.waitSampling(); g += 1 }
+      }
+      assert(seen,
+        "the second write's B was never presented to the D-cache -- EVICT_WR would wait " +
+        "for its id=2 ack forever, which is the p141 0x40806b68 boot wedge")
+      assert(dut.io.out.b.ready.toBoolean,
+        "the second write's B was never accepted on out.b -- BVALID is stranded on the fabric")
+      dut.io.out.b.valid #= false
+    }
+  }
+
+  test("a held write grant does not forward a second AW into the fabric") {
+    // The other half of the same property, stated positively: while one write's B is
+    // still outstanding the arbiter must BACK-PRESSURE the next AW (`aw.ready` low)
+    // rather than let it through under the open grant. That is exactly what the SoC
+    // crossbar's own `ws_state` does (`AxiMemModel`'s `crossbarSingleOutstanding`), and
+    // it is what keeps every B paired with a live grant.
+    M68kSim().compile(new MergeDut()).doSim("one-write-per-grant", seed = 7) { dut =>
+      dut.clockDomain.forkStimulus(10)
+      idleAll(dut)
+      idleOutSlave(dut)
+      dut.clockDomain.waitSampling(4)
+      dcWriteKickoff(dut, 0x1000, AxiIds.D_STORE)
+      // B withheld. A second write must not be admitted.
+      dut.io.dc.aw.payload.addr #= 0x2000
+      dut.io.dc.aw.payload.id   #= AxiIds.D_PUSH
+      dut.io.dc.w.payload.data  #= 0xEE
+      dut.io.dc.aw.valid #= true
+      dut.io.dc.w.valid  #= true
+      for (i <- 0 until 24) {
+        dut.clockDomain.waitSampling()
+        assert(!dut.io.dc.aw.ready.toBoolean,
+          s"a second AW was admitted at cycle $i while the first write's B was outstanding")
+        assert(!dut.io.out.aw.valid.toBoolean,
+          s"a second AW was forwarded to the fabric at cycle $i under the open grant")
+      }
+      // Once the first B lands the second write proceeds normally.
+      assert(returnB(dut, AxiIds.D_STORE), "the arbiter never accepted the first B")
+      var g = 0
+      while (!dut.io.dc.aw.ready.toBoolean && g < 200) { dut.clockDomain.waitSampling(); g += 1 }
+      assert(g < 200, "the second write never got its own grant after the first B")
+      dut.io.dc.aw.valid #= false; dut.io.dc.w.valid #= false
+      assert(returnB(dut, AxiIds.D_PUSH), "the second write's B was never accepted")
+    }
+  }
+
   test("D20's real bound is v1's value verbatim, not a re-derivation") {
     // Spec section 8.3: "inherit v1's final TIMEOUT_CYCLES value verbatim -- 2,000,000,000
     // core-clk cycles (32'h7735_9400, axi_narrow_to_wide.v:263). Do NOT re-derive it from
