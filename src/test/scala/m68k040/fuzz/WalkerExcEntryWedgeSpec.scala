@@ -323,6 +323,10 @@ final case class WalkExcResult(
   badAr: Long,
   badAw: Long,
   badArLog: String,
+  multiHit: Long,
+  maxDcStore: Int,
+  maxLsStore: Int,
+  cyclesAtEight: Long,
   wedgeDump: String
 ) {
   def report(): Unit = {
@@ -332,7 +336,9 @@ final case class WalkExcResult(
       f"walkStores=$walkStores excEntries=$excEntries excWithWalkGrant=$excWithWalkGrant")
     println(f"[walkexc] sledWalks=$sledWalks maxEDrainRun=$maxEDrainRun " +
       f"itlbRspFault=$itlbRspFault dtlbRspFault=$dtlbRspFault dcDiag=$dcDiag")
-    println(f"[walkexc] MISTRANSLATED AXI: badAr=$badAr badAw=$badAw")
+    println(f"[walkexc] MISTRANSLATED AXI: badAr=$badAr badAw=$badAw multiHit=$multiHit")
+    println(f"[walkexc] storeOutstanding: dcMax=$maxDcStore lsMirrorMax=$maxLsStore " +
+      f"cyclesAt8=$cyclesAtEight  (the 3-bit mirror wraps at 8)")
     if (badArLog.nonEmpty) print(badArLog)
     if (wedgeDump.nonEmpty) println(wedgeDump)
   }
@@ -427,6 +433,11 @@ object WalkExcHarness {
       var prevExcActive = false
       var tracePend = 0
       val ring = scala.collection.mutable.ArrayBuffer.empty[String]
+      var prevXrspValid = false
+      var multiHit = 0L
+      var maxDcStoreOutstanding = 0
+      var maxLsStoreOutstanding = 0
+      var dcStoreOutstandingAt8 = 0L
       var badAr = 0L
       var badAw = 0L
       var badArLog = ""
@@ -479,6 +490,51 @@ object WalkExcHarness {
               f"quiesceHold=${exc.quiesceHoldOut.toBoolean} " +
               f"maintWalking=${dut.dcache.logic.maintWalkingDbg.toBoolean}")
         }
+        // `LsEuPlugin.coreStOutstanding` is 3 bits; `DcachePlugin.storeOutstanding` is 4
+        // and asserts `<= 8`. The EIGHTH outstanding core store therefore wraps the
+        // mirror 7 -> 0 and spuriously satisfies `stGrantOk`'s `coreStOutstanding === 0`
+        // drain-to-zero term with eight core stores still in flight. Measure whether
+        // this posture actually reaches that point rather than arguing about it.
+        val dcSo = dut.dcache.logic.storeOutstanding.toInt
+        val lsSo = dut.lsEu.logic.coreStOutstanding.toInt
+        if (dcSo > maxDcStoreOutstanding) maxDcStoreOutstanding = dcSo
+        if (lsSo > maxLsStoreOutstanding) maxLsStoreOutstanding = lsSo
+        if (dcSo >= 8) dcStoreOutstandingAt8 += 1
+        // Every walker->TLB fill, and every non-one-hot lookup.
+        if (dut.dtlb.logic.dbgFillFire.toBoolean) {
+          ring += f"    cyc=$cyc%7d FILL vpn=0x${dut.dtlb.logic.dbgFillVpn.toLong}%05x " +
+            f"ppn=0x${dut.dtlb.logic.dbgFillPpn.toLong}%05x " +
+            f"walkVpn=0x${dut.dtlb.logic.dbgWalkVpn.toLong}%05x " +
+            f"walkerPpn=0x${dut.dtlb.logic.dbgWalkerRspPpn.toLong}%05x"
+          if (ring.size > 90) ring.remove(0)
+        }
+        val hc = dut.dtlb.logic.tlb.dbgHitCount.toInt
+        if (hc > 1) {
+          multiHit += 1
+          if (multiHit <= 3) {
+            ring += f"    cyc=$cyc%7d !!! DTLB MULTI-HIT: $hc ways matched vpn=0x" +
+              f"${dut.dtlb.logic.dbgReqVpn.toLong}%05x -- MuxOH select is not one-hot"
+            if (ring.size > 90) ring.remove(0)
+          }
+        }
+        // Which of the DTLB's four response classes answered each translation request.
+        if (dut.dtlb.logic.dbgReqFire.toBoolean) {
+          val cls =
+            if (dut.dtlb.logic.dbgTtHit.toBoolean) "TTR"
+            else if (!dut.dtlb.logic.dbgMmuEnable.toBoolean) "MMUOFF"
+            else if (dut.dtlb.logic.dbgTlbHit.toBoolean && !dut.dtlb.logic.dbgNeedsMRefresh.toBoolean) "TLBHIT"
+            else "MISS->WALK"
+          ring += f"    cyc=$cyc%7d XREQ vpn=0x${dut.dtlb.logic.dbgReqVpn.toLong}%05x $cls%-10s " +
+            f"entryPpn=0x${dut.dtlb.logic.dbgTlbEntryPpn.toLong}%05x"
+          if (ring.size > 90) ring.remove(0)
+        }
+        if (dut.dtlb.logic.rspValid.toBoolean && !prevXrspValid) {
+          ring += f"    cyc=$cyc%7d XRSP ppn=0x${dut.dtlb.logic.rspPayload.ppn.toLong}%05x " +
+            f"fault=${dut.dtlb.logic.rspPayload.fault.toBoolean} " +
+            f"tok=${dut.dtlb.logic.rspPayload.token.toInt}"
+          if (ring.size > 90) ring.remove(0)
+        }
+        prevXrspValid = dut.dtlb.logic.rspValid.toBoolean
         // Ring log of the shared D-cache LOAD port: every command accepted and every
         // response returned, with the ownership tag the arbiter attributed it to. A
         // mistranslation whose descriptor read never faulted can only come from the
@@ -644,8 +700,9 @@ object WalkExcHarness {
                           f"addr=0x${dut.dcache.logic.diagFaultAddr.toLong}%08x " +
                           f"kind=${dut.dcache.logic.diagFaultKind.toInt} " +
                           f"resp=${dut.dcache.logic.diagFaultResp.toInt}",
-                          badAr, badAw, badArLog,
-                          wedgeDump)
+                          badAr, badAw, badArLog, multiHit,
+                          maxDcStoreOutstanding, maxLsStoreOutstanding,
+                          dcStoreOutstandingAt8, wedgeDump)
     }
     out
   }
@@ -760,6 +817,24 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
         s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
         s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
     }
+  }
+
+  /** Determinism / robustness of the mistranslation reproducer. */
+  test("mistranslation reproducer is stable across sim seeds", VerilatorTest) {
+    val results = (1 to 6).map { seed =>
+      val r = WalkExcHarness.run(
+        TableStressProgram.src(6, dirtyTables = true, cpush = true, irqs = true,
+                               leafWritethrough = true, storeBurst = 12, storeGroups = 24),
+        timeoutCycles = 900000L, simSeed = seed, irqPeriod = 700, memCfg = slowMem)
+      println(f"[walkexc] seed=$seed sentinel=0x${r.sentinel}%08x badAr=${r.badAr} " +
+        f"badAw=${r.badAw} retired=${r.retired} cycles=${r.cycles}")
+      (seed, r)
+    }
+    val bad = results.count(_._2.badAr > 0)
+    println(s"[walkexc] mistranslation seen in $bad of 6 seeds")
+    assert(results.forall(_._2.badAr == 0),
+      s"MISTRANSLATION in $bad of 6 seeds: " +
+      results.filter(_._2.badAr > 0).map(t => s"seed ${t._1}").mkString(", "))
   }
 
   for ((name, dirty, cp, irq, period, mem) <- sledMatrix) {

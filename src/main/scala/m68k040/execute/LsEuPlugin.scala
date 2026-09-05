@@ -532,7 +532,24 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // CORE store credits: SQ drains AND exception-sequencer stores, minus CORE acks.
     // The store port is handed to a walker only at zero, so a walker's U/M store can
     // never interleave with a core store the untagged ack could then be attributed to.
-    val coreStOutstanding = Reg(UInt(3 bits)) init 0
+    //
+    // FOUR bits, mirroring the width of the count it shadows. `DcachePlugin`'s own
+    // `storeOutstanding` is 4 bits and asserts `storeOutstanding <= 8`, so EIGHT core
+    // stores can legally be in flight. At three bits this counter wrapped 7 -> 0 on the
+    // eighth and spuriously satisfied `stGrantOk`'s `coreStOutstanding === 0`
+    // drain-to-zero term with eight core stores outstanding -- handing the store port to
+    // a walker whose untagged `storeAck` then demultiplexes to the wrong client, and
+    // masking `sq.io.drainAck`/`coreStAck` (both are qualified `!walkStOutstanding`) for
+    // every core store whose ack lands inside the walker's window. The wrap also read
+    // back as a legal 0 to the `!(walkStOutstanding && coreStOutstanding =/= 0)`
+    // tripwire below, so the tripwire could not see it either.
+    //
+    // HONEST SCOPE: this is carried forward from `030651f` on the RTL argument, NOT on a
+    // measurement. `WalkerExcEntryWedgeSpec`'s store-port stress rows drive the D-cache
+    // to at most FOUR outstanding stores in every configuration (dcMax=4, mirror max=4,
+    // zero cycles at 8), so no test in this tree currently reaches the wrap. Widening is
+    // behaviourally identical below 8 and correct at and above it.
+    val coreStOutstanding = Reg(UInt(4 bits)) init 0
     coreStOutstanding.simPublic()
     sqEmptySig := sq.io.empty           // surfaced for the exception FSM's drain wait
     // Simulation-only visibility for the full-path exception/SQ arbitration proof.
