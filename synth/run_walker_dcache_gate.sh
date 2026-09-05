@@ -15,6 +15,26 @@
 # Example (the gate this work needs -- baseline first, then the change):
 #   synth/run_walker_dcache_gate.sh bb3bca1 baseline HEAD walker-dcache
 #
+# HOW TO ACTUALLY LAUNCH IT FROM AN AGENT SESSION. The header above is right that a
+# committed launcher is necessary, but it is NOT sufficient: something still has to
+# start it, and this environment reaps the STARTER's whole process tree. Measured twice
+# on 2026-09-05 -- `setsid nohup ... & disown` and a plain backgrounded run BOTH died
+# mid-`place_design`, leaving `Terminated "$RDI_PROG" "$@"` and "Parent process (pid N)
+# has died" in the arm's .out and no summary at all. The failure is silent: the outer
+# shell still reports exit 0.
+#
+# What survives is a user systemd unit, which is genuinely outside the caller's tree:
+#
+#   systemd-run --user --unit=m68k-gate --working-directory=/home/qwertyoruiop/m68k-core-040-ooo \
+#     --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+#     bash -lc 'synth/run_walker_dcache_gate.sh <ref> <label> ... > synth/gate.log 2>&1'
+#
+#   systemctl --user is-active m68k-gate     # still running?
+#   systemctl --user show m68k-gate -p Result,ExecMainStatus
+#
+# Check for `Terminated`/`Parent process ... has died` in the arm .out before trusting
+# ANY gate result: a killed arm produces a plausible-looking partial log and no summary.
+#
 # Each arm:
 #   1. waits for the Vivado mutex (flock, blocking -- it QUEUES, never forces),
 #   2. waits until the host actually has room for a full_impl (see wait_for_room),
