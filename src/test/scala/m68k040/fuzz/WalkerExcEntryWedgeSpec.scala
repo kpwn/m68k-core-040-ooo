@@ -80,8 +80,46 @@ object TableStressProgram {
     *                        leaves its page, so it cannot exhibit that at all. */
   def src(iterations: Int, pflushInHandler: Boolean = true,
           dirtyTables: Boolean = false, cpush: Boolean = false,
-          irqs: Boolean = false, sledPages: Int = 0): String = {
+          irqs: Boolean = false, sledPages: Int = 0,
+          leafWritethrough: Boolean = false,
+          storeBurst: Int = 0, storeGroups: Int = 24,
+          noWalk: Boolean = false): String = {
     require(sledPages == 0 || sledPages >= 2, "a sled needs at least two pages to hop")
+    require(storeGroups < 60, "the data leaf table only maps 64 pages")
+    // Leaf CM field (descriptor bits [6:5]). WRITETHROUGH stores are the ones the
+    // D-cache pipelines and counts in `storeOutstanding` (COPYBACK is stage-credit
+    // based and never gates on it), so a writethrough working set is what actually
+    // drives `LsEuPlugin.coreStOutstanding` towards its 3-bit wrap point.
+    val leafCmHex = if (leafWritethrough) "01" else "21"
+    // STORE-PORT STRESS. Each group first saturates the D-cache store pipeline with
+    // `storeBurst` writethrough stores on distinct 64 B lines INSIDE an already-mapped
+    // page (so none of them waits on a walk), and then touches a FRESH page, whose
+    // DTLB miss starts a walk whose U/M writeback needs the very store port those
+    // stores are occupying. That is the drain-to-zero hand-over `stGrantOk` guards
+    // with `coreStOutstanding === 0`.
+    val storeStress =
+      if (storeBurst == 0) ""
+      else {
+        val sb = new StringBuilder
+        sb ++= "    | ---- store-port stress: saturate the store pipe, then walk ----\n"
+        sb ++= "    move.l  #DATA_VA, %a2\n"
+        for (_ <- 0 until storeGroups) {
+          for (b <- 0 until storeBurst) sb ++= s"    move.l  %d7, ${b * 0x40}(%a2)\n"
+          sb ++= "    lea     0x1000(%a2), %a2\n"
+          sb ++= "    move.l  (%a2), %d0\n"
+        }
+        sb.toString
+      }
+    // Re-arm U=0/M=0 on every data leaf each iteration, so EVERY pass produces a fresh
+    // walker U/M writeback store instead of only the very first one (without this the
+    // whole run contains ~11 walker stores and the store direction is barely tested).
+    val reArmUm =
+      if (storeBurst == 0) ""
+      else s"""    lea     PGTD, %a0
+    move.l  #(DATA_VA+0x$leafCmHex), %d1
+    bsr     _fill64
+"""
+
     // The runaway sled: `sledPages` hops, one 4 KiB page apart, looping forever. Sized
     // ABOVE the 32-entry ITLB so every hop misses on every pass and every miss is a
     // real table walk. Never architecturally executed -- both handlers rewrite the
@@ -98,13 +136,20 @@ object TableStressProgram {
     val sledEntry = if (sledPages == 0) "" else "    bra     _rw0\n"
     val handlerFlush = if (pflushInHandler) "    pflusha\n" else ""
     val loopCpush    = if (cpush) "    cpusha  %bc\n" else ""
+    // The `noWalk` CONTROL. Byte-identical instruction stream, byte-identical memory
+    // model, same TC.E=1 -- but the TTRs cover everything, and a TTR hit resolves
+    // BEFORE the TLB, so not one table walk happens. Any behaviour that survives this
+    // substitution is not the walker's.
+    val dtt0Val = if (noWalk) "0x007FE000" else "0x0000E020"
+    val itt0Val = if (noWalk) "0x4000C000" else "0x00000000"
     val ttrBlock =
-      """    move.l  #0x0000E020, %d0               | DTT0: VA[31:24]==0x00 only, copyback
+      s"""    move.l  #$dtt0Val, %d0
     movec   %d0, %dtt0
     move.l  #0xFF00E060, %d0               | DTT1: 0xFF......, inhibited (sentinel)
     movec   %d0, %dtt1
-    moveq   #0, %d0                        | NO instruction-side TTR at all
+    move.l  #$itt0Val, %d0
     movec   %d0, %itt0
+    moveq   #0, %d0
     movec   %d0, %itt1
     move.l  #0x80008000, %d0               | CACR: DE | IE
     movec   %d0, %cacr
@@ -154,7 +199,7 @@ $ttrEarly
     | ---- leaf tables: 64 entries, PDT=01 resident, CM=01 copyback, U=0 M=0 so the
     | ---- FIRST touch of every page also runs a walker U/M writeback store.
     lea     PGTD, %a0
-    move.l  #(DATA_VA+0x21), %d1
+    move.l  #(DATA_VA+0x$leafCmHex), %d1
     bsr     _fill64
     lea     PGTC, %a0
     move.l  #0x40800021, %d1
@@ -186,7 +231,7 @@ $irqUnmask
     move.l  #$iterations, %d7
 _loop:
     pflusha
-$loopCpush    move.l  #DATA_VA, %a2
+$loopCpush$reArmUm$storeStress    move.l  #DATA_VA, %a2
     move.l  (%a2), %d0                     | DTLB walk + U writeback
     lea     0x1000(%a2), %a2
     move.l  %d0, (%a2)                     | DTLB walk + U/M writeback (store)
@@ -272,6 +317,12 @@ final case class WalkExcResult(
   stalledCycles: Long,
   sledWalks: Long,
   maxEDrainRun: Long,
+  itlbRspFault: Long,
+  dtlbRspFault: Long,
+  dcDiag: String,
+  badAr: Long,
+  badAw: Long,
+  badArLog: String,
   wedgeDump: String
 ) {
   def report(): Unit = {
@@ -279,7 +330,10 @@ final case class WalkExcResult(
       f"lastPc=0x$lastCommitPc%08x")
     println(f"[walkexc] itlbWalkCmds=$itlbWalkCmds dtlbWalkCmds=$dtlbWalkCmds " +
       f"walkStores=$walkStores excEntries=$excEntries excWithWalkGrant=$excWithWalkGrant")
-    println(f"[walkexc] sledWalks=$sledWalks maxEDrainRun=$maxEDrainRun")
+    println(f"[walkexc] sledWalks=$sledWalks maxEDrainRun=$maxEDrainRun " +
+      f"itlbRspFault=$itlbRspFault dtlbRspFault=$dtlbRspFault dcDiag=$dcDiag")
+    println(f"[walkexc] MISTRANSLATED AXI: badAr=$badAr badAw=$badAw")
+    if (badArLog.nonEmpty) print(badArLog)
     if (wedgeDump.nonEmpty) println(wedgeDump)
   }
 }
@@ -372,6 +426,13 @@ object WalkExcHarness {
       var lastPc = 0L
       var prevExcActive = false
       var tracePend = 0
+      val ring = scala.collection.mutable.ArrayBuffer.empty[String]
+      var badAr = 0L
+      var badAw = 0L
+      var badArLog = ""
+      var itlbRspFault = 0L
+      var dtlbRspFault = 0L
+      var firstFaultCyc = 0L
       var sledWalks = 0L
       var eDrainRun = 0L
       var maxEDrainRun = 0L
@@ -397,6 +458,68 @@ object WalkExcHarness {
         if (dut.dtlb.walkLoadCmd.valid.toBoolean && dut.dtlb.walkLoadCmd.ready.toBoolean) dtlbWalkCmds += 1
         if ((dut.itlb.walkStore.valid.toBoolean && dut.itlb.walkStore.ready.toBoolean) ||
             (dut.dtlb.walkStore.valid.toBoolean && dut.dtlb.walkStore.ready.toBoolean)) walkStores += 1
+        // A descriptor read that came back FAULTED. After 2db5bd3 this terminates the
+        // walk and is reported as NON_RESIDENT, i.e. it becomes an architectural access
+        // fault. The pre-existing dedicated walker AXI port never checked `rresp` at all,
+        // so this is a NEW way for a walk to fail.
+        if (dut.itlb.walkLoadRsp.valid.toBoolean && dut.itlb.walkLoadRsp.payload.fault.toBoolean) {
+          itlbRspFault += 1
+          if (firstFaultCyc == 0L) firstFaultCyc = cyc
+        }
+        if (dut.dtlb.walkLoadRsp.valid.toBoolean && dut.dtlb.walkLoadRsp.payload.fault.toBoolean) {
+          dtlbRspFault += 1
+          if (firstFaultCyc == 0L) firstFaultCyc = cyc
+          if (trace && dtlbRspFault <= 4)
+            println(f"[walkexc] cyc=$cyc%7d DTLB DESCRIPTOR READ FAULTED, descAddr=0x" +
+              f"${dut.dtlb.walkLoadCmd.payload.paddr.toLong}%08x " +
+              f"dcDiagFault=${dut.dcache.logic.diagFaultValid.toBoolean} " +
+              f"dcDiagAddr=0x${dut.dcache.logic.diagFaultAddr.toLong}%08x " +
+              f"dcDiagKind=${dut.dcache.logic.diagFaultKind.toInt} " +
+              f"ldOwner=${dut.lsEu.logic.ldOwner.toInt} " +
+              f"quiesceHold=${exc.quiesceHoldOut.toBoolean} " +
+              f"maintWalking=${dut.dcache.logic.maintWalkingDbg.toBoolean}")
+        }
+        // Ring log of the shared D-cache LOAD port: every command accepted and every
+        // response returned, with the ownership tag the arbiter attributed it to. A
+        // mistranslation whose descriptor read never faulted can only come from the
+        // walker having decoded the WRONG DATA, and this is where that is visible.
+        if (dut.dcache.logic.loadCmdPort.valid.toBoolean && dut.dcache.logic.loadCmdPort.ready.toBoolean) {
+          ring += f"    cyc=$cyc%7d CMD paddr=0x${dut.dcache.logic.loadCmdPort.payload.paddr.toLong}%08x " +
+            f"tok=${dut.dcache.logic.loadCmdPort.payload.token.toInt}%3d ldOwner=${dut.lsEu.logic.ldOwner.toInt}"
+          if (ring.size > 60) ring.remove(0)
+        }
+        if (dut.dcache.logic.loadRspPort.valid.toBoolean) {
+          ring += f"    cyc=$cyc%7d RSP data=0x${dut.dcache.logic.loadRspPort.payload.data.toBigInt}%08x " +
+            f"fault=${dut.dcache.logic.loadRspPort.payload.fault.toBoolean} " +
+            f"rspTag=${dut.lsEu.logic.ldRspTag.toInt} ldOwner=${dut.lsEu.logic.ldOwner.toInt}"
+          if (ring.size > 60) ring.remove(0)
+        }
+        // Every PHYSICAL address the D-cache actually puts on AXI. Everything this
+        // program can legally touch is in one of four windows; anything else is a
+        // MISTRANSLATION, and (because the sim model DECERRs an undecoded address) is
+        // also the only way this program can produce a vector-2 access fault without
+        // the MMU reporting a fault of its own.
+        def legal(a: Long): Boolean =
+          (a < 0x01000000L) || (a >= 0x40800000L && a < 0x40840000L) ||
+          (a >= 0x60000000L && a < 0x60040000L) || ((a >>> 16) == 0xffffL)
+        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
+          val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
+          if (!legal(a)) {
+            badAr += 1
+            if (badAr == 1L) {
+              badArLog += f"    AR  0x$a%08x @cyc $cyc ldOwner=${dut.lsEu.logic.ldOwner.toInt}%n"
+              badArLog += "    --- D-cache LOAD-port history leading up to it ---\n"
+              badArLog += ring.mkString("\n") + "\n"
+            }
+          }
+        }
+        if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) {
+          val a = dut.dcache.logic.axi.aw.payload.addr.toLong & 0xffffffffL
+          if (!legal(a)) {
+            badAw += 1
+            if (badAw <= 6) badArLog += f"    AW  0x$a%08x @cyc $cyc stOwner=${dut.lsEu.logic.stOwner.toInt}%n"
+          }
+        }
         // How long the entry drain actually lasts. If this stays at 1-2 cycles the
         // E_DRAIN livelock mechanism is not being stressed at all, whatever else the
         // run contains.
@@ -487,6 +610,11 @@ object WalkExcHarness {
         i("itlbWalkCmds", itlbWalkCmds); i("dtlbWalkCmds", dtlbWalkCmds)
         i("walkStores", walkStores); i("excEntries", excEntries)
         i("irqsInjected", irqsInjected); i("sledWalks", sledWalks)
+        i("itlbRspFault", itlbRspFault); i("dtlbRspFault", dtlbRspFault)
+        b("dc.diagFaultValid", dut.dcache.logic.diagFaultValid.toBoolean)
+        sb ++= f"  dc.diagFaultAddr       = 0x${dut.dcache.logic.diagFaultAddr.toLong}%08x\n"
+        i("dc.diagFaultKind", dut.dcache.logic.diagFaultKind.toInt.toLong)
+        i("dc.diagFaultResp", dut.dcache.logic.diagFaultResp.toInt.toLong)
         i("maxEDrainRun", maxEDrainRun)
         sb.toString
       }
@@ -510,7 +638,14 @@ object WalkExcHarness {
 
       out = WalkExcResult(word, cyc, retired, lastPc, itlbWalkCmds, dtlbWalkCmds,
                           walkStores, excEntries, excWithWalkGrant,
-                          cyc - lastRetireCyc, sledWalks, maxEDrainRun, wedgeDump)
+                          cyc - lastRetireCyc, sledWalks, maxEDrainRun,
+                          itlbRspFault, dtlbRspFault,
+                          f"valid=${dut.dcache.logic.diagFaultValid.toBoolean} " +
+                          f"addr=0x${dut.dcache.logic.diagFaultAddr.toLong}%08x " +
+                          f"kind=${dut.dcache.logic.diagFaultKind.toInt} " +
+                          f"resp=${dut.dcache.logic.diagFaultResp.toInt}",
+                          badAr, badAw, badArLog,
+                          wedgeDump)
     }
     out
   }
@@ -581,6 +716,51 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     ("sled+slowMem+cpush+irq",     true,  true,  true,  700, slowMem),
     ("sled+slowMemXbar+cpush+irq", true,  true,  true,  700, slowMemXbar)
   )
+
+  /** STORE-PORT stress.  `stGrantOk` hands the D-cache store port to a walker only on
+    * `coreStOutstanding === 0` -- a drain-to-zero hand-over.  `DcachePlugin`'s own
+    * `storeOutstanding` is 4 bits and asserts `<= 8`, while `LsEuPlugin`'s mirror is 3
+    * bits, so the EIGHTH outstanding core store wraps the mirror to 0 and satisfies the
+    * hand-over with eight core stores still in flight.  These rows drive the store pipe
+    * to that point while a walker U/M writeback is asking for the same port. */
+  //                        name                    wt    mem          burst irq  cpush noWalk
+  private val storeMatrix = Seq(
+    ("stores-copyback",        false, zeroLat,     12, true,  true,  false),
+    ("stores-wt",              true,  zeroLat,     12, true,  true,  false),
+    ("stores-wt+slowMem",      true,  slowMem,     12, true,  true,  false),
+    ("stores-wt+slowMem-deep", true,  slowMem,     20, true,  true,  false),
+    ("stores-wt+xbar-deep",    true,  slowMemXbar, 20, true,  true,  false),
+    // isolation of the slowMem failure
+    ("stores-wt+slowMem-noirq",   true, slowMem, 12, false, true,  false),
+    ("stores-wt+slowMem-nocpush", true, slowMem, 12, true,  false, false),
+    ("stores-wt+slowMem-bare",    true, slowMem, 12, false, false, false),
+    // THE CONTROL: identical program, identical memory model, TC.E still on, but the
+    // TTRs cover everything so not one table walk happens.
+    ("stores-wt+slowMem-NOWALK",  true, slowMem, 12, true,  true,  true),
+    ("stores-wt+slowMem-NOWALK-bare", true, slowMem, 12, false, false, true)
+  )
+
+  for ((name, wt, mem, burst, irq, cp, noWalk) <- storeMatrix) {
+    test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
+      val r = WalkExcHarness.run(
+        TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
+                               leafWritethrough = wt, storeBurst = burst,
+                               storeGroups = 24, noWalk = noWalk),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = if (irq) 700 else 0,
+        memCfg = mem, trace = sys.env.contains("WALKEXC_TRACE"))
+      println(s"[walkexc] --- $name ---")
+      r.report()
+      if (!noWalk) assert(r.walkStores > 50,
+        s"VACUOUS [$name]: only ${r.walkStores} walker U/M stores -- the store " +
+        "direction is not actually being stressed")
+      else assert(r.dtlbWalkCmds == 0 && r.itlbWalkCmds == 0,
+        s"CONTROL BROKEN [$name]: the no-walk control still walked " +
+        s"(itlb=${r.itlbWalkCmds} dtlb=${r.dtlbWalkCmds})")
+      assert(r.sentinel == WalkExcHarness.PassWord,
+        s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
+        s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+    }
+  }
 
   for ((name, dirty, cp, irq, period, mem) <- sledMatrix) {
     test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
