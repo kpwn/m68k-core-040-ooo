@@ -94,6 +94,17 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
     val ftqHeadBrLen      = out UInt (4 bits)
     val ftqConfirm        = out Bool ()
     val ftqCount          = out UInt (6 bits) // ftqDepth=32 -> log2Up(33)=6
+    // 2026-09-05 p141 walker-stall ILA taps. These are the SAME four packed
+    // words the live debug CSRs expose (DcachePlugin.dbgStallDcPack,
+    // LsEuPlugin.dbgStallGrantPack, ExceptionUnit.dbgStallExcPack, and both
+    // TableWalkers' io.dbgPack), re-driven onto ports so an ILA can sample them
+    // every cycle. Deliberately the identical bit layouts, so one decoder and
+    // one documented table serve both instruments and the two cannot drift.
+    val stallDc      = out Bits (32 bits)
+    val stallGrant   = out Bits (32 bits)
+    val stallExc     = out Bits (32 bits)
+    val stallWalk    = out Bits (32 bits)
+    val macroCountLo = out Bits (32 bits)
     Fiber.build {
       val rob = host[m68k040.rob.RobPlugin]
       normalIrqGate      := rob.logic.normalIrqGate
@@ -148,6 +159,26 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false)
       ftqHeadBrLen  := fap.logic.ftqHeadE.brLen
       ftqConfirm    := fap.logic.ftqConfirm
       ftqCount      := fap.logic.ftqCount.resized
+
+      // ── p141 walker-stall taps ──────────────────────────────────────────
+      // Hard `host[...]` rather than `host.get`, unlike DebugCtrlPlugin's
+      // readers of these same signals: `dbg040` only elaborates when
+      // `exposeDebugPorts` is set, which is the socket build, and that build
+      // always carries all four of these plugins. DebugCtrlPlugin needs the
+      // Option form because it ALSO builds in the Stage-1 standalone fixture,
+      // which hosts none of them.
+      stallDc    := host[m68k040.cache.DcachePlugin].logic.dbgStallDcPack
+      stallGrant := host[m68k040.execute.LsEuPlugin].logic.dbgStallGrantPack
+      stallExc   := rob.logic.exc.dbgStallExcPack
+      // DTLB in [15:0], ITLB in [31:16] -- the same packing the
+      // OFF_STALL_WALK CSR uses, so one decode table serves both.
+      stallWalk  := host[m68k040.mmu.ItlbPlugin].logic.walker.io.dbgPack ##
+                    host[m68k040.mmu.DtlbPlugin].logic.walker.io.dbgPack
+      // The ILA TRIGGER. This is the SAME counter OFF_INST_LO reads
+      // (RobPlugin's DebugCommitService.macroCount), so the freeze value
+      // measured from the board -- 0x0543222c -- can be used verbatim as an
+      // equality trigger with no unit conversion.
+      macroCountLo := rob.macroCount(31 downto 0).asBits
     }
   } else null
 }

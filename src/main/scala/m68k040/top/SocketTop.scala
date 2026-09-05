@@ -219,6 +219,29 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val dbg040_ftqHeadBrLen       = out UInt (4 bits)
   val dbg040_ftqConfirm         = out Bool ()
   val dbg040_ftqCount           = out UInt (6 bits)
+  // 2026-09-05 p141 walker-stall ILA taps. Same four packed words the live
+  // debug CSRs at 0x5090101C..0x50901028 already carry, plus the retire
+  // counter -- exported as ports so a real ILA can record them as a TIME
+  // SERIES rather than a single terminal sample.
+  //
+  // Why both a CSR and an ILA path for the same bits: the CSRs answer WHAT the
+  // machine is stuck on, the ILA answers HOW IT GOT THERE. A frozen read cannot
+  // distinguish a quiesce term that NEVER cleared from one that cleared and was
+  // RE-ARMED by a grant hand-over, nor from a hand-over that landed one cycle
+  // late relative to the drain entry. Those three imply different fixes and
+  // have identical terminal state, which is exactly the ambiguity that has been
+  // costing board cycles on this wedge.
+  //
+  // `macroCountLo` is the TRIGGER: the wedge freezes retire at a bit-identical
+  // count every boot, so an equality match on it fires on the exact cycle the
+  // machine stops, and a late TRIGGER_POSITION then fills the buffer with the
+  // cycles BEFORE the freeze -- the only ones that carry information, since the
+  // stall persists unchanged afterwards.
+  val dbg040_stallDc            = out Bits (32 bits)
+  val dbg040_stallGrant         = out Bits (32 bits)
+  val dbg040_stallExc           = out Bits (32 bits)
+  val dbg040_stallWalk          = out Bits (32 bits)
+  val dbg040_macroCountLo       = out Bits (32 bits)
 
   // ── Deferred wiring: everything that reads a plugin's `.logic` Handle ─────────────
   // Registered as a `spinal.core.fiber.Fiber.build` task -- the SAME generic async-fiber
@@ -424,6 +447,11 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     dbg040_ftqHeadBrLen        := socket.core.dbg040.ftqHeadBrLen
     dbg040_ftqConfirm          := socket.core.dbg040.ftqConfirm
     dbg040_ftqCount            := socket.core.dbg040.ftqCount
+    dbg040_stallDc             := socket.core.dbg040.stallDc
+    dbg040_stallGrant          := socket.core.dbg040.stallGrant
+    dbg040_stallExc            := socket.core.dbg040.stallExc
+    dbg040_stallWalk           := socket.core.dbg040.stallWalk
+    dbg040_macroCountLo        := socket.core.dbg040.macroCountLo
 
     // ── dbg_axi and the SoC-fabric control group pass straight through ─────────────
     // Socket groups 4 and 6. They are DEBUG-CTRL-OWNED (spec section 10) and this task adds,
