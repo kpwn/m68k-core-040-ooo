@@ -3114,8 +3114,39 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // True inside this arm (`!stSubLast` implies it, by `stSubLast`'s definition)
       // and this site does not write it, so the new value is a literal True.
       stSubLastReg := stSubLastOf(True, newStSubP, stSubEnd, newStSubLog2)
-      stAwDone := False
-      stWDone  := False
+      // 2026-09-05: the SAME `!evictAxiPairOpen && !maintAxiPairOpen` gate the other two
+      // kickoff sites carry (:2933 and :2957). This site is the third writer of
+      // `stAwDone`/`stWDone` and was the only one WITHOUT it -- a real hole, not a
+      // stylistic gap, because `storeWantsAxi` is derived from these two flags and
+      // EVICT_WR's AXI drive is gated on it (:1811/:1820).
+      //
+      // Un-gated, the sequence is: at cycle T, `stAwDone` still reads True (a registered
+      // write lands on the NEXT edge), so `storeWantsAxi` is False and EVICT_WR is
+      // presenting AW(evictAddr, id=D_PUSH). If the fabric does not accept it that cycle,
+      // then at T+1 `storeWantsAxi` goes True, EVICT_WR's drive is gated OFF, and the
+      // store's own `when(!stAwDone)` drive takes over -- AWVALID stays continuously
+      // high, but its ADDR and ID CHANGE mid-handshake. That is an AXI4 violation, and on
+      // this SoC it is a silent-corruption path rather than a tolerated one: `axi_xbar.v`
+      // LATCHES AND COMMITS a request in the cycle AWVALID is first seen
+      // (`axi_xbar.v:2789-2810`) and only pulses AWREADY one cycle later, without
+      // re-validating. The xbar therefore commits the EVICTION's address and id, the
+      // STORE consumes the AWREADY and believes its own write was accepted, the W beat
+      // that follows carries the STORE's data, and the single B comes back tagged
+      // `ws_mid == D_PUSH` -- so the store's `=== D_STORE` demux never sees its ack and
+      // `storeOutstanding` never drains.
+      //
+      // Deferring through `pendingWtKickoff` is exactly what the two sibling sites do,
+      // and its consumer (:2957) is source-ordered ABOVE this block, so the deferred
+      // kickoff fires on the first cycle EVICT_WR's pair is closed. `pendingWtKickoff` is
+      // itself a `dcIdleForMaint` term, so a deferred kickoff can never be silently
+      // stranded. `stSubP`/`stSubLog2Reg`/`stSubLastReg` still advance unconditionally
+      // above -- only the AXI re-arm is held.
+      when(!evictAxiPairOpen && !maintAxiPairOpen) {
+        stAwDone := False
+        stWDone  := False
+      } otherwise {
+        pendingWtKickoff := True
+      }
       stSubErr := stSubErr || storeBErr
     }
     // FMax retime: `stSubActive := False` forces `stSubLast` True by definition, and
