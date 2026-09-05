@@ -2,6 +2,7 @@ package m68k040.mmu
 
 import m68k040.cache.CacheMode
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 
 /** One TLB (address translation cache) entry. `valid` is held in a separate
@@ -53,8 +54,12 @@ object Tlb {
   *  - fill   : pulse `fillValid` with `fillVpn`/`fillEntry`; written this cycle.
   *  - invalidateAll : pulse to clear all valid bits (PFLUSH-style).
   *
-  * All valid bits are RegInit(False); the round-robin victim per (bank,set) is a
-  * RegInit. No uninitialised state. */
+  * All valid bits are RegInit(False) and the round-robin victim per (bank,set) is a
+  * RegInit, so no entry can be READ before it is written. `tags`/`ppns` and the other
+  * payload arrays are deliberately plain `Reg` (no init) -- they are only ever reachable
+  * through a set `valid` bit. NOTE: that guarantee depends on `hitVec` being ONE-HOT,
+  * which is why the fill replaces a resident way rather than allocating a duplicate;
+  * see the fill block. */
 class Tlb(entries: Int = Tlb.DefaultEntries,
           ways: Int = Tlb.DefaultWays,
           banks: Int = Tlb.DefaultBanks) extends Component {
@@ -122,12 +127,46 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   }
   io.hit      := hitVec.orR
   io.hitEntry := MuxOH(hitVec, entVec)
+  // sim-only: `MuxOH` is only defined for a ONE-HOT select. Nothing in the fill path
+  // checks whether the VPN is already resident in another way, so two ways of the same
+  // (bank,set) could end up holding the same tag -- and then `MuxOH` returns the
+  // contents of a way that did not match at all (its index is derived by OR-ing the set
+  // bit positions, so ways {0,1,2} select index 3). The fill below now replaces a
+  // resident way instead of allocating a duplicate; this counter stays as the tripwire
+  // that keeps that invariant honest.
+  val dbgHitCount = CountOne(hitVec); dbgHitCount.simPublic()
 
-  // ---- fill (round-robin victim within the target bank/set) ----
+  // ---- fill (replace-in-place if resident, else round-robin victim) ----
+  //
+  // A fill of a VPN that is ALREADY RESIDENT must REPLACE that way and must NOT
+  // allocate a second one.  Two ways of one set holding the same tag make the lookup's
+  // `hitVec` non-one-hot, and `MuxOH` is only defined for a one-hot select: measured on
+  // this component (`TlbDuplicateFillSpec`), three fills of one VPN make three ways
+  // match and the lookup then returns the contents of a way that never matched at all
+  // -- a PPN nobody ever wrote, delivered upward as a valid, NON-FAULTING translation.
+  // On the full core that reaches AXI as a read of an unrelated physical page
+  // (`WalkerExcEntryWedgeSpec` caught 0xae0cf000 for a VA whose only descriptor says
+  // 0x60008) with no fault reported by the MMU, the D-cache or the walker.
+  //
+  // Refilling a resident VPN is reachable BY DESIGN, not just in theory:
+  // `DtlbPlugin.needsMRefresh` (task #210, MC68040 UM S3.3) deliberately re-walks an
+  // already-resident VPN when a write hits an entry whose `modified` bit is clear, and
+  // that re-walk ends in this very fill.  So an ordinary read-then-write to a page whose
+  // leaf descriptor starts M=0 duplicates that page's entry.
   val flBank = bankOf(io.fillVpn)
   val flSet  = setOf(io.fillVpn)
   val flTag  = tagOf(io.fillVpn)
-  val flWay  = victim(flBank)(flSet)
+  val flResidentVec = Vec(Bool(), ways)
+  for (w <- 0 until ways) {
+    flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag)
+  }
+  val flResident = flResidentVec.orR
+  // `OHMasking.first` rather than a bare `OHToUInt`: a PRIORITY pick is well-defined
+  // even if a duplicate somehow already exists, so this replacement path can never
+  // itself select a way that did not match. `OHToUInt` on a non-one-hot vector is
+  // exactly the bug being fixed and must not be reintroduced here.
+  val flWay = Mux(flResident, OHToUInt(OHMasking.first(flResidentVec)),
+                  victim(flBank)(flSet))
   when(io.fillValid) {
     for (b <- 0 until banks; w <- 0 until ways) {
       val bankMatch = if (bankBits == 0) True else flBank === U(b, bankBits bits)
@@ -141,7 +180,10 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
         modif(b)(w)(flSet)  := io.fillEntry.modified
       }
     }
-    victim(flBank)(flSet) := flWay + 1
+    // Only a genuine ALLOCATION advances the round-robin victim. A replace-in-place
+    // must not, or an M-refresh would still churn the victim and evict a live way for
+    // no reason.
+    when(!flResident) { victim(flBank)(flSet) := flWay + 1 }
   }
 
   // ---- invalidateAll (priority clear) ----

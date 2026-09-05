@@ -323,6 +323,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       }
     }
 
+    // ── sim-only observation taps (no RTL consumer; pruned from every netlist) ──
+    // Added while chasing a silent MISTRANSLATION found by WalkerExcEntryWedgeSpec: a
+    // core load issued AXI to a physical address whose PPN matched no descriptor in
+    // memory, with no fault reported anywhere. These make it possible to say WHICH of
+    // the four response classes above produced a given PPN instead of inferring it.
+    rspValid.simPublic(); rspPayload.simPublic()
+    val dbgFillFire = Bool(); dbgFillFire := False; dbgFillFire.simPublic()
+    val dbgTtHit         = ttHit;         dbgTtHit.simPublic()
+    val dbgTlbHit        = tlbHit;        dbgTlbHit.simPublic()
+    val dbgNeedsMRefresh = needsMRefresh; dbgNeedsMRefresh.simPublic()
+    val dbgTlbEntryPpn   = tlbEntry.ppn;  dbgTlbEntryPpn.simPublic()
+    val dbgReqFire       = _req.fire;     dbgReqFire.simPublic()
+    val dbgReqVpn        = _req.payload.vpn; dbgReqVpn.simPublic()
+    val dbgMmuEnable     = mmuEnable;     dbgMmuEnable.simPublic()
+
     // Real 68040 semantics: a supervisor-space access walks SRP, a user-space
     // access walks URP (task #131 — previously both shared ONE `rootPtr`, which
     // was architecturally wrong: MOVEC-driven user code couldn't have its OWN
@@ -405,7 +420,20 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       when(!walker.io.rsp.fault && !walkFlushPoison && !flushAll && !walkUmPoison) {
         tlb.io.fillValid := True
       }
+      // sim-only taps for the walker->TLB fill (see the `simPublic` block above).
+      dbgFillFire := tlb.io.fillValid
     }
+
+    // sim-only taps for the fill payload and the walk-poison state.
+    val dbgFillVpn         = tlb.io.fillVpn;      dbgFillVpn.simPublic()
+    val dbgFillPpn         = tlb.io.fillEntry.ppn; dbgFillPpn.simPublic()
+    val dbgWalkerDone      = walker.io.done;      dbgWalkerDone.simPublic()
+    val dbgWalkerRspPpn    = walker.io.rsp.ppn;   dbgWalkerRspPpn.simPublic()
+    val dbgWalkerRspFault  = walker.io.rsp.fault; dbgWalkerRspFault.simPublic()
+    val dbgWalkFlushPoison = walkFlushPoison;     dbgWalkFlushPoison.simPublic()
+    val dbgWalkUmPoison    = walkUmPoison;        dbgWalkUmPoison.simPublic()
+    val dbgFlushAll        = flushAll;            dbgFlushAll.simPublic()
+    val dbgWalkVpn         = walkVpn;             dbgWalkVpn.simPublic()
 
     // PFLUSHA clears the response slot and prevents a pre-flush in-flight walk from
     // refilling the just-invalidated ATC. Branch/exception flush may retain a
