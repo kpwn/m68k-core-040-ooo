@@ -121,7 +121,8 @@ object TableStressProgram {
           noWalk: Boolean = false,
           pages8K: Boolean = false,
           faultData: Boolean = false, faultInHandler: Boolean = false,
-          faultHandlerPage: Boolean = false, faultSled: Boolean = false): String = {
+          faultHandlerPage: Boolean = false, faultSled: Boolean = false,
+          faultSuper: Boolean = false): String = {
     // ---- page-size-dependent geometry (task #195 semantics) ----
     // Root index = VA[31:25] (7 bits, 32 MiB per entry)  -- page-size independent.
     // Ptr index  = VA[24:18] (7 bits, 256 KiB per entry) -- page-size independent.
@@ -133,7 +134,7 @@ object TableStressProgram {
     val leafN  = if (pages8K) 32 else 64
     val tcHex  = if (pages8K) "0x0000C000" else "0x00008000"
     val tcCmt  = if (pages8K) "TC: E=1, P=1 (8 KiB pages)" else "TC: E=1, 4 KiB pages"
-    val anyFault = faultData || faultInHandler || faultHandlerPage || faultSled
+    val anyFault = faultData || faultInHandler || faultHandlerPage || faultSled || faultSuper
     // The fault rows need STATIC code-page indices (a descriptor is broken by absolute
     // address from the loop body, so the handler's page number must be known at assembly
     // time).  `.balign` gives whatever page the preceding code happened to end on, so
@@ -245,6 +246,16 @@ _irq_handler:
     val hpgR = leafN - 2   // the same pair, but touched INSIDE the A-line handler
     val hpgW = leafN - 1
     val leafCmWp = leafCmHex.take(1) + "5"   // PDT=01 | W=1 | same CM
+    // The SUPERVISOR case. Descriptor bit 7 (MmuTypes.pgSupervisor) marks a page
+    // supervisor-only; a USER access to it makes the walk return
+    // MmuFaultReason.SUPERVISOR -- the third of the walker's three permission exits
+    // (NON_RESIDENT / WRITE_PROTECT / SUPERVISOR) and the only one this posture could
+    // not reach at all, because everything it ran was supervisor code. Reaching it also
+    // makes the run exercise `walker.io.req.rootPtr := Mux(isSuper, srp, urp)` on the
+    // URP leg for the first time, and takes an exception FROM user mode (so entry
+    // switches the active stack pointer, which supervisor-only entries never do).
+    val spg = leafN - 5
+    val leafCmSu = f"${Integer.parseInt(leafCmHex, 16) | 0x80}%02X"   // PDT=01 | S=1
     // Break the descriptors again at the top of every iteration -- the vector-2 handler
     // repairs them, so without this only the first pass would fault. Placed AFTER
     // `reArmUm` (which rewrites the whole data leaf table) so it is not undone.
@@ -256,6 +267,8 @@ _irq_handler:
         sb ++= s"    move.l  #0, PGTD+${fpgR * 4}\n"
         sb ++= s"    move.l  #(${dva(fpgW)}+0x$leafCmWp), PGTD+${fpgW * 4}\n"
       }
+      if (faultSuper)
+        sb ++= s"    move.l  #(${dva(spg)}+0x$leafCmSu), PGTD+${spg * 4}\n"
       if (faultInHandler) {
         sb ++= s"    move.l  #0, PGTD+${hpgR * 4}\n"
         sb ++= s"    move.l  #(${dva(hpgW)}+0x$leafCmWp), PGTD+${hpgW * 4}\n"
@@ -284,6 +297,26 @@ _irq_handler:
       else s"""    move.l  ${dva(hpgR)}, %d5              | NESTED access fault (inside vec 10)
     move.l  %d5, ${dva(hpgW)}              | NESTED access fault (inside vec 10)
 """
+    // The user-mode excursion. `move.w #0, %sr` drops to USER mode (S=0, IPL 0); the
+    // load then walks URP with isSuper=0 against a descriptor whose S bit is set, which
+    // is the SUPERVISOR fault exit. The vector-2 handler clears S and RTEs, so the load
+    // retries and succeeds; `trap #1` then returns to supervisor by SETTING S in its own
+    // stacked SR before RTE (the standard 68k way back up -- RTE restores SR from the
+    // frame, so A7 reverts to the ISP and the loop's privileged `pflusha` is legal again).
+    val superVec  = if (faultSuper)
+      "    move.l  #_trap1_handler, VBR_BASE+132  | vec 33  TRAP #1 (back to supervisor)\n" else ""
+    val superSite = if (!faultSuper) "" else s"""    | ---- user-mode excursion: a supervisor-only page faults from USER mode ----
+    move.l  #USTACK, %a0
+    move.l  %a0, %usp
+    move.w  #0x0000, %sr                   | S=0 -> USER mode
+    move.l  ${dva(spg)}, %d6                | supervisor-only page -> vector 2
+    trap    #1                             | back to supervisor
+"""
+    val superHandler = if (!faultSuper) "" else """
+_trap1_handler:
+    ori.w   #0x2000, (%a7)                 | set S in the stacked SR
+    rte
+"""
     // The vector-2 handler. Repairs EVERY page this program deliberately breaks (the
     // repair is idempotent, so it does not need to know which one faulted) and RTEs
     // from the format-$7 frame. Lives on a page that is never broken.
@@ -296,11 +329,12 @@ _bus_handler:
     move.l  #(${dva(fpgW)}+0x$leafCmHex), PGTD+${fpgW * 4}
     move.l  #(${dva(hpgR)}+0x$leafCmHex), PGTD+${hpgR * 4}
     move.l  #(${dva(hpgW)}+0x$leafCmHex), PGTD+${hpgW * 4}
+    move.l  #(${dva(spg)}+0x$leafCmHex), PGTD+${spg * 4}
     move.l  #(${cva(TrapPg)}+0x21), PGTC+${TrapPg * 4}
 ${(0 until sledBreak).map(i =>
       s"    move.l  #(${cva(SledPg + i)}+0x21), PGTC+${(SledPg + i) * 4}\n").mkString}    pflusha
     rte
-"""
+$superHandler"""
     val busVec = if (anyFault) "    move.l  #_bus_handler, VBR_BASE+8     | vec 2  access fault\n" else ""
     // 8 KiB only: the second code leaf table (see PgtC2).
     val code2Link = if (needCode2)
@@ -323,6 +357,7 @@ ${(0 until sledBreak).map(i =>
     .equ PGTC,      0x00204000
     .equ PGTC2,     0x00205000
     .equ DATA_VA,   0x60000000
+    .equ USTACK,    0x00028000
 
 _start:
     lea     0x00030000, %a7
@@ -364,7 +399,7 @@ _vt:
     bne     _vt
     move.l  #_aline_handler, VBR_BASE+40    | vec 10  A-line
     move.l  #_trap0_handler, VBR_BASE+128   | vec 32  TRAP #0
-$busVec$irqVec
+$busVec$superVec$irqVec
     | ---- restricted TTR posture: the INSTRUCTION side gets no TTR at all ----
 $ttrLate    move.l  #ROOT, %d0
     movec   %d0, %urp
@@ -396,7 +431,7 @@ ${sledEntry}_after_aline:
     move.l  %d2, (%a2)
     trap    #0
 ${sledEntry}_after_trap:
-    subq.l  #1, %d7
+$superSite    subq.l  #1, %d7
     bne     _loop
 
 _pass:
@@ -943,10 +978,10 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
         irqs = true, leafWritethrough = true, storeBurst = 20, storeGroups = 24, pages8K = p8))
       check(tag(p8, "noWalk"), TableStressProgram.src(6, dirtyTables = true, cpush = true,
         irqs = true, leafWritethrough = true, storeBurst = 12, noWalk = true, pages8K = p8))
-      for ((n, fd, fh, fe, fs, cp, irq, _) <- faultMatrix)
+      for ((n, fd, fh, fe, fs, su, cp, irq, _) <- faultMatrix)
         check(tag(p8, n), TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
           sledPages = if (fs) 12 else 0, pages8K = p8, faultData = fd, faultInHandler = fh,
-          faultHandlerPage = fe, faultSled = fs))
+          faultHandlerPage = fe, faultSled = fs, faultSuper = su))
     }
   }
 
@@ -1127,25 +1162,28 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
   // BYTE-IDENTICAL vector histograms (2:18,10:24,32:39) and `itlbFaultSeen=false` on the
   // row whose entire point was an I-side fault -- two of the three rows were vacuous and
   // said nothing about it. One row per case; one combined row at the end.
-  //                       name            data   nested entry  sled   cpush  irq   mem
+  //                       name            data   nested entry  sled   super  cpush  irq   mem
   private val faultMatrix = Seq(
-    ("faults-data",        true,  false, false, false, false, false, zeroLat),
-    ("faults-nested",      false, true,  false, false, false, false, zeroLat),
-    ("faults-entry",       false, false, true,  false, true,  false, zeroLat),
-    ("faults-wrongpath",   false, false, false, true,  true,  false, zeroLat),
-    ("faults-all",         true,  true,  true,  true,  true,  true,  zeroLat),
-    ("faults-all+slowMem", true,  true,  true,  true,  true,  true,  slowMem),
-    ("faults-all+xbar",    true,  true,  true,  true,  true,  true,  slowMemXbar)
+    ("faults-data",        true,  false, false, false, false, false, false, zeroLat),
+    ("faults-nested",      false, true,  false, false, false, false, false, zeroLat),
+    ("faults-entry",       false, false, true,  false, false, true,  false, zeroLat),
+    ("faults-wrongpath",   false, false, false, true,  false, true,  false, zeroLat),
+    ("faults-super",       false, false, false, false, true,  false, false, zeroLat),
+    ("faults-super+cpush", false, false, false, false, true,  true,  true,  slowMem),
+    ("faults-all",         true,  true,  true,  true,  true,  true,  true,  zeroLat),
+    ("faults-all+slowMem", true,  true,  true,  true,  true,  true,  true,  slowMem),
+    ("faults-all+xbar",    true,  true,  true,  true,  true,  true,  true,  slowMemXbar)
   )
 
-  for (p8 <- pageSizes; (name0, fd, fh, fe, fs, cp, irq, mem) <- faultMatrix) {
+  for (p8 <- pageSizes; (name0, fd, fh, fe, fs, su, cp, irq, mem) <- faultMatrix) {
     val name = tag(p8, name0)
     test(s"faulting walks [$name] make forward progress", VerilatorTest) {
       val r = WalkExcHarness.run(
         TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
                                sledPages = if (fs) 12 else 0, pages8K = p8,
                                faultData = fd, faultInHandler = fh,
-                               faultHandlerPage = fe, faultSled = fs),
+                               faultHandlerPage = fe, faultSled = fs,
+                               faultSuper = su),
         timeoutCycles = 900000L, simSeed = 1, irqPeriod = if (irq) 700 else 0,
         memCfg = mem, trace = sys.env.contains("WALKEXC_TRACE"),
         codeTop = codeTopFor(p8))
@@ -1155,7 +1193,7 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
         s"VACUOUS [$name]: no real table walk occurred")
       // A broken descriptor that never produced a fault has tested nothing, and that
       // failure is otherwise completely silent.
-      if (fd || fh || fe)
+      if (fd || fh || fe || su)
         assert(r.vec2Entries > 0,
           s"VACUOUS [$name]: no vector-2 access fault was ever delivered " +
           s"(vectors=${r.vecHist.toSeq.sortBy(_._1).mkString(",")})")
@@ -1166,8 +1204,8 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
       // which side wins the race is not determined by the program (the repair is global,
       // so whichever page faults first suppresses the rest), so asserting a side there
       // would be asserting a coincidence.
-      val isolated = Seq(fd, fh, fe, fs).count(identity) == 1
-      if (isolated && (fd || fh)) assert(r.dtlbFaultSeen, s"VACUOUS [$name]: the DTLB never faulted")
+      val isolated = Seq(fd, fh, fe, fs, su).count(identity) == 1
+      if (isolated && (fd || fh || su)) assert(r.dtlbFaultSeen, s"VACUOUS [$name]: the DTLB never faulted")
       if (isolated && fe) assert(r.itlbFaultSeen,
         s"VACUOUS [$name]: the ITLB never reported a faulting translation -- the " +
         s"exception-entry redirect walk never happened (itlbWalkCmds=${r.itlbWalkCmds})")
