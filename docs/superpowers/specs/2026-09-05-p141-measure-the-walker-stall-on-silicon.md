@@ -181,3 +181,85 @@ Two informative outcomes:
 And one that is a finding rather than a failure: if adding four CSR reads makes
 the wedge disappear, that means it is **perturbation-sensitive**, which is
 itself diagnostic and must be reported as such rather than quietly re-rolled.
+
+---
+
+# RESULT — measured on silicon 2026-09-05
+
+The wedge reproduced and the stall words are **bit-identical on every wedged
+boot**:
+
+```
+dc=0x0003c002  grant=0x08000000  exc=0x00000203  walk=0x00210028
+```
+
+A/B against the preserved p133 artifact, interleaved, same session:
+p133 **retire ADVANCING** every cycle; p141 **retire FROZEN** every cycle, at
+`0x40806b68`. Screens were mixed on both arms, as expected — retire liveness is
+the discriminator, not the screen.
+
+## What is stuck
+
+| word | reading |
+|---|---|
+| D-cache | **`busy` is the ONLY blocking term.** All sixteen other `dcIdleForMaint` terms are clear: `storeOutstanding=0`, all four AXI `*Done` flags set, every load/store pipeline stage empty. |
+| grant | **`ldOwner=CORE`, `stOwner=CORE`, `walkGrantHeld=0`, `walkerPortWedge=0`.** No walker holds any D-cache port. `store.valid=1 / store.ready=0`. |
+| ExceptionUnit | **`E_STWAIT`**, `active=1`, `sqDrained=1`, **`dcQuiesced=0`**. |
+| walkers | **DTLB in `RD_PAGE`, `cmdSent=1`**, `loadCmd.valid=0`, `loadRsp.valid=0`. ITLB `IDLE`. |
+
+## The deadlock, stated plainly
+
+1. The A-line trap at `0x40806b68` enters the ExceptionUnit, which reaches
+   `E_STWAIT` — it is pushing the exception frame and waiting on the store.
+2. That store is presented and **refused**: `store.valid=1, store.ready=0`.
+3. It is refused because the D-cache is **`busy`** — and `busy` is False *only*
+   in the load FSM's `IDLE` state (`DcachePlugin.scala:1442`; it is set in
+   `EVICT_WR`, `REFILL` and `REPLAY`). So the load FSM is parked in a
+   miss/fill state and never returns to `IDLE`.
+4. It is parked there on behalf of the **DTLB walker**, which sits in `RD_PAGE`
+   with `cmdSent=1` — its page-descriptor read was **accepted** and it is
+   waiting for a response that never arrives.
+5. `busy` never clears → `dcIdleForMaint` never asserts → `dcQuiesced` stays 0
+   → the exception store is never accepted → retire never advances.
+
+## Two hypotheses this kills
+
+**"A walker holds the port and starves the core."** Refuted directly:
+`walkGrantHeld=0`, `ldOwner=stOwner=CORE`, `walkerPortWedge=0`. The walker
+released the grant on acceptance, exactly as `LsEuPlugin.scala:3379` specifies.
+This is consistent with — and now explains — why `030651f` (adding
+`E_DRAIN`/`R_DRAIN` to `quiesceHoldOut`) was verified active in the p140 netlist
+and **still wedged**: it was defending a grant hand-over that was never the
+problem.
+
+**"The exception sequencer is stuck in a DRAIN state."** It is not. It is in
+`E_STWAIT`, past the drain, blocked on a store the D-cache will not take.
+
+## Where the bug is
+
+Not in the arbiter and not in the ExceptionUnit. It is a **lost or misrouted
+D-cache load response for an accepted DTLB descriptor read**: the walker's
+command was consumed (`cmdSent=1`, grant released), but no `loadRsp` was ever
+delivered back to it, so both the walker and the D-cache load FSM wait forever.
+The prime suspects are the response-routing path arm C introduced — the
+ownership FIFO and its `ldRspTag` demux in `LsEuPlugin` — and whichever of
+`EVICT_WR`/`REFILL`/`REPLAY` the load FSM is parked in.
+
+`busy` alone does not say which of those three states it is. That is the first
+thing the next probe round should add, alongside the ownership-FIFO occupancy
+and `ldRspTag`.
+
+## Caveat, reported not buried
+
+This bitstream's `fabric_clk100` is **WNS +1.329 ns, 0 failing of 272165**
+(better than p140's +0.547) and **WHS +0.010, 0 failing of 272117** intra-clock.
+But the `pb_clk → fabric_clk100` group has **one failing hold endpoint,
+WHS −0.177 ns**, on
+`u_pb_s1_cdc/u_bridge/ar_fifo/rptr_gray_reg[2]` → its 2-flop synchroniser — a
+gray-code CDC pointer in the peripheral-bus bridge. p140 met that same path by
+only **+0.021 ns**, so both builds are marginal on what is an unconstrained
+asynchronous crossing that arguably should carry `set_false_path`/
+`set_max_delay -datapath_only` rather than be hold-analysed at all. It is in the
+peripheral bus, not the CPU/walker/D-cache path, so it does not explain a
+CPU-internal deadlock that is bit-identical across boots — but it is a real
+constraint gap and should be closed on its own merits.
