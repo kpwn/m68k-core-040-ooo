@@ -53,11 +53,72 @@ object TableStressProgram {
   val PgtC = 0x00204000L   // PtrB[32] -> VA 0x40800000..0x4083FFFF  (code)
   val DataVa = 0x60000000L
 
-  /** @param iterations how many (A-line + TRAP) rounds to run
+  /** @param iterations      how many (A-line + TRAP) rounds to run
     * @param pflushInHandler whether the handlers also flush, i.e. whether an ITLB walk
-    *        is forced on the RTE-side redirect as well as the entry-side one */
-  def src(iterations: Int, pflushInHandler: Boolean = true): String = {
+    *                        is forced on the RTE-side redirect as well as the entry one
+    * @param dirtyTables     install DTT0 + `CACR.DE` BEFORE building the page tables, so
+    *                        the tables sit DIRTY in the copyback L1D while the walker
+    *                        reads them.  This is the state real boot code leaves them in
+    *                        and the exact coherency case `2db5bd3` exists to fix, so it
+    *                        exercises the new walker->L1D path far harder than building
+    *                        the tables with the cache off.
+    * @param cpush           emit `cpusha %bc` in the loop.  This is the ONLY thing that
+    *                        makes `quiesceHold` actually assert (S_DRAIN / S_APPLY /
+    *                        S_MAINTWAIT), i.e. the mechanism under investigation.
+    * @param irqs            unmask interrupts and install an autovector-30 handler on
+    *                        its own code page, so the harness can inject ASYNCHRONOUS
+    *                        exception entries that land at arbitrary points inside a
+    *                        walk -- unlike A-line/TRAP, which can only fire at commit.
+    * @param sledPages       size, in 4 KiB pages, of a RUNAWAY SLED planted immediately
+    *                        after each trapping instruction -- the structural ingredient
+    *                        a small directed program cannot otherwise have.  `030651f`'s
+    *                        claimed mechanism is that during `E_DRAIN` the frontend is
+    *                        NOT quiesced and runs away down the wrong path; every page it
+    *                        runs into is an ITLB miss, and after `2db5bd3` every ITLB
+    *                        miss is a table walk that re-arms exactly the terms
+    *                        `dcQuiesced` waits on.  A one-page program's runaway never
+    *                        leaves its page, so it cannot exhibit that at all. */
+  def src(iterations: Int, pflushInHandler: Boolean = true,
+          dirtyTables: Boolean = false, cpush: Boolean = false,
+          irqs: Boolean = false, sledPages: Int = 0): String = {
+    require(sledPages == 0 || sledPages >= 2, "a sled needs at least two pages to hop")
+    // The runaway sled: `sledPages` hops, one 4 KiB page apart, looping forever. Sized
+    // ABOVE the 32-entry ITLB so every hop misses on every pass and every miss is a
+    // real table walk. Never architecturally executed -- both handlers rewrite the
+    // stacked PC past the `bra` that enters it.
+    val sled =
+      if (sledPages == 0) ""
+      else (0 until sledPages).map { i =>
+        val j = (i + 1) % sledPages
+        // The wrap-around hop is ~192 KB backwards, past `braw`'s +-32 KB range, so it
+        // has to be the 32-bit-displacement form explicitly.
+        val op = if (j < i) "bral" else "bra "
+        s"    .balign 4096\n_rw$i:\n    $op    _rw$j\n"
+      }.mkString("\n    | ---- runaway sled ----\n", "", "")
+    val sledEntry = if (sledPages == 0) "" else "    bra     _rw0\n"
     val handlerFlush = if (pflushInHandler) "    pflusha\n" else ""
+    val loopCpush    = if (cpush) "    cpusha  %bc\n" else ""
+    val ttrBlock =
+      """    move.l  #0x0000E020, %d0               | DTT0: VA[31:24]==0x00 only, copyback
+    movec   %d0, %dtt0
+    move.l  #0xFF00E060, %d0               | DTT1: 0xFF......, inhibited (sentinel)
+    movec   %d0, %dtt1
+    moveq   #0, %d0                        | NO instruction-side TTR at all
+    movec   %d0, %itt0
+    movec   %d0, %itt1
+    move.l  #0x80008000, %d0               | CACR: DE | IE
+    movec   %d0, %cacr
+"""
+    val ttrEarly = if (dirtyTables) ttrBlock else ""
+    val ttrLate  = if (dirtyTables) "" else ttrBlock
+    val irqVec   = if (irqs) "    move.l  #_irq_handler, VBR_BASE+120  | autovector 30 (level 6)\n" else ""
+    val irqUnmask= if (irqs) "    move.w  #0x2000, %sr               | unmask interrupts\n" else ""
+    val irqHandler = if (irqs)
+      """
+    .balign 4096
+_irq_handler:
+    rte
+""" else ""
     s"""
     .text
     .org 0
@@ -73,7 +134,7 @@ object TableStressProgram {
 
 _start:
     lea     0x00030000, %a7
-
+$ttrEarly
     | ---- zero ROOT / PTRC / PTRB (128 longwords each). The D-side sim memory is
     | ---- 0xFF-filled, and 0xFFFFFFFF decodes as a RESIDENT table descriptor
     | ---- pointing at garbage, so an unzeroed table is not merely untidy.
@@ -111,30 +172,21 @@ _vt:
     bne     _vt
     move.l  #_aline_handler, VBR_BASE+40    | vec 10  A-line
     move.l  #_trap0_handler, VBR_BASE+128   | vec 32  TRAP #0
-
+$irqVec
     | ---- restricted TTR posture: the INSTRUCTION side gets no TTR at all ----
-    moveq   #0, %d0
-    movec   %d0, %itt0
-    movec   %d0, %itt1
-    move.l  #0x0000E020, %d0               | DTT0: VA[31:24]==0x00 only, copyback
-    movec   %d0, %dtt0
-    move.l  #0xFF00E060, %d0               | DTT1: 0xFF......, inhibited (sentinel)
-    movec   %d0, %dtt1
-    move.l  #ROOT, %d0
+$ttrLate    move.l  #ROOT, %d0
     movec   %d0, %urp
     movec   %d0, %srp
-    move.l  #0x80008000, %d0               | CACR: DE | IE
-    movec   %d0, %cacr
     move.l  #0x00008000, %d0               | TC: E=1, 4 KiB pages
     movec   %d0, %tc
-
+$irqUnmask
     | ==== from here every fetch may run an ITLB walk and every DATA_VA access a
     | ==== DTLB walk. Nothing below is covered by a transparent translation.
 
     move.l  #$iterations, %d7
 _loop:
     pflusha
-    move.l  #DATA_VA, %a2
+$loopCpush    move.l  #DATA_VA, %a2
     move.l  (%a2), %d0                     | DTLB walk + U writeback
     lea     0x1000(%a2), %a2
     move.l  %d0, (%a2)                     | DTLB walk + U/M writeback (store)
@@ -144,14 +196,14 @@ _loop:
     move.l  %d1, (%a2)
 _aline_site:
     .short  0xa05d                         | A-line trap with walks in flight
-_after_aline:
+${sledEntry}_after_aline:
     lea     0x1000(%a2), %a2
     move.l  (%a2), %d2
     pflusha
     lea     0x1000(%a2), %a2
     move.l  %d2, (%a2)
     trap    #0
-_after_trap:
+${sledEntry}_after_trap:
     subq.l  #1, %d7
     bne     _loop
 
@@ -202,7 +254,7 @@ _trap0_handler:
     move.l  #_after_trap, 2(%a7)
 $handlerFlush    move.l  0x60012000, %d4
     rte
-"""
+$irqHandler$sled"""
   }
 }
 
@@ -218,6 +270,8 @@ final case class WalkExcResult(
   excEntries: Long,
   excWithWalkGrant: Long,
   stalledCycles: Long,
+  sledWalks: Long,
+  maxEDrainRun: Long,
   wedgeDump: String
 ) {
   def report(): Unit = {
@@ -225,6 +279,7 @@ final case class WalkExcResult(
       f"lastPc=0x$lastCommitPc%08x")
     println(f"[walkexc] itlbWalkCmds=$itlbWalkCmds dtlbWalkCmds=$dtlbWalkCmds " +
       f"walkStores=$walkStores excEntries=$excEntries excWithWalkGrant=$excWithWalkGrant")
+    println(f"[walkexc] sledWalks=$sledWalks maxEDrainRun=$maxEDrainRun")
     if (wedgeDump.nonEmpty) println(wedgeDump)
   }
 }
@@ -238,8 +293,20 @@ object WalkExcHarness {
     * cold-TLB walk chain plus an AXI refill is a few hundred cycles at worst. */
   val StallLimit = 20000L
 
+  /** @param irqPeriod when > 0, inject a level-6 autovector interrupt roughly every
+    *        `irqPeriod` cycles (jittered by `simSeed`) once the program has switched the
+    *        MMU on.  A synchronous trap can only fire at commit; an interrupt can land
+    *        at an ARBITRARY point inside a walk, which is the interleaving a directed
+    *        program cannot reach on its own. */
+  /** @param memCfg AXI memory-model configuration for BOTH the I and D sides.  The
+    *        default is the zero-latency model every other harness uses, which makes a
+    *        3-level walk finish almost immediately and therefore almost never leaves a
+    *        walk in flight when anything else happens.  `AxiMemModel.l2DramSlow` /
+    *        `crossbarSingleOutstanding` reproduce the real SoC's memory behaviour, which
+    *        widens that window by an order of magnitude. */
   def run(src: String, timeoutCycles: Long = 400000L, simSeed: Int = 1,
-          trace: Boolean = false): WalkExcResult = {
+          trace: Boolean = false, irqPeriod: Int = 0,
+          memCfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig()): WalkExcResult = {
     val image = ProgramAssembler.assemble(src, PortedTestRunner.loadAddr) match {
       case Right(i)  => i
       case Left(err) => throw new AssertionError(s"assemble failed: ${err.reason}")
@@ -252,10 +319,13 @@ object WalkExcHarness {
 
       // Memory wiring is byte-identical to PortedTestRunner's (same I-side swap
       // convention, same 0xFF-filled shared D-side image, same SMC write mirror).
-      val iAgent = FuzzDut.attachProgramWithBusErrors(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val iAgent = m68k040.sim.AxiMemModel.attachProgramIFetch(
+        dut.icache.logic.axi, cd, loadAddr, image.bytes,
+        cfg = memCfg.copy(injectBusErrors = true))
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
-                                                   sharedMem = dsideMem, injectBusErrors = true)
+                                                   sharedMem = dsideMem, injectBusErrors = true,
+                                                   dcfg = memCfg)
       dmem.setByteWriteObserver((addr, byte) => iAgent.mem.write(addr, byte))
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 4) dmem.mem.write(SentinelAddr + i, 0.toByte)
@@ -302,15 +372,38 @@ object WalkExcHarness {
       var lastPc = 0L
       var prevExcActive = false
       var tracePend = 0
+      var sledWalks = 0L
+      var eDrainRun = 0L
+      var maxEDrainRun = 0L
+      var irqHold = 0
+      var irqsInjected = 0L
+      var nextIrqCyc = 0L
+      val rnd = new scala.util.Random(simSeed)
       var cyc = 0L
       var lastRetireCyc = 0L
 
       cd.onSamplings {
         cyc += 1
-        if (dut.itlb.walkLoadCmd.valid.toBoolean && dut.itlb.walkLoadCmd.ready.toBoolean) itlbWalkCmds += 1
+        if (dut.itlb.walkLoadCmd.valid.toBoolean && dut.itlb.walkLoadCmd.ready.toBoolean) {
+          itlbWalkCmds += 1
+          // A LEAF descriptor read for a code page with pageIdx >= 4 can only come from
+          // the runaway sled (page 0 is the program, 1..3 are the handlers). This is the
+          // direct measurement of whether the frontend really "runs away down the wrong
+          // path" during E_DRAIN, which is 030651f's central claim.
+          val pa = dut.itlb.walkLoadCmd.payload.paddr.toLong & 0xffffffffL
+          if (pa >= (TableStressProgram.PgtC + 16) && pa < (TableStressProgram.PgtC + 256))
+            sledWalks += 1
+        }
         if (dut.dtlb.walkLoadCmd.valid.toBoolean && dut.dtlb.walkLoadCmd.ready.toBoolean) dtlbWalkCmds += 1
         if ((dut.itlb.walkStore.valid.toBoolean && dut.itlb.walkStore.ready.toBoolean) ||
             (dut.dtlb.walkStore.valid.toBoolean && dut.dtlb.walkStore.ready.toBoolean)) walkStores += 1
+        // How long the entry drain actually lasts. If this stays at 1-2 cycles the
+        // E_DRAIN livelock mechanism is not being stressed at all, whatever else the
+        // run contains.
+        if (exc.dbgFsmIsEDrain.toBoolean) {
+          eDrainRun += 1
+          if (eDrainRun > maxEDrainRun) maxEDrainRun = eDrainRun
+        } else eDrainRun = 0
         val a = exc.active.toBoolean
         // `curVec`/`curPc` latch on the trigger edge; read them a cycle later so the
         // trace never prints the PREVIOUS episode's captured state (this cost one
@@ -329,6 +422,23 @@ object WalkExcHarness {
         for (k <- 0 until 2) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) { retired += 1; lastPc = c.pc.toLong & 0xffffffffL; lastRetireCyc = cyc }
+        }
+        // Asynchronous interrupt injection. Held for a few cycles (the IPL input is a
+        // level, not a pulse) and only once the program has actually enabled the MMU --
+        // before that the vector table is not built yet and an interrupt would panic.
+        if (irqPeriod > 0) {
+          if (dut.ctrl.logic.mmuEnable.toBoolean) {
+            if (irqHold > 0) {
+              irqHold -= 1
+              if (irqHold == 0) dut.intCtrl.logic.iplIn #= 0
+            } else if (cyc >= nextIrqCyc) {
+              dut.intCtrl.logic.iackAvec #= true
+              dut.intCtrl.logic.iplIn #= 6
+              irqHold = 4
+              irqsInjected += 1
+              nextIrqCyc = cyc + irqPeriod / 2 + rnd.nextInt(irqPeriod)
+            }
+          }
         }
       }
 
@@ -376,6 +486,8 @@ object WalkExcHarness {
         b("dtlb.faultSeen", dut.dtlb.logic.faultSeen.toBoolean)
         i("itlbWalkCmds", itlbWalkCmds); i("dtlbWalkCmds", dtlbWalkCmds)
         i("walkStores", walkStores); i("excEntries", excEntries)
+        i("irqsInjected", irqsInjected); i("sledWalks", sledWalks)
+        i("maxEDrainRun", maxEDrainRun)
         sb.toString
       }
 
@@ -398,7 +510,7 @@ object WalkExcHarness {
 
       out = WalkExcResult(word, cyc, retired, lastPc, itlbWalkCmds, dtlbWalkCmds,
                           walkStores, excEntries, excWithWalkGrant,
-                          cyc - lastRetireCyc, wedgeDump)
+                          cyc - lastRetireCyc, sledWalks, maxEDrainRun, wedgeDump)
     }
     out
   }
@@ -415,6 +527,75 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     assert(r.dtlbWalkCmds > 0, "VACUOUS: no DTLB descriptor read ever issued")
     assert(r.walkStores > 0, "VACUOUS: no walker U/M writeback store ever issued")
     assert(r.excEntries > 0, "VACUOUS: no exception entry ever taken")
+  }
+
+  /** The escalation matrix.  Each row adds ONE ingredient, so a wedge names its own
+    * cause instead of needing a bisect afterwards.  `cpush` is the important one: it is
+    * the only ingredient that makes `quiesceHold` assert at all. */
+  private val zeroLat = m68k040.sim.AxiMemModelConfig()
+  // The real SoC's memory: a 5/60-cycle L2 in front of DRAM, and a crossbar that allows
+  // exactly ONE outstanding read per master port. Both widen the "walk still in flight"
+  // window by an order of magnitude relative to the zero-latency default.
+  private val slowMem = m68k040.sim.AxiMemModelConfig(
+    latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 60))
+  private val slowMemXbar = slowMem.copy(crossbarSingleOutstanding = true)
+
+  private val matrix = Seq(
+    ("base",                       false, false, false, 0,   zeroLat),
+    ("dirtyTables",                true,  false, false, 0,   zeroLat),
+    ("cpush",                      false, true,  false, 0,   zeroLat),
+    ("dirtyTables+cpush",          true,  true,  false, 0,   zeroLat),
+    ("irq",                        false, false, true,  700, zeroLat),
+    ("dirtyTables+cpush+irq",      true,  true,  true,  700, zeroLat),
+    ("dirtyTables+cpush+fastIrq",  true,  true,  true,  180, zeroLat),
+    ("slowMem",                    true,  false, false, 0,   slowMem),
+    ("slowMem+cpush",              true,  true,  false, 0,   slowMem),
+    ("slowMem+cpush+irq",          true,  true,  true,  700, slowMem),
+    ("slowMemXbar+cpush+irq",      true,  true,  true,  700, slowMemXbar)
+  )
+
+  for ((name, dirty, cp, irq, period, mem) <- matrix) {
+    test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
+      val r = WalkExcHarness.run(
+        TableStressProgram.src(16, dirtyTables = dirty, cpush = cp, irqs = irq),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem)
+      println(s"[walkexc] --- $name ---")
+      r.report()
+      assert(r.itlbWalkCmds > 0 && r.dtlbWalkCmds > 0,
+        s"VACUOUS [$name]: no real table walk occurred")
+      assert(r.sentinel == WalkExcHarness.PassWord,
+        s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
+        s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+    }
+  }
+
+  /** The runaway-sled rows: the frontend's wrong-path fetch during `E_DRAIN` crosses
+    * 48 pages in a loop -- more than the 32-entry ITLB holds -- so every hop misses and
+    * every miss is a table walk.  This is the closest structural match to the boot ROM
+    * that a directed program can be, and it is the exact mechanism `030651f` claims. */
+  private val sledMatrix = Seq(
+    ("sled",                       true,  false, false, 0,   zeroLat),
+    ("sled+cpush",                 true,  true,  false, 0,   zeroLat),
+    ("sled+cpush+irq",             true,  true,  true,  700, zeroLat),
+    ("sled+slowMem",               true,  false, false, 0,   slowMem),
+    ("sled+slowMem+cpush+irq",     true,  true,  true,  700, slowMem),
+    ("sled+slowMemXbar+cpush+irq", true,  true,  true,  700, slowMemXbar)
+  )
+
+  for ((name, dirty, cp, irq, period, mem) <- sledMatrix) {
+    test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
+      val r = WalkExcHarness.run(
+        TableStressProgram.src(12, dirtyTables = dirty, cpush = cp, irqs = irq,
+                               sledPages = 48),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem)
+      println(s"[walkexc] --- $name ---")
+      r.report()
+      assert(r.itlbWalkCmds > 0 && r.dtlbWalkCmds > 0,
+        s"VACUOUS [$name]: no real table walk occurred")
+      assert(r.sentinel == WalkExcHarness.PassWord,
+        s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
+        s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+    }
   }
 
   test("exception entry with table walks in flight makes forward progress", VerilatorTest) {
