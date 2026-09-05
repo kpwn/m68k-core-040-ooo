@@ -154,6 +154,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val historyEnabled = enable && stage >= 3 && historyDepth > 0
     val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
     val frontendDebug = if (enable && stage >= 5) host.get[FrontendDebugMatchService] else None
+
+    // 2026-09-05 walker-stall observability (p141). `host.get` (Option), not
+    // `host[...]`, for exactly the reason the `dbgCommit` comment above gives:
+    // the Stage-1 standalone fixture hosts no D-cache, no LS EU, no ROB and no
+    // DTLB, and a hard reach-in would make every one of those DUTs fail to
+    // elaborate. Each reader below falls back to a literal zero, so an absent
+    // peer reads as an all-zero word rather than breaking the build.
+    val stallDcache = if (enable) host.get[m68k040.cache.DcachePlugin] else None
+    val stallLsEu   = if (enable) host.get[m68k040.execute.LsEuPlugin] else None
+    val stallRob    = if (enable) host.get[m68k040.rob.RobPlugin] else None
+    val stallDtlb   = if (enable) host.get[m68k040.mmu.DtlbPlugin] else None
+    val stallItlb   = if (enable) host.get[m68k040.mmu.ItlbPlugin] else None
     val historyBuilt = historyEnabled && debugHistory.nonEmpty
     val unavailableFeatures = Set("dcache_probe") ++
       (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
@@ -838,6 +850,29 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
+          // ── p141 walker-stall state (live; no halt required) ──────────────────
+          // Read these ALONGSIDE OFF_INST_LO/HI: the wedge is identified by the
+          // retire count being frozen, and these four words say what it is frozen
+          // ON. See DebugRegMap's OFF_STALL_* comment for why they live here in
+          // the counter block rather than the halt-captured arch block.
+          is(DebugRegMap.OFF_STALL_DC) {
+            rData := stallDcache.map(_.logic.dbgStallDcPack).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_STALL_GRANT) {
+            rData := stallLsEu.map(_.logic.dbgStallGrantPack).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_STALL_EXC) {
+            rData := stallRob.map(_.logic.exc.dbgStallExcPack).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_STALL_WALK) {
+            // Both walkers in one word: DTLB in [15:0] (the D-side walker arm C
+            // routed through L1D, i.e. the suspect) and ITLB in [15:8] (the
+            // control -- if the I-side walker is idle while the D-side is stuck,
+            // that localises the stall to the D-cache port hand-over).
+            val dtlbBits = stallDtlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
+            val itlbBits = stallItlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
+            rData := itlbBits ## dtlbBits
+          }
           is(DebugRegMap.OFF_HALT_HIT_INST_LO) {
             rData := haltHitInstCount(31 downto 0).asBits
           }

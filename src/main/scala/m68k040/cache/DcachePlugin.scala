@@ -2215,6 +2215,52 @@ class DcachePlugin(val socketMerged: Boolean = false,
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
 
+    /** 2026-09-05 walker-stall observability (p141), read live over jtag_axi at
+      * `DebugRegMap.OFF_STALL_DC`. Pure observation: no new state, no consumer
+      * inside this plugin, nothing feeds back into the datapath.
+      *
+      * WHY EVERY TERM SEPARATELY. `dcIdleForMaint` above is a 17-way conjunction,
+      * and the whole question this capture exists to answer is *which* term never
+      * clears when the `0x40806b68` A-line exception entry wedges. Probing the
+      * AND (or `maintQuiesced`, which is that AND plus `!maintBusyReg`) would
+      * report only "not idle" -- the fact already known from the frozen retire
+      * count -- and would not discriminate between a stuck load stage, a stuck
+      * store stage, an undrained AXI write channel, and a leaked
+      * `storeOutstanding` credit. Those four point at different RTL.
+      *
+      * Bit layout MUST stay in sync with the `dcIdleForMaint` expression above;
+      * the order here is deliberately the same, left to right. */
+    val dbgStallDcPack = Bits(32 bits)
+    dbgStallDcPack := B(0, 32 bits)
+    dbgStallDcPack(0)  := resetSweepBusy
+    dbgStallDcPack(1)  := busy
+    dbgStallDcPack(2)  := ldS1Valid
+    dbgStallDcPack(3)  := ldS2Valid
+    dbgStallDcPack(4)  := loadShadowValid
+    dbgStallDcPack(5)  := earlyProbeValid
+    dbgStallDcPack(6)  := pendingStoreMiss
+    dbgStallDcPack(7)  := pendingWtKickoff
+    dbgStallDcPack(8)  := s0Valid
+    dbgStallDcPack(9)  := stS1Valid
+    dbgStallDcPack(10) := stS2Valid
+    dbgStallDcPack(11) := stS3Valid
+    dbgStallDcPack(12) := serialStoreInFlight
+    dbgStallDcPack(13) := storeMissBarrier
+    // The four AXI write-channel completion flags are ACTIVE-HIGH-DONE in the
+    // conjunction (`&& stAwDone && ...`), so a ZERO here is a term that is
+    // holding `dcIdleForMaint` low -- the opposite polarity to the bits above.
+    dbgStallDcPack(14) := stAwDone
+    dbgStallDcPack(15) := stWDone
+    dbgStallDcPack(16) := evictAwDone
+    dbgStallDcPack(17) := evictWDone
+    dbgStallDcPack(21 downto 18) := storeOutstanding.asBits.resize(4 bits)
+    dbgStallDcPack(22) := dcIdleForMaint
+    dbgStallDcPack(23) := maintBusyReg
+    // [24] is the composite the ExceptionUnit actually waits on, so a capture can
+    // confirm the CSR view agrees with the consumer rather than assuming it.
+    dbgStallDcPack(24) := dcIdleForMaint && !maintBusyReg
+    dbgStallDcPack.simPublic()
+
     val maintWalkingDbg = Bool(); maintWalkingDbg.simPublic()
 
     val maintCmdPort = Flow(CacheMaintCmd())

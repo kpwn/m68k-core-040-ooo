@@ -2518,6 +2518,61 @@ class ExceptionUnit(
                        fsm.isActive(fsm.S_MAINTWAIT)
   quiesceHoldOut.simPublic()
 
+  /** 2026-09-05 walker-stall observability (p141), read live over jtag_axi at
+    * `DebugRegMap.OFF_STALL_EXC`. Pure observation -- every bit already exists;
+    * nothing here is a new consumer and nothing feeds back into the datapath.
+    *
+    * `0x40806b68` is an A-line trap (Slot Manager dispatch), i.e. an EXCEPTION
+    * ENTRY, so this FSM is the sequencer that is running when the machine stops
+    * retiring. The refuted fix `030651f` added `E_DRAIN`/`R_DRAIN` to
+    * `quiesceHoldOut` on the theory that the entry was starved by a walker
+    * holding the port; that was verified active in the p140 netlist and still
+    * wedged, so the premise is dead and the actual stuck state is unknown.
+    * `stateReg` answers it directly rather than by inference.
+    *
+    * The three DRAIN-family waits are broken out as their own bits because they
+    * are the states that can wait UNBOUNDEDLY on someone else: `E_DRAIN` and
+    * `R_DRAIN` on `sqDrained && dcQuiesced`, and `S_MAINTWAIT` on `maintDoneIn`.
+    * Pairing each with the predicate it waits on is what makes the capture
+    * self-interpreting: a DRAIN bit high with its predicate low names both the
+    * waiter and the thing it waits for, in one 32-bit read.
+    *
+    * The state is emitted ONE-HOT via `isActive` rather than as `fsm.stateReg`:
+    * `stateReg` does not exist yet at this point in elaboration (reading it is a
+    * null dereference -- measured), which is the same reason `quiesceHoldOut`
+    * just above is written with `isActive`. A one-hot also needs no
+    * enum-encoding table to decode from a raw 32-bit CSR read on the bench. */
+  val dbgStallExcPack = Bits(32 bits)
+  dbgStallExcPack := B(0, 32 bits)
+  dbgStallExcPack(0)  := active
+  dbgStallExcPack(1)  := sqDrained
+  dbgStallExcPack(2)  := dcQuiesced
+  dbgStallExcPack(3)  := quiesceHoldOut
+  dbgStallExcPack(4)  := maintDoneIn
+  dbgStallExcPack(5)  := redirectValid
+  dbgStallExcPack(6)  := fsm.isActive(fsm.IDLE)
+  dbgStallExcPack(7)  := fsm.isActive(fsm.E_DRAIN)
+  dbgStallExcPack(8)  := fsm.isActive(fsm.E_STORE)
+  dbgStallExcPack(9)  := fsm.isActive(fsm.E_STWAIT)
+  dbgStallExcPack(10) := fsm.isActive(fsm.E_VECREQ)
+  dbgStallExcPack(11) := fsm.isActive(fsm.E_VECWAIT)
+  dbgStallExcPack(12) := fsm.isActive(fsm.E_REDIR)
+  dbgStallExcPack(13) := fsm.isActive(fsm.R_DRAIN)
+  dbgStallExcPack(14) := fsm.isActive(fsm.R_SRREQ)
+  dbgStallExcPack(15) := fsm.isActive(fsm.R_SRWAIT)
+  dbgStallExcPack(16) := fsm.isActive(fsm.R_PCREQ)
+  dbgStallExcPack(17) := fsm.isActive(fsm.R_PCWAIT)
+  dbgStallExcPack(18) := fsm.isActive(fsm.R_PCREQ2)
+  dbgStallExcPack(19) := fsm.isActive(fsm.R_PCWAIT2)
+  dbgStallExcPack(20) := fsm.isActive(fsm.R_FMTREQ)
+  dbgStallExcPack(21) := fsm.isActive(fsm.R_FMTWAIT)
+  dbgStallExcPack(22) := fsm.isActive(fsm.R_REDIR)
+  dbgStallExcPack(23) := fsm.isActive(fsm.S_DRAIN)
+  dbgStallExcPack(24) := fsm.isActive(fsm.S_APPLY)
+  dbgStallExcPack(25) := fsm.isActive(fsm.S_MAINTWAIT)
+  dbgStallExcPack(26) := fsm.isActive(fsm.S_REDIR)
+  dbgStallExcPack.simPublic()
+
   // ---- debug-only observability (task #139 wild-PC / a7-minus-8 investigation) ----
   // Zero synth impact (sim tap only, not referenced by any RTL logic).
   active.simPublic()

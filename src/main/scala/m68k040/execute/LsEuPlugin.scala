@@ -3500,6 +3500,61 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     }
     walkerPortWedge.simPublic()
 
+    /** 2026-09-05 walker-stall observability (p141), read live over jtag_axi at
+      * `DebugRegMap.OFF_STALL_GRANT`. Pure observation -- no new state (every bit
+      * below already exists), no consumer, nothing feeds back into the datapath.
+      *
+      * This is the "who holds the walker grant" half of the capture. The D-cache
+      * port is arbitrated between the CORE and the two table walkers, and since
+      * arm C (`2db5bd3`) routed MMU table walks through L1D that arbiter sits
+      * directly on the path the `0x40806b68` A-line exception entry takes. The
+      * bits that matter, in order of what they discriminate:
+      *
+      *   ldOwner/stOwner   WHO holds each direction (CORE / ITLB / DTLB). If a
+      *                     walker owns a port and never releases it, this names
+      *                     which walker.
+      *   walkerPortWedge   the design's OWN sticky detector for exactly that --
+      *                     grant held with no progress for `walkerWedgeLimit`
+      *                     cycles. If this reads 1 the stall is proven to be in
+      *                     the walker/port hand-over and not upstream of it.
+      *   ldGrantOk/stGrantOk  whether a NEW grant is currently possible. Both
+      *                     low with the core wanting the port is the starvation
+      *                     shape; `quiesceHold` is the reason they would be low
+      *                     during an exception entry.
+      *   coreStOutstanding the counter widened 3->4 bits by `56ad2d4`. It gates
+      *                     `stGrantOk`, so a non-zero stuck value here is the
+      *                     latent-wrap failure that commit predicted, observed. */
+    val dbgStallGrantPack = Bits(32 bits)
+    dbgStallGrantPack := B(0, 32 bits)
+    dbgStallGrantPack(1 downto 0) := ldOwner.asBits.resize(2 bits)
+    dbgStallGrantPack(3 downto 2) := stOwner.asBits.resize(2 bits)
+    dbgStallGrantPack(4)  := ldGrantOk
+    dbgStallGrantPack(5)  := stGrantOk
+    dbgStallGrantPack(6)  := quiesceHold
+    dbgStallGrantPack(7)  := walkGrantHeld
+    dbgStallGrantPack(8)  := walkerOwnsLoad
+    dbgStallGrantPack(9)  := walkerOwnsStore
+    dbgStallGrantPack(10) := walkerPortWedge
+    dbgStallGrantPack(11) := walkGrantProgress
+    dbgStallGrantPack(15 downto 12) := coreStOutstanding.asBits.resize(4 bits)
+    dbgStallGrantPack(16) := walkStOutstanding
+    dbgStallGrantPack(17) := ldBusyExc
+    dbgStallGrantPack(18) := ldFifoFull
+    dbgStallGrantPack(19) := coreLsLoadReq
+    dbgStallGrantPack(20) := walkLdReq(walkIdxItlb)
+    dbgStallGrantPack(21) := walkLdReq(walkIdxDtlb)
+    dbgStallGrantPack(22) := walkStReq(walkIdxItlb)
+    dbgStallGrantPack(23) := walkStReq(walkIdxDtlb)
+    dbgStallGrantPack(24) := dcache.loadCmd.valid
+    dbgStallGrantPack(25) := dcache.loadCmd.ready
+    dbgStallGrantPack(26) := dcache.loadRsp.valid
+    dbgStallGrantPack(27) := dcache.store.valid
+    dbgStallGrantPack(28) := dcache.store.ready
+    dbgStallGrantPack(29) := dcache.storeAck
+    dbgStallGrantPack(30) := excStoreOutstanding
+    dbgStallGrantPack(31) := walkWedgeCnt =/= 0
+    dbgStallGrantPack.simPublic()
+
     // ── Structural tripwires (simulation only; pruned from every synthesised netlist) ──
     GenerationFlags.simulation {
       val admitCount = coreLsLoadAdmit.asUInt +^ excLoadAdmit.asUInt +^

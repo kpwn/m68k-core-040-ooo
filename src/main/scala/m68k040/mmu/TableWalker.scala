@@ -61,6 +61,29 @@ class TableWalker extends Component {
     // is presented.
     val loadCmd = master(Stream(DLoadCmd()))
     val loadRsp = slave(Flow(DLoadRsp()))
+    /** 2026-09-05 walker-stall ILA tap (p141). Pure observation -- no new state,
+      * no consumer inside this Component, nothing feeds back into the datapath.
+      *
+      * This walker is a CHILD Component of `M68kCore` (constructed inside
+      * `DtlbPlugin`/`ItlbPlugin`'s `logic` Area, which is itself an Area of
+      * M68kCore, not a Component), so its INTERNALS are not legally readable
+      * from M68kCore's scope -- only its PORTS are. `simPublic()` would not
+      * help: it affects simulation visibility only, never synthesis-time
+      * cross-component readability. Hence a real `out` port rather than a
+      * reach-in, matching the structural pattern `M68kCore.dbg040` already
+      * established for every other ILA tap in this design.
+      *
+      * Layout (see `M68kCore.dbg040.stallWalkPack` for where these bits land):
+      *   [4:0] fsm state, ONE-HOT: IDLE, RD_ROOT, RD_PTR, RD_PAGE, FINISH
+      *   [5]   cmdSent   -- a descriptor read is outstanding
+      *   [6]   loadCmd.valid, [7] loadCmd.ready  -- the D-cache request
+      *                       handshake; valid && !ready is the walker BLOCKED
+      *                       on the port, which is the shape this capture is
+      *                       looking for
+      *   [8]   loadRsp.valid
+      *   [9]   io.start
+      *   [10]  donePulse */
+    val dbgPack = out Bits (16 bits)
   }
 
   // ---- latched request ----
@@ -270,6 +293,30 @@ class TableWalker extends Component {
 
   io.busy := !fsm.isActive(fsm.IDLE)
   io.done := donePulse
+
+  // 2026-09-05 walker-stall tap (p141) -- see `io.dbgPack`'s declaration comment.
+  // `stateReg` is the StateMachine's own registered state; `IDLE` is the EntryPoint
+  // so state 0 reads as "no walk in progress" and any other value with
+  // `loadCmd.valid && !loadCmd.ready` is a walker BLOCKED on the D-cache port.
+  // The state is emitted ONE-HOT via `isActive`, not as `fsm.stateReg`. Two
+  // reasons, the first fatal: `StateMachine.stateReg` does not exist yet at this
+  // point in elaboration (it is created when the FSM builds, so reading it here
+  // is a null dereference -- measured), whereas `isActive` registers a deferred
+  // post-build task and is therefore legal at class scope. This is exactly why
+  // `ExceptionUnit.quiesceHoldOut` is written with `isActive` too. Second, a
+  // one-hot needs no enum-encoding table to interpret from a raw CSR read.
+  io.dbgPack := B(0, 16 bits)
+  io.dbgPack(0) := fsm.isActive(fsm.IDLE)
+  io.dbgPack(1) := fsm.isActive(fsm.RD_ROOT)
+  io.dbgPack(2) := fsm.isActive(fsm.RD_PTR)
+  io.dbgPack(3) := fsm.isActive(fsm.RD_PAGE)
+  io.dbgPack(4) := fsm.isActive(fsm.FINISH)
+  io.dbgPack(5) := cmdSent
+  io.dbgPack(6) := io.loadCmd.valid
+  io.dbgPack(7) := io.loadCmd.ready
+  io.dbgPack(8) := io.loadRsp.valid
+  io.dbgPack(9) := io.start
+  io.dbgPack(10) := donePulse
 
   io.rsp.ppn         := rPpn
   io.rsp.writeProt   := rWp
