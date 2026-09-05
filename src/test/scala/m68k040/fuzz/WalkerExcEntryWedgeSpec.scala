@@ -51,7 +51,12 @@ object TableStressProgram {
   val PgtD = 0x00202000L   // PtrC[0]  -> VA 0x60000000..0x6003FFFF  (data working set)
   val PtrB = 0x00203000L   // root[32] -> VA 0x40000000..0x41FFFFFF
   val PgtC = 0x00204000L   // PtrB[32] -> VA 0x40800000..0x4083FFFF  (code)
+  // 8 KiB mode only.  A leaf table maps 256 KiB whatever the page size (32 x 8 KiB ==
+  // 64 x 4 KiB), so a 48-page sled at 8 KiB spacing (384 KiB) no longer fits in ONE
+  // leaf table the way it does at 4 KiB.  PTRB[33] -> PGTC2 adds the second 256 KiB.
+  val PgtC2 = 0x00205000L  // PtrB[33] -> VA 0x40840000..0x4087FFFF  (code, 8 KiB only)
   val DataVa = 0x60000000L
+  val CodeVa = 0x40800000L
 
   /** @param iterations      how many (A-line + TRAP) rounds to run
     * @param pflushInHandler whether the handlers also flush, i.e. whether an ITLB walk
@@ -77,15 +82,70 @@ object TableStressProgram {
     *                        runs into is an ITLB miss, and after `2db5bd3` every ITLB
     *                        miss is a table walk that re-arms exactly the terms
     *                        `dcQuiesced` waits on.  A one-page program's runaway never
-    *                        leaves its page, so it cannot exhibit that at all. */
+    *                        leaves its page, so it cannot exhibit that at all.
+    * @param pages8K         `TC.P = 1` -- 8 KiB pages.  NOT a cosmetic parameter and not
+    *                        merely "the same test with bigger pages": `is8K` changes
+    *                        BOTH the walker's leaf-descriptor offset (`TableWalker`
+    *                        RD_PTR: PGI is VA[17:13], 5 bits, not VA[17:12], 6) AND the
+    *                        TLB tagging key (`Itlb/DtlbPlugin.tlbKey` forces vpn(0) to a
+    *                        constant, so two VAs differing only in VA[12] collide into
+    *                        ONE entry) AND the PA assembly (`LsEuPlugin.s1Paddr` /
+    *                        `IcachePlugin.lookupPaddr` take PA[12] from the untranslated
+    *                        VA).  All three sit on exactly the path `2db5bd3` re-routed.
+    *                        The board ROM uses 8 KiB pages; every posture in this file
+    *                        before this parameter existed was 4 KiB only.
+    * @param faultData       leave two DATA leaf descriptors BROKEN on every iteration --
+    *                        one non-resident (PDT=00) and one write-protected (W=1) --
+    *                        and touch them just before the A-line.  Each is a walk that
+    *                        FAULTS, which the posture otherwise never contains: every
+    *                        walk in it succeeds.  A vector-2 handler repairs them,
+    *                        `PFLUSHA`es and `RTE`s (demand paging), so the program still
+    *                        terminates.
+    * @param faultInHandler  the same, but the broken pages are touched INSIDE the A-line
+    *                        handler -- an access fault raised while the machine is
+    *                        already inside an exception (a genuinely NESTED fault).
+    * @param faultHandlerPage the TRAP#0 handler's own CODE page is left non-resident, so
+    *                        the exception-entry REDIRECT's ITLB walk faults.  That is the
+    *                        fault landing inside exception ENTRY rather than in ordinary
+    *                        code.
+    * @param faultSled       the FIRST sled page is left non-resident.  The sled is never
+    *                        architecturally executed (both handlers rewrite the stacked
+    *                        PC past the `bra` that enters it), so this is a walk that
+    *                        faults on a WRONG-PATH fetch which is then squashed -- the
+    *                        case `walkFlushPoison` exists for. */
   def src(iterations: Int, pflushInHandler: Boolean = true,
           dirtyTables: Boolean = false, cpush: Boolean = false,
           irqs: Boolean = false, sledPages: Int = 0,
           leafWritethrough: Boolean = false,
           storeBurst: Int = 0, storeGroups: Int = 24,
-          noWalk: Boolean = false): String = {
+          noWalk: Boolean = false,
+          pages8K: Boolean = false,
+          faultData: Boolean = false, faultInHandler: Boolean = false,
+          faultHandlerPage: Boolean = false, faultSled: Boolean = false): String = {
+    // ---- page-size-dependent geometry (task #195 semantics) ----
+    // Root index = VA[31:25] (7 bits, 32 MiB per entry)  -- page-size independent.
+    // Ptr index  = VA[24:18] (7 bits, 256 KiB per entry) -- page-size independent.
+    // Leaf index = VA[17:12] (6 bits, 64 entries) at 4 KiB
+    //            = VA[17:13] (5 bits, 32 entries) at 8 KiB
+    // so a leaf table always covers 256 KiB and only its ENTRY COUNT and STRIDE change.
+    val ps     = if (pages8K) 0x2000 else 0x1000
+    val psHex  = f"$ps%04x"
+    val leafN  = if (pages8K) 32 else 64
+    val tcHex  = if (pages8K) "0x0000C000" else "0x00008000"
+    val tcCmt  = if (pages8K) "TC: E=1, P=1 (8 KiB pages)" else "TC: E=1, 4 KiB pages"
+    val anyFault = faultData || faultInHandler || faultHandlerPage || faultSled
+    // The fault rows need STATIC code-page indices (a descriptor is broken by absolute
+    // address from the loop body, so the handler's page number must be known at assembly
+    // time).  `.balign` gives whatever page the preceding code happened to end on, so
+    // those rows pin the layout with `.org`.  Every other row keeps the exact `.balign`
+    // layout it has always had, so no pre-existing row's binary changes.
+    val orgLayout = faultHandlerPage || faultSled
+    // At 8 KiB a 48-page sled spans 384 KiB, which no longer fits the single 256 KiB
+    // code leaf table it fits at 4 KiB.  PTRB[33] -> PGTC2 adds the second 256 KiB.
+    val needCode2 = pages8K
     require(sledPages == 0 || sledPages >= 2, "a sled needs at least two pages to hop")
-    require(storeGroups < 60, "the data leaf table only maps 64 pages")
+    require(storeGroups < leafN - 5, s"the data leaf table only maps $leafN pages")
+    require(!faultSled || sledPages > 0, "faultSled needs a sled to break a page of")
     // Leaf CM field (descriptor bits [6:5]). WRITETHROUGH stores are the ones the
     // D-cache pipelines and counts in `storeOutstanding` (COPYBACK is stage-credit
     // based and never gates on it), so a writethrough working set is what actually
@@ -105,7 +165,7 @@ object TableStressProgram {
         sb ++= "    move.l  #DATA_VA, %a2\n"
         for (_ <- 0 until storeGroups) {
           for (b <- 0 until storeBurst) sb ++= s"    move.l  %d7, ${b * 0x40}(%a2)\n"
-          sb ++= "    lea     0x1000(%a2), %a2\n"
+          sb ++= s"    lea     0x${psHex}(%a2), %a2\n"
           sb ++= "    move.l  (%a2), %d0\n"
         }
         sb.toString
@@ -120,7 +180,17 @@ object TableStressProgram {
     bsr     _fill64
 """
 
-    // The runaway sled: `sledPages` hops, one 4 KiB page apart, looping forever. Sized
+    // Section placement. `.balign` for every pre-existing row (byte-identical binaries);
+    // `.org <page>*<pageSize>` for the fault rows, which need the handler/sled page
+    // NUMBERS to be assembly-time constants so a descriptor can be broken by absolute
+    // address. Page 0..3 is the main body, 4 = A-line handler, 5 = TRAP#0 handler,
+    // 6 = IRQ handler, 7 = access-fault handler, 8.. = the sled.
+    def sec(pg: Int): String = if (orgLayout) s"    .org ${pg * ps}" else s"    .balign $ps"
+    val AlinePg = 4; val TrapPg = 5; val IrqPg = 6; val BusPg = 7; val SledPg = 8
+    def dva(pg: Int): String = f"0x${TableStressProgram.DataVa + pg.toLong * ps}%08x"
+    def cva(pg: Int): String = f"0x${TableStressProgram.CodeVa + pg.toLong * ps}%08x"
+
+    // The runaway sled: `sledPages` hops, one page apart, looping forever. Sized
     // ABOVE the 32-entry ITLB so every hop misses on every pass and every miss is a
     // real table walk. Never architecturally executed -- both handlers rewrite the
     // stacked PC past the `bra` that enters it.
@@ -128,10 +198,11 @@ object TableStressProgram {
       if (sledPages == 0) ""
       else (0 until sledPages).map { i =>
         val j = (i + 1) % sledPages
-        // The wrap-around hop is ~192 KB backwards, past `braw`'s +-32 KB range, so it
-        // has to be the 32-bit-displacement form explicitly.
+        // The wrap-around hop is ~192 KB (4 KiB pages) or ~384 KB (8 KiB) backwards,
+        // past `braw`'s +-32 KB range, so it has to be the 32-bit-displacement form.
         val op = if (j < i) "bral" else "bra "
-        s"    .balign 4096\n_rw$i:\n    $op    _rw$j\n"
+        val place = if (i == 0 && orgLayout) sec(SledPg) else s"    .balign $ps"
+        s"$place\n_rw$i:\n    $op    _rw$j\n"
       }.mkString("\n    | ---- runaway sled ----\n", "", "")
     val sledEntry = if (sledPages == 0) "" else "    bra     _rw0\n"
     val handlerFlush = if (pflushInHandler) "    pflusha\n" else ""
@@ -159,10 +230,78 @@ object TableStressProgram {
     val irqVec   = if (irqs) "    move.l  #_irq_handler, VBR_BASE+120  | autovector 30 (level 6)\n" else ""
     val irqUnmask= if (irqs) "    move.w  #0x2000, %sr               | unmask interrupts\n" else ""
     val irqHandler = if (irqs)
-      """
-    .balign 4096
+      s"""
+${sec(IrqPg)}
 _irq_handler:
     rte
+""" else ""
+
+    // ── FAULTING WALKS ────────────────────────────────────────────────────────────
+    // Which leaf entries get deliberately broken. The four highest data pages, so they
+    // never collide with the store-stress working set (pages 0..storeGroups).
+    val fpgR = leafN - 4   // non-resident        (read  -> NON_RESIDENT walk fault)
+    val fpgW = leafN - 3   // resident, W=1       (store -> WRITE_PROTECT walk fault)
+    val hpgR = leafN - 2   // the same pair, but touched INSIDE the A-line handler
+    val hpgW = leafN - 1
+    val leafCmWp = leafCmHex.take(1) + "5"   // PDT=01 | W=1 | same CM
+    // Break the descriptors again at the top of every iteration -- the vector-2 handler
+    // repairs them, so without this only the first pass would fault. Placed AFTER
+    // `reArmUm` (which rewrites the whole data leaf table) so it is not undone.
+    val breakFaults = {
+      val sb = new StringBuilder
+      if (faultData || faultInHandler)
+        sb ++= "    | ---- arm the faulting leaf descriptors ----\n"
+      if (faultData) {
+        sb ++= s"    move.l  #0, PGTD+${fpgR * 4}\n"
+        sb ++= s"    move.l  #(${dva(fpgW)}+0x$leafCmWp), PGTD+${fpgW * 4}\n"
+      }
+      if (faultInHandler) {
+        sb ++= s"    move.l  #0, PGTD+${hpgR * 4}\n"
+        sb ++= s"    move.l  #(${dva(hpgW)}+0x$leafCmWp), PGTD+${hpgW * 4}\n"
+      }
+      // The TRAP#0 handler's own code page: the exception-entry REDIRECT's ITLB walk
+      // is then a walk that faults DURING exception entry.
+      if (faultHandlerPage) sb ++= s"    move.l  #0, PGTC+${TrapPg * 4}\n"
+      // The first sled page: a wrong-path fetch's walk faults and is then squashed.
+      if (faultSled) sb ++= s"    move.l  #0, PGTC+${SledPg * 4}\n"
+      if (sb.nonEmpty) sb ++= "    pflusha\n"
+      sb.toString
+    }
+    val faultSites =
+      if (!faultData) ""
+      else s"""    move.l  ${dva(fpgR)}, %d5           | non-resident -> access fault
+    move.l  %d5, ${dva(fpgW)}           | write-protected -> access fault
+"""
+    val handlerFaultSites =
+      if (!faultInHandler) ""
+      else s"""    move.l  ${dva(hpgR)}, %d5              | NESTED access fault (inside vec 10)
+    move.l  %d5, ${dva(hpgW)}              | NESTED access fault (inside vec 10)
+"""
+    // The vector-2 handler. Repairs EVERY page this program deliberately breaks (the
+    // repair is idempotent, so it does not need to know which one faulted) and RTEs
+    // from the format-$7 frame. Lives on a page that is never broken.
+    val busHandler =
+      if (!anyFault) ""
+      else s"""
+${sec(BusPg)}
+_bus_handler:
+    move.l  #(${dva(fpgR)}+0x$leafCmHex), PGTD+${fpgR * 4}
+    move.l  #(${dva(fpgW)}+0x$leafCmHex), PGTD+${fpgW * 4}
+    move.l  #(${dva(hpgR)}+0x$leafCmHex), PGTD+${hpgR * 4}
+    move.l  #(${dva(hpgW)}+0x$leafCmHex), PGTD+${hpgW * 4}
+    move.l  #(${cva(TrapPg)}+0x21), PGTC+${TrapPg * 4}
+    move.l  #(${cva(SledPg)}+0x21), PGTC+${SledPg * 4}
+    pflusha
+    rte
+"""
+    val busVec = if (anyFault) "    move.l  #_bus_handler, VBR_BASE+8     | vec 2  access fault\n" else ""
+    // 8 KiB only: the second code leaf table (see PgtC2).
+    val code2Link = if (needCode2)
+      "    move.l  #(PGTC2+2), PTRB+132        | PTRB[33] -> PGTC2  (VA 0x40840000)\n" else ""
+    val code2Fill = if (needCode2)
+      s"""    lea     PGTC2, %a0
+    move.l  #${f"0x${TableStressProgram.CodeVa + leafN.toLong * ps + 0x21}%08x"}, %d1
+    bsr     _fill64
 """ else ""
     s"""
     .text
@@ -175,6 +314,7 @@ _irq_handler:
     .equ PGTD,      0x00202000
     .equ PTRB,      0x00203000
     .equ PGTC,      0x00204000
+    .equ PGTC2,     0x00205000
     .equ DATA_VA,   0x60000000
 
 _start:
@@ -195,8 +335,8 @@ $ttrEarly
     move.l  #(PTRB+2), ROOT+128         | root[32] -> PTRB   (VA 0x40000000)
     move.l  #(PGTD+2), PTRC             | PTRC[0]  -> PGTD   (VA 0x60000000)
     move.l  #(PGTC+2), PTRB+128         | PTRB[32] -> PGTC   (VA 0x40800000)
-
-    | ---- leaf tables: 64 entries, PDT=01 resident, CM=01 copyback, U=0 M=0 so the
+$code2Link
+    | ---- leaf tables: $leafN entries, PDT=01 resident, CM=01 copyback, U=0 M=0 so the
     | ---- FIRST touch of every page also runs a walker U/M writeback store.
     lea     PGTD, %a0
     move.l  #(DATA_VA+0x$leafCmHex), %d1
@@ -204,7 +344,7 @@ $ttrEarly
     lea     PGTC, %a0
     move.l  #0x40800021, %d1
     bsr     _fill64
-
+$code2Fill
     | ---- vector table ----
     move.l  #VBR_BASE, %d0
     movec   %d0, %vbr
@@ -217,12 +357,12 @@ _vt:
     bne     _vt
     move.l  #_aline_handler, VBR_BASE+40    | vec 10  A-line
     move.l  #_trap0_handler, VBR_BASE+128   | vec 32  TRAP #0
-$irqVec
+$busVec$irqVec
     | ---- restricted TTR posture: the INSTRUCTION side gets no TTR at all ----
 $ttrLate    move.l  #ROOT, %d0
     movec   %d0, %urp
     movec   %d0, %srp
-    move.l  #0x00008000, %d0               | TC: E=1, 4 KiB pages
+    move.l  #$tcHex, %d0               | $tcCmt
     movec   %d0, %tc
 $irqUnmask
     | ==== from here every fetch may run an ITLB walk and every DATA_VA access a
@@ -231,21 +371,21 @@ $irqUnmask
     move.l  #$iterations, %d7
 _loop:
     pflusha
-$loopCpush$reArmUm$storeStress    move.l  #DATA_VA, %a2
+$loopCpush$reArmUm$breakFaults$storeStress    move.l  #DATA_VA, %a2
     move.l  (%a2), %d0                     | DTLB walk + U writeback
-    lea     0x1000(%a2), %a2
+    lea     0x${psHex}(%a2), %a2
     move.l  %d0, (%a2)                     | DTLB walk + U/M writeback (store)
-    lea     0x1000(%a2), %a2
+    lea     0x${psHex}(%a2), %a2
     move.l  (%a2), %d1
-    lea     0x1000(%a2), %a2
+    lea     0x${psHex}(%a2), %a2
     move.l  %d1, (%a2)
-_aline_site:
+${faultSites}_aline_site:
     .short  0xa05d                         | A-line trap with walks in flight
 ${sledEntry}_after_aline:
-    lea     0x1000(%a2), %a2
+    lea     0x${psHex}(%a2), %a2
     move.l  (%a2), %d2
     pflusha
-    lea     0x1000(%a2), %a2
+    lea     0x${psHex}(%a2), %a2
     move.l  %d2, (%a2)
     trap    #0
 ${sledEntry}_after_trap:
@@ -276,30 +416,30 @@ _z128l:
 
     .align 2
 _fill64:
-    move.l  #64, %d0
+    move.l  #$leafN, %d0
 _f64l:
     move.l  %d1, (%a0)+
-    add.l   #0x1000, %d1
+    add.l   #0x$psHex, %d1
     subq.l  #1, %d0
     bne     _f64l
     rts
 
-    | ---- handlers live on their OWN 4 KiB code pages, so every exception redirect
+    | ---- handlers live on their OWN code pages, so every exception redirect
     | ---- takes a cold ITLB miss and runs a real walk (this is the boot shape:
     | ---- A-line -> dispatch on a different page).
-    .balign 4096
+${sec(AlinePg)}
 _aline_handler:
     move.l  #_after_aline, 2(%a7)          | resume past the A-line word
-$handlerFlush    move.l  0x60010000, %d3                | DTLB walk inside the handler
-    move.l  %d3, 0x60011000                | walker U/M store inside the handler
-    rte
+$handlerFlush    move.l  ${dva(16)}, %d3                | DTLB walk inside the handler
+    move.l  %d3, ${dva(17)}                | walker U/M store inside the handler
+$handlerFaultSites    rte
 
-    .balign 4096
+${sec(TrapPg)}
 _trap0_handler:
     move.l  #_after_trap, 2(%a7)
-$handlerFlush    move.l  0x60012000, %d4
+$handlerFlush    move.l  ${dva(18)}, %d4
     rte
-$irqHandler$sled"""
+$irqHandler$busHandler$sled"""
   }
 }
 
@@ -327,7 +467,15 @@ final case class WalkExcResult(
   maxDcStore: Int,
   maxLsStore: Int,
   cyclesAtEight: Long,
-  wedgeDump: String
+  wedgeDump: String,
+  // Exception-entry vector histogram, and the count of vector-2 (access fault)
+  // entries specifically. Non-vacuity for the faulting-walk rows: a "broken
+  // descriptor" that never actually produced an architectural fault has tested
+  // nothing, and that failure mode is silent without this.
+  vecHist: Map[Int, Long] = Map.empty,
+  vec2Entries: Long = 0L,
+  itlbFaultSeen: Boolean = false,
+  dtlbFaultSeen: Boolean = false
 ) {
   def report(): Unit = {
     println(f"[walkexc] sentinel=0x$sentinel%08x cycles=$cycles retired=$retired " +
@@ -336,6 +484,9 @@ final case class WalkExcResult(
       f"walkStores=$walkStores excEntries=$excEntries excWithWalkGrant=$excWithWalkGrant")
     println(f"[walkexc] sledWalks=$sledWalks maxEDrainRun=$maxEDrainRun " +
       f"itlbRspFault=$itlbRspFault dtlbRspFault=$dtlbRspFault dcDiag=$dcDiag")
+    println(f"[walkexc] vec2Entries=$vec2Entries itlbFaultSeen=$itlbFaultSeen " +
+      f"dtlbFaultSeen=$dtlbFaultSeen vectors=" +
+      vecHist.toSeq.sortBy(_._1).map { case (v, n) => s"$v:$n" }.mkString(","))
     println(f"[walkexc] MISTRANSLATED AXI: badAr=$badAr badAw=$badAw multiHit=$multiHit")
     println(f"[walkexc] storeOutstanding: dcMax=$maxDcStore lsMirrorMax=$maxLsStore " +
       f"cyclesAt8=$cyclesAtEight  (the 3-bit mirror wraps at 8)")
@@ -364,9 +515,15 @@ object WalkExcHarness {
     *        walk in flight when anything else happens.  `AxiMemModel.l2DramSlow` /
     *        `crossbarSingleOutstanding` reproduce the real SoC's memory behaviour, which
     *        widens that window by an order of magnitude. */
+  /** @param codeTop exclusive top of the legally-mapped CODE window, for the
+    *        mistranslation detector.  4 KiB postures map ONE 256 KiB code leaf table
+    *        (`0x40840000`); 8 KiB postures map two (`0x40880000`), because a 48-page
+    *        sled at 8 KiB spacing is 384 KiB.  Passing the wrong one either misses
+    *        real mistranslations or reports legal fetches as bad. */
   def run(src: String, timeoutCycles: Long = 400000L, simSeed: Int = 1,
           trace: Boolean = false, irqPeriod: Int = 0,
-          memCfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig()): WalkExcResult = {
+          memCfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+          codeTop: Long = 0x40840000L): WalkExcResult = {
     val image = ProgramAssembler.assemble(src, PortedTestRunner.loadAddr) match {
       case Right(i)  => i
       case Left(err) => throw new AssertionError(s"assemble failed: ${err.reason}")
@@ -445,6 +602,8 @@ object WalkExcHarness {
       var dtlbRspFault = 0L
       var firstFaultCyc = 0L
       var sledWalks = 0L
+      val vecHist = scala.collection.mutable.Map.empty[Int, Long]
+      var vec2Entries = 0L
       var eDrainRun = 0L
       var maxEDrainRun = 0L
       var irqHold = 0
@@ -463,7 +622,11 @@ object WalkExcHarness {
           // direct measurement of whether the frontend really "runs away down the wrong
           // path" during E_DRAIN, which is 030651f's central claim.
           val pa = dut.itlb.walkLoadCmd.payload.paddr.toLong & 0xffffffffL
-          if (pa >= (TableStressProgram.PgtC + 16) && pa < (TableStressProgram.PgtC + 256))
+          // PGTC2 exists only in 8 KiB postures, where the sled spills past the first
+          // 256 KiB code leaf table; counting it too keeps `sledWalks` meaning the same
+          // thing at both page sizes.
+          if ((pa >= (TableStressProgram.PgtC + 16) && pa < (TableStressProgram.PgtC + 256)) ||
+              (pa >= TableStressProgram.PgtC2 && pa < (TableStressProgram.PgtC2 + 256)))
             sledWalks += 1
         }
         if (dut.dtlb.walkLoadCmd.valid.toBoolean && dut.dtlb.walkLoadCmd.ready.toBoolean) dtlbWalkCmds += 1
@@ -556,7 +719,7 @@ object WalkExcHarness {
         // also the only way this program can produce a vector-2 access fault without
         // the MMU reporting a fault of its own.
         def legal(a: Long): Boolean =
-          (a < 0x01000000L) || (a >= 0x40800000L && a < 0x40840000L) ||
+          (a < 0x01000000L) || (a >= 0x40800000L && a < codeTop) ||
           (a >= 0x60000000L && a < 0x60040000L) || ((a >>> 16) == 0xffffL)
         if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
           val a = dut.dcache.logic.axi.ar.payload.addr.toLong & 0xffffffffL
@@ -589,6 +752,11 @@ object WalkExcHarness {
         // confusing run showing a stale vec/PC pair).
         if (tracePend > 0) {
           tracePend -= 1
+          if (tracePend == 0) {
+            val v = exc.curVec.toInt
+            vecHist(v) = vecHist.getOrElse(v, 0L) + 1L
+            if (v == 2) vec2Entries += 1
+          }
           if (tracePend == 0 && trace && excEntries <= 40)
             println(f"[walkexc] cyc=$cyc%7d ENTRY vec=${exc.curVec.toInt}%3d " +
               f"pc=0x${exc.curPc.toLong}%08x dtlbFault=${dut.dtlb.logic.faultSeen.toBoolean} " +
@@ -702,7 +870,10 @@ object WalkExcHarness {
                           f"resp=${dut.dcache.logic.diagFaultResp.toInt}",
                           badAr, badAw, badArLog, multiHit,
                           maxDcStoreOutstanding, maxLsStoreOutstanding,
-                          dcStoreOutstandingAt8, wedgeDump)
+                          dcStoreOutstandingAt8, wedgeDump,
+                          vecHist.toMap, vec2Entries,
+                          dut.itlb.logic.faultSeen.toBoolean,
+                          dut.dtlb.logic.faultSeen.toBoolean)
     }
     out
   }
@@ -732,6 +903,46 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 60))
   private val slowMemXbar = slowMem.copy(crossbarSingleOutstanding = true)
 
+  // ── PAGE SIZE ──────────────────────────────────────────────────────────────────
+  // Every row below runs at BOTH page sizes. This is not padding: `is8K` changes the
+  // walker's leaf-descriptor offset, the TLB tagging key and the PA assembly (see
+  // `TableStressProgram.src`'s `pages8K` doc), all on the path `2db5bd3` re-routed,
+  // and the board ROM this campaign is chasing uses 8 KiB pages while every posture
+  // in this file was 4 KiB.
+  private val pageSizes = Seq(false, true)
+  private def tag(p8: Boolean, name: String): String = if (p8) s"8K/$name" else name
+  // 8 KiB postures map a SECOND code leaf table (a 48-page sled is 384 KiB at 8 KiB
+  // spacing), so the mistranslation detector's legal code window is twice as wide.
+  private def codeTopFor(p8: Boolean): Long = if (p8) 0x40880000L else 0x40840000L
+
+  /** A NO-SIM gate on the generator itself.  The fault rows pin the code layout with
+    * `.org`, and the 8 KiB rows change every page stride, leaf-table size and immediate
+    * in the program -- both are ways to produce source that a real `m68k-linux-gnu-as`
+    * rejects (`.org` backwards, a branch out of range, a leaf index past the table).
+    * Without this the first symptom would be a Verilator run failing minutes later with
+    * an assembler message, which costs a whole test JVM to learn. Deliberately NOT
+    * tagged `VerilatorTest`: it needs no DUT and runs in seconds. */
+  test("every posture assembles (no sim; catches .org / layout / range errors)") {
+    for (p8 <- pageSizes) {
+      def check(label: String, src: String): Unit =
+        ProgramAssembler.assemble(src, PortedTestRunner.loadAddr) match {
+          case Right(img) => println(f"[walkexc] asm ok  $label%-32s ${img.bytes.size}%8d bytes")
+          case Left(e)    => fail(s"$label failed to assemble: ${e.reason}")
+        }
+      check(tag(p8, "plain"), TableStressProgram.src(16, pages8K = p8))
+      check(tag(p8, "sled48"), TableStressProgram.src(12, dirtyTables = true, cpush = true,
+        irqs = true, sledPages = 48, pages8K = p8))
+      check(tag(p8, "stores"), TableStressProgram.src(6, dirtyTables = true, cpush = true,
+        irqs = true, leafWritethrough = true, storeBurst = 20, storeGroups = 24, pages8K = p8))
+      check(tag(p8, "noWalk"), TableStressProgram.src(6, dirtyTables = true, cpush = true,
+        irqs = true, leafWritethrough = true, storeBurst = 12, noWalk = true, pages8K = p8))
+      for ((n, fd, fh, fe, fs, cp, irq, _) <- faultMatrix)
+        check(tag(p8, n), TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
+          sledPages = if (fs) 12 else 0, pages8K = p8, faultData = fd, faultInHandler = fh,
+          faultHandlerPage = fe, faultSled = fs))
+    }
+  }
+
   private val matrix = Seq(
     ("base",                       false, false, false, 0,   zeroLat),
     ("dirtyTables",                true,  false, false, 0,   zeroLat),
@@ -746,15 +957,20 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     ("slowMemXbar+cpush+irq",      true,  true,  true,  700, slowMemXbar)
   )
 
-  for ((name, dirty, cp, irq, period, mem) <- matrix) {
+  for (p8 <- pageSizes; (name0, dirty, cp, irq, period, mem) <- matrix) {
+    val name = tag(p8, name0)
     test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
       val r = WalkExcHarness.run(
-        TableStressProgram.src(16, dirtyTables = dirty, cpush = cp, irqs = irq),
-        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem)
+        TableStressProgram.src(16, dirtyTables = dirty, cpush = cp, irqs = irq,
+                               pages8K = p8),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem,
+        codeTop = codeTopFor(p8))
       println(s"[walkexc] --- $name ---")
       r.report()
       assert(r.itlbWalkCmds > 0 && r.dtlbWalkCmds > 0,
         s"VACUOUS [$name]: no real table walk occurred")
+      assert(r.badAr == 0 && r.badAw == 0,
+        s"MISTRANSLATION [$name]: badAr=${r.badAr} badAw=${r.badAw}\n${r.badArLog}")
       assert(r.sentinel == WalkExcHarness.PassWord,
         s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
         s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
@@ -797,14 +1013,16 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     ("stores-wt+slowMem-NOWALK-bare", true, slowMem, 12, false, false, true)
   )
 
-  for ((name, wt, mem, burst, irq, cp, noWalk) <- storeMatrix) {
+  for (p8 <- pageSizes; (name0, wt, mem, burst, irq, cp, noWalk) <- storeMatrix) {
+    val name = tag(p8, name0)
     test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
       val r = WalkExcHarness.run(
         TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
                                leafWritethrough = wt, storeBurst = burst,
-                               storeGroups = 24, noWalk = noWalk),
+                               storeGroups = 24, noWalk = noWalk, pages8K = p8),
         timeoutCycles = 900000L, simSeed = 1, irqPeriod = if (irq) 700 else 0,
-        memCfg = mem, trace = sys.env.contains("WALKEXC_TRACE"))
+        memCfg = mem, trace = sys.env.contains("WALKEXC_TRACE"),
+        codeTop = codeTopFor(p8))
       println(s"[walkexc] --- $name ---")
       r.report()
       if (!noWalk) assert(r.walkStores > 50,
@@ -837,12 +1055,14 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
       results.filter(_._2.badAr > 0).map(t => s"seed ${t._1}").mkString(", "))
   }
 
-  for ((name, dirty, cp, irq, period, mem) <- sledMatrix) {
+  for (p8 <- pageSizes; (name0, dirty, cp, irq, period, mem) <- sledMatrix) {
+    val name = tag(p8, name0)
     test(s"walk/exception stress [$name] makes forward progress", VerilatorTest) {
       val r = WalkExcHarness.run(
         TableStressProgram.src(12, dirtyTables = dirty, cpush = cp, irqs = irq,
-                               sledPages = 48),
-        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem)
+                               sledPages = 48, pages8K = p8),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = period, memCfg = mem,
+        codeTop = codeTopFor(p8))
       println(s"[walkexc] --- $name ---")
       r.report()
       assert(r.itlbWalkCmds > 0 && r.dtlbWalkCmds > 0,
@@ -853,13 +1073,91 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     }
   }
 
-  test("exception entry with table walks in flight makes forward progress", VerilatorTest) {
-    val r = WalkExcHarness.run(TableStressProgram.src(24), timeoutCycles = 600000L, simSeed = 1)
-    r.report()
-    assert(r.excWithWalkGrant > 0,
-      "VACUOUS: no exception-sequencer episode ever overlapped a held walker grant")
-    assert(r.sentinel == WalkExcHarness.PassWord,
-      s"program did not pass: sentinel=0x${r.sentinel.toHexString} " +
-      s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+  for (p8 <- pageSizes) {
+    test(s"exception entry with table walks in flight makes forward progress " +
+         s"[${if (p8) "8K" else "4K"}]", VerilatorTest) {
+      val r = WalkExcHarness.run(TableStressProgram.src(24, pages8K = p8),
+                                 timeoutCycles = 600000L, simSeed = 1,
+                                 codeTop = codeTopFor(p8))
+      r.report()
+      assert(r.excWithWalkGrant > 0,
+        "VACUOUS: no exception-sequencer episode ever overlapped a held walker grant")
+      assert(r.sentinel == WalkExcHarness.PassWord,
+        s"program did not pass: sentinel=0x${r.sentinel.toHexString} " +
+        s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+    }
+  }
+
+  /** FAULTING WALKS -- the posture's other structural hole.
+    *
+    * Before these rows EVERY walk in this file succeeded.  A walk that FAULTS takes a
+    * different exit out of `TableWalker` (RD_ROOT/RD_PTR non-resident, RD_PAGE
+    * invalid/write-protect/supervisor, or a `loadRsp.fault` descriptor read) and, when
+    * it faults, the owning TLB must still release the D-cache load/store port it holds,
+    * still retire `missPending`, and still let the U/M queue credit go back.  Doing that
+    * WHILE the exception sequencer is mid-entry is the case that has never been
+    * simulated, and a deterministic loss of forward progress is exactly what a port that
+    * is not released on the fault path looks like.
+    *
+    * Each row installs a vector-2 handler that REPAIRS the descriptor it broke,
+    * `PFLUSHA`es and `RTE`s, so a correct machine demand-pages and finishes; a machine
+    * that leaks the port on the fault path stops retiring instead.
+    *
+    *  - `data`      : the faulting accesses sit in ordinary code, immediately before the
+    *                  A-line, so the fault and the A-line entry overlap.
+    *  - `nested`    : they sit INSIDE the A-line handler -- a fault raised while the
+    *                  machine is already inside an exception.
+    *  - `entry`     : the TRAP#0 handler's own code page is non-resident, so the
+    *                  exception-entry REDIRECT's ITLB walk is the thing that faults.
+    *  - `wrongpath` : the first sled page is non-resident.  The sled is never
+    *                  architecturally reached, so this is a faulting walk on a fetch
+    *                  that is then SQUASHED (`walkFlushPoison`'s reason to exist). */
+  //                       name            data   nested entry  sled   cpush  irq   mem
+  private val faultMatrix = Seq(
+    ("faults-data",        true,  false, false, false, false, false, zeroLat),
+    ("faults-nested",      true,  true,  false, false, false, false, zeroLat),
+    ("faults-entry",       true,  true,  true,  false, true,  false, zeroLat),
+    ("faults-wrongpath",   false, false, false, true,  true,  false, zeroLat),
+    ("faults-all",         true,  true,  true,  true,  true,  true,  zeroLat),
+    ("faults-all+slowMem", true,  true,  true,  true,  true,  true,  slowMem),
+    ("faults-all+xbar",    true,  true,  true,  true,  true,  true,  slowMemXbar)
+  )
+
+  for (p8 <- pageSizes; (name0, fd, fh, fe, fs, cp, irq, mem) <- faultMatrix) {
+    val name = tag(p8, name0)
+    test(s"faulting walks [$name] make forward progress", VerilatorTest) {
+      val r = WalkExcHarness.run(
+        TableStressProgram.src(6, dirtyTables = true, cpush = cp, irqs = irq,
+                               sledPages = if (fs) 12 else 0, pages8K = p8,
+                               faultData = fd, faultInHandler = fh,
+                               faultHandlerPage = fe, faultSled = fs),
+        timeoutCycles = 900000L, simSeed = 1, irqPeriod = if (irq) 700 else 0,
+        memCfg = mem, trace = sys.env.contains("WALKEXC_TRACE"),
+        codeTop = codeTopFor(p8))
+      println(s"[walkexc] --- $name ---")
+      r.report()
+      assert(r.itlbWalkCmds > 0 && r.dtlbWalkCmds > 0,
+        s"VACUOUS [$name]: no real table walk occurred")
+      // A broken descriptor that never produced a fault has tested nothing, and that
+      // failure is otherwise completely silent.
+      if (fd || fh || fe)
+        assert(r.vec2Entries > 0,
+          s"VACUOUS [$name]: no vector-2 access fault was ever delivered " +
+          s"(vectors=${r.vecHist.toSeq.sortBy(_._1).mkString(",")})")
+      assert(r.dtlbFaultSeen || r.itlbFaultSeen,
+        s"VACUOUS [$name]: neither TLB ever reported a faulting translation")
+      // The wrong-path-only row must NOT deliver an architectural fault: the sled is
+      // unreachable in program order. If it does, the squash path is leaking a
+      // speculative walk's fault into the architectural state -- report it as such.
+      if (fs && !fd && !fh && !fe)
+        assert(r.vec2Entries == 0,
+          s"[$name] a SQUASHED wrong-path fetch's faulting walk was delivered " +
+          s"architecturally: vec2Entries=${r.vec2Entries} lastPc=0x${r.lastCommitPc.toHexString}")
+      assert(r.badAr == 0 && r.badAw == 0,
+        s"MISTRANSLATION [$name]: badAr=${r.badAr} badAw=${r.badAw}\n${r.badArLog}")
+      assert(r.sentinel == WalkExcHarness.PassWord,
+        s"[$name] did not pass: sentinel=0x${r.sentinel.toHexString} " +
+        s"retired=${r.retired} lastPc=0x${r.lastCommitPc.toHexString}")
+    }
   }
 }
