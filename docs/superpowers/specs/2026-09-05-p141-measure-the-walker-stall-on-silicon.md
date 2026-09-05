@@ -263,3 +263,112 @@ asynchronous crossing that arguably should carry `set_false_path`/
 peripheral bus, not the CPU/walker/D-cache path, so it does not explain a
 CPU-internal deadlock that is bit-identical across boots — but it is a real
 constraint gap and should be closed on its own merits.
+
+---
+
+# ILA RESULT — the approach, captured cycle-exact 2026-09-05
+
+The owner's call to build the ILA anyway was right: the snapshot named the
+stuck term, but it could not have produced the mechanism below.
+
+**`ILA_ENABLE + CPU_M68K040` was a real build defect and is now fixed** (see the
+SoC commit "fix(ila): make ILA_ENABLE + CPU_M68K040 build again"). The ILA
+bitstream is `build_id=0xf6b570c4`, cpu040 `358d687`, and `hw_ila_1` enumerates
+on the device.
+
+## First finding: the wedge is NOT perturbation-sensitive
+
+The ILA build carries ~28-32 extra BRAMs and thousands of LUTs and has a
+completely different placement. **It wedges anyway, with a bit-identical stall
+word** to the CSR build:
+`dc=0x0003c002 grant=0x08000000 exc=0x00000203 walk=0x00210028`.
+
+That is a direct contrast with p128, where instrumentation made the wedge
+disappear. This deadlock is structural and placement-independent.
+
+## Capture method — the part that matters
+
+Arming while the machine was already wedged triggers instantly and fills the
+buffer with 4096 identical post-freeze samples (useless). The working recipe is:
+
+1. `reset hold` — CPU held, trigger condition verifiably false (`dc=0x0003c001`).
+2. arm (trigger position 3968/4096, late, to keep the approach).
+3. `reset release` — the wedge then happens *while armed*.
+
+Also: **the retire count at freeze is NOT constant on this build**
+(`0x050906ab`, `0x0541fcfe`, `0x050902dd`, `0x05421cdc`). Only the *stall state*
+is bit-identical. So an equality trigger on the retire count does not work; the
+trigger is the three-word deadlock state itself.
+
+## The mechanism, cycle by cycle
+
+`rel` is relative to the last retire (sample 3949).
+
+```
+ rel  exc        ld    dtlb      cmdSent cmdV cmdR rsp busy  blocking
+  +0  IDLE       CORE  IDLE         1     0    0    0   0    earlyProbeValid
+  +1  E_DRAIN    CORE  RD_ROOT      0     1    0    0   0    earlyProbeValid
+  +2  E_DRAIN    DTLB  RD_ROOT      0     1    1    0   0    -            <- accepted
+  +3  E_STORE    CORE  RD_ROOT      1     0    0    0   0    ldS1Valid    <- grant released
+  +4  E_STWAIT   CORE  RD_ROOT      1     0    0    1   0    ldS2Valid    <- response OK
+  +5  E_STWAIT   CORE  RD_PTR       0     1    0    0   0    ...
+  +6  E_STWAIT   DTLB  RD_PTR       0     1    1    0   0    ...          <- accepted
+  +8  E_STWAIT   CORE  RD_PTR       1     0    0    1   0    ...          <- response OK
+  +9  E_STWAIT   CORE  RD_PAGE      0     1    0    0   0    ...
+ +10  E_STWAIT   DTLB  RD_PAGE      0     1    1    0   0    ...          <- ACCEPTED
+ +11  E_STWAIT   CORE  RD_PAGE      1     0    0    0   0    ...          <- grant released
+ +12  E_STWAIT   CORE  RD_PAGE      1     0    0    0   1    busy,!evictAwDone,!evictWDone
+ +13… E_STWAIT   CORE  RD_PAGE      1     0    0    0   1    busy         <- forever
+```
+
+So `busy` **did not "never clear"** — it was **newly asserted at rel +12** by the
+walker's third descriptor read and then never cleared. That is discrimination
+(b)/(c), not (a), and it is exactly what a frozen snapshot could not have told
+us.
+
+The first two descriptor reads (`RD_ROOT`, `RD_PTR`) **hit** and returned in two
+cycles. The third (`RD_PAGE`) **missed**: the load FSM left `IDLE` (hence
+`busy`), started an eviction (`!evictAwDone`/`!evictWDone` at +12, both done by
++13), entered the refill — and **the refill's AXI read response never arrives**.
+
+Note the grant machine is working perfectly throughout: CORE→DTLB→CORE
+hand-overs complete in one cycle, every time, right up to +11. Nothing is
+starved and no grant is held. That is why `030651f` could not have helped.
+
+## The trigger condition
+
+In this capture five table walks start. The separation is total:
+
+| walk start | ExceptionUnit state at start | outcome |
+|---|---|---|
+| rel −2085 | `IDLE` | completed |
+| rel −413 | `IDLE` | completed |
+| rel −160 | `IDLE` | completed |
+| rel −122 | `IDLE` | completed |
+| **rel +1** | **`E_DRAIN`** | **DEADLOCK** |
+
+**A table walk that begins while an exception entry is in progress — and that
+then MISSES the D-cache — never gets its refill response.** Four walks that
+started with the sequencer idle all completed normally.
+
+## Where to look next
+
+The failure is in the **D-cache line-fill read path for a walker-initiated
+miss taken while an exception-frame store is in flight** (`serialStoreInFlight=1`,
+`storeOutstanding=1` across rel +5…+17). The eviction completes; the refill read
+response does not come back.
+
+Prime suspects, in order:
+1. **AXI read-ID / response routing** for the refill issued concurrently with the
+   exception's serialised write — there is already a `cpu040-axi-id-race`
+   worktree and an "AXI socket-adapter: 2 CRITICAL silent-corruption gaps" note.
+2. The D-cache load FSM's `REFILL` arm and its interaction with
+   `serialStoreInFlight` / the store-side AXI pair flags.
+3. The MSHR/`AxiDMerge` multiplexing of a walker-tagged fill against core traffic.
+
+The next probe round should add the **load FSM state** (`EVICT_WR`/`REFILL`/
+`REPLAY` — `busy` alone cannot distinguish them), the refill AXI **ARID/RID**,
+and the ownership-FIFO `ldRspTag`.
+
+Raw captures: `logs/p141/p141_approach.csv.gz` (the approach, the important one)
+and `logs/p141/p141_terminal.csv.gz`.
