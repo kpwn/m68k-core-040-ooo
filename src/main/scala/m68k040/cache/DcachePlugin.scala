@@ -2259,6 +2259,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // [24] is the composite the ExceptionUnit actually waits on, so a capture can
     // confirm the CSR view agrees with the consumer rather than assuming it.
     dbgStallDcPack(24) := dcIdleForMaint && !maintBusyReg
+
     dbgStallDcPack.simPublic()
 
     val maintWalkingDbg = Bool(); maintWalkingDbg.simPublic()
@@ -3291,6 +3292,44 @@ class DcachePlugin(val socketMerged: Boolean = false,
         "DcachePlugin: unexpected async diagnostic fault (a trusted-cacheable-path AXI transaction errored) -- if this test intends to exercise it, poke diagFaultExpected := True first",
         FAILURE)
     }
+
+    // ── Late-sampled stall observability ─────────────────────────────────────────────
+    // ASSIGNED HERE, at the very end of the Area, and NOT beside the other
+    // `dbgStallDcPack` bits ~1000 lines up: SpinalHDL resolves conditional drives by
+    // SOURCE ORDER (last assignment wins), so reading `axi.ar.valid`/`axi.aw.valid`/
+    // `axi.w.valid` at the earlier site would capture only the drives elaborated before
+    // it -- REFILL's AR (:1876) and EVICT_WR's aw/w (:1812/:1821) but NOT the store
+    // backend's own aw/w (:3034/:3043), silently reporting the write channels idle
+    // whenever the store path is the one driving them. Every AXI drive in this file is
+    // above this point, so these seven bits see the final values.
+    /** [31:25], 2026-09-05: WHICH state `busy` is stuck in, and whether any AXI beat is
+      * actually outstanding. The p141 ILA capture pinned the wedge to exactly one of the
+      * 17 terms above -- `busy` -- and there it stopped, because `busy` is True across
+      * the whole EVICT_WR/REFILL/REPLAY excursion and cannot tell them apart. The three
+      * candidates need different fixes and are otherwise INDISTINGUISHABLE in the pack:
+      * with `evictAwDone`/`evictWDone` both set (as measured), EVICT_WR waiting on a B
+      * whose `id =/= D_PUSH` never arrives (:1828) and REFILL waiting on an R that never
+      * arrives (:1899) produce a bit-identical [24:0].
+      *
+      * [26:25] separates them. [28]/[29]/[30]/[31] then say whether the core is still
+      * ASKING (a valid presented and unaccepted -- a fabric-side stall) or has gone
+      * quiet with a response outstanding (an ID-filter or grant-routing loss, which no
+      * watchdog in this design covers: `AxiDMerge.wr.wedge` is gated on its own `busy`,
+      * and `axi.b.ready` is held True globally at :468, so a B whose id matches no
+      * consumer is silently consumed and dropped). [27] `arSent` distinguishes "REFILL
+      * has not issued its AR yet" from "issued, awaiting R".
+      *
+      * Costs nothing to carry: these are seven previously-zero bits of an already-
+      * exported 32-bit pack, no new ports, no new state, no datapath consumer. */
+    dbgStallDcPack(26 downto 25) := Mux(fsm.isActive(fsm.EVICT_WR), B("01"),
+                                    Mux(fsm.isActive(fsm.REFILL),   B("10"),
+                                    Mux(fsm.isActive(fsm.REPLAY),   B("11"), B("00"))))
+    dbgStallDcPack(27) := arSent
+    dbgStallDcPack(28) := axi.ar.valid
+    dbgStallDcPack(29) := axi.r.valid
+    dbgStallDcPack(30) := axi.b.valid
+    dbgStallDcPack(31) := axi.aw.valid || axi.w.valid
+
   }
 
   override def loadProbe = logic.loadProbePort
