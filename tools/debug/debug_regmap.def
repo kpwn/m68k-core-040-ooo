@@ -119,6 +119,13 @@ REG OFF_INST_HI           0x0100C RO    2 0x00000000 Architectural macro-instruc
 REG OFF_MISPRED_COUNT     0x01010 RO    7 0x00000000 Branch mispredictions; zero until a real producer exists.
 REG OFF_FLUSH_COUNT       0x01014 RO    7 0x00000000 Pipeline flushes; zero until a real producer exists.
 REG OFF_EXC_COUNT         0x01018 RO    7 0x00000000 Exceptions taken; zero until a real producer exists.
+# p141 walker-stall state. LIVE (no halt), stage 2 like OFF_INST_LO -- these are
+# for diagnosing a livelock, where a debug halt never lands, so a halt-captured
+# register in the 0x020xx arch block would read stale or zero.
+REG OFF_STALL_DC          0x0101C RO    2 0x00000000 D-cache dcIdleForMaint terms, individually.
+REG OFF_STALL_GRANT       0x01020 RO    2 0x00000000 D-cache port ownership and walker grant machine.
+REG OFF_STALL_EXC         0x01024 RO    2 0x00000000 ExceptionUnit FSM one-hot and its drain predicates.
+REG OFF_STALL_WALK        0x01028 RO    2 0x00000000 TableWalker FSMs: DTLB in [15:0], ITLB in [31:16].
 
 # ------------------------------------------- architectural write shadows --
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.

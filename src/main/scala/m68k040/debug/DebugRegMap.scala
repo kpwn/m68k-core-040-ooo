@@ -101,16 +101,6 @@ object DebugRegMap {
   val OFF_MISPRED_COUNT: Int = 0x01010
   val OFF_FLUSH_COUNT: Int = 0x01014
   val OFF_EXC_COUNT: Int = 0x01018
-  // 2026-09-05 walker-stall observability (p141). Four LIVE, read-only state
-  // words for diagnosing the deterministic `0x40806b68` boot wedge on silicon.
-  //
-  // Deliberately placed in the 0x010xx counter block, NOT the 0x020xx arch-state
-  // block: 0x020xx is the halt-captured architectural snapshot, and this wedge
-  // is a livelock with no retire boundary, so a debug halt does not land and a
-  // halt-captured register would read stale or zero. These four follow the
-  // `OFF_INST_LO` precedent instead -- sampled from live core signals with no
-  // halt required, which is the only reason `retired_macros` is trustworthy on
-  // a wedged board while `inst-count` is not.
   val OFF_STALL_DC: Int = 0x0101C
   val OFF_STALL_GRANT: Int = 0x01020
   val OFF_STALL_EXC: Int = 0x01024
