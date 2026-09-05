@@ -187,6 +187,7 @@ object TableStressProgram {
     // 6 = IRQ handler, 7 = access-fault handler, 8.. = the sled.
     def sec(pg: Int): String = if (orgLayout) s"    .org ${pg * ps}" else s"    .balign $ps"
     val AlinePg = 4; val TrapPg = 5; val IrqPg = 6; val BusPg = 7; val SledPg = 8
+    val sledBreak = if (sledPages == 0) 0 else math.min(sledPages, 8)
     def dva(pg: Int): String = f"0x${TableStressProgram.DataVa + pg.toLong * ps}%08x"
     def cva(pg: Int): String = f"0x${TableStressProgram.CodeVa + pg.toLong * ps}%08x"
 
@@ -262,8 +263,14 @@ _irq_handler:
       // The TRAP#0 handler's own code page: the exception-entry REDIRECT's ITLB walk
       // is then a walk that faults DURING exception entry.
       if (faultHandlerPage) sb ++= s"    move.l  #0, PGTC+${TrapPg * 4}\n"
-      // The first sled page: a wrong-path fetch's walk faults and is then squashed.
-      if (faultSled) sb ++= s"    move.l  #0, PGTC+${SledPg * 4}\n"
+      // The sled's leading pages: a wrong-path fetch's walk faults and is then squashed.
+      // MEASURED: breaking only the FIRST sled page reached the fault at 4 KiB
+      // (itlbFaultSeen) but not at 8 KiB -- how far the runaway gets before the A-line's
+      // redirect squashes it is not something the program controls. Breaking the leading
+      // run makes the case reachable wherever the runaway stops, instead of depending on
+      // it reaching one specific page.
+      if (faultSled)
+        for (i <- 0 until sledBreak) sb ++= s"    move.l  #0, PGTC+${(SledPg + i) * 4}\n"
       if (sb.nonEmpty) sb ++= "    pflusha\n"
       sb.toString
     }
@@ -290,8 +297,8 @@ _bus_handler:
     move.l  #(${dva(hpgR)}+0x$leafCmHex), PGTD+${hpgR * 4}
     move.l  #(${dva(hpgW)}+0x$leafCmHex), PGTD+${hpgW * 4}
     move.l  #(${cva(TrapPg)}+0x21), PGTC+${TrapPg * 4}
-    move.l  #(${cva(SledPg)}+0x21), PGTC+${SledPg * 4}
-    pflusha
+${(0 until sledBreak).map(i =>
+      s"    move.l  #(${cva(SledPg + i)}+0x21), PGTC+${(SledPg + i) * 4}\n").mkString}    pflusha
     rte
 """
     val busVec = if (anyFault) "    move.l  #_bus_handler, VBR_BASE+8     | vec 2  access fault\n" else ""
@@ -1112,11 +1119,19 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
     *  - `wrongpath` : the first sled page is non-resident.  The sled is never
     *                  architecturally reached, so this is a faulting walk on a fetch
     *                  that is then SQUASHED (`walkFlushPoison`'s reason to exist). */
+  // THE ROWS ARE DELIBERATELY ISOLATED, not cumulative. The vector-2 handler repairs
+  // EVERY page the program breaks (it does not decode which one faulted), so in a
+  // cumulative row the FIRST fault repairs all the others and every later case becomes
+  // unreachable. That is not a hypothetical: the first version of this matrix was
+  // cumulative and `faults-data`, `faults-nested` and `faults-entry` came back with
+  // BYTE-IDENTICAL vector histograms (2:18,10:24,32:39) and `itlbFaultSeen=false` on the
+  // row whose entire point was an I-side fault -- two of the three rows were vacuous and
+  // said nothing about it. One row per case; one combined row at the end.
   //                       name            data   nested entry  sled   cpush  irq   mem
   private val faultMatrix = Seq(
     ("faults-data",        true,  false, false, false, false, false, zeroLat),
-    ("faults-nested",      true,  true,  false, false, false, false, zeroLat),
-    ("faults-entry",       true,  true,  true,  false, true,  false, zeroLat),
+    ("faults-nested",      false, true,  false, false, false, false, zeroLat),
+    ("faults-entry",       false, false, true,  false, true,  false, zeroLat),
     ("faults-wrongpath",   false, false, false, true,  true,  false, zeroLat),
     ("faults-all",         true,  true,  true,  true,  true,  true,  zeroLat),
     ("faults-all+slowMem", true,  true,  true,  true,  true,  true,  slowMem),
@@ -1144,15 +1159,48 @@ class WalkerExcEntryWedgeSpec extends AnyFunSuite {
         assert(r.vec2Entries > 0,
           s"VACUOUS [$name]: no vector-2 access fault was ever delivered " +
           s"(vectors=${r.vecHist.toSeq.sortBy(_._1).mkString(",")})")
-      assert(r.dtlbFaultSeen || r.itlbFaultSeen,
-        s"VACUOUS [$name]: neither TLB ever reported a faulting translation")
-      // The wrong-path-only row must NOT deliver an architectural fault: the sled is
-      // unreachable in program order. If it does, the squash path is leaking a
-      // speculative walk's fault into the architectural state -- report it as such.
-      if (fs && !fd && !fh && !fe)
+      // Per-case non-vacuity, on the SIDE the case is about -- and ONLY on the isolated
+      // rows. `dtlbFaultSeen` alone would have passed all three cumulative rows while two
+      // of them tested nothing; only `itlbFaultSeen` distinguishes an I-side
+      // (fetch / entry-redirect) faulting walk from a D-side one. On the COMBINED row
+      // which side wins the race is not determined by the program (the repair is global,
+      // so whichever page faults first suppresses the rest), so asserting a side there
+      // would be asserting a coincidence.
+      val isolated = Seq(fd, fh, fe, fs).count(identity) == 1
+      if (isolated && (fd || fh)) assert(r.dtlbFaultSeen, s"VACUOUS [$name]: the DTLB never faulted")
+      if (isolated && fe) assert(r.itlbFaultSeen,
+        s"VACUOUS [$name]: the ITLB never reported a faulting translation -- the " +
+        s"exception-entry redirect walk never happened (itlbWalkCmds=${r.itlbWalkCmds})")
+      if (isolated && fs) {
+        // MEASURED at both page sizes with the eight leading sled pages non-resident:
+        //
+        //   4 KiB -- the runaway during exception entry DOES cross into the next code
+        //            page, its ITLB walk faults, and the fault is correctly SQUASHED
+        //            (itlbFaultSeen=true, vec2Entries=0). That is the case
+        //            `walkFlushPoison` exists for, and it is now covered.
+        //   8 KiB -- the runaway does NOT reach the next page at all (itlbFaultSeen
+        //            false), because that page is twice as far away.
+        //
+        // Both directions are asserted so a change in either is reported rather than
+        // silently absorbed. Note what the 8 KiB result costs `030651f`'s premise --
+        // "during E_DRAIN the frontend runs away down the wrong path, every page it runs
+        // into is an ITLB miss and hence a walk": on a machine with the BOARD's page
+        // size, the runaway does not leave its page even when the next eight pages are
+        // deliberately unmapped and it is invited to.
+        if (!p8) assert(r.itlbFaultSeen,
+          s"[$name] the wrong-path runaway no longer reaches the broken sled page at " +
+          s"4 KiB -- this row is now vacuous (sledWalks=${r.sledWalks})")
+        else assert(!r.itlbFaultSeen,
+          s"[$name] the wrong-path runaway now DOES reach the broken sled page at 8 KiB " +
+          s"(it previously did not) -- re-examine the E_DRAIN runaway story " +
+          s"(sledWalks=${r.sledWalks})")
+        // Either way it must NOT be delivered architecturally: the sled is unreachable in
+        // program order, so a vector-2 here means the squash path is leaking a
+        // speculative walk's fault into architectural state.
         assert(r.vec2Entries == 0,
           s"[$name] a SQUASHED wrong-path fetch's faulting walk was delivered " +
           s"architecturally: vec2Entries=${r.vec2Entries} lastPc=0x${r.lastCommitPc.toHexString}")
+      }
       assert(r.badAr == 0 && r.badAw == 0,
         s"MISTRANSLATION [$name]: badAr=${r.badAr} badAw=${r.badAw}\n${r.badArLog}")
       assert(r.sentinel == WalkExcHarness.PassWord,
