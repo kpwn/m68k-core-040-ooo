@@ -1,0 +1,124 @@
+===== walker/D-cache postroute gate: arm 'p141head' =====
+ref            : 6e3de3b (6e3de3b)
+netlist md5    : 6c399b33c87f639e2209ab8c3df77175
+POSTROUTE_ROUNDS: 1
+finished       : 2026-09-05T13:32:57+02:00
+--- verdict lines (clk domain; SIGNOFF_* is re-derived at a real 5.000 ns) ---
+#   # (rounds 4-9 all -0.015). Total TNS across the whole design was -0.277ns over just 32
+#   # failing endpoints, all inside a 0.015ns band. That is not a design that has run out
+#   # once `phys_opt_design` has driven WNS to within a hair of the 5.000ns target and TNS
+#   # SIGNOFF_200MHZ_WNS_NS +0.009) it was under precisely that flow.
+#   # the one predicted above: under the 5.000ns target phys_opt reached TNS -0.277ns over
+#   puts "POSTROUTE_ROUND 0 WNS [get_property SLACK $rp]"
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.550 | TNS=-641.334 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.308 | TNS=-228.692 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.308 | TNS=-228.692 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.308 | TNS=-227.615 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.308 | TNS=-227.615 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.291 | TNS=-193.064 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.291 | TNS=-192.780 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.291 | TNS=-192.671 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.290 | TNS=-192.380 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.290 | TNS=-192.100 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.284 | TNS=-191.818 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.282 | TNS=-191.878 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.278 | TNS=-184.663 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.271 | TNS=-184.385 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.269 | TNS=-184.384 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.268 | TNS=-182.964 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.266 | TNS=-181.313 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.262 | TNS=-181.046 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.262 | TNS=-180.784 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.261 | TNS=-180.676 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.259 | TNS=-180.425 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.256 | TNS=-174.521 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.254 | TNS=-174.507 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.254 | TNS=-173.570 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.254 | TNS=-173.112 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.253 | TNS=-171.786 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.250 | TNS=-171.533 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.248 | TNS=-170.994 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.245 | TNS=-169.830 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.244 | TNS=-169.363 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.243 | TNS=-169.232 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.242 | TNS=-166.976 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.938 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.763 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.763 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.763 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.590 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.239 | TNS=-166.350 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.236 | TNS=-166.235 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.234 | TNS=-166.008 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.234 | TNS=-165.867 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.234 | TNS=-165.056 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-164.822 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-164.726 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-164.520 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-161.669 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-157.202 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-156.136 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.233 | TNS=-155.784 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.232 | TNS=-155.782 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.232 | TNS=-144.128 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.231 | TNS=-144.086 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.227 | TNS=-143.383 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.225 | TNS=-143.308 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.224 | TNS=-143.256 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.221 | TNS=-143.232 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.221 | TNS=-143.232 |
+INFO: [Physopt 32-603] Post Physical Optimization Timing Summary | WNS=-0.221 | TNS=-143.232 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.068 | TNS=-0.073 | WHS=0.003  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.268 | TNS=-2250.226| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.018 | TNS=-1229.365| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.685 | TNS=-549.894| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.396 | TNS=-281.366| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.327 | TNS=-165.761| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.273 | TNS=-140.301| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.249 | TNS=-84.899| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.320 | TNS=-78.211| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.249 | TNS=-84.899| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.249 | TNS=-84.899| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.240 | TNS=-72.849| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.240 | TNS=-72.849| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-57] Estimated Timing Summary | WNS=-0.240 | TNS=-72.849| WHS=0.010  | THS=0.000  |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+POSTROUTE_ROUND 0 WNS -0.231
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.231 | TNS=-48.572 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.115 | TNS=-15.508 | WHS=0.011 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.115 | TNS=-15.508 | WHS=0.011 | THS=0.000 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.779| WHS=0.010  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.128 | TNS=-23.644| WHS=0.010  | THS=0.000  |
+Phase 3 TNS Cleanup | Checksum: 218f012a3
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=-0.115 | TNS=-15.514| WHS=0.011  | THS=0.000  |
+INFO: [Route 35-253] TNS is the sum of the worst slack violation on every endpoint in the design. Review the paths with the biggest WNS violations in the timing reports and modify your constraints or your design to improve both WNS and TNS.
+POSTROUTE_ROUND 1 WNS -0.115
+# puts "SOURCE_MD5 $source_md5"
+SOURCE_MD5 6c399b33c87f639e2209ab8c3df77175
+# puts "NETLIST_MD5 $gate_netlist_md5"
+NETLIST_MD5 6c399b33c87f639e2209ab8c3df77175
+# puts "POSTROUTE_FULLCORE_WNS_NS $wns"
+POSTROUTE_FULLCORE_WNS_NS -0.115
+# if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_${target_mhz}  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_${target_mhz}  FMAX_MHZ $achieved" }
+POSTROUTE_FULLCORE_RESULT FAILED_AT_200  ACHIEVED_FMAX_MHZ 195.50342130987292
+# puts "SIGNOFF_200MHZ_WNS_NS $wns"
+SIGNOFF_200MHZ_WNS_NS -0.115
+# if {$wns >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
+SIGNOFF_200MHZ_RESULT FAILED_AT_200

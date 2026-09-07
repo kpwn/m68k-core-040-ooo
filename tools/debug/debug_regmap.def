@@ -118,7 +118,13 @@ REG OFF_INST_LO           0x01008 RO    2 0x00000000 Architectural macro-instruc
 REG OFF_INST_HI           0x0100C RO    2 0x00000000 Architectural macro-instruction count, high word.
 REG OFF_MISPRED_COUNT     0x01010 RO    7 0x00000000 Branch mispredictions; zero until a real producer exists.
 REG OFF_FLUSH_COUNT       0x01014 RO    7 0x00000000 Pipeline flushes; zero until a real producer exists.
-REG OFF_EXC_COUNT         0x01018 RO    7 0x00000000 Exceptions taken; zero until a real producer exists.
+# SERVED since 2026-09-06. Free-running 32-bit count of every committed
+# exception ENTRY, live (no halt required), cleared only by CPU reset -- v1
+# parity with debug_ctrl.v exc_count_r. Read this, NOT OFF_EXC_RING_HEAD: the
+# head is 5 bits and wraps at 32, and reading it as a count has already
+# produced a wrong conclusion. Stage 2 (needs only a ROB), not 3 -- the counter
+# does not require the forensic ring to be built.
+REG OFF_EXC_COUNT         0x01018 RO    2 0x00000000 Exceptions taken (free-running, live, reset-only clear).
 # p141 walker-stall state. LIVE (no halt), stage 2 like OFF_INST_LO -- these are
 # for diagnosing a livelock, where a debug halt never lands, so a halt-captured
 # register in the 0x020xx arch block would read stale or zero.

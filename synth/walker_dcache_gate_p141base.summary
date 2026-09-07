@@ -1,0 +1,163 @@
+===== walker/D-cache postroute gate: arm 'p141base' =====
+ref            : 0f88f74 (0f88f74)
+netlist md5    : 5e5ff0beea176da243caf6d28663d1ce
+POSTROUTE_ROUNDS: 1
+finished       : 2026-09-05T13:06:58+02:00
+--- verdict lines (clk domain; SIGNOFF_* is re-derived at a real 5.000 ns) ---
+#   # (rounds 4-9 all -0.015). Total TNS across the whole design was -0.277ns over just 32
+#   # failing endpoints, all inside a 0.015ns band. That is not a design that has run out
+#   # once `phys_opt_design` has driven WNS to within a hair of the 5.000ns target and TNS
+#   # SIGNOFF_200MHZ_WNS_NS +0.009) it was under precisely that flow.
+#   # the one predicted above: under the 5.000ns target phys_opt reached TNS -0.277ns over
+#   puts "POSTROUTE_ROUND 0 WNS [get_property SLACK $rp]"
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.413 | TNS=-956.037 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.200 | TNS=-864.151 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.200 | TNS=-864.151 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.200 | TNS=-864.151 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.197 | TNS=-862.852 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.130 | TNS=-862.785 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.087 | TNS=-862.701 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.086 | TNS=-862.605 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.085 | TNS=-862.538 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.055 | TNS=-862.662 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.049 | TNS=-862.710 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.049 | TNS=-862.769 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.049 | TNS=-862.779 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.045 | TNS=-862.791 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.039 | TNS=-861.087 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.030 | TNS=-819.043 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.026 | TNS=-818.943 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.020 | TNS=-815.588 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.017 | TNS=-811.363 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.014 | TNS=-811.255 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.012 | TNS=-810.709 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.011 | TNS=-810.436 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-1.003 | TNS=-807.513 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.997 | TNS=-807.511 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.997 | TNS=-807.563 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.991 | TNS=-807.645 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.977 | TNS=-807.534 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.975 | TNS=-807.490 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.971 | TNS=-807.416 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.970 | TNS=-807.346 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.968 | TNS=-807.488 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.964 | TNS=-807.434 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.959 | TNS=-807.580 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.950 | TNS=-806.169 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.948 | TNS=-806.138 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.947 | TNS=-806.047 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.946 | TNS=-805.974 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.945 | TNS=-805.912 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.933 | TNS=-805.889 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.932 | TNS=-805.793 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.932 | TNS=-805.826 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.931 | TNS=-805.873 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.925 | TNS=-805.324 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.923 | TNS=-805.316 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.920 | TNS=-805.271 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.920 | TNS=-805.192 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.919 | TNS=-804.390 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.917 | TNS=-804.321 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.917 | TNS=-804.305 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.917 | TNS=-804.289 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.915 | TNS=-804.273 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.913 | TNS=-804.184 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.912 | TNS=-804.136 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.908 | TNS=-802.034 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.908 | TNS=-802.090 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.908 | TNS=-802.152 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.206 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.201 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.196 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.196 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.196 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.906 | TNS=-802.191 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.904 | TNS=-802.186 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.904 | TNS=-802.183 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.903 | TNS=-798.418 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.903 | TNS=-798.429 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.903 | TNS=-798.503 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.903 | TNS=-798.575 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.902 | TNS=-798.529 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.899 | TNS=-797.895 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.898 | TNS=-797.740 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.897 | TNS=-797.599 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.897 | TNS=-797.709 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.897 | TNS=-797.844 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.897 | TNS=-798.004 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.894 | TNS=-798.166 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.887 | TNS=-786.935 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.887 | TNS=-786.832 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.886 | TNS=-786.785 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.865 | TNS=-781.217 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.862 | TNS=-781.238 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.846 | TNS=-792.995 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.842 | TNS=-787.128 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.840 | TNS=-781.968 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.833 | TNS=-781.911 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.822 | TNS=-772.063 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.811 | TNS=-719.459 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.799 | TNS=-703.050 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.793 | TNS=-686.887 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.784 | TNS=-682.881 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.774 | TNS=-680.116 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.763 | TNS=-675.297 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.762 | TNS=-674.860 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.761 | TNS=-674.421 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.757 | TNS=-664.377 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.754 | TNS=-663.567 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.749 | TNS=-646.536 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.748 | TNS=-646.457 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.748 | TNS=-645.377 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.744 | TNS=-644.772 |
+INFO: [Physopt 32-619] Estimated Timing Summary | WNS=-0.740 | TNS=-641.283 |
+INFO: [Physopt 32-603] Post Physical Optimization Timing Summary | WNS=-0.698 | TNS=-585.392 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.398 | TNS=-64.622| WHS=0.003  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.457 | TNS=-2159.234| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.056 | TNS=-1666.024| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.094 | TNS=-1430.189| WHS=N/A    | THS=N/A    |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.056 | TNS=-1666.024| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-1.056 | TNS=-1666.024| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.998 | TNS=-1564.380| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-57] Estimated Timing Summary | WNS=-0.998 | TNS=-1564.380| WHS=0.015  | THS=0.000  |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+POSTROUTE_ROUND 0 WNS -0.968
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.968 | TNS=-1459.964 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-668] Current Timing Summary | WNS=-0.754 | TNS=-1261.040 | WHS=0.016 | THS=0.000 |
+INFO: [Physopt 32-669] Post Physical Optimization Timing Summary | WNS=-0.754 | TNS=-1261.040 | WHS=0.016 | THS=0.000 |
+|  Optimization   |  WNS Gain (ns)  |  TNS Gain (ns)  |  Added Cells  |  Removed Cells  |  Optimized Cells/Nets  |  Dont Touch  |  Iterations  |  Elapsed   |
+Phase 3 TNS Cleanup
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1366.913| WHS=0.015  | THS=0.000  |
+INFO: [Route 35-416] Intermediate Timing Summary | WNS=-0.783 | TNS=-1337.015| WHS=0.015  | THS=0.000  |
+Phase 3 TNS Cleanup | Checksum: 2677eefda
+INFO: [Route 35-20] Post Routing Timing Summary | WNS=-0.754 | TNS=-1232.003| WHS=0.016  | THS=0.000  |
+INFO: [Route 35-253] TNS is the sum of the worst slack violation on every endpoint in the design. Review the paths with the biggest WNS violations in the timing reports and modify your constraints or your design to improve both WNS and TNS.
+POSTROUTE_ROUND 1 WNS -0.754
+# puts "SOURCE_MD5 $source_md5"
+SOURCE_MD5 5e5ff0beea176da243caf6d28663d1ce
+# puts "NETLIST_MD5 $gate_netlist_md5"
+NETLIST_MD5 5e5ff0beea176da243caf6d28663d1ce
+# puts "POSTROUTE_FULLCORE_WNS_NS $wns"
+POSTROUTE_FULLCORE_WNS_NS -0.754
+# if {$wns < 0} { puts "POSTROUTE_FULLCORE_RESULT FAILED_AT_${target_mhz}  ACHIEVED_FMAX_MHZ $achieved" } else { puts "POSTROUTE_FULLCORE_RESULT MET_${target_mhz}  FMAX_MHZ $achieved" }
+POSTROUTE_FULLCORE_RESULT FAILED_AT_200  ACHIEVED_FMAX_MHZ 173.79214459506431
+# puts "SIGNOFF_200MHZ_WNS_NS $wns"
+SIGNOFF_200MHZ_WNS_NS -0.754
+# if {$wns >= 0} { puts "SIGNOFF_200MHZ_RESULT MET_200" } else { puts "SIGNOFF_200MHZ_RESULT FAILED_AT_200" }
+SIGNOFF_200MHZ_RESULT FAILED_AT_200

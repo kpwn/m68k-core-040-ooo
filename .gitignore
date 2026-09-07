@@ -43,3 +43,20 @@ vivado*.jou
 cong/
 synth/vivado_*.log
 bench_logs/
+
+# --- 2026-09-05 audit: ~38 MB of derived artifacts were sitting untracked ---
+# Python bytecode from tools/
+__pycache__/
+# Vivado stdout transcripts. Same rule as synth/*.out above: the distilled
+# *.summary beside them is the committed evidence, the raw transcript is not.
+synth/*.stdout
+# Pinned/archived build products and gate scratch dirs -- large and regenerable
+# from the netlist md5 recorded alongside each gate result.
+synth/pinned/
+synth/fpucore_gate/
+# Fuzz and ported-test run logs. The triage conclusions are written up in
+# docs/superpowers/specs/; these are the raw per-seed transcripts behind them.
+fuzz_logs*/
+ported_logs_*/
+# ROM disassembly -- 13 MB, regenerable from files/*.rom
+*.dis

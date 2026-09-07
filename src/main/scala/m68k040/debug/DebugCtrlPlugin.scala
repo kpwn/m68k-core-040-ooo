@@ -153,6 +153,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val debugMemory = if (enable && stage >= 3) host.get[DebugMemoryService] else None
     val historyEnabled = enable && stage >= 3 && historyDepth > 0
     val debugHistory = if (historyEnabled) host.get[DebugHistoryService] else None
+    // OFF_EXC_COUNT source. Deliberately a SEPARATE lookup from `debugHistory`
+    // above: the counter must exist whenever there is an exception-entry
+    // producer at all, NOT only when the 32-entry forensic ring is built. A
+    // build with historyDepth = 0 still has to answer "how many exceptions has
+    // this core taken", and `OFF_EXC_RING_HEAD` cannot answer it -- the head is
+    // 5 bits and wraps at 32. Reading the head as a count is exactly the
+    // mistake this register exists to prevent.
+    val excCountHistory = if (enable && stage >= 2) host.get[DebugHistoryService] else None
     val frontendDebug = if (enable && stage >= 5) host.get[FrontendDebugMatchService] else None
 
     // 2026-09-05 walker-stall observability (p141). `host.get` (Option), not
@@ -268,6 +276,28 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           ex.valid)
         when(ex.valid) { excRingHead := excRingHead + 1 }
       }
+
+      // ── Free-running exception counter (OFF_EXC_COUNT) ───────────────────────
+      // Counts EVERY exception ENTRY the ROB commits -- the same `exceptionEntry`
+      // pulse the forensic ring records, unfiltered by vector, by the halt mask,
+      // or by whether the ring is even built. Mirrors v1's `exc_count_r`
+      // (macqd700-soc/cpu/rtl/core/debug/debug_ctrl.v:2859), including its
+      // lifetime: it clears on CPU reset and NOTHING else. It is deliberately
+      // NOT halt-captured and NOT clearable by the sticky-clear control bit, so
+      // it can be sampled twice under free-run to get an exception RATE.
+      //
+      // 32 bits, matching v1 and the register width. At the highest rate ever
+      // measured on this SoC (154 exceptions/s, the 60 Hz VIA tick plus SCSI)
+      // that wraps in ~885 years; even a pathological 1-per-100-cycles at
+      // 200 MHz takes ~35 min. Wrap is not a practical concern -- which is the
+      // whole point, since the 5-bit ring head wrapping at 32 is what produced a
+      // wrong conclusion before this register was served.
+      val excCountReg = excCountHistory.map(_ => Reg(UInt(32 bits)) init 0)
+      excCountReg.foreach(_.simPublic())
+      excCountHistory.foreach { h =>
+        when(h.exceptionEntry.valid) { excCountReg.get := excCountReg.get + 1 }
+      }
+      def excCount: Bits = excCountReg.map(_.asBits).getOrElse(B(0, 32 bits))
 
       val pcBodyRead = if (historyBuilt)
         arAddr >= DebugRegMap.OFF_PC_TRACE_BODY &&
@@ -850,6 +880,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
+          // Live, free-running, never halt-captured -- see excCountReg above.
+          is(DebugRegMap.OFF_EXC_COUNT) { rData := excCount }
           // ── p141 walker-stall state (live; no halt required) ──────────────────
           // Read these ALONGSIDE OFF_INST_LO/HI: the wedge is identified by the
           // retire count being frozen, and these four words say what it is frozen
