@@ -2595,14 +2595,43 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val inhibitedLoadLaunch = (alignedEnq && p4Inhibited && !p4Front.twoAccess) ||
                               (alignedEnqSplit && p4Inhibited)
     val inhibitedLoadConsume = loadBusyReg && alignedRspFire && alignedRspTerminal
-    // +1 cycle past resolution (mirrors StoreQueue's `preciseFinalAckD`): keeps the
-    // ROB's gate from racing a same-cycle preempt against a drain that just
-    // resolved.
-    val inhibitedLoadConsumeD = RegNext(inhibitedLoadConsume, init = False)
-    when(inhibitedLoadLaunch) { loadBusyReg := True }
-      .elsewhen(inhibitedLoadConsumeD) { loadBusyReg := False }
+    // ── 2026-09-07 REWORK (hardware wedge ROM 0x40899664, bitstream 0xAFA3628F,
+    // sim repro "inhibited-load IRQ storm" in ExecuteLockStepSpec): clearing busy
+    // "+1 cycle past resolution" left a GAP between response consumption and the
+    // µop's RETIRE — completion-port contention (`frontCompHeld`) or same-macro
+    // trailing µops can hold retire for several cycles, and an interrupt
+    // recognized in that gap SQUASHES a macro whose device read has already
+    // happened. The re-execution then re-reads the device: measured 178 device
+    // ARs for 150 architectural loads under an IRQ storm, and on hardware the
+    // 53C96 FIFO ran exactly one word ahead of the ROM's blind pseudo-DMA drain,
+    // pinning the CPU forever on a DAFB-handshake beat DRQ can never satisfy.
+    //
+    // Busy therefore stays asserted from LAUNCH until the launching µop has
+    // RETIRED: the response has been consumed AND the ROB head has moved past
+    // the launcher's robId. Head-advance is the retire witness — while busy no
+    // interrupt/trace can be recognized (this signal gates normalIrqGate /
+    // traceNormalGate), a parked head µop cannot be squashed by anything else
+    // those gates admit, so the head leaving the launcher's robId proves the
+    // µop retired rather than vanished. Once the load µop retires, any
+    // remaining µops of the same macro are interrupt-immune via the ROB's
+    // `p0.first` recognition term, so clearing here is exact — no window
+    // remains on either side. Termination: a completed head µop always
+    // retires (retire0 does not depend on interrupt recognition), so busy
+    // cannot latch forever.
+    val inhibitedLaunchRobId = Reg(cloneOf(p4Front.robId))
+    val inhibitedRespSeen    = RegInit(False)
+    when(inhibitedLoadConsume) { inhibitedRespSeen := True }
+    val launcherStillAtHead = robHeadValidIn && (robHeadIn === inhibitedLaunchRobId)
+    when(inhibitedLoadLaunch) {
+      loadBusyReg          := True
+      inhibitedRespSeen    := False
+      inhibitedLaunchRobId := p4Front.robId
+    }.elsewhen(loadBusyReg && inhibitedRespSeen && !launcherStillAtHead) {
+      loadBusyReg := False
+    }
     inhibitedLoadBusySig := loadBusyReg
     inhibitedLoadLaunch.simPublic(); inhibitedLoadConsume.simPublic()
+    inhibitedRespSeen.simPublic()
 
     // P3 performs the registered-PA SQ operation. Stores terminate here; loads capture
     // the registered forwarding result into P4. An older P4/front-back completion wins

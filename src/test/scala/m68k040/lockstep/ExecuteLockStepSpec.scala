@@ -10646,4 +10646,164 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         s"reached cache-inhibited space from a wrong-path load: " +
         arHits.distinct.take(8).map(a => f"0x$a%08x").mkString(", "))
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // INHIBITED-LOAD × INTERRUPT REPLAY — exactly-once device-read property
+  //
+  // Motivated by the 2026-09-07 hardware wedge at ROM 0x40899664 (bitstream
+  // 0xAFA3628F): the ROM's blind pseudo-DMA Duff burst pinned on its FINAL
+  // `movew %a1@(256),%a2@+` with the 53C96 side fully complete (TC0, fifo=0,
+  // S_STATUS, I_BUS raised) — i.e. the device had answered exactly ONE MORE word
+  // than the CPU architecturally retired.  A FIFO-popping device read is
+  // clear-on-read state: if cpu040 ever issues the AXI read for an inhibited
+  // load and then SQUASHES that instruction (interrupt preemption recognized in
+  // the gap between `loadBusyReg` clearing and the macro actually retiring),
+  // the re-execution pops the device a second time and the guest ends one word
+  // short forever.  `p4PreemptSafe` guards the LAUNCH cycle and
+  // `inhibitedLoadBusyIn` guards the outstanding window, but the busy flag
+  // clears +1 cycle after the AXI response while retire can lag further
+  // (completion-port contention / same-macro store µop) — this test storms that
+  // gap.
+  //
+  // Property under test: across a 150-iteration `move.w (dev),(%a2)+` loop with
+  // a continuous phase-swept level-1 IRQ storm (handler = bare RTE), the number
+  // of AXI ARs reaching the device address is EXACTLY the number of
+  // architecturally executed loads.  >150 = replayed device read (the hardware
+  // wedge mechanism).  <150 or no completion flag = a lost/withheld beat.
+  // The split cacheable `move.l (%a4),%d1` in the loop body generates back-FSM
+  // completion traffic to contend the completion port, widening the
+  // consume-to-retire gap the storm is aimed at.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  test("inhibited-load IRQ storm: device read fires exactly once per retired load", VerilatorTest) {
+    val loadAddr  = ProgramAssembler.DefaultLoadAddress
+    val DevRdVa   = 0x50F0F100L      // pseudo-DMA-shaped device word port (inhibited via dtt0)
+    val DevDoneVa = 0x50F0F200L      // completion flag: inhibited store => guaranteed AW beat
+    val Iters     = 150
+    val src =
+      s"move.l #0x50F0F100,%a0 ; " +
+      "move.l #0x00300000,%a2 ; " +
+      "move.l #0x00310001,%a4 ; " +   // odd base -> split (back-FSM) cacheable loads
+      "move.l #handler,%d0 ; " +
+      "move.l %d0,0x64 ; " +          // level-1 autovector (vector 25) slot
+      "move.w #0x2000,%sr ; " +       // unmask (mask 7 -> 0)
+      s"move.w #${Iters - 1},%d4 ; " +
+      "loop: move.l (%a4),%d1 ; " +   // younger split cacheable load: completion-port contention
+      "move.w (%a0),(%a2)+ ; " +      // THE inhibited device read (pseudo-DMA shape)
+      "dbf %d4,loop ; " +
+      "move.w #0xBEEF,0x50F0F200 ; " + // inhibited store = observable done flag
+      "end: bra.s end ; " +
+      "handler: rte"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[inh-irq-replay] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+
+    var devArCount   = 0
+    var devArOther   = 0        // ARs in the device page that are NOT the read port
+    var doneSeen     = false
+    var doneCycle    = -1
+    var excEntries   = 0
+    var sawInhibited = false
+    var cyc          = 0
+    val budget       = 200000
+
+    compiledDut.doSim(freshSimName("inh-irq-replay")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iackVector #= 0
+
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+
+      dut.rob.logic.exc.ss.isp  #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.rob.logic.exc.ss.usp  #= BigInt(0x00200000L)
+      dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff   // start MASKED; program unmasks
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0
+      dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0
+      dut.ctrl.logic.itt1 #= 0
+      // dtt0: 0x50xxxxxx cache-inhibited serialized (same value the spec-mmio tests use).
+      // dtt1: 0x00xxxxxx..0x0F cacheable — stack/vector/buffer/split-load traffic stays
+      // ordinary so younger loads run ahead of the parked inhibited load (contention).
+      dut.ctrl.logic.dtt0 #= BigInt(SpecMmioItt0Inhibited)
+      dut.ctrl.logic.dtt1 #= BigInt(0x000FC000L)
+
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      // ── IRQ storm: continuous level-1 pulses with a swept inter-pulse gap so the
+      // recognition edge slides across every phase of the ~tens-of-cycles loop body.
+      val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        var gap = 5
+        while (!stormDone.get()) {
+          cd.waitSampling(gap)
+          dut.intCtrl.logic.iplIn #= 1
+          cd.waitSampling(6)
+          dut.intCtrl.logic.iplIn #= 0
+          gap = if (gap >= 61) 5 else gap + 1
+        }
+        dut.intCtrl.logic.iplIn #= 0
+      }
+
+      var lastExcActive = false
+      while (cyc < budget && !doneSeen) {
+        cd.waitSampling(); cyc += 1
+        val ax = dut.dcache.logic.axi
+        if (ax.ar.valid.toBoolean && ax.ar.ready.toBoolean) {
+          val a = ax.ar.payload.addr.toLong & 0xffffffffL
+          if (a == DevRdVa) devArCount += 1
+          else if (a >= 0x50F0F000L && a < 0x50F10000L) devArOther += 1
+        }
+        if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) {
+          val a = ax.aw.payload.addr.toLong & 0xffffffffL
+          if (a == DevDoneVa) { doneSeen = true; doneCycle = cyc }
+        }
+        if (dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Inhibited.toBoolean)
+          sawInhibited = true
+        val excA = !dut.rob.logic.excIdle.toBoolean
+        if (excA && !lastExcActive) excEntries += 1
+        lastExcActive = excA
+      }
+      stormDone.set(true)
+      cd.waitSampling(4)
+    }
+
+    println(f"[inh-irq-replay] devARs=$devArCount (expect exactly $Iters), otherDevARs=$devArOther, " +
+      f"done=$doneSeen@cyc=$doneCycle, excEntries=$excEntries, sawInhibitedAtGate=$sawInhibited, cycles=$cyc")
+    assert(sawInhibited, "[inh-irq-replay] VACUOUS: no inhibited load ever reached the p4 gate")
+    assert(excEntries > 10,
+      s"[inh-irq-replay] VACUOUS STORM: only $excEntries exception entries — the IRQ storm never " +
+        "really interleaved with the loop; property untested")
+    assert(doneSeen,
+      s"[inh-irq-replay] LOST/WITHHELD BEAT or wedge: program never stored the done flag " +
+        s"(devARs=$devArCount of $Iters after $cyc cycles)")
+    assert(devArCount == Iters,
+      s"[inh-irq-replay] DEVICE READ COUNT MISMATCH: $devArCount AXI reads for $Iters " +
+        s"architecturally executed loads — " +
+        (if (devArCount > Iters) "a squashed-and-replayed inhibited load re-read the device " +
+          "(clear-on-read state lost; this is the 0x40899664 hardware wedge mechanism)"
+         else "a device read was lost"))
+  }
 }
