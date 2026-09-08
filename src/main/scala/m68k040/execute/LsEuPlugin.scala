@@ -1320,10 +1320,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     dcache.loadCmd.payload.size  := Mux(useSplitCmd, llReg.size, alignedCmd.size)
     dcache.loadCmd.payload.cacheMode := Mux(
       useSplitCmd, Mux(llReg.bDone, llReg.cmodeB, llReg.cmode), alignedCmd.cmode)
+    // Token layout is a DOCUMENTED contract (DcacheTypes.scala `DLoadToken`): bit [7]
+    // = non-LS source, bit [6] = split half, [5:0] = ROB id. The ring path (split pairs
+    // pushed through the aligned ring since 03b8ab0e) must stamp bit [6] from the
+    // descriptor's own `splitSecond`, exactly as the serial `llReg` path stamps it from
+    // `bDone`. 03b8ab0e left it hardwired False, so slot B went out tagged as plain
+    // `robId` and the encoding silently diverged from its contract (caught by
+    // DtlbCrossPageSplitSpec's exact per-half token check). No consumer misbehaved --
+    // the only reader, DcachePlugin's early-probe CAM, also qualifies on vaddr -- but
+    // a documented encoding is not something a perf refactor gets to change silently.
     dcache.loadCmd.payload.token := Mux(
       useSplitCmd,
       (False ## llReg.bDone ## llReg.robId.asBits).asUInt,
-      (False ## False ## alignedCmd.bk.robId.asBits).asUInt)
+      (False ## (alignedCmd.twoAccess && alignedCmd.splitSecond) ##
+       alignedCmd.bk.robId.asBits).asUInt)
     val alignedCmdFire = alignedSendValid && coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
     alignedCmdFire.simPublic()
 
