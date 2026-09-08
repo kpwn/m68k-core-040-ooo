@@ -187,7 +187,19 @@ class LsBackendInjectSpec extends AnyFunSuite {
       dut.rsrc.logic.src.valid #= false
       dut.rsrc.logic.u1v #= false
       dut.rob.logic.flush.valid #= false
+      // This test's whole point is a store->load FORWARD. With CACR.DE=0 (the reset
+      // value of the ROB-owned `ss.cacr`, which is this DUT's CacheControlService) the
+      // LS EU classifies every load as cache-INHIBITED (`txEffectiveCmode`), and an
+      // inhibited load may NEVER forward from the store queue (`p4SqForwardAllowed`):
+      // it is a device read, precise since f5f9fe13, launched at the ROB head only
+      // after every older store has DRAINED -- the opposite of what this test exists
+      // to prove. Enable the D-cache (CACR.DE = bit 31, same poke RobPluginSpec uses)
+      // so the load is the ordinary cacheable, forwardable access it was written as.
+      dut.rob.logic.exc.ss.cacr #= (1L << 31)
       cd.waitSampling(80) // PRF init sweep
+      // c6e3ad43: the D-cache invalidates one set per cycle after reset and holds every
+      // port not-ready until done; this test's wait budgets assume a ready cache.
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
 
       def push1(configure: RenamedUop => Unit): Unit = {
         configure(dut.rsrc.logic.src.payload(0))
