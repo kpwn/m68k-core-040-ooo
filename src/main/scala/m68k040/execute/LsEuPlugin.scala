@@ -856,6 +856,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val fwdHit   = Bool()
       val fwdStall = Bool()
       val fwdData  = Bits(32 bits)
+      // The captured verdict was taken under the SQ's INHIBITED serialization barrier
+      // (`SqFwdRsp.serial`): `fwdHit` is masked and NOT trustworthy. p4 keeps
+      // re-querying (the query mux selects p4) until a verdict is captured with the
+      // barrier absent; only then may it forward or launch. Without this, a load whose
+      // exact-match older store sat behind an older inhibited store parked on
+      // `olderInhibitedStore` holding hit=0/stall=0 and, when the barrier lifted,
+      // launched to the D-cache while the store was still undrained -- returning the
+      // slot's previous generation (ROM 0x408990E2 `move.l (sp),d0` after nine 53C96
+      // FIFO stores + `jsr`, caught on hardware 2026-09-08).
+      val fwdSerial = Bool()
     }
 
     val tValid   = RegInit(False)              // P2: registered DTLB + VIPT request
@@ -874,6 +884,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p4Ctx    = Reg(ResolvePipeCtx())
     tValid.simPublic(); txValid.simPublic(); p3Valid.simPublic(); p4Valid.simPublic(); txSecond.simPublic()
     tCtx.robId.simPublic(); txCtx.robId.simPublic(); p3Ctx.front.robId.simPublic(); p4Ctx.xlate.front.robId.simPublic()
+    // Debug-only taps (zero synth impact): the p4 load's physical address and the SQ
+    // forward verdict it is holding -- the stale-forward-verdict regression test reads
+    // these to prove a load launched to the cache while its producing store was resident.
+    p4Ctx.xlate.paddr.simPublic(); p4Ctx.fwdHit.simPublic(); p4Ctx.fwdStall.simPublic()
+    p4Ctx.fwdSerial.simPublic()
 
     // ---- translate-at-execute: the LS EU DRIVES the D-side translation port ----
     // It presents the access VPN (loadVaddr, which the FSM sets to s1Va for slot A
@@ -1373,7 +1388,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       (!p4Ctx.xlate.front.twoAccess ||
        (p4Ctx.xlate.cmodeB =/= m68k040.cache.CacheMode.INHIBITED))
     val p4RetryQuery = p4Valid &&
-      (p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Ctx.xlate.front.twoAccess))
+      (p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Ctx.xlate.front.twoAccess) || p4Ctx.fwdSerial)
     val fwdQueryCtx = Mux(p4RetryQuery, p4Ctx.xlate, p3Ctx)
     sq.io.fwd.query.robId := fwdQueryCtx.front.robId
     sq.io.fwd.query.paddr := fwdQueryCtx.paddr
@@ -2513,7 +2528,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
     when(p4Valid && !sqFlushSig && !excActive) {
       val fullForward = p4Ctx.fwdHit && !p4Front.twoAccess
-      val mustRetry    = p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Front.twoAccess)
+      // `fwdSerial`: the held verdict was masked by the inhibited-store barrier -- keep
+      // re-querying until one is captured with the barrier absent (it lifts exactly when
+      // `sq.io.barrier.olderInhibitedStore` would, so this adds no new wait condition).
+      val mustRetry    = p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Front.twoAccess) || p4Ctx.fwdSerial
       when(fullForward) {
         when(backCompFires || preciseReplayClaimsComp) {
           frontCompHeld := True
@@ -2529,6 +2547,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         // launch gate below, not spin here.  See `p4LaunchOk`.
         p4Ctx.fwdStall := sq.io.fwd.rsp.stall
         p4Ctx.fwdData  := sq.io.fwd.rsp.data
+        p4Ctx.fwdSerial := sq.io.fwd.rsp.serial
       } otherwise {
         when(p4LaunchOk) {
         when(!p4Front.twoAccess) {
@@ -2839,6 +2858,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     normalReqArm := tValid && tIsMem && txReady && !splitReqArm &&
                     !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
     val normalReqFire = xlate.req.fire && !reqFromSplit && !excActive
+    // Debug-only taps (zero synth impact): P2 launch gating terms.
+    normalReqFire.simPublic(); dcLoadHeldByOther.simPublic(); dcache.loadProbe.ready.simPublic(); xlate.req.ready.simPublic()
     val splitReqFire  = xlate.req.fire && reqFromSplit && !excActive
 
     // P2 launches the tagged DTLB command and virtual-set probe. Memory operations
@@ -2883,6 +2904,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       p4Ctx.fwdHit     := sq.io.fwd.rsp.hit && p3SqForwardAllowed
       p4Ctx.fwdStall   := sq.io.fwd.rsp.stall
       p4Ctx.fwdData    := sq.io.fwd.rsp.data
+      p4Ctx.fwdSerial  := sq.io.fwd.rsp.serial
     }
     when(txToP3) {
       p3Valid := True

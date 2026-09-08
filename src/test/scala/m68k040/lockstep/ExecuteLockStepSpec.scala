@@ -10806,4 +10806,210 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           "(clear-on-read state lost; this is the 0x40899664 hardware wedge mechanism)"
          else "a device read was lost"))
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // STALE SQ-FORWARD VERDICT ACROSS THE INHIBITED-STORE BARRIER
+  //
+  // Motivated by the hardware capture at ROM 0x408990E2 (`move.l (sp),d0` in the
+  // Translate24 helper, SP = 0x3FF1C2, called from the SCSI COMMAND-phase handler):
+  // on 1 of 154 calls the load returned a STALE OLDER IMAGE of the stack slot while
+  // coherent memory held the just-pushed return address.  The shape is: ten
+  // cache-INHIBITED byte stores into the 53C96 FIFO (`move.b (a2)+,0x20(a3)`), then
+  // a `jsr` (pushes the RA at SP-4, a COPYBACK store), then `move.l (sp),d0` -- no
+  // interrupt in the window.
+  //
+  // Mechanism (StoreQueue.scala `io.fwd.rsp`, LsEuPlugin p4): while an OLDER
+  // INHIBITED store is resident, `serialStall` masks the `hit` for the load's
+  // exact-match older push, but `stall` is ALSO false because `fullValid` is true.
+  // The load therefore drops into the p4 `otherwise` launch arm and parks on
+  // `!sq.io.barrier.olderInhibitedStore` WITHOUT ever re-querying the SQ; when the
+  // last inhibited store drains, it launches to the D-cache carrying the stale
+  // "no forward" verdict -- while the push is still sitting undrained in the ring.
+  // The cache/DRAM then serves the slot's previous generation.
+  //
+  // Each variant lock-steps D0 against Musashi (a wrong D0 diverges) and records the
+  // smoking-gun event live: `alignedEnq` for the stack-slot load while an SQ entry
+  // for that same address is still valid.  Non-vacuity: the load must actually have
+  // parked on the barrier (p4Valid at the slot address with olderInhibitedStore).
+  // ═══════════════════════════════════════════════════════════════════════════════
+  private def staleForwardAcrossInhibitedBarrier(tag: String, evictLine: Boolean,
+                                                 copyback: Boolean,
+                                                 dc: m68k040.sim.AxiMemModelConfig,
+                                                 loopForm: Boolean = false,
+                                                 expectParked: Boolean = true): Unit = {
+    // The pushed slot: word-aligned, NOT long-aligned, and INSIDE one 16-byte line (the
+    // ROM's SP=0x3FF1C2 shape: bytes C2..C5 of line C0).  A slot at ...BE would straddle
+    // the line and take the split-access path instead -- a different SQ arm.
+    val StackVa = 0x00101FC2L
+    val CdbVa   = 0x00102000L      // the 10-byte READ(10) CDB the ROM copies into the FIFO
+    val dtt1    = if (copyback) 0x000FE020L else 0x000FE000L   // CM=01 copyback / CM=00 write-through
+    // Mirrors ROM 0x40898e86..0x408990e8: `move.b (a2)+,0x20(a3)` x10 fills the 53C96 FIFO
+    // (cacheable load + INHIBITED store each), `jsr` pushes the RA at SP-4, the helper
+    // loads it back.  The FIFO fill is UNROLLED by default:
+    // in the ROM's `dbf` loop the loop-exit MISPREDICT recovery is ordered behind the
+    // precise inhibited store's bus response, so the jsr path normally starts only AFTER
+    // the last FIFO store drained -- which is what protects most hardware calls.  The
+    // corrupting call is one where the loop exit is predicted correctly, and from the LS
+    // pipe's point of view that is exactly the straight-line sequence.  `loopForm` keeps
+    // the ROM's literal `dbf` loop as a control.
+    val fill =
+      if (loopForm) "moveq #9,%d2 ; loop: move.b (%a2)+,0x20(%a3) ; dbf %d2,loop ; "
+      else (1 to 10).map(_ => "move.b (%a2)+,0x20(%a3) ; ").mkString
+    // One "SCSI command": old image into the slot, [evict the line], FIFO fill, the call.
+    val pass =
+      "move.l #0x8CF88000,-4(%sp) ; " +                          // the slot's OLDER generation
+      // Evict the stack line WITHOUT cpusha (Musashi has no CPUSH handler and mis-sizes
+      // it): the L1D is 4-way with a per-set round-robin victim (DcachePlugin `victim`),
+      // so four write-allocating stores into the SAME set (stride 0x800 = 128 sets x 16 B)
+      // deterministically push the dirty stack line out to DRAM, old image and all.
+      (if (evictLine)
+         (1 to 4).map(k => f"move.l #0,0x${StackVa + k * 0x800L}%x ; ").mkString
+       else "") +
+      fill +                                                     // ten INHIBITED FIFO stores (ROM 0x40898e90)
+      "jsr helper(%pc) ; " +                                     // `jsr %pc@(d16)`, the ROM's form (ROM 0x40898e98)
+      "move.l %d0,%d1 ; "
+    // TWO passes over the SAME code.  The BTB is indexed by the jsr's own PC and only
+    // trained at retire, so on pass 1 the jsr is cold: it MISPREDICTS and its recovery
+    // is a COMMIT-TIME redirect, which is ordered behind the last precise inhibited
+    // store's bus response -- the helper cannot overlap the push (measured: redirect
+    // 2 cycles after the store's completion).  On pass 2 the jsr is a warm force-taken
+    // unconditional BTB entry, the helper streams in right behind the push, and the
+    // load meets the resident inhibited store: the ROM's 150th call.
+    val src =
+      "move.l #0x5000C040,%d7 ; movec %d7,%dtt0 ; " +            // 0x50xxxxxx: cache-inhibited serialized device
+      f"move.l #0x$dtt1%08x,%%d7 ; movec %%d7,%%dtt1 ; " +       // 0x0xxxxxxx: cacheable RAM
+      "move.l #0x400FE020,%d7 ; movec %d7,%itt0 ; " +            // 0x4xxxxxxx: code, cacheable
+      // MMU ON (the board's TC=0xC000: E=1, 8K pages).  LOAD-BEARING: `LsEuPlugin.fastStore`
+      // is `mmuEnable && cacheable`, so with the MMU off every store is PRECISE and the
+      // push's A7 write-back is deferred until its own drain -- the load could never
+      // overlap the push and the hazard is unreachable.  All accesses are TT-covered, so
+      // no table walk happens; Musashi's 68040 `movec %tc` is a no-op (stays identity).
+      "move.l #0xC000,%d7 ; movec %d7,%tc ; " +
+      "move.l #0x50F0F000,%a3 ; " +                              // 53C96 base (FIFO at +0x20)
+      f"move.l #0x$CdbVa%08x,%%a2 ; " +
+      "move.l #0x28000000,(%a2) ; move.l #0x13040000,4(%a2) ; move.w #0x0100,8(%a2) ; " + // READ(10) LBA 0x1304
+      f"move.l #0x${StackVa + 4}%08x,%%sp ; " +
+      "moveq #1,%d6 ; " +
+      "pass: " + pass +
+      f"move.l #0x$CdbVa%08x,%%a2 ; " +                          // rewind the CDB pointer
+      "dbf %d6,pass ; " +
+      "done: bra.s done ; " +
+      "helper: move.l (%sp),%d0 ; rts"                           // THE LOAD (ROM 0x408990e2)
+    val passInstrs = 1 + (if (evictLine) 4 else 0) + (if (loopForm) 21 else 10) + 1 + 2 + 1 + 1 + 1
+    val nInstr = 2 + 2 + 2 + 2 + 1 + 1 + 3 + 1 + 1 + 2 * passInstrs
+    val trace  = sys.env.contains("STALEFWD_TRACE")
+
+    var parkedCycles       = 0     // load at the slot parked on the inhibited-store barrier
+    var launchedResident   = 0     // load launched to the cache while the push was still in the SQ
+    var launched           = 0
+    var staleValueSeen     = 0     // a slot load completed with the OLD image
+    runLockStep(tag, src, nInstr = nInstr, maxCycles = 60000, dcfg = dc,
+      duringRun = (dut, cd) => {
+        var cyc = 0
+        var lastP4 = -1L
+        var lastStages = ""
+        var lastGate = ""
+        val slotLoadRobs = scala.collection.mutable.Set[Int]()
+        cd.onSamplings {
+          val ls = dut.lsEu.logic
+          cyc += 1
+          val p4Here = ls.p4Valid.toBoolean &&
+            ((ls.p4Ctx.xlate.paddr.toLong & 0xffffffffL) == StackVa)
+          if (trace) {
+            val stages = f"t=${if (ls.tValid.toBoolean) ls.tCtx.robId.toInt else -1} " +
+              f"tx=${if (ls.txValid.toBoolean) ls.txCtx.robId.toInt else -1} " +
+              f"p3=${if (ls.p3Valid.toBoolean) ls.p3Ctx.front.robId.toInt else -1} " +
+              f"p4=${if (ls.p4Valid.toBoolean) ls.p4Ctx.xlate.front.robId.toInt else -1}"
+            if (stages != lastStages) { lastStages = stages; println(f"[$tag][$cyc] stages $stages") }
+            if (dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean)
+              println(f"[$tag][$cyc] issue rob=${dut.lsEu.issuePort.payload.robId.toInt}")
+            if (ls.compValid.toBoolean) println(f"[$tag][$cyc] complete rob=${ls.compRobId.toInt}")
+            val bu = dut.rob.logic.btbUpdateFlow
+            if (bu.valid.toBoolean)
+              println(f"[$tag][$cyc] BTB update pc=0x${bu.payload.pc.toLong}%08x target=0x${bu.payload.target.toLong}%08x " +
+                f"taken=${bu.payload.taken.toBoolean} type=${bu.payload.brType.toInt} mispred=${dut.rob.logic.debugBranchRetire.payload.mispredicted.toBoolean}")
+            if (dut.rob.logic.branchRedirect.toBoolean) println(f"[$tag][$cyc] ROB commit-time branchRedirect")
+            if (ls.tValid.toBoolean) {
+              val g = f"probeRdy=${ls.dcache.loadProbe.ready.toBoolean} xlateRdy=${ls.xlate.req.ready.toBoolean} heldByOther=${ls.dcLoadHeldByOther.toBoolean}"
+              if (g != lastGate) { lastGate = g; println(f"[$tag][$cyc] P2 gate $g") }
+            }
+            if (ls.sq.io.alloc.valid.toBoolean)
+              println(f"[$tag][$cyc] SQ alloc paddr=0x${ls.sq.io.alloc.payload.paddr.toLong}%08x rob=${ls.sq.io.alloc.payload.robId.toInt}")
+            val p4Now = if (ls.p4Valid.toBoolean) (ls.p4Ctx.xlate.paddr.toLong & 0xffffffffL) else -1L
+            if (p4Now != lastP4) {
+              lastP4 = p4Now
+              if (p4Now >= 0) {
+                val modes = (0 until 8).map(i => if (ls.sq.valids(i).toBoolean)
+                  f"${ls.sq.vaddrAs(i).toLong & 0xffffffffL}%08x:${ls.sq.cacheModes(i).toEnum}" else "-").mkString(" ")
+                println(f"[$tag][$cyc] p4 paddr=0x$p4Now%08x fwdHit=${ls.p4Ctx.fwdHit.toBoolean} " +
+                  f"fwdStall=${ls.p4Ctx.fwdStall.toBoolean} olderInh=${ls.sq.io.barrier.olderInhibitedStore.toBoolean} " +
+                  f"sq=[$modes]")
+              }
+            }
+            if (p4Here && ls.alignedEnq.toBoolean) println(f"[$tag][$cyc] alignedEnq for the slot")
+          }
+          // Every load of the slot (the helper's `move.l (sp),d0` AND the `rts` pop) is
+          // tracked by rob id until its completion, so each one's data is reported.
+          if (p4Here) slotLoadRobs += ls.p4Ctx.xlate.front.robId.toInt
+          if (ls.compValid.toBoolean && slotLoadRobs.contains(ls.compRobId.toInt)) {
+            val r = ls.compRobId.toInt
+            val v = ls.compData.toLong & 0xffffffffL
+            println(f"[$tag][$cyc] slot load rob=$r completed with data=0x$v%08x" +
+              (if (v == 0x8CF88000L) "  <-- the slot's OLDER generation (the hardware's D0=0x8CF88000)" else ""))
+            if (v == 0x8CF88000L) staleValueSeen += 1
+            slotLoadRobs -= r
+          }
+          if (p4Here && ls.sq.io.barrier.olderInhibitedStore.toBoolean) parkedCycles += 1
+          if (p4Here && ls.alignedEnq.toBoolean) {
+            launched += 1
+            val resident = (0 until 8).exists(i =>
+              ls.sq.valids(i).toBoolean && ((ls.sq.vaddrAs(i).toLong & 0xffffffffL) == StackVa))
+            if (resident) {
+              launchedResident += 1
+              println(f"[$tag][$cyc] SMOKING GUN: load of 0x$StackVa%08x launched to the D-cache " +
+                f"(fwdHit=${ls.p4Ctx.fwdHit.toBoolean} fwdStall=${ls.p4Ctx.fwdStall.toBoolean}) " +
+                f"while an SQ entry for the same address is still resident (undrained push); " +
+                f"parkedCycles so far=$parkedCycles")
+            }
+          }
+        }
+      })
+    println(f"[$tag] parkedCycles=$parkedCycles launched=$launched launchedWhileStoreResident=$launchedResident staleValueSeen=$staleValueSeen")
+    if (expectParked) assert(parkedCycles > 0,
+      s"[$tag] VACUOUS: the stack-slot load never parked on the inhibited-store barrier; " +
+        "the scenario under test was not exercised")
+    assert(staleValueSeen == 0,
+      s"[$tag] a load of the stack slot completed with the slot's OLDER image 0x8CF88000 " +
+        s"instead of the just-pushed return address ($staleValueSeen time(s))")
+    assert(launchedResident == 0,
+      s"[$tag] load of the just-pushed stack slot was launched to the D-cache while its producing " +
+        s"store was still resident in the store queue (stale forward verdict across the inhibited-" +
+        s"store barrier) -- $launchedResident time(s)")
+  }
+
+  // Device-store B latency sweep: the race is "does the load reach its SQ query before the
+  // last FIFO store's peripheral-bus write completes" -- on the board that is tens of cycles.
+  private val staleFwdLatencies: Seq[(String, m68k040.sim.AxiMemModelConfig)] = Seq(
+    // (A zero-latency device store drains before the helper's load can arrive even with
+    //  a warm jsr, so that point is vacuous and deliberately not in the sweep.)
+    "b5"     -> m68k040.sim.L2Sweeps.l2DramFast,
+    "b60"    -> m68k040.sim.L2Sweeps.storeSlow)
+
+  for ((lat, dc) <- staleFwdLatencies) {
+    test(s"stale-fwd[$lat]: move.l (sp),d0 after the ROM's 10 FIFO stores + jsr push -- COPYBACK, line evicted (ROM 0x408990E2 shape)", VerilatorTest) {
+      staleForwardAcrossInhibitedBarrier(s"stale-fwd-cb-evicted-$lat", evictLine = true, copyback = true, dc = dc)
+    }
+  }
+  test("stale-fwd[b60]: same shape, COPYBACK, line resident", VerilatorTest) {
+    staleForwardAcrossInhibitedBarrier("stale-fwd-cb-resident-b60", evictLine = false, copyback = true,
+      dc = m68k040.sim.L2Sweeps.storeSlow)
+  }
+  test("stale-fwd[b60]: same shape, WRITE-THROUGH, line evicted", VerilatorTest) {
+    staleForwardAcrossInhibitedBarrier("stale-fwd-wt-evicted-b60", evictLine = true, copyback = false,
+      dc = m68k040.sim.L2Sweeps.storeSlow)
+  }
+  test("stale-fwd[b60]: CONTROL -- the ROM's literal dbf loop form (loop-exit mispredict ordering)", VerilatorTest) {
+    staleForwardAcrossInhibitedBarrier("stale-fwd-cb-evicted-loop-b60", evictLine = true, copyback = true,
+      dc = m68k040.sim.L2Sweeps.storeSlow, loopForm = true, expectParked = false)
+  }
 }

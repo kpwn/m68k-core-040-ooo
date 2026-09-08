@@ -63,6 +63,15 @@ case class SqFwdRsp() extends Bundle {
   val hit   = Bool()          // full-overlap forward
   val data  = Bits(32 bits)
   val stall = Bool()          // partial/ambiguous overlap with an older store
+  // The verdict above was computed while the INHIBITED serialization barrier was
+  // present (`serialStall`): an older inhibited store is resident (any query), or the
+  // query itself is inhibited and any older store is resident. `hit` is masked in
+  // that case, and `stall` is NOT raised for it (see the deliberate note at the
+  // driver) -- so a consumer that registers this verdict and later acts on it MUST
+  // treat it as provisional: the masked `hit` may hide an exact-match older store
+  // that is still undrained when the barrier lifts (hardware corruption at ROM
+  // 0x408990E2, 2026-09-08). The LS-EU re-queries while this is set.
+  val serial = Bool()
 }
 
 /** Speculative store queue: a small ring (depth parametric, default 8).
@@ -796,6 +805,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   // the DEVICE, never echo an older store's data out of this ring.
   io.fwd.rsp.hit   := fullValid && !serialStall
   io.fwd.rsp.data  := best.data
+  io.fwd.rsp.serial := serialStall
   // DELIBERATELY NOT `|| serialStall`.  Driving the boundary as a forwarding STALL
   // made the LS-EU re-query from p4 every cycle until the older store drained --
   // a wait whose release condition is not self-resolving, because the spinning load
