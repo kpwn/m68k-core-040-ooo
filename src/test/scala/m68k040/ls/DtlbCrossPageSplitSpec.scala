@@ -385,6 +385,12 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
       lineB.indices.foreach(i => dataMem.pokeByte(paB + i, lineB(i)))
       seedPreg(dut, cd, preg = 10, data = va)
 
+      // Slot B is cache-INHIBITED, which makes the whole split access `p4Inhibited`
+      // (LsEuPlugin: `cmode === INHIBITED || (twoAccess && cmodeB === INHIBITED)`), and
+      // since f5f9fe13 an inhibited load is precise: it launches only when it is the ROB
+      // head. Park the head on it, exactly as the real ROB would once rob 12 retired.
+      dut.wire.logic.iRobHeadIn #= 13; dut.wire.logic.iRobHeadValidIn #= true
+
       val run = runLoad(dut, cd, basePreg = 10, pdst = 22, robId = 13, expectFault = false)
       assert(run.reqs == expectedReqs(va, 13), s"mode split DTLB requests: ${run.reqs}")
       assert(run.rsps.map(r => (r.token, r.mode)) == Vector(
