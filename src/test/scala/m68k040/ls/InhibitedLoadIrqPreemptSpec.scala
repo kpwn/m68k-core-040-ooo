@@ -32,8 +32,9 @@ import org.scalatest.funsuite.AnyFunSuite
   *      `!debugHaltImminentIn` -- do not LAUNCH on a cycle where an interrupt/trace
   *      is already known pending, or a debug automatic-halt boundary is already due
   *      for this exact head. Tested here directly (Tests A/B).
-  *   2. `inhibitedLoadBusySig` -- true from launch until the response is genuinely
-  *      consumed, +1 cycle -- feeds the ROB's `normalIrqGate`/`traceNormalGate` as a
+  *   2. `inhibitedLoadBusySig` -- true from launch until the launching uop has RETIRED
+  *      (response consumed AND the ROB head moved past it; was "+1 cycle past the
+  *      response" before 360f6a49) -- feeds the ROB's `normalIrqGate`/`traceNormalGate` as a
   *      sibling of `preciseDrainBusyIn`, closing the narrower race where the
   *      interrupt/trace only becomes pending AFTER the load has already launched
   *      (invisible to a launch-time gate by construction). The ROB-side half of
@@ -233,8 +234,17 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
     }
   }
 
-  // ── Test C: inhibitedLoadBusySig's own launch-to-consumption lifecycle ────────
-  test("C: inhibitedLoadBusySig is true from launch through response consumption, and clears shortly after") {
+  // ── Test C: inhibitedLoadBusySig's own launch-to-RETIRE lifecycle ─────────────
+  // Contract since 360f6a49 (hardware wedge ROM 0x40899664: an interrupt recognized
+  // between the device read's response and the launching µop's RETIRE squashed a macro
+  // whose clear-on-read access had already happened, and the replay re-read the
+  // device): busy is asserted from LAUNCH until the launching µop has RETIRED, i.e.
+  // the response has been consumed AND the ROB head has moved past the launcher's
+  // robId (`launcherStillAtHead`). The pre-360f6a49 "+1 cycle past the response"
+  // clear is exactly the hole that fix closes, so this test must FAIL against it:
+  // it holds the head on the launcher for HOLD cycles after the response and requires
+  // busy to stay up the whole time, then advances the head and requires the clear.
+  test("C: inhibitedLoadBusySig holds from launch through response consumption until the launching uop retires") {
     simConfig.compile(new Dut).doSim { dut =>
       val (cd, mem, ptmem) = initDut(dut)
       val base = 0x9200L
@@ -252,12 +262,11 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       var enqCycle = -1
       var arCycle = -1
       var rspCycle = -1
-      var clearCycle = -1
       var everFalseBetweenEnqAndRsp = false
       var sawBusyByArTime = false
       var cyc = 0
       val maxCycles = 300
-      while (clearCycle < 0 && cyc < maxCycles) {
+      while (rspCycle < 0 && cyc < maxCycles) {
         if (enqCycle < 0 && dut.eu.logic.alignedEnq.toBoolean) enqCycle = cyc
         if (arCycle < 0 && arFiredTo(dut, base)) {
           arCycle = cyc
@@ -266,7 +275,6 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
         if (rspCycle < 0 && dut.eu.logic.alignedRspFire.toBoolean) rspCycle = cyc
         if (enqCycle >= 0 && rspCycle < 0 && !dut.eu.logic.loadBusyReg.toBoolean && cyc > enqCycle + 1)
           everFalseBetweenEnqAndRsp = true
-        if (rspCycle >= 0 && clearCycle < 0 && !dut.eu.logic.loadBusyReg.toBoolean) clearCycle = cyc
         cd.waitSampling()
         cyc += 1
       }
@@ -274,15 +282,34 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       assert(enqCycle >= 0, "the inhibited load never enqueued into the aligned ring")
       assert(arCycle >= 0, "the inhibited load never issued its AR")
       assert(rspCycle >= 0, "the inhibited load's response never arrived")
-      assert(clearCycle >= 0, "inhibitedLoadBusySig never cleared after the response was consumed")
       assert(sawBusyByArTime,
         "inhibitedLoadBusySig must already be true by the cycle the device AR fires")
       assert(!everFalseBetweenEnqAndRsp,
         "inhibitedLoadBusySig must not glitch false between launch and response consumption")
-      assert(clearCycle - rspCycle <= 3,
-        s"inhibitedLoadBusySig must clear within a few cycles of response consumption " +
-        s"(rspCycle=$rspCycle clearCycle=$clearCycle)")
-      assert(completed(dut, robId) || true) // response already observed via alignedRspFire above
+
+      // (1) The launcher is still the ROB head (not yet retired): busy must HOLD. The
+      // pre-360f6a49 RTL cleared it +1 cycle after the response and fails right here.
+      val HOLD = 12
+      for (k <- 0 until HOLD) {
+        assert(dut.eu.logic.loadBusyReg.toBoolean,
+          s"inhibitedLoadBusySig dropped ${k} cycle(s) after the response while the launching " +
+          "uop (rob=" + robId + ") was STILL the ROB head -- the retire gap 360f6a49 closes " +
+          "(an interrupt recognized here replays a device read that already happened)")
+        cd.waitSampling()
+      }
+
+      // (2) Retire witness: the head moves past the launcher. Busy must now clear promptly.
+      dut.wire.logic.iRobHeadIn #= robId + 1
+      var clearCycle = -1
+      var k = 0
+      while (clearCycle < 0 && k < 8) {
+        if (!dut.eu.logic.loadBusyReg.toBoolean) clearCycle = k
+        cd.waitSampling(); k += 1
+      }
+      assert(clearCycle >= 0, "inhibitedLoadBusySig never cleared after the launching uop retired")
+      assert(clearCycle <= 3,
+        s"inhibitedLoadBusySig must clear within a few cycles of the head leaving the launcher " +
+        s"(cleared $clearCycle cycle(s) after the head advanced)")
     }
   }
 
