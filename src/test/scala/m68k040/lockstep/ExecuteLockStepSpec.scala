@@ -11012,4 +11012,265 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     staleForwardAcrossInhibitedBarrier("stale-fwd-cb-evicted-loop-b60", evictLine = true, copyback = true,
       dc = m68k040.sim.L2Sweeps.storeSlow, loopForm = true, expectParked = false)
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // p163 (2026-09-08, cpu040 4aaee2b1 on the Quadra 700 SoC): a ~10-byte STORE landed at
+  // RAM 0x0..0x9 = [ff ff][00 00 00 00][00 00 00 00] in a dirty L1D line (DRAM correct
+  // until `dcache-op push`); the ROM later dereferences a NIL pointer through mem[0]
+  // (0x40832caa) and bus-errors at 0xffff0062 -> Sad Mac. The shape is QuickDraw's
+  // picture-header failure init in the ROM's picture-append routine 0x40831ab0:
+  //
+  //   40831af8  clrl %a1@(8)          ; picSave size := 0
+  //   40831afc  moveq #10,%d0
+  //   40831afe  moveal %a3,%a0
+  //   40831b00  _SetHandleSize (0xa024, line-A trap)
+  //   40831b02  moveal %a3@,%a0       ; a0 := *pictureHandle (the master pointer)
+  //   40831b04  movew #-1,%a0@+       ; picSize := -1     \
+  //   40831b08  clrl %a0@+            ; picFrame.topLeft   } exactly bytes 0..9 if a0 == 0
+  //   40831b0a  clrl %a0@+            ; picFrame.botRight /
+  //
+  // reached only on the `_SetHandleSize` FAILURE arm (the `beqs` at 0x40831af6 tests the
+  // CCR the trap returned). These tests play the routine BYTE-EXACT at its REAL PC with a
+  // vector-10 handler that emulates a failing SetHandleSize (D0 = memFullErr, CCR from
+  // `tst.l %d0` written into the stacked SR, RTE), lock-step against Musashi, under the
+  // committed-store address tripwire (`StoreAddrTripwire`): any committed store whose
+  // lowest physical byte is below 0x10 fails the test with the full provenance of its
+  // base register (psrcA, PRF-vs-bypass, last physical writer). Non-vacuity is taken from
+  // the ORACLE: the writer instruction (0x40831b04) must retire once per call.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  object PicNil {
+    val Vbr   = 0x3000L
+    val Qd    = 0x00102000L; val Port = 0x00102100L; val H1 = 0x00102200L; val R = 0x00102300L
+    val H2    = 0x00102400L; val P    = 0x00102500L; val A5w = 0x00102600L; val Src = 0x00102700L
+    val StopPc = ProgramAssembler.DefaultLoadAddress + 0x400L
+    val RomOff = 0x31ab0L
+    def routinePc(romOff: Long) = ProgramAssembler.DefaultLoadAddress + romOff   // 0x40831ab0 for the real offset
+    def writerPc(romOff: Long)  = routinePc(romOff) + 0x54                       // 0x40831b04
+    // verbatim 0x40831ab0..0x40831b2d from files/420dbff3.rom (full_rom.dis)
+    val RomWords = Seq(0x4e56,0x0000,0x48e7,0x0118,0x2855,0x2854,0x4aac,0x005c,0x6762,0x286c,0x005c,
+      0x2254,0x2e29,0x0008,0x6756,0x2651,0x302e,0x0008,0x48c0,0xd087,0x2340,0x0008,0x2053,0x3080,
+      0xb0a9,0x0004,0x6f28,0x0680,0x0000,0x0200,0x2340,0x0004,0x204b,0xa024,0x2254,0x6716,0x42a9,
+      0x0008,0x700a,0x204b,0xa024,0x2053,0x30fc,0xffff,0x4298,0x4298,0x6016,0x2251,0x2251,0xd3c7,
+      0x206e,0x000a,0x302e,0x0008,0x6002,0x12d8,0x51c8,0xfffc,0x4cdf,0x1880,0x4e5e,0x4e74,0x0006)
+    val Done  = 0x00103000L
+    def program(calls: Int, phaseNops: Int, romOff: Long = RomOff, handlerResult: Int = -108,
+                irq: Boolean = false, mmuOn: Boolean = false,
+                longHandler: Boolean = false, touchMp: Boolean = false): String = {
+      // longHandler: the real _SetHandleSize is hundreds of instructions, so the ROB wraps
+      // between the squashed pre-trap incarnation of `moveal (a3),a0` and its re-execution
+      // (same robId, same vaddr). touchMp: the handler rewrites the master-pointer slot
+      // (same value), so the post-RTE load depends on a store that crossed the RTE.
+      val hLong  = if (longHandler) "moveq #70,%d2 ; hl: subq.l #1,%d2 ; bne hl ; " else ""
+      val hTouch = if (touchMp) "move.l (%a0),%d2 ; move.l %d2,(%a0) ; " else ""
+      val nops = Seq.fill(phaseNops)("nop").mkString(" ; ") + (if (phaseNops > 0) " ; " else "")
+      // mmuOn flavour (the board's posture, TC=0xC000): everything TT-covered (RAM copyback,
+      // code cacheable) so no table walk happens; `LsEuPlugin.fastStore = mmuEnable &&
+      // cacheable` then makes the (An)+ stores FAST stores whose An write-back is immediate.
+      val mmuSetup = if (mmuOn)
+        "move.l #0x000FC000,%d7 ; movec %d7,%dtt1 ; move.l #0x400FE020,%d7 ; movec %d7,%itt0 ; " +
+        "move.l #0xC000,%d7 ; movec %d7,%tc ; " else ""
+      // irq flavour: a level-1 autovector handler (bare RTE) at VBR+0x64, SR unmasked after
+      // setup, and a committed done-flag store the harness watches on the store port.
+      val irqSetup = if (irq) f"move.l #irqh,%%d1 ; move.l %%d1,0x${Vbr + 0x64}%x ; move.w #0x2000,%%sr ; " else ""
+      val irqTail  = if (irq) f"move.l #0xD0E5D0E5,0x$Done%x ; " else ""
+      val irqHnd   = if (irq) "irqh: rte ; " else ""
+      ".org 0 ; " +
+      f"move.l #0x$Vbr%x,%%d0 ; movec %%d0,%%vbr ; move.l #handler,%%d1 ; move.l %%d1,0x${Vbr + 0x28}%x ; " +
+      f"move.l #0x$Port%x,0x$Qd%x ; move.l #0x$H1%x,0x${Port + 92}%x ; move.l #0x$R%x,0x$H1%x ; " +
+      f"move.l #0x$H2%x,0x$R%x ; move.l #0x$P%x,0x$H2%x ; move.l #0x$Qd%x,0x$A5w%x ; " +
+      f"move.l #0x$A5w%x,%%a5 ; clr.l 0x${R + 4}%x ; move.w #0x5a5a,0x${P + 10}%x ; " +
+      mmuSetup + irqSetup + f"move.w #${calls - 1},%%d6 ; " +
+      f"loop: move.l #16,0x${R + 8}%x ; clr.l 0x${R + 4}%x ; pea 0x$Src%x ; move.w #8,-(%%sp) ; jsr 0x${routinePc(romOff)}%x ; " +
+      nops + "dbf %d6,loop ; " +
+      irqTail + "bra stop ; " + irqHnd +
+      // vector-10 handler = a FAILING _SetHandleSize: skip the trap word, D0 := memFullErr,
+      // CCR := flags of D0 (the OS trap dispatcher's return convention), RTE.
+      f"handler: addq.l #2,2(%%sp) ; " + hLong + hTouch + f"move.l #$handlerResult,%%d0 ; tst.l %%d0 ; " +
+      "move.w %ccr,%d1 ; move.b %d1,1(%sp) ; rte ; " +
+      ".org 0x400 ; stop: bra stop ; " +
+      f".org 0x$romOff%x ; .short " + RomWords.map(w => f"0x$w%04x").mkString(", ")
+    }
+  }
+
+  def picNilHeaderRun(tag: String, calls: Int, phaseNops: Int,
+                      dc: m68k040.sim.AxiMemModelConfig, cacr: Long,
+                      romOff: Long = PicNil.RomOff, mmu: Option[(Long, Long)] = None,
+                      mmuOn: Boolean = false, longHandler: Boolean = false, touchMp: Boolean = false): Unit = {
+    val src = PicNil.program(calls, phaseNops, romOff, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp)
+    val steps = Musashi.assembleAndTrace(src) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val stopIdx = steps.indexWhere(s => (s.pc & 0xffffffffL) == PicNil.StopPc)
+    assert(stopIdx > 0, s"[$tag] oracle never reached the stop loop (${steps.size} steps)")
+    val writerRuns = steps.count(s => (s.pc & 0xffffffffL) == PicNil.writerPc(romOff))
+    assert(writerRuns == calls,
+      s"[$tag] VACUOUS: the oracle executed the writer 0x${PicNil.writerPc(romOff).toHexString} " +
+        s"$writerRuns times, expected $calls (the SetHandleSize-failure arm was not taken)")
+    var trip: StoreAddrTripwire = null
+    runLockStep(tag, src, nInstr = stopIdx + 1, maxCycles = 300000, dcfg = dc, cacr = cacr, mmuMap = mmu,
+      duringRun = (dut, cd) => {
+        trip = new StoreAddrTripwire(dut.lsEu, dut.dcache, dut.rfInt)
+        cd.onSamplings { trip.onCycle() }
+      },
+      afterRun = (dut, _) => {
+        val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+        val a0 = probe.readArch(8)
+        println(f"[$tag] final A0=0x$a0%08x (expected 0x${PicNil.P + 10}%08x); ${trip.report}")
+        assert(trip.hits.isEmpty,
+          s"[$tag] a committed STORE landed below 0x10 (the p163 corruption):\n${trip.report}\n" +
+            s"recent store issues:\n${trip.recentStores(12)}")
+        assert(a0 == PicNil.P + 10,
+          f"[$tag] final A0=0x$a0%08x, expected the picture pointer + 10 (0x${PicNil.P + 10}%08x)")
+      })
+  }
+
+  /** p163 under a phase-swept level-1 IRQ storm (the recipe that exposed the inhibited-load
+    * replay): no oracle -- the checks are the tripwire, the writer's retire count (from the
+    * ROB commit observation), the storm's non-vacuity, the final picture bytes recovered
+    * from the committed byte-write stream, and the final architectural A0. */
+  def picNilIrqStorm(tag: String, calls: Int, dc: m68k040.sim.AxiMemModelConfig, cacr: Long,
+                     gapMax: Int = 61, mmuOn: Boolean = false,
+                     longHandler: Boolean = false, touchMp: Boolean = false): Unit = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = PicNil.program(calls, 0, irq = true, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp)
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    val writerPc = PicNil.writerPc(PicNil.RomOff)
+    var doneSeen = false; var excEntries = 0; var writerRetires = 0; var cyc = 0
+    val budget = 3000000
+    var tripReport = ""; var tripHits = 0; var recent = ""; var a0 = -1L
+    var picBytes: Seq[Int] = Nil
+    compiledDut.doSim(freshSimName(tag)) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc)
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid    #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp  #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= BigInt(cacr & 0xffffffffL)
+      dut.rob.logic.exc.ss.usp  #= BigInt(0x00200000L)
+      dut.rob.logic.exc.ss.srSys #= 0x27
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= 0; dut.ctrl.logic.dtt1 #= 0
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00100000L)
+      cd.waitSampling(2)
+      dut.wire.logic.seedValid #= false
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= true
+      dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling()
+      dut.fa.logic.redirect.valid   #= false
+
+      val trip = new StoreAddrTripwire(dut.lsEu, dut.dcache, dut.rfInt)
+      val mw   = new MemWriteCapture.Handle(dut.dcache)
+      val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        var gap = 5
+        while (!stormDone.get()) {
+          cd.waitSampling(gap)
+          dut.intCtrl.logic.iplIn #= 1
+          cd.waitSampling(6)
+          dut.intCtrl.logic.iplIn #= 0
+          gap = if (gap >= gapMax) 5 else gap + 1
+        }
+        dut.intCtrl.logic.iplIn #= 0
+      }
+      var lastExcActive = false
+      val sp = dut.dcache.logic.storePort
+      while (cyc < budget && !doneSeen) {
+        cd.waitSampling(); cyc += 1
+        trip.onCycle(); mw.onCycle()
+        for (k <- 0 until 2) {
+          val o = dut.rob.logic.commitObs(k)
+          // per-MACRO count: the commit obs fires per uop and the writer is a 2-uop macro
+          if (o.fire.toBoolean && o.macroLast.toBoolean && (o.pc.toLong & 0xffffffffL) == writerPc) writerRetires += 1
+        }
+        if (sp.valid.toBoolean && sp.ready.toBoolean &&
+            (sp.payload.paddr.toLong & 0xffffffffL) == PicNil.Done) doneSeen = true
+        val excA = !dut.rob.logic.excIdle.toBoolean
+        if (excA && !lastExcActive) excEntries += 1
+        lastExcActive = excA
+      }
+      stormDone.set(true)
+      cd.waitSampling(4)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      a0 = probe.readArch(8)
+      tripReport = trip.report; tripHits = trip.hits.size; recent = trip.recentStores(16)
+      // final picture bytes = last committed write per byte address (the stream is ordered)
+      val last = scala.collection.mutable.HashMap[Long, Int]()
+      mw.events.foreach(e => last(e.addr) = e.value)
+      picBytes = (0 until 12).map(i => last.getOrElse(PicNil.P + i, -1))
+    }
+    println(f"[$tag] cycles=$cyc done=$doneSeen excEntries=$excEntries writerRetires=$writerRetires " +
+      f"A0=0x$a0%08x pic=${picBytes.map(b => if (b < 0) "--" else f"$b%02x").mkString(" ")} ; $tripReport")
+    assert(doneSeen, s"[$tag] program never stored the done flag in $cyc cycles (wedge?) -- $tripReport")
+    assert(excEntries - 2 * calls > calls,
+      s"[$tag] VACUOUS STORM: only ${excEntries - 2 * calls} IRQ entries over $calls calls")
+    assert(writerRetires == calls, s"[$tag] the writer 0x${writerPc.toHexString} retired $writerRetires times, expected $calls")
+    assert(tripHits == 0, s"[$tag] a committed STORE landed below 0x10 (the p163 corruption):\n$tripReport\nrecent store issues:\n$recent")
+    val expect = Seq(0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a, 0x5a)
+    assert(picBytes == expect, s"[$tag] final picture bytes ${picBytes.map(_.toHexString)} != ${expect.map(_.toHexString)}")
+    assert(a0 == PicNil.P + 10, f"[$tag] final A0=0x$a0%08x expected 0x${PicNil.P + 10}%08x")
+  }
+  for ((dtag, dc) <- Seq("zero" -> m68k040.sim.L2Sweeps.zeroLatency,
+                         "xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar,
+                         "storeSlow" -> m68k040.sim.L2Sweeps.storeSlow);
+       (ctag, cacr) <- Seq("DE1" -> 0x80008000L, "DE0" -> 0x00008000L)) {
+    test(s"p163 pic-header NIL store: IRQ storm x40 calls, D-side $dtag, CACR $ctag", VerilatorTest) {
+      picNilIrqStorm(s"p163-picnil-storm-$dtag-$ctag", calls = 40, dc = dc, cacr = cacr)
+    }
+  }
+  for ((dtag, dc) <- Seq("xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar,
+                         "storeSlow" -> m68k040.sim.L2Sweeps.storeSlow,
+                         "chaos" -> m68k040.sim.L2Sweeps.chaosDram)) {
+    test(s"p163 pic-header NIL store: MMU ON (TC=0xC000, fast stores), chain x6, D-side $dtag", VerilatorTest) {
+      picNilHeaderRun(s"p163-picnil-mmu-$dtag", calls = 6, phaseNops = 0, dc = dc, cacr = 0x80008000L, mmuOn = true)
+    }
+    test(s"p163 pic-header NIL store: MMU ON, IRQ storm x40 calls, D-side $dtag", VerilatorTest) {
+      picNilIrqStorm(s"p163-picnil-mmu-storm-$dtag", calls = 40, dc = dc, cacr = 0x80008000L, mmuOn = true)
+    }
+  }
+  for ((mtag, mmuOn) <- Seq("mmuOn" -> true, "mmuOff" -> false);
+       (dtag, dc) <- Seq("xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar, "chaos" -> m68k040.sim.L2Sweeps.chaosDram)) {
+    test(s"p163 pic-header NIL store: LONG handler (ROB wraps) + master-pointer rewrite, chain x6, $mtag, D-side $dtag", VerilatorTest) {
+      picNilHeaderRun(s"p163-picnil-long-$mtag-$dtag", calls = 6, phaseNops = 0, dc = dc, cacr = 0x80008000L,
+        mmuOn = mmuOn, longHandler = true, touchMp = true)
+    }
+    test(s"p163 pic-header NIL store: LONG handler + master-pointer rewrite, IRQ storm x40, $mtag, D-side $dtag", VerilatorTest) {
+      picNilIrqStorm(s"p163-picnil-long-storm-$mtag-$dtag", calls = 40, dc = dc, cacr = 0x80008000L,
+        mmuOn = mmuOn, longHandler = true, touchMp = true)
+    }
+  }
+  for ((dtag, dc) <- Seq("zero" -> m68k040.sim.L2Sweeps.zeroLatency,
+                         "xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar,
+                         "dram60" -> m68k040.sim.L2Sweeps.l2DramSlow,
+                         "storeSlow" -> m68k040.sim.L2Sweeps.storeSlow);
+       (ctag, cacr) <- Seq("DE1" -> 0x80008000L, "DE0" -> 0x00008000L)) {
+    test(s"p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side $dtag, CACR $ctag", VerilatorTest) {
+      picNilHeaderRun(s"p163-picnil-$dtag-$ctag", calls = 6, phaseNops = 0, dc = dc, cacr = cacr)
+    }
+  }
+  for (phase <- 1 until 6) {
+    test(s"p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side xbar, phase=$phase", VerilatorTest) {
+      picNilHeaderRun(s"p163-picnil-xbar-p$phase", calls = 6, phaseNops = phase,
+        dc = m68k040.sim.L2Sweeps.todaysCrossbar, cacr = 0x80008000L)
+    }
+  }
 }
