@@ -1357,6 +1357,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val o = if (k < oracle.size) { val st = oracle(k); f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.a(7) & 0xffffffffL}%08x" } else "-"
           println(f"[$name]   $k%3d: $d%-32s | $o")
         }
+      }
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
@@ -11354,6 +11355,622 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     test(s"p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side xbar, phase=$phase", VerilatorTest) {
       picNilHeaderRun(s"p163-picnil-xbar-p$phase", calls = 6, phaseNops = phase,
         dc = m68k040.sim.L2Sweeps.todaysCrossbar, cacr = 0x80008000L)
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // THE A7-BYTE RULE (2026-09-09, the p164 "odd supervisor stack pointer" boot defect)
+  //
+  // On every 68000-family CPU a BYTE-size predecrement/postincrement through A7 adjusts
+  // the stack pointer by 2, not 1 (PRM 2.2.2), so the SP stays word-aligned. p164 froze
+  // with A7 = 0x003ff1ad (ODD) and a register frame written at an odd address; the
+  // decoder's rule lives in EaDecoder.autoDeltaOf / Microcode.deltaBytesU /
+  // MicroOpAssembler.bitOpByteDelta / DecodeStage's FP delta, but NO test exercised a
+  // byte access through SP. Musashi implements the rule (EA_A7_PD_8 / EA_A7_PI_8), so the
+  // lock-step catches any A7 divergence after every retired instruction. `a7ByteFormsBody`
+  // is every byte-size form that reads or writes through -(sp)/(sp)+ (source AND
+  // destination, register / immediate / memory partners, RMW, bit ops, BCD, extended
+  // arithmetic, CMPM, Scc, TAS), run in all three A7 banks (ISP,
+  // MSP, USP); the same body also drives byte forms through A2 so the non-A7 step of 1 is
+  // pinned. The 32 bytes around the starting SP are written first, because Musashi and the
+  // DUT disagree on never-written memory. `afterRun` asserts the ORACLE's A7 is even at
+  // every step (non-vacuity: the program really keeps SP even), and the lock-step asserts
+  // the DUT tracks it. Non-vacuity of the RULE itself: with `deltaBytesU`/`autoDeltaOf`
+  // returning sizeBytes for A7 these tests fail at the first byte push (verified by hand,
+  // see the commit message).
+  //
+  // Excluded on purpose (oracle, not RTL, limitations): PACK/UNPK with a -(a7) SOURCE (the
+  // repo's Musashi applies EA_A7_PD_8 twice = -4, real hardware and the RTL do -2) and FPU
+  // byte forms (`m68kfpu.c` READ_EA_8 uses EA_AY_PD_8 = --AY with no A7 quirk). Excluded as a
+  // known RTL gap: NBCD <mem> (OperationDecoder task #159 leaves the memory form ILLEGAL; the
+  // DUT vectors through an uninitialised table, which is what a `nbcd -(%sp)` row diverged on).
+  // ═══════════════════════════════════════════════════════════════════════════════
+  private val a7ByteFormsBody: Seq[String] = Seq(
+    "move.l #0x00003000,%a0", "move.l #0x0102a3b4,(%a0)", "move.l #0xc5d6e7f8,4(%a0)",
+    "move.l #0x00003006,%a1", "move.l #0x00003004,%a2",
+    "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)",
+    "move.l #0x0f1e2d3c,-(%sp)", "move.l #0x4b5a6978,-(%sp)", "move.l #0x8796a5b4,-(%sp)", "move.l #0xc3d2e1f0,-(%sp)",
+    "lea 16(%sp),%sp",                       // SP = S0-16: 16 written bytes above AND below
+    "move.l #0x0000005a,%d0", "move.l #0x000000a5,%d1", "moveq #2,%d5", "move.l %sp,%a6",
+    // ── register / immediate partners ──
+    "move.b %d0,-(%sp)", "move.b (%sp)+,%d2",
+    "move.b #0x33,-(%sp)", "move.b (%sp)+,%d3",
+    "move.b %d1,(%sp)+", "move.b -(%sp),%d4",
+    // ── memory-source byte pushes (mem->mem MOVE with a -(sp) destination) ──
+    "move.b (%a0),-(%sp)", "move.b 2(%a0),-(%sp)", "move.b (%a0)+,-(%sp)", "move.b -(%a0),-(%sp)",
+    "move.b 0x3003,-(%sp)", "move.b (1,%a0,%d5.w),-(%sp)",                    // SP = S0-28
+    // ── (sp)+ source pops into memory destinations, and both-A7 forms ──
+    "move.b (%sp)+,(%a0)", "move.b (%sp)+,-(%a1)", "move.b (%sp)+,(%a1)+", "move.b (%sp)+,4(%a0)",
+    "move.b (%sp)+,0x3006", "move.b (%sp)+,-(%sp)", "move.b -(%sp),(%sp)+", "move.b (%sp)+,%d6",   // SP = S0-16
+    // ── RMW / single-operand / bit / compare forms ──
+    "clr.b -(%sp)", "tst.b (%sp)+", "tst.b -(%sp)", "clr.b (%sp)+",
+    "neg.b -(%sp)", "negx.b (%sp)+", "not.b -(%sp)", "addq.b #3,(%sp)+",
+    "subq.b #1,-(%sp)", "add.b %d0,(%sp)+", "add.b -(%sp),%d0", "sub.b (%sp)+,%d1",
+    "and.b %d0,-(%sp)", "or.b (%sp)+,%d2", "eor.b %d1,-(%sp)", "cmp.b (%sp)+,%d0",
+    "cmpi.b #0x12,-(%sp)", "andi.b #0x0f,(%sp)+", "ori.b #0x80,-(%sp)", "eori.b #0xff,(%sp)+",
+    "addi.b #5,-(%sp)", "subi.b #5,(%sp)+", "st -(%sp)", "sne (%sp)+",
+    "tas -(%sp)", "tas (%sp)+",   // NBCD <mem> is NOT implemented (ILLEGAL, task #159) -- excluded, see the header
+    "bset #0,-(%sp)", "bclr #1,(%sp)+", "bchg %d0,-(%sp)", "btst %d1,(%sp)+",
+    "btst #3,-(%sp)", "btst #3,(%sp)+",
+    "move.l #0x00003004,%a0",
+    "cmpm.b (%sp)+,(%sp)+", "subq.l #4,%sp", "cmpm.b (%a0)+,(%sp)+", "cmpm.b (%sp)+,(%a1)+", "subq.l #4,%sp",
+    "abcd -(%sp),-(%sp)", "abcd -(%a0),-(%sp)", "abcd -(%sp),-(%a1)", "sbcd -(%sp),-(%sp)", "addx.b -(%sp),-(%sp)",  // SP = S0-32
+    "lea 16(%sp),%sp",                                                                                         // SP = S0-16
+    "subx.b -(%a0),-(%sp)", "subx.b -(%sp),-(%a1)", "addx.b -(%a1),-(%sp)", "lea 6(%sp),%sp",
+    // ── byte forms through a NON-A7 address register step by exactly 1 ──
+    "move.b %d0,-(%a2)", "move.b (%a2)+,%d2", "clr.b -(%a2)", "tst.b (%a2)+", "move.b (%a2)+,-(%a2)",
+    "abcd -(%a2),-(%a2)", "addq.l #2,%a2", "cmpm.b (%a2)+,(%a2)+", "subq.l #2,%a2", "st -(%a2)", "btst #0,(%a2)+",
+    "move.b (%a2)+,-(%sp)", "move.b (%sp)+,-(%a2)",
+    "cmpa.l %a6,%sp",                        // SP must be back at S0-16 (flags lock-stepped)
+    "lea 16(%sp),%sp")
+  private val a7ByteMovesForms: Seq[String] = Seq(
+    "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "lea 4(%sp),%sp",
+    "moves.b %d0,-(%sp)", "moves.b (%sp)+,%d2", "moves.b %d1,(%sp)+", "moves.b -(%sp),%d3", "lea 4(%sp),%sp")
+  private def assertOracleA7Even(tag: String)(dut: FullCoreDut, steps: Vector[OracleStep]): Unit = {
+    val odd = steps.zipWithIndex.collect { case (s, i) if (s.a(7) & 1L) != 0 => f"step $i pc=0x${s.pc}%08x a7=0x${s.a(7)}%08x" }
+    assert(odd.isEmpty, s"[$tag] the ORACLE's A7 went odd (the test program is wrong): ${odd.mkString(", ")}")
+    assert(steps.size > 100, s"[$tag] VACUOUS: only ${steps.size} oracle steps")
+  }
+
+  test("a7-byte: every byte form through -(sp)/(sp)+ keeps SP even -- supervisor ISP bank (+MOVES)", VerilatorTest) {
+    runLockStep("a7-byte-isp", (a7ByteFormsBody ++ a7ByteMovesForms).mkString(" ; "),
+      afterRun = assertOracleA7Even("a7-byte-isp"))
+  }
+  test("a7-byte: every byte form through -(sp)/(sp)+ keeps SP even -- USER mode (USP bank)", VerilatorTest) {
+    // the moves-priv recipe: seed USP, then drop S via MOVE-to-SR (A7 := USP)
+    runLockStep("a7-byte-usp", (Seq("move.l #0x00080000,%d5", "movec %d5,%usp", "move.w #0x0000,%sr") ++
+      a7ByteFormsBody).mkString(" ; "), afterRun = assertOracleA7Even("a7-byte-usp"))
+  }
+  test("a7-byte: every byte form through -(sp)/(sp)+ keeps SP even -- supervisor M=1 (MSP bank)", VerilatorTest) {
+    // the mbit-msp recipe: seed the inactive MSP bank, then MOVE-to-SR sets M=1 (A7 := MSP)
+    runLockStep("a7-byte-msp", (Seq("move.w #0x3000,%sr") ++ a7ByteFormsBody ++ a7ByteMovesForms).mkString(" ; "),
+      initialMsp = Some(0x00180000L), afterRun = assertOracleA7Even("a7-byte-msp"))
+  }
+  // The board's posture: CACR.DE=0 makes EVERY data access cache-INHIBITED (precise store,
+  // deferred An write-back through LsEuPlugin's pendMem leg) under realistic AXI timing.
+  test("a7-byte: every byte form, D-cache OFF (all accesses inhibited) + realistic D-side timing", VerilatorTest) {
+    runLockStep("a7-byte-isp-de0", (a7ByteFormsBody ++ a7ByteMovesForms).mkString(" ; "),
+      cacr = 0x00008000L, dcfg = m68k040.sim.L2Sweeps.todaysCrossbar, maxCycles = 120000,
+      afterRun = assertOracleA7Even("a7-byte-isp-de0"))
+  }
+
+  // TAS in isolation: the straight-line form test diverged at `tas -(%sp)` (DUT commit pc
+  // garbage + one extra commit record) -- pin which TAS forms misbehave and whether A7 matters.
+  test("a7-byte: TAS forms in isolation -- Dn, (An), (An)+, -(An), abs, (sp)+, -(sp)", VerilatorTest) {
+    val pre = Seq("move.l #0x00003004,%a2", "move.l #0x0102a3b4,0x3000", "move.l #0xc5d6e7f8,0x3004",
+      "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "lea 4(%sp),%sp", "move.l #0x00000041,%d0")
+    runLockStep("tas-forms", (pre ++ Seq("tas %d0", "tas (%a2)", "tas (%a2)+", "tas -(%a2)", "tas 0x3002",
+      "tas (%sp)+", "tas -(%sp)", "move.l (%sp),%d1", "move.l %sp,%d2", "move.l %a2,%d3", "nop")).mkString(" ; "))
+  }
+  test("a7-byte: TAS -(sp) alone, then a dependent read of SP", VerilatorTest) {
+    runLockStep("tas-predec-sp", Seq("move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "lea 4(%sp),%sp",
+      "tas -(%sp)", "move.l %sp,%d2", "move.b (%sp),%d1", "nop", "nop").mkString(" ; "))
+  }
+  test("a7-byte: TAS -(a2) alone (non-A7 control)", VerilatorTest) {
+    runLockStep("tas-predec-a2", Seq("move.l #0x00003004,%a2", "move.l #0x0102a3b4,0x3000",
+      "tas -(%a2)", "move.l %a2,%d2", "move.b (%a2),%d1", "nop", "nop").mkString(" ; "))
+  }
+  // PACK with a -(sp) destination (Musashi's ax7 arm: one EA_A7_PD_8 = -2, matching hardware).
+  // Kept OUT of the form body: it diverged on the commit-record shape (DUT next-PC 4 bytes past
+  // the oracle's, 6 extra commit records), which masked every form after it.
+  test("a7-byte: PACK -(a0),-(sp) in isolation (+ the -(a2) control)", VerilatorTest) {
+    runLockStep("pack-predec-sp", Seq("move.l #0x00003004,%a0", "move.l #0x0102a3b4,0x3000",
+      "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "lea 4(%sp),%sp",
+      "pack -(%a0),-(%sp),#0", "move.l %sp,%d2", "move.l %a0,%d3", "move.b (%sp),%d1", "nop", "nop").mkString(" ; "))
+  }
+  test("a7-byte: PACK -(a0),-(a2) in isolation (non-A7 control)", VerilatorTest) {
+    runLockStep("pack-predec-a2", Seq("move.l #0x00003004,%a0", "move.l #0x0102a3b4,0x3000", "move.l #0x00003008,%a2",
+      "move.l #0xc5d6e7f8,0x3004", "pack -(%a0),-(%a2),#0", "move.l %a2,%d2", "move.l %a0,%d3", "move.b (%a2),%d1", "nop", "nop").mkString(" ; "))
+  }
+  // Same RTE-CCR check with two NOPs between the last flag-writing instruction and the IRQ
+  // boundary: if THIS passes while the unpadded one fails, the entry stacks a committed-CCR
+  // shadow that has not yet absorbed the instruction retiring in the trigger cycle.
+  test("rte restores the CCR: same check, IRQ boundary two NOPs after the flag write", VerilatorTest) {
+    val src = "move.l #handler,%d0 ; move.l %d0,0x64 ; move.w #0x2000,%sr ; moveq #0,%d1 ; tst.l %d1 ; nop ; nop ; " +
+      "beq.s ok ; move.l #0xbad,%d2 ; bra.s end ; ok: move.l #0x600d,%d2 ; end: bra.s end ; handler: moveq #1,%d5 ; rte"
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[rte-ccr-branch-nops] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val beqPc = plain(7).pc   // `beq.s ok` is the 8th executed instruction
+    runIrqLockStep("rte-ccr-branch-nops", src, nInstr = 13, irqEvents = Seq((beqPc, 1)), initialSr = 0x2700)
+  }
+  // Whitebox-independent version of the RTE-CCR check: a `tst.l` / `beq` pair looped under a
+  // cycle-swept level-1 storm whose handler leaves Z=0. If flags ever fail to survive an
+  // interrupt between the two, the loop stores to the BAD address (observable on the D-side AXI
+  // AW channel); otherwise, after all iterations, to the GOOD address.
+  test("rte restores the CCR: tst/beq pair under an IRQ storm (self-checking, no whitebox)", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val GoodVa = 0x50F0F200L; val BadVa = 0x50F0F300L
+    val src = Seq(
+      "move.l #handler,%d0", "move.l %d0,0x64", "move.w #0x2000,%sr", "move.w #199,%d4",
+      "loop: moveq #0,%d1", "tst.l %d1", "nop", "nop", "beq.s ok", "move.w #1,0x50F0F300", "bra.s end",
+      "ok: dbf %d4,loop", "move.w #1,0x50F0F200", "end: bra.s end",
+      "handler: moveq #1,%d5", "rte").mkString(" ; ")
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[rte-ccr-storm] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    var goodSeen = false; var badSeen = false; var excEntries = 0; var cyc = 0
+    compiledDut.doSim(freshSimName("rte-ccr-storm")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L; dut.rob.logic.exc.ss.cacr #= BigInt(0x80008000L)
+      dut.rob.logic.exc.ss.usp #= BigInt(0x00200000L); dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= BigInt(SpecMmioItt0Inhibited); dut.ctrl.logic.dtt1 #= BigInt(0x000FC000L)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        var gap = 3
+        while (!stormDone.get()) {
+          cd.waitSampling(gap); dut.intCtrl.logic.iplIn #= 1; cd.waitSampling(6); dut.intCtrl.logic.iplIn #= 0
+          gap = if (gap >= 41) 3 else gap + 1
+        }
+        dut.intCtrl.logic.iplIn #= 0
+      }
+      var lastExcActive = false
+      while (cyc < 200000 && !goodSeen && !badSeen) {
+        cd.waitSampling(); cyc += 1
+        val ax = dut.dcache.logic.axi
+        if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) {
+          val a = ax.aw.payload.addr.toLong & 0xffffffffL
+          if (a == GoodVa) goodSeen = true
+          if (a == BadVa) badSeen = true
+        }
+        val excA = !dut.rob.logic.excIdle.toBoolean
+        if (excA && !lastExcActive) excEntries += 1
+        lastExcActive = excA
+      }
+      stormDone.set(true); cd.waitSampling(4)
+    }
+    println(s"[rte-ccr-storm] good=$goodSeen bad=$badSeen excEntries=$excEntries cycles=$cyc")
+    assert(excEntries > 50, s"[rte-ccr-storm] VACUOUS: only $excEntries interrupt entries")
+    assert(goodSeen || badSeen, s"[rte-ccr-storm] program never finished after $cyc cycles")
+    assert(!badSeen, s"[rte-ccr-storm] the CCR did NOT survive an interrupt between `tst.l` and `beq` " +
+      s"(a `beq` fell through on Z=1) after $excEntries interrupt entries")
+  }
+  // The a7-irq boundary-9 dump: an interrupt taken right after `move.b (%sp)+,(%a1)` -- a
+  // MOVE to memory, whose NZVC comes from the STORE uop -- RTE'd with the HANDLER's CCR
+  // (0x04) instead of the pre-interrupt one (0x08), while ALU-written flags (boundaries
+  // 5/6) survived. Whitebox-independent pin: `move.b %d0,(%a1)` (N=1) then `bmi` under a
+  // cycle-swept storm; a fall-through means the stacked CCR missed the store's flags.
+  test("rte restores the CCR: flags written by a MOVE-to-memory store survive an IRQ storm", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val GoodVa = 0x50F0F200L; val BadVa = 0x50F0F300L
+    val src = Seq(
+      "move.l #handler,%d0", "move.l %d0,0x64", "move.l #0x00003000,%a1", "move.w #0x2000,%sr", "move.w #199,%d4",
+      "loop: move.l #0xff,%d0", "move.b %d0,(%a1)", "bmi.s ok", "move.w #1,0x50F0F300", "bra.s end",
+      "ok: move.b (%a1),%d1", "move.b %d1,-(%sp)", "move.b (%sp)+,(%a1)", "bmi.s ok2", "move.w #1,0x50F0F300", "bra.s end",
+      "ok2: dbf %d4,loop", "move.w #1,0x50F0F200", "end: bra.s end",
+      "handler: moveq #0,%d5", "tst.l %d5", "rte").mkString(" ; ")
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[rte-ccr-store-storm] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    var goodSeen = false; var badSeen = false; var excEntries = 0; var cyc = 0
+    compiledDut.doSim(freshSimName("rte-ccr-store-storm")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L; dut.rob.logic.exc.ss.cacr #= BigInt(0x80008000L)
+      dut.rob.logic.exc.ss.usp #= BigInt(0x00200000L); dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= BigInt(SpecMmioItt0Inhibited); dut.ctrl.logic.dtt1 #= BigInt(0x000FC000L)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        var gap = 3
+        while (!stormDone.get()) {
+          cd.waitSampling(gap); dut.intCtrl.logic.iplIn #= 1; cd.waitSampling(6); dut.intCtrl.logic.iplIn #= 0
+          gap = if (gap >= 41) 3 else gap + 1
+        }
+        dut.intCtrl.logic.iplIn #= 0
+      }
+      var lastExcActive = false
+      while (cyc < 300000 && !goodSeen && !badSeen) {
+        cd.waitSampling(); cyc += 1
+        val ax = dut.dcache.logic.axi
+        if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) {
+          val a = ax.aw.payload.addr.toLong & 0xffffffffL
+          if (a == GoodVa) goodSeen = true
+          if (a == BadVa) badSeen = true
+        }
+        val excA = !dut.rob.logic.excIdle.toBoolean
+        if (excA && !lastExcActive) excEntries += 1
+        lastExcActive = excA
+      }
+      stormDone.set(true); cd.waitSampling(4)
+    }
+    println(s"[rte-ccr-store-storm] good=$goodSeen bad=$badSeen excEntries=$excEntries cycles=$cyc")
+    assert(excEntries > 50, s"[rte-ccr-store-storm] VACUOUS: only $excEntries interrupt entries")
+    assert(goodSeen || badSeen, s"[rte-ccr-store-storm] program never finished after $cyc cycles")
+    assert(!badSeen, s"[rte-ccr-store-storm] a MOVE-to-memory's N flag did NOT survive an interrupt " +
+      s"(`bmi` fell through) after $excEntries interrupt entries: the entry stacked a CCR that missed the store's flags")
+  }
+  // Exact-boundary lock-step of the same shape: the interrupt is taken right after
+  // `move.b %d0,(%a1)` (store-written N=1); the RTE step's restored SR and the `bmi` that
+  // follows are compared against Musashi. A plain straight-line control validates the program.
+  test("rte restores the CCR: flags written by a MOVE-to-memory store, exact IRQ boundary (lock-step)", VerilatorTest) {
+    val src = "move.l #handler,%d0 ; move.l %d0,0x64 ; move.l #0x00003000,%a1 ; move.w #0x2000,%sr ; move.l #0xff,%d0 ; " +
+      "move.b %d0,(%a1) ; bmi.s ok ; move.l #0xbad,%d2 ; bra.s end ; ok: move.l #0x600d,%d2 ; end: bra.s end ; " +
+      "handler: moveq #0,%d5 ; tst.l %d5 ; rte"
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[rte-ccr-store-exact] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val bmiPc = plain(4).pc                      // post-step pc of `move.b %d0,(%a1)` == the `bmi` address
+    val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((bmiPc, 1))).getOrElse(fail("oracle"))
+    val k = withIrq.indexWhere(_.pc == withIrq.last.pc)
+    assert(k > 8, s"[rte-ccr-store-exact] interrupt not taken (end at $k)")
+    runIrqLockStep("rte-ccr-store-exact", src, nInstr = k + 1, irqEvents = Seq((bmiPc, 1)), initialSr = 0x2700)
+  }
+  // Localise the cracked-MOVE stacked-CCR loss: the interrupt lands right after each MOVE shape.
+  private def rteCcrAfterMove(tag: String, move: String): Unit = {
+    val src = "move.l #handler,%d0 ; move.l %d0,0x64 ; move.l #0x00003000,%a0 ; move.l #0x00003008,%a1 ; " +
+      "move.l #0xff,%d0 ; move.b %d0,(%a0) ; move.b %d0,-(%sp) ; move.w #0x2000,%sr ; " +
+      s"$move ; bmi.s ok ; move.l #0xbad,%d2 ; bra.s end ; ok: move.l #0x600d,%d2 ; end: bra.s end ; " +
+      "handler: moveq #0,%d5 ; tst.l %d5 ; rte"
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val bmiPc = plain(8).pc                      // post-step pc of the MOVE under test == the `bmi` address
+    val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((bmiPc, 1))).getOrElse(fail("oracle"))
+    val k = withIrq.indexWhere(_.pc == withIrq.last.pc)
+    assert(k > 12, s"[$tag] interrupt not taken (end at $k)")
+    runIrqLockStep(tag, src, nInstr = k + 1, irqEvents = Seq((bmiPc, 1)), initialSr = 0x2700)
+  }
+  for ((tag, mv) <- Seq("reg-to-mem" -> "move.b %d0,(%a1)", "mem-to-mem" -> "move.b (%a0),(%a1)",
+                        "postinc-src-to-mem" -> "move.b (%a0)+,(%a1)", "sp-postinc-src-to-mem" -> "move.b (%sp)+,(%a1)",
+                        "mem-to-predec" -> "move.b (%a0),-(%a1)", "imm-to-mem" -> "move.b #0xff,(%a1)",
+                        "long-mem-to-mem" -> "move.l (%a0),(%a1)"))
+    test(s"rte restores the CCR: IRQ right after MOVE $tag ($mv)", VerilatorTest) { rteCcrAfterMove(s"rte-ccr-after-$tag", mv) }
+  test("rte restores the CCR: MOVE-to-memory flags control (no interrupt, straight-line lock-step)", VerilatorTest) {
+    runLockStep("move-mem-flags-control", Seq("move.l #0x00003000,%a1", "move.l #0xff,%d0", "move.b %d0,(%a1)",
+      "smi %d3", "move.b (%a1),%d1", "move.b %d1,-(%sp)", "move.b (%sp)+,(%a1)", "smi %d4", "nop").mkString(" ; "))
+  }
+  // Direct measurement of the mechanism: watch RobPlugin.committedCcr (the shadow the
+  // exception entry stacks) around the retire of a flag-writing STORE vs an ALU op.
+  test("committedCcr shadow: a MOVE-to-memory's NZVC must be folded by the cycle after its retire", VerilatorTest) {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val src = "move.l #0x00003000,%a1 ; move.l #0xff,%d0 ; nop ; nop ; nop ; nop ; move.b %d0,(%a1) ; nop ; nop ; nop ; nop ; " +
+      "moveq #0,%d1 ; nop ; nop ; nop ; nop ; move.b %d0,%d2 ; nop ; nop ; nop ; nop ; end: bra.s end"
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[ccr-shadow] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    val trace = scala.collection.mutable.ArrayBuffer[String]()
+    var storeRetireCyc = -1; var ccrAfterStore = -1; var moveqRetireCyc = -1; var ccrAfterMoveq = -1
+    var aluRetireCyc = -1; var ccrAfterAlu = -1
+    compiledDut.doSim(freshSimName("ccr-shadow")) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L; dut.rob.logic.exc.ss.cacr #= BigInt(0x80008000L)
+      dut.rob.logic.exc.ss.usp #= BigInt(0x00200000L); dut.rob.logic.exc.ss.srSys #= 0x27
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0; dut.ctrl.logic.dtt0 #= 0; dut.ctrl.logic.dtt1 #= BigInt(0x000FC000L)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      val obs = dut.rob.logic.commitObs
+      // instruction start addresses: a1(6) d0(6) nop*4(8) -> store at +20 (2 bytes) -> moveq at +30 -> move.b d0,d2 at +40
+      val storePc = loadAddr + 20; val moveqPc = loadAddr + 30; val aluPc = loadAddr + 40
+      var cyc = 0
+      while (cyc < 600) {
+        cd.waitSampling(); cyc += 1
+        val ccr = dut.rob.logic.committedCcr.toInt
+        val w = dut.lsEu.logic.wbObs
+        if (w.valid.toBoolean)
+          trace += f"cyc=$cyc LS wbObs robId=${w.robId.toInt} nzvcWrite=${w.nzvcWrite.toBoolean} nzvc=0x${w.nzvc.toInt}%x intWrite=${w.intWrite.toBoolean} divRem=${w.divRem.toBoolean}"
+        if (dut.rob.logic.retire0.toBoolean) {
+          val h = dut.rob.logic.head.toInt
+          trace += f"cyc=$cyc RETIRE0 head=$h nzvcWrStore(head)=${dut.rob.logic.nzvcWrStore(h).toBoolean} nzvcValStore(head)=0x${dut.rob.logic.nzvcValStore(h).toInt}%x committedCcr=0x$ccr%02x" +
+                   (if (dut.rob.logic.retire1.toBoolean) f" +RETIRE1 h1=${(h + 1) % 64} nzvcWrStore(h1)=${dut.rob.logic.nzvcWrStore((h + 1) % 64).toBoolean}" else "")
+        }
+        for (i <- 0 until 2) if (obs(i).fire.toBoolean) {
+          val nextPc = obs(i).pc.toLong & 0xffffffffL
+          trace += f"cyc=$cyc retire slot$i nextPc=0x$nextPc%08x committedCcr=0x$ccr%02x"
+          if (nextPc == storePc + 2) storeRetireCyc = cyc
+          if (nextPc == moveqPc + 2) moveqRetireCyc = cyc
+          if (nextPc == aluPc + 2)   aluRetireCyc = cyc
+        }
+        // the obs fires the cycle AFTER the retire, and committedCcr is registered off that
+        // retire cycle: sample it at the obs cycle itself (== retire + 1), before the next
+        // flag-writing instruction (4 NOPs later) can fold on top.
+        if (storeRetireCyc > 0 && cyc == storeRetireCyc) ccrAfterStore = ccr
+        if (moveqRetireCyc > 0 && cyc == moveqRetireCyc) ccrAfterMoveq = ccr
+        if (aluRetireCyc > 0 && cyc == aluRetireCyc)     ccrAfterAlu = ccr
+      }
+    }
+    println(s"[ccr-shadow] store retired @$storeRetireCyc -> committedCcr at its obs cycle = 0x${ccrAfterStore.toHexString}; " +
+      s"moveq retired @$moveqRetireCyc -> 0x${ccrAfterMoveq.toHexString}; move.b d0,d2 retired @$aluRetireCyc -> 0x${ccrAfterAlu.toHexString}")
+    trace.foreach(l => println(s"[ccr-shadow]   $l"))
+    assert(storeRetireCyc > 0 && moveqRetireCyc > 0 && aluRetireCyc > 0, "[ccr-shadow] did not observe all three retires")
+    assert(ccrAfterMoveq == 0x04, f"[ccr-shadow] control: moveq #0 should leave Z=1 in the shadow, got 0x$ccrAfterMoveq%02x")
+    assert(ccrAfterAlu == 0x08, f"[ccr-shadow] control: move.b %%d0,%%d2 (0xff) should leave N=1, got 0x$ccrAfterAlu%02x")
+    assert(ccrAfterStore == 0x08, f"[ccr-shadow] the STORE's N=1 never reached committedCcr (0x$ccrAfterStore%02x): the exception " +
+      "entry would stack a stale CCR after any MOVE to memory")
+  }
+  // Decisive RTE-CCR check (the IRQ-boundary run diverged on CCR right at the `rte` step): a
+  // conditional branch immediately after RTE must follow the PRE-interrupt flags (Z=1 from
+  // `tst.l` of zero) even though the handler left Z=0 -- compared on PC, not on the whitebox CCR.
+  test("rte restores the CCR: a conditional branch right after RTE follows the pre-interrupt flags", VerilatorTest) {
+    val src = "move.l #handler,%d0 ; move.l %d0,0x64 ; move.w #0x2000,%sr ; moveq #0,%d1 ; tst.l %d1 ; " +
+      "beq.s ok ; move.l #0xbad,%d2 ; bra.s end ; ok: move.l #0x600d,%d2 ; end: bra.s end ; handler: moveq #1,%d5 ; rte"
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[rte-ccr-branch] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val beqPc = plain(5).pc   // `beq.s ok` is the 6th executed instruction
+    runIrqLockStep("rte-ccr-branch", src, nInstr = 11, irqEvents = Seq((beqPc, 1)), initialSr = 0x2700)
+  }
+
+  // ── The ROM's SwapMMUMode idiom under an interrupt at EVERY instruction boundary ──
+  // `move.b %d0,-(sp) ; <A-line trap> ; move.b (sp)+,%d0` and `move.b 0xcb2,-(sp)` (the
+  // MMU32bit flag push, 103 ROM sites) are lock-stepped against Musashi with a level-1
+  // autovector IRQ recognised before each instruction of the idiom in turn (one run per
+  // boundary), the handler itself doing a byte push/pop (as the ROM's handlers do).
+  private val a7IrqIdiom: Seq[String] = Seq(
+    "move.b %d0,-(%sp)", "nop", "move.b (%sp)+,%d0",
+    "move.b 0x0cb2,-(%sp)", "move.b (%a0),-(%sp)", "tst.b (%sp)+", "move.b (%sp)+,%d1",
+    "clr.b -(%sp)", "st -(%sp)", "move.b (%sp)+,(%a1)", "move.b (%sp)+,%d2")
+  private val a7IrqSrc: String = (Seq(
+    "move.l #handler,%d0", "move.l %d0,0x64", "move.l #aline,%d0", "move.l %d0,0x28",
+    "move.l #0x00003000,%a0", "move.l #0x00003008,%a1", "move.l #0x5a5a5a5a,(%a0)",
+    "move.b #0x01,0x0cb2",
+    "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)",
+    "lea 8(%sp),%sp", "move.l #0x00000042,%d0", "move.w #0x2000,%sr") ++ a7IrqIdiom ++ Seq(
+    "lea 8(%sp),%sp", "end: bra.s end",
+    "handler: move.b %d5,-(%sp)", "move.b 0x0cb2,-(%sp)", "move.b (%sp)+,%d5", "tst.b (%sp)+", "rte",
+    "aline: move.b %d6,-(%sp)", "move.b (%sp)+,%d6", "addq.l #2,2(%sp)", "rte")).mkString(" ; ")
+  test("a7-byte: IRQ at every boundary of the SwapMMUMode byte push/pop idiom (lock-step)", VerilatorTest) {
+    val plain = Musashi.assembleAndTrace(a7IrqSrc, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[a7-irq] Musashi.assembleAndTrace (plain) failed: ${err.reason}")
+    }
+    val Pre = 15                                   // straight-line preamble instructions
+    assert(plain.size > Pre + a7IrqIdiom.size + 2, s"[a7-irq] plain trace too short: ${plain.size}")
+    // OracleStep.pc is the POST-step pc, so entry i is the boundary BEFORE idiom[i+1]; one
+    // extra entry (the `lea` after the idiom) serves the last boundary's one-late retry.
+    val idiomPcs = plain.slice(Pre, Pre + a7IrqIdiom.size + 1).map(_.pc)
+    val endPc    = plain(Pre + a7IrqIdiom.size + 1).pc   // `end: bra.s end`
+    for ((pc, i) <- idiomPcs.dropRight(1).zipWithIndex) {
+      val withIrq = Musashi.assembleAndTrace(a7IrqSrc, initialSr = Some(0x2700), irqEvents = Seq((pc, 1))) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[a7-irq] Musashi.assembleAndTrace (irq@$pc) failed: ${err.reason}")
+      }
+      assert(withIrq.forall(s => (s.a(7) & 1L) == 0), f"[a7-irq] ORACLE A7 odd with IRQ at 0x$pc%08x (test program wrong)")
+      val k = withIrq.indexWhere(_.pc == endPc)
+      assert(k > Pre + a7IrqIdiom.size, f"[a7-irq] IRQ at 0x$pc%08x: the interrupt was not taken (trace reached `end` at step $k)")
+      val n = k + 1
+      // The harness raises IPL the cycle the event's predecessor retires; with a 2-wide
+      // retire and a cracked byte pop the DUT can legally take the interrupt ONE boundary
+      // later (seen at boundary 5: DUT ran `move.b (sp)+,d1` first, A7 identical on both
+      // sides). The DUT is deterministic per program+event, so on a miss re-check the same
+      // DUT behaviour against the oracle for boundary i+1 -- both are exact A7 lock-steps.
+      val exact = try { runIrqLockStep(f"a7-irq-b$i", a7IrqSrc, nInstr = n min withIrq.size, irqEvents = Seq((pc, 1)), initialSr = 0x2700); true }
+                  catch { case _: org.scalatest.exceptions.TestFailedException if i + 1 < idiomPcs.size => false }
+      if (!exact) {
+        val pc2 = idiomPcs(i + 1)
+        val withIrq2 = Musashi.assembleAndTrace(a7IrqSrc, initialSr = Some(0x2700), irqEvents = Seq((pc2, 1))).getOrElse(fail(s"[a7-irq] oracle failed"))
+        val k2 = withIrq2.indexWhere(_.pc == endPc)
+        println(f"[a7-irq] boundary $i (0x$pc%08x) did not match exactly; re-checking the DUT against the boundary-${i + 1} oracle")
+        runIrqLockStep(f"a7-irq-b$i-late", a7IrqSrc, nInstr = (k2 + 1) min withIrq2.size, irqEvents = Seq((pc, 1)), initialSr = 0x2700,
+          oracleIrqEvents = Some(Seq((pc2, 1))))
+      }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // MISALIGNED (ODD) STACK POINTER. MAME shows the Q700 ROM legitimately running a short
+  // stretch with an ODD SSP (SP=0x0017fe63 at 0x4080b1ba, the boot-block/ROM handshake) and
+  // then reloading SP; our core ended that window with SP odd and never recovered. Every
+  // stack operation the ROM performs in that window -- movem.l (sp)+ / -(sp) epilogues,
+  // move.w (sp)+,%sr, bsr/rts, pea, link/unlk, word and long push/pop, byte push/pop, an
+  // exception frame + rte -- is lock-stepped here with SP pre-set ODD at three alignments
+  // (odd inside a 16-byte line; odd with the pushes straddling a line; odd straddling the
+  // 0x100000 page boundary) in both supervisor banks. A7 and every popped value must track
+  // Musashi exactly; the final `cmpa`/`move.l %sp,%d7` pins the restored SP.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  private def oddSpSrc(delta: Int, msp: Boolean): String = ((if (msp) Seq("move.w #0x3000,%sr") else Seq.empty[String]) ++ Seq(
+    "move.l #trap0,%d0", "move.l %d0,0x80",
+    "move.l #0x00003000,%a0", "move.l #0x11223344,%d0", "move.l #0x55667788,%d1", "move.l #0x0000beef,%d2",
+    "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)", "move.l #0x0f1e2d3c,-(%sp)", "move.l #0x4b5a6978,-(%sp)",
+    "lea 16(%sp),%sp", "move.l %sp,%a6",
+    s"lea $delta(%sp),%sp",                                   // SP := S0 + delta (ODD)
+    "move.l %d0,-(%sp)", "move.w %d1,-(%sp)", "move.b %d2,-(%sp)", "move.b (%sp)+,%d3", "move.w (%sp)+,%d4", "move.l (%sp)+,%d5",
+    "pea (%a0)", "move.l (%sp)+,%d6",
+    "movem.l %d0-%d3/%a0-%a2,-(%sp)", "moveq #0,%d0", "moveq #0,%d1", "move.l #0,%a0", "movem.l (%sp)+,%d0-%d3/%a0-%a2",
+    "movem.w %d0-%d3,-(%sp)", "moveq #0,%d2", "movem.w (%sp)+,%d0-%d3",
+    "move.w %sr,-(%sp)", "move.w (%sp)+,%sr",
+    "link %a4,#-6", "move.l %sp,%d7", "unlk %a4",
+    "bsr.s sub1", "nop",
+    "trap #0", "nop",
+    "move.l %d0,-(%sp)", "move.l (%sp)+,%d7",
+    s"lea ${-delta}(%sp),%sp", "cmpa.l %a6,%sp", "move.l %sp,%d7",
+    "end: bra.s end",
+    "sub1: rts",
+    "trap0: rte")).mkString(" ; ")
+  private def oddSpRun(tag: String, delta: Int, msp: Boolean): Unit = {
+    val src = oddSpSrc(delta, msp)
+    val plain = Musashi.assembleAndTrace(src, initialMsp = if (msp) Some(0x00180000L) else None) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
+    }
+    val endPc = plain.last.pc                                   // the `end: bra.s end` loop
+    val n = plain.indexWhere(_.pc == endPc) + 1
+    assert(n > 30, s"[$tag] oracle reached `end` after only $n steps")
+    val oddSteps = plain.take(n).count(s => (s.a(7) & 1L) != 0)
+    assert(oddSteps > 20, s"[$tag] VACUOUS: the oracle's A7 was odd on only $oddSteps steps")
+    runLockStep(tag, src, nInstr = n, initialMsp = if (msp) Some(0x00180000L) else None, maxCycles = 20000)
+  }
+  for ((atag, delta) <- Seq("odd-in-line" -> -1, "odd-line-straddle" -> -15, "odd-page-straddle" -> 1);
+       (btag, msp) <- Seq("ISP" -> false, "MSP" -> true)) {
+    test(s"odd-sp: stack ops with SP ODD ($atag), $btag bank -- movem/push/pop/sr/bsr-rts/pea/link-unlk/trap-rte", VerilatorTest) {
+      oddSpRun(s"odd-sp-$atag-$btag", delta, msp)
+    }
+  }
+
+  // ── Cycle-swept level-1 IRQ storm across a loop of byte SP pushes/pops (self-checking) ──
+  // Lock-step cannot place an interrupt at a CYCLE offset, so this variant sweeps the IRQ
+  // edge across every phase of a byte push/pop loop (with the ROM's A-line-in-between
+  // shape), in the four D-side postures {DE on/off} x {zero-latency, today's crossbar},
+  // and checks (1) the committed A7 is never odd on any cycle (with the last retired PCs),
+  // (2) the program's own final SP check (an inhibited store to GOOD vs BAD address), and
+  // (3) non-vacuity: many exception entries actually interleaved, and inhibited accesses
+  // reached the LS EU gate when the D-cache is off.
+  private def a7ByteIrqStorm(tag: String, cacr: Long, dc: m68k040.sim.AxiMemModelConfig): Unit = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val GoodVa = 0x50F0F200L; val BadVa = 0x50F0F300L
+    val Iters = 48
+    val src = (Seq(
+      "move.l #handler,%d0", "move.l %d0,0x64", "move.l #aline,%d0", "move.l %d0,0x28",
+      "move.l #0x00300000,%a0", "move.b #0x5a,(%a0)", "move.l #0x00300100,%a1", "move.b #0x01,0x0cb2",
+      "move.l #0x11111111,-(%sp)", "move.l #0x22222222,-(%sp)", "move.l #0x33333333,-(%sp)", "move.l #0x44444444,-(%sp)",
+      "lea 16(%sp),%sp", "move.l %sp,%a6", "move.l #0x00000042,%d0", "move.w #0x2000,%sr",
+      s"move.w #${Iters - 1},%d4",
+      "loop: move.b %d0,-(%sp)", ".short 0xa05d", "move.b (%sp)+,%d0",
+      "move.b 0x0cb2,-(%sp)", "move.b (%a0),-(%sp)", "move.b #0x77,-(%sp)",
+      "move.b (%sp)+,%d1", "tst.b (%sp)+", "move.b (%sp)+,%d2",
+      "clr.b -(%sp)", "st -(%sp)", "move.b (%sp)+,(%a1)+", "move.b (%sp)+,%d3",
+      "move.b %d1,(%sp)+", "move.b -(%sp),%d6",
+      "dbf %d4,loop",
+      "cmpa.l %a6,%sp", "bne.s bad", "move.w #1,0x50F0F200", "bra.s end",
+      "bad: move.w #1,0x50F0F300", "end: bra.s end",
+      "handler: move.b %d5,-(%sp)", "move.b 0x0cb2,-(%sp)", "move.b (%sp)+,%d5", "tst.b (%sp)+", "rte",
+      "aline: move.b %d6,-(%sp)", "move.b (%sp)+,%d6", "addq.l #2,2(%sp)", "rte")).mkString(" ; ")
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] ProgramAssembler.assemble failed: ${err.reason}")
+    }
+    var goodSeen = false; var badSeen = false; var excEntries = 0; var sawInhibited = false
+    var cyc = 0; val budget = 400000
+    val oddHits = scala.collection.mutable.ArrayBuffer[String]()
+    val recentPcs = scala.collection.mutable.ArrayBuffer[String]()
+    compiledDut.doSim(freshSimName(tag)) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc)
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= BigInt(cacr & 0xffffffffL)
+      dut.rob.logic.exc.ss.usp #= BigInt(0x00200000L)
+      dut.rob.logic.exc.ss.srSys #= (0x2700 >> 8) & 0xff
+      dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.ctrl.logic.itt0 #= 0; dut.ctrl.logic.itt1 #= 0
+      dut.ctrl.logic.dtt0 #= BigInt(SpecMmioItt0Inhibited)   // 0x50xxxxxx inhibited (the flag stores)
+      dut.ctrl.logic.dtt1 #= BigInt(0x000FC000L)             // 0x00..0x0F cacheable (stack, vectors, data)
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
+      fork {
+        var gap = 3
+        while (!stormDone.get()) {
+          cd.waitSampling(gap)
+          dut.intCtrl.logic.iplIn #= 1
+          cd.waitSampling(6)
+          dut.intCtrl.logic.iplIn #= 0
+          gap = if (gap >= 97) 3 else gap + 1
+        }
+        dut.intCtrl.logic.iplIn #= 0
+      }
+      var lastExcActive = false
+      val obs = dut.rob.logic.commitObs
+      while (cyc < budget && !goodSeen && !badSeen) {
+        cd.waitSampling(); cyc += 1
+        for (i <- 0 until 3) if (obs(i).fire.toBoolean) {
+          recentPcs += f"0x${obs(i).pc.toLong & 0xffffffffL}%08x${if (i == 2) "x" else ""}"
+          if (recentPcs.size > 12) recentPcs.remove(0)
+        }
+        val a7 = dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL
+        if ((a7 & 1L) != 0 && oddHits.size < 8)
+          oddHits += f"cycle=$cyc a7=0x$a7%08x srSys=0x${dut.rob.logic.exc.ss.srSys.toInt}%02x recent commits (oldest first): ${recentPcs.mkString(" ")}"
+        val ax = dut.dcache.logic.axi
+        if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) {
+          val a = ax.aw.payload.addr.toLong & 0xffffffffL
+          if (a == GoodVa) goodSeen = true
+          if (a == BadVa) badSeen = true
+        }
+        if (dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Inhibited.toBoolean) sawInhibited = true
+        val excA = !dut.rob.logic.excIdle.toBoolean
+        if (excA && !lastExcActive) excEntries += 1
+        lastExcActive = excA
+      }
+      stormDone.set(true); cd.waitSampling(4)
+    }
+    println(s"[$tag] good=$goodSeen bad=$badSeen excEntries=$excEntries sawInhibited=$sawInhibited cycles=$cyc oddHits=${oddHits.size}")
+    assert(oddHits.isEmpty, s"[$tag] A7 WENT ODD:\n  ${oddHits.mkString("\n  ")}")
+    assert(excEntries > 3 * Iters, s"[$tag] VACUOUS STORM: only $excEntries exception entries for $Iters iterations")
+    if ((cacr & 0x80000000L) == 0) assert(sawInhibited, s"[$tag] VACUOUS: D-cache off but no inhibited access reached the p4 gate")
+    assert(goodSeen || badSeen, s"[$tag] program never reached its final SP check after $cyc cycles (wedge?)")
+    assert(!badSeen, s"[$tag] final SP != initial SP after $Iters iterations of byte pushes/pops under the IRQ storm")
+  }
+  for ((dtag, dc) <- Seq("zero-latency" -> m68k040.sim.AxiMemModelConfig(), "todays-crossbar" -> m68k040.sim.L2Sweeps.todaysCrossbar);
+       (ctag, cacr) <- Seq("DE-on" -> 0x80008000L, "DE-off" -> 0x00008000L)) {
+    test(s"a7-byte: cycle-swept IRQ storm over byte SP push/pop + A-line, $ctag, D-side $dtag", VerilatorTest) {
+      a7ByteIrqStorm(s"a7-storm-$ctag-$dtag", cacr = cacr, dc = dc)
     }
   }
 }
