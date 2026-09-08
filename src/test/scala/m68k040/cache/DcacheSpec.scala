@@ -137,6 +137,12 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.maintCmdIn.payload.sel #= 0
     dut.probe.logic.maintCmdIn.payload.addr #= 0
     cd.waitSampling(4)
+    // c6e3ad43: after reset the D-cache invalidates one set per cycle (`resetSweepBusy`,
+    // 128 cycles here) and holds loadCmd/loadProbe/store `ready` low until it is done.
+    // Every test that begins with a `load()` waits that out implicitly; one that drives
+    // `loadProbeIn` directly and asserts same-cycle `ready` (VIPT D2) does not. Start
+    // every test from a swept, ready cache rather than from reset+4.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem)
   }
 
@@ -158,6 +164,12 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.maintCmdIn.payload.sel #= 0
     dut.probe.logic.maintCmdIn.payload.addr #= 0
     cd.waitSampling(4)
+    // c6e3ad43: after reset the D-cache invalidates one set per cycle (`resetSweepBusy`,
+    // 128 cycles here) and holds loadCmd/loadProbe/store `ready` low until it is done.
+    // Every test that begins with a `load()` waits that out implicitly; one that drives
+    // `loadProbeIn` directly and asserts same-cycle `ready` (VIPT D2) does not. Start
+    // every test from a swept, ready cache rather than from reset+4.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem)
   }
 
@@ -216,6 +228,12 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.maintCmdIn.payload.sel #= 0
     dut.probe.logic.maintCmdIn.payload.addr #= 0
     cd.waitSampling(4)
+    // c6e3ad43: after reset the D-cache invalidates one set per cycle (`resetSweepBusy`,
+    // 128 cycles here) and holds loadCmd/loadProbe/store `ready` low until it is done.
+    // Every test that begins with a `load()` waits that out implicitly; one that drives
+    // `loadProbeIn` directly and asserts same-cycle `ready` (VIPT D2) does not. Start
+    // every test from a swept, ready cache rather than from reset+4.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem)
   }
 
