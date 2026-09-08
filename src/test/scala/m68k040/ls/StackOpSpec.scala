@@ -122,6 +122,15 @@ class StackOpSpec extends AnyFunSuite {
 
       // POP.L: plain load from (new A7) -> phys 21. (A7)+ postinc is folded into the
       // ibranch in Tasks 4/5; here we just validate the pop READ reads the pushed value.
+      //
+      // The push (rob 1) has retired in any real pipeline by now, so the ROB head is the
+      // pop itself (rob 2) -- and that is load-bearing, not cosmetic: this DUT hosts no
+      // CacheControlService, so the LS EU classifies the pop as cache-INHIBITED (CACR.DE=0
+      // reset state), and since f5f9fe13 an inhibited load launches ONLY at the ROB head
+      // (`p4LaunchOk` = `p4AtRobHead && !olderStore`). Leaving the head parked on rob 1
+      // is a permanent hang (`no completion for rob=2`), the same shape task #233 fixed
+      // for the push.
+      dut.wire.logic.iRobHeadIn #= 2; dut.wire.logic.iRobHeadValidIn #= true
       s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= Size.LONG
       s.iStkPush #= false
       s.iPsrcA #= 20; s.iPsrcAValid #= true      // base = new A7 (phys20 = A7-4)
