@@ -2341,8 +2341,34 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfChosenArSel = Mux(heldOnSetBusyQ, pfBlockingArSel, pfArSel)
     val pfChosenArMshr = (pfChosenArSel.resize(mshrIdxBits) +
                           U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
+    // ── Per-AXI-id BUS-outstanding tracking (2026-09-08, p163 campaign) ──────────
+    // The MSHR state is NOT a record of what is outstanding on the bus: an `anyInvalidate`
+    // (CPUSHA/CINVA BC -- the ROM's _BlockMove executes one after every >12-byte copy)
+    // that lands while a demand fill is in flight poisons the slot, the miss FSM leaves
+    // it, and the next demand miss RE-ARMS the same slot (`mshrArSent := False`,
+    // `mshrGen + 1`) and presents a NEW AR under the SAME AXI id while the old
+    // transaction's R beats have not returned. Caught by AxiMemModel's protocol checker
+    // ("AR id=1 presented while ALREADY outstanding") on the ExecuteLockStepSpec p163
+    // BlockMove+CPUSHA tests. It is not cosmetic: the R consumer's stale filter is
+    // `mshrArSentGen === mshrGen`, a generation that is NOT carried on the bus, so once
+    // the new AR has fired the OLD response (same id, in order) matches and is installed
+    // as the NEW line's data -- the core then executes another line's bytes. Whether the
+    // SoC pairs it that way depends only on whether anything ahead of the L2's id-busy
+    // CAM accepts the duplicate AR (a register slice does).
+    //
+    // Fix: track the bus transaction per id, set on AR fire and cleared on the id's
+    // R.last, and never present an AR for an id that is still outstanding. The old
+    // response then arrives while `mshrArSent` of the re-armed slot is still False and
+    // takes the existing `staleDrain` path; the new AR goes out afterwards and its
+    // response is the one consumed. Termination: an outstanding transaction always
+    // completes (the slave owes its beats), so the gate can only delay, never block.
+    val arOutstanding = Vec.fill(MSHR_N)(RegInit(False))
+    arOutstanding.foreach(_.simPublic())
+    when(axi.ar.fire) { arOutstanding(arHoldId.resize(mshrIdxBits)) := True }
+    when(axi.r.fire && axi.r.payload.last) { arOutstanding(axi.r.payload.id.resize(mshrIdxBits)) := False }
+
     when(!arHoldValid) {
-      when(refillActive && !mshrArSent(DEMAND_IDX)) {
+      when(refillActive && !mshrArSent(DEMAND_IDX) && !arOutstanding(DEMAND_IDX)) {
         arHoldValid := True
         arHoldId    := U(AxiIds.I_DEMAND, AxiIds.ID_W bits)
         arHoldAddr  := mshrPa(DEMAND_IDX) & ~U(63, 32 bits)
@@ -2354,7 +2380,7 @@ class IcachePlugin extends FiberPlugin with FetchService {
       // S1 as soon as the FSM reaches IDLE (a bounded <= 3-cycle speculative install
       // dwell, which needs no AR of its own), and the demand's OWN AR is launched by the
       // higher-priority `refillActive` arm above, not by this one.
-      } elsewhen(pfAnyArWant && !demandFillStart &&
+      } elsewhen(pfAnyArWant && !demandFillStart && !arOutstanding(pfChosenArMshr) &&
                  (!demandStuckQ || (heldOnSetBusyQ && pfBlockingArAny))) {
         arHoldValid := True
         arHoldId    := (pfChosenArSel.resize(AxiIds.ID_W) +
