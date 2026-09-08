@@ -92,6 +92,13 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
       b.valid := w.valid; b.address := w.address; b.data := w.data; b
     })
     spinal.core.sim.SimPublic(dbgW)
+    // sim-only debug: the bypass ports (EU same-cycle result forwarding into the read
+    // ports), so a whitebox can tell whether a read was served from `ram` or a bypass.
+    val dbgByp = Vec(bypasses.map { b =>
+      val c = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
+      c.valid := b.valid; c.address := b.address; c.data := b.data; c
+    })
+    spinal.core.sim.SimPublic(dbgByp)
 
     // init-zero boot sweep: write 0 to every address through physical write 0
     // before normal operation (no fetch happens until the first redirect).

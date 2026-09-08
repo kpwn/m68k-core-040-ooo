@@ -701,11 +701,21 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     s1Valid.simPublic(); s1Va.simPublic(); s1Base.simPublic(); s1Disp.simPublic()
     s1Index.simPublic(); s1Data.simPublic(); s1Ctx.uop.pc.simPublic()
     s1Ctx.uop.imm.simPublic(); s1Ctx.uop.useImm.simPublic()
+    // Sim-only taps for the committed-store address tripwire (test/lockstep/StoreAddrTripwire.scala):
+    // the S0 base operand as read (post-bypass) and its physical source, plus the S1 store
+    // context, so a drained store can be traced back to WHERE its base register value came
+    // from. Zero synth impact (simPublic only), same convention as the taps above.
+    base0.simPublic(); u0.psrcA.simPublic(); u0.psrcAValid.simPublic(); u0.memOp.simPublic()
+    u0.pc.simPublic(); u0.pdst.simPublic(); u0.pdstValid.simPublic(); u0.eaAuto.simPublic()
+    u0.stkPush.simPublic()
+    u1.memOp.simPublic(); u1.psrcA.simPublic(); u1.psrcAValid.simPublic(); u1.eaAuto.simPublic()
+    u1.pdst.simPublic(); u1.pdstValid.simPublic()
     // The An write-back value for an auto-update µop (when it carries an int dst):
     //   PREDEC  -> s1Va (= base - eaDelta, the decremented An)
     //   POSTINC -> base + eaDelta
     val s1AnPost = (s1Base + u1.eaDelta).asBits
     val s1AnWb   = Mux(u1.eaAuto === m68k040.decode.EaAuto.POSTINC, s1AnPost, s1Va.asBits)
+    s1AnWb.simPublic()   // tripwire tap (see the block above s1Va)
     // A2 fix: the MOVES write µop reads Rn AND folds the (An)+/-(An) auto write-back
     // into the SAME atomic store. When Rn statically aliases the EA's An (decode-time
     // marker, see DecodedUop.movesAliasStore), Musashi's actual byte-written value is
