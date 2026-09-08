@@ -2809,6 +2809,73 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       obs(2).macroLast := True
       obs
     }
+
+    // ── A7-ODD TRIPWIRE (2026-09-09, the p164 odd-SSP boot defect) ──────────────────
+    // ELABORATION-GATED on the CPU040_A7_TRIPWIRE environment variable: absent from every
+    // synth / default GenVerilog build (the `if` is Scala, so nothing is elaborated), which
+    // is why it is not under GenerationFlags.simulation -- the SoC's GenSocketTopVerilog does
+    // not enable includeSimulation, and the tripwire must run in that Verilator flow.
+    // Watches the COMMITTED active-bank A7 (`exc.ss.a7`: the live PRF readback of arch-15,
+    // the same value the exception FSM sizes frames from) and prints, on every EVEN->ODD and
+    // ODD->EVEN transition, the last 8 retired instruction PCs (r = normal retire, x =
+    // exception/RTE pseudo-commit), the SR system byte and a running retire count. A 68k
+    // stack pointer must never be odd, so an EVEN->ODD print names the instruction (or the
+    // exception sequence) that broke it; the ODD->EVEN print pairs with it so a transient
+    // (e.g. the documented sysOp readback garbage) can be told from a persistent drift.
+    // `report` lowers to a `$display` under `ifndef SYNTHESIS`, so even a build that set
+    // the variable by accident would synthesize to nothing but the ring + counter.
+    if (sys.env.contains("CPU040_A7_TRIPWIRE")) new Area {
+      val a7      = exc.ss.a7
+      val odd     = a7(0)
+      val oddPrev = RegNext(odd) init False
+      val ringPc  = Vec.fill(8)(Reg(UInt(32 bits)) init 0)
+      val ringX   = Vec.fill(8)(Reg(Bool()) init False)
+      val retired = Reg(UInt(48 bits)) init 0
+      val hits    = Reg(UInt(16 bits)) init 0
+      retired := retired + retiredThisCycle.resized
+      // Shift the ring by however many instructions retired this cycle (slot 0 is the
+      // oldest of a pair, so it lands deeper). An exception/RTE commit (obsFire) never
+      // coincides with a normal retire (the ROB is drained), so its own shift is safe.
+      when(retire0 && retire1) {
+        for (i <- 7 downto 2) { ringPc(i) := ringPc(i - 2); ringX(i) := ringX(i - 2) }
+        ringPc(1) := p0.pc; ringX(1) := False
+        ringPc(0) := p1.pc; ringX(0) := False
+      } elsewhen(retire0) {
+        for (i <- 7 downto 1) { ringPc(i) := ringPc(i - 1); ringX(i) := ringX(i - 1) }
+        ringPc(0) := p0.pc; ringX(0) := False
+      }
+      when(exc.obsFire) {
+        for (i <- 7 downto 1) { ringPc(i) := ringPc(i - 1); ringX(i) := ringX(i - 1) }
+        ringPc(0) := exc.obsPc; ringX(0) := True
+      }
+      // ODD-EPISODE TRACE: while A7 is odd (the ROM legitimately runs short odd-SSP stretches
+      // and a real 68040 undoes them exactly), print every retired instruction PC and every
+      // change of the committed A7, so the one instruction whose A7 update differs from the
+      // architecture can be read straight off the log. Capped per elaboration.
+      val cyc     = Reg(UInt(48 bits)) init 0
+      cyc := cyc + 1
+      val a7Prev  = RegNext(a7) init 0
+      val traceN  = Reg(UInt(16 bits)) init 0
+      val tracing = odd && traceN < 6000
+      when(tracing && (retire0 || retire1 || exc.obsFire)) {
+        traceN := traceN + 1
+        report(Seq("[A7-TRACE] cyc=", cyc, " retire pc0=", p0.pc, " r0=", retire0, " pc1=", p1.pc, " r1=", retire1,
+                   " excObs=", exc.obsFire, " excPc=", exc.obsPc, " a7=", a7))
+      }
+      when((odd || oddPrev) && (a7 =/= a7Prev) && traceN < 6000) {
+        report(Seq("[A7-TRACE] cyc=", cyc, " A7 ", a7Prev, " -> ", a7, " srSys=", exc.ss.srSys))
+      }
+      when((odd ^ oddPrev) && hits < 64) {
+        hits := hits + 1
+        report(Seq(
+          "[A7-TRIPWIRE] cyc=", cyc, " odd=", odd, " (1 = A7 just went ODD, 0 = back even) a7=", a7,
+          " srSys=", exc.ss.srSys, " isp=", exc.ss.isp, " msp=", exc.ss.msp, " usp=", exc.ss.usp,
+          " retired=", retired, " lastPcs(newest first):",
+          " ", ringPc(0), ringX(0), " ", ringPc(1), ringX(1), " ", ringPc(2), ringX(2),
+          " ", ringPc(3), ringX(3), " ", ringPc(4), ringX(4), " ", ringPc(5), ringX(5),
+          " ", ringPc(6), ringX(6), " ", ringPc(7), ringX(7)))
+      }
+    }
   }
 
   override def trace     = logic.traceVec
