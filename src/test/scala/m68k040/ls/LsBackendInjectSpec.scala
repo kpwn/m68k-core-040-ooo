@@ -156,6 +156,27 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.phtValid #= false; u.phtIndex #= 0
     u.casForm #= 0
     u.firstOfInstr #= true
+    // EVERY RenamedUop field must be poked: an un-poked testbench input is randomised
+    // per Verilator seed (this project's documented sim gotcha). Left undriven,
+    // `debugBreakValid` alone made this test seed-dependent -- on seed 758449358 the
+    // first MOVEQ arrived flagged as a debug breakpoint, RobPlugin's
+    // `debugBreakpointBoundaryHit` (count>0 && p0.first && p0.debugBreakValid) took the
+    // debug-halt FSM RUNNING->RECOVER->HALTED, and `headReady` (!debugHalted) never
+    // let anything retire ('LS load must write back; saw List()'). `eaAuto` /
+    // `lastOfInstr` would corrupt the LS uop's EA and the ROB's macro-boundary logic
+    // the same way.
+    u.lastOfInstr #= true
+    u.debugBreakValid #= false; u.debugBreakSlot #= 0
+    u.eaAuto #= m68k040.decode.EaAuto.NONE; u.eaDelta #= 0
+    u.isReturn #= false
+    u.fpuSoftwareComplete #= false; u.fpuCmdWord #= 0; u.fpuOp #= 0
+    u.fpSrcKind #= m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt #= 0; u.fpWideImm #= 0
+    u.fpDstArch #= 0
+    u.pFpDst #= 0; u.pFpDstValid #= false; u.pFpOld #= 0
+    u.pFpSrcA #= 0; u.psrcAFpValid #= false
+    u.pFpSrcB #= 0; u.psrcBFpValid #= false
+    u.pFpccDst #= 0; u.writesFpcc #= false; u.pFpccOld #= 0
+    u.pFpccSrc #= 0; u.readsFpcc #= false
   }
 
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt
@@ -187,6 +208,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
       dut.rsrc.logic.src.valid #= false
       dut.rsrc.logic.u1v #= false
       dut.rob.logic.flush.valid #= false
+      cd.waitSampling(80) // PRF init sweep
       // This test's whole point is a store->load FORWARD. With CACR.DE=0 (the reset
       // value of the ROB-owned `ss.cacr`, which is this DUT's CacheControlService) the
       // LS EU classifies every load as cache-INHIBITED (`txEffectiveCmode`), and an
@@ -195,8 +217,9 @@ class LsBackendInjectSpec extends AnyFunSuite {
       // after every older store has DRAINED -- the opposite of what this test exists
       // to prove. Enable the D-cache (CACR.DE = bit 31, same poke RobPluginSpec uses)
       // so the load is the ordinary cacheable, forwardable access it was written as.
+      // Poked AFTER the reset window (forkStimulus holds reset for the first cycles
+      // and a RegInit poked during it is simply reset again), as RobPluginSpec does.
       dut.rob.logic.exc.ss.cacr #= (1L << 31)
-      cd.waitSampling(80) // PRF init sweep
       // c6e3ad43: the D-cache invalidates one set per cycle after reset and holds every
       // port not-ready until done; this test's wait budgets assume a ready cache.
       cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
