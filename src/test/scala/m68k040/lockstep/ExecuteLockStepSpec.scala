@@ -11053,9 +11053,22 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       0x0008,0x700a,0x204b,0xa024,0x2053,0x30fc,0xffff,0x4298,0x4298,0x6016,0x2251,0x2251,0xd3c7,
       0x206e,0x000a,0x302e,0x0008,0x6002,0x12d8,0x51c8,0xfffc,0x4cdf,0x1880,0x4e5e,0x4e74,0x0006)
     val Done  = 0x00103000L
+    val Src2  = 0x00102800L; val Dst2 = 0x00102900L   // the emulated BlockMove's 64-byte block
     def program(calls: Int, phaseNops: Int, romOff: Long = RomOff, handlerResult: Int = -108,
                 irq: Boolean = false, mmuOn: Boolean = false,
-                longHandler: Boolean = false, touchMp: Boolean = false): String = {
+                longHandler: Boolean = false, touchMp: Boolean = false,
+                rtsExit: Boolean = false, blockMove: Boolean = false): String = {
+      // rtsExit: the REAL A-line dispatcher exit (0x40809a14: `tstw %d0 ; addqw #4,%sp ; rts`
+      // after rewriting the frame's PC.lo/format word with the return address) -- the return
+      // to 0x40831b02 is an RTS with no matching RAS push, never an RTE.
+      // blockMove: the Memory Manager relocates blocks through _BlockMove, whose >12-byte
+      // path "returns" into jCacheFlush = `nop ; cpusha bc ; rts` (ROM 0x40885030) right
+      // after its unrolled `movel %a0@+,%a1@+` burst; then the master pointer is written.
+      // Musashi cannot execute CPUSH (no handler) -> blockMove flavours run without oracle.
+      val bm = if (blockMove)
+        f"move.l #0x$Src2%x,%%a0 ; move.l #0x$Dst2%x,%%a1 ; pea cont ; pea flush ; " +
+        Seq.fill(16)("move.l (%a0)+,(%a1)+").mkString(" ; ") + " ; moveq #0,%d0 ; rts ; " +
+        "flush: nop ; .short 0xf4f8 ; rts ; cont: " else ""
       // longHandler: the real _SetHandleSize is hundreds of instructions, so the ROB wraps
       // between the squashed pre-trap incarnation of `moveal (a3),a0` and its re-execution
       // (same robId, same vaddr). touchMp: the handler rewrites the master-pointer slot
@@ -11079,14 +11092,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       f"move.l #0x$Port%x,0x$Qd%x ; move.l #0x$H1%x,0x${Port + 92}%x ; move.l #0x$R%x,0x$H1%x ; " +
       f"move.l #0x$H2%x,0x$R%x ; move.l #0x$P%x,0x$H2%x ; move.l #0x$Qd%x,0x$A5w%x ; " +
       f"move.l #0x$A5w%x,%%a5 ; clr.l 0x${R + 4}%x ; move.w #0x5a5a,0x${P + 10}%x ; " +
+      (if (blockMove) (0 until 16).map(k => f"move.l #0x${0xB10C0000L + k}%08x,0x${Src2 + 4 * k}%x").mkString(" ; ") + " ; " else "") +
       mmuSetup + irqSetup + f"move.w #${calls - 1},%%d6 ; " +
       f"loop: move.l #16,0x${R + 8}%x ; clr.l 0x${R + 4}%x ; pea 0x$Src%x ; move.w #8,-(%%sp) ; jsr 0x${routinePc(romOff)}%x ; " +
       nops + "dbf %d6,loop ; " +
       irqTail + "bra stop ; " + irqHnd +
       // vector-10 handler = a FAILING _SetHandleSize: skip the trap word, D0 := memFullErr,
       // CCR := flags of D0 (the OS trap dispatcher's return convention), RTE.
-      f"handler: addq.l #2,2(%%sp) ; " + hLong + hTouch + f"move.l #$handlerResult,%%d0 ; tst.l %%d0 ; " +
-      "move.w %ccr,%d1 ; move.b %d1,1(%sp) ; rte ; " +
+      (if (rtsExit)
+        "handler: move.l 2(%sp),%a2 ; addq.l #2,%a2 ; move.l %a2,4(%sp) ; " + hLong + bm + hTouch +
+        f"move.l #$handlerResult,%%d0 ; tst.w %%d0 ; addq.w #4,%%sp ; rts ; "
+      else
+        f"handler: addq.l #2,2(%%sp) ; " + hLong + bm + hTouch + f"move.l #$handlerResult,%%d0 ; tst.l %%d0 ; " +
+        "move.w %ccr,%d1 ; move.b %d1,1(%sp) ; rte ; ") +
       ".org 0x400 ; stop: bra stop ; " +
       f".org 0x$romOff%x ; .short " + RomWords.map(w => f"0x$w%04x").mkString(", ")
     }
@@ -11095,8 +11113,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   def picNilHeaderRun(tag: String, calls: Int, phaseNops: Int,
                       dc: m68k040.sim.AxiMemModelConfig, cacr: Long,
                       romOff: Long = PicNil.RomOff, mmu: Option[(Long, Long)] = None,
-                      mmuOn: Boolean = false, longHandler: Boolean = false, touchMp: Boolean = false): Unit = {
-    val src = PicNil.program(calls, phaseNops, romOff, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp)
+                      mmuOn: Boolean = false, longHandler: Boolean = false, touchMp: Boolean = false,
+                      rtsExit: Boolean = false): Unit = {
+    val src = PicNil.program(calls, phaseNops, romOff, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp,
+                             rtsExit = rtsExit)
     val steps = Musashi.assembleAndTrace(src) match {
       case Right(v)  => v
       case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
@@ -11131,9 +11151,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     * from the committed byte-write stream, and the final architectural A0. */
   def picNilIrqStorm(tag: String, calls: Int, dc: m68k040.sim.AxiMemModelConfig, cacr: Long,
                      gapMax: Int = 61, mmuOn: Boolean = false,
-                     longHandler: Boolean = false, touchMp: Boolean = false): Unit = {
+                     longHandler: Boolean = false, touchMp: Boolean = false,
+                     rtsExit: Boolean = false, blockMove: Boolean = false, storm: Boolean = true): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
-    val src = PicNil.program(calls, 0, irq = true, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp)
+    val src = PicNil.program(calls, 0, irq = true, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp,
+                             rtsExit = rtsExit, blockMove = blockMove)
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => fail(s"[$tag] ProgramAssembler.assemble failed: ${err.reason}")
@@ -11183,7 +11205,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val stormDone = new java.util.concurrent.atomic.AtomicBoolean(false)
       fork {
         var gap = 5
-        while (!stormDone.get()) {
+        while (storm && !stormDone.get()) {
           cd.waitSampling(gap)
           dut.intCtrl.logic.iplIn #= 1
           cd.waitSampling(6)
@@ -11194,9 +11216,30 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       var lastExcActive = false
       val sp = dut.dcache.logic.storePort
+      // P163_ITRACE=1: I-side AXI tracer -- every AR/R.last with the MSHR state, flagging an
+      // AR whose id is still outstanding on the bus (the duplicate the protocol checker kills).
+      val itrace = sys.env.contains("P163_ITRACE")
+      val iax = dut.icache.logic.axi
+      val iOutstanding = scala.collection.mutable.HashSet[Int]()
       while (cyc < budget && !doneSeen) {
         cd.waitSampling(); cyc += 1
         trip.onCycle(); mw.onCycle()
+        if (itrace) {
+          val ic = dut.icache.logic
+          def mshrState: String = (0 until ic.mshrValid.size).map(i =>
+            f"$i:${if (ic.mshrValid(i).toBoolean) "V" else "-"}${if (ic.mshrArSent(i).toBoolean) "S" else "-"}" +
+            f"${if (ic.mshrComplete(i).toBoolean) "C" else "-"}g${ic.mshrGen(i).toInt}@${ic.mshrPa(i).toLong & 0xffffffffL}%x").mkString(" ")
+          if (iax.ar.valid.toBoolean && iax.ar.ready.toBoolean) {
+            val id = iax.ar.payload.id.toInt; val a = iax.ar.payload.addr.toLong & 0xffffffffL
+            println(f"[itrace][$cyc] AR id=$id addr=0x$a%08x${if (iOutstanding(id)) " DUPLICATE-ID" else ""} mshr[$mshrState] exc=${!dut.rob.logic.excIdle.toBoolean}")
+            iOutstanding += id
+          }
+          if (iax.r.valid.toBoolean && iax.r.ready.toBoolean && iax.r.payload.last.toBoolean) {
+            val id = iax.r.payload.id.toInt
+            println(f"[itrace][$cyc] R.last id=$id mshr[$mshrState]")
+            iOutstanding -= id
+          }
+        }
         for (k <- 0 until 2) {
           val o = dut.rob.logic.commitObs(k)
           // per-MACRO count: the commit obs fires per uop and the writer is a 2-uop macro
@@ -11221,8 +11264,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     println(f"[$tag] cycles=$cyc done=$doneSeen excEntries=$excEntries writerRetires=$writerRetires " +
       f"A0=0x$a0%08x pic=${picBytes.map(b => if (b < 0) "--" else f"$b%02x").mkString(" ")} ; $tripReport")
     assert(doneSeen, s"[$tag] program never stored the done flag in $cyc cycles (wedge?) -- $tripReport")
-    assert(excEntries - 2 * calls > calls,
+    if (storm) assert(excEntries - 2 * calls > calls,
       s"[$tag] VACUOUS STORM: only ${excEntries - 2 * calls} IRQ entries over $calls calls")
+    else assert(excEntries >= 2 * calls, s"[$tag] VACUOUS: only $excEntries exception entries over $calls calls")
     assert(writerRetires == calls, s"[$tag] the writer 0x${writerPc.toHexString} retired $writerRetires times, expected $calls")
     assert(tripHits == 0, s"[$tag] a committed STORE landed below 0x10 (the p163 corruption):\n$tripReport\nrecent store issues:\n$recent")
     val expect = Seq(0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a, 0x5a)
@@ -11245,6 +11289,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     test(s"p163 pic-header NIL store: MMU ON, IRQ storm x40 calls, D-side $dtag", VerilatorTest) {
       picNilIrqStorm(s"p163-picnil-mmu-storm-$dtag", calls = 40, dc = dc, cacr = 0x80008000L, mmuOn = true)
+    }
+  }
+  // The REAL dispatcher exit (rts, not rte), lock-stepped; and the REAL Memory-Manager
+  // relocation shape (BlockMove burst -> rts into `cpusha bc` -> master-pointer write),
+  // which Musashi cannot follow (no CPUSH handler) -> invariant-checked only.
+  for ((mtag, mmuOn) <- Seq("mmuOn" -> true, "mmuOff" -> false)) {
+    test(s"p163 pic-header NIL store: REAL dispatcher exit (tstw/addq/rts), chain x6, $mtag, D-side xbar", VerilatorTest) {
+      picNilHeaderRun(s"p163-picnil-rts-$mtag", calls = 6, phaseNops = 0, dc = m68k040.sim.L2Sweeps.todaysCrossbar,
+        cacr = 0x80008000L, mmuOn = mmuOn, rtsExit = true, touchMp = true)
+    }
+    test(s"p163 pic-header NIL store: REAL dispatcher exit, IRQ storm x40, $mtag, D-side xbar", VerilatorTest) {
+      picNilIrqStorm(s"p163-picnil-rts-storm-$mtag", calls = 40, dc = m68k040.sim.L2Sweeps.todaysCrossbar,
+        cacr = 0x80008000L, mmuOn = mmuOn, rtsExit = true, touchMp = true)
+    }
+    for ((dtag, dc) <- Seq("xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar, "chaos" -> m68k040.sim.L2Sweeps.chaosDram);
+         (stag, storm) <- Seq("quiet" -> false, "storm" -> true)) {
+      test(s"p163 pic-header NIL store: BlockMove burst + CPUSHA BC + master-pointer write, x40, $mtag, D-side $dtag, $stag", VerilatorTest) {
+        picNilIrqStorm(s"p163-picnil-cpusha-$mtag-$dtag-$stag", calls = 40, dc = dc, cacr = 0x80008000L,
+          mmuOn = mmuOn, rtsExit = true, touchMp = true, blockMove = true, storm = storm)
+      }
     }
   }
   for ((mtag, mmuOn) <- Seq("mmuOn" -> true, "mmuOff" -> false);
