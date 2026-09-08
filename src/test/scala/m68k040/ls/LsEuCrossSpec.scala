@@ -30,7 +30,14 @@ class LsEuCrossSpec extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val eu     = new LsEuPlugin
     val src    = new LsEuSourcePlugin
-    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src)) }
+    // This DUT hosts no CacheControlService, so the LS EU classifies EVERY load as
+    // cache-INHIBITED (LsEuPlugin `txEffectiveCmode`: CACR.DE=0 is the architectural
+    // reset state), and since f5f9fe13 an inhibited load is PRECISE: it launches only
+    // when it is the ROB head (`p4LaunchOk` = `p4AtRobHead && !olderStore`). A
+    // standalone harness therefore has to play the ROB and park the head on the load
+    // it issues -- same detour StackOpSpec/InhibitedLoadIrqPreemptSpec already use.
+    val wire   = new TbPreciseDrainWirePlugin(eu)
+    db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, xlate, dcache, eu, src, wire)) }
   }
 
   def simConfig = M68kSim().withVerilator
@@ -61,13 +68,20 @@ class LsEuCrossSpec extends AnyFunSuite {
                           // randomizes it per seed -> this spec failed ~1-in-3 runs.
     s.iStkPush #= false   // MUST default: an undriven stkPush makes a load PREDECREMENT,
                           // writing (base - size) to the dst instead of the loaded data.
-    cd.waitSampling(80)
+    dut.wire.logic.iRobHeadIn #= 0; dut.wire.logic.iRobHeadValidIn #= false
+    cd.waitSampling(80)   // PRF init sweep
+    // c6e3ad43: the D-cache invalidates one set per cycle after reset and holds every
+    // port not-ready until done; start each test from a clean, ready cache.
+    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem)
   }
 
   def issueLoad(dut: Dut, cd: ClockDomain, basePreg: Int, disp: Long,
                 size: SpinalEnumElement[Size.type], pdst: Int, robId: Int): Unit = {
     val s = dut.src.logic
+    // Park the ROB head on this load BEFORE it issues (see the note on `Dut`): every
+    // load here is cache-inhibited and therefore launches only at the ROB head.
+    dut.wire.logic.iRobHeadIn #= robId; dut.wire.logic.iRobHeadValidIn #= true
     s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= size
     s.iPsrcA #= basePreg; s.iPsrcAValid #= true; s.iPsrcBValid #= false
     s.iImm #= BigInt(disp & 0xffffffffL)
