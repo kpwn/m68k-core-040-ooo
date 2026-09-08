@@ -1128,12 +1128,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   def runIrqLockStep(name: String, src: String, nInstr: Int,
                      irqEvents: Seq[(Long, Int)], avec: Boolean = true,
                      vectorIn: Int = 0, initialSr: Int = 0x2700,
-                     initialMsp: Option[Long] = None): Unit = {
+                     initialMsp: Option[Long] = None,
+                     // When set, the ORACLE takes its interrupts at these events while the DUT
+                     // is still poked per `irqEvents` -- for a caller that has established the
+                     // DUT legally takes the interrupt one boundary later (see a7-irq).
+                     oracleIrqEvents: Option[Seq[(Long, Int)]] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val ackVector = if (avec) None else Some(vectorIn)
 
     val oracleSteps: Vector[OracleStep] =
-      Musashi.assembleAndTrace(src, irqEvents = irqEvents, interruptAckVector = ackVector,
+      Musashi.assembleAndTrace(src, irqEvents = oracleIrqEvents.getOrElse(irqEvents), interruptAckVector = ackVector,
                                initialSr = Some(initialSr), initialMsp = initialMsp) match {
         case Right(v)  => v
         case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
@@ -1276,6 +1280,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
               commitCount += 1
               handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
                 if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+                // RTE / MOVE-to-SR publish the ABSOLUTE restored CCR here; without it the
+                // whitebox kept the HANDLER's flags across every RTE (invisible while every
+                // IRQ test's handler was flag-neutral -- found by the a7-byte IRQ tests).
+                setCcr5 = if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1,
                 msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
                 isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             } else {
@@ -1338,6 +1346,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         s"[$name] only ${handle.result.size}/$nInstr instructions committed within $cap cycles")
 
       val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      if (!res.ok) {
+        // Failure dump: the two streams side by side around the divergence (post-step pc /
+        // SR / A7), so a wrong-path record can be told from a wrong fetch without a rerun.
+        val dutSeq = handle.result
+        val lo = scala.math.max(0, res.matched.toInt - 6); val hi = scala.math.min(res.matched.toInt + 8, scala.math.max(dutSeq.size, oracle.size))
+        println(s"[$name] divergence context (index: DUT pc/sr/a7 | ORACLE pc/sr/a7):")
+        for (k <- lo until hi) {
+          val d = if (k < dutSeq.size) { val c = dutSeq(k); f"0x${c.pc & 0xffffffffL}%08x/0x${c.sr & 0xffff}%04x/0x${c.a7 & 0xffffffffL}%08x" } else "-"
+          val o = if (k < oracle.size) { val st = oracle(k); f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.a(7) & 0xffffffffL}%08x" } else "-"
+          println(f"[$name]   $k%3d: $d%-32s | $o")
+        }
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
