@@ -805,6 +805,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // only if the retire path stops being the binding constraint.
     val nzvcValStore = Vec.fill(depth)(Reg(UInt(4 bits)))
     val nzvcWrStore  = Vec.fill(depth)(RegInit(False))
+    nzvcValStore.simPublic(); nzvcWrStore.simPublic()   // sim-only taps (committedCcr shadow tests)
     val xValStore    = Vec.fill(depth)(RegInit(False))
     val xWrStore     = Vec.fill(depth)(RegInit(False))
     // CCR-value completion: the EU-wiring drives {robId, nzvc, nzvcWrite, x, xWrite}
@@ -2024,6 +2025,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val ccrAfter1 = UInt(5 bits); ccrAfter1 := ccrAfter0
     when(retire1 && nzvcWrStore(h1)) { ccrAfter1(3 downto 0) := nzvcValStore(h1) }
     when(retire1 && xWrStore(h1))    { ccrAfter1(4)          := xValStore(h1) }
+    // SAME-CYCLE FLAG BYPASS (2026-09-09, the "interrupt after a MOVE to memory restores the
+    // handler's flags" defect). A store that completes through the StoreQueue's precise /
+    // deferred path is marked complete by `sqCompletionPort` COMBINATIONALLY (LsEuPlugin's
+    // apply arm) while its NZVC rides `compValid`, a REGISTER, one cycle later -- so the store
+    // can retire in the very cycle its `ccrCompletion` arrives, when `nzvcWrStore(h)` is still
+    // the alloc-time False and the fold above sees nothing. The flags PRF is unaffected (the
+    // EU writes it directly); only this shadow -- the CCR the next exception STACKS and RTE
+    // therefore restores -- silently kept the pre-store value (lock-step: a `move.b %d0,(%a1)`
+    // followed by an IRQ RTE'd with the handler's CCR; measured directly by the
+    // `committedCcr shadow` test: the wbObs for the head fires in the retire cycle). Fold the
+    // live port when it names the retiring head, same-cycle -- zero latency change.
+    for (c <- ccrCompletion) {
+      when(retire0 && c.valid && c.payload.robId === h0) {
+        when(c.payload.nzvcWrite) { ccrAfter0(3 downto 0) := c.payload.nzvc }
+        when(c.payload.xWrite)    { ccrAfter0(4)          := c.payload.x }
+      }
+      when(retire1 && c.valid && c.payload.robId === h1) {
+        when(c.payload.nzvcWrite) { ccrAfter1(3 downto 0) := c.payload.nzvc }
+        when(c.payload.xWrite)    { ccrAfter1(4)          := c.payload.x }
+      }
+    }
     committedCcr := ccrAfter1
     // (MOVE-to-SR's absolute full-CCR write to committedCcr is applied AFTER the exc
     // unit is built — see `exc.obsSetCcr5Valid` override below.)
