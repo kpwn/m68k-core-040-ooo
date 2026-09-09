@@ -36,7 +36,17 @@ class AguCrossSpec extends AnyFunSuite {
   def simConfig = M68kSim().withVerilator
 
   def initDut(dut: Dut): ClockDomain = {
-    val cd = dut.clockDomain; cd.forkStimulus(10)
+    val cd = dut.clockDomain
+    // Pre-existing harness race (2026-09-09): NOTHING drove the D-cache's AXI slave side
+    // in this fixture, so the R/B valid + payload inputs were randomized per seed for the
+    // whole test. On an unlucky seed a randomly-asserted B response reaches the cache as a
+    // store acknowledgement with no accepted descriptor and its own tripwire kills the sim
+    // at time=170 ("FAILURE DcachePlugin: storeAck pulsed with no accepted store
+    // descriptor"). Attach a responder, BEFORE the first clock edge -- the same ordering
+    // ExceptionEntrySpec/RteSpec already document for the identical hazard. This test never
+    // reads memory; the agent exists purely to own those inputs.
+    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.seedValid #= false; s.obsIntAddr #= 0; s.iPsrcAValid #= false; s.iPsrcBValid #= false

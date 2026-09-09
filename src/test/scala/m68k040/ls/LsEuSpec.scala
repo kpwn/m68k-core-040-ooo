@@ -44,8 +44,14 @@ class LsEuSpec extends AnyFunSuite {
   }
 
   def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
-    val cd = dut.clockDomain; cd.forkStimulus(10)
+    val cd = dut.clockDomain
+    // 2026-09-09: construct the AXI responder BEFORE the first clock edge. Built after
+    // `forkStimulus` it left the R/B valid + payload inputs undriven across reset release,
+    // and a randomly-asserted B response then reaches the cache as a store acknowledgement
+    // with no accepted descriptor (its tripwire kills the sim at time=170). Same ordering
+    // ExceptionEntrySpec/RteSpec already document for the identical hazard.
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
     s.iStkPush #= false
