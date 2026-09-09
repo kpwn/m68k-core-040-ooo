@@ -190,6 +190,16 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
       // finds its S bit set and faults. What changed is that reaching that verdict
       // now costs a table search, which is asserted explicitly below rather than
       // being left implicit.
+      // B's response is STILL occupying the one-entry slot at this point (the block
+      // above asserted it is there but never retired it -- it relied on accept-last
+      // handing the slot straight to the next resident HIT). The user request below
+      // is now a MISS, so its answer arrives cycles later; without draining B first,
+      // `consumeRsp` would sample B's answer and report it as the user request's.
+      rsp.ready #= true
+      var drain = 0
+      while (rsp.valid.toBoolean && drain < 20) { cd.waitSampling(); sleep(1); drain += 1 }
+      assert(!rsp.valid.toBoolean, "B's held response never retired")
+
       val beforeUserWalk = arCount
       driveReq(dut, cd, vpnOf(supVa), 0x23, write = false, supervisor = false)
       assert(consumeRsp(dut, cd) == ((0x23, supPpn, true)),

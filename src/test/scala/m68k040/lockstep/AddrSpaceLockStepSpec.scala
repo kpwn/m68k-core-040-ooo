@@ -282,6 +282,14 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
   //
   // Fail-before, both tests: 16 entries, ALL of them in bank 0.
 
+  // A line-A trap stacks the format-$0 frame {SR, PC, format/vector} with PC = the
+  // address of the FAULTING instruction, so a bare `rte` re-executes the A-line word
+  // and traps again forever. Every handler below therefore steps the stacked PC over
+  // the 2-byte opword before returning -- the same thing `Addr32LockStepSpec`'s
+  // exception tests do, and the same thing a real unimplemented-instruction handler
+  // does once it has emulated the instruction.
+  private val StepStackedPc = "move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7)"
+
   /** Census of a TLB's valid bits, as (bank 0 occupancy, bank 1 occupancy). */
   private def census(tlb: m68k040.mmu.Tlb): (Int, Int) = {
     def count(b: Int): Int = {
@@ -542,7 +550,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       ".short 0xa9c9",
       "moveq #11,%d5",
       "bra stop",
-      "handler: moveq #33,%d3", "rte",
+      "handler: " + StepStackedPc, "moveq #33,%d3", "rte",
       "stop: bra stop").mkString(" ; ")
     val image = assemble("exc-mmu-off", src, loadAddr)
 
@@ -600,8 +608,8 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       ".short 0xa9c9",                                   // trap 2: paging ON
       "moveq #22,%d6",
       "bra stop",
-      "h1: moveq #33,%d3", "rte",
-      "h2: moveq #44,%d4", "rte",
+      "h1: " + StepStackedPc, "moveq #33,%d3", "rte",
+      "h2: " + StepStackedPc, "moveq #44,%d4", "rte",
       "stop: bra stop").mkString(" ; ")
     val image = assemble("exc-mmu-enable", src, loadAddr)
 
@@ -672,7 +680,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       ".short 0xa9c9",
       "moveq #11,%d5",
       "bra stop",
-      "handler: moveq #33,%d3", "rte",
+      "handler: " + StepStackedPc, "moveq #33,%d3", "rte",
       "stop: bra stop").mkString(" ; ")
     val image = assemble("exc-ttr", src, loadAddr)
 
