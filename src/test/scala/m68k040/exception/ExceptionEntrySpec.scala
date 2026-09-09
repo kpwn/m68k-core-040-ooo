@@ -238,4 +238,77 @@ class ExceptionEntrySpec extends AnyFunSuite {
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 1, "S must be set after entry")
     }
   }
+  // ── 2026-09-09: the VECTOR FETCH must not read past the end of its D-cache line ──
+  //
+  // `E_VECREQ` reads `VBR + vector*4` as ONE LONG straight into `dcache.loadCmd`, so it
+  // never sees the LS EU's AGU cross-line splitter. `DcacheByteLane.extract` indexes the
+  // 16-byte line with a 4-BIT offset, so a LONG at line offset 13/14/15 WRAPS its last
+  // 1/2/3 bytes back to the line's own HEAD: the core would redirect to an address built
+  // partly out of unrelated memory. `VBR + vector*4` is 16-byte aligned only when VBR is,
+  // and the 68040's MOVEC to VBR takes all 32 bits, so `VBR mod 16` in {13, 14, 15} makes
+  // every vector fetch straddle. Architecturally legal; never produced by Mac OS, which is
+  // why this is a latent hole and not the p164-p167 boot defect.
+  //
+  // FAIL-BEFORE / PASS-AFTER, measured on this DUT with the split forced off. Decoy
+  // 0xDEADBEEF at the head of the line the vector word starts in, handler 0x40009000 at
+  // VBR+16:
+  //   VBR mod 16 = 12 -> 0x40009000  (LONG ends exactly at the line boundary: the
+  //                                   non-crossing CONTROL, and proof the split is not
+  //                                   applied blanket)
+  //   VBR mod 16 = 13 -> 0x4000903f / 0x40009093 / ... -- the trailing byte is GARBAGE
+  //                      and varies with the simulator seed
+  // The garbage (rather than the decoy's 0xDE) is itself informative: this DUT has no
+  // `CacheControlService`, so the exception sequencer's loads run CACHE-INHIBITED and the
+  // wrapped byte is taken from the never-filled remainder of the miss line rather than
+  // from resident data. Either way the core redirects to an address it never read.
+  // With task A's tripwire also live in this DUT (`M68kSim()` implies `.includeSimulation`),
+  // an unfixed core additionally dies on the `extract` assertion itself -- that is how this
+  // fail-before was run: the assertion had to be silenced before the wrong PC was visible.
+  test("vector fetch straddling a 16-byte line (misaligned VBR) reads the whole longword") {
+    val compiled = M68kSim().withVerilator.compile(new Dut)
+    // 12 = non-crossing control; 13/14/15 = the three LONG straddle shapes (3+1, 2+2, 1+3).
+    for (vbrLow <- Seq(12, 13, 14, 15)) {
+      compiled.doSim(s"vbrLow$vbrLow") { dut =>
+        val cd = dut.clockDomain
+        dut.wire.logic.storeAllow #= true
+        val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        cd.forkStimulus(10)
+        init(dut, cd)
+
+        val ssp0    = 0x00100000L
+        val vbr     = 0x00002000L + vbrLow
+        val handler = 0x40009000L
+        val vecAddr = vbr + 4 * 4                 // vector 4 (illegal instruction)
+        dut.rob.logic.exc.ss.isp #= ssp0
+        dut.rob.logic.exc.ss.vbr #= vbr
+        dut.rob.logic.haltExceptionMaskIn #= 0
+        def pokeBE32(a: Long, w: Long): Unit =
+          for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+        pokeBE32(vecAddr & ~0xfL, 0xDEADBEEFL)    // decoy at the line head
+        pokeBE32(vecAddr, handler)
+        cd.waitSampling(2)
+
+        val faultPc = 0x40000010L
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = faultPc, faulted = true, faultVector = 4)
+        dut.rsrc.logic.src.valid #= true
+        dut.rsrc.logic.u1v #= false
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false
+        cd.waitSampling()
+        dut.rob.logic.completion(0).valid #= true
+        dut.rob.logic.completion(0).payload #= 0
+        cd.waitSampling()
+        dut.rob.logic.completion(0).valid #= false
+
+        var n = 0; var redirPc = -1L
+        while (redirPc < 0 && n < 600) {
+          if (dut.rob.logic.doFlushReg.toBoolean) redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
+          n += 1; cd.waitSampling()
+        }
+        assert(redirPc == handler,
+          f"VBR mod 16 = $vbrLow%d: redirect pc=0x$redirPc%x expected handler 0x$handler%x " +
+          f"(vector word at 0x$vecAddr%x, line offset ${(vecAddr & 0xf).toInt}%d)")
+      }
+    }
+  }
 }

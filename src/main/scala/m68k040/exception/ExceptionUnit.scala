@@ -839,6 +839,9 @@ class ExceptionUnit(
   // DTLB-translated PA here instead (Task 11).
   dcLoadCmd.payload.paddr := ldoPaddrReg
   dcLoadCmd.payload.size  := ldoSizeReg
+  // Every exception-sequencer load consumes `loadRsp.data`; none reads the raw line.
+  // (see `DLoadCmd.lineOnly` -- keeps the extract wrap tripwire live for this path)
+  dcLoadCmd.payload.lineOnly := False
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
   // NOTE: this particular field is currently INERT in every integrated DUT --
@@ -1173,6 +1176,31 @@ class ExceptionUnit(
   val rdSplitLow = RegInit(False); rdSplitLow.simPublic()
   val rdHiByte   = Reg(Bits(8 bits)) init 0
   def rdCrosses(addr: UInt): Bool = addr(3 downto 0) === U(15, 4 bits)
+
+  // ── 2026-09-09: the VECTOR FETCH carries the same hole, one size class up ──────
+  // `E_VECREQ` reads the handler address at `VBR + vector*4` as one LONG straight into
+  // `dcache.loadCmd` -- again bypassing the LS EU's AGU cross-line splitter. A LONG at
+  // line-relative offset 13, 14 or 15 runs 1, 2 or 3 bytes past the end of the line and
+  // `DcacheByteLane.extract` WRAPS those bytes back to the line's own head, so the core
+  // would redirect to an address built partly from unrelated memory: a silent jump to
+  // the wrong handler, the single worst outcome in the whole exception path.
+  //
+  // `VBR + vector*4` is 16-byte aligned only when VBR is, and the 68040's MOVEC to VBR
+  // takes all 32 bits (this core stores it unmasked, as real silicon does) -- so
+  // VBR mod 16 in {13, 14, 15} makes EVERY vector fetch straddle. Architecturally legal,
+  // never produced by Mac OS, and therefore not the p164-p167 boot defect -- but real.
+  //
+  // WHY FOUR SUB-ACCESSES, not two: a WORD straddles in exactly one way (1 + 1 bytes),
+  // but a LONG straddles in three (3 + 1, 2 + 2, 1 + 3), and `Size` has no 3-byte
+  // encoding, so a "head + tail" split cannot express offset 13 or 15 as two commands.
+  // Rather than a three-shape mux, a straddling vector fetch is read as FOUR BYTE loads
+  // at addr+0..+3 and shifted together big-endian (byte at addr+0 is the MSB). Each
+  // sub-access re-presents its OWN address to the translate port, so a vector word that
+  // also straddles a page boundary re-translates for the bytes on the far side -- the
+  // same rule `fsRdCurVa` states for FRESTORE's header. Non-straddling fetches (every
+  // sane VBR) are byte-for-byte the single LONG they always were.
+  val vecSplitIdx = Reg(UInt(2 bits)) init 0; vecSplitIdx.simPublic()
+  val vecAcc      = Reg(Bits(32 bits)) init 0
 
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
@@ -1512,6 +1540,9 @@ class ExceptionUnit(
         // treatment as frameBase above (read from the settled bank at E_DRAIN, not
         // the possibly-stale IDLE-time snapshot).
         frameBase2 := ss.isp - 8
+        // E_STORE -> E_STWAIT -> E_VECREQ is the ONLY path to the vector fetch, so this
+        // is the one place the split-fetch cursor needs re-arming (2026-09-09).
+        vecSplitIdx := 0
         goto(E_STORE)
       }
     }
@@ -1569,17 +1600,41 @@ class ExceptionUnit(
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
+    // A vector fetch whose LONG runs past the end of its 16-byte line (offset 13/14/15
+    // -- see `vecSplitIdx`'s comment) is read as four BYTE loads instead. `vecCurVa`
+    // walks addr+0..+3 and is what the translate port sees, so a fetch that also
+    // straddles a page re-translates for the far-side bytes.
+    val vecCrosses = vecTarget(3 downto 0) > U(12, 4 bits)
+    val vecCurVa   = Mux(vecCrosses, vecTarget + vecSplitIdx.resize(32 bits), vecTarget)
     E_VECREQ.whenIsActive {
-      dtoVld := True; dtoVpn := vecTarget(31 downto 12); dtoWr := False
-      ldoVld := True; ldoVaddr := vecTarget; ldoSize := Size.LONG
+      dtoVld := True; dtoVpn := vecCurVa(31 downto 12); dtoWr := False
+      ldoVld := True; ldoVaddr := vecCurVa
+      ldoSize := Mux(vecCrosses, Size.BYTE, Size.LONG)
       when(dcLoadCmd.fire) { goto(E_VECWAIT) }
     }
     E_VECWAIT.whenIsActive {
       // keep the translation valid while the load is in flight
-      dtoVld := True; dtoVpn := vecTarget(31 downto 12)
+      dtoVld := True; dtoVpn := vecCurVa(31 downto 12)
       when(dcLoadRsp.valid) {
-        vecTarget := dcLoadRsp.payload.data.asUInt
-        goto(E_REDIR)
+        when(vecCrosses) {
+          // Big-endian: the byte at the LOWEST address is the MSB, and the four bytes
+          // arrive in ascending address order -- so a plain left-shift accumulates them.
+          // `vecTarget` itself is the result register, so it must stay UNTOUCHED until
+          // the last byte (it is also what `vecCrosses`/`vecCurVa` are derived from).
+          val acc = vecAcc(23 downto 0) ## dcLoadRsp.payload.data(7 downto 0)
+          vecAcc := acc
+          when(vecSplitIdx === U(3, 2 bits)) {
+            vecSplitIdx := 0
+            vecTarget   := acc.asUInt
+            goto(E_REDIR)
+          } otherwise {
+            vecSplitIdx := vecSplitIdx + 1
+            goto(E_VECREQ)
+          }
+        } otherwise {
+          vecTarget := dcLoadRsp.payload.data.asUInt
+          goto(E_REDIR)
+        }
       }
     }
     E_REDIR.whenIsActive {

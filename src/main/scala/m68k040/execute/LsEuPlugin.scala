@@ -1344,6 +1344,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       (False ## llReg.bDone ## llReg.robId.asBits).asUInt,
       (False ## (alignedCmd.twoAccess && alignedCmd.splitSecond) ##
        alignedCmd.bk.robId.asBits).asUInt)
+    // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`): BOTH halves of a
+    // cross-line split pair consume `loadRsp.line`, never `loadRsp.data` -- slot A is
+    // deliberately presented at the ORIGINAL crossing offset/size. Flagging them here
+    // is what lets `DcacheByteLane.extract`'s wrap assertion stay strict for every
+    // other requester (the exception sequencer, the table walker) instead of being
+    // weakened to tolerate this one legitimate producer.
+    dcache.loadCmd.payload.lineOnly := Mux(useSplitCmd, True, alignedCmd.twoAccess)
     val alignedCmdFire = alignedSendValid && coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
     alignedCmdFire.simPublic()
 
@@ -3262,6 +3269,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // DTLB-translated PA, which the old identity regeneration would have discarded.
       dcache.loadCmd.payload.paddr := excLoadCmdPaddr
       dcache.loadCmd.payload.size  := excLoadCmdSize
+      // The exception sequencer always consumes `loadRsp.data` -- never the raw line --
+      // so its commands must NOT be exempt from the extract wrap tripwire. Explicit
+      // (not inherited from the LS branch above, whose value tracks the aligned ring).
+      dcache.loadCmd.payload.lineOnly := False
       // identity-physical, matching dcStore's exc-path cacheMode.
       //
       // Task P5.7 root-cause fix -- CACR.DE MUST be honoured here too. This mux is
@@ -3386,6 +3397,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.loadCmd.payload.token := Mux(ldWalkSelDtlb,
         U(m68k040.cache.DLoadToken.WALK_DTLB, m68k040.cache.DLoadToken.Width bits),
         U(m68k040.cache.DLoadToken.WALK_ITLB, m68k040.cache.DLoadToken.Width bits))
+      // A descriptor read consumes `loadRsp.data`, never the raw line -- so it must NOT
+      // inherit the LS branch's `lineOnly` (which tracks the aligned ring and would
+      // silently exempt the walker from the `DcacheByteLane.extract` wrap tripwire).
+      dcache.loadCmd.payload.lineOnly := False
     }
 
     // ── Store leg ──────────────────────────────────────────────────────────────────
