@@ -158,7 +158,33 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     }
   }
 
-  test("resident supervisor permission fault stays associated at two-cycle latency",
+  // RENAMED AND RE-POINTED 2026-09-09 (was "resident supervisor permission fault stays
+  // associated at two-cycle latency"). The scenario it measured no longer exists, and
+  // the reason is worth stating rather than quietly deleting a cycle count:
+  //
+  // The ATC tag now carries FC2 (`Tlb.tagSup`), because the 68040 has SEPARATE user and
+  // supervisor root pointers and one logical address therefore translates to DIFFERENT
+  // pages in the two spaces. The warm-up below fetches `VirtPage` in SUPERVISOR mode, so
+  // the only resident entry is supervisor-tagged; the USER fetch that follows can no
+  // longer be answered from it and must walk. It still FAULTS -- this DUT sets
+  // URP = SRP, so the walk reaches the same descriptor and finds its S bit set -- but it
+  // is no longer a resident hit, so "two-cycle latency" and "must not re-walk" are not
+  // properties this access can have any more.
+  //
+  // WHY THE 2-CYCLE CASE IS UNREACHABLE RATHER THAN JUST MOVED: this core does not fill
+  // the ATC on a FAULTING walk (`DtlbPlugin`/`ItlbPlugin` gate `fillValid` on
+  // `!walker.io.rsp.fault`), so a faulting user access never leaves a user-tagged entry
+  // behind for a second one to hit. A real 68040 DOES cache faulting translations, which
+  // is what makes "resident permission fault, no re-walk" reachable on silicon. That
+  // divergence is PRE-EXISTING and is recorded as a known deviation in
+  // docs/KNOWN_DEVIATION_atc_no_fill_on_faulting_walk.md -- it is deliberately NOT
+  // changed here.
+  //
+  // Everything else this test proved is kept and still asserted: the verdict is a
+  // fault, it is attributed to the ATC rather than the bus, it carries the right PC, it
+  // does NOT launch an I-cache refill, and it produces exactly one response with no late
+  // duplicate. The walk is now asserted EXPLICITLY (it used to be asserted absent).
+  test("a user fetch of a supervisor-only page faults via a walk, with no refill and exactly one response",
        VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
@@ -221,24 +247,31 @@ class IcacheParallelViptSpec extends AnyFunSuite {
 
       cd.waitSampling()
       assert(!dut.probe.logic.rspOut.valid.toBoolean,
-        "resident permission fault escaped before the response register")
-      cd.waitSampling()
+        "the permission fault escaped ahead of the response register")
+      // The user-space fetch MISSES (its address space has no resident entry), so its
+      // verdict arrives only after a table search rather than at the registered
+      // two-cycle resident latency. Wait for it instead of sampling a fixed cycle.
+      var permWait = 0
+      while (!dut.probe.logic.rspOut.valid.toBoolean && permWait < 200) {
+        cd.waitSampling(); permWait += 1
+      }
       assert(dut.probe.logic.rspOut.valid.toBoolean,
-        "resident permission fault missing at N+2")
-      assert(cycle - acceptCycle == 2,
-        s"resident permission fault latency=${cycle - acceptCycle}, expected 2")
+        s"the user fetch never produced a verdict at all (waited $permWait cycles after " +
+          s"accept at cycle $acceptCycle)")
       assert(dut.probe.logic.rspOut.payload.pc.toLong == VirtPage,
         f"permission fault PC=0x${dut.probe.logic.rspOut.payload.pc.toLong}%x expected 0x$VirtPage%x")
       assert(dut.probe.logic.rspOut.payload.fault.toBoolean,
-        "user fetch of resident supervisor-only page must fault")
+        "a USER fetch of a supervisor-only page must fault")
       assert(dut.probe.logic.rspOut.payload.atc.toBoolean,
-        "resident permission fault must be identified as ATC/MMU, not bus")
+        "the permission fault must be identified as ATC/MMU, not bus")
       assert(iArCount == iArBefore,
-        s"resident permission fault launched an I-cache refill: $iArBefore -> $iArCount")
-      assert(walkArCount == walkArBefore,
-        s"resident permission fault re-walked the ITLB: $walkArBefore -> $walkArCount")
+        s"the faulting fetch launched an I-cache refill: $iArBefore -> $iArCount")
+      assert(walkArCount > walkArBefore,
+        s"the USER fetch MUST have walked -- its address space has no resident entry, " +
+          s"and answering it from the SUPERVISOR-tagged one would be reading the wrong " +
+          s"tree (ARs $walkArBefore -> $walkArCount)")
       assert(rspCount == rspBefore + 1,
-        s"resident permission command produced ${rspCount - rspBefore} responses")
+        s"the permission command produced ${rspCount - rspBefore} responses")
       cd.waitSampling(4)
       assert(rspCount == rspBefore + 1, "late duplicate permission response")
     }
