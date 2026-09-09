@@ -603,6 +603,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // correctness of that one exact instruction shape is unverified/known-broken.
   def runLockStep(name: String, src: String, nInstr: Int = -1, checkMem: Seq[Long] = Seq.empty,
                   checkSpan: Int = 4, mmuMap: Option[(Long, Long)] = None,
+                  // Task addr32: EXTRA (VA -> PPN) leaf mappings installed alongside
+                  // `mmuMap`'s single data page, so a program can walk far more pages
+                  // than the 32-entry ATC holds. Default Nil => every pre-existing call
+                  // site is byte-for-byte unchanged. All entries must live inside ONE
+                  // 256 KB pointer-table region (`mapPage` files every leaf into
+                  // MMU_PAGT), which the caller is responsible for. `pa()`'s checkMem
+                  // translation still keys off `mmuMap` alone, so callers using these
+                  // extra pages verify through the REGISTER stream, not `checkMem`.
+                  extraMmuPages: Seq[(Long, Long)] = Nil,
                   initialSr: Option[Int] = None, usp: Long = 0x00200000L,
                   initialMsp: Option[Long] = None, pcOnly: Boolean = false,
                   // Post-run whitebox hook, default no-op => every existing call site is
@@ -860,6 +869,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         buildMmuTable(ptmem, dataPageVA, ppn)
         buildMmuTable(itlbPtmem, dataPageVA, ppn)
       }
+      extraMmuPages.foreach { case (va, ppn) => mapPage(ptmem, va, ppn, MMU_PAGT) }
       // debug-only, env-gated trace for MMU-enabled lock-step tests (task #194
       // investigation: an early `mmuEnable`/`urp`/`srp` poke landing inside the reset
       // window was silently wiped once MmuControlPlugin gained a real conditional
