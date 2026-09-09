@@ -338,4 +338,85 @@ class Addr32LockStepSpec extends AnyFunSuite {
       nInstr = 3 + (PGN - 1) * 4 + 3 + (PGN - 1) * 3,
       mmuMap = Some(fwdPages.head), extraMmuPages = fwdPages.tail, maxCycles = 600000)
   }
+
+  // ── 16. THE BOARD'S EXACT EXCEPTION POSTURE. In 24-bit mode this machine runs
+  //      VBR = 0; in 32-bit mode Mac OS relocates the vector table and the live
+  //      value is VBR = 0x01FF6978 with an ODD supervisor stack at A7 = 0x01FF6A7A.
+  //      A NON-ZERO VBR is therefore something only 32-bit mode produces, and no
+  //      pre-existing lock-step test puts VBR above 0x3000. These take the very
+  //      A-line trap the failing trace shows (_A9C9), through a vector slot stored
+  //      at run time into high RAM, on an odd high stack, at every SSP alignment.
+  private val HiVbr = 0x01FF6978L
+
+  private def hiVbrTrap(tag: String, ssp: Long, handlerBody: String, nInstr: Int): Unit =
+    h.runLockStep(tag, Seq(
+      f"move.l #0x$HiVbr%x,%%d0",
+      "movec %d0,%vbr",
+      f"move.l #0x$ssp%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x${HiVbr + 0x28}%x",       // vector 10 (line-A) slot
+      "move.l #0x11223344,%d5",
+      ".short 0xa9c9",                          // _A9C9 -- the trap the bomb trace shows
+      "moveq #7,%d3",
+      "bra stop",
+      "handler: " + handlerBody,
+      "stop: bra stop").mkString(" ; "), nInstr = nInstr, maxCycles = 40000)
+
+  // stacked-PC fixup handler: read the frame's PC long off an ODD high stack, bump it
+  // past the 2-byte trap word, write it back, RTE.
+  private val fixupHandler = "move.l 2(%a7),%d0 ; addq.l #2,%d0 ; move.l %d0,2(%a7) ; moveq #1,%d2 ; rte"
+
+  for (d <- 0 until 16) {
+    test(f"addr32: high VBR + A-line trap + RTE, SSP = 0x01FF6A70+$d%d", VerilatorTest) {
+      hiVbrTrap(f"addr32-hivbr-ssp$d%d", 0x01FF6A70L + d, fixupHandler, nInstr = 13)
+    }
+  }
+
+  // the same, with the handler saving and restoring the whole register file onto the
+  // ODD high stack first -- a 60-byte multi-access spanning four 16-byte cache lines,
+  // which is what the ROM's own SysError entry does.
+  test("addr32: high VBR + A-line trap, MOVEM save/restore on the odd high stack", VerilatorTest) {
+    hiVbrTrap("addr32-hivbr-movem", 0x01FF6A7AL,
+      "movem.l %d0-%d7/%a0-%a6,-(%a7) ; movem.l (%a7)+,%d0-%d7/%a0-%a6 ; " + fixupHandler,
+      nInstr = 15)
+  }
+
+  // ── 17. THE RTE-CCR CHECK, RE-RUN IN THE BOARD'S 32-BIT POSTURE. `1c4daf25`
+  //      fixed "an IRQ after a MOVE to memory RTEs with the HANDLER's flags"; the
+  //      A-trap dispatch epilogue the failing trace implicates returns its result
+  //      exactly that way (D0 = result, CCR = flags of D0, then the caller branches),
+  //      and a wrong branch there IS a bad-patch-header verdict. The existing checks
+  //      run with VBR = 0 and an even low SSP; these re-run them with the live board
+  //      values -- VBR = 0x01FF6978, an ODD supervisor stack at 0x01FF6A7A -- at
+  //      four SSP alignments.
+  for (d <- Seq(0, 1, 7, 10)) {
+    test(f"addr32: RTE restores the CCR across an IRQ, high VBR + odd high SSP +$d%d", VerilatorTest) {
+      val ssp = 0x01FF6A70L + d
+      val src = Seq(
+        f"move.l #0x$HiVbr%x,%%d0",
+        "movec %d0,%vbr",
+        f"move.l #0x$ssp%x,%%a7",
+        "move.l #handler,%d0",
+        f"move.l %%d0,0x${HiVbr + 0x64}%x",     // level-1 autovector slot
+        "move.w #0x2000,%sr",
+        "moveq #0,%d1",
+        "tst.l %d1",
+        "nop",
+        "nop",
+        "beq.s ok",
+        "move.l #0xbad,%d2",
+        "bra.s end",
+        "ok: move.l #0x600d,%d2",
+        "end: bra.s end",
+        "handler: moveq #1,%d5",
+        "rte").mkString(" ; ")
+      val plain = m68k040.oracle.Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"Musashi.assembleAndTrace failed: ${err.reason}")
+      }
+      val beqPc = plain(10).pc   // `beq.s ok` is the 11th executed instruction
+      h.runIrqLockStep(f"addr32-hivbr-rteccr-$d%d", src, nInstr = 16,
+        irqEvents = Seq((beqPc, 1)), initialSr = 0x2700, maxCycles = 40000)
+    }
+  }
 }
