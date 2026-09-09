@@ -649,4 +649,107 @@ class Addr32LockStepSpec extends AnyFunSuite {
       f"the 0xDEAD0000 poison at PA 0x$VecSlotVa%08x was modified; the test's own " +
         "assumptions about what maps where are wrong")
   }
+
+  // ── 20. FSAVE / FRESTORE TRANSLATION FAULT MUST BE AN ACCESS FAULT, NOT A HALT ──
+  //
+  // F_XWAIT and F_RXWAIT used to answer a DTLB fault on an FSAVE frame push or an
+  // FRESTORE header read with `fsXlateFault := True; goto(F_HALT)` -- they HALTED THE
+  // PROCESSOR. FSAVE and FRESTORE are ordinary instructions and halting is never the
+  // correct 68040 response to one faulting: a non-resident state-frame page is an ACCESS
+  // FAULT the OS pages in and retries. 24-bit mode never reaches it because everything
+  // it touches is low and already resident; 32-bit mode does `frestore (%a7)+` on a high
+  // supervisor stack on every FPU context switch.
+  //
+  // The state-frame pointer is aimed at an UNMAPPED high page while the supervisor stack
+  // and vector table stay in a mapped one -- so the fault is on the instruction's own
+  // access, and the vector-2 entry it raises can be stacked successfully. The handler
+  // does NOT RTE (that would re-run the faulting instruction and fault again); it sets a
+  // marker and stops, which is enough to prove the core raised the exception and kept
+  // running.
+  private def fsaveFaultRun(tag: String, insn: String, marker: Int): Unit = {
+    val loadAddr = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val PageVa   = 0x01FF6000L      // MAPPED   -> PA 0x00700000 (stack + vector table)
+    val PagePpn  = 0x00700L
+    val UnmapVa  = 0x01FF5000L      // NOT mapped at all -> the walk faults NON_RESIDENT
+    val src = Seq(
+      f"move.l #0x$PageVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x${PageVa + 0xF00}%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x${PageVa + 8}%x",          // vector 2 (access fault) slot
+      f"move.l #0x${UnmapVa + 0x800}%x,%%a0",
+      "moveq #0,%d3",
+      insn,                                       // faults: the page has no descriptor
+      "moveq #99,%d4",                            // must NOT be reached
+      "bra stop",
+      f"handler: moveq #$marker,%%d3",
+      "bra stop",
+      "stop: bra stop").mkString(" ; ")
+    val image = m68k040.oracle.ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] assemble failed: ${err.reason}")
+    }
+    var d3 = -1L; var d4 = -1L
+    var halted = false; var fsFault = false; var dblFault = false; var vecWord = -1
+    h.compiledDut.doSim(s"$tag-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      h.buildMmuTable(dmem, PageVa, PagePpn)     // maps PageVa + the 8 code pages ONLY
+      // ...and make UnmapVa's leaf descriptor EXPLICITLY invalid (PDT = 00). Writing it
+      // is not optional: `buildMmuTable` only fills the entries it needs, and the D-side
+      // `SparseMemory` PRNG-fills everything else -- so an untouched descriptor slot
+      // reads as a random, usually "resident" descriptor with a random PPN, and the walk
+      // succeeds with a garbage translation instead of faulting.
+      val unmapPageIdx = ((UnmapVa >> 12) & 0x3f).toInt
+      for (i <- 0 until 4) dmem.pokeByte(h.MMU_PAGT + unmapPageIdx * 4 + i, 0)
+      cd.onSamplings {
+        if (dut.rob.logic.coreHaltedIn.toBoolean) halted = true
+        if (dut.rob.logic.exc.fsXlateFault.toBoolean) fsFault = true
+        if (dut.rob.logic.exc.dblFault.toBoolean) dblFault = true
+      }
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= h.MMU_ROOT; dut.ctrl.logic.srp #= h.MMU_ROOT
+      dut.rob.logic.exc.ss.isp  #= 0x00120000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(0x00120000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      cd.waitSampling(40000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d4 = probe.readArch(4)
+      // format-$7 frame at (mapped) SSP-60; its format/vector word is at +6 and must
+      // read 0x7008 -- format $7, vector 2 (2 << 2 = 8).
+      val frameBasePa = 0x00700000L | ((0xF00L - 60) & 0xFFFL)
+      vecWord = (dmem.peekByte(frameBasePa + 6) << 8) | dmem.peekByte(frameBasePa + 7)
+    }
+    assert(!halted,
+      f"[$tag] THE CORE HALTED on a faulting ordinary instruction " +
+        f"(fsXlateFault=$fsFault dblFault=$dblFault). FSAVE/FRESTORE must raise an " +
+        "access fault the OS can handle, not stop the processor.")
+    assert(!fsFault, s"[$tag] fsXlateFault was raised; the halt path is still taken")
+    assert(d3 == marker.toLong,
+      f"[$tag] the vector-2 handler never ran (D3 = 0x$d3%08x, expected $marker; " +
+        f"D4 = 0x$d4%08x, frame format/vector word = 0x$vecWord%04x, halted=$halted " +
+        f"fsXlateFault=$fsFault dblFault=$dblFault)")
+    assert(d4 != 99L, f"[$tag] execution fell through the faulting instruction (D4 = 0x$d4%08x)")
+    assert(vecWord == 0x7008,
+      f"[$tag] the stacked frame is not a format-7 vector-2 access fault " +
+        f"(format/vector word = 0x$vecWord%04x, expected 0x7008)")
+  }
+
+  test("addr32: an FSAVE frame-push translation fault raises vector 2 and keeps running", VerilatorTest) {
+    fsaveFaultRun("fsave-xlate-fault", "fsave -(%a0)", 41)
+  }
+  test("addr32: an FRESTORE header-read translation fault raises vector 2 and keeps running", VerilatorTest) {
+    fsaveFaultRun("frestore-xlate-fault", "frestore (%a0)+", 42)
+  }
 }

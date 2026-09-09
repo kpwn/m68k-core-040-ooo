@@ -40,8 +40,11 @@ object HaltReason {
     * response on a trusted-cacheable-path transaction. Sub-coded by that plugin's own
     * private `diagFaultKind`. */
   val DCACHE_DIAG = 1
-  /** A DTLB translation fault taken while the commit-side sequencer is transferring an
-    * FSAVE/FRESTORE state frame (`exc.fsXlateFault`). */
+  /** A fault taken while the commit-side sequencer is transferring an FSAVE/FRESTORE
+    * state frame (`exc.fsXlateFault`): a DTLB translation fault on any word, or (since
+    * 2026-09-09) a physical BUS error on FRESTORE's header read. Both escalate here for
+    * the reason `ExceptionUnit.F_HALT` documents -- this unit has no unwind machinery for
+    * a partially-transferred frame. */
   val FS_XLATE = 2
   /** D15: a non-OKAY response to the reset-vector fetch at physical 0. Hardware-faithful
     * -- a bus fault during reset exception processing is a double bus fault on a real
@@ -57,17 +60,20 @@ object HaltReason {
     * grant at all -- the `axi_d` arbiter sees nothing, the D-cache's own diagnostic
     * channel sees nothing, and the failure would otherwise be completely unobservable. */
   val WALKER_PORT_WEDGE = 5
-  /** A DTLB translation fault taken while the commit-side exception sequencer was
-    * stacking an ENTRY frame, fetching the handler VECTOR, or popping an RTE frame
-    * (`exc.excXlateFault`).
+  /** 2026-09-09: a DOUBLE FAULT -- a fault taken while the processor was ALREADY in
+    * exception processing, which a real 68040 cannot report (there is no stack to report
+    * it on and no meaningful PC to resume) and answers by asserting halt until reset
+    * (M68040UM S8.4.2 / S8.2.6). `exc.dblFault`, with `OFF_DBL_FAULT_PC` /
+    * `OFF_DBL_FAULT_VEC` carrying which instruction and which vector.
     *
-    * This is the 68040's DOUBLE FAULT. MC68040 UM S8.2.6: a fault taken during the
-    * exception processing of a previous fault cannot itself be reported -- there is no
-    * stack to report it on and no meaningful PC to resume -- so the processor asserts
-    * its halt output and stops until reset. Modelling it as a halt (rather than as a
-    * nested exception, or worse, as the silent identity-mapped access this core used
-    * before) is the hardware-faithful behaviour and is the same treatment
-    * `RESET_VECTOR` already gives a bus fault during reset exception processing. */
+    * TWO producers share it, deliberately, because they are the same architectural
+    * event reached two ways:
+    *   - a BUS ERROR on the handler-vector read at `VBR + vector*4`;
+    *   - a DTLB TRANSLATION fault while stacking an ENTRY frame or fetching that same
+    *     vector (2026-09-09, when those accesses stopped being identity-physical).
+    * Faults on the RTE frame POP are NOT here: that path is read-only and nothing
+    * architectural has been applied yet, so it raises an ordinary vector-2 access fault
+    * instead -- see `ExceptionUnit.busErrorEntry`. */
   val DOUBLE_FAULT = 6
 
   def name(code: Int): String = code match {
