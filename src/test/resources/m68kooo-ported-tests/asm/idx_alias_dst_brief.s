@@ -1,4 +1,11 @@
 | idx_alias_dst_brief.s — brief-format (d8,An,Xn.SIZE*SCALE) effective
+| CYCLE BUDGET: this test carries a `.timeout` sidecar (3,000,000 cycles).
+| It is not slow because anything is wrong -- it front-loads a large
+| poison-fill / setup loop before the first assertion, and simply does not
+| fit the 200,000-cycle default. Without the sidecar it reports HANG, which
+| reads exactly like a core deadlock and cost real investigation time on
+| 2026-09-09. Verified: it PASSES with the larger budget, unchanged.
+|
 | addresses where the INDEX register and the DESTINATION register are
 | THE SAME register.
 |

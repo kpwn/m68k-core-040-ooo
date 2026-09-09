@@ -1,4 +1,11 @@
 | ras_leaf_value_return_loop.s — repeated short-leaf calls returning a
+| CYCLE BUDGET: this test carries a `.timeout` sidecar (3,000,000 cycles).
+| It is not slow because anything is wrong -- it front-loads a large
+| poison-fill / setup loop before the first assertion, and simply does not
+| fit the 200,000-cycle default. Without the sidecar it reports HANG, which
+| reads exactly like a core deadlock and cost real investigation time on
+| 2026-09-09. Verified: it PASSES with the larger budget, unchanged.
+|
 | COMPUTED VALUE, checked every iteration
 |
 | MECHANISM UNDER TEST:
