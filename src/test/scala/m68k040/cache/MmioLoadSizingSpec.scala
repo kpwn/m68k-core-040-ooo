@@ -90,12 +90,28 @@ class MmioLoadSizingSpec extends AnyFunSuite {
     dut.probe.logic.maintCmdIn.payload.addr #= 0
   }
 
-  private def load(dut: Dut, vaddr: Long, size: SpinalEnumElement[Size.type]): BigInt = {
+  /** `lineOnly` is the `DcacheByteLane.extract` line-wrap tripwire's exemption, and it
+    * is a PROMISE: this requester consumes no byte lane at or beyond the end of the
+    * 16-byte line. See `DLoadCmd.lineOnly`.
+    *
+    * These two tests drive `loadCmd` DIRECTLY, bypassing the LS EU's AGU splitter, in
+    * order to prove the cache contains a straddling INHIBITED access to its own line.
+    * That shape is deliberately not one the core can produce -- `s1CrossLine` is an
+    * address/size predicate that is NOT conditioned on cache mode, so a device read
+    * that crosses a line is split into two commands before `DcachePlugin` sees either
+    * half -- which is exactly why the tripwire fires on it and why the exemption,
+    * rather than a split, is the right answer HERE and would be the wrong answer for
+    * any requester inside the core.
+    *
+    * Default False so every non-straddling case in the same loops stays guarded. */
+  private def load(dut: Dut, vaddr: Long, size: SpinalEnumElement[Size.type],
+                   lineOnly: Boolean = false): BigInt = {
     val p = dut.probe.logic
     p.loadCmdIn.valid #= true
     p.loadCmdIn.payload.vaddr #= vaddr
     p.loadCmdIn.payload.paddr #= vaddr
     p.loadCmdIn.payload.size  #= size
+    p.loadCmdIn.payload.lineOnly #= lineOnly
     p.loadCmdIn.payload.cacheMode #= CacheMode.INHIBITED
     p.loadCmdIn.payload.token #= 0
     dut.clockDomain.waitSamplingWhere(p.loadCmdIn.ready.toBoolean && p.loadCmdIn.valid.toBoolean)
@@ -126,7 +142,11 @@ class MmioLoadSizingSpec extends AnyFunSuite {
         val lineBase = BASE + 0x100L * (off * 3 + n)
         for (i <- 0 until 32) mem.pokeByte(lineBase + i, ((lineBase + i) * 5 + 0x23).toInt & 0xff)
         log.clear()
-        val got = load(dut, lineBase + off, sz)
+        // `off + n > 16` is precisely the straddling set (off=13/14/15 LONG, off=15
+        // WORD). For those the comparison below is CLAMPED to `clampEnd`, so every
+        // wrapped lane is shifted out and none is consumed -- which is what licenses
+        // the exemption. Non-straddling shapes pass False and stay guarded.
+        val got = load(dut, lineBase + off, sz, lineOnly = off + n > 16)
         dut.clockDomain.waitSampling(8)
 
         val want = MmioCover.model(off, math.min(off + n, 16))
@@ -185,7 +205,9 @@ class MmioLoadSizingSpec extends AnyFunSuite {
       val lineBase = BASE + 0x1000L - 16
       for (off <- 12 until 16; (sz, n) <- Seq((Size.WORD, 2), (Size.LONG, 4))) {
         log.clear()
-        load(dut, lineBase + off, sz)
+        // This test inspects ONLY the emitted AR log -- it never reads the returned
+        // data -- so no byte lane, wrapped or not, is consumed for any of its cases.
+        load(dut, lineBase + off, sz, lineOnly = off + n > 16)
         dut.clockDomain.waitSampling(8)
         assert(log.nonEmpty, s"no transaction for off=$off n=$n")
         for ((a, s) <- log) {

@@ -114,11 +114,34 @@ case class DLoadCmd() extends Bundle {
   val size      = Size()
   val cacheMode = CacheMode()
   val token     = UInt(DLoadToken.Width bits)
-  /** The requester consumes `DLoadRsp.line` (the raw 128-bit line) and IGNORES
-    * `DLoadRsp.data`. Set by the LS EU for BOTH halves of a cross-line split pair:
-    * slot A is deliberately presented at the ORIGINAL, line-CROSSING offset/size
-    * (it needs that line, not that value), and the pair is merged later by
-    * `DcacheByteLane.extractCross`. Everything else leaves it False.
+  /** THE INVARIANT: this requester consumes NO byte lane at or beyond the end of the
+    * 16-byte line. It is the exemption from the `DcacheByteLane.extract` line-wrap
+    * tripwire, and it is the requester's promise that a wrapped lane, if one is
+    * produced, is discarded rather than used.
+    *
+    * Two producers legitimately satisfy that promise, and BOTH must, because the bit
+    * disables a guard against silent wrong data:
+    *
+    *  1. The LS EU's cross-line split pair. Slot A is deliberately presented at the
+    *     ORIGINAL, line-CROSSING offset/size because it needs that LINE, not that
+    *     value; it consumes `DLoadRsp.line` and ignores `DLoadRsp.data` entirely, and
+    *     the pair is merged later by `DcacheByteLane.extractCross`.
+    *  2. A DIRECTED TEST that drives `loadCmd` straight, bypassing the AGU splitter,
+    *     to prove the cache's own containment -- `MmioLoadSizingSpec`'s D25/D30. Those
+    *     assert which AXI sub-transactions are emitted for a straddling INHIBITED
+    *     access; D25 reads no data at all, and D30 CLAMPS its comparison to the bytes
+    *     inside the line (`got >> 8*(n - clampedN)` shifts every wrapped lane out). So
+    *     neither consumes a wrapped lane. They set it ONLY for the shapes that
+    *     actually straddle (`off + n > 16`); the non-straddling shapes in the same
+    *     loop leave it False so the tripwire still guards them.
+    *
+    * Everything else leaves it False. Setting it where a wrapped lane IS consumed
+    * silently reintroduces exactly the bug the tripwire exists to catch.
+    *
+    * NOT a licence to drive straddling commands from the core. The LS EU's
+    * `s1CrossLine` predicate is address/size only and is NOT conditioned on cache
+    * mode, so every line-crossing data access -- INHIBITED device reads included --
+    * is split into two commands before `DcachePlugin` sees either half.
     *
     * It exists to make the `DcacheByteLane.extract` line-wrap tripwire precise: that
     * assertion (see `extract` below) fires on a multi-byte extract whose bytes run
