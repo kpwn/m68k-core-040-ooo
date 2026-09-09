@@ -60,10 +60,20 @@ object HaltReason {
     * grant at all -- the `axi_d` arbiter sees nothing, the D-cache's own diagnostic
     * channel sees nothing, and the failure would otherwise be completely unobservable. */
   val WALKER_PORT_WEDGE = 5
-  /** 2026-09-09: a DOUBLE BUS FAULT -- the exception sequencer's handler-vector read at
-    * `VBR + vector*4` returned a bus error while the processor was ALREADY in exception
-    * processing (`exc.dblFault`). M68040UM S8.4.2: the part halts. `OFF_DBL_FAULT_PC` /
-    * `OFF_DBL_FAULT_VEC` carry which instruction and which vector. */
+  /** 2026-09-09: a DOUBLE FAULT -- a fault taken while the processor was ALREADY in
+    * exception processing, which a real 68040 cannot report (there is no stack to report
+    * it on and no meaningful PC to resume) and answers by asserting halt until reset
+    * (M68040UM S8.4.2 / S8.2.6). `exc.dblFault`, with `OFF_DBL_FAULT_PC` /
+    * `OFF_DBL_FAULT_VEC` carrying which instruction and which vector.
+    *
+    * TWO producers share it, deliberately, because they are the same architectural
+    * event reached two ways:
+    *   - a BUS ERROR on the handler-vector read at `VBR + vector*4`;
+    *   - a DTLB TRANSLATION fault while stacking an ENTRY frame or fetching that same
+    *     vector (2026-09-09, when those accesses stopped being identity-physical).
+    * Faults on the RTE frame POP are NOT here: that path is read-only and nothing
+    * architectural has been applied yet, so it raises an ordinary vector-2 access fault
+    * instead -- see `ExceptionUnit.busErrorEntry`. */
   val DOUBLE_FAULT = 6
 
   def name(code: Int): String = code match {

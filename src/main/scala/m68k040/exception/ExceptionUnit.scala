@@ -175,26 +175,23 @@ class ExceptionUnit(
   val icMaintPulse = Bool(); icMaintPulse := False
 
   // ── exposed D-side translation request (wiring MUXes it onto DTranslationService) ─
-  // LEGACY, I-SIDE-SHAPED, AND UNCONSUMED. `dtReq`/`dtRsp` are `TranslationReq`/
-  // `TranslationRsp` -- the COMBINATIONAL, UNTAGGED I-side bundle family. No DUT in this
-  // project has ever wired them (confirmed: zero references outside this file), and they
-  // are structurally incapable of talking to the real D-side `DTranslationService`, whose
-  // contract is `Stream[DTranslationCmd]`/`Stream[DTranslationRsp]` plus an 8-bit token
-  // to match responses across an elastic pipeline. They are kept only because the
-  // existing frame/vector states drive `dtoVld`/`dtoVpn` into them; the REAL D-side
-  // acquisition Task 11 added for FSAVE/FRESTORE is `dxReq*`/`dxRsp*` below.
-  val dtReq = TranslationReq()
-  val dtRsp = TranslationRsp()
-  dtRsp.ready.allowOverride;     dtRsp.ready := True
-  dtRsp.ppn.allowOverride;       dtRsp.ppn := U(0, 20 bits)
-  dtRsp.cacheMode.allowOverride; dtRsp.cacheMode.assignDontCare()
-  dtRsp.fault.allowOverride;     dtRsp.fault := False
+  // (2026-09-09: the LEGACY, I-side-shaped `dtReq`/`dtRsp` pair that used to sit here is
+  // DELETED. It was a `TranslationReq`/`TranslationRsp` -- the combinational, untagged
+  // I-side bundle family -- structurally incapable of talking to the real D-side
+  // `DTranslationService`, and wired by no DUT in this project. It survived only because
+  // the entry-frame / vector / RTE states still drove `dtoVld`/`dtoVpn` into it while
+  // performing their accesses UNTRANSLATED, which made it look like those states had a
+  // translation story when they did not. Now that all of them go through `dxReq*`/
+  // `dxRsp*` and the shared `X_REQ`/`X_WAIT` stage, the last driver is gone and so is
+  // the port.)
 
   // ── REAL D-side DTLB acquisition (Task 11) ───────────────────────────────────
-  // FSAVE's frame stores and FRESTORE's header load are the FIRST exception-sequencer
-  // memory accesses that are genuinely VIRTUAL: every pre-existing one (entry frames,
-  // RTE pops, vector fetches) is identity-physical by construction. So this unit needs a
-  // real translation, and gets one by TIME-MULTIPLEXING the single `DTranslationService`
+  // FSAVE's frame stores and FRESTORE's header load were the FIRST exception-sequencer
+  // memory accesses to be translated (Task 11). As of 2026-09-09 they are no longer the
+  // only ones: the ENTRY frame push, the handler VECTOR fetch and the RTE frame pop all
+  // go through this same port too (see `excPpn`/`X_REQ`). EVERY memory access this unit
+  // makes is now translated -- there is no identity-physical path left. The port is
+  // shared by TIME-MULTIPLEXING the single `DTranslationService`
   // port -- which is deliberately single-producer by design -- via the already-proven
   // `excActive` MUX. `LsEuPlugin` already fully idles its own claim for the entire
   // duration `excActive` is held (`xlate.req.valid := !excActive && ...`, and
@@ -758,9 +755,15 @@ class ExceptionUnit(
   dcStore.payload.strb    := B(0, 16 bits)
   dcStore.payload.lineData:= B(0, 128 bits)
   // ── Exception-sequencer D-cache access cacheability (Task P5.7 root-cause fix) ──
-  // The exception sequencer's frame/vector accesses are always identity-physical
-  // (MMU-off in slice-1), so there is no page attribute to consult -- but CACR.DE
-  // still applies. Task P5.6 made DE=0 mean LITERALLY fully uncached for every data
+  // The exception sequencer's frame/vector accesses are now DTLB-translated
+  // (2026-09-09), so a page attribute does exist -- but this unit still does not consult
+  // it, and deliberately so for now: `excCacheMode` stays CACR.DE-derived
+  // (DE=1 => WRITETHROUGH, DE=0 => INHIBITED). WRITETHROUGH is the conservative choice
+  // against a COPYBACK page (memory is always updated and a resident line is still
+  // merged, so the two can never disagree), and an exception frame on a
+  // cache-INHIBITED page is not a configuration any OS produces. Honouring
+  // `DTranslationRsp.cacheMode` here is a genuine follow-up, not a correctness hole
+  // this change leaves open. CACR.DE applies either way. Task P5.6 made DE=0 mean LITERALLY fully uncached for every data
   // access and folded that into `LsEuPlugin`'s `s2Cmode` capture; these two ports are
   // the D-cache's OTHER data-access requesters and were missed, leaving a REAL
   // coherency hole with DE=0:
@@ -817,10 +820,11 @@ class ExceptionUnit(
   val ldoVld   = Bool();        ldoVld := False
   val ldoVaddr = UInt(32 bits); ldoVaddr := U(0, 32 bits)
   val ldoSize  = Size();        ldoSize := Size.LONG
-  // Task 11: the PHYSICAL address of the load. Every pre-existing exception-sequencer
-  // load is identity-physical, so this defaults to `ldoVaddr` and those states are
-  // byte-for-byte unchanged; only FRESTORE's header read (whose address is genuinely
-  // virtual) overrides it with a real DTLB-translated PA.
+  // The PHYSICAL address of the load. EVERY state that issues a load now overrides this
+  // with a real DTLB-translated PA -- FRESTORE's header read (Task 11), and as of
+  // 2026-09-09 the handler vector fetch and all four RTE frame-word pops as well. The
+  // `:= ldoVaddr` default is now only the inert fallback for a state that forgets to set
+  // it; it is NOT an "identity is fine here" statement, and no live state relies on it.
   val ldoPaddr = UInt(32 bits); ldoPaddr := ldoVaddr
   // This is a real Stream source, not a delayed pulse. A plain RegNext(ldoVld)
   // leaves valid asserted for one tail cycle after the request state observes
@@ -834,9 +838,9 @@ class ExceptionUnit(
   val ldoCmodeReg = Reg(m68k040.cache.CacheMode())
   dcLoadCmd.valid         := ldoValidReg
   dcLoadCmd.payload.vaddr := ldoVaddrReg
-  // Identity (paddr == vaddr) for every pre-existing exception-sequencer load, because
-  // `ldoPaddr` defaults to `ldoVaddr`; FRESTORE's header read supplies a real
-  // DTLB-translated PA here instead (Task 11).
+  // The DTLB-translated PA. Every load-issuing state supplies one (2026-09-09); see
+  // `ldoPaddr`'s declaration for why the `:= ldoVaddr` default is no longer reachable
+  // from any live state.
   dcLoadCmd.payload.paddr := ldoPaddrReg
   dcLoadCmd.payload.size  := ldoSizeReg
   // Every exception-sequencer load consumes `loadRsp.data`; none reads the raw line.
@@ -862,29 +866,13 @@ class ExceptionUnit(
     ldoCmodeReg := excCacheMode
   }
 
-  val dtoVld = Bool();        dtoVld := False
-  val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)
-  val dtoWr  = Bool();        dtoWr := False
-  dtReq.valid      := RegNext(dtoVld) init False
-  dtReq.vpn        := RegNext(dtoVpn)
-  dtReq.supervisor := True
-  dtReq.write      := RegNext(dtoWr) init False
 
-  // helper: present one aligned store of `sz` at `va`. The store paddr is the
-  // identity-translated va (MMU off in slice-1 exception tests; a real-DTLB frame
-  // translation is a fast-follow). Both sto* (the store) and dto* (the matching
-  // D-TLB request, for the cache's coherence) are REGISTERED onto dcStore/dtReq.
-  def driveStore(va: UInt, sz: Size.C, data: Bits): Unit = {
-    dtoVld := True; dtoVpn := va(31 downto 12); dtoWr := True
-    stoVld   := True
-    stoPaddr := va
-    stoSize  := sz
-    stoData  := data.resize(32)
-  }
-  // Identity supervisor PHYSICAL store WITHOUT a translation request. The exception
-  // frame/vector accesses are physical (paddr == va); the D-cache store port uses the
-  // paddr directly. Driving the DTLB here would (with the MMU live) start a walk whose
-  // multi-cycle not-ready stalls the store state -> re-pulsed stores. So we don't.
+  // Present one supervisor store at an ALREADY-TRANSLATED physical address. The name is
+  // historical and means "does not itself drive a translation request", NOT "needs no
+  // translation": callers (E_STORE, F_STORE) resolve the PA in a separate FSM state
+  // first and pass it in. That separation is deliberate -- driving the DTLB from inside
+  // a store state would, with the MMU live, start a walk whose multi-cycle not-ready
+  // re-pulses the combinational store command and pushes the same word repeatedly.
   def driveStoreNoXlate(va: UInt, sz: Size.C, data: Bits): Unit = {
     stoVld   := True
     stoPaddr := va
@@ -1100,6 +1088,59 @@ class ExceptionUnit(
     * `RobPlugin.coreHaltedIn` through the top-level wiring. See F_HALT. */
   val fsXlateFault = RegInit(False); fsXlateFault.simPublic()
 
+  // ══ REAL DTLB TRANSLATION FOR THE ENTRY FRAME / VECTOR FETCH / RTE POP ═════════
+  // 2026-09-09. Until now EVERY access this sequencer made outside the FSAVE/FRESTORE
+  // path was IDENTITY-PHYSICAL: `ldoPaddr` defaulted to `ldoVaddr` and
+  // `driveStoreNoXlate` put the virtual address straight into `DStoreCmd.paddr`. The
+  // three sites carried a comment calling a real translation "a fast-follow".
+  //
+  // WHY IT IS NOT OPTIONAL. The supervisor stack pointer and the VBR are LOGICAL
+  // addresses -- ordinary `move.l` to the same stack goes through the DTLB, and the OS
+  // stores its vector table with translated stores. Whenever the supervisor map is not
+  // an identity map, an untranslated frame push writes the frame to the wrong physical
+  // page and an untranslated vector fetch reads a handler address out of memory the OS
+  // never wrote. Both are SILENT: no fault, no bus error, deterministic. The frame push
+  // and pop stay self-consistent with each other (both are equally wrong), which is
+  // exactly what makes the failure so hard to see -- only the vector fetch and the
+  // collateral damage to whatever really lives at that physical address show up.
+  //
+  // SHAPE. One shared translation context for the whole episode, mirroring the
+  // FSAVE/FRESTORE machinery immediately above it (`fsPpn`/`fsLastVpn`/`fsVpnValid`):
+  // translate once, reuse while the VPN is unchanged, re-translate the moment a step
+  // walks into a new page. A 30-word format-$7 frame therefore costs ONE translation,
+  // not thirty -- and still gets a real, current one for every word.
+  //
+  // The FSM reaches the shared `X_REQ`/`X_WAIT` pair from six different places, so the
+  // caller latches the VA, the access class and a RETURN CODE (`xVa`/`xWrite`/`xRet`)
+  // and `X_WAIT` dispatches back. That is 2 states instead of the 12 a per-site
+  // request/wait pair would have cost, and it keeps a single copy of the fault check.
+  val excPpn      = Reg(UInt(20 bits)) init 0; excPpn.simPublic()
+  val excLastVpn  = Reg(UInt(20 bits)) init 0
+  val excVpnValid = RegInit(False); excVpnValid.simPublic()
+  val xVa         = Reg(UInt(32 bits)) init 0
+  val xWrite      = RegInit(False)
+  val xRet        = Reg(UInt(3 bits)) init 0
+
+  // `X_WAIT` return codes. Kept as plain Ints (not a SpinalEnum) to match how this file
+  // already encodes small FSM-local selectors, and because they are never a port type.
+  val XRET_E_STORE = 0   // ENTRY: next frame word push
+  val XRET_E_VEC   = 1   // ENTRY: handler vector fetch
+  val XRET_R_SR    = 2   // RTE: SR word     @ frameBase+0
+  val XRET_R_PC    = 3   // RTE: PC hi word  @ frameBase+2
+  val XRET_R_PC2   = 4   // RTE: PC lo word  @ frameBase+4
+  val XRET_R_FMT   = 5   // RTE: format word @ frameBase+6
+
+  /** PA = PPN ## page-offset, sized by TCR.P. Identical construction to F_STORE's, and
+    * the same reason it must be a Mux: with 8 KiB pages VA[12] is an OFFSET bit, not the
+    * PPN's LSB (MC68040 UM S3.1.2), and the page descriptor's bit 12 is architecturally
+    * undefined in that mode. `fsIs8K` is the same `mmuCtrl.pageSize8K` read the
+    * FSAVE/FRESTORE path uses -- one getter, two consumers, no new dependency. */
+  def excPaOf(va: UInt): UInt = Mux(fsIs8K,
+    (excPpn(19 downto 1) ## va(12 downto 0)).asUInt,
+    (excPpn ## va(11 downto 0)).asUInt)
+  /** True when `va` is not covered by the translation currently held in `excPpn`. */
+  def excNeedXlate(va: UInt): Bool = !excVpnValid || (va(31 downto 12) =/= excLastVpn)
+
   /** 3-bit STAG/DTAG operand data-type tag from an 80-bit extended value.
     * Encodings verbatim from the MC68040 UM (1989 1st ed.) p.9-34 "STAG, DTAG":
     *   000 Normalized / 001 Zero / 010 Infinity / 011 NAN
@@ -1245,6 +1286,13 @@ class ExceptionUnit(
     val E_VECWAIT = new State    // await vector load rsp
     val E_DBLFAULT= new State    // TERMINAL: the vector fetch bus-errored (see `dblFault`)
     val E_REDIR   = new State    // pulse redirect, commit SSP/SR, done
+    // ── shared DTLB translation stage for the frame/vector accesses (2026-09-09) ──
+    // Reached from E_STORE, E_VECREQ and all four RTE pop states; `xRet` says which one
+    // to return to. Neither state drives `ldoVld` or `stoVld`, so the D-cache load/store
+    // command ports are FREE for the table walker that this very request may launch --
+    // the same no-deadlock construction F_XREQ/F_XWAIT already rely on.
+    val X_REQ     = new State    // present the translation request
+    val X_WAIT    = new State    // await it; dispatch back on `xRet`, or halt on a fault
     // RTE path
     val R_DRAIN   = new State    // wait for the SQ to drain + the live-A7 readback to
                                   // settle before capturing frameBase (mirrors E_DRAIN)
@@ -1577,33 +1625,70 @@ class ExceptionUnit(
         // E_STORE -> E_STWAIT -> E_VECREQ is the ONLY path to the vector fetch, so this
         // is the one place the split-fetch cursor needs re-arming (2026-09-09).
         vecSplitIdx := 0
+        // Start every episode with NO cached translation. The ATC can have been flushed
+        // (PFLUSHA) or re-pointed (MOVEC to URP/SRP) since the last episode, and this is
+        // the one place per entry episode that is guaranteed to run, so it is where the
+        // "translate at least once, freshly" guarantee belongs.
+        excVpnValid := False
         goto(E_STORE)
       }
+    }
+
+    /** Latch {VA, access class, return code} and enter the shared translation stage. */
+    def excGoXlate(va: UInt, write: Boolean, ret: Int): Unit = {
+      xVa    := va
+      xWrite := Bool(write)
+      xRet   := U(ret, 3 bits)
+      goto(X_REQ)
     }
 
     // ── ENTRY: stack the frame (one word at a time) ─────────────────────────────
     E_STORE.whenIsActive {
       // Capture the store EXACTLY ONCE, hold its registered Stream command until
-      // accepted, then wait its terminal ACK.
-      // The exception sequencer is a supervisor PHYSICAL access: the store paddr is
-      // identity, and the D-cache store port uses that paddr directly — it needs NO
-      // translation. We must NOT gate on `dtRsp.ready`
-      // (with the MMU live, the frame VPN walks and dtRsp.ready drops for several
-      // cycles, during which a combinational `driveStore` would recapture the same
-      // word repeatedly). One cycle here captures exactly one stable Stream item.
+      // accepted, then wait its terminal ACK. One cycle here captures exactly one
+      // stable Stream item.
       // Task #163: split a line-crossing word (line-relative offset 15) into two
       // single-byte pushes — see stSplitLow's doc comment above.
       val addr    = frameWordAddr(stStep)
       val data    = frameWordData(stStep)
       val crosses = addr(3 downto 0) === U(15, 4 bits)
-      when(stSplitLow) {
-        driveStoreNoXlate(addr + U(1, 32 bits), Size.BYTE, data(7 downto 0))
-      } elsewhen(crosses) {
-        driveStoreNoXlate(addr, Size.BYTE, data(15 downto 8))
+      // 2026-09-09: the address of the half actually being pushed THIS visit -- the
+      // split's low byte lives at addr+1, which can be in the NEXT page when the word
+      // sits at page offset $FFF, so it is what must be translated (the same rule
+      // `fsCurVa` states for FSAVE and `fsRdCurVa` for FRESTORE).
+      val va      = Mux(stSplitLow, addr + U(1, 32 bits), addr)
+      when(excNeedXlate(va)) {
+        // A frame push is a supervisor WRITE: it must be permission-checked as one
+        // (write-protect faults) and it must set the page descriptor's M bit, exactly
+        // like the `move.l` an ordinary program would use to write the same stack.
+        //
+        // KNOWN, BOUNDED FOLLOW-UP (2026-09-09, opened by this change). A write walk
+        // queues a deferred U/M descriptor write in `DtlbPlugin`'s `UmWriteQueue`,
+        // tagged with `lsEu.xlateRobId` -- which, for a request that came from THIS
+        // unit, is whatever robId the (squashed) LS pipe last held, not a robId with
+        // any relationship to the exception. The entry therefore commits at an
+        // arbitrary time or, more often, is discarded by the next flush, so the M bit
+        // frequently never reaches memory. That is NOT a correctness hole: U/M updates
+        // are monotonic, the ATC entry this walk fills already carries the post-update
+        // `modified`, so no later write to the page re-walks, and Mac OS does not page.
+        // The proper fix is a `preCommitted` flag on `UmWriteAlloc` -- an exception
+        // episode is non-speculative by construction, so its descriptor write should be
+        // born committed and immune to flush -- driven from a new latched
+        // `umAccessPreCommitted` alongside `umAccessRobId`. Deliberately NOT folded into
+        // this change: it touches the DTLB request path and wants its own fail-before
+        // test and synth gate.
+        excGoXlate(va, write = true, XRET_E_STORE)
       } otherwise {
-        driveStoreNoXlate(addr, Size.WORD, data)
+        val pa = excPaOf(va)
+        when(stSplitLow) {
+          driveStoreNoXlate(pa, Size.BYTE, data(7 downto 0))
+        } elsewhen(crosses) {
+          driveStoreNoXlate(pa, Size.BYTE, data(15 downto 8))
+        } otherwise {
+          driveStoreNoXlate(pa, Size.WORD, data)
+        }
+        goto(E_STWAIT)
       }
-      goto(E_STWAIT)
     }
     E_STWAIT.whenIsActive {
       // The registered command remains asserted here until dcStore.fire. Wait for
@@ -1641,14 +1726,20 @@ class ExceptionUnit(
     val vecCrosses = vecTarget(3 downto 0) > U(12, 4 bits)
     val vecCurVa   = Mux(vecCrosses, vecTarget + vecSplitIdx.resize(32 bits), vecTarget)
     E_VECREQ.whenIsActive {
-      dtoVld := True; dtoVpn := vecCurVa(31 downto 12); dtoWr := False
-      ldoVld := True; ldoVaddr := vecCurVa
-      ldoSize := Mux(vecCrosses, Size.BYTE, Size.LONG)
-      when(dcLoadCmd.fire) { goto(E_VECWAIT) }
+      // 2026-09-09: VBR is a LOGICAL address -- the OS writes its vector table with
+      // ordinary translated stores -- so the vector fetch must translate too. Reading
+      // it untranslated returns whatever physical memory happens to live at VBR+vec*4,
+      // i.e. the core redirects to a handler address the OS never wrote: silent, with
+      // no fault, and the single worst outcome in the whole exception path.
+      when(excNeedXlate(vecCurVa)) {
+        excGoXlate(vecCurVa, write = false, XRET_E_VEC)
+      } otherwise {
+        ldoVld := True; ldoVaddr := vecCurVa; ldoPaddr := excPaOf(vecCurVa)
+        ldoSize := Mux(vecCrosses, Size.BYTE, Size.LONG)
+        when(dcLoadCmd.fire) { goto(E_VECWAIT) }
+      }
     }
     E_VECWAIT.whenIsActive {
-      // keep the translation valid while the load is in flight
-      dtoVld := True; dtoVpn := vecCurVa(31 downto 12)
       when(dcLoadRsp.valid) {
         when(dcLoadRsp.payload.fault) {
           // DOUBLE FAULT (see `dblFault`'s declaration): a bus error on the handler
@@ -1745,6 +1836,7 @@ class ExceptionUnit(
     R_DRAIN.whenIsActive {
       when(sqDrained && dcQuiesced) {
         frameBase := Mux(ss.m, ss.msp, ss.isp)   // RTE reads the SETTLED current supervisor stack
+        excVpnValid := False                     // fresh translation per episode (see E_DRAIN)
         goto(R_SRREQ)
       }
     }
@@ -1752,11 +1844,19 @@ class ExceptionUnit(
     // word straddling a 16-byte line into two BYTE reads (see rdSplitLow above).
     /** Issue one frame-word read at `addr` (WORD, or the BYTE half selected by
       * `rdSplitLow` when the word straddles a line). */
-    def frameWordReq(addr: UInt): Unit = {
+    def frameWordReq(addr: UInt, ret: Int): Unit = {
       val va = Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
-      dtoVld := True; dtoVpn := va(31 downto 12)
-      ldoVld := True; ldoVaddr := va
-      ldoSize := Mux(rdCrosses(addr), Size.BYTE, Size.WORD)
+      // 2026-09-09: the RTE frame lives on the supervisor stack, a LOGICAL address --
+      // so the pop translates, exactly like the push. `va` is already the split-aware
+      // address, so a frame word whose low byte falls in the next page re-translates
+      // for that byte. `ret` names the state to come back to (each of the four pop
+      // request states re-enters ITSELF, so a mid-word re-translate resumes correctly).
+      when(excNeedXlate(va)) {
+        excGoXlate(va, write = false, ret)
+      } otherwise {
+        ldoVld := True; ldoVaddr := va; ldoPaddr := excPaOf(va)
+        ldoSize := Mux(rdCrosses(addr), Size.BYTE, Size.WORD)
+      }
     }
     /** Synthesize a vector-2 ACCESS FAULT (format-$7) ENTRY for a bus error taken on an
       * RTE frame-word read at `faultAddr`.
@@ -1772,16 +1872,24 @@ class ExceptionUnit(
       * introduced), R/W = 1 (read), FC = supervisor DATA (0b101), SIZE = 10 (word: the
       * ARCHITECTURAL access is the frame WORD, even when the line-straddle split reads it
       * as two bytes). */
-    def busErrorEntry(faultAddr: UInt): Unit = {
+    /** `atc`: TRUE for an MMU translation fault (SSW.ATC set, M68040UM format-$7 SSW
+      * bit 10), FALSE for a physical bus error. Everything else about the frame is
+      * identical -- both are access faults reported at vector 2. */
+    def busErrorEntry(faultAddr: UInt, atc: Boolean = false, pc: UInt = null): Unit = {
+      // `pc` is the PC to STACK, i.e. the address of the instruction that faulted. It
+      // defaults to `rteCapPc` because RTE was the first caller; FSAVE/FRESTORE pass
+      // their own `sysCapPc` (both are latched at trigger for the same reason -- by the
+      // time we get here the ROB slot has long been reused).
+      val stackedPc = if (pc == null) rteCapPc else pc
       curVec       := U(2, 8 bits)
-      curPc        := rteCapPc
+      curPc        := stackedPc
       curIs7       := True
       curIs2       := False
       curIsInt     := False
       curLevel     := U(0, 3 bits)
-      curPpc       := rteCapPc
+      curPpc       := stackedPc
       curFault     := faultAddr
-      curSsw       := U(0x0145, 16 bits)
+      curSsw       := U(if (atc) 0x0545 else 0x0145, 16 bits)
       curThrowaway := False
       stFrame2     := False
       // The SR to stack is the CURRENT one: R_REDIR is where RTE would have applied the
@@ -1791,14 +1899,18 @@ class ExceptionUnit(
       stStep       := 0
       stSplitLow   := False
       rdSplitLow   := False    // drop any half-read split word
+      // Drop any half-transferred FSAVE/FRESTORE state-frame cursor too, so an aborted
+      // state-frame transfer leaves nothing armed for the entry we are about to push.
+      fsStep       := 0
+      fsSplitLow   := False
+      fsRdSplitLow := False
+      fsVpnValid   := False
       goto(E_DRAIN)
     }
     /** Await the response of `frameWordReq(addr)`. Calls `onWord(w)` with the complete
       * 16-bit word; on the first half of a split word, latches the high byte and
       * re-enters `reqState` for the low byte. */
     def frameWordWait(addr: UInt, reqState: State, onWord: UInt => Unit): Unit = {
-      val va = Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
-      dtoVld := True; dtoVpn := va(31 downto 12)
       when(dcLoadRsp.valid) {
         when(dcLoadRsp.payload.fault) {
           // 2026-09-09: a BUS ERROR on a frame-word read. Previously consumed as if it
@@ -1819,22 +1931,84 @@ class ExceptionUnit(
         }
       }
     }
+    // ── shared DTLB translation stage (2026-09-09) ──────────────────────────────
+    // Byte-for-byte the F_XREQ/F_XWAIT contract the FSAVE/FRESTORE path already proves:
+    // present {vpn, write} on the exception unit's own claim of the single
+    // `DTranslationService` port (the LS pipe idles its claim for the whole duration of
+    // `excActive`), wait for the response carrying THIS unit's token, and cache the PPN.
+    //
+    // NO D-cache command is driven here. That is what makes it deadlock-free: the
+    // request may miss and launch a table walk, and the walker needs the very D-cache
+    // load/store ports the frame push would otherwise be holding.
+    //
+    // Placed after `busErrorEntry`/`frameWordWait` purely so those helpers are already in
+    // scope; a StateMachine does not care what order its state bodies are written in.
+    X_REQ.whenIsActive {
+      dxReqValid := True
+      dxReqVpn   := xVa(31 downto 12)
+      dxReqWrite := xWrite
+      when(dxReqReady) { dxPendVpn := xVa(31 downto 12); goto(X_WAIT) }
+    }
+    X_WAIT.whenIsActive {
+      when(dxRspMine) {
+        when(dxRspFault) {
+          // Non-resident, write-protected or supervisor-protected. WHICH access was being
+          // translated decides the architectural answer, and it is exactly the same split
+          // the BUS-ERROR arms make for the same three access classes:
+          //
+          //  * ENTRY frame push / handler VECTOR fetch -> the processor is ALREADY in
+          //    exception processing. There is no stack to report this on and no PC to
+          //    resume: DOUBLE FAULT, halt (M68040UM S8.4.2). Shares `dblFault` and
+          //    `E_DBLFAULT` with the vector read's bus-error arm rather than duplicating
+          //    them, so one halt reason and one pair of debug registers cover both.
+          //  * RTE frame POP -> RTE is an ORDINARY INSTRUCTION and its path up to
+          //    R_REDIR is READ-ONLY, so nothing architectural has been applied and a
+          //    clean vector-2 ACCESS FAULT can be raised that the OS can actually
+          //    handle -- the same treatment, and for the same reason, that a bus error
+          //    on that read already gets. Halting an ordinary faulting instruction is
+          //    never correct 68040 behaviour.
+          //
+          // `xVa` is the address whose translation failed, which is precisely what the
+          // format-$7 frame's fault-address field must report.
+          when((xRet === U(XRET_E_STORE, 3 bits)) || (xRet === U(XRET_E_VEC, 3 bits))) {
+            dblFault    := True
+            dblFaultPc  := curPc
+            dblFaultVec := curVec
+            goto(E_DBLFAULT)
+          } otherwise {
+            busErrorEntry(xVa, atc = true)
+          }
+        } otherwise {
+          excPpn      := dxRspPpn
+          excLastVpn  := dxPendVpn
+          excVpnValid := True
+          switch(xRet) {
+            is(U(XRET_E_STORE, 3 bits)) { goto(E_STORE)  }
+            is(U(XRET_E_VEC,   3 bits)) { goto(E_VECREQ) }
+            is(U(XRET_R_SR,    3 bits)) { goto(R_SRREQ)  }
+            is(U(XRET_R_PC,    3 bits)) { goto(R_PCREQ)  }
+            is(U(XRET_R_PC2,   3 bits)) { goto(R_PCREQ2) }
+            default                     { goto(R_FMTREQ) }
+          }
+        }
+      }
+    }
     R_SRREQ.whenIsActive {
-      frameWordReq(frameBase + 0)
+      frameWordReq(frameBase + 0, XRET_R_SR)
       when(dcLoadCmd.fire) { goto(R_SRWAIT) }
     }
     R_SRWAIT.whenIsActive {
       frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
     }
     R_PCREQ.whenIsActive {
-      frameWordReq(frameBase + 2)
+      frameWordReq(frameBase + 2, XRET_R_PC)
       when(dcLoadCmd.fire) { goto(R_PCWAIT) }
     }
     R_PCWAIT.whenIsActive {
       frameWordWait(frameBase + 2, R_PCREQ, w => { popPc(31 downto 16) := w; goto(R_PCREQ2) })
     }
     R_PCREQ2.whenIsActive {
-      frameWordReq(frameBase + 4)
+      frameWordReq(frameBase + 4, XRET_R_PC2)
       when(dcLoadCmd.fire) { goto(R_PCWAIT2) }
     }
     R_PCWAIT2.whenIsActive {
@@ -1842,7 +2016,7 @@ class ExceptionUnit(
     }
     // Read the format word @base+6 to select the pop size ($0 = 8 bytes, $7 = 60).
     R_FMTREQ.whenIsActive {
-      frameWordReq(frameBase + 6)
+      frameWordReq(frameBase + 6, XRET_R_FMT)
       when(dcLoadCmd.fire) { goto(R_FMTWAIT) }
     }
     R_FMTWAIT.whenIsActive {
@@ -2482,8 +2656,24 @@ class ExceptionUnit(
     F_XWAIT.whenIsActive {
       when(dxRspMine) {
         when(dxRspFault) {
-          fsXlateFault := True
-          goto(F_HALT)
+          // 2026-09-09: was `fsXlateFault := True; goto(F_HALT)` -- it HALTED THE
+          // PROCESSOR. FSAVE is an ordinary instruction and halting is never the correct
+          // 68040 response to one faulting: a non-resident or write-protected state-frame
+          // page is an ACCESS FAULT the OS is expected to handle (page it in, RTE, the
+          // instruction re-runs). Halting made an FPU context switch onto a
+          // not-yet-resident supervisor stack unrecoverable, which 24-bit mode never
+          // reaches because everything it touches is low and already resident.
+          //
+          // HONEST LIMITATION, stated rather than papered over: this core has no
+          // format-$7 CONTINUATION machinery, so the model is retry-from-scratch, not
+          // resume-mid-transfer. For the FIRST frame word that is exact. For a
+          // MID-FRAME re-translate (F_STORE re-enters here when a step walks into a new
+          // page) some words are already written -- but FSAVE's An write-back has not
+          // happened (it is applied at S_REDIR, which this never reaches), so the
+          // handler sees the original An and a retry rewrites those words with the same
+          // values. Same "left in place, re-attempt the whole instruction" convention
+          // the existing vector-14 format-error and vector-3 odd-PC re-entries use.
+          busErrorEntry(fsCurVa, atc = true, pc = sysCapPc)
         } otherwise {
           fsPpn      := dxRspPpn
           fsLastVpn  := dxPendVpn
@@ -2558,8 +2748,19 @@ class ExceptionUnit(
     F_RXWAIT.whenIsActive {
       when(dxRspMine) {
         when(dxRspFault) {
-          fsXlateFault := True
-          goto(F_HALT)
+          // Same change, and CLEANER than the FSAVE side: this is the translation for
+          // FRESTORE's HEADER word, the instruction's FIRST access. Nothing has been
+          // transferred and no register has been written, so the vector-2 entry is an
+          // exact restart point -- the identical read-only argument the RTE frame-pop
+          // arm relies on. `frestore (%a7)+` on a high supervisor stack is exactly what
+          // Mac OS does on an FPU context switch in 32-bit addressing mode.
+          //
+          // NOTE, for whoever harmonises this next: the BUS-ERROR arm on this same
+          // access (F_HDRWAIT) still goes to `F_HALT`. That was a deliberate, separately
+          // reasoned choice; this change deliberately does NOT reach across into it.
+          // The two should almost certainly match, and the argument above says they
+          // should both be vector 2.
+          busErrorEntry(fsRdCurVa, atc = true, pc = sysCapPc)
         } otherwise {
           fsPpn      := dxRspPpn
           fsLastVpn  := dxPendVpn

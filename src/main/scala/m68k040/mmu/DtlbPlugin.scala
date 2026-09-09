@@ -199,20 +199,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkUmPoison = RegInit(False)
     missPending.simPublic()
 
-    // Task #210: forward-declared (umq itself is built further below, mirroring
-    // umQueueFull's own forward-declaration) -- True while ANY queued-but-not-yet-
-    // drained deferred U/M descriptor write targets the SAME PAGE as this cycle's
-    // incoming request. See the assignment site (next to `umq`) for the full
-    // rationale: a resolved translation alone is not enough to guarantee a
-    // PROGRAM-ORDER-LATER access to that same page observes the updated
-    // descriptor, because the actual memory RMW only drains after the triggering
-    // instruction commits -- strictly later than when its own translation
-    // response (and hence its retirement) becomes possible.
-    val umqPageHazard = Bool()
-
     _rsp.valid   := rspValid && !flushAll
     _rsp.payload := rspPayload
-    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll && !umqPageHazard
+    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll
 
     when(_rsp.fire) { rspValid := False }
 
@@ -459,19 +448,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // performed speculatively.
     val umq = new UmWriteQueue(4)
     umQueueFull := umq.io.full
-    // Task #210: a queued-but-undrained deferred descriptor write is invisible to
-    // ordinary memory reads until it actually lands (commit marks it drainable;
-    // the AXI RMW itself then takes further cycles) -- strictly LATER than when
-    // the triggering instruction's own translation resolves. A PROGRAM-ORDER-LATER
-    // access to the SAME PAGE (page-granularity, not exact-byte: cheap and only
-    // ever over-blocks, never under-blocks) must not translate/proceed until that
-    // write has drained, or it can observe the stale pre-update descriptor byte --
-    // exactly the read-after-the-triggering-write race this task's own ATC test
-    // exercises. Real 68040 hardware has no such gap because a table search is
-    // simply part of the write's own (fully synchronous, non-speculative) bus
-    // activity; this is this OoO core's equivalent enforcement.
-    umq.io.pageQuery := _req.payload.vpn
-    umqPageHazard    := umq.io.pageHazard
+    // (2026-09-09: the task #210 same-page interlock that used to be driven from here
+    // is GONE -- it compared this VIRTUAL page number against the queue's PHYSICAL
+    // descriptor addresses, so it was dead under any non-identity map and could not be
+    // made to fire correctly without deadlocking. UmWriteQueue.scala carries the full
+    // argument and the monotonicity tripwire that replaces it.)
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !flushAll

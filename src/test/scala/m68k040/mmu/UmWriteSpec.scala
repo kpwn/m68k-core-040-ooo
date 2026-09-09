@@ -601,4 +601,90 @@ class UmWriteSpec extends AnyFunSuite {
         s"an active pre-PFLUSHA walk left a stale fill: $beforeReplay -> $arCount")
     }
   }
+
+  // ── flush rollback: a COMMITTED entry stranded behind an uncommitted one ────────
+  //
+  // FAIL-BEFORE / PASS-AFTER for the `UmWriteQueue.flush` ring-invariant bug
+  // (2026-09-09). Entries are allocated in walk-COMPLETION order, which is LS ISSUE
+  // order (`IssueQueuePlugin` selects the oldest READY op, not the oldest op), while
+  // `commit` arrives in program order -- so a committed entry CAN sit behind an
+  // uncommitted one. The old flush body cleared every non-kept slot and set
+  // `tail := head + CountOne(keep)`, a POPULATION count rather than a prefix count from
+  // `head`. In that state `head` was left pointing at a slot whose `valid` had just been
+  // cleared, so `headReady` was false forever and the queue NEVER DRAINED AGAIN, and
+  // `tail` landed on the surviving committed entry for the next allocation to overwrite.
+  // Losing an M means a page that IS dirty is later evicted as clean.
+  //
+  // Unfixed, the second assertion below reads 0x01 (the committed write never lands).
+  test("flush: a COMMITTED entry behind an uncommitted one still drains", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      // Two pages under the SAME root/pointer entries, different page-table slots.
+      val vaYoung = 0x00802000L   // walked FIRST  -> queue slot 0; robId 9  = YOUNGER
+      val vaOld   = 0x00803000L   // walked SECOND -> queue slot 1; robId 2  = OLDER
+      val pgYoung = buildTable(mem, vaYoung, ppn = 0x11100L)
+      val pgOld   = buildTable(mem, vaOld,   ppn = 0x22200L)
+      assert(mem.peekByte(pgYoung + 3) == 0x01, "initial descriptor (young page)")
+      assert(mem.peekByte(pgOld   + 3) == 0x01, "initial descriptor (old page)")
+
+      // The YOUNGER access's walk completes first, so its entry takes the queue HEAD.
+      walk(dut, cd, vaYoung, write = true, robId = 9)
+      walk(dut, cd, vaOld,   write = true, robId = 2)
+
+      // The OLDER instruction retires first -- its entry (slot 1) becomes committed
+      // while slot 0, at the head, is still speculative.
+      dut.probe.logic.commitValid #= true; dut.probe.logic.commitId #= 2
+      cd.waitSampling(); dut.probe.logic.commitValid #= false
+      cd.waitSampling(2)
+
+      // ...and then the younger instruction is squashed.
+      dut.probe.logic.flush #= true
+      cd.waitSampling()
+      dut.probe.logic.flush #= false
+      cd.waitSampling(80)
+
+      assert(mem.peekByte(pgYoung + 3) == 0x01,
+        f"the SQUASHED entry must never be written (got 0x${mem.peekByte(pgYoung + 3)}%02x)")
+      assert(mem.peekByte(pgOld + 3) == 0x19,
+        f"the COMMITTED entry stranded behind it must still drain: got " +
+        f"0x${mem.peekByte(pgOld + 3)}%02x, expected 0x19 (PDT|U|M). 0x01 means the queue " +
+        "was left with `head` on an invalidated slot and never drained again")
+    }
+  }
+
+  // The queue must also stay USABLE afterwards: a flush that strands a committed entry
+  // used to leave `tail` on top of it, so the next allocation silently overwrote an
+  // architectural write. Here the post-flush allocation must land on its own slot and
+  // drain on its own commit, with the stranded entry's write already in memory.
+  test("flush: the queue keeps allocating correctly after a stranded-commit flush", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val (cd, mem) = init(dut)
+      val vaYoung = 0x00804000L
+      val vaOld   = 0x00805000L
+      val vaNext  = 0x00806000L
+      val pgYoung = buildTable(mem, vaYoung, ppn = 0x33300L)
+      val pgOld   = buildTable(mem, vaOld,   ppn = 0x44400L)
+      val pgNext  = buildTable(mem, vaNext,  ppn = 0x55500L)
+
+      walk(dut, cd, vaYoung, write = true, robId = 9)
+      walk(dut, cd, vaOld,   write = true, robId = 2)
+      dut.probe.logic.commitValid #= true; dut.probe.logic.commitId #= 2
+      cd.waitSampling(); dut.probe.logic.commitValid #= false
+      cd.waitSampling(2)
+      dut.probe.logic.flush #= true
+      cd.waitSampling()
+      dut.probe.logic.flush #= false
+      cd.waitSampling(80)
+      assert(mem.peekByte(pgOld + 3) == 0x19, "stranded committed entry drained")
+
+      // A fresh access after the flush must queue and drain normally.
+      walk(dut, cd, vaNext, write = true, robId = 17)
+      dut.probe.logic.commitValid #= true; dut.probe.logic.commitId #= 17
+      cd.waitSampling(); dut.probe.logic.commitValid #= false
+      cd.waitSampling(80)
+      assert(mem.peekByte(pgNext + 3) == 0x19,
+        f"a post-flush allocation must still drain (got 0x${mem.peekByte(pgNext + 3)}%02x)")
+      assert(mem.peekByte(pgYoung + 3) == 0x01, "the squashed entry is still never written")
+    }
+  }
 }

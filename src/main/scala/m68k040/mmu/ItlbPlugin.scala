@@ -346,12 +346,6 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // entry drains at the fetching instruction's commit and is discarded on a flush.
     val umq = new UmWriteQueue(4)
     umQueueFull := umq.io.full
-    // Task #210 added a mandatory pageQuery/pageHazard port to UmWriteQueue for
-    // the D-side write-hit M-refresh race; the I-side has no such race (fetches
-    // never set M, and no write-hit-triggered re-walk exists here) so this is
-    // wired but deliberately NOT consulted -- keeps ItlbPlugin's own behavior
-    // byte-for-byte unchanged.
-    umq.io.pageQuery := _req.vpn
     // C6 fix: previously UNCONDITIONAL -- no poison of any kind, not even a
     // `flushAll` (PFLUSHA) gate (DtlbPlugin's equivalent line gates on
     // `!walkUmPoison && !walkFlushPoison && !flushAll`). A walk that completed
