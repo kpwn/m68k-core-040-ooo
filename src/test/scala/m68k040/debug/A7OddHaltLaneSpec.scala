@@ -176,6 +176,46 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
     }
   }
 
+  test("PC-RANGE lane: halts on the first retirement inside the window, captures it and the two PCs before it, and is inert outside the window or when disabled") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut, cd)
+      // Window = "RAM above 8 MB", the boot defect's wild-jump target region.
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_LO, 0x00800000L)
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_HI, 0x03FFFFFFL)
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_CTL, 1L)
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_LO) == 0x00800000L, "LO readback")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_HI) == 0x03FFFFFFL, "HI readback")
+
+      // Retirements BELOW the window must not trip it.
+      retireOne(dut, cd, 0x00009008L)
+      retireOne(dut, cd, 0x0000900cL)
+      retireOne(dut, cd, 0x00009012L)
+      assert(!halted(dut, cd), "halted on an out-of-window PC")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_COUNT) == 0L, "counted an out-of-window PC")
+
+      // The wild jump: one retirement inside the window halts the core.
+      retireOne(dut, cd, 0x00a54cfaL)
+      waitHalt(dut, cd, expect = true, "in-window retirement")
+      assert(rd(dut, cd, DebugRegMap.OFF_HALT_REASON) == DebugHaltReasonCode.A7_ODD,
+        "the PC-range lane reports the shared lane reason code")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_PC0) == 0x00a54cfaL, "PC0 = the in-window PC")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_PC1) == 0x00009012L, "PC1 = the PC before it")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_PC2) == 0x0000900cL, "PC2 = the one before that")
+      assert(rd(dut, cd, DebugRegMap.OFF_PCRANGE_COUNT) == 1L, "in-range count")
+      assert(rd(dut, cd, DebugRegMap.OFF_A7ODD_COUNT) == 0L, "the A7 lane must not have fired")
+
+      // Disable, resume: a further in-window retirement is ignored.
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_CTL, 0L)
+      wr(dut, cd, DebugRegMap.OFF_CONTROL, 0L)
+      waitHalt(dut, cd, expect = false, "resume after disable")
+      retireOne(dut, cd, 0x00b78570L)
+      cd.waitSampling(40)
+      assert(!halted(dut, cd), "halted while the PC-range lane was disabled")
+    }
+  }
+
   test("threshold 4: counts retired macros while odd and reports the PCs retired before the edge") {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain

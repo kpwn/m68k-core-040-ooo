@@ -486,9 +486,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // A7-ODD halt lane control (bit 0 enable, bits 31:16 threshold); debug reset
       // domain like the masks, so it survives the CPU resets a boot trial issues.
       val a7OddCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
+      val pcRangeCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
+      val pcRangeLo  = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
+      val pcRangeHi  = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
       if (stage >= 5) {
         breakPc.simPublic(); breakPcEnable.simPublic(); breakSkipOnce.simPublic()
         haltExceptionMask.simPublic(); a7OddCtl.simPublic()
+        pcRangeCtl.simPublic(); pcRangeLo.simPublic(); pcRangeHi.simPublic()
         frontendDebug.foreach { matcher =>
           when(matcher.skipConsumed.orR) {
             breakSkipOnce := breakSkipOnce & ~matcher.skipConsumed
@@ -861,6 +865,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               is(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) { rData := haltExceptionMask(i) }
             }
             is(DebugRegMap.OFF_A7ODD_CTL) { rData := a7OddCtl }
+            is(DebugRegMap.OFF_PCRANGE_CTL) { rData := pcRangeCtl }
+            is(DebugRegMap.OFF_PCRANGE_LO)  { rData := pcRangeLo }
+            is(DebugRegMap.OFF_PCRANGE_HI)  { rData := pcRangeHi }
+            is(DebugRegMap.OFF_PCRANGE_PC0) {
+              rData := dbgCommit.map(_.pcRangePc0.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_PCRANGE_PC1) {
+              rData := dbgCommit.map(_.pcRangePc1.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_PCRANGE_PC2) {
+              rData := dbgCommit.map(_.pcRangePc2.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_PCRANGE_COUNT) {
+              rData := dbgCommit.map(s => B(0, 16 bits) ## s.pcRangeCount.asBits)
+                .getOrElse(B(0, 32 bits)) }
             is(DebugRegMap.OFF_A7ODD_PC0) {
               rData := dbgCommit.map(_.a7OddPc0.asBits).getOrElse(B(0, 32 bits)) }
             is(DebugRegMap.OFF_A7ODD_PC1) {
@@ -1076,6 +1092,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             }
             is(DebugRegMap.OFF_A7ODD_CTL) {
               when(wStrb.orR) { a7OddCtl := merged(a7OddCtl).asBits }
+            }
+            is(DebugRegMap.OFF_PCRANGE_CTL) {
+              when(wStrb.orR) { pcRangeCtl := merged(pcRangeCtl).asBits }
+            }
+            is(DebugRegMap.OFF_PCRANGE_LO) {
+              when(wStrb.orR) { pcRangeLo := merged(pcRangeLo).asBits }
+            }
+            is(DebugRegMap.OFF_PCRANGE_HI) {
+              when(wStrb.orR) { pcRangeHi := merged(pcRangeHi).asBits }
             }
           }
           is(DebugRegMap.OFF_HALT_CTL) {
@@ -1298,11 +1323,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         dbgCommit.foreach(_.configureExceptionMask(exceptionMask))
         dbgCommit.foreach(_.configureA7OddHalt(csr.a7OddCtl(0) && !dbgRst,
           csr.a7OddCtl(31 downto 16).asUInt))
+        dbgCommit.foreach(_.configurePcRangeHalt(csr.pcRangeCtl(0) && !dbgRst,
+          csr.pcRangeLo.asUInt, csr.pcRangeHi.asUInt))
         frontendDebug.foreach(_.configure(csr.breakPc, csr.breakPcEnable,
           csr.breakSkipOnce))
       } else {
         dbgCommit.foreach(_.configureExceptionMask(B(0, 256 bits)))
         dbgCommit.foreach(_.configureA7OddHalt(False, U(0, 16 bits)))
+        dbgCommit.foreach(_.configurePcRangeHalt(False, U(0, 32 bits), U(0, 32 bits)))
       }
     }
     if (enable && stage >= 3) {

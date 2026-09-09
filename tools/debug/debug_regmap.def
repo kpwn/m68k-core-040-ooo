@@ -108,6 +108,13 @@ REG OFF_A7ODD_PC1         0x00114 RO    5 0x00000000 A7-ODD lane: newest PC reti
 REG OFF_A7ODD_PC2         0x00118 RO    5 0x00000000 A7-ODD lane: the PC retired before PC1.
 REG OFF_A7ODD_VALUE       0x0011C RO    5 0x00000000 A7-ODD lane: the odd committed A7 at the edge.
 REG OFF_A7ODD_COUNT       0x00120 RO    5 0x00000000 A7-ODD lane: EVEN->ODD edges seen while enabled ([15:0]).
+REG OFF_PCRANGE_CTL       0x00124 RW    5 0x00000000 PC-RANGE halt lane control: bit 0 enable (halt with reason PC_RANGE=6 style via the manual path, reason code A7_ODD is separate).
+REG OFF_PCRANGE_LO        0x00128 RW    5 0x00000000 PC-RANGE lane: inclusive low bound of the trip window.
+REG OFF_PCRANGE_HI        0x0012C RW    5 0x00000000 PC-RANGE lane: inclusive high bound of the trip window.
+REG OFF_PCRANGE_PC0       0x00130 RO    5 0x00000000 PC-RANGE lane: first retired PC inside the window.
+REG OFF_PCRANGE_PC1       0x00134 RO    5 0x00000000 PC-RANGE lane: the PC retired before PC0.
+REG OFF_PCRANGE_PC2       0x00138 RO    5 0x00000000 PC-RANGE lane: the PC retired before PC1.
+REG OFF_PCRANGE_COUNT     0x0013C RO    5 0x00000000 PC-RANGE lane: in-range retirements seen while enabled ([15:0]).
 
 # --------------------------------------------- cache probe and operations --
 REG OFF_DCACHE_PROBE_SEL   0x00200 RW    4 0x00000000 D-cache probe way/set select.
