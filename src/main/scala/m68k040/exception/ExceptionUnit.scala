@@ -175,20 +175,15 @@ class ExceptionUnit(
   val icMaintPulse = Bool(); icMaintPulse := False
 
   // ── exposed D-side translation request (wiring MUXes it onto DTranslationService) ─
-  // LEGACY, I-SIDE-SHAPED, AND UNCONSUMED. `dtReq`/`dtRsp` are `TranslationReq`/
-  // `TranslationRsp` -- the COMBINATIONAL, UNTAGGED I-side bundle family. No DUT in this
-  // project has ever wired them (confirmed: zero references outside this file), and they
-  // are structurally incapable of talking to the real D-side `DTranslationService`, whose
-  // contract is `Stream[DTranslationCmd]`/`Stream[DTranslationRsp]` plus an 8-bit token
-  // to match responses across an elastic pipeline. They are kept only because the
-  // existing frame/vector states drive `dtoVld`/`dtoVpn` into them; the REAL D-side
-  // acquisition Task 11 added for FSAVE/FRESTORE is `dxReq*`/`dxRsp*` below.
-  val dtReq = TranslationReq()
-  val dtRsp = TranslationRsp()
-  dtRsp.ready.allowOverride;     dtRsp.ready := True
-  dtRsp.ppn.allowOverride;       dtRsp.ppn := U(0, 20 bits)
-  dtRsp.cacheMode.allowOverride; dtRsp.cacheMode.assignDontCare()
-  dtRsp.fault.allowOverride;     dtRsp.fault := False
+  // (2026-09-09: the LEGACY, I-side-shaped `dtReq`/`dtRsp` pair that used to sit here is
+  // DELETED. It was a `TranslationReq`/`TranslationRsp` -- the combinational, untagged
+  // I-side bundle family -- structurally incapable of talking to the real D-side
+  // `DTranslationService`, and wired by no DUT in this project. It survived only because
+  // the entry-frame / vector / RTE states still drove `dtoVld`/`dtoVpn` into it while
+  // performing their accesses UNTRANSLATED, which made it look like those states had a
+  // translation story when they did not. Now that all of them go through `dxReq*`/
+  // `dxRsp*` and the shared `X_REQ`/`X_WAIT` stage, the last driver is gone and so is
+  // the port.)
 
   // ── REAL D-side DTLB acquisition (Task 11) ───────────────────────────────────
   // FSAVE's frame stores and FRESTORE's header load were the FIRST exception-sequencer
@@ -871,26 +866,7 @@ class ExceptionUnit(
     ldoCmodeReg := excCacheMode
   }
 
-  val dtoVld = Bool();        dtoVld := False
-  val dtoVpn = UInt(20 bits); dtoVpn := U(0, 20 bits)
-  val dtoWr  = Bool();        dtoWr := False
-  dtReq.valid      := RegNext(dtoVld) init False
-  dtReq.vpn        := RegNext(dtoVpn)
-  dtReq.supervisor := True
-  dtReq.write      := RegNext(dtoWr) init False
 
-  // LEGACY, UNUSED. Presents a store AND drives the `dto*`/`dtReq` port -- which is the
-  // I-side-shaped bundle documented above as structurally unable to talk to the real
-  // D-side `DTranslationService` and wired by no DUT in this project. Every live store
-  // site uses `driveStoreNoXlate` with a PA resolved in `X_REQ`/`F_XREQ` instead. Kept
-  // only so the shape of the abandoned approach stays legible; do not add callers.
-  def driveStore(va: UInt, sz: Size.C, data: Bits): Unit = {
-    dtoVld := True; dtoVpn := va(31 downto 12); dtoWr := True
-    stoVld   := True
-    stoPaddr := va
-    stoSize  := sz
-    stoData  := data.resize(32)
-  }
   // Present one supervisor store at an ALREADY-TRANSLATED physical address. The name is
   // historical and means "does not itself drive a translation request", NOT "needs no
   // translation": callers (E_STORE, F_STORE) resolve the PA in a separate FSM state
@@ -1665,6 +1641,22 @@ class ExceptionUnit(
         // A frame push is a supervisor WRITE: it must be permission-checked as one
         // (write-protect faults) and it must set the page descriptor's M bit, exactly
         // like the `move.l` an ordinary program would use to write the same stack.
+        //
+        // KNOWN, BOUNDED FOLLOW-UP (2026-09-09, opened by this change). A write walk
+        // queues a deferred U/M descriptor write in `DtlbPlugin`'s `UmWriteQueue`,
+        // tagged with `lsEu.xlateRobId` -- which, for a request that came from THIS
+        // unit, is whatever robId the (squashed) LS pipe last held, not a robId with
+        // any relationship to the exception. The entry therefore commits at an
+        // arbitrary time or, more often, is discarded by the next flush, so the M bit
+        // frequently never reaches memory. That is NOT a correctness hole: U/M updates
+        // are monotonic, the ATC entry this walk fills already carries the post-update
+        // `modified`, so no later write to the page re-walks, and Mac OS does not page.
+        // The proper fix is a `preCommitted` flag on `UmWriteAlloc` -- an exception
+        // episode is non-speculative by construction, so its descriptor write should be
+        // born committed and immune to flush -- driven from a new latched
+        // `umAccessPreCommitted` alongside `umAccessRobId`. Deliberately NOT folded into
+        // this change: it touches the DTLB request path and wants its own fail-before
+        // test and synth gate.
         excGoXlate(va, write = true, XRET_E_STORE)
       } otherwise {
         val pa = excPaOf(va)
