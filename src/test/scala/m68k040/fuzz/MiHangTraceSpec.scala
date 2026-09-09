@@ -326,6 +326,18 @@ class MiHangTraceSpec extends AnyFunSuite {
       // (A7/arch-15 was left unseeded, garbage/X-valued) — the actual root cause,
       // confirmed by this fix alone reproducing the real HANG (see memory writeup).
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      // IE only -- deliberately NOT DE. As of 2026-09-09 CACR.IE acquired its FIRST
+      // reader (IcachePlugin), so a bespoke sim that leaves CACR at its reset value
+      // of 0 silently starts running with the INSTRUCTION cache disabled. This poke
+      // restores exactly the posture this test had before that change: I-cache on
+      // (it was unconditionally enabled), D-cache off (DE was already 0).
+      //
+      // DE MUST STAY 0 HERE. These harnesses observe individual AXI frame writes at
+      // their exact word addresses; enabling the D-cache coalesces them into
+      // line-granular writebacks and the instrument reads one line base instead of
+      // four frame words. Setting DE|IE here broke 8 of M1ThrowawayFrameIrqSpec's
+      // tests for exactly that reason.
+      dut.rob.logic.exc.ss.cacr #= 0x00008000L
       dut.rob.logic.exc.ss.usp #= 0L
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15

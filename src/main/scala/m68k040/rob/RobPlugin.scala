@@ -53,11 +53,21 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   // combinationally taps its (later-driven) value.
   private var _supervisor: Bool = null
   override def supervisor: Bool = _supervisor
+  // PrivilegeService's SFC/DFC half: the SAME setup-allocated-wire pattern and the
+  // SAME reason as `_supervisor` above. Consumed by the LS EU, which needs the MOVES
+  // function code on the DTLB request's address-space bit (see PrivilegeService).
+  private var _sourceFc: UInt = null
+  private var _destFc: UInt = null
+  override def sourceFc: UInt = _sourceFc
+  override def destFc: UInt = _destFc
   // CacheControlService: same setup-allocated-wire pattern as PrivilegeService above,
   // for the identical reason (breaks the DcachePlugin <- RobPlugin Fiber dependency
   // cycle). Mirrors ss.cacr(31) combinationally; INERT in P1 (no consumer yet).
   private var _dcacheEnabled: Bool = null
   override def dcacheEnabled: Bool = _dcacheEnabled
+  // CACR bit 15 (IE) -- same wire pattern, same reason. See CacheControlService.
+  private var _icacheEnabled: Bool = null
+  override def icacheEnabled: Bool = _icacheEnabled
   // FrontendQuiesceService: setup-allocated for the same Fiber-cycle reason as
   // PrivilegeService. FetchAlign consumes `next` while ROB build itself depends on
   // rename -> decode -> FetchAlign, so exposing a build-local signal would deadlock
@@ -107,7 +117,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def haltKind:    UInt = _debugHaltKind
   during setup {
     _supervisor             = Bool()
+    _sourceFc               = UInt(3 bits)
+    _destFc                 = UInt(3 bits)
     _dcacheEnabled          = Bool()
+    _icacheEnabled          = Bool()
     _frontendQuiesceActive  = Bool()
     _frontendQuiesceNext    = Bool()
     _debugEffectiveHalt     = Bool()
@@ -2249,7 +2262,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val excActive = exc.active; excActive.simPublic()
     // Drive the forward-declared committed-S (the privilege check gates on it).
     committedS := exc.ss.s
+    // PrivilegeService's SFC/DFC half -- combinational passthrough of the two
+    // committed function-code registers, exactly like `committedS` above.
+    _sourceFc := exc.ss.sfc
+    _destFc   := exc.ss.dfc
     _dcacheEnabled := exc.ss.cacr(31)
+    // CACR bit 15 = IE, the instruction-cache enable (MC68040 UM S6.1). Committed
+    // register, MOVEC-written, serializing -- identical shape to DE above.
+    _icacheEnabled := exc.ss.cacr(15)
     // The commit-time system op's S=1 vs S=0 split (needs exc.ss.s): S=1 supervisor ->
     // drive the S_APPLY FSM (sysTrigger); S=0 user -> a vector-8 privilege fault.
     // EXCEPTION to the "every sysOp is privileged" rule (Task 9): FMOVE to/from a

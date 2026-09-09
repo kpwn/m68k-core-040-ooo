@@ -32,16 +32,51 @@ object DLoadToken {
 
 /** Early VIPT lookup request. `vaddr` selects the page-invariant set in parallel
   * with the DTLB lookup and `token` associates the result with the later command.
-  * `resolved` supports an already-known PA hint. Normally the probe launches with
-  * `resolved=False`; the following tokenized DLoadProbeResolve qualifies the same
-  * synchronous array read when the registered DTLB response arrives. If that
-  * qualification is late, the entry is deliberately unusable and the later command
-  * falls back to the ordinary resolved read path. */
+  * Normally the probe launches with `resolved=False`; the following tokenized
+  * DLoadProbeResolve qualifies the same synchronous array read when the registered
+  * DTLB response arrives. If that qualification is late, the entry is deliberately
+  * unusable and the later command falls back to the ordinary resolved read path.
+  *
+  * ── `resolved` / `paddrHint`: A LOADED GUN. READ THIS BEFORE SETTING EITHER. ────
+  *
+  * Indexing the array early from `vaddr` is CORRECT: the set index lives below the
+  * page offset, so it is identical in the virtual and the physical address. The TAG
+  * IS NOT. `paddrHint` is compared against physical tags (`DcachePlugin`'s
+  * `probeReadTag`), so it MUST be a genuinely TRANSLATED address -- and at the
+  * moment a probe launches, no translation exists yet. That is the entire reason
+  * the early probe exists.
+  *
+  * Until 2026-09-09 this field was named `paddr` and its one IN-CORE producer
+  * assigned it `tCtx.vaddr` -- a VIRTUAL address in a field the cache tags with.
+  * Inert, because that producer also hard-wires `resolved` False and it gates every
+  * consumer (and note the compile-time `earlyViptEnabled` gate ANDs with `resolved`,
+  * so flipping THAT alone is inert too -- both halves have to change). But a trap:
+  * setting `resolved := True` would have silently turned virtual addresses into
+  * physical tag comparisons. Harmless under an identity map; a silent FALSE-HIT
+  * generator under any real one, which is the exact failure class this cache spent
+  * months chasing. The field is now named for what it is, and the in-core producer
+  * supplies NO hint (0) rather than a plausible-looking wrong one, so a future
+  * `resolved := True` there fails loudly instead of quietly.
+  *
+  * `resolved=1` IS a supported, exercised path -- `DcacheSpec`'s VIPT slice-B tests
+  * drive it directly, with an identity paddr -- so it is not dead code to be deleted.
+  * It is guarded instead: `DcachePlugin` asserts in simulation that an early tag,
+  * once a resolve for the same token arrives, equals the genuinely translated one.
+  *
+  * THE SAFE EARLY-HIT PATH ALREADY EXISTS and is the one that actually runs:
+  * `DcachePlugin`'s `probeResolveTagIn` / `probeUsableIfResolved` /
+  * `probeWayMatchResolved`, which tag against the DLoadProbeResolve payload -- a
+  * genuinely translated physical address. Anyone wanting hit determination one cycle
+  * earlier must extend THAT path, not revive this one, and must supply a real
+  * translation here. `DcachePlugin`'s allocation-site assertion says so too.
+  */
 case class DLoadProbe() extends Bundle {
   val vaddr     = UInt(32 bits)
   val token     = UInt(DLoadToken.Width bits)
+  /** Set ONLY if `paddrHint` carries a genuinely TRANSLATED physical address. */
   val resolved  = Bool()
-  val paddr     = UInt(32 bits)
+  /** Meaningless unless `resolved`. MUST be physical -- see the class comment. */
+  val paddrHint = UInt(32 bits)
   val size      = Size()
   val cacheMode = CacheMode()
   val needsLine = Bool()
@@ -79,11 +114,34 @@ case class DLoadCmd() extends Bundle {
   val size      = Size()
   val cacheMode = CacheMode()
   val token     = UInt(DLoadToken.Width bits)
-  /** The requester consumes `DLoadRsp.line` (the raw 128-bit line) and IGNORES
-    * `DLoadRsp.data`. Set by the LS EU for BOTH halves of a cross-line split pair:
-    * slot A is deliberately presented at the ORIGINAL, line-CROSSING offset/size
-    * (it needs that line, not that value), and the pair is merged later by
-    * `DcacheByteLane.extractCross`. Everything else leaves it False.
+  /** THE INVARIANT: this requester consumes NO byte lane at or beyond the end of the
+    * 16-byte line. It is the exemption from the `DcacheByteLane.extract` line-wrap
+    * tripwire, and it is the requester's promise that a wrapped lane, if one is
+    * produced, is discarded rather than used.
+    *
+    * Two producers legitimately satisfy that promise, and BOTH must, because the bit
+    * disables a guard against silent wrong data:
+    *
+    *  1. The LS EU's cross-line split pair. Slot A is deliberately presented at the
+    *     ORIGINAL, line-CROSSING offset/size because it needs that LINE, not that
+    *     value; it consumes `DLoadRsp.line` and ignores `DLoadRsp.data` entirely, and
+    *     the pair is merged later by `DcacheByteLane.extractCross`.
+    *  2. A DIRECTED TEST that drives `loadCmd` straight, bypassing the AGU splitter,
+    *     to prove the cache's own containment -- `MmioLoadSizingSpec`'s D25/D30. Those
+    *     assert which AXI sub-transactions are emitted for a straddling INHIBITED
+    *     access; D25 reads no data at all, and D30 CLAMPS its comparison to the bytes
+    *     inside the line (`got >> 8*(n - clampedN)` shifts every wrapped lane out). So
+    *     neither consumes a wrapped lane. They set it ONLY for the shapes that
+    *     actually straddle (`off + n > 16`); the non-straddling shapes in the same
+    *     loop leave it False so the tripwire still guards them.
+    *
+    * Everything else leaves it False. Setting it where a wrapped lane IS consumed
+    * silently reintroduces exactly the bug the tripwire exists to catch.
+    *
+    * NOT a licence to drive straddling commands from the core. The LS EU's
+    * `s1CrossLine` predicate is address/size only and is NOT conditioned on cache
+    * mode, so every line-crossing data access -- INHIBITED device reads included --
+    * is split into two commands before `DcachePlugin` sees either half.
     *
     * It exists to make the `DcacheByteLane.extract` line-wrap tripwire precise: that
     * assertion (see `extract` below) fires on a multi-byte extract whose bytes run

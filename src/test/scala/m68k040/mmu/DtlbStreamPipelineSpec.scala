@@ -169,20 +169,50 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
              rsp.payload.ppn.toLong == wpPpn && rsp.payload.fault.toBoolean,
              "resident WP write must fault with B's token")
 
-      // Repeat accept-last across a supervisor-only page: user hit faults, then a
-      // supervisor hit succeeds. Both are resident and must issue no walker reads.
-      req.valid #= true
-      req.payload.vpn #= vpnOf(supVa)
-      req.payload.token #= 0x23
-      req.payload.write #= false
-      req.payload.supervisor #= false
-      cd.waitSampling()
-      req.valid #= false
-      sleep(1)
-      assert(rsp.valid.toBoolean && rsp.payload.token.toInt == 0x23 &&
-             rsp.payload.ppn.toLong == supPpn && rsp.payload.fault.toBoolean,
-             "resident supervisor page must fault for user token")
+      // Now the same page in the OTHER ADDRESS SPACE. `supVa`'s only ATC entry was
+      // filled by the supervisor warm-up above, and as of 2026-09-09 the ATC tags FC2
+      // (Tlb.tagSup), so a USER request for that VPN MISSES and walks.
+      //
+      // THIS TEST USED TO ASSERT THE OPPOSITE -- that the user request hit the
+      // resident supervisor entry and faulted off its `supervisor` attribute with no
+      // walk at all. That expectation was unsound, and not merely a timing detail:
+      // the 68040 has SEPARATE user and supervisor root pointers, so one logical
+      // address legitimately translates to DIFFERENT pages in the two spaces. An ATC
+      // that answers a user request out of a supervisor-filled entry is not
+      // "conservatively faulting", it is answering from the wrong tree -- and had URP
+      // here mapped `supVa` to a valid user page, the architecturally correct answer
+      // would have been a successful translation, not a fault. Answering without
+      // walking is only sound if the two spaces share a tree, which is exactly the
+      // assumption the FC2 tag removes.
+      //
+      // The ARCHITECTURAL outcome is unchanged and is still asserted in full: this
+      // DUT sets URP = SRP = ROOT, so the user walk reaches the same descriptor,
+      // finds its S bit set and faults. What changed is that reaching that verdict
+      // now costs a table search, which is asserted explicitly below rather than
+      // being left implicit.
+      // B's response is STILL occupying the one-entry slot at this point (the block
+      // above asserted it is there but never retired it -- it relied on accept-last
+      // handing the slot straight to the next resident HIT). The user request below
+      // is now a MISS, so its answer arrives cycles later; without draining B first,
+      // `consumeRsp` would sample B's answer and report it as the user request's.
+      rsp.ready #= true
+      var drain = 0
+      while (rsp.valid.toBoolean && drain < 20) { cd.waitSampling(); sleep(1); drain += 1 }
+      assert(!rsp.valid.toBoolean, "B's held response never retired")
 
+      val beforeUserWalk = arCount
+      driveReq(dut, cd, vpnOf(supVa), 0x23, write = false, supervisor = false)
+      assert(consumeRsp(dut, cd) == ((0x23, supPpn, true)),
+        "a USER request for a supervisor-only page must fault (via a user-tree walk)")
+      assert(arCount > beforeUserWalk,
+        s"the user-space request MUST have walked -- its address space has no resident " +
+          s"entry (ARs $beforeUserWalk -> $arCount). A hit here would mean the ATC " +
+          "answered a user access out of the supervisor tree.")
+
+      // ...and the supervisor entry must have SURVIVED that: a same-VPN fill in the
+      // other space allocates beside it, it does not replace it. So the supervisor
+      // request is still a resident hit and issues no walker read.
+      val afterUserWalk = arCount
       req.valid #= true
       req.payload.vpn #= vpnOf(supVa)
       req.payload.token #= 0x24
@@ -196,8 +226,9 @@ class DtlbStreamPipelineSpec extends AnyFunSuite {
              "resident supervisor page must pass for supervisor token")
       cd.waitSampling()
 
-      assert(arCount == warmArCount,
-        s"timed resident permission hits unexpectedly walked: $warmArCount -> $arCount")
+      assert(arCount == afterUserWalk,
+        s"the SUPERVISOR resident hit unexpectedly walked: $afterUserWalk -> $arCount " +
+          "-- its entry did not survive the user-space fill beside it")
     }
   }
 }

@@ -61,7 +61,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     loadProbePort.payload.vaddr.allowOverride; loadProbePort.payload.vaddr := U(0, 32 bits)
     loadProbePort.payload.token.allowOverride; loadProbePort.payload.token := U(0, DLoadToken.Width bits)
     loadProbePort.payload.resolved.allowOverride; loadProbePort.payload.resolved := False
-    loadProbePort.payload.paddr.allowOverride; loadProbePort.payload.paddr := U(0, 32 bits)
+    loadProbePort.payload.paddrHint.allowOverride; loadProbePort.payload.paddrHint := U(0, 32 bits)
     loadProbePort.payload.size.allowOverride; loadProbePort.payload.size := Size.LONG
     loadProbePort.payload.cacheMode.allowOverride
     loadProbePort.payload.cacheMode := CacheMode.INHIBITED
@@ -602,7 +602,37 @@ class DcachePlugin(val socketMerged: Boolean = false,
       probeReadHitVec(w) := Mux(probeResolveMatchesRead,
                                 probeUsableIfResolved && probeWayMatchResolved(w),
                                 probeReadUsable       && probeWayMatchRead(w))
+    // ── TRIPWIRE: an EARLY physical tag must equal the REAL one ──────────────────
+    //
+    // `probeReadTag` comes from the probe's `paddrHint`, which a producer may only
+    // supply alongside `resolved` (`probeReadUsable`). `probeResolveTagIn` is the
+    // GENUINELY TRANSLATED address, arriving later on the resolve port for the same
+    // token. When both exist for one probe they must agree; if they do not, someone
+    // is feeding this an address that has not been through the DTLB, and the early
+    // hit determination in the `!probeResolveMatchesRead` arm above is deciding hits
+    // by comparing a VIRTUAL address against PHYSICAL tags.
+    //
+    // That was a live risk until 2026-09-09: the field was named `paddr` and the LS
+    // EU pre-filled it with `tCtx.vaddr`, so setting `resolved := True` read as a
+    // one-line optimisation. Inert then (the LS EU hard-wires `resolved` False, and
+    // the compile-time `earlyViptEnabled` gate ANDs with it, so flipping THAT alone
+    // is inert too) -- but harmless only under an identity map, and a silent
+    // false-hit generator under any real one, which is the exact failure class this
+    // cache has spent months chasing. `DcacheSpec`'s VIPT slice-B tests DO exercise
+    // `resolved=1`, with an identity paddr, so this is not dead: it is the check
+    // that keeps those tests honest the day an address stops being identity.
+    //
+    // Deliberately an assertion and not a gate: a comment is what protected this
+    // before, and a comment is what failed.
     GenerationFlags.simulation {
+      when(probeResolveMatchesRead && probeReadUsable) {
+        assert(probeReadTag === probeResolveTagIn,
+          "DcachePlugin: an early VIPT probe claimed resolved=1 but its paddrHint tag " +
+            "does not match the TRANSLATED address that later arrived on the resolve " +
+            "port -- a virtual address is being compared against physical tags. See " +
+            "DcacheTypes.DLoadProbe.",
+          FAILURE)
+      }
       val probeResolvedTagRef = Mux(probeResolveMatchesRead, probeResolveTagIn, probeReadTag)
       val probeResolvedUsableRef = probeReadUsable ||
         (probeResolveMatchesRead && !probeReadNeedsLine &&
@@ -1535,7 +1565,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             probeReadValid  := True
             probeReadSlot   := earlyProbeAllocIdx
             probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-            probeReadTag    := loadProbePort.payload.paddr(31 downto offBits + setBits)
+            probeReadTag    := loadProbePort.payload.paddrHint(31 downto offBits + setBits)
             probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
             probeReadSize   := loadProbePort.payload.size
             probeReadUsable := (if (earlyViptEnabled) {

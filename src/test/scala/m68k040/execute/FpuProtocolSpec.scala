@@ -180,7 +180,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       uop.isScc := False; uop.isDbcc := False
       uop.firstOfInstr := True
       uop.indexLong := False; uop.indexScale := 0
-      uop.leaAddr := False; uop.movesAliasStore := False
+      uop.leaAddr := False; uop.movesAliasStore := False; uop.altAddrSpace := False
       uop.fromCcr := False; uop.fromSr := False; uop.needsSupervisor := False
       uop.keepCommit := False
       uop.sysOp := False; uop.sysKind := SysKind.NONE; uop.sysReadDir := False

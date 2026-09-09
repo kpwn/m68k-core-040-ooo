@@ -24,13 +24,25 @@ import org.scalatest.funsuite.AnyFunSuite
   * own sim-poke discipline. */
 class CacheControlStubPlugin extends FiberPlugin with CacheControlService {
   var _dcacheEnabled: Bool = null
+  var _icacheEnabled: Bool = null
   override def dcacheEnabled: Bool = _dcacheEnabled
+  override def icacheEnabled: Bool = _icacheEnabled
   val logic = during build new Area {
     // Sim-poked control register (held; the sim pokes it). Self-assign so it has a
     // driver (no UNASSIGNED REGISTER), mirroring DFaultingTranslationPlugin's
     // established pattern for this exact situation.
     val dcacheEnabled = RegInit(False); dcacheEnabled.simPublic(); dcacheEnabled := dcacheEnabled
     _dcacheEnabled = dcacheEnabled
+    // CACR.IE (2026-09-09): the service acquired the I-side enable. There is no
+    // IcachePlugin in this LS-only DUT, so nothing reads it; it is a poke-able
+    // register of the same shape rather than a constant so this stub cannot drift
+    // into disagreeing with the real producer if an I-cache is ever added here.
+    // Defaults TRUE, matching IcachePlugin's own no-service fallback (and hence the
+    // behaviour every I-cache test had before IE acquired a reader) rather than
+    // CACR's architectural reset, because this bit's absence, not its reset value,
+    // is what this stub is standing in for.
+    val icacheEnabled = RegInit(True); icacheEnabled.simPublic(); icacheEnabled := icacheEnabled
+    _icacheEnabled = icacheEnabled
   }
 }
 

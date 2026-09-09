@@ -142,7 +142,38 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // set/bank exactly like a real duplicate lookup would). The walker's own PGI
     // computation (TableWalker's RD_PTR state) never reads vpn(0) in 8K mode either,
     // so masking it before `missReqReg.vpn` costs nothing there.
-    def tlbKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
+    //
+    // 2026-09-09 CAPACITY FIX -- THE MASK HALVED THE ATC. `Tlb.bankOf(vpn)` is
+    // `vpn(0)` (32 entries = 2 banks x 4 ways x 4 sets, so bank = key[0], set =
+    // key[2:1], tag = key[19:3]). Forcing key[0] to a CONSTANT ZERO in 8 KB mode
+    // therefore made `bankOf` constant 0: BANK 1 WAS NEVER LOOKED UP AND NEVER
+    // FILLED, so the ATC held 16 of its 32 entries whenever TCR.P=1. Not a
+    // correctness bug (the masked key is still injective over the meaningful VPN
+    // bits, so nothing mistranslates) but a pure, silent halving of capacity -- and
+    // the board runs 8 KB pages with NEITHER TTR covering main memory, so every RAM
+    // and ROM access walks the tables and pays for it.
+    //
+    // SHIFT instead of MASK. `vpn(19 downto 1)` zero-extended to 20 bits is still
+    // injective -- two VAs name the same 8 KB page exactly when they agree in
+    // vpn[19:1] (vpn(0) = VA[12] is an in-page offset bit at 8 KB), so distinct
+    // pages keep distinct keys -- but now bank = vpn(1), set = vpn(3:2) and tag =
+    // {0, vpn[19:4]}. 19 meaningful bits over 1 bank bit + 2 set bits + 16 live tag
+    // bits: all 32 entries reachable, no aliasing. The top tag bit is a constant 0
+    // (8 wasted flops per TLB); the alternative -- narrowing the tag in 8 KB mode --
+    // would need a mode-dependent tag width, which the array cannot have.
+    def tlbKeyOf(vpn: UInt, p8K: Bool): UInt = Mux(p8K, vpn(19 downto 1).resize(20), vpn)
+    def tlbKey(vpn: UInt): UInt = tlbKeyOf(vpn, is8K)
+
+    // ...AND WHY THAT IS NOT A ONE-LINE CHANGE. `missReqReg.vpn` is NOT a TLB key:
+    // it is ALSO `walker.io.req.vpn`, and `TableWalker` slices it into the three
+    // table indices (root = vpn[19:13], pointer = vpn[12:6], page = vpn[5:1] at
+    // 8 KB). Feeding the SHIFTED key there would index every level of every table
+    // search one bit off -- silent, total mistranslation. The walk keeps the MASKED
+    // form (identical to the pre-fix key: bit 0 is not read by the walker in 8 KB
+    // mode, so zeroing it costs nothing) and the TLB key is re-derived at the fill.
+    // `tlbKey(walkKey(v)) === tlbKey(v)` because the mask only clears the one bit
+    // the shift discards.
+    def walkKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
 
     // ---- DTT0/DTT1 transparent-translation match (task #194) ----
     // A hit bypasses the walker/TLB entirely: PA=VA, no fault, no page table
@@ -179,6 +210,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := tlbKey(_req.payload.vpn)
+    // FC2 completes the ATC tag (MC68040 UM S3.3). `_req.payload.supervisor` is the
+    // ACCESS's address space -- for MOVES that is SFC/DFC bit 2, not the current
+    // privilege level -- so a user-space and a supervisor-space translation of one
+    // virtual page coexist instead of overwriting each other's answer.
+    tlb.io.lookupSup := _req.payload.supervisor
     tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
@@ -300,7 +336,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         rspVpn               := _req.payload.vpn
       } otherwise {
         missReqReg.valid := True
-        missReqReg.vpn   := tlbKey(_req.payload.vpn)
+        missReqReg.vpn   := walkKey(_req.payload.vpn)
         missReqReg.write := _req.payload.write
         missReqReg.sup   := _req.payload.supervisor
         missReqReg.is8K  := is8K
@@ -343,10 +379,16 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
     // so the fill/result target the right VPN even if a later command changes it.
     val walkVpn = Reg(UInt(20 bits))
+    // The page size this walk was LAUNCHED under (see the fill below).
+    val walkIs8K = Reg(Bool())
+    // ...and the address space it was launched in (the ATC's FC2 tag bit).
+    val walkSup  = Reg(Bool())
     val walkToken = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
     val walkRobId = Reg(UInt(6 bits))   // robId of the access that triggered the walk
     when(walker.io.start) {
       walkVpn   := missReqReg.vpn
+      walkIs8K  := missReqReg.is8K
+      walkSup   := missReqReg.sup
       walkToken := missReqReg.token
       walkRobId := missReqReg.robId
     }
@@ -363,7 +405,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // write access itself triggered (the walker always sets M on a write).
     fe.modified   := walker.io.rsp.modified
     tlb.io.fillValid := False
-    tlb.io.fillVpn   := walkVpn
+    // `walkVpn` is the WALK key (see `walkKey`); the array is indexed by the TLB key.
+    // Keyed off the walk's OWN latched page size, not the live TCR.P, so a TCR
+    // rewrite while a walk is in flight cannot file the result under a key the
+    // lookup that requested it would never form -- the pre-fix code had this
+    // property for free (the key was computed once, at capture) and it is kept.
+    tlb.io.fillVpn   := tlbKeyOf(walkVpn, walkIs8K)
+    // Filled under the address space the WALK ran in (it chose URP vs SRP with this
+    // very bit), latched at launch alongside the VPN for the same reason.
+    tlb.io.fillSup   := walkSup
     tlb.io.fillEntry := fe
     when(walker.io.done) {
       missPending := False

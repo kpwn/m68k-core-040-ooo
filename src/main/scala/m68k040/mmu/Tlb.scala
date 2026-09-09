@@ -76,11 +76,14 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
 
   val io = new Bundle {
     val lookupVpn = in UInt (Tlb.VpnBits bits)
+    // FC2 -- the address-space half of the tag. See `tagSup` below.
+    val lookupSup = in Bool ()
     val hit       = out Bool ()
     val hitEntry  = out(TlbEntry())
 
     val fillValid = in Bool ()
     val fillVpn   = in UInt (Tlb.VpnBits bits)
+    val fillSup   = in Bool ()
     val fillEntry = in(TlbEntry())
 
     val invalidateAll = in Bool ()
@@ -99,10 +102,40 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val wProt   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   val sup     = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   val cmode   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(CacheMode.WRITETHROUGH))))
+  // ---- FC2: THE ADDRESS-SPACE HALF OF THE TAG (2026-09-09) --------------------
+  // NOT the same thing as `sup` above, and the distinction is the whole point:
+  //   * `sup`   is the PAGE's supervisor-only PROTECTION attribute, read out of the
+  //             leaf descriptor and returned as DATA (`hitEntry.supervisor`), which
+  //             the owning plugin then checks the access against.
+  //   * `tagSup` is the FUNCTION CODE the entry was FILLED under, and it is
+  //             COMPARED. It is part of the tag, exactly as on real silicon: the
+  //             MC68040's ATC tag is {V, logical address A31-A12, FC2} (UM S3.3).
+  //
+  // Without it the ATC cannot hold a user-space and a supervisor-space translation
+  // of the SAME virtual page at once -- the first one filled answers both -- and
+  // those two translations are genuinely different objects whenever URP =/= SRP,
+  // because the two roots index independent table trees. That was a latent bug for
+  // any URP =/= SRP configuration with user code running (the live board has exactly
+  // that: SRP = 0x03FFFA00, URP = 0), and it became a BLOCKING one the moment MOVES
+  // started honouring SFC/DFC: supervisor code can now issue a user-space access and
+  // an ordinary supervisor access to one address in consecutive instructions, and
+  // with a VPN-only tag the second silently inherits the first one's PPN.
+  //
+  // COST ON THE LOOKUP PATH: one extra input to an equality that already reduces
+  // `tagBits` (17) bits. It widens an existing comparator by one bit; it adds no
+  // level to the way-mux, no second lookup and no CAM entry.
+  val tagSup  = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   // Task #210: per-entry M-bit shadow (see TlbEntry doc).
   val modif   = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
   // round-robin victim per (bank,set)
   val victim  = Vec.fill(banks)(Vec.fill(nSets)(RegInit(U(0, wayBits bits))))
+  // Sim-only: expose the valid bits so a test can COUNT occupancy per bank. Added
+  // for the 8 KB-page capacity fix (`DtlbPlugin.tlbKey`), whose whole claim is
+  // "bank 1 is never used" -- a claim only an occupancy census can settle. These are
+  // already registers with real consumers, so `simPublic` adds nothing to a netlist.
+  valids.foreach(_.foreach(_.foreach(_.simPublic())))
+  tags.foreach(_.foreach(_.foreach(_.simPublic())))
+  tagSup.foreach(_.foreach(_.foreach(_.simPublic())))
 
   // ---- combinational lookup ----
   val lkBank = bankOf(io.lookupVpn)
@@ -115,7 +148,7 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   for (w <- 0 until ways) {
     val v = valids(lkBank)(w)(lkSet)
     val t = tags(lkBank)(w)(lkSet)
-    hitVec(w) := v && (t === lkTag)
+    hitVec(w) := v && (t === lkTag) && (tagSup(lkBank)(w)(lkSet) === io.lookupSup)
     val e = TlbEntry()
     e.vpnTag     := t
     e.ppn        := ppns(lkBank)(w)(lkSet)
@@ -158,7 +191,12 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val flTag  = tagOf(io.fillVpn)
   val flResidentVec = Vec(Bool(), ways)
   for (w <- 0 until ways) {
-    flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag)
+    // The residency test MUST use the SAME key the lookup does, FC2 included. If it
+    // did not, a user-space fill would REPLACE the supervisor-space entry for the
+    // same VPN (and vice versa) instead of allocating beside it -- which would undo
+    // the tag bit above for the exact interleaving it exists to serve.
+    flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag) &&
+                        (tagSup(flBank)(w)(flSet) === io.fillSup)
   }
   val flResident = flResidentVec.orR
   // `OHMasking.first` rather than a bare `OHToUInt`: a PRIORITY pick is well-defined
@@ -173,6 +211,7 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
       when(bankMatch && (flWay === U(w, wayBits bits))) {
         valids(b)(w)(flSet) := True
         tags(b)(w)(flSet)   := flTag
+        tagSup(b)(w)(flSet) := io.fillSup
         ppns(b)(w)(flSet)   := io.fillEntry.ppn
         wProt(b)(w)(flSet)  := io.fillEntry.writeProt
         sup(b)(w)(flSet)    := io.fillEntry.supervisor

@@ -138,6 +138,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // wired defaults to False (user), exactly the prior hardcoded behavior — unchanged
     // for every existing non-full-core test.
     val privCtrl = host.get[PrivilegeService]
+    // ── CACR.IE (bit 15): THE INSTRUCTION-CACHE ENABLE ────────────────────────────
+    // Until 2026-09-09 this bit had NO reader anywhere in the core -- `cacr(31)`/DE
+    // was consumed in four places, `cacr(15)`/IE in none -- so the I-cache was
+    // unconditionally enabled and could not be turned off. That is a real divergence
+    // from a 68040 (and from the v1 core that boots this machine): software that
+    // clears IE and relies on that INSTEAD of an explicit CINV goes on executing
+    // stale instruction bytes, which is silent wrong CODE with no fault anywhere. It
+    // also denies the boot campaign the I-side half of a bisection tool it already
+    // has on the D side via DE.
+    //
+    // Same optional-`host.get` pattern as `privCtrl` above: a standalone I-cache DUT
+    // with no RobPlugin wired defaults to TRUE (enabled), which is exactly the prior
+    // unconditional behaviour -- unchanged for every existing directed I-cache test.
+    val cacheCtrl = host.get[m68k040.services.CacheControlService]
+    val icacheEnabled = cacheCtrl.map(_.icacheEnabled).getOrElse(True)
     // Task #195: TCR.P (8KB pages) — same optional-host pattern as `privCtrl` above.
     // A standalone I-cache DUT with no MmuControlPlugin wired defaults to False (4K
     // pages, the pre-#195 behavior, unchanged).
@@ -255,7 +270,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
       (xlate.rsp.ppn ## lookupPc(11 downto 0)).asUInt)
     val lookupFault     = xlate.rsp.fault
     val lookupCmode     = xlate.rsp.cacheMode
-    val lookupCacheable = lookupCmode =/= CacheMode.INHIBITED
+    // The PAGE's own cacheability, from the ITLB/TTR verdict alone. Kept separate
+    // from `lookupCacheable` below because the two feed DIFFERENT decisions: this one
+    // says "this is a DEVICE", the other says "this fetch may use the array".
+    val lookupPageCacheable = lookupCmode =/= CacheMode.INHIBITED
+    // ...and this is the effective verdict every array/allocate/prefetch decision
+    // reads. CACR.IE=0 turns the whole cache off: it must not HIT (a resident line
+    // would serve exactly the stale bytes IE exists to escape) and it must not
+    // ALLOCATE. Both fall straight out of routing IE through the pre-existing,
+    // already-tested no-allocate path -- `s0Cacheable := lookupCacheable` feeds
+    // `s1Hit` (which ANDs `s0Cacheable`), `missCacheable` (which gates `doAllocate`)
+    // and `s0FromMiss` (the direct-from-MSHR delivery for a non-allocated miss) --
+    // rather than by inventing a second disable mechanism next to it.
+    val lookupCacheable = lookupPageCacheable && icacheEnabled
 
     // ══ SPECULATIVE ACCESS TO CACHE-INHIBITED (DEVICE) SPACE — THE I-SIDE GATE ═══
     // MC68040 UM §3.1.2/§4: a cache-inhibited page denotes a DEVICE. A device READ has
@@ -303,7 +330,17 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // test that fetches an inhibited line.
     nonSpecFetch := True
     nonSpecFetch.simPublic()
-    val inhibitedSpecBlock = !lookupCacheable && !nonSpecFetch
+    // DELIBERATELY keyed on `lookupPageCacheable`, NOT on `lookupCacheable`. This gate
+    // exists because a CACHE-INHIBITED PAGE IS A DEVICE and a device read may not be
+    // performed speculatively; it refuses the command until the machine is drained
+    // (`nonSpecFetch := drainedQ && ringCount === 0`, SpeculativeFetchGate). CACR.IE=0
+    // says nothing about what the page IS -- ordinary RAM stays ordinary RAM, it just
+    // may not be cached -- and folding IE in here would declare EVERY fetch a device
+    // access, so the frontend could only fetch with the pipeline empty. That is not a
+    // slowdown, it is a livelock: the drain condition can never be met by a machine
+    // that needs the fetch to make progress. IE belongs on the ARRAY decisions above
+    // and nowhere near this one.
+    val inhibitedSpecBlock = !lookupPageCacheable && !nonSpecFetch
     inhibitedSpecBlock.simPublic()
 
     // ---- install-context latches (M2c: NOT part of the MSHR control file) ----
@@ -1340,7 +1377,13 @@ class IcachePlugin extends FiberPlugin with FetchService {
     val pfFreeIdx = OHToUInt(OHMasking.first(pfFreeVec.asBits))
     val pfFreeMshr = (pfFreeIdx.resize(mshrIdxBits) +
                       U(AxiIds.I_SPEC_BASE, mshrIdxBits bits)).resize(mshrIdxBits)
-    val pfWindowHasCandidate = pfSeqValid && prefetchEnable &&
+    // `icacheEnabled`: with the cache off there is nothing to prefetch INTO -- a
+    // speculative fill would allocate a line the demand path is forbidden to hit,
+    // burning bus bandwidth to poison the array for whenever IE goes back on.
+    // `s0KillsWindowQ` (which already carries `!s0Cacheable`) closes the window on
+    // every accepted fetch anyway; this states the invariant at the source rather
+    // than relying on that timing.
+    val pfWindowHasCandidate = pfSeqValid && prefetchEnable && icacheEnabled &&
       (pfNextPa <= pfLimitPa) && (pfNextPa(31 downto 12) === pfDemandLine(31 downto 12))
 
     // A held demand matching any live speculative line must re-look-up after install;
