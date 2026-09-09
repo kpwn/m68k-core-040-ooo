@@ -120,9 +120,26 @@ class DcacheClientMemAgent(cmdP: Stream[DLoadCmd], rspP: Flow[DLoadRsp],
     v
   }
 
+  /** EXACTLY what `DcacheByteLane.extract` computes, wrap included.
+    *
+    * The real D-cache serves a load out of the ONE 16-byte line that contains `addr`,
+    * indexing it with a 4-BIT line offset -- so a WORD at line offset 15, or a LONG at
+    * 13/14/15, takes its trailing bytes from the line's own HEAD instead of from the
+    * next line. This agent used to read the flat byte array (`mem.read(addr + i)`), which
+    * silently DID cross the boundary and therefore could never reproduce that wrap: a
+    * walker or exception sequencer presenting a straddling access looked correct here and
+    * wrong only on real hardware. That blindness is the same shape as the D-cache-side
+    * defects it is meant to model, so the model is corrected rather than the check
+    * relaxed. Non-straddling accesses (every access any passing test made before) are
+    * bit-for-bit unchanged.
+    *
+    * A requester that legitimately wants the raw line sets `DLoadCmd.lineOnly` and reads
+    * `DLoadRsp.line`, which this agent still fills from flat memory. */
   private def readBE(addr: Long, nbytes: Int): BigInt = {
+    val lineBase = addr & ~0xfL
+    val off      = (addr & 0xfL).toInt
     var v = BigInt(0)
-    for (i <- 0 until nbytes) v = (v << 8) | BigInt(mem.read(addr + i).toInt & 0xff)
+    for (i <- 0 until nbytes) v = (v << 8) | BigInt(mem.read(lineBase + ((off + i) & 0xf)).toInt & 0xff)
     v
   }
 

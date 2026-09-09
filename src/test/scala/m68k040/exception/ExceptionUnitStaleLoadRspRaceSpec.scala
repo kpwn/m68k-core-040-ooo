@@ -114,6 +114,8 @@ class ExceptionUnitStaleLoadRspRaceSpec extends AnyFunSuite {
       dc.loadCmd.payload.cacheMode := Mux(injValid, injCmode, exc.dcLoadCmd.payload.cacheMode)
       dc.loadCmd.payload.token     := Mux(injValid,
         U(0x40, DLoadToken.Width bits), exc.dcLoadCmd.payload.token)
+      // Neither requester here reads the raw line (see `DLoadCmd.lineOnly`).
+      dc.loadCmd.payload.lineOnly  := False
       injReady            := dc.loadCmd.ready && injValid
       exc.dcLoadCmd.ready := dc.loadCmd.ready && !injValid
 

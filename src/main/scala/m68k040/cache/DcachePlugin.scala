@@ -294,6 +294,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val probeLineLine  = Reg(Bits(128 bits))
     val probeLineOff   = Reg(UInt(offBits bits))
     val probeLineSize  = Reg(Size())
+    // 2026-09-09 line-wrap tripwire: `needsLine` carried one stage further, purely so
+    // the `DcacheByteLane.extract` assertion below can exempt a split pair's slot A
+    // (which is presented at the ORIGINAL crossing offset/size and consumes only the
+    // raw line). See `DLoadCmd.lineOnly`.
+    val probeLineNeedsLine = RegInit(False)
 
     val earlyProbeValid = earlyProbeValids.asBits.orR
     val earlyProbeFresh = (earlyProbeValids.asBits & earlyProbeReadies.asBits).orR
@@ -313,6 +318,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
     val missSize  = Reg(Size())
+    // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`): does the requester of
+    // the access that missed consume `data`, or only the raw `line`?
+    val missLineOnly = RegInit(False)
     // D6/D25/D30: the INHIBITED sub-transaction sequencer's cursor and its CLAMPED end.
     // Both are LINE-RELATIVE, so `subP`'s low bits are the emitted address's low bits and
     // the natural-alignment test needs no separate address arithmetic (spec 3.4).
@@ -491,6 +499,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS1Tag   = Reg(UInt(tagBits bits))
     val ldS1Off   = Reg(UInt(offBits bits))
     val ldS1Size  = Reg(Size())
+    // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`).
+    val ldS1LineOnly = RegInit(False)
     // Task P1.4: the cacheability of the access that launched this S1 read. Gates
     // the hit vector below — an INHIBITED (MMIO) access must never observe a
     // stale resident alias left over from when the same physical line was
@@ -630,12 +640,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
       probeLineLine := MuxOH(probeReadHitVec, rdData)
       probeLineOff  := probeReadOff
       probeLineSize := probeReadSize
+      probeLineNeedsLine := probeReadNeedsLine
     }
     when(probeLineValid && earlyProbeValids(probeLineSlot)) {
       earlyProbeReadies(probeLineSlot) := True
       earlyProbeHits(probeLineSlot)    := probeLineHit
       earlyProbeData(probeLineSlot)    := DcacheByteLane.extract(
-        probeLineLine, probeLineOff, probeLineSize)
+        probeLineLine, probeLineOff, probeLineSize, !probeLineNeedsLine)
     }
 
     // Match the later resolved command by both token and VA. A token-present but
@@ -878,6 +889,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2Line  = Reg(Bits(128 bits))
     val ldS2Off   = Reg(UInt(offBits bits))
     val ldS2Size  = Reg(Size())
+    // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`).
+    val ldS2LineOnly = RegInit(False)
     val ldS2Direct = RegInit(False)
     val ldS2DirectData = Reg(Bits(32 bits))
     ldS2Valid := ldS1Valid
@@ -885,15 +898,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     ldS2Line  := ldS1Line
     ldS2Off   := ldS1Off
     ldS2Size  := ldS1Size
+    ldS2LineOnly := ldS1LineOnly
     ldS2Direct := False
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
     loadRspPort.valid         := ldS2Resp || busFaultResp || inhibitedResp
     loadRspPort.payload.data  := Mux(inhibitedResp,
-                                      DcacheByteLane.extract(missLine, missOff, missSize),
+                                      DcacheByteLane.extract(missLine, missOff, missSize,
+                                                             inhibitedResp && !missLineOnly),
                                       Mux(ldS2Direct, ldS2DirectData,
-                                          DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size)))
+                                          DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size,
+                                                                 ldS2Resp && !ldS2Direct && !ldS2LineOnly)))
     loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS2Line)
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
@@ -1572,6 +1588,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Tag      := loadShadowCmd.paddr(31 downto offBits + setBits)
           ldS1Off      := loadShadowCmd.vaddr(offBits - 1 downto 0)
           ldS1Size     := loadShadowCmd.size
+          ldS1LineOnly := loadShadowCmd.lineOnly
           ldS1Cmode    := loadShadowCmd.cacheMode
           ldS1Paddr    := loadShadowCmd.paddr
           loadShadowValid := False
@@ -1604,6 +1621,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Tag      := cmdTag
           ldS1Off      := cmdOff
           ldS1Size     := loadCmdPort.payload.size
+          ldS1LineOnly := loadCmdPort.payload.lineOnly
           ldS1Cmode    := loadCmdPort.payload.cacheMode
           // Translation faults are consumed before a command is emitted. The only
           // fault generated by the cache itself is a physical AXI refill error,
@@ -1623,6 +1641,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
+          missLineOnly := ldS1LineOnly
           missCmode := ldS1Cmode
           // D25's clamp, applied where the range ENTERS the sequencer rather than where it
           // is consumed: `end = min(off + n, 16)`. The incoming range is NOT already
@@ -1745,6 +1764,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missTag   := pTag
           missOff   := pendingStorePaddr(offBits - 1 downto 0)
           missSize  := Size.LONG
+          // A store-miss refill's response data is never consumed as a value.
+          missLineOnly := True
           missCmode := CacheMode.COPYBACK
           // Task P4.3 Finding 1 fix: use the victim way/dirty/tag/line LOCKED at
           // store-S2 time (`pendingVictim*`) instead of re-deriving live here —
@@ -2072,6 +2093,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Tag      := missTag
           ldS1Off      := missOff
           ldS1Size     := missSize
+          ldS1LineOnly := missLineOnly
           ldS1Cmode    := missCmode
           ldS1Paddr    := missPaddr
           loadMissStoreBarrier := False
