@@ -483,9 +483,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val breakSkipOnce = if (stage >= 5) Reg(Bits(4 bits)) init 0 else B(0, 4 bits)
       val haltExceptionMask = if (stage >= 5)
         Vec.fill(8)(Reg(Bits(32 bits)) init 0) else null
+      // A7-ODD halt lane control (bit 0 enable, bits 31:16 threshold); debug reset
+      // domain like the masks, so it survives the CPU resets a boot trial issues.
+      val a7OddCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
       if (stage >= 5) {
         breakPc.simPublic(); breakPcEnable.simPublic(); breakSkipOnce.simPublic()
-        haltExceptionMask.simPublic()
+        haltExceptionMask.simPublic(); a7OddCtl.simPublic()
         frontendDebug.foreach { matcher =>
           when(matcher.skipConsumed.orR) {
             breakSkipOnce := breakSkipOnce & ~matcher.skipConsumed
@@ -857,6 +860,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             for (i <- 0 until 8) {
               is(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) { rData := haltExceptionMask(i) }
             }
+            is(DebugRegMap.OFF_A7ODD_CTL) { rData := a7OddCtl }
+            is(DebugRegMap.OFF_A7ODD_PC0) {
+              rData := dbgCommit.map(_.a7OddPc0.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_A7ODD_PC1) {
+              rData := dbgCommit.map(_.a7OddPc1.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_A7ODD_PC2) {
+              rData := dbgCommit.map(_.a7OddPc2.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_A7ODD_VALUE) {
+              rData := dbgCommit.map(_.a7OddValue.asBits).getOrElse(B(0, 32 bits)) }
+            is(DebugRegMap.OFF_A7ODD_COUNT) {
+              rData := dbgCommit.map(s => B(0, 16 bits) ## s.a7OddEpisodes.asBits)
+                .getOrElse(B(0, 32 bits)) }
           }
           is(DebugRegMap.OFF_HALT_CTL) {
             rData := B(0, 31 bits) ## haltAfterArmed
@@ -1058,6 +1073,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                   haltExceptionMask(i) := merged(haltExceptionMask(i)).asBits
                 }
               }
+            }
+            is(DebugRegMap.OFF_A7ODD_CTL) {
+              when(wStrb.orR) { a7OddCtl := merged(a7OddCtl).asBits }
             }
           }
           is(DebugRegMap.OFF_HALT_CTL) {
@@ -1278,10 +1296,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       if (stage >= 5) {
         val exceptionMask = csr.haltExceptionMask.reverse.reduce(_ ## _)
         dbgCommit.foreach(_.configureExceptionMask(exceptionMask))
+        dbgCommit.foreach(_.configureA7OddHalt(csr.a7OddCtl(0) && !dbgRst,
+          csr.a7OddCtl(31 downto 16).asUInt))
         frontendDebug.foreach(_.configure(csr.breakPc, csr.breakPcEnable,
           csr.breakSkipOnce))
       } else {
         dbgCommit.foreach(_.configureExceptionMask(B(0, 256 bits)))
+        dbgCommit.foreach(_.configureA7OddHalt(False, U(0, 16 bits)))
       }
     }
     if (enable && stage >= 3) {

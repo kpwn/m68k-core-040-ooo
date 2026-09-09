@@ -23,6 +23,7 @@ object DebugHaltReasonCode {
   val FATAL = 4
   val BREAKPOINT = 5
   val EXCEPTION = 6
+  val A7_ODD = 7      // the A7-odd halt lane (OFF_A7ODD_CTL) requested the stop
 }
 
 /** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
@@ -575,6 +576,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     haltAfterInvalidateIn := False; haltAfterInvalidateIn.simPublic()
     val haltExceptionMaskIn = Bits(256 bits); haltExceptionMaskIn.allowOverride
     haltExceptionMaskIn := 0; haltExceptionMaskIn.simPublic()
+    // A7-ODD halt lane configuration (DebugCommitService.configureA7OddHalt) and its
+    // sticky stop request, which rides the MANUAL-stop path so the halt lands on a
+    // clean macro boundary exactly like a host-requested stop. Driven by `a7OddLane`.
+    val haltA7OddEnIn = Bool(); haltA7OddEnIn.allowOverride
+    haltA7OddEnIn := False; haltA7OddEnIn.simPublic()
+    val haltA7OddThreshIn = UInt(16 bits); haltA7OddThreshIn.allowOverride
+    haltA7OddThreshIn := U(0, 16 bits); haltA7OddThreshIn.simPublic()
+    val a7OddStopReq = Bool(); a7OddStopReq.simPublic()
     // D28 (axi-socket adapter spec section 6.4): the halt seam carries a KIND alongside the
     // Bool. "Halts" is only half a diagnostic; an operator staring at a wedged core has to
     // know why. Deliberately an OBSERVATION, not a control path -- `coreHalted`'s three
@@ -939,7 +948,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     val debugBreakpointBoundaryHit = Bool()
     val debugExceptionBoundaryHit = Bool()
     val debugQuiesceNext = Mux(debugHaltState === DebugHaltState.RUNNING,
-      debugStopRequestIn || haltAfterDue || debugBreakpointBoundaryHit || debugExceptionBoundaryHit,
+      debugStopRequestIn || a7OddStopReq || haltAfterDue || debugBreakpointBoundaryHit || debugExceptionBoundaryHit,
       Mux(debugHaltState === DebugHaltState.HALTED,
         !(debugResumeRequestIn || debugStepRequestIn),
         Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
@@ -1153,7 +1162,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // same retire cycle from crossing into its successor. HALTED is not observable
     // until the following RECOVER cycle has driven the registered flush.
     val debugAutoHaltLatchedReg = RegInit(False); debugAutoHaltLatchedReg.simPublic()
-    val debugStopActive = debugStopRequestIn || haltAfterDue ||
+    val debugStopActive = debugStopRequestIn || a7OddStopReq || haltAfterDue ||
       (debugHaltState === DebugHaltState.STOP_PENDING)
     val debugSequencerBoundaryHit = Bool() // driven below from the completed redirect
     val debugNormalBoundaryHit = retire0 && h0IsMacroLast
@@ -1245,7 +1254,7 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       is(DebugHaltState.RUNNING) {
         when((debugExceptionBoundaryHit || debugBreakpointBoundaryHit) && !preciseDrainBusyIn) {
           debugHaltState := DebugHaltState.RECOVER
-        }.elsewhen(debugStopRequestIn || haltAfterDue) {
+        }.elsewhen(debugStopRequestIn || a7OddStopReq || haltAfterDue) {
           when(debugStopBoundaryHit && !preciseDrainBusyIn) { debugHaltState := DebugHaltState.RECOVER }
             .otherwise                                      { debugHaltState := DebugHaltState.STOP_PENDING }
         }
@@ -1295,7 +1304,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
             U(DebugHaltReasonCode.STEP, 3 bits),
             Mux(haltAfterDue || debugAutoHaltLatchedReg,
               U(DebugHaltReasonCode.HALT_AFTER, 3 bits),
-              U(DebugHaltReasonCode.MANUAL, 3 bits)))))
+              Mux(a7OddStopReq,
+                U(DebugHaltReasonCode.A7_ODD, 3 bits),
+                U(DebugHaltReasonCode.MANUAL, 3 bits))))))
     }
     GenerationFlags.simulation {
       assert(!((debugHalted || coreHalted) && (retire0 || retire1)),
@@ -2824,6 +2835,51 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // (e.g. the documented sysOp readback garbage) can be told from a persistent drift.
     // `report` lowers to a `$display` under `ifndef SYNTHESIS`, so even a build that set
     // the variable by accident would synthesize to nothing but the ring + counter.
+    // ── A7-ODD HALT LANE (synthesizable; 2026-09-09, the boot odd-SSP defect) ──────────
+    // Hardware counterpart of the sim tripwire below. Watches the COMMITTED active-bank
+    // A7 (`exc.ss.a7`). While it is odd, `run` counts retired macros; once `run` reaches
+    // the host-programmed threshold (OFF_A7ODD_CTL[31:16]) with the lane enabled, a sticky
+    // stop request is raised and the core halts on the next clean macro boundary with
+    // reason A7_ODD. At every EVEN->ODD edge the lane latches the PC retiring in that
+    // cycle (0 when none), the two PCs retired before it, and the odd A7 -- so the halt
+    // shows exactly which instruction produced the odd stack pointer, even when the
+    // threshold delayed the stop. The lane re-arms only after A7 has been even again, so
+    // resuming from the halt (A7 still odd) does not re-trip immediately.
+    val a7OddLane = new Area {
+      val a7       = exc.ss.a7
+      val odd      = a7(0)
+      val oddPrev  = RegNext(odd) init False
+      val last0    = Reg(UInt(32 bits)) init 0   // newest retired PC (registered)
+      val last1    = Reg(UInt(32 bits)) init 0
+      when(retire0 && retire1) { last0 := p1.pc; last1 := p0.pc }
+        .elsewhen(retire0)     { last0 := p0.pc; last1 := last0 }
+      val pcNow    = Mux(retire1, p1.pc, Mux(retire0, p0.pc, U(0, 32 bits)))
+      val run      = Reg(UInt(16 bits)) init 0
+      when(!odd) { run := 0 }
+        .elsewhen(run < U(0xFFF0, 16 bits)) { run := run + retiredThisCycle.resized }
+      val pc0      = Reg(UInt(32 bits)) init 0
+      val pc1      = Reg(UInt(32 bits)) init 0
+      val pc2      = Reg(UInt(32 bits)) init 0
+      val value    = Reg(UInt(32 bits)) init 0
+      val episodes = Reg(UInt(16 bits)) init 0
+      when(haltA7OddEnIn && odd && !oddPrev) {
+        pc0 := pcNow; pc1 := last0; pc2 := last1; value := a7
+        episodes := episodes + 1
+      }
+      val armed    = RegInit(True)
+      val req      = RegInit(False)
+      val hit      = haltA7OddEnIn && odd && armed && (run >= haltA7OddThreshIn) &&
+                     !coreHalted && (debugHaltState === DebugHaltState.RUNNING)
+      when(hit)  { req := True; armed := False }
+      when(!odd) { armed := True }
+      when((debugHaltState === DebugHaltState.HALTED) || debugClearStickyIn || !haltA7OddEnIn) {
+        req := False
+      }
+      pc0.simPublic(); pc1.simPublic(); pc2.simPublic(); value.simPublic()
+      episodes.simPublic(); run.simPublic(); req.simPublic(); hit.simPublic()
+    }
+    a7OddStopReq := a7OddLane.req
+
     if (sys.env.contains("CPU040_A7_TRIPWIRE")) new Area {
       val a7      = exc.ss.a7
       val odd     = a7(0)
@@ -2906,6 +2962,15 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def configureExceptionMask(mask: Bits): Unit = {
     logic.haltExceptionMaskIn := mask
   }
+  override def configureA7OddHalt(enable: Bool, threshold: UInt): Unit = {
+    logic.haltA7OddEnIn := enable
+    logic.haltA7OddThreshIn := threshold
+  }
+  override def a7OddPc0:      UInt = logic.a7OddLane.pc0
+  override def a7OddPc1:      UInt = logic.a7OddLane.pc1
+  override def a7OddPc2:      UInt = logic.a7OddLane.pc2
+  override def a7OddValue:    UInt = logic.a7OddLane.value
+  override def a7OddEpisodes: UInt = logic.a7OddLane.episodes
 
   override def sr: UInt = logic.debugSystemSr
   override def vbr: UInt = logic.exc.ss.vbr
