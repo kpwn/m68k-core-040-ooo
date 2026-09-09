@@ -60,6 +60,13 @@ class FsaveFrestoreSpec extends AnyFunSuite {
                   everExecuted: Boolean = false,
                   unimp: Option[(Int, BigInt, BigInt)] = None,
                   restoreHeader: Option[Long] = None,
+                  // p167: place the FRESTORE frame at RestoreBuf + this byte offset, and
+                  // plant `restoreDecoy` at the enclosing 16-byte LINE BASE. A header word
+                  // at line-relative offset 15 that is read as one WORD comes back as
+                  // {byte[15], byte[0]} of the same line -- i.e. with the decoy's high byte
+                  // as its LENGTH byte -- so the decoy makes a wrapped read unmistakable.
+                  restoreOff: Int = 0,
+                  restoreDecoy: Option[Long] = None,
                   mmuFaulting: Boolean = false,
                   a7FrameHeader: Option[Long] = None,
                   cycles: Int = 4000,
@@ -89,7 +96,12 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
       restoreHeader.foreach { h =>
         for (i <- 0 until 4)
-          dmem.pokeByte(RestoreBuf + i, ((h >> (8 * (3 - i))) & 0xff).toInt)
+          dmem.pokeByte(RestoreBuf + restoreOff + i, ((h >> (8 * (3 - i))) & 0xff).toInt)
+      }
+      restoreDecoy.foreach { d =>
+        val lineBase = (RestoreBuf + restoreOff) & ~0xfL
+        for (i <- 0 until 4)
+          dmem.pokeByte(lineBase + i, ((d >> (8 * (3 - i))) & 0xff).toInt)
       }
       // A frame planted at the boot A7 itself, for the `FRESTORE (A7)+` case.
       a7FrameHeader.foreach { h =>
@@ -322,6 +334,41 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       assert(got == RestoreBuf + expectPop,
         f"FRESTORE (A0)+ on header 0x$header%08X must advance A0 by $expectPop " +
         f"(0x${RestoreBuf + expectPop}%08X); got 0x$got%08X")
+    }
+  }
+
+  // ── p167: the header word at a 16-byte LINE BOUNDARY (odd frame base) ─────────
+  //
+  // `DcacheByteLane.extract` indexes `off + 1` with a 4-bit WRAPPING index, so a WORD
+  // read at line-relative offset 15 returns {byte[15], byte[0]} of the SAME line. The
+  // FSAVE store side has split exactly this case since task #163 (`fsSplitLow`) and the
+  // RTE frame-word read side since p167 (`rdSplitLow`); FRESTORE's header read was the
+  // last unguarded one (`F_HDRREQ`). It is reachable, not theoretical: `frestore (%a7)+`
+  // with an ODD supervisor SP is what Mac OS does on an FPU context switch inside a
+  // `link %a6,#-75` stretch (RAM 0x9008, SSP = 0x0017fec7 on the p167 Quadra 700 boot).
+  //
+  // A wrapped read takes the LENGTH byte from unrelated memory, so FRESTORE pops the
+  // wrong number of bytes and An/A7 lands off the real frame for the rest of the program.
+  // The decoy at the line base makes that unambiguous: header 0x41300000 at offset 15
+  // must pop 4 + 0x30 = 52; a wrapped read sees 0x41DE and would pop 4 + 0xDE = 226.
+  test("FRESTORE header word at line offset 15 reads the REAL length byte, not the " +
+       "byte wrapped from the line base (p167)", VerilatorTest) {
+    // Sweep every offset in the top half of the line: 15 crosses, 8..14 are controls that
+    // must be unaffected by the split logic.
+    for (off <- Seq(8, 12, 13, 14, 15); (header, expectPop) <- Seq(0x41300000L -> 52, 0x41280000L -> 44, 0x00000000L -> 4)) {
+      val probe = 0x00025000L
+      val base  = RestoreBuf + off
+      val r = run(
+        f"lea 0x$base%08x,%%a0 ; $frestoreA0 ; move.l %%a0,0x$probe%08x ; done: bra.s done",
+        restoreHeader = Some(header), restoreOff = off, restoreDecoy = Some(0xDEADBEEFL),
+        name = f"frestore-line15-$off-$expectPop")
+      val got = (0 until 4).map(i => r.mem.peekByte(probe + i).toLong)
+                           .reduceLeft((acc, b) => (acc << 8) | b)
+      assert(got == base + expectPop,
+        f"FRESTORE (A0)+ on header 0x$header%08X at line offset $off must advance A0 by " +
+        f"$expectPop (0x${base + expectPop}%08X); got 0x$got%08X " +
+        f"(a wrapped read would pop 4 + the decoy's 0xDE = 226)")
+      assert(!r.coreHalted, f"FRESTORE at line offset $off must not halt the core")
     }
   }
 
