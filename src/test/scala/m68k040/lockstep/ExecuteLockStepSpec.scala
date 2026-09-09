@@ -12258,7 +12258,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // oracle for whichever boundary it chose, plus the same frame/locals memory
       // comparison. Nothing is relaxed except "which boundary"; a wrong frame, a wrong
       // RTE, or a clobbered local still fails.
-      val lateWindow = (i to (i + 2)).filter(_ < boundaryPcs.size)
+      // Which boundary the interrupt lands on is not pinnable to a single instruction:
+      // the harness raises IPL on the PREDECESSOR's retire and the DUT recognises IPL at
+      // its own 2-wide macro boundaries, so it usually lands ON or one/two AFTER the
+      // requested one. It can also land EARLIER, because the boundary list is `.distinct`
+      // (a PC executed twice -- `sub1`'s rts -- collapses to one entry, so consecutive
+      // list indices are not always consecutive program boundaries). Search LATER first
+      // (the common case, so most boundaries still cost a single simulation), then
+      // EARLIER. Whichever boundary is chosen, the lock-step against it is exact and
+      // full-length and the frame/locals memory comparison still runs.
+      val lateWindow = ((i to (i + 2)) ++ ((i - 1) to (i - 2) by -1)).filter(j => j >= 0 && j < boundaryPcs.size)
       var matchedAt = -1
       var lastErr: org.scalatest.exceptions.TestFailedException = null
       for (j <- lateWindow if matchedAt < 0) {
@@ -12283,7 +12292,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(matchedAt >= 0,
         f"[$tag] boundary $i (0x$pc%08x): the DUT lock-stepped against NONE of the " +
         f"boundary-${lateWindow.mkString("/")} oracles. Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
-      if (matchedAt != i) println(f"[$tag] boundary $i matched the boundary-$matchedAt oracle (IPL recognised $matchedAt-$i boundaries late)")
+      if (matchedAt != i) println(f"[$tag] boundary $i matched the boundary-$matchedAt oracle (offset ${matchedAt - i})")
     }
   }
   for (k <- 0 until 16 by 2) {
