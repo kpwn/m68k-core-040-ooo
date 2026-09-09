@@ -312,6 +312,20 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
         DebugRegMap.OFF_LAST_PC.toLong) == 0x4080122CL)
       assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
         DebugRegMap.OFF_HALT_REASON.toLong) == 4)
+      // 2026-09-09: OFF_HALT_REASON's 4 above is the DEBUG-domain code FATAL, which says
+      // nothing about WHICH fatal producer fired. OFF_HALT_KIND carries the socket
+      // HaltReason attribution -- here WALKER_PORT_WEDGE(5), deliberately a different
+      // value from the reason code so a wire-up that accidentally returned the wrong
+      // source could not pass.
+      dut.commitStub.logic.haltKindDrive #= m68k040.socket.HaltReason.WALKER_PORT_WEDGE
+      dut.clockDomain.waitSampling(2)
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_HALT_KIND.toLong) == m68k040.socket.HaltReason.WALKER_PORT_WEDGE,
+        "OFF_HALT_KIND must report the socket HaltReason attribution, not the debug code")
+      dut.commitStub.logic.haltKindDrive #= m68k040.socket.HaltReason.DOUBLE_FAULT
+      dut.clockDomain.waitSampling(2)
+      assert(DbgAxiDriver.read(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_HALT_KIND.toLong) == m68k040.socket.HaltReason.DOUBLE_FAULT)
     }
   }
 

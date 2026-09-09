@@ -88,15 +88,12 @@ object DebugRegMap {
   val OFF_AT_HIT_PC: Int = 0x00100
   val OFF_AT_HIT_A0: Int = 0x00104
   val OFF_AT_HIT_D0: Int = 0x00108
-  // A7-ODD halt lane (stage 5). CTL: bit 0 enable, bits 31:16 threshold (retired
-  // macros the committed A7 must stay odd before a debug stop is requested).
   val OFF_A7ODD_CTL: Int = 0x0010C
   val OFF_A7ODD_PC0: Int = 0x00110
   val OFF_A7ODD_PC1: Int = 0x00114
   val OFF_A7ODD_PC2: Int = 0x00118
   val OFF_A7ODD_VALUE: Int = 0x0011C
   val OFF_A7ODD_COUNT: Int = 0x00120
-  // PC-RANGE halt lane (stage 5). CTL bit 0 = enable.
   val OFF_PCRANGE_CTL: Int = 0x00124
   val OFF_PCRANGE_LO: Int = 0x00128
   val OFF_PCRANGE_HI: Int = 0x0012C
@@ -104,6 +101,7 @@ object DebugRegMap {
   val OFF_PCRANGE_PC1: Int = 0x00134
   val OFF_PCRANGE_PC2: Int = 0x00138
   val OFF_PCRANGE_COUNT: Int = 0x0013C
+  val OFF_HALT_KIND: Int = 0x00140
   val OFF_DCACHE_PROBE_SEL: Int = 0x00200
   val OFF_DCACHE_PROBE_TAG: Int = 0x00204
   val OFF_DCACHE_PROBE_FLAGS: Int = 0x00208
@@ -295,6 +293,7 @@ object DebugRegMap {
     ("OFF_PCRANGE_PC1", 0x00134),
     ("OFF_PCRANGE_PC2", 0x00138),
     ("OFF_PCRANGE_COUNT", 0x0013C),
+    ("OFF_HALT_KIND", 0x00140),
     ("OFF_DCACHE_PROBE_SEL", 0x00200),
     ("OFF_DCACHE_PROBE_TAG", 0x00204),
     ("OFF_DCACHE_PROBE_FLAGS", 0x00208),

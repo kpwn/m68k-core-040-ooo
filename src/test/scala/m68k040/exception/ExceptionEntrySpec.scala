@@ -53,9 +53,27 @@ class ExceptionEntrySpec extends AnyFunSuite {
       dc.loadCmd.valid   := exc.dcLoadCmd.valid
       dc.loadCmd.payload := exc.dcLoadCmd.payload
       exc.dcLoadCmd.ready := dc.loadCmd.ready
-      exc.dcLoadRsp.valid   := dc.loadRsp.valid
-      exc.dcLoadRsp.payload := dc.loadRsp.payload
+      // Fault injection for the 2026-09-09 `DLoadRsp.fault` work: force the fault bit on
+      // every load response the exception sequencer sees, without perturbing the D-cache
+      // itself (a real AXI error on a cacheable refill would also trip the cache's own
+      // diagnostic-fault channel and halt the core for a DIFFERENT reason, which would
+      // mask the behaviour under test). Field-by-field, because SpinalHDL rejects a
+      // same-scope field override of a just-assigned bundle.
+      val injLoadFault = in(Bool())
+      exc.dcLoadRsp.valid        := dc.loadRsp.valid
+      // POISON the data alongside the fault bit -- a bus error returns an error response,
+      // not valid data, and a test that leaves the data intact would understate what the
+      // unfixed core does with it.
+      exc.dcLoadRsp.payload.data := Mux(injLoadFault, B(0xBADF00D1L, 32 bits), dc.loadRsp.payload.data)
+      exc.dcLoadRsp.payload.line := dc.loadRsp.payload.line
+      exc.dcLoadRsp.payload.fault := dc.loadRsp.payload.fault || injLoadFault
       exc.dcLoadBusy        := dc.loadBusy
+      // Mirror FullCoreSynth's halt fold so the double-fault halt is observable here.
+      // Inert while `dblFault` is False, i.e. for every other test in this file.
+      rob.logic.coreHaltedIn := exc.dblFault
+      rob.logic.haltReasonIn := Mux(exc.dblFault,
+        U(m68k040.socket.HaltReason.DOUBLE_FAULT, m68k040.socket.HaltReason.W bits),
+        U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))
       dc.store.valid   := exc.dcStore.valid && storeAllow
       dc.store.payload := exc.dcStore.payload
       exc.dcStore.ready := dc.store.ready && storeAllow
@@ -115,6 +133,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       dut.wire.logic.storeAllow #= false
+      dut.wire.logic.injLoadFault #= false
       // Attach the AXI responder before the first clock edge. Constructing it only
       // after init's three samples left R/B valid and payload inputs undriven during
       // reset release; a random B response could then become a cache storeAck with no
@@ -236,6 +255,152 @@ class ExceptionEntrySpec extends AnyFunSuite {
       // SSP decremented by 8; S still set (srSys bit5).
       assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == base, f"ssp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x$base%x")
       assert(((dut.rob.logic.exc.ss.srSys.toInt >> 5) & 1) == 1, "S must be set after entry")
+    }
+  }
+  // ── 2026-09-09: the VECTOR FETCH must not read past the end of its D-cache line ──
+  //
+  // `E_VECREQ` reads `VBR + vector*4` as ONE LONG straight into `dcache.loadCmd`, so it
+  // never sees the LS EU's AGU cross-line splitter. `DcacheByteLane.extract` indexes the
+  // 16-byte line with a 4-BIT offset, so a LONG at line offset 13/14/15 WRAPS its last
+  // 1/2/3 bytes back to the line's own HEAD: the core would redirect to an address built
+  // partly out of unrelated memory. `VBR + vector*4` is 16-byte aligned only when VBR is,
+  // and the 68040's MOVEC to VBR takes all 32 bits, so `VBR mod 16` in {13, 14, 15} makes
+  // every vector fetch straddle. Architecturally legal; never produced by Mac OS, which is
+  // why this is a latent hole and not the p164-p167 boot defect.
+  //
+  // FAIL-BEFORE / PASS-AFTER, measured on this DUT with the split forced off. Decoy
+  // 0xDEADBEEF at the head of the line the vector word starts in, handler 0x40009000 at
+  // VBR+16:
+  //   VBR mod 16 = 12 -> 0x40009000  (LONG ends exactly at the line boundary: the
+  //                                   non-crossing CONTROL, and proof the split is not
+  //                                   applied blanket)
+  //   VBR mod 16 = 13 -> 0x4000903f / 0x40009093 / ... -- the trailing byte is GARBAGE
+  //                      and varies with the simulator seed
+  // The garbage (rather than the decoy's 0xDE) is itself informative: this DUT has no
+  // `CacheControlService`, so the exception sequencer's loads run CACHE-INHIBITED and the
+  // wrapped byte is taken from the never-filled remainder of the miss line rather than
+  // from resident data. Either way the core redirects to an address it never read.
+  // With task A's tripwire also live in this DUT (`M68kSim()` implies `.includeSimulation`),
+  // an unfixed core additionally dies on the `extract` assertion itself -- that is how this
+  // fail-before was run: the assertion had to be silenced before the wrong PC was visible.
+  test("vector fetch straddling a 16-byte line (misaligned VBR) reads the whole longword") {
+    val compiled = M68kSim().withVerilator.compile(new Dut)
+    // 12 = non-crossing control; 13/14/15 = the three LONG straddle shapes (3+1, 2+2, 1+3).
+    for (vbrLow <- Seq(12, 13, 14, 15)) {
+      compiled.doSim(s"vbrLow$vbrLow") { dut =>
+        val cd = dut.clockDomain
+        dut.wire.logic.storeAllow #= true
+        dut.wire.logic.injLoadFault #= false
+        val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        cd.forkStimulus(10)
+        init(dut, cd)
+
+        val ssp0    = 0x00100000L
+        val vbr     = 0x00002000L + vbrLow
+        val handler = 0x40009000L
+        val vecAddr = vbr + 4 * 4                 // vector 4 (illegal instruction)
+        dut.rob.logic.exc.ss.isp #= ssp0
+        dut.rob.logic.exc.ss.vbr #= vbr
+        dut.rob.logic.haltExceptionMaskIn #= 0
+        def pokeBE32(a: Long, w: Long): Unit =
+          for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+        pokeBE32(vecAddr & ~0xfL, 0xDEADBEEFL)    // decoy at the line head
+        pokeBE32(vecAddr, handler)
+        cd.waitSampling(2)
+
+        val faultPc = 0x40000010L
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = faultPc, faulted = true, faultVector = 4)
+        dut.rsrc.logic.src.valid #= true
+        dut.rsrc.logic.u1v #= false
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false
+        cd.waitSampling()
+        dut.rob.logic.completion(0).valid #= true
+        dut.rob.logic.completion(0).payload #= 0
+        cd.waitSampling()
+        dut.rob.logic.completion(0).valid #= false
+
+        var n = 0; var redirPc = -1L
+        while (redirPc < 0 && n < 600) {
+          if (dut.rob.logic.doFlushReg.toBoolean) redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
+          n += 1; cd.waitSampling()
+        }
+        assert(redirPc == handler,
+          f"VBR mod 16 = $vbrLow%d: redirect pc=0x$redirPc%x expected handler 0x$handler%x " +
+          f"(vector word at 0x$vecAddr%x, line offset ${(vecAddr & 0xf).toInt}%d)")
+      }
+    }
+  }
+
+  // ── 2026-09-09: a BUS ERROR on the handler-vector read is a DOUBLE FAULT ─────────
+  //
+  // `DLoadRsp` has always carried a `fault` bit and the exception sequencer never looked
+  // at it, so E_VECWAIT consumed a faulting vector read exactly like a good one and the
+  // core redirected to whatever data rode along with the error response. On a real 68040
+  // a bus error taken while the processor is ALREADY in exception processing is a double
+  // bus fault and the part HALTS (M68040UM S8.4.2); this core had no double-fault path at
+  // all, which is what turns one bad vector read into an unbounded re-fault loop that
+  // marches the supervisor stack down through video memory.
+  //
+  // FAIL-BEFORE (measured, with the E_VECWAIT fault arm forced off): `dblFault` never
+  // rises, nothing halts, and the core redirects to the poisoned response data as if it
+  // were a handler address.
+  // PASS-AFTER: no redirect at all, `dblFault` set, `coreHalted` with reason
+  // DOUBLE_FAULT, and OFF_DBL_FAULT_PC / OFF_DBL_FAULT_VEC's backing registers carrying
+  // the faulting instruction's PC and the vector number.
+  //
+  // The no-fault control is the first test in this file: same DUT, `injLoadFault` low,
+  // redirect to the handler and no halt.
+  test("a bus error on the vector fetch is a DOUBLE FAULT: halt, no redirect, capture PC+vector") {
+    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      dut.wire.logic.storeAllow #= true
+      dut.wire.logic.injLoadFault #= true      // every exc-sequencer load response faults
+      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
+
+      val ssp0    = 0x00100000L
+      val handler = 0x40009000L
+      dut.rob.logic.exc.ss.isp #= ssp0
+      dut.rob.logic.exc.ss.vbr #= 0L
+      dut.rob.logic.haltExceptionMaskIn #= 0
+      // A perfectly good vector table -- the point is that the READ of it errors, so the
+      // core must NOT reach this value.
+      for (i <- 0 until 4) dmem.pokeByte(4 * 4 + i, ((handler >> (8 * (3 - i))) & 0xff).toInt)
+      cd.waitSampling(2)
+
+      val faultPc = 0x40000010L
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = faultPc, faulted = true, faultVector = 4)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= true
+      dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+
+      var n = 0; var redirPc = -1L; var sawDbl = false
+      while (n < 600 && !sawDbl) {
+        if (dut.rob.logic.doFlushReg.toBoolean && redirPc < 0)
+          redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
+        if (dut.rob.logic.exc.dblFault.toBoolean) sawDbl = true
+        n += 1; cd.waitSampling()
+      }
+      assert(sawDbl, "a faulting vector fetch must raise dblFault")
+      // Give the halt a few cycles to land, and prove no LATE redirect sneaks out.
+      cd.waitSampling(20)
+      assert(redirPc < 0 && !dut.rob.logic.doFlushReg.toBoolean,
+        f"a double fault must NOT redirect (saw pc=0x$redirPc%x)")
+      assert(dut.rob.logic.coreHalted.toBoolean, "a double fault must halt the core")
+      assert(dut.rob.logic.haltReason.toInt == m68k040.socket.HaltReason.DOUBLE_FAULT,
+        s"halt reason ${dut.rob.logic.haltReason.toInt} expected DOUBLE_FAULT")
+      assert((dut.rob.logic.exc.dblFaultPc.toLong & 0xffffffffL) == faultPc,
+        f"OFF_DBL_FAULT_PC capture 0x${dut.rob.logic.exc.dblFaultPc.toLong}%x expected 0x$faultPc%x")
+      assert(dut.rob.logic.exc.dblFaultVec.toInt == 4,
+        s"OFF_DBL_FAULT_VEC capture ${dut.rob.logic.exc.dblFaultVec.toInt} expected 4")
     }
   }
 }

@@ -909,6 +909,26 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_EXC_FAULT_ADDR) {
             rData := dbgCommit.map(_.haltExceptionFaultAddress.asBits).getOrElse(B(0, 32 bits))
           }
+          // 2026-09-09: these two have been RESERVED in the regmap since Stage 1 with
+          // nothing driving them, which is why the REPL always printed `dbl_fault=0` even
+          // on a core that had double-faulted. Now backed by `ExceptionUnit.dblFaultPc` /
+          // `dblFaultVec` -- the PC of the instruction whose exception processing hit a
+          // bus error on its handler-vector read, and the vector it was fetching (the
+          // faulting table address is VBR + vec*4). Both stay 0 until a double fault.
+          is(DebugRegMap.OFF_DBL_FAULT_PC) {
+            rData := dbgCommit.map(_.dblFaultPc.asBits).getOrElse(B(0, 32 bits))
+          }
+          is(DebugRegMap.OFF_DBL_FAULT_VEC) {
+            rData := dbgCommit.map(s => s.dblFaultVec.resize(32).asBits).getOrElse(B(0, 32 bits))
+          }
+          // 2026-09-09: the fatal-halt ATTRIBUTION. `OFF_HALT_REASON` reports the debug
+          // domain's coarse code and collapses every fatal cause to FATAL(4); this is
+          // `RobPlugin.haltReason`, the sticky first-wins `socket.HaltReason` value that
+          // says WHICH producer halted the core. Without it a fatal halt on hardware is
+          // unattributable without an ENABLE_ILA bitstream.
+          is(DebugRegMap.OFF_HALT_KIND) {
+            rData := dbgCommit.map(s => s.haltKind.resize(32).asBits).getOrElse(B(0, 32 bits))
+          }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
           // Live, free-running, never halt-captured -- see excCountReg above.

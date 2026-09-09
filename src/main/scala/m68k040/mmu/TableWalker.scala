@@ -95,6 +95,32 @@ class TableWalker extends Component {
   val descAddr = Reg(UInt(32 bits))      // byte address of the current descriptor
   val cmdSent  = Reg(Bool()) init False
 
+  // ── 2026-09-09: descriptor read split at a 16-byte D-cache line boundary ────────
+  // `DcacheByteLane.extract` indexes the line with a 4-bit offset, so a LONG at
+  // line-relative offset 13, 14 or 15 WRAPS its last 1/2/3 bytes back to the line's own
+  // head instead of crossing into the next line -- silent wrong data. This walker drives
+  // `io.loadCmd` DIRECTLY (through the TLB plugins' W1/W2 arbiter), so it gets none of
+  // the LS EU's AGU cross-line splitting, exactly like the exception sequencer's frame
+  // pops and vector fetch.
+  //
+  // Reachability: the root descriptor address is `rootPtr + rootIdx*4`, and `rootPtr` is
+  // URP/SRP straight out of MOVEC. The 68040 manual requires those to be 512-byte
+  // aligned, but MOVEC takes all 32 bits and this core stores them unmasked (as real
+  // silicon does), so a misaligned URP/SRP with `rootPtr mod 16` in {13, 14, 15} makes
+  // every root read straddle. The two deeper levels cannot: `MmuDesc.tblNextBase` masks
+  // the table base to 16 bytes and every index is a multiple of 4, so offsets there are
+  // always 0/4/8/12. The split below is written at the SHARED read micro-sequence
+  // anyway, so it stays correct if a future descriptor format widens that base.
+  //
+  // FOUR sub-accesses, not two: a LONG straddles as 3+1, 2+2 or 1+3 bytes and `Size` has
+  // no 3-byte encoding, so no two-command shape covers offsets 13 and 15. The walk is a
+  // PHYSICAL access (vaddr == paddr, no translation), so unlike the FRESTORE header
+  // there is nothing to re-translate when the split walks into the next page.
+  val descCrosses  = descAddr(3 downto 0) > U(12, 4 bits)
+  val descSplitIdx = Reg(UInt(2 bits)) init 0
+  val descAcc      = Reg(Bits(32 bits)) init 0
+  val descCurAddr  = Mux(descCrosses, descAddr + descSplitIdx.resize(32 bits), descAddr)
+
   // ---- accumulated walk state ----
   val accWriteProt = Reg(Bool())
   val pageDescAddr = Reg(UInt(32 bits))  // address of the leaf page descriptor (for U/M write)
@@ -119,9 +145,12 @@ class TableWalker extends Component {
   // presented to the (VIPT) cache are the same value. That trivially satisfies
   // `DLoadCmd`'s stated `paddr[11:0] == vaddr[11:0]` construction requirement.
   io.loadCmd.valid           := False
-  io.loadCmd.payload.vaddr   := descAddr
-  io.loadCmd.payload.paddr   := descAddr
-  io.loadCmd.payload.size    := m68k040.isa.Size.LONG
+  io.loadCmd.payload.vaddr   := descCurAddr
+  io.loadCmd.payload.paddr   := descCurAddr
+  io.loadCmd.payload.size    := Mux(descCrosses, m68k040.isa.Size.BYTE, m68k040.isa.Size.LONG)
+  // Descriptor reads consume `loadRsp.data`, never the raw line -- keep the
+  // `DcacheByteLane.extract` wrap tripwire live for this path (`DLoadCmd.lineOnly`).
+  io.loadCmd.payload.lineOnly := False
   // Overwritten by the arbiter (W1/W2): the descriptor fetch's own cache mode is a
   // fixed architectural policy this component cannot see. WRITETHROUGH is the inert
   // default so a standalone DUT with no arbiter still sees a well-defined value.
@@ -134,6 +163,36 @@ class TableWalker extends Component {
                                   m68k040.cache.DLoadToken.Width bits)
 
   donePulse := False
+
+  // Split-aware descriptor-response front end. The FSM below consumes THESE three
+  // signals, never `io.loadRsp` directly: on a straddling descriptor the four BYTE
+  // responses are shifted together big-endian (byte at the lowest address = MSB) and
+  // only the LAST one is presented as a complete descriptor. A fault on any sub-read
+  // terminates the descriptor immediately (fail-closed, matching `descFault` below).
+  // Placed BEFORE the state machine so the FSM's own `cmdSent` writes still win on the
+  // cycle a descriptor completes; on an intermediate byte the FSM writes none.
+  val descRspValid = Bool();       descRspValid := False
+  val descRspData  = Bits(32 bits); descRspData := io.loadRsp.payload.data
+  val descRspFault = Bool();       descRspFault := io.loadRsp.payload.fault
+  when(io.loadRsp.valid) {
+    when(!descCrosses) {
+      descRspValid := True
+    } otherwise {
+      val acc = descAcc(23 downto 0) ## io.loadRsp.payload.data(7 downto 0)
+      descAcc := acc
+      when(io.loadRsp.payload.fault) {
+        descRspValid := True
+        descSplitIdx := 0
+      } elsewhen(descSplitIdx === U(3, 2 bits)) {
+        descRspValid := True
+        descRspData  := acc
+        descSplitIdx := 0
+      } otherwise {
+        descSplitIdx := descSplitIdx + 1
+        cmdSent      := False       // re-arm `issueRead` for the next byte
+      }
+    }
+  }
 
   val fsm = new StateMachine {
     val IDLE     = new State with EntryPoint
@@ -176,6 +235,7 @@ class TableWalker extends Component {
         val rootOff  = (io.req.vpn(19 downto 13) ## U(0, 2 bits)).asUInt   // rootIdx(7)*4
         descAddr := rootBase + rootOff.resize(32)
         cmdSent  := False
+        descSplitIdx := 0        // no split-read carry into this walk
         goto(RD_ROOT)
       }
     }
@@ -183,9 +243,9 @@ class TableWalker extends Component {
     // ---- ROOT level ----
     RD_ROOT.whenIsActive {
       issueRead()
-      when(io.loadRsp.valid) {
-        val d = io.loadRsp.payload.data
-        when(io.loadRsp.payload.fault) {
+      when(descRspValid) {
+        val d = descRspData
+        when(descRspFault) {
           descFault()
           goto(FINISH)
         } elsewhen(!MmuDesc.tblResident(d)) {
@@ -206,9 +266,9 @@ class TableWalker extends Component {
     // ---- POINTER level ----
     RD_PTR.whenIsActive {
       issueRead()
-      when(io.loadRsp.valid) {
-        val d = io.loadRsp.payload.data
-        when(io.loadRsp.payload.fault) {
+      when(descRspValid) {
+        val d = descRspData
+        when(descRspFault) {
           descFault()
           goto(FINISH)
         } elsewhen(!MmuDesc.tblResident(d)) {
@@ -235,12 +295,12 @@ class TableWalker extends Component {
     // ---- PAGE (leaf) level ----
     RD_PAGE.whenIsActive {
       issueRead()
-      when(io.loadRsp.valid && io.loadRsp.payload.fault) {
+      when(descRspValid && descRspFault) {
         descFault()
         goto(FINISH)
       }
-      when(io.loadRsp.valid && !io.loadRsp.payload.fault) {
-        val d = io.loadRsp.payload.data
+      when(descRspValid && !descRspFault) {
+        val d = descRspData
         pageDescAddr := descAddr
         val wp  = accWriteProt | MmuDesc.pgWriteProt(d)
         val sup = MmuDesc.pgSupervisor(d)

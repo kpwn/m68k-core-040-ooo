@@ -40,8 +40,11 @@ object HaltReason {
     * response on a trusted-cacheable-path transaction. Sub-coded by that plugin's own
     * private `diagFaultKind`. */
   val DCACHE_DIAG = 1
-  /** A DTLB translation fault taken while the commit-side sequencer is transferring an
-    * FSAVE/FRESTORE state frame (`exc.fsXlateFault`). */
+  /** A fault taken while the commit-side sequencer is transferring an FSAVE/FRESTORE
+    * state frame (`exc.fsXlateFault`): a DTLB translation fault on any word, or (since
+    * 2026-09-09) a physical BUS error on FRESTORE's header read. Both escalate here for
+    * the reason `ExceptionUnit.F_HALT` documents -- this unit has no unwind machinery for
+    * a partially-transferred frame. */
   val FS_XLATE = 2
   /** D15: a non-OKAY response to the reset-vector fetch at physical 0. Hardware-faithful
     * -- a bus fault during reset exception processing is a double bus fault on a real
@@ -57,6 +60,11 @@ object HaltReason {
     * grant at all -- the `axi_d` arbiter sees nothing, the D-cache's own diagnostic
     * channel sees nothing, and the failure would otherwise be completely unobservable. */
   val WALKER_PORT_WEDGE = 5
+  /** 2026-09-09: a DOUBLE BUS FAULT -- the exception sequencer's handler-vector read at
+    * `VBR + vector*4` returned a bus error while the processor was ALREADY in exception
+    * processing (`exc.dblFault`). M68040UM S8.4.2: the part halts. `OFF_DBL_FAULT_PC` /
+    * `OFF_DBL_FAULT_VEC` carry which instruction and which vector. */
+  val DOUBLE_FAULT = 6
 
   def name(code: Int): String = code match {
     case NONE          => "NONE"
@@ -65,6 +73,7 @@ object HaltReason {
     case RESET_VECTOR  => "RESET_VECTOR"
     case ARBITER_WEDGE => "ARBITER_WEDGE"
     case WALKER_PORT_WEDGE => "WALKER_PORT_WEDGE"
+    case DOUBLE_FAULT  => "DOUBLE_FAULT"
     case other         => s"UNKNOWN($other)"
   }
 }

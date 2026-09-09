@@ -115,6 +115,7 @@ REG OFF_PCRANGE_PC0       0x00130 RO    5 0x00000000 PC-RANGE lane: first retire
 REG OFF_PCRANGE_PC1       0x00134 RO    5 0x00000000 PC-RANGE lane: the PC retired before PC0.
 REG OFF_PCRANGE_PC2       0x00138 RO    5 0x00000000 PC-RANGE lane: the PC retired before PC1.
 REG OFF_PCRANGE_COUNT     0x0013C RO    5 0x00000000 PC-RANGE lane: in-range retirements seen while enabled ([15:0]).
+REG OFF_HALT_KIND         0x00140 RO    5 0x00000000 Fatal-halt ATTRIBUTION (socket HaltReason): 0 none, 1 DCACHE_DIAG, 2 FS_XLATE, 3 RESET_VECTOR, 4 ARBITER_WEDGE, 5 WALKER_PORT_WEDGE, 6 DOUBLE_FAULT. OFF_HALT_REASON only says FATAL.
 
 # --------------------------------------------- cache probe and operations --
 REG OFF_DCACHE_PROBE_SEL   0x00200 RW    4 0x00000000 D-cache probe way/set select.

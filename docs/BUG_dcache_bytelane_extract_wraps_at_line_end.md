@@ -1,9 +1,9 @@
 # BUG: `DcacheByteLane.extract` wraps its byte index, so a non-AGU read at the end of a cache line returns bytes from the START of the same line
 
-**Status**: ROOT CAUSE CONFIRMED and FIXED for the two reachable consumers
-(`676db27b`, `9b9b6665`, merged to `integrate/cpu040-merged` as `c7fd193d`).
-Two further consumers remain unguarded but are not reachable without an
-architecturally misaligned VBR / URP / SRP; see §6.
+**Status**: ROOT CAUSE CONFIRMED and FIXED. The two reachable consumers were closed
+first (`676db27b`, `9b9b6665`, merged to `integrate/cpu040-merged` as `c7fd193d`);
+the two remaining latent ones and a permanent tripwire followed on branch
+`fix/dcache-line-wrap-extract` (`487a23b1`, `b03c51be`). See §6 and §8.
 
 **Severity**: CRITICAL, silent data corruption. This was the terminal blocker on
 the Quadra 700 boot campaign. Fixing it took cold-boot success from **0 of 6** to
@@ -90,21 +90,90 @@ half's VPN derived from the split-aware address so a straddle at page offset
   instead of 52**, which destroys stack discipline for everything after it.
   `frestore (%a7)+` on an odd SSP is what Mac OS does on an FPU context switch.
 
-## 6. Still open
+## 6. The two latent consumers — CLOSED (`487a23b1`)
 
-Two `Size.LONG` reads on the same unguarded path:
+Two `Size.LONG` reads sat on the same unguarded path. Neither is reachable on this
+boot, because both need an architecturally misaligned control register rather than
+merely an odd stack pointer — but a 68040 permits those register values, MOVEC on
+this core stores them unmasked (as real silicon does), and a LONG straddles in three
+distinct shapes rather than the WORD's one.
 
-* `ExceptionUnit.scala:1572` — the exception vector fetch. Needs `VBR mod 16`
-  in {13, 14, 15}.
-* `TableWalker.scala:121` — the table-walker root descriptor. Needs URP or SRP
-  similarly misaligned.
+* **Exception vector fetch** — `ExceptionUnit.scala`, `E_VECREQ` / `E_VECWAIT`.
+  `VBR + vector*4` is 16-byte aligned only when VBR is, so `VBR mod 16` in
+  {13, 14, 15} makes EVERY vector fetch straddle and the core redirects to an address
+  built partly out of unrelated memory — the worst outcome in the whole exception path.
+* **Table-walker root descriptor** — `TableWalker.scala`, the shared `issueRead`
+  micro-sequence. `rootPtr` is URP/SRP straight out of MOVEC, so `rootPtr mod 16` in
+  {13, 14, 15} makes every root read straddle. The two deeper levels provably cannot:
+  `MmuDesc.tblNextBase` masks the table base to 16 bytes and every index is a multiple
+  of 4, so their offsets are always 0/4/8/12.
 
-Neither is reachable on this boot, because both require an architecturally
-misaligned control register rather than merely an odd stack pointer. The right
-permanent fix is to make `extract` unable to wrap (a simulation assertion at
-minimum) instead of hand-splitting each consumer as it is discovered.
+**Why four sub-accesses, not two.** A WORD straddles in exactly one way (1 + 1 bytes),
+which is why the two shipped fixes are a clean high/low byte pair. A LONG straddles as
+**3 + 1, 2 + 2 or 1 + 3**, and `Size` has no 3-byte encoding — no two-command shape can
+express offsets 13 and 15. Both fixes therefore read a straddling access as FOUR BYTE
+loads at `addr+0..+3`, shifted together big-endian (byte at the lowest address is the
+MSB). The vector fetch re-presents each sub-access's own address to the translate port,
+so a vector word that also straddles a page re-translates for the far-side bytes; the
+table walk is physical (vaddr == paddr) and has nothing to re-translate.
 
-## 7. Verification
+Fail-before / pass-after:
+
+| test | unfixed | fixed |
+|---|---|---|
+| `ExceptionEntrySpec`, VBR mod 16 = 13 | redirect `0x4000903f` (trailing byte garbage, seed-dependent) | `0x40009000` |
+| `ExceptionEntrySpec`, VBR mod 16 = 12 (control) | `0x40009000` | `0x40009000` |
+| `TableWalkerSpec`, rootPtr mod 16 = 13 | root descriptor reads `0x000110DE` for `0x00011003` -> NON_RESIDENT | PPN `0xABCDE`, no fault |
+
+(The vector-fetch garbage rather than the planted decoy is itself informative: that DUT
+has no `CacheControlService`, so the exception sequencer's loads run cache-INHIBITED and
+the wrapped byte comes from the never-filled remainder of the miss line.)
+
+## 7. The permanent guard (`487a23b1`)
+
+Hand-splitting each consumer as it is discovered is not a fix for the class, so
+`DcacheByteLane.extract` now carries a `GenerationFlags.simulation` assertion that fires
+whenever `off + size > 16`. The synthesised behaviour is deliberately **unchanged** — the
+wrap is still what the hardware computes — so this costs nothing in the netlist and turns
+any future unguarded consumer into a loud simulation failure instead of silent wrong data.
+
+The one legitimate wrapping producer is slot A of an LS EU cross-line split pair, which is
+presented at the ORIGINAL crossing offset/size purely to obtain `DLoadRsp.line` and
+discards `DLoadRsp.data`. It is exempted by a new, documented contract bit —
+`DLoadCmd.lineOnly` — rather than by weakening the assertion. `DcachePlugin` pipes that bit
+S0 -> S1 -> S2 and through the miss latches; every other `dcache.loadCmd` driver stamps it
+False explicitly (the exception leg and the walker leg of `LsEuPlugin`'s arbitration mux,
+`ExceptionUnit.dcLoadCmd`, `TableWalker.io.loadCmd`).
+
+A harness fix was needed before any of this was testable: `DcacheClientMemAgent.readBE`
+read FLAT memory, silently CROSSING the 16-byte boundary the real cache cannot cross, so a
+straddling walker read looked correct in simulation and was wrong only on hardware. It now
+models `extract` exactly, wrap included.
+
+### Complete sweep of `dcache.loadCmd` drivers (2026-09-09)
+
+| driver | AGU-split? | can present a straddling multi-byte access? | status |
+|---|---|---|---|
+| `LsEuPlugin` core LS path (aligned ring) | yes (`s1CrossLine`) | slot A of a split pair only, by design | safe; `lineOnly` True |
+| `LsEuPlugin` early VIPT probe (`loadProbe`) | same predicate | same, flagged by the pre-existing `needsLine` | safe |
+| `LsEuPlugin` exception leg | no | forwards `ExceptionUnit`'s command | see below |
+| `LsEuPlugin` walker leg | no | forwards `TableWalker`'s command | see below |
+| `ExceptionUnit` RTE frame words (4x WORD) | no | yes, offset 15 | FIXED `676db27b` |
+| `ExceptionUnit` FRESTORE header (WORD) | no | yes, offset 15 | FIXED `9b9b6665` |
+| `ExceptionUnit` vector fetch (LONG) | no | yes, offsets 13/14/15 | FIXED `487a23b1` |
+| `TableWalker` descriptor reads (LONG) | no | yes at ROOT, offsets 13/14/15 | FIXED `487a23b1` |
+| `DcachePlugin` `loadShadowCmd` replay | n/a | replays the original command verbatim | inherits its `lineOnly` |
+| `DcachePlugin` store-miss refill (`pendingStorePaddr`, LONG) | n/a | no — the SQ splits cross-line stores | `lineOnly` True; data never consumed |
+| `ResetVectorFsm` (2x LONG via `extract`) | n/a | no — constant offsets 0 and 4 | safe by construction |
+| `IcachePlugin` / `FetchAlignPlugin` window assembly | n/a | no — fixed compile-time word indices with an explicit next-beat source, no runtime wrapping index | safe by construction |
+
+The STORE side of the byte lane is not affected: `storeStrb` computes its enable with a
+WIDENING add, so a crossing store DROPS the far bytes rather than wrapping them, and every
+store consumer already splits (`stSplitLow` / `fsSplitLow` / the SQ's explicit-strobe form).
+
+## 8. Verification
+
+Of the original two fixes (`676db27b`, `9b9b6665`):
 
 * Lock-step, fail-before / pass-after at every odd SSP alignment: A-line trap
   plus RTE 8/8; LINK-stretch straight-line 24 plus 8 data-cache/crossbar
@@ -113,6 +182,15 @@ minimum) instead of hand-splitting each consumer as it is discovered.
 * `ExecuteLockStepSpec` 521 tests, 0 failures.
 * Hardware, same SoC, instruments disarmed: cold 8/8 alive, warm 9/10,
   and the owner reached the Finder and ran an application.
+
+Of the latent-consumer fixes plus the tripwire (`487a23b1`, `b03c51be`):
+
+* `ByteLaneSplitSpec` 9/9 — including the tripwire's own four cases (silent at
+  off 12/LONG and at off 15/WORD with `lineOnly`; kills the simulation at
+  off 15/WORD and off 13/LONG).
+* `ExceptionEntrySpec` 2/2 and `TableWalkerSpec` 3/3, each with the four
+  offsets 12/13/14/15 and the fail-before shown in §6's table.
+* `FsaveFrestoreSpec` 18/18.
 
 `RobPluginSpec` "preciseDrainBusyIn holds a debugPcApply off an in-flight
 precise drain" is a pre-existing seed flake that fails roughly two runs in three

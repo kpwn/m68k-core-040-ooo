@@ -132,9 +132,9 @@ class TableWalkerSpec extends AnyFunSuite {
   }
 
   def runWalk(dut: Dut, cd: ClockDomain, va: Long, isWrite: Boolean, isSuper: Boolean,
-             is8K: Boolean = false): Unit = {
+             is8K: Boolean = false, rootPtr: Long = ROOT): Unit = {
     dut.vpn     #= vpnOf(va)
-    dut.rootPtr #= ROOT
+    dut.rootPtr #= rootPtr
     dut.isWrite #= isWrite
     dut.isSuper #= isSuper
     dut.is8K    #= is8K
@@ -253,6 +253,59 @@ class TableWalkerSpec extends AnyFunSuite {
       runWalk(dut, cd, va8k, isWrite = false, isSuper = false, is8K = false)
       assert(dut.fault.toBoolean, "4K-mode walk of va8k must hit the non-resident decoy")
       assert(dut.faultReason.toEnum == MmuFaultReason.NON_RESIDENT)
+    }
+  }
+
+  // ── 2026-09-09: a ROOT descriptor straddling a 16-byte D-cache line ──────────────
+  //
+  // The walker drives `io.loadCmd` DIRECTLY (via the TLB plugins' W1/W2 arbiter), so it
+  // gets none of the LS EU's AGU cross-line splitting. `DcacheByteLane.extract` indexes
+  // the line with a 4-BIT offset, so a LONG descriptor read at line offset 13/14/15 WRAPS
+  // its last 1/2/3 bytes back to the line's own HEAD -- the walker would then install a
+  // translation decoded partly from unrelated memory, or fault on a page that is resident.
+  //
+  // Reachability: the root descriptor address is `rootPtr + rootIdx*4`, and `rootPtr` is
+  // URP/SRP straight out of MOVEC. The manual requires 512-byte alignment but MOVEC takes
+  // all 32 bits and this core stores them unmasked, so `rootPtr mod 16` in {13, 14, 15}
+  // makes every root read straddle. The two deeper levels CANNOT straddle
+  // (`MmuDesc.tblNextBase` masks the table base to 16 bytes and every index is a multiple
+  // of 4), which is why only the root is exercised here.
+  //
+  // FAIL-BEFORE: with the walker unfixed and the decoy 0xDEADBEEF at the line head, the
+  // root descriptor at offset 13 reads back as 0x000110DE instead of 0x00011003 -- still
+  // "resident", so the walk silently follows a pointer table at 0x110D0 that does not
+  // exist and reports NON_RESIDENT. PASS-AFTER: PPN 0xABCDE, no fault, for 13/14/15 alike.
+  //
+  // NOTE this only became testable once `DcacheClientMemAgent.readBE` was corrected to
+  // model the wrap (it read flat memory, silently CROSSING the boundary the real cache
+  // cannot cross -- a harness that could never have reproduced this class of defect).
+  test("root descriptor straddling a 16-byte line (misaligned URP/SRP) is read whole", VerilatorTest) {
+    val compiled = SimConfig.withVerilator.compile(new Dut)
+    // 12 = the non-crossing control (LONG ends exactly at the line boundary);
+    // 13/14/15 = the three LONG straddle shapes (3+1, 2+2, 1+3 bytes).
+    for (rootLow <- Seq(12, 13, 14, 15)) {
+      compiled.doSim(s"rootLow$rootLow") { dut =>
+        val cd = dut.clockDomain
+        cd.forkStimulus(10)
+        val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
+        dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
+        dut.vpn #= 0; dut.rootPtr #= 0
+        cd.waitSampling(4)
+
+        val rootM = 0x10000L + rootLow          // deliberately misaligned URP/SRP
+        val va    = 0x00802000L                 // rootIdx == 0 -> descAddr == rootM exactly
+        assert(rootIdx(va) == 0, "test relies on the root index being 0")
+        pokeWordLE(mem, rootM & ~0xfL, 0xDEADBEEFL)   // decoy at the line head
+        pokeWordLE(mem, rootM, (PTRT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(mem, PTRT + ptrIdx(va) * 4, (PAGT & 0xfffffff0L) | 0x3L)
+        pokeWordLE(mem, PAGT + pageIdx(va) * 4, ((0xABCDEL << 12) & 0xfffff000L) | 0x1L)
+
+        runWalk(dut, cd, va, isWrite = false, isSuper = false, rootPtr = rootM)
+        assert(!dut.fault.toBoolean,
+          s"rootPtr mod 16 = $rootLow: resident walk faulted (${dut.faultReason.toEnum})")
+        assert(dut.ppn.toLong == 0xABCDEL,
+          f"rootPtr mod 16 = $rootLow%d: ppn=0x${dut.ppn.toLong}%x expected 0xABCDE")
+      }
     }
   }
 }

@@ -79,6 +79,21 @@ case class DLoadCmd() extends Bundle {
   val size      = Size()
   val cacheMode = CacheMode()
   val token     = UInt(DLoadToken.Width bits)
+  /** The requester consumes `DLoadRsp.line` (the raw 128-bit line) and IGNORES
+    * `DLoadRsp.data`. Set by the LS EU for BOTH halves of a cross-line split pair:
+    * slot A is deliberately presented at the ORIGINAL, line-CROSSING offset/size
+    * (it needs that line, not that value), and the pair is merged later by
+    * `DcacheByteLane.extractCross`. Everything else leaves it False.
+    *
+    * It exists to make the `DcacheByteLane.extract` line-wrap tripwire precise: that
+    * assertion (see `extract` below) fires on a multi-byte extract whose bytes run
+    * past the end of the 16-byte line, which is exactly the silent-wrong-data shape
+    * that bit the RTE frame pops and the FRESTORE header read. Slot A of a split pair
+    * is the ONE legitimate producer of that shape, and this bit is how the cache
+    * knows to exempt it -- rather than the alternative of weakening the assertion so
+    * it no longer catches a real unguarded consumer. Purely a verification contract:
+    * no synthesised logic reads it. */
+  val lineOnly  = Bool()
 }
 
 /** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
@@ -198,9 +213,43 @@ object DcacheByteLane {
   /** Extract a size-typed value from a 128-bit line at byte offset `off` (0..15),
     * assembling bytes big-endian: result MSB = byte at `off`. Result is right-
     * justified in 32 bits (zero-extended above the access size). */
-  def extract(line: Bits, off: UInt, size: Size.C): Bits = {
+  def extract(line: Bits, off: UInt, size: Size.C, dataUsed: Bool = null): Bits = {
     // Per-byte view of the line (byte i = line[i*8 +: 8]).
     val bytes = line.subdivideIn(8 bits)   // bytes(0) = line[7:0] = mem byte at offset 0
+    // ── LINE-WRAP TRIPWIRE (2026-09-09) ─────────────────────────────────────────
+    // `off` is 4 bits, so `off + 1/2/3` WRAP inside the line: a WORD at offset 15
+    // returns {byte[15], byte[0]} of the SAME line, and a LONG at offset 13/14/15
+    // returns 1/2/3 bytes of the line's own head, instead of crossing into the next
+    // line. That is SILENT WRONG DATA, and it has already cost two real defects --
+    // the RTE exception-frame word pops and the FRESTORE header word, both of which
+    // reach `dcache.loadCmd` directly and therefore bypass the LS EU's AGU cross-line
+    // splitter (LsEuPlugin's `crossesLine`/`twoAccess`). The synthesised behaviour is
+    // deliberately UNCHANGED (the wrap is still what the hardware computes); this is a
+    // simulation-only assertion so that any future consumer which presents a crossing
+    // multi-byte access AND consumes `DLoadRsp.data` fails loudly instead of quietly.
+    //
+    // `dataUsed` is the caller's "this extraction's value is actually consumed"
+    // predicate. It must EXCLUDE the one legitimate wrapping producer: slot A of an
+    // LS EU cross-line split pair, which is presented at the original crossing
+    // offset/size purely to obtain `DLoadRsp.line` (see `DLoadCmd.lineOnly`). A `null`
+    // default means "always consumed" -- correct for the callers whose enclosing
+    // `when` already carries the validity, and for the constant-offset callers.
+    GenerationFlags.simulation {
+      val used   = if (dataUsed == null) True else dataUsed
+      val nbytes = UInt(3 bits); nbytes := 1
+      switch(size) {
+        is(Size.BYTE) { nbytes := 1 }
+        is(Size.WORD) { nbytes := 2 }
+        is(Size.LONG) { nbytes := 4 }
+      }
+      // Widening add: off=15 + 4 must not itself wrap the comparison.
+      assert(!used || ((off +^ nbytes) <= U(16, 5 bits)),
+        "DcacheByteLane.extract: multi-byte access WRAPS past the end of the 16-byte " +
+        "line (off + size > 16). The consumer must split the access -- a direct " +
+        "dcache.loadCmd requester does NOT get the LS EU's AGU cross-line split. " +
+        "See DLoadCmd.lineOnly.",
+        FAILURE)
+    }
     val b0 = bytes(off)
     val b1 = bytes(off + 1)
     val b2 = bytes(off + 2)

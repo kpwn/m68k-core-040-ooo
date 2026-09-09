@@ -89,6 +89,9 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   override def haltExceptionVector: UInt = logic.haltExceptionVectorDrive
   override def haltExceptionPc: UInt = logic.haltExceptionPcDrive
   override def haltExceptionFaultAddress: UInt = logic.haltExceptionFaultAddressDrive
+  override def dblFaultPc:  UInt = logic.dblFaultPcDrive
+  override def dblFaultVec: UInt = logic.dblFaultVecDrive
+  override def haltKind:    UInt = logic.haltKindDrive
   override def configureA7OddHalt(enable: Bool, threshold: UInt): Unit = {
     a7OddEnWire := enable
     a7OddThreshWire := threshold
@@ -153,6 +156,12 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val haltExceptionPcDrive = Reg(UInt(32 bits)) init 0; haltExceptionPcDrive.simPublic()
     val haltExceptionFaultAddressDrive = Reg(UInt(32 bits)) init 0
     haltExceptionFaultAddressDrive.simPublic()
+    // 2026-09-09 double-bus-fault capture (OFF_DBL_FAULT_PC / OFF_DBL_FAULT_VEC).
+    val dblFaultPcDrive  = Reg(UInt(32 bits)) init 0; dblFaultPcDrive.simPublic()
+    val dblFaultVecDrive = Reg(UInt(8 bits)) init 0;  dblFaultVecDrive.simPublic()
+    // 2026-09-09 fatal-halt attribution (OFF_HALT_KIND).
+    val haltKindDrive = Reg(UInt(m68k040.socket.HaltReason.W bits)) init 0
+    haltKindDrive.simPublic()
     effectiveHaltDrive := effectiveHaltDrive
     autoHaltDrive := autoHaltDrive
     haltReasonDrive := haltReasonDrive
@@ -166,6 +175,9 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     haltExceptionVectorDrive := haltExceptionVectorDrive
     haltExceptionPcDrive := haltExceptionPcDrive
     haltExceptionFaultAddressDrive := haltExceptionFaultAddressDrive
+    dblFaultPcDrive  := dblFaultPcDrive
+    dblFaultVecDrive := dblFaultVecDrive
+    haltKindDrive    := haltKindDrive
     effectiveHaltWire := effectiveHaltDrive
     autoHaltWire := autoHaltDrive
 

@@ -97,9 +97,21 @@ class Format7Spec extends AnyFunSuite {
 
   test("access fault (vector 2) at retire stacks format-$7 frame, fetches vector 2, redirects", VerilatorTest) {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
-      val cd = dut.clockDomain; cd.forkStimulus(10)
-      init(dut, cd)
+      val cd = dut.clockDomain
+      // Attach the AXI responder BEFORE the first clock edge -- the same ordering fix
+      // ExceptionEntrySpec's own comment already documents for its identical DUT.
+      // Constructing it only after `init`'s three sampled edges left the R/B valid and
+      // payload inputs undriven across reset release, so a randomly-asserted B response
+      // could become a cache storeAck with no accepted store descriptor (and, with RESP
+      // nonzero, a bogus diagnostic fault). That tripped this test as
+      // "FAILURE DcachePlugin: storeAck pulsed with no accepted store descriptor" at
+      // time=170 on some seeds -- a HARNESS race, seed-dependent, unrelated to the DUT.
+      // (Found while gating the byte-lane wrap fixes: those add registers and a DLoadCmd
+      // field, which reshuffles the seed -> uninitialised-register mapping and so changes
+      // which pre-existing flakes draw a losing seed.)
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
 
       val ssp0 = 0x00100000L
       val vbr  = 0L

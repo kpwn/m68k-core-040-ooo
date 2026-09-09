@@ -839,6 +839,9 @@ class ExceptionUnit(
   // DTLB-translated PA here instead (Task 11).
   dcLoadCmd.payload.paddr := ldoPaddrReg
   dcLoadCmd.payload.size  := ldoSizeReg
+  // Every exception-sequencer load consumes `loadRsp.data`; none reads the raw line.
+  // (see `DLoadCmd.lineOnly` -- keeps the extract wrap tripwire live for this path)
+  dcLoadCmd.payload.lineOnly := False
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
   // NOTE: this particular field is currently INERT in every integrated DUT --
@@ -1174,6 +1177,64 @@ class ExceptionUnit(
   val rdHiByte   = Reg(Bits(8 bits)) init 0
   def rdCrosses(addr: UInt): Bool = addr(3 downto 0) === U(15, 4 bits)
 
+  // ── 2026-09-09: the VECTOR FETCH carries the same hole, one size class up ──────
+  // `E_VECREQ` reads the handler address at `VBR + vector*4` as one LONG straight into
+  // `dcache.loadCmd` -- again bypassing the LS EU's AGU cross-line splitter. A LONG at
+  // line-relative offset 13, 14 or 15 runs 1, 2 or 3 bytes past the end of the line and
+  // `DcacheByteLane.extract` WRAPS those bytes back to the line's own head, so the core
+  // would redirect to an address built partly from unrelated memory: a silent jump to
+  // the wrong handler, the single worst outcome in the whole exception path.
+  //
+  // `VBR + vector*4` is 16-byte aligned only when VBR is, and the 68040's MOVEC to VBR
+  // takes all 32 bits (this core stores it unmasked, as real silicon does) -- so
+  // VBR mod 16 in {13, 14, 15} makes EVERY vector fetch straddle. Architecturally legal,
+  // never produced by Mac OS, and therefore not the p164-p167 boot defect -- but real.
+  //
+  // WHY FOUR SUB-ACCESSES, not two: a WORD straddles in exactly one way (1 + 1 bytes),
+  // but a LONG straddles in three (3 + 1, 2 + 2, 1 + 3), and `Size` has no 3-byte
+  // encoding, so a "head + tail" split cannot express offset 13 or 15 as two commands.
+  // Rather than a three-shape mux, a straddling vector fetch is read as FOUR BYTE loads
+  // at addr+0..+3 and shifted together big-endian (byte at addr+0 is the MSB). Each
+  // sub-access re-presents its OWN address to the translate port, so a vector word that
+  // also straddles a page boundary re-translates for the bytes on the far side -- the
+  // same rule `fsRdCurVa` states for FRESTORE's header. Non-straddling fetches (every
+  // sane VBR) are byte-for-byte the single LONG they always were.
+  val vecSplitIdx = Reg(UInt(2 bits)) init 0; vecSplitIdx.simPublic()
+  val vecAcc      = Reg(Bits(32 bits)) init 0
+
+  // ── 2026-09-09: DLoadRsp.fault was NEVER checked on ANY exception-sequencer load ──
+  // `DLoadRsp` carries a `fault` bit (a physical AXI error on the access), and until now
+  // not one of this unit's `when(dcLoadRsp.valid)` arms looked at it: a faulting read was
+  // consumed exactly like a successful one and whatever data rode along with the error
+  // response became the restored SR, the resume PC, the frame format, or -- worst -- the
+  // handler address. Two distinct architectural behaviours are owed, and they are
+  // deliberately NOT collapsed into one:
+  //
+  //  (a) VECTOR FETCH  -> DOUBLE FAULT. A bus error while the processor is already in
+  //      exception processing is a double bus fault on a real 68040 and the part HALTS
+  //      (M68040UM S8.4.2). Nothing in this core implemented that -- the whole RTL had no
+  //      `doubleFault` anywhere -- so the core instead redirected to the error response's
+  //      data. On hardware that is what turns a single bad vector read into an unbounded
+  //      re-fault loop that marches the supervisor stack down through video memory
+  //      (observed: pc_live = 0x00000008, low memory offset 8 reading 0x00000000, the
+  //      screen filling with a repeating pattern). Halting is what makes it a clean stop
+  //      rather than a destructive one.
+  //  (b) RTE FRAME-WORD READ -> ordinary ACCESS FAULT, vector 2. The RTE path up to
+  //      R_REDIR is READ-ONLY (nothing architectural has been applied yet), which is
+  //      exactly the property the existing malformed-format vector-14 / odd-PC vector-3
+  //      re-entries already rely on, so a clean format-$7 entry can be synthesized here
+  //      the same way. See `busErrorEntry`.
+  //
+  // `dblFault` is sticky and mirrors `fsXlateFault`'s shape: a Reg driven out to the top
+  // level, where FullCoreSynth ORs it into `RobPlugin.coreHaltedIn` with its own
+  // `HaltReason.DOUBLE_FAULT` code. `dblFaultPc` / `dblFaultVec` back the two debug
+  // registers the regmap has reserved since Stage 1 and nothing ever wrote --
+  // `OFF_DBL_FAULT_PC` (0x94) and `OFF_DBL_FAULT_VEC` (0x98), which is why the REPL has
+  // always printed `dbl_fault=0`. Without them the halt is real but undiagnosable.
+  val dblFault    = RegInit(False); dblFault.simPublic()
+  val dblFaultPc  = Reg(UInt(32 bits)) init 0; dblFaultPc.simPublic()
+  val dblFaultVec = Reg(UInt(8 bits)) init 0; dblFaultVec.simPublic()
+
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
     // ENTRY path
@@ -1182,6 +1243,7 @@ class ExceptionUnit(
     val E_STWAIT  = new State    // await its write-through ACK; advance step
     val E_VECREQ  = new State    // issue vector load @ VBR+vec*4
     val E_VECWAIT = new State    // await vector load rsp
+    val E_DBLFAULT= new State    // TERMINAL: the vector fetch bus-errored (see `dblFault`)
     val E_REDIR   = new State    // pulse redirect, commit SSP/SR, done
     // RTE path
     val R_DRAIN   = new State    // wait for the SQ to drain + the live-A7 readback to
@@ -1512,6 +1574,9 @@ class ExceptionUnit(
         // treatment as frameBase above (read from the settled bank at E_DRAIN, not
         // the possibly-stale IDLE-time snapshot).
         frameBase2 := ss.isp - 8
+        // E_STORE -> E_STWAIT -> E_VECREQ is the ONLY path to the vector fetch, so this
+        // is the one place the split-fetch cursor needs re-arming (2026-09-09).
+        vecSplitIdx := 0
         goto(E_STORE)
       }
     }
@@ -1569,18 +1634,62 @@ class ExceptionUnit(
       }
     }
     // ── ENTRY: fetch the handler vector ─────────────────────────────────────────
+    // A vector fetch whose LONG runs past the end of its 16-byte line (offset 13/14/15
+    // -- see `vecSplitIdx`'s comment) is read as four BYTE loads instead. `vecCurVa`
+    // walks addr+0..+3 and is what the translate port sees, so a fetch that also
+    // straddles a page re-translates for the far-side bytes.
+    val vecCrosses = vecTarget(3 downto 0) > U(12, 4 bits)
+    val vecCurVa   = Mux(vecCrosses, vecTarget + vecSplitIdx.resize(32 bits), vecTarget)
     E_VECREQ.whenIsActive {
-      dtoVld := True; dtoVpn := vecTarget(31 downto 12); dtoWr := False
-      ldoVld := True; ldoVaddr := vecTarget; ldoSize := Size.LONG
+      dtoVld := True; dtoVpn := vecCurVa(31 downto 12); dtoWr := False
+      ldoVld := True; ldoVaddr := vecCurVa
+      ldoSize := Mux(vecCrosses, Size.BYTE, Size.LONG)
       when(dcLoadCmd.fire) { goto(E_VECWAIT) }
     }
     E_VECWAIT.whenIsActive {
       // keep the translation valid while the load is in flight
-      dtoVld := True; dtoVpn := vecTarget(31 downto 12)
+      dtoVld := True; dtoVpn := vecCurVa(31 downto 12)
       when(dcLoadRsp.valid) {
-        vecTarget := dcLoadRsp.payload.data.asUInt
-        goto(E_REDIR)
+        when(dcLoadRsp.payload.fault) {
+          // DOUBLE FAULT (see `dblFault`'s declaration): a bus error on the handler
+          // vector read, taken while the processor is ALREADY in exception processing.
+          // Capture what identifies it -- the PC of the instruction whose exception this
+          // is, and the vector being fetched (its table address is VBR + vec*4, both of
+          // which the host can already read) -- then stop. Checked FIRST so a faulting
+          // sub-byte of a split fetch never accumulates into `vecAcc`.
+          dblFault    := True
+          dblFaultPc  := curPc
+          dblFaultVec := curVec
+          goto(E_DBLFAULT)
+        } elsewhen(vecCrosses) {
+          // Big-endian: the byte at the LOWEST address is the MSB, and the four bytes
+          // arrive in ascending address order -- so a plain left-shift accumulates them.
+          // `vecTarget` itself is the result register, so it must stay UNTOUCHED until
+          // the last byte (it is also what `vecCrosses`/`vecCurVa` are derived from).
+          val acc = vecAcc(23 downto 0) ## dcLoadRsp.payload.data(7 downto 0)
+          vecAcc := acc
+          when(vecSplitIdx === U(3, 2 bits)) {
+            vecSplitIdx := 0
+            vecTarget   := acc.asUInt
+            goto(E_REDIR)
+          } otherwise {
+            vecSplitIdx := vecSplitIdx + 1
+            goto(E_VECREQ)
+          }
+        } otherwise {
+          vecTarget := dcLoadRsp.payload.data.asUInt
+          goto(E_REDIR)
+        }
       }
+    }
+    // TERMINAL BY DESIGN, exactly like `F_HALT` below and for the same reason: the halt
+    // must actually STOP the sequencer, not merely raise a flag while it keeps going. No
+    // redirect is pulsed, no further load or store is ever driven, and the FSM never
+    // returns to IDLE -- which holds `active` (and therefore `excActive`) asserted,
+    // matching `coreHalted`'s own semantics. A halted core stays halted; only reset or
+    // the debug port recovers it.
+    E_DBLFAULT.whenIsActive {
+      dblFault := True    // hold it asserted; the ROB-side latch is sticky anyway
     }
     E_REDIR.whenIsActive {
       // commit the architectural side-effects + redirect
@@ -1649,6 +1758,41 @@ class ExceptionUnit(
       ldoVld := True; ldoVaddr := va
       ldoSize := Mux(rdCrosses(addr), Size.BYTE, Size.WORD)
     }
+    /** Synthesize a vector-2 ACCESS FAULT (format-$7) ENTRY for a bus error taken on an
+      * RTE frame-word read at `faultAddr`.
+      *
+      * Same shape as the malformed-format vector-14 and odd-PC vector-3 re-entries below,
+      * and legal for the same reason: RTE's path up to `R_REDIR` is READ-ONLY, so nothing
+      * architectural has been applied yet and the frame can simply be left in place while
+      * a NEW frame is pushed below it. The stacked PC is the RTE instruction's own address
+      * (`rteCapPc`), so a handler that repairs the mapping and RTEs out of the vector-2
+      * frame re-attempts the SAME original RTE -- the vector-14 path's contract exactly.
+      *
+      * SSW: ATC = 0 (a physical bus error, no MMU involvement -- the distinction task #189
+      * introduced), R/W = 1 (read), FC = supervisor DATA (0b101), SIZE = 10 (word: the
+      * ARCHITECTURAL access is the frame WORD, even when the line-straddle split reads it
+      * as two bytes). */
+    def busErrorEntry(faultAddr: UInt): Unit = {
+      curVec       := U(2, 8 bits)
+      curPc        := rteCapPc
+      curIs7       := True
+      curIs2       := False
+      curIsInt     := False
+      curLevel     := U(0, 3 bits)
+      curPpc       := rteCapPc
+      curFault     := faultAddr
+      curSsw       := U(0x0145, 16 bits)
+      curThrowaway := False
+      stFrame2     := False
+      // The SR to stack is the CURRENT one: R_REDIR is where RTE would have applied the
+      // popped SR, and this never reaches it.
+      oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
+      vecTarget    := (ss.vbr + (U(2, 8 bits) << 2)).resized
+      stStep       := 0
+      stSplitLow   := False
+      rdSplitLow   := False    // drop any half-read split word
+      goto(E_DRAIN)
+    }
     /** Await the response of `frameWordReq(addr)`. Calls `onWord(w)` with the complete
       * 16-bit word; on the first half of a split word, latches the high byte and
       * re-enters `reqState` for the low byte. */
@@ -1656,7 +1800,15 @@ class ExceptionUnit(
       val va = Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
       dtoVld := True; dtoVpn := va(31 downto 12)
       when(dcLoadRsp.valid) {
-        when(rdCrosses(addr) && !rdSplitLow) {
+        when(dcLoadRsp.payload.fault) {
+          // 2026-09-09: a BUS ERROR on a frame-word read. Previously consumed as if it
+          // had succeeded, so RTE restored a garbage SR / resume PC / frame format from
+          // whatever data rode along with the error response. Checked FIRST, ahead of the
+          // split-word reassembly, so a faulting half never latches into `rdHiByte`.
+          // `addr` -- not the split-aware `va` -- is the ARCHITECTURAL access address the
+          // format-$7 frame must report.
+          busErrorEntry(addr)
+        } elsewhen(rdCrosses(addr) && !rdSplitLow) {
           rdHiByte := dcLoadRsp.payload.data(7 downto 0)
           rdSplitLow := True
           goto(reqState)
@@ -2439,7 +2591,19 @@ class ExceptionUnit(
       }
     }
     F_HDRWAIT.whenIsActive {
-      when(dcLoadRsp.valid && fsRdCrosses && !fsRdSplitLow) {
+      when(dcLoadRsp.valid && dcLoadRsp.payload.fault) {
+        // 2026-09-09: a BUS ERROR on the FRESTORE header read -- previously consumed as a
+        // valid header, so FRESTORE popped a length byte taken from an error response.
+        // Routed to `F_HALT`, the SAME policy `F_RXWAIT` above already applies to a
+        // TRANSLATION fault on this very access, and for the reason `F_HALT`'s own comment
+        // gives: this unit has no unwind machinery for a partially-transferred state frame,
+        // so an FSAVE/FRESTORE transfer fault escalates to the sticky core halt rather
+        // than synthesizing a nested entry. Deliberately NOT the vector-2 treatment the
+        // RTE frame reads get -- those are read-only up to R_REDIR, this family is not.
+        fsRdSplitLow := False
+        fsXlateFault := True
+        goto(F_HALT)
+      } elsewhen(dcLoadRsp.valid && fsRdCrosses && !fsRdSplitLow) {
         // p167: that was the HIGH byte of a split header word; go back for the low byte.
         fsRdHiByte   := dcLoadRsp.payload.data(7 downto 0)
         fsRdSplitLow := True
