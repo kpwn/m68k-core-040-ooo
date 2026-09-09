@@ -99,6 +99,24 @@ trait DebugCommitService {
   def configureHaltAfter(target: UInt, epoch: UInt, armed: Bool, invalidate: Bool): Unit
   /** Surviving debug-domain halt-on-exception configuration. */
   def configureExceptionMask(mask: Bits): Unit
+  /** A7-ODD halt lane (2026-09-09, the boot odd-SSP defect): when `enable`, request a
+    * debug stop once the COMMITTED active-bank A7 has stayed odd for `threshold`
+    * retired macros (the ROM legitimately runs short odd stretches). Read-side: the
+    * PCs retiring at / just before the EVEN->ODD edge and the odd value itself. */
+  def configureA7OddHalt(enable: Bool, threshold: UInt): Unit
+  /** PC-RANGE halt lane: when `enable`, request a debug stop as soon as a macro
+    * RETIRES with its PC inside [lo, hi]. Used to catch a wild jump into memory the
+    * OS never allocated (executing DRAM filler) at the instruction it happens. */
+  def configurePcRangeHalt(enable: Bool, lo: UInt, hi: UInt): Unit
+  def pcRangePc0: UInt   // first in-range PC seen
+  def pcRangePc1: UInt   // the PC retired before it
+  def pcRangePc2: UInt   // and the one before that
+  def pcRangeCount: UInt // in-range entries seen while enabled (16 bits)
+  def a7OddPc0:      UInt   // PC retiring in the edge cycle (0 if none)
+  def a7OddPc1:      UInt   // newest PC retired before the edge
+  def a7OddPc2:      UInt   // the one before that
+  def a7OddValue:    UInt   // the odd A7
+  def a7OddEpisodes: UInt   // EVEN->ODD edges seen while enabled (16 bits)
 }
 
 /** One atomic commit-owner update used by the halted architectural-apply FSM.

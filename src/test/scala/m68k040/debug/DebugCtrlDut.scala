@@ -69,6 +69,11 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   private var haltAfterArmedWire: Bool = null
   private var haltAfterInvalidateWire: Bool = null
   private var haltExceptionMaskWire: Bits = null
+  private var a7OddEnWire: Bool = null
+  private var a7OddThreshWire: UInt = null
+  private var pcRangeEnWire: Bool = null
+  private var pcRangeLoWire: UInt = null
+  private var pcRangeHiWire: UInt = null
 
   override def effectiveHalt: Bool = effectiveHaltWire
   override def autoHaltLatched: Bool = autoHaltWire
@@ -84,6 +89,22 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
   override def haltExceptionVector: UInt = logic.haltExceptionVectorDrive
   override def haltExceptionPc: UInt = logic.haltExceptionPcDrive
   override def haltExceptionFaultAddress: UInt = logic.haltExceptionFaultAddressDrive
+  override def configureA7OddHalt(enable: Bool, threshold: UInt): Unit = {
+    a7OddEnWire := enable
+    a7OddThreshWire := threshold
+  }
+  override def a7OddPc0:      UInt = logic.a7OddZero32
+  override def a7OddPc1:      UInt = logic.a7OddZero32
+  override def a7OddPc2:      UInt = logic.a7OddZero32
+  override def a7OddValue:    UInt = logic.a7OddZero32
+  override def a7OddEpisodes: UInt = logic.a7OddZero16
+  override def configurePcRangeHalt(enable: Bool, lo: UInt, hi: UInt): Unit = {
+    pcRangeEnWire := enable; pcRangeLoWire := lo; pcRangeHiWire := hi
+  }
+  override def pcRangePc0:   UInt = logic.a7OddZero32
+  override def pcRangePc1:   UInt = logic.a7OddZero32
+  override def pcRangePc2:   UInt = logic.a7OddZero32
+  override def pcRangeCount: UInt = logic.a7OddZero16
 
   during setup {
     effectiveHaltWire = Bool()
@@ -101,6 +122,11 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     haltAfterInvalidateWire := False
     haltExceptionMaskWire = Bits(256 bits); haltExceptionMaskWire.allowOverride
     haltExceptionMaskWire := 0
+    a7OddEnWire = Bool(); a7OddEnWire.allowOverride; a7OddEnWire := False
+    a7OddThreshWire = UInt(16 bits); a7OddThreshWire.allowOverride; a7OddThreshWire := U(0, 16 bits)
+    pcRangeEnWire = Bool(); pcRangeEnWire.allowOverride; pcRangeEnWire := False
+    pcRangeLoWire = UInt(32 bits); pcRangeLoWire.allowOverride; pcRangeLoWire := U(0, 32 bits)
+    pcRangeHiWire = UInt(32 bits); pcRangeHiWire.allowOverride; pcRangeHiWire := U(0, 32 bits)
   }
 
   val logic = during build new Area {
@@ -113,6 +139,8 @@ class DebugCommitStubPlugin extends FiberPlugin with DebugCommitService {
     val haltHitInstCountDrive = Reg(UInt(64 bits)) init 0; haltHitInstCountDrive.simPublic()
     val haltAfterConsumedDrive = RegInit(False); haltAfterConsumedDrive.simPublic()
     val haltHitPcDrive = Reg(UInt(32 bits)) init 0; haltHitPcDrive.simPublic()
+    val a7OddZero32 = U(0, 32 bits)
+    val a7OddZero16 = U(0, 16 bits)
     val breakpointHitDrive = spinal.lib.Flow(UInt(2 bits))
     val breakpointHitValidDrive = RegInit(False); breakpointHitValidDrive.simPublic()
     val breakpointHitSlotDrive = Reg(UInt(2 bits)) init 0; breakpointHitSlotDrive.simPublic()
