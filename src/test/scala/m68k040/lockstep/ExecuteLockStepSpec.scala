@@ -6915,6 +6915,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)           // pageA[0] = identity VPN 0 (vectors)
       pokeLE(PAGA + 2 * 4,    0x0L)                          // pageA[2] = NON-RESIDENT (the fault)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
       // The 68040 has ONE MMU: the I-fetch path also translates. IDENTITY-map the code
       // region (8 pages from loadAddr; the oracle treats I-fetch as identity) so the
@@ -7102,6 +7111,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)
       pokeLE(PAGA + 2 * 4,    leafWp)                        // pageA[2] = resident, W=1 (the fault)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)
       val PAGD = 0x00084000L
       pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
@@ -8944,6 +8962,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 2 * 4, 0x0L)                          // pageA[2] = NON-RESIDENT (the pointer-load fault)
       pokeLE(PAGA + 3 * 4, (0x3L << 12) | 0x1L)           // pageA[3] = identity VPN 3 (data, resident)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)       // pageA[0x3f] = identity VPN 0xFF (supervisor stack)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       // pageC[2] holds the PT-write target (the handler writes pageA[2] @ 0x82008 -> page 0x82).
       pokeLE(PTRT + 2 * 4, (PAGC & 0xfffffff0L) | 0x2L)
       pokeLE(PAGC + 2 * 4, (0x82L << 12) | 0x1L)          // pageC[2] = identity VPN 0x82 (PT write)
@@ -9200,6 +9227,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 3 * 4,    0x0L)                          // pageA[3] NON-RESIDENT (D2/D3 -- the fault)
       pokeLE(PAGA + 5 * 4,    (0x5L << 12) | 0x1L)           // pageA[5] identity VPN 5 (scratch dump), resident
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // pageA[0x3f] identity VPN 0xFF (supervisor stack; frame push bypasses translation, kept defensively)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       // Identity-map the code region (I-fetch also translates).
       pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
       pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
@@ -9417,6 +9453,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 3 * 4,    (0x3L << 12) | 0x1L)           // resident (D3/D2)
       pokeLE(PAGA + 5 * 4,    (0x5L << 12) | 0x1L)           // resident (scratch dump)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
       pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
       for (i <- 0 until 8) {
@@ -9623,6 +9668,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 3 * 4,    (0x3L << 12) | 0x1L)
       pokeLE(PAGA + 5 * 4,    (0x5L << 12) | 0x1L)
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
       pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
       for (i <- 0 until 8) {
@@ -12428,6 +12482,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)           // vectors
       pokeLE(PAGA + 2 * 4,    0x0L)                          // VA 0x2000 NON-RESIDENT
       pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // supervisor stack (identity)
+      // 2026-09-09: the supervisor stack REALLY needs `ptr[3]`, not `pageA`. The line
+      // above maps pageA[0x3f], which -- because pageA hangs off ptr[0] -- covers
+      // VA 0x0003F000, NOT the boot SSP's 0x000FF000 (VA[24:18] = 3). It was harmless
+      // for as long as the exception sequencer pushed frames UNTRANSLATED; now that it
+      // translates them, the format-$7 frame at SSP-60 = 0x000FFFC4 walks ptr[3], finds
+      // nothing, and takes a double fault. Map it properly.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3 * 4,    (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f * 4, (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // PT write page (identity)
       pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
       pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)

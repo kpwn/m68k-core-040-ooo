@@ -752,4 +752,107 @@ class Addr32LockStepSpec extends AnyFunSuite {
   test("addr32: an FRESTORE header-read translation fault raises vector 2 and keeps running", VerilatorTest) {
     fsaveFaultRun("frestore-xlate-fault", "frestore (%a0)+", 42)
   }
+
+  // ── 21. THE SAME, WITH 8 KB PAGES -- the granule the board actually runs ────────
+  //
+  // The machine under test has TC = 0x0000C000, i.e. TCR.P = 1, 8 KB pages. `excPaOf`
+  // therefore takes its 8 KB arm -- `excPpn(19 downto 1) ## va(12 downto 0)` -- on every
+  // real exception, and test 19 above exercises only the 4 KB arm, because
+  // `buildMmuTable`/`mapPage` are 4 KB-only. An 8 KB-mode bug would put every exception
+  // frame 4 KB away from where it belongs.
+  //
+  // Both the vector table and the frame are deliberately placed in the UPPER half of
+  // their 8 KB page (offsets 0x1028 and 0x1EF8), which is exactly where the two formulas
+  // disagree: the 4 KB assembly would drop VA[12] and land them 0x1000 lower. Those two
+  // wrong destinations are the ones that get poisoned.
+  test("addr32: exception frame + vector fetch translate with 8 KB pages (TC.P=1)", VerilatorTest) {
+    val loadAddr  = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val PageVa    = 0x01FF6000L                 // 8 KB-aligned
+    val PagePa    = 0x00700000L                 // 8 KB-aligned
+    val VbrVa     = PageVa + 0x1000             // UPPER half -> VA[12] = 1
+    val VecSlotVa = VbrVa + 10 * 4              // 0x01FF7028, page offset 0x1028
+    val StackVa   = PageVa + 0x1F00             // 0x01FF7F00, also upper half
+    val FrameVa   = StackVa - 8                 // 0x01FF7EF8, page offset 0x1EF8
+    def pa8k(va: Long) = PagePa | (va & 0x1FFFL)
+    def pa4k(va: Long) = PagePa | (va & 0x0FFFL)   // what a 4 KB assembly would produce
+
+    val src = Seq(
+      f"move.l #0x$VbrVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x$StackVa%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x$VecSlotVa%x",
+      "moveq #0,%d3",
+      ".short 0xa9c9",
+      "moveq #33,%d4",
+      "bra stop",
+      "handler: move.l 2(%a7),%d0", "addq.l #2,%d0", "move.l %d0,2(%a7)",
+      "moveq #51,%d3", "rte",
+      "stop: bra stop").mkString(" ; ")
+    val image = m68k040.oracle.ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"assemble failed: ${err.reason}")
+    }
+
+    var d3 = -1L; var d4 = -1L; var vecWordAt8k = -1
+    var guard4kIntact = true; var poison4kIntact = true
+    h.compiledDut.doSim(s"addr32-exc-xlate-8k-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+
+      // ── hand-built 8 KB page tables: root VA[31:25], pointer VA[24:18], page VA[17:13]
+      def poke32BE(a: Long, w: Long): Unit =
+        for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      def map8k(va: Long, phys: Long, leaf: Long): Unit = {
+        poke32BE(h.MMU_ROOT + ((va >> 25) & 0x7f) * 4, (h.MMU_PTRT & 0xfffffff0L) | 0x3L)
+        poke32BE(h.MMU_PTRT + ((va >> 18) & 0x7f) * 4, (leaf & 0xfffffff0L) | 0x3L)
+        poke32BE(leaf + ((va >> 13) & 0x1f) * 4, (phys & 0xffffe000L) | 0x1L)
+      }
+      map8k(PageVa, PagePa, h.MMU_PAGT)                                  // data, non-identity
+      for (i <- 0 until 4)                                               // code, identity
+        map8k(loadAddr + i * 0x2000L, loadAddr + i * 0x2000L, h.MMU_PAGT2)
+
+      // Poison exactly where a 4 KB assembly would go.
+      for (i <- 0 until 4) dmem.pokeByte(pa4k(VecSlotVa) + i, Seq(0xDE, 0xAD, 0x00, 0x00)(i))
+      for (i <- 0 until 8) dmem.pokeByte(pa4k(FrameVa) + i, 0xEE)
+
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable  #= true
+      dut.ctrl.logic.pageSize8K #= true          // TCR.P = 1, the board's own posture
+      dut.ctrl.logic.urp #= h.MMU_ROOT; dut.ctrl.logic.srp #= h.MMU_ROOT
+      dut.rob.logic.exc.ss.isp  #= 0x00120000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15
+      dut.wire.logic.seedData #= BigInt(0x00120000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      cd.waitSampling(40000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d4 = probe.readArch(4)
+      vecWordAt8k = (dmem.peekByte(pa8k(FrameVa) + 6) << 8) | dmem.peekByte(pa8k(FrameVa) + 7)
+      guard4kIntact  = (0 until 8).forall(i => dmem.peekByte(pa4k(FrameVa) + i) == 0xEE)
+      poison4kIntact = Seq(0xDE, 0xAD, 0x00, 0x00).zipWithIndex
+                         .forall { case (b, i) => dmem.peekByte(pa4k(VecSlotVa) + i) == b }
+    }
+    assert(d3 == 51L,
+      f"8 KB-mode VECTOR FETCH went to the wrong physical address: the handler never ran " +
+        f"(D3 = 0x$d3%08x, expected 51). A 4 KB page-offset assembly reads " +
+        f"0x${pa4k(VecSlotVa)}%08x instead of 0x${pa8k(VecSlotVa)}%08x.")
+    assert(d4 == 33L, f"8 KB-mode RTE did not resume after the trap (D4 = 0x$d4%08x)")
+    assert(vecWordAt8k == 0x0028,
+      f"8 KB-mode FRAME PUSH is not at 0x${pa8k(FrameVa) + 6}%08x " +
+        f"(read 0x$vecWordAt8k%04x, expected 0x0028)")
+    assert(guard4kIntact,
+      f"8 KB-mode FRAME PUSH landed at the 4 KB address 0x${pa4k(FrameVa)}%08x -- VA[12] " +
+        "was dropped from the page offset")
+    assert(poison4kIntact, "the 4 KB-address poison was modified; the test's assumptions are wrong")
+  }
 }
