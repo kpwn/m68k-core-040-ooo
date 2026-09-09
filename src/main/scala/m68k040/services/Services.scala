@@ -99,6 +99,13 @@ trait DebugCommitService {
     * vector-table address that faulted is VBR + `dblFaultVec`*4. */
   def dblFaultPc:  UInt
   def dblFaultVec: UInt
+  /** 2026-09-09: WHICH fatal condition halted the core, in the `socket.HaltReason`
+    * encoding (0 none, 1 DCACHE_DIAG, 2 FS_XLATE, 3 RESET_VECTOR, 4 ARBITER_WEDGE,
+    * 5 WALKER_PORT_WEDGE, 6 DOUBLE_FAULT). `haltReasonDebug` deliberately collapses every
+    * one of those to the single `DebugHaltReasonCode.FATAL`, so before this the ONLY place
+    * the attribution appeared was an ILA probe -- which needs an ENABLE_ILA bitstream. A
+    * core that halts fatally has to be able to say why. Backs `OFF_HALT_KIND` (0x140). */
+  def haltKind: UInt
   def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit
   /** Surviving debug-domain halt-after configuration. `invalidate` is the accepted
     * target-write pulse; it cancels a stale pipelined comparison on that same edge. */
