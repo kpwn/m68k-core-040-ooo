@@ -2469,7 +2469,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.payload.vaddr #= addr
       dut.probe.logic.loadProbeIn.payload.token #= token
       dut.probe.logic.loadProbeIn.payload.resolved #= true
-      dut.probe.logic.loadProbeIn.payload.paddr #= addr
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addr
       dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
       dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2527,7 +2527,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.payload.vaddr #= addr
       dut.probe.logic.loadProbeIn.payload.token #= token
       dut.probe.logic.loadProbeIn.payload.resolved #= true
-      dut.probe.logic.loadProbeIn.payload.paddr #= addr
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addr
       dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
       dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2602,7 +2602,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.payload.vaddr #= addrA
       dut.probe.logic.loadProbeIn.payload.token #= tokenA
       dut.probe.logic.loadProbeIn.payload.resolved #= true
-      dut.probe.logic.loadProbeIn.payload.paddr #= addrA
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addrA
       dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
       dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2630,7 +2630,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.payload.vaddr #= addrB
       dut.probe.logic.loadProbeIn.payload.token #= tokenB
       dut.probe.logic.loadProbeIn.payload.resolved #= true
-      dut.probe.logic.loadProbeIn.payload.paddr #= addrB
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addrB
       dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
       dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2723,7 +2723,7 @@ class DcacheSpec extends AnyFunSuite {
         dut.probe.logic.loadProbeIn.payload.vaddr #= addr
         dut.probe.logic.loadProbeIn.payload.token #= token
         dut.probe.logic.loadProbeIn.payload.resolved #= true
-        dut.probe.logic.loadProbeIn.payload.paddr #= addr
+        dut.probe.logic.loadProbeIn.payload.paddrHint #= addr
         dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
         dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
         dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2909,7 +2909,7 @@ class DcacheSpec extends AnyFunSuite {
         // Deliberately unresolved: queue allocation/cancellation must not depend on
         // a hit, and the resulting entry must be safe to fall back later.
         dut.probe.logic.loadProbeIn.payload.resolved #= false
-        dut.probe.logic.loadProbeIn.payload.paddr #= 0
+        dut.probe.logic.loadProbeIn.payload.paddrHint #= 0
         dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
         dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
         dut.probe.logic.loadProbeIn.payload.needsLine #= false
@@ -2959,7 +2959,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadProbeIn.payload.vaddr #= addr
       dut.probe.logic.loadProbeIn.payload.token #= token
       dut.probe.logic.loadProbeIn.payload.resolved #= false
-      dut.probe.logic.loadProbeIn.payload.paddr #= 0
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= 0
       dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
       dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadProbeIn.payload.needsLine #= false

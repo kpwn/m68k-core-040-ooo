@@ -46,15 +46,22 @@ object DLoadToken {
   * moment a probe launches, no translation exists yet. That is the entire reason
   * the early probe exists.
   *
-  * Until 2026-09-09 this field was named `paddr` and its one producer assigned it
-  * `tCtx.vaddr` -- a VIRTUAL address in a field the cache tags with. Inert, because
-  * `resolved` is hard-wired False and gates every consumer, but a trap: setting
-  * `resolved := True` would have silently turned virtual addresses into physical tag
-  * comparisons. Harmless under an identity map; a silent FALSE-HIT generator under
-  * any real one, which is the exact failure class this cache spent months chasing.
-  * The field is now named for what it is, and the producer supplies NO hint (0)
-  * rather than a plausible-looking wrong one, so a future `resolved := True` fails
-  * loudly instead of quietly.
+  * Until 2026-09-09 this field was named `paddr` and its one IN-CORE producer
+  * assigned it `tCtx.vaddr` -- a VIRTUAL address in a field the cache tags with.
+  * Inert, because that producer also hard-wires `resolved` False and it gates every
+  * consumer (and note the compile-time `earlyViptEnabled` gate ANDs with `resolved`,
+  * so flipping THAT alone is inert too -- both halves have to change). But a trap:
+  * setting `resolved := True` would have silently turned virtual addresses into
+  * physical tag comparisons. Harmless under an identity map; a silent FALSE-HIT
+  * generator under any real one, which is the exact failure class this cache spent
+  * months chasing. The field is now named for what it is, and the in-core producer
+  * supplies NO hint (0) rather than a plausible-looking wrong one, so a future
+  * `resolved := True` there fails loudly instead of quietly.
+  *
+  * `resolved=1` IS a supported, exercised path -- `DcacheSpec`'s VIPT slice-B tests
+  * drive it directly, with an identity paddr -- so it is not dead code to be deleted.
+  * It is guarded instead: `DcachePlugin` asserts in simulation that an early tag,
+  * once a resolve for the same token arrives, equals the genuinely translated one.
   *
   * THE SAFE EARLY-HIT PATH ALREADY EXISTS and is the one that actually runs:
   * `DcachePlugin`'s `probeResolveTagIn` / `probeUsableIfResolved` /

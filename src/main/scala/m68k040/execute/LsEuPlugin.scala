@@ -1532,7 +1532,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // `paddrHint` used to be assigned `tCtx.vaddr` -- a VIRTUAL address in a field the
     // D-cache builds a PHYSICAL tag from. That was inert (the `resolved` gate below is
     // hard-wired False, and it is this file's ONLY producer) but it was a trap: it made
-    // "set resolved := True" look like a one-line optimisation while silently arming
+    // "set resolved := True" look like a one-line optimisation (and `earlyViptEnabled`
+    // is not the guard people assume -- it ANDs with `resolved`, so flipping it alone
+    // is already inert) while silently arming
     // virtual-vs-physical tag comparisons -- correct under an identity map, a false-hit
     // generator under a real one. Supplying no hint at all means that shortcut now
     // fails loudly rather than plausibly. The SAFE early-hit path is unaffected and
