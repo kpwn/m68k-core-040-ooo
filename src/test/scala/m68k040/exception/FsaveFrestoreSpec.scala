@@ -47,7 +47,20 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
   /** Result of one directed run. */
   private case class Run(mem: BehavioralMemAgent, a7: Long, xlateReqs: Int,
-                         coreHalted: Boolean, sawVector: Int)
+                         coreHalted: Boolean, sawVector: Int,
+                         // 2026-09-09: the two halt causes, separately, so a test can say
+                         // WHICH one fired. `fsXlateFault` is the FSAVE/FRESTORE
+                         // state-frame escalation; `dblFault` is a fault taken while
+                         // already in exception processing.
+                         fsXlateFault: Boolean, dblFault: Boolean,
+                         // `dblFaultVec` latched at the double fault: WHICH vector's entry
+                         // was being processed when the second fault hit. That is the only
+                         // observable proof of an INTERNALLY synthesized entry -- the ROB's
+                         // `exceptionPending` only fires for exceptions an INSTRUCTION
+                         // raises, so `sawVector` cannot see one (the pre-existing
+                         // vector-14 format-error and vector-3 odd-PC re-entries are
+                         // invisible to it for the same reason).
+                         dblVec: Int)
 
   /** Boot a FuzzCoreDut in supervisor mode, run `src`, and return observations.
     *
@@ -181,6 +194,9 @@ class FsaveFrestoreSpec extends AnyFunSuite {
 
       var xlateReqs = 0
       var halted = false
+      var fsFault = false
+      var dblF = false
+      var dblVec = -1
       var vec = -1
       var i = 0
       while (i < cycles) {
@@ -189,12 +205,17 @@ class FsaveFrestoreSpec extends AnyFunSuite {
         if (dut.rob.logic.exc.dxReqValid.toBoolean && dut.rob.logic.exc.dxReqReady.toBoolean)
           xlateReqs += 1
         if (dut.rob.logic.coreHalted.toBoolean) halted = true
+        if (dut.rob.logic.exc.fsXlateFault.toBoolean) fsFault = true
+        if (dut.rob.logic.exc.dblFault.toBoolean) {
+          if (!dblF) dblVec = dut.rob.logic.exc.dblFaultVec.toInt
+          dblF = true
+        }
         if (vec < 0 && dut.rob.logic.exceptionPending.toBoolean)
           vec = dut.rob.logic.exceptionVector.toInt
         i += 1
       }
       val a7 = dut.rob.logic.exc.ss.a7.toLong & 0xffffffffL
-      out = Run(dmem, a7, xlateReqs, halted, vec)
+      out = Run(dmem, a7, xlateReqs, halted, vec, fsFault, dblF, dblVec)
     }
     out
   }
@@ -514,29 +535,58 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       s"(translate-on-VPN-change, not per-word); got $reqs")
   }
 
-  test("a DTLB translation fault during an FSAVE frame store HALTS the core", VerilatorTest) {
-    // The failure mode this whole redesign exists to close: before Task 11 the frame store
-    // proceeded with an identity-physical address as if the access had succeeded. Now the
-    // fault escalates to the sticky coreHalted latch and the transfer STOPS.
+  // ── 2026-09-09: these two used to assert that a translation fault HALTS the core ──
+  //
+  // It does not, and it must not. FSAVE and FRESTORE are ORDINARY INSTRUCTIONS, and
+  // halting is never the correct 68040 response to one faulting: a non-resident or
+  // write-protected state-frame page is an ACCESS FAULT the OS is expected to handle
+  // (page it in, RTE, the instruction re-runs). Task 11 escalated it to `fsXlateFault`
+  // -> `coreHaltedIn` because there was no fault-delivery path in this unit at all; there
+  // is one now (`busErrorEntry`), so the escalation is gone and these tests are INVERTED
+  // rather than deleted -- the behaviour they pin is still exactly the interesting one.
+  //
+  // What this harness makes visible, and why the core still ends up halted: `mmuFaulting`
+  // installs an ALL-ZERO page table, so EVERY data translation faults -- including the
+  // vector-2 entry's own frame push. That second fault IS taken while already in
+  // exception processing, so it is a genuine DOUBLE FAULT and the part genuinely halts
+  // (M68040UM S8.4.2). The two flags are therefore the assertion: `fsXlateFault` must be
+  // CLEAR (the instruction no longer halts on its own account) and `dblFault` must be
+  // SET (the halt is attributed to the entry, not to FSAVE). That is the full escalation
+  // chain -- instruction fault -> access fault -> double fault -- in one run.
+  test("a DTLB translation fault during an FSAVE frame store raises vector 2, not a halt", VerilatorTest) {
     val src80 = (BigInt(0x4001) << 64) | BigInt(0x5555)
     val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true,
                 unimp = Some((0xBEEF, src80, BigInt(0))), mmuFaulting = true,
                 name = "fsave-xlate-fault")
-    assert(r.coreHalted,
-      "a faulting DTLB translation for an FSAVE frame store must drive coreHaltedIn")
-    // And it must actually STOP: no frame word may have been written. The background is a
-    // deterministic 0 fill, and the header word would be 0x4130 if the store had gone ahead.
+    assert(!r.fsXlateFault,
+      "an FSAVE state-frame translation fault must NOT take the halt escalation any more")
+    assert(r.dblFault && r.coreHalted,
+      "it must raise a vector-2 ACCESS FAULT entry instead; because THIS harness leaves " +
+      "every page unmapped, that entry's own frame push then faults in turn -- a real " +
+      "double fault, which must halt")
+    assert(r.dblVec == 2,
+      s"and the entry being processed at the double fault must be the ACCESS FAULT " +
+      s"(vector 2); got vector ${r.dblVec}. That is the escalation chain: instruction " +
+      s"fault -> access fault -> double fault.")
+    // Unchanged and still the point: the transfer must STOP at the fault. The background
+    // is a deterministic 0 fill; the header word would be 0x4130 had the store proceeded.
     val base = StackTop - 52
     assert(frameWord(r, base, 0) == 0x0000,
       f"the frame transfer must not proceed past the fault; header word was " +
       f"0x${frameWord(r, base, 0)}%04X")
   }
 
-  test("a DTLB translation fault during a FRESTORE header read HALTS the core", VerilatorTest) {
+  test("a DTLB translation fault during a FRESTORE header read raises vector 2, not a halt", VerilatorTest) {
     val r = run(f"lea 0x$RestoreBuf%08x,%%a0 ; $frestoreA0 ; done: bra.s done",
                 mmuFaulting = true, name = "frestore-xlate-fault")
-    assert(r.coreHalted,
-      "a faulting DTLB translation for the FRESTORE header read must drive coreHaltedIn")
+    assert(!r.fsXlateFault,
+      "a FRESTORE header-read translation fault must NOT take the halt escalation any more")
+    assert(r.dblFault && r.coreHalted,
+      "it must raise a vector-2 ACCESS FAULT entry instead; that entry's own frame push " +
+      "then faults in turn in this all-unmapped harness -- a real double fault, halt")
+    assert(r.dblVec == 2,
+      s"and the entry being processed at the double fault must be the ACCESS FAULT " +
+      s"(vector 2); got vector ${r.dblVec}")
   }
 
   /** 8 KiB PAGES: the FSAVE frame store must take PA[12] from the untranslated VA.
