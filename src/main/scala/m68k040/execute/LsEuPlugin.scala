@@ -3397,6 +3397,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.loadCmd.payload.token := Mux(ldWalkSelDtlb,
         U(m68k040.cache.DLoadToken.WALK_DTLB, m68k040.cache.DLoadToken.Width bits),
         U(m68k040.cache.DLoadToken.WALK_ITLB, m68k040.cache.DLoadToken.Width bits))
+      // A descriptor read consumes `loadRsp.data`, never the raw line -- so it must NOT
+      // inherit the LS branch's `lineOnly` (which tracks the aligned ring and would
+      // silently exempt the walker from the `DcacheByteLane.extract` wrap tripwire).
+      dcache.loadCmd.payload.lineOnly := False
     }
 
     // ── Store leg ──────────────────────────────────────────────────────────────────
