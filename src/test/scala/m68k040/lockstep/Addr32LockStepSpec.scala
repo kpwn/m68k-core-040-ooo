@@ -1,6 +1,9 @@
 package m68k040.lockstep
 
 import m68k040.VerilatorTest
+import spinal.core._
+import spinal.core.sim._
+import spinal.lib.sim.SparseMemory
 import org.scalatest.funsuite.AnyFunSuite
 
 /** 32-BIT-ADDRESSING lock-step battery.
@@ -418,5 +421,116 @@ class Addr32LockStepSpec extends AnyFunSuite {
       h.runIrqLockStep(f"addr32-hivbr-rteccr-$d%d", src, nInstr = 16,
         irqEvents = Seq((beqPc, 1)), initialSr = 0x2700, maxCycles = 40000)
     }
+  }
+
+  // ── 18. WRITE CODE, CPUSH, THEN EXECUTE IT -- the patch installer's own pattern ──
+  //
+  // NO test in this repository has ever backed the I-cache and the D-cache with the
+  // SAME memory: `runLockStep` gives the I-side its own `SparseMemory` through
+  // `attachProgram` and the D-side an independent `BehavioralMemAgent`, and every
+  // bespoke doSim in `ExecuteLockStepSpec` does the same. Self-modifying code is
+  // therefore STRUCTURALLY unobservable in this harness -- and "store instruction
+  // bytes through the D-cache, CPUSH, then fetch them" is exactly what the System
+  // patch installer does, and exactly the class of transaction v1 (with no copyback
+  // D-cache, hence no dirty line to push) never issues at all.
+  //
+  // These wire ONE `SparseMemory` to both ports and run the pattern for real:
+  //
+  //   jsr (a0)                  -- executes the PRE-IMAGE, so the I-cache caches it
+  //   move.l %d3,%d6            -- witness: proves the pre-image really ran
+  //   move.l #<new code>,(a0)   -- overwrite through the D-cache (dirty, copyback)
+  //   cpush{a,l,p} bc           -- push the dirty line, invalidate the I-cache
+  //   jsr (a0)                  -- MUST now execute the NEW bytes
+  //
+  // A stale fetch leaves D3 at the pre-image's value instead of the new one, and the
+  // program still terminates cleanly, so the failure signal is a wrong VALUE rather
+  // than a crash. The low-address variant is the 24-bit-mode control.
+  private val StaleWord = 0x76114E75L    // moveq #0x11,%d3 ; rts
+  private val FreshWord = 0x765A4E75L    // moveq #0x5A,%d3 ; rts
+
+  private def smcRun(tag: String, codeVa: Long, cpush: String): Unit = {
+    val loadAddr = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val src = Seq(
+      "move.l #0x00120000,%a7",
+      f"move.l #0x$codeVa%x,%%a0",
+      "jsr (%a0)",                                   // runs the PRE-IMAGE  -> d3 = 0x11
+      "move.l %d3,%d6",                              // witness
+      f"move.l #0x$FreshWord%08x,(%%a0)",            // overwrite through the D-cache
+      cpush,
+      "jsr (%a0)",                                   // must run the NEW code -> d3 = 0x5A
+      "stop: bra stop").mkString(" ; ")
+    val image = m68k040.oracle.ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] assemble failed: ${err.reason}")
+    }
+    var d3 = -1L; var d6 = -1L
+    h.compiledDut.doSim(s"$tag-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+
+      // ONE memory behind BOTH cache ports. `loadProgramIFetch` is a plain linear
+      // byte write (architectural big-endian order, byte at the lowest address =
+      // opword MSB), which is the same layout a real `move.l` store produces through
+      // `DcacheByteLane.storeData` -- so the two ports agree byte-for-byte.
+      val mem = SparseMemory()
+      m68k040.sim.AxiMemModel.loadProgramIFetch(mem, loadAddr, image.bytes)
+      m68k040.sim.AxiMemModel.fillIFetchRunAheadGuard(
+        mem, loadAddr + image.bytes.length, m68k040.sim.AxiMemModel.LockStepRunAheadGuardWords)
+      // the PRE-IMAGE routine, plus a `bra .-0` fence so a run-ahead prefetch past the
+      // rts can never execute PRNG fill.
+      for (i <- 0 until 4) mem.write(codeVa + i, ((StaleWord >> (8 * (3 - i))) & 0xff).toByte)
+      m68k040.sim.AxiMemModel.fillIFetchRunAheadGuard(mem, codeVa + 4, 1024)
+
+      m68k040.sim.AxiMemModel.attachReadOnly(dut.icache.logic.axi, cd, sharedMem = mem)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, sharedMem = mem)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= false
+      dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
+      dut.rob.logic.exc.ss.isp  #= 0x00120000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L      // DE|IE
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00120000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      cd.waitSampling(20000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d6 = probe.readArch(6)
+    }
+    // NOT-VACUOUS first: if the pre-image never ran, the harness is wrong, not the RTL.
+    assert(d6 == 0x11L,
+      f"[$tag] VACUOUS: the PRE-IMAGE routine at 0x$codeVa%08x never ran (D6 = 0x$d6%08x, expected 0x11) " +
+        "-- the shared-memory attach or the boot sequence is wrong, not the cache")
+    assert(d3 == 0x5AL,
+      f"[$tag] STALE INSTRUCTION FETCH: after storing new code to 0x$codeVa%08x and `$cpush`, " +
+        f"the fetch still executed the OLD bytes (D3 = 0x$d3%08x, expected 0x5A, pre-image value 0x11)")
+  }
+
+  test("addr32: store code at 0x01FF7000, CPUSHA BC, execute it", VerilatorTest) {
+    smcRun("smc-hi-cpusha", 0x01FF7000L, "cpusha %bc")
+  }
+  test("addr32: store code at 0x01FF7000, CPUSHL BC (line), execute it", VerilatorTest) {
+    smcRun("smc-hi-cpushl", 0x01FF7000L, "cpushl %bc,(%a0)")
+  }
+  test("addr32: store code at 0x01FF7000, CPUSHP BC (page), execute it", VerilatorTest) {
+    smcRun("smc-hi-cpushp", 0x01FF7000L, "cpushp %bc,(%a0)")
+  }
+  // 24-bit-mode controls: the identical pattern below 16 MB.
+  test("addr32 control: store code at 0x00007000, CPUSHA BC, execute it", VerilatorTest) {
+    smcRun("smc-lo-cpusha", 0x00007000L, "cpusha %bc")
+  }
+  test("addr32 control: store code at 0x00007000, CPUSHL BC (line), execute it", VerilatorTest) {
+    smcRun("smc-lo-cpushl", 0x00007000L, "cpushl %bc,(%a0)")
   }
 }
