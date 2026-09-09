@@ -424,6 +424,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainSetBits  = Reg(Bits(8 bits))
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
+    val drainDropAck  = RegInit(False)
+    drainDropAck := False
 
     when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
          !drainNeedRead && !drainReadPend && !walker.io.busy) {
@@ -448,7 +450,18 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainReadPend := True
     }
     when(drainReadPend) { walker.io.loadRsp.valid := False }
-    when(drainReadPend && _walkLoadRsp.valid) {
+    // A FAULTING re-read must not be merged. `data` is meaningless then, and writing
+    // a merge of garbage back over a live descriptor would be far worse than dropping
+    // a U/M update: it is exactly the corruption this whole change exists to remove.
+    // Pop the entry without storing -- the bit is a hint the next walk re-derives, and
+    // the faulting access itself reports the fault through its own path.
+    val drainReadFault = drainReadPend && _walkLoadRsp.valid && _walkLoadRsp.payload.fault
+    when(drainReadFault) {
+      drainReadPend := False
+      drainArmed    := False
+      drainDropAck  := True
+    }
+    when(drainReadPend && _walkLoadRsp.valid && !_walkLoadRsp.payload.fault) {
       drainReadPend := False
       val curByte = _walkLoadRsp.payload.data(7 downto 0)
       val merged  = curByte | drainSetBits
@@ -476,7 +489,9 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore.payload.precise    := False
     when(_walkStore.fire) { drainArmed := False; drainAckWait := True }
     when(drainAckWait && _walkStoreAck) { drainAckWait := False }
-    umq.io.drainAck := drainAckWait && _walkStoreAck
+    // `drainDropAck` pops an entry whose re-read faulted, so a faulting descriptor
+    // cannot wedge the queue head forever.
+    umq.io.drainAck := (drainAckWait && _walkStoreAck) || drainDropAck
 
     // ---- response mux ----
     // hit-class perm fault for a fetch: a user fetch of a supervisor page. (A fetch

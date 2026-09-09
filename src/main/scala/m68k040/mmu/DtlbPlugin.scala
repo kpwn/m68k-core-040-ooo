@@ -571,6 +571,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainSetBits  = Reg(Bits(8 bits))
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
+    val drainDropAck  = RegInit(False)
+    drainDropAck := False
 
     when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
          !drainNeedRead && !drainReadPend && !walker.io.busy) {
@@ -601,7 +603,18 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     }
     // The response to OUR read belongs to us, not to the walker.
     when(drainReadPend) { walker.io.loadRsp.valid := False }
-    when(drainReadPend && _walkLoadRsp.valid) {
+    // A FAULTING re-read must not be merged. `data` is meaningless then, and writing
+    // a merge of garbage back over a live descriptor would be far worse than dropping
+    // a U/M update: it is exactly the corruption this whole change exists to remove.
+    // Pop the entry without storing -- the bit is a hint the next walk re-derives, and
+    // the faulting access itself reports the fault through its own path.
+    val drainReadFault = drainReadPend && _walkLoadRsp.valid && _walkLoadRsp.payload.fault
+    when(drainReadFault) {
+      drainReadPend := False
+      drainArmed    := False
+      drainDropAck  := True
+    }
+    when(drainReadPend && _walkLoadRsp.valid && !_walkLoadRsp.payload.fault) {
       drainReadPend := False
       val curByte = _walkLoadRsp.payload.data(7 downto 0)
       val merged  = curByte | drainSetBits
@@ -640,7 +653,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // entry. `_walkStoreErr` is deliberately not consulted: the pre-existing AXI path
     // did not inspect `bresp` either, and inventing a fault report here would attribute
     // a bus error to whatever instruction happens to be retiring.
-    umq.io.drainAck := drainAckWait && _walkStoreAck
+    // `drainDropAck` pops an entry whose re-read faulted, so a faulting descriptor
+    // cannot wedge the queue head forever.
+    umq.io.drainAck := (drainAckWait && _walkStoreAck) || drainDropAck
 
     // Sim-only sticky fault observation: set whenever a translation resolves with a
     // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step
