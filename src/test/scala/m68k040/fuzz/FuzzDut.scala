@@ -282,7 +282,13 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // `dc.diagFault` into `coreHaltedIn` (a pre-existing parity gap with FullCoreSynth,
     // not this task's business); adding it here would change ported-corpus behaviour for
     // unrelated reasons.
-    rob.logic.coreHaltedIn    := exc.fsXlateFault
+    // 2026-09-09: `exc.dblFault` is a SECOND producer and must be here too, for exactly
+    // the reason the note above gives about the Task-11 one -- without it the DOUBLE
+    // FAULT this harness can genuinely provoke (an all-zero page table makes the
+    // vector-2 entry's OWN frame push fault) is invisible, and a halt that a real 68040
+    // would assert simply does not happen in simulation. Same parity argument, same
+    // shape; `dc.diagFault` deliberately stays out (see the note).
+    rob.logic.coreHaltedIn    := exc.fsXlateFault || exc.dblFault
     exc.sqDrained             := lsEu.sqEmptySig
     // Task P5.4/P5.5 parity with FullCoreSynth (this block mirrors it by hand; the
     // P5.4 `dcQuiesced` line was missing here, leaving the ExceptionUnit default of a
