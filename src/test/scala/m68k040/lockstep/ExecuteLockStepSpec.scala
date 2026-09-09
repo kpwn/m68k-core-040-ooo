@@ -1132,9 +1132,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                      // When set, the ORACLE takes its interrupts at these events while the DUT
                      // is still poked per `irqEvents` -- for a caller that has established the
                      // DUT legally takes the interrupt one boundary later (see a7-irq).
-                     oracleIrqEvents: Option[Seq[(Long, Int)]] = None): Unit = {
+                     oracleIrqEvents: Option[Seq[(Long, Int)]] = None,
+                     // p167 odd-SSP campaign: after the lock-step compare, let the stores
+                     // drain and compare these DATA bytes (each base spans `checkSpan`
+                     // bytes) against the oracle's final memory image from an
+                     // `assembleAndRun` with the SAME interrupt events. Lets a test pin
+                     // the exception FRAME bytes and the locals around it, not just the
+                     // registers. Default empty == every existing call site unchanged.
+                     checkMem: Seq[Long] = Seq.empty, checkSpan: Int = 4,
+                     // D-side AXI timing (mirrors runLockStep's `dcfg`); default zero-latency.
+                     dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+                     // Committed CACR posture (mirrors runLockStep's `cacr`).
+                     cacr: Long = 0x80008000L,
+                     maxCycles: Int = 6000): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val ackVector = if (avec) None else Some(vectorIn)
+    val oracleMem: Map[Long, Int] =
+      if (checkMem.nonEmpty) Musashi.assembleAndRun(src, irqEvents = oracleIrqEvents.getOrElse(irqEvents),
+                                                    interruptAckVector = ackVector, initialSr = Some(initialSr)) match {
+        case Right(st) => st.memoryWrites
+        case Left(err) => fail(s"[$name] Musashi.assembleAndRun failed: ${err.reason}")
+      } else Map.empty
+    val checkAddrs: Seq[Long] = checkMem.flatMap(a => (0L until checkSpan.toLong).map(a + _))
 
     val oracleSteps: Vector[OracleStep] =
       Musashi.assembleAndTrace(src, irqEvents = oracleIrqEvents.getOrElse(irqEvents), interruptAckVector = ackVector,
@@ -1296,7 +1315,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg)
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
@@ -1315,7 +1334,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
-      dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
+      dut.rob.logic.exc.ss.cacr #= BigInt(cacr & 0xffffffffL)   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
       // Task #132: seed MSP when the caller wants a boot M=1 scenario (the
       // throwaway-frame tests). Inactive-bank default (0) is harmless when unused.
       dut.rob.logic.exc.ss.msp #= BigInt(initialMsp.getOrElse(0L) & 0xffffffffL)
@@ -1340,7 +1359,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= false
 
-      var guard = 0; val cap = 6000
+      var guard = 0; val cap = maxCycles
       while (handle.result.size < nInstr && guard < cap) { cd.waitSampling(); guard += 1 }
       assert(handle.result.size >= nInstr,
         s"[$name] only ${handle.result.size}/$nInstr instructions committed within $cap cycles")
@@ -1361,6 +1380,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(res.ok,
         s"[$name] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+      if (checkMem.nonEmpty) {
+        cd.waitSampling(200)
+        val bad = checkAddrs.flatMap { addr =>
+          val expected = oracleMem.getOrElse(addr, 0) & 0xff
+          val got = dmem.peekByte(addr)
+          if (got != expected) Some(f"0x$addr%08x: dut=0x$got%02x oracle=0x$expected%02x") else None
+        }
+        assert(bad.isEmpty, s"[$name] memory mismatch after the interrupted run (${bad.size} bytes):\n    " + bad.mkString("\n    "))
+      }
     }
   }
 
@@ -11982,6 +12010,293 @@ class ExecuteLockStepSpec extends AnyFunSuite {
        (ctag, cacr) <- Seq("DE-on" -> 0x80008000L, "DE-off" -> 0x00008000L)) {
     test(s"a7-byte: cycle-swept IRQ storm over byte SP push/pop + A-line, $ctag, D-side $dtag", VerilatorTest) {
       a7ByteIrqStorm(s"a7-storm-$ctag-$dtag", cacr = cacr, dc = dc)
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // p167 (2026-09-09): EXCEPTION FRAMES AT AN ODD SUPERVISOR STACK POINTER.
+  // The A7-ODD halt lane caught Mac OS running `link %a6,#-75` (odd frame size, byte
+  // locals) at RAM 0x9008 with SSP = 0x0017fec7, then executing A-line traps / JSR /
+  // RTS and taking 60 Hz ticks inside that stretch. A format-$0 frame is 8 bytes below
+  // the SSP, so its four WORDS land at line-relative offsets (SSP-8)&0xF + {0,2,4,6}:
+  // for SSP mod 16 in {7, 5, 3, 1} one word sits at offset 15 and STRADDLES a 16-byte
+  // D-cache line. The pre-existing odd-sp tests only ever used SSP mod 16 in {15, 1}.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Fill the 256 bytes below the boot SSP with a known non-zero pattern so a byte read
+  // from the WRONG address is guaranteed to differ from the frame word it replaces.
+  private val oddSspFill: Seq[String] = Seq("move.w #63,%d1", "fill: move.l #0xa5a5a5a5,-(%sp)", "dbf %d1,fill", "lea 256(%sp),%sp")
+
+  // (b) A-line trap taken and RTE'd with SSP = boot - k, k odd (every odd alignment mod 16).
+  private def oddSspAlineSrc(k: Int): String = (Seq("move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
+    s"lea -$k(%sp),%sp", "move.l #0x11223344,%d1", "move.l #0x0000beef,%d2", "move.w #0x1f,%ccr",
+    ".short 0xa06e", "move.l %sp,%d7", "move.w %sr,%d3", "move.w #0x08,%ccr", ".short 0xa06e", "move.l %sp,%d6",
+    s"lea $k(%sp),%sp", "end: bra.s end",
+    "aline: addq.l #2,2(%sp)", "rte")).mkString(" ; ")
+  for (k <- Seq(1, 3, 5, 7, 9, 11, 13, 15)) {
+    test(s"odd-ssp: A-line trap + RTE with SSP = boot-$k (SSP mod 16 = ${(16 - k) % 16})", VerilatorTest) {
+      val tag = s"odd-ssp-aline-$k"; val src = oddSspAlineSrc(k)
+      val plain = Musashi.assembleAndTrace(src) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
+      }
+      val n = plain.indexWhere(_.pc == plain.last.pc) + 1
+      assert(n > 10 && plain.take(n).exists(st => (st.a(7) & 1L) != 0), s"[$tag] VACUOUS program ($n steps)")
+      runLockStep(tag, src, nInstr = n, maxCycles = 20000)
+    }
+  }
+
+  // The board's stretch (RAM 0x9008..0x905c), reproduced instruction for instruction where
+  // it matters: LINK with an odd frame size, byte locals at fp-7/fp-5, a word local at
+  // fp-66, LEA/PEA, an A-line trap, JSR/BSR/RTS, MOVEM push/pop, word and long push/pop,
+  // then UNLK. `k` (even, 0..14) shifts the boot SSP so the odd SP inside the stretch
+  // takes every value mod 16. `handler` / `aline` are the bodies of the interrupt and
+  // A-line handlers (plain / MOVEM push+pop / a subroutine call).
+  private val oddSspHandlerKinds: Seq[(String, Seq[String])] = Seq(
+    "plain" -> Seq("nop"),
+    "movem" -> Seq("movem.l %d0-%d7/%a0-%a6,-(%sp)", "moveq #0,%d0", "move.l #0,%a6", "movem.l (%sp)+,%d0-%d7/%a0-%a6"),
+    "call"  -> Seq("jsr sub2", "bsr.s sub2", "pea 4(%sp)", "move.l (%sp)+,%d5"))
+  private def oddSspLinkSrc(k: Int, level: Int, handler: Seq[String], aline: Seq[String]): String = {
+    val vecAddr = (24 + level) * 4
+    (Seq("move.l #handler,%d0", f"move.l %%d0,0x$vecAddr%x", "move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
+      s"lea -$k(%sp),%sp",
+      "move.l #0x00003000,%a0", "move.l #0x55555555,%d5", "move.b #0x42,0x0cb3", "move.l %sp,%a5",
+      "move.w #0x2000,%sr",
+      "link %a6,#-75",
+      "move.w #1,2(%a0)",
+      "clr.b -7(%a6)", "clr.b -5(%a6)", "move.w #128,-66(%a6)",
+      "lea sub1(%pc),%a1",
+      "move.b 0x0cb3,%d1", "addq.w #1,%d1", "lea -56(%a6),%a0", "lea -64(%a6),%a2", "move.l %a2,(%a0)",
+      "moveq #17,%d0", ".short 0xa06e",
+      "tst.w (%a2)",
+      "jsr (%a1)", "bsr.s sub1",
+      "pea -7(%a6)", "move.l (%sp)+,%d4",
+      "movem.l %d0-%d3/%a0-%a2,-(%sp)", "moveq #0,%d0", "move.l #0,%a0", "movem.l (%sp)+,%d0-%d3/%a0-%a2",
+      "move.l %d1,-(%sp)", "move.w %d1,-(%sp)", "move.w #0x1f,%ccr", ".short 0xa06e", "move.w (%sp)+,%d5", "move.l (%sp)+,%d6",
+      "move.b -7(%a6),%d2", "move.b -5(%a6),%d3", "move.w -66(%a6),%d4",
+      "unlk %a6",
+      s"lea $k(%sp),%sp", "move.l %sp,%d7", "cmpa.l %a5,%sp",
+      "end: bra.s end",
+      "sub1: rts",
+      "sub2: rts") ++ (Seq("handler:") ++ handler ++ Seq("rte")) ++ (Seq("aline:") ++ aline ++ Seq("addq.l #2,2(%sp)", "rte"))).mkString(" ; ")
+  }
+  // (a)/(b)/(d) straight-line: no external interrupt, every odd alignment, three A-line handler shapes.
+  for (k <- 0 until 16 by 2; (htag, hb) <- oddSspHandlerKinds) {
+    test(s"odd-ssp: LINK #-75 stretch straight-line, boot-$k, A-line handler $htag", VerilatorTest) {
+      val tag = s"odd-ssp-link-$k-$htag"; val src = oddSspLinkSrc(k, 1, Seq("nop"), hb)
+      val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace failed: ${err.reason}")
+      }
+      val n = plain.indexWhere(_.pc == plain.last.pc) + 1
+      assert(plain.take(n).count(st => (st.a(7) & 1L) != 0) > 20, s"[$tag] VACUOUS: too few odd-SP steps")
+      runLockStep(tag, src, nInstr = n, maxCycles = 30000)
+    }
+  }
+  // Same stretch with the D-cache OFF (every access inhibited/precise) and today's crossbar
+  // timing -- the store-to-load forwarding of a just-pushed odd RA under real latency.
+  for (k <- Seq(2, 6, 10, 14); (dtag, dc, cacr) <- Seq(("DE-on-crossbar", m68k040.sim.L2Sweeps.todaysCrossbar, 0x80008000L),
+                                                      ("DE-off-crossbar", m68k040.sim.L2Sweeps.todaysCrossbar, 0x00008000L))) {
+    test(s"odd-ssp: LINK #-75 stretch straight-line, boot-$k, $dtag", VerilatorTest) {
+      val tag = s"odd-ssp-link-$k-$dtag"; val src = oddSspLinkSrc(k, 1, Seq("nop"), oddSspHandlerKinds(1)._2)
+      val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)).getOrElse(fail(s"[$tag] oracle"))
+      val n = plain.indexWhere(_.pc == plain.last.pc) + 1
+      runLockStep(tag, src, nInstr = n, maxCycles = 200000, dcfg = dc, cacr = cacr)
+    }
+  }
+
+  // (c)/(e) an EXTERNAL autovector interrupt recognised at EVERY instruction boundary of the
+  // stretch in turn (one lock-step run per boundary): the boundary before LINK, after it
+  // (SP just went odd), around the A-line traps, on the JSR/BSR/RTS, on UNLK and after.
+  // After each run the FRAME bytes, the bytes just below the frame and the locals at
+  // fp-7/fp-5/fp-66 are compared against the oracle's memory image.
+  private def oddSspIrqSweep(tag: String, k: Int, level: Int, handler: Seq[String], aline: Seq[String],
+                             dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+                             cacr: Long = 0x80008000L, onlyBoundaries: Option[Seq[Int]] = None): Unit = {
+    val src = oddSspLinkSrc(k, level, handler, aline)
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2700)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace (plain) failed: ${err.reason}")
+    }
+    val endPc = plain.last.pc
+    val endIdx = plain.indexWhere(_.pc == endPc)
+    val firstOdd = plain.indexWhere(st => (st.a(7) & 1L) != 0)
+    val lastOdd  = plain.lastIndexWhere(st => (st.a(7) & 1L) != 0)
+    assert(firstOdd > 0 && lastOdd > firstOdd && lastOdd + 2 <= endIdx, s"[$tag] odd stretch not found ($firstOdd..$lastOdd, end $endIdx)")
+    // OracleStep.pc is the POST-step pc => plain(i).pc is the boundary BEFORE the next
+    // instruction. firstOdd-1 = before LINK ... lastOdd+1 = after UNLK.
+    val boundaryPcs = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc).distinct
+    val a6 = plain(firstOdd).a(6)
+    val locals = Seq(a6 - 7, a6 - 5, a6 - 66, a6 - 65)
+    def frameBaseOf(tr: Vector[OracleStep]): Long = {
+      val j = tr.indexWhere(st => ((st.sr >> 8) & 7) == level)
+      assert(j > 0, s"[$tag] interrupt entry not found in the oracle trace"); tr(j).a(7)
+    }
+    val chosen = onlyBoundaries.map(sel => sel.map(boundaryPcs(_))).getOrElse(boundaryPcs)
+    for ((pc, i0) <- chosen.zipWithIndex) {
+      val i = boundaryPcs.indexOf(pc)
+      val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pc, level))) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[$tag] Musashi.assembleAndTrace (irq@$pc) failed: ${err.reason}")
+      }
+      val kEnd = withIrq.indexWhere(_.pc == endPc)
+      assert(kEnd > endIdx, f"[$tag] IRQ at 0x$pc%08x: the interrupt was not taken (trace reached `end` at step $kEnd)")
+      val fb = frameBaseOf(withIrq)
+      val mem = (fb - 4 until fb + 8) ++ locals
+      println(f"[$tag] boundary $i: IRQ at 0x$pc%08x, oracle frame base 0x$fb%08x (mod 16 = ${fb & 15})")
+      val exact = try {
+        runIrqLockStep(f"$tag-b$i", src, nInstr = (kEnd + 1) min withIrq.size, irqEvents = Seq((pc, level)),
+                       initialSr = 0x2700, checkMem = mem, checkSpan = 1, dcfg = dcfg, cacr = cacr, maxCycles = 60000); true
+      } catch { case _: org.scalatest.exceptions.TestFailedException if i + 1 < boundaryPcs.size => false }
+      if (!exact) {
+        // The harness raises IPL the cycle the event's predecessor retires; with a 2-wide
+        // retire the DUT can legally take the interrupt ONE boundary later (see a7-irq).
+        // Re-check the same DUT run against the boundary-(i+1) oracle -- exact lock-step
+        // either way; if that fails too, the failure is real and is reported.
+        val pc2 = boundaryPcs(i + 1)
+        val withIrq2 = Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pc2, level))).getOrElse(fail(s"[$tag] oracle"))
+        val k2 = withIrq2.indexWhere(_.pc == endPc)
+        val fb2 = frameBaseOf(withIrq2)
+        println(f"[$tag] boundary $i (0x$pc%08x) did not match exactly; re-checking the DUT against the boundary-${i + 1} oracle (frame base 0x$fb2%08x)")
+        runIrqLockStep(f"$tag-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size, irqEvents = Seq((pc, level)), initialSr = 0x2700,
+                       oracleIrqEvents = Some(Seq((pc2, level))), checkMem = (fb2 - 4 until fb2 + 8) ++ locals, checkSpan = 1,
+                       dcfg = dcfg, cacr = cacr, maxCycles = 60000)
+      }
+    }
+  }
+  for (k <- 0 until 16 by 2) {
+    test(s"odd-ssp: level-1 IRQ at every boundary of the LINK #-75 stretch, boot-$k, plain handlers", VerilatorTest) {
+      oddSspIrqSweep(s"odd-ssp-irq1-$k", k, 1, Seq("nop"), Seq("nop"))
+    }
+  }
+  for (k <- Seq(2, 6, 10, 14); (htag, hb) <- oddSspHandlerKinds.drop(1)) {
+    test(s"odd-ssp: level-1 IRQ at every boundary of the LINK #-75 stretch, boot-$k, handlers $htag", VerilatorTest) {
+      oddSspIrqSweep(s"odd-ssp-irq1-$k-$htag", k, 1, hb, hb)
+    }
+  }
+  for (k <- Seq(2, 10)) {
+    test(s"odd-ssp: level-7 (NMI) IRQ at every boundary of the LINK #-75 stretch, boot-$k", VerilatorTest) {
+      oddSspIrqSweep(s"odd-ssp-irq7-$k", k, 7, Seq("nop"), Seq("nop"))
+    }
+  }
+  for (k <- Seq(2, 10); (dtag, cacr) <- Seq("DE-on" -> 0x80008000L, "DE-off" -> 0x00008000L)) {
+    test(s"odd-ssp: level-1 IRQ at every boundary of the LINK #-75 stretch, boot-$k, $dtag + crossbar timing", VerilatorTest) {
+      oddSspIrqSweep(s"odd-ssp-irq1-$k-$dtag-xbar", k, 1, Seq("nop"), Seq("nop"), dcfg = m68k040.sim.L2Sweeps.todaysCrossbar, cacr = cacr)
+    }
+  }
+
+  // (f) a format-$7 ACCESS FAULT (page fault on a byte store) taken with the SSP ODD and
+  // returned. The 60-byte frame sits at SSP-60, so its SR / PC-hi / PC-lo / format words
+  // land at line-relative offset 15 for SSP mod 16 = 11 / 9 / 7 / 5 (k = 5 / 7 / 9 / 11);
+  // k = 1 is the non-crossing control. Same MMU layout as the page-fault lock-step above
+  // (VA 0x2000 non-resident, handler maps it, RTE re-executes the store); the supervisor
+  // stack page (VPN 0xFF) is identity-mapped. Registers/PC/SR/A7 are lock-stepped; the
+  // frame's SR/PC/format words and the re-executed store's landing are checked directly.
+  private def oddSspPageFaultRun(tag: String, k: Int): Unit = {
+    val loadAddr = ProgramAssembler.DefaultLoadAddress
+    val PTRT = 0x00081000L; val PAGA = 0x00082000L; val PAGC = 0x00083000L; val PAGD = 0x00084000L
+    val dataPPN = 0x1000L
+    val src =
+      "move.l #handler,%d1 ; move.l %d1,0x8 ; " +
+      s"lea -$k(%sp),%sp ; move.l %sp,%a5 ; move.w #0x1f,%ccr ; " +
+      "moveq #42,%d0 ; move.b %d0,0x2003 ; " +           // byte store FAULTS, re-runs after RTE
+      s"move.l %sp,%d7 ; lea $k(%sp),%sp ; " +
+      "loop: bra loop ; " +
+      "handler: move.l #0x01000001,%d1 ; move.l %d1,0x82008 ; rte"
+    val oraclePt = Seq(0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L), PTRT -> ((PAGA & 0xfffffff0L) | 0x2L))
+    val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x3000L, ptPreload = oraclePt))
+    val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[$tag] oracle trace failed: ${err.reason}")
+    }
+    val nInstr = oracleSteps.indexWhere(_.pc == oracleSteps.last.pc) + 1
+    assert(nInstr >= 11, s"[$tag] oracle reached `loop` after only $nInstr steps -- fault not taken?")
+    val oracle = oracleSteps.take(nInstr)
+    val image = ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"[$tag] assemble failed: ${err.reason}")
+    }
+    val faultPc = loadAddr + 6 + 6 + 4 + 2 + 4 + 2   // vec-imm(6) vec-store(6) lea(4) move.l sp,a5(2) move #,ccr(4) moveq(2)
+    compiledDut.doSim(freshSimName(tag)) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val handle = new WhiteboxCapture.Handle
+      def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
+        handle.onWb(w.robId.toInt, WhiteboxCapture.Wb(
+          dstArch = w.dstArch.toInt, result = w.result.toLong & 0xffffffffL,
+          intWrite = w.intWrite.toBoolean, nzvc = w.nzvc.toInt, nzvcWrite = w.nzvcWrite.toBoolean,
+          x = if (w.x.toBoolean) 1 else 0, xWrite = w.xWrite.toBoolean, divRem = w.divRem.toBoolean, secondDst = secondDst))
+      }
+      cd.onSamplings {
+        captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
+        locally { val bw = dut.branchEu.logic.wbObs; if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)) }
+        locally { val sc = dut.lsEu.sqCompletionPort; if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)) }
+        for (kk <- 0 until 2) {
+          val c = dut.rob.logic.commitObs(kk)
+          if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
+            sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL, macroLast = c.macroLast.toBoolean)
+        }
+        locally { val c = dut.rob.logic.commitObs(2)
+          if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
+            if (c.ccrFoldValid.toBoolean) c.ccrFold.toInt & 0xf else -1,
+            setCcr5 = if (c.setCcr5Valid.toBoolean) c.setCcr5.toInt & 0x1f else -1,
+            msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
+            isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) }
+      }
+      attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)
+      pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)
+      pokeLE(PAGA + 0 * 4,    (0x0L << 12) | 0x1L)           // vectors
+      pokeLE(PAGA + 2 * 4,    0x0L)                          // VA 0x2000 NON-RESIDENT
+      pokeLE(PAGA + 0x3f * 4, (0xffL << 12) | 0x1L)          // supervisor stack (identity)
+      pokeLE(PAGC + 2 * 4,    (0x82L << 12) | 0x1L)          // PT write page (identity)
+      pokeLE(PTRT + (((loadAddr >> 18) & 0x7f).toInt) * 4, (PAGD & 0xfffffff0L) | 0x2L)
+      pokeLE(MMU_ROOT + (((loadAddr >> 25) & 0x7f).toInt) * 4, (PTRT & 0xfffffff0L) | 0x2L)
+      for (i <- 0 until 8) {
+        val cva = loadAddr + i * 0x1000L
+        pokeLE(PAGD + (((cva >> 12) & 0x3f).toInt) * 4, (((cva >> 12) & 0xfffffL) << 12) | 0x1L)
+      }
+      dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
+      dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= false; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true; cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= true; dut.ctrl.logic.urp #= 0x80000L; dut.ctrl.logic.srp #= 0x80000L
+      dut.rob.logic.exc.ss.isp #= 0x00100000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+      var guard = 0; val cap = 12000; var sawFault = false
+      while (handle.result.size < nInstr && guard < cap) {
+        if (dut.dtlb.logic.faultSeen.toBoolean) sawFault = true
+        cd.waitSampling(); guard += 1
+      }
+      assert(sawFault, s"[$tag] the byte store to the non-resident page must flag a DTLB fault")
+      assert(handle.result.size >= nInstr, s"[$tag] only ${handle.result.size}/$nInstr committed within $cap cycles")
+      val fb = 0x100000L - k - 60
+      def pk16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def pk32(a: Long): Long = ((pk16(a).toLong << 16) | pk16(a + 2)) & 0xffffffffL
+      assert(pk16(fb) == 0x271f, f"[$tag] frame SR=0x${pk16(fb)}%04x expected 0x271f (frame base 0x$fb%08x)")
+      assert(pk32(fb + 2) == faultPc, f"[$tag] frame PC=0x${pk32(fb + 2)}%08x expected the faulting-instr PC 0x$faultPc%08x")
+      assert(pk16(fb + 6) == 0x7008, f"[$tag] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008")
+      assert(pk32(fb + 8) == 0x2003L, f"[$tag] frame EA=0x${pk32(fb + 8)}%08x expected 0x2003")
+      val res = LockStep.compare(handle.result.take(nInstr), oracle)
+      assert(res.ok, s"[$tag] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
+        s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
+      cd.waitSampling(200)
+      val pa = (dataPPN << 12) | 0x003L
+      assert(dmem.peekByte(pa) == 0x2a, f"[$tag] re-executed byte store must land 0x2a at PA 0x$pa%08x (got 0x${dmem.peekByte(pa)}%02x)")
+    }
+  }
+  for (k <- Seq(1, 5, 7, 9, 11)) {
+    test(s"odd-ssp: format-7 page fault on a byte store with SSP = boot-$k (frame base mod 16 = ${(0x100000 - k - 60) & 15})", VerilatorTest) {
+      oddSspPageFaultRun(s"odd-ssp-pf-$k", k)
     }
   }
 }
