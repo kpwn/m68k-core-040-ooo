@@ -1,6 +1,7 @@
 package m68k040.lockstep
 
 import m68k040.VerilatorTest
+import spinal.core._
 import spinal.core.sim._
 import spinal.lib.sim.SparseMemory
 import org.scalatest.funsuite.AnyFunSuite
@@ -61,7 +62,7 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
   /** The boot poke sequence every bespoke full-core sim in this repo repeats. */
   private def boot(dut: ExecuteLockStepSpec#FullCoreDut, cd: ClockDomain, loadAddr: Long,
                    mmuOn: Boolean, page8K: Boolean, urp: Long, srp: Long,
-                   cacr: Long, sp: Long): Unit = {
+                   cacr: Long, sp: Long, dtt0: Long = 0L): Unit = {
     dut.fa.logic.redirect.valid #= false
     dut.fa.logic.resume.valid   #= false
     dut.rob.logic.flush.valid   #= false
@@ -76,6 +77,10 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
     dut.ctrl.logic.pageSize8K #= page8K
     dut.ctrl.logic.urp #= urp
     dut.ctrl.logic.srp #= srp
+    // Poked HERE, before the redirect that starts the program -- not after `boot`
+    // returns. The guest's very first data access (staging its vector table) already
+    // needs the transparent mapping, and it is only a handful of instructions in.
+    dut.ctrl.logic.dtt0 #= dtt0
     dut.rob.logic.exc.ss.isp  #= sp
     dut.rob.logic.exc.ss.cacr #= cacr
     dut.wire.logic.seedValid #= true
@@ -492,5 +497,214 @@ class AddrSpaceLockStepSpec extends AnyFunSuite {
       f"CACR.IE HAS NO EFFECT: after `movec #0,%%cacr` cleared IE, the fetch STILL " +
         f"served the stale cached bytes (D3 = 0x$d3%08x, expected 0x5A). The " +
         "instruction cache is unconditionally enabled -- CACR bit 15 has no reader.")
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // 6. EXCEPTIONS MUST STILL WORK WHEN TRANSLATION IS NOT PAGED
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //
+  // 2026-09-09 REGRESSION HUNT. The preceding slice made the exception sequencer
+  // translate its frame pushes, RTE frame pops and vector fetches through the DTLB
+  // instead of assuming PA = VA (ExceptionUnit's `X_REQ`/`X_WAIT`). That is right for
+  // a paged machine -- but the Quadra runs its ENTIRE early boot with TC.E = 0, and
+  // it takes exceptions the whole way. If the translation port fails to answer, or
+  // answers `fault`, when paging is off, then every early-boot exception breaks in a
+  // way it did not before: `X_WAIT` waits forever, or the entry becomes the
+  // `E_DBLFAULT` processor halt.
+  //
+  // The board evidence that prompted these: a build carrying that slice sat in a ROM
+  // diagnostic loop with SysError 99, in 24-BIT addressing mode -- the configuration
+  // the previous build booted 8/8. A failure in the WORKING configuration is worse
+  // than an unfixed failure in the broken one.
+  //
+  // There are exactly three ways an address resolves on a 68040, and the exception
+  // path has to survive all three. These test them in order:
+  //   (a) paging DISABLED  -- DtlbPlugin's `!mmuEnable` identity arm;
+  //   (b) paging turned ON MID-STREAM -- both arms in one instruction stream, which
+  //       also pins the sequencer's one-entry translation cache (`excVpnValid` /
+  //       `excLastVpn`) being invalidated across the TC write;
+  //   (c) a TRANSPARENT TRANSLATION REGISTER -- resolved with no table walk at all,
+  //       the arm that runs before the tables even exist.
+
+  test("exc: an exception with the MMU DISABLED still frames, vectors and returns", VerilatorTest) {
+    val loadAddr = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val SysVa    = 0x00300000L          // MMU off -> PA = VA
+    val StackVa  = SysVa + 0xF00
+    val FrameVa  = StackVa - 8
+    val VecSlot  = SysVa + 10 * 4
+
+    val src = Seq(
+      f"move.l #0x$SysVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x$StackVa%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x$VecSlot%x",
+      "moveq #0,%d3", "moveq #0,%d5",
+      ".short 0xa9c9",
+      "moveq #11,%d5",
+      "bra stop",
+      "handler: moveq #33,%d3", "rte",
+      "stop: bra stop").mkString(" ; ")
+    val image = assemble("exc-mmu-off", src, loadAddr)
+
+    var d3, d5 = -1L
+    var fmtWord = -1
+    h.compiledDut.doSim(s"exc-mmu-off-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // No page tables at all -- there is nothing to walk and nothing that should try.
+      boot(dut, cd, loadAddr, mmuOn = false, page8K = false,
+           urp = 0L, srp = 0L, cacr = 0x80008000L, sp = 0x00120000L)
+      cd.waitSampling(40000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d5 = probe.readArch(5)
+      fmtWord = (dmem.peekByte(FrameVa + 6) << 8) | dmem.peekByte(FrameVa + 7)
+    }
+
+    assert(d3 == 33L,
+      f"MMU-OFF EXCEPTION BROKEN: the handler never ran (D3 = 0x$d3%08x, expected 33). " +
+        "With TC.E = 0 the exception sequencer's DTLB request must be answered by the " +
+        "identity arm; if it is never answered X_WAIT hangs, and if it answers `fault` " +
+        "the entry becomes an E_DBLFAULT halt. This is the whole of early boot.")
+    assert(fmtWord == 0x0028,
+      f"MMU-OFF FRAME PUSH went to the wrong address: the format/vector word at " +
+        f"0x${FrameVa + 6}%08x reads 0x$fmtWord%04x, expected 0x0028 (vector 10)")
+    assert(d5 == 11L,
+      f"MMU-OFF RTE did not resume after the trap (D5 = 0x$d5%08x, expected 11)")
+  }
+
+  test("exc: exceptions either side of the MOVEC that ENABLES paging", VerilatorTest) {
+    val loadAddr  = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val OffSysVa  = 0x00300000L         // used while TC.E = 0, so PA = VA
+    val OffStack  = OffSysVa + 0xF00
+    val OnSysVa   = 0x01FF6000L         // used after TC.E = 1, mapped NON-identity...
+    val OnSysPa   = 0x00700000L         // ...to here
+    val OnStack   = OnSysVa + 0xF00
+    val OnFramePa = (OnSysPa + 0xF00) - 8
+    val OnFrameVa = OnStack - 8         // where an UNtranslated push would land
+
+    // Both vector tables are written while paging is still off, so the second one is
+    // written at its PHYSICAL address -- exactly how firmware stages a table it will
+    // only start using once it turns the MMU on.
+    val src = Seq(
+      f"move.l #0x$OffSysVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x$OffStack%x,%%a7",
+      "move.l #h1,%d1", f"move.l %%d1,0x${OffSysVa + 40}%x",
+      "move.l #h2,%d1", f"move.l %%d1,0x${OnSysPa + 40}%x",
+      "moveq #0,%d3", "moveq #0,%d4", "moveq #0,%d5", "moveq #0,%d6",
+      ".short 0xa9c9",                                   // trap 1: paging OFF
+      "moveq #11,%d5",
+      "move.l #0x8000,%d0", "movec %d0,%tc",             // TC.E = 1, 4 KB pages
+      f"move.l #0x$OnSysVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x$OnStack%x,%%a7",
+      ".short 0xa9c9",                                   // trap 2: paging ON
+      "moveq #22,%d6",
+      "bra stop",
+      "h1: moveq #33,%d3", "rte",
+      "h2: moveq #44,%d4", "rte",
+      "stop: bra stop").mkString(" ; ")
+    val image = assemble("exc-mmu-enable", src, loadAddr)
+
+    var d3, d4, d5, d6 = -1L
+    var fmtOn = -1
+    var vaGuardIntact = true
+    h.compiledDut.doSim(s"exc-mmu-enable-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Code identity-mapped (the I side translates too once TC.E is set) + the
+      // post-enable system page mapped NON-identity.
+      h.buildMmuTable(dmem, OnSysVa, OnSysPa >> 12)
+      // Also map the pre-enable region identity, so nothing that lingers there faults.
+      // MMU_PAGT, not MMU_PAGT2: `buildMmuTable` fills MMU_PAGT2 entries 0..7 with the
+      // eight identity-mapped CODE pages, and 0x00300000's page index is 0 -- the same
+      // slot 0x40800000 occupies. Writing it there would silently re-point the first
+      // code page at 0x00300000. MMU_PAGT's only other occupant is OnSysVa at index
+      // 0x36, so index 0 is free.
+      h.mapPage(dmem, OffSysVa, OffSysVa >> 12, h.MMU_PAGT)
+      for (i <- 0 until 8) dmem.pokeByte(OnFrameVa + i, 0xEE)   // untranslated destination
+
+      boot(dut, cd, loadAddr, mmuOn = false, page8K = false,
+           urp = h.MMU_ROOT, srp = h.MMU_ROOT, cacr = 0x80008000L, sp = 0x00120000L)
+      cd.waitSampling(60000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d4 = probe.readArch(4)
+      d5 = probe.readArch(5); d6 = probe.readArch(6)
+      fmtOn = (dmem.peekByte(OnFramePa + 6) << 8) | dmem.peekByte(OnFramePa + 7)
+      vaGuardIntact = (0 until 8).forall(i => dmem.peekByte(OnFrameVa + i) == 0xEE)
+    }
+
+    assert(d3 == 33L && d5 == 11L,
+      f"the PAGING-OFF exception broke (D3 = 0x$d3%08x expected 33, D5 = 0x$d5%08x " +
+        "expected 11) -- see the MMU-DISABLED test above")
+    assert(d4 == 44L,
+      f"the PAGING-ON exception never reached its handler (D4 = 0x$d4%08x, expected 44). " +
+        "The sequencer caches ONE translation (`excVpnValid`/`excLastVpn`); if that " +
+        "cache is not invalidated when TC changes, the second entry reuses the first " +
+        "episode's PPN -- which was an identity one taken while paging was off.")
+    assert(fmtOn == 0x0028,
+      f"the PAGING-ON frame is not at its TRANSLATED address 0x${OnFramePa + 6}%08x " +
+        f"(reads 0x$fmtOn%04x, expected 0x0028)")
+    assert(vaGuardIntact,
+      f"the PAGING-ON frame landed at the UNtranslated address 0x$OnFrameVa%08x -- " +
+        "the push used PA = VA even though paging was on")
+    assert(d6 == 22L,
+      f"the PAGING-ON RTE did not resume after the trap (D6 = 0x$d6%08x, expected 22)")
+  }
+
+  test("exc: an exception whose stack and vectors resolve only via DTT0", VerilatorTest) {
+    val loadAddr = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val SysVa    = 0x01FF6000L        // top byte 0x01 -- covered by DTT0 below...
+    val StackVa  = SysVa + 0xF00      // ...and DELIBERATELY absent from the page tables
+    val FrameVa  = StackVa - 8
+    val VecSlot  = SysVa + 10 * 4
+    // base = 0x01, mask = 0x00 (exact top-byte match), E = bit15, S = bit14 (either
+    // privilege), CM = 00 (cacheable writethrough). Same shape as the board's own
+    // DTT0 = 0xF900C060, which is how the ROM marks MMIO before paging exists.
+    val Dtt0     = 0x0100C000L
+
+    val src = Seq(
+      f"move.l #0x$SysVa%x,%%d0", "movec %d0,%vbr",
+      f"move.l #0x$StackVa%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x$VecSlot%x",
+      "moveq #0,%d3", "moveq #0,%d5",
+      ".short 0xa9c9",
+      "moveq #11,%d5",
+      "bra stop",
+      "handler: moveq #33,%d3", "rte",
+      "stop: bra stop").mkString(" ; ")
+    val image = assemble("exc-ttr", src, loadAddr)
+
+    var d3, d5 = -1L
+    var fmtWord = -1
+    h.compiledDut.doSim(s"exc-ttr-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Code identity-mapped; the data page argument is a THROWAWAY far from SysVa,
+      // so the vector table and stack have NO page-table entry of any kind. Only the
+      // transparent-translation register can resolve them -- if the exception path
+      // ignored TTRs the walk would fault NON_RESIDENT and halt on a double fault.
+      h.buildMmuTable(dmem, 0x00300000L, 0x00300L)
+
+      boot(dut, cd, loadAddr, mmuOn = true, page8K = false,
+           urp = h.MMU_ROOT, srp = h.MMU_ROOT, cacr = 0x80008000L, sp = 0x00120000L,
+           dtt0 = Dtt0)
+      cd.waitSampling(40000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d5 = probe.readArch(5)
+      fmtWord = (dmem.peekByte(FrameVa + 6) << 8) | dmem.peekByte(FrameVa + 7)
+    }
+
+    assert(d3 == 33L,
+      f"TTR-COVERED EXCEPTION BROKEN: the handler never ran (D3 = 0x$d3%08x, expected " +
+        "33). The stack and vector table have no page-table entry at all, so DTT0 is " +
+        "the only thing that can resolve them -- this is the arm that runs before the " +
+        "tables exist.")
+    assert(fmtWord == 0x0028,
+      f"TTR-COVERED FRAME PUSH went to the wrong address: the format/vector word at " +
+        f"0x${FrameVa + 6}%08x reads 0x$fmtWord%04x, expected 0x0028")
+    assert(d5 == 11L, f"TTR-COVERED RTE did not resume (D5 = 0x$d5%08x, expected 11)")
   }
 }
