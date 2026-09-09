@@ -318,6 +318,22 @@ trait GshareUpdateService {
   * boundary, so it is stable for any access issued between those boundaries. */
 trait PrivilegeService {
   def supervisor: Bool
+  /** SFC / DFC -- the 3-bit source / destination FUNCTION CODE registers (MOVEC
+    * control registers 0x000 / 0x001, stored in `SystemState`). MOVES is the ONE
+    * instruction whose data access does not run in the current privilege level's
+    * address space: it drives FC from SFC (read form) or DFC (write form), and on
+    * a 68040 FC[2] IS the supervisor/user address-space selector -- it picks URP vs
+    * SRP for the table search and it is the bit the ATC's supervisor-only page
+    * protection is checked against. Everything else (including the SR-changing
+    * system ops) uses `supervisor` above.
+    *
+    * Same ROB-owned, `setup`-allocated-wire shape as `supervisor` for the identical
+    * Fiber-cycle reason. Reading these LIVE in an execute-stage plugin is sound
+    * because the only writer is MOVEC, which is a SERIALIZING sysOp: it retires
+    * alone at the ROB head (so every older MOVES has already executed) and squashes
+    * everything younger (so every younger MOVES re-executes after the update). */
+  def sourceFc: UInt
+  def destFc: UInt
 }
 
 /** Owned by the ROB (mirrors `ss.cacr(31)` — the SAME committed register the
@@ -330,6 +346,15 @@ trait PrivilegeService {
   * shape of this hazard). */
 trait CacheControlService {
   def dcacheEnabled: Bool
+  /** CACR bit 15 (IE), the INSTRUCTION-cache enable -- the I-side twin of bit 31.
+    * Consumed by `IcachePlugin`, which folds it into the fetch's cacheability
+    * verdict exactly where the LS EU folds `dcacheEnabled` into the D-side access's
+    * cache mode. Until 2026-09-09 this bit had NO reader anywhere in the core: the
+    * instruction cache was unconditionally enabled and could not be turned off, so
+    * software that clears IE and relies on that instead of an explicit CINV executed
+    * stale instruction bytes -- silent wrong CODE, and a difference from the v1 core
+    * that boots the same machine. */
+  def icacheEnabled: Bool
 }
 
 /** The ONE 68040 MMU control (TC enable + separate URP/SRP root pointers + the four

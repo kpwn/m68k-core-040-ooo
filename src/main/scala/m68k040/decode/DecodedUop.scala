@@ -657,6 +657,23 @@ case class DecodedUop() extends Bundle {
   // The LS-EU muxes its store-data source between the raw register read and the
   // already-computed auto-update value (s1AnWb) on this bit. Default False.
   val movesAliasStore = Bool()
+  // ── MOVES ALTERNATE ADDRESS SPACE (SFC / DFC) ───────────────────────────────
+  // True on the ONE memory µop of a MOVES macro (the store of the write form, the
+  // load of the read form). MOVES is the only 68040 instruction whose data access
+  // does not run in the current privilege level's address space: the function code
+  // it drives on the bus comes from SFC (read) or DFC (write), NOT from SR.S. FC[2]
+  // is the supervisor/user address-space selector, so it -- not the live S bit --
+  // must choose URP vs SRP for a table search and must be the bit the ATC's
+  // supervisor-only page protection is checked against. That is the entire point of
+  // the instruction: supervisor code uses MOVES to reach USER space.
+  //
+  // This does NOT affect the instruction's own PRIVILEGE check. MOVES is privileged
+  // whatever SFC/DFC hold, so `needsSupervisor` stays on the live S bit; only the
+  // ADDRESS SPACE of the access moves. Keeping the two separate is load-bearing: if
+  // the translate bit and the privilege bit were one field, `moves.l %d0,(%a0)` run
+  // in USER mode with DFC=5 would look supervisor to the vector-8 check and skip its
+  // privilege violation. Default False.
+  val altAddrSpace = Bool()
   // ── MOVE from/to SR/CCR (ALU cluster) ───────────────────────────────────────
   // fromCcr: the int result = the CCR byte {X,N,Z,V,C} zero-extended (.W). fromSr:
   // the int result = the 16-bit SR = {srSysIn, CCR byte} zero-extended (.W). Both

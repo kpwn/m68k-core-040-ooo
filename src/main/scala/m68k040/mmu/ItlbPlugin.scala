@@ -132,7 +132,20 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // in-page offset in 8K mode, not the page number, so it must be excluded from
     // the TLB tag/index compare — two fetches differing only in VA[12] address the
     // same 8K page.
-    def tlbKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
+    //
+    // 2026-09-09 CAPACITY FIX -- the I-side twin of DtlbPlugin's identical change;
+    // read that file's block for the full derivation. Short form: `Tlb.bankOf` is
+    // `vpn(0)`, so a key with bit 0 MASKED to zero made bank 1 unreachable and the
+    // ITLB held 16 of its 32 entries whenever TCR.P=1. SHIFTING instead keeps the
+    // key injective over the 19 meaningful VPN bits (two VAs name the same 8 KB page
+    // exactly when they agree in vpn[19:1]) and gives bank = vpn(1), set = vpn(3:2).
+    def tlbKeyOf(vpn: UInt, p8K: Bool): UInt = Mux(p8K, vpn(19 downto 1).resize(20), vpn)
+    def tlbKey(vpn: UInt): UInt = tlbKeyOf(vpn, is8K)
+
+    // The WALK key -- what `TableWalker` slices into root/pointer/page indices, and
+    // what `latchVpn` holds. It must stay the MASKED form: the shifted key would
+    // index every table level one bit off. See DtlbPlugin's `walkKey` comment.
+    def walkKey(vpn: UInt): UInt = Mux(is8K, (vpn(19 downto 1) ## False).asUInt, vpn)
 
     // ---- ITT0/ITT1 transparent-translation match (task #194) — mirrors DtlbPlugin's
     // DTT0/DTT1 treatment exactly, on the I-side. A hit bypasses the walker/TLB
@@ -156,6 +169,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // ---- TLB lookup (combinational) ----
     tlb.io.lookupVpn := tlbKey(_req.vpn)
+    // FC2 completes the ATC tag -- see DtlbPlugin's identical wiring. An instruction
+    // fetch's address space is simply the current privilege level (there is no I-side
+    // MOVES), but the bit must still be tagged: a supervisor fetch and a user fetch of
+    // one virtual page are different translations whenever URP =/= SRP.
+    tlb.io.lookupSup := _req.supervisor
     tlb.io.invalidateAll := flushAll
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
@@ -164,7 +182,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val latchValid  = RegInit(False)
     val latchVpn    = Reg(UInt(20 bits))
     val latchPpn    = Reg(UInt(20 bits))
-    val latchSup    = Reg(Bool())
+    val latchSup    = Reg(Bool())   // the PAGE's supervisor-only protection attribute
+    // ...and the ADDRESS SPACE (FC2) the latched walk ran in -- the latch is a
+    // one-entry result cache in front of the ATC, so it needs the same tag the ATC
+    // itself now carries or it re-introduces the very aliasing `Tlb.tagSup` closes.
+    val latchFcSup  = Reg(Bool())
     val latchCmode  = Reg(CacheMode())
     val latchFault  = Reg(Bool())
 
@@ -172,7 +194,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Task #195: `latchVpn` was filled from a masked (tlbKey'd) walkVpn, so the live
     // side of this compare must be masked the SAME way, or two fetches to the same
     // 8K page differing only in VA[12] would spuriously miss the just-filled latch.
-    val latchMatch = latchValid && (latchVpn === tlbKey(_req.vpn))
+    val latchMatch = latchValid && (latchVpn === walkKey(_req.vpn)) &&
+                     (latchFcSup === _req.supervisor)
     val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
                      !walker.io.busy && !walker.io.done
 
@@ -243,7 +266,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     missReqReg.valid := False
     when(needWalk && !missReqReg.valid && !umQueueFull) {
       missReqReg.valid := True
-      missReqReg.vpn   := tlbKey(_req.vpn)
+      missReqReg.vpn   := walkKey(_req.vpn)
       missReqReg.sup   := _req.supervisor
       missReqReg.is8K  := is8K
       missReqReg.robId := umAccessRobId
@@ -268,9 +291,15 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
     // so the fill/latch target the right VPN even if _req.vpn changes while walking.
     val walkVpn = Reg(UInt(20 bits))
+    // The page size this walk was LAUNCHED under (see the fill below).
+    val walkIs8K = Reg(Bool())
+    // ...and the address space it was launched in (the ATC's FC2 tag bit).
+    val walkSup  = Reg(Bool())
     val walkRobId = Reg(UInt(6 bits))
     when(missReqReg.valid) {
       walkVpn   := missReqReg.vpn
+      walkIs8K  := missReqReg.is8K
+      walkSup   := missReqReg.sup
       walkRobId := missReqReg.robId
     }
 
@@ -286,7 +315,13 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // a bare constant so the field is never left with a made-up value.
     fe.modified   := walker.io.rsp.modified
     tlb.io.fillValid := False
-    tlb.io.fillVpn   := walkVpn
+    // `walkVpn` is the WALK key (see `walkKey`); the array is indexed by the TLB key.
+    // Keyed off the walk's OWN latched page size, not the live TCR.P, so a TCR
+    // rewrite while a walk is in flight cannot file the result under a key the
+    // lookup that requested it would never form -- the pre-fix code had this
+    // property for free (the key was computed once, at capture) and it is kept.
+    tlb.io.fillVpn   := tlbKeyOf(walkVpn, walkIs8K)
+    tlb.io.fillSup   := walkSup
     tlb.io.fillEntry := fe
     when(walker.io.done) {
       missPending := False
@@ -294,6 +329,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       latchVpn   := walkVpn
       latchPpn   := walker.io.rsp.ppn
       latchSup   := walker.io.rsp.supervisor
+      latchFcSup := walkSup
       latchCmode := walker.io.rsp.cacheMode
       latchFault := walker.io.rsp.fault
       // C6/C1-mirror fix: a poisoned walk (backend flush landed while it was still

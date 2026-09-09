@@ -32,16 +32,44 @@ object DLoadToken {
 
 /** Early VIPT lookup request. `vaddr` selects the page-invariant set in parallel
   * with the DTLB lookup and `token` associates the result with the later command.
-  * `resolved` supports an already-known PA hint. Normally the probe launches with
-  * `resolved=False`; the following tokenized DLoadProbeResolve qualifies the same
-  * synchronous array read when the registered DTLB response arrives. If that
-  * qualification is late, the entry is deliberately unusable and the later command
-  * falls back to the ordinary resolved read path. */
+  * Normally the probe launches with `resolved=False`; the following tokenized
+  * DLoadProbeResolve qualifies the same synchronous array read when the registered
+  * DTLB response arrives. If that qualification is late, the entry is deliberately
+  * unusable and the later command falls back to the ordinary resolved read path.
+  *
+  * ── `resolved` / `paddrHint`: A LOADED GUN. READ THIS BEFORE SETTING EITHER. ────
+  *
+  * Indexing the array early from `vaddr` is CORRECT: the set index lives below the
+  * page offset, so it is identical in the virtual and the physical address. The TAG
+  * IS NOT. `paddrHint` is compared against physical tags (`DcachePlugin`'s
+  * `probeReadTag`), so it MUST be a genuinely TRANSLATED address -- and at the
+  * moment a probe launches, no translation exists yet. That is the entire reason
+  * the early probe exists.
+  *
+  * Until 2026-09-09 this field was named `paddr` and its one producer assigned it
+  * `tCtx.vaddr` -- a VIRTUAL address in a field the cache tags with. Inert, because
+  * `resolved` is hard-wired False and gates every consumer, but a trap: setting
+  * `resolved := True` would have silently turned virtual addresses into physical tag
+  * comparisons. Harmless under an identity map; a silent FALSE-HIT generator under
+  * any real one, which is the exact failure class this cache spent months chasing.
+  * The field is now named for what it is, and the producer supplies NO hint (0)
+  * rather than a plausible-looking wrong one, so a future `resolved := True` fails
+  * loudly instead of quietly.
+  *
+  * THE SAFE EARLY-HIT PATH ALREADY EXISTS and is the one that actually runs:
+  * `DcachePlugin`'s `probeResolveTagIn` / `probeUsableIfResolved` /
+  * `probeWayMatchResolved`, which tag against the DLoadProbeResolve payload -- a
+  * genuinely translated physical address. Anyone wanting hit determination one cycle
+  * earlier must extend THAT path, not revive this one, and must supply a real
+  * translation here. `DcachePlugin`'s allocation-site assertion says so too.
+  */
 case class DLoadProbe() extends Bundle {
   val vaddr     = UInt(32 bits)
   val token     = UInt(DLoadToken.Width bits)
+  /** Set ONLY if `paddrHint` carries a genuinely TRANSLATED physical address. */
   val resolved  = Bool()
-  val paddr     = UInt(32 bits)
+  /** Meaningless unless `resolved`. MUST be physical -- see the class comment. */
+  val paddrHint = UInt(32 bits)
   val size      = Size()
   val cacheMode = CacheMode()
   val needsLine = Bool()

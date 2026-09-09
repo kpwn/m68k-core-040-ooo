@@ -838,6 +838,28 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val keepCommit      = Bool()
       val needsSupervisor = Bool()
       val supervisor      = Bool()
+      // The ADDRESS-SPACE bit this access translates and protection-checks under.
+      // Identical to `supervisor` for every instruction except MOVES, whose data
+      // access runs in the alternate address space named by SFC (read form) or DFC
+      // (write form) -- FC[2] is the supervisor/user selector. See
+      // DecodedUop.altAddrSpace.
+      //
+      // WHY IT IS A SEPARATE FIELD FROM `supervisor` RATHER THAN A REPLACEMENT OF IT.
+      // `supervisor` is ALSO the operand of two PRIVILEGE checks (`storePrivBlocked`
+      // and `txSuppressForLaterPrivCheck`, both `needsSupervisor && !supervisor`) and
+      // of the fault completion's SSW bit. MOVES is privileged no matter what DFC
+      // holds, so folding the function code into `supervisor` would make a USER-mode
+      // `moves.l %d0,(%a0)` with DFC=5 look supervisor to the vector-8 check and skip
+      // its privilege violation -- trading an address-space bug for a protection
+      // hole. The two bits are genuinely different questions ("who is running" vs
+      // "which space is being addressed") and are kept apart.
+      //
+      // COST ON THE TRANSLATE PATH: none. This is computed in the S1 capture cycle
+      // and consumed at `reqDrvSup` by SUBSTITUTION -- the existing
+      // `Mux(reqFromSplit, txCtx.*, tCtx.*)` 2:1 mux keeps exactly the shape it had,
+      // with both arms still plain register outputs. No gate is added between a
+      // register and the DTLB request.
+      val fcSup           = Bool()
       // MOVEM far-page probe (task movem-translate-ahead): True iff `twoAccess`/
       // `addrB` on THIS entry were set for a translate-ONLY probe of the macro's
       // far boundary page, not a genuine second data access. Read exactly once, at
@@ -1445,7 +1467,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val reqFromSplit = splitReqArm
     val reqDrvVaddr  = Mux(reqFromSplit, txCtx.addrB, tCtx.vaddr)
     val reqDrvVpn    = reqDrvVaddr(31 downto 12)
-    val reqDrvSup    = Mux(reqFromSplit, txCtx.supervisor, tCtx.supervisor)
+    // The ADDRESS-SPACE bit, not the privilege bit -- see `FrontPipeCtx.fcSup`. Both
+    // arms are register outputs, exactly as they were when this read `.supervisor`,
+    // so the translate path's depth is unchanged.
+    val reqDrvSup    = Mux(reqFromSplit, txCtx.fcSup, tCtx.fcSup)
     val reqDrvWrite  = Mux(reqFromSplit,
       txCtx.memOp === MemOp.STORE, tCtx.memOp === MemOp.STORE)
     val reqDrvRobId  = Mux(reqFromSplit, txCtx.robId, tCtx.robId)
@@ -1502,8 +1527,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     dcache.loadProbe.payload.token := reqProbeToken
     // The registered translation returns later; retain the raw virtual-set read and
     // resolve it by token when the physical command arrives. No second RAM read.
-    dcache.loadProbe.payload.resolved := False
-    dcache.loadProbe.payload.paddr := tCtx.vaddr
+    // NO early physical-address hint, and there cannot be one: this probe launches in
+    // the SAME cycle as the DTLB request, so nothing here has been translated yet.
+    // `paddrHint` used to be assigned `tCtx.vaddr` -- a VIRTUAL address in a field the
+    // D-cache builds a PHYSICAL tag from. That was inert (the `resolved` gate below is
+    // hard-wired False, and it is this file's ONLY producer) but it was a trap: it made
+    // "set resolved := True" look like a one-line optimisation while silently arming
+    // virtual-vs-physical tag comparisons -- correct under an identity map, a false-hit
+    // generator under a real one. Supplying no hint at all means that shortcut now
+    // fails loudly rather than plausibly. The SAFE early-hit path is unaffected and
+    // untouched: it qualifies this same array read from `loadProbeResolve.paddr`
+    // (driven from `s1Paddr` below), which IS translated. See DcacheTypes.DLoadProbe.
+    dcache.loadProbe.payload.resolved  := False
+    dcache.loadProbe.payload.paddrHint := U(0, 32 bits)
     dcache.loadProbe.payload.size  := tCtx.size
     dcache.loadProbe.payload.cacheMode := m68k040.cache.CacheMode.INHIBITED
     dcache.loadProbe.payload.needsLine := tCtx.twoAccess
@@ -1687,6 +1723,26 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dst.keepCommit      := u1.keepCommit
       dst.needsSupervisor := u1.needsSupervisor
       dst.supervisor      := privCtrl.map(_.supervisor).getOrElse(False)
+      // MOVES: the access runs in the address space named by SFC (read) / DFC
+      // (write), not in the current privilege level's. FC[2] is the supervisor/user
+      // selector on a 68040, so bit 2 of the selected function-code register IS the
+      // DTLB request's `supervisor` bit -- it chooses URP vs SRP for the table
+      // search and it is what the ATC's supervisor-only page protection compares
+      // against. Every other µop keeps the live architectural S bit.
+      //
+      // Reading SFC/DFC live is sound: their only writer is MOVEC, a SERIALIZING
+      // sysOp (it retires alone at the ROB head, so every older MOVES has already
+      // translated, and it squashes everything younger, so every younger MOVES
+      // re-executes against the new value). Same argument PrivilegeService already
+      // makes for the S bit itself.
+      //
+      // A standalone LS-EU DUT with no PrivilegeService wired falls back to the
+      // live-supervisor value (False), exactly the pre-change behaviour.
+      val altFcSup = privCtrl.map { pc =>
+        Mux(u1.memOp === MemOp.STORE, pc.destFc(2), pc.sourceFc(2))
+      }.getOrElse(False)
+      dst.fcSup           := Mux(u1.altAddrSpace, altFcSup,
+                                 privCtrl.map(_.supervisor).getOrElse(False))
     }
 
     // captured-decision -> register (called in the decision cycle). A STACK-PUSH store

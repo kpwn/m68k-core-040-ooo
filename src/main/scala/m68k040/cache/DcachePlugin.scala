@@ -61,7 +61,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     loadProbePort.payload.vaddr.allowOverride; loadProbePort.payload.vaddr := U(0, 32 bits)
     loadProbePort.payload.token.allowOverride; loadProbePort.payload.token := U(0, DLoadToken.Width bits)
     loadProbePort.payload.resolved.allowOverride; loadProbePort.payload.resolved := False
-    loadProbePort.payload.paddr.allowOverride; loadProbePort.payload.paddr := U(0, 32 bits)
+    loadProbePort.payload.paddrHint.allowOverride; loadProbePort.payload.paddrHint := U(0, 32 bits)
     loadProbePort.payload.size.allowOverride; loadProbePort.payload.size := Size.LONG
     loadProbePort.payload.cacheMode.allowOverride
     loadProbePort.payload.cacheMode := CacheMode.INHIBITED
@@ -1535,7 +1535,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             probeReadValid  := True
             probeReadSlot   := earlyProbeAllocIdx
             probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-            probeReadTag    := loadProbePort.payload.paddr(31 downto offBits + setBits)
+            probeReadTag    := loadProbePort.payload.paddrHint(31 downto offBits + setBits)
             probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
             probeReadSize   := loadProbePort.payload.size
             probeReadUsable := (if (earlyViptEnabled) {
@@ -1544,6 +1544,36 @@ class DcachePlugin(val socketMerged: Boolean = false,
                 (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
             } else False)
             probeReadNeedsLine := loadProbePort.payload.needsLine
+            // ── TRIPWIRE: the early PHYSICAL-tag shortcut is disarmed, keep it so ──
+            //
+            // `probeReadTag` above is compared against physical tags, and its only
+            // source is the probe's `paddrHint`, which is only meaningful when the
+            // producer sets `resolved`. There is no producer of a translated address
+            // at probe-launch time -- that is what the early probe is FOR -- so a
+            // `resolved` probe means someone has started feeding this an address that
+            // has not been through the DTLB, and virtual-vs-physical tag comparison
+            // is a SILENT FALSE HIT under any non-identity map (correct under an
+            // identity map, which is exactly why it would survive review and a local
+            // test run). Note that flipping `earlyViptEnabled` alone is inert: it
+            // ANDs with `resolved`, so both halves must change. This catches the half
+            // that matters, in every simulation, on the first probe.
+            //
+            // If you are here because you deliberately want hit determination one
+            // cycle earlier: do NOT delete this and set `resolved`. Extend the SAFE
+            // path instead (`probeResolveTagIn` / `probeUsableIfResolved` /
+            // `probeWayMatchResolved` above), which tags against the DLoadProbeResolve
+            // payload -- a genuinely translated physical address -- or supply a real
+            // translation in `paddrHint` and replace this assertion with an equality
+            // check against `probeResolveTagIn` when the resolve for the same token
+            // lands. Either way it is a performance change and needs its own timing
+            // gate; see DcacheTypes.DLoadProbe.
+            GenerationFlags.simulation {
+              assert(!loadProbePort.payload.resolved,
+                "DcachePlugin: an early VIPT probe arrived with resolved=1. Its paddrHint " +
+                  "is tagged against PHYSICAL tags but nothing is translated at probe " +
+                  "launch -- see DcacheTypes.DLoadProbe before enabling this.",
+                FAILURE)
+            }
           }
         }
 

@@ -18,9 +18,13 @@ class TlbSpec extends AnyFunSuite {
     val io  = tlb.io.toIo.setName("io")
   }
 
+  /** `fcSup` is the ADDRESS SPACE (FC2) the entry is tagged with -- not `sup`, which
+    * is the page's supervisor-only protection attribute carried as data. */
   def fill(dut: Dut, cd: ClockDomain, vpn: Long, ppn: Long,
-           wp: Boolean = false, sup: Boolean = false, inhibited: Boolean = false): Unit = {
+           wp: Boolean = false, sup: Boolean = false, inhibited: Boolean = false,
+           fcSup: Boolean = false): Unit = {
     dut.io.fillVpn   #= vpn
+    dut.io.fillSup   #= fcSup
     dut.io.fillEntry.ppn        #= ppn
     dut.io.fillEntry.vpnTag     #= 0
     dut.io.fillEntry.writeProt  #= wp
@@ -33,8 +37,10 @@ class TlbSpec extends AnyFunSuite {
     cd.waitSampling()
   }
 
-  def lookup(dut: Dut, cd: ClockDomain, vpn: Long): (Boolean, Long, Boolean, Boolean, Boolean) = {
+  def lookup(dut: Dut, cd: ClockDomain, vpn: Long,
+             fcSup: Boolean = false): (Boolean, Long, Boolean, Boolean, Boolean) = {
     dut.io.lookupVpn #= vpn
+    dut.io.lookupSup #= fcSup
     cd.waitSampling()  // combinational, but settle a sampling edge for clean reads
     sleep(1)
     val hit = dut.io.hit.toBoolean
@@ -52,6 +58,7 @@ class TlbSpec extends AnyFunSuite {
       dut.io.fillValid     #= false
       dut.io.invalidateAll #= false
       dut.io.lookupVpn     #= 0
+      dut.io.lookupSup     #= false
       cd.waitSampling(4)
 
       // fill VPN 0x12345 -> PPN 0xABCDE, write-protected, supervisor, inhibited
@@ -84,6 +91,61 @@ class TlbSpec extends AnyFunSuite {
       val (h5, _, _, _, _) = lookup(dut, cd, 0x12345L)
       val (h6, _, _, _, _) = lookup(dut, cd, 0x00010L)
       assert(!h5 && !h6, "invalidateAll must clear all entries")
+    }
+  }
+
+  // ── FC2 IS PART OF THE TAG ────────────────────────────────────────────────────
+  //
+  // The MC68040's ATC tag is {V, logical address A31-A12, FC2} (UM S3.3). Until
+  // 2026-09-09 this component tagged on the VPN alone, so ONE virtual page could
+  // hold only ONE translation -- whichever address space filled it first answered
+  // both. That is wrong whenever URP =/= SRP (the live board: SRP = 0x03FFFA00,
+  // URP = 0), because the two roots index independent table trees, and it is
+  // BLOCKING for MOVES, which lets supervisor code issue a user-space access and an
+  // ordinary supervisor access to one address in consecutive instructions.
+  //
+  // Fail-before/pass-after: with a VPN-only tag the second lookup below returns the
+  // FIRST fill's PPN (0xAAAAA) instead of missing, and the second fill REPLACES the
+  // first rather than allocating beside it.
+  test("FC2 is part of the tag: user and supervisor translations of one VPN coexist", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      dut.io.fillValid     #= false
+      dut.io.invalidateAll #= false
+      dut.io.lookupVpn     #= 0
+      dut.io.lookupSup     #= false
+      cd.waitSampling(4)
+
+      // One VPN, filled ONLY in the supervisor space.
+      fill(dut, cd, 0x12345L, 0xAAAAAL, fcSup = true)
+
+      val (hS, pS, _, _, _) = lookup(dut, cd, 0x12345L, fcSup = true)
+      assert(hS && pS == 0xAAAAAL, f"supervisor-space lookup must hit its own fill (h=$hS p=0x$pS%x)")
+
+      val (hU, pU, _, _, _) = lookup(dut, cd, 0x12345L, fcSup = false)
+      assert(!hU,
+        f"USER-space lookup of a SUPERVISOR-space entry must MISS -- FC2 is part of the " +
+          f"tag. Got a hit with ppn=0x$pU%x, i.e. the ATC answered a user access out of " +
+          "the supervisor tree.")
+
+      // Now fill the SAME VPN in the user space with a different PPN.
+      fill(dut, cd, 0x12345L, 0x55555L, fcSup = false)
+
+      val (hU2, pU2, _, _, _) = lookup(dut, cd, 0x12345L, fcSup = false)
+      assert(hU2 && pU2 == 0x55555L, f"user-space lookup wrong (h=$hU2 p=0x$pU2%x)")
+
+      // ...and the supervisor entry must still be there, UNCHANGED. (The fill's
+      // resident-replace test carries FC2 too; without that the user fill would have
+      // overwritten the supervisor way in place.)
+      val (hS2, pS2, _, _, _) = lookup(dut, cd, 0x12345L, fcSup = true)
+      assert(hS2 && pS2 == 0xAAAAAL,
+        f"the SUPERVISOR-space entry must survive a USER-space fill of the same VPN " +
+          f"(h=$hS2 p=0x$pS2%x, expected 0xAAAAA) -- a same-VPN fill in the OTHER space " +
+          "must ALLOCATE, not replace in place.")
+
+      // Tripwire: the lookup must still be one-hot with both spaces resident.
+      assert(dut.tlb.dbgHitCount.toInt <= 1, "lookup hitVec must stay one-hot")
     }
   }
 }

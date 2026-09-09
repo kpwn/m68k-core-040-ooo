@@ -137,6 +137,10 @@ case class RenamedUop() extends Bundle {
   // (s1AnWb) instead of the raw Rn read when Rn statically aliases the EA's An.
   // See DecodedUop.movesAliasStore for the full rationale. Threaded.
   val movesAliasStore = Bool()
+  // See DecodedUop.altAddrSpace for the full rationale. Threaded: the LS EU reads it
+  // to pick the DTLB request's address-space bit out of SFC/DFC instead of the live
+  // architectural S bit.
+  val altAddrSpace = Bool()
   // MOVE from/to CCR/SR (ALU). fromCcr/fromSr select the CCR/SR int result; needs-
   // Supervisor = privileged (ROB vector-8 check on the committed S bit). Threaded.
   val fromCcr  = Bool()

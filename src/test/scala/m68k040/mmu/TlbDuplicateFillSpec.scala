@@ -39,6 +39,7 @@ class TlbDuplicateFillSpec extends AnyFunSuite {
 
   private def fill(dut: Tlb, cd: ClockDomain, vpn: Long, ppn: Long): Unit = {
     dut.io.fillVpn #= vpn
+    dut.io.fillSup #= false
     dut.io.fillEntry.ppn #= ppn
     dut.io.fillEntry.vpnTag #= 0
     dut.io.fillEntry.writeProt #= false
@@ -53,6 +54,7 @@ class TlbDuplicateFillSpec extends AnyFunSuite {
 
   private def lookup(dut: Tlb, cd: ClockDomain, vpn: Long): (Boolean, Long, Int) = {
     dut.io.lookupVpn #= vpn
+    dut.io.lookupSup #= false
     cd.waitSampling()
     // combinational lookup: sleep(0) settles the mux after the poke
     sleep(0)
@@ -67,6 +69,7 @@ class TlbDuplicateFillSpec extends AnyFunSuite {
       dut.io.fillValid #= false
       dut.io.invalidateAll #= false
       dut.io.lookupVpn #= 0
+      dut.io.lookupSup #= false
       cd.waitSampling(2)
       dut.io.invalidateAll #= true
       cd.waitSampling()

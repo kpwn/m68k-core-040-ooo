@@ -2854,6 +2854,15 @@ object Microcode {
     // for the full rationale.
     u.movesAliasStore := Bool(d.srcB == SMovesRn && d.mem == MStore) &&
       ctx.movesRnIsA && (ctx.movesRn === ctx.eaBase) && (ctx.casAutoMode =/= EaAuto.NONE)
+    // MOVES alternate address space (SFC/DFC) -- see DecodedUop.altAddrSpace.
+    // `ctx.needsSup` is set by EXACTLY ONE decoder site (`DecodeStage`'s
+    // `ucEntryCtx.needsSup := ucIsMoves`), so within the µcode ROM it means "this
+    // macro is a MOVES" and nothing else. The MOVES memory access is the isFirst row
+    // of both forms (µPC45 the write's store, µPC46 the read's load), so the isFirst
+    // + "row has a memory operand" conjunction names those two rows and only those.
+    // The read form's other two rows (the An update, the Rn writeback) touch no
+    // memory and correctly stay False.
+    u.altAddrSpace := ctx.needsSup && Bool(d.isFirst && d.mem != MNone)
     d.uop match {
       case UBfMem =>
         u.bfMem       := True
@@ -3423,6 +3432,9 @@ object Microcode {
     // test is now a hardware `===` pair over the ROM-read enum fields.)
     u.movesAliasStore := (d.srcB === SelHw.SMovesRn) && (d.mem === MemHw.MStore) &&
       ctx.movesRnIsA && (ctx.movesRn === ctx.eaBase) && (ctx.casAutoMode =/= EaAuto.NONE)
+    // MOVES alternate address space -- the hardware twin of resolve()'s identical
+    // expression (see there for the full argument).
+    u.altAddrSpace := ctx.needsSup && d.isFirst && (d.mem =/= MemHw.MNone)
     u.bfMem := False; u.bfOp := B(0, 3 bits); u.bfStoreForm := U(0, 3 bits)  // = the original's `case _` arm
     switch(d.uop) {
       is(UOpHw.UBfMem) {
