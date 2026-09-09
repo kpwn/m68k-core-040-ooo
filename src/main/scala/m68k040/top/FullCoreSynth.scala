@@ -465,8 +465,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // producer rather than folded into `arbWedge`, because a wedge there raises no AXI
     // grant at all and is invisible to every other watchdog in the core.
     val walkWedge = lsEu.logic.walkerPortWedge
+    // 2026-09-09: a DOUBLE BUS FAULT is a SIXTH halt producer -- see `ExceptionUnit`'s
+    // `dblFault`. It is the only one that is architectural rather than diagnostic: a real
+    // 68040 halts on a bus error taken during exception processing, so this is not a
+    // watchdog but the specified behaviour.
     rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge || rvHalt ||
-                              walkWedge
+                              walkWedge || exc.dblFault
     // D28: priority when several fire on the same cycle is stated here rather than left to
     // elaboration order. The D-cache's diagnostic fault wins because it is the one with a
     // sub-code (DcachePlugin's private diagFaultKind) that further localises the failure;
@@ -481,7 +485,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
             U(m68k040.socket.HaltReason.ARBITER_WEDGE, m68k040.socket.HaltReason.W bits),
             Mux(walkWedge,
               U(m68k040.socket.HaltReason.WALKER_PORT_WEDGE, m68k040.socket.HaltReason.W bits),
-              U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))))))
+              // Last in the chain only because it is the newest producer; it cannot
+              // collide with the others in practice (the exception sequencer is the sole
+              // requester of the load port while it is active).
+              Mux(exc.dblFault,
+                U(m68k040.socket.HaltReason.DOUBLE_FAULT, m68k040.socket.HaltReason.W bits),
+                U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))))))
     lsEu.excActive          := excActive
     // W19: closes table-walker admission to the D-cache ports across the commit-time
     // sysOp maintenance quiesce (`S_DRAIN`/`S_APPLY`). See `ExceptionUnit.quiesceHoldOut`.

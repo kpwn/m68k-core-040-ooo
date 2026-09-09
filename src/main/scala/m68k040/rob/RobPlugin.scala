@@ -85,6 +85,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   private var _debugHaltExceptionVector: UInt = null
   private var _debugHaltExceptionPc: UInt = null
   private var _debugHaltExceptionFaultAddress: UInt = null
+  private var _debugDblFaultPc:  UInt = null
+  private var _debugDblFaultVec: UInt = null
   override def effectiveHalt:    Bool = _debugEffectiveHalt
   override def autoHaltLatched:  Bool = _debugAutoHaltLatched
   override def haltReasonDebug:  UInt = _debugHaltReason
@@ -99,6 +101,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def haltExceptionVector: UInt = _debugHaltExceptionVector
   override def haltExceptionPc: UInt = _debugHaltExceptionPc
   override def haltExceptionFaultAddress: UInt = _debugHaltExceptionFaultAddress
+  override def dblFaultPc:  UInt = _debugDblFaultPc
+  override def dblFaultVec: UInt = _debugDblFaultVec
   during setup {
     _supervisor             = Bool()
     _dcacheEnabled          = Bool()
@@ -118,6 +122,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugHaltExceptionVector = UInt(8 bits)
     _debugHaltExceptionPc = UInt(32 bits)
     _debugHaltExceptionFaultAddress = UInt(32 bits)
+    _debugDblFaultPc  = UInt(32 bits)
+    _debugDblFaultVec = UInt(8 bits)
   }
 
   /** One ROB entry's commit/free + trace payload. */
@@ -2407,6 +2413,12 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     _debugBreakpointHit.payload := p0.debugBreakSlot
     _debugExceptionPending := debugExceptionPendingReg
     _debugHaltExceptionVector := debugHaltExceptionVectorReg
+    // 2026-09-09: straight from the exception sequencer's own sticky capture -- these are
+    // set exactly once, at the double fault, and the core is halted from that cycle on, so
+    // no halt-capture latch of their own is needed (unlike the halt-on-exception group
+    // above, which samples a LIVE event stream).
+    _debugDblFaultPc  := exc.dblFaultPc
+    _debugDblFaultVec := exc.dblFaultVec
     _debugHaltExceptionPc := debugHaltExceptionPcReg
     _debugHaltExceptionFaultAddress := debugHaltExceptionFaultAddressReg
 

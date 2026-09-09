@@ -93,6 +93,12 @@ trait DebugCommitService {
   def haltExceptionVector: UInt
   def haltExceptionPc:   UInt
   def haltExceptionFaultAddress: UInt
+  /** 2026-09-09 double-bus-fault capture, backing the two debug registers the regmap has
+    * reserved since Stage 1 and nothing ever wrote (`OFF_DBL_FAULT_PC` 0x94 /
+    * `OFF_DBL_FAULT_VEC` 0x98). `dblFaultVec` is 0 until a double fault occurs; the
+    * vector-table address that faulted is VBR + `dblFaultVec`*4. */
+  def dblFaultPc:  UInt
+  def dblFaultVec: UInt
   def request(stop: Bool, resume: Bool, step: Bool, clearSticky: Bool): Unit
   /** Surviving debug-domain halt-after configuration. `invalidate` is the accepted
     * target-write pulse; it cancels a stale pipelined comparison on that same edge. */
