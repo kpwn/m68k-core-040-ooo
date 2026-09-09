@@ -326,6 +326,13 @@ class MiHangTraceSpec extends AnyFunSuite {
       // (A7/arch-15 was left unseeded, garbage/X-valued) — the actual root cause,
       // confirmed by this fix alone reproducing the real HANG (see memory writeup).
       dut.rob.logic.exc.ss.isp #= 0x00100000L
+      // DE|IE -- "firmware already enabled the caches", the posture every other
+      // full-core harness in this repo states explicitly (design doc section 5.2).
+      // Stated here too as of 2026-09-09: CACR.IE acquired its FIRST reader that
+      // day (IcachePlugin), so a bespoke sim that leaves CACR at its reset value 0
+      // now runs with the instruction cache DISABLED. Correct, but not what this
+      // test means to exercise -- and silently so.
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
       dut.rob.logic.exc.ss.usp #= 0L
       dut.wire.logic.seedValid #= true
       dut.wire.logic.seedAddr  #= 15
