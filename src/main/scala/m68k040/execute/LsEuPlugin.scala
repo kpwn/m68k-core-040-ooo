@@ -141,8 +141,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   //
   // Task 11: the exception sequencer's frame/vector accesses used to be UNIFORMLY
   // identity-physical, which is why this MUX never covered the tagged DTLB service.
-  // FSAVE/FRESTORE's state-frame transfers are the first ones that are genuinely
-  // VIRTUAL, so the same MUX now also hands over `xlate.req` — safe for exactly the
+  // FSAVE/FRESTORE's state-frame transfers were the first ones that were genuinely
+  // VIRTUAL. As of 2026-09-09 they are no longer special: the ENTRY frame push, the
+  // handler VECTOR fetch and the RTE frame pop all translate too, so EVERY memory
+  // access this sequencer makes now goes through this hand-off and there is no
+  // identity-physical exception path left anywhere. The same MUX hands over
+  // `xlate.req` — safe for exactly the
   // reason the D-cache hand-off is: the LS pipe already relinquishes its own DTLB
   // claim for the entire duration `excActive` is held (`xlate.req.valid := !excActive
   // && ...` below, and `xlate.rsp.ready` unconditionally True while `excActive`).
@@ -266,8 +270,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // data access to a supervisor-only page would otherwise fault. `host.get`
     // (optional): a standalone LS-EU DUT with no RobPlugin/PrivilegeService wired
     // defaults to False (user), unchanged for every existing non-full-core test. Does
-    // It does not affect the exception sequencer's separate identity-physical
-    // frame/vector accesses.
+    // It does not affect the exception sequencer's frame/vector accesses, which carry
+    // their own supervisor bit (hardwired True at the `excActive` hand-off below --
+    // the sequencer runs supervisor by definition) rather than this live architectural
+    // one. They are no longer identity-physical (2026-09-09); they are translated with
+    // that hardwired supervisor bit.
     val privCtrl = host.get[m68k040.services.PrivilegeService]
 
     // fast/precise store classification (Task P2.2). OPTIONAL (host.get, mirrors
@@ -292,10 +299,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     excActive.allowOverride;            excActive := False
     excLoadCmdValid.allowOverride;      excLoadCmdValid := False
     excLoadCmdVaddr.allowOverride;      excLoadCmdVaddr := U(0, 32 bits)
-    // Defaults to the vaddr (identity), NOT to zero: every DUT that wires the exception
-    // unit's load command but not this new paddr pass-through keeps its pre-Task-11
-    // identity-physical behaviour automatically, and a later override of
-    // `excLoadCmdVaddr` is followed for free because this is a plain combinational alias.
+    // Defaults to the vaddr, NOT to zero, so a DUT that wires the exception unit's load
+    // command but not this paddr pass-through still elaborates.
+    //
+    // ⚠ THIS DEFAULT IS A TRAP, and it cost real debugging time on 2026-09-09. It is
+    // SILENT: a DUT that forgets the pass-through does not fail to elaborate and does
+    // not assert -- it quietly runs every exception-sequencer access identity-mapped,
+    // which is indistinguishable from correct behaviour under an identity page table
+    // and is silent WRONG DATA under any other. `FullCoreDut` (the whole lock-step
+    // suite) had exactly that gap, together with the matching one on the exception
+    // unit's own `dxRsp*` defaults, so NO lock-step test could observe a translated
+    // exception frame -- including FSAVE/FRESTORE's, translated since Task 11.
+    // If you add a DUT, wire `excLoadCmdPaddr` AND the `dxReq*`/`dxRsp*` port; copy
+    // FullCoreSynth, do not rely on these defaults.
     excLoadCmdPaddr.allowOverride;      excLoadCmdPaddr := excLoadCmdVaddr
     excLoadCmdSize.allowOverride;       excLoadCmdSize := m68k040.isa.Size.LONG
     excStoreValid.allowOverride;        excStoreValid := False
@@ -3273,7 +3289,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // so its commands must NOT be exempt from the extract wrap tripwire. Explicit
       // (not inherited from the LS branch above, whose value tracks the aligned ring).
       dcache.loadCmd.payload.lineOnly := False
-      // identity-physical, matching dcStore's exc-path cacheMode.
+      // (Historically this said "identity-physical, matching dcStore's exc-path
+      // cacheMode". The address half of that is obsolete as of 2026-09-09 -- the
+      // sequencer's loads carry a real DTLB-translated PA now. The CACHE MODE half
+      // still holds and is what the rest of this comment is about.)
       //
       // Task P5.7 root-cause fix -- CACR.DE MUST be honoured here too. This mux is
       // the LIVE driver of the exception sequencer's frame/vector LOADS (FuzzDut /
