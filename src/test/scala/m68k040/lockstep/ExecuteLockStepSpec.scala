@@ -363,6 +363,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
       lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size
       exc.dcLoadCmd.ready       := lsEu.excLoadCmdReady
+      // 2026-09-09: this hand-maintained mirror of FullCoreSynth was missing BOTH the
+      // exception load's PHYSICAL address and the whole exception-side DTLB port. The
+      // consequences were silent, because every one of those signals has a
+      // "no consumer wired, degrade gracefully" default:
+      //   * `LsEuPlugin.excLoadCmdPaddr` defaults to `excLoadCmdVaddr`, so an exception
+      //     load reached the D-cache with paddr == vaddr no matter what the sequencer
+      //     had computed;
+      //   * `ExceptionUnit.dxRspValid/dxRspPpn` default to "an IDENTITY translation that
+      //     resolves next cycle", so the sequencer's translation requests were answered
+      //     by its own fallback instead of by the DTLB.
+      // Together those made EVERY exception-path translation an identity map in this
+      // DUT -- including FSAVE/FRESTORE's, which have been translated since Task 11 --
+      // so no lock-step test could observe a translated exception frame, or a
+      // regression in one. Wired here exactly as FullCoreSynth wires it.
+      lsEu.excLoadCmdPaddr      := exc.dcLoadCmd.payload.paddr
+      val dtlbPlug              = host[m68k040.mmu.DtlbPlugin]
+      lsEu.excXlateValid        := exc.dxReqValid
+      lsEu.excXlateVpn          := exc.dxReqVpn
+      lsEu.excXlateWrite        := exc.dxReqWrite
+      lsEu.excXlateToken        := U(exc.ExcDtlbToken, m68k040.cache.DTranslationToken.Width bits)
+      exc.dxReqReady            := lsEu.excXlateReady
+      exc.dxRspValid            := dtlbPlug.rsp.valid
+      exc.dxRspPpn              := dtlbPlug.rsp.payload.ppn
+      exc.dxRspFault            := dtlbPlug.rsp.payload.fault
+      exc.dxRspToken            := dtlbPlug.rsp.payload.token
       lsEu.excStoreValid        := exc.dcStore.valid
       lsEu.excStorePayload      := exc.dcStore.payload
       exc.dcStore.ready         := lsEu.excStoreReady

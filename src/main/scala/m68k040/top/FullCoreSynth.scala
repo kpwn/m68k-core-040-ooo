@@ -465,8 +465,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // producer rather than folded into `arbWedge`, because a wedge there raises no AXI
     // grant at all and is invisible to every other watchdog in the core.
     val walkWedge = lsEu.logic.walkerPortWedge
-    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || arbWedge || rvHalt ||
-                              walkWedge
+    // 2026-09-09: `exc.excXlateFault` is a SIXTH producer -- a DTLB fault taken while
+    // stacking an entry frame, fetching the handler vector or popping an RTE frame. It
+    // is deliberately separate from `fsXlateFault` (an FSAVE/FRESTORE state-frame fault)
+    // so the halt reason says WHICH of the two sequencer paths faulted; they are hit by
+    // completely different software and localise to different bugs.
+    rob.logic.coreHaltedIn := dc.diagFault || exc.fsXlateFault || exc.excXlateFault ||
+                              arbWedge || rvHalt || walkWedge
     // D28: priority when several fire on the same cycle is stated here rather than left to
     // elaboration order. The D-cache's diagnostic fault wins because it is the one with a
     // sub-code (DcachePlugin's private diagFaultKind) that further localises the failure;
@@ -475,13 +480,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
       U(m68k040.socket.HaltReason.DCACHE_DIAG, m68k040.socket.HaltReason.W bits),
       Mux(exc.fsXlateFault,
         U(m68k040.socket.HaltReason.FS_XLATE, m68k040.socket.HaltReason.W bits),
+        Mux(exc.excXlateFault,
+          U(m68k040.socket.HaltReason.DOUBLE_FAULT, m68k040.socket.HaltReason.W bits),
         Mux(rvHalt,
           U(m68k040.socket.HaltReason.RESET_VECTOR, m68k040.socket.HaltReason.W bits),
           Mux(arbWedge,
             U(m68k040.socket.HaltReason.ARBITER_WEDGE, m68k040.socket.HaltReason.W bits),
             Mux(walkWedge,
               U(m68k040.socket.HaltReason.WALKER_PORT_WEDGE, m68k040.socket.HaltReason.W bits),
-              U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits))))))
+              U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))))))
     lsEu.excActive          := excActive
     // W19: closes table-walker admission to the D-cache ports across the commit-time
     // sysOp maintenance quiesce (`S_DRAIN`/`S_APPLY`). See `ExceptionUnit.quiesceHoldOut`.

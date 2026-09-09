@@ -57,6 +57,18 @@ object HaltReason {
     * grant at all -- the `axi_d` arbiter sees nothing, the D-cache's own diagnostic
     * channel sees nothing, and the failure would otherwise be completely unobservable. */
   val WALKER_PORT_WEDGE = 5
+  /** A DTLB translation fault taken while the commit-side exception sequencer was
+    * stacking an ENTRY frame, fetching the handler VECTOR, or popping an RTE frame
+    * (`exc.excXlateFault`).
+    *
+    * This is the 68040's DOUBLE FAULT. MC68040 UM S8.2.6: a fault taken during the
+    * exception processing of a previous fault cannot itself be reported -- there is no
+    * stack to report it on and no meaningful PC to resume -- so the processor asserts
+    * its halt output and stops until reset. Modelling it as a halt (rather than as a
+    * nested exception, or worse, as the silent identity-mapped access this core used
+    * before) is the hardware-faithful behaviour and is the same treatment
+    * `RESET_VECTOR` already gives a bus fault during reset exception processing. */
+  val DOUBLE_FAULT = 6
 
   def name(code: Int): String = code match {
     case NONE          => "NONE"
@@ -65,6 +77,7 @@ object HaltReason {
     case RESET_VECTOR  => "RESET_VECTOR"
     case ARBITER_WEDGE => "ARBITER_WEDGE"
     case WALKER_PORT_WEDGE => "WALKER_PORT_WEDGE"
+    case DOUBLE_FAULT  => "DOUBLE_FAULT"
     case other         => s"UNKNOWN($other)"
   }
 }

@@ -533,4 +533,120 @@ class Addr32LockStepSpec extends AnyFunSuite {
   test("addr32 control: store code at 0x00007000, CPUSHL BC (line), execute it", VerilatorTest) {
     smcRun("smc-lo-cpushl", 0x00007000L, "cpushl %bc,(%a0)")
   }
+
+  // ── 19. THE EXCEPTION SEQUENCER MUST TRANSLATE ─────────────────────────────────
+  //
+  // Until 2026-09-09 every entry-frame push, every RTE frame pop and every VBR vector
+  // fetch used PA = VA (ExceptionUnit `ldoPaddr := ldoVaddr`, `driveStoreNoXlate`), with
+  // the file's own comment calling a real translation "a fast-follow". That is inert
+  // under an identity map and SILENT DATA CORRUPTION under any other: the frame is
+  // written to the wrong physical page and the handler address is read out of memory the
+  // OS never wrote. It is also, on a 68040, unobservable -- no fault is raised.
+  //
+  // This maps ONE data page NON-IDENTITY (VA 0x01FF6000 -> PA 0x00700000) and puts BOTH
+  // the vector table (VBR = 0x01FF6000) and the supervisor stack (A7 = 0x01FF6F00) in
+  // it, which is exactly the 32-bit-mode posture the board reports. Then it takes the
+  // _A9C9 line-A trap and RTEs.
+  //
+  // Both untranslated destinations are PRE-POISONED so the unfixed behaviour is
+  // deterministic rather than dependent on SparseMemory's PRNG fill:
+  //   * PA 0x01FF6028 (the vector slot AT ITS VIRTUAL ADDRESS) holds 0xDEAD0000, so an
+  //     untranslated vector fetch redirects to 0xDEAD0000 and the handler never runs;
+  //   * PA 0x01FF6EF8..0x01FF6EFF (the frame base at its virtual address) holds 0xEE
+  //     bytes, so an untranslated frame push overwrites them.
+  test("addr32: exception frame + vector fetch translate through the DTLB (non-identity map)", VerilatorTest) {
+    val loadAddr = m68k040.oracle.ProgramAssembler.DefaultLoadAddress
+    val PageVa   = 0x01FF6000L
+    val PagePpn  = 0x00700L
+    val PagePa   = PagePpn << 12                 // 0x00700000
+    val VecSlotVa = PageVa + 10 * 4              // vector 10 (line-A) = 0x01FF6028
+    val StackVa   = PageVa + 0xF00               // A7 = 0x01FF6F00
+    val FrameVa   = StackVa - 8                  // format-$0 frame base = 0x01FF6EF8
+    def pa(va: Long) = PagePa | (va & 0xFFFL)
+
+    val src = Seq(
+      f"move.l #0x$PageVa%x,%%d0",
+      "movec %d0,%vbr",
+      f"move.l #0x$StackVa%x,%%a7",
+      "move.l #handler,%d1",
+      f"move.l %%d1,0x$VecSlotVa%x",
+      "moveq #0,%d3",
+      ".short 0xa9c9",                            // line-A trap -> vector 10
+      "moveq #33,%d4",                            // runs only if the RTE resumed here
+      "bra stop",
+      "handler: move.l 2(%a7),%d0",
+      "addq.l #2,%d0",
+      "move.l %d0,2(%a7)",
+      "moveq #51,%d3",
+      "rte",
+      "stop: bra stop").mkString(" ; ")
+    val image = m68k040.oracle.ProgramAssembler.assemble(src, loadAddr) match {
+      case Right(i)  => i
+      case Left(err) => fail(s"assemble failed: ${err.reason}")
+    }
+
+    var d3 = -1L; var d4 = -1L
+    var vecWordAtPa = -1; var guardIntact = true; var poisonIntact = true
+    h.compiledDut.doSim(s"addr32-exc-xlate-${System.nanoTime()}") { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      h.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
+      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      // Page table: the code identity-mapped (so I-fetch works), the ONE data page
+      // deliberately NOT.
+      h.buildMmuTable(dmem, PageVa, PagePpn)
+      // Poison both untranslated destinations.
+      for (i <- 0 until 4) dmem.pokeByte(VecSlotVa + i, Seq(0xDE, 0xAD, 0x00, 0x00)(i))
+      for (i <- 0 until 8) dmem.pokeByte(FrameVa + i, 0xEE)
+
+      dut.fa.logic.redirect.valid #= false
+      dut.fa.logic.resume.valid   #= false
+      dut.rob.logic.flush.valid   #= false
+      dut.icache.logic.invalidateAll #= false
+      dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
+      dut.intCtrl.logic.iplIn #= 0; dut.intCtrl.logic.iackAvec #= true; dut.intCtrl.logic.iackVector #= 0
+      cd.waitSampling(2)
+      dut.icache.logic.invalidateAll #= true
+      cd.waitSampling(); dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(80)
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= h.MMU_ROOT
+      dut.ctrl.logic.srp #= h.MMU_ROOT
+      dut.rob.logic.exc.ss.isp  #= 0x00120000L
+      dut.rob.logic.exc.ss.cacr #= 0x80008000L
+      dut.wire.logic.seedValid #= true
+      dut.wire.logic.seedAddr  #= 15
+      dut.wire.logic.seedData  #= BigInt(0x00120000L)
+      cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
+      dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
+      cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+
+      cd.waitSampling(40000)
+      val probe = new ArchStateProbe(dut.ren, dut.rfInt, dut.rfNzvc, dut.rfX)
+      d3 = probe.readArch(3); d4 = probe.readArch(4)
+      // The frame's format/vector word sits at frameBase+6 and must read 0x0028 for
+      // vector 10 (vec << 2 = 40). Read it at the TRANSLATED physical address.
+      vecWordAtPa = (dmem.peekByte(pa(FrameVa) + 6) << 8) | dmem.peekByte(pa(FrameVa) + 7)
+      guardIntact = (0 until 8).forall(i => dmem.peekByte(FrameVa + i) == 0xEE)
+      poisonIntact = Seq(0xDE, 0xAD, 0x00, 0x00).zipWithIndex
+                       .forall { case (b, i) => dmem.peekByte(VecSlotVa + i) == b }
+    }
+    // 1. the handler ran => the VECTOR FETCH read the slot at its TRANSLATED address.
+    assert(d3 == 51L,
+      f"UNTRANSLATED VECTOR FETCH: the handler never ran (D3 = 0x$d3%08x, expected 51). " +
+        "The fetch read VBR+40 as a physical address and redirected to the 0xDEAD0000 poison.")
+    // 2. the RTE resumed at the instruction after the trap => the frame POP translated.
+    assert(d4 == 33L,
+      f"UNTRANSLATED RTE POP: execution did not resume after the trap (D4 = 0x$d4%08x, expected 33)")
+    // 3. the frame landed at the TRANSLATED physical address...
+    assert(vecWordAtPa == 0x0028,
+      f"UNTRANSLATED FRAME PUSH: the format/vector word is not at the translated PA " +
+        f"0x${pa(FrameVa) + 6}%08x (read 0x$vecWordAtPa%04x, expected 0x0028)")
+    // 4. ...and NOT at the virtual address treated as physical.
+    assert(guardIntact,
+      f"UNTRANSLATED FRAME PUSH: the 0xEE guard at PA 0x$FrameVa%08x -- the frame base's " +
+        "VIRTUAL address -- was overwritten, so the push used PA = VA")
+    assert(poisonIntact,
+      f"the 0xDEAD0000 poison at PA 0x$VecSlotVa%08x was modified; the test's own " +
+        "assumptions about what maps where are wrong")
+  }
 }
