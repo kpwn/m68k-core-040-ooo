@@ -22,15 +22,31 @@ class IcacheParallelViptSpec extends AnyFunSuite {
 
   class TestPrivilegePlugin extends FiberPlugin with PrivilegeService {
     private var supervisorWire: Bool = null
+    // SFC / DFC (2026-09-09): the service acquired the MOVES function-code pair.
+    // This DUT is I-side only and there is no such thing as an instruction fetch in
+    // an alternate address space, so both simply MIRROR the privilege level in the
+    // 68040's own FC encoding (5 = supervisor data, 1 = user data; FC[2] is the
+    // address-space selector). Deriving them from `supervisorIn` rather than tying
+    // them to a constant keeps this stub HONEST if a future consumer reads them:
+    // a constant would silently disagree with the DUT's own privilege input.
+    private var sourceFcWire: UInt = null
+    private var destFcWire: UInt = null
     override def supervisor: Bool = supervisorWire
+    override def sourceFc: UInt = sourceFcWire
+    override def destFc: UInt = destFcWire
 
     during setup {
       supervisorWire = Bool()
+      sourceFcWire = UInt(3 bits)
+      destFcWire = UInt(3 bits)
     }
 
     val logic = during build new Area {
       val supervisorIn = in Bool()
       supervisorWire := supervisorIn
+      val fc = Mux(supervisorIn, U(5, 3 bits), U(1, 3 bits))
+      sourceFcWire := fc
+      destFcWire   := fc
     }
   }
 

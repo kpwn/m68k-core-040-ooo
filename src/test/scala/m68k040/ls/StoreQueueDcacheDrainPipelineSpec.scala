@@ -59,7 +59,7 @@ class SqDcacheDrainBoundaryPlugin(sq: StoreQueue) extends FiberPlugin {
     ds.loadProbe.payload.vaddr     := 0
     ds.loadProbe.payload.token     := 0
     ds.loadProbe.payload.resolved  := False
-    ds.loadProbe.payload.paddr     := 0
+    ds.loadProbe.payload.paddrHint := 0
     ds.loadProbe.payload.size      := Size.LONG
     ds.loadProbe.payload.cacheMode := CacheMode.INHIBITED
     ds.loadProbe.payload.needsLine := False

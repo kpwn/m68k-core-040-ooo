@@ -1740,8 +1740,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       //
       // A standalone LS-EU DUT with no PrivilegeService wired falls back to the
       // live-supervisor value (False), exactly the pre-change behaviour.
-      val altFcSup = privCtrl.map { pc =>
-        Mux(u1.memOp === MemOp.STORE, pc.destFc(2), pc.sourceFc(2))
+      val altFcSup = privCtrl.map { pv =>
+        Mux(u1.memOp === MemOp.STORE, pv.destFc(2), pv.sourceFc(2))
       }.getOrElse(False)
       dst.fcSup           := Mux(u1.altAddrSpace, altFcSup,
                                  privCtrl.map(_.supervisor).getOrElse(False))
