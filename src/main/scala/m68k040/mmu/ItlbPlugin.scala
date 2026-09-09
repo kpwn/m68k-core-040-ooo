@@ -407,23 +407,62 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainArmed   = RegInit(False)
     val drainAckWait = RegInit(False)
     val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
-    val drainBeat = Bits(128 bits)
-    val drainStrb = Bits(16 bits)
-    drainBeat := B(0, 128 bits)
-    drainStrb := B(0, 16 bits)
-    for (i <- 0 until 16) {
-      when(drainByteOff === U(i, 4 bits)) {
-        drainBeat(8 * i + 7 downto 8 * i) := umq.io.drain.payload.newByte
-        drainStrb(i) := True
-      }
-    }
     val drainAddrReg = Reg(UInt(32 bits))
     val drainBeatReg = Reg(Bits(128 bits))
     val drainStrbReg = Reg(Bits(16 bits))
-    when(umq.io.drain.valid && !drainArmed && !drainAckWait) {
-      drainAddrReg := (umq.io.drain.payload.addr(31 downto 4) ## U(0, 4 bits)).asUInt
-      drainBeatReg := drainBeat
-      drainStrbReg := drainStrb
+
+    // ── MERGE, DO NOT OVERWRITE (2026-09-10) ────────────────────────────────────
+    // Mirrors DtlbPlugin's block of the same name; see it for the full reasoning.
+    // `newByte` was sampled at the walk's READ, and the descriptor's low byte also
+    // carries PDT, W, CM and S, so writing the sample back verbatim reverts whatever
+    // software stored into that byte in the meantime. The I-side sets only U (a fetch
+    // is never a write), but it can revert a supervisor's descriptor store exactly
+    // the same way.
+    val UmSetMask     = B"8'h08"                 // U = bit 3 (the I-side never sets M)
+    val drainNeedRead = RegInit(False)
+    val drainReadPend = RegInit(False)
+    val drainSetBits  = Reg(Bits(8 bits))
+    val drainRdAddr   = Reg(UInt(32 bits))
+    val drainOffReg   = Reg(UInt(4 bits))
+
+    when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
+         !drainNeedRead && !drainReadPend && !walker.io.busy) {
+      drainNeedRead := True
+      drainRdAddr   := umq.io.drain.payload.addr
+      drainOffReg   := drainByteOff
+      drainSetBits  := umq.io.drain.payload.newByte & UmSetMask
+    }
+    when(drainNeedRead) {
+      _walkLoadCmd.valid             := True
+      _walkLoadCmd.payload.vaddr     := drainRdAddr
+      _walkLoadCmd.payload.paddr     := drainRdAddr
+      _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
+      _walkLoadCmd.payload.lineOnly  := False
+      _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+      _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_ITLB,
+                                          m68k040.cache.DLoadToken.Width bits)
+      walker.io.loadCmd.ready        := False
+    }
+    when(drainNeedRead && _walkLoadCmd.ready) {
+      drainNeedRead := False
+      drainReadPend := True
+    }
+    when(drainReadPend) { walker.io.loadRsp.valid := False }
+    when(drainReadPend && _walkLoadRsp.valid) {
+      drainReadPend := False
+      val curByte = _walkLoadRsp.payload.data(7 downto 0)
+      val merged  = curByte | drainSetBits
+      drainAddrReg := (drainRdAddr(31 downto 4) ## U(0, 4 bits)).asUInt
+      val mBeat = Bits(128 bits); mBeat := B(0, 128 bits)
+      val mStrb = Bits(16 bits);  mStrb := B(0, 16 bits)
+      for (i <- 0 until 16) {
+        when(drainOffReg === U(i, 4 bits)) {
+          mBeat(8 * i + 7 downto 8 * i) := merged
+          mStrb(i) := True
+        }
+      }
+      drainBeatReg := mBeat
+      drainStrbReg := mStrb
       drainArmed   := True
     }
     _walkStore.valid              := drainArmed

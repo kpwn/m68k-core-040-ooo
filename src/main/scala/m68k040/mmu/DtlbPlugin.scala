@@ -534,23 +534,88 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainArmed  = RegInit(False)
     val drainAckWait = RegInit(False)
     val drainByteOff = umq.io.drain.payload.addr(3 downto 0)
-    val drainBeat = Bits(128 bits)
-    val drainStrb = Bits(16 bits)
-    drainBeat := B(0, 128 bits)
-    drainStrb := B(0, 16 bits)
-    for (i <- 0 until 16) {
-      when(drainByteOff === U(i, 4 bits)) {
-        drainBeat(8 * i + 7 downto 8 * i) := umq.io.drain.payload.newByte
-        drainStrb(i) := True
-      }
-    }
     val drainAddrReg = Reg(UInt(32 bits))
     val drainBeatReg = Reg(Bits(128 bits))
     val drainStrbReg = Reg(Bits(16 bits))
-    when(umq.io.drain.valid && !drainArmed && !drainAckWait) {
-      drainAddrReg := (umq.io.drain.payload.addr(31 downto 4) ## U(0, 4 bits)).asUInt
-      drainBeatReg := drainBeat
-      drainStrbReg := drainStrb
+
+    // ── MERGE, DO NOT OVERWRITE (2026-09-10) ────────────────────────────────────
+    // `newByte` was sampled when the walk READ the descriptor, and the descriptor's
+    // low byte also carries PDT, W, CM and S. Writing that sample back verbatim
+    // REVERTS anything software stored into the byte since the walk -- a supervisor
+    // that write-protects, re-types or changes the cache mode of the page inside the
+    // window has its page-table update silently undone. UmWriteQueue.scala recorded
+    // this as an unaddressed residual in its own words: "Software that rewrites a
+    // descriptor between a walk's read and the drain has its change clobbered. No
+    // interlock in this file ever addressed that."
+    //
+    // It is a nondeterministic corruption engine, because which store loses depends
+    // only on where the drain lands relative to it. Demonstrated by
+    // WalkerDescriptorCoherencySpec's "a deferred U/M write must not revert a
+    // descriptor written in the meantime", which read the byte back as 0x19 -- U and
+    // M set, and the supervisor's write-protect gone.
+    //
+    // THE FIX: re-read the descriptor here and OR IN ONLY the bits a table search is
+    // ever allowed to set -- U (bit 3) and M (bit 4). A walk never CLEARS a bit, so
+    // an OR is the entire required update, and every other bit is left as whoever
+    // wrote it last left it.
+    //
+    // ORDERING: the read is issued only while the walker is IDLE, so the walker can
+    // have no descriptor read outstanding and the single response cannot be
+    // misattributed. While the drain owns the port the walker's `loadCmd.ready` is
+    // held low, which is ordinary backpressure and cannot deadlock: the drain's read
+    // does not wait on a walk. Starvation would need a permanently busy walker, which
+    // is already a hang in its own right.
+    val UmSetMask     = B"8'h18"                 // U = bit 3, M = bit 4
+    val drainNeedRead = RegInit(False)
+    val drainReadPend = RegInit(False)
+    val drainSetBits  = Reg(Bits(8 bits))
+    val drainRdAddr   = Reg(UInt(32 bits))
+    val drainOffReg   = Reg(UInt(4 bits))
+
+    when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
+         !drainNeedRead && !drainReadPend && !walker.io.busy) {
+      drainNeedRead := True
+      drainRdAddr   := umq.io.drain.payload.addr
+      drainOffReg   := drainByteOff
+      drainSetBits  := umq.io.drain.payload.newByte & UmSetMask
+    }
+
+    // Drain owns the walker's descriptor-read port for exactly one transaction.
+    when(drainNeedRead) {
+      _walkLoadCmd.valid             := True
+      _walkLoadCmd.payload.vaddr     := drainRdAddr
+      _walkLoadCmd.payload.paddr     := drainRdAddr
+      _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
+      _walkLoadCmd.payload.lineOnly  := False
+      // Both overwritten by the arbiter with the same fixed policy the walker's own
+      // reads get; these are the inert standalone-DUT defaults, exactly as in
+      // TableWalker.
+      _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+      _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_DTLB,
+                                          m68k040.cache.DLoadToken.Width bits)
+      walker.io.loadCmd.ready        := False
+    }
+    when(drainNeedRead && _walkLoadCmd.ready) {
+      drainNeedRead := False
+      drainReadPend := True
+    }
+    // The response to OUR read belongs to us, not to the walker.
+    when(drainReadPend) { walker.io.loadRsp.valid := False }
+    when(drainReadPend && _walkLoadRsp.valid) {
+      drainReadPend := False
+      val curByte = _walkLoadRsp.payload.data(7 downto 0)
+      val merged  = curByte | drainSetBits
+      drainAddrReg := (drainRdAddr(31 downto 4) ## U(0, 4 bits)).asUInt
+      val mBeat = Bits(128 bits); mBeat := B(0, 128 bits)
+      val mStrb = Bits(16 bits);  mStrb := B(0, 16 bits)
+      for (i <- 0 until 16) {
+        when(drainOffReg === U(i, 4 bits)) {
+          mBeat(8 * i + 7 downto 8 * i) := merged
+          mStrb(i) := True
+        }
+      }
+      drainBeatReg := mBeat
+      drainStrbReg := mStrb
       drainArmed   := True
     }
     _walkStore.valid              := drainArmed

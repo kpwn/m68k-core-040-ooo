@@ -423,4 +423,94 @@ class WalkerDescriptorCoherencySpec extends AnyFunSuite {
         f"holds the pre-walk image and its eviction would discard the update.")
     }
   }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // THE DEFERRED-WRITE CLOBBER.
+  //
+  // UmWriteQueue.scala says so in its own words: "the drain is a whole-BYTE RMW
+  // and that byte also carries PDT/W/CM/S. Software that rewrites a descriptor
+  // between a walk's read and the drain has its change clobbered. No interlock in
+  // this file ever addressed that."
+  //
+  // The captured byte is sampled when the walk READS the descriptor. It is written
+  // back much later, when the triggering instruction's robId commits. A supervisor
+  // that write-protects, re-types, or changes the cache mode of that page inside
+  // that window has its store silently REVERTED -- not delayed, reverted -- because
+  // the drain rewrites the whole low byte from the stale sample.
+  //
+  // A reverted page-table update is a nondeterministic memory-corruption engine:
+  // the page keeps stale protection or a stale cache mode, and which access loses
+  // depends purely on where the drain lands relative to the supervisor's store.
+  // That matches the failure seen on hardware, where a 7.5.3 boot lands somewhere
+  // different every time.
+  //
+  // This test makes the window explicit rather than racing for it: the drain is
+  // gated on `pulseUmCommit`, so the supervisor's store is placed between the walk
+  // and the drain deterministically.
+  // ────────────────────────────────────────────────────────────────────────────
+  test("a deferred U/M write must not revert a descriptor written in the meantime", VerilatorTest) {
+    M68kSim().withVerilator.compile(new Dut).doSim("walkUmClobbersSwWrite") { dut =>
+      val (cd, mem) = initDut(dut)
+      buildTable(mem, TestVa, PpnOld)
+      armPosture(dut, cd)
+      val leaf     = leafAddr(TestVa)
+      val descBase = leafDesc(PpnOld)          // PDT=01, U=0, M=0, W=0
+      val WBit     = 0x4L                      // write-protect, bit 2 of the low byte
+
+      seed(dut, cd, preg = 10, value = leaf)
+
+      // ── 1. A WRITE to the walked page. The walk reads the leaf and SAMPLES its
+      // low byte; the deferred U/M write is queued but cannot drain until its
+      // robId is committed below.
+      seed(dut, cd, preg = 12, value = TestVa)
+      seed(dut, cd, preg = 13, value = 0x5a5a5a5aL)
+      issueStore(dut, cd, basePreg = 12, disp = 0, dataPreg = 13, robId = 7)
+      val obs = observe(dut, cd, 300)
+      assert(obs.sqAlloc, "the walked-page store never reached the SQ")
+      assert(obs.walkReads.contains(leaf),
+        f"no walk of the leaf descriptor at 0x$leaf%08x happened, so nothing was " +
+        f"sampled and this test would be vacuous: " +
+        f"${obs.walkReads.map(a => f"0x$a%08x").mkString(", ")}")
+      commitSq(dut, cd, robId = 7)
+
+      // ── 2. SUPERVISOR WRITES THE DESCRIPTOR, inside the window. This is an
+      // ordinary store to the page-table entry, exactly what an OS does when it
+      // write-protects a page.
+      seed(dut, cd, preg = 11, value = descBase | WBit)
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, robId = 9)
+      assert(waitSqAlloc(dut, cd), "the supervisor's descriptor store never reached the SQ")
+      cd.waitSampling(4)
+      commitSq(dut, cd, robId = 9)
+      assert(waitSqEmpty(dut, cd), "the supervisor's descriptor store never drained")
+      cd.waitSampling(40)
+
+      // Non-vacuity: the supervisor's W really is in place before the drain runs.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 22, robId = 10)
+      cd.waitSampling(120)
+      val beforeDrain = readPreg(dut, 22).toLong & 0xffffffffL
+      assert((beforeDrain & WBit) == WBit,
+        f"setup invalid: the supervisor's write-protect never landed (read back " +
+        f"0x$beforeDrain%08x from 0x$leaf%08x), so the clobber below would be untestable")
+
+      // ── 3. NOW let the deferred U/M write drain.
+      pulseUmCommit(dut, cd, robId = 7)
+      cd.waitSampling(200)
+
+      // ── 4. THE ASSERTION. The drain must merge U and M into whatever the
+      // descriptor now holds, not rewrite the byte it sampled before the
+      // supervisor's store.
+      issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 21, robId = 11)
+      cd.waitSampling(120)
+      val after = readPreg(dut, 21).toLong & 0xffffffffL
+      assert((after & WBit) == WBit,
+        f"REVERTED: the deferred U/M write clobbered the supervisor's descriptor " +
+        f"store. Read back 0x$after%08x from 0x$leaf%08x; write-protect (bit 2) was " +
+        f"set before the drain and is clear after it. The drain rewrote the whole " +
+        f"low byte from the value sampled at walk time, discarding everything " +
+        f"software changed in between.")
+      assert((after & 0x18L) == 0x18L,
+        f"the drain lost its own update: read back 0x$after%08x, expected U (bit 3) " +
+        f"and M (bit 4) both set")
+    }
+  }
 }
