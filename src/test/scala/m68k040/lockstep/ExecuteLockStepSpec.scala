@@ -7395,7 +7395,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr
       pokeLE(PTRT + 0*4,      (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA (0x0..0x3FFFF)
       pokeLE(PAGA + 0*4,      (0x0L << 12) | 0x1L)           // pageA[0] = identity (vector store VA 0x8)
-      pokeLE(PAGA + 0x3f*4,   (0x3fL << 12) | 0x1L)          // pageA[0x3f] = identity VPN 0x3F (PT write VA 0x3F008)
+      pokeLE(PAGA + 0x3f*4,   (0x3fL << 12) | 0x1L)
+      // 2026-09-09: the boot SSP's page (0x000FF000, VA[24:18] = 3) was never mapped --
+      // it did not need to be while the exception sequencer pushed frames UNTRANSLATED.
+      // `PAGA[0x3f]` above is a DIFFERENT page (VA 0x0003F000, the PT-write target), not
+      // the stack. The format-$7 frame at SSP-60 now walks ptr[3], so map it.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3*4,      (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f*4,   (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)          // pageA[0x3f] = identity VPN 0x3F (PT write VA 0x3F008)
       // Code region: root[code]->ptr, ptr[code]->PAGD; PAGD[2] NON-RESIDENT, the rest
       // identity-resident.
       pokeLE(0x80000L + rIdx*4, (PTRT & 0xfffffff0L) | 0x2L)
@@ -7527,6 +7534,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       pokeLE(PTRT + 0*4,      (PAGA & 0xfffffff0L) | 0x2L)
       pokeLE(PAGA + 0*4,      (0x0L << 12) | 0x1L)
       pokeLE(PAGA + 0x3f*4,   (0x3fL << 12) | 0x1L)
+      // 2026-09-09: the boot SSP's page (0x000FF000, VA[24:18] = 3) was never mapped --
+      // it did not need to be while the exception sequencer pushed frames UNTRANSLATED.
+      // `PAGA[0x3f]` above is a DIFFERENT page (VA 0x0003F000, the PT-write target), not
+      // the stack. The format-$7 frame at SSP-60 now walks ptr[3], so map it.
+      val PAGS = 0x00085000L
+      pokeLE(PTRT + 3*4,      (PAGS & 0xfffffff0L) | 0x2L)   // ptr[3] -> stack leaf table
+      pokeLE(PAGS + 0x3f*4,   (0xffL << 12) | 0x1L)          // VA 0x000FF000 identity (SSP page)
       pokeLE(0x80000L + rIdx*4, (PTRT & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + pIdx*4,     (PAGD & 0xfffffff0L) | 0x2L)
       for (i <- 0 until 8) {
