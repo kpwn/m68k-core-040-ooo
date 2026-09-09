@@ -1064,6 +1064,19 @@ class ExceptionUnit(
   val fsIsUnimp   = RegInit(False)
   val fsStep      = Reg(UInt(5 bits)) init 0; fsStep.simPublic() // WORD index, 0..25
   val fsSplitLow  = RegInit(False)
+  // ── p167 (2026-09-09): FRESTORE's header READ carries the SAME cross-line hole the
+  // FSAVE store side closed with `fsSplitLow` (task #163) and the RTE frame-word read
+  // closed with `rdSplitLow` below. `DcacheByteLane.extract` indexes `off + 1` with a
+  // 4-bit WRAPPING index, so a WORD read at line-relative offset 15 comes back as
+  // {byte[15], byte[0]} of the SAME line. `frestore (%a7)+` with an ODD supervisor SP is
+  // exactly what Mac OS does on an FPU context switch inside a `link %a6,#-75` stretch
+  // (RAM 0x9008, SSP = 0x0017fec7 on the p167 boot), and a wrong LENGTH byte pops the
+  // wrong number of bytes -- A7 lands off the real frame for the rest of the program.
+  // Split such a header into two BYTE reads (hi @ base, lo @ base+1); the low byte's VPN
+  // is derived from the split-aware address, so a header at page offset $FFF genuinely
+  // re-translates for its second byte (same rule F_STORE's `fsCurVa` states).
+  val fsRdSplitLow = RegInit(False)
+  val fsRdHiByte   = Reg(Bits(8 bits)) init 0
   val fsAnWrite   = RegInit(False)                               // does this op write An back?
   // Translate-on-VPN-change bookkeeping (design addendum point 3). A 52-byte frame spans
   // at most one page boundary, so a full replica of LsEuPlugin's two-pass cross-page split
@@ -2153,6 +2166,7 @@ class ExceptionUnit(
           fsAnWrite   := isPredec
           fsStep      := 0
           fsSplitLow  := False
+          fsRdSplitLow := False   // p167: no split-header carry into this episode
           fsVpnValid  := False    // force a translation before the first word
           // An write-back through the SAME port MOVEC's read direction uses. Driven HERE
           // (not after the stores) because the value is already known combinationally --
@@ -2173,6 +2187,7 @@ class ExceptionUnit(
           // write-back differs. The pop size is unknown until the header word is read.
           fsFrameBase := sysCapVal.asUInt
           fsAnWrite   := sysCapRc(3 downto 1) === U(3, 3 bits)   // (An)+ postincrement
+          fsRdSplitLow := False   // p167: no split-header carry into this episode
           fsVpnValid  := False
         }
       }
@@ -2292,6 +2307,14 @@ class ExceptionUnit(
     // address is what makes the translate-on-VPN-change rule correct at a page boundary:
     // a word at page offset $FFF splits, and its low byte genuinely lives in the NEXT
     // page, so the split phase re-triggers a translation all by itself.
+    // p167: the FRESTORE header read's split-aware address / VPN (see `fsRdSplitLow`).
+    // Deriving the VPN from `fsRdCurVa` is what makes a header at page offset $FFF
+    // re-translate for its second byte, exactly as `fsCurVa` does on the store side.
+    val fsRdCrosses = fsFrameBase(3 downto 0) === U(15, 4 bits)
+    val fsRdCurVa   = Mux(fsRdSplitLow, fsFrameBase + U(1, 32 bits), fsFrameBase)
+    val fsRdCurVpn  = fsRdCurVa(31 downto 12)
+    val fsRdNeedXlate = !fsVpnValid || (fsRdCurVpn =/= fsLastVpn)
+
     val fsWordAddr = fsFrameWordAddr(fsStep)
     val fsCrosses  = fsWordAddr(3 downto 0) === U(15, 4 bits)
     val fsCurVa    = Mux(fsSplitLow, fsWordAddr + U(1, 32 bits), fsWordAddr)
@@ -2374,9 +2397,11 @@ class ExceptionUnit(
     // "translate once, use once" here and is deliberately NOT built as a loop.
     F_RXREQ.whenIsActive {
       dxReqValid := True
-      dxReqVpn   := fsFrameBase(31 downto 12)
+      // p167: the split-aware VPN, so the low byte of a header word that straddles a
+      // page boundary ($FFF) genuinely re-translates before it is read.
+      dxReqVpn   := fsRdCurVpn
       dxReqWrite := False                      // the header access is a LOAD
-      when(dxReqReady) { dxPendVpn := fsFrameBase(31 downto 12); goto(F_RXWAIT) }
+      when(dxReqReady) { dxPendVpn := fsRdCurVpn; goto(F_RXWAIT) }
     }
     F_RXWAIT.whenIsActive {
       when(dxRspMine) {
@@ -2392,24 +2417,37 @@ class ExceptionUnit(
       }
     }
     F_HDRREQ.whenIsActive {
-      ldoVld   := True
-      ldoVaddr := fsFrameBase
-      // Same page-size mux as F_STORE above (see the comment there) -- FRESTORE's header
-      // read had the identical hardcoded 4 KiB assembly.
-      ldoPaddr := Mux(fsIs8K,
-        (fsPpn(19 downto 1) ## fsFrameBase(12 downto 0)).asUInt,
-        (fsPpn ## fsFrameBase(11 downto 0)).asUInt)
-      ldoSize  := Size.WORD
-      // WORD granularity, not LONG, for the same reason task #189 split RTE's PC read:
-      // `DcacheByteLane.extract` has no cross-line awareness. The residual exposure is
-      // identical to (and no worse than) that already-documented one -- a WORD landing
-      // exactly at line-relative offset 15, which for the header would ALSO be a page
-      // crossing. Not closed here; it is the same narrow residual class R_PCREQ carries.
-      when(dcLoadCmd.fire) { goto(F_HDRWAIT) }
+      when(fsRdNeedXlate) {
+        // The split phase walked into the next page -- re-translate before touching it
+        // (mirrors F_STORE's `fsNeedXlate` re-entry; at most one re-entry per header).
+        goto(F_RXREQ)
+      } otherwise {
+        ldoVld   := True
+        ldoVaddr := fsRdCurVa
+        // Same page-size mux as F_STORE above (see the comment there) -- FRESTORE's header
+        // read had the identical hardcoded 4 KiB assembly.
+        ldoPaddr := Mux(fsIs8K,
+          (fsPpn(19 downto 1) ## fsRdCurVa(12 downto 0)).asUInt,
+          (fsPpn ## fsRdCurVa(11 downto 0)).asUInt)
+        // p167: WORD normally; a header at line-relative offset 15 is read as two BYTEs
+        // (hi @ base, lo @ base+1) because `DcacheByteLane.extract` wraps `off + 1`
+        // inside the line. `frestore (%a7)+` with an ODD supervisor SP -- what Mac OS
+        // does on an FPU context switch inside a `link %a6,#-75` stretch -- otherwise
+        // reads {byte[15], byte[0]} and pops a length taken from unrelated memory.
+        ldoSize  := Mux(fsRdCrosses, Size.BYTE, Size.WORD)
+        when(dcLoadCmd.fire) { goto(F_HDRWAIT) }
+      }
     }
     F_HDRWAIT.whenIsActive {
-      when(dcLoadRsp.valid) {
-        val hdr     = dcLoadRsp.payload.data(15 downto 0)
+      when(dcLoadRsp.valid && fsRdCrosses && !fsRdSplitLow) {
+        // p167: that was the HIGH byte of a split header word; go back for the low byte.
+        fsRdHiByte   := dcLoadRsp.payload.data(7 downto 0)
+        fsRdSplitLow := True
+        goto(F_HDRREQ)
+      } elsewhen(dcLoadRsp.valid) {
+        fsRdSplitLow := False
+        val hdr     = Mux(fsRdCrosses, fsRdHiByte ## dcLoadRsp.payload.data(7 downto 0),
+                                       dcLoadRsp.payload.data(15 downto 0))
         val version = hdr(15 downto 8)
         val lenByte = hdr(7 downto 0).asUInt
         // Pop size = 4 + the length-in-hex indicator, for EVERY frame flavour. This is
