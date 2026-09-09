@@ -102,6 +102,12 @@ REG OFF_AT_HIT            0x000FC MIXED 6 0x00000000 A-trap hit descriptor.
 REG OFF_AT_HIT_PC         0x00100 RO    6 0x00000000 A-trap hit PC.
 REG OFF_AT_HIT_A0         0x00104 RO    6 0x00000000 A-trap hit A0 capture.
 REG OFF_AT_HIT_D0         0x00108 RO    6 0x00000000 A-trap hit D0 capture.
+REG OFF_A7ODD_CTL         0x0010C RW    5 0x00000000 A7-ODD halt lane control: bit 0 enable, [31:16] threshold (retired macros the committed A7 must stay odd before a stop with reason A7_ODD=7).
+REG OFF_A7ODD_PC0         0x00110 RO    5 0x00000000 A7-ODD lane: PC retiring in the EVEN->ODD edge cycle (0 if none).
+REG OFF_A7ODD_PC1         0x00114 RO    5 0x00000000 A7-ODD lane: newest PC retired before the edge.
+REG OFF_A7ODD_PC2         0x00118 RO    5 0x00000000 A7-ODD lane: the PC retired before PC1.
+REG OFF_A7ODD_VALUE       0x0011C RO    5 0x00000000 A7-ODD lane: the odd committed A7 at the edge.
+REG OFF_A7ODD_COUNT       0x00120 RO    5 0x00000000 A7-ODD lane: EVEN->ODD edges seen while enabled ([15:0]).
 
 # --------------------------------------------- cache probe and operations --
 REG OFF_DCACHE_PROBE_SEL   0x00200 RW    4 0x00000000 D-cache probe way/set select.
