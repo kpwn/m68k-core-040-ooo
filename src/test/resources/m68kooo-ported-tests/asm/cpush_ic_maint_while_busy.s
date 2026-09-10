@@ -29,6 +29,15 @@
 | miss-filling those fresh NOP lines — exactly the "maint_req arrives
 | while FSM != S_IDLE" window the bug hits.
 |
+| ⚠️ POSTURE: THIS TEST IS ONLY VALID WITH THE MMU OFF / D-CACHE INHIBITED.
+| Do NOT add it to the cache-mode sweep manifest. Step 1 below states the
+| requirement outright: with the MMU off, mmu.v forces cache_inh=1 globally so
+| the D-cache never caches the test's writes, which is what isolates the
+| EXPLICIT CPUSH/CINV IC path this test exists to cover. Under forced-copyback
+| that premise is violated -- the writes sit dirty in the D-cache instead of
+| reaching memory -- and the test reports 0xDEAD0004 for reasons unrelated to
+| the bug it targets. (2026-09-10: observed exactly that; not a core defect.)
+|
 | Strategy:
 |   1. Leave the MMU disabled (default cold-boot state: TC.E=0).  With
 |      the MMU off, mmu.v forces cache_inh=1 globally, so the D-cache
