@@ -1167,11 +1167,14 @@ class ExceptionUnit(
     //   idle : $41 $00   (0 extra bytes)
     //   unimp: $41 $30   (48 extra bytes -> 52 total; byte-for-byte the header the Q700
     //                     ROM FPSP manufactures for itself at $4088DA52..$4088DA60)
-    val hdr = Mux(fsIsNull,  B(0x0000, 16 bits),
-              Mux(fsIsUnimp, B((FPU_FRAME_VERSION << 8) | 0x30, 16 bits),
-                             B((FPU_FRAME_VERSION << 8) | 0x00, 16 bits)))
-    val src = fpuCtrl.uiSrcOperand   // ETEMP  : [79] sign, [78:64] exponent, [63:0] mantissa
-    val dst = fpuCtrl.uiDstOperand   // FPTEMP : same layout
+    // Always $41 $30 -- 4 + $30 = the 52 bytes the Q700 FPSP hard-assumes (see the
+    // FSAVE selection block). `fsIsNull` is retained only because FRESTORE still
+    // needs to recognise a null frame that SOFTWARE manufactured.
+    val hdr = B((FPU_FRAME_VERSION << 8) | 0x30, 16 bits)
+    // Zero-filled body on a non-UNIMP frame, matching v1: there is no in-flight FPU
+    // state to checkpoint, and the FPSP reads zeroed fields as benign.
+    val src = Mux(fsIsUnimp, fpuCtrl.uiSrcOperand, B(0, fpuCtrl.uiSrcOperand.getWidth bits))
+    val dst = Mux(fsIsUnimp, fpuCtrl.uiDstOperand, B(0, fpuCtrl.uiDstOperand.getWidth bits))
     switch(step) {
       is(U(0,  5 bits)) { out := hdr }                                        // $00 version|len
       // steps 2..5 ($04, $08) are the two longwords the 52-byte frame adds over the
@@ -1197,7 +1200,7 @@ class ExceptionUnit(
   }
   /** 26 words ($34 bytes) for the unimplemented-instruction frame, 2 words (4 bytes) for
     * null and idle alike (both are a single longword, unchanged between manual editions). */
-  val fsLastStep = Mux(fsIsUnimp, U(25, 5 bits), U(1, 5 bits))
+  val fsLastStep = U(25, 5 bits)   // every FSAVE frame is now 26 words / 52 bytes
 
   // ── p167 (2026-09-09): RTE frame-word READ split at a 16-byte line boundary ──
   // A format-$0/$2/$7 frame sits at SSP-8/-12/-60. Mac OS legitimately runs stretches
@@ -2477,10 +2480,33 @@ class ExceptionUnit(
           //                               latched it) -- this is the route-to-FPSP frame
           //   null                      : no FP op has executed since reset / null restore
           //   idle                      : otherwise
+          // ── v1 PARITY (2026-09-10): FSAVE ALWAYS emits the 52-byte
+          // version-0x41 / size-0x30 frame. THE SIZE IS LOAD-BEARING, not cosmetic.
+          //
+          // The Q700 ROM FPSP kernel (F-line handler at 0x4088D9FE) does
+          //     linkw %fp,#-192 ; fsave %sp@-
+          // and then addresses the frame's fields as FIXED A6-relative offsets
+          // fp@(-244..-196) -- it hard-assumes FSAVE moved SP by 52 bytes. A 4-byte
+          // NULL/IDLE frame leaves SP 48 bytes HIGH, so the FPSP's own BSR chain
+          // pushes return addresses INSIDE what it believes is the frame image and
+          // its scratch writes (e.g. `fmove.x %fp0,%fp@(-204)` on the packed-decimal
+          // path) overwrite a LIVE RETURN-ADDRESS SLOT -- then RTS to garbage.
+          //
+          // v1 caught this on real hardware on 2026-07-15 as a Sad Mac 02: a vec-3
+          // odd-PC frame with PC=0x4088E4C6 (the classify RTS) and address
+          // 0x7FFFFFFF (the saturated FMOVE.X payload that clobbered the slot). Its
+          // decode_1111.vh states the rule plainly and this core must match it; the
+          // owner confirms v1's FSAVE behaviour is the correct reference.
+          //
+          // The body is ZERO-FILLED unless a genuine unimplemented-instruction frame
+          // is pending: we track no FPU micro-sequencer state worth checkpointing,
+          // and the FPSP reads zeroed fields as "no exception pending" shaped.
+          // FPCR/FPSR round-trip fidelity rides the FSAVE/FRESTORE side channel,
+          // unchanged. FRESTORE still pops 4 + the frame's own size byte, so a frame
+          // the FPSP manufactures itself is popped by ITS size, not by this one.
           val isUnimp = fpuCtrl.uiValid
-          val isNull  = !fpuCtrl.everExecuted && !isUnimp
-          val size    = Mux(isUnimp, U(52, 8 bits), U(4, 8 bits))
-          fsIsNull  := isNull
+          val size    = U(52, 8 bits)
+          fsIsNull  := False
           fsIsUnimp := isUnimp
           fsSize    := size
           // sysCapRc[3:1] = the EA mode, sysCapRc[0] = isRestore (0 here).
