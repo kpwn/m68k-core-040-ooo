@@ -24,7 +24,8 @@ object OperationDecoder {
     switch(line) {
       // ---- Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> ----
       // 0000 ooo0 ss mmmrrr + imm. opmode ooo (bits 11:9): 0=ORI,1=ANDI,2=SUBI,
-      // 3=ADDI,5=EORI,6=CMPI (4=bit/BTST-imm, 7=MOVES -> out of scope). bit8=0; size
+      // 3=ADDI,5=EORI,6=CMPI (4=bit/BTST-imm, 7=MOVES -> its OWN decode arm further down
+      // this same line-0 block, `isMovesFamily`; it is NOT out of scope). bit8=0; size
       // ss (bits 7:6): 00=.B,01=.W,10=.L (11 illegal). The IMMEDIATE is srcB (the
       // trailing ext word(s), sized by the op); the EA (op[5:0]) is the DESTINATION
       // operand (srcA, read) AND the writeback dst (dst=EASRC). CMPI writes no reg.
@@ -400,10 +401,12 @@ object OperationDecoder {
         // when active). The EA mode field DISAMBIGUATES from EXT.W (0x4880, mode 000) /
         // EXT.L (0x48C0, mode 000), which share bit11=1 & bits9:7=001 but use Dn-direct
         // (mode 0): a real MOVEM EA is a MEMORY mode (>=2), so EXCLUDE reg-direct modes 0/1.
-        // Indexed An-base (mode 6) LOAD is now admitted below (task movem-agu-index-hazard-
-        // 2026-08-19); mode-6 STORE / #imm+reserved (mode 7 reg>=4) remain OUT OF SCOPE
-        // (STORE has no An-indexed EA support in the FSM at all — pinned illegal by
-        // movem_idx_unimpl_traps.s). `(d8,PC,Xn)` (mode 7 reg 3) GAINED an index-register
+        // Indexed An-base (mode 6) is admitted below in BOTH directions — LOAD by task
+        // movem-agu-index-hazard-2026-08-19, STORE by task movem-idx-an-store-2026-09-11
+        // (`(d8,An,Xn)` is control-ALTERABLE, so `MOVEM <list>,(d8,An,Xn)` is a real 68040
+        // instruction; see the long note at the `movemEaOk` gate itself). #imm + the
+        // reserved mode-7 regs >= 4 remain OUT OF SCOPE (genuinely illegal on silicon
+        // too). `(d8,PC,Xn)` (mode 7 reg 3) GAINED an index-register
         // read port in the FSM (task #200, MicroOpAssembler.movemMoveUop's new srcC/
         // indexLong/indexScale threading), originally admitted here ONLY for `.L` (bit6=1).
         // ported-tests triage (movem_pc_idx_w HANG investigation): `.W` PC-indexed MOVEM is
@@ -467,16 +470,47 @@ object OperationDecoder {
         // the generalized `eIdxPresent`-gated front-end resume + a TWO-STEP base+index
         // snapshot (mode 6 is the first MOVEM EA shape with a REAL base register AND a real
         // index register live at once, unlike PC-indexed where the base is folded into a
-        // literal and (An)/(d16,An) which have no index). STORE direction (opword(10)=0)
-        // stays OUT of scope -- `v2_movem_ea_ok_store` never gained an indexed row upstream
-        // either, and `movem_idx_unimpl_traps.s` pins An-indexed STORE (.W and .L) as a
-        // required vec-4 illegal trap.
+        // literal and (An)/(d16,An) which have no index).
+        // task movem-idx-an-store-2026-09-11: the STORE direction (opword(10)=0) of that
+        // SAME mode-6 EA is now admitted too. `(d8,An,Xn)` is a CONTROL ALTERABLE mode, so
+        // `MOVEM <list>,(d8,An,Xn)` is a REAL, legal MC68040 instruction (Musashi's own
+        // `movem_re_*` EA mask is `A+-DXWL`, i.e. it includes mode 6); trapping it was a
+        // divergence from silicon, and the Quadra 700 ROM is exactly the kind of code that
+        // reaches for it. Admitting it needed NO new FSM state: DecodeStage.scala's MOVEM
+        // micro-sequencer is already DIRECTION-AGNOSTIC for this EA -- `eIsAnIdxMovem` /
+        // `eBaseDispV` / `eIdxPresent` / the base+index snapshot sequencing / the
+        // `movemPcIdxResumeFire` front-end resume / the `movemHasFinal` `An += 0` kept
+        // commit are all selected on the EA MODE alone, never on `eopw(10)`, and
+        // `MicroOpAssembler.movemMoveUop` already threads `idxReg` onto srcC for BOTH
+        // directions (a STORE's srcA=base, srcB=data, srcC=index triple is the same shape
+        // `MicroOpAssembler`'s ordinary indexed-store crack -- `stUop.srcCReg :=
+        // stDstEa.indexReg` -- has always emitted, so the LS EU/AGU read port already
+        // exists). The two LOAD-only mechanisms in the FSM (`movemLoadDst`'s postinc
+        // base-in-list DISCARD and the `movemProbeCount` far-page probe) are both gated on
+        // `movemIsLoad` and correctly stay inert for a store: a MOVEM STORE writes no
+        // architectural register, so it needs neither the in-list discard nor mid-list
+        // register rollback. The base/index SNAPSHOT µops still fire (they are gated on the
+        // EA shape, not the direction); they are redundant-but-harmless for a store for the
+        // same reason, and keeping them shared avoids a second, direction-specific entry
+        // path through the FSM. `movem_idx_unimpl_traps.s` no longer pins this shape (see
+        // that file's header for the same "a pin on an implemented shape would be wrong"
+        // update it already took twice before); positive coverage lives in
+        // `movem_idx_an_store.s` + the `movem-idx-an-store-*` lock-steps.
+        // STILL out of scope for BOTH directions: reg-direct (modes 0/1), #imm / the
+        // reserved mode-7 regs >= 4, and FULL-FORMAT (bd,An/PC,Xn) extension words (ext
+        // bit8=1), which this first-opword-only classifier cannot distinguish from brief
+        // and which degrade to a wrong-but-bounded EA (characterized, not fixed -- task
+        // #200). Note also that this gate is DIRECTION-AGNOSTIC where a real 68040 is not:
+        // `(An)+` STORE, `-(An)` LOAD and PC-relative STORE are accepted here although
+        // silicon takes vector 4 on them. That is an OVER-acceptance (we execute where the
+        // 040 traps), the opposite polarity of the gap this task closed, and no assembler
+        // can even emit those encodings -- tracked, not fixed here.
         val mmMode4 = opword(5 downto 3)
         val mmReg4  = opword(2 downto 0)
         val movemEaOk = (mmMode4.asUInt >= 2 && mmMode4.asUInt <= 5) ||
                         (mmMode4 === B"3'b111" && mmReg4.asUInt <= 2) ||
                         (mmMode4 === B"3'b111" && mmReg4 === B"3'b011") ||  // (d8,PC,Xn), .W and .L
-                        (mmMode4 === B"3'b110" && opword(10))               // (d8,An,Xn) LOAD only, .W and .L
+                        (mmMode4 === B"3'b110")                             // (d8,An,Xn) LOAD+STORE, .W and .L
         when(opword(11) && (opword(9 downto 7) === B"001") && movemEaOk) {
           o.illegal := False
           o.op := DecOp.MOVE                     // benign placeholder; the FSM produces the real µops

@@ -35,7 +35,10 @@ class MovemDecodeSpec extends AnyFunSuite {
   /** One collected µop (the fields under test). */
   case class U(op: String, mem: String, dst: Int, dstV: Boolean, srcB: Int, srcBV: Boolean,
                base: Int, baseV: Boolean, imm: Long, sizeL: Boolean, isMovea: Boolean, first: Boolean,
-               last: Boolean)
+               last: Boolean,
+               // Brief-indexed EA (mode 6 / mode 7 reg 3): the index register Xn rides
+               // srcC, constant across the whole macro, with its own long/scale attributes.
+               idx: Int, idxV: Boolean, idxLong: Boolean, idxScale: Int)
 
   /** Drive `words` at `base`, redirect, and collect up to `n` emitted µops. */
   def collect(words: Seq[Int], base: Long, n: Int): Seq[U] = {
@@ -58,7 +61,8 @@ class MovemDecodeSpec extends AnyFunSuite {
             U(p.op.toEnum.toString, p.memOp.toEnum.toString, p.dstReg.toInt, p.dstValid.toBoolean,
               p.srcBReg.toInt, p.srcBValid.toBoolean, p.srcAReg.toInt, p.srcAValid.toBoolean,
               p.imm.toLong & 0xffffffffL, p.size.toEnum == Size.LONG, p.isMovea.toBoolean, p.firstOfInstr.toBoolean,
-              p.lastOfInstr.toBoolean)
+              p.lastOfInstr.toBoolean,
+              p.srcCReg.toInt, p.srcCValid.toBoolean, p.indexLong.toBoolean, p.indexScale.toInt)
           }
           acc += rd(0)
           if (dut.sink.logic.u1v.toBoolean) acc += rd(1)
@@ -257,6 +261,74 @@ class MovemDecodeSpec extends AnyFunSuite {
     assert(us(0).first && !us(0).last, s"the snapshot uop is first, never last: $us")
     assert(us.slice(1, 4).forall(!_.last), s"no store may claim lastOfInstr: $us")
     assert(us(4).op == "ADD" && us(4).last, s"the trailing An update is last: $us")
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // `(d8,An,Xn)` brief-indexed MOVEM (EA mode 6) — BOTH directions.
+  //
+  // The LOAD direction was admitted by task movem-agu-index-hazard-2026-08-19; the
+  // STORE direction by task movem-idx-an-store-2026-09-11. `(d8,An,Xn)` is a CONTROL
+  // ALTERABLE mode, so `MOVEM <list>,(d8,An,Xn)` is a real MC68040 instruction
+  // (Musashi's `movem_re_*` EA mask `A+-DXWL` includes mode 6) and trapping it was a
+  // divergence from silicon. Mode 6 is also the ONLY MOVEM EA with a real base register
+  // AND a real index register live at once, so it is the only shape that emits BOTH
+  // snapshot µops (base/T0 first, then index/T1).
+  //
+  // Brief-format extension word, at words(2) (the register-mask word occupies words(1)):
+  //   bit15 = D/A, bits14:12 = Xn, bit11 = W/L, bits10:9 = scale, bit8 = 0 (brief),
+  //   bits7:0 = d8.
+  // ══════════════════════════════════════════════════════════════════════════
+  def briefExt(da: Int, xn: Int, long: Int, scale: Int, d8: Int): Int =
+    (da << 15) | (xn << 12) | (long << 11) | (scale << 9) | (d8 & 0xff)
+
+  test("MOVEM.L D1/D4,(0x10,A2,D3.l*4) STORE (EA mode 6) -> base+index snapshots, indexed stores, An+=0", VerilatorTest) {
+    val base = 0x9880L
+    // store (.L), mode 6, An = A2 (arch reg 10); mask D1(bit1)/D4(bit4) = 0x12;
+    // ext = D3 as a LONG index, scale 4, d8 = 0x10.
+    val us = collect(Seq(movem(0, 1, 6, 2), 0x0012, briefExt(0, 3, 1, 2, 0x10), 0x4e71), base, 5)
+    assert(us.length == 5, s"expected base snap + index snap + 2 stores + An update, got ${us.length}: $us")
+    // BOTH snapshots run, base/T0 first then index/T1 (DecodeStage's movemSnapIdxPending
+    // sequencing). NOTE: movemSnapUop sets firstOfInstr unconditionally, so in this
+    // two-snapshot shape BOTH carry it -- benign (both share the macro's own pc, so an
+    // interrupt taken at either returns to the MOVEM and re-runs the whole macro).
+    assert(us(0).op == "ADD" && us(0).mem == "NONE" && us(0).dst == MicroOpAssembler.T0 &&
+           us(0).dstV && us(0).base == 10 && us(0).baseV && us(0).first,
+      s"uop0 must be the base snapshot T0 := A2: $us")
+    assert(us(1).op == "ADD" && us(1).mem == "NONE" && us(1).dst == MicroOpAssembler.T1 &&
+           us(1).dstV && us(1).base == 3 && us(1).baseV,
+      s"uop1 must be the index snapshot T1 := D3: $us")
+    val st = us.slice(2, 4)
+    assert(st.forall(s => s.mem == "STORE" && !s.dstV && s.sizeL && !s.isMovea),
+      s"both transfers must be plain .L STOREs that write no register: $st")
+    // The index rides srcC on EVERY element, redirected to the immutable T1 snapshot,
+    // carrying the brief format's long/scale attributes; only the folded disp walks.
+    assert(st.forall(s => s.idxV && s.idx == MicroOpAssembler.T1 && s.idxLong && s.idxScale == 2),
+      s"the index must ride srcC (T1 snapshot, long, scale 4) on both stores: $st")
+    assert(st(0).srcB == 1 && st(0).srcBV && st(0).base == MicroOpAssembler.T0 && st(0).baseV &&
+           st(0).imm == 0x10, s"store0 = D1 at base+d8: $us")
+    assert(st(1).srcB == 4 && st(1).base == MicroOpAssembler.T0 && st(1).imm == 0x14,
+      s"store1 = D4 at base+d8+4: $us")
+    // Control mode -> the trailing kept `An += 0` commit, exactly like (An)/(d16,An).
+    assert(us(4).op == "ADD" && us(4).mem == "NONE" && us(4).dst == 10 && us(4).dstV &&
+           us(4).imm == 0 && us(4).last, s"anUpd=$us")
+  }
+
+  // The LOAD direction of the SAME EA, as a side-by-side control: the ONLY differences
+  // must be the memOp/dst routing and the far-page probe carrier -- the snapshots, the
+  // srcC index threading, the folded displacements and the trailing An+=0 are identical.
+  test("MOVEM.L (0x10,A2,D3.l*4),D1/D4 LOAD (EA mode 6) -> same EA machinery, LOAD routing", VerilatorTest) {
+    val base = 0x98c0L
+    val us = collect(Seq(movem(1, 1, 6, 2), 0x0012, briefExt(0, 3, 1, 2, 0x10), 0x4e71), base, 5)
+    assert(us.length == 5, s"expected base snap + index snap + 2 loads + An update, got ${us.length}: $us")
+    assert(us(0).dst == MicroOpAssembler.T0 && us(1).dst == MicroOpAssembler.T1,
+      s"both snapshots must still be emitted for the LOAD direction: $us")
+    val ld = us.slice(2, 4)
+    assert(ld.forall(u => u.mem == "LOAD" && u.dstV && !u.srcBV),
+      s"both transfers must be LOADs that write a register and read no store data: $ld")
+    assert(ld.forall(u => u.idxV && u.idx == MicroOpAssembler.T1 && u.idxLong && u.idxScale == 2),
+      s"the index rides srcC identically in the LOAD direction: $ld")
+    assert(ld(0).dst == 1 && ld(0).imm == 0x10 && ld(1).dst == 4 && ld(1).imm == 0x14, s"$us")
+    assert(us(4).op == "ADD" && us(4).dst == 10 && us(4).imm == 0 && us(4).last, s"anUpd=$us")
   }
 
   test("MOVEM then a following MOVEQ -> front-end resumes (the held fed releases cleanly)", VerilatorTest) {

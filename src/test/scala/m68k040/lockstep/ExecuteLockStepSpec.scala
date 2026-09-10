@@ -7766,6 +7766,72 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x3000L, 0x3004L, 0x3008L))   // D0,D2,A1 stored ascending
   }
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // MOVEM with a BRIEF-INDEXED An base, `(d8,An,Xn)` (EA mode 6).
+  //
+  // `(d8,An,Xn)` is a CONTROL ALTERABLE mode, so `MOVEM <list>,(d8,An,Xn)` is a real
+  // MC68040 instruction (Musashi's own `movem_re_*` EA mask is `A+-DXWL`, which
+  // includes mode 6). The core admitted this EA for the LOAD direction only (task
+  // movem-agu-index-hazard-2026-08-19) and took a vector-4 ILLEGAL on every STORE --
+  // a divergence from silicon and a latent ROM/OS failure. Task
+  // movem-idx-an-store-2026-09-11 admits the store direction; these lock-steps are the
+  // Musashi oracle for it.
+  //
+  // A MOVEM STORE writes NO architectural register, so `checkMem` is the primary
+  // oracle for the store direction (the PC/SR/register stream every lock-step compares
+  // covers the rest). The LOAD direction is checked through the register stream: the
+  // per-element loads are dropped crack uops, so the trailing ADD folds are what
+  // actually compare the loaded values against Musashi.
+  // ══════════════════════════════════════════════════════════════════════════════
+  test("lock-step: MOVEM.L <list>,(d8,An,Xn) STORE (An-indexed, scale 1)", VerilatorTest) {
+    runLockStep("movem-idx-an-store-l",
+      "move.l #0x11112222,%d0 ; move.l #0x33334444,%d1 ; move.l #0xa1a2a3a4,%a1 ; " +
+      "move.l #0x2000,%a0 ; move.l #0x1000,%d5 ; " +          // EA = A0 + D5*1 + 0 = 0x3000
+      "movem.l %d0/%d1/%a1,(0,%a0,%d5.l) ; " +                // D0@0x3000, D1@0x3004, A1@0x3008
+      ".stop: bra .stop", nInstr = 6,
+      checkMem = Seq(0x3000L, 0x3004L, 0x3008L))
+  }
+
+  // .W store (each element truncates to 16 bits), a SCALED long index and a NEGATIVE d8:
+  // EA = A0 + D5*4 - 8 = 0x3000 + 8 - 8. Both elements land inside one long, so a single
+  // checkMem long (0xFFFE0007) pins the truncation AND the +2 stride.
+  test("lock-step: MOVEM.W <list>,(d8,An,Xn) STORE (scale 4, negative d8, .W truncation)", VerilatorTest) {
+    runLockStep("movem-idx-an-store-w",
+      "move.l #0x1111fffe,%d0 ; move.l #0x22220007,%d1 ; " +
+      "move.l #0x3000,%a0 ; move.l #2,%d5 ; " +
+      "movem.w %d0/%d1,(-8,%a0,%d5.l*4) ; " +
+      ".stop: bra .stop", nInstr = 5, checkMem = Seq(0x3000L))
+  }
+
+  // The stored list CONTAINS the EA's own base An AND its index Dn. A MOVEM store writes
+  // no architectural register, so both must be written out with their PRE-instruction
+  // values, the EA must use those same values, and A2 must survive unchanged (mode 6 is a
+  // control mode -- no auto-update). This is the store-side analogue of the in-list
+  // self-corruption case the LOAD direction needed the T0/T1 snapshot uops for.
+  test("lock-step: MOVEM.L <list>,(d8,An,Xn) STORE with the base An and index Dn IN the list", VerilatorTest) {
+    runLockStep("movem-idx-an-store-inlist",
+      "move.l #0x3000,%a2 ; moveq #0,%d3 ; " +
+      "movem.l %d3/%a2,(0,%a2,%d3.l) ; " +                    // D3@0x3000 (=0), A2@0x3004 (=0x3000)
+      "move.l %a2,%d7 ; " +                                   // A2 must be UNCHANGED
+      ".stop: bra .stop", nInstr = 4, checkMem = Seq(0x3000L, 0x3004L))
+  }
+
+  // LOAD direction of the SAME EA: admitted since task movem-agu-index-hazard-2026-08-19
+  // but never lock-stepped (only ported-asm coverage existed), so both directions of mode
+  // 6 now have a Musashi oracle. Memory is seeded through the -(An) predec store form (the
+  // reliable seed-then-reload shape -- see the movem-l-postinc-load note above about the
+  // plain-store -> immediate-load LS race).
+  test("lock-step: MOVEM.L (d8,An,Xn),<list> LOAD (An-indexed)", VerilatorTest) {
+    runLockStep("movem-idx-an-load-l",
+      "move.l #0x0a0a0a0a,%d0 ; move.l #0x0b0b0b0b,%d1 ; move.l #0x0c0c0c0c,%d2 ; " +
+      "move.l #0x300c,%a1 ; movem.l %d0/%d1/%d2,-(%a1) ; " +  // seed 0x3000..0x300b; A1 := 0x3000
+      "move.l #0x2000,%a0 ; move.l #0x1000,%d5 ; " +          // EA = A0 + D5 = 0x3000
+      "movem.l (0,%a0,%d5.l),%d3/%d4/%d6 ; " +
+      "add.l %d4,%d3 ; add.l %d6,%d3 ; " +                    // surface the dropped loads
+      ".stop: bra .stop", nInstr = 10,
+      checkMem = Seq(0x3000L, 0x3004L, 0x3008L))
+  }
+
   // MOVEM.L (An)+,<list> load + final An update (A0 += 12). The loaded D3/D4/D5 are dropped
   // crack µops -> surface them via adds (each a kept step) so the loaded values are
   // compared vs Musashi. A0 (=0x300C after postinc) is the kept An-update step. Stores via

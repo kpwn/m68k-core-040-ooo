@@ -997,11 +997,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val eIdxD8     = eIdxExt(7 downto 0).asSInt.resize(32).asBits
     val ePcIdxBase = (ePc + U(4, 32 bits) + eIdxD8.asUInt).asBits    // PC+4+sext(d8)
     val eIsPcIdxMovem = (eMode === B"3'b111") && (eReg === B"3'b011")
-    // `(d8,An,Xn)` brief-indexed LOAD (task movem-agu-index-hazard-2026-08-19, mode 6):
+    // `(d8,An,Xn)` brief-indexed MOVEM (task movem-agu-index-hazard-2026-08-19 for the
+    // LOAD direction, task movem-idx-an-store-2026-09-11 for the STORE direction, mode 6):
     // the AN-based analogue of `eIsPcIdxMovem` above. Shares the SAME extension-word
     // decode (eIdxExt/eIdxD8/etc, read unconditionally) since the mask still occupies
     // words(1) regardless of base type -- only the base differs (a real An register here
-    // vs PC there).
+    // vs PC there). NOTHING in this FSM's mode-6 handling reads `eopw(10)`: the base/index
+    // latching, the two-step snapshot sequencing, the `movemPcIdxResumeFire` front-end
+    // resume and the `movemHasFinal` `An += 0` kept commit are all EA-shape decisions, so
+    // admitting the STORE direction in OperationDecoder.scala needed no change here. The
+    // two direction-specific mechanisms (`movemLoadDst`'s postinc in-list DISCARD and the
+    // `movemProbeCount` far-page probe) are both already gated on `movemIsLoad` and stay
+    // correctly inert for a store, which writes no architectural register at all.
     val eIsAnIdxMovem = (eMode === B"3'b110")
     val eIdxPresent = eIsPcIdxMovem || eIsAnIdxMovem
     val eBaseValidV = Bits(1 bits); val eBaseRegV = UInt(5 bits)

@@ -856,9 +856,17 @@ object Microcode {
 
     // ════════════════════════════════════════════════════════════════════════
     // MOVES .B/.W/.L (010+ PRIVILEGED move to/from alternate address space). The access
-    // is FLAT (Musashi `(void)fc` — the FC is stored in SFC/DFC but never redirects address
-    // space), so functionally it is a normal sized MOVE + the EA auto-inc/dec side effect +
-    // a privilege trap. The EA (memory-alterable, incl (An)+/-(An)) rides the shared
+    // really does run in the alternate space: `DecodedUop.altAddrSpace` rides the ONE memory
+    // µop of the macro (the store of the write form / the load of the read form) and
+    // LsEuPlugin drives the DTLB request's `supervisor` bit from DFC[2] (store) / SFC[2]
+    // (read) instead of the live architectural S bit, so a supervisor MOVES with SFC/DFC
+    // naming user space searches URP and is protection-checked as user (see
+    // AddrSpaceLockStepSpec's "SFC/DFC select the address space" battery, and Tlb.scala's
+    // `tagSup`, which had to start tagging FC2 for that to be sound). With the MMU DISABLED
+    // -- and in the Musashi oracle, whose `(void)fc` ignores the function code entirely --
+    // the access is flat, which is why the MMU-off MOVES lock-steps trace-match a normal
+    // sized MOVE. Functionally, then: a sized MOVE + the EA auto-inc/dec side effect + a
+    // privilege trap, with the address space selected by SFC/DFC. The EA (memory-alterable, incl (An)+/-(An)) rides the shared
     // eaBase/eaDispLo/eaIndex group; the CAS auto EA machinery (eaAuto from ctx) carries the
     // (An)+/-(An) single side effect. Privilege: the FIRST µop carries needsSupervisor (set
     // in resolve from ctx) -> the ROB delivers a vector-8 if committed S==0 (op does NOT
