@@ -407,4 +407,91 @@ class DtlbCrossPageSplitSpec extends AnyFunSuite {
         "distinct-mode split must still assemble bytes from both nonadjacent PPNs")
     }
   }
+
+  /** MMU ON, walker LIVE, squash landing inside a cross-page split.
+    *
+    * This is the configuration the board actually runs and simulation mostly does
+    * not: every LsEuPlugin split test pins `mmuEnable = false`, and the three
+    * tests above run the MMU but never squash. The combination matters because
+    * the table walker SHARES the `loadCmd` port with the LS EU:
+    *
+    *   - `ldForce` (LsEuPlugin's per-walker aging bit) OUTRANKS CORE-LS after
+    *     `walkerAgeLimit` un-granted cycles, and the grant machine's own comment
+    *     says "a walker's descriptor read may be OUTSTANDING at the same time as
+    *     up to four ordinary LS loads".
+    *   - a cold cross-page split performs SIX descriptor reads (three per half),
+    *     so the walker is not incidental here, it is saturating the port.
+    *
+    * That directly stresses `splitMergeLine`'s claim that slot B is "the very next
+    * thing sent and the very next response processed, so nothing else can land in
+    * between" — while a squash cancels the pair mid-flight.
+    *
+    * The sweep is SELF-CALIBRATED against a measured un-squashed run: a cold
+    * MMU-on split takes far longer than a fixed guess would cover, and a sweep
+    * that stops short of the window passes VACUOUSLY.
+    */
+  test("MMU ON: a squash during a cross-page split (walker live) must not corrupt a later split", VerilatorTest) {
+    val vaV = 0x0040affeL; val ppnA = 0x0120aL; val ppnB = 0x0230bL
+    val vaF = 0x0040dffeL; val ppnC = 0x0340dL; val ppnD = 0x0450eL
+    val lineA = (0 until 16).map(i => (0x31 + i * 9) & 0xff)
+    val lineB = (0 until 16).map(i => (0xe7 - i * 11) & 0xff)
+    val lineC = (0 until 16).map(i => (0x5a + i * 7) & 0xff)
+    val lineD = (0 until 16).map(i => (0xc3 - i * 5) & 0xff)
+
+    def setup(dut: Dut, cd: ClockDomain, dataMem: AxiMemModel, pageMem: AxiMemModel): Unit = {
+      prepareSplit(dut, cd, pageMem, vaV, ppnA, ppnB, residentB = true, modeA = 0, modeB = 0)
+      prepareSplit(dut, cd, pageMem, vaF, ppnC, ppnD, residentB = true, modeA = 0, modeB = 0)
+      lineA.indices.foreach(i => dataMem.pokeByte((((ppnA << 12) | 0xffeL) & ~0xfL) + i, lineA(i)))
+      lineB.indices.foreach(i => dataMem.pokeByte((ppnB << 12) + i, lineB(i)))
+      lineC.indices.foreach(i => dataMem.pokeByte((((ppnC << 12) | 0xffeL) & ~0xfL) + i, lineC(i)))
+      lineD.indices.foreach(i => dataMem.pokeByte((ppnD << 12) + i, lineD(i)))
+    }
+
+    // ── calibrate: how long does a cold MMU-on cross-page split actually take? ──
+    var span = 0
+    compiled.doSim("mmu-squash-calib") { dut =>
+      val (cd, dataMem, pageMem) = initDut(dut)
+      setup(dut, cd, dataMem, pageMem)
+      seedPreg(dut, cd, preg = 10, data = vaV)
+      var cyc = 0
+      val run = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork { while (run.get()) { cd.waitSampling(); cyc += 1 } }
+      runLoad(dut, cd, basePreg = 10, pdst = 20, robId = 7, expectFault = false)
+      run.set(false)
+      span = cyc
+    }
+    assert(span > 20, s"calibration span implausibly short ($span cycles)")
+    info(s"cold MMU-on cross-page split completes in ~$span cycles; sweeping squash delays 1..${span + 10}")
+
+    for (delay <- 1 to span + 10) {
+      compiled.doSim(s"mmu-squash-$delay") { dut =>
+        val (cd, dataMem, pageMem) = initDut(dut)
+        setup(dut, cd, dataMem, pageMem)
+        val s = dut.src.logic
+
+        // Victim split -- squashed somewhere inside its walk/refill sequence.
+        seedPreg(dut, cd, preg = 10, data = vaV)
+        startLoad(dut, basePreg = 10, pdst = 20, robId = 7)
+        cd.waitSamplingWhere(s.iReady.toBoolean)
+        s.iValid #= false
+        cd.waitSampling(delay)
+
+        s.iSqFlush #= true
+        cd.waitSampling()
+        s.iSqFlush #= false
+        cd.waitSampling(8)
+
+        // Fresh split -- must assemble entirely from ITS OWN two pages.
+        seedPreg(dut, cd, preg = 11, data = vaF)
+        runLoad(dut, cd, basePreg = 11, pdst = 21, robId = 8, expectFault = false)
+        val got = readPreg(dut, 21)
+        val exp = expectedData(lineC, lineD)
+        assert(got == exp,
+          f"squash at +$delay during an MMU-on cross-page split corrupted the NEXT " +
+          f"split: got 0x$got%08x expected 0x$exp%08x -- a cancelled pair's captured " +
+          f"line or translation leaked across the squash")
+      }
+    }
+  }
+
 }
