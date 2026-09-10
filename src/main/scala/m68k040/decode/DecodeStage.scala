@@ -787,6 +787,29 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // THIS task's scope is load-direction only (opclass 110); store (111) stays on the
     // pre-existing µcode-engine trap path until task #242 lands.
     val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && (s0FpOpClass === B"3'b110") && s0FpIsStatic
+    // ── SLOT 1 (2026-09-10) ─────────────────────────────────────────────────────
+    // The same classifier on slot1. Task #241 deliberately omitted this and said so:
+    // a slot1 FMOVEM.X "already falls through correctly to the generic
+    // slot1IsUcodeEarly µcode-engine stash ... which traps it at the pre-existing
+    // FP_MEM_TRAP_ENTRY -- a known, bounded, NON-regressing scope limit".
+    //
+    // It is not bounded in practice. Whether an FMOVEM.X lands in slot0 or slot1 is
+    // pure ALIGNMENT, so the identical instruction executes or takes a vector-11
+    // F-line depending only on what precedes it. `fmovemx (%a0),%fp0` is, by this
+    // repo's own fpu_fmovem_x_an_indirect.s, "the single most common FMOVEM.X EA in
+    // the Q700 universal ROM (~93 static-list sites)", and a live vec-11 was confirmed
+    // on FPGA at ROM 0x40891196 for exactly that opword pair. Measured here: the same
+    // load traps with no NOP before it and executes with one.
+    //
+    // Every trap drags in the ROM FPSP, which itself uses FMOVEM.X -- so the fallback
+    // is not a graceful degradation, it is a fault in the handler for the fault.
+    val s1fxOpw        = fed.payload.packets(1).words(0)
+    val s1fxExt1       = fed.payload.packets(1).words(1)
+    val s1fxEaMode     = s1fxOpw(5 downto 3)
+    val s1IsFpGenMemEa = (s1fxOpw(15 downto 9) === B"7'b1111001") && (s1fxOpw(8 downto 6) === B"3'b000") &&
+                         ((s1fxEaMode === B"3'b010") || (s1fxEaMode === B"3'b101"))
+    val slot1IsFmovemx = fed.valid && fed.payload.slot1Valid && s1IsFpGenMemEa &&
+                         (s1fxExt1(15 downto 13) === B"3'b110") && !s1fxExt1(11)
     // Control-transfer / address-generate full-format mem-indirect (task #201): see the
     // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
     // never recognizes JMP/JSR at all (illegal=True always) and marks LEA/PEA non-illegal
@@ -920,13 +943,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // scope never enters from a stashed slot1 (§ the entry-detection doc at `slot0IsFmovemx`
     // above), so there is no `fmovemxPendValid` to hoist alongside it.
     val fmovemxActive  = RegInit(False)
+    // Slot1 entry (2026-09-10): the stash that the comment above used to say did not
+    // exist. Mirrors movemPendValid/movemPendPkt verbatim.
+    val fmovemxPendValid = RegInit(False)
+    val fmovemxPendPkt   = Reg(DecodePacket())
+    when(pipeFlush) { fmovemxPendValid := False }
 
     // The source packet the FSM enters from: the stashed slot1 MOVEM, else slot0.
     val movemEntryPkt = Mux(movemPendValid, movemPendPkt, fed.payload.packets(0))
     // Begin a MOVEM: there's a MOVEM to start (a pending slot1 one, or slot0 is MOVEM and
     // not blocked by a stash/replay) and the FSM is idle.
     val movemBegin = !movemActive && !ucActive && !ucPendValid && !movepActive && !movepPendValid &&
-                     !fmovemxActive &&
+                     !fmovemxActive && !fmovemxPendValid &&
                      (movemPendValid || (slot0IsMovem && !stashValid))
 
     // Decode the entry packet's EA + mask. The mask is words(1); a (d16,An)/(xxx)/(d16,PC)
@@ -1051,7 +1079,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // Begin a MOVEP: a pending slot1 one, OR a slot0 MOVEP (not blocked by a stash/replay),
     // while the MOVEP FSM AND the MOVEM/µcode sequencers are all idle.
     val movepBegin = !movepActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
-                     !fmovemxActive &&
+                     !fmovemxActive && !fmovemxPendValid &&
                      (movepPendValid || (slot0IsMovep && !stashValid))
 
     // The per-step µop. The address disp for the byte at position k is movepDisp + k
@@ -1200,7 +1228,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ── FMOVEM.X entry detection (slot0 only in this task's scope -- see slot0IsFmovemx's
     // own doc for why a slot1-positioned in-scope op is left on the pre-existing µcode-
     // engine trap path instead of a new pend/stash mechanism). ──────────────────────────
-    val fxEntryPkt  = fed.payload.packets(0)
+    val fxEntryPkt  = Mux(fmovemxPendValid, fmovemxPendPkt, fed.payload.packets(0))
     val fxOpw       = fxEntryPkt.words(0)
     val fxExt1      = fxEntryPkt.words(1)
     val fxMaskIn    = fxExt1(7 downto 0)
@@ -1217,7 +1245,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val (fxBit0, _) = RegListWalk.extractLowest1(fxMaskIn)
 
     val fmovemxBegin = !fmovemxActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
-                       !movepActive && !movepPendValid && slot0IsFmovemx && !stashValid
+                       !movepActive && !movepPendValid &&
+                       (fmovemxPendValid || (slot0IsFmovemx && !stashValid))
 
     // ── Normal (non-MOVEM) push production ──────────────────────────────────────
     def normUop(i: Int): DecodedUop = i match {
@@ -1230,7 +1259,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive && !slot0IsFmovemx && !fmovemxActive)
+    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive && !slot0IsFmovemx && !fmovemxActive && !fmovemxPendValid)
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
@@ -1303,7 +1332,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // Begin a µcode op: a pending slot1 microcoded op, OR a microcoded slot0 (not blocked
     // by a stash), while the engine + the MOVEM FSM are idle.
     val ucBegin = !ucActive && !movemActive && !movemPendValid && !movepActive && !movepPendValid &&
-                  !fmovemxActive &&
+                  !fmovemxActive && !fmovemxPendValid &&
                   (ucPendValid || (slot0OwnedByUc && !stashValid))
     // Entering a slot0 microcoded op (not a pending one): its group is consumed on entry.
     val ucEnterSlot0 = ucBegin && !ucPendValid
@@ -2632,6 +2661,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         // The MOVEP FSM enters from it next cycle (mirrors the slot1 MOVEM pend).
         movepPendValid := True
         movepPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsFmovemx) {
+        // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
+        // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
+        fmovemxPendValid := True
+        fmovemxPendPkt   := fed.payload.packets(1)
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MICROCODED packet, consume fed.
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
@@ -2704,7 +2738,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
+        } elsewhen(slot1IsFmovemx) {
+        // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
+        // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
+        fmovemxPendValid := True
+        fmovemxPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           // A µCODE-OWNED slot1 (CAS/MOVES/BCD-mem/mem-indirect/bf-dyn) behind a slot0
           // MOVEM must stash the PACKET for the engine (ucPend), NOT the a1raw µops —
           // the assembler's placeholder crack of a microcoded opword is an ILLEGAL/
@@ -2784,6 +2823,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
 
     // ── FMOVEM.X data-list FSM transitions (task #241/#246) ──────────────────────
     when(fmovemxBegin) {
+      fmovemxPendValid := False   // consumed (no-op when entering from slot0)
       // Latch all state; start emitting next cycle from these registers (mirrors
       // movemBegin's own "entry cycle primes registers, emission starts next cycle"
       // shape -- pushProduced's `elsewhen(fmovemxActive)` reads the REGISTERED value,
@@ -2815,7 +2855,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
+        } elsewhen(slot1IsFmovemx) {
+        // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
+        // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
+        fmovemxPendValid := True
+        fmovemxPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
           ucPendSpecReg := fed.payload.specs(1).spec
@@ -2915,7 +2960,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
+        } elsewhen(slot1IsFmovemx) {
+        // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
+        // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
+        fmovemxPendValid := True
+        fmovemxPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
           ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
@@ -2960,7 +3010,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
           movepPendPkt   := fed.payload.packets(1)
-        } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
+        } elsewhen(slot1IsFmovemx) {
+        // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
+        // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
+        fmovemxPendValid := True
+        fmovemxPendPkt   := fed.payload.packets(1)
+      } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
           ucPendPkt   := fed.payload.packets(1)
           ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
