@@ -666,4 +666,62 @@ class LsEuSplitRingSpec extends AnyFunSuite {
 
 
 
+
+  /** The split-pair invariant under REORDERED / CHAOS response ordering.
+    *
+    * `splitMergeLine`'s safety argument is that "slot B is always the very next
+    * thing sent and the very next RESPONSE PROCESSED, so nothing else can land in
+    * between". That is an ordering claim, and two things in this design can break
+    * an ordering claim:
+    *
+    *  1. The table walker shares the `loadCmd` port. Its `ldForce` aging bit
+    *     OUTRANKS CORE-LS after `walkerAgeLimit` un-granted cycles, and the grant
+    *     machine's own comment says "a walker's descriptor read may be OUTSTANDING
+    *     at the same time as up to four ordinary LS loads". So something CAN be in
+    *     flight between slot A and slot B.
+    *  2. The L2 has MSHRs and can return responses out of order.
+    *
+    * Every existing split test runs `AxiRspMode.InOrder`, so neither is covered.
+    * This drives the merge at every crossing offset with unrelated loads in flight
+    * (so the reorderer has something to reorder) under Reordered and Chaos.
+    */
+  test("split load merge stays correct under REORDERED and CHAOS response ordering", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut)
+    val modes = Seq(
+      ("Reordered", m68k040.sim.AxiRspMode.Reordered),
+      ("Chaos",     m68k040.sim.AxiRspMode.Chaos),
+    )
+    val offsets = Seq(13, 14, 15)
+    for ((mname, mode) <- modes; off <- offsets; trial <- 0 until 3) {
+      val addr = 0x3000L + off
+      compiled.doSim(s"reorder-$mname-off$off-t$trial", seed = 7000 + off * 10 + trial) { dut =>
+        val (cd, mem) = initDut(dut, AxiMemModelConfig(
+          rspMode = mode,
+          latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40)))
+        preload(mem, 0x3000L, 48)
+        preload(mem, 0x8000L, 32)
+
+        // Unrelated in-flight loads give the reorder engine something to shuffle
+        // against the split pair's two halves.
+        seed(dut, cd, preg = 12, value = 0x8000L)
+        issueLoad(dut, cd, basePreg = 12, disp = 0, Size.LONG, pdst = 30, robId = 1)
+
+        seed(dut, cd, preg = 10, value = addr)
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
+
+        seed(dut, cd, preg = 13, value = 0x8010L)
+        issueLoad(dut, cd, basePreg = 13, disp = 0, Size.LONG, pdst = 31, robId = 5)
+
+        assert(waitCompletion(dut, cd, robId = 4, maxCycles = 900),
+          s"[$mname off=$off t=$trial] split load never completed")
+        cd.waitSampling(6)
+        val got = readInt(dut, 20)
+        val exp = expected(addr, 4)
+        assert(got == exp,
+          f"[$mname off=$off t=$trial] merged split load WRONG: got 0x$got%08x " +
+          f"expected 0x$exp%08x -- halves spliced from the wrong responses")
+      }
+    }
+  }
+
 }
