@@ -6,6 +6,7 @@ bench_wset_1k
 blockmove_computed_jmp_unrolled_copy
 cacr_bit31_roundtrip
 cinv_line_basic
+exc_frame_a7_align_sweep
 exc_ssw_size_field
 lsu_predec_long_burst
 memind_full_matrix
