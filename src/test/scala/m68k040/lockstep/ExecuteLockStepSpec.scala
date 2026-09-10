@@ -12616,6 +12616,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val nextPc = Map(0x40800034L -> 0x40800036L, 0x40800036L -> 0x40800038L,
                      0x40800038L -> 0x4080003aL)
     val endPc  = 0x4080003aL
+    // Board-realistic D-side postures. Zero latency is NOT representative: the SoC's
+    // axi_xbar allows exactly ONE outstanding read today, and the L2 refuses a second
+    // AR whose ID is already live. Both change where an interrupt can land relative
+    // to an in-flight crossing pop -- which is the whole point of this test.
+    val dPostures = Seq(
+      ("zero-latency", m68k040.sim.AxiMemModelConfig()),
+      ("L2+DRAM", m68k040.sim.AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40))),
+      ("L2+DRAM, single-outstanding crossbar", m68k040.sim.AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40),
+         crossbarSingleOutstanding = true)),
+    )
+    for ((dname, dcfg) <- dPostures)
     for ((pc, i) <- popPcs.zipWithIndex) {
       assert(plain.exists(_.pc == pc), f"[a7-popchain] boundary 0x$pc%08x absent from the oracle trace")
       val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc, 5))) match {
@@ -12627,18 +12640,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(k > popPcs.size, f"[a7-popchain] IRQ at 0x$pc%08x was NOT taken (reached `loop` at step $k)")
       val n = (k + 1) min withIrq.size
       val exact = try {
-        runIrqLockStep(f"a7-popchain-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
-                       avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4); true
+        runIrqLockStep(f"a7-popchain-$dname-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
+                       avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4,
+                       dcfg = dcfg, maxCycles = 20000); true
       } catch { case _: org.scalatest.exceptions.TestFailedException => false }
       if (!exact) {
         val pc2 = nextPc(pc)
         val withIrq2 = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc2, 5)))
           .getOrElse(fail(s"[a7-popchain] oracle (irq@$pc2) failed"))
         val k2 = withIrq2.indexWhere(_.pc == endPc)
-        println(f"[a7-popchain] boundary $i (0x$pc%08x) not exact; re-checking against the boundary-${i + 1} oracle (0x$pc2%08x)")
-        runIrqLockStep(f"a7-popchain-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
+        println(f"[a7-popchain/$dname] boundary $i (0x$pc%08x) not exact; re-checking against the boundary-${i + 1} oracle (0x$pc2%08x)")
+        runIrqLockStep(f"a7-popchain-$dname-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
                        irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
-                       oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4)
+                       oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4,
+                       dcfg = dcfg, maxCycles = 20000)
       }
     }
   }

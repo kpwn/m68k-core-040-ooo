@@ -577,46 +577,93 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     // in the result rather than coincidentally correct.
     val victimAddr = 0x3000L + 14   // pair 1: squashed mid-flight
     val freshAddr  = 0x5000L + 14   // pair 2: must be untainted
-    var checked = 0
-    for (delay <- 1 to 60) {
-      compiled.doSim(s"squashAt$delay", seed = 1000 + delay) { dut =>
-        val (cd, mem) = initDut(dut)
+
+    // Board-realistic postures. Zero-latency alone is NOT representative: the SoC's
+    // axi_xbar allows exactly ONE outstanding read today (crossbarSingleOutstanding)
+    // and the L2 refuses a second AR whose ID is already live (idBusyBlock) -- both
+    // change WHERE the A-resolved/B-pending window sits and how long it stays open.
+    val postures = Seq(
+      ("zero-latency", AxiMemModelConfig()),
+      ("L2+DRAM latency", AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40))),
+      ("L2+DRAM, single-outstanding crossbar", AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40),
+         crossbarSingleOutstanding = true)),
+      ("L2+DRAM, id-busy CAM", AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40),
+         idBusyBlock = true)),
+    )
+
+    for ((pname, cfg) <- postures) {
+      // ── SELF-CALIBRATION ───────────────────────────────────────────────────────
+      // Measure THIS posture's slot-A / slot-B response cycles instead of assuming
+      // them. A hard-coded sweep that stops short of slot A's response passes
+      // VACUOUSLY -- it never opens the window it claims to test.
+      var rspCycles = Seq.empty[Int]
+      compiled.doSim(s"calib-$pname") { dut =>
+        val (cd, mem) = initDut(dut, cfg)
         preload(mem, 0x3000L, 32)
-        preload(mem, 0x5000L, 32)
-        val s = dut.src.logic
-
-        // Pair 1 -- will be squashed somewhere in its two-access sequence.
+        val seen = scala.collection.mutable.ArrayBuffer[Int]()
+        var cyc = 0
+        val run = new java.util.concurrent.atomic.AtomicBoolean(true)
+        fork { while (run.get()) { cd.waitSampling(); cyc += 1
+          if (dut.dcache.logic.loadRspPort.valid.toBoolean) seen += cyc } }
         seed(dut, cd, preg = 10, value = victimAddr)
+        val t0 = cyc
         issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
-        cd.waitSampling(delay)
-
-        // Squash: cancels the whole queue, exactly as an exception/mispredict does.
-        s.iSqFlush #= true
-        cd.waitSampling()
-        s.iSqFlush #= false
-        cd.waitSampling(6)
-
-        // Pair 2 -- a completely independent crossing load. Its merged value must
-        // come entirely from ITS OWN two lines.
-        seed(dut, cd, preg = 11, value = freshAddr)
-        issueLoad(dut, cd, basePreg = 11, disp = 0, Size.LONG, pdst = 21, robId = 5)
-        if (waitCompletion(dut, cd, robId = 5, maxCycles = 400)) {
-          cd.waitSampling(4)
-          val got = readInt(dut, 21)
-          val exp = expected(freshAddr, 4)
-          assert(got == exp,
-            f"squash at +$delay cycles corrupted the NEXT split load: " +
-            f"got 0x$got%08x expected 0x$exp%08x -- slot A's stale line leaked " +
-            f"into a later pair's merge (halves spliced from different lines)")
-          checked += 1
-        }
-        // A pair-2 that never completes is a separate concern (the squash left the
-        // ring wedged); assert that explicitly rather than passing silently.
-        else assert(false, s"after a squash at +$delay, a later split load never completed")
+        waitCompletion(dut, cd, robId = 4, maxCycles = 800)
+        run.set(false)
+        rspCycles = seen.map(_ - t0).toSeq
       }
+      assert(rspCycles.size >= 2,
+        s"[$pname] calibration saw ${rspCycles.size} load responses; a split must produce 2")
+      val slotA = rspCycles.head
+      val slotB = rspCycles(1)
+      val maxDelay = slotB + 10
+      info(s"[$pname] slot A responds at +$slotA, slot B at +$slotB; sweeping 1..$maxDelay")
+
+      var checked = 0
+      for (delay <- 1 to maxDelay) {
+        compiled.doSim(s"squash-$pname-$delay", seed = 1000 + delay) { dut =>
+          val (cd, mem) = initDut(dut, cfg)
+          preload(mem, 0x3000L, 32)
+          preload(mem, 0x5000L, 32)
+          val s = dut.src.logic
+
+          // Pair 1 -- squashed somewhere in its two-access sequence.
+          seed(dut, cd, preg = 10, value = victimAddr)
+          issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
+          cd.waitSampling(delay)
+
+          // Squash: cancels the whole queue, as an exception/mispredict does.
+          s.iSqFlush #= true
+          cd.waitSampling()
+          s.iSqFlush #= false
+          cd.waitSampling(6)
+
+          // Pair 2 -- an independent crossing load whose merged value must come
+          // entirely from ITS OWN two lines.
+          seed(dut, cd, preg = 11, value = freshAddr)
+          issueLoad(dut, cd, basePreg = 11, disp = 0, Size.LONG, pdst = 21, robId = 5)
+          if (waitCompletion(dut, cd, robId = 5, maxCycles = 900)) {
+            cd.waitSampling(4)
+            val got = readInt(dut, 21)
+            val exp = expected(freshAddr, 4)
+            assert(got == exp,
+              f"[$pname] squash at +$delay corrupted the NEXT split load: " +
+              f"got 0x$got%08x expected 0x$exp%08x -- slot A's stale line leaked " +
+              f"into a later pair's merge (halves spliced from different lines)")
+            checked += 1
+          }
+          else assert(false, s"[$pname] after a squash at +$delay, a later split load never completed")
+        }
+      }
+      // The sweep must actually reach past slot A, or it never opened the window.
+      assert(maxDelay > slotA, s"[$pname] sweep (max $maxDelay) never reached slot A (+$slotA)")
+      assert(checked >= maxDelay / 2, s"[$pname] only $checked/$maxDelay delays verified")
     }
-    assert(checked >= 30, s"sweep only verified $checked delays; expected most of 60")
   }
+
 
 
 }
