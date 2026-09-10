@@ -415,6 +415,32 @@ object PortedTestRunner {
           // U/M drain wedge diagnosis (2026-09-10): the hang has NOTHING in flight,
           // so record the drain state machine directly -- it is the only way to tell
           // "walker held off by the drain" from "walker never asked".
+          // Shared store-ack demux: sq.io.drainAck is qualified `!walkStOutstanding`,
+          // so if that bit ever pins HIGH the CORE's store queue can never be acked
+          // again -- commit stalls and fetch stops, which is this wedge's shape.
+          if (dut.lsEu.logic.walkStOutstanding.toBoolean) probe.walkStOutCycles += 1
+          // Core loads are admitted only while ldOwner==CORE. If the walker grant is
+          // never released, core loads can NEVER issue -- the CPU wedges with every
+          // response delivered and nothing in flight, which is this hang's shape.
+          probe.ldOwnerCycles(dut.lsEu.logic.ldOwner.toInt) += 1
+          // A FULL U/M queue withholds the walker's admission credit, so the walker
+          // cannot start the next walk and the stalled uop never issues its load.
+          if (dut.itlb.logic.umq.io.full.toBoolean) probe.iUmFullCycles += 1
+          if (dut.dtlb.logic.umq.io.full.toBoolean) probe.dUmFullCycles += 1
+          // A hang whose last event is an un-returned load: count RESPONSES against
+          // commands. cmds > rsps at the end == a load response was LOST.
+          if (dut.dcache.logic.loadRspPort.valid.toBoolean) {
+            probe.dcLoadRsps += 1
+            probe.rspByTag(dut.lsEu.logic.ldRspTag.toInt) += 1
+          }
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean)
+            probe.cmdByTag(dut.lsEu.logic.ldPushTag.toInt) += 1
+          if (dut.dtlb.logic.drainReadPend.toBoolean) probe.dDrainReadPendCycles += 1
+          if (dut.dtlb.logic.drainNeedRead.toBoolean) probe.dDrainNeedReadCycles += 1
+          if (dut.dtlb.logic.drainAckWait.toBoolean)  probe.dDrainAckWaitCycles += 1
+          if (dut.dtlb.logic.drainArmed.toBoolean)    probe.dDrainArmedCycles += 1
+          if (dut.dtlb.logic.umq.io.drain.valid.toBoolean) probe.dDrainValidCycles += 1
           if (dut.itlb.logic.drainReadPend.toBoolean) probe.iDrainReadPendCycles += 1
           if (dut.itlb.logic.drainNeedRead.toBoolean) probe.iDrainNeedReadCycles += 1
           if (dut.itlb.logic.drainAckWait.toBoolean) probe.iDrainAckWaitCycles += 1

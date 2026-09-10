@@ -232,6 +232,23 @@ final class PostureProbe {
   var walkStores = 0L       // deferred U/M descriptor writebacks that actually fired
   // U/M drain wedge (2026-09-10): cycles spent in each drain state. A hang with
   // nothing in flight is diagnosed by WHICH of these is pinned high at the end.
+  var walkStOutCycles      = 0L
+  var dcLoadRsps           = 0L
+  // per-owner balance: index 0=CORE_LS 1=CORE_EXC 2=ITLB 3=DTLB
+  var dDrainIssues = 0L
+  var dWalkIssues  = 0L
+  var dDrainReadPendCycles = 0L
+  var dDrainNeedReadCycles = 0L
+  var dDrainAckWaitCycles  = 0L
+  var dDrainArmedCycles    = 0L
+  var dDrainValidCycles    = 0L
+  var iUmFullCycles = 0L
+  var dUmFullCycles = 0L
+  val ldOwnerCycles = Array.fill(4)(0L)   // 0=CORE 1=ITLB 2=DTLB
+  val cmdByTag = Array.fill(4)(0L)
+  val rspByTag = Array.fill(4)(0L)
+  def tagBalance: String =
+    (0 until 4).map(i => f"${Seq("core","exc","itlb","dtlb")(i)}=${cmdByTag(i)}/${rspByTag(i)}").mkString(" ")
   var iDrainReadPendCycles = 0L
   var iDrainNeedReadCycles = 0L
   var iDrainAckWaitCycles  = 0L
@@ -251,8 +268,8 @@ final class PostureProbe {
 
   def summary: String =
     f"walks(I=$itlbWalkStarts/$itlbWalkReads D=$dtlbWalkStarts/$dtlbWalkReads) " +
-      f"umStores=$walkStores drain(rdPend=$iDrainReadPendCycles needRd=$iDrainNeedReadCycles ackWait=$iDrainAckWaitCycles) dcHits(ld=$dcLoadHits st=$dcStoreHits) " +
-      f"dcLoadCmds=$dcLoadCmds axi(dAr=$dAxiAr dAw=$dAxiAw iAr=$iAxiAr) " +
+      f"umStores=$walkStores walkStOut=$walkStOutCycles drain(rdPend=$iDrainReadPendCycles needRd=$iDrainNeedReadCycles ackWait=$iDrainAckWaitCycles) dcHits(ld=$dcLoadHits st=$dcStoreHits) " +
+      f"dcLoadCmds=$dcLoadCmds dcLoadRsps=$dcLoadRsps tag(cmd/rsp)[$tagBalance] umFull(i=$iUmFullCycles d=$dUmFullCycles) dIssue(drain=$dDrainIssues walk=$dWalkIssues) dDrain(valid=$dDrainValidCycles needRd=$dDrainNeedReadCycles rdPend=$dDrainReadPendCycles armed=$dDrainArmedCycles ackWait=$dDrainAckWaitCycles) ldOwner(core=${ldOwnerCycles(0)} itlb=${ldOwnerCycles(1)} dtlb=${ldOwnerCycles(2)}) axi(dAr=$dAxiAr dAw=$dAxiAw iAr=$iAxiAr) " +
       f"descFaults(I=$itlbDescFaults D=$dtlbDescFaults) xlateFaults=$dtlbXlateFaults " +
       f"blocks=${touchedBlocks.size} holes=${holeBlocks.size}/${holeRegions.size}" +
       f"(I=$itlbHoles D=$dtlbHoles) inFlightAtEnd=$inFlightWalksAtEnd cyc=$cycles"

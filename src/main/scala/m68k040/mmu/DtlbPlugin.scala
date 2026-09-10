@@ -497,6 +497,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // descriptor byte over this same AXI bus) and is discarded on a flush. NOT
     // performed speculatively.
     val umq = new UmWriteQueue(4)
+    umq.io.full.simPublic()   // sim-only: a full queue withholds the walker's admission credit
+    umq.io.drain.valid.simPublic()   // sim-only: is there an entry waiting to drain?
     umQueueFull := umq.io.full
     // (2026-09-09: the task #210 same-page interlock that used to be driven from here
     // is GONE -- it compared this VIRTUAL page number against the queue's PHYSICAL
@@ -580,6 +582,14 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainDropAck  = RegInit(False)
     drainDropAck := False
 
+    // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
+    // it is not visible until the cycle AFTER arming -- which left a ONE-CYCLE HOLE in
+    // the "hold the walker off for the whole drain read" guard below: on the arming
+    // cycle itself the walker's `loadCmd.ready` was still high, so it could issue a
+    // descriptor read in the same cycle the drain decided to issue one. Two reads
+    // outstanding on a port whose response is unlabelled = swapped responses and a
+    // WRONG TRANSLATION -- caught by this file's own tripwire the moment the drain
+    // offer became a held level rather than a self-cancelling one-cycle pulse.
     when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
          !drainNeedRead && !drainReadPend && !walker.io.busy) {
       drainNeedRead := True

@@ -3615,6 +3615,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // same-cycle coherence hole from the other side: the mux would select off one value
     // and the tag record the other.
     val ldPushTag = UInt(2 bits)
+    ldPushTag.simPublic()   // sim-only: lets a test BALANCE commands vs responses
+                            // per owner tag. A per-tag mismatch is direct proof a
+                            // response was delivered to the wrong requester.
     ldPushTag := U(LDTAG_CORE_LS, 2 bits)
     when(excLoadAdmit)                     { ldPushTag := U(LDTAG_CORE_EXC, 2 bits) }
     when(walkerLoadAdmit(walkIdxItlb))     { ldPushTag := U(LDTAG_ITLB, 2 bits) }
