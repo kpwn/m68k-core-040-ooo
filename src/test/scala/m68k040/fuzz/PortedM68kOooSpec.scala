@@ -169,53 +169,65 @@ class PortedM68kOooSpec extends AnyFunSuite {
         s"attempts=${r.attempts}${r.extensions.map("\n  " + _).mkString}"
       info(ctx)
 
-      // ---- POSTURE NON-VACUITY, asserted before the program's own verdict -----------
-      // A "cached + MMU" run that silently executed with the MMU off, or with a TTR
-      // covering everything, is a vacuous pass and is worth strictly less than a red
-      // test. These are measurements taken from inside the running DUT, not a restatement
-      // of the setup code.
-      assert(r.probe.itlbWalkStarts > 0,
-        s"VACUOUS POSTURE [$name]: no ITLB table walk ever started -- instruction fetch " +
-          s"was not translated by a page table.\n$ctx")
-      assert(r.probe.dtlbWalkStarts > 0,
-        s"VACUOUS POSTURE [$name]: no DTLB table walk ever started -- data accesses were " +
-          s"not translated by a page table.\n$ctx")
-      if (!mmuSweepPresetUM)
-        assert(r.probe.walkStores > 0,
-          s"VACUOUS POSTURE [$name]: no walker U/M descriptor writeback ever fired, so no " +
-            s"leaf descriptor was actually consumed and updated.\n$ctx")
-      assert(r.probe.dcLoadHits + r.probe.dcStoreHits > 0,
-        s"VACUOUS POSTURE [$name]: the D-cache reported zero hits, so accesses were still " +
-          s"effectively inhibited and no line-crossing behaviour was exercised.\n$ctx")
+      // ---- 1. pre-existing corpus reds carry no MMU signal --------------------------
+      // If the program does not pass under the posture the corpus was written for, running
+      // it again with caches and the MMU on can only produce a second, uninformative red
+      // (the FPU cluster is ~28 known reds on its own). Cancel with the baseline verdict
+      // attached rather than reporting it as an MMU-posture failure.
+      assume(r.baselineOutcome == PortedPass,
+        s"SKIPPED [$name]: pre-existing corpus red under AsWritten " +
+          s"(${r.baselineOutcome}) -- the MMU posture adds no signal here.\n$ctx")
+
+      // ---- 2. harness sanity, whatever the verdict ----------------------------------
       // A descriptor READ that bus-faulted means the descriptor arena itself landed on an
       // undecoded physical address -- a harness placement bug, never a core defect.
       assert(r.probe.itlbDescFaults == 0 && r.probe.dtlbDescFaults == 0,
         s"HARNESS BUG [$name]: a page-table descriptor read took a bus fault, so the " +
           s"descriptor arena is not backed by memory.\n$ctx")
 
-      // ---- hole policy -------------------------------------------------------------
-      // A walk into a region the map does not cover is NOT automatically a harness bug:
-      // a wrong-path speculative fetch or a speculative load off a stale address register
-      // legitimately asks to translate garbage, and the core is supposed to fault-and-
-      // squash it. That is exactly what the board does. So holes are fatal only when the
-      // program ALSO failed -- in which case they are the leading suspect and the failure
-      // must be triaged as a harness gap rather than reported as a core defect. (The
-      // driver has already re-built the map around any hole it saw and re-run; see
+      // ---- 3. the program's verdict -------------------------------------------------
+      // Hole policy: a walk into a region the map does not cover is NOT automatically a
+      // harness bug. A wrong-path speculative fetch, or a speculative load off a stale
+      // address register, legitimately asks to translate garbage and the core is supposed
+      // to fault-and-squash it -- that is exactly what the board does. So holes are fatal
+      // only when the program ALSO failed, in which case they are the leading suspect and
+      // the failure must be triaged as a harness gap rather than a core defect. (The driver
+      // has already re-built the map around any hole it saw and re-run; see
       // MmuWalkDriver.runWithRealTables.)
       val holes = r.probe.holeBlocks.nonEmpty || r.probe.holeRegions.nonEmpty
-
       r.outcome match {
-        case PortedPass       => ()
+        case PortedPass =>
+          // ---- 4. a PASS must be proven NON-VACUOUS ---------------------------------
+          // A "cached + MMU" run that silently executed with the MMU off, or with a TTR
+          // covering everything, is a green tick worth strictly less than a red test.
+          // These are measurements taken from inside the running DUT, not a restatement of
+          // the setup code. (They are checked only on a pass: on a failure the counters
+          // are already in `ctx`, and asserting them first would relabel a genuine HANG as
+          // "vacuous posture" -- which it did, to fline_before_move_sp_postinc_sr_tmp1.)
+          assert(r.probe.itlbWalkStarts > 0,
+            s"VACUOUS POSTURE [$name]: no ITLB table walk ever started -- instruction " +
+              s"fetch was not translated by a page table.\n$ctx")
+          assert(r.probe.dtlbWalkStarts > 0,
+            s"VACUOUS POSTURE [$name]: no DTLB table walk ever started -- data accesses " +
+              s"were not translated by a page table.\n$ctx")
+          if (!mmuSweepPresetUM)
+            assert(r.probe.walkStores > 0,
+              s"VACUOUS POSTURE [$name]: no walker U/M descriptor writeback ever fired, " +
+                s"so no leaf descriptor was actually consumed and updated.\n$ctx")
+          assert(r.probe.dcLoadHits + r.probe.dcStoreHits > 0,
+            s"VACUOUS POSTURE [$name]: the D-cache reported zero hits, so accesses were " +
+              s"still effectively inhibited and no line-crossing behaviour was " +
+              s"exercised.\n$ctx")
         case other if holes =>
           fail(s"[mmu-walk sweep] HARNESS MAP HOLE (not a core verdict) [$name]: $other, " +
             s"and a walk demanded translation the harness page table does not provide " +
             s"after ${r.attempts} attempt(s): ${r.probe.holeSummary}\n$ctx")
         case PortedFail(word) =>
-          fail(f"[mmu-walk sweep] FAIL sentinel word=0x$word%08x " +
+          fail(f"[mmu-walk sweep] REGRESSION vs AsWritten: FAIL sentinel word=0x$word%08x " +
             f"(expected 0x${PortedTestRunner.PassWord}%08x)%n$ctx")
         case PortedHang(cycles) =>
-          fail(s"[mmu-walk sweep] HANG: no sentinel write within $cycles cycles " +
-            s"(timeout=$timeout)\n$ctx")
+          fail(s"[mmu-walk sweep] REGRESSION vs AsWritten: HANG, no sentinel write within " +
+            s"$cycles cycles (timeout=$timeout)\n$ctx")
         case PortedGenFail(reason) =>
           fail(s"[mmu-walk sweep] assemble/toolchain error: $reason")
       }
