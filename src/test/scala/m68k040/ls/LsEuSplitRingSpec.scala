@@ -538,4 +538,85 @@ class LsEuSplitRingSpec extends AnyFunSuite {
       }
     }
   }
+
+  /** THE UNTESTED WINDOW: a squash landing BETWEEN slot A and slot B.
+    *
+    * `splitMergeLine` (LsEuPlugin) is a plain Reg with no reset and no squash
+    * clear. It holds slot A's 128-bit line until slot B responds, and its safety
+    * argument is strict ring FIFO order -- "slot B is always the very next thing
+    * sent and the very next response processed, so nothing else can land in
+    * between". That argument is about ORDERING; it says nothing about a squash
+    * that cancels the pair while slot A's line is already captured.
+    *
+    * If a cancelled pair's captured slot-A line can survive into a LATER pair's
+    * merge, the result is a longword assembled from two UNRELATED lines -- i.e.
+    * silently wrong data whose halves come from different places. That is the
+    * exact shape of a live hardware fault (A0 = 0x26FA4080 at ROM 0x40827FE8,
+    * two plausible halves spliced together), and it is timing-dependent, which
+    * is why it survives single-stepping and every static alignment sweep.
+    *
+    * Every other test in this file aborts a pair via a FAULT, never a squash.
+    * The delay sweep is the point: the dangerous window is a few cycles wide and
+    * its position depends on refill latency, so a single hand-picked delay would
+    * almost certainly miss it.
+    *
+    * SENSITIVITY (measured, not assumed): with this DUT's AXI model, slot A's
+    * response lands at +18 cycles from issue and slot B's at +27. The 1..60 sweep
+    * therefore brackets the window on both sides, and delays 19..26 fall squarely
+    * INSIDE it. If the refill latency of this harness ever changes, re-measure --
+    * a sweep that stops short of slot A's response would pass VACUOUSLY.
+    *
+    * RESULT: PASSES at all 60 delays. The squash-leak hypothesis is REFUTED at
+    * this level -- the poison mechanism does cancel a squashed pair's captured
+    * line. Kept as a permanent fence, because `splitMergeLine` still has no reset
+    * and no squash clear, so its correctness rests entirely on that poison path.
+    */
+  test("a squash between slot A and slot B must not leak slot A's line into a later split", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut)
+    // Two crossing LONGs in DIFFERENT lines, so a stale slot-A line is visible
+    // in the result rather than coincidentally correct.
+    val victimAddr = 0x3000L + 14   // pair 1: squashed mid-flight
+    val freshAddr  = 0x5000L + 14   // pair 2: must be untainted
+    var checked = 0
+    for (delay <- 1 to 60) {
+      compiled.doSim(s"squashAt$delay", seed = 1000 + delay) { dut =>
+        val (cd, mem) = initDut(dut)
+        preload(mem, 0x3000L, 32)
+        preload(mem, 0x5000L, 32)
+        val s = dut.src.logic
+
+        // Pair 1 -- will be squashed somewhere in its two-access sequence.
+        seed(dut, cd, preg = 10, value = victimAddr)
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
+        cd.waitSampling(delay)
+
+        // Squash: cancels the whole queue, exactly as an exception/mispredict does.
+        s.iSqFlush #= true
+        cd.waitSampling()
+        s.iSqFlush #= false
+        cd.waitSampling(6)
+
+        // Pair 2 -- a completely independent crossing load. Its merged value must
+        // come entirely from ITS OWN two lines.
+        seed(dut, cd, preg = 11, value = freshAddr)
+        issueLoad(dut, cd, basePreg = 11, disp = 0, Size.LONG, pdst = 21, robId = 5)
+        if (waitCompletion(dut, cd, robId = 5, maxCycles = 400)) {
+          cd.waitSampling(4)
+          val got = readInt(dut, 21)
+          val exp = expected(freshAddr, 4)
+          assert(got == exp,
+            f"squash at +$delay cycles corrupted the NEXT split load: " +
+            f"got 0x$got%08x expected 0x$exp%08x -- slot A's stale line leaked " +
+            f"into a later pair's merge (halves spliced from different lines)")
+          checked += 1
+        }
+        // A pair-2 that never completes is a separate concern (the squash left the
+        // ring wedged); assert that explicitly rather than passing silently.
+        else assert(false, s"after a squash at +$delay, a later split load never completed")
+      }
+    }
+    assert(checked >= 30, s"sweep only verified $checked delays; expected most of 60")
+  }
+
+
 }
