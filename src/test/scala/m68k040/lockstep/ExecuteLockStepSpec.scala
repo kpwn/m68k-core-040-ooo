@@ -12552,4 +12552,96 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       oddSspPageFaultRun(s"odd-ssp-pf-$k", k)
     }
   }
+
+  /** The ROM sequence that bus-errors on hardware, with an interrupt landing in it.
+    *
+    * ROM 0x40827FE0..FE8 (Quadra 700, 420dbff3):
+    *   movea.l (%sp)+,%a1     A7 stays 0-mod-4
+    *   move.w  (%sp)+,%d0     A7 -> 2-mod-4   <-- the word in the middle
+    *   movea.l (%sp)+,%a0     reads at 2-mod-4
+    *   movea.l (%a0),%a0      BUS ERROR, A0 = 0x26FA4080
+    *
+    * On the board this faults on every free-running boot and NEVER under
+    * single-step, so it needs an event landing inside the chain. A0's observed
+    * value is two plausible halves spliced together (0x4080 is a ROM address
+    * prefix), which is what a pop reading two bytes off its intended address
+    * produces -- i.e. an A7 that is 2 bytes wrong, not a mis-merged load.
+    *
+    * The stack base is chosen so the FINAL long pop reads at line-relative
+    * offset 14 and therefore genuinely CROSSES a 16-byte D-cache line:
+    *   A7 = 0x000F0008 -> +4 = 0x000F000C -> +2 = 0x000F000E (offset 14).
+    * So this exercises the odd-SP pop chain AND a crossing access AND an
+    * interrupt. The nearest existing coverage, "exception after OoO A7 write",
+    * uses a plain `move.l #imm,%sp` rather than a postincrement chain, and the
+    * `a7-byte` sweep uses BYTE pushes/pops that never leave A7 at 2-mod-4.
+    *
+    * Boundary PCs come from the oracle's own trace, never hand arithmetic: a
+    * wrong event PC makes DUT and oracle BOTH skip the interrupt, and the test
+    * would pass VACUOUSLY. Each boundary is asserted to actually take the
+    * interrupt before it is lock-stepped.
+    *
+    * One-boundary-late retry follows the established `a7-irq` convention: the
+    * harness raises IPL as the event's predecessor retires, so with 2-wide retire
+    * the DUT may legally take the interrupt at the NEXT boundary. That is a
+    * scheduling difference, not an architectural one -- the retry is still an
+    * exact A7/frame lock-step, just against the boundary-i+1 oracle.
+    */
+  test("lock-step IRQ: interrupt at every boundary of the ROM A7 postincrement pop chain (word in the middle, final LONG crosses a line)", VerilatorTest) {
+    val src =
+      "move.l #handler,%d0 ; move.l %d0,0x74 ; " +          // vector 29 @ 0x74
+      "move.l #0x11223344,%d0 ; move.l %d0,0x000F0008 ; " + // -> A1
+      "move.l #0x55667788,%d0 ; move.l %d0,0x000F000C ; " + // -> D0(word) + A0(hi)
+      "move.l #0x99aabbcc,%d0 ; move.l %d0,0x000F0010 ; " + // -> A0(lo), next line
+      "move.l #0x000F0008,%sp ; " +
+      "movea.l (%sp)+,%a1 ; move.w (%sp)+,%d0 ; movea.l (%sp)+,%a0 ; " +
+      "loop: bra loop ; " +
+      "handler: moveq #9,%d3 ; move.l %d3,0x3000 ; rte"
+    // Pin only addresses the PROGRAM actually writes. The frame lands just below
+    // A7 inside this seeded region -- exactly as in ROM -- so a frame written at a
+    // 2-bytes-off A7 still shows up here as wrong bytes.
+    //
+    // Do NOT pin frame-only addresses that vary with the boundary (0x000F0000/4):
+    // the oracle side is `memoryWrites`, which has no entry for an address the
+    // oracle never wrote and therefore reads as 0, while the DUT's AXI model holds
+    // uninitialised contents there. That compares sim garbage against a default and
+    // fails for reasons unrelated to the core.
+    val pins = Seq(0x000F0008L, 0x000F000CL, 0x000F0010L, 0x3000L)
+    val plain = Musashi.assembleAndTrace(src, initialSr = Some(0x2000)) match {
+      case Right(v)  => v
+      case Left(err) => fail(s"[a7-popchain] Musashi.assembleAndTrace (plain) failed: ${err.reason}")
+    }
+    // OracleStep.pc is the POST-step pc, so the boundary BEFORE the first pop is
+    // the step whose pc IS that pop's address.
+    val popPcs = Seq(0x40800034L, 0x40800036L, 0x40800038L)
+    val nextPc = Map(0x40800034L -> 0x40800036L, 0x40800036L -> 0x40800038L,
+                     0x40800038L -> 0x4080003aL)
+    val endPc  = 0x4080003aL
+    for ((pc, i) <- popPcs.zipWithIndex) {
+      assert(plain.exists(_.pc == pc), f"[a7-popchain] boundary 0x$pc%08x absent from the oracle trace")
+      val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc, 5))) match {
+        case Right(v)  => v
+        case Left(err) => fail(s"[a7-popchain] oracle (irq@$pc) failed: ${err.reason}")
+      }
+      // SENSITIVITY: prove the interrupt is actually taken at this boundary.
+      val k = withIrq.indexWhere(_.pc == endPc)
+      assert(k > popPcs.size, f"[a7-popchain] IRQ at 0x$pc%08x was NOT taken (reached `loop` at step $k)")
+      val n = (k + 1) min withIrq.size
+      val exact = try {
+        runIrqLockStep(f"a7-popchain-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
+                       avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4); true
+      } catch { case _: org.scalatest.exceptions.TestFailedException => false }
+      if (!exact) {
+        val pc2 = nextPc(pc)
+        val withIrq2 = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc2, 5)))
+          .getOrElse(fail(s"[a7-popchain] oracle (irq@$pc2) failed"))
+        val k2 = withIrq2.indexWhere(_.pc == endPc)
+        println(f"[a7-popchain] boundary $i (0x$pc%08x) not exact; re-checking against the boundary-${i + 1} oracle (0x$pc2%08x)")
+        runIrqLockStep(f"a7-popchain-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
+                       irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
+                       oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4)
+      }
+    }
+  }
+
+
 }
