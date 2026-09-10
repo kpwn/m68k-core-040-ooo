@@ -13,6 +13,13 @@ object CachePosture {
   /** Harness-injected prologue: poke CACR.DE=1 + a cacheable identity/DTT mapping
     * over the test's working set before execution starts (Slice P6's §6.1 sweep). */
   case object ForceCacheableCopyback extends CachePosture
+  /** Harness-injected REAL page tables: all four TTRs ZERO, `TC.E = 1`, `CACR = DE|IE`.
+    * Every I-fetch and every data access to a cold TLB entry runs a genuine 3-level table
+    * walk through the D-cache, and every leaf descriptor is planted `U = M = 0` so the
+    * first touch of each page also issues the deferred U/M writeback store. See
+    * `MmuWalkPosture` for why this is not the same test as `ForceCacheableCopyback`
+    * (a TTR hit resolves BEFORE the TLB, so that posture never walks at all). */
+  final case class ForceMmuWalkCopyback(map: MmuWalkPosture.Map) extends CachePosture
 
   // The already-proven transparent-translation partition used by the D-cache
   // performance programs. A set mask bit is "don't care", so 0x7F covers a
@@ -51,7 +58,8 @@ object PortedTestRunner {
   private var runIdx = 0
 
   def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1,
-        cachePosture: CachePosture = CachePosture.AsWritten): PortedOutcome = {
+        cachePosture: CachePosture = CachePosture.AsWritten,
+        probe: PostureProbe = null): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
@@ -267,12 +275,160 @@ object PortedTestRunner {
             s"ForceCacheableCopyback DTT1 readback was 0x${dut.ctrl.logic.dtt1.toBigInt.toString(16)}")
           assert(dut.rob.logic.exc.ss.cacr.toBigInt == CachePosture.CacrDataAndInstructionEnable,
             s"ForceCacheableCopyback CACR readback was 0x${dut.rob.logic.exc.ss.cacr.toBigInt.toString(16)}")
+
+        case CachePosture.ForceMmuWalkCopyback(map) =>
+          // ---- 1. plant the descriptors in ORDINARY BACKING MEMORY ----------------
+          // Big-endian longwords, exactly as a supervisor `move.l #desc,addr` would
+          // leave them, because that is the convention the walker's descriptor read
+          // goes through `DcacheByteLane.extract` expecting (task #194).
+          //
+          // The arena must not overlap the program image or the sentinel; the caller
+          // picks it from MEASURED untouched space (`MmuWalkPosture.chooseArena`), but
+          // fail closed here rather than corrupt the program under test.
+          val arenaEnd = map.arenaBase + map.arenaBytes
+          assert(arenaEnd <= loadAddr || map.arenaBase >= loadAddr + image.bytes.length,
+            f"MMU descriptor arena [0x${map.arenaBase}%08x,0x$arenaEnd%08x) overlaps the " +
+              f"program image at 0x$loadAddr%08x+${image.bytes.length}")
+          assert(arenaEnd <= SentinelAddr || map.arenaBase >= SentinelAddr + 4,
+            "MMU descriptor arena overlaps the completion sentinel")
+          for ((addr, value) <- map.descriptors) {
+            dmem.mem.write(addr,     ((value >>> 24) & 0xff).toByte)
+            dmem.mem.write(addr + 1, ((value >>> 16) & 0xff).toByte)
+            dmem.mem.write(addr + 2, ((value >>>  8) & 0xff).toByte)
+            dmem.mem.write(addr + 3, ( value         & 0xff).toByte)
+          }
+
+          // ---- 2. arm the posture --------------------------------------------------
+          // ZERO transparent translation on BOTH sides. This is the whole point: a TTR
+          // hit resolves before the TLB, so any nonzero TTR here would silently turn
+          // this back into `ForceCacheableCopyback` and no walk would ever happen.
+          dut.ctrl.logic.itt0 #= 0
+          dut.ctrl.logic.itt1 #= 0
+          dut.ctrl.logic.dtt0 #= 0
+          dut.ctrl.logic.dtt1 #= 0
+          dut.ctrl.logic.urp #= BigInt(map.rootBase)
+          dut.ctrl.logic.srp #= BigInt(map.rootBase)
+          dut.ctrl.logic.pageSize8K #= map.pages8K
+          dut.rob.logic.exc.ss.cacr #= CachePosture.CacrDataAndInstructionEnable
+          dut.ctrl.logic.mmuEnable #= true
+          cd.waitSampling()
+
+          // Fail closed if any poke did not stick (stale hierarchy name, non-sticky
+          // register). A vacuous "cached + MMU" run is worse than no run at all.
+          assert(dut.ctrl.logic.mmuEnable.toBoolean,
+            "ForceMmuWalkCopyback did not enable TC.E")
+          assert(dut.ctrl.logic.itt0.toBigInt == 0 && dut.ctrl.logic.itt1.toBigInt == 0 &&
+                 dut.ctrl.logic.dtt0.toBigInt == 0 && dut.ctrl.logic.dtt1.toBigInt == 0,
+            f"ForceMmuWalkCopyback requires ALL FOUR TTRs zero (a TTR hit short-circuits " +
+              f"the walk); read back itt0=0x${dut.ctrl.logic.itt0.toBigInt.toString(16)} " +
+              f"itt1=0x${dut.ctrl.logic.itt1.toBigInt.toString(16)} " +
+              f"dtt0=0x${dut.ctrl.logic.dtt0.toBigInt.toString(16)} " +
+              f"dtt1=0x${dut.ctrl.logic.dtt1.toBigInt.toString(16)}")
+          assert(dut.ctrl.logic.urp.toBigInt == BigInt(map.rootBase) &&
+                 dut.ctrl.logic.srp.toBigInt == BigInt(map.rootBase),
+            "ForceMmuWalkCopyback URP/SRP readback mismatch")
+          assert(dut.ctrl.logic.pageSize8K.toBoolean == map.pages8K,
+            "ForceMmuWalkCopyback TC.P readback mismatch")
+          assert(dut.rob.logic.exc.ss.cacr.toBigInt == CachePosture.CacrDataAndInstructionEnable,
+            s"ForceMmuWalkCopyback CACR readback was 0x${dut.rob.logic.exc.ss.cacr.toBigInt.toString(16)}")
       }
 
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= false
+
+      // ---- posture non-vacuity instrumentation (opt-in, zero cost when probe==null) --
+      // Nothing here drives the DUT. It exists so a caller can PROVE, from measurements
+      // rather than from the setup code, that the posture it asked for is the posture
+      // that ran: how many table walks actually started, how many D-cache HITS actually
+      // occurred (identically zero when every access is inhibited), and -- when a real
+      // page table is installed -- which 256 KiB regions a walk demanded that the map
+      // did not contain. See `PostureProbe`.
+      var flushWalkHoles: () => Unit = () => ()
+      if (probe != null) {
+        val walkMap: MmuWalkPosture.Map = cachePosture match {
+          case CachePosture.ForceMmuWalkCopyback(m) => m
+          case _                                    => null
+        }
+        // Deepest level the CURRENT walk reached, per TLB. A walk always begins with a
+        // ROOT-table read, so a new root read closes out the previous walk: if that one
+        // never got past ROOT its root descriptor was invalid (32 MiB region unmapped);
+        // if it never got past POINTER its pointer descriptor was invalid (256 KiB block
+        // unmapped). Both are holes in the harness map, not core defects, and this is
+        // how the caller learns which block to add.
+        val lvl    = Array(-1, -1)   // 0 = ITLB, 1 = DTLB
+        val region = Array(-1L, -1L)
+        val block  = Array(-1L, -1L)
+        def closeWalk(i: Int): Unit = {
+          if (lvl(i) == 0 && region(i) >= 0) {
+            probe.holeRegions += region(i); if (i == 0) probe.itlbHoles += 1 else probe.dtlbHoles += 1
+          } else if (lvl(i) == 1 && block(i) >= 0) {
+            probe.holeBlocks += block(i); if (i == 0) probe.itlbHoles += 1 else probe.dtlbHoles += 1
+          }
+          lvl(i) = -1
+        }
+        // A walk is only known to have STOPPED when the same walker starts the next one
+        // (the walker FSM is single-outstanding and always begins at the root). The walk
+        // that is still mid-flight when the program writes its sentinel has not stopped,
+        // it just has not issued its next descriptor read yet -- counting it as a map hole
+        // fabricates a gap out of nothing, which is exactly what the first version of this
+        // instrumentation did to `bench_memcpy8k` and `adv_rts_unaligned_a7`.
+        flushWalkHoles = () => {
+          for (i <- 0 until 2) if (lvl(i) >= 0 && lvl(i) < 2) probe.inFlightWalksAtEnd += 1
+        }
+        def onWalkRead(i: Int, pa: Long): Unit = {
+          if (walkMap != null) walkMap.decodeDescRead(pa) match {
+            case Some((0, r, _)) => closeWalk(i); lvl(i) = 0; region(i) = r; block(i) = -1L
+            case Some((l, r, b)) => lvl(i) = l; region(i) = r; block(i) = b
+            case None            => ()
+          }
+        }
+        cd.onSamplings {
+          probe.cycles += 1
+          if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) {
+            probe.iAxiAr += 1
+            probe.touchedBlocks += MmuWalkPosture.blockOf(dut.icache.logic.axi.ar.payload.addr.toLong)
+          }
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
+            probe.dAxiAr += 1
+            probe.touchedBlocks += MmuWalkPosture.blockOf(dut.dcache.logic.axi.ar.payload.addr.toLong)
+          }
+          if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) {
+            probe.dAxiAw += 1
+            probe.touchedBlocks += MmuWalkPosture.blockOf(dut.dcache.logic.axi.aw.payload.addr.toLong)
+          }
+          if (dut.itlb.walkLoadCmd.valid.toBoolean && dut.itlb.walkLoadCmd.ready.toBoolean) {
+            probe.itlbWalkReads += 1
+            val pa = dut.itlb.walkLoadCmd.payload.paddr.toLong & 0xffffffffL
+            if (walkMap != null && pa >= walkMap.rootBase &&
+                pa < walkMap.rootBase + MmuWalkPosture.RootTableBytes) probe.itlbWalkStarts += 1
+            onWalkRead(0, pa)
+          }
+          if (dut.dtlb.walkLoadCmd.valid.toBoolean && dut.dtlb.walkLoadCmd.ready.toBoolean) {
+            probe.dtlbWalkReads += 1
+            val pa = dut.dtlb.walkLoadCmd.payload.paddr.toLong & 0xffffffffL
+            if (walkMap != null && pa >= walkMap.rootBase &&
+                pa < walkMap.rootBase + MmuWalkPosture.RootTableBytes) probe.dtlbWalkStarts += 1
+            onWalkRead(1, pa)
+          }
+          if (dut.itlb.walkStore.valid.toBoolean && dut.itlb.walkStore.ready.toBoolean) probe.walkStores += 1
+          if (dut.dtlb.walkStore.valid.toBoolean && dut.dtlb.walkStore.ready.toBoolean) probe.walkStores += 1
+          if (dut.itlb.walkLoadRsp.valid.toBoolean && dut.itlb.walkLoadRsp.payload.fault.toBoolean)
+            probe.itlbDescFaults += 1
+          if (dut.dtlb.walkLoadRsp.valid.toBoolean && dut.dtlb.walkLoadRsp.payload.fault.toBoolean)
+            probe.dtlbDescFaults += 1
+          if (dut.dtlb.logic.rspValid.toBoolean && dut.dtlb.logic.rspPayload.fault.toBoolean)
+            probe.dtlbXlateFaults += 1
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean) probe.dcLoadCmds += 1
+          if (dut.dcache.logic.ldS2Valid.toBoolean && dut.dcache.logic.ldS2Hit.toBoolean)
+            probe.dcLoadHits += 1
+          if (dut.dcache.logic.stS3Valid.toBoolean && dut.dcache.logic.stS3Hit.toBoolean)
+            probe.dcStoreHits += 1
+          for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) probe.retiredUops += 1
+        }
+      }
 
       // debug-only, env-gated trace for the MI_MOVE_EAEA_REV (memory-indirect dst,
       // plain-memory src) MOVE crack -- ported-tests triage (move_l_abs_memind_dst).
@@ -625,6 +781,7 @@ object PortedTestRunner {
           println(f"[exctrace] MEM 0x$a%08x = 0x$v%02x")
         }
       }
+      flushWalkHoles()
       outcome =
         if (bkptFired) PortedPass
         else if (word == 0) PortedHang(cyc)

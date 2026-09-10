@@ -54,6 +54,33 @@ class PortedM68kOooSpec extends AnyFunSuite {
   private val canonicalAsmDir =
     Paths.get("src/test/resources/m68kooo-ported-tests/asm")
 
+  // The THIRD posture (see MmuWalkPosture.scala): D-cache ON *and* real 3-level table
+  // walks, with all four TTRs zero so nothing can short-circuit the walk. Same wiring
+  // convention as the copyback sweep above -- a manifest plus an env override, so it can
+  // be run narrowly (the checked-in list) or broadly (point PORTED_MMU_SWEEP_LIST at
+  // any subset, e.g. the full corpus).
+  //
+  // The checked-in manifest deliberately EXCLUDES every corpus program that programs
+  // %urp/%srp/%tc/%itt*/%dtt* itself: those install their own translation and would
+  // simply take the posture over, so they gain nothing here and would defeat the
+  // non-vacuity assertions below.
+  private val mmuSweepManifest = Paths.get(sys.env.getOrElse(
+    "PORTED_MMU_SWEEP_LIST",
+    "src/test/resources/m68kooo-ported-tests/mmu-walk-sweep-list.txt"))
+  private val mmuSweepNames: Vector[String] =
+    if (Files.isRegularFile(mmuSweepManifest)) {
+      new String(Files.readAllBytes(mmuSweepManifest)).linesIterator
+        .map(_.trim).filter(_.nonEmpty).toVector
+    } else Vector.empty
+  private val mmuSweep8K = sys.env.get("PORTED_MMU_SWEEP_8K").exists(v => v == "1" || v == "true")
+  // Diagnostic knob: plant the leaf descriptors with U = M = 1 so no walk ever queues a
+  // deferred U/M descriptor writeback. Everything else about the posture is unchanged, so
+  // a failure that survives this is in the walker's descriptor READ path and one that does
+  // not is in the U/M writeback path. Not the default -- the default posture deliberately
+  // exercises both.
+  private val mmuSweepPresetUM =
+    sys.env.get("PORTED_MMU_SWEEP_PRESET_UM").exists(v => v == "1" || v == "true")
+
   test("ported cache-mode sweep manifest is valid") {
     assert(Files.isRegularFile(sweepManifest),
       s"missing required cache-mode sweep manifest: $sweepManifest")
@@ -89,6 +116,20 @@ class PortedM68kOooSpec extends AnyFunSuite {
     }
   }
 
+  test("ported MMU-walk sweep manifest is valid") {
+    assert(Files.isRegularFile(mmuSweepManifest),
+      s"missing required MMU-walk sweep manifest: $mmuSweepManifest")
+    assert(mmuSweepNames.nonEmpty, s"MMU-walk sweep manifest is empty: $mmuSweepManifest")
+    val duplicates = mmuSweepNames.groupBy(identity).collect {
+      case (name, entries) if entries.size > 1 => name
+    }.toVector.sorted
+    assert(duplicates.isEmpty, s"duplicate MMU-walk sweep entries: ${duplicates.mkString(", ")}")
+    val missing = mmuSweepNames.filterNot(name =>
+      Files.isRegularFile(canonicalAsmDir.resolve(s"$name.s")))
+    assert(missing.isEmpty,
+      s"MMU-walk sweep entries missing from canonical corpus: ${missing.mkString(", ")}")
+  }
+
   for (name <- sweepNames if names.contains(name)) {
     test(s"ported-sweep-copyback: $name", VerilatorTest) {
       val src = new String(Files.readAllBytes(dir.resolve(s"$name.s")))
@@ -107,6 +148,75 @@ class PortedM68kOooSpec extends AnyFunSuite {
           fail(s"[copyback sweep] HANG: no sentinel write within $cycles cycles " +
             s"(timeout=$timeout)")
         case PortedGenFail(r)    => fail(s"[copyback sweep] assemble/toolchain error: $r")
+      }
+    }
+  }
+
+  for (name <- mmuSweepNames if names.contains(name)) {
+    test(s"ported-sweep-mmuwalk: $name", VerilatorTest) {
+      val src = new String(Files.readAllBytes(dir.resolve(s"$name.s")))
+      val timeoutPath = dir.resolve(s"$name.timeout")
+      val timeout =
+        if (Files.exists(timeoutPath)) new String(Files.readAllBytes(timeoutPath)).trim.toLong
+        else DefaultTimeoutCycles
+      val r = MmuWalkDriver.runWithRealTables(name, src, timeout, pages8K = mmuSweep8K,
+                                             presetUM = mmuSweepPresetUM)
+      val ctx =
+        s"posture: ${r.probe.summary}\n" +
+        s"baseline(AsWritten): ${r.baseline.summary} -> ${r.baselineOutcome}\n" +
+        s"map: ${r.map.blockCount} block(s), arena=0x${r.map.arenaBase.toHexString}, " +
+        s"attempts=${r.attempts}${r.extensions.map("\n  " + _).mkString}"
+      info(ctx)
+
+      // ---- POSTURE NON-VACUITY, asserted before the program's own verdict -----------
+      // A "cached + MMU" run that silently executed with the MMU off, or with a TTR
+      // covering everything, is a vacuous pass and is worth strictly less than a red
+      // test. These are measurements taken from inside the running DUT, not a restatement
+      // of the setup code.
+      assert(r.probe.itlbWalkStarts > 0,
+        s"VACUOUS POSTURE [$name]: no ITLB table walk ever started -- instruction fetch " +
+          s"was not translated by a page table.\n$ctx")
+      assert(r.probe.dtlbWalkStarts > 0,
+        s"VACUOUS POSTURE [$name]: no DTLB table walk ever started -- data accesses were " +
+          s"not translated by a page table.\n$ctx")
+      if (!mmuSweepPresetUM)
+        assert(r.probe.walkStores > 0,
+          s"VACUOUS POSTURE [$name]: no walker U/M descriptor writeback ever fired, so no " +
+            s"leaf descriptor was actually consumed and updated.\n$ctx")
+      assert(r.probe.dcLoadHits + r.probe.dcStoreHits > 0,
+        s"VACUOUS POSTURE [$name]: the D-cache reported zero hits, so accesses were still " +
+          s"effectively inhibited and no line-crossing behaviour was exercised.\n$ctx")
+      // A descriptor READ that bus-faulted means the descriptor arena itself landed on an
+      // undecoded physical address -- a harness placement bug, never a core defect.
+      assert(r.probe.itlbDescFaults == 0 && r.probe.dtlbDescFaults == 0,
+        s"HARNESS BUG [$name]: a page-table descriptor read took a bus fault, so the " +
+          s"descriptor arena is not backed by memory.\n$ctx")
+
+      // ---- hole policy -------------------------------------------------------------
+      // A walk into a region the map does not cover is NOT automatically a harness bug:
+      // a wrong-path speculative fetch or a speculative load off a stale address register
+      // legitimately asks to translate garbage, and the core is supposed to fault-and-
+      // squash it. That is exactly what the board does. So holes are fatal only when the
+      // program ALSO failed -- in which case they are the leading suspect and the failure
+      // must be triaged as a harness gap rather than reported as a core defect. (The
+      // driver has already re-built the map around any hole it saw and re-run; see
+      // MmuWalkDriver.runWithRealTables.)
+      val holes = r.probe.holeBlocks.nonEmpty || r.probe.holeRegions.nonEmpty
+
+      r.outcome match {
+        case PortedPass       => ()
+        case other if holes =>
+          fail(s"[mmu-walk sweep] HARNESS MAP HOLE (not a core verdict) [$name]: $other, " +
+            s"and a walk demanded translation the harness page table does not provide " +
+            s"after ${r.attempts} attempt(s): ${r.probe.holeSummary}\n$ctx")
+        case PortedFail(word) =>
+          fail(f"[mmu-walk sweep] FAIL sentinel word=0x$word%08x " +
+            f"(expected 0x${PortedTestRunner.PassWord}%08x)%n$ctx")
+        case PortedHang(cycles) =>
+          fail(s"[mmu-walk sweep] HANG: no sentinel write within $cycles cycles " +
+            s"(timeout=$timeout)\n$ctx")
+        case PortedGenFail(reason) =>
+          fail(s"[mmu-walk sweep] assemble/toolchain error: $reason")
       }
     }
   }
