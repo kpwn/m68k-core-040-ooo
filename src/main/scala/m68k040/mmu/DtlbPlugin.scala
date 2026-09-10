@@ -595,8 +595,14 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
       _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_DTLB,
                                           m68k040.cache.DLoadToken.Width bits)
-      walker.io.loadCmd.ready        := False
     }
+    // Hold the walker off for the WHOLE drain read -- issue AND response -- not just
+    // while issuing. Releasing it at acceptance lets the walker put a second read on a
+    // port that carries one outstanding transaction, and the two responses are then
+    // swapped: the drain consumes the walker's descriptor and the walker consumes the
+    // drain's. That installs a WRONG TRANSLATION, which on the board showed up as an
+    // F-line storm at a fixed RAM address on every boot.
+    when(drainNeedRead || drainReadPend) { walker.io.loadCmd.ready := False }
     when(drainNeedRead && _walkLoadCmd.ready) {
       drainNeedRead := False
       drainReadPend := True
@@ -656,6 +662,30 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // `drainDropAck` pops an entry whose re-read faulted, so a faulting descriptor
     // cannot wedge the queue head forever.
     umq.io.drainAck := (drainAckWait && _walkStoreAck) || drainDropAck
+
+    // ── TRIPWIRE: ONE descriptor read outstanding, ever ─────────────────────────
+    // The walk port carries a single outstanding transaction and its response is
+    // unlabelled, so a second read in flight means the two responses are SWAPPED --
+    // the drain consumes the walker's descriptor and the walker consumes the drain's,
+    // installing a wrong translation. That is silent: every MMU unit test passed with
+    // this hazard present, because a standalone DUT's memory agent answers instantly
+    // and the walker never became busy inside the window. It cost a bitstream and a
+    // boot campaign to find, as an F-line storm at a fixed RAM address on 5 of 5 boots.
+    // Assert the invariant structurally so no future change can reintroduce it
+    // quietly, whether or not a test happens to look.
+    GenerationFlags.simulation {
+      val descOutstanding = Reg(UInt(2 bits)) init (0)
+      val descIssue = _walkLoadCmd.valid && _walkLoadCmd.ready
+      val descRsp   = _walkLoadRsp.valid
+      when(descIssue && !descRsp) { descOutstanding := descOutstanding + 1 }
+      when(!descIssue && descRsp && descOutstanding =/= 0) { descOutstanding := descOutstanding - 1 }
+      assert(
+        !(descIssue && descOutstanding =/= 0 && !descRsp),
+        "DtlbPlugin: a second descriptor read was issued while one was still outstanding " +
+        "on the walk port -- the two responses will be swapped and a WRONG TRANSLATION " +
+        "installed. The drain must hold walker.io.loadCmd.ready low for its whole read.",
+        FAILURE)
+    }
 
     // Sim-only sticky fault observation: set whenever a translation resolves with a
     // fault flagged (FLAGGED only — no exception delivery this slice). The lock-step
