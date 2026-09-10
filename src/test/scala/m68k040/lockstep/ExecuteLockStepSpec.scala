@@ -12621,14 +12621,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // AR whose ID is already live. Both change where an interrupt can land relative
     // to an in-flight crossing pop -- which is the whole point of this test.
     val dPostures = Seq(
-      ("zero-latency", m68k040.sim.AxiMemModelConfig()),
+      ("zero-latency", m68k040.sim.AxiMemModelConfig(), 0x80008000L),
       ("L2+DRAM", m68k040.sim.AxiMemModelConfig(
-         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40))),
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40)), 0x80008000L),
       ("L2+DRAM, single-outstanding crossbar", m68k040.sim.AxiMemModelConfig(
          latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40),
-         crossbarSingleOutstanding = true)),
+         crossbarSingleOutstanding = true), 0x80008000L),
+      // CACR=0: every data access becomes INHIBITED and precise, so each pop is a
+      // real bus round trip that an interrupt can land in the middle of. That is the
+      // "exception at a wrong time, re-entering an I/O stall" regime, and it is a
+      // different preemption path (`irqPreemptPendingIn` gates an inhibited load's
+      // device read from launching at all). InhibitedLoadIrqPreemptSpec covers that
+      // gating signal but checks NOTHING about A7 or the exception frame.
+      ("INHIBITED (CACR=0), L2+DRAM", m68k040.sim.AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40)), 0x00000000L),
+      ("INHIBITED (CACR=0), single-outstanding crossbar", m68k040.sim.AxiMemModelConfig(
+         latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40),
+         crossbarSingleOutstanding = true), 0x00000000L),
     )
-    for ((dname, dcfg) <- dPostures)
+    for ((dname, dcfg, cacrVal) <- dPostures)
     for ((pc, i) <- popPcs.zipWithIndex) {
       assert(plain.exists(_.pc == pc), f"[a7-popchain] boundary 0x$pc%08x absent from the oracle trace")
       val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc, 5))) match {
@@ -12642,7 +12653,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val exact = try {
         runIrqLockStep(f"a7-popchain-$dname-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
                        avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4,
-                       dcfg = dcfg, maxCycles = 20000); true
+                       dcfg = dcfg, cacr = cacrVal, maxCycles = 40000); true
       } catch { case _: org.scalatest.exceptions.TestFailedException => false }
       if (!exact) {
         val pc2 = nextPc(pc)
@@ -12653,7 +12664,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         runIrqLockStep(f"a7-popchain-$dname-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
                        irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
                        oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4,
-                       dcfg = dcfg, maxCycles = 20000)
+                       dcfg = dcfg, cacr = cacrVal, maxCycles = 40000)
       }
     }
   }
