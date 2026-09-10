@@ -113,12 +113,21 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     * exists only so the ring's [head, tail) contiguity survives a flush (see below). */
   val headDead   = valids(head) && dead(head) && !drainBusy
   val headReady  = valids(head) && committed(head) && !dead(head) && !io.flush
-  val drainIssue = headReady && !drainBusy
+  // LEVEL held until `drainAck` -- what the comment above always claimed. As
+  // `headReady && !drainBusy` with `when(drainIssue){drainBusy := True}` this was a
+  // ONE-CYCLE PULSE that cancelled itself, stranding the entry FOREVER if the consumer
+  // could not accept on that exact cycle: drainBusy stayed set, the queue never
+  // re-offered, the ack could never arrive, the queue filled, `io.full` withheld the
+  // walker's admission credit, and the machine deadlocked.
+  val drainIssue = headReady
   io.drain.valid         := drainIssue
   io.drain.payload.addr    := addrs(head)
   io.drain.payload.newByte := bytes(head)
 
   when(drainIssue) { drainBusy := True }
+  // Withdraw the offered flag if the head stops being drainable, so a stale
+  // `drainBusy` can never block `headDead` retirement.
+  when(!headReady) { drainBusy := False }
   when(io.drainAck && drainBusy) {
     drainBusy    := False
     valids(head) := False

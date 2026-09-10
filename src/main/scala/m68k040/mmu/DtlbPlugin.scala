@@ -590,8 +590,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // outstanding on a port whose response is unlabelled = swapped responses and a
     // WRONG TRANSLATION -- caught by this file's own tripwire the moment the drain
     // offer became a held level rather than a self-cancelling one-cycle pulse.
-    when(umq.io.drain.valid && !drainArmed && !drainAckWait &&
-         !drainNeedRead && !drainReadPend && !walker.io.busy) {
+    // Combinational: `drainNeedRead` is a register (invisible on the arming cycle) and
+    // `walker.io.busy` is `!fsm.isActive(IDLE)`, also registered, so it still reads
+    // False on the cycle the walker STARTS. Both lags must be closed here.
+    val drainArmingNow = umq.io.drain.valid && !drainArmed && !drainAckWait &&
+                         !drainNeedRead && !drainReadPend &&
+                         !walker.io.busy && !walker.io.start
+    when(drainArmingNow) {
       drainNeedRead := True
       drainRdAddr   := umq.io.drain.payload.addr
       drainOffReg   := drainByteOff
@@ -599,6 +604,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     }
 
     // Drain owns the walker's descriptor-read port for exactly one transaction.
+    // THE PORT ITSELF must be silenced while the drain owns it. `_walkLoadCmd.valid`
+    // defaults to `walker.io.loadCmd.valid`, and during `drainReadPend` the drain's
+    // read is OUTSTANDING while `drainNeedRead` is already False -- so the walker's
+    // valid passed straight through and a SECOND read issued on a port that allows
+    // exactly one. Holding `walker.io.loadCmd.ready` low only stops the walker from
+    // BELIEVING it issued; it does not stop the port from issuing, so the walker's
+    // response was then consumed by the drain. That is the swapped-response hazard
+    // this file's tripwire exists to catch.
+    when(drainArmingNow || drainReadPend) { _walkLoadCmd.valid := False }
     when(drainNeedRead) {
       _walkLoadCmd.valid             := True
       _walkLoadCmd.payload.vaddr     := drainRdAddr
@@ -618,7 +632,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // swapped: the drain consumes the walker's descriptor and the walker consumes the
     // drain's. That installs a WRONG TRANSLATION, which on the board showed up as an
     // F-line storm at a fixed RAM address on every boot.
-    when(drainNeedRead || drainReadPend) { walker.io.loadCmd.ready := False }
+    when(drainArmingNow || drainNeedRead || drainReadPend) { walker.io.loadCmd.ready := False }
     when(drainNeedRead && _walkLoadCmd.ready) {
       drainNeedRead := False
       drainReadPend := True
