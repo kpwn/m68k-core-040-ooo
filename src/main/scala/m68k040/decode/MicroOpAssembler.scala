@@ -333,6 +333,118 @@ object MicroOpAssembler {
     * non-drop writer per macro" convention -- not an explicit keepCommit override -- is the
     * ONLY mechanism CPLX writers have, and it generalizes to this FSM's up-to-8 writers with
     * no new EU-side plumbing. */
+  /** STORE direction, phase A: convert ONE 32-bit chunk of FPn into a scratch temp.
+    * Field-for-field the register-direct `DecOp.FPSTORECVT` uop this file already builds for
+    * `FMOVE FPn,Dn` (task 14b), with the chunk index on `imm` and Extended as the format --
+    * exactly what `Microcode.scala`'s `fpStoreCvtRows` emits for the SCALAR Extended store.
+    * Always dropped: it writes only a scratch temp. */
+  def fmovemxStoreCvtUop(fpSrc: UInt, chunk: UInt, dstTemp: UInt,
+                          first: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.FPSTORECVT
+    u.cluster     := Cluster.CPLX          // the only cluster with an FP-file read port
+    u.size        := Size.LONG
+    u.memOp       := MemOp.NONE
+    u.srcAReg     := 0; u.srcAValid := False
+    u.srcBReg     := 0; u.srcBValid := False
+    u.srcCReg     := 0; u.srcCValid := False
+    u.dstReg      := dstTemp; u.dstValid := True
+    u.useImm      := True; u.imm := chunk.resize(32).asBits
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := True                  // a scratch-temp convert is never the kept commit
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0
+    u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0
+    u.extByte := False; u.altAddrSpace := False
+    u.isMovea     := False
+    u.isScc       := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False
+    u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.firstOfInstr := first
+    u.lastOfInstr  := False                // the element's 3 stores always follow
+    // FP-domain: FPn is a pure SOURCE; nothing in the FP file is written and FPCC is
+    // untouched (FMOVEM is not a compute op -- design doc S2).
+    u.writesFp   := False; u.writesFpcc := False; u.readsFpcc := False
+    u.fpDstReg   := 0
+    u.fpSrcAReg  := fpSrc.resize(3); u.usesFpSrcA := True
+    u.fpSrcBReg  := 0;               u.usesFpSrcB := False
+    u.fpSrcKind  := FpSrcKind.FPREG
+    u.fpSrcFmt   := B"3'b010"              // Extended -- the ONLY FMOVEM.X format
+    u.fpWideImm  := B(0, 80 bits)
+    u.fpuOp      := B(0, 7 bits)
+    u
+  }
+
+  /** STORE direction, phase B: write one already-converted chunk temp to memory.
+    * The mirror of `fmovemxLoadChunkUop` -- same plain LS-cluster shape, direction
+    * reversed. `drop`/`last` follow the same "N dropped writers + 1 kept" convention the
+    * load direction uses, except the kept commit is the LAST STORE of the LAST element
+    * (a store direction has no trailing FP issue row to carry it). */
+  def fmovemxStoreChunkUop(base: UInt, baseValid: Bool, disp: Bits, srcTemp: UInt,
+                            drop: Bool, last: Bool, first: Bool, valid: Bool,
+                            pc: UInt, nextPc: UInt): DecodedUop = {
+    val u = DecodedUop()
+    u.debugBreakValid := False; u.debugBreakSlot := 0
+    u.fpInert()
+    u.valid       := valid
+    u.pc          := pc
+    u.nextPc      := nextPc
+    u.op          := DecOp.MOVE
+    u.cluster     := Cluster.LS
+    u.size        := Size.LONG
+    u.memOp       := MemOp.STORE
+    u.srcAReg     := base;    u.srcAValid := baseValid
+    u.srcBReg     := srcTemp; u.srcBValid := True     // the value written
+    u.srcCReg     := 0;       u.srcCValid := False
+    u.dstReg      := 0;       u.dstValid  := False
+    u.useImm      := True; u.imm := disp
+    u.readsNzvc   := False; u.readsX := False
+    u.writesNzvc  := False; u.writesX := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.cond        := 0; u.branchDisp := 0
+    u.unimplemented := False
+    u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
+    u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
+    u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
+    u.divSigned   := False; u.div64 := False
+    u.divIsRem    := drop
+    u.isChk2      := False
+    u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
+    u.ccrRestore  := False; u.toCcr := False
+    u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0
+    u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0
+    u.extByte := False; u.altAddrSpace := False
+    u.isMovea     := False
+    u.isScc       := False; u.isDbcc := False
+    u.indexLong   := False; u.indexScale := 0
+    u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False
+    u.needsSupervisor := False; u.keepCommit := False
+    u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
+    u.predTaken := False; u.predTarget := U(0, 32 bits)
+    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.firstOfInstr := first
+    u.lastOfInstr  := last
+    u
+  }
+
   def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, last: Bool, valid: Bool,
                        pc: UInt, nextPc: UInt): DecodedUop = {
     val u = DecodedUop()

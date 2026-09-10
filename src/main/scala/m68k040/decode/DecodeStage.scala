@@ -774,7 +774,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // restriction to mode 010 `(An)` / 101 `(d16,An)` (this task's scope only).
     val s0FpGenEaMode = s0opw(5 downto 3)
     val s0IsFpGenMemEa = (s0opw(15 downto 9) === B"7'b1111001") && (s0opw(8 downto 6) === B"3'b000") &&
-                         ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101"))
+                         ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101") ||
+                          (s0FpGenEaMode === B"3'b011") || (s0FpGenEaMode === B"3'b100"))
     // The real ext word (`words(1)`, right after the opword — mirrors `movemEntryPkt`'s own
     // `eMask = words(1)` layout, and `ucFpExt`'s identical positioning): opclass[15:13] (110
     // load / 111 store — store is task #242, so only 110 is admitted here), bit[11] = static
@@ -786,7 +787,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0FpIsStatic = !s0FpExt1(11)
     // THIS task's scope is load-direction only (opclass 110); store (111) stays on the
     // pre-existing µcode-engine trap path until task #242 lands.
-    val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && (s0FpOpClass === B"3'b110") && s0FpIsStatic
+    val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && s0FpIsStatic &&
+                         ((s0FpOpClass === B"3'b110") || (s0FpOpClass === B"3'b111"))
     // ── SLOT 1 (2026-09-10) ─────────────────────────────────────────────────────
     // The same classifier on slot1. Task #241 deliberately omitted this and said so:
     // a slot1 FMOVEM.X "already falls through correctly to the generic
@@ -807,9 +809,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s1fxExt1       = fed.payload.packets(1).words(1)
     val s1fxEaMode     = s1fxOpw(5 downto 3)
     val s1IsFpGenMemEa = (s1fxOpw(15 downto 9) === B"7'b1111001") && (s1fxOpw(8 downto 6) === B"3'b000") &&
-                         ((s1fxEaMode === B"3'b010") || (s1fxEaMode === B"3'b101"))
-    val slot1IsFmovemx = fed.valid && fed.payload.slot1Valid && s1IsFpGenMemEa &&
-                         (s1fxExt1(15 downto 13) === B"3'b110") && !s1fxExt1(11)
+                         ((s1fxEaMode === B"3'b010") || (s1fxEaMode === B"3'b101") ||
+                          (s1fxEaMode === B"3'b011") || (s1fxEaMode === B"3'b100"))
+    val slot1IsFmovemx = fed.valid && fed.payload.slot1Valid && s1IsFpGenMemEa && !s1fxExt1(11) &&
+                         ((s1fxExt1(15 downto 13) === B"3'b110") || (s1fxExt1(15 downto 13) === B"3'b111"))
     // Control-transfer / address-generate full-format mem-indirect (task #201): see the
     // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
     // never recognizes JMP/JSR at all (illegal=True always) and marks LEA/PEA non-illegal
@@ -1183,7 +1186,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fmovemxEmitted  = Reg(UInt(4 bits))    // elements emitted so far (0..8)
     val fmovemxPc       = Reg(UInt(32 bits))
     val fmovemxNextPc   = Reg(UInt(32 bits))
-    val fmovemxPhase    = Reg(UInt(2 bits))    // 0/1/2 = LOAD chunk 0/1/2 (-> T0/T1/T2); 3 = the FP issue row
+    // 3 bits (2026-09-10, store direction): a LOAD element is 4 phases (0/1/2 = chunk
+    // loads into T0/T1/T2, 3 = the FP issue row); a STORE element is 6 (0/1/2 = the
+    // FPSTORECVT rows that narrow FPn into T0/T1/T2, 3/4/5 = the three chunk stores).
+    val fmovemxPhase    = Reg(UInt(3 bits))
+    val fmovemxIsStore  = Reg(Bool())          // ext1[15:13]: 110 = load, 111 = store
+    // Auto-update (2026-09-10, the form the ROM FPSP actually uses): -(An) and (An)+.
+    // The addressing itself needs no new machinery -- a predecrement's base is folded
+    // into `fmovemxBaseDisp` as a NEGATIVE displacement at entry, so every element still
+    // addresses base + disp + running offset, ascending, with the highest-numbered listed
+    // register at the lowest address (design spec S2). Only the trailing architectural
+    // An write is new, and it reuses MOVEM's own `movemAnUpdUop` builder verbatim.
+    val fmovemxHasFinal = RegInit(False)
+    val fmovemxDelta    = Reg(SInt(32 bits))
+    val fmovemxAnPhase  = RegInit(False)       // elements drained -> drive the An update
+    when(pipeFlush) { fmovemxHasFinal := False; fmovemxAnPhase := False }
     val fmovemxCurReg   = Reg(UInt(3 bits))    // this element's target FPn (0-7), latched when the element begins
     when(pipeFlush) { fmovemxActive := False }
 
@@ -1206,24 +1223,59 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
 
     // ── Per-cycle sub-phase µop (combinational; latched by pushReg like every other FSM) ──
     val fmovemxLoadDisp = fmovemxPhase.mux(
-      U(0, 2 bits) -> fmovemxChunkDisp(0),
-      U(1, 2 bits) -> fmovemxChunkDisp(1),
+      U(0, 3 bits) -> fmovemxChunkDisp(0),
+      U(1, 3 bits) -> fmovemxChunkDisp(1),
       default      -> fmovemxChunkDisp(2))
     val fmovemxLoadTemp = fmovemxPhase.mux(
-      U(0, 2 bits) -> U(MicroOpAssembler.T0, 5 bits),
-      U(1, 2 bits) -> U(MicroOpAssembler.T1, 5 bits),
+      U(0, 3 bits) -> U(MicroOpAssembler.T0, 5 bits),
+      U(1, 3 bits) -> U(MicroOpAssembler.T1, 5 bits),
       default      -> U(MicroOpAssembler.T2, 5 bits))
+    // STORE phases 3/4/5 address chunk 0/1/2 and read back T0/T1/T2 in the same order.
+    val fmovemxStDisp = fmovemxPhase.mux(
+      U(3, 3 bits) -> fmovemxChunkDisp(0),
+      U(4, 3 bits) -> fmovemxChunkDisp(1),
+      default      -> fmovemxChunkDisp(2))
+    val fmovemxStTemp = fmovemxPhase.mux(
+      U(3, 3 bits) -> U(MicroOpAssembler.T0, 5 bits),
+      U(4, 3 bits) -> U(MicroOpAssembler.T1, 5 bits),
+      default      -> U(MicroOpAssembler.T2, 5 bits))
+    val fmovemxCvtChunk = fmovemxPhase.mux(
+      U(0, 3 bits) -> U(0, 2 bits),
+      U(1, 3 bits) -> U(1, 2 bits),
+      default      -> U(2, 2 bits))
+    // The element's LAST phase: 3 for a load (the issue row), 5 for a store.
+    val fmovemxLastPhase = Mux(fmovemxIsStore, U(5, 3 bits), U(3, 3 bits))
     // The macro's very FIRST emitted µop (the first LOAD chunk of the first element) carries
     // firstOfInstr -- mirrors movemFirst0's identical "only the first emitted move of the
     // whole macro" rule.
-    val fmovemxFirstUop = (fmovemxEmitted === 0) && (fmovemxPhase === U(0, 2 bits))
+    val fmovemxFirstUop = (fmovemxEmitted === 0) && (fmovemxPhase === U(0, 3 bits))
     val fmovemxLoadUop  = MicroOpAssembler.fmovemxLoadChunkUop(
       base = fmovemxBaseReg, baseValid = True, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
       first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxIssueKept = fmovemxIsLastElem && !fmovemxHasFinal
     val fmovemxIssueUopV = MicroOpAssembler.fmovemxIssueUop(
-      fpDst = fmovemxCurReg, drop = !fmovemxIsLastElem, first = False, last = fmovemxIsLastElem, valid = True,
+      fpDst = fmovemxCurReg, drop = !fmovemxIssueKept, first = False, last = fmovemxIssueKept, valid = True,
       pc = fmovemxPc, nextPc = fmovemxNextPc)
-    val fmovemxCurUop = Mux(fmovemxPhase === U(3, 2 bits), fmovemxIssueUopV, fmovemxLoadUop)
+    // STORE element: [FPSTORECVT x3] then [STORE x3]. The macro's kept commit is the
+    // LAST store of the LAST element -- a store direction has no trailing FP issue row to
+    // carry it, unlike the load.
+    // With an auto-update form the KEPT commit is the trailing An write, not the last
+    // element's own terminal µop -- mirrors MOVEM's `movemHasFinal` convention exactly.
+    val fmovemxStIsLastUop = fmovemxIsLastElem && (fmovemxPhase === U(5, 3 bits)) && !fmovemxHasFinal
+    val fmovemxAnUpdUopV   = MicroOpAssembler.movemAnUpdUop(
+      an = fmovemxBaseReg, signedDelta = fmovemxDelta, valid = True,
+      pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxCvtUopV = MicroOpAssembler.fmovemxStoreCvtUop(
+      fpSrc = fmovemxCurReg, chunk = fmovemxCvtChunk, dstTemp = fmovemxLoadTemp,
+      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxStUopV = MicroOpAssembler.fmovemxStoreChunkUop(
+      base = fmovemxBaseReg, baseValid = True, disp = fmovemxStDisp, srcTemp = fmovemxStTemp,
+      drop = !fmovemxStIsLastUop, last = fmovemxStIsLastUop, first = False, valid = True,
+      pc = fmovemxPc, nextPc = fmovemxNextPc)
+    val fmovemxElemUop = Mux(fmovemxIsStore,
+      Mux(fmovemxPhase >= U(3, 3 bits), fmovemxStUopV, fmovemxCvtUopV),
+      Mux(fmovemxPhase === U(3, 3 bits), fmovemxIssueUopV, fmovemxLoadUop))
+    val fmovemxCurUop = Mux(fmovemxAnPhase, fmovemxAnUpdUopV, fmovemxElemUop)
 
     // ── FMOVEM.X entry detection (slot0 only in this task's scope -- see slot0IsFmovemx's
     // own doc for why a slot1-positioned in-scope op is left on the pre-existing µcode-
@@ -1238,9 +1290,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fxAnReg     = (U(8, 5 bits) + fxReg.asUInt).resized
     val fxDisp16    = fxEntryPkt.words(2).asSInt.resize(32).asBits
     val fxIsDispAn  = fxMode === B"3'b101"          // (d16,An); else mode 010 (An), disp=0
-    val fxBaseDisp  = Mux(fxIsDispAn, fxDisp16, B(0, 32 bits))
+    val fxIsPredec  = fxMode === B"3'b100"          // -(An)
+    val fxIsPostinc = fxMode === B"3'b011"          // (An)+
+    val fxIsAuto    = fxIsPredec || fxIsPostinc
+    // 12 bytes per listed register (Extended's full in-memory footprint, spec S2).
+    // 0..8 registers -> 0..96 bytes; widths kept explicit so the multiply does not
+    // silently widen into the operator width assert.
+    val fxCount     = CountOne(fxMaskIn).resize(4)
+    val fxAutoBytes = (fxCount * U(12, 4 bits)).resize(8)
+    val fxAutoDelta = fxAutoBytes.resize(32).asSInt
+    // -(An): the frame occupies [An-12N, An), so the running ascending walk starts at
+    // An-12N. (An)+ and (An) both start at An itself; (d16,An) adds its displacement.
+    val fxBaseDisp  = Mux(fxIsPredec, (S(0, 32 bits) - fxAutoDelta).resize(32).asBits,
+                      Mux(fxIsDispAn, fxDisp16, B(0, 32 bits)))
     val fxPc        = fxEntryPkt.pc
     val fxNextPc    = (fxPc + (fxEntryPkt.lenWords << 1)).resize(32)
+    val fxIsStore   = fxExt1(15 downto 13) === B"3'b111"   // 110 = load, 111 = store
     val fxMaskEmpty = fxMaskIn === 0
     val (fxBit0, _) = RegListWalk.extractLowest1(fxMaskIn)
 
@@ -2829,6 +2894,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       // shape -- pushProduced's `elsewhen(fmovemxActive)` reads the REGISTERED value,
       // which is still False during this very cycle).
       fmovemxActive   := True
+      fmovemxIsStore  := fxIsStore
+      fmovemxHasFinal := fxIsAuto && !fxMaskEmpty
+      fmovemxDelta    := Mux(fxIsPredec, (S(0, 32 bits) - fxAutoDelta).resized, fxAutoDelta)
+      fmovemxAnPhase  := False
       fmovemxMask     := fxMaskIn
       fmovemxRevMap   := fxRevIn
       fmovemxBaseReg  := fxAnReg
@@ -2837,7 +2906,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       fmovemxEmitted  := 0
       fmovemxPc       := fxPc
       fmovemxNextPc   := fxNextPc
-      fmovemxPhase    := 0
+      fmovemxPhase    := U(0, 3 bits)
       fmovemxCurReg   := fmovemxMapBit(fxBit0, fxRevIn)
       // Entering a slot0 fmovemx op: STASH its slot1 (if any) so it is not lost when `fed`
       // is consumed this cycle -- mirrors movemBegin's own identical block verbatim (same
@@ -2878,10 +2947,18 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       }
     } elsewhen(fmovemxActive) {
       when(pushProduced.ready) {
-        when(fmovemxPhase === U(3, 2 bits)) {
-          // The element's issue row was accepted -> this element is done.
+        when(fmovemxAnPhase) {
+          // The trailing An update was accepted -- it is the macro's kept commit.
+          fmovemxActive  := False
+          fmovemxAnPhase := False
+        } elsewhen(fmovemxPhase === fmovemxLastPhase) {
+          // The element's terminal µop was accepted -> this element is done.
           when(fmovemxIsLastElem) {
-            fmovemxActive := False    // last element's issue row was the kept commit; macro done
+            when(fmovemxHasFinal) {
+              fmovemxAnPhase := True   // one more µop: the auto-update An write
+            } otherwise {
+              fmovemxActive := False   // the terminal µop was the kept commit; macro done
+            }
           } otherwise {
             fmovemxMask    := fmovemxMaskAfterCur
             fmovemxOff     := (fmovemxOff + S(12, 32 bits)).resize(32)
