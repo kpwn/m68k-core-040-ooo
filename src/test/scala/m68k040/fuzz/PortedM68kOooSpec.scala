@@ -162,6 +162,7 @@ class PortedM68kOooSpec extends AnyFunSuite {
       val r = MmuWalkDriver.runWithRealTables(name, src, timeout, pages8K = mmuSweep8K,
                                              presetUM = mmuSweepPresetUM)
       val ctx =
+        s"outcome: ${r.outcome}\n" +
         s"posture: ${r.probe.summary}\n" +
         s"baseline(AsWritten): ${r.baseline.summary} -> ${r.baselineOutcome}\n" +
         s"map: ${r.map.blockCount} block(s), arena=0x${r.map.arenaBase.toHexString}, " +
