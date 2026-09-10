@@ -605,4 +605,43 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_EXC_FAULT_ADDR.toLong) == 0x00ABCDEFL)
     }
   }
+
+  // ── OFF_IRQ_INJECT ────────────────────────────────────────────────────────────
+  // This register was in DebugRegMap from the start and `tools/jtag_repl.tcl` has
+  // shipped an `irq-inject <level>` command writing it -- but NOTHING in
+  // DebugCtrlPlugin ever decoded the address, so every write was accepted and
+  // silently discarded and JTAG interrupt/NMI injection never worked. Found
+  // 2026-09-11 after the owner reported "nmi injection seems broken".
+  //
+  // The register HOLDS the requested level (a real device holds its request until
+  // serviced) rather than pulsing, so a request cannot be missed because it landed
+  // while the core was masked or mid-flush. These tests pin exactly that.
+  test("OFF_IRQ_INJECT holds the requested level (it used to be silently dropped)") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.clockDomain.waitSampling(20)
+      assert(DbgAxiDriver.write(dut.axi, dut.clockDomain,
+        DebugRegMap.OFF_IRQ_INJECT.toLong, 7L) == 0, "write must answer OKAY")
+      dut.clockDomain.waitSampling(4)
+      assert(dut.dbg.irqInjectLevel.toInt == 7,
+        s"level 7 (NMI) must be HELD, got ${dut.dbg.irqInjectLevel.toInt} -- " +
+        "a dropped write here is the original bug")
+    }
+  }
+
+  test("OFF_IRQ_INJECT level 0 cancels a pending request") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      dut.clockDomain.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.clockDomain.waitSampling(20)
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_IRQ_INJECT.toLong, 5L)
+      dut.clockDomain.waitSampling(4)
+      assert(dut.dbg.irqInjectLevel.toInt == 5, "precondition: level 5 held")
+      DbgAxiDriver.write(dut.axi, dut.clockDomain, DebugRegMap.OFF_IRQ_INJECT.toLong, 0L)
+      dut.clockDomain.waitSampling(4)
+      assert(dut.dbg.irqInjectLevel.toInt == 0, "writing 0 must cancel the request")
+    }
+  }
+
 }

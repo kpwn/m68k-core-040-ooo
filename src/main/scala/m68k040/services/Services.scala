@@ -367,6 +367,22 @@ trait CacheControlService {
   * attempt) commit-time MOVEC-writable via the `setX` Flow ports — see
   * MmuControlPlugin's doc comment for why the original write mechanism was reverted
   * and what changed to make it safe to re-add. */
+/** Debug-injected interrupt request (`OFF_IRQ_INJECT`, DebugRegMap 0x020).
+  *
+  * Exposed as a SERVICE rather than a plain accessor on purpose: `host[...]` BLOCKS the
+  * consumer's build body until the provider's body has run, which is the documented cure
+  * for the cross-Fiber ordering race (see MmuControl.scala's own note). Reading a bare
+  * `var` accessor from SocketTop instead gave a null at elaboration.
+  *
+  *  - `irqInjectLevel` : requested IPL, HELD until an interrupt entry is actually taken.
+  *                       0 = no request. 7 = NMI.
+  *  - `irqInjectAck`   : drive from the core's `ipl_ack` to clear the held request.
+  */
+trait DebugIrqInjectService {
+  def irqInjectLevel: UInt
+  def irqInjectAck: Bool
+}
+
 trait MmuControlService {
   def mmuEnable: Bool
   def urp: UInt   // 32 bits — user root pointer

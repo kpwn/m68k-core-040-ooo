@@ -396,7 +396,24 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val iplInPort      = in UInt (3 bits)
     val iackAvecIn     = in Bool ()
     val iackVectorIn   = in UInt (8 bits)
-    intCtrlPlug.logic.iplIn      := RegNext(iplInPort) init 0
+    // ── Debug-injected interrupts (OFF_IRQ_INJECT) ──────────────────────────────
+    // Folded in HERE rather than at the socket: this build body already uses blocking
+    // `host[...]` getters, so the provider's body is guaranteed to have run. Reading a
+    // bare accessor from SocketTop instead produced a null at elaboration (the
+    // cross-Fiber ordering race).
+    //
+    // MAX, never OR: IPL is a LEVEL, so OR-ing two 3-bit levels would fabricate a
+    // priority neither source asked for (inject 1 during external 2 would give 3). Max
+    // is what a real priority encoder does when two devices request at once.
+    val dbgIrqOpt = host.get[m68k040.services.DebugIrqInjectService]
+    val dbgIplLvl = dbgIrqOpt.map(_.irqInjectLevel).getOrElse(U(0, 3 bits))
+    val iplMerged = Mux(dbgIplLvl > iplInPort, dbgIplLvl, iplInPort)
+    intCtrlPlug.logic.iplIn      := RegNext(iplMerged) init 0
+    // Clear the held debug request once the CPU actually TAKES an interrupt entry.
+    dbgIrqOpt.foreach { d =>
+      d.irqInjectAck := host.get[m68k040.socket.IplAckPlugin]
+                            .map(_.logic.iplAck).getOrElse(False)
+    }
     intCtrlPlug.logic.iackAvec   := RegNext(iackAvecIn) init False
     intCtrlPlug.logic.iackVector := RegNext(iackVectorIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId

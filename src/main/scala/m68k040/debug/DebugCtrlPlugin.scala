@@ -60,7 +60,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                       val porCycles: Int     = DebugRegMap.POR_CYCLES_DEFAULT,
                       val stage:     Int     = 1,
                       val enable:    Boolean = true,
-                      val historyDepth: Int  = 32) extends FiberPlugin {
+                      val historyDepth: Int  = 32) extends FiberPlugin
+                      with m68k040.services.DebugIrqInjectService {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
   require(historyDepth == 0 || historyDepth == 32,
@@ -90,6 +91,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       }
     }
   }
+
+  // Plugin-level handles for the debug-injected interrupt (OFF_IRQ_INJECT). Exposed
+  // this way -- the same `var _x` + accessor pattern InterruptControl uses for `iplIn` --
+  // rather than reaching into `logic.<...>` from the socket, because `logic` is a
+  // `during build` Handle whose structural type does not reliably resolve members.
+  var _irqInjectLevel: UInt = null
+  var _irqInjectAck:   Bool = null
+  override def irqInjectLevel: UInt = _irqInjectLevel
+  override def irqInjectAck:   Bool = _irqInjectAck
 
   val logic = during build new Area {
     // ── Socket surface (cpu_socket.vh section 4) ────────────────────────────────────
@@ -346,6 +356,35 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       doWrite.simPublic()
       when(doWrite)                 { awPend := False; wPend := False; bPend := True }
       when(bPend && dbgAxi.bready)  { bPend := False }
+
+      // ── OFF_IRQ_INJECT (0x020): debug-driven interrupt request ────────────────
+      // `DebugRegMap` has carried `OFF_IRQ_INJECT` since the map was written, and
+      // `tools/jtag_repl.tcl` has shipped an `irq-inject <level> [count] [delay_ms]`
+      // command that writes it -- but NOTHING in this plugin ever decoded the
+      // address. The write was ACCEPTED and silently discarded, so JTAG interrupt
+      // and NMI injection has never done anything. Found 2026-09-11 after the owner
+      // reported "nmi injection seems broken".
+      //
+      // (The HARDWARE NMI path is separate and intact: btn[1] -> debounce ->
+      // nmi_btn_core -> irq_agg.nmi_edge -> cpu_ipl, with ipl_ack returned by
+      // IplAckPlugin. Only the JTAG route was missing.)
+      //
+      // Semantics deliberately match a real device rather than a one-shot pulse:
+      // the requested level is HELD until the CPU actually TAKES an interrupt entry
+      // (`irqInjectAck`, driven from the socket's `ipl_ack`), so a request cannot be
+      // missed because it happened to land while the core was masked or mid-flush.
+      // Writing level 0 cancels a pending request. Level 7 is the NMI.
+      val irqInjectLevel = RegInit(U(0, 3 bits)); irqInjectLevel.simPublic()
+      val irqInjectAck   = Bool(); irqInjectAck.allowOverride; irqInjectAck := False
+      irqInjectAck.simPublic()
+      // Clear first, write second: a write landing on the same cycle as an ack is a
+      // NEW request and must win, or a back-to-back inject would be swallowed.
+      when(irqInjectAck) { irqInjectLevel := 0 }
+      when(doWrite && awAddr === DebugRegMap.OFF_IRQ_INJECT && wStrb(0)) {
+        irqInjectLevel := wData(2 downto 0).asUInt
+      }
+      _irqInjectLevel = irqInjectLevel
+      _irqInjectAck   = irqInjectAck
 
       when(dbgAxi.arvalid && dbgAxi.arready) { arPend := True; arAddr := dbgAxi.araddr }
       /** High for exactly one cycle, the cycle in which the read mux result is latched.
