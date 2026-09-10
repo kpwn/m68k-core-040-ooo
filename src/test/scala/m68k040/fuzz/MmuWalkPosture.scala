@@ -230,6 +230,11 @@ final class PostureProbe {
   var itlbWalkStarts = 0L   // ROOT-level reads == number of walks begun
   var dtlbWalkStarts = 0L
   var walkStores = 0L       // deferred U/M descriptor writebacks that actually fired
+  // U/M drain wedge (2026-09-10): cycles spent in each drain state. A hang with
+  // nothing in flight is diagnosed by WHICH of these is pinned high at the end.
+  var iDrainReadPendCycles = 0L
+  var iDrainNeedReadCycles = 0L
+  var iDrainAckWaitCycles  = 0L
   var itlbDescFaults = 0L   // descriptor read came back with a bus fault
   var dtlbDescFaults = 0L
   var dtlbXlateFaults = 0L  // DTLB response with fault set (non-resident/WP/supervisor)
@@ -246,7 +251,7 @@ final class PostureProbe {
 
   def summary: String =
     f"walks(I=$itlbWalkStarts/$itlbWalkReads D=$dtlbWalkStarts/$dtlbWalkReads) " +
-      f"umStores=$walkStores dcHits(ld=$dcLoadHits st=$dcStoreHits) " +
+      f"umStores=$walkStores drain(rdPend=$iDrainReadPendCycles needRd=$iDrainNeedReadCycles ackWait=$iDrainAckWaitCycles) dcHits(ld=$dcLoadHits st=$dcStoreHits) " +
       f"dcLoadCmds=$dcLoadCmds axi(dAr=$dAxiAr dAw=$dAxiAw iAr=$iAxiAr) " +
       f"descFaults(I=$itlbDescFaults D=$dtlbDescFaults) xlateFaults=$dtlbXlateFaults " +
       f"blocks=${touchedBlocks.size} holes=${holeBlocks.size}/${holeRegions.size}" +

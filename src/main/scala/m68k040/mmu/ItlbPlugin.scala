@@ -421,6 +421,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val UmSetMask     = B"8'h08"                 // U = bit 3 (the I-side never sets M)
     val drainNeedRead = RegInit(False)
     val drainReadPend = RegInit(False)
+    // sim-only visibility: the U/M drain wedge (2026-09-10) is a HANG with nothing
+    // in flight, so the only way to tell "walker held off by the drain" apart from
+    // "walker never asked" is to see this state directly. simPublic does not affect
+    // the synthesised netlist.
+    drainNeedRead.simPublic(); drainReadPend.simPublic()
+    drainArmed.simPublic();    drainAckWait.simPublic()
     val drainSetBits  = Reg(Bits(8 bits))
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))

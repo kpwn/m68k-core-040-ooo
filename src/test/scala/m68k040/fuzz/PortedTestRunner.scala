@@ -412,6 +412,12 @@ object PortedTestRunner {
                 pa < walkMap.rootBase + MmuWalkPosture.RootTableBytes) probe.dtlbWalkStarts += 1
             onWalkRead(1, pa)
           }
+          // U/M drain wedge diagnosis (2026-09-10): the hang has NOTHING in flight,
+          // so record the drain state machine directly -- it is the only way to tell
+          // "walker held off by the drain" from "walker never asked".
+          if (dut.itlb.logic.drainReadPend.toBoolean) probe.iDrainReadPendCycles += 1
+          if (dut.itlb.logic.drainNeedRead.toBoolean) probe.iDrainNeedReadCycles += 1
+          if (dut.itlb.logic.drainAckWait.toBoolean) probe.iDrainAckWaitCycles += 1
           if (dut.itlb.walkStore.valid.toBoolean && dut.itlb.walkStore.ready.toBoolean) probe.walkStores += 1
           if (dut.dtlb.walkStore.valid.toBoolean && dut.dtlb.walkStore.ready.toBoolean) probe.walkStores += 1
           if (dut.itlb.walkLoadRsp.valid.toBoolean && dut.itlb.walkLoadRsp.payload.fault.toBoolean)
