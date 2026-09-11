@@ -774,9 +774,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // own `isFpGeneric` bit test (`opword[11:9]===001 && opword[8:6]===000`) plus the EA-mode
     // restriction to mode 010 `(An)` / 101 `(d16,An)` (this task's scope only).
     val s0FpGenEaMode = s0opw(5 downto 3)
+    // Mode 111 reg {0,1,2} — (xxx).W, (xxx).L and (d16,PC) — are admitted alongside the four
+    // An-based modes. None of them has a base REGISTER, so they ride `baseValid=False` with
+    // the whole address folded into the displacement, exactly as the bit-field abs/PC-rel
+    // paths do (the LS EU forces an invalid base's contribution to zero). (d16,PC) is
+    // LOAD-only: a store to PC-relative space is not a legal 68k EA, and is rejected below.
+    val s0FpGenEaReg  = s0opw(2 downto 0)
+    val s0FpEaIsAbsPc = (s0FpGenEaMode === B"3'b111") &&
+                        ((s0FpGenEaReg === B"3'b000") || (s0FpGenEaReg === B"3'b001") ||
+                         (s0FpGenEaReg === B"3'b010"))
     val s0IsFpGenMemEa = (s0opw(15 downto 9) === B"7'b1111001") && (s0opw(8 downto 6) === B"3'b000") &&
                          ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101") ||
-                          (s0FpGenEaMode === B"3'b011") || (s0FpGenEaMode === B"3'b100"))
+                          (s0FpGenEaMode === B"3'b011") || (s0FpGenEaMode === B"3'b100") ||
+                          (s0FpGenEaMode === B"3'b110") || s0FpEaIsAbsPc)
     // The real ext word (`words(1)`, right after the opword — mirrors `movemEntryPkt`'s own
     // `eMask = words(1)` layout, and `ucFpExt`'s identical positioning): opclass[15:13] (110
     // load / 111 store — store is task #242, so only 110 is admitted here), bit[11] = static
@@ -788,7 +798,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0FpIsStatic = !s0FpExt1(11)
     // THIS task's scope is load-direction only (opclass 110); store (111) stays on the
     // pre-existing µcode-engine trap path until task #242 lands.
-    val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && s0FpIsStatic &&
+    val s0FpPcRelStore = (s0FpGenEaMode === B"3'b111") && (s0FpGenEaReg === B"3'b010") &&
+                         (s0FpOpClass === B"3'b111")          // store to (d16,PC): illegal EA
+    val slot0IsFmovemx = fed.valid && s0IsFpGenMemEa && s0FpIsStatic && !s0FpPcRelStore &&
                          ((s0FpOpClass === B"3'b110") || (s0FpOpClass === B"3'b111"))
     // ── SLOT 1 (2026-09-10) ─────────────────────────────────────────────────────
     // The same classifier on slot1. Task #241 deliberately omitted this and said so:
@@ -809,10 +821,23 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s1fxOpw        = fed.payload.packets(1).words(0)
     val s1fxExt1       = fed.payload.packets(1).words(1)
     val s1fxEaMode     = s1fxOpw(5 downto 3)
+    // MUST track slot0's `s0IsFpGenMemEa` exactly, including the abs / (d16,PC) / indexed
+    // modes. Whether an FMOVEM.X lands in slot0 or slot1 is pure ALIGNMENT, so any mode
+    // admitted on one side and not the other makes the identical instruction execute or
+    // take a vector-11 F-line depending only on what precedes it -- which is precisely the
+    // hazard this slot1 block was added to close, re-introduced by widening slot0 alone.
+    val s1fxEaReg      = s1fxOpw(2 downto 0)
+    val s1fxEaIsAbsPc  = (s1fxEaMode === B"3'b111") &&
+                         ((s1fxEaReg === B"3'b000") || (s1fxEaReg === B"3'b001") ||
+                          (s1fxEaReg === B"3'b010"))
     val s1IsFpGenMemEa = (s1fxOpw(15 downto 9) === B"7'b1111001") && (s1fxOpw(8 downto 6) === B"3'b000") &&
                          ((s1fxEaMode === B"3'b010") || (s1fxEaMode === B"3'b101") ||
-                          (s1fxEaMode === B"3'b011") || (s1fxEaMode === B"3'b100"))
+                          (s1fxEaMode === B"3'b011") || (s1fxEaMode === B"3'b100") ||
+                          (s1fxEaMode === B"3'b110") || s1fxEaIsAbsPc)
+    val s1fxPcRelStore = (s1fxEaMode === B"3'b111") && (s1fxEaReg === B"3'b010") &&
+                         (s1fxExt1(15 downto 13) === B"3'b111")     // store to (d16,PC): illegal
     val slot1IsFmovemx = fed.valid && fed.payload.slot1Valid && s1IsFpGenMemEa && !s1fxExt1(11) &&
+                         !s1fxPcRelStore &&
                          ((s1fxExt1(15 downto 13) === B"3'b110") || (s1fxExt1(15 downto 13) === B"3'b111"))
     // Control-transfer / address-generate full-format mem-indirect (task #201): see the
     // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
@@ -1187,7 +1212,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // integer register files are disjoint, so an FPn can never alias the An base, per the
     // design doc §3's explicit note).
     val fmovemxMask     = Reg(Bits(8 bits))
+    val fmovemxFromTop  = Reg(Bool())        // -(An): drain the register mask highest-bit-first
     val fmovemxRevMap   = Reg(Bool())          // ext1[12]: True=control/postinc (bit n -> FP(7-n)); False=predecrement-list (bit n -> FPn identity) -- design doc §2
+    val fmovemxIdxReg   = Reg(UInt(5 bits))   // (d8,An,Xn): the scaled index register
+    val fmovemxIdxValid = Reg(Bool())
+    val fmovemxIdxLong  = Reg(Bool())
+    val fmovemxIdxScale = Reg(UInt(2 bits))
+    val fmovemxBaseValid = Reg(Bool())        // False for (xxx).W/.L and (d16,PC): no base An
     val fmovemxBaseReg  = Reg(UInt(5 bits))    // always a real An in this task's scope (both admitted EA modes have one)
     val fmovemxBaseDisp = Reg(Bits(32 bits))   // 0 for (An); sign-extended d16 for (d16,An)
     val fmovemxOff      = Reg(SInt(32 bits))   // running byte offset for the CURRENT element (12 bytes/elt Extended, always ascending -- neither admitted EA mode auto-updates)
@@ -1223,9 +1254,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // below when advancing. (Extracting `fmovemxMask` only ONCE and reusing that same bit
     // as "next" is a bug -- it re-derives the CURRENT element's own bit, not the next one;
     // this is why the second extraction below is not redundant.)
-    val (fmovemxCurBit, fmovemxMaskAfterCur) = RegListWalk.extractLowest1(fmovemxMask)
+    // Consumed from the TOP for `-(An)`: the address walk is ascending from An-12N, so the
+    // mask must be drained highest-bit-first or the block lands reversed (0xDEAD1105 in
+    // fpu_fmovem_x_roundtrip). `fmovemxFromTop` is latched at begin from `fxIsPredec` --
+    // the live `fxIsPredec` belongs to the ENTRY packet and is not valid mid-walk.
+    val (fmovemxCurBit, fmovemxMaskAfterCur) = RegListWalk.extract1(fmovemxMask, fmovemxFromTop)
     val fmovemxIsLastElem = fmovemxMaskAfterCur === 0
-    val (fmovemxNextBit, _) = RegListWalk.extractLowest1(fmovemxMaskAfterCur)
+    val (fmovemxNextBit, _) = RegListWalk.extract1(fmovemxMaskAfterCur, fmovemxFromTop)
     val fmovemxElemAddr   = (fmovemxBaseDisp.asSInt + fmovemxOff).asBits
     def fmovemxChunkDisp(i: Int): Bits = (fmovemxElemAddr.asSInt + S(i * 4, 32 bits)).asBits
 
@@ -1258,8 +1293,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // whole macro" rule.
     val fmovemxFirstUop = (fmovemxEmitted === 0) && (fmovemxPhase === U(0, 3 bits))
     val fmovemxLoadUop  = MicroOpAssembler.fmovemxLoadChunkUop(
-      base = fmovemxBaseReg, baseValid = True, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
-      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
+      base = fmovemxBaseReg, baseValid = fmovemxBaseValid, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
+      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc,
+      idxReg = fmovemxIdxReg, idxValid = fmovemxIdxValid, idxLong = fmovemxIdxLong, idxScale = fmovemxIdxScale)
     val fmovemxIssueKept = fmovemxIsLastElem && !fmovemxHasFinal
     val fmovemxIssueUopV = MicroOpAssembler.fmovemxIssueUop(
       fpDst = fmovemxCurReg, drop = !fmovemxIssueKept, first = False, last = fmovemxIssueKept, valid = True,
@@ -1277,9 +1313,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       fpSrc = fmovemxCurReg, chunk = fmovemxCvtChunk, dstTemp = fmovemxLoadTemp,
       first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
     val fmovemxStUopV = MicroOpAssembler.fmovemxStoreChunkUop(
-      base = fmovemxBaseReg, baseValid = True, disp = fmovemxStDisp, srcTemp = fmovemxStTemp,
+      base = fmovemxBaseReg, baseValid = fmovemxBaseValid, disp = fmovemxStDisp, srcTemp = fmovemxStTemp,
       drop = !fmovemxStIsLastUop, last = fmovemxStIsLastUop, first = False, valid = True,
-      pc = fmovemxPc, nextPc = fmovemxNextPc)
+      pc = fmovemxPc, nextPc = fmovemxNextPc,
+      idxReg = fmovemxIdxReg, idxValid = fmovemxIdxValid, idxLong = fmovemxIdxLong, idxScale = fmovemxIdxScale)
     val fmovemxElemUop = Mux(fmovemxIsStore,
       Mux(fmovemxPhase >= U(3, 3 bits), fmovemxStUopV, fmovemxCvtUopV),
       Mux(fmovemxPhase === U(3, 3 bits), fmovemxIssueUopV, fmovemxLoadUop))
@@ -1297,6 +1334,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fxReg       = fxOpw(2 downto 0)
     val fxAnReg     = (U(8, 5 bits) + fxReg.asUInt).resized
     val fxDisp16    = fxEntryPkt.words(2).asSInt.resize(32).asBits
+    // Brief-format (d8,An,Xn), mode 110. The extension word is words(2):
+    //   [15] D/A, [14:12] Xn, [11] W/L, [10:9] scale, [8] must be 0 (brief), [7:0] d8.
+    // Bit 8 set means FULL format (memory-indirect etc.) which stays out of scope and
+    // falls through to the pre-existing F-line trap.
+    val fxIdxExt    = fxEntryPkt.words(2)
+    val fxIsIdxAn   = (fxMode === B"3'b110") && !fxIdxExt(8)
+    val fxIdxReg    = (fxIdxExt(15) ## fxIdxExt(14 downto 12)).asUInt.resize(5)
+    val fxIdxLong   = fxIdxExt(11)
+    val fxIdxScale  = fxIdxExt(10 downto 9).asUInt
+    val fxIdxDisp   = fxIdxExt(7 downto 0).asSInt.resize(32).asBits
+    val fxIsAbsW    = (fxMode === B"3'b111") && (fxReg === B"3'b000")
+    val fxIsAbsL    = (fxMode === B"3'b111") && (fxReg === B"3'b001")
+    val fxIsPcDi    = (fxMode === B"3'b111") && (fxReg === B"3'b010")
+    val fxNoBase    = fxIsAbsW || fxIsAbsL || fxIsPcDi
     val fxIsDispAn  = fxMode === B"3'b101"          // (d16,An); else mode 010 (An), disp=0
     val fxIsPredec  = fxMode === B"3'b100"          // -(An)
     val fxIsPostinc = fxMode === B"3'b011"          // (An)+
@@ -1309,13 +1360,27 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fxAutoDelta = fxAutoBytes.resize(32).asSInt
     // -(An): the frame occupies [An-12N, An), so the running ascending walk starts at
     // An-12N. (An)+ and (An) both start at An itself; (d16,An) adds its displacement.
+    // The base-less modes fold their whole address here. (d16,PC) is relative to the
+    // extension word's own address = pc+2 (one opword ahead), matching every other PC-rel
+    // EA in this decoder.
+    val fxAbsLVal   = (fxEntryPkt.words(2) ## fxEntryPkt.words(3))
+    // (d16,PC) is relative to the address of the DISPLACEMENT word, which for FMOVEM.X is
+    // the THIRD word: opword at pc, the FP extension word at pc+2, the d16 at pc+4. (Not
+    // pc+2 — that is the FP ext word, and using it lands every access 2 bytes low. The
+    // corpus pins this: fpu_fmovem_x_idx_pcdi_data encodes its displacement as
+    // `_pcdata - (_pcref + 4)`.)
+    val fxPcDiVal   = ((fxEntryPkt.pc + U(4, 32 bits)).asSInt + fxDisp16.asSInt).asBits
     val fxBaseDisp  = Mux(fxIsPredec, (S(0, 32 bits) - fxAutoDelta).resize(32).asBits,
-                      Mux(fxIsDispAn, fxDisp16, B(0, 32 bits)))
+                      Mux(fxIsAbsL, fxAbsLVal,
+                      Mux(fxIsAbsW, fxDisp16,
+                      Mux(fxIsPcDi, fxPcDiVal,
+                      Mux(fxIsIdxAn, fxIdxDisp,
+                      Mux(fxIsDispAn, fxDisp16, B(0, 32 bits)))))))
     val fxPc        = fxEntryPkt.pc
     val fxNextPc    = (fxPc + (fxEntryPkt.lenWords << 1)).resize(32)
     val fxIsStore   = fxExt1(15 downto 13) === B"3'b111"   // 110 = load, 111 = store
     val fxMaskEmpty = fxMaskIn === 0
-    val (fxBit0, _) = RegListWalk.extractLowest1(fxMaskIn)
+    val (fxBit0, _) = RegListWalk.extract1(fxMaskIn, fxIsPredec)
 
     val fmovemxBegin = !fmovemxActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
                        !movepActive && !movepPendValid &&
@@ -2926,7 +2991,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       fmovemxAnPhase  := False
       fmovemxMask     := fxMaskIn
       fmovemxRevMap   := fxRevIn
+      fmovemxFromTop  := fxIsPredec
       fmovemxBaseReg  := fxAnReg
+      fmovemxBaseValid := !fxNoBase
+      fmovemxIdxReg    := fxIdxReg
+      fmovemxIdxValid  := fxIsIdxAn
+      fmovemxIdxLong   := fxIdxLong
+      fmovemxIdxScale  := fxIdxScale
       fmovemxBaseDisp := fxBaseDisp
       fmovemxOff      := S(0, 32 bits)
       fmovemxEmitted  := 0

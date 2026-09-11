@@ -58,6 +58,26 @@ object RegListWalk {
     (bit0, mask1)
   }
 
+  /** Same primitive from the OTHER end: the HIGHEST set bit, and the mask with it cleared.
+    *
+    * FMOVEM.X `-(An)` needs this. Its frame occupies [An-12N, An) and the element walk runs
+    * ASCENDING from An-12N, so to place the list's LAST register at the lowest address (and
+    * therefore the first-transferred register adjacent to An, as the predecrement form
+    * requires) the mask must be consumed from the top down. Consuming it lowest-first with
+    * an ascending address walk lays the block down exactly reversed. */
+  def extractHighest1(mask: Bits): (UInt, Bits) = {
+    val hi   = OHMasking.last(mask)
+    val bitN = OHToUInt(hi)
+    (bitN, (mask.asUInt & ~hi.asUInt).asBits)
+  }
+
+  /** Direction-selected extraction: `fromTop` picks `extractHighest1`, else `extractLowest1`. */
+  def extract1(mask: Bits, fromTop: Bool): (UInt, Bits) = {
+    val (loBit, loRest) = extractLowest1(mask)
+    val (hiBit, hiRest) = extractHighest1(mask)
+    (Mux(fromTop, hiBit, loBit), Mux(fromTop, hiRest, loRest))
+  }
+
   /** Bit-position -> register-number mapping: `reverse` selects the caller's REVERSE
     * formula, else the caller's FORWARD formula. Deliberately takes both maps as FUNCTIONS
     * (not a fixed `width - 1 - bit` formula) -- int MOVEM's reverse map is `15 - bit`

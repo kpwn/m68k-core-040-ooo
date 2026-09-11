@@ -75,6 +75,7 @@ object MicroOpAssembler {
     // NOT auto-update per element, unlike the running `disp`); idxValid=False for every
     // non-indexed MOVEM EA (the AGU zeroes the index contribution when srcCValid=False).
     u.srcCReg     := idxReg; u.srcCValid := idxValid
+    u.indexLong   := idxLong; u.indexScale := idxScale
     // LOAD writes the register; STORE writes no int reg (no eaAuto fold here).
     u.dstReg      := reg; u.dstValid := isLoad
     u.useImm      := True; u.imm := disp
@@ -115,7 +116,6 @@ object MicroOpAssembler {
     // Reuse isMovea as the ".W load -> sign-extend the full 32-bit reg" marker (LOAD only).
     u.isMovea     := isLoad && !sizeLong
     u.isScc       := False; u.isDbcc := False
-    u.indexLong   := idxLong; u.indexScale := idxScale
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
@@ -266,7 +266,8 @@ object MicroOpAssembler {
     * loaded VALUE still reaches the scratch temp's real PRF slot via the ordinary rename/
     * wakeup path, so the following issue-row's srcA/srcB/srcC reads see it correctly. */
   def fmovemxLoadChunkUop(base: UInt, baseValid: Bool, disp: Bits, dstTemp: UInt,
-                           first: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+                           first: Bool, valid: Bool, pc: UInt, nextPc: UInt,
+                           idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
@@ -279,7 +280,10 @@ object MicroOpAssembler {
     u.memOp       := MemOp.LOAD
     u.srcAReg     := base; u.srcAValid := baseValid
     u.srcBReg     := 0;    u.srcBValid := False
-    u.srcCReg     := 0;    u.srcCValid := False    // no index -- this task's EA scope has none
+    // Indexed (d8,An,Xn) rides the ordinary AGU index path: the LS EU already computes
+    // base + disp + ((Xn sized) << scale). Non-indexed callers pass idxValid=False.
+    u.srcCReg     := idxReg; u.srcCValid := idxValid
+    u.indexLong   := idxLong; u.indexScale := idxScale
     u.dstReg      := dstTemp; u.dstValid := True
     u.useImm      := True; u.imm := disp
     u.readsNzvc   := False; u.readsX := False
@@ -298,7 +302,6 @@ object MicroOpAssembler {
     u.shiftOp     := 0; u.shiftDir := False; u.bcdSub := False; u.bitOp := 0; u.bfOp := 0; u.bfDynamic := False; u.bfMem := False; u.bfStoreForm := 0; u.extByte := False
     u.isMovea     := False
     u.isScc       := False; u.isDbcc := False
-    u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
     u.predTaken := False; u.predTarget := U(0, 32 bits)
@@ -401,7 +404,8 @@ object MicroOpAssembler {
     * (a store direction has no trailing FP issue row to carry it). */
   def fmovemxStoreChunkUop(base: UInt, baseValid: Bool, disp: Bits, srcTemp: UInt,
                             drop: Bool, last: Bool, first: Bool, valid: Bool,
-                            pc: UInt, nextPc: UInt): DecodedUop = {
+                            pc: UInt, nextPc: UInt,
+                           idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
@@ -414,7 +418,8 @@ object MicroOpAssembler {
     u.memOp       := MemOp.STORE
     u.srcAReg     := base;    u.srcAValid := baseValid
     u.srcBReg     := srcTemp; u.srcBValid := True     // the value written
-    u.srcCReg     := 0;       u.srcCValid := False
+    u.srcCReg     := idxReg; u.srcCValid := idxValid
+    u.indexLong   := idxLong; u.indexScale := idxScale
     u.dstReg      := 0;       u.dstValid  := False
     u.useImm      := True; u.imm := disp
     u.readsNzvc   := False; u.readsX := False
@@ -435,7 +440,6 @@ object MicroOpAssembler {
     u.extByte := False; u.altAddrSpace := False
     u.isMovea     := False
     u.isScc       := False; u.isDbcc := False
-    u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
