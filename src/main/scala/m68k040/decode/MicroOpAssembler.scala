@@ -822,12 +822,22 @@ object MicroOpAssembler {
   // own 2 ext words land where EaDecoder's abs.L case expects them: words(1)##words(2)
   // of the shifted view = pkt.words(2)##pkt.words(3)). EaDecoder.scala's shared table
   // is untouched — mode7/reg7 stays ILLEGAL for every other opcode in the ISA.
+  //
+  // GENERALISED for FScc (task: FP conditional set): EVERY `1111 001 001 mmmrrr` carries a
+  // condition extension word at words(1), so the <ea>'s OWN extension words start at
+  // words(2) -- one later than a line-5 Scc, whose extensions follow the opword directly.
+  // The same shifted view the FSF literal already needed is therefore correct for the whole
+  // FScc family; only the reserved-EA SUBSTITUTION stays specific to 0xF27F. (isFsfAbsL
+  // implies isFScc, so the substitution Mux is checked first and both shift.)
   private def srcEaFor(pkt: DecodePacket, size: Size.C): EaSpec = {
     val isFsfAbsL = pkt.words(0) === B"16'hF27F"
+    val isFScc    = (pkt.words(0)(15 downto 12) === B"4'hF") &&
+                    (pkt.words(0)(11 downto 9)  === B"3'b001") &&
+                    (pkt.words(0)(8 downto 6)   === B"3'b001")
     EaDecoder.decode(
       Mux(isFsfAbsL, B"6'b111001", pkt.words(0)(5 downto 0)),
       size,
-      Mux(isFsfAbsL, shiftedWordsFor(pkt.words, U(1, 3 bits)), pkt.words))
+      Mux(isFsfAbsL || isFScc, shiftedWordsFor(pkt.words, U(1, 3 bits)), pkt.words))
   }
 
   /** Shared body of `computeOffload` / `computeOffloadFromWords`: identical in every
@@ -1629,6 +1639,18 @@ object MicroOpAssembler {
     stUop.firstOfInstr  := !crackMemMem && !immToMemCase
     stUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
+    // FScc <ea> (`1111 001 001 mmmrrr` + a condition extension word) -- hoisted here
+    // because `rmwStUop.size` below needs it. Same EA scope as the integer `isSccOp`
+    // (mode 1 = FDBcc, mode 7 reg>=2 = FTRAPcc, both still F-line traps); 0xF27F is
+    // excluded because its reserved mode7/reg7 field keeps its own abs.L carve-out.
+    val fsccMode5  = pkt.words(0)(5 downto 3).asUInt
+    val fsccReg5   = pkt.words(0)(2 downto 0).asUInt
+    val isFSccOp   = (pkt.words(0)(15 downto 12) === B"4'hF") &&
+                     (pkt.words(0)(11 downto 9)  === B"3'b001") &&
+                     (pkt.words(0)(8 downto 6)   === B"3'b001") &&
+                     (fsccMode5 =/= 1) && !((fsccMode5 === 7) && (fsccReg5 >= 2)) &&
+                     (pkt.words(0) =/= B"16'hF27F")
+
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
     // side effect, so base+disp recompute identically). data = T1 (the op result). NO
@@ -1641,7 +1663,14 @@ object MicroOpAssembler {
     rmwStUop.nextPc        := nextPc
     rmwStUop.op            := DecOp.MOVE
     rmwStUop.cluster       := Cluster.LS
-    rmwStUop.size          := Mux(isBitOp, Size.BYTE, spec.size)   // bit-op store is byte
+    // `isFSccOp`: an FScc memory destination is a BYTE write, but unlike the line-5 Scc it
+    // gets no size fix-up from OperationDecoder -- that fix-up (task #160) keys on the
+    // line-5 opword, and an F-line opword leaves `spec.size` as whatever the F-line decode
+    // produced. Without this the trailing store goes out LONG: T1 is 0x000000FF (the branch
+    // EU merges the condition byte into an all-zero `oldDn`, since the mem form sets
+    // srcAValid=False), so a long store puts the 0x00 MSB at the destination address and the
+    // byte reads back 0 for a TRUE condition. It would also step An by 4 on (An)+/-(An).
+    rmwStUop.size          := Mux(isBitOp || isFSccOp, Size.BYTE, spec.size)   // bit-op/FScc store is byte
     rmwStUop.memOp         := MemOp.STORE
     rmwStUop.srcAReg       := srcEa.base; rmwStUop.srcAValid := srcEaBaseValidEff
     rmwStUop.srcBReg       := U(T1, 5 bits); rmwStUop.srcBValid := True       // store data = T1
@@ -1844,6 +1873,18 @@ object MicroOpAssembler {
     // the `when(isSccOp)` crack below actually branches on (DATAREG vs MEMSIMPLE).
     val isSccOp    = isLine5 && (ss5 === 3) && (mode5 =/= 1) &&
                      !((mode5 === 7) && (rrr5raw >= 2))
+    // FScc <ea>: `1111 001 001 mmmrrr` + a condition extension word.  Same EA scope as the
+    // integer isSccOp above (mode 1 = FDBcc, mode 7 reg>=2 = FTRAPcc -- both still F-line
+    // traps), and deliberately the same shape, because an FScc IS an Scc whose predicate
+    // reads FPCC instead of the integer CCR.  The condition lives in the EXTENSION word,
+    // which is why this cannot be decoded in OperationDecoder (it sees only the opword) --
+    // the same reason FBcc's `readsFpcc` is set here rather than there.
+    // 0xF27F is EXCLUDED: its <ea> field is the reserved mode7/reg7 encoding and it keeps
+    // its own dedicated abs.L carve-out (see srcEaFor).
+    // (`isFSccOp` is hoisted above rmwStUop — it feeds that store's SIZE.)
+    // cc[3:0] only -- 0x10..0x1F are the truth-identical signaling spellings; see the FP
+    // predicate note in BranchEuPlugin.
+    val fsccCond   = pkt.words(1)(3 downto 0)
     // TRAPcc: line-5 ss==11, mode==7 (reg field is the ttt operand form), ttt ∈ {2,3,4}.
     //   ttt=4 (reg=4): no operand (1 word). ttt=2 (reg=2): #data16 (2 words).
     //   ttt=3 (reg=3): #data32 (3 words). Other ttt -> illegal (stays sccMemBad).
@@ -2175,7 +2216,7 @@ object MicroOpAssembler {
     // mantissa. This IS the internal Fp80 layout (Decision 1) -- zero conversion needed.
     val fpImmExtVal    = pkt.words(2) ## pkt.words(4) ## pkt.words(5) ## pkt.words(6) ## pkt.words(7)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
+              !isRtsBad && !isRtrBad && !isSccOp && !isFSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
@@ -2840,15 +2881,20 @@ object MicroOpAssembler {
     // encoding via its mode7-reg>=2 gate, so this is a defensive re-check, not load-
     // bearing). sccIsMem selects the 2-µop [compute cond -> T1][store T1 -> EA] crack
     // (below, at the final uops-array assembly) instead of the 1-µop Dn form.
-    val sccIsMem = isSccOp && srcIsMem && !srcEa.pcRel
-    when(isSccOp) {
+    val sccIsMem = (isSccOp || isFSccOp) && srcIsMem && !srcEa.pcRel
+    when(isSccOp || isFSccOp) {
       opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives the write
       opUop.cluster       := Cluster.INT
       opUop.memOp         := MemOp.NONE
       opUop.isBranch      := True             // branch EU (condition mux)
       opUop.isScc         := True
-      opUop.cond          := cccc5
-      opUop.readsNzvc     := True             // read NZVC for the condition
+      // The ONLY differences between Scc and FScc: where the condition comes from (the
+      // opword's cccc field vs the FP extension word's cc[3:0]) and which condition-code
+      // register the branch EU reads. `readsFpcc` is what selects the FP predicate table
+      // there, exactly as for FBcc; the byte-write machinery below is shared unchanged.
+      opUop.cond          := Mux(isFSccOp, fsccCond, cccc5)
+      opUop.readsNzvc     := !isFSccOp        // integer Scc reads NZVC...
+      opUop.readsFpcc     := isFSccOp         // ...an FScc reads FPCC instead
       opUop.useImm        := False
       opUop.writesNzvc    := False; opUop.writesX := False
       opUop.branchDisp    := 0

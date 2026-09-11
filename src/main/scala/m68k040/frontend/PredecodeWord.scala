@@ -1136,6 +1136,23 @@ object PredecodeWord {
         // ESTABLISHED INVARIANT (Task 6 depends on it): a cpGEN instruction is never
         // genuinely 1 word, so lenWords===1 on a cpGEN opword means "not framed".
         val fpIsGen   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
+        // FScc framing: cpID 001 + type 001, `1111 001 001 mmmrrr` + a condition extension
+        // word + the <ea>'s OWN extension words.  Scoped exactly like the integer `isSccOp`
+        // gate in MicroOpAssembler: mode 1 (An direct) is FDBcc and mode 7 with reg>=2 is
+        // FTRAPcc, both of which have DIFFERENT lengths (FDBcc adds a disp16; FTRAPcc adds
+        // 0/1/2 immediate words) and are still F-line traps -- excluding them here leaves
+        // their existing 1-word framing and trap PC untouched.
+        // `extW2` (the word AFTER the condition word) is the EA's first extension word,
+        // exactly as the cpGEN arm above passes it -- an FScc's <ea> extensions are shifted
+        // one word later than a line-5 Scc's because the condition word comes first.
+        val fsccMode  = op(5 downto 3).asUInt
+        val fsccReg   = op(2 downto 0).asUInt
+        val fsccIsEa  = (fsccMode =/= 1) && !((fsccMode === 7) && (fsccReg >= 2))
+        val fpScc     = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b001") &&
+                        fsccIsEa
+        val (fsccEaOk, fsccEaExt, fsccEaAmb) =
+          eaExt(fsccMode, fsccReg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
+
         // FBcc framing: cpID 001 + type 01x (010=FBcc.W, 011=FBcc.L).  Now that the whole
         // family executes -- FBF/FNOP as a no-op, every other condition as a real
         // PC-relative branch off FPCC -- ALL of them must be framed, not just cc==0.
@@ -1236,6 +1253,10 @@ object PredecodeWord {
           r.simple        := True
           r.lenWords      := (U(2, 4 bits) + fpEaExt).resized   // opword + FP ext + EA ext
           r.ambiguousLine := fpEaAmb
+        } .elsewhen(fpScc && fsccEaOk) {
+          r.simple        := True
+          r.lenWords      := (U(2, 4 bits) + fsccEaExt).resized  // opword + cond ext + EA ext
+          r.ambiguousLine := fsccEaAmb
         } .elsewhen(fpBcc) {
           // `1111 001 01x cccccc`: 2 words for FBcc.W (type 010, opword + disp16), 3 for
           // FBcc.L (type 011, opword + disp32).  The generic F-line fallback below frames
