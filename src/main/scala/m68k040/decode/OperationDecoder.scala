@@ -1225,6 +1225,44 @@ object OperationDecoder {
           o.readsNzvc := False; o.writesNzvc := False   // FP ops touch FPCC, never the integer CCR
           o.readsX    := False; o.writesX    := False
         }
+        // ── FBF / FNOP: the "branch never" FP conditional branch ─────────────────
+        // `1111 001 01x cccccc` is FBcc.W (type 010) / FBcc.L (type 011).  The whole
+        // FBcc/FScc/FDBcc/FTRAPcc family is otherwise still an F-line vec-11 trap here
+        // (see the F27F FSF carve-out's closing note), because evaluating a real FP
+        // condition needs FPCC routed into the branch EU -- FPCC is renamed and
+        // scoreboarded already (pFpccSrc/sbFpcc/cplxFpccWakeupPort) but only the CPLX
+        // cluster reads it, and branches issue elsewhere.
+        //
+        // Condition 0 is the exception, and it is worth having on its own: cc=000000 is
+        // "F" (false), which NEVER branches, so it needs no FPCC, no target, and no
+        // branch resolution -- it is a pure no-op that merely has to consume its
+        // displacement.  That encoding is FNOP: `FBF.W #0` == F280 0000, the canonical
+        // 68k FPU synchronization idiom, which appears as an exact aligned 4-byte
+        // sequence 40 times in the Q700 boot ROM.  Trapping it is a real 1:1 divergence
+        // from a 68040, which executes it silently.
+        //
+        // Decoded exactly like NOP (0x4E71) above: a no-operand, no-dst, no-flags MOVE,
+        // so the commit is a pure PC step.  srcA/srcB are explicitly cleared -- the
+        // opword's low 6 bits are the CONDITION field, not an <ea>, and an unnamed
+        // operand slot would otherwise resolve to a live register (EaDecoder gives every
+        // EA a nominal base; see AluEuPlugin's `src1` note).
+        //
+        // The LENGTH half of this lives in PredecodeWord.scala: FBcc's fallback framing
+        // is lenWords=1, which is right only while the opword traps on its own.  Once it
+        // executes, the displacement MUST be skipped or it is fetched as an instruction.
+        // Both halves are scoped to cc==0 so every still-trapping condition keeps its
+        // present framing and trap PC, exactly as before.
+        val isFpBcc   = (opword(11 downto 9) === B"3'b001") &&
+                        (opword(8 downto 7) === B"2'b01")        // type 010 (.W) or 011 (.L)
+        val isFpBccF  = isFpBcc && (opword(5 downto 0) === B"6'b000000")
+        when(isFpBccF) {
+          o.illegal := False
+          o.op      := DecOp.MOVE
+          o.size    := Size.LONG
+          o.srcA.setNone(); o.srcB.setNone(); o.dst.setNone(); o.dstWrites := False
+          o.readsNzvc := False; o.writesNzvc := False
+          o.readsX    := False; o.writesX    := False
+        }
         // ── Task 6b: F-line FP-generic MEMORY-mode <ea> -> the µcode ROM ────────
         // `F<op> <mem>,FPn` (opclass 010, this task), `FMOVE FPn,<mem>` (011, store,
         // NOT this task), `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` (100/101, Task 9's territory),
