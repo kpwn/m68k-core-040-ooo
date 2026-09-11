@@ -38,6 +38,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     "FTQ depth must be a positive power of two")
 
   val logic = during build new Area {
+    // Driven by the top level from the CPUSH/CINV I-cache invalidate pulse (the same
+    // `icMaintPulse` that feeds IcachePlugin.maintInvalidateAll and the BTB). Defaults
+    // False so a DUT that wires nothing keeps the previous behaviour.
+    val icMaintFlush = Bool(); icMaintFlush.allowOverride; icMaintFlush := False
 
     // ---- Resolve I-cache service ----
     val ic = host[FetchService]
@@ -1288,6 +1292,37 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // just-emitted packet's fall-through), clear only this FTB entry, and suppress one
     // refetch application so the same stale claim cannot livelock. Architectural redirects
     // below retain their existing higher priority.
+    // ── I-cache maintenance (CPUSH / CINV) must also flush the INSTRUCTION BUFFER ──
+    // The canonical 68040 self-modifying-code sequence is `store / CPUSHL / jump`. The
+    // store lands, the CPUSHL correctly drops the I-cache line -- and the pre-patch bytes
+    // then get executed anyway, because they were already sitting in `ibuf`, which until
+    // now was flushed ONLY by branch redirects and FTQ mismatch. Nothing connected
+    // `icMaintPulse` (the CPUSH/CINV I-cache invalidate, already wired to IcachePlugin and
+    // the BTB) to the fetch buffer, so the buffer kept serving stale instructions and no
+    // amount of re-execution cleared it -- the instruction is simply never re-fetched.
+    //
+    // Observed on hardware as legal instructions that "cannot be decoded": a `JMP xxx.L`
+    // thunk in a runtime-built dispatch table, and an FP store, both verified correct in
+    // memory and both decoding correctly in simulation. Reproduced by the 7 ifstage_smc_*
+    // tests, which fail 7/7 with caches ON (they run cache-OFF by default -- see the
+    // cache-sweep manifest note in PortedM68kOooSpec).
+    //
+    // Handled as a self-redirect rather than a bare flush: dropping the buffer alone would
+    // lose the fetch stream position. Re-fetching from `decodePc` is exactly what the
+    // architecture requires after cache maintenance, and it is ordered AFTER the pulse --
+    // which ExceptionUnit deliberately fires on the maintenance walk's COMPLETION -- so the
+    // refetch cannot repopulate from a line that is about to be invalidated.
+    when(icMaintFlush) {
+      val newPc       = decodePc
+      decodePc        := newPc
+      fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
+      ibuf.io.flush   := True
+      stalled         := False
+      started         := True
+      pendingDrop     := newPc(2 downto 1)
+      ringStale.foreach(_ := True)
+    }
+
     when(ftqMismatch) {
       val newPc       = ftqMismatchPc
       decodePc        := newPc

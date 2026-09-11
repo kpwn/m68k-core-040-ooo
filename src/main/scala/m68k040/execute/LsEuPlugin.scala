@@ -401,11 +401,41 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val walkStReq = Vec(Bool(), 2)
     val walkLdPayload = Vec(m68k040.cache.DLoadCmd(), 2)
     val walkStPayload = Vec(m68k040.cache.DStoreCmd(), 2)
+    // ── FMax: a REGISTERED stage on the walker LOAD request (TLB-miss path) ───────
+    // `walkLoadCmd.valid` is a live combinational function of the walker FSM — for the
+    // ITLB that is `descSplitIdx`, which post-synth reports name as the startpoint of
+    // EVERY one of the 30 worst setup paths:
+    //
+    //   ItlbPlugin walker/descSplitIdx -> (35 Itlb cells) -> (16 LsEu cells)
+    //     -> IssueQueuePlugin lines_*_ways_*_sel      29 levels, 6.486 ns, 76.7% route
+    //
+    // The walkers share this D-cache port, so the INSTRUCTION-side page-table walker's
+    // state reached the LS admission predicates (`walkerLoadAdmit` / `ldCand`) and from
+    // there the whole ready chain — `s1Ready -> issuePort.ready -> (IQ) selPorts.fire
+    // -> the per-slot triggers` — the same four-plugin spine this file already documents
+    // as a recurring worst-path family (see the `applyBacklog` cut note below).
+    //
+    // Staging the request breaks that root: the walker's combinational request now
+    // terminates at a flop, and the LS side sees a register. The handshake is unchanged
+    // (`m2sPipe` is valid/ready-correct), so the only cost is ONE CYCLE per descriptor
+    // fetch — on the TLB MISS path, which already costs a full table walk of several
+    // memory accesses. Making the rare path one cycle longer to shorten the cone that
+    // gates EVERY issue-queue selection is the intended trade.
+    //
+    // LOAD side only: the walker STORE request (the U/M writeback) is not on any
+    // reported critical path, and leaving it alone keeps the blast radius to one stream.
+    val walkLdStaged = Vec.tabulate(2) { i =>
+      walkClients(i) match {
+        case Some(c) => c.walkLoadCmd.m2sPipe()
+        case None    => { val d = Stream(m68k040.cache.DLoadCmd()); d.valid := False
+                          d.payload.assignDontCare(); d }
+      }
+    }
     for (i <- 0 until 2) {
       walkClients(i) match {
         case Some(c) =>
-          walkLdReq(i)     := c.walkLoadCmd.valid
-          walkLdPayload(i) := c.walkLoadCmd.payload
+          walkLdReq(i)     := walkLdStaged(i).valid
+          walkLdPayload(i) := walkLdStaged(i).payload
           walkStReq(i)     := c.walkStore.valid
           walkStPayload(i) := c.walkStore.payload
         case None =>
@@ -3633,7 +3663,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val tagI = if (i == walkIdxItlb) LDTAG_ITLB else LDTAG_DTLB
       val ownerI = if (i == walkIdxItlb) OWNER_ITLB else OWNER_DTLB
       walkClients(i).foreach { c =>
-        c.walkLoadCmd.ready   := dcache.loadCmd.ready && walkerLoadAdmit(i)
+        // The staged request is what the admission logic saw, so the grant goes back to
+        // the STAGE, not to the walker directly (the stage forwards the release).
+        walkLdStaged(i).ready := dcache.loadCmd.ready && walkerLoadAdmit(i)
         c.walkLoadRsp.valid   := dcache.loadRsp.valid && (ldRspTag === U(tagI, 2 bits))
         c.walkLoadRsp.payload := dcache.loadRsp.payload
         c.walkStore.ready     := dcache.store.ready && walkerStoreAdmit(i)

@@ -153,6 +153,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // for the recorded rationale. Pulses only AFTER the D-side maintenance walk
     // completes (ExceptionUnit's S_MAINTWAIT), so the BTB clear inherits that timing.
     host[IcachePlugin].logic.maintInvalidateAll := rob.logic.exc.icMaintPulse || debugMaintDonePulse
+    // The SAME pulse must also drop the fetch BUFFER, not just the I-cache array: `ibuf`
+    // sits downstream of the cache and was invalidated by nothing, so the canonical
+    // store/CPUSHL/jump SMC sequence executed pre-patch bytes straight out of it. See
+    // FetchAlignPlugin's `icMaintFlush` for the full note.
+    fa.logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
     // Two per-instruction combinational BTB lookups (the aligner's slot0/slot1 PCs);
     // the predict-taken + target return THIS cycle into FetchAlign's prediction inputs.
     btb.logic.queryPc     := fa.logic.btbQueryPc0

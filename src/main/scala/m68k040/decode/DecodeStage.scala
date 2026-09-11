@@ -2633,36 +2633,56 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       pushProduced.payload.count   := totalCount
     }
 
-    // Stage-5 registered PC-breakpoint marker. Both its PC and configuration inputs are
-    // registers, and its only destination is the existing push register below. It cannot
-    // affect admission/backpressure. Stamp all uops; the ROB honors only firstOfInstr.
-    val debugSkipConsumeNow = Bits(4 bits)
-    debugSkipConsumeNow := 0
-    for (i <- 0 until 4) {
-      val matchBits = Bits(4 bits)
-      for (slot <- 0 until 4)
-        matchBits(slot) := debugBreakEn(slot) &&
-          (pushProduced.payload.uops(i).pc === debugBreakPcs(slot))
-      val firstMatch = OHMasking.first(matchBits)
-      val matchSlot = OHToUInt(firstMatch).resize(2)
-      pushProduced.payload.uops(i).debugBreakValid.allowOverride
-      pushProduced.payload.uops(i).debugBreakSlot.allowOverride
-      pushProduced.payload.uops(i).debugBreakValid := matchBits.orR && !debugBreakSkip(matchSlot)
-      pushProduced.payload.uops(i).debugBreakSlot := matchSlot
-      when(pushProduced.fire && pushProduced.payload.uops(i).firstOfInstr &&
-           matchBits.orR && debugBreakSkip(matchSlot)) {
-        debugSkipConsumeNow(matchSlot) := True
-      }
-    }
-    _debugSkipConsumed := RegNext(debugSkipConsumeNow) init 0
 
     // P1: register the produced push. The deep `assemble` cone ends at pushReg's input;
     // the ring write in N+1 is a shallow, register-driven broadcast. Flushed by the SAME
     // pipeFlush that squashes `fed` and the queue, so a held wrong-path group is discarded.
     val pushReg = PipeStage(pushProduced, pipeFlush)
+    // Stage-5 PC-breakpoint marker — computed AFTER the push register, deliberately.
+    //
+    // FMax (measured): this block used to hang 16 32-bit PC comparators, an OR-reduce and
+    // a priority encode off `pushProduced`, i.e. off the END of the `assemble` cone. The
+    // old comment here claimed "both its PC and configuration inputs are registers", which
+    // was true of `debugBreakPcs`/`debugBreakEn` but NOT of `pushProduced.payload.uops(i).pc`
+    // — those are assembled combinationally. The post-route report on the real SoC build
+    // named the result as the design's worst `fabric_clk100` path:
+    //
+    //   _zz_DecodeStage_logic_fed_payload_specs_0_spec_size_reg
+    //     -> DecodeStage_logic_debugSkipConsumeNow_regNext_reg      23 levels, 9.134 ns
+    //
+    // i.e. DEBUG-ONLY breakpoint logic was the machine's frequency limiter. Moving the
+    // match behind `pushReg` makes the claim true: `pushReg.payload.uops(i).pc` IS a
+    // register, so the comparators now start at flops instead of extending the deepest
+    // cone in decode. The stamp still rides the SAME uop into the queue, so which
+    // instruction carries the marker is unchanged.
+    //
+    // One behavioural note: `skipConsumed` (the one-shot ack that clears DebugCtrlPlugin's
+    // `breakSkipOnce`) now fires one cycle later, together with the stamp it corresponds
+    // to. The two move as a pair, so the skip stays matched to the instruction it skipped.
+    val debugSkipConsumeNow = Bits(4 bits)
+    debugSkipConsumeNow := 0
+    val pushOut = cloneOf(queue.io.push.uops)
+    pushOut := pushReg.payload.uops
+    for (i <- 0 until 4) {
+      val matchBits = Bits(4 bits)
+      for (slot <- 0 until 4)
+        matchBits(slot) := debugBreakEn(slot) &&
+          (pushReg.payload.uops(i).pc === debugBreakPcs(slot))
+      val firstMatch = OHMasking.first(matchBits)
+      val matchSlot = OHToUInt(firstMatch).resize(2)
+      pushOut(i).debugBreakValid.allowOverride
+      pushOut(i).debugBreakSlot.allowOverride
+      pushOut(i).debugBreakValid := matchBits.orR && !debugBreakSkip(matchSlot)
+      pushOut(i).debugBreakSlot := matchSlot
+      when(pushReg.valid && pushReg.ready && pushReg.payload.uops(i).firstOfInstr &&
+           matchBits.orR && debugBreakSkip(matchSlot)) {
+        debugSkipConsumeNow(matchSlot) := True
+      }
+    }
+    _debugSkipConsumed := RegNext(debugSkipConsumeNow) init 0
     queue.io.push.valid := pushReg.valid
     queue.io.push.count := pushReg.payload.count
-    queue.io.push.uops  := pushReg.payload.uops
+    queue.io.push.uops  := pushOut
     pushReg.ready       := queue.io.push.ready
     // ── sim-only debug probes (bf3c bring-up; TEMPORARY) ──
     pushReg.valid.simPublic(); pushReg.payload.count.simPublic()
