@@ -74,6 +74,13 @@ class FpuCore extends Component {
     val dst     = in Bits (80 bits)   // FPn destination operand (SoftFloat's `a`)
     val src     = in Bits (80 bits)   // <ea>/FPm source operand (SoftFloat's `b`)
     val rmode   = in Bits (2 bits)    // FPCR[5:4] verbatim: 0=RN 1=RZ 2=RM 3=RP
+    /** The EFFECTIVE rounding precision (see `FpPrec`): FPCR[7:6], or the precision an
+      * FS<op>/FD<op> opmode forces. Resolved ABOVE this component, by
+      * `FpSource.opmodeToPrecision`, because `io.op` has already had the precision
+      * stripped out of it -- FSADD and FADD are both `FpOp.FADD` here, on purpose: the
+      * two differ in exactly one 2-bit field and nothing else, so doubling the `FpOp`
+      * enum would double every front-end's op decode for no functional gain. */
+    val precision = in Bits (2 bits)
     val cromSel = in Bits (7 bits)    // FMOVECR offset (command word bits [6:0])
     val ready   = out Bool ()         // combinational, a function of `op`
 
@@ -110,16 +117,19 @@ class FpuCore extends Component {
   addPipe.io.dst   := io.dst
   addPipe.io.src   := io.src
   addPipe.io.rmode := io.rmode
+  addPipe.io.precision := io.precision
 
   mulPipe.io.start := io.start && isMul
   mulPipe.io.dst   := io.dst
   mulPipe.io.src   := io.src
   mulPipe.io.rmode := io.rmode
+  mulPipe.io.precision := io.precision
 
   cheapPipe.io.start   := io.start && isCheap
   cheapPipe.io.op      := io.op
   cheapPipe.io.src     := io.src
   cheapPipe.io.rmode   := io.rmode
+  cheapPipe.io.precision := io.precision
   cheapPipe.io.cromSel := io.cromSel
 
   iterCore.io.start  := io.start && isIter && !iterCore.io.busy
@@ -127,6 +137,7 @@ class FpuCore extends Component {
   iterCore.io.dst    := io.dst
   iterCore.io.src    := io.src
   iterCore.io.rmode  := io.rmode
+  iterCore.io.precision := io.precision
   iterCore.io.ack    := io.iterAck
 
   // Mutually exclusive by construction (one `start` port, three equal-depth fronts).

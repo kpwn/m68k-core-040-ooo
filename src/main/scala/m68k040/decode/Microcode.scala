@@ -2908,10 +2908,10 @@ object Microcode {
       val cmdOpmode  = ctx.fpCmd(6 downto 0)
       val cmdDstFp   = ctx.fpCmd(9 downto 7).asUInt
       val cmdSrcSpec = ctx.fpCmd(12 downto 10)
-      // Mirrors MicroOpAssembler's fpDyadic/fpNoFpDst whitelists verbatim (Task 6).
-      val fpNoFpDstC = (cmdOpmode === B"7'h38") || (cmdOpmode === B"7'h3A")   // FCMP / FTST
-      val fpDyadicC  = (cmdOpmode === B"7'h20") || (cmdOpmode === B"7'h22") || (cmdOpmode === B"7'h23") ||
-                       (cmdOpmode === B"7'h28") || (cmdOpmode === B"7'h38")
+      // Shares MicroOpAssembler's fpDyadic/fpNoFpDst sets rather than re-listing them
+      // (Task 6's "mirrors verbatim" is now a literal shared table -- see FpSource).
+      val fpNoFpDstC = m68k040.execute.fpu.FpSource.isNoFpDstOpmode(cmdOpmode)  // FCMP / FTST
+      val fpDyadicC  = m68k040.execute.fpu.FpSource.isDyadicOpmode(cmdOpmode)
       u.fpuOp      := cmdOpmode
       u.fpDstReg   := cmdDstFp
       u.writesFp   := !fpNoFpDstC
@@ -3467,10 +3467,10 @@ object Microcode {
       val cmdOpmode  = ctx.fpCmd(6 downto 0)
       val cmdDstFp   = ctx.fpCmd(9 downto 7).asUInt
       val cmdSrcSpec = ctx.fpCmd(12 downto 10)
-      // Mirrors MicroOpAssembler's fpDyadic/fpNoFpDst whitelists verbatim (Task 6).
-      val fpNoFpDstC = (cmdOpmode === B"7'h38") || (cmdOpmode === B"7'h3A")   // FCMP / FTST
-      val fpDyadicC  = (cmdOpmode === B"7'h20") || (cmdOpmode === B"7'h22") || (cmdOpmode === B"7'h23") ||
-                       (cmdOpmode === B"7'h28") || (cmdOpmode === B"7'h38")
+      // Shares MicroOpAssembler's fpDyadic/fpNoFpDst sets rather than re-listing them
+      // (Task 6's "mirrors verbatim" is now a literal shared table -- see FpSource).
+      val fpNoFpDstC = m68k040.execute.fpu.FpSource.isNoFpDstOpmode(cmdOpmode)  // FCMP / FTST
+      val fpDyadicC  = m68k040.execute.fpu.FpSource.isDyadicOpmode(cmdOpmode)
       u.fpuOp      := cmdOpmode
       u.fpDstReg   := cmdDstFp
       u.writesFp   := !fpNoFpDstC

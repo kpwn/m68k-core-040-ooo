@@ -16,6 +16,74 @@ object FpOp extends SpinalEnum {
       FINT, FINTRZ, FMOVECR = newElement()
 }
 
+/** FPCR PREC (bits 7:6) as a rounding-PRECISION selector, and everything that selection
+  * changes about a rounding request.
+  *
+  * MC68040UM 9.4.1 / M68000PRM 3.5.1-3.5.2 (both quoted below) make PREC drive TWO
+  * things, not one:
+  *
+  *  (a) THE MANTISSA ROUNDING BOUNDARY. "Single-precision results are rounded to a 24-bit
+  *      boundary; double-precision results are rounded to a 53-bit boundary; and
+  *      extended-precision results are rounded to a 64-bit boundary" (PRM 3.5.2), and
+  *      "All mantissa bits beyond the selected precision are zero" (UM 9.4.1). Our 64-bit
+  *      significand carries an EXPLICIT integer bit, so a 24-bit single result keeps bits
+  *      63..40 and zeroes 39..0 -- i.e. `lsbPos` = 64 - 24 = 40. Double keeps 63..11
+  *      (64 - 53 = 11). Extended keeps everything (`lsbPos` = 0).
+  *
+  *  (b) RANGE CONTROL. "Range control is the process of rounding the mantissa of the
+  *      intermediate result to the specified precision AND CHECKING THE 16-BIT
+  *      INTERMEDIATE EXPONENT to ensure that it is within the representable range of the
+  *      selected rounding-precision format" (UM 9.4.2). Overflow is detected "when the
+  *      intermediate result's exponent is greater than or equal to the maximum exponent
+  *      value of the selected rounding precision" (UM 9.7.4) and underflow "when the
+  *      intermediate result exponent is less than or equal to the minimum exponent value
+  *      of the selected rounding precision" (UM 9.7.5).
+  *
+  * THE LIMITS, in the internal 15-bit EXTENDED bias (16383 = $3FFF), because the value
+  * that finally lands in FPn is always an extended-format word ("the exponent value is in
+  * the correct range even if it is stored in extended-precision format", UM 9.4.1):
+  *
+  *   precision  largest finite unbiased exp   biased    smallest NORMAL exp   biased
+  *   single      +127                          $407E     -126                  $3F81
+  *   double     +1023                          $43FE    -1022                  $3C01
+  *   extended  +16383                          $7FFE   -16382                  $0001
+  *
+  * so `expMax` is the largest exponent a finite result may have and `expMinNorm` is the
+  * smallest exponent a NORMALISED result may have; underflow is `exp < expMinNorm` and
+  * overflow is `exp > expMax`. For extended those are exactly the `exp <= 0` / `exp >
+  * 0x7FFE` tests SoftFloat's precision80 path uses, so the extended path is unchanged
+  * bit-for-bit -- see FpRoundPack's header.
+  *
+  * ⚠ SOFTFLOAT IS NOT AN ORACLE FOR (b). The vendored `roundAndPackFloatx80`'s
+  * roundingPrecision 32/64 arms round the MANTISSA at the reduced boundary but keep the
+  * EXTENDED exponent limits ($7FFE / `zExp <= 0`) -- that is the x87 PC-field semantic,
+  * not the 68k one. Musashi never even sets `floatx80_rounding_precision` (its
+  * `fmove_fpcr` writes only `float_rounding_mode`), so LOCK-STEP CANNOT VALIDATE ANY OF
+  * THIS, in either direction. The directed tests in FpuPrecisionSpec are the only oracle.
+  *
+  * Encoding is FPCR[7:6] verbatim: 00 Extend, 01 Single, 10 Double, 11 "Undefined"
+  * (PRM Table 3-21). 11 is treated as Extend -- the architecture defines no behaviour, and
+  * Extend is the reset value and the do-nothing choice. */
+object FpPrec {
+  val Ext = 0
+  val Sgl = 1
+  val Dbl = 2
+
+  /** Index of the RETAINED least-significant mantissa bit. Bits below it are forced to
+    * zero by rounding ("All mantissa bits beyond the selected precision are zero"). */
+  def lsbPos(p: Int): Int = p match { case Sgl => 40; case Dbl => 11; case _ => 0 }
+  /** Mask of the DISCARDED mantissa bits. */
+  def roundMask(p: Int): BigInt = (BigInt(1) << lsbPos(p)) - 1
+  /** Largest biased extended exponent a finite result of this precision may carry. */
+  def expMax(p: Int): Int = p match { case Sgl => 0x407E; case Dbl => 0x43FE; case _ => 0x7FFE }
+  /** Smallest biased extended exponent a NORMALISED result of this precision may carry. */
+  def expMinNorm(p: Int): Int = p match { case Sgl => 0x3F81; case Dbl => 0x3C01; case _ => 1 }
+
+  /** 3-way select on a 2-bit PREC field, mapping the undefined encoding 11 onto Extend. */
+  def sel[T <: Data](p: Bits, ext: T, sgl: T, dbl: T): T =
+    Mux(p === B(Sgl, 2 bits), sgl, Mux(p === B(Dbl, 2 bits), dbl, ext))
+}
+
 /** FPSR exception-status bits this arithmetic core can raise. BSUN is a branch-side
   * condition (FBcc on unordered) and INEX1 is packed-decimal-only; neither can originate
   * here, so neither is present. Never lock-stepped (Divergence Register D4). */
@@ -74,6 +142,23 @@ case class FpRoundReq() extends Bundle {
     * with the request rather than read live in FpRoundPack, so an FPCR write landing while
     * an operation is in flight cannot re-mux an already-issued result. */
   val rmode        = Bits(2 bits)
+
+  /** The EFFECTIVE rounding precision for this operation, FPCR[7:6]-encoded (see
+    * `FpPrec`): either FPCR.PREC as it stood at ISSUE, or the precision the INSTRUCTION
+    * forces -- "Instructions with an S or D (e.g., FSADD) have the same effect as setting
+    * the rounding precision to S or D" (MC68040UM 10.7). The choice between those two is
+    * made once, at issue, by `FpSource.opmodeToPrecision`; by the time a request exists
+    * the distinction is gone. Latched WITH the request for exactly the reason `rmode` is:
+    * an FPCR write landing while an operation is in flight must not re-mux an
+    * already-issued result.
+    *
+    * IGNORED when `bypass` is set -- a bypassed value is already the final bit pattern
+    * (NaN/infinity propagation, FTST, FINT). The one subtlety that costs real logic is
+    * that FABS/FNEG/FMOVE are NOT bypassed at single/double precision: their result is a
+    * genuine 64-bit-significand extended value that still has to be rounded and
+    * range-checked at the selected precision (PRM FMOVE: "MOVE will round the result to
+    * the precision selected in the floating-point control register"). See FpCheapPipe. */
+  val prec         = Bits(2 bits)
 
   /** Mark every leaf as overridable. The front-ends deliberately build a request as
     * "assign a complete default, then refine a few fields", which SpinalHDL's

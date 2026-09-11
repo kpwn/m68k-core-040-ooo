@@ -65,9 +65,11 @@ class FpuCoreSpec extends AnyFunSuite {
     * that number (the same convention MulCoreSpec's dense burst test locks in for MulCore:
     * `firstDoneCycle == MulCore.Latency`). */
   def runFixed(dut: FpuCore, cd: ClockDomain, op: FpOp.E,
-               d: BigInt, s: BigInt, rm: Int, crom: Int = 0): Got = {
+               d: BigInt, s: BigInt, rm: Int, crom: Int = 0,
+               prec: Int = FpPrec.Ext): Got = {
     dut.io.start #= true; dut.io.op #= op
     dut.io.dst #= d; dut.io.src #= s; dut.io.rmode #= rm; dut.io.cromSel #= crom
+    dut.io.precision #= prec
     cd.waitSampling()
     dut.io.start #= false
     var n = 0
@@ -78,9 +80,11 @@ class FpuCoreSpec extends AnyFunSuite {
     val g = readRes(dut.io.resFixed); cd.waitSampling(2); g
   }
 
-  def runIter(dut: FpuCore, cd: ClockDomain, op: FpOp.E, d: BigInt, s: BigInt, rm: Int): Got = {
+  def runIter(dut: FpuCore, cd: ClockDomain, op: FpOp.E, d: BigInt, s: BigInt, rm: Int,
+              prec: Int = FpPrec.Ext): Got = {
     dut.io.start #= true; dut.io.op #= op
     dut.io.dst #= d; dut.io.src #= s; dut.io.rmode #= rm; dut.io.cromSel #= 0
+    dut.io.precision #= prec
     cd.waitSampling()
     dut.io.start #= false
     var n = 0
@@ -104,6 +108,7 @@ class FpuCoreSpec extends AnyFunSuite {
   def init(dut: FpuCore, cd: ClockDomain): Unit = {
     dut.io.start #= false; dut.io.op #= FpOp.FMOVE
     dut.io.dst #= 0; dut.io.src #= 0; dut.io.rmode #= 0
+    dut.io.precision #= FpPrec.Ext
     dut.io.cromSel #= 0; dut.io.iterAck #= false
     cd.forkStimulus(10); cd.waitSampling(5)
   }
@@ -835,6 +840,354 @@ class FpuCoreSpec extends AnyFunSuite {
       val special = measure(FpOp.FDIV, One, PosZero)
       assert(special == FpDivSqrtCore.SpecialLatency,
         s"divide-by-zero short circuit took $special cycles, declared ${FpDivSqrtCore.SpecialLatency}")
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════════
+  // ROUNDING PRECISION (FPCR.PREC / the MC68040 FS<op>,FD<op> forced-precision forms)
+  //
+  // ⚠ READ THIS BEFORE ADDING OR "FIXING" ANY VECTOR BELOW. THERE IS NO EXECUTABLE
+  // ORACLE FOR THIS FEATURE.
+  //   - MUSASHI IGNORES PREC ENTIRELY. `fmove_fpcr` (m68kfpu.c) writes only
+  //     `float_rounding_mode`; `floatx80_rounding_precision` is left at its initial 80 and
+  //     is never assigned anywhere in the vendored tree. So a lock-step test passes
+  //     whether this feature is implemented correctly, incorrectly, or not at all.
+  //   - THE VENDORED SOFTFLOAT IS NOT A MODEL EITHER. Its `roundAndPackFloatx80`
+  //     roundingPrecision 32/64 arms round the mantissa at the narrow boundary but keep
+  //     the EXTENDED exponent limits ($7FFE / zExp <= 0). That is x87 precision-control
+  //     semantics; the 68k does RANGE CONTROL, which SoftFloat does not implement.
+  //
+  // Every expected word below is therefore derived by hand from the manuals and IEEE-754,
+  // with the derivation written out, and independently re-derived by an exact-integer
+  // model written from the UM's algorithm (not from this RTL). Sources:
+  //   [UM]  MC68040 User's Manual 9.4.1, 9.4.2, 9.7.4, 9.7.5, Tables 9-12 / 9-13.
+  //   [PRM] M68000 Family Programmer's Reference Manual 3.5.1, 3.5.2, 3.6.1,
+  //         Tables 1-4/1-5/1-6 (format exponent ranges), Table 3-21 (PREC encoding).
+  //
+  // THE TWO HALVES, because getting only the first is the easy mistake:
+  //   (a) mantissa rounding at a 24- / 53- / 64-bit boundary;
+  //   (b) RANGE CONTROL -- OVFL/UNFL against the SELECTED precision's exponent range.
+  // Vectors P4..P12 are entirely about (b): an implementation that rounds the mantissa
+  // correctly but keeps the extended exponent limits fails every one of them.
+  //
+  // Biased-extended exponent limits used throughout (bias $3FFF):
+  //   single  largest finite $407E,  smallest normal $3F81
+  //   double  largest finite $43FE,  smallest normal $3C01
+  //   extended                $7FFE,                  $0001
+  // ════════════════════════════════════════════════════════════════════════════════
+
+  /** 80-bit word from its three fields. */
+  private def fp80(sign: Int, exp: Int, sig: BigInt): BigInt =
+    (BigInt(sign) << 79) | (BigInt(exp) << 64) | sig
+
+  private def hx(v: BigInt): String = f"$v%020X"
+
+  /** One directed precision vector. `flags` is (ovfl, unfl, inex). */
+  private case class PV(name: String, op: FpOp.E, dst: BigInt, src: BigInt,
+                        rm: Int, prec: Int, want: BigInt,
+                        ovfl: Boolean = false, unfl: Boolean = false, inex: Boolean = false)
+
+  private def checkPV(d0: FpuCore, cd: ClockDomain, v: PV): Unit = {
+    val g = if (v.op == FpOp.FDIV || v.op == FpOp.FSQRT)
+              runIter(d0, cd, v.op, v.dst, v.src, v.rm, v.prec)
+            else runFixed(d0, cd, v.op, v.dst, v.src, v.rm, 0, v.prec)
+    assert(g.value == v.want,
+      s"${v.name}: got ${hx(g.value)}, want ${hx(v.want)}")
+    assert(g.ovfl == v.ovfl, s"${v.name}: OVFL ${g.ovfl}, want ${v.ovfl}")
+    assert(g.unfl == v.unfl, s"${v.name}: UNFL ${g.unfl}, want ${v.unfl}")
+    assert(g.inex == v.inex, s"${v.name}: INEX2 ${g.inex}, want ${v.inex}")
+  }
+
+  // Operands used by the vectors, all exact 80-bit words.
+  private val OnePlus2m24 = fp80(0, 0x3FFF, BigInt("8000008000000000", 16)) // 1 + 2^-24
+  private val OnePlus2m23 = fp80(0, 0x3FFF, BigInt("8000010000000000", 16)) // 1 + 2^-23
+  private val OnePlus2m30 = fp80(0, 0x3FFF, BigInt("8000000200000000", 16)) // 1 + 2^-30
+  private val TieUp       = fp80(0, 0x3FFF, BigInt("8000018000000000", 16)) // 1 + 2^-23 + 2^-24
+  private val P200        = fp80(0, 0x40C7, BigInt(1) << 63)                // 2^200
+  private val P2000       = fp80(0, 0x47CF, BigInt(1) << 63)                // 2^2000
+  private val M130        = fp80(0, 0x3F7D, BigInt(1) << 63)                // 2^-130
+  private val M130Eps     = fp80(0, 0x3F7D, BigInt("8000000000000001", 16)) // 2^-130*(1+2^-63)
+  private val M1030       = fp80(0, 0x3BF9, BigInt(1) << 63)                // 2^-1030
+  private val M16000      = fp80(0, 0x017F, BigInt(1) << 63)                // 2^-16000
+  private val NegM16000   = fp80(1, 0x017F, BigInt(1) << 63)                // -2^-16000
+  private val MaxSgl      = fp80(0, 0x407E, BigInt("FFFFFF0000000000", 16)) // largest single
+  private val MaxDbl      = fp80(0, 0x43FE, BigInt("FFFFFFFFFFFFF800", 16)) // largest double
+  private val AllOnes407E = fp80(0, 0x407E, (BigInt(1) << 64) - 1)
+  private val AllOnes3F80 = fp80(0, 0x3F80, (BigInt(1) << 64) - 1)
+  private val OneM2m25    = fp80(0, 0x3FFE, BigInt("FFFFFF8000000000", 16)) // 1 - 2^-25
+  private val TwoM24      = fp80(0, 0x3FE7, BigInt(1) << 63)                // 2^-24
+  private val TwoM25      = fp80(0, 0x3FE6, BigInt(1) << 63)                // 2^-25
+  private val P100        = fp80(0, 0x4063, BigInt(1) << 63)                // 2^100
+
+  test("PREC: mantissa rounding boundary is 24 / 53 / 64 bits", VerilatorTest) {
+    dut.doSim { d0 =>
+      val cd = d0.clockDomain; init(d0, cd)
+      // ── P1. 1 + 2^-24 needs 25 significant bits, so it is EXACT in extended and in
+      // double but NOT in single. Significand $8000008000000000 = 2^63 + 2^39, i.e. the
+      // guard bit for a 24-bit boundary (bit 39) is set and everything below it is zero:
+      // an exact TIE. RN rounds a tie to EVEN; the retained LSB (bit 40) is 0, so the tie
+      // truncates. [PRM 3.5.2 "Single-precision results are rounded to a 24-bit
+      // boundary"; UM 9.4.1 "All mantissa bits beyond the selected precision are zero".]
+      checkPV(d0, cd, PV("P1 Ext 1+2^-24 RN", FpOp.FMOVE, 0, OnePlus2m24, 0, FpPrec.Ext,
+                         OnePlus2m24))
+      checkPV(d0, cd, PV("P1 Dbl 1+2^-24 RN", FpOp.FMOVE, 0, OnePlus2m24, 0, FpPrec.Dbl,
+                         OnePlus2m24))
+      checkPV(d0, cd, PV("P1 Sgl 1+2^-24 RN", FpOp.FMOVE, 0, OnePlus2m24, 0, FpPrec.Sgl,
+                         fp80(0, 0x3FFF, BigInt(1) << 63), inex = true))
+      // ── P2. NEGATIVE CONTROL: 1 + 2^-23 fits exactly in 24 bits, so single precision
+      // must leave it alone and must NOT set INEX2.
+      checkPV(d0, cd, PV("P2 Sgl 1+2^-23 RN", FpOp.FMOVE, 0, OnePlus2m23, 0, FpPrec.Sgl,
+                         OnePlus2m23))
+      // ── P3. The other half of round-to-nearest-EVEN: same tie, retained LSB now 1
+      // (significand $8000018000000000 = 2^63 + 2^40 + 2^39), so the tie rounds UP to
+      // 1 + 2^-22 = $8000020000000000. Together P1/P3 pin ties-to-even in both directions;
+      // a plain round-half-up would pass P3 and fail P1.
+      checkPV(d0, cd, PV("P3 Sgl tie-up RN", FpOp.FMOVE, 0, TieUp, 0, FpPrec.Sgl,
+                         fp80(0, 0x3FFF, BigInt("8000020000000000", 16)), inex = true))
+      // ── P4. All four rounding modes on the SAME inexact single-precision operand
+      // (1 + 2^-24, which sits exactly half way between 1.0 and 1 + 2^-23).
+      // RZ chops; RP rounds away from zero for a positive value; RM rounds towards zero
+      // for a positive value; RM rounds AWAY from zero for a negative one.
+      checkPV(d0, cd, PV("P4 Sgl RZ", FpOp.FMOVE, 0, OnePlus2m24, 1, FpPrec.Sgl,
+                         fp80(0, 0x3FFF, BigInt(1) << 63), inex = true))
+      checkPV(d0, cd, PV("P4 Sgl RM +", FpOp.FMOVE, 0, OnePlus2m24, 2, FpPrec.Sgl,
+                         fp80(0, 0x3FFF, BigInt(1) << 63), inex = true))
+      checkPV(d0, cd, PV("P4 Sgl RP +", FpOp.FMOVE, 0, OnePlus2m24, 3, FpPrec.Sgl,
+                         OnePlus2m23, inex = true))
+      checkPV(d0, cd, PV("P4 Sgl RM -", FpOp.FMOVE, 0,
+                         OnePlus2m24 | (BigInt(1) << 79), 2, FpPrec.Sgl,
+                         OnePlus2m23 | (BigInt(1) << 79), inex = true))
+      // ── P5. A THREE-WAY discriminator: 1 + 2^-30 needs 31 bits. Exact at extended and
+      // at double (bit 33 is above the 53-bit boundary at bit 11); at single the whole
+      // 2^-30 term is below the guard bit, so it is pure sticky and RN truncates to 1.0.
+      checkPV(d0, cd, PV("P5 Ext 1+2^-30", FpOp.FMOVE, 0, OnePlus2m30, 0, FpPrec.Ext,
+                         OnePlus2m30))
+      checkPV(d0, cd, PV("P5 Dbl 1+2^-30", FpOp.FMOVE, 0, OnePlus2m30, 0, FpPrec.Dbl,
+                         OnePlus2m30))
+      checkPV(d0, cd, PV("P5 Sgl 1+2^-30", FpOp.FMOVE, 0, OnePlus2m30, 0, FpPrec.Sgl,
+                         fp80(0, 0x3FFF, BigInt(1) << 63), inex = true))
+      // ── P6. PREC encoding 11 is "Undefined" (PRM Table 3-21). We treat it as Extend,
+      // the reset value and the do-nothing choice; pin that so it cannot drift silently.
+      checkPV(d0, cd, PV("P6 prec=11 behaves as Extend", FpOp.FMOVE, 0, OnePlus2m24, 0, 3,
+                         OnePlus2m24))
+    }
+  }
+
+  test("PREC: RANGE CONTROL -- overflow at the SELECTED precision's exponent range",
+       VerilatorTest) {
+    dut.doSim { d0 =>
+      val cd = d0.clockDomain; init(d0, cd)
+      // ── P7. 2^200 is an ordinary normalised number in extended AND in double, but it is
+      // far above the single-precision maximum of 2^127. [UM 9.7.4: "An overflow exception
+      // is detected ... when the intermediate result's exponent is greater than or equal
+      // to the maximum exponent value of the SELECTED ROUNDING PRECISION", and "Even if
+      // the intermediate result is small enough to be represented as an extended-precision
+      // number, an overflow can occur."]  THIS IS THE VECTOR A MANTISSA-ONLY
+      // IMPLEMENTATION FAILS: rounding 2^200 to 24 bits changes nothing at all.
+      checkPV(d0, cd, PV("P7 Ext 2^200", FpOp.FMOVE, 0, P200, 0, FpPrec.Ext, P200))
+      checkPV(d0, cd, PV("P7 Dbl 2^200", FpOp.FMOVE, 0, P200, 0, FpPrec.Dbl, P200))
+      checkPV(d0, cd, PV("P7 Sgl 2^200 RN", FpOp.FMOVE, 0, P200, 0, FpPrec.Sgl,
+                         fp80(0, 0x7FFF, BigInt(1) << 63), ovfl = true, inex = true))
+      // ── P8. UM 9.4.2's OWN WORKED EXAMPLE, verbatim: "if the data format and rounding
+      // mode is single-precision RM and the result of an arithmetic operation overflows
+      // the magnitude of the single-precision format, the largest normalized
+      // single-precision value is stored as an extended-precision number in the
+      // destination floating-point data register (i.e., ... a mantissa of
+      // $FFFFFF0000000000)."  Exponent is the largest finite single exponent, $407E.
+      checkPV(d0, cd, PV("P8 Sgl 2^200 RM = UM worked example", FpOp.FMOVE, 0, P200, 2,
+                         FpPrec.Sgl, MaxSgl, ovfl = true, inex = true))
+      // RZ picks the same "largest magnitude number" arm (UM Table 9-12).
+      checkPV(d0, cd, PV("P8b Sgl 2^200 RZ", FpOp.FMOVE, 0, P200, 1, FpPrec.Sgl,
+                         MaxSgl, ovfl = true, inex = true))
+      // ── P9. The same table one precision up: 2^2000 overflows double (max 2^1023) but
+      // not extended. RZ -> largest double = $43FE_FFFFFFFFFFFFF800 (53 retained bits).
+      checkPV(d0, cd, PV("P9 Ext 2^2000", FpOp.FMOVE, 0, P2000, 0, FpPrec.Ext, P2000))
+      checkPV(d0, cd, PV("P9 Dbl 2^2000 RZ", FpOp.FMOVE, 0, P2000, 1, FpPrec.Dbl,
+                         MaxDbl, ovfl = true, inex = true))
+      // ── P10. THE BOUNDARY, both sides. $407E with an all-ones significand is the
+      // largest representable single magnitude PLUS a nonzero tail below the 24-bit
+      // boundary. Under RN that tail rounds the retained field up and carries out of the
+      // format -> overflow -> +infinity. Under RZ the same operand does NOT overflow: it
+      // truncates to the largest single. One operand, one exponent, two outcomes decided
+      // purely by the rounding mode -- SoftFloat's `(zExp == 0x7FFE) && allOnes &&
+      // increment` corner, relocated to the single-precision boundary.
+      checkPV(d0, cd, PV("P10 Sgl $407E all-ones RN", FpOp.FMOVE, 0, AllOnes407E, 0,
+                         FpPrec.Sgl, fp80(0, 0x7FFF, BigInt(1) << 63),
+                         ovfl = true, inex = true))
+      checkPV(d0, cd, PV("P10b Sgl $407E all-ones RZ", FpOp.FMOVE, 0, AllOnes407E, 1,
+                         FpPrec.Sgl, MaxSgl, inex = true))
+      // The largest single itself must pass through untouched and raise nothing.
+      checkPV(d0, cd, PV("P10c Sgl largest single RN", FpOp.FMOVE, 0, MaxSgl, 0,
+                         FpPrec.Sgl, MaxSgl))
+      // ── P11. Infinities and NaNs are exact at every precision: they must survive
+      // unchanged and must NOT be reported as overflow.
+      checkPV(d0, cd, PV("P11 Sgl +Inf", FpOp.FMOVE, 0, PosInf, 0, FpPrec.Sgl, PosInf))
+      checkPV(d0, cd, PV("P11 Sgl QNaN", FpOp.FMOVE, 0, QNan, 0, FpPrec.Sgl, QNan))
+      // ── P12. Zero survives with its sign and raises nothing, even though its exponent
+      // is far below the single-precision minimum (the UNFL arm must not mistake it for a
+      // tiny nonzero result).
+      checkPV(d0, cd, PV("P12 Sgl -0", FpOp.FMOVE, 0, NegZero, 0, FpPrec.Sgl, NegZero))
+    }
+  }
+
+  test("PREC: RANGE CONTROL -- underflow denormalises to the SELECTED precision",
+       VerilatorTest) {
+    dut.doSim { d0 =>
+      val cd = d0.clockDomain; init(d0, cd)
+      // ── P13. 2^-130 is normalised in extended and in double, but it is below the
+      // single-precision smallest normal 2^-126, so single precision must DENORMALISE it:
+      // "Shifting the mantissa of the intermediate result to the right while incrementing
+      // the exponent until it is equal to the denormalized exponent value for the
+      // destination format accomplishes denormalization" (UM 9.7.5). Shift = $3F81-$3F7D
+      // = 4, so significand 2^63 becomes 2^59 and the exponent parks at $3F81:
+      // 2^59 * 2^($3F81-$3FFF-63) = 2^59 * 2^-189 = 2^-130. Exact, so no INEX2 -- and, by
+      // this core's pre-existing SoftFloat "tininess AFTER rounding AND inexact"
+      // convention (see the P15 note), no UNFL either.
+      checkPV(d0, cd, PV("P13 Ext 2^-130", FpOp.FMOVE, 0, M130, 0, FpPrec.Ext, M130))
+      checkPV(d0, cd, PV("P13 Dbl 2^-130", FpOp.FMOVE, 0, M130, 0, FpPrec.Dbl, M130))
+      checkPV(d0, cd, PV("P13 Sgl 2^-130", FpOp.FMOVE, 0, M130, 0, FpPrec.Sgl,
+                         fp80(0, 0x3F81, BigInt("0800000000000000", 16))))
+      // ── P14. The same value with one extra low bit set. After the 4-bit denormalising
+      // shift that bit falls off, so the result is the same word but now INEXACT, and
+      // therefore reports UNFL. Three-way again: double keeps it normalised at $3F7D and
+      // rounds only the mantissa (bit 0 is below double's 53-bit boundary at bit 11).
+      checkPV(d0, cd, PV("P14 Ext 2^-130+eps", FpOp.FMOVE, 0, M130Eps, 0, FpPrec.Ext,
+                         M130Eps))
+      checkPV(d0, cd, PV("P14 Dbl 2^-130+eps", FpOp.FMOVE, 0, M130Eps, 0, FpPrec.Dbl,
+                         fp80(0, 0x3F7D, BigInt(1) << 63), inex = true))
+      checkPV(d0, cd, PV("P14 Sgl 2^-130+eps", FpOp.FMOVE, 0, M130Eps, 0, FpPrec.Sgl,
+                         fp80(0, 0x3F81, BigInt("0800000000000000", 16)),
+                         unfl = true, inex = true))
+      // ── P15. TININESS IS DETECTED AFTER ROUNDING. $3F80 (= 2^-127, one below single's
+      // smallest normal) with an all-ones significand denormalises by 1 and then rounds
+      // BACK UP to exactly 2^-126, the smallest normal single -- so no UNFL, only INEX2.
+      // Move the operand one exponent lower and it would be tiny; this is the single-
+      // precision relocation of SoftFloat's `float_tininess_after_rounding` corner.
+      checkPV(d0, cd, PV("P15 Sgl rounds back up to smallest normal", FpOp.FMOVE, 0,
+                         AllOnes3F80, 0, FpPrec.Sgl, fp80(0, 0x3F81, BigInt(1) << 63),
+                         inex = true))
+      // ── P16. GROSS underflow, UM Table 9-13. 2^-16000 is normal in extended; at single
+      // precision the denormalising shift ($3F81-$017F = 15874 places) empties the
+      // mantissa completely. RN -> "Zero, with the sign of the intermediate result".
+      checkPV(d0, cd, PV("P16 Ext 2^-16000", FpOp.FMOVE, 0, M16000, 0, FpPrec.Ext, M16000))
+      checkPV(d0, cd, PV("P16 Sgl 2^-16000 RN", FpOp.FMOVE, 0, M16000, 0, FpPrec.Sgl,
+                         BigInt(0), unfl = true, inex = true))
+      // RM on a NEGATIVE gross underflow -> "smallest denormalized" number of the selected
+      // precision (UM Table 9-13), i.e. -2^-149: significand 2^40 at exponent $3F81,
+      // 2^40 * 2^($3F81-$3FFF-63) = 2^40 * 2^-189 = 2^-149. An implementation without
+      // range control would instead produce the EXTENDED smallest denormal, 2^-16445.
+      checkPV(d0, cd, PV("P16b Sgl -2^-16000 RM", FpOp.FMOVE, 0, NegM16000, 2, FpPrec.Sgl,
+                         fp80(1, 0x3F81, BigInt(1) << 40), unfl = true, inex = true))
+      // ── P17. Double-precision underflow: 2^-1030 is below double's smallest normal
+      // 2^-1022 by 8, so it denormalises to significand 2^55 at exponent $3C01 -- exactly
+      // (2^55 * 2^($3C01-$3FFF-63) = 2^55 * 2^-1085 = 2^-1030). At single it is gross
+      // underflow instead.
+      checkPV(d0, cd, PV("P17 Dbl 2^-1030", FpOp.FMOVE, 0, M1030, 0, FpPrec.Dbl,
+                         fp80(0, 0x3C01, BigInt("0080000000000000", 16))))
+      checkPV(d0, cd, PV("P17 Sgl 2^-1030 RN", FpOp.FMOVE, 0, M1030, 0, FpPrec.Sgl,
+                         BigInt(0), unfl = true, inex = true))
+    }
+  }
+
+  test("PREC reaches every arithmetic front-end, not just the FMOVE path", VerilatorTest) {
+    dut.doSim { d0 =>
+      val cd = d0.clockDomain; init(d0, cd)
+      // FADD: 1.0 + 2^-24 is computed EXACTLY by the adder, then rounded at the 24-bit
+      // boundary to a tie-to-even -> 1.0 (same arithmetic as P1, reached through FpAddPipe).
+      checkPV(d0, cd, PV("FADD Sgl 1+2^-24", FpOp.FADD, One, TwoM24, 0, FpPrec.Sgl,
+                         One, inex = true))
+      checkPV(d0, cd, PV("FADD Ext 1+2^-24", FpOp.FADD, One, TwoM24, 0, FpPrec.Ext,
+                         OnePlus2m24))
+      // FSUB exercising the CARRY-OUT path at a narrow boundary: 1 - 2^-25 normalises to
+      // $3FFE:$FFFFFF8000000000, whose 24-bit boundary sits on an exact tie with the
+      // retained LSB set -> rounds up -> the retained field carries out of the format ->
+      // significand 2^63, exponent $3FFE+1 -> exactly 1.0.
+      checkPV(d0, cd, PV("FSUB Ext 1-2^-25", FpOp.FSUB, One, TwoM25, 0, FpPrec.Ext,
+                         OneM2m25))
+      checkPV(d0, cd, PV("FSUB Sgl 1-2^-25 carries to 1.0", FpOp.FSUB, One, TwoM25, 0,
+                         FpPrec.Sgl, One, inex = true))
+      // FMUL through the DSP chain: 2^100 * 2^100 = 2^200, fine in double, overflow in
+      // single -> +infinity (UM Table 9-12, RN).
+      checkPV(d0, cd, PV("FMUL Dbl 2^100^2", FpOp.FMUL, P100, P100, 0, FpPrec.Dbl, P200))
+      checkPV(d0, cd, PV("FMUL Sgl 2^100^2 overflows", FpOp.FMUL, P100, P100, 0,
+                         FpPrec.Sgl, fp80(0, 0x7FFF, BigInt(1) << 63),
+                         ovfl = true, inex = true))
+      // FDIV on the ITERATIVE lane (its own private FpRoundPack instance, so precision has
+      // to reach that one too). 1/3 rounded to 24 bits is the IEEE single 0x3EAAAAAB, i.e.
+      // significand $AAAAAB0000000000 at exponent $3FFD -- cross-checked below against the
+      // host's own float division.
+      val oneThirdSgl = fp80(0, 0x3FFD, BigInt("AAAAAB0000000000", 16))
+      checkPV(d0, cd, PV("FDIV Sgl 1/3", FpOp.FDIV, One, Three, 0, FpPrec.Sgl,
+                         oneThirdSgl, inex = true))
+      // FSQRT, same lane. sqrt(2) rounded to 24 bits is 0x3FB504F3.
+      val sqrt2Sgl = fp80(0, 0x3FFF, BigInt("B504F30000000000", 16))
+      checkPV(d0, cd, PV("FSQRT Sgl sqrt(2)", FpOp.FSQRT, 0, Two, 0, FpPrec.Sgl,
+                         sqrt2Sgl, inex = true))
+      // FABS / FNEG are value-moving ops whose 68040 forced-precision forms (FSABS $58 /
+      // FDABS $5C, FSNEG $5A / FDNEG $5E) exist precisely because they DO round: a
+      // sign-flip of an arbitrary extended value is not generally representable at 24 bits.
+      checkPV(d0, cd, PV("FNEG Sgl -(1+2^-24)", FpOp.FNEG, 0, OnePlus2m24, 0, FpPrec.Sgl,
+                         One | (BigInt(1) << 79), inex = true))
+      checkPV(d0, cd, PV("FABS Sgl |-(1+2^-24)|", FpOp.FABS, 0,
+                         OnePlus2m24 | (BigInt(1) << 79), 0, FpPrec.Sgl, One, inex = true))
+      // FCMP is FORCED to extended regardless of FPCR.PREC: it stores nothing, and UM
+      // 9.7.4/9.7.5 detect OVFL/UNFL only "for arithmetic operations in which the
+      // DESTINATION is a floating-point data register or memory". FCMP's only destination
+      // is the FPCC, so PREC has nothing to apply to.
+      //
+      // The discriminating pair is `FCMP #0,FP(2^200)`: the internal difference is 2^200,
+      // which is a perfectly ordinary extended number but is far outside the
+      // single-precision range. WITHOUT the carve-out this reports a spurious OVFL at
+      // FPCR.PREC = single; with it, the two runs are bit-identical in every output field.
+      for ((d, sv, name) <- Seq((P200, PosZero,                      "2^200 vs 0"),
+                                (MaxFin, MaxFin | (BigInt(1) << 79), "MAX vs -MAX"))) {
+        val e = runFixed(d0, cd, FpOp.FCMP, d, sv, 0, 0, FpPrec.Ext)
+        val g = runFixed(d0, cd, FpOp.FCMP, d, sv, 0, 0, FpPrec.Sgl)
+        assert(g == e,
+          s"FCMP $name must behave identically at every FPCR.PREC setting: $g vs $e")
+      }
+      // ... and specifically, the first pair must raise nothing at all. (The second pair's
+      // difference, 2 * MAX, genuinely overflows EXTENDED too, which is this core's
+      // long-standing SoftFloat-shaped behaviour and is deliberately left untouched here.)
+      assert(!runFixed(d0, cd, FpOp.FCMP, P200, PosZero, 0, 0, FpPrec.Sgl).ovfl,
+        "FCMP must not raise OVFL merely because its difference is outside single range")
+      // FTST likewise: it only classifies its operand.
+      val tstExt = runFixed(d0, cd, FpOp.FTST, 0, OnePlus2m24, 0, 0, FpPrec.Ext)
+      val tstSgl = runFixed(d0, cd, FpOp.FTST, 0, OnePlus2m24, 0, 0, FpPrec.Sgl)
+      assert(tstSgl == tstExt, "FTST must behave identically at every FPCR.PREC setting")
+    }
+  }
+
+  test("PREC: every single-precision result is exactly an IEEE single", VerilatorTest) {
+    // STRUCTURAL cross-check, independent of every expected literal above: whatever a
+    // single-precision operation produces must round-trip through a real 32-bit IEEE
+    // single without loss. This catches "rounded to the wrong boundary" and "kept the
+    // extended exponent range" without needing to know the right answer.
+    dut.doSim { d0 =>
+      val cd = d0.clockDomain; init(d0, cd)
+      val srcs = Seq(OnePlus2m24, OnePlus2m30, TieUp, P200, P2000, M130, M130Eps, M1030,
+                     AllOnes407E, AllOnes3F80, MaxFin, MinNorm, MinSub, ThreePt5,
+                     One, Two, Half, Three, Nine)
+      for (s <- srcs; rm <- 0 until 4) {
+        val g = runFixed(d0, cd, FpOp.FMOVE, 0, s, rm, 0, FpPrec.Sgl)
+        val v = g.value
+        val e = ((v >> 64) & 0x7FFF).toInt
+        val m = v & ((BigInt(1) << 64) - 1)
+        if (e == 0x7FFF) {
+          // infinity or NaN -- nothing to check beyond "not corrupted into a finite".
+        } else if (e == 0 && m == 0) {
+          // signed zero
+        } else {
+          assert(e <= 0x407E,
+            f"exponent $e%04X exceeds the single-precision maximum for src ${hx(s)} rm=$rm")
+          assert((m & ((BigInt(1) << 40) - 1)) == 0,
+            f"mantissa ${m}%016X has bits below the 24-bit boundary for src ${hx(s)} rm=$rm")
+          // A single denormal keeps the exponent parked at $3F81 with leading zeros; a
+          // normal one has the integer bit set. Nothing else is representable.
+          assert((m >> 63) == 1 || e == 0x3F81,
+            f"un-normalised result ${hx(v)} at exponent $e%04X for src ${hx(s)} rm=$rm")
+        }
+      }
     }
   }
 }

@@ -71,6 +71,7 @@ class FpDivSqrtCore extends Component {
     val dst    = in Bits (80 bits)      // dividend (FPn); ignored by FSQRT
     val src    = in Bits (80 bits)      // divisor (<ea>); the operand for FSQRT
     val rmode  = in Bits (2 bits)
+    val precision = in Bits (2 bits)     // effective FPCR.PREC / forced FSDIV,FDDIV,FSSQRT,FDSQRT
     val busy   = out Bool ()
     val done   = out Bool ()
     val ack    = in Bool ()
@@ -89,6 +90,7 @@ class FpDivSqrtCore extends Component {
   val aClz   = Reg(UInt(7 bits)) init 0;  val bClz = Reg(UInt(7 bits)) init 0
   val aSubR  = RegInit(False);            val bSubR = RegInit(False)
   val rmodeR = Reg(Bits(2 bits)) init 0   // FPCR[5:4] latched at accept
+  val precR  = Reg(Bits(2 bits)) init 0   // effective rounding precision, latched at accept
 
   val rem    = Reg(UInt(68 bits)) init 0
   val quot   = Reg(UInt(65 bits)) init 0
@@ -115,6 +117,7 @@ class FpDivSqrtCore extends Component {
     is(U(S_IDLE, 3 bits)) {
       when(io.start) {
         sqrtR := io.isSqrt; dstR := io.dst; srcR := io.src; rmodeR := io.rmode
+        precR := io.precision
         state := U(S_CLZ, 3 bits)
       }
     }
@@ -133,6 +136,7 @@ class FpDivSqrtCore extends Component {
       r.writeFp := True; r.fpccFromSrc := False; r.fpccOverride := 0
       r.bypass := True; r.bypassValue := Fp80.defaultNan
       r.rmode := rmodeR
+      r.prec  := precR
       r.exc.clearExc()
       r.exc.snan := Mux(sqrtR, Fp80.isSNan(a), Fp80.isSNan(a) || Fp80.isSNan(b))
 

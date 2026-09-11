@@ -1,6 +1,7 @@
 package m68k040.decode
 
 import m68k040.frontend.DecodePacket
+import m68k040.execute.fpu.FpSource
 import m68k040.isa.{Cluster, Size, MemOp}
 import spinal.core._
 import spinal.lib._
@@ -1975,24 +1976,23 @@ object MicroOpAssembler {
     val fpEaMode   = op(5 downto 3).asUInt
     val fpEaReg    = op(2 downto 0).asUInt
 
-    // The hardware-native opmode whitelist (plan Global Constraints; every value
-    // confirmed against m68kfpu.c's fpgen_rm_reg opmode switch). Anything else --
-    // transcendentals, FMOD/FREM/FSCALE/FGETEXP, FSINCOS, and the 68040 rounded-precision
-    // FSxxx/FDxxx variants (opmode bit 6 set) -- routes to FPSP via vector 11.
-    val fpNative =
-      (fpOpmode === B"7'h00") || (fpOpmode === B"7'h01") || (fpOpmode === B"7'h03") ||
-      (fpOpmode === B"7'h04") || (fpOpmode === B"7'h18") || (fpOpmode === B"7'h1A") ||
-      (fpOpmode === B"7'h20") || (fpOpmode === B"7'h22") || (fpOpmode === B"7'h23") ||
-      (fpOpmode === B"7'h28") || (fpOpmode === B"7'h38") || (fpOpmode === B"7'h3A")
-    // DYADIC ops compute `FPn <op> source`, so they READ the destination FPn as an
-    // operand. The monadic ops (FMOVE/FABS/FNEG/FSQRT/FINT/FINTRZ/FTST) do not -- their
-    // result is a function of the source alone, and claiming a false RAW dependency on
-    // FPn would needlessly serialize independent FP work in the IQ.
-    val fpDyadic =
-      (fpOpmode === B"7'h20") || (fpOpmode === B"7'h22") || (fpOpmode === B"7'h23") ||
-      (fpOpmode === B"7'h28") || (fpOpmode === B"7'h38")
-    // FCMP (0x38) and FTST (0x3A) write ONLY the condition codes -- no FP destination.
-    val fpNoFpDst = (fpOpmode === B"7'h38") || (fpOpmode === B"7'h3A")
+    // The hardware-native opmode whitelist, the dyadic set and the "writes no FP
+    // destination" set all live in ONE place now -- `FpSource`'s opmode table -- because
+    // FIVE sites used to carry hand-copied duplicates of them (this one, DecodeStage's
+    // `ucFpNative`, and both Microcode `UFpIssue` arms), and the MC68040 forced-precision
+    // encodings had to be added to every one of them at once. Anything NOT in the table --
+    // transcendentals, FMOD/FREM/FSCALE/FGETEXP, FSINCOS -- still routes to FPSP via
+    // vector 11.
+    //
+    // The forced-precision FS<op>/FD<op> encodings (opmode bit 6 set: $40/$44 FSMOVE/
+    // FDMOVE, $41/$45 FSSQRT/FDSQRT, $58/$5C, $5A/$5E, $60/$64, $62/$66, $63/$67, $68/$6C)
+    // are now ACCEPTED rather than trapped: they are real 68040 hardware instructions
+    // (absent from UM Table 9-10's unimplemented list), they execute the same operation as
+    // their base opmode, and the only thing that differs is the rounding precision, which
+    // rides to the EU inside the same 7-bit `fpuOp` field the base opmodes already use.
+    val fpNative  = FpSource.isNativeOpmode(fpOpmode)
+    val fpDyadic  = FpSource.isDyadicOpmode(fpOpmode)
+    val fpNoFpDst = FpSource.isNoFpDstOpmode(fpOpmode)
 
     // Emittable forms (this task's scope -- see the plan's scope table). All of these are
     // single-uop and touch no memory:

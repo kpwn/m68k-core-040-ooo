@@ -53,7 +53,104 @@ object FpSource {
     * ROB head that never completes. Keeping the two functions symmetric on `romConst` is
     * what makes that unrepresentable. */
   def isIterativeOpmode(opmode: Bits, romConst: Bool): Bool =
-    !romConst && ((opmode === B"7'h20") || (opmode === B"7'h04"))
+    !romConst && iterOpmodes.map(o => opmode === B(o, 7 bits)).reduce(_ || _)
+
+  // ══════════════════════════════════════════════════════════════════════════════════
+  // THE cpGEN OPMODE TABLE, in ONE place.
+  //
+  // The MC68040 added 16 "forced rounding precision" encodings alongside the base ones
+  // (M68000PRM per-instruction Instruction Format tables; MC68040UM 10.7: "Instructions
+  // with an S or D (e.g., FSADD) have the same effect as setting the rounding precision
+  // to S or D"). They are GENUINE 68040 HARDWARE instructions -- absent from UM Table
+  // 9-10's unimplemented list, present in every FMOVE/FADD/... "Opmode field" table with
+  // the note "Supported by MC68040 only".
+  //
+  // Note the two that do NOT follow the "base opmode | $40, plus $04 for double" pattern:
+  // FSSQRT/FDSQRT are $41/$45, not $44/$48. The table is therefore written out literally
+  // rather than derived by masking -- deriving it would silently alias FDMOVE ($44) onto
+  // FSQRT ($04).
+  //
+  //   base                       single      double
+  //   $00 FMOVE                  $40 FSMOVE  $44 FDMOVE
+  //   $04 FSQRT                  $41 FSSQRT  $45 FDSQRT
+  //   $18 FABS                   $58 FSABS   $5C FDABS
+  //   $1A FNEG                   $5A FSNEG   $5E FDNEG
+  //   $20 FDIV                   $60 FSDIV   $64 FDDIV
+  //   $22 FADD                   $62 FSADD   $66 FDADD
+  //   $23 FMUL                   $63 FSMUL   $67 FDMUL
+  //   $28 FSUB                   $68 FSSUB   $6C FDSUB
+  //   $01 FINT  $03 FINTRZ  $38 FCMP  $3A FTST   (no forced-precision form exists)
+  //
+  // ══════════════════════════════════════════════════════════════════════════════════
+
+  /** (base opmode, single-precision opmode, double-precision opmode) for every operation
+    * that has a forced-precision form. */
+  val precisionFamily: Seq[(Int, Int, Int)] = Seq(
+    (0x00, 0x40, 0x44),   // FMOVE  / FSMOVE  / FDMOVE
+    (0x04, 0x41, 0x45),   // FSQRT  / FSSQRT  / FDSQRT
+    (0x18, 0x58, 0x5C),   // FABS   / FSABS   / FDABS
+    (0x1A, 0x5A, 0x5E),   // FNEG   / FSNEG   / FDNEG
+    (0x20, 0x60, 0x64),   // FDIV   / FSDIV   / FDDIV
+    (0x22, 0x62, 0x66),   // FADD   / FSADD   / FDADD
+    (0x23, 0x63, 0x67),   // FMUL   / FSMUL   / FDMUL
+    (0x28, 0x68, 0x6C))   // FSUB   / FSSUB   / FDSUB
+
+  /** Opmodes with no forced-precision variant: FINT, FINTRZ, FCMP, FTST. */
+  val precisionlessOpmodes: Seq[Int] = Seq(0x01, 0x03, 0x38, 0x3A)
+
+  /** Every opmode this core executes in hardware. Anything else -- transcendentals,
+    * FMOD/FREM/FSCALE/FGETEXP, FSINCOS -- routes to FPSP via vector 11. */
+  val nativeOpmodes: Seq[Int] =
+    (precisionFamily.flatMap(t => Seq(t._1, t._2, t._3)) ++ precisionlessOpmodes).sorted
+
+  /** The ops FpuCore runs on its single-context ITERATIVE lane: FDIV and FSQRT, in all
+    * three precision spellings each. */
+  val iterOpmodes: Seq[Int] = Seq(0x20, 0x60, 0x64, 0x04, 0x41, 0x45)
+
+  /** DYADIC ops compute `FPn <op> source`, so they READ the destination FPn as an operand:
+    * FDIV/FADD/FMUL/FSUB/FCMP and their forced-precision forms. The monadic ops
+    * (FMOVE/FABS/FNEG/FSQRT/FINT/FINTRZ/FTST) do not -- their result is a function of the
+    * source alone, and claiming a false RAW dependency on FPn would needlessly serialize
+    * independent FP work in the IQ. */
+  val dyadicOpmodes: Seq[Int] =
+    (Seq(0x20, 0x22, 0x23, 0x28).flatMap { b =>
+       val t = precisionFamily.find(_._1 == b).get; Seq(t._1, t._2, t._3)
+     } :+ 0x38).sorted
+
+  /** FCMP ($38) and FTST ($3A) write ONLY the condition codes -- no FP destination. Neither
+    * has a forced-precision form. */
+  val noFpDstOpmodes: Seq[Int] = Seq(0x38, 0x3A)
+
+  private def anyOf(opmode: Bits, set: Seq[Int]): Bool =
+    set.map(o => opmode === B(o, 7 bits)).reduce(_ || _)
+
+  /** The hardware-native opmode whitelist. `MicroOpAssembler.fpNative`, `DecodeStage`'s
+    * `ucFpNative` and this core's own dispatch all read THIS, so the three cannot drift. */
+  def isNativeOpmode(opmode: Bits): Bool  = anyOf(opmode, nativeOpmodes)
+  def isDyadicOpmode(opmode: Bits): Bool  = anyOf(opmode, dyadicOpmodes)
+  def isNoFpDstOpmode(opmode: Bits): Bool = anyOf(opmode, noFpDstOpmodes)
+
+  /** The EFFECTIVE rounding precision for an operation: the one the INSTRUCTION forces if
+    * it has a forced-precision opmode, else FPCR.PREC as it stands right now.
+    *
+    * MC68040UM 10.7: "Instructions with an S or D (e.g., FSADD) have the same effect as
+    * setting the rounding precision to S or D." M68000PRM FMOVE: "FSMOVE and FDMOVE will
+    * round the result to single or double precision, respectively, REGARDLESS of the
+    * rounding precision selected in the floating-point control register."
+    *
+    * `romConst` is the same MANDATORY veto `opmodeToFpOp`/`isIterativeOpmode` carry, for
+    * the same reason: for FMOVECR the 7-bit field is the constant-ROM OFFSET, not an
+    * opmode, and offsets $40..$6C are perfectly encodable. Without the veto
+    * `FMOVECR #$62,FPn` would silently force single-precision rounding. */
+  def opmodeToPrecision(opmode: Bits, romConst: Bool, fpcrPrec: Bits): Bits = {
+    val r = Bits(2 bits)
+    r := fpcrPrec
+    when(!romConst) {
+      when(anyOf(opmode, precisionFamily.map(_._2))) { r := B(FpPrec.Sgl, 2 bits) }
+      when(anyOf(opmode, precisionFamily.map(_._3))) { r := B(FpPrec.Dbl, 2 bits) }
+    }
+    r
+  }
 
   /** `RenamedUop.op` is always `DecOp.FPU` for the whole F-line family (one DecOp), so the
     * real per-operation selector is `RenamedUop.fpuOp`, the raw 7-bit extension-word opmode.
@@ -65,20 +162,23 @@ object FpSource {
     * `fpNative` whitelist already rejected every opmode not listed here to the FPSP
     * (vector-11) path, so no other value can reach this mapping. */
   def opmodeToFpOp(opmode: Bits, romConst: Bool): FpOp.C = {
+    val base: Seq[(Int, FpOp.E)] = Seq(
+      0x01 -> FpOp.FINT, 0x03 -> FpOp.FINTRZ, 0x04 -> FpOp.FSQRT,
+      0x18 -> FpOp.FABS, 0x1A -> FpOp.FNEG,   0x20 -> FpOp.FDIV,
+      0x22 -> FpOp.FADD, 0x23 -> FpOp.FMUL,   0x28 -> FpOp.FSUB,
+      0x38 -> FpOp.FCMP, 0x3A -> FpOp.FTST)
     val r = FpOp()
     r := FpOp.FMOVE                              // 0x00 FMOVE, and the unreachable default
     switch(opmode) {
-      is(B"7'h01") { r := FpOp.FINT }
-      is(B"7'h03") { r := FpOp.FINTRZ }
-      is(B"7'h04") { r := FpOp.FSQRT }
-      is(B"7'h18") { r := FpOp.FABS }
-      is(B"7'h1A") { r := FpOp.FNEG }
-      is(B"7'h20") { r := FpOp.FDIV }
-      is(B"7'h22") { r := FpOp.FADD }
-      is(B"7'h23") { r := FpOp.FMUL }
-      is(B"7'h28") { r := FpOp.FSUB }
-      is(B"7'h38") { r := FpOp.FCMP }
-      is(B"7'h3A") { r := FpOp.FTST }
+      for ((o, e) <- base) is(B(o, 7 bits)) { r := e }
+      // The forced-precision forms execute the SAME operation; only `prec` differs, and
+      // that travels separately (opmodeToPrecision). $40/$44 (FSMOVE/FDMOVE) fall through
+      // to the FMOVE default, exactly like $00.
+      for ((b, sgl, dbl) <- precisionFamily if b != 0x00) {
+        val e = base.toMap.apply(b)
+        is(B(sgl, 7 bits)) { r := e }
+        is(B(dbl, 7 bits)) { r := e }
+      }
     }
     when(romConst) { r := FpOp.FMOVECR }
     r

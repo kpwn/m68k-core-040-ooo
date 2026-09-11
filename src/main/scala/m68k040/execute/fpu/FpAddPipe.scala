@@ -64,6 +64,7 @@ class FpAddPipe extends Component {
     val dst      = in Bits (80 bits)
     val src      = in Bits (80 bits)
     val rmode    = in Bits (2 bits)
+    val precision = in Bits (2 bits)     // effective FPCR.PREC / forced FS<op>,FD<op>
     val outValid = out Bool ()
     val outReq   = out(FpRoundReq())
   }
@@ -80,6 +81,13 @@ class FpAddPipe extends Component {
     val cmp  = RegNext(isCmp)
     val rmRM = RegNext(io.rmode === 2)                 // for the exact-cancellation zero sign
     val rmod = RegNext(io.rmode)                       // latched at issue, travels with the req
+    // FCMP is FORCED to extended regardless of FPCR.PREC. It has no forced-precision
+    // opmode of its own ($38 only) and, per MC68040UM 9.7.4/9.7.5, OVFL/UNFL are detected
+    // only "for arithmetic operations in which the DESTINATION is a floating-point data
+    // register or memory" -- FCMP's only destination is the FPCC. Rounding its internal
+    // difference at single precision would both raise a spurious OVFL for
+    // `FCMP MAX,-MAX` and let a tiny difference flush to zero and report EQUAL.
+    val prec = RegNext(Mux(isCmp, B(FpPrec.Ext, 2 bits), io.precision))
 
     val dNan  = RegNext(Fp80.isNan(io.dst));  val sNan  = RegNext(Fp80.isNan(io.src))
     val dInf  = RegNext(Fp80.isInf(io.dst));  val sInf  = RegNext(Fp80.isInf(io.src))
@@ -136,6 +144,7 @@ class FpAddPipe extends Component {
     req.fpccFromSrc  := cmpSpecial
     req.fpccOverride := fpccCmp
     req.rmode := a0.rmod
+    req.prec  := a0.prec
     req.exc.clearExc()
     req.exc.snan  := a0.dSNan || a0.sSNan
     // Divergence Register D6: Musashi's FCMP resolves infinities from the explicit table and

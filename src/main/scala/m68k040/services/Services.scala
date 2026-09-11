@@ -467,31 +467,45 @@ trait FpuControlService {
     *
     * `roundingMode` and `excEnable` are consumed by `DivEuPlugin.wireFpControl` (Task 14c).
     *
-    * `precision` HAS NO CONSUMER, AND THAT IS A KNOWN GAP, NOT A DESIGN CHOICE. Task 14c
-    * checked the real M68040 User's Manual specifically to find out whether the 68040
-    * implements FPCR's precision-control field, on the theory that a uniformly
-    * extended-precision datapath (design Decision 1) might make it legacy/non-functional.
-    * IT DOES NOT: the manual is explicit and repeated that PREC is functional silicon.
-    *   - 9.2.2.2 (p.9-3): "Single-precision results are rounded to a 24-bit boundary;
-    *     double-precision results are rounded to a 53-bit boundary; and extended-precision
-    *     results are rounded to a 64-bit boundary." Table 9-1 gives PREC a real encoding
-    *     (00 Extend / 01 Single / 10 Double / 11 Undefined).
-    *   - 9.4.1 (p.9-12): the FPU keeps a 67-bit intermediate mantissa and rounds it "to 64
-    *     bits (or less, depending on the selected rounding precision)"; "All mantissa bits
-    *     beyond the selected precision are zero." Memory destinations ignore PREC.
-    *   - 9.4.2 (p.9-13) / 9.7.4 (p.9-31): PREC also drives RANGE CONTROL — OVFL/UNFL are
-    *     detected against the SELECTED precision's exponent range, not the extended range.
-    *   - 10.7 (p.10-28): "Instructions with an S or D (e.g., FSADD) have the same effect as
-    *     setting the rounding precision to S or D", and FSADD/FDADD/FSMUL/FDMUL are absent
-    *     from Table 9-10's unimplemented list, i.e. they are hardware instructions.
-    * `FpuCore` has no `precision` input anywhere and `FpRoundPack` is a port of SoftFloat's
-    * precision80 path only, so this core always rounds and range-checks at extended
-    * precision regardless of PREC. Musashi ignores PREC too (`m68kfpu.c`'s `fmove_fpcr`
-    * sets only `float_rounding_mode`), so lock-step CANNOT catch this — it needs a directed
-    * test against the UM. Closing it is a real arithmetic-core change (thread a latched
-    * `precision` through `FpRoundReq` as `rmode` already is, then precision-dependent
-    * rounding boundaries and OVFL/UNFL limits in `FpRoundPack`), deliberately NOT attempted
-    * as part of Task 14c's wiring scope. */
+    * `precision` is consumed by `DivEuPlugin.wireFpControl` -> `DivEuPlugin.fpPrecIn`,
+    * sampled at ISSUE into `fpS1Prec` (exactly as `roundingMode` is sampled into
+    * `fpS1Rmode`, so an FPCR write landing mid-flight cannot re-mux an already-issued
+    * result), combined there with the instruction's own opmode by
+    * `FpSource.opmodeToPrecision` -- the MC68040's FS<op>/FD<op> encodings OVERRIDE
+    * FPCR.PREC (UM 10.7) -- and delivered to `FpuCore.io.precision`, which threads it into
+    * every front-end's `FpRoundReq.prec` and on into `FpRoundPack`.
+    *
+    * It drives BOTH of the things the manual says it drives, not just the first:
+    *   - 9.2.2.2 (p.9-3) / 9.4.1 (p.9-12): the MANTISSA ROUNDING BOUNDARY -- 24 / 53 / 64
+    *     bits, "All mantissa bits beyond the selected precision are zero".
+    *   - 9.4.2 (p.9-13) / 9.7.4 / 9.7.5: RANGE CONTROL -- OVFL/UNFL detected against the
+    *     SELECTED precision's exponent range, with the overflow substitution being that
+    *     precision's largest finite (UM Table 9-12) and the underflow arm denormalising to
+    *     that precision's own minimum exponent (UM Table 9-13).
+    * See `FpPrec` and `FpRoundPack`'s headers for the derivation and the limits table.
+    *
+    * ⚠ NOT LOCK-STEPPABLE, IN EITHER DIRECTION. Musashi ignores PREC (`fmove_fpcr` sets
+    * only `float_rounding_mode`; `floatx80_rounding_precision` is never assigned in the
+    * vendored tree) and the vendored SoftFloat's own reduced-precision arms implement x87
+    * mantissa-only semantics with no range control. The directed vectors in
+    * `FpuCoreSpec`'s "PREC:" tests are the only oracle; a green lock-step says nothing
+    * about this field.
+    *
+    * KNOWN REMAINING GAPS, deliberate and recorded rather than overlooked:
+    *   - FMOVECR, FINT and FINTRZ are still rounded at extended precision regardless of
+    *     PREC. All three are FPSP-emulated on real MC68040 silicon (this core runs them in
+    *     hardware as a documented superset), and FMOVECR additionally needs a per-request
+    *     range-control suppression bit to honour the PRM's "OVFL Cleared / UNFL Cleared"
+    *     rule while still rounding its mantissa. See `FpCheapPipe`.
+    *   - UNFL follows this core's pre-existing SoftFloat "tiny AND inexact" rule at every
+    *     precision, whereas UM 9.7.5 says the FPSR EXC byte's UNFL is set "any time a tiny
+    *     number is generated". That is an EXTENDED-precision behaviour inherited by the
+    *     new precisions, not something this slice introduced; changing it would move
+    *     lock-stepped extended-precision behaviour and belongs in its own slice.
+    *   - FMOVE to a MEMORY destination correctly ignores PREC already: that path is
+    *     `FpNarrowPack`, which rounds to the DESTINATION FORMAT (`io.fmt`) and never reads
+    *     PREC at all -- "If the destination is a memory location, the FPSR PREC bits are
+    *     ignored" (UM 9.4.1). */
   def roundingMode: Bits
   def precision:    Bits
   def excEnable:    Bits

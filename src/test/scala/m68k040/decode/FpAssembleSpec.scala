@@ -339,7 +339,51 @@ class FpAssembleSpec extends AnyFunSuite {
       // <ea> = mode 0 (Dn direct) -- Task 6's own scope, unaffected by Task 6b's new
       // memory-mode-<ea> µcode gate (mode 0 is explicitly excluded from it).
       trapsWithNextPc(0xF200, 0x000E, 2, "FSIN (transcendental -> FPSP)")
-      trapsWithNextPc(0xF200, 0x0462, 2, "FSADD (rounded-precision variant, opmode bit6 -> FPSP)")
+      // $21 FMOD, $27 FSGLMUL: still genuinely unimplemented in hardware. These replace
+      // the FSADD case this test used to carry -- see the next test for why.
+      trapsWithNextPc(0xF200, 0x0421, 2, "FMOD (-> FPSP)")
+      trapsWithNextPc(0xF200, 0x0427, 2, "FSGLMUL (-> FPSP)")
+    }
+  }
+
+  test("the MC68040 forced-rounding-precision opmodes are NATIVE, not FPSP traps", VerilatorTest) {
+    // This test replaces an earlier assertion that `FSADD` (opmode $62) trapped to vector
+    // 11. That assertion encoded a real GAP, not a design decision: FSADD/FDADD/FSMUL/...
+    // are absent from MC68040UM Table 9-10's unimplemented-instruction list and appear in
+    // every M68000PRM "Opmode field" table marked "Supported by MC68040 only", i.e. they
+    // are hardware instructions. They execute the SAME operation as their base opmode and
+    // differ only in rounding precision, which rides to the EU in the same 7-bit `fpuOp`
+    // field -- so the whole of decode's job here is to stop rejecting them and to get
+    // `usesFpSrcA` (dyadic-ness) right for the new encodings.
+    run { dut =>
+      // (ext word, expected raw opmode, dyadic?, writes an FP destination?)
+      val cases = Seq(
+        (0x0440, 0x40, false),   // FSMOVE.S Dn,FPn   (monadic)
+        (0x0444, 0x44, false),   // FDMOVE
+        (0x0441, 0x41, false),   // FSSQRT
+        (0x0445, 0x45, false),   // FDSQRT
+        (0x0458, 0x58, false),   // FSABS
+        (0x045C, 0x5C, false),   // FDABS
+        (0x045A, 0x5A, false),   // FSNEG
+        (0x045E, 0x5E, false),   // FDNEG
+        (0x0460, 0x60, true),    // FSDIV  (dyadic -- reads FPn)
+        (0x0464, 0x64, true),    // FDDIV
+        (0x0462, 0x62, true),    // FSADD
+        (0x0466, 0x66, true),    // FDADD
+        (0x0463, 0x63, true),    // FSMUL
+        (0x0467, 0x67, true),    // FDMUL
+        (0x0468, 0x68, true),    // FSSUB
+        (0x046C, 0x6C, true))    // FDSUB
+      for ((ext, opmode, dyadic) <- cases) {
+        drive(dut, op = 0xF200, ext = ext, len = 2); sleep(1)
+        val n = f"opmode $$$opmode%02X"
+        assert(!dut.uop.faulted.toBoolean, s"$n must NOT trap to FPSP any more")
+        assert(dut.uop.fpuOp.toInt == opmode,
+          s"$n: fpuOp must carry the RAW opmode (the precision travels in it)")
+        assert(dut.uop.writesFp.toBoolean, s"$n writes an FP destination")
+        assert(dut.uop.usesFpSrcA.toBoolean == dyadic,
+          s"$n: usesFpSrcA=${dut.uop.usesFpSrcA.toBoolean}, expected $dyadic")
+      }
     }
   }
 

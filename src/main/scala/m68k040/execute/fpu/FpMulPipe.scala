@@ -30,6 +30,7 @@ class FpMulPipe extends Component {
     val dst      = in Bits (80 bits)
     val src      = in Bits (80 bits)
     val rmode    = in Bits (2 bits)
+    val precision = in Bits (2 bits)     // effective FPCR.PREC / forced FSMUL,FDMUL
     val outValid = out Bool ()
     val outReq   = out(FpRoundReq())
   }
@@ -47,6 +48,7 @@ class FpMulPipe extends Component {
     val sZero = RegNext(io.src(78 downto 0) === 0)
     val dSub  = RegNext(Fp80.exp(io.dst) === 0); val sSub = RegNext(Fp80.exp(io.src) === 0)
     val rmod  = RegNext(io.rmode)          // latched at issue, travels with the req
+    val prec  = RegNext(io.precision)      // ditto -- see FpRoundReq.prec
     val dClz  = RegNext(Fp80.clz(io.dst(63 downto 0)))
     val sClz  = RegNext(Fp80.clz(io.src(63 downto 0)))
   }
@@ -69,6 +71,7 @@ class FpMulPipe extends Component {
     req.sign := zSign; req.exp := zExp; req.sig := 0; req.round := False; req.sticky := False
     req.writeFp := True; req.fpccFromSrc := False; req.fpccOverride := 0
     req.rmode := m0.rmod
+    req.prec  := m0.prec
     req.exc.clearExc()
     req.exc.snan  := m0.dSN || m0.sSN
     req.exc.operr := infZero && !anyNan

@@ -1629,11 +1629,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // the Byte format's A7 word-alignment quirk are carried over UNVERIFIED against the
     // MC68040 UM's own FP data format chapter (this session had no primary-source access) --
     // flagged exactly as Finding 6/7 required, not silently assumed correct.
-    val ucFpNative =
-      (ucFpOpmode === B"7'h00") || (ucFpOpmode === B"7'h01") || (ucFpOpmode === B"7'h03") ||
-      (ucFpOpmode === B"7'h04") || (ucFpOpmode === B"7'h18") || (ucFpOpmode === B"7'h1A") ||
-      (ucFpOpmode === B"7'h20") || (ucFpOpmode === B"7'h22") || (ucFpOpmode === B"7'h23") ||
-      (ucFpOpmode === B"7'h28") || (ucFpOpmode === B"7'h38") || (ucFpOpmode === B"7'h3A")
+    val ucFpNative = m68k040.execute.fpu.FpSource.isNativeOpmode(ucFpOpmode)
     // MEMINDIRECT-klass EAs ([bd,An],od / ([bd,An,Xn],od) / PC-rel memory-indirect
     // brackets) are OUT of this task's scope (not listed among Task 5's covered modes) --
     // `EaClass.MEMSIMPLE` excludes them (mirrors the bit-field-memory family's own

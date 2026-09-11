@@ -151,6 +151,7 @@ object DivEuPlugin {
     divEu.fpCtrlFpsrIn  := svc.fpsr
     divEu.fpCtrlFpiarIn := svc.fpiar
     divEu.fpRmodeIn     := svc.roundingMode
+    divEu.fpPrecIn      := svc.precision
     val en = svc.excEnable
     divEu.fpExcEnableIn.snan  := en(6)
     divEu.fpExcEnableIn.operr := en(5)
@@ -214,6 +215,15 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     * The default is also the architecturally correct value for an unwired DUT: FPCR
     * resets to 0. */
   var fpRmodeIn: Bits = null
+  /** FPCR[7:6], the architectural rounding PRECISION (`FpPrec`: 00 Extend / 01 Single /
+    * 10 Double / 11 undefined). Same contract as `fpRmodeIn` in every respect: sampled at
+    * ISSUE into `fpS1Prec` so an FPCR write landing mid-flight cannot re-mux an
+    * already-issued result, and default-driven to the reset value (Extend) so a standalone
+    * EU DUT that instantiates no `FpuControlPlugin` still elaborates. What reaches
+    * `FpuCore` is NOT this value directly but `FpSource.opmodeToPrecision`'s combination of
+    * it with the instruction's own opmode, because the MC68040's FS<op>/FD<op> encodings
+    * override FPCR.PREC (UM 10.7). */
+  var fpPrecIn: Bits = null
   /** Per-class exception-ENABLE bits, i.e. FPCR[15:8] re-mapped field by field into
     * `FpExcFlags` (the re-map lives in `DivEuPlugin.wireFpControl`). Same contract as
     * `fpRmodeIn`: default all-clear for a standalone DUT, driven from
@@ -266,6 +276,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpccWakeupPort   = Flow(UInt(4 bits))
     fpFaultPort      = Flow(EuFault()); fpFaultPort.simPublic()
     fpRmodeIn = Bits(2 bits); fpRmodeIn.allowOverride; fpRmodeIn := B"2'b00"
+    fpPrecIn  = Bits(2 bits); fpPrecIn.allowOverride;  fpPrecIn  := B"2'b00"
     fpExcEnableIn = FpExcFlags()
     fpExcEnableIn.flatten.foreach(_.allowOverride)
     fpExcEnableIn.clearExc()
@@ -1062,6 +1073,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpS1Fmt    = Reg(Bits(3 bits))
     val fpS1Opmode = Reg(Bits(7 bits))      // u0.fpuOp: the FpOp selector AND io.cromSel
     val fpS1Rmode  = Reg(Bits(2 bits))      // FPCR[5:4] as it stood at ISSUE, not at start
+    // The EFFECTIVE rounding precision: FPCR[7:6] at ISSUE, unless the opmode is one of the
+    // 16 MC68040 forced-precision encodings (FSADD/FDADD/...), which override it. Resolved
+    // HERE rather than inside FpuCore because FpuCore's `io.op` has already collapsed
+    // FSADD and FADD onto the same `FpOp` -- the precision is the only thing that differs.
+    val fpS1Prec   = Reg(Bits(2 bits))
     when(fpAccept) {
       fpS1IntA   := rdA.data
       // `rdB.data` RAW rather than `s0B`: the microcode-emitted FP rows set useImm=True to
@@ -1077,6 +1093,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       fpS1Fmt    := u0.fpSrcFmt
       fpS1Opmode := u0.fpuOp
       fpS1Rmode  := fpRmodeIn
+      fpS1Prec   := FpSource.opmodeToPrecision(u0.fpuOp,
+                      u0.fpSrcKind === FpSrcKind.ROMCONST, fpPrecIn)
       loadFpCtx(fpS1Ctx)
     }
 
@@ -1134,6 +1152,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpu.io.dst     := fpS1FpDst
     fpu.io.src     := fpSrcVal
     fpu.io.rmode   := fpS1Rmode
+    fpu.io.precision := fpS1Prec
     fpu.io.cromSel := fpS1Opmode      // meaningful only when fpSrcKind === ROMCONST
 
     // ---- fixed lane: a descriptor shadow pipe, sized from FpuCore.FixedLatency ----
