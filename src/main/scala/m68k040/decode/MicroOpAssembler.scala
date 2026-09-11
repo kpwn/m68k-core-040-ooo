@@ -1650,6 +1650,16 @@ object MicroOpAssembler {
                      (pkt.words(0)(8 downto 6)   === B"3'b001") &&
                      (fsccMode5 =/= 1) && !((fsccMode5 === 7) && (fsccReg5 >= 2)) &&
                      (pkt.words(0) =/= B"16'hF27F")
+    // The other two members of type 001, same `1111 001 001 mmmrrr` + condition-extension
+    // word shape, split by the SAME <ea>-field carve-up the line-5 family uses:
+    //   mode 001            -> FDBcc Dn, disp16   (+ a trailing displacement word)
+    //   mode 111 reg {2,3,4}-> FTRAPcc            (no operand / #data16 / #data32)
+    val isFpType001 = (pkt.words(0)(15 downto 12) === B"4'hF") &&
+                      (pkt.words(0)(11 downto 9)  === B"3'b001") &&
+                      (pkt.words(0)(8 downto 6)   === B"3'b001")
+    val isFDbccOp   = isFpType001 && (fsccMode5 === 1)
+    val isFTrapccOp = isFpType001 && (fsccMode5 === 7) &&
+                      ((fsccReg5 === 2) || (fsccReg5 === 3) || (fsccReg5 === 4))
 
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
@@ -2216,7 +2226,7 @@ object MicroOpAssembler {
     // mantissa. This IS the internal Fp80 layout (Decision 1) -- zero conversion needed.
     val fpImmExtVal    = pkt.words(2) ## pkt.words(4) ## pkt.words(5) ## pkt.words(6) ## pkt.words(7)
     val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isFSccOp && !isDbccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
+              !isRtsBad && !isRtrBad && !isSccOp && !isFSccOp && !isDbccOp && !isFDbccOp && !isFTrapccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
               !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
               !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
@@ -2850,6 +2860,55 @@ object MicroOpAssembler {
     // is a branch-class cond-trap (isCondTrap, cond=cccc); the branch EU evaluates the
     // condition via `taken` and, if taken, drives a trapvFault (vector 7). Stacked PC
     // = nextPc (not restartable) -> faultUsesNextPc=True. No register/CCR change.
+    // ── FDBcc Dn,disp16 / FTRAPcc — the rest of F-line type 001 ───────────────────
+    // Both mirror their line-5 twins exactly; the only differences are the condition
+    // SOURCE (the FP extension word's cc[3:0] rather than the opword's cccc field) and
+    // which condition-code register the branch EU reads (`readsFpcc` selects the FP
+    // predicate table there, as for FBcc/FScc).  Only cc[3:0] is carried -- 0x10..0x1F are
+    // the truth-identical signaling spellings.
+    when(isFDbccOp) {
+      opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.isBranch      := True
+      opUop.isDbcc        := True
+      opUop.cond          := fsccCond
+      opUop.readsNzvc     := False
+      opUop.readsFpcc     := True
+      opUop.srcAReg       := fsccReg5.resize(5); opUop.srcAValid := True  // old Dn (counter)
+      opUop.srcBValid     := False
+      opUop.dstReg        := fsccReg5.resize(5); opUop.dstValid := True   // Dn (dec or unchanged)
+      opUop.useImm        := False
+      opUop.writesNzvc    := False; opUop.writesX := False
+      // The displacement is one word LATER than a line-5 DBcc's: the condition extension
+      // word sits at words(1), so disp16 is words(2).  The 68k rule is that the destination
+      // is the DISPLACEMENT WORD'S OWN ADDRESS plus the displacement -- which is pc+2 for a
+      // line-5 DBcc and for FBcc, but pc+4 here because the condition word comes first.
+      // The branch EU's shared `relTarget` is pc+2+branchDisp, so fold the extra word in
+      // rather than special-casing the adder.
+      opUop.branchDisp    := (pkt.words(2).asSInt.resize(32) + 2).asBits
+      opUop.unimplemented := False
+      opUop.faulted       := False; opUop.faultVector := 0
+      opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
+    }
+    when(isFTrapccOp) {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.unimplemented := False
+      opUop.isRte         := False
+      opUop.faulted       := False            // conditional: the fault is raised at execute
+      opUop.faultVector   := 0
+      opUop.isBranch      := True
+      opUop.cond          := fsccCond
+      opUop.branchDisp    := 0
+      opUop.readsNzvc     := False
+      opUop.readsFpcc     := True
+      opUop.isCondTrap    := True
+      opUop.faultUsesNextPc := True
+    }
     when(isTrapccOp) {
       opUop.op            := DecOp.ILLEGAL    // no ALU action
       opUop.cluster       := Cluster.INT

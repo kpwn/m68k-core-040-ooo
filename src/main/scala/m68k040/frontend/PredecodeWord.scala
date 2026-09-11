@@ -1150,6 +1150,16 @@ object PredecodeWord {
         val fsccIsEa  = (fsccMode =/= 1) && !((fsccMode === 7) && (fsccReg >= 2))
         val fpScc     = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b001") &&
                         fsccIsEa
+        // The other two type-001 members, with their own fixed lengths:
+        //   FDBcc  = opword + cond ext + disp16                      -> 3 words
+        //   FTRAPcc= opword + cond ext + {0,1,2} immediate words     -> 2/3/4 words
+        //            (reg 4 = no operand, reg 2 = #data16, reg 3 = #data32)
+        val fpType001 = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b001")
+        val fpDbcc    = fpType001 && (fsccMode === 1)
+        val fpTrapcc  = fpType001 && (fsccMode === 7) &&
+                        ((fsccReg === 2) || (fsccReg === 3) || (fsccReg === 4))
+        val fpTrapccLen = Mux(fsccReg === 4, U(2, 4 bits),
+                          Mux(fsccReg === 2, U(3, 4 bits), U(4, 4 bits)))
         val (fsccEaOk, fsccEaExt, fsccEaAmb) =
           eaExt(fsccMode, fsccReg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
 
@@ -1253,6 +1263,12 @@ object PredecodeWord {
           r.simple        := True
           r.lenWords      := (U(2, 4 bits) + fpEaExt).resized   // opword + FP ext + EA ext
           r.ambiguousLine := fpEaAmb
+        } .elsewhen(fpDbcc) {
+          r.simple   := True
+          r.lenWords := U(3, 4 bits)
+        } .elsewhen(fpTrapcc) {
+          r.simple   := True
+          r.lenWords := fpTrapccLen
         } .elsewhen(fpScc && fsccEaOk) {
           r.simple        := True
           r.lenWords      := (U(2, 4 bits) + fsccEaExt).resized  // opword + cond ext + EA ext
