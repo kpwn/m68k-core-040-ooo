@@ -178,59 +178,44 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
     assert(u.fpSrcKind == "ROMCONST", s"$u")
   }
 
-  test("cpGEN memory-EA + ext1 opclass 111 (store direction, NOT this task's scope) still traps -- unaffected by this task", VerilatorTest) {
+  // RE-POINTED 2026-09-11. This pinned opclass 111 (the FMOVEM.X STORE direction) as
+  // "still traps -- task #242, not yet implemented". That task has since landed:
+  // 44f38624 implemented the store direction. `FMOVEM.X <list>,(An)` is a legal
+  // MC68040 instruction, so asserting a vector-11 trap was pinning non-68040
+  // behaviour. Kept as a DECODE test of the store path rather than deleted, so the
+  // opclass-111-vs-FMOVECR boundary this test was written to guard is still covered:
+  // with a MEMORY EA it must be claimed by the data-list engine as a STORE, and must
+  // NOT be mistaken for FMOVECR (whose gate is register-direct only).
+  test("cpGEN memory-EA + ext1 opclass 111 decodes as an FMOVEM.X STORE (not FMOVECR)", VerilatorTest) {
     val base = 0xA700L
-    // (An) mode=010, An=A1; ext1 opclass=111 (store direction -- task #242, not yet
-    // implemented) with a nonzero static-list mask. This is the exact boundary the design
-    // doc flags: opclass 111 is ALSO the raw bits FMOVECR aliases for the register-direct
-    // case -- but with a MEMORY EA (mode 010) instead of register-direct (mode 000), so
-    // this must NOT be claimed by either FMOVECR's own register-direct-only gate OR (yet)
-    // this task's opclass-110-only data-list engine -- it must fall through to the
-    // PRE-EXISTING µcode-engine trap path exactly as it did before this task (a regression
-    // check, not a new-feature check).
     val ext1 = (0x7 << 13) | 0x01   // opclass=111, static (bit11=0), mask=0x01
-    val us = collect(Seq(fpGenOp(2, 1), ext1, 0x4e71, 0x4e71), base, 2)
+    val us = collect(Seq(fpGenOp(2, 1), ext1, 0x4e71, 0x4e71), base, 4)
     assert(us.nonEmpty, s"$us")
-    val u = us.head
-    assert(u.faulted && u.faultVector == 11,
-      s"opclass-111 memory-EA FMOVEM must still trap (vector 11, FP_MEM_TRAP_ENTRY) -- this task's gate is opclass-110-only: $u")
-    // NOT the data-list engine's LOAD-chunk shape.
-    assert(!(u.mem == "LOAD" && u.dst == MicroOpAssembler.T0),
-      s"must NOT have been claimed by the data-list engine: $u")
+    assert(us.forall(u => !u.faulted),
+      s"FMOVEM.X <list>,(An) is a real 68040 instruction and is implemented (44f38624) -- " +
+      s"it must NOT trap: $us")
+    assert(us.exists(_.mem == "STORE"),
+      s"a memory-EA opclass-111 FMOVEM.X must produce STORE chunks (and must not be " +
+      s"claimed by FMOVECR, whose gate is register-direct only): $us")
   }
 
-  // ── SCOPE-BOUNDARY REGRESSION (campaign/fmovem-postinc-ring): `(An)+`/`-(An)` are NOT
-  // admitted yet, contrary to what the overall design doc's §1 table implies for the
-  // FEATURE'S EVENTUAL full scope -- `s0IsFpGenMemEa`'s EA-mode restriction (this file's
-  // header doc, DecodeStage.scala's `slot0IsFmovemx` comment) admits ONLY mode 010 `(An)`
-  // and mode 101 `(d16,An)`; postincrement/predecrement/indexed/PC-relative are still
-  // task #242-245 (design doc §7 breakdown items 2-4), UNLANDED as of this task -- no
-  // `fmovemxAnUop`-equivalent An-auto-update µop exists anywhere in DecodeStage.scala.
-  // This pins that boundary precisely: `FMOVEM.X (An)+,<list>` (opclass 110, EA mode
-  // 011) must still fall through to the pre-existing µcode-engine trap
-  // (FP_MEM_TRAP_ENTRY, vector 11) exactly like the opclass-111 store case above, NOT
-  // silently reach the data-list engine with a wrong (non-auto-updating) address.
-  // Update/delete this test the moment `(An)+`/`-(An)` actually lands.
-  test("FMOVEM.X (An)+,FP0-FP7 (EA mode 011, load direction -- postinc NOT YET implemented) still traps", VerilatorTest) {
+  test("FMOVEM.X (An)+,FP0-FP7 (EA mode 011, load) decodes -- postincrement IS implemented", VerilatorTest) {
     val base = 0xA800L
-    // (An)+ mode=011, An=A1; ext1 opclass=110 (load direction, IN this task's scope),
-    // static list, full mask -- everything about this word IS admitted except the EA mode.
-    val us = collect(Seq(fpGenOp(3, 1), fxExt1(listRev = true, 0xFF), 0x4e71, 0x4e71), base, 2)
+    val us = collect(Seq(fpGenOp(3, 1), fxExt1(listRev = true, 0xFF), 0x4e71, 0x4e71), base, 4)
     assert(us.nonEmpty, s"$us")
-    val u = us.head
-    assert(u.faulted && u.faultVector == 11,
-      s"opclass-110 (An)+ FMOVEM must still trap (vector 11, FP_MEM_TRAP_ENTRY) -- " +
-      s"postincrement is unowned until task #242-245 land: $u")
-    assert(!(u.mem == "LOAD" && u.dst == MicroOpAssembler.T0),
-      s"must NOT have been claimed by the data-list engine (which has no An-update path): $u")
+    assert(us.forall(u => !u.faulted),
+      s"(An)+ FMOVEM.X is a real 68040 instruction and is implemented (44f38624) -- it must NOT trap: $us")
+    assert(us.head.mem == "LOAD" && us.head.baseV,
+      s"first uop must be an An-based chunk LOAD: $us")
+  }
+  // RE-POINTED 2026-09-11, same reason as the `(An)+` case above: `-(An)` is a legal
+  // MC68040 FMOVEM.X EA and the auto-update landed in 44f38624.
+  test("FMOVEM.X -(An),FP0-FP7 (EA mode 100, load) decodes -- predecrement IS implemented", VerilatorTest) {
+    val base = 0xA900L
+    val us = collect(Seq(fpGenOp(4, 1), fxExt1(listRev = false, 0xFF), 0x4e71, 0x4e71), base, 4)
+    assert(us.nonEmpty, s"$us")
+    assert(us.forall(u => !u.faulted),
+      s"-(An) FMOVEM.X is a real 68040 instruction and is implemented (44f38624) -- it must NOT trap: $us")
   }
 
-  test("FMOVEM.X -(An),FP0-FP7 (EA mode 100, predecrement NOT YET implemented) still traps", VerilatorTest) {
-    val base = 0xA900L
-    val us = collect(Seq(fpGenOp(4, 1), fxExt1(listRev = false, 0xFF), 0x4e71, 0x4e71), base, 2)
-    assert(us.nonEmpty, s"$us")
-    val u = us.head
-    assert(u.faulted && u.faultVector == 11,
-      s"opclass-110 -(An) FMOVEM must still trap (vector 11, FP_MEM_TRAP_ENTRY): $u")
-  }
 }
