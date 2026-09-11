@@ -18,13 +18,24 @@
 | behavior, and are kept out of the fuzzer's generation set instead
 | (tools/fuzz/gen_program.py).
 |
-| (An) direct — mode=010: Musashi's WRITE_EA_32/READ_EA_32 case 2 always
-|   computes `ea = REG_A[reg]` with NO increment and NO per-register
-|   offset — every present register in the list targets the identical
-|   address.  Store: only the LAST-processed present register (FPIAR,
-|   since access order is always FPCR,FPSR,FPIAR) survives in memory.
-|   (Load direction exists in decode too, but see the KNOWN SEPARATE
-|   BUG note below — not asserted here.)
+| (An) direct — mode=010: CONSECUTIVE longs, FPCR@0 / FPSR@4 / FPIAR@8 —
+|   the same forward packing every other control-mode EA uses.
+|
+|   ⚠️ CORRECTED 2026-09-11. This test previously asserted a SAME-ADDRESS
+|   CLOBBER here ("only FPIAR survives"), derived from Musashi's
+|   fmove_fpcr(), which does:
+|       if (reg & 4) WRITE_EA_32(ea, REG_FPCR);
+|       if (reg & 2) WRITE_EA_32(ea, REG_FPSR);
+|       if (reg & 1) WRITE_EA_32(ea, REG_FPIAR);
+|   — all three to the SAME `ea`, because its WRITE_EA_32 case 2 does not
+|   advance the address. That is a MUSASHI BUG, not 68040 behaviour: a real
+|   chip transfers a multi-register control list to consecutive memory
+|   locations. The test even asserted forward packing for (An)+ two blocks
+|   below, which is inconsistent with the clobber model it used here.
+|
+|   The core was already architecturally correct and this check was failing
+|   it (0xDEAD2001). Where Musashi and the chip disagree, this project
+|   follows the chip — the goal is 1:1 with a real 68040.
 |
 | (An)+ postincrement — mode=011: forward packing (FPCR@0, FPSR@4,
 |   FPIAR@8), same as (d16,An)/predecrement's forward table, PLUS a
@@ -83,10 +94,20 @@ _start:
 
     lea     0x00021000, %a0
     .short  0xF210, 0xBC00             | FMOVEM.L FPCR/FPSR/FPIAR,(A0)
-    | Same-address clobber: only FPIAR (processed last) survives.
+    | CONSECUTIVE longs — FPCR@0, FPSR@4, FPIAR@8 — exactly as every other
+    | control-mode EA packs them. NOT the same-address clobber this check used to
+    | assert: that was Musashi's bug being mistaken for the architecture (see the
+    | header note), and a real 68040 transfers a multi-register control list to
+    | consecutive memory locations regardless of which control-mode EA is used.
     move.l  0x00021000, %d1
-    cmp.l   #0x00000000, %d1
-    bne     _fail_20_01                | mem[(A0)] should be FPIAR(0), not FPCR
+    cmp.l   #0xCCCCCCCC, %d1
+    bne     _fail_20_01                | mem[(A0)+0] must be FPCR
+    move.l  0x00021004, %d1
+    cmp.l   #0xDDDDDDDD, %d1
+    bne     _fail_20_01                | mem[(A0)+4] must be FPSR
+    move.l  0x00021008, %d1
+    tst.l   %d1
+    bne     _fail_20_01                | mem[(A0)+8] must be FPIAR (0)
 
     | Load direction: decode coverage only (must not F-line) — exact
     | register content not asserted, see KNOWN SEPARATE BUG above.
