@@ -361,9 +361,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s1bfEa     = EaDecoder.decode(s1mi_opw(5 downto 0), Size.LONG,
                                       Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3)))
     // task #197: baseValid dropped for TRUE abs EAs only -- mirrors slot0IsBfDynMem's
-    // identical relaxation above (abs.W/.L EAs are MEMSIMPLE/baseValid=False; the Do=1-abs
-    // case is separately carved out to the illegal entry at ucBfDynRdEntry, not pre-filtered
-    // here). `!s1bfEa.pcRel` keeps (d16,PC) OUT of this engine (see s0bfEaOk's comment above
+    // identical relaxation above (abs.W/.L EAs are MEMSIMPLE/baseValid=False).  The Do=1-abs
+    // case used to be carved out to the illegal entry at ucBfDynRdEntry; it is now a fully
+    // supported shape (AluEuPlugin gates an invalid srcA to zero, so the DO1 byte-base
+    // recompute no longer adds the nominal base register) and needs no pre-filtering here. `!s1bfEa.pcRel` keeps (d16,PC) OUT of this engine (see s0bfEaOk's comment above
     // for the full rationale — neither the DO0 fold nor the DO1 byteBase recompute fold the
     // PC value, so admitting it here would silently miscompute instead of the pre-existing
     // fail-safe illegal trap).
@@ -861,10 +862,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // MicroOpAssembler 3a crack, whose `bfmBad` gate (bfDo||bfDw) unconditionally routes
     // ANY dynamic form to an ILLEGAL trap regardless of baseValid -- with no vector-4
     // handler installed, that traps into the reset vector's garbage and free-runs forever
-    // (a HANG from the test harness's viewpoint, not a clean fail). A genuinely-unsupported
-    // Do=1 (dynamic OFFSET) abs EA is separately carved out to the illegal entry at
-    // ucBfDynRdEntry (mirrors ucBfRmwDynEntry's identical abs+Do1 carve-out) -- this gate
-    // only needs to admit the EA class here, not pre-filter Do.
+    // (a HANG from the test harness's viewpoint, not a clean fail). Do=1 (dynamic OFFSET) at
+    // an abs EA used to be carved out to the illegal entry at ucBfDynRdEntry; it is now
+    // supported (see that comment) -- either way this gate only needs to admit the EA class
+    // here, not pre-filter Do.
     //
     // `!s0bfEa.pcRel` (review follow-up): PC-relative (d16,PC) is ALSO klass=MEMSIMPLE/
     // baseValid=False, so the plain baseValid-drop above would ALSO newly admit a dynamic
@@ -2371,45 +2372,47 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucBfEntRdOnly = (ucBfEntOp === 0) || (ucBfEntOp === 1) || (ucBfEntOp === 3) || (ucBfEntOp === 5)
     val ucIsBfDynRd   = !ucEntrySpec.microcoded && (ucEntrySpec.op === DecOp.BITFIELD) &&
                         ucBfEntRdOnly && (ucBfDo || ucBfDw)
-    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) is OUT OF SCOPE for the SAME reason
-    // as the RMW carve-out below (UBfAdd's byteBase-recompute reads SEaBase as a REGISTER,
-    // which an abs EA has none of) -- route to the vector-4 ILLEGAL entry instead of
-    // silently computing a wrong address (task #197: this case is newly REACHABLE now that
-    // slot0IsBfDynMem/slot1IsBfDynMemEarly no longer require baseValid; previously it never
-    // reached the engine at all, falling to the 3a bfmBad illegal gate instead — this Mux
-    // arm preserves that same fail-safe outcome via the engine's own illegal entry).
+    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) USED to be carved out to the vector-4
+    // ILLEGAL entry: the DO1 byteBase recompute is `UBfAdd srcA=SEaBase, srcB=T0(byteDelta)`,
+    // an abs EA has no base REGISTER -- but EaDecoder still gives it a NOMINAL `base = 8+reg`
+    // and merely clears baseValid, so the add read a live, unrelated address register (A1 for
+    // (xxx).L, A0 for (xxx).W) and produced a wrong address deterministically. AluEuPlugin now gates srcA to ZERO when `psrcAValid` is
+    // False (matching what BranchEu/LsEu already did for the identical invalid-base case —
+    // see the comment at its `src1`), so the add yields byteDelta alone and `eaDispLo` (the
+    // absolute address, already the raw EA disp for Do=1 since `ucBfByteOff` is forced 0)
+    // applies on top at the load rows — exactly the address the Do=0 abs chain computes.
+    // The carve-out is therefore gone and abs falls through to the ordinary DO1 entries.
     // Do=1 at a PC-REL EA (baseValid=False, pcRel=True) is task #199's newly-IMPLEMENTED
     // case (bf_pcrel_read.s cases 6-10) -- route to the dedicated PC-rel DO1 entries
     // (which fold `ctx.bfPcRelConst`=pc+4 into the byteBase recompute instead of reading
-    // SEaBase as a register) rather than falling into the abs-EA's ILLEGAL carve-out above.
-    // Checked BEFORE the plain abs carve-out so it takes priority for the pcRel subset.
+    // SEaBase as a register) rather than into the ordinary DO1 entries.  Still checked
+    // FIRST, and still a separate entry pair even though the abs carve-out is gone: zeroing
+    // an invalid base is enough for an ABSOLUTE EA (its whole address rides eaDispLo) but
+    // NOT for a PC-relative one, which additionally needs pc+4 folded into the byte base.
     val ucBfDynRdEntry = Mux(ucBfDo && !ucBfEaDec.baseValid && ucBfEaDec.pcRel,
       Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_PCREL_DO1_ENTRY, ew bits),
                            U(Microcode.BF_DYN_RD_PCREL_DO1_ENTRY,  ew bits)),
-      Mux(ucBfDo && !ucBfEaDec.baseValid,
-        U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
-        Mux(ucBfDo,
-          Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
-                               U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
-          U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits))))
+      Mux(ucBfDo,
+        Mux(ucBfEntOp === 5, U(Microcode.BF_DYN_FFO_DO1_ENTRY, ew bits),
+                             U(Microcode.BF_DYN_RD_DO1_ENTRY,  ew bits)),
+        U(Microcode.BF_DYN_RD_DO0_ENTRY, ew bits)))
     // Bit-field RMW DYNAMIC (slice 3c): BFCHG(2)/BFCLR(4)/BFSET(6) with Do||Dw -> the dynamic
     // RMW entry (Do=1 recomputes byteBase; Do=0 folds). BFINS(7) dynamic -> the dedicated INS
     // entries (prefunnel -> register-form insert -> reload+inverse-funnel; X untouched).
-    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) is OUT OF SCOPE (the DO1 chains'
-    // UBfAdd reads SEaBase as a REGISTER — an abs EA has none, so the byteBase add would
-    // read garbage): route it to the vector-4 ILLEGAL entry (traps, NOT silent-wrong) —
-    // mirroring the read-only path, where the !baseValid dynamic falls to the 3a bfmBad
-    // illegal gate. Do=0 abs is IN scope (byteBase folds into the disp; the loads/stores
-    // take the LS disp-only path exactly like the static 3b abs chain).
+    // Do=1 at an ABS EA (baseValid=False, (xxx).W/.L) is now IN scope, for the same reason
+    // as the read-only path above: AluEuPlugin gates an invalid srcA to ZERO, so the DO1
+    // chains' `UBfAdd srcA=SEaBase` contributes nothing and the byteBase is byteDelta alone,
+    // with the absolute address riding `eaDispLo` at every load/store row. Do=0 abs was
+    // always in scope (byteBase folds into the disp; the loads/stores take the LS disp-only
+    // path exactly like the static 3b abs chain) — both offsets now share that behaviour.
     val ucBfRmwOp   = ucEntryPkt.words(0)(10 downto 8)
     val ucIsBfRmwDyn = ucIsBfRmw && (ucBfDo || ucBfDw)
-    val ucBfRmwDynEntry = Mux(ucBfDo && !ucBfEaDec.baseValid,
-      U(Microcode.BF_DYN_ILLEGAL_ENTRY, ew bits),
+    val ucBfRmwDynEntry =
       Mux(ucBfRmwOp === 7,
         Mux(ucBfDo, U(Microcode.BF_DYN_INS_DO1_ENTRY, ew bits),
                     U(Microcode.BF_DYN_INS_DO0_ENTRY, ew bits)),
         Mux(ucBfDo, U(Microcode.BF_DYN_RMW_DO1_ENTRY, ew bits),
-                    U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits))))
+                    U(Microcode.BF_DYN_RMW_DO0_ENTRY, ew bits)))
     // ── Bit-field MEMORY-INDIRECT routing (task #197) ──────────────────────────────
     // Reuses the SAME EXISTING generic MI pointer-resolve pattern (UMiPtrLoad) already
     // built for the §5 host-op crack, chained into the SAME bit-field funnel/RES/LO5/HI5

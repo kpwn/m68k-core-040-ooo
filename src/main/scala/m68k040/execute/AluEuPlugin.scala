@@ -152,7 +152,31 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
     rdC.addr := u0.psrcC                 // BITFIELD-dynamic srcC = T0 (packed offset/width)
-    val src1 = rdA.data
+    // srcAValid=False does NOT mean "reads zero" on its own, and the value it does read
+    // is worse than undefined — it is a LIVE ARCHITECTURAL REGISTER. EaDecoder gives every
+    // EA a nominal `base = 8 + reg` and merely clears `baseValid` for the modes that have
+    // no base (EaDecoder.scala's defaults + the mode-7 arms), so an absolute (xxx).L EA
+    // (mode 7, reg 1) still carries srcAReg = A1, which rename resolves to A1's current
+    // value. Reading it is not a rare corruption — it is a deterministic read of whatever
+    // the program last left in an unrelated register.
+    //
+    // Both other EUs that can see an invalid srcA already force the contribution to ZERO
+    // for exactly this reason (BranchEuPlugin's `s1TgtBase`, "base contribution must be
+    // ZERO"; LsEuPlugin's abs/PC-rel "the assembler folded the absolute/PC value into imm"
+    // path). The ALU was the odd one out, and that inconsistency was a real ISA gap: the
+    // bit-field DYNAMIC-offset (Do=1) byte-base recompute is `UBfAdd srcA=SEaBase,
+    // srcB=T0(byteDelta)`, so at an absolute EA all five DO1 chains (RD/FFO/RMW/INS and the
+    // RMW store recompute) would have added A1 to byteDelta and accessed a wrong address.
+    // That shape had to be carved out to a vector-4 ILLEGAL trap to keep it from silently
+    // reading and WRITING the wrong memory. With srcA gated to zero here the add yields
+    // byteDelta alone and `eaDispLo` (the absolute address) applies on top at the load/store
+    // rows, exactly as it already does for the Do=0 abs chain, so the carve-outs are gone —
+    // see `ucBfDynRdEntry`/`ucBfRmwDynEntry` in DecodeStage.scala and the regression
+    // bf_abs_dyn_offset.s, whose A1 poison is what makes its negative control bite.
+    //
+    // Audited at the same time: `UMove` and `UMiPtrLoad` are the only other micro-ops that
+    // take srcA = SEaBase, and both are LS-cluster, where the gate already existed.
+    val src1 = Mux(u0.psrcAValid, rdA.data, B(0, 32 bits))
     val src2 = Mux(u0.useImm, u0.imm, rdB.data)
     // Flag sources (only the toCcr read-modify-write uses them).
     nzvcRd.addr := u0.pNzvcSrc
