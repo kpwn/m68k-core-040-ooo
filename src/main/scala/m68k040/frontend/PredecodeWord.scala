@@ -1136,10 +1136,10 @@ object PredecodeWord {
         // ESTABLISHED INVARIANT (Task 6 depends on it): a cpGEN instruction is never
         // genuinely 1 word, so lenWords===1 on a cpGEN opword means "not framed".
         val fpIsGen   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
-        // FBF/FNOP framing (OperationDecoder's `isFpBccF`): cpID 001 + type 01x
-        // (010=FBcc.W, 011=FBcc.L) with the condition field == 0 ("branch never").
-        val fpBccF    = (op(11 downto 9) === B"3'b001") && (op(8 downto 7) === B"2'b01") &&
-                        (op(5 downto 0) === B"6'b000000")
+        // FBcc framing: cpID 001 + type 01x (010=FBcc.W, 011=FBcc.L).  Now that the whole
+        // family executes -- FBF/FNOP as a no-op, every other condition as a real
+        // PC-relative branch off FPCC -- ALL of them must be framed, not just cc==0.
+        val fpBcc     = (op(11 downto 9) === B"3'b001") && (op(8 downto 7) === B"2'b01")
         val fpClass   = extW(15 downto 13)          // 000/010 arith, 011 FMOVE->ea,
                                                     // 100/101 FMOVE(M) ctrl regs, 110/111 FMOVEM
         val fpSrcSpec = extW(12 downto 10).asUInt   // R/M=1: source data FORMAT (see Task 4 Step 1)
@@ -1236,15 +1236,13 @@ object PredecodeWord {
           r.simple        := True
           r.lenWords      := (U(2, 4 bits) + fpEaExt).resized   // opword + FP ext + EA ext
           r.ambiguousLine := fpEaAmb
-        } .elsewhen(fpBccF) {
-          // FBF / FNOP (see OperationDecoder's `isFpBccF`).  `1111 001 01x cccccc` with
-          // cc==0 is "branch never" -- a pure no-op that still has to SKIP its
-          // displacement: 2 words for FBcc.W (type 010), 3 for FBcc.L (type 011).  The
-          // generic F-line fallback below frames every non-cpGEN opword as 1 word, which
-          // is correct only while the opword traps on its own; now that cc==0 executes,
-          // framing it as 1 word would fetch the displacement as an instruction.  Scoped
-          // to cc==0 so every other (still-trapping) FBcc condition keeps its 1-word
-          // framing and therefore its existing trap PC.
+        } .elsewhen(fpBcc) {
+          // `1111 001 01x cccccc`: 2 words for FBcc.W (type 010, opword + disp16), 3 for
+          // FBcc.L (type 011, opword + disp32).  The generic F-line fallback below frames
+          // every non-cpGEN opword as 1 word, which is only correct while the opword traps
+          // on its own -- once it executes, a 1-word frame fetches the displacement as an
+          // instruction.  This covers the whole family: cc==0 is the FBF/FNOP no-op and
+          // every other condition is a real branch (see OperationDecoder's `isFpBcc`).
           r.simple   := True
           r.lenWords := Mux(op(6), U(3, 4 bits), U(2, 4 bits))
         } .otherwise {

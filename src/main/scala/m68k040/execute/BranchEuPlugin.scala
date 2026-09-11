@@ -1,7 +1,7 @@
 package m68k040.execute
 
 import m68k040.execute.iq.IqContext
-import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
+import m68k040.execute.regfile.{FpccRegFileService, IntRegFileService, NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -106,6 +106,13 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
   // psrcCValid=False so the read is architecturally a don't-care (the S1 term is forced
   // to zero, exactly like the LS EU's `idxTerm0` gating).
   var idxRd: RegFileReadPort = null
+  // FPCC read port for the FP conditional branches (FBcc). The 4-bit renamed FPCC is
+  // {NaN, I, Z, N} = bit3..bit0 (FpAddPipe.scala's "Internal FPCC order" note). An FBcc
+  // declares `readsFpcc`, which is all the IQ needs: `trigInit`'s FPCC dep and the
+  // `cplxFpccWait` dynamic wait are both cluster-agnostic (keyed only on `readsFpcc`) and
+  // the per-slot `ready` term already includes `!cplxFpccWait`, so a branch waiting on an
+  // in-flight FCMP is handled by the SAME machinery as a CPLX reader -- no IQ change.
+  var fpccRd: RegFileReadPort = null
   override def issue = issuePort
   override def completion = completionPort
   override def trapvFault = trapvFaultPort
@@ -124,6 +131,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     anW   = host[IntRegFileService].newWrite(latency = 1)
     anByp = host[IntRegFileService].newBypass()
     idxRd = host[IntRegFileService].newRead(forceNoBypass = false)
+    fpccRd = host[FpccRegFileService].newRead(forceNoBypass = true)
   }
 
   val logic = during build new Area {
@@ -141,6 +149,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // term is REGISTERED into s1Index at the S0->S1 boundary so the target adder stays a
     // shallow stage off flops, mirroring `s1TgtBase` (no deep ALU-bypass cone).
     idxRd.addr := u0.psrcC
+    fpccRd.addr := u0.pFpccSrc
     val idxRaw0   = Mux(u0.indexLong, idxRd.data.asUInt,
                         idxRd.data(15 downto 0).asSInt.resize(32).asUInt)
     val idxScaled = ((idxRaw0 << u0.indexScale).resize(32))
@@ -150,6 +159,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val s1Valid = RegNext(issuePort.valid) init False
     val s1Ctx   = RegNext(issuePort.payload)
     val s1Nzvc  = RegNext(nzRd.data)              // {N(3),Z(2),V(1),C(0)}
+    val s1Fpcc  = RegNext(fpccRd.data)            // {NaN(3),I(2),Z(1),N(0)}
     val s1AnBase= RegNext(anRd.data.asUInt)       // pre-pop A7 (for the postinc write)
     // Registered int target base (psrcA). For an absolute / PC-folded ibranch the
     // assembler leaves psrcAValid=False (base contribution must be ZERO; the folded
@@ -161,7 +171,7 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
 
     // ---- S1: condition eval (cond[3:0]) ----
     val n = s1Nzvc(3); val z = s1Nzvc(2); val v = s1Nzvc(1); val c = s1Nzvc(0)
-    val taken = u1.cond.asUInt.mux(
+    val intTaken = u1.cond.asUInt.mux(
       0  -> True,                  // T   (BRA / always)
       1  -> False,                 // F   (BSR-style false; no branch)
       2  -> (!c && !z),            // HI
@@ -179,6 +189,38 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       14 -> (!z && (n === v)),     // GT
       15 -> (z || (n =/= v))       // LE
     )
+    // ---- S1: FP condition eval (FBcc) ----------------------------------------------
+    // The PRM's 32 FP conditional predicates split into two halves IDENTICAL in truth
+    // value: 0x10..0x1F are the "signaling" spellings of 0x00..0x0F (SF/SEQ/GT/... vs
+    // F/EQ/OGT/...), differing ONLY in whether an unordered operand raises BSUN. The
+    // taken/not-taken decision therefore depends on cc[3:0] alone, so an FBcc reuses the
+    // EXISTING 4-bit `cond` field and needs no wider uop state -- cc[4] matters only for
+    // BSUN, which belongs to FP exception delivery (vec 48-54, not implemented). And
+    // `readsFpcc` already distinguishes an FP branch from an integer one, so no extra
+    // "isFpBranch" bit is needed either.
+    val fpNan = s1Fpcc(3); val fpZ = s1Fpcc(1); val fpN = s1Fpcc(0)
+    val fpTaken = u1.cond.asUInt.mux(
+      0  -> False,                              // F   / SF    (never)
+      1  -> fpZ,                                // EQ  / SEQ
+      2  -> !(fpNan || fpZ || fpN),             // OGT / GT
+      3  -> (fpZ || !(fpNan || fpN)),           // OGE / GE
+      4  -> (fpN && !(fpNan || fpZ)),           // OLT / LT
+      5  -> (fpZ || (fpN && !fpNan)),           // OLE / LE
+      6  -> !(fpNan || fpZ),                    // OGL / GL
+      7  -> !fpNan,                             // OR  / GLE
+      8  -> fpNan,                              // UN  / NGLE
+      9  -> (fpNan || fpZ),                     // UEQ / NGL
+      10 -> (fpNan || !(fpN || fpZ)),           // UGT / NLE
+      11 -> (fpNan || fpZ || !fpN),             // UGE / NLT
+      12 -> (fpNan || (fpN && !fpZ)),           // ULT / NGE
+      13 -> (fpNan || fpZ || fpN),              // ULE / NGT
+      14 -> !fpZ,                               // NE  / SNE
+      15 -> True                                // T   / ST    (always)
+    )
+    // Select, not merge: the two tables deliberately disagree on cond 0/1 (integer
+    // 0=T/1=F vs FP 0=F/1=EQ).
+    val taken = Mux(u1.readsFpcc, fpTaken, intTaken)
+
     // PC-relative target (Bcc/BRA/BSR). INDIRECT (ibranch) target = base + imm + scaled
     // index (a tiny AGU: base = psrcA for (An)/(d16,An)/RTS-RTR-T0, 0 for absolute/PC-
     // folded; imm = displacement / folded absolute / folded PC / 0; index = scaled Xn for
@@ -279,10 +321,20 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     val isReturn   = u1.ibranch && u1.isReturn
     val isBtbBranch = s1Valid && !u1.isScc && !u1.isCondTrap && !isReturn && !addrErr &&
                       (u1.ibranch || u1.isBranch)
-    // brType: uncond (1) = ibranch (JMP/JSR) OR an always-taken relative branch
-    // (cond==0: BRA/BSR). cond (0) = Bcc (cond>=2) / DBcc. Used to force-take an
-    // unconditional on a fresh BTB install + for stats.
-    val isUncond = u1.ibranch || (!u1.isDbcc && (u1.cond.asUInt === U(0, 4 bits)))
+    // brType: uncond (1) = ibranch (JMP/JSR) OR an always-taken relative branch.
+    // cond (0) = Bcc (cond>=2) / DBcc / FBcc. Used to force-take an unconditional on a
+    // fresh BTB install (Ftb's ctrAlloc installs brType==1 as STRONGLY TAKEN) + for stats.
+    //
+    // "Always taken" is encoding-dependent and the two tables are OPPOSITE at cond==0:
+    // integer cond 0 is T (BRA/BSR, always taken), but FP cond 0 is F/SF ("branch never").
+    // Reading the integer meaning for an FBcc would install FBSF as strongly-taken and
+    // mispredict it every single execution. Prediction-only -- the EU still resolves the
+    // true direction and `mispredict` redirects -- but wrong, and free to get right.
+    // FBF proper (cc==0 exactly) never arrives here at all: it decodes as a NOP. The
+    // encoding that does is SF (0x10), whose cc[3:0] is likewise 0.
+    val condAlwaysTaken = Mux(u1.readsFpcc, u1.cond.asUInt === U(15, 4 bits),   // FP T / ST
+                                            u1.cond.asUInt === U(0,  4 bits))   // int T (BRA)
+    val isUncond = u1.ibranch || (!u1.isDbcc && condAlwaysTaken)
     val brType   = Mux(isUncond, U(1, 2 bits), U(0, 2 bits))
 
     // ---- S1: completion (entry completes either way so it can retire) ----

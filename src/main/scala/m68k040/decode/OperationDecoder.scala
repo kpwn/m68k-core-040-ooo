@@ -1263,6 +1263,39 @@ object OperationDecoder {
           o.readsNzvc := False; o.writesNzvc := False
           o.readsX    := False; o.writesX    := False
         }
+        // ── FBcc with a REAL condition: an ordinary PC-relative conditional branch whose
+        // predicate reads FPCC instead of the integer CCR ─────────────────────────────
+        // Decoded exactly like the line-6 Bcc above (DecOp.BRANCH / isBranch / cond /
+        // Cluster.INT) with two differences: the condition field is the OPWORD's low bits
+        // rather than bits 11:8, and it declares `readsFpcc` instead of `readsNzvc`.
+        //
+        // Only cc[3:0] is carried.  The PRM's 32 FP predicates are two truth-identical
+        // halves -- 0x10..0x1F are the "signaling" spellings of 0x00..0x0F, differing ONLY
+        // in raising BSUN on an unordered operand -- so the branch decision needs 4 bits
+        // and the existing `cond` field fits it with no widening of the uop, the rename
+        // payload, or the 480-bit IQ slot.  cc[4] is dropped deliberately: it selects BSUN
+        // signaling, which is FP exception delivery (vec 48-54) and not implemented.
+        //
+        // The IQ needs NOTHING for this: `trigInit`'s FPCC dependency and the
+        // `cplxFpccWait` dynamic wait are keyed only on `readsFpcc` (not on cluster), and
+        // the per-slot `ready` term already includes `!cplxFpccWait` -- so an FBcc waiting
+        // on an in-flight FCMP is gated by the same machinery as any CPLX FPCC reader.
+        // The displacement (extension word(s)) is filled by MicroOpAssembler; the target
+        // formula pc+2+disp is identical to Bcc's, since an FBcc displacement is likewise
+        // relative to the address of its own extension word.
+        when(isFpBcc && !isFpBccF) {
+          o.illegal   := False
+          o.op        := DecOp.BRANCH
+          o.isBranch  := True
+          o.cond      := opword(3 downto 0)
+          o.cluster   := Cluster.INT
+          o.srcA.setNone(); o.srcB.setNone(); o.dst.setNone(); o.dstWrites := False
+          o.readsNzvc := False; o.writesNzvc := False
+          o.readsX    := False; o.writesX    := False
+          // NOTE: `readsFpcc` is NOT an OpSpec field -- MicroOpAssembler sets it directly
+          // on the uop from the same opword test (`asmIsFpBcc`), alongside the FBcc
+          // displacement, rather than widening OpSpec for one bit.
+        }
         // ── Task 6b: F-line FP-generic MEMORY-mode <ea> -> the µcode ROM ────────
         // `F<op> <mem>,FPn` (opclass 010, this task), `FMOVE FPn,<mem>` (011, store,
         // NOT this task), `FMOVE(M) <ea>,FPCR/FPSR/FPIAR` (100/101, Task 9's territory),

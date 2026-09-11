@@ -1430,11 +1430,29 @@ object MicroOpAssembler {
     }
 
     // Branch displacement (byte / word / long), reproducing the simple-decode rule.
+    // An FBcc is the exception: its opword's low 6 bits are the CONDITION, never a
+    // displacement, which always lives in the extension word(s) -- disp16 for FBcc.W
+    // (type 010) and disp32 for FBcc.L (type 011).  Feeding it through the line-6 rule
+    // above would read the condition as an 8-bit displacement.  `readsFpcc` is the same
+    // marker the branch EU selects the FP condition table with (OperationDecoder's
+    // `isFpBcc`), so no extra spec field is needed here either.
+    val asmIsFpBcc = (op(15 downto 12) === B"4'hF") && (op(11 downto 9) === B"3'b001") &&
+                     (op(8 downto 7) === B"2'b01")
     when(spec.isBranch) {
-      val disp8 = op(7 downto 0)
-      when(disp8 === 0x00) { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }
-        .elsewhen(disp8 === M"11111111") { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }
-        .otherwise { opUop.branchDisp := disp8.asSInt.resize(32).asBits }
+      when(asmIsFpBcc) {
+        // The FP-condition marker, set here rather than in OperationDecoder because
+        // `readsFpcc` lives on the uop, not on OpSpec. Rename picks it up generically
+        // (`r.readsFpcc := dec.readsFpcc`, `r.pFpccSrc := fpccRat...`), and BranchEu
+        // selects the FP predicate table on it.
+        opUop.readsFpcc := True
+        when(op(6)) { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }   // FBcc.L
+          .otherwise { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }  // FBcc.W
+      } .otherwise {
+        val disp8 = op(7 downto 0)
+        when(disp8 === 0x00) { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }
+          .elsewhen(disp8 === M"11111111") { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }
+          .otherwise { opUop.branchDisp := disp8.asSInt.resize(32).asBits }
+      }
     }
 
     // ── ldUop = the LOAD (used only when crackLoad) ────────────────────────────

@@ -24,7 +24,6 @@
 |   0xDEAD0B03 — FBF.L took an F-line trap
 |   0xDEAD0B04 — FBF.L's displacement was EXECUTED (D6/D5 clobbered)
 |   0xDEAD0B05 — FBF clobbered CCR
-|   0xDEAD0B06 — a NON-zero FBcc condition FAILED to trap (framing/scope regression)
 
     .text
     .org 0
@@ -62,15 +61,16 @@ _start:
     cmp.w   %d3, %d2
     bne     _fail_ccr
 
-    | ---- A NON-zero condition must STILL trap (this fix is scoped to cc==0) ----
-    | FBNE.W = cond 0x0E -> opword 0xF28E.  Expect the F-line handler to run; it sets
-    | D0 = 1 and resumes after the 2-word instruction.
-    moveq   #0, %d0
-    move.l  #_fline_expected, 0x0000002C
-_fbne_site:
+    | ---- A non-zero condition must also NOT trap (the whole family is decoded now) ----
+    | FBNE.W = cond 0x0E -> opword 0xF28E.  Displacement 0x0000 makes this
+    | DIRECTION-INDEPENDENT: an FBcc.W displacement is relative to PC+2 (the address of
+    | its OWN extension word), and the instruction is 4 bytes, so disp=+2 makes the target
+    | PC+2+2 = PC+4 = exactly the fall-through address.  It
+    | lands in the same place whether FPCC says taken or not.  That pins "an FBcc with a
+    | real condition executes instead of trapping" without this test having to establish an
+    | FPCC state of its own (fpu_fbcc_branch's job).  A trap here lands in _fline ->
+    | 0xDEAD0B01, so no separate sentinel is needed.
     .short  0xF28E, 0x0002
-    tst.l   %d0
-    beq     _fail_no_trap
 
 _pass:
     move.l  #0xC0FFEE00, %d7
@@ -78,12 +78,6 @@ _pass:
     move.l  %d7, (%a0)
 _halt:
     bra     _halt
-
-| The scoped-out conditions still trap: record it and skip the 4-byte instruction.
-_fline_expected:
-    moveq   #1, %d0
-    addq.l  #4, 2(%a7)                 | advance stacked PC past the 2-word FBcc
-    rte
 
 _fline:
     move.l  #0xDEAD0B01, %d7
@@ -96,9 +90,6 @@ _fail_disp_l:
     bra     _report
 _fail_ccr:
     move.l  #0xDEAD0B05, %d7
-    bra     _report
-_fail_no_trap:
-    move.l  #0xDEAD0B06, %d7
     bra     _report
 _report:
     move.l  #PASS_SENT, %a0
