@@ -12736,4 +12736,32 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   }
 
 
+
+  /** `FMOVE.L #imm,FPSR` / `FMOVE.L #imm,FPCR` -- the immediate-source control write.
+    *
+    * This is a REAL MC68040 instruction and the Quadra 700 ROM executes it: caught live
+    * on hardware at ROM 0x4088db52, where `F23C 8800 0000 0000` (= `FMOVE.L #0,FPSR`)
+    * took a vector-11 F-line trap. MicroOpAssembler previously declared the `#imm` form
+    * "explicitly out of scope" because a single uop cannot carry BOTH the 32-bit datum
+    * and the 3-bit register mask (`imm` holds the mask). It is now cracked into two:
+    *     uop0  MOVE.L #imm -> T0
+    *     uop1  FMOVE_FPCTRL srcB = T0   (the register-direct form that already worked)
+    *
+    * Lock-stepped against Musashi, which implements the form natively, so the oracle is
+    * independent of our crack.
+    */
+  test("lock-step: FMOVE.L #imm,FPSR and #imm,FPCR (the form the ROM traps on)", VerilatorTest) {
+    runLockStep("fmove-imm-fpctrl",
+      // #imm -> FPSR, then read it back into a data register so the value is observable
+      ".short 0xF23C,0x8800,0x0800,0xA5C3 ; " +  // fmove.l #0x0800A5C3,%fpsr
+      ".short 0xF206,0xA800 ; " +                // fmove.l %fpsr,%d6
+      // #imm -> FPCR, read back too
+      ".short 0xF23C,0x9000,0x0000,0x00F0 ; " +  // fmove.l #0x000000F0,%fpcr
+      ".short 0xF205,0xB000 ; " +                // fmove.l %fpcr,%d5
+      "move.l %d6,%d7 ; " +                      // expose both through ordinary writebacks
+      "move.l %d5,%d4 ; " +
+      "done: bra.s done",
+      nInstr = 8)
+  }
+
 }

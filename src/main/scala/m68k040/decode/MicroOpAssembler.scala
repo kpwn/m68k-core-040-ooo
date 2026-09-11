@@ -2059,9 +2059,28 @@ object MicroOpAssembler {
     val fpCtrlOneReg = (fpSrcSpec === B"3'b100") || (fpSrcSpec === B"3'b010") ||
                        (fpSrcSpec === B"3'b001")   // one-hot {FPCR, FPSR, FPIAR}
     val fpCtrlEaReg  = (fpEaMode === U(0, 3 bits)) || (fpEaMode === U(1, 3 bits))
+    // `#<data>` is EA mode 111 reg 100. `FMOVE.L #imm,FPCR/FPSR/FPIAR` (F23C 8800
+    // xxxxxxxx) is a REAL 68040 instruction the Quadra ROM executes -- hit live on
+    // hardware at ROM 0x4088db52 (`FMOVE.L #0,FPSR`), where it took a vector-11 F-line
+    // trap because this band only ever accepted a register-direct EA.
+    //
+    // The comment above called the form "explicitly out of scope" because ONE uop
+    // cannot carry both the 32-bit immediate AND the 3-bit register mask (`imm` holds
+    // the mask; `p.sysRc` is the only sysOp side-channel to commit). True of one uop --
+    // so crack it into TWO, which needs no new ROB thread:
+    //     uop0:  MOVE.L #imm -> T0        (plain integer immediate move)
+    //     uop1:  FMOVE_FPCTRL srcB = T0   (the register-direct form that already works)
+    // T0 is int arch reg 16, the first scratch temp above the 16 architectural entries.
+    val fpCtrlIsImm  = (fpEaMode === U(7, 3 bits)) && (fpEaReg === U(4, 3 bits))
+    val FPCTRL_TMP   = U(T0, 5 bits)   // the shared scratch temp, as other cracks use
+    // Immediate form is a WRITE only (`#imm -> FPcr`); `FPcr -> #imm` is nonsense and
+    // stays illegal. Four words: opword + FP extension + the 32-bit datum.
+    val fpCtrlImmEmit = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(4)) &&
+                        !spec.microcoded && fpCtrlIsTo && fpCtrlOneReg && fpCtrlIsImm
     val fpCtrlEmit   = spec.fpGeneric && pkt.simple && (pkt.lenWords >= U(2)) &&
                        !spec.microcoded &&
-                       (fpCtrlIsTo || fpCtrlIsFrom) && fpCtrlOneReg && fpCtrlEaReg
+                       (fpCtrlIsTo || fpCtrlIsFrom) && fpCtrlOneReg &&
+                       (fpCtrlEaReg || fpCtrlImmEmit)
 
     // ── Task 14b: FMOVE FPn,<ea> (opclass 011) with a REGISTER-DIRECT destination ───
     // Modes 000 (Dn) and 001 (An) never reach the microcode engine at all
@@ -2460,7 +2479,9 @@ object MicroOpAssembler {
       } otherwise {                         // Rn -> FPcr
         // op is MOVE (result = srcB), so the ALU EU's writeback = Rn's value; the ROB
         // captures it (sysValStore) for the commit-time FpuControlPlugin write.
-        opUop.srcBReg := fpCtrlRnId; opUop.srcBValid := True
+        // For the `#imm` crack the value arrives in T0 from the staging uop below.
+        opUop.srcBReg := Mux(fpCtrlIsImm, FPCTRL_TMP, fpCtrlRnId); opUop.srcBValid := True
+        when(fpCtrlIsImm) { opUop.firstOfInstr := False }
         opUop.dstValid := False
       }
     }
@@ -3994,6 +4015,15 @@ object MicroOpAssembler {
       useImm = True, imm = bfResImm, first = True)
 
     // Default the 3rd µop slot (only RTR uses it) so every path drives uops(2) once.
+    // `FMOVE.L #imm,FPcr` staging uop: MOVE.L #imm -> T0. Plain integer immediate move;
+    // the control write itself is `opUop`, which sources srcB from T0. The 32-bit datum
+    // is extension words 2..3 (word 0 = opword, word 1 = the FP extension word).
+    val fpCtrlImmUop = mkUop(
+      op = DecOp.MOVE, cluster = Cluster.INT, size = Size.LONG,
+      dstReg = U(T0, 5 bits), dstValid = True,
+      useImm = True, imm = (pkt.words(2) ## pkt.words(3)).asBits.resize(32),
+      first = True)          // THIS is the macro boundary; opUop clears its own flag
+
     out.uops(2) := opUop
     when(spec.microcoded) {
       // The DecodeStage µcode SEQUENCER owns emission (like MOVEM): emit a benign single
@@ -4007,6 +4037,14 @@ object MicroOpAssembler {
       // Fetch fault dominates: a single faulted (vector-2) delivery µop.
       out.count   := 1
       out.uops(0) := opUop
+      out.uops(1) := opUop
+    } elsewhen(fpCtrlImmEmit) {
+      // `FMOVE.L #imm,FPCR/FPSR/FPIAR` cracks into TWO uops -- see fpCtrlIsImm above for
+      // why one cannot work (imm carries the register mask, so it cannot also carry the
+      // 32-bit datum). uop0 stages the immediate into T0; uop1 is the ordinary
+      // register-direct control write sourcing srcB from T0.
+      out.count   := 2
+      out.uops(0) := fpCtrlImmUop
       out.uops(1) := opUop
     } elsewhen(bad) {
       out.count   := 1

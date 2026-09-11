@@ -1210,6 +1210,24 @@ object PredecodeWord {
           // destination is not encodable, so no other opclass reaches here.
           r.simple   := True
           r.lenWords := (U(2, 4 bits) + fpImmWords).resized
+        } .elsewhen(fpIsGen && fpIsImmEa && (fpClass === B"3'b100")) {
+          // `FMOVE.L #imm,FPCR/FPSR/FPIAR` (e.g. F23C 8800 xxxxxxxx). Length is FIXED at
+          // 4 words -- opword + FP extension + a 32-bit datum -- because all three
+          // control registers are 32 bits.
+          //
+          // It must NOT reuse `fpImmWords`: that table decodes ext[12:10] as a DATA
+          // FORMAT, but for the control-register classes those same bits are the
+          // REGISTER MASK {FPCR,FPSR,FPIAR}. FPSR's mask 010 would be read as format 2 =
+          // Extended = 6 words, giving a 10-word instruction, and the PC would advance
+          // into the middle of the next instruction. That is exactly how this presented:
+          // the DUT diverged at commit 0 with a wild PC while the oracle stepped
+          // normally.
+          //
+          // Without this arm the form fell through to the `fpEaOk` arm below, whose
+          // `eaExt(..., allowImm = false)` rejects a `#imm` EA -- so the instruction the
+          // Quadra ROM executes at 0x4088db52 became a vector-11 F-line trap.
+          r.simple   := True
+          r.lenWords := U(4, 4 bits)
         } .elsewhen(fpIsGen && fpEaOk) {
           r.simple        := True
           r.lenWords      := (U(2, 4 bits) + fpEaExt).resized   // opword + FP ext + EA ext
