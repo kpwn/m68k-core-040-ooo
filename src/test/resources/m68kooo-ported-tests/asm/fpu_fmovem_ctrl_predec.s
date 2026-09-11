@@ -17,19 +17,47 @@
 | 2026-07-23 via tb/models/musashi_run — see decode_1111.vh's
 | fmoveml_ctrl_ea header comment for the full derivation).
 |
-| Musashi's WRITE_EA_32/READ_EA_32 case 4 (-(An)) decrements An by 4
-| *before each individual present register's* access, still walking
-| FPCR,FPSR,FPIAR in that fixed order — net effect vs. a single
-| upfront "An -= 4*popcount": identical final An, but memory packing
-| is the *reverse* of the (d16,An)/postincrement case: the
-| last-accessed present register (FPIAR if present) ends up at the
-| LOWEST address (the final An), not the first.
+| MEMORY LAYOUT — CORRECTED 2026-09-12 (was Musashi-derived and WRONG).
 |
-| Part A: store direction (ctrl->mem).  A0=0x00020020, popcount=3
-|   (all three), so final A0 = 0x00020020-12 = 0x00020014.  Expect:
-|     mem[0x00020014] = FPIAR (0 — never programmed, reset default)
-|     mem[0x00020018] = FPSR  (0xBBBBBBBB)
-|     mem[0x0002001C] = FPCR  (0xAAAAAAAA)
+| This test used to expect Musashi's layout for -(An): FPIAR at the
+| LOWEST address, FPCR at the highest.  That expectation is a faithful
+| copy of a Musashi BUG, not 68040 behaviour, and our core was failing
+| the test while being RIGHT.
+|
+| Musashi (tools/musashi/musashi/m68kfpu.c, fmove_fpcr()) calls
+| WRITE_EA_32() three times in the fixed order FPCR, FPSR, FPIAR.  With
+| ea = -(An) each call predecrements, so FPCR lands HIGHEST and FPIAR
+| LOWEST.  But its load path calls READ_EA_32() in that SAME order, so
+| with ea = (An)+ it reads FPCR from the LOWEST address.  Musashi's own
+| push/pop pair therefore does NOT round-trip: it restores FPCR with
+| FPIAR's saved value and vice versa.  That is self-inconsistent, so it
+| cannot be the architectural reference.
+|
+| The Q700 ROM settles it.  The FPSP saves and restores control regs as
+| an exact mirrored pair (bytes verified in
+| "420DBFF3 - Quadra 700&900 & PB140&170.ROM"):
+|
+|   entry 0x408ed8e6  moveml  %d0-%d2/%a0-%a1,%sp@-
+|         0x408ed8ea  f227 bc00  fmoveml %fpcr/%fpsr/%fpiar,%sp@-
+|   exit  0x408ede90  f21f 9c00  fmoveml %sp@+,%fpcr/%fpsr/%fpiar
+|         0x408ede94  moveml  %sp@+,%d0-%d2/%a0-%a1
+|
+| There are 8 such push sites converging on that one pop.  This is real
+| 68040 code whose entire purpose is to restore FPCR (rounding mode and
+| precision control!) unchanged, so push -(A7) / pop (A7)+ MUST
+| round-trip on silicon.  That requires FPCR at the LOWEST address for
+| the predecrement case — i.e. -(An) produces the SAME memory image as
+| every other mode, exactly like integer MOVEM.
+|
+| Layout asserted below (An_final = lowest address):
+|     mem[An_final + 0] = FPCR
+|     mem[An_final + 4] = FPSR
+|     mem[An_final + 8] = FPIAR
+|
+| See fpu_fmovem_ctrl_roundtrip.s for the ROM idiom itself, which is the
+| oracle-free regression guarding this: it asserts only that the values
+| survive a push/pop, which is true on any correct implementation
+| regardless of layout convention, and which Musashi fails.
 |
 | Part B: load direction (mem->ctrl) address arithmetic ONLY.
 |   Confirmed-separate, pre-existing bug found while building this
@@ -84,9 +112,9 @@
 | FAIL sentinels:
 |   0xDEAD1001 — vec-11 F-line fired (decoder didn't recognise -(An))
 |   0xDEAD1002 — store: final A0 wrong
-|   0xDEAD1003 — store: mem[final+0] (FPIAR slot) wrong
+|   0xDEAD1003 — store: mem[final+0] (FPCR slot) wrong
 |   0xDEAD1004 — store: mem[final+4] (FPSR slot) wrong
-|   0xDEAD1005 — store: mem[final+8] (FPCR slot) wrong
+|   0xDEAD1005 — store: mem[final+8] (FPIAR slot) wrong
 |   0xDEAD1006 — load: final A0 wrong (address arithmetic — NOT
 |                subject to the known bug above)
 
@@ -112,17 +140,17 @@ _start:
     cmp.l   #0x00020014, %a0
     bne     _fail_a0_store
 
-    move.l  0x00020014, %d1           | FPIAR slot (final+0)
-    cmp.l   #0x00000000, %d1
-    bne     _fail_fpiar_store
+    move.l  0x00020014, %d1           | FPCR slot (final+0)
+    cmp.l   #0xAAAAAAAA, %d1
+    bne     _fail_fpcr_store
 
     move.l  0x00020018, %d1           | FPSR slot (final+4)
     cmp.l   #0xBBBBBBBB, %d1
     bne     _fail_fpsr_store
 
-    move.l  0x0002001C, %d1           | FPCR slot (final+8)
-    cmp.l   #0xAAAAAAAA, %d1
-    bne     _fail_fpcr_store
+    move.l  0x0002001C, %d1           | FPIAR slot (final+8)
+    cmp.l   #0x00000000, %d1
+    bne     _fail_fpiar_store
 
     | ── Part B: load direction, -(An), address arithmetic only ──────
     | (register-content round-trip NOT asserted here — see the
@@ -149,13 +177,13 @@ _halt:
 _fail_a0_store:
     move.l  #0xDEAD1002, %d2
     bra     _fail_common
-_fail_fpiar_store:
+_fail_fpcr_store:
     move.l  #0xDEAD1003, %d2
     bra     _fail_common
 _fail_fpsr_store:
     move.l  #0xDEAD1004, %d2
     bra     _fail_common
-_fail_fpcr_store:
+_fail_fpiar_store:
     move.l  #0xDEAD1005, %d2
     bra     _fail_common
 _fail_a0_load:
