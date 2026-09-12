@@ -15,7 +15,7 @@ Quadra 700 SoC, executing the stock Q700 ROM unmodified.
 | Language | SpinalHDL (Scala), elaborated to Verilog |
 | Scale | ~108 source files, ~56k lines |
 | Verification | 274 ScalaTest specs · 921 assembled 68k programs · Musashi lock-step |
-| Silicon | Xilinx KU5P, ~100 MHz core clock, timing-closed |
+| Silicon | Xilinx KU5P, timing-closed. Design target **200 MHz**; deployed at 100 MHz in the Quadra 700 SoC to leave slack for debug instrumentation |
 | Boots | Mac OS to the Finder on the stock Quadra 700 ROM |
 
 The core is under active development. Known defects and deliberate deviations are
@@ -43,6 +43,14 @@ FetchAlign ─ BTB/FTB/gshare/RAS ─ Icache ─ Predecode
                    Dcache ─ DTLB ─┐
                    Icache ─ ITLB ─┴─ hardware table walker (U/M writeback)
 ```
+
+### Clocking
+
+The core is designed for **200 MHz** and the RTL is written to that target. The
+Quadra 700 SoC currently instantiates it at **100 MHz** deliberately — the extra slack
+absorbs the debug instrumentation (trace rings, halt lanes, VIO probes, JTAG-AXI debug
+window) that the bring-up campaign depends on. The 100 MHz figure is a deployment
+choice, not the core's ceiling.
 
 Key structures (`Config.scala` defaults): ROB 64, 50 physical integer registers,
 separate NZVC/X/FPCC rename files, 8-deep load and store queues, L1I 16 KB 4-way

@@ -60,3 +60,10 @@ fuzz_logs*/
 ported_logs_*/
 # ROM disassembly -- 13 MB, regenerable from files/*.rom
 *.dis
+
+# Vivado design checkpoints are build artifacts and must NEVER be tracked.
+# ~675 MB of history was once consumed by eleven ~59 MB fullcore_routed.dcp files
+# under exp4ns/ exp5ns/ exp5ns_implonly/ -- paths the earlier synth/*.dcp rules did
+# not cover. Stripped from history 2026-09-12; these patterns stop a recurrence.
+*.dcp
+exp*/**/*.dcp
