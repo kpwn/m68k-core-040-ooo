@@ -53,11 +53,28 @@ becomes two terms keyed on `EaClass.MEMINDIRECT` with no family names, and the
 decoder to own the rest of the instruction.
 
 **Slice 2 -- the decoder owns the FORM.** Replace the 21 opword re-matches with
-spec fields. The assembler asks *what shape is this* rather than *what bits are
-these*. `DecOp` already exists and already carries 12 such answers; the rest
-need adding (`JMP`, `JSR`, `LEA`, `PEA`, `Scc`, `RTE`, `RTS`, `RTR`, `RTD`,
-`LINK`, `TRAP`, `TRAPV`, `TRAPcc`, `DIV.L`, `MUL.L`, the FP condition family,
-`MOVE from SR/CCR`, `MOVE to CCR`).
+a spec field. The assembler asks *what shape is this* rather than *what bits are
+these*. Missing families: `JMP`, `JSR`, `LEA`, `PEA`, `Scc`, `RTE`, `RTS`,
+`RTR`, `RTD`, `LINK`, `UNLK`, `TRAP`, `TRAPV`, `TRAPcc`, `BSR`, `EXG`, `DIV.L`,
+`MUL.L`, the FP condition family, `MOVE from SR/CCR`, `MOVE to CCR`.
+
+> **CONSTRAINT -- do NOT express the form as new `DecOp` elements.**
+>
+> `DecodedUop.op` is 6 bits and is FMax-critical. Measured, post-route
+> (`xcku5p-ffvb676-2` @4.000ns, checkpoint `3cba17f`): a single extra test
+> `op === SHIFT || op === BITFIELD` in `IssueQueuePlugin`'s scoreboard-clear
+> cone dragged the `op` MuxOH out of the select cone and into a second cone,
+> making that family **the design's WNS holder -- 9 of the 10 worst paths,
+> -1.699ns**. Removing the term measured -1.518ns. The `FPU` DecOp exists as ONE
+> element with a `fpuOp` sub-kind for exactly this reason, and the enum comment
+> says so.
+>
+> The form therefore belongs on **`OpSpec`**, not on `DecodedUop.op`. OpSpec is
+> DECODE-TIME: the assembler reads it and it never propagates into the issue
+> queue, so it adds nothing to the `op` cone. This is also why the existing 12
+> spec-driven predicates are free while the 21 opword re-matches are not merely
+> ugly -- they are decode-time work done in the wrong place, not an execute-time
+> cost.
 
 **Slice 3 -- legality decided once.** With Slices 1 and 2 done, `bad` collapses:
 the decoder knows whether an instruction is legal, because it knows its form and
