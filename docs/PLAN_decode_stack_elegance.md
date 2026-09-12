@@ -87,6 +87,50 @@ writes are the residue. Some are legitimate (a macro's per-element uops are
 genuinely constructed); the ones that exist to OVERRIDE a spec the decoder got
 wrong are not. Separate the two and fix the decoder in each case.
 
+**Slice 5 -- narrow what the issue queue carries.** (Owner question: *"why does
+the issue queue need so much info and not a narrower DecodedUop"*.)
+
+`DecodedUop` has **89 fields**. The IQ already splits its payload -- `IqHot()` is
+registered and sits in the critical cones, while `coldWay0/1 = Mem(RenamedUop(),
+64)` holds the bulk in a Mem. The split is right; `op` is on the WRONG SIDE of
+it.
+
+`IqHot` carries dependency state (`psrcA/B/C`, `pNzvcSrc`, `pXSrc`,
+`pFpSrcA/B`, `pFpccSrc`, `pdst`, `pNzvcDst`) -- genuinely needed for wakeup --
+plus routing (`cluster`, `memOp`, `isBranch`), plus **`op`**, a 6-bit `DecOp`.
+And `op` exists in the hot payload for exactly FIVE tests:
+
+```scala
+isAluSlow   = op === SHIFT || op === BITFIELD
+isPackUnpk  = op === PACK  || op === UNPK
+isBitfield  = op === BITFIELD
+isBfResolve = op === BFRESOLVE
+(op === DIV || op === DIVREM)
+```
+
+Every one is a LATENCY/PORT-CLASS question -- *how should this be scheduled* --
+not *what operation is this*. The IQ never needs the operation; the EU reads
+that at issue. `cluster` in the same bundle already demonstrates the correct
+shape.
+
+**The change:** compute a narrow scheduling class once (at decode or rename) --
+something like `IqClass {FAST, SLOW_ALU, BITFIELD, BFRESOLVE, PACKUNPK, DIV}`,
+3 bits -- put THAT in `IqHot`, and move `op` to the cold `Mem`. The five MuxOH
+comparisons become field tests, and the `op` MuxOH leaves the IQ's cones
+entirely.
+
+That makes the -1.699ns WNS family **structurally impossible** rather than
+avoided by comment. The existing mitigation is a comment warning future readers
+not to re-add a term -- which is exactly the "remember not to" mechanism this
+whole goal is trying to delete. It also removes the constraint that currently
+shapes Slice 2 (see the CONSTRAINT box above): once `op` is not in the hot
+payload, its width stops being FMax-critical.
+
+**Gate:** this one is FMax-sensitive by nature, so it needs a full-core synth
+gate before/after, not just fuzz. Independent of Slices 1-4 -- it touches
+`IqContext.scala`/`IssueQueuePlugin.scala`, not the decode files -- so it can
+proceed in parallel.
+
 ## Rules for every slice
 
 1. **Fuzz, do not just run the suite.** Fuzz caught all four prior instances of
