@@ -1914,7 +1914,7 @@ object MicroOpAssembler {
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
     // commit-side exception FSM acts on it at retire (pops the frame, redirects).
-    val isRteOp = (op === B"16'h4E73")
+    val isRteOp = spec.form === OpForm.RTE
     // ── TRAP #n (0x4E4n) — a decode-time UNCONDITIONAL software trap. ───────────
     // bits 15:4 == 0x4E4; n = op[3:0]. A faulted op µop (vector 32+n) delivering at
     // retire via the format-$0 FSM. TRAP is NOT restartable: it stacks the PC of the
@@ -1924,7 +1924,7 @@ object MicroOpAssembler {
     // ── TRAPV (0x4E76) — an EXECUTE-time CONDITIONAL trap (vector 7 if V). ──────
     // Decoded as a branch-class trap-check µop (isBranch so it issues to the branch
     // EU, readsNzvc so it reads V). The branch EU drives a trapvFault when V=1.
-    val isTrapvOp = (op === B"16'h4E76")
+    val isTrapvOp = spec.form === OpForm.TRAPV
     // DIVU.L/DIVS.L: opword 0100 1100 01 mmmrrr (op[15:6]==0x131). Decoded here (line 4
     // is otherwise illegal) from the extension word — NOT `bad`.
     val isDivLOp = spec.form === OpForm.DIVL
@@ -1969,8 +1969,8 @@ object MicroOpAssembler {
     // false-positive "real cpu040 bug" finding for a case actually fixed 6 weeks earlier.
     val ctrlEaOk = srcIsMem
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
-    val isRtsBad = (op === B"16'h4E75")
-    val isRtrBad = (op === B"16'h4E77")
+    val isRtsBad = spec.form === OpForm.RTS   // name is legacy: this is plain RTS
+    val isRtrBad = spec.form === OpForm.RTR   // name is legacy: this is plain RTR
     // LINK An,#disp16 (0100 1110 0101 0aaa) / UNLK An (0100 1110 0101 1aaa): line-4
     // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
     val isLinkOp = (op(15 downto 4) === B"12'h4E5") && !op(3)
@@ -2029,7 +2029,7 @@ object MicroOpAssembler {
     // retire, NOT decode.
     val isSysOp = spec.sysOp
     // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
-    val isRtdBad = (op === B"16'h4E74")
+    val isRtdBad = spec.form === OpForm.RTD   // name is legacy: this is plain RTD
     // Merged illegal-detection exclusion list (Track C ops + Track D ops).
     val isCmp2Chk2Enc = !op(11) && !op(8) && (op(7 downto 6) === B"11") &&
                         (op(10 downto 9) =/= B"11") && (op(5 downto 3).asUInt >= 2) &&

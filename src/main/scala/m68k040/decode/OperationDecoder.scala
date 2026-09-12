@@ -298,6 +298,15 @@ object OperationDecoder {
       // CHK writes NO register and leaves CCR per the 68k rule (only N is meaningful,
       // set by the EU at execute; matched in lock-step). Routed to the CPLX (DivEu).
       is(0x4) {
+        // Exact-opword line-4 forms. These carry NO operands the decoder owns -- the
+        // assembler builds each uop -- but naming the SHAPE here stops it re-matching the
+        // same constants. `illegal` is deliberately left alone: the assembler already
+        // overrides it for these, so this is purely additive.
+        when(opword === B"16'h4E73") { o.form := OpForm.RTE   }
+        when(opword === B"16'h4E75") { o.form := OpForm.RTS   }
+        when(opword === B"16'h4E74") { o.form := OpForm.RTD   }
+        when(opword === B"16'h4E77") { o.form := OpForm.RTR   }
+        when(opword === B"16'h4E76") { o.form := OpForm.TRAPV }
         // EXTB.L (0100 1001 11 000 rrr, op[15:6]==0x127) has bit8=1 & bit6=0 and would
         // otherwise alias the CHK pattern; decode it as the unary EXT (byte->long) below
         // and exclude it from CHK. (The remaining bit8=1/bit6=0 line-4 opwords are CHK.)

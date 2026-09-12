@@ -114,7 +114,16 @@ object OpForm extends SpinalEnum {
       JMP, JSR,     // computed-target branches
       DIVL, MULL,   // .L forms; the Dl:Dh/size selector is in the extension word
       MOVEFROMSR,   // MOVE SR,<ea>        -- privileged on the 040
-      MOVEFROMCCR   // MOVE CCR,<ea>
+      MOVEFROMCCR,  // MOVE CCR,<ea>
+      // Exact-opword line-4 forms. The decoder did not recognise ANY of these before --
+      // they were matched only in MicroOpAssembler, which is what made them "by-hand
+      // constructions". Naming them here does not make the decoder own their uops; it
+      // only stops the shape being re-derived from bits in a second file.
+      RTE,          // 0x4E73
+      RTS,          // 0x4E75  (the assembler's predicate is misnamed `isRtsBad`)
+      RTD,          // 0x4E74  (`isRtdBad`)
+      RTR,          // 0x4E77  (`isRtrBad`)
+      TRAPV         // 0x4E76
       = newElement()
 }
 
