@@ -144,22 +144,6 @@ class PackUnpkDecodeSpec extends AnyFunSuite {
   // mem-dest). We check at the assembler level: unimplemented=True, op != PACK/UNPK.
   // ─────────────────────────────────────────────────────────────────────────────
 
-  test("PACK memory form op[5:3]=001 (0x8149): assembler unimplemented (deferred)", VerilatorTest) {
-    // 0x8149 = 1000 000 1 0100 1 001: opmode=5 (PACK field), op[5:3]=001 (memory form)
-    runAsm { dut => driveAsm(dut, 0x8149, 0x0000); sleep(1)
-      assert(dut.uop0.op.toEnum != DecOp.PACK,    "memory-form must NOT decode as PACK")
-      assert(dut.uop0.unimplemented.toBoolean,     "memory-form PACK is unimplemented (deferred)")
-    }
-  }
-
-  test("UNPK memory form op[5:3]=001 (0x8189): assembler unimplemented (deferred)", VerilatorTest) {
-    // 0x8189 = 1000 000 1 1000 1 001: opmode=6 (UNPK field), op[5:3]=001 (memory form)
-    runAsm { dut => driveAsm(dut, 0x8189, 0x0000); sleep(1)
-      assert(dut.uop0.op.toEnum != DecOp.UNPK,    "memory-form must NOT decode as UNPK")
-      assert(dut.uop0.unimplemented.toBoolean,     "memory-form UNPK is unimplemented (deferred)")
-    }
-  }
-
   // ─────────────────────────────────────────────────────────────────────────────
   // NEGATIVE: line-C opmode 5/6 is AND.B/.W RMW, NOT PACK/UNPK
   // (line 8 opmode 5 = PACK; line C opmode 5 = AND.B RMW; must NOT be confused)

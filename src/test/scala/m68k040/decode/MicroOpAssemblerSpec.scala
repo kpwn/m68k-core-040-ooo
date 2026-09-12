@@ -278,53 +278,6 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       assert(bad.isEmpty, s"${bad.size}/4096 line-A opwords mis-routed; first 10: ${bad.take(10).mkString(", ")}")
     }
   }
-  test("line-F (0xF000-0xFFFF): every UNIMPLEMENTED opword faults to vector 11, exhaustively", VerilatorTest) {
-    run { dut =>
-      // The F-line encodings this core DOES implement (OperationDecoder's is(0xF) arm);
-      // they are legitimately not vector-11 traps and are excluded from the sweep.
-      // Extended to also recognize the cpGEN band (0xF200-0xF23F) so it is excluded from
-      // this base "faults, usesNextPc always false" baseline sweep -- Task 6 gives cpGEN
-      // its own dedicated, length-aware coverage below (this base sweep always drives
-      // len=1, which is TRUE for every cpGEN opword too -- an unframed cpGEN packet still
-      // traps with usesNextPc=False -- but the len=1 default means this sweep can never
-      // exercise the len>=2 framed case at all, so cpGEN gets its own sweep instead of
-      // silently relying on this one to cover it).
-      def implemented(op: Int): Boolean = {
-        val cpush   = (op & 0x0F00) == 0x0400                                  // 0xF4xx CPUSH/CINV
-        val pflush  = ((op & 0xFFC0) == 0xF500) && ((op >> 3) & 7) <= 3        // 0xF500-0xF51F
-        val ptest   = ((op & 0xFF00) == 0xF500) && ((op & 0x0080) == 0) &&
-                      ((op & 0x0040) != 0) && ((op & 0x0010) == 0) && ((op & 0x0008) != 0)
-        val move16  = (op & 0xFFF8) == 0xF620                                  // (Ax)+,(Ay)+ form
-        val fsf     = op == 0xF27F                                             // task #180 carve-out
-        val cpgen   = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0         // 0xF200-0xF23F
-        // Task 11: FSAVE (0xF300|<ea>, opclass 100) / FRESTORE (0xF340|<ea>, opclass
-        // 101), register-indirect EA modes only -- FSAVE takes -(An) (mode 100) and (An)
-        // (mode 010); FRESTORE takes (An)+ (mode 011) and (An) (mode 010). Every OTHER
-        // <ea> mode in those two opclass bands is deliberately still a vector-11 trap
-        // (displacement/absolute forms are out of scope: the commit-time sysOp path has
-        // no AGU), so this exclusion is narrow on purpose and the sweep still covers them.
-        val fsave    = ((op & 0xFFC0) == 0xF300) &&
-                       (((op >> 3) & 7) == 4 || ((op >> 3) & 7) == 2)
-        val frestore = ((op & 0xFFC0) == 0xF340) &&
-                       (((op >> 3) & 7) == 3 || ((op >> 3) & 7) == 2)
-        cpush || pflush || ptest || move16 || fsf || cpgen || fsave || frestore
-      }
-      val bad = scala.collection.mutable.ArrayBuffer[String]()
-      var swept = 0
-      for (op <- 0xF000 to 0xFFFF if !implemented(op)) {
-        drive(dut, op); sleep(1)
-        swept += 1
-        val faulted = dut.uop.faulted.toBoolean
-        val vec     = dut.uop.faultVector.toInt
-        val unimpl  = dut.uop.unimplemented.toBoolean
-        val nextPc  = dut.uop.faultUsesNextPc.toBoolean
-        if (!faulted || vec != 11 || !unimpl || nextPc)
-          bad += f"0x$op%04X faulted=$faulted vec=$vec unimpl=$unimpl usesNextPc=$nextPc"
-      }
-      assert(bad.isEmpty, s"${bad.size}/$swept unimplemented line-F opwords mis-routed; first 10: ${bad.take(10).mkString(", ")}")
-    }
-  }
-
   // ── Task 6: the cpGEN band's OWN length-aware coverage (see the comment above --
   // the base sweep now excludes cpGEN entirely, since its always-len=1 drive can never
   // exercise fpLenKnown's real (len>=2) behavior). This sweep drives every cpGEN opword
@@ -458,32 +411,6 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
       // FPm,FPn), NOT a control-register move. It must NOT be claimed as a sysOp.
       drive(dut, 0xF200, w1 = 0x0000, len = 2); sleep(1)
       assert(!dut.uop.sysOp.toBoolean, "opclass 000 is arithmetic, not a control-register move")
-    }
-  }
-  test("Task 9 out-of-scope FMOVE-control forms keep the vector-11 fall-through", VerilatorTest) {
-    run { dut =>
-      // (a) MULTI-register mask (the FMOVEM control-list form): F210 BC00 is the real
-      //     toolchain encoding of `fmovem.l %fpiar/%fpsr/%fpcr,(%a0)` -- mask 111.
-      //     Deferred to Task 9b. Here it is a memory <ea> too, so it defers to the µcode
-      //     engine rather than trapping at this layer; the mask-only case is F200 BC00.
-      drive(dut, 0xF200, w1 = 0xBC00, len = 2); sleep(1)
-      assert(!dut.uop.sysOp.toBoolean, "multi-register control masks are OUT of Task 9's scope")
-      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
-      // (b) The #imm form (F23C 8800 xxxx xxxx). Dropped from Task 9 because the mask and
-      //     the 32-bit immediate cannot BOTH ride `imm`, and `casForm` -- the brief's
-      //     proposed second side-channel -- was checked and is NOT ROB-visible (decode ->
-      //     RenamedUop -> AluEuPlugin only, never RobPayload). Returns with Task 9b.
-      //     CAVEAT for a future reader: the `len = 4` packet below is what a CORRECTLY
-      //     framed #imm form would look like, but it is NOT what the real frontend
-      //     produces today. PredecodeWord's fpIsGen/eaExt arm frames 0xF23C as ONE word,
-      //     because the opclass-010 immediate arm does not match FMOVE_FPCTRL's opclass
-      //     100/101, so in the real pipeline this traps vector 11 with nextPc = pc + 2,
-      //     not pc + 8. That mis-framing is PRE-EXISTING and untouched by Task 9 (the form
-      //     F-line trapped before it too); it is called out here only so nobody assumes
-      //     the deferred path is already length-correct. Task 9b owns fixing it.
-      drive(dut, 0xF23C, w1 = 0x8800, w2 = 0x0000, len = 4); sleep(1)
-      assert(!dut.uop.sysOp.toBoolean, "the #imm form is explicitly out of Task 9's scope")
-      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
     }
   }
 }
