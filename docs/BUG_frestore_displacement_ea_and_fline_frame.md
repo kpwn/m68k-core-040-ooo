@@ -68,13 +68,65 @@ instructions a frame the FPSP can parse, on purpose.
    displacement/absolute forms need the base to be a computed EA, so this needs
    either a packed displacement the EU adds, or real EA routing. `imm` already
    carries a side-channel, so the encoding needs a decision.
-2. **Route FPU-space F-lines to the FP frame.** An undecoded F-line whose
-   cpID is 001 should take the FPU-unimplemented path (format-$2 + the FSAVE
-   state capture) rather than the generic illegal path, so the FPSP gets a frame
-   it can parse. Worth doing independently of (1): it makes every future
-   unimplemented-FP case report truthfully instead of printing garbage.
+2. **Classify the F-line frame by ENCODING VALIDITY, not by instruction form.**
+
+   The single site that sets `fpuSoftwareComplete` (MicroOpAssembler, the
+   "Task 10, reduced scope" arm) is:
+
+   ```scala
+   val fpuGenRegUnimpl = bad && spec.fpGeneric && fpFormIsReg && pkt.simple &&
+                         (pkt.lenWords === U(2, ...))
+   ```
+
+   i.e. **cpGEN register-to-register form only**. Every other FPU-space F-line --
+   FSAVE, FRESTORE, FBcc, FScc, and every cpGEN MEMORY form -- falls through with
+   `fpuUnimp = false` and stacks format-$0.
+
+   A 68040 splits it differently:
+
+   | case | exception | frame |
+   |---|---|---|
+   | a VALID FPU encoding the hardware cannot execute | Unimplemented FP Instruction | **$2** (the FPSP then EMULATES it) |
+   | an encoding the FPU does not recognise at all | F-line Emulator | $0 |
+
+   So the predicate should be "is this a valid FPU encoding?", not "is this
+   cpGEN register form?". `FRESTORE d16(A5)` is a valid FPU encoding, which is
+   why it deserved a parseable frame even before (1) made it execute.
+
+   This is not only diagnostics: format-$2 is the mechanism by which the FPSP
+   emulates instructions the hardware lacks, so widening the classification
+   correctly would let unimplemented FP ops WORK in software rather than crash.
+
+   CAUTION for whoever implements it: the same arm sets
+   `fpuCmdWord := fpExt`, which assumes a cpGEN extension word exists.
+   FSAVE/FRESTORE/FBcc have no FP command word in that sense, so the frame
+   contents need deciding per family -- widening the predicate blindly would
+   trade an UNPARSEABLE frame for a MALFORMED one.
 
 ## Reproducing
 
 Any FPU context restore through `d16(An)`. On the machine it reproduced every
 time; caches on (`CACR = 0x80008000`).
+
+## Status (2026-09-12)
+
+Fix (1) is IMPLEMENTED, generalized past the original d16(An) scope on owner
+direction ("we want to generalize every possible opcode against every possible
+EA mode"):
+
+* `OperationDecoder` admits the architectural classes -- FSAVE = control
+  alterable + `-(An)`, FRESTORE = control + `(An)+` + the PC-relative forms --
+  rather than an enumerated mode list.
+* `PredecodeWord` computes the length through the existing generic
+  `eaExt(mode, reg, ...)` helper, so every mode's length (and its
+  `ambiguousLine`) is covered by one arm.
+* `MicroOpAssembler` cracks the computed-address modes into
+  `[T0 := EA] + [sysOp reading T0]`, reusing PEA's `leaGenUop` verbatim (aliased,
+  not re-instantiated, so the EA datapath is not duplicated). The sysOp then
+  reports mode 010 `(An)` to the FSM because T0 already holds the final address
+  -- a shape the FSM implements today, so `ExceptionUnit` and `RobPlugin` need
+  no change. The auto-update modes keep the single-uop form since they write An.
+
+Not yet compiled or tested at the time of writing.
+
+Fix (2) is NOT implemented.
