@@ -89,12 +89,33 @@ class DecodeStageSpec extends AnyFunSuite {
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
       var consumed = false
       var checked = false
-      for (_ <- 0 until 30 if !checked) {
+      // Sample for the FULL window, not `if !checked`. This loop used to stop the moment
+      // uopsOut went valid, but `skipConsumed` can pulse on or AFTER that same cycle -- so
+      // the test raced its own two observations and lost a run in ten to
+      // "skip-once consumption pulse for slot 2 was not observed". They are independent
+      // events: watch both across the whole window, and let `checked` gate only the payload
+      // assertions.
+      // 30 cycles was too tight: after a pipeFlush + redirect the macro sometimes needs
+      // longer to reach the output, losing a run in ten to "skipped breakpoint macro
+      // never reached decode output". The FIRST half of this test waits UNBOUNDED via
+      // waitSamplingWhere; only this half guessed a bound. Give it a generous one and
+      // exit as soon as BOTH events are seen, so the common case stays fast.
+      for (_ <- 0 until 200 if !(checked && consumed)) {
         cd.waitSampling()
         consumed ||= (dut.debugMatch.logic.skipConsumed.toInt & 4) != 0
-        if (dut.sink.logic.uopsOut.valid.toBoolean) {
+        if (!checked && dut.sink.logic.uopsOut.valid.toBoolean) {
           assert(!dut.sink.logic.uopsOut.payload(0).debugBreakValid.toBoolean)
-          assert(dut.sink.logic.uopsOut.payload(0).debugBreakSlot.toInt == 2)
+          // The breakpoint was SKIPPED, so debugBreakValid is False -- and with it False,
+          // debugBreakSlot is a DON'T-CARE. MicroOpAssembler defaults every uop to
+          // {debugBreakValid=False, debugBreakSlot=0} (:59, :143), and DecodeStage overrides
+          // the slot ONLY on a match (:2666-2668), so a skipped macro legitimately carries 0.
+          //
+          // Asserting slot==2 here made this test fail ~40% of runs (measured: 2 failures in 5
+          // consecutive standalone runs on an unmodified tree). It asserted a value the design
+          // never promised. The real property -- that the break was SUPPRESSED -- is the
+          // assertion above; the consumption pulse is checked by `consumed` below. The slot IS
+          // still asserted earlier in this test, where debugBreakValid is True and it means
+          // something.
           checked = true
         }
       }
