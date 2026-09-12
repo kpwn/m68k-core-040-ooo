@@ -35,6 +35,11 @@
 |   0xBAD00BAD — wrong-path poison committed: ordinary misprediction
 |                 recovery itself is broken (unrelated pre-existing
 |                 invariant; sanity net, not the bug under test).
+| ENCODING CORRECTED 2026-09-12: the FMOVE.S loads below carried source specifier
+| 000 = LONG WORD INTEGER (ext 0x40xx) instead of 001 = SINGLE (ext 0x44xx), so the
+| bit pattern was loaded as a 32-bit integer and every downstream value was wrong.
+| Same defect as fpu_fint_basic et al (commit 328de7d9). The core is correct.
+|
 
     .text
     .org 0
@@ -49,7 +54,7 @@ _start:
 
     | FP0 := 4.0
     move.l  #0x40800000, %d0
-    .short  0xF200, 0x4000          | FMOVE.S D0,FP0  (Dn=0,FPn=0)
+    .short  0xF200, 0x4400          | FMOVE.S D0,FP0  (Dn=0,FPn=0)
 
     | FSQRT.X FP0,FP1  ->  FP1 := sqrt(FP0) = 2.0.  OLDER tag, in
     | flight for 56 cycles inside fpu_sqrt.v.
