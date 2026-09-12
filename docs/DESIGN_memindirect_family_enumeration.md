@@ -89,6 +89,54 @@ Until the microcode entries exist, the correct INTERIM behaviour for a family
 that cannot be routed is a clean trap, not execution with a garbage address:
 a wrong-register write or a wild PC is strictly worse to debug than vector 4.
 
+## Why the generic rule cannot simply replace the list YET
+
+The obvious refactor -- drop the 12 family predicates for
+
+```scala
+(usesSrcEa && srcEa.klass === MEMINDIRECT) || (usesDstEa && dstEa.klass === MEMINDIRECT)
+```
+
+using the `usesSrcEa`/`usesDstEa` signals `MicroOpAssembler` already computes
+from `spec.srcA/srcB/dst.kind` -- would SILENTLY MISS several families, because
+`OperationDecoder` deliberately does not type their EAs at all:
+
+* **Scc/DBcc/TRAPcc (line 5, ss==11).** The decoder's own comment: *"the
+  assembler builds the WHOLE Scc instruction by hand (branch-EU condition
+  write; illegal-gating is via the assembler's isSccOp exclusion, not
+  spec.illegal), so this decoder does NOT otherwise touch Scc/DBcc/TRAPcc
+  (ss==3) at all"* and *"OpSpec here leaves them illegal; the assembler
+  overrides."*
+* **LEA / PEA / JMP / JSR.** Matched by OPWORD PATTERN in the assembler
+  (`isLeaOp`, `isPeaOp`, `isJmpOp`, `isJsrOp`); there is no `DecOp` for them, so
+  `spec.srcA.kind` is not `EASRC`.
+* **The line-0 immediate family**, whose EA extension words are SHIFTED, so its
+  EA must be decoded from a different word vector (`s1mi_immEa`) rather than
+  read from `specs(N).srcEa`.
+
+So the family list is a SYMPTOM. The root cause is that the spec does not
+describe the EA for instructions the assembler hand-builds -- and a gate keyed
+on the spec therefore cannot see them. Swapping the predicate without fixing
+that trades a drift bug for a silent-miss bug, and no existing test would catch
+it (the corpus does not currently exercise a memory-INDIRECT Scc at all).
+
+### The ordering this implies
+
+1. **Make the decoder own the EA.** Every instruction that HAS an effective
+   address gets it typed in `OpSpec` (`EASRC`/`EADST`), including the ones the
+   assembler otherwise builds by hand. Typing the EA does not require the
+   decoder to own the rest of the instruction -- Scc can keep its branch-EU
+   condition path and still declare "my destination is this EA".
+2. **Then the gate becomes generic** -- two terms keyed on EA class, no family
+   names -- and `Scc` plus the line-E memory shift are covered without being
+   mentioned. The shifted-extension immediate family is the one legitimately
+   per-op residue, and it is per-op because its EXTENSION WORDS differ, not
+   because its opcode does.
+
+That is the same principle the owner stated for the EA work generally: EAs are
+the domain of the EA machinery, and only the strictly necessary should be
+per-op typed.
+
 ## Status
 
 Not implemented. This touches the decode fast path, which everything depends on,
