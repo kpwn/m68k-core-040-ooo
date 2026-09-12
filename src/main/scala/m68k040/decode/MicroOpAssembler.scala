@@ -1228,6 +1228,62 @@ object MicroOpAssembler {
       opUop.faultUsesNextPc := False
     }
 
+    /** A CONDITIONAL trap µop (TRAPV / TRAPcc / FTRAPcc): no ALU action, routed to the
+      * branch EU, which evaluates `cond` and raises the fault at EXECUTE -- so `faulted`
+      * is False at decode and `isCondTrap` suppresses the redirect either way.
+      *
+      * Three arms built this identical 18-field shape by hand, differing only in the
+      * condition and in whether the predicate reads NZVC or FPCC. Neither integer arm
+      * set `readsFpcc` at all -- the same inherit-from-an-earlier-arm exposure that
+      * `inertTrap` was written to close. Here both are always driven. */
+    def condTrap(cond: Bits, fromFpcc: Boolean = false): Unit = {
+      opUop.op            := DecOp.ILLEGAL      // no ALU action
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.unimplemented := False
+      opUop.isRte         := False
+      opUop.faulted       := False              // conditional: set at execute, not decode
+      opUop.faultVector   := 0
+      opUop.isBranch      := True               // branch EU (reads the condition source)
+      opUop.cond          := cond
+      opUop.branchDisp    := 0
+      opUop.readsNzvc     := Bool(!fromFpcc)
+      opUop.readsFpcc     := Bool(fromFpcc)
+      opUop.isCondTrap    := True
+      opUop.faultUsesNextPc := True             // not restartable: stacks the NEXT pc
+    }
+
+    /** A DBcc / FDBcc µop: decrement-and-branch, driven entirely by the branch EU.
+      * `counter` is the Dn read AND written (old value is also the .W merge source);
+      * `disp` is the displacement, which differs by word position because FDBcc's
+      * condition extension word pushes its displacement one word later.
+      *
+      * Two arms built this same 22-field shape by hand. As with `condTrap`, the integer
+      * arm never drove `readsFpcc`; here both condition sources are always driven. */
+    def dbccUop(cond: Bits, counter: UInt, disp: Bits, fromFpcc: Boolean = false): Unit = {
+      opUop.op            := DecOp.ILLEGAL      // no ALU action; the branch EU drives it
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.isBranch      := True               // branch EU (condition mux + PC-rel target)
+      opUop.isDbcc        := True
+      opUop.cond          := cond
+      opUop.readsNzvc     := Bool(!fromFpcc)
+      opUop.readsFpcc     := Bool(fromFpcc)
+      opUop.srcAReg       := counter; opUop.srcAValid := True  // old Dn (counter / merge src)
+      opUop.srcBValid     := False
+      opUop.dstReg        := counter; opUop.dstValid := True   // Dn (decremented or unchanged)
+      opUop.useImm        := False
+      opUop.writesNzvc    := False; opUop.writesX := False
+      opUop.branchDisp    := disp
+      opUop.unimplemented := False
+      opUop.faulted       := False; opUop.faultVector := 0
+      opUop.isRte         := False
+      opUop.isCondTrap    := False
+      opUop.ibranch       := False
+    }
+
     // --- srcA slot ---
     switch(spec.srcA.kind) {
       is(OperandKind.REGFIELD) {
@@ -2846,23 +2902,7 @@ object MicroOpAssembler {
       // faultPc = nextPc). Not taken -> retires as a no-op. TRAPV is not restartable ->
       // faultUsesNextPc. The redirect is suppressed by the `isCondTrap` gate in the EU
       // regardless of `taken`, so completion/mispredict stay off the critical path.
-      opUop.op            := DecOp.ILLEGAL    // no ALU action
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False
-      opUop.unimplemented := False
-      opUop.isRte         := False
-      opUop.faulted       := False            // conditional: set at execute, not decode
-      opUop.faultVector   := 0
-      opUop.isBranch      := True             // route to the branch EU (NZVC read)
-      // cond = 9 (VS): taken iff V=1, matching TRAPV semantics. The EU suppresses
-      // redirect via the `isCondTrap` gate (no mispredict regardless of `taken`).
-      opUop.cond          := 9
-      opUop.branchDisp    := 0
-      opUop.readsNzvc     := True
-      opUop.isCondTrap    := True
-      opUop.faultUsesNextPc := True
+      condTrap(B"4'd9")
     }
     // ── TRAPcc (0101 cccc 11 111 ttt): conditional trap, vector 7, format-$2 ──────
     // ttt=4 (1 word), ttt=2 (+word), ttt=3 (+long). The operand words are handler-only
@@ -2877,64 +2917,13 @@ object MicroOpAssembler {
     // predicate table there, as for FBcc/FScc).  Only cc[3:0] is carried -- 0x10..0x1F are
     // the truth-identical signaling spellings.
     when(isFDbccOp) {
-      opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives it
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.isBranch      := True
-      opUop.isDbcc        := True
-      opUop.cond          := fsccCond
-      opUop.readsNzvc     := False
-      opUop.readsFpcc     := True
-      opUop.srcAReg       := fsccReg5.resize(5); opUop.srcAValid := True  // old Dn (counter)
-      opUop.srcBValid     := False
-      opUop.dstReg        := fsccReg5.resize(5); opUop.dstValid := True   // Dn (dec or unchanged)
-      opUop.useImm        := False
-      opUop.writesNzvc    := False; opUop.writesX := False
-      // The displacement is one word LATER than a line-5 DBcc's: the condition extension
-      // word sits at words(1), so disp16 is words(2).  The 68k rule is that the destination
-      // is the DISPLACEMENT WORD'S OWN ADDRESS plus the displacement -- which is pc+2 for a
-      // line-5 DBcc and for FBcc, but pc+4 here because the condition word comes first.
-      // The branch EU's shared `relTarget` is pc+2+branchDisp, so fold the extra word in
-      // rather than special-casing the adder.
-      opUop.branchDisp    := (pkt.words(2).asSInt.resize(32) + 2).asBits
-      opUop.unimplemented := False
-      opUop.faulted       := False; opUop.faultVector := 0
-      opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
+      dbccUop(fsccCond, fsccReg5.resize(5), (pkt.words(2).asSInt.resize(32) + 2).asBits, fromFpcc = true)
     }
     when(isFTrapccOp) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False
-      opUop.unimplemented := False
-      opUop.isRte         := False
-      opUop.faulted       := False            // conditional: the fault is raised at execute
-      opUop.faultVector   := 0
-      opUop.isBranch      := True
-      opUop.cond          := fsccCond
-      opUop.branchDisp    := 0
-      opUop.readsNzvc     := False
-      opUop.readsFpcc     := True
-      opUop.isCondTrap    := True
-      opUop.faultUsesNextPc := True
+      condTrap(fsccCond, fromFpcc = true)
     }
     when(isTrapccOp) {
-      opUop.op            := DecOp.ILLEGAL    // no ALU action
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False
-      opUop.unimplemented := False
-      opUop.isRte         := False
-      opUop.faulted       := False            // conditional: fault set at execute, not decode
-      opUop.faultVector   := 0
-      opUop.isBranch      := True             // route to the branch EU (NZVC read)
-      opUop.cond          := cccc5            // the 4-bit condition code from op[11:8]
-      opUop.branchDisp    := 0
-      opUop.readsNzvc     := True
-      opUop.isCondTrap    := True
-      opUop.faultUsesNextPc := True
+      condTrap(cccc5)
       // nextPc is the pc + length (1/2/3 words by ttt); predecode computes the correct
       // lenWords and the DecodePacket carries nextPc = pc + lenWords*2. No override needed.
     }
@@ -2996,23 +2985,7 @@ object MicroOpAssembler {
     // = Mux(cond, Dn, {Dn[31:16], Dn[15:0]-1})); redirect = `!cond && (decW != -1)` to
     // pc+2+disp (the branch EU's relTarget). cond = cccc (DBRA/DBF = cccc=F=1). NO flags.
     when(isDbccOp) {
-      opUop.op            := DecOp.ILLEGAL    // no ALU action; the branch EU drives it
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.isBranch      := True             // branch EU (condition mux + PC-rel target)
-      opUop.isDbcc        := True
-      opUop.cond          := cccc5
-      opUop.readsNzvc     := True             // read NZVC for the condition
-      opUop.srcAReg       := rrr5; opUop.srcAValid := True   // old Dn (counter / merge source)
-      opUop.srcBValid     := False
-      opUop.dstReg        := rrr5; opUop.dstValid := True    // Dn (decremented or unchanged)
-      opUop.useImm        := False
-      opUop.writesNzvc    := False; opUop.writesX := False
-      // disp16 (the trailing extension word) — the PC-relative branch displacement.
-      opUop.branchDisp    := pkt.words(1).asSInt.resize(32).asBits
-      opUop.unimplemented := False
-      opUop.faulted       := False; opUop.faultVector := 0
-      opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
+      dbccUop(cccc5, rrr5, pkt.words(1).asSInt.resize(32).asBits)
     }
 
     // ── INSTRUCTION-FETCH fault (the I-cache raised DecodePacket.fault) ─────────
