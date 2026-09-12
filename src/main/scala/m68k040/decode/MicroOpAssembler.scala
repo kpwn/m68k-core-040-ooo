@@ -3746,6 +3746,25 @@ object MicroOpAssembler {
     // PC). The EA is op[5:0] (`srcEa`, control modes). For (d16,PC) the assembler folds
     // pc into the imm (base=0), exactly like the load crack's pcRelAddr.
     val ctrlPcRelAddr = (pkt.pc + U(2, 32 bits) + srcEa.disp.asUInt).asBits
+    // ── JSR (A7): the branch must use the PRE-push A7 ─────────────────────────────
+    // JSR cracks to [push retPC -> -(A7)] + [ibranch whose base is the EA base An].
+    // When that base IS A7 the push renames A7 BEFORE the branch reads it, so the
+    // branch computes its target from the POST-push value and JSR (A7) jumps to
+    // target-4 -- precisely where the push just wrote the return address, so the CPU
+    // executes that address as an instruction (observed: jsr_a7_indirect hangs).
+    // Musashi is the reference: `ea = EA; push_32(REG_PC); jump(ea)` -- the EA is read
+    // BEFORE the push decrements.
+    //
+    // Fix: for this ONE degenerate form, prepend a snapshot uop (T0 := A7 + 0) and
+    // point the branch at T0. Every other JSR keeps the cheap 2-uop crack and pays
+    // nothing. Suppressing rename's intra-group bypass was tried first and does NOT
+    // work -- the push and branch are not reliably in the same rename packet, and
+    // across packets the branch reads a RAT that already holds the push's new mapping.
+    //
+    // The snapshot carries the base only; the branch still adds its own displacement
+    // and index term, so (d16,A7) and (d8,A7,Xn) are covered by the same path.
+    val jsrNeedsSnap = isJsrOp && !jsrBad && srcEa.baseValid &&
+                       (srcEa.base === U(15, 5 bits))   // 15 = A7
     val ibrUop = DecodedUop()
     ibrUop.debugBreakValid := False; ibrUop.debugBreakSlot := 0
     ibrUop.fpInert()
@@ -3756,7 +3775,9 @@ object MicroOpAssembler {
     ibrUop.cluster       := Cluster.INT
     ibrUop.size          := Size.LONG
     ibrUop.memOp         := MemOp.NONE
-    ibrUop.srcAReg       := srcEa.base; ibrUop.srcAValid := srcEa.baseValid   // EA base An
+    // base An -- or the pre-push snapshot temp for JSR (A7), see jsrNeedsSnap above
+    ibrUop.srcAReg       := Mux(jsrNeedsSnap, U(T0, 5 bits), srcEa.base)
+    ibrUop.srcAValid     := srcEa.baseValid
     ibrUop.srcBReg       := 0;          ibrUop.srcBValid := False
     // Brief-indexed control EA (task #187): the index register Xn rides srcC, exactly like
     // the LS-EU AGU / LEA's leaGenUop. Non-indexed JMP/JSR leaves indexValid=False -> the
@@ -3911,7 +3932,11 @@ object MicroOpAssembler {
     // The push store is FIRST; the ibranch (ibrUop, firstOfInstr=False for JSR) jumps
     // to the EA effective ADDRESS (psrcA = base An + imm = disp/folded), exactly like
     // JMP's target. (No An postinc — JSR does not pop.)
-    val jsrPush = pushUop(A7, nextPc.asBits, first = True)
+    // With the JSR (A7) snapshot prepended, the SNAPSHOT is the instruction's first uop.
+    val jsrPush = pushUop(A7, nextPc.asBits, first = !jsrNeedsSnap)
+    val jsrSnap = movemSnapUop(
+      dst = U(T0, 5 bits), src = U(A7, 5 bits), valid = pkt.valid,
+      pc = pkt.pc, nextPc = nextPc)
 
     // ── RTR (0x4E77) — pop CCR (word) then PC (long); restore CCR; A7 += 6. ─────────
     // Crack: [load.w (A7) -> CCR restore (NZVC:=d[3:0], X:=d[4])] + [load.l (A7+2) -> T0]
@@ -4286,9 +4311,13 @@ object MicroOpAssembler {
       out.uops(1) := Mux(jmpBad, opUop, ibrUop)
     } elsewhen(isJsrOp) {
       // JSR -> [push.l retPC -> -(A7)] + [ibranch -> EA addr]. Bad EA -> illegal.
-      out.count   := Mux(jsrBad, U(1, 2 bits), U(2, 2 bits))
-      out.uops(0) := Mux(jsrBad, opUop, jsrPush)
-      out.uops(1) := Mux(jsrBad, opUop, ibrUop)
+      // JSR (A7) additionally prepends [T0 := A7] so the branch sees the PRE-push
+      // base (see jsrNeedsSnap). Only that degenerate form pays the third uop.
+      out.count   := Mux(jsrBad, U(1, 2 bits),
+                     Mux(jsrNeedsSnap, U(3, 2 bits), U(2, 2 bits)))
+      out.uops(0) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap, jsrSnap, jsrPush))
+      out.uops(1) := Mux(jsrBad, opUop, Mux(jsrNeedsSnap, jsrPush, ibrUop))
+      out.uops(2) := ibrUop
     } elsewhen(isBsr) {
       // BSR -> [push.l retPC -> -(A7)] + [bra pc+2+disp].
       out.count   := 2
