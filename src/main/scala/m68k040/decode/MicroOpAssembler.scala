@@ -1927,19 +1927,19 @@ object MicroOpAssembler {
     val isTrapvOp = (op === B"16'h4E76")
     // DIVU.L/DIVS.L: opword 0100 1100 01 mmmrrr (op[15:6]==0x131). Decoded here (line 4
     // is otherwise illegal) from the extension word — NOT `bad`.
-    val isDivLOp = (op(15 downto 6) === B"10'b0100110001")
+    val isDivLOp = spec.form === OpForm.DIVL
     // MULU.L/MULS.L: opword 0100 1100 00 mmmrrr (op[15:6]==0x130). Decoded here (line 4
     // is otherwise illegal) from the extension word — NOT `bad`.
-    val isMulLOp = (op(15 downto 6) === B"10'b0100110000")
+    val isMulLOp = spec.form === OpForm.MULL
     // ── JMP (0x4EC0 | ea) — a computed-target branch to the EA *address* (no push). ─
     // op[15:6] == 0100111011 (0x13B). Target = EA address: psrcA = base An (or none for
     // abs/PC), imm = displacement / folded absolute / folded PC. Control EA modes only:
     // (An), (d16,An), (xxx).W/.L, (d16,PC). Reg-direct / imm / (An)+ / -(An) / indexed
     // are illegal for JMP (-> `bad`). Decoded here (line 4 is otherwise illegal).
-    val isJmpOp = (op(15 downto 6) === B"10'b0100111011")
+    val isJmpOp = spec.form === OpForm.JMP
     // JSR (0x4E80 | ea) — call: push retPC + ibranch to the EA address. Same control
     // EA modes as JMP. op[15:6] == 0100111010 (0x13A).
-    val isJsrOp = (op(15 downto 6) === B"10'b0100111010")
+    val isJsrOp = spec.form === OpForm.JSR
     // A JMP/JSR control EA is the in-scope MEMSIMPLE set (the EaDecoder classifies
     // (An)/(d16,An)/(xxx)/(d16,PC) as MEMSIMPLE; predec/postinc are MEMCOMPLEX, reg-direct
     // DATAREG/ADDRREG, imm IMM). Indexed (d8,An,Xn)/(d8,PC,Xn) brief-format is MEMSIMPLE too

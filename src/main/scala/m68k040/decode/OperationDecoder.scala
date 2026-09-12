@@ -590,6 +590,8 @@ object OperationDecoder {
         when((opword(15 downto 6) === B"10'b0100111011") ||
              (opword(15 downto 6) === B"10'b0100111010")) {
           eaHand := True
+          // The two encodings differ ONLY in bit 6: JMP is ...1011, JSR ...1010.
+          o.form := Mux(opword(6), OpForm.JMP, OpForm.JSR)
         }
         // ── DIVU.L/DIVS.L (0100 1100 01 mmmrrr) / MULU.L/MULS.L (0100 1100 00 ...) ──
         // Also assembler-built (the Dl:Dh/size selector lives in the extension word this
@@ -600,6 +602,8 @@ object OperationDecoder {
              (opword(15 downto 6) === B"10'b0100110000")) {
           eaHand  := True
           eaShift := 1
+          // Bit 6 again: DIV.L is ...0001, MUL.L ...0000.
+          o.form  := Mux(opword(6), OpForm.DIVL, OpForm.MULL)
         }
         // ── MOVE from SR (0100 0000 11 mmmrrr): op[15:6]==0x103. SR(16) -> EA (.W).
         // PRIVILEGED (040): the assembler sets needsSupervisor (ROB vector-8 if S==0).
