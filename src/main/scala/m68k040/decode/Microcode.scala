@@ -2256,6 +2256,15 @@ object Microcode {
   val BF_DYN_RMW_DO0_ENTRY = 66
   val BF_DYN_RMW_DO1_ENTRY = 74
   val BF_DYN_ILLEGAL_ENTRY = 86
+  // The generic "this EA needs a pointer chain walked, and no entry in this ROM knows
+  // how" fail-safe (see DecodeStage's `ucRealEntry`). It is the SAME single row as
+  // BF_DYN_ILLEGAL -- one `bfIllegal` uop, i.e. a vector-4 ILLEGAL that reads no ctx
+  // field at all, so it is opcode- and context-free and correct for any caller. Named
+  // separately because the two call sites mean different things: that one is a
+  // characterized bit-field sub-gap, this one is "an unclassified family reached the
+  // engine". Deliberately an ALIAS and not a new row: a second identical row would
+  // renumber every entry after it for no behavioural difference.
+  val MI_UNSUPPORTED_ENTRY = BF_DYN_ILLEGAL_ENTRY
   val BF_DYN_INS_DO0_ENTRY = 87
   val BF_DYN_INS_DO1_ENTRY = 98
   val BF_RMW_4B_ENTRY = 6

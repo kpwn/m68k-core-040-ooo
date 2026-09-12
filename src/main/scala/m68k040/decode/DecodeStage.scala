@@ -102,38 +102,45 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // │    TAS via `opw(15 downto 6) === ...`       WNS -0.607   178.35 MHz        │
     // │                                                                            │
     // │ One term off `spec` cost 20.14 MHz (-11.5%). The identical condition off   │
-    // │ the opword cost nothing. That is why s0IsLea/s0IsPea/s0IsJmp/s0IsJsr       │
-    // │ (~line 760) are written against the opword — now you know the price.       │
+    // │ the opword cost nothing — now you know the price.                          │
     // │                                                                            │
     // │ The EA-class check at each call site (=== MEMINDIRECT) already excludes    │
     // │ register-direct and other non-memory modes, so an opword match that is      │
     // │ broader than the real instruction (e.g. TAS bits 15:6 also matching TAS Dn │
     // │ and the illegal 0x4AFC) cannot misfire.                                    │
     // └────────────────────────────────────────────────────────────────────────────┘
-    // Routing a MEMINDIRECT EA into the µcode engine requires the instruction family to
-    // be named in THREE parallel gates that must agree:
-    //   slot0IsMemInd       (slot-0 entry)     ~line 745
-    //   slot1IsMemIndEarly  (slot-1 entry)     ~line 285
-    //   ucIsMemInd          (engine re-decode) ~line 1975
-    // Historically each gate carried its OWN inline copy of the family list, and the
-    // copies DRIFTED. Every drift has the same failure mode: the family silently falls
-    // through to the ordinary non-microcoded fast path, whose EA machinery cannot walk a
-    // pointer chain, so it computes a GARBAGE address -> access fault -> wild PC (or, for
-    // Scc, a wrong-register write). That has now happened FOUR times:
+    // WHICH INSTRUCTIONS ROUTE A MEMINDIRECT EA INTO THE ENGINE IS NO LONGER A LIST.
+    // The two ENTRY gates (`slot0IsMemInd`, `slot1IsMemIndEarly`) now ask the EA:
+    // `spec.eaSrcValid/eaSrcShift/eaDstValid` come from OperationDecoder, which types
+    // the effective address of every instruction that has one -- including the ones
+    // MicroOpAssembler builds by hand. Nothing below has to be remembered for a new
+    // family, and nothing can drift between the two slots, because there is no list.
+    //
+    // The predicates that remain here are read ONLY by the engine's entry re-decode
+    // (`ucIsMemInd`/`ucMiEntry`, ~line 1975), which picks WHICH µcode entry to run.
+    // That one is legitimately per-op: the entry row IS the family-specific part.
+    // It is also no longer a correctness trap -- an op the entry mux does not
+    // recognize now falls to MI_UNSUPPORTED_ENTRY (a clean vector-4 ILLEGAL), not to
+    // ROM row 0. See `ucRealEntry`'s fail-safe comment.
+    //
+    // History, because it is what justifies the shape above. Each gate used to carry
+    // its OWN inline copy of a family list, and the copies DRIFTED. Every drift had the
+    // same failure mode: the family silently fell through to the ordinary
+    // non-microcoded fast path, whose EA machinery cannot walk a pointer chain, so it
+    // computed a GARBAGE address -> access fault -> wild PC (or, for Scc, a
+    // wrong-register write). That happened FOUR times, every one caught by FUZZING
+    // rather than by construction:
     //   task #144/#145  MOVE / ADDA-SUBA-CMPA src
     //   task #150       ALU Dn,<ea> RMW dst (opmode 4/5/6) + ADDQ/SUBQ
     //   task #152       static bit-op (tt vs ss field collision)
-    //   2026-09-03      TAS  <- fuzz clusters B/D, this change
-    // Adding one more inline entry would leave the trap armed for the fifth family, so
-    // the family predicates now live HERE, once, and all three gates call them. A future
-    // family is added in exactly one place and cannot drift.
-    //
-    // NOTE (deliberately NOT yet routed, see the campaign doc): the line-E MEMORY
-    // shift/rotate form and Scc <ea> are ALSO missing, but neither fits the existing
-    // MI_RMW_ENTRY shape without new machinery -- Microcode.scala hardcodes
-    // `u.shiftOp`/`u.shiftDir` (:2818, :3386) so a memory shift cannot carry its
-    // tt/dr through ctx, and Scc needs a CONDITION evaluation (branch EU) rather than
-    // an ALU host-op. Both need their own µcode entry; tracked as follow-ups.
+    //   2026-09-03      TAS  <- fuzz clusters B/D
+    // and the fifth and sixth were sitting there unfound: `Scc <ea>` (fuzz seed 80) and
+    // the line-E MEMORY shift/rotate (fuzz seeds 109, 127) were never in any list.
+    // Neither has a µcode entry yet -- Microcode.scala hardcodes `u.shiftOp`/`u.shiftDir`
+    // so a memory shift cannot carry its tt/dr through ctx, and Scc needs a CONDITION
+    // evaluation (branch EU) rather than an ALU host-op -- so both now take the clean
+    // vector-4 trap the fail-safe delivers, instead of executing wrong. Giving them real
+    // entries is a follow-up; being WRONG about them is no longer possible.
     def miSingleEaFamily(spec: OpSpec, opw: Bits): Bool =
       (spec.op === DecOp.CLR) || (spec.op === DecOp.NEG) || (spec.op === DecOp.NEGX) ||
       (spec.op === DecOp.NOT) || (spec.op === DecOp.TST) ||
@@ -299,60 +306,17 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s1mi_srcEa = fed.payload.specs(1).srcEa
     val s1mi_dstEa = fed.payload.specs(1).dstEa
     val s1mi_opw   = s1mi_pkt.words(0)
-    val s1mi_line  = s1mi_opw(15 downto 12).asUInt
-    val s1mi_opmode= s1mi_opw(8 downto 6).asUInt
-    val s1mi_isMove= (s1mi_line === U(1, 4 bits)) || (s1mi_line === U(2, 4 bits)) || (s1mi_line === U(3, 4 bits))
-    // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic) mirror s0AnArith/ucAnArith below —
-    // see the s0AnArith comment (task #144 follow-up) for why this is needed and why it
-    // does not affect DIVU/DIVS (line 8) / MULU/MULS (line C).
-    val s1mi_anArith = miAnArithFamily(slot1Spec0)
-    val s1mi_isAluLine = (s1mi_line === U(8, 4 bits)) || (s1mi_line === U(9, 4 bits)) || (s1mi_line === U(0xB, 4 bits)) ||
-                         (s1mi_line === U(0xC, 4 bits)) || (s1mi_line === U(0xD, 4 bits))
-    val s1mi_isAlu = s1mi_isAluLine &&
-                     ((s1mi_opmode === U(0, 3 bits)) || (s1mi_opmode === U(1, 3 bits)) || (s1mi_opmode === U(2, 3 bits)) ||
-                      (s1mi_anArith && ((s1mi_opmode === U(3, 3 bits)) || (s1mi_opmode === U(7, 3 bits)))))
-    // ALU Dn,<ea> RMW dst-EA (task #150, mirrors s0AluDstMode/ucAluDstMi): opmode 4/5/6.
-    val s1mi_isAluDst = s1mi_isAluLine &&
-                        ((s1mi_opmode === U(4, 3 bits)) || (s1mi_opmode === U(5, 3 bits)) || (s1mi_opmode === U(6, 3 bits)))
-    val s1mi_isSingle = miSingleEaFamily(slot1Spec0, s1mi_opw)   // shared predicate (see logic's header)
-    // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors s0IsAddqSubq/ucAddqSubqMi).
-    val s1mi_isAddqSubq = miAddqSubqFamily(slot1Spec0)
-    val s1mi_isImm = miLineImmFamily(slot1Spec0)
-    // DYNAMIC bit-op mirror of s0IsDynBitOp above (see its doc comment for the full
-    // root-cause story, bit_dyn_indexed_memind.s cases 5/6): slot1's own copy of the
-    // same missing classifier.
-    val s1mi_isDynBitOp = miDynBitFamily(slot1Spec0)
-    // task #152: exclude the bit-op tt/.L-size field collision (see ucImmIsL's comment).
-    val s1mi_immL  = (slot1Spec0.op =/= DecOp.BITOP) && (s1mi_opw(7 downto 6) === B"10")
-    val s1mi_immVec= Mux(s1mi_immL, Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
-                                    Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3), s1mi_pkt.words(4)))
-    val s1mi_immEa = EaDecoder.decode(s1mi_opw(5 downto 0), slot1Spec0.size, s1mi_immVec)
-    // Control-transfer / address-generate full-format mem-indirect (task #201): LEA/PEA/
-    // JMP/JSR are NEVER recognized by OperationDecoder (it leaves them illegal=True even
-    // in their brief/register-EA form — MicroOpAssembler re-derives their identity from
-    // the raw opword independently), so slot1Spec0.op/.illegal carry NO usable signal for
-    // them; classify straight off `s1mi_opw` bits, mirroring MicroOpAssembler's own
-    // isLeaOp/isPeaOp/isJmpOp/isJsrOp patterns exactly.
-    val s1mi_isLea = (s1mi_opw(15 downto 12) === B"4'h4") && s1mi_opw(8) &&
-                     (s1mi_opw(7 downto 6) === B"11") && (s1mi_opw(5 downto 3).asUInt >= 2)
-    val s1mi_isPea = (s1mi_opw(15 downto 6) === B"10'b0100100001") && (s1mi_opw(5 downto 3).asUInt >= 2)
-    val s1mi_isJmp = s1mi_opw(15 downto 6) === B"10'b0100111011"
-    val s1mi_isJsr = s1mi_opw(15 downto 6) === B"10'b0100111010"
+    // The EA view for the families whose EA extension words are SHIFTED (see the
+    // slot-0 mirror `s0EaShifted` for the full rationale). Selected by the DECODER's
+    // own `eaSrcShift`, not by an opword re-match.
+    val s1mi_shiftVec = Mux(slot1Spec0.eaSrcShift === U(2, 2 bits),
+                            Vec(s1mi_opw, s1mi_pkt.words(3), s1mi_pkt.words(4), s1mi_pkt.words(5)),
+                            Vec(s1mi_opw, s1mi_pkt.words(2), s1mi_pkt.words(3), s1mi_pkt.words(4)))
+    val s1mi_shiftEa  = EaDecoder.decode(s1mi_opw(5 downto 0), slot1Spec0.size, s1mi_shiftVec)
+    val s1mi_srcKlass = Mux(slot1Spec0.eaSrcShift === U(0, 2 bits), s1mi_srcEa.klass, s1mi_shiftEa.klass)
     val slot1IsMemIndEarly = fed.valid && fed.payload.slot1Valid && (
-      (s1mi_isMove && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isMove && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isAlu && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isAluDst && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isAddqSubq && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      // task #153: the .L-imm case (s1mi_immL) is now routed too (predecode correctly
-      // frames it via extW3) -- see the s0IsLineImm mirror below for the full explanation.
-      (s1mi_isImm && (s1mi_immEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isDynBitOp && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isSingle && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isLea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isPea && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isJmp && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s1mi_isJsr && (s1mi_srcEa.klass === EaClass.MEMINDIRECT)))
+      (slot1Spec0.eaSrcValid && (s1mi_srcKlass    === EaClass.MEMINDIRECT)) ||
+      (slot1Spec0.eaDstValid && (s1mi_dstEa.klass === EaClass.MEMINDIRECT)))
     slot1IsMemIndEarly.simPublic()  // debug-only (task #144)
     // slot1 DYNAMIC read-only bit-field (slice 3c) — mirror slot1IsMemIndEarly: its real µops
     // come from the engine (entered from the stashed slot1 packet), so EXCLUDE it from the
@@ -634,73 +598,33 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0srcEa  = fed.payload.specs(0).srcEa   // offloaded EA on op[5:0] @ words(1)
     val s0dstEa  = fed.payload.specs(0).dstEa   // offloaded EA on the MOVE dst field
     val s0opw    = s0pkt.words(0)
-    val s0line   = s0opw(15 downto 12).asUInt
-    val s0opmode = s0opw(8 downto 6).asUInt
-    val s0IsMove = (s0line === U(1, 4 bits)) || (s0line === U(2, 4 bits)) || (s0line === U(3, 4 bits))
-    val s0IsAluSrcLine = (s0line === U(8, 4 bits)) || (s0line === U(9, 4 bits)) ||
-                         (s0line === U(0xB, 4 bits)) || (s0line === U(0xC, 4 bits)) || (s0line === U(0xD, 4 bits))
-    // ADDA/SUBA/CMPA (opmode 3/7, An-dest arithmetic — mirrors MicroOpAssembler.scala's
-    // `anArith`): these are ALSO ALU-src-EA ops (source = EA, dest = An) and need the SAME
-    // mem-indirect routing as the Dn-dest opmode 0/1/2 forms (task #144 follow-up: ADDA
-    // with a full-format mem-indirect source silently fell through to the ordinary,
-    // mem-indirect-unaware assembler path instead of tripping any illegal-gate, producing
-    // a garbage EA/wild PC). DIVU/DIVS (line 8) and MULU/MULS (line C) also use opmode
-    // 3/7 but resolve to a different DecOp (not ADD/SUB/CMP), so s0AnArith naturally
-    // excludes them — this does NOT change their routing.
-    val s0AnArith = miAnArithFamily(spec0)
-    val s0AluSrcMode = (s0opmode === U(0, 3 bits)) || (s0opmode === U(1, 3 bits)) || (s0opmode === U(2, 3 bits)) ||
-                       (s0AnArith && ((s0opmode === U(3, 3 bits)) || (s0opmode === U(7, 3 bits))))
-    // ALU Dn,<ea> RMW dst-EA (task #150, mirrors ucAluDstMi below): opmode 4/5/6 on the
-    // SAME op[5:0] EA field, just read/written instead of only read. Needed here too —
-    // this early slot0 gate is what decides whether the instruction enters the µcode
-    // engine AT ALL; without it a memory-indirect RMW dst falls through to the ordinary
-    // fast head with a garbage EA (wild PC), regardless of the later ucAluDstMi fix.
-    val s0AluDstMode = (s0opmode === U(4, 3 bits)) || (s0opmode === U(5, 3 bits)) || (s0opmode === U(6, 3 bits))
-    // ADDQ/SUBQ #n,<ea> (task #150 follow-up, mirrors ucAddqSubqMi below): another
-    // dst-EA RMW form, srcB.kind=IMMQ3 (distinct from the line-0 IMMEXT immediate).
-    val s0IsAddqSubq = miAddqSubqFamily(spec0)
-    val s0IsSingleEa = miSingleEaFamily(spec0, s0opw)          // shared predicate (see logic's header)
-    val s0IsLineImm  = miLineImmFamily(spec0)
-    // DYNAMIC bit-op (BTST/BCHG/BCLR/BSET Dn,<ea>): OperationDecoder gives its srcB a
-    // REGISTER (dnField, the bit-number Dn -- see OperationDecoder.scala's
-    // `o.srcB := Mux(isDynBit, dnField, immext)`), NOT an IMMEXT immediate like the
-    // static form (whose #n rides s0IsLineImm above via its own bit-number ext word).
-    // Bug repro: bit_dyn_indexed_memind.s cases 5/6 (BSET/BTST Dn,([bd,An],od)) --
-    // slot0IsMemInd below previously had NO clause covering this shape at all (only
-    // s0IsLineImm, which structurally cannot see a register-sourced srcB), so a
-    // dynamic bit-op with a full-format memory-indirect EA never entered the µcode
-    // engine and instead fell through to the ordinary fast path, where
-    // MicroOpAssembler's `bitOpMemBad` gate (srcEa.klass is MEMINDIRECT, neither
-    // DATAREG nor MEMSIMPLE) unconditionally illegalised it (vector 4) -- with no
-    // vector-4 handler installed, this bare-metal harness free-runs into random
-    // SparseMemory fill afterward (a HANG, not a trap). The EA ext word sits directly
-    // at op+1 for the dynamic form (no preceding bit-number word, unlike static), so
-    // this uses the SAME unshifted `s0srcEa` an ordinary ALU-src-EA op already uses --
-    // not the shifted `s0ImmEa` the static form needs.
-    val s0IsDynBitOp = miDynBitFamily(spec0)
-    // task #152: op[7:6] doubles as the bit-op tt sub-kind (BCLR=10 collides with the .L
-    // size encoding) -- see ucImmIsL's comment below for the full explanation. Excluded
-    // here too (this early gate is what decides engine entry in the first place).
-    val s0ImmIsL     = (spec0.op =/= DecOp.BITOP) && (s0opw(7 downto 6) === B"10")
-    val s0ImmEaVec   = Mux(s0ImmIsL, Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
-                                     Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
-    val s0ImmEa      = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0ImmEaVec)
-    // FORMERLY a SILENT-CORRUPTION HOLE (task #153 fix): a .L-immediate op with a
-    // FULL-FORMAT dst EA (mem-indirect here) places the EA's first ext word at op+3, one
-    // word beyond the ORIGINAL 2-word predecode lookahead (op+1/op+2 only) -- it used to
-    // frame BRIEF (too short), mis-fetching the FOLLOWING instruction, and was never routed
-    // to the engine (fell through to the normal head, gated ILLEGAL by MicroOpAssembler's
-    // `limmFullFmtDstBad`, vector 4). PredecodeWord.classify/IcachePlugin now thread a 3rd
-    // lookahead word (extW3, op+3) so this frames correctly (see PredecodeWord.scala's
-    // extW3 doc comment) and routes here exactly like the .B/.W imm-dst mem-indirect forms
-    // below. `limmFullFmtDstBad` itself was REMOVED in Part 122 of
-    // BUG_calibration_word_misplaced_0d00.md: with the extW3 lookahead plus Aligner's
-    // `ambiguousLine` stall/pack-refusal, a line-0 immediate can no longer reach decode
-    // with a guessed length, so that blanket gate only manufactured spurious vector-4
-    // traps -- it was the reason the Quadra 700 ROM's `cmpi.l #imm,%a0@(0xFEFFC)` at
-    // 0x000098E2 (full-format, I/IS=000) trapped on real silicon. (`s0LimmFullDstBad`
-    // below is declared for documentation/future diagnostic use; not read elsewhere.)
-    val s0LimmFullDstBad = s0IsLineImm && s0ImmIsL && (s0ImmEa.klass === EaClass.MEMINDIRECT)
+    // ── MEMORY-INDIRECT routing: ask the EA, not the opcode ─────────────────────
+    // The question this gate exists to answer is "does this instruction's EA need a
+    // pointer chain walked?". That is a property of the EA, and `OperationDecoder`
+    // now TYPES the EA for every instruction that has one -- including the ones
+    // MicroOpAssembler builds by hand (Scc, LEA, PEA, JMP, JSR, MOVE from SR/CCR,
+    // DIV.L/MUL.L) -- as `spec.eaSrcValid` / `spec.eaSrcShift` / `spec.eaDstValid`.
+    // So the gate below is TWO terms with no family names, and the 11-entry list this
+    // block used to carry (s0IsMove / s0IsAluSrcLine / s0AnArith / s0AluSrcMode /
+    // s0AluDstMode / s0IsAddqSubq / s0IsSingleEa / s0IsLineImm / s0IsDynBitOp /
+    // s0IsLea / s0IsPea / s0IsJmp / s0IsJsr) is gone along with the drift hazard that
+    // produced four silent-wrong-answer bugs (tasks #144/#145, #150, #152, TAS) and
+    // left `Scc <ea>` and the line-E memory shift executing with a garbage address.
+    //
+    // The ONE per-op residue is `eaSrcShift`, and it survives because the ENCODING
+    // differs rather than the opcode: a line-0 immediate, a static bit-op, a
+    // bit-field, CAS/MOVES/CMP2/CHK2 and DIV.L/MUL.L all place the EA's own first
+    // extension word AFTER a word of their own, so the offloaded `s0srcEa` (decoded at
+    // words(1)) reads the WRONG word for them. The decoder says how far to shift; this
+    // decodes that one view. (It replaces the old `s0ImmIsL`/`s0ImmEaVec`/`s0ImmEa`
+    // trio, which re-derived the same shift from the opword plus a DecOp.BITOP
+    // carve-out for the tt-vs-size field collision -- that collision is now the
+    // decoder's business, where the tt field is already decoded.)
+    val s0EaShiftVec = Mux(spec0.eaSrcShift === U(2, 2 bits),
+                           Vec(s0opw, s0pkt.words(3), s0pkt.words(4), s0pkt.words(5)),
+                           Vec(s0opw, s0pkt.words(2), s0pkt.words(3), s0pkt.words(4)))
+    val s0EaShifted  = EaDecoder.decode(s0opw(5 downto 0), spec0.size, s0EaShiftVec)
+    val s0EaSrcKlass = Mux(spec0.eaSrcShift === U(0, 2 bits), s0srcEa.klass, s0EaShifted.klass)
     // ported-tests triage (move_l_abs_memind_dst): the OFFLOADED s0dstEa (Offload /
     // computeOffload in MicroOpAssembler.scala) reads the MOVE dst's own ext word at a
     // FIXED words(1)/words(2) position — correct only when the SOURCE EA is register-direct
@@ -716,7 +640,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // lines to hoist ucMiDstEa above this point) because THIS classification is what gates
     // entry into the engine in the first place. Repro: move_l_abs_memind_dst.s (MOVE.L
     // (abs).W src -> ([bd.W,An],od) memind dst, no index) — now correctly detected.
-    val s0dstModeIsFullCandidate = s0IsMove &&
+    val s0dstModeIsFullCandidate = spec0.eaDstValid &&
       ((s0opw(8 downto 6) === B"110") || ((s0opw(8 downto 6) === B"111") && (s0opw(11 downto 9) === B"011")))
     def s0miWordsOf(extW: Bits): UInt = {
       val bdSize  = extW(5 downto 4).asUInt
@@ -839,31 +763,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val slot1IsFmovemx = fed.valid && fed.payload.slot1Valid && s1IsFpGenMemEa && !s1fxExt1(11) &&
                          !s1fxPcRelStore &&
                          ((s1fxExt1(15 downto 13) === B"3'b110") || (s1fxExt1(15 downto 13) === B"3'b111"))
-    // Control-transfer / address-generate full-format mem-indirect (task #201): see the
-    // s1mi_isLea/isPea/isJmp/isJsr comment (mirrored here for slot0) — OperationDecoder
-    // never recognizes JMP/JSR at all (illegal=True always) and marks LEA/PEA non-illegal
-    // for ANY EA mode>=2 (not gated on EA class), so `spec0` carries no usable signal for
-    // this classification; derive straight off `s0opw` bits instead.
-    val s0IsLea = (s0opw(15 downto 12) === B"4'h4") && s0opw(8) &&
-                  (s0opw(7 downto 6) === B"11") && (s0opw(5 downto 3).asUInt >= 2)
-    val s0IsPea = (s0opw(15 downto 6) === B"10'b0100100001") && (s0opw(5 downto 3).asUInt >= 2)
-    val s0IsJmp = s0opw(15 downto 6) === B"10'b0100111011"
-    val s0IsJsr = s0opw(15 downto 6) === B"10'b0100111010"
     val slot0IsMemInd = fed.valid && (
-      ((s0IsMove && (s0srcEa.klass === EaClass.MEMINDIRECT))) ||
-      ((s0IsMove && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted))) ||
-      (s0IsAluSrcLine && s0AluSrcMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsAluSrcLine && s0AluDstMode && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsAddqSubq && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      // task #153: the .L-imm case (s0ImmIsL) is NOW routed too -- predecode correctly
-      // frames it (extW3), so s0ImmEa's klass is trustworthy for it exactly like .B/.W.
-      (s0IsLineImm && (s0ImmEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsDynBitOp && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsSingleEa && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsLea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsPea && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsJmp && (s0srcEa.klass === EaClass.MEMINDIRECT)) ||
-      (s0IsJsr && (s0srcEa.klass === EaClass.MEMINDIRECT)))
+      (spec0.eaSrcValid && (s0EaSrcKlass === EaClass.MEMINDIRECT)) ||
+      (spec0.eaDstValid && ((s0dstEa.klass === EaClass.MEMINDIRECT) || s0dstIsMemIndShifted)))
     // ── Bit-field DYNAMIC read-only MEMORY detection (slice 3c) ──────────────────
     // BFTST/BFEXTU/BFEXTS/BFFFO at a memory EA with Do(ext[11])||Dw(ext[5]) set route through
     // the µcode engine (the static-offset/width read-only forms keep the 3a MicroOpAssembler
@@ -2577,17 +2479,42 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucFpRealEntry = Mux(ucFpCtrlOk, ucFpCtrlEntryMux,
       Mux(ucFpStoreOk, ucFpStoreEntry,
       Mux(ucFpMemBad, U(Microcode.FP_MEM_TRAP_ENTRY, ew bits), ucFpRealEntryOk)))
+    // `&& !ucBfIsMemindEa` on the three REGISTER-BASE bit-field arms below: those entry
+    // families read `ucBfEaDec.disp` as a complete byte address, but for a MEMINDIRECT EA
+    // that field is `bd` -- the FIRST-level, PRE-dereference displacement (the same
+    // silent-wrong bug class ucIsBfMemindRd/Rmw were added to close). The memind-aware
+    // arms above claim every memind shape they implement; anything they do NOT claim (a
+    // STATIC-offset pre/post-indexed memind EA, today) must fall through to the fail-safe
+    // and TRAP, not be handed to a register-base chain that will compute the wrong
+    // address. Before the routing gate became generic, the read-only arm was protected by
+    // the front gate (`slot0IsBfMemindMem` admitted only the shapes MI_BF_* implements, so
+    // an unimplemented memind bit-field never entered the engine at all); the RMW arms
+    // never were, because `spec.microcoded` admits them unconditionally -- so this also
+    // closes a pre-existing hole rather than only guarding the new path.
     val ucRealEntry = Mux(ucIsFpMem, ucFpRealEntry,
       Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
       Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
       Mux(ucIsMemInd, ucMiEntry,
-      Mux(ucIsBfDynRd, ucBfDynRdEntry,
-      Mux(ucIsBfRmwDyn, ucBfRmwDynEntry,
-      Mux(ucIsBfRmw,
+      Mux(ucIsBfDynRd  && !ucBfIsMemindEa, ucBfDynRdEntry,
+      Mux(ucIsBfRmwDyn && !ucBfIsMemindEa, ucBfRmwDynEntry,
+      Mux(ucIsBfRmw    && !ucBfIsMemindEa,
         Mux(ucBfNeedHi, U(Microcode.BF_RMW_5B_ENTRY, ew bits),
                         U(Microcode.BF_RMW_4B_ENTRY, ew bits)),
       Mux(ucIsMoves, ucMovesEntry,
-        ucEntrySpec.ucEntry))))))))
+        // FAIL-SAFE (the generic memory-indirect gate's safety net). Reaching here means
+        // an early gate routed this op into the engine and NO entry classifier above
+        // claimed it. A `microcoded` op keeps the entry OperationDecoder gave it (BCD /
+        // ADDX / SUBX / CAS / CAS2 / ...). Anything else got here ONLY through the
+        // memory-indirect EA gate -- its EA needs a pointer chain walked and this ROM has
+        // no entry for its family (today: `Scc <ea>` and the line-E memory shift, both of
+        // which need machinery the MI_RMW_ENTRY shape does not have -- a branch-EU
+        // condition evaluation and a tt/dr carried through ctx respectively). Those
+        // deliver a clean vector-4 ILLEGAL instead of executing ROM row 0 with a garbage
+        // address. This is what makes the gate SAFE to make generic: a family nobody
+        // routed traps, rather than silently writing the wrong register or branching to a
+        // wild PC -- which is exactly how all four previous drift bugs presented.
+        Mux(ucEntrySpec.microcoded, ucEntrySpec.ucEntry,
+                                    U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits))))))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
     // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from
