@@ -1200,6 +1200,34 @@ object MicroOpAssembler {
     opUop.firstOfInstr  := !opHasLeadingLoad
     opUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
+    /** Make `opUop` an INERT FAULTING µop: illegal, reads nothing, writes nothing,
+      * faulting to `vector` at retire.
+      *
+      * Seven `when` arms built this same shape BY HAND -- `bad`, the MOVE-from-SR/CCR
+      * and MOVE-to-CCR bad-EA arm, DIV.L, MUL.L, bitfield, CMP2/CHK2, and JMP/JSR --
+      * and each cleared a DIFFERENT subset of the fields (12 to 19 of the 21 that
+      * matter). That is not a style problem: these arms run LAST and win, so a field
+      * an EARLIER arm set stays set unless the trap arm clears it. `when(bad)` sat
+      * directly after an arm setting `needsSupervisor := True` and did not clear it,
+      * so an illegal instruction could retire still marked privileged.
+      *
+      * One definition, clearing the full set, so every trap is inert the same way. */
+    def inertTrap(vector: UInt): Unit = {
+      opUop.op            := DecOp.ILLEGAL
+      opUop.cluster       := Cluster.INT
+      opUop.memOp         := MemOp.NONE
+      opUop.unimplemented := True
+      opUop.dstValid  := False; opUop.srcAValid := False
+      opUop.srcBValid := False; opUop.srcCValid := False
+      opUop.fromCcr   := False; opUop.fromSr    := False; opUop.toCcr := False
+      opUop.needsSupervisor := False; opUop.keepCommit := False
+      opUop.writesNzvc := False; opUop.writesX := False
+      opUop.readsNzvc  := False; opUop.readsX  := False
+      opUop.isBranch   := False
+      opUop.faulted    := True; opUop.faultVector := vector
+      opUop.faultUsesNextPc := False
+    }
+
     // --- srcA slot ---
     switch(spec.srcA.kind) {
       is(OperandKind.REGFIELD) {
@@ -2256,24 +2284,13 @@ object MicroOpAssembler {
       opUop.needsSupervisor := True
     }
     when(bad) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      // Illegal instruction -> precise fault. Line-1010/Line-1111 ("Line-A"/"Line-F")
-      // opcodes get their own dedicated vectors (10/11) per real 68040 hardware (Musashi
-      // m68kcpu.h: opword top nibble 0xA/0xF traps unconditionally, distinct from the
-      // generic vector-4 illegal-instruction path); everything else illegal is vector 4.
-      // The op µop retires as the faulting head; the exception FSM stacks the frame +
-      // vectors (both land in the generic short format-$0 frame, same as vector 4/8).
-      opUop.faulted     := True
-      opUop.faultVector := (op(15 downto 12).asUInt).mux(
+      // Line-A / Line-F opcodes get their own vectors (10/11) per real 68040 hardware
+      // (Musashi m68kcpu.h: top nibble 0xA/0xF traps unconditionally, distinct from the
+      // generic vector-4 illegal path). Everything else illegal is vector 4.
+      inertTrap((op(15 downto 12).asUInt).mux(
         U(0xA, 4 bits) -> U(10, 8 bits),
         U(0xF, 4 bits) -> U(11, 8 bits),
-        default        -> U(4, 8 bits)
-      )
+        default        -> U(4,  8 bits)))
     }
     // ── Line-F trap PC flavor: pre-instruction vs post-instruction ───────────────
     // A vector-11 F-line trap comes in two flavors, and this project previously had only
@@ -2641,14 +2658,7 @@ object MicroOpAssembler {
     }
     // Forced-illegal (vector 4) for a bad-EA MOVE-from-SR/CCR / MOVE-to-CCR (like jmpBad).
     when(moveFromSrBad || moveFromCcrBad || moveToCcrBad) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.fromCcr := False; opUop.fromSr := False; opUop.toCcr := False; opUop.needsSupervisor := False; opUop.keepCommit := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.readsNzvc := False; opUop.readsX := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
     // ── Privileged commit-time SYSTEM ops: MOVE-to-SR / MOVE-USP / MOVEC ─────────
     // The op µop is the macro boundary (single µop; reg-source/reg-dest forms only —
@@ -3275,13 +3285,7 @@ object MicroOpAssembler {
     // exactly like the `bad` path. opUop is already illegal for the 4C4x opword
     // (OperationDecoder's line-4 default), so we just force the faulted illegal fields.
     when(isDivLOp && !divLOk) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
 
     // ── MULU.L / MULS.L (32x32->32 and 32x32->64) — line-4 extension-word forms ──
@@ -3418,13 +3422,7 @@ object MicroOpAssembler {
     val mulLOk = mullMulIsReg || mullMulIsImm || mullMulOkMem
     val mullLoadUop = divMulLoadUop(mullSrcEa)
     when(isMulLOp && !mulLOk) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
 
     // ── Bit-field MEMORY load-only crack (BFTST/BFEXTU/BFEXTS/BFFFO <ea>, static) ──
@@ -3569,15 +3567,7 @@ object MicroOpAssembler {
     // (BFFFO An-base dynamic-mem IS routed — the FFOFULL redesign.) (The static read-only mem forms keep the 3a crack.)
     val bfmBad = isBfMemSpec && (!bfmEaOk || bfDo || bfDw)
     when(bfmBad) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.srcCValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      opUop.readsNzvc := False; opUop.readsX := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
 
     // ── CMP2 / CHK2 (0000 0ss0 11 mmm rrr) + ext word — the 2-load+compare crack ──
@@ -3725,15 +3715,7 @@ object MicroOpAssembler {
     // A CMP2/CHK2 with a non-control EA -> illegal (vector 4).
     val c2Bad = isCmp2Chk2Op && !c2EaOk
     when(c2Bad) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.srcCValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      opUop.readsNzvc := False; opUop.readsX := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
 
     // ── ibrUop = an INDIRECT branch to a computed EA address (JMP / JSR target). ──
@@ -3807,13 +3789,7 @@ object MicroOpAssembler {
 
     // A JMP/JSR with a non-control EA -> illegal (vector 4), like the `bad` path.
     when(jmpBad || jsrBad) {
-      opUop.op            := DecOp.ILLEGAL
-      opUop.cluster       := Cluster.INT
-      opUop.memOp         := MemOp.NONE
-      opUop.unimplemented := True
-      opUop.dstValid := False; opUop.srcAValid := False; opUop.srcBValid := False
-      opUop.writesNzvc := False; opUop.writesX := False; opUop.isBranch := False
-      opUop.faulted := True; opUop.faultVector := 4; opUop.faultUsesNextPc := False
+      inertTrap(4)
     }
 
     // ── Call/return µop builder: every field assigned EXACTLY ONCE (SpinalHDL flags an
