@@ -1164,18 +1164,46 @@ object OperationDecoder {
         // already documents as reserved.
         //
         // SCOPE: the register-indirect EA modes only --
-        //   FSAVE    : mode 100 (-(An))  and mode 010 ((An))   [predecrement + control]
-        //   FRESTORE : mode 011 ((An)+)  and mode 010 ((An))   [postincrement + control]
+        //   FSAVE    : control alterable + -(An)
+        //   FRESTORE : control + (An)+ (including the PC-relative forms)
         // matching the architectural alterable/control restrictions on each. The
         // displacement/absolute forms (0xF338/0xF378 etc.) need a real EA computation
         // that this commit-time sysOp path has no AGU for, so they stay OUT of scope on
         // the line-F vector-11 fall-through.
         val fsvBase    = opword(11 downto 9) === B"3'b001"
         val fsvMode    = opword(5 downto 3)
+        // d16(An) (mode 101) admitted 2026-09-12. Mac OS restores FPU context through
+        // `FRESTORE d16(An)` (measured: 0xF36D = FRESTORE d16(A5), in system RAM), and
+        // leaving it undecoded dropped it onto the F-line illegal default -> vector 11,
+        // which the ROM's FPSP then misparsed. See
+        // docs/BUG_frestore_displacement_ea_and_fline_frame.md.
+        //
+        // Unlike the register-indirect modes this one is TWO words (opword + d16), so
+        // PredecodeWord must agree on the length or the NEXT instruction is mis-framed --
+        // the same trap the FMOVE.L #imm,FPCR arm documents there. MicroOpAssembler
+        // cracks it into [T0 := An + sext(d16)] + [the sysOp reading T0], so the FSM
+        // still receives a ready-made base address on srcB and needs no change.
+        // The architectural EA classes, not a hand-picked subset:
+        //   FSAVE    = control ALTERABLE + -(An)
+        //   FRESTORE = control           + (An)+
+        val fsvReg     = opword(2 downto 0)
+        val fsvIs7     = fsvMode === B"3'b111"
+        val fsvAbsW    = fsvIs7 && (fsvReg === B"3'b000")
+        val fsvAbsL    = fsvIs7 && (fsvReg === B"3'b001")
+        val fsvPcD16   = fsvIs7 && (fsvReg === B"3'b010")
+        val fsvPcIdx   = fsvIs7 && (fsvReg === B"3'b011")
+        // Common to both directions: (An), (d16,An), (d8,An,Xn), (xxx).W, (xxx).L
+        val fsvControl = (fsvMode === B"3'b010") || (fsvMode === B"3'b101") ||
+                         (fsvMode === B"3'b110") || fsvAbsW || fsvAbsL
         val isFsave    = fsvBase && (opword(8 downto 6) === B"3'b100") &&
-                         ((fsvMode === B"3'b100") || (fsvMode === B"3'b010"))
+                         (fsvControl || (fsvMode === B"3'b100"))          // + -(An)
         val isFrestore = fsvBase && (opword(8 downto 6) === B"3'b101") &&
-                         ((fsvMode === B"3'b011") || (fsvMode === B"3'b010"))
+                         (fsvControl || (fsvMode === B"3'b011") ||        // + (An)+
+                          fsvPcD16 || fsvPcIdx)                           // + PC-relative
+        // Everything except (An)/-(An)/(An)+ needs a COMPUTED address, which
+        // MicroOpAssembler supplies by cracking into [T0 := EA] + [sysOp reading T0]
+        // (leaGenUop, the same path PEA uses). The auto-update modes keep the
+        // single-uop form because they must write An back.
         when(isFsave || isFrestore) {
           o.illegal    := False
           o.op         := DecOp.MOVE

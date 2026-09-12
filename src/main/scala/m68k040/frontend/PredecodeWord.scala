@@ -1136,6 +1136,18 @@ object PredecodeWord {
         // ESTABLISHED INVARIANT (Task 6 depends on it): a cpGEN instruction is never
         // genuinely 1 word, so lenWords===1 on a cpGEN opword means "not framed".
         val fpIsGen   = (op(11 downto 9) === B"3'b001") && (op(8 downto 6) === B"3'b000")
+        // FSAVE (`1111 001 100 mmmrrr`) / FRESTORE (`1111 001 101 mmmrrr`). Length is
+        // EA-DEPENDENT now that both admit the full control / control-alterable classes
+        // (2026-09-12): (An)/-(An)/(An)+ are 1 word, but (d16,An) is 2, (xxx).L is 3, and
+        // the indexed forms vary. The generic fallback below frames every non-cpGEN opword
+        // as 1 word -- correct only while the opword traps on its own. Now that these
+        // EXECUTE, a 1-word frame would fetch the displacement as the next instruction:
+        // exactly the wild-PC failure the FMOVE.L #imm,FPCR and FBcc arms document.
+        val fpSaveRest = (op(11 downto 9) === B"3'b001") &&
+                         ((op(8 downto 6) === B"3'b100") || (op(8 downto 6) === B"3'b101"))
+        val (fsvEaOk, fsvEaExt, fsvEaAmb) =
+          eaExt(op(5 downto 3).asUInt, op(2 downto 0).asUInt, sizeL = False,
+                allowImm = false, eaW = extW, eaWKnown = extWKnown)
         // FScc framing: cpID 001 + type 001, `1111 001 001 mmmrrr` + a condition extension
         // word + the <ea>'s OWN extension words.  Scoped exactly like the integer `isSccOp`
         // gate in MicroOpAssembler: mode 1 (An direct) is FDBcc and mode 7 with reg>=2 is
@@ -1282,6 +1294,10 @@ object PredecodeWord {
           // every other condition is a real branch (see OperationDecoder's `isFpBcc`).
           r.simple   := True
           r.lenWords := Mux(op(6), U(3, 4 bits), U(2, 4 bits))
+        } .elsewhen(fpSaveRest && fsvEaOk) {
+          r.simple        := True
+          r.lenWords      := (U(1, 4 bits) + fsvEaExt).resized   // opword + EA ext words
+          r.ambiguousLine := fsvEaAmb
         } .otherwise {
           r.simple := True; r.lenWords := U(1, 4 bits)
         }

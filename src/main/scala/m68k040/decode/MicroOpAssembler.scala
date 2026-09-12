@@ -2810,12 +2810,23 @@ object MicroOpAssembler {
         // (mode 010) writes nothing back. The decoder already restricted the admitted
         // modes per direction, so testing both here is safe and self-documenting.
         val fsvAuto   = (op(5 downto 3) === B"3'b100") || (op(5 downto 3) === B"3'b011")
-        opUop.srcBReg   := fsvAn; opUop.srcBValid := True
+        // The three REGISTER-INDIRECT modes carry their base in An directly. Every other
+        // admitted mode -- (d16,An), (d8,An,Xn), (xxx).W/.L and FRESTORE's PC-relative
+        // forms -- needs a COMPUTED address, so the macro is cracked into
+        // [T0 := EA] + [this uop reading T0] and the base arrives in T0 instead.
+        val fsvDirect  = (op(5 downto 3) === B"3'b010") || (op(5 downto 3) === B"3'b011") ||
+                         (op(5 downto 3) === B"3'b100")
+        val fsvNeedsEa = !fsvDirect
+        opUop.srcBReg   := Mux(fsvNeedsEa, U(T0, 5 bits), fsvAn); opUop.srcBValid := True
         opUop.srcAValid := False
-        opUop.useImm    := False   // srcB is a REAL register read (An), like MOVEC/PTEST
-        opUop.imm       := (op(5 downto 3) ## fsvIsRest.asBits).resize(32)
+        opUop.useImm    := False   // srcB is a REAL register read (An/T0), like MOVEC/PTEST
+        // Report mode 010 ((An)) to the FSM on the computed-address path: by then T0 HOLDS
+        // the final address, so the frame walk is a plain base-register walk with no
+        // auto-update. That is a shape the FSM already implements, so it needs no change.
+        opUop.imm       := (Mux(fsvNeedsEa, B"3'b010", op(5 downto 3)) ##
+                            fsvIsRest.asBits).resize(32)
         opUop.dstReg    := fsvAn
-        opUop.dstValid  := fsvAuto
+        opUop.dstValid  := fsvAuto        // only -(An)/(An)+ write An back
         opUop.isMovea   := True    // An destination: full-32 write, no partial merge
       }
     }
@@ -4139,6 +4150,15 @@ object MicroOpAssembler {
     val leaAn   = (U(8, 5 bits) + op(11 downto 9).asUInt).resized
     val leaUop  = leaGenUop(leaAn, leaFirst = True)             // LEA: addr -> An (single µop)
     val peaAddr = leaGenUop(U(T0, 5 bits), leaFirst = True)     // PEA: addr -> T0 (then push)
+    // FSAVE/FRESTORE with a computed address reuses PEA's EA->T0 uop verbatim (same
+    // leaGenUop, same temp), so the whole control / control-alterable class is covered by
+    // one path instead of a carve-out per mode. Aliased rather than re-instantiated so the
+    // EA datapath is not duplicated.
+    val fsvAddrUop  = peaAddr
+    val fsvIsSysOp  = (spec.sysKind === SysKind.FSAVE) || (spec.sysKind === SysKind.FRESTORE)
+    val fsvCracks   = fsvIsSysOp && !((op(5 downto 3) === B"3'b010") ||
+                                      (op(5 downto 3) === B"3'b011") ||
+                                      (op(5 downto 3) === B"3'b100"))
     // PEA push: stkPush store, base/dst A7 (A7 -= 4), store DATA = T0 (srcB) — the LINK
     // register-data stkPush precedent (LsEu data0 mux selects srcB when srcBValid).
     val peaPush = mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
@@ -4309,6 +4329,11 @@ object MicroOpAssembler {
       out.count   := 1
       out.uops(0) := Mux(jmpBad, opUop, ibrUop)
       out.uops(1) := Mux(jmpBad, opUop, ibrUop)
+    } elsewhen(fsvCracks) {
+      // FSAVE/FRESTORE <computed ea> -> [T0 := EA] + [the sysOp reading T0].
+      out.count   := 2
+      out.uops(0) := fsvAddrUop
+      out.uops(1) := opUop
     } elsewhen(isJsrOp) {
       // JSR -> [push.l retPC -> -(A7)] + [ibranch -> EA addr]. Bad EA -> illegal.
       // JSR (A7) additionally prepends [T0 := A7] so the branch sees the PRE-push
