@@ -355,10 +355,17 @@ object PredecodeWord {
                          (mode === U(6, 3 bits)) || (mode === U(7, 3 bits))
           // CMP2/CHK2 EA ext follows a PRECEDING ext word, so op+1 is NOT the EA ext;
           // pass 0 to keep brief framing (full-format here is out of scope).
-          val (ok, e, _) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+          // task #197 precedent: the EA ext follows a PRECEDING ext word, so op+1 is NOT it -- but a HARDCODED
+          // zero told eaExt the word is definitely all-zero. eaExt reads eaW(8) to pick brief vs FULL format
+          // for mode 6 / mode-7-3, so a zero always said 'brief': lenWords came out too short for a genuine
+          // full-format EA and fetch resynced mid-instruction (wild PC). Pass the REAL extW2 + extW2Known, so
+          // an unresident word falls back to the existing eaWKnown=False 'assume brief' safety net like every
+          // other caller here.
+          val (ok, e, amb) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
           when(ok && ctrlMode) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
+            r.ambiguousLine := amb
           }
         }
         // ── CAS / CAS2 (020+ atomic compare-and-swap) ──────────────────────────
@@ -383,10 +390,17 @@ object PredecodeWord {
             val casOk = (mode === U(2, 3 bits)) || (mode === U(3, 3 bits)) || (mode === U(4, 3 bits)) ||
                         (mode === U(5, 3 bits)) || (mode === U(6, 3 bits)) ||
                         ((mode === U(7, 3 bits)) && ((reg === U(0, 3 bits)) || (reg === U(1, 3 bits))))
-            val (ok, e, _) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+            // task #197 precedent: the EA ext follows a PRECEDING ext word, so op+1 is NOT it -- but a
+            // HARDCODED zero told eaExt the word is definitely all-zero. eaExt reads eaW(8) to pick brief vs
+            // FULL format for mode 6 / mode-7-3, so a zero always said 'brief': lenWords came out too short for
+            // a genuine full-format EA and fetch resynced mid-instruction (wild PC). Pass the REAL extW2 +
+            // extW2Known, so an unresident word falls back to the existing eaWKnown=False 'assume brief' safety
+            // net like every other caller here.
+            val (ok, e, amb) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
             when(ok && casOk) {
               r.simple   := True
               r.lenWords := (U(2, 3 bits) + e).resized          // opword + 1 ext + EA ext
+              r.ambiguousLine := amb
             }
           }
         }
@@ -401,10 +415,17 @@ object PredecodeWord {
           val movesOk = (mode === U(2, 3 bits)) || (mode === U(3, 3 bits)) || (mode === U(4, 3 bits)) ||
                         (mode === U(5, 3 bits)) || (mode === U(6, 3 bits)) ||
                         ((mode === U(7, 3 bits)) && ((reg === U(0, 3 bits)) || (reg === U(1, 3 bits))))
-          val (ok, e, _) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = B(0, 16 bits))
+          // task #197 precedent: the EA ext follows a PRECEDING ext word, so op+1 is NOT it -- but a HARDCODED
+          // zero told eaExt the word is definitely all-zero. eaExt reads eaW(8) to pick brief vs FULL format
+          // for mode 6 / mode-7-3, so a zero always said 'brief': lenWords came out too short for a genuine
+          // full-format EA and fetch resynced mid-instruction (wild PC). Pass the REAL extW2 + extW2Known, so
+          // an unresident word falls back to the existing eaWKnown=False 'assume brief' safety net like every
+          // other caller here.
+          val (ok, e, amb) = eaExt(mode, reg, sizeL = False, allowImm = false, eaW = extW2, eaWKnown = extW2Known)
           when(ok && movesOk) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized            // opword + 1 ext + EA ext
+            r.ambiguousLine := amb
           }
         }
       }
@@ -635,10 +656,17 @@ object PredecodeWord {
         when(isDivL || isMulL) {
           val srcMode = op(5 downto 3).asUInt
           val srcReg  = op(2 downto 0).asUInt
-          val (ok, e, _) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true, eaW = B(0, 16 bits))  // EA ext follows the Dl/Dh word
+          // task #197 precedent: the EA ext follows a PRECEDING ext word, so op+1 is NOT it -- but a HARDCODED
+          // zero told eaExt the word is definitely all-zero. eaExt reads eaW(8) to pick brief vs FULL format
+          // for mode 6 / mode-7-3, so a zero always said 'brief': lenWords came out too short for a genuine
+          // full-format EA and fetch resynced mid-instruction (wild PC). Pass the REAL extW2 + extW2Known, so
+          // an unresident word falls back to the existing eaWKnown=False 'assume brief' safety net like every
+          // other caller here.
+          val (ok, e, amb) = eaExt(srcMode, srcReg, sizeL = True, allowImm = true, eaW = extW2, eaWKnown = extW2Known)  // EA ext follows the Dl/Dh word
           when(ok) {
             r.simple   := True
             r.lenWords := (U(2, 3 bits) + e).resized   // opword + ext word + EA ext
+            r.ambiguousLine := amb
           }
         }
         // JMP (0100111011 mmmrrr) / JSR (0100111010 mmmrrr): a computed-target branch
