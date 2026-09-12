@@ -127,7 +127,25 @@ EA mode"):
   -- a shape the FSM implements today, so `ExceptionUnit` and `RobPlugin` need
   no change. The auto-update modes keep the single-uop form since they write An.
 
-Not yet compiled or tested at the time of writing.
+VALIDATED 2026-09-12. `fsave_frestore_basic` PASSES (sim completes in 1.23 s).
+
+That test had been HANGING the entire ported suite -- it stalled at test 889 of
+~940, so everything alphabetically after `f` never ran, which is why the
+project's "~12 pre-existing failures" baseline was never trustworthy. The cause
+was this very gap: the test has always exercised
+
+    fsave 8(%a0) / frestore 8(%a0)          d16(An)
+    fsave 0x1F00.w / frestore 0x1F00.w      abs.W
+    fsave 0x00020010 / frestore 0x00020010  abs.L
+
+and before this change the decoder admitted only (An)/-(An)/(An)+, so the first
+displacement form fell to the F-line illegal default and spun. Its `.timeout`
+sidecar is 3,000,000 units -- effectively no timeout -- so it took the suite
+down instead of reporting a failure.
+
+The coverage existed all along; the implementation did not. Three separate
+symptoms -- the Mac OS FPU-restore crash, the suite hang, and the untrustworthy
+failure baseline -- were this one bug.
 
 Fix (2) is NOT implemented.
 
