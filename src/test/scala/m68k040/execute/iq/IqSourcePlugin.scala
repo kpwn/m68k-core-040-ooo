@@ -46,6 +46,24 @@ class IqSourcePlugin extends FiberPlugin {
       val c = IqContext()
       c.robId := io.robId
       val u = c.uop
+      // Drive EVERY field first, then override the ones this harness cares about.
+      //
+      // This used to be a hand-written list of "safe defaults". RenamedUop then GREW -- it
+      // is 84 fields now, the list reached 44 -- and the ~40 fields it never learned about
+      // were left undriven, so SpinalHDL's PhaseCheck_noLatchNoOverride failed elaboration
+      // with `NO DRIVER ON ... RenamedUop`. That killed EVERY spec in this directory:
+      // IssueQueueSpec, IqAluSlowSpec, IqLsSpec, IqCplxSpec, IqFpSpec, IqColdPayloadSpec --
+      // 20 tests -- and did it silently, because a suite that cannot elaborate reports
+      // FAILURES, which read like broken behaviour rather than absent coverage.
+      //
+      // Zeroing the whole bundle in one line cannot drift: a field added to RenamedUop
+      // tomorrow is driven here today. The explicit assignments below still win, since in
+      // SpinalHDL the later assignment takes precedence.
+      // `allowOverride` is required: SpinalHDL's noLatchNoOverride check treats a whole-
+      // bundle default followed by field overrides as an ASSIGNMENT OVERLAP, even though
+      // the later assignment is exactly the intended winner.
+      u.allowOverride()
+      u := u.getZero
       // Safe defaults for unused fields so the bundle is fully driven.
       u.valid        := True
       // `pc` is a COLD field (it lives only in the cold payload Mem, never in the narrow
