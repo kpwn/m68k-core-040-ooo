@@ -1864,9 +1864,6 @@ object MicroOpAssembler {
     // ss == 11 (op[7:6]). mode = op[5:3]. DBcc = mode 001 (+ disp16 word). Scc = any
     // other mode (a byte set on cond); in-scope = mode 000 (Dn). TRAPcc = mode 111 with
     // reg ∈ {2,3,4} (no-operand/word/long). cccc = op[11:8]. rrr = op[2:0].
-    val isLine5    = (op(15 downto 12) === B"4'h5")
-    val ss5        = op(7 downto 6)
-    val mode5      = op(5 downto 3)
     val cccc5      = op(11 downto 8)
     val rrr5       = op(2 downto 0).asUInt.resize(5)
     val isDbccOp = spec.form === OpForm.DBCC
@@ -1900,7 +1897,6 @@ object MicroOpAssembler {
     val isTrapccOp = spec.form === OpForm.TRAPCC
     // A memory Scc / other mode-7 TRAPcc line-5 ss==11 form is deferred -> illegal.
     // Exclude TRAPcc (mode7,reg{2,3,4}) from the sccMemBad bucket.
-    val sccMemBad  = isLine5 && (ss5 === 3) && (mode5 =/= 0) && (mode5 =/= 1) && !isTrapccOp
     // ── RTE (0x4E73) — a serializing return-from-exception µop (privileged). ────
     // Decoded here (line 0x4 is otherwise unimplemented) so it is NOT treated as an
     // illegal instruction. It commits like a no-op op µop but carries isRte; the
@@ -2221,7 +2217,7 @@ object MicroOpAssembler {
     // `form === NONE`. `isSysOp`/`isBfMemSpec` stay: they read spec FIELDS
     // (spec.sysOp, spec.op/microcoded), not a re-derived opword match.
     val bad = (spec.form === OpForm.NONE) && !isSysOp && !isBfMemSpec &&
-              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
+              (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad || fpGenBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
     // A JMP/JSR with a non-control EA is illegal (vector 4).
@@ -3525,7 +3521,6 @@ object MicroOpAssembler {
     // The BITFIELD bfMem compute µop (the macro architectural commit): srcA=T0, srcB=T1
     // (valid iff needHi), dst=Dn2 for EXTU/EXTS/FFO, none for BFTST.
     val bfmIsExtFfo = (bfmBfOp === 1) || (bfmBfOp === 3) || (bfmBfOp === 5)
-    val bfmIsTst    = (bfmBfOp === 0)
     val bfmCompute = {
       val u = DecodedUop()
       u.debugBreakValid := False; u.debugBreakSlot := 0
