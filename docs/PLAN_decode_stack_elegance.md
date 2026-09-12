@@ -126,6 +126,23 @@ whole goal is trying to delete. It also removes the constraint that currently
 shapes Slice 2 (see the CONSTRAINT box above): once `op` is not in the hot
 payload, its width stops being FMax-critical.
 
+**Refinement found while implementing (not yet done).** Slice 5 as landed
+precomputes the classes on the IQ's PUSH path. That removes them from the
+per-slot cones, which was the FMax win, but the SHIFT|BITFIELD classification
+now exists in two places: `IqContext.assignFrom` and `AluEuPlugin:231`
+(`isSlowIn`, re-derived from the issue-port payload). Two copies of one
+predicate is the drift mechanism this goal exists to remove.
+
+The complete form is to classify ONCE at DECODE -- where `op` is decided
+anyway -- carry the flag in `RenamedUop`, and have both `IqHot` and the EU read
+that single field. Nothing re-derives it. This is blocked only on the decode
+files being held by the Slice 1 work; it is a small change once they are free.
+
+A survey confirmed the rest of the execute side is NOT debt: the 13 `op ===`
+comparisons in `AluEuPlugin`, 9 in `DivEuPlugin` and 8 in `AluDatapath` are EU
+DISPATCH -- "which operation should this unit perform" -- which is exactly what
+`op` is for and exactly where it belongs.
+
 **Gate:** this one is FMax-sensitive by nature, so it needs a full-core synth
 gate before/after, not just fuzz. Independent of Slices 1-4 -- it touches
 `IqContext.scala`/`IssueQueuePlugin.scala`, not the decode files -- so it can
