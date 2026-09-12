@@ -50,10 +50,32 @@ case class IqHot() extends Bundle {
   val pFpSrcB  = UInt(fpW bits);   val psrcBFpValid  = Bool()
   val pFpccSrc = UInt(fpW bits);   val readsFpcc     = Bool()
 
-  // ---- Class / select-mask fields. `op` is needed by `srcBIsReg`'s PACK/UNPK/BITFIELD/
-  // BFRESOLVE exceptions (which decide whether psrcB is a live register dependency at
-  // all) and by `isAluSlowProducer`; cluster/memOp/leaAddr are `isLs`/`isCplx`. ----
+  // ---- Class / select-mask fields. cluster/memOp/leaAddr are `isLs`/`isCplx`. ----
+  //
+  // The IQ SCHEDULES; it does not execute. Every question it used to ask of `op` was a
+  // latency/dependency-CLASS question, so those answers are precomputed ONCE on the push
+  // path (see assignFrom) and read here as plain flops:
+  //
+  //   isAluSlow          SHIFT | BITFIELD  -- six-stage EU path, dynamic slow wakeup
+  //   srcBRegDespiteImm  PACK | UNPK | BITFIELD | BFRESOLVE -- useImm=True yet psrcB IS a
+  //                      live register read (the EU reads s1RdB directly, bypassing the
+  //                      useImm mux), so its srcB dependency must not be suppressed
+  //   isDivFam           DIV | DIVREM      -- the one-at-a-time divide family
+  //
+  // WHY, measured rather than stylistic: `op` is 6 bits, and testing it inside a per-slot
+  // cone drags its MuxOH into that cone. Exactly one such term --
+  // `op === SHIFT || op === BITFIELD` in the scoreboard-clear cone -- was measured
+  // post-route (xcku5p-ffvb676-2 @4.000ns, checkpoint 3cba17f) as the design's WNS holder:
+  // 9 of the 10 worst paths at -1.699ns, against -1.518ns with that arc disabled. The fix
+  // at the time was a comment telling future readers not to re-add the term. Precomputing
+  // the class deletes the mechanism instead of warning about it.
+  //
+  // `op` itself remains only for the simPublic debug/whitebox hooks. It has NO functional
+  // reader in the IQ, so it contributes nothing to the select, wakeup or scoreboard cones.
   val op       = m68k040.decode.DecOp()
+  val isAluSlow         = Bool()
+  val srcBRegDespiteImm = Bool()
+  val isDivFam          = Bool()
   val cluster  = m68k040.isa.Cluster()
   val memOp    = m68k040.isa.MemOp()
   val leaAddr  = Bool()
@@ -90,6 +112,15 @@ case class IqHot() extends Bundle {
     pFpSrcB  := u.pFpSrcB;  psrcBFpValid := u.psrcBFpValid
     pFpccSrc := u.pFpccSrc; readsFpcc := u.readsFpcc
     op := u.op; cluster := u.cluster; memOp := u.memOp
+    // Scheduling classes, derived ONCE here instead of in every slot's cone.
+    isAluSlow         := (u.op === m68k040.decode.DecOp.SHIFT) ||
+                         (u.op === m68k040.decode.DecOp.BITFIELD)
+    srcBRegDespiteImm := (u.op === m68k040.decode.DecOp.PACK)     ||
+                         (u.op === m68k040.decode.DecOp.UNPK)     ||
+                         (u.op === m68k040.decode.DecOp.BITFIELD) ||
+                         (u.op === m68k040.decode.DecOp.BFRESOLVE)
+    isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
+                         (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm
     pdst     := u.pdst;     pdstValid   := u.pdstValid
     pNzvcDst := u.pNzvcDst; writesNzvc  := u.writesNzvc

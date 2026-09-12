@@ -382,8 +382,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // writes int + NZVC + (X for non-rotate).
     // BITFIELD shares the same dynamic slowWakeup, so a
     // dependent of a bit-field op (its Dn2/Dy result) must wait on the slow wakeup too.
-    def isAluSlowProducer(u: IqHot): Bool =
-      (u.op === m68k040.decode.DecOp.SHIFT) || (u.op === m68k040.decode.DecOp.BITFIELD)
+    def isAluSlowProducer(u: IqHot): Bool = u.isAluSlow
 
     // An LS op that writes NZVC = a dynamic (variable-latency) NZVC producer (a
     // MOVE-to-memory store / RTR CCR-restore). Tracked in lsNzvcBusy (dynamic), NOT
@@ -398,16 +397,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // PACK/UNPK are a second exception: they set useImm=True (adj16 as imm) but ALSO
     // have psrcB = Dy (a real register read). The EU reads rdB.data (s1RdB) directly,
     // bypassing the useImm mux, so psrcB IS a live data dependency.
-    def isPackUnpk(u: IqHot): Bool = (u.op === m68k040.decode.DecOp.PACK) || (u.op === m68k040.decode.DecOp.UNPK)
     // BFINS is a third exception: useImm=True (offset/width packed in imm) but psrcB =
-    // Dn2 (the insert source) is a LIVE register read (the EU reads rdB.data / s1RdB
-    // directly, bypassing the useImm mux). So its srcB dependency must NOT be suppressed.
-    def isBitfield(u: IqHot): Bool = u.op === m68k040.decode.DecOp.BITFIELD
-    // BFRESOLVE (bit-field dynamic offset/width resolve) is a fourth exception: useImm=True
-    // (static offset/width + Do/Dw in imm) but psrcB = width-Dn (Dw form) is a LIVE register
-    // read (the EU reads s1RdB directly). srcAValid=Do already gates psrcA the normal way.
-    def isBfResolve(u: IqHot): Bool = u.op === m68k040.decode.DecOp.BFRESOLVE
-    def srcBIsReg(u: IqHot): Bool = u.psrcBValid && (!u.useImm || isLs(u) || isPackUnpk(u) || isBitfield(u) || isBfResolve(u))
+    // Dn2 (the insert source) is a LIVE register read. BFRESOLVE is a fourth: useImm=True
+    // (static offset/width + Do/Dw in imm) but psrcB = width-Dn (Dw form) is likewise live
+    // (srcAValid=Do already gates psrcA the normal way).
+    //
+    // All four exceptions ask ONE question -- "does this uop read psrcB as a register even
+    // though useImm is set?" -- so they are one precomputed flag, `srcBRegDespiteImm`,
+    // rather than three helpers each re-deriving it from `op` in this cone.
+    def srcBIsReg(u: IqHot): Bool = u.psrcBValid && (!u.useImm || isLs(u) || u.srcBRegDespiteImm)
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
@@ -526,7 +524,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // OCCUPIED slots only -- an empty slot's `hot.op` is stale and must not be mistaken
     // for the oldest divide.
     val divFamPresent = B(slots.map(s => s.sel &&
-      (s.hot.op === m68k040.decode.DecOp.DIV || s.hot.op === m68k040.decode.DecOp.DIVREM)))
+      s.hot.isDivFam))
     val divFamOldest  = OHMasking.first(divFamPresent)
     val divFamBlocked = divFamPresent & ~divFamOldest  // every divide-family slot but the oldest
     val ohC = OHMasking.first(cplxReady & ~divFamBlocked)
