@@ -161,6 +161,20 @@ object DecOp extends SpinalEnum {
       // register-direct `.W`/`.B` forms, where it selects the partial-register MERGE.
       FPSTORECVT
       = newElement()
+
+  /** The ALU EU's SLOW path: ops needing the barrel shifter / bit-field datapath,
+    * which take the six-stage route instead of the one-stage fast one.
+    *
+    * ONE definition. This rule was written out three times -- IqHot.assignFrom and
+    * twice in AluEuPlugin -- each as its own `(op === SHIFT) || (op === BITFIELD)`,
+    * with nothing tying them together. Widening "slow" (a third op class, say) meant
+    * finding every copy by hand, and missing one mis-sizes the EU capacity check and
+    * the IQ's slow-slot accounting: a scheduling bug, not a build error.
+    *
+    * Deliberately a FUNCTION of `op`, not a field carried on the uop/IqContext: it is
+    * a 2-way decode of a 6-bit enum the consumer already holds, so re-evaluating it
+    * locally costs less than widening every pipeline register it would otherwise ride. */
+  def isAluSlow(op: DecOp.C): Bool = (op === DecOp.SHIFT) || (op === DecOp.BITFIELD)
 }
 
 /** Where an FP-generic uop's SOURCE operand comes from (DecodedUop.fpSrcKind).

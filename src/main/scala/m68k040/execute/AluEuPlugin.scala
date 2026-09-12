@@ -228,8 +228,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s3Valid  = Bool()
     s1Valid.simPublic(); s1aValid.simPublic(); s1a2Valid.simPublic()
     s1bValid.simPublic(); s2Valid.simPublic(); s3Valid.simPublic()
-    val isSlowIn = (issuePort.payload.uop.op === DecOp.SHIFT) ||
-                   (issuePort.payload.uop.op === DecOp.BITFIELD)
+    val isSlowIn = DecOp.isAluSlow(issuePort.payload.uop.op)
     // An empty upstream register must always see capacity: its retained payload is
     // stale and must not prevent the IQ from loading a safe slow candidate.
     issuePort.ready := !flushPort && (!issuePort.valid || isSlowIn || !s2Valid)

@@ -113,8 +113,7 @@ case class IqHot() extends Bundle {
     pFpccSrc := u.pFpccSrc; readsFpcc := u.readsFpcc
     op := u.op; cluster := u.cluster; memOp := u.memOp
     // Scheduling classes, derived ONCE here instead of in every slot's cone.
-    isAluSlow         := (u.op === m68k040.decode.DecOp.SHIFT) ||
-                         (u.op === m68k040.decode.DecOp.BITFIELD)
+    isAluSlow         := m68k040.decode.DecOp.isAluSlow(u.op)
     srcBRegDespiteImm := (u.op === m68k040.decode.DecOp.PACK)     ||
                          (u.op === m68k040.decode.DecOp.UNPK)     ||
                          (u.op === m68k040.decode.DecOp.BITFIELD) ||
