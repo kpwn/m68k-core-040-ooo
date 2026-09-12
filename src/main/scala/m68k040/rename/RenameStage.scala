@@ -347,6 +347,23 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       fpccRat.io.writes(s).data  := fpccFree.io.pop(s).id
     }
 
+    // ---- Debug-only rename observability (2026-09-12) ------------------------
+    // Added for the FMOVEM.X-then-Bcc defect (fpu_store_then_cmp_bcc.s): a sim needs
+    // each renamed uop's pc together with its NZVC source/destination physregs to tell
+    // a wrong-VALUE read from a wrong-REGISTER read. Debug only; no hardware consumer.
+    val rnDbg = Vec(Seq.tabulate(2) { s =>
+      val b = new Bundle {
+        val valid     = Bool()
+        val pc        = UInt(32 bits)
+        val readsNzvc = Bool()
+        val writesNzvc= Bool()
+        val pNzvcSrc  = UInt(4 bits)
+        val pNzvcDst  = UInt(4 bits)
+      }
+      b
+    })
+    spinal.core.sim.SimPublic(rnDbg)
+
     // ── Intra-group hazards (slot1 reads slot0's writes) ───────────────────────
     val dec0 = du.uops.payload(0)
     val dec1 = du.uops.payload(1)
@@ -373,6 +390,20 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       slot1.pFpccSrc := slot0.pFpccDst
       slot1.pFpccOld := slot0.pFpccDst
     }
+
+    // debug-only: capture the POST-bypass rename identities (see rnDbg above)
+    rnDbg(0).valid      := fire
+    rnDbg(0).pc         := slot0.pc
+    rnDbg(0).readsNzvc  := slot0.readsNzvc
+    rnDbg(0).writesNzvc := slot0.writesNzvc
+    rnDbg(0).pNzvcSrc   := slot0.pNzvcSrc.resized
+    rnDbg(0).pNzvcDst   := slot0.pNzvcDst.resized
+    rnDbg(1).valid      := uop1Sig
+    rnDbg(1).pc         := slot1.pc
+    rnDbg(1).readsNzvc  := slot1.readsNzvc
+    rnDbg(1).writesNzvc := slot1.writesNzvc
+    rnDbg(1).pNzvcSrc   := slot1.pNzvcSrc.resized
+    rnDbg(1).pNzvcDst   := slot1.pNzvcDst.resized
 
     uopsPort.payload(0) := slot0
     uopsPort.payload(1) := slot1

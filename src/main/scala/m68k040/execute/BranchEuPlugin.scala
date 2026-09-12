@@ -168,6 +168,12 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // Registered scaled index term (brief-indexed control EA): 0 for a non-indexed ibranch.
     val s1Index = RegNext(idxTerm0)
     val u1 = s1Ctx.uop
+    // Debug-only observability (2026-09-12): the FMOVEM.X-then-Bcc defect
+    // (fpu_store_then_cmp_bcc.s) needs the flags this EU ACTUALLY acted on plus the
+    // physical NZVC register it read them from, to tell a wrong-VALUE read from a
+    // wrong-ADDRESS read. Registered copies only; mirrors the existing wbObs pattern.
+    val s1NzAddr  = RegNext(u0.pNzvcSrc)
+    val s1ReadsNz = RegNext(u0.readsNzvc)
 
     // ---- S1: condition eval (cond[3:0]) ----
     val n = s1Nzvc(3); val z = s1Nzvc(2); val v = s1Nzvc(1); val c = s1Nzvc(0)
@@ -407,5 +413,30 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // Mirrors AluEuPlugin's `wbObs.keepCommit := RegNext(...u1.keepCommit) init False`.
     wbObs.keepCommit := RegNext(u1.keepCommit) init False
     wbObs.simPublic()
+
+    // ---- Debug-only branch-condition observability (2026-09-12) -------------------
+    // Not consumed by any hardware; exists so a sim can answer "what flags did this
+    // branch actually act on, and which physical NZVC register did they come from?".
+    val brDbg = new Bundle {
+      val valid   = Bool()
+      val pc      = UInt(32 bits)
+      val cond    = Bits(4 bits)
+      val readsNz = Bool()
+      val nzAddr  = UInt(u0.pNzvcSrc.getWidth bits)
+      val nzvc    = Bits(4 bits)
+      val taken   = Bool()
+      val redirect= Bool()
+      val nextPc  = UInt(32 bits)
+    }
+    brDbg.valid    := s1Valid
+    brDbg.pc       := u1.pc
+    brDbg.cond     := u1.cond
+    brDbg.readsNz  := s1ReadsNz
+    brDbg.nzAddr   := s1NzAddr
+    brDbg.nzvc     := s1Nzvc
+    brDbg.taken    := taken
+    brDbg.redirect := redirect
+    brDbg.nextPc   := nextPc
+    brDbg.simPublic()
   }
 }
