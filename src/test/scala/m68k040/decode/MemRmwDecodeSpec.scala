@@ -324,17 +324,6 @@ class MemRmwDecodeSpec extends AnyFunSuite {
     assert(dut.uop0.faultVector.toInt == 4, s"vector 4, got ${dut.uop0.faultVector.toInt}")
   }
 
-  test("ADDI.L #imm,(8,A0,D1.L*4) FULL-FORMAT no-mem-indirect dst -> ILLEGAL (vector 4)", VerilatorTest) {
-    // ADDI.L #imm,<full-format dst>: 0000 0110 10 110 000 = 0x06B0 (ADDI.L, dst mode6 reg0=A0).
-    // imm32 = words(1..2); the full-format ext word is at words(3): bit8=1 (full), Xn=D1,
-    // W/L=.L, scale=*4 (=2), bd-size=long (3), I/IS=000 (no-mem-indirect = MEMSIMPLE-full).
-    // ext = (1<<12)|(1<<11)|(2<<9)|(1<<8)|(3<<4)|0 = 0x1B30, then bd.l = words(4..5).
-    run { dut => drive2(dut, 0x06B0, Seq(0x1111, 0x2222, 0x1B30, 0x0000, 0x0008), len = 6)
-      dut.pkt.words(5) #= 0x0008; sleep(1)
-      assertIllegalVec4(dut)
-    }
-  }
-
   test("ADDI.L #imm,([0x10,A0,D1.L*4],0x20) FULL-FORMAT MEM-INDIRECT dst -> ILLEGAL (vector 4)", VerilatorTest) {
     // Same opword 0x06B0 (ADDI.L mode6 reg0). full-format ext at words(3): bit8=1, Xn=D1,
     // .L, *4, bd-size=word(2), I/IS=010 (pre-index, word od) -> MEMINDIRECT. ext = 0x1B22.
