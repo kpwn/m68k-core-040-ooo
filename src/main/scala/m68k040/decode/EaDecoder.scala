@@ -57,6 +57,7 @@ object EaDecoder {
     e.disp      := 0
     e.pcRel     := False
     e.autoMode  := EaAuto.NONE
+    e.baseDirect := False
     e.autoDelta := 0
     e.indexValid := False
     e.indexReg   := 0
@@ -112,13 +113,16 @@ object EaDecoder {
       is(0) { e.klass := EaClass.DATAREG; e.reg := reg.asUInt.resized }                  // Dn
       is(1) { e.klass := EaClass.ADDRREG; e.reg := (U(8, 5 bits) + reg.asUInt).resized } // An
       is(2) {                                                                            // (An)
+        e.baseDirect := True                 // EA is the base An itself
         e.klass := EaClass.MEMSIMPLE; e.baseValid := True; e.disp := 0
       }
       is(3) {                                      // (An)+ postincrement
+        e.baseDirect := True                 // EA is the base An itself
         e.klass := EaClass.MEMSIMPLE; e.baseValid := True; e.disp := 0
         e.autoMode := EaAuto.POSTINC; e.autoDelta := autoDeltaOf
       }
       is(4) {                                      // -(An) predecrement
+        e.baseDirect := True                 // EA is the base An itself
         e.klass := EaClass.MEMSIMPLE; e.baseValid := True; e.disp := 0
         e.autoMode := EaAuto.PREDEC;  e.autoDelta := autoDeltaOf
       }

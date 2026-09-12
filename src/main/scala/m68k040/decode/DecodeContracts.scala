@@ -54,6 +54,12 @@ case class EaSpec() extends Bundle {
   // EA auto-update (predec/postinc, modes 4/3). NONE for every other EA. autoDelta is
   // the An adjust in bytes (1/2/4, or 2 for a BYTE access on A7 to keep SP even); valid
   // only when autoMode != NONE. The base An reg id is `base` (= 8+reg) with baseValid.
+    // TRUE for exactly the three REGISTER-INDIRECT modes -- (An), (An)+, -(An) -- where
+    // the effective address IS the base An register, so no address computation is needed.
+    // This is an EA property, so the EA machinery owns it: before this, ops that care
+    // (FSAVE/FRESTORE) re-derived `mode in {010,011,100}` from raw opword bits, in two
+    // places 1300 lines apart that had to be kept in step by hand.
+    val baseDirect = Bool()
   val autoMode  = EaAuto()
   val autoDelta = UInt(3 bits)
   // Brief-format INDEXED EA (modes 6 / 7-3): EA = base + sext(d8) + (Xn sized) << scale.
@@ -82,7 +88,7 @@ object EaSpec {
     val e = EaSpec()
     e.klass := EaClass.ILLEGAL; e.reg := 0; e.imm := 0
     e.baseValid := False; e.base := 0; e.disp := 0; e.pcRel := False
-    e.autoMode := EaAuto.NONE; e.autoDelta := 0
+    e.autoMode := EaAuto.NONE; e.autoDelta := 0; e.baseDirect := False
     e.indexValid := False; e.indexReg := 0; e.indexLong := False; e.indexScale := 0
     e.od := 0; e.memPost := False
     e

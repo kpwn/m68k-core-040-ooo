@@ -2795,13 +2795,14 @@ object MicroOpAssembler {
         // -(An) is mode 100 (FSAVE only); (An)+ is mode 011 (FRESTORE only). Plain (An)
         // (mode 010) writes nothing back. The decoder already restricted the admitted
         // modes per direction, so testing both here is safe and self-documenting.
-        val fsvAuto   = (op(5 downto 3) === B"3'b100") || (op(5 downto 3) === B"3'b011")
+        // Auto-update is an EA property; ask the EA, do not re-read mode bits.
+        val fsvAuto = srcEa.autoMode =/= EaAuto.NONE
         // The three REGISTER-INDIRECT modes carry their base in An directly. Every other
         // admitted mode -- (d16,An), (d8,An,Xn), (xxx).W/.L and FRESTORE's PC-relative
         // forms -- needs a COMPUTED address, so the macro is cracked into
         // [T0 := EA] + [this uop reading T0] and the base arrives in T0 instead.
-        val fsvDirect  = (op(5 downto 3) === B"3'b010") || (op(5 downto 3) === B"3'b011") ||
-                         (op(5 downto 3) === B"3'b100")
+        // modes 010/011/100: the EA IS the base An, so no address computation.
+        val fsvDirect = srcEa.baseDirect
         val fsvNeedsEa = !fsvDirect
         opUop.srcBReg   := Mux(fsvNeedsEa, U(T0, 5 bits), fsvAn); opUop.srcBValid := True
         opUop.srcAValid := False
@@ -4142,9 +4143,8 @@ object MicroOpAssembler {
     // EA datapath is not duplicated.
     val fsvAddrUop  = peaAddr
     val fsvIsSysOp  = (spec.sysKind === SysKind.FSAVE) || (spec.sysKind === SysKind.FRESTORE)
-    val fsvCracks   = fsvIsSysOp && !((op(5 downto 3) === B"3'b010") ||
-                                      (op(5 downto 3) === B"3'b011") ||
-                                      (op(5 downto 3) === B"3'b100"))
+    // Cracks whenever the address must be COMPUTED -- the same EA property as
+    val fsvCracks = fsvIsSysOp && !srcEa.baseDirect
     // PEA push: stkPush store, base/dst A7 (A7 -= 4), store DATA = T0 (srcB) — the LINK
     // register-data stkPush precedent (LsEu data0 mux selects srcB when srcBValid).
     val peaPush = mkUop(cluster = Cluster.LS, memOp = MemOp.STORE, stkPush = True,
