@@ -141,9 +141,16 @@ object OpForm extends SpinalEnum {
         // CONDITION lives in the extension word, but WHICH OF THE THREE does not --
         // that is the opword's <ea> field, exactly as in line 5.
         FSCC, FDBCC, FTRAPCC,
-        EXG,          // line C, op[8], opmode {01000,01001,10001}
+        // EXG's three variants differ only in which operands are ADDRESS registers --
+        // register-class typing, which the decoder owns. Naming them here stops the
+        // assembler re-matching line-C opmode bits to recover the same fact.
+        EXGDD,        // 01000 -- EXG Dx,Dy
+        EXGAA,        // 01001 -- EXG Ax,Ay
+        EXGDA,        // 10001 -- EXG Dx,Ay
         MOVETOCCR,    // 0100 0100 11 mmmrrr
-        CMP2CHK2      // line 0, bit11=0 bit8=0 bits[7:6]==11 (+ ext word)
+        CMP2CHK2,     // line 0, bit11=0 bit8=0 bits[7:6]==11 (+ ext word)
+        BSR,          // line 6 cond==0001 -- branch-to-subroutine
+        FBCC          // line F type 010/011 -- FBcc.W/.L (incl. FBF/FNOP)
       = newElement()
 }
 

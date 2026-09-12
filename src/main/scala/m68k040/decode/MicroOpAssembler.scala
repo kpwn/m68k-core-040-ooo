@@ -1450,8 +1450,7 @@ object MicroOpAssembler {
     // above would read the condition as an 8-bit displacement.  `readsFpcc` is the same
     // marker the branch EU selects the FP condition table with (OperationDecoder's
     // `isFpBcc`), so no extra spec field is needed here either.
-    val asmIsFpBcc = (op(15 downto 12) === B"4'hF") && (op(11 downto 9) === B"3'b001") &&
-                     (op(8 downto 7) === B"2'b01")
+    val asmIsFpBcc = spec.form === OpForm.FBCC
     when(spec.isBranch) {
       when(asmIsFpBcc) {
         // The FP-condition marker, set here rather than in OperationDecoder because
@@ -1730,7 +1729,10 @@ object MicroOpAssembler {
     // ALU EU does the read-modify-write. CCR ONLY — the privileged to-SR (word, ss=01)
     // forms are deferred (they stay illegal: ss=01 -> spec.op illegal at OperationDecoder).
     val isLineImm  = spec.srcB.kind === OperandKind.IMMEXT
-    val isToCcr    = isLineImm && (op(5 downto 0) === B"6'b111100") && (spec.size === Size.BYTE) &&
+    // op[5:0]==0b111100 is mode7/reg4, the IMMEDIATE EA encoding -- and that is a
+    // question about the EA, which the EA machinery already answers. EaDecoder maps
+    // mode7/reg4 to EaClass.IMM unconditionally (no allowImm gate), so this is exact.
+    val isToCcr    = isLineImm && (srcEa.klass === EaClass.IMM) && (spec.size === Size.BYTE) &&
                      (spec.op === DecOp.AND || spec.op === DecOp.OR || spec.op === DecOp.EOR)
     // ── ANDI/ORI/EORI #imm,SR (the PRIVILEGED to-SR forms) ───────────────────────
     // Same encoding shape as the non-privileged to-CCR form above (line0, opmode in
@@ -1749,7 +1751,7 @@ object MicroOpAssembler {
     // MOVE_TO_SR's own plain direct write. srcA/srcB below don't carry the real
     // operand VALUE for this case -- only imm/useImm matter (already correctly
     // threaded by the generic IMMEXT srcB slot).
-    val isToSr     = isLineImm && (op(5 downto 0) === B"6'b111100") && (spec.size === Size.WORD) &&
+    val isToSr     = isLineImm && (srcEa.klass === EaClass.IMM) && (spec.size === Size.WORD) &&
                      (spec.op === DecOp.AND || spec.op === DecOp.OR || spec.op === DecOp.EOR)
     // EOR (line B, register dest): the EA (op[5:0]) is the DESTINATION, read AND
     // written. This slice supports a DATA-REGISTER destination only; a memory EA is
@@ -1973,9 +1975,9 @@ object MicroOpAssembler {
     // EXG (line C, bit8=1, opmode in {01000,01001,10001}): a reg-reg swap cracked below
     // into 3 MOVE µops. Its opmode lands in the AND-RMW band (5/6) with a reg-direct EA,
     // which aluRmwMemBad would illegalise -> exclude from `bad` (mirror !isRtrBad).
-    val isExgAA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01001") // EXG Ax,Ay
-    val isExgDA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b10001") // EXG Dx,Ay
-    val isExgOp = spec.form === OpForm.EXG
+    val isExgAA = spec.form === OpForm.EXGAA
+    val isExgDA = spec.form === OpForm.EXGDA
+    val isExgOp = (spec.form === OpForm.EXGDD) || (spec.form === OpForm.EXGAA) || (spec.form === OpForm.EXGDA)
     // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR (line-4) ───────────
     // LEA (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2. Control EA -> An (no flags).
     val isLeaOp = spec.form === OpForm.LEA
@@ -3903,7 +3905,7 @@ object MicroOpAssembler {
             isReturn = True,
             anInc = U(inc, 3 bits), first = False)
 
-    val isBsr = (op(15 downto 8) === B"8'h61")
+    val isBsr = spec.form === OpForm.BSR
     val bsrDisp = {
       val disp8 = op(7 downto 0)
       val d = Bits(32 bits)

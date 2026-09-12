@@ -759,6 +759,8 @@ object OperationDecoder {
         o.cond := opword(11 downto 8)
         o.cluster := Cluster.INT
         o.readsNzvc := (opword(11 downto 8).asUInt >= 2)
+        // BSR is cond==0001; the decoder already has the cond field, so name it here
+        when(opword(11 downto 8) === B"4'b0001") { o.form := OpForm.BSR }
       }
       // ---- Line-E register-form shifts/rotates (1110 ccc d ss i tt rrr) ----
       // ss (bits 7:6) = .B/.W/.L (11 selects the word-sized memory single-bit form).
@@ -1049,7 +1051,9 @@ object OperationDecoder {
           // builds the 3 MOVE µops (regA->T0 ; regB->regA ; T0->regB) from the opword.
           o.illegal := False
           o.op := DecOp.MOVE
-            o.form := OpForm.EXG
+          o.form := OpForm.EXGDD
+          when(opword(7 downto 3) === B"5'b01001") { o.form := OpForm.EXGAA }
+          when(opword(7 downto 3) === B"5'b10001") { o.form := OpForm.EXGDA }
         } .elsewhen(isDivuW || isDivsW) {
           o.illegal := False
           o.op := DecOp.DIV
@@ -1403,6 +1407,9 @@ object OperationDecoder {
         val isFpBcc   = (opword(11 downto 9) === B"3'b001") &&
                         (opword(8 downto 7) === B"2'b01")        // type 010 (.W) or 011 (.L)
         val isFpBccF  = isFpBcc && (opword(5 downto 0) === B"6'b000000")
+        // BROAD on purpose: the assembler's predicate covers FBF/FNOP too, so the form
+        // must not be narrowed to `isFpBcc && !isFpBccF`.
+        when(isFpBcc) { o.form := OpForm.FBCC }
         when(isFpBccF) {
           o.illegal := False
           o.op      := DecOp.MOVE
