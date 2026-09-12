@@ -95,6 +95,13 @@ object OperationDecoder {
         val ssCmp2 = opword(10 downto 9)
         val isCmp2Chk2 = !opword(11) && !opword(8) && (opword(7 downto 6) === 3) &&
                          (ssCmp2 =/= 3) && (opword(5 downto 3).asUInt >= 2)
+        // Name the line-0 CMP2/CHK2 ENCODING -- deliberately the BROAD test (no ss/mode
+        // qualification). `isCmp2Chk2` above is the VALID subset and drives op/size;
+        // this form is what the assembler's `bad` excludes, and narrowing it here would
+        // silently turn ss==3 / mode<2 encodings into illegal instructions.
+        when(!opword(11) && !opword(8) && (opword(7 downto 6) === 3)) {
+          o.form := OpForm.CMP2CHK2
+        }
         when(isCmp2Chk2) {
           o.illegal := False
           o.op      := DecOp.CMP2CHK2
@@ -280,6 +287,13 @@ object OperationDecoder {
           eaHand := True
           o.form := OpForm.SCC
         }
+        // The other two members of the line-5 ss==11 family, split by the SAME <ea>
+        // field. Neither declares an EA (DBcc's op[2:0] is a Dn counter; TRAPcc's is
+        // the ttt operand-count selector) -- this only NAMES them.
+        when(ss === 3 && (sccMode === B"001")) { o.form := OpForm.DBCC }
+        when(ss === 3 && (sccMode === B"111") && (sccReg >= 2) && (sccReg <= 4)) {
+          o.form := OpForm.TRAPCC
+        }
       }
       // ---- MOVE.B/.W/.L (00 ss ...) src EA = bits 5-0, dst EA = bits 11-6 ----
       is(0x1, 0x3, 0x2) {
@@ -307,6 +321,11 @@ object OperationDecoder {
         when(opword === B"16'h4E74") { o.form := OpForm.RTD   }
         when(opword === B"16'h4E77") { o.form := OpForm.RTR   }
         when(opword === B"16'h4E76") { o.form := OpForm.TRAPV }
+        // TRAP #n / LINK.W / UNLK / LINK.L -- same deal: the assembler builds the uops,
+        // the decoder names the shape so the constants live in exactly one file.
+        when(opword(15 downto 4) === B"12'h4E4") { o.form := OpForm.TRAP }
+        when(opword(15 downto 4) === B"12'h4E5") { o.form := Mux(opword(3), OpForm.UNLK, OpForm.LINK) }
+        when(opword(15 downto 3) === B(0x901, 13 bits)) { o.form := OpForm.LINKL }
         // EXTB.L (0100 1001 11 000 rrr, op[15:6]==0x127) has bit8=1 & bit6=0 and would
         // otherwise alias the CHK pattern; decode it as the unary EXT (byte->long) below
         // and exclude it from CHK. (The remaining bit8=1/bit6=0 line-4 opwords are CHK.)
@@ -636,6 +655,7 @@ object OperationDecoder {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.WORD
           o.srcB := easrc
+          o.form := OpForm.MOVETOCCR
         }
         // ── MOVE to SR (0100 0110 11 mmmrrr) + ea : src.W -> SR (PRIVILEGED) ──────
         // The opmode-6 case of the 0x4xC0 family (Track C owns opmodes 0/2/4 =
@@ -1029,6 +1049,7 @@ object OperationDecoder {
           // builds the 3 MOVE µops (regA->T0 ; regB->regA ; T0->regB) from the opword.
           o.illegal := False
           o.op := DecOp.MOVE
+            o.form := OpForm.EXG
         } .elsewhen(isDivuW || isDivsW) {
           o.illegal := False
           o.op := DecOp.DIV
@@ -1131,6 +1152,25 @@ object OperationDecoder {
       // stays illegal (falls to illegalDefault, vector 11, via MicroOpAssembler's
       // top-nibble faultVector select).
       is(0xF) {
+        // ── Line-F type 001 (`1111 001 001 mmmrrr`): FScc / FDBcc / FTRAPcc ───────
+        // The decoder does NOT implement these (they stay F-line traps below); it only
+        // NAMES them, so MicroOpAssembler stops re-deriving the same bit tests. The
+        // CONDITION lives in the extension word, but WHICH of the three this is does
+        // not -- that is the opword's <ea> field, carved up exactly as in line 5.
+        // 0xF27F is excluded from FSCC: its reserved mode7/reg7 field keeps its own
+        // abs.L carve-out in the assembler (see srcEaFor).
+        val fpT001   = (opword(11 downto 9) === B"3'b001") && (opword(8 downto 6) === B"3'b001")
+        val fpT001M  = opword(5 downto 3)
+        val fpT001R  = opword(2 downto 0).asUInt
+        when(fpT001 && (fpT001M === B"001")) { o.form := OpForm.FDBCC }
+        when(fpT001 && (fpT001M === B"111") && (fpT001R >= 2) && (fpT001R <= 4)) {
+          o.form := OpForm.FTRAPCC
+        }
+        when(fpT001 && (fpT001M =/= B"001") &&
+             !((fpT001M === B"111") && (fpT001R >= 2)) &&
+             (opword =/= B"16'hF27F")) {
+          o.form := OpForm.FSCC
+        }
         // ── CPUSH/CINV (line-1111, top byte 0xF4: 1111 0100 CC O SS AAA -- Task P5.1's
         // cross-checked encoding): privileged cache push/invalidate. bit[5]=1 selects
         // CPUSH (push, optionally invalidate, matching lines), bit[5]=0 selects CINV

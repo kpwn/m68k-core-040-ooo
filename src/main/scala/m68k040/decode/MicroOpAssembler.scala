@@ -1647,23 +1647,14 @@ object MicroOpAssembler {
     // because `rmwStUop.size` below needs it. Same EA scope as the integer `isSccOp`
     // (mode 1 = FDBcc, mode 7 reg>=2 = FTRAPcc, both still F-line traps); 0xF27F is
     // excluded because its reserved mode7/reg7 field keeps its own abs.L carve-out.
-    val fsccMode5  = pkt.words(0)(5 downto 3).asUInt
     val fsccReg5   = pkt.words(0)(2 downto 0).asUInt
-    val isFSccOp   = (pkt.words(0)(15 downto 12) === B"4'hF") &&
-                     (pkt.words(0)(11 downto 9)  === B"3'b001") &&
-                     (pkt.words(0)(8 downto 6)   === B"3'b001") &&
-                     (fsccMode5 =/= 1) && !((fsccMode5 === 7) && (fsccReg5 >= 2)) &&
-                     (pkt.words(0) =/= B"16'hF27F")
+    val isFSccOp = spec.form === OpForm.FSCC
     // The other two members of type 001, same `1111 001 001 mmmrrr` + condition-extension
     // word shape, split by the SAME <ea>-field carve-up the line-5 family uses:
     //   mode 001            -> FDBcc Dn, disp16   (+ a trailing displacement word)
     //   mode 111 reg {2,3,4}-> FTRAPcc            (no operand / #data16 / #data32)
-    val isFpType001 = (pkt.words(0)(15 downto 12) === B"4'hF") &&
-                      (pkt.words(0)(11 downto 9)  === B"3'b001") &&
-                      (pkt.words(0)(8 downto 6)   === B"3'b001")
-    val isFDbccOp   = isFpType001 && (fsccMode5 === 1)
-    val isFTrapccOp = isFpType001 && (fsccMode5 === 7) &&
-                      ((fsccReg5 === 2) || (fsccReg5 === 3) || (fsccReg5 === 4))
+    val isFDbccOp = spec.form === OpForm.FDBCC
+    val isFTrapccOp = spec.form === OpForm.FTRAPCC
 
     // ── rmwStUop = the STORE of a memory-destination RMW (crackRmw / crackClr) ──
     // The EA is op[5:0] = `srcEa` (the SAME descriptor the load used — MEMSIMPLE has no
@@ -1876,8 +1867,7 @@ object MicroOpAssembler {
     val mode5      = op(5 downto 3)
     val cccc5      = op(11 downto 8)
     val rrr5       = op(2 downto 0).asUInt.resize(5)
-    val rrr5raw    = op(2 downto 0).asUInt
-    val isDbccOp   = isLine5 && (ss5 === 3) && (mode5 === 1)
+    val isDbccOp = spec.form === OpForm.DBCC
     // Scc <ea>: any mode except DBcc's mode=1, and (mode=7 valid only for reg 0/1 =
     // abs.W/abs.L; reg>=2 is TRAPcc's ttt operand-count selector, or a reserved mode-7
     // sub-form -- neither is a valid Scc destination). Task #160 widened this from
@@ -1905,8 +1895,7 @@ object MicroOpAssembler {
     // TRAPcc: line-5 ss==11, mode==7 (reg field is the ttt operand form), ttt ∈ {2,3,4}.
     //   ttt=4 (reg=4): no operand (1 word). ttt=2 (reg=2): #data16 (2 words).
     //   ttt=3 (reg=3): #data32 (3 words). Other ttt -> illegal (stays sccMemBad).
-    val isTrapccOp = isLine5 && (ss5 === 3) && (mode5 === 7) &&
-                     ((rrr5raw === 2) || (rrr5raw === 3) || (rrr5raw === 4))
+    val isTrapccOp = spec.form === OpForm.TRAPCC
     // A memory Scc / other mode-7 TRAPcc line-5 ss==11 form is deferred -> illegal.
     // Exclude TRAPcc (mode7,reg{2,3,4}) from the sccMemBad bucket.
     val sccMemBad  = isLine5 && (ss5 === 3) && (mode5 =/= 0) && (mode5 =/= 1) && !isTrapccOp
@@ -1920,7 +1909,7 @@ object MicroOpAssembler {
     // retire via the format-$0 FSM. TRAP is NOT restartable: it stacks the PC of the
     // NEXT instruction -> faultPc = nextPc. Decoded here (line 0x4 is otherwise
     // unimplemented) so it is NOT treated illegal.
-    val isTrapOp = (op(15 downto 4) === B"12'h4E4")
+    val isTrapOp = spec.form === OpForm.TRAP
     // ── TRAPV (0x4E76) — an EXECUTE-time CONDITIONAL trap (vector 7 if V). ──────
     // Decoded as a branch-class trap-check µop (isBranch so it issues to the branch
     // EU, readsNzvc so it reads V). The branch EU drives a trapvFault when V=1.
@@ -1969,12 +1958,10 @@ object MicroOpAssembler {
     // false-positive "real cpu040 bug" finding for a case actually fixed 6 weeks earlier.
     val ctrlEaOk = srcIsMem
     // RTS (0x4E75) / RTR (0x4E77) are line-4 returns cracked below (NOT illegal).
-    val isRtsBad = spec.form === OpForm.RTS   // name is legacy: this is plain RTS
-    val isRtrBad = spec.form === OpForm.RTR   // name is legacy: this is plain RTR
     // LINK An,#disp16 (0100 1110 0101 0aaa) / UNLK An (0100 1110 0101 1aaa): line-4
     // stack-frame ops cracked below (NOT illegal). op[15:4]==0x4E5, op[3] selects.
-    val isLinkOp = (op(15 downto 4) === B"12'h4E5") && !op(3)
-    val isUnlkOp = (op(15 downto 4) === B"12'h4E5") &&  op(3)
+    val isLinkOp = spec.form === OpForm.LINK
+    val isUnlkOp = spec.form === OpForm.UNLK
     // LINK An,#disp32 (68020+, 0100 1000 0000 1 aaa, op[15:3]==0x901): the 32-bit-
     // displacement sibling of LINK.W above, distinct opcode region — cracked below with
     // the SAME machinery (linkPush/linkA7/linkAnU), just a wider displacement read from
@@ -1982,14 +1969,13 @@ object MicroOpAssembler {
     // (link_long_unlk.s): previously entirely unhandled (fell through to `bad` ->
     // illegal vector 4, and with no vector-4 handler installed in the bare-metal test
     // harness the resulting fault cascade hung rather than trapped cleanly).
-    val isLinkLOp = op(15 downto 3) === B(0x901, 13 bits)
+    val isLinkLOp = spec.form === OpForm.LINKL
     // EXG (line C, bit8=1, opmode in {01000,01001,10001}): a reg-reg swap cracked below
     // into 3 MOVE µops. Its opmode lands in the AND-RMW band (5/6) with a reg-direct EA,
     // which aluRmwMemBad would illegalise -> exclude from `bad` (mirror !isRtrBad).
-    val isExgDD = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01000") // EXG Dx,Dy
     val isExgAA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b01001") // EXG Ax,Ay
     val isExgDA = (op(15 downto 12) === B"4'hC") && op(8) && (op(7 downto 3) === B"5'b10001") // EXG Dx,Ay
-    val isExgOp = isExgDD || isExgAA || isExgDA
+    val isExgOp = spec.form === OpForm.EXG
     // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR (line-4) ───────────
     // LEA (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2. Control EA -> An (no flags).
     val isLeaOp = spec.form === OpForm.LEA
@@ -2002,7 +1988,7 @@ object MicroOpAssembler {
     val isMoveFromSrOp  = spec.form === OpForm.MOVEFROMSR
     val isMoveFromCcrOp = spec.form === OpForm.MOVEFROMCCR
     // MOVE to CCR (0x44C0): EA(.W low byte) -> CCR. NOT privileged.
-    val isMoveToCcrOp   = (op(15 downto 6) === B"10'b0100010011")
+    val isMoveToCcrOp = spec.form === OpForm.MOVETOCCR
     // LEA/PEA control-EA validity: in-scope MEMSIMPLE, NOT auto (-(An)/(An)+ illegal for
     // LEA/PEA), NOT indexed-with-no-AGU-support... (the LS-EU AGU DOES read the index, so
     // indexed IS allowed for LEA/PEA — unlike JMP/JSR's branch-EU AGU). PC-rel allowed.
@@ -2029,11 +2015,8 @@ object MicroOpAssembler {
     // retire, NOT decode.
     val isSysOp = spec.sysOp
     // RTD (0x4E74): a line-4 return cracked below (NOT illegal).
-    val isRtdBad = spec.form === OpForm.RTD   // name is legacy: this is plain RTD
     // Merged illegal-detection exclusion list (Track C ops + Track D ops).
-    val isCmp2Chk2Enc = !op(11) && !op(8) && (op(7 downto 6) === B"11") &&
-                        (op(10 downto 9) =/= B"11") && (op(5 downto 3).asUInt >= 2) &&
-                        (op(15 downto 12) === B"4'h0")     // line-0 CMP2/CHK2 (assembler-decoded)
+    val isCmp2Chk2Enc = spec.form === OpForm.CMP2CHK2
     // Bit-field register form: the DYNAMIC offset/width forms (ext[11]=Do / ext[5]=Dw)
     // are now LEGAL (slice 2/3) — emitted as a 2-µop crack ([BFRESOLVE -> T0] [BITFIELD
     // bfDynamic]) below. There are no truly-illegal register-form Do/Dw combos. The
@@ -2231,10 +2214,11 @@ object MicroOpAssembler {
     // tools/musashi/musashi/m68kfpu.c:64-77,684-711 in this session), words4-7=64-bit
     // mantissa. This IS the internal Fp80 layout (Decision 1) -- zero conversion needed.
     val fpImmExtVal    = pkt.words(2) ## pkt.words(4) ## pkt.words(5) ## pkt.words(6) ## pkt.words(7)
-    val bad = !isRteOp && !isTrapOp && !isTrapvOp && !isTrapccOp && !isDivLOp && !isMulLOp && !isJmpOp && !isJsrOp &&
-              !isRtsBad && !isRtrBad && !isSccOp && !isFSccOp && !isDbccOp && !isFDbccOp && !isFTrapccOp && !isLinkOp && !isLinkLOp && !isUnlkOp && !isExgOp &&
-              !isLeaOp && !isPeaOp && !isMoveFromSrOp && !isMoveFromCcrOp && !isMoveToCcrOp &&
-              !isSysOp && !isRtdBad && !isCmp2Chk2Enc && !isBfMemSpec &&
+    // Every one of the 26 families that used to be negated here one-by-one is now a
+    // NAMED OpForm, and `form` holds exactly one value -- so the whole chain IS
+    // `form === NONE`. `isSysOp`/`isBfMemSpec` stay: they read spec FIELDS
+    // (spec.sysOp, spec.op/microcoded), not a re-derived opword match.
+    val bad = (spec.form === OpForm.NONE) && !isSysOp && !isBfMemSpec &&
               (!pkt.simple || spec.illegal || eorMemBad || lineImmBad || addqMemBad || sccMemBad ||
                line4UnaryMemBad || aluRmwMemBad || bitOpMemBad || eaDstPcRelBad || fpGenBad ||
                (usesSrcEa && !srcEaOk) || (usesDstEa && !dstOk))
@@ -3935,11 +3919,11 @@ object MicroOpAssembler {
     // The pop load reads (A7) into T0 (a temp); the trailing ibranch redirects to T0
     // and folds the A7 += 4 postincrement. The ibranch depends on the load's T0
     // (dynamic LS wakeup; the IQ tracks the load's pdst via lsBusy/lsWakeup).
-    val isRtsOp   = (op === B"16'h4E75")
+    val isRtsOp   = spec.form === OpForm.RTS
     val rtsLoad   = popUop(A7, disp = 0, dst = T0, first = True)
     val rtsBranch = retBranchUop(tgt = T0, an = A7, inc = 4)
 
-    val isRtdOp   = (op === B"16'h4E74")
+    val isRtdOp   = spec.form === OpForm.RTD
 
     // ── JSR (0x4E80|ea) — crack into [push.l retPC -> -(A7)] + [ibranch -> EA addr]. ─
     // The push store is FIRST; the ibranch (ibrUop, firstOfInstr=False for JSR) jumps
@@ -3957,7 +3941,7 @@ object MicroOpAssembler {
     // system byte. 3 µops (the widened AssembledUops budget). The CCR-restore load
     // writes the renamed NZVC + X PRFs from the loaded byte; the PC load -> T0; the
     // trailing ibranch redirects to T0 and folds A7 += 6 (2 for the CCR word + 4 PC).
-    val isRtrOp   = (op === B"16'h4E77")
+    val isRtrOp   = spec.form === OpForm.RTR
     val rtrCcr    = mkUop(cluster = Cluster.LS, memOp = MemOp.LOAD, size = Size.WORD,
                           srcAReg = U(A7, 5 bits), srcAValid = True,
                           useImm = True, imm = B(0, 32 bits),

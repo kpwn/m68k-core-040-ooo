@@ -123,7 +123,21 @@ object OpForm extends SpinalEnum {
       RTS,          // 0x4E75  (the assembler's predicate is misnamed `isRtsBad`)
       RTD,          // 0x4E74  (`isRtdBad`)
       RTR,          // 0x4E77  (`isRtrBad`)
-      TRAPV         // 0x4E76
+        TRAPV,        // 0x4E76
+        TRAP,         // 0x4E4n -- unconditional software trap, vector 32+n
+        LINK,         // 0x4E5n bit3=0 -- LINK.W An,#disp16
+        UNLK,         // 0x4E5n bit3=1 -- UNLK An
+        LINKL,        // op[15:3]==0x901 -- LINK.L An,#disp32
+        // Line-5 ss==11 splits three ways on the <ea> field; SCC above is the third.
+        DBCC,         // mode 001            -- DBcc Dn,disp16
+        TRAPCC,       // mode 111 reg{2,3,4} -- TRAPcc (no operand / #data16 / #data32)
+        // Line-F type 001 (`1111 001 001 mmmrrr`) splits the SAME three ways. The
+        // CONDITION lives in the extension word, but WHICH OF THE THREE does not --
+        // that is the opword's <ea> field, exactly as in line 5.
+        FSCC, FDBCC, FTRAPCC,
+        EXG,          // line C, op[8], opmode {01000,01001,10001}
+        MOVETOCCR,    // 0100 0100 11 mmmrrr
+        CMP2CHK2      // line 0, bit11=0 bit8=0 bits[7:6]==11 (+ ext word)
       = newElement()
 }
 
