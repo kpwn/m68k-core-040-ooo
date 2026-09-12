@@ -130,3 +130,46 @@ EA mode"):
 Not yet compiled or tested at the time of writing.
 
 Fix (2) is NOT implemented.
+
+## Fix (2): v1 already has the proven rule — split on COPROCESSOR ID
+
+Reviewing the v1 core (`/home/qwertyoruiop/m68k-ooo/rtl/core/decode/decode.v`,
+the F-line fallback) settles the open question. v1 does NOT classify by
+instruction family; it classifies by coprocessor ID:
+
+```verilog
+else if (op_f3[15:12] == 4'b1111) begin
+    // Coprocessor-ID 1 is the on-chip 040 FPU and uses the format-$2
+    // unsupported-instruction path consumed by the ROM FPSP.  Other
+    // coprocessor IDs use generic line-F format $0.  Pseudo-vector $CB is
+    // translated back to architectural vector 11 by commit.
+    exc_vec   = (op_f3[11:9] == 3'b001) ? 8'd11 : 8'hCB;
+    imm       = {ext1_f3, op_f3};   // CMDREG1B payload
+```
+
+So: **cpID == 001 -> vector 11 on the format-$2 FPSP path; any other cpID ->
+format-$0.** That is the whole predicate.
+
+It also answers the CMDREG1B caution recorded above. The worry was that
+FSAVE/FRESTORE/FBcc have no cpGEN extension word to put in the frame. v1 passes
+`{ext1, opword}` unconditionally, and that is exactly what the ROM FPSP kernel
+reads at `fp@(-228)`. No per-family frame design is needed, and excluding those
+families -- the conservative option first proposed here -- would be NARROWER
+than the core that actually boots System 7. Do not exclude them.
+
+Our current predicate (`bad && spec.fpGeneric && fpFormIsReg && pkt.simple &&
+lenWords === 2`) is far tighter than v1's and is the defect.
+
+### Musashi is NOT a usable oracle here
+
+`tools/musashi/musashi/m68kfpu.c`'s `m68040_fpu_op1` implements FSAVE/FRESTORE
+with a mode switch covering only `(An)`, `(An)+` and `-(An)`, and calls
+`fatalerror()` on everything else (36 fatalerror sites in that file). So it
+cannot lock-step-validate the EA modes fix (1) adds -- it hard-fails rather than
+disagreeing. It is also loose: its FSAVE accepts `(An)+`, which is
+architecturally a FRESTORE-only mode. Nine corpus asm tests touch these
+instructions; plan their validation accordingly.
+
+Musashi's `m68ki_exception_1111` always pushes `m68ki_stack_frame_0000`
+(format-$0) -- unsurprising, since Musashi emulates the FP ops itself and never
+needs to hand anything to an FPSP.
