@@ -1,3 +1,25 @@
+=== BEGIN HUMAN ===
+
+This is a vibecoded core that tries to faithfully implement a high-performance 68040 core in SpinalHDL.
+I'm using this as a benchmark for LLM model capabilities in the face of large complex projects, and this was in my bucket list
+of things to do within my lifetime for a long while now. I'll probably still end up rewriting this manually at some point just for the fun
+of it, but yeah - i went into this not expecting a LLM to actually succeed.
+
+The core is heavily inspired by NaxRiscv by Dolu1990 and his copyright (MIT, (c) Charles Papon) applies on this project due to being the reference core.
+
+= https://github.com/SpinalHDL/NaxRiscv
+
+This core likely has many flaws and bugs; I know of several that are triggerable by running common Macintosh applications, mostly around FPU.
+It's stable and correct enough to boot System 7.0.1 and System 7.5.3; A/UX, Amiga etc. hasn't been tried yet but I'd assume this has applications in that space.
+
+The core does NOT model a real 68040 from the bus perspective: instead AXI is used to allow for multiple OoO memory transactions in-flight.
+The goal was to have a core that from the programmer's perspective is the real thing - NOT a drop-in replacement from the bus perspective.
+
+ - 2k26 KJC *still* out here
+
+=== END HUMAN ===
+=== BEGIN LLM ===
+
 # m68k-core-040-ooo
 
 An out-of-order, superscalar Motorola 68040 CPU core written in
