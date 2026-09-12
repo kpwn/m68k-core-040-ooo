@@ -1,38 +1,52 @@
-| fpu_fsave_ea_modes.s — FSAVE HANGS THE CORE on (d16,An), (xxx).W and (xxx).L.
+| fpu_fsave_ea_modes.s — FSAVE's displaced/absolute EA forms are NOT IMPLEMENTED
+|                        and correctly take the vector-11 F-line trap.
 |
-| Isolated 2026-09-12 while triaging fsave_frestore_basic. FSAVE works for the
-| register-indirect forms and hangs for the displaced/absolute ones:
+| ⚠ CORRECTED 2026-09-12 — the first version of this file claimed "FSAVE HANGS
+| THE CORE". THAT WAS WRONG, and the mistake is worth recording:
 |
-|     fsave -(%a7)    OK   A7 -= 52, header 0x41300000, body zero-filled
-|     fsave (%a0)     OK   header 0x41300000
-|     fsave -(%a0)    OK   A0 -= 52
-|     fsave 8(%a0)    HANG   <-- (d16,An)
-|     fsave 0x1F00.w  HANG   <-- (xxx).W
-|     fsave 0x00020010 HANG  <-- (xxx).L
+|   The probes that "hung" installed NO vector-11 handler, so the (correct)
+|   F-line trap dispatched through a ZERO vector-table entry, jumped to address
+|   0, and spun. With a handler installed, `fsave 8(%a0)` lands in it cleanly
+|   (verified: the vec-11 handler runs), exactly like the cpGEN control
+|   (an unimplemented FSINCOS-family opcode) does.
 |
-| These are GENUINE HANGS, not the "sentinel written as 0 reads as no-write"
-| harness artifact: each probe ORs 0xA0000000 into the reported value, so any
-| completion writes a non-zero sentinel. Nothing was written at all.
+|   A non-zero marker in the reported value ruled out the "sentinel written as 0
+|   reads as no-write" harness artifact — but said nothing about a missing
+|   handler. Two different ways to fake a hang; check BOTH.
 |
-| Not a malformed test — gas emits the architecturally correct encodings:
-|     f328 0008   fsave %a0@(8)
-|     f310        fsave %a0@
-|     f338 1f00   fsave 0x1f00
-| and a control program with the SAME shape minus the FSAVE completes normally
-| (and `fsave (%a0)` in that exact shape returns the correct 0x41300000 header).
+| WHAT IS ACTUALLY TRUE
 |
-| Why it matters: FSAVE/FRESTORE is FPSP-critical. The Q700 ROM's FPSP uses
-| `fsave %sp@-` (the predecrement form, which works), so this does not break the
-| common path — but any FPSP or OS path using a displaced/absolute FSAVE would
-| hang the machine outright rather than fault.
+| A real 68040 accepts control-alterable and predecrement modes for FSAVE, so
+| (d16,An), (xxx).W and (xxx).L are all LEGAL there and execute in hardware.
+| This core implements only the register-indirect forms:
 |
-| This test covers ONLY the (d16,An) form; the two absolute forms fail
-| identically and are listed above rather than given separate tests.
+|     fsave -(%a7)     implemented   A7 -= 52, header 0x41300000, zero body
+|     fsave (%a0)      implemented   header 0x41300000
+|     fsave -(%a0)     implemented   A0 -= 52
+|     fsave 8(%a0)     -> vector 11  (this test)
+|     fsave 0x1F00.w   -> vector 11
+|     fsave 0x00020010 -> vector 11
 |
-| PASS sentinel: 0xC0FFEE00
+| That is a REAL 1:1 deviation, deliberately scoped: OperationDecoder.scala's
+| FSAVE/FRESTORE arm documents it ("the displacement/absolute forms need a real
+| EA computation that this commit-time sysOp path has no AGU for, so they stay
+| OUT of scope on the line-F vector-11 fall-through"). The fall-through WORKS;
+| what is missing is the EA computation itself.
+|
+| Impact is bounded: the Q700 ROM's FPSP uses `fsave %sp@-`, which is
+| implemented, so the boot path is unaffected. Code using a displaced or
+| absolute FSAVE gets a vector-11 trap the FPSP will not emulate (FSAVE is not
+| a cpGEN opcode), so it would fault rather than work.
+|
+| This test PINS THE CURRENT BEHAVIOUR: the trap fires and is dispatchable. If
+| the EA forms are ever implemented, this test must be updated to expect the
+| frame instead of the trap.
+|
+| PASS sentinel: 0xC0FFEE00 — vector 11 taken, as currently designed.
 | FAIL sentinels:
-|   0xDEAD0E01 — header at 8(A0) is not 0x41300000
-|   (a HANG means FSAVE (d16,An) never completed — the defect this test exists for)
+|   0xDEAD0E01 — executed silently (would mean the EA forms became implemented,
+|                at which point this test should assert the frame instead)
+|   0xDEAD0E04 — vector 4 taken instead of 11 (wrong vector)
 
     .text
     .org 0
@@ -41,19 +55,19 @@
 
 _start:
     lea     0x00010000, %a7
+    move.l  #_fline, 0x0000002C        | vec 11 — MUST be installed, see above
+    move.l  #_illegal, 0x00000010      | vec 4, to catch a wrong-vector dispatch
     lea     0x00020000, %a0
-    move.l  #0xDEADBEEF, 8(%a0)        | poison the header slot
 
-    fsave   8(%a0)                     | (d16,An) — HANGS TODAY
+    fsave   8(%a0)                     | (d16,An): not implemented -> vector 11
 
-    move.l  8(%a0), %d1
-    cmp.l   #0x41300000, %d1
-    bne     _fail
-
+    move.l  #0xDEAD0E01, %d2           | fell through = it executed
+    bra     _done
+_fline:
     move.l  #0xC0FFEE00, %d2
     bra     _done
-_fail:
-    move.l  #0xDEAD0E01, %d2
+_illegal:
+    move.l  #0xDEAD0E04, %d2
 _done:
     lea     PASS_SENT, %a2
     move.l  %d2, (%a2)
