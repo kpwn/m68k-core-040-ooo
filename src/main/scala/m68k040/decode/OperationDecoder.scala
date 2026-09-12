@@ -21,6 +21,16 @@ object OperationDecoder {
     val immext  = OperandSrc(); immext.kind := OperandKind.IMMEXT; immext.isAddr := False
     val immq3   = OperandSrc(); immq3.kind := OperandKind.IMMQ3;  immq3.isAddr := False
 
+    // ── EA typing ─────────────────────────────────────────────────────────────
+    // `eaHand` names the instructions whose OPERANDS this decoder deliberately does
+    // not type -- MicroOpAssembler builds them by hand -- but which still HAVE an
+    // op[5:0] effective address. `eaShift` is how many extension words precede the
+    // EA's own first one. Both are resolved into `o.eaSrcValid`/`o.eaSrcShift` AFTER
+    // the switch, where an instruction that names its EA through srcA/srcB/dst needs
+    // no entry here at all: the rule below derives it from the operand kinds.
+    val eaHand  = Bool();       eaHand.allowOverride;  eaHand  := False
+    val eaShift = UInt(2 bits); eaShift.allowOverride; eaShift := 0
+
     switch(line) {
       // ---- Line-0 immediates: ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm,<ea> ----
       // 0000 ooo0 ss mmmrrr + imm. opmode ooo (bits 11:9): 0=ORI,1=ANDI,2=SUBI,
@@ -56,6 +66,10 @@ object OperationDecoder {
             .otherwise { o.size := Size.LONG }
           when(opmode === 2 || opmode === 3) { o.writesNzvc := True; o.writesX := True }   // ADDI/SUBI
             .otherwise { o.writesNzvc := True }                                            // AND/OR/EOR/CMP
+          // The IMMEDIATE word(s) sit between the opword and the EA's own extension
+          // words: 1 for .B/.W, 2 for .L. (This is what DecodeStage used to re-derive
+          // as `s0ImmIsL`/`s1mi_immL` from the opword + a DecOp.BITOP carve-out.)
+          eaShift := Mux(ss === 2, U(2, 2 bits), U(1, 2 bits))
         }
         // ── Bit ops (BTST/BCHG/BCLR/BSET) ──────────────────────────────────────
         // dynamic 0000 rrr 1 tt mmmrrr (bit8=1, NOT mode 001=MOVEP); static 0000 1000
@@ -89,6 +103,7 @@ object OperationDecoder {
             .elsewhen(ssCmp2 === 1) { o.size := Size.WORD }
             .otherwise { o.size := Size.LONG }
           o.srcA := easrc                  // the EA bounds pointer (LOWER bound base)
+          eaShift := 1                     // the Rn/size ext word precedes the EA's own
           o.dst.setNone(); o.dstWrites := False
           o.readsNzvc  := True             // RMW: read old N/V to preserve them
           o.writesNzvc := True             // write {oldN, Z, oldV, C}
@@ -122,6 +137,9 @@ object OperationDecoder {
           o.dstWrites := (tt =/= B"00")             // BTST writes nothing
           o.readsNzvc  := True                      // the EU needs old N/V/C to preserve them
           o.writesNzvc := True                      // Z computed; the EU preserves N/V/C (Z-only)
+          // STATIC form: the bit-number ext word precedes the EA's own. DYNAMIC form:
+          // the bit number is Dn (op[11:9]), so the EA ext sits directly at op+1.
+          eaShift := Mux(isStatBit, U(1, 2 bits), U(0, 2 bits))
           // size is dest-dependent (Dn=LONG, mem=BYTE) -> resolved in the assembler.
         }
         // ── CAS / CAS2 (020+ atomic compare-and-swap) ──────────────────────────
@@ -171,6 +189,7 @@ object OperationDecoder {
             o.cluster := Cluster.INT
             setCasSize()
             o.srcA := easrc                  // the EA (so predecode/EaDecoder frame it)
+            eaShift := 1                     // the Dc/Du ext word precedes the EA's own
             o.writesNzvc := True             // NZVC from cmp(dest,Dc) (no X)
           }
           // A non-memory-alterable CAS EA (Dn/An/PC-rel/#imm) stays ILLEGAL
@@ -196,6 +215,7 @@ object OperationDecoder {
           o.op         := DecOp.MOVES
           o.cluster    := Cluster.INT
           o.srcA       := easrc            // the EA (so predecode/EaDecoder frame it)
+          eaShift      := 1                // the Rn/dr ext word precedes the EA's own
           // size from op[7:6] (00=.B,01=.W,10=.L). NO CCR effect.
           when(opword(7 downto 6) === B"00") { o.size := Size.BYTE }
             .elsewhen(opword(7 downto 6) === B"01") { o.size := Size.WORD }
@@ -247,6 +267,18 @@ object OperationDecoder {
         // trailing store size). Harmless for DBcc/TRAPcc (neither reads srcEa-derived
         // size/delta in its own hand-built crack).
         when(ss === 3) { o.size := Size.BYTE }
+        // ...and, for the same reason, `Scc <ea>` DOES declare its effective address
+        // even though the assembler builds the rest of the instruction. Scc keeps its
+        // branch-EU condition path and still says "my destination is this EA", so the
+        // memory-indirect routing gate can see it without naming the family. Scope
+        // mirrors MicroOpAssembler's `isSccOp` EXACTLY: every mode except 001 (that is
+        // DBcc, whose op[2:0] is a Dn counter, not an EA) and except mode 111 reg>=2
+        // (TRAPcc's ttt operand-count selector / reserved -- likewise not an EA).
+        val sccMode = opword(5 downto 3)
+        val sccReg  = opword(2 downto 0).asUInt
+        when(ss === 3 && (sccMode =/= B"001") && !((sccMode === B"111") && (sccReg >= 2))) {
+          eaHand := True
+        }
       }
       // ---- MOVE.B/.W/.L (00 ss ...) src EA = bits 5-0, dst EA = bits 11-6 ----
       is(0x1, 0x3, 0x2) {
@@ -530,7 +562,10 @@ object OperationDecoder {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.LONG
           // operands left to the assembler's leaAddr crack (the EA is an ADDRESS the AGU
-          // computes, not a loaded value — no EASRC operand here).
+          // computes, not a loaded value — no EASRC operand here). The EA ITSELF is still
+          // declared: "no EASRC operand" is a statement about the DATA FLOW, not about
+          // whether op[5:0] is an effective address.
+          eaHand := True
         }
         // ── PEA <ea> (0100 1000 01 mmmrrr): op[15:6]==0x121. Push the control-EA address.
         // The EA must be a CONTROL addressing mode (mode field >= 2): reg-direct (mode 000
@@ -540,17 +575,41 @@ object OperationDecoder {
         when((opword(15 downto 6) === B"10'b0100100001") && (opword(5 downto 3).asUInt >= 2)) {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.LONG
+          eaHand := True                          // address-generate; see LEA above
+        }
+        // ── JMP (0100 1110 11 mmmrrr) / JSR (0100 1110 10 mmmrrr) ─────────────────
+        // This decoder does not recognize either (they stay `illegal`, and
+        // MicroOpAssembler re-derives their identity from the opword to build the
+        // ibranch crack) -- but their op[5:0] IS an effective address, and a
+        // memory-indirect one needs a pointer chain walked before the branch target
+        // exists. Declaring the EA costs nothing else: `illegal` is untouched, so every
+        // downstream consumer sees exactly what it saw before.
+        when((opword(15 downto 6) === B"10'b0100111011") ||
+             (opword(15 downto 6) === B"10'b0100111010")) {
+          eaHand := True
+        }
+        // ── DIVU.L/DIVS.L (0100 1100 01 mmmrrr) / MULU.L/MULS.L (0100 1100 00 ...) ──
+        // Also assembler-built (the Dl:Dh/size selector lives in the extension word this
+        // decoder cannot see), and also EA-taking. Their EA's own extension words follow
+        // that Dl:Dh word, exactly like CMP2/CHK2, CAS and MOVES -- the same shift
+        // PredecodeWord frames them with.
+        when((opword(15 downto 6) === B"10'b0100110001") ||
+             (opword(15 downto 6) === B"10'b0100110000")) {
+          eaHand  := True
+          eaShift := 1
         }
         // ── MOVE from SR (0100 0000 11 mmmrrr): op[15:6]==0x103. SR(16) -> EA (.W).
         // PRIVILEGED (040): the assembler sets needsSupervisor (ROB vector-8 if S==0).
         when(opword(15 downto 6) === B"10'b0100000011") {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.WORD
+          eaHand := True                          // op[5:0] is the WRITE destination EA
         }
         // ── MOVE from CCR (0100 0010 11 mmmrrr): op[15:6]==0x10B. CCR(byte,ZX) -> EA (.W).
         when(opword(15 downto 6) === B"10'b0100001011") {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.WORD
+          eaHand := True                          // op[5:0] is the WRITE destination EA
         }
         // ── MOVE to CCR (0100 0100 11 mmmrrr): op[15:6]==0x113. EA(.W low byte) -> CCR.
         // srcB = the EA source (so a memSimple EA gets the generic leading-load crack);
@@ -747,6 +806,9 @@ object OperationDecoder {
         // T1][BITFIELD bfMem]); OperationDecoder only NAMES the op (BITFIELD, NZ
         // write) + marks the EA as srcA so predecode/EaDecoder frame it. The
         // assembler rejects a non-control EA (postinc/predec/Dn/An/#imm) -> illegal.
+        // Every bit-field form (register, memory read-only, memory RMW) carries its
+        // {offset,width} extension word BEFORE the EA's own extension words.
+        when(ss === 3 && opword(11)) { eaShift := 1 }
         val bfMemOp = opword(10 downto 8)
         val bfMemLoadOnly = (bfMemOp === 0) || (bfMemOp === 1) || (bfMemOp === 3) || (bfMemOp === 5)
         val isBitfieldMem = opword(11) && (mode.asUInt >= 2) && bfMemLoadOnly
@@ -1400,6 +1462,24 @@ object OperationDecoder {
         }
       }
     }
+
+    // ── EA typing: ONE rule, no family list ─────────────────────────────────────
+    // An instruction addresses through op[5:0] if it named that field as an operand
+    // (the arms above already do this for every instruction whose operands this
+    // decoder owns) OR if it is one of the hand-built families marked `eaHand`.
+    // Nothing else is needed, and nothing has to be REMEMBERED here when a family is
+    // added: an arm that names `easrc` is typed by construction.
+    //
+    // MOVEM and MOVEP are deliberately NOT declared, and that is not an oversight:
+    // their EA belongs to a dedicated micro-sequencer in DecodeStage that frames its
+    // own extension words and whose entry is NOT mutually exclusive with the µcode
+    // engine's (`movemBegin`/`ucBegin` gate on each other's ACTIVE/PEND flags, not on
+    // each other's BEGIN), so a routing gate must not divert them into the engine.
+    o.eaSrcValid := eaHand || (o.srcA.kind === OperandKind.EASRC) ||
+                              (o.srcB.kind === OperandKind.EASRC) ||
+                              (o.dst.kind  === OperandKind.EASRC)
+    o.eaSrcShift := eaShift
+    o.eaDstValid := o.dst.kind === OperandKind.EADST
     o
   }
 }

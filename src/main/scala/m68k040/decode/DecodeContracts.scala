@@ -175,6 +175,26 @@ case class OpSpec() extends Bundle {
   val sysOp         = Bool()
   val sysKind       = SysKind()
   val sysReadDir    = Bool()
+  // ── Effective-address typing ────────────────────────────────────────────────
+  // WHICH opword field is an effective address, and WHERE its extension words
+  // start. Deliberately SEPARATE from srcA/srcB/dst.kind: those say how an operand
+  // is PLUMBED (and drive MicroOpAssembler's crack selection), while these say what
+  // the EA MACHINERY must resolve. An instruction the assembler builds BY HAND --
+  // Scc, LEA, PEA, JMP, JSR, MOVE from SR/CCR, DIV.L/MUL.L -- still HAS an effective
+  // address, and a gate asking "does this EA need a pointer chain walked?" must be
+  // able to see it without knowing the opcode. Typing the EA does not require this
+  // decoder to own the rest of the instruction.
+  //   eaSrcValid : op[5:0] is a real EA this instruction addresses through.
+  //   eaSrcShift : extension words that PRECEDE the EA's own first extension word
+  //                (0 for most; 1 for a bit-number / bit-field / Rn / Dc:Du / Dl:Dh
+  //                word; 2 for a .L line-0 immediate). This is the ONE legitimately
+  //                per-op residue of EA typing, and it is per-op because the
+  //                ENCODING differs, not because the opcode does.
+  //   eaDstValid : the MOVE dst field (op[11:6], swapped) is a real EA.
+  // MOVEM/MOVEP deliberately leave eaSrcValid False -- see OperationDecoder.
+  val eaSrcValid = Bool()
+  val eaSrcShift = UInt(2 bits)
+  val eaDstValid = Bool()
   // ── F-line FP-generic (cpGEN) family marker ─────────────────────────────────
   // True for `1111 001 000 mmmrrr` -- the ONE thing about an FP instruction that is a
   // function of the OPWORD alone. Which operation it is (FADD vs FMUL), which FP
@@ -207,6 +227,7 @@ object OpSpec {
     o.movep := False; o.movepDir := False; o.movepSizeLong := False
     o.microcoded := False; o.ucEntry := 0
     o.sysOp := False; o.sysKind := SysKind.NONE; o.sysReadDir := False
+    o.eaSrcValid := False; o.eaSrcShift := 0; o.eaDstValid := False
     o.fpGeneric := False
     o
   }
