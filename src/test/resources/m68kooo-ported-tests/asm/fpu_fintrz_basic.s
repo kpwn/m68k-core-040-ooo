@@ -21,6 +21,14 @@
 |   0xDEAD0F03 — FINTRZ(3.7) != 3.0
 |   0xDEAD0F04 — FINTRZ(-3.7) != -3.0
 |   0xDEAD0F05 — FINTRZ(2.5) != 2.0
+| ENCODING CORRECTED 2026-09-12: these FMOVE.S loads carried source specifier
+| 000 = LONG WORD INTEGER (ext 0x40xx), not 001 = SINGLE (ext 0x44xx), so every
+| one of them loaded the bit pattern as a 32-bit INTEGER. 0x40666666 became
+| 1080033350.0 instead of ~3.6, and every downstream expectation failed. The core
+| was CORRECT: with ext 0x4400 the round-trip returns 0x40666666 exactly and
+| FINT gives 0x40800000 = 4.0. Same class as fpu_fmovem_ctrl_predec -- a wrong
+| test, not a core defect.
+|
 
     .text
     .org 0
@@ -35,7 +43,7 @@ _start:
 
     | FP0 := 3.7
     move.l  #0x40666666, %d0
-    .short  0xF200, 0x4000             | FMOVE.S D0,FP0
+    .short  0xF200, 0x4400             | FMOVE.S D0,FP0
 
     | FP1 := FINTRZ.X FP0,FP1  ext = (0<<10)|(1<<7)|0x03 = 0x83
     .short  0xF200, 0x0083
@@ -48,7 +56,7 @@ _start:
 
     | FP2 := -3.7
     move.l  #0xC0666666, %d0
-    .short  0xF200, 0x4100             | FMOVE.S D0,FP2
+    .short  0xF200, 0x4500             | FMOVE.S D0,FP2
 
     | FP3 := FINTRZ.X FP2,FP3  ext = (2<<10)|(3<<7)|0x03 = 0x983
     .short  0xF200, 0x0983
@@ -61,7 +69,7 @@ _start:
 
     | FP4 := 2.5
     move.l  #0x40200000, %d0
-    .short  0xF200, 0x4200             | FMOVE.S D0,FP4
+    .short  0xF200, 0x4600             | FMOVE.S D0,FP4
 
     | FP5 := FINTRZ.X FP4,FP5  ext = (4<<10)|(5<<7)|0x03 = 0x1283
     .short  0xF200, 0x1283

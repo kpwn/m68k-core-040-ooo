@@ -42,6 +42,14 @@
 |
 | OBSERVED on main: assembles; runtime DEAD0F01 (FMOVE.S FPn,(An)
 | undecoded).  Recorded as expected.
+| ENCODING CORRECTED 2026-09-12: these FMOVE.S loads carried source specifier
+| 000 = LONG WORD INTEGER (ext 0x40xx), not 001 = SINGLE (ext 0x44xx), so every
+| one of them loaded the bit pattern as a 32-bit INTEGER. 0x40666666 became
+| 1080033350.0 instead of ~3.6, and every downstream expectation failed. The core
+| was CORRECT: with ext 0x4400 the round-trip returns 0x40666666 exactly and
+| FINT gives 0x40800000 = 4.0. Same class as fpu_fmovem_ctrl_predec -- a wrong
+| test, not a core defect.
+|
 
     .text
     .org 0
@@ -56,11 +64,11 @@ _start:
 
     | FP0 := 1.0
     move.l  #0x3F800000, %d0
-    .short  0xF200, 0x4000             | FMOVE.S D0,FP0
+    .short  0xF200, 0x4400             | FMOVE.S D0,FP0
 
     | FP1 := 2.0
     move.l  #0x40000000, %d0
-    .short  0xF200, 0x4080             | FMOVE.S D0,FP1 (Dn=0,FPn=1 -> ext=0x4080)
+    .short  0xF200, 0x4480             | FMOVE.S D0,FP1 (Dn=0,FPn=1 -> ext=0x4080)
 
     | FP2 := FP0 + FP1.  ext = (1<<10)|(2<<7)|0x22 = 0x0522
     .short  0xF200, 0x0522             | FADD.X FP1,FP2 (FP2 := FP1; FP2 += FP0?)
