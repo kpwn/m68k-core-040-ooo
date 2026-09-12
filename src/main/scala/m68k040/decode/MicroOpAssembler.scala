@@ -1885,8 +1885,11 @@ object MicroOpAssembler {
     // mem's "any MEMSIMPLE dest, non-pcRel" pattern); srcEa.klass (already EA-agnostic,
     // decoded from this SAME op[5:0] field regardless of instruction family) is what
     // the `when(isSccOp)` crack below actually branches on (DATAREG vs MEMSIMPLE).
-    val isSccOp    = isLine5 && (ss5 === 3) && (mode5 =/= 1) &&
-                     !((mode5 === 7) && (rrr5raw >= 2))
+    // Read the DECODER's verdict instead of re-matching the opword here. OperationDecoder
+    // already tests this exact condition (line-5, ss==11, not DBcc's mode 001, not
+    // TRAPcc's mode 111/reg>=2) in order to set eaSrcValid -- so the comparison used to
+    // exist twice, in two files, kept in step by hand. See OpForm.
+    val isSccOp    = spec.form === OpForm.SCC
     // FScc <ea>: `1111 001 001 mmmrrr` + a condition extension word.  Same EA scope as the
     // integer isSccOp above (mode 1 = FDBcc, mode 7 reg>=2 = FTRAPcc -- both still F-line
     // traps), and deliberately the same shape, because an FScc IS an Scc whose predicate
@@ -1989,16 +1992,15 @@ object MicroOpAssembler {
     val isExgOp = isExgDD || isExgAA || isExgDA
     // ── Track C: LEA / PEA / MOVE from-SR / from-CCR / to-CCR (line-4) ───────────
     // LEA (0100 An 1 11 mmmrrr): bit8=1, bits7:6=11, mode>=2. Control EA -> An (no flags).
-    val isLeaOp = (op(15 downto 12) === B"4'h4") && op(8) && (op(7 downto 6) === B"11") &&
-                  (op(5 downto 3).asUInt >= 2)
+    val isLeaOp = spec.form === OpForm.LEA
     // PEA (0100 1000 01 mmmrrr): op[15:6]==0x121, mode>=2 (CONTROL EA). Compute control
     // EA -> push to -(A7). Reg-direct (mode 000) is SWAP Dn (0x4840|rrr), which shares
     // op[15:6]==0x121 — require mode>=2 so SWAP keeps its own unary decode (and the
     // illegal reg-direct PEA is rejected), mirroring isLeaOp's mode>=2 guard.
-    val isPeaOp = (op(15 downto 6) === B"10'b0100100001") && (op(5 downto 3).asUInt >= 2)
+    val isPeaOp = spec.form === OpForm.PEA
     // MOVE from SR (0x40C0) / from CCR (0x42C0): SR/CCR -> EA (.W). from-SR is PRIVILEGED.
-    val isMoveFromSrOp  = (op(15 downto 6) === B"10'b0100000011")
-    val isMoveFromCcrOp = (op(15 downto 6) === B"10'b0100001011")
+    val isMoveFromSrOp  = spec.form === OpForm.MOVEFROMSR
+    val isMoveFromCcrOp = spec.form === OpForm.MOVEFROMCCR
     // MOVE to CCR (0x44C0): EA(.W low byte) -> CCR. NOT privileged.
     val isMoveToCcrOp   = (op(15 downto 6) === B"10'b0100010011")
     // LEA/PEA control-EA validity: in-scope MEMSIMPLE, NOT auto (-(An)/(An)+ illegal for

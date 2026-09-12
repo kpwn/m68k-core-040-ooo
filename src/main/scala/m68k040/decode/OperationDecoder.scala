@@ -278,6 +278,7 @@ object OperationDecoder {
         val sccReg  = opword(2 downto 0).asUInt
         when(ss === 3 && (sccMode =/= B"001") && !((sccMode === B"111") && (sccReg >= 2))) {
           eaHand := True
+          o.form := OpForm.SCC
         }
       }
       // ---- MOVE.B/.W/.L (00 ss ...) src EA = bits 5-0, dst EA = bits 11-6 ----
@@ -566,6 +567,7 @@ object OperationDecoder {
           // declared: "no EASRC operand" is a statement about the DATA FLOW, not about
           // whether op[5:0] is an effective address.
           eaHand := True
+          o.form := OpForm.LEA
         }
         // ── PEA <ea> (0100 1000 01 mmmrrr): op[15:6]==0x121. Push the control-EA address.
         // The EA must be a CONTROL addressing mode (mode field >= 2): reg-direct (mode 000
@@ -576,6 +578,7 @@ object OperationDecoder {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.LONG
           eaHand := True                          // address-generate; see LEA above
+          o.form := OpForm.PEA
         }
         // ── JMP (0100 1110 11 mmmrrr) / JSR (0100 1110 10 mmmrrr) ─────────────────
         // This decoder does not recognize either (they stay `illegal`, and
@@ -604,12 +607,14 @@ object OperationDecoder {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.WORD
           eaHand := True                          // op[5:0] is the WRITE destination EA
+          o.form := OpForm.MOVEFROMSR
         }
         // ── MOVE from CCR (0100 0010 11 mmmrrr): op[15:6]==0x10B. CCR(byte,ZX) -> EA (.W).
         when(opword(15 downto 6) === B"10'b0100001011") {
           o.illegal := False
           o.op := DecOp.MOVE; o.size := Size.WORD
           eaHand := True                          // op[5:0] is the WRITE destination EA
+          o.form := OpForm.MOVEFROMCCR
         }
         // ── MOVE to CCR (0100 0100 11 mmmrrr): op[15:6]==0x113. EA(.W low byte) -> CCR.
         // srcB = the EA source (so a memSimple EA gets the generic leading-load crack);

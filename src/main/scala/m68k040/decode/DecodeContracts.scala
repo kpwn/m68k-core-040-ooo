@@ -90,8 +90,38 @@ object EaSpec {
 }
 
 /** EA-agnostic operation descriptor produced by the OperationDecoder. */
+/** WHICH INSTRUCTION SHAPE the assembler must build, decided ONCE by
+  * `OperationDecoder` and read by `MicroOpAssembler`.
+  *
+  * WHY THIS EXISTS. `MicroOpAssembler` used to re-match the OPWORD to recognise these
+  * families -- `isJmpOp = op(15 downto 6) === B"10'b0100111011"` and 20 more like it --
+  * while `OperationDecoder` was ALREADY testing the same bit patterns a few hundred lines
+  * away (it has to, to set `eaHand`/`eaSrcValid`). The same comparison lived in two files
+  * and was kept in step by hand. This field carries the decoder's answer forward instead.
+  *
+  * WHY IT IS NOT A `DecOp` VALUE. `DecodedUop.op` is 6 bits and FMax-critical: a single
+  * extra `op === X` test in IssueQueuePlugin's scoreboard-clear cone was measured
+  * post-route as the design's WNS holder (9 of the 10 worst paths, -1.699ns,
+  * checkpoint 3cba17f). `OpSpec` is DECODE-TIME -- the assembler consumes it and it never
+  * reaches the issue queue -- so a form here costs nothing in that cone.
+  *
+  * NONE means "no special shape": the ordinary operand-driven path applies. */
+object OpForm extends SpinalEnum {
+  val NONE,
+      SCC,          // Scc <ea>            -- branch-EU condition write, assembler-built
+      LEA,          // LEA <ea>,An         -- address generate
+      PEA,          // PEA <ea>            -- address generate + push
+      JMP, JSR,     // computed-target branches
+      DIVL, MULL,   // .L forms; the Dl:Dh/size selector is in the extension word
+      MOVEFROMSR,   // MOVE SR,<ea>        -- privileged on the 040
+      MOVEFROMCCR   // MOVE CCR,<ea>
+      = newElement()
+}
+
 case class OpSpec() extends Bundle {
   val op       = DecOp()
+  /** The instruction SHAPE, for families MicroOpAssembler builds by hand. See OpForm. */
+  val form     = OpForm()
   val size     = Size()
   val cluster  = Cluster()
   val srcA     = OperandSrc()
@@ -210,6 +240,7 @@ object OpSpec {
   def illegalDefault(): OpSpec = {
     val o = OpSpec()
     o.op := DecOp.ILLEGAL; o.size := Size.WORD; o.cluster := Cluster.INT
+    o.form := OpForm.NONE
     o.srcA.setNone(); o.srcB.setNone(); o.dst.setNone()
     o.dstWrites := False
     o.readsNzvc := False; o.writesNzvc := False
