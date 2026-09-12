@@ -2794,8 +2794,54 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // task's scope only ever enters from slot0 -- `slot0IsFmovemx`'s own doc). §6.5's binding
     // constraint: folded in as one more OR/AND term on these SAME pre-existing aggregates,
     // not a parallel hold-decision tree.
-    val fmovemxEnterSlot0 = fmovemxBegin
-    val fmovemxHoldsFed   = fmovemxActive
+    // MUST exclude the pend entry, exactly like movem/movep/ucode above
+    // (movemEnterSlot0 = movemBegin && !movemPendValid, etc.). `fmovemxBegin` is ALSO
+    // true when the macro enters from a previously-stashed slot1 packet
+    // (`fmovemxPendValid`), and in THAT cycle `fed` holds the NEXT instruction group,
+    // not this macro's own. Forcing `fed.ready` there consumed that group while the
+    // stash below saved only its slot1 -- silently DROPPING its slot0.
+    // Measured: `3 stores / fmovem.x / move.l (a1),d0 / cmpi / beq` lost the move.l
+    // entirely (it never reached rename), so d0 kept its reset mapping and the cmpi
+    // computed 0 - imm; see fpu_store_then_cmp_bcc.s and FmovemBranchTraceSpec.
+    val fmovemxEnterSlot0 = fmovemxBegin && !fmovemxPendValid
+
+    // debug-only: why does an instruction next to an FMOVEM.X vanish? (2026-09-12)
+    val fxDbg = new Bundle {
+      val begin      = Bool()
+      val pend       = Bool()
+      val active     = Bool()
+      val enterSlot0 = Bool()
+      val slot1Valid = Bool()
+      val slot1Count = UInt(2 bits)
+      val stashV     = Bool()
+      val stashN     = UInt(2 bits)
+      val fedValid   = Bool()
+      val fedReady   = Bool()
+      val pc0        = UInt(32 bits)
+      val pc1        = UInt(32 bits)
+    }
+    fxDbg.begin      := fmovemxBegin
+    fxDbg.pend       := fmovemxPendValid
+    fxDbg.active     := fmovemxActive
+    fxDbg.enterSlot0 := fmovemxEnterSlot0
+    fxDbg.slot1Valid := fed.payload.slot1Valid
+    fxDbg.slot1Count := a1raw.count.resized
+    fxDbg.stashV     := stashValid
+    fxDbg.stashN     := stashCount.resized
+    fxDbg.fedValid   := fed.valid
+    fxDbg.fedReady   := fed.ready
+    fxDbg.pc0        := fed.payload.packets(0).pc
+    fxDbg.pc1        := fed.payload.packets(1).pc
+    fxDbg.simPublic()
+    // `|| fmovemxPendValid` is LOAD-BEARING and was missing: movem/movep/ucode all
+    // include their pend flag here (movemHoldsFed = movemActive || movemPendValid, etc.).
+    // While the pend is set the macro has NOT started yet (fmovemxActive is still False),
+    // so without this term the normal consume path fires and eats the incoming `fed`
+    // group WITHOUT emitting it -- silently dropping a real instruction.
+    // Measured on `3 stores / fmovem.x / move.l (a1),d0 / cmpi / beq`: at the begin
+    // cycle fed.slot0 was pc=0x40800046 (the move.l) and fed.ready was high, so the load
+    // never reached rename, d0 kept its reset mapping, and the cmpi computed 0 - imm.
+    val fmovemxHoldsFed   = fmovemxActive || fmovemxPendValid
     // NOTE: the engine does NOT consume `fed` on its last µop — the held FOLLOWING group
     // is emitted by the normal head once ucActive clears (ucHoldsFed drops). Consuming it
     // here would DROP that group. The sbcd's OWN group was already consumed at entry
@@ -3014,7 +3060,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       // is ALSO always `spec.microcoded`, per `slot0IsFmovemx`'s own doc), which traps it at
       // the pre-existing FP_MEM_TRAP_ENTRY -- a known, bounded, NON-regressing scope limit
       // (this exact case was unsupported before this task too), not a dropped instruction.
-      when(fed.payload.slot1Valid) {
+      // Gate on fmovemxEnterSlot0, not on fmovemxBegin: when entering from the pend
+      // packet `fed` is the NEXT group and is no longer consumed here, so stashing its
+      // slot1 would both duplicate that instruction and drop its slot0. Mirrors
+      // movemBegin's `when(movemEnterSlot0 && fed.payload.slot1Valid)` verbatim.
+      when(fmovemxEnterSlot0 && fed.payload.slot1Valid) {
         when(slot1IsMovem) {
           movemPendValid := True
           movemPendPkt   := fed.payload.packets(1)
