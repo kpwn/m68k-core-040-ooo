@@ -28,7 +28,7 @@ An out-of-order, superscalar Motorola 68040 CPU core written in
 (Fiber + Database) backbone.
 
 It is a real core, not a model: it boots Mac OS to the Finder on FPGA, inside a
-Quadra 700 SoC, executing the stock Q700 ROM unmodified.
+Quadra 700 SoC, executing the stock Q700 ROM unmodified (*except for timing issues needing a patch due to having too fast of a core relative to wall clock).
 
 ## Status
 
