@@ -52,6 +52,37 @@ Consequences, each independently tested:
 
 ---
 
+## 1a. THE IPC LEDGER -- what each item does to the hot path
+
+The goal is to close 200 MHz WITHOUT losing IPC, ideally GAINING it. Tracking that
+explicitly, because "area reduction" reads as a pure sacrifice and here it is not:
+
+| item | hot-path IPC | why |
+|---|---|---|
+| Early slow wakeup (S3->S1b) | **+2 cycles per shift->dependent edge** | broadcast at the bypass cycle was 2 cycles late; anticipation restores the machine's own "wake 2 before bypass" rule |
+| Bitfield extraction | **+2 cycles per shift** | shift drops lat-6 -> lat-4 once S1a/S1b (bitfield-only) go |
+| Speculative LS wakeup | **+1 cycle on the most common dependency** | load-use; dependents currently learn at completion broadcast |
+| Balanced bypass mux | neutral IPC, **shortens the hot read path** | linear N-level fold -> compare + log2(N) + mux |
+| Write-port reservation | neutral | select-time stall only on reservation miss; ~1 write/cycle vs 2 ports |
+| `op` out of `IqHot` | neutral | no functional reader |
+| DebugCtrl out of perf builds | neutral | not in any datapath |
+| Bitfield on the single CPLX port | **- (unquantified)** | head-of-line blocking; the ONE item with a real IPC cost |
+
+So the ledger is strongly positive before the area win is even counted. The only debit
+is bitfield contending for the single CPLX issue port -- measure it (§6).
+
+**AND the locality argument means some of these pay twice.** Static/local wakeup is not
+mainly an IPC play: dynamic wakeup requires a CROSS-PLUGIN BROADCAST from each EU into
+all 16 IQ slots (`aluSlowWakeup` x2 ALUs, `lsWakeup`, four `cplx*Wakeup`), each fanning
+to ~5 comparators per slot. That is the same shape-C anti-pattern as §1, inside the
+hot select region. Closing the wakeup-select loop LOCALLY -- the IQ predicts the common
+case, the EU signals only the exception (a miss -> replay) -- shrinks the loop's physical
+extent, which under an 80%-wire regime is worth more than any logic-level count.
+⚠️ This is why an analysis that judged static wakeup by LOGIC LEVELS ("saves ~0 of 19")
+reached the wrong conclusion: it measured the 20%.
+
+---
+
 ## 2. Free wins -- zero IPC cost, do these first
 
 They also calibrate the utilisation->WNS slope, which is still UNMEASURED. Do not
@@ -345,6 +376,10 @@ should be decided separately from the write-port work.
   IPC the way we were guessing at timing before the census.
 - **Fast area gate.** OOC synth of the core is ~10 min vs ~50 for a full route. Its FMax
   has a ~1 ns noise floor -- **use it for AREA only**, which is what it is good for.
+  ⭐ A debug-OFF twin ALREADY EXISTS: `M68kFullCoreSynthNoDebug`
+  (`FullCoreSynth.scala:828`, `debugEnable = false`). So `DebugCtrlPlugin`'s area cost is
+  measurable with NO RTL change -- run the gate on both twins and diff. Do this first; it
+  also calibrates the gate itself against a known-nonzero delta.
 - **Bitfield dynamic frequency** in the boot workload, before betting on §3.
 - **Utilisation -> WNS slope.** Unknown. Establish it with one full route per ~10k LUTs
   removed. If 10k buys ~0.2 ns, 200 MHz is reachable; if it buys 0.03 ns, stop.
