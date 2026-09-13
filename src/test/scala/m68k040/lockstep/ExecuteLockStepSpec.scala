@@ -6462,11 +6462,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // the hardware's stale reads actually produced).
   //
   // The reproducer needs the DIV's dividend to arrive LATE while the DIVREM is already
-  // ready. `asr.l #1,%d5` is a line-E SHIFT, i.e. a SLOW-ALU producer on the six-stage
+  // ready. `asr.l #1,%d5` is a line-E SHIFT, i.e. a SLOW-ALU producer on the four-stage
   // path with a DYNAMIC completion wakeup (IssueQueuePlugin.isAluSlowProducer), so the
   // DIV sits in `aluSlowWait` for several cycles with its DIVREM ready beside it -- the
   // widest, most deterministic form of the same window the ROM's one-cycle
   // `move.l %d4,%d5 ; divsl.l %d2,%d6:%d5` hits intermittently.
+  // ⚠️ COVERAGE NOTE (2026-09-13): this window got SHORTER twice over -- the slow pipe
+  // went lat-6 -> lat-4 when BITFIELD moved to the CPLX cluster, and the slow wakeup now
+  // broadcasts two stages early (S1a, not S3). SHIFT is still the slow-ALU producer, so
+  // the test remains VALID, but it exercises a narrower window than when it was written.
+  // If this ever needs to be a strong reproducer again, widen it with a genuinely
+  // long-latency producer (a DIV) rather than assuming a shift still stalls for "several
+  // cycles" -- a test that silently stops reaching its bug still passes.
+  //
   // Two conditions have to hold together for the DIVREM to actually win the race, and
   // both are load-bearing in the program below -- get either wrong and the test passes on
   // the broken RTL:
