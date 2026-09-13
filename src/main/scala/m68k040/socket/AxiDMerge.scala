@@ -231,6 +231,21 @@ class AxiDMerge(axiCfg: Axi4Config,
     io.rvArReady     := arOpen && (sel === U(Owner.RESETVEC, 2 bits)) && io.out.ar.ready
 
     when(grant) { owner := pick; busy := True; rr := pick + 1 }
+    
+    // ── D20b (2026-09-13): release a grant whose owner WITHDREW before the address
+    // phase issued. `busy` latches on `grant` (deliberately -- see above) but is
+    // cleared ONLY by transaction COMPLETION, and this module has no flush/abort
+    // input. So an owner that wins arbitration and is then squashed (a core flush
+    // after an exception) leaves `busy` set with NO transaction behind it: no
+    // AR was ever issued, so no response can ever arrive, and the watchdog
+    // eventually halts the core with ARBITER_WEDGE on a completely idle machine.
+    // Observed on hardware: every client idle, zero outstanding, arbiter halted.
+    //
+    // Gated on `!arTaken` so D20 is PRESERVED: once the address is out the response
+    // must be awaited (this module never fabricates one), and an owner that is still
+    // asking while the wide side stalls keeps `req(owner)` high -- which is exactly
+    // the case the watchdog exists to catch.
+    when(busy && !arTaken && !req(owner)) { busy := False }
 
     // R fans out to the LATCHED owner only. Payload is broadcast (cheaper than a mux and
     // harmless -- `valid` is what gates a consumer), `valid` is not.
@@ -354,6 +369,21 @@ class AxiDMerge(axiCfg: Axi4Config,
     io.dtlb.w.ready  := wOpen && (sel === U(Owner.DTLB,   2 bits)) && io.out.w.ready
 
     when(grant) { owner := pick; busy := True; rr := pick + 1 }
+    
+    // ── D20b (2026-09-13): release a grant whose owner WITHDREW before the address
+    // phase issued. `busy` latches on `grant` (deliberately -- see above) but is
+    // cleared ONLY by transaction COMPLETION, and this module has no flush/abort
+    // input. So an owner that wins arbitration and is then squashed (a core flush
+    // after an exception) leaves `busy` set with NO transaction behind it: no
+    // AW was ever issued, so no response can ever arrive, and the watchdog
+    // eventually halts the core with ARBITER_WEDGE on a completely idle machine.
+    // Observed on hardware: every client idle, zero outstanding, arbiter halted.
+    //
+    // Gated on `!awTaken` so D20 is PRESERVED: once the address is out the response
+    // must be awaited (this module never fabricates one), and an owner that is still
+    // asking while the wide side stalls keeps `req(owner)` high -- which is exactly
+    // the case the watchdog exists to catch.
+    when(busy && !awTaken && !req(owner)) { busy := False }
 
     io.dc.b.payload   := io.out.b.payload
     io.itlb.b.payload := io.out.b.payload
@@ -391,10 +421,21 @@ class AxiDMerge(axiCfg: Axi4Config,
     assert(rHot <= U(1), "AxiDMerge: an R beat was presented to more than one owner", FAILURE)
     val bHot = io.dc.b.valid.asUInt +^ io.itlb.b.valid.asUInt +^ io.dtlb.b.valid.asUInt
     assert(bHot <= U(1), "AxiDMerge: a B beat was presented to more than one owner", FAILURE)
-    assert(!(RegNext(rd.busy) init False) || rd.busy || RegNext(io.out.r.fire && io.out.r.payload.last),
-      "AxiDMerge: the read grant cleared without an r.last fire", FAILURE)
-    assert(!(RegNext(wr.busy) init False) || wr.busy || RegNext(io.out.b.fire),
-      "AxiDMerge: the write grant cleared without a b fire", FAILURE)
+    // D20b (2026-09-13): the invariant is now "a grant clears on COMPLETION, or because
+    // it never had a transaction behind it at all". The second arm covers the
+    // withdrawn-request release added above: the owner was squashed before its address
+    // was accepted, so arTaken/awTaken is still False and NO beat can ever arrive for
+    // it. Without that arm the release trips this assertion -- which is exactly what it
+    // is for, so the arm is spelled out rather than the assertion weakened. A grant that
+    // HAS issued its address must still await its response; that case is unchanged.
+    assert(!(RegNext(rd.busy) init False) || rd.busy
+           || RegNext(io.out.r.fire && io.out.r.payload.last)
+           || !(RegNext(rd.arTaken) init False),
+      "AxiDMerge: the read grant cleared without an r.last fire (AR had issued)", FAILURE)
+    assert(!(RegNext(wr.busy) init False) || wr.busy
+           || RegNext(io.out.b.fire)
+           || !(RegNext(wr.awTaken) init False),
+      "AxiDMerge: the write grant cleared without a b fire (AW had issued)", FAILURE)
     // A granted owner's AR payload must not change while granted (an owner that mutates
     // its request mid-grant would make the forwarded payload and the latched owner
     // describe different transactions). Scoped to `rd.busy` STILL being true THIS cycle:
