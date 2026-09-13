@@ -179,6 +179,51 @@ in there: `:598-599`, `:131-133`, `:811`, `:20-22`, `:58-66`.
 
 ---
 
+## 4a. Two PRF write ports via WRITE-PORT RESERVATION (the design that makes it work)
+
+**Why 5-wide issue is right and should stay.** The point of five select ports is
+LATENCY-CLASS DECOUPLING -- a DIV must not occupy a port an ALU op needs -- not peak
+bandwidth. Specialised ports per latency class are correct. The real duplication cost
+is that eu0 and eu1 are each a FULL ALU carrying a six-stage shift+bitfield pipe; that
+is what §3 attacks. Do not "narrow the issue width" as an area measure.
+
+**The tension.** Static wakeup is a PROMISE: "this result is in the PRF at T+N". Write-
+port contention breaks the promise and the consumer reads STALE. So fewer write ports
+and static wakeup are in direct conflict -- unless the port is RESERVED when the promise
+is made.
+
+**The resolution: reserve the write port at SELECT time.** A small shared table, 2 ports
+x N future cycles (a 2-bit-wide shift register ~6 deep):
+
+- A STATIC-latency op reserves its slot at T+N when it is selected. If no slot is free
+  it is not selected. The promise is then guaranteed by construction.
+- A VARIABLE-latency op (DIV, FP-iterative, loads) does NOT reserve. It arbitrates for a
+  free port when it actually completes, and -- the safety property -- **broadcasts its
+  dynamic wakeup only once the write has landed**. A delayed write can then never be
+  read early.
+
+Heterogeneous latencies SELF-DISTRIBUTE: two lat-1 ALU ops want the same future cycle
+(that is what the 2 ports are for), while a lat-4 shift lands three cycles later and
+does not contend at all. At ~1 write/cycle average against 2 ports, occupancy is low,
+and a reservation miss is a cheap SELECT-time stall (the uop stays in the IQ).
+
+**This DELETES hot-path logic rather than adding it.** The core already has a degenerate,
+one-cycle, per-EU version of exactly this: `fastAcceptNext` ("a fast candidate is
+eligible only when fastAcceptNext says the EU will have no S3 collision next cycle").
+Generalising it replaces the ad-hoc `aluFastAcceptNext`/`aluSlowSlots` muxing -- which
+sits in the IQ SELECT cone -- with one shared lookup.
+
+**Prerequisite:** this makes adding `ready` to `RegFileWritePort` mandatory, not an
+optional cleanup -- an arbitrating completer needs to be told "not this cycle". See the
+dead-end entry below for why merging without it is unsafe.
+
+**Residual:** loads are the most common writer AND variable-latency, so they keep
+dynamic wakeup with deferred broadcast -- safe, but it leaves the load-use cycle
+unclaimed. Reserving on PREDICTED hit with replay on miss buys it back; that is §4.1 and
+should be decided separately from the write-port work.
+
+---
+
 ## 5. DEAD ENDS -- do not retry
 
 - **PRF write-port merging while `RegFileWritePort` has no `ready`.** Every int writer
