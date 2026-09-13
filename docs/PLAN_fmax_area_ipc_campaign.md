@@ -360,6 +360,38 @@ busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
 
 ## 4a. Two PRF write ports via WRITE-PORT RESERVATION (the design that makes it work)
 
+> ### ⭐⭐ THE PRIZE IS THE WHOLE PORT SHAPE, NOT JUST THE WRITES (measured 2026-09-13)
+>
+> The int PRF as built is **14 reads x 6 writes = 6471 LUT / 3940 LUTRAM**. Measured
+> alternatives, same gate:
+>
+> | shape | LUT | LUTRAM | saves |
+> |---|---|---|---|
+> | 14R / 6W (today) | 6471 | 3940 | -- |
+> | 3W / 6R | 1503 | 820 | **4968 LUT** |
+> | **2W / 6R** | **897** | **512** | **5574 LUT (86%)** |
+> | 2W / 4R | 623 | 344 | 5848 LUT |
+>
+> **2W/6R saves 5.6% of the ENTIRE 99298-LUT core from one structure -- ~5x the whole
+> bitfield cascade (1136 LUT).** This is the largest single area item found so far.
+>
+> **Why 2W/6R is the principled target.** Sustained write bandwidth cannot exceed
+> 2/cycle because RENAME is 2-wide, and average int-write demand is well under that
+> (stores, branches and CMPs write no int register -- flags live in separate NZVC/X
+> files). Sustained issue is likewise <=2/cycle, and 2 uops x 3 sources = 6 reads.
+>
+> **What the port count does NOT capture, and what must be costed instead:**
+> * Writes: latency divergence means a load from T-3, a DIV from T-20 and an ALU op
+>   from T-1 all land together, so the INSTANTANEOUS rate exceeds 2 even though the
+>   average cannot. That burst is what the extra ports absorb today, and it is what the
+>   reservation scheme below must absorb instead.
+> * Reads: the 14 are per-EU DEDICATED (AluEu x2 x2, BranchEu 3, DivEu 3, LsEu 3, plus
+>   the committed-A7 readback). Cutting to 6 means SHARING them across EUs, which puts a
+>   select-time crossbar in the operand-read path -- the hottest path in the machine.
+>   The 3448 LUT freed is the budget available to pay for that crossbar; the question is
+>   the DELAY it adds, not whether the area works out.
+
+
 > ### ✅ MEASURED 2026-09-13 -- the prize, and where it actually sits
 >
 > Measured with the OOC PRF gate, int RF, reads held at the real core's 8, sweeping
