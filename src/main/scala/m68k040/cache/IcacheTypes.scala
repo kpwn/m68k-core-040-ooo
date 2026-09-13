@@ -62,6 +62,34 @@ case class ChunkPredecode() extends Bundle {
   // leaving only a plumbing/pairing invariant to prove (FedSpecsPacketPairingSpec). See
   // `docs/superpowers/specs/2026-08-08-fmax-leverb-precompute-size-design.md`.
   val size = m68k040.isa.Size()
+
+    // ── Straddle TOKEN (2026-09-13, 200 MHz campaign) ─────────────────────────
+    // See DESIGN_icache_straddle_token.md. When `ambiguousLine` is set, Aligner
+    // discards this whole entry (`p0 = Mux(preds(0).ambiguousLine, p0LiveReg,
+    // preds(0))`, Aligner.scala), so `simple` and `lenWords` are DEAD PAYLOAD in
+    // exactly that case. They are therefore reused, with no growth of the line
+    // array, to publish the refill-resolved length indirectly:
+    //
+    //   ambiguousLine=0 : `simple`/`lenWords` mean what they always meant.
+    //   ambiguousLine=1 : `simple`   -> hasToken  (a side-table entry exists)
+    //                     `lenWords` -> token idx (0..15)
+    //
+    // `size` is deliberately NOT reused: it is not ambiguity-qualified and Aligner
+    // reads `preds(0).size` directly in BOTH arms of that mux.
+    //
+    // Reading a token is ALWAYS optional -- the side entry carries an ownerKey that
+    // must match {way,set,word}, and any mismatch (recycled entry, evicted line)
+    // falls back to the live re-classify, i.e. exactly today's behaviour. There is
+    // no failure mode in which a stale token yields a WRONG length rather than no
+    // length; that asymmetry is the reason for the indirection.
+    def hasToken: Bool = ambiguousLine && simple
+    def tokenIdx: UInt = lenWords
+    /** Mark this word as "straddle, resolved -- see side-table entry `idx`". */
+    def setToken(idx: UInt): Unit = {
+      ambiguousLine := True
+      simple        := True
+      lenWords      := idx.resize(4)
+    }
 }
 
 object CacheMode extends SpinalEnum {
