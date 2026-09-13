@@ -73,13 +73,23 @@ spend IPC until that slope is known.
 
 ## 3. The bitfield cascade -- main line of work
 
-`DecOp.isAluSlow = SHIFT || BITFIELD`, a six-stage pipe, inside `AluEuPlugin` which is
-instantiated **TWICE** (eu0, eu1) -- so it is duplicated. `AluEuPlugin.scala:~599`:
+`DecOp.isAluSlow = SHIFT || BITFIELD`, inside `AluEuPlugin` which is instantiated
+**TWICE** (eu0, eu1) -- so it is duplicated.
 
-> "the shift is the lat-5 (S1,S1a,S1b,S2,S3) SLOW path (it passes through **S1b
-> unmodified, lat-matched to the now-deeper bit-field pipe**); the dynamic slowWakeup
-> (broadcast at S3) makes the extra cycles latency-agnostic (**no static scoreboard
-> constant** -- the IQ waits on the wakeup)"
+⚠️ The slow pipe is **SIX** stages: `S1, S1a, S1a2, S1b, S2, S3`. The comment at
+`AluEuPlugin.scala:598-599` saying "lat-5 (S1,S1a,S1b,S2,S3)" is **STALE** -- it
+predates task #123's S1a2 stage, and the class doc at :62 contradicts it. Fix it.
+
+**TWO of those stages are pure pass-throughs for shift, not one.** Verified by
+fan-out: `s1aStage1a` (:607) has exactly ONE reader, `s1a2Stage1a` (:761); and
+`s1bStage1` (:771) has exactly ONE reader, `s2Stage1` (:777). No datapath function
+reads either. S1a and S1b exist ONLY for bitfield. Shift therefore goes
+**lat-6 -> lat-4** -- two cycles off every shift.
+
+Stage map: SHIFT computes in S1 (`Shifter.stage1a`), S1a2 (`stage1b`), S2 (`stage2`),
+S3 (merge/writeback). BITFIELD computes in S1 (forward funnel + `bfCmd`), S1a
+(`Bitfield.stage1`), S1a2 (`Bitfield.stage2`), S1b (inverse funnel + store-form mux).
+`Bitfield.scala` (220 lines) has exactly ONE caller in the repo -- it moves wholesale.
 
 So bitfield sets the latency of the common case AND forced the dynamic wakeup. Moving
 it cascades:
@@ -99,8 +109,50 @@ it cascades:
    select cone** (15 of its 19 levels).
 
 Steps 1-3 = area. 4-6 = IPC + hot path. Each is independently checkable; do not bet the
-whole cascade up front. **Load-bearing assumption to verify first: that S1b really is a
-pure pass-through for shift.** If shift uses it, the cascade collapses to steps 1-3.
+whole cascade up front. The load-bearing assumption (S1a/S1b are pure pass-throughs for
+shift) is **VERIFIED** -- see the stage map above.
+
+### 3a. Extraction risks -- every one of these fails SILENTLY
+
+1. ⚠️ **`fastAcceptNextPort` (`AluEuPlugin.scala:237`) hardcodes `!s1bValid`** because
+   S1b is "one before S2". Delete S1b without RE-POINTING this to the new pre-S2 stage
+   and the IQ's select-time look-ahead lies by a cycle -> a fast S1 writeback collides
+   with a slow S3 writeback on the `wbKey`-merged port. The fast request has
+   `priority=1`, so it manifests as a **silently DROPPED SLOW RESULT**, not an error.
+   Highest-risk line in the change.
+2. ⚠️ **Do NOT delete the `rdC` third int read port.** Its comment (:131-133) claims
+   BITFIELD is the only `psrcC` user on this EU -- **STALE**. `CASOP` reads it
+   (`casC`, :416, fed by `Microcode.scala:821,852-853`). Deleting it silently corrupts
+   CAS/CAS2.
+3. ⚠️ **Narrowing `DecOp.isAluSlow` (`DecodedUop.scala:177`) to SHIFT-only** is correct,
+   but any BITFIELD uop still routed to `Cluster.INT` is then treated as a **fast lat-1
+   producer** by the static scoreboards -> silent RAW hazard. The cluster change has >=4
+   sites across TWO mirrored models (`Microcode.scala:2640` `resolve()` and `:3224`
+   `resolveHw()`, plus `MicroOpAssembler.scala:3503` and the register-form block at
+   `:1431-1464`). `MicrocodeResolveEquivalenceSpec` catches a one-armed edit; it cannot
+   catch a both-armed one.
+4. **A dedicated pipelined bitfield LANE in DivEu is mandatory, not optional.** Bit-field
+   memory RMW chains issue **3-4 BITFIELD uops back to back** (`Microcode.scala:711,
+   730-734`); DivEu's legacy lane gates on `!busy && !s1Valid` (:414-418) and would
+   serialize them behind each other and behind any DIV/CHK.
+5. **DivEu's `s0B` goes through a `useImm` mux** (`DivEuPlugin.scala:379`). Every
+   BITFIELD uop sets `useImm=True` AND needs the **raw** `rdB` (this is what
+   `srcBRegDespiteImm` exists for). DivEu already has one ad-hoc raw-rdB workaround for
+   the FP rows (:1083); bitfield needs the same, or BFINS reads the immediate as its
+   insert source.
+6. **Bit-field cracks contain non-BITFIELD uops that STAY on AluEu**: `UBfShiftOff` ->
+   SHIFT, `UBfAdd` -> ADD, `UBfResolve` -> BFRESOLVE (a fast lat-1 ALU op). So one
+   bit-field instruction becomes a CROSS-CLUSTER chain (ALU BFRESOLVE -> CPLX BITFIELD
+   -> ALU SHIFT/ADD), and the CPLX->ALU edges need `cplxWait`/`cplxNzvcWait` instead of
+   `aluSlowWait`.
+7. **BITFIELD's contract for DivEu**: writes INT (full 32 bits, NO .B/.W size merge) and
+   NZVC (N,Z only; V=0,C=0); **never writes X**; reads NO flags; needs up to THREE int
+   sources; raises NO faults (`AluEuService` has no fault port -- bit-field illegality is
+   resolved at decode). DivEu has 3 int reads and no X port, so the shape fits.
+
+Sim/whitebox is clean -- no test reaches into a bitfield signal. `AluFastSlowSpec` does
+exercise BITFIELD as a slow op and its cases need re-homing. Stale comments to fix while
+in there: `:598-599`, `:131-133`, `:811`, `:20-22`, `:58-66`.
 
 ---
 
