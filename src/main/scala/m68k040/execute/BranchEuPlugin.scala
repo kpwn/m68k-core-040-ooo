@@ -87,6 +87,11 @@ trait BranchEuService {
 
 /** Latency-1 branch EU. S0 reads NZVC; S1 evaluates the 68k condition, computes
   * target = pc+2+disp, taken, nextPc, mispredict (=taken; no predictor yet). */
+object BranchEuPlugin {
+  /** Sharing key for BranchEu's int write port; the ExceptionUnit's A7 write borrows it. */
+  val IntWbKey = "branchEuIntWb"
+}
+
 class BranchEuPlugin extends FiberPlugin with BranchEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[BranchCompletion] = null
@@ -128,7 +133,17 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     nzRd = host[NzvcRegFileService].newRead(forceNoBypass = false)
     tgtRd = host[IntRegFileService].newRead(forceNoBypass = false)
     anRd  = host[IntRegFileService].newRead(forceNoBypass = false)
-    anW   = host[IntRegFileService].newWrite(latency = 1)
+    // SHARED with the ExceptionUnit's A7 write (see FullCoreSynth's `a7Wr`). BranchEu
+    // is the right lender precisely because it is FIXED-LATENCY: `s1Valid` is a plain
+    // RegNext of `issuePort.valid` and `issuePort.ready` is unconditionally True, so
+    // this port is busy for exactly ONE cycle after a branch issues and never longer.
+    // That makes "the port is free" a STATIC bound rather than a dynamic busy signal --
+    // by the time the exception FSM reaches its A7 write it has been through E_DRAIN
+    // (store-queue drain) and the frame stores, many cycles after the last issue, and
+    // no new uop can issue meanwhile because the pipe is flushed and retire is blocked.
+    // Priority 1 = BranchEu wins a collision; a collision is a BUG, and RegFilePlugin
+    // asserts on it in simulation rather than silently dropping the loser.
+    anW   = host[IntRegFileService].newWrite(latency = 1, sharingKey = BranchEuPlugin.IntWbKey, priority = 1)
     anByp = host[IntRegFileService].newBypass()
     idxRd = host[IntRegFileService].newRead(forceNoBypass = false)
     fpccRd = host[FpccRegFileService].newRead(forceNoBypass = true)

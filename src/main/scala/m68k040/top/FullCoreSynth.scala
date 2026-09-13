@@ -59,7 +59,19 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     debugQuiescedOut = Bool()
     debugMaintDoneOut = Bool()
     debugMaintErrorOut = Bool()
-    a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+    // BORROWS BranchEu's int write port instead of owning a 6th physical port.
+    // Measured: the 6th port costs 900 LUT (vs ~500 for ports 3-5), for machinery idle
+    // outside exception entry / RTE. The ExceptionUnit already borrows rather than owns
+    // elsewhere -- E_DRAIN is literally "wait for the SQ to drain before grabbing the
+    // port", after which it drives the D-cache command ports directly.
+    // Exclusivity is STATIC, which is why BranchEu is the lender: it is lat-1 and never
+    // stalls, so it occupies the port for exactly one cycle after a branch issues. The
+    // A7 write happens far later in the FSM (past the store-queue drain and the frame
+    // stores) with the pipe flushed and retire blocked, so nothing can issue in between.
+    // Lower priority than BranchEu; RegFilePlugin asserts in simulation if both are ever
+    // valid together, so this is checked rather than argued.
+    a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(
+             latency = 1, sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
     xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
