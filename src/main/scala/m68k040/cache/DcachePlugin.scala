@@ -2267,6 +2267,46 @@ class DcachePlugin(val socketMerged: Boolean = false,
                          stAwDone && stWDone && evictAwDone && evictWDone
     dcIdleForMaint.simPublic()
 
+    /** REGISTERED export of the maintenance precondition (2026-09-13, 200 MHz cone).
+      *
+      * WHAT THIS BREAKS. `maintQuiesced` used to be exported as the raw combinational
+      * `dcIdleForMaint && !maintBusyReg`. Its sole consumer is the ExceptionUnit's
+      * drain states, whose verdict comes straight back here as `maintCmd.valid` and
+      * lands on this Area's `lastSet`/`walkSet`/`cmd` clock enables. That is a
+      * COMBINATIONAL ROUND TRIP -- DcachePlugin -> ExceptionUnit -> DcachePlugin -- in
+      * a single cycle, and the two plugins are placed far apart. It showed up as seven
+      * of the fifty worst violated paths in the 200 MHz build
+      * (`loadShadowValid` -> `maint_lastSet[1]/CE`, 11 logic levels but 84% ROUTE):
+      * the delay is the die crossing, twice, not the logic.
+      *
+      * WHY A STALE "IDLE" IS SAFE -- the argument, because a registered precondition
+      * is only sound if idle cannot un-assert under the consumer.
+      *
+      *  (1) Every consumer reads it from a DRAIN state (`E_DRAIN`, `R_DRAIN`,
+      *      `S_DRAIN`, each as `sqDrained && dcQuiesced`). In those states `excActive`
+      *      has already stopped the LS EU issuing anything new, so no fresh load,
+      *      store or refill can enter the datapath. The terms this conjoins are then
+      *      cleared by bounded, self-driving processes and never re-armed -- so within
+      *      a drain, `dcIdleForMaint` is MONOTONIC once true. A registered copy can
+      *      therefore only be LATE by one cycle; it can never report idle for a cycle
+      *      in which the datapath had restarted, because nothing can restart it.
+      *
+      *  (2) Independently of (1), the maintenance walk does not trust this signal
+      *      anyway: `WAIT` re-tests the LOCAL `dcIdleForMaint` before `READ` touches
+      *      the arrays or the AXI write channels. That self-check is deliberate (see
+      *      its comment) and is exactly what absorbs a command issued a cycle early.
+      *      So even if (1) were ever violated, the walk still cannot race a live
+      *      transaction -- it would merely sit one extra cycle in WAIT.
+      *
+      * COST: one extra cycle before an exception-time CPUSH/CINV starts, on a path
+      * that is already ROB-serialized and rare. The hot load/store path is untouched
+      * -- `loadCmdPort.ready`, `probeAdmitBase` and the store pipe all keep reading
+      * the combinational `dcIdleForMaint`/`loadShadowValid` exactly as before; only
+      * the cross-plugin EXPORT is registered.
+      */
+    val maintQuiescedReg = RegNext(dcIdleForMaint && !maintBusyReg) init False
+    maintQuiescedReg.simPublic()
+
     /** 2026-09-05 walker-stall observability (p141), read live over jtag_axi at
       * `DebugRegMap.OFF_STALL_DC`. Pure observation: no new state, no consumer
       * inside this plugin, nothing feeds back into the datapath.
@@ -3430,5 +3470,5 @@ class DcachePlugin(val socketMerged: Boolean = false,
   override def maintError = logic.maintErrorReg
   // Exported precondition (see DcacheService.maintQuiesced's contract): the whole
   // D-cache datapath is idle AND no walk is already running.
-  override def maintQuiesced = logic.dcIdleForMaint && !logic.maintBusyReg
+  override def maintQuiesced = logic.maintQuiescedReg
 }

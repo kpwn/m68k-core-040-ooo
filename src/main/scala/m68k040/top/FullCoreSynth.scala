@@ -295,7 +295,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
     lsEu.robHeadIn           := rob.logic.h0
     lsEu.robHeadValidIn      := rob.logic.count > 0
-    lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
+    // Shallow SUPERSET of `interruptPending || tracePendingFire` -- see the long
+    // rationale at `irqPreemptArmed`'s declaration in RobPlugin. Keeps the ROB's
+    // 64-entry head muxes out of the LS EU launch decision (the core's -1.834 ns
+    // worst path family) and breaks the Rob<->LsEu inhibited-load-busy ring.
+    lsEu.irqPreemptPendingIn := rob.logic.irqPreemptArmed
     // The I-side counterpart of `robHeadValidIn`/`p4LaunchOk` above: an instruction
     // fetch into a CACHE-INHIBITED (device) page may not be issued speculatively
     // either. See SpeculativeFetchGate for the predicate and why it is the right

@@ -565,16 +565,48 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // the EU will have no S3 collision next cycle.  The stored per-slot class keeps
     // this guarantee out of the post-MuxOH opcode cone and also lets the sibling port
     // take a skipped fast uop instead of creating a head-of-line bubble.
+    /** One-hot payload select WITHOUT SpinalHDL's encode-then-decode (2026-09-13, FMax).
+      *
+      * `MuxOH(oh, hots)` does not lower to a one-hot mux. SpinalHDL emits
+      * `OHToUInt(oh)` -- four index bits, each an OR tree over the 16 slot bits --
+      * and then a 16-way `case` on that index. That is ~4 LUT levels, and it sits in
+      * the TAIL of the select cone, i.e. directly on the arc the 200 MHz build reports
+      * as `lines_0_ways_0_sel_reg -> selPorts_1_rData_*` (19 logic levels).
+      *
+      * An explicit AND-OR reduce is ~2 levels: a LUT6 absorbs three (data, select)
+      * pairs, so 16 slots collapse in one level plus one OR, and the AND fuses into
+      * the first level rather than costing an encode and a decode. Same idiom the
+      * straddle tables and this file's own `events` already use.
+      *
+      * IDENTICAL WHERE IT MATTERS, and the one place it differs is unobservable.
+      * With exactly one bit set the two forms are equal by construction. With NO bit
+      * set `MuxOH` returned element 0 (`OHToUInt(0) == 0`) while this returns all
+      * zeroes -- but the payload is qualified by `selPorts(k).valid = oh.orR`, and the
+      * downstream `m2sPipe` data register only loads on `fire`, so a payload produced
+      * while `oh === 0` is never captured by anything.
+      *
+      * NOT a retime: no register moves, no cycle is added anywhere. The wakeup-select
+      * loop proper (ready -> cand -> OHMasking.first -> fire -> triggers) is untouched;
+      * this only shortens the combinational tail hanging off it.
+      */
+    def ohSelect(oh: Bits): IqHot = {
+      val r = IqHot()
+      r.assignFromBits(
+        hots.zip(oh.asBools).map { case (h, sel) => h.asBits.andMask(sel) }
+            .reduceBalancedTree(_ | _))
+      r
+    }
+
     selPorts(0).valid   := oh0.orR && !flushSignal
-    selPorts(0).payload := MuxOH(oh0, hots)
+    selPorts(0).payload := ohSelect(oh0)
     selPorts(1).valid   := oh1.orR && !flushSignal
-    selPorts(1).payload := MuxOH(oh1, hots)
+    selPorts(1).payload := ohSelect(oh1)
     selPorts(2).valid   := ohB.orR && !flushSignal
-    selPorts(2).payload := MuxOH(ohB, hots)
+    selPorts(2).payload := ohSelect(ohB)
     selPorts(3).valid   := ohL.orR && !flushSignal
-    selPorts(3).payload := MuxOH(ohL, hots)
+    selPorts(3).payload := ohSelect(ohL)
     selPorts(4).valid   := ohC.orR && !flushSignal
-    selPorts(4).payload := MuxOH(ohC, hots)
+    selPorts(4).payload := ohSelect(ohC)
 
     // Registered issue stage: drop the in-flight registered uop on a flush (it is
     // wrong-path), exactly as the slots are squashed. `flush` clears the pipe's

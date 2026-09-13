@@ -2575,6 +2575,70 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
                           !p0.isRte && !privViolation && !p0.sysOp &&
                           !preciseDrainBusyIn && !inhibitedLoadBusyIn
     tracePendingFire := tracePendingReg && traceNormalGate && !flushing && excIdle
+
+    // ── `irqPreemptArmed`: the SHALLOW export that replaces sending the whole head
+    //    cone to the LS EU (2026-09-13, FMax) ────────────────────────────────────
+    //
+    // WHAT IT REPLACES. `FullCoreSynth` used to wire
+    //     lsEu.irqPreemptPendingIn := interruptPending || tracePendingFire
+    // which drags TWO 64-entry async head muxes (`faultedStore(h0)` and the `p0`
+    // payload Mem read) plus `headReady` (itself reading `completes(h0)`), `excIdle`,
+    // `privViolation`, `preciseDrainBusyIn` and `inhibitedLoadBusyIn` across the die
+    // into the LS EU's launch decision, which then reaches the issue queue's slot
+    // clock enables. That is the core's WORST path family: -1.834 ns, 27 logic levels,
+    // 80.3% ROUTE, Rob -> LsEu -> IQ in a single cycle.
+    //
+    // It also closed a Rob <-> LsEu ring: `lsEu.inhibitedLoadBusySig` ->
+    // `inhibitedLoadBusyIn` -> `normalIrqGate` -> `interruptPending` -> back to
+    // `lsEu.irqPreemptPendingIn`, held open by exactly ONE flop (`loadBusyReg`).
+    // Dropping that term from the export breaks the ring structurally.
+    //
+    // DOMINATION (why over-approximating is safe). The consumer treats this as
+    // "an interrupt/trace may preempt, so do not LAUNCH an inhibited load now".
+    // Suppressing a launch is always safe; the requirement is only that we never
+    // suppress LESS than before:
+    //   interruptPending = (normalIrqGate || stopped) && ... && iplActive
+    //                    => iplActive && (p0.first || stopped)      [normalIrqGate
+    //                       conjoins p0.first; the stopped disjunct is carried]
+    //   tracePendingFire = tracePendingReg && traceNormalGate && ...
+    //                    => tracePendingReg && p0.first             [traceNormalGate
+    //                       is the same expression as normalIrqGate]
+    // Both are implied by the conjunction below. The sim assert makes this a CHECKED
+    // invariant on every existing test rather than an argument in a comment.
+    //
+    // PROGRESS (why `p0.first || stopped` is load-bearing, and the naive superset is
+    // WRONG). `iplActive || tracePendingReg` alone dominates too -- and LIVELOCKS.
+    // `MicroOpAssembler` emits ONE `firstOfInstr` uop per MOVEM (the snapshot) and
+    // marks every later move and the trailing An update NON-first, deliberately, so
+    // an interrupt is only taken at the MOVEM boundary. A MOVEM against CACHE-
+    // INHIBITED space therefore parks non-first inhibited LOAD uops at the ROB head --
+    // and the Q700 ROM does exactly that on device registers. With the naive superset:
+    // `iplActive` suppresses the element, so the macro never completes, so the head
+    // never reaches a `first` uop, so `normalIrqGate` never asserts, so the interrupt
+    // is never recognized and `iplActive` never clears. Requiring `p0.first` removes
+    // the deadlock: when the head is NON-first the gate is off and the parked element
+    // launches, advancing the macro to a boundary where recognition can happen.
+    //
+    // When the head IS `first`, every remaining term that could block recognition is
+    // self-clearing, so a bounded wait is all the over-approximation can cost:
+    // `faultedStore(h0)` -> faultRetire; `privViolation` -> exception; `isRte`/`sysOp`
+    // -> not a load, so no inhibited load is parked behind it; `preciseDrainBusyIn` /
+    // `inhibitedLoadBusyIn` -> bounded bus transactions; `!excIdle` / `flushing` ->
+    // transient; `coreHalted` -> nothing is meant to progress.
+    //
+    // HOT-PATH COST: none. `irqPreemptPendingIn` is consumed ONLY in the `p4Inhibited`
+    // arm of `LsEuPlugin`'s `p4LaunchOk`; an ordinary cacheable load takes the other
+    // arm and never reads it. Only device (MMIO) loads, which must already be at the
+    // ROB head and are inherently serialized, can be delayed -- and delaying one while
+    // an interrupt is pending is the very hazard this gate exists to prevent.
+    val irqPreemptArmed = (iplActive || tracePendingReg) && (p0.first || stopped)
+    irqPreemptArmed.simPublic()
+    GenerationFlags.simulation {
+      assert(!((interruptPending || tracePendingFire) && !irqPreemptArmed),
+        "RobPlugin: irqPreemptArmed must DOMINATE interruptPending|tracePendingFire -- " +
+        "the LS EU's inhibited-load launch gate would suppress LESS than before, " +
+        "re-opening the interrupt-replays-a-device-read hazard", FAILURE)
+    }
     when(tracePendingFire) { tracePendingReg := False }
 
     // Squash + serialize while the FSM runs (NOT on the trigger cycle, when the FSM

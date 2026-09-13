@@ -2960,7 +2960,40 @@ class ExceptionUnit(
   }
 
   // `active` high whenever the FSM is mid-sequence (not IDLE).
-  active := !fsm.isActive(fsm.IDLE)
+  //
+  // DRIVEN FROM `stateNext`, THROUGH A FLOP (2026-09-13, FMax). This is a pure STATE
+  // DECODE restaging, and it is cycle-identical by construction:
+  //     RegNext(f(stateNext))  ==  f(stateReg)
+  // because `stateReg` is precisely `RegNext(stateNext)`. Same cycle, same value, no
+  // protocol change, no cycle added. IDLE is the FSM's `EntryPoint`, so `stateReg`
+  // holds IDLE out of reset and `init False` reproduces the old reset value exactly.
+  //
+  // WHY. `active` was a LUT output -- a decode of the 6-bit exception state register --
+  // with FANOUT 113, reaching `RenameStage.pipeFlush`, `decodeUop.pipeFlush`, `feFlush`,
+  // `divEu.cplxFlush`, ~30 sites in `LsEuPlugin`, the IQ's `triggers` clock enables, and
+  // (via `pipeFlush` -> AluEu `fastFire` -> `ccrObs.valid`) the clock enables of the
+  // ROB's 64-entry `sysValStore`/`nzvcValStore`/`xValStore` arrays -- 192 flops. That is
+  // the measured `exc_fsm_stateReg -> RobPlugin sysValStore_61[14]/CE` cone:
+  // 0.647 ns of LOGIC against 4.990 ns of ROUTE (88.5% route). The delay is one LUT
+  // output crossing the die to 113 loads; it is not a logic-depth problem, so adding or
+  // removing logic cannot fix it.
+  //
+  // As a FLOP the placer can REPLICATE it per consumer region (and `-keep_equivalent_
+  // registers`/phys_opt replication both apply to registers, not to a LUT already
+  // placed with its loads spread). Every derived signal inherits this for free:
+  // `RobPlugin.excIdle := !exc.active` and `RobPlugin.excSquash := excActive`.
+  //
+  // NOT the transform that `4b00cccb` tried and `68c778b6` reverted. That staged a
+  // HANDSHAKE (`maintCmd.valid`), which moves an accept/backpressure window and
+  // regressed `DcacheSpec`. Staging a state decode moves nothing observable.
+  // NOTE ON THE DEFERRAL. `fsm.enumOf(state)` resolves EAGERLY against a map that is
+  // only populated when the state machine is built, so calling it here throws
+  // `key not found: toplevel/IDLE`. (`fsm.isActive` works at this point because it is
+  // itself deferred.) `fsm.postBuild` is SpinalHDL's own hook for exactly this: the
+  // register is declared now and its driver is assigned once the FSM exists.
+  val activeReg = Reg(Bool()) init False
+  fsm.postBuild { activeReg := (fsm.stateNext =/= fsm.enumOf(fsm.IDLE)) }
+  active := activeReg
 
   // ── W19: the maintenance-quiesce hold, exported to the D-cache port arbitration ──
   // High across `S_DRAIN` and `S_APPLY`, and consumed by `LsEuPlugin` to close TABLE
@@ -2992,8 +3025,17 @@ class ExceptionUnit(
   // descriptor reads; the maintenance walk depends on nothing the walker holds and
   // completes autonomously, so the dependency graph is `walker -> maintenance` and never
   // the reverse.
-  val quiesceHoldOut = fsm.isActive(fsm.S_DRAIN) || fsm.isActive(fsm.S_APPLY) ||
-                       fsm.isActive(fsm.S_MAINTWAIT)
+  // Same `RegNext(f(stateNext))` restaging as `active` above, and sound for the same
+  // reason: cycle-identical, so the walker-admission invariant this exists to enforce
+  // (and its assertion in `LsEuPlugin`, `!(quiesceHold && (ldGrantOk || stGrantOk))`)
+  // holds cycle-for-cycle exactly as before. None of these three states is the
+  // EntryPoint, so `init False` matches the old reset value.
+  val quiesceHoldOut = Reg(Bool()) init False
+  fsm.postBuild {
+    quiesceHoldOut := (fsm.stateNext === fsm.enumOf(fsm.S_DRAIN)) ||
+                      (fsm.stateNext === fsm.enumOf(fsm.S_APPLY)) ||
+                      (fsm.stateNext === fsm.enumOf(fsm.S_MAINTWAIT))
+  }
   quiesceHoldOut.simPublic()
 
   /** 2026-09-05 walker-stall observability (p141), read live over jtag_axi at
