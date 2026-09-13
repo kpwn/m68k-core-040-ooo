@@ -103,10 +103,14 @@ it cascades:
 3. Delete the bitfield datapath from `AluEuPlugin` -- removes **two** copies (funnel
    shifter, mask gen, BFFFO priority encoder). **This is where the area lands.**
 4. Drop S1b from the shift pipe: shift lat-5 -> **lat-4**, one cycle off a common op.
-5. Shift is then clean fixed-latency -> convert to a STATIC scoreboard trigger,
-   retiring `aluSlowWait` / `aluSlowWakeup`.
-6. Which lets `aluSlowSlots` / `aluFastAcceptNext` / `isAluSlow` leave the **hot IQ
-   select cone** (15 of its 19 levels).
+5. ~~Convert shift to a STATIC scoreboard trigger~~ -- **DOWNGRADED, see §3b. Do the
+   6-line EARLY BROADCAST instead; it gets the entire IPC win for free.**
+6. ~~Which lets `aluSlowSlots`/`aluFastAcceptNext`/`isAluSlow` leave the hot IQ select
+   cone~~ -- **WRONG, this was a non-sequitur. Those masks exist for a WRITE-PORT
+   STRUCTURAL HAZARD (fast-S1 and slow-S3 share one physical port via `wbKey`;
+   `fastAcceptNextPort` is the look-ahead keeping them exclusive), NOT for dependency
+   wakeup. At lat-4 the collision still exists, so they stay. Only §4a write-port
+   RESERVATION removes them.**
 
 Steps 1-3 = area. 4-6 = IPC + hot path. Each is independently checkable; do not bet the
 whole cascade up front. The load-bearing assumption (S1a/S1b are pure pass-throughs for
@@ -150,9 +154,95 @@ shift) is **VERIFIED** -- see the stage map above.
    sources; raises NO faults (`AluEuService` has no fault port -- bit-field illegality is
    resolved at decode). DivEu has 3 int reads and no X port, so the shape fits.
 
+**MEASURED SIZING -- the area win is modest, so do this for the right reasons.**
+Net ~**-1,510 LUT** and ~-480 FF: delete 2 copies from AluEu (est. -3,360 LUT, measured
+-1,568 FF), add 1 to DivEu (+1,680 LUT, +784 FF) plus lane overhead (~+170 LUT, +300 FF).
+⚠️ Scope note: that is against the CORE-ONLY OOC census (`synth/census_util.rpt`:
+103,740 LUTs = 47.82%, FFs 10.91%). The ~80% figure in §1 is the FULL SoC build
+(174,619 of 216,960) -- the SoC number is the one that governs placement pressure. **FF
+savings do not relieve the binding resource; LUTs do.** The strongest argument is
+second-order: removing ~3,670 FF of 918-bit `IqContext` fanout from two EUs cuts routing
+and control-set pressure (1,391 unique control sets) on a design that keeps losing on
+placement rather than logic depth. The contingent second prize is deleting the two
+lat-match-only stages (~7,236 FF across both instances, 15% of ALL design flops) -- but
+that is load-bearing in the `wbKey` proof and in `fastAcceptNextPort`, so gate it
+separately.
+
+⚠️ **TOP IPC RISK, and it is unmodelled: single CPLX issue port head-of-line blocking.**
+`ohC` selects exactly ONE CPLX slot per cycle. Today BITFIELD can go to EITHER ALU port.
+Worse, memory-RMW chains emit **three consecutive `UBfMem` uops** which would all contend
+for that one port alongside the entire FP family, MUL, DIV and CHK -- delaying every FP
+and MUL uop behind them. Measure before committing.
+
+**DivEu integration, settled:** copy the **MUL lane** (pruned context descriptor +
+credit-reserved `StreamFifo` + credit-counter accept gate), NOT the FP-fixed lane, whose
+unconditional accept is only sound because it owns its completion register outright.
+`intW` needs NO structural change: DivEu does not arbitrate at the write port, it
+arbitrates one stage earlier into a shared completion register with HOLDING sources
+(`:1537-1566`), so a bitfield lane is a **fourth arm** reusing `captureArb`. Everything
+downstream (`intW`, `intByp`, `nzvcW`, `nzvcByp`, `completionPort`, wakeups, `wbObs`,
+`ccrObs`) then comes free. No new IQ wait bit, no new ROB completion port, no new
+`ccrCompletion` port, no new regfile port. Do NOT use `sharingKey` here -- that is the
+silent priority-fold, and DivEu cannot construct the mutual-exclusion proof AluEu has.
+
+⚠️ `s0B = Mux(u0.useImm, u0.imm, rdB.data)` -- every BITFIELD row sets `useImm=True` AND
+needs the raw register (that is what `srcBRegDespiteImm` exists for). Capture raw
+`rdB.data`, or BFINS silently inserts the immediate. Precedent: `fpS1IntB := rdB.data`.
+⚠️ DivEu does NOT gate `psrcAValid` (bare `val s0A = rdA.data`); AluEu does, and its
+comment records a real ISA gap on the bit-field dynamic-offset path. Audit every
+`UBfMem`/`UBfReg` row for a possibly-invalid srcA.
+⚠️ DivEu already carries THREE FMax post-mortems; adding 7 barrel rotates and a 32-input
+CLZ risks placement congestion. OOC A/B before committing -- and elaboration order alone
+has moved post-route FMax 12.7-17.8 MHz here, so one measurement is not a gate.
+
 Sim/whitebox is clean -- no test reaches into a bitfield signal. `AluFastSlowSpec` does
 exercise BITFIELD as a slow op and its cases need re-homing. Stale comments to fix while
 in there: `:598-599`, `:131-133`, `:811`, `:20-22`, `:58-66`.
+
+---
+
+## 3b. Slow-ALU wakeup: do the EARLY BROADCAST, not the static conversion
+
+**The rule this machine obeys** is "wake the consumer exactly 2 cycles before the
+producer's bypass cycle" -- which is why the FAST path's static `events` trigger clears
+at SELECT time, not at writeback. The slow path broadcast at S3, i.e. AT its bypass
+cycle, so a dependent became ready a cycle later and read a cycle after that: **2 cycles
+late on every shift->dependent edge.**
+
+**The fix is ~6 lines in `AluEuPlugin`,** moving the broadcast from S3 to S1b
+(`slowWakeupPort.valid := s1bValid && !flushPort`, payload from `s1bCtx.uop`). Wake at
+S3-2 -> ready at S3-1 -> select at S3-1 -> the consumer's S0 read lands exactly on S3,
+the cycle `intByps`/`nzvcByps`/`xByps` forward. **This captures 100% of the IPC a fully
+static conversion would deliver.** The gain is ANTICIPATION, not staticness.
+
+Sound because the slow pipe CANNOT STALL, making S1b a reliable 2-cycle predictor of S3:
+`issuePort.ready` is unconditional for a slow uop, the valid chain is plain `RegNext`
+with no back-pressure, and the S3 write port is reserved ahead by `fastAcceptNextPort`.
+Those three are the invariant; if any stops holding this becomes a SILENT stale read
+(there is no replay path). Flush-safe because `doFlush` is retire-gated, so a flush kills
+producer and early-woken consumer together -- a mid-pipeline flush source would break
+that. After the bitfield extraction, re-point the broadcast to the new 2-before-S3 stage.
+
+**Why the STATIC conversion is NOT worth doing after this:**
+- **IPC delta becomes ZERO.** It buys only area: ~98 FF of `aluSlow*` bitmaps + wait bit,
+  several hundred LUTs of the per-slot wakeup CAM (`IssueQueuePlugin.scala:1136-1164`,
+  which is OFF the critical path), and 2 EU ports.
+- ⛔ **The compaction shift DISCARDS trigger bits 0/1** (`:951`). That is sound today only
+  because `push.ready` guarantees line 0 is empty at every compaction. A DELAYED event
+  references an already-freed slot and violates exactly that premise -- on the most
+  common firing site (`OHMasking.first` picks the LOWEST index, so producers fire from
+  line 0/1), within one cycle of the fire. Result: silent stale read.
+- Repairing it needs **2d guard bits per slot** below index 0 across all 16 slots (+96 FF
+  after extraction, +160 before -- so never attempt it before §3) plus a guard-extended
+  `physToSlot` across five scoreboards. The wider trigger zero-compare lands in the
+  `ready` cone INCLUDING slot 0, whose test is currently a free literal `True` and sits
+  at the head of both `OHMasking.first` priority chains. **Net effect on the 19-level
+  path is plausibly NEGATIVE.**
+- `!aluSlowWait` is one input of a 9-input AND; dropping to 8 removes no LUT level.
+
+⚠️ It would also force slow producers into `sbInt`/`sbNzvc`/`sbX`, whose retimed C+1
+busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
+`IssueQueuePlugin.scala:1278-1310` documents as the design's measured WNS holder.
 
 ---
 
