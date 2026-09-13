@@ -2398,30 +2398,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // (set, way) pairs to do nothing.
       def touchesDc(c: CacheMaintCmd): Bool = (c.sel === U(1, 2 bits)) || (c.sel === U(3, 2 bits))
 
-      // ── FMax retime (200 MHz campaign): stage the cross-module maintenance command ──
-      // `maintCmdPort` is driven by ExceptionUnit (retire-time CPUSH/CINV), so keying the
-      // walk's capture registers directly off `maintCmdPort.valid` placed a CROSS-MODULE
-      // combinational cone on the clock-enables of `cmd`/`walkSet`/`lastSet`/`curWay`.
-      // Measured post-route at 200 MHz that is loadShadowValid -> maint_lastSet[*]/CE,
-      // -0.678 ns, 11 logic levels and 84% ROUTE -- a distribution problem, not depth.
-      //
-      // Latching the pulse LOCALLY first means those enables come from a flop a few slices
-      // away instead of from the exception unit. Cost: ONE cycle before a CPUSH/CINV walk
-      // starts -- already multi-cycle, and only at retire of a maintenance instruction.
-      // The hot load/store path does not touch this logic at all.
-      //
-      // Safe against the Flow contract (ExceptionUnit's `maintCmdOut` is DELIBERATELY a
-      // single-cycle pulse so a held command cannot re-trigger the walk): the pulse is
-      // captured unconditionally so it can never be missed, and `maintReqReg` self-clears
-      // on consumption so it cannot re-fire. The caller waits on the walk's DONE pulse,
-      // not a fixed latency, so starting a cycle later simply makes that wait longer.
-      val maintReqReg = RegInit(False)
-      val maintPayReg = Reg(CacheMaintCmd())
-      when(maintCmdPort.valid) {
-        maintReqReg := True
-        maintPayReg := maintCmdPort.payload
-      }
-
       val sm = new StateMachine {
         val IDLE  = new State with EntryPoint
         val WAIT  = new State   // command latched; hold until the D-cache is quiesced
@@ -2432,9 +2408,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
         IDLE.whenIsActive {
           maintBusyReg := False
-          when(maintReqReg) {
-            maintReqReg := False          // consume once; cannot re-trigger the walk
-            val p      = maintPayReg
+          when(maintCmdPort.valid) {
+            val p      = maintCmdPort.payload
             val tgtSet = p.addr(offBits + setBits - 1 downto offBits)
             val isLine = p.scope === U(1, 2 bits)
             cmd     := p
