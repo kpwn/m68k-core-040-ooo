@@ -96,6 +96,11 @@ spend IPC until that slope is known.
    *Written, uncommitted, untested.*
 2. **`op` out of `IqHot`.** 6 bits x 16 slots of compaction shift network x 5 select
    muxes, with NO functional reader (`simPublic` only). 3 tests reference it.
+   *Still open.* ⚠️ The bit-field merge made this HARDER to lose by accident and easier
+   to finish: the resolution deliberately kept `isAluSlowProducer`/`srcBIsReg` reading
+   the precomputed `isAluSlow`/`srcBRegDespiteImm` flops rather than re-deriving them
+   from `u.op` in the select cone (the merged-in branch had re-introduced `u.op === ...`
+   there). Keep every new IQ predicate precomputed on the PUSH path or this item dies.
 3. **`DebugCtrlPlugin` out of performance builds.** 5,232 cells. NOTE: VIO and ADB
    injection are SoC-side (`SLOT_ADBINJ`, JTAG-AXI) and are NOT affected -- keep both.
    This blinds `halt-status`/exc-ring, so it is a measurement-build knob only.
@@ -103,6 +108,33 @@ spend IPC until that slope is known.
 ---
 
 ## 3. The bitfield cascade -- main line of work
+
+> ### ✅ DONE 2026-09-13 -- steps 1-5 landed, MEASURED. Do not re-plan this section.
+>
+> Merged as `e35fc65e` (agent commits `1b3f5b9a` + `6924f4e1`, resolved onto master).
+> OOC area, BASE vs HEAD through the same flow:
+>
+> | | LUT | FF | CARRY | MUXF | RAM |
+> |---|---|---|---|---|---|
+> | BASE | 100434 | 39765 | 1036 | 4928 | 15804 |
+> | HEAD | 99298 | 38481 | 1024 | 4678 | 15854 |
+> | **delta** | **-1136 (-1.1%)** | **-1284 (-3.2%)** | -12 | -250 | +50 |
+>
+> **Area and IPC moved the SAME direction** -- the duplicated bit-field cone left both
+> ALU EUs *and* shift went lat-6 -> lat-4. That is the campaign's thesis holding on a
+> real measurement, not an argument.
+>
+> Step 5 (early broadcast) is `92e8f69a`. ⚠️ Its anchor stage MOVED as a consequence of
+> step 4: the rule is "broadcast two stages before S3", which was S1b in the six-stage
+> pipe and is **S1a** in the four-stage one. The anchor tracks pipe DEPTH, not a stage
+> NAME, and getting it wrong is a silent stale read. Re-check it on any future change to
+> the slow depth.
+>
+> Step 6 stays refuted (write-port structural hazard, not wakeup) -- only §4a removes it.
+>
+> **Still unvalidated:** the merge resolution has not been compiled or tested (a Vivado
+> build held the memory budget). Run the EU/IQ suites before trusting it.
+
 
 `DecOp.isAluSlow = SHIFT || BITFIELD`, inside `AluEuPlugin` which is instantiated
 **TWICE** (eu0, eu1) -- so it is duplicated.
