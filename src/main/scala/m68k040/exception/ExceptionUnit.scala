@@ -2673,11 +2673,27 @@ class ExceptionUnit(
     val fsCurVpn   = fsCurVa(31 downto 12)
     val fsNeedXlate = !fsVpnValid || (fsCurVpn =/= fsLastVpn)
 
+    // FMax (200 MHz campaign): registered copies feeding the DTLB request. Free-running,
+    // so once a request state has been active for one cycle the registered copy is
+    // identical to the live value (see the F_XREQ note below).
+    val fsCurVpnReg   = RegNext(fsCurVpn)   init U(0, 20 bits)
+    val fsRdCurVpnReg = RegNext(fsRdCurVpn) init U(0, 20 bits)
+
+    // ── FMax retime (200 MHz campaign) ───────────────────────────────────────
+    // `fsCurVpn` = `fsFrameBase + (fsStep << 1)` through a further add/mux (two
+    // 32-bit carry chains), then leaves this module for the DTLB compare. Measured
+    // post-route at 200 MHz: Rob exc_fsFrameBase -> Dtlb missReqReg_write/CE,
+    // -0.678 ns, 16 levels, 67% ROUTE. Driving the request from a FLOP ends it here.
+    // `fsFrameBase`/`fsStep`/`fsSplitLow` cannot change while this state is active
+    // (it holds until `dxReqReady`), so from the second cycle the registered copy
+    // EQUALS the live one. Costs ONE cycle per frame-word TRANSLATE -- only when the
+    // frame crosses a page during exception stacking. No hot path touches this.
+    val fsXreqArmed = RegNext(isActive(F_XREQ)) init False
     F_XREQ.whenIsActive {
-      dxReqValid := True
-      dxReqVpn   := fsCurVpn
+      dxReqValid := fsXreqArmed
+      dxReqVpn   := fsCurVpnReg
       dxReqWrite := True                       // the frame push is a STORE
-      when(dxReqReady) { dxPendVpn := fsCurVpn; goto(F_XWAIT) }
+      when(fsXreqArmed && dxReqReady) { dxPendVpn := fsCurVpnReg; goto(F_XWAIT) }
     }
     F_XWAIT.whenIsActive {
       when(dxRspMine) {
@@ -2763,13 +2779,15 @@ class ExceptionUnit(
     // frame's size, because a non-null frame's BODY is deliberately never applied (see
     // F_HDRWAIT) -- so the translate-on-VPN-change machinery degenerates to
     // "translate once, use once" here and is deliberately NOT built as a loop.
+    // Same retime as F_XREQ above (the frame-READ side of the identical cone).
+    val fsRxreqArmed = RegNext(isActive(F_RXREQ)) init False
     F_RXREQ.whenIsActive {
-      dxReqValid := True
+      dxReqValid := fsRxreqArmed
       // p167: the split-aware VPN, so the low byte of a header word that straddles a
       // page boundary ($FFF) genuinely re-translates before it is read.
-      dxReqVpn   := fsRdCurVpn
+      dxReqVpn   := fsRdCurVpnReg
       dxReqWrite := False                      // the header access is a LOAD
-      when(dxReqReady) { dxPendVpn := fsRdCurVpn; goto(F_RXWAIT) }
+      when(fsRxreqArmed && dxReqReady) { dxPendVpn := fsRdCurVpnReg; goto(F_RXWAIT) }
     }
     F_RXWAIT.whenIsActive {
       when(dxRspMine) {
