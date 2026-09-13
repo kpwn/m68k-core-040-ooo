@@ -78,10 +78,16 @@ class PrfSynthProbePlugin extends FiberPlugin {
     }.getOrElse(dflt)
   val nIntWrites = envInt("PRF_PROBE_INT_WRITES", 2)
   val nIntReads  = envInt("PRF_PROBE_INT_READS", 2)
+  // BYPASS SOURCES are the third dimension, and the least examined one: every
+  // bypass source costs an address COMPARATOR ON EVERY READ PORT, so its cost
+  // scales as sources x reads -- the real core has ~6 sources against 14 reads.
+  // Flattening the mux (92e8f69a) fixed the mux DEPTH; it did not reduce the
+  // comparator COUNT. PRF_PROBE_INT_BYPASSES=n sweeps it.
+  val nIntByps   = envInt("PRF_PROBE_INT_BYPASSES", 1)
 
   var iReads: Seq[RegFileReadPort] = null
   var iWrites: Seq[RegFileWritePort] = null
-  var iB0: RegFileBypassPort = null
+  var iByps: Seq[RegFileBypassPort] = null
   var nR: RegFileReadPort = null
   var nW: RegFileWritePort = null
   var xW: RegFileWritePort = null
@@ -97,7 +103,7 @@ class PrfSynthProbePlugin extends FiberPlugin {
       if (i == 0) irf.newWrite(latency = 1, sharingKey = k, priority = 1)
       else        irf.newWrite(latency = 1)
     }
-    iB0 = irf.newBypass()
+    iByps = Seq.fill(nIntByps)(irf.newBypass())
     val nz = host[NzvcRegFileService]
     nR = nz.newRead(); nW = nz.newWrite(latency = 1)
     val xrf = host[XRegFileService]
@@ -116,7 +122,11 @@ class PrfSynthProbePlugin extends FiberPlugin {
       w.address := RegNext(in UInt (w.address.getWidth bits))
       w.data    := RegNext(in Bits (w.data.getWidth bits))
     }
-    iB0.valid := RegNext(in Bool ()) init False; iB0.address := RegNext(in UInt (iB0.address.getWidth bits)); iB0.data := RegNext(in Bits (iB0.data.getWidth bits))
+    for (b <- iByps) {
+      b.valid   := RegNext(in Bool ()) init False
+      b.address := RegNext(in UInt (b.address.getWidth bits))
+      b.data    := RegNext(in Bits (b.data.getWidth bits))
+    }
     // nzvc
     nR.addr := RegNext(in UInt (nR.addr.getWidth bits))
     val nRData = out(RegNext(nR.data))
