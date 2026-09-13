@@ -424,4 +424,55 @@ class AxiDMergeSpec extends AnyFunSuite {
     assert(AxiDMerge.V1_TIMEOUT_CYCLES != BigInt(1) << 28,
       "2^28 is the SUPERSEDED 2026-08-02 derivation, not the value")
   }
+  /** D20b: the grant LEAK that actually halted the board on 2026-09-13.
+    *
+    * `busy` latches when arbitration PICKS an owner (deliberate -- D20's watchdog is
+    * gated on `busy`, so latching on `ar.fire` instead would make it structurally
+    * unable to fire on the absent-wide-side case). But it is cleared ONLY by
+    * transaction COMPLETION, and this module has no flush/abort input. So an owner
+    * that wins arbitration and is then SQUASHED -- a core flush after an exception,
+    * before its AR is ever accepted -- used to leave `busy` set forever with no
+    * transaction behind it, and the watchdog then halted a completely IDLE machine
+    * with ARBITER_WEDGE.
+    *
+    * Hardware evidence: every client idle, both walkers IDLE, storeOutstanding = 0,
+    * store queue drained, exception FSM IDLE -- and the arbiter halted the core.
+    */
+  test("D20b: a grant whose owner withdraws before AR issues is released, not wedged") {
+    M68kSim().compile(new MergeDut(timeout = 40)).doSim("grant-withdraw", seed = 7) { dut =>
+      dut.clockDomain.forkStimulus(10)
+      idleAll(dut)
+      // Wide side never accepts the address -- same stalled fabric as the D20 test.
+      dut.io.out.ar.ready #= false; dut.io.out.aw.ready #= false
+      dut.io.out.w.ready  #= false; dut.io.out.r.valid  #= false
+      dut.io.out.b.valid  #= false
+      dut.clockDomain.waitSampling(4)
+
+      // Win the grant...
+      dut.io.dc.ar.payload.addr #= 0x8000
+      dut.io.dc.ar.payload.id   #= AxiIds.dRefill(0)
+      dut.io.dc.ar.valid #= true
+      dut.clockDomain.waitSampling(3)
+      // ...then WITHDRAW before the AR was ever accepted (the squash).
+      dut.io.dc.ar.valid #= false
+
+      // Well past the bounded-grant window: the arbiter must NOT wedge, because there
+      // is no transaction outstanding to wait for.
+      for (_ <- 0 until 200) {
+        dut.clockDomain.waitSampling()
+        assert(!dut.io.wedge.toBoolean,
+          "grant leaked: the arbiter wedged on a withdrawn request with nothing outstanding")
+      }
+
+      // And the port must be USABLE again -- a different owner can now be served.
+      dut.io.out.ar.ready #= true
+      dut.io.dtlb.ar.payload.addr #= 0x9000
+      dut.io.dtlb.ar.payload.id   #= AxiIds.WALK_READ
+      dut.io.dtlb.ar.valid #= true
+      var g = 0
+      while (!dut.io.out.ar.valid.toBoolean && g < 50) { dut.clockDomain.waitSampling(); g += 1 }
+      assert(g < 50, "the port never recovered: a later owner could not win the freed grant")
+    }
+  }
+
 }
