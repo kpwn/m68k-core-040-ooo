@@ -360,6 +360,45 @@ busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
 
 ## 4a. Two PRF write ports via WRITE-PORT RESERVATION (the design that makes it work)
 
+> ### ⭐ DO THIS FIRST: kill the exception unit's TWO private PRF ports by BORROWING
+>
+> `excA7` owns a private write port (`a7Wr`) and a private read port (`a7Rd`). Measured,
+> that is ~900 LUT (it is the SIXTH write port, the worst marginal one) + ~431 LUT for
+> the read = **~1330 LUT, comparable to the entire bitfield cascade**, for machinery that
+> is idle except during exception entry / RTE.
+>
+> **The precedent is in the same FSM.** ExceptionUnit does NOT own a private memory path:
+> it has `E_DRAIN` ("wait for the SQ to drain before **grabbing the port**") and then
+> drives the D-cache load/store command ports directly for frame stores and vector
+> fetches. It already borrows the LS machinery under a drain. The PRF port is simply the
+> one resource it never got around to sharing.
+>
+> **Why borrowing is sound here specifically.** The FSM is SERIALIZING: it owns the ROB
+> head with retire0/1 blocked for the whole sequence, so there is no rename allocation,
+> no freelist interaction and no RAT remap (this is the argument `a7Wr`'s existing direct
+> write already relies on). Under that window an EU's write port is a free resource, the
+> same way the D-cache command ports are.
+>
+> **Design:** mux the exception's A7 write onto an existing EU's int write port (AluEu or
+> LsEu), selected only while the FSM owns the ROB head. No reservation table needed --
+> this is the ONE provably-exclusive pair that §4a otherwise requires the whole scheme to
+> get at.
+>
+> ⚠️ **The gap to close before implementing:** `E_DRAIN` waits for the STORE QUEUE to
+> drain, which is not the same as the EU being idle -- a long-latency result (a DIV
+> issued much earlier) could still land in that window. So either extend the drain
+> condition to cover the borrowed EU, or pick the EU whose idleness is already implied.
+> `54f0c492` makes this checkable rather than arguable: two writers sharing one physical
+> port that go valid in the same cycle now FAIL in simulation instead of silently
+> dropping the loser.
+>
+> **The read port is a second, separate step.** `a7Rd` is read EVERY CYCLE only to keep
+> `ss.usp/isp/msp` in sync with the committed A7; the FSM itself needs it just at capture
+> time (`R_DRAIN` waits for "the live-A7 readback to settle"). Relax the every-cycle sync
+> -- snoop writes to `committedPhysA7`, or read on demand inside the drain window using a
+> borrowed EU read port -- and the port goes too.
+
+
 > ### ⭐⭐ THE PRIZE IS THE WHOLE PORT SHAPE, NOT JUST THE WRITES (measured 2026-09-13)
 >
 > The int PRF as built is **14 reads x 6 writes = 6471 LUT / 3940 LUTRAM**. Measured
