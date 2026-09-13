@@ -823,15 +823,45 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     xByps.valid    := xWs.valid;    xByps.address    := xWs.address;    xByps.data    := xWs.data
 
     // ---- SLOW dynamic-completion wakeup (mirror LsEu/DivEu): broadcast the shift's
-    // int + NZVC + X dsts the cycle the result lands in the PRF (S3). The IQ holds a
-    // dependent of the shift (int OR flag source) until this fires (aluSlowWait). ----
-    slowWakeupPort.valid            := slowFire
-    slowWakeupPort.payload.pdst     := u3.pdst
-    slowWakeupPort.payload.pdstValid:= u3.pdstValid
-    slowWakeupPort.payload.pNzvcDst := u3.pNzvcDst
-    slowWakeupPort.payload.nzvcValid:= u3.writesNzvc
-    slowWakeupPort.payload.pXDst    := u3.pXDst
-    slowWakeupPort.payload.xValid   := u3.writesX
+    // int + NZVC + X dsts. The IQ holds a dependent of the shift (int OR flag source)
+    // until this fires (aluSlowWait). ----
+    //
+    // BROADCAST TWO STAGES EARLY, from S1b rather than S3 (2026-09-13, IPC).
+    //
+    // The rule this machine obeys is "wake the consumer exactly 2 cycles before the
+    // producer's bypass cycle" -- which is why the FAST path's static `events` trigger
+    // clears at SELECT time, not at writeback. The slow path was broadcasting at S3,
+    // i.e. AT the bypass cycle, so a dependent became ready one cycle later and read one
+    // cycle after that: TWO CYCLES LATE on every shift -> dependent edge.
+    //
+    // Broadcasting from S1b restores the 2-cycle lead: wake at S3-2 -> consumer ready at
+    // S3-1 -> consumer selects at S3-1 -> consumer's S0 read lands exactly on S3, which
+    // is the cycle `intByps`/`nzvcByps`/`xByps` forward the result. Not early, not late.
+    //
+    // SOUND because the slow pipe CANNOT STALL, so S1b is a reliable 2-cycle predictor
+    // of S3: `issuePort.ready` (above) is unconditional for a slow uop, the valid chain
+    // s1a/s1a2/s1b/s2/s3 is plain `RegNext` with no back-pressure, and the S3 writeback
+    // port is reserved ahead by `fastAcceptNextPort`. If any of those three ever stops
+    // holding, this becomes a SILENT stale read -- there is no replay path -- so treat
+    // them as the invariant this line depends on.
+    //
+    // FLUSH-SAFE because `doFlush` is retire-gated (commit-time redirect): a flush kills
+    // the producer and any consumer woken early TOGETHER, since the consumer is strictly
+    // younger. A mid-pipeline (non-commit) flush source would break that and must not be
+    // added without revisiting this.
+    //
+    // This captures the whole IPC benefit a fully STATIC scoreboard conversion would
+    // deliver (the gain is anticipation, not staticness) at ~zero area and no change to
+    // the issue queue. See docs/PLAN_fmax_area_ipc_campaign.md.
+    val slowWakeEarly = s1bValid && !flushPort
+    val uWake         = s1bCtx.uop
+    slowWakeupPort.valid            := slowWakeEarly
+    slowWakeupPort.payload.pdst     := uWake.pdst
+    slowWakeupPort.payload.pdstValid:= uWake.pdstValid
+    slowWakeupPort.payload.pNzvcDst := uWake.pNzvcDst
+    slowWakeupPort.payload.nzvcValid:= uWake.writesNzvc
+    slowWakeupPort.payload.pXDst    := uWake.pXDst
+    slowWakeupPort.payload.xValid   := uWake.writesX
 
     // ---- completion: fast (S1) OR slow (S3) — single port, never both same cycle
     // (the S3 reservation guarantees S1-fast and S3-slow never coincide). ----

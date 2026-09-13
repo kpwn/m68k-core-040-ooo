@@ -152,14 +152,37 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
       v
     }
 
+    // ── Read path: hit-vector + BALANCED masked-OR, not a linear priority fold ───────
+    //
+    // The previous form was `bypasses.foldLeft(rfData)(Mux(hit, b.data, acc))`: a LINEAR
+    // chain, so N bypass sources cost N mux levels on the REGISTER-READ path, which is
+    // hot. The int file has 6 sources, so 6 levels of pure serial mux.
+    //
+    // The priority that fold implements is not needed. This file's own precondition (see
+    // the merge note above) is that every in-flight writer owns a DISTINCT physical
+    // register -- rename's unique-pdst allocation guarantees it, and the multi-write
+    // lowering already depends on it. So AT MOST ONE source can match a given read
+    // address, which makes a masked OR-reduce exactly equivalent -- and balanced, so the
+    // depth is one compare + log2(N) + a final mux instead of N.
+    //
+    // The sim assert turns that precondition into a CHECKED invariant rather than a
+    // comment: if two sources ever matched one address the OR would silently merge two
+    // values into garbage -- the same silent-corruption class the multi-write lowering
+    // warns about, which is exactly why it is worth asserting rather than assuming.
     for ((r, noByp) <- reads) {
       val rfData = ram.readAsync(r.addr)
       if (noByp || bypasses.isEmpty) {
         r.data := rfData
       } else {
-        // a bypass hit on the read address overrides RF data
-        r.data := bypasses.foldLeft(rfData) { case (acc, b) =>
-          Mux(b.valid && b.address === r.addr, b.data, acc)
+        val hits    = bypasses.map(b => b.valid && b.address === r.addr)
+        val anyHit  = hits.reduceBalancedTree(_ || _)
+        val bypData = bypasses.zip(hits).map { case (b, h) => b.data.andMask(h) }.reduceBalancedTree(_ | _)
+        r.data := Mux(anyHit, bypData, rfData)
+        GenerationFlags.simulation {
+          assert(CountOne(hits) <= 1,
+            s"RegFile ${spec.name}: two bypass sources matched ONE read address -- the " +
+            "distinct-physical-register precondition is broken and the OR-reduce would " +
+            "merge two values into garbage", FAILURE)
         }
       }
     }
