@@ -450,10 +450,27 @@ should be decided separately from the write-port work.
   form adds `&& (p0.first || stopped)`.
 - **PRF depth 50 -> 32.** Would cut in-flight renames ~34 -> ~16 against a 64-entry ROB.
   Severe throttle for a modest area win.
-- **Clustered / unit-local register files** (Alpha-21264 style). Wrong axis: it reduces
+- ~~**Clustered / unit-local register files** (Alpha-21264 style). Wrong axis: it reduces
   READ ports per copy, and reads are already the cheap dimension (exactly linear below
   the measured 12-read LUTRAM inference cliff; replication is area-NEUTRAL). Write ports
-  are what cost -- under LVT each is a FULL copy.
+  are what cost -- under LVT each is a FULL copy.~~
+  **⛔ RETRACTED 2026-09-13 -- the premise was FALSE and this is NOT a dead end.**
+  Measured on the OOC PRF gate, int RF, sweeping reads 2..14 with writes pinned at 6:
+
+  | reads | 2 | 4 | 6 | 8 | 10 | 12 | 14 |
+  |---|---|---|---|---|---|---|---|
+  | LUT | 1162 | 2024 | 2885 | 3885 | 4747 | 5609 | 6471 |
+
+  **431 LUT per read port, dead linear, and NO cliff at 12** -- the sweep runs to 14
+  and never bends. A read port costs ~86% of a write port (~500 LUT), so reads are NOT
+  "the cheap dimension"; they are the same dimension. And the core has **14 reads
+  against 6 writes**, so reads are the LARGER share of PRF area.
+
+  Read-port count is therefore worth as much as write-port count, and unit-local /
+  clustered register files go back on the table. The real objection to them was never
+  area -- it is that cutting the total read count means sharing ports across EUs, which
+  puts a select-time CROSSBAR in the operand-read path, the hottest path in the machine.
+  That is the thing to cost, not the port count.
 - **Name-pattern floorplanning** -- blocked by LUT-level fusion (§1).
 
 ---
