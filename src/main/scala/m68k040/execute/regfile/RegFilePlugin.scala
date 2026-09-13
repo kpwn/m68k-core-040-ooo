@@ -63,12 +63,51 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     // permute `byKey.values.toSeq` on the line below — nothing else in the design depends
     // on the slot order (phys(0) is only special in that it also carries the reset-time
     // init-zero sweep, which is complete long before any real write can occur).
+    //
+    // SWEEPING THE PERMUTATION.  Because the order is worth double-digit MHz it is a
+    // knob worth measuring, and re-ordering plugin SETUP to get at it would change far
+    // more than the slot order.  So it is exposed explicitly instead:
+    //
+    //   -DprfSlotPerm.Int=2,0,1,3,4,5      (JVM system property; also accepts an env
+    //   PRF_SLOT_PERM_INT=2,0,1,3,4,5       var, which survives sbt/Makefile layers)
+    //
+    // The value is a permutation of 0..N-1 in FIRST-APPEARANCE order, so for the Int RF
+    // (0=AluEu0 1=AluEu1 2=BranchEu 3=LsEu 4=DivEu 5=excA7) the identity is 0,1,2,3,4,5
+    // and that is the DEFAULT -- absent the knob, nothing changes.
+    //
+    // It is validated as a true permutation of exactly the right length and fails
+    // elaboration otherwise: a typo'd sweep that silently DROPPED a write port would
+    // corrupt the register file rather than just measure slower, and every entry here
+    // is a distinct physical port whose loss is invisible in a timing report.
+    val slotPerm: Option[Seq[Int]] = {
+      val key = spec.name.capitalize
+      val raw = Option(System.getProperty(s"prfSlotPerm.$key"))
+        .orElse(sys.env.get(s"PRF_SLOT_PERM_${spec.name.toUpperCase}"))
+        .map(_.trim).filter(_.nonEmpty)
+      raw.map { txt =>
+        val idx = txt.split(",").map(_.trim).filter(_.nonEmpty).map { t =>
+          try t.toInt catch { case _: NumberFormatException =>
+            SpinalError(s"RegFile ${spec.name}: slot permutation '$txt' is not a comma-separated integer list") }
+        }.toSeq
+        idx
+      }
+    }
     val phys = {
       // kept inside a block (not an Area member) so the private WriteReq type does not
       // escape the plugin's scope through the anonymous Area's inferred type
       val byKey = scala.collection.mutable.LinkedHashMap[Any, ArrayBuffer[WriteReq]]()
       for (r <- writeReq) byKey.getOrElseUpdate(r.key, ArrayBuffer[WriteReq]()) += r
-      byKey.values.toSeq
+      val ordered = byKey.values.toSeq
+      slotPerm match {
+        case None => ordered
+        case Some(idx) =>
+          if (idx.sorted != ordered.indices.toSeq) SpinalError(
+            s"RegFile ${spec.name}: slot permutation [${idx.mkString(",")}] is not a permutation of " +
+            s"0..${ordered.size - 1} -- it must list EVERY physical write port exactly once, or ports " +
+            s"would be dropped or duplicated (silent register-file corruption, not a slow build)")
+          println(s"[RegFile ${spec.name}] physical write-port slot permutation: ${idx.mkString(",")}")
+          idx.map(ordered)
+      }
     }.map { grp =>
       // sort descending by priority so element 0 is the highest priority
       val sorted = grp.sortBy(-_.priority)
