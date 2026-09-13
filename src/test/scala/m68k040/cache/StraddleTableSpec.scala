@@ -22,6 +22,7 @@ class StraddleTableSpec extends AnyFunSuite {
       val qWay      = in UInt (2 bits); val qSet = in UInt (6 bits)
       val qWord     = in UInt (5 bits)
       val hit       = out Bool(); val len = out UInt (4 bits)
+      val kHit      = out Bool(); val kLen = out UInt (4 bits)
       val allocIdx  = out UInt (4 bits)
       val doKillWS  = in Bool(); val doKillAll = in Bool()
     }
@@ -32,6 +33,8 @@ class StraddleTableSpec extends AnyFunSuite {
     when(io.doKillAll) { t.killAll() }
     val (h, l) = t.lookup(io.qIdx, io.qWay, io.qSet, io.qWord)
     io.hit := h; io.len := l
+    val (kh, kl) = t.lookupByKey(io.qWay, io.qSet, io.qWord)
+    io.kHit := kh; io.kLen := kl
   }
 
   def run(body: Dut => Unit): Unit = SimConfig.withVerilator.compile(new Dut).doSim { dut =>
@@ -48,6 +51,10 @@ class StraddleTableSpec extends AnyFunSuite {
     dut.io.aWay #= way; dut.io.aSet #= set; dut.io.aWord #= word; dut.io.aLen #= len
     dut.io.doAlloc #= true; dut.clockDomain.waitSampling(); dut.io.doAlloc #= false
     dut.clockDomain.waitSampling(); idx
+  }
+  def probeKey(dut: Dut, way: Int, set: Int, word: Int): (Boolean, Int) = {
+    dut.io.qWay #= way; dut.io.qSet #= set; dut.io.qWord #= word
+    sleep(1); (dut.io.kHit.toBoolean, dut.io.kLen.toInt)
   }
   def probe(dut: Dut, idx: Int, way: Int, set: Int, word: Int): (Boolean, Int) = {
     dut.io.qIdx #= idx; dut.io.qWay #= way; dut.io.qSet #= set; dut.io.qWord #= word
@@ -89,6 +96,24 @@ class StraddleTableSpec extends AnyFunSuite {
     dut.clockDomain.waitSampling()
     assert(!probe(dut, a, 1, 7, 1)._1, "refilled {way,set} entry must be dropped")
     assert(probe(dut, b, 1, 8, 1)._1,  "a different set must survive")
+  }}
+
+  test("lookupByKey: resolves by ADDRESS with no token, and misses on any mismatch", VerilatorTest) { run { dut =>
+    alloc(dut, way = 2, set = 40, word = 29, len = 6)
+    assert(probeKey(dut, 2, 40, 29) == (true, 6), "exact key must hit with its length")
+    assert(!probeKey(dut, 3, 40, 29)._1, "wrong way must miss")
+    assert(!probeKey(dut, 2, 41, 29)._1, "wrong set must miss")
+    assert(!probeKey(dut, 2, 40, 28)._1, "wrong word must miss")
+  }}
+
+  test("re-allocating the SAME key replaces, never duplicates", VerilatorTest) { run { dut =>
+    // lookupByKey OR-reduces the matching lengths, so two live entries on one key
+    // would hand back a corrupt mixture. allocate() must invalidate the old one.
+    alloc(dut, way = 1, set = 3, word = 7, len = 4)
+    alloc(dut, way = 1, set = 3, word = 7, len = 9)
+    val (h, l) = probeKey(dut, 1, 3, 7)
+    assert(h, "re-allocated key must still hit")
+    assert(l == 9, s"must be the NEW length, not a mix: got $l (4|9 would be 13)")
   }}
 
   test("killAll drops everything (CINV / CPUSHA)", VerilatorTest) { run { dut =>

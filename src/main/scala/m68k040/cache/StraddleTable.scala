@@ -40,14 +40,50 @@ case class StraddleTable(entries: Int, wayBits: Int, setBits: Int, wordBits: Int
     * costs one live re-classify. */
   val allocPtr = RegInit(U(0, idxBits bits))
 
-  /** Read: hit ONLY when the entry is valid AND owned by this exact {way,set,word}. */
+  /** Read by INDEX (token form): hit only when valid AND owned by this {way,set,word}. */
   def lookup(idx: UInt, way: UInt, set: UInt, word: UInt): (Bool, UInt) = {
     val hit = valid(idx) && (ownWay(idx) === way) && (ownSet(idx) === set) && (ownWord(idx) === word)
     (hit, lenWords(idx))
   }
 
-  /** Allocate an entry for a newly resolved straddle; returns the index used. */
+  /** Read by ADDRESS -- the form actually used on the fetch path.
+    *
+    * Keying the table by {way,set,word} rather than pointing at it with a token
+    * stored in the line means the I-cache line array is NEVER written to publish a
+    * resolution: no read-modify-write of the 352-bit lineMem entry, no lazy
+    * write-back queue, and no window in which a stale fix-up can land in a line that
+    * has since been replaced. A recycled line simply stops matching.
+    *
+    * 16 entries x a 13-bit compare, fully parallel -- it replaces a 30-logic-level
+    * classifier on the fetch critical path, so the comparator cost is not the point.
+    *
+    * At most ONE entry can match: `allocate` refuses to create a duplicate key, and
+    * every key written names a distinct {way,set,word}. */
+  def lookupByKey(way: UInt, set: UInt, word: UInt): (Bool, UInt) = {
+    val hits = Vec((0 until entries).map(i =>
+      valid(i) && (ownWay(i) === way) && (ownSet(i) === set) && (ownWord(i) === word)))
+    val hit  = hits.asBits.orR
+    // OR-reduce the masked lengths: at most one `hits` bit is set (see above), so this
+    // is a one-hot select. Deliberately NOT MuxOH -- if the no-duplicate-key invariant
+    // were ever broken, MuxOH silently ORs the SET BITS of several entries into a
+    // plausible-looking wrong length, whereas this makes `hit` still true and the
+    // length a detectable mix. The frontend treats any doubt as "resolve live", and
+    // StraddleTableSpec pins the single-match property directly.
+    val len  = lenWords.zip(hits).map { case (l, h) => l.asBits.andMask(h) }
+                       .reduce(_ | _).asUInt
+    (hit, len)
+  }
+
+  /** Allocate an entry for a newly resolved straddle; returns the index used.
+    *
+    * Invalidates any existing entry with the SAME key first, so `lookupByKey` can
+    * never see two matches. Re-resolving the same straddle (the line was evicted and
+    * refetched, say) therefore replaces rather than duplicates. */
   def allocate(way: UInt, set: UInt, word: UInt, len: UInt): UInt = {
+    for (k <- 0 until entries)
+      when(valid(k) && (ownWay(k) === way) && (ownSet(k) === set) && (ownWord(k) === word)) {
+        valid(k) := False
+      }
     val i = allocPtr
     valid(i)    := True
     ownWay(i)   := way
