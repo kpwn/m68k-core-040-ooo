@@ -120,6 +120,27 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
       bus.valid   := anyValid
       bus.address := sorted.foldRight(U(0, spec.addressWidth bits)) { case (r, acc) => Mux(r.port.valid, r.port.address, acc) }
       bus.data    := sorted.foldRight(B(0, spec.dataWidth bits))    { case (r, acc) => Mux(r.port.valid, r.port.data, acc) }
+      // SHARING A KEY IS A PROMISE OF SAME-CYCLE EXCLUSIVITY, AND THIS CHECKS IT.
+      //
+      // The fold above is a PRIORITY MUX: if two requests in one group are valid in the
+      // same cycle, the lower-priority one is not stalled, not retried and not reported
+      // -- it is silently DROPPED. A dropped write leaves the destination physical
+      // register holding a stale value, and since rename guarantees each in-flight
+      // writer owns a distinct pdst, nothing downstream can ever notice. It surfaces
+      // much later as a wrong operand with no trace back to here.
+      //
+      // The existing groups claim exclusivity STRUCTURALLY (AluEu's fast-S1 vs slow-S3
+      // share `wbKey`, kept apart by the `fastAcceptNextPort` look-ahead). That claim
+      // was never checked. Check it, so the claim is validated by every simulation and
+      // lock-step run instead of being re-argued from comments each time -- and so that
+      // any FUTURE merge (the 6-port -> fewer-port work) is provable rather than a
+      // plausibility argument about how often two writers can collide.
+      if (grp.size > 1) GenerationFlags.simulation {
+        assert(CountOne(Vec(valids)) <= 1,
+          s"RegFile ${spec.name}: two writers sharing one physical port were valid in the " +
+          s"same cycle -- the lower-priority write was SILENTLY DROPPED. The group's " +
+          s"exclusivity guarantee is broken.", FAILURE)
+      }
       bus
     }
 
