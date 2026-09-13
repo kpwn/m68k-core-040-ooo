@@ -131,7 +131,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // by cplxWakeup (a completing multi-cycle DIV). A consumer of a DIV result
         // waits here (DIV is variable-latency; no static issue-event).
         val cplxWait   = Reg(Bool()) init False
-        // SLOW-ALU (SHIFT, six-stage) dynamic dependency: identical mechanism to
+        // SLOW-ALU (SHIFT, four-stage) dynamic dependency: identical mechanism to
         // cplxWait, cleared by aluSlowWakeup. A consumer of a shift result (int OR flag
         // source) waits here (the slow path uses completion wakeup, not a static event).
         val aluSlowWait = Reg(Bool()) init False

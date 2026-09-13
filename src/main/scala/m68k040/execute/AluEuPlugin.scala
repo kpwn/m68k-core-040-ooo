@@ -17,7 +17,7 @@ trait AluEuService {
     * broadcast a dynamic wakeup after this pulse. */
   def flush: Bool
   def completion: Flow[UInt]   // robId
-  /** Dynamic-completion wakeup (mirroring DivEu/LsEu): the six-stage SLOW path
+  /** Dynamic-completion wakeup (mirroring DivEu/LsEu): the four-stage SLOW path
     * broadcasts its int+NZVC+X dsts the cycle the result lands at S3. The IQ holds a
     * dependent of a slow producer until this fires. Fast (lat1) ops do NOT drive it. */
   def slowWakeup: Flow[AluSlowWakeup]
@@ -59,7 +59,7 @@ case class WbObs() extends Bundle {
   * FAST path (ADD/SUB/AND/OR/EOR/CMP/MOVE/imm/CLR/NEGX/EXT/SWAP): writeback +
   * bypass + completion at S1 (latency-1) — the dependent-chain IPC path, UNCHANGED.
   * SLOW path (SHIFT): the retimed barrel-shifter datapath runs through
-  * S1/S1a/S1a2/S1b/S2/S3, then writes back (sharing the fast path's physical write
+  * S1/S1a/S2/S3 (lat-4), then writes back (sharing the fast path's physical write
   * ports — see `wbKey`) and broadcasts `slowWakeup` at S3.
   * BITFIELD used to share this pipe; it now lives on the CPLX cluster (DivEuPlugin's
   * bit-field lane).  It was duplicated here because this plugin is instantiated TWICE
@@ -218,34 +218,40 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val isShift = u1.op === DecOp.SHIFT
     val isSlow  = isShift
 
-    // SLOW is a genuine six-stage pipeline.  A slow uop is always accepted.  A FAST
-    // uop is blocked only when the slow uop currently in S2 will reach S3 next cycle,
-    // exactly when the accepted fast uop would reach S1 and use the shared writeback.
-    // (s1aValid/s2Valid/s3Valid are the slow valid chain, forward-declared here.)
-    // FMax #3 added the S1a stage (split stage1); FMax #4 added the S1b stage (split the
-    // bit-field forward-funnel -> modify cone); task #123 added the S1a2 stage (split the
-    // bit-field modify's clz+mux from its rotate/shift half), so the slow pipe is
-    // S1/S1a/S1a2/S1b/S2/S3.
-    // NOTE: S1a and S1b exist ONLY because the bit-field pipe needed those two cuts; for
-    // SHIFT they have ALWAYS been pure pass-throughs, lat-matching it to the deeper
-    // bit-field pipe. Now that bit-field has moved to the CPLX cluster they are dead
-    // weight and the shift pipe can go lat-4. Deleting them is a SEPARATE change because
-    // it also has to re-point `fastAcceptNextPort` (which hardcodes `!s1bValid` on the
-    // strength of S1b being the stage one before S2).
+    // SLOW is a genuine FOUR-stage pipeline (S1/S1a/S2/S3).  A slow uop is always
+    // accepted.  A FAST uop is blocked only when the slow uop currently in S2 will reach
+    // S3 next cycle, exactly when the accepted fast uop would reach S1 and use the shared
+    // writeback.  (s1aValid/s2Valid/s3Valid are the slow valid chain, forward-declared
+    // here.)
+    //
+    // It was SIX stages (S1/S1a/S1a2/S1b/S2/S3) until bit-field moved to the CPLX cluster.
+    // Two of those six were cuts the BIT-FIELD cone needed and SHIFT merely rode through
+    // as pure pass-throughs, purely to stay lat-matched with the deeper bit-field pipe:
+    // FMax#4's S1b (splitting the bit-field forward funnel from its modify) and task
+    // #123's S1a2 (splitting the bit-field modify's clz+mux from its rotate/shift half).
+    // With no bit-field left to match, they carried no logic at all and are deleted.
+    // SHIFT keeps BOTH of its own cuts: FMax#3's split of stage1a (count-derived amounts)
+    // from stage1b (the wide variable barrel shifts) is the S1->S1a boundary, and stage2
+    // stays in S2.  So this is a latency reduction with NO change to any shifter cone.
     val s1aValid = Bool()
-    val s1a2Valid = Bool()
-    val s1bValid = Bool()
     val s2Valid  = Bool()
     val s3Valid  = Bool()
-    s1Valid.simPublic(); s1aValid.simPublic(); s1a2Valid.simPublic()
-    s1bValid.simPublic(); s2Valid.simPublic(); s3Valid.simPublic()
+    s1Valid.simPublic(); s1aValid.simPublic(); s2Valid.simPublic(); s3Valid.simPublic()
     val isSlowIn = issuePort.payload.uop.op === DecOp.SHIFT
     // An empty upstream register must always see capacity: its retained payload is
     // stale and must not prevent the IQ from loading a safe slow candidate.
     issuePort.ready := !flushPort && (!issuePort.valid || isSlowIn || !s2Valid)
-    // A selection at C reaches this issue port at C+1.  s2Valid(C+1) equals
-    // s1bValid(C), so this tells the IQ whether a selected FAST uop is safe.
-    fastAcceptNextPort := !flushPort && !s1bValid
+    // A selection at C reaches this issue port at C+1.  This must name the stage ONE
+    // BEFORE S2, because that is the stage whose valid becomes s2Valid next cycle:
+    // s2Valid(C+1) == s1aValid(C).  It said `!s1bValid` while the pipe was six stages
+    // deep and S1b held that position; deleting S1b moved the position to S1a.
+    //
+    // GETTING THIS WRONG IS SILENT.  The IQ uses this as select-time look-ahead to
+    // preserve its static-wakeup contract; if it reports "safe" a cycle early, a FAST S1
+    // writeback collides with a SLOW S3 writeback on the `wbKey`-MERGED physical write
+    // port.  The fast request carries priority=1, so the collision does not assert or
+    // corrupt -- it silently DROPS THE SLOW RESULT.
+    fastAcceptNextPort := !flushPort && !s1aValid
 
     // ---- S1: FAST execute (ALU datapath; NO shifter, NO CCR-RMW on this cone) ----
     // ── ADDA/SUBA/CMPA "An-wide" marker: isMovea on a non-MOVE ALU op. The op runs
@@ -606,43 +612,31 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (cheap) count-derived SHIFT AMOUNTS + masked source; we REGISTER that midpoint
     // (s1aStage1a) and stage1b performs the (wide) variable barrel shifts off the
     // registered amounts. The deep funnel cone is now halved across the S1->S1a boundary.
-    // The shift is the LAT-6 (S1, S1a, S1a2, S1b, S2, S3) SLOW path — NOT lat-5; the
-    // comment that said so predated task #123's S1a2 stage and was stale for a year.
-    // Shift COMPUTES in exactly three of those six (S1 = stage1a, S1a2 = stage1b,
-    // S2 = stage2, then S3 merges/writes back); S1a and S1b are pure pass-throughs it
-    // inherited from lat-matching the (deeper, now-departed) bit-field pipe.
+    // The shift is the LAT-4 (S1, S1a, S2, S3) SLOW path, and every one of those four
+    // stages now does real work: S1 = stage1a, S1a = stage1b, S2 = stage2, S3 =
+    // merge/writeback. (It was lat-6 while the bit-field pipe shared the path; the two
+    // extra stages were bit-field cuts SHIFT only rode through — see the pipeline comment
+    // at the valid-chain declaration. An even older comment here called it "lat-5", which
+    // was stale from the moment task #123 added the S1a2 stage.)
     // The dynamic slowWakeup (broadcast at S3) makes the stage count latency-agnostic
     // (no static scoreboard constant — the IQ waits on the wakeup). RegNext (chained
     // s*Valid) gates issue.
     //
-    // S1: stage1a (amounts) -> register into S1a.
+    // S1: stage1a (the cheap count-derived amounts) -> register into S1a.
     val s1Stage1a = Shifter.stage1a(shiftCmd)
     s1aValid     := RegNext(s1Valid && isSlow && !flushPort) init False
     val s1aStage1a = RegNext(s1Stage1a)
     val s1aCtx     = RegNext(s1Ctx)
     val s1aSrc1    = RegNext(s1Src1)
 
-    // ── S1a -> S1a2: PURE PASS-THROUGH for the shift/ctx/valid/src1 chain (no shifter
-    // computation here). It existed only to lat-match the bit-field pipe's S1a stage
-    // (task #123); with bit-field gone it is a dead stage. ──
-    s1a2Valid      := RegNext(s1aValid && !flushPort) init False
-    val s1a2Stage1a = RegNext(s1aStage1a)
-    val s1a2Ctx    = RegNext(s1aCtx)
-    val s1a2Src1   = RegNext(s1aSrc1)
-    // ── S1a2: stage1b (the deep variable shifts) off the registered amounts -> register
-    // the ShiftStage1 midpoint into S1b (the FMax#3 cut). The shift midpoint and ctx/src1
-    // pass THROUGH S1b unmodified into S2 — S1b was the bit-field inverse-funnel stage
-    // and is likewise dead now. ──
-    val s1Stage1 = Shifter.stage1b(s1a2Stage1a)
-    s1bValid     := RegNext(s1a2Valid && !flushPort) init False
-    val s1bStage1 = RegNext(s1Stage1)
-    val s1bCtx    = RegNext(s1a2Ctx)
-    val s1bSrc1   = RegNext(s1a2Src1)
-    // ── S1b -> S2: register the shift midpoint (pass-through). ──
-    s2Valid      := RegNext(s1bValid && !flushPort) init False
-    val s2Stage1 = RegNext(s1bStage1)
-    val s2Ctx    = RegNext(s1bCtx)
-    val s2Src1   = RegNext(s1bSrc1)        // merge source preserved to S3
+    // ── S1a: stage1b (the wide variable barrel shifts) off the registered amounts ->
+    // register the ShiftStage1 midpoint into S2. This is the FMax#3 cut, unchanged: the
+    // deep funnel cone is still halved across the S1->S1a boundary. ──
+    val s1Stage1 = Shifter.stage1b(s1aStage1a)
+    s2Valid      := RegNext(s1aValid && !flushPort) init False
+    val s2Stage1 = RegNext(s1Stage1)
+    val s2Ctx    = RegNext(s1aCtx)
+    val s2Src1   = RegNext(s1aSrc1)        // merge source preserved to S3
 
     // SLOW S2: bit-extract + mux on the registered midpoint. Register the finished
     // result/flags into final stage S3.

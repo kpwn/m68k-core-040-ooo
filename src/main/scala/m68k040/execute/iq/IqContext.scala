@@ -101,7 +101,7 @@ case class IqHot() extends Bundle {
   }
 }
 
-/** Dynamic-completion wakeup for the six-stage SLOW ALU path. A SHIFT
+/** Dynamic-completion wakeup for the four-stage SLOW ALU path. A SHIFT
   * produces its destinations atomically at S3, so the broadcast carries all
   * three physreg dsts (with per-class valid). The IQ clears its per-class slow-busy
   * bitmaps + any dependent's `aluSlowWait` matching ANY of the three. (Unlike LS/DIV,
