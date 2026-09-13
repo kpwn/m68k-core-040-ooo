@@ -402,7 +402,26 @@ should be decided separately from the write-port work.
 - **Vivado segfaults at `Phase 11.1.1 Leaf ClockOpt Init`** on some netlists, AFTER
   routing succeeds but BEFORE write_checkpoint. No parameter disables that pass
   (checked `list_param` for skew|clockopt|leafclock|progdelay). Recovery: resume from
-  `place.dcp` with `route_design -directive Explore`, then the TWO post-route passes the
-  normal flow does and a naive resume SKIPS -- `phys_opt_design -directive
-  AggressiveExplore` then `-directive AlternateReplication`. Skipping them left 10
-  failing hold endpoints; running them took it to 1.
+  `place.dcp` -- but `place.dcp` is written at `vivado.tcl:2525` and the flow runs MORE
+  PASSES AFTER IT, so a naive resume silently drops them. The CORRECT sequence, measured:
+
+  | resume | passes | WNS | WHS | failing hold |
+  |---|---|---|---|---|
+  | v1 | route only | -0.197 | **-0.510** | **1** |
+  | v2 | + pre-route `phys_opt -directive AggressiveExplore` (:2531) | **-0.089** | **+0.009** | **0** |
+  | v3 | + pre-route `phys_opt -force_replication_on_nets` (:2549) | -0.089 | +0.009 | 0 (no change) |
+
+  So: **`open_checkpoint place.dcp` -> `phys_opt_design -directive AggressiveExplore` ->
+  `route_design -directive Explore` -> `phys_opt_design -directive AggressiveExplore` ->
+  `phys_opt_design -directive AlternateReplication`.** The force-replication pass matches
+  NO nets on this design (`dbg_overlay_q|crat_rb|vif_rdata`), which is why v3 == v2
+  bit-for-bit; include it anyway for fidelity, it is free.
+
+  ⚠️ Skipping the PRE-route pass is the expensive mistake: it cost -0.108 ns of WNS and,
+  worse, left **-0.510 WHS with a failing hold endpoint** -- and hold violations corrupt
+  data at ANY clock rate, which is what produced visible video glitching on the board.
+  ⚠️ A recovered build still lands ~0.13 ns short of a native full-flow build
+  (-0.089 vs +0.043 on the reference). That gap is NOT a missing pass -- it is placement
+  variation (the resumed `place.dcp` came from a different run) and/or the cost of
+  whatever RTL differs. Consequence: **a recovered build cannot serve as a timing-clean
+  control**, so it cannot distinguish a real RTL bug from timing marginality.
