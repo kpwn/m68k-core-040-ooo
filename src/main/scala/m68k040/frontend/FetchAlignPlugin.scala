@@ -838,14 +838,28 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // see PredecodeWord.scala's classify() for the actual restructuring (flat Vec-indexed
     // select instead of the nested-Mux chain), which is what fixes the regression while
     // this call site's own wiring stays functionally identical to the original fix.
+    // FMax (200 MHz campaign, 2026-09-13): classify against the REGISTERED availEff.
+    // The worst cone in the 200 MHz build was ftqHead -> ftqMem async read -> the 32-bit
+    // `ftqDiff = ftqHeadE.brPc - decodePc` carry chain -> availEff -> THIS classify ->
+    // p0LiveReg (-1.694 ns, 30 logic levels, 74% route; the top five violations in the
+    // design all sourced from ftqHead_reg[1]). Feeding the valid flags from a register
+    // cuts the FTQ read + subtract out of the classify cone entirely.
+    //
+    // SAFE BY THE EXISTING CONTRACT, not by a new argument: `p0LiveInvalidate` below
+    // already contains `availEffPrev =/= availEff`, i.e. it forces ambiguousLine := True
+    // (-> Aligner's pre-existing stall arm) on exactly the cycles where the registered
+    // and live values differ. When they are equal this classify is bit-identical to the
+    // live one; when they differ the result is discarded anyway. Same "either identical
+    // or explicitly not-resolved" guarantee the block comment above states.
+    val availEffPrev = RegNext(availEff) init 0
     val p0LiveClassified = PredecodeWord.classify(ibuf.io.head(0), ibuf.io.head(1), ibuf.io.head(2), ibuf.io.head(3),
       ibuf.io.head(4), ibuf.io.head(5), ibuf.io.head(6),
-      extWValid  = availEff >= U(2, 4 bits),
-      extW2Valid = availEff >= U(3, 4 bits),
-      extW3Valid = availEff >= U(4, 4 bits),
-      extW4Valid = availEff >= U(5, 4 bits),
-      extW5Valid = availEff >= U(6, 4 bits),
-      extW6Valid = availEff >= U(7, 4 bits))
+      extWValid  = availEffPrev >= U(2, 4 bits),
+      extW2Valid = availEffPrev >= U(3, 4 bits),
+      extW3Valid = availEffPrev >= U(4, 4 bits),
+      extW4Valid = availEffPrev >= U(5, 4 bits),
+      extW5Valid = availEffPrev >= U(6, 4 bits),
+      extW6Valid = availEffPrev >= U(7, 4 bits))
     // task #250: assign only the fields `Aligner.align` actually reads off `p0LiveReg`
     // (`.simple`/`.lenWords`/`.ambiguousLine`, via the `p0` mux) — NOT a bulk bundle
     // assign. `.size` is deliberately left undriven here (see the field's own comment
@@ -854,7 +868,6 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     p0LiveReg.simple        := p0LiveClassified.simple
     p0LiveReg.lenWords      := p0LiveClassified.lenWords
     p0LiveReg.ambiguousLine := p0LiveClassified.ambiguousLine
-    val availEffPrev = RegNext(availEff) init 0
     // task #242: the content-immutability threshold widens from `cnt<4` to `cnt<7` to
     // match the classify() call now reading `ibuf.io.head(4..6)` too -- a push landing at
     // cnt in [4,6] writes exactly those newly-read logical positions (see the `cnt<4`
