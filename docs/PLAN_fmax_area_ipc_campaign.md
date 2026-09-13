@@ -360,6 +360,37 @@ busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
 
 ## 4a. Two PRF write ports via WRITE-PORT RESERVATION (the design that makes it work)
 
+> ### ✅ MEASURED 2026-09-13 -- the prize, and where it actually sits
+>
+> Measured with the OOC PRF gate, int RF, reads held at the real core's 8, sweeping
+> PHYSICAL write ports (`PRF_PROBE_INT_WRITES=n PRF_PROBE_INT_READS=8`):
+>
+> | ports | LUT | LUTRAM | FF | OOC WNS |
+> |---|---|---|---|---|
+> | 2 | 1419 | 680 | 449 | 3.611 |
+> | 3 | 1963 | 1084 | 488 | 3.434 |
+> | 4 | 2459 | 1460 | 527 | 3.425 |
+> | 5 | 2985 | 1844 | 566 | 3.410 |
+> | **6 (today)** | **3885** | **2356** | **605** | **3.372** |
+>
+> Marginal cost is ~500 LUT + ~390 LUTRAM per port for ports 3-5, and then **+900 LUT
+> for the 6th**. The core sits at 6.
+>
+> **So dropping ONE port is worth 900 LUT -- 80% of what the entire bitfield cascade
+> delivered (1136 LUT) -- and it is the cheapest structural change on the board.**
+> Full 6 -> 2 is worth 2466 LUT + 1676 LUTRAM.
+>
+> ⚠️ **Do NOT quote the WNS column as a timing result.** The gate constrains 4.000 ns
+> and every point lands at 3.37-3.61, i.e. ~0.6-0.9 ns of SLACK -- these paths are
+> nowhere near critical in isolation, so the 0.239 ns spread across the sweep is not
+> evidence about the full-core critical path. AREA is the solid signal here; the timing
+> benefit has to be claimed from a full-core run, not from this gate.
+>
+> **Ordering consequence:** attack the 6th port FIRST. It is the biggest single step,
+> and unlike the 2-port end state it does not require the full reservation scheme --
+> only ONE pair of writers that can be proven same-cycle exclusive.
+
+
 **Why 5-wide issue is right and should stay.** The point of five select ports is
 LATENCY-CLASS DECOUPLING -- a DIV must not occupy a port an ALU op needs -- not peak
 bandwidth. Specialised ports per latency class are correct. The real duplication cost

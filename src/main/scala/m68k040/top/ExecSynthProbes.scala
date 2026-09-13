@@ -59,8 +59,28 @@ class IqSynthProbePlugin extends FiberPlugin {
   * setup and registers its IO, so an OOC run measures the RF read/bypass/LVT-mux
   * + write-merge paths reg→reg. */
 class PrfSynthProbePlugin extends FiberPlugin {
-  var iR0, iR1: RegFileReadPort = null
-  var iW0, iW1: RegFileWritePort = null
+  // PORT COUNTS ARE SWEEPABLE so the cost of a physical write port can be MEASURED
+  // rather than argued.  Under the LVT lowering (dataWidth >= 10, so the int RF) every
+  // physical write port is a FULL COPY of the register file, which is why the port
+  // count -- not the depth -- dominates PRF area.
+  //
+  //   PRF_PROBE_INT_WRITES=6 PRF_PROBE_INT_READS=8   (the REAL core's int RF shape:
+  //                                                   6 write ports, 8 read ports)
+  //
+  // Defaults stay 2/2, the shape this gate has always measured, so historical
+  // M68kPrfSynth numbers remain comparable.  Sweep, do not redefine the baseline.
+  private def envInt(name: String, dflt: Int): Int =
+    sys.env.get(name).map(_.trim).filter(_.nonEmpty).map { v =>
+      val n = try v.toInt catch { case _: NumberFormatException =>
+        SpinalError(s"$name must be an integer, got '$v'") }
+      if (n < 1) SpinalError(s"$name must be >= 1, got $n")
+      n
+    }.getOrElse(dflt)
+  val nIntWrites = envInt("PRF_PROBE_INT_WRITES", 2)
+  val nIntReads  = envInt("PRF_PROBE_INT_READS", 2)
+
+  var iReads: Seq[RegFileReadPort] = null
+  var iWrites: Seq[RegFileWritePort] = null
   var iB0: RegFileBypassPort = null
   var nR: RegFileReadPort = null
   var nW: RegFileWritePort = null
@@ -68,10 +88,15 @@ class PrfSynthProbePlugin extends FiberPlugin {
 
   during setup {
     val irf = host[IntRegFileService]
-    iR0 = irf.newRead(); iR1 = irf.newRead()
+    iReads = Seq.fill(nIntReads)(irf.newRead())
+    // Each write gets a DISTINCT sharing key, so each becomes its own PHYSICAL port --
+    // that is the thing being measured.  (iW0 keeps the priority=1 shared-key form the
+    // original harness used, so the 2-port default is bit-for-bit the old gate.)
     val k = new Object
-    iW0 = irf.newWrite(latency = 1, sharingKey = k, priority = 1)
-    iW1 = irf.newWrite(latency = 1)        // distinct key -> 2nd physical write port (LVT)
+    iWrites = (0 until nIntWrites).map { i =>
+      if (i == 0) irf.newWrite(latency = 1, sharingKey = k, priority = 1)
+      else        irf.newWrite(latency = 1)
+    }
     iB0 = irf.newBypass()
     val nz = host[NzvcRegFileService]
     nR = nz.newRead(); nW = nz.newWrite(latency = 1)
@@ -80,14 +105,17 @@ class PrfSynthProbePlugin extends FiberPlugin {
   }
 
   val logic = during build new Area {
-    // int read 0
-    iR0.addr := RegNext(in UInt (iR0.addr.getWidth bits))
-    val iR0Data = out(RegNext(iR0.data))
-    iR1.addr := RegNext(in UInt (iR1.addr.getWidth bits))
-    val iR1Data = out(RegNext(iR1.data))
-    // int writes
-    iW0.valid := RegNext(in Bool ()) init False; iW0.address := RegNext(in UInt (iW0.address.getWidth bits)); iW0.data := RegNext(in Bits (iW0.data.getWidth bits))
-    iW1.valid := RegNext(in Bool ()) init False; iW1.address := RegNext(in UInt (iW1.address.getWidth bits)); iW1.data := RegNext(in Bits (iW1.data.getWidth bits))
+    // int reads -- registered both sides so the measured path is RF read + bypass mux
+    val iRData = iReads.zipWithIndex.map { case (r, i) =>
+      r.addr := RegNext(in UInt (r.addr.getWidth bits))
+      out(RegNext(r.data)).setName(s"iR${i}Data")
+    }
+    // int writes -- one registered input set per PHYSICAL port
+    for (w <- iWrites) {
+      w.valid   := RegNext(in Bool ()) init False
+      w.address := RegNext(in UInt (w.address.getWidth bits))
+      w.data    := RegNext(in Bits (w.data.getWidth bits))
+    }
     iB0.valid := RegNext(in Bool ()) init False; iB0.address := RegNext(in UInt (iB0.address.getWidth bits)); iB0.data := RegNext(in Bits (iB0.data.getWidth bits))
     // nzvc
     nR.addr := RegNext(in UInt (nR.addr.getWidth bits))
