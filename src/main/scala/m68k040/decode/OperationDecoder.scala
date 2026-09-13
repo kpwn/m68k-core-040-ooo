@@ -830,7 +830,7 @@ object OperationDecoder {
         when(ss === 3 && isBitfieldReg) {
           o.illegal := False
           o.op := DecOp.BITFIELD
-          o.cluster := Cluster.INT
+          o.cluster := Cluster.CPLX   // the bit-field datapath lives on the CPLX cluster (DivEu)
           o.size := Size.LONG
           o.bfOp := opword(10 downto 8)
           // operands (srcA=Dy, srcB=Dn2 for BFINS, dst per bfOp) + the offset/width imm
@@ -855,7 +855,7 @@ object OperationDecoder {
         when(ss === 3 && isBitfieldMem) {
           o.illegal := False
           o.op := DecOp.BITFIELD
-          o.cluster := Cluster.INT
+          o.cluster := Cluster.CPLX   // the bit-field datapath lives on the CPLX cluster (DivEu)
           o.size := Size.LONG
           o.bfOp := bfMemOp
           o.srcA := easrc                  // the memory EA base (so predecode/EaDecoder frame it)
@@ -882,7 +882,7 @@ object OperationDecoder {
           o.microcoded := True
           o.ucEntry := U(Microcode.BF_RMW_4B_ENTRY, o.ucEntry.getWidth bits)  // overridden by ucBegin (needHi)
           o.op := DecOp.BITFIELD
-          o.cluster := Cluster.INT
+          o.cluster := Cluster.CPLX   // the bit-field datapath lives on the CPLX cluster (DivEu)
           o.size := Size.LONG
           o.bfOp := bfMemOp
           o.writesNzvc := True             // NZ only (V=C=0, X untouched)

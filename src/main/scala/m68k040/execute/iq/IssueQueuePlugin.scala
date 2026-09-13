@@ -131,7 +131,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // by cplxWakeup (a completing multi-cycle DIV). A consumer of a DIV result
         // waits here (DIV is variable-latency; no static issue-event).
         val cplxWait   = Reg(Bool()) init False
-        // SLOW-ALU (SHIFT/BITFIELD, six-stage) dynamic dependency: identical mechanism to
+        // SLOW-ALU (SHIFT, four-stage) dynamic dependency: identical mechanism to
         // cplxWait, cleared by aluSlowWakeup. A consumer of a shift result (int OR flag
         // source) waits here (the slow path uses completion wakeup, not a static event).
         val aluSlowWait = Reg(Bool()) init False
@@ -377,11 +377,22 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // A CPLX op that writes FPCC = a dynamic FPCC producer (every HW-native FP op).
     def isCplxFpccProducer(u: IqHot): Bool = isCplx(u) && u.writesFpcc
 
-    // SLOW-ALU producer: line-E SHIFT or BITFIELD on the six-stage EU path. Tracked
-    // in the aluSlow* bitmaps (dynamic S3 wakeup), NOT the static scoreboards. A shift
-    // writes int + NZVC + (X for non-rotate).
-    // BITFIELD shares the same dynamic slowWakeup, so a
-    // dependent of a bit-field op (its Dn2/Dy result) must wait on the slow wakeup too.
+    // SLOW-ALU producer: line-E SHIFT on the four-stage ALU-EU path. Tracked in the
+    // aluSlow* bitmaps (dynamic wakeup), NOT the static scoreboards. A shift writes
+    // int + NZVC + (X for non-rotate).
+    //
+    // BITFIELD USED TO BE IN THIS CLASS and must NOT come back: it now runs on the CPLX
+    // cluster, so its dependents are tracked by cplxBusy/cplxNzvcBusy and woken by
+    // cplxWakeup/cplxNzvcWakeup. Listing it here as well would park a consumer on an
+    // aluSlowWait bit that NOTHING can ever clear -- no ALU EU broadcasts a bit-field
+    // slowWakeup any more -- i.e. a silent HANG, not a stale read. The converse (leaving
+    // a BITFIELD uop on Cluster.INT while narrowing this) is the symmetric silent bug:
+    // the static scoreboards would then treat it as a FAST lat-1 producer.
+    //
+    // The narrowing lives in `DecOp.isAluSlow`, which this flag is precomputed from on
+    // the PUSH path -- deliberately NOT re-derived from `op` here. The IQ select cone is
+    // the hottest contested logic in the machine; it reads one flop instead of decoding
+    // an op, and that is what keeps `op` removable from IqHot later.
     def isAluSlowProducer(u: IqHot): Bool = u.isAluSlow
 
     // An LS op that writes NZVC = a dynamic (variable-latency) NZVC producer (a
@@ -398,13 +409,18 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // have psrcB = Dy (a real register read). The EU reads rdB.data (s1RdB) directly,
     // bypassing the useImm mux, so psrcB IS a live data dependency.
     // BFINS is a third exception: useImm=True (offset/width packed in imm) but psrcB =
-    // Dn2 (the insert source) is a LIVE register read. BFRESOLVE is a fourth: useImm=True
-    // (static offset/width + Do/Dw in imm) but psrcB = width-Dn (Dw form) is likewise live
-    // (srcAValid=Do already gates psrcA the normal way).
+    // Dn2 (the insert source) is a LIVE register read. This stays true now that BITFIELD
+    // runs on the CPLX cluster: DivEu's bit-field lane captures the RAW `rdB.data` for
+    // exactly this reason (its `s0B` is the useImm mux, which would otherwise substitute
+    // the packed offset/width immediate for Dn2). `srcBIsReg` also feeds `cplxDepInit`,
+    // so dropping this arm would let a BFINS issue AHEAD of the producer of its insert
+    // source. BFRESOLVE is a fourth exception: useImm=True (static offset/width + Do/Dw
+    // in imm) but psrcB = width-Dn (Dw form) is likewise live (srcAValid=Do already gates
+    // psrcA the normal way).
     //
     // All four exceptions ask ONE question -- "does this uop read psrcB as a register even
     // though useImm is set?" -- so they are one precomputed flag, `srcBRegDespiteImm`,
-    // rather than three helpers each re-deriving it from `op` in this cone.
+    // rather than four helpers each re-deriving it from `op` in this cone.
     def srcBIsReg(u: IqHot): Bool = u.psrcBValid && (!u.useImm || isLs(u) || u.srcBRegDespiteImm)
 
     // ---- Occupancy / back-pressure ----
@@ -1306,8 +1322,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // for them with NO guard at all (see the paragraph above, ":922-924"). If the
     // "clearing a bit my own push did not set is a harmless no-op" argument were
     // unsound, the design would already be broken for those four far more common
-    // classes. `!slowFire` was the lone asymmetric guard; dropping it makes
-    // SHIFT/BITFIELD consistent with them rather than special.
+    // classes. `!slowFire` was the lone asymmetric guard; dropping it makes SHIFT
+    // consistent with them rather than special. (The measured gate quoted above still
+    // names BITFIELD because that is what the netlist held at the time; BITFIELD has
+    // since moved to the CPLX cluster, which only shrinks the cone further.)
     //
     // FMAX (task #219, Fix 2 -- netlist-grounded against
     // `synth/archive/866437c_fmax_fanout_fix_decode_fetch/fullcore_slack_matrix.rpt`,

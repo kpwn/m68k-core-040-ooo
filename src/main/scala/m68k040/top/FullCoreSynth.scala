@@ -237,7 +237,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // entry/RTE, which fully flushes -> no in-flight fromSr observes a stale value).
     eu0.srSysIn := rob.logic.exc.ss.srSys
     eu1.srSysIn := rob.logic.exc.ss.srSys
-    // SLOW-ALU (SHIFT/BITFIELD, S3) dynamic wakeup: ONE IQ port per ALU EU (both EUs can
+    // SLOW-ALU (SHIFT, S3) dynamic wakeup: ONE IQ port per ALU EU (both EUs can
     // complete a distinct shift the same cycle, so no shared/OR'd port).
     iq.aluSlowWakeup(0).valid   := eu0.slowWakeup.valid
     iq.aluSlowWakeup(0).payload := eu0.slowWakeup.payload

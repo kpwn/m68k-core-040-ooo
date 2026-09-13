@@ -3500,7 +3500,7 @@ object MicroOpAssembler {
       u.pc          := pkt.pc
       u.nextPc      := nextPc
       u.op          := DecOp.BITFIELD
-      u.cluster     := Cluster.INT
+      u.cluster     := Cluster.CPLX   // the bit-field datapath lives on the CPLX cluster (DivEu)
       u.size        := Size.LONG
       u.memOp       := MemOp.NONE
       u.srcAReg     := U(T0, 5 bits); u.srcAValid := True             // lo (LS-produced)

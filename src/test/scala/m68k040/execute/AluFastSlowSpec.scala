@@ -10,9 +10,10 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
-/** Fast/slow ALU split: fast ops (ADD) complete at S1 with bypass; SHIFT/BITFIELD
-  * complete at S3 of the deep S1/S1a/S1a2/S1b/S2/S3 pipe.  The slow datapath is
-  * fixed latency but accepts independent operations every cycle. */
+/** Fast/slow ALU split: fast ops (ADD) complete at S1 with bypass; SHIFT completes at
+  * S3 of the S1/S1a/S2/S3 pipe.  The slow datapath is fixed latency but accepts
+  * independent operations every cycle.  (BITFIELD used to share this pipe and is what
+  * made it six stages deep; it now runs on the CPLX cluster's own bit-field lane.) */
 class AluFastSlowSpec extends AnyFunSuite {
   class Dut extends Component {
     val db   = new Database
@@ -110,7 +111,7 @@ class AluFastSlowSpec extends AnyFunSuite {
     }
   }
 
-  test("slow SHIFT (LSL #1) result correct, completes at six-stage S3", VerilatorTest) {
+  test("slow SHIFT (LSL #1) result correct, completes at four-stage S3", VerilatorTest) {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initPorts(dut); idle(dut)
@@ -119,10 +120,12 @@ class AluFastSlowSpec extends AnyFunSuite {
       issueMoveq(dut, 0x21, pdst = 3, robId = 0); cd.waitSampling()  // R3 = 0x21
       idle(dut); cd.waitSampling(6)
       val lat = latencyOf(dut, 9, window = 10) { issueLslImm(dut, pa = 3, count = 1, pdst = 4, robId = 9) }
-      // The active pipe includes S1a2, so S1/S1a/S1a2/S1b/S2/S3 is six stages.
-      // This harness samples once before the capture edge and therefore reports 7.
-      // The former six-cycle window was too short and could only report -1.
-      assert(lat == 7, s"slow SHIFT completion latency=$lat (expected 7 = six stages + harness pre-capture sample)")
+      // The pipe is S1/S1a/S2/S3 = FOUR stages, every one of them doing real shifter
+      // work. It was six (S1/S1a/S1a2/S1b/S2/S3) while BITFIELD shared the path: S1a2
+      // and S1b were bit-field cuts that SHIFT only rode through as pass-throughs, to
+      // stay lat-matched. Bit-field now lives on the CPLX cluster, so they are gone.
+      // This harness samples once before the capture edge and therefore reports 5.
+      assert(lat == 5, s"slow SHIFT completion latency=$lat (expected 5 = four stages + harness pre-capture sample)")
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 4; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == 0x42,

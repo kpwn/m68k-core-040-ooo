@@ -174,7 +174,13 @@ object DecOp extends SpinalEnum {
     * Deliberately a FUNCTION of `op`, not a field carried on the uop/IqContext: it is
     * a 2-way decode of a 6-bit enum the consumer already holds, so re-evaluating it
     * locally costs less than widening every pipeline register it would otherwise ride. */
-  def isAluSlow(op: DecOp.C): Bool = (op === DecOp.SHIFT) || (op === DecOp.BITFIELD)
+  // SHIFT only. BITFIELD used to share this six-stage ALU path and was listed here;
+  // it now runs on the CPLX cluster (DivEu's bit-field lane), so it is not "slow ALU"
+  // any more -- no ALU EU broadcasts a bit-field slowWakeup. Re-adding it here would
+  // park a bit-field dependent on an `aluSlowWait` bit that NOTHING can ever clear:
+  // a silent HANG, not a stale read. This predicate and BITFIELD's `Cluster` routing
+  // are ONE change and must move together.
+  def isAluSlow(op: DecOp.C): Bool = op === DecOp.SHIFT
 }
 
 /** Where an FP-generic uop's SOURCE operand comes from (DecodedUop.fpSrcKind).

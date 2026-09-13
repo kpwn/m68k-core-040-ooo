@@ -2637,8 +2637,8 @@ object Microcode {
       case _: UCasOp   => u.op := DecOp.CASOP
     }
     u.cluster := (d.uop match {
-      case UBfMem    => Cluster.INT          // the bit-field compute runs on the ALU/slow pipe
-      case UBfReg    => Cluster.INT          // register-form bit-field (BFINS prefunnel consumer)
+      case UBfMem    => Cluster.CPLX         // the bit-field compute runs on the CPLX (DivEu) bit-field lane
+      case UBfReg    => Cluster.CPLX         // register-form bit-field (BFINS prefunnel consumer)
       case UBfResolve => Cluster.INT
       case UBfShiftOff => Cluster.INT
       case UBfAdd    => Cluster.INT
@@ -3221,8 +3221,8 @@ object Microcode {
     u.cluster := Cluster.LS
     when(d.mem === MemHw.MNone) { u.cluster := Cluster.INT }
     switch(d.uop) {
-      is(UOpHw.UBfMem)      { u.cluster := Cluster.INT }  // the bit-field compute runs on the ALU/slow pipe
-      is(UOpHw.UBfReg)      { u.cluster := Cluster.INT }  // register-form bit-field (BFINS prefunnel consumer)
+      is(UOpHw.UBfMem)      { u.cluster := Cluster.CPLX } // the bit-field compute runs on the CPLX (DivEu) bit-field lane
+      is(UOpHw.UBfReg)      { u.cluster := Cluster.CPLX } // register-form bit-field (BFINS prefunnel consumer)
       is(UOpHw.UBfResolve)  { u.cluster := Cluster.INT }
       is(UOpHw.UBfShiftOff) { u.cluster := Cluster.INT }
       is(UOpHw.UBfAdd)      { u.cluster := Cluster.INT }
