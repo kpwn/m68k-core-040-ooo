@@ -101,7 +101,7 @@ case class IqHot() extends Bundle {
   }
 }
 
-/** Dynamic-completion wakeup for the six-stage SLOW ALU path. A SHIFT/BITFIELD
+/** Dynamic-completion wakeup for the six-stage SLOW ALU path. A SHIFT
   * produces its destinations atomically at S3, so the broadcast carries all
   * three physreg dsts (with per-class valid). The IQ clears its per-class slow-busy
   * bitmaps + any dependent's `aluSlowWait` matching ANY of the three. (Unlike LS/DIV,
@@ -150,7 +150,7 @@ trait IssueQueueService {
     * writeback. Mirrors `lsNzvcWakeup` exactly, on the CPLX port instead of LS. */
   def cplxNzvcWakeup: Flow[UInt]
   /** Dynamic-completion wakeup for the SLOW ALU path: each ALU EU broadcasts the
-    * int+NZVC+X dsts of its just-completed SHIFT/BITFIELD at S3. A dependent
+    * int+NZVC+X dsts of its just-completed SHIFT at S3. A dependent
     * (int OR flag source) is held NOT-ready until a matching broadcast fires. The op
     * is tracked in SEPARATE slow-busy bitmaps (NOT the static latency-1 scoreboards), so
     * a dependent wakes from actual completion, not a static latency. ONE port per ALU EU (both can

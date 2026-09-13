@@ -60,7 +60,12 @@ case class BitfieldMid() extends Bundle {
   * bit (31-offset) toward the LSB. `mask = ROR_32(0xffffffff << (32-width), offset)`.
   * All eight ops share the rotate (`rotL = ROL_32(Dy, offset)`); the result mux +
   * the CLZ priority-encode (BFFFO) + the arithmetic-vs-logical extract shift complete
-  * the datapath. Reused on the ALU EU's slow/shifter (lat-matched) path.
+  * the datapath.
+  *
+  * SOLE CALLER: `DivEuPlugin`'s bit-field lane (the CPLX cluster). It used to live on
+  * the ALU EU's slow/shifter path, which meant TWO copies of this funnel + mask-gen +
+  * BFFFO priority encoder, since `AluEuPlugin` is instantiated twice (eu0/eu1) — an
+  * expensive duplicate for a rare 68020+ instruction family. CPLX is instantiated once.
   *
   * Split into `stage1`/`stage2` (task #123): the ORIGINAL single-cycle `apply` chained
   * 4 parallel barrel rotates into an 8-way result mux whose BFFFO leg carries a

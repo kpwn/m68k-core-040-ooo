@@ -60,6 +60,10 @@ class DivWSpec extends AnyFunSuite {
       uop.isCondTrap := False; uop.faultUsesNextPc := True; uop.isScc := False; uop.isDbcc := False
       uop.divSigned := iSigned; uop.div64 := False; uop.divIsRem := False
       uop.isChk2 := False
+      // Bit-field fields: same story as the FP-domain block above -- the CPLX EU now also
+      // carries the BIT-FIELD lane and reads these on every issued uop, so they must be
+      // DRIVEN even though no uop in this spec is a DecOp.BITFIELD. Inert values.
+      uop.bfOp := 0; uop.bfDynamic := False; uop.bfMem := False; uop.bfStoreForm := 0
       uop.firstOfInstr := True
       uop.predTaken := False; uop.predTarget := 0
       uop.pc := 0x2000; uop.nextPc := 0x2002

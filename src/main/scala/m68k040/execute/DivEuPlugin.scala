@@ -79,6 +79,25 @@ case class MulHiContext() extends Bundle {
   val dstArch     = UInt(5 bits)
 }
 
+/** Pruned descriptor that follows the fixed BIT-FIELD datapath.  Exactly the role
+  * `MulPipeContext` plays for the multiplier: result ROUTING metadata only.  The
+  * operand/funnel VALUES travel in their own per-stage registers alongside, because the
+  * bit-field pipe carries wide intermediates whose TYPES differ stage by stage (a
+  * `BitfieldCmd`, then a `BitfieldMid`, then a result+flags triple) -- folding them in
+  * here would just make this bundle a union of three unrelated shapes.
+  *
+  * Deliberately NOT an `IqContext`: a bit-field uop's result needs a physical int
+  * destination, an NZVC destination and the arch-reg number for the whitebox, and
+  * nothing else.  BITFIELD raises no fault, reads no flags and never writes X. */
+case class BfPipeContext() extends Bundle {
+  val robId       = UInt(6 bits)
+  val pdst        = UInt(6 bits)
+  val pdstValid   = Bool()
+  val pNzvcDst    = UInt(4 bits)
+  val writesNzvc  = Bool()
+  val dstArch     = UInt(5 bits)
+}
+
 /** One result waiting for the existing single CPLX completion/writeback lane. */
 case class CplxResult() extends Bundle {
   val robId       = UInt(6 bits)
@@ -400,6 +419,13 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpIterBusy     = RegInit(False)
     val mulCanAccept = Bool(); mulCanAccept.allowOverride; mulCanAccept := False
     val mulHiAvailable = Bool(); mulHiAvailable.allowOverride; mulHiAvailable := False
+    // Bit-field: its own independent, fully pipelined II=1 lane (see the BIT-FIELD LANE
+    // section below).  Like MUL it bypasses the legacy `busy`/`s1Valid` FSM entirely and
+    // gates acceptance on a CREDIT counter against its own result FIFO, not on lane
+    // occupancy -- a bit-field memory-RMW chain emits 3-4 BITFIELD uops back to back, and
+    // the legacy lane's `!busy && !s1Valid` gate would serialize them at one per ~5 cycles.
+    val issueIsBf = u0.op === DecOp.BITFIELD
+    val bfCanAccept = Bool(); bfCanAccept.allowOverride; bfCanAccept := False
     // The IQ connection is a non-collapsing registered Stream.  When its current
     // valid is low, stale payload bits must not hold ready low or the IQ cannot load
     // a new lane-eligible candidate behind an active divider.
@@ -414,8 +440,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     issuePort.ready := !flushSig && (!issuePort.valid || Mux(issueIsMul,
       mulCanAccept,
       Mux(issueIsMulHi, mulHiAvailable,
+      Mux(issueIsBf, bfCanAccept,
       Mux(issueIsFpFixed, True,
-      Mux(issueIsFpIter, !fpIterBusy, !busy && !s1Valid)))))
+      Mux(issueIsFpIter, !fpIterBusy, !busy && !s1Valid))))))
 
     // ---- debug-only observability (task #139 CMP2/CHK2 hang investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
@@ -442,7 +469,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // operation captures the legacy lane context and clears it explicitly on use.
     // (An FP uop MUST be excluded here: the legacy FSM's defensive `otherwise` arm would
     // otherwise complete it a second time, on the int lane, with its robId.)
-    when(issuePort.fire && !issueIsMul && !issueIsMulHi && !issueIsFp) {
+    // (A BITFIELD uop MUST be excluded here for EXACTLY the reason the parenthesis above
+    // gives for FP: it runs on its own lane below, so the legacy FSM's defensive
+    // `otherwise` arm would otherwise complete it a SECOND time, on the int lane, with
+    // its robId -- a double completion of one ROB entry.)
+    when(issuePort.fire && !issueIsMul && !issueIsMulHi && !issueIsFp && !issueIsBf) {
       s1Valid := True
       s1Ctx   := issuePort.payload
       s1A     := s0A
@@ -1509,12 +1540,255 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
     }
 
-    // Atomic three-source completion arbitration.  The legacy result and both
+    // ═════════════════════════════════════════════════════════════════════════════
+    // BIT-FIELD LANE (DecOp.BITFIELD) -- an INDEPENDENT, fully pipelined II=1 lane
+    // ═════════════════════════════════════════════════════════════════════════════
+    // Moved here from AluEuPlugin, where it was instantiated TWICE (eu0 and eu1 each
+    // carried a full copy of the funnel + mask-gen + BFFFO priority encoder for an
+    // instruction family that is rare and expensive).  One copy on the CPLX cluster.
+    //
+    // WHY A DEDICATED LANE AND NOT THE LEGACY FSM.  Two independent reasons:
+    //   1. THROUGHPUT.  A memory bit-field RMW chain (BFCHG/BFCLR/BFSET/BFINS at a
+    //      misaligned EA) emits 3-4 BITFIELD uops back to back.  The legacy lane gates
+    //      on `!busy && !s1Valid`, so it would accept one every ~5 cycles.
+    //   2. THE `flushed` LATCH.  The legacy lane's `flushed` register is set by
+    //      `when(flushSig && (busy || s1Valid))` and cleared only at the op's
+    //      completion -- occupying `s1Valid` for several cycles is exactly the shape
+    //      that makes that latch leak onto the NEXT, correct-path legacy op (see the
+    //      `fpCvtFlushing` comment, which documents the real deadlock it caused).  An
+    //      independent lane does not touch `flushed` at all, so the hazard cannot exist.
+    //
+    // STRUCTURE: copied from the MUL lane, NOT the FP fixed lane.  The FP fixed lane's
+    // unconditional accept is sound only because it owns its completion register
+    // outright; bit-field shares the int completion register with DIV/MUL/CHK, so it
+    // needs MUL's shape: a pruned context shift chain + a credit-reserved result FIFO +
+    // a credit-counter accept gate.
+    //
+    // STAGE MAP (identical cut points to the AluEu pipe it replaces, so the two FMax
+    // splits measured there -- the forward funnel vs. the modify, and the rotate/shift
+    // half vs. the clz+mux half -- are preserved verbatim).  C = the accept cycle:
+    //   C    : issuePort.fire; the operands + control fields are captured into bf1*.
+    //   C+1  : forward funnel + `BitfieldCmd` assembly      -> registered into bf2*.
+    //   C+2  : `Bitfield.stage1` (rotates / left-justify)   -> registered into bf3*.
+    //   C+3  : `Bitfield.stage2` (clz + mask-modify + mux)  -> registered into bf4*.
+    //   C+4  : the RMW inverse funnel + store-form mux      -> pushed to `bfResultQ`.
+    // From there it is an ordinary CplxResult: the arbiter below captures it into the
+    // SHARED completion register, so `intW`/`intByp`/`nzvcW`/`nzvcByp`/`completionPort`/
+    // `wakeupPort`/`wakeupNzvcPort`/`wbObs`/`ccrObs` all come free with no new port.
+    //
+    // BITFIELD writes INT (the FULL 32 bits -- no .B/.W size merge) and NZVC (N and Z
+    // only; V=0, C=0).  It never writes X, reads no flags, and raises no fault -- which
+    // is what makes it fit a cluster that has three int reads and no X port at all.
+    val bfLatency = 4
+    // Reservation is released only when a result leaves the FIFO: allow the complete
+    // non-stallable pipe plus push-to-pop visibility to be resident, so a continuous
+    // bit-field stream never bubbles before its first retirement (MUL's rule verbatim).
+    val bfResultDepth = bfLatency + 2
+    val bfResultQ = StreamFifo(CplxResult(), bfResultDepth)
+    bfResultQ.io.flush := flushSig
+
+    val bfReserved = Reg(UInt(log2Up(bfResultDepth + 1) bits)) init 0
+    val bfRetire = bfResultQ.io.pop.fire
+    bfCanAccept := (bfReserved =/= bfResultDepth) || bfRetire
+    val bfStart = issuePort.fire && issueIsBf
+    switch(bfStart ## bfRetire) {
+      is(B"10") { bfReserved := bfReserved + 1 }
+      is(B"01") { bfReserved := bfReserved - 1 }
+    }
+    when(flushSig) { bfReserved := 0 }
+
+    // ---- routing context shift chain (the MUL idiom) ----
+    val bfCtx = Vec.fill(bfLatency)(Reg(BfPipeContext()))
+    val bfCtxValid = Vec.fill(bfLatency)(RegInit(False))
+    bfCtxValid(0) := bfStart
+    when(bfStart) {
+      bfCtx(0).robId      := issuePort.payload.robId
+      bfCtx(0).pdst       := u0.pdst
+      bfCtx(0).pdstValid  := u0.pdstValid
+      bfCtx(0).pNzvcDst   := u0.pNzvcDst
+      bfCtx(0).writesNzvc := u0.writesNzvc
+      bfCtx(0).dstArch    := u0.dstArch
+    }
+    for (i <- 1 until bfLatency) {
+      bfCtxValid(i) := bfCtxValid(i - 1)
+      when(bfCtxValid(i - 1)) { bfCtx(i) := bfCtx(i - 1) }
+    }
+    when(flushSig) { bfCtxValid.foreach(_ := False) }
+
+    // ---- C -> C+1: operand + control capture (the M2S register) ----
+    // srcA IS GATED ON psrcAValid, exactly as AluEuPlugin gated it.  DivEu's own
+    // `s0A = rdA.data` is UNGATED, and an invalid srcA does NOT read zero -- EaDecoder
+    // gives every EA a nominal `base = 8 + reg` and merely clears `baseValid`, so an
+    // absolute (xxx).L EA still carries srcAReg = A1 and rename resolves it to A1's
+    // CURRENT value.  Carrying DivEu's ungated read into this lane would therefore
+    // silently fold a live architectural register into the funnel.
+    val bf1A = Reg(Bits(32 bits))        // srcA: Dy (register form) / T0, the misaligned LONG `lo` (mem form)
+    // The RAW `rdB.data`, NOT `s0B`.  `s0B` is `Mux(u0.useImm, u0.imm, rdB.data)`, and
+    // nearly every bit-field uop sets useImm=True (the packed offset/width rides the imm)
+    // while ALSO needing the register: srcB is BFINS's insert source Dn2, the memory
+    // form's spill byte `hi`, or the LO5/HI5 `res` temp.  Taking `s0B` here would
+    // substitute the immediate for all three -- a silent wrong-value write, not a hang.
+    // The IQ knows this too: `srcBIsReg`'s `isBitfield` arm is what keeps the srcB
+    // dependency live despite useImm.  Precedent for the raw capture: the FP lane's own
+    // `fpS1IntB := rdB.data`.
+    val bf1B = Reg(Bits(32 bits))
+    val bf1C = Reg(Bits(32 bits))        // srcC (via the rdH port): the BFRESOLVE-packed temp / Dn2 / raw Dn[off]
+    // The STATIC packed offset/width slot. This is `s0B` — the useImm MUX — not `u0.imm`,
+    // deliberately: it reproduces AluEuPlugin's `s1Src2` bit for bit. Most BITFIELD rows
+    // set useImm=True so the two are the same, but the microcode's LO5RAW/HI5RAW rows
+    // (bfStoreForm 4/5, µPC80/81) set NEITHER useImm NOR bfDynamic, so the old EU read
+    // rdB.data into this slot. Those rows never actually consume the value (their result
+    // comes from the inverse funnel, whose inputs are srcA/srcB/srcC), so both choices are
+    // don't-care — but matching exactly removes the need to re-derive that every time.
+    val bf1Packed     = Reg(Bits(32 bits))
+    val bf1Op         = Reg(Bits(3 bits))
+    val bf1Dynamic    = Reg(Bool())
+    val bf1Mem        = Reg(Bool())
+    val bf1StoreForm  = Reg(UInt(3 bits))
+    val bf1PsrcCValid = Reg(Bool())
+    when(bfStart) {
+      bf1A          := Mux(u0.psrcAValid, rdA.data, B(0, 32 bits))
+      bf1B          := rdB.data
+      bf1C          := rdH.data
+      bf1Packed     := s0B            // the useImm mux (== AluEu's s1Src2)
+      bf1Op         := u0.bfOp
+      bf1Dynamic    := u0.bfDynamic
+      bf1Mem        := u0.bfMem
+      bf1StoreForm  := u0.bfStoreForm
+      bf1PsrcCValid := u0.psrcCValid
+    }
+
+    // ---- C+1: the forward funnel + BitfieldCmd assembly ----
+    // STATIC: offset/raw-width from the imm.  DYNAMIC (bfDynamic): from the
+    // BFRESOLVE-packed temp read via srcC -- the SAME packed layout (offset[4:0],
+    // raw width[9:5]).
+    val bfPacked = Mux(bf1Dynamic, bf1C, bf1Packed)
+    // MEMORY load/RMW form (bfMem): the field comes from a (possibly misaligned) memory
+    // LONG `lo` (srcA) plus an optional spill BYTE `hi` (srcB, valid only when
+    // bitOff+width>32).  The funnel left-justifies the `width`-bit field into
+    // bits[31:32-width]:  field32 = (lo << bitOff) | (needHi ? (hi[7:0] >> (8-bitOff)) : 0)
+    // then feeds the SAME datapath with rotate offset = 0 and ffoBase = the ORIGINAL
+    // memory bit offset (for BFFFO).
+    val bfMemImm = Mux(bf1Mem && bf1Dynamic, bf1C, bf1Packed)
+    // LO5RAW/HI5RAW (store forms 4/5): the inverse funnel reads bitOff from srcC = the
+    // RAW offset register Dn[off] (bitOff = Dn[off] & 7), so the resolved `packed` temp
+    // need not be held live across the store reconstruction.
+    val bfRawOffForm = (bf1StoreForm === U(4, 3 bits)) || (bf1StoreForm === U(5, 3 bits))
+    // FFOFULL (store form 6): the field is ALREADY left-aligned (prefunnelled into srcA)
+    // so bitOff=0 / needHi=0, and ffoBase = srcB = the FULL signed Dn[off].
+    val bfFfoFull   = bf1StoreForm === U(6, 3 bits)
+    val bfMemBitOff = Mux(bfRawOffForm, bf1C(2 downto 0).asUInt,
+                         Mux(bfFfoFull, U(0, 3 bits), bfMemImm(12 downto 10).asUInt))   // 0..7
+    val bfMemNeedHi = Mux(bfFfoFull, False, bfMemImm(13))
+    val bfMemOrigOff= bfMemImm(18 downto 14).asUInt                                      // 0..31
+    val bfFieldLo   = (bf1A.asUInt << bfMemBitOff)(31 downto 0)
+    // hi >> (8 - bitOff): keep the top `bitOff` bits of the byte.  (8-bitOff) in 1..8.
+    val bfHiShAmt   = (U(8, 4 bits) - bfMemBitOff.resize(4))
+    val bfFieldHi   = Mux(bfMemNeedHi, (bf1B(7 downto 0).asUInt.resize(32) >> bfHiShAmt)(31 downto 0), U(0, 32 bits))
+    val bfField32   = (bfFieldLo | bfFieldHi).asBits
+    val bfCmd = BitfieldCmd()
+    bfCmd.dy       := Mux(bf1Mem, bfField32, bf1A)
+    // BFINS insert source Dn2: the register form / mem load-only path carries it on srcB;
+    // the mem-RMW chains route it via srcC because srcB carries the spill byte `hi`.
+    bfCmd.dn2      := Mux(bf1Mem && bf1PsrcCValid, bf1C, bf1B)
+    bfCmd.offset   := Mux(bf1Mem, U(0, 5 bits), bfPacked(4 downto 0).asUInt)
+    bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
+    bfCmd.bfOp     := bf1Op
+    bfCmd.ffoBase  := Mux(bfFfoFull, bf1B.asUInt,
+                         Mux(bf1Mem, bfMemOrigOff.resize(32),
+                             bfPacked(4 downto 0).asUInt.resize(32)))
+    // ── C+1 -> C+2 CUT (the FMax#4 split: forward funnel OUT of series with the modify) ──
+    val bf2Cmd       = RegNext(bfCmd)
+    val bf2StoreForm = RegNext(bf1StoreForm)
+    val bf2BitOff    = RegNext(bfMemBitOff)
+    val bf2InvSrc    = RegNext(bf1A)      // the lo/hi merge source (srcA = T0 / T1)
+    val bf2T2        = RegNext(bf1B)      // the LO5/HI5 `res` source (srcB = T2)
+
+    // ---- C+2: the rotate / shift / left-justify cone (cheap half) ----
+    val bf2Mid = Bitfield.stage1(bf2Cmd)
+    // ── C+2 -> C+3 CUT (the task-#123 split: the 32-input clz + 8-way mux is the deep
+    // half and runs a cycle later off a REGISTERED BitfieldMid). ──
+    val bf3Mid       = RegNext(bf2Mid)
+    val bf3StoreForm = RegNext(bf2StoreForm)
+    val bf3BitOff    = RegNext(bf2BitOff)
+    val bf3InvSrc    = RegNext(bf2InvSrc)
+    val bf3T2        = RegNext(bf2T2)
+
+    // ---- C+3: clz + mask-modify + the 8-way result/flag mux (deep half) ----
+    val bfRsp = Bitfield.stage2(bf3Mid)
+    // `res` driving the inverse funnel: LO4 (form 1) recomputes it inline from the
+    // funnel; LO5/HI5 (forms 2/3/4/5) read it from T2 (the b2 result of an earlier uop).
+    val bf3InvRes = Mux(bf3StoreForm === U(1, 3 bits), bfRsp.result, bf3T2)
+    // ── C+3 -> C+4 CUT: register the inverse-funnel inputs + the modify result/flags. ──
+    val bf4InvRes    = RegNext(bf3InvRes)
+    val bf4InvSrc    = RegNext(bf3InvSrc)
+    val bf4BitOff    = RegNext(bf3BitOff)
+    val bf4StoreForm = RegNext(bf3StoreForm)
+    val bf4FunnelRes = RegNext(bfRsp.result)
+    val bf4N         = RegNext(bfRsp.n)
+    val bf4Z         = RegNext(bfRsp.z)
+
+    // ---- C+4: the MEMORY RMW INVERSE FUNNEL (store-back) + store-form select ----
+    //   lomask = (bitOff==0) ? 0 : (0xffffffff << (32-bitOff))
+    //   lo' = (lo & lomask) | (res >> bitOff)                  [LO4/LO5 output]
+    //   himask = 0xff >> bitOff
+    //   hi' = (hi & himask) | ((res << (8-bitOff)) & 0xff)     [HI5 output]
+    val bf4Lomask = Mux(bf4BitOff === 0, B(0, 32 bits),
+                        (B(0xffffffffL, 32 bits).asUInt << (U(32, 6 bits) - bf4BitOff.resize(6)))(31 downto 0).asBits)
+    val bf4LoStore = ((bf4InvSrc.asUInt & bf4Lomask.asUInt) | (bf4InvRes.asUInt >> bf4BitOff)).asBits
+    val bf4HiShL   = (U(8, 4 bits) - bf4BitOff.resize(4))       // 8-bitOff, 1..8
+    val bf4Himask  = (B(0xff, 8 bits).asUInt >> bf4BitOff)(7 downto 0).asBits
+    val bf4HiStore = ((bf4InvSrc(7 downto 0).asUInt & bf4Himask.asUInt) |
+                      (bf4InvRes.asUInt << bf4HiShL)(7 downto 0))(7 downto 0).asBits
+    // RES / load-only / LO4 take the modify result; LO5/HI5 (and their RAW-offset twins)
+    // take the inverse-funnel output computed this stage.  HI5 writes only the low byte
+    // (its store uop is BYTE-sized; the upper bits are don't-care).
+    val bf4Res = bf4StoreForm.mux(
+      U(1, 3 bits) -> bf4LoStore,                          // LO4
+      U(2, 3 bits) -> bf4LoStore,                          // LO5
+      U(3, 3 bits) -> bf4HiStore.resize(32),               // HI5 (low byte)
+      U(4, 3 bits) -> bf4LoStore,                          // LO5RAW
+      U(5, 3 bits) -> bf4HiStore.resize(32),               // HI5RAW (low byte)
+      default      -> bf4FunnelRes)                        // 0 = RES / load-only, 6 = FFOFULL
+
+    val bfDoneCtx = bfCtx.last
+    bfResultQ.io.push.valid := bfCtxValid.last && !flushSig
+    bfResultQ.io.push.payload.robId       := bfDoneCtx.robId
+    bfResultQ.io.push.payload.data        := bf4Res
+    bfResultQ.io.push.payload.pdst        := bfDoneCtx.pdst
+    bfResultQ.io.push.payload.pdstValid   := bfDoneCtx.pdstValid
+    // N,Z from the datapath; V and C are ARCHITECTURALLY ZERO for every BFxxx; X is not
+    // written at all (the uop's writesX mask is False, and this cluster has no X port).
+    bfResultQ.io.push.payload.nzvc        := (bf4N ## bf4Z ## False ## False).asBits
+    bfResultQ.io.push.payload.nzvcWrite   := bfDoneCtx.writesNzvc
+    bfResultQ.io.push.payload.pNzvcDst    := bfDoneCtx.pNzvcDst
+    bfResultQ.io.push.payload.dstArch     := bfDoneCtx.dstArch
+    bfResultQ.io.push.payload.fault       := False       // BITFIELD raises no fault
+    bfResultQ.io.push.payload.faultVec    := 0
+    bfResultQ.io.push.payload.crackTail   := False       // never a DIVREM/MULHI crack tail
+    bfResultQ.io.push.payload.flushed     := False
+    bfResultQ.io.push.payload.mulHigh     := B(0, 32 bits)   // MUL-only fields, unused here
+    bfResultQ.io.push.payload.mul64       := False
+    // The credit counter makes this structurally impossible; assert it so a future depth
+    // or latency edit that breaks the accounting fails loudly instead of dropping results.
+    assert(!bfResultQ.io.push.valid || bfResultQ.io.push.ready,
+      "bit-field result FIFO overflow: the credit reservation is wrong")
+    bfCtxValid.last.simPublic(); bfReserved.simPublic()
+
+    // Atomic FOUR-source completion arbitration.  The legacy result and all three
     // FIFOs hold their payloads until selected, so the Flow-only ROB lane cannot
-    // lose a same-cycle DIV/MUL or MUL/MULHI collision.  Legacy wins to bound an
-    // older divider; a ready MULHI wins next; pure MUL drains every cycle.
+    // lose a same-cycle DIV/MUL, MUL/MULHI or MUL/BITFIELD collision.  Legacy wins to
+    // bound an older divider; a ready MULHI wins next; MUL then bit-field drain every
+    // cycle.  Bit-field is placed LAST deliberately: it is the only source with no
+    // in-order coupling to another (MULHI must follow its MUL; legacy bounds the
+    // divider), so it is the safe one to yield.  It cannot be starved indefinitely --
+    // the ROB retires in order, so a bit-field uop that is not completing eventually
+    // reaches the ROB head, fills the ROB, stops dispatch, and drains every other
+    // source.  That is the SAME bounded-starvation argument the MUL arm already relies
+    // on against `legacyValid`.
     mulResultQ.io.pop.ready := False
     mulHiPendingQ.io.pop.ready := False
+    bfResultQ.io.pop.ready := False
     val arbCollisionObs = legacyValid && mulResultQ.io.pop.valid
     arbCollisionObs.simPublic()
 
@@ -1562,6 +1836,14 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
           mulHiMem.write(tailRobId, mulResultQ.io.pop.payload.mulHigh)
           mulHiValid(tailRobId) := True
         }
+      } elsewhen(bfResultQ.io.pop.valid) {
+        // Reuses `captureArb` verbatim -- nothing bit-field-specific reaches the shared
+        // completion register, which is the whole point of shaping the lane's output as
+        // a `CplxResult`.  NOT a `sharingKey` merge at the write port: DivEu does not
+        // arbitrate at the write port at all, it arbitrates one stage earlier into this
+        // holding register, so a fourth arm here is the structurally correct seam.
+        captureArb(bfResultQ.io.pop.payload)
+        bfResultQ.io.pop.ready := True
       }
     }
     when(flushSig) {

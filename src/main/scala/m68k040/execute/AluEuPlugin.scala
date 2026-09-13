@@ -58,9 +58,13 @@ case class WbObs() extends Bundle {
 /** Fast/slow integer ALU EU. S0 read | M2S | S1 execute.
   * FAST path (ADD/SUB/AND/OR/EOR/CMP/MOVE/imm/CLR/NEGX/EXT/SWAP): writeback +
   * bypass + completion at S1 (latency-1) — the dependent-chain IPC path, UNCHANGED.
-  * SLOW path (SHIFT || BITFIELD): the retimed barrel/funnel datapaths run through
-  * S1/S1a/S1a2/S1b/S2/S3, then write back (sharing the fast path's physical write
-  * ports — see `wbKey`) and broadcast `slowWakeup` at S3.
+  * SLOW path (SHIFT): the retimed barrel-shifter datapath runs through
+  * S1/S1a/S1a2/S1b/S2/S3, then writes back (sharing the fast path's physical write
+  * ports — see `wbKey`) and broadcasts `slowWakeup` at S3.
+  * BITFIELD used to share this pipe; it now lives on the CPLX cluster (DivEuPlugin's
+  * bit-field lane).  It was duplicated here because this plugin is instantiated TWICE
+  * (eu0/eu1), so each copy carried its own funnel + mask-gen + BFFFO priority encoder
+  * for a rare 68020+ family — one shared copy on CPLX replaces both.
   * The slow path is fully occupied as a pipeline (II=1).  A one-cycle reservation
   * blocks only a FAST op that would collide with a slow S3 completion on the shared
   * writeback/completion ports. */
@@ -128,8 +132,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     fastAcceptNextPort = Bool()
     val irf = host[IntRegFileService]
     rdA = irf.newRead(); rdB = irf.newRead()
-    // 3rd int read port: the BITFIELD-dynamic µop's srcC = T0 (BFRESOLVE-packed
-    // offset/width). Only that op uses psrcC on the ALU EU (idle/psrcC=0 otherwise).
+    // 3rd int read port: CASOP's `casC` (Du for CAS, or the packed eq/bothEq status temp
+    // for CAS2) reads psrcC.  DO NOT DELETE THIS PORT when auditing bit-field removal —
+    // an older comment here claimed the BITFIELD-dynamic µop was the ONLY psrcC user on
+    // this EU, and that was already stale when CAS/CAS2 landed.  BITFIELD has since moved
+    // to the CPLX cluster; CASOP has not, and it still needs three int sources.
     rdC = irf.newRead()
     intW = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); intByp = irf.newBypass()
     intWs = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 0); intByps = irf.newBypass()
@@ -151,7 +158,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val u0 = issuePort.payload.uop
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
-    rdC.addr := u0.psrcC                 // BITFIELD-dynamic srcC = T0 (packed offset/width)
+    rdC.addr := u0.psrcC                 // CASOP srcC = Du / the CAS2 status temp
     // srcAValid=False does NOT mean "reads zero" on its own, and the value it does read
     // is worse than undefined — it is a LIVE ARCHITECTURAL REGISTER. EaDecoder gives every
     // EA a nominal `base = 8 + reg` and merely clears `baseValid` for the modes that have
@@ -191,7 +198,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // srcA=Dx (old, merge source) AND srcB=Dy (source data) in s1RdB, while imm=adj16
     // rides s1Src2. All other ops that set useImm=False read s1Src2 == rdB.data anyway.
     val s1RdB   = RegNext(rdB.data)
-    // s1RdC = the BITFIELD-dynamic packed offset/width (srcC = T0 from BFRESOLVE).
+    // s1RdC = CASOP's third source (Du for CASS, or the CAS2 packed eq/bothEq status temp).
     val s1RdC   = RegNext(rdC.data)
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
@@ -205,13 +212,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // toCcr writes only NZVC+X (flag physregs), which are tracked by the STATIC
     // latency-1 flag scoreboards (sbNzvc/sbX); a dynamic slow write would desync them.
     // (Re-confirmed by synth: moving the shifter alone clears the cone.) ──
+    // DecOp.BITFIELD used to share this classification (it added two 32-bit barrel
+    // rotates + a BFFFO CLZ — a comparable cone). It now runs on the CPLX cluster's own
+    // bit-field lane, so SHIFT is the sole slow class here.
     val isShift = u1.op === DecOp.SHIFT
-    // The bit-field datapath (DecOp.BITFIELD) reuses the slow path: it adds two 32-bit
-    // barrel rotates + a CLZ (BFFFO) — a comparable cone to the shifter — and writes
-    // NZ only (V=C=0, X untouched). Routed lat-matched (S1->S3) like SHIFT, with the
-    // same dynamic slowWakeup so a dependent waits on the result landing.
-    val isBitfield = u1.op === DecOp.BITFIELD
-    val isSlow  = isShift || isBitfield
+    val isSlow  = isShift
 
     // SLOW is a genuine six-stage pipeline.  A slow uop is always accepted.  A FAST
     // uop is blocked only when the slow uop currently in S2 will reach S3 next cycle,
@@ -219,8 +224,14 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (s1aValid/s2Valid/s3Valid are the slow valid chain, forward-declared here.)
     // FMax #3 added the S1a stage (split stage1); FMax #4 added the S1b stage (split the
     // bit-field forward-funnel -> modify cone); task #123 added the S1a2 stage (split the
-    // bit-field modify's clz+mux from its rotate/shift half), so the slow pipe is now
+    // bit-field modify's clz+mux from its rotate/shift half), so the slow pipe is
     // S1/S1a/S1a2/S1b/S2/S3.
+    // NOTE: S1a and S1b exist ONLY because the bit-field pipe needed those two cuts; for
+    // SHIFT they have ALWAYS been pure pass-throughs, lat-matching it to the deeper
+    // bit-field pipe. Now that bit-field has moved to the CPLX cluster they are dead
+    // weight and the shift pipe can go lat-4. Deleting them is a SEPARATE change because
+    // it also has to re-point `fastAcceptNextPort` (which hardcodes `!s1bValid` on the
+    // strength of S1b being the stage one before S2).
     val s1aValid = Bool()
     val s1a2Valid = Bool()
     val s1bValid = Bool()
@@ -228,8 +239,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s3Valid  = Bool()
     s1Valid.simPublic(); s1aValid.simPublic(); s1a2Valid.simPublic()
     s1bValid.simPublic(); s2Valid.simPublic(); s3Valid.simPublic()
-    val isSlowIn = (issuePort.payload.uop.op === DecOp.SHIFT) ||
-                   (issuePort.payload.uop.op === DecOp.BITFIELD)
+    val isSlowIn = issuePort.payload.uop.op === DecOp.SHIFT
     // An empty upstream register must always see capacity: its retained payload is
     // stale and must not prevent the IQ from loading a safe slow candidate.
     issuePort.ready := !flushPort && (!issuePort.valid || isSlowIn || !s2Valid)
@@ -596,11 +606,14 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (cheap) count-derived SHIFT AMOUNTS + masked source; we REGISTER that midpoint
     // (s1aStage1a) and stage1b performs the (wide) variable barrel shifts off the
     // registered amounts. The deep funnel cone is now halved across the S1->S1a boundary.
-    // After FMax#4 (the bit-field S1b stage) the shift is the lat-5 (S1,S1a,S1b,S2,S3)
-    // SLOW path (it passes through S1b unmodified, lat-matched to the now-deeper bit-field
-    // pipe); the dynamic slowWakeup (broadcast at S3) makes the extra cycles latency-
-    // agnostic (no static scoreboard constant — the IQ waits on the wakeup). RegNext
-    // (chained s*Valid) gates issue.
+    // The shift is the LAT-6 (S1, S1a, S1a2, S1b, S2, S3) SLOW path — NOT lat-5; the
+    // comment that said so predated task #123's S1a2 stage and was stale for a year.
+    // Shift COMPUTES in exactly three of those six (S1 = stage1a, S1a2 = stage1b,
+    // S2 = stage2, then S3 merges/writes back); S1a and S1b are pure pass-throughs it
+    // inherited from lat-matching the (deeper, now-departed) bit-field pipe.
+    // The dynamic slowWakeup (broadcast at S3) makes the stage count latency-agnostic
+    // (no static scoreboard constant — the IQ waits on the wakeup). RegNext (chained
+    // s*Valid) gates issue.
     //
     // S1: stage1a (amounts) -> register into S1a.
     val s1Stage1a = Shifter.stage1a(shiftCmd)
@@ -609,178 +622,27 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s1aCtx     = RegNext(s1Ctx)
     val s1aSrc1    = RegNext(s1Src1)
 
-    // ── S1: bit-field datapath (DecOp.BITFIELD) ────────────────────────────────
-    // Dy = s1Src1 (field reg, srcA=op[2:0]); Dn2 = s1RdB (insert source for BFINS,
-    // srcB); offset/width = the packed imm (imm[4:0]=offset, imm[9:5]=raw width). The
-    // datapath is computed combinationally here (parallel to the shifter, NOT on the
-    // fast S1 writeback cone) and its finished result+flags are pipelined to S3 so the
-    // slow writeback/wakeup mechanism is shared with SHIFT (lat-matched).
-    // STATIC: offset/raw-width from the imm (s1Src2[9:0]). DYNAMIC (bfDynamic): from the
-    // BFRESOLVE-packed T0 read via srcC (s1RdC[9:0]) — SAME packed layout (offset[4:0],
-    // raw width[9:5]). The EU normalizes width = ((rawWidth-1)&31)+1 (5-bit field; the
-    // register-value low 5 bits are equivalent to Musashi's ((width-1)&31)+1 on the full
-    // value). Dy/Dn2 (BFINS) are unchanged.
-    val bfPacked = Mux(u1.bfDynamic, s1RdC, s1Src2)
-    // ── MEMORY bit-field load-only form (bfMem): the field comes from a (possibly
-    // misaligned) memory LONG `lo` (= srcA = T0) plus an optional spill BYTE `hi`
-    // (= srcB = T1, valid only when bitOff+width>32). The funnel left-justifies the
-    // `width`-bit field into bits[31:32-width]:
-    //   field32 = (lo << bitOff) | (needHi ? (hi[7:0] >> (8-bitOff)) : 0)
-    // then feeds the SAME datapath with dy=field32, rotate offset=0, rawWidth=width,
-    // and ffoBase = the ORIGINAL memory bit offset (for BFFFO). All of bitOff/width/
-    // needHi/origOffset are STATIC, packed into imm by the assembler:
-    //   imm[4:0]=0 (rotate offset), imm[9:5]=rawWidth, imm[12:10]=bitOff,
-    //   imm[13]=needHi, imm[18:14]=origOffset.
-    val bfMem      = u1.bfMem
-    // DYNAMIC mem (slice 3c): the packed {origOff/needHi/bitOff/rawWidth} rides srcC (the
-    // BFRESOLVE-produced temp), not the static imm. (bfPacked already muxes rawWidth.)
-    val bfMemImm   = Mux(bfMem && u1.bfDynamic, s1RdC, s1Src2)
-    // LO5RAW/HI5RAW (bfStoreForm 4/5, slice 3c Do=1 RMW): the inverse funnel reads bitOff
-    // from srcC = the raw offset reg Dn[off] (bitOff = Dn[off]&7) so the resolved `packed`
-    // temp is NOT held across the store reconstruction — keeps the live set within T0/T1/T2
-    // (no archDepth bump). needHi/origOff are unused by the LO5/HI5 inverse funnel.
-    val bfRawOffForm = (u1.bfStoreForm === U(4, 3 bits)) || (u1.bfStoreForm === U(5, 3 bits))
-    // FFOFULL (bfStoreForm=6, slice 3c dynamic-mem BFFFO): the field is ALREADY left-aligned
-    // (prefunnelled into srcA) so bitOff=0 / needHi=0; ffoBase = srcB = the FULL signed Dn[off]
-    // (Musashi result = original_offset + first-set-index). A bfMem op (NOT register-form) so it
-    // rides the proven bfMem slow path.
-    val bfFfoFull   = u1.bfStoreForm === U(6, 3 bits)
-    val bfMemBitOff = Mux(bfRawOffForm, s1RdC(2 downto 0).asUInt,
-                         Mux(bfFfoFull, U(0, 3 bits), bfMemImm(12 downto 10).asUInt))  // 0..7
-    val bfMemNeedHi = Mux(bfFfoFull, False, bfMemImm(13))
-    val bfMemOrigOff= bfMemImm(18 downto 14).asUInt          // 0..31
-    val bfLo       = s1Src1                                   // T0 (the misaligned long)
-    val bfHi       = s1RdB                                    // T1 (the spill byte, low 8 bits)
-    val bfFieldLo  = (bfLo.asUInt << bfMemBitOff)(31 downto 0)
-    // hi >> (8 - bitOff): keep the top `bitOff` bits of the byte. (8-bitOff) in 1..8.
-    val bfHiShAmt  = (U(8, 4 bits) - bfMemBitOff.resize(4))   // 1..8
-    val bfFieldHi  = Mux(bfMemNeedHi, (bfHi(7 downto 0).asUInt.resize(32) >> bfHiShAmt)(31 downto 0), U(0, 32 bits))
-    val bfField32  = (bfFieldLo | bfFieldHi).asBits
-    // FMax #4 — SPLIT the forward-funnel -> modify cone. The post-route critical path was
-    // the bit-field forward funnel (bfField32 = (lo<<bitOff)|(hi>>(8-bitOff))) feeding the
-    // Bitfield datapath modify (chg/clr/set/ins) ALL in one S1 cone (16 LUT levels, WNS
-    // -1.142 @ 250). We now REGISTER the Bitfield inputs (the funnelled `dy`, dn2, offset,
-    // rawWidth, op, ffoBase) at the end of S1 and compute the modify in the NEXT stage
-    // (S1a), then the inverse funnel in S1b. This adds ONE cycle of latency to the slow
-    // pipe (now S1/S1a/S1b/S2/S3); the dynamic slowWakeup (broadcast at S3) makes the
-    // extra cycle latency-agnostic (the IQ waits on the wakeup — no static scoreboard
-    // constant). Register-form (bfMem=False) ops ride the same added stage (uniform latency,
-    // byte-correct) since dy=s1Src1 is registered into the same s1aBfCmd.
-    val bfCmd = BitfieldCmd()
-    bfCmd.dy       := Mux(bfMem, bfField32, s1Src1)
-    // BFINS insert source Dn2: the register form / 3a load-only path carries it on srcB
-    // (s1RdB). The mem-RMW chains route Dn2 via srcC (s1RdC) because srcB carries the spill
-    // byte `hi` (5-byte RES form) — keyed on a valid srcC for a bfMem compute.
-    bfCmd.dn2      := Mux(bfMem && u1.psrcCValid, s1RdC, s1RdB)
-    bfCmd.offset   := Mux(bfMem, U(0, 5 bits), bfPacked(4 downto 0).asUInt)
-    bfCmd.rawWidth := bfPacked(9 downto 5).asUInt
-    bfCmd.bfOp     := u1.bfOp
-    // FFO additive base (32-bit): static-mem -> origOff (the memory bit offset); register form
-    // -> the field offset (offset&31). DYNAMIC mem BFFFO (slice 3c, prefunnelled register-form:
-    // bfMem=False, bfOp=5, with a valid srcB carrying Dn[off]) -> the FULL signed 32-bit offset
-    // (Musashi result = original_offset + first-set-index). Register-form BFFFO (Dn) has srcB
-    // invalid -> falls to offset&31.
-    bfCmd.ffoBase  := Mux(bfFfoFull, s1RdB.asUInt,
-                         Mux(bfMem, bfMemOrigOff.resize(32),
-                             bfPacked(4 downto 0).asUInt.resize(32)))
-    val bfStoreForm = u1.bfStoreForm
-    // ── S1 -> S1a CUT: register the Bitfield inputs (post forward-funnel) + the inverse-
-    // funnel raw inputs (bitOff, storeForm, the lo/hi merge source s1Src1, the LO5/HI5 res
-    // source s1RdB=T2). The Bitfield datapath modify now runs in S1a off these registers. ──
-    val s1aBfCmd     = RegNext(bfCmd)
-    val s1aBfStoreF1 = RegNext(bfStoreForm)
-    val s1aBfBitOff1 = RegNext(bfMemBitOff)
-    val s1aBfInvSrc1 = RegNext(s1Src1)        // lo/hi merge source (srcA = T0/T1)
-    val s1aBfT2      = RegNext(s1RdB)          // LO5/HI5 res source (srcB = T2)
-
-    // S1a: the Bitfield datapath rotate/shift/left-justify cone (task #123, Fable audit
-    // 2026-07-12 finding F1). This is the FIRST half of the (now further-split) modify
-    // cone — see Bitfield.stage1/stage2's doc comment. The clz + mask-modify + result
-    // mux (the deep half, 20 LUT levels combined with the rotates in the ORIGINAL
-    // single-cycle `Bitfield.apply`) now runs a cycle later in S1a2, off a REGISTERED
-    // BitfieldMid — mirroring the FMax#4 precedent that split the forward-funnel from
-    // the modify (S1 -> S1a) below.
-    val s1aBfMid = Bitfield.stage1(s1aBfCmd)
-    // ── S1a -> S1a2 CUT: register the rotate/shift midpoint + the OTHER S1a-registered
-    // inverse-funnel inputs (they must move in lockstep with bfMid, one more cycle). ──
-    val s1a2BfMid    = RegNext(s1aBfMid)
-    val s1a2BfStoreF1 = RegNext(s1aBfStoreF1)
-    val s1a2BfBitOff1 = RegNext(s1aBfBitOff1)
-    val s1a2BfInvSrc1 = RegNext(s1aBfInvSrc1)
-    val s1a2BfT2      = RegNext(s1aBfT2)
-
-    // S1a2: the clz + mask-modify + 8-way result/flag mux, off the REGISTERED midpoint.
-    val bfRsp = Bitfield.stage2(s1a2BfMid)
-    // ── MEMORY bit-field RMW INVERSE FUNNEL (store-back, slice 3b) ───────────────
-    // The RMW chains (BFCHG/BFCLR/BFSET/BFINS) route through the microcode engine; each
-    // compute µop carries a bfStoreForm (DecodedUop): 0=RES, 1=LO4 (4-byte combined),
-    // 2=LO5, 3=HI5. The RES/LO4 forms compute `res` via the funnel+modify (bfRsp.result
-    // over the funnelled field32) + the NZ flags from the loaded field. The LO5/HI5 forms
-    // read `res` directly from srcB (= T2, the b2 result) — NO funnel.
-    //   lomask = (bitOff==0) ? 0 : (0xffffffff << (32-bitOff))
-    //   lo' = (lo & lomask) | (res >> bitOff)                  [LO4/LO5 output]
-    //   himask = 0xff >> bitOff
-    //   hi' = (hi & himask) | ((res << (8-bitOff)) & 0xff)     [HI5 output]
-    // The inverse funnel is PIPELINED into the S1b stage (off a registered `res`/`lo`/`hi`/
-    // bitOff) so it does NOT stack in series with the modify in one cone; for LO5/HI5 each
-    // is its OWN µop (one funnel-depth, naturally shallow).
-    // `res` driving the inverse funnel: LO4 (form 1) recomputes it inline from the funnel;
-    // LO5/HI5 (forms 2/3) read it from T2 (registered s1a2BfT2). The lo/hi source for the
-    // merge = srcA (T0 for lo / T1 for hi) = registered s1a2BfInvSrc1.
-    val bfInvResS1a2 = Mux(s1a2BfStoreF1 === U(1, 2 bits), bfRsp.result, s1a2BfT2)
-    val bfInvSrcS1a2 = s1a2BfInvSrc1
-    // ── S1a2 -> S1b CUT: register the inverse-funnel inputs + the modify result/flags. ──
-    val s1bInvRes    = RegNext(bfInvResS1a2)
-    val s1bInvSrc    = RegNext(bfInvSrcS1a2)
-    val s1bBitOff    = RegNext(s1a2BfBitOff1)
-    val s1bStoreForm = RegNext(s1a2BfStoreF1)
-    val s1bBfFunnelRes = RegNext(bfRsp.result)
-    val s1bBfN       = RegNext(bfRsp.n)
-    val s1bBfZ       = RegNext(bfRsp.z)
-    // S1b: the inverse-funnel masks/shifts (off the registered inputs).
-    val s1bLomask = Mux(s1bBitOff === 0, B(0, 32 bits),
-                        (B(0xffffffffL, 32 bits).asUInt << (U(32, 6 bits) - s1bBitOff.resize(6)))(31 downto 0).asBits)
-    val s1bLoStore = ((s1bInvSrc.asUInt & s1bLomask.asUInt) | (s1bInvRes.asUInt >> s1bBitOff)).asBits
-    val s1bHiShL   = (U(8, 4 bits) - s1bBitOff.resize(4))     // 8-bitOff, 1..8
-    val s1bHimask  = (B(0xff, 8 bits).asUInt >> s1bBitOff)(7 downto 0).asBits
-    val s1bHiStore = ((s1bInvSrc(7 downto 0).asUInt & s1bHimask.asUInt) |
-                      (s1bInvRes.asUInt << s1bHiShL)(7 downto 0))(7 downto 0).asBits
-    // S1b: select the bit-field result by store form. RES/load-only/LO4 take the modify
-    // result (registered from S1a); LO5/HI5 take the inverse-funnel output computed THIS
-    // stage. HI5 writes only the low byte (the store µop is BYTE-sized; upper bits d/c).
-    val s1bBfRes  = s1bStoreForm.mux(
-      U(1, 3 bits) -> s1bLoStore,                          // LO4
-      U(2, 3 bits) -> s1bLoStore,                          // LO5
-      U(3, 3 bits) -> s1bHiStore.resize(32),               // HI5 (low byte)
-      U(4, 3 bits) -> s1bLoStore,                          // LO5RAW (3c Do=1: bitOff from Dn[off])
-      U(5, 3 bits) -> s1bHiStore.resize(32),               // HI5RAW (low byte)
-      default      -> s1bBfFunnelRes)                      // 0 = RES / load-only
-    // ── S1a -> S1a2: pure pass-through for the shift/ctx/valid/src1 chain (no shifter
-    // computation here) — keeps the shift pipe lat-matched with the bit-field pipe's
-    // NEW S1a2 stage (task #123). ──
+    // ── S1a -> S1a2: PURE PASS-THROUGH for the shift/ctx/valid/src1 chain (no shifter
+    // computation here). It existed only to lat-match the bit-field pipe's S1a stage
+    // (task #123); with bit-field gone it is a dead stage. ──
     s1a2Valid      := RegNext(s1aValid && !flushPort) init False
     val s1a2Stage1a = RegNext(s1aStage1a)
     val s1a2Ctx    = RegNext(s1aCtx)
     val s1a2Src1   = RegNext(s1aSrc1)
     // ── S1a2: stage1b (the deep variable shifts) off the registered amounts -> register
-    // the ShiftStage1 midpoint into S1b (the FMax#3 cut). FMax#4 added the S1b stage, and
-    // task #123 added this S1a2 stage, so the shift pipe stays lat-matched with the (now
-    // two cycles longer) bit-field pipe; the shift midpoint and ctx/src1 pass THROUGH S1b
-    // unmodified into S2. ──
+    // the ShiftStage1 midpoint into S1b (the FMax#3 cut). The shift midpoint and ctx/src1
+    // pass THROUGH S1b unmodified into S2 — S1b was the bit-field inverse-funnel stage
+    // and is likewise dead now. ──
     val s1Stage1 = Shifter.stage1b(s1a2Stage1a)
     s1bValid     := RegNext(s1a2Valid && !flushPort) init False
     val s1bStage1 = RegNext(s1Stage1)
     val s1bCtx    = RegNext(s1a2Ctx)
     val s1bSrc1   = RegNext(s1a2Src1)
-    // ── S1b -> S2: register the shift midpoint (pass-through) + the finished bit-field
-    // result/flags (computed in S1b above), so a single S2/S3 stage serves both. ──
+    // ── S1b -> S2: register the shift midpoint (pass-through). ──
     s2Valid      := RegNext(s1bValid && !flushPort) init False
     val s2Stage1 = RegNext(s1bStage1)
     val s2Ctx    = RegNext(s1bCtx)
     val s2Src1   = RegNext(s1bSrc1)        // merge source preserved to S3
-    val s2BfRes  = RegNext(s1bBfRes)
-    val s2BfN    = RegNext(s1bBfN)
-    val s2BfZ    = RegNext(s1bBfZ)
 
     // SLOW S2: bit-extract + mux on the registered midpoint. Register the finished
     // result/flags into final stage S3.
@@ -791,10 +653,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val s3ShiftRes  = RegNext(s2Rsp.result)
     val s3ShiftNzvc = RegNext(s2Rsp.n ## s2Rsp.z ## s2Rsp.v ## s2Rsp.c)
     val s3ShiftX    = RegNext(s2Rsp.xOut)
-    val s3BfRes     = RegNext(s2BfRes)
-    val s3BfNzvc    = RegNext(s2BfN ## s2BfZ ## False ## False)   // {N,Z,V=0,C=0}
     val u3 = s3Ctx.uop
-    val s3IsBitfield = u3.op === DecOp.BITFIELD
     val slowFire = s3Valid && !flushPort
     s2Valid.simPublic(); s3Valid.simPublic(); slowFire.simPublic()
 
@@ -804,12 +663,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
       Size.BYTE -> (s3Src1(31 downto 8)  ## s3ShiftRes(7 downto 0)),
       Size.WORD -> (s3Src1(31 downto 16) ## s3ShiftRes(15 downto 0)),
       Size.LONG -> s3ShiftRes)
-    // BITFIELD writes the FULL 32-bit result (no .B/.W merge); the shifter takes the
-    // size-merge. The slow path completes at most one op per cycle, so a simple
-    // op-class mux is correct.
-    val slowResult = Mux(s3IsBitfield, s3BfRes, slowMerged)
-    val slowNzvc   = Mux(s3IsBitfield, s3BfNzvc, s3ShiftNzvc)
-    val slowX      = s3ShiftX   // BITFIELD leaves X untouched (writesX=False)
+    // SHIFT is now the only class on this pipe, so the former BITFIELD-vs-SHIFT result
+    // and flag muxes are gone (BITFIELD wrote the full 32 bits with no size merge).
+    val slowResult = slowMerged
+    val slowNzvc   = s3ShiftNzvc
+    val slowX      = s3ShiftX
 
     // ---- S3: SLOW writeback. These drive the SAME physical PRF write
     // ports as the fast S1 writeback above (merged by `wbKey`); the S3 reservation
