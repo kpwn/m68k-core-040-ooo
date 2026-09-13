@@ -311,6 +311,32 @@ busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
 
 ## 4. Bigger structural items, in value order
 
+> ### ⭐ 0. PRF WRITE-PORT SLOT PERMUTATION -- best MHz per unit of risk, do it FIRST
+>
+> `RegFilePlugin` records that the physical write-port slot ORDER moved post-route
+> FMax by **12.7-17.8 MHz** between two observed draws. That is larger than any single
+> RTL lever measured in this campaign, and it costs NO area, NO IPC and NO logic
+> change -- nothing in the design depends on the order.
+>
+> The current order (`0=AluEu0 1=AluEu1 2=BranchEu 3=LsEu 4=DivEu 5=excA7`) was chosen
+> to END an elaboration-order lottery, not to be fast, and **has never been measured**.
+> So there is a double-digit-MHz result sitting unclaimed behind a one-line change.
+>
+> Now sweepable without touching source (`83a1a1ac`):
+>
+>     PRF_SLOT_PERM_INT=2,0,1,3,4,5    make impl ...
+>
+> Default = identity = today's order, so the knob is inert until used. A malformed
+> permutation FAILS ELABORATION -- it would otherwise silently delete a physical write
+> port, which is register-file corruption that shows up in a timing report as a
+> *faster* build.
+>
+> **Method:** 6 slots = 720 permutations, so do NOT sweep exhaustively. Each point is a
+> full implementation run. Sample a handful, and read §7 before believing any delta --
+> run-to-run implementation variance is real and this effect must be separated from it.
+> The Nzvc and X files have their own slot orders and their own knobs.
+
+
 1. **Load-use speculative wakeup.** `lsWait` is DYNAMIC: a load's dependents learn at
    completion broadcast and issue a cycle late. Load-use is the most common dependency
    in real code, so this cycle is paid constantly. Static/speculative wakeup on
