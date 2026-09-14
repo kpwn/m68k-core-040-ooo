@@ -252,7 +252,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      itlb.umAccessRobId := U(0, 6 bits)
+      // ROB_ID_W is 5 bits since the ROB 64->32 cut; hardcoding 6 here made this
+      // whole spec fail to ELABORATE (width mismatch), silently disabling the
+      // strongest validation suite in the repo.  Track the global instead.
+      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1

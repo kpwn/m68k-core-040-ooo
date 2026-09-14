@@ -56,7 +56,12 @@ trait RegfileService {
   def spec: RegfileSpec
   def newRead(forceNoBypass: Boolean = false): RegFileReadPort
   def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0): RegFileWritePort
-  def newBypass(): RegFileBypassPort
+  /** `deadProbe` = this source is BELIEVED never to be the hit source (its producer
+    * drives write+bypass+wakeup in the same cycle, and the registered issue stage means
+    * no dependent read can land that cycle).  In SIMULATION ONLY, RegFilePlugin asserts
+    * the port never hits, turning that reasoning into a checked invariant before the
+    * port is deleted.  Zero synthesis cost. */
+  def newBypass(deadProbe: Boolean = false): RegFileBypassPort
 }
 
 trait IntRegFileService  extends RegfileService

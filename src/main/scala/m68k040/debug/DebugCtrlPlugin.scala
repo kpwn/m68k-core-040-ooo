@@ -81,7 +81,21 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     if (enable && stage >= 3) {
       host.get[IntRegFileService].foreach { rf =>
         debugIntRead = rf.newRead(forceNoBypass = true)
-        debugIntWrite = rf.newWrite(latency = 1, sharingKey = "excA7", priority = 2)
+        // Share BranchEu's int write port rather than owning one.  The
+        // exception A7 write moved to BranchEuPlugin.IntWbKey (FullCoreSynth
+        // a7Wr, priority 0), which left "excA7" referenced by this line ALONE
+        // -- i.e. a whole distinct physical write port for writes that only
+        // happen at an effective halt.  Under the PRF's LVT every write port
+        // costs a FULL register-file copy (measured marginal cost of the 6th
+        // port: ~900 LUT, plus a 32-bit write-data broadcast and a 6-bit
+        // write-address fanout).  A debug write and a BranchEu write cannot be
+        // valid together: debug writes only with the pipe drained and retire
+        // blocked.  RegFilePlugin asserts in simulation if two writers sharing
+        // a key are ever valid in the same cycle, so this is CHECKED, not
+        // argued -- the same basis as a7Wr's own comment in FullCoreSynth.
+        debugIntWrite = rf.newWrite(latency = 1,
+                          sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey,
+                          priority = 2)
       }
       host.get[NzvcRegFileService].foreach { rf =>
         debugNzvcWrite = rf.newWrite(latency = 1, sharingKey = "rteNzvc", priority = 2)

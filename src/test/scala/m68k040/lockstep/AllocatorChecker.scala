@@ -72,12 +72,25 @@ final class FreelistShadow(val name: String, physCount: Int, archCount: Int) {
   * NaxRiscv comparison: we rename five register classes where NaxRiscv renames two). */
 final class AllocatorChecker(ren: RenameStage) {
   private case class Bound(shadow: FreelistShadow, fl: Freelist)
+  // Sizes are read FROM THE DUT's own Freelist components, never hardcoded.
+  //
+  // They used to be literals, and the int one said 50 while Config.physInt had
+  // moved to 54 -- so every legal allocation of phys id 50..53 was reported as
+  // "pop/push of out-of-range phys id", failing whichever tests happened to
+  // allocate that far.  That is why the failures looked random and spanned
+  // completely unrelated families (bitfield mem-DYNAMIC, p163 pic-header, CAS,
+  // stale-fwd): the only thing they shared was allocating deep enough to reach
+  // 50.  Deriving from `fl.physCount`/`fl.archCount` makes the checker track any
+  // future PRF resize by construction.
+  private def shadowFor(name: String, fl: Freelist) =
+    Bound(new FreelistShadow(name, fl.physCount, fl.archCount), fl)
+
   private val bound: Seq[Bound] = Seq(
-    Bound(new FreelistShadow("int",  50, m68k040.isa.Isa.ARCH_INT_REGS), ren.logic.intFree),
-    Bound(new FreelistShadow("nzvc", 16, 1), ren.logic.nzvcFree),
-    Bound(new FreelistShadow("x",    16, 1), ren.logic.xFree),
-    Bound(new FreelistShadow("fp",   16, 8), ren.logic.fpFree),
-    Bound(new FreelistShadow("fpcc", 16, 1), ren.logic.fpccFree))
+    shadowFor("int",  ren.logic.intFree),
+    shadowFor("nzvc", ren.logic.nzvcFree),
+    shadowFor("x",    ren.logic.xFree),
+    shadowFor("fp",   ren.logic.fpFree),
+    shadowFor("fpcc", ren.logic.fpccFree))
 
   private var cycle = 0L
 

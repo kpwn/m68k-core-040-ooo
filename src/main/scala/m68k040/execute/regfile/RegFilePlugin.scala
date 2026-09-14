@@ -10,6 +10,7 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
   private val reads    = ArrayBuffer[(RegFileReadPort, Boolean)]()
   private val writeReq = ArrayBuffer[WriteReq]()
   private val bypasses = ArrayBuffer[RegFileBypassPort]()
+  private val bypassDeadProbe = ArrayBuffer[Boolean]()
 
   override def newRead(forceNoBypass: Boolean = false): RegFileReadPort = {
     val p = RegFileReadPort(spec.addressWidth, spec.dataWidth)
@@ -19,9 +20,9 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     val p = RegFileWritePort(spec.addressWidth, spec.dataWidth)
     writeReq += WriteReq(p, latency, if (sharingKey == null) new Object else sharingKey, priority); p
   }
-  override def newBypass(): RegFileBypassPort = {
+  override def newBypass(deadProbe: Boolean = false): RegFileBypassPort = {
     val p = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
-    bypasses += p; p
+    bypasses += p; bypassDeadProbe += deadProbe; p
   }
 
   val logic = during build new Area {
@@ -56,7 +57,8 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     // LinkedHashMap still hashes for lookup but iterates in insertion order.
     //
     // The resulting Int-RF slot order is
-    //   0=AluEu0  1=AluEu1  2=BranchEu  3=LsEu  4=DivEu  5=RobPlugin exception ("excA7")
+    //   0=AluEu0  1=AluEu1  2=BranchEu (+ exception A7 + DebugCtrl, all on IntWbKey)
+    //   3=LsEu  4=DivEu
     // which is a DIFFERENT permutation from either of the two lottery draws previously
     // observed, so it has not itself been post-route-measured. The permutation IS a real
     // (if second-order) FMax knob; it is now a deliberate, reproducible one. To sweep it,
@@ -239,6 +241,11 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
         val bypData = bypasses.zip(hits).map { case (b, h) => b.data.andMask(h) }.reduceBalancedTree(_ | _)
         r.data := Mux(anyHit, bypData, rfData)
         GenerationFlags.simulation {
+          for ((h, i) <- hits.zipWithIndex if bypassDeadProbe(i)) {
+            assert(!h,
+              s"RegFile ${spec.name}: bypass source #$i is marked deadProbe but HIT a " +
+              "read address -- it is load-bearing after all; do NOT delete it", FAILURE)
+          }
           assert(CountOne(hits) <= 1,
             s"RegFile ${spec.name}: two bypass sources matched ONE read address -- the " +
             "distinct-physical-register precondition is broken and the OR-reduce would " +

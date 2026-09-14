@@ -20,7 +20,7 @@ class DebugIntRfStubPlugin extends FiberPlugin with IntRegFileService {
   override def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0) = {
     val p = RegFileWritePort(spec.addressWidth, spec.dataWidth); writes += p; p
   }
-  override def newBypass() = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
+  override def newBypass(deadProbe: Boolean = false) = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
 
   val logic = during build new Area {
     val values = in(Vec.fill(spec.depth)(Bits(spec.dataWidth bits)))
@@ -37,7 +37,7 @@ class DebugNzvcRfStubPlugin extends FiberPlugin with NzvcRegFileService {
   override def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0) = {
     write = RegFileWritePort(spec.addressWidth, spec.dataWidth); write
   }
-  override def newBypass() = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
+  override def newBypass(deadProbe: Boolean = false) = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
   val logic = during build new Area {
     val writePort = write
     writePort.valid.simPublic(); writePort.address.simPublic(); writePort.data.simPublic()
@@ -51,7 +51,7 @@ class DebugXRfStubPlugin extends FiberPlugin with XRegFileService {
   override def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0) = {
     write = RegFileWritePort(spec.addressWidth, spec.dataWidth); write
   }
-  override def newBypass() = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
+  override def newBypass(deadProbe: Boolean = false) = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
   val logic = during build new Area {
     val writePort = write
     writePort.valid.simPublic(); writePort.address.simPublic(); writePort.data.simPublic()
