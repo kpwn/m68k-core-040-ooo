@@ -179,8 +179,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   // fully PREDICTABLE internal one: the debug session's own retire-count target.
   var debugHaltImminentIn: Bool = null
   // `inhibitedLoadBusySig`: True from the cycle an INHIBITED load's bus command
-  // launches until its response is actually consumed, +1 cycle -- mirrors
-  // StoreQueue's `preciseDrainBusyReg`/`io.preciseDrainBusy` exactly, but tracks
+  // launches until the LAUNCHING UOP RETIRES (it leaves the ROB head) -- see
+  // `launcherStillAtHead` at the drive site. It is NOT "response consumed +1 cycle";
+  // that was the PRE-4b6a91bc behaviour and this comment described it for a while
+  // after the fix landed, which is actively misleading: the whole point of the fix is
+  // that an IRQ arriving in the +1-cycle window squashed a macro whose device read had
+  // ALREADY happened, and the replay re-popped the device. It mirrors
+  // StoreQueue's `preciseDrainBusyReg`/`io.preciseDrainBusy` in ROLE, but tracks
   // the LOAD-launch half of the same "a precise device transaction is in flight"
   // concept instead of the STORE-drain half. Fed to the ROB as a sibling of
   // `preciseDrainBusyIn` (kept separate, not folded in: that name is store-
