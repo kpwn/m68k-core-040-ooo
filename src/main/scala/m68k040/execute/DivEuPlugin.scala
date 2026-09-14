@@ -500,7 +500,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // completion/writeback/wakeup/euFault ports the SAME or next cycle. A 1-cycle
     // pulse: default-clear, set only by a capture.
     val compValid     = RegInit(False)
-    val compRobId     = Reg(UInt(6 bits))
+    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
     val compData      = Reg(Bits(32 bits))
     val compPdst      = Reg(UInt(6 bits))
     val compPdstValid = RegInit(False)
@@ -873,7 +873,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // single-outstanding iterative lane.
     val remLatch      = Reg(Bits(32 bits)) init 0
     val ovLatch       = RegInit(False)
-    val remStashRobId = Reg(UInt(6 bits)) init 0
+    val remStashRobId = Reg(UInt(m68k040.Global.ROB_ID_W bits)) init 0
     val remStashValid = RegInit(False)
     /** Publish this DIV's remainder/overflow under its OWN robId. Guarded on the flush
       * latch so a wrong-path divide that finishes AFTER the flush cannot hand its
@@ -1002,8 +1002,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
     // A main .L64 result is associated with the immediately following MULHI ROB
     // entry.  Store high under (mainRob+1) so the queued tail indexes with its own id.
-    val mulHiMem = Mem(Bits(32 bits), 64)
-    val mulHiValid = Reg(Bits(64 bits)) init 0
+    val mulHiMem = Mem(Bits(32 bits), m68k040.Global.ROB_DEPTH.get)
+    val mulHiValid = Reg(Bits(m68k040.Global.ROB_DEPTH.get bits)) init 0
     val mulHiHead = mulHiPendingQ.io.pop.payload
     val mulHiHeadReady = mulHiPendingQ.io.pop.valid && mulHiValid(mulHiHead.robId)
     val mulHiData = mulHiMem.readAsync(mulHiHead.robId)
@@ -1249,7 +1249,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // A second, independent completion register. compValid/compData/... above remain
     // exclusively the int/NZVC 32-bit path and are untouched by this lane.
     val fpCompValid     = RegInit(False)
-    val fpCompRobId     = Reg(UInt(6 bits))
+    val fpCompRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
     val fpCompPdst      = Reg(UInt(4 bits))
     val fpCompPdstValid = RegInit(False)
     val fpCompData      = Reg(Bits(80 bits))

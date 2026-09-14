@@ -101,12 +101,12 @@ class StoreQueue(depth: Int = 8) extends Component {
   val io = new Bundle {
     val alloc    = slave(Flow(SqAlloc()))
     val fwd      = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
-    val commit   = slave(Flow(UInt(6 bits)))
+    val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
     // Second same-cycle commit port: a store can retire in EITHER slot of the 2-wide
     // retire (slot 1 when it completed early behind a long-latency head, e.g. DIV).
     // Marking a cycle LATE is unsafe — a flush arriving the next cycle would squash
     // the already-retired store — so both retire slots must mark in the retire cycle.
-    val commitB  = slave(Flow(UInt(6 bits)))
+    val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
     val flush    = in(Bool())
     val drain    = master(Stream(DStoreCmd()))
     // Terminal acknowledgement for the oldest accepted half. `drain` is a real
@@ -123,7 +123,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     // (which is muxed between P3 and P4), so the gate is always answered for the
     // load it is actually gating.
     val barrier = new Bundle {
-      val robId               = in(UInt(6 bits))
+      val robId               = in(UInt(m68k040.Global.ROB_ID_W bits))
       val olderStore          = out(Bool())   // ANY older resident store
       val olderInhibitedStore = out(Bool())   // an older resident DEVICE store
     }
@@ -134,7 +134,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     // allocating while full; the sim assert below enforces that contract.
     val full     = out(Bool())
     // ---- precise-path at-head drain (Task P2) ----
-    val robHeadIn           = in(UInt(6 bits))   // = rob.logic.h0
+    val robHeadIn           = in(UInt(m68k040.Global.ROB_ID_W bits))   // = rob.logic.h0
     val robHeadValidIn      = in(Bool())         // = rob.logic.count > 0
     val irqPreemptPendingIn = in(Bool())         // = rob.logic.interruptPending || rob.logic.tracePendingFire
     val sqCompletion        = master(Flow(UInt(6 bits)))

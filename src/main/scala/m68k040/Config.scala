@@ -7,11 +7,17 @@ import spinal.core._
 case class M68kParams(
     // ROB depth. RobPlugin now DERIVES its array size from this (it used to hardcode
     // 64, which made this knob a lie -- see the 2026-09-14 note there).
-    // ⚠️ 32 DOES NOT ELABORATE YET. 28 robId sites now derive from Global.ROB_ID_W
-    // (19 bundle fields + 9 service ports), but the tail is not finished: elaboration
-    // still stops in LsEuPlugin.scala:238 and DivEuPlugin.scala:1009. Finish those and
-    // re-verify by checking the NETLIST (sysValStore_32..63 must vanish), not merely
-    // that a build ran -- that mistake was made once already.
+    // ⚠️ 32 DOES NOT ELABORATE YET -- the refactor is ~45 sites in and NOT finished.
+    // Ten iterations each uncovered one more class; the last stop was
+    // LsEuPlugin.scala:1410. Remaining work is mechanical but long: every robId-carrying
+    // width must derive from Global.ROB_ID_W, and every ROB-indexed array from
+    // ROB_DEPTH. DO NOT widen `pdst` along with them -- pdst is 6 bits because there
+    // are 54 PHYSICAL REGISTERS, and conflating the two is how this breaks.
+    //
+    // ⚠️ VERIFY BY THE NETLIST, NOT BY "a build ran": `sysValStore_32..63` must VANISH
+    // from generated/M68kFullCoreSynth.v. Earlier today a rebuild was confirmed, the
+    // ROB had NOT shrunk, and the resulting "IPC-neutral" reading was neutral precisely
+    // because nothing had changed.
     // The payoff when done: ROB per-entry state (~19,318 cells) halves and robIdWidth
     // drops 6 -> 5 across ~339 references -- the largest congestion lever left for the
     // 200 MHz SoC, which closes standalone (+0.007) but misses by 0.5-1.2 ns integrated.

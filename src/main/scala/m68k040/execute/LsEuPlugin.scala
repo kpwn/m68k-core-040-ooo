@@ -218,7 +218,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     excXlateWrite   = Bool(); excXlateToken = UInt(DTranslationToken.Width bits)
     excXlateReady   = Bool()
     sqEmptySig      = Bool()
-    robHeadIn              = UInt(6 bits)
+    robHeadIn              = UInt(m68k040.Global.ROB_ID_W bits)
     robHeadValidIn         = Bool()
     irqPreemptPendingIn    = Bool()
     sqCompletionPort       = Flow(UInt(m68k040.Global.ROB_ID_W bits))
@@ -235,12 +235,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // need no wiring; the full-core wiring overrides it with {retire1, h1}.
     sqCommitBPort  = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     sqCommitBPort.valid.allowOverride;   sqCommitBPort.valid   := False
-    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, 6 bits)
+    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, m68k040.Global.ROB_ID_W bits)
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
-    xlateRobIdSig  = UInt(6 bits)
+    xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -327,7 +327,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
     // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
     // can never assert, matching the SQ's own pre-P2.5 dead-wired defaults.
-    robHeadIn.allowOverride;           robHeadIn := U(0, 6 bits)
+    robHeadIn.allowOverride;           robHeadIn := U(0, m68k040.Global.ROB_ID_W bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
     // A DUT with no RobPlugin (most standalone LS tests) never has a debug-auto-
@@ -622,7 +622,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // on the wrong (by-then-reallocated) robId. Idle-default here; driven from
     // the SAME apply event as the wbObs replay so the two can never separate.
     sqCompletionPort.valid   := False
-    sqCompletionPort.payload := U(0, 6 bits)
+    sqCompletionPort.payload := U(0, m68k040.Global.ROB_ID_W bits)
     sqFaultCompletionPort.valid := False
     sqFaultCompletionPort.payload.assignDontCare()
     preciseDrainBusySig    := sq.io.preciseDrainBusy
@@ -1100,7 +1100,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val size      = Reg(m68k040.isa.Size()) init m68k040.isa.Size.BYTE
       val cmode     = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
       val cmodeB    = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
-      val robId     = Reg(UInt(6 bits)) init 0
+      val robId     = Reg(UInt(m68k040.Global.ROB_ID_W bits)) init 0
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -1617,7 +1617,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // at the cost of ONE extra completion-latency cycle (lock-step is latency-
     // agnostic). All comp* are RegInit/Reg (no uninit fanout).
     val compValid     = RegInit(False)
-    val compRobId     = Reg(UInt(6 bits))
+    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
     compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
     compData.simPublic() // debug-only, task #144
