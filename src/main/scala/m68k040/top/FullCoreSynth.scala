@@ -447,7 +447,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // The fetch walk's U-descriptor write drains at retire (tagged robId 0; the U bit
     // is idempotent / not architecturally compared) and discards on flush.
     val itlb = host[m68k040.mmu.ItlbPlugin]
-    itlb.umAccessRobId := U(0, 6 bits)
+    itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
     itlb.umCommitValid := rob.logic.retire0
     itlb.umCommitBValid := rob.logic.retire1
     itlb.umCommitBId    := rob.logic.h1

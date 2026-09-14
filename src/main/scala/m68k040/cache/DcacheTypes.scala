@@ -22,6 +22,12 @@ import spinal.core._
   */
 object DLoadToken {
   val Width = 8
+  /** Bits the token reserves for the robId. FIXED AT 6 and deliberately INDEPENDENT of
+    * Global.ROB_ID_W: the token is a cross-module encoding (bit7 = special, bit6 =
+    * bDone, bits5:0 = robId, with 0x80/0x81/0x82 reserved), shared with DcachePlugin's
+    * early-probe CAM. A smaller ROB pads into this field rather than reshaping the
+    * token -- the layout, and every reserved value, stay bit-identical. */
+  val RobIdBits = 6
   /** Commit-side exception sequencer (`LsEuPlugin`'s exception override mux). */
   val EXC       = 0x80
   /** ITLB table-walk descriptor read. */

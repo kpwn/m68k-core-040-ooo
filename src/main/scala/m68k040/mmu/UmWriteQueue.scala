@@ -99,7 +99,7 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     * (see the flush block). A dead entry keeps its slot -- so the ring stays contiguous
     * -- and pops at the head in one cycle WITHOUT issuing its descriptor write. */
   val dead      = Vec.fill(depth)(RegInit(False))
-  val robIds    = Vec.fill(depth)(RegInit(U(0, 6 bits)))
+  val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W bits)))
   val addrs     = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val bytes     = Vec.fill(depth)(RegInit(B(0, 8 bits)))
 

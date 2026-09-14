@@ -137,7 +137,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     val robHeadIn           = in(UInt(m68k040.Global.ROB_ID_W bits))   // = rob.logic.h0
     val robHeadValidIn      = in(Bool())         // = rob.logic.count > 0
     val irqPreemptPendingIn = in(Bool())         // = rob.logic.interruptPending || rob.logic.tracePendingFire
-    val sqCompletion        = master(Flow(UInt(6 bits)))
+    val sqCompletion        = master(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
     val sqFaultCompletion   = master(Flow(m68k040.execute.LsFault()))
     val preciseDrainBusy    = out(Bool())
     // ---- Part 127: flush/orphan handshake with LsEuPlugin's `pendMem` ring --------
@@ -156,7 +156,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   // ---- ring storage (all RegInit) ----
   val valids    = Vec.fill(depth)(RegInit(False))
   val committed = Vec.fill(depth)(RegInit(False))
-  val robIds    = Vec.fill(depth)(RegInit(U(0, 6 bits)))
+  val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W bits)))
   val paddrs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val datas     = Vec.fill(depth)(RegInit(B(0, 32 bits)))
   val sizes     = Vec.fill(depth)(RegInit(Size.BYTE()))
@@ -403,8 +403,10 @@ class StoreQueue(depth: Int = 8) extends Component {
   // (`committed(a)` is checked at the call site below, not inside this helper,
   // so `olderThan` here covers ONLY case 2's head-anchored math.)
   def olderThan(a: UInt, b: UInt): Bool = {
-    val ageA = (a - io.robHeadIn)(5 downto 0)
-    val ageB = (b - io.robHeadIn)(5 downto 0)
+    // Age is computed modulo the ROB, so the slice width must follow ROB_ID_W --
+    // it was hardcoded (5 downto 0) for a 64-entry ROB.
+    val ageA = (a - io.robHeadIn)(m68k040.Global.ROB_ID_W - 1 downto 0)
+    val ageB = (b - io.robHeadIn)(m68k040.Global.ROB_ID_W - 1 downto 0)
     ageA < ageB
   }
 
@@ -764,9 +766,9 @@ class StoreQueue(depth: Int = 8) extends Component {
   // single tree (same depth as the prior youngest-full select), avoiding a serial
   // dependency on a separately-reduced `best.dist` (which regressed FMax).
   val anyPartial = perEntry.map(_.partial).orR
-  val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(5 downto 0)))
+  val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(m68k040.Global.ROB_ID_W - 1 downto 0)))
   case class Cand() extends Bundle {
-    val valid = Bool(); val full = Bool(); val dist = UInt(6 bits); val data = Bits(32 bits)
+    val valid = Bool(); val full = Bool(); val dist = UInt(m68k040.Global.ROB_ID_W bits); val data = Bits(32 bits)
   }
   val cands = (0 until depth).map { i =>
     val c = Cand()

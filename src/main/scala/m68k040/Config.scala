@@ -29,7 +29,7 @@ case class M68kParams(
     // The payoff when done: ROB per-entry state (~19,318 cells) halves and robIdWidth
     // drops 6 -> 5 across ~339 references -- the largest congestion lever left for the
     // 200 MHz SoC, which closes standalone (+0.007) but misses by 0.5-1.2 ns integrated.
-    robDepth:     Int = 64,
+    robDepth:     Int = 32,
     physInt:      Int = 54,
     physNzvc:     Int = 16,
     physX:        Int = 16,

@@ -161,6 +161,10 @@ case class TranslationRsp() extends Bundle {
   * while the preceding registered response is consumed. */
 object DTranslationToken {
   // LsEuPlugin composition: {backendEpoch, splitPhase, robId[5:0]}.
+  /** Bits reserved for the robId, FIXED AT 6 and deliberately independent of
+    * Global.ROB_ID_W -- same contract as DLoadToken.RobIdBits. A smaller ROB pads into
+    * this field so the composition and the $80 reservation stay bit-identical. */
+  val RobIdBits = 6
   //
   // Task 11 reserves the value $80 for the serializing commit-side ExceptionUnit's own
   // FSAVE/FRESTORE state-frame translations, mirroring the sibling `DLoadToken`
