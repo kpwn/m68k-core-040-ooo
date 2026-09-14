@@ -7,7 +7,7 @@ import spinal.core.sim._
 import spinal.lib._
 
 case class SqAlloc() extends Bundle {
-  val robId = UInt(6 bits)
+  val robId = UInt(m68k040.Global.ROB_ID_W bits)
   // ---- slot A (always present) ----
   val paddr = UInt(32 bits)
   val vaddr = UInt(32 bits)   // logical address of slot A -- the SSW EA field for a
@@ -35,7 +35,7 @@ case class SqAlloc() extends Bundle {
 }
 
 case class SqFwdQuery() extends Bundle {
-  val robId = UInt(6 bits)
+  val robId = UInt(m68k040.Global.ROB_ID_W bits)
   val paddr = UInt(32 bits)
   val size  = Size()
   // ── split/page-crossing second half (cross-page forward-hazard fix) ──────────

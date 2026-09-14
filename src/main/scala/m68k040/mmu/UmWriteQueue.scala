@@ -4,7 +4,7 @@ import spinal.core._
 import spinal.lib._
 
 case class UmWriteAlloc() extends Bundle {
-  val robId   = UInt(6 bits)
+  val robId   = UInt(m68k040.Global.ROB_ID_W bits)
   val addr    = UInt(32 bits)   // byte address of the descriptor byte to RMW
   val newByte = Bits(8 bits)    // new value of that byte (old | set-bits)
 }
@@ -34,10 +34,10 @@ class UmWriteQueue(depth: Int = 4) extends Component {
 
   val io = new Bundle {
     val alloc    = slave(Flow(UmWriteAlloc()))
-    val commit   = slave(Flow(UInt(6 bits)))
+    val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
     // Slot-1 retire commit (a tagged op can dual-retire at h1 behind a long-latency
     // head; both retire slots must mark the SAME cycle — see StoreQueue.commitB).
-    val commitB  = slave(Flow(UInt(6 bits)))
+    val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
     val flush    = in Bool ()
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()

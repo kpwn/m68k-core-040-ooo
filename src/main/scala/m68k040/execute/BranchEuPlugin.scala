@@ -13,7 +13,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * is a real control-transfer branch worth learning). The ROB records these per-entry
   * at completion and drives the BTB write port at retire (no wrong-path pollution). */
 case class BranchCompletion() extends Bundle {
-  val robId      = UInt(6 bits)
+  val robId      = UInt(m68k040.Global.ROB_ID_W bits)
   val mispredict = Bool()
   val nextPc     = UInt(32 bits)
   // ── BTB-update fields ──
@@ -46,7 +46,7 @@ case class BranchCompletion() extends Bundle {
   * ExceptionUnit.entryFaultAddr exactly like an LS access-fault EA. Zero/unused for
   * TRAPV/CHK/DIV0 (their is2 path never reads entryFaultAddr). */
 case class EuFault() extends Bundle {
-  val robId     = UInt(6 bits)
+  val robId     = UInt(m68k040.Global.ROB_ID_W bits)
   val vector    = UInt(8 bits)
   val faultAddr = UInt(32 bits)
 }
@@ -56,7 +56,7 @@ case class EuFault() extends Bundle {
   * lock-step whitebox reconstructs the A7 update (joined by robId). */
 case class BrWbObs() extends Bundle {
   val valid   = Bool()
-  val robId   = UInt(6 bits)
+  val robId   = UInt(m68k040.Global.ROB_ID_W bits)
   val nextPc  = UInt(32 bits)
   val anWrite = Bool()
   val anData  = Bits(32 bits)

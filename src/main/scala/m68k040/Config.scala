@@ -7,12 +7,11 @@ import spinal.core._
 case class M68kParams(
     // ROB depth. RobPlugin now DERIVES its array size from this (it used to hardcode
     // 64, which made this knob a lie -- see the 2026-09-14 note there).
-    // ⚠️ 32 DOES NOT ELABORATE YET, by design -- it now fails LOUDLY instead of
-    // silently aliasing. `robId` is hardcoded `UInt(6 bits)` in at least five places
-    // (rob/CommitSlot.scala:7,25; execute/iq/IqContext.scala:9,99;
-    // execute/AluEuPlugin.scala:33, and the other EUs' completion payloads). Those must
-    // all derive from this parameter before the ROB can shrink; until then elaboration
-    // stops with "Too many bit to address the vector (6 in place of 5)".
+    // ⚠️ 32 DOES NOT ELABORATE YET. 28 robId sites now derive from Global.ROB_ID_W
+    // (19 bundle fields + 9 service ports), but the tail is not finished: elaboration
+    // still stops in LsEuPlugin.scala:238 and DivEuPlugin.scala:1009. Finish those and
+    // re-verify by checking the NETLIST (sysValStore_32..63 must vanish), not merely
+    // that a build ran -- that mistake was made once already.
     // The payoff when done: ROB per-entry state (~19,318 cells) halves and robIdWidth
     // drops 6 -> 5 across ~339 references -- the largest congestion lever left for the
     // 200 MHz SoC, which closes standalone (+0.007) but misses by 0.5-1.2 ns integrated.

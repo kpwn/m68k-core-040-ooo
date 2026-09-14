@@ -59,7 +59,7 @@ trait DivEuService {
 /** Pruned descriptor that follows the fixed MUL datapath.  Do not replace this
   * with IqContext: the multiplier needs only result-routing and flag metadata. */
 case class MulPipeContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
   val pNzvcDst    = UInt(4 bits)
@@ -74,7 +74,7 @@ case class MulPipeContext() extends Bundle {
   * routing descriptor removes it from the sole CPLX issue port without carrying
   * a full IqContext or inventing a false PRF dependency. */
 case class MulHiContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val dstArch     = UInt(5 bits)
 }
@@ -90,7 +90,7 @@ case class MulHiContext() extends Bundle {
   * destination, an NZVC destination and the arch-reg number for the whitebox, and
   * nothing else.  BITFIELD raises no fault, reads no flags and never writes X. */
 case class BfPipeContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
   val pNzvcDst    = UInt(4 bits)
@@ -100,7 +100,7 @@ case class BfPipeContext() extends Bundle {
 
 /** One result waiting for the existing single CPLX completion/writeback lane. */
 case class CplxResult() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val data        = Bits(32 bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
@@ -123,7 +123,7 @@ case class CplxResult() extends Bundle {
   * no operation selector (the op is already inside FpuCore's own pipe, and the rounding mode
   * travels with the request inside `FpRoundReq.rmode`). */
 case class FpPipeContext() extends Bundle {
-  val robId     = UInt(6 bits)
+  val robId     = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst      = UInt(4 bits)   // FP data physical dest (RenamedUop.pFpDst)
   val pdstValid = Bool()         // False for FCMP/FTST (FPCC-only ops)
   val pFpccDst  = UInt(4 bits)
@@ -273,7 +273,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
   during setup {
     issuePort      = Stream(IqContext())
-    completionPort = Flow(UInt(6 bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
@@ -290,7 +290,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
     nzvcRd = nz.newRead(forceNoBypass = false)   // CMP2/CHK2 reads old N/V to preserve them
     // ---- FP lane ----
-    fpCompletionPort = Flow(UInt(6 bits))
+    fpCompletionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     fpWakeupPort     = Flow(UInt(4 bits))
     fpccWakeupPort   = Flow(UInt(4 bits))
     fpFaultPort      = Flow(EuFault()); fpFaultPort.simPublic()

@@ -53,7 +53,7 @@ trait LsEuService {
   * `entryFaultAtc`. Was previously hardcoded True unconditionally (moot before
   * this task since the ONLY existing fault source was the MMU path). */
 case class LsFault() extends Bundle {
-  val robId      = UInt(6 bits)
+  val robId      = UInt(m68k040.Global.ROB_ID_W bits)
   val faultAddr  = UInt(32 bits)
   val write      = Bool()
   val sizeBits   = UInt(2 bits)
@@ -221,7 +221,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     robHeadIn              = UInt(6 bits)
     robHeadValidIn         = Bool()
     irqPreemptPendingIn    = Bool()
-    sqCompletionPort       = Flow(UInt(6 bits))
+    sqCompletionPort       = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     sqFaultCompletionPort  = Flow(LsFault())
     preciseDrainBusySig    = Bool()
     debugHaltImminentIn    = Bool()
@@ -229,11 +229,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     quiesceHold            = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
-    completionPort = Flow(UInt(6 bits))
-    sqCommitPort   = Flow(UInt(6 bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
+    sqCommitPort   = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     // Slot-1 commit: defaults to idle (allowOverride) so single-retire benches/stubs
     // need no wiring; the full-core wiring overrides it with {retire1, h1}.
-    sqCommitBPort  = Flow(UInt(6 bits))
+    sqCommitBPort  = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     sqCommitBPort.valid.allowOverride;   sqCommitBPort.valid   := False
     sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, 6 bits)
     sqFlushSig     = Bool()
@@ -859,7 +859,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // The full 300+ bit RenamedUop stays in P1; P2/P3/P4 replicate this pruned token
     // instead, keeping the area cost of three simultaneously-resident accesses bounded.
     case class FrontPipeCtx() extends Bundle {
-      val robId           = UInt(6 bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W bits)
       val vaddr           = UInt(32 bits)
       val addrB           = UInt(32 bits)
       val storeData       = Bits(32 bits)
@@ -1122,7 +1122,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // extractCross, are ALREADY carried as llReg.vaddr(3 downto 0) / llReg.size —
     // no new state for those.
     case class BkCtx() extends Bundle {
-      val robId           = UInt(6 bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W bits)
       val pdst            = UInt(6 bits)
       val pdstValid       = Bool()
       val wakes           = Bool()
@@ -2150,7 +2150,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // the ROB head and completed, so it is guaranteed older than anything a later
     // flush could legitimately discard).
     case class PendingStoreWb() extends Bundle {
-      val robId      = UInt(6 bits)
+      val robId      = UInt(m68k040.Global.ROB_ID_W bits)
       val dstArch    = UInt(5 bits)
       val data       = Bits(32 bits)
       val pdst       = UInt(6 bits)
