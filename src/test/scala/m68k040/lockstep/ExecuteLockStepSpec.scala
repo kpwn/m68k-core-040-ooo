@@ -1299,13 +1299,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         {
           val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
           val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
-          if (dut.rob.logic.retire0.toBoolean && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
+          // MACRO-LAST uops only (2026-09-15). `commitPc` is the retiring UOP's next pc:
+          // for a branch uop that is the RESOLVED target, but for every other uop it is
+          // the sequential `pc + len`. JSR/BSR crack to [push retPC] + [ibranch], and the
+          // push uop's sequential next pc IS the return address -- i.e. the pc of the
+          // instruction after the call. Keying the poke on every uop therefore raised
+          // IPL on the call's PUSH retire, one whole macro before the boundary the
+          // event named, and the DUT took the interrupt before the callee's `rts`. When
+          // that callee is entered twice (odd-ssp: `jsr (%a1)` then `bsr.s sub1`) the
+          // resulting boundary -- "before the SECOND visit of sub1's rts" -- is one the
+          // pc-keyed oracle cannot express at all, so the boundary sweep failed on the
+          // untouched baseline exactly as on any change. Gating on the macro-last uop
+          // makes the trigger the instruction's real next pc (the branch uop's resolved
+          // target for a call), which is what the oracle's own `--irq-event` keys on.
+          val last0 = dut.rob.logic.debugMacroRetirePc(0).valid.toBoolean
+          val last1 = dut.rob.logic.debugMacroRetirePc(1).valid.toBoolean
+          if (dut.rob.logic.retire0.toBoolean && last0 && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
             firedEvents += rawPc0
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc0)
             dut.intCtrl.logic.iackAvec   #= avec
             dut.intCtrl.logic.iackVector #= vectorIn
           }
-          if (dut.rob.logic.retire1.toBoolean && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
+          if (dut.rob.logic.retire1.toBoolean && last1 && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
             firedEvents += rawPc1
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc1)
             dut.intCtrl.logic.iackAvec   #= avec

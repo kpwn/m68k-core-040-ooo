@@ -1476,6 +1476,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugMacroRetirePc(0).payload := p0.pc
     debugMacroRetirePc(1).valid := retire1 && p1.last
     debugMacroRetirePc(1).payload := p1.pc
+    // Sim-only (2026-09-15): the IRQ lock-step harness keys its reactive IPL poke on the
+    // MACRO-LAST retire, not on every uop -- see ExecuteLockStepSpec.runIrqLockStep. No
+    // hardware; may renumber auto-named signals (documented name hazard, not QoR).
+    debugMacroRetirePc.foreach(_.valid.simPublic())
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
     // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
