@@ -88,5 +88,9 @@ class AxiDMergePlugin(val grantTimeout: BigInt = AxiDMerge.V1_TIMEOUT_CYCLES)
     val wedge = merge.io.wedge
     val wedgeIsRead = merge.io.wedgeIsRead
     wedge.simPublic(); wedgeIsRead.simPublic()
+    /** Hardware-readable post-mortem (DebugRegMap.OFF_STALL_ARB). `wedge`/`wedgeIsRead`
+      * above are simPublic ONLY, so on real silicon an ARBITER_WEDGE halt said nothing
+      * about direction or owner. */
+    val dbgArbPack = merge.io.dbgArbPack
   }
 }

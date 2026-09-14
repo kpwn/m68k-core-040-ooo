@@ -122,6 +122,13 @@ class AxiDMerge(axiCfg: Axi4Config,
     val rvRReady  = in Bool ()
     val wedge       = spinal.core.out Bool ()
     val wedgeIsRead = spinal.core.out Bool ()
+    /** D20 POST-MORTEM PACK. When the watchdog fires, the halt tells you THAT the
+      * arbiter wedged but not WHICH owner stranded a transaction, and every owner has
+      * usually gone idle by the time you look -- measured 2026-09-14: at a live wedge
+      * the D-cache, both TLB walkers, the ExceptionUnit and the store queue all read
+      * IDLE while the grant was still held. Without this you cannot tell a read-side
+      * from a write-side wedge, nor name the owner. */
+    val dbgArbPack  = spinal.core.out Bits (32 bits)
     val out         = master(Axi4(axiCfg))
   }
 
@@ -407,6 +414,26 @@ class AxiDMerge(axiCfg: Axi4Config,
 
   io.wedge       := rd.wedge || wr.wedge
   io.wedgeIsRead := rd.wedge
+
+  // ── D20 post-mortem pack (2026-09-14) ────────────────────────────────────────────
+  // Readable at DebugRegMap.OFF_STALL_ARB. Answers the two questions a bare
+  // ARBITER_WEDGE halt cannot: WHICH DIRECTION wedged, and WHICH OWNER held the grant.
+  // Both are latched arbiter state, so they survive the owners going idle -- which they
+  // do: at a live wedge the D-cache, both TLB walkers, the ExceptionUnit and the store
+  // queue all read IDLE while the grant was still held, meaning an AR/AW went out and
+  // the response never came back.
+  io.dbgArbPack := B(0, 32 bits)
+  io.dbgArbPack(0)            := rd.busy
+  io.dbgArbPack(1)            := rd.arTaken
+  io.dbgArbPack(3 downto 2)   := rd.owner.asBits
+  io.dbgArbPack(7 downto 4)   := rd.req.asBits.resize(4)     // per-owner read requests
+  io.dbgArbPack(8)            := rd.wedge
+  io.dbgArbPack(16)           := wr.busy
+  io.dbgArbPack(17)           := wr.awTaken
+  io.dbgArbPack(19 downto 18) := wr.owner.asBits
+  io.dbgArbPack(23 downto 20) := wr.req.asBits.resize(4)     // per-owner write requests
+  io.dbgArbPack(24)           := wr.wedge
+  io.dbgArbPack(31)           := io.wedge
 
   // ── Section 4.4's required assertions ─────────────────────────────────────────────
   // Sim-only. `GenerationFlags.simulation` needs `.includeSimulation` on the enclosing

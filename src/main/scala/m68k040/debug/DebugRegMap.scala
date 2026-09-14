@@ -119,6 +119,10 @@ object DebugRegMap {
   val OFF_STALL_GRANT: Int = 0x01020
   val OFF_STALL_EXC: Int = 0x01024
   val OFF_STALL_WALK: Int = 0x01028
+  /** AxiDMerge post-mortem: which DIRECTION wedged and which OWNER held the grant.
+    * A bare ARBITER_WEDGE halt cannot say, and every owner is typically idle by the
+    * time the halt is read (measured 2026-09-14). */
+  val OFF_STALL_ARB: Int = 0x0102C
   val OFF_ARCH_D0: Int = 0x02000
   val OFF_ARCH_D1: Int = 0x02004
   val OFF_ARCH_D2: Int = 0x02008

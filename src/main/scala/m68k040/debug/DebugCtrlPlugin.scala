@@ -180,6 +180,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     // elaborate. Each reader below falls back to a literal zero, so an absent
     // peer reads as an all-zero word rather than breaking the build.
     val stallDcache = if (enable) host.get[m68k040.cache.DcachePlugin] else None
+    // AxiDMergePlugin shares this PluginHost (SocketTop adds it to M68kCore's plugin
+    // list), so the arbiter's post-mortem pack is reachable the same way.
+    val stallArb    = if (enable) host.get[m68k040.socket.AxiDMergePlugin] else None
     val stallLsEu   = if (enable) host.get[m68k040.execute.LsEuPlugin] else None
     val stallRob    = if (enable) host.get[m68k040.rob.RobPlugin] else None
     val stallDtlb   = if (enable) host.get[m68k040.mmu.DtlbPlugin] else None
@@ -977,6 +980,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           // retire count being frozen, and these four words say what it is frozen
           // ON. See DebugRegMap's OFF_STALL_* comment for why they live here in
           // the counter block rather than the halt-captured arch block.
+          is(DebugRegMap.OFF_STALL_ARB) {
+            rData := stallArb.map(_.logic.dbgArbPack).getOrElse(B(0, 32 bits))
+          }
           is(DebugRegMap.OFF_STALL_DC) {
             rData := stallDcache.map(_.logic.dbgStallDcPack).getOrElse(B(0, 32 bits))
           }
