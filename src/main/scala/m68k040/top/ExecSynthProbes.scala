@@ -84,6 +84,16 @@ class PrfSynthProbePlugin extends FiberPlugin {
   // Flattening the mux (92e8f69a) fixed the mux DEPTH; it did not reduce the
   // comparator COUNT. PRF_PROBE_INT_BYPASSES=n sweeps it.
   val nIntByps   = envInt("PRF_PROBE_INT_BYPASSES", 1)
+  /** PRF_PROBE_CROSSBAR=k: model the SHARED-READ design. Instead of giving every
+    * consumer its own RF read port, allocate k PHYSICAL read ports and fan them out
+    * to `PRF_PROBE_INT_READS` consumers through a select mux -- i.e. what the
+    * 14R -> 6R reduction would actually build.
+    *
+    * This exists to measure the ONE thing that gates that reduction: the crossbar sits
+    * in the operand-read path, the hottest path in the machine, so the question was
+    * never whether the area works out (14 reads x ~431 LUT says it does) but how much
+    * DELAY the mux adds. 0 = off (dedicated ports, today's design). */
+  val nXbar      = envInt("PRF_PROBE_CROSSBAR", 0)
 
   var iReads: Seq[RegFileReadPort] = null
   var iWrites: Seq[RegFileWritePort] = null
@@ -94,7 +104,9 @@ class PrfSynthProbePlugin extends FiberPlugin {
 
   during setup {
     val irf = host[IntRegFileService]
-    iReads = Seq.fill(nIntReads)(irf.newRead())
+    // With the crossbar modelled, only nXbar PHYSICAL ports exist; the extra
+    // consumers are served by muxing those, exactly as a shared-read PRF would.
+    iReads = Seq.fill(if (nXbar > 0) nXbar else nIntReads)(irf.newRead())
     // Each write gets a DISTINCT sharing key, so each becomes its own PHYSICAL port --
     // that is the thing being measured.  (iW0 keeps the priority=1 shared-key form the
     // original harness used, so the 2-port default is bit-for-bit the old gate.)
@@ -112,9 +124,20 @@ class PrfSynthProbePlugin extends FiberPlugin {
 
   val logic = during build new Area {
     // int reads -- registered both sides so the measured path is RF read + bypass mux
-    val iRData = iReads.zipWithIndex.map { case (r, i) =>
-      r.addr := RegNext(in UInt (r.addr.getWidth bits))
-      out(RegNext(r.data)).setName(s"iR${i}Data")
+    val iRAddrIn = iReads.map(r => RegNext(in UInt (r.addr.getWidth bits)))
+    iReads.zip(iRAddrIn).foreach { case (r, a) => r.addr := a }
+    val iRData = if (nXbar <= 0) {
+      iReads.zipWithIndex.map { case (r, i) => out(RegNext(r.data)).setName(s"iR${i}Data") }
+    } else {
+      // Each of the nIntReads consumers selects one of the nXbar physical ports.
+      // The select is registered so the measured path is RF read -> crossbar mux ->
+      // consumer flop, which is precisely the added delay in question.
+      val sel = (0 until nIntReads).map(i => RegNext(in UInt (log2Up(nXbar) max 1 bits)).setName(s"xbSel$i"))
+      (0 until nIntReads).map { i =>
+        val chosen = if (nXbar == 1) iReads.head.data
+                     else iReads.map(_.data).read(sel(i).resize(log2Up(nXbar)))
+        out(RegNext(chosen)).setName(s"iR${i}Data")
+      }
     }
     // int writes -- one registered input set per PHYSICAL port
     for (w <- iWrites) {
