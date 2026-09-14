@@ -12463,7 +12463,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         } catch {
           case e: org.scalatest.exceptions.TestFailedException =>
             lastErr = e
-            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against the boundary-$j oracle (frame base 0x$fbJ%08x)")
+            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against the boundary-$j oracle (frame base 0x$fbJ%08x): ${e.getMessage.take(360)}")
         }
       }
       assert(matchedAt >= 0,
