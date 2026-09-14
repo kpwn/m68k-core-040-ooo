@@ -301,8 +301,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       case None    => iplIn := 0;       iackAvec := False;      iackVector := 0
     }
 
-    val depth  = 64
-    val robIdW = log2Up(depth) // = 6, wraps naturally
+    // Depth comes from the PARAMETER, not a literal (2026-09-14). It was `= 64`
+    // hardcoded, which made `Config.robDepth` a LIE: setting robDepth=32 narrowed
+    // `robIdWidth` to 5 bits while leaving 64 entries here -- 64 entries addressed by
+    // a 5-bit id, i.e. silent aliasing rather than a smaller ROB. Everything else in
+    // this plugin already derives from `depth` (45 uses, and robIdW below), so wiring
+    // the parameter in is all that was missing.
+    val depth  = m68k040.Global.ROB_DEPTH.get
+    val robIdW = log2Up(depth) // wraps naturally
 
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)
