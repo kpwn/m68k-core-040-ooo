@@ -7,12 +7,20 @@ import spinal.core._
 case class M68kParams(
     // ROB depth. RobPlugin now DERIVES its array size from this (it used to hardcode
     // 64, which made this knob a lie -- see the 2026-09-14 note there).
-    // ⚠️ 32 DOES NOT ELABORATE YET -- the refactor is ~45 sites in and NOT finished.
-    // Ten iterations each uncovered one more class; the last stop was
-    // LsEuPlugin.scala:1410. Remaining work is mechanical but long: every robId-carrying
-    // width must derive from Global.ROB_ID_W, and every ROB-indexed array from
-    // ROB_DEPTH. DO NOT widen `pdst` along with them -- pdst is 6 bits because there
-    // are 54 PHYSICAL REGISTERS, and conflating the two is how this breaks.
+    // ⚠️ 32 DOES NOT ELABORATE YET. ~45 sites are converted and the MECHANICAL work is
+    // DONE -- a full sweep confirms every remaining `UInt(6 bits)` in the core is a
+    // shift count or bit-field width (0..63), not a robId.
+    //
+    // What blocks it is ONE DESIGN DECISION, not another edit. LsEuPlugin.scala:1410
+    // packs the D-cache load token as `False ## bDone ## robId` = 1+1+6 = 8 bits. A
+    // 5-bit robId makes it 7 and the encoding breaks. The comment directly above it
+    // says a documented encoding is not something a perf refactor changes silently, and
+    // that is right: the token is a cross-module contract with DcachePlugin's early-probe
+    // CAM. Decide deliberately whether to pad the robId back to 6 in the token or to
+    // re-spec the token, then finish.
+    //
+    // DO NOT widen `pdst` along the way -- pdst is 6 bits because there are 54 PHYSICAL
+    // REGISTERS, not because of the ROB. Conflating the two is how this breaks.
     //
     // ⚠️ VERIFY BY THE NETLIST, NOT BY "a build ran": `sysValStore_32..63` must VANISH
     // from generated/M68kFullCoreSynth.v. Earlier today a rebuild was confirmed, the
