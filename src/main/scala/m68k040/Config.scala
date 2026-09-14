@@ -5,14 +5,14 @@ import spinal.core._
 /** Compile-time sizing for the whole core (spec Appendix A). All depths are
   * parameters so IPC/area/FMax can be swept without rearchitecting. */
 case class M68kParams(
-    // ROB 32 + PRF 54 (2026-09-14). The PRF, not the ROB, used to bound the window:
-    // 50 phys - 20 arch = 30 in-flight renames against a 64-entry ROB, so more than
-    // half the ROB was unreachable for int-heavy code.
-    // 54 = 20 arch + 32 ROB + 2, the last 2 being what 2-wide rename needs in hand so
-    // the freelist cannot stall in the cycle it allocates before a retire frees.
-    // log2Up(54) = 6, the SAME width as 50 -- no address field, bypass comparator or
-    // IQ scoreboard bitmap widens. robIdWidth drops 6 -> 5 across ~339 references.
-    robDepth:     Int = 32,
+    // ⛔ DO NOT SHRINK THIS EXPECTING THE ROB TO SHRINK. `RobPlugin.scala:304` is
+    // `val depth = 64` -- HARDCODED. robDepth feeds `robIdWidth` and the ID plumbing,
+    // NOT the ROB array. Setting it to 32 therefore leaves 64 entries addressed by a
+    // 5-bit id: silent aliasing, not a smaller ROB. (Tried 2026-09-14; the IPC bench
+    // read "neutral" precisely because nothing had shrunk.)
+    // To actually resize the ROB, RobPlugin must take its depth from this parameter
+    // first -- then the two can move together.
+    robDepth:     Int = 64,
     physInt:      Int = 54,
     physNzvc:     Int = 16,
     physX:        Int = 16,
