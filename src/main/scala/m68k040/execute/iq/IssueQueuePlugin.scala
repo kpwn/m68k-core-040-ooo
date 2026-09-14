@@ -1600,7 +1600,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       // the SAME enable mirrors it cycle for cycle, back-pressure included.
       val ohOf = Seq(oh0, oh1, ohB, ohL, ohC)
       for (k <- 0 until 5) {
-        val fsPiped = RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
+        // PORT 3 (2026-09-14): the LS port has a one-entry skid in front of its issue
+        // register (see `lsSkidValid`), so its shadow mirrors that structure: a skid
+        // shadow captured on every port-3 fire (exactly as `lsSkidHot` is), and an issue
+        // shadow loaded on `lsPiped.ready` from the skid shadow while the skid holds,
+        // else from the live select -- the same source rule the real pipe applies.
+        val fsPiped = if (k == 3) {
+          val fsSkid = RegNextWhen(MuxOH(ohL, fsCtx), selPorts(3).fire)
+          RegNextWhen(Mux(lsSkidValid, fsSkid, MuxOH(ohL, fsCtx)), lsPiped.ready)
+        } else RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
         when(pipedPorts(k).valid) {
           assert(issuePorts(k).payload === fsPiped,
             s"IQ cold-split: port $k dispatch payload diverged from the full-context shadow")
