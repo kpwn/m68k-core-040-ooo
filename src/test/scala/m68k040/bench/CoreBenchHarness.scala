@@ -604,7 +604,14 @@ trait CoreBenchHarness extends AnyFunSuite {
           nzvc      = w.nzvc.toInt,
           nzvcWrite = w.nzvcWrite.toBoolean,
           x         = if (w.x.toBoolean) 1 else 0,
-          xWrite    = w.xWrite.toBoolean)
+          xWrite    = w.xWrite.toBoolean,
+          // 2026-09-14: mirror ExecuteLockStepSpec's capture. Without these two the
+          // handle's emit rule (`WhiteboxCapture.scala:107`, `(!isTempOnly && !divRem)
+          // || keepCommit`) counted every crack tail -- a BSR/JSR stack push, an RMW
+          // store, a DIVREM -- as its own macro instruction, inflating call/return IPC
+          // and reading RMW kernels ~2x.
+          divRem     = w.divRem.toBoolean,
+          keepCommit = w.keepCommit.toBoolean)
         wbMap(w.robId.toInt) = wb
         handle.onWb(w.robId.toInt, wb)
       }

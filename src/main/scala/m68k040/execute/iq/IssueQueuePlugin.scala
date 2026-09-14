@@ -508,7 +508,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // mistaken for the oldest LS — that would block real LS issue forever -> deadlock).
     val lsPresent = B(slots.map(s => s.sel && isLs(s.hot)))
     val ohLoldest = OHMasking.first(lsPresent)         // oldest occupied LS slot (ready or not)
-    val ohL = ohLoldest & lsReady                      // issue it ONLY if it is ready
+    // ---- LS port (3): REGISTERED slot ready via a one-entry skid (2026-09-14) ----
+    // See the port-3 pipe in the registered-issue-stage block below for the full
+    // design. `lsSkidValid` is the ONLY thing `selPorts(3).ready` reads, so the LS
+    // slot's `fire` -- and through it the per-slot `triggers`/scoreboard/compaction
+    // clock enables of all 16 slots -- is a function of a flop, never of the LS EU's
+    // `issuePort.ready` cone. While the skid holds a uop the LS select is masked:
+    // nothing may be selected (the slot's ready is low anyway, this keeps the payload
+    // OR in the pipe exclusive) and the skid's own uop is what the pipe forwards.
+    val lsSkidValid = RegInit(False)
+    lsSkidValid.simPublic()
+    val ohL = ohLoldest & lsReady & B(slotCount bits, default -> !lsSkidValid)
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop
     // writes only the quotient and hands the remainder to its trailing DIVREM crack µop
@@ -672,8 +682,96 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // independently, and now simply carry a 7-bit address instead of a 418-bit payload
     // between the pick and the read. The `readAsync` is combinational, so a µop is still
     // presented to its EU on exactly the same cycle it always was.
+    //
+    // ═══ LS PORT (3): a REGISTERED slot ready (2026-09-14, routing-congestion plan item
+    // 6, half (b)) ═══════════════════════════════════════════════════════════════════
+    //
+    // For ports 0/1/2/4 the m2sPipe with `collapsBubble = false` passes the EU's ready
+    // STRAIGHT THROUGH: `selPorts(k).ready := issuePorts(k).ready`. For the LS EU that
+    // ready is the deepest cone in the machine -- `s1Ready <- tReady <- tCanLeave <-
+    // normalReqArm <- {xlate.req.ready, the D-cache's probe admission, the completion
+    // arbitration ...}` -- and it landed, in ONE cycle, on `selPorts(3).fire`, hence on
+    // `slot.fire` / `events` / `issued` and the triggers/scoreboard/compaction clock
+    // enables of all 16 slots (3,336 of the 3,856 failing endpoints on the routed
+    // 200 MHz build; the D-cache half of that chain is cut in DcachePlugin, this is the
+    // IQ half, and it cuts EVERY source of `issuePort.ready`, not only the D-cache one).
+    //
+    // DESIGN: a one-entry skid (`lsSkidValid`/`lsSkidHot`) in front of the same
+    // registered issue stage the other ports have. Occupancy credit, not a delayed
+    // valid: `selPorts(3).ready := !lsSkidValid`, a plain flop. When the slot fires and
+    // the EU is ready the uop passes straight into the issue register as before (hit
+    // path neutral, no added cycle); when the EU is NOT ready the uop parks in the skid,
+    // the slot ready drops NEXT cycle, and the skid drains into the issue register the
+    // first cycle the EU is ready. The EU's ready still exists -- as the load enable of
+    // the issue register and the skid's drain, i.e. ~2x`IqHot` flops, exactly the
+    // endpoint set it drove before through the m2sPipe register -- but it no longer
+    // reaches the slot array.
+    //
+    // ORDER AND THROUGHPUT. The skid is strictly older than any selectable slot (it was
+    // selected first), and the select is masked while it holds (`ohL` AND `!lsSkidValid`),
+    // so LS issue stays in program order: skid, then oldest ready slot. Throughput is
+    // that of any 2-deep elastic buffer: a 1-cycle EU stall costs the IQ nothing (the
+    // uop it would have refused is absorbed and drains on the recovery cycle), and a
+    // longer stall parks exactly one uop and holds the port -- the slot the old design
+    // would have held is now freed one cycle earlier, never later.
+    //
+    // WHY `collapsBubble = false` IS STILL RIGHT FOR THE OTHER PORTS, AND WHY THIS
+    // DOES NOT REOPEN ITS HAZARD. That flag's comment above warns that freeing a slot
+    // before the EU accepts "grows effective queue depth past slotCount". That IS what
+    // a skid does, by one uop, and it is harmless here because every consumer of an LS
+    // slot's fire is order-insensitive to WHEN the EU takes the uop: LS results are
+    // dynamic-wakeup only (`lsBusy`/`lsNzvcBusy`, cleared at COMPLETION, never a static
+    // latency-1 `events` trigger -- an LS pdst never enters `sbInt`, see the push-time
+    // `push0IsLs` arm), `count`/`readyReg` only need the slot to be truly empty, and a
+    // flush squashes the skid exactly as it squashes the issue register. The one thing
+    // that DID key off "the issue register holds the payload that fired last cycle" is
+    // the retimed C+1 scoreboard clear (`sbClearFire`); with a skid in front that is no
+    // longer true for port 3, so its clear decodes `lsSkidHot`, which by construction
+    // holds the LAST FIRED payload whether it parked or passed through.
+    //
+    // FLUSH. `flushSignal` (the ROB's doFlush pulse OR excActive) clears both the skid
+    // and the issue register (later assignment wins over the same-cycle loads), and the
+    // issue-port valid is additionally gated by `!flushSignal` exactly as for the other
+    // ports (task #139: a payload latched the cycle before a flush must not fire on the
+    // flush cycle). `selPorts(3).valid` is already `... && !flushSignal`, so nothing
+    // enters the skid on a flush cycle either.
+    val lsSkidHot   = Reg(IqHot())
+    val lsIssValid  = RegInit(False)
+    val lsIssHot    = Reg(IqHot())
+    val lsPiped     = Stream(IqHot())
+    lsPiped.valid   := lsIssValid
+    lsPiped.payload := lsIssHot
+    selPorts(3).ready := !lsSkidValid
+    // Forward source into the issue register: the skid when it holds (the select is
+    // masked then, so `selPorts(3).payload` reads all-zero -- `ohSelect` of an empty
+    // one-hot), else the live selection. Folded as an OR so the skid term joins the
+    // existing AND-OR reduce rather than adding a mux level behind it.
+    val lsFwdValid = selPorts(3).valid || lsSkidValid
+    val lsFwdHot   = IqHot()
+    lsFwdHot.assignFromBits(selPorts(3).payload.asBits | lsSkidHot.asBits.andMask(lsSkidValid))
+    when(lsPiped.ready) {                       // m2sPipe(collapsBubble = false) load rule
+      lsIssValid := lsFwdValid
+      lsIssHot   := lsFwdHot
+      lsSkidValid := False                      // whatever the skid held has moved on
+    }
+    when(selPorts(3).fire) {
+      lsSkidHot := selPorts(3).payload          // always: the last fired payload (sbClear)
+      when(!lsPiped.ready) { lsSkidValid := True }
+    }
+    when(flushSignal) {
+      lsSkidValid := False
+      lsIssValid  := False
+    }
+    GenerationFlags.simulation {
+      // The two forward sources are exclusive by the `ohL` mask; a violation here would
+      // OR two payloads into the issue register.
+      assert(!(lsSkidValid && selPorts(3).valid),
+        "IssueQueuePlugin: LS select fired while the port-3 skid holds a uop", FAILURE)
+    }
+
     val pipedPorts = Seq.tabulate(5) { k =>
-      val piped = selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+      val piped = if (k == 3) lsPiped
+                  else selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
       issuePorts(k).valid       := piped.valid && !flushSignal
       issuePorts(k).payload.uop := coldRead(piped.payload)
       issuePorts(k).payload.robId := piped.payload.robId
@@ -1356,8 +1454,14 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // reads a plain m2sPipe FLOP, exactly as task #219 left it -- the cold Mem's LUTRAM
     // read is NOT in this cone. Routing the dsts through the Mem instead would have put a
     // distributed-RAM level back into the `sb*_busy` path this fix exists to shorten.
+    // PORT 3 (2026-09-14): with the registered-ready skid in front of the LS issue
+    // register, `pipedPorts(3).payload` is no longer guaranteed to be the payload that
+    // fired last cycle (a parked uop sits in the skid while the register still holds the
+    // older one). `lsSkidHot` is written on EVERY port-3 fire, parked or passed-through,
+    // so it is exactly "the payload that fired last cycle" on every `sbClearFire(3)`
+    // cycle. Still a plain flop; the sb*_busy cone is unchanged.
     for (k <- selPorts.indices) {
-      val ctx = pipedPorts(k).payload
+      val ctx = if (k == 3) lsSkidHot else pipedPorts(k).payload
       when(sbClearFire(k)) {
         when(ctx.pdstValid)   { sbInt.busy(ctx.pdst)      := False; sbIntClr(ctx.pdst)      := True }
         when(ctx.writesNzvc)  { sbNzvc.busy(ctx.pNzvcDst) := False; sbNzvcClr(ctx.pNzvcDst) := True }
