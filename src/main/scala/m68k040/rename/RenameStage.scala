@@ -58,7 +58,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
                               xRat.io.committedPhys)
 
     // ── Freelists ────────────────────────────────────────────────────────────
-    val intFree  = Freelist(physCount = 50, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
+    val intFree  = Freelist(physCount = 54, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
     val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val fpFree   = Freelist(physCount = 16, archCount = 8, popPorts = 2, pushPorts = 2)

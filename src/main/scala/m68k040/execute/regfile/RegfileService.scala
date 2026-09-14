@@ -14,7 +14,7 @@ object RegfileSpec {
   // the 48-entry Mem, so the producing write never landed and the dependent read returned
   // an uninitialized (per-seed-random) value. addressWidth is log2Up(50)=6 = log2Up(48),
   // so all port widths are unchanged; only the Mem entry count grows (48 -> 50).
-  val Int  = RegfileSpec("int",  32, 50)
+  val Int  = RegfileSpec("int",  32, 54)
   val Nzvc = RegfileSpec("nzvc", 4,  16)
   val X    = RegfileSpec("x",    1,  16)
   val Fp   = RegfileSpec("fp",   80, 16)
