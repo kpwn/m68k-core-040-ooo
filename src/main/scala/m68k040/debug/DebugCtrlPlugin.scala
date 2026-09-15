@@ -309,6 +309,39 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       }
       def excCount: Bits = excCountReg.map(_.asBits).getOrElse(B(0, 32 bits))
 
+      // ── Free-running core_clk cycle counter (OFF_CYCLE_LO / OFF_CYCLE_HI) ────
+      // The ONLY measurement of the core clock this project has. Everything else
+      // is three copies of the same INTENT agreeing with each other -- the SoC's
+      // `buildinfo core_clk_hz`, `fpga_top_clocks.vh`'s MMCM divides, and the XDC
+      // `core_mmcm_clkout0` period. Agreement between three statements of what we
+      // ASKED for is not evidence of what the silicon DOES. Read OFF_CYCLE_LO
+      // twice a known wall-clock interval apart and divide: that is the core
+      // clock, measured.
+      //
+      // No producer, no service lookup, no `stage` gate and no Option: this
+      // counter needs nothing but the clock edge, which is exactly the property
+      // that makes it a clock probe. `excCountReg` above is Option-gated because
+      // it needs a ROB to count anything; this one does not.
+      //
+      // LIFETIME. `CsrArea` runs in `dbgCd` (line ~151), whose reset is the debug
+      // POR -- NOT the socket reset this block can itself request. So the counter
+      // keeps advancing across a CPU reset, across a debug halt, and across a
+      // wedge. That is deliberate: a counter that stops when the CPU stops cannot
+      // distinguish "the clock is dead" from "the CPU is dead", and telling those
+      // two apart is the whole job at a wedge.
+      //
+      // 64 bits, sliced LO/HI exactly like OFF_INST_LO/HI, so a read pair that
+      // straddles a LO wrap can tear the same way OFF_INST does and the host
+      // handles it the same way. LO alone answers the frequency question: it
+      // wraps every 21.5 s at 200 MHz.
+      //
+      // COST: 64 flops plus one carry chain whose only fanout is the read mux --
+      // a self-contained loop that cannot lengthen an existing path.
+      val cycleCountReg = Reg(UInt(64 bits)) init 0
+      cycleCountReg := cycleCountReg + 1
+      cycleCountReg.simPublic()
+      def cycleCount: UInt = cycleCountReg
+
       val pcBodyRead = if (historyBuilt)
         arAddr >= DebugRegMap.OFF_PC_TRACE_BODY &&
           arAddr < DebugRegMap.OFF_PC_TRACE_BODY + historyDepth * 4 else False
@@ -968,6 +1001,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_HALT_KIND) {
             rData := dbgCommit.map(s => s.haltKind.resize(32).asBits).getOrElse(B(0, 32 bits))
           }
+          // Free-running core_clk cycle count -- see cycleCountReg above. This is
+          // the frequency probe; it advances whenever the clock does, halted or
+          // not, so a pair of reads a known interval apart MEASURES the core
+          // clock instead of restating what the build asked for.
+          is(DebugRegMap.OFF_CYCLE_LO) { rData := cycleCount(31 downto 0).asBits }
+          is(DebugRegMap.OFF_CYCLE_HI) { rData := cycleCount(63 downto 32).asBits }
           is(DebugRegMap.OFF_INST_LO) { rData := macroCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_INST_HI) { rData := macroCount(63 downto 32).asBits }
           // Live, free-running, never halt-captured -- see excCountReg above.

@@ -560,6 +560,71 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
     }
   }
 
+  // ── OFF_CYCLE_LO / OFF_CYCLE_HI ────────────────────────────────────────────
+  // This register is the project's ONLY measurement of the core clock; before it
+  // was served, reading 0x01000 returned a hard zero and "the core runs at 5 ns"
+  // rested entirely on three build-time statements of INTENT agreeing with each
+  // other. So these tests check a DERIVATIVE (cycles per known interval), not a
+  // snapshot: a mux arm wired to a plausible constant would pass a snapshot check
+  // and still be a dead probe.
+  test("OFF_CYCLE_LO advances one per core clock, at stage 1, with no producer") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      cd.waitSampling(20)
+
+      val a = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_CYCLE_LO.toLong)
+      assert(a != 0L, "OFF_CYCLE_LO read 0 after 20+ clocks -- the offset is unserved. " +
+        "An unmapped offset returns a hard zero, which is exactly the defect this closes.")
+
+      // Derivative: sample the DUT's own counter 97 clocks apart and require the
+      // register to be the low word of it at the moment it was read.
+      val regBefore = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_CYCLE_LO.toLong)
+      val rawBefore = dut.dbg.logic.csr.cycleCountReg.toBigInt
+      cd.waitSampling(97)
+      val rawAfter = dut.dbg.logic.csr.cycleCountReg.toBigInt
+      assert(rawAfter - rawBefore == 97,
+        s"the counter moved ${rawAfter - rawBefore} over 97 clocks, expected 97")
+      assert(regBefore > 0 && rawBefore >= BigInt(regBefore) && rawBefore - regBefore < 8,
+        s"OFF_CYCLE_LO ($regBefore) does not track the counter ($rawBefore) -- " +
+          "the read mux is wired to the wrong source")
+    }
+  }
+
+  test("OFF_CYCLE_HI is the HIGH word of the same counter, not a second copy of LO") {
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      cd.waitSampling(20)
+      // Far below 2^32 clocks, so HI must read zero while LO does not. A mux arm
+      // accidentally wired to the low slice reads identically to LO and would
+      // otherwise pass unnoticed.
+      val hi = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_CYCLE_HI.toLong)
+      val lo = DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_CYCLE_LO.toLong)
+      assert(hi == 0L, f"OFF_CYCLE_HI = 0x$hi%08X, expected 0 this early in the count")
+      assert(lo != 0L, "OFF_CYCLE_LO must be non-zero by now")
+    }
+  }
+
+  test("the cycle counter survives a config wipe -- only the debug POR clears it") {
+    // The point of siting it in dbgCd with no clear path: at a wedge you must be
+    // able to tell "the clock is dead" from "the CPU is dead", and a counter that
+    // any host write can zero cannot be trusted as the clock witness. cfg_wipe
+    // (OFF_DBG_RESET_CTL bit 0) restores every host-writable CSR to POR; this
+    // counter must be untouched by it and must keep counting straight through.
+    M68kSim().compile(new DebugCtrlDut()).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      cd.waitSampling(20)
+      val a = dut.dbg.logic.csr.cycleCountReg.toBigInt
+      assert(DbgAxiDriver.write(dut.axi, cd, DebugRegMap.OFF_DBG_RESET_CTL.toLong, 1L) == 0)
+      cd.waitSampling(20)
+      val b = dut.dbg.logic.csr.cycleCountReg.toBigInt
+      assert(b > a,
+        s"the cycle counter went backwards or froze across a config wipe ($a -> $b)")
+    }
+  }
+
   test("Stage 5 exposes four PC slots, skip-once, exception masks, and atomic hit descriptors") {
     M68kSim().compile(new DebugCtrlDut(stageArg = 5, withCommitStubArg = true,
       withFrontendStubArg = true)).doSim { dut =>
