@@ -193,9 +193,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // argument -- independent fix, NOT part of the `0x40800284` wild-jump
     // investigation that surfaced this gap as a side effect). `checkpointSave`
     // refreshes the checkpoint to the live RAS state every cycle the ROB is fully
-    // drained (`rob.logic.count === 0`): at that instant nothing is outstanding, so
-    // the live state is architecturally correct by construction (mod a few cycles of
-    // fetch->dispatch pipeline latency). `checkpointRestore` undoes any wrong-path
+    // drained (`rob.logic.countIsZero`, the registered restatement of `count === 0`):
+    // at that instant nothing is outstanding, so the live state is architecturally
+    // correct by construction (mod a few cycles of fetch->dispatch pipeline latency,
+    // plus the one-cycle deferred apply inside RasPlugin -- which captures the SAME
+    // state, just installs it a cycle later). `checkpointRestore` undoes any wrong-path
     // push/pop since that save on either flush-class event that can follow a bad
     // speculative excursion: the ROB's own commit-time correction (`doFlush`, already
     // in scope above) and FetchAlign's own `ftqMismatch` re-framing recovery (a
@@ -206,8 +208,14 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // Tier 2 under `feSuppress` would undo the LEGITIMATE correct-path pushes made
     // while rename was frozen, which is the same undo-too-much mistake in miniature.
     val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
-    ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
-                                    !rasCheckpointRestore
+    // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
+    // itself gates it with !checkpointRestore (restore wins by construction), so
+    // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
+    // registered restatement of `count === 0` (see RobPlugin), not an approximation.
+    // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
+    // change is that the long ROB->frontend route into 500+ clock-enable pins
+    // starts at a flop Q with the whole period in front of it.
+    ras.logic.checkpointSave    := rob.logic.countIsZero
     ras.logic.checkpointRestore := rasCheckpointRestore
     // ── gshare direction predictor (slice 3) ────────────────────────────────────
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit

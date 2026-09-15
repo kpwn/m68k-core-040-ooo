@@ -76,19 +76,26 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - predValid (comb)      : count > 0 — a return can be predicted this cycle (OUTPUT).
   *  - predTarget (comb)     : ras[rasSp-1], the top-of-stack return PC (OUTPUT).
   *  - invalidateAll         : clear count/rasSp (driven from the I-cache invalidate).
-  *  - checkpointSave        : copy the CURRENT (post this-cycle's push/pop) rasSp/
-  *    count/ras into the checkpoint shadow (ckRasSp/ckCount/ckRas). Driven from the
-  *    wiring layer whenever the ROB is fully drained (see the doc comment above).
+  *  - checkpointSave        : ARM a refresh of the checkpoint shadow (ckRasSp/ckCount/
+  *    ckRas). Driven from the wiring layer whenever the ROB is fully drained (see the
+  *    doc comment above) -- in the synth/bench/lockstep compositions that is now the
+  *    ROB's REGISTERED `countIsZero` flag, a bit-exact restatement of `count === 0`.
+  *    The copy itself lands the CYCLE AFTER the arm and reads the live registers
+  *    directly, which captures bit-identically the same state the old same-cycle form
+  *    hand-computed with `nextRasSp`/`nextCount`/a push-bypass mux -- see the FMax
+  *    note at the `ckSaveArm` declaration for why that is exact rather than
+  *    approximate, and for the two bounded corners (a restore on the deferred cycle
+  *    cancels that one refresh; an `invalidateAll` on the arming cycle is now
+  *    correctly reflected in the checkpoint).
   *  - checkpointRestore     : copy the checkpoint shadow back into rasSp/count/ras,
   *    undoing any wrong-path push/pop since the last save. Driven from the wiring
   *    layer on RedirectService.doFlush (the ROB's commit-time correction) OR
-  *    FetchAlignPlugin's ftqMismatch (a frontend-only re-framing correction). These
-  *    two conditions are independent (a ROB-drain and an ftqMismatch CAN coincide),
-  *    so the wiring layer explicitly ANDs `!checkpointRestore`'s condition into
-  *    `checkpointSave`'s so the two ports are never driven together (checked in sim
-  *    below); checkpointRestore is ALSO given last-assignment priority in the RTL
-  *    itself, so a save-then-immediately-restore is always well-defined (the save's
-  *    own write is simply overridden) even if a future driver ever violated that.
+  *    FetchAlignPlugin's ftqMismatch (a frontend-only re-framing correction). Restore
+  *    always wins over save: the shadow write is gated by `!checkpointRestore` and the
+  *    live-array restore is placed LAST (SpinalHDL last-assignment-wins) over
+  *    invalidateAll/push/pop. Wiring sites therefore no longer need to AND
+  *    `!checkpointRestore` into their `checkpointSave` term (and must not, if the
+  *    point is to keep the ROB->frontend route purely register-to-register).
   *
   * At most ONE push OR one pop per cycle (an instruction is a call XOR a return, and
   * the aligner emits at most one predicted-redirecting slot/cycle) -> single-ported. */
@@ -168,16 +175,61 @@ class RasPlugin extends FiberPlugin {
       rasSp := U(0, spBits bits)
     }
 
-    // ---- checkpointSave: snapshot the post-this-cycle rasSp/count/ras into the
-    //      checkpoint shadow. See the class doc comment for WHEN the wiring layer
-    //      drives this (ROB fully drained -> nothing outstanding -> live state is
-    //      architecturally correct by construction). ----
-    when(checkpointSave) {
-      ckRasSp := nextRasSp
-      ckCount := nextCount
-      for (i <- 0 until entries) {
-        ckRas(i) := Mux(pushValid && (rasSp === U(i, spBits bits)), pushRetPc, ras(i))
-      }
+    // ---- checkpointSave: snapshot rasSp/count/ras into the checkpoint shadow.
+    //      See the class doc comment for WHEN the wiring layer arms this (ROB fully
+    //      drained -> nothing outstanding -> live state is architecturally correct by
+    //      construction) and for the ONE-CYCLE-DEFERRED APPLY below. ----
+    //
+    // FMax (2026-09-15): `checkpointSave` is an ARM; the copy lands the cycle AFTER.
+    // The previous form applied the copy on the arming cycle, which forced it to
+    // pre-apply this cycle's push by hand:
+    //     ckRas(i) := Mux(pushValid && rasSp === i, pushRetPc, ras(i))
+    // `pushValid` is `feed.fire && !faultHold && s0IsCall` (FetchAlignPlugin), and
+    // `feed.fire` carries DecodeStage's ready ladder -- ~17 levels of logic. That put
+    // the deepest combinational cone in the frontend on the D pin of all
+    // `entries`*32 `ckRas` flops, and `ckRas_*_reg[*]/D` became the worst endpoint
+    // family in the whole design. Deferring by one cycle removes that cone outright:
+    // the `ras` REGISTERS already hold "post this cycle's push" state on the next
+    // edge, so the copy degenerates to a flop-to-flop `ckRas(i) := ras(i)` with ZERO
+    // levels of logic between them.
+    //
+    // Why the CAPTURED VALUE is bit-identical, not merely "close enough": SpinalHDL
+    // register reads return Q, so on the deferred cycle `ras(i)`/`rasSp`/`count` read
+    // back exactly `Mux(pushValid && rasSp===i, pushRetPc, ras(i))`/`nextRasSp`/
+    // `nextCount` as evaluated on the ARMING cycle -- i.e. precisely what the old code
+    // wrote. A push/pop on the deferred cycle itself cannot contaminate the snapshot:
+    // it only changes the D inputs of `ras`/`rasSp`/`count`, never their Q. So the
+    // checkpoint CONTENT is unchanged; only the cycle it is installed on moves by one.
+    //
+    // The one behavioural consequence is the `!checkpointRestore` term below: a
+    // restore landing on the deferred cycle cancels that refresh, so the RAS rolls
+    // back to the PREVIOUS ROB-drain checkpoint instead of this one. That is sound by
+    // the same argument that licenses the whole scheme -- an older drain snapshot is
+    // still a state in which nothing was outstanding, so it is still a valid restore
+    // point; it is strictly a (rare, bounded) prediction-QUALITY question, never a
+    // correctness one, because the branch EU verifies every RTS/RTR target. It cannot
+    // capture a MORE speculative state than intended: the deferred read is the arming
+    // cycle's end-of-cycle state, full stop.
+    //
+    // The mirror corner -- a restore on the ARMING cycle, which the old wiring
+    // suppressed with its `&& !rasCheckpointRestore` term and this one no longer does
+    // -- is a provable NO-OP, not a new hazard: the restore has last-assignment
+    // priority, so at the end of the arming cycle `ras`/`rasSp`/`count` hold EXACTLY
+    // the checkpoint, and the deferred copy therefore writes `ckRas := ckRas`.
+    //
+    // Second-order improvement, called out so it is not mistaken for a regression:
+    // the deferred read now sees `invalidateAll`'s effect too (that block writes
+    // `rasSp`/`count` directly, bypassing `nextRasSp`/`nextCount`). So an I-cache
+    // invalidate on a drained-ROB cycle now also empties the CHECKPOINT, where before
+    // the checkpoint kept the pre-invalidate occupancy and a later restore resurrected
+    // it. Strictly closer to the architectural model.
+    val ckSaveArm = RegNext(checkpointSave) init False
+    val ckSaveNow = ckSaveArm && !checkpointRestore
+    ckSaveArm.simPublic(); ckSaveNow.simPublic()
+    when(ckSaveNow) {
+      ckRasSp := rasSp
+      ckCount := count
+      for (i <- 0 until entries) { ckRas(i) := ras(i) }
     }
 
     // ---- checkpointRestore: undo any wrong-path push/pop since the last save by
@@ -190,13 +242,15 @@ class RasPlugin extends FiberPlugin {
       for (i <- 0 until entries) { ras(i) := ckRas(i) }
     }
 
-    GenerationFlags.simulation {
-      when(!ClockDomain.current.isResetActive) {
-        assert(!(checkpointSave && checkpointRestore),
-          "RasPlugin: checkpointSave and checkpointRestore asserted the same cycle " +
-          "-- no driver should ever do this (save = ROB-drained refresh, restore = a flush)",
-          FAILURE)
-      }
-    }
+    // NOTE (2026-09-15): the old sim assertion `!(checkpointSave && checkpointRestore)`
+    // is GONE on purpose. It policed a DRIVER contract -- every wiring site had to AND
+    // `!rasCheckpointRestore` into its `checkpointSave` term -- that only existed
+    // because save and restore both wrote the shadow/live arrays on the same cycle.
+    // With the deferred apply the arm and the restore are no longer even the same
+    // cycle, so the contract is unenforceable at the port, and the mutual exclusion is
+    // now guaranteed INSIDE the module by `ckSaveNow = ckSaveArm && !checkpointRestore`
+    // (restore wins, by construction, with no driver cooperation needed). Keeping the
+    // AND at the wiring sites would also have kept the exact thing this change
+    // removes: combinational logic in front of the long ROB->frontend route.
   }
 }

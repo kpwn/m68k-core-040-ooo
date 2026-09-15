@@ -220,8 +220,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
       // see Ras.scala's doc comment for the design).
       val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
-      rasP.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
-                                       !rasCheckpointRestore
+      // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
+      // itself gates it with !checkpointRestore (restore wins by construction), so
+      // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
+      // registered restatement of `count === 0` (see RobPlugin), not an approximation.
+      // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
+      // change is that the long ROB->frontend route into 500+ clock-enable pins
+      // starts at a flop Q with the whole period in front of it.
+      rasP.logic.checkpointSave    := rob.logic.countIsZero
       rasP.logic.checkpointRestore := rasCheckpointRestore
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
