@@ -126,8 +126,33 @@ REG OFF_DCACHE_OP          0x00210 MIXED 4 0x00000000 Write bit0 START, bit1 pus
 REG OFF_ICACHE_OP          0x00214 MIXED 4 0x00000000 I-cache invalidate command/status; shares BUSY/DONE/select/REJECTED/ERROR status with OFF_DCACHE_OP.
 
 # ------------------------------------------------------------- telemetry --
-REG OFF_CYCLE_LO          0x01000 RO    7 0x00000000 Free-running cycle count, low word.
-REG OFF_CYCLE_HI          0x01004 RO    7 0x00000000 Free-running cycle count, high word.
+# SERVED since 2026-09-15. Free-running 64-bit count of core_clk cycles, split
+# LO/HI. Stage 2, NOT stage 7 (the perf_counters FEAT bit stays at 7 because
+# OFF_MISPRED_COUNT / OFF_FLUSH_COUNT still have no producer -- that bit means
+# "EVERY advertised performance counter is real", and it would be a lie to set
+# it): this counter needs no producer at all, only the clock, exactly like
+# OFF_EXC_COUNT needs only a ROB. Discover it via OFF_VERSION/build_id, not via
+# the perf_counters bit.
+#
+# WHY IT EXISTS. Until this was served we had NO measurement that the core runs
+# at the frequency we configured -- only three places AGREEING with each other
+# (buildinfo core_clk_hz, fpga_top_clocks.vh MMCM divides, and the XDC period).
+# Agreement between three copies of the same intent is not a measurement. Read
+# OFF_CYCLE_LO twice with a known wall-clock gap and divide: that is the core
+# clock, measured on silicon.
+#
+# LIFETIME: it lives in the debug clock domain (dbgCd), so it is cleared only by
+# the DEBUG power-on reset and keeps counting across a CPU reset, a halt, and a
+# wedge. That is deliberate -- a counter that stops when the CPU stops cannot
+# tell you "is the clock alive" from "is the CPU alive", which is the exact
+# question a wedge poses.
+#
+# TEARING: LO and HI are two reads of one 64-bit register, so a read pair that
+# straddles a LO wrap can tear -- identical to OFF_INST_LO/HI, which the REPL
+# already handles. LO alone is enough for a rate measurement: at 200 MHz it
+# wraps every 21.5 s, and at 100 MHz every 42.9 s.
+REG OFF_CYCLE_LO          0x01000 RO    2 0x00000000 Free-running core_clk cycle count, low word.
+REG OFF_CYCLE_HI          0x01004 RO    2 0x00000000 Free-running core_clk cycle count, high word.
 REG OFF_INST_LO           0x01008 RO    2 0x00000000 Architectural macro-instruction count, low word.
 REG OFF_INST_HI           0x0100C RO    2 0x00000000 Architectural macro-instruction count, high word.
 REG OFF_MISPRED_COUNT     0x01010 RO    7 0x00000000 Branch mispredictions; zero until a real producer exists.
