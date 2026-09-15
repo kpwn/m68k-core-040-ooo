@@ -12787,4 +12787,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       nInstr = 8)
   }
 
+  // ── 2026-09-15 board hang repro (plan item 6, registered probe credit) ──────────────
+  // Silicon pinned at ROM 0x40804834 `andb %a0@(-9),%d1` inside early VIA init with
+  // exc_count = 0, the D-cache idle (STALL_DC: FSM IDLE, probe queue EMPTY, no store in
+  // flight) and NO load command presented (STALL_GRANT: loadCmd.valid = 0). Early ROM
+  // runs with CACR = 0, so every access is INHIBITED (precise): byte stores to VIA
+  // registers, then a byte LOAD from the same page. Same shape here, caches OFF, real
+  // crossbar timing, plus interrupts masked as the ROM has them.
+  for ((dtag, dc) <- Seq(("crossbar", m68k040.sim.L2Sweeps.todaysCrossbar),
+                         ("zero-latency", m68k040.sim.AxiMemModelConfig()))) {
+    test(s"board-repro: VIA-init byte stores then byte load, both caches OFF, $dtag", VerilatorTest) {
+      val src = Seq(
+        "move.l #0x00003000,%a1", "clr.w 2(%a1)",
+        "move.b #0x80,7680(%a1)", "move.b #0x30,1536(%a1)", "move.b #0x11,1024(%a1)", "move.b #0x22,0(%a1)",
+        "lea 9(%a1),%a0", "moveq #-1,%d1",
+        "and.b -9(%a0),%d1",
+        "move.b #0x7f,7680(%a1)", "move.b 1536(%a1),%d2", "and.b -9(%a0),%d1", "or.b 1024(%a1),%d2",
+        "move.b %d1,4(%a1)", "move.b 4(%a1),%d3",
+        "moveq #7,%d4",
+        "loop: move.b %d4,8(%a1)", "and.b -9(%a0),%d1", "move.b 8(%a1),%d5", "eor.b %d5,%d1",
+        "move.w 2(%a1),%d6", "move.b %d6,7680(%a1)", "dbf %d4,loop",
+        "end: bra.s end").mkString(" ; ")
+      runLockStep(s"board-repro-$dtag", src, maxCycles = 200000, dcfg = dc, cacr = 0L)
+    }
+  }
+
 }
