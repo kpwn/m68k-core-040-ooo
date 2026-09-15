@@ -1846,6 +1846,39 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // IssueQueue readyReg pattern: count resets to 0 there too, always <= depth-2).
     allocReadySig := RegNext(countNext <= (depth - 2)) init True
 
+    // ── countIsZero: a REGISTERED restatement of `count === 0` ──────────────────
+    // EXACTLY equal to `count === 0` on every cycle — not an approximation and NOT
+    // delayed. It is computed a cycle early off the SAME `countNext` expression that
+    // drives `count` itself (plus the flush override mirrored in the `when(flushing)`
+    // block below, which is the only OTHER writer of `count`), so the flop's Q is by
+    // construction the zero-compare of the value `count` holds this cycle. Same trick,
+    // and the same two writers, as `allocReadySig` directly above.
+    //
+    // Exists for physical, not logical, reasons: the only consumer is the RAS
+    // checkpoint refresh (`RasPlugin.checkpointSave`, wired in FullCoreSynth /
+    // FuzzDut / CoreBenchHarness / ExecuteLockStepSpec), and the RAS lives at the far
+    // end of the die from the ROB. A live `count === 0` there puts a 7-bit
+    // zero-compare (2 LUT levels) IN FRONT of that long ROB->frontend route, and the
+    // route then lands on 500+ clock-enable pins. A register output gets the whole
+    // period for the route and can be replicated/placed by phys_opt; a combinational
+    // cone in front of a high-fanout net cannot (see the campaign note: `max_fanout`
+    // on a COMBINATIONAL driver just moves the long wire to the other side of the gate).
+    val countIsZero = RegInit(True)
+    countIsZero := countNext === 0
+    countIsZero.simPublic()
+    // The "EXACTLY equal" claim above is an invariant, so it is CHECKED, not asserted
+    // in prose: sim-only, zero synthesis cost, and every lock-step / fuzz / bench
+    // program in the corpus exercises it on every cycle. If a future edit adds a third
+    // writer to `count` without mirroring it here, this fires instead of silently
+    // drifting the RAS checkpoint's refresh window.
+    GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(countIsZero === (count === 0),
+          "RobPlugin: countIsZero drifted from `count === 0` -- a writer of `count` " +
+          "was added without mirroring it into the registered flag", FAILURE)
+      }
+    }
+
     // ── Commit-time mispredict redirect (REGISTERED pulse) ──────────────────────
     // When the retiring head is a mispredicting branch (retireAlone), register the
     // flush for next cycle. doFlushReg is the ONLY flush signal that fans out, and
@@ -2812,6 +2845,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // rather than waiting a cycle for the RegNext(countNext<=...) path to catch up
       // (countNext was computed off the PRE-flush count/alloc/retire this cycle).
       allocReadySig := True
+      // Same reason for countIsZero, but it is a REGISTER (not a comb override):
+      // `count := 0` above makes the ROB empty NEXT cycle, so the registered
+      // zero-compare must be forced True here to stay exactly equal to `count === 0`.
+      // This assignment is later than `countIsZero := countNext === 0` above, so it wins.
+      countIsZero := True
     }
     rc.flushPort := flushing
 
