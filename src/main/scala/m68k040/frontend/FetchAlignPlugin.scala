@@ -204,6 +204,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
     spinal.core.sim.SimPublic(decodePc, fetchPc)
+    // FMax (frontend floor, 2026-09-15 — the `decodePc_reg[*]/D` family, measured at
+    // -0.632 ns / 22 logic levels in the SoC build, the deepest cone in the design).
+    //
+    // `decodePc` closes a COMBINATIONAL LOOP ON ITSELF in one cycle:
+    //   decodePc -> `ftqDiff = ftqHeadE.brPc - decodePc` (32-bit subtract, 4 chained
+    //   CARRY8) -> `ftqNear`/`ftqDelta` -> `availEff` -> `Aligner.align` -> slot lengths
+    //   -> `decodePc + len*2` (a second 32-bit carry chain) -> the `suppressSlot1` mux
+    //   -> decodePc.
+    // Both 32-bit ripples are avoidable WITHOUT touching the loop's cycle structure,
+    // because both of them only ever need a ±32-byte window of the PC:
+    //   * the FTQ compare asks `brPc - decodePc ∈ [0,31]` (a 5-bit subtract plus an
+    //     equality on the upper 27 bits), and
+    //   * the decode advance adds at most WINDOW*2 = 20 < 32 bytes.
+    // So the upper 27 bits of `decodePc` only ever move by 0 or +1. Keeping
+    // `decodePc(31 downto 5) + 1` LIVE IN A REGISTER turns both 27-bit ripples into a
+    // registered operand: the compare becomes a 27-bit equality tree (2 levels, no
+    // carry) and the advance becomes a 27-bit 2:1 select (1 level, no carry).
+    //
+    // `decodePcHiP1` is a pure DERIVED register: the invariant
+    // `decodePcHiP1 === decodePc(31 downto 5) + 1` holds on EVERY cycle, and is asserted
+    // as such in simulation below. It is maintained at every one of `decodePc`'s writers
+    // via `setDecodePc` / the sequential-advance arm; nothing else may write it.
+    val decodePcHiP1  = Reg(UInt(27 bits)) init 1    // == decodePc(31 downto 5) + 1
+    val decodePcHi    = decodePc(31 downto 5)        // pure slice, free
+    spinal.core.sim.SimPublic(decodePcHiP1)
+    // Every NON-sequential `decodePc` writer goes through this helper so the companion
+    // register can never be forgotten. The 27-bit increment it carries is off the
+    // frontend loop by construction: every call site's `x` is a register output or an
+    // FTQ-memory read, never a value derived from `decodePc` this cycle.
+    def setDecodePc(x: UInt): Unit = {
+      decodePc     := x
+      decodePcHiP1 := x(31 downto 5) + 1
+    }
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
@@ -780,9 +813,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // emit a packet made entirely of genuine bytes, never consume target bytes as an
     // extension of a fall-through instruction.
     val ftqDiff  = ftqHeadE.brPc - decodePc
-    val ftqDelta = ftqDiff(4 downto 1)
-    val ftqNear  = ftqValid && (ftqDiff(31 downto 5) === U(0, 27 bits))
+    // FMax (frontend floor, 2026-09-15 — see `decodePcHiP1`'s declaration): `ftqDelta`
+    // and `ftqNear` used to be slices of the FULL 32-bit `ftqDiff` subtract, putting four
+    // chained CARRY8s plus a 27-bit zero-detect at the HEAD of the `decodePc -> availEff
+    // -> Aligner -> decodePc` loop (and at the head of the `ftqHead -> ftqMem -> 8 CARRY8`
+    // family too, since `brPc` is an asynchronous FTQ-memory read). Restructured, NOT
+    // re-timed — bit-identical every cycle, asserted below:
+    //   * the low 5 bits of a subtract do not depend on anything above bit 4, so
+    //     `ftqDiffLow(4 downto 0) === ftqDiff(4 downto 0)` by construction, and
+    //     `ftqDiffLow(5)` is exactly the borrow OUT of bit 4;
+    //   * `ftqDiff(31 downto 5) === 0` iff `brPc(31:5) === decodePc(31:5) + borrow`
+    //     (mod 2^27) — i.e. a 2:1 select between two 27-bit EQUALITY compares, with the
+    //     `+1` operand supplied by the `decodePcHiP1` register instead of a ripple.
+    // Net effect: three chained carry hops and a 27-bit NOR tree leave the loop head,
+    // replaced by one 6-bit carry plus a 2-level equality tree. `ftqDiff` itself survives
+    // for `ftqPast` (a genuine full-width sign test) and for the simulation oracle; that
+    // residue feeds only the two-level `feed.valid` AND, not the deep aligner cone.
+    val ftqDiffLow = (False ## ftqHeadE.brPc(4 downto 0)).asUInt -
+                     (False ## decodePc(4 downto 0)).asUInt      // 6 bits; [5] = borrow
+    val ftqBorrow  = ftqDiffLow(5)
+    val ftqDelta = ftqDiffLow(4 downto 1)
+    val ftqHiEq  = Mux(ftqBorrow, ftqHeadE.brPc(31 downto 5) === decodePcHiP1,
+                                  ftqHeadE.brPc(31 downto 5) === decodePcHi)
+    val ftqNear  = ftqValid && ftqHiEq
     val ftqAt0   = ftqNear && (ftqDelta === 0)
+    // Differential proof of the restructuring above: the live oracle is the original
+    // full-width form. Elaborated in simulation only (`.includeSimulation`), so the
+    // synthesized netlist keeps only the restructured form.
+    GenerationFlags.simulation {
+      assert(ftqDelta === ftqDiff(4 downto 1),
+        "FetchAlignPlugin: narrowed ftqDelta diverged from the full-width subtract", FAILURE)
+      assert(ftqHiEq === (ftqDiff(31 downto 5) === U(0, 27 bits)),
+        "FetchAlignPlugin: registered-carry ftqNear diverged from the full-width subtract", FAILURE)
+    }
     val spliceWords = ftqDelta.resize(5) + ftqHeadE.brLen.resize(5)
     val availEff = UInt(4 bits)
     when(ftqNear && (spliceWords < ibuf.io.avail.resize(5))) {
@@ -1107,9 +1170,59 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // L0L1 -> slot1Ok/suppress -> addend -> adder` arc was the bistable-ordering 194MHz
     // limiter): the adders now start as soon as their length is ready, and suppressSlot1 only
     // drives a final 1-LUT 32-bit 2:1 result mux. Byte-identical: same value, restructured.
-    val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)   // slot1 suppressed
-    val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)       // full aligner shift
-    val decodePcNext     = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
+    //
+    // FMax 2026-09-15 (same lever as `decodePcHiP1`'s declaration): that retime is KEPT
+    // exactly — `suppressSlot1` still passes through precisely ONE 2:1 select before the
+    // flop — but the two 32-bit adders behind it are replaced by two 6-bit adds plus a
+    // registered high half. `res.slot0.lenWords`/`res.shiftWords` are aligner outputs
+    // bounded by WINDOW=10, so the byte increment is at most 20 and the upper 27 bits of
+    // `decodePc` can only stay put or advance by one. Hence, for each candidate:
+    //     low   = decodePc(4 downto 0) + (len << 1)        -- 6 bits, [5] = carry out
+    //     high  = carry ? decodePcHiP1 : decodePc(31 downto 5)
+    // which is bit-identical to the 32-bit add (a ripple carry out of bit 4 into bit 5 is
+    // exactly `low(5)`), and drops three of the four chained CARRY8s from the LATE
+    // `pred_lenWords -> aligner -> decodePc[31:5]` arrival — 27 of this family's 32
+    // endpoints. `decodePcHiP1` is a register, so the `+1` it supplies costs nothing here.
+    //
+    // The companion register must advance with it: next(decodePc(31:5)) + 1 is
+    // `carry ? decodePcHiP1 + 1 : decodePcHiP1`, and that increment is likewise a
+    // register-to-register ripple that never sees an aligner output.
+    val pcLow        = decodePc(4 downto 0)
+    // NB `|<<` is SpinalHDL's FIXED-WIDTH shift: the widening `.resize(6)` MUST come
+    // before it, exactly as the full-width reference below resizes to 32 before shifting.
+    // Shifting a 4-bit `lenWords` in place drops its MSB, which is wrong for every
+    // instruction of 8 words or more — caught by the equivalence assert below on
+    // `lock-step F2 FIX` (the 8-word mem-indirect case), not by inspection.
+    val lowSuppress  = (False ## pcLow).asUInt + (res.slot0.lenWords.resize(6) |<< 1)
+    val lowFull      = (False ## pcLow).asUInt + (res.shiftWords.resize(6)     |<< 1)
+    val hiP1Inc      = decodePcHiP1 + 1
+    val hiSuppress   = Mux(lowSuppress(5), decodePcHiP1, decodePcHi)
+    val hiFull       = Mux(lowFull(5),     decodePcHiP1, decodePcHi)
+    val hiP1Suppress = Mux(lowSuppress(5), hiP1Inc,      decodePcHiP1)
+    val hiP1Full     = Mux(lowFull(5),     hiP1Inc,      decodePcHiP1)
+    val decodePcNext     = Mux(suppressSlot1, hiSuppress, hiFull) @@
+                           Mux(suppressSlot1, lowSuppress(4 downto 0), lowFull(4 downto 0))
+    val decodePcNextHiP1 = Mux(suppressSlot1, hiP1Suppress, hiP1Full)
+    // Differential proof of the split-field advance: the live oracle is the original
+    // full-width form. Simulation only; the netlist keeps only the split form.
+    //
+    // These run UNGATED, on every cycle: they caught the `|<<` width bug above on the
+    // lock-step corpus, and holding them everywhere (not only where `decodePcNext` is
+    // consumed) is what makes the restructuring a proof rather than a spot check.
+    GenerationFlags.simulation {
+      val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)
+      val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)
+      val refNext          = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
+      assert(decodePcNext === refNext,
+        "FetchAlignPlugin: split-field decodePc advance diverged from the full-width adders",
+        FAILURE)
+      assert(decodePcNextHiP1 === (refNext(31 downto 5) + 1),
+        "FetchAlignPlugin: split-field decodePc companion diverged from its invariant",
+        FAILURE)
+      assert(decodePcHiP1 === (decodePcHi + 1),
+        "FetchAlignPlugin: decodePcHiP1 lost its decodePc(31 downto 5)+1 invariant",
+        FAILURE)
+    }
 
     // A shorter real instruction at the claimed branch PC may emit because every one of
     // its words is still genuine; recover at its fall-through. Likewise, an instruction
@@ -1202,6 +1315,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift
       decodePc      := decodePcNext
+      decodePcHiP1  := decodePcNextHiP1
       when(res.complex) {
         // Complex instruction: stall after emitting — wait for resume
         stalled := True
@@ -1212,7 +1326,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // already appended by the fetch ring. It does not flush the IBuf or stale the ring.
     val ftqConfirmFire = ftqConfirm && feed.fire && !emittingFaultPacket
     when(ftqConfirmFire) {
-      decodePc := ftqHeadE.target
+      setDecodePc(ftqHeadE.target)
     }
     ftqPop := ftqConfirmFire
     spinal.core.sim.SimPublic(ftqConfirmFire)
@@ -1253,7 +1367,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       val newBase = predictWindowPc
       val actionWins = !(redirect.valid || (resume.valid && stalled) ||
                          mispredictRedirect.valid || ftqMismatch)
-      decodePc    := newPc
+      setDecodePc(newPc)
       fetchPc     := Mux(ic.cmd.fire && actionWins, newBase + 8, newBase)
       ibuf.io.flush  := True
       stalled        := False
@@ -1279,7 +1393,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // genuinely different (the `actionWins` window-reuse logic), so folding either in here
     // would blur a real distinction rather than remove a redundant one.
     def commonRedirect(newPc: UInt, clearFaultHold: Boolean = true): Unit = {
-      decodePc      := newPc
+      setDecodePc(newPc)
       // fetchPc = 8-aligned base of the window containing newPc
       fetchPc       := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush := True
@@ -1327,7 +1441,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // refetch cannot repopulate from a line that is about to be invalidated.
     when(icMaintFlush) {
       val newPc       = decodePc
-      decodePc        := newPc
+      setDecodePc(newPc)
       fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush   := True
       stalled         := False
@@ -1338,7 +1452,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
 
     when(ftqMismatch) {
       val newPc       = ftqMismatchPc
-      decodePc        := newPc
+      setDecodePc(newPc)
       fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush   := True
       stalled         := False
