@@ -125,7 +125,7 @@ class IqSourcePlugin extends FiberPlugin {
       // dormant undriven fields perturbed `IqCplxSpec`/`IqAluSlowSpec` (unrelated
       // arbitration-timing tests, not exercising anything FP-specific) -- fixed here by
       // finally giving them the same safe-default treatment as every other post-hoc field.
-      u.fpuOp := 0; u.fpSrcKind := m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt := 0; u.fpWideImm := 0
+      u.fpuOp := 0; u.fpSrcKind := m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt := 0
       // Third source (DIV.L 64/32) + CPLX/div control + precise-fault fields: safe
       // defaults (these IQ tests don't exercise DIV/CHK/faults).
       u.psrcC        := 0; u.psrcCValid := False

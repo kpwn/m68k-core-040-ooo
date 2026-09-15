@@ -11,7 +11,15 @@ class FpAssembleSpec extends AnyFunSuite {
   class Dut extends Component {
     val pkt = in(DecodePacket())
     val uop = out(DecodedUop())
-    uop := MicroOpAssembler.assemble(pkt).uops(0)
+    // The 80-bit FP immediate left the uop record (plan item 3): it is now an
+    // `AssembledUops` SIDE CHANNEL that DecodeStage writes into its FP wide-immediate
+    // side table. Expose it so the assembler-level checks below still observe the value.
+    val fpImmAlloc = out Bool()
+    val fpWideImm  = out Bits(80 bits)
+    private val asm = MicroOpAssembler.assemble(pkt)
+    uop        := asm.uops(0)
+    fpImmAlloc := asm.fpImmAlloc
+    fpWideImm  := asm.fpWideImm
   }
   /** Drive a packet whose length matches what PredecodeWord would really frame. */
   def drive(dut: Dut, op: Int, ext: Int = 0, ext2: Int = 0, len: Int = 2, simple: Boolean = true): Unit = {
@@ -210,8 +218,8 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
       assert(dut.uop.fpSrcFmt.toInt == 0, "fpSrcFmt=000 (Long)")
       assert(!dut.uop.useImm.toBoolean, "imm/useImm stay reserved for FMOVECR -- these ride fpWideImm")
-      assert(dut.uop.fpWideImm.toBigInt == BigInt("0000000012345678", 16),
-        f"fpWideImm must be the 32-bit value zero-extended to 80 bits, got 0x${dut.uop.fpWideImm.toBigInt.toString(16)}")
+      assert(dut.fpWideImm.toBigInt == BigInt("0000000012345678", 16),
+        f"fpWideImm must be the 32-bit value zero-extended to 80 bits, got 0x${dut.fpWideImm.toBigInt.toString(16)}")
       assert(dut.uop.usesFpSrcB.toBoolean == false && dut.uop.srcAValid.toBoolean == false,
         "no register source of any kind for an immediate form")
       assert(dut.uop.usesFpSrcA.toBoolean, "FADD is dyadic -- it still reads its destination FP0")
@@ -225,10 +233,10 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(!dut.uop.faulted.toBoolean)
       assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
       assert(dut.uop.fpSrcFmt.toInt == 4, "fpSrcFmt=100 (Word)")
-      val lo32 = dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
+      val lo32 = dut.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
       assert(lo32 == BigInt("FFFF8000", 16),
         f"word 0x8000 (-32768) must sign-extend to 0xFFFF8000, got 0x${lo32.toString(16)}")
-      assert((dut.uop.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
+      assert((dut.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
     }
   }
 
@@ -239,10 +247,10 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(!dut.uop.faulted.toBoolean)
       assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.INTIMM)
       assert(dut.uop.fpSrcFmt.toInt == 6, "fpSrcFmt=110 (Byte)")
-      val lo32 = dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
+      val lo32 = dut.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)
       assert(lo32 == BigInt("FFFFFF80", 16),
         f"byte 0x80 (-128) must sign-extend to 0xFFFFFF80, got 0x${lo32.toString(16)}")
-      assert((dut.uop.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
+      assert((dut.fpWideImm.toBigInt >> 32) == 0, "upper 48 bits must be zero-padded")
     }
   }
 
@@ -256,7 +264,7 @@ class FpAssembleSpec extends AnyFunSuite {
         "0x3F800000 with a Single source specifier must be tagged SINGLEIMM, never converted as an integer " +
         "(misrouting it through INTREG/INTIMM would silently mean 1065353216 instead of 1.0f)")
       assert(dut.uop.fpSrcFmt.toInt == 1, "fpSrcFmt=001 (Single)")
-      assert((dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
+      assert((dut.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
         "the bit pattern rides through VERBATIM, unconverted")
 
       // Long, same raw bits: ext opclass 010, src spec 000, dst FP0, opmode 0x22 -> 0x4022
@@ -266,7 +274,7 @@ class FpAssembleSpec extends AnyFunSuite {
         "the IDENTICAL bit pattern 0x3F800000 with a Long source specifier must be tagged INTIMM -- " +
         "Task 8 converts this as the INTEGER 1065353216, not the float 1.0")
       assert(dut.uop.fpSrcFmt.toInt == 0, "fpSrcFmt=000 (Long)")
-      assert((dut.uop.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
+      assert((dut.fpWideImm.toBigInt & BigInt("FFFFFFFF", 16)) == BigInt("3F800000", 16),
         "the raw bits are identical -- only fpSrcKind/fpSrcFmt tell Long and Single apart")
     }
   }
@@ -282,7 +290,7 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(!dut.uop.faulted.toBoolean)
       assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.DOUBLEIMM)
       assert(dut.uop.fpSrcFmt.toInt == 5, "fpSrcFmt=101 (Double)")
-      val got = dut.uop.fpWideImm.toBigInt
+      val got = dut.fpWideImm.toBigInt
       val want = BigInt("400921FB54442D18", 16)
       assert(got == want,
         f"fpWideImm must be the 64-bit bit pattern zero-extended to 80 bits, want 0x${want.toString(16)}, got 0x${got.toString(16)}")
@@ -304,7 +312,7 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(!dut.uop.faulted.toBoolean)
       assert(dut.uop.fpSrcKind.toEnum == FpSrcKind.EXTIMM)
       assert(dut.uop.fpSrcFmt.toInt == 2, "fpSrcFmt=010 (Extended)")
-      val got = dut.uop.fpWideImm.toBigInt
+      val got = dut.fpWideImm.toBigInt
       // word2(16)##word4(16)##word5(16)##word6(16)##word7(16) = 3FFF|8000|0000|0000|0000
       val want = BigInt("3FFF8000000000000000", 16)
       assert(got == want,

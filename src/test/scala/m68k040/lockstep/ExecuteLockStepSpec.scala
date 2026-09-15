@@ -278,6 +278,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val feSuppress = rob.logic.earlySuppressFe && !excActive
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
+      decodeUop.backendFlush := pipeFlush       // FP wide-imm side table: backend-owned entries (Tier 2 only)
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB

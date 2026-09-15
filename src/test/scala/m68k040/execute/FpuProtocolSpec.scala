@@ -204,7 +204,6 @@ class FpuProtocolSpec extends AnyFunSuite {
       uop.fpuOp := iFpuOp
       uop.fpSrcKind := FpSrcKind.FPREG
       uop.fpSrcFmt := 0
-      uop.fpWideImm := 0
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -279,7 +278,7 @@ class FpuProtocolSpec extends AnyFunSuite {
     val rfFpcc = new RegFilePluginFpcc
     val eu     = new DivEuPlugin
     val src    = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new FpImmTableStub, src)) }
   }
 
   private lazy val dut = M68kSim().withVerilator.compile(new Dut)
