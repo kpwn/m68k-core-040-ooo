@@ -30,5 +30,8 @@ class DecodeUopSourcePlugin extends FiberPlugin with DecodeUopService {
   override def uops: Stream[Vec[DecodedUop]] = logic.src
   override def uop1Valid: Bool               = logic.s1v
   override def pipeFlush: Bool               = logic.flush
+  // No DecodeStage here (this plugin REPLACES it), so there is no FP wide-immediate side
+  // table to reclaim: tie the backend squash to the same inert wire as the frontend one.
+  override def backendFlush: Bool            = logic.flush
   override def complexResume: Flow[UInt]     = logic.resume
 }

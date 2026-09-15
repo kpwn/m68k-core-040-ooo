@@ -54,7 +54,7 @@ class ChkSpec extends AnyFunSuite {
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
-      uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
+      uop.fpSrcFmt := 0;
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.sswInstr := False
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
@@ -93,7 +93,7 @@ class ChkSpec extends AnyFunSuite {
     // files must be present for it to elaborate. Unused by this spec.
     val rfFp   = new m68k040.execute.regfile.RegFilePluginFp
     val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new m68k040.execute.FpImmTableStub, src)) }
   }
 
   /** Returns (complete, fault, vector, nFlag, architectural-NZVC observation,

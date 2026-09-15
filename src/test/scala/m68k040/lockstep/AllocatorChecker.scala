@@ -73,7 +73,11 @@ final class FreelistShadow(val name: String, physCount: Int, archCount: Int) {
 final class AllocatorChecker(ren: RenameStage) {
   private case class Bound(shadow: FreelistShadow, fl: Freelist)
   private val bound: Seq[Bound] = Seq(
-    Bound(new FreelistShadow("int",  50, m68k040.isa.Isa.ARCH_INT_REGS), ren.logic.intFree),
+    // Sizes taken from the Freelist each shadow is bound to, never restated: a shadow
+    // that disagrees with the RTL turns every allocation into an "out-of-range" report
+    // (or, worse, hides one). The int shadow used to hardcode 50 while `intFree` was
+    // briefly built at 54.
+    Bound(new FreelistShadow("int",  ren.logic.intFree.physCount, m68k040.isa.Isa.ARCH_INT_REGS), ren.logic.intFree),
     Bound(new FreelistShadow("nzvc", 16, 1), ren.logic.nzvcFree),
     Bound(new FreelistShadow("x",    16, 1), ren.logic.xFree),
     Bound(new FreelistShadow("fp",   16, 8), ren.logic.fpFree),

@@ -167,7 +167,11 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       uop.fpuOp := iFpuOp
       uop.fpSrcKind := iFpSrcKind
       uop.fpSrcFmt := iFpSrcFmt
-      uop.fpWideImm := iFpWideImm
+      // The 80-bit FP immediate no longer rides the uop record: DivEu reads it from
+      // DecodeStage's FP wide-immediate side table (FpImmTableService). This harness has
+      // no DecodeStage, so `FpImmTableStub` stands in and the stimulus drives its read
+      // data directly (the stub ignores the tag).
+      host[m68k040.services.FpImmTableService].fpImmRdData := iFpWideImm
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -231,7 +235,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     val rfFpcc = new RegFilePluginFpcc
     val eu = new DivEuPlugin
     val src = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new FpImmTableStub, src)) }
   }
 
   private lazy val dut = M68kSim().withVerilator.compile(new Dut)

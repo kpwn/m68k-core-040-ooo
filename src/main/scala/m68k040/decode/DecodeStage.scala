@@ -1,7 +1,8 @@
 package m68k040.decode
 
 import m68k040.frontend.{DecodePacket, PipeStage}
-import m68k040.services.{DecodeFeedService, DecodeUopService, FrontendDebugMatchService}
+import m68k040.services.{DecodeFeedService, DecodeUopService, FpImmTableService, FrontendDebugMatchService}
+import m68k040.Global
 import m68k040.isa.Size
 import spinal.core._
 import spinal.core.sim._
@@ -29,7 +30,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * The skid is flushed by the same `pipeFlush` as the queue so a wrong-path group
   * held in the register is squashed on a mispredict/exception redirect.
   */
-class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMatchService {
+class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                                       with FpImmTableService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
   // its build order part of the frontend's existing Fetch->Decode dependency chain.
@@ -37,11 +39,28 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
   private var _debugBreakEn: Bits = null
   private var _debugBreakSkip: Bits = null
   private var _debugSkipConsumed: Bits = null
+  // FP wide-immediate side table ports (FpImmTableService) and the BACKEND squash pulse
+  // (DecodeUopService.backendFlush). Setup-allocated for the same reason as the debug
+  // wires above: DivEuPlugin (the table's only reader) and the backend wiring bind to
+  // them without an edge into this plugin's frontend-chained build. The consumer-owned
+  // ones are default-driven idle (allowOverride) so a decode-only harness elaborates.
+  private var _fpImmRdAddr: UInt = null
+  private var _fpImmRdData: Bits = null
+  private var _fpImmFree: Flow[UInt] = null
+  private var _backendFlush: Bool = null
   during setup {
     _debugBreakPcs = Vec(UInt(32 bits), 4)
     _debugBreakEn = Bits(4 bits)
     _debugBreakSkip = Bits(4 bits)
     _debugSkipConsumed = Bits(4 bits)
+    _fpImmRdAddr = UInt(Global.FP_IMM_TAG_W bits)
+    _fpImmRdAddr.allowOverride; _fpImmRdAddr := 0
+    _fpImmRdData = Bits(80 bits)
+    _fpImmFree = Flow(UInt(Global.FP_IMM_TAG_W bits))
+    _fpImmFree.valid.allowOverride;   _fpImmFree.valid   := False
+    _fpImmFree.payload.allowOverride; _fpImmFree.payload := 0
+    _backendFlush = Bool()
+    _backendFlush.allowOverride; _backendFlush := False
   }
 
   // FMAX "FRONTEND LEVER C" (docs/superpowers/specs/2026-08-08-fmax-frontend-leverc-register-split-design.md,
@@ -276,6 +295,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val stashUops  = Reg(Vec(DecodedUop(), 3))
     val stashCount = Reg(UInt(2 bits))
     when(pipeFlush) { stashValid := False }
+    // FP wide-immediate side table (plan item 3): a stashed slot1 that is an
+    // `F<op>.<fmt> #imm,FPn` uop carries its 80-bit immediate HERE, not in the table --
+    // the table has ONE write port and it belongs to the HEAD instruction, so a slot1
+    // FP-immediate is always deferred (see `deferSlot1`) and allocates on its replay
+    // cycle, when it IS the head. Qualified by stashValid; never needs a flush clear.
+    val stashFpPend = Reg(Bool()) init False
+    val stashFpVal  = Reg(Bits(80 bits))
 
     val slot1Is3 = a1raw.count === U(3, 2 bits)
     val slot0Is3 = a0.count === U(3, 2 bits)
@@ -359,11 +385,120 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // slot1 is emitted alongside slot0 only when: not replaying a stash, slot1 present,
     // slot0 is NOT 3-µop, slot1 itself is NOT 3-µop (a 3-µop slot1 is deferred), and
     // slot1 is NOT a MOVEM/MOVEP (the FSM owns it — see slot1IsMovemEarly/slot1IsMovepEarly).
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly && !slot1IsBfMemindMemEarly
+    // `!a1raw.fpImmAlloc`: a slot1 FP-immediate uop is never emitted alongside slot0 --
+    // the FP wide-immediate side table has a single write port, owned by the head (see
+    // `fpImmTable` below), so it is deferred to the stash and allocates as next cycle's
+    // head. Cost: one extra decode cycle per slot1 FP-immediate (a rare shape; the 16-deep
+    // MicroOpQueue absorbs it), zero cost to the OoO window itself.
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly && !slot1IsBfMemindMemEarly && !a1raw.fpImmAlloc
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
-    // slot0). In both cases emit slot0 this cycle + stash slot1's µops; replay next.
-    val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && (slot0Is3 || slot1Is3)
+    // slot0) OR slot1 is an FP-immediate uop (single table write port, see slot1Emit).
+    // In all cases emit slot0 this cycle + stash slot1's µops; replay next.
+    val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && (slot0Is3 || slot1Is3 || a1raw.fpImmAlloc)
+
+    // ── FP wide-immediate side table (docs/PLAN_routing_congestion_architectural.md item 3)
+    // The 80-bit `F<op>.<fmt> #imm,FPn` immediate used to be a DecodedUop/RenamedUop field,
+    // riding MicroOpQueue -> rename skid -> IqContext cold Mems (x5 read ports) to reach its
+    // ONE consumer, DivEuPlugin's `fpS1Imm` capture. It now lives here: a
+    // Global.FP_IMM_TABLE_DEPTH x 80b 1W/1R LUTRAM (16 deep -- same RAM32M count as 8, see
+    // Global), written on the cycle the uop enters the MicroOpQueue (from the HEAD slot only
+    // -- a slot1 FP-immediate is deferred, see slot1Emit), tagged by
+    // `imm[FP_IMM_TAG_W-1:0]` (these rows have useImm=False), read+freed by DivEu on its
+    // accepting cycle.
+    //
+    // RECLAMATION ON SQUASH is NOT "clear everything on flush". With the two-tier
+    // reschedule (RobPlugin earlyFire / feSuppress) the FRONTEND (this stage's `pipeFlush`
+    // = feFlush) and the BACKEND (`backendFlush` = doFlush || excActive, what clears the
+    // IQ and the rename->dispatch skid) are squashed by DIFFERENT pulses: a Tier-1
+    // earlyFire squashes only the frontend while live FP-immediate uops sit in the IQ; the
+    // matching Tier-2 doFlush (feSuppress) squashes only the backend while the correct-path
+    // frontend keeps its uops. So each entry remembers WHICH DOMAIN its uop is in:
+    // `backend` is set when the uop pops out of the MicroOpQueue into rename (the exact
+    // boundary between the two flush domains -- RenameStage's input PipeStage is flushed by
+    // doFlush || excActive only), and a squash pulse frees exactly the entries of its own
+    // domain. Same-cycle ordering: an entry popped on a backend-flush cycle is dropped by
+    // rename's PipeStage (flush wins over the load there), so it must count as backend when
+    // that flush frees -- hence `backendNext` below; an entry allocated on a frontend-flush
+    // cycle is dropped with pushReg, so it counts as frontend and is freed at once.
+    //
+    // The table is FULL-stalling: when the head needs an entry and none is free, the
+    // normal push/consume path holds (fed.ready, normalHeadValid and the consume block all
+    // take `!fpImmTable.stall`). Livelock-free: entries are freed by issue (older uops,
+    // independent of decode progress) or by a squash.
+    val fpImmTable = new Area {
+      val depth = Global.FP_IMM_TABLE_DEPTH
+      val tagW  = Global.FP_IMM_TAG_W
+      val mem   = Mem(Bits(80 bits), depth)
+      mem.addAttribute("ram_style", "distributed")
+      val valid   = RegInit(B(0, depth bits))   // entry holds a live, unconsumed immediate
+      val backend = RegInit(B(0, depth bits))   // ... whose uop has popped out of the queue
+      val full     = valid.andR
+      val allocOh  = OHMasking.first(~valid)
+      val allocIdx = OHToUInt(allocOh)
+      // The head candidate: the replayed stash, else fed's slot0.
+      val headPend = Mux(stashValid, stashFpPend, fed.valid && a0.fpImmAlloc)
+      val headVal  = Mux(stashValid, stashFpVal, a0.fpWideImm)
+      val stall    = headPend && full
+      // Driven at the push chain: the normal head (with a pending immediate) enters
+      // pushReg this cycle. Its tag is stamped into that uop's imm there too.
+      val allocFire = Bool()
+      mem.write(address = allocIdx, data = headVal, enable = allocFire)
+      val allocOhFire = Mux(allocFire, allocOh, B(0, depth bits))
+
+      def isFpImmUop(u: DecodedUop): Bool =
+        u.op === DecOp.FPU && (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
+                               u.fpSrcKind === FpSrcKind.DOUBLEIMM || u.fpSrcKind === FpSrcKind.EXTIMM)
+      def tagOf(u: DecodedUop): UInt = u.imm(tagW - 1 downto 0).asUInt
+      // Decode -> rename boundary crossing: the uop becomes BACKEND-owned.
+      val pop = queue.io.pop
+      val popOh = (0 until 2).map { k =>
+        val v = pop.fire && (if (k == 0) True else queue.io.pop1Valid) && isFpImmUop(pop.payload(k))
+        Mux(v, UIntToOh(tagOf(pop.payload(k)), depth), B(0, depth bits))
+      }.reduce(_ | _)
+      // Consumer release (DivEu's capture).
+      val free   = _fpImmFree
+      val freeOh = Mux(free.valid, UIntToOh(free.payload, depth), B(0, depth bits))
+
+      val backendNext = (backend | popOh) & ~allocOhFire
+      val feFree = Mux(pipeFlush,     ~backendNext, B(0, depth bits))   // frontend squash
+      val beFree = Mux(_backendFlush,  backendNext, B(0, depth bits))   // backend squash
+      valid   := ((valid | allocOhFire) & ~freeOh) & ~feFree & ~beFree
+      backend := backendNext
+
+      _fpImmRdData := mem.readAsync(_fpImmRdAddr)
+
+      // Sim-only invariants (the plan's "entry valid at consume", plus the domain rules).
+      assert(!(free.valid && !valid(free.payload)),
+        "FpImmTable: DivEu consumed a tag whose entry is not allocated (freed/overwritten slot)")
+      assert(!(free.valid && !backend(free.payload)),
+        "FpImmTable: DivEu consumed a tag whose uop never popped out of the decode queue")
+      assert(!(allocFire && full), "FpImmTable: allocation while full (stall gate broken)")
+      assert(!(allocFire && !stashValid && a0.count =/= U(1, 2 bits)),
+        "FpImmTable: an FP-immediate uop must be a 1-uop crack (slot0)")
+      assert(!(allocFire && stashValid && stashCount =/= U(1, 2 bits)),
+        "FpImmTable: an FP-immediate uop must be a 1-uop crack (stash)")
+      assert(!(popOh & ~valid).orR, "FpImmTable: a popped FP-immediate uop carries a tag that is not allocated")
+      assert(!(popOh & backend).orR, "FpImmTable: a popped FP-immediate uop's entry was already backend-owned")
+      valid.simPublic(); backend.simPublic(); stall.simPublic(); allocFire.simPublic()
+      free.valid.simPublic(); free.payload.simPublic()
+      // LEAK WATCHDOG (sim-only). An entry that is neither consumed nor reclaimed for a
+      // very long time means a squash path this table does not see: concretely, a core
+      // wiring that drives `pipeFlush` but forgot `backendFlush` (FuzzDut's own wiring
+      // plugin did exactly that on first integration: the program still PASSED, with 7 of
+      // the entries leaked at the end -- the failure mode is a silent later deadlock, not a
+      // wrong value). 1M cycles is far beyond any legitimate residency (an FP-immediate
+      // uop parked behind eight worst-case FDIVs is ~600 cycles) yet short enough for a
+      // boot-length simulation to trip.
+      GenerationFlags.simulation {
+        val age = Vec.fill(depth)(Reg(UInt(21 bits)) init 0)
+        for (e <- 0 until depth) {
+          when(!valid(e) || allocOhFire(e)) { age(e) := 0 } otherwise { age(e) := age(e) + 1 }
+          assert(age(e) < U(1000000, 21 bits),
+            s"FpImmTable: entry $e has been live for 1M cycles without being consumed or reclaimed (a squash path this table cannot see -- is backendFlush wired?)")
+        }
+      }
+    }
 
     // Head instruction this cycle: the stashed slot1 (registered uops) else slot0 (a0).
     val nCur = Mux(stashValid, stashCount, a0.count)       // 1..3
@@ -1299,7 +1434,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
     // replaying a stash) is owned by the FSM -> the normal head does not push it.
-    val normalHeadValid = stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive && !slot0IsFmovemx && !fmovemxActive && !fmovemxPendValid)
+    // `!fpImmTable.stall`: the head is an FP-immediate uop and the side table is full --
+    // hold it (and everything behind it) until DivEu frees an entry or a squash does.
+    val normalHeadValid = !fpImmTable.stall && (stashValid || (fed.valid && !slot0IsMovem && !slot0OwnedByUc && !slot0IsMovep && !movemPendValid && !ucPendValid && !ucActive && !movepPendValid && !movepActive && !slot0IsFmovemx && !fmovemxActive && !fmovemxPendValid))
 
     // Produce the push as a Stream. When the MOVEM FSM is active it OVERRIDES the source
     // (its 2 moves / the final An update); otherwise the normal crack drives it.
@@ -2574,6 +2711,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucCurLast = ucRowBits.isLast
 
         val pushProduced = Stream(PushPayload())
+    // True exactly when the `otherwise` (normal head) arm of the chain below is selected:
+    // the FP wide-immediate table allocates only for that arm.
+    val normalPushSel = Bool(); normalPushSel := False
     when(movemActive) {
       pushProduced.valid           := True
       when(movemSnapPhase) {
@@ -2617,13 +2757,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       pushProduced.payload.uops(3) := fmovemxCurUop
       pushProduced.payload.count   := U(1, 3 bits)
     } otherwise {
+      normalPushSel                := True
       pushProduced.valid           := normalHeadValid
       pushProduced.payload.uops(0) := normUop(0)
       pushProduced.payload.uops(1) := normUop(1)
       pushProduced.payload.uops(2) := normUop(2)
       pushProduced.payload.uops(3) := normUop(3)
       pushProduced.payload.count   := totalCount
+      // FP wide-immediate side table: stamp the entry tag into the head uop's `imm`
+      // (the assembler zeroed it; useImm=False on these rows so nothing reads it as a
+      // value). The table write itself fires with `allocFire` below.
+      when(fpImmTable.headPend) {
+        pushProduced.payload.uops(0).imm := fpImmTable.allocIdx.resize(32).asBits
+      }
     }
+    fpImmTable.allocFire := normalPushSel && pushProduced.valid && pushProduced.ready && fpImmTable.headPend
 
 
     // P1: register the produced push. The deep `assemble` cone ends at pushReg's input;
@@ -2679,9 +2827,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ── sim-only debug probes (bf3c bring-up; TEMPORARY) ──
     pushReg.valid.simPublic(); pushReg.payload.count.simPublic()
     queue.io.push.ready.simPublic()
+    queue.io.pop.valid.simPublic(); queue.io.pop.ready.simPublic(); queue.io.pop1Valid.simPublic() // uop-crack bench
     for (i <- 0 until 4) {
       pushReg.payload.uops(i).pc.simPublic(); pushReg.payload.uops(i).faulted.simPublic()
       pushReg.payload.uops(i).faultVector.simPublic(); pushReg.payload.uops(i).firstOfInstr.simPublic()
+      // uop-crack bench: per-uop GPR-write / memOp / cluster class (sim-only, zero synth impact)
+      pushReg.payload.uops(i).dstValid.simPublic(); pushReg.payload.uops(i).memOp.simPublic()
+      pushReg.payload.uops(i).cluster.simPublic(); pushReg.payload.uops(i).lastOfInstr.simPublic()
     }
     fed.valid.simPublic(); fed.ready.simPublic()
     fed.payload.packets(0).pc.simPublic(); fed.payload.packets(1).pc.simPublic()
@@ -2775,10 +2927,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // (ucEnterSlot0) or when its slot1 was stashed (ucPendValid set in the normal consume).
     fed.ready := (!stashValid && !movemHoldsFed && !slot0IsMovem && !ucHoldsFed &&
                   !movepHoldsFed && !slot0IsMovep && !fmovemxHoldsFed && !slot0IsFmovemx &&
-                  pushProduced.ready) ||
+                  !fpImmTable.stall && pushProduced.ready) ||
                  movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0 || fmovemxEnterSlot0
+    // `!fpImmTable.stall`: the normal head is HELD (not emitted, see normalHeadValid), so
+    // it must not be consumed here either -- neither the stash nor `fed`.
     when(!movemActive && !movemBegin && !ucBegin && !ucActive && !movepActive && !movepBegin &&
-         !fmovemxActive && !fmovemxBegin && pushProduced.ready) {
+         !fmovemxActive && !fmovemxBegin && !fpImmTable.stall && pushProduced.ready) {
       when(stashValid) {
         stashValid := False                  // the stashed slot1/RTR was emitted (into pushReg) this cycle
       } elsewhen(slot1IsMovem) {
@@ -2805,6 +2959,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         stashValid  := True                  // defer slot1 to next cycle (3-µop slot0 or slot1)
         stashCount  := a1raw.count
         for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
       }
     }
     // ── MOVEM FSM transitions ───────────────────────────────────────────────────
@@ -2887,6 +3042,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
           stashValid  := True
           stashCount  := a1raw.count
           for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
       // Empty mask: no moves (count 0 -> An unchanged); finish immediately (but the slot1
@@ -3011,6 +3167,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
           stashValid  := True
           stashCount  := a1raw.count
           for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
       // Empty list (design doc §2): architecturally a no-op (no memory traffic, An
@@ -3124,6 +3281,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
           stashValid := True
           stashCount := a1raw.count
           for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
     } elsewhen(ucActive) {
@@ -3174,6 +3332,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
           stashValid := True
           stashCount := a1raw.count
           for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
+          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
     } elsewhen(movepActive) {
@@ -3224,6 +3383,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
   override def uops: Stream[Vec[DecodedUop]] = logic.uopsOut
   override def uop1Valid: Bool               = logic.uop1Sig
   override def pipeFlush: Bool               = logic.pipeFlush
+  override def backendFlush: Bool            = _backendFlush
+  override def fpImmRdAddr: UInt             = _fpImmRdAddr
+  override def fpImmRdData: Bits             = _fpImmRdData
+  override def fpImmFree: Flow[UInt]         = _fpImmFree
   override def complexResume: Flow[UInt]     = logic.ucComplexResume
   override def configure(pcs: Vec[UInt], enables: Bits, skipOnce: Bits): Unit = {
     for (i <- 0 until 4) _debugBreakPcs(i) := pcs(i)

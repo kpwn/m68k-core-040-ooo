@@ -207,9 +207,10 @@ case class RenamedUop() extends Bundle {
   // rename plumbing) had already landed, so they were never threaded through here.
   // Task 6 closes that gap: without them, Task 8's EU would have real FP register
   // renaming but no way to learn WHICH operation to perform or WHERE its source
-  // comes from. fpSrcFmt/fpWideImm are the NEW fields this task's own scope adds.
+  // comes from. fpSrcFmt is the NEW field this task's own scope adds. (The 80-bit
+  // `fpWideImm` that used to sit here now lives in DecodeStage's FP wide-immediate side
+  // table; the tag rides `imm[Global.FP_IMM_TAG_W-1:0]` -- see DecodedUop.)
   val fpuOp     = Bits(7 bits)
   val fpSrcKind = FpSrcKind()
   val fpSrcFmt  = Bits(3 bits)
-  val fpWideImm = Bits(80 bits)
 }

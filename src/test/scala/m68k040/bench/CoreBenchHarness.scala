@@ -183,6 +183,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val feSuppress = rob.logic.earlySuppressFe && !excActive
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
+      decodeUop.backendFlush := pipeFlush      // FP wide-imm side table: backend-owned entries (Tier 2 only)
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see

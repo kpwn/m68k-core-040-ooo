@@ -637,10 +637,39 @@ trait DecodeUopService {
   def uops: Stream[Vec[DecodedUop]]   // Vec length 2
   def uop1Valid: Bool
   def pipeFlush: Bool
+  /** The BACKEND squash pulse (RobPlugin `doFlush || excActive`, i.e. exactly what
+    * clears the issue queue and the rename->dispatch skid). Distinct from `pipeFlush`
+    * (the FRONTEND squash, which additionally carries Tier-1 `earlyFire` and is withheld
+    * on a Tier-2 `feSuppress` flush). DecodeStage needs BOTH because it owns the FP
+    * wide-immediate side table, whose entries are held by uops on either side of the
+    * decode->rename boundary. Default-driven False (allowOverride); backend wiring
+    * drives it alongside `IssueQueueService.flushPort`. */
+  def backendFlush: Bool
   /** DecodeStage is the sole real-core producer. Rare complex packets pulse their exact
     * architectural fall-through target here; frontend wiring adds the consumer-local
     * register required by the 250 MHz FMax contract. */
   def complexResume: Flow[UInt]
+}
+
+/** The FP wide-immediate side table (docs/PLAN_routing_congestion_architectural.md
+  * item 3). Producer: DecodeStage (allocates an entry when an `F<op>.<fmt> #imm,FPn`
+  * uop enters the MicroOpQueue and stamps the entry tag into that uop's
+  * `imm[Global.FP_IMM_TAG_W-1:0]`).
+  * Consumer: DivEuPlugin (the ONLY reader of the immediate) -- it presents the tag on
+  * `fpImmRdAddr` on the accepting cycle, captures `fpImmRdData` (asynchronous LUTRAM
+  * read) into its own `fpS1Imm` register, and pulses `fpImmFree` with the same tag to
+  * release the entry. All three are directionless wires created in the producer's setup
+  * phase (so no Fiber build-order edge exists between the two plugins); the producer
+  * default-drives the consumer-owned ones (allowOverride) so a decode-only harness
+  * still elaborates, and a DivEu-only harness supplies a stub implementation.
+  * Reclamation on squash is the producer's job and is NOT "clear everything on flush":
+  * with the two-tier reschedule (RobPlugin `earlyFire`/`feSuppress`) the frontend and
+  * the backend are squashed by DIFFERENT pulses, so an entry is freed by the pulse that
+  * squashes the domain its uop currently sits in (see DecodeStage `fpImmTable`). */
+trait FpImmTableService {
+  def fpImmRdAddr: UInt      // FP_IMM_TAG_W bits, consumer-driven
+  def fpImmRdData: Bits      // 80 bits, async read of the entry at fpImmRdAddr
+  def fpImmFree: Flow[UInt]  // consumer-driven: release this tag (fires with the capture)
 }
 
 /** Produced by rename; consumed by the (future) dispatch/ROB. Plain Stream. */

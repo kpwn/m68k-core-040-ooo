@@ -256,6 +256,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // hardcoded 48 — became 50 when the 2 temp arch regs T0/T1 widened the int
     // pool, so a temp's pdst could index past 48 and alias/over-run the bitmaps).
     val physIntN = m68k040.Global.PHYS_INT_REGS.get
+    // The ONE place where the configured pool size meets the plain constant every
+    // structural site derives from (RenameStage's freelist, RegfileSpec.Int.depth). If a
+    // config ever sets physInt to something else, these bitmaps and the PRF would still be
+    // built for the constant while rename handed out ids from the config -- the exact
+    // silent-corruption/frozen-machine class documented on Global.PHYS_INT_REGS_DEFAULT.
+    // Fail the BUILD instead of the board.
+    require(physIntN == m68k040.Global.PHYS_INT_REGS_DEFAULT &&
+            physIntN == m68k040.execute.regfile.RegfileSpec.Int.depth,
+      s"int physical-register pool size disagreement: Global.PHYS_INT_REGS=$physIntN, " +
+      s"Global.PHYS_INT_REGS_DEFAULT=${m68k040.Global.PHYS_INT_REGS_DEFAULT} (what " +
+      s"RenameStage's intFree allocates from), RegfileSpec.Int.depth=" +
+      s"${m68k040.execute.regfile.RegfileSpec.Int.depth} (the int PRF Mem). All three MUST " +
+      s"be equal -- see Global.PHYS_INT_REGS_DEFAULT.")
     val sbInt  = new Scoreboard(physIntN) // int physregs
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     sbNzvc.busy.simPublic()  // debug-only (task #141)

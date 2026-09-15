@@ -6,6 +6,7 @@ import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{FpccRegFileService, FpRegFileService, IntRegFileService,
   NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.Size
+import m68k040.services.FpImmTableService
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -59,7 +60,7 @@ trait DivEuService {
 /** Pruned descriptor that follows the fixed MUL datapath.  Do not replace this
   * with IqContext: the multiplier needs only result-routing and flag metadata. */
 case class MulPipeContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
   val pNzvcDst    = UInt(4 bits)
@@ -74,7 +75,7 @@ case class MulPipeContext() extends Bundle {
   * routing descriptor removes it from the sole CPLX issue port without carrying
   * a full IqContext or inventing a false PRF dependency. */
 case class MulHiContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val dstArch     = UInt(5 bits)
 }
@@ -90,7 +91,7 @@ case class MulHiContext() extends Bundle {
   * destination, an NZVC destination and the arch-reg number for the whitebox, and
   * nothing else.  BITFIELD raises no fault, reads no flags and never writes X. */
 case class BfPipeContext() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
   val pNzvcDst    = UInt(4 bits)
@@ -100,7 +101,7 @@ case class BfPipeContext() extends Bundle {
 
 /** One result waiting for the existing single CPLX completion/writeback lane. */
 case class CplxResult() extends Bundle {
-  val robId       = UInt(6 bits)
+  val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val data        = Bits(32 bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
@@ -123,7 +124,7 @@ case class CplxResult() extends Bundle {
   * no operation selector (the op is already inside FpuCore's own pipe, and the rounding mode
   * travels with the request inside `FpRoundReq.rmode`). */
 case class FpPipeContext() extends Bundle {
-  val robId     = UInt(6 bits)
+  val robId     = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst      = UInt(4 bits)   // FP data physical dest (RenamedUop.pFpDst)
   val pdstValid = Bool()         // False for FCMP/FTST (FPCC-only ops)
   val pFpccDst  = UInt(4 bits)
@@ -273,7 +274,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
   during setup {
     issuePort      = Stream(IqContext())
-    completionPort = Flow(UInt(6 bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
@@ -290,7 +291,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()
     nzvcRd = nz.newRead(forceNoBypass = false)   // CMP2/CHK2 reads old N/V to preserve them
     // ---- FP lane ----
-    fpCompletionPort = Flow(UInt(6 bits))
+    fpCompletionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     fpWakeupPort     = Flow(UInt(4 bits))
     fpccWakeupPort   = Flow(UInt(4 bits))
     fpFaultPort      = Flow(EuFault()); fpFaultPort.simPublic()
@@ -500,7 +501,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // completion/writeback/wakeup/euFault ports the SAME or next cycle. A 1-cycle
     // pulse: default-clear, set only by a capture.
     val compValid     = RegInit(False)
-    val compRobId     = Reg(UInt(6 bits))
+    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
     val compData      = Reg(Bits(32 bits))
     val compPdst      = Reg(UInt(6 bits))
     val compPdstValid = RegInit(False)
@@ -873,7 +874,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // single-outstanding iterative lane.
     val remLatch      = Reg(Bits(32 bits)) init 0
     val ovLatch       = RegInit(False)
-    val remStashRobId = Reg(UInt(6 bits)) init 0
+    val remStashRobId = Reg(UInt(m68k040.Global.ROB_ID_W bits)) init 0
     val remStashValid = RegInit(False)
     /** Publish this DIV's remainder/overflow under its OWN robId. Guarded on the flush
       * latch so a wrong-path divide that finishes AFTER the flush cannot hand its
@@ -1002,8 +1003,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
 
     // A main .L64 result is associated with the immediately following MULHI ROB
     // entry.  Store high under (mainRob+1) so the queued tail indexes with its own id.
-    val mulHiMem = Mem(Bits(32 bits), 64)
-    val mulHiValid = Reg(Bits(64 bits)) init 0
+    val mulHiMem = Mem(Bits(32 bits), m68k040.Global.ROB_DEPTH.get)
+    val mulHiValid = Reg(Bits(m68k040.Global.ROB_DEPTH.get bits)) init 0
     val mulHiHead = mulHiPendingQ.io.pop.payload
     val mulHiHeadReady = mulHiPendingQ.io.pop.valid && mulHiValid(mulHiHead.robId)
     val mulHiData = mulHiMem.readAsync(mulHiHead.robId)
@@ -1075,7 +1076,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpS1IntC   = Reg(Bits(32 bits))     // rdH: Extended chunk T2
     val fpS1FpDst  = Reg(Bits(80 bits))     // fpRdA: FPn read back for dyadic ops
     val fpS1FpSrc  = Reg(Bits(80 bits))     // fpRdB: FPm (fpSrcKind === FPREG)
-    val fpS1Imm    = Reg(Bits(80 bits))     // u0.fpWideImm
+    // The FP wide-immediate, captured from DecodeStage's side table (FpImmTableService,
+    // docs/PLAN_routing_congestion_architectural.md item 3) on the accepting cycle: the
+    // uop carries only the entry TAG in imm[FP_IMM_TAG_W-1:0] (useImm=False on these
+    // rows), the table is an async-read LUTRAM, and the SAME cycle releases the entry.
+    // This register is the value's ONLY consumer-side home, exactly as before.
+    val fpS1Imm    = Reg(Bits(80 bits))
+    val fpImmTab   = host[FpImmTableService]
+    val u0FpImmTag = u0.imm(m68k040.Global.FP_IMM_TAG_W - 1 downto 0).asUInt
+    val u0FpImmKind = u0.fpSrcKind === FpSrcKind.INTIMM   || u0.fpSrcKind === FpSrcKind.SINGLEIMM ||
+                      u0.fpSrcKind === FpSrcKind.DOUBLEIMM || u0.fpSrcKind === FpSrcKind.EXTIMM
+    fpImmTab.fpImmRdAddr       := u0FpImmTag
+    fpImmTab.fpImmFree.valid   := fpAccept && u0FpImmKind
+    fpImmTab.fpImmFree.payload := u0FpImmTag
     val fpS1Kind   = Reg(FpSrcKind())
     // ── FMax fanout split: a physical duplicate of `fpS1Kind` (task #265, option O4) ──
     // `fpS1Kind` is ONE register whose output fans out into two structurally different
@@ -1118,7 +1131,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       fpS1IntC   := rdH.data
       fpS1FpDst  := fpRdA.data
       fpS1FpSrc  := fpRdB.data
-      fpS1Imm    := u0.fpWideImm
+      fpS1Imm    := fpImmTab.fpImmRdData   // side-table read, tag = u0.imm[FP_IMM_TAG_W-1:0]
       fpS1Kind   := u0.fpSrcKind
       fpS1KindB  := u0.fpSrcKind    // physical duplicate of fpS1Kind, see comment above
       fpS1Fmt    := u0.fpSrcFmt
@@ -1249,7 +1262,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // A second, independent completion register. compValid/compData/... above remain
     // exclusively the int/NZVC 32-bit path and are untouched by this lane.
     val fpCompValid     = RegInit(False)
-    val fpCompRobId     = Reg(UInt(6 bits))
+    val fpCompRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
     val fpCompPdst      = Reg(UInt(4 bits))
     val fpCompPdstValid = RegInit(False)
     val fpCompData      = Reg(Bits(80 bits))

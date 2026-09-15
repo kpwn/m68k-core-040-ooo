@@ -118,6 +118,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
     iq.flushPort := pipeFlush                  // IQ clear (Tier 2 only)
     decodeUop.pipeFlush := feFlush             // FE skid (decode->rename)
+    decodeUop.backendFlush := pipeFlush        // FP wide-imm side table: backend-owned entries (Tier 2 only)
     host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
     host[RenameStage].logic.allocHalt := rob.logic.earlyPend  // Tier-1 rename freeze
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
@@ -447,7 +448,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // The fetch walk's U-descriptor write drains at retire (tagged robId 0; the U bit
     // is idempotent / not architecturally compared) and discards on flush.
     val itlb = host[m68k040.mmu.ItlbPlugin]
-    itlb.umAccessRobId := U(0, 6 bits)
+    itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
     itlb.umCommitValid := rob.logic.retire0
     itlb.umCommitBValid := rob.logic.retire1
     itlb.umCommitBId    := rob.logic.h1
