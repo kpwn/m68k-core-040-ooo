@@ -2989,6 +2989,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     normalReqArm := tValid && tIsMem && txReady && !splitReqArm &&
                     !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
     val normalReqFire = xlate.req.fire && !reqFromSplit && !excActive
+    // ── LIVENESS TRIPWIRE (2026-09-15): a memory op parked in P2 with nothing holding it
+    // architecturally must launch within a bounded time. `dcLoadHeldByOther` (exception
+    // ownership, a walker owning the port) and a flush are the only legitimate
+    // indefinite holds; everything else -- the D-cache's registered probe credit, the
+    // DTLB's ready, P2T draining its previous request -- is a bounded wait (a device
+    // read or a three-level table walk is hundreds of cycles, never tens of thousands).
+    // The existing suites see a no-forward-progress bug here only as a generic
+    // timeout; this names the site. Simulation-only, pruned from every netlist.
+    GenerationFlags.simulation {
+      val p2StallCycles = Reg(UInt(16 bits)) init 0
+      val p2Parked = tValid && tIsMem && !dcLoadHeldByOther && !sqFlushSig && !normalReqFire
+      when(p2Parked) { p2StallCycles := p2StallCycles + 1 } otherwise { p2StallCycles := 0 }
+      assert(p2StallCycles < U(20000, 16 bits),
+        "LsEuPlugin: a memory op has been parked in P2 for 20000 cycles without launching " +
+          "(probe credit / DTLB ready / P2T never freed) -- no forward progress on load admission",
+        FAILURE)
+    }
     // Debug-only taps (zero synth impact): P2 launch gating terms.
     normalReqFire.simPublic(); dcLoadHeldByOther.simPublic(); dcache.loadProbe.ready.simPublic(); xlate.req.ready.simPublic()
     val splitReqFire  = xlate.req.fire && reqFromSplit && !excActive

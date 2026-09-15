@@ -2992,6 +2992,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      !(storeReadOwedNext && stS1ValidNext) &&
                      earlyProbeHasFreeNext
 
+    // LIVENESS TRIPWIRE (2026-09-15): the credit may close for a refill, a device read, a
+    // maintenance walk or an owed store read -- all bounded -- but never indefinitely
+    // while a requester waits. A closed credit with `loadProbePort.valid` high for 20000
+    // cycles is a no-forward-progress bug in this block (a stuck replica, a leaked
+    // queue entry, a term that never clears), named here instead of as a test timeout.
+    GenerationFlags.simulation {
+      val creditClosedCycles = Reg(UInt(16 bits)) init 0
+      when(loadProbePort.valid && !probeReadyReg) {
+        creditClosedCycles := creditClosedCycles + 1
+      } otherwise { creditClosedCycles := 0 }
+      assert(creditClosedCycles < U(20000, 16 bits),
+        "DcachePlugin: the registered probe credit has refused a waiting probe for 20000 " +
+          "cycles -- no forward progress on load admission",
+        FAILURE)
+    }
+
     // TRIPWIRES: every next-state replica above must equal the register it mirrors on
     // the following cycle. A drift here would make the credit optimistic about a
     // resource (a fire that then finds no entry -- also asserted at the launch site)

@@ -767,6 +767,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       // OR two payloads into the issue register.
       assert(!(lsSkidValid && selPorts(3).valid),
         "IssueQueuePlugin: LS select fired while the port-3 skid holds a uop", FAILURE)
+      // LIVENESS (2026-09-15): the skid drains the first cycle the LS EU is ready or a
+      // flush lands; a uop parked in it for 20000 cycles means the EU's front never
+      // freed -- a no-forward-progress bug, named at the IQ rather than as a timeout.
+      val skidHeldCycles = Reg(UInt(16 bits)) init 0
+      when(lsSkidValid) { skidHeldCycles := skidHeldCycles + 1 } otherwise { skidHeldCycles := 0 }
+      assert(skidHeldCycles < U(20000, 16 bits),
+        "IssueQueuePlugin: the LS port-3 skid has held a uop for 20000 cycles -- the LS EU " +
+          "never accepted it; no forward progress on LS issue",
+        FAILURE)
     }
 
     val pipedPorts = Seq.tabulate(5) { k =>
