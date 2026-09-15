@@ -827,14 +827,31 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
           dut.eu.logic.p4Ctx.xlate.front.robId.toInt else -1
         // A cold miss deliberately blocks further D-cache probes: general
         // hit-under-miss is out of scope.  The fifth request therefore remains in
-        // the elastic LS front when the oldest ring entry completes; it cannot be
-        // used as a resident-hit pop/push turnover test.  Prove that boundary
-        // explicitly, then prove that the retained request is eventually admitted.
+        // the elastic LS front when the oldest ring entry completes.  Prove that
+        // boundary explicitly, then prove that the retained request is eventually
+        // admitted.
+        //
+        // 2026-09-15: the fifth's hold point is ANY front stage, exactly as the
+        // full-ring check above already accepts (P1/P2/P2T/P3/P4).  This used to
+        // demand P2 specifically, plus "no enqueue on the completion cycle": that
+        // was the four-entry early-probe queue's back-pressure point (four cold
+        // misses hold four probe entries, so the fifth's probe could not launch and
+        // P2 stalled).  With the registered probe credit the queue has five entries
+        // (DcachePlugin.earlyProbeDepth), so the fifth probes, resolves, and waits
+        // in P4 on `alignedCanEnq` -- and enqueues on the very cycle the oldest
+        // entry pops, which is the ring's own designed pop/push turnover
+        // (`!alignedFull || alignedRspFire`), not a hit-under-miss.  The capacity
+        // contract is unchanged: the fifth is still resident upstream of the ring
+        // when the oldest completes, enqueues exactly once (below), and completes
+        // in order (below).
+        val fifthInFront =
+          (dut.eu.logic.s1Valid.toBoolean && dut.eu.logic.s1Ctx.robId.toInt == 14) ||
+          (dut.eu.logic.tValid.toBoolean && dut.eu.logic.tCtx.robId.toInt == 14) ||
+          (dut.eu.logic.txValid.toBoolean && dut.eu.logic.txCtx.robId.toInt == 14) ||
+          (dut.eu.logic.p3Valid.toBoolean && dut.eu.logic.p3Ctx.front.robId.toInt == 14) ||
+          (p4Rob == 14)
         sawSerializedMissBoundary ||=
-          dut.eu.logic.alignedRspFire.toBoolean &&
-          dut.eu.logic.tValid.toBoolean &&
-          dut.eu.logic.tCtx.robId.toInt == 14 &&
-          !dut.eu.logic.alignedEnq.toBoolean
+          dut.eu.logic.alignedRspFire.toBoolean && fifthInFront
         sawFifthEnqueue ||=
           dut.eu.logic.alignedEnq.toBoolean && p4Rob == 14
         if (dut.src.logic.cValid.toBoolean)
