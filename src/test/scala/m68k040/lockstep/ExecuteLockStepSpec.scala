@@ -1306,8 +1306,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         {
           val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
           val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
-          // ── MACRO-LAST uops only (2026-09-16; originally 9635f91c, reverted by 599180b7,
-          // re-applied here with the evidence that motivates it) ─────────────────────────
+          // ── WHY THIS POKE IS PER-UOP AND NOT PER-MACRO -- MEASURED, 2026-09-16 ───────
+          // TEMPTING FIX THAT DOES NOT WORK, do not re-try it without new evidence:
+          // gating this poke on `debugMacroRetirePc(k).valid` (= retire && p.last, i.e.
+          // MACRO retirement) is what 9635f91c did and 599180b7 reverted. Re-applied and
+          // MEASURED on 817bf43d: it REGRESSES `a7-byte: IRQ at every boundary ...` (b5
+          // diverges on pc, b7-late on pc) and does NOT fix the odd-ssp LINK #-75 sweeps
+          // (boot-0/2/4/6/8/10/12 still fail). Net loss, so the per-uop form stands.
+          // The reasoning BEHIND the tempting fix is still true and worth knowing:
           // `commitPc` is the retiring UOP's next pc: for a BRANCH uop that is the RESOLVED
           // target, but for every other uop it is the sequential `pc + len`. JSR/BSR crack
           // to [push retPC] + [ibranch], and the push uop's sequential next pc IS the
@@ -1322,15 +1328,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           // rejoining right after the RTE. Gating on the macro-last uop makes the trigger
           // the instruction's real next pc (the branch uop's resolved target for a call),
           // which is exactly what the oracle's own `--irq-event` keys on.
-          val last0 = dut.rob.logic.debugMacroRetirePc(0).valid.toBoolean
-          val last1 = dut.rob.logic.debugMacroRetirePc(1).valid.toBoolean
-          if (dut.rob.logic.retire0.toBoolean && last0 && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
+          if (dut.rob.logic.retire0.toBoolean && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
             firedEvents += rawPc0
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc0)
             dut.intCtrl.logic.iackAvec   #= avec
             dut.intCtrl.logic.iackVector #= vectorIn
           }
-          if (dut.rob.logic.retire1.toBoolean && last1 && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
+          if (dut.rob.logic.retire1.toBoolean && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
             firedEvents += rawPc1
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc1)
             dut.intCtrl.logic.iackAvec   #= avec
@@ -12060,7 +12064,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     "move.l #0x00003000,%a0", "move.l #0x00003008,%a1", "move.l #0x5a5a5a5a,(%a0)",
     "move.b #0x01,0x0cb2",
     "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)",
-    "lea 8(%sp),%sp", "move.l #0x00000042,%d0", "move.w #0x2000,%sr") ++ a7IrqIdiom ++ Seq(
+    "lea 8(%sp),%sp", "move.l #0x00000042,%d0",
+    // D1/D2 (idiom) and D5/D6 (the two handlers) are BYTE-written and otherwise never
+    // initialised, so their upper 24 bits are the DUT's RANDOM PRF init against the
+    // oracle's zero -- measured here as `reg D1: dut=0xf6e68601 oracle=0x00000001`. That
+    // makes this test SEED-DEPENDENT: it passes only when the random init happens to be
+    // zero, or when the interrupt alignment keeps that write out of the compare. Four
+    // moveq's cost four preamble instructions (mind `Pre` below) and remove the flake.
+    "moveq #0,%d1", "moveq #0,%d2", "moveq #0,%d5", "moveq #0,%d6",
+    "move.w #0x2000,%sr") ++ a7IrqIdiom ++ Seq(
     "lea 8(%sp),%sp", "end: bra.s end",
     "handler: move.b %d5,-(%sp)", "move.b 0x0cb2,-(%sp)", "move.b (%sp)+,%d5", "tst.b (%sp)+", "rte",
     "aline: move.b %d6,-(%sp)", "move.b (%sp)+,%d6", "addq.l #2,2(%sp)", "rte")).mkString(" ; ")
@@ -12069,7 +12081,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(v)  => v
       case Left(err) => fail(s"[a7-irq] Musashi.assembleAndTrace (plain) failed: ${err.reason}")
     }
-    val Pre = 15                                   // straight-line preamble instructions
+    val Pre = 19                                   // straight-line preamble instructions
+                                                   // (15 original + the 4 moveq register
+                                                   // initialisers added above -- keep in step)
     assert(plain.size > Pre + a7IrqIdiom.size + 2, s"[a7-irq] plain trace too short: ${plain.size}")
     // OracleStep.pc is the POST-step pc, so entry i is the boundary BEFORE idiom[i+1]; one
     // extra entry (the `lea` after the idiom) serves the last boundary's one-late retry.
@@ -12345,7 +12359,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // ═══════════════════════════════════════════════════════════════════════════════
   // Fill the 256 bytes below the boot SSP with a known non-zero pattern so a byte read
   // from the WRONG address is guaranteed to differ from the frame word it replaces.
-  private val oddSspFill: Seq[String] = Seq("move.w #63,%d1", "fill: move.l #0xa5a5a5a5,-(%sp)", "dbf %d1,fill", "lea 256(%sp),%sp")
+  // ⚠️ `moveq #63,%d1`, NOT `move.w #63,%d1` (fixed 2026-09-16). Musashi zeroes every
+  // register at reset; SpinalSim RANDOMISES the PRF per simulation seed. A WORD write
+  // leaves D1's upper 16 bits at that random value while the oracle has zero, so the
+  // lock-step compare mismatched on the committed 32-bit value -- measured as
+  // `reg D1: dut=0x0d7c003f/0xa98e003f/0xccf9003f oracle=0x0000003f` at index 4 (0x3f =
+  // 63), three different garbage uppers in three runs of the SAME test. That made every
+  // odd-ssp test built on this fill seed-dependently red BEFORE the interrupt was even
+  // involved. A moveq writes all 32 bits, so DUT and oracle agree by construction; D1 is
+  // only a loop counter here, so nothing the test exercises changes.
+  private val oddSspFill: Seq[String] = Seq("moveq #63,%d1", "fill: move.l #0xa5a5a5a5,-(%sp)", "dbf %d1,fill", "lea 256(%sp),%sp")
 
   // (b) A-line trap taken and RTE'd with SSP = boot - k, k odd (every odd alignment mod 16).
   private def oddSspAlineSrc(k: Int): String = (Seq("move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
@@ -12380,6 +12403,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val vecAddr = (24 + level) * 4
     (Seq("move.l #handler,%d0", f"move.l %%d0,0x$vecAddr%x", "move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
       s"lea -$k(%sp),%sp",
+      // D2/D3 are BYTE-written later (`move.b -7(%a6),%d2`, `move.b -5(%a6),%d3`) and are
+      // otherwise never initialised, so without these their upper 24 bits are the DUT's
+      // RANDOM PRF init against the oracle's zero -- measured as
+      // `reg D2: dut=0x4c1b9d00 oracle=0x00000000` / `reg D3: dut=0xb058b600 oracle=0x0`.
+      // See the oddSspFill comment for the full mechanism. Long writes, so both sides agree.
+      "moveq #0,%d2", "moveq #0,%d3",
       "move.l #0x00003000,%a0", "move.l #0x55555555,%d5", "move.b #0x42,0x0cb3", "move.l %sp,%a5",
       "move.w #0x2000,%sr",
       "link %a6,#-75",
