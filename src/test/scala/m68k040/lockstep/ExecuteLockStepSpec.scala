@@ -409,6 +409,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dc.maintCmd               := exc.maintCmdOut
       exc.maintDoneIn           := dc.maintDone
       host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
+      // FullCoreSynth parity (2026-09-16): the SAME pulse must also drop the fetch
+      // BUFFER, not just the I-cache array -- `ibuf` sits DOWNSTREAM of the cache and is
+      // invalidated by nothing else, so the canonical store/CPUSHL/jump SMC sequence
+      // executes pre-patch bytes straight out of it. This line exists in
+      // FullCoreSynth.scala and was MISSING from all three simulation harnesses, so the
+      // whole ifstage_smc_* / cpush corpus was passing against a DUT in which the fix was
+      // absent -- i.e. it had zero simulation coverage and a regression deleting it from
+      // FullCoreSynth would have been invisible to the test suite.
+      host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       // A7 (arch-15) write on exc/RTE A7 change. The SAME PRF write port also serves
       // a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC Rc->Rn writes an
       // arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write in S_REDIR

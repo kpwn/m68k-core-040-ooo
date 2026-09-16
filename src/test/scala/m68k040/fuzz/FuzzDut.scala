@@ -305,6 +305,15 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     dc.maintCmd               := exc.maintCmdOut
     exc.maintDoneIn           := dc.maintDone
     host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
+    // FullCoreSynth parity (2026-09-16): the SAME pulse must also drop the fetch
+    // BUFFER, not just the I-cache array -- `ibuf` sits DOWNSTREAM of the cache and is
+    // invalidated by nothing else, so the canonical store/CPUSHL/jump SMC sequence
+    // executes pre-patch bytes straight out of it. This line exists in
+    // FullCoreSynth.scala and was MISSING from all three simulation harnesses, so the
+    // whole ifstage_smc_* / cpush corpus was passing against a DUT in which the fix was
+    // absent -- i.e. it had zero simulation coverage and a regression deleting it from
+    // FullCoreSynth would have been invisible to the test suite.
+    host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
     a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
     a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                               host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
