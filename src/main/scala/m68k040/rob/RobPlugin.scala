@@ -1006,7 +1006,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
     // the exc unit is built.
     val committedS = _supervisor; committedS.simPublic()
-    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted && !debugHalted
+    // FMax capture cut (see the fault-arbitration block below): True for exactly the
+    // one cycle between a fault's MARK (`faultedStore`, still written combinationally
+    // on the completion cycle) and its RECORD (`faultDynStore` + the `faultDynMem`
+    // row, written one cycle later out of the four-entry capture register). In that
+    // window an entry is `faulted` but its dyn gate is not yet open, so a commit
+    // decision taken there would read the ALLOC-time record and deliver the wrong
+    // vector / fault address.
+    //
+    // It is ANDed into `headReady` rather than into `faultRetire` alone, deliberately.
+    // `retire0`/`retire1`/`sysRetire`/`normalIrqGate`/`traceNormalGate` are all
+    // ALREADY gated on `!faultedStore(h0/h1)`, which IS set on the mark cycle, so
+    // they need no hold — but `rteRetire` carries no faulted gate at all, and the
+    // note at the sysOp-commit block below explicitly asks that any NEW commit
+    // variant inherit `headReady`'s gating rather than re-derive it. Holding the one
+    // shared gate makes the rule "the ROB commits NOTHING in the hold cycle", which
+    // is checkable by inspection and cannot be silently bypassed by a future commit
+    // path. The cost is one commit cycle per fault-completion event — an event that
+    // squashes the whole machine microseconds later.
+    val faultCapPending = Bool(); faultCapPending.simPublic()   // driven below
+    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted && !debugHalted &&
+                      !faultCapPending
     // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
     // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
     // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
@@ -1645,12 +1665,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Therefore L's mark is unreachable in every case. QED.
     //
     // Two deliberate design choices follow from the proof:
-    //   * The loser's `faultedStore` mark is dropped TOO (not kept). Keeping it while
-    //     dropping its record would leave L in a self-inconsistent "faulted, but the
-    //     fault payload is the alloc-time one (usually vector 0)" state — strictly
-    //     worse than not marking it, if the proof were ever violated by a future
-    //     change. Gate and Mem row are always written by the same statement, so
-    //     `faultDynStore(i)` True ALWAYS implies row i is fresh.
+    //   * SUPERSEDED 2026-09-16 by the capture register cut below — read that block
+    //     for the current rule. The arbitration now decides ONLY the `faultDynMem`
+    //     row and its `faultDynStore` gate; `faultedStore` is set for EVERY faulting
+    //     port, unarbitrated. (The old rule dropped the loser's `faultedStore` mark
+    //     too, to avoid a "faulted, but the payload is the alloc-time one" state.
+    //     Marking every loser reaches the same place from the other side: L is now
+    //     blocked from retiring by its own mark, so the proof's step (2) holds at
+    //     every faulting entry at once instead of at one arbitrated W. Gate and Mem
+    //     row are still written by the same statement, so `faultDynStore(i)` True
+    //     ALWAYS implies row i is fresh — that invariant is untouched.)
     //   * A same-robId, same-cycle collision resolves to the WINNING PORT'S WHOLE
     //     record, where the old code produced a per-field HYBRID (e.g. an ls+eu
     //     collision took eu's vector/addr but kept ls's size/wr/sup/atc, because eu
@@ -1715,17 +1739,112 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultPortOf(fpFaultCompletion.valid, fpFaultCompletion.payload.robId,
                   fpFaultCompletion.payload.faultAddr, fpFaultCompletion.payload.vector,
                   faultAllocSize, faultAllocWr, faultAllocSup, True))
+    // ══════════════════════════════════════════════════════════════════════════
+    // FMax — THE CAPTURE REGISTER CUT (2026-09-16, 200 MHz closure task)
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // MEASURED PROBLEM (post-route, build/vivado200_closure/reports/timing_route.rpt):
+    //
+    //   -0.312 ns, 26 logic levels, logic 1.629 / route 3.390
+    //   RobPlugin_logic_head_reg[1]_rep__11/C -> RobPlugin_logic_faultDynStore_43_reg/CE
+    //   (same source -> faultedStore_43_reg/CE, and -> faultDynMem_reg_0_63_*/RAMG,RAMB)
+    //
+    // The chain is a THREE-PLUGIN COMBINATIONAL ROUND TRIP, not a fanout problem:
+    //
+    //   head -> LsEuPlugin.p4AtRobHead (`robHeadValidIn && p4Front.robId === robHeadIn`)
+    //        -> p4LaunchOk -> the P3/P4 resolve + capture cone -> liveCompletionFires
+    //        -> the precise-store replay apply gate (`(applyFast || applyBacklog) &&
+    //           !liveCompletionFires`) -> sqFaultCompletionPort.valid/.payload.robId
+    //        -> BACK INTO THIS BLOCK: the four-port age fold below (which consumes
+    //           `head` a SECOND time, via `age = robId - head`)
+    //        -> faultWin.robId -> the 6->64 write decode -> 128 Reg CEs + the
+    //           faultDynMem write-address/WE pins.
+    //
+    // Measured segment budget on that path (delays from the routed report):
+    //   head/Q .................................. 5.154 ns
+    //   ... LsEu sq resolve cone (12 levels) .... 7.828 ns   (+2.674)
+    //   ... four-port age fold (10 levels) ...... 9.486 ns   (+1.658)  [_zz_faultWinRobId]
+    //   ... write decode (2 levels) -> CE ...... 10.096 ns   (+0.610)
+    //
+    // WHY REGISTER REPLICATION COULD NOT FIX IT. `head` was already replicated at
+    // least twelve times (`_rep__11`) and the path still failed. It had to: the
+    // head net itself contributes 0.256 ns of the 5.019 ns data path (5%), and the
+    // remaining 3.13 ns of "route" is 25 ordinary short local hops averaging
+    // 0.13 ns each — the irreducible interconnect cost of HAVING 26 LEVELS, not a
+    // high-fanout net any placement can shorten. Worse, `head` is consumed at BOTH
+    // ENDS of the chain (p4AtRobHead at the start, the age fold at the end), so a
+    // replica placed near one consumer is necessarily far from the other. The only
+    // lever that moves this path is REMOVING LEVELS.
+    //
+    // THE CUT. The fault write is split in two, at the one place the four ports
+    // converge, and each half now sees roughly half the levels:
+    //
+    //   (1) `faultedStore` — the RETIRE-BLOCKING mark — stays COMBINATIONAL and is
+    //       now driven by a DIRECT per-port decode with NO arbitration and NO
+    //       `head` in it at all. Its path is head -> LsEu cone -> compare -> CE,
+    //       i.e. exactly the shape of the `completes(robId)` writes right above,
+    //       which close today. Retirement timing is bit-for-bit unchanged.
+    //
+    //   (2) `faultDynStore` + the `faultDynMem` row — the fault RECORD — move one
+    //       cycle later, behind a four-entry capture register. The age fold now
+    //       starts at those registers (the ages are captured too, so `head` is off
+    //       the fold's input cone entirely) and ends at the RAM, ~12 levels.
+    //
+    // MARK-ALL IS STRICTLY SAFER THAN THE OLD DROP-THE-LOSER RULE. The proof above
+    // shows a loser is unobservable; it does NOT need the loser to be unmarked.
+    // Marking every faulting entry means the OLDEST faulting entry is always
+    // blocked from retiring by its own mark, so step (2) of the proof ("head must
+    // advance past W") is now blocked at every W simultaneously rather than at one
+    // arbitrated W — the invariant gets stronger, not weaker, and the sim tripwire
+    // `faultedStore(h0) === fsFaulted(h0)` becomes exact instead of merely provable.
+    // The dyn-record gate is still opened for the WINNER ONLY, so the old
+    // "faultDynStore(i) True ALWAYS implies row i is fresh" invariant is preserved
+    // unchanged — gate and row are still written by one statement, one cycle later.
+    //
+    // THE ONE-CYCLE HOLD. Between the mark (cycle T) and the record (cycle T+1) an
+    // entry is `faultedStore` but NOT yet `faultDynStore`, so a commit decision taken
+    // in that window would read the ALLOC-time record. `faultCapPending` (declared
+    // next to `headReady`, driven at the end of this block) holds the whole commit
+    // gate off for exactly that one cycle — see the comment there for why the hold is
+    // on `headReady` and not on `faultRetire` alone.
+    //
+    // SLOT-REUSE. The delayed half must not land on a REALLOCATED index. A faulting
+    // robId can only be handed back between T and T+1 by a flush (retirement needs
+    // `completes`, which the faulting completion itself only sets at the end of T),
+    // so the capture is killed on `flushing` and on an alloc port taking that exact
+    // robId in the capture cycle — reproducing the alloc-wins-on-a-re-used-index
+    // priority the textual ordering gives the undelayed writes.
+    //
+    // AGE VALIDITY ACROSS THE CUT. Ages are captured at T (anchored to head at T)
+    // and folded at T+1. Head can only advance by retiring, and no faulting entry
+    // can retire at T (its `completes` bit is only set at the end of T), so head
+    // never passes a captured robId; and if head advances by k, EVERY captured age
+    // shifts by the same k, so the min-age ORDER — the only thing the fold reads —
+    // is invariant.
+    val faultCap = faultPorts.map { p =>
+      val r = Reg(RobFaultPort())
+      r.valid.init(False)
+      val allocReuse = (alloc0 && (tail === p.robId)) ||
+                       (alloc1 && ((tail + 1) === p.robId))
+      r.valid := p.valid && !flushing && !allocReuse
+      when(p.valid) { r.robId := p.robId; r.age := p.age; r.d := p.d }
+      r
+    }
     // `b` (the later, higher-priority port) wins on an age TIE — see ARBITRATION.
-    val faultWin = faultPorts.reduceLeft { (a, b) =>
+    val faultWin = faultCap.reduceLeft { (a, b) =>
       Mux(b.valid && (!a.valid || (b.age <= a.age)), b, a)
     }
     faultWin.valid.setName("faultWinValid"); faultWin.robId.setName("faultWinRobId")
     faultWin.valid.simPublic(); faultWin.robId.simPublic()
+    // Half (1): the un-delayed, un-arbitrated, head-free retire-blocking mark.
+    faultPorts.foreach { p => when(p.valid) { faultedStore(p.robId) := True } }
+    // Half (2): the winner's record, one cycle later.
     faultDynMem.write(faultWin.robId, faultWin.d, faultWin.valid)
     when(faultWin.valid) {
-      faultedStore(faultWin.robId)  := True
       faultDynStore(faultWin.robId) := True
     }
+    // Drives the forward-declared hold next to `faultRetire` (see above).
+    faultCapPending := faultCap.map(_.valid).orR
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
