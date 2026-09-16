@@ -12,13 +12,20 @@ case class RenamedUop() extends Bundle {
   val fpW   = 4   // log2Up(16) -- FP data and FPCC both have 16 physical entries
   val valid        = Bool()
   val pc           = UInt(32 bits)
-  val nextPc       = UInt(32 bits)   // POST-instruction PC (pc + length); used for commit pc
+  // Instruction LENGTH in words (4 bits), NOT the 32-bit post-PC it replaced -- see
+  // DecodedUop.lenWords for why the sum is redundant with `pc`. `nextPc` below rebuilds
+  // it for the three consumers that need the value.
+  val lenWords     = UInt(4 bits)
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()
   val memOp        = MemOp()
+  // `imm` is the shared 32-bit slot -- ALU/LS immediate value (useImm=True), a non-value
+  // tag/id (useImm=False), OR, for `isBranch && !ibranch`, the PC-RELATIVE BRANCH
+  // DISPLACEMENT. See DecodedUop.imm for the full role table and the exclusivity proof;
+  // the separate 32-bit `branchDisp` field it replaces is gone from this record too.
   val useImm       = Bool();  val imm = Bits(32 bits)
-  val isBranch     = Bool();  val cond = Bits(4 bits); val branchDisp = Bits(32 bits)
+  val isBranch     = Bool();  val cond = Bits(4 bits)
   // Indirect / computed-target branch (JSR/JMP/RTS/RTR): target = psrcA + imm,
   // unconditional redirect. Threaded from decode.
   val ibranch      = Bool()
@@ -213,4 +220,7 @@ case class RenamedUop() extends Bundle {
   val fpuOp     = Bits(7 bits)
   val fpSrcKind = FpSrcKind()
   val fpSrcFmt  = Bits(3 bits)
+
+  /** POST-instruction PC (`pc + lenWords*2`). DERIVED -- one 32-bit adder per call. */
+  def nextPc: UInt = (pc + (lenWords << 1)).resize(32)
 }

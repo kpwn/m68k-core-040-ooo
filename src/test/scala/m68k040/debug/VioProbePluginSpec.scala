@@ -121,13 +121,13 @@ class VioProbePluginSpec extends AnyFunSuite {
   private def pokeRu(u: RenamedUop, pc: Long, dstArch: Int, pdst: Int, pdstOld: Int): Unit = {
     u.valid #= true
     u.pc #= pc
-    u.nextPc #= pc + 2   // 2-byte instruction model: commit pc = nextPc = pc + 2
+    u.lenWords #= 1   // 2-byte instruction model: commit pc = nextPc = pc + 2
     u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.dstArch #= dstArch
     u.psrcA #= 0; u.psrcAValid #= false

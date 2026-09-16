@@ -20,7 +20,7 @@ class MicroOpQueueSpec extends AnyFunSuite {
       val u = dut.io.push.uops(i)
       u.valid        #= (i < nPush)
       u.pc           #= 0
-      u.nextPc       #= 0
+      u.lenWords     #= 0
       u.op           #= DecOp.MOVE
       u.cluster      #= Cluster.INT
       u.size         #= Size.LONG
@@ -31,7 +31,7 @@ class MicroOpQueueSpec extends AnyFunSuite {
       u.useImm  #= false; u.imm #= 0
       u.readsNzvc #= false; u.readsX #= false
       u.writesNzvc #= false; u.writesX #= false
-      u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+      u.isBranch #= false; u.cond #= 0
       u.unimplemented #= false
     }
   }

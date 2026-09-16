@@ -8,7 +8,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 /** DBcc decode: `0101 cccc 11 001 rrr` + disp16 -> a branch-EU µop that conditionally
   * decrements Dn.W and branches to pc+2+disp. isDbcc, reads NZVC (cond) + Dn (psrcA),
-  * writes Dn (pdst), branchDisp = sign-extended disp16. NO flags. len = 2 words. */
+  * writes Dn (pdst), imm = sign-extended disp16 (the shared branch-displacement slot). NO flags. len = 2 words. */
 class DbccDecodeSpec extends AnyFunSuite {
   class Dut extends Component {
     val pkt = in(DecodePacket())
@@ -33,7 +33,7 @@ class DbccDecodeSpec extends AnyFunSuite {
       assert(dut.uop.srcAReg.toInt == 0 && dut.uop.srcAValid.toBoolean, "reads D0 (counter)")
       assert(dut.uop.dstReg.toInt == 0 && dut.uop.dstValid.toBoolean, "writes D0 (decremented)")
       assert(!dut.uop.writesNzvc.toBoolean && !dut.uop.writesX.toBoolean, "DBcc sets NO flags")
-      assert((dut.uop.branchDisp.toLong & 0xffffffffL) == 0xfffffffeL, "disp16 sign-extended (-2)")
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 0xfffffffeL, "disp16 sign-extended (-2)")
       assert(!dut.uop.unimplemented.toBoolean && !dut.uop.isScc.toBoolean && !dut.uop.ibranch.toBoolean)
     }
   }
@@ -41,14 +41,14 @@ class DbccDecodeSpec extends AnyFunSuite {
   test("DBEQ D6 -> cond=7 (EQ), positive disp", VerilatorTest) {
     run { dut => drive(dut, 0x57CE, 0x0010); sleep(1)
       assert(dut.uop.isDbcc.toBoolean && dut.uop.cond.toInt == 0x7 && dut.uop.dstReg.toInt == 6)
-      assert((dut.uop.branchDisp.toLong & 0xffffffffL) == 0x10L)
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 0x10L)
     }
   }
   // DBNE D3,. = 0x56CB (cccc=0110 NE).
   test("DBNE D3 -> cond=6 (NE), D3", VerilatorTest) {
     run { dut => drive(dut, 0x56CB, -8); sleep(1)
       assert(dut.uop.isDbcc.toBoolean && dut.uop.cond.toInt == 0x6 && dut.uop.dstReg.toInt == 3)
-      assert((dut.uop.branchDisp.toLong & 0xffffffffL) == 0xfffffff8L)
+      assert((dut.uop.imm.toLong & 0xffffffffL) == 0xfffffff8L)
     }
   }
 }

@@ -629,6 +629,22 @@ trait DecodeFeedService {
   def slot1Valid: Bool
 }
 
+/** The fetch-time branch-prediction record that `DecodedUop.brPredTag` names: what used
+  * to be four separate fields on every decoded µop. Only DecodeStage (which owns the side
+  * table) produces one; only RenameStage consumes one, copying it onto `RenamedUop`. */
+case class BranchPredRec() extends Bundle {
+  val predTaken  = Bool()
+  val predTarget = UInt(32 bits)
+  val phtValid   = Bool()
+  val phtIndex   = UInt(11 bits)
+
+  /** No prediction. The value a `brPredTag` of 0 expands to. */
+  def setInert(): Unit = {
+    predTaken := False; predTarget := U(0, 32 bits)
+    phtValid  := False; phtIndex   := U(0, 11 bits)
+  }
+}
+
 /** Produced by the decode stage; consumed by the (future) rename stage.
   * Two µops/cycle. Plain Stream (directionless) per the service convention.
   * `pipeFlush` is the directionless squash input driven by backend wiring; exposing it
@@ -636,6 +652,13 @@ trait DecodeFeedService {
 trait DecodeUopService {
   def uops: Stream[Vec[DecodedUop]]   // Vec length 2
   def uop1Valid: Bool
+  /** The fetch-time branch-prediction record for each of the two popped uops, re-expanded
+    * from the uop's `brPredTag` (see DecodedUop.brPredTag / Global.BR_PRED_TABLE_DEPTH).
+    * Parallel to `uops.payload`: index k describes uops.payload(k) in the same cycle, and
+    * is valid under exactly the same conditions. Rename copies it straight onto
+    * `RenamedUop`, which still carries the four fields, so nothing downstream of rename
+    * changed when the 45 bits came off the DECODE record. */
+  def uopPred: Vec[BranchPredRec]     // Vec length 2
   def pipeFlush: Bool
   /** The BACKEND squash pulse (RobPlugin `doFlush || excActive`, i.e. exactly what
     * clears the issue queue and the rename->dispatch skid). Distinct from `pipeFlush`

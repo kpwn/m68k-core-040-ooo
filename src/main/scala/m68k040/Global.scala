@@ -125,4 +125,37 @@ object Global {
     * half the ROB, before it engages. */
   val FP_IMM_TABLE_DEPTH: Int = 16
   def FP_IMM_TAG_W: Int       = spinal.core.log2Up(FP_IMM_TABLE_DEPTH)
+
+  /** Fetch-time BRANCH-PREDICTION side channel (the same idea as FP_IMM_TABLE_DEPTH above,
+    * applied to the 45 prediction bits {predTaken, predTarget(32), phtValid, phtIndex(11)}).
+    *
+    * Those 45 bits are a property of the *fetch slot*, identical on every uop of a macro,
+    * and read by exactly ONE consumer -- BranchEuPlugin's predicted-vs-actual check (the
+    * ROB's gshare training gets `phtIndex` forwarded through that EU's completion port).
+    * Carried on `DecodedUop` they rode 11 decode mux sources -> 4 push slots -> 3 stash
+    * slots -> 16 MicroOpQueue entries, which is where the 2026-09-17 routed census found
+    * the `pushReg_payload_uops_*` / `stashUops_*` failing-endpoint family. They now live in
+    * a DecodeStage-owned BR_PRED_TABLE_DEPTH x 45b distributed RAM and the uop carries only
+    * a BR_PRED_TAG_W-bit tag, re-expanded at the MicroOpQueue POP boundary (so `RenamedUop`
+    * and the IQ are untouched -- this narrows the DECODE record only).
+    *
+    * NO ALLOCATOR, NO FREE LIST, NO STALL. Tag 0 is reserved and means "inert" (no
+    * prediction: a non-predicted packet, slot 1 -- which the Aligner/FetchAlignPlugin never
+    * stamp a prediction onto -- and every FSM/microcode-emitted uop, all of which drove
+    * predTaken=False before this change too, so they are bit-identical). Tags 1..DEPTH-1 are
+    * handed out by a wrapping counter in FetchAlignPlugin that advances ONLY when a packet
+    * actually carries a prediction.
+    *
+    * DEPTH BOUND (why a wrapping counter cannot hand out a tag whose entry is still live):
+    * an entry must survive from its packet's `feed.fire` until that packet's uops POP from
+    * the MicroOpQueue. No packet can be fed while a decode-side FSM or a stash replay is
+    * holding `fed`, so the packets that can allocate in that window are exactly the ones
+    * whose uops are still in {pushReg (<=4 uops), stash (<=3), queue (<=16)} -- at most 23
+    * distinct macros, and only the PREDICTED ones allocate at all. 63 usable tags is a
+    * >=2.7x margin on the absolute worst case. DecodeStage carries a sim-only assertion
+    * (`BrPredTable: ...`) that fails loudly if an entry is ever read after that many
+    * allocations, so the failure mode is a stopped simulation, not a silently wrong
+    * predicted-vs-actual verdict. */
+  val BR_PRED_TABLE_DEPTH: Int = 64
+  def BR_PRED_TAG_W: Int       = spinal.core.log2Up(BR_PRED_TABLE_DEPTH)
 }

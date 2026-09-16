@@ -104,12 +104,12 @@ class BackendWhiteboxSpec extends AnyFunSuite {
       pXDst: Int = 0, writesX: Boolean = false, pXOld: Int = 0
   ): Unit = {
     u.valid #= valid
-    u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
+    u.pc #= pc; u.lenWords #= 1; u.faultUsesNextPc #= false
     u.op #= op
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= useImm; u.imm #= BigInt(imm & 0xffffffffL)
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.dstArch #= dstArch

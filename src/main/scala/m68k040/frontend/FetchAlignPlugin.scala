@@ -1,5 +1,6 @@
 package m68k040.frontend
 
+import m68k040.Global
 import m68k040.cache.{ChunkPredecode, FetchCmd, FetchRsp, IcacheInstructionOrder}
 import m68k040.services.{DecodeFeedService, FetchService, FrontendQuiesceService,
   FtbLookupCmd, FtbLookupRsp, FtbLookupService, GshareWindowRsp, GshareWindowService}
@@ -1193,6 +1194,38 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       feed.payload(0).phtValid   := ftqHeadE.isCond
       feed.payload(0).phtIndex   := ftqHeadE.phtIdx
     }
+    // ── Branch-prediction side-channel TAG allocation (Global.BR_PRED_TABLE_DEPTH) ──
+    // The 45 prediction bits stay on the packet but no longer ride every DecodedUop; the
+    // uop carries this tag instead and DecodeStage re-expands it at the queue pop.
+    //
+    // Read AFTER every stamp above: `predTaken`/`phtValid` are plain combinational nets,
+    // so this sees their FINAL value however far up the file they were assigned (that is
+    // also why this block sits below the `ftqConfirm` override -- textual order only
+    // matters for the assignments, not for the reads).
+    //
+    // Only a packet that actually carries a prediction consumes a tag, and the counter
+    // advances only when such a packet is CONSUMED (`feed.fire`), so the wrapping distance
+    // is measured in predicted packets, not cycles. Everything else -- slot 1 (which never
+    // carries a prediction: `Aligner` zeroes its four fields and nothing here overrides
+    // them), a non-predicted slot 0, and the synthetic faulted packet -- gets the reserved
+    // inert tag 0.
+    val brPredCtr = Reg(UInt(Global.BR_PRED_TAG_W bits)) init 1
+    val brPredLive0 = feed.payload(0).predTaken || feed.payload(0).phtValid
+    feed.payload(0).brPredTag.allowOverride   // unconditional re-drive over `:= res.slot0`
+    feed.payload(0).brPredTag := Mux(brPredLive0, brPredCtr, U(0, Global.BR_PRED_TAG_W bits))
+    // slot 1 keeps the Aligner's inert 0 -- deliberately NOT re-driven here.
+    when(feed.fire && brPredLive0) {
+      brPredCtr := Mux(brPredCtr === U(Global.BR_PRED_TABLE_DEPTH - 1, Global.BR_PRED_TAG_W bits),
+                       U(1, Global.BR_PRED_TAG_W bits), brPredCtr + 1)
+    }
+    // The invariant the "slot1 is always inert" half of the scheme rests on. Checked live
+    // rather than trusted: if a future front-end change ever predicts slot 1, this fires
+    // instead of silently handing slot 1 a stale slot-0 record.
+    GenerationFlags.simulation {
+      assert(!(feed.valid && slot1ValidOut && (feed.payload(1).predTaken || feed.payload(1).phtValid)),
+        "FetchAlign: slot1 must never carry a branch prediction (the side-channel tag reserves 0 for it)")
+    }
+
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
     // allocated into the ROB while halted (the quiesce only ends on the wake redirect).
     feed.valid      := res.slot0Valid && !stalled && !quiesce && !ftqPast &&

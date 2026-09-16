@@ -104,7 +104,7 @@ class PhysIntPoolConsistencySpec extends AnyFunSuite {
       var cycles = 0
       var stalled = 0            // consecutive cycles with the source held off
       while (stalled < 40 && cycles < 4000) {
-        u.valid #= true; u.pc #= 0; u.nextPc #= 0
+        u.valid #= true; u.pc #= 0; u.lenWords #= 0
         u.op #= DecOp.MOVE; u.cluster #= Cluster.INT; u.size #= Size.LONG
         u.srcAReg #= 0; u.srcAValid #= false
         u.srcBReg #= 0; u.srcBValid #= false
@@ -112,7 +112,7 @@ class PhysIntPoolConsistencySpec extends AnyFunSuite {
         u.useImm #= false; u.imm #= 0
         u.readsNzvc #= false; u.readsX #= false
         u.writesNzvc #= false; u.writesX #= false
-        u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+        u.isBranch #= false; u.cond #= 0
         u.unimplemented #= false
         // Every OTHER rename-class write bit must be driven explicitly: SpinalSim leaves
         // un-poked top-level inputs at a random value, and a stray writesFp/writesFpcc/

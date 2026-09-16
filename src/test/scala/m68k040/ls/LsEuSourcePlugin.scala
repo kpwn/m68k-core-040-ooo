@@ -39,7 +39,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val uop = ctx.uop
     uop.valid        := False
     uop.pc           := U(0)
-    uop.nextPc       := U(0)
+    uop.lenWords     := U(0)
     uop.cluster      := Cluster.LS
     uop.memOp        := iMemOp
     uop.op           := m68k040.decode.DecOp.MOVE
@@ -47,7 +47,6 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.ibranch      := False
     uop.stkPush      := iStkPush
     uop.cond         := B(0)
-    uop.branchDisp   := B(0)
     uop.unimplemented:= False
     uop.dstArch      := U(0)
     uop.pdstOld      := U(0)

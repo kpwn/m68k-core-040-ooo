@@ -178,6 +178,12 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
 
     for (s <- 0 until 2) {
       val dec = du.uops.payload(s)
+      // The fetch-time prediction record no longer rides the DECODED uop -- it is
+      // re-expanded from `dec.brPredTag` by DecodeStage and handed over parallel to the
+      // payload (see DecodeUopService.uopPred / DecodedUop.brPredTag). `RenamedUop` is
+      // UNCHANGED: it still carries the four fields, so the IQ, the ROB and the branch EU
+      // see exactly what they saw before.
+      val decPred = du.uopPred(s)
       val r   = raw(s)
       // Resource allocation (freelist pops + RAT writes) for slot 1 must ALSO be
       // gated on uop1Valid — otherwise an empty/invalid second slot whose decoded
@@ -207,7 +213,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       // copy decoded fields
       r.valid        := dec.valid
       r.pc           := dec.pc
-      r.nextPc       := dec.nextPc
+      r.lenWords     := dec.lenWords
       r.op           := dec.op
       r.cluster      := dec.cluster
       r.size         := dec.size
@@ -224,7 +230,6 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.ccrRestore   := dec.ccrRestore
       r.toCcr        := dec.toCcr
       r.cond         := dec.cond
-      r.branchDisp   := dec.branchDisp
       r.unimplemented:= dec.unimplemented
       r.faulted      := dec.faulted
       r.faultVector  := dec.faultVector
@@ -267,10 +272,10 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.sysOp        := dec.sysOp
       r.sysKind      := dec.sysKind
       r.sysReadDir   := dec.sysReadDir
-      r.predTaken    := dec.predTaken
-      r.predTarget   := dec.predTarget
-      r.phtValid     := dec.phtValid
-      r.phtIndex     := dec.phtIndex
+      r.predTaken    := decPred.predTaken
+      r.predTarget   := decPred.predTarget
+      r.phtValid     := decPred.phtValid
+      r.phtIndex     := decPred.phtIndex
       r.casForm      := dec.casForm
       r.fpuOp        := dec.fpuOp
       r.fpSrcKind    := dec.fpSrcKind

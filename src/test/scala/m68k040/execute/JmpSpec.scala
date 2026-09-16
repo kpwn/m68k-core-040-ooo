@@ -57,7 +57,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.ibranch      := True
     uop.cond         := 0           // unconditional (T); ibranch ignores cond
     uop.pc           := iPc
-    uop.branchDisp   := 0
+
     uop.pNzvcSrc     := 0
     uop.readsNzvc    := False
     uop.isCondTrap   := False; uop.isScc := False; uop.isDbcc := False
@@ -71,7 +71,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     uop.indexLong := False; uop.indexScale := 0
     uop.firstOfInstr := True
     uop.predTaken    := False; uop.predTarget := 0
-    uop.nextPc       := iPc + 2
+    uop.lenWords     := 1
     ctx.robId        := iRobId
 
     eu.issue.valid   := iValid

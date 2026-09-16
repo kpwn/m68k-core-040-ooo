@@ -50,13 +50,13 @@ class RobPluginSpec extends AnyFunSuite {
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
-    u.nextPc #= pc + 2   // 2-byte instruction model: commit pc = nextPc = pc + 2
+    u.lenWords #= 1   // 2-byte instruction model: commit pc = nextPc = pc + 2
     u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
-    u.isBranch #= isBranch; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= isBranch; u.cond #= 0
     u.unimplemented #= false
     u.dstArch #= dstArch
     u.psrcA #= 0; u.psrcAValid #= false
@@ -274,7 +274,7 @@ class RobPluginSpec extends AnyFunSuite {
       // as a real (An) FMOVEM.X would carry (4-byte macro: opword + ext1, no EA ext word).
       pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x40800018, dstArch = 0, pdstValid = false,
              isBranch = false)
-      dut.rsrc.logic.src.payload(0).nextPc #= 0x4080001c   // fmovemxNextPc: pc+4, not pc+2
+      dut.rsrc.logic.src.payload(0).lenWords #= 2   // fmovemx macro length: pc+4, not pc+2
       dut.rsrc.logic.src.valid #= true
       dut.rsrc.logic.u1v #= false
       cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
@@ -328,7 +328,7 @@ class RobPluginSpec extends AnyFunSuite {
       // robId 0: FMOVEM.X-issue-row shape, FP-lane completion.
       pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x408000cc, dstArch = 0, pdstValid = false,
              isBranch = false)
-      dut.rsrc.logic.src.payload(0).nextPc #= 0x408000cc   // degenerate 0-length, matches repro C's idx25/26 values
+      dut.rsrc.logic.src.payload(0).lenWords #= 0   // degenerate 0-length, matches repro C's idx25/26 values
       dut.rsrc.logic.src.valid #= true
       dut.rsrc.logic.u1v #= false
       cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
@@ -338,7 +338,7 @@ class RobPluginSpec extends AnyFunSuite {
       // robId 1: the trailing `move.l %a1,%d7` -- ordinary int-lane MOVE, completes port 0.
       pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x408000cc, dstArch = 15, pdst = 20,
              pdstValid = true, pdstOld = 15, isBranch = false)
-      dut.rsrc.logic.src.payload(0).nextPc #= 0x408000ceL   // real: pc + 2 (a MOVE.L Ax,Dx is a 2-byte opword)
+      dut.rsrc.logic.src.payload(0).lenWords #= 1   // real: pc + 2 (a MOVE.L Ax,Dx is a 2-byte opword)
       dut.rsrc.logic.src.valid #= true
       dut.rsrc.logic.u1v #= false
       cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
@@ -703,7 +703,7 @@ class RobPluginSpec extends AnyFunSuite {
         val u = dut.dsrc.logic.src.payload(s)
         u.valid #= true
         u.pc #= 0
-        u.nextPc #= 2
+        u.lenWords #= 1
         u.faultUsesNextPc #= false
         u.op #= DecOp.MOVE
         u.cluster #= Cluster.INT
@@ -714,7 +714,7 @@ class RobPluginSpec extends AnyFunSuite {
         u.useImm #= true; u.imm #= 1
         u.readsNzvc #= false; u.readsX #= false
         u.writesNzvc #= false; u.writesX #= false
-        u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+        u.isBranch #= false; u.cond #= 0
         u.unimplemented #= false
         u.faulted #= false; u.faultVector #= 0; u.isRte #= false
         u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
@@ -1003,13 +1003,13 @@ class RobPluginSpec extends AnyFunSuite {
   def pokeGateRu(u: RenamedUop, pc: Long = 0, firstOfInstr: Boolean = true): Unit = {
     u.valid #= true
     u.pc #= pc
-    u.nextPc #= pc + 2
+    u.lenWords #= 1
     u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.dstArch #= 0
     u.psrcA #= 0; u.psrcAValid #= false

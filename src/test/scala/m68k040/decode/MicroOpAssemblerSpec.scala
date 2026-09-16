@@ -55,7 +55,7 @@ class MicroOpAssemblerSpec extends AnyFunSuite {
     assert(dut.uop.op.toEnum == DecOp.CMP && !dut.uop.dstValid.toBoolean && dut.uop.writesNzvc.toBoolean)
   }}
   test("Bcc word disp", VerilatorTest) { run { dut => drive(dut, 0x6700, 0x0010, len = 2); sleep(1)
-    assert(dut.uop.isBranch.toBoolean && dut.uop.cond.toInt == 7 && dut.uop.branchDisp.toLong == 0x10)
+    assert(dut.uop.isBranch.toBoolean && dut.uop.cond.toInt == 7 && dut.uop.imm.toLong == 0x10)
   }}
   test("memSimple-EA source -> cracked load uop (slot0), not unimplemented", VerilatorTest) { run { dut => drive(dut, 0xD090); sleep(1)
     // ADD.L (A0),D0 — EA (A0) is memSimple -> slot0 is now the LOAD µop (cracking

@@ -52,7 +52,8 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.op           := m68k040.decode.DecOp.MOVE
     uop.size         := m68k040.isa.Size.WORD
     uop.useImm       := False
-    uop.imm          := 0
+    // PC-relative displacement now rides the shared `imm` slot (branchDisp merged away).
+    uop.imm          := iDisp
     uop.unimplemented:= False
     uop.anInc := iAnInc; uop.stkPush := False; uop.ccrRestore := False
     uop.isReturn     := iIsReturn
@@ -73,7 +74,6 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.ibranch      := iIbranch
     uop.cond         := iCond
     uop.pc           := iPc
-    uop.branchDisp   := iDisp
     uop.pNzvcSrc     := iPNzvcSrc
     uop.readsNzvc    := True
     uop.isCondTrap   := False
@@ -83,7 +83,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     // Fetch-time prediction: NOT predicted (predictor-inert) -> mispredict == taken.
     uop.predTaken    := False
     uop.predTarget   := 0
-    uop.nextPc       := iPc + 2
+    uop.lenWords     := 1
     ctx.robId        := iRobId
 
     eu.issue.valid   := iValid

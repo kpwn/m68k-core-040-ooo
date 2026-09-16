@@ -55,7 +55,6 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.cluster      := m68k040.isa.Cluster.INT
     uop.isBranch     := False
     uop.cond         := B(0)
-    uop.branchDisp   := B(0)
     uop.unimplemented:= False
     uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
     uop.dstArch      := U(0)
@@ -78,7 +77,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     uop.bcdSub     := False
     uop.toCcr      := iToCcr
     // remaining RenamedUop fields (defaults; not exercised by the ALU EU directly).
-    uop.nextPc       := U(0)
+    uop.lenWords     := U(0)
     uop.memOp        := m68k040.isa.MemOp.NONE
     uop.faulted      := False; uop.faultVector := U(0); uop.isRte := False
     uop.faultUsesNextPc := False

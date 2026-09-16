@@ -40,8 +40,8 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.faultVector.toInt == 11, s"architectural vector stays 11, got ${dut.uop.faultVector.toInt}")
       assert(dut.uop.faultUsesNextPc.toBoolean,
         "a framed line-F trap must stack the POST-instruction PC, else FPSP's RTE re-executes the same opword forever")
-      assert(dut.uop.nextPc.toLong == 0x2004L,
-        f"nextPc must be pc + 2*lenWords = 0x2004, got 0x${dut.uop.nextPc.toLong}%x")
+      assert(dut.uop.lenWords.toInt == 2,
+        f"lenWords must be 2 (nextPc = pc + 2*lenWords = 0x2004), got ${dut.uop.lenWords.toInt}")
     }
   }
 
@@ -331,7 +331,7 @@ class FpAssembleSpec extends AnyFunSuite {
       assert(dut.uop.faultUsesNextPc.toBoolean, "framed (len=8), so FPSP must be able to RTE past it")
       assert(!dut.uop.writesFp.toBoolean && !dut.uop.writesFpcc.toBoolean,
         "no FP side effect on the trapping uop")
-      assert(dut.uop.nextPc.toLong == 0x2010L, "nextPc = pc + 2*8 = 0x2010")
+      assert(dut.uop.lenWords.toInt == 8, "lenWords = 8 -> nextPc = pc + 2*8 = 0x2010")
     }
   }
 

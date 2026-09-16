@@ -38,6 +38,10 @@ object Aligner {
     // OVERRIDES phtValid/phtIndex on the emitted conditional's slot0 after the aligner runs.
     r.slot0.phtValid := False; r.slot0.phtIndex := U(0, 11 bits)
     r.slot1.phtValid := False; r.slot1.phtIndex := U(0, 11 bits)
+    // Side-channel tag: inert by default; FetchAlignPlugin stamps slot0's real tag
+    // when (and only when) it stamps a real prediction. slot1 NEVER carries one.
+    r.slot0.brPredTag := U(0, m68k040.Global.BR_PRED_TAG_W bits)
+    r.slot1.brPredTag := U(0, m68k040.Global.BR_PRED_TAG_W bits)
 
     // Default control signals
     r.slot0Valid  := False
