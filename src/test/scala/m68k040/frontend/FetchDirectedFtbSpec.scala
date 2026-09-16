@@ -133,6 +133,7 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
       p.lenWords #= 1
       p.ambiguousLine #= false
       p.size #= Size.LONG
+      p.ctrlXfer #= false
     }
     dut.update.logic.update.valid #= false
     dut.update.logic.update.payload.pc #= 0
@@ -188,11 +189,16 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     r.payload.data #= data
     r.payload.fault #= fault
     r.payload.atc #= atc
-    for ((p, len) <- r.payload.pred.zip(lens)) {
+    // The predecode MUST be consistent with the bytes: the real I-cache bakes it from
+    // the line it just refilled, and the fetch-time prediction gate now reads it. Deriving
+    // `ctrlXfer` from the driven opword (rather than pinning it) is what makes a
+    // stale-predictor test honest -- see PredecodeRef.ctrlXfer.
+    for (((p, len), w) <- r.payload.pred.zip(lens).zip(words)) {
       p.simple #= true
       p.lenWords #= len
       p.ambiguousLine #= false
       p.size #= Size.LONG
+      p.ctrlXfer #= PredecodeRef.ctrlXfer(w)
     }
     cd.waitSampling()
   }

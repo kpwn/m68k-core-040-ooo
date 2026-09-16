@@ -385,7 +385,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // `words.foreach(_ := 0)` default-drive on the line above, and `decode(0x0000).size`
     // is `Size.BYTE` (`ORI.B #imm,D0`). See ChunkPredecode.size.
     ibuf.io.push.payload.preds.foreach { p =>
-      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE }
+      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE
+      // Fail-closed: an un-pushed predecode slot never enables a prediction.
+      p.ctrlXfer := False }
     ibuf.io.push.payload.n := 0
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
@@ -755,6 +757,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
             // FMax Lever B: indexed by the SAME `srcIdx` as `words(j)` above, which is what
             // keeps `preds(j).size` paired with `words(j)` across the leading-word drop.
             ibuf.io.push.payload.preds(j).size            := rspPreds(srcIdx).size
+            // Control-transfer gate: same `srcIdx` pairing as `words(j)`/`size` above, so
+            // the bit the fetch-side prediction gate reads always belongs to the opword it
+            // is gating. Dropping this line would silently pin `ctrlXfer` at its False
+            // default and disable prediction outright (caught exactly that way).
+            ibuf.io.push.payload.preds(j).ctrlXfer        := rspPreds(srcIdx).ctrlXfer
           }
         }
         ibuf.io.push.payload.n := nWords
@@ -884,6 +891,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
+    // `p0LiveReg.ctrlXfer` gets the SAME treatment as `.size` (see the task #250 note
+    // below): it is never assigned and never read. `ctrlXfer` is a pure function of the
+    // opword, so it is not ambiguity-qualified — the prediction gates read
+    // `ibuf.io.headPred(0).ctrlXfer` DIRECTLY, exactly as `Aligner.align` reads
+    // `preds(0).size` directly and for the identical reason (both mux arms carry the same
+    // value, and bypassing the `p0` mux keeps the term off `L0`'s arrival chain). Leaving
+    // it undriven is what lets synthesis prune the field out of this register entirely.
     // task #250: `p0LiveReg.size` is UNREAD by construction — `Aligner.align` sources
     // slot0's/slot1's `size` from `preds(0).size`/`p1.size` directly (see Aligner.scala's
     // "Lever B" comments), never from the `p0 = Mux(preds(0).ambiguousLine, p0LiveReg,
@@ -993,8 +1007,54 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // branch EU verifies predicted-vs-actual + the commit-time redirect recovers a
     // mispredict. A correct prediction simply avoids the squash.
     val predEnable = !faultHold && !quiesce && !stalled
+    // ── Predecoded control-transfer gate (2026-09-16) ────────────────────────────
+    // `slot0IsCtrlXfer` is a PURE MEMORY OUTPUT: the `ctrlXfer` bit of the buffer-head
+    // predecode entry, baked at I-cache REFILL time (ChunkPredecode.ctrlXfer,
+    // PredecodeWord.classify). NOTHING is computed here — no opword comparison, no
+    // aligner mux, no dependence on `L0`. It is read from `ibuf.io.headPred(0)`
+    // DIRECTLY and not through `Aligner`'s `p0` ambiguity mux, for the same reason
+    // `Aligner.align` reads `preds(0).size` directly: `ctrlXfer` needs only the opword,
+    // which is `words(0)` in BOTH arms of that mux, so the two arms are identical — and
+    // bypassing the mux keeps this term off `L0`'s arrival chain, which feeds the whole
+    // `slot0Predicted -> suppressSlot1 -> decodePcNext` arc (the measured front-end FMax
+    // floor). The gate is therefore one extra input to the AND that already forms
+    // `btbQueryValid0`, arriving at t~=0 — no new logic level in that arc.
+    //
+    // WHAT IT CLOSES: `btbQueryValid0` was gated only on "a slot was emitted", never on
+    // the slot BEING a branch, and `predTaken` — stamped on every µop of the emitted
+    // instruction — is read ONLY by `BranchEuPlugin`. So a BTB entry that survived a
+    // change of the bytes at its (fully-tagged, exact) virtual PC redirected fetch on an
+    // ordinary ALU/LS instruction with nothing downstream able to detect it, and the
+    // wrong-path instructions RETIRED. With this gate, a prediction can only ever be
+    // stamped on an instruction that decodes to a branch-EU µop, and `BranchEuPlugin`'s
+    // `mispredict` check then verifies direction AND target — so the worst case becomes a
+    // correctly-recovered mispredict instead of silent wrong-path retirement.
+    //
+    // WHY A STALE ENTRY IS REACHABLE AT ALL (the honest severity): the BTB is fully
+    // tagged on the complete 32-bit PC (`Btb.scala`: idx = pc[7:1], tag = pc[31:8]) and
+    // allocates ONLY at retire on `btbIsBranchStore` (`RobPlugin.scala`), so a non-branch
+    // PC cannot alias into a branch's entry and a non-branch can never train one. The
+    // entry must therefore have been LEGITIMATELY trained and the bytes at that exact VA
+    // must then have CHANGED underneath it. Self-modifying code is already closed
+    // (`IcachePlugin.maintInvalidateAll` fans CINV/CPUSH-IC out to the BTB). What is NOT
+    // closed is a TRANSLATION change — PFLUSH/PFLUSHA, a URP/SRP/TC write, or a 24/32-bit
+    // addressing-mode switch — remapping that VA to different physical code: the L1I is
+    // VIPT with a PHYSICAL tag, so it correctly misses and refills the new bytes, but the
+    // predictors are keyed on VIRTUAL PC and nothing invalidates them. That asymmetry is
+    // the reachable route, and it is not an everyday path.
+    //
+    // PROVEN, not argued. Two self-checking corpus programs take exactly that route on
+    // the full core (train a branch at an MMU-translated VA, repoint its leaf descriptor,
+    // PFLUSHA, execute) and issue NO cache-maintenance instruction, so the predictors
+    // survive: `mmu_remap_stale_btb_predict.s` (the FTB confirmation path -- fails
+    // 0xDEAD0B03 with the `ftqConfirm` gate removed) and `mmu_remap_stale_btb_nonbranch.s`
+    // (the decode-time BTB path, with the branch placed so the FTB declines to frame it --
+    // fails 0xDEAD0C03 with the `btbQueryValid0` gate removed). Each fails with ITS gate
+    // removed and passes with it present, so both gates are independently load-bearing.
+    val slot0IsCtrlXfer = ibuf.io.headPred(0).ctrlXfer
+    spinal.core.sim.SimPublic(slot0IsCtrlXfer)
     btbQueryPc0    := res.slot0.pc
-    btbQueryValid0 := predEnable && res.slot0Valid
+    btbQueryValid0 := predEnable && res.slot0Valid && slot0IsCtrlXfer
     btbQueryPc1    := res.slot1.pc
     btbQueryValid1 := predEnable && res.slot1Valid
     // ── gshare direction composition (slice 3) ──────────────────────────────────
@@ -1054,7 +1114,15 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Exact decode-time confirmation of the fetch-side framing claim. A predicted branch
     // in slot1 is deferred to slot0 just like the retained BTB/RAS fallbacks; neither
     // fallback is removed by the FTB.
-    val ftqConfirm = ftqAt0 && res.slot0Valid && res.slot0.simple &&
+    // `slot0IsCtrlXfer` (see its declaration above) closes the same hole on the
+    // fetch-directed path. The FTB's confirmation was a 4-bit LENGTH match and nothing
+    // else, so a stale window entry whose claimed branch PC now holds a same-length
+    // NON-branch confirmed, stamped `predTaken`+`ftqHeadE.target` on it, and suppressed
+    // slot1 — again with no downstream verifier. Failing the confirm is the already-built
+    // FAIL-CLOSED path: `ftqLenBad` (below) fires, raising `ftqMismatchDetect`, which
+    // clears the FTB entry and re-steers to the instruction's real fall-through. Same
+    // pure-memory-output term, same zero added logic levels.
+    val ftqConfirm = ftqAt0 && res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer &&
                      (res.slot0.lenWords === ftqHeadE.brLen)
     val slot1WouldFtq = ftqNear && !ftqAt0 && res.slot0Valid && res.slot1Valid &&
                         (ftqDelta === res.slot0.lenWords) && !ftqConfirm

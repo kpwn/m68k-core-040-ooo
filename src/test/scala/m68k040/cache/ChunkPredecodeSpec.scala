@@ -5,7 +5,7 @@ import spinal.lib._
 import org.scalatest.funsuite.AnyFunSuite
 
 class ChunkPredecodeSpec extends AnyFunSuite {
-  test("ChunkPredecode is 8 bits; FetchRsp carries 4 of them") {
+  test("ChunkPredecode is 9 bits; FetchRsp carries 4 of them") {
     SpinalConfig().generateVerilog(new Component {
       val c = ChunkPredecode()
       assert(c.simple.isInstanceOf[Bool])
@@ -21,7 +21,15 @@ class ChunkPredecodeSpec extends AnyFunSuite {
       // `IcachePlugin`'s per-line predecode storage from 192 to 256 bits per way (the plugin itself
       // needs no edit — every width there derives from `ChunkPredecode().getBitsWidth`).
       assert(c.size.getBitsWidth == 2)
-      assert(c.asBits.getWidth == 8)
+      // Widened 8->9 bits (2026-09-16, predecoded branch gate): added `ctrlXfer`, the
+      // control-transfer bit that gates fetch-time BTB/FTB prediction so a predictor
+      // entry that outlived a change of the bytes at its virtual PC (a translation
+      // change: PFLUSH/PFLUSHA, URP/SRP/TC, 24/32-bit mode switch) can no longer
+      // redirect fetch on an ordinary ALU/LS instruction. See ChunkPredecode.ctrlXfer.
+      // `IcachePlugin`'s UFA_W therefore moves 384 -> 400 bits; the plugin itself needs
+      // no edit (every width there derives from `ChunkPredecode().getBitsWidth`).
+      assert(c.ctrlXfer.isInstanceOf[Bool])
+      assert(c.asBits.getWidth == 9)
       val r = master(Flow(FetchRsp()))
       r.valid := False
       r.payload.assignDontCare()

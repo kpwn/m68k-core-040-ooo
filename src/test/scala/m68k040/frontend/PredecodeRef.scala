@@ -6,6 +6,27 @@ object PredecodeRef {
   final case class CP(simple: Boolean, lenWords: Int)
   val COMPLEX = CP(false, 0)
 
+  /** Pure-Scala mirror of `ChunkPredecode.ctrlXfer` (PredecodeWord's control-transfer
+    * classification). Test harnesses that synthesise a `FetchRsp.pred` by hand use this
+    * so the predecode they drive is CONSISTENT WITH THE BYTES they drive -- which is what
+    * the real I-cache refill guarantees, and what the fetch-time prediction gate now
+    * depends on. The RTL is proven equivalent to the REAL decoder (not to this mirror)
+    * over all 65536 opwords by `PredecodeCtrlXferSpec`; this exists only so a hand-built
+    * window is not accidentally self-inconsistent. */
+  def ctrlXfer(op: Int): Boolean = {
+    val w = op & 0xffff
+    val line6  = (w >>> 12) == 0x6                                     // Bcc/BRA/BSR
+    val dbcc   = ((w >>> 12) == 0x5) && ((w >>> 6) & 0x3) == 0x3 &&
+                 ((w >>> 3) & 0x7) == 0x1                              // DBcc
+    val jmpJsr = (w >>> 7) == 0x9d                                     // 0x4E80..0x4EFF
+    val ret    = ((w >>> 3) == 0x9ce) &&
+                 Set(3, 4, 5, 7).contains(w & 0x7)                     // RTE/RTD/RTS/RTR
+    val fpT    = ((w >>> 12) == 0xf) && (((w >>> 9) & 0x7) == 0x1)
+    val fbcc   = fpT && (((w >>> 7) & 0x3) == 0x1) && ((w & 0x3f) != 0) // FBcc, cc!=0
+    val fdbcc  = fpT && (((w >>> 6) & 0x7) == 0x1) && (((w >>> 3) & 0x7) == 0x1)
+    line6 || dbcc || jmpJsr || ret || fbcc || fdbcc
+  }
+
   /** Extension-word count for an EA mode/reg. None => an unsupported mode/reg pair
     * (including immediate when allowImm=false). Brief indexed An/PC EAs are one word;
     * sizeL selects #imm width (long=2). */

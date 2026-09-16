@@ -133,6 +133,7 @@ class InstructionBuffer extends Component {
           entries(s).pred.lenWords       := io.push.payload.preds(j).lenWords
           entries(s).pred.ambiguousLine  := io.push.payload.preds(j).ambiguousLine
           entries(s).pred.size           := io.push.payload.preds(j).size   // FMax Lever B
+          entries(s).pred.ctrlXfer       := io.push.payload.preds(j).ctrlXfer
         }
       }
     }
@@ -174,6 +175,12 @@ class InstructionBuffer extends Component {
       // relies on is `headPred(i).size === OperationDecoder.decode(head(i)).size`;
       // `decode(0x0000).size === Size.BYTE` (opword 0x0000 is `ORI.B #imm,D0`).
       io.headPred(i).size            := m68k040.isa.Size.BYTE
+      // Control-transfer gate: a beyond-`count` head word does not exist, so it must
+      // never enable a prediction. False is also the honest classification of the
+      // co-located `io.head(i) := 0` (opword 0x0000 is ORI.B, not a control transfer),
+      // so the `headPred(i).ctrlXfer === classify(head(i)).ctrlXfer` invariant holds
+      // here exactly as the `size` invariant above does.
+      io.headPred(i).ctrlXfer        := False
     }
   }
 
