@@ -128,6 +128,20 @@ no-`late` attempt) after defects A/B/C were fixed:
 That clusters the remaining work on one mechanism -- interrupt recognition across a trap
 entry -- rather than leaving it open-ended.
 
+And defect E is ENTANGLED with it, not independent. In the dominant `b20` shape the A7
+columns disagree BEFORE the pc does, and the DUT's A7 trails the oracle's by 4 across
+SEVERAL commits during nested A-line-trap entry/exit before realigning:
+
+    159  DUT 0x408000b6/.../0x000fffab | ORACLE 0x408000b6/.../0x000fffab   trap entry
+    160  DUT 0x40800078/.../0x000fffab | ORACLE 0x40800078/.../0x000fffaf   differs; tolerated
+    162  DUT 0x408000bc/0x2108/0x000fffa3 | ORACLE 0x4080007a/0x2008/0x000fffaf   <<<
+    165  DUT .../0x000fffab/A7=0x000fffab | ORACLE .../0x000fffab/A7=0x000fffab   realigned
+
+So E is not "one stale commit at an RTS"; the live-PRF A7 probe can trail for a multi-commit
+window whenever exception entries and returns bunch up. Anyone attacking the residual
+should fix the A7 observation (per-commit archived A7) FIRST, because until then the
+boundary evidence is read through a lagging probe.
+
 ## 5. The residual, and why it is NOT a core defect
 
 After A/B/C the remaining odd-ssp failures are `pc` divergences -- the interrupt landing on
