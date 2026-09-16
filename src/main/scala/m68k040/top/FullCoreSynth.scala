@@ -315,7 +315,17 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // head until it resolves, mirroring the store-drain interlock exactly.
     rob.logic.inhibitedLoadBusyIn       := lsEu.inhibitedLoadBusySig
     lsEu.robHeadIn           := rob.logic.h0
-    lsEu.robHeadValidIn      := rob.logic.count > 0
+    // `!countIsZero`, NOT a live `count > 0`. `countIsZero` is a REGISTERED restatement
+    // of `count === 0` that is EXACTLY equal to it on every cycle — computed a cycle
+    // early off the same `countNext` expression that drives `count`, with the flush
+    // override mirrored, and checked by a sim-only invariant in RobPlugin on every
+    // cycle of every lock-step/fuzz/bench program. So this is a bit-identical swap with
+    // ZERO latency change, and it takes a 7-bit zero-compare OUT of the front of the
+    // ROB -> LS EU route — the same transformation, for the same reason, as
+    // `irqPreemptArmed` directly below (see RobPlugin's `countIsZero` doc comment: a
+    // combinational cone in front of a long high-fanout route cannot be replicated or
+    // re-placed by phys_opt; a register output can).
+    lsEu.robHeadValidIn      := !rob.logic.countIsZero
     // Shallow SUPERSET of `interruptPending || tracePendingFire` -- see the long
     // rationale at `irqPreemptArmed`'s declaration in RobPlugin. Keeps the ROB's
     // 64-entry head muxes out of the LS EU launch decision (the core's -1.834 ns
