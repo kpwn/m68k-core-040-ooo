@@ -91,7 +91,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // ---- issue-side stimulus ----
       val iValid     = in Bool ()
       val iOp        = in(DecOp())
-      val iRob       = in UInt (6 bits)
+      val iRob       = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iFlush     = in Bool ()
       // FP-specific
       val iFpuOp     = in Bits (7 bits)
@@ -195,7 +195,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- FP-lane observation ----
       val fpCValid = out Bool (); fpCValid := eu.fpCompletion.valid
-      val fpCRob   = out UInt (6 bits); fpCRob := eu.fpCompletion.payload
+      val fpCRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); fpCRob := eu.fpCompletion.payload
       val fpWakeV  = out Bool (); fpWakeV := eu.fpWakeup.valid
       val fpWakeP  = out UInt (4 bits); fpWakeP := eu.fpWakeup.payload
       val fpccWakeV = out Bool (); fpccWakeV := eu.fpccWakeup.valid
@@ -211,7 +211,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- int-lane observation (lane independence) ----
       val intCValid = out Bool (); intCValid := eu.completion.valid
-      val intCRob   = out UInt (6 bits); intCRob := eu.completion.payload
+      val intCRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); intCRob := eu.completion.payload
       val intWakeV  = out Bool (); intWakeV := eu.wakeup.valid
       val euFaultV  = out Bool (); euFaultV := eu.euFault.valid
       // ---- int-lane FLUSH-STATE whitebox (Task 14b fix pass, Critical #1) ----

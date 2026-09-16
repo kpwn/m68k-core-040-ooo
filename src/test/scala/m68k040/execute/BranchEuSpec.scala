@@ -34,7 +34,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     val iPc       = in UInt (32 bits)
     val iDisp     = in Bits (32 bits)
     val iPNzvcSrc = in UInt (4 bits)
-    val iRobId    = in UInt (6 bits)
+    val iRobId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     // RTD-btb-training-fix directed test inputs: drive ibranch/isReturn/anInc/pdstValid
     // independently so the classification test can reproduce JMP/JSR (ibranch, not a
     // return) vs RTS/RTR (ibranch, isReturn, real anInc-folded A7 postinc) vs RTD
@@ -99,7 +99,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
 
     // ---- completion observation ----
     val cValid      = out Bool ();        cValid      := eu.completion.valid
-    val cRob        = out UInt (6 bits);  cRob        := eu.completion.payload.robId
+    val cRob        = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob        := eu.completion.payload.robId
     val cMispredict = out Bool ();        cMispredict := eu.completion.payload.mispredict
     val cNextPc     = out UInt (32 bits); cNextPc     := eu.completion.payload.nextPc
     // RTD-btb-training-fix: the BTB/FTB training-eligibility decision (BranchEuPlugin's

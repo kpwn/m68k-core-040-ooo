@@ -160,7 +160,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       dtlb.umCommitId    := rob.logic.h0
       dtlb.umFlush       := host[RedirectService].doFlush
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      itlb.umAccessRobId := U(0, 6 bits)
+      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1

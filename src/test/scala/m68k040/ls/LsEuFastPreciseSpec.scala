@@ -62,13 +62,13 @@ class CacheControlStubPlugin extends FiberPlugin with CacheControlService {
   * for observation -- both are then real, freely sim-pokeable/readable signals. */
 class TbPreciseDrainWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
   val logic = during build new Area {
-    val iRobHeadIn      = in UInt (6 bits)
+    val iRobHeadIn      = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val iRobHeadValidIn = in Bool ()
     eu.robHeadIn      := iRobHeadIn
     eu.robHeadValidIn := iRobHeadValidIn
 
     val oSqCompValid   = out Bool ()
-    val oSqCompPayload = out UInt (6 bits)
+    val oSqCompPayload = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     oSqCompValid   := eu.sqCompletionPort.valid
     oSqCompPayload := eu.sqCompletionPort.payload
   }

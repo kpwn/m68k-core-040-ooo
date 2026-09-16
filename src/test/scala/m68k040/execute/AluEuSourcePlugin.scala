@@ -39,7 +39,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     val iPdst     = in UInt (6 bits); val iPdstValid  = in Bool ()
     val iWritesNz = in Bool ();       val iPNzvcDst   = in UInt (4 bits)
     val iWritesX  = in Bool ();       val iPXDst      = in UInt (4 bits)
-    val iRobId    = in UInt (6 bits)
+    val iRobId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val iReady    = out Bool ()
     // shift / CCR-RMW / flag-source controls (slow path)
     val iShiftOp  = in Bits (2 bits); val iShiftDir = in Bool ()
@@ -110,7 +110,7 @@ class AluEuSourcePlugin extends FiberPlugin {
     iReady := eu.issue.ready
 
     // completion observation
-    val cValid = out Bool (); val cRob = out UInt (6 bits)
+    val cValid = out Bool (); val cRob = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     cValid := eu.completion.valid
     cRob   := eu.completion.payload
     val slowWakeValid = out Bool ()

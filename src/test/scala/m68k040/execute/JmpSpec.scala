@@ -32,7 +32,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     val iImm       = in Bits (32 bits)
     val iPsrcA     = in UInt (6 bits)
     val iPsrcAValid= in Bool ()
-    val iRobId     = in UInt (6 bits)
+    val iRobId     = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
 
     val ctx = IqContext()
     val uop = ctx.uop
@@ -86,7 +86,7 @@ class IbranchSourcePlugin extends FiberPlugin {
     nzW.valid := False; nzW.address := 0; nzW.data := 0
 
     val cValid      = out Bool ();        cValid      := eu.completion.valid
-    val cRob        = out UInt (6 bits);  cRob        := eu.completion.payload.robId
+    val cRob        = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob        := eu.completion.payload.robId
     val cMispredict = out Bool ();        cMispredict := eu.completion.payload.mispredict
     val cNextPc     = out UInt (32 bits); cNextPc     := eu.completion.payload.nextPc
   }

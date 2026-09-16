@@ -252,7 +252,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      itlb.umAccessRobId := U(0, 6 bits)
+      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1

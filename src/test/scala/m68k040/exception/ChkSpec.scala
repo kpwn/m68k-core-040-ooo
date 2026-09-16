@@ -27,7 +27,7 @@ class ChkSpec extends AnyFunSuite {
     val logic = during build new Area {
       val eu = host[DivEuService]
       val iValid  = in Bool ()
-      val iRobId  = in UInt (6 bits)
+      val iRobId  = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iPsrcA  = in UInt (6 bits)
       val iPsrcB  = in UInt (6 bits)
       val iWord   = in Bool ()   // size: word vs long
@@ -73,10 +73,10 @@ class ChkSpec extends AnyFunSuite {
       wB.valid := wBValid; wB.address := wBAddr; wB.data := wBData
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
-      val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val cRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob    := eu.completion.payload
       val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
-      val fRob    = out UInt (6 bits);  fRob    := eu.euFault.payload.robId
+      val fRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  fRob    := eu.euFault.payload.robId
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector
       val nObs    = out Bool ();        nObs    := host[DivEuPlugin].logic.chkNObs
       val wbNzvcWrite = out Bool ();    wbNzvcWrite := host[DivEuPlugin].logic.wbObs.valid && host[DivEuPlugin].logic.wbObs.nzvcWrite

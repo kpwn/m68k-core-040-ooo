@@ -36,7 +36,7 @@ class IqCplxSpec extends AnyFunSuite {
     val logic = during build new Area {
       val iq = host[IssueQueueService]
       val fire = out Bool ()
-      val rob  = out UInt (6 bits)
+      val rob  = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       fire := iq.issue(4).fire
       rob  := iq.issue(4).payload.robId
     }

@@ -40,7 +40,7 @@ class AccessFaultCaptureSpec extends AnyFunSuite {
   // them.
   class TbPreciseDrainWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
     val logic = during build new Area {
-      val iRobHeadIn      = in UInt (6 bits)
+      val iRobHeadIn      = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iRobHeadValidIn = in Bool ()
       eu.robHeadIn      := iRobHeadIn
       eu.robHeadValidIn := iRobHeadValidIn

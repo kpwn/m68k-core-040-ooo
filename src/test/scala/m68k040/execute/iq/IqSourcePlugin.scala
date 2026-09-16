@@ -18,7 +18,7 @@ class IqSourcePlugin extends FiberPlugin {
 
     // Per-slot driving signals (k = 0, 1).
     case class SlotIo() {
-      val robId      = in UInt (6 bits)
+      val robId      = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val cluster    = in(m68k040.isa.Cluster())
       val memOp      = in(m68k040.isa.MemOp())
       val pdst       = in UInt (6 bits); val pdstValid  = in Bool ()

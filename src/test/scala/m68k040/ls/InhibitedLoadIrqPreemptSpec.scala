@@ -72,7 +72,7 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
     * pass-through cannot work under Verilator without a real driving IO port). */
   class TbPreemptWirePlugin(eu: LsEuPlugin) extends FiberPlugin {
     val logic = during build new Area {
-      val iRobHeadIn           = in UInt (6 bits)
+      val iRobHeadIn           = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iRobHeadValidIn      = in Bool ()
       val iIrqPreemptPendingIn = in Bool ()
       val iDebugHaltImminentIn = in Bool ()

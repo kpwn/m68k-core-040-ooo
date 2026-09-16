@@ -23,7 +23,7 @@ class WalkerCoherencyUmWirePlugin(eu: LsEuPlugin, dtlb: DtlbPlugin) extends Fibe
   val logic = during build new Area {
     dtlb.umAccessRobId := eu.xlateRobId
     val iCommitValid = in Bool ()
-    val iCommitId    = in UInt (6 bits)
+    val iCommitId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     dtlb.umCommitValid := iCommitValid
     dtlb.umCommitId    := iCommitId
   }

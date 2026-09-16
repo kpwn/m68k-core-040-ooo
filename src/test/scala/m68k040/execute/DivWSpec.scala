@@ -27,7 +27,7 @@ class DivWSpec extends AnyFunSuite {
     val logic = during build new Area {
       val eu = host[DivEuService]
       val iValid  = in Bool ()
-      val iRobId  = in UInt (6 bits)
+      val iRobId  = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iSigned = in Bool ()
       val iPdst   = in UInt (6 bits)
 
@@ -79,7 +79,7 @@ class DivWSpec extends AnyFunSuite {
       val rdData = out Bits (32 bits); rdData := rdRes.data
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
-      val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val cRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob    := eu.completion.payload
       val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector

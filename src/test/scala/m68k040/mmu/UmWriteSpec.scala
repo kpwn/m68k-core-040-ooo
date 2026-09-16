@@ -20,9 +20,9 @@ class UmProbePlugin extends FiberPlugin {
     val dtlb  = host[DtlbPlugin]
     val reqIn = in(TranslationReq())
     val rspOut = out(TranslationRsp())
-    val accessRobId = in UInt (6 bits)
+    val accessRobId = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val commitValid = in Bool ()
-    val commitId    = in UInt (6 bits)
+    val commitId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val flush       = in Bool ()
     val pflusha     = in Bool ()
     val walkDone    = out Bool ()
