@@ -1306,13 +1306,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         {
           val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
           val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
-          if (dut.rob.logic.retire0.toBoolean && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
+          // ── MACRO-LAST uops only (2026-09-16; originally 9635f91c, reverted by 599180b7,
+          // re-applied here with the evidence that motivates it) ─────────────────────────
+          // `commitPc` is the retiring UOP's next pc: for a BRANCH uop that is the RESOLVED
+          // target, but for every other uop it is the sequential `pc + len`. JSR/BSR crack
+          // to [push retPC] + [ibranch], and the push uop's sequential next pc IS the
+          // return address -- i.e. the pc of the instruction AFTER the call. Keying the
+          // poke on every uop therefore raised IPL on the call's PUSH retire, one whole
+          // macro before the boundary the event named, and the DUT took the interrupt
+          // before the callee's `rts`. When that callee is entered twice (odd-ssp:
+          // `jsr (%a1)` then `bsr.s sub1`) the resulting boundary -- "before the SECOND
+          // visit of sub1's rts" -- is one the pc-keyed Musashi `--irq-event` oracle cannot
+          // express, so the boundary sweep failed on a CORRECT DUT: the divergence dumps
+          // show the same frame base, self-consistent SR on both sides, and the streams
+          // rejoining right after the RTE. Gating on the macro-last uop makes the trigger
+          // the instruction's real next pc (the branch uop's resolved target for a call),
+          // which is exactly what the oracle's own `--irq-event` keys on.
+          val last0 = dut.rob.logic.debugMacroRetirePc(0).valid.toBoolean
+          val last1 = dut.rob.logic.debugMacroRetirePc(1).valid.toBoolean
+          if (dut.rob.logic.retire0.toBoolean && last0 && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
             firedEvents += rawPc0
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc0)
             dut.intCtrl.logic.iackAvec   #= avec
             dut.intCtrl.logic.iackVector #= vectorIn
           }
-          if (dut.rob.logic.retire1.toBoolean && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
+          if (dut.rob.logic.retire1.toBoolean && last1 && eventPcs.contains(rawPc1) && !firedEvents.contains(rawPc1)) {
             firedEvents += rawPc1
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc1)
             dut.intCtrl.logic.iackAvec   #= avec
@@ -1434,15 +1452,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       val res = LockStep.compare(handle.result.take(nInstr), oracle, a7ProbeLag = a7ProbeLag)
       if (!res.ok) {
-        // Failure dump: the two streams side by side around the divergence (post-step pc /
-        // SR / A7), so a wrong-path record can be told from a wrong fetch without a rerun.
+        // ── Failure dump ──────────────────────────────────────────────────────────────
+        // TRAP THIS DUMP USED TO SET (fixed 2026-09-16): it printed ONLY pc/sr/a7, while
+        // `LockStep.compare` checks pc, ccr, the full SR, a7, msp, isp AND the committed
+        // architectural register write (plus the second destination of a cracked
+        // DIV.L/MUL.L). So a genuine `reg D3` or `ccr` divergence produced a dump whose
+        // every visible column MATCHED -- indistinguishable from "no divergence here" --
+        // and cost a full extra investigation to tell apart from a boundary offset. The
+        // first line now states WHAT diverged (res.firstDivergence.detail, which already
+        // names the exact field and both values), and the table carries the committed
+        // register write and CCR alongside pc/sr/a7.
         val dutSeq = handle.result
         val lo = scala.math.max(0, res.matched.toInt - 6); val hi = scala.math.min(res.matched.toInt + 8, scala.math.max(dutSeq.size, oracle.size))
-        println(s"[$name] divergence context (index: DUT pc/sr/a7 | ORACLE pc/sr/a7):")
+        println(s"[$name] DIVERGED: ${res.firstDivergence.map(_.detail).getOrElse("?")} " +
+                s"(at index ${res.matched}; dut commits ${dutSeq.size}, oracle steps ${oracle.size})")
+        def regOf(id: Int): String = if (id < 8) s"D$id" else s"A${id - 8}"
+        println(s"[$name] divergence context (index: DUT pc/sr/ccr/a7/reg | ORACLE pc/sr/ccr/a7/reg):")
         for (k <- lo until hi) {
-          val d = if (k < dutSeq.size) { val c = dutSeq(k); f"0x${c.pc & 0xffffffffL}%08x/0x${c.sr & 0xffff}%04x/0x${c.a7 & 0xffffffffL}%08x" } else "-"
-          val o = if (k < oracle.size) { val st = oracle(k); f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.a(7) & 0xffffffffL}%08x" } else "-"
-          println(f"[$name]   $k%3d: $d%-32s | $o")
+          val d = if (k < dutSeq.size) { val c = dutSeq(k)
+            val r = if (c.archRegValid) f"${regOf(c.archRegId)}=0x${c.archRegWrite & 0xffffffffL}%08x" else "-"
+            f"0x${c.pc & 0xffffffffL}%08x/0x${c.sr & 0xffff}%04x/0x${c.ccr & 0xff}%02x/0x${c.a7 & 0xffffffffL}%08x/$r" } else "-"
+          // The oracle has no "which register did this step write"; show the DUT-named
+          // register's oracle VALUE so the two columns are directly comparable.
+          val o = if (k < oracle.size) { val st = oracle(k)
+            val r = if (k < dutSeq.size && dutSeq(k).archRegValid) {
+                      val id = dutSeq(k).archRegId
+                      f"${regOf(id)}=0x${(if (id < 8) st.d(id) else st.a(id - 8)) & 0xffffffffL}%08x"
+                    } else "-"
+            f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.ccr & 0xff}%02x/0x${st.a(7) & 0xffffffffL}%08x/$r" } else "-"
+          val mark = if (k == res.matched.toInt) " <<<" else ""
+          println(f"[$name]   $k%3d: $d%-48s | $o%-48s$mark")
         }
       }
       assert(res.ok,
@@ -12406,7 +12445,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(firstOdd > 0 && lastOdd > firstOdd && lastOdd + 2 <= endIdx, s"[$tag] odd stretch not found ($firstOdd..$lastOdd, end $endIdx)")
     // OracleStep.pc is the POST-step pc => plain(i).pc is the boundary BEFORE the next
     // instruction. firstOdd-1 = before LINK ... lastOdd+1 = after UNLK.
-    val boundaryPcs = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc).distinct
+    // PROGRAM-ORDERED boundary sequence -- deliberately NOT distinct. `boundaryPcs` below
+    // is the distinct list of TARGETS (one simulation per distinct boundary pc), but the
+    // retry window must walk THIS sequence, because only here do adjacent positions mean
+    // adjacent program boundaries.
+    //
+    // ⚠️ ORACLE LIMITATION, read before touching this (cost a full investigation on
+    // 2026-09-16). The oracle is `Musashi.assembleAndTrace(..., irqEvents = Seq((pc, lvl)))`
+    // -- the interrupt is named by a PROGRAM COUNTER. This stretch RE-ENTERS pcs: the
+    // program has three `.short 0xa06e` A-line traps sharing one handler, and `sub1: rts`
+    // is entered twice (`jsr (%a1)` then `bsr.s sub1`). For any pc visited more than once
+    // the oracle takes the interrupt at its FIRST visit and there is NO way to ask it for
+    // the second -- so "before the SECOND visit of sub1's rts" is a boundary this oracle
+    // simply cannot express, and a DUT that legitimately lands there can match NO oracle.
+    // Keep the IPL poke keyed on MACRO retirement (see runIrqLockStep) so the DUT does not
+    // get pushed onto such a boundary in the first place.
+    val boundarySeq = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc)
+    val boundaryPcs = boundarySeq.distinct
     val a6 = plain(firstOdd).a(6)
     val locals = Seq(a6 - 7, a6 - 5, a6 - 66, a6 - 65)
     // The interrupt entry is the first step AT OR AFTER the requested boundary whose SR
@@ -12445,17 +12500,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Which boundary the interrupt lands on is not pinnable to a single instruction:
       // the harness raises IPL on the PREDECESSOR's retire and the DUT recognises IPL at
       // its own 2-wide macro boundaries, so it usually lands ON or one/two AFTER the
-      // requested one. It can also land EARLIER, because the boundary list is `.distinct`
-      // (a PC executed twice -- `sub1`'s rts -- collapses to one entry, so consecutive
-      // list indices are not always consecutive program boundaries). Search LATER first
-      // (the common case, so most boundaries still cost a single simulation), then
-      // EARLIER. Whichever boundary is chosen, the lock-step against it is exact and
-      // full-length and the frame/locals memory comparison still runs.
-      val lateWindow = ((i to (i + 2)) ++ ((i - 1) to (i - 2) by -1)).filter(j => j >= 0 && j < boundaryPcs.size)
+      // requested one, and can land EARLIER. Search LATER first (the common case, so most
+      // boundaries still cost a single simulation), then EARLIER. Whichever boundary is
+      // chosen, the lock-step against it is exact and full-length and the frame/locals
+      // memory comparison still runs.
+      //
+      // PROGRAM-RELATIVE (fixed 2026-09-16). This window used to be index arithmetic over
+      // the `.distinct` list, so "i+1" was the next DISTINCT pc, not the next PROGRAM
+      // boundary -- wherever the stretch re-entered a pc (the shared A-line handler,
+      // `sub1`'s rts) the distinct list SKIPPED boundaries and an i±2 list window did not
+      // cover the i±1 program window. It now walks `boundarySeq`, where adjacent positions
+      // really are adjacent boundaries; `.distinct` at the end only removes duplicate
+      // SIMULATIONS, it no longer distorts adjacency.
+      val pos = boundarySeq.indexOf(pc)
+      val windowPcs = (((pos to (pos + 2)) ++ ((pos - 1) to (pos - 2) by -1))
+                        .filter(j => j >= 0 && j < boundarySeq.size).map(boundarySeq)).distinct
       var matchedAt = -1
       var lastErr: org.scalatest.exceptions.TestFailedException = null
-      for (j <- lateWindow if matchedAt < 0) {
-        val pcJ = boundaryPcs(j)
+      for (pcJ <- windowPcs if matchedAt < 0) {
+        val j = boundaryPcs.indexOf(pcJ)
         val trJ = if (j == i) withIrq else Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pcJ, level)))
                                                  .getOrElse(fail(s"[$tag] oracle (irq@$pcJ)"))
         val kJ  = trJ.indexWhere(_.pc == endPc)
@@ -12475,7 +12538,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
       assert(matchedAt >= 0,
         f"[$tag] boundary $i (0x$pc%08x): the DUT lock-stepped against NONE of the " +
-        f"boundary-${lateWindow.mkString("/")} oracles. Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
+        f"oracles at pcs ${windowPcs.map(w => f"0x$w%08x").mkString("/")}. " +
+        f"Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
       if (matchedAt != i) println(f"[$tag] boundary $i matched the boundary-$matchedAt oracle (offset ${matchedAt - i})")
     }
   }

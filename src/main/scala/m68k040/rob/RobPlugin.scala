@@ -1476,6 +1476,19 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     debugMacroRetirePc(0).payload := p0.pc
     debugMacroRetirePc(1).valid := retire1 && p1.last
     debugMacroRetirePc(1).payload := p1.pc
+    // Sim-only (re-applied 2026-09-16; originally 9635f91c, reverted by 599180b7 with no
+    // stated reason). The IRQ lock-step harness MUST key its reactive IPL poke on MACRO
+    // retirement, not on every uop: `commitPc0`/`commitPc1` above are the retiring UOP's
+    // next pc, and for a cracked call -- JSR/BSR become [push retPC] + [ibranch] -- the
+    // PUSH uop's sequential next pc IS the return address, i.e. the pc of the instruction
+    // after the call. A poke keyed on that fires one whole macro early, so the DUT takes
+    // the interrupt before the callee's `rts`. When the callee is entered twice (the
+    // odd-ssp LINK #-75 program does `jsr (%a1)` then `bsr.s sub1`) the resulting landing
+    // -- "before the SECOND visit of sub1's rts" -- is a boundary the pc-keyed Musashi
+    // `--irq-event` oracle cannot express at all, so NO window oracle can match it and the
+    // sweep fails on a correct DUT. `.valid` is what the harness needs; the payload is
+    // already readable. No hardware: a simPublic only marks the net for the simulator.
+    debugMacroRetirePc.foreach(_.valid.simPublic())
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
     // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
