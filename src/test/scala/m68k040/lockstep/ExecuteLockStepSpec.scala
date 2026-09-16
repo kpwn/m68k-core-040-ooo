@@ -12130,6 +12130,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def oddSpSrc(delta: Int, msp: Boolean): String = ((if (msp) Seq("move.w #0x3000,%sr") else Seq.empty[String]) ++ Seq(
     "move.l #trap0,%d0", "move.l %d0,0x80",
     "move.l #0x00003000,%a0", "move.l #0x11223344,%d0", "move.l #0x55667788,%d1", "move.l #0x0000beef,%d2",
+    // D3 is BYTE-written (`move.b (%sp)+,%d3`) and D4 WORD-written (`move.w (%sp)+,%d4`)
+    // below, and neither was initialised -- so their upper bits were the DUT's RANDOM PRF
+    // init against the oracle's zero. These tests PASS today only by seed luck; same class
+    // as the oddSspFill defect, see docs/BUG_lockstep_irq_boundary_sweeps_harness_defects.md.
+    "moveq #0,%d3", "moveq #0,%d4",
     "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)", "move.l #0x0f1e2d3c,-(%sp)", "move.l #0x4b5a6978,-(%sp)",
     "lea 16(%sp),%sp", "move.l %sp,%a6",
     s"lea $delta(%sp),%sp",                                   // SP := S0 + delta (ODD)
@@ -12183,6 +12188,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def oddSpFwdSrc(delta: Int): String = (Seq(
     "move.l #trap0,%d0", "move.l %d0,0x80",
     "move.l #0x11223344,%d0", "move.l #0x55667788,%d1", "move.l #0x99aabbcc,%d2", "move.l #0xddeeff00,%d3",
+    // D7 is WORD-written (`move.w (%sp)+,%d7`) below and never initialised -- same latent
+    // seed-dependent hole as D3/D4 in oddSpSrc above.
+    "moveq #0,%d7",
     "move.l #0x00003000,%a0", "move.l #0x00003100,%a1", "move.l #0x00003200,%a2", "move.l #0x00003300,%a3",
     "move.l %sp,%a6",                                        // A6 := the 16-byte-aligned boot SSP
     s"lea $delta(%sp),%sp",                                  // SP := boot + delta (ODD)
