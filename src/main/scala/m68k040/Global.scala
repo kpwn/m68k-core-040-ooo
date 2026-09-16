@@ -39,6 +39,28 @@ object Global {
   /** Width of a robId, for bundles elaborated OUTSIDE a plugin host. Equal to
     * `ROB_ID_W` by the `RobPlugin` require -- see `ROB_DEPTH_DEFAULT`. */
   def ROB_ID_W_DEFAULT: Int = spinal.core.log2Up(ROB_DEPTH_DEFAULT)
+
+  /** Pack `{hi, robId}` into a FIXED-width tag, zero-extending on the left.
+    *
+    * The D-side `DLoadToken`/`DTranslationToken` tags are 8 bits by contract (values
+    * $80/$81/$82 are reserved for the exception sequencer and the two table walkers), and
+    * `LsEuPlugin` composes the LS-side ones as `{backendEpoch, splitPhase, robId}`. That
+    * concatenation is exactly 8 bits only while a robId is 6 bits wide; at any smaller ROB
+    * depth the raw `##` is too NARROW for the port and elaboration fails. Padding keeps the
+    * field order and the reserved-value split (pad and epoch both live above bit 6, so a
+    * padded LS tag still has bit 7 = 0 and can never collide with $80/$81/$82).
+    *
+    * The `if` is a SCALA-level test, not a mux: when no padding is needed this returns the
+    * identical node graph the hand-written `##` produced, so the generated Verilog at the
+    * default depth is byte-for-byte unchanged. */
+  def robTag(hi: spinal.core.Bits, id: spinal.core.UInt, w: Int): spinal.core.UInt = {
+    import spinal.core._
+    val core = hi ## id.asBits
+    require(core.getWidth <= w,
+      s"robTag: {hi=${hi.getWidth}, robId=${id.getWidth}} = ${core.getWidth} bits does not " +
+      s"fit in a $w-bit tag")
+    (if (core.getWidth == w) core else B(0, w - core.getWidth bits) ## core).asUInt
+  }
   val PHYS_INT_REGS   = Database.blocking[Int]()
   /** THE int physical-register pool size — the ONE number, in plain-constant form.
     *

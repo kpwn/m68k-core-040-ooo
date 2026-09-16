@@ -225,8 +225,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // re-allocatable. On a flush the ROB does recycle ids (`tail := head`), but a flush
     // also clears every slot and force-invalidates the pipe output (`issuePorts(k).valid
     // := piped.valid && !flushSignal`), so no consumer can observe a recycled row.
-    val coldWay0 = Mem(RenamedUop(), 64)
-    val coldWay1 = Mem(RenamedUop(), 64)
+    val coldWay0 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH_DEFAULT) // robId-addressed
+    val coldWay1 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH_DEFAULT) // robId-addressed
     coldWay0.addAttribute("ram_style", "distributed") // reads must be async; BRAM cannot serve
     coldWay1.addAttribute("ram_style", "distributed")
     /** The one and only cold read: 2:1 over the two single-write-port banks. */

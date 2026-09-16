@@ -403,8 +403,8 @@ class StoreQueue(depth: Int = 8) extends Component {
   // (`committed(a)` is checked at the call site below, not inside this helper,
   // so `olderThan` here covers ONLY case 2's head-anchored math.)
   def olderThan(a: UInt, b: UInt): Bool = {
-    val ageA = (a - io.robHeadIn)(5 downto 0)
-    val ageB = (b - io.robHeadIn)(5 downto 0)
+    val ageA = (a - io.robHeadIn)(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)
+    val ageB = (b - io.robHeadIn)(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)
     ageA < ageB
   }
 
