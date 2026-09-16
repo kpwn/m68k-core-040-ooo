@@ -43,6 +43,92 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // False so a DUT that wires nothing keeps the previous behaviour.
     val icMaintFlush = Bool(); icMaintFlush.allowOverride; icMaintFlush := False
 
+    // ── The REGISTERED arm. Every internal consumer uses THIS, never the port ─────
+    // FMax (2026-09-17). `icMaintFlush` is a combinational function of the ROB
+    // EXCEPTION FSM state -- `icMaintPulse = isActive(S_MAINTWAIT) && maintDoneIn &&
+    // (cacheSel === IC || cacheSel === BC)`, OR'd at the top level with the debug
+    // bridge's own maintenance-done pulse. Feeding that raw into `ftbBlocked` broke the
+    // design contract this file already records on `applyNow` -- "every remaining term is
+    // a register or a one-level select of one" -- of which `ftbBlocked` is a term, and
+    // which the FTQ-capacity note on `ftbBlocked` restates by REFUSING to admit a live
+    // `ftqCount === 32` comparator there. `ftbBlocked` sits at the head of the frontend's
+    // longest cone --
+    //     ftbBlocked -> applyNow -> cmdWindowPc -> ic.cmd.pc
+    //                -> live ITLB CAM/permission -> L1I cacheability
+    //                -> speculative prefetch installer control
+    // -- and anything joining it is carried through all of it in ONE cycle.
+    //
+    // Measured on `build/vivado200_allfix` place.dcp (200 MHz, 5.000 ns):
+    //   -1.524 ns, 24 levels, logic 1.625 / route 4.709
+    //   RobPlugin_logic_exc_fsm_stateReg_reg[1]/C  (fo=120, 0.628 ns of route)
+    //     -> ... -> FetchAlignPlugin_logic_applyNow (fo=146)
+    //     -> ItlbPlugin missReqReg_vpn -> the 32-entry ITLB CAM + CARRY8 -> tlb_io_hit
+    //     -> IcachePlugin lookupPageCacheable -> s0Cacheable -> nonSpecFetch
+    //     -> mshrPa -> IcachePlugin_logic_pfNextPa_reg[*]/CE
+    // and 9 further paths differing only in the destination `pfNextPa` bit. Those TEN are
+    // the only violated setup paths the CORE contributes to that run at all; every other
+    // violated endpoint in it is SoC infrastructure at >= -0.370 ns.
+    //
+    // THE SAME ENDPOINT ALREADY FAILED before this arm existed, and the comparison is the
+    // whole argument for the cut. Same flow, same worktree, one change (`build/
+    // vivado200_rob32`):
+    //   -0.429 ns, 22 levels, data path 5.205 (logic 1.191 / route 4.014)
+    //   FetchAlignPlugin_logic_quiesce_reg/C -> IcachePlugin_logic_pfNextPa_reg[7]/CE
+    // i.e. the TAIL (a `ftbBlocked` term -> applyNow -> ... -> pfNextPa/CE) is
+    // pre-existing and structural. The exception-FSM source added +2 logic levels,
+    // +0.434 ns of logic and +0.695 ns of route -- 1.129 ns of pure PREFIX -- in front of
+    // it. `quiesce` is itself a `RegNext` of the ROB's published next-state for exactly
+    // this reason (see its declaration above); this register is that same treatment, and
+    // should return the endpoint to the quiesce-sourced level.
+    //
+    // WHY ONE CYCLE OF LATENCY IS FREE, and why it does not weaken the flush.
+    // ALL THIRTEEN consumers move together -- the action block below AND the six shared
+    // decision terms -- so the arm stays self-consistent by construction, which is the
+    // entire property the completeness fix exists to hold. It is a pure retime of one
+    // restart arm, not a partial one; a partial cut (action at C, `issueBornStale` at
+    // C+1) would re-open hole 1 verbatim and is the one thing NOT to do here.
+    //
+    // The arm's job is to land strictly BETWEEN the I-cache invalidate and the
+    // architectural refetch. Both fences have a full cycle of room:
+    //   C   : `S_MAINTWAIT && maintDoneIn` -> `icMaintPulse`. `maintInvalidateAll`
+    //         clears the I-cache/BTB/FTB valids at this edge (effective C+1).
+    //         `goto(S_REDIR)`.
+    //   C+1 : THIS ARM fires. The I-cache is already empty, so the refetch it seeds
+    //         cannot repopulate from a line the CPUSH was meant to drop -- the ordering
+    //         the action block's own comment demands, with one cycle MORE margin than
+    //         the unregistered form had. `S_REDIR` asserts `exc.redirectValid`.
+    //   C+2 : `RobPlugin.doFlushReg` -> `redirect.valid` here -> `commonRedirect` to
+    //         `sysCapNextPc`, which supersedes this arm (the redirect block is textually
+    //         later, so it wins) and is the architecturally correct restart.
+    // `excActive = (fsm.state =/= IDLE)` is high at C and C+1 and `doFlush` at C+2, so
+    // `pipeFlush` is CONTINUOUS across the gap: any uop decoded out of the pre-flush
+    // IBuf during cycle C is squashed and refetched after C+2 regardless. That is not a
+    // new reliance -- the frontend free-runs for the WHOLE maintenance walk (1500+
+    // cycles for a BC-selector CPUSH ALL, `ic.cmd.valid` has no `excActive` term), so
+    // one more speculative cycle before the buffer drop changes nothing architectural.
+    //
+    // The three holes the completeness fix closed, re-checked at the new cycle:
+    //   1. `issueBornStale`. A command firing at C+1 is born stale AND has its ring
+    //      record marked stale in the same cycle -> `resultStaleProof` holds. A command
+    //      that fired at C launched a LIVE lookup; at C+1 the oracle compares
+    //      `ringStale(resultSlot)` (still False -- `ringStale.foreach(_ := True)` is a
+    //      register write landing at C+2) against `resultExpectedBornStale` (False).
+    //      They AGREE. In the unfixed RTL they disagreed precisely because the ring
+    //      write happened at C while the born-stale flag did not; shifting the whole arm
+    //      keeps the two on the same edge, which is what the oracle actually checks.
+    //   2. `ftqFlush`. The FTQ entries and `targetHoldValid` describing the discarded
+    //      stream are dropped at C+1, before the C+2 refetch can be steered by them.
+    //      Anything pushed at C describes the still-current stream and is flushed with
+    //      the rest.
+    //   3. `ftbBlocked`. No FTB plan can be APPLIED on the flush cycle. The plan from
+    //      the C command is vetoed at C+1 by this very term, and its ring window is
+    //      marked stale in the same cycle, so its cache response is discarded too.
+    // The debug-bridge source needs no argument at all: the bridge issues maintenance
+    // only while the core is halted, and `quiesce` already holds `ic.cmd.valid` low and
+    // `ftbBlocked` high for the whole of it.
+    val icMaintFlushArm = RegNext(icMaintFlush) init False
+    icMaintFlushArm.simPublic()
+
     // ---- Resolve I-cache service ----
     val ic = host[FetchService]
 
@@ -435,7 +521,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // what keeps all four consistent by construction.
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
                             mispredictRedirect.valid || predictFire || ftqMismatch ||
-                            icMaintFlush
+                            icMaintFlushArm
 
     // Join the two fixed-C+1 lookup results. A command which is born stale still launches
     // the I-cache request (its response must drain), but it cannot use a read-only fetch
@@ -445,7 +531,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
     // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
     // bound. The delayed issue/stale state below remains an assertion oracle.
-    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlush
+    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlushArm
     val planLookupFire = ic.cmd.fire && !issueBornStale
     val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
     val resultExpectedValid = RegNext(planLookupFire) init False
@@ -525,7 +611,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // rejected at elaboration or given a separately pipelined reservation mechanism.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
                      quiesce || stalled || faultHold || ftbSuppress ||
-                     targetHoldValid || icMaintFlush
+                     targetHoldValid || icMaintFlushArm
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
                             !(resultInWindow && resultAfterDrop)
@@ -606,7 +692,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // ring window and appends its target without invalidating any older bytes.
     ftqFlush := redirect.valid || (resume.valid && stalled) ||
                 mispredictRedirect.valid || predictFire || ftqMismatch ||
-                icMaintFlush
+                icMaintFlushArm
 
     when(applyNow && (predictFire || ftqMismatch || mispredictRedirect.valid)) {
       assert(ftqFlush && redirectThisCycle,
@@ -1371,7 +1457,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     }
     val predictDetectBlocked = redirect.valid || (resume.valid && stalled) ||
                                mispredictRedirect.valid || ftqMismatchDetect ||
-                               icMaintFlush
+                               icMaintFlushArm
     when(predictDetectBlocked) {
       predictPending := False
     }
@@ -1389,12 +1475,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // plan, so it cancels the pending action. A same-cycle fallback detector is itself
     // canceled above: the registered mismatch action owns the next cycle.
     when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
-         icMaintFlush) {
+         icMaintFlushArm) {
       ftqMismatchPending := False
     }
     val ftqMismatchDetectKept = ftqMismatchDetect &&
       !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
-        icMaintFlush)
+        icMaintFlushArm)
     val ftqMismatchDetectKeptD = RegNext(ftqMismatchDetectKept) init False
     when(ftqMismatch) {
       assert(ftqMismatchDetectKeptD,
@@ -1535,7 +1621,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // architecture requires after cache maintenance, and it is ordered AFTER the pulse --
     // which ExceptionUnit deliberately fires on the maintenance walk's COMPLETION -- so the
     // refetch cannot repopulate from a line that is about to be invalidated.
-    when(icMaintFlush) {
+    when(icMaintFlushArm) {
       val newPc       = decodePc
       setDecodePc(newPc)
       fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
@@ -1642,7 +1728,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbSuppress := True
     }
     when(redirect.valid || (resume.valid && stalled) ||
-         mispredictRedirect.valid || predictFire || icMaintFlush) {
+         mispredictRedirect.valid || predictFire || icMaintFlushArm) {
       ftbSuppress := False
     }
 
