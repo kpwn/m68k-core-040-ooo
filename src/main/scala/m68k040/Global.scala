@@ -30,7 +30,7 @@ object Global {
     * an aliasing robId, i.e. silent wrong-entry completion. `RobPlugin` therefore
     * `require`s the two to agree, exactly as `IssueQueuePlugin` does for the int
     * physical-register pool. */
-  val ROB_DEPTH_DEFAULT: Int = 64
+  val ROB_DEPTH_DEFAULT: Int = 32
   /** Width of a robId, host-side. Derived, so the ROB array and every robId field in
     * every EU payload move TOGETHER. They used to disagree: `RobPlugin` hardcoded
     * depth=64 while ~40 sites across 12 files hardcoded `UInt(6 bits)`, which meant
