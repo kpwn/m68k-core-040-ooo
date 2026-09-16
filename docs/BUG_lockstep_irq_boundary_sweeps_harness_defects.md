@@ -108,6 +108,26 @@ not the boundary search, is what blocks those tests at their own boundary. The s
 is for the DUT to publish a per-commit ARCHIVED A7 rather than a live readback (RTL work);
 widening the tolerance to two steps would weaken a check that exists to catch real A7 bugs.
 
+## 4c. The residual is ONE dominant shape, not a diffuse mess (measured)
+
+Classifying every failing test by what diverged at its OWN requested boundary (the
+no-`late` attempt) after defects A/B/C were fixed:
+
+* **4 tests blocked by `reg A6`** -- `irq1-0` b11, `irq1-12` b16, `irq1-6-movem` b5,
+  `irq1-10-call` b13. These are the `link`/`unlk` case above and are fixed.
+  `irq1-0` b11 is the proof that the boundary search itself is fine: the DUT matched the
+  b11 oracle's pc stream all the way to index 183 and diverged ONLY on the uninitialised
+  A6, while the `late12` retry shows it one macro EARLIER than the b12 oracle -- i.e. the
+  DUT really was at boundary 11 and the search found it.
+* **~10 tests share ONE identical signature**: `b20 -> pc: dut=0x408000bc
+  oracle=0x4080007a` (and the `-call` variants `b16 -> dut=0x408000b8
+  oracle=0x408000ce`). `0x408000bc` is inside the A-LINE HANDLER while the oracle is
+  still in the main body. So the interrupt lands on the far side of the program's SECOND
+  `.short 0xa06e` A-line trap from every oracle the window offers.
+
+That clusters the remaining work on one mechanism -- interrupt recognition across a trap
+entry -- rather than leaving it open-ended.
+
 ## 5. The residual, and why it is NOT a core defect
 
 After A/B/C the remaining odd-ssp failures are `pc` divergences -- the interrupt landing on
