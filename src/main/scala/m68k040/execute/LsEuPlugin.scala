@@ -53,7 +53,7 @@ trait LsEuService {
   * `entryFaultAtc`. Was previously hardcoded True unconditionally (moot before
   * this task since the ONLY existing fault source was the MMU path). */
 case class LsFault() extends Bundle {
-  val robId      = UInt(6 bits)
+  val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val faultAddr  = UInt(32 bits)
   val write      = Bool()
   val sizeBits   = UInt(2 bits)
@@ -218,10 +218,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     excXlateWrite   = Bool(); excXlateToken = UInt(DTranslationToken.Width bits)
     excXlateReady   = Bool()
     sqEmptySig      = Bool()
-    robHeadIn              = UInt(6 bits)
+    robHeadIn              = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     robHeadValidIn         = Bool()
     irqPreemptPendingIn    = Bool()
-    sqCompletionPort       = Flow(UInt(6 bits))
+    sqCompletionPort       = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     sqFaultCompletionPort  = Flow(LsFault())
     preciseDrainBusySig    = Bool()
     debugHaltImminentIn    = Bool()
@@ -229,18 +229,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     quiesceHold            = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
-    completionPort = Flow(UInt(6 bits))
-    sqCommitPort   = Flow(UInt(6 bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    sqCommitPort   = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     // Slot-1 commit: defaults to idle (allowOverride) so single-retire benches/stubs
     // need no wiring; the full-core wiring overrides it with {retire1, h1}.
-    sqCommitBPort  = Flow(UInt(6 bits))
+    sqCommitBPort  = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     sqCommitBPort.valid.allowOverride;   sqCommitBPort.valid   := False
-    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, 6 bits)
+    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
-    xlateRobIdSig  = UInt(6 bits)
+    xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -327,7 +327,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
     // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
     // can never assert, matching the SQ's own pre-P2.5 dead-wired defaults.
-    robHeadIn.allowOverride;           robHeadIn := U(0, 6 bits)
+    robHeadIn.allowOverride;           robHeadIn := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
     // A DUT with no RobPlugin (most standalone LS tests) never has a debug-auto-
@@ -622,7 +622,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // on the wrong (by-then-reallocated) robId. Idle-default here; driven from
     // the SAME apply event as the wbObs replay so the two can never separate.
     sqCompletionPort.valid   := False
-    sqCompletionPort.payload := U(0, 6 bits)
+    sqCompletionPort.payload := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     sqFaultCompletionPort.valid := False
     sqFaultCompletionPort.payload.assignDontCare()
     preciseDrainBusySig    := sq.io.preciseDrainBusy
@@ -859,7 +859,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // The full 300+ bit RenamedUop stays in P1; P2/P3/P4 replicate this pruned token
     // instead, keeping the area cost of three simultaneously-resident accesses bounded.
     case class FrontPipeCtx() extends Bundle {
-      val robId           = UInt(6 bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val vaddr           = UInt(32 bits)
       val addrB           = UInt(32 bits)
       val storeData       = Bits(32 bits)
@@ -1131,7 +1131,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val size      = Reg(m68k040.isa.Size()) init m68k040.isa.Size.BYTE
       val cmode     = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
       val cmodeB    = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
-      val robId     = Reg(UInt(6 bits)) init 0
+      val robId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -1153,7 +1153,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // extractCross, are ALREADY carried as llReg.vaddr(3 downto 0) / llReg.size —
     // no new state for those.
     case class BkCtx() extends Bundle {
-      val robId           = UInt(6 bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val pdst            = UInt(6 bits)
       val pdstValid       = Bool()
       val wakes           = Bool()
@@ -1695,7 +1695,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // at the cost of ONE extra completion-latency cycle (lock-step is latency-
     // agnostic). All comp* are RegInit/Reg (no uninit fanout).
     val compValid     = RegInit(False)
-    val compRobId     = Reg(UInt(6 bits))
+    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
     compData.simPublic() // debug-only, task #144
@@ -2228,7 +2228,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // the ROB head and completed, so it is guaranteed older than anything a later
     // flush could legitimately discard).
     case class PendingStoreWb() extends Bundle {
-      val robId      = UInt(6 bits)
+      val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val dstArch    = UInt(5 bits)
       val data       = Bits(32 bits)
       val pdst       = UInt(6 bits)
@@ -3590,7 +3590,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // belongs to, and an exception-sequencer translation belongs to no ROB entry. Feeding
     // the stale `reqDrvRobId` there would attribute the walk to an unrelated (possibly
     // already-retired) instruction.
-    xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, 6 bits))
+    xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, m68k040.Global.ROB_ID_W_DEFAULT bits))
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // WALKER LEGS OF THE D-CACHE PORT MUX  (last drivers -- they override both the

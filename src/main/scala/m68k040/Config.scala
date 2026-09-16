@@ -5,7 +5,7 @@ import spinal.core._
 /** Compile-time sizing for the whole core (spec Appendix A). All depths are
   * parameters so IPC/area/FMax can be swept without rearchitecting. */
 case class M68kParams(
-    robDepth:     Int = 64,
+    robDepth:     Int = Global.ROB_DEPTH_DEFAULT,
     physInt:      Int = Global.PHYS_INT_REGS_DEFAULT,
     physNzvc:     Int = 16,
     physX:        Int = 16,

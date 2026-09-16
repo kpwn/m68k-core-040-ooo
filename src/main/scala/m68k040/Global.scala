@@ -11,11 +11,34 @@ object Global {
   // invariant #3 (one producer per key) is a convention, not runtime-enforced.
   // Producer: ParamPlugin (setup phase)
   val ROB_DEPTH       = Database.blocking[Int]()
-  /** Width of a robId. Derived, so the ROB array and every robId field in every EU
-    * payload move TOGETHER. They used to disagree: RobPlugin hardcoded depth=64 while
-    * ~20 payload bundles hardcoded `UInt(6 bits)`, which meant shrinking the ROB
-    * either aliased silently or failed deep inside elaboration. */
+  /** THE reorder-buffer depth, in plain-constant form -- the ONE number every robId
+    * field is sized from.
+    *
+    * WHY A PLAIN CONSTANT AND NOT JUST THE DATABASE KEY. `ROB_ID_W` below reads
+    * `ROB_DEPTH.get`, a `Database.blocking` read that is only legal inside a plugin
+    * host's fiber. But most robId-carrying bundles are STANDALONE classes --
+    * `IqContext`, `SqAlloc`, `LsFault`, `BranchCompletion`, `CcrCompletion`,
+    * `UmWriteAlloc`, the `StoreQueue`/`UmWriteQueue` `Component` io bundles -- and unit
+    * specs construct several of them outside any host. They cannot call `ROB_ID_W`, so
+    * before this they simply hardcoded `UInt(6 bits)`. Same problem, same solution as
+    * `PHYS_INT_REGS_DEFAULT` below.
+    *
+    * CONSEQUENCE: the depth is configured HERE, and `M68kParams.robDepth` defaults to
+    * this constant so there is exactly one source of truth. Passing a DIFFERENT
+    * `robDepth` to `M68kParams` would make the ROB array (sized from `ROB_DEPTH.get`)
+    * disagree with every standalone payload bundle (sized from `ROB_ID_W_DEFAULT`) --
+    * an aliasing robId, i.e. silent wrong-entry completion. `RobPlugin` therefore
+    * `require`s the two to agree, exactly as `IssueQueuePlugin` does for the int
+    * physical-register pool. */
+  val ROB_DEPTH_DEFAULT: Int = 64
+  /** Width of a robId, host-side. Derived, so the ROB array and every robId field in
+    * every EU payload move TOGETHER. They used to disagree: `RobPlugin` hardcoded
+    * depth=64 while ~40 sites across 12 files hardcoded `UInt(6 bits)`, which meant
+    * shrinking the ROB either aliased silently or failed deep inside elaboration. */
   def ROB_ID_W: Int   = spinal.core.log2Up(ROB_DEPTH.get)
+  /** Width of a robId, for bundles elaborated OUTSIDE a plugin host. Equal to
+    * `ROB_ID_W` by the `RobPlugin` require -- see `ROB_DEPTH_DEFAULT`. */
+  def ROB_ID_W_DEFAULT: Int = spinal.core.log2Up(ROB_DEPTH_DEFAULT)
   val PHYS_INT_REGS   = Database.blocking[Int]()
   /** THE int physical-register pool size — the ONE number, in plain-constant form.
     *

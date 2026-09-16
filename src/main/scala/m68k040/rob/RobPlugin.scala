@@ -301,8 +301,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       case None    => iplIn := 0;       iackAvec := False;      iackVector := 0
     }
 
-    val depth  = 64
-    val robIdW = log2Up(depth) // = 6, wraps naturally
+    val depth  = m68k040.Global.ROB_DEPTH_DEFAULT // == M68kParams.robDepth; ParamPlugin requires it
+    val robIdW = log2Up(depth) // = 6 at the default depth, wraps naturally
 
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)

@@ -30,7 +30,7 @@ trait AluEuService {
 /** Sim-only per-instruction writeback observation (NaxRiscv-style whitebox). */
 case class WbObs() extends Bundle {
   val valid     = Bool()
-  val robId     = UInt(6 bits)
+  val robId     = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val dstArch   = UInt(5 bits)
   val result    = Bits(32 bits)
   val intWrite  = Bool()
@@ -127,7 +127,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
   during setup {
     issuePort      = Stream(IqContext())
     flushPort      = Bool()
-    completionPort = Flow(UInt(6 bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     slowWakeupPort = Flow(AluSlowWakeup())
     fastAcceptNextPort = Bool()
     val irf = host[IntRegFileService]

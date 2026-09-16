@@ -4,7 +4,7 @@ import spinal.core._
 import spinal.lib._
 
 case class UmWriteAlloc() extends Bundle {
-  val robId   = UInt(6 bits)
+  val robId   = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val addr    = UInt(32 bits)   // byte address of the descriptor byte to RMW
   val newByte = Bits(8 bits)    // new value of that byte (old | set-bits)
 }
@@ -34,10 +34,10 @@ class UmWriteQueue(depth: Int = 4) extends Component {
 
   val io = new Bundle {
     val alloc    = slave(Flow(UmWriteAlloc()))
-    val commit   = slave(Flow(UInt(6 bits)))
+    val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     // Slot-1 retire commit (a tagged op can dual-retire at h1 behind a long-latency
     // head; both retire slots must mark the SAME cycle — see StoreQueue.commitB).
-    val commitB  = slave(Flow(UInt(6 bits)))
+    val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     val flush    = in Bool ()
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()
@@ -99,7 +99,7 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     * (see the flush block). A dead entry keeps its slot -- so the ring stays contiguous
     * -- and pops at the head in one cycle WITHOUT issuing its descriptor write. */
   val dead      = Vec.fill(depth)(RegInit(False))
-  val robIds    = Vec.fill(depth)(RegInit(U(0, 6 bits)))
+  val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)))
   val addrs     = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val bytes     = Vec.fill(depth)(RegInit(B(0, 8 bits)))
 
