@@ -492,14 +492,44 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // UNPK overrides result low word (WORD size -> .W merge preserves Dx[31:16]).
     // For PACK: opResult must present the result in low 8 bits (upper 24 don't-care for .B merge).
     // For UNPK: opResult must present the result in low 16 bits (upper 16 don't-care for .W merge).
-    val opResult = Mux(isBfResolve, bfResolveRes,
-                   Mux(isPack, packRes8,
-                   Mux(isUnpk, unpkRes32,
-                   Mux(isBcd,  B(0, 24 bits) ## bcdRes8, rsp.result))))
-    val sizeMerged = u1.size.mux(
-      Size.BYTE -> (s1Src1(31 downto 8)  ## opResult(7 downto 0)),
-      Size.WORD -> (s1Src1(31 downto 16) ## opResult(15 downto 0)),
-      Size.LONG -> opResult)
+    // ── LEVER N-A2' — the 32-bit INTEGER twin of the NZVC re-association below ────
+    // Same shape, same proof obligation, applied to the wider cone N-A2 never covered.
+    //
+    // `rsp.result` is the ONE LATE input here: it comes off AluDatapath's 32-bit adder.
+    // EVERY other leg (bfResolveRes / packRes8 / unpkRes32 / bcdRes8 / srLogicResult /
+    // casResult / moveaResult / sizeMergedMove / s1Src1) is shallow logic off the S1
+    // operand registers, and EVERY selector is a pure function of the REGISTERED µop
+    // (op / size / isMovea / fromCcr / fromSr / sysOp / sysKind) -- settled at T=0.
+    //
+    // The old nesting buried the late leg at the DEEPEST position of all three chains
+    // it had to cross: innermost of a 4-deep `opResult`, then the size merge, then
+    // three more levels of `mergedResult` -- EIGHT serial 2:1 muxes. On the routed
+    // vivado200_fmax2 checkpoint that is exactly the four LUT levels between the CARRY8
+    // and this EU's output, and it heads the design's single densest failing family:
+    // 234 failing setup endpoints sourced at `s1Ctx_uop_op` (this register, both
+    // lanes), 212 of them landing in RobPlugin -- 176 in `sysValStore` alone. That is
+    // 19% of every failing endpoint in the SoC, from one 6-bit register.
+    //
+    // Re-associated so the late leg sits ONE 2:1 mux from the output, behind an EARLY
+    // select. The early legs fold into `earlyOpResult`/`earlyOther`/`rest*`, which
+    // resolve in parallel with the adder and are off the critical cone entirely.
+    // Zero latency, zero IPC, no µop change, no architectural state.
+    //
+    // ⚠️ DO NOT "improve" this by pre-decoding the op class INTO THE µOP (a
+    // RenamedUop / IQ-entry field). That is Lever N-A: implemented, measured
+    // post-route, and REVERTED (ea2c7a1d / 4efc9f75). Its own logic did shorten
+    // (-0.151 ns) but widening every IQ entry grew route delay +0.423 ns -- net WORSE
+    // on a design that is 62-76% wire. Re-association is the half that measured
+    // positive, and it needs no µop change at all.
+    //
+    // The non-adder `opResult` legs, priority order preserved. Reached only when
+    // `opIsAlu` is False -- i.e. exactly one of the four markers is set -- so the BCD
+    // fall-through is a DON'T-CARE when none of them is.
+    val earlyOpResult = Mux(isBfResolve, bfResolveRes,
+                        Mux(isPack, packRes8,
+                        Mux(isUnpk, unpkRes32, B(0, 24 bits) ## bcdRes8)))
+    // `opResult === rsp.result` exactly when none of the four overrides applies.
+    val opIsAlu = !isBfResolve && !isPack && !isUnpk && !isBcd
     // MOVEA (MOVE to An): An is ALWAYS written full-32 — NO partial merge. The source
     // (src2) is SIGN-EXTENDED to 32 from the op size. Normal MOVEA reaches only .W/.L
     // (byte MOVEA is illegal in the ISA); the MOVES read-to-An form (which reuses isMovea)
@@ -547,10 +577,45 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // the generic size-merge (like MOVEA / fromCcr-Sr).
     // anWide (ADDA/SUBA): the full-32 datapath result, NO merge (the WORD size field
     // would otherwise merge the old An's upper 16 over the carry-propagated result).
-    val mergedResult = Mux(isLogicSr, srLogicResult,
-                       Mux(casIsOp, casResult,
-                       Mux(anWide, opResult,
-                       Mux(u1.isMovea, moveaResult, Mux(isFromCcrSr, sizeMergedMove, sizeMerged)))))
+    // ── The re-associated final select (see LEVER N-A2' above) ───────────────────
+    // The old chain, kept here as the mapping this must reproduce EXACTLY:
+    //   1 isLogicSr   -> srLogicResult
+    //   2 casIsOp     -> casResult
+    //   3 anWide      -> opResult        (RAW: An has no partial-register merge)
+    //   4 isMovea     -> moveaResult
+    //   5 isFromCcrSr -> sizeMergedMove
+    //   6 default     -> sizeMerged      (= the size merge OF opResult)
+    // Arms 3 and 6 are the only two that carry the late `opResult`, and they differ
+    // ONLY in whether the size merge applies -- which is precisely what `anWide`
+    // decides. Folding `anWide` into the merge mask collapses them into ONE arm:
+    val takeOpRes = !isLogicSr && !casIsOp && (anWide || (!u1.isMovea && !isFromCcrSr))
+    //   isLogicSr                                  -> F  (arm 1)
+    //   !isLogicSr && casIsOp                      -> F  (arm 2)
+    //   !isLogicSr && !casIsOp && anWide           -> T  (arm 3)
+    //   ...        && !anWide && isMovea           -> F  (arm 4)  [anWide ⊂ isMovea]
+    //   ...        && !anWide && !isMovea && fromCcrSr  -> F  (arm 5)
+    //   ...        && !anWide && !isMovea && !fromCcrSr -> T  (arm 6)
+    val earlyOther = Mux(isLogicSr, srLogicResult,
+                     Mux(casIsOp, casResult,
+                     Mux(u1.isMovea, moveaResult, sizeMergedMove)))
+    // The partial-register merge mask, per bit-GROUP (three lanes, not 32 bits):
+    // "this lane keeps s1Src1's OLD bits". anWide writes An full-32, so it clears it.
+    val keepOldHi  = !anWide && (u1.size =/= Size.LONG)   // [31:16]: BYTE and WORD keep
+    val keepOldMid = !anWide && (u1.size === Size.BYTE)   // [15:8] : only BYTE keeps
+    //                                                       [7:0]  : never keeps
+    val takeAluLo  = takeOpRes && opIsAlu
+    val takeAluMid = takeAluLo && !keepOldMid
+    val takeAluHi  = takeAluLo && !keepOldHi
+    // Everything that is NOT `rsp.result`, resolved per lane in parallel with the adder.
+    val restLo  = Mux(takeOpRes, earlyOpResult(7 downto 0), earlyOther(7 downto 0))
+    val restMid = Mux(takeOpRes, Mux(keepOldMid, s1Src1(15 downto 8),  earlyOpResult(15 downto 8)),
+                                 earlyOther(15 downto 8))
+    val restHi  = Mux(takeOpRes, Mux(keepOldHi,  s1Src1(31 downto 16), earlyOpResult(31 downto 16)),
+                                 earlyOther(31 downto 16))
+    // ONE 2:1 with an early select between the adder and this EU's writeback/bypass.
+    val mergedResult = Mux(takeAluHi,  rsp.result(31 downto 16), restHi) ##
+                       Mux(takeAluMid, rsp.result(15 downto 8),  restMid) ##
+                       Mux(takeAluLo,  rsp.result(7 downto 0),   restLo)
 
     // ---- S1: ANDI/ORI/EORI #imm,CCR (toCcr) — CCR read-modify-write (FAST path) ----
     // Assemble the current 5-bit CCR {X,N,Z,V,C} from the flag PRFs, apply the logical
@@ -571,8 +636,24 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Fast final flags: CASOP cmp/preserve flags for CAS/CAS2, CCR-rmw for toCcr, BCD
     // decimal carry/quirky-N/V for BCD, else the ALU datapath (NO shifter). X = the BCD
     // decimal carry/borrow for a BCD op (CAS/CAS2 never write X).
-    val finalNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, Mux(isBcd, bcdNzvc, aluNzvc)))
-    val finalX    = Mux(u1.toCcr, ccrX, Mux(isBcd, bcdCarry, rsp.xOut))
+    // LEVER N-A2 (mux re-association ONLY -- zero area, no uop change).
+    // Unconditionally value-identical to the old nesting; `useAluNzvc` is exactly the
+    // old chain's fall-through arm and the cas>toCcr>bcd priority is preserved.
+    // Hoists the ONE late input (aluNzvc, off the adder) to the outermost 2:1 mux.
+    //
+    // PROVENANCE: this is the half of Lever N-A that MEASURED POSITIVE post-route and
+    // was preserved when the rest of N-A was reverted -- see 4efc9f75 and
+    // docs/superpowers/specs/2026-08-08-fmax-levern-a2-muxonly.patch. It was held back
+    // then for ONE named reason: the family it handed WNS to,
+    // `tagMem -> faultAddrStore`, got worse. `faultAddrStore` NO LONGER EXISTS -- the
+    // ROB-fold Slice C rewrite replaced all seven per-entry fault Reg-Vecs with the
+    // single `faultDynMem` (see RobPlugin.scala), and the name appears ZERO times in
+    // the current routed timing report. The stated precondition is met; re-applied.
+    val useAluNzvc = !casIsOp && !u1.toCcr && !isBcd
+    val nonAluNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, bcdNzvc))
+    val finalNzvc = Mux(useAluNzvc, aluNzvc, nonAluNzvc)
+    val useAluX   = !u1.toCcr && !isBcd
+    val finalX    = Mux(useAluX, rsp.xOut, Mux(u1.toCcr, ccrX, bcdCarry))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
     val fastFire = s1Valid && !isSlow && !flushPort
