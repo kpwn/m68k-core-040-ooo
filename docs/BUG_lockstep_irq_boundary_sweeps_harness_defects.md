@@ -39,6 +39,13 @@ so EVERY odd-ssp test built on that fill was seed-dependently red **before the i
 was even involved**. `a7IrqSrc` has the same hole in D1/D2 (idiom) and D5/D6 (handlers);
 it initialises only D0.
 
+Also **A6**: `link %a6,#-75` PUSHES the old A6 and `unlk %a6` pops it back, so an
+uninitialised A6 is round-tripped through memory -- measured as
+`reg A6: dut=0x2925a6a2 oracle=0x00000000` at the `unlk`. Found only AFTER the D1/D2/D3
+fix removed the earlier noise and moved every killing boundary later (boot-0 19 -> 11,
+boot-2 4 -> 20, boot-4 6 -> 20). `movea.l #0,%a6` is flag-neutral, unlike a `moveq`, so it
+cannot perturb the CCR these sweeps check.
+
 **Fix:** `moveq #63,%d1` in the fill (a long write; D1 is only a loop counter, so nothing
 the test exercises changes), plus `moveq #0` for D2/D3 in `oddSspLinkSrc` and for
 D1/D2/D5/D6 in `a7IrqSrc`. `Pre` in the a7-irq test is a hardcoded preamble count and was
@@ -80,6 +87,26 @@ interrupt at the FIRST visit, and there is no way to ask for the second. "Before
 SECOND visit of `sub1`'s rts" is therefore inexpressible, and a DUT that legitimately
 lands there can match NO oracle. A real fix needs an ordinal-aware `(pc, nth-visit)` event
 in the oracle. Documented loudly at the `boundarySeq` definition.
+
+## 4b. DEFECT E -- `a7ProbeLag` tolerates ONE stale commit, but two A7 events can land back-to-back (REAL, NOT fixed)
+
+`LockStep.compare`'s `a7ProbeLag` exists because the commit port publishes A7 as
+`RegNext(exc.ss.a7)` over a LIVE PRF readback of arch-15, so at an RTS return it can show
+the pre-pop A7 for ONE commit. It tolerates exactly that: the DUT's A7 must equal the
+oracle's A7 at the IMMEDIATELY PRECEDING step.
+
+When an RTS return is IMMEDIATELY followed by an interrupt entry, two A7-changing macros
+retire back-to-back and the probe is stale for TWO consecutive commits, which the
+tolerance rejects. Measured (`odd-ssp-irq1-0-b19`, and identically at `irq1-6-b19`):
+
+    157  DUT 0x408000b0/.../0x000fffad | ORACLE 0x408000b0/.../0x000fffad   jsr -> sub1
+    158  DUT 0x40800074/.../0x000fffad | ORACLE 0x40800074/.../0x000fffb1   rts; DUT A7 stale (tolerated)
+    159  DUT 0x408000b6/.../0x000fffad | ORACLE 0x408000b6/.../0x000fffa9   IRQ entry; REJECTED
+
+Note the pc stream matches EXACTLY at the correct boundary -- only A7 diverges. So this,
+not the boundary search, is what blocks those tests at their own boundary. The sound fix
+is for the DUT to publish a per-commit ARCHIVED A7 rather than a live readback (RTL work);
+widening the tolerance to two steps would weaken a check that exists to catch real A7 bugs.
 
 ## 5. The residual, and why it is NOT a core defect
 
