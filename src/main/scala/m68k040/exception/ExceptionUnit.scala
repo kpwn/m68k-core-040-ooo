@@ -428,7 +428,33 @@ class ExceptionUnit(
   val curPc    = Reg(UInt(32 bits)); curPc.simPublic()   // ENTRY: faulting PC to stack; RTE: restored PC
   val oldSr    = Reg(UInt(16 bits))   // ENTRY: SR to stack
   val frameBase= Reg(UInt(32 bits))   // ENTRY: new SP = supervisor bank (M?MSP:ISP) - frame size; RTE: old SP
-  val vecTarget= Reg(UInt(32 bits))   // redirect target
+  // ── 2026-09-16: the vector FETCH ADDRESS and the FETCHED HANDLER are now TWO
+  // registers, not one. `vecTarget` used to serve both roles: the entry capture wrote
+  // `VBR + vector*4` into it, `E_VECWAIT` overwrote it with the fetched longword, and
+  // `E_REDIR` read it as `redirectPc`. That made "the FSM reached E_REDIR without the
+  // fetch result ever landing" indistinguishable from a correct dispatch -- it silently
+  // redirected the CPU to `VBR + vector*4`, i.e. INTO THE VECTOR TABLE, executing the
+  // table's own bytes as code. There is no such thing as a partially-correct redirect
+  // here, so the two roles are now separate storage and `redirectPc` is PHYSICALLY
+  // incapable of carrying the fetch address:
+  //   `vecAddr`      -- WRITE-ONLY from the entry captures (IDLE's entryTrigger and the
+  //                     three re-entry synthesizers), READ by the fetch states.
+  //   `vecTarget`    -- WRITE-ONLY from `E_VECWAIT`'s two result arms, READ by E_REDIR.
+  //   `vecTargetVld` -- cleared by every entry capture, set only by those two arms; a
+  //                     sim assertion in `E_REDIR` machine-checks that the episode
+  //                     actually fetched a handler before it redirects.
+  // `vecAddr` also makes `vecCrosses`/`vecCurVa` derive from a value that CANNOT be
+  // clobbered mid-straddle by the result write, which the old single register only
+  // avoided by write-ordering luck.
+  val vecAddr  = Reg(UInt(32 bits)) init 0; vecAddr.simPublic()
+  val vecTarget= Reg(UInt(32 bits)) init 0; vecTarget.simPublic()   // FETCHED handler
+  val vecTargetVld = RegInit(False); vecTargetVld.simPublic()
+  /** Arm a vector fetch at `VBR + vec*4`: set the fetch address and INVALIDATE any
+    * handler left over from a previous episode. Every entry capture calls this. */
+  def armVectorFetch(addr: UInt): Unit = {
+    vecAddr      := addr
+    vecTargetVld := False
+  }
   // ENTRY: is this an access fault (vector 2)? -> stack a format-$7 frame (30 words)
   // instead of format-$0 (4 words). Captured at trigger.
   val curIs7   = RegInit(False)
@@ -812,7 +838,7 @@ class ExceptionUnit(
   }
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
-  // vaddr (off `frameBase`/`vecTarget`) drives the D-cache hit/miss-tag + the LS
+  // vaddr (off `frameBase`/`vecAddr`) drives the D-cache hit/miss-tag + the LS
   // EU's SQ-overlap compare; combinationally that put `frameBase -> miss-tag ->
   // SQ-compare -> fwdData` on the critical arc. We register the load cmd + the
   // matching D-TLB request. The load states hold the request until the registered
@@ -1279,6 +1305,18 @@ class ExceptionUnit(
   val dblFaultPc  = Reg(UInt(32 bits)) init 0; dblFaultPc.simPublic()
   val dblFaultVec = Reg(UInt(8 bits)) init 0; dblFaultVec.simPublic()
 
+  // ── 2026-09-16: sticky "dispatched INTO the vector table" tripwire ──────────────
+  // Set in `E_REDIR` when the handler address just fetched lands inside
+  // [VBR, VBR+0x400). Observational only (see the comment at the set site): it changes
+  // no dispatch, costs one comparator + three registers, and exists so a board capture
+  // can DISTINGUISH an exception-unit dispatch fault from software transferring control
+  // to address 0 and walking up through the table -- two mechanisms with the identical
+  // landing PC. Exposed on `dbgStallExcPack` bits 27/28 (the read the REPL already has),
+  // not on a new CSR.
+  val vecTableRedirect    = RegInit(False); vecTableRedirect.simPublic()
+  val vecTableRedirectPc  = Reg(UInt(32 bits)) init 0; vecTableRedirectPc.simPublic()
+  val vecTableRedirectVec = Reg(UInt(8 bits)) init 0; vecTableRedirectVec.simPublic()
+
   val fsm = new StateMachine {
     val IDLE      = new State with EntryPoint
     // ENTRY path
@@ -1519,7 +1557,7 @@ class ExceptionUnit(
         curThrowaway := entryIsInterrupt && ss.m
         stFrame2     := False
         // compute vector fetch base = VBR + vec*4
-        vecTarget := (ss.vbr + (entryVector << 2)).resized
+        armVectorFetch((ss.vbr + (entryVector << 2)).resized)
         stStep    := 0
         stSplitLow := False   // task #163: clear any split-word carry from a prior entry
         goto(E_DRAIN)
@@ -1726,8 +1764,8 @@ class ExceptionUnit(
     // -- see `vecSplitIdx`'s comment) is read as four BYTE loads instead. `vecCurVa`
     // walks addr+0..+3 and is what the translate port sees, so a fetch that also
     // straddles a page re-translates for the far-side bytes.
-    val vecCrosses = vecTarget(3 downto 0) > U(12, 4 bits)
-    val vecCurVa   = Mux(vecCrosses, vecTarget + vecSplitIdx.resize(32 bits), vecTarget)
+    val vecCrosses = vecAddr(3 downto 0) > U(12, 4 bits)
+    val vecCurVa   = Mux(vecCrosses, vecAddr + vecSplitIdx.resize(32 bits), vecAddr)
     E_VECREQ.whenIsActive {
       // 2026-09-09: VBR is a LOGICAL address -- the OS writes its vector table with
       // ordinary translated stores -- so the vector fetch must translate too. Reading
@@ -1764,14 +1802,16 @@ class ExceptionUnit(
           vecAcc := acc
           when(vecSplitIdx === U(3, 2 bits)) {
             vecSplitIdx := 0
-            vecTarget   := acc.asUInt
+            vecTarget    := acc.asUInt
+            vecTargetVld := True
             goto(E_REDIR)
           } otherwise {
             vecSplitIdx := vecSplitIdx + 1
             goto(E_VECREQ)
           }
         } otherwise {
-          vecTarget := dcLoadRsp.payload.data.asUInt
+          vecTarget    := dcLoadRsp.payload.data.asUInt
+          vecTargetVld := True
           goto(E_REDIR)
         }
       }
@@ -1810,6 +1850,39 @@ class ExceptionUnit(
                        (newSysBase & U(0xf8, 8 bits)) | curLevel.resize(8),
                        newSysBase)
       ss.setSrSys.valid := True; ss.setSrSys.payload := newSys
+      // ── 2026-09-16: the two guards on "did this dispatch actually fetch a handler?" ──
+      // (a) SIM: `vecTargetVld` is cleared by every entry capture and set ONLY by
+      //     `E_VECWAIT`'s two result arms, so reaching E_REDIR without it means the FSM
+      //     left the fetch by a route that skipped the result write. With `vecTarget`
+      //     now a separate register from `vecAddr` that is structurally impossible --
+      //     this assertion is what keeps it impossible as the FSM grows.
+      // (b) SILICON: a sticky tripwire on the SHAPE the hardware failure took -- a
+      //     dispatch whose handler address lands INSIDE the vector table the dispatch
+      //     just read from (`VBR <= pc < VBR+0x400`). That is never a real handler; an
+      //     OS that put one there could not take a second exception. Recorded rather
+      //     than acted on (no redirect is suppressed, no halt is forced -- changing the
+      //     dispatch under a fault would destroy the evidence), and surfaced in
+      //     `dbgStallExcPack` so a halted board can tell "the exception unit dispatched
+      //     into the table" apart from "software transferred control to a nil pointer
+      //     and walked up through it". Those two have the SAME landing PC, and the only
+      //     previous capture of this signature that was ever decoded end-to-end (a p163
+      //     pc-trace: 0x0 -> 0x2 -> 0x6 -> 0xa -> ... -> 0x2a -> 0x2e, i.e. the vector
+      //     table executed as code from address 0 after an `rts` off a corrupted stack)
+      //     was the SECOND one. Without this bit the distinction can only be made by
+      //     forensics after the fact, and only if a pc-trace happens to survive.
+      GenerationFlags.simulation {
+        assert(vecTargetVld,
+          "ExceptionUnit: E_REDIR reached with NO vector-fetch result -- the dispatch " +
+          "would redirect to a stale or uninitialised handler address",
+          FAILURE)
+      }
+      // Modular difference, not a pair of compares: it is correct for a VBR in the
+      // top 1 KiB of the address space, where `vbr + 0x400` itself wraps.
+      when((vecTarget - ss.vbr) < U(0x400, 32 bits)) {
+        vecTableRedirect    := True
+        vecTableRedirectPc  := vecTarget
+        vecTableRedirectVec := curVec
+      }
       redirectValid := True
       redirectPc    := vecTarget
       // commit observation: the faulting instruction's trace step == handler entry
@@ -1898,7 +1971,7 @@ class ExceptionUnit(
       // The SR to stack is the CURRENT one: R_REDIR is where RTE would have applied the
       // popped SR, and this never reaches it.
       oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-      vecTarget    := (ss.vbr + (U(2, 8 bits) << 2)).resized
+      armVectorFetch((ss.vbr + (U(2, 8 bits) << 2)).resized)
       stStep       := 0
       stSplitLow   := False
       rdSplitLow   := False    // drop any half-read split word
@@ -2081,7 +2154,7 @@ class ExceptionUnit(
           curThrowaway := False
           stFrame2     := False
           oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-          vecTarget    := (ss.vbr + (U(3, 8 bits) << 2)).resized
+          armVectorFetch((ss.vbr + (U(3, 8 bits) << 2)).resized)
           stStep       := 0
           stSplitLow   := False
           goto(E_DRAIN)
@@ -2105,7 +2178,7 @@ class ExceptionUnit(
           curThrowaway := False
           stFrame2     := False
           oldSr        := (ss.srSys ## committedCcr.resize(8 bits)).asUInt
-          vecTarget    := (ss.vbr + (U(14, 8 bits) << 2)).resized
+          armVectorFetch((ss.vbr + (U(14, 8 bits) << 2)).resized)
           stStep       := 0
           stSplitLow   := False
           goto(E_DRAIN)
@@ -3091,6 +3164,9 @@ class ExceptionUnit(
   dbgStallExcPack(24) := fsm.isActive(fsm.S_APPLY)
   dbgStallExcPack(25) := fsm.isActive(fsm.S_MAINTWAIT)
   dbgStallExcPack(26) := fsm.isActive(fsm.S_REDIR)
+  // 2026-09-16 vector-dispatch integrity (see `vecTableRedirect`).
+  dbgStallExcPack(27) := vecTableRedirect
+  dbgStallExcPack(28) := vecTargetVld
   dbgStallExcPack.simPublic()
 
   // ---- debug-only observability (task #139 wild-PC / a7-minus-8 investigation) ----
