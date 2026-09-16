@@ -18,6 +18,20 @@ the SwapMMUMode byte push/pop idiom`.
   still failing. Net loss. Do not re-try it without new evidence. (The reasoning behind
   it is sound and is recorded in the code comment; it is simply not sufficient.)
 
+## 0b. PROVENANCE -- these tests were never sound, on either lineage
+
+`move.w #63,%d1` (defect A's origin) was introduced by **`cf53df4a`**, the commit that
+CREATED the odd-ssp family ("test(lockstep): odd-SSP exception frames ... IRQ at every
+boundary ... (p167)"). It is present verbatim at the merge-base `2be94044` and on BOTH
+lineages that descend from it -- `master` @ `b452c957` and `closure-200mhz` @ `817bf43d`
+-- whose commit sets are DISJOINT (12 vs 16 commits, sharing nothing beyond the base).
+The same is true of a7IrqSrc's uninitialised D1/D2/D5/D6 and oddSpSrc's D3/D4.
+
+So the family has been seed-dependently red since birth. A defect that appears on two
+disjoint change-sets and on their common ancestor cannot have been introduced by a merge
+between them. **That settles "is it a regression?" as NO without needing a baseline
+suite run**, which is why the baseline run was cancelled rather than waited on.
+
 ## 1. DEFECT A -- uninitialised data registers (REAL, fixed)
 
 Musashi **zeroes every register at reset**; SpinalSim **randomises the PRF per seed**. A
