@@ -12408,7 +12408,12 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // RANDOM PRF init against the oracle's zero -- measured as
       // `reg D2: dut=0x4c1b9d00 oracle=0x00000000` / `reg D3: dut=0xb058b600 oracle=0x0`.
       // See the oddSspFill comment for the full mechanism. Long writes, so both sides agree.
-      "moveq #0,%d2", "moveq #0,%d3",
+      // A6 too: `link %a6,#-75` PUSHES the old A6 and `unlk %a6` restores it, but A6 is
+      // never initialised -- so the DUT restores its random PRF value and the oracle
+      // restores zero. Measured as `reg A6: dut=0x2925a6a2 oracle=0x00000000` at the
+      // `unlk`. movea is flag-neutral, unlike a moveq, so it cannot perturb the CCR the
+      // sweep is checking.
+      "moveq #0,%d2", "moveq #0,%d3", "movea.l #0,%a6",
       "move.l #0x00003000,%a0", "move.l #0x55555555,%d5", "move.b #0x42,0x0cb3", "move.l %sp,%a5",
       "move.w #0x2000,%sr",
       "link %a6,#-75",
