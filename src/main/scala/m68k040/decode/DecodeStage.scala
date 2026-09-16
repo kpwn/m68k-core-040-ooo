@@ -3368,11 +3368,25 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // cycle. (The earlier per-signal flush-clears above are left in place — harmless,
     // redundant, and matches the existing movepPendValid style of a belt-and-suspenders
     // early clear plus an authoritative late one.)
+    //
+    // 2026-09-16: `fmovemxPendValid` (the slot-1 FMOVEM.X stash, added 2026-09-10) was
+    // MISSING from this block and so reproduced the exact bug the block exists to fix. Its
+    // only flush-clear is at its declaration (:1016), textually BEFORE all five of its
+    // setters — the normal fed-consume arm plus the movem/fmovemx/uc/movep entry blocks —
+    // and `fed.valid` is still HIGH on a pipeFlush cycle (PipeStage clears its `valid` reg
+    // AT the edge), so every one of those arms fires on the squash cycle and wins.
+    // A flush landing there left the WRONG-PATH FMOVEM.X packet pending; the next cycle
+    // `fmovemxBegin` fired from it (every other FSM flag HAD been cleared by the flush) and
+    // the macro was emitted into the CORRECT-path stream — a phantom commit doing real
+    // memory traffic / FP register writes at a wrong-path EA with a wrong-path pc/nextPc.
+    // Measured 43/43 coincident flushes before this line, 0/43 after; the MOVEM sibling
+    // (already in this block) was 0/41 both ways. See `FmovemxPendFlushSpec`.
     when(pipeFlush) {
-      stashValid     := False
-      movemPendValid := False
-      ucPendValid    := False
-      movepPendValid := False
+      stashValid       := False
+      movemPendValid   := False
+      ucPendValid      := False
+      movepPendValid   := False
+      fmovemxPendValid := False
     }
 
     // ── Rename-facing output ───────────────────────────────────────────────────

@@ -408,8 +408,32 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // sequential command and make it born stale. The registered fallback action instead
     // selects its captured target at the command mux; its ring entry is re-marked live
     // after the common born-stale assignment below.
+    // ── `icMaintFlush` IS a frontend restart arm (2026-09-16) ────────────────────
+    // The CPUSH/CINV instruction-buffer flush below (`when(icMaintFlush)`) does the same
+    // four things every other restart arm does -- reset decodePc/fetchPc, flush the IBuf,
+    // and mark EVERY outstanding ring entry stale -- but it was absent from the four
+    // shared decision terms (`redirectThisCycle`, `issueBornStale`, `ftbBlocked`,
+    // `ftqFlush`) and from the two pending-action cancels. That left three live holes,
+    // none of which any simulation could see because `icMaintFlush` was wired ONLY in
+    // FullCoreSynth and in none of the test DUTs:
+    //   1. `issueBornStale`: a command accepted on the maintenance-flush cycle still
+    //      launched a LIVE FTB/gshare fetch-plan lookup for a window the flush had just
+    //      discarded, while `ringStale.foreach(_ := True)` marked its ring record stale.
+    //      The two then disagreed at C+1 and the design's own oracle fired:
+    //      "delayed fetch-plan stale decision no longer matches its resident ring record"
+    //      (reproduced on ifstage_smc_l0_backbranch / _victim_cinv_ic / _victim_dc_ic with
+    //      caches ON, within ~100 cycles, once the harnesses wire `icMaintFlush`).
+    //   2. `ftqFlush`: the FTQ entries and `targetHoldValid` describing the DISCARDED
+    //      stream survived the flush, so the next command could be steered to a held
+    //      target from that stream and a stale `brPc` could clamp `availEff` or claim a
+    //      confirm against the re-fetched stream.
+    //   3. `ftbBlocked`: an FTB plan could still be APPLIED on the flush cycle, truncating
+    //      a ring window and pushing an FTQ entry for bytes that are being thrown away.
+    // Folding it into the existing terms (rather than adding a parallel decision tree) is
+    // what keeps all four consistent by construction.
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
-                            mispredictRedirect.valid || predictFire || ftqMismatch
+                            mispredictRedirect.valid || predictFire || ftqMismatch ||
+                            icMaintFlush
 
     // Join the two fixed-C+1 lookup results. A command which is born stale still launches
     // the I-cache request (its response must drain), but it cannot use a read-only fetch
@@ -419,7 +443,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
     // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
     // bound. The delayed issue/stale state below remains an assertion oracle.
-    val issueBornStale = redirect.valid || mispredictRedirect.valid
+    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlush
     val planLookupFire = ic.cmd.fire && !issueBornStale
     val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
     val resultExpectedValid = RegNext(planLookupFire) init False
@@ -499,7 +523,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // rejected at elaboration or given a separately pipelined reservation mechanism.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
                      quiesce || stalled || faultHold || ftbSuppress ||
-                     targetHoldValid
+                     targetHoldValid || icMaintFlush
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
                             !(resultInWindow && resultAfterDrop)
@@ -579,7 +603,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // application is intentionally absent from this flush term: it truncates one live
     // ring window and appends its target without invalidating any older bytes.
     ftqFlush := redirect.valid || (resume.valid && stalled) ||
-                mispredictRedirect.valid || predictFire || ftqMismatch
+                mispredictRedirect.valid || predictFire || ftqMismatch ||
+                icMaintFlush
 
     when(applyNow && (predictFire || ftqMismatch || mispredictRedirect.valid)) {
       assert(ftqFlush && redirectThisCycle,
@@ -1277,7 +1302,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       predictTargetReg := predTargetSel
     }
     val predictDetectBlocked = redirect.valid || (resume.valid && stalled) ||
-                               mispredictRedirect.valid || ftqMismatchDetect
+                               mispredictRedirect.valid || ftqMismatchDetect ||
+                               icMaintFlush
     when(predictDetectBlocked) {
       predictPending := False
     }
@@ -1294,11 +1320,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // An architectural redirect on the detector edge already discards the malformed
     // plan, so it cancels the pending action. A same-cycle fallback detector is itself
     // canceled above: the registered mismatch action owns the next cycle.
-    when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid) {
+    when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
+         icMaintFlush) {
       ftqMismatchPending := False
     }
     val ftqMismatchDetectKept = ftqMismatchDetect &&
-      !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid)
+      !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
+        icMaintFlush)
     val ftqMismatchDetectKeptD = RegNext(ftqMismatchDetectKept) init False
     when(ftqMismatch) {
       assert(ftqMismatchDetectKeptD,
@@ -1546,7 +1574,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbSuppress := True
     }
     when(redirect.valid || (resume.valid && stalled) ||
-         mispredictRedirect.valid || predictFire) {
+         mispredictRedirect.valid || predictFire || icMaintFlush) {
       ftbSuppress := False
     }
 
