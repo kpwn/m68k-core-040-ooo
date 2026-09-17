@@ -204,7 +204,26 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // stale entries surviving a root write, and the architecture explicitly does not
     // permit that dependence -- there is no conforming program this can break.
     val rootWrite     = ctrl.setSrp.valid || ctrl.setUrp.valid
-    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange || rootWrite
+    // A TTR WRITE WITHDRAWS ANY PENDING RESPONSE (owner rule, 2026-09-17).
+    //
+    // TTRs do NOT leave stale ATC entries -- a transparent hit is checked BEFORE the
+    // array and never fills it, so covering a region cannot be shadowed by an old
+    // entry and uncovering one cannot expose an entry that was never created. The
+    // hazard is the REGISTERED RESPONSE, the same shape as the TC.E case: the response
+    // mux picks its arm at `_req.fire` and latches `{ppn, cacheMode}`. A TTR write
+    // before that payload is consumed leaves either
+    //   * a STALE CACHE MODE -- an access marked cacheable when the new TTR says
+    //     inhibited. That is the exact shape of the DAFB MMIO bug documented at
+    //     `ttHit` above: a burst refill issued against an AXI-lite-only slave, which
+    //     SLVERRs every beat; or
+    //   * a STALE ARM -- "TTR hit, PA = VA" for a region the new TTR no longer covers,
+    //     which should have gone to the tables. A real mistranslation.
+    //
+    // Only THIS side's pair is watched: a D-side response's cache mode comes from
+    // DTT0/DTT1 and an I-side's from ITT0/ITT1, so gating on the other pair would only
+    // add flushes that cannot fix anything.
+    val ttrWrite      = ctrl.setItt0.valid || ctrl.setItt1.valid
+    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange || rootWrite || ttrWrite
     // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
     // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
     // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root
