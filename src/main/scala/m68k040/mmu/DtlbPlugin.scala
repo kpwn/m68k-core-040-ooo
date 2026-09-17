@@ -507,15 +507,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // PFLUSHA clears the response slot and prevents a pre-flush in-flight walk from
     // refilling the just-invalidated ATC. Branch/exception flush may retain a
     // speculative resident fill; the tagged response is discarded by the LSU epoch.
+    // The flush-poison ARM condition, named ONCE so the debug probe below cannot
+    // drift from the behaviour it claims to report (`OFF_MMU_DPOISON_COUNT`).
+    // Identical to the `elsewhen(missPending)` arm it replaces: a PFLUSHA landing
+    // on a walk that has already LAUNCHED (the `missReqReg.valid` pre-launch case
+    // is killed outright instead, one line down).
+    val flushPoisonArm = atcFlush && missPending && !missReqReg.valid
+    flushPoisonArm.simPublic()
     when(atcFlush) {
       rspValid := False
       when(missReqReg.valid) {
         missReqReg.valid := False
         missPending      := False
-      } elsewhen(missPending) {
-        walkFlushPoison := True
       }
     }
+    when(flushPoisonArm) { walkFlushPoison := True }
     // A speculative resident translation may still fill after a backend squash,
     // but its architectural deferred U/M write belongs to the killed ROB entry and
     // must never be allocated after the one-cycle flush pulse has passed.

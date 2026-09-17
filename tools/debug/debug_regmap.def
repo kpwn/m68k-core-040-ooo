@@ -171,6 +171,50 @@ REG OFF_STALL_DC          0x0101C RO    2 0x00000000 D-cache dcIdleForMaint term
 REG OFF_STALL_GRANT       0x01020 RO    2 0x00000000 D-cache port ownership and walker grant machine.
 REG OFF_STALL_EXC         0x01024 RO    2 0x00000000 ExceptionUnit FSM one-hot and its drain predicates.
 REG OFF_STALL_WALK        0x01028 RO    2 0x00000000 TableWalker FSMs: DTLB in [15:0], ITLB in [31:16].
+# 2026-09-14 AxiDMerge post-mortem: which DIRECTION wedged and which OWNER held
+# the grant. A bare ARBITER_WEDGE halt cannot say, and every owner is typically
+# idle by the time the halt is read.
+# ⚠ THIS RECORD WAS MISSING (2026-09-17). `OFF_STALL_ARB` was hand-added to the
+# GENERATED `DebugRegMap.scala` and never to this file, so `gen_debug_regmap.py
+# --check` was already RED at 773ea391 and a regeneration would have DELETED the
+# constant and broken `DebugCtrlPlugin.scala`'s `is(DebugRegMap.OFF_STALL_ARB)`
+# read arm. Restored here at its deployed offset; no offset moves.
+REG OFF_STALL_ARB         0x0102C RO    2 0x00000000 AxiDMerge post-mortem: wedged direction and grant owner.
+
+# ---------------------------------------------- MMU translation-key probes --
+# WHY THESE EXIST. Two defects found on 2026-09-17 both produce the same thing:
+# a correct virtual address translated to the WRONG physical page, delivered as
+# a CLEAN ONE-HOT ATC hit with no fault -- so the multi-hot fail-safe and the
+# duplicate-fill tripwire are both blind to them, and nothing in the existing
+# register set can say whether either mechanism fired on a given boot.
+#
+#   (1) TCR.P RE-KEYING. `Dtlb/ItlbPlugin.tlbKey` derives the ATC array key from
+#       the LIVE TCR.P while a resident entry's key came from the TCR.P at ITS
+#       fill; a TCR.P change re-interprets every resident key (a 4 KB entry for
+#       VPN v becomes a one-hot match for the 8 KB lookup of VPN 2v, i.e. VA*2).
+#   (2) PFLUSHA-DURING-WALK. A walk already in flight when PFLUSHA retires used
+#       to complete and install its PRE-FLUSH translation (I-side; the D-side
+#       already had `walkFlushPoison`). That is the ROM's `_SwapMMUMode` shape,
+#       and under A/UX it is every context switch.
+#
+# Both are fixed, but the probes stay: they are the only way to say whether the
+# preconditions occur AT ALL on a given boot, and a zero here is a real answer
+# (with the PRESENT bits below proving it is not a dead probe).
+#
+# LIFETIME: `CsrArea` runs in `dbgCd`, whose reset is the debug POR, NOT the
+# socket reset this block can request -- so these survive a CPU/VIO reset and
+# clear only on debug POR or an explicit OFF_MMU_PROBE_CTL write. That is
+# deliberate: a warm reset must not silently erase the evidence of the boot that
+# went wrong. Clear them at the START of a trial so the trial reports its own
+# window.
+#
+# A concurrent event WINS over a concurrent clear (clear is applied first, the
+# set second), so evidence is never silently lost by a badly timed poll.
+REG OFF_MMU_PROBE_STATUS  0x0104C RO    2 0x00000000 Sticky MMU translation-key probe bits; see the bit list in DebugCtrlPlugin.
+REG OFF_MMU_REKEY_COUNT   0x01050 RO    2 0x00000000 Saturating count of TCR.P changes that re-keyed the ATC.
+REG OFF_MMU_IPOISON_COUNT 0x01054 RO    2 0x00000000 Saturating count of PFLUSHA-on-in-flight-walk events, I side.
+REG OFF_MMU_DPOISON_COUNT 0x01058 RO    2 0x00000000 Saturating count of PFLUSHA-on-in-flight-walk events, D side.
+REG OFF_MMU_PROBE_CTL     0x0105C W1P   2 0x00000000 Write bit0 clears the four registers above. Reads zero.
 
 # ------------------------------------------- architectural write shadows --
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.

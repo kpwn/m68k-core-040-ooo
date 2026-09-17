@@ -119,10 +119,12 @@ object DebugRegMap {
   val OFF_STALL_GRANT: Int = 0x01020
   val OFF_STALL_EXC: Int = 0x01024
   val OFF_STALL_WALK: Int = 0x01028
-  /** AxiDMerge post-mortem: which DIRECTION wedged and which OWNER held the grant.
-    * A bare ARBITER_WEDGE halt cannot say, and every owner is typically idle by the
-    * time the halt is read (measured 2026-09-14). */
   val OFF_STALL_ARB: Int = 0x0102C
+  val OFF_MMU_PROBE_STATUS: Int = 0x0104C
+  val OFF_MMU_REKEY_COUNT: Int = 0x01050
+  val OFF_MMU_IPOISON_COUNT: Int = 0x01054
+  val OFF_MMU_DPOISON_COUNT: Int = 0x01058
+  val OFF_MMU_PROBE_CTL: Int = 0x0105C
   val OFF_ARCH_D0: Int = 0x02000
   val OFF_ARCH_D1: Int = 0x02004
   val OFF_ARCH_D2: Int = 0x02008
@@ -315,6 +317,12 @@ object DebugRegMap {
     ("OFF_STALL_GRANT", 0x01020),
     ("OFF_STALL_EXC", 0x01024),
     ("OFF_STALL_WALK", 0x01028),
+    ("OFF_STALL_ARB", 0x0102C),
+    ("OFF_MMU_PROBE_STATUS", 0x0104C),
+    ("OFF_MMU_REKEY_COUNT", 0x01050),
+    ("OFF_MMU_IPOISON_COUNT", 0x01054),
+    ("OFF_MMU_DPOISON_COUNT", 0x01058),
+    ("OFF_MMU_PROBE_CTL", 0x0105C),
     ("OFF_ARCH_D0", 0x02000),
     ("OFF_ARCH_D1", 0x02004),
     ("OFF_ARCH_D2", 0x02008),

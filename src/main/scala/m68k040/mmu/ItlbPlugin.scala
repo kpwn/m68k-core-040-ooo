@@ -431,13 +431,16 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     }
     // PFLUSHA: the TLB array is cleared combinationally via tlb.io.invalidateAll above;
     // the 1-entry walk-result latch needs its own explicit clear (see DtlbPlugin).
+    // The flush-poison ARM condition, named ONCE so the debug probe that counts it
+    // (`OFF_MMU_IPOISON_COUNT`) cannot drift from the behaviour it reports.
+    val flushPoisonArm = atcFlush && missPending
+    flushPoisonArm.simPublic()
     when(atcFlush) {
       latchValid := False
-      // ...and mark any walk that is ALREADY in flight, so its late completion cannot
-      // refill the array/latch it was just cleared out of (DtlbPlugin's identical
-      // `elsewhen(missPending) { walkFlushPoison := True }`).
-      when(missPending) { walkFlushPoison := True }
     }
+    // ...and mark any walk that is ALREADY in flight, so its late completion cannot
+    // refill the array/latch it was just cleared out of (DtlbPlugin's identical arm).
+    when(flushPoisonArm) { walkFlushPoison := True }
 
     // ---- deferred U descriptor-write queue (U-only on fetch; drained at commit) ----
     // A non-faulting walk that needs to set U pushes {robId, addr, newByte}; the

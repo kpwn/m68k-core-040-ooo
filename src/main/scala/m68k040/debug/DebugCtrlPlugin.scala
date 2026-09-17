@@ -464,6 +464,101 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         val itlbBits = stallItlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
         RegNext(itlbBits ## dtlbBits) init B(0, 32 bits)
       } else B(0, 32 bits)
+      // ── MMU translation-key probes (OFF_MMU_PROBE_STATUS/_*_COUNT/_CTL) ──────────
+      // See `tools/debug/debug_regmap.def` for WHY these exist. Two defects fixed on
+      // 2026-09-17 both produce a correct VA translated to the wrong physical page as a
+      // CLEAN ONE-HOT ATC hit with no fault, invisible to the multi-hot fail-safe:
+      //   * a TCR.P change re-keying every resident entry (`pageSizeRekey`), and
+      //   * a PFLUSHA landing on an already-launched table walk (`flushPoisonArm`),
+      //     which under A/UX is every context switch, not the ROM's occasional
+      //     `_SwapMMUMode`.
+      // These probes answer the only question the fixes leave open: do the
+      // preconditions occur at all on a given boot?
+      //
+      // NOT A CLOCK CROSSING. `dbgCd` is `coreCd.clock` with a different RESET and is
+      // `setSynchronousWith(coreCd)` (see above), so a one-cycle core-domain pulse is
+      // captured on the same edge. That is why a 1-cycle event cannot be missed here
+      // the way it would be across a real CDC.
+      //
+      // EVERY producer is registered ONCE before it feeds a counter, exactly like the
+      // five stall packs above: the only new load on `pageSizeRekey` / `flushPoisonArm`
+      // is one flop D-input, and the counters' carry chains start from a flop and end
+      // in the read mux. Nothing is added to the ATC lookup cone.
+      val mmuRekeyDPulse  = stallDtlb.map(d => RegNext(d.logic.pageSizeRekey) init False)
+                                     .getOrElse(False)
+      val mmuRekeyIPulse  = stallItlb.map(i => RegNext(i.logic.pageSizeRekey) init False)
+                                     .getOrElse(False)
+      val mmuPoisonDPulse = stallDtlb.map(d => RegNext(d.logic.flushPoisonArm) init False)
+                                     .getOrElse(False)
+      val mmuPoisonIPulse = stallItlb.map(i => RegNext(i.logic.flushPoisonArm) init False)
+                                     .getOrElse(False)
+
+      // Sticky latches + saturating counts. Cleared ONLY by a write to
+      // OFF_MMU_PROBE_CTL bit 0 (`mmuProbeClear`, driven from the WRITE decode -- see
+      // the `when(doWrite)` switch, NOT from any read arm) or by the debug POR.
+      //
+      // A concurrent event WINS over a concurrent clear: the clear is assigned first
+      // and the set second, so SpinalHDL's last-assignment-wins leaves the bit set.
+      // Evidence is never silently lost by a badly-timed poll.
+      // Declared and defaulted HERE, driven True only from the write switch far below.
+      // Reading it above its conditional assignment is fine -- this is a netlist, not a
+      // program -- and it keeps the clear's single driver inside `when(doWrite)`.
+      val mmuProbeClear    = Bool(); mmuProbeClear := False; mmuProbeClear.simPublic()
+      val mmuRekeyStickyD  = RegInit(False); mmuRekeyStickyD.simPublic()
+      val mmuRekeyStickyI  = RegInit(False); mmuRekeyStickyI.simPublic()
+      val mmuPoisonStickyD = RegInit(False); mmuPoisonStickyD.simPublic()
+      val mmuPoisonStickyI = RegInit(False); mmuPoisonStickyI.simPublic()
+      val mmuRekeyCount    = Reg(UInt(32 bits)) init 0; mmuRekeyCount.simPublic()
+      val mmuPoisonCountD  = Reg(UInt(32 bits)) init 0; mmuPoisonCountD.simPublic()
+      val mmuPoisonCountI  = Reg(UInt(32 bits)) init 0; mmuPoisonCountI.simPublic()
+      /** Saturate rather than wrap: a wrapped counter reading 0 is indistinguishable
+        * from "never happened", which is the exact reading this probe exists to make
+        * trustworthy. */
+      def mmuSatInc(c: UInt, en: Bool): Unit =
+        when(en && !c.andR) { c := c + 1 }
+      when(mmuProbeClear) {
+        mmuRekeyStickyD  := False; mmuRekeyStickyI  := False
+        mmuPoisonStickyD := False; mmuPoisonStickyI := False
+        mmuRekeyCount    := 0
+        mmuPoisonCountD  := 0
+        mmuPoisonCountI  := 0
+      }
+      when(mmuRekeyDPulse)  { mmuRekeyStickyD  := True }
+      when(mmuRekeyIPulse)  { mmuRekeyStickyI  := True }
+      when(mmuPoisonDPulse) { mmuPoisonStickyD := True }
+      when(mmuPoisonIPulse) { mmuPoisonStickyI := True }
+      // One TCR.P change pulses BOTH plugins in the same cycle; count it ONCE.
+      mmuSatInc(mmuRekeyCount,   mmuRekeyDPulse || mmuRekeyIPulse)
+      mmuSatInc(mmuPoisonCountD, mmuPoisonDPulse)
+      mmuSatInc(mmuPoisonCountI, mmuPoisonIPulse)
+
+      /** OFF_MMU_PROBE_STATUS.
+        *
+        *   [0] sticky: a TCR.P change re-keyed the D-side ATC
+        *   [1] sticky: a TCR.P change re-keyed the I-side ATC
+        *   [2] sticky: a PFLUSHA armed the I-side walk-flush poison
+        *   [3] sticky: a PFLUSHA armed the D-side walk-flush poison
+        *   [4] live TCR.P (1 = 8 KB pages)
+        *   [5] live TC.E (paged translation enabled)
+        *   [8] D-side probe PRESENT (a DtlbPlugin is hosted in this build)
+        *   [9] I-side probe PRESENT (an ItlbPlugin is hosted in this build)
+        *
+        * Bits 8/9 are the DEAD-PROBE GUARD and are the reason this register is worth
+        * reading when it is otherwise zero. This project has a history of registers
+        * that read zero and lie -- `pc_live`, `exc_count` before it was served,
+        * `MISPRED`/`FLUSH`, `wedge-status`. With bits 8/9 set, a zero in [3:0] is a
+        * MEASUREMENT ("these mechanisms did not fire"); with them clear it is an
+        * absence of evidence ("this build has no MMU to probe"), and the two can no
+        * longer be confused. */
+      val mmuProbeStatus: Bits =
+        B(0, 22 bits) ##
+        Bool(stallItlb.nonEmpty) ## Bool(stallDtlb.nonEmpty) ##   // [9] [8]
+        B(0, 2 bits) ##                                           // [7:6]
+        stallDtlb.map(_.logic.mmuEnable).getOrElse(False) ##       // [5]
+        stallDtlb.map(_.logic.is8K).getOrElse(False) ##            // [4]
+        mmuPoisonStickyD ## mmuPoisonStickyI ##                    // [3] [2]
+        mmuRekeyStickyI ## mmuRekeyStickyD                         // [1] [0]
+
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadPcOdd = if (historyBuilt) RegInit(False) else False
@@ -1263,6 +1358,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_STALL_GRANT) { rdCount := stallGrantPackReg }
           is(DebugRegMap.OFF_STALL_EXC)   { rdCount := stallExcPackReg }
           is(DebugRegMap.OFF_STALL_WALK)  { rdCount := stallWalkPackReg }
+          // ── MMU translation-key probes (live; no halt required) ───────────────
+          // OFF_MMU_PROBE_CTL is WRITE-ONLY (W1P) and deliberately has NO read arm:
+          // it reads back as zero from the region default, which is what the map
+          // promises. Its clear is decoded in the WRITE switch below -- putting a
+          // clear in a read switch elaborates cleanly, reads back perfectly and does
+          // nothing, which is the exact trap this comment exists to flag.
+          is(DebugRegMap.OFF_MMU_PROBE_STATUS)  { rdCount := mmuProbeStatus }
+          is(DebugRegMap.OFF_MMU_REKEY_COUNT)   { rdCount := mmuRekeyCount.asBits }
+          is(DebugRegMap.OFF_MMU_IPOISON_COUNT) { rdCount := mmuPoisonCountI.asBits }
+          is(DebugRegMap.OFF_MMU_DPOISON_COUNT) { rdCount := mmuPoisonCountD.asBits }
         }
 
         // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
@@ -1440,6 +1545,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               cfgWipe := wData(0)
               when(wData(1)) { cpuResetCount := U(0, 16 bits) }
             }
+          }
+          // OFF_MMU_PROBE_CTL: W1P clear for the four MMU translation-key probe
+          // registers. THIS IS THE WRITE SWITCH (`when(doWrite) { switch(awAddr) ... }`)
+          // -- the clear has to be here and nowhere else.
+          is(DebugRegMap.OFF_MMU_PROBE_CTL) {
+            when(wStrb(0) && wData(0)) { mmuProbeClear := True }
           }
           for (i <- 0 until 8) {
             is(DebugRegMap.OFF_ARCH_D0 + i * 4) { writeArch(i) }
