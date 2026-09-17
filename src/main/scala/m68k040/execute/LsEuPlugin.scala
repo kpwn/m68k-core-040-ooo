@@ -1445,9 +1445,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // a documented encoding is not something a perf refactor gets to change silently.
     dcache.loadCmd.payload.token := Mux(
       useSplitCmd,
-      m68k040.Global.robTag(False ## llReg.bDone, llReg.robId, m68k040.cache.DLoadToken.Width),
+      m68k040.Global.robTag(False ## llReg.bDone, llReg.robId, m68k040.cache.DLoadToken.Width,
+                            m68k040.cache.DLoadToken.RobIdBits),
       m68k040.Global.robTag(False ## (alignedCmd.twoAccess && alignedCmd.splitSecond),
-       alignedCmd.bk.robId, m68k040.cache.DLoadToken.Width))
+       alignedCmd.bk.robId, m68k040.cache.DLoadToken.Width, m68k040.cache.DLoadToken.RobIdBits))
     // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`): BOTH halves of a
     // cross-line split pair consume `loadRsp.line`, never `loadRsp.data` -- slot A is
     // deliberately presented at the ORIGINAL crossing offset/size. Flagging them here
@@ -1603,7 +1604,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val reqDrvWrite  = Mux(reqFromSplit,
       txCtx.memOp === MemOp.STORE, tCtx.memOp === MemOp.STORE)
     val reqDrvRobId  = Mux(reqFromSplit, txCtx.robId, tCtx.robId)
-    val reqDrvToken  = m68k040.Global.robTag(xlateEpoch ## reqFromSplit, reqDrvRobId, DTranslationToken.Width)
+    val reqDrvToken  = m68k040.Global.robTag(xlateEpoch ## reqFromSplit, reqDrvRobId, DTranslationToken.Width,
+                                                DTranslationToken.RobIdBits)
     val tIsLoad  = tCtx.memOp === MemOp.LOAD
     val tIsStore = tCtx.memOp === MemOp.STORE
     val tIsMem   = tIsLoad || tIsStore
@@ -1649,7 +1651,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val probeCancelToken = UInt(m68k040.cache.DLoadToken.Width bits)
     probeCancel := False
     probeCancelToken := U(0, m68k040.cache.DLoadToken.Width bits)
-    val reqProbeToken = m68k040.Global.robTag(False ## False, tCtx.robId, m68k040.cache.DLoadToken.Width)
+    val reqProbeToken = m68k040.Global.robTag(False ## False, tCtx.robId, m68k040.cache.DLoadToken.Width,
+                                              m68k040.cache.DLoadToken.RobIdBits)
 
     dcache.loadProbe.valid         := probeWanted && xlate.req.ready
     dcache.loadProbe.payload.vaddr := tCtx.vaddr
@@ -2720,7 +2723,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // concrete downstream resource is unable to consume; accept-last turnover keeps
     // a resident same-page aligned stream at II=1 after fill.
     def cancelProbeFor(robId: UInt): Unit = {
-      val token = m68k040.Global.robTag(False ## False, robId, m68k040.cache.DLoadToken.Width)
+      val token = m68k040.Global.robTag(False ## False, robId, m68k040.cache.DLoadToken.Width,
+                                        m68k040.cache.DLoadToken.RobIdBits)
       probeCancel      := True
       probeCancelToken := token
     }
@@ -3070,7 +3074,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     dcache.loadProbeResolve.valid := txRspFire && !xlateFault && !txSecond &&
                                      (txCtx.memOp === MemOp.LOAD) && !txCtx.twoAccess
     dcache.loadProbeResolve.payload.token :=
-      m68k040.Global.robTag(False ## False, txCtx.robId, m68k040.cache.DLoadToken.Width)
+      m68k040.Global.robTag(False ## False, txCtx.robId, m68k040.cache.DLoadToken.Width,
+                            m68k040.cache.DLoadToken.RobIdBits)
     dcache.loadProbeResolve.payload.paddr := s1Paddr
     dcache.loadProbeResolve.payload.cacheMode := txEffectiveCmode
 
