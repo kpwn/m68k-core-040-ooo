@@ -123,6 +123,36 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
     val is8K      = ctrl.pageSize8K
+
+    // ── TCR.P RE-KEYING: the ATC must be INVALIDATED when the page size changes ──
+    // `tlbKey` below derives the ATC array key from the LIVE TCR.P, while the key a
+    // resident entry was FILED under came from the TCR.P in force at ITS fill
+    // (`tlbKeyOf(walkVpn, walkIs8K)`). Nothing in the tag records which page size
+    // that was, so a TCR.P change silently RE-INTERPRETS every resident key: an
+    // entry filled at 4 KB under key `v` becomes a CLEAN ONE-HOT match for the 8 KB
+    // lookup of VPN 2v (VA*2) -- an architecturally different page answered with the
+    // wrong PPN and NO fault. Because the hit is one-hot, the duplicate-fill
+    // tripwire (`Tlb.dbgHitCount`) and the multi-hot fail-safe cannot see it.
+    // Reproduced in both directions by `TlbPageSizeRekeySpec` (walker reads = 0,
+    // hitVec popcount = 1, fault = false).
+    //
+    // The MC68040 UM requires software to PFLUSH after writing TC and the Q700 ROM
+    // does exactly that -- but the hardware must not answer confidently wrong when
+    // software omits it, and this implementation's aliasing is far more violent than
+    // real silicon's (which masks A12 in the comparison, so a stale entry can only
+    // mistranslate WITHIN the same 8 KB region; the shifted key aliases VA to VA*2).
+    // Invalidate the whole ATC in the SAME cycle the key changes, driven from
+    // MmuControl's commit-time TC write port, so the array is already empty on the
+    // first cycle the new key is in force and there is no window at all.
+    //
+    // COST: NOT on the lookup path. `atcFlush` ORs one term into `invalidateAll`
+    // (the valid-bit clear enable) and into `_req.ready` -- both already carry
+    // `flushAll` from PFLUSHA -- and the term itself is one XNOR off an existing
+    // commit-time signal. No tag bit, no comparator widening, no extra way-mux
+    // level, zero added depth on the hit cone.
+    val pageSizeRekey = ctrl.setPageSize.valid && (ctrl.setPageSize.payload =/= ctrl.pageSize8K)
+    val atcFlush      = flushAll || pageSizeRekey
+    pageSizeRekey.simPublic()
     val urp       = ctrl.urp
     val srp       = ctrl.srp
     val itt0      = ctrl.itt0
@@ -174,7 +204,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // MOVES), but the bit must still be tagged: a supervisor fetch and a user fetch of
     // one virtual page are different translations whenever URP =/= SRP.
     tlb.io.lookupSup := _req.supervisor
-    tlb.io.invalidateAll := flushAll
+    tlb.io.invalidateAll := atcFlush
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
@@ -341,7 +371,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       // here -- that residual gap is pre-existing on this walk-completion path
       // (the sibling `latchValid` handling below has the identical same-cycle-only
       // limitation already) and is out of scope for this fix).
-      when(!walker.io.rsp.fault && !walkUmPoison && !flushAll) {
+      when(!walker.io.rsp.fault && !walkUmPoison && !atcFlush) {
         tlb.io.fillValid := True
       }
     }
@@ -373,7 +403,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     }
     // PFLUSHA: the TLB array is cleared combinationally via tlb.io.invalidateAll above;
     // the 1-entry walk-result latch needs its own explicit clear (see DtlbPlugin).
-    when(flushAll) {
+    when(atcFlush) {
       latchValid := False
     }
 
@@ -392,7 +422,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // at `walkUmPoison`'s declaration above for the full spurious-write mechanism
     // this was producing.
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
-                                  !walker.io.rsp.fault && !walkUmPoison && !flushAll
+                                  !walker.io.rsp.fault && !walkUmPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte

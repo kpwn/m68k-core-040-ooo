@@ -129,6 +129,36 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val ctrl = host[MmuControlService]
     val mmuEnable = ctrl.mmuEnable
     val is8K      = ctrl.pageSize8K
+
+    // ── TCR.P RE-KEYING: the ATC must be INVALIDATED when the page size changes ──
+    // `tlbKey` below derives the ATC array key from the LIVE TCR.P, while the key a
+    // resident entry was FILED under came from the TCR.P in force at ITS fill
+    // (`tlbKeyOf(walkVpn, walkIs8K)`). Nothing in the tag records which page size
+    // that was, so a TCR.P change silently RE-INTERPRETS every resident key: an
+    // entry filled at 4 KB under key `v` becomes a CLEAN ONE-HOT match for the 8 KB
+    // lookup of VPN 2v (VA*2) -- an architecturally different page answered with the
+    // wrong PPN and NO fault. Because the hit is one-hot, the duplicate-fill
+    // tripwire (`Tlb.dbgHitCount`) and the multi-hot fail-safe cannot see it.
+    // Reproduced in both directions by `TlbPageSizeRekeySpec` (walker reads = 0,
+    // hitVec popcount = 1, fault = false).
+    //
+    // The MC68040 UM requires software to PFLUSH after writing TC and the Q700 ROM
+    // does exactly that -- but the hardware must not answer confidently wrong when
+    // software omits it, and this implementation's aliasing is far more violent than
+    // real silicon's (which masks A12 in the comparison, so a stale entry can only
+    // mistranslate WITHIN the same 8 KB region; the shifted key aliases VA to VA*2).
+    // Invalidate the whole ATC in the SAME cycle the key changes, driven from
+    // MmuControl's commit-time TC write port, so the array is already empty on the
+    // first cycle the new key is in force and there is no window at all.
+    //
+    // COST: NOT on the lookup path. `atcFlush` ORs one term into `invalidateAll`
+    // (the valid-bit clear enable) and into `_req.ready` -- both already carry
+    // `flushAll` from PFLUSHA -- and the term itself is one XNOR off an existing
+    // commit-time signal. No tag bit, no comparator widening, no extra way-mux
+    // level, zero added depth on the hit cone.
+    val pageSizeRekey = ctrl.setPageSize.valid && (ctrl.setPageSize.payload =/= ctrl.pageSize8K)
+    val atcFlush      = flushAll || pageSizeRekey
+    pageSizeRekey.simPublic()
     val urp       = ctrl.urp
     val srp       = ctrl.srp
     val dtt0      = ctrl.dtt0
@@ -215,7 +245,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // privilege level -- so a user-space and a supervisor-space translation of one
     // virtual page coexist instead of overwriting each other's answer.
     tlb.io.lookupSup := _req.payload.supervisor
-    tlb.io.invalidateAll := flushAll
+    tlb.io.invalidateAll := atcFlush
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
@@ -235,9 +265,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkUmPoison = RegInit(False)
     missPending.simPublic()
 
-    _rsp.valid   := rspValid && !flushAll
+    _rsp.valid   := rspValid && !atcFlush
     _rsp.payload := rspPayload
-    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !flushAll
+    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !atcFlush
 
     when(_rsp.fire) { rspValid := False }
 
@@ -373,7 +403,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     walker.io.req.isWrite := missReqReg.write
     walker.io.req.isSuper := missReqReg.sup
     walker.io.req.is8K    := missReqReg.is8K
-    walker.io.start       := missReqReg.valid && !umQueueFull && !flushAll
+    walker.io.start       := missReqReg.valid && !umQueueFull && !atcFlush
     when(walker.io.start) { missReqReg.valid := False }
 
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
@@ -417,7 +447,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     tlb.io.fillEntry := fe
     when(walker.io.done) {
       missPending := False
-      when(!walkFlushPoison && !flushAll) {
+      when(!walkFlushPoison && !atcFlush) {
         assert(!rspValid, "walker result collided with an occupied DTLB response")
         rspValid             := True
         rspPayload.ppn       := walker.io.rsp.ppn
@@ -456,7 +486,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // exactly the same real 3-level table search a first-time cold miss pays --
       // and that re-walk (assuming no second flush collision) will correctly queue
       // and, once its own instruction commits, drain BOTH U and M.
-      when(!walker.io.rsp.fault && !walkFlushPoison && !flushAll && !walkUmPoison) {
+      when(!walker.io.rsp.fault && !walkFlushPoison && !atcFlush && !walkUmPoison) {
         tlb.io.fillValid := True
       }
       // sim-only taps for the walker->TLB fill (see the `simPublic` block above).
@@ -471,13 +501,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val dbgWalkerRspFault  = walker.io.rsp.fault; dbgWalkerRspFault.simPublic()
     val dbgWalkFlushPoison = walkFlushPoison;     dbgWalkFlushPoison.simPublic()
     val dbgWalkUmPoison    = walkUmPoison;        dbgWalkUmPoison.simPublic()
-    val dbgFlushAll        = flushAll;            dbgFlushAll.simPublic()
+    val dbgFlushAll        = atcFlush;            dbgFlushAll.simPublic()
     val dbgWalkVpn         = walkVpn;             dbgWalkVpn.simPublic()
 
     // PFLUSHA clears the response slot and prevents a pre-flush in-flight walk from
     // refilling the just-invalidated ATC. Branch/exception flush may retain a
     // speculative resident fill; the tagged response is discarded by the LSU epoch.
-    when(flushAll) {
+    when(atcFlush) {
       rspValid := False
       when(missReqReg.valid) {
         missReqReg.valid := False
@@ -507,7 +537,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // argument and the monotonicity tripwire that replaces it.)
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
                                   !walker.io.rsp.fault && !walkUmPoison &&
-                                  !walkFlushPoison && !flushAll
+                                  !walkFlushPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
