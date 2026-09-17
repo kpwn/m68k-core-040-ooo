@@ -152,7 +152,31 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // commit-time signal. No tag bit, no comparator widening, no extra way-mux
     // level, zero added depth on the hit cone.
     val pageSizeRekey = ctrl.setPageSize.valid && (ctrl.setPageSize.payload =/= ctrl.pageSize8K)
-    val atcFlush      = flushAll || pageSizeRekey
+    // ── FOURTH INSTANCE OF THE SAME FAMILY (2026-09-17): TC.E ────────────────────
+    // The response mux below selects its arm at `_req.fire` -- `when(ttHit) ...
+    // elsewhen(!mmuEnable) ... elsewhen(tlbHit)` -- and REGISTERS the result. The
+    // chosen arm therefore records the `mmuEnable` of the CAPTURE cycle, while the
+    // consumer receives the payload one or more cycles later. A MOVEC to TC that
+    // clears TC.E in between leaves a TRANSLATED PA being delivered to an access that,
+    // by then, should be identity-mapped -- and that access is necessarily YOUNGER
+    // than the MOVEC, because MOVEC retires at the ROB head, so every older access has
+    // already completed.
+    //
+    // Masked today by the same incidental chain as the root case: the sysOp retire
+    // pulses a redirect that squashes younger ops. Nothing names it, nothing asserts
+    // it. `pageSizeRekey` already kills a pending response on a TC.P change (it feeds
+    // `atcFlush`, and the flush block clears `rspValid`); an E-only change did not.
+    //
+    // Deliberately a SEPARATE term from `pageSizeRekey` rather than folded into it:
+    // `pageSizeRekey` is what `OFF_MMU_REKEY_COUNT` counts, and that CSR means "TCR.P
+    // changed". Widening it would silently change what a hardware reading reports.
+    //
+    // COST: one XNOR into the existing OR. Same net, no new depth. Over-invalidating
+    // on an E toggle is free in practice -- the ROM toggles TC.E a handful of times in
+    // the whole boot.
+    val mmuEnableChange = ctrl.setEnable.valid && (ctrl.setEnable.payload =/= ctrl.mmuEnable)
+    mmuEnableChange.simPublic()
+    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange
     // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
     // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
     // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root
