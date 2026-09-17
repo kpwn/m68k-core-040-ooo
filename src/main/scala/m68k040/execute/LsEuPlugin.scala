@@ -2188,6 +2188,27 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedPoisoned(idxA) := sqFlushSig; alignedPoisoned(idxB) := sqFlushSig
       alignedPushPtr         := alignedPushPtr + 2
     }
+    // The selector is `push-kind ## response`. Every reachable combination has an arm:
+    // `alignedEnq` and `alignedEnqSplit` are mutually exclusive by construction (the
+    // `p4Front.twoAccess` if/else at the enqueue site), so 110/111 cannot occur, and 000
+    // correctly holds.
+    //
+    // 101 -- an ORDINARY push with a response in the same cycle -- was MISSING, and
+    // "missing" silently means "hold the register". For an ordinary pop that is right
+    // (+1 -1 = 0). For an `alignedRspAbortsPair` pop it is WRONG: an abort retires slot A
+    // AND slot B together, so the correct update is +1 -2 = -1 and the counter instead
+    // stayed put. `alignedCount` is then permanently one higher than the true occupancy,
+    // and since it is the ADMISSION gate (`alignedFull`/`alignedEmpty`/`alignedCanEnq`),
+    // four such coincidences pin `alignedFull` high on an EMPTY ring: `alignedRspFire`
+    // can never fire again (nothing valid to respond), `alignedCanEnq` is dead, no load is
+    // ever admitted again and the core silently stops retiring with every architectural
+    // register intact. Reproduced by `cpush_split_fault_ring_leak.s`; see that file.
+    //
+    // The ring ORDER is fine in this case and does not need fixing: with the ring full
+    // `alignedPushPtr === alignedRspPtr`, so the new descriptor lands on slot A's
+    // just-freed index, and `alignedRspPtr`/`alignedSendPtr` advancing to `alignedRspPtr+2`
+    // reaches it again after wrapping -- it is the correct, in-order next entry, not an
+    // orphan. Only the count was wrong.
     switch(alignedEnq ## alignedEnqSplit ## alignedRspFire) {
       is(B"100") { alignedCount := alignedCount + 1 }         // ordinary push only
       is(B"001") {                                             // response only
@@ -2197,6 +2218,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       is(B"011") {                                             // split-pair push + response
         alignedCount := Mux(alignedRspAbortsPair, alignedCount, alignedCount + 1)
       }
+      is(B"101") {                                             // ordinary push + response
+        alignedCount := Mux(alignedRspAbortsPair, alignedCount - 1, alignedCount)
+      }
+    }
+
+    // ── Sim-only ring-accounting tripwire (2026-09-17) ───────────────────────────
+    // `alignedCount` is a redundant encoding of `alignedValid`: it MUST equal the number
+    // of occupied ring slots on every cycle boundary. It is redundant because it is needed
+    // COMBINATIONALLY (`alignedFull`/`alignedEmpty`/`alignedCanEnq*` sit in the admission
+    // path and cannot afford a live popcount), and redundant state is exactly the state
+    // that desynchronises silently.
+    //
+    // The consequence of a desync is not a wrong value, it is a DEAD MACHINE, and the
+    // signature is indistinguishable from "it just froze" -- which is why this is asserted
+    // rather than left to be inferred from a hang. It is the invariant the switch above
+    // exists to maintain, so it is checked here rather than trusted.
+    GenerationFlags.simulation {
+      assert(alignedCount === CountOne(alignedValid).resize(alignedCount.getWidth),
+        "LsEuPlugin: alignedCount desynchronised from the aligned-ring occupancy " +
+        "(popcount of alignedValid). The counter gates admission (alignedFull / " +
+        "alignedEmpty / alignedCanEnq), so an over-count permanently removes ring " +
+        "capacity and an over-count of alignedDepth wedges load admission entirely.",
+        FAILURE)
     }
 
     // ── Precise-store deferred-completion replay (root-cause fix, post-P2.5
