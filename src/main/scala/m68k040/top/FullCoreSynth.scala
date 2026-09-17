@@ -472,10 +472,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     dtlb.umCommitId    := rob.logic.h0
     dtlb.umFlush       := doFlush
     // ── ITLB U deferred-write queue wiring (U-only; instruction fetch sets U not M) ──
-    // The fetch walk's U-descriptor write drains at retire (tagged robId 0; the U bit
-    // is idempotent / not architecturally compared) and discards on flush.
+    // The fetch walk's U-descriptor write is BORN COMMITTED: an instruction fetch is
+    // translated before rename, so it has no owning robId to wait for. There is no
+    // `itlb.umAccessRobId` any more -- it was hardwired to 0 here and at three other
+    // wiring sites, which made the write become architectural whenever whatever
+    // instruction happened to hold robId 0 retired. See `UmWriteAlloc.preCommitted`.
     val itlb = host[m68k040.mmu.ItlbPlugin]
-    itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
     itlb.umCommitValid := rob.logic.retire0
     itlb.umCommitBValid := rob.logic.retire1
     itlb.umCommitBId    := rob.logic.h1

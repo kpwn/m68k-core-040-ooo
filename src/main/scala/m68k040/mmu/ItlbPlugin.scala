@@ -62,7 +62,6 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _rsp = TranslationRsp()
     // U-write queue hooks (sibling-driven; default-idle in logic so a standalone DUT
     // that doesn't wire them still elaborates). Fetch sets U only.
-    umAccessRobId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid = Bool()
     umCommitId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid = Bool()
@@ -76,9 +75,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStoreErr = Bool()
   }
 
-  // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB;
-  // for the I-side these carry the fetching access's robId / commit / flush).
-  var umAccessRobId: UInt = null
+  // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB).
+  // NOTE there is deliberately NO `umAccessRobId` here, unlike the DTLB: an instruction
+  // fetch is translated before rename, so the walk it triggers has no owning robId to
+  // be tagged with. The I-side entry is born committed instead -- see
+  // `UmWriteAlloc.preCommitted`. The commit/flush hooks below are still real: `umFlush`
+  // discards a walk poisoned mid-flight, which is C6's guarantee and is unchanged.
   var umCommitValid: Bool = null
   var umCommitId:    UInt = null
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
@@ -111,7 +113,6 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore.payload.simPublic(); _walkStoreAck.simPublic()
 
     // U queue hooks default-idle (allowOverride) so a standalone DUT elaborates.
-    umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid.allowOverride; umCommitValid := False
     umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid.allowOverride; umCommitBValid := False
@@ -262,7 +263,6 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val vpn   = Reg(UInt(20 bits))
       val sup   = Reg(Bool())
       val is8K  = Reg(Bool())
-      val robId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     }
     // C6 fix: mirrors DtlbPlugin's `missPending`/`walkUmPoison` pair exactly, adapted
     // to this plugin's own walk-in-progress tracking (ItlbPlugin has no `missPending`
@@ -320,7 +320,6 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       missReqReg.vpn   := walkKey(_req.vpn)
       missReqReg.sup   := _req.supervisor
       missReqReg.is8K  := is8K
-      missReqReg.robId := umAccessRobId
       missPending      := True
       walkUmPoison     := False
     }
@@ -346,12 +345,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkIs8K = Reg(Bool())
     // ...and the address space it was launched in (the ATC's FC2 tag bit).
     val walkSup  = Reg(Bool())
-    val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     when(missReqReg.valid) {
       walkVpn   := missReqReg.vpn
       walkIs8K  := missReqReg.is8K
       walkSup   := missReqReg.sup
-      walkRobId := missReqReg.robId
     }
 
     // On walk completion: latch the result and (if no fault) fill the TLB.
@@ -433,6 +430,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // the 1-entry walk-result latch needs its own explicit clear (see DtlbPlugin).
     // The flush-poison ARM condition, named ONCE so the debug probe that counts it
     // (`OFF_MMU_IPOISON_COUNT`) cannot drift from the behaviour it reports.
+
     val flushPoisonArm = atcFlush && missPending
     flushPoisonArm.simPublic()
     when(atcFlush) {
@@ -459,7 +457,20 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !atcFlush
-    umq.io.alloc.payload.robId  := walkRobId
+    // NO OWNER EXISTS. An instruction fetch is translated before rename, so there is
+    // no robId to tag this with; the field is inert for a pre-committed entry (it is
+    // never compared, because the entry is already committed) and is driven to a
+    // constant only because the bundle has the field for the D side's sake.
+    //
+    // WHY BORN-COMMITTED IS A REPAIR AND NOT A SEMANTIC CHANGE: an I-fetch IS
+    // speculative, but U is MONOTONIC and ADVISORY, and today's code ALREADY PERFORMS
+    // THIS WRITE -- just at an arbitrary time, under an unrelated instruction's
+    // identity (robId 0, hardwired at every wiring site). Born-committed makes an
+    // existing write deterministic; it does not add a new architectural commitment.
+    // The page genuinely was fetched, and the ATC is filled on that same fetch, so
+    // marking it used is exactly what the access did.
+    umq.io.alloc.payload.robId  := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
+    umq.io.alloc.payload.preCommitted := True
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid

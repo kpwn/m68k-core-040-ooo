@@ -512,6 +512,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Identical to the `elsewhen(missPending)` arm it replaces: a PFLUSHA landing
     // on a walk that has already LAUNCHED (the `missReqReg.valid` pre-launch case
     // is killed outright instead, one line down).
+
     val flushPoisonArm = atcFlush && missPending && !missReqReg.valid
     flushPoisonArm.simPublic()
     when(atcFlush) {
@@ -545,6 +546,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
+    // The D side has a REAL owner: `umAccessRobId` is `lsEu.xlateRobId`, the robId of
+    // the access that triggered the walk. (The one D-side producer that does NOT is
+    // the ExceptionUnit's own write-walk; that site is converted separately.)
+    umq.io.alloc.payload.preCommitted := False
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid
