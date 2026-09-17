@@ -43,7 +43,7 @@ class DtlbCrossPageTracePlugin extends FiberPlugin {
 
     val cancelValid = out Bool ()
     val cancelAll   = out Bool ()
-    val cancelToken = out UInt (m68k040.cache.DTranslationToken.Width bits)
+    val cancelToken = out UInt (m68k040.cache.DLoadToken.Width bits)
     cancelValid := dcache.loadProbeCancel.valid
     cancelAll   := dcache.loadProbeCancel.payload.all
     cancelToken := dcache.loadProbeCancel.payload.token

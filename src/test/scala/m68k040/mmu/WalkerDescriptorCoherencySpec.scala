@@ -36,11 +36,11 @@ class WalkerCoherencyTracePlugin extends FiberPlugin {
     val dcache = host[DcacheService]
     val rspFire  = out Bool ();        rspFire  := xlate.rsp.fire
     val rspPpn   = out UInt (20 bits); rspPpn   := xlate.rsp.payload.ppn
-    val rspToken = out UInt (8 bits);  rspToken := xlate.rsp.payload.token
+    val rspToken = out UInt (m68k040.cache.DTranslationToken.Width bits);  rspToken := xlate.rsp.payload.token
     val rspFault = out Bool ();        rspFault := xlate.rsp.payload.fault
     val cmdFire  = out Bool ()
     cmdFire := dcache.loadCmd.valid && dcache.loadCmd.ready
-    val cmdToken = out UInt (8 bits);  cmdToken := dcache.loadCmd.payload.token
+    val cmdToken = out UInt (m68k040.cache.DLoadToken.Width bits);  cmdToken := dcache.loadCmd.payload.token
     val cmdPaddr = out UInt (32 bits); cmdPaddr := dcache.loadCmd.payload.paddr
     val stFire   = out Bool ()
     stFire := dcache.store.valid && dcache.store.ready
