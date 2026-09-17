@@ -390,6 +390,35 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     when(_rsp.fire) { rspValid := False }
 
+    // ── TRIPWIRE: NO MISS CAPTURE ON AN ATC-FLUSH CYCLE (race audit, 2026-09-18) ──
+    // `_req.ready`'s `&& !atcFlush` above is not only response-withdrawal: it is ALSO
+    // the D side's structural exclusion against capturing a miss in the same cycle an
+    // MMU control register is written. Nothing said so, and no test pinned it, so a
+    // future narrowing of that term for timing would silently reintroduce the ITLB
+    // defect fixed on 2026-09-18 on THIS side.
+    //
+    // THE SHAPE, if it were ever reopened. The capture arm below writes `missPending`
+    // and clears `walkFlushPoison`; `flushPoisonArm` reads `missPending` as a REGISTER,
+    // i.e. its PRE-capture value. A miss captured beside an `atcFlush` would therefore
+    // carry NO poison at all, while `missReqReg.is8K` and `walkKey(_req.payload.vpn)`
+    // hold the PRE-write TCR.P and `walker.io.req.rootPtr` reads the POST-write root at
+    // launch. The fill then files a result under a key form no later lookup produces --
+    // a one-hot ATC hit on the wrong physical page, with no fault, invisible to
+    // `Tlb.dbgHitCount`. That is `TlbPageSizeRekeySpec`'s defect through a one-cycle
+    // window, and it is exactly what `ItlbCaptureRaceSpec` measures on the I side.
+    //
+    // Assert the exclusion instead of trusting the reader to re-derive it. Zero
+    // hardware; pruned from every netlist.
+    GenerationFlags.simulation {
+      assert(!(_req.fire && atcFlush),
+        "DtlbPlugin: a translation request FIRED on an ATC-flush cycle. The capture arm " +
+        "clears walkFlushPoison while flushPoisonArm still reads the pre-capture " +
+        "missPending, so that walk carries no poison and installs a translation derived " +
+        "from the PRE-write TC/roots under a stale key form. `_req.ready` must keep its " +
+        "`&& !atcFlush` term -- see ItlbCaptureRaceSpec for the measured I-side twin.",
+        FAILURE)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the Dcache valids → walker cone).
     //
