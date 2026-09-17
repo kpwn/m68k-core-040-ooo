@@ -19,6 +19,7 @@ class DecodeUopInputPlugin extends FiberPlugin with DecodeUopService {
   override def uops: Stream[Vec[DecodedUop]] = uopsPort
   override def uop1Valid: Bool = uop1ValidReg
   override def pipeFlush: Bool = flushTie
+  override def backendFlush: Bool = flushTie   // no FP wide-imm table consumer in the backend-only synth host
   override def complexResume: Flow[UInt] = complexResumeTie
 
   during setup {

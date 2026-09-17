@@ -18,7 +18,7 @@ class IqSourcePlugin extends FiberPlugin {
 
     // Per-slot driving signals (k = 0, 1).
     case class SlotIo() {
-      val robId      = in UInt (6 bits)
+      val robId      = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val cluster    = in(m68k040.isa.Cluster())
       val memOp      = in(m68k040.isa.MemOp())
       val pdst       = in UInt (6 bits); val pdstValid  = in Bool ()
@@ -125,7 +125,7 @@ class IqSourcePlugin extends FiberPlugin {
       // dormant undriven fields perturbed `IqCplxSpec`/`IqAluSlowSpec` (unrelated
       // arbitration-timing tests, not exercising anything FP-specific) -- fixed here by
       // finally giving them the same safe-default treatment as every other post-hoc field.
-      u.fpuOp := 0; u.fpSrcKind := m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt := 0; u.fpWideImm := 0
+      u.fpuOp := 0; u.fpSrcKind := m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt := 0
       // Third source (DIV.L 64/32) + CPLX/div control + precise-fault fields: safe
       // defaults (these IQ tests don't exercise DIV/CHK/faults).
       u.psrcC        := 0; u.psrcCValid := False

@@ -154,6 +154,14 @@ class DcacheSpec extends AnyFunSuite {
     cd.forkStimulus(period = 10)
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
     dut.probe.logic.loadCmdIn.valid #= false
+    // 2026-09-14: pin the probe ports idle too, exactly as `initDut` does. An un-poked
+    // testbench input is NOT guaranteed 0 across seeds (the documented sim gotcha); a
+    // random-valid probe with a random offset/size trips the `DcacheByteLane.extract`
+    // line-wrap tripwire on whatever cycle the (now registered) admission credit
+    // happens to open. Surfaced by the probe-queue netlist change reshuffling the
+    // random-init stream; latent before it.
+    dut.probe.logic.loadProbeIn.valid #= false
+    dut.probe.logic.loadProbeCancelIn.valid #= false
     dut.probe.logic.storeIn.valid #= false
     // Task P5.4: pin the maintenance port idle (an un-poked testbench-driven input is
     // NOT guaranteed 0 across seeds/runs -- this project's documented sim gotcha).
@@ -2674,7 +2682,7 @@ class DcacheSpec extends AnyFunSuite {
       sleep(1)
       assert(dut.dcache.logic.useEarlyProbe.toBoolean,
         "B's token+VA must own a HIT VIPT result; queue=" +
-        (0 until 4).map { i =>
+        dut.dcache.logic.earlyProbeValids.indices.map { i =>
           s"$i:v=${dut.dcache.logic.earlyProbeValids(i).toBoolean}" +
           s",r=${dut.dcache.logic.earlyProbeReadies(i).toBoolean}" +
           s",h=${dut.dcache.logic.earlyProbeHits(i).toBoolean}" +
@@ -2732,7 +2740,7 @@ class DcacheSpec extends AnyFunSuite {
         dut.probe.logic.loadProbeIn.valid #= false
       }
       def probeReadyFor(token: Int): Boolean =
-        (0 until 4).exists { i =>
+        dut.dcache.logic.earlyProbeValids.indices.exists { i =>
           dut.dcache.logic.earlyProbeValids(i).toBoolean &&
           dut.dcache.logic.earlyProbeReadies(i).toBoolean &&
           dut.dcache.logic.earlyProbeTokens(i).toInt == token
@@ -2896,11 +2904,16 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
-  test("VIPT D2: four distinct probe results queue without aliasing and cancel-all releases them", VerilatorTest) {
+  test("VIPT D2: every probe-result queue entry fills without aliasing and cancel-all releases them", VerilatorTest) {
     sharedCompiled.doSim { dut =>
       val (cd, mem) = initDut(dut)
-      val addrs  = Seq(0x7200L, 0x7310L, 0x7420L, 0x7530L)
-      val tokens = Seq(0x40, 0x41, 0x42, 0x43)
+      // 2026-09-14: sized from the DUT, not hardcoded. The queue grew from four to
+      // five entries with the registered admission credit (see `earlyProbeDepth`); a
+      // hardcoded four here would have passed vacuously on a deeper queue or failed
+      // spuriously, exactly the stale-harness-constant trap this project keeps hitting.
+      val depth  = dut.dcache.logic.earlyProbeDepth
+      val addrs  = (0 until depth).map(i => 0x7200L + i * 0x110L)
+      val tokens = (0 until depth).map(i => 0x40 + i)
 
       for (i <- addrs.indices) {
         dut.probe.logic.loadProbeIn.valid #= true
@@ -2919,17 +2932,17 @@ class DcacheSpec extends AnyFunSuite {
         cd.waitSampling()
       }
 
-      // A fifth token proves the depth rather than merely observing four writes.
-      dut.probe.logic.loadProbeIn.payload.vaddr #= 0x7640L
-      dut.probe.logic.loadProbeIn.payload.token #= 0x44
+      // One token past the depth proves the depth rather than merely observing the writes.
+      dut.probe.logic.loadProbeIn.payload.vaddr #= 0x7200L + depth * 0x110L
+      dut.probe.logic.loadProbeIn.payload.token #= 0x40 + depth
       sleep(1)
       assert(!dut.probe.logic.loadProbeIn.ready.toBoolean,
-        "the four-entry probe-result queue must backpressure a fifth resident token")
-      assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == 4,
-        "all four queue entries must be physically resident")
+        s"the $depth-entry probe-result queue must backpressure one more resident token")
+      assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == depth,
+        s"all $depth queue entries must be physically resident")
       assert(dut.dcache.logic.earlyProbeTokens.zip(dut.dcache.logic.earlyProbeValids)
         .collect { case (t, v) if v.toBoolean => t.toInt }.toSet == tokens.toSet,
-        "free-slot selection must preserve four distinct tokens without aliasing")
+        s"free-slot selection must preserve $depth distinct tokens without aliasing")
 
       dut.probe.logic.loadProbeCancelIn.valid #= true
       dut.probe.logic.loadProbeCancelIn.payload.all #= true

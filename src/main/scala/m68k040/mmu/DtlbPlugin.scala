@@ -57,11 +57,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _rsp = Stream(DTranslationRsp())
     // U/M queue hooks (sibling-driven; default-idle in logic via allowOverride so a
     // standalone DUT that doesn't wire them still elaborates).
-    umAccessRobId = UInt(m68k040.Global.ROB_ID_W bits)
+    umAccessRobId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid = Bool()
-    umCommitId    = UInt(m68k040.Global.ROB_ID_W bits)
+    umCommitId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid = Bool()
-    umCommitBId    = UInt(m68k040.Global.ROB_ID_W bits)
+    umCommitBId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umFlush       = Bool()
     flushAll      = Bool()
     _walkLoadCmd  = Stream(DLoadCmd())
@@ -116,11 +116,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
     // the LS-cluster wiring OVERRIDES them.
-    umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
+    umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid.allowOverride; umCommitValid := False
-    umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W bits)
+    umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid.allowOverride; umCommitBValid := False
-    umCommitBId.allowOverride;    umCommitBId    := U(0, m68k040.Global.ROB_ID_W bits)
+    umCommitBId.allowOverride;    umCommitBId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umFlush.allowOverride;       umFlush       := False
     flushAll.allowOverride;      flushAll      := False; flushAll.simPublic()
 
@@ -272,7 +272,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val sup   = Reg(Bool())
       val is8K  = Reg(Bool())
       val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
-      val robId = Reg(UInt(m68k040.Global.ROB_ID_W bits))
+      val robId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     }
     // Task #210 (MC68040 UM S3.3): "If the page is not write protected and the
     // modified bit of the ATC entry is clear, a table search proceeds to set the
@@ -384,7 +384,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // ...and the address space it was launched in (the ATC's FC2 tag bit).
     val walkSup  = Reg(Bool())
     val walkToken = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
-    val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W bits))   // robId of the access that triggered the walk
+    val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))   // robId of the access that triggered the walk
     when(walker.io.start) {
       walkVpn   := missReqReg.vpn
       walkIs8K  := missReqReg.is8K

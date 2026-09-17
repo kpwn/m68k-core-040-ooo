@@ -7,7 +7,7 @@ import spinal.core.sim._
 import spinal.lib._
 
 case class SqAlloc() extends Bundle {
-  val robId = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   // ---- slot A (always present) ----
   val paddr = UInt(32 bits)
   val vaddr = UInt(32 bits)   // logical address of slot A -- the SSW EA field for a
@@ -35,7 +35,7 @@ case class SqAlloc() extends Bundle {
 }
 
 case class SqFwdQuery() extends Bundle {
-  val robId = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val paddr = UInt(32 bits)
   val size  = Size()
   // ── split/page-crossing second half (cross-page forward-hazard fix) ──────────
@@ -101,12 +101,12 @@ class StoreQueue(depth: Int = 8) extends Component {
   val io = new Bundle {
     val alloc    = slave(Flow(SqAlloc()))
     val fwd      = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
-    val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
+    val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     // Second same-cycle commit port: a store can retire in EITHER slot of the 2-wide
     // retire (slot 1 when it completed early behind a long-latency head, e.g. DIV).
     // Marking a cycle LATE is unsafe — a flush arriving the next cycle would squash
     // the already-retired store — so both retire slots must mark in the retire cycle.
-    val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
+    val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     val flush    = in(Bool())
     val drain    = master(Stream(DStoreCmd()))
     // Terminal acknowledgement for the oldest accepted half. `drain` is a real
@@ -123,7 +123,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     // (which is muxed between P3 and P4), so the gate is always answered for the
     // load it is actually gating.
     val barrier = new Bundle {
-      val robId               = in(UInt(m68k040.Global.ROB_ID_W bits))
+      val robId               = in(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
       val olderStore          = out(Bool())   // ANY older resident store
       val olderInhibitedStore = out(Bool())   // an older resident DEVICE store
     }
@@ -134,10 +134,10 @@ class StoreQueue(depth: Int = 8) extends Component {
     // allocating while full; the sim assert below enforces that contract.
     val full     = out(Bool())
     // ---- precise-path at-head drain (Task P2) ----
-    val robHeadIn           = in(UInt(m68k040.Global.ROB_ID_W bits))   // = rob.logic.h0
+    val robHeadIn           = in(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))   // = rob.logic.h0
     val robHeadValidIn      = in(Bool())         // = rob.logic.count > 0
     val irqPreemptPendingIn = in(Bool())         // = rob.logic.interruptPending || rob.logic.tracePendingFire
-    val sqCompletion        = master(Flow(UInt(m68k040.Global.ROB_ID_W bits)))
+    val sqCompletion        = master(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     val sqFaultCompletion   = master(Flow(m68k040.execute.LsFault()))
     val preciseDrainBusy    = out(Bool())
     // ---- Part 127: flush/orphan handshake with LsEuPlugin's `pendMem` ring --------
@@ -156,7 +156,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   // ---- ring storage (all RegInit) ----
   val valids    = Vec.fill(depth)(RegInit(False))
   val committed = Vec.fill(depth)(RegInit(False))
-  val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W bits)))
+  val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)))
   val paddrs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val datas     = Vec.fill(depth)(RegInit(B(0, 32 bits)))
   val sizes     = Vec.fill(depth)(RegInit(Size.BYTE()))
@@ -403,10 +403,8 @@ class StoreQueue(depth: Int = 8) extends Component {
   // (`committed(a)` is checked at the call site below, not inside this helper,
   // so `olderThan` here covers ONLY case 2's head-anchored math.)
   def olderThan(a: UInt, b: UInt): Bool = {
-    // Age is computed modulo the ROB, so the slice width must follow ROB_ID_W --
-    // it was hardcoded (5 downto 0) for a 64-entry ROB.
-    val ageA = (a - io.robHeadIn)(m68k040.Global.ROB_ID_W - 1 downto 0)
-    val ageB = (b - io.robHeadIn)(m68k040.Global.ROB_ID_W - 1 downto 0)
+    val ageA = (a - io.robHeadIn)(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)
+    val ageB = (b - io.robHeadIn)(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)
     ageA < ageB
   }
 
@@ -766,9 +764,9 @@ class StoreQueue(depth: Int = 8) extends Component {
   // single tree (same depth as the prior youngest-full select), avoiding a serial
   // dependency on a separately-reduced `best.dist` (which regressed FMax).
   val anyPartial = perEntry.map(_.partial).orR
-  val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(m68k040.Global.ROB_ID_W - 1 downto 0)))
+  val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)))
   case class Cand() extends Bundle {
-    val valid = Bool(); val full = Bool(); val dist = UInt(m68k040.Global.ROB_ID_W bits); val data = Bits(32 bits)
+    val valid = Bool(); val full = Bool(); val dist = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits); val data = Bits(32 bits)
   }
   val cands = (0 until depth).map { i =>
     val c = Cand()

@@ -27,7 +27,7 @@ class DivWSpec extends AnyFunSuite {
     val logic = during build new Area {
       val eu = host[DivEuService]
       val iValid  = in Bool ()
-      val iRobId  = in UInt (6 bits)
+      val iRobId  = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iSigned = in Bool ()
       val iPdst   = in UInt (6 bits)
 
@@ -53,7 +53,7 @@ class DivWSpec extends AnyFunSuite {
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
-      uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
+      uop.fpSrcFmt := 0;
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.sswInstr := False
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
@@ -79,7 +79,7 @@ class DivWSpec extends AnyFunSuite {
       val rdData = out Bits (32 bits); rdData := rdRes.data
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
-      val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val cRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob    := eu.completion.payload
       val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector
@@ -98,7 +98,7 @@ class DivWSpec extends AnyFunSuite {
     // files must be present for it to elaborate. Unused by this spec.
     val rfFp   = new m68k040.execute.regfile.RegFilePluginFp
     val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new FpImmTableStub, src)) }
   }
 
   /** Returns (result32, nzvc, intWrite, faultVec). result valid only if no fault. */

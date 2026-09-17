@@ -53,7 +53,7 @@ trait LsEuService {
   * `entryFaultAtc`. Was previously hardcoded True unconditionally (moot before
   * this task since the ONLY existing fault source was the MMU path). */
 case class LsFault() extends Bundle {
-  val robId      = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val faultAddr  = UInt(32 bits)
   val write      = Bool()
   val sizeBits   = UInt(2 bits)
@@ -223,10 +223,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     excXlateWrite   = Bool(); excXlateToken = UInt(DTranslationToken.Width bits)
     excXlateReady   = Bool()
     sqEmptySig      = Bool()
-    robHeadIn              = UInt(m68k040.Global.ROB_ID_W bits)
+    robHeadIn              = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     robHeadValidIn         = Bool()
     irqPreemptPendingIn    = Bool()
-    sqCompletionPort       = Flow(UInt(m68k040.Global.ROB_ID_W bits))
+    sqCompletionPort       = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     sqFaultCompletionPort  = Flow(LsFault())
     preciseDrainBusySig    = Bool()
     debugHaltImminentIn    = Bool()
@@ -234,18 +234,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     quiesceHold            = Bool()
     issuePort      = Stream(IqContext())
     issuePort.valid.simPublic(); issuePort.ready.simPublic(); issuePort.payload.robId.simPublic() // debug-only, task #139 finding #1; zero synth impact
-    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
-    sqCommitPort   = Flow(UInt(m68k040.Global.ROB_ID_W bits))
+    completionPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    sqCommitPort   = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     // Slot-1 commit: defaults to idle (allowOverride) so single-retire benches/stubs
     // need no wiring; the full-core wiring overrides it with {retire1, h1}.
-    sqCommitBPort  = Flow(UInt(m68k040.Global.ROB_ID_W bits))
+    sqCommitBPort  = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     sqCommitBPort.valid.allowOverride;   sqCommitBPort.valid   := False
-    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, m68k040.Global.ROB_ID_W bits)
+    sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
-    xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W bits)
+    xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
     rdBase = irf.newRead()
     rdData = irf.newRead()
@@ -332,7 +332,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Precise-path pass-throughs default-idle (allowOverride): a DUT that doesn't
     // wire the ROB (standalone LS tests) sees robHeadValidIn=False -> headPreciseReady
     // can never assert, matching the SQ's own pre-P2.5 dead-wired defaults.
-    robHeadIn.allowOverride;           robHeadIn := U(0, m68k040.Global.ROB_ID_W bits)
+    robHeadIn.allowOverride;           robHeadIn := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
     // A DUT with no RobPlugin (most standalone LS tests) never has a debug-auto-
@@ -627,7 +627,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // on the wrong (by-then-reallocated) robId. Idle-default here; driven from
     // the SAME apply event as the wbObs replay so the two can never separate.
     sqCompletionPort.valid   := False
-    sqCompletionPort.payload := U(0, m68k040.Global.ROB_ID_W bits)
+    sqCompletionPort.payload := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     sqFaultCompletionPort.valid := False
     sqFaultCompletionPort.payload.assignDontCare()
     preciseDrainBusySig    := sq.io.preciseDrainBusy
@@ -864,7 +864,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // The full 300+ bit RenamedUop stays in P1; P2/P3/P4 replicate this pruned token
     // instead, keeping the area cost of three simultaneously-resident accesses bounded.
     case class FrontPipeCtx() extends Bundle {
-      val robId           = UInt(m68k040.Global.ROB_ID_W bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val vaddr           = UInt(32 bits)
       val addrB           = UInt(32 bits)
       val storeData       = Bits(32 bits)
@@ -965,6 +965,37 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p3Ctx    = Reg(XlatePipeCtx())
     val p4Valid  = RegInit(False)              // P4: registered SQ response -> resolve
     val p4Ctx    = Reg(ResolvePipeCtx())
+    // ── FMax (2026-09-16): a REGISTERED shadow of the SQ forward-query MUX SELECT.
+    //
+    // The select is `p4RetryQuery == p4Valid && (fwdStall || (fwdHit && twoAccess) ||
+    // fwdSerial)`. Every operand is already a flop, so this is not a depth problem --
+    // it is a ONE-LUT-plus-a-fanout-156-net problem sitting in FRONT of the deepest
+    // combinational cone in the LS EU (StoreQueue's 8-entry line+mask compare, ~12
+    // levels). The post-route report for this checkpoint:
+    //
+    //   p4Ctx_fwdStall_reg/C -> LUT5 (p4RetryQuery) -> [fo=156, 0.432 ns]
+    //     -> LUT3 (fwdQueryCtx.paddr mux) -> [fo=16, 0.597 ns] -> sq perEntry compare
+    //     -> ... -> p4Ctx_fwdHit_reg/D          15 levels, 72.9% route, -0.313 ns
+    //
+    // i.e. ~0.65 ns of the 5.17 ns arc is spent deciding WHICH registered address to
+    // compare, before the compare starts. Precomputing the select into its own flop
+    // deletes the LUT5 and its high-fanout net from the arc and, being a flop, lets
+    // `phys_opt_design` replicate it across the mux's 156 sinks (it cannot usefully
+    // replicate a LUT whose inputs are five separate flops).
+    //
+    // COST: one flop plus the duplicated retry term (~2 LUTs). ZERO cycles -- this is
+    // a same-cycle value, not a pipeline stage; load-use latency is unchanged.
+    //
+    // CORRECTNESS. This register is a MIRROR: it is assigned at exactly the four sites
+    // that change `p4Valid` or the three `fwd*` fields it reads, in the same source
+    // (= generated always-block) order, so last-assignment-wins resolves identically.
+    // Divergence would mean the SQ is queried with the WRONG context's address and a
+    // forward verdict captured for a different address -- the silent-wrong-data class
+    // (cf. the 2026-09-08 `fwdSerial` bug recorded on `ResolvePipeCtx`). So the
+    // original expression is retained as `p4RetryQueryRef` and machine-checked against
+    // this register every cycle under `GenerationFlags.simulation`; the shadow is
+    // pruned from every netlist and fires in every LS/cache/lockstep suite.
+    val p4RetryQ = RegInit(False)
     tValid.simPublic(); txValid.simPublic(); p3Valid.simPublic(); p4Valid.simPublic(); txSecond.simPublic()
     tCtx.robId.simPublic(); txCtx.robId.simPublic(); p3Ctx.front.robId.simPublic(); p4Ctx.xlate.front.robId.simPublic()
     // Debug-only taps (zero synth impact): the p4 load's physical address and the SQ
@@ -1105,7 +1136,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val size      = Reg(m68k040.isa.Size()) init m68k040.isa.Size.BYTE
       val cmode     = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
       val cmodeB    = Reg(m68k040.cache.CacheMode()) init m68k040.cache.CacheMode.INHIBITED
-      val robId     = Reg(UInt(m68k040.Global.ROB_ID_W bits)) init 0
+      val robId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
@@ -1127,7 +1158,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // extractCross, are ALREADY carried as llReg.vaddr(3 downto 0) / llReg.size —
     // no new state for those.
     case class BkCtx() extends Bundle {
-      val robId           = UInt(m68k040.Global.ROB_ID_W bits)
+      val robId           = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val pdst            = UInt(6 bits)
       val pdstValid       = Bool()
       val wakes           = Bool()
@@ -1414,9 +1445,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // a documented encoding is not something a perf refactor gets to change silently.
     dcache.loadCmd.payload.token := Mux(
       useSplitCmd,
-      (False ## llReg.bDone ## llReg.robId.asBits.resize(m68k040.cache.DLoadToken.RobIdBits)).asUInt,
-      (False ## (alignedCmd.twoAccess && alignedCmd.splitSecond) ##
-       alignedCmd.bk.robId.asBits.resize(m68k040.cache.DLoadToken.RobIdBits)).asUInt)
+      m68k040.Global.robTag(False ## llReg.bDone, llReg.robId, m68k040.cache.DLoadToken.Width),
+      m68k040.Global.robTag(False ## (alignedCmd.twoAccess && alignedCmd.splitSecond),
+       alignedCmd.bk.robId, m68k040.cache.DLoadToken.Width))
     // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`): BOTH halves of a
     // cross-line split pair consume `loadRsp.line`, never `loadRsp.data` -- slot A is
     // deliberately presented at the ORIGINAL crossing offset/size. Flagging them here
@@ -1487,8 +1518,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED) &&
       (!p4Ctx.xlate.front.twoAccess ||
        (p4Ctx.xlate.cmodeB =/= m68k040.cache.CacheMode.INHIBITED))
-    val p4RetryQuery = p4Valid &&
+    // The REFERENCE expression (what the select means). It has no RTL consumer: the
+    // mux below selects off the registered mirror `p4RetryQ`, and this is what that
+    // mirror is machine-checked against in simulation (see `p4RetryQ`'s declaration).
+    val p4RetryQueryRef = p4Valid &&
       (p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Ctx.xlate.front.twoAccess) || p4Ctx.fwdSerial)
+    val p4RetryQuery = p4RetryQ
+    p4RetryQuery.simPublic(); p4RetryQueryRef.simPublic()
+    GenerationFlags.simulation {
+      assert(p4RetryQ === p4RetryQueryRef,
+        "LsEuPlugin: the registered SQ forward-query select diverged from its reference " +
+        "-- the store-to-load forward query is using the WRONG pipeline context's address",
+        FAILURE)
+    }
     val fwdQueryCtx = Mux(p4RetryQuery, p4Ctx.xlate, p3Ctx)
     sq.io.fwd.query.robId := fwdQueryCtx.front.robId
     sq.io.fwd.query.paddr := fwdQueryCtx.paddr
@@ -1515,7 +1557,43 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // split reuses P2T for addrB and takes command priority over a younger P2 op.
     val normalReqArm = Bool(); normalReqArm.allowOverride; normalReqArm := False
     val splitReqArm  = Bool(); splitReqArm.allowOverride;  splitReqArm  := False
-    val reqFromSplit = splitReqArm
+    // ── FMax (2026-09-16): the DTLB request PAYLOAD SELECT is `xlateBArm` -- the three
+    // P2T flops and nothing else -- NOT `splitReqArm`.
+    //
+    // `splitReqArm` is `xlateBArm` ANDed with the ARBITRATION gate
+    // (`!sqFlushSig && !dcLoadHeldByOther`), and `dcLoadHeldByOther` carries
+    // `walkerOwnsLoad`, i.e. the `ldOwner` arbitration register. Using it as the mux
+    // select put `ldOwner` in front of `reqDrvVpn`, which is `tlb.io.lookupVpn`, which
+    // is the operand of the DTLB's 4-way/2-bank hitVec compare tree. The post-route
+    // report for this checkpoint names exactly that arc as a worst path:
+    //
+    //   LsEuPlugin ldOwner_reg[1]/C -> (LUT2 walkerOwnsLoad, LUT2 dcLoadHeldByOther,
+    //     LUT5 splitReqArm) -> reqDrvVpn -> DtlbPlugin tlb hitVec (11 levels)
+    //     -> DtlbPlugin rspPayload_ppn_reg[2]/CE      15 levels, 73.9% route, -0.313 ns
+    //
+    // (`rspPayload`'s clock-enable is `_req.fire && !missBranch`, and `missBranch`
+    // is the hit cone -- see the response mux in DtlbPlugin.) So a three-valued port
+    // owner that changes only on a TLB MISS was gating a 28-bit CAM compare that runs
+    // on EVERY translation.
+    //
+    // The class-level note on `FrontPipeCtx.fcSup` already states the intended
+    // property -- "the existing `Mux(reqFromSplit, txCtx.*, tCtx.*)` 2:1 mux keeps
+    // exactly the shape it had, with both arms still plain register outputs. No gate
+    // is added between a register and the DTLB request" -- but the SELECT had picked
+    // up three gate levels since. This restores it.
+    //
+    // WHY IT IS EXACTLY EQUIVALENT, not merely "close enough". `reqFromSplit` drives
+    // ONLY payload (`reqDrvVaddr`/`Sup`/`Write`/`RobId`/`Token`) plus the two
+    // `*Fire` predicates. Payload is architecturally observable only while
+    // `xlate.req.valid` is high, and `xlate.req.valid` is
+    // `!excActive && (normalReqArm || splitReqArm)` -- every term of which already
+    // carries `!sqFlushSig && !dcLoadHeldByOther`. So in the ONLY case where the two
+    // selects differ (`xlateBArm && (sqFlushSig || dcLoadHeldByOther)`) the LS-side
+    // valid is LOW and the payload is a don't-care. `normalReqFire`/`splitReqFire`
+    // are both `xlate.req.fire && ... && !excActive`, which likewise cannot be true
+    // with the LS-side valid low (the only other driver of `xlate.req.valid` is the
+    // exception override, which requires `excActive`).
+    val reqFromSplit = xlateBArm
     val reqDrvVaddr  = Mux(reqFromSplit, txCtx.addrB, tCtx.vaddr)
     val reqDrvVpn    = reqDrvVaddr(31 downto 12)
     // The ADDRESS-SPACE bit, not the privilege bit -- see `FrontPipeCtx.fcSup`. Both
@@ -1525,7 +1603,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val reqDrvWrite  = Mux(reqFromSplit,
       txCtx.memOp === MemOp.STORE, tCtx.memOp === MemOp.STORE)
     val reqDrvRobId  = Mux(reqFromSplit, txCtx.robId, tCtx.robId)
-    val reqDrvToken  = (xlateEpoch ## reqFromSplit ## reqDrvRobId.asBits.resize(m68k040.cache.DTranslationToken.RobIdBits)).asUInt
+    val reqDrvToken  = m68k040.Global.robTag(xlateEpoch ## reqFromSplit, reqDrvRobId, DTranslationToken.Width)
     val tIsLoad  = tCtx.memOp === MemOp.LOAD
     val tIsStore = tCtx.memOp === MemOp.STORE
     val tIsMem   = tIsLoad || tIsStore
@@ -1571,7 +1649,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val probeCancelToken = UInt(m68k040.cache.DLoadToken.Width bits)
     probeCancel := False
     probeCancelToken := U(0, m68k040.cache.DLoadToken.Width bits)
-    val reqProbeToken = (False ## False ## tCtx.robId.asBits.resize(m68k040.cache.DLoadToken.RobIdBits)).asUInt
+    val reqProbeToken = m68k040.Global.robTag(False ## False, tCtx.robId, m68k040.cache.DLoadToken.Width)
 
     dcache.loadProbe.valid         := probeWanted && xlate.req.ready
     dcache.loadProbe.payload.vaddr := tCtx.vaddr
@@ -1622,7 +1700,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // at the cost of ONE extra completion-latency cycle (lock-step is latency-
     // agnostic). All comp* are RegInit/Reg (no uninit fanout).
     val compValid     = RegInit(False)
-    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W bits))
+    val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
     compData.simPublic() // debug-only, task #144
@@ -2155,7 +2233,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // the ROB head and completed, so it is guaranteed older than anything a later
     // flush could legitimately discard).
     case class PendingStoreWb() extends Bundle {
-      val robId      = UInt(m68k040.Global.ROB_ID_W bits)
+      val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val dstArch    = UInt(5 bits)
       val data       = Bits(32 bits)
       val pdst       = UInt(6 bits)
@@ -2574,7 +2652,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // concrete downstream resource is unable to consume; accept-last turnover keeps
     // a resident same-page aligned stream at II=1 after fill.
     def cancelProbeFor(robId: UInt): Unit = {
-      val token = (False ## False ## robId.asBits.resize(m68k040.cache.DLoadToken.RobIdBits)).asUInt
+      val token = m68k040.Global.robTag(False ## False, robId, m68k040.cache.DLoadToken.Width)
       probeCancel      := True
       probeCancelToken := token
     }
@@ -2684,6 +2762,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         p4Ctx.fwdStall := sq.io.fwd.rsp.stall
         p4Ctx.fwdData  := sq.io.fwd.rsp.data
         p4Ctx.fwdSerial := sq.io.fwd.rsp.serial
+        // MIRROR 1 of 4 (see `p4RetryQ`). `p4Ctx.xlate` is NOT rewritten in this arm,
+        // so next-cycle `twoAccess` is this cycle's `p4Front.twoAccess`; and this arm
+        // never sets `p4CanLeave`, so next-cycle `p4Valid` is still True (a later
+        // `p4CanLeave`/flush mirror overrides this assignment if that changes).
+        p4RetryQ := sq.io.fwd.rsp.stall ||
+                    ((sq.io.fwd.rsp.hit && p4SqForwardAllowed) && p4Front.twoAccess) ||
+                    sq.io.fwd.rsp.serial
       } otherwise {
         when(p4LaunchOk) {
         when(!p4Front.twoAccess) {
@@ -2917,7 +3002,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     dcache.loadProbeResolve.valid := txRspFire && !xlateFault && !txSecond &&
                                      (txCtx.memOp === MemOp.LOAD) && !txCtx.twoAccess
     dcache.loadProbeResolve.payload.token :=
-      (False ## False ## txCtx.robId.asBits.resize(m68k040.cache.DLoadToken.RobIdBits)).asUInt
+      m68k040.Global.robTag(False ## False, txCtx.robId, m68k040.cache.DLoadToken.Width)
     dcache.loadProbeResolve.payload.paddr := s1Paddr
     dcache.loadProbeResolve.payload.cacheMode := txEffectiveCmode
 
@@ -2990,10 +3075,34 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // folds the walker-owner bit into the existing `!excActive` conjunction rather than
     // adding a separate gate, so the two hand-overs stay one mechanism.
     val dcLoadHeldByOther = excActive || walkerOwnsLoad
-    splitReqArm := txValid && txSecond && !txWaitingRsp && !sqFlushSig && !dcLoadHeldByOther
-    normalReqArm := tValid && tIsMem && txReady && !splitReqArm &&
+    // `xlateBArm` IS `txValid && txSecond && !txWaitingRsp` (declared with the P2T
+    // FSM above); naming it here rather than re-spelling it is what makes the
+    // payload-select/arbitration split at `reqFromSplit` visible at both ends.
+    splitReqArm := xlateBArm && !sqFlushSig && !dcLoadHeldByOther
+    // `!xlateBArm` rather than `!splitReqArm`: identical (this conjunction already
+    // carries `!sqFlushSig && !dcLoadHeldByOther`, so under it `!splitReqArm` reduces
+    // to `!xlateBArm`) and it keeps the split's command PRIORITY independent of the
+    // arbitration gate, exactly as the payload select now is.
+    normalReqArm := tValid && tIsMem && txReady && !xlateBArm &&
                     !sqFlushSig && !dcLoadHeldByOther && (!tIsLoad || dcache.loadProbe.ready)
     val normalReqFire = xlate.req.fire && !reqFromSplit && !excActive
+    // ── LIVENESS TRIPWIRE (2026-09-15): a memory op parked in P2 with nothing holding it
+    // architecturally must launch within a bounded time. `dcLoadHeldByOther` (exception
+    // ownership, a walker owning the port) and a flush are the only legitimate
+    // indefinite holds; everything else -- the D-cache's registered probe credit, the
+    // DTLB's ready, P2T draining its previous request -- is a bounded wait (a device
+    // read or a three-level table walk is hundreds of cycles, never tens of thousands).
+    // The existing suites see a no-forward-progress bug here only as a generic
+    // timeout; this names the site. Simulation-only, pruned from every netlist.
+    GenerationFlags.simulation {
+      val p2StallCycles = Reg(UInt(16 bits)) init 0
+      val p2Parked = tValid && tIsMem && !dcLoadHeldByOther && !sqFlushSig && !normalReqFire
+      when(p2Parked) { p2StallCycles := p2StallCycles + 1 } otherwise { p2StallCycles := 0 }
+      assert(p2StallCycles < U(20000, 16 bits),
+        "LsEuPlugin: a memory op has been parked in P2 for 20000 cycles without launching " +
+          "(probe credit / DTLB ready / P2T never freed) -- no forward progress on load admission",
+        FAILURE)
+    }
     // Debug-only taps (zero synth impact): P2 launch gating terms.
     normalReqFire.simPublic(); dcLoadHeldByOther.simPublic(); dcache.loadProbe.ready.simPublic(); xlate.req.ready.simPublic()
     val splitReqFire  = xlate.req.fire && reqFromSplit && !excActive
@@ -3028,7 +3137,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
     // Oldest-to-youngest valid updates, then accept-last replacements. Later writes
     // intentionally win when a stage consumes and accepts on the same edge.
-    when(p4CanLeave) { p4Valid := False }
+    when(p4CanLeave) { p4Valid := False; p4RetryQ := False }   // MIRROR 2 of 4
     when(p3CanLeave) { p3Valid := False }
     when(txCanLeave) { txValid := False; txSecond := False; txWaitingRsp := False }
     when(tCanLeave)  { tValid := False }
@@ -3041,6 +3150,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       p4Ctx.fwdStall   := sq.io.fwd.rsp.stall
       p4Ctx.fwdData    := sq.io.fwd.rsp.data
       p4Ctx.fwdSerial  := sq.io.fwd.rsp.serial
+      // MIRROR 3 of 4 (see `p4RetryQ`). Next-cycle `p4Valid` is True and next-cycle
+      // `p4Ctx.xlate.front.twoAccess` is `p3Ctx.front.twoAccess` (the line above).
+      p4RetryQ         := sq.io.fwd.rsp.stall ||
+                          ((sq.io.fwd.rsp.hit && p3SqForwardAllowed) &&
+                           p3Ctx.front.twoAccess) ||
+                          sq.io.fwd.rsp.serial
     }
     when(txToP3) {
       p3Valid := True
@@ -3080,6 +3195,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       txWaitingRsp:= False
       p3Valid     := False
       p4Valid     := False
+      p4RetryQ    := False   // MIRROR 4 of 4 (see `p4RetryQ`)
     }
     // Epoch is a squash generation, not an exception-active level. Toggling it on
     // every cycle of a serializing exception would eventually alias a stale tagged
@@ -3437,6 +3553,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // it is ALSO what makes the hand-off below safe.
     val lsXlateReqValid = !excActive && (normalReqArm || splitReqArm)
     xlate.req.valid              := lsXlateReqValid
+    // ── Tripwire for the `reqFromSplit` payload-select/arbitration split (see the long
+    // note at `reqFromSplit`). The equivalence argument there is a PROOF, but the thing
+    // it protects -- a DTLB request that carries slot B's address under slot A's token,
+    // or the reverse -- is a silent-mistranslation bug, so it is machine-checked rather
+    // than merely reasoned about: whenever this port is actually presenting an LS
+    // request, the (now ungated) payload select must equal the (gated) split arm.
+    // Simulation-only; pruned from every netlist.
+    GenerationFlags.simulation {
+      assert(!lsXlateReqValid || (reqFromSplit === splitReqArm),
+        "LsEuPlugin: the DTLB request PAYLOAD select disagrees with the arbitration-gated " +
+        "split arm while the LS-side request is VALID -- the request would carry the " +
+        "wrong half's address/supervisor/token",
+        FAILURE)
+    }
     xlate.req.payload.vpn        := reqDrvVpn
     xlate.req.payload.supervisor := reqDrvSup
     xlate.req.payload.write      := reqDrvWrite
@@ -3465,7 +3595,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // belongs to, and an exception-sequencer translation belongs to no ROB entry. Feeding
     // the stale `reqDrvRobId` there would attribute the walk to an unrelated (possibly
     // already-retired) instruction.
-    xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, m68k040.Global.ROB_ID_W bits))
+    xlateRobIdSig                := Mux(lsXlateReqValid, reqDrvRobId, U(0, m68k040.Global.ROB_ID_W_DEFAULT bits))
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // WALKER LEGS OF THE D-CACHE PORT MUX  (last drivers -- they override both the

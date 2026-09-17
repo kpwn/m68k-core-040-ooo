@@ -144,7 +144,7 @@ class FpuProtocolSpec extends AnyFunSuite {
 
       // ---- issue-side stimulus ----
       val iValid     = in Bool ()
-      val iRob       = in UInt (6 bits)
+      val iRob       = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iFlush     = in Bool ()
       val iFpuOp     = in Bits (7 bits)
       val iPFpSrcA   = in UInt (4 bits)
@@ -204,7 +204,6 @@ class FpuProtocolSpec extends AnyFunSuite {
       uop.fpuOp := iFpuOp
       uop.fpSrcKind := FpSrcKind.FPREG
       uop.fpSrcFmt := 0
-      uop.fpWideImm := 0
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -225,7 +224,7 @@ class FpuProtocolSpec extends AnyFunSuite {
 
       // ---- the four external FP-lane service ports ----
       val fpCValid  = out Bool ();       fpCValid  := eu.fpCompletion.valid
-      val fpCRob    = out UInt (6 bits); fpCRob    := eu.fpCompletion.payload
+      val fpCRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); fpCRob    := eu.fpCompletion.payload
       val fpWakeV   = out Bool ();       fpWakeV   := eu.fpWakeup.valid
       val fpWakeP   = out UInt (4 bits); fpWakeP   := eu.fpWakeup.payload
       val fpccWakeV = out Bool ();       fpccWakeV := eu.fpccWakeup.valid
@@ -262,7 +261,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       inFlight := CountOne(divEu.logic.fpFixedCtxValid.asBits).resized
 
       // ---- the issue payload as the EU actually sees it (payload-stability check) ----
-      val obsRob   = out UInt (6 bits); obsRob   := eu.issue.payload.robId
+      val obsRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); obsRob   := eu.issue.payload.robId
       val obsOp    = out Bits (7 bits); obsOp    := eu.issue.payload.uop.fpuOp
       val obsFpDst = out UInt (4 bits); obsFpDst := eu.issue.payload.uop.pFpDst
       val obsSrcA  = out UInt (4 bits); obsSrcA  := eu.issue.payload.uop.pFpSrcA
@@ -279,7 +278,7 @@ class FpuProtocolSpec extends AnyFunSuite {
     val rfFpcc = new RegFilePluginFpcc
     val eu     = new DivEuPlugin
     val src    = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new FpImmTableStub, src)) }
   }
 
   private lazy val dut = M68kSim().withVerilator.compile(new Dut)

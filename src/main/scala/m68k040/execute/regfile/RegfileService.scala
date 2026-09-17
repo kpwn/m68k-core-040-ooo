@@ -14,7 +14,10 @@ object RegfileSpec {
   // the 48-entry Mem, so the producing write never landed and the dependent read returned
   // an uninitialized (per-seed-random) value. addressWidth is log2Up(50)=6 = log2Up(48),
   // so all port widths are unchanged; only the Mem entry count grows (48 -> 50).
-  val Int  = RegfileSpec("int",  32, 54)
+  // Derived from the ONE pool-size constant (see Global.PHYS_INT_REGS_DEFAULT) rather
+  // than restated, so the PRF can never again be a different size from the pool rename
+  // allocates out of.
+  val Int  = RegfileSpec("int",  32, m68k040.Global.PHYS_INT_REGS_DEFAULT)
   val Nzvc = RegfileSpec("nzvc", 4,  16)
   val X    = RegfileSpec("x",    1,  16)
   val Fp   = RegfileSpec("fp",   80, 16)

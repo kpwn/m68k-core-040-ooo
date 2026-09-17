@@ -63,6 +63,70 @@ case class ChunkPredecode() extends Bundle {
   // `docs/superpowers/specs/2026-08-08-fmax-leverb-precompute-size-design.md`.
   val size = m68k040.isa.Size()
 
+  // ── Control-transfer bit (2026-09-16, "predecoded branch gate") ────────────────
+  // True iff THIS word's opword is a control-transfer instruction, i.e. one whose
+  // decode can produce a µop that reaches `BranchEuPlugin` AND that the BTB/FTB is
+  // allowed to learn:
+  //
+  //   Bcc / BRA / BSR      (line 6, every condition)
+  //   DBcc                 (line 5, ss==11, mode==001)
+  //   JMP / JSR            (0x4E80..0x4EFF)
+  //   RTE / RTD / RTS / RTR(0x4E73 / 74 / 75 / 77)
+  //   FBcc.W/.L            (line F type 010/011) EXCEPT cc==0 (FBF/FNOP decodes as a NOP)
+  //   FDBcc                (line F type 001, mode 001)
+  //
+  // WHY IT EXISTS. `FetchAlignPlugin`'s fetch-time prediction enables --
+  // `btbQueryValid0` and the fetch-directed `ftqConfirm` -- were gated only on "a slot
+  // was emitted", never on the slot actually BEING a branch. `predTaken` is stamped on
+  // every µop of the emitted instruction (MicroOpAssembler's last-wins stamp) but is
+  // READ ONLY BY `BranchEuPlugin`, so a stale BTB/FTB entry hitting an ordinary ALU/LS
+  // instruction redirected fetch with NOTHING downstream able to detect it, and the
+  // wrong-path instructions RETIRED. Both predictors are keyed on VIRTUAL PC and are
+  // invalidated only by I-cache maintenance and the external boot port -- nothing
+  // invalidates them on a translation change (PFLUSH/PFLUSHA, URP/SRP/TC write, 24/32-bit
+  // mode switch) -- so the stale-entry precondition is reachable without any SMC at all.
+  // See IcachePlugin's `maintInvalidateAll` comment, which conceded exactly this.
+  //
+  // WHY IT LIVES HERE rather than at fetch time. The alternative -- classifying the
+  // opword inside FetchAlignPlugin -- puts ~7 opword comparators into the
+  // `slot0Predicted -> suppressSlot1 -> decodePcNext` arc, which is the measured
+  // front-end FMax floor. Baking it at REFILL time makes the fetch-side gate a pure
+  // memory-output AND: `btbQueryValid0 := predEnable && res.slot0Valid &&
+  // headPred(0).ctrlXfer`, where the new term is a register/LUTRAM output arriving at
+  // t~=0 and folding into the existing AND's LUT. Exactly the `size` precedent
+  // ("FMax Lever B") above, for exactly the same reason.
+  //
+  // AMBIGUITY. Like `size`, and UNLIKE `simple`/`lenWords`, this is a pure function of
+  // the OPWORD ALONE -- no extension-word lookahead -- so it is never
+  // `ambiguousLine`-qualified, is identical in both arms of Aligner's `p0` mux, and is
+  // NOT part of the straddle-token field reuse documented below. Consumers read
+  // `preds(0).ctrlXfer` DIRECTLY, never through `p0`.
+  //
+  // FAIL-CLOSED. Every default/undefined path drives it False (no prediction), never
+  // True: InstructionBuffer's beyond-`count` head default, FetchAlignPlugin's push
+  // default-drive, and PredecodeWord's own unconditional default. A word this
+  // classifier cannot place is therefore un-predictable, not mis-predictable.
+  //
+  // COHERENCE WITH THE PREDICTORS. A BTB/FTB entry outlives the cache line it was learned
+  // from; this bit does not, and that asymmetry is deliberate and is what makes the gate
+  // sound. `ctrlXfer` is not a cached copy of the predictor's claim -- it is a property of
+  // THE BYTES BEING FETCHED RIGHT NOW. It is produced at refill from the very line the
+  // fetch consumes, and it travels with those words through the fetch ring and the
+  // instruction buffer, so `headPred(0)` is by construction the predecode of `head(0)`.
+  // There is no window in which the gate sees an old line's bit against a new line's
+  // bytes. When a line is evicted and refilled with DIFFERENT contents at the SAME virtual
+  // address (the translation-change case above, or any eviction), the refill re-runs
+  // `classify` on the new bytes and exactly two things can happen:
+  //   - the new bytes are not a control transfer -> gate 0 -> the surviving predictor entry
+  //     is never consulted. NO PREDICTION.
+  //   - the new bytes ARE a control transfer -> gate 1 -> the (possibly wrong-target)
+  //     prediction is allowed through, and it is now riding a real branch micro-op, so
+  //     `BranchEuPlugin.mispredict` checks direction AND target and redirects at resolve.
+  //     A RECOVERED MISPREDICT.
+  // Neither outcome is "a wrong prediction that nothing checks", which is the outcome the
+  // ungated path had.
+  val ctrlXfer = Bool()
+
     // ── Straddle TOKEN (2026-09-13, 200 MHz campaign) ─────────────────────────
     // See DESIGN_icache_straddle_token.md. When `ambiguousLine` is set, Aligner
     // discards this whole entry (`p0 = Mux(preds(0).ambiguousLine, p0LiveReg,

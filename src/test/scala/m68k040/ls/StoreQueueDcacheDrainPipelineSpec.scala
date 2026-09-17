@@ -99,13 +99,13 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     val sq = new StoreQueue(8)
 
     val allocIn   = slave(Flow(SqAlloc()))
-    val commitIn  = slave(Flow(UInt(6 bits)))
-    val commitBIn = slave(Flow(UInt(6 bits)))
+    val commitIn  = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+    val commitBIn = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     val flushIn   = in Bool ()
-    val robHeadIn = in UInt (6 bits)
+    val robHeadIn = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val robHeadValidIn = in Bool ()
     val irqPendingIn = in Bool ()
-    val fwdRobIn  = in UInt (6 bits)
+    val fwdRobIn  = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val fwdAddrIn = in UInt (32 bits)
     val fwdSizeIn = in(Size())
     val fwdHitOut   = out Bool ()
@@ -114,7 +114,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     val emptyOut = out Bool ()
     val fullOut  = out Bool ()
     val sqCompValidOut = out Bool ()
-    val sqCompRobOut   = out UInt (6 bits)
+    val sqCompRobOut   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
 
     sq.io.alloc.valid   := allocIn.valid
     sq.io.alloc.payload := allocIn.payload

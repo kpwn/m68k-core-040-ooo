@@ -22,7 +22,7 @@ case class CommitSlot() extends Bundle {
   * records it per-entry and folds it into the committed CCR at retire (used by the
   * exception FSM's stacked frame SR low byte). */
 case class CcrCompletion() extends Bundle {
-  val robId     = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId     = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val nzvc      = UInt(4 bits); val nzvcWrite = Bool()
   val x         = Bool();       val xWrite    = Bool()
   // The EU writeback VALUE (wbObs.result) + intWrite, captured per-ROB-entry. Used by

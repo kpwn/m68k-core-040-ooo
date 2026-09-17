@@ -18,6 +18,72 @@ import spinal.lib.misc.plugin.FiberPlugin
   * port1 the next lowest. A slot freed by a port this cycle is observed as
   * empty (selComb) by a simultaneous compaction shift, exactly as NaxRiscv does.
   */
+/** Bit indices of the per-slot PER-SOURCE dynamic-wait vector (`slot.dynWait`).
+  *
+  * ONE BIT PER (SOURCE OPERAND x DYNAMIC PRODUCER CLASS). This replaces the seven
+  * per-CLASS `*Wait` bits (lsWait / cplxWait / aluSlowWait / lsNzvcWait / cplxNzvcWait /
+  * cplxFpWait / cplxFpccWait) that used to cover ALL of a slot's sources with a single
+  * flop each.
+  *
+  * WHY: a per-class bit cannot tell WHICH of its sources is still outstanding, so
+  * clearing it on the first matching wakeup would release a consumer whose OTHER source
+  * of the same class is still in flight (a silent stale-PRF read, not a hang). The old
+  * code paid for that with a `*Remaining` guard evaluated PER SLOT, PER CYCLE: for every
+  * source it re-indexed the class's `*Busy` bitmap (50-deep for the int classes, 16-deep
+  * for the flag/FP ones) and re-compared against the live wakeup payload. That is
+  * 9 x 50:1 + 4 x 16:1 dynamic-index muxes PER SLOT, x16 slots -- measured at 2,960 LUT
+  * and 1,343 MUXF7/F8 in the post-route netlist (the fanin cone of the 112 wait flops
+  * that is reachable from the `*Busy` registers).
+  *
+  * With one bit per source the guard is STRUCTURAL: each bit is set at push from its own
+  * source's busy lookup (on the push path, x2, where that lookup already happened) and
+  * cleared by a bare tag compare against its own class's wakeup. No slot ever reads a
+  * `*Busy` bitmap again. A slot is dynamically ready exactly when the whole vector is 0,
+  * which is the same cycle the old `*Remaining==0` condition was satisfied -- see the
+  * equivalence argument on `dynWaitClear` below. Issue order and wakeup latency are
+  * unchanged; this is an area/congestion transform, not a scheduling change.
+  *
+  * The class split is DELIBERATELY KEPT (16 bits, not 8). Merging LS_A/CPLX_A/SLOW_A into
+  * one "srcA is waiting" bit would be legal under the one-in-flight-producer-per-physreg
+  * invariant this file already relies on, and would cost 8 fewer flops per slot -- but it
+  * would convert any future violation of that invariant from a HANG into a SILENT
+  * WRONG-VALUE issue (a cross-class wakeup carrying a recycled tag would release a
+  * consumer whose real producer is still running). Flops are the cheap resource here
+  * (24.5% used vs 78.8% LUT); that trade is not worth taking.
+  */
+object DynWait {
+  // int sources (psrcA / psrcB / psrcC), one bit per dynamic int producer class
+  val LS_A        = 0   // cleared by lsWakeup
+  val LS_B        = 1
+  val LS_C        = 2
+  val CPLX_A      = 3   // cleared by cplxWakeup
+  val CPLX_B      = 4
+  val CPLX_C      = 5
+  val SLOW_A      = 6   // cleared by aluSlowWakeup.pdst
+  val SLOW_B      = 7
+  val SLOW_C      = 8
+  // NZVC source (pNzvcSrc), one bit per dynamic NZVC producer class
+  val LS_NZVC     = 9   // cleared by lsNzvcWakeup
+  val CPLX_NZVC   = 10  // cleared by cplxNzvcWakeup
+  val SLOW_NZVC   = 11  // cleared by aluSlowWakeup.pNzvcDst
+  // X source (pXSrc): only the slow ALU produces X dynamically
+  val SLOW_X      = 12  // cleared by aluSlowWakeup.pXDst
+  // FP-data sources (pFpSrcA / pFpSrcB) and FPCC source (pFpccSrc): CPLX only
+  val FP_A        = 13  // cleared by cplxFpWakeup
+  val FP_B        = 14
+  val FPCC        = 15  // cleared by cplxFpccWakeup
+  val width       = 16
+
+  /** The old per-class views, for sim-only debug taps and the equivalence assertions. */
+  val lsBits       = Seq(LS_A, LS_B, LS_C)
+  val cplxBits     = Seq(CPLX_A, CPLX_B, CPLX_C)
+  val aluSlowBits  = Seq(SLOW_A, SLOW_B, SLOW_C, SLOW_NZVC, SLOW_X)
+  val lsNzvcBits   = Seq(LS_NZVC)
+  val cplxNzvcBits = Seq(CPLX_NZVC)
+  val cplxFpBits   = Seq(FP_A, FP_B)
+  val cplxFpccBits = Seq(FPCC)
+}
+
 class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   val slotCount = 16
   val wayCount  = 2
@@ -119,51 +185,54 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
         // Stored slow-class bit.  Keep opcode decoding out of the timing-sensitive
         // select cone; shift this bit with the slot during compaction.
         val isAluSlow = Reg(Bool()) init False
-        // Dynamic LS dependency: a REGISTERED per-slot bit (like `triggers`), set at
-        // push if a source physreg is produced by an in-flight LS load, cleared on
-        // the matching lsWakeup. Keeping it a single registered bit (vs reading the
-        // 48-wide lsBusy in the ready cone) keeps the lsBusy->ready->select->PRF-read
-        // path off the FMax-critical S0 arc (variant-A FMax fix). `lsDepNext` (a wire)
-        // holds the combinational next value; the compaction/maintenance below writes
-        // the reg from it (default keep).
-        val lsWait     = Reg(Bool()) init False
-        // CPLX (DivEu) dynamic dependency: identical mechanism to lsWait, but cleared
-        // by cplxWakeup (a completing multi-cycle DIV). A consumer of a DIV result
-        // waits here (DIV is variable-latency; no static issue-event).
-        val cplxWait   = Reg(Bool()) init False
-        // SLOW-ALU (SHIFT, four-stage) dynamic dependency: identical mechanism to
-        // cplxWait, cleared by aluSlowWakeup. A consumer of a shift result (int OR flag
-        // source) waits here (the slow path uses completion wakeup, not a static event).
-        val aluSlowWait = Reg(Bool()) init False
-        // LS NZVC dynamic dependency: identical mechanism to lsWait, but on lsNzvcBusy /
-        // lsNzvcWakeup. A flag-reader of an in-flight LS-produced NZVC (a MOVE-to-memory
-        // store) waits here. SEPARATE bit from lsWait so a uop reading BOTH an LS int
-        // source (T0) AND an LS NZVC source (a store) waits on each independently.
-        val lsNzvcWait = Reg(Bool()) init False
-        // CPLX NZVC dynamic dependency (task #167): identical mechanism to lsNzvcWait,
-        // but on cplxNzvcBusy / cplxNzvcWakeup. A flag-reader of an in-flight CPLX
-        // (DivEu) flag-writer (DIV/MUL/CHK/CMP2/CHK2) waits here instead of the static
-        // sbNzvc scoreboard — CPLX ops are variable-latency (CMP2/CHK2 near-immediate,
-        // DIV/MUL many cycles), so a static latency-1 trigger is wrong for them (it was
-        // being force-cleared at ISSUE time, not real completion — see cplxNzvcWakeup's
-        // doc comment in IqContext.scala). SEPARATE bit from cplxWait (int dst): CHK2/
-        // CMP2/CHK write NZVC with no int dst at all.
-        val cplxNzvcWait = Reg(Bool()) init False
-        // CPLX FP-DATA dynamic dependency: identical mechanism to cplxNzvcWait, but on
-        // cplxFpBusy / cplxFpWakeup. A reader of an in-flight FP result (a variable-latency
-        // FADD/FMUL/FDIV/FSQRT on the shared CPLX EU) waits here. SEPARATE bit from
-        // cplxWait (int dst): an FP op has NO int dst, and an FP consumer may read an
-        // int source (an FMOVE.L Dn,FPn operand) AND an FP source independently.
-        val cplxFpWait   = Reg(Bool()) init False
-        // CPLX FPCC dynamic dependency: same mechanism, on cplxFpccBusy / cplxFpccWakeup.
-        // SEPARATE bit from cplxFpWait: FCMP/FTST write FPCC with no FP dst at all.
-        val cplxFpccWait = Reg(Bool()) init False
+        // ---- PER-SOURCE dynamic-wait vector (see the `DynWait` object above) ----
+        // One REGISTERED bit per (source operand x dynamic producer class): set at push
+        // from that source's own `*Busy` lookup, cleared by a bare tag compare against
+        // that class's wakeup payload. Replaces the seven per-CLASS `*Wait` bits and,
+        // with them, the per-slot `*Remaining` / `*StillDep` re-evaluation that had to
+        // re-index the 50-deep / 16-deep `*Busy` bitmaps for every source, every cycle,
+        // in all 16 slots.
+        //
+        // `dynWaitNext` is the combinational NEXT value (default: hold). EVERY maintenance
+        // site below -- compaction shift, push insert, wakeup clear -- writes the WIRE, in
+        // the same order the old code wrote the registers, so last-assignment-wins keeps
+        // the original precedence (compaction first, wakeup clear overriding it).
+        val dynWait     = Reg(Bits(DynWait.width bits)) init 0
+        val dynWaitNext = Bits(DynWait.width bits)
+        dynWaitNext := dynWait
+        dynWait     := dynWaitNext
+        // Registered OR-reduction of the SAME next value, so `dynWaitAny` is bit-exactly
+        // `dynWait.orR` in every cycle (including reset) while costing the ready cone ONE
+        // flop input instead of a 16-wide OR. This keeps the select cone -- the hottest
+        // contested logic in the machine -- no wider than it was with seven separate bits.
+        val dynWaitAny  = Reg(Bool()) init False
+        dynWaitAny  := dynWaitNext.orR
         // default: hold (overridden by compaction-shift and wakeup-clear below).
-        // triggers==0 (static lat1) AND no pending LS / CPLX / slow-ALU / LS-NZVC / CPLX-NZVC
-        // / CPLX-FP / CPLX-FPCC source -> ready.
+        // triggers==0 (static lat1) AND no outstanding dynamic source -> ready.
         val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) &&
-                       !lsWait && !cplxWait && !aluSlowWait && !lsNzvcWait && !cplxNzvcWait &&
-                       !cplxFpWait && !cplxFpccWait
+                       !dynWaitAny
+
+        // ---- Sim-only per-CLASS views of `dynWait` ----------------------------------
+        // The fuzz / lockstep traces and PortedTestRunner's cplxNzvcWait watchdog read
+        // `slot.lsWait` / `.cplxWait` / `.cplxNzvcWait` by name. Keep those names as
+        // OR-reductions of the matching `dynWait` bits so the existing instrumentation
+        // keeps working unchanged -- elaborated ONLY under GenerationFlags.simulation
+        // (like the `fsCtx` cold-split shadow below), so a synth/GenVerilog build has
+        // no such logic at all and these vals are null there.
+        // NO setName here: an explicit name is ABSOLUTE in SpinalHDL, so naming these
+        // "lsWait" collided across all 16 slots ("Reserved name lsWait is not free").
+        // Leave them to the Area's val-name reflection, which scopes them per slot.
+        private def dynView(bits: Seq[Int]): Bool = GenerationFlags.simulation {
+          val b = bits.map(dynWait(_)).reduceLeft(_ || _)
+          b.simPublic(); b
+        }
+        val lsWait       = dynView(DynWait.lsBits)
+        val cplxWait     = dynView(DynWait.cplxBits)
+        val aluSlowWait  = dynView(DynWait.aluSlowBits)
+        val lsNzvcWait   = dynView(DynWait.lsNzvcBits)
+        val cplxNzvcWait = dynView(DynWait.cplxNzvcBits)
+        val cplxFpWait   = dynView(DynWait.cplxFpBits)
+        val cplxFpccWait = dynView(DynWait.cplxFpccBits)
 
         when(fire) { selComb := False }
         sel := selComb
@@ -175,7 +244,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // (Every field these taps expose is in the HOT record, so the split costs no
     // observability -- the ad-hoc slot traces past investigations relied on still work.)
     slots.foreach { s => s.sel.simPublic(); s.hot.robId.simPublic(); s.hot.op.simPublic()
-      s.lsWait.simPublic(); s.cplxWait.simPublic(); s.triggers.simPublic(); s.cplxNzvcWait.simPublic()
+      // The per-class `s.lsWait`/`s.cplxWait`/`s.cplxNzvcWait` taps are now sim-only
+      // OR-views of `dynWait`, published at their point of definition in the slot Area.
+      s.dynWait.simPublic(); s.dynWaitAny.simPublic()
+      s.triggers.simPublic()
       s.isAluSlow.simPublic()
       s.hot.psrcA.simPublic(); s.hot.psrcAValid.simPublic()
       s.hot.psrcB.simPublic(); s.hot.psrcBValid.simPublic()
@@ -225,8 +297,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // re-allocatable. On a flush the ROB does recycle ids (`tail := head`), but a flush
     // also clears every slot and force-invalidates the pipe output (`issuePorts(k).valid
     // := piped.valid && !flushSignal`), so no consumer can observe a recycled row.
-    val coldWay0 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH.get)
-    val coldWay1 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH.get)
+    val coldWay0 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH_DEFAULT) // robId-addressed
+    val coldWay1 = Mem(RenamedUop(), m68k040.Global.ROB_DEPTH_DEFAULT) // robId-addressed
     coldWay0.addAttribute("ram_style", "distributed") // reads must be async; BRAM cannot serve
     coldWay1.addAttribute("ram_style", "distributed")
     /** The one and only cold read: 2:1 over the two single-write-port banks. */
@@ -256,6 +328,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // hardcoded 48 — became 50 when the 2 temp arch regs T0/T1 widened the int
     // pool, so a temp's pdst could index past 48 and alias/over-run the bitmaps).
     val physIntN = m68k040.Global.PHYS_INT_REGS.get
+    // The ONE place where the configured pool size meets the plain constant every
+    // structural site derives from (RenameStage's freelist, RegfileSpec.Int.depth). If a
+    // config ever sets physInt to something else, these bitmaps and the PRF would still be
+    // built for the constant while rename handed out ids from the config -- the exact
+    // silent-corruption/frozen-machine class documented on Global.PHYS_INT_REGS_DEFAULT.
+    // Fail the BUILD instead of the board.
+    require(physIntN == m68k040.Global.PHYS_INT_REGS_DEFAULT &&
+            physIntN == m68k040.execute.regfile.RegfileSpec.Int.depth,
+      s"int physical-register pool size disagreement: Global.PHYS_INT_REGS=$physIntN, " +
+      s"Global.PHYS_INT_REGS_DEFAULT=${m68k040.Global.PHYS_INT_REGS_DEFAULT} (what " +
+      s"RenameStage's intFree allocates from), RegfileSpec.Int.depth=" +
+      s"${m68k040.execute.regfile.RegfileSpec.Int.depth} (the int PRF Mem). All three MUST " +
+      s"be equal -- see Global.PHYS_INT_REGS_DEFAULT.")
     val sbInt  = new Scoreboard(physIntN) // int physregs
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     sbNzvc.busy.simPublic()  // debug-only (task #141)
@@ -508,7 +593,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // mistaken for the oldest LS — that would block real LS issue forever -> deadlock).
     val lsPresent = B(slots.map(s => s.sel && isLs(s.hot)))
     val ohLoldest = OHMasking.first(lsPresent)         // oldest occupied LS slot (ready or not)
-    val ohL = ohLoldest & lsReady                      // issue it ONLY if it is ready
+    // ---- LS port (3): REGISTERED slot ready via a one-entry skid (2026-09-14) ----
+    // See the port-3 pipe in the registered-issue-stage block below for the full
+    // design. `lsSkidValid` is the ONLY thing `selPorts(3).ready` reads, so the LS
+    // slot's `fire` -- and through it the per-slot `triggers`/scoreboard/compaction
+    // clock enables of all 16 slots -- is a function of a flop, never of the LS EU's
+    // `issuePort.ready` cone. While the skid holds a uop the LS select is masked:
+    // nothing may be selected (the slot's ready is low anyway, this keeps the payload
+    // OR in the pipe exclusive) and the skid's own uop is what the pipe forwards.
+    val lsSkidValid = RegInit(False)
+    lsSkidValid.simPublic()
+    val ohL = ohLoldest & lsReady & B(slotCount bits, default -> !lsSkidValid)
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop
     // writes only the quotient and hands the remainder to its trailing DIVREM crack µop
@@ -672,8 +767,105 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // independently, and now simply carry a 7-bit address instead of a 418-bit payload
     // between the pick and the read. The `readAsync` is combinational, so a µop is still
     // presented to its EU on exactly the same cycle it always was.
+    //
+    // ═══ LS PORT (3): a REGISTERED slot ready (2026-09-14, routing-congestion plan item
+    // 6, half (b)) ═══════════════════════════════════════════════════════════════════
+    //
+    // For ports 0/1/2/4 the m2sPipe with `collapsBubble = false` passes the EU's ready
+    // STRAIGHT THROUGH: `selPorts(k).ready := issuePorts(k).ready`. For the LS EU that
+    // ready is the deepest cone in the machine -- `s1Ready <- tReady <- tCanLeave <-
+    // normalReqArm <- {xlate.req.ready, the D-cache's probe admission, the completion
+    // arbitration ...}` -- and it landed, in ONE cycle, on `selPorts(3).fire`, hence on
+    // `slot.fire` / `events` / `issued` and the triggers/scoreboard/compaction clock
+    // enables of all 16 slots (3,336 of the 3,856 failing endpoints on the routed
+    // 200 MHz build; the D-cache half of that chain is cut in DcachePlugin, this is the
+    // IQ half, and it cuts EVERY source of `issuePort.ready`, not only the D-cache one).
+    //
+    // DESIGN: a one-entry skid (`lsSkidValid`/`lsSkidHot`) in front of the same
+    // registered issue stage the other ports have. Occupancy credit, not a delayed
+    // valid: `selPorts(3).ready := !lsSkidValid`, a plain flop. When the slot fires and
+    // the EU is ready the uop passes straight into the issue register as before (hit
+    // path neutral, no added cycle); when the EU is NOT ready the uop parks in the skid,
+    // the slot ready drops NEXT cycle, and the skid drains into the issue register the
+    // first cycle the EU is ready. The EU's ready still exists -- as the load enable of
+    // the issue register and the skid's drain, i.e. ~2x`IqHot` flops, exactly the
+    // endpoint set it drove before through the m2sPipe register -- but it no longer
+    // reaches the slot array.
+    //
+    // ORDER AND THROUGHPUT. The skid is strictly older than any selectable slot (it was
+    // selected first), and the select is masked while it holds (`ohL` AND `!lsSkidValid`),
+    // so LS issue stays in program order: skid, then oldest ready slot. Throughput is
+    // that of any 2-deep elastic buffer: a 1-cycle EU stall costs the IQ nothing (the
+    // uop it would have refused is absorbed and drains on the recovery cycle), and a
+    // longer stall parks exactly one uop and holds the port -- the slot the old design
+    // would have held is now freed one cycle earlier, never later.
+    //
+    // WHY `collapsBubble = false` IS STILL RIGHT FOR THE OTHER PORTS, AND WHY THIS
+    // DOES NOT REOPEN ITS HAZARD. That flag's comment above warns that freeing a slot
+    // before the EU accepts "grows effective queue depth past slotCount". That IS what
+    // a skid does, by one uop, and it is harmless here because every consumer of an LS
+    // slot's fire is order-insensitive to WHEN the EU takes the uop: LS results are
+    // dynamic-wakeup only (`lsBusy`/`lsNzvcBusy`, cleared at COMPLETION, never a static
+    // latency-1 `events` trigger -- an LS pdst never enters `sbInt`, see the push-time
+    // `push0IsLs` arm), `count`/`readyReg` only need the slot to be truly empty, and a
+    // flush squashes the skid exactly as it squashes the issue register. The one thing
+    // that DID key off "the issue register holds the payload that fired last cycle" is
+    // the retimed C+1 scoreboard clear (`sbClearFire`); with a skid in front that is no
+    // longer true for port 3, so its clear decodes `lsSkidHot`, which by construction
+    // holds the LAST FIRED payload whether it parked or passed through.
+    //
+    // FLUSH. `flushSignal` (the ROB's doFlush pulse OR excActive) clears both the skid
+    // and the issue register (later assignment wins over the same-cycle loads), and the
+    // issue-port valid is additionally gated by `!flushSignal` exactly as for the other
+    // ports (task #139: a payload latched the cycle before a flush must not fire on the
+    // flush cycle). `selPorts(3).valid` is already `... && !flushSignal`, so nothing
+    // enters the skid on a flush cycle either.
+    val lsSkidHot   = Reg(IqHot())
+    val lsIssValid  = RegInit(False)
+    val lsIssHot    = Reg(IqHot())
+    val lsPiped     = Stream(IqHot())
+    lsPiped.valid   := lsIssValid
+    lsPiped.payload := lsIssHot
+    selPorts(3).ready := !lsSkidValid
+    // Forward source into the issue register: the skid when it holds (the select is
+    // masked then, so `selPorts(3).payload` reads all-zero -- `ohSelect` of an empty
+    // one-hot), else the live selection. Folded as an OR so the skid term joins the
+    // existing AND-OR reduce rather than adding a mux level behind it.
+    val lsFwdValid = selPorts(3).valid || lsSkidValid
+    val lsFwdHot   = IqHot()
+    lsFwdHot.assignFromBits(selPorts(3).payload.asBits | lsSkidHot.asBits.andMask(lsSkidValid))
+    when(lsPiped.ready) {                       // m2sPipe(collapsBubble = false) load rule
+      lsIssValid := lsFwdValid
+      lsIssHot   := lsFwdHot
+      lsSkidValid := False                      // whatever the skid held has moved on
+    }
+    when(selPorts(3).fire) {
+      lsSkidHot := selPorts(3).payload          // always: the last fired payload (sbClear)
+      when(!lsPiped.ready) { lsSkidValid := True }
+    }
+    when(flushSignal) {
+      lsSkidValid := False
+      lsIssValid  := False
+    }
+    GenerationFlags.simulation {
+      // The two forward sources are exclusive by the `ohL` mask; a violation here would
+      // OR two payloads into the issue register.
+      assert(!(lsSkidValid && selPorts(3).valid),
+        "IssueQueuePlugin: LS select fired while the port-3 skid holds a uop", FAILURE)
+      // LIVENESS (2026-09-15): the skid drains the first cycle the LS EU is ready or a
+      // flush lands; a uop parked in it for 20000 cycles means the EU's front never
+      // freed -- a no-forward-progress bug, named at the IQ rather than as a timeout.
+      val skidHeldCycles = Reg(UInt(16 bits)) init 0
+      when(lsSkidValid) { skidHeldCycles := skidHeldCycles + 1 } otherwise { skidHeldCycles := 0 }
+      assert(skidHeldCycles < U(20000, 16 bits),
+        "IssueQueuePlugin: the LS port-3 skid has held a uop for 20000 cycles -- the LS EU " +
+          "never accepted it; no forward progress on LS issue",
+        FAILURE)
+    }
+
     val pipedPorts = Seq.tabulate(5) { k =>
-      val piped = selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
+      val piped = if (k == 3) lsPiped
+                  else selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
       issuePorts(k).valid       := piped.valid && !flushSignal
       issuePorts(k).payload.uop := coldRead(piped.payload)
       issuePorts(k).payload.robId := piped.payload.robId
@@ -810,9 +1002,14 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // then the op reading the temp, dispatched within 1-2 cycles).
     def stillBusy(p: UInt): Bool =
       lsBusy(p) && !(lsWakeupPort.valid && lsWakeupPort.payload === p)
-    def lsDepInit(uop: IqHot): Bool =
-      (uop.psrcAValid && stillBusy(uop.psrcA)) || (srcBIsReg(uop) && stillBusy(uop.psrcB)) ||
-      (uop.psrcCValid && stillBusy(uop.psrcC))
+    // PER SOURCE (DynWait.LS_A / LS_B / LS_C), deliberately NOT OR-ed together: each
+    // source's verdict lands in its own slot bit, which is what makes the old per-slot
+    // `lsStillDep` re-evaluation (an lsBusy index mux per source, in all 16 slots, every
+    // cycle) unnecessary -- the multi-LS-source guard is now structural.
+    def lsDepInit(uop: IqHot): Seq[Bool] = Seq(
+      uop.psrcAValid && stillBusy(uop.psrcA),
+      srcBIsReg(uop)  && stillBusy(uop.psrcB),
+      uop.psrcCValid && stillBusy(uop.psrcC))
     val lsDep0 = lsDepInit(pushHot0)
     val lsDep1Base = lsDepInit(pushHot1)
     // Intra-push: slot1 reads slot0's dst and slot0 is an LS INT producer -> slot1 waits
@@ -821,10 +1018,10 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // + broadcast lsWakeup (compWakes covers load AND stkPush), so BOTH are lsBusy-tracked
     // (push0IsLs = isLs, store-inclusive) and BOTH must suppress the static int trigger.
     val s0IsLsIntProd = isLs(pushHot0) && pushHot0.pdstValid
-    val lsDep1 = lsDep1Base ||
-      (s0IsLsIntProd && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)) ||
-      (s0IsLsIntProd && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)) ||
-      (s0IsLsIntProd && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst))
+    val lsDep1 = Seq(
+      lsDep1Base(0) || (s0IsLsIntProd && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)),
+      lsDep1Base(1) || (s0IsLsIntProd && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)),
+      lsDep1Base(2) || (s0IsLsIntProd && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst)))
 
     // Push-time LS-NZVC dependency: does this uop READ an NZVC physreg produced by an
     // in-flight LS NZVC writer (a MOVE-to-memory store)? Same same-cycle-wakeup guard as
@@ -844,17 +1041,19 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // cplxWakeup. A consumer of an in-flight DIV result latches cplxWait.
     def stillCplxBusy(p: UInt): Bool =
       cplxBusy(p) && !(cplxWakeupPort.valid && cplxWakeupPort.payload === p)
-    def cplxDepInit(uop: IqHot): Bool =
-      (uop.psrcAValid && stillCplxBusy(uop.psrcA)) || (srcBIsReg(uop) && stillCplxBusy(uop.psrcB)) ||
-      (uop.psrcCValid && stillCplxBusy(uop.psrcC))
+    // Per source (DynWait.CPLX_A / CPLX_B / CPLX_C) -- same rationale as lsDepInit.
+    def cplxDepInit(uop: IqHot): Seq[Bool] = Seq(
+      uop.psrcAValid && stillCplxBusy(uop.psrcA),
+      srcBIsReg(uop)  && stillCplxBusy(uop.psrcB),
+      uop.psrcCValid && stillCplxBusy(uop.psrcC))
     val cplxDep0 = cplxDepInit(pushHot0)
     val cplxDep1Base = cplxDepInit(pushHot1)
     // Intra-push: slot1 reads slot0's dst and slot0 is a DIV producer -> slot1 waits.
     val s0IsCplxProd = isCplxProducer(pushHot0)
-    val cplxDep1 = cplxDep1Base ||
-      (s0IsCplxProd && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)) ||
-      (s0IsCplxProd && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)) ||
-      (s0IsCplxProd && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst))
+    val cplxDep1 = Seq(
+      cplxDep1Base(0) || (s0IsCplxProd && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)),
+      cplxDep1Base(1) || (s0IsCplxProd && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)),
+      cplxDep1Base(2) || (s0IsCplxProd && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst)))
 
     // Push-time CPLX-NZVC (DivEu flag-writer) dependency (task #167): same mechanism as
     // lsNzvcDep but on cplxNzvcBusy / cplxNzvcWakeup. A flag-reader of an in-flight CPLX
@@ -874,15 +1073,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // completes THIS exact cycle (the lost-wakeup race lsDep's own comment documents).
     def stillCplxFpBusy(p: UInt): Bool =
       cplxFpBusy(p) && !(cplxFpWakeupPort.valid && cplxFpWakeupPort.payload === p)
-    def cplxFpDepInit(uop: IqHot): Bool =
-      (uop.psrcAFpValid && stillCplxFpBusy(uop.pFpSrcA)) ||
-      (uop.psrcBFpValid && stillCplxFpBusy(uop.pFpSrcB))
+    // Per source (DynWait.FP_A / FP_B): this is the pair the old single `cplxFpWait` bit
+    // had to cover with the `cplxFpRemaining` guard (IqFpSpec's dyadic-FADD case).
+    def cplxFpDepInit(uop: IqHot): Seq[Bool] = Seq(
+      uop.psrcAFpValid && stillCplxFpBusy(uop.pFpSrcA),
+      uop.psrcBFpValid && stillCplxFpBusy(uop.pFpSrcB))
     val cplxFpDep0 = cplxFpDepInit(pushHot0)
     val cplxFpDep1Base = cplxFpDepInit(pushHot1)
     val s0IsCplxFp = isCplxFpProducer(pushHot0)
-    val cplxFpDep1 = cplxFpDep1Base ||
-      (s0IsCplxFp && pushHot1.psrcAFpValid && (pushHot1.pFpSrcA === pushHot0.pFpDst)) ||
-      (s0IsCplxFp && pushHot1.psrcBFpValid && (pushHot1.pFpSrcB === pushHot0.pFpDst))
+    val cplxFpDep1 = Seq(
+      cplxFpDep1Base(0) || (s0IsCplxFp && pushHot1.psrcAFpValid && (pushHot1.pFpSrcA === pushHot0.pFpDst)),
+      cplxFpDep1Base(1) || (s0IsCplxFp && pushHot1.psrcBFpValid && (pushHot1.pFpSrcB === pushHot0.pFpDst)))
 
     // Push-time CPLX FPCC dependency: single source, so no multi-source guard is needed
     // (mirrors cplxNzvcDep exactly).
@@ -905,20 +1106,54 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     def stillAluSlowInt(p: UInt): Bool  = aluSlowIntBusy(p)  && !slowWokeInt(p)
     def stillAluSlowNzvc(p: UInt): Bool = aluSlowNzvcBusy(p) && !slowWokeNzvc(p)
     def stillAluSlowX(p: UInt): Bool    = aluSlowXBusy(p)    && !slowWokeX(p)
-    def aluSlowDepInit(uop: IqHot): Bool =
-      (uop.psrcAValid && stillAluSlowInt(uop.psrcA)) || (srcBIsReg(uop) && stillAluSlowInt(uop.psrcB)) ||
-      (uop.psrcCValid && stillAluSlowInt(uop.psrcC)) ||
-      (uop.readsNzvc && stillAluSlowNzvc(uop.pNzvcSrc)) || (uop.readsX && stillAluSlowX(uop.pXSrc))
+    // Per source, in DynWait order SLOW_A / SLOW_B / SLOW_C / SLOW_NZVC / SLOW_X. The
+    // shift writes three reg classes at once, so the old single `aluSlowWait` bit needed
+    // the widest `*Remaining` guard of all (three 50:1 int lookups plus two 16:1 flag
+    // lookups per slot); splitting by source removes it outright.
+    def aluSlowDepInit(uop: IqHot): Seq[Bool] = Seq(
+      uop.psrcAValid && stillAluSlowInt(uop.psrcA),
+      srcBIsReg(uop)  && stillAluSlowInt(uop.psrcB),
+      uop.psrcCValid && stillAluSlowInt(uop.psrcC),
+      uop.readsNzvc   && stillAluSlowNzvc(uop.pNzvcSrc),
+      uop.readsX      && stillAluSlowX(uop.pXSrc))
     val aluSlowDep0 = aluSlowDepInit(pushHot0)
     val aluSlowDep1Base = aluSlowDepInit(pushHot1)
     // Intra-push: slot1 reads slot0's (a shift's) int/NZVC/X dst -> slot1 waits.
     val s0IsAluSlowProd = isAluSlowProducer(pushHot0)
-    val aluSlowDep1 = aluSlowDep1Base ||
-      (s0IsAluSlowProd && pushHot0.pdstValid && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)) ||
-      (s0IsAluSlowProd && pushHot0.pdstValid && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)) ||
-      (s0IsAluSlowProd && pushHot0.pdstValid && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst)) ||
-      (s0IsAluSlowProd && pushHot0.writesNzvc && pushHot1.readsNzvc && (pushHot1.pNzvcSrc === pushHot0.pNzvcDst)) ||
-      (s0IsAluSlowProd && pushHot0.writesX    && pushHot1.readsX    && (pushHot1.pXSrc === pushHot0.pXDst))
+    val aluSlowDep1 = Seq(
+      aluSlowDep1Base(0) || (s0IsAluSlowProd && pushHot0.pdstValid && pushHot1.psrcAValid && (pushHot1.psrcA === pushHot0.pdst)),
+      aluSlowDep1Base(1) || (s0IsAluSlowProd && pushHot0.pdstValid && srcBIsReg(pushHot1) && (pushHot1.psrcB === pushHot0.pdst)),
+      aluSlowDep1Base(2) || (s0IsAluSlowProd && pushHot0.pdstValid && pushHot1.psrcCValid && (pushHot1.psrcC === pushHot0.pdst)),
+      aluSlowDep1Base(3) || (s0IsAluSlowProd && pushHot0.writesNzvc && pushHot1.readsNzvc && (pushHot1.pNzvcSrc === pushHot0.pNzvcDst)),
+      aluSlowDep1Base(4) || (s0IsAluSlowProd && pushHot0.writesX    && pushHot1.readsX    && (pushHot1.pXSrc === pushHot0.pXDst)))
+    // ---- Assemble the two pushed slots' per-source dynamic-wait vectors -------------
+    // One bit per (source x dynamic class), in DynWait order. This is the ONLY place a
+    // `*Busy` bitmap is indexed on behalf of a NEW slot -- twice per cycle (way 0 / way 1)
+    // instead of the 16 per-slot re-evaluations the `*Remaining` guards used to do.
+    def dynVec(ls: Seq[Bool], cplx: Seq[Bool], slow: Seq[Bool],
+               lsNzvc: Bool, cplxNzvc: Bool, fp: Seq[Bool], fpcc: Bool): Bits = {
+      val d = Bits(DynWait.width bits)
+      d(DynWait.LS_A)      := ls(0)
+      d(DynWait.LS_B)      := ls(1)
+      d(DynWait.LS_C)      := ls(2)
+      d(DynWait.CPLX_A)    := cplx(0)
+      d(DynWait.CPLX_B)    := cplx(1)
+      d(DynWait.CPLX_C)    := cplx(2)
+      d(DynWait.SLOW_A)    := slow(0)
+      d(DynWait.SLOW_B)    := slow(1)
+      d(DynWait.SLOW_C)    := slow(2)
+      d(DynWait.LS_NZVC)   := lsNzvc
+      d(DynWait.CPLX_NZVC) := cplxNzvc
+      d(DynWait.SLOW_NZVC) := slow(3)
+      d(DynWait.SLOW_X)    := slow(4)
+      d(DynWait.FP_A)      := fp(0)
+      d(DynWait.FP_B)      := fp(1)
+      d(DynWait.FPCC)      := fpcc
+      d
+    }
+    val dynDep0 = dynVec(lsDep0, cplxDep0, aluSlowDep0, lsNzvcDep0, cplxNzvcDep0, cplxFpDep0, cplxFpccDep0)
+    val dynDep1 = dynVec(lsDep1, cplxDep1, aluSlowDep1, lsNzvcDep1, cplxNzvcDep1, cplxFpDep1, cplxFpccDep1)
+
     // Intra-push: slot1 reads a physreg that slot0 (pushed same cycle) writes.
     // slot0 ends at slot0Prio; set slot1's trigger bit there.
     //
@@ -966,13 +1201,11 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
           wDst.isAluSlow := wSrc.isAluSlow
           wDst.triggers := (wSrc.triggers >> wayCount).resized
           wDst.sel      := wSrc.selComb
-          wDst.lsWait   := wSrc.lsWait     // LS dependency shifts with the slot
-          wDst.cplxWait := wSrc.cplxWait   // CPLX (DIV) dependency shifts with the slot
-          wDst.aluSlowWait := wSrc.aluSlowWait // slow-ALU (shift) dependency shifts too
-          wDst.lsNzvcWait  := wSrc.lsNzvcWait  // LS-NZVC dependency shifts with the slot
-          wDst.cplxNzvcWait := wSrc.cplxNzvcWait // CPLX-NZVC dependency shifts too (task #167)
-          wDst.cplxFpWait   := wSrc.cplxFpWait     // CPLX FP-DATA dependency shifts with the slot
-          wDst.cplxFpccWait := wSrc.cplxFpccWait   // CPLX FPCC dependency shifts too
+          // The whole per-source dynamic-wait vector shifts with the slot, exactly as the
+          // seven per-class bits used to. Source = the REGISTER (`wSrc.dynWait`), matching
+          // the old `wDst.lsWait := wSrc.lsWait`; the wakeup-clear block below then
+          // overrides individual bits of the DESTINATION wire, same precedence as before.
+          wDst.dynWaitNext := wSrc.dynWait
         }
       }
       // New uops into the last line. Only the NARROW record lands in the slot; the wide
@@ -983,24 +1216,12 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       wDst0.isAluSlow := push0IsAluSlow
       wDst0.triggers := trig0
       wDst0.sel      := True
-      wDst0.lsWait   := lsDep0
-      wDst0.cplxWait := cplxDep0
-      wDst0.aluSlowWait := aluSlowDep0
-      wDst0.lsNzvcWait  := lsNzvcDep0
-      wDst0.cplxNzvcWait := cplxNzvcDep0
-      wDst0.cplxFpWait   := cplxFpDep0
-      wDst0.cplxFpccWait := cplxFpccDep0
+      wDst0.dynWaitNext := dynDep0
       wDst1.hot      := pushHot1
       wDst1.isAluSlow := push1IsAluSlow
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
-      wDst1.lsWait   := lsDep1
-      wDst1.cplxWait := cplxDep1
-      wDst1.aluSlowWait := aluSlowDep1
-      wDst1.lsNzvcWait  := lsNzvcDep1
-      wDst1.cplxNzvcWait := cplxNzvcDep1
-      wDst1.cplxFpWait   := cplxFpDep1
-      wDst1.cplxFpccWait := cplxFpccDep1
+      wDst1.dynWaitNext := dynDep1
     }
 
     // ---- Cold-payload writes (the wide half of the same push) ----------------------
@@ -1034,149 +1255,94 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       }
     }
 
-    // ---- LS dynamic wakeup: clear lsWait for slots reading the woken pdst. ----
-    // Mirrors the trigger/eventsMoved shift discipline: on a compaction cycle the
-    // matched slot moves down by wayCount, so the clear is applied to slot i-wayCount.
-    // Placed AFTER the compaction block so it overrides the shifted lsWait value.
-    val lsWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      lsWakeupPort.valid && s.sel &&
-        ((u.psrcAValid && (u.psrcA === lsWakeupPort.payload)) ||
-         (srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)) ||
-         (u.psrcCValid && (u.psrcC === lsWakeupPort.payload)))
-    })
-    // MULTI-LS-SOURCE GUARD: a slot may read TWO (or three) registers that are EACH an
-    // in-flight LS LOAD result (the first consumer of a multi-register MOVEM load — e.g.
-    // `ADD Dn,Dm` where both Dn and Dm were just MOVEM-loaded). `lsWait` is a single bit,
-    // so a naive clear on the FIRST matching wakeup would let the slot issue while the
-    // OTHER LS source is still in flight -> it reads a stale (pre-load) value. Only clear
-    // `lsWait` once NO other LS source of the slot is still busy: re-evaluate the slot's
-    // remaining LS dependency against `stillBusy` (which already excludes the pdst woken
-    // THIS cycle), and keep waiting while another source remains busy.
-    val lsStillDep = Vec(slots.map { s => lsDepInit(s.hot) })
-    for (i <- 0 until slotCount) {
-      when(lsWakeMatch(i) && !lsStillDep(i)) {
-        // on a non-compaction cycle, clear slot i; on compaction, clear slot i-wayCount.
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).lsWait := False }
-          .otherwise        { slots(i).lsWait := False }
-      }
-    }
+    // ---- DYNAMIC WAKEUP: clear the matching PER-SOURCE wait bits -------------------
+    // This one block replaces the seven per-class clear blocks (lsWakeMatch,
+    // lsNzvcWakeMatch, cplxWakeMatch, cplxNzvcWakeMatch, cplxFpWakeMatch,
+    // cplxFpccWakeMatch, aluSlowWakeMatch) and, with them, every `*Remaining` /
+    // `lsStillDep` re-evaluation.
+    //
+    // WHAT WENT AWAY AND WHY IT IS SAFE. A per-CLASS bit covered every source of that
+    // class at once, so the old code could not clear it on the first matching wakeup --
+    // a second source of the same class might still be in flight (a stale-PRF read, not
+    // a hang). It therefore re-derived, PER SLOT and PER CYCLE, whether any source of
+    // that class was still busy: `lsStillDep` / `cplxRemaining` / `cplxFpRemaining` /
+    // `aluSlowRemaining`, each indexing the class's `*Busy` bitmap (50-deep for the int
+    // classes, 16-deep for the flag/FP ones) once per source. With one bit per source
+    // that question is answered by the bit vector itself, so the guard is deleted
+    // outright: a bit clears on ITS OWN source's wakeup and nothing else.
+    //
+    // CYCLE-EXACT EQUIVALENCE (this is an area transform, not a scheduling change).
+    // Fix a slot and a class K.
+    //   - At push, old K = OR over K's sources of "source is K-in-flight"; new K_s is
+    //     that same per-source term, from the same `still*` helpers. So old K is set iff
+    //     some new K_s is set.
+    //   - Old K cleared in the first cycle C where (a) a K wakeup matched one of the
+    //     slot's sources and (b) no K source was still K-busy after C's wakeup. (b) holds
+    //     exactly when every K source's producer has completed by C, i.e. when every
+    //     new K_s has cleared by C. Conversely if every K_s has cleared by C then the
+    //     last of them cleared on its own wakeup at some C' <= C, and at C' condition (a)
+    //     held (that source matched) and (b) held (no K source outstanding after it) --
+    //     so old K cleared at C' too. The two therefore go to zero in the SAME cycle, and
+    //     `dynWaitAny` (the registered OR of the whole vector) reaches zero in the same
+    //     cycle the old seven-way AND of `!*Wait` did. Issue order, age ordering and
+    //     wakeup latency are untouched.
+    //   - A source cannot acquire a NEW in-flight producer after its consumer is pushed
+    //     (rename hands the next writer a different physreg), which is what makes the
+    //     push-time snapshot and the old live `*Remaining` read agree in the first place.
+    //
+    // SHIFT DISCIPLINE unchanged: on a compaction cycle the matched slot moves down by
+    // wayCount, so the clear is applied to slot i-wayCount; this block sits AFTER the
+    // compaction block so it overrides the shifted value, exactly as before.
+    //
+    // The clears are pure TAG COMPARES against the wakeup payloads -- the same comparator
+    // set the old `*WakeMatch` terms already built (12 six-bit and 9 four-bit compares per
+    // slot), so the comparator cost is a wash and the `*Busy` index muxes are pure saving.
+    def slowIntWoke(p: UInt): Bool =
+      aluSlowWakeupPorts.map(w => w.valid && w.payload.pdstValid && (p === w.payload.pdst)).orR
+    def slowNzvcWoke(p: UInt): Bool =
+      aluSlowWakeupPorts.map(w => w.valid && w.payload.nzvcValid && (p === w.payload.pNzvcDst)).orR
+    def slowXWoke(p: UInt): Bool =
+      aluSlowWakeupPorts.map(w => w.valid && w.payload.xValid && (p === w.payload.pXDst)).orR
 
-    // ---- LS-NZVC dynamic wakeup: clear lsNzvcWait for slots reading the woken NZVC
-    // physreg (identical shift discipline to lsWakeMatch, on the pNzvcSrc). ----
-    val lsNzvcWakeMatch = Vec(slots.map { s =>
+    /** Per-slot clear mask: bit b set => that source's producer completed this cycle.
+      * Gated on `s.sel` exactly as every old `*WakeMatch` term was. */
+    val dynClear = Vec(slots.map { s =>
       val u = s.hot
-      lsNzvcWakeupPort.valid && s.sel && u.readsNzvc && (u.pNzvcSrc === lsNzvcWakeupPort.payload)
+      val c = Bits(DynWait.width bits)
+      val lsW   = lsWakeupPort.valid
+      val cpW   = cplxWakeupPort.valid
+      c(DynWait.LS_A)      := lsW && u.psrcAValid && (u.psrcA === lsWakeupPort.payload)
+      c(DynWait.LS_B)      := lsW && srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)
+      c(DynWait.LS_C)      := lsW && u.psrcCValid && (u.psrcC === lsWakeupPort.payload)
+      c(DynWait.CPLX_A)    := cpW && u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)
+      c(DynWait.CPLX_B)    := cpW && srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)
+      c(DynWait.CPLX_C)    := cpW && u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)
+      c(DynWait.SLOW_A)    := u.psrcAValid && slowIntWoke(u.psrcA)
+      c(DynWait.SLOW_B)    := srcBIsReg(u) && slowIntWoke(u.psrcB)
+      c(DynWait.SLOW_C)    := u.psrcCValid && slowIntWoke(u.psrcC)
+      c(DynWait.LS_NZVC)   := lsNzvcWakeupPort.valid && u.readsNzvc &&
+                              (u.pNzvcSrc === lsNzvcWakeupPort.payload)
+      c(DynWait.CPLX_NZVC) := cplxNzvcWakeupPort.valid && u.readsNzvc &&
+                              (u.pNzvcSrc === cplxNzvcWakeupPort.payload)
+      c(DynWait.SLOW_NZVC) := u.readsNzvc && slowNzvcWoke(u.pNzvcSrc)
+      c(DynWait.SLOW_X)    := u.readsX    && slowXWoke(u.pXSrc)
+      c(DynWait.FP_A)      := cplxFpWakeupPort.valid && u.psrcAFpValid &&
+                              (u.pFpSrcA === cplxFpWakeupPort.payload)
+      c(DynWait.FP_B)      := cplxFpWakeupPort.valid && u.psrcBFpValid &&
+                              (u.pFpSrcB === cplxFpWakeupPort.payload)
+      c(DynWait.FPCC)      := cplxFpccWakeupPort.valid && u.readsFpcc &&
+                              (u.pFpccSrc === cplxFpccWakeupPort.payload)
+      c.andMask(s.sel)
     })
-    for (i <- 0 until slotCount) {
-      when(lsNzvcWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).lsNzvcWait := False }
-          .otherwise        { slots(i).lsNzvcWait := False }
-      }
-    }
-
-    // ---- CPLX (DivEu) dynamic wakeup: clear cplxWait for slots reading the woken
-    // pdst (identical discipline to lsWakeMatch). A slot may read multiple in-flight
-    // CPLX results, while cplxWait is deliberately a single registered bit to keep the
-    // cplxBusy bitmap out of the ready/select cone. Re-evaluate all sources after the
-    // matching wakeup and clear only after the last CPLX dependency has completed.
-    // `stillCplxBusy` already excludes the current wake, making this safe both for
-    // separated completions and a wake concurrent with a consumer push. ----
-    def cplxRemaining(u: IqHot): Bool =
-      (u.psrcAValid && stillCplxBusy(u.psrcA)) || (srcBIsReg(u) && stillCplxBusy(u.psrcB)) ||
-      (u.psrcCValid && stillCplxBusy(u.psrcC))
-    val cplxWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      cplxWakeupPort.valid && s.sel &&
-        ((u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)) ||
-         (srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)) ||
-         (u.psrcCValid && (u.psrcC === cplxWakeupPort.payload))) &&
-        !cplxRemaining(u)
-    })
-    for (i <- 0 until slotCount) {
-      when(cplxWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxWait := False }
-          .otherwise        { slots(i).cplxWait := False }
-      }
-    }
-
-    // ---- CPLX-NZVC dynamic wakeup (task #167): clear cplxNzvcWait for slots reading
-    // the woken NZVC physreg (identical shift discipline to lsNzvcWakeMatch, on the
-    // pNzvcSrc). ----
-    val cplxNzvcWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      cplxNzvcWakeupPort.valid && s.sel && u.readsNzvc && (u.pNzvcSrc === cplxNzvcWakeupPort.payload)
-    })
-    for (i <- 0 until slotCount) {
-      when(cplxNzvcWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxNzvcWait := False }
-          .otherwise        { slots(i).cplxNzvcWait := False }
-      }
-    }
-
-    // ---- CPLX FP-DATA dynamic wakeup: clear cplxFpWait for slots reading the woken
-    // pFpDst. Like cplxWait, this is ONE registered bit covering TWO possible FP sources
-    // (the dyadic FADD/FSUB/FMUL/FDIV/FCMP forms read both), so clearing on the FIRST
-    // matching wakeup would release a consumer whose OTHER FP operand is still in flight
-    // (it would then read a stale 80-bit PRF entry -- a silent wrong-result, not a hang).
-    // Only clear once NO FP source remains busy AFTER this cycle's wakeup. ----
-    def cplxFpRemaining(u: IqHot): Bool =
-      (u.psrcAFpValid && stillCplxFpBusy(u.pFpSrcA)) || (u.psrcBFpValid && stillCplxFpBusy(u.pFpSrcB))
-    val cplxFpWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      cplxFpWakeupPort.valid && s.sel &&
-        ((u.psrcAFpValid && (u.pFpSrcA === cplxFpWakeupPort.payload)) ||
-         (u.psrcBFpValid && (u.pFpSrcB === cplxFpWakeupPort.payload))) &&
-        !cplxFpRemaining(u)
-    })
-    for (i <- 0 until slotCount) {
-      when(cplxFpWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxFpWait := False }
-          .otherwise        { slots(i).cplxFpWait := False }
-      }
-    }
-
-    // ---- CPLX FPCC dynamic wakeup: single source, so no remaining-guard (mirrors
-    // cplxNzvcWakeMatch exactly). ----
-    val cplxFpccWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      cplxFpccWakeupPort.valid && s.sel && u.readsFpcc && (u.pFpccSrc === cplxFpccWakeupPort.payload)
-    })
-    for (i <- 0 until slotCount) {
-      when(cplxFpccWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).cplxFpccWait := False }
-          .otherwise        { slots(i).cplxFpccWait := False }
-      }
-    }
-
-    // ---- SLOW-ALU (shift) dynamic wakeup: clear aluSlowWait for slots reading ANY of
-    // the woken int/NZVC/X dsts, on EITHER ALU-EU wakeup port (same shift discipline as
-    // cplxWakeMatch). ----
-    def slowMatchOne(u: IqHot, aw: Flow[AluSlowWakeup]): Bool =
-      aw.valid && (
-        (aw.payload.pdstValid && ((u.psrcAValid && (u.psrcA === aw.payload.pdst)) ||
-                                  (srcBIsReg(u) && (u.psrcB === aw.payload.pdst)) ||
-                                  (u.psrcCValid && (u.psrcC === aw.payload.pdst)))) ||
-        (aw.payload.nzvcValid && u.readsNzvc && (u.pNzvcSrc === aw.payload.pNzvcDst)) ||
-        (aw.payload.xValid    && u.readsX    && (u.pXSrc === aw.payload.pXDst)))
-    // A slot may read MORE THAN ONE in-flight slow (shift) producer (e.g. `sub d0,d2`
-    // where both d0 and d2 are still-in-flight shifts). With a deeper slow pipe the two
-    // producers' wakeups can be several cycles apart, so clearing the single aluSlowWait
-    // bit on the FIRST matching wakeup would issue the consumer before its OTHER slow
-    // operand has landed. Only clear aluSlowWait once NO slow operand remains in flight
-    // AFTER this cycle's wakeups (stillAluSlow* already excludes a same-cycle wake). ──
-    def aluSlowRemaining(u: IqHot): Bool =
-      (u.psrcAValid && stillAluSlowInt(u.psrcA)) || (srcBIsReg(u) && stillAluSlowInt(u.psrcB)) ||
-      (u.psrcCValid && stillAluSlowInt(u.psrcC)) ||
-      (u.readsNzvc && stillAluSlowNzvc(u.pNzvcSrc)) || (u.readsX && stillAluSlowX(u.pXSrc))
-    val aluSlowWakeMatch = Vec(slots.map { s =>
-      val u = s.hot
-      s.sel && aluSlowWakeupPorts.map(aw => slowMatchOne(u, aw)).orR && !aluSlowRemaining(u)
-    })
-    for (i <- 0 until slotCount) {
-      when(aluSlowWakeMatch(i)) {
-        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).aluSlowWait := False }
-          .otherwise        { slots(i).aluSlowWait := False }
+    // Per-bit conditional clears (NOT `next := next & ~clear`): reading a combinational
+    // signal one is also driving is a loop in SpinalHDL, and the `when(...) { := False }`
+    // form is the same last-assignment-wins override the old per-class blocks used.
+    for (i <- 0 until slotCount; b <- 0 until DynWait.width) {
+      when(dynClear(i)(b)) {
+        // On a non-compaction cycle clear slot i; on compaction, slot i-wayCount (the two
+        // oldest slots are discarded by the shift, so i < wayCount has no destination).
+        when(pushPort.fire) { if (i >= wayCount) slots(i - wayCount).dynWaitNext(b) := False }
+          .otherwise        { slots(i).dynWaitNext(b) := False }
       }
     }
 
@@ -1356,8 +1522,14 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // reads a plain m2sPipe FLOP, exactly as task #219 left it -- the cold Mem's LUTRAM
     // read is NOT in this cone. Routing the dsts through the Mem instead would have put a
     // distributed-RAM level back into the `sb*_busy` path this fix exists to shorten.
+    // PORT 3 (2026-09-14): with the registered-ready skid in front of the LS issue
+    // register, `pipedPorts(3).payload` is no longer guaranteed to be the payload that
+    // fired last cycle (a parked uop sits in the skid while the register still holds the
+    // older one). `lsSkidHot` is written on EVERY port-3 fire, parked or passed-through,
+    // so it is exactly "the payload that fired last cycle" on every `sbClearFire(3)`
+    // cycle. Still a plain flop; the sb*_busy cone is unchanged.
     for (k <- selPorts.indices) {
-      val ctx = pipedPorts(k).payload
+      val ctx = if (k == 3) lsSkidHot else pipedPorts(k).payload
       when(sbClearFire(k)) {
         when(ctx.pdstValid)   { sbInt.busy(ctx.pdst)      := False; sbIntClr(ctx.pdst)      := True }
         when(ctx.writesNzvc)  { sbNzvc.busy(ctx.pNzvcDst) := False; sbNzvcClr(ctx.pNzvcDst) := True }
@@ -1496,7 +1668,15 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
       // the SAME enable mirrors it cycle for cycle, back-pressure included.
       val ohOf = Seq(oh0, oh1, ohB, ohL, ohC)
       for (k <- 0 until 5) {
-        val fsPiped = RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
+        // PORT 3 (2026-09-14): the LS port has a one-entry skid in front of its issue
+        // register (see `lsSkidValid`), so its shadow mirrors that structure: a skid
+        // shadow captured on every port-3 fire (exactly as `lsSkidHot` is), and an issue
+        // shadow loaded on `lsPiped.ready` from the skid shadow while the skid holds,
+        // else from the live select -- the same source rule the real pipe applies.
+        val fsPiped = if (k == 3) {
+          val fsSkid = RegNextWhen(MuxOH(ohL, fsCtx), selPorts(3).fire)
+          RegNextWhen(Mux(lsSkidValid, fsSkid, MuxOH(ohL, fsCtx)), lsPiped.ready)
+        } else RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
         when(pipedPorts(k).valid) {
           assert(issuePorts(k).payload === fsPiped,
             s"IQ cold-split: port $k dispatch payload diverged from the full-context shadow")

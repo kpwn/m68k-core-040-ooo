@@ -5,32 +5,28 @@ import spinal.core._
 /** Compile-time sizing for the whole core (spec Appendix A). All depths are
   * parameters so IPC/area/FMax can be swept without rearchitecting. */
 case class M68kParams(
-    // ROB depth. RobPlugin now DERIVES its array size from this (it used to hardcode
-    // 64, which made this knob a lie -- see the 2026-09-14 note there).
-    // ⚠️ 32 DOES NOT ELABORATE YET. ~45 sites are converted and the MECHANICAL work is
-    // DONE -- a full sweep confirms every remaining `UInt(6 bits)` in the core is a
-    // shift count or bit-field width (0..63), not a robId.
+    // ROB depth and int phys-reg pool. Both are DERIVED from the single source of
+    // truth in `Global`, never restated here -- see `Global.ROB_DEPTH_DEFAULT` and
+    // `Global.PHYS_INT_REGS_DEFAULT` for why each is a plain constant and what the
+    // `require`s in `ParamPlugin`/`IssueQueuePlugin` are protecting.
     //
-    // What blocks it is ONE DESIGN DECISION, not another edit. LsEuPlugin.scala:1410
-    // packs the D-cache load token as `False ## bDone ## robId` = 1+1+6 = 8 bits. A
-    // 5-bit robId makes it 7 and the encoding breaks. The comment directly above it
-    // says a documented encoding is not something a perf refactor changes silently, and
-    // that is right: the token is a cross-module contract with DcachePlugin's early-probe
-    // CAM. Decide deliberately whether to pad the robId back to 6 in the token or to
-    // re-spec the token, then finish.
+    // MERGE NOTE (2026-09-17): master's note here said "⚠️ 32 DOES NOT ELABORATE YET",
+    // blocked on LsEuPlugin packing the D-cache load token as `False ## bDone ## robId`
+    // = 1+1+6 = 8 bits, which a 5-bit robId narrows to 7. That blocker is RESOLVED, and
+    // resolved the deliberate way the note asked for: `Global.robTag` pads the tag to
+    // the port's fixed width on the left, preserving field order and the reserved
+    // $80/$81/$82 split, so the cross-module contract with DcachePlugin's early-probe
+    // CAM is unchanged. The stale warning is dropped; the two below are still live.
     //
     // DO NOT widen `pdst` along the way -- pdst is 6 bits because there are 54 PHYSICAL
     // REGISTERS, not because of the ROB. Conflating the two is how this breaks.
     //
     // ⚠️ VERIFY BY THE NETLIST, NOT BY "a build ran": `sysValStore_32..63` must VANISH
-    // from generated/M68kFullCoreSynth.v. Earlier today a rebuild was confirmed, the
-    // ROB had NOT shrunk, and the resulting "IPC-neutral" reading was neutral precisely
-    // because nothing had changed.
-    // The payoff when done: ROB per-entry state (~19,318 cells) halves and robIdWidth
-    // drops 6 -> 5 across ~339 references -- the largest congestion lever left for the
-    // 200 MHz SoC, which closes standalone (+0.007) but misses by 0.5-1.2 ns integrated.
-    robDepth:     Int = 32,
-    physInt:      Int = 54,
+    // from generated/M68kFullCoreSynth.v. A rebuild was once confirmed, the ROB had NOT
+    // shrunk, and the resulting "IPC-neutral" reading was neutral precisely because
+    // nothing had changed.
+    robDepth:     Int = Global.ROB_DEPTH_DEFAULT,
+    physInt:      Int = Global.PHYS_INT_REGS_DEFAULT,
     physNzvc:     Int = 16,
     physX:        Int = 16,
     intRsDepth:   Int = 8,

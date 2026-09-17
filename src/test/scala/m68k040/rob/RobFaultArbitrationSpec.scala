@@ -23,7 +23,8 @@ import org.scalatest.funsuite.AnyFunSuite
   *
   * Covered here:
   *  1. two ports, same cycle, DIFFERENT robIds -> the OLDER one's record is what the
-  *     exception delivers, and the younger robId carries no mark at all;
+  *     exception delivers, and the younger robId's dyn-record gate stays closed
+  *     (since the 2026-09-16 capture cut BOTH carry the retire-blocking mark);
   *  2. the same case across the 0/63 ring WRAP, where age must be
   *     (robId - head) mod 64 and a naive robId compare would pick the wrong entry;
   *  3. a single port firing alone (the overwhelmingly common case) is unchanged;
@@ -175,15 +176,22 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
       idleFaults(dut)
       cd.waitSampling()
 
-      // The winner is marked; the loser carries NO mark at all (neither `faulted`
-      // nor the dyn-record gate) -- gate and Mem row are written by one statement,
-      // so a dropped port can never leave a half-written entry behind.
+      // FMax capture cut: the MARK is written on the fault cycle, the dyn RECORD
+      // (gate + Mem row) one cycle later, out of the four-entry capture register.
+      cd.waitSampling()
+      // FMax capture cut (2026-09-16): the arbitration now decides the dyn RECORD
+      // only. BOTH faulting entries carry the retire-blocking `faultedStore` mark
+      // (unarbitrated, so the mark never depends on `head`); only the OLDER one's
+      // dyn-record gate opens, so gate and Mem row are still written together and a
+      // loser can never present a half-written record at the head.
       assert(dut.rob.logic.faultedStore(1).toBoolean, "older entry (robId 1) must be marked faulted")
       assert(dut.rob.logic.faultDynStore(1).toBoolean, "older entry's dyn-record gate must be open")
-      assert(!dut.rob.logic.faultedStore(3).toBoolean,
-        "younger entry (robId 3) must NOT be marked -- its fault was dropped by arbitration")
+      assert(dut.rob.logic.faultedStore(3).toBoolean,
+        "younger entry (robId 3) is ALSO marked faulted -- the mark is unarbitrated, " +
+        "so a younger fault can never retire out from under an older one")
       assert(!dut.rob.logic.faultDynStore(3).toBoolean,
-        "younger entry's dyn-record gate must stay closed (no half-written entry)")
+        "younger entry's dyn-record gate must stay closed -- the OLDER entry won the " +
+        "record arbitration (no half-written entry)")
 
       // Complete 0 and 1 so the head walks to the faulted entry and delivers.
       for (id <- Seq(0, 1)) {
@@ -230,10 +238,18 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
       idleFaults(dut)
       cd.waitSampling()
 
-      assert(dut.rob.logic.faultedStore(63).toBoolean,
-        "robId 63 (age 1) is the OLDER entry across the wrap and must win")
-      assert(!dut.rob.logic.faultedStore(1).toBoolean,
-        "robId 1 (age 3) is YOUNGER across the wrap -- its fault must be dropped")
+      // FMax capture cut: the MARK is written on the fault cycle, the dyn RECORD
+      // (gate + Mem row) one cycle later, out of the four-entry capture register.
+      cd.waitSampling()
+      assert(dut.rob.logic.faultDynStore(63).toBoolean,
+        "robId 63 (age 1) is the OLDER entry across the wrap and must win the record")
+      assert(!dut.rob.logic.faultDynStore(1).toBoolean,
+        "robId 1 (age 3) is YOUNGER across the wrap -- its record must be dropped")
+      // Both are marked faulted (the mark is unarbitrated since the capture cut);
+      // what the wrap-aware age compare decides is WHICH record is delivered, and
+      // that is what the exception check below pins.
+      assert(dut.rob.logic.faultedStore(63).toBoolean && dut.rob.logic.faultedStore(1).toBoolean,
+        "both faulting entries carry the retire-blocking mark")
 
       // Retire 62 so the winner reaches the head.
       dut.rob.logic.completion(0).valid #= true
@@ -304,6 +320,9 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
       driveLs(dut, robId = 0, addr = 0x9000L, wr = true, size = 0, sup = true, atc = false)
       cd.waitSampling()
       idleFaults(dut)
+      cd.waitSampling()
+      // FMax capture cut: the MARK is written on the fault cycle, the dyn RECORD
+      // (gate + Mem row) one cycle later, out of the four-entry capture register.
       cd.waitSampling()
       assert(dut.rob.logic.faultDynStore(0).toBoolean, "occupant #1's dyn record is live")
 

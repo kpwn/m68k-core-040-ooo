@@ -65,6 +65,7 @@ class FetchAlignRingTurnoverSpec extends AnyFunSuite {
       p.lenWords #= 1
       p.ambiguousLine #= false
       p.size #= Size.LONG
+      p.ctrlXfer #= false
     }
     dut.probe.logic.feedOut.ready #= true
     dut.fa.logic.redirect.valid #= false
@@ -89,6 +90,7 @@ class FetchAlignRingTurnoverSpec extends AnyFunSuite {
       p.lenWords #= 1
       p.ambiguousLine #= false
       p.size #= Size.LONG
+      p.ctrlXfer #= false
     }
   }
 

@@ -62,11 +62,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _rsp = TranslationRsp()
     // U-write queue hooks (sibling-driven; default-idle in logic so a standalone DUT
     // that doesn't wire them still elaborates). Fetch sets U only.
-    umAccessRobId = UInt(m68k040.Global.ROB_ID_W bits)
+    umAccessRobId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid = Bool()
-    umCommitId    = UInt(m68k040.Global.ROB_ID_W bits)
+    umCommitId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid = Bool()
-    umCommitBId    = UInt(m68k040.Global.ROB_ID_W bits)
+    umCommitBId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umFlush       = Bool()
     flushAll      = Bool()
     _walkLoadCmd  = Stream(DLoadCmd())
@@ -111,11 +111,11 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore.payload.simPublic(); _walkStoreAck.simPublic()
 
     // U queue hooks default-idle (allowOverride) so a standalone DUT elaborates.
-    umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
+    umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitValid.allowOverride; umCommitValid := False
-    umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W bits)
+    umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid.allowOverride; umCommitBValid := False
-    umCommitBId.allowOverride;    umCommitBId    := U(0, m68k040.Global.ROB_ID_W bits)
+    umCommitBId.allowOverride;    umCommitBId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umFlush.allowOverride;       umFlush       := False
     flushAll.allowOverride;      flushAll      := False; flushAll.simPublic()
 
@@ -232,7 +232,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       val vpn   = Reg(UInt(20 bits))
       val sup   = Reg(Bool())
       val is8K  = Reg(Bool())
-      val robId = Reg(UInt(m68k040.Global.ROB_ID_W bits))
+      val robId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     }
     // C6 fix: mirrors DtlbPlugin's `missPending`/`walkUmPoison` pair exactly, adapted
     // to this plugin's own walk-in-progress tracking (ItlbPlugin has no `missPending`
@@ -295,7 +295,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkIs8K = Reg(Bool())
     // ...and the address space it was launched in (the ATC's FC2 tag bit).
     val walkSup  = Reg(Bool())
-    val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W bits))
+    val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     when(missReqReg.valid) {
       walkVpn   := missReqReg.vpn
       walkIs8K  := missReqReg.is8K

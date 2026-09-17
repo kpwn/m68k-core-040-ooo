@@ -74,6 +74,19 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //     by a correct CINV IC and a correct refetch of the new bytes, could still have
     //     the stale BTB entry silently redirect fetch away from X, and the wrong-path
     //     instructions RETIRE. That is an architectural divergence, not a perf artifact.
+    //
+    //     UPDATE (2026-09-16): that whole paragraph described a hole this clear only
+    //     PARTLY closes, and the rest is now closed structurally. `btbQueryValid0` (and
+    //     the fetch-directed `ftqConfirm`, whose only confirmation was a 4-bit length
+    //     match) ARE now gated on `ChunkPredecode.ctrlXfer` -- a control-transfer bit
+    //     baked by `PredecodeWord.classify` at REFILL time, so the fetch-side gate is a
+    //     pure memory-output AND with no logic added to the front end's FMax-critical
+    //     arc. That matters because THIS clear only covers the SMC route: both predictors
+    //     are keyed on VIRTUAL PC and nothing invalidates them on a TRANSLATION change
+    //     (PFLUSH/PFLUSHA, a URP/SRP/TC or ITT0/ITT1 write), while the L1I -- being VIPT
+    //     with a PHYSICAL tag -- correctly misses and refills the new bytes. The BTB clear
+    //     below stays: it is still the right thing for the SMC case, and it also stops the
+    //     predictor wasting entries on code that no longer exists.
     //   - RAS: NOT invalidated, and does not need to be. The RAS predict is gated on
     //     `s0IsReturn`, recomputed every cycle from the FRESHLY FETCHED slot0 opword
     //     (RTS=0x4E75 / RTR=0x4E77). If SMC replaces the return with something else, the

@@ -6,7 +6,7 @@ import spinal.lib._
 
 case class IqContext() extends Bundle {
   val uop   = RenamedUop()
-  val robId = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
 }
 
 /** The NARROW per-slot record: exactly the `IqContext` fields the issue queue's OWN
@@ -96,7 +96,7 @@ case class IqHot() extends Bundle {
   // ---- Cold-payload address. `robId` is the Mem index; `coldWay` selects which of the
   // two single-write-port banks holds it (see IssueQueuePlugin for why the banking is by
   // PUSH WAY and not by robId parity). ----
-  val robId    = UInt(m68k040.Global.ROB_ID_W bits)
+  val robId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val coldWay  = Bool()
 
   /** Project the wide dispatch record onto the hot fields. The ONLY writer of an IqHot,

@@ -6,6 +6,7 @@ import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{FpccRegFileService, FpRegFileService, IntRegFileService,
   NzvcRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.Size
+import m68k040.services.FpImmTableService
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -1075,7 +1076,19 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val fpS1IntC   = Reg(Bits(32 bits))     // rdH: Extended chunk T2
     val fpS1FpDst  = Reg(Bits(80 bits))     // fpRdA: FPn read back for dyadic ops
     val fpS1FpSrc  = Reg(Bits(80 bits))     // fpRdB: FPm (fpSrcKind === FPREG)
-    val fpS1Imm    = Reg(Bits(80 bits))     // u0.fpWideImm
+    // The FP wide-immediate, captured from DecodeStage's side table (FpImmTableService,
+    // docs/PLAN_routing_congestion_architectural.md item 3) on the accepting cycle: the
+    // uop carries only the entry TAG in imm[FP_IMM_TAG_W-1:0] (useImm=False on these
+    // rows), the table is an async-read LUTRAM, and the SAME cycle releases the entry.
+    // This register is the value's ONLY consumer-side home, exactly as before.
+    val fpS1Imm    = Reg(Bits(80 bits))
+    val fpImmTab   = host[FpImmTableService]
+    val u0FpImmTag = u0.imm(m68k040.Global.FP_IMM_TAG_W - 1 downto 0).asUInt
+    val u0FpImmKind = u0.fpSrcKind === FpSrcKind.INTIMM   || u0.fpSrcKind === FpSrcKind.SINGLEIMM ||
+                      u0.fpSrcKind === FpSrcKind.DOUBLEIMM || u0.fpSrcKind === FpSrcKind.EXTIMM
+    fpImmTab.fpImmRdAddr       := u0FpImmTag
+    fpImmTab.fpImmFree.valid   := fpAccept && u0FpImmKind
+    fpImmTab.fpImmFree.payload := u0FpImmTag
     val fpS1Kind   = Reg(FpSrcKind())
     // ── FMax fanout split: a physical duplicate of `fpS1Kind` (task #265, option O4) ──
     // `fpS1Kind` is ONE register whose output fans out into two structurally different
@@ -1118,7 +1131,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
       fpS1IntC   := rdH.data
       fpS1FpDst  := fpRdA.data
       fpS1FpSrc  := fpRdB.data
-      fpS1Imm    := u0.fpWideImm
+      fpS1Imm    := fpImmTab.fpImmRdData   // side-table read, tag = u0.imm[FP_IMM_TAG_W-1:0]
       fpS1Kind   := u0.fpSrcKind
       fpS1KindB  := u0.fpSrcKind    // physical duplicate of fpS1Kind, see comment above
       fpS1Fmt    := u0.fpSrcFmt

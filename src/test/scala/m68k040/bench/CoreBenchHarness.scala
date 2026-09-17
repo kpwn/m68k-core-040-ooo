@@ -160,7 +160,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       dtlb.umCommitId    := rob.logic.h0
       dtlb.umFlush       := host[RedirectService].doFlush
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
+      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1
@@ -183,6 +183,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val feSuppress = rob.logic.earlySuppressFe && !excActive
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
+      decodeUop.backendFlush := pipeFlush      // FP wide-imm side table: backend-owned entries (Tier 2 only)
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
@@ -220,8 +221,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
       // see Ras.scala's doc comment for the design).
       val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
-      rasP.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
-                                       !rasCheckpointRestore
+      // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
+      // itself gates it with !checkpointRestore (restore wins by construction), so
+      // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
+      // registered restatement of `count === 0` (see RobPlugin), not an approximation.
+      // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
+      // change is that the long ROB->frontend route into 500+ clock-enable pins
+      // starts at a flop Q with the whole period in front of it.
+      rasP.logic.checkpointSave    := rob.logic.countIsZero
       rasP.logic.checkpointRestore := rasCheckpointRestore
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
@@ -270,6 +277,15 @@ trait CoreBenchHarness extends AnyFunSuite {
       dc.maintCmd               := exc.maintCmdOut
       exc.maintDoneIn           := dc.maintDone
       host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
+      // FullCoreSynth parity (2026-09-16): the SAME pulse must also drop the fetch
+      // BUFFER, not just the I-cache array -- `ibuf` sits DOWNSTREAM of the cache and is
+      // invalidated by nothing else, so the canonical store/CPUSHL/jump SMC sequence
+      // executes pre-patch bytes straight out of it. This line exists in
+      // FullCoreSynth.scala and was MISSING from all three simulation harnesses, so the
+      // whole ifstage_smc_* / cpush corpus was passing against a DUT in which the fix was
+      // absent -- i.e. it had zero simulation coverage and a regression deleting it from
+      // FullCoreSynth would have been invisible to the test suite.
+      host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       a7Wr.valid   := exc.a7WriteValid
       a7Wr.address := U(15, a7Wr.address.getWidth bits)
       a7Wr.data    := exc.a7WriteData.asBits
@@ -604,7 +620,14 @@ trait CoreBenchHarness extends AnyFunSuite {
           nzvc      = w.nzvc.toInt,
           nzvcWrite = w.nzvcWrite.toBoolean,
           x         = if (w.x.toBoolean) 1 else 0,
-          xWrite    = w.xWrite.toBoolean)
+          xWrite    = w.xWrite.toBoolean,
+          // 2026-09-14: mirror ExecuteLockStepSpec's capture. Without these two the
+          // handle's emit rule (`WhiteboxCapture.scala:107`, `(!isTempOnly && !divRem)
+          // || keepCommit`) counted every crack tail -- a BSR/JSR stack push, an RMW
+          // store, a DIVREM -- as its own macro instruction, inflating call/return IPC
+          // and reading RMW kernels ~2x.
+          divRem     = w.divRem.toBoolean,
+          keepCommit = w.keepCommit.toBoolean)
         wbMap(w.robId.toInt) = wb
         handle.onWb(w.robId.toInt, wb)
       }

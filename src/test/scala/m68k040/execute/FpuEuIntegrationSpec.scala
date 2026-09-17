@@ -91,7 +91,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // ---- issue-side stimulus ----
       val iValid     = in Bool ()
       val iOp        = in(DecOp())
-      val iRob       = in UInt (6 bits)
+      val iRob       = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iFlush     = in Bool ()
       // FP-specific
       val iFpuOp     = in Bits (7 bits)
@@ -167,7 +167,11 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       uop.fpuOp := iFpuOp
       uop.fpSrcKind := iFpSrcKind
       uop.fpSrcFmt := iFpSrcFmt
-      uop.fpWideImm := iFpWideImm
+      // The 80-bit FP immediate no longer rides the uop record: DivEu reads it from
+      // DecodeStage's FP wide-immediate side table (FpImmTableService). This harness has
+      // no DecodeStage, so `FpImmTableStub` stands in and the stimulus drives its read
+      // data directly (the stub ignores the tag).
+      host[m68k040.services.FpImmTableService].fpImmRdData := iFpWideImm
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -191,7 +195,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- FP-lane observation ----
       val fpCValid = out Bool (); fpCValid := eu.fpCompletion.valid
-      val fpCRob   = out UInt (6 bits); fpCRob := eu.fpCompletion.payload
+      val fpCRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); fpCRob := eu.fpCompletion.payload
       val fpWakeV  = out Bool (); fpWakeV := eu.fpWakeup.valid
       val fpWakeP  = out UInt (4 bits); fpWakeP := eu.fpWakeup.payload
       val fpccWakeV = out Bool (); fpccWakeV := eu.fpccWakeup.valid
@@ -207,7 +211,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- int-lane observation (lane independence) ----
       val intCValid = out Bool (); intCValid := eu.completion.valid
-      val intCRob   = out UInt (6 bits); intCRob := eu.completion.payload
+      val intCRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); intCRob := eu.completion.payload
       val intWakeV  = out Bool (); intWakeV := eu.wakeup.valid
       val euFaultV  = out Bool (); euFaultV := eu.euFault.valid
       // ---- int-lane FLUSH-STATE whitebox (Task 14b fix pass, Critical #1) ----
@@ -231,7 +235,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
     val rfFpcc = new RegFilePluginFpcc
     val eu = new DivEuPlugin
     val src = new Src
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new FpImmTableStub, src)) }
   }
 
   private lazy val dut = M68kSim().withVerilator.compile(new Dut)

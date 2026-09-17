@@ -43,6 +43,92 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // False so a DUT that wires nothing keeps the previous behaviour.
     val icMaintFlush = Bool(); icMaintFlush.allowOverride; icMaintFlush := False
 
+    // ── The REGISTERED arm. Every internal consumer uses THIS, never the port ─────
+    // FMax (2026-09-17). `icMaintFlush` is a combinational function of the ROB
+    // EXCEPTION FSM state -- `icMaintPulse = isActive(S_MAINTWAIT) && maintDoneIn &&
+    // (cacheSel === IC || cacheSel === BC)`, OR'd at the top level with the debug
+    // bridge's own maintenance-done pulse. Feeding that raw into `ftbBlocked` broke the
+    // design contract this file already records on `applyNow` -- "every remaining term is
+    // a register or a one-level select of one" -- of which `ftbBlocked` is a term, and
+    // which the FTQ-capacity note on `ftbBlocked` restates by REFUSING to admit a live
+    // `ftqCount === 32` comparator there. `ftbBlocked` sits at the head of the frontend's
+    // longest cone --
+    //     ftbBlocked -> applyNow -> cmdWindowPc -> ic.cmd.pc
+    //                -> live ITLB CAM/permission -> L1I cacheability
+    //                -> speculative prefetch installer control
+    // -- and anything joining it is carried through all of it in ONE cycle.
+    //
+    // Measured on `build/vivado200_allfix` place.dcp (200 MHz, 5.000 ns):
+    //   -1.524 ns, 24 levels, logic 1.625 / route 4.709
+    //   RobPlugin_logic_exc_fsm_stateReg_reg[1]/C  (fo=120, 0.628 ns of route)
+    //     -> ... -> FetchAlignPlugin_logic_applyNow (fo=146)
+    //     -> ItlbPlugin missReqReg_vpn -> the 32-entry ITLB CAM + CARRY8 -> tlb_io_hit
+    //     -> IcachePlugin lookupPageCacheable -> s0Cacheable -> nonSpecFetch
+    //     -> mshrPa -> IcachePlugin_logic_pfNextPa_reg[*]/CE
+    // and 9 further paths differing only in the destination `pfNextPa` bit. Those TEN are
+    // the only violated setup paths the CORE contributes to that run at all; every other
+    // violated endpoint in it is SoC infrastructure at >= -0.370 ns.
+    //
+    // THE SAME ENDPOINT ALREADY FAILED before this arm existed, and the comparison is the
+    // whole argument for the cut. Same flow, same worktree, one change (`build/
+    // vivado200_rob32`):
+    //   -0.429 ns, 22 levels, data path 5.205 (logic 1.191 / route 4.014)
+    //   FetchAlignPlugin_logic_quiesce_reg/C -> IcachePlugin_logic_pfNextPa_reg[7]/CE
+    // i.e. the TAIL (a `ftbBlocked` term -> applyNow -> ... -> pfNextPa/CE) is
+    // pre-existing and structural. The exception-FSM source added +2 logic levels,
+    // +0.434 ns of logic and +0.695 ns of route -- 1.129 ns of pure PREFIX -- in front of
+    // it. `quiesce` is itself a `RegNext` of the ROB's published next-state for exactly
+    // this reason (see its declaration above); this register is that same treatment, and
+    // should return the endpoint to the quiesce-sourced level.
+    //
+    // WHY ONE CYCLE OF LATENCY IS FREE, and why it does not weaken the flush.
+    // ALL THIRTEEN consumers move together -- the action block below AND the six shared
+    // decision terms -- so the arm stays self-consistent by construction, which is the
+    // entire property the completeness fix exists to hold. It is a pure retime of one
+    // restart arm, not a partial one; a partial cut (action at C, `issueBornStale` at
+    // C+1) would re-open hole 1 verbatim and is the one thing NOT to do here.
+    //
+    // The arm's job is to land strictly BETWEEN the I-cache invalidate and the
+    // architectural refetch. Both fences have a full cycle of room:
+    //   C   : `S_MAINTWAIT && maintDoneIn` -> `icMaintPulse`. `maintInvalidateAll`
+    //         clears the I-cache/BTB/FTB valids at this edge (effective C+1).
+    //         `goto(S_REDIR)`.
+    //   C+1 : THIS ARM fires. The I-cache is already empty, so the refetch it seeds
+    //         cannot repopulate from a line the CPUSH was meant to drop -- the ordering
+    //         the action block's own comment demands, with one cycle MORE margin than
+    //         the unregistered form had. `S_REDIR` asserts `exc.redirectValid`.
+    //   C+2 : `RobPlugin.doFlushReg` -> `redirect.valid` here -> `commonRedirect` to
+    //         `sysCapNextPc`, which supersedes this arm (the redirect block is textually
+    //         later, so it wins) and is the architecturally correct restart.
+    // `excActive = (fsm.state =/= IDLE)` is high at C and C+1 and `doFlush` at C+2, so
+    // `pipeFlush` is CONTINUOUS across the gap: any uop decoded out of the pre-flush
+    // IBuf during cycle C is squashed and refetched after C+2 regardless. That is not a
+    // new reliance -- the frontend free-runs for the WHOLE maintenance walk (1500+
+    // cycles for a BC-selector CPUSH ALL, `ic.cmd.valid` has no `excActive` term), so
+    // one more speculative cycle before the buffer drop changes nothing architectural.
+    //
+    // The three holes the completeness fix closed, re-checked at the new cycle:
+    //   1. `issueBornStale`. A command firing at C+1 is born stale AND has its ring
+    //      record marked stale in the same cycle -> `resultStaleProof` holds. A command
+    //      that fired at C launched a LIVE lookup; at C+1 the oracle compares
+    //      `ringStale(resultSlot)` (still False -- `ringStale.foreach(_ := True)` is a
+    //      register write landing at C+2) against `resultExpectedBornStale` (False).
+    //      They AGREE. In the unfixed RTL they disagreed precisely because the ring
+    //      write happened at C while the born-stale flag did not; shifting the whole arm
+    //      keeps the two on the same edge, which is what the oracle actually checks.
+    //   2. `ftqFlush`. The FTQ entries and `targetHoldValid` describing the discarded
+    //      stream are dropped at C+1, before the C+2 refetch can be steered by them.
+    //      Anything pushed at C describes the still-current stream and is flushed with
+    //      the rest.
+    //   3. `ftbBlocked`. No FTB plan can be APPLIED on the flush cycle. The plan from
+    //      the C command is vetoed at C+1 by this very term, and its ring window is
+    //      marked stale in the same cycle, so its cache response is discarded too.
+    // The debug-bridge source needs no argument at all: the bridge issues maintenance
+    // only while the core is halted, and `quiesce` already holds `ic.cmd.valid` low and
+    // `ftbBlocked` high for the whole of it.
+    val icMaintFlushArm = RegNext(icMaintFlush) init False
+    icMaintFlushArm.simPublic()
+
     // ---- Resolve I-cache service ----
     val ic = host[FetchService]
 
@@ -204,6 +290,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     val decodePc      = Reg(UInt(32 bits)) init 0
     val fetchPc       = Reg(UInt(32 bits)) init 0   // 8-aligned
     spinal.core.sim.SimPublic(decodePc, fetchPc)
+    // FMax (frontend floor, 2026-09-15 — the `decodePc_reg[*]/D` family, measured at
+    // -0.632 ns / 22 logic levels in the SoC build, the deepest cone in the design).
+    //
+    // `decodePc` closes a COMBINATIONAL LOOP ON ITSELF in one cycle:
+    //   decodePc -> `ftqDiff = ftqHeadE.brPc - decodePc` (32-bit subtract, 4 chained
+    //   CARRY8) -> `ftqNear`/`ftqDelta` -> `availEff` -> `Aligner.align` -> slot lengths
+    //   -> `decodePc + len*2` (a second 32-bit carry chain) -> the `suppressSlot1` mux
+    //   -> decodePc.
+    // Both 32-bit ripples are avoidable WITHOUT touching the loop's cycle structure,
+    // because both of them only ever need a ±32-byte window of the PC:
+    //   * the FTQ compare asks `brPc - decodePc ∈ [0,31]` (a 5-bit subtract plus an
+    //     equality on the upper 27 bits), and
+    //   * the decode advance adds at most WINDOW*2 = 20 < 32 bytes.
+    // So the upper 27 bits of `decodePc` only ever move by 0 or +1. Keeping
+    // `decodePc(31 downto 5) + 1` LIVE IN A REGISTER turns both 27-bit ripples into a
+    // registered operand: the compare becomes a 27-bit equality tree (2 levels, no
+    // carry) and the advance becomes a 27-bit 2:1 select (1 level, no carry).
+    //
+    // `decodePcHiP1` is a pure DERIVED register: the invariant
+    // `decodePcHiP1 === decodePc(31 downto 5) + 1` holds on EVERY cycle, and is asserted
+    // as such in simulation below. It is maintained at every one of `decodePc`'s writers
+    // via `setDecodePc` / the sequential-advance arm; nothing else may write it.
+    val decodePcHiP1  = Reg(UInt(27 bits)) init 1    // == decodePc(31 downto 5) + 1
+    val decodePcHi    = decodePc(31 downto 5)        // pure slice, free
+    spinal.core.sim.SimPublic(decodePcHiP1)
+    // Every NON-sequential `decodePc` writer goes through this helper so the companion
+    // register can never be forgotten. The 27-bit increment it carries is off the
+    // frontend loop by construction: every call site's `x` is a register output or an
+    // FTQ-memory read, never a value derived from `decodePc` this cycle.
+    def setDecodePc(x: UInt): Unit = {
+      decodePc     := x
+      decodePcHiP1 := x(31 downto 5) + 1
+    }
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
     // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
@@ -352,7 +471,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // `words.foreach(_ := 0)` default-drive on the line above, and `decode(0x0000).size`
     // is `Size.BYTE` (`ORI.B #imm,D0`). See ChunkPredecode.size.
     ibuf.io.push.payload.preds.foreach { p =>
-      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE }
+      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE
+      // Fail-closed: an un-pushed predecode slot never enables a prediction.
+      p.ctrlXfer := False }
     ibuf.io.push.payload.n := 0
     ibuf.io.shift        := 0
     ibuf.io.flush        := False
@@ -375,8 +496,32 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // sequential command and make it born stale. The registered fallback action instead
     // selects its captured target at the command mux; its ring entry is re-marked live
     // after the common born-stale assignment below.
+    // ── `icMaintFlush` IS a frontend restart arm (2026-09-16) ────────────────────
+    // The CPUSH/CINV instruction-buffer flush below (`when(icMaintFlush)`) does the same
+    // four things every other restart arm does -- reset decodePc/fetchPc, flush the IBuf,
+    // and mark EVERY outstanding ring entry stale -- but it was absent from the four
+    // shared decision terms (`redirectThisCycle`, `issueBornStale`, `ftbBlocked`,
+    // `ftqFlush`) and from the two pending-action cancels. That left three live holes,
+    // none of which any simulation could see because `icMaintFlush` was wired ONLY in
+    // FullCoreSynth and in none of the test DUTs:
+    //   1. `issueBornStale`: a command accepted on the maintenance-flush cycle still
+    //      launched a LIVE FTB/gshare fetch-plan lookup for a window the flush had just
+    //      discarded, while `ringStale.foreach(_ := True)` marked its ring record stale.
+    //      The two then disagreed at C+1 and the design's own oracle fired:
+    //      "delayed fetch-plan stale decision no longer matches its resident ring record"
+    //      (reproduced on ifstage_smc_l0_backbranch / _victim_cinv_ic / _victim_dc_ic with
+    //      caches ON, within ~100 cycles, once the harnesses wire `icMaintFlush`).
+    //   2. `ftqFlush`: the FTQ entries and `targetHoldValid` describing the DISCARDED
+    //      stream survived the flush, so the next command could be steered to a held
+    //      target from that stream and a stale `brPc` could clamp `availEff` or claim a
+    //      confirm against the re-fetched stream.
+    //   3. `ftbBlocked`: an FTB plan could still be APPLIED on the flush cycle, truncating
+    //      a ring window and pushing an FTQ entry for bytes that are being thrown away.
+    // Folding it into the existing terms (rather than adding a parallel decision tree) is
+    // what keeps all four consistent by construction.
     val redirectThisCycle = redirect.valid || (resume.valid && stalled) ||
-                            mispredictRedirect.valid || predictFire || ftqMismatch
+                            mispredictRedirect.valid || predictFire || ftqMismatch ||
+                            icMaintFlushArm
 
     // Join the two fixed-C+1 lookup results. A command which is born stale still launches
     // the I-cache request (its response must drain), but it cannot use a read-only fetch
@@ -386,7 +531,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
     // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
     // bound. The delayed issue/stale state below remains an assertion oracle.
-    val issueBornStale = redirect.valid || mispredictRedirect.valid
+    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlushArm
     val planLookupFire = ic.cmd.fire && !issueBornStale
     val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
     val resultExpectedValid = RegNext(planLookupFire) init False
@@ -466,7 +611,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // rejected at elaboration or given a separately pipelined reservation mechanism.
     val ftbBlocked = redirect.valid || (resume.valid && stalled) ||
                      quiesce || stalled || faultHold || ftbSuppress ||
-                     targetHoldValid
+                     targetHoldValid || icMaintFlushArm
     val ftbDeclineDirection = ftbCandidate && !resultDirection
     val ftbDeclineFraming = ftbCandidate && resultDirection &&
                             !(resultInWindow && resultAfterDrop)
@@ -546,7 +691,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // application is intentionally absent from this flush term: it truncates one live
     // ring window and appends its target without invalidating any older bytes.
     ftqFlush := redirect.valid || (resume.valid && stalled) ||
-                mispredictRedirect.valid || predictFire || ftqMismatch
+                mispredictRedirect.valid || predictFire || ftqMismatch ||
+                icMaintFlushArm
 
     when(applyNow && (predictFire || ftqMismatch || mispredictRedirect.valid)) {
       assert(ftqFlush && redirectThisCycle,
@@ -697,6 +843,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
             // FMax Lever B: indexed by the SAME `srcIdx` as `words(j)` above, which is what
             // keeps `preds(j).size` paired with `words(j)` across the leading-word drop.
             ibuf.io.push.payload.preds(j).size            := rspPreds(srcIdx).size
+            // Control-transfer gate: same `srcIdx` pairing as `words(j)`/`size` above, so
+            // the bit the fetch-side prediction gate reads always belongs to the opword it
+            // is gating. Dropping this line would silently pin `ctrlXfer` at its False
+            // default and disable prediction outright (caught exactly that way).
+            ibuf.io.push.payload.preds(j).ctrlXfer        := rspPreds(srcIdx).ctrlXfer
           }
         }
         ibuf.io.push.payload.n := nWords
@@ -780,9 +931,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // emit a packet made entirely of genuine bytes, never consume target bytes as an
     // extension of a fall-through instruction.
     val ftqDiff  = ftqHeadE.brPc - decodePc
-    val ftqDelta = ftqDiff(4 downto 1)
-    val ftqNear  = ftqValid && (ftqDiff(31 downto 5) === U(0, 27 bits))
+    // FMax (frontend floor, 2026-09-15 — see `decodePcHiP1`'s declaration): `ftqDelta`
+    // and `ftqNear` used to be slices of the FULL 32-bit `ftqDiff` subtract, putting four
+    // chained CARRY8s plus a 27-bit zero-detect at the HEAD of the `decodePc -> availEff
+    // -> Aligner -> decodePc` loop (and at the head of the `ftqHead -> ftqMem -> 8 CARRY8`
+    // family too, since `brPc` is an asynchronous FTQ-memory read). Restructured, NOT
+    // re-timed — bit-identical every cycle, asserted below:
+    //   * the low 5 bits of a subtract do not depend on anything above bit 4, so
+    //     `ftqDiffLow(4 downto 0) === ftqDiff(4 downto 0)` by construction, and
+    //     `ftqDiffLow(5)` is exactly the borrow OUT of bit 4;
+    //   * `ftqDiff(31 downto 5) === 0` iff `brPc(31:5) === decodePc(31:5) + borrow`
+    //     (mod 2^27) — i.e. a 2:1 select between two 27-bit EQUALITY compares, with the
+    //     `+1` operand supplied by the `decodePcHiP1` register instead of a ripple.
+    // Net effect: three chained carry hops and a 27-bit NOR tree leave the loop head,
+    // replaced by one 6-bit carry plus a 2-level equality tree. `ftqDiff` itself survives
+    // for `ftqPast` (a genuine full-width sign test) and for the simulation oracle; that
+    // residue feeds only the two-level `feed.valid` AND, not the deep aligner cone.
+    val ftqDiffLow = (False ## ftqHeadE.brPc(4 downto 0)).asUInt -
+                     (False ## decodePc(4 downto 0)).asUInt      // 6 bits; [5] = borrow
+    val ftqBorrow  = ftqDiffLow(5)
+    val ftqDelta = ftqDiffLow(4 downto 1)
+    val ftqHiEq  = Mux(ftqBorrow, ftqHeadE.brPc(31 downto 5) === decodePcHiP1,
+                                  ftqHeadE.brPc(31 downto 5) === decodePcHi)
+    val ftqNear  = ftqValid && ftqHiEq
     val ftqAt0   = ftqNear && (ftqDelta === 0)
+    // Differential proof of the restructuring above: the live oracle is the original
+    // full-width form. Elaborated in simulation only (`.includeSimulation`), so the
+    // synthesized netlist keeps only the restructured form.
+    GenerationFlags.simulation {
+      assert(ftqDelta === ftqDiff(4 downto 1),
+        "FetchAlignPlugin: narrowed ftqDelta diverged from the full-width subtract", FAILURE)
+      assert(ftqHiEq === (ftqDiff(31 downto 5) === U(0, 27 bits)),
+        "FetchAlignPlugin: registered-carry ftqNear diverged from the full-width subtract", FAILURE)
+    }
     val spliceWords = ftqDelta.resize(5) + ftqHeadE.brLen.resize(5)
     val availEff = UInt(4 bits)
     when(ftqNear && (spliceWords < ibuf.io.avail.resize(5))) {
@@ -796,6 +977,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     p0LiveReg.simple        init False
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
+    // `p0LiveReg.ctrlXfer` gets the SAME treatment as `.size` (see the task #250 note
+    // below): it is never assigned and never read. `ctrlXfer` is a pure function of the
+    // opword, so it is not ambiguity-qualified — the prediction gates read
+    // `ibuf.io.headPred(0).ctrlXfer` DIRECTLY, exactly as `Aligner.align` reads
+    // `preds(0).size` directly and for the identical reason (both mux arms carry the same
+    // value, and bypassing the `p0` mux keeps the term off `L0`'s arrival chain). Leaving
+    // it undriven is what lets synthesis prune the field out of this register entirely.
     // task #250: `p0LiveReg.size` is UNREAD by construction — `Aligner.align` sources
     // slot0's/slot1's `size` from `preds(0).size`/`p1.size` directly (see Aligner.scala's
     // "Lever B" comments), never from the `p0 = Mux(preds(0).ambiguousLine, p0LiveReg,
@@ -905,8 +1093,54 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // branch EU verifies predicted-vs-actual + the commit-time redirect recovers a
     // mispredict. A correct prediction simply avoids the squash.
     val predEnable = !faultHold && !quiesce && !stalled
+    // ── Predecoded control-transfer gate (2026-09-16) ────────────────────────────
+    // `slot0IsCtrlXfer` is a PURE MEMORY OUTPUT: the `ctrlXfer` bit of the buffer-head
+    // predecode entry, baked at I-cache REFILL time (ChunkPredecode.ctrlXfer,
+    // PredecodeWord.classify). NOTHING is computed here — no opword comparison, no
+    // aligner mux, no dependence on `L0`. It is read from `ibuf.io.headPred(0)`
+    // DIRECTLY and not through `Aligner`'s `p0` ambiguity mux, for the same reason
+    // `Aligner.align` reads `preds(0).size` directly: `ctrlXfer` needs only the opword,
+    // which is `words(0)` in BOTH arms of that mux, so the two arms are identical — and
+    // bypassing the mux keeps this term off `L0`'s arrival chain, which feeds the whole
+    // `slot0Predicted -> suppressSlot1 -> decodePcNext` arc (the measured front-end FMax
+    // floor). The gate is therefore one extra input to the AND that already forms
+    // `btbQueryValid0`, arriving at t~=0 — no new logic level in that arc.
+    //
+    // WHAT IT CLOSES: `btbQueryValid0` was gated only on "a slot was emitted", never on
+    // the slot BEING a branch, and `predTaken` — stamped on every µop of the emitted
+    // instruction — is read ONLY by `BranchEuPlugin`. So a BTB entry that survived a
+    // change of the bytes at its (fully-tagged, exact) virtual PC redirected fetch on an
+    // ordinary ALU/LS instruction with nothing downstream able to detect it, and the
+    // wrong-path instructions RETIRED. With this gate, a prediction can only ever be
+    // stamped on an instruction that decodes to a branch-EU µop, and `BranchEuPlugin`'s
+    // `mispredict` check then verifies direction AND target — so the worst case becomes a
+    // correctly-recovered mispredict instead of silent wrong-path retirement.
+    //
+    // WHY A STALE ENTRY IS REACHABLE AT ALL (the honest severity): the BTB is fully
+    // tagged on the complete 32-bit PC (`Btb.scala`: idx = pc[7:1], tag = pc[31:8]) and
+    // allocates ONLY at retire on `btbIsBranchStore` (`RobPlugin.scala`), so a non-branch
+    // PC cannot alias into a branch's entry and a non-branch can never train one. The
+    // entry must therefore have been LEGITIMATELY trained and the bytes at that exact VA
+    // must then have CHANGED underneath it. Self-modifying code is already closed
+    // (`IcachePlugin.maintInvalidateAll` fans CINV/CPUSH-IC out to the BTB). What is NOT
+    // closed is a TRANSLATION change — PFLUSH/PFLUSHA, a URP/SRP/TC write, or a 24/32-bit
+    // addressing-mode switch — remapping that VA to different physical code: the L1I is
+    // VIPT with a PHYSICAL tag, so it correctly misses and refills the new bytes, but the
+    // predictors are keyed on VIRTUAL PC and nothing invalidates them. That asymmetry is
+    // the reachable route, and it is not an everyday path.
+    //
+    // PROVEN, not argued. Two self-checking corpus programs take exactly that route on
+    // the full core (train a branch at an MMU-translated VA, repoint its leaf descriptor,
+    // PFLUSHA, execute) and issue NO cache-maintenance instruction, so the predictors
+    // survive: `mmu_remap_stale_btb_predict.s` (the FTB confirmation path -- fails
+    // 0xDEAD0B03 with the `ftqConfirm` gate removed) and `mmu_remap_stale_btb_nonbranch.s`
+    // (the decode-time BTB path, with the branch placed so the FTB declines to frame it --
+    // fails 0xDEAD0C03 with the `btbQueryValid0` gate removed). Each fails with ITS gate
+    // removed and passes with it present, so both gates are independently load-bearing.
+    val slot0IsCtrlXfer = ibuf.io.headPred(0).ctrlXfer
+    spinal.core.sim.SimPublic(slot0IsCtrlXfer)
     btbQueryPc0    := res.slot0.pc
-    btbQueryValid0 := predEnable && res.slot0Valid
+    btbQueryValid0 := predEnable && res.slot0Valid && slot0IsCtrlXfer
     btbQueryPc1    := res.slot1.pc
     btbQueryValid1 := predEnable && res.slot1Valid
     // ── gshare direction composition (slice 3) ──────────────────────────────────
@@ -966,7 +1200,15 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Exact decode-time confirmation of the fetch-side framing claim. A predicted branch
     // in slot1 is deferred to slot0 just like the retained BTB/RAS fallbacks; neither
     // fallback is removed by the FTB.
-    val ftqConfirm = ftqAt0 && res.slot0Valid && res.slot0.simple &&
+    // `slot0IsCtrlXfer` (see its declaration above) closes the same hole on the
+    // fetch-directed path. The FTB's confirmation was a 4-bit LENGTH match and nothing
+    // else, so a stale window entry whose claimed branch PC now holds a same-length
+    // NON-branch confirmed, stamped `predTaken`+`ftqHeadE.target` on it, and suppressed
+    // slot1 — again with no downstream verifier. Failing the confirm is the already-built
+    // FAIL-CLOSED path: `ftqLenBad` (below) fires, raising `ftqMismatchDetect`, which
+    // clears the FTB entry and re-steers to the instruction's real fall-through. Same
+    // pure-memory-output term, same zero added logic levels.
+    val ftqConfirm = ftqAt0 && res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer &&
                      (res.slot0.lenWords === ftqHeadE.brLen)
     val slot1WouldFtq = ftqNear && !ftqAt0 && res.slot0Valid && res.slot1Valid &&
                         (ftqDelta === res.slot0.lenWords) && !ftqConfirm
@@ -1107,9 +1349,59 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // L0L1 -> slot1Ok/suppress -> addend -> adder` arc was the bistable-ordering 194MHz
     // limiter): the adders now start as soon as their length is ready, and suppressSlot1 only
     // drives a final 1-LUT 32-bit 2:1 result mux. Byte-identical: same value, restructured.
-    val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)   // slot1 suppressed
-    val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)       // full aligner shift
-    val decodePcNext     = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
+    //
+    // FMax 2026-09-15 (same lever as `decodePcHiP1`'s declaration): that retime is KEPT
+    // exactly — `suppressSlot1` still passes through precisely ONE 2:1 select before the
+    // flop — but the two 32-bit adders behind it are replaced by two 6-bit adds plus a
+    // registered high half. `res.slot0.lenWords`/`res.shiftWords` are aligner outputs
+    // bounded by WINDOW=10, so the byte increment is at most 20 and the upper 27 bits of
+    // `decodePc` can only stay put or advance by one. Hence, for each candidate:
+    //     low   = decodePc(4 downto 0) + (len << 1)        -- 6 bits, [5] = carry out
+    //     high  = carry ? decodePcHiP1 : decodePc(31 downto 5)
+    // which is bit-identical to the 32-bit add (a ripple carry out of bit 4 into bit 5 is
+    // exactly `low(5)`), and drops three of the four chained CARRY8s from the LATE
+    // `pred_lenWords -> aligner -> decodePc[31:5]` arrival — 27 of this family's 32
+    // endpoints. `decodePcHiP1` is a register, so the `+1` it supplies costs nothing here.
+    //
+    // The companion register must advance with it: next(decodePc(31:5)) + 1 is
+    // `carry ? decodePcHiP1 + 1 : decodePcHiP1`, and that increment is likewise a
+    // register-to-register ripple that never sees an aligner output.
+    val pcLow        = decodePc(4 downto 0)
+    // NB `|<<` is SpinalHDL's FIXED-WIDTH shift: the widening `.resize(6)` MUST come
+    // before it, exactly as the full-width reference below resizes to 32 before shifting.
+    // Shifting a 4-bit `lenWords` in place drops its MSB, which is wrong for every
+    // instruction of 8 words or more — caught by the equivalence assert below on
+    // `lock-step F2 FIX` (the 8-word mem-indirect case), not by inspection.
+    val lowSuppress  = (False ## pcLow).asUInt + (res.slot0.lenWords.resize(6) |<< 1)
+    val lowFull      = (False ## pcLow).asUInt + (res.shiftWords.resize(6)     |<< 1)
+    val hiP1Inc      = decodePcHiP1 + 1
+    val hiSuppress   = Mux(lowSuppress(5), decodePcHiP1, decodePcHi)
+    val hiFull       = Mux(lowFull(5),     decodePcHiP1, decodePcHi)
+    val hiP1Suppress = Mux(lowSuppress(5), hiP1Inc,      decodePcHiP1)
+    val hiP1Full     = Mux(lowFull(5),     hiP1Inc,      decodePcHiP1)
+    val decodePcNext     = Mux(suppressSlot1, hiSuppress, hiFull) @@
+                           Mux(suppressSlot1, lowSuppress(4 downto 0), lowFull(4 downto 0))
+    val decodePcNextHiP1 = Mux(suppressSlot1, hiP1Suppress, hiP1Full)
+    // Differential proof of the split-field advance: the live oracle is the original
+    // full-width form. Simulation only; the netlist keeps only the split form.
+    //
+    // These run UNGATED, on every cycle: they caught the `|<<` width bug above on the
+    // lock-step corpus, and holding them everywhere (not only where `decodePcNext` is
+    // consumed) is what makes the restructuring a proof rather than a spot check.
+    GenerationFlags.simulation {
+      val decodePcSuppress = decodePc + (res.slot0.lenWords.resize(32) |<< 1)
+      val decodePcFull     = decodePc + (res.shiftWords.resize(32) |<< 1)
+      val refNext          = Mux(suppressSlot1, decodePcSuppress, decodePcFull)
+      assert(decodePcNext === refNext,
+        "FetchAlignPlugin: split-field decodePc advance diverged from the full-width adders",
+        FAILURE)
+      assert(decodePcNextHiP1 === (refNext(31 downto 5) + 1),
+        "FetchAlignPlugin: split-field decodePc companion diverged from its invariant",
+        FAILURE)
+      assert(decodePcHiP1 === (decodePcHi + 1),
+        "FetchAlignPlugin: decodePcHiP1 lost its decodePc(31 downto 5)+1 invariant",
+        FAILURE)
+    }
 
     // A shorter real instruction at the claimed branch PC may emit because every one of
     // its words is still genuine; recover at its fall-through. Likewise, an instruction
@@ -1164,7 +1456,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       predictTargetReg := predTargetSel
     }
     val predictDetectBlocked = redirect.valid || (resume.valid && stalled) ||
-                               mispredictRedirect.valid || ftqMismatchDetect
+                               mispredictRedirect.valid || ftqMismatchDetect ||
+                               icMaintFlushArm
     when(predictDetectBlocked) {
       predictPending := False
     }
@@ -1181,11 +1474,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // An architectural redirect on the detector edge already discards the malformed
     // plan, so it cancels the pending action. A same-cycle fallback detector is itself
     // canceled above: the registered mismatch action owns the next cycle.
-    when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid) {
+    when(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
+         icMaintFlushArm) {
       ftqMismatchPending := False
     }
     val ftqMismatchDetectKept = ftqMismatchDetect &&
-      !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid)
+      !(redirect.valid || (resume.valid && stalled) || mispredictRedirect.valid ||
+        icMaintFlushArm)
     val ftqMismatchDetectKeptD = RegNext(ftqMismatchDetectKept) init False
     when(ftqMismatch) {
       assert(ftqMismatchDetectKeptD,
@@ -1202,6 +1497,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift
       decodePc      := decodePcNext
+      decodePcHiP1  := decodePcNextHiP1
       when(res.complex) {
         // Complex instruction: stall after emitting — wait for resume
         stalled := True
@@ -1212,7 +1508,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // already appended by the fetch ring. It does not flush the IBuf or stale the ring.
     val ftqConfirmFire = ftqConfirm && feed.fire && !emittingFaultPacket
     when(ftqConfirmFire) {
-      decodePc := ftqHeadE.target
+      setDecodePc(ftqHeadE.target)
     }
     ftqPop := ftqConfirmFire
     spinal.core.sim.SimPublic(ftqConfirmFire)
@@ -1253,7 +1549,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       val newBase = predictWindowPc
       val actionWins = !(redirect.valid || (resume.valid && stalled) ||
                          mispredictRedirect.valid || ftqMismatch)
-      decodePc    := newPc
+      setDecodePc(newPc)
       fetchPc     := Mux(ic.cmd.fire && actionWins, newBase + 8, newBase)
       ibuf.io.flush  := True
       stalled        := False
@@ -1279,7 +1575,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // genuinely different (the `actionWins` window-reuse logic), so folding either in here
     // would blur a real distinction rather than remove a redundant one.
     def commonRedirect(newPc: UInt, clearFaultHold: Boolean = true): Unit = {
-      decodePc      := newPc
+      setDecodePc(newPc)
       // fetchPc = 8-aligned base of the window containing newPc
       fetchPc       := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush := True
@@ -1325,9 +1621,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // architecture requires after cache maintenance, and it is ordered AFTER the pulse --
     // which ExceptionUnit deliberately fires on the maintenance walk's COMPLETION -- so the
     // refetch cannot repopulate from a line that is about to be invalidated.
-    when(icMaintFlush) {
+    when(icMaintFlushArm) {
       val newPc       = decodePc
-      decodePc        := newPc
+      setDecodePc(newPc)
       fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush   := True
       stalled         := False
@@ -1338,7 +1634,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
 
     when(ftqMismatch) {
       val newPc       = ftqMismatchPc
-      decodePc        := newPc
+      setDecodePc(newPc)
       fetchPc         := newPc(31 downto 3) @@ U(0, 3 bits)
       ibuf.io.flush   := True
       stalled         := False
@@ -1432,7 +1728,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
       ftbSuppress := True
     }
     when(redirect.valid || (resume.valid && stalled) ||
-         mispredictRedirect.valid || predictFire) {
+         mispredictRedirect.valid || predictFire || icMaintFlushArm) {
       ftbSuppress := False
     }
 

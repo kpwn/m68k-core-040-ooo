@@ -265,10 +265,24 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // parallel with the DTLB lookup. One shared two-stage result pipe registers the
     // selected 128-bit way, then stores only the extracted 32-bit value in the
     // reserved entry. This supports a probe every cycle without replicating a full
-    // cache line per outstanding load. Four entries cover D1's fixed P2->command
+    // cache line per outstanding load. The entries cover D1's fixed P2->command
     // distance; if they fill, probe.ready drops but the resolved load path remains
     // correct and simply uses the ordinary S1 read.
-    val earlyProbeDepth = 4
+    //
+    // FIVE entries, not four (2026-09-14, item 6 of the routing-congestion plan).
+    // `loadProbePort.ready` is now a REGISTERED credit (`probeReadyReg`, see its
+    // declaration below the store pipe): it says "a queue entry is free THIS cycle",
+    // computed exactly from last cycle's next-state, and it can no longer see a
+    // same-cycle consume. The measured P2 -> loadCmd distance is FOUR cycles (P2 fire
+    // -> tx -> P3 -> P4 -> aligned ring -> loadCmd), so a saturated one-load-per-cycle
+    // stream keeps four entries live and the old four-entry queue was FULL on every
+    // cycle of it, sustaining II=1 only through the same-cycle consume-and-replace
+    // reuse (`earlyProbeReusesConsume`). A registered credit cannot express that
+    // reuse, so with four entries it would have closed the port every other cycle
+    // under saturation. The fifth entry restores exactly today's envelope: four live
+    // plus one free, so the credit is transparent at II=1, and a fifth live entry
+    // (a command lagging one cycle) stalls P2 exactly where the old design did.
+    val earlyProbeDepth = 5
     val earlyProbePtrW  = log2Up(earlyProbeDepth)
     val earlyProbeValids  = Vec.fill(earlyProbeDepth)(RegInit(False))
     val earlyProbeReadies = Vec.fill(earlyProbeDepth)(RegInit(False))
@@ -464,7 +478,29 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val diagFaultKind1Fires = Bool(); diagFaultKind1Fires := False
 
     // ---- defaults ----
-    loadProbePort.ready := False
+    // `loadProbePort.ready` is a REGISTERED credit (2026-09-14, routing-congestion plan
+    // item 6): `probeReadyReg`, declared and driven below the store pipe, is the ONLY
+    // driver. The load FSM no longer touches the port's ready at all; it decides
+    // LAUNCH (`loadProbeLaunch`) for a probe the credit already admitted. See the
+    // block that drives `probeReadyReg` for the full contract.
+    val probeReadyReg = RegInit(False)
+    probeReadyReg.simPublic()
+    loadProbePort.ready := probeReadyReg
+    /** A probe that handshaked THIS cycle is actually launched (array read + entry
+      * allocation). `loadProbePort.fire && !loadProbeLaunch` is a DROPPED probe: the
+      * credit admitted it but a same-cycle condition the credit cannot know one cycle
+      * ahead (a resolved command owning the shared read port, or an older S1 miss
+      * being discovered) made the launch impossible. Dropping is architecturally
+      * invisible -- the probe is a side-effect-free array read, and its later
+      * resolved command finds no queued token and takes the ordinary S1 read. Driven
+      * only from the load FSM's IDLE arm; defaults False in every other state. */
+    val loadProbeLaunch = Bool(); loadProbeLaunch := False
+    loadProbeLaunch.simPublic()
+    /** The shadow-replay slot's two events, exported from the IDLE arms that own them
+      * purely so the credit's next-state replica of `loadShadowValid` reads the same
+      * conditions the register itself is written from. */
+    val loadShadowLaunchEv  = Bool(); loadShadowLaunchEv  := False
+    val loadShadowCaptureEv = Bool(); loadShadowCaptureEv := False
     loadCmdPort.ready := False
     axi.ar.valid := False
     axi.ar.payload.assignDontCare()
@@ -866,7 +902,19 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // `earlyProbeReusesConsume` is deliberately left as its own signal: the
     // consume-and-replace guard at the `loadCmdPort.fire && earlyProbeOwnsCmd` block
     // below still reads it, and it is NOT the same expression as this one.
-    val earlyProbeSlotAndPortFree = Mux(loadCmdPort.valid, useEarlyProbe, earlyProbeHasFree)
+    //
+    // 2026-09-14 (registered probe credit, plan item 6): `loadCmdPort.FIRE`, no longer
+    // `.valid`. This term now gates the LAUNCH of an already-admitted probe, and a probe
+    // that cannot launch is DROPPED (see `loadProbeLaunch`), so the question it must
+    // answer is exactly "does a resolved command use the shared read port THIS cycle" --
+    // and a command that is presented but HELD (`loadCmdPort.ready` low: its own probe
+    // result not yet ready, the one-cycle `earlyProbeConflict` hold, ...) launches no
+    // read. Under the old combinational ready the `.valid` form merely stalled P2 for
+    // that cycle; under drop semantics it would throw the probe away for nothing.
+    // Every arm of the load FSM that drives `rdSet` is `loadCmdPort.fire && ...`, so
+    // `fire` is the precise port-ownership predicate. `loadCmdPort.ready` does not
+    // depend on the probe launch, so this closes no combinational loop.
+    val earlyProbeSlotAndPortFree = Mux(loadCmdPort.fire, useEarlyProbe, earlyProbeHasFree)
     // `OHToUInt` requires a one-hot input. The free vector is normally multi-hot;
     // mask it first or simultaneous residents can alias the same physical entry.
     val earlyProbeAllocIdx     = Mux(
@@ -1517,8 +1565,35 @@ class DcachePlugin(val socketMerged: Boolean = false,
                              !pendingStoreMiss && !maintBusyReg &&
                              !(ldS1Valid && !ldS1Hit) &&
                              !(storeReadOwed && stS1Valid)
-        loadProbePort.ready := probeAdmitBase && earlyProbeSlotAndPortFree
-        when(loadProbePort.fire) {
+        // 2026-09-14 (plan item 6): this expression USED TO BE `loadProbePort.ready`
+        // itself -- the tag BRAM's current output (`ldS1Hit`, through
+        // `!(ldS1Valid && !ldS1Hit)`) and the token+VA CAM (`useEarlyProbe`) reached
+        // the LS EU's `normalReqArm` (fanout 170) and, in the SAME cycle, `tCanLeave ->
+        // tReady -> s1Ready -> issuePort.ready -> IQ selPorts(3).ready -> slot fire ->
+        // the triggers/scoreboard/compaction clock enables of all 16 IQ slots`: 3,336
+        // of the 3,856 failing endpoints on the routed 200 MHz build. The port's ready
+        // is now the registered credit `probeReadyReg`; this is the LAUNCH predicate
+        // for a probe the credit already admitted. Everything the credit can know one
+        // cycle ahead (FSM state, the shadow slot, a pending store miss, maintenance,
+        // the owed store read, a free queue entry) it already folded into the ready,
+        // so a `fire` normally launches. The two terms it cannot know ahead -- an
+        // older load MISSING in S1 right now, and a resolved command taking the read
+        // port right now -- DROP the probe instead (`loadProbePort.fire &&
+        // !loadProbeLaunch`): nothing is allocated, and the resolved command later
+        // takes the ordinary S1 read. Both are the exact events after which the old
+        // design stalled P2 for at least one cycle, and a load that stalls one cycle
+        // to keep a probe worth exactly one cycle of latency gains nothing.
+        val probeLaunchOk = probeAdmitBase && earlyProbeSlotAndPortFree
+        loadProbeLaunch := loadProbePort.fire && probeLaunchOk
+        GenerationFlags.simulation {
+          // The credit's contract: an admitted probe always finds a free entry, so the
+          // consume-and-replace reuse below is never the reason a launch succeeds.
+          assert(!loadProbePort.fire || earlyProbeHasFree,
+            "DcachePlugin: the registered probe credit admitted a probe with no free " +
+              "queue entry -- the next-state replica of earlyProbeValids is wrong",
+            FAILURE)
+        }
+        when(loadProbeLaunch) {
           val canceledAtLaunch = loadProbeCancelPort.valid &&
                                  (loadProbeCancelPort.payload.all ||
                                   (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
@@ -1596,7 +1671,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         when(loadCmdPort.fire && earlyProbeOwnsCmd) {
           // Full-queue consume-and-replace reuses this physical entry for the new
           // probe on the same edge; keep the launch block's replacement valid.
-          when(!(loadProbePort.fire && earlyProbeReusesConsume &&
+          when(!(loadProbeLaunch && earlyProbeReusesConsume &&
                  (earlyProbeAllocIdx === earlyProbeMatchIdx))) {
             earlyProbeValids(earlyProbeMatchIdx)  := False
             earlyProbeReadies(earlyProbeMatchIdx) := False
@@ -1622,6 +1697,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Cmode    := loadShadowCmd.cacheMode
           ldS1Paddr    := loadShadowCmd.paddr
           loadShadowValid := False
+          loadShadowLaunchEv := True
         } elsewhen(loadCmdPort.fire && ldS1Valid && !ldS1Hit) {
           // The older S1 request misses this cycle. The command still FIRES — that
           // is what permits II=1 hits — but its RAM read is deferred so no untagged
@@ -1629,6 +1705,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // slot on the first safe IDLE cycle after the refill.
           loadShadowCmd   := loadCmdPort.payload
           loadShadowValid := True
+          loadShadowCaptureEv := True
         } elsewhen(loadCmdPort.fire && useEarlyProbe) {
           // The queued VIPT result already contains the physical-tag-qualified,
           // size-extracted hit data. Bypass the redundant normal S1 read and land in
@@ -2806,6 +2883,149 @@ class DcachePlugin(val socketMerged: Boolean = false,
       s0Valid   := True
       s0Payload := storePort.payload
     }
+
+    // ═══ REGISTERED early-probe admission credit (2026-09-14, routing-congestion plan
+    // item 6, the 3,336-endpoint family) ═════════════════════════════════════════════
+    //
+    // `loadProbePort.ready` is `probeReadyReg`, a flop, and NOTHING else. Its D input
+    // is "will a probe be launchable next cycle", computed from this cycle's NEXT-STATE
+    // of every registered admission term the old combinational ready read directly:
+    //
+    //   old ready = IDLE && !resetSweepBusy && !loadShadowValid && !pendingStoreMiss
+    //               && !maintBusyReg && !(ldS1Valid && !ldS1Hit)
+    //               && !(storeReadOwed && stS1Valid)
+    //               && Mux(loadCmdPort.valid, useEarlyProbe, earlyProbeHasFree)
+    //
+    // Term by term:
+    //   IDLE                       -> `fsm.stateNext === IDLE` (exact; `stateReg` is
+    //                                 `RegNext(stateNext)` by definition)
+    //   loadShadowValid            -> exact next-state from the two IDLE events that
+    //                                 write it (`loadShadowCaptureEv`/`LaunchEv`)
+    //   earlyProbeHasFree          -> exact next-state of `earlyProbeValids` (replica
+    //                                 below, tripwired against the real registers)
+    //   storeReadOwed && stS1Valid -> exact next-state of both (replicas, tripwired)
+    //   resetSweepBusy             -> current value (the credit opens one cycle after
+    //                                 the post-reset sweep; nothing else)
+    //   pendingStoreMiss           -> `pendingStoreMiss || storeMissDiscovered`: exact
+    //                                 on the SET edge (the one that matters -- a stale
+    //                                 "clear" here would drop one probe per store
+    //                                 miss); its only CLEAR is the IDLE arm that also
+    //                                 leaves IDLE, which `stateNext` already covers
+    //   maintBusyReg               -> `maintBusyReg || maintCmdPort.valid`: exact on the
+    //                                 set edge; the clear is seen one cycle late (one
+    //                                 probe slot lost after a CPUSH/CINV walk)
+    //   !(ldS1Valid && !ldS1Hit)   -> UNKNOWABLE one cycle ahead (it is next cycle's
+    //                                 tag compare). Not in the credit: a probe fired on
+    //                                 a miss-discovery cycle is DROPPED by the launch
+    //                                 predicate. One probe per D-cache miss, on an event
+    //                                 that then stalls the load FSM for a refill.
+    //   loadCmdPort.valid/fire     -> UNKNOWABLE one cycle ahead (the LS EU's aligned
+    //                                 ring decides it). Not in the credit: a probe fired
+    //                                 on a cycle a resolved command owns the read port
+    //                                 is DROPPED. The old design stalled P2 for that
+    //                                 cycle instead, which cost the same one cycle on
+    //                                 the SAME load and stalled the LS pipe behind it.
+    //
+    // WHY THIS IS A CREDIT AND NOT A DELAYED SAMPLE. Every term above is either an
+    // exact next-state (the credit is never optimistic about a resource a probe needs:
+    // a queue entry, the FSM, the shadow slot, the owed store read) or a conservative
+    // superset on the set edge. The two dropped cases are the ONLY optimism, and both
+    // are side-effect-free by construction: a probe allocates nothing until
+    // `loadProbeLaunch`, and its resolved command is complete without it. Contrast the
+    // reverted `maintCmd.valid` staging (`4b00cccb`/`68c778b6`): that delayed a VALID
+    // whose consumer had real state to lose. Nothing here delays a valid, and the
+    // launch predicate is the old ready, bit for bit, evaluated where it always was.
+    //
+    // COST. +1 flop on the port; the probe queue grew 4 -> 5 entries (see
+    // `earlyProbeDepth`). SCHEDULING FREEDOM: none lost against the old design --
+    // P2 stalls in exactly the registered cases it stalled before (one cycle later on
+    // the maintenance clear, one cycle later out of reset), and the two dropped cases
+    // trade a one-cycle P2 stall for a one-cycle-longer load on the same instruction.
+    val probeIdleNext = Bool()
+    // `fsm.enumOf` resolves against a map populated only when the state machine is
+    // built (ExceptionUnit.scala's `activeReg` has the same deferral); `postBuild` is
+    // SpinalHDL's hook for reading `stateNext` once the FSM exists.
+    fsm.postBuild { probeIdleNext := (fsm.stateNext === fsm.enumOf(fsm.IDLE)) }
+
+    val loadShadowValidNext = loadShadowCaptureEv || (loadShadowValid && !loadShadowLaunchEv)
+    // Mirror the two `storeReadOwed` writers above (`when(stS1Advance) := False` then
+    // `when(freshLoadUsesPort && stS1Valid) := True`, later assignment wins; the two are
+    // exclusive anyway since `stS1Advance` requires `!fsm.loadUsesPort`).
+    val storeReadOwedNext = Mux(freshLoadUsesPort && stS1Valid, True,
+                                Mux(stS1Advance, False, storeReadOwed))
+    // Mirror the two `stS1Valid` writers (`when(stS1Advance) := False` then
+    // `when(s0Advance) := True`, later wins).
+    val stS1ValidNext = Mux(s0Advance, True, Mux(stS1Advance, False, stS1Valid))
+    // Exact next-state of every `earlyProbeValids(i)`. Writers, in last-wins order
+    // (the FSM body is elaborated after every plain statement, and within IDLE the
+    // consume block follows the launch block):
+    //   1. consume  (IDLE): `loadCmdPort.fire && earlyProbeOwnsCmd`, entry matchIdx,
+    //                       unless a full-queue consume-and-replace re-arms that same
+    //                       entry on this edge
+    //   2. launch   (IDLE): `loadProbeLaunch && !canceledAtLaunch`, entry allocIdx
+    //   3. cancel  (plain): token / `all` match
+    val probeCanceledAtLaunch = loadProbeCancelPort.valid &&
+      (loadProbeCancelPort.payload.all ||
+       (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
+    val earlyProbeValidsNext = Vec(Bool(), earlyProbeDepth)
+    for (i <- 0 until earlyProbeDepth) {
+      val consumeClr = loadCmdPort.fire && earlyProbeOwnsCmd &&
+                       (earlyProbeMatchIdx === U(i, earlyProbePtrW bits)) &&
+                       !(loadProbeLaunch && earlyProbeReusesConsume &&
+                         (earlyProbeAllocIdx === earlyProbeMatchIdx))
+      val allocSet   = loadProbeLaunch && !probeCanceledAtLaunch &&
+                       (earlyProbeAllocIdx === U(i, earlyProbePtrW bits))
+      val cancelClr  = loadProbeCancelPort.valid && earlyProbeValids(i) &&
+                       (loadProbeCancelPort.payload.all ||
+                        (earlyProbeTokens(i) === loadProbeCancelPort.payload.token))
+      earlyProbeValidsNext(i) := Mux(consumeClr, False,
+                                 Mux(allocSet, True,
+                                 Mux(cancelClr, False, earlyProbeValids(i))))
+    }
+    val earlyProbeHasFreeNext = !earlyProbeValidsNext.asBits.andR
+
+    probeReadyReg := probeIdleNext &&
+                     !resetSweepBusy &&
+                     !loadShadowValidNext &&
+                     !(pendingStoreMiss || storeMissDiscovered) &&
+                     !(maintBusyReg || maintCmdPort.valid) &&
+                     !(storeReadOwedNext && stS1ValidNext) &&
+                     earlyProbeHasFreeNext
+
+    // LIVENESS TRIPWIRE (2026-09-15): the credit may close for a refill, a device read, a
+    // maintenance walk or an owed store read -- all bounded -- but never indefinitely
+    // while a requester waits. A closed credit with `loadProbePort.valid` high for 20000
+    // cycles is a no-forward-progress bug in this block (a stuck replica, a leaked
+    // queue entry, a term that never clears), named here instead of as a test timeout.
+    GenerationFlags.simulation {
+      val creditClosedCycles = Reg(UInt(16 bits)) init 0
+      when(loadProbePort.valid && !probeReadyReg) {
+        creditClosedCycles := creditClosedCycles + 1
+      } otherwise { creditClosedCycles := 0 }
+      assert(creditClosedCycles < U(20000, 16 bits),
+        "DcachePlugin: the registered probe credit has refused a waiting probe for 20000 " +
+          "cycles -- no forward progress on load admission",
+        FAILURE)
+    }
+
+    // TRIPWIRES: every next-state replica above must equal the register it mirrors on
+    // the following cycle. A drift here would make the credit optimistic about a
+    // resource (a fire that then finds no entry -- also asserted at the launch site)
+    // or pessimistic (a silently lost probe slot, i.e. an IPC regression nobody sees).
+    GenerationFlags.simulation {
+      for (i <- 0 until earlyProbeDepth) {
+        assert(RegNext(earlyProbeValidsNext(i), init = False) === earlyProbeValids(i),
+          s"DcachePlugin: earlyProbeValidsNext($i) drifted from earlyProbeValids($i)",
+          FAILURE)
+      }
+      assert(RegNext(loadShadowValidNext, init = False) === loadShadowValid,
+        "DcachePlugin: loadShadowValidNext drifted from loadShadowValid", FAILURE)
+      assert(RegNext(storeReadOwedNext, init = False) === storeReadOwed,
+        "DcachePlugin: storeReadOwedNext drifted from storeReadOwed", FAILURE)
+      assert(RegNext(stS1ValidNext, init = False) === stS1Valid,
+        "DcachePlugin: stS1ValidNext drifted from stS1Valid", FAILURE)
+    }
+
     when(stS1Advance) {
       stS2Valid   := True
       stS2Payload := stS1Payload

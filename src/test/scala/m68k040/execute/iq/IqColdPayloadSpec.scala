@@ -40,7 +40,7 @@ class IqColdPayloadSpec extends AnyFunSuite {
       val iq = host[IssueQueueService]
       val ready = in Bits (5 bits)
       val valid = out Bits (5 bits)
-      val rob   = out Vec (UInt(6 bits), 5)
+      val rob   = out Vec (UInt(m68k040.Global.ROB_ID_W_DEFAULT bits), 5)
       val pc    = out Vec (UInt(32 bits), 5)
       for (k <- 0 until 5) {
         iq.issue(k).ready := ready(k)

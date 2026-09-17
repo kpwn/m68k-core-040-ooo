@@ -95,6 +95,72 @@ class IqLsSpec extends AnyFunSuite {
     }
   }
 
+  // push a uop reading BOTH psrcA and psrcB (slot1 invalid)
+  def pushOneAB(dut: Dut, robId: Int, cluster: SpinalEnumElement[Cluster.type], memOp: SpinalEnumElement[MemOp.type],
+                pdst: Int, pdstValid: Boolean, psrcA: Int, psrcB: Int): Unit = {
+    val s = dut.source.logic
+    s.s0.robId #= robId; s.s0.cluster #= cluster; s.s0.memOp #= memOp
+    s.s0.pdst #= pdst; s.s0.pdstValid #= pdstValid
+    s.s0.psrcA #= psrcA; s.s0.psrcAValid #= true
+    s.s0.psrcB #= psrcB; s.s0.psrcBValid #= true; s.s0.useImm #= false
+    s.s0.isShift #= false
+    s.pushValid #= true; s.slot1Valid #= false
+  }
+
+  /** The MULTI-LS-SOURCE case: a consumer whose TWO int sources are each produced by a
+    * distinct in-flight LS load (the first consumer of a multi-register MOVEM load, e.g.
+    * `ADD Dn,Dm` where both were just loaded). Releasing it on the FIRST lsWakeup would
+    * read a stale (pre-load) PRF entry -- a silent wrong value, not a hang.
+    *
+    * This is the invariant the old single `lsWait` bit maintained with a per-slot
+    * `lsStillDep` re-evaluation of the 50-wide lsBusy bitmap; the per-source `dynWait`
+    * bits (DynWait.LS_A / LS_B) maintain it structurally. Locks that in either way. */
+  test("consumer of TWO in-flight LS loads waits for BOTH lsWakeups", VerilatorTest) {
+    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      idle(dut); cd.waitSampling(3)
+
+      // Two independent LS loads producing pdst 7 and pdst 9.
+      pushOne(dut, robId = 1, Cluster.LS, MemOp.LOAD, pdst = 7, pdstValid = true, psrcA = 3, psrcAValid = true)
+      cd.waitSamplingWhere(dut.source.logic.pushReady.toBoolean)
+      pushOne(dut, robId = 2, Cluster.LS, MemOp.LOAD, pdst = 9, pdstValid = true, psrcA = 4, psrcAValid = true)
+      cd.waitSamplingWhere(dut.source.logic.pushReady.toBoolean)
+      // The consumer reads BOTH.
+      pushOneAB(dut, robId = 3, Cluster.INT, MemOp.NONE, pdst = 12, pdstValid = true, psrcA = 7, psrcB = 9)
+      cd.waitSamplingWhere(dut.source.logic.pushReady.toBoolean)
+      dut.source.logic.pushValid #= false
+      cd.waitSampling(2)
+
+      def consumerIssued(): Boolean =
+        (dut.sink.logic.v0.toBoolean && dut.sink.logic.rob0.toInt == 3) ||
+        (dut.sink.logic.v1.toBoolean && dut.sink.logic.rob1.toInt == 3)
+
+      var early = false
+      for (_ <- 0 until 6) { if (consumerIssued()) early = true; cd.waitSampling() }
+      assert(!early, "consumer must not issue before ANY lsWakeup")
+
+      // Wake ONLY the first source. The consumer must stay blocked on the second.
+      dut.source.logic.lsWakeupValid #= true
+      dut.source.logic.lsWakeupPdst #= 7
+      cd.waitSampling()
+      dut.source.logic.lsWakeupValid #= false
+      early = false
+      for (_ <- 0 until 6) { if (consumerIssued()) early = true; cd.waitSampling() }
+      assert(!early,
+        "consumer must STAY blocked after only its FIRST LS source wakes -- releasing here " +
+        "reads a stale pre-load PRF entry (silent wrong value, not a hang)")
+
+      // Wake the second source: now it must go.
+      dut.source.logic.lsWakeupValid #= true
+      dut.source.logic.lsWakeupPdst #= 9
+      cd.waitSampling()
+      dut.source.logic.lsWakeupValid #= false
+      var issued = false
+      for (_ <- 0 until 8) { if (consumerIssued()) issued = true; cd.waitSampling() }
+      assert(issued, "consumer must issue once BOTH LS sources have woken")
+    }
+  }
+
   test("two LS loads both reach issue port 3 (one at a time)", VerilatorTest) {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)

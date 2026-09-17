@@ -84,6 +84,44 @@ object PredecodeWord {
     // the replicated cost is ~22 LUTs per word (measured: +715 logic LUTs total).
     r.size          := m68k040.decode.OperationDecoder.decode(op).size
 
+    // ── Control-transfer classification (2026-09-16) ────────────────────────────────
+    // Assigned ONCE, unconditionally, outside every branch below — like `size`, and for
+    // the same reason: it depends on the OPWORD ALONE and must NOT be re-qualified by the
+    // extension-word-availability logic that drives `simple`/`lenWords`/`ambiguousLine`.
+    // A branch/return opcode is identifiable from its first word in every 68k encoding,
+    // so a straddling line boundary can never make this uncertain. See
+    // ChunkPredecode.ctrlXfer for the defect it closes and why it is baked here.
+    //
+    // WRITTEN AS DIRECT OPWORD COMPARATORS, not as `spec.isBranch || spec.form === ...`,
+    // deliberately: consuming `OperationDecoder`'s `form` field (a ~50-element enum) at
+    // each of the 16 per-beat predecode instances would un-prune that whole decode cone,
+    // where these seven comparators cost a handful of LUTs. The equivalence to the real
+    // decoder is NOT assumed — `PredecodeCtrlXferSpec` proves it exhaustively over all
+    // 65536 opwords against `OperationDecoder.decode(op).isBranch` / `.form`.
+    //
+    // The set is exactly "opwords whose decode can produce a BranchEuPlugin µop that the
+    // BTB/FTB is allowed to train" (BranchEuPlugin.isBtbBranch) plus the returns the RAS
+    // and the FTB's own confirmation path care about:
+    val cxLine6  = op(15 downto 12) === B"4'h6"                   // Bcc / BRA / BSR
+    val cxDbcc   = (op(15 downto 12) === B"4'h5") &&              // DBcc Dn,disp16
+                   (op(7 downto 6) === B"2'b11") && (op(5 downto 3) === B"3'b001")
+    val cxJmpJsr = op(15 downto 7) === B"9'b010011101"            // JSR/JMP 0x4E80..0x4EFF
+    val cxRet    = (op(15 downto 3) === B"13'b0100111001110") &&  // 0x4E70..0x4E77 band...
+                   ((op(2 downto 0) === B"3'b011") ||             // ...RTE  0x4E73
+                    (op(2 downto 0) === B"3'b100") ||             // ...RTD  0x4E74
+                    (op(2 downto 0) === B"3'b101") ||             // ...RTS  0x4E75
+                    (op(2 downto 0) === B"3'b111"))               // ...RTR  0x4E77
+    val cxFpT    = (op(15 downto 12) === B"4'hF") && (op(11 downto 9) === B"3'b001")
+    // FBcc.W/.L (type 010/011). cc==0 is EXCLUDED: FBF/FNOP decodes as a plain NOP
+    // (OperationDecoder's `isFpBccF` carve-out) and never reaches the branch EU, so a
+    // stale prediction on it would be exactly the unverified redirect this bit exists to
+    // prevent.
+    val cxFbcc   = cxFpT && (op(8 downto 7) === B"2'b01") && (op(5 downto 0) =/= B"6'b000000")
+    // FDBcc (type 001, <ea> mode 001) — a real branch: MicroOpAssembler builds it with
+    // the SAME `dbccUop` as the integer DBcc (fromFpcc=true).
+    val cxFdbcc  = cxFpT && (op(8 downto 6) === B"3'b001") && (op(5 downto 3) === B"3'b001")
+    r.ctrlXfer      := cxLine6 || cxDbcc || cxJmpJsr || cxRet || cxFbcc || cxFdbcc
+
     val cls = op(15 downto 12).asUInt
 
     // Full-format (bit8=1) EA extension length = 1 (ext word) + bd + od words:

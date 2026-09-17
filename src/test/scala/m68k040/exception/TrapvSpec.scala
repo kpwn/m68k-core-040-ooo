@@ -26,7 +26,7 @@ class TrapvSpec extends AnyFunSuite {
       val eu = host[BranchEuService]
       val iValid    = in Bool ()
       val iPNzvcSrc = in UInt (4 bits)
-      val iRobId    = in UInt (6 bits)
+      val iRobId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iNextPc   = in UInt (32 bits)
 
       val ctx = IqContext(); val uop = ctx.uop
@@ -70,11 +70,11 @@ class TrapvSpec extends AnyFunSuite {
       // Branch EU completion (the entry must complete so it can retire) + the
       // trapv-fault output (vector 7 if V).
       val cValid   = out Bool ();        cValid   := eu.completion.valid
-      val cRob     = out UInt (6 bits);  cRob     := eu.completion.payload.robId
+      val cRob     = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob     := eu.completion.payload.robId
       val cMis     = out Bool ();        cMis     := eu.completion.payload.mispredict
       val cNextPc  = out UInt (32 bits); cNextPc  := eu.completion.payload.nextPc
       val tvValid  = out Bool ();        tvValid  := eu.trapvFault.valid
-      val tvRob    = out UInt (6 bits);  tvRob    := eu.trapvFault.payload.robId
+      val tvRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  tvRob    := eu.trapvFault.payload.robId
     }
   }
   class Dut extends Component {

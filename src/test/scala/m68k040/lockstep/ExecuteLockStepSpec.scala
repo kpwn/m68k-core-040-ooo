@@ -252,10 +252,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      // ROB_ID_W is 5 bits since the ROB 64->32 cut; hardcoding 6 here made this
-      // whole spec fail to ELABORATE (width mismatch), silently disabling the
-      // strongest validation suite in the repo.  Track the global instead.
-      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W bits)
+      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1
@@ -281,6 +278,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val feSuppress = rob.logic.earlySuppressFe && !excActive
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
+      decodeUop.backendFlush := pipeFlush       // FP wide-imm side table: backend-owned entries (Tier 2 only)
       host[RenameStage].logic.pipeFlush := doFlush || excActive
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
@@ -322,8 +320,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // state whenever the ROB is fully drained; checkpointRestore undoes any
       // wrong-path push/pop on the ROB's own flush or FetchAlign's own ftqMismatch.
       val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || faBtb.logic.ftqMismatch
-      ras.logic.checkpointSave    := (rob.logic.count === U(0, rob.logic.count.getWidth bits)) &&
-                                      !rasCheckpointRestore
+      // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
+      // itself gates it with !checkpointRestore (restore wins by construction), so
+      // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
+      // registered restatement of `count === 0` (see RobPlugin), not an approximation.
+      // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
+      // change is that the long ROB->frontend route into 500+ clock-enable pins
+      // starts at a flop Q with the whole period in front of it.
+      ras.logic.checkpointSave    := rob.logic.countIsZero
       ras.logic.checkpointRestore := rasCheckpointRestore
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
@@ -405,6 +409,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dc.maintCmd               := exc.maintCmdOut
       exc.maintDoneIn           := dc.maintDone
       host[IcachePlugin].logic.maintInvalidateAll := exc.icMaintPulse
+      // FullCoreSynth parity (2026-09-16): the SAME pulse must also drop the fetch
+      // BUFFER, not just the I-cache array -- `ibuf` sits DOWNSTREAM of the cache and is
+      // invalidated by nothing else, so the canonical store/CPUSHL/jump SMC sequence
+      // executes pre-patch bytes straight out of it. This line exists in
+      // FullCoreSynth.scala and was MISSING from all three simulation harnesses, so the
+      // whole ifstage_smc_* / cpush corpus was passing against a DUT in which the fix was
+      // absent -- i.e. it had zero simulation coverage and a regression deleting it from
+      // FullCoreSynth would have been invisible to the test suite.
+      host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       // A7 (arch-15) write on exc/RTE A7 change. The SAME PRF write port also serves
       // a commit-time SYSTEM op's READ direction (MOVE-USP / MOVEC Rc->Rn writes an
       // arbitrary int arch-Rn): sysRegWrite fires in S_APPLY, a7Write in S_REDIR
@@ -1302,6 +1315,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         {
           val rawPc0 = dut.rob.logic.commitPc0.toLong & 0xffffffffL
           val rawPc1 = dut.rob.logic.commitPc1.toLong & 0xffffffffL
+          // ── WHY THIS POKE IS PER-UOP AND NOT PER-MACRO -- MEASURED, 2026-09-16 ───────
+          // TEMPTING FIX THAT DOES NOT WORK, do not re-try it without new evidence:
+          // gating this poke on `debugMacroRetirePc(k).valid` (= retire && p.last, i.e.
+          // MACRO retirement) is what 9635f91c did and 599180b7 reverted. Re-applied and
+          // MEASURED on 817bf43d: it REGRESSES `a7-byte: IRQ at every boundary ...` (b5
+          // diverges on pc, b7-late on pc) and does NOT fix the odd-ssp LINK #-75 sweeps
+          // (boot-0/2/4/6/8/10/12 still fail). Net loss, so the per-uop form stands.
+          // The reasoning BEHIND the tempting fix is still true and worth knowing:
+          // `commitPc` is the retiring UOP's next pc: for a BRANCH uop that is the RESOLVED
+          // target, but for every other uop it is the sequential `pc + len`. JSR/BSR crack
+          // to [push retPC] + [ibranch], and the push uop's sequential next pc IS the
+          // return address -- i.e. the pc of the instruction AFTER the call. Keying the
+          // poke on every uop therefore raised IPL on the call's PUSH retire, one whole
+          // macro before the boundary the event named, and the DUT took the interrupt
+          // before the callee's `rts`. When that callee is entered twice (odd-ssp:
+          // `jsr (%a1)` then `bsr.s sub1`) the resulting boundary -- "before the SECOND
+          // visit of sub1's rts" -- is one the pc-keyed Musashi `--irq-event` oracle cannot
+          // express, so the boundary sweep failed on a CORRECT DUT: the divergence dumps
+          // show the same frame base, self-consistent SR on both sides, and the streams
+          // rejoining right after the RTE. Gating on the macro-last uop makes the trigger
+          // the instruction's real next pc (the branch uop's resolved target for a call),
+          // which is exactly what the oracle's own `--irq-event` keys on.
           if (dut.rob.logic.retire0.toBoolean && eventPcs.contains(rawPc0) && !firedEvents.contains(rawPc0)) {
             firedEvents += rawPc0
             dut.intCtrl.logic.iplIn      #= levelByPc(rawPc0)
@@ -1430,15 +1465,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
       val res = LockStep.compare(handle.result.take(nInstr), oracle, a7ProbeLag = a7ProbeLag)
       if (!res.ok) {
-        // Failure dump: the two streams side by side around the divergence (post-step pc /
-        // SR / A7), so a wrong-path record can be told from a wrong fetch without a rerun.
+        // ── Failure dump ──────────────────────────────────────────────────────────────
+        // TRAP THIS DUMP USED TO SET (fixed 2026-09-16): it printed ONLY pc/sr/a7, while
+        // `LockStep.compare` checks pc, ccr, the full SR, a7, msp, isp AND the committed
+        // architectural register write (plus the second destination of a cracked
+        // DIV.L/MUL.L). So a genuine `reg D3` or `ccr` divergence produced a dump whose
+        // every visible column MATCHED -- indistinguishable from "no divergence here" --
+        // and cost a full extra investigation to tell apart from a boundary offset. The
+        // first line now states WHAT diverged (res.firstDivergence.detail, which already
+        // names the exact field and both values), and the table carries the committed
+        // register write and CCR alongside pc/sr/a7.
         val dutSeq = handle.result
         val lo = scala.math.max(0, res.matched.toInt - 6); val hi = scala.math.min(res.matched.toInt + 8, scala.math.max(dutSeq.size, oracle.size))
-        println(s"[$name] divergence context (index: DUT pc/sr/a7 | ORACLE pc/sr/a7):")
+        println(s"[$name] DIVERGED: ${res.firstDivergence.map(_.detail).getOrElse("?")} " +
+                s"(at index ${res.matched}; dut commits ${dutSeq.size}, oracle steps ${oracle.size})")
+        def regOf(id: Int): String = if (id < 8) s"D$id" else s"A${id - 8}"
+        println(s"[$name] divergence context (index: DUT pc/sr/ccr/a7/reg | ORACLE pc/sr/ccr/a7/reg):")
         for (k <- lo until hi) {
-          val d = if (k < dutSeq.size) { val c = dutSeq(k); f"0x${c.pc & 0xffffffffL}%08x/0x${c.sr & 0xffff}%04x/0x${c.a7 & 0xffffffffL}%08x" } else "-"
-          val o = if (k < oracle.size) { val st = oracle(k); f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.a(7) & 0xffffffffL}%08x" } else "-"
-          println(f"[$name]   $k%3d: $d%-32s | $o")
+          val d = if (k < dutSeq.size) { val c = dutSeq(k)
+            val r = if (c.archRegValid) f"${regOf(c.archRegId)}=0x${c.archRegWrite & 0xffffffffL}%08x" else "-"
+            f"0x${c.pc & 0xffffffffL}%08x/0x${c.sr & 0xffff}%04x/0x${c.ccr & 0xff}%02x/0x${c.a7 & 0xffffffffL}%08x/$r" } else "-"
+          // The oracle has no "which register did this step write"; show the DUT-named
+          // register's oracle VALUE so the two columns are directly comparable.
+          val o = if (k < oracle.size) { val st = oracle(k)
+            val r = if (k < dutSeq.size && dutSeq(k).archRegValid) {
+                      val id = dutSeq(k).archRegId
+                      f"${regOf(id)}=0x${(if (id < 8) st.d(id) else st.a(id - 8)) & 0xffffffffL}%08x"
+                    } else "-"
+            f"0x${st.pc & 0xffffffffL}%08x/0x${st.sr & 0xffff}%04x/0x${st.ccr & 0xff}%02x/0x${st.a(7) & 0xffffffffL}%08x/$r" } else "-"
+          val mark = if (k == res.matched.toInt) " <<<" else ""
+          println(f"[$name]   $k%3d: $d%-48s | $o%-48s$mark")
         }
       }
       assert(res.ok,
@@ -12017,7 +12073,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     "move.l #0x00003000,%a0", "move.l #0x00003008,%a1", "move.l #0x5a5a5a5a,(%a0)",
     "move.b #0x01,0x0cb2",
     "move.l #0x11223344,-(%sp)", "move.l #0x55667788,-(%sp)", "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)",
-    "lea 8(%sp),%sp", "move.l #0x00000042,%d0", "move.w #0x2000,%sr") ++ a7IrqIdiom ++ Seq(
+    "lea 8(%sp),%sp", "move.l #0x00000042,%d0",
+    // D1/D2 (idiom) and D5/D6 (the two handlers) are BYTE-written and otherwise never
+    // initialised, so their upper 24 bits are the DUT's RANDOM PRF init against the
+    // oracle's zero -- measured here as `reg D1: dut=0xf6e68601 oracle=0x00000001`. That
+    // makes this test SEED-DEPENDENT: it passes only when the random init happens to be
+    // zero, or when the interrupt alignment keeps that write out of the compare. Four
+    // moveq's cost four preamble instructions (mind `Pre` below) and remove the flake.
+    "moveq #0,%d1", "moveq #0,%d2", "moveq #0,%d5", "moveq #0,%d6",
+    "move.w #0x2000,%sr") ++ a7IrqIdiom ++ Seq(
     "lea 8(%sp),%sp", "end: bra.s end",
     "handler: move.b %d5,-(%sp)", "move.b 0x0cb2,-(%sp)", "move.b (%sp)+,%d5", "tst.b (%sp)+", "rte",
     "aline: move.b %d6,-(%sp)", "move.b (%sp)+,%d6", "addq.l #2,2(%sp)", "rte")).mkString(" ; ")
@@ -12026,7 +12090,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(v)  => v
       case Left(err) => fail(s"[a7-irq] Musashi.assembleAndTrace (plain) failed: ${err.reason}")
     }
-    val Pre = 15                                   // straight-line preamble instructions
+    val Pre = 19                                   // straight-line preamble instructions
+                                                   // (15 original + the 4 moveq register
+                                                   // initialisers added above -- keep in step)
     assert(plain.size > Pre + a7IrqIdiom.size + 2, s"[a7-irq] plain trace too short: ${plain.size}")
     // OracleStep.pc is the POST-step pc, so entry i is the boundary BEFORE idiom[i+1]; one
     // extra entry (the `lea` after the idiom) serves the last boundary's one-late retry.
@@ -12073,6 +12139,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def oddSpSrc(delta: Int, msp: Boolean): String = ((if (msp) Seq("move.w #0x3000,%sr") else Seq.empty[String]) ++ Seq(
     "move.l #trap0,%d0", "move.l %d0,0x80",
     "move.l #0x00003000,%a0", "move.l #0x11223344,%d0", "move.l #0x55667788,%d1", "move.l #0x0000beef,%d2",
+    // D3 is BYTE-written (`move.b (%sp)+,%d3`) and D4 WORD-written (`move.w (%sp)+,%d4`)
+    // below, and neither was initialised -- so their upper bits were the DUT's RANDOM PRF
+    // init against the oracle's zero. These tests PASS today only by seed luck; same class
+    // as the oddSspFill defect, see docs/BUG_lockstep_irq_boundary_sweeps_harness_defects.md.
+    "moveq #0,%d3", "moveq #0,%d4",
     "move.l #0x99aabbcc,-(%sp)", "move.l #0xddeeff00,-(%sp)", "move.l #0x0f1e2d3c,-(%sp)", "move.l #0x4b5a6978,-(%sp)",
     "lea 16(%sp),%sp", "move.l %sp,%a6",
     s"lea $delta(%sp),%sp",                                   // SP := S0 + delta (ODD)
@@ -12126,6 +12197,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def oddSpFwdSrc(delta: Int): String = (Seq(
     "move.l #trap0,%d0", "move.l %d0,0x80",
     "move.l #0x11223344,%d0", "move.l #0x55667788,%d1", "move.l #0x99aabbcc,%d2", "move.l #0xddeeff00,%d3",
+    // D7 is WORD-written (`move.w (%sp)+,%d7`) below and never initialised -- same latent
+    // seed-dependent hole as D3/D4 in oddSpSrc above.
+    "moveq #0,%d7",
     "move.l #0x00003000,%a0", "move.l #0x00003100,%a1", "move.l #0x00003200,%a2", "move.l #0x00003300,%a3",
     "move.l %sp,%a6",                                        // A6 := the 16-byte-aligned boot SSP
     s"lea $delta(%sp),%sp",                                  // SP := boot + delta (ODD)
@@ -12302,7 +12376,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // ═══════════════════════════════════════════════════════════════════════════════
   // Fill the 256 bytes below the boot SSP with a known non-zero pattern so a byte read
   // from the WRONG address is guaranteed to differ from the frame word it replaces.
-  private val oddSspFill: Seq[String] = Seq("move.w #63,%d1", "fill: move.l #0xa5a5a5a5,-(%sp)", "dbf %d1,fill", "lea 256(%sp),%sp")
+  // ⚠️ `moveq #63,%d1`, NOT `move.w #63,%d1` (fixed 2026-09-16). Musashi zeroes every
+  // register at reset; SpinalSim RANDOMISES the PRF per simulation seed. A WORD write
+  // leaves D1's upper 16 bits at that random value while the oracle has zero, so the
+  // lock-step compare mismatched on the committed 32-bit value -- measured as
+  // `reg D1: dut=0x0d7c003f/0xa98e003f/0xccf9003f oracle=0x0000003f` at index 4 (0x3f =
+  // 63), three different garbage uppers in three runs of the SAME test. That made every
+  // odd-ssp test built on this fill seed-dependently red BEFORE the interrupt was even
+  // involved. A moveq writes all 32 bits, so DUT and oracle agree by construction; D1 is
+  // only a loop counter here, so nothing the test exercises changes.
+  private val oddSspFill: Seq[String] = Seq("moveq #63,%d1", "fill: move.l #0xa5a5a5a5,-(%sp)", "dbf %d1,fill", "lea 256(%sp),%sp")
 
   // (b) A-line trap taken and RTE'd with SSP = boot - k, k odd (every odd alignment mod 16).
   private def oddSspAlineSrc(k: Int): String = (Seq("move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
@@ -12337,6 +12420,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val vecAddr = (24 + level) * 4
     (Seq("move.l #handler,%d0", f"move.l %%d0,0x$vecAddr%x", "move.l #aline,%d0", "move.l %d0,0x28") ++ oddSspFill ++ Seq(
       s"lea -$k(%sp),%sp",
+      // D2/D3 are BYTE-written later (`move.b -7(%a6),%d2`, `move.b -5(%a6),%d3`) and are
+      // otherwise never initialised, so without these their upper 24 bits are the DUT's
+      // RANDOM PRF init against the oracle's zero -- measured as
+      // `reg D2: dut=0x4c1b9d00 oracle=0x00000000` / `reg D3: dut=0xb058b600 oracle=0x0`.
+      // See the oddSspFill comment for the full mechanism. Long writes, so both sides agree.
+      // A6 too: `link %a6,#-75` PUSHES the old A6 and `unlk %a6` restores it, but A6 is
+      // never initialised -- so the DUT restores its random PRF value and the oracle
+      // restores zero. Measured as `reg A6: dut=0x2925a6a2 oracle=0x00000000` at the
+      // `unlk`. movea is flag-neutral, unlike a moveq, so it cannot perturb the CCR the
+      // sweep is checking.
+      "moveq #0,%d2", "moveq #0,%d3", "movea.l #0,%a6",
       "move.l #0x00003000,%a0", "move.l #0x55555555,%d5", "move.b #0x42,0x0cb3", "move.l %sp,%a5",
       "move.w #0x2000,%sr",
       "link %a6,#-75",
@@ -12402,7 +12496,23 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(firstOdd > 0 && lastOdd > firstOdd && lastOdd + 2 <= endIdx, s"[$tag] odd stretch not found ($firstOdd..$lastOdd, end $endIdx)")
     // OracleStep.pc is the POST-step pc => plain(i).pc is the boundary BEFORE the next
     // instruction. firstOdd-1 = before LINK ... lastOdd+1 = after UNLK.
-    val boundaryPcs = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc).distinct
+    // PROGRAM-ORDERED boundary sequence -- deliberately NOT distinct. `boundaryPcs` below
+    // is the distinct list of TARGETS (one simulation per distinct boundary pc), but the
+    // retry window must walk THIS sequence, because only here do adjacent positions mean
+    // adjacent program boundaries.
+    //
+    // ⚠️ ORACLE LIMITATION, read before touching this (cost a full investigation on
+    // 2026-09-16). The oracle is `Musashi.assembleAndTrace(..., irqEvents = Seq((pc, lvl)))`
+    // -- the interrupt is named by a PROGRAM COUNTER. This stretch RE-ENTERS pcs: the
+    // program has three `.short 0xa06e` A-line traps sharing one handler, and `sub1: rts`
+    // is entered twice (`jsr (%a1)` then `bsr.s sub1`). For any pc visited more than once
+    // the oracle takes the interrupt at its FIRST visit and there is NO way to ask it for
+    // the second -- so "before the SECOND visit of sub1's rts" is a boundary this oracle
+    // simply cannot express, and a DUT that legitimately lands there can match NO oracle.
+    // Keep the IPL poke keyed on MACRO retirement (see runIrqLockStep) so the DUT does not
+    // get pushed onto such a boundary in the first place.
+    val boundarySeq = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc)
+    val boundaryPcs = boundarySeq.distinct
     val a6 = plain(firstOdd).a(6)
     val locals = Seq(a6 - 7, a6 - 5, a6 - 66, a6 - 65)
     // The interrupt entry is the first step AT OR AFTER the requested boundary whose SR
@@ -12441,17 +12551,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Which boundary the interrupt lands on is not pinnable to a single instruction:
       // the harness raises IPL on the PREDECESSOR's retire and the DUT recognises IPL at
       // its own 2-wide macro boundaries, so it usually lands ON or one/two AFTER the
-      // requested one. It can also land EARLIER, because the boundary list is `.distinct`
-      // (a PC executed twice -- `sub1`'s rts -- collapses to one entry, so consecutive
-      // list indices are not always consecutive program boundaries). Search LATER first
-      // (the common case, so most boundaries still cost a single simulation), then
-      // EARLIER. Whichever boundary is chosen, the lock-step against it is exact and
-      // full-length and the frame/locals memory comparison still runs.
-      val lateWindow = ((i to (i + 2)) ++ ((i - 1) to (i - 2) by -1)).filter(j => j >= 0 && j < boundaryPcs.size)
+      // requested one, and can land EARLIER. Search LATER first (the common case, so most
+      // boundaries still cost a single simulation), then EARLIER. Whichever boundary is
+      // chosen, the lock-step against it is exact and full-length and the frame/locals
+      // memory comparison still runs.
+      //
+      // PROGRAM-RELATIVE (fixed 2026-09-16). This window used to be index arithmetic over
+      // the `.distinct` list, so "i+1" was the next DISTINCT pc, not the next PROGRAM
+      // boundary -- wherever the stretch re-entered a pc (the shared A-line handler,
+      // `sub1`'s rts) the distinct list SKIPPED boundaries and an i±2 list window did not
+      // cover the i±1 program window. It now walks `boundarySeq`, where adjacent positions
+      // really are adjacent boundaries; `.distinct` at the end only removes duplicate
+      // SIMULATIONS, it no longer distorts adjacency.
+      val pos = boundarySeq.indexOf(pc)
+      val windowPcs = (((pos to (pos + 2)) ++ ((pos - 1) to (pos - 2) by -1))
+                        .filter(j => j >= 0 && j < boundarySeq.size).map(boundarySeq)).distinct
       var matchedAt = -1
       var lastErr: org.scalatest.exceptions.TestFailedException = null
-      for (j <- lateWindow if matchedAt < 0) {
-        val pcJ = boundaryPcs(j)
+      for (pcJ <- windowPcs if matchedAt < 0) {
+        val j = boundaryPcs.indexOf(pcJ)
         val trJ = if (j == i) withIrq else Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pcJ, level)))
                                                  .getOrElse(fail(s"[$tag] oracle (irq@$pcJ)"))
         val kJ  = trJ.indexWhere(_.pc == endPc)
@@ -12466,12 +12584,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         } catch {
           case e: org.scalatest.exceptions.TestFailedException =>
             lastErr = e
-            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against the boundary-$j oracle (frame base 0x$fbJ%08x)")
+            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against the boundary-$j oracle (frame base 0x$fbJ%08x): ${e.getMessage.take(360)}")
         }
       }
       assert(matchedAt >= 0,
         f"[$tag] boundary $i (0x$pc%08x): the DUT lock-stepped against NONE of the " +
-        f"boundary-${lateWindow.mkString("/")} oracles. Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
+        f"oracles at pcs ${windowPcs.map(w => f"0x$w%08x").mkString("/")}. " +
+        f"Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
       if (matchedAt != i) println(f"[$tag] boundary $i matched the boundary-$matchedAt oracle (offset ${matchedAt - i})")
     }
   }
@@ -12773,6 +12892,31 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l %d5,%d4 ; " +
       "done: bra.s done",
       nInstr = 8)
+  }
+
+  // ── 2026-09-15 board hang repro (plan item 6, registered probe credit) ──────────────
+  // Silicon pinned at ROM 0x40804834 `andb %a0@(-9),%d1` inside early VIA init with
+  // exc_count = 0, the D-cache idle (STALL_DC: FSM IDLE, probe queue EMPTY, no store in
+  // flight) and NO load command presented (STALL_GRANT: loadCmd.valid = 0). Early ROM
+  // runs with CACR = 0, so every access is INHIBITED (precise): byte stores to VIA
+  // registers, then a byte LOAD from the same page. Same shape here, caches OFF, real
+  // crossbar timing, plus interrupts masked as the ROM has them.
+  for ((dtag, dc) <- Seq(("crossbar", m68k040.sim.L2Sweeps.todaysCrossbar),
+                         ("zero-latency", m68k040.sim.AxiMemModelConfig()))) {
+    test(s"board-repro: VIA-init byte stores then byte load, both caches OFF, $dtag", VerilatorTest) {
+      val src = Seq(
+        "move.l #0x00003000,%a1", "clr.w 2(%a1)",
+        "move.b #0x80,7680(%a1)", "move.b #0x30,1536(%a1)", "move.b #0x11,1024(%a1)", "move.b #0x22,0(%a1)",
+        "lea 9(%a1),%a0", "moveq #-1,%d1",
+        "and.b -9(%a0),%d1",
+        "move.b #0x7f,7680(%a1)", "move.b 1536(%a1),%d2", "and.b -9(%a0),%d1", "or.b 1024(%a1),%d2",
+        "move.b %d1,4(%a1)", "move.b 4(%a1),%d3",
+        "moveq #7,%d4",
+        "loop: move.b %d4,8(%a1)", "and.b -9(%a0),%d1", "move.b 8(%a1),%d5", "eor.b %d5,%d1",
+        "move.w 2(%a1),%d6", "move.b %d6,7680(%a1)", "dbf %d4,loop",
+        "end: bra.s end").mkString(" ; ")
+      runLockStep(s"board-repro-$dtag", src, maxCycles = 200000, dcfg = dc, cacr = 0L)
+    }
   }
 
 }

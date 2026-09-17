@@ -35,6 +35,15 @@ object MicroOpAssembler {
     // 4-wide MicroOpQueue push never overflows (3 <= 4).
     val uops  = Vec(DecodedUop(), 3)
     val count = UInt(2 bits)         // 1, 2, or 3 µops valid
+    // ── FP wide-immediate SIDE CHANNEL (docs/PLAN_routing_congestion_architectural.md
+    // item 3). `fpImmAlloc` marks "uops(0) is an `F<op>.<fmt> #imm,FPn` uop whose 80-bit
+    // immediate is `fpWideImm`". The value is deliberately NOT a DecodedUop field any more:
+    // DecodeStage writes it into the FP wide-immediate side table on the cycle the uop
+    // enters the MicroOpQueue and stamps the table tag into uops(0).imm[FP_IMM_TAG_W-1:0]
+    // (the assembler leaves that field 0 for these rows). Only meaningful when
+    // `fpImmAlloc`; `fpWideImm` is 0 otherwise. Always a 1-uop crack (count === 1).
+    val fpImmAlloc = Bool()
+    val fpWideImm  = Bits(80 bits)
   }
 
   /** Fully-defaulted plain LOAD/STORE µop builder for the MOVEM micro-sequencer
@@ -392,7 +401,6 @@ object MicroOpAssembler {
     u.fpSrcBReg  := 0;               u.usesFpSrcB := False
     u.fpSrcKind  := FpSrcKind.FPREG
     u.fpSrcFmt   := B"3'b010"              // Extended -- the ONLY FMOVEM.X format
-    u.fpWideImm  := B(0, 80 bits)
     u.fpuOp      := B(0, 7 bits)
     u
   }
@@ -511,7 +519,6 @@ object MicroOpAssembler {
     u.usesFpSrcB := False                      // source is the memory-loaded temps, not FPm
     u.fpSrcFmt   := B"3'b010"                  // srcSpec code for Extended (design doc §2)
     u.fpSrcKind  := FpSrcKind.MEMEXT
-    u.fpWideImm  := B(0, 80 bits)
     u
   }
 
@@ -907,6 +914,8 @@ object MicroOpAssembler {
 
   private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload]): AssembledUops = {
     val out = AssembledUops()
+    out.fpImmAlloc := False            // overridden ONLY by the `F<op>.<fmt> #imm,FPn` arm below
+    out.fpWideImm  := B(0, 80 bits)
     val op  = pkt.words(0)
     // FMax Lever B: the no-offload fallback is reached ONLY from the standalone
     // `assemble(pkt)` overload, whose callers (~14 unit specs) hand-build `DecodePacket`s
@@ -2428,7 +2437,6 @@ object MicroOpAssembler {
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := True
         opUop.imm        := fpOpmode.resize(32)
-        opUop.fpWideImm  := B(0, 80 bits)
         opUop.size       := Size.LONG
       } .elsewhen(fpFormIsReg) {
         // F<op> FPm,FPn: the source is FP register FPm (ext[12:10]).
@@ -2437,15 +2445,15 @@ object MicroOpAssembler {
         opUop.usesFpSrcB := True
         opUop.srcAValid  := False; opUop.srcBValid := False
         opUop.useImm     := False
-        opUop.fpWideImm  := B(0, 80 bits)
         opUop.size       := Size.LONG
       } .elsewhen(fpFormIsImm) {
         // F<op>.<fmt> #imm,FPn (THIS DELIVERABLE): no register source at all. The value
-        // rides the NEW `fpWideImm` field (80 bits, carried through the IQ exactly like
-        // `imm` already is -- IqContext embeds the WHOLE RenamedUop). `imm`/`useImm` stay
-        // reserved for FMOVECR's ROM offset and are NOT reused here, so Task 8 has exactly
-        // ONE dispatch: fpSrcKind selects the ROUTE (register / imm / fpWideImm),
-        // fpSrcFmt selects the FORMAT within a fpWideImm-routed value.
+        // used to ride an 80-bit `fpWideImm` uop field through the IQ; it now goes to
+        // DecodeStage's FP wide-immediate side table (plan item 3) and only a 3-bit tag
+        // rides `imm`. `useImm` stays False (the ROM offset of FMOVECR is the only
+        // useImm=True FP row), so Task 8 still has exactly ONE dispatch: fpSrcKind selects
+        // the ROUTE (register / ROM offset / side-table immediate), fpSrcFmt selects the
+        // FORMAT within a side-table-routed value.
         //
         // Gated identically to the register-form/INTREG cases: fpNative excludes every
         // transcendental/rounded-precision opmode regardless of source format (an
@@ -2467,8 +2475,15 @@ object MicroOpAssembler {
         }
         opUop.usesFpSrcB := False; opUop.fpSrcBReg := 0   // no FP register source
         opUop.srcAValid  := False; opUop.srcBValid := False   // no INT register source either
-        opUop.useImm     := False    // `imm` is NOT used for these -- fpWideImm is, see above
-        opUop.fpWideImm  := fpSrcSpec.mux(
+        opUop.useImm     := False    // `imm` is NOT used as a VALUE for these -- see below
+        // The 80-bit value goes out on the AssembledUops SIDE CHANNEL, not on the uop:
+        // DecodeStage writes it into the FP wide-immediate side table as this uop enters
+        // the MicroOpQueue and stamps the entry tag into imm[FP_IMM_TAG_W-1:0]. `imm` is
+        // zeroed here so the stamp is the ONLY non-zero content (the EA decode above may
+        // have left srcEa.imm in it -- harmless, but a clean field makes the tag readable).
+        opUop.imm        := 0
+        out.fpImmAlloc   := True
+        out.fpWideImm    := fpSrcSpec.mux(
           B"3'b000" -> (B(0, 48 bits) ## fpImmLongVal),
           B"3'b001" -> (B(0, 48 bits) ## fpImmSingleVal),
           B"3'b010" -> fpImmExtVal,
@@ -2490,7 +2505,6 @@ object MicroOpAssembler {
         opUop.srcAValid  := True
         opUop.srcBValid  := False
         opUop.useImm     := False
-        opUop.fpWideImm  := B(0, 80 bits)
         // `size` distinguishes Word/Byte from the default 32-bit read (Long AND Single
         // both read a full 32-bit Dn -- Single's BIT-PATTERN-vs-INTEGER distinction is
         // now carried by `fpSrcFmt` above, not by `size`; this RESOLVES the open item this
@@ -2526,7 +2540,6 @@ object MicroOpAssembler {
       opUop.usesFpSrcB := False; opUop.fpSrcBReg := 0
       opUop.fpSrcKind  := FpSrcKind.FPREG   // inert: this op has no FpuCore source gateway
       opUop.fpSrcFmt   := fpSrcSpec         // ext[12:10] = the DESTINATION format
-      opUop.fpWideImm  := B(0, 80 bits)
       // The chunk index rides imm[1:0]; every register-direct format is a single chunk.
       opUop.useImm := True; opUop.imm := U(0, 32 bits).asBits
       // `.W`/`.B` read the old Dn back as the partial-write merge source.
@@ -4383,6 +4396,12 @@ object MicroOpAssembler {
       out.uops(0) := opUop
       out.uops(1) := opUop
     }
+    // FP wide-immediate side channel: the `fpEmit` arm above raised `fpImmAlloc` from the
+    // FP decode alone; the crack tree's two HIGHER-priority arms (µcode placeholder, fetch
+    // fault) replace uops(0) with something that never reaches DivEu's capture, so no
+    // table entry may be allocated for them (it would only be reclaimed by the eventual
+    // squash). Squelched here, after the tree, so the arm ordering is stated exactly once.
+    when(spec.microcoded || pkt.fault) { out.fpImmAlloc := False }
     // ── Macro-boundary LAST stamp (Stage 2 task 4, spec section 6.2's `macroLast`) ──
     // `firstOfInstr` is decided per-builder because the builders themselves know which
     // µop leads their crack. `lastOfInstr` is stamped HERE instead, from the crack tree

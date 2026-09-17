@@ -301,14 +301,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       case None    => iplIn := 0;       iackAvec := False;      iackVector := 0
     }
 
-    // Depth comes from the PARAMETER, not a literal (2026-09-14). It was `= 64`
-    // hardcoded, which made `Config.robDepth` a LIE: setting robDepth=32 narrowed
-    // `robIdWidth` to 5 bits while leaving 64 entries here -- 64 entries addressed by
-    // a 5-bit id, i.e. silent aliasing rather than a smaller ROB. Everything else in
-    // this plugin already derives from `depth` (45 uses, and robIdW below), so wiring
-    // the parameter in is all that was missing.
-    val depth  = m68k040.Global.ROB_DEPTH.get
-    val robIdW = log2Up(depth) // wraps naturally
+    val depth  = m68k040.Global.ROB_DEPTH_DEFAULT // == M68kParams.robDepth; ParamPlugin requires it
+    val robIdW = log2Up(depth) // = 6 at the default depth, wraps naturally
 
     // ── Ring storage ────────────────────────────────────────────────────────
     val payload   = Mem(RobPayload(), depth)
@@ -511,7 +505,60 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // frees nothing — the array must stay for (1) — while ADDING a PRF read port whose
     // index comes from `payload.readAsync(h0)`, i.e. serialising a Mem read into a PRF
     // read inside the retire path. Strictly negative.
-    val sysValStore     = Vec.fill(depth)(Reg(Bits(32 bits)))
+    //
+    // ── WHAT IT IS NOW: an 8-entry TAG-INDEXED capture buffer, not a per-entry array ──
+    // The reasoning above rules out sourcing the value from the PRF; it does NOT require
+    // one 32-bit register PER ROB ENTRY. The old `Vec.fill(depth)(Reg(Bits(32 bits)))`
+    // (2048 FF at depth=64) paid for `depth` copies of the value, `depth` write-enable
+    // decodes, and — the measured cost — a `depth`-wide fanout on the completion RESULT
+    // bus: `ccrCompletion_1_payload_result[23]` drove 64 entry-write muxes (1.051 ns of
+    // routing at fanout 64, 21% of the 5.0 ns period, on the #1 late-source family in the
+    // CPU). Every one of those 64 copies existed to serve ONE of three reads, all of them
+    // at the ROB HEAD (`sysValStore(h0)` twice, `sysValStore(h1)` once — enumerated, not
+    // assumed), and only for entries that are a `sysOp` or carry `SysKind.FPCTRL_CAP`.
+    //
+    // So the value now lives in `sysCapDepth` (8) {valid, tag, data} slots:
+    //   * RESERVE at ALLOC — a slot is claimed by an allocating µop that needs one
+    //     (`sysOp || sysKind === FPCTRL_CAP`), and its `tag` is that µop's ROB index.
+    //     Reserving at alloc (rather than at completion) is what makes overflow a
+    //     STRUCTURAL impossibility instead of a silent data loss: `allocReadySig` is
+    //     ANDed with "at least 2 slots free next cycle", computed off the same
+    //     next-state expression that drives the slot valids (mirrors how that signal
+    //     already registers `countNext <= depth-2`).
+    //   * FILL at COMPLETION — the four `ccrCompletion` ports CAM-match `tag`; only a
+    //     slot that matches takes the write. The result bus now fans out to 8 muxes.
+    //   * FREE on retire of the tagged index, on `flushing` (a flush squashes the whole
+    //     ROB — `tail := head; count := 0`), and on re-ALLOCATION of the tagged index
+    //     (the last one preserves the old array's alloc-wins-over-completion priority
+    //     and guarantees at most one valid slot per tag).
+    //   * READ by tag, as a masked OR over the 8 slots. `sysValStore(idx)` is kept as a
+    //     `def` with the identical signature so the three read sites are untouched.
+    //
+    // DEADLOCK: the alloc-side stall cannot deadlock. A reserved slot's tag is always a
+    // LIVE ROB entry, every live entry leaves the ROB by retire, flush or re-alloc, and
+    // nothing on the retire path depends on a NEW allocation — so slots always drain.
+    //
+    // LATENCY: none. Reserve/fill/free/read all happen in the same cycles the array did.
+    //
+    // `sysValRdyStore` is deliberately NOT folded into `sysCapValid`: it is a 1-bit
+    // per-entry array (64 FF) that costs nothing, it is what the retire gates below
+    // already read, and its alloc-clear/completion-set semantics are the value-vs-trigger
+    // race fix documented directly beneath it. Folding it would make "no slot" and "value
+    // not yet landed" the same condition, and the first of those must never gate retire.
+    val sysCapDepth = scala.math.min(8, depth)
+    val sysCapValid = Vec.fill(sysCapDepth)(RegInit(False))
+    val sysCapTag   = Vec.fill(sysCapDepth)(Reg(UInt(robIdW bits)) init 0)
+    val sysCapData  = Vec.fill(sysCapDepth)(Reg(Bits(32 bits)))
+    sysCapValid.foreach(_.simPublic())
+    sysCapTag.foreach(_.simPublic())
+    sysCapData.foreach(_.simPublic())
+    /** The captured EU writeback VALUE for ROB index `idx`, or 0 if no slot holds it.
+      * Only meaningful where `sysValRdyStore(idx)` is set — exactly as the old per-entry
+      * array was. Masked-OR over the slots (the `StraddlePending` read-port idiom). */
+    def sysValStore(idx: UInt): Bits =
+      (0 until sysCapDepth)
+        .map(k => sysCapData(k).andMask(sysCapValid(k) && (sysCapTag(k) === idx)))
+        .reduceBalancedTree(_ | _)
     // The EU's `completion` port (marks `completes`) fires ONE cycle BEFORE its `wbObs`
     // (the value, captured into sysValStore via ccrCompletion). So a write-direction
     // sysOp head could `sysRetire` (gated on completes) before its VALUE lands -> the FSM
@@ -1012,7 +1059,27 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // here too (the privilege check below gates on it) and DRIVEN from exc.ss.s after
     // the exc unit is built.
     val committedS = _supervisor; committedS.simPublic()
-    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted && !debugHalted
+    // FMax capture cut (see the fault-arbitration block below): True for exactly the
+    // one cycle between a fault's MARK (`faultedStore`, still written combinationally
+    // on the completion cycle) and its RECORD (`faultDynStore` + the `faultDynMem`
+    // row, written one cycle later out of the four-entry capture register). In that
+    // window an entry is `faulted` but its dyn gate is not yet open, so a commit
+    // decision taken there would read the ALLOC-time record and deliver the wrong
+    // vector / fault address.
+    //
+    // It is ANDed into `headReady` rather than into `faultRetire` alone, deliberately.
+    // `retire0`/`retire1`/`sysRetire`/`normalIrqGate`/`traceNormalGate` are all
+    // ALREADY gated on `!faultedStore(h0/h1)`, which IS set on the mark cycle, so
+    // they need no hold — but `rteRetire` carries no faulted gate at all, and the
+    // note at the sysOp-commit block below explicitly asks that any NEW commit
+    // variant inherit `headReady`'s gating rather than re-derive it. Holding the one
+    // shared gate makes the rule "the ROB commits NOTHING in the hold cycle", which
+    // is checkable by inspection and cannot be silently bypassed by a future commit
+    // path. The cost is one commit cycle per fault-completion event — an event that
+    // squashes the whole machine microseconds later.
+    val faultCapPending = Bool(); faultCapPending.simPublic()   // driven below
+    val headReady   = (count > 0) && completes(h0) && !flushing && !coreHalted && !debugHalted &&
+                      !faultCapPending
     // Privilege violation: a needsSupervisor head retiring in USER mode (committed S==0)
     // takes a vector-8 (format-$0) exception. Treated like a faulted head — the op does
     // NOT commit its result (precise). Only meaningful when the head is otherwise ready.
@@ -1561,10 +1628,9 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       nzvcWrStore(c.payload.robId)  := c.payload.nzvcWrite
       xValStore(c.payload.robId)    := c.payload.x
       xWrStore(c.payload.robId)     := c.payload.xWrite
-      // Capture the EU writeback VALUE for a commit-time system op's write direction
-      // (the op µop is a MOVE -> result = the source register). The ROB ignores it for
-      // non-sysOps. (Placed BEFORE alloc-reset so a re-used index's alloc wins.)
-      sysValStore(c.payload.robId)  := c.payload.result
+      // (The EU writeback VALUE for a commit-time system op is no longer captured
+      //  here — it goes into the tag-indexed `sysCap*` buffer, filled in the
+      //  capture-buffer maintenance block below. See `sysValStore`'s declaration.)
       // The value has landed -> a write-direction sysOp may now trigger (this fires the
       // cycle AFTER the EU's `completion` set `completes`, closing the value-vs-trigger
       // race). An intWrite-only capture qualifies (a sysOp µop always writes via its EU).
@@ -1651,12 +1717,16 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // Therefore L's mark is unreachable in every case. QED.
     //
     // Two deliberate design choices follow from the proof:
-    //   * The loser's `faultedStore` mark is dropped TOO (not kept). Keeping it while
-    //     dropping its record would leave L in a self-inconsistent "faulted, but the
-    //     fault payload is the alloc-time one (usually vector 0)" state — strictly
-    //     worse than not marking it, if the proof were ever violated by a future
-    //     change. Gate and Mem row are always written by the same statement, so
-    //     `faultDynStore(i)` True ALWAYS implies row i is fresh.
+    //   * SUPERSEDED 2026-09-16 by the capture register cut below — read that block
+    //     for the current rule. The arbitration now decides ONLY the `faultDynMem`
+    //     row and its `faultDynStore` gate; `faultedStore` is set for EVERY faulting
+    //     port, unarbitrated. (The old rule dropped the loser's `faultedStore` mark
+    //     too, to avoid a "faulted, but the payload is the alloc-time one" state.
+    //     Marking every loser reaches the same place from the other side: L is now
+    //     blocked from retiring by its own mark, so the proof's step (2) holds at
+    //     every faulting entry at once instead of at one arbitrated W. Gate and Mem
+    //     row are still written by the same statement, so `faultDynStore(i)` True
+    //     ALWAYS implies row i is fresh — that invariant is untouched.)
     //   * A same-robId, same-cycle collision resolves to the WINNING PORT'S WHOLE
     //     record, where the old code produced a per-field HYBRID (e.g. an ls+eu
     //     collision took eu's vector/addr but kept ls's size/wr/sup/atc, because eu
@@ -1721,16 +1791,205 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       faultPortOf(fpFaultCompletion.valid, fpFaultCompletion.payload.robId,
                   fpFaultCompletion.payload.faultAddr, fpFaultCompletion.payload.vector,
                   faultAllocSize, faultAllocWr, faultAllocSup, True))
+    // ══════════════════════════════════════════════════════════════════════════
+    // FMax — THE CAPTURE REGISTER CUT (2026-09-16, 200 MHz closure task)
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // MEASURED PROBLEM (post-route, build/vivado200_closure/reports/timing_route.rpt):
+    //
+    //   -0.312 ns, 26 logic levels, logic 1.629 / route 3.390
+    //   RobPlugin_logic_head_reg[1]_rep__11/C -> RobPlugin_logic_faultDynStore_43_reg/CE
+    //   (same source -> faultedStore_43_reg/CE, and -> faultDynMem_reg_0_63_*/RAMG,RAMB)
+    //
+    // The chain is a THREE-PLUGIN COMBINATIONAL ROUND TRIP, not a fanout problem:
+    //
+    //   head -> LsEuPlugin.p4AtRobHead (`robHeadValidIn && p4Front.robId === robHeadIn`)
+    //        -> p4LaunchOk -> the P3/P4 resolve + capture cone -> liveCompletionFires
+    //        -> the precise-store replay apply gate (`(applyFast || applyBacklog) &&
+    //           !liveCompletionFires`) -> sqFaultCompletionPort.valid/.payload.robId
+    //        -> BACK INTO THIS BLOCK: the four-port age fold below (which consumes
+    //           `head` a SECOND time, via `age = robId - head`)
+    //        -> faultWin.robId -> the 6->64 write decode -> 128 Reg CEs + the
+    //           faultDynMem write-address/WE pins.
+    //
+    // Measured segment budget on that path (delays from the routed report):
+    //   head/Q .................................. 5.154 ns
+    //   ... LsEu sq resolve cone (12 levels) .... 7.828 ns   (+2.674)
+    //   ... four-port age fold (10 levels) ...... 9.486 ns   (+1.658)  [_zz_faultWinRobId]
+    //   ... write decode (2 levels) -> CE ...... 10.096 ns   (+0.610)
+    //
+    // WHY REGISTER REPLICATION COULD NOT FIX IT. `head` was already replicated at
+    // least twelve times (`_rep__11`) and the path still failed. It had to: the
+    // head net itself contributes 0.256 ns of the 5.019 ns data path (5%), and the
+    // remaining 3.13 ns of "route" is 25 ordinary short local hops averaging
+    // 0.13 ns each — the irreducible interconnect cost of HAVING 26 LEVELS, not a
+    // high-fanout net any placement can shorten. Worse, `head` is consumed at BOTH
+    // ENDS of the chain (p4AtRobHead at the start, the age fold at the end), so a
+    // replica placed near one consumer is necessarily far from the other. The only
+    // lever that moves this path is REMOVING LEVELS.
+    //
+    // THE CUT. The fault write is split in two, at the one place the four ports
+    // converge, and each half now sees roughly half the levels:
+    //
+    //   (1) `faultedStore` — the RETIRE-BLOCKING mark — stays COMBINATIONAL and is
+    //       now driven by a DIRECT per-port decode with NO arbitration and NO
+    //       `head` in it at all. Its path is head -> LsEu cone -> compare -> CE,
+    //       i.e. exactly the shape of the `completes(robId)` writes right above,
+    //       which close today. Retirement timing is bit-for-bit unchanged.
+    //
+    //   (2) `faultDynStore` + the `faultDynMem` row — the fault RECORD — move one
+    //       cycle later, behind a four-entry capture register. The age fold now
+    //       starts at those registers (the ages are captured too, so `head` is off
+    //       the fold's input cone entirely) and ends at the RAM, ~12 levels.
+    //
+    // MARK-ALL IS STRICTLY SAFER THAN THE OLD DROP-THE-LOSER RULE. The proof above
+    // shows a loser is unobservable; it does NOT need the loser to be unmarked.
+    // Marking every faulting entry means the OLDEST faulting entry is always
+    // blocked from retiring by its own mark, so step (2) of the proof ("head must
+    // advance past W") is now blocked at every W simultaneously rather than at one
+    // arbitrated W — the invariant gets stronger, not weaker, and the sim tripwire
+    // `faultedStore(h0) === fsFaulted(h0)` becomes exact instead of merely provable.
+    // The dyn-record gate is still opened for the WINNER ONLY, so the old
+    // "faultDynStore(i) True ALWAYS implies row i is fresh" invariant is preserved
+    // unchanged — gate and row are still written by one statement, one cycle later.
+    //
+    // THE ONE-CYCLE HOLD. Between the mark (cycle T) and the record (cycle T+1) an
+    // entry is `faultedStore` but NOT yet `faultDynStore`, so a commit decision taken
+    // in that window would read the ALLOC-time record. `faultCapPending` (declared
+    // next to `headReady`, driven at the end of this block) holds the whole commit
+    // gate off for exactly that one cycle — see the comment there for why the hold is
+    // on `headReady` and not on `faultRetire` alone.
+    //
+    // SLOT-REUSE. The delayed half must not land on a REALLOCATED index. A faulting
+    // robId can only be handed back between T and T+1 by a flush (retirement needs
+    // `completes`, which the faulting completion itself only sets at the end of T),
+    // so the capture is killed on `flushing` and on an alloc port taking that exact
+    // robId in the capture cycle — reproducing the alloc-wins-on-a-re-used-index
+    // priority the textual ordering gives the undelayed writes.
+    //
+    // AGE VALIDITY ACROSS THE CUT. Ages are captured at T (anchored to head at T)
+    // and folded at T+1. Head can only advance by retiring, and no faulting entry
+    // can retire at T (its `completes` bit is only set at the end of T), so head
+    // never passes a captured robId; and if head advances by k, EVERY captured age
+    // shifts by the same k, so the min-age ORDER — the only thing the fold reads —
+    // is invariant.
+    val faultCap = faultPorts.map { p =>
+      val r = Reg(RobFaultPort())
+      r.valid.init(False)
+      val allocReuse = (alloc0 && (tail === p.robId)) ||
+                       (alloc1 && ((tail + 1) === p.robId))
+      r.valid := p.valid && !flushing && !allocReuse
+      when(p.valid) { r.robId := p.robId; r.age := p.age; r.d := p.d }
+      r
+    }
     // `b` (the later, higher-priority port) wins on an age TIE — see ARBITRATION.
-    val faultWin = faultPorts.reduceLeft { (a, b) =>
+    val faultWin = faultCap.reduceLeft { (a, b) =>
       Mux(b.valid && (!a.valid || (b.age <= a.age)), b, a)
     }
     faultWin.valid.setName("faultWinValid"); faultWin.robId.setName("faultWinRobId")
     faultWin.valid.simPublic(); faultWin.robId.simPublic()
+    // Half (1): the un-delayed, un-arbitrated, head-free retire-blocking mark.
+    faultPorts.foreach { p => when(p.valid) { faultedStore(p.robId) := True } }
+    // Half (2): the winner's record, one cycle later.
     faultDynMem.write(faultWin.robId, faultWin.d, faultWin.valid)
     when(faultWin.valid) {
-      faultedStore(faultWin.robId)  := True
       faultDynStore(faultWin.robId) := True
+    }
+    // Drives the forward-declared hold next to `faultRetire` (see above).
+    faultCapPending := faultCap.map(_.valid).orR
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // System-value capture buffer — reserve (alloc) / fill (completion) / free
+    // ══════════════════════════════════════════════════════════════════════════════
+    // See the `sysValStore` declaration above for WHY this replaced the depth x 32
+    // per-entry Reg Vec. This block is the whole of its state machine.
+    //
+    // Placed textually AFTER the ccrCompletion block and BEFORE the alloc ports so the
+    // reads it performs (`sysCapValid`/`sysCapTag`) are register outputs and its own
+    // writes are the only drivers of the slot state — there is no last-assign priority
+    // interaction with either neighbour.
+    //
+    // A slot is NEEDED by an allocating µop that is either a serializing `sysOp` (whose
+    // write-direction source value reaches the exception FSM as `sysVal`) or carries
+    // `SysKind.FPCTRL_CAP` (an ordinary load whose value is copied into `sysAux` at its
+    // own in-order retirement). Read-direction sysOps do not strictly need one, but they
+    // are included: the direction bit would add a term to the alloc-side critical path
+    // to save a slot the buffer is never short of, and "every sysOp has a slot" is a far
+    // cheaper invariant to keep true across future SysKind additions.
+    val sysCapNeed0 = allocUopVec(0).sysOp || (allocUopVec(0).sysKind === sysAuxCapKind)
+    val sysCapNeed1 = allocUopVec(1).sysOp || (allocUopVec(1).sysKind === sysAuxCapKind)
+    // `!flushing` is LOAD-BEARING, not defensive. An alloc port can fire on a flushing
+    // cycle (nothing in this file gates `alloc0`/`alloc1` on `flushing` — the alloc-time
+    // `payload.write` and `sysValRdyStore(tail) := False` both happen too), and the ROB
+    // then DISCARDS the entry: `when(flushing) { tail := head; count := 0 }` is textually
+    // last and wins over `when(allocFireSig) { tail := tail + ... }`. Without this term
+    // such an alloc claims a slot whose tag names an index that was never really
+    // allocated — the slot leaks until that index is next re-allocated, and two flushes
+    // resolving to the same `tail` hand TWO slots the SAME tag. Caught by the sim-only
+    // duplicate-tag invariant below, deterministically, in RobPluginSpec's flush-heavy
+    // `preciseDrainBusyIn` and `sustained free-loop` cases.
+    val sysCapTake0 = alloc0 && !flushing && sysCapNeed0
+    val sysCapTake1 = alloc1 && !flushing && sysCapNeed1
+    // Free-slot priority pick. `allocReadySig` (below) guarantees >= 2 free slots on any
+    // cycle alloc can fire, so `sysCapSel1` is always a real second slot when needed.
+    val sysCapFreeMask = Bits(sysCapDepth bits)
+    for (k <- 0 until sysCapDepth) { sysCapFreeMask(k) := !sysCapValid(k) }
+    val sysCapSel0 = OHMasking.first(sysCapFreeMask)
+    val sysCapSel1 = OHMasking.first(sysCapFreeMask & ~sysCapSel0)
+    // Explicit next-state (not a `when` chain) because `allocReadySig` has to popcount it
+    // a cycle early, exactly as it already does with `countNext`.
+    val sysCapValidNext = Vec(Bool(), sysCapDepth)
+    for (k <- 0 until sysCapDepth) {
+      // The tagged entry is being re-allocated -> its old capture is dead. This is the
+      // same priority the deleted array got from the alloc-time `sysValRdyStore(tail) :=
+      // False` writes, and it is what keeps at most ONE valid slot per tag.
+      val reuse   = (alloc0 && (sysCapTag(k) === tail)) ||
+                    (alloc1 && (sysCapTag(k) === (tail + 1)))
+      // The tagged entry retired normally (the FPCTRL_CAP case; a sysOp head never takes
+      // retire0/retire1 — it leaves via `sysRetire` -> exception FSM -> flush).
+      val retired = (retire0 && (sysCapTag(k) === h0)) ||
+                    (retire1 && (sysCapTag(k) === h1))
+      val take0 = sysCapTake0 && sysCapSel0(k)
+      val take1 = sysCapTake1 && Mux(sysCapTake0, sysCapSel1(k), sysCapSel0(k))
+      // `flushing` squashes the ENTIRE ROB (`tail := head; count := 0`), so every slot's
+      // tagged entry is gone. Safe for the sysOp that CAUSED the flush: `flushing` is
+      // `excSquash = exc.active`, which is False on the trigger cycle itself, and the FSM
+      // latches `sysVal` into its own `sysCapVal` register on exactly that cycle.
+      sysCapValidNext(k) := (sysCapValid(k) && !flushing && !reuse && !retired) ||
+                            take0 || take1
+      sysCapValid(k) := sysCapValidNext(k)
+      when(take0) { sysCapTag(k) := tail }
+      when(take1) { sysCapTag(k) := tail + 1 }
+      // Fill: the four completion ports CAM-match the tag. This is the whole point of the
+      // restructure — `c.payload.result` now drives `sysCapDepth` (8) write muxes instead
+      // of one per ROB entry.
+      for (c <- ccrCompletion) {
+        when(c.valid && sysCapValid(k) && (sysCapTag(k) === c.payload.robId)) {
+          sysCapData(k) := c.payload.result
+        }
+      }
+    }
+    // Consumed by `allocReadySig` below. 0..sysCapDepth, so log2Up(sysCapDepth+1) bits.
+    val sysCapFreeNext = CountOne(sysCapValidNext.map(!_))
+    // ── Invariant (sim-only, zero synthesis cost): AT MOST ONE valid slot per tag ──
+    // This is what makes the masked-OR read above well-defined: with two valid slots
+    // carrying the same tag the read would OR two different values together and produce
+    // a word that was never captured. It is also the observable symptom of the weaker
+    // property the buffer actually relies on — every valid slot's tag names a LIVE ROB
+    // entry, which is in turn what bounds occupancy and makes the alloc-side stall
+    // deadlock-free. It is not decoration: it is what caught the missing `!flushing`
+    // term above, deterministically, on the first run.
+    GenerationFlags.simulation {
+      val sysCapDupTag = (for {
+        a <- 0 until sysCapDepth
+        b <- (a + 1) until sysCapDepth
+      } yield sysCapValid(a) && sysCapValid(b) && (sysCapTag(a) === sysCapTag(b)))
+      if (sysCapDupTag.nonEmpty) {
+        when(!ClockDomain.current.isResetActive) {
+          assert(!sysCapDupTag.reduceBalancedTree(_ || _),
+            "ROB sysCap buffer: two valid slots hold the same tag", FAILURE)
+        }
+      }
     }
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
@@ -1850,7 +2109,50 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // instead of a live combinational `count <= depth-2` read every cycle. init True
     // matches count=0 at reset. Overridden to True on a flush below (mirrors the
     // IssueQueue readyReg pattern: count resets to 0 there too, always <= depth-2).
-    allocReadySig := RegNext(countNext <= (depth - 2)) init True
+    // AND the system-value capture buffer's own back-pressure (see `sysValStore`'s
+    // declaration): a slot is RESERVED at alloc, so allocation must not be offered
+    // unless BOTH alloc ports could claim one. Computed off `sysCapValidNext`, the same
+    // next-state expression that drives the slot valids — so, exactly like the count
+    // term beside it, the flop's Q is the free-slot verdict for the value the buffer
+    // actually holds this cycle, not a delayed one. In practice never the binding term:
+    // occupancy is bounded by the number of in-flight sysOps/FPCTRL_CAP loads, a sysOp
+    // flushes the whole ROB when it retires, and the flush override below re-asserts
+    // ready immediately.
+    allocReadySig := RegNext((countNext <= (depth - 2)) &&
+                             (sysCapFreeNext >= U(2, sysCapFreeNext.getWidth bits))) init True
+
+    // ── countIsZero: a REGISTERED restatement of `count === 0` ──────────────────
+    // EXACTLY equal to `count === 0` on every cycle — not an approximation and NOT
+    // delayed. It is computed a cycle early off the SAME `countNext` expression that
+    // drives `count` itself (plus the flush override mirrored in the `when(flushing)`
+    // block below, which is the only OTHER writer of `count`), so the flop's Q is by
+    // construction the zero-compare of the value `count` holds this cycle. Same trick,
+    // and the same two writers, as `allocReadySig` directly above.
+    //
+    // Exists for physical, not logical, reasons: the only consumer is the RAS
+    // checkpoint refresh (`RasPlugin.checkpointSave`, wired in FullCoreSynth /
+    // FuzzDut / CoreBenchHarness / ExecuteLockStepSpec), and the RAS lives at the far
+    // end of the die from the ROB. A live `count === 0` there puts a 7-bit
+    // zero-compare (2 LUT levels) IN FRONT of that long ROB->frontend route, and the
+    // route then lands on 500+ clock-enable pins. A register output gets the whole
+    // period for the route and can be replicated/placed by phys_opt; a combinational
+    // cone in front of a high-fanout net cannot (see the campaign note: `max_fanout`
+    // on a COMBINATIONAL driver just moves the long wire to the other side of the gate).
+    val countIsZero = RegInit(True)
+    countIsZero := countNext === 0
+    countIsZero.simPublic()
+    // The "EXACTLY equal" claim above is an invariant, so it is CHECKED, not asserted
+    // in prose: sim-only, zero synthesis cost, and every lock-step / fuzz / bench
+    // program in the corpus exercises it on every cycle. If a future edit adds a third
+    // writer to `count` without mirroring it here, this fires instead of silently
+    // drifting the RAS checkpoint's refresh window.
+    GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(countIsZero === (count === 0),
+          "RobPlugin: countIsZero drifted from `count === 0` -- a writer of `count` " +
+          "was added without mirroring it into the registered flag", FAILURE)
+      }
+    }
 
     // ── Commit-time mispredict redirect (REGISTERED pulse) ──────────────────────
     // When the retiring head is a mispredicting branch (retireAlone), register the
@@ -2818,6 +3120,11 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // rather than waiting a cycle for the RegNext(countNext<=...) path to catch up
       // (countNext was computed off the PRE-flush count/alloc/retire this cycle).
       allocReadySig := True
+      // Same reason for countIsZero, but it is a REGISTER (not a comb override):
+      // `count := 0` above makes the ROB empty NEXT cycle, so the registered
+      // zero-compare must be forced True here to stay exactly equal to `count === 0`.
+      // This assignment is later than `countIsZero := countNext === 0` above, so it wins.
+      countIsZero := True
     }
     rc.flushPort := flushing
 

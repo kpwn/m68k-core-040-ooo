@@ -194,14 +194,14 @@ object DecOp extends SpinalEnum {
   *   INTIMM   : a 32-bit SIGN-EXTENDED integer immediate (Long/Word/Byte source
   *              specifiers all normalize to this -- MicroOpAssembler already did the
   *              sign-extension at decode time). Converts like INTREG, sourced from
-  *              fpWideImm(31 downto 0) instead of a register read.
+  *              the side-table immediate's low 32 bits instead of a register read.
   *   SINGLEIMM: a 32-bit single-precision BIT PATTERN immediate (NOT an integer --
   *              converting it as one would turn 0x3F800000 (1.0f) into 1065353216.0,
-  *              a completely wrong result). fpWideImm(31 downto 0).
-  *   DOUBLEIMM: a 64-bit double-precision BIT PATTERN immediate. fpWideImm(63 downto 0).
+  *              a completely wrong result). Side-table immediate, low 32 bits.
+  *   DOUBLEIMM: a 64-bit double-precision BIT PATTERN immediate. Side-table immediate, low 64 bits.
   *   EXTIMM   : an 80-bit extended-precision immediate -- the SAME internal layout as
   *              an FP register (Decision 1), so this is the simplest case: route
-  *              fpWideImm(79 downto 0) directly as the extended-precision source, no
+  *              the 80-bit side-table immediate directly as the extended-precision source, no
   *              format conversion at the EU at all.
   *   Task 6b (memory-source loads) reuses INTREG unmodified for its 1-chunk formats
   *   (Byte/Word/Long/Single via a temp register) and adds two SEPARATE kinds of its
@@ -799,13 +799,15 @@ case class DecodedUop() extends Bundle {
   // updated note): `size` alone cannot distinguish a 32-bit INTEGER from a 32-bit BIT
   // PATTERN, but fpSrcFmt (000 vs 001) can.
   val fpSrcFmt  = Bits(3 bits)
-  // The immediate VALUE for every fpWideImm-routed fpSrcKind above, right-justified /
-  // zero-padded to 80 bits regardless of the real format width (32/64/80 bits meaningful,
-  // per fpSrcFmt). Carried through rename/IQ exactly like `imm` already is -- IqContext
-  // embeds the WHOLE RenamedUop, so this costs nothing beyond its own bit-width, the same
-  // class of cost as `imm`/`fpuCmdWord`. Deliberately NOT reusing `imm` (32 bits, and
-  // already committed to FMOVECR's ROM offset) -- see this task's routing-contract note.
-  val fpWideImm = Bits(80 bits)
+  // The immediate VALUE for the immediate-routed fpSrcKinds above (INTIMM/SINGLEIMM/
+  // DOUBLEIMM/EXTIMM) does NOT ride this record any more. It used to be an 80-bit
+  // `fpWideImm` field carried DecodedUop -> MicroOpQueue -> rename skid -> IqContext cold
+  // Mems (x5 read ports) to reach its ONE consumer, DivEuPlugin's `fpS1Imm` capture; the
+  // routed-netlist census counted 137+86+77+69 failing endpoints on those registers
+  // (docs/PLAN_routing_congestion_architectural.md item 3). It now lives in DecodeStage's
+  // Global.FP_IMM_TABLE_DEPTH-entry side table and the uop carries only the entry TAG in
+  // `imm[Global.FP_IMM_TAG_W-1:0]` -- legal because these rows set useImm=False (`imm`
+  // stays reserved for FMOVECR's ROM offset, which is a DIFFERENT fpSrcKind, ROMCONST).
 
   /** Drive every FP field to its inert (non-FP-uop) default. Called by every
     * DecodedUop construction site that is not building an FP uop -- SpinalHDL requires
@@ -817,7 +819,7 @@ case class DecodedUop() extends Bundle {
     fpDstReg  := 0; writesFp   := False
     readsFpcc := False; writesFpcc := False
     fpuOp     := 0; fpSrcKind := FpSrcKind.FPREG
-    fpSrcFmt  := 0; fpWideImm := B(0, 80 bits)
+    fpSrcFmt  := 0
   }
 }
 

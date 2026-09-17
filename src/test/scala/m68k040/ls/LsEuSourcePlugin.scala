@@ -30,7 +30,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val iPsrcB   = in UInt (6 bits); val iPsrcBValid = in Bool ()  // store data
     val iImm     = in Bits (32 bits)                               // displacement
     val iPdst    = in UInt (6 bits); val iPdstValid  = in Bool ()  // load dst
-    val iRobId   = in UInt (6 bits)
+    val iRobId   = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val iStkPush = in Bool ()                                      // stack-push store
     val iLeaAddr = in Bool ()                                      // LEA (no translate/no mem access)
     val iReady   = out Bool ()
@@ -100,13 +100,13 @@ class LsEuSourcePlugin extends FiberPlugin {
     iReady := eu.issue.ready
 
     // completion observation
-    val cValid = out Bool (); val cRob = out UInt (6 bits)
+    val cValid = out Bool (); val cRob = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     cValid := eu.completion.valid
     cRob   := eu.completion.payload
 
     // MMU access-fault completion observation (Task 1).
     val fValid = out Bool ();        fValid := eu.faultCompletion.valid
-    val fRob   = out UInt (6 bits);  fRob   := eu.faultCompletion.payload.robId
+    val fRob   = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  fRob   := eu.faultCompletion.payload.robId
     val fAddr  = out UInt (32 bits); fAddr  := eu.faultCompletion.payload.faultAddr
     val fWrite = out Bool ();        fWrite := eu.faultCompletion.payload.write
     val fSize  = out UInt (2 bits);  fSize  := eu.faultCompletion.payload.sizeBits
@@ -114,7 +114,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     val fAtc   = out Bool ();        fAtc   := eu.faultCompletion.payload.atc
 
     // ROB-side SQ commit / flush (sim-driven)
-    val iSqCommitValid = in Bool (); val iSqCommitRob = in UInt (6 bits)
+    val iSqCommitValid = in Bool (); val iSqCommitRob = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
     val iSqFlush       = in Bool ()
     eu.sqCommit.valid   := iSqCommitValid
     eu.sqCommit.payload := iSqCommitRob

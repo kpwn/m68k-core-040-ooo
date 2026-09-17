@@ -91,7 +91,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       val iSize = in(Size())
       val iSigned = in Bool()
       val iIs64 = in Bool()
-      val iRob = in UInt(6 bits)
+      val iRob = in UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iPsrcA = in UInt(6 bits)
       val iPsrcB = in UInt(6 bits)
       val iPdst = in UInt(6 bits)
@@ -196,7 +196,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
-      uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
+      uop.fpSrcFmt := 0;
 
       ctx.robId := iRob
       eu.issue.valid := iValid
@@ -231,7 +231,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       readNzvcData := readNzvc.data
 
       val cValid = out Bool()
-      val cRob = out UInt(6 bits)
+      val cRob = out UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       cValid := eu.completion.valid
       cRob := eu.completion.payload
 
@@ -253,7 +253,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       arbCollision := divEu.logic.arbCollisionObs
 
       val wbValid = out Bool()
-      val wbRob = out UInt(6 bits)
+      val wbRob = out UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val wbDstArch = out UInt(5 bits)
       val wbResult = out Bits(32 bits)
       val wbIntWrite = out Bool()
@@ -282,7 +282,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
     // files must be present for it to elaborate. Unused by this spec.
     val rfFp   = new m68k040.execute.regfile.RegFilePluginFp
     val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new m68k040.execute.FpImmTableStub, src)) }
   }
 
   private def signedValue(value: BigInt, bits: Int): BigInt = {

@@ -116,18 +116,36 @@ class FpNarrowPack extends Component {
     val intTie   = (intRb === U(0x40, 7 bits)) && rn      // round-half-to-EVEN LSB clear
     val intAbs   = Mux(intTie, intShr & ~U(1, 58 bits), intShr)
 
+    /** The low 7 bits of the subnormal right-shift count, shared by the single and double
+      * tails (T3). Both bias constants are 1 mod 128 -- 0x3F81 = 127*128 + 1 and
+      * 0x3C01 = 120*128 + 1 -- so `(bias - aExp) mod 128` is the same expression for both,
+      * and a subtraction's low bits never depend on its high bits. The saturating compare
+      * that decides whether this value is used at all is per-format and evaluates from
+      * `aExp` in parallel with it. */
+    val cntLow7 = U(1, 7 bits) - aExp(6 downto 0)
+
     // ── Single: floatx80_to_float32 + roundAndPackFloat32 ─────────────────────────
     val f32Sig0 = jam(aSig, U(33, 7 bits))(31 downto 0)
-    val f32Exp0 = Mux(aExp =/= 0 || f32Sig0 =/= 0,
-                      aExp.resize(18).asSInt - S(0x3F81, 18 bits),
-                      aExp.resize(18).asSInt)
+    // T1: SoftFloat's `if (aExp || zSig) aExp -= 0x3F81` guard is DROPPED -- see the
+    // `T1` note on the double path below for the equivalence argument. It applies verbatim
+    // here (`f32Sig0 == 0` iff `aSig == 0`, because shift64RightJamming's sticky bit keeps
+    // any non-zero significand non-zero), and it takes a 64-bit OR-reduce of `aSig` off the
+    // front of the whole conversion.
+    val f32Exp0 = aExp.resize(18).asSInt - S(0x3F81, 18 bits)
     val f32Incr   = incrFor(aSign, 0x40, 0x7F, 8)
     val f32PreSum = f32Sig0 +^ f32Incr.resize(32)          // 33 bits
     val f32Ovfl = !aIsSpecial && ((f32Exp0 > S(0xFD, 18 bits)) ||
                   ((f32Exp0 === S(0xFD, 18 bits)) && f32PreSum(31)))
-    val f32Sub  = !f32Ovfl && (f32Exp0 < S(0, 18 bits))
-    val f32CntR = -f32Exp0
-    val f32Cnt  = Mux(f32CntR >= S(64, 18 bits), U(64, 7 bits), f32CntR.asUInt.resize(7))
+    // T2: `!f32Ovfl &&` dropped -- f32Ovfl can only be true when f32Exp0 >= 0xFD > 0, so it
+    // is already false whenever f32Exp0 < 0. Exact for every input, and it takes the 32-bit
+    // `f32PreSum` carry chain out of this mux select's cone.
+    val f32Sub  = f32Exp0 < S(0, 18 bits)
+    // T3: the shift count, direct. Was `-(aExp - 0x3F81)` -- a subtract THEN an 18-bit
+    // negate THEN an 18-bit compare, all serial. `0x3F81 - aExp >= 64` is the constant
+    // compare `aExp <= 0x3F41`, and the unsaturated count only ever needs 7 bits, whose
+    // value is `(0x3F81 - aExp) mod 128 = (1 - aExp[6:0]) mod 128` -- independent of every
+    // high bit. The two now evaluate in parallel from `aExp` and meet at one mux.
+    val f32Cnt  = Mux(aExp <= U(0x3F81 - 64, 15 bits), U(64, 7 bits), cntLow7)
     val f32Sig  = Mux(f32Sub, jam(f32Sig0.resize(64), f32Cnt)(31 downto 0), f32Sig0)
     val f32ExpS = Mux(f32Sub, S(0, 18 bits), f32Exp0)
     val f32Rb   = f32Sig(6 downto 0)
@@ -141,16 +159,40 @@ class FpNarrowPack extends Component {
 
     // ── Double: floatx80_to_float64 + roundAndPackFloat64 ─────────────────────────
     val f64Sig0 = jam(aSig, U(1, 7 bits))
-    val f64Exp0 = Mux(aExp =/= 0 || aSig =/= 0,
-                      aExp.resize(18).asSInt - S(0x3C01, 18 bits),
-                      aExp.resize(18).asSInt)
+    // T1: SoftFloat writes `if (aExp || aSig) aExp -= 0x3C01`, and that OR-reduce of the
+    // full 64-bit significand was measured (post-route, `timing_route.rpt`) as the FIRST
+    // 1.178 ns / 4 logic levels of the worst setup path in the entire design -- it sat in
+    // FRONT of the bias subtract, the shift count and the round add, so every one of them
+    // waited on a 64-bit zero test.
+    //
+    // It is unconditionally droppable. The guard changes nothing unless `aExp == 0 &&
+    // aSig == 0`, i.e. a true zero, and for that input BOTH forms produce an identical
+    // registered output. With the guard f64Exp0 = 0, so f64Sub is false and f64Sig =
+    // f64Sig0 = 0; without it f64Exp0 = -0x3C01, so f64Sub is true and f64Sig =
+    // jam(0, 64) = 0 -- the same zero, because shifting zero yields zero and its sticky bit
+    // is zero too. From there every downstream signal agrees: f64ExpS is 0 either way (the
+    // guarded form passes f64Exp0 = 0 through, the unguarded form is forced to 0 by
+    // f64Sub); f64Ovfl is false either way (-0x3C01 is not > 0x7FD); f64Rb = 0, so f64Unfl
+    // and f64Inex are false either way; and f64Shr = (0 + f64Incr) >> 10 = 0 because
+    // f64Incr <= 0x3FF < 1024. So the zero still packs as a zero, with no flags.
+    val f64Exp0 = aExp.resize(18).asSInt - S(0x3C01, 18 bits)
     val f64Incr   = incrFor(aSign, 0x200, 0x3FF, 11)
     val f64PreSum = f64Sig0 +^ f64Incr.resize(64)          // 65 bits
     val f64Ovfl = !aIsSpecial && ((f64Exp0 > S(0x7FD, 18 bits)) ||
                   ((f64Exp0 === S(0x7FD, 18 bits)) && f64PreSum(63)))
-    val f64Sub  = !f64Ovfl && (f64Exp0 < S(0, 18 bits))
-    val f64CntR = -f64Exp0
-    val f64Cnt  = Mux(f64CntR >= S(64, 18 bits), U(64, 7 bits), f64CntR.asUInt.resize(7))
+    // T2: `!f64Ovfl &&` dropped. f64Ovfl is only ever true when f64Exp0 >= 0x7FD, which is
+    // positive, so it is ALREADY false whenever f64Exp0 < 0 -- the conjunction is exactly
+    // the second term for every input. What this buys is structural: f64Ovfl depends on
+    // f64PreSum(63), the top of a 64-bit carry chain, and that chain was therefore in the
+    // select cone of the f64Sig mux that feeds the final round add.
+    val f64Sub  = f64Exp0 < S(0, 18 bits)
+    // T3: the shift count, direct -- see the f32 note. `0x3C01 - aExp >= 64` is the
+    // constant compare `aExp <= 0x3BC1`, and the unsaturated 7-bit count is
+    // `(0x3C01 - aExp) mod 128 = (1 - aExp[6:0]) mod 128`. Both bias constants happen to be
+    // 1 mod 128 (0x3C00 = 120*128, 0x3F80 = 127*128), so single and double share `cntLow7`.
+    // Replaces an 18-bit negate feeding an 18-bit compare -- two serial carry chains --
+    // with a 15-bit compare and a 7-bit subtract that run side by side.
+    val f64Cnt  = Mux(aExp <= U(0x3C01 - 64, 15 bits), U(64, 7 bits), cntLow7)
     val f64Sig  = Mux(f64Sub, jam(f64Sig0, f64Cnt), f64Sig0)
     val f64ExpS = Mux(f64Sub, S(0, 18 bits), f64Exp0)
     val f64Rb   = f64Sig(9 downto 0)

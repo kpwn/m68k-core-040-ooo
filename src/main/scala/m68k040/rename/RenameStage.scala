@@ -58,7 +58,13 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
                               xRat.io.committedPhys)
 
     // ── Freelists ────────────────────────────────────────────────────────────
-    val intFree  = Freelist(physCount = 54, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
+    // The int pool size is DERIVED, never restated: rename hands out these ids, and the
+    // IQ's int busy bitmaps (Global.PHYS_INT_REGS wide) and the int PRF Mem
+    // (RegfileSpec.Int.depth) are what they index. An over-sized freelist hands out ids
+    // with no busy bit and no PRF row: the busy SET is dropped, the busy READ is 0, so the
+    // producer's consumers issue before it has written — a wrong operand with no fault.
+    // See Global.PHYS_INT_REGS_DEFAULT for the full note and the two times this shipped.
+    val intFree  = Freelist(physCount = m68k040.Global.PHYS_INT_REGS_DEFAULT, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = 2)
     val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = 2)
     val fpFree   = Freelist(physCount = 16, archCount = 8, popPorts = 2, pushPorts = 2)
@@ -269,7 +275,6 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       r.fpuOp        := dec.fpuOp
       r.fpSrcKind    := dec.fpSrcKind
       r.fpSrcFmt     := dec.fpSrcFmt
-      r.fpWideImm    := dec.fpWideImm
 
       // architectural int dst reg (threaded for commit RAT update + CommitTrace)
       r.dstArch    := dec.dstReg

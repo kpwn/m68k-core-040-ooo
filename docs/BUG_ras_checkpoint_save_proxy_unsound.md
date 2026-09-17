@@ -18,6 +18,19 @@ state with a checkpoint/restore pair rather than a per-branch checkpoint stack:
 Wired identically in all four DUT copies (`FullCoreSynth.scala:159`,
 `FuzzDut.scala:215`, `ExecuteLockStepSpec.scala:309`, and `IpcBenchSpec`).
 
+> **Amendment 2026-09-15 (FMax, does NOT change this bug).** The `checkpointSave`
+> wiring is now `rob.logic.countIsZero` — a REGISTERED flag in `RobPlugin` that is
+> bit-exactly `count === 0` (computed off the same `countNext` that drives `count`,
+> with the flush override mirrored; guarded by a sim-only equality assertion) — and
+> `RasPlugin` applies the copy the cycle AFTER the arm, gating it internally with
+> `!checkpointRestore` instead of requiring each wiring site to AND that in. Purely a
+> timing restructure: `ckRas_*_reg[*]/D` had become the worst endpoint family in the
+> design because the old same-cycle form put FetchAlign's `pushValid` (~17 levels,
+> through DecodeStage's ready ladder) on 512 flop D pins. The captured CONTENT is
+> identical, so **everything below still applies verbatim**: the proxy is still
+> `rob.count === 0`, and the frontend still runs ahead of it. Measured IPC before/after
+> at a pinned seed was bit-identical on all 13 kernels including `call-return`.
+
 The soundness argument for the `rob.count === 0` proxy is stated in Ras.scala's own
 class comment: *"at that instant NOTHING is outstanding/unresolved, so the live RAS
 state is, by construction, exactly the architecturally correct one (module the few

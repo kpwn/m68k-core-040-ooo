@@ -170,7 +170,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
     u.eaAuto #= m68k040.decode.EaAuto.NONE; u.eaDelta #= 0
     u.isReturn #= false
     u.fpuSoftwareComplete #= false; u.fpuCmdWord #= 0; u.fpuOp #= 0
-    u.fpSrcKind #= m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt #= 0; u.fpWideImm #= 0
+    u.fpSrcKind #= m68k040.decode.FpSrcKind.FPREG; u.fpSrcFmt #= 0
     u.fpDstArch #= 0
     u.pFpDst #= 0; u.pFpDstValid #= false; u.pFpOld #= 0
     u.pFpSrcA #= 0; u.psrcAFpValid #= false

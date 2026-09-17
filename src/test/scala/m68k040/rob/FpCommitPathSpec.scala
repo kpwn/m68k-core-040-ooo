@@ -91,7 +91,7 @@ class FpCommitPathSpec extends AnyFunSuite {
     u.fpSrcBReg #= fpSrcBReg; u.usesFpSrcB #= usesFpSrcB
     u.fpDstReg  #= fpDstReg;  u.writesFp   #= writesFp
     u.readsFpcc #= false;     u.writesFpcc #= writesFpcc
-    u.fpuOp #= 0; u.fpSrcKind #= FpSrcKind.FPREG; u.fpSrcFmt #= 0; u.fpWideImm #= BigInt(0)
+    u.fpuOp #= 0; u.fpSrcKind #= FpSrcKind.FPREG; u.fpSrcFmt #= 0
   }
 
   def clearSlot(u: DecodedUop): Unit = { u.valid #= false; u.writesFp #= false; u.writesFpcc #= false }

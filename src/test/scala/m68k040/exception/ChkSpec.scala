@@ -27,7 +27,7 @@ class ChkSpec extends AnyFunSuite {
     val logic = during build new Area {
       val eu = host[DivEuService]
       val iValid  = in Bool ()
-      val iRobId  = in UInt (6 bits)
+      val iRobId  = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
       val iPsrcA  = in UInt (6 bits)
       val iPsrcB  = in UInt (6 bits)
       val iWord   = in Bool ()   // size: word vs long
@@ -54,7 +54,7 @@ class ChkSpec extends AnyFunSuite {
       uop.pFpccSrc := 0; uop.readsFpcc := False
       uop.pFpccDst := 0; uop.writesFpcc := False; uop.pFpccOld := 0
       uop.fpuOp := 0; uop.fpSrcKind := m68k040.decode.FpSrcKind.FPREG
-      uop.fpSrcFmt := 0; uop.fpWideImm := B(0, 80 bits)
+      uop.fpSrcFmt := 0;
       uop.faulted := False; uop.faultVector := 0; uop.isRte := False
       uop.sswInstr := False
       uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
@@ -73,10 +73,10 @@ class ChkSpec extends AnyFunSuite {
       wB.valid := wBValid; wB.address := wBAddr; wB.data := wBData
 
       val cValid  = out Bool ();        cValid  := eu.completion.valid
-      val cRob    = out UInt (6 bits);  cRob    := eu.completion.payload
+      val cRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  cRob    := eu.completion.payload
       val iReady  = out Bool ();        iReady  := eu.issue.ready
       val fValid  = out Bool ();        fValid  := eu.euFault.valid
-      val fRob    = out UInt (6 bits);  fRob    := eu.euFault.payload.robId
+      val fRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits);  fRob    := eu.euFault.payload.robId
       val fVec    = out UInt (8 bits);  fVec    := eu.euFault.payload.vector
       val nObs    = out Bool ();        nObs    := host[DivEuPlugin].logic.chkNObs
       val wbNzvcWrite = out Bool ();    wbNzvcWrite := host[DivEuPlugin].logic.wbObs.valid && host[DivEuPlugin].logic.wbObs.nzvcWrite
@@ -93,7 +93,7 @@ class ChkSpec extends AnyFunSuite {
     // files must be present for it to elaborate. Unused by this spec.
     val rfFp   = new m68k040.execute.regfile.RegFilePluginFp
     val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
-    db.on { host.asHostOf(Seq[FiberPlugin](rfInt, rfNzvc, rfFp, rfFpcc, eu, src)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new m68k040.core.ParamPlugin(m68k040.M68kParams()), rfInt, rfNzvc, rfFp, rfFpcc, eu, new m68k040.execute.FpImmTableStub, src)) }
   }
 
   /** Returns (complete, fault, vector, nFlag, architectural-NZVC observation,

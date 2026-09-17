@@ -146,6 +146,7 @@ class FtqCapacitySpec extends AnyFunSuite {
       p.lenWords #= 1
       p.ambiguousLine #= false
       p.size #= Size.LONG
+      p.ctrlXfer #= false
     }
     dut.update.logic.update.valid #= false
     dut.update.logic.update.payload.pc #= 0
@@ -262,11 +263,13 @@ class FtqCapacitySpec extends AnyFunSuite {
         r.payload.data #= data
         r.payload.fault #= false
         r.payload.atc #= false
-        for (p <- r.payload.pred) {
+        for ((p, lane) <- r.payload.pred.zipWithIndex) {
           p.simple #= true
           p.lenWords #= 1
           p.ambiguousLine #= false
           p.size #= Size.LONG
+          p.ctrlXfer #= PredecodeRef.ctrlXfer(
+            ((data >> (lane * 16)) & BigInt(0xffff)).toInt)
         }
       } else {
         r.valid #= false
