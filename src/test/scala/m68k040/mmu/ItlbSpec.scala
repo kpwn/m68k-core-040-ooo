@@ -28,6 +28,10 @@ class ItlbProbePlugin extends FiberPlugin {
     val flush       = in Bool ()
     val pflusha     = in Bool ()
     val walkDone    = out Bool ()
+    // Additive observation port (2026-09-17): the cycle in which a miss is CAPTURED
+    // but the walker has not started yet. `ItlbFlushPoisonSpec` needs it to place a
+    // PFLUSHA in the PRE-LAUNCH straddle position; nothing else reads it.
+    val missCaptured = out Bool ()
     xlate.req.valid      := reqIn.valid
     xlate.req.vpn        := reqIn.vpn
     xlate.req.supervisor := reqIn.supervisor
@@ -42,6 +46,7 @@ class ItlbProbePlugin extends FiberPlugin {
     itlb.umFlush       := flush
     itlb.flushAll      := pflusha
     walkDone           := itlb.logic.walker.io.done
+    missCaptured       := itlb.logic.missReqReg.valid
   }
 }
 
