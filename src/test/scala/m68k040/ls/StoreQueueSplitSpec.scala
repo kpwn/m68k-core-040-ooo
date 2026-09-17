@@ -559,7 +559,10 @@ class StoreQueueSplitSpec extends AnyFunSuite {
       var injected = false
       var tailAtInject = -1
       var headAtInject = -1
-      val injRobId = 40   // robId is only 6 bits (0..63); 40 is far from the 0..7 range used above
+      // The TOP of the id space, i.e. as far as the ROB allows from the 0..7 range used
+      // above. This was the literal 40 with the comment "robId is only 6 bits (0..63)" --
+      // true when the ROB was 64 deep, an out-of-range poke once it became 32.
+      val injRobId = m68k040.TestRobIds.highBlock(1).head
       val injPaddr = 0x00009000L
       val injData  = 0xFEEDFACEL
       while (!injected && guard < 400) {

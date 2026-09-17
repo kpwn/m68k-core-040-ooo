@@ -959,7 +959,7 @@ class StoreQueueSpec extends AnyFunSuite {
       // THE ONE CHANGED INPUT: the ROB flush destroyed robId 21's entry and the ROB
       // moved on. Anything may now sit at the head -- including, later, a brand-new
       // instruction that inherits id 21.
-      dut.io.robHeadIn #= 40
+      dut.io.robHeadIn #= m68k040.TestRobIds.otherThan(21)
       dut.io.robHeadValidIn #= true
       sleep(1)
       assert(dut.valids(0).toBoolean, "Part 37's keep rule still applies -- the entry survives")
@@ -972,7 +972,7 @@ class StoreQueueSpec extends AnyFunSuite {
       assert(!dut.io.empty.toBoolean, "slot B has not drained yet")
 
       // Slot B MUST be presented. Before the Part 127 fix `headPreciseReady` required
-      // `robIds(head) === io.robHeadIn` (21 vs 40) and this wait never returns -- the
+      // `robIds(head) === io.robHeadIn` (21 vs some other head) and this wait never returns -- the
       // ring is wedged on a dead index and NOTHING can drain again, which is the same
       // permanent-hang class Part 37 fixed one instance of.
       var waited = 0
