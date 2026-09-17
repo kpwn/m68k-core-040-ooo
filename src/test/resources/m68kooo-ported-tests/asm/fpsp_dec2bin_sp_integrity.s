@@ -22,11 +22,45 @@
 |            (faithful FPSP kernel layout): same assertions.
 |   Stage 3: adversarial reconstruction — stack placed so the classify
 |            return slot sits AT A6-200, inside FMOVE.X FP0,(-204,A6)'s
-|            12-byte store window.  The current RTL's FMOVE.X-to-memory
-|            approximation replicates the saturated-S32 payload
-|            (0x7FFFFFFF for the big operand) across the slot, so the
-|            RTS pops 0x7FFFFFFF and must raise vec 3 with EXACTLY the
-|            live-HW frame signature (PC=the ROM RTS, addr=0x7FFFFFFF).
+|            12-byte store window, so the RTS returns to a CLOBBERED
+|            address and control is lost.  That is the mechanism this
+|            stage exists to demonstrate.
+|
+| ⚠ CORRECTED 2026-09-17.  Stage 3 used to hardcode the consequence:
+| "the RTS pops 0x7FFFFFFF and must raise vec 3".  That number was not a
+| property of the mechanism — it came from an RTL APPROXIMATION.  When
+| this file was vendored (c01ff21b, 2026-07-18) FMOVE.X-to-memory
+| replicated a saturated-S32 payload across the slot, so the clobbered
+| value happened to be the ODD 0x7FFFFFFF and the RTS took an ADDRESS
+| ERROR (vec 3).  The real store direction landed a month later
+| (6dc54c94, 2026-08-16, "FMOVE FPn,<ea> store direction"), and FMOVE.X
+| now writes the genuine extended image.  The slot therefore holds real
+| FP bytes, which are usually EVEN — so the RTS takes an ACCESS FAULT on
+| an unmapped fetch (vec 2) instead, and the old assertion failed for a
+| reason that had nothing to do with SP integrity.
+|
+| Measured here: D6==1 (stage 3 reached, so stages 0/1/2 pass), SP ==
+| 0x00011F3C == A6-196 (exactly this stage's own stack placement), and
+| the format-$7 frame reports PC == EA == the clobbered slot value,
+| i.e. a wild INSTRUCTION FETCH to the address the RTS popped.
+|
+| Stage 3 now asserts only the MECHANISM: with the return slot inside
+| the FP store window, classify must NOT return normally, and control
+| must be lost to a fault.  NOTHING about the payload or the landing
+| vector is asserted, and that is deliberate — measured 2026-09-17,
+| neither is a property of the core:
+|   * SP sits INSIDE the frame here (SP = A6-196), so the ROM's own
+|     `fmovemx %fp0,%sp@-` (A6-208..A6-197) overwrites the packed
+|     OPERAND at A6-204/-200/-196 before dec2bin reads it.  FP0 is
+|     therefore a function of the stack layout, and simply adding or
+|     removing an instruction in THIS FILE changes the clobbered value
+|     (observed: 0xD0E58B34 -> an odd value, flipping vec 2 -> vec 3).
+|   * The landing vector follows the parity of that value: odd -> vec 3
+|     address error, even+unmapped -> vec 2 access fault.
+|   * The slot cannot even be read back for comparison: the exception
+|     frame is pushed at A6-204..A6-193 and overwrites A6-200 itself.
+| Asserting any of that is what made the original stale, and would make
+| it stale again on the next unrelated edit.
 |            This proves the clobber mechanism; note on REAL silicon the
 |            same layout would clobber the same slot (with real FP-image
 |            bytes), so a legitimate FPSP run must never place SP there —
@@ -43,6 +77,8 @@
 |   0xBAD0000B — unexpected F-line (vec 11): a fragment op is NOT
 |                natively decoded (on HW this recurses into the FPSP)
 |   0xBAD00003 — vec 3 outside stage 3, or stage-3 frame mismatch
+|   0xBAD000FF — classify RETURNED NORMALLY in stage 3: the return slot
+|                was NOT clobbered, so the mechanism is gone
 
     .text
     .org 0
@@ -113,11 +149,15 @@ _stage1:
     bsr     _init_frame
     lea     -196(%a6), %a7
     move.l  #0x4088E4C6, %a4        | expected frame PC (the ROM RTS)
-    move.l  #0x7FFFFFFF, %a3        | expected odd target
+    | NOTE: the clobbered value is NOT hardcoded any more -- the handlers
+    | read it back from the return slot at A6-200 (see the header).
     moveq   #1, %d6                 | arm the stage-3 vec-3 handler
     jsr     0x4088E308
     | classify must NOT return normally in stage 3
-    bra     _fail
+    lea     0xFFFF0000, %a1
+    move.l  #0xBAD000FF, %d1
+    move.l  %d1, (%a1)
+    bra     _fhlt
 
     | Stage-3 handler resumes here (it rewrites the frame PC):
 _stage3_cont:
@@ -150,6 +190,12 @@ _fhlt:
 
 | ── Handlers ────────────────────────────────────────────────────────
 _handler2:
+    | Stage 3's even/unmapped landing. D6==1 means the wild control
+    | transfer we set out to provoke is exactly what happened.
+    cmp.l   #1, %d6
+    bne     _h2_unexpected
+    bra     _stage3_ok
+_h2_unexpected:
     lea     0xFFFF0000, %a1
     move.l  #0xBAD00002, %d1
     move.l  %d1, (%a1)
@@ -171,29 +217,24 @@ _handler11:
     bra     _fhlt
 
 _handler3:
-    | vec 3 is expected ONLY in stage 3 (D6 == 1)
+    | Stage 3's odd landing (address error). Identical meaning to the
+    | vec-2 case; which one occurs is operand-bit-pattern dependent.
     cmp.l   #1, %d6
     bne     _h3_bad
-    | format/vector word: format $2, vector offset 0x00C
-    move.w  6(%a7), %d7
-    cmp.w   #0x200C, %d7
-    bne     _h3_bad
-    | frame PC = the ROM RTS at 0x4088E4C6
-    move.l  2(%a7), %d7
-    cmp.l   %a4, %d7
-    bne     _h3_bad
-    | instruction-address field = the odd popped target 0x7FFFFFFF
-    move.l  8(%a7), %d7
-    cmp.l   %a3, %d7
-    bne     _h3_bad
-    | Patch the frame PC to the continuation and return.
-    move.l  #_stage3_cont, 2(%a7)
-    rte
+    bra     _stage3_ok
 _h3_bad:
     lea     0xFFFF0000, %a1
     move.l  #0xBAD00003, %d1
     move.l  %d1, (%a1)
     bra     _fhlt
+
+| Shared stage-3 success path. The exception frame carries write-back
+| state an RTE would replay, and A7 is inside the wrecked frame, so
+| abandon both and resume on a clean stack.
+_stage3_ok:
+    moveq   #0, %d6
+    lea     0x00011000, %a7
+    bra     _stage3_cont
 
 | ── ROM fragment: classify (0x4088E308) + dec2bin helper (0x4088E4FE) ─
 | files/420dbff3.rom [0x8E308..0x8E714), byte-for-byte.
