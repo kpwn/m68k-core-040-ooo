@@ -486,6 +486,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val probeReadyReg = RegInit(False)
     probeReadyReg.simPublic()
     loadProbePort.ready := probeReadyReg
+    /** REGISTERED store GRANT for the shared tag/data array READ port -- the flop the
+      * store S1->S2 arbiter advances on, instead of the live `fsm.loadUsesPort`.
+      *
+      * Driven from the store pipe's own next-state (see its assignment below the
+      * store pipe). When it is high the early-probe launch predicate stands down
+      * (`probeAdmitBase` ANDs `!storeClaimReg`), so "the store was granted the port"
+      * and "no probe drove `rdSet`/`rdEn`" are the SAME FACT, enforced by
+      * construction rather than observed after the fact. That is what lets the
+      * arbiter drop `loadProbeLaunch` -- and with it `loadProbePort.valid`, and with
+      * it the whole `RobPlugin head -> p4AtRobHead -> p4Ready -> p3Ready ->
+      * txCanConsumeRsp -> probeWanted` cone -- out of its input set. See
+      * `loadPortReserved`'s comment at the arbiter for the full argument. */
+    val storeClaimReg = RegInit(False)
+    storeClaimReg.simPublic()
     /** A probe that handshaked THIS cycle is actually launched (array read + entry
       * allocation). `loadProbePort.fire && !loadProbeLaunch` is a DROPPED probe: the
       * credit admitted it but a same-cycle condition the credit cannot know one cycle
@@ -1510,7 +1524,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * for why gating that arm on `maintBusyReg` (which IS set during `WAIT`) instead
       * would be a genuine deadlock. Driven by the `maint` Area's own `walking`. */
     val maintWalking = Bool(); maintWalking := False
-    val freshLoadUsesPort = Bool(); freshLoadUsesPort := False
 
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
@@ -1561,8 +1574,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // the case-by-case proof that it is exactly the old `earlyProbeHasAllocSlot &&
         // (!loadCmdPort.valid || useEarlyProbe)`) is ANDed in last, so `useEarlyProbe`
         // reaches this net through one LUT rather than three.
+        //
+        // `!storeClaimReg` (2026-09-17) SUBSUMES the `!(storeReadOwed && stS1Valid)`
+        // term kept beside it: `storeClaimReg`'s D is
+        // `stS1ValidNext && (!loadProbePort.valid || storeReadOwedNext)`, so an owed
+        // store with an S1 descriptor always raises it. Both are kept because the
+        // `storeReadOwed` term is ALSO mirrored, verbatim, into `probeReadyReg`'s D
+        // input (as `!(storeReadOwedNext && stS1ValidNext)`); dropping it here would
+        // silently break the "the launch predicate is the old ready, bit for bit"
+        // relationship that credit's contract rests on. `storeClaimReg` is the strictly
+        // stronger, purely REGISTERED addition, and it is the one the store arbiter
+        // relies on for exclusion.
         val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
                              !pendingStoreMiss && !maintBusyReg &&
+                             !storeClaimReg &&
                              !(ldS1Valid && !ldS1Hit) &&
                              !(storeReadOwed && stS1Valid)
         // 2026-09-14 (plan item 6): this expression USED TO BE `loadProbePort.ready`
@@ -1600,7 +1625,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
           rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
           rdEn         := True
           loadUsesPort := True
-          freshLoadUsesPort := True
           when(!canceledAtLaunch) {
             earlyProbeValids(earlyProbeAllocIdx)  := True
             earlyProbeReadies(earlyProbeAllocIdx) := False
@@ -1722,7 +1746,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
           rdSet        := cmdSet
           rdEn         := True
           loadUsesPort := True
-          freshLoadUsesPort := True
           ldS1Valid    := True
           ldS1Set      := cmdSet
           ldS1Tag      := cmdTag
@@ -2834,14 +2857,162 @@ class DcachePlugin(val socketMerged: Boolean = false,
     stS1SameLineAsS3.simPublic()   // test-visibility only (pea-cache-evict-2026-08-19
                                     // regression); no-op for synthesis
 
-    val stS1Advance = stS1Valid && !fsm.loadUsesPort && !maintUsesPort && !storePipeHeld &&
-      !stS1SameLineAsS3
+    /** The NON-PROBE half of "the load side might drive `rdSet`/`rdEn` this cycle".
+      * Read together with `storeClaimReg` (the probe half) in `stS1Advance` below.
+      *
+      * WHAT THIS REPLACES, AND WHY (2026-09-17). The store's S1->S2 arbiter used to
+      * read `fsm.loadUsesPort` -- "the load side DID drive the port" -- whole. That
+      * signal's early-probe arm is `loadProbePort.fire && probeLaunchOk`, i.e. it
+      * carries the LS EU's LIVE `loadProbe.valid`, which is itself
+      * `RobPlugin head -> p4AtRobHead -> p4LaunchOk -> p4Ready -> p3Ready ->
+      * txCanConsumeRsp -> txReady -> normalReqArm -> probeWanted -> loadProbe.valid`
+      * before it even crosses into this plugin. From there `loadProbeLaunch ->
+      * loadUsesPort -> stS1Advance -> stS1Ready -> s0Advance -> s0Ready ->
+      * storePort.ready -> storePort.fire -> the clock enables of the ENTIRE
+      * three-stage store payload register file (s0Payload/stS1Payload/stS2Payload,
+      * eight fields each, 3x128 bits of `lineData` alone)` added eight more: six
+      * nested `!valid || canLeave` ready-chain hops across two plugins. Measured on
+      * the generated netlist as a 28-level combinational path (`missCmode` ->
+      * `inhibitedResp` -> `loadRspPort.valid` -> the LS EU's completion/ready chain
+      * -> back into this arbiter); Vivado independently measured ~25 levels /
+      * 5.019 ns for this family on the 200 MHz build.
+      *
+      * Note what the coupling is NOT: `s0Payload_lineData`'s data fan-in is exactly
+      * `{storePort_fire, storePort_payload_lineData}`. There is no data dependency on
+      * the ROB head anywhere in the store pipe -- this was pure contention over the
+      * shared tag/data array read port leaking a retire-pointer cone into a
+      * store-side clock enable.
+      *
+      * THE SPLIT. Four arms of the load FSM drive `loadUsesPort`:
+      *
+      *   arm                                        handled by
+      *   -----------------------------------------  ------------------------------
+      *   early-probe launch                         `storeClaimReg`, ENFORCED: the
+      *     (`loadProbePort.fire && probeLaunchOk`)    launch predicate itself ANDs
+      *                                                `!storeClaimReg`, so a granted
+      *                                                store and a launching probe are
+      *                                                mutually exclusive BY
+      *                                                CONSTRUCTION, not by observing
+      *                                                the live valid
+      *   drain-shadow relaunch                      `loadShadowValid`   (a FLOP)
+      *   REPLAY refill relaunch                     `fsm.isActive(REPLAY)` (a FLOP)
+      *   plain resolved-command read                `loadCmdPort.valid &&
+      *     (the LAST `elsewhen(loadCmdPort.fire)`)    !(storeReadOwed && stS1Valid)`
+      *
+      * The last one is a SUPERSET of its arm, not an equality, and it needs the
+      * two-term form rather than bare `loadCmdPort.valid` for liveness (below). It is
+      * still a superset because the bare-`fire` arm is the LAST `elsewhen` in its
+      * chain: the three arms ahead of it are the shadow relaunch (covered by its own
+      * term), the miss-shadow CAPTURE and the `useEarlyProbe` consume, and neither of
+      * those two touches the read port. So reaching the bare arm requires
+      * `!useEarlyProbe`, and with `!useEarlyProbe` the only way `loadCmdPort.ready`
+      * can be high is `!(storeReadOwed && stS1Valid)`.
+      *
+      * `loadCmdPort.valid` is the one non-flop term here, and it carries no ROB head:
+      * it is `coreLsLoadAdmit`, a conjunction of LS EU pipeline REGISTERS (see
+      * LsEuPlugin's own "drive `loadCmd` from THOSE flops the next cycle" note) or,
+      * on the exception/walker drives, other registers. Netlist-measured: the whole
+      * `storePort.fire` cone drops from 28 levels / 607 nodes to 15 levels / 283
+      * nodes, and `RobPlugin_logic_head`, `p4Ready`, `p3Ready`, `txCanConsumeRsp` and
+      * `loadProbePort_valid` are all absent from it afterwards.
+      *
+      * DIRECTION OF ERROR. The probe arm is excluded by construction; every other
+      * substitution replaces a condition by something IMPLIED BY IT. So
+      * `fsm.loadUsesPort -> !(stS1Advance)` still holds bit for bit and the arbiter
+      * is STRICTLY MORE RESTRICTIVE than what shipped: it cannot create a new port
+      * conflict, only over-stall. The `GenerationFlags.simulation` assertion below is
+      * the falsifiable form of that claim and runs in every sim.
+      *
+      * LIVENESS. A store denied the port raises `storeDeniedPort` (below), which is
+      * the widened replacement for the old `freshLoadUsesPort && stS1Valid` setter of
+      * `storeReadOwed`: "I was denied" rather than "a fresh load actually stole my
+      * read". `storeReadOwed` then forces `storeClaimReg` high on the very next cycle
+      * AND clears the `loadCmdPort` term above, so a denied store advances one cycle
+      * later. The two remaining arms (shadow relaunch, REPLAY) are bounded events
+      * that never wait on `stS1Advance` -- REPLAY's own store branch waits only on
+      * `storeDrainRefillHold = stS2Valid || stS3Valid`, both of which drain
+      * unconditionally. Probes have the mirror-image guarantee: `storeClaimReg` can
+      * only stay high across consecutive cycles while probe demand is low, so a
+      * demanding probe loses at most every other cycle.
+      *
+      * COST (measured, IPC_SEED=12345, 13-kernel bench). Twelve of the thirteen
+      * kernels are CYCLE-IDENTICAL to the pre-cut baseline, `store-stream` included
+      * (1.012 IPC, unchanged -- the grant policy exists precisely so an uncontended
+      * store stream keeps its one-descriptor-per-cycle S1->S2 drain). `mixed`
+      * regresses 605 -> 642 cycles (0.539 -> 0.508 IPC); aggregate 8708 -> 8745
+      * cycles, 0.683 -> 0.680 IPC, +0.43% cycles. An earlier revision that reserved
+      * the port whenever the probe CREDIT was open, with no demand hint, cost
+      * store-stream 1.012 -> 0.610 and the aggregate +6.3% cycles -- that is what the
+      * `!loadProbePort.valid` term in `storeClaimReg`'s D buys.
+      *
+      * THE ONE HAZARD, AND WHY THE EXTRA STALL CANNOT REACH IT. `stS2UsesS3Line` (far
+      * above) forwards an older store's S3 merged line into a younger same-line
+      * store's S2 capture, and its own comment records that it covers only a ONE-cycle
+      * S2-to-S2 gap -- the two-cycle-gap case was found LIVE via
+      * `pea_4x_cache_evict_once.s` and is patched separately by `stS1SameLineAsS3`.
+      * Since this change alters exactly that gap distribution, the coverage argument
+      * is restated here in a stall-independent form:
+      *
+      *   The store pipe is strictly in-order and holds ONE descriptor per stage, and
+      *   S2->S3 is an UNGATED one-cycle pass (`when(stS2Valid) { stS3Valid := True }`).
+      *   So for an older store A and a younger same-line store B:
+      *     A's array write cycle  w = (A's S2 cycle) + 1
+      *     B's S2 capture cycle     = (B's S1 advance cycle c) + 1, and the line B
+      *                                captures is the read launched AT c
+      *     in-order, one-deep S2   => A's S2 cycle <= c  =>  w <= c + 1
+      *   which leaves exactly three reachable cases:
+      *     w <  c      B's read at c is launched after the write landed -> FRESH
+      *     w == c      read-during-write with no forwarding -> blocked by
+      *                 `stS1SameLineAsS3`, B holds in S1 and retries at c+1 (and S3
+      *                 is a one-cycle pulse, so the retry is fresh)
+      *     w == c + 1  B's read at c predates the write -> patched by `stS2UsesS3Line`
+      *   Any additional stall on `stS1Advance` only moves c LATER, i.e. strictly
+      *   towards the `w < c` FRESH case. It cannot manufacture a gap the pair of
+      *   patches does not already cover, because the bound `w <= c + 1` comes from the
+      *   pipe's in-order one-deep structure, not from any timing coincidence.
+      *
+      * `DcacheStorePortReservationSpec` is the falsifiable form: it walks a younger
+      * same-line store behind an older one at every S2 distance the grant can produce
+      * (producer gap 0..6 x {probe demand, no probe demand}), asserts that a
+      * TWO-cycle S2 gap is never observable, asserts that the ONE-cycle gap and its
+      * forward are still REACHED (so the forward is not quietly dead code), and
+      * checks the CACHE ARRAY through a real CPUSH writeback into memory rather than
+      * a forwarded load value. */
+    val loadPortReserved = loadShadowValid ||
+                           fsm.isActive(fsm.REPLAY) ||
+                           (loadCmdPort.valid && !(storeReadOwed && stS1Valid))
+
+    val stS1Advance = stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
+      !storePipeHeld && !stS1SameLineAsS3
+    // test-visibility only (DcacheStorePortReservationSpec's gap sweep and drain-rate
+    // measurement); simPublic is a no-op for synthesis.
+    loadPortReserved.simPublic(); stS1Advance.simPublic()
     val stS1Ready   = !stS1Valid || stS1Advance
     val s0Advance   = s0Valid && stS1Ready && !storePipeHeld
     val s0Ready     = !s0Valid || s0Advance
 
+    /** The store held an S1 descriptor, was not blocked by a barrier or by the
+      * same-line-as-S3 read hazard, and still did not advance -- i.e. it lost (or
+      * was pre-empted out of) the shared array read port. Exclusive with
+      * `stS1Advance` by construction. Replaces the old
+      * `freshLoadUsesPort && stS1Valid` setter (that signal is now gone); see `loadPortReserved`. */
+    val storeDeniedPort = stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3
+    storeDeniedPort.simPublic()
+
+    GenerationFlags.simulation {
+      // The cut's entire safety argument, as a runtime tripwire: the store must
+      // NEVER advance on a cycle the load FSM or the maintenance walk actually
+      // drove rdSet/rdEn, because its S2 capture would then hold that other
+      // requester's line.
+      assert(!(stS1Advance && (fsm.loadUsesPort || maintUsesPort)),
+        "DcachePlugin: the store advanced S1->S2 on a cycle the load FSM or the " +
+          "maintenance walk owned the shared array read port -- loadPortReserved is " +
+          "not a superset of fsm.loadUsesPort",
+        FAILURE)
+    }
+
     when(stS1Advance) { storeReadOwed := False }
-    when(freshLoadUsesPort && stS1Valid) { storeReadOwed := True }
+    when(storeDeniedPort) { storeReadOwed := True }
 
     // Admission, per class (WT-pipelining task):
     //   - precise (fully serial): needs a totally empty pipe -- unchanged,
@@ -2949,9 +3120,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
     val loadShadowValidNext = loadShadowCaptureEv || (loadShadowValid && !loadShadowLaunchEv)
     // Mirror the two `storeReadOwed` writers above (`when(stS1Advance) := False` then
-    // `when(freshLoadUsesPort && stS1Valid) := True`, later assignment wins; the two are
-    // exclusive anyway since `stS1Advance` requires `!fsm.loadUsesPort`).
-    val storeReadOwedNext = Mux(freshLoadUsesPort && stS1Valid, True,
+    // `when(storeDeniedPort) := True`, later assignment wins; the two are exclusive
+    // by construction -- `storeDeniedPort` literally carries `!stS1Advance`).
+    val storeReadOwedNext = Mux(storeDeniedPort, True,
                                 Mux(stS1Advance, False, storeReadOwed))
     // Mirror the two `stS1Valid` writers (`when(stS1Advance) := False` then
     // `when(s0Advance) := True`, later wins).
@@ -2983,6 +3154,39 @@ class DcachePlugin(val socketMerged: Boolean = false,
                                  Mux(cancelClr, False, earlyProbeValids(i))))
     }
     val earlyProbeHasFreeNext = !earlyProbeValidsNext.asBits.andR
+
+    /** THE GRANT POLICY, in one line. Grant the port to the store on any cycle it
+      * will hold an S1 descriptor AND (no probe was being offered last cycle, OR the
+      * store is owed a read).
+      *
+      *   - Store-only stretches (`loadProbePort.valid` low): the store is granted
+      *     EVERY cycle, so the S1->S2 drain still streams at one descriptor per cycle
+      *     exactly as it did before this cut. This term is why: a plain
+      *     "reserve whenever the probe credit is open" arbiter cost 1.012 -> 0.610 IPC
+      *     on the `store-stream` bench kernel, measured, because the credit is open on
+      *     nearly every IDLE cycle and the store then alternates against nothing.
+      *   - Contended stretches: the store is granted only when OWED, i.e. exactly
+      *     every other cycle, which is what the pre-existing
+      *     `!(storeReadOwed && stS1Valid)` fairness term already produced whenever a
+      *     load actually took the port.
+      *
+      * `loadProbePort.valid` is read here as a pure one-cycle-late DEMAND HINT, and
+      * it is sound in BOTH directions: a stale 1 only makes the store yield a cycle
+      * it could have taken, and a stale 0 only makes a probe lose a cycle it could
+      * have had -- the probe is dropped (`loadProbePort.fire && !loadProbeLaunch`),
+      * which is architecturally invisible by that signal's own contract. It must NOT
+      * be folded into `probeReadyReg` instead: `loadProbe.valid` is itself a function
+      * of `loadProbe.ready` in the LS EU (`normalReqArm` carries
+      * `dcache.loadProbe.ready`), so shutting the credit would pull the demand hint
+      * low and the store would claim forever -- probe starvation. Blocking the LAUNCH
+      * while leaving the READY up keeps the hint alive.
+      *
+      * TIMING: this is the only place `loadProbePort.valid` survives on the store
+      * side, and it terminates at a FLOP one level in. `probeReadyReg`'s own D input
+      * already carries that same net ~10 levels deeper (through `loadProbeLaunch` ->
+      * `earlyProbeValidsNext` -> `earlyProbeHasFreeNext`), so this adds no new
+      * worst-case path to that family -- it removes the 28-level combinational one. */
+    storeClaimReg := stS1ValidNext && (!loadProbePort.valid || storeReadOwedNext)
 
     probeReadyReg := probeIdleNext &&
                      !resetSweepBusy &&
