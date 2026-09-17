@@ -28,7 +28,14 @@ import spinal.lib.misc.plugin.FiberPlugin
   * walk root is selected per-access from the request's own supervisor bit. */
 class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin
+                 banks: Int = Tlb.DefaultBanks,
+                 /** THE NEGATIVE CONTROL for the per-search cache-mode latch. Defaults true and
+           * nothing in `src/main` passes false, so it folds away with no netlist difference.
+           * False restores the pre-fix behaviour -- the drain's store re-reads the LIVE
+           * policy instead of the value latched at arming -- which is what let a CACR.DE
+           * write land between a drain's re-read and its store. See
+           * `WalkerDcacheClient.walkCmodePolicy` and `WalkDrainCacheModeSpec`. */
+                 latchDrainCmode: Boolean = true) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -786,7 +793,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainOffReg   = Reg(UInt(4 bits))
     val drainDropAck  = RegInit(False)
     /** The descriptor cache-mode policy in force when THIS drain armed. */
-    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH
+    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH; drainCmode.simPublic()
     drainDropAck := False
 
     // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
@@ -889,7 +896,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
     // forbidden: the read and the write halves of one table search must agree, or the
     // read can hit an array copy the write never updated.
-    _walkStore.payload.cacheMode  := drainCmode
+    _walkStore.payload.cacheMode  := (if (latchDrainCmode) drainCmode else _walkCmodePolicy)
     // NOT on the SQ's at-head precise path: this store belongs to no ROB entry's
     // precise fault reporting, and marking it precise would route a bus error into the
     // SQ's `sqFaultCompletion` against an unrelated robId.

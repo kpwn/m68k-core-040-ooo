@@ -715,7 +715,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainOffReg   = Reg(UInt(4 bits))
     val drainDropAck  = RegInit(False)
     /** The descriptor cache-mode policy in force when THIS drain armed. */
-    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH
+    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH; drainCmode.simPublic()
     drainDropAck := False
 
     // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
