@@ -3805,6 +3805,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // here would be an unrelated change smuggled into this one.
     val excStoreAckOut = dcache.storeAck && !walkStOutstanding
     excStoreAckOut.simPublic()
+    // 2026-09-18: the error pulse must be filtered by the SAME `walkStOutstanding`
+    // term as the ack it rides with, or a TABLE WALKER store's bus error would be
+    // attributed to the exception sequencer's frame push and double-fault the core for
+    // someone else's failure. Structurally paired with the line above on purpose.
+    val excStoreErrOut = dcache.storeErr && !walkStOutstanding
+    excStoreErrOut.simPublic()
     when(coreStFire && !coreStAck) { coreStOutstanding := coreStOutstanding + 1 }
     when(!coreStFire && coreStAck && (coreStOutstanding =/= 0)) {
       coreStOutstanding := coreStOutstanding - 1

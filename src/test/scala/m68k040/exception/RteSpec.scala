@@ -274,4 +274,156 @@ class RteSpec extends AnyFunSuite {
         "the aborted RTE must not have restored the frame's S=0")
     }
   }
+
+  // ── 2026-09-18 race audit: the M=1 THROWAWAY RTE's odd-PC guard ─────────────────
+  //
+  // `ExceptionUnit.scala`'s R_FMTWAIT built its odd-PC guard as
+  //     val pcOdd = fmtOk && !popIs1 && popPc(0)
+  // where `popIs1` is a Reg ASSIGNED FOUR LINES ABOVE. SpinalHDL register reads return
+  // Q, so the guard consumed the PREVIOUS pop's nibble. `popIs7`/`popIs2` are read a
+  // cycle later (in R_REDIR) and were always correct; `popIs1` was the only same-cycle
+  // read of the family, and the comment beside it ("NOT for the format-$1 throwaway
+  // pop") described an intent the code did not implement.
+  //
+  // The two tests below are the two directions of that defect. Both FAIL with the
+  // one-token fix reverted (`(nib =/= U(1, 4 bits))` -> `!popIs1`) and PASS with it.
+  //
+  // Neither direction had coverage: `exc_addr_error_odd_rte.s` exercises only the
+  // single-frame (non-$1) path, where `popIs1` happens to read False, and
+  // `M1ThrowawayFrameIrqSpec` only ever builds WELL-FORMED frames, so its RTEs never
+  // reach the odd-PC arm at all.
+
+  /** Drive one RTE µop through alloc+complete and return the redirect PC it produces. */
+  private def runRteAndCatchRedirect(dut: Dut, cd: ClockDomain, rtePc: Long, budget: Int): Long = {
+    pokeRu(dut.rsrc.logic.src.payload(0), pc = rtePc, isRte = true)
+    dut.rsrc.logic.src.valid #= true
+    dut.rsrc.logic.u1v #= false
+    cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+    dut.rsrc.logic.src.valid #= false
+    cd.waitSampling()
+    dut.rob.logic.completion(0).valid #= true
+    dut.rob.logic.completion(0).payload #= 0
+    cd.waitSampling()
+    dut.rob.logic.completion(0).valid #= false
+    var n = 0; var redirPc = -1L
+    while (redirPc < 0 && n < budget) {
+      if (dut.rob.logic.doFlushReg.toBoolean) redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
+      n += 1; cd.waitSampling()
+    }
+    redirPc
+  }
+
+  test("M=1 throwaway RTE: an ODD PC in the SECOND (real, format-$0) frame raises vector 3") {
+    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      dut.wire.logic.injLoadFault #= false
+      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
+
+      // Handler context: S=1, M=0 (srSys resets to 0x27) -> A7 is the ISP, which is where
+      // the format-$1 throwaway frame sits. The real format-$0 frame is on the MSP.
+      val ispBase  = 0x00100000L
+      val mspBase  = 0x00200000L
+      val rtePc    = 0x40000020L
+      val oddPc    = 0x40001235L        // the malformed resume PC -- ODD
+      val handler3 = 0x40003300L        // vector 3 handler, at VBR+12 with VBR = 0
+      dut.rob.logic.exc.ss.isp #= ispBase
+      dut.rob.logic.exc.ss.msp #= mspBase
+      dut.rob.logic.exc.ss.usp #= 0x0000BEEFL
+      dut.rob.logic.exc.ss.vbr #= 0L
+      def pokeBE16(a: Long, w: Int): Unit = { dmem.pokeByte(a, (w >> 8) & 0xff); dmem.pokeByte(a + 1, w & 0xff) }
+
+      // Frame 1 (ISP): format-$1 throwaway. Its SR carries M=1, so applying it re-banks
+      // A7 back to the MSP; its PC is architecturally DISCARDED, so keep it EVEN -- an
+      // odd one here would confound this test with the other direction (next test).
+      pokeBE16(ispBase + 0, 0x3700)                      // SR: S=1, M=1, I=7
+      pokeBE16(ispBase + 2, 0x4000); pokeBE16(ispBase + 4, 0x5678)
+      pokeBE16(ispBase + 6, 0x1008)                      // format nibble 1
+      // Frame 2 (MSP): the REAL format-$0 frame -- with an ODD PC.
+      pokeBE16(mspBase + 0, 0x3700)
+      pokeBE16(mspBase + 2, ((oddPc >> 16) & 0xffff).toInt)
+      pokeBE16(mspBase + 4, (oddPc & 0xffff).toInt)
+      pokeBE16(mspBase + 6, 0x0008)                      // format nibble 0
+      // Vector 3 (address error) @ VBR + 3*4 = 12.
+      pokeBE16(12, ((handler3 >> 16) & 0xffff).toInt)
+      pokeBE16(14, (handler3 & 0xffff).toInt)
+      cd.waitSampling(2)
+
+      val redirPc = runRteAndCatchRedirect(dut, cd, rtePc, 1500)
+      assert(redirPc != oddPc,
+        f"the RTE redirected straight to the ODD resume PC 0x$oddPc%x -- the odd-PC guard " +
+        "was disabled on the throwaway path's second pop (this is the defect)")
+      assert(redirPc == handler3,
+        f"an odd PC in the real format-0 frame must vector to 3's handler 0x$handler3%x, got 0x$redirPc%x")
+      cd.waitSampling(40)  // let the 6 frame words drain
+
+      // The malformed frame is left in place and a format-$2 frame is pushed BELOW it on
+      // the now-re-banked MSP (the throwaway pop restored M=1; the $0 frame was never
+      // popped, so MSP is still mspBase).
+      def peekBE16(a: Long): Int = ((dmem.peekByte(a) << 8) | dmem.peekByte(a + 1)) & 0xffff
+      def peekBE32(a: Long): Long = ((peekBE16(a).toLong << 16) | peekBE16(a + 2)) & 0xffffffffL
+      val base = mspBase - 12
+      assert((dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL) == base,
+        f"msp=0x${dut.rob.logic.exc.ss.msp.toLong}%x expected the format-2 base 0x$base%x")
+      assert(peekBE16(base + 6) == 0x200C,
+        f"format/vector word 0x${peekBE16(base + 6)}%04x expected 0x200C (format 2, vector 3)")
+      // Both the PC field and the instruction-address field carry the odd resume PC.
+      assert(peekBE32(base + 2) == oddPc,
+        f"stacked PC 0x${peekBE32(base + 2)}%x expected the odd resume PC 0x$oddPc%x")
+      assert(peekBE32(base + 8) == oddPc,
+        f"stacked instruction address 0x${peekBE32(base + 8)}%x expected the odd resume PC 0x$oddPc%x")
+      // The ISP did advance past the throwaway frame it legitimately consumed.
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == ispBase + 8,
+        f"isp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x${ispBase + 8}%x (throwaway reclaimed)")
+    }
+  }
+
+  test("M=1 throwaway RTE: an ODD PC in the format-$1 frame is DISCARDED, not a vector 3") {
+    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      dut.wire.logic.injLoadFault #= false
+      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
+
+      val ispBase  = 0x00100000L
+      val mspBase  = 0x00200000L
+      val rtePc    = 0x40000020L
+      val goodPc   = 0x40001234L        // the REAL resume PC -- even, well-formed
+      val handler3 = 0x40003300L
+      dut.rob.logic.exc.ss.isp #= ispBase
+      dut.rob.logic.exc.ss.msp #= mspBase
+      dut.rob.logic.exc.ss.usp #= 0x0000BEEFL
+      dut.rob.logic.exc.ss.vbr #= 0L
+      def pokeBE16(a: Long, w: Int): Unit = { dmem.pokeByte(a, (w >> 8) & 0xff); dmem.pokeByte(a + 1, w & 0xff) }
+
+      // Frame 1 (ISP): format-$1 throwaway whose PC field is ODD. Architecturally that
+      // field is thrown away (Musashi: m68ki_fake_pull_32), so its parity is irrelevant
+      // and it must NOT raise an address error.
+      pokeBE16(ispBase + 0, 0x3700)
+      pokeBE16(ispBase + 2, 0x4000); pokeBE16(ispBase + 4, 0x5679)   // ODD, discarded
+      pokeBE16(ispBase + 6, 0x1008)
+      // Frame 2 (MSP): a perfectly good format-$0 frame.
+      pokeBE16(mspBase + 0, 0x3700)
+      pokeBE16(mspBase + 2, ((goodPc >> 16) & 0xffff).toInt)
+      pokeBE16(mspBase + 4, (goodPc & 0xffff).toInt)
+      pokeBE16(mspBase + 6, 0x0008)
+      pokeBE16(12, ((handler3 >> 16) & 0xffff).toInt)
+      pokeBE16(14, (handler3 & 0xffff).toInt)
+      cd.waitSampling(2)
+
+      val redirPc = runRteAndCatchRedirect(dut, cd, rtePc, 1500)
+      assert(redirPc != handler3,
+        "the DISCARDED format-$1 PC field raised a spurious vector-3 address error")
+      assert(redirPc == goodPc,
+        f"the throwaway RTE must resume at the real frame's PC 0x$goodPc%x, got 0x$redirPc%x")
+      cd.waitSampling(10)
+      // Both banks unwound by exactly one frame each -- the whole point of the $1 path.
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == ispBase + 8,
+        f"isp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected 0x${ispBase + 8}%x")
+      assert((dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL) == mspBase + 8,
+        f"msp=0x${dut.rob.logic.exc.ss.msp.toLong}%x expected 0x${mspBase + 8}%x")
+    }
+  }
 }

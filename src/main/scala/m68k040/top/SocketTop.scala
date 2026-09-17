@@ -387,9 +387,14 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val bw = socket.core.plugins.collectFirst { case b: BackendWiringPlugin => b }.get
     bw.logic.iplInPort := cpu_ipl
     // D18: the socket declares NO vector input, so all seven levels take autovectors 25-31
-    // -- what the Mac hardware does and what v1 does. The existing RegNext(...) init 0
-    // synchroniser inside BackendWiringPlugin is retained untouched: it is the correct
-    // placement AND it keeps the IPL compare cone non-foldable, which the OOC flow relies on.
+    // -- what the Mac hardware does and what v1 does. `cpu_ipl` is ASYNCHRONOUS to the
+    // core clock; its crossing lives inside BackendWiringPlugin, which is the correct
+    // placement AND keeps the IPL compare cone non-foldable, which the OOC flow relies
+    // on. 2026-09-18: that crossing was a SINGLE `RegNext` -- this comment used to call
+    // it "the existing ... synchroniser", which it was not. It is now a two-flop
+    // ASYNC_REG synchroniser plus a 2-of-2 level-agreement filter; see the long note at
+    // `iplSync1` in FullCoreSynth.scala for why per-bit synchronising alone is not
+    // enough for a multi-bit LEVEL.
     bw.logic.iackAvecIn   := True
     bw.logic.iackVectorIn := U(0, 8 bits)
     ipl_ack := socket.iplAck.logic.iplAck

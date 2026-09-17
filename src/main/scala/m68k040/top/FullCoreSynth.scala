@@ -456,7 +456,53 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // is what a real priority encoder does when two devices request at once.
     val dbgIrqOpt = host.get[m68k040.services.DebugIrqInjectService]
     val dbgIplLvl = dbgIrqOpt.map(_.irqInjectLevel).getOrElse(U(0, 3 bits))
-    val iplMerged = Mux(dbgIplLvl > iplInPort, dbgIplLvl, iplInPort)
+    // ── CDC: `iplInPort` is a 3-bit ASYNCHRONOUS input (2026-09-18 race audit) ────
+    // It comes from `cpu_ipl` at the SocketTop pin, driven by the 50 MHz peripheral
+    // side, and until now crossed into the core domain behind a SINGLE flop -- which
+    // SocketTop's own comment called "the existing RegNext(...) init 0 synchroniser".
+    // One flop is not a synchroniser. TWO distinct defects lived here, and both are
+    // closed below because they need different fixes:
+    //
+    //   1. METASTABILITY. A single flop sampling an unrelated clock domain can settle
+    //      to either value OR propagate a metastable level into the recognition cone.
+    //      Fixed by the classic TWO-FLOP synchroniser (`iplSync1`/`iplSync2`), tagged
+    //      ASYNC_REG so the placer keeps the pair in one slice and the tools do not
+    //      retime or replicate them.
+    //
+    //   2. BIT INCOHERENCE. Two flops per bit fix metastability but NOT SKEW: the
+    //      three bits are independent, so a level walking 1 -> 7 can be sampled as any
+    //      intermediate code (3, 5, ...) for one cycle. That is a DIFFERENT bug and it
+    //      survives any amount of per-bit synchronising. It matters here because the
+    //      consumer is a LEVEL comparator feeding vector selection, and because a
+    //      transient 7 latches the STICKY `nmiPending` -- a one-cycle glitch becomes a
+    //      permanent non-maskable interrupt. Fixed by the 2-of-2 agreement filter
+    //      below: a level is accepted only once it has held for two consecutive core
+    //      cycles. This is also what the 68k family itself does (the CPU samples IPL
+    //      on successive edges and requires them to agree), so it is the architectural
+    //      behaviour, not a workaround.
+    //
+    // COST: 9 flops, all at the input boundary. The consumer still reads a bare
+    // register Q exactly as before (`iplStable` feeds the same `RegNext(iplMerged)`),
+    // so NO logic level is added to any downstream cone. Latency grows by 3 core
+    // cycles (15 ns at 200 MHz) on interrupt RECOGNITION only, which is far inside any
+    // interrupt-latency budget.
+    //
+    // NOTE FOR SYNTH (not done here -- this file owns no constraints): the
+    // `iplSync1` D pins want a `set_false_path`/`set_max_delay -datapath_only` from
+    // the `cpu_ipl` input in the XDC. Absent that, the tools time an unconstrained
+    // input-to-first-flop path; ASYNC_REG at least stops them merging the pair.
+    val iplSync1 = RegNext(iplInPort) init 0
+    val iplSync2 = RegNext(iplSync1)  init 0
+    iplSync1.addAttribute("ASYNC_REG", "TRUE")
+    iplSync2.addAttribute("ASYNC_REG", "TRUE")
+    val iplPrev   = RegNext(iplSync2) init 0
+    val iplStable = RegInit(U(0, 3 bits))
+    when(iplSync2 === iplPrev) { iplStable := iplSync2 }
+    spinal.core.sim.SimPublic(iplStable)
+    // The debug-injected level is already core-synchronous, so it is merged AFTER the
+    // filter: routing it through the settle logic would delay OFF_IRQ_INJECT for no
+    // reason and would make a deliberate one-cycle injection unrepresentable.
+    val iplMerged = Mux(dbgIplLvl > iplStable, dbgIplLvl, iplStable)
     intCtrlPlug.logic.iplIn      := RegNext(iplMerged) init 0
     // Clear the held debug request once the CPU actually TAKES an interrupt entry.
     dbgIrqOpt.foreach { d =>
@@ -500,6 +546,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // must be demultiplexed before the exception sequencer consumes it. See
     // `LsEuPlugin.logic.excStoreAckOut`.
     exc.dcStoreAck        := lsEu.logic.excStoreAckOut
+    exc.dcStoreErr        := lsEu.logic.excStoreErrOut
     // Task P4.5: the D-cache's async diagnostic-fault channel (a non-OKAY AXI
     // response on a trusted-cacheable-path transaction) latches a sticky,
     // non-interrupt-wakeable CORE HALT.

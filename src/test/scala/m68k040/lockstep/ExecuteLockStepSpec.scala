@@ -367,6 +367,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // must be demultiplexed before the exception sequencer consumes it. See
     // `LsEuPlugin.logic.excStoreAckOut`.
     exc.dcStoreAck        := lsEu.logic.excStoreAckOut
+    exc.dcStoreErr        := lsEu.logic.excStoreErrOut
       // route the exc's cache requests through the LS EU's arbiter
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid

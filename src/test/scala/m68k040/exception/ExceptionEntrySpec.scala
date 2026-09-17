@@ -78,6 +78,14 @@ class ExceptionEntrySpec extends AnyFunSuite {
       dc.store.payload := exc.dcStore.payload
       exc.dcStore.ready := dc.store.ready && storeAllow
       exc.dcStoreAck   := dc.storeAck
+      // 2026-09-18: inject a non-OKAY B response on the exception sequencer's FRAME-PUSH
+      // stores only. Mirrors `injLoadFault` above and, like it, does NOT perturb the
+      // D-cache itself -- a real AXI write error would also trip the cache's own
+      // diagnostic-fault channel and halt the core for a DIFFERENT reason, masking the
+      // behaviour under test. `dcStoreErr` is only consulted under `dcStoreAck`, so a
+      // level-high injection is equivalent to erroring every frame word.
+      val injStoreErr = in(Bool())
+      exc.dcStoreErr   := dc.storeErr || injStoreErr
     }
   }
 
@@ -134,6 +142,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val cd = dut.clockDomain
       dut.wire.logic.storeAllow #= false
       dut.wire.logic.injLoadFault #= false
+      dut.wire.logic.injStoreErr #= false
       // Attach the AXI responder before the first clock edge. Constructing it only
       // after init's three samples left R/B valid and payload inputs undriven during
       // reset release; a random B response could then become a cache storeAck with no
@@ -291,6 +300,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
         val cd = dut.clockDomain
         dut.wire.logic.storeAllow #= true
         dut.wire.logic.injLoadFault #= false
+        dut.wire.logic.injStoreErr #= false
         val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
         cd.forkStimulus(10)
         init(dut, cd)
@@ -356,6 +366,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       val cd = dut.clockDomain
       dut.wire.logic.storeAllow #= true
       dut.wire.logic.injLoadFault #= true      // every exc-sequencer load response faults
+      dut.wire.logic.injStoreErr #= false
       val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
       cd.forkStimulus(10)
       init(dut, cd)
@@ -401,6 +412,81 @@ class ExceptionEntrySpec extends AnyFunSuite {
         f"OFF_DBL_FAULT_PC capture 0x${dut.rob.logic.exc.dblFaultPc.toLong}%x expected 0x$faultPc%x")
       assert(dut.rob.logic.exc.dblFaultVec.toInt == 4,
         s"OFF_DBL_FAULT_VEC capture ${dut.rob.logic.exc.dblFaultVec.toInt} expected 4")
+    }
+  }
+
+  // ── 2026-09-18 race audit: a bus error on the FRAME PUSH was silently swallowed ──
+  //
+  // `DcacheService.storeErr` (a one-cycle pulse alongside `storeAck` on a non-OKAY AXI
+  // B response) has existed since task P1.4, but the exception sequencer had no input
+  // for it: `E_STWAIT` consulted `dcStoreAck` ALONE, and DcachePlugin raises `storeAck`
+  // on a bus-errored write exactly as on a good one. So a frame-push that bus-errored
+  // advanced to the next frame word, then to the vector fetch, and the handler ran on a
+  // PARTIALLY WRITTEN frame -- no vector, no halt, no diagnostic at all. The vector
+  // FETCH side has had `E_DBLFAULT` since 2026-09-09; the frame PUSH side had nothing.
+  //
+  // This is the exact negative control for that: `injLoadFault` is LOW here, so the
+  // vector table read would succeed -- the ONLY thing wrong is the frame store. That is
+  // what separates this test from the vector-fetch double-fault test above; without the
+  // fix this test reaches the handler cleanly.
+  test("a bus error on the FRAME PUSH is a DOUBLE FAULT: halt, no redirect, no vector") {
+    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      dut.wire.logic.storeAllow #= true
+      dut.wire.logic.injLoadFault #= false     // the vector read is HEALTHY
+      dut.wire.logic.injStoreErr #= true       // ...the frame push is not
+      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      cd.forkStimulus(10)
+      init(dut, cd)
+
+      val ssp0    = 0x00100000L
+      val handler = 0x40009000L
+      dut.rob.logic.exc.ss.isp #= ssp0
+      dut.rob.logic.exc.ss.vbr #= 0L
+      dut.rob.logic.haltExceptionMaskIn #= 0
+      // A perfectly good vector-4 entry. The core must NOT reach it: the frame it would
+      // be returning through was never successfully written.
+      for (i <- 0 until 4) dmem.pokeByte(4 * 4 + i, ((handler >> (8 * (3 - i))) & 0xff).toInt)
+      cd.waitSampling(2)
+
+      val faultPc = 0x40000010L
+      pokeRu(dut.rsrc.logic.src.payload(0), pc = faultPc, faulted = true, faultVector = 4)
+      dut.rsrc.logic.src.valid #= true
+      dut.rsrc.logic.u1v #= false
+      cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+      dut.rsrc.logic.src.valid #= false
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= true
+      dut.rob.logic.completion(0).payload #= 0
+      cd.waitSampling()
+      dut.rob.logic.completion(0).valid #= false
+
+      var n = 0; var redirPc = -1L; var sawDbl = false
+      while (n < 600 && !sawDbl) {
+        if (dut.rob.logic.doFlushReg.toBoolean && redirPc < 0)
+          redirPc = dut.rob.logic.flushPcReg.toLong & 0xffffffffL
+        if (dut.rob.logic.exc.dblFault.toBoolean) sawDbl = true
+        n += 1; cd.waitSampling()
+      }
+      assert(sawDbl,
+        "a bus error while STACKING the exception frame must raise dblFault -- without " +
+        "it the sequencer walks on to the vector fetch and the handler runs on a " +
+        "partially written frame")
+      cd.waitSampling(20)
+      assert(redirPc < 0 && !dut.rob.logic.doFlushReg.toBoolean,
+        f"a double fault must NOT redirect (saw pc=0x$redirPc%x -- that is the handler " +
+        "being entered over a half-written frame)")
+      assert(dut.rob.logic.coreHalted.toBoolean, "a frame-push double fault must halt the core")
+      assert(dut.rob.logic.haltReason.toInt == m68k040.socket.HaltReason.DOUBLE_FAULT,
+        s"halt reason ${dut.rob.logic.haltReason.toInt} expected DOUBLE_FAULT")
+      assert((dut.rob.logic.exc.dblFaultPc.toLong & 0xffffffffL) == faultPc,
+        f"OFF_DBL_FAULT_PC capture 0x${dut.rob.logic.exc.dblFaultPc.toLong}%x expected 0x$faultPc%x")
+      assert(dut.rob.logic.exc.dblFaultVec.toInt == 4,
+        s"OFF_DBL_FAULT_VEC capture ${dut.rob.logic.exc.dblFaultVec.toInt} expected 4")
+      // E_REDIR is where the new SSP is committed, and it is never reached -- so the
+      // stack pointer must still be exactly where it was.
+      assert((dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) == ssp0,
+        f"isp=0x${dut.rob.logic.exc.ss.isp.toLong}%x expected the untouched 0x$ssp0%x")
     }
   }
 }
