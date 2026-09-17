@@ -509,6 +509,41 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //   * The read half and the write half use the SAME expression from the SAME
     //     signal. A per-half mode would let a read hit an array copy the write never
     //     updated.
+    //
+    // ── RESIDUAL, FOUND BY THE RACE AUDIT (2026-09-18): SAME NET, DIFFERENT CYCLE ──
+    // "The SAME expression from the SAME signal" is SPATIAL agreement. It is not
+    // TEMPORAL agreement, and the invariant above needs the temporal kind. This is a
+    // LIVE read of `CACR.DE`, sampled independently by the load leg (:3703) and the
+    // store leg (:3733), and a table search spans both: the three descriptor reads,
+    // then the deferred U/M drain's re-read, then that drain's merged store -- hundreds
+    // of cycles, with a MOVEC to CACR free to retire anywhere inside it.
+    //
+    // `quiesceHold` makes the split MORE likely, not less: a CACR write is a sysOp, its
+    // `S_DRAIN`/`S_APPLY` refuse the walker a fresh STORE grant, so a drain whose
+    // re-read already completed under the old CACR.DE is deliberately parked until the
+    // write has landed -- and then stamped with the NEW mode.
+    //
+    // DE 1->0 is the damaging direction and it is exactly the case the bullet above
+    // claims is safe: the re-read ran WRITETHROUGH and ALLOCATED the descriptor line
+    // (`DcachePlugin` :2166 `doAllocate = !respErr && missCmode =/= INHIBITED`), then the
+    // store runs INHIBITED and "never touches the cache array" (:1424) -- so memory gets
+    // the U/M update and the resident copy keeps the pre-update byte. Re-enable DE
+    // without a CINV and that copy answers the next descriptor read: the M bit is lost
+    // and a dirty page is later evicted as clean, which is the precise silent-data-loss
+    // the whole deferred-U/M path exists to prevent.
+    //
+    // NOT FIXED HERE, deliberately. The fix is to LATCH the mode once per table search
+    // and use the latched value for every leg of it -- but this arbiter owns the stamp by
+    // design ("the descriptor fetch's own cache mode is a fixed architectural policy this
+    // component cannot see", TableWalker.scala), so latching it means moving ownership
+    // into the TLB plugins and changing a port contract. The obvious cheap alternative --
+    // drop the drain when the mode changed under it, the way `drainDropAck` already drops
+    // a faulting re-read -- is WRONG here: the ATC entry was filled with
+    // `WalkRsp.modified = 1`, so nothing ever re-walks to repair the dropped M (this is
+    // C1 verbatim, see DtlbPlugin's `walkUmPoison` block). Software is architecturally
+    // required to CINV around a cache-enable change, so this is a "software omitted the
+    // maintenance" residual of the same class as the PFLUSH ones -- recorded at the site
+    // rather than silently left as the incorrect claim above.
     val walkCacheMode = Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
                             m68k040.cache.CacheMode.WRITETHROUGH,
                             m68k040.cache.CacheMode.INHIBITED)

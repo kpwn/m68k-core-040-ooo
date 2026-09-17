@@ -329,8 +329,45 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // 8K page differing only in VA[12] would spuriously miss the just-filled latch.
     val latchMatch = latchValid && (latchVpn === walkKey(_req.vpn)) &&
                      (latchFcSup === _req.supervisor)
+    // ── FIFTH INSTANCE OF THE SAME FAMILY (2026-09-18): THE CAPTURE CYCLE ITSELF ──
+    // `!atcFlush` is the I-side equivalent of the D side's `_req.ready := ... &&
+    // !atcFlush`, and its absence was the one asymmetry left between the two plugins.
+    //
+    // THE HOLE. Everything that poisons an I-side walk keys off `missPending`, and
+    // `missPending` is a REGISTER written by the capture arm below. On the cycle the
+    // capture happens, `flushPoisonArm = atcFlush && missPending` reads the OLD (False)
+    // `missPending`, so it does not arm -- while the capture arm itself writes
+    // `walkFlushPoison := False`. A walk captured in the SAME cycle as an MMU control
+    // write is therefore the one walk in this plugin that carries NO poison at all.
+    //
+    // WHY THAT IS A MISTRANSLATION AND NOT JUST A WASTED WALK. `missReqReg.is8K := is8K`
+    // and `walkKey(_req.vpn)` both read the LIVE TCR.P, which on the write cycle is
+    // still the PRE-write value, whereas the array key every later lookup forms
+    // (`tlbKey`) is derived from the POST-write one. The walk then slices the tables
+    // under the old page size and the fill files the result under the old key form --
+    // which is exactly the TCR.P re-keying that `pageSizeRekey`/`atcFlush` exists to
+    // prevent, reopened through a one-cycle window. A 4 KB-keyed entry for VPN v is a
+    // clean ONE-HOT match for the 8 KB lookup of VPN 2v: wrong PPN, no fault, and
+    // invisible to both `Tlb.dbgHitCount` and the multi-hot fail-safe.
+    //
+    // IT IS NOT MASKED BY THE REDIRECT. The sysOp sequencer writes the MMU control
+    // registers in `S_APPLY` and only pulses `redirectValid` in `S_REDIR`, the cycle
+    // AFTER -- so `doFlush` is low on the write cycle -- and the front end does not stop
+    // for `excActive` anyway: `FetchAlignPlugin.ic.cmd.valid` has no `excActive` term
+    // (that file's own comment: "the frontend free-runs for the WHOLE maintenance
+    // walk"). The window is genuinely open. Measured by `ItlbCaptureRaceSpec`.
+    //
+    // GATE THE CAPTURE, DO NOT POISON THE WALK. Suppressing the capture costs one
+    // cycle on a fetch that is already stalled (`_rsp.ready` is False in the miss arm)
+    // and the very next cycle re-derives every term from the POST-write configuration,
+    // which is the answer the fetch should have had. Poisoning instead would still run
+    // a useless three-level walk. `atcFlush` is a one-cycle pulse on every one of its
+    // terms, so this can never stall the front end for more than that cycle.
+    //
+    // COST: one input to an AND that already has six, in parallel with the deep
+    // `tlbHit` cone that sets this expression's delay. No new level on the hit path.
     val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
-                     !walker.io.busy && !walker.io.done
+                     !walker.io.busy && !walker.io.done && !atcFlush
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the _req/tlbHit → walker cone).
@@ -576,6 +613,40 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     umq.io.alloc.payload.preCommitted := True
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
+
+    // ── AN INCIDENTAL MASK, NAMED AND CHECKED (race audit, 2026-09-18) ───────────
+    // `when(umFlush && missPending)` above reads `missPending` as a REGISTER, and the
+    // capture arm writes it. So a walk captured in the SAME cycle as `umFlush` gets
+    // `walkUmPoison := False` from the capture and no poison from that arm -- the exact
+    // shape of the `atcFlush` hole closed at `needWalk`. Unlike `atcFlush`, `umFlush`
+    // is NOT gated out of the capture, and it is reachable: `FetchAlignPlugin`'s
+    // `ic.cmd.valid` carries no flush term, so a wrong-path fetch can miss on the very
+    // cycle `doFlush` pulses.
+    //
+    // That window is harmless TODAY for a reason that lives one line below and nowhere
+    // else: the I-side entry is BORN COMMITTED, so it is immune to the flush it raced
+    // (`UmWriteQueue.flush` keeps every committed entry) and it is an architecturally
+    // legitimate write regardless -- the page genuinely was fetched. The TLB fill it
+    // also permits is likewise allowed after a backend squash by this plugin's own rule.
+    //
+    // That is an INCIDENTAL mask, which is precisely how the missing `walkFlushPoison`
+    // survived. It is not gated out in hardware because `needWalk` is a timing-relevant
+    // conjunction and this costs nothing today -- but the dependency is made explicit
+    // and machine-checked here instead of left implicit. Give the I side a real owning
+    // robId (i.e. stop driving `preCommitted` to a constant) and C6 reopens through that
+    // one-cycle window; this assertion goes live the moment that happens, and the fix is
+    // to add `&& !umFlush` alongside the `&& !atcFlush` already on `needWalk`.
+    GenerationFlags.simulation {
+      assert(!umq.io.alloc.valid || umq.io.alloc.payload.preCommitted,
+        "ItlbPlugin: an I-side U write was allocated WITHOUT preCommitted. A miss captured " +
+        "in the same cycle as `umFlush` carries NO walkUmPoison (the poison arm reads " +
+        "`missPending` before the capture arm writes it, and `needWalk` has no flush term), " +
+        "so such an entry belongs to an already-squashed fetch and would sit uncommitted " +
+        "until the ROB recycles its robId -- C6 verbatim. Born-committed is the ONLY thing " +
+        "making that window safe. Gate `needWalk` on `!umFlush` before removing it.",
+        FAILURE)
+    }
+
     umq.io.commit.valid   := umCommitValid
     umq.io.commit.payload := umCommitId
     umq.io.commitB.valid   := umCommitBValid
