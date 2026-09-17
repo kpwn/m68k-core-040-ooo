@@ -466,6 +466,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     intCtrlPlug.logic.iackAvec   := RegNext(iackAvecIn) init False
     intCtrlPlug.logic.iackVector := RegNext(iackVectorIn) init 0
     dtlb.umAccessRobId := lsEu.xlateRobId
+    // ...and: is this translation the COMMIT-TIME EXCEPTION SEQUENCER's? Its accesses
+    // share this DTLB port while `excActive` is held, and they own no robId -- the
+    // `xlateRobId` above is the squashed LS pipe's. Such a walk's U/M descriptor write
+    // is born committed instead of waiting for an identity it borrowed.
+    dtlb.umAccessPreCommitted := rob.logic.excActive
     dtlb.umCommitValid := rob.logic.retire0
     dtlb.umCommitBValid := rob.logic.retire1
     dtlb.umCommitBId    := rob.logic.h1

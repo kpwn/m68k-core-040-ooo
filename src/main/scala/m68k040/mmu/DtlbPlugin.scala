@@ -58,6 +58,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // U/M queue hooks (sibling-driven; default-idle in logic via allowOverride so a
     // standalone DUT that doesn't wire them still elaborates).
     umAccessRobId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+    umAccessPreCommitted = Bool()
     umCommitValid = Bool()
     umCommitId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid = Bool()
@@ -77,6 +78,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   //  - umCommit      : ROB retired this robId (mark the queued U/M write committable)
   //  - umFlush       : mispredict squash (discard speculative U/M writes)
   var umAccessRobId: UInt = null
+  /** "The access being translated belongs to a COMMIT-TIME EXCEPTION EPISODE, which is
+    * non-speculative by construction; its descriptor write has no owning robId and must
+    * not wait for one."
+    *
+    * The ExceptionUnit's own frame/vector/RTE accesses are translated through this same
+    * DTLB port while `excActive` is held. A write-walk for one of them queues a U/M
+    * descriptor write tagged with `lsEu.xlateRobId` -- whatever robId the SQUASHED LS
+    * pipe last held, which has no relationship to the exception. The entry then commits
+    * at an arbitrary time or, more often, is discarded by the next flush, so the M bit
+    * frequently never reaches memory. `ExceptionUnit.scala` has carried a comment naming
+    * exactly this fix since 2026-09-09; this is it.
+    *
+    * DEFAULTS FALSE, so every standalone DTLB DUT (UmWriteSpec,
+    * WalkerDescriptorCoherencySpec) is bit-for-bit unchanged and needs no new wiring. */
+  var umAccessPreCommitted: Bool = null
   var umCommitValid: Bool = null
   var umCommitId:    UInt = null
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
@@ -117,6 +133,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
     // the LS-cluster wiring OVERRIDES them.
     umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
+    umAccessPreCommitted.allowOverride; umAccessPreCommitted := False
     umCommitValid.allowOverride; umCommitValid := False
     umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid.allowOverride; umCommitBValid := False
@@ -303,6 +320,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val is8K  = Reg(Bool())
       val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
       val robId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+      val preCommitted = Reg(Bool())
     }
     // Task #210 (MC68040 UM S3.3): "If the page is not write protected and the
     // modified bit of the ATC entry is clear, a table search proceeds to set the
@@ -372,6 +390,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         missReqReg.is8K  := is8K
         missReqReg.token := _req.payload.token
         missReqReg.robId := umAccessRobId
+        missReqReg.preCommitted := umAccessPreCommitted
         missPending      := True
         walkFlushPoison  := False
         walkUmPoison     := False
@@ -415,12 +434,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkSup  = Reg(Bool())
     val walkToken = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
     val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))   // robId of the access that triggered the walk
+    /** ...and whether that access was an exception episode's, which owns no robId. */
+    val walkPreCommitted = RegInit(False)
     when(walker.io.start) {
       walkVpn   := missReqReg.vpn
       walkIs8K  := missReqReg.is8K
       walkSup   := missReqReg.sup
       walkToken := missReqReg.token
       walkRobId := missReqReg.robId
+      walkPreCommitted := missReqReg.preCommitted
     }
 
     // On walk completion: latch the result and (if no fault) fill the TLB.
@@ -546,10 +568,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
-    // The D side has a REAL owner: `umAccessRobId` is `lsEu.xlateRobId`, the robId of
-    // the access that triggered the walk. (The one D-side producer that does NOT is
-    // the ExceptionUnit's own write-walk; that site is converted separately.)
-    umq.io.alloc.payload.preCommitted := False
+    // The D side normally has a REAL owner: `umAccessRobId` is `lsEu.xlateRobId`, the
+    // robId of the access that triggered the walk. The ONE exception -- literally -- is
+    // a walk for an access made by the commit-time exception sequencer, which owns no
+    // robId; see `umAccessPreCommitted`.
+    umq.io.alloc.payload.preCommitted := walkPreCommitted
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid
