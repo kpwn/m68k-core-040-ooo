@@ -198,7 +198,35 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // the whole boot.
     val mmuEnableChange = ctrl.setEnable.valid && (ctrl.setEnable.payload =/= ctrl.mmuEnable)
     mmuEnableChange.simPublic()
-    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange
+    // ── "WE SHOULD NOT DEPEND ON PFLUSHA" (owner directive, 2026-09-17) ──────────
+    // A ROOT WRITE INVALIDATES THE ATC. `rootChanged` (above) only stops a walk that
+    // is ALREADY IN FLIGHT from installing a result from the old tree; it does nothing
+    // about entries that are ALREADY RESIDENT. On real 68040 those survive a MOVEC to
+    // SRP/URP and software is required to PFLUSH. Under the owner's rule the hardware
+    // must not mistranslate when software omits that flush, so the array is emptied on
+    // the write instead.
+    //
+    // THIS IS REACHABLE IN CONFORMING SOFTWARE TOO, which is the stronger argument.
+    // 7.0.1's MMU restore at image offset 0x27a4bc does:
+    //     movec %d0,%tc ; movec %d0,%urp ; movec %d0,%srp ; <four TTR writes> ; pflusha
+    // The roots change at 0x27a4c4/c8 and the PFLUSHA is eight instructions later at
+    // 0x27a4ee. Every fetch and every data access in that window is translated with the
+    // NEW roots installed and the OLD entries still resident -- a window the program
+    // cannot close, because the architecture's contract is "flush AFTER". Flushing at
+    // the write closes it.
+    //
+    // ON `valid` RATHER THAN A VALUE COMPARE: deliberately. Two extra OR inputs on a
+    // net that already exists, versus two 32-bit comparators; and a root rewritten to
+    // its own current value is so rare that spending area to avoid a harmless flush
+    // would be the wrong trade. Over-invalidation costs re-walks, never correctness.
+    //
+    // CAN THIS BREAK CONFORMING SOFTWARE? No. A conforming program writes the root and
+    // then PFLUSHes; it now gets two flushes instead of one, which is indistinguishable
+    // except in timing. A program could only notice the difference by DEPENDING on
+    // stale entries surviving a root write, and the architecture explicitly does not
+    // permit that dependence -- there is no conforming program this can break.
+    val rootWrite     = ctrl.setSrp.valid || ctrl.setUrp.valid
+    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange || rootWrite
     // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
     // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
     // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root
@@ -222,6 +250,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // COST: one flop and an OR, off the lookup path. Self-healing exactly like
     // `walkFlushPoison`: suppressing the fill costs one re-walk under the NEW root,
     // which is the answer the access should have had.
+    // NOTE (2026-09-17): now largely SUBSUMED by `rootWrite` feeding `atcFlush`
+    // below, which also poisons an in-flight walk via `flushPoisonArm`. Kept --
+    // one flop -- because it names the property directly and holds even if the
+    // flush term is ever narrowed; it is a second line, not dead code.
     val rootChanged = RegInit(False)
     rootChanged.simPublic()
     when(walker.io.start) { rootChanged := False }
