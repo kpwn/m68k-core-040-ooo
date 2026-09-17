@@ -4031,6 +4031,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       assert(!(quiesceHold && (ldGrantOk || stGrantOk)),
         "LsEuPlugin: a table walker was granted a D-cache port during the exception " +
         "sequencer's maintenance quiesce window", FAILURE)
+
+      // ── REACHABILITY, because the assertion above cannot tell you it is idle ──────
+      // The race audit classified this pair UNKNOWN rather than HANDLED, and the reason
+      // is worth keeping at the site: nothing establishes that the guarded condition is
+      // ever ENTERED. An assertion that is never evaluated under the circumstance it
+      // guards is indistinguishable from one that holds, so `quiesceHold` could have
+      // been dead for a release and every run would still be green.
+      //
+      // This counts the cycles a walker actually WANTED a port while the hold was
+      // active -- the precondition the assertion exists to make safe. A directed run
+      // (MMU on with real table walks, plus a CPUSH/CINV so the sequencer reaches
+      // `S_DRAIN`/`S_APPLY`/`S_MAINTWAIT`) can then assert this is NON-ZERO, which is
+      // what turns the UNKNOWN into a HANDLED.
+      //
+      // `walkLdReq`/`walkStReq` are existing nets already tapped into
+      // `dbgStallGrantPack(20..23)`, so this adds no new signal; the counter is
+      // simulation-only and pruned from every netlist.
+      val quiesceBlockedWalker = Reg(UInt(16 bits)) init 0
+      when(quiesceHold && (walkLdReq.orR || walkStReq.orR) &&
+           quiesceBlockedWalker =/= U(0xffff, 16 bits)) {
+        quiesceBlockedWalker := quiesceBlockedWalker + 1
+      }
+      quiesceBlockedWalker.simPublic()
     }
 
     // W23: `excLoadCmdReady` was UNCONDITIONAL. `ExceptionUnit` computes
