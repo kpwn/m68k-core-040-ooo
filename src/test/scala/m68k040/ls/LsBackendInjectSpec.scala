@@ -84,6 +84,19 @@ class LsBackendInjectSpec extends AnyFunSuite {
     }
   }
 
+  /** Idle FPCC write port -- see `fpccInit` in the DUT below. */
+  class FpccInitWritePlugin extends FiberPlugin {
+    var w: m68k040.execute.regfile.RegFileWritePort = null
+    during setup {
+      w = host[m68k040.execute.regfile.FpccRegFileService].newWrite(latency = 1)
+    }
+    val logic = during build new Area {
+      w.valid := False
+      w.address := 0
+      w.data := 0
+    }
+  }
+
   class Dut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
@@ -100,13 +113,27 @@ class LsBackendInjectSpec extends AnyFunSuite {
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
     val rfX    = new RegFilePluginX
+    // `BranchEuPlugin` takes an FPCC read port (BranchEuPlugin.scala:149,
+    // `host[FpccRegFileService].newRead(...)` -- FBcc needs the FP condition codes).
+    // This DUT instantiates that EU but never listed a provider, so it could not
+    // elaborate at all: `Can't find the service ...FpccRegFileService`, raised from
+    // PluginHost during setup. Every other DUT that hosts a BranchEuPlugin already
+    // carries this plugin; this one was simply not updated when the dependency landed.
+    val rfFpcc = new m68k040.execute.regfile.RegFilePluginFpcc
+    // ...and `RegFilePlugin` requires every regfile to have at least ONE WRITE PORT,
+    // which it uses to drive the reset-time init sweep ("RegFile fpcc: at least one
+    // write port required (for init)"). In the full core that port comes from
+    // `DivEuPlugin`; this DUT has no FP/DIV EU and does not need one -- nothing here
+    // ever writes FPCC -- so it supplies an idle port rather than dragging in an
+    // unrelated EU and its wiring.
+    val fpccInit = new FpccInitWritePlugin
     val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu)
     val ftie   = new IqFlushTiePlugin
     val csink  = new RenameCommitSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       rsrc, rob, disp, iq, eu0, eu1, branchEu, xlateD, dcache, lsEu,
-      rfInt, rfNzvc, rfX, wire, ftie, csink)) }
+      rfInt, rfNzvc, rfX, rfFpcc, fpccInit, wire, ftie, csink)) }
   }
 
   def pokeUop(
