@@ -93,11 +93,14 @@ class ItlbCaptureRaceSpec extends AnyFunSuite {
     }
   }
 
-  class Dut extends Component {
+  /** @param gate `ItlbPlugin.captureGateOnFlush`. `false` elaborates the PRE-FIX
+    *   `needWalk` (no `&& !atcFlush`), which is how the negative control stays in the
+    *   suite instead of being a `sed` someone ran once. */
+  class Dut(gate: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val ctrl = new MmuControlPlugin()
-    val itlb = new ItlbPlugin()
+    val itlb = new ItlbPlugin(captureGateOnFlush = gate)
     val probe = new ProbePlugin()
     val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, itlb, probe, walkPort)) }
@@ -129,8 +132,9 @@ class ItlbCaptureRaceSpec extends AnyFunSuite {
     *                                   tables, same aliasing VPN pair, no collision).
     *   The false arm is what proves the true arm is not simply a broken test: if the
     *   assertion fired for both, the aliasing construction itself would be wrong. */
-  private def body(alignTcWithCapture: Boolean): Unit = {
-    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+  private def body(alignTcWithCapture: Boolean, gate: Boolean = true,
+                   expectMistranslation: Boolean = false): Unit = {
+    SimConfig.withVerilator.compile(new Dut(gate)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       val mem = new DcacheClientMemAgent(dut.walkPort, cd)
@@ -229,21 +233,51 @@ class ItlbCaptureRaceSpec extends AnyFunSuite {
 
       assert(ready, "the post-TCR.P-change fetch must resolve")
       assert(!fault, "no fault is reported either way")
-      if (reWalkReads == 0) {
+
+      if (expectMistranslation) {
+        // NEGATIVE CONTROL. Without the gate this MUST mistranslate -- and it must do so
+        // in the specific, silent way that makes the defect dangerous: a ONE-HOT ATC hit
+        // with no re-walk and no fault. Asserting all three rather than just "ppn is
+        // wrong" is what stops this arm from passing for some unrelated reason (a fault,
+        // a genuine re-walk that happened to return the other PPN) and quietly ceasing to
+        // be a control.
+        assert(reWalkReads == 0,
+          s"[control] the stale entry must be served with NO re-walk; saw $reWalkReads reads")
         assert(hitCount == 1,
-          s"the stale answer is a ONE-HOT hit (popcount=$hitCount) -- invisible to the " +
-          s"multi-hot fail-safe, which is what makes this silent")
+          s"[control] the stale answer must be a ONE-HOT hit -- that is why neither " +
+          s"`Tlb.dbgHitCount` nor the multi-hot fail-safe can see it; popcount=$hitCount")
+        assert(ppn == ppnLo,
+          f"[control] with `captureGateOnFlush = false` the pre-write 4 KB-keyed entry MUST " +
+          f"answer vpn 0x$vpnHi%05x with 0x$ppnLo%05x; got 0x$ppn%05x. If this fails the " +
+          f"aliasing construction no longer reaches the defect and the positive case below " +
+          f"proves nothing.")
+      } else {
+        if (reWalkReads == 0) {
+          assert(hitCount == 1,
+            s"the stale answer is a ONE-HOT hit (popcount=$hitCount) -- invisible to the " +
+            s"multi-hot fail-safe, which is what makes this silent")
+        }
+        assert(ppn == ppnHi,
+          f"MISTRANSLATION: vpn 0x$vpnHi%05x served ppn 0x$ppn%05x -- the PPN of vpn 0x$vpnLo%05x, " +
+          f"filed under the PRE-write 4 KB key form by a walk captured in the same cycle as the " +
+          f"MOVEC-to-TC. Correct is 0x$ppnHi%05x. Re-walk reads after the change = $reWalkReads.")
       }
-      assert(ppn == ppnHi,
-        f"MISTRANSLATION: vpn 0x$vpnHi%05x served ppn 0x$ppn%05x -- the PPN of vpn 0x$vpnLo%05x, " +
-        f"filed under the PRE-write 4 KB key form by a walk captured in the same cycle as the " +
-        f"MOVEC-to-TC. Correct is 0x$ppnHi%05x. Re-walk reads after the change = $reWalkReads.")
     }
   }
 
   test("ITLB: a TC.P write in the miss-CAPTURE cycle must not leave an unpoisoned pre-write walk",
        VerilatorTest) {
     body(alignTcWithCapture = true)
+  }
+
+  // NEGATIVE CONTROL -- the same stimulus against the PRE-FIX `needWalk`. It pins that
+  // the fix is what closes the hole, and it stays in the suite: a future change that
+  // makes the gate ineffective for some reason OTHER than deleting the term (a reordered
+  // assignment, a narrowed `atcFlush`) fails this arm too, which a one-off textual revert
+  // could never have caught.
+  test("ITLB control: WITHOUT the capture gate the same sequence mistranslates, one-hot and silently",
+       VerilatorTest) {
+    body(alignTcWithCapture = true, gate = false, expectMistranslation = true)
   }
 
   // Negative control for the test itself: identical tables, identical aliasing VPN

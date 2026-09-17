@@ -30,10 +30,30 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - Instruction fetch is a READ: the walk sets only the descriptor U bit (never M).
   *    Since the I-cache always drives `req.write=False`, the walker's deferred write
   *    is U-only; it drains at commit via the same U-only queue path (reused from the
-  *    DTLB). No write-protect fault on fetch (a fetch is never a write). */
+  *    DTLB). No write-protect fault on fetch (a fetch is never a write).
+  *
+  * @param captureGateOnFlush THE NEGATIVE CONTROL FOR THE MISS-CAPTURE RACE, and the
+  *   only reason this parameter exists. It defaults to `true` and NOTHING in
+  *   `src/main` ever passes `false`, so it is a Scala compile-time constant that
+  *   folds away entirely -- there is no mux, no flop and no netlist difference.
+  *
+  *   Setting it `false` restores the pre-2026-09-18 `needWalk`, i.e. deletes the
+  *   `&& !atcFlush` term whose absence let an MMU control write land in the same
+  *   cycle as a miss capture and leave a walk carrying no poison and the PRE-write
+  *   TCR.P. `ItlbCaptureRaceSpec` elaborates the DUT BOTH ways and asserts the
+  *   defect is present with `false` and absent with `true`.
+  *
+  *   WHY A PARAMETER RATHER THAN EDITING THE FILE FOR ONE RUN: a negative control
+  *   that lives in a shell command is run once and then gone, and the guarantee it
+  *   established quietly stops being checked. This one is part of the suite, so a
+  *   future change that makes the gate ineffective for some OTHER reason -- not by
+  *   deleting the term -- fails the `false` arm too, which a textual revert could
+  *   never catch.
+  */
 class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin
+                 banks: Int = Tlb.DefaultBanks,
+                 captureGateOnFlush: Boolean = true) extends FiberPlugin
     with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
@@ -367,7 +387,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // COST: one input to an AND that already has six, in parallel with the deep
     // `tlbHit` cone that sets this expression's delay. No new level on the hit path.
     val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
-                     !walker.io.busy && !walker.io.done && !atcFlush
+                     !walker.io.busy && !walker.io.done &&
+                     (if (captureGateOnFlush) !atcFlush else True)
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the _req/tlbHit → walker cone).
