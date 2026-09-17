@@ -2251,6 +2251,28 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(retire0 && phtValidStore(h0)) {
       gshareUpdateValidComb := True
     }
+    // ── Pin the invariant the whole gshare repair scheme rests on (2026-09-18) ─────
+    // `GsharePlugin` rebuilds the speculative GHR from `ghrArch` on every commit flush,
+    // and that is only bit-exact because `gshareUpdate.valid` pulses EXACTLY ONCE per
+    // retiring branch that carried a fetch-time `phtValid`. There is one update port and
+    // it is driven from slot 0 only, so a `phtValid` entry retiring in SLOT 1 would
+    // SILENTLY DROP a history bit and every later repair would install a history shifted
+    // by one -- the exact failure mode the repair exists to prevent, and one that shows
+    // up only as degraded prediction, never as a wrong result.
+    //
+    // It cannot happen today: `phtValidStore` is written ONLY by `branchCompletion`, a
+    // branch µop has `isBranch` hence `retireAlone` (see the alloc write), and `retire1`
+    // requires `!p0.retireAlone && !p1.retireAlone`. But that chain was backed only by a
+    // comment ("branches are retireAlone → always slot 0"), and it spans three files. A
+    // future µop that reaches the branch EU without `isBranch`, or a relaxation of
+    // `retire1`, reopens it with no other symptom. Sim-only, zero netlist cost.
+    GenerationFlags.simulation {
+      assert(!(retire1 && phtValidStore(h1)),
+        "RobPlugin: a phtValid branch retired in slot 1 -- its gshare history bit was " +
+        "dropped (the single update port is slot-0 only), so ghrArch has silently " +
+        "diverged from the speculative GHR and every commit-flush repair now installs " +
+        "a history shifted by one bit", FAILURE)
+    }
 
     // ── Precise-fault exception-pending (combinational at faulted retire) ───────
     // When the head is a faulted µop ready to retire, signal an exception with its
@@ -2680,7 +2702,29 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // A halted core (Task P4.5) recognizes no interrupt -- deliberately NOT
     // wakeable, matching the design doc's decision (unlike `stopped`, which IS
     // interrupt-wakeable).
-    interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive && !coreHalted
+    // 2026-09-18 race audit: `!coreHalted` alone is the FATAL-halt signal
+    // (D-cache diag fault / arbiter wedge / walker wedge / reset-vector halt). It does
+    // NOT cover a DEBUG halt, so the comment above ("A halted core recognizes no
+    // interrupt") described an intent the gate did not implement. The `normalIrqGate`
+    // leg was safe by accident -- it carries `count > 0`, which the RECOVER flush makes
+    // false -- but the `|| stopped` leg bypasses that entirely, and a STOP'd core
+    // reaches HALTED via exactly `debugIdleBoundaryHit` (`count === 0 && excIdle`). So
+    // debug-halting a STOP'd core and then raising IPL ran a FULL exception entry --
+    // stacking a frame, moving A7/SR, redirecting, and clearing `stopped` -- while
+    // STATUS still read HALTED. The `retire0/retire1` assert below cannot catch it: an
+    // exception entry is not a retirement.
+    //
+    // `debugQuiesceActive` (not the narrower `debugHalted`) is the right gate, and is
+    // the SAME signal the Tier-1 `earlyArm` already uses for the same "core is not
+    // making architectural forward progress" purpose. It excludes RUNNING and
+    // STEP_RUNNING, so a single-STEPPED instruction can still take an interrupt (real
+    // single-step semantics), and it additionally covers STOP_PENDING and RECOVER,
+    // where an entry would corrupt the pending halt just as badly. It cannot hang a
+    // STOP'd core: `debugIdleBoundaryHit` fires immediately for `count === 0`, so
+    // STOP_PENDING resolves to HALTED without needing an interrupt, and the operator's
+    // resume is what releases it.
+    interruptPending := (normalIrqGate || stopped) && !flushing && excIdle && iplActive &&
+                        !coreHalted && !debugQuiesceActive
     // Priority-rule invariant (design doc §4.1/§5 item 8): interruptPending can only
     // go true when normalIrqGate held (which now requires !preciseDrainBusyIn AND
     // !inhibitedLoadBusyIn), so a LAUNCHED precise store drain -- or an outstanding
@@ -2991,10 +3035,33 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
+    // ── ONE expression for the debug restart PC (2026-09-18 race audit) ──────────
+    // This arm used to REBUILD the mux above with only three of its arms, and the two
+    // drifted. `debugRestartPc` feeds `debugLivePcReg` (what OFF_PC REPORTS);
+    // `flushPcReg` is what the frontend actually RESUMES AT. They must be the same
+    // value, and they were not:
+    //   - `debugIdleBoundaryHit` (`count === 0`): `debugRestartPc` selects
+    //     `debugLivePcReg`; this arm fell through to `p0.predNextPc`, and `p0` is
+    //     `payload.readAsync(head)` on an EMPTY ROB -- an uninitialised-Mem read, as
+    //     this file's own `h0IsMacroLast` comment states. The debugger reported the
+    //     right PC and the core resumed at GARBAGE. This is the boundary a manual stop
+    //     between fetch bursts takes, and the one a STOP'd core takes.
+    //   - `debugAutomaticBoundaryHit` (`haltAfterDue`): `retire0` is held, so h0 is the
+    //     target macro's UNTOUCHED SUCCESSOR; `p0.predNextPc` is therefore one macro
+    //     PAST the resume point. halt-after resumed having SKIPPED an instruction.
+    // The two extra arms are provably inert on every ordinary boundary --
+    // `debugAutoHaltLatchedReg` is set only by `haltAfterDue` while RUNNING (see its
+    // `when` above) and cleared on accepted resume -- so for breakpoint / single-step /
+    // manual-stop this is bit-identical to the old expression.
+    //
+    // Assigning the SHARED signal (rather than re-deriving a matching one) is the
+    // point: the first two arms of `debugRestartPc` are `exc.redirectValid` and
+    // `branchRedirect`, which this `when`'s own guard already excludes, so under the
+    // guard the two expressions are the same function -- and they can no longer drift
+    // apart under a future edit, because there is only one of them. No logic added:
+    // `debugRestartPc` is already elaborated and already drives `debugLivePcReg`.
     when(debugRecoverEnter && !branchRedirect && !exc.redirectValid) {
-      flushPcReg := Mux(debugBreakpointBoundaryHit, p0.pc,
-        Mux(debugHaltState === DebugHaltState.STEP_RUNNING,
-          debugStepRestartPc, p0.predNextPc))
+      flushPcReg := debugRestartPc
     }
     when(debugRecoverEnter) { debugLivePcReg := debugRestartPc }
 
