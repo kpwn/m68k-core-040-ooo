@@ -316,9 +316,14 @@ class ItlbSpec extends AnyFunSuite {
         if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
         if (dut.probe.logic.walkStart.toBoolean) walkStarts += 1 } }
 
-      // Fetch (robId 40): wait until the walk is genuinely active, then squash
+      // Two distinct ids for the two fetches below. Were the literals 40/41, which ran
+      // off the end of a 32-deep ROB and aborted this test at stimulus time -- so C6 has
+      // been carried as a known behavioural red while none of its behaviour ever ran.
+      val c6Ids = m68k040.TestRobIds.highBlock(2)
+
+      // Fetch (first id): wait until the walk is genuinely active, then squash
       // before completion -- the exact collision C6 describes.
-      dut.probe.logic.accessRobId #= 40
+      dut.probe.logic.accessRobId #= c6Ids(0)
       dut.probe.logic.reqIn.valid #= true
       dut.probe.logic.reqIn.vpn   #= vpnOf(va)
       dut.probe.logic.reqIn.write #= false
@@ -341,7 +346,7 @@ class ItlbSpec extends AnyFunSuite {
       // Part 1: recycling/committing the SAME robId later (as if an unrelated
       // later instruction reused it) must NOT drain a spurious descriptor write.
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 40
+      dut.probe.logic.commitId #= c6Ids(0)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       cd.waitSampling(30)
@@ -353,7 +358,7 @@ class ItlbSpec extends AnyFunSuite {
       // must perform a real re-walk -- neither the TLB nor the 1-entry result
       // latch may still be serving the poisoned walk's cached result.
       val beforeSecond = arCount
-      dut.probe.logic.accessRobId #= 41
+      dut.probe.logic.accessRobId #= c6Ids(1)
       val (r2, p2, f2) = lookup(dut, cd, vpnOf(va))
       assert(r2 && !f2 && p2 == 0x33333L, "second fetch to the same page must still resolve correctly")
       assert(arCount > beforeSecond,
@@ -363,7 +368,7 @@ class ItlbSpec extends AnyFunSuite {
       cd.waitSampling(2)
 
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 41
+      dut.probe.logic.commitId #= c6Ids(1)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       guard = 0

@@ -370,7 +370,8 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       // any of them ever waiting behind the (irrelevant, held-true) preempt gates --
       // directly counters the "one-at-a-time chokepoint on the ordinary hot path"
       // failure mode the interlock could have introduced if mis-scoped.
-      val robs = 31 to 34
+      // Four consecutive ids; `31 to 34` ran off the end of a 32-deep ROB.
+      val robs = m68k040.TestRobIds.highBlock(4)
       val disps = Seq(4, 8, 12, 16)
       robs.zip(disps).foreach { case (rid, disp) =>
         issueLoad(dut, cd, basePreg = 10, disp = disp, pdst = 24, robId = rid)
