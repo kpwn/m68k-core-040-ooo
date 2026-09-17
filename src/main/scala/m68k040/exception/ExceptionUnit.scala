@@ -139,6 +139,17 @@ class ExceptionUnit(
   val dcLoadBusy = Bool()
   val dcStore    = Stream(DStoreCmd()); dcStore.simPublic()
   val dcStoreAck = Bool()
+  // ── 2026-09-18 race audit: the frame-push STORE's error status ────────────────
+  // `DcacheService` has exported `storeErr` (a 1-cycle pulse alongside `storeAck` on a
+  // non-OKAY AXI B response) since task P1.4, but the exception sequencer never had an
+  // input for it: `E_STWAIT`/`F_STWAIT` consulted `dcStoreAck` ALONE, and DcachePlugin
+  // raises `storeAck` on a bus-errored write exactly as on a good one. So a frame-push
+  // that bus-errored advanced to the next frame word, then to the vector fetch, and the
+  // handler ran on a PARTIALLY WRITTEN frame -- no vector, no halt, no diagnostic. The
+  // vector-FETCH side has had `E_DBLFAULT` all along; the frame-PUSH side had nothing.
+  // Defaults False (`allowOverride`, like `maintDoneIn` above) so a DUT that wires only
+  // `dcStoreAck` keeps exactly today's behaviour and still elaborates.
+  val dcStoreErr = Bool()
   // consumer-side inputs default (wiring drives them; allowOverride so a DUT that
   // does NOT wire the exception D-cache ports still elaborates — the wiring layer
   // OVERRIDES these when present).
@@ -148,6 +159,7 @@ class ExceptionUnit(
   dcLoadBusy.allowOverride;        dcLoadBusy := False
   dcStore.ready.allowOverride;     dcStore.ready := False
   dcStoreAck.allowOverride;        dcStoreAck := False
+  dcStoreErr.allowOverride;        dcStoreErr := False
 
   // ── Task P5.5: cache-maintenance (CPUSH / CINV) dispatch ports ───────────────
   // `maintCmdOut` is a 1-cycle Flow pulse issued from S_APPLY's CPUSH/CINV arms and
@@ -1735,7 +1747,22 @@ class ExceptionUnit(
       // The registered command remains asserted here until dcStore.fire. Wait for
       // the accepted write to reach storeAck before advancing to the next frame word
       // or vector fetch. Stream ready now represents cache occupancy directly.
-      when(dcStoreAck) {
+      when(dcStoreAck && dcStoreErr) {
+        // DOUBLE FAULT. A bus error while STACKING the exception frame is the same
+        // class of event as a bus error on the handler VECTOR read below, and the
+        // 68040 treats it the same way: the processor cannot report a fault taken
+        // while reporting a fault, so it halts. Checked FIRST, before the advance
+        // arm, so a failed word never advances `stStep`, never flips `stFrame2`, and
+        // never reaches `E_VECREQ` -- which is exactly what used to happen, leaving
+        // the handler to run on a partially written frame with a valid-looking SP.
+        // Reuses `E_DBLFAULT` and the `dblFault`/`dblFaultPc`/`dblFaultVec` debug
+        // triple unchanged, so the host sees HaltReason.DOUBLE_FAULT with the PC and
+        // vector that identify the episode, exactly as for a vector-read fault.
+        dblFault    := True
+        dblFaultPc  := curPc
+        dblFaultVec := curVec
+        goto(E_DBLFAULT)
+      } elsewhen(dcStoreAck) {
         val addr    = frameWordAddr(stStep)
         val crosses = addr(3 downto 0) === U(15, 4 bits)
         when(crosses && !stSplitLow) {
@@ -2848,7 +2875,27 @@ class ExceptionUnit(
       }
     }
     F_STWAIT.whenIsActive {
-      when(dcStoreAck) {
+      // FSAVE is an ORDINARY instruction, not exception processing, so a bus error on
+      // one of its frame words is NOT a double fault -- it is an ordinary ACCESS FAULT,
+      // vector 2, exactly as `F_XWAIT` takes for a frame-word TRANSLATION fault.
+      //
+      // Deliberately NOT `F_HALT`, even though that state exists and the analogy is
+      // tempting: `F_XWAIT` used to do precisely that and it was CHANGED on 2026-09-09
+      // because halting is never the correct 68040 response to an ordinary instruction
+      // faulting (see that state's own comment -- it made an FPU context switch onto a
+      // not-yet-resident supervisor stack unrecoverable). The same reasoning applies
+      // verbatim here, so this takes the same `busErrorEntry` exit, and inherits the
+      // same honest limitation recorded there: retry-from-scratch, not resume-mid-
+      // transfer, which is sound because FSAVE's An write-back happens at `S_REDIR`
+      // and this never reaches it.
+      //
+      // `atc = false`: this is a real BUS error on the write itself, not a translation
+      // failure, so the SSW carries 0x0145 rather than the ATC-fault 0x0545.
+      // Checked first, for the same reason as `E_STWAIT` above: a failed word must not
+      // advance `fsStep` and must not reach `S_REDIR`.
+      when(dcStoreAck && dcStoreErr) {
+        busErrorEntry(fsCurVa, atc = false, pc = sysCapPc)
+      } elsewhen(dcStoreAck) {
         when(fsCrosses && !fsSplitLow) {
           // Just pushed the HIGH byte of a split word; push the LOW byte next (same
           // fsStep, same frame word -- do not advance).

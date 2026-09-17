@@ -266,6 +266,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // must be demultiplexed before the exception sequencer consumes it. See
       // `LsEuPlugin.logic.excStoreAckOut`.
       exc.dcStoreAck        := lsEu.logic.excStoreAckOut
+    exc.dcStoreErr        := lsEu.logic.excStoreErrOut
       lsEu.excActive            := excActive
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
       lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr

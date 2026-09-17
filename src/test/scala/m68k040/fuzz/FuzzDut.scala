@@ -265,6 +265,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // must be demultiplexed before the exception sequencer consumes it. See
     // `LsEuPlugin.logic.excStoreAckOut`.
     exc.dcStoreAck        := lsEu.logic.excStoreAckOut
+    exc.dcStoreErr        := lsEu.logic.excStoreErrOut
     lsEu.excActive            := excActive
     lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
