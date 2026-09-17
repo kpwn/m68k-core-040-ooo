@@ -4,6 +4,7 @@ import m68k040.isa.Size
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
+import m68k040.hw.OneHotSafe
 import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
 import spinal.lib.fsm._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -155,7 +156,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Reg/Vec(Reg) array, a Mem is NOT peekable via getBigInt/setBigInt in sim
     // without this explicit per-instance simPublic() loop -- omitting it throws
     // UNACCESSIBLE SIGNAL at sim time, not a silent no-op.
-    for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
+    // `tagMem` joins them (2026-09-17): the multi-hot duplicate-purge tests plant a
+    // duplicate through the BACKDOOR, because the reachable producers of one were
+    // closed and a repair mechanism has to be tested against the state it repairs.
+    for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic(); tagMem(w).simPublic() }
     val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
     // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
     // merely at FPGA configuration); one set is invalidated per cycle after reset
@@ -211,6 +215,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val validsVoteW0 = Vec.fill(ways)(False)   // W0: runtime-reset invalidate
     val validsVoteW2 = Vec.fill(ways)(False)   // W2: maint CHECK-invalidate
     val validsVoteW3 = Vec.fill(ways)(False)   // W3: maint WRB-invalidate
+    val validsVoteW4 = Vec.fill(ways)(False)   // W4: multi-hot duplicate purge
     val dirtysVoteD1 = Vec.fill(ways)(False)   // D1: REFILL-allocate
     val dirtysVoteD0 = Vec.fill(ways)(False)   // D0: runtime-reset clear
     val dirtysVoteD2 = Vec.fill(ways)(False)   // D2: REPLAY-merge write-allocate
@@ -582,8 +587,23 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS1HitVec = Vec(Bool(), ways)
     for (w <- 0 until ways)
       ldS1HitVec(w) := ldS1Cacheable && rdValid(w) && (rdTag(w) === ldS1Tag)
-    val ldS1Hit     = ldS1HitVec.orR
+    // ── MULTI-HOT FAIL-SAFE (2026-09-17) ──────────────────────────────────────
+    // `OHToUInt` OR-s the set bit positions, so a 2-hot vector over ways {0,1}
+    // selects way 3 -- a way that did not match at all -- and `ldS1Line` then
+    // delivers an UNRELATED cache line as load data, with no fault and nothing
+    // raised. A multi-hot match is now a MISS, which routes to the ordinary
+    // miss/REFILL path this pipeline already handles on every cold access.
+    //
+    // `ldS1HitWay`/`ldS1Line` are deliberately left alone: `ldS2Line` is registered
+    // unconditionally but consumed only under `ldS2Hit`, so the wrong-way line is
+    // still computed and never used. Leaving the mux alone is what keeps the cost at
+    // zero -- at ways = 4, `orR` and "exactly one" are both four-variable Boolean
+    // functions, i.e. the same single LUT6 with the same fanin and fanout. See
+    // `OneHotSafe`.
+    val ldS1MultiHot = OneHotSafe.multiHot(ldS1HitVec)
+    val ldS1Hit     = OneHotSafe.exactlyOne(ldS1HitVec)
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
+    ldS1MultiHot.simPublic()
     // DEBUG (task #189 investigation, temporary): sim-only visibility.
     ldS1Valid.simPublic(); ldS1Set.simPublic(); ldS1Tag.simPublic(); ldS1Off.simPublic()
     ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
@@ -700,7 +720,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
     probeLineValid := probeReadValid
     when(probeReadValid) {
       probeLineSlot := probeReadSlot
-      probeLineHit  := probeReadHitVec.asBits.orR
+      // MULTI-HOT FAIL-SAFE (2026-09-17): `MuxOH` below returns the bitwise OR of
+      // two lines on a 2-hot select, so a multi-hot probe is recorded as a MISS and
+      // the request falls back to the ordinary S1 read path -- exactly what an
+      // all-zero vector already does here. The `MuxOH` itself is untouched:
+      // `probeLineLine` is consumed only under `earlyProbeHits(...)`, which this bit
+      // drives (see the note just below), so the OR-ed line is computed and never
+      // read. Free at ways = 4; see `OneHotSafe`.
+      probeLineHit  := OneHotSafe.exactlyOne(probeReadHitVec)
       // FMax: one-hot way mux instead of `rdData(OHToUInt(probeReadHitVec))`. The binary
       // round trip costs a level -- Vivado builds it as an `OHToUInt` reduction, then a
       // shared select decode broadcast to all 128 bits, then the per-bit mux -- and this
@@ -1330,8 +1357,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // AXI beat at all); WRITETHROUGH (hit or miss) and INHIBITED are unchanged.
     val stS2Inhibited = stS2Payload.cacheMode === CacheMode.INHIBITED
     val stS2Copyback  = stS2Payload.cacheMode === CacheMode.COPYBACK
-    val stS2HitAny    = stS2HitVec.orR
+    // ── MULTI-HOT FAIL-SAFE (2026-09-17) ──────────────────────────────────────
+    // The WORST of the four cache sites: `stS2HitWay = OHToUInt(stS2HitVec)` selects
+    // the write target, so a 2-hot vector does not merely return wrong data, it
+    // WRITES the store into a way that never matched -- persistent corruption of an
+    // unrelated line, not a transient read error. A multi-hot lookup is now a store
+    // MISS, which takes the write-allocate / write-through miss path; unlike the load
+    // and fetch sides that path always COMPLETES on the bus, so it cannot livelock
+    // even before the purge below.
+    val stS2MultiHot  = OneHotSafe.multiHot(stS2HitVec)
+    val stS2HitAny    = OneHotSafe.exactlyOne(stS2HitVec)
     val stS2HitWay    = OHToUInt(stS2HitVec)
+    stS2MultiHot.simPublic()
     val stS2MergeData = Mux(stS2Payload.useStrb,
       stS2Payload.lineData,
       DcacheByteLane.storeData(stS2Off, stS2Payload.size, stS2Payload.data))
@@ -2729,6 +2766,123 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
     maintWalkingDbg := maint.walking
 
+    // ══ DUPLICATE PURGE (multi-hot fail-safe, 2026-09-17) ═════════════════════════
+    // Forcing a miss is NOT sufficient on its own for the LOAD side. On a persistent
+    // duplicate (two ways of one set genuinely valid carrying the same tag) the forced
+    // miss refills, the refill picks a round-robin victim, and if that victim is not
+    // one of the duplicates the set now holds THREE matching ways. Every access to
+    // that line then misses forever and the load never completes -- the naive
+    // fail-safe would convert silent corruption into a wedged LS pipe. This is what
+    // makes it terminate.
+    //
+    // ── THE RULE: PURGE ONLY MATCHING **CLEAN** WAYS. NEVER DISCARD DIRTY. ───────
+    // This is the one place where the obvious rule ("clear every match") is WRONG,
+    // and the reason is the very scenario this whole mechanism is for. A hit bit is
+    // `cacheable && rdValid(w) && (rdTag(w) === tag)`; if the multi-hot came from a
+    // TRANSIENT -- a metastable tag-array output making a way that does not really
+    // match compare equal -- then clearing "every match" would drop the valid bit of
+    // an unrelated line chosen by the glitch. If that line were DIRTY, a transient
+    // read-side glitch would have caused permanent, silent WRITE-side data loss:
+    // strictly worse than the corruption being prevented. Restricting the purge to
+    // clean ways makes it impossible for this mechanism to lose committed state, in
+    // either the transient or the real-duplicate world -- a purged clean line is just
+    // re-filled from memory.
+    //
+    // TERMINATION under that rule. A duplicate becomes dirty only through a 1-hot
+    // store hit or a write-allocate install, and the store side's own fail-safe above
+    // turns a multi-hot store into a miss, so a duplicate pair can contain AT MOST ONE
+    // dirty way in any reachable sequence. With <= 1 dirty match the purge leaves
+    // exactly one matching way (the dirty one) or zero (all clean), and the next
+    // lookup is one-hot either way: one purge, always. Two dirty matches would mean
+    // two DIVERGENT committed copies of one line -- already unrecoverable, with no
+    // correct way to pick -- and there the forced miss persists rather than silently
+    // choosing. That is a loud stall instead of quiet corruption, and it is asserted
+    // below so simulation names it rather than leaving it a mystery.
+    //
+    // ── SOURCES ARE MUTUALLY EXCLUSIVE ──────────────────────────────────────────
+    // All three detectors read the SAME `rdValid`/`rdTag` nets off the ONE shared
+    // synchronous read port, so at most one of them can correspond to this cycle's
+    // array read; the priority chain below is a static mux, not an arbiter. Each
+    // source contributes its own registered set, because that is the set whose read
+    // produced the vector.
+    //
+    // ── INTEGRATION ─────────────────────────────────────────────────────────────
+    //  * `!maintBusyReg`: a CPUSH/CINV maintenance walk owns the arrays exclusively
+    //    while it runs (the walk's own sim assert enforces exactly that), so the
+    //    purge must not write underneath it. This costs nothing -- `maintBusyReg`
+    //    already holds `loadCmdPort.ready` and store ready low, so no lookup can be
+    //    resolving anyway.
+    //  * `!resetSweepBusy`: same argument for the runtime-reset sweep (writer W0).
+    //  * `validsVoteW4`: registered in the Task #255 per-way exclusivity vote next to
+    //    W0..W3, so a real collision trips that tripwire instead of being absorbed by
+    //    the last-assignment-wins mux.
+    //  * PLACED AFTER every other `validsWrEn` writer so the purge WINS a same-cycle
+    //    collision. That direction is deliberate: a cleared line is merely re-filled,
+    //    whereas letting an allocate win could re-validate a way the purge was
+    //    retiring and leave the duplicate standing. There is no ping-pong -- the
+    //    purge fires only while multi-hot, and one purge removes it.
+    //
+    // Off the critical path: a write-enable driven by a condition that is False in
+    // every cycle of normal operation. It adds nothing to the `ldS1Hit` cone.
+    val probeMultiHot = OneHotSafe.multiHot(probeReadHitVec)
+    val dupPurgeArmed = !maintBusyReg && !resetSweepBusy
+    val dupPurgeFire  = Bool(); dupPurgeFire := False
+    val dupPurgeSet   = UInt(setBits bits); dupPurgeSet := ldS1Set
+    val dupPurgeVec   = Vec(Bool(), ways)
+    dupPurgeVec.foreach(_ := False)
+    when(dupPurgeArmed) {
+      when(probeReadValid && probeMultiHot) {
+        dupPurgeFire := True; dupPurgeSet := probeReadSet
+        for (w <- 0 until ways) dupPurgeVec(w) := probeReadHitVec(w)
+      }
+      when(stS2Valid && stS2MultiHot) {
+        dupPurgeFire := True; dupPurgeSet := stS2Set
+        for (w <- 0 until ways) dupPurgeVec(w) := stS2HitVec(w)
+      }
+      when(ldS1Valid && ldS1MultiHot) {
+        dupPurgeFire := True; dupPurgeSet := ldS1Set
+        for (w <- 0 until ways) dupPurgeVec(w) := ldS1HitVec(w)
+      }
+    }
+    dupPurgeFire.simPublic(); dupPurgeSet.simPublic(); dupPurgeVec.simPublic()
+
+    // ── STICKY EVIDENCE, readable over JTAG (DebugRegMap.OFF_MULTIHOT_*) ────────
+    // Three INDEPENDENT sites, kept separate on purpose: a load-side multi-hot
+    // returns wrong data, whereas a store-side one WRITES into a way that never
+    // matched, and telling those apart on a returned board is most of the diagnosis.
+    // Latched on DETECTION, not on `dupPurgeFire`, so an occurrence during a
+    // maintenance walk (when the purge is deliberately held off) is still recorded.
+    val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
+    val dbgMultiHotLoad = OneHotSafe.evidence(
+      ldS1Valid && ldS1MultiHot, ldS1Paddr, dbgMultiHotClear)
+    val dbgMultiHotProbe = OneHotSafe.evidence(
+      probeReadValid && probeMultiHot,
+      (probeReadTag ## probeReadSet ## U(0, offBits bits)).asUInt, dbgMultiHotClear)
+    val dbgMultiHotStore = OneHotSafe.evidence(
+      stS2Valid && stS2MultiHot, stS2Payload.paddr, dbgMultiHotClear)
+    for (e <- Seq(dbgMultiHotLoad, dbgMultiHotProbe, dbgMultiHotStore)) {
+      e.sticky.simPublic(); e.count.simPublic(); e.addr.simPublic()
+    }
+    when(dupPurgeFire) {
+      for (w <- 0 until ways) when(dupPurgeVec(w) && !rdDirty(w)) {
+        validsWrEn(w)   := True
+        validsWrSet(w)  := dupPurgeSet
+        validsWrData(w) := False
+        validsVoteW4(w) := True    // Task #255 exclusivity tripwire (W4)
+      }
+    }
+    GenerationFlags.simulation {
+      // The one shape the purge cannot repair: two DIVERGENT dirty copies of one
+      // line. Loud here rather than an unexplained stall on the bench.
+      val dupDirtyCount = CountOne((0 until ways).map(w => dupPurgeVec(w) && rdDirty(w)))
+      assert(!(dupPurgeFire && dupDirtyCount > U(1)),
+        "DcachePlugin: multi-hot tag match with TWO OR MORE DIRTY matching ways -- two " +
+        "divergent committed copies of one line. The duplicate purge cannot repair " +
+        "this (discarding either would lose a committed store), so the fail-safe miss " +
+        "will persist on this address.",
+        FAILURE)
+    }
+
     // Review-added: prove (rather than assume) the mutual-exclusion invariants the
     // walk's array-port and AXI safety rest on. Sim-only; no synthesis cost.
     GenerationFlags.simulation {
@@ -2757,7 +2911,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // comment for why).
     GenerationFlags.simulation {
       for (w <- 0 until ways) {
-        assert(CountOne(Seq(validsVoteW0(w), validsVoteW1(w), validsVoteW2(w), validsVoteW3(w))) <= U(1),
+        assert(CountOne(Seq(validsVoteW0(w), validsVoteW1(w), validsVoteW2(w), validsVoteW3(w),
+                            validsVoteW4(w))) <= U(1),
           "DcachePlugin: multiple writers targeted validsMem(w) the same cycle -- the task-#240 write-mux exclusivity proof was violated",
           FAILURE)
         assert(CountOne(Seq(dirtysVoteD0(w), dirtysVoteD1(w), dirtysVoteD2(w), dirtysVoteD3(w), dirtysVoteD4(w), dirtysVoteD5(w))) <= U(1),
@@ -3700,7 +3855,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // COPYBACK hits may now ack on consecutive cycles. Variable-latency classes are
     // hardware barriers, so a WT B or store-allocate ack cannot overlap a hit ack.
     GenerationFlags.simulation {
-      assert(CountOne(stS2HitVec) <= U(1),
+      // QUALIFIED with `stS2Valid` (2026-09-17). `stS2Tag` is a slice of the
+      // `stS2Payload` REGISTER, which retains the last store's address indefinitely
+      // after that store has drained, and `rdValid`/`rdTag` belong to whatever the
+      // shared read port fetched most recently -- so with no store in the pipe this
+      // compared a stale tag against an unrelated set and could fire on a state no
+      // store ever observed. That is a false positive by construction, and it is not a
+      // weakening to remove it: `stS2HitVec`/`stS2HitAny` are READ only inside
+      // `when(stS2Valid)` (the S2->S3 advance below), so the qualifier is exact.
+      // Surfaced by `DcacheMultiHotFailSafeSpec`'s dirty-carve-out test, which plants a
+      // duplicate in the set a since-drained store last touched.
+      assert(!stS2Valid || CountOne(stS2HitVec) <= U(1),
         "DcachePlugin: multiple ways matched one store lookup",
         FAILURE)
       val ackSources = Seq(storeBAck, cbHitAckReg, storeAllocAckReg)

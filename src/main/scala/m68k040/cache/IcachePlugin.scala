@@ -5,6 +5,7 @@ import m68k040.frontend.PredecodeWord
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
+import m68k040.hw.OneHotSafe
 import spinal.lib.bus.amba4.axi.{Axi4Config, Axi4ReadOnly, Axi4}
 import spinal.lib.fsm._
 import spinal.lib.misc.plugin.FiberPlugin
@@ -878,7 +879,27 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // adds NO new term to them.
     val s1HitVec = Vec((0 until ways).map(w =>
       s0Cacheable && validsQ(w) && (tagQ(w) === s0Ppn)))
-    val s1Hit    = s1HitVec.orR
+    // ── MULTI-HOT FAIL-SAFE (2026-09-17) ──────────────────────────────────────
+    // `s1HitVec` feeds the one-hot AND-OR way mux (`s1WayOh`/`ohOr` below), so a
+    // 2-hot vector does not fail loudly -- it silently ORs two ways' instruction
+    // bytes into ONE FetchRsp, and FetchRsp carries no tag, so the corruption is
+    // invisible until it executes as the wrong opcode. This exact failure mode is
+    // what the assert further down was added to watch; the assert makes it loud in
+    // SIMULATION, and this makes it safe in HARDWARE.
+    //
+    // A multi-hot match is now a MISS, which routes to the ordinary refill path.
+    // `s1WayOh`/`ohOr` are deliberately NOT touched: their output is only delivered
+    // as a response under the hit verdict, so the OR-ed line is still computed and
+    // never consumed -- and leaving the mux alone is what keeps this free. At
+    // ways = 4 both `orR` and "exactly one" are four-variable Boolean functions, so
+    // this is one LUT6 either way: same fanin, same fanout, same logic level. That
+    // matters because `s1Hit` -> `s1Unresolved` -> `cmdPort.ready` is the accept
+    // cone this whole M3b pipeline exists to shorten (see the verdict comment
+    // above). See `OneHotSafe` for the full cost argument and for what this does
+    // NOT cover.
+    val s1MultiHot = OneHotSafe.multiHot(s1HitVec)
+    val s1Hit      = OneHotSafe.exactlyOne(s1HitVec)
+    s1MultiHot.simPublic()
     // Held high while an ACCEPTED command's miss has not yet been dispatched to a fill.
     // This is the signal that gates `cmdPort.ready`, dispatches the demand MSHR write,
     // freezes the prefetch frontier and steers the AR arbiter.
@@ -971,9 +992,27 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // logic (same style as the `missPC` immutability, `mshrValid(DEMAND_IDX)` and
     // two-beat refill asserts elsewhere in this file, and as DcachePlugin's own
     // `CountOne(stS2HitVec) <= 1` store-hit assertion).
-    assert(!(s0Valid && !s0Replay && !s0Fault) || CountOne(s1HitVec.asBits) <= U(1),
-      "M3b: s1HitVec must be one-hot-or-zero on every non-replay non-fault response -- " +
-      "a 2-hot vector silently ORs two cache ways into response data/predecode")
+    // KEPT at full severity (2026-09-17). The hardware fail-safe above turns a 2-hot
+    // vector into a MISS, which would otherwise let this condition pass SILENTLY -- the
+    // machine would quietly take an extra refill and nobody would learn that the
+    // allocator invariant had been violated. The point of the fail-safe is to survive
+    // the condition, not to hide it, so the tripwire stays.
+    //
+    // `dbgAllowMultiHot` is a sim-only acknowledgement for the ONE class of test that
+    // creates this state ON PURPOSE: `IcacheMultiHotFailSafeSpec` plants a duplicate
+    // through the array backdoor precisely to prove the fail-safe and its purge work.
+    // Without it that test cannot exist, because the assert kills the simulation before
+    // the behaviour under test can be observed. It defaults False and has no other
+    // driver, so every other simulation in the repo sees this assert exactly as it was.
+    val dbgAllowMultiHot = GenerationFlags.simulation {
+      val b = RegInit(False); b.simPublic(); b
+    }
+    GenerationFlags.simulation {
+      assert(!(s0Valid && !s0Replay && !s0Fault) || CountOne(s1HitVec.asBits) <= U(1) ||
+             dbgAllowMultiHot,
+        "M3b: s1HitVec must be one-hot-or-zero on every non-replay non-fault response -- " +
+        "a 2-hot vector silently ORs two cache ways into response data/predecode")
+    }
 
     // Slice I3 telemetry, moved from S0 to S1 with the verdict. `pfHitUseful` is a pure
     // wire (declared with the other FSM control nets below) that a testbench counts;
@@ -2740,6 +2779,56 @@ class IcachePlugin extends FiberPlugin with FetchService {
       commitBeat := commitBeat + 1
       when(!isLoBeat) {
         commitBeat := U(0, 1 bits)   // reset for the NEXT fill's predecode dwell
+      }
+    }
+
+    // ---- DUPLICATE PURGE (multi-hot fail-safe, 2026-09-17) -------------------
+    // Forcing a miss is NOT sufficient on its own. On a PERSISTENT duplicate (two
+    // ways of one set genuinely valid carrying the same PPN -- the allocator
+    // invariant violation the `s1HitVec` assert names) the forced miss refills, the
+    // refill picks a victim by round-robin, and if that victim is not one of the
+    // duplicates the set now has THREE matching ways. Every fetch of that line then
+    // misses forever and the frontend never delivers the instruction: a livelock,
+    // i.e. the naive fail-safe converts silent corruption into a hang.
+    //
+    // So: clear the valid bit of every matching way. I-cache lines are READ-ONLY --
+    // there is no dirty state and the bytes are always re-fetchable from memory --
+    // so purging all matches can never lose data, and it provably converges: after
+    // the purge the set holds zero matches, the refill installs exactly one, and the
+    // next lookup is one-hot. One purge, always.
+    //
+    // PLACED HERE, AFTER the refill's `valids(w)(installSet) := True` above, so that
+    // under SpinalHDL's last-assignment-wins the PURGE wins a same-cycle collision.
+    // That direction is deliberate and is what makes termination unconditional: a
+    // cleared line is simply re-fetched, whereas letting the install win could
+    // re-validate a way the purge was retiring and leave the duplicate standing. It
+    // is the same ordering lesson the `when(!anyInvalidate)` guard on that install
+    // records one screen up.
+    //
+    // Gated exactly like the assert below it (`s0Valid && !s0Replay && !s0Fault`):
+    // REPLAY and FAULT inject a synthetic S0 context whose `tagQ`/`validsQ`/`s0Ppn`
+    // are the last accepted command's leftovers, so `s1HitVec` is meaningless on
+    // those cycles and must not be allowed to clear anything.
+    //
+    // Off the critical path: a flop-array write enabled by a condition that is False
+    // in every cycle of normal operation. It adds nothing to the `s1Hit` cone.
+    val icDupPurge = s0Valid && !s0Replay && !s0Fault && s1MultiHot
+    icDupPurge.simPublic()
+
+    // ── STICKY EVIDENCE, readable over JTAG (DebugRegMap.OFF_MULTIHOT_*) ────────
+    // Latched on DETECTION, deliberately not on the purge: a multi-hot that occurs
+    // while some other condition prevents the repair must still be recorded.
+    // `dbgMultiHotClear` is driven by DebugCtrlPlugin's write decode and defaults
+    // False, so a DUT that wires nothing keeps a latch that only ever accumulates.
+    // VIPT: the page offset is untranslated, so `s0Ppn ## s0Set ## 0` IS the physical
+    // line base -- the same expression `s1Line` uses.
+    val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
+    val dbgMultiHot = OneHotSafe.evidence(
+      icDupPurge, (s0Ppn ## s0Set ## U(0, 6 bits)).asUInt, dbgMultiHotClear)
+    dbgMultiHot.sticky.simPublic(); dbgMultiHot.count.simPublic(); dbgMultiHot.addr.simPublic()
+    when(icDupPurge) {
+      for (w <- 0 until ways) when(s1HitVec(w)) {
+        valids(w)(s0Set) := False
       }
     }
 

@@ -88,6 +88,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
   val logic = during build new Area {
     val tlb    = new Tlb(entries, ways, banks)
+    // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
+    // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
+    // override it from its write decode, and so a DUT that wires nothing still
+    // elaborates with a latch that only ever accumulates. Never left undriven: an
+    // un-poked testbench-driven input is not guaranteed 0 in this project's sim
+    // (documented gotcha), and a randomly-asserted clear would silently erase the
+    // evidence this register exists to preserve.
+    val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
+    tlb.io.dbgMultiHotClear := dbgMultiHotClear
     val walker = new TableWalker()
 
     // ── Table-walk traffic now goes through the D-CACHE, not a private AXI master ──

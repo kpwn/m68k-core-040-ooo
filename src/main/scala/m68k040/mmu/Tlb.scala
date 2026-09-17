@@ -4,6 +4,7 @@ import m68k040.cache.CacheMode
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
+import m68k040.hw.OneHotSafe
 
 /** One TLB (address translation cache) entry. `valid` is held in a separate
   * RegInit'd Vec (cleared by invalidateAll); the rest live in a per-way Reg array.
@@ -87,6 +88,21 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val fillEntry = in(TlbEntry())
 
     val invalidateAll = in Bool ()
+
+    // ── MULTI-HOT EVIDENCE, readable over JTAG (DebugRegMap.OFF_MULTIHOT_*) ─────
+    // `Tlb` is a real Component, so unlike the caches -- whose probes are plain vals
+    // in a plugin Area that DebugCtrlPlugin can reach directly -- these have to cross
+    // the boundary as explicit ports. Same shape as `TableWalker.io.dbgPack`, which
+    // is the established precedent for a probe living inside a sub-Component.
+    //
+    // The ITLB and the DTLB are two separate instances of this component and their
+    // evidence MUST stay separate: an ITLB multi-hot mistranslates a perfectly correct
+    // PC and explains a wild BRANCH TARGET, a DTLB one explains a wild DATA address.
+    // Merging them would throw away the single most useful bit of the diagnosis.
+    val dbgMultiHotClear  = in Bool ()
+    val dbgMultiHotSticky = out Bool ()
+    val dbgMultiHotCount  = out UInt (4 bits)
+    val dbgMultiHotVpn    = out UInt (32 bits)
   }
 
   // ---- VPN decomposition helpers ----
@@ -158,16 +174,71 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     e.modified   := modif(lkBank)(w)(lkSet)
     entVec(w) := e
   }
-  io.hit      := hitVec.orR
+  // ── MULTI-HOT FAIL-SAFE (2026-09-17) ────────────────────────────────────────
+  // `MuxOH` is defined only for a ONE-HOT select, and on a 2-hot vector it returns
+  // the bitwise OR of two entries -- a PPN nobody ever wrote, delivered upward as a
+  // valid, NON-FAULTING translation. That is not hypothetical here: the fill-path
+  // comment below records `WalkerExcEntryWedgeSpec` catching 0xae0cf000 for a VA
+  // whose only descriptor says 0x60008. The FILL end was fixed (replace-in-place,
+  // `OHMasking.first`); this is the CONSUMER end.
+  //
+  // A multi-hot lookup now reports a MISS, which sends the request to a table walk
+  // -- an outcome every consumer of this component already handles. `io.hitEntry`
+  // is deliberately left as-is: it is read only under `io.hit` (DtlbPlugin.scala's
+  // `tlbHit && !needsMRefresh` arm and `needsMRefresh`'s own `tlbHit` term), so the
+  // OR-ed entry is still computed and never consumed. Leaving the mux alone is what
+  // keeps this free -- see `OneHotSafe` for why the reduction itself costs nothing.
+  //
+  // FORCING A MISS IS NOT ENOUGH ON ITS OWN. The fill below replaces
+  // `OHMasking.first(flResidentVec)`, i.e. the FIRST matching way -- so on a real
+  // duplicate the OTHER match survives, the next lookup is multi-hot again, and the
+  // walk repeats forever. A forced miss without the purge is a guaranteed livelock.
+  // `dupPurge` below is what makes it terminate.
+  val lkMultiHot = OneHotSafe.multiHot(hitVec)
+  io.hit      := OneHotSafe.exactlyOne(hitVec)
   io.hitEntry := MuxOH(hitVec, entVec)
-  // sim-only: `MuxOH` is only defined for a ONE-HOT select. Nothing in the fill path
-  // checks whether the VPN is already resident in another way, so two ways of the same
-  // (bank,set) could end up holding the same tag -- and then `MuxOH` returns the
-  // contents of a way that did not match at all (its index is derived by OR-ing the set
-  // bit positions, so ways {0,1,2} select index 3). The fill below now replaces a
-  // resident way instead of allocating a duplicate; this counter stays as the tripwire
-  // that keeps that invariant honest.
+  // sim-only: the tripwire that keeps the one-hot invariant honest, KEPT so the
+  // condition stays loud in simulation rather than being silently absorbed by the
+  // fail-safe above. Nothing in the fill path checks whether the VPN is already
+  // resident in another way, so two ways of the same (bank,set) could end up holding
+  // the same tag.
   val dbgHitCount = CountOne(hitVec); dbgHitCount.simPublic()
+  val dbgMultiHot = lkMultiHot; dbgMultiHot.simPublic()
+  val dbgPurgeFire = Bool(); dbgPurgeFire := False; dbgPurgeFire.simPublic()
+
+  // Sticky evidence. Latched on DETECTION (`lkMultiHot`), which is also what arms the
+  // purge -- so a cleared board that nonetheless shows a set sticky bit proves the
+  // condition occurred and was repaired, rather than leaving it invisible. The address
+  // captured is the looked-up VPN KEY, i.e. exactly the value the lookup compared, so
+  // it can be correlated against the faulting VA without re-deriving the key.
+  val dbgEvidence = m68k040.hw.OneHotSafe.evidence(
+    lkMultiHot, io.lookupVpn.resize(32), io.dbgMultiHotClear)
+  io.dbgMultiHotSticky := dbgEvidence.sticky
+  io.dbgMultiHotCount  := dbgEvidence.count
+  io.dbgMultiHotVpn    := dbgEvidence.addr
+  dbgEvidence.sticky.simPublic(); dbgEvidence.count.simPublic(); dbgEvidence.addr.simPublic()
+
+  // ── DUPLICATE PURGE ─────────────────────────────────────────────────────────
+  // Clear the valid bit of EVERY matching way of the looked-up (bank,set). A TLB
+  // entry is a pure cache of a page-table descriptor -- the architectural copy,
+  // `modified` bit included, lives in memory and `DtlbPlugin.needsMRefresh` already
+  // re-walks to refresh it -- so dropping entries can never lose state. Purging ALL
+  // matches (rather than all-but-one) is therefore the safest rule here AND the one
+  // that provably converges: after the purge the set holds zero matches, the walk
+  // fills exactly one, and the next lookup is one-hot. One purge, always.
+  //
+  // Off the critical path by construction: this is a write into a flop array
+  // enabled by a condition that is False in every cycle of normal operation, so it
+  // adds nothing to the lookup cone that `io.hit` sits in.
+  when(lkMultiHot) {
+    dbgPurgeFire := True
+    for (b <- 0 until banks; w <- 0 until ways) {
+      val bankMatch = if (bankBits == 0) True else lkBank === U(b, bankBits bits)
+      when(bankMatch && hitVec(w)) {
+        valids(b)(w)(lkSet) := False
+      }
+    }
+  }
 
   // ---- fill (replace-in-place if resident, else round-robin victim) ----
   //

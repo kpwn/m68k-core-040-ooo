@@ -68,6 +68,7 @@ class TlbDuplicateFillSpec extends AnyFunSuite {
       cd.forkStimulus(10)
       dut.io.fillValid #= false
       dut.io.invalidateAll #= false
+    dut.io.dbgMultiHotClear #= false
       dut.io.lookupVpn #= 0
       dut.io.lookupSup #= false
       cd.waitSampling(2)
