@@ -610,6 +610,31 @@ trait WalkerDcacheClient {
   def walkStore:    Stream[m68k040.cache.DStoreCmd]
   def walkStoreAck: Bool
   def walkStoreErr: Bool
+
+  /** The arbiter's fixed descriptor-access cache-mode POLICY (`CACR.DE ? WRITETHROUGH
+    * : INHIBITED`), driven by `LsEuPlugin` and read by this plugin.
+    *
+    * WHY THE POLICY AND NOT THE STAMP (race audit, 2026-09-18). The arbiter used to
+    * STAMP `cacheMode` onto both walker legs, live, at each leg
+    * (`dcache.loadCmd.payload.cacheMode` and `dcache.store.payload.cacheMode`). Both
+    * legs read the same net -- which is SPATIAL agreement, and the invariant needs
+    * TEMPORAL agreement: one table search spans the three descriptor reads, the
+    * deferred U/M drain's re-read and that drain's merged store, hundreds of cycles,
+    * with a MOVEC to CACR free to retire anywhere inside it.
+    *
+    * `quiesceHold` made the split MORE likely rather than less: a CACR write is a
+    * sysOp, and its `S_DRAIN`/`S_APPLY` deny the walker a fresh STORE grant, so a
+    * drain whose re-read had already completed under the old `CACR.DE` was parked
+    * until after the write landed and then stamped with the NEW mode. DE 1->0 is the
+    * damaging direction: the re-read ran WRITETHROUGH and ALLOCATED the descriptor
+    * line, then the store ran INHIBITED and "never touches the cache array", so memory
+    * got the U/M update and the resident copy kept the pre-update byte. Re-enable DE
+    * without a CINV and that stale copy answers the next descriptor read -- M lost, and
+    * a dirty page later evicted as clean.
+    *
+    * Exporting the policy instead lets the client LATCH it once for the read/write pair
+    * that must agree, which is the only place in the search that MUTATES. */
+  def walkCmodePolicy: m68k040.cache.CacheMode.C
 }
 
 /** The I-side walker's client port (`ItlbPlugin`). A SEPARATE trait from the D-side

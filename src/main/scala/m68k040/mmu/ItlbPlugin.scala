@@ -71,11 +71,13 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var _walkStore:    Stream[DStoreCmd] = null
   var _walkStoreAck: Bool = null
   var _walkStoreErr: Bool = null
+  var _walkCmodePolicy: CacheMode.C = null
   override def walkLoadCmd:  Stream[DLoadCmd]  = _walkLoadCmd
   override def walkLoadRsp:  Flow[DLoadRsp]    = _walkLoadRsp
   override def walkStore:    Stream[DStoreCmd] = _walkStore
   override def walkStoreAck: Bool = _walkStoreAck
   override def walkStoreErr: Bool = _walkStoreErr
+  override def walkCmodePolicy: CacheMode.C = _walkCmodePolicy
 
   during setup {
     _req = TranslationReq()
@@ -93,6 +95,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore    = Stream(DStoreCmd())
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
+    _walkCmodePolicy = CacheMode()
   }
 
   // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB).
@@ -119,6 +122,12 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // DUT still elaborates and can attach a sim-side `DcacheClientMemAgent`.
     _walkLoadCmd.valid   := walker.io.loadCmd.valid
     _walkLoadCmd.payload := walker.io.loadCmd.payload
+    // Driven by the arbiter; WRITETHROUGH is the inert standalone-DUT default, the
+    // same value the arbiter used to stamp unconditionally.
+    _walkCmodePolicy.allowOverride; _walkCmodePolicy := CacheMode.WRITETHROUGH
+    // The WALKER's own descriptor reads take the LIVE policy: a read does not
+    // mutate, so nothing downstream depends on two reads agreeing.
+    _walkLoadCmd.payload.cacheMode := _walkCmodePolicy
     _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
     walker.io.loadCmd.ready := _walkLoadCmd.ready
     _walkLoadRsp.valid.allowOverride;   _walkLoadRsp.valid := False
@@ -705,6 +714,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
     val drainDropAck  = RegInit(False)
+    /** The descriptor cache-mode policy in force when THIS drain armed. */
+    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH
     drainDropAck := False
 
     // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
@@ -726,6 +737,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainRdAddr   := umq.io.drain.payload.addr
       drainOffReg   := drainByteOff
       drainSetBits  := umq.io.drain.payload.newByte & UmSetMask
+      // LATCH the policy for this drain. The re-read and the merged store that
+      // follows it are one read-modify-write and MUST agree: see
+      // `WalkerDcacheClient.walkCmodePolicy` for the DE 1->0 lost-M mechanism.
+      drainCmode    := _walkCmodePolicy
     }
     // THE PORT ITSELF must be silenced while the drain owns it. `_walkLoadCmd.valid`
     // defaults to `walker.io.loadCmd.valid`, and during `drainReadPend` the drain's
@@ -742,7 +757,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _walkLoadCmd.payload.paddr     := drainRdAddr
       _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
       _walkLoadCmd.payload.lineOnly  := False
-      _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+      _walkLoadCmd.payload.cacheMode := drainCmode
       _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_ITLB,
                                           m68k040.cache.DLoadToken.Width bits)
     }
@@ -793,7 +808,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore.payload.useStrb    := True
     _walkStore.payload.strb       := drainStrbReg
     _walkStore.payload.lineData   := drainBeatReg
-    _walkStore.payload.cacheMode  := CacheMode.WRITETHROUGH   // stamped by the arbiter
+    _walkStore.payload.cacheMode  := drainCmode
     _walkStore.payload.precise    := False
     when(_walkStore.fire) { drainArmed := False; drainAckWait := True }
     when(drainAckWait && _walkStoreAck) { drainAckWait := False }

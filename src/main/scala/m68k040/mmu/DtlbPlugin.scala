@@ -44,11 +44,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var _walkStore:    Stream[DStoreCmd] = null
   var _walkStoreAck: Bool = null
   var _walkStoreErr: Bool = null
+  var _walkCmodePolicy: CacheMode.C = null
   override def walkLoadCmd:  Stream[DLoadCmd]  = _walkLoadCmd
   override def walkLoadRsp:  Flow[DLoadRsp]    = _walkLoadRsp
   override def walkStore:    Stream[DStoreCmd] = _walkStore
   override def walkStoreAck: Bool = _walkStoreAck
   override def walkStoreErr: Bool = _walkStoreErr
+  override def walkCmodePolicy: CacheMode.C = _walkCmodePolicy
 
   during setup {
     // Allocate the service ports in the plugin's own scope (deterministic — avoids
@@ -70,6 +72,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore    = Stream(DStoreCmd())
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
+    _walkCmodePolicy = CacheMode()
   }
 
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
@@ -117,6 +120,12 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // `DcacheClientMemAgent` to these ports instead, which is why they are simPublic.
     _walkLoadCmd.valid   := walker.io.loadCmd.valid
     _walkLoadCmd.payload := walker.io.loadCmd.payload
+    // Driven by the arbiter; WRITETHROUGH is the inert standalone-DUT default, the
+    // same value the arbiter used to stamp unconditionally.
+    _walkCmodePolicy.allowOverride; _walkCmodePolicy := CacheMode.WRITETHROUGH
+    // The WALKER's own descriptor reads take the LIVE policy: a read does not
+    // mutate, so nothing downstream depends on two reads agreeing.
+    _walkLoadCmd.payload.cacheMode := _walkCmodePolicy
     _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
     walker.io.loadCmd.ready := _walkLoadCmd.ready
     _walkLoadRsp.valid.allowOverride;   _walkLoadRsp.valid := False
@@ -776,6 +785,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
     val drainDropAck  = RegInit(False)
+    /** The descriptor cache-mode policy in force when THIS drain armed. */
+    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH
     drainDropAck := False
 
     // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
@@ -797,6 +808,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainRdAddr   := umq.io.drain.payload.addr
       drainOffReg   := drainByteOff
       drainSetBits  := umq.io.drain.payload.newByte & UmSetMask
+      // LATCH the policy for this drain. The re-read and the merged store that
+      // follows it are one read-modify-write and MUST agree: see
+      // `WalkerDcacheClient.walkCmodePolicy` for the DE 1->0 lost-M mechanism.
+      drainCmode    := _walkCmodePolicy
     }
 
     // Drain owns the walker's descriptor-read port for exactly one transaction.
@@ -818,7 +833,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // Both overwritten by the arbiter with the same fixed policy the walker's own
       // reads get; these are the inert standalone-DUT defaults, exactly as in
       // TableWalker.
-      _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+      _walkLoadCmd.payload.cacheMode := drainCmode
       _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_DTLB,
                                           m68k040.cache.DLoadToken.Width bits)
     }
@@ -874,7 +889,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
     // forbidden: the read and the write halves of one table search must agree, or the
     // read can hit an array copy the write never updated.
-    _walkStore.payload.cacheMode  := CacheMode.WRITETHROUGH
+    _walkStore.payload.cacheMode  := drainCmode
     // NOT on the SQ's at-head precise path: this store belongs to no ROB entry's
     // precise fault reporting, and marking it precise would route a bus error into the
     // SQ's `sqFaultCompletion` against an unrelated robId.

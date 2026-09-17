@@ -510,43 +510,30 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //     signal. A per-half mode would let a read hit an array copy the write never
     //     updated.
     //
-    // ── RESIDUAL, FOUND BY THE RACE AUDIT (2026-09-18): SAME NET, DIFFERENT CYCLE ──
-    // "The SAME expression from the SAME signal" is SPATIAL agreement. It is not
-    // TEMPORAL agreement, and the invariant above needs the temporal kind. This is a
-    // LIVE read of `CACR.DE`, sampled independently by the load leg (:3703) and the
-    // store leg (:3733), and a table search spans both: the three descriptor reads,
-    // then the deferred U/M drain's re-read, then that drain's merged store -- hundreds
-    // of cycles, with a MOVEC to CACR free to retire anywhere inside it.
+    // ── FIXED (race audit, 2026-09-18). The bullet above said "the read half and the
+    // write half use the SAME expression from the SAME signal", which is SPATIAL
+    // agreement; the invariant needs TEMPORAL agreement. This was a LIVE `CACR.DE` read
+    // sampled independently by the load leg and the store leg, and one table search spans
+    // both -- three descriptor reads, the deferred U/M drain's re-read, then that drain's
+    // merged store -- with a MOVEC to CACR free to retire anywhere inside it. Worse,
+    // `quiesceHold` made the split MORE likely: a CACR write is a sysOp whose
+    // `S_DRAIN`/`S_APPLY` deny the walker a fresh STORE grant, so a drain that had already
+    // completed its re-read under the old DE was parked until after the write landed and
+    // then stamped with the new mode. DE 1->0 left the descriptor line ALLOCATED by the
+    // WRITETHROUGH re-read holding the pre-update byte while the INHIBITED store updated
+    // only memory -- M lost, and a dirty page later evicted as clean.
     //
-    // `quiesceHold` makes the split MORE likely, not less: a CACR write is a sysOp, its
-    // `S_DRAIN`/`S_APPLY` refuse the walker a fresh STORE grant, so a drain whose
-    // re-read already completed under the old CACR.DE is deliberately parked until the
-    // write has landed -- and then stamped with the NEW mode.
-    //
-    // DE 1->0 is the damaging direction and it is exactly the case the bullet above
-    // claims is safe: the re-read ran WRITETHROUGH and ALLOCATED the descriptor line
-    // (`DcachePlugin` :2166 `doAllocate = !respErr && missCmode =/= INHIBITED`), then the
-    // store runs INHIBITED and "never touches the cache array" (:1424) -- so memory gets
-    // the U/M update and the resident copy keeps the pre-update byte. Re-enable DE
-    // without a CINV and that copy answers the next descriptor read: the M bit is lost
-    // and a dirty page is later evicted as clean, which is the precise silent-data-loss
-    // the whole deferred-U/M path exists to prevent.
-    //
-    // NOT FIXED HERE, deliberately. The fix is to LATCH the mode once per table search
-    // and use the latched value for every leg of it -- but this arbiter owns the stamp by
-    // design ("the descriptor fetch's own cache mode is a fixed architectural policy this
-    // component cannot see", TableWalker.scala), so latching it means moving ownership
-    // into the TLB plugins and changing a port contract. The obvious cheap alternative --
-    // drop the drain when the mode changed under it, the way `drainDropAck` already drops
-    // a faulting re-read -- is WRONG here: the ATC entry was filled with
-    // `WalkRsp.modified = 1`, so nothing ever re-walks to repair the dropped M (this is
-    // C1 verbatim, see DtlbPlugin's `walkUmPoison` block). Software is architecturally
-    // required to CINV around a cache-enable change, so this is a "software omitted the
-    // maintenance" residual of the same class as the PFLUSH ones -- recorded at the site
-    // rather than silently left as the incorrect claim above.
+    // The fix moves the stamp to the client, which is the only place that knows which
+    // accesses form one read-modify-write. See `WalkerDcacheClient.walkCmodePolicy`.
     val walkCacheMode = Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
                             m68k040.cache.CacheMode.WRITETHROUGH,
                             m68k040.cache.CacheMode.INHIBITED)
+    // EXPORT the policy; do not stamp it onto the legs. Each TLB plugin uses it live for
+    // the walker's own (read-only) descriptor fetches and LATCHES it for the U/M drain's
+    // read-modify-write pair, which is the only part of a table search that mutates and
+    // therefore the only part that needs the two halves to agree ACROSS CYCLES rather
+    // than merely come from the same net. See `WalkerDcacheClient.walkCmodePolicy`.
+    walkClients.foreach(_.foreach(_.walkCmodePolicy := walkCacheMode))
 
     // ── Load-response ownership FIFO ───────────────────────────────────────────────
     // Depth 8, which is the real bound and not a round number: the aligned ring is 4
@@ -3733,9 +3720,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.loadCmd.payload.vaddr := walkLdSel.vaddr
       dcache.loadCmd.payload.paddr := walkLdSel.paddr
       dcache.loadCmd.payload.size  := walkLdSel.size
-      // W1/W2/W3: the FIXED architectural policy, stamped here and nowhere else. The
-      // walker's own drive of this field is an inert default that never reaches the cache.
-      dcache.loadCmd.payload.cacheMode := walkCacheMode
+      // W1/W2/W3, REVISED (race audit, 2026-09-18): the policy is EXPORTED to the client
+      // (`walkCmodePolicy`, driven where `walkCacheMode` is defined) and the client stamps
+      // its own payload -- live for a descriptor read, latched for the U/M drain's RMW
+      // pair. Stamping here re-derived `CACR.DE` independently at this leg and at the
+      // store leg below, which is spatial agreement but not temporal agreement across the
+      // hundreds of cycles one table search spans.
+      dcache.loadCmd.payload.cacheMode := walkLdSel.cacheMode
       // W25: a RESERVED token per walker, never a don't-care. A don't-care token could
       // match a live early-probe entry on token AND vaddr and silently answer this
       // descriptor read out of that probe's captured data.
@@ -3764,8 +3755,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.store.payload.strb     := walkStSel.strb
       dcache.store.payload.lineData := walkStSel.lineData
       dcache.store.payload.precise  := walkStSel.precise
-      // W3: the SAME fixed policy expression the read half uses, from the same signal.
-      dcache.store.payload.cacheMode := walkCacheMode
+      // W3: the client latched this at drain-arm time so it is the SAME value its own
+      // re-read used -- the guarantee the old "same expression, same signal" wording
+      // claimed but could not provide, because the two legs fire in different cycles.
+      dcache.store.payload.cacheMode := walkStSel.cacheMode
     }
 
     // ── Grant machine, LOAD direction ──────────────────────────────────────────────
