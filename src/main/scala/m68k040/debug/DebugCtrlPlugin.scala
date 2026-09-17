@@ -201,6 +201,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val stallRob    = if (enable) host.get[m68k040.rob.RobPlugin] else None
     val stallDtlb   = if (enable) host.get[m68k040.mmu.DtlbPlugin] else None
     val stallItlb   = if (enable) host.get[m68k040.mmu.ItlbPlugin] else None
+    // 2026-09-17 multi-hot evidence (DebugRegMap.OFF_MULTIHOT_*). Same `host.get`
+    // Option discipline as every reader above: the Stage-1 standalone fixture hosts no
+    // I-cache, and a hard reach-in would break its elaboration. An absent peer reads as
+    // a clean zero -- which for THIS register is a meaningful answer, not a lie: zero
+    // means "no multi-hot was detected", and that is the reading which FALSIFIES the
+    // duplicate-entry hypothesis. That is exactly why every source is proven live in
+    // simulation rather than assumed (see DebugCtrlMultiHotSpec).
+    val mhIcache    = if (enable) host.get[m68k040.cache.IcachePlugin] else None
     val historyBuilt = historyEnabled && debugHistory.nonEmpty
     val unavailableFeatures = Set("dcache_probe") ++
       (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
@@ -464,6 +472,51 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         val itlbBits = stallItlb.map(_.logic.walker.io.dbgPack).getOrElse(B(0, 16 bits))
         RegNext(itlbBits ## dtlbBits) init B(0, 32 bits)
       } else B(0, 32 bits)
+      // ── Multi-hot evidence words (2026-09-17) ────────────────────────────────
+      // Registered on the same terms as the stall packs above: these are deep
+      // combinational reach-ins into three different plugins (and, for the TLBs,
+      // across a sub-Component boundary), and the read mux must not carry them raw.
+      //
+      // SIX sites, deliberately not merged. An ITLB multi-hot mistranslates a correct
+      // PC and explains a wild BRANCH TARGET; a DTLB one explains a wild DATA address;
+      // a D-cache STORE one is a write into a way that never matched. Which bit is set
+      // is most of the diagnosis, so each keeps its own bit, its own saturating counter
+      // and its own first-occurrence address.
+      def mhSticky(o: Option[Bool]): Bool = o.getOrElse(False)
+      def mhCount(o: Option[UInt]): UInt  = o.getOrElse(U(0, 4 bits))
+      def mhAddr(o: Option[UInt]): UInt   = o.getOrElse(U(0, 32 bits))
+      val mhIc  = mhIcache.map(_.logic.dbgMultiHot)
+      val mhDc  = stallDcache.map(_.logic)
+      val mhSt  = Seq(
+        mhSticky(mhIc.map(_.sticky)),
+        mhSticky(mhDc.map(_.dbgMultiHotLoad.sticky)),
+        mhSticky(mhDc.map(_.dbgMultiHotProbe.sticky)),
+        mhSticky(mhDc.map(_.dbgMultiHotStore.sticky)),
+        mhSticky(stallItlb.map(_.logic.tlb.io.dbgMultiHotSticky)),
+        mhSticky(stallDtlb.map(_.logic.tlb.io.dbgMultiHotSticky)))
+      val mhCt  = Seq(
+        mhCount(mhIc.map(_.count)),
+        mhCount(mhDc.map(_.dbgMultiHotLoad.count)),
+        mhCount(mhDc.map(_.dbgMultiHotProbe.count)),
+        mhCount(mhDc.map(_.dbgMultiHotStore.count)),
+        mhCount(stallItlb.map(_.logic.tlb.io.dbgMultiHotCount)),
+        mhCount(stallDtlb.map(_.logic.tlb.io.dbgMultiHotCount)))
+      val mhStatusRaw = Cat(
+        mhCt.reverse.map(_.asBits).reduce(_ ## _),   // [31:8] six 4-bit counters
+        B(0, 2 bits),                                 // [7:6]  reserved
+        mhSt.reverse.map(_.asBits).reduce(_ ## _))    // [5:0]  six sticky bits
+      val multiHotStatusReg = RegNext(mhStatusRaw.resize(32)) init B(0, 32 bits)
+      val multiHotAddrRegs = Seq(
+        mhAddr(mhIc.map(_.addr)),
+        mhAddr(mhDc.map(_.dbgMultiHotLoad.addr)),
+        mhAddr(mhDc.map(_.dbgMultiHotProbe.addr)),
+        mhAddr(mhDc.map(_.dbgMultiHotStore.addr)),
+        mhAddr(stallItlb.map(_.logic.tlb.io.dbgMultiHotVpn)),
+        mhAddr(stallDtlb.map(_.logic.tlb.io.dbgMultiHotVpn))
+      ).map(a => RegNext(a.asBits) init B(0, 32 bits))
+      multiHotStatusReg.simPublic()
+      multiHotAddrRegs.foreach(_.simPublic())
+
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadPcOdd = if (historyBuilt) RegInit(False) else False
@@ -655,14 +708,21 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val debugResumeRequest = if (stage >= 2) RegInit(False) else False
       val debugStepRequest = if (stage >= 2) RegInit(False) else False
       val debugClearStickyRequest = if (stage >= 2) RegInit(False) else False
+      // Host-driven clear for the multi-hot evidence latches. A SEPARATE request from
+      // `debugClearStickyRequest`: that one clears the halt reason/report latches, and
+      // folding the two together would mean every ordinary halt-reason clear silently
+      // erased the corruption evidence this register exists to preserve.
+      val multiHotClearRequest = if (stage >= 2) RegInit(False) else False
       if (stage >= 2) {
         manualHaltLevel.simPublic()
         debugStopRequest.simPublic(); debugResumeRequest.simPublic(); debugStepRequest.simPublic()
         debugClearStickyRequest.simPublic()
+        multiHotClearRequest.simPublic()
         debugStopRequest := False
         debugResumeRequest := False
         debugStepRequest := False
         debugClearStickyRequest := False
+        multiHotClearRequest := False
       }
 
       // Halt-after configuration is debug-owned and therefore survives CPU reset.
@@ -1263,6 +1323,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_STALL_GRANT) { rdCount := stallGrantPackReg }
           is(DebugRegMap.OFF_STALL_EXC)   { rdCount := stallExcPackReg }
           is(DebugRegMap.OFF_STALL_WALK)  { rdCount := stallWalkPackReg }
+        // Multi-hot evidence (2026-09-17). Region 2 so it is LIVE -- no halt required
+        // -- for the same reason the p141 stall words are: a multi-hot may well be part
+        // of why a halt never lands.
+        is(DebugRegMap.OFF_MULTIHOT_STATUS)   { rdCount := multiHotStatusReg }
+        is(DebugRegMap.OFF_MULTIHOT_IC)       { rdCount := multiHotAddrRegs(0) }
+        is(DebugRegMap.OFF_MULTIHOT_DCLOAD)   { rdCount := multiHotAddrRegs(1) }
+        is(DebugRegMap.OFF_MULTIHOT_DCPROBE)  { rdCount := multiHotAddrRegs(2) }
+        is(DebugRegMap.OFF_MULTIHOT_DCSTORE)  { rdCount := multiHotAddrRegs(3) }
+        is(DebugRegMap.OFF_MULTIHOT_ITLB)     { rdCount := multiHotAddrRegs(4) }
+        is(DebugRegMap.OFF_MULTIHOT_DTLB)     { rdCount := multiHotAddrRegs(5) }
         }
 
         // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
@@ -1342,6 +1412,23 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // response, which the FSM above already produces unconditionally.
       when(doWrite) {
         switch(awAddr) {
+          // Clear the multi-hot evidence latches. Modelled on OFF_HALT_CTL bit 2 (the
+          // sticky reason/report clear): one write-strobe-qualified data bit, no
+          // read-modify-write, and the rest of the word -- which is the read-side
+          // status -- is ignored on write.
+          //
+          // THIS ARM BELONGS IN THIS SWITCH AND NOWHERE ELSE. It was first written into
+          // a READ-region `switch(arAddr)` by mistake, where it elaborated cleanly,
+          // emitted no warning, and simply never fired: the CSR read back correctly and
+          // the clear silently did nothing. That is the exact "one arm dropped into the
+          // wrong region" failure this file's read-mux comment describes, and it was
+          // caught only because DebugCtrlMultiHotSpec tests the clear rather than
+          // assuming it.
+          is(DebugRegMap.OFF_MULTIHOT_STATUS) {
+            if (stage >= 2) when(wStrb(0)) {
+              when(wData(0)) { multiHotClearRequest := True }
+            }
+          }
           is(DebugRegMap.OFF_CONTROL) {
             // Read-modify-write through the byte-strobe merge against the SAME word the
             // host reads back, so an unstrobed byte provably cannot change a bit. Bit 1
@@ -1629,6 +1716,17 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         csr.debugResumeRequest && !dbgRst && !csr.archApplyBusy && !csr.cacheOpBusy,
         csr.debugStepRequest && !dbgRst && !csr.archApplyBusy && !csr.cacheOpBusy,
         csr.debugClearStickyRequest && !dbgRst))
+      // Route the multi-hot clear back to every producer. `&& !dbgRst` mirrors every
+      // other request above: the CPU domain can leave reset before this reset-less
+      // debug POR generator finishes, and a transient must never wipe the evidence.
+      // Direct assignment into each plugin's `allowOverride` default-False wire, the
+      // same reach-in this file already uses to READ their packs; `dbgCd` shares
+      // `coreCd.clock` (only the reset differs), so this is not a clock crossing.
+      val mhClear = csr.multiHotClearRequest && !dbgRst
+      mhIcache.foreach(_.logic.dbgMultiHotClear := mhClear)
+      stallDcache.foreach(_.logic.dbgMultiHotClear := mhClear)
+      stallItlb.foreach(_.logic.dbgMultiHotClear := mhClear)
+      stallDtlb.foreach(_.logic.dbgMultiHotClear := mhClear)
       dbgCommit.foreach(_.configureHaltAfter(csr.haltAfterTarget, csr.haltAfterEpoch,
         csr.haltAfterArmed && !dbgRst, csr.haltAfterInvalidate && !dbgRst))
       if (stage >= 5) {

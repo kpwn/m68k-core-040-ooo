@@ -171,6 +171,48 @@ REG OFF_STALL_DC          0x0101C RO    2 0x00000000 D-cache dcIdleForMaint term
 REG OFF_STALL_GRANT       0x01020 RO    2 0x00000000 D-cache port ownership and walker grant machine.
 REG OFF_STALL_EXC         0x01024 RO    2 0x00000000 ExceptionUnit FSM one-hot and its drain predicates.
 REG OFF_STALL_WALK        0x01028 RO    2 0x00000000 TableWalker FSMs: DTLB in [15:0], ITLB in [31:16].
+# DRIFT REPAIR (2026-09-17). This record was MISSING: master commit e5bace11 added
+# `OFF_STALL_ARB` by hand-editing the GENERATED DebugRegMap.scala instead of this
+# file, so the offset existed in Scala, was absent from debug_regmap.py/.tcl, and
+# `gen_debug_regmap.py --check` reported the tree stale. Regenerating without this
+# line would DELETE the val and break DebugCtrlPlugin's mux arm.
+REG OFF_STALL_ARB         0x0102C RO    2 0x00000000 AxiDMerge post-mortem: wedged direction and grant owner.
+
+# ---- multi-hot way-match detector (2026-09-17) ---------------------------------
+# DIRECT EVIDENCE for the one hypothesis that currently explains all four board
+# symptoms at once -- a ROM misdecode of immutable bytes that is correct on retry,
+# two wild data addresses full of instruction bytes (0x2F08226B, 0x6bebfbef), and a
+# branch into VRAM. Every set-associative lookup in this core reduces its per-way
+# match vector both to a scalar hit and to a way SELECT, and the select is defined
+# only for a one-hot vector: `OHToUInt` OR-s the matching bit POSITIONS and `MuxOH`
+# merges entries, so a multi-hot match silently yields an unrelated cache line, two
+# instruction lines OR-ed together, or -- for a TLB -- a PPN nobody ever wrote,
+# handed upward as a VALID, NON-FAULTING translation.
+#
+# WHY A REGISTER AND NOT ANOTHER SIMULATION: `live-mmu` exposes only TC/DTT/ITT/
+# SRP/URP. There is NO TLB entry dump, so a duplicate entry is currently
+# UNOBSERVABLE on the board and all four symptoms above are circumstantial. A
+# sticky bit that says "this structure returned a multi-hot match" is direct
+# evidence -- and its ABSENCE after a failed boot FALSIFIES the hypothesis just as
+# cleanly, which is the point.
+#
+# SIX sites, not five: the ITLB and the DTLB are separate Tlb instances and the
+# distinction is the whole diagnostic value. An ITLB multi-hot mistranslates a
+# perfectly correct PC and explains a wild BRANCH TARGET; a DTLB one explains a wild
+# DATA address. Do not merge them.
+#
+# Each *_ADDR word latches the FIRST occurrence only and is frozen until cleared, so
+# it can be correlated against the faulting address without a later event
+# overwriting it. Stage 2 (live, no halt required): a multi-hot may well be what
+# prevents the halt from ever landing. These deliberately do NOT claim the
+# `perf_counters` feature bit, which stays at stage 7 for the reason recorded above.
+REG OFF_MULTIHOT_STATUS   0x01030 MIXED 2 0x00000000 Multi-hot sticky bits [5:0] + six 4-bit saturating counters [31:8]; write bit 0 clears all.
+REG OFF_MULTIHOT_IC       0x01034 RO    2 0x00000000 First I-cache multi-hot: physical line base.
+REG OFF_MULTIHOT_DCLOAD   0x01038 RO    2 0x00000000 First D-cache LOAD multi-hot: physical address.
+REG OFF_MULTIHOT_DCPROBE  0x0103C RO    2 0x00000000 First D-cache early-probe multi-hot: set index.
+REG OFF_MULTIHOT_DCSTORE  0x01040 RO    2 0x00000000 First D-cache STORE multi-hot: physical address.
+REG OFF_MULTIHOT_ITLB     0x01044 RO    2 0x00000000 First ITLB multi-hot: looked-up VPN key.
+REG OFF_MULTIHOT_DTLB     0x01048 RO    2 0x00000000 First DTLB multi-hot: looked-up VPN key.
 
 # ------------------------------------------- architectural write shadows --
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.
