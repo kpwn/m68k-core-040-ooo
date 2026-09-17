@@ -885,10 +885,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0FpEaIsAbsPc = (s0FpGenEaMode === B"3'b111") &&
                         ((s0FpGenEaReg === B"3'b000") || (s0FpGenEaReg === B"3'b001") ||
                          (s0FpGenEaReg === B"3'b010"))
+    // FAIL-SAFE (2026-09-17): mode 110 is admitted only in its BRIEF form. The FMOVEM.X
+    // FSM's own EA mux (`fxIsIdxAn = (fxMode === 110) && !fxIdxExt(8)`) recognises the
+    // brief format ONLY, so a FULL-format word reaching the FSM matched no arm of
+    // `fxBaseDisp` and silently degraded to a bare `(An)` -- a WRONG ADDRESS with no
+    // fault, the exact silent-corruption class this file's memory-indirect routing notes
+    // warn about ("anything they do NOT claim must fall through to the fail-safe and
+    // TRAP, not be handed to a chain that will compute the wrong address"). Excluding it
+    // here routes it to the pre-existing F-line trap instead. This is a HARDENING, not
+    // the memory-indirect feature: FMOVEM.X is an FSM, not a microcode family, so giving
+    // it real full-format/memory-indirect support is separate work. Measured ROM
+    // exposure is zero -- the Q700 FP package has no FMOVEM.X with a full-format EA.
     val s0IsFpGenMemEa = (s0opw(15 downto 9) === B"7'b1111001") && (s0opw(8 downto 6) === B"3'b000") &&
                          ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101") ||
                           (s0FpGenEaMode === B"3'b011") || (s0FpGenEaMode === B"3'b100") ||
-                          (s0FpGenEaMode === B"3'b110") || s0FpEaIsAbsPc)
+                          ((s0FpGenEaMode === B"3'b110") && !s0pkt.words(2)(8)) || s0FpEaIsAbsPc)
     // The real ext word (`words(1)`, right after the opword — mirrors `movemEntryPkt`'s own
     // `eMask = words(1)` layout, and `ucFpExt`'s identical positioning): opclass[15:13] (110
     // load / 111 store — store is task #242, so only 110 is admitted here), bit[11] = static
