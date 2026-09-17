@@ -1,7 +1,7 @@
 package m68k040.rename
 
 import m68k040.decode.DecodedUop
-import m68k040.services.DecodeUopService
+import m68k040.services.{BranchPredRec, DecodeUopService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -21,6 +21,11 @@ class DecodeUopSourcePlugin extends FiberPlugin with DecodeUopService {
     src.payload.foreach(in(_))
     src.ready.simPublic()
     val s1v = in Bool ()
+    // Branch-prediction side channel (DecodeUopService.uopPred): this plugin REPLACES
+    // DecodeStage, so there is no side table -- drive the inert record. Tests that care
+    // about prediction verification drive RenamedUop directly at the EU instead.
+    val pred = Vec(BranchPredRec(), 2)
+    pred.foreach(_.setInert())
     val flush = False
     val resume = Flow(UInt(32 bits))
     resume.valid   := False
@@ -29,6 +34,7 @@ class DecodeUopSourcePlugin extends FiberPlugin with DecodeUopService {
 
   override def uops: Stream[Vec[DecodedUop]] = logic.src
   override def uop1Valid: Bool               = logic.s1v
+  override def uopPred: Vec[BranchPredRec]   = logic.pred
   override def pipeFlush: Bool               = logic.flush
   // No DecodeStage here (this plugin REPLACES it), so there is no FP wide-immediate side
   // table to reclaim: tie the backend squash to the same inert wire as the frontend one.

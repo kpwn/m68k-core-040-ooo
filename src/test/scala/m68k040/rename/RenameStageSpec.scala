@@ -36,7 +36,7 @@ class RenameStageSpec extends AnyFunSuite {
   ): Unit = {
     u.valid        #= valid
     u.pc           #= 0
-    u.nextPc       #= 0
+    u.lenWords     #= 0
     u.op           #= op
     u.cluster      #= Cluster.INT
     u.size         #= Size.LONG
@@ -48,7 +48,7 @@ class RenameStageSpec extends AnyFunSuite {
     u.writesNzvc   #= writesNzvc; u.writesX #= writesX
     u.isBranch     #= isBranch
     u.cond         #= cond
-    u.branchDisp   #= 0
+
     u.unimplemented#= false
   }
 

@@ -88,7 +88,7 @@ class IqSourcePlugin extends FiberPlugin {
       // is a value every spec already drives. Lets a test exercise issue port 2.
       u.isBranch     := (io.cluster === m68k040.isa.Cluster.EA)
       u.cond         := 0
-      u.branchDisp   := 0
+
       u.unimplemented := False
       u.ibranch := False; u.anInc := 0; u.stkPush := False; u.ccrRestore := False
       u.dstArch      := 0
@@ -131,7 +131,7 @@ class IqSourcePlugin extends FiberPlugin {
       u.psrcC        := 0; u.psrcCValid := False
       u.divSigned    := False; u.div64 := False; u.divIsRem := False
       u.isChk2 := False
-      u.nextPc       := 0
+      u.lenWords     := 0
       u.faulted      := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.isRte        := False; u.isCondTrap := False; u.isScc := False; u.isDbcc := False
       u.sswInstr := False

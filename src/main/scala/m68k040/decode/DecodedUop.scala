@@ -379,7 +379,24 @@ object SysKind extends SpinalEnum {
 case class DecodedUop() extends Bundle {
   val valid        = Bool()
   val pc           = UInt(32 bits)
-  val nextPc       = UInt(32 bits)   // POST-instruction PC = pc + length (all µops of an instr share it)
+  // ── Instruction LENGTH, not the post-PC ─────────────────────────────────────
+  // This used to be a second 32-bit field, `nextPc`. It is REDUNDANT with `pc`: every
+  // construction site in this core computes it as `pkt.pc + (lenWords << 1)` from the
+  // SAME packet whose `pc` lands in the field above --
+  //   MicroOpAssembler.assemble        `nextPc = pkt.pc + (pkt.lenWords << 1)`
+  //   DecodeStage.ucEntryCtx           `pc + (lenWords << 1)`, override `pc + (realLen << 1)`
+  //   DecodeStage MOVEM / FMOVEM FSMs  `ePc + (lenWords << 1)` / `ePc + 6` / `fxPc + (len << 1)`
+  // -- so carrying the 32-bit sum through ~40 decode mux/stash/queue slots, the rename
+  // skid and the IQ cold Mems bought nothing that `pc + len*2` cannot rebuild at the
+  // three places that actually READ it (BranchEuPlugin's fall-through, RobPlugin's two
+  // alloc ports). `lenWords` is the predecode length in WORDS, 4 bits, exactly as it
+  // arrives on DecodePacket; the front end can never present more (DecodePacket.words
+  // is 10 deep and `wordCount` is 1..10, and the one recomputed length,
+  // DecodeStage's `ucMoveRealLenWords`, is gated `<= wordCount`).
+  // A `complex` packet carries lenWords=0 -> nextPc == pc, which is what the 32-bit
+  // field held for that case too: bit-identical, not merely equivalent.
+  // BranchEuPlugin's `btbLen` (= (nextPc-pc)>>1) is now a plain field read.
+  val lenWords     = UInt(4 bits)
   val op           = DecOp()
   val cluster      = Cluster()
   val size         = Size()
@@ -390,6 +407,29 @@ case class DecodedUop() extends Bundle {
   // other µops leave srcCValid=False. Threaded through rename to a 3rd physical source.
   val srcCReg      = UInt(5 bits); val srcCValid = Bool()
   val dstReg       = UInt(5 bits); val dstValid  = Bool()
+  // ── `imm` is a SHARED 32-bit slot with THREE mutually exclusive roles ────────
+  //   (1) useImm=True                       : the ALU/LS/store-data immediate VALUE.
+  //   (2) useImm=False, non-value tag/id     : the FP wide-immediate side-table tag, the
+  //       MOVEC Rc id, the FMOVEM register-list/position word, ... (documented at each
+  //       site; all set useImm=False so no EU reads it as a value).
+  //   (3) isBranch && !ibranch               : the PC-RELATIVE BRANCH DISPLACEMENT.
+  //       The branch EU forms `relTarget = pc + 2 + imm` for Bcc/BRA/BSR/FBcc/DBcc, and
+  //       `indTarget = psrcA + imm + index` for an `ibranch`. `ibranch` IS the selector --
+  //       no extra field is needed, because the two roles are structurally exclusive: a
+  //       µop is either PC-relative or indirect, never both.
+  //       This used to be a SEPARATE 32-bit `branchDisp` field. It rode every decode
+  //       mux/stash/queue slot and every rename/IQ copy for the benefit of ONE adder in
+  //       BranchEuPlugin, and the 2026-09-17 routed census named
+  //       `pushReg_payload_uops_2_branchDisp` (15 endpoints) and `..._2_imm` (24) in the
+  //       SAME failing family. Merged into `imm`.
+  //       SOUNDNESS (checked live by the `relative branch uop must not carry a value
+  //       immediate` assertion in DecodeStage, and by construction here): every builder
+  //       that stamps a displacement -- the `when(spec.isBranch)` Bcc/FBcc block,
+  //       `dbccUop`, and BSR's `bsrBranch` -- leaves useImm=False and has no operand-
+  //       immediate of its own (Bcc/FBcc/BSR decode srcA/srcB/dst as NONE; DBcc drives
+  //       useImm=False explicitly). The two isBranch µops that DO reach the EU without a
+  //       displacement, Scc and TRAPcc/TRAPV (isCondTrap), have `redirect` forced False
+  //       there, so `relTarget` is never consulted for them at all.
   val useImm       = Bool();       val imm       = Bits(32 bits)
   val readsNzvc    = Bool();       val readsX    = Bool()
   val writesNzvc   = Bool();       val writesX   = Bool()
@@ -420,7 +460,6 @@ case class DecodedUop() extends Bundle {
   // train the BTB/FTB with the popped return address. Default False.
   val isReturn     = Bool()
   val cond         = Bits(4 bits)
-  val branchDisp   = Bits(32 bits)
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` marks this µop as raising
   // a synchronous fault at retire; `faultVector` is the m68k exception vector
@@ -729,22 +768,26 @@ case class DecodedUop() extends Bundle {
   val sysOp        = Bool()
   val sysKind      = SysKind()
   val sysReadDir   = Bool()
-  // ── Fetch-time branch prediction carry-down (BTB + bimodal, slice 1) ─────────
-  // predTaken : this µop's instruction was predicted-taken at fetch (the front-end
-  //   redirected to predTarget on its behalf). predTarget : the redirected-to target
-  //   (meaningful iff predTaken). Both ride DecodePacket -> here -> RenamedUop ->
-  //   IqContext -> branch EU `u1`, where the branch EU computes mispredict =
-  //   (predTaken != actualTaken) || (actualTaken && actualTarget != predTarget).
-  //   Every builder defaults these to False/0 (non-branch / not-predicted); the
-  //   DecodeStage choke point STAMPS the real fetch-time values onto a packet's µops.
-  val predTaken    = Bool()
-  val predTarget   = UInt(32 bits)
-  // ── gshare direction-predictor carry-down (slice 3) ─────────────────────────
-  // phtValid : a CONDITIONAL gshare-predicted branch carrying its fetch-time 11-bit
-  //   folded-XOR `phtIndex` to retire (the ROB trains pht[phtIndex] := saturate±1
-  //   (actualTaken)). Non-conditional / not-gshare-predicted µops carry phtValid=False.
-  val phtValid     = Bool()
-  val phtIndex     = UInt(11 bits)
+  // ── Fetch-time branch prediction: a SIDE-CHANNEL TAG, not the record ────────
+  // This used to be four fields -- predTaken(1), predTarget(32), phtValid(1),
+  // phtIndex(11) = 45 bits -- stamped identically onto EVERY uop of a macro and read by
+  // exactly ONE consumer, BranchEuPlugin's predicted-vs-actual check (`mispredict =
+  // (predTaken != actualTaken) || (actualTaken && actualTarget != predTarget)`, plus the
+  // {phtValid, phtIndex} pair it forwards to the ROB's gshare training).
+  //
+  // 45 bits x (11 decode mux sources -> 4 push slots -> 3 stash slots -> 16 MicroOpQueue
+  // entries) is what the 2026-09-17 routed census saw as the `pushReg_payload_uops_*` /
+  // `stashUops_*` failing-endpoint family. The record now lives in a DecodeStage-owned
+  // Global.BR_PRED_TABLE_DEPTH x 45b distributed RAM and the uop carries only this tag;
+  // DecodeStage re-expands it at the MicroOpQueue POP boundary, so `RenamedUop`, the IQ
+  // and the branch EU are UNCHANGED -- they still see the four fields.
+  //
+  // 0 = inert (no prediction). That is the value every non-assembler builder drives, which
+  // is bit-identical to the `predTaken := False` those builders drove before: the MOVEM /
+  // MOVEP / FMOVEM.X / microcode-engine uops were never stamped with a packet prediction.
+  // See Global.BR_PRED_TABLE_DEPTH for the tag-reuse bound and the sim assertion that
+  // enforces it.
+  val brPredTag    = UInt(m68k040.Global.BR_PRED_TAG_W bits)
   // ── CAS/CAS2 compute sub-form (DecOp.CASOP) ─────────────────────────────────
   // Selects which CAS/CAS2 compute kernel this µop runs in the ALU EU. The two
   // address-loaded operands ride srcA (= the loaded memory value, T0/T1) and srcB
@@ -808,6 +851,11 @@ case class DecodedUop() extends Bundle {
   // Global.FP_IMM_TABLE_DEPTH-entry side table and the uop carries only the entry TAG in
   // `imm[Global.FP_IMM_TAG_W-1:0]` -- legal because these rows set useImm=False (`imm`
   // stays reserved for FMOVECR's ROM offset, which is a DIFFERENT fpSrcKind, ROMCONST).
+
+  /** POST-instruction PC (`pc + lenWords*2`) -- the architectural fall-through / commit
+    * PC. DERIVED, not stored: each call builds one 32-bit adder, so read it once per
+    * consumer and reuse the result (there are three consumers in the whole core). */
+  def nextPc: UInt = (pc + (lenWords << 1)).resize(32)
 
   /** Drive every FP field to its inert (non-FP-uop) default. Called by every
     * DecodedUop construction site that is not building an FP uop -- SpinalHDL requires

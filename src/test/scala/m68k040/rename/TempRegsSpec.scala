@@ -35,7 +35,7 @@ class TempRegsSpec extends AnyFunSuite {
   ): Unit = {
     u.valid        #= valid
     u.pc           #= 0
-    u.nextPc       #= 0
+    u.lenWords     #= 0
     u.op           #= op
     u.cluster      #= Cluster.INT
     u.size         #= Size.LONG
@@ -48,7 +48,7 @@ class TempRegsSpec extends AnyFunSuite {
     u.writesNzvc   #= false;  u.writesX #= false
     u.isBranch     #= false
     u.cond         #= 0
-    u.branchDisp   #= 0
+
     u.unimplemented#= false
   }
 

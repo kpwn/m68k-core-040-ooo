@@ -158,13 +158,13 @@ class FpuProtocolSpec extends AnyFunSuite {
       // Drive EVERY RenamedUop field: a newly-consumed field must fail deterministically
       // rather than turn this into a netlist-dependent test (CplxMulPipelineSpec's rule).
       uop.valid := iValid
-      uop.pc := U(0x2000, 32 bits); uop.nextPc := U(0x2004, 32 bits)
+      uop.pc := U(0x2000, 32 bits); uop.lenWords := 2
       uop.op := DecOp.FPU
       uop.cluster := Cluster.CPLX
       uop.size := Size.LONG
       uop.memOp := MemOp.NONE
       uop.useImm := False; uop.imm := 0
-      uop.isBranch := False; uop.cond := 0; uop.branchDisp := 0
+      uop.isBranch := False; uop.cond := 0
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False
       uop.eaAuto := EaAuto.NONE; uop.eaDelta := 0
       uop.ccrRestore := False; uop.toCcr := False; uop.unimplemented := False

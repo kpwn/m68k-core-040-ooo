@@ -1,7 +1,7 @@
 package m68k040.decode
 
 import m68k040.frontend.{DecodePacket, PipeStage}
-import m68k040.services.{DecodeFeedService, DecodeUopService, FpImmTableService, FrontendDebugMatchService}
+import m68k040.services.{BranchPredRec, DecodeFeedService, DecodeUopService, FpImmTableService, FrontendDebugMatchService}
 import m68k040.Global
 import m68k040.isa.Size
 import spinal.core._
@@ -22,7 +22,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * chained 1-deep `PipeStage`s (`raw` then `fedIn`→`fed`; the first was added by
   * FMax Frontend Lever C — see the `RawPacket` comment below). This SPLITS the
   * standing route-dominated critical arc
-  * `ibuf.count → Aligner predicated-length/branchDisp select → MicroOpQueue ring
+  * `ibuf.count → Aligner predicated-length/branch-displacement select → MicroOpQueue ring
   * write-enable` into two shorter halves: (1) `ibuf.count → Aligner → fedStage
   * register`, and (2) `fedStage register → MicroOpAssembler → queue ring`. The
   * decode is LATENCY-AGNOSTIC (whitebox lock-step joins by robId, the MicroOpQueue
@@ -500,6 +500,47 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       }
     }
 
+    // ── Fetch-time branch-prediction side table (Global.BR_PRED_TABLE_DEPTH) ────
+    // Sibling of `fpImmTable` above, and deliberately MUCH simpler: no free list, no
+    // domain tracking, no stall. The 45 prediction bits are a property of the fetch SLOT,
+    // not of a uop, so the tag is allocated once per predicted packet in FetchAlignPlugin
+    // and the write here is IDEMPOTENT -- the same address and the same data for however
+    // many cycles that packet sits in `fed` (held by a stash replay, a MOVEM/µcode FSM, or
+    // back-pressure), so "write whenever the packet is present" needs no edge detection.
+    //
+    // Nothing is ever freed, and nothing needs to be: entry 0 is the reserved inert record
+    // (never written, never allocated) and every other entry is simply overwritten the
+    // next time the wrapping counter reaches it. Correctness rests on that counter not
+    // lapping a LIVE entry, which Global.BR_PRED_TABLE_DEPTH proves and the assertion
+    // below checks live.
+    //
+    // A flush needs no reclamation either: a squashed uop never pops, so its entry is
+    // simply never read.
+    val brPredTable = new Area {
+      val depth = Global.BR_PRED_TABLE_DEPTH
+      val inert = BranchPredRec(); inert.setInert()
+      val recW  = inert.getBitsWidth
+      val mem   = Mem(Bits(recW bits), depth)
+      mem.addAttribute("ram_style", "distributed")
+
+      val wrPkt  = fed.payload.packets(0)
+      val wrTag  = wrPkt.brPredTag
+      val wrRec  = BranchPredRec()
+      wrRec.predTaken := wrPkt.predTaken; wrRec.predTarget := wrPkt.predTarget
+      wrRec.phtValid  := wrPkt.phtValid;  wrRec.phtIndex   := wrPkt.phtIndex
+      mem.write(address = wrTag, data = wrRec.asBits, enable = fed.valid && (wrTag =/= 0))
+
+      /** Expand a popped uop's tag back into the record rename expects. */
+      def expand(tag: UInt): BranchPredRec = {
+        val r = BranchPredRec()
+        val rd = BranchPredRec()
+        rd.assignFromBits(mem.readAsync(tag))
+        when(tag === 0) { r.setInert() } otherwise { r := rd }
+        r
+      }
+
+    }
+
     // Head instruction this cycle: the stashed slot1 (registered uops) else slot0 (a0).
     val nCur = Mux(stashValid, stashCount, a0.count)       // 1..3
     val n1   = Mux(slot1Emit, a1raw.count, U(0, 2 bits))   // slot1 µops (0 if not emitted)
@@ -574,7 +615,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movemOff      = Reg(SInt(32 bits))     // running byte offset for the NEXT element's address
     val movemEmitted  = Reg(UInt(5 bits))      // elements emitted so far (for the final An delta count)
     val movemPc       = Reg(UInt(32 bits))
-    val movemNextPc   = Reg(UInt(32 bits))
+    // Instruction LENGTH in words for the whole MOVEM macro (was a 32-bit `movemNextPc`;
+    // see DecodedUop.lenWords). Brief-indexed MOVEM is a FIXED 3 words (opword+mask+ext).
+    val movemLenWords = Reg(UInt(4 bits))
     val movemAnUpdPhase = RegInit(False)       // mask drained -> drive the single final An update
     when(pipeFlush) { movemActive := False; movemAnUpdPhase := False }
     // Total element count (task movem-translate-ahead): popcount of the WHOLE mask,
@@ -671,12 +714,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movemUop0 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg0), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm0,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = movemFirst0, last = movemLast0, drop = movemHasFinal,
-      valid = True, pc = movemPc, nextPc = movemNextPc, probeCount = movemProbeCount,
+      valid = True, pc = movemPc, lenWords = movemLenWords, probeCount = movemProbeCount,
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     val movemUop1 = MicroOpAssembler.movemMoveUop(
       reg = movemLoadDst(movemReg1), base = movemBaseReg, baseValid = movemBaseValid, disp = movemImm1,
       sizeLong = movemSizeLong, isLoad = movemIsLoad, first = False, last = movemLast1, drop = movemHasFinal,
-      valid = True, pc = movemPc, nextPc = movemNextPc, probeCount = U(0, 5 bits),
+      valid = True, pc = movemPc, lenWords = movemLenWords, probeCount = U(0, 5 bits),
       idxReg = movemIdxReg, idxValid = movemIdxValid, idxLong = movemIdxLong, idxScale = movemIdxScale)
     // The final An update (kept macro commit): An := An + emitted*step for (An)+/-(An)
     // (movemStep carries the sign), or An := An + 0 for the control (An)/(d16,An) modes
@@ -699,7 +742,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movemAnDelta = Mux(movemDoAnUpd, movemSignedDelta, S(0, 32 bits))
     val movemAnUop = MicroOpAssembler.movemAnUpdUop(
       an = movemAnReg, signedDelta = movemAnDelta,
-      valid = True, pc = movemPc, nextPc = movemNextPc)
+      valid = True, pc = movemPc, lenWords = movemLenWords)
     // Base/index SNAPSHOT µop (task #200): `T0 := movemBaseReg` (control-mode base) or
     // `T1 := movemIdxReg` ((d8,PC,Xn) index) — see `movemSnapUop`'s doc. movemBaseReg/
     // movemIdxReg still hold the REAL architectural id at this point (redirected to the
@@ -707,7 +750,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movemSnapDst = Mux(movemSnapIsIdx, U(MicroOpAssembler.T1, 5 bits), U(MicroOpAssembler.T0, 5 bits))
     val movemSnapSrc = Mux(movemSnapIsIdx, movemIdxReg, movemBaseReg)
     val movemSnapUop = MicroOpAssembler.movemSnapUop(
-      dst = movemSnapDst, src = movemSnapSrc, valid = True, pc = movemPc, nextPc = movemNextPc)
+      dst = movemSnapDst, src = movemSnapSrc, valid = True, pc = movemPc, lenWords = movemLenWords)
 
     // ── MOVEM entry detection (slot0 directly, or a slot1 MOVEM stashed as a packet) ──
     // OperationDecoder marks MOVEM via spec.movem; re-decode the head packet's opword to
@@ -1132,7 +1175,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val movepAy        = Reg(UInt(5 bits))     // the base address register (8 + op[2:0])
     val movepDisp      = Reg(Bits(32 bits))    // sign-extended disp16 (EA = Ay + disp)
     val movepPc        = Reg(UInt(32 bits))
-    val movepNextPc    = Reg(UInt(32 bits))
+    // Instruction LENGTH in words for the whole MOVEP macro (was `movepNextPc`;
+    // see DecodedUop.lenWords).
+    val movepLenWords  = Reg(UInt(4 bits))
     when(pipeFlush) { movepActive := False }
 
     // MOVEP entry: a pending slot1 MOVEP (movepPendValid), else slot0. Decode Dx/Ay/disp16.
@@ -1147,7 +1192,6 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val mpDir    = mpOpw(7)                                          // 1 = reg->mem
     val mpSizeL  = mpOpw(6)                                          // 1 = .L
     val mpPc     = movepEntryPkt.pc
-    val mpNextPc = (mpPc + (movepEntryPkt.lenWords << 1)).resize(32) // = pc + 4 (opword + disp16)
 
     // Begin a MOVEP: a pending slot1 one, OR a slot0 MOVEP (not blocked by a stash/replay),
     // while the MOVEP FSM AND the MOVEM/µcode sequencers are all idle.
@@ -1168,25 +1212,25 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val T0 = MicroOpAssembler.T0; val T1 = MicroOpAssembler.T1
     // Default (overwritten by the per-variant/step switches below): the final move
     // placeholder (also the natural step for the mem->reg last step).
-    movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1, 5 bits), movepDx, movepPc, movepNextPc)
+    movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1, 5 bits), movepDx, movepPc, movepLenWords)
     when(movepDirReg) {
       when(movepSizeLong) {
         // reg->mem .L : 7 steps (3 shift+store pairs + the position-0 store of Dx).
         switch(movepStep) {
-          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 24, dirLeft=false, first=true,  movepPc, movepNextPc); movepLast := False }
-          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
-          is(2) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 16, dirLeft=false, first=false, movepPc, movepNextPc); movepLast := False }
-          is(3) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
-          is(4) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits),  8, dirLeft=false, first=false, movepPc, movepNextPc); movepLast := False }
-          is(5) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(4), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
-          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(6), movepDx, keep=true, first=false, movepPc, movepNextPc); movepLast := True }   // step 6
+          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 24, dirLeft=false, first=true,  movepPc, movepLenWords); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepLenWords); movepLast := False }
+          is(2) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 16, dirLeft=false, first=false, movepPc, movepLenWords); movepLast := False }
+          is(3) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), U(T1,5 bits), keep=false, first=false, movepPc, movepLenWords); movepLast := False }
+          is(4) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits),  8, dirLeft=false, first=false, movepPc, movepLenWords); movepLast := False }
+          is(5) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(4), U(T1,5 bits), keep=false, first=false, movepPc, movepLenWords); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(6), movepDx, keep=true, first=false, movepPc, movepLenWords); movepLast := True }   // step 6
         }
       } otherwise {
         // reg->mem .W : 3 steps (LSR Dx>>8 -> T1 ; STORE T1 ; STORE Dx (keep)).
         switch(movepStep) {
-          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 8, dirLeft=false, first=true,  movepPc, movepNextPc); movepLast := False }
-          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepNextPc); movepLast := False }
-          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), movepDx, keep=true, first=false, movepPc, movepNextPc); movepLast := True }   // step 2
+          is(0) { movepUop := MicroOpAssembler.movepShiftUop(movepDx, U(T1,5 bits), 8, dirLeft=false, first=true,  movepPc, movepLenWords); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(0), U(T1,5 bits), keep=false, first=false, movepPc, movepLenWords); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepStoreUop(movepAy, mpDispK(2), movepDx, keep=true, first=false, movepPc, movepLenWords); movepLast := True }   // step 2
         }
       }
     } otherwise {
@@ -1196,30 +1240,30 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         //  5 LOAD[ea+4]->T0 ; 6 LSL T0<<8->T0 ; 7 OR T1|T0->T1 ; 8 LOAD[ea+6]->T0 ; 9 OR T1|T0->T1 ;
         // 10 MOVE T1->Dx (keep).
         switch(movepStep) {
-          is(0)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=true,  movepPc, movepNextPc); movepLast := False }
-          is(1)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T1,5 bits), 24, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
-          is(2)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepNextPc); movepLast := False }
-          is(3)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 16, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
-          is(4)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
-          is(5)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(4), first=false, movepPc, movepNextPc); movepLast := False }
-          is(6)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits),  8, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
-          is(7)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
-          is(8)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(6), first=false, movepPc, movepNextPc); movepLast := False }
-          is(9)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
-          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepNextPc); movepLast := True }   // step 10
+          is(0)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=true,  movepPc, movepLenWords); movepLast := False }
+          is(1)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T1,5 bits), 24, dirLeft=true, first=false, movepPc, movepLenWords); movepLast := False }
+          is(2)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepLenWords); movepLast := False }
+          is(3)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 16, dirLeft=true, first=false, movepPc, movepLenWords); movepLast := False }
+          is(4)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepLenWords); movepLast := False }
+          is(5)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(4), first=false, movepPc, movepLenWords); movepLast := False }
+          is(6)  { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits),  8, dirLeft=true, first=false, movepPc, movepLenWords); movepLast := False }
+          is(7)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepLenWords); movepLast := False }
+          is(8)  { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(6), first=false, movepPc, movepLenWords); movepLast := False }
+          is(9)  { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepLenWords); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepLenWords); movepLast := True }   // step 10
         }
       } otherwise {
         // mem->reg .W : 7 steps. Preserve Dx[31:16] via AND mask into T1, assemble low word.
         //  0 AND Dx & 0xFFFF0000 -> T1 ; 1 LOAD[ea]->T0 ; 2 LSL T0<<8->T0 ; 3 OR T1|T0->T1 ;
         //  4 LOAD[ea+2]->T0 ; 5 OR T1|T0->T1 ; 6 MOVE T1->Dx (keep, full write).
         switch(movepStep) {
-          is(0) { movepUop := MicroOpAssembler.movepAndMaskUop(movepDx, U(T1,5 bits), 0xFFFF0000L, first=true, movepPc, movepNextPc); movepLast := False }
-          is(1) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=false, movepPc, movepNextPc); movepLast := False }
-          is(2) { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 8, dirLeft=true, first=false, movepPc, movepNextPc); movepLast := False }
-          is(3) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
-          is(4) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepNextPc); movepLast := False }
-          is(5) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepNextPc); movepLast := False }
-          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepNextPc); movepLast := True }   // step 6
+          is(0) { movepUop := MicroOpAssembler.movepAndMaskUop(movepDx, U(T1,5 bits), 0xFFFF0000L, first=true, movepPc, movepLenWords); movepLast := False }
+          is(1) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(0), first=false, movepPc, movepLenWords); movepLast := False }
+          is(2) { movepUop := MicroOpAssembler.movepShiftUop(U(T0,5 bits), U(T0,5 bits), 8, dirLeft=true, first=false, movepPc, movepLenWords); movepLast := False }
+          is(3) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepLenWords); movepLast := False }
+          is(4) { movepUop := MicroOpAssembler.movepLoadUop(movepAy, mpDispK(2), first=false, movepPc, movepLenWords); movepLast := False }
+          is(5) { movepUop := MicroOpAssembler.movepOrUop(U(T1,5 bits), U(T0,5 bits), U(T1,5 bits), movepPc, movepLenWords); movepLast := False }
+          default { movepUop := MicroOpAssembler.movepFinalMoveUop(U(T1,5 bits), movepDx, movepPc, movepLenWords); movepLast := True }   // step 6
         }
       }
     }
@@ -1261,7 +1305,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fmovemxOff      = Reg(SInt(32 bits))   // running byte offset for the CURRENT element (12 bytes/elt Extended, always ascending -- neither admitted EA mode auto-updates)
     val fmovemxEmitted  = Reg(UInt(4 bits))    // elements emitted so far (0..8)
     val fmovemxPc       = Reg(UInt(32 bits))
-    val fmovemxNextPc   = Reg(UInt(32 bits))
+    // Instruction LENGTH in words for the whole FMOVEM.X macro (was `fmovemxNextPc`).
+    val fmovemxLenWords = Reg(UInt(4 bits))
     // 3 bits (2026-09-10, store direction): a LOAD element is 4 phases (0/1/2 = chunk
     // loads into T0/T1/T2, 3 = the FP issue row); a STORE element is 6 (0/1/2 = the
     // FPSTORECVT rows that narrow FPn into T0/T1/T2, 3/4/5 = the three chunk stores).
@@ -1331,12 +1376,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fmovemxFirstUop = (fmovemxEmitted === 0) && (fmovemxPhase === U(0, 3 bits))
     val fmovemxLoadUop  = MicroOpAssembler.fmovemxLoadChunkUop(
       base = fmovemxBaseReg, baseValid = fmovemxBaseValid, disp = fmovemxLoadDisp, dstTemp = fmovemxLoadTemp,
-      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc,
+      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, lenWords = fmovemxLenWords,
       idxReg = fmovemxIdxReg, idxValid = fmovemxIdxValid, idxLong = fmovemxIdxLong, idxScale = fmovemxIdxScale)
     val fmovemxIssueKept = fmovemxIsLastElem && !fmovemxHasFinal
     val fmovemxIssueUopV = MicroOpAssembler.fmovemxIssueUop(
       fpDst = fmovemxCurReg, drop = !fmovemxIssueKept, first = False, last = fmovemxIssueKept, valid = True,
-      pc = fmovemxPc, nextPc = fmovemxNextPc)
+      pc = fmovemxPc, lenWords = fmovemxLenWords)
     // STORE element: [FPSTORECVT x3] then [STORE x3]. The macro's kept commit is the
     // LAST store of the LAST element -- a store direction has no trailing FP issue row to
     // carry it, unlike the load.
@@ -1345,14 +1390,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fmovemxStIsLastUop = fmovemxIsLastElem && (fmovemxPhase === U(5, 3 bits)) && !fmovemxHasFinal
     val fmovemxAnUpdUopV   = MicroOpAssembler.movemAnUpdUop(
       an = fmovemxBaseReg, signedDelta = fmovemxDelta, valid = True,
-      pc = fmovemxPc, nextPc = fmovemxNextPc)
+      pc = fmovemxPc, lenWords = fmovemxLenWords)
     val fmovemxCvtUopV = MicroOpAssembler.fmovemxStoreCvtUop(
       fpSrc = fmovemxCurReg, chunk = fmovemxCvtChunk, dstTemp = fmovemxLoadTemp,
-      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, nextPc = fmovemxNextPc)
+      first = fmovemxFirstUop, valid = True, pc = fmovemxPc, lenWords = fmovemxLenWords)
     val fmovemxStUopV = MicroOpAssembler.fmovemxStoreChunkUop(
       base = fmovemxBaseReg, baseValid = fmovemxBaseValid, disp = fmovemxStDisp, srcTemp = fmovemxStTemp,
       drop = !fmovemxStIsLastUop, last = fmovemxStIsLastUop, first = False, valid = True,
-      pc = fmovemxPc, nextPc = fmovemxNextPc,
+      pc = fmovemxPc, lenWords = fmovemxLenWords,
       idxReg = fmovemxIdxReg, idxValid = fmovemxIdxValid, idxLong = fmovemxIdxLong, idxScale = fmovemxIdxScale)
     val fmovemxElemUop = Mux(fmovemxIsStore,
       Mux(fmovemxPhase >= U(3, 3 bits), fmovemxStUopV, fmovemxCvtUopV),
@@ -1519,6 +1564,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     ucEntryCtx.opword       := ucEntryPkt.words(0)
     ucEntryCtx.pc           := ucEntryPkt.pc
     ucEntryCtx.nextPc       := (ucEntryPkt.pc + (ucEntryPkt.lenWords << 1)).resize(32)
+    ucEntryCtx.lenWords     := ucEntryPkt.lenWords
     ucEntryCtx.op           := ucEntrySpec.op
     ucEntryCtx.bcdSub       := ucEntrySpec.bcdSub
     ucEntryCtx.size         := ucEntrySpec.size
@@ -1987,7 +2033,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // currently-passing `complex` case observed in this corpus had wordCount==10 (the full
     // window, comfortably >= any real length).
     val ucMoveLenKnown = ucMoveRealLenWords <= ucEntryPkt.wordCount.resize(5)
-    when(ucIsMove && ucMoveLenKnown) { ucEntryCtx.nextPc := ucMoveRealNextPc }
+    when(ucIsMove && ucMoveLenKnown) {
+      ucEntryCtx.nextPc   := ucMoveRealNextPc
+      // `ucMoveRealLenWords` is 5 bits but gated `<= wordCount` (<= 10) right above, so
+      // the 4-bit uop field never truncates a value this override can actually apply.
+      ucEntryCtx.lenWords := ucMoveRealLenWords.resize(4)
+    }
     // FetchAlignPlugin permanently stalls fetch after emitting a genuinely `complex` packet
     // until its `resume` port fires -- but NOTHING in this codebase drives that port (a
     // previous investigation of indexed MOVEM hit the identical gap and worked around it by
@@ -2820,6 +2871,29 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       }
     }
     _debugSkipConsumed := RegNext(debugSkipConsumeNow) init 0
+
+    // ── `imm` role-exclusivity invariants (sim-only) ────────────────────────────
+    // `imm` is a shared slot (see DecodedUop.imm). Two of its roles are decided by
+    // `ibranch` alone, with NO selector bit of their own, so the merge is only sound
+    // while the roles stay structurally exclusive. Both directions are checked here, on
+    // every uop entering the MicroOpQueue -- the one choke point every builder
+    // (assembler, microcode engine, MOVEM/FMOVEM/MOVEP FSMs) passes through.
+    //
+    //   1. A relative branch that can actually REDIRECT reads `imm` as its displacement
+    //      (`relTarget = pc + 2 + imm`), so it must not also carry a value immediate.
+    //      Scc and TRAPcc/TRAPV are excluded: BranchEuPlugin forces `redirect` False for
+    //      them, so `relTarget` is never consulted on those uops.
+    //   2. An `ibranch` reads `imm` as its EA displacement; it must never be marked as a
+    //      PC-relative branch at the same time (that would be a mux with two live inputs).
+    GenerationFlags.simulation {
+      for (i <- 0 until 4) {
+        val u = pushReg.payload.uops(i)
+        val live = pushReg.valid && (U(i, 3 bits) < pushReg.payload.count)
+        assert(!(live && u.isBranch && !u.ibranch && !u.isScc && !u.isCondTrap && u.useImm),
+          "relative branch uop must not carry a value immediate (imm is its displacement)")
+      }
+    }
+
     queue.io.push.valid := pushReg.valid
     queue.io.push.count := pushReg.payload.count
     queue.io.push.uops  := pushOut
@@ -3009,7 +3083,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       // indexed shape — override with the real 3-word length here (mirrors
       // `ucMoveRealNextPc`'s override of `ucEntryCtx.nextPc` for the analogous mem-indirect-
       // MOVE blackout).
-      movemNextPc   := Mux(eIdxPresent, movemPcIdxRealNextPc, eNextPc)
+      movemLenWords := Mux(eIdxPresent, U(3, 4 bits), movemEntryPkt.lenWords)
       // A pending slot1 MOVEM is now being consumed by this entry.
       when(movemPendValid) { movemPendValid := False }
       // Entering a slot0 MOVEM: STASH its slot1 (if any) so it is not lost when `fed` is
@@ -3131,7 +3205,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       fmovemxOff      := S(0, 32 bits)
       fmovemxEmitted  := 0
       fmovemxPc       := fxPc
-      fmovemxNextPc   := fxNextPc
+      fmovemxLenWords := fxEntryPkt.lenWords
       fmovemxPhase    := U(0, 3 bits)
       fmovemxCurReg   := fmovemxMapBit(fxBit0, fxRevIn)
       // Entering a slot0 fmovemx op: STASH its slot1 (if any) so it is not lost when `fed`
@@ -3306,7 +3380,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       movepAy       := mpAy
       movepDisp     := mpDisp
       movepPc       := mpPc
-      movepNextPc   := mpNextPc
+      movepLenWords := movepEntryPkt.lenWords
       // A pending slot1 MOVEP is now consumed by this entry.
       when(movepPendValid) { movepPendValid := False }
       // Entering a slot0 MOVEP: STASH its slot1 (if any) so it is not lost when `fed` is
@@ -3392,10 +3466,50 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // ── Rename-facing output ───────────────────────────────────────────────────
     val uopsOut = queue.io.pop
     val uop1Sig = queue.io.pop1Valid
+    // Re-expand each popped uop's branch-prediction tag into the record rename copies onto
+    // `RenamedUop` (which still carries the four fields verbatim, so rename, the IQ, the
+    // ROB and the branch EU are all unchanged by the decode-side narrowing).
+    val uopPredOut = Vec(BranchPredRec(), 2)
+    for (k <- 0 until 2) uopPredOut(k) := brPredTable.expand(uopsOut.payload(k).brPredTag)
+
+    // ── Branch-prediction tag-reuse watchdog (SIM ONLY) ────────────────────────
+    // The ONE way the side-channel could be silently wrong is the wrapping tag counter in
+    // FetchAlignPlugin lapping an entry whose uops have not popped yet: a branch would
+    // then verify itself against ANOTHER branch's predicted target and could conclude
+    // "correctly predicted" for a wrong-path fetch. Global.BR_PRED_TABLE_DEPTH argues that
+    // cannot happen (at most ~23 macros are ever live between `feed.fire` and the pop, and
+    // only PREDICTED ones allocate, against 63 usable tags). This turns that argument into
+    // a live check, so a future change that breaks the bound STOPS the simulation instead
+    // of corrupting one branch in a million.
+    //
+    // `allocSeq` counts ALLOCATIONS, not cycles: the table write is idempotent while a
+    // packet is merely being held in `fed`, and `wrTag =/= prevTag` filters those out.
+    GenerationFlags.simulation {
+      val depth    = brPredTable.depth
+      val wrTag    = brPredTable.wrTag
+      val allocSeq = Reg(UInt(32 bits)) init 0
+      val seqAtWr  = Vec.fill(depth)(Reg(UInt(32 bits)) init 0)
+      val prevTag  = Reg(UInt(Global.BR_PRED_TAG_W bits)) init 0
+      val wrFire   = fed.valid && (wrTag =/= 0) && (wrTag =/= prevTag)
+      when(fed.valid) { prevTag := wrTag }
+      when(wrFire) {
+        allocSeq := allocSeq + 1
+        for (e <- 0 until depth) {
+          when(wrTag === U(e, Global.BR_PRED_TAG_W bits)) { seqAtWr(e) := allocSeq + 1 }
+        }
+      }
+      def assertFresh(tag: UInt, live: Bool): Unit =
+        assert(!(live && (tag =/= 0) && ((allocSeq - seqAtWr(tag)) >= U(depth - 1, 32 bits))),
+          "BrPredTable: a popped uop read an entry older than the whole table -- the " +
+          "wrapping tag counter lapped a LIVE prediction record (see Global.BR_PRED_TABLE_DEPTH)")
+      assertFresh(uopsOut.payload(0).brPredTag, uopsOut.valid)
+      assertFresh(uopsOut.payload(1).brPredTag, uopsOut.valid && uop1Sig)
+    }
   }
 
   override def uops: Stream[Vec[DecodedUop]] = logic.uopsOut
   override def uop1Valid: Bool               = logic.uop1Sig
+  override def uopPred: Vec[m68k040.services.BranchPredRec] = logic.uopPredOut
   override def pipeFlush: Bool               = logic.pipeFlush
   override def backendFlush: Bool            = _backendFlush
   override def fpImmRdAddr: UInt             = _fpImmRdAddr

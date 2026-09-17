@@ -108,7 +108,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       // into a netlist-dependent test.
       uop.valid := iValid
       uop.pc := U(0x2000, 32 bits)
-      uop.nextPc := U(0x2002, 32 bits)
+      uop.lenWords := 1
       uop.op := iOp
       uop.cluster := Cluster.CPLX
       uop.size := iSize
@@ -117,7 +117,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       uop.imm := 0
       uop.isBranch := False
       uop.cond := 0
-      uop.branchDisp := 0
+
       uop.ibranch := False
       uop.anInc := 0
       uop.stkPush := False

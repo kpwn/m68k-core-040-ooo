@@ -67,7 +67,7 @@ class FpCommitPathSpec extends AnyFunSuite {
   ): Unit = {
     u.valid #= true
     u.pc #= pc
-    u.nextPc #= pc + 4
+    u.lenWords #= 2
     u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.CPLX
@@ -79,7 +79,7 @@ class FpCommitPathSpec extends AnyFunSuite {
     u.useImm #= false; u.imm #= 0
     u.readsNzvc #= false; u.readsX #= false
     u.writesNzvc #= false; u.writesX #= false
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.sysOp #= false; u.sysKind #= m68k040.decode.SysKind.NONE; u.sysReadDir #= false
@@ -370,10 +370,10 @@ class FpCommitPathSpec extends AnyFunSuite {
       def pokeRu(u: m68k040.rename.RenamedUop, pc: Long,
                  fpDstArch: Int, pFpDst: Int, pFpDstValid: Boolean, pFpOld: Int,
                  pFpccDst: Int, writesFpcc: Boolean, pFpccOld: Int): Unit = {
-        u.valid #= true; u.pc #= pc; u.nextPc #= pc + 4; u.faultUsesNextPc #= false
+        u.valid #= true; u.pc #= pc; u.lenWords #= 2; u.faultUsesNextPc #= false
         u.op #= DecOp.MOVE; u.cluster #= Cluster.CPLX; u.size #= Size.LONG
         u.useImm #= false; u.imm #= 0
-        u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0; u.unimplemented #= false
+        u.isBranch #= false; u.cond #= 0; u.unimplemented #= false
         u.dstArch #= 0; u.pdst #= 0; u.pdstValid #= false; u.pdstOld #= 0
         u.psrcA #= 0; u.psrcAValid #= false; u.psrcB #= 0; u.psrcBValid #= false
         u.pNzvcSrc #= 0; u.readsNzvc #= false

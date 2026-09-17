@@ -61,7 +61,7 @@ object MicroOpAssembler {
     *  - STORE: reg -> [base+disp] (srcBReg=reg = the stored data, no int dst, NO flags).
     */
   def movemMoveUop(reg: UInt, base: UInt, baseValid: Bool, disp: Bits, sizeLong: Bool,
-                   isLoad: Bool, first: Bool, last: Bool, drop: Bool, valid: Bool, pc: UInt, nextPc: UInt,
+                   isLoad: Bool, first: Bool, last: Bool, drop: Bool, valid: Bool, pc: UInt, lenWords: UInt,
                    idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt,
                    probeCount: UInt = U(0, 5 bits)): DecodedUop = {
     val u = DecodedUop()
@@ -69,7 +69,7 @@ object MicroOpAssembler {
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.MOVE
     u.cluster     := Cluster.LS
     u.size        := Mux(sizeLong, Size.LONG, Size.WORD)
@@ -91,7 +91,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False
     // `faultVector` REPURPOSED (task movem-translate-ahead; see DecodeStage.scala's
@@ -127,8 +127,8 @@ object MicroOpAssembler {
     u.isScc       := False; u.isDbcc := False
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     // Only the VERY FIRST emitted move of the whole MOVEM is the macro boundary
     // (firstOfInstr); every later move + the final An update is non-first, so an
     // interrupt is only taken at the MOVEM boundary (never mid-emission — the partly-
@@ -147,13 +147,13 @@ object MicroOpAssembler {
     * (ONE ADD, not a per-move fold). It is the macro instruction's last µop (NOT first).
     * `signedDelta` is the full signed byte delta (+count*size for postinc, -count*size
     * for predec). It carries the nextPc so the ROB advances PC correctly at commit. */
-  def movemAnUpdUop(an: UInt, signedDelta: SInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+  def movemAnUpdUop(an: UInt, signedDelta: SInt, valid: Bool, pc: UInt, lenWords: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.ADD
     u.cluster     := Cluster.INT
     u.size        := Size.LONG
@@ -166,7 +166,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // An update sets NO flags
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -180,8 +180,8 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := False    // trailing µop of the MOVEM macro
     // ...and, when it is emitted at all (every An-base MOVEM form, movemHasFinal), it is
     // UNCONDITIONALLY the macro's last µop: the FSM leaves movemAnUpdPhase straight to
@@ -205,13 +205,13 @@ object MicroOpAssembler {
     * use). Dropped from the oracle step count (like every intermediate MOVEM move); its
     * Tn write is real and consumed by every later per-element move via rename. Always the
     * macro's first emitted µop when present (the interrupt/firstOfInstr boundary). */
-  def movemSnapUop(dst: UInt, src: UInt, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+  def movemSnapUop(dst: UInt, src: UInt, valid: Bool, pc: UInt, lenWords: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.ADD
     u.cluster     := Cluster.INT
     u.size        := Size.LONG
@@ -224,7 +224,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -239,8 +239,8 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := True
     // The snapshot µop is emitted BEFORE any move and is never the macro's last µop:
     // the FSM only enters the snap phase from `movemBegin` with a NON-empty mask (an
@@ -275,14 +275,14 @@ object MicroOpAssembler {
     * loaded VALUE still reaches the scratch temp's real PRF slot via the ordinary rename/
     * wakeup path, so the following issue-row's srcA/srcB/srcC reads see it correctly. */
   def fmovemxLoadChunkUop(base: UInt, baseValid: Bool, disp: Bits, dstTemp: UInt,
-                           first: Bool, valid: Bool, pc: UInt, nextPc: UInt,
+                           first: Bool, valid: Bool, pc: UInt, lenWords: UInt,
                            idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.MOVE
     u.cluster     := Cluster.LS
     u.size        := Size.LONG
@@ -298,7 +298,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // FMOVEM affects NO integer condition codes
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -313,8 +313,8 @@ object MicroOpAssembler {
     u.isScc       := False; u.isDbcc := False
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := first
     // A chunk LOAD is NEVER the macro's last µop: each element is [LOAD x3][issue row],
     // so the element's own FP issue row always follows the 3 chunk loads.
@@ -352,12 +352,12 @@ object MicroOpAssembler {
     * exactly what `Microcode.scala`'s `fpStoreCvtRows` emits for the SCALAR Extended store.
     * Always dropped: it writes only a scratch temp. */
   def fmovemxStoreCvtUop(fpSrc: UInt, chunk: UInt, dstTemp: UInt,
-                          first: Bool, valid: Bool, pc: UInt, nextPc: UInt): DecodedUop = {
+                          first: Bool, valid: Bool, pc: UInt, lenWords: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.FPSTORECVT
     u.cluster     := Cluster.CPLX          // the only cluster with an FP-file read port
     u.size        := Size.LONG
@@ -370,7 +370,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -389,8 +389,8 @@ object MicroOpAssembler {
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := first
     u.lastOfInstr  := False                // the element's 3 stores always follow
     // FP-domain: FPn is a pure SOURCE; nothing in the FP file is written and FPCC is
@@ -412,14 +412,14 @@ object MicroOpAssembler {
     * (a store direction has no trailing FP issue row to carry it). */
   def fmovemxStoreChunkUop(base: UInt, baseValid: Bool, disp: Bits, srcTemp: UInt,
                             drop: Bool, last: Bool, first: Bool, valid: Bool,
-                            pc: UInt, nextPc: UInt,
+                            pc: UInt, lenWords: UInt,
                            idxReg: UInt, idxValid: Bool, idxLong: Bool, idxScale: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.MOVE
     u.cluster     := Cluster.LS
     u.size        := Size.LONG
@@ -433,7 +433,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -451,15 +451,15 @@ object MicroOpAssembler {
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False
     u.needsSupervisor := False; u.keepCommit := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := first
     u.lastOfInstr  := last
     u
   }
 
   def fmovemxIssueUop(fpDst: UInt, drop: Bool, first: Bool, last: Bool, valid: Bool,
-                       pc: UInt, nextPc: UInt): DecodedUop = {
+                       pc: UInt, lenWords: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     // NO `u.fpInert()` here (unlike every OTHER builder in this file): every fp* field is
@@ -470,7 +470,7 @@ object MicroOpAssembler {
     // to avoid -- here the simpler fix is to just not double-write these particular fields).
     u.valid       := valid
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.FPU
     u.cluster     := Cluster.CPLX
     u.size        := Size.LONG
@@ -483,7 +483,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -499,8 +499,8 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := first
     // The element's issue row is the macro's last µop exactly when this is the LAST
     // element of the list (`fmovemxIsLastElem`): the FSM clears fmovemxActive right
@@ -536,7 +536,7 @@ object MicroOpAssembler {
 
   /** Common defaults for a MOVEP µop: NO flags, NO branch/sys/fault/index/auto markers,
     * pc/nextPc threaded for the macro commit. Mutated by the specific builders. */
-  private def movepBase(pc: UInt, nextPc: UInt): DecodedUop = {
+  private def movepBase(pc: UInt, lenWords: UInt): DecodedUop = {
     val u = DecodedUop()
     u.debugBreakValid := False; u.debugBreakSlot := 0
     u.fpInert()
@@ -546,7 +546,7 @@ object MicroOpAssembler {
     u.flattenForeach(_.allowOverride)
     u.valid       := True
     u.pc          := pc
-    u.nextPc      := nextPc
+    u.lenWords      := lenWords
     u.op          := DecOp.MOVE
     u.cluster     := Cluster.INT
     u.size        := Size.LONG
@@ -559,7 +559,7 @@ object MicroOpAssembler {
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEP affects NO condition codes
     u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-    u.cond        := 0; u.branchDisp := 0
+    u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -574,8 +574,8 @@ object MicroOpAssembler {
     u.indexLong   := False; u.indexScale := 0
     u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
     u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+    u.brPredTag := 0
+    u.casForm := 0
     u.firstOfInstr := False
     // Inert default. The AUTHORITATIVE value for every MOVEP µop is stamped once, by
     // the DecodeStage MOVEP FSM, from its OWN pre-existing per-step `movepLast` signal
@@ -590,8 +590,8 @@ object MicroOpAssembler {
     * dst is a temp (dropped); reads `src` (srcA). Used both to extract a byte from Dx
     * (reg->mem) and to position a loaded byte (mem->reg). */
   def movepShiftUop(src: UInt, dst: UInt, count: Int, dirLeft: Boolean,
-                    first: Boolean, pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+                    first: Boolean, pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op       := DecOp.SHIFT
     u.shiftOp  := B"01"                 // tt=01 = LSL/LSR
     u.shiftDir := Bool(dirLeft)
@@ -606,8 +606,8 @@ object MicroOpAssembler {
   /** AND µop: `src & imm -> dst` (LONG), no flags. Used by mem->reg .W to preserve
     * Dx[31:16] (imm = 0xFFFF0000) before assembling the low word. dst is a temp. */
   def movepAndMaskUop(src: UInt, dst: UInt, mask: Long, first: Boolean,
-                      pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+                      pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op       := DecOp.AND
     u.srcAReg  := src; u.srcAValid := True
     u.useImm   := True; u.imm := B(mask, 32 bits)
@@ -618,8 +618,8 @@ object MicroOpAssembler {
   }
 
   /** OR µop: `srcA | srcB -> dst` (LONG), no flags. The accumulator merge. dst is a temp. */
-  def movepOrUop(srcA: UInt, srcB: UInt, dst: UInt, pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+  def movepOrUop(srcA: UInt, srcB: UInt, dst: UInt, pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op       := DecOp.OR
     u.srcAReg  := srcA; u.srcAValid := True
     u.srcBReg  := srcB; u.srcBValid := True
@@ -631,8 +631,8 @@ object MicroOpAssembler {
   /** Byte LOAD µop: `[base + disp] -> T0` (.B, ZERO-extended into T0[31:8]=0 by the LS-EU
     * DcacheByteLane.extract). dst = T0 (temp, dropped). NO auto-update (MOVEP EA is
     * (d16,Ay) — no predec/postinc). */
-  def movepLoadUop(base: UInt, disp: Bits, first: Boolean, pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+  def movepLoadUop(base: UInt, disp: Bits, first: Boolean, pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op      := DecOp.MOVE
     u.cluster := Cluster.LS
     u.size    := Size.BYTE
@@ -650,8 +650,8 @@ object MicroOpAssembler {
     * byte, or a shifted temp). `keep` forces the macro commit (reg->mem writes no reg, so
     * the LAST store carries keepCommit). NO auto-update. */
   def movepStoreUop(base: UInt, disp: Bits, srcData: UInt, keep: Boolean, first: Boolean,
-                    pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+                    pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op      := DecOp.MOVE
     u.cluster := Cluster.LS
     u.size    := Size.BYTE
@@ -667,8 +667,8 @@ object MicroOpAssembler {
   /** Final reg MOVE µop (mem->reg): `acc -> Dx` (full .L write; the .W form's acc
     * already carries the preserved Dx[31:16] from the AND mask). KEPT macro commit
     * (writes a real reg, not a temp; not divIsRem). srcB = acc (MOVE reads src2). */
-  def movepFinalMoveUop(acc: UInt, dx: UInt, pc: UInt, nextPc: UInt): DecodedUop = {
-    val u = movepBase(pc, nextPc)
+  def movepFinalMoveUop(acc: UInt, dx: UInt, pc: UInt, lenWords: UInt): DecodedUop = {
+    val u = movepBase(pc, lenWords)
     u.op      := DecOp.MOVE
     u.size    := Size.LONG              // full 32-bit write
     u.srcBReg := acc; u.srcBValid := True
@@ -1151,7 +1151,7 @@ object MicroOpAssembler {
     opUop.fpInert()
     opUop.valid         := pkt.valid
     opUop.pc            := pkt.pc
-    opUop.nextPc        := nextPc
+    opUop.lenWords        := pkt.lenWords
     opUop.op            := spec.op
     opUop.cluster       := spec.cluster
     opUop.size          := spec.size
@@ -1165,7 +1165,7 @@ object MicroOpAssembler {
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
     opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.isReturn := False; opUop.ccrRestore := False; opUop.toCcr := False; opUop.cond := spec.cond
     opUop.eaAuto        := EaAuto.NONE; opUop.eaDelta := 0
-    opUop.branchDisp    := 0
+
     opUop.unimplemented := False
     opUop.faulted       := False
     opUop.faultVector   := 0
@@ -1192,8 +1192,8 @@ object MicroOpAssembler {
     opUop.indexLong     := False; opUop.indexScale := 0
     opUop.leaAddr := False; opUop.movesAliasStore := False; opUop.fromCcr := False; opUop.fromSr := False; opUop.needsSupervisor := False; opUop.keepCommit := False; opUop.altAddrSpace := False
     opUop.sysOp := False; opUop.sysKind := SysKind.NONE; opUop.sysReadDir := False
-    opUop.predTaken := False; opUop.predTarget := U(0, 32 bits)
-    opUop.phtValid := False; opUop.phtIndex := U(0, 11 bits); opUop.casForm := 0
+    opUop.brPredTag := 0
+    opUop.casForm := 0
     // CHK / DIV are group-2 traps (CHK vec6, DIV0 vec5) delivered execute-time via
     // euFault -> format-$2: they stack the NEXT instruction's PC (the 040 group-2
     // frame's PC = pc+len). The fault is conditional (set at execute), but faultPc is
@@ -1257,7 +1257,7 @@ object MicroOpAssembler {
       opUop.faultVector   := 0
       opUop.isBranch      := True               // branch EU (reads the condition source)
       opUop.cond          := cond
-      opUop.branchDisp    := 0
+
       opUop.readsNzvc     := Bool(!fromFpcc)
       opUop.readsFpcc     := Bool(fromFpcc)
       opUop.isCondTrap    := True
@@ -1285,7 +1285,7 @@ object MicroOpAssembler {
       opUop.dstReg        := counter; opUop.dstValid := True   // Dn (decremented or unchanged)
       opUop.useImm        := False
       opUop.writesNzvc    := False; opUop.writesX := False
-      opUop.branchDisp    := disp
+      opUop.imm           := disp   // PC-relative displacement rides the shared `imm` slot
       opUop.unimplemented := False
       opUop.faulted       := False; opUop.faultVector := 0
       opUop.isRte         := False
@@ -1551,13 +1551,13 @@ object MicroOpAssembler {
         // (`r.readsFpcc := dec.readsFpcc`, `r.pFpccSrc := fpccRat...`), and BranchEu
         // selects the FP predicate table on it.
         opUop.readsFpcc := True
-        when(op(6)) { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }   // FBcc.L
-          .otherwise { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }  // FBcc.W
+        when(op(6)) { opUop.imm := pkt.words(1) ## pkt.words(2) }   // FBcc.L
+          .otherwise { opUop.imm := pkt.words(1).asSInt.resize(32).asBits }  // FBcc.W
       } .otherwise {
         val disp8 = op(7 downto 0)
-        when(disp8 === 0x00) { opUop.branchDisp := pkt.words(1).asSInt.resize(32).asBits }
-          .elsewhen(disp8 === M"11111111") { opUop.branchDisp := pkt.words(1) ## pkt.words(2) }
-          .otherwise { opUop.branchDisp := disp8.asSInt.resize(32).asBits }
+        when(disp8 === 0x00) { opUop.imm := pkt.words(1).asSInt.resize(32).asBits }
+          .elsewhen(disp8 === M"11111111") { opUop.imm := pkt.words(1) ## pkt.words(2) }
+          .otherwise { opUop.imm := disp8.asSInt.resize(32).asBits }
       }
     }
 
@@ -1569,7 +1569,7 @@ object MicroOpAssembler {
     ldUop.fpInert()
     ldUop.valid         := pkt.valid
     ldUop.pc            := pkt.pc
-    ldUop.nextPc        := nextPc
+    ldUop.lenWords        := pkt.lenWords
     ldUop.op            := DecOp.MOVE
     ldUop.cluster       := Cluster.LS
     // mem-RMW / load-only access size: BYTE for a bit-op (mem BITOP is always byte),
@@ -1612,8 +1612,8 @@ object MicroOpAssembler {
     // later sysOp commit).
     ldUop.leaAddr := False; ldUop.movesAliasStore := False; ldUop.fromCcr := False; ldUop.fromSr := False; ldUop.needsSupervisor := spec.sysOp; ldUop.keepCommit := False; ldUop.altAddrSpace := False
     ldUop.sysOp := False; ldUop.sysKind := SysKind.NONE; ldUop.sysReadDir := False
-    ldUop.predTaken := False; ldUop.predTarget := U(0, 32 bits)
-    ldUop.phtValid := False; ldUop.phtIndex := U(0, 11 bits); ldUop.casForm := 0
+    ldUop.brPredTag := 0
+    ldUop.casForm := 0
     ldUop.dstReg        := U(T0, 5 bits); ldUop.dstValid := True
     ldUop.useImm        := True
     // disp = rmwEaDisp (immEa for a line-0 immediate mem-dest, else srcEa). A (d16,PC)
@@ -1648,7 +1648,7 @@ object MicroOpAssembler {
     // An update rides a separate ADD µop (anUpdUop). For crackRmw the SAME eaAuto is on
     // BOTH the load (here) and the store so they access the same predec address.
     ldUop.eaAuto        := srcEa.autoMode; ldUop.eaDelta := srcEaDelta
-    ldUop.branchDisp    := 0
+
     ldUop.unimplemented := False
     ldUop.faulted       := False; ldUop.faultVector := 0; ldUop.isRte := False
     ldUop.faultUsesNextPc := False
@@ -1690,7 +1690,7 @@ object MicroOpAssembler {
     stUop.fpInert()
     stUop.valid         := pkt.valid
     stUop.pc            := pkt.pc
-    stUop.nextPc        := nextPc
+    stUop.lenWords        := pkt.lenWords
     stUop.op            := DecOp.MOVE
     stUop.cluster       := Cluster.LS
     stUop.size          := spec.size
@@ -1707,8 +1707,8 @@ object MicroOpAssembler {
     stUop.indexLong     := stDstEa.indexLong; stUop.indexScale := stDstEa.indexScale
     stUop.leaAddr := False; stUop.movesAliasStore := False; stUop.fromCcr := False; stUop.fromSr := False; stUop.needsSupervisor := False; stUop.keepCommit := False; stUop.altAddrSpace := False
     stUop.sysOp := False; stUop.sysKind := SysKind.NONE; stUop.sysReadDir := False
-    stUop.predTaken := False; stUop.predTarget := U(0, 32 bits)
-    stUop.phtValid := False; stUop.phtIndex := U(0, 11 bits); stUop.casForm := 0
+    stUop.brPredTag := 0
+    stUop.casForm := 0
     // Auto-update DEST EA (-(An)/(An)+): the store's (otherwise unused) int dst carries
     // the An write (An := An ± delta) — generalizing stkPush to any An. PREDEC: addr =
     // An-delta = the written An; POSTINC: addr = An, written An = An+delta. The LS EU
@@ -1721,7 +1721,7 @@ object MicroOpAssembler {
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
     stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.isReturn := False; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
     stUop.eaAuto        := stDstEa.autoMode; stUop.eaDelta := stDstEa.autoDelta
-    stUop.branchDisp    := 0
+
     stUop.unimplemented := False
     stUop.faulted       := False; stUop.faultVector := 0; stUop.isRte := False
     stUop.faultUsesNextPc := False
@@ -1757,7 +1757,7 @@ object MicroOpAssembler {
     rmwStUop.fpInert()
     rmwStUop.valid         := pkt.valid
     rmwStUop.pc            := pkt.pc
-    rmwStUop.nextPc        := nextPc
+    rmwStUop.lenWords        := pkt.lenWords
     rmwStUop.op            := DecOp.MOVE
     rmwStUop.cluster       := Cluster.LS
     // `isFSccOp`: an FScc memory destination is a BYTE write, but unlike the line-5 Scc it
@@ -1778,8 +1778,8 @@ object MicroOpAssembler {
     rmwStUop.indexLong     := rmwIdxEa.indexLong; rmwStUop.indexScale := rmwIdxEa.indexScale
     rmwStUop.leaAddr := False; rmwStUop.movesAliasStore := False; rmwStUop.fromCcr := False; rmwStUop.fromSr := False; rmwStUop.needsSupervisor := False; rmwStUop.keepCommit := False; rmwStUop.altAddrSpace := False
     rmwStUop.sysOp := False; rmwStUop.sysKind := SysKind.NONE; rmwStUop.sysReadDir := False
-    rmwStUop.predTaken := False; rmwStUop.predTarget := U(0, 32 bits)
-    rmwStUop.phtValid := False; rmwStUop.phtIndex := U(0, 11 bits); rmwStUop.casForm := 0
+    rmwStUop.brPredTag := 0
+    rmwStUop.casForm := 0
     // Auto-update RMW EA (-(An)/(An)+): the load + this store share ONE EA and ONE An
     // update — the store carries the An write (An := An ± delta) on its int dst (the
     // load carries the SAME eaAuto for its address but writes only T0). The An write
@@ -1793,7 +1793,7 @@ object MicroOpAssembler {
     rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
     rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.isReturn := False; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
     rmwStUop.eaAuto        := srcEa.autoMode; rmwStUop.eaDelta := srcEaDelta
-    rmwStUop.branchDisp    := 0
+
     rmwStUop.unimplemented := False
     rmwStUop.faulted       := False; rmwStUop.faultVector := 0; rmwStUop.isRte := False
     rmwStUop.faultUsesNextPc := False
@@ -2968,7 +2968,7 @@ object MicroOpAssembler {
       opUop.readsFpcc     := isFSccOp         // ...an FScc reads FPCC instead
       opUop.useImm        := False
       opUop.writesNzvc    := False; opUop.writesX := False
-      opUop.branchDisp    := 0
+
       opUop.unimplemented := False
       opUop.faulted       := False; opUop.faultVector := 0
       opUop.isRte         := False; opUop.isCondTrap := False; opUop.ibranch := False
@@ -3051,7 +3051,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.MOVE
       u.cluster     := Cluster.LS
       u.size        := Size.LONG
@@ -3067,7 +3067,7 @@ object MicroOpAssembler {
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
     u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -3078,8 +3078,8 @@ object MicroOpAssembler {
       u.indexLong   := ea.indexLong; u.indexScale := ea.indexScale
       u.leaAddr := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := True
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3119,7 +3119,7 @@ object MicroOpAssembler {
     divlUop.fpInert()
     divlUop.valid         := pkt.valid
     divlUop.pc            := pkt.pc
-    divlUop.nextPc        := nextPc
+    divlUop.lenWords        := pkt.lenWords
     divlUop.op            := DecOp.DIV
     divlUop.cluster       := Cluster.CPLX
     divlUop.size          := Size.LONG
@@ -3139,7 +3139,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := True;  divlUop.readsX := False   // overflow preserves old N/Z/C (Musashi: only V set)
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.isReturn := False; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0; divlUop.branchDisp := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.isReturn := False; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0
     divlUop.eaAuto        := EaAuto.NONE; divlUop.eaDelta := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
@@ -3152,8 +3152,8 @@ object MicroOpAssembler {
     divlUop.indexLong := False; divlUop.indexScale := 0
     divlUop.leaAddr := False; divlUop.movesAliasStore := False; divlUop.fromCcr := False; divlUop.fromSr := False; divlUop.needsSupervisor := False; divlUop.keepCommit := False; divlUop.altAddrSpace := False
     divlUop.sysOp := False; divlUop.sysKind := SysKind.NONE; divlUop.sysReadDir := False
-    divlUop.predTaken := False; divlUop.predTarget := U(0, 32 bits)
-    divlUop.phtValid := False; divlUop.phtIndex := U(0, 11 bits); divlUop.casForm := 0
+    divlUop.brPredTag := 0
+    divlUop.casForm := 0
     // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple divisor,
     // task #180 — the load becomes uops(0) and divlUop moves to uops(1)).
     divlUop.firstOfInstr  := !divlDivisorIsMem
@@ -3180,7 +3180,7 @@ object MicroOpAssembler {
     divremUop.fpInert()
     divremUop.valid         := pkt.valid
     divremUop.pc            := pkt.pc
-    divremUop.nextPc        := nextPc
+    divremUop.lenWords        := pkt.lenWords
     divremUop.op            := DecOp.DIVREM
     divremUop.cluster       := Cluster.CPLX
     divremUop.size          := Size.LONG
@@ -3239,7 +3239,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.isReturn := False; divremUop.ccrRestore := False; divremUop.toCcr := False; divremUop.cond := 0; divremUop.branchDisp := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.isReturn := False; divremUop.ccrRestore := False; divremUop.toCcr := False; divremUop.cond := 0
     divremUop.eaAuto        := EaAuto.NONE; divremUop.eaDelta := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
@@ -3252,8 +3252,8 @@ object MicroOpAssembler {
     divremUop.indexLong := False; divremUop.indexScale := 0
     divremUop.leaAddr := False; divremUop.movesAliasStore := False; divremUop.fromCcr := False; divremUop.fromSr := False; divremUop.needsSupervisor := False; divremUop.keepCommit := False; divremUop.altAddrSpace := False
     divremUop.sysOp := False; divremUop.sysKind := SysKind.NONE; divremUop.sysReadDir := False
-    divremUop.predTaken := False; divremUop.predTarget := U(0, 32 bits)
-    divremUop.phtValid := False; divremUop.phtIndex := U(0, 11 bits); divremUop.casForm := 0
+    divremUop.brPredTag := 0
+    divremUop.casForm := 0
     divremUop.firstOfInstr  := False           // trailing crack µop
     divremUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
@@ -3300,7 +3300,7 @@ object MicroOpAssembler {
     mullUop.fpInert()
     mullUop.valid         := pkt.valid
     mullUop.pc            := pkt.pc
-    mullUop.nextPc        := nextPc
+    mullUop.lenWords        := pkt.lenWords
     mullUop.op            := DecOp.MUL
     mullUop.cluster       := Cluster.CPLX
     mullUop.size          := Size.LONG
@@ -3320,7 +3320,7 @@ object MicroOpAssembler {
     mullUop.dstReg        := mullDl; mullUop.dstValid := True               // low product -> Dl
     mullUop.readsNzvc     := False; mullUop.readsX := False
     mullUop.writesNzvc    := True;  mullUop.writesX := False                // MUL sets N/Z (+V .L32)
-    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.isReturn := False; mullUop.ccrRestore := False; mullUop.toCcr := False; mullUop.cond := 0; mullUop.branchDisp := 0
+    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.isReturn := False; mullUop.ccrRestore := False; mullUop.toCcr := False; mullUop.cond := 0
     mullUop.eaAuto        := EaAuto.NONE; mullUop.eaDelta := 0
     mullUop.unimplemented := False
     mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
@@ -3333,8 +3333,8 @@ object MicroOpAssembler {
     mullUop.indexLong := False; mullUop.indexScale := 0
     mullUop.leaAddr := False; mullUop.movesAliasStore := False; mullUop.fromCcr := False; mullUop.fromSr := False; mullUop.needsSupervisor := False; mullUop.keepCommit := False; mullUop.altAddrSpace := False
     mullUop.sysOp := False; mullUop.sysKind := SysKind.NONE; mullUop.sysReadDir := False
-    mullUop.predTaken := False; mullUop.predTarget := U(0, 32 bits)
-    mullUop.phtValid := False; mullUop.phtIndex := U(0, 11 bits); mullUop.casForm := 0
+    mullUop.brPredTag := 0
+    mullUop.casForm := 0
     // firstOfInstr: True unless a leading LOAD µop precedes it (memSimple multiplier,
     // task #180 — the load becomes uops(0) and mullUop moves to uops(1)).
     mullUop.firstOfInstr  := !mullMulIsMem
@@ -3368,7 +3368,7 @@ object MicroOpAssembler {
     mulhiUop.fpInert()
     mulhiUop.valid         := pkt.valid
     mulhiUop.pc            := pkt.pc
-    mulhiUop.nextPc        := nextPc
+    mulhiUop.lenWords        := pkt.lenWords
     mulhiUop.op            := DecOp.MULHI
     mulhiUop.cluster       := Cluster.CPLX
     mulhiUop.size          := Size.LONG
@@ -3380,7 +3380,7 @@ object MicroOpAssembler {
     mulhiUop.dstReg        := mullDh; mulhiUop.dstValid := True             // high product -> Dh
     mulhiUop.readsNzvc     := False; mulhiUop.readsX := False
     mulhiUop.writesNzvc    := False; mulhiUop.writesX := False
-    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.isReturn := False; mulhiUop.ccrRestore := False; mulhiUop.toCcr := False; mulhiUop.cond := 0; mulhiUop.branchDisp := 0
+    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.isReturn := False; mulhiUop.ccrRestore := False; mulhiUop.toCcr := False; mulhiUop.cond := 0
     mulhiUop.eaAuto        := EaAuto.NONE; mulhiUop.eaDelta := 0
     mulhiUop.unimplemented := False
     mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
@@ -3393,8 +3393,8 @@ object MicroOpAssembler {
     mulhiUop.indexLong := False; mulhiUop.indexScale := 0
     mulhiUop.leaAddr := False; mulhiUop.movesAliasStore := False; mulhiUop.fromCcr := False; mulhiUop.fromSr := False; mulhiUop.needsSupervisor := False; mulhiUop.keepCommit := False; mulhiUop.altAddrSpace := False
     mulhiUop.sysOp := False; mulhiUop.sysKind := SysKind.NONE; mulhiUop.sysReadDir := False
-    mulhiUop.predTaken := False; mulhiUop.predTarget := U(0, 32 bits)
-    mulhiUop.phtValid := False; mulhiUop.phtIndex := U(0, 11 bits); mulhiUop.casForm := 0
+    mulhiUop.brPredTag := 0
+    mulhiUop.casForm := 0
     mulhiUop.firstOfInstr  := False           // trailing crack µop
     mulhiUop.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
 
@@ -3468,7 +3468,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.MOVE
       u.cluster     := Cluster.LS
       u.size        := size
@@ -3483,7 +3483,7 @@ object MicroOpAssembler {
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -3494,8 +3494,8 @@ object MicroOpAssembler {
       u.indexLong   := bfmEaDec.indexLong; u.indexScale := bfmEaDec.indexScale
       u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := first
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3511,7 +3511,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.BITFIELD
       u.cluster     := Cluster.CPLX   // the bit-field datapath lives on the CPLX cluster (DivEu)
       u.size        := Size.LONG
@@ -3527,7 +3527,7 @@ object MicroOpAssembler {
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -3539,8 +3539,8 @@ object MicroOpAssembler {
       u.indexLong   := False; u.indexScale := 0
       u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := False
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3618,7 +3618,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.MOVE
       u.cluster     := Cluster.LS
       u.size        := c2Size
@@ -3633,7 +3633,7 @@ object MicroOpAssembler {
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -3644,8 +3644,8 @@ object MicroOpAssembler {
       u.indexLong   := c2SrcEa.indexLong; u.indexScale := c2SrcEa.indexScale
       u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := first
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3661,7 +3661,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.CMP2CHK2
       u.cluster     := Cluster.CPLX
       u.size        := c2Size
@@ -3676,7 +3676,7 @@ object MicroOpAssembler {
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0
       // CHK2 vec-6 is a group-2 (format-$2) trap delivered execute-time via euFault:
@@ -3692,8 +3692,8 @@ object MicroOpAssembler {
       u.indexLong   := False; u.indexScale := 0
       u.leaAddr     := False; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := False                                   // trailing (loads are first)
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3733,7 +3733,7 @@ object MicroOpAssembler {
     ibrUop.fpInert()
     ibrUop.valid         := pkt.valid
     ibrUop.pc            := pkt.pc
-    ibrUop.nextPc        := nextPc
+    ibrUop.lenWords        := pkt.lenWords
     ibrUop.op            := DecOp.BRANCH
     ibrUop.cluster       := Cluster.INT
     ibrUop.size          := Size.LONG
@@ -3754,7 +3754,7 @@ object MicroOpAssembler {
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
     ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.isReturn := False; ibrUop.ccrRestore := False; ibrUop.toCcr := False    // JMP: no An postinc (JSR/RTS override)
     ibrUop.eaAuto        := EaAuto.NONE; ibrUop.eaDelta := 0
-    ibrUop.cond          := 0;     ibrUop.branchDisp := 0
+    ibrUop.cond          := 0
     ibrUop.unimplemented := False
     ibrUop.faulted       := False; ibrUop.faultVector := 0; ibrUop.isRte := False
     ibrUop.faultUsesNextPc := False
@@ -3766,8 +3766,8 @@ object MicroOpAssembler {
     ibrUop.indexLong := srcEa.indexLong; ibrUop.indexScale := srcEa.indexScale
     ibrUop.leaAddr := False; ibrUop.movesAliasStore := False; ibrUop.fromCcr := False; ibrUop.fromSr := False; ibrUop.needsSupervisor := False; ibrUop.keepCommit := False; ibrUop.altAddrSpace := False
     ibrUop.sysOp := False; ibrUop.sysKind := SysKind.NONE; ibrUop.sysReadDir := False
-    ibrUop.predTaken := False; ibrUop.predTarget := U(0, 32 bits)
-    ibrUop.phtValid := False; ibrUop.phtIndex := U(0, 11 bits); ibrUop.casForm := 0
+    ibrUop.brPredTag := 0
+    ibrUop.casForm := 0
     // JMP is a single µop (its own first); JSR's ibranch is the TRAILING µop (the push
     // is first), so firstOfInstr is False for JSR.
     ibrUop.firstOfInstr  := !isJsrOp
@@ -3789,7 +3789,7 @@ object MicroOpAssembler {
               useImm: Bool = False, imm: Bits = B(0, 32 bits),
               isBranch: Bool = False, ibranch: Bool = False, stkPush: Bool = False,
               anInc: UInt = U(0, 3 bits), cond: Bits = B(0, 4 bits),
-              branchDisp: Bits = B(0, 32 bits), first: Bool = True,
+              first: Bool = True,
               size: Size.C = Size.LONG, ccrRestore: Bool = False,
               writesNzvc: Bool = False, writesX: Bool = False,
               op: DecOp.C = DecOp.MOVE, divIsRem: Bool = False,
@@ -3799,7 +3799,7 @@ object MicroOpAssembler {
       val u = DecodedUop()
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
-      u.valid := pkt.valid; u.pc := pkt.pc; u.nextPc := nextPc
+      u.valid := pkt.valid; u.pc := pkt.pc; u.lenWords := pkt.lenWords
       u.op := op; u.cluster := cluster; u.size := size; u.memOp := memOp
       u.srcAReg := srcAReg; u.srcAValid := srcAValid
       u.srcBReg := srcBReg; u.srcBValid := srcBValid
@@ -3811,7 +3811,7 @@ object MicroOpAssembler {
       u.isReturn := isReturn
       u.eaAuto := eaAuto; u.eaDelta := eaDelta
       u.ccrRestore := ccrRestore; u.toCcr := False
-      u.cond := cond; u.branchDisp := branchDisp
+      u.cond := cond
       u.unimplemented := False
       u.faulted := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -3822,8 +3822,8 @@ object MicroOpAssembler {
       u.indexLong := False; u.indexScale := 0
       u.leaAddr := False; u.movesAliasStore := movesAliasStore; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := keepCommit; u.altAddrSpace := False
       u.sysOp := False; u.sysKind := SysKind.NONE; u.sysReadDir := False
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := first
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -3873,7 +3873,7 @@ object MicroOpAssembler {
     }
     val bsrPush   = pushUop(A7, nextPc.asBits, first = True)
     val bsrBranch = mkUop(isBranch = True, cond = B(0, 4 bits),    // unconditional BRA
-                          branchDisp = bsrDisp, first = False)
+                          useImm = False, imm = bsrDisp, first = False)
 
     // ── RTS (0x4E75) — crack into [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4]. ─
     // The pop load reads (A7) into T0 (a temp); the trailing ibranch redirects to T0
@@ -3893,7 +3893,7 @@ object MicroOpAssembler {
     val jsrPush = pushUop(A7, nextPc.asBits, first = !jsrNeedsSnap)
     val jsrSnap = movemSnapUop(
       dst = U(T0, 5 bits), src = U(A7, 5 bits), valid = pkt.valid,
-      pc = pkt.pc, nextPc = nextPc)
+      pc = pkt.pc, lenWords = pkt.lenWords)
 
     // ── RTR (0x4E77) — pop CCR (word) then PC (long); restore CCR; A7 += 6. ─────────
     // Crack: [load.w (A7) -> CCR restore (NZVC:=d[3:0], X:=d[4])] + [load.l (A7+2) -> T0]
@@ -4059,7 +4059,7 @@ object MicroOpAssembler {
       u.fpInert()
       u.valid       := pkt.valid
       u.pc          := pkt.pc
-      u.nextPc      := nextPc
+      u.lenWords      := pkt.lenWords
       u.op          := DecOp.MOVE
       u.cluster     := Cluster.LS
       u.size        := Size.LONG
@@ -4073,7 +4073,7 @@ object MicroOpAssembler {
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
       u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
-      u.cond        := 0; u.branchDisp := 0
+      u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
       u.fpuSoftwareComplete := False; u.fpuCmdWord := B(0, 16 bits)
@@ -4087,8 +4087,8 @@ object MicroOpAssembler {
       u.indexLong   := srcEa.indexLong; u.indexScale := srcEa.indexScale
       u.leaAddr     := True; u.movesAliasStore := False; u.fromCcr := False; u.fromSr := False; u.needsSupervisor := False; u.keepCommit := False; u.altAddrSpace := False
       u.sysOp       := False; u.sysKind := SysKind.NONE; u.sysReadDir := False   // (Track D fields; LEA is not a sysOp)
-      u.predTaken := False; u.predTarget := U(0, 32 bits)
-      u.phtValid := False; u.phtIndex := U(0, 11 bits); u.casForm := 0
+      u.brPredTag := 0
+      u.casForm := 0
       u.firstOfInstr := leaFirst
       u.lastOfInstr := False   // placeholder -- authoritative value stamped from out.count (see the crack tree below)
       u
@@ -4423,21 +4423,16 @@ object MicroOpAssembler {
       out.uops(i).lastOfInstr := out.count === U(i + 1, 2 bits)
     }
     // ── Fetch-time prediction stamp (BTB + bimodal, slice 1) ────────────────────
-    // Stamp EVERY µop of this instruction with the SOURCE PACKET's predTaken/predTarget
-    // (last-wins, after the crack tree above). Only the branch µop's prediction is read
-    // by the branch EU; stamping the non-branch crack µops (push/load/An-update) is
-    // harmless. This uniformly covers BSR/JSR/RTS (mkUop cracks) + Bcc/BRA (opUop) +
-    // JMP (ibrUop) without per-builder threading. predTaken defaults False at the
-    // packet until the fetch redirect is live, so this is behavior-neutral in step 1.
+    // Stamp EVERY µop of this instruction with the SOURCE PACKET's prediction SIDE-CHANNEL
+    // TAG (last-wins, after the crack tree above). This used to copy four fields --
+    // predTaken/predTarget/phtValid/phtIndex; it now copies the one tag that names them
+    // (see DecodedUop.brPredTag), with identical reach: the branch µop of a BSR/JSR/RTS
+    // (mkUop cracks), a Bcc/BRA (opUop) and a JMP (ibrUop) are all covered without
+    // per-builder threading, and stamping the non-branch crack µops stays harmless.
+    // A packet with no prediction carries tag 0 (inert), exactly as it carried
+    // predTaken=False before.
     for (i <- 0 until 3) {
-      out.uops(i).predTaken.allowOverride;  out.uops(i).predTaken  := pkt.predTaken
-      out.uops(i).predTarget.allowOverride; out.uops(i).predTarget := pkt.predTarget
-      // gshare carry-down (slice 3): the conditional-gshare-predicted bit + the 11-bit
-      // fetch-time index ride to retire. Only the branch µop's phtValid is acted on (the
-      // ROB trains pht[phtIndex]); stamping the crack µops is harmless (a crack µop never
-      // retires as a conditional branch). Last-wins after the crack tree, like predTaken.
-      out.uops(i).phtValid.allowOverride;   out.uops(i).phtValid   := pkt.phtValid
-      out.uops(i).phtIndex.allowOverride;   out.uops(i).phtIndex   := pkt.phtIndex
+      out.uops(i).brPredTag.allowOverride;  out.uops(i).brPredTag := pkt.brPredTag
     }
     out
   }

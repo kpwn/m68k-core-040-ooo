@@ -52,12 +52,12 @@ class DispatchSpec extends AnyFunSuite {
       pdst: Int = 0, pdstValid: Boolean = true, pdstOld: Int = 0
   ): Unit = {
     u.valid #= valid
-    u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
+    u.pc #= pc; u.lenWords #= 1; u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= true; u.imm #= 0
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.faulted #= false; u.faultVector #= 0; u.isRte #= false
     u.debugBreakValid #= false; u.debugBreakSlot #= 0

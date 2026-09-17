@@ -250,7 +250,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // SINGLE shallow 3-input adder off held flops, not a second serial add stage chained
     // onto s1TgtBase — mirrors LsEuPlugin's `s1Va = s1Base + s1Disp + s1Index` exactly
     // (see that file's FMax rationale comment).
-    val relTarget = (u1.pc + 2 + u1.branchDisp.asUInt)
+    // PC-relative displacement rides the SHARED `imm` slot (`ibranch` is the selector --
+    // see DecodedUop.imm). A relative branch always carries useImm=False, so `imm` is
+    // never simultaneously an ALU value here; DecodeStage asserts that in simulation.
+    val relTarget = (u1.pc + 2 + u1.imm.asUInt)
     val indTarget = (s1TgtBase + u1.imm.asUInt + s1Index)
     val target    = Mux(u1.ibranch, indTarget, relTarget)
 
@@ -305,7 +308,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // Fall-through PC = the instruction's POST-PC (pc + length). DBcc is a 2-word
     // instruction (opword + disp16) so its not-taken/expiry PC is pc+4, NOT pc+2 —
     // use the assembler-computed u1.nextPc (also correct for a not-taken Bcc.w).
-    val nextPc    = Mux(redirect, target, u1.nextPc)
+    // `u1.nextPc` is DERIVED (`pc + lenWords*2`); read it once -- every reference builds
+    // its own adder. This is the branch EU's only consumer of it.
+    val fallThruPc = u1.nextPc
+    val nextPc    = Mux(redirect, target, fallThruPc)
 
     // ---- S1: branch prediction verification (BTB + bimodal, slice 1) ────────────
     // `redirect` is the ACTUAL taken/redirect condition (the old "mispredict" meaning).
@@ -372,7 +378,10 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     completionPort.payload.btbTaken  := actualTaken
     completionPort.payload.btbTarget := target
     completionPort.payload.brType    := brType
-    completionPort.payload.btbLen    := ((u1.nextPc - u1.pc) >> 1).resize(4)
+    // `btbLen` IS the carried instruction length now -- `nextPc` used to be a stored
+    // 32-bit field and this re-derived the length from it; the uop carries the length
+    // itself (DecodedUop.lenWords), so the subtract/shift is gone.
+    completionPort.payload.btbLen    := u1.lenWords
     // gshare PHT-update carry (slice 3): a conditional gshare-predicted branch (phtValid,
     // set at fetch on a condBtbHit) trains pht[phtIndex] toward actualTaken at retire. The
     // carried fetch-time index — not a retire-time recompute — is mandatory (the GHR has

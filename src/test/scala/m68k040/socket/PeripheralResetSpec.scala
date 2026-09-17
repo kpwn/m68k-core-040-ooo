@@ -123,13 +123,13 @@ class PeripheralResetSpec extends AnyFunSuite {
              sysOp: Boolean = false, sysKind: SpinalEnumElement[SysKind.type] = SysKind.NONE): Unit = {
     u.valid #= true
     u.pc #= pc
-    u.nextPc #= pc + 2
+    u.lenWords #= 1
     u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE
     u.cluster #= Cluster.INT
     u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0
+    u.isBranch #= false; u.cond #= 0
     u.unimplemented #= false
     u.dstArch #= dstArch
     u.psrcA #= 0; u.psrcAValid #= false

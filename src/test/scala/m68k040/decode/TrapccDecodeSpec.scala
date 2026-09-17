@@ -51,8 +51,8 @@ class TrapccDecodeSpec extends AnyFunSuite {
       assert(!dut.uop.unimplemented.toBoolean, "TRAPcc is implemented")
       assert(!dut.uop.isScc.toBoolean && !dut.uop.isDbcc.toBoolean, "not Scc / DBcc")
       // nextPc should be pc + 1*2 = 0x1002
-      assert(dut.uop.nextPc.toLong == 0x1002L,
-             s"nextPc must be pc+2=0x1002 for no-operand form, got 0x${dut.uop.nextPc.toLong.toHexString}")
+      assert(dut.uop.lenWords.toInt == 1,
+             s"lenWords must be 1 (nextPc = pc+2 = 0x1002) for the no-operand form, got ${dut.uop.lenWords.toInt}")
     }
   }
 
@@ -70,8 +70,8 @@ class TrapccDecodeSpec extends AnyFunSuite {
       assert(!dut.uop.dstValid.toBoolean)
       assert(dut.uop.faultUsesNextPc.toBoolean)
       assert(!dut.uop.faulted.toBoolean && !dut.uop.unimplemented.toBoolean)
-      assert(dut.uop.nextPc.toLong == 0x1004L,
-             s"nextPc must be pc+4=0x1004 for word form, got 0x${dut.uop.nextPc.toLong.toHexString}")
+      assert(dut.uop.lenWords.toInt == 2,
+             s"lenWords must be 2 (nextPc = pc+4 = 0x1004) for the word form, got ${dut.uop.lenWords.toInt}")
     }
   }
 
@@ -89,8 +89,8 @@ class TrapccDecodeSpec extends AnyFunSuite {
       assert(!dut.uop.dstValid.toBoolean)
       assert(dut.uop.faultUsesNextPc.toBoolean)
       assert(!dut.uop.faulted.toBoolean && !dut.uop.unimplemented.toBoolean)
-      assert(dut.uop.nextPc.toLong == 0x1006L,
-             s"nextPc must be pc+6=0x1006 for long form, got 0x${dut.uop.nextPc.toLong.toHexString}")
+      assert(dut.uop.lenWords.toInt == 3,
+             s"lenWords must be 3 (nextPc = pc+6 = 0x1006) for the long form, got ${dut.uop.lenWords.toInt}")
     }
   }
 
@@ -101,7 +101,7 @@ class TrapccDecodeSpec extends AnyFunSuite {
       drive(dut, 0x50FC, len = 1)
       sleep(1)
       assert(dut.uop.isCondTrap.toBoolean && dut.uop.cond.toInt == 0)
-      assert(dut.uop.nextPc.toLong == 0x1002L)
+      assert(dut.uop.lenWords.toInt == 1)
     }
   }
 

@@ -52,10 +52,10 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
   }
 
   private def pokeRu(u: RenamedUop, pc: Long): Unit = {
-    u.valid #= true; u.pc #= pc; u.nextPc #= pc + 2; u.faultUsesNextPc #= false
+    u.valid #= true; u.pc #= pc; u.lenWords #= 1; u.faultUsesNextPc #= false
     u.op #= DecOp.MOVE; u.cluster #= Cluster.LS; u.size #= Size.LONG
     u.useImm #= false; u.imm #= 0
-    u.isBranch #= false; u.cond #= 0; u.branchDisp #= 0; u.unimplemented #= false
+    u.isBranch #= false; u.cond #= 0; u.unimplemented #= false
     u.dstArch #= 0
     u.psrcA #= 0; u.psrcAValid #= false; u.psrcB #= 0; u.psrcBValid #= false
     u.pdst #= 0; u.pdstValid #= false; u.pdstOld #= 0

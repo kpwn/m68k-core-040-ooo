@@ -27,7 +27,7 @@ class TrapvSpec extends AnyFunSuite {
       val iValid    = in Bool ()
       val iPNzvcSrc = in UInt (4 bits)
       val iRobId    = in UInt (m68k040.Global.ROB_ID_W_DEFAULT bits)
-      val iNextPc   = in UInt (32 bits)
+      val iLenWords = in UInt (4 bits)
 
       val ctx = IqContext(); val uop = ctx.uop
       // Default-drive every uop field (the bundle has grown many fields — ibranch/anInc/
@@ -48,11 +48,11 @@ class TrapvSpec extends AnyFunSuite {
       // TRAPV cond-trap µop: a branch-class uop reading NZVC, marked isCondTrap.
       // cond = 9 (VS): the EU evaluates taken=v -> trapvFault if V=1. Redirect is
       // suppressed by the `isCondTrap` gate regardless of `taken`.
-      uop.isBranch := True; uop.cond := 9; uop.branchDisp := 0
+      uop.isBranch := True; uop.cond := 9
       uop.isCondTrap := True; uop.isScc := False; uop.isDbcc := False
       // branch-EU control fields the TRAPV path must NOT trigger (call/return + line-5):
       uop.ibranch := False; uop.anInc := 0; uop.stkPush := False; uop.ccrRestore := False
-      uop.pc := 0x2000; uop.nextPc := iNextPc; uop.faultUsesNextPc := True
+      uop.pc := 0x2000; uop.lenWords := iLenWords; uop.faultUsesNextPc := True
       uop.pNzvcSrc := iPNzvcSrc; uop.readsNzvc := True
       // Fetch-time predictor carry fields (added after this stub was written; a TRAPV is
       // never fetch-predicted). assignDontCare() above randomizes them per-seed, and the
@@ -91,7 +91,7 @@ class TrapvSpec extends AnyFunSuite {
     M68kSim().compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); val s = dut.src.logic
       s.iValid #= false; s.wValid #= false; s.wAddr #= 0; s.wData #= 0
-      s.iPNzvcSrc #= 0; s.iRobId #= 5; s.iNextPc #= 0x3000
+      s.iPNzvcSrc #= 0; s.iRobId #= 5; s.iLenWords #= 1
       cd.waitSampling(80)
       // V=bit1. Preload addr 1 with V set/clear.
       s.wValid #= true; s.wAddr #= 1; s.wData #= (if (vSet) 0x2 else 0x0)

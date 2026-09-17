@@ -2330,7 +2330,11 @@ object Microcode {
   case class Ctx() extends Bundle {
     val opword       = Bits(16 bits)
     val pc           = UInt(32 bits)
+    // The 32-bit post-PC is still a CTX field (one register, not a per-uop field): the
+    // SRetPc selector needs it as a VALUE (JSR-memind's pushed return address). What the
+    // emitted uops carry is `lenWords` -- see DecodedUop.lenWords.
     val nextPc       = UInt(32 bits)
+    val lenWords     = UInt(4 bits)
     val op           = DecOp()           // the latched op (BCD/ADDX/SUBX) for UOpFromCtx
     val bcdSub       = Bool()
     val size         = Size()
@@ -2613,7 +2617,7 @@ object Microcode {
 
     u.valid  := valid
     u.pc     := ctx.pc
-    u.nextPc := ctx.nextPc
+    u.lenWords := ctx.lenWords
     d.uop match {
       case UMove       => u.op := DecOp.MOVE
       case UAddDrop    => u.op := DecOp.ADD
@@ -2759,7 +2763,7 @@ object Microcode {
     u.isBranch := Bool(d.uop == UMiBranchFinal); u.ibranch := Bool(d.uop == UMiBranchFinal)
     u.stkPush  := Bool(d.uop == UMiPushFinal);   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
-    u.cond := 0; u.branchDisp := 0
+    u.cond := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
     // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
@@ -3005,9 +3009,8 @@ object Microcode {
                   else if (d.fpCtrlCap) SysKind.FPCTRL_CAP
                   else SysKind.NONE)
     u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits)
-    // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
+    u.brPredTag := 0
+        // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
     u.casForm := (d.uop match {
       case co: UCasOp => B(co.form, 3 bits)
       case _          => B(0, 3 bits)
@@ -3192,7 +3195,7 @@ object Microcode {
 
     u.valid  := valid
     u.pc     := ctx.pc
-    u.nextPc := ctx.nextPc
+    u.lenWords := ctx.lenWords
     u.op := DecOp.MOVE                     // pre-switch default (dead: the switch is exhaustive)
     switch(d.uop) {
       is(UOpHw.UMove)       { u.op := DecOp.MOVE }
@@ -3349,7 +3352,7 @@ object Microcode {
     u.isBranch := d.uop === UOpHw.UMiBranchFinal; u.ibranch := d.uop === UOpHw.UMiBranchFinal
     u.stkPush  := d.uop === UOpHw.UMiPushFinal;   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
-    u.cond := 0; u.branchDisp := 0
+    u.cond := 0
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
     // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
@@ -3543,9 +3546,8 @@ object Microcode {
     when(d.fpCtrlApply)    { u.sysKind := SysKind.FMOVE_FPCTRL }
       .elsewhen(d.fpCtrlCap) { u.sysKind := SysKind.FPCTRL_CAP }
     u.sysReadDir := False
-    u.predTaken := False; u.predTarget := U(0, 32 bits)
-    u.phtValid := False; u.phtIndex := U(0, 11 bits)
-    // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
+    u.brPredTag := 0
+        // CAS/CAS2 compute sub-form (DecOp.CASOP); 0 for every other µop.
     u.casForm := Mux(d.uop === UOpHw.UCasOp, d.casForm.asBits, B(0, 3 bits))
     u.firstOfInstr := d.isFirst
     // `lastOfInstr` -- exact twin of resolve()'s block above (the ROM row's own `isLast`

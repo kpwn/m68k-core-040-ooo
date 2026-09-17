@@ -42,6 +42,14 @@ case class DecodePacket() extends Bundle {
   //   Non-conditional / not-gshare-predicted packets carry phtValid=False.
   val phtValid   = Bool()
   val phtIndex   = UInt(11 bits)
+  // ── Branch-prediction SIDE-CHANNEL tag (see Global.BR_PRED_TABLE_DEPTH) ─────
+  // Names the DecodeStage table entry holding this packet's {predTaken, predTarget,
+  // phtValid, phtIndex}. The four fields above stay on the PACKET (only two packet
+  // registers exist per pipeline stage, so they are not the area problem); what they
+  // no longer do is ride every DecodedUop. 0 = "inert / no prediction" -- a reserved
+  // tag that is never allocated, so it needs no table entry.
+  // Allocated in FetchAlignPlugin, written (idempotently, from `fed`) in DecodeStage.
+  val brPredTag  = UInt(m68k040.Global.BR_PRED_TAG_W bits)
   // ── FMax "Lever B" (2026-08-08): precomputed operand size ────────────────────
   // `OperationDecoder.decode(words(0)).size`, baked at I-cache REFILL time into
   // `ChunkPredecode.size` and carried here by the Aligner. `MicroOpAssembler.computeOffload`
