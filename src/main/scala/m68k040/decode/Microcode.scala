@@ -2334,6 +2334,14 @@ object Microcode {
   def fpMemIndEntry(store: Boolean, fmtIdx: Int): Int =
     (if (store) fpMemIndStOffsets else fpMemIndLdOffsets)(fmtIdx)
 
+  // The microcode PC (`ucPc`/`ucNextPc` in DecodeStage) and `OpSpec.ucEntry` are 9 bits,
+  // so the ROM cannot exceed 512 rows. Without this guard an overflow would SILENTLY
+  // truncate an entry address and dispatch a valid instruction into the middle of some
+  // other program -- the worst possible failure mode for a decoder. Fail elaboration
+  // instead; the fix is to widen those three declarations together.
+  require(rom.size <= 512,
+    s"Microcode ROM has ${rom.size} rows but the 9-bit microcode PC addresses only 512. " +
+      "Widen OpSpec.ucEntry, DecodeStage's ucPc and ucNextPc together.")
 
   /** `fpMemFormats` index for an ext[12:10] format code, or -1 for the two Packed codes
     * (011 static-k / 111 dynamic-k), which are out of hardware scope entirely. */
