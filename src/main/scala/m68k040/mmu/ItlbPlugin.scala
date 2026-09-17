@@ -127,6 +127,15 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkCmodePolicy.allowOverride; _walkCmodePolicy := CacheMode.WRITETHROUGH
     // The WALKER's own descriptor reads take the LIVE policy: a read does not
     // mutate, so nothing downstream depends on two reads agreeing.
+    //
+    // `allowOverride` because `_walkLoadCmd.payload` was just assigned as a WHOLE
+    // BUNDLE above: SpinalHDL's no-latch/no-override check rejects an unconditional
+    // field override of a just-assigned bundle as a complete assignment overlap (the
+    // same gotcha `LsEuPlugin`'s walker legs document, which is why THEY assign field
+    // by field). The `when(drainNeedRead)` override further down does not need it --
+    // a CONDITIONAL override of an unconditionally assigned signal is ordinary
+    // last-assignment-wins.
+    _walkLoadCmd.payload.cacheMode.allowOverride
     _walkLoadCmd.payload.cacheMode := _walkCmodePolicy
     _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
     walker.io.loadCmd.ready := _walkLoadCmd.ready
