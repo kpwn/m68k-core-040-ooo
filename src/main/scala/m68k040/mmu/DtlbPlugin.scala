@@ -175,6 +175,33 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // level, zero added depth on the hit cone.
     val pageSizeRekey = ctrl.setPageSize.valid && (ctrl.setPageSize.payload =/= ctrl.pageSize8K)
     val atcFlush      = flushAll || pageSizeRekey
+    // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
+    // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
+    // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root
+    // it started under. If software then writes SRP/URP -- MOVEC, control register
+    // 0x806/0x807 -- while that walk is still reading descriptors, the walk completes
+    // against a tree that is NO LONGER INSTALLED and installs the result in the ATC.
+    //
+    // Today that is masked INCIDENTALLY: a sysOp retire pulses a redirect, the redirect
+    // raises `doFlush`, `doFlush` drives `umFlush`, and `umFlush` sets `walkUmPoison`
+    // which happens to gate `tlb.io.fillValid`. Nothing asserts that chain, nothing
+    // names it, and an incidental mask that nobody asserted is EXACTLY how the I-side
+    // `walkFlushPoison` gap survived: its absence was masked the same way until a test
+    // put a PFLUSHA in the window and watched a pre-flush translation get installed.
+    //
+    // THE PATTERN, which is why this is worth naming: the walk LATCHES some piece of
+    // MMU configuration at launch and a consumer RE-DERIVES it live. Three defects in
+    // this family have now been found within a day -- TCR.P re-keying the ATC key, the
+    // ITLB's missing walk-flush poison, and this. Anywhere else configuration is
+    // latched at miss time and re-read live is a candidate for a fourth.
+    //
+    // COST: one flop and an OR, off the lookup path. Self-healing exactly like
+    // `walkFlushPoison`: suppressing the fill costs one re-walk under the NEW root,
+    // which is the answer the access should have had.
+    val rootChanged = RegInit(False)
+    rootChanged.simPublic()
+    when(walker.io.start) { rootChanged := False }
+    when(ctrl.setSrp.valid || ctrl.setUrp.valid) { rootChanged := True }
     pageSizeRekey.simPublic()
     val urp       = ctrl.urp
     val srp       = ctrl.srp
@@ -508,7 +535,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // exactly the same real 3-level table search a first-time cold miss pays --
       // and that re-walk (assuming no second flush collision) will correctly queue
       // and, once its own instruction commits, drain BOTH U and M.
-      when(!walker.io.rsp.fault && !walkFlushPoison && !atcFlush && !walkUmPoison) {
+      when(!walker.io.rsp.fault && !walkFlushPoison && !atcFlush && !walkUmPoison &&
+           !rootChanged) {
         tlb.io.fillValid := True
       }
       // sim-only taps for the walker->TLB fill (see the `simPublic` block above).
