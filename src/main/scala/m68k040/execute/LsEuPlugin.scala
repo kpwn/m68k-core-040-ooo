@@ -4048,12 +4048,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // `walkLdReq`/`walkStReq` are existing nets already tapped into
       // `dbgStallGrantPack(20..23)`, so this adds no new signal; the counter is
       // simulation-only and pruned from every netlist.
-      val quiesceBlockedWalker = Reg(UInt(16 bits)) init 0
-      when(quiesceHold && (walkLdReq.orR || walkStReq.orR) &&
-           quiesceBlockedWalker =/= U(0xffff, 16 bits)) {
-        quiesceBlockedWalker := quiesceBlockedWalker + 1
+    }
+
+    // ── REACHABILITY COUNTER (see the tripwire block above) ──────────────────────
+    // Declared at AREA level, not inside the `GenerationFlags.simulation` block, and
+    // that is the whole point: a `val` inside that block is a local, so nothing outside
+    // could ever read it and the counter would be write-only -- useless for the one job
+    // it has, which is letting a directed run ASSERT the window was reached.
+    // `GenerationFlags.simulation { ... }` RETURNS its value, so the register is still
+    // elaborated only in simulation and pruned from every netlist; this is the idiom
+    // `StoreQueue.fsNbytesA`/`fsPaddrHiA` already use for exactly this reason.
+    val quiesceBlockedWalker = GenerationFlags.simulation {
+      val c = Reg(UInt(16 bits)) init 0
+      when(quiesceHold && (walkLdReq.orR || walkStReq.orR) && c =/= U(0xffff, 16 bits)) {
+        c := c + 1
       }
-      quiesceBlockedWalker.simPublic()
+      c.simPublic()
+      c
     }
 
     // W23: `excLoadCmdReady` was UNCONDITIONAL. `ExceptionUnit` computes
