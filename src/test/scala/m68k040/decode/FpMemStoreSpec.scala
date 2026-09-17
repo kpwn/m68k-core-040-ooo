@@ -218,12 +218,55 @@ class FpMemStoreSpec extends AnyFunSuite {
       s"(d8,PC,Xn) destination must trap: $b")
   }
 
-  test("memory-indirect destinations trap (out of the microcode engine's scope)", VerilatorTest) {
+  // ⚠ REWRITTEN 2026-09-17. This test previously asserted that a memory-indirect
+  // destination TRAPS ("out of the microcode engine's scope"). That scope limit was a
+  // real 1:1 divergence, not a design choice, and it has been removed:
+  //   * M68040UM 9.6.1 scopes the unimplemented-instruction F-line exception to
+  //     instruction PATTERNS (Table 9-10 lists opcodes -- FSIN, FMOD, ...), never to
+  //     addressing modes; App. D-2 lists memory-indirect addressing among the
+  //     68020/030/040 extensions the part supports.
+  //   * Musashi -- this project's own lock-step oracle -- executes them
+  //     (`READ_EA_FPE` case 6 -> `EA_AY_IX_16()` -> `m68ki_get_ea_ix`, which implements
+  //     the full I/IS walk).
+  //   * The Quadra 700 ROM's SANE package depends on it: operands arrive as POINTERS and
+  //     are dereferenced INSIDE the FP instruction (`fmoved %fp@(c)@(0),%fp0` and 71
+  //     siblings), so every SANE floating-point call was trapping into the FPSP.
+  // The program is now the pointer walk (`UMiPtrLoad` + `UMiLeaFinal`, the same pair
+  // MI_LEA_ENTRY is built from) followed by the ordinary convert + store rows re-based on
+  // the resolved address. Asserted structurally -- the temp NUMBERS are read back out of
+  // the uops rather than hardcoded, so this survives microcode row renumbering but still
+  // pins that the dereference actually happens and that the store does NOT address An.
+  test("memory-indirect destinations EXECUTE: pointer walk, then a store off the resolved address", VerilatorTest) {
     // full-format ext: bit8 = full, I/IS != 000 -> MEMINDIRECT.
     val full = (1 << 8) | (1 << 4) | 1     // BD_SIZE=01(null), IS=0, I/IS=001
-    val us = collect(Seq(fpOp(6, 0), stExt(FmtL, 0), full) ++ filler, 0x40800000L, 1)
-    assert(us.length == 1 && us.head.faulted && us.head.faultVector == 11,
-      s"memory-indirect destination must trap: $us")
+    val us = collect(Seq(fpOp(6, 0), stExt(FmtL, 0), full) ++ filler, 0x40800000L, 4)
+    assert(us.length == 4, s"expected the 4-row memory-indirect store program: $us")
+    assert(us.forall(!_.faulted), s"a memory-indirect destination must NOT trap: $us")
+
+    val ptr = us(0)   // LOAD.L [A0 + bd] -> Tptr
+    assert(ptr.memOp.startsWith("LOAD") && ptr.cluster.startsWith("LS") &&
+           ptr.sz.startsWith("LONG") && ptr.dstV && ptr.srcAV && ptr.srcA == 8 && ptr.first,
+      s"row 0 must be the LONG pointer load off A0: $ptr")
+    val tPtr = ptr.dst
+
+    val fin = us(1)   // Tptr := Tptr + od  (address-generate, no memory access)
+    assert(fin.memOp.startsWith("NONE") && fin.cluster.startsWith("LS") &&
+           fin.dstV && fin.dst == tPtr && fin.srcAV && fin.srcA == tPtr,
+      s"row 1 must resolve the final address into the same temp, with no memory access: $fin")
+
+    val cvt = us(2)
+    assert(cvt.op.startsWith("FPSTORECVT") && cvt.cluster.startsWith("CPLX") &&
+           cvt.usesFpSrcA && cvt.fpSrcAReg == 0 && cvt.fpSrcFmt == FmtL && cvt.dstV,
+      s"row 2 must be the narrowing convert of FP0: $cvt")
+    val tData = cvt.dst
+
+    val st = us(3)
+    assert(st.memOp.startsWith("STORE") && st.cluster.startsWith("LS") &&
+           st.sz.startsWith("LONG") && st.srcAV && st.srcA == tPtr &&
+           st.srcBV && st.srcB == tData && !st.dstV,
+      s"row 3 must store the converted word through the RESOLVED address (not A0), " +
+        s"and must not write An: $st")
+    assert(tPtr != tData, s"the address temp and the data temp must be distinct: $us")
   }
 
   // ══ register-direct destinations (D4/D5) ═════════════════════════════════════════
