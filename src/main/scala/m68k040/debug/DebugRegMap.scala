@@ -127,6 +127,19 @@ object DebugRegMap {
   val OFF_MULTIHOT_DCSTORE: Int = 0x01040
   val OFF_MULTIHOT_ITLB: Int = 0x01044
   val OFF_MULTIHOT_DTLB: Int = 0x01048
+  val OFF_PERF_CTL: Int = 0x01080
+  val OFF_PERF_CYCLE_LO: Int = 0x01084
+  val OFF_PERF_CYCLE_HI: Int = 0x01088
+  val OFF_PERF_INST_LO: Int = 0x0108C
+  val OFF_PERF_INST_HI: Int = 0x01090
+  val OFF_PERF_BRANCH: Int = 0x01094
+  val OFF_PERF_DC_MISS: Int = 0x01098
+  val OFF_PERF_IC_MISS: Int = 0x0109C
+  val OFF_PERF_DTLB_WALK: Int = 0x010A0
+  val OFF_PERF_ITLB_WALK: Int = 0x010A4
+  val OFF_PERF_STALL_RETIRE: Int = 0x010A8
+  val OFF_PERF_STALL_DC: Int = 0x010AC
+  val OFF_PERF_STALL_WALK: Int = 0x010B0
   val OFF_ARCH_D0: Int = 0x02000
   val OFF_ARCH_D1: Int = 0x02004
   val OFF_ARCH_D2: Int = 0x02008
@@ -327,6 +340,19 @@ object DebugRegMap {
     ("OFF_MULTIHOT_DCSTORE", 0x01040),
     ("OFF_MULTIHOT_ITLB", 0x01044),
     ("OFF_MULTIHOT_DTLB", 0x01048),
+    ("OFF_PERF_CTL", 0x01080),
+    ("OFF_PERF_CYCLE_LO", 0x01084),
+    ("OFF_PERF_CYCLE_HI", 0x01088),
+    ("OFF_PERF_INST_LO", 0x0108C),
+    ("OFF_PERF_INST_HI", 0x01090),
+    ("OFF_PERF_BRANCH", 0x01094),
+    ("OFF_PERF_DC_MISS", 0x01098),
+    ("OFF_PERF_IC_MISS", 0x0109C),
+    ("OFF_PERF_DTLB_WALK", 0x010A0),
+    ("OFF_PERF_ITLB_WALK", 0x010A4),
+    ("OFF_PERF_STALL_RETIRE", 0x010A8),
+    ("OFF_PERF_STALL_DC", 0x010AC),
+    ("OFF_PERF_STALL_WALK", 0x010B0),
     ("OFF_ARCH_D0", 0x02000),
     ("OFF_ARCH_D1", 0x02004),
     ("OFF_ARCH_D2", 0x02008),
@@ -434,7 +460,7 @@ object DebugRegMap {
     ("rts_snap", 9, 9),
     ("live_arch", 10, 3),
     ("dcache_probe", 11, 4),
-    ("perf_counters", 12, 7),
+    ("perf_counters", 12, 2),
     ("watchpoints", 13, 6),
     ("trace_trigger", 14, 9),
     ("atrap_bp", 15, 6),

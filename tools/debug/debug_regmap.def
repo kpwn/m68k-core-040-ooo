@@ -155,8 +155,29 @@ REG OFF_CYCLE_LO          0x01000 RO    2 0x00000000 Free-running core_clk cycle
 REG OFF_CYCLE_HI          0x01004 RO    2 0x00000000 Free-running core_clk cycle count, high word.
 REG OFF_INST_LO           0x01008 RO    2 0x00000000 Architectural macro-instruction count, low word.
 REG OFF_INST_HI           0x0100C RO    2 0x00000000 Architectural macro-instruction count, high word.
-REG OFF_MISPRED_COUNT     0x01010 RO    7 0x00000000 Branch mispredictions; zero until a real producer exists.
-REG OFF_FLUSH_COUNT       0x01014 RO    7 0x00000000 Pipeline flushes; zero until a real producer exists.
+# SERVED since 2026-09-17. These two were DECLARED at Stage 1 and never driven --
+# "zero until a real producer exists" -- which is the exact dead-probe shape this
+# project has been bitten by four times (pc_live, exc_count, OFF_CYCLE_LO,
+# wedge-status). They now have real producers in RobPlugin and they are part of the
+# WINDOWED counter set: OFF_PERF_CTL bit 0 zeroes them and bit 1 freezes them, so a
+# read pair around a bounded piece of execution describes exactly that window.
+#
+# OFF_MISPRED_COUNT counts `RobPlugin.logic.branchRedirect` -- the COMMIT-time
+# mispredict redirect, `retire0 && p0.retireAlone && mispredictStore(h0)`. That is the
+# definitive "a branch retired mispredicted" event: one pulse per mispredicting branch,
+# no wrong-path double-counting (a squashed speculative branch never reaches retire).
+# It is deliberately NOT `debugBranchRetire.payload.mispredicted`, which is gated by
+# `btbUpdateValidComb` and therefore only sees BTB-ELIGIBLE branches -- that would
+# silently UNDERCOUNT.
+#
+# OFF_FLUSH_COUNT counts `RobPlugin.logic.doFlushReg` -- the registered global flush
+# pulse, i.e. EVERY whole-ROB squash: a branch mispredict, an exception/RTE redirect, a
+# debug recover, and a halted PC apply. So FLUSH >= MISPRED by construction and
+# FLUSH - MISPRED is the non-branch flush traffic (exceptions, RTEs, debug). Reading
+# the two together is itself the liveness check: a build where MISPRED moves and FLUSH
+# does not has a broken tap, not an interesting workload.
+REG OFF_MISPRED_COUNT     0x01010 RO    2 0x00000000 Retired branch mispredicts (windowed; zeroed/frozen by OFF_PERF_CTL).
+REG OFF_FLUSH_COUNT       0x01014 RO    2 0x00000000 Global pipeline flushes (windowed; zeroed/frozen by OFF_PERF_CTL).
 # SERVED since 2026-09-06. Free-running 32-bit count of every committed
 # exception ENTRY, live (no halt required), cleared only by CPU reset -- v1
 # parity with debug_ctrl.v exc_count_r. Read this, NOT OFF_EXC_RING_HEAD: the
@@ -213,6 +234,77 @@ REG OFF_MULTIHOT_DCPROBE  0x0103C RO    2 0x00000000 First D-cache early-probe m
 REG OFF_MULTIHOT_DCSTORE  0x01040 RO    2 0x00000000 First D-cache STORE multi-hot: physical address.
 REG OFF_MULTIHOT_ITLB     0x01044 RO    2 0x00000000 First ITLB multi-hot: looked-up VPN key.
 REG OFF_MULTIHOT_DTLB     0x01048 RO    2 0x00000000 First DTLB multi-hot: looked-up VPN key.
+
+# ---- windowed performance counters (2026-09-17) -------------------------------
+# THE OWNER'S REQUEST: "do we have any perf counters available? i would like a way to
+# zero 'em, too, such that i can capture a precise path." Everything in the 0x01000
+# block before this line is FREE-RUNNING and READ-ONLY, so the only way to measure a
+# bounded piece of execution was to subtract two reads -- and OFF_CYCLE_LO/HI and
+# OFF_INST_LO/HI can TEAR across a LO wrap, so even that difference is not trustworthy.
+#
+# ADDRESS CHOICE -- READ THIS BEFORE ADDING ANYTHING HERE. The 0x01000 block already
+# carries ONE live collision: `OFF_MULTIHOT_STATUS` sits at 0x01030 on this branch and
+# `OFF_STALL_ABSORB` sits at 0x01030 on `fix/arbiter-reset-wedge` (core b989571c). Two
+# different registers, one offset, two branches -- whoever merges those has to resolve
+# it DELIBERATELY. This block therefore starts at 0x01080 and leaves 0x0104C-0x0107C
+# entirely unallocated, so it cannot become a third party to that collision and so the
+# resolver has room to relocate either claimant without moving anything else.
+#
+# WHY A SEPARATE CYCLE/INSTRUCTION PAIR instead of making OFF_CYCLE_*/OFF_INST_*
+# clearable. Both of those have documented lifetimes that clearing would DESTROY:
+# OFF_CYCLE_* is the only measurement of the core clock this project has and must keep
+# running across a CPU reset, a halt and a wedge (see its comment above); OFF_INST_* is
+# `RobPlugin.macroCount`, which is ALSO the comparand for the absolute halt-after
+# target, so zeroing it would silently re-aim every armed OFF_HALT_AFTER_*. The windowed
+# pair below is a second, independently gated set. The free-running ones are untouched.
+#
+# HOW TO TAKE A WINDOW:
+#   write OFF_PERF_CTL = 0x3   (CLEAR + RUN)   -- zero everything and start counting
+#   ... run the bounded piece of execution ...
+#   write OFF_PERF_CTL = 0x0   (RUN=0)         -- FREEZE
+#   read the counters                          -- no tearing: they are not moving
+#   write OFF_PERF_CTL = 0x2   (RUN=1)         -- resume
+# The freeze is what makes the 64-bit LO/HI pairs atomic. It is the answer to the
+# tearing warning on OFF_CYCLE_LO/HI: those cannot be frozen, these can.
+#
+# LATENCY AND WINDOW EDGES (2026-09-17 owner directive: "a few cycles latency in
+# updating the values are OK"). Every counter is fed from a REGISTERED copy of its
+# event, never from the producer's live combinational cone, so no increment can ever
+# extend a path in the machine it is measuring. The cost is latency, all of it at the
+# window EDGES and none of it in the totals:
+#   * direct-pulse lanes (MISPRED, FLUSH, INST, BRANCH, DC_MISS, STALL_*) are 1 core
+#     clock behind their event;
+#   * edge-detected lanes (IC_MISS, DTLB_WALK, ITLB_WALK) are 2, because the level they
+#     watch is differentiated from two registered copies rather than from the live net;
+#   * the RUN gate is delay-matched to the 1-cycle lanes, so freezing does NOT drop an
+#     event that already happened -- the window boundary moves with the pipeline instead
+#     of cutting across it. The residual is at most ONE event per lane at each edge, and
+#     one more on the 2-cycle lanes. Over a window of millions of cycles that is noise;
+#     over a window of ten cycles it is not, and a ten-cycle window is not what this is
+#     for.
+# A CLEAR discards whatever is in flight rather than counting it into the new window:
+# the zeroing happens at the same pipeline stage as the increment and wins the
+# collision, so the new window starts clean at the cost of at most one event.
+#
+# PRODUCER PRESENCE IS ADVERTISED, NOT ASSUMED. OFF_PERF_CTL[20:16] reports which
+# producer plugins this build actually contains. A counter with no producer reads zero
+# -- indistinguishable from "the event never happened" -- which is precisely how a dead
+# probe retires a live hypothesis for free. Read the presence bits before believing a
+# zero, and the `perf_counters` feature bit (12) is asserted ONLY when every counter
+# advertised here has its producer.
+REG OFF_PERF_CTL          0x01080 MIXED 2 0x00000002 Windowed-counter control. Write bit0=CLEAR (self-clearing, zeroes every windowed counter), bit1=RUN level (POR 1). Read bit1=RUN, [15:8]=implemented windowed counters, [20:16]=producer presence {ROB,DCACHE,ICACHE,DTLB,ITLB}.
+REG OFF_PERF_CYCLE_LO     0x01084 RO    2 0x00000000 Windowed core_clk cycles, low word (counts while RUN).
+REG OFF_PERF_CYCLE_HI     0x01088 RO    2 0x00000000 Windowed core_clk cycles, high word.
+REG OFF_PERF_INST_LO      0x0108C RO    2 0x00000000 Windowed retired macro-instructions, low word (0/1/2 per cycle).
+REG OFF_PERF_INST_HI      0x01090 RO    2 0x00000000 Windowed retired macro-instructions, high word.
+REG OFF_PERF_BRANCH       0x01094 RO    2 0x00000000 Windowed retired BTB-ELIGIBLE branches (the BTB-update Flow). NOT every branch -- use it as the mispredict denominator knowing that.
+REG OFF_PERF_DC_MISS      0x01098 RO    2 0x00000000 Windowed D-cache LOAD misses (DcachePlugin.loadMissDiscovered, one pulse per missing load).
+REG OFF_PERF_IC_MISS      0x0109C RO    2 0x00000000 Windowed I-cache DEMAND misses (rising edge of IcachePlugin.s1Unresolved). Speculative prefetch fills are not counted.
+REG OFF_PERF_DTLB_WALK    0x010A0 RO    2 0x00000000 Windowed DTLB table walks STARTED (rising edge of the walker leaving IDLE).
+REG OFF_PERF_ITLB_WALK    0x010A4 RO    2 0x00000000 Windowed ITLB table walks STARTED.
+REG OFF_PERF_STALL_RETIRE 0x010A8 RO    2 0x00000000 Windowed cycles with the ROB NON-EMPTY and zero macros retired: the top-line stall count.
+REG OFF_PERF_STALL_DC     0x010AC RO    2 0x00000000 Windowed cycles with the D-cache busy (DcachePlugin `busy`, the same bit OFF_STALL_DC[1] reports).
+REG OFF_PERF_STALL_WALK   0x010B0 RO    2 0x00000000 Windowed cycles with EITHER table walker out of IDLE. Read against OFF_PERF_STALL_RETIRE to see how much of the stall is MMU.
 
 # ------------------------------------------- architectural write shadows --
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.
@@ -301,7 +393,7 @@ FEAT fault_snap             8  9 Legacy fault snapshot; never implemented on thi
 FEAT rts_snap               9  9 Legacy RTS snapshot; never implemented on this core.
 FEAT live_arch             10  3 Live architectural register readback.
 FEAT dcache_probe          11  4 D-cache probe readback AND cache operations both real.
-FEAT perf_counters         12  7 Every advertised performance counter has a real producer.
+FEAT perf_counters         12  2 Every advertised performance counter has a real producer AND is clearable/freezable via OFF_PERF_CTL. Withheld unless every producer plugin is present.
 FEAT watchpoints           13  6 Data watchpoints.
 FEAT trace_trigger         14  9 Armed/filtered PC trace; not planned for this core.
 FEAT atrap_bp              15  6 A-trap breakpoint slots.

@@ -214,7 +214,17 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
       (if (debugMemory.nonEmpty) Set.empty[String] else Set("cache_maint_only")) ++
       (if (frontendDebug.nonEmpty) Set.empty[String] else Set("break_pc_multi")) ++
-      (if (dbgCommit.nonEmpty) Set.empty[String] else Set("halt_exc_mask"))
+      (if (dbgCommit.nonEmpty) Set.empty[String] else Set("halt_exc_mask")) ++
+      // `perf_counters` means "EVERY advertised performance counter has a real
+      // producer" (spec 3.4). The windowed block degrades gracefully -- an absent peer
+      // plugin yields a clean zero -- but a clean zero is exactly what a dead probe
+      // looks like, so the BIT is withheld unless every producer is present. A build
+      // with, say, no I-cache still serves the other eleven counters; it just does not
+      // claim the capability.
+      (if (stage >= 2 && stallRob.nonEmpty && excCountHistory.nonEmpty &&
+           stallDcache.nonEmpty && mhIcache.nonEmpty &&
+           stallDtlb.nonEmpty && stallItlb.nonEmpty)
+        Set.empty[String] else Set("perf_counters"))
     val advertisedFeatures = DebugRegMap.features
       .filter(f => f._3 <= stage && !unavailableFeatures.contains(f._1))
       .foldLeft(BigInt(0))((acc, f) => acc | (BigInt(1) << f._2))
@@ -516,6 +526,216 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       ).map(a => RegNext(a.asBits) init B(0, 32 bits))
       multiHotStatusReg.simPublic()
       multiHotAddrRegs.foreach(_.simPublic())
+
+      // ══ WINDOWED PERFORMANCE COUNTERS (OFF_PERF_*, 2026-09-17) ════════════════
+      // The owner's request, verbatim: "do we have any perf counters available? i
+      // would like a way to zero 'em, too, such that i can capture a precise path."
+      //
+      // Everything above this line in the 0x01000 block is FREE-RUNNING and READ-ONLY.
+      // The only way to measure a bounded piece of execution with those is to subtract
+      // two reads -- and OFF_CYCLE_LO/HI and OFF_INST_LO/HI can TEAR across a LO wrap,
+      // so even the difference is not trustworthy. This block is the answer: a second,
+      // independently gated counter set that can be ZEROED and FROZEN, so a read taken
+      // while it is frozen describes exactly one window and cannot tear at all.
+      //
+      // The free-running registers are deliberately NOT made clearable. OFF_CYCLE_* is
+      // the only measurement of the core clock this project has and must keep running
+      // across a CPU reset, a halt and a wedge; OFF_INST_* is `RobPlugin.macroCount`,
+      // which is ALSO the comparand for the absolute halt-after target, so zeroing it
+      // would silently re-aim every armed OFF_HALT_AFTER_*.
+      //
+      // ── TIMING DISCIPLINE (2026-09-17 owner directive) ────────────────────────
+      // "is it possible to have the implementation be aware that we are super relaxed
+      // with timing and a few cycles latency in updating the values are OK". Taken
+      // literally and applied uniformly: EVERY counter is fed from a REGISTERED copy of
+      // its event, never from the producer's live combinational cone.
+      //
+      // THE `RegNext` ON EACH TAP IS LOAD-BEARING. Do not "optimise" it away as a
+      // redundant pipeline stage. This design closes 200 MHz at +0.002..+0.010 ns and
+      // several of these sources are among the latest signals in the machine
+      // (`loadMissDiscovered` is a tag-compare verdict; `s1Unresolved` feeds the I-cache
+      // accept gate; `retire0` gates the whole retire cone). A flop between the source
+      // and a 32-bit carry chain means the counter's adder starts at a flop output and
+      // ends at a flop input -- a self-contained loop that CANNOT lengthen any existing
+      // path. Deleting the flop would put a 32-bit incrementer's enable directly on
+      // those nets. Each tap costs exactly one extra fanout load on its source; that is
+      // the entire price.
+      //
+      // ── LATENCY, AND WHERE IT LANDS ────────────────────────────────────────────
+      // All of the latency is at the window EDGES, none of it in the totals:
+      //   * direct-pulse lanes (MISPRED, FLUSH, INST, BRANCH, DC_MISS, STALL_*) are one
+      //     core clock behind their event;
+      //   * edge-detected lanes (IC_MISS, DTLB_WALK, ITLB_WALK) are two, because the
+      //     level they watch is differentiated from two registered copies;
+      //   * `perfRunQ` -- the RUN gate -- is delay-matched to the one-cycle lanes, so a
+      //     FREEZE does not drop an event that already happened. The window boundary
+      //     moves with the pipeline instead of cutting across it. This is the one
+      //     correctness risk the latency introduces and it is handled by construction,
+      //     not by hoping the window is long.
+      // Residual: at most one event per lane at each edge, two on the edge-detected
+      // lanes. Over a window of millions of cycles that is noise.
+      val perfBuilt = stage >= 2
+
+      /** RUN level. POR = 1 so a build behaves like the free-running counters until a
+        * host deliberately takes a window. Written by OFF_PERF_CTL bit 1. */
+      val perfRun = if (perfBuilt) RegInit(True) else True
+
+      /** CLEAR request: one cycle, raised by the OFF_PERF_CTL arm of the WRITE decode.
+        *
+        * IT BELONGS IN `switch(awAddr)` UNDER `when(doWrite)` AND NOWHERE ELSE. The
+        * multi-hot clear was first written into a READ-region `switch(arAddr)`, where it
+        * elaborated cleanly, emitted no warning, read back perfectly and silently never
+        * fired. `PerfCounterSpec` tests the clear rather than assuming it, for exactly
+        * that reason. */
+      val perfClear = if (perfBuilt) RegInit(False) else False
+      if (perfBuilt) {
+        perfRun.simPublic(); perfClear.simPublic()
+        perfClear := False
+      }
+
+      /** The RUN gate, delayed by exactly the one flop every direct tap goes through.
+        *
+        * Without the match, freezing at cycle W would drop the event that happened at
+        * W-1 (its registered copy only arrives at W). With it, the increment at cycle
+        * T+1 is gated by RUN as it was at cycle T -- the same cycle the event happened
+        * -- so the window is closed on EVENT time, not on observation time. */
+      val perfRunQ = if (perfBuilt) (RegNext(perfRun) init True) else True
+
+      /** A producer tap: one flop in the debug domain, or a hard False when the peer
+        * plugin is absent from this build. `initValue` exists for levels whose idle
+        * state is high (none today; walker IDLE is inverted at the tap instead). */
+      def perfTap(src: Option[Bool]): Bool =
+        if (!perfBuilt) False else src.map(s => RegNext(s) init False).getOrElse(False)
+
+      /** Rising edge of an already-REGISTERED level, differentiated from a second
+        * registered copy. Never touches the live net -- that is the whole point. */
+      def perfRise(level: Option[Bool]): Bool = level match {
+        case Some(q) => val prev = RegNext(q) init False; q && !prev
+        case None    => False
+      }
+
+      /** One 32-bit windowed counter.
+        *
+        * The CLEAR is written LAST so last-assignment-wins gives it the collision: a
+        * clear landing on the same cycle as an increment discards the in-flight event
+        * rather than carrying it into the new window. That costs at most one event and
+        * buys a window that provably starts at zero. */
+      def perfCounter(evt: Bool): UInt = {
+        val r = Reg(UInt(32 bits)) init 0
+        when(evt && perfRunQ) { r := r + 1 }
+        when(perfClear) { r := 0 }
+        r.simPublic()
+        r
+      }
+
+      /** 64-bit windowed accumulator; `incr` is 0..2 (the dual retire slots) or a
+        * constant 1 (cycles). Same clear-wins ordering as `perfCounter`.
+        *
+        * A 64-bit carry chain is NOT a timing concern here and does not need splitting:
+        * `cycleCountReg` above is already a 64-bit free-running counter in this same
+        * area and this design closes 200 MHz with it in place. That is a measurement,
+        * not an argument. */
+      def perfCounter64(incr: UInt): UInt = {
+        val r = Reg(UInt(64 bits)) init 0
+        when(perfRunQ) { r := r + incr.resize(64) }
+        when(perfClear) { r := 0 }
+        r.simPublic()
+        r
+      }
+
+      // ── Producer taps ─────────────────────────────────────────────────────────
+      // `stallRob` / `stallDcache` / `mhIcache` / `stallDtlb` / `stallItlb` are the
+      // SAME Option handles the p141 stall packs and the multi-hot evidence already
+      // use; an absent peer yields a hard False and the lane reads a clean zero.
+      //
+      // MISPRED is `branchRedirect` -- `retire0 && p0.retireAlone && mispredictStore(h0)`,
+      // the COMMIT-time mispredict redirect. One pulse per mispredicting branch, no
+      // wrong-path double counting. Deliberately NOT `debugBranchRetire.mispredicted`,
+      // which is gated by `btbUpdateValidComb` and therefore only sees BTB-ELIGIBLE
+      // branches -- that would silently UNDERCOUNT and this register's whole history is
+      // reading zero and lying.
+      //
+      // FLUSH is `doFlushReg` -- already a register in the ROB -- i.e. EVERY whole-ROB
+      // squash: mispredict, exception/RTE redirect, debug recover, halted PC apply. So
+      // FLUSH >= MISPRED by construction and the difference is the non-branch flush
+      // traffic. Reading them together is itself a liveness check.
+      val perfEvtMispred = perfTap(stallRob.map(_.logic.branchRedirect))
+      val perfEvtFlush   = perfTap(stallRob.map(_.logic.doFlushReg))
+      val perfLvlRobBusy = perfTap(stallRob.map(_.logic.count =/= 0))
+      val perfLvlRetire  = perfTap(stallRob.map(_.logic.retire0))
+      val perfEvtBranch  = perfTap(excCountHistory.map(_.branchRetire.valid))
+      val perfEvtDcMiss  = perfTap(stallDcache.map(_.logic.loadMissDiscovered))
+      // I-cache: `s1Unresolved` is a LEVEL held from miss discovery until the fill is
+      // dispatched, so it is edge-detected. It cannot merge two misses: `cmdPort.ready`
+      // is gated by `!s1Unresolved`, so no younger command can be accepted behind an
+      // unresolved miss and the level always returns low between two of them.
+      val perfLvlIcMiss  = if (perfBuilt) mhIcache.map(i => RegNext(i.logic.s1Unresolved) init False) else None
+      // Table walkers: `dbgPack(0)` is `fsm.isActive(IDLE)`, so the tap inverts it and
+      // its reset value is "idle" -- no spurious start edge out of reset. A walk always
+      // returns through IDLE (FINISH -> IDLE -> start), so back-to-back walks cannot
+      // merge into one edge either.
+      val perfLvlDtlbWalk = if (perfBuilt) stallDtlb.map(t => RegNext(!t.logic.walker.io.dbgPack(0)) init False) else None
+      val perfLvlItlbWalk = if (perfBuilt) stallItlb.map(t => RegNext(!t.logic.walker.io.dbgPack(0)) init False) else None
+      /** Retired macros this cycle, 0/1/2, from the SAME `macroRetirePc` Flows the PC
+        * trace ring records. Cross-checkable against OFF_INST_LO by construction, which
+        * is how `PerfCounterSpec` proves this lane is not fabricating numbers. */
+      val perfEvtInst = if (perfBuilt) {
+        val live = excCountHistory.map(h =>
+          h.macroRetirePc(0).valid.asUInt.resize(2) + h.macroRetirePc(1).valid.asUInt.resize(2)
+        ).getOrElse(U(0, 2 bits))
+        RegNext(live) init 0
+      } else U(0, 2 bits)
+
+      // ── The counters ──────────────────────────────────────────────────────────
+      // Each is a named `val` so SpinalHDL's val-name reflection gives it a real
+      // netlist name (`DebugCtrlPlugin_logic_csr_perfMispred_reg`) instead of a `_zz_`.
+      val perfMispred     = if (perfBuilt) perfCounter(perfEvtMispred) else U(0, 32 bits)
+      val perfFlush       = if (perfBuilt) perfCounter(perfEvtFlush) else U(0, 32 bits)
+      val perfBranch      = if (perfBuilt) perfCounter(perfEvtBranch) else U(0, 32 bits)
+      val perfDcMiss      = if (perfBuilt) perfCounter(perfEvtDcMiss) else U(0, 32 bits)
+      val perfIcMiss      = if (perfBuilt) perfCounter(perfRise(perfLvlIcMiss)) else U(0, 32 bits)
+      val perfDtlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlDtlbWalk)) else U(0, 32 bits)
+      val perfItlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlItlbWalk)) else U(0, 32 bits)
+      // The top-line stall: ROB non-empty and nothing retired. Both terms are taps, so
+      // the enable is a LUT2 over two flops.
+      val perfStallRetire = if (perfBuilt) perfCounter(perfLvlRobBusy && !perfLvlRetire) else U(0, 32 bits)
+      // D-cache busy. Reuses `stallDcPackReg(1)`, the ALREADY-registered copy of
+      // `DcachePlugin.busy` that OFF_STALL_DC bit 1 reports -- zero extra flops and zero
+      // extra fanout on the D-cache. Its reset value is 0 = "not busy", the correct idle
+      // polarity, which is why this one does not need a tap of its own.
+      val perfStallDc     = if (perfBuilt) perfCounter(stallDcPackReg(1)) else U(0, 32 bits)
+      val perfStallWalk   = if (perfBuilt)
+        perfCounter(perfLvlDtlbWalk.getOrElse(False) || perfLvlItlbWalk.getOrElse(False))
+        else U(0, 32 bits)
+      val perfCycle       = if (perfBuilt) perfCounter64(U(1, 1 bits)) else U(0, 64 bits)
+      val perfInst        = if (perfBuilt) perfCounter64(perfEvtInst) else U(0, 64 bits)
+
+      // ── OFF_PERF_CTL read word ────────────────────────────────────────────────
+      // [20:16] is the PRODUCER PRESENCE bitmap and it is the anti-dead-probe device at
+      // runtime. A counter with no producer reads zero -- indistinguishable from "the
+      // event never happened", which is precisely how a dead probe retires a live
+      // hypothesis for free. The host reads these bits FIRST and renders a lane with no
+      // producer as absent rather than as zero.
+      val perfPresentRob  = perfBuilt && stallRob.nonEmpty && excCountHistory.nonEmpty
+      val perfPresentDc   = perfBuilt && stallDcache.nonEmpty
+      val perfPresentIc   = perfBuilt && mhIcache.nonEmpty
+      val perfPresentDtlb = perfBuilt && stallDtlb.nonEmpty
+      val perfPresentItlb = perfBuilt && stallItlb.nonEmpty
+      /** LOGICAL counters, not words: cycle and inst are one counter each despite
+        * occupying a LO/HI pair. 12 when this block is built, 0 when it is not -- so a
+        * host reading 0 here knows the block is absent rather than merely idle. */
+      val perfNumCounters = if (perfBuilt) 12 else 0
+      val perfCtlWord: Bits =
+        B(0, 11 bits) ##                   // [31:21] reserved zero
+        Bool(perfPresentItlb) ##           // [20]
+        Bool(perfPresentDtlb) ##           // [19]
+        Bool(perfPresentIc) ##             // [18]
+        Bool(perfPresentDc) ##             // [17]
+        Bool(perfPresentRob) ##            // [16]
+        B(perfNumCounters, 8 bits) ##      // [15:8] implemented logical counters
+        B(0, 6 bits) ##                    // [7:2]  reserved zero
+        perfRun ##                         // [1]    RUN level
+        False                              // [0]    CLEAR is self-clearing, reads 0
 
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
@@ -1333,6 +1553,31 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         is(DebugRegMap.OFF_MULTIHOT_DCSTORE)  { rdCount := multiHotAddrRegs(3) }
         is(DebugRegMap.OFF_MULTIHOT_ITLB)     { rdCount := multiHotAddrRegs(4) }
         is(DebugRegMap.OFF_MULTIHOT_DTLB)     { rdCount := multiHotAddrRegs(5) }
+        // ── Windowed performance counters (2026-09-17) ────────────────────────
+        // Region 2 so they are LIVE -- no halt required. A halt would itself change
+        // the numbers, which for a performance counter is the one thing that must not
+        // happen; the FREEZE bit in OFF_PERF_CTL is how a window is made read-stable,
+        // not a halt.
+        //
+        // OFF_MISPRED_COUNT / OFF_FLUSH_COUNT were DECLARED at Stage 1 and never
+        // driven ("zero until a real producer exists"). They are served here. Their
+        // offsets do not move: a host that has been reading them all along starts
+        // getting truth from the same address.
+        is(DebugRegMap.OFF_MISPRED_COUNT)     { rdCount := perfMispred.asBits }
+        is(DebugRegMap.OFF_FLUSH_COUNT)       { rdCount := perfFlush.asBits }
+        is(DebugRegMap.OFF_PERF_CTL)          { rdCount := perfCtlWord }
+        is(DebugRegMap.OFF_PERF_CYCLE_LO)     { rdCount := perfCycle(31 downto 0).asBits }
+        is(DebugRegMap.OFF_PERF_CYCLE_HI)     { rdCount := perfCycle(63 downto 32).asBits }
+        is(DebugRegMap.OFF_PERF_INST_LO)      { rdCount := perfInst(31 downto 0).asBits }
+        is(DebugRegMap.OFF_PERF_INST_HI)      { rdCount := perfInst(63 downto 32).asBits }
+        is(DebugRegMap.OFF_PERF_BRANCH)       { rdCount := perfBranch.asBits }
+        is(DebugRegMap.OFF_PERF_DC_MISS)      { rdCount := perfDcMiss.asBits }
+        is(DebugRegMap.OFF_PERF_IC_MISS)      { rdCount := perfIcMiss.asBits }
+        is(DebugRegMap.OFF_PERF_DTLB_WALK)    { rdCount := perfDtlbWalk.asBits }
+        is(DebugRegMap.OFF_PERF_ITLB_WALK)    { rdCount := perfItlbWalk.asBits }
+        is(DebugRegMap.OFF_PERF_STALL_RETIRE) { rdCount := perfStallRetire.asBits }
+        is(DebugRegMap.OFF_PERF_STALL_DC)     { rdCount := perfStallDc.asBits }
+        is(DebugRegMap.OFF_PERF_STALL_WALK)   { rdCount := perfStallWalk.asBits }
         }
 
         // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
@@ -1427,6 +1672,28 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_MULTIHOT_STATUS) {
             if (stage >= 2) when(wStrb(0)) {
               when(wData(0)) { multiHotClearRequest := True }
+            }
+          }
+          // Windowed performance counters (2026-09-17). SAME SWITCH, SAME REASON as
+          // the multi-hot clear directly above: this is `switch(awAddr)` inside
+          // `when(doWrite)`, the WRITE decode. An arm placed in a read-region
+          // `switch(arAddr)` elaborates cleanly, warns about nothing, reads back
+          // perfectly and never fires. That is not hypothetical here -- it is what
+          // happened to the multi-hot clear on 2026-09-17, and it was caught only
+          // because the spec TESTED the clear instead of assuming it.
+          //
+          // Byte 0 carries both controls, so one strobed write sets both:
+          //   0x3  CLEAR + RUN   -- zero everything and start a fresh window
+          //   0x0  RUN=0         -- FREEZE; now the 64-bit LO/HI pairs read atomically
+          //   0x2  RUN=1         -- resume without zeroing
+          //   0x1  CLEAR, RUN=0  -- zero and stay frozen
+          // RUN is taken from the written bit unconditionally (no read-modify-write):
+          // the host always states the run state it wants, so a clear cannot silently
+          // leave the counters frozen or running against its intent.
+          is(DebugRegMap.OFF_PERF_CTL) {
+            if (stage >= 2) when(wStrb(0)) {
+              perfRun := wData(1)
+              when(wData(0)) { perfClear := True }
             }
           }
           is(DebugRegMap.OFF_CONTROL) {

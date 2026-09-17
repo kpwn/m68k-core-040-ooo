@@ -130,7 +130,24 @@ class DebugCtrlCsrSpec extends AnyFunSuite {
       dut.clockDomain.waitSampling(20)
       val got = DbgAxiDriver.read(dut.axi, dut.clockDomain, DebugRegMap.OFF_FEATURES.toLong)
       val stage1 = DebugRegMap.featuresForStage(1).toLong
-      assert(got == DebugRegMap.featuresForStage(2).toLong)
+      // `perf_counters` (bit 12) became a STAGE-2 feature on 2026-09-17, and it is
+      // CONDITIONAL: the plugin withholds it unless every producer plugin is present
+      // (ROB + DebugHistoryService, D-cache, I-cache, both TLBs). This standalone
+      // fixture hosts none of them, so the bit is correctly absent.
+      //
+      // This is the SAME `unavailableFeatures` mechanism that already withholds
+      // `dcache_probe`; a bare equality against `featuresForStage(2)` used to hold only
+      // because every conditional member happened to be stage 3 or later and was
+      // filtered by the stage test before the condition could bite. Withholding is the
+      // honest direction -- the bit's definition is "EVERY advertised performance
+      // counter has a real producer", and claiming it on a build with no producers is
+      // precisely the lie the bit exists to prevent.
+      val perfBit = 1L << DebugRegMap.features.find(_._1 == "perf_counters").get._2
+      assert(got == (DebugRegMap.featuresForStage(2).toLong & ~perfBit),
+        f"OFF_FEATURES read 0x$got%08x; expected the stage-2 bitmap minus the " +
+        f"conditional perf_counters bit")
+      assert((got & perfBit) == 0L,
+        "perf_counters must NOT be advertised by a fixture with no producer plugins")
       assert((got & stage1) == stage1, "stage 2 must not retract a stage-1 bit")
     }
   }
