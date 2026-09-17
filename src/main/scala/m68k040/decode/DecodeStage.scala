@@ -1192,7 +1192,6 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val mpDir    = mpOpw(7)                                          // 1 = reg->mem
     val mpSizeL  = mpOpw(6)                                          // 1 = .L
     val mpPc     = movepEntryPkt.pc
-    val mpNextPc = (mpPc + (movepEntryPkt.lenWords << 1)).resize(32) // = pc + 4 (opword + disp16)
 
     // Begin a MOVEP: a pending slot1 one, OR a slot0 MOVEP (not blocked by a stash/replay),
     // while the MOVEP FSM AND the MOVEM/µcode sequencers are all idle.
