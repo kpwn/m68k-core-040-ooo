@@ -3816,14 +3816,34 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val walkGrantProgress = (dcache.loadCmd.valid && dcache.loadCmd.ready) ||
                             dcache.loadRsp.valid ||
                             (dcache.store.valid && dcache.store.ready) || dcache.storeAck
+    // ═══ THE WATCHDOG OBSERVES THROUGH A PIPELINE STAGE ════════════════════════════
+    // (2026-09-17, ROB head-pointer fanout family, ~29 failing setup paths named
+    //  `RobPlugin_logic_head_reg => LsEuPlugin_logic_walkWedgeCnt_reg`.)
+    //
+    // `walkGrantProgress` contains `dcache.store.valid` and `dcache.loadCmd.valid`,
+    // whose core legs are `sq.io.drain.valid` / the LS pipe's launch -- and BOTH carry
+    // StoreQueue's `robIds(head) === io.robHeadIn` and `p4AtRobHead` in their cones.
+    // That is how the ROB head pointer ends up feeding a WATCHDOG COUNTER: not by any
+    // design intent, just by being upstream of "did the shared D-cache port move this
+    // cycle". Registering the two observation terms cuts the entire cone -- the
+    // counter's inputs become flops, so nothing upstream of them is timed against it.
+    //
+    // WHY A CYCLE OF LAG IS FREE HERE. This is a saturating watchdog with
+    // `walkerWedgeLimit = 1 << 20`, and both terms are delayed by the SAME one cycle,
+    // so the reset/increment relationship is preserved exactly and the count is merely
+    // shifted. `walkerPortWedge` therefore latches one cycle later out of ~1,048,576 --
+    // and it is a sticky diagnostic folded into the halt-reason channel, with no
+    // datapath consumer whatsoever. IPC cost: zero cycles.
+    val walkGrantHeldReg     = RegNext(walkGrantHeld)     init False
+    val walkGrantProgressReg = RegNext(walkGrantProgress) init False
     val walkWedgeCnt = Reg(UInt(log2Up(walkerWedgeLimit + 1) bits)) init 0
-    when(!walkGrantHeld || walkGrantProgress) {
+    when(!walkGrantHeldReg || walkGrantProgressReg) {
       walkWedgeCnt := 0
     } elsewhen (walkWedgeCnt =/= U(walkerWedgeLimit, walkWedgeCnt.getWidth bits)) {
       walkWedgeCnt := walkWedgeCnt + 1
     }
     val walkerPortWedge = RegInit(False)
-    when(walkGrantHeld && (walkWedgeCnt === U(walkerWedgeLimit, walkWedgeCnt.getWidth bits))) {
+    when(walkGrantHeldReg && (walkWedgeCnt === U(walkerWedgeLimit, walkWedgeCnt.getWidth bits))) {
       walkerPortWedge := True
     }
     walkerPortWedge.simPublic()
