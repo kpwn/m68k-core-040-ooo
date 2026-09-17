@@ -76,6 +76,89 @@ object MmuDesc {
   def pgInhibited(d: Bits): Bool   = d(6)
   def pgSupervisor(d: Bits): Bool  = d(7)
   def pgPpn(d: Bits): UInt         = d(31 downto 12).asUInt
+  // The three upper attribute bits the ATC does NOT cache but MMUSR must report.
+  // MC68040 UM Fig 3-11, long-format page descriptor:
+  //   [11] UR (user reserved)  [10] G (global)  [9] U1  [8] U0
+  def pgUserReserved(d: Bits): Bool = d(11)
+  def pgGlobal(d: Bits): Bool       = d(10)
+  def pgU1(d: Bits): Bool           = d(9)
+  def pgU0(d: Bits): Bool           = d(8)
+
+  // ---- table-search byte offsets -------------------------------------------------
+  // SHARED so a second table-search implementation cannot drift from `TableWalker`'s.
+  // Both `TableWalker` and `ExceptionUnit`'s PTEST search read these; a change to the
+  // index arithmetic is now a change in ONE place. (Before PTEST existed the
+  // arithmetic was inline in TableWalker's three states; the bodies below are those
+  // expressions moved verbatim, not re-derived.)
+  /** Root-table byte offset: rootIdx(7) * 4. */
+  def rootOffset(vpn: UInt): UInt = (vpn(19 downto 13) ## U(0, 2 bits)).asUInt
+  /** Pointer-table byte offset: ptrIdx(7) * 4. */
+  def ptrOffset(vpn: UInt): UInt  = (vpn(12 downto 6) ## U(0, 2 bits)).asUInt
+  /** Page-table byte offset: PGI * 4 -- 6-bit PGI (VA[17:12]) at 4 KB, 5-bit
+    * (VA[17:13]) at 8 KB. Both branches are the same 8-bit width. */
+  def pageOffset(vpn: UInt, is8K: Bool): UInt = Mux(is8K,
+    (U(0, 1 bits) ## vpn(5 downto 1) ## U(0, 2 bits)).asUInt,
+    (vpn(5 downto 0) ## U(0, 2 bits)).asUInt)
+}
+
+/** MC68040 MMU STATUS REGISTER (MMUSR), UM Fig 3-13.
+  *
+  *   31       12 11 10  9  8  7  6  5  4  3  2  1  0
+  *   [   PA    ][B ][G][U1][U0][S][ CM ][M][0][W][T][R]
+  *
+  * It is DELIBERATELY the long-format page descriptor with three substitutions --
+  * [11] UR becomes B (bus error), [3] U becomes 0, and [1:0] PDT becomes {T, R} --
+  * which is why `fromPageDesc` below is a field-for-field re-tag of the descriptor
+  * rather than a table of unrelated bits.
+  *
+  *   R  resident: the table search completed and found a resident page descriptor
+  *   T  transparent: a TTR matched, so no table search was performed
+  *   W  write protected: the OR of every W bit down the search (table + page)
+  *   M  modified, S supervisor-only, CM cache mode, U0/U1 user bits, G global:
+  *      straight out of the leaf page descriptor
+  *   B  a descriptor READ took a bus error
+  *
+  * A Unix fault handler distinguishes "not present" from "protection violation" as
+  * `R == 0` versus `R == 1 && (W or S)`; that distinction is the reason this register
+  * has to be real. */
+object MmuSr {
+  /** Compose MMUSR from a completed table search.
+    *
+    * @param pa        the translated physical address (page-aligned; the offset bits
+    *                  are the VA's own, mirroring the load path's PA assembly)
+    * @param desc      the leaf PAGE descriptor, verbatim
+    * @param writeProt W accumulated down the whole search, not just the leaf's own bit
+    * @param resident  the search found a resident page descriptor
+    */
+  def fromPageDesc(pa: UInt, desc: Bits, writeProt: Bool, resident: Bool): Bits =
+    pa(31 downto 12).asBits ##          // [31:12] PA
+    False ##                            // [11]    B  (no bus error on this path)
+    desc(10 downto 8) ##                // [10:8]  G, U1, U0
+    desc(7) ##                          // [7]     S
+    desc(6 downto 5) ##                 // [6:5]   CM
+    desc(4) ##                          // [4]     M
+    False ##                            // [3]     always zero
+    writeProt ##                        // [2]     W (accumulated)
+    False ##                            // [1]     T (a table search, not a TTR hit)
+    resident                            // [0]     R
+
+  /** MMUSR for a search that never reached a resident page descriptor -- an invalid
+    * or non-resident descriptor at any level, or a descriptor read that bus-errored.
+    * R = 0 is the answer a page-fault handler acts on; W is still reported because the
+    * levels already walked accumulated it. */
+  def notResident(writeProt: Bool, busError: Bool): Bits =
+    B(0, 20 bits) ##                    // [31:12] PA  (no translation was produced)
+    busError ##                         // [11]    B
+    B(0, 8 bits) ##                     // [10:3]  G, U1, U0, S, CM, M, 0
+    writeProt ##                        // [2]     W (accumulated by the levels walked)
+    False ##                            // [1]     T
+    False                               // [0]     R = 0 -- NOT PRESENT
+
+  /** MMUSR for a TRANSPARENT-translation hit: T and R set, PA = VA, CM from the TTR.
+    * No table search runs, so G/U1/U0/S/M/W have no descriptor to come from and read
+    * zero (MC68040 UM: on a TTR hit the remaining status bits are not meaningful). */
+  def transparent(va: UInt, cm: Bits): Bits =
+    va(31 downto 12).asBits ## B(0, 5 bits) ## cm ## B(0, 3 bits) ## True ## True
 }
 
 /** Fault reasons flagged by a walk (no exception delivery this slice). */
