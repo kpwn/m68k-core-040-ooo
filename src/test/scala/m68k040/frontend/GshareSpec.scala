@@ -53,11 +53,13 @@ class GshareSpec extends AnyFunSuite {
       val uIdx   = in UInt (11 bits); val uTaken = in Bool ()
       val wV     = in Bool ();        val wPc = in UInt (32 bits)
       val wSlot  = in UInt (2 bits);  val wSeq = in UInt (8 bits)
+      val fRep   = in Bool ()
       g.logic.queryPc0    := qPc0
       g.logic.queryValid0 := qV0
       g.logic.shiftValid  := sV
       g.logic.shiftDir    := sD
       g.logic.invalidateAll := inval
+      g.logic.flushRepair   := fRep
       // Drive the plugin's own update Flow (override its idle default).
       g.logic.upd.valid        := uV
       g.logic.upd.payload.index := uIdx
@@ -69,6 +71,7 @@ class GshareSpec extends AnyFunSuite {
       val oTaken = out(Bool());        oTaken := g.logic.phtTaken0
       val oIndex = out(UInt(11 bits)); oIndex := g.logic.phtIndex0
       val oGhr   = out(UInt(16 bits)); oGhr   := g.logic.ghr
+      val oGhrArch = out(UInt(16 bits)); oGhrArch := g.logic.ghrArch
       val wRspV = out(Bool()); wRspV := win.windowRsp.valid
       val wRspSlot = out(UInt(2 bits)); wRspSlot := win.windowRsp.payload.token.ringSlot
       val wRspSeq = out(UInt(8 bits)); wRspSeq := win.windowRsp.payload.token.seq
@@ -91,6 +94,7 @@ class GshareSpec extends AnyFunSuite {
     dut.wire.logic.uV #= false; dut.wire.logic.uIdx #= 0; dut.wire.logic.uTaken #= false
     dut.wire.logic.wV #= false; dut.wire.logic.wPc #= 0
     dut.wire.logic.wSlot #= 0; dut.wire.logic.wSeq #= 0
+    dut.wire.logic.fRep #= false
     cd.waitSampling()
   }
 
@@ -233,6 +237,53 @@ class GshareSpec extends AnyFunSuite {
       w.wV #= false; cd.waitSampling(); sleep(1)
       assert(!w.wRspV.toBoolean, "window Flow must end after exactly eight results")
       assert(cmds == 8 && rsps == 8)
+    }
+  }
+
+  /** Pulse the ROB's registered commit-flush for one cycle. The repair is deliberately
+    * ONE FLOP behind it inside the plugin (no combinational term on the redirect path),
+    * so the restored value is only visible from the cycle after that. */
+  def flushRepair(dut: GshareDut, cd: ClockDomain): Unit = {
+    dut.wire.logic.fRep #= true
+    cd.waitSampling()
+    dut.wire.logic.fRep #= false
+    cd.waitSampling()
+    cd.waitSampling()
+  }
+
+  test("commit flush REPAIRS the whole GHR from the architectural history", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      // Two correct-path conditionals: the fetch side shifts the PREDICTED bit, the
+      // retire side (the update Flow the ROB drives) shifts the RESOLVED bit. Same
+      // sequence, so speculative and architectural histories agree.
+      shift(dut, cd, true);  train(dut, cd, 0, true)
+      shift(dut, cd, false); train(dut, cd, 0, false)
+      assert(dut.wire.logic.oGhr.toInt == 2, s"spec GHR ${dut.wire.logic.oGhr.toInt} != 2")
+      assert(dut.wire.logic.oGhrArch.toInt == 2, s"arch GHR ${dut.wire.logic.oGhrArch.toInt} != 2")
+
+      // A mispredict: three WRONG-PATH conditionals shift before the branch resolves.
+      shift(dut, cd, true); shift(dut, cd, true); shift(dut, cd, true)
+      assert(dut.wire.logic.oGhr.toInt == 0x17, s"polluted GHR ${dut.wire.logic.oGhr.toInt} != 0x17")
+      assert(dut.wire.logic.oGhrArch.toInt == 2, "arch GHR must be untouched by wrong-path shifts")
+
+      // The commit flush discards every wrong-path entry; the repair overwrites the WHOLE
+      // register with the architectural history. Pre-fix this test would still read 0x17
+      // and the next lookup would fold a history that never happened.
+      flushRepair(dut, cd)
+      assert(dut.wire.logic.oGhr.toInt == 2,
+        s"GHR ${dut.wire.logic.oGhr.toInt} was not repaired to the architectural 2")
+
+      // The repaired GHR is the one the next lookup folds.
+      val (_, idx) = read(dut, cd, 0x4000L)
+      assert(idx == idxOf(0x4000L, 2), s"post-repair index $idx != model ${idxOf(0x4000L, 2)}")
+
+      // invalidateAll clears BOTH histories (and beats a coincident repair).
+      dut.wire.logic.qV0 #= false
+      dut.wire.logic.inval #= true; cd.waitSampling(); dut.wire.logic.inval #= false
+      cd.waitSampling()
+      assert(dut.wire.logic.oGhr.toInt == 0 && dut.wire.logic.oGhrArch.toInt == 0,
+        "invalidateAll must clear the speculative AND the architectural GHR")
     }
   }
 }
