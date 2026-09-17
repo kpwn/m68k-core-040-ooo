@@ -248,6 +248,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
       gsh.logic.shiftValid    := fa.logic.gsShiftValid
       gsh.logic.shiftDir      := fa.logic.gsShiftDir
+      // Whole-GHR repair trigger -- MUST MIRROR top/FullCoreSynth.scala's
+      // BackendWiringPlugin. `doFlush` is the ROB's REGISTERED commit-flush pulse and
+      // the GsharePlugin consumes it behind one more flop, so nothing here reaches the
+      // redirect / ftbBlocked cone. Deliberately NOT feFlush/earlyFire/ftqMismatch --
+      // see the FullCoreSynth mirror for why.
+      gsh.logic.flushRepair   := doFlush
       gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
       gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
 

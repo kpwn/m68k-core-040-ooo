@@ -34,12 +34,22 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - shiftValid + shiftDir (IN)   : GHR shift control (from FetchAlign; shift on every
   *                                   emitted predicted conditional, dir = predicted bit).
   *  - update (Flow, IN via service): retire-time PHT train { index, taken }.
-  *  - invalidateAll (IN)           : ghr := 0 on the I-cache invalidate (PHT self-retrains).
+  *  - invalidateAll (IN)           : ghr/ghrArch := 0 on the I-cache invalidate (PHT self-retrains).
+  *  - flushRepair (IN)             : the ROB's registered commit-flush pulse; arms the
+  *                                   whole-GHR repair one cycle later (see below).
   *
-  * Recovery = ACCEPT CORRUPTION (no GHR checkpoint/restore): after a mispredict the GHR
-  * carries wrong-path bits that shift out naturally; the branch EU always verifies the
-  * actual direction/target → a gshare misprediction is only a perf loss (the existing
-  * commit-time redirect recovers). Mirrors the RAS. */
+  * Recovery = WHOLE-GHR REPAIR FROM THE ARCHITECTURAL HISTORY. `ghrArch` mirrors `ghr`
+  * but shifts at RETIRE, with the RESOLVED direction, on exactly the branches the fetch
+  * side shifted for; on the ROB's registered commit flush (`flushRepair`) the whole
+  * speculative `ghr` is overwritten with it, two cycles later (`RegNext` -> no new
+  * combinational term on the redirect path). Wrong-path bits are therefore ERASED
+  * rather than left to shift out over the next ghrBits branches. Without this a
+  * mispredicting alternating branch folds a DIFFERENT GHR on every execution, lands on
+  * a different PHT entry, and the 2-bit counters never accumulate -- "trains one entry,
+  * then reads another" rather than "learns slowly".
+  *
+  * The branch EU still verifies every direction/target, so a gshare miss remains a pure
+  * perf loss. */
 class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindowService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
@@ -92,6 +102,13 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     val shiftValid  = Bool();        shiftValid.allowOverride;  shiftValid  := False
     val shiftDir    = Bool();        shiftDir.allowOverride;    shiftDir    := False
     val invalidateAll = Bool();      invalidateAll.allowOverride; invalidateAll := False
+    // ---- flushRepair (IN): the ROB's REGISTERED commit-time flush pulse ----------
+    // One cycle wide and already a flop at the source (RobPlugin's `doFlushReg`). It is
+    // consumed ONLY through `repairArm = RegNext(flushRepair)` below, so this plugin adds
+    // NO combinational term to the redirect / ftbBlocked cone: the repair deliberately
+    // lands TWO cycles after the flush, which is free because a redirect already costs a
+    // full refetch (measured flush->first-commit distance is ~13 cycles).
+    val flushRepair = Bool();        flushRepair.allowOverride; flushRepair := False
 
     // ---- combinational read: phtTaken (>=2) + the 11-bit index, per query PC ----
     val phtIndex0 = indexOf(queryPc0)
@@ -150,14 +167,50 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     pht.write(upd.payload.index, uNew, enable = upd.valid)
 
     // ---- GHR speculative shift (from FetchAlign, on every emitted predicted cond) ----
-    // shift in the predicted direction bit: ghr := (ghr << 1) | shiftDir. NOT
-    // checkpointed/restored on a flush — wrong-path bits shift out (accept-corruption).
+    // shift in the predicted direction bit: ghr := (ghr << 1) | shiftDir. This is the
+    // PRIMARY (and, absent a flush, the only) producer of history; the repair below
+    // never inserts single bits alongside it, it overwrites the whole register.
     when(shiftValid) {
       ghr := (ghr(ghrBits - 2 downto 0) ## shiftDir).asUInt
     }
-    // ---- invalidateAll: clear the GHR (PHT left as-is; it self-retrains) ----
+
+    // ---- ARCHITECTURAL (retire-time) GHR + whole-GHR repair on a commit flush -----
+    // `ghrArch` is the history of RETIRED branches only. It shifts on exactly the same
+    // event set as the speculative `ghr` -- `upd.valid` pulses once per retiring branch
+    // that carried a fetch-time `phtValid`, and FetchAlignPlugin stamps `phtValid` on
+    // EXACTLY the branches it raises `gsShiftValid` for -- but with the
+    // RESOLVED direction instead of the predicted one, and in strict program order
+    // (retire is in-order). So `ghrArch` is, by construction, the bit-exact GHR the
+    // fetch side WOULD have had if every prediction had been right.
+    //
+    // On a commit-time flush every non-retired entry is discarded, so at that instant
+    // the correct speculative history IS `ghrArch`. `repairArm` therefore OVERWRITES
+    // THE WHOLE REGISTER with it. This is a repair, never a per-bit insertion: the
+    // fetch-time shift stays the primary/only producer of history in the common case,
+    // and nothing is ever interleaved between the two sources, so the GHR cannot stop
+    // representing the executed path.
+    //
+    // TIMING. `upd.valid` and the ROB's `doFlushReg` are both RegNext of the SAME
+    // retire-cycle decision, so they are coincident; `ghrArch` therefore absorbs the
+    // flushing branch's own bit at the end of that cycle, and `repairArm` (one more
+    // flop) reads the already-updated value. Two cycles late on purpose.
+    val ghrArch = RegInit(U(0, ghrBits bits)); ghrArch.simPublic()
+    when(upd.valid) {
+      ghrArch := (ghrArch(ghrBits - 2 downto 0) ## upd.payload.taken).asUInt
+    }
+    val repairArm = RegNext(flushRepair) init False; repairArm.simPublic()
+    // Repair WINS over a same-cycle speculative shift (whole-GHR overwrite semantics).
+    // It cannot race a legitimate correct-path branch in practice: the refetch after a
+    // redirect is an order of magnitude longer than the two cycles of repair latency.
+    when(repairArm) {
+      ghr := ghrArch
+    }
+    // ---- invalidateAll: clear BOTH histories (PHT left as-is; it self-retrains) ----
+    // Last, so it beats the repair: the repair would otherwise reinstall the pre-clear
+    // `ghrArch` (its own clear lands on the same edge).
     when(invalidateAll) {
       ghr := U(0, ghrBits bits)
+      ghrArch := U(0, ghrBits bits)
     }
   }
 }

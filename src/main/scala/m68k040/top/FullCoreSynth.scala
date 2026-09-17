@@ -241,6 +241,15 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
     gsh.logic.shiftValid    := fa.logic.gsShiftValid
     gsh.logic.shiftDir      := fa.logic.gsShiftDir
+    // Whole-GHR repair trigger. `doFlush` is the ROB's REGISTERED commit-time flush
+    // pulse (`doFlushReg`) -- a bare flop Q, and gshare consumes it behind one more
+    // flop, so this adds nothing to the redirect / ftbBlocked cone. Deliberately NOT
+    // `feFlush`/`earlyFire`: Tier 1 fires BEFORE the mispredicting branch reaches the
+    // ROB head, so the architectural GHR does not yet hold that branch's bit. And
+    // deliberately NOT `fa.logic.ftqMismatch` (unlike the RAS checkpoint above): an FTQ
+    // re-framing is frontend-only and does NOT squash already-dispatched branches, so
+    // repairing there would delete history bits that will never be re-shifted.
+    gsh.logic.flushRepair   := doFlush
     gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
     gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
     // STOP/fatal frontend quiesce is now carried by the ROB-owned

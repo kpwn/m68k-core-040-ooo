@@ -347,6 +347,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1
       gsh.logic.shiftValid    := faBtb.logic.gsShiftValid
       gsh.logic.shiftDir      := faBtb.logic.gsShiftDir
+      // Whole-GHR repair trigger -- mirrors top/FullCoreSynth.scala. The ROB's
+      // REGISTERED commit-flush pulse; GsharePlugin consumes it behind one more flop.
+      gsh.logic.flushRepair   := host[RedirectService].doFlush
       gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
       gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
 

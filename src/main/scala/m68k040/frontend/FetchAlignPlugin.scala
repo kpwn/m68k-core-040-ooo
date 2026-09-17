@@ -1267,7 +1267,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // shifted by retire, so only the carried index is right). This is INDEPENDENT of the
     // predicted direction: a predicted-NOT-taken conditional (slot0 not redirecting) is
     // ALSO trained, so both directions of the alternating beq learn.
-    when(condBtbHit0 && res.slot0Valid) {
+    // `!faultHold` makes this stamp EXACTLY the set `gsShiftValid` shifts the GHR for
+    // (below). That 1:1 correspondence is what lets the GsharePlugin rebuild the
+    // speculative GHR from its retire-time `ghrArch`: `gshareUpdate.valid` pulses once
+    // per retiring `phtValid` branch, so arch and speculative histories are the SAME
+    // bit sequence, one lagging the other. Without it, a branch emitted while an
+    // I-fetch fault is draining would be counted at retire but never at fetch, and
+    // every later repair would install a history shifted by one bit.
+    when(condBtbHit0 && res.slot0Valid && !faultHold) {
       feed.payload(0).phtValid := True
       feed.payload(0).phtIndex := gsPhtIndex0
     }
@@ -1520,8 +1527,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // next cycle (slot1WouldFtq / slot1WouldRasPred); a slot1 not-taken conditional that co-emits with slot0
     // simply loses its GHR bit (accept-corruption — its carried phtIndex still trains the
     // right entry at retire, so correctness is unaffected). The lookup index used the GHR
-    // BEFORE this shift; the carried phtIndex (stamped above) matches. NOT checkpointed/
-    // restored on a flush (accept-corruption).
+    // BEFORE this shift; the carried phtIndex (stamped above) matches. The GHR IS now
+    // repaired on a commit flush -- see GsharePlugin's `ghrArch`/`flushRepair`; this
+    // shift set and the `phtValid` stamp set above are deliberately identical so that
+    // repair installs a bit-exact history.
     val ftqConfirmCond = ftqConfirmFire && ftqHeadE.isCond
     gsShiftValid := ftqConfirmCond ||
                     (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm)
