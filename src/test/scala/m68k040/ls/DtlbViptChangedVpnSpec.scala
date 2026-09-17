@@ -26,7 +26,7 @@ class DTranslationTracePlugin extends FiberPlugin {
     val reqReady = out Bool ()
     val reqFire  = out Bool ()
     val reqVpn   = out UInt (20 bits)
-    val reqToken = out UInt (8 bits)
+    val reqToken = out UInt (m68k040.cache.DTranslationToken.Width bits)
     reqValid := xlate.req.valid
     reqReady := xlate.req.ready
     reqFire  := xlate.req.fire
@@ -37,7 +37,7 @@ class DTranslationTracePlugin extends FiberPlugin {
     val rspReady     = out Bool ()
     val rspFire      = out Bool ()
     val rspPpn       = out UInt (20 bits)
-    val rspToken     = out UInt (8 bits)
+    val rspToken     = out UInt (m68k040.cache.DTranslationToken.Width bits)
     val rspFault     = out Bool ()
     val rspCacheMode = out(CacheMode())
     rspValid     := xlate.rsp.valid

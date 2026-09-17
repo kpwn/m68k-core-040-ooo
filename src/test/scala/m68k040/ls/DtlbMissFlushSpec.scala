@@ -80,7 +80,7 @@ class DcacheMissTracePlugin extends FiberPlugin {
     val dcache = host[DcacheService]
     val resolveValid = out Bool ()
     val resolvePaddr = out UInt (32 bits)
-    val resolveToken = out UInt (8 bits)
+    val resolveToken = out UInt (m68k040.cache.DTranslationToken.Width bits)
     resolveValid := dcache.loadProbeResolve.valid
     resolvePaddr := dcache.loadProbeResolve.payload.paddr
     resolveToken := dcache.loadProbeResolve.payload.token

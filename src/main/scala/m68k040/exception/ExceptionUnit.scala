@@ -229,13 +229,22 @@ class ExceptionUnit(
     * robId[5:0]}`, and an ExceptionUnit-originated request has no natural `robId`. This
     * mirrors the ALREADY-ESTABLISHED sibling convention on the D-cache side, where
     * `DLoadToken`'s own doc comment reserves "[7] source (0 = LS ROB, 1 = serializing
-    * exception unit)" and this unit stamps `U(0x80)` on `dcLoadCmd.payload.token`. So:
-    * bit[7] = 1 (source = exception unit), bits[6:0] = 0.
+    * exception unit)" and this unit stamps `U(0x80)` on `dcLoadCmd.payload.token` --
+    * that sibling is `DLoadToken`, still 8 bits, and 0x80 is still its source bit. On
+    * THIS side the equivalent is now bit[8] = 1 (source = exception unit), bits[7:0] = 0,
+    * because `DTranslationToken` gained a ninth bit so the exclusion is structural.
     *
     * The token is NOT what makes response matching correct, and this is deliberate --
-    * `LsEuPlugin` can in principle produce the same 8-bit value, since all 64 robIds and
-    * both epoch/split bits are reachable. The REAL guarantee is structural, and holds
-    * without any token at all:
+    * the REAL guarantee is structural and holds without any token at all:
+    *
+    * (CORRECTED 2026-09-18. This paragraph used to read "`LsEuPlugin` can in principle
+    * produce the same 8-bit value, since all 64 robIds and both epoch/split bits are
+    * reachable" -- true while the DTLB token was 8 bits wide, and the reason the match
+    * was only ever defence in depth. `DTranslationToken` is now NINE bits, the LS
+    * composition occupies bits 7:0, and `robTag`'s top pad makes bit 8 structurally zero
+    * for every LS token, so it can no longer produce this value at all. The structural
+    * argument below is unchanged and is still the primary mechanism; the token match
+    * behind it is simply no longer defeatable.)
     *   (a) `xlate.req.valid := !excActive && ...` -- the LS pipe issues NO translation
     *       request for the entire duration of an episode, so nothing new can be launched
     *       alongside ours;
@@ -249,7 +258,13 @@ class ExceptionUnit(
     * token match below is defence in depth against that argument being invalidated by a
     * future multi-outstanding DTLB, and the constant gives such a change an obvious hook.
     */
-  val ExcDtlbToken = 0x80
+  /** 0x100: bit 8, the SOURCE bit `DTranslationToken` widened to nine bits to provide.
+    * The structural argument (a)-(c) above is still what makes response matching
+    * correct; what changed on 2026-09-18 is that the token match behind it is no longer
+    * defeatable even in principle -- the LS composition occupies bits 7:0 and cannot
+    * reach bit 8. See `DTranslationToken.Width` for why that exclusion was made
+    * structural rather than left to how wide the ROB happens to be. */
+  val ExcDtlbToken = 0x100
 
   /** VPN of the translation request currently outstanding (latched on request fire).
     * Also the source of the unwired-DUT identity default just below. */
