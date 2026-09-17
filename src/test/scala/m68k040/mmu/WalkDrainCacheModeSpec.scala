@@ -138,32 +138,53 @@ class WalkDrainCacheModeSpec extends AnyFunSuite {
       p.reqIn.valid #= false
       cd.waitSampling(2)
 
+      // Record the drain store's mode the CYCLE IT IS PRESENTED, from a fork started
+      // BEFORE the drain can begin. Polling after the fact races the sim memory agent,
+      // which accepts the store the cycle it appears -- `drainArmed` rises one cycle
+      // after the re-read response and `st.valid` drops as soon as it fires, so a poll
+      // that starts even one cycle late misses it entirely (measured twice).
+      val d = dut.dtlb.logic
+      var seenStoreMode: Option[String] = None
+      var armedMode: Option[String] = None
+      val watch = fork {
+        while (true) {
+          cd.waitSampling(); sleep(1)
+          if (armedMode.isEmpty && d.drainNeedRead.toBoolean) {
+            armedMode = Some(if (d.drainCmode.toEnum == CacheMode.WRITETHROUGH) "WRITETHROUGH"
+                             else "INHIBITED")
+          }
+          if (seenStoreMode.isEmpty && dut.walkPort.logic.st.valid.toBoolean) {
+            seenStoreMode = Some(dut.walkPort.logic.st.payload.cacheMode.toEnum.toString)
+          }
+        }
+      }
+
       // Commit it so the queued entry becomes drainable.
       p.commitValid #= true; p.commitId #= rob
       cd.waitSampling()
       p.commitValid #= false
 
-      // Watch the drain: arm -> re-read issued -> re-read RESPONSE consumed. The cycle
-      // `drainReadPend` falls is the seam the CACR write slips into.
-      val d = dut.dtlb.logic
-      g = 0
-      while (!d.drainReadPend.toBoolean && g < 400) { cd.waitSampling(); g += 1 }
-      assert(d.drainReadPend.toBoolean, "the drain's descriptor re-read must go out")
-      val modeAtReRead = if (d.drainCmode.toEnum == CacheMode.WRITETHROUGH) "WRITETHROUGH" else "INHIBITED"
-      g = 0
-      while (d.drainReadPend.toBoolean && g < 400) { cd.waitSampling(); g += 1 }
-      assert(!d.drainReadPend.toBoolean, "the re-read must complete")
+      // Wait until the drain has ARMED -- the cycle `drainCmode` latches the policy --
+      // then clear CACR.DE. Everything the drain still has to do (issue the re-read,
+      // consume its response, present the merged store) happens after this point, so a
+      // store that follows the LIVE policy will come out INHIBITED and one that follows
+      // the latch will come out WRITETHROUGH. Arming is a much wider window than the
+      // single cycle between the re-read response and the store, and it tests the same
+      // property: the latch is taken at `drainArmingNow`.
+      var g2 = 0
+      while (armedMode.isEmpty && g2 < 400) { cd.waitSampling(); g2 += 1 }
+      assert(armedMode.isDefined, "the U/M drain must arm (walk queued a U+M write, commit landed)")
 
-      // THE EVENT: a MOVEC to CACR clears DE here -- after the re-read, before the store.
+      // THE EVENT: a MOVEC to CACR clears DE, after the drain armed, before its store.
       p.policyInhibited #= true
-      cd.waitSampling()
 
-      // The store must carry the mode its own re-read ran under.
-      g = 0
-      while (!dut.walkPort.logic.st.valid.toBoolean && g < 400) { cd.waitSampling(); g += 1 }
-      assert(dut.walkPort.logic.st.valid.toBoolean, "the drain's store must be presented")
-      sleep(1)
-      val storeMode = dut.walkPort.logic.st.payload.cacheMode.toEnum.toString
+      g2 = 0
+      while (seenStoreMode.isEmpty && g2 < 400) { cd.waitSampling(); g2 += 1 }
+      watch.terminate()
+      assert(seenStoreMode.isDefined, "the drain's store must be presented")
+      val modeAtReRead = armedMode.get
+      val storeMode = seenStoreMode.get
+
       info(s"[latchDrainCmode=$latch] re-read ran $modeAtReRead, CACR.DE cleared before the " +
            s"store, store presented as $storeMode")
 
