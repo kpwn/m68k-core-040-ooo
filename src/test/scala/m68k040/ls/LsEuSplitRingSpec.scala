@@ -667,6 +667,89 @@ class LsEuSplitRingSpec extends AnyFunSuite {
 
 
 
+  /** THE SQUASH CLEAR ITSELF (2026-09-17, backlog item 9).
+    *
+    * The sweep above REFUTES the leak and then says, in its own words, why it is
+    * kept anyway: "`splitMergeLine` still has no reset and no squash clear, so
+    * its correctness rests entirely on that poison path". That is a statement
+    * about a coupling which lives somewhere else entirely -- in
+    * `alignedPoisoned`'s bookkeeping -- and which nothing in the merge itself
+    * would notice breaking.
+    *
+    * `splitMergeLine` now HAS a squash clear, a valid bit and a pairing tag, so
+    * the property can be asserted directly at the register instead of inferred
+    * from a downstream value. This is the fail-before / pass-after evidence for
+    * that change: on the old RTL the register still held slot A's captured line
+    * after the squash (and `splitMergeValid` did not exist at all).
+    *
+    * Timing is CALIBRATED, not assumed, for the same reason the sweep above
+    * calibrates: a squash that lands before slot A has responded would find the
+    * register empty anyway and the test would pass vacuously. The assertion that
+    * the captured line was non-zero BEFORE the squash is what rules that out.
+    */
+  test("a squash CLEARS splitMergeLine and its valid bit", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut)
+    val victimAddr = 0x3000L + 14    // a crossing LONG: two lines, one merge
+
+    val cfg = AxiMemModelConfig(
+      latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40))
+
+    // ── calibrate: when does slot A's response land? ────────────────────────
+    var slotA = -1
+    compiled.doSim("squashclear-calib") { dut =>
+      val (cd, mem) = initDut(dut, cfg)
+      preload(mem, 0x3000L, 32)
+      var cyc = 0
+      val seen = scala.collection.mutable.ArrayBuffer[Int]()
+      val run = new java.util.concurrent.atomic.AtomicBoolean(true)
+      fork { while (run.get()) { cd.waitSampling(); cyc += 1
+        if (dut.dcache.logic.loadRspPort.valid.toBoolean) seen += cyc } }
+      seed(dut, cd, preg = 10, value = victimAddr)
+      val t0 = cyc
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
+      waitCompletion(dut, cd, robId = 4, maxCycles = 800)
+      run.set(false)
+      assert(seen.size >= 2, s"calibration saw ${seen.size} responses; a split must produce 2")
+      slotA = seen.head - t0
+    }
+    info(s"slot A responds at +$slotA")
+
+    compiled.doSim("squashclear") { dut =>
+      val (cd, mem) = initDut(dut, cfg)
+      // Non-zero line content, so "captured" is distinguishable from "cleared".
+      preload(mem, 0x3000L, 32)
+      val l = dut.eu.logic
+      val s = dut.src.logic
+
+      seed(dut, cd, preg = 10, value = victimAddr)
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 4)
+
+      // Land squarely in the A-captured / B-pending window.
+      cd.waitSampling(slotA + 2)
+
+      assert(l.splitMergeValid.toBoolean,
+        "vacuity guard: slot A had not captured yet, so the squash below would " +
+        "have nothing to clear -- re-calibrate slotA")
+      val captured = l.splitMergeLine.toBigInt
+      assert(captured != 0,
+        "vacuity guard: slot A captured an ALL-ZERO line, so a cleared register " +
+        "would be indistinguishable from a held one -- preload non-zero data")
+
+      s.iSqFlush #= true
+      cd.waitSampling()
+      s.iSqFlush #= false
+      cd.waitSampling(2)
+
+      assert(!l.splitMergeValid.toBoolean,
+        "splitMergeValid survived a squash -- a later pair's slot B could merge " +
+        "against this orphaned line")
+      assert(l.splitMergeLine.toBigInt == 0,
+        f"splitMergeLine still holds the squashed pair's slot-A line " +
+        f"(0x${l.splitMergeLine.toBigInt}%032x) -- the residue after a squash must " +
+        "be a known constant, not another instruction's data")
+    }
+  }
+
   /** The split-pair invariant under REORDERED / CHAOS response ordering.
     *
     * `splitMergeLine`'s safety argument is that "slot B is always the very next

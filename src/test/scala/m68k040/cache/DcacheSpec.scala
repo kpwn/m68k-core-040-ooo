@@ -2517,6 +2517,93 @@ class DcacheSpec extends AnyFunSuite {
     }
   }
 
+  // ── backlog item 7 (2026-09-17) ─────────────────────────────────────────────
+  // The early-probe CAM matched on token + VIRTUAL address only, and NOTHING
+  // re-checked the PHYSICAL address at consume time. The entry's data was read
+  // using the probe's `paddrHint`; the command that later claims it carries its
+  // own, independently translated `paddr`. Those are two different points in
+  // time and need not agree -- and when they disagreed, the fast path served a
+  // value read from a DIFFERENT physical line at the right virtual address, with
+  // nothing to say so. The file documented the hazard; the only protection was a
+  // `GenerationFlags.simulation` assert.
+  //
+  // This is the fail-before / pass-after pair. The alias differs by 0x800, which
+  // is bit 11: set bits are vaddr[10:4] so the SET is identical and the TAG is
+  // not -- exactly the case a virtual-only CAM cannot distinguish.
+  //
+  // The first half is a POSITIVE CONTROL and is not decoration: without it a
+  // regression that simply disabled the fast path altogether would make the
+  // second half pass vacuously.
+  test("VIPT slice B2: a probe whose paddrHint disagrees with the command's paddr " +
+       "must NOT be consumed", VerilatorTest) {
+    sharedCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base  = 0x7C00L
+      val addr  = base + 8
+      val alias = addr + 0x800L      // same set (bits [10:4]), different tag
+      preload(mem, base, 16)
+      preload(mem, alias - 8, 16)
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      cd.waitSampling(8)
+
+      def probe(token: Int, hint: Long): Unit = {
+        dut.probe.logic.loadProbeIn.valid #= true
+        dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+        dut.probe.logic.loadProbeIn.payload.token #= token
+        dut.probe.logic.loadProbeIn.payload.resolved #= true
+        dut.probe.logic.loadProbeIn.payload.paddrHint #= hint
+        dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+        dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.loadProbeIn.payload.needsLine #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+                             dut.probe.logic.loadProbeIn.ready.toBoolean)
+        dut.probe.logic.loadProbeIn.valid #= false
+        var w = 0
+        while (!dut.dcache.logic.earlyProbeFresh.toBoolean && w < 8) { cd.waitSampling(); w += 1 }
+        assert(dut.dcache.logic.earlyProbeFresh.toBoolean,
+          s"probe result must become ready (waited $w cycles)")
+      }
+      def presentCmd(token: Int, paddr: Long): Unit = {
+        dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+        dut.probe.logic.loadCmdIn.payload.paddr #= paddr
+        dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.loadCmdIn.payload.token #= token
+        sleep(1)
+      }
+      def runCmd(): BigInt = {
+        dut.probe.logic.loadCmdIn.valid #= true
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+                             dut.probe.logic.loadCmdIn.ready.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+        dut.probe.logic.loadRspOut.payload.data.toBigInt
+      }
+
+      // ── POSITIVE CONTROL: hint == paddr, the fast path MUST engage ────────
+      probe(0x31, addr)
+      presentCmd(0x31, addr)
+      assert(dut.dcache.logic.useEarlyProbe.toBoolean,
+        "vacuity guard: an AGREEING probe must still be consumed -- if this fails, " +
+        "the negative case below proves nothing")
+      assert(runCmd() == expected(addr, 4), "agreeing probe must return its own line")
+      cd.waitSampling(6)
+
+      // ── THE DEFECT: same VA, same token, DIFFERENT physical tag ───────────
+      probe(0x32, addr)
+      presentCmd(0x32, alias)
+      assert(!dut.dcache.logic.useEarlyProbe.toBoolean,
+        "a probe read with paddrHint=0x%x was consumed by a command whose paddr is " .format(addr) +
+        "0x%x -- same virtual address, DIFFERENT physical line. ".format(alias) +
+        "The CAM must compare the physical tag too.")
+      val got = runCmd()
+      assert(got == expected(alias, 4),
+        f"command with paddr=0x$alias%x returned 0x$got%x, expected " +
+        f"0x${expected(alias, 4)}%x -- it was served the probe's line, not its own")
+      cd.waitSampling(6)
+    }
+  }
+
   test("VIPT D2: a same-set store write stales a held snapshot and forces updated fallback",
        VerilatorTest) {
     sharedCompiled.doSim { dut =>

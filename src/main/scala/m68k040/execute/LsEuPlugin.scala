@@ -2420,10 +2420,51 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // and completes the instruction as a fault HERE, exactly like the aligned
     // (non-split) fault arm; slot B is never sent for that case, so it can never
     // reach this block at all.
-    val splitMergeLine = Reg(Bits(128 bits))
+    //
+    // ── CHECKED, NOT ARGUED (2026-09-17, backlog item 9) ─────────────────────
+    // Everything above is an ARGUMENT, and the register it defends had no valid
+    // bit, no pairing tag, no reset and no squash clear.  Its correctness rested
+    // entirely on a coupling that is implicit and lives somewhere else: the only
+    // thing stopping a LATER pair's slot B merging against a PREVIOUS pair's
+    // residual line is that a flush poisons BOTH halves, so slot B's own capture
+    // is skipped too.  That coupling is in `alignedPoisoned`'s bookkeeping, not
+    // in the merge, and nothing here would notice if it broke -- a longword
+    // assembled from two unrelated lines still looks like an address, which is
+    // precisely the shape of the wrong-PC-on-RTE defect.
+    //
+    // Three things make it self-defending instead:
+    //
+    //  1. A VALID bit, set when slot A captures and cleared when slot B consumes.
+    //  2. A PAIRING TAG -- the pair's robId.  Slot A and slot B are two halves of
+    //     ONE instruction, so their `bk.robId` is the same; a slot B whose robId
+    //     does not match the line in the register is, by construction, not the
+    //     partner of whatever put it there.
+    //  3. A SQUASH CLEAR.  On `sqFlushSig` the line is zeroed and the valid bit
+    //     dropped, so a stale line cannot outlive the flush that orphaned it even
+    //     if the poison coupling ever stops holding.  Clearing to a CONSTANT is
+    //     what makes the residue deterministic rather than another instruction's
+    //     data, and it is free: `when(cond) { reg := 0 }` maps to the flops' own
+    //     synchronous-reset pin, not to 128 LUTs of mux on their D.
+    //
+    // The pairing check itself is a simulation assertion rather than a hardware
+    // mux, deliberately: a mismatch means the ring's send/response ordering has
+    // ALREADY desynced, which is a deeper bug than this register, and gating the
+    // merge on it in hardware would cost a 128-bit mux on the merge path to
+    // substitute one wrong answer for another.  What hardware guarantees is the
+    // part that actually reduces harm -- that the residue after a squash is a
+    // known constant, not a previous instruction's line.
+    val splitMergeLine  = Reg(Bits(128 bits)) init B(0, 128 bits)
+    val splitMergeValid = RegInit(False)
+    val splitMergeRob   = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
+    // Test-visibility only (LsEuSplitRingSpec's squash-clear fence); no-op for
+    // synthesis, same idiom as DcachePlugin's `earlyProbeStale.simPublic()`.
+    splitMergeLine.simPublic()
+    splitMergeValid.simPublic()
     when(alignedRspFire && !alignedRspIsPoison) {
       when(alignedRspIsSplitA && !dcache.loadRsp.payload.fault) {
-        splitMergeLine := dcache.loadRsp.payload.line
+        splitMergeLine  := dcache.loadRsp.payload.line
+        splitMergeValid := True
+        splitMergeRob   := alignedRspEntry.bk.robId
       } otherwise {
         val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
                                         !alignedRspEntry.bk.xlateSup
@@ -2434,15 +2475,42 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           // Slot B: merge slot A's captured line with this cycle's own line using
           // the ORIGINAL access offset/size (mirrors the old bkFsm WAIT_B arm's
           // `extractCross(lineA, loadRsp.line, llReg.vaddr(3:0), llReg.size)`).
+          //
+          // backlog item 9: the line being merged must be THIS pair's slot A, and
+          // it must still be there.  Both are invariants of the ring's ordering,
+          // so they are CHECKED every time the merge runs rather than left as the
+          // paragraph above.
+          GenerationFlags.simulation {
+            assert(splitMergeValid,
+              "LsEuPlugin: split slot B merged against an EMPTY splitMergeLine -- " +
+              "slot A never captured, or a squash cleared it and slot B was not " +
+              "poisoned with it. The merged longword would be half constant zero.",
+              FAILURE)
+            assert(!splitMergeValid || (splitMergeRob === alignedRspEntry.bk.robId),
+              "LsEuPlugin: split slot B merged against ANOTHER PAIR's line " +
+              "(splitMergeRob != this entry's robId) -- the aligned ring's " +
+              "send/response ordering has desynced. The merged longword is " +
+              "assembled from two unrelated lines.",
+              FAILURE)
+          }
           val merged = m68k040.cache.DcacheByteLane.extractCross(
             splitMergeLine, dcache.loadRsp.payload.line,
             alignedRspEntry.mergeOff, alignedRspEntry.size)
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
+          splitMergeValid := False   // consumed
         } otherwise {
           captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
                                 alignedRspEntry.size)
         }
       }
+    }
+    // backlog item 9: a squash orphans whatever slot A left here.  Elaborated
+    // AFTER the capture above so it wins on the edge a flush and a slot-A
+    // response coincide -- that response is being poisoned anyway.  The 128-bit
+    // clear costs no LUTs (it is the flops' synchronous-reset pin).
+    when(sqFlushSig) {
+      splitMergeLine  := B(0, 128 bits)
+      splitMergeValid := False
     }
 
     // ── SPLIT-ACCESS REPLAY FSM: owns the cold two-line D-cache access ─────────

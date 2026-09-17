@@ -314,10 +314,39 @@ object DcacheByteLane {
         "See DLoadCmd.lineOnly.",
         FAILURE)
     }
+    // ── THE WRAP IS NOW CLOSED IN HARDWARE TOO (2026-09-17) ────────────────────
+    // The tripwire above is simulation-only, so on silicon a crossing access still
+    // returned the line's OWN HEAD BYTES -- data that is plausible, aliased to real
+    // memory, and therefore silently wrong.  That is exactly the shape of the
+    // wrong-PC-on-RTE defect: a longword assembled half from the frame and half
+    // from the top of the same line still looks like an address.
+    //
+    // The lanes below replace those head bytes with a CONSTANT ZERO, and they do it
+    // for FREE -- no extra logic level, in fact slightly LESS logic than before.
+    //
+    // WHY IT IS FREE.  `bytes(off + k)` is a 16:1 mux whose select is `off + k` mod
+    // 16.  Which mux INPUTS can a wrap reach?  For lane k, index j is produced by
+    // off = j - k mod 16, and that is a wrap exactly when j < k:
+    //
+    //     lane 1 (off+1): index 0 <- off=15                    -> wrap-only
+    //     lane 2 (off+2): index 0 <- off=14, index 1 <- off=15 -> wrap-only
+    //     lane 3 (off+3): indices 0,1,2 <- off=13,14,15        -> wrap-only
+    //
+    // So "did this lane wrap" is a property of the SELECTED INDEX, not a separate
+    // predicate that would have to be ANDed onto the mux output.  Tying those
+    // inputs to a literal zero is therefore exact -- every legal (off, size) pair
+    // reads an index >= k and is bit-identical to before -- and it costs a mux
+    // input becoming a constant, which the synthesiser folds away.
+    //
+    // The assertion is KEPT: zero is deterministic, not correct.  A requester that
+    // needs the bytes past the line end must still split the access; this only
+    // guarantees that if one does not, it cannot be handed a convincing lie.
+    def lane(k: Int): Bits =
+      Vec((0 until 16).map(j => if (j < k) B(0, 8 bits) else bytes(j)))(off + k)
     val b0 = bytes(off)
-    val b1 = bytes(off + 1)
-    val b2 = bytes(off + 2)
-    val b3 = bytes(off + 3)
+    val b1 = lane(1)
+    val b2 = lane(2)
+    val b3 = lane(3)
     val result = Bits(32 bits)
     result := B(0, 32 bits)
     switch(size) {
