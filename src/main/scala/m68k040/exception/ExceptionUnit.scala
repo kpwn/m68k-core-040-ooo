@@ -2127,7 +2127,23 @@ class ExceptionUnit(
         // field is discarded — m68ki_fake_pull_32 — so its parity is architecturally
         // irrelevant). `popPc` was already captured in R_PCWAIT above (frameBase+2,
         // same offset for every format).
-        val pcOdd = fmtOk && !popIs1 && popPc(0)
+        // `popIs1` is a Reg ASSIGNED FOUR LINES ABOVE, so reading it here returns Q --
+        // the PREVIOUS pop's nibble, not this frame's. Its siblings `popIs7`/`popIs2` are
+        // read a cycle later (in `R_REDIR`) and were therefore always correct; this was
+        // the only same-cycle read of the family. Two live consequences, both closed by
+        // using the combinational `nib` that every other term in this scope already uses:
+        //   1. On the M=1 THROWAWAY path the first ($1) pop set the register, and
+        //      `R_REDIR` loops back to `R_SRREQ` -- so the SECOND, REAL format-$0 pop
+        //      re-entered this state with `popIs1` still reading True and the odd-PC
+        //      guard DISABLED. Every M=1 interrupt return could redirect to an odd PC
+        //      instead of raising vector 3: a diagnosable address error became a wild
+        //      PC, which is exactly how a fault at an immutable ROM address presents as
+        //      a transient F-line/illegal that "re-executes correctly on continue".
+        //   2. On the first ($1) pop the guard read a STALE True/False from whatever
+        //      RTE ran before, so a $1 frame with an odd (architecturally discarded) PC
+        //      field could raise a spurious vector 3.
+        // `nib` is already in `fmtOk`'s cone one line below, so this adds no logic level.
+        val pcOdd = fmtOk && (nib =/= U(1, 4 bits)) && popPc(0)
         when(fmtOk && !pcOdd) {
           goto(R_REDIR)
         } elsewhen(pcOdd) {
