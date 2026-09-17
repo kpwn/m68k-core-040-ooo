@@ -54,6 +54,14 @@ class LsEuSpec extends AnyFunSuite {
     cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
+    // `iSqCommitRob` is the PAYLOAD of that commit port and was the one input this
+    // fixture never drove. It is gated by `iSqCommitValid` (held false here), so it is
+    // harmless today -- but an undriven input is randomised per seed, and this spec
+    // already has history with exactly that: see `iLeaAddr` below, where a randomised
+    // default sent EVERY load down the LEA address-generate path. Leaving one behind is
+    // leaving a trap for whoever next chases the intermittent "load hit (second load
+    // same line)" failure in this file.
+    s.iSqCommitRob #= 0
     s.iStkPush #= false
     s.iLeaAddr #= false   // MUST default: undriven -> randomized per seed -> every load
                           // takes the LEA address-generate path (dst = EA, not the data).
