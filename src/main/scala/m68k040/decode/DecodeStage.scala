@@ -885,10 +885,21 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val s0FpEaIsAbsPc = (s0FpGenEaMode === B"3'b111") &&
                         ((s0FpGenEaReg === B"3'b000") || (s0FpGenEaReg === B"3'b001") ||
                          (s0FpGenEaReg === B"3'b010"))
+    // FAIL-SAFE (2026-09-17): mode 110 is admitted only in its BRIEF form. The FMOVEM.X
+    // FSM's own EA mux (`fxIsIdxAn = (fxMode === 110) && !fxIdxExt(8)`) recognises the
+    // brief format ONLY, so a FULL-format word reaching the FSM matched no arm of
+    // `fxBaseDisp` and silently degraded to a bare `(An)` -- a WRONG ADDRESS with no
+    // fault, the exact silent-corruption class this file's memory-indirect routing notes
+    // warn about ("anything they do NOT claim must fall through to the fail-safe and
+    // TRAP, not be handed to a chain that will compute the wrong address"). Excluding it
+    // here routes it to the pre-existing F-line trap instead. This is a HARDENING, not
+    // the memory-indirect feature: FMOVEM.X is an FSM, not a microcode family, so giving
+    // it real full-format/memory-indirect support is separate work. Measured ROM
+    // exposure is zero -- the Q700 FP package has no FMOVEM.X with a full-format EA.
     val s0IsFpGenMemEa = (s0opw(15 downto 9) === B"7'b1111001") && (s0opw(8 downto 6) === B"3'b000") &&
                          ((s0FpGenEaMode === B"3'b010") || (s0FpGenEaMode === B"3'b101") ||
                           (s0FpGenEaMode === B"3'b011") || (s0FpGenEaMode === B"3'b100") ||
-                          (s0FpGenEaMode === B"3'b110") || s0FpEaIsAbsPc)
+                          ((s0FpGenEaMode === B"3'b110") && !s0pkt.words(2)(8)) || s0FpEaIsAbsPc)
     // The real ext word (`words(1)`, right after the opword — mirrors `movemEntryPkt`'s own
     // `eMask = words(1)` layout, and `ucFpExt`'s identical positioning): opclass[15:13] (110
     // load / 111 store — store is task #242, so only 110 is admitted here), bit[11] = static
@@ -1785,9 +1796,20 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // brackets) are OUT of this task's scope (not listed among Task 5's covered modes) --
     // `EaClass.MEMSIMPLE` excludes them (mirrors the bit-field-memory family's own
     // MEMSIMPLE-vs-MEMINDIRECT routing split).
+    // FULL-FORMAT MEMORY-INDIRECT EAs are now IMPLEMENTED (2026-09-17), not rejected.
+    // A real MC68040 executes an FP instruction through `([bd,An],od)` and friends
+    // (M68040UM 9.6.1 scopes the unimplemented-instruction F-line to instruction
+    // PATTERNS, never to addressing modes; App. D-2 lists memory-indirect addressing as
+    // a supported 68020/030/040 extension), and so does Musashi, this project's own
+    // lock-step oracle. Rejecting them cost the Quadra 700 ROM 72 SANE sites -- SANE
+    // passes operands as POINTERS and dereferences them inside the FP instruction, so
+    // EVERY SANE floating-point call was trapping into the FPSP. See
+    // `Microcode.fpMemMemIndGroup` for the program and the full evidence.
+    val ucFpEaIsMemInd = ucBfEaDec.klass === EaClass.MEMINDIRECT
+    val ucFpEaOk       = (ucBfEaDec.klass === EaClass.MEMSIMPLE) || ucFpEaIsMemInd
     val ucFpMemBad =
       (ucFpOpClass =/= B"3'b010") || (ucFpSrcSpec === B"3'b011") ||
-      !ucFpNative || (ucBfEaDec.klass =/= EaClass.MEMSIMPLE)
+      !ucFpNative || !ucFpEaOk
     // Signed per-format An auto-increment/decrement delta (SFpAutoDelta). Byte gets the
     // A7 word-alignment quirk (mirrors `deltaBytesU`'s existing special-case); every other
     // format is >=2 bytes so the quirk (byte-access-only, per general 68k semantics) never
@@ -1904,9 +1926,14 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // There is NO opmode whitelist here, and that is correct rather than an omission: for
     // opclass 011 ext[6:0] is not an opmode at all -- it is the Packed k-factor, and Packed
     // is already excluded.
+    // MEMINDIRECT admitted 2026-09-17 alongside the load direction (see `ucFpEaOk`).
+    // `!pcRel` STAYS, and stays correct for the memory-indirect forms too: the M68000PRM
+    // classes put every program-counter mode -- including the PC memory-indirect brackets
+    // -- in CONTROL but NOT ALTERABLE, so a store through one is illegal on real silicon
+    // and keeps taking the same clean vector-11 trap it takes today.
     val ucFpStoreOk = (ucFpOpClass === B"3'b011") &&
                       (ucFpSrcSpec =/= B"3'b011") && (ucFpSrcSpec =/= B"3'b111") &&
-                      (ucBfEaDec.klass === EaClass.MEMSIMPLE) && !ucBfEaDec.pcRel
+                      ucFpEaOk && !ucBfEaDec.pcRel
     // ── FULL-format MEMORY-INDIRECT host-op Ctx population (spec §5) ──────────────
     // A general EA-taking op (MOVE/ALU/imm/single-EA) whose EA is a full-format memory-
     // indirect mode routes through the engine: [LOAD.L pointer -> T0] then the host op at
@@ -2362,7 +2389,13 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     ucLeaMi.simPublic(); ucPeaMi.simPublic(); ucJmpMi.simPublic(); ucJsrMi.simPublic()
     // Populate the MI Ctx group + (reuse the EA infra) the pointer-load EA fields. The host
     // size = spec.size; the pointer load is always LONG. od/post from the chosen EaSpec.
-    ucEntryCtx.miOd         := ucMiEa.od
+    // `ucMiEa` is the INTEGER EA decode, taken from the UNSHIFTED extension words. An FP
+    // instruction's EA extensions sit one word later (the FP ext word comes first), so for
+    // the FP memory-indirect family these two must come from `ucBfEaDec` -- the same decode
+    // `ucFpMemBad`, `eaBase` and `eaIndex*` above already use for this family. Reading
+    // `ucMiEa` here would walk the pointer chain with a displacement decoded from the wrong
+    // word. (2026-09-17, with the FP memory-indirect EA support.)
+    ucEntryCtx.miOd         := Mux(ucIsFpMem, ucBfEaDec.od, ucMiEa.od)
     // task #203: a bit-field op's memory-indirect EA is decoded SEPARATELY (`ucBfEaDec`,
     // over the bf-ext-shifted word window — a plain-op decode over `ucMiEa`'s own window
     // would misread a bit-field's ext words entirely). `ctx.miPost` is READ by the NEW
@@ -2370,7 +2403,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // this override strictly to `ucEntrySpec.op === DecOp.BITFIELD` so a NON-bit-field
     // memory-indirect op (which owns the real `ucMiEa` window) is completely unaffected
     // (zero regression risk to the already-working §5 host-op indexed-memind family).
-    ucEntryCtx.miPost       := Mux(ucEntrySpec.op === DecOp.BITFIELD, ucBfEaDec.memPost, ucMiEa.memPost)
+    ucEntryCtx.miPost       := Mux(ucIsFpMem || (ucEntrySpec.op === DecOp.BITFIELD), ucBfEaDec.memPost, ucMiEa.memPost)
     ucEntryCtx.miOp         := ucEntrySpec.op
     // BITOP (BTST/BCHG/BCLR/BSET) tt sub-kind (task #152): OperationDecoder carries it as
     // opword[7:6] regardless of static/dynamic form (see OperationDecoder.scala's `tt`),
@@ -2616,17 +2649,22 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // getWidth`) is only in scope from here on, mirroring every other `ucXxxEntry` helper
     // in this section (`ucMovesEntry`/`ucBfDynRdEntry`/etc, all likewise computed here
     // rather than at the early population point).
-    def ucFpEntryForFmt(base: Int, autoPost: Int, autoPre: Int): UInt =
+    // `memInd` added 2026-09-17: a full-format MEMORY-INDIRECT EA is never mode 3/4
+    // (those are the register-indirect auto modes), so it is a clean extra arm rather
+    // than a re-ordering of the existing three. Its entry address comes from the SAME
+    // `scanLeft`-generated table as the ROM rows, so the two cannot drift.
+    def ucFpEntryForFmt(base: Int, autoPost: Int, autoPre: Int, memInd: Int): UInt =
+      Mux(ucFpEaIsMemInd,              U(memInd,   ew bits),
       Mux(ucFpEaMode === U(3, 3 bits), U(autoPost, ew bits),
-      Mux(ucFpEaMode === U(4, 3 bits), U(autoPre, ew bits),
-                                        U(base, ew bits)))
+      Mux(ucFpEaMode === U(4, 3 bits), U(autoPre,  ew bits),
+                                        U(base,    ew bits))))
     val ucFpRealEntryOk = ucFpSrcSpec.mux(
-      B"3'b000" -> ucFpEntryForFmt(Microcode.FP_MEM_L_ENTRY, Microcode.FP_MEM_L_AUTO_POST_ENTRY, Microcode.FP_MEM_L_AUTO_PRE_ENTRY),
-      B"3'b001" -> ucFpEntryForFmt(Microcode.FP_MEM_S_ENTRY, Microcode.FP_MEM_S_AUTO_POST_ENTRY, Microcode.FP_MEM_S_AUTO_PRE_ENTRY),
-      B"3'b010" -> ucFpEntryForFmt(Microcode.FP_MEM_X_ENTRY, Microcode.FP_MEM_X_AUTO_POST_ENTRY, Microcode.FP_MEM_X_AUTO_PRE_ENTRY),
-      B"3'b100" -> ucFpEntryForFmt(Microcode.FP_MEM_W_ENTRY, Microcode.FP_MEM_W_AUTO_POST_ENTRY, Microcode.FP_MEM_W_AUTO_PRE_ENTRY),
-      B"3'b101" -> ucFpEntryForFmt(Microcode.FP_MEM_D_ENTRY, Microcode.FP_MEM_D_AUTO_POST_ENTRY, Microcode.FP_MEM_D_AUTO_PRE_ENTRY),
-      B"3'b110" -> ucFpEntryForFmt(Microcode.FP_MEM_B_ENTRY, Microcode.FP_MEM_B_AUTO_POST_ENTRY, Microcode.FP_MEM_B_AUTO_PRE_ENTRY),
+      B"3'b000" -> ucFpEntryForFmt(Microcode.FP_MEM_L_ENTRY, Microcode.FP_MEM_L_AUTO_POST_ENTRY, Microcode.FP_MEM_L_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 2)),
+      B"3'b001" -> ucFpEntryForFmt(Microcode.FP_MEM_S_ENTRY, Microcode.FP_MEM_S_AUTO_POST_ENTRY, Microcode.FP_MEM_S_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 3)),
+      B"3'b010" -> ucFpEntryForFmt(Microcode.FP_MEM_X_ENTRY, Microcode.FP_MEM_X_AUTO_POST_ENTRY, Microcode.FP_MEM_X_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 5)),
+      B"3'b100" -> ucFpEntryForFmt(Microcode.FP_MEM_W_ENTRY, Microcode.FP_MEM_W_AUTO_POST_ENTRY, Microcode.FP_MEM_W_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 1)),
+      B"3'b101" -> ucFpEntryForFmt(Microcode.FP_MEM_D_ENTRY, Microcode.FP_MEM_D_AUTO_POST_ENTRY, Microcode.FP_MEM_D_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 4)),
+      B"3'b110" -> ucFpEntryForFmt(Microcode.FP_MEM_B_ENTRY, Microcode.FP_MEM_B_AUTO_POST_ENTRY, Microcode.FP_MEM_B_AUTO_PRE_ENTRY, Microcode.fpMemIndEntry(false, 0)),
       default   -> U(Microcode.FP_MEM_TRAP_ENTRY, ew bits)   // 011 Packed / 111 n/a -- ucFpMemBad already rejects 011
     )
     // Task 9b: the FMOVEM control-register LIST family's own 18-way dispatch
@@ -2647,8 +2685,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val ucFpStoreEntry = {
       def e(bucket: Int, code: Int) =
         U(Microcode.fpStoreEntry(bucket, Microcode.fpStoreFmtIdx(code)), ew bits)
-      def byBucket(code: Int) = Mux(ucFpCtrlPostinc, e(1, code),
-                                Mux(ucFpPredec,     e(2, code), e(0, code)))
+      def mi(code: Int) = U(Microcode.fpMemIndEntry(true, Microcode.fpStoreFmtIdx(code)), ew bits)
+      def byBucket(code: Int) = Mux(ucFpEaIsMemInd,  mi(code),
+                                Mux(ucFpCtrlPostinc, e(1, code),
+                                Mux(ucFpPredec,      e(2, code), e(0, code))))
       ucFpSrcSpec.mux(
         B"3'b000" -> byBucket(0),   // Long
         B"3'b001" -> byBucket(1),   // Single

@@ -1174,6 +1174,19 @@ object OperationDecoder {
              !((fpT001M === B"111") && (fpT001R >= 2)) &&
              (opword =/= B"16'hF27F")) {
           o.form := OpForm.FSCC
+          // FScc <ea> is a BYTE operation (M68000PRM: the destination byte is set to
+          // 0x00 or 0xFF), and `o.size` feeds the offloaded EaDecoder call whose
+          // `autoDelta` is what folds the `An := An +/- delta` write-back for a
+          // -(An)/(An)+ destination. Without this fix-up an FScc predecrement/
+          // postincrement stepped An by the OpSpec WORD default (2) instead of 1 --
+          // and EaDecoder's own A7-byte rule (BYTE on A7 -> 2, keep the stack even)
+          // never applied either, so `fsf -(%a7)` moved A7 by the wrong amount too.
+          // This is EXACTLY the fix-up the integer Scc sibling already carries at the
+          // line-5 `ss === 3` arm above (`when(ss === 3) { o.size := Size.BYTE }`);
+          // FScc needs it for the identical reason and was missed when the family
+          // was added. MicroOpAssembler's `rmwStUop.size` already forced BYTE for the
+          // STORE itself, which is why only the An delta was wrong.
+          o.size := Size.BYTE
         }
         // ── CPUSH/CINV (line-1111, top byte 0xF4: 1111 0100 CC O SS AAA -- Task P5.1's
         // cross-checked encoding): privileged cache push/invalidate. bit[5]=1 selects

@@ -1991,6 +1991,94 @@ object Microcode {
       }
     }.toVector
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // MEMORY-INDIRECT EA bucket, BOTH directions (2026-09-17).
+  //
+  // WHY THIS EXISTS. Until now `ucFpMemBad` rejected every EA whose class was not
+  // `MEMSIMPLE`, so an FP instruction with a full-format MEMORY-INDIRECT `<ea>` --
+  // `([bd,An],od)`, `([bd,An,Xn],od)`, and the PC-relative brackets -- took a vector-11
+  // F-line trap. A real MC68040 EXECUTES those: M68040UM 9.6.1 scopes the unimplemented-
+  // instruction exception to instruction PATTERNS (Table 9-10 lists opcodes -- FSIN,
+  // FMOD, ...), never to addressing modes, and App. D-2 lists memory-indirect addressing
+  // among the 68020/030/040 extensions the part supports. Musashi -- this project's own
+  // lock-step oracle -- executes them too (`READ_EA_FPE` case 6 -> `EA_AY_IX_16()` ->
+  // `m68ki_get_ea_ix`, which implements the full I/IS walk).
+  //
+  // It is not a corner case. The Quadra 700 ROM's SANE package passes its operands as
+  // POINTERS in the caller's frame and dereferences them INSIDE the floating-point
+  // instruction:
+  //     408ecd36:  f236 5400 8161 000c    fmoved  %fp@(c)@(0),%fp0
+  //     408ec6a0:  f236 4420 8161 000c    fdivs   %fp@(c)@(0),%fp0
+  // i.e. `([12,A6])`. There are 72 such sites across the ROM's FP package, covering
+  // FADD/FSUB/FMUL/FDIV/FCMP/FREM/FMOVE in every operand format -- that is SANE's calling
+  // convention, so EVERY SANE floating-point call was spuriously trapping into the FPSP,
+  // which was then asked to emulate an instruction whose operand address it cannot
+  // reconstruct from the one-word CMDREG1B its state frame carries.
+  //
+  // THE PROGRAM IS A COMPOSITION OF TWO THINGS THAT ALREADY EXIST -- no new datapath, no
+  // EU change, no FPU-pipeline change, and it strictly REMOVES traps:
+  //   1. the pointer walk every `MI_*` entry already uses (`UMiPtrLoad` + `UMiLeaFinal`,
+  //      the same pair `MI_LEA_ENTRY` is built from), resolving
+  //      `mem.L[base + bd (+pre-index)] + od (+post-index)` into a temp;
+  //   2. the ordinary chunk load/store + `UFpIssue` rows of the BASE bucket, re-based on
+  //      that temp.
+  // The whole I/IS matrix therefore comes for free: pre- vs post-indexed selection is
+  // `miPtrIndex && !ctx.miPost` / `miHostIndex && ctx.miPost` in the existing resolve,
+  // base suppression is `ctx.eaBaseValid` (BS), index suppression is `ctx.eaIndexValid`
+  // (IS), and all four outer-displacement sizes arrive pre-folded in `ctx.miOd` from
+  // `EaDecoder`'s own full-format decode.
+  //
+  // TEMP CHOICE. The resolved address lives in T3 -- the 4th temp, introduced for the
+  // memind bit-field family precisely because it must stay live ACROSS the chunk rows.
+  // T0/T1/T2 are the chunk temps (`fpMemChunkTemp`) and the `UFpIssue` row reads them as
+  // srcA/srcB/srcC, so the address could not share one.
+  //
+  // CHUNK OFFSETS. The BASE bucket's `SEaDispLo/SFpDispMid/SFpDispHi` are displacements
+  // off the EA's BASE REGISTER and are meaningless here (for a memory-indirect EA
+  // `ucBfEaDec.disp` is `bd`, the FIRST-level pre-dereference displacement). The resolved
+  // address is already complete, so the chunk rows use the literal +0/+4/+8 selectors the
+  // AUTO buckets already use (`fpMemChunkAutoImm`), and carry NO `indexFromEa` -- the
+  // index was folded into the walk exactly once, which is what the architecture specifies.
+  private def fpMemIndWalk: Vector[Desc] = Vector(
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST3, useImm = true, imm = SEaDispLo,
+         sz = SzLong, miPtrIndex = true, isFirst = true),
+    Desc(UMiLeaFinal, srcA = ST3, dst = ST3, useImm = true, imm = SMiOd,
+         sz = SzLong, miHostIndex = true))
+
+  // LOAD direction: [ptr walk] + [LOAD x chunks @ T3+0/4/8] + [UFpIssue].
+  private def fpMemMemIndGroup(fmt: FpMemFmt): Vector[Desc] =
+    fpMemIndWalk ++ (0 until fmt.chunks).map { i =>
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MLoad, srcA = ST3, dst = fpMemChunkTemp(i),
+                               useImm = true, imm = sel, sz = fmt.loadSz)
+        case None      => Desc(UMove, mem = MLoad, srcA = ST3, dst = fpMemChunkTemp(i),
+                               sz = fmt.loadSz)
+      }
+    }.toVector :+ fpMemIssueRow(fmt, isLast = true)
+
+  // STORE direction: [ptr walk] + [CVT x chunks] + [STORE x chunks @ T3+0/4/8].
+  // `firstIsFirst = false` because the walk's first row already carries `isFirst`; the
+  // last store carries `keepCommit` for the same lock-step reason the BASE bucket does
+  // (every other row of a store program is a temp write or a dropped `rmwStore`).
+  private def fpStoreMemIndGroup(fmt: FpMemFmt): Vector[Desc] =
+    fpMemIndWalk ++ fpStoreCvtRows(fmt, firstIsFirst = false) ++ (0 until fmt.chunks).map { i =>
+      val last = i == fmt.chunks - 1
+      fpMemChunkAutoImm(i) match {
+        case Some(sel) => Desc(UMove, mem = MStore, srcA = ST3, srcB = fpMemChunkTemp(i),
+                               useImm = true, imm = sel, sz = fmt.loadSz,
+                               keepCommit = last, isLast = last)
+        case None      => Desc(UMove, mem = MStore, srcA = ST3, srcB = fpMemChunkTemp(i),
+                               sz = fmt.loadSz, keepCommit = last, isLast = last)
+      }
+    }.toVector
+
+  // The two memory-indirect FP families are appended at the very END of the ROM so that
+  // every pre-existing entry constant keeps its address (they are all self-computed by
+  // `scanLeft`, but an insertion in the middle would still move every later group).
+  private def romP12(): Vector[Desc] =
+    fpMemFormats.flatMap(fpMemMemIndGroup) ++
+    fpMemFormats.flatMap(fpStoreMemIndGroup)
+
   private def romP9(): Vector[Desc] =
     fpMemFormats.flatMap(fpMemBaseGroup) ++
     fpMemFormats.flatMap(fpMemAutoPostGroup) ++
@@ -2144,7 +2232,7 @@ object Microcode {
     fpMemFormats.flatMap(fpStoreAutoPostGroup) ++
     fpMemFormats.flatMap(fpStoreAutoPreGroup)
 
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10() ++ romP11()
+  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10() ++ romP11() ++ romP12()
 
   // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
   // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
@@ -2227,6 +2315,33 @@ object Microcode {
     * same `scanLeft` produced. */
   def fpStoreEntry(bucket: Int, fmtIdx: Int): Int =
     Vector(fpStoreBaseOffsets, fpStorePostOffsets, fpStorePreOffsets)(bucket)(fmtIdx)
+
+  // FP MEMORY-INDIRECT entry constants (2026-09-17) -- SELF-COMPUTED from each group's own
+  // real row count, exactly like the three families above, and appended at the ROM's END so
+  // no pre-existing entry address moves. 12 groups (6 formats x 2 directions); row counts
+  // are 2 (walk) + chunks + 1 (issue) for a load and 2 + 2*chunks for a store, i.e.
+  // 4/4/4/4/5/6 + 4/4/4/4/6/8 = 57 new rows.
+  private val fpMemIndRomStart: Int = fpStorePreOffsets.last
+  private val fpMemIndLdOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpMemIndRomStart)      { (acc, fmt) => acc + fpMemMemIndGroup(fmt).size }
+  private val fpMemIndStOffsets: Vector[Int] =
+    fpMemFormats.scanLeft(fpMemIndLdOffsets.last) { (acc, fmt) => acc + fpStoreMemIndGroup(fmt).size }
+
+  /** Entry point for an FP instruction whose `<ea>` is full-format MEMORY INDIRECT.
+    * `store` selects direction (opclass 011 vs 010); `fmtIdx` indexes `fpMemFormats`
+    * (0=B, 1=W, 2=L, 3=S, 4=D, 5=X) -- the SAME table every other FP family is generated
+    * from, so `DecodeStage`'s dispatch mux cannot drift from the ROM layout. */
+  def fpMemIndEntry(store: Boolean, fmtIdx: Int): Int =
+    (if (store) fpMemIndStOffsets else fpMemIndLdOffsets)(fmtIdx)
+
+  // The microcode PC (`ucPc`/`ucNextPc` in DecodeStage) and `OpSpec.ucEntry` are 9 bits,
+  // so the ROM cannot exceed 512 rows. Without this guard an overflow would SILENTLY
+  // truncate an entry address and dispatch a valid instruction into the middle of some
+  // other program -- the worst possible failure mode for a decoder. Fail elaboration
+  // instead; the fix is to widen those three declarations together.
+  require(rom.size <= 512,
+    s"Microcode ROM has ${rom.size} rows but the 9-bit microcode PC addresses only 512. " +
+      "Widen OpSpec.ucEntry, DecodeStage's ucPc and ucNextPc together.")
 
   /** `fpMemFormats` index for an ext[12:10] format code, or -1 for the two Packed codes
     * (011 static-k / 111 dynamic-k), which are out of hardware scope entirely. */
