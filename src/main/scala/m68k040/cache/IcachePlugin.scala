@@ -2361,7 +2361,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
     // stay pfSlots-only even though entry 0's `mshrComplete` is no longer always False.
     for (i <- 0 until pfSlots) {
       val e = i + AxiIds.I_SPEC_BASE
-      when(mshrValid(e) && mshrComplete(e) && (mshrErr(e) || mshrPoison(e))) {
+      // AXI completion does not end the installer's ownership: PREDECODE
+      // still reads this slot's tag and poison alongside latched set/way.
+      // Reclaiming it in INSTALL_ARM permits a new allocation to clear poison
+      // before the second array write, publishing old data under the new tag.
+      // An installing poisoned slot is released by PREDECODE's final beat.
+      val installerOwnsSlot = predIsPfReg &&
+        (fsm.isActive(fsm.INSTALL_ARM) || fsm.isActive(fsm.PREDECODE)) &&
+        (installIdx === U(e, mshrIdxBits bits))
+      when(mshrValid(e) && mshrComplete(e) && (mshrErr(e) || mshrPoison(e)) &&
+           !installerOwnsSlot) {
         mshrValid(e)    := False
         mshrArSent(e)   := False
         mshrComplete(e) := False
