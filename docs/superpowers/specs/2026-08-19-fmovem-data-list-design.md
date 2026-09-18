@@ -30,8 +30,12 @@ Musashi `fmovem()`/`m68kfpu.c:1662`)
 
 - **Register-list → address ordering**: predecrement list (`ext1[12:11]==00`) maps mask bit
   `n` → `FPn`; control/postincrement list (`ext1[12:11]==10`) maps mask bit `n` → `FP(7-n)`.
-  Both lay the **highest-numbered listed register at the lowest address** — this is why an
-  `-(An)` save round-trips through an `(An)+`/control restore without a separate reversal.
+  Correction (2026-09-19, M68000PRM pp.5-85–5-88): both lay the
+  **lowest-numbered listed register at the lowest address**. Control/postincrement
+  transfers FP0 toward FP7 at increasing addresses; predecrement stores FP7 toward
+  FP0, subtracting 12 before each element. The prior opposite ordering was a design
+  error, reproduced by the independent `FmovemDataInteropSpec` memory-image check.
+  A save/restore round trip alone cannot detect reversing both directions.
 - **Empty list (`ext1[7:0]==0`) is an architectural no-op**: no memory traffic, `An`
   unchanged. NOT illegal (unlike the control-register-list crack's mask==000, which IS
   illegal for a different reason — D9b divergence register, no consumer expects an empty

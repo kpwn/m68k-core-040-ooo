@@ -31,6 +31,23 @@ trait CommittedMapService {
   def xPhys:    UInt      // singleton committed X mapping
 }
 
+/** Committed FP mappings for precise exception operand capture.
+  * PRODUCER: RenameStage, exclusively. Consumers must not use speculative RAT
+  * mappings or writeback bypasses for an architectural exception frame. */
+trait CommittedFpMapService {
+  def fpPhys: Vec[UInt] // FP0..FP7, committed physical locations
+}
+
+/** Memory attributes for a nonprivileged instruction using the serialized
+  * backend port. PRODUCER: RobPlugin exclusively. Inactive preserves the
+  * existing supervisor exception-frame behavior. Cache mode is the translated
+  * page mode with the architectural CACR.DE policy already applied. */
+trait SerializedMemoryContextService {
+  def instructionActive: Bool
+  def instructionSupervisor: Bool
+  def instructionCacheMode: m68k040.cache.CacheMode.C
+}
+
 /** ROB exposes; lock-step harness / sinks consume. Up to 2 retired instr/cycle. */
 trait CommitTraceService {
   def trace:     Vec[CommitTrace]   // length 2
@@ -718,6 +735,15 @@ trait FpImmTableService {
   def fpImmRdAddr: UInt      // FP_IMM_TAG_W bits, consumer-driven
   def fpImmRdData: Bits      // 80 bits, async read of the entry at fpImmRdAddr
   def fpImmFree: Flow[UInt]  // consumer-driven: release this tag (fires with the capture)
+}
+
+/** Read-only exception view of FP immediates. Sole producer: DecodeStage.
+  * RobPlugin reads the head's retained tag at exception entry. The backend
+  * squash AFTER capture releases it; ordinary EU consumption remains separate. */
+trait FpTrapImmediateService {
+  def trapImmAddr: UInt
+  def trapImmData: Bits
+  def trapImmValid: Bool
 }
 
 /** Produced by rename; consumed by the (future) dispatch/ROB. Plain Stream. */

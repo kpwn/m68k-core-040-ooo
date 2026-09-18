@@ -3699,6 +3699,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.loadCmd.payload.cacheMode := Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
                                               m68k040.cache.CacheMode.WRITETHROUGH,
                                               m68k040.cache.CacheMode.INHIBITED)
+      host.get[m68k040.services.SerializedMemoryContextService].foreach { ctx =>
+        when(ctx.instructionActive) {
+          // Serialized ordinary instructions obey CACR.DE just like the hot LSU.
+          // Keep this fold at the live port even if the producer also applies it.
+          dcache.loadCmd.payload.cacheMode := Mux(
+            cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
+            ctx.instructionCacheMode, m68k040.cache.CacheMode.INHIBITED)
+        }
+      }
       dcache.loadCmd.payload.token := U(0x80, m68k040.cache.DLoadToken.Width bits)
     }
     excStoreReady := False
@@ -3757,6 +3766,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       xlate.req.valid              := True
       xlate.req.payload.vpn        := excXlateVpn
       xlate.req.payload.supervisor := True    // the exception sequencer runs supervisor
+      host.get[m68k040.services.SerializedMemoryContextService].foreach { ctx =>
+        when(ctx.instructionActive) {
+          xlate.req.payload.supervisor := ctx.instructionSupervisor
+        }
+      }
       xlate.req.payload.write      := excXlateWrite
       xlate.req.payload.token      := excXlateToken
     }

@@ -200,6 +200,7 @@ object Microcode {
   case object UMiPtrLoad extends UOp    // LOAD.L pointer (eaBase + eaDispLo (+ pre-index)) -> T0
   case object UMiHostMove extends UOp   // host MOVE load/store at (T0 + od (+post-index)); op=MOVE
   case object UMiHostOp  extends UOp     // host ALU/unary compute (ctx.miOp): srcA,srcB -> dst + flags
+  case object UMiScc extends UOp        // branch-EU condition result -> T1, no CCR write
   // ── control-transfer / address-generate MEMORY-INDIRECT kinds (task #201) ──────────
   // LEA/PEA/JMP/JSR resolve their EA directly (no loaded VALUE, unlike the §7 host-op
   // family above) — the pointer load (UMiPtrLoad, reused unchanged) yields T0, then ONE
@@ -422,7 +423,7 @@ object Microcode {
         UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
         UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
         UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UFpCtrlRead,
-        UFpStoreCvt, UCasOp = newElement()
+        UFpStoreCvt, UCasOp, UMiScc = newElement()
   }
 
   /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
@@ -528,6 +529,7 @@ object Microcode {
         case UMiPtrLoad     => (UOpHw.UMiPtrLoad, 0, false, false, false)
         case UMiHostMove    => (UOpHw.UMiHostMove, 0, false, false, false)
         case UMiHostOp      => (UOpHw.UMiHostOp, 0, false, false, false)
+        case UMiScc         => (UOpHw.UMiScc, 0, false, false, false)
         case UMiLeaFinal    => (UOpHw.UMiLeaFinal, 0, false, false, false)
         case UMiPushFinal   => (UOpHw.UMiPushFinal, 0, false, false, false)
         case UMiBranchFinal => (UOpHw.UMiBranchFinal, 0, false, false, false)
@@ -2232,7 +2234,16 @@ object Microcode {
     fpMemFormats.flatMap(fpStoreAutoPostGroup) ++
     fpMemFormats.flatMap(fpStoreAutoPreGroup)
 
-  val rom: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10() ++ romP11() ++ romP12()
+  private val romBeforeScc: Vector[Desc] = romP1() ++ romP2() ++ romP3() ++ romP4() ++ romP5() ++ romP6() ++ romP7() ++ romP8() ++ romP9() ++ romP10() ++ romP11() ++ romP12()
+  val MI_SCC_ENTRY: Int = romBeforeScc.size
+  // Scc is store-only: walk the pointer, evaluate the incoming CCR, then store
+  // exactly one byte. Never read the destination (which may be write-only MMIO).
+  val rom: Vector[Desc] = romBeforeScc ++ Vector(
+    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true,
+      imm = SEaDispLo, sz = SzLong, miPtrIndex = true, isFirst = true),
+    Desc(UMiScc, dst = ST1, sz = SzByte),
+    Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true,
+      imm = SMiOd, sz = SzByte, miHostIndex = true, isLast = true))
 
   // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
   // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
@@ -2746,6 +2757,7 @@ object Microcode {
       case UMiPtrLoad  => u.op := DecOp.MOVE
       case UMiHostMove => u.op := DecOp.MOVE
       case UMiHostOp   => u.op := ctx.miOp
+      case UMiScc      => u.op := DecOp.BRANCH
       case UMiLeaFinal    => u.op := DecOp.MOVE     // address-generate (leaAddr short-circuits memOp)
       case UMiPushFinal   => u.op := DecOp.MOVE     // stack-push store (mirrors pushUop/peaPush)
       case UMiBranchFinal => u.op := DecOp.BRANCH   // indirect branch (mirrors ibrUop)
@@ -2868,17 +2880,17 @@ object Microcode {
       u.useImm     := Bool(d.useImm)
       u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
       u.srcBValid  := srcBV
-      u.readsNzvc  := Bool(d.writesFlags)
+      u.readsNzvc  := Bool(d.writesFlags || d.uop == UMiScc)
       u.readsX     := Bool(d.writesFlags)
       u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz || d.nzvcOnly)
       u.writesX    := Bool(d.writesFlags)
     }
     // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
     // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
-    u.isBranch := Bool(d.uop == UMiBranchFinal); u.ibranch := Bool(d.uop == UMiBranchFinal)
+    u.isBranch := Bool(d.uop == UMiBranchFinal || d.uop == UMiScc); u.ibranch := Bool(d.uop == UMiBranchFinal)
     u.stkPush  := Bool(d.uop == UMiPushFinal);   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
-    u.cond := 0
+    u.cond := (if (d.uop == UMiScc) ctx.opword(11 downto 8) else B(0, 4 bits))
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
     // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
@@ -3084,7 +3096,7 @@ object Microcode {
       u.fpSrcAReg  := ctx.fpCmd(9 downto 7).asUInt
       u.usesFpSrcA := True
     }
-    u.isScc := False; u.isDbcc := False
+    u.isScc := Bool(d.uop == UMiScc); u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
     // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
     // other µcode µops use no index (default inert).
@@ -3325,6 +3337,7 @@ object Microcode {
       is(UOpHw.UMiPtrLoad)  { u.op := DecOp.MOVE }
       is(UOpHw.UMiHostMove) { u.op := DecOp.MOVE }
       is(UOpHw.UMiHostOp)   { u.op := ctx.miOp }
+      is(UOpHw.UMiScc)      { u.op := DecOp.BRANCH }
       is(UOpHw.UMiLeaFinal)    { u.op := DecOp.MOVE }     // address-generate (leaAddr short-circuits memOp)
       is(UOpHw.UMiPushFinal)   { u.op := DecOp.MOVE }     // stack-push store (mirrors pushUop/peaPush)
       is(UOpHw.UMiBranchFinal) { u.op := DecOp.BRANCH }   // indirect branch (mirrors ibrUop)
@@ -3457,17 +3470,17 @@ object Microcode {
       u.useImm     := d.useImm
       u.imm        := immVal
       u.srcBValid  := srcBV
-      u.readsNzvc  := d.writesFlags
+      u.readsNzvc  := d.writesFlags || (d.uop === UOpHw.UMiScc)
       u.readsX     := d.writesFlags
       u.writesNzvc := d.writesFlags || d.bfWritesNz || d.nzvcOnly
       u.writesX    := d.writesFlags
     }
     // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
     // stack-push store (mirrors pushUop/peaPush). Every other µcode customer is neither.
-    u.isBranch := d.uop === UOpHw.UMiBranchFinal; u.ibranch := d.uop === UOpHw.UMiBranchFinal
+    u.isBranch := (d.uop === UOpHw.UMiBranchFinal) || (d.uop === UOpHw.UMiScc); u.ibranch := d.uop === UOpHw.UMiBranchFinal
     u.stkPush  := d.uop === UOpHw.UMiPushFinal;   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
-    u.cond := 0
+    u.cond := Mux(d.uop === UOpHw.UMiScc, ctx.opword(11 downto 8), B(0, 4 bits))
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
     // fpMemTrap (task 6b): deliver a vector-11 F-line trap (the `ucFpMemBad` reject
@@ -3632,7 +3645,7 @@ object Microcode {
       u.fpSrcAReg  := ctx.fpCmd(9 downto 7).asUInt
       u.usesFpSrcA := True
     }
-    u.isScc := False; u.isDbcc := False
+    u.isScc := d.uop === UOpHw.UMiScc; u.isDbcc := False
     // Indexed-EA descriptor fields. The bit-field chain and the full-format mem-indirect
     // pointer/host LS rows carry the EA index (srcC) -> drive its size/scale from Ctx; all
     // other µcode µops use no index (default inert).

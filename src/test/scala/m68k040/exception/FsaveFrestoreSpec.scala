@@ -249,6 +249,20 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     assert(r.a7 == base, f"A7 must be 0x$base%08X, got 0x${r.a7}%08X")
   }
 
+  test("FSAVE pending unimplemented E1 distinguishes packed from binary sources", VerilatorTest) {
+    val one = (BigInt(0x3fff) << 64) | (BigInt(1) << 63)
+    // This checks only the frame discriminator. Packed operand capture/layout
+    // is a separate requirement and is not established by injecting mock state.
+    for ((cmd, packed) <- Seq((0x0526, false), (0x5926, false), (0x4d26, true))) {
+      val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true,
+        unimp = Some((cmd, one, one)), name = s"fsave-e1-$cmd")
+      val base = StackTop - 52
+      assert(r.a7 == base)
+      assert(((frameByte(r, base, 0x18) & 4) != 0) == packed,
+        f"CMD=$cmd%04x must set E1 iff packed=$packed")
+    }
+  }
+
   test("FSAVE -(A7) with a pending unimplemented instruction emits the 52-byte frame " +
        "with MC68040 UM Figure 9-10(d)'s exact field placement", VerilatorTest) {
     // Sentinel operands, laid out {sign[79], exponent[78:64], mantissa[63:0]}.
@@ -257,7 +271,7 @@ class FsaveFrestoreSpec extends AnyFunSuite {
     val src80 = (BigInt(0x4001) << 64) | BigInt("C0FFEE0011223344", 16)
     val dst80 = (BigInt(1) << 79) | (BigInt(0x7FFF) << 64)
     val r = run(s"$fsaveA7 ; done: bra.s done", everExecuted = true,
-                unimp = Some((0xBEEF, src80, dst80)), name = "fsave-unimp")
+                unimp = Some((0x5926, src80, dst80)), name = "fsave-unimp")
     val base = StackTop - 52
     assert(r.a7 == base, f"FSAVE -(A7) of the 52-byte frame must leave A7 = 0x$base%08X, got 0x${r.a7}%08X")
     assert(frameByte(r, base, 0) == 0x41, "unimplemented frame version byte")
@@ -270,16 +284,16 @@ class FsaveFrestoreSpec extends AnyFunSuite {
       f"STAG at byte 0x0C bits 7:5 must be 000 (Normalized); got 0x${frameByte(r, base, 0x0C)}%02X")
     // $10 [31:16] CMDREG1B -- ROM-pinned: $4088DA86 `movew %d0,%fp@(-228)` with the frame
     // base at %fp@(-244), and `b1238_fix`'s bfextu reads at the same address.
-    assert(frameWord(r, base, 0x10) == 0xBEEF,
+    assert(frameWord(r, base, 0x10) == 0x5926,
       f"CMDREG1B at offset 0x10; got 0x${frameWord(r, base, 0x10)}%04X")
     // $14 [31:29] DTAG -- destination is infinity -> 010. ROM-pinned: $4088DC6A/$4088DC70
     // copy %fp@(-224) and mask it with #$E0000000.
     assert((frameByte(r, base, 0x14) >> 5) == 0x2,
       f"DTAG at byte 0x14 bits 7:5 must be 010 (Infinity); got 0x${frameByte(r, base, 0x14)}%02X")
-    // $18 bit 2 = E1 (an unimplemented-instruction frame always reports the CU-detected
-    // exception). ROM-pinned: $4088DF60 `bset #2,%fp@(-220)` / $4088DF74 `bclr #2,...`.
-    assert((frameByte(r, base, 0x18) & 0x04) != 0,
-      f"E1 must be bit 2 of the byte at offset 0x18; got 0x${frameByte(r, base, 0x18)}%02X")
+    // Motorola FPSP uni_getop interprets E1 as packed-source for vector 11.
+    // FSCALE.B is not packed, so its binary operand must not enter unpack.
+    assert((frameByte(r, base, 0x18) & 0x04) == 0,
+      f"non-packed unimplemented frame must clear E1; got 0x${frameByte(r, base, 0x18)}%02X")
     // $1C FPTS|FPTE, $20..$27 FPTM -- the DESTINATION operand (FPTEMP).
     assert(frameWord(r, base, 0x1C) == 0xFFFF,
       f"FPTS|FPTE at 0x1C must be sign 1 | exponent 0x7FFF; got 0x${frameWord(r, base, 0x1C)}%04X")

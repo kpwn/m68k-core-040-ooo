@@ -131,7 +131,8 @@ class ExceptionUnit(
     // delivery, to latch the state a later FSAVE turns into the unimplemented-instruction
     // frame. Defaulted so every standalone unit DUT needs no change.
     entryFpuUnimp: Bool = False,
-    entryFpuCmd:   Bits = B(0, 16 bits)) extends Area {
+    entryFpuCmd:   Bits = B(0, 16 bits),
+    entryFpuImmediate: Bool = False) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -291,6 +292,19 @@ class ExceptionUnit(
   // `active` is high whenever the FSM is mid-sequence; the wiring gates the MUX on it.
   val active = Bool()
 
+  // Cold nonprivileged instruction context; defaults keep all existing frame
+  // traffic unchanged. The dynamic-FMOVEM adapter will drive these only while
+  // owning the serialized data path, never during subsequent exception entry.
+  val serializedInstructionActive = Bool(); serializedInstructionActive := False
+  serializedInstructionActive.allowOverride
+  val serializedInstructionSupervisor = Bool(); serializedInstructionSupervisor := ss.s
+  val serializedInstructionCacheMode = m68k040.cache.CacheMode()
+  serializedInstructionCacheMode := m68k040.cache.CacheMode.INHIBITED
+  serializedInstructionCacheMode.allowOverride
+  val dxRspCacheMode = m68k040.cache.CacheMode()
+  dxRspCacheMode := m68k040.cache.CacheMode.INHIBITED
+  dxRspCacheMode.allowOverride
+
   // ── Live committed A7 (arch reg 15) read back from the int PRF ────────────────
   // The full-core wiring drives this every cycle with the committed A7 value (PRF
   // read at the committed arch-15 phys mapping). It feeds ss.writeA7 so the committed
@@ -370,12 +384,12 @@ class ExceptionUnit(
   // where the missing dependency is -- the frame still carries a correct header, a correct
   // length code and a correct CMDREG1B, which is what actually routes the FPSP.
   //
-  // NOT WIRED IN ANY DUT AS OF THIS TASK, deliberately and explicitly: Task 1's FP regfile
-  // has no committed-mapping read port exposed at this site yet. Both inputs therefore sit
-  // at their zero defaults, STAG/DTAG read as "Zero" (001) and the ETEMP/FPTEMP fields are
-  // zero. Wiring them is a pure addition when that read port lands.
+  // RobPlugin wires these through CommittedFpMapService/FpRegFileService when
+  // present. Standalone exception DUTs can supply them directly. R/M=1 source
+  // capture is separate: ext[12:10] is a format and MUST NOT select an FP register.
   val committedFpSrcIn = Bits(80 bits); committedFpSrcIn.allowOverride; committedFpSrcIn := B(0, 80 bits)
   val committedFpDstIn = Bits(80 bits); committedFpDstIn.allowOverride; committedFpDstIn := B(0, 80 bits)
+  val fpuOperandValidIn = Bool(); fpuOperandValidIn.allowOverride; fpuOperandValidIn := True
   /** The FP register numbers the captured command word names, exposed so a future wiring
     * can address the FP RAT with them. CMDREG1B layout (MC68040 UM Figure 9-8, 1989 1st
     * ed. p.9-33): [15:13] OPCLASS, [12:10] SRC (Rx), [9:7] DST (Ay), [6:0] OPMODE. */
@@ -528,6 +542,46 @@ class ExceptionUnit(
   val sysCapDstPhys = Reg(UInt(6 bits))
   val sysCapPc      = Reg(UInt(32 bits))
   val sysCapNextPc  = Reg(UInt(32 bits))
+  // Dynamic-list cold op: sysVal is the EA, aux[0] is the retired Dn mask.
+  // Rc[6]=store, Rc[5:3]=EA mode, Rc[2:0]=An. No renamed An destination.
+  val fmMask = Reg(Bits(32 bits))
+  val fmFpReadReg = UInt(3 bits)
+  val fmFpReadValue = Bits(80 bits); fmFpReadValue := 0; fmFpReadValue.allowOverride
+  val fmFpWrite = Flow(m68k040.execute.fpu.FmovemColdLoadedRegister())
+  fmFpWrite.valid := False
+  fmFpWrite.payload.fpReg := 0
+  fmFpWrite.payload.value := 0
+  val fmAnWrite = Flow(UInt(32 bits)); fmAnWrite.valid := False; fmAnWrite.payload := 0
+  val fmAnReg = sysCapRc(2 downto 0)
+  val fmBackend = new m68k040.execute.fpu.FmovemColdBackend
+  fmBackend.io.request.valid := False
+  fmBackend.io.request.payload.mask := fmMask
+  fmBackend.io.request.payload.address := sysCapVal.asUInt
+  fmBackend.io.request.payload.store := sysCapRc(6)
+  fmBackend.io.request.payload.predecrement := sysCapRc(5 downto 3) === 4
+  fmBackend.io.request.payload.postincrement := sysCapRc(5 downto 3) === 3
+  fmBackend.io.supervisor := ss.s
+  fmBackend.io.pageSize8K := mmuCtrl.pageSize8K
+  fmBackend.io.cacheEnabled := ss.cacr(31)
+  fmFpReadReg := fmBackend.io.fpReadReg
+  fmBackend.io.fpReadValue := fmFpReadValue
+  fmBackend.io.loaded.ready := False
+  fmBackend.io.result.ready := False
+  fmBackend.io.translation.ready := False
+  fmBackend.io.translated.valid := False
+  fmBackend.io.translated.payload.ppn := dxRspPpn
+  fmBackend.io.translated.payload.token := dxRspToken
+  fmBackend.io.translated.payload.fault := dxRspFault
+  fmBackend.io.translated.payload.cacheMode := dxRspCacheMode
+  fmBackend.io.memory.ready := False
+  fmBackend.io.memoryResponse.valid := False
+  fmBackend.io.memoryResponse.payload.data := 0
+  fmBackend.io.memoryResponse.payload.fault := False
+  val fmLoaded = Vec.fill(8)(Reg(Bits(80 bits)))
+  val fmLoadedMask = Reg(Bits(8 bits)) init 0
+  val fmWriteIndex = Reg(UInt(3 bits)) init 0
+  val fmNextAddress = Reg(UInt(32 bits))
+  val fmMemoryMode = Reg(m68k040.cache.CacheMode())
   // ── "this sysOp's OWN destination register IS A7" (arch 15) ──────────────────
   // Latched at sysTrigger from `sysDstArch`. See `sysOwnA7Valid` right below for why
   // this exists at all; `sysCapDstPhys` alone cannot answer the question (it is a
@@ -841,6 +895,12 @@ class ExceptionUnit(
   // directly here since `ss` is this unit's own state -- no new port or dependency.
   val excCacheMode = Mux(ss.cacr(31), m68k040.cache.CacheMode.WRITETHROUGH,
                                       m68k040.cache.CacheMode.INHIBITED)
+  // Ordinary serialized memory operations retain their translated page policy.
+  // Capture it with each command, and never bypass the architectural DE fold.
+  val serializedCommandCacheMode = Mux(ss.cacr(31),
+    serializedInstructionCacheMode, m68k040.cache.CacheMode.INHIBITED)
+  val commandCacheMode = Mux(serializedInstructionActive,
+    serializedCommandCacheMode, excCacheMode)
   dcStore.payload.cacheMode := stoCmodeReg
   // The exception sequencer's frame pushes are conceptually "always awaited" --
   // driving precise=True means a hypothetical bus error there is simply never
@@ -861,7 +921,7 @@ class ExceptionUnit(
     stoPaddrReg := stoPaddr
     stoDataReg  := stoData
     stoSizeReg  := stoSize
-    stoCmodeReg := excCacheMode
+    stoCmodeReg := commandCacheMode
   }
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
@@ -916,7 +976,7 @@ class ExceptionUnit(
     ldoVaddrReg := ldoVaddr
     ldoPaddrReg := ldoPaddr
     ldoSizeReg  := ldoSize
-    ldoCmodeReg := excCacheMode
+    ldoCmodeReg := commandCacheMode
   }
 
 
@@ -1080,8 +1140,8 @@ class ExceptionUnit(
   //   CMDREG3B / CMDREG2B destination-register compare) -- so $04 most likely carries
   //   CMDREG2B and $00's reserved word most likely carries CMDREG3B. Both describe E3
   //   (write-back-stage) exceptions, and this core's FP EU has no write-back-stage
-  //   exception state at all: it raises E1 only, and an E1-only frame legitimately reports
-  //   E3 = 0 with no CMDREG2B/CMDREG3B. Emitting zero is therefore not a placeholder for
+  //   exception state in this unimplemented-frame path: E3 remains zero, and E1 is
+  //   the packed-source discriminator (see fsFrameWord below). Emitting zero is not a placeholder for
   //   missing data, it IS the correct content -- and it is what the FPSP requires, since it
   //   checks E3 first and skips the whole E3 path when the bit is clear.
   //   STAG at $0C is [DER], not [ROM]: no ROM instruction unambiguously reads a [31:29] tag
@@ -1280,6 +1340,13 @@ class ExceptionUnit(
     // state to checkpoint, and the FPSP reads zeroed fields as benign.
     val src = Mux(fsIsUnimp, fpuCtrl.uiSrcOperand, B(0, fpuCtrl.uiSrcOperand.getWidth bits))
     val dst = Mux(fsIsUnimp, fpuCtrl.uiDstOperand, B(0, fpuCtrl.uiDstOperand.getWidth bits))
+    // In a vector-11 unimplemented frame, Motorola FPSP's uni_getop uses E1
+    // to distinguish PACKED input, not merely to indicate a pending exception.
+    // Setting it for binary operands sends them through decimal conversion.
+    // See docs/FSCALE_IMMEDIATE_BOARD_FAULT.md for the manual/source discrepancy.
+    val unimpPacked = fsIsUnimp &&
+      fpuCtrl.uiCmdReg1B(15 downto 13) === B"3'b010" &&
+      fpuCtrl.uiCmdReg1B(12 downto 10) === B"3'b011"
     switch(step) {
       is(U(0,  5 bits)) { out := hdr }                                        // $00 version|len
       // steps 2..5 ($04, $08) are the two longwords the 52-byte frame adds over the
@@ -1288,7 +1355,7 @@ class ExceptionUnit(
       is(U(6,  5 bits)) { out := fpTag(src) ## B(0, 13 bits) }                // $0C STAG  [31:29]
       is(U(8,  5 bits)) { out := fpuCtrl.uiCmdReg1B }                         // $10 CMDREG1B [31:16]
       is(U(10, 5 bits)) { out := fpTag(dst) ## B(0, 13 bits) }                // $14 DTAG  [31:29]
-      is(U(12, 5 bits)) { out := B(0, 5 bits) ## True ## B(0, 10 bits) }      // $18 E1 = bit 26
+      is(U(12, 5 bits)) { out := B(0, 5 bits) ## unimpPacked ## B(0, 10 bits) } // $18 E1
       is(U(14, 5 bits)) { out := dst(79 downto 64) }                          // $1C FPTS|FPTE
       is(U(16, 5 bits)) { out := dst(63 downto 48) }                          // $20 FPTM[63:32]
       is(U(17, 5 bits)) { out := dst(47 downto 32) }
@@ -1467,6 +1534,12 @@ class ExceptionUnit(
     val S_PTREQ   = new State   // issue one descriptor read at `ptDescAddr`
     val S_PTWAIT  = new State   // await it; advance a level or compose MMUSR
     val S_REDIR   = new State
+    val FM_START  = new State
+    val FM_RUN    = new State
+    val FM_LWAIT  = new State
+    val FM_SWAIT  = new State
+    val FM_WRITE  = new State
+    val FM_DONE   = new State
     // ── Task 11: FSAVE / FRESTORE state-frame transfer ────────────────────────────
     // Same two-state REQ/WAIT shape as every other memory step in this FSM
     // (E_STORE/E_STWAIT, R_SRREQ/R_SRWAIT, E_VECREQ/E_VECWAIT, ...), plus a dedicated
@@ -1564,7 +1637,11 @@ class ExceptionUnit(
         curIs2    := is2
         curIsInt  := entryIsInterrupt
         curLevel  := entryIplLevel
-        curPpc    := ppcOrTarget.resized
+        // FP format2 carries the calculated source EA, not FPIAR. For #imm,
+        // the literal starts after the opcode and command word. Keep FPIAR
+        // below tied to the instruction's own PC.
+        curPpc    := Mux(entryVector === 11 && entryFpuUnimp && entryFpuImmediate,
+                        (ppc + 4).resize(32), ppcOrTarget.resize(32))
         // Only access/address faults architecturally carry a fault address. Other
         // exception sources are allowed to leave entryFaultAddr unspecified, so do
         // not leak an unrelated combinational value into committed debug history.
@@ -1576,6 +1653,7 @@ class ExceptionUnit(
         // STAG/DTAG and the FPTS/FPTE/FPTM + ETS/ETE/ETM fields are derived at emit time.
         // Non-speculative: exception delivery is at commit.
         when(entryVector === 11 && entryFpuUnimp) {
+          assert(fpuOperandValidIn, "FP emulation captured an invalid/reclaimed source operand")
           setUnimpFramePort.valid   := True
           setUnimpFramePort.payload := entryFpuCmd ## committedFpSrcIn ## committedFpDstIn
           // FPIAR := the faulting instruction's OWN PC (its architectural definition,
@@ -1673,6 +1751,8 @@ class ExceptionUnit(
         sysCapDstIsA7 := sysDstArch === U(15, 5 bits)
         sysCapPc      := sysPc
         sysCapNextPc  := sysNextPc
+        fmMask := (if (sysAux == null) B(0, 32 bits) else sysAux(0))
+        fmLoadedMask := 0
         goto(S_DRAIN)
       }
     }
@@ -2050,7 +2130,8 @@ class ExceptionUnit(
     /** `atc`: TRUE for an MMU translation fault (SSW.ATC set, M68040UM format-$7 SSW
       * bit 10), FALSE for a physical bus error. Everything else about the frame is
       * identical -- both are access faults reported at vector 2. */
-    def busErrorEntry(faultAddr: UInt, atc: Boolean = false, pc: UInt = null): Unit = {
+    def busErrorEntry(faultAddr: UInt, atc: Boolean = false, pc: UInt = null,
+                      ssw: UInt = null): Unit = {
       // `pc` is the PC to STACK, i.e. the address of the instruction that faulted. It
       // defaults to `rteCapPc` because RTE was the first caller; FSAVE/FRESTORE pass
       // their own `sysCapPc` (both are latched at trigger for the same reason -- by the
@@ -2064,7 +2145,7 @@ class ExceptionUnit(
       curLevel     := U(0, 3 bits)
       curPpc       := stackedPc
       curFault     := faultAddr
-      curSsw       := U(if (atc) 0x0545 else 0x0145, 16 bits)
+      curSsw       := (if (ssw == null) U(if (atc) 0x0545 else 0x0145, 16 bits) else ssw)
       curThrowaway := False
       stFrame2     := False
       // The SR to stack is the CURRENT one: R_REDIR is where RTE would have applied the
@@ -2779,6 +2860,8 @@ class ExceptionUnit(
         goto(F_XREQ)
       } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.FRESTORE)) {
         goto(F_RXREQ)
+      } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.FMOVEM_DATA)) {
+        goto(FM_START)
       } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.PTEST) &&
                  mmuCtrl.mmuEnable && !mmuCtrl.setMmusr.valid) {
         // PTEST needs a real table search: paged translation is on AND the arm above
@@ -2906,6 +2989,104 @@ class ExceptionUnit(
           }
         }
       }
+    }
+    // Cold dynamic FMOVEM owns the ports only after the ordinary S_DRAIN barrier.
+    // No decode admission yet: the direct owner path must be tested first.
+    val fmActive = isActive(FM_START) || isActive(FM_RUN) ||
+      isActive(FM_LWAIT) || isActive(FM_SWAIT) || isActive(FM_WRITE) || isActive(FM_DONE)
+    when(fmActive) {
+      serializedInstructionActive := True
+      serializedInstructionCacheMode := fmMemoryMode
+      dxReqValid := fmBackend.io.translation.valid
+      dxReqVpn := fmBackend.io.translation.payload.vpn
+      dxReqWrite := fmBackend.io.translation.payload.write
+      fmBackend.io.translation.ready := dxReqReady
+      fmBackend.io.translated.valid := dxRspMine
+      when(fmBackend.io.translation.fire) { dxPendVpn := fmBackend.io.translation.payload.vpn }
+      fmBackend.io.loaded.ready := True
+      when(fmBackend.io.loaded.fire) {
+        for (i <- 0 until 8) {
+          when(fmBackend.io.loaded.payload.fpReg === i) {
+            fmLoaded(i) := fmBackend.io.loaded.payload.value
+            fmLoadedMask(i) := True
+          }
+        }
+      }
+    }
+    FM_START.whenIsActive {
+      fmBackend.io.request.valid := True
+      when(fmBackend.io.request.fire) { goto(FM_RUN) }
+    }
+    FM_RUN.whenIsActive {
+      when(fmBackend.io.memory.valid) {
+        // Cache mode is held throughout the registered command and its response.
+        serializedInstructionCacheMode := fmBackend.io.memory.payload.cacheMode
+        fmMemoryMode := fmBackend.io.memory.payload.cacheMode
+        when(fmBackend.io.memory.payload.store) {
+          driveStoreNoXlate(fmBackend.io.memory.payload.paddr, Size.BYTE,
+            fmBackend.io.memory.payload.data)
+          fmBackend.io.memory.ready := True
+          goto(FM_SWAIT)
+        } otherwise {
+          ldoVld := True
+          ldoVaddr := fmBackend.io.memory.payload.vaddr
+          ldoPaddr := fmBackend.io.memory.payload.paddr
+          ldoSize := Size.BYTE
+          fmBackend.io.memory.ready := dcLoadCmd.fire
+          when(dcLoadCmd.fire) { goto(FM_LWAIT) }
+        }
+      }
+      fmBackend.io.result.ready := True
+      when(fmBackend.io.result.fire) {
+        // Admission must exclude illegal direction/EA combinations before issue.
+        assert(!fmBackend.io.result.payload.illegal, "invalid cold FMOVEM admitted")
+        when(fmBackend.io.result.payload.fault) {
+          // Restart model: staged loads and An remain unchanged; acknowledged
+          // stores remain in memory and may be repeated by the restarted opcode.
+          val ssw = (Mux(fmBackend.io.translationFault, U(0x400,16 bits), U(0,16 bits)) |
+            Mux(sysCapRc(6), U(0,16 bits), U(0x100,16 bits)) |
+            U(0x20,16 bits) | Mux(ss.s, U(5,16 bits), U(1,16 bits)))
+          busErrorEntry(fmBackend.io.byteFaultAddress, pc = sysCapPc, ssw = ssw)
+          fmLoadedMask := 0
+        } otherwise {
+          fmNextAddress := fmBackend.io.result.payload.nextAddress
+          fmWriteIndex := 0
+          goto(FM_WRITE)
+        }
+      }
+    }
+    FM_LWAIT.whenIsActive {
+      when(dcLoadRsp.valid) {
+        fmBackend.io.memoryResponse.valid := True
+        fmBackend.io.memoryResponse.payload.data := dcLoadRsp.payload.data(7 downto 0)
+        fmBackend.io.memoryResponse.payload.fault := dcLoadRsp.payload.fault
+        goto(FM_RUN)
+      }
+    }
+    FM_SWAIT.whenIsActive {
+      when(dcStoreAck) {
+        fmBackend.io.memoryResponse.valid := True
+        fmBackend.io.memoryResponse.payload.fault := dcStoreErr
+        goto(FM_RUN)
+      }
+    }
+    FM_WRITE.whenIsActive {
+      fmFpWrite.valid := fmLoadedMask(fmWriteIndex)
+      fmFpWrite.payload.fpReg := fmWriteIndex
+      fmFpWrite.payload.value := fmLoaded(fmWriteIndex)
+      when(fmWriteIndex === 7) { goto(FM_DONE) } otherwise { fmWriteIndex := fmWriteIndex + 1 }
+    }
+    FM_DONE.whenIsActive {
+      when(sysCapRc(5 downto 3) === 3 || sysCapRc(5 downto 3) === 4) {
+        fmAnWrite.valid := True
+        fmAnWrite.payload := fmNextAddress
+        when(fmAnReg === 7) {
+          // Bypass the stale live-A7 readback on the subsequent re-bank cycle.
+          sysOwnA7Valid := True
+          sysOwnA7Data := fmNextAddress
+        }
+      }
+      goto(S_REDIR)
     }
     S_REDIR.whenIsActive {
       // Re-bank A7 in the int PRF: ss.a7 = Mux(s, Mux(m, msp, isp), usp) with the

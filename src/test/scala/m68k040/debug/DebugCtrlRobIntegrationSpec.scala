@@ -114,8 +114,10 @@ class DebugCtrlRobIntegrationSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.intRf.logic.write.valid.toBoolean)
-            intWrites += ((dut.intRf.logic.write.address.toBigInt, dut.intRf.logic.write.data.toBigInt))
+          dut.intRf.logic.writePorts.foreach { port =>
+            if (port.valid.toBoolean)
+              intWrites += ((port.address.toBigInt, port.data.toBigInt))
+          }
           if (dut.nzvcRf.logic.writePort.valid.toBoolean)
             nzvcWrites += ((dut.nzvcRf.logic.writePort.address.toBigInt, dut.nzvcRf.logic.writePort.data.toBigInt))
           if (dut.xRf.logic.writePort.valid.toBoolean)

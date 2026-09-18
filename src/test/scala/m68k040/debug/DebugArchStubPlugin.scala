@@ -25,8 +25,12 @@ class DebugIntRfStubPlugin extends FiberPlugin with IntRegFileService {
   val logic = during build new Area {
     val values = in(Vec.fill(spec.depth)(Bits(spec.dataWidth bits)))
     reads.foreach(r => r.data := values(r.addr))
-    val write = writes.head
-    write.valid.simPublic(); write.address.simPublic(); write.data.simPublic()
+    // Observe every allocated writer; allocation order is not a service contract.
+    // The ROB's cold An writer may precede the debugger's writer.
+    val writePorts = writes.toSeq
+    writePorts.foreach { write =>
+      write.valid.simPublic(); write.address.simPublic(); write.data.simPublic()
+    }
   }
 }
 

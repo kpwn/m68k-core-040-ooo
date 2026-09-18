@@ -30,6 +30,30 @@ class FpAssembleSpec extends AnyFunSuite {
   }
   def run(check: Dut => Unit): Unit = SimConfig.withVerilator.compile(new Dut).doSim(check)
 
+  test("ROM FSCALE immediate before FDIV requires an FPU emulation frame", VerilatorTest) {
+    run { dut =>
+      // Board ROM: 408eeeCE F23C 5926 0001 = FSCALE.B #1,FP2;
+      //            408eeeD4 F200 0520      = FDIV FP1,FP2.
+      // MC68040UM 9.6.1: recognized unsupported FP instructions use vector11,
+      // a format2 frame and the following instruction's PC, not generic F-line.
+      drive(dut, op = 0xF200, ext = 0x0520, len = 2)
+      dut.pkt.pc #= 0x408eeed4L
+      sleep(1)
+      assert(!dut.uop.faulted.toBoolean && dut.uop.op.toEnum == DecOp.FPU,
+        "the displayed FDIV must execute natively")
+      assert(dut.uop.fpuOp.toInt == 0x20)
+
+      drive(dut, op = 0xF23C, ext = 0x5926, ext2 = 1, len = 3)
+      dut.pkt.pc #= 0x408eeeceL
+      sleep(1)
+      assert(dut.uop.faulted.toBoolean && dut.uop.faultVector.toInt == 11)
+      assert(dut.uop.faultUsesNextPc.toBoolean && dut.uop.lenWords.toInt == 3)
+      assert(dut.uop.fpuSoftwareComplete.toBoolean,
+        "FSCALE.B immediate needs format2/FPSP state, not format0 with the following FDIV PC")
+      assert(dut.uop.fpuCmdWord.toInt == 0x5926)
+    }
+  }
+
   // ── Step 2's standalone fix: the two line-F trap PC flavors ────────────────────
   test("a FRAMED line-F encoding traps to vector 11 with the POST-instruction PC", VerilatorTest) {
     run { dut =>

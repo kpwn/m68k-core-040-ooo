@@ -202,7 +202,7 @@ class FpCommitPathSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       initDut(dut, cd)
 
-      val mask = 63
+      val mask = M68kParams().robDepth - 1
       var nextTail = 0
       var allocs = 0
       var cyc = 0

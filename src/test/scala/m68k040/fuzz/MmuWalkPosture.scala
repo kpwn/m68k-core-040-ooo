@@ -355,13 +355,14 @@ object MmuWalkDriver {
     * @param maxAttempts total MMU passes, including the first. */
   def runWithRealTables(name: String, src: String, timeoutCycles: Long,
                         pages8K: Boolean = false, simSeed: Int = 1,
-                        maxAttempts: Int = 3, presetUM: Boolean = false): MmuWalkRun = {
+                        maxAttempts: Int = 3, presetUM: Boolean = false,
+                        allowBkptCompletion: Boolean = true): MmuWalkRun = {
     val imageBytes = m68k040.oracle.ProgramAssembler
       .assemble(src, PortedTestRunner.loadAddr).map(_.bytes.length).getOrElse(0)
 
     val baseline = new PostureProbe
     val baseOutcome = PortedTestRunner.run(
-      name, src, timeoutCycles, simSeed, CachePosture.AsWritten, baseline)
+      name, src, timeoutCycles, simSeed, CachePosture.AsWritten, baseline, allowBkptCompletion)
 
     var blocks = baseline.touchedBlocks.toSet ++ seedBlocks(imageBytes)
     var attempt = 0
@@ -373,7 +374,8 @@ object MmuWalkDriver {
       val map = buildFor(blocks, pages8K, presetUM)
       val probe = new PostureProbe
       val outcome = PortedTestRunner.run(
-        name, src, timeoutCycles, simSeed, CachePosture.ForceMmuWalkCopyback(map), probe)
+        name, src, timeoutCycles, simSeed, CachePosture.ForceMmuWalkCopyback(map), probe,
+        allowBkptCompletion)
       last = MmuWalkRun(outcome, probe, baseline, baseOutcome, map, attempt, extensions)
       val newBlocks =
         probe.holeBlocks.toSet ++

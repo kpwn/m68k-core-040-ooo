@@ -2,10 +2,10 @@
 | family the microcode engine has no entry for must take a CLEAN vector-4
 | ILLEGAL, never execute with the wrong destination.
 |
-| Two such families exist today, and both need machinery MI_RMW_ENTRY does not
-| have (a branch-EU condition evaluation; a tt/dr carried through ctx):
-|   Scc <ea>                 — `scs ([bd,An],od)`
+| The remaining unsupported family needs a tt/dr carried through ctx:
 |   line-E MEMORY shift      — `rol.w ([bd,An],od)`
+| Scc is now implemented with a dedicated condition-and-byte-store program.
+| Keep it as a positive control: it must execute and leave D0 unchanged.
 |
 | Before routing was keyed on the EA (OpSpec.eaSrcValid + the MI_UNSUPPORTED
 | fail-safe), neither was in the hand-written family list, and `bad`'s leading
@@ -16,8 +16,8 @@
 |
 | D0 is poisoned and checked: it is the register the old wrong-register write
 | landed in (the EA field is mode 110 / reg 000), so an unchanged D0 is a real
-| negative control, not just "the trap counter says 2".
-| The pointer slot and the target word are also checked untouched.
+| negative control, not just "the trap counter says 1".
+| The pointer slot and the target's untouched trailing bytes are checked too.
 |
 | PASS: 0xC0FFEE00.  FAIL: 0xDEADBEEF.
 
@@ -35,19 +35,19 @@ _start:
     move.l  #0x5A5A5A5A, 0x00021000   | the target word (must stay untouched)
     move.l  #0x11223344, %d0          | poison: the OLD wrong-register write's landing site
 
-    lea     _c2, %a5
-    scs     ([0x10,%a0],0)            | Scc <memory-indirect>  -> must trap
-    bra     _fail
+    lea     _fail, %a5                | a remaining Scc trap must fail cleanly
+    move.w  #1, %ccr                  | C=1, so SCS must store FF
+    scs     ([0x10,%a0],0)            | now implemented; must NOT trap
 _c2:
     lea     _c3, %a5
     rol.w   ([0x10,%a0],0)            | line-E memory shift <memory-indirect> -> must trap
     bra     _fail
 _c3:
-    cmp.l   #2, %d5                   | both must have trapped
+    cmp.l   #1, %d5                   | only unsupported memory shift traps
     bne     _fail
     cmp.l   #0x11223344, %d0          | no wrong-register write
     bne     _fail
-    cmp.l   #0x5A5A5A5A, 0x00021000   | the target is untouched
+    cmp.l   #0xFF5A5A5A, 0x00021000   | SCS byte write only; shift untouched
     bne     _fail
     cmp.l   #0x00021000, 0x00020010   | the pointer is untouched
     bne     _fail

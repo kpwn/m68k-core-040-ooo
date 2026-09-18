@@ -33,7 +33,7 @@
 |     manufactures for itself at $4088DA52..$4088DA60
 |   * a CONTROL EA has no write-back, so An must be unchanged (unlike -(An))
 | The BODY is deliberately NOT asserted word-for-word here: frame+$18 carries the
-| E1 flag (0x04000000) unconditionally and the operand fields are only populated
+| E1 packed-source flag (0x04000000), and the operand fields are only populated
 | for an unimplemented-instruction frame.  fsave_frestore_basic owns the body.
 |
 | PASS sentinel: 0xC0FFEE00

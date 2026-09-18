@@ -58,13 +58,9 @@ object RegListWalk {
     (bit0, mask1)
   }
 
-  /** Same primitive from the OTHER end: the HIGHEST set bit, and the mask with it cleared.
-    *
-    * FMOVEM.X `-(An)` needs this. Its frame occupies [An-12N, An) and the element walk runs
-    * ASCENDING from An-12N, so to place the list's LAST register at the lowest address (and
-    * therefore the first-transferred register adjacent to An, as the predecrement form
-    * requires) the mask must be consumed from the top down. Consuming it lowest-first with
-    * an ascending address walk lays the block down exactly reversed. */
+  /** Highest set bit and the mask with it cleared. FMOVEM uses this for both
+    * list formats: control/postincrement maps bit7 to FP0 and walks upward;
+    * predecrement maps bit7 to FP7 and walks downward from An-12. */
   def extractHighest1(mask: Bits): (UInt, Bits) = {
     val hi   = OHMasking.last(mask)
     val bitN = OHToUInt(hi)

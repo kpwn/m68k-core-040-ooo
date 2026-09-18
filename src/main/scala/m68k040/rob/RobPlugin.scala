@@ -2,6 +2,10 @@ package m68k040.rob
 
 import m68k040.services.{RenameCommitService, CommitTraceService, RobAllocService, RedirectService, BtbUpdateService, BtbUpdate, GshareUpdateService, GshareUpdate, PrivilegeService, CacheControlService, FrontendQuiesceService, DebugCommitService, DebugSystemApply, DebugSystemStateService, DebugHistoryService, DebugBranchEvent, DebugExceptionEvent}
 import m68k040.rename.RenamedUop
+import m68k040.services.{CommittedFpMapService, FpTrapImmediateService, SerializedMemoryContextService}
+import m68k040.execute.fpu.FpSource
+import m68k040.decode.FpSrcKind
+import m68k040.execute.regfile.{FpRegFileService, RegFileReadPort}
 import m68k040.types.CommitTrace
 import spinal.core._
 import spinal.core.sim._
@@ -39,7 +43,7 @@ object DebugHaltReasonCode {
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService {
+class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService {
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -115,7 +119,36 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
   override def dblFaultPc:  UInt = _debugDblFaultPc
   override def dblFaultVec: UInt = _debugDblFaultVec
   override def haltKind:    UInt = _debugHaltKind
+  private var frameFpSrcRead: RegFileReadPort = null
+  private var frameFpDstRead: RegFileReadPort = null
+  private var fmFpRead: RegFileReadPort = null
+  private var fmFpWrite: m68k040.execute.regfile.RegFileWritePort = null
+  private var fmAnWrite: m68k040.execute.regfile.RegFileWritePort = null
+  private var _serializedInstructionActive: Bool = null
+  private var _serializedInstructionSupervisor: Bool = null
+  private var _serializedInstructionCacheMode: m68k040.cache.CacheMode.C = null
+  override def instructionActive = _serializedInstructionActive
+  override def instructionSupervisor = _serializedInstructionSupervisor
+  override def instructionCacheMode = _serializedInstructionCacheMode
   during setup {
+    // Setup allocation avoids LS -> ROB -> rename -> frontend elaboration cycles.
+    _serializedInstructionActive = Bool()
+    _serializedInstructionSupervisor = Bool()
+    _serializedInstructionCacheMode = m68k040.cache.CacheMode()
+    // Minimal ROB unit DUTs need not instantiate an FP register file. In a
+    // complete core both services exist; allocate through the PRF service before
+    // its build phase, never through another plugin's internal storage.
+    if (host.get[CommittedFpMapService].nonEmpty) {
+      host.get[FpRegFileService].foreach { rf =>
+        frameFpSrcRead = rf.newRead(forceNoBypass = true)
+        frameFpDstRead = rf.newRead(forceNoBypass = true)
+        fmFpRead = rf.newRead(forceNoBypass = true)
+        fmFpWrite = rf.newWrite()
+      }
+    }
+    if (host.get[m68k040.services.CommittedMapService].nonEmpty) {
+      host.get[m68k040.execute.regfile.IntRegFileService].foreach { rf => fmAnWrite = rf.newWrite() }
+    }
     _supervisor             = Bool()
     _sourceFc               = UInt(3 bits)
     _destFc                 = UInt(3 bits)
@@ -246,6 +279,8 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // headReady/count>0 discipline as every other B1 field (see SAFETY above).
     val fpuUnimp = Bool()
     val fpuCmd   = Bits(16 bits)
+    val fpuImm = Bool()
+    val fpuImmTag = UInt(m68k040.Global.FP_IMM_TAG_W bits)
   }
 
   /** COMPLETION-TIME per-entry fault record (ROB-fold Slice C).
@@ -968,6 +1003,10 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // fpuUnimpStore/fpuCmdStore -- Task 10's decode fields, same as before).
       p.fpuUnimp := u.fpuSoftwareComplete
       p.fpuCmd   := u.fpuCmdWord
+      p.fpuImm := u.fpuSoftwareComplete &&
+        (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
+         u.fpSrcKind === FpSrcKind.DOUBLEIMM || u.fpSrcKind === FpSrcKind.EXTIMM)
+      p.fpuImmTag := u.imm(m68k040.Global.FP_IMM_TAG_W - 1 downto 0).asUInt
       p
     }
 
@@ -2587,7 +2626,53 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
       // Task 11: the head's FP unimplemented-instruction marker + command word, read
       // only at vector-11 delivery. ROB-fold task #249: now payload.fpuUnimp/fpuCmd.
       entryFpuUnimp = p0.fpuUnimp,
-      entryFpuCmd   = p0.fpuCmd)
+      entryFpuCmd   = p0.fpuCmd,
+      entryFpuImmediate = p0.fpuImm)
+    _serializedInstructionActive := exc.serializedInstructionActive
+    _serializedInstructionSupervisor := exc.serializedInstructionSupervisor
+    _serializedInstructionCacheMode := exc.serializedInstructionCacheMode
+    if (fmFpRead != null) {
+      val committed = host[CommittedFpMapService]
+      fmFpRead.addr := committed.fpPhys(exc.fmFpReadReg)
+      exc.fmFpReadValue := fmFpRead.data
+      fmFpWrite.valid := exc.fmFpWrite.valid
+      fmFpWrite.address := committed.fpPhys(exc.fmFpWrite.payload.fpReg)
+      fmFpWrite.data := exc.fmFpWrite.payload.value
+      assert(!fmFpWrite.valid || exc.active, "cold FP write outside serialized ownership")
+    }
+    if (fmAnWrite != null) {
+      val committed = host[m68k040.services.CommittedMapService]
+      fmAnWrite.valid := exc.fmAnWrite.valid
+      fmAnWrite.address := committed.intPhys((U(8,5 bits) + exc.fmAnReg.resize(5)).resized)
+      fmAnWrite.data := exc.fmAnWrite.payload.asBits
+      assert(!fmAnWrite.valid || exc.active, "cold An write outside serialized ownership")
+    }
+    host.get[m68k040.services.DTranslationService].foreach { translation =>
+      exc.dxRspCacheMode := translation.rsp.payload.cacheMode
+    }
+    if (frameFpSrcRead != null) {
+      val committedFp = host[CommittedFpMapService]
+      frameFpSrcRead.addr := committedFp.fpPhys(exc.fpuSrcArch)
+      frameFpDstRead.addr := committedFp.fpPhys(exc.fpuDstArch)
+      // At head exception delivery all older FP writers have retired and the
+      // faulting instruction has not changed the committed destination mapping.
+      // R/M=1 names a FORMAT, not an FP source register. Its operand must come
+      // from the immediate/memory capture path, not from FP[format].
+      exc.committedFpSrcIn := Mux(!p0.fpuCmd(14), frameFpSrcRead.data, B(0, 80 bits))
+      exc.committedFpDstIn := frameFpDstRead.data
+    }
+    host.get[FpTrapImmediateService].foreach { imm =>
+      imm.trapImmAddr := p0.fpuImmTag
+      exc.fpuOperandValidIn := !p0.fpuImm || imm.trapImmValid
+      val source = Bits(80 bits)
+      source := FpSource.intToExtended(imm.trapImmData(31 downto 0))
+      switch(p0.fpuCmd(12 downto 10)) {
+        is(B"3'b001") { source := FpSource.singleToExtended(imm.trapImmData(31 downto 0)) }
+        is(B"3'b010") { source := imm.trapImmData }
+        is(B"3'b101") { source := FpSource.doubleToExtended(imm.trapImmData(63 downto 0)) }
+      }
+      when(p0.fpuImm) { exc.committedFpSrcIn := source }
+    }
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
     // Drive the forward-declared committed-S (the privilege check gates on it).
@@ -2609,9 +2694,14 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     // purely because FPCR/FPSR/FPIAR are non-renamed single-copy state that must be
     // touched at a serializing retire (spec Decision 5), NOT because of privilege. So it
     // drives the S_APPLY FSM regardless of committed S, and never raises vector 8.
-    val sysUserOk = p0.sysKind === m68k040.decode.SysKind.FMOVE_FPCTRL
+    val sysUserOk = p0.sysKind === m68k040.decode.SysKind.FMOVE_FPCTRL ||
+      p0.sysKind === m68k040.decode.SysKind.FMOVEM_DATA
     sysTriggerSig := sysRetire && (exc.ss.s || sysUserOk)
     sysPrivFault  := sysRetire && !exc.ss.s && !sysUserOk
+    when(sysTriggerSig && p0.sysKind === m68k040.decode.SysKind.FMOVEM_DATA) {
+      assert(!p0.intWrite && !p0.fpWrite && !p0.sysReadDir,
+        "cold FMOVEM must not commit a renamed destination before memory completion")
+    }
     // MOVE-to-SR writes the FULL CCR (sysVal[4:0]) as an absolute value: override the
     // committed CCR when the system-op FSM applies it (so a LATER exception's stacked SR
     // low byte is correct). The FSM surfaces obsSetCcr5 on S_REDIR; apply it last-wins

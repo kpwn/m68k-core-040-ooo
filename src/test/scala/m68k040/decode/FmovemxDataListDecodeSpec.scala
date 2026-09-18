@@ -82,8 +82,8 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
 
   test("FMOVEM.X (An),FP0 single register load -> 3 LOAD chunks + 1 FP issue row (kept)", VerilatorTest) {
     val base = 0xA000L
-    // (An) mode=010, An=A1 (reg 1); mask=0x01 (FP0), forward/identity map.
-    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = false, 0x01), 0x4e71, 0x4e71), base, 4)
+    // Motorola PRM 5-85..5-88: control mode, bit7 selects FP0.
+    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = true, 0x80), 0x4e71, 0x4e71), base, 4)
     assert(us.length == 4, s"expected 3 chunk loads + 1 issue row, got ${us.length}: $us")
     val loads = us.take(3)
     assert(loads.forall(u => u.mem == "LOAD" && u.base == 9 && u.baseV && u.sizeL && u.dropped),
@@ -97,12 +97,12 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
       s"single-element issue row must target FP0, write FP, NOT write FPCC, and be KEPT: $issue")
   }
 
-  test("FMOVEM.X (An),FP0-FP2 (3 registers, forward/identity map) -> ascending addr, bit n -> FPn", VerilatorTest) {
+  test("FMOVEM.X (An),FP0-FP2 -> ascending registers at ascending addresses", VerilatorTest) {
     val base = 0xA100L
-    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = false, 0x07), 0x4e71, 0x4e71), base, 12)
+    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = true, 0xe0), 0x4e71, 0x4e71), base, 12)
     assert(us.length == 12, s"expected 3 elements x 4 sub-phases, got ${us.length}: $us")
     val issues = (0 to 2).map(k => us(k * 4 + 3))
-    assert(issues.map(_.fpDst) == Seq(0, 1, 2), s"forward map: bit n -> FPn, got ${issues.map(_.fpDst)}: $us")
+    assert(issues.map(_.fpDst) == Seq(0, 1, 2), s"control order must be FP0 through FP2: $us")
     // element k's first chunk load address = base(An) + 12*k.
     val firstLoads = (0 to 2).map(k => us(k * 4))
     assert(firstLoads.map(_.imm) == Seq(0L, 12L, 24L), s"element addresses must step by 12 (Extended): $firstLoads")
@@ -120,12 +120,12 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
     val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = true, 0x07), 0x4e71, 0x4e71), base, 12)
     assert(us.length == 12, s"$us")
     val issues = (0 to 2).map(k => us(k * 4 + 3))
-    assert(issues.map(_.fpDst) == Seq(7, 6, 5), s"reverse map: bit n -> FP(7-n), got ${issues.map(_.fpDst)}: $us")
+    assert(issues.map(_.fpDst) == Seq(5, 6, 7), s"control order must be FP5 through FP7: $us")
   }
 
   test("FMOVEM.X (An),FP0-FP7 (full 8-register list) -> 8 elements x 4 phases = 32 uops", VerilatorTest) {
     val base = 0xA300L
-    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = false, 0xFF), 0x4e71, 0x4e71), base, 32)
+    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = true, 0xFF), 0x4e71, 0x4e71), base, 32)
     assert(us.length == 32, s"expected 8 elements x 4 sub-phases, got ${us.length}: $us")
     val issues = (0 to 7).map(k => us(k * 4 + 3))
     assert(issues.map(_.fpDst) == (0 to 7), s"$issues")
@@ -138,8 +138,8 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
 
   test("FMOVEM.X (d16,An),<list> load -> element addresses fold An + d16 + 12*k", VerilatorTest) {
     val base = 0xA400L
-    // (d16,An) mode=101, An=A2 (reg 2), d16=0x40; mask=0x03 (2 elements).
-    val us = collect(Seq(fpGenOp(5, 2), fxExt1(listRev = false, 0x03), 0x0040, 0x4e71), base, 8)
+    // (d16,An) mode=101, An=A2 (reg 2), d16=0x40; FP0-FP1.
+    val us = collect(Seq(fpGenOp(5, 2), fxExt1(listRev = true, 0xc0), 0x0040, 0x4e71), base, 8)
     assert(us.length == 8, s"$us")
     val firstLoads = Seq(us(0), us(4))
     assert(firstLoads.map(u => u.base) == Seq(10, 10), s"base An must be A2 (arch id 10): $firstLoads")
@@ -149,7 +149,7 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
   test("FMOVEM.X empty list -> architectural no-op; the FOLLOWING instruction still decodes", VerilatorTest) {
     val base = 0xA500L
     // (An) mode=010, An=A1, mask=0 (empty), then MOVEQ #5,D0 (0x7005).
-    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = false, 0x00), 0x7005, 0x4e71), base, 1)
+    val us = collect(Seq(fpGenOp(2, 1), fxExt1(listRev = true, 0x00), 0x7005, 0x4e71), base, 1)
     assert(us.length == 1, s"$us")
     assert(us(0).op == "MOVE" && us(0).mem == "NONE" && us(0).dst == 0 && us(0).imm == 5,
       s"expected the trailing MOVEQ to decode after the empty-list FMOVEM: $us")
@@ -188,7 +188,7 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
   // NOT be mistaken for FMOVECR (whose gate is register-direct only).
   test("cpGEN memory-EA + ext1 opclass 111 decodes as an FMOVEM.X STORE (not FMOVECR)", VerilatorTest) {
     val base = 0xA700L
-    val ext1 = (0x7 << 13) | 0x01   // opclass=111, static (bit11=0), mask=0x01
+    val ext1 = (0x7 << 13) | 0x1080 // store, static control list, FP0
     val us = collect(Seq(fpGenOp(2, 1), ext1, 0x4e71, 0x4e71), base, 4)
     assert(us.nonEmpty, s"$us")
     assert(us.forall(u => !u.faulted),
@@ -210,12 +210,14 @@ class FmovemxDataListDecodeSpec extends AnyFunSuite {
   }
   // RE-POINTED 2026-09-11, same reason as the `(An)+` case above: `-(An)` is a legal
   // MC68040 FMOVEM.X EA and the auto-update landed in 44f38624.
-  test("FMOVEM.X -(An),FP0-FP7 (EA mode 100, load) decodes -- predecrement IS implemented", VerilatorTest) {
+  test("FMOVEM.X FP0-FP7,-(An) (EA mode 100, store) decodes", VerilatorTest) {
     val base = 0xA900L
-    val us = collect(Seq(fpGenOp(4, 1), fxExt1(listRev = false, 0xFF), 0x4e71, 0x4e71), base, 4)
+    // Predecrement is store-only; the old test incorrectly used a load encoding.
+    val us = collect(Seq(fpGenOp(4, 1), 0xe0ff, 0x4e71, 0x4e71), base, 4)
     assert(us.nonEmpty, s"$us")
     assert(us.forall(u => !u.faulted),
       s"-(An) FMOVEM.X is a real 68040 instruction and is implemented (44f38624) -- it must NOT trap: $us")
+    assert(us.exists(_.mem == "STORE"), s"predecrement must emit store chunks: $us")
   }
 
 }

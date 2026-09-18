@@ -18,6 +18,16 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class RobPluginSpec extends AnyFunSuite {
 
+  // Drive the public service with real input pins. Poking the ROB's idle
+  // assignDontCare payload does not override the generated constant-X driver;
+  // Verilator can still use its randomized constant instead of the poked value.
+  class SystemApplyDriver extends FiberPlugin {
+    val logic = during build new Area {
+      val cmd = slave(Flow(m68k040.services.DebugSystemApply()))
+      host[m68k040.services.DebugSystemStateService].requestApply(cmd)
+    }
+  }
+
   // ── Simple DUT: fake rename source + rob + fake commit sink + trace sink ──────
   class SimpleDut extends Component {
     val db   = new Database
@@ -29,8 +39,9 @@ class RobPluginSpec extends AnyFunSuite {
     val tsink = new CommitTraceSinkPlugin
     val cacheCtrl = new CacheControlSinkPlugin
     val dsink = new DebugCommitSinkPlugin
+    val applyDriver = new SystemApplyDriver
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, cacheCtrl, dsink)) }
+      new ParamPlugin(M68kParams()), rsrc, drv, rob, csink, tsink, cacheCtrl, dsink, applyDriver)) }
   }
 
   /** Poke a RenamedUop slot with sane defaults. */
@@ -88,7 +99,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.debugResumeRequestIn #= false
     dut.rob.logic.debugStepRequestIn #= false
     dut.rob.logic.debugClearStickyIn #= false
-    dut.rob.logic.debugSystemApplyIn.valid #= false
+    dut.applyDriver.logic.cmd.valid #= false
     dut.rob.logic.haltAfterTargetIn #= 0
     dut.rob.logic.haltAfterEpochIn #= 0
     dut.rob.logic.haltAfterArmedIn #= false
@@ -602,19 +613,20 @@ class RobPluginSpec extends AnyFunSuite {
         cd.waitSampling()
       }
 
-      // More than one complete ROB turn makes the 63->0 association observable.
+      // More than one complete ROB turn makes the last-slot -> 0 association observable.
+      val depth = M68kParams().robDepth
       val lengths = Seq(1, 2, 3, 5)
       var updates = 0
-      for (n <- 0 until 68) {
+      for (n <- 0 until depth + 4) {
         val pc = 0x4000L + n * 16L
         val len = lengths(n & 3)
         val id = allocBranch(pc)
-        assert(id == (n & 63), s"expected ROB wrap id=${n & 63}, got $id")
+        assert(id == (n % depth), s"expected ROB wrap id=${n % depth}, got $id")
         completeBranch(id, pc, len)
         awaitUpdate(pc, len)
         updates += 1
       }
-      assert(updates == 68)
+      assert(updates == depth + 4)
 
       // A flushed branch never reaches retire-time training.
       val flushedPc = 0x9000L
@@ -2281,7 +2293,7 @@ class RobPluginSpec extends AnyFunSuite {
     * pulse shape but held as a level here (see the test's own doc comment for why
     * that is the right thing to drive from this harness). */
   def pokeSystemApplyPcOnly(dut: SimpleDut, pc: Long): Unit = {
-    val c = dut.rob.logic.debugSystemApplyIn
+    val c = dut.applyDriver.logic.cmd
     c.valid #= true
     c.payload.pcValid #= true; c.payload.pc #= pc
     c.payload.srValid #= false; c.payload.vbrValid #= false
@@ -2327,7 +2339,7 @@ class RobPluginSpec extends AnyFunSuite {
       waitUntil(cd, dut.rob.logic.doFlushReg.toBoolean)
       assert(dut.rob.logic.flushPcReg.toLong == 0x3000L,
         "the held PC-apply must land the correct target once the drain resolves")
-      dut.rob.logic.debugSystemApplyIn.valid #= false
+      dut.applyDriver.logic.cmd.valid #= false
       cd.waitSampling()
       assert(dut.dsink.logic.livePcOut.toLong == 0x3000L, "the applied PC must be observable afterward")
     }

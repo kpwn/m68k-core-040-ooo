@@ -25,8 +25,8 @@ import org.scalatest.funsuite.AnyFunSuite
   *  1. two ports, same cycle, DIFFERENT robIds -> the OLDER one's record is what the
   *     exception delivers, and the younger robId's dyn-record gate stays closed
   *     (since the 2026-09-16 capture cut BOTH carry the retire-blocking mark);
-  *  2. the same case across the 0/63 ring WRAP, where age must be
-  *     (robId - head) mod 64 and a naive robId compare would pick the wrong entry;
+  *  2. the same case across the ring WRAP, where age must be
+  *     (robId - head) mod depth and a naive robId compare would pick the wrong entry;
   *  3. a single port firing alone (the overwhelmingly common case) is unchanged;
   *  4. a same-robId same-cycle collision preserves the OLD last-assign priority
   *     (fp > eu > sq > ls).
@@ -141,7 +141,7 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
     dut.rob.logic.completion(0).valid #= false
     var n = 0
     while (dut.rob.logic.head.toInt == robId && n < 40) { cd.waitSampling(); n += 1 }
-    assert(dut.rob.logic.head.toInt == ((robId + 1) % 64),
+    assert(dut.rob.logic.head.toInt == ((robId + 1) % M68kParams().robDepth),
       s"head failed to advance past robId $robId (head=${dut.rob.logic.head.toInt})")
   }
 
@@ -213,26 +213,28 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
   }
 
   // ────────────────────────────────────────────────────────────────────────────
-  // 2. The 0/63 ring wrap -- the case a naive `robId <` comparison gets wrong.
+  // 2. The ring wrap -- the case a naive `robId <` comparison gets wrong.
   // ────────────────────────────────────────────────────────────────────────────
-  test("wraparound: with head near 63, age is (robId - head) mod 64, not a raw compare") {
+  test("wraparound: age is modular distance from head, not a raw robId compare") {
     M68kSim().compile(new RobDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       init(dut, cd)
 
-      // Walk head to 62 by cycling 62 single entries through the ring.
-      for (i <- 0 until 62) cycleOneEntry(dut, cd, i)
-      assert(dut.rob.logic.head.toInt == 62, s"head=${dut.rob.logic.head.toInt}, want 62")
+      val last = M68kParams().robDepth - 1
+      // Walk to the penultimate slot, preserving the wrap collision at any depth.
+      for (i <- 0 until last - 1) cycleOneEntry(dut, cd, i)
+      assert(dut.rob.logic.head.toInt == last - 1,
+        s"head=${dut.rob.logic.head.toInt}, want ${last - 1}")
 
-      // Four in-flight entries straddling the wrap: robIds 62, 63, 0, 1.
+      // Four in-flight entries straddling the wrap: last-1, last, 0, 1.
       // Ages are 0, 1, 2, 3 respectively.
-      val pcs = Seq(62 -> 0x6200L, 63 -> 0x6300L, 0 -> 0x0100L, 1 -> 0x0200L)
+      val pcs = Seq((last - 1) -> 0x6200L, last -> 0x6300L, 0 -> 0x0100L, 1 -> 0x0200L)
       for ((_, pc) <- pcs) allocOne(dut, cd, pc)
 
-      // Same cycle: sq fault at robId 63 (age 1, OLDER) and ls fault at robId 1
-      // (age 3, younger). A raw magnitude compare on robId would call 1 < 63 and
-      // pick the WRONG (younger) entry; mod-64 age picks robId 63.
-      driveSq(dut, robId = 63, addr = 0x6363L, wr = false, size = 0, sup = true, atc = false)
+      // Same cycle: sq fault at the last robId (age 1, OLDER) and ls fault at 1
+      // (age 3, younger). A raw magnitude compare would pick the younger entry;
+      // age modulo depth must pick the last robId.
+      driveSq(dut, robId = last, addr = 0x6363L, wr = false, size = 0, sup = true, atc = false)
       driveLs(dut, robId = 1, addr = 0x0101L)
       cd.waitSampling()
       idleFaults(dut)
@@ -241,29 +243,29 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
       // FMax capture cut: the MARK is written on the fault cycle, the dyn RECORD
       // (gate + Mem row) one cycle later, out of the four-entry capture register.
       cd.waitSampling()
-      assert(dut.rob.logic.faultDynStore(63).toBoolean,
-        "robId 63 (age 1) is the OLDER entry across the wrap and must win the record")
+      assert(dut.rob.logic.faultDynStore(last).toBoolean,
+        s"robId $last (age 1) is the OLDER entry across the wrap and must win the record")
       assert(!dut.rob.logic.faultDynStore(1).toBoolean,
         "robId 1 (age 3) is YOUNGER across the wrap -- its record must be dropped")
       // Both are marked faulted (the mark is unarbitrated since the capture cut);
       // what the wrap-aware age compare decides is WHICH record is delivered, and
       // that is what the exception check below pins.
-      assert(dut.rob.logic.faultedStore(63).toBoolean && dut.rob.logic.faultedStore(1).toBoolean,
+      assert(dut.rob.logic.faultedStore(last).toBoolean && dut.rob.logic.faultedStore(1).toBoolean,
         "both faulting entries carry the retire-blocking mark")
 
-      // Retire 62 so the winner reaches the head.
+      // Retire last-1 so the winner reaches the head.
       dut.rob.logic.completion(0).valid #= true
-      dut.rob.logic.completion(0).payload #= 62
+      dut.rob.logic.completion(0).payload #= last - 1
       cd.waitSampling()
-      dut.rob.logic.completion(0).payload #= 63
+      dut.rob.logic.completion(0).payload #= last
       cd.waitSampling()
       dut.rob.logic.completion(0).valid #= false
 
-      expectException(dut, cd, "sq fault at robId 63 across the wrap") {
+      expectException(dut, cd, s"sq fault at robId $last across the wrap") {
         assert(dut.rob.logic.exceptionVector.toInt == 2,
           s"an sq access fault is vector 2, got ${dut.rob.logic.exceptionVector.toInt}")
         assert(dut.rob.logic.exceptionFaultAddr.toLong == 0x6363L,
-          f"faultAddr must be robId 63's 0x6363, got 0x${dut.rob.logic.exceptionFaultAddr.toLong}%x")
+          f"faultAddr must be robId $last%d's 0x6363, got 0x${dut.rob.logic.exceptionFaultAddr.toLong}%x")
         // The full SSW attribute set must be the winner's, not a hybrid.
         assert(!dut.rob.logic.exceptionFaultWr.toBoolean, "sq fault was a READ")
         assert(dut.rob.logic.exceptionFaultSize.toInt == 0, "sq fault was BYTE-sized")

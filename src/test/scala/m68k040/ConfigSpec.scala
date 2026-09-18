@@ -3,10 +3,10 @@ package m68k040
 import org.scalatest.funsuite.AnyFunSuite
 
 class ConfigSpec extends AnyFunSuite {
-  test("default params expose the Appendix A baselines") {
+  test("default params expose the configured sizing baselines") {
     val p = M68kParams()
-    assert(p.robDepth == 64)
-    assert(p.physInt == 50)   // 48 + headroom for the 2 EA-cracking temp arch regs
+    assert(p.robDepth == Global.ROB_DEPTH_DEFAULT)
+    assert(p.physInt == Global.PHYS_INT_REGS_DEFAULT)
     assert(p.physNzvc == 16)
     assert(p.physX == 16)
     assert(p.decodeWidth == 2)
@@ -16,8 +16,8 @@ class ConfigSpec extends AnyFunSuite {
 
   test("derived widths are consistent") {
     val p = M68kParams()
-    assert(p.robIdWidth == 6)        // log2Up(64)
-    assert(p.physIntIdWidth == 6)    // log2Up(48) == 6
+    assert(p.robIdWidth == spinal.core.log2Up(p.robDepth))
+    assert(p.physIntIdWidth == spinal.core.log2Up(p.physInt))
   }
 
   test("derived widths track non-default sizing") {

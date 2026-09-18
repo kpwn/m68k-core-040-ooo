@@ -59,7 +59,7 @@ object PortedTestRunner {
 
   def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1,
         cachePosture: CachePosture = CachePosture.AsWritten,
-        probe: PostureProbe = null): PortedOutcome = {
+        probe: PostureProbe = null, allowBkptCompletion: Boolean = true): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
@@ -521,7 +521,11 @@ object PortedTestRunner {
               f"simple=${p0.simple.toBoolean} fault=${p0.fault.toBoolean} " +
               f"wordCount=${p0.wordCount.toInt} lenWords=${p0.lenWords.toInt} " +
               f"w0=0x${p0.words(0).toLong & 0xffffL}%04x w1=0x${p0.words(1).toLong & 0xffffL}%04x " +
-              f"slot1Valid=$slot1V" + (if (slot1V) f" p1pc=0x$p1pc%08x" else ""))
+              f"slot1Valid=$slot1V" + (if (slot1V) {
+                val p1 = dut.dec.logic.fed.payload.packets(1)
+                f" p1pc=0x$p1pc%08x p1valid=${p1.valid.toBoolean}" +
+                  f" p1w0=0x${p1.words(0).toInt}%04x p1w1=0x${p1.words(1).toInt}%04x"
+              } else ""))
           }
         }
       }
@@ -727,6 +731,19 @@ object PortedTestRunner {
       // is what identified the same-cycle dependent ALU dual-issue (see
       // IssueQueuePlugin's `aluSlowHandoff` comment). Zero cost unless
       // PORTED_TRACE_WBDBG is set.
+      // Correlate FP completions with the existing committed-PC trace when
+      // narrowing a numerical failure inside the unmodified ROM FPSP handler.
+      if (sys.env.contains("PORTED_TRACE_FP")) {
+        var fpTraceCycle = 0
+        cd.onSamplings {
+          fpTraceCycle += 1
+          val fp = dut.divEu.logic
+          if (fp.fpCompValid.toBoolean)
+            println(s"[fptrace] cyc=$fpTraceCycle robId=${fp.fpCompRobId.toInt} " +
+              s"pdst=${fp.fpCompPdst.toInt} write=${fp.fpCompPdstValid.toBoolean} " +
+              s"value=0x${fp.fpCompData.toBigInt.toString(16)} fault=${fp.fpCompFault.toBoolean}")
+        }
+      }
       if (sys.env.contains("PORTED_TRACE_WBDBG")) {
         var trCyc = 0
         cd.onSamplings {
@@ -792,7 +809,7 @@ object PortedTestRunner {
       }
 
       var bkptFired = false
-      if (bkptPcs.nonEmpty) {
+      if (allowBkptCompletion && bkptPcs.nonEmpty) {
         cd.onSamplings {
           for (k <- 0 until 2) {
             val c = dut.rob.logic.commitObs(k)
@@ -803,6 +820,7 @@ object PortedTestRunner {
 
       var cyc = 0L
       var word = 0L
+      val progressAddress = sys.env.get("PORTED_PROGRESS_ADDR").map(java.lang.Long.decode(_).longValue)
       while (word == 0 && !bkptFired && cyc < timeoutCycles) {
         cd.waitSampling()
         cyc += 1
@@ -811,6 +829,12 @@ object PortedTestRunner {
         val b2 = dmem.mem.read(SentinelAddr + 2).toLong & 0xffL
         val b3 = dmem.mem.read(SentinelAddr + 3).toLong & 0xffL
         word = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        if ((cyc & 0xffffL) == 0L) progressAddress.foreach { address =>
+          val progress = (0 until 4).foldLeft(0L) { (value, offset) =>
+            (value << 8) | (dmem.mem.read(address + offset).toLong & 0xffL)
+          }
+          println(f"[ported-progress] $name cycles=$cyc addr=0x$address%08x value=0x$progress%08x")
+        }
       }
       if (sys.env.contains("PORTED_TRACE_EXC")) {
         for (a <- 0xFFF0L to 0x10010L) {

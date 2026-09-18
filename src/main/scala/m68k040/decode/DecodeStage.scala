@@ -1,7 +1,7 @@
 package m68k040.decode
 
 import m68k040.frontend.{DecodePacket, PipeStage}
-import m68k040.services.{BranchPredRec, DecodeFeedService, DecodeUopService, FpImmTableService, FrontendDebugMatchService}
+import m68k040.services.{BranchPredRec, DecodeFeedService, DecodeUopService, FpImmTableService, FpTrapImmediateService, FrontendDebugMatchService}
 import m68k040.Global
 import m68k040.isa.Size
 import spinal.core._
@@ -31,7 +31,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * held in the register is squashed on a mispredict/exception redirect.
   */
 class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
-                                       with FpImmTableService {
+                                       with FpImmTableService with FpTrapImmediateService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
   // its build order part of the frontend's existing Fetch->Decode dependency chain.
@@ -47,6 +47,12 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
   private var _fpImmRdAddr: UInt = null
   private var _fpImmRdData: Bits = null
   private var _fpImmFree: Flow[UInt] = null
+  private var _trapImmAddr: UInt = null
+  private var _trapImmData: Bits = null
+  private var _trapImmValid: Bool = null
+  override def trapImmAddr: UInt = _trapImmAddr
+  override def trapImmData: Bits = _trapImmData
+  override def trapImmValid: Bool = _trapImmValid
   private var _backendFlush: Bool = null
   during setup {
     _debugBreakPcs = Vec(UInt(32 bits), 4)
@@ -56,6 +62,10 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     _fpImmRdAddr = UInt(Global.FP_IMM_TAG_W bits)
     _fpImmRdAddr.allowOverride; _fpImmRdAddr := 0
     _fpImmRdData = Bits(80 bits)
+    _trapImmAddr = UInt(Global.FP_IMM_TAG_W bits)
+    _trapImmAddr.allowOverride; _trapImmAddr := 0
+    _trapImmData = Bits(80 bits)
+    _trapImmValid = Bool()
     _fpImmFree = Flow(UInt(Global.FP_IMM_TAG_W bits))
     _fpImmFree.valid.allowOverride;   _fpImmFree.valid   := False
     _fpImmFree.payload.allowOverride; _fpImmFree.payload := 0
@@ -155,11 +165,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     //   2026-09-03      TAS  <- fuzz clusters B/D
     // and the fifth and sixth were sitting there unfound: `Scc <ea>` (fuzz seed 80) and
     // the line-E MEMORY shift/rotate (fuzz seeds 109, 127) were never in any list.
-    // Neither has a µcode entry yet -- Microcode.scala hardcodes `u.shiftOp`/`u.shiftDir`
-    // so a memory shift cannot carry its tt/dr through ctx, and Scc needs a CONDITION
-    // evaluation (branch EU) rather than an ALU host-op -- so both now take the clean
-    // vector-4 trap the fail-safe delivers, instead of executing wrong. Giving them real
-    // entries is a follow-up; being WRONG about them is no longer possible.
+    // Scc now has a pointer-load / branch-EU condition / byte-store entry. Memory
+    // shifts still lack a tt/dr-carrying entry and retain the clean vector-4 fallback.
     def miSingleEaFamily(spec: OpSpec, opw: Bits): Bool =
       (spec.op === DecOp.CLR) || (spec.op === DecOp.NEG) || (spec.op === DecOp.NEGX) ||
       (spec.op === DecOp.NOT) || (spec.op === DecOp.TST) ||
@@ -318,7 +325,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // packet, so both MUST be excluded from the normal slot1 push to avoid a phantom commit).
     val slot1Spec0        = fed.payload.specs(1).spec   // ANGLE E: registered offloaded spec
     val slot1IsMovemEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.movem
-    val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded
+    val slot1IsUcodeEarly = fed.valid && fed.payload.slot1Valid && slot1Spec0.microcoded &&
+      !MicroOpAssembler.isDynamicFmovem(fed.payload.packets(1))
     slot1IsUcodeEarly.simPublic()  // debug-only (task #144)
     // A slot1 MOVEP, like a slot1 MOVEM, cannot be emitted as a normal crack — its real
     // µops come from the MOVEP FSM (entered next cycle from the stashed packet). Exclude
@@ -447,7 +455,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       val allocOhFire = Mux(allocFire, allocOh, B(0, depth bits))
 
       def isFpImmUop(u: DecodedUop): Bool =
-        u.op === DecOp.FPU && (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
+        (u.op === DecOp.FPU || u.fpuSoftwareComplete) && (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
                                u.fpSrcKind === FpSrcKind.DOUBLEIMM || u.fpSrcKind === FpSrcKind.EXTIMM)
       def tagOf(u: DecodedUop): UInt = u.imm(tagW - 1 downto 0).asUInt
       // Decode -> rename boundary crossing: the uop becomes BACKEND-owned.
@@ -467,6 +475,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       backend := backendNext
 
       _fpImmRdData := mem.readAsync(_fpImmRdAddr)
+      _trapImmData := mem.readAsync(_trapImmAddr)
+      _trapImmValid := valid(_trapImmAddr) && backend(_trapImmAddr)
 
       // Sim-only invariants (the plan's "entry valid at consume", plus the domain rules).
       assert(!(free.valid && !valid(free.payload)),
@@ -1044,7 +1054,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // µcode engine never also tries to claim it. `slot0IsFmovemx` is False for every
     // pre-existing opword/EA-mode, so this exclusion is a no-op everywhere else.
     val slot0OwnedByUc = (slot0IsMicrocoded || slot0IsMemInd || slot0IsBfDynMem || slot0IsBfMemindMem) &&
-                         !slot0IsFmovemx
+                         !slot0IsFmovemx && !MicroOpAssembler.isDynamicFmovem(fed.payload.packets(0))
     // µcode engine state (declared early — referenced by normalHeadValid below). The
     // sequencer logic + transitions live in the µcode SEQUENCER region further down.
     val ucActive    = RegInit(False)
@@ -1304,7 +1314,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // integer register files are disjoint, so an FPn can never alias the An base, per the
     // design doc §3's explicit note).
     val fmovemxMask     = Reg(Bits(8 bits))
-    val fmovemxFromTop  = Reg(Bool())        // -(An): drain the register mask highest-bit-first
+    val fmovemxPredec   = Reg(Bool())        // address progression; both list formats drain highest bit first
     val fmovemxRevMap   = Reg(Bool())          // ext1[12]: True=control/postinc (bit n -> FP(7-n)); False=predecrement-list (bit n -> FPn identity) -- design doc §2
     val fmovemxIdxReg   = Reg(UInt(5 bits))   // (d8,An,Xn): the scaled index register
     val fmovemxIdxValid = Reg(Bool())
@@ -1324,10 +1334,9 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fmovemxPhase    = Reg(UInt(3 bits))
     val fmovemxIsStore  = Reg(Bool())          // ext1[15:13]: 110 = load, 111 = store
     // Auto-update (2026-09-10, the form the ROM FPSP actually uses): -(An) and (An)+.
-    // The addressing itself needs no new machinery -- a predecrement's base is folded
-    // into `fmovemxBaseDisp` as a NEGATIVE displacement at entry, so every element still
-    // addresses base + disp + running offset, ascending, with the highest-numbered listed
-    // register at the lowest address (design spec S2). Only the trailing architectural
+    // Predecrement starts at An-12 and walks downward, FP7 toward FP0. Control and
+    // postincrement walk upward, FP0 toward FP7. The lowest-numbered listed register
+    // consequently occupies the lowest address in either format. The trailing architectural
     // An write is new, and it reuses MOVEM's own `movemAnUpdUop` builder verbatim.
     val fmovemxHasFinal = RegInit(False)
     val fmovemxDelta    = Reg(SInt(32 bits))
@@ -1347,13 +1356,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // below when advancing. (Extracting `fmovemxMask` only ONCE and reusing that same bit
     // as "next" is a bug -- it re-derives the CURRENT element's own bit, not the next one;
     // this is why the second extraction below is not redundant.)
-    // Consumed from the TOP for `-(An)`: the address walk is ascending from An-12N, so the
-    // mask must be drained highest-bit-first or the block lands reversed (0xDEAD1105 in
-    // fpu_fmovem_x_roundtrip). `fmovemxFromTop` is latched at begin from `fxIsPredec` --
-    // the live `fxIsPredec` belongs to the ENTRY packet and is not valid mid-walk.
-    val (fmovemxCurBit, fmovemxMaskAfterCur) = RegListWalk.extract1(fmovemxMask, fmovemxFromTop)
+    // Highest bit means FP0 for control/postincrement, FP7 for predecrement.
+    // Address direction, not bit priority, distinguishes their execution order.
+    val (fmovemxCurBit, fmovemxMaskAfterCur) = RegListWalk.extractHighest1(fmovemxMask)
     val fmovemxIsLastElem = fmovemxMaskAfterCur === 0
-    val (fmovemxNextBit, _) = RegListWalk.extract1(fmovemxMaskAfterCur, fmovemxFromTop)
+    val (fmovemxNextBit, _) = RegListWalk.extractHighest1(fmovemxMaskAfterCur)
     val fmovemxElemAddr   = (fmovemxBaseDisp.asSInt + fmovemxOff).asBits
     def fmovemxChunkDisp(i: Int): Bits = (fmovemxElemAddr.asSInt + S(i * 4, 32 bits)).asBits
 
@@ -1451,8 +1458,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fxCount     = CountOne(fxMaskIn).resize(4)
     val fxAutoBytes = (fxCount * U(12, 4 bits)).resize(8)
     val fxAutoDelta = fxAutoBytes.resize(32).asSInt
-    // -(An): the frame occupies [An-12N, An), so the running ascending walk starts at
-    // An-12N. (An)+ and (An) both start at An itself; (d16,An) adds its displacement.
+    // -(An): the frame occupies [An-12N, An), but execution starts at An-12 and
+    // walks downward. (An)+ and (An) start at An; (d16,An) adds its displacement.
     // The base-less modes fold their whole address here. (d16,PC) is relative to the
     // extension word's own address = pc+2 (one opword ahead), matching every other PC-rel
     // EA in this decoder.
@@ -1463,7 +1470,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // corpus pins this: fpu_fmovem_x_idx_pcdi_data encodes its displacement as
     // `_pcdata - (_pcref + 4)`.)
     val fxPcDiVal   = ((fxEntryPkt.pc + U(4, 32 bits)).asSInt + fxDisp16.asSInt).asBits
-    val fxBaseDisp  = Mux(fxIsPredec, (S(0, 32 bits) - fxAutoDelta).resize(32).asBits,
+    val fxBaseDisp  = Mux(fxIsPredec, S(-12, 32 bits).asBits,
                       Mux(fxIsAbsL, fxAbsLVal,
                       Mux(fxIsAbsW, fxDisp16,
                       Mux(fxIsPcDi, fxPcDiVal,
@@ -1473,7 +1480,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     val fxNextPc    = (fxPc + (fxEntryPkt.lenWords << 1)).resize(32)
     val fxIsStore   = fxExt1(15 downto 13) === B"3'b111"   // 110 = load, 111 = store
     val fxMaskEmpty = fxMaskIn === 0
-    val (fxBit0, _) = RegListWalk.extract1(fxMaskIn, fxIsPredec)
+    val (fxBit0, _) = RegListWalk.extractHighest1(fxMaskIn)
 
     val fmovemxBegin = !fmovemxActive && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
                        !movepActive && !movepPendValid &&
@@ -2304,7 +2311,11 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     // #144: on the stashed-slot1 path, this cycle's live fed.valid is unrelated to the
     // stashed packet's validity and can independently be false, e.g. a bubble, silently
     // zeroing ucIsMemInd and misrouting the µcode entry to the wrong default row).
-    val ucIsMemInd = (ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucDynBitMi || ucSingleMi ||
+    // Alterable indexed An EA only; mode7 PC-relative destinations remain illegal.
+    // Raw opword matching avoids adding a late decoded-spec dependency.
+    val ucSccMi = (ucEopw(15 downto 12) === B"0101") &&
+      (ucEopw(7 downto 3) === B"11110") && (ucMiSrcEa.klass === EaClass.MEMINDIRECT)
+    val ucIsMemInd = (ucSccMi || ucMoveSrcMi || ucMoveDstMi || ucAluSrcMi || ucAluDstMi || ucAddqSubqMi || ucImmDstMi || ucDynBitMi || ucSingleMi ||
                        ucLeaMi || ucPeaMi || ucJmpMi || ucJsrMi) &&
                      (ucPendValid || fed.valid)
     // The host op's OTHER operand register:
@@ -2360,6 +2371,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       // ucMoveBothMi — checked FIRST so it wins over the illegal fallback; a post-indexed
       // dst (or any other both-MI shape ucMoveBothMiOk excludes) still falls through to the
       // existing MI_MOVE_BOTH_MI_ILLEGAL_ENTRY arm below.
+      Mux(ucSccMi, U(Microcode.MI_SCC_ENTRY, ew bits),
       Mux(ucMoveBothMiOk,  U(Microcode.MI_MOVE_BOTH_MI_ENTRY, ew bits),
       Mux(ucMoveBothMi,    U(Microcode.MI_MOVE_BOTH_MI_ILLEGAL_ENTRY, ew bits),
       Mux(ucMoveSrcMiEaEa, U(Microcode.MI_MOVE_EAEA_ENTRY,     ew bits),
@@ -2376,7 +2388,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       Mux(ucPeaMi, U(Microcode.MI_PEA_ENTRY, ew bits),
       Mux(ucJmpMi, U(Microcode.MI_JMP_ENTRY, ew bits),
       Mux(ucJsrMi, U(Microcode.MI_JSR_ENTRY, ew bits),
-                         U(Microcode.MI_RMW_ENTRY,    ew bits))))))))))))))
+                         U(Microcode.MI_RMW_ENTRY,    ew bits)))))))))))))))
     // ---- debug-only observability (task #139 mechanism #2 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     ucMiEntry.simPublic()
@@ -2734,9 +2746,8 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
         // claimed it. A `microcoded` op keeps the entry OperationDecoder gave it (BCD /
         // ADDX / SUBX / CAS / CAS2 / ...). Anything else got here ONLY through the
         // memory-indirect EA gate -- its EA needs a pointer chain walked and this ROM has
-        // no entry for its family (today: `Scc <ea>` and the line-E memory shift, both of
-        // which need machinery the MI_RMW_ENTRY shape does not have -- a branch-EU
-        // condition evaluation and a tt/dr carried through ctx respectively). Those
+        // no entry for its family (today: the line-E memory shift, which needs
+        // tt/dr carried through ctx, unlike the generic MI_RMW_ENTRY). Those
         // deliver a clean vector-4 ILLEGAL instead of executing ROM row 0 with a garbage
         // address. This is what makes the gate SAFE to make generic: a family nobody
         // routed traps, rather than silently writing the wrong register or branching to a
@@ -2952,6 +2963,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
     fed.valid.simPublic(); fed.ready.simPublic()
     fed.payload.packets(0).pc.simPublic(); fed.payload.packets(1).pc.simPublic()
     fed.payload.packets(1).words(0).simPublic(); fed.payload.packets(1).words(1).simPublic()
+    fed.payload.packets(1).valid.simPublic()
     fed.payload.packets(1).words(2).simPublic(); fed.payload.packets(1).words(3).simPublic()
     fed.payload.packets(1).words(4).simPublic(); fed.payload.packets(1).wordCount.simPublic()
     fed.payload.packets(1).simple.simPublic(); fed.payload.packets(1).complex.simPublic()  // debug-only (task #144)
@@ -3234,7 +3246,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       fmovemxAnPhase  := False
       fmovemxMask     := fxMaskIn
       fmovemxRevMap   := fxRevIn
-      fmovemxFromTop  := fxIsPredec
+      fmovemxPredec   := fxIsPredec
       fmovemxBaseReg  := fxAnReg
       fmovemxBaseValid := !fxNoBase
       fmovemxIdxReg    := fxIdxReg
@@ -3306,7 +3318,7 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
             }
           } otherwise {
             fmovemxMask    := fmovemxMaskAfterCur
-            fmovemxOff     := (fmovemxOff + S(12, 32 bits)).resize(32)
+            fmovemxOff     := (fmovemxOff + Mux(fmovemxPredec, S(-12,32 bits), S(12,32 bits))).resize(32)
             fmovemxEmitted := fmovemxEmitted + 1
             fmovemxPhase   := 0
             fmovemxCurReg  := fmovemxMapBit(fmovemxNextBit, fmovemxRevMap)

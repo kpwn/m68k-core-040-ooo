@@ -369,7 +369,10 @@ object SysKind extends SpinalEnum {
       // D-side DTLB translation added (the addendum's whole point), time-multiplexed onto
       // the single DTranslationService port via the already-proven `excActive` MUX.
       FSAVE,
-      FRESTORE
+      FRESTORE,
+      // Backend-only dynamic-list transfer. Admission remains disabled until the
+      // serialized memory/register integration and precise-fault tests pass.
+      FMOVEM_DATA
       = newElement()
 }
 

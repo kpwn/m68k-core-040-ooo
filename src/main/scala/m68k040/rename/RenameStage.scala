@@ -1,6 +1,6 @@
 package m68k040.rename
 
-import m68k040.services.{CommittedMapService, DecodeUopService, RenameUopService, RenameCommitService}
+import m68k040.services.{CommittedMapService, CommittedFpMapService, DecodeUopService, RenameUopService, RenameCommitService}
 import m68k040.rob.CommitSlot
 import spinal.core._
 import spinal.core.sim._
@@ -21,7 +21,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * - commit: minimal int-RAT commit port (updates committed mapping).
   */
 class RenameStage extends FiberPlugin with RenameUopService with RenameCommitService
-    with CommittedMapService {
+    with CommittedMapService with CommittedFpMapService {
 
   val logic = during build new Area {
     val du = host[DecodeUopService]
@@ -548,6 +548,7 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
   override def intPhys: Vec[UInt] = logic.intRat.io.committedPhys
   override def nzvcPhys: UInt = logic.nzvcRat.committedPhys(0)
   override def xPhys: UInt = logic.xRat.committedPhys(0)
+  override def fpPhys: Vec[UInt] = logic.fpRat.io.committedPhys
 
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
   override def flushPort:   Bool                  = logic.flush

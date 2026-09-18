@@ -18,6 +18,25 @@ import spinal.lib._
   * EA DESTINATION (the EADST store). */
 object MicroOpAssembler {
 
+  /** Encoding-only admission. Runtime Dn mask contents never enter decode. */
+  def isDynamicFmovem(pkt: DecodePacket): Bool = {
+    val op = pkt.words(0)
+    val ext = pkt.words(1)
+    val mode = op(5 downto 3).asUInt
+    val reg = op(2 downto 0).asUInt
+    val store = ext(13)
+    val eaOk = mode === 2 || mode === 5 ||
+      (mode === 3 && !store) || (mode === 4 && store) ||
+      (mode === 6 && !pkt.words(2)(8)) ||
+      (mode === 7 && (reg === 0 || reg === 1 || (reg === 2 && !store)))
+    // Packet.valid is not the decode stream/slot qualifier (aligned payloads may
+    // carry False). Callers own emission validity; classify only the encoding.
+    !pkt.fault && (op(15 downto 6) === B(0x3c8,10 bits)) &&
+      ext(15 downto 14) === B"2'b11" && ext(11) &&
+      ((ext & B(0x078f,16 bits)) === 0) &&
+      (ext(12) === (mode =/= 4)) && eaOk
+  }
+
   /** Internal int temp arch regs targeted by EA cracking. T2 is the 3rd temp added for
     * the microcode engine's 5-byte bit-field RMW chain (3 simultaneously-live temps
     * {lo,hi,res}); T3 (task #203) is the 4th, holding the memory-indirect dynamic-
@@ -2571,6 +2590,31 @@ object MicroOpAssembler {
       opUop.fpuCmdWord          := fpExt   // == pkt.words(1)
     }
 
+    // Recognized unsupported immediate-source operation: retain its raw operand
+    // in the existing immediate table until precise exception entry. It does NOT
+    // issue to the FPU or write FP/FPCC; the FPSP receives the converted operand.
+    val fpuGenImmUnimpl = bad && spec.fpGeneric && fpFormIsImm &&
+      !fpImmIsPacked && !fpNative && pkt.simple && (pkt.lenWords >= U(3))
+    when(fpuGenImmUnimpl) {
+      opUop.fpuSoftwareComplete := True
+      opUop.fpuCmdWord := fpExt
+      opUop.fpSrcKind := FpSrcKind.INTIMM
+      when(fpSrcSpec === B"3'b001") { opUop.fpSrcKind := FpSrcKind.SINGLEIMM }
+      when(fpSrcSpec === B"3'b010") { opUop.fpSrcKind := FpSrcKind.EXTIMM }
+      when(fpSrcSpec === B"3'b101") { opUop.fpSrcKind := FpSrcKind.DOUBLEIMM }
+      opUop.fpSrcFmt := fpSrcSpec
+      opUop.imm := 0 // DecodeStage stamps the retained table tag.
+      out.fpImmAlloc := True
+      out.fpWideImm := fpSrcSpec.mux(
+        B"3'b000" -> (B(0, 48 bits) ## fpImmLongVal),
+        B"3'b001" -> (B(0, 48 bits) ## fpImmSingleVal),
+        B"3'b010" -> fpImmExtVal,
+        B"3'b100" -> (B(0, 48 bits) ## fpImmWordVal),
+        B"3'b101" -> (B(0, 16 bits) ## fpImmDoubleVal),
+        B"3'b110" -> (B(0, 48 bits) ## fpImmByteVal),
+        default -> B(0, 80 bits))
+    }
+
     // ── FMOVE.L <ea>,FPcr / FPcr,<ea> : a COMMIT-TIME SYSTEM op (Task 9) ────────
     // Structurally identical to MOVEC's arm in the `isSysOp` block below -- same op
     // (MOVE), same cluster (INT), same operand routing, same `imm` side-channel -- but
@@ -4141,8 +4185,35 @@ object MicroOpAssembler {
       useImm = True, imm = (pkt.words(2) ## pkt.words(3)).asBits.resize(32),
       first = True)          // THIS is the macro boundary; opUop clears its own flag
 
+    // Fixed three-uop cold transfer: capture Dn at retirement, compute EA into
+    // another renamed temp, then serialize. No mask-dependent decode sequencing.
+    val coldEa = EaDecoder.decode(op(5 downto 0), Size.LONG,
+      shiftedWordsFor(pkt.words, U(1,3 bits)))
+    val coldMaskUop = mkUop(srcBReg=pkt.words(1)(6 downto 4).asUInt.resize(5),
+      srcBValid=True, dstReg=U(T0,5 bits), dstValid=True, divIsRem=True)
+    coldMaskUop.sysKind.allowOverride; coldMaskUop.sysKind := SysKind.FPCTRL_CAP
+    val coldAddrUop = mkUop(cluster=Cluster.LS, srcAReg=coldEa.base,
+      srcAValid=coldEa.baseValid, dstReg=U(T1,5 bits), dstValid=True,
+      useImm=True, imm=Mux(coldEa.pcRel,
+        (pkt.pc + U(4,32 bits) + coldEa.disp.asUInt).asBits, coldEa.disp),
+      first=False, divIsRem=True)
+    coldAddrUop.leaAddr.allowOverride; coldAddrUop.leaAddr := True
+    coldAddrUop.srcCReg.allowOverride; coldAddrUop.srcCReg := coldEa.indexReg
+    coldAddrUop.srcCValid.allowOverride; coldAddrUop.srcCValid := coldEa.indexValid
+    coldAddrUop.indexLong.allowOverride; coldAddrUop.indexLong := coldEa.indexLong
+    coldAddrUop.indexScale.allowOverride; coldAddrUop.indexScale := coldEa.indexScale
+    val coldFinalUop = mkUop(srcBReg=U(T1,5 bits), srcBValid=True,
+      imm=(pkt.words(1)(13).asBits ## op(5 downto 0)).resize(32), first=False)
+    coldFinalUop.sysOp.allowOverride; coldFinalUop.sysOp := True
+    coldFinalUop.sysKind.allowOverride; coldFinalUop.sysKind := SysKind.FMOVEM_DATA
+
     out.uops(2) := opUop
-    when(spec.microcoded) {
+    when(isDynamicFmovem(pkt)) {
+      out.count := 3
+      out.uops(0) := coldMaskUop
+      out.uops(1) := coldAddrUop
+      out.uops(2) := coldFinalUop
+    } elsewhen(spec.microcoded) {
       // The DecodeStage µcode SEQUENCER owns emission (like MOVEM): emit a benign single
       // placeholder µop here so the assembler's `bad`/crack never fires. The sequencer
       // gates this off (it does not push the placeholder). opUop is already non-`bad`
