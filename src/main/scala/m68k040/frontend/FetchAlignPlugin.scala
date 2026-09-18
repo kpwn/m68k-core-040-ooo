@@ -169,6 +169,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // priority (applied last, below).
     val mispredictRedirect = Flow(UInt(32 bits))
     mispredictRedirect.valid.allowOverride;   mispredictRedirect.valid   := False
+    // Sim-only: the DELIVERED redirect, at the port, before FetchAlign consumes it. The
+    // whole redirect-delivery question is "does this equal the ROB's resolved target,
+    // and does the fetch pointer end up there", so both halves must be observable.
+    mispredictRedirect.valid.simPublic(); mispredictRedirect.payload.simPublic()
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
 
     // axi-socket adapter D12/D16: the reset-vector reader's redirect. Declared with the
@@ -326,6 +330,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     }
     val stalled       = Reg(Bool()) init False       // complex-instruction stall
     val started       = Reg(Bool()) init False       // don't fetch until first redirect
+    // Sim-only taps (2026-09-18, redirect-delivery trace). `quiesce` was already
+    // published; these three are the rest of the front end's "why am I not fetching"
+    // state, and without them a hang cannot be told apart from a wrong redirect target.
+    // `.simPublic()` emits no hardware -- it only keeps the net name through elaboration.
+    stalled.simPublic(); started.simPublic()
     // I-fetch fault hold: a translation fault (ITLB non-resident / protect) on a
     // fetch response. We STOP issuing further real fetches immediately (the fetch
     // pipeline can be up to RING windows ahead of decode), but do NOT immediately
@@ -340,6 +349,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // redirects away from the fault entirely — both existing redirect paths already
     // clear faultHold).
     val faultHold     = Reg(Bool()) init False
+    faultHold.simPublic()   // sim-only tap, see `stalled`/`started` above
     val faultEmitted  = Reg(Bool()) init False   // the faulted packet was already emitted
     // Task #211: which cause raised the held fault — latched from the FIRST fault
     // response's `atc` bit (True=ITLB/MMU translation fault, False=physical AXI bus
