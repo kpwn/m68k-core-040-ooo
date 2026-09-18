@@ -241,13 +241,22 @@ class ExceptionUnit(
     * robId[5:0]}`, and an ExceptionUnit-originated request has no natural `robId`. This
     * mirrors the ALREADY-ESTABLISHED sibling convention on the D-cache side, where
     * `DLoadToken`'s own doc comment reserves "[7] source (0 = LS ROB, 1 = serializing
-    * exception unit)" and this unit stamps `U(0x80)` on `dcLoadCmd.payload.token`. So:
-    * bit[7] = 1 (source = exception unit), bits[6:0] = 0.
+    * exception unit)" and this unit stamps `U(0x80)` on `dcLoadCmd.payload.token` --
+    * that sibling is `DLoadToken`, still 8 bits, and 0x80 is still its source bit. On
+    * THIS side the equivalent is now bit[8] = 1 (source = exception unit), bits[7:0] = 0,
+    * because `DTranslationToken` gained a ninth bit so the exclusion is structural.
     *
     * The token is NOT what makes response matching correct, and this is deliberate --
-    * `LsEuPlugin` can in principle produce the same 8-bit value, since all 64 robIds and
-    * both epoch/split bits are reachable. The REAL guarantee is structural, and holds
-    * without any token at all:
+    * the REAL guarantee is structural and holds without any token at all:
+    *
+    * (CORRECTED 2026-09-18. This paragraph used to read "`LsEuPlugin` can in principle
+    * produce the same 8-bit value, since all 64 robIds and both epoch/split bits are
+    * reachable" -- true while the DTLB token was 8 bits wide, and the reason the match
+    * was only ever defence in depth. `DTranslationToken` is now NINE bits, the LS
+    * composition occupies bits 7:0, and `robTag`'s top pad makes bit 8 structurally zero
+    * for every LS token, so it can no longer produce this value at all. The structural
+    * argument below is unchanged and is still the primary mechanism; the token match
+    * behind it is simply no longer defeatable.)
     *   (a) `xlate.req.valid := !excActive && ...` -- the LS pipe issues NO translation
     *       request for the entire duration of an episode, so nothing new can be launched
     *       alongside ours;
@@ -261,7 +270,13 @@ class ExceptionUnit(
     * token match below is defence in depth against that argument being invalidated by a
     * future multi-outstanding DTLB, and the constant gives such a change an obvious hook.
     */
-  val ExcDtlbToken = 0x80
+  /** 0x100: bit 8, the SOURCE bit `DTranslationToken` widened to nine bits to provide.
+    * The structural argument (a)-(c) above is still what makes response matching
+    * correct; what changed on 2026-09-18 is that the token match behind it is no longer
+    * defeatable even in principle -- the LS composition occupies bits 7:0 and cannot
+    * reach bit 8. See `DTranslationToken.Width` for why that exclusion was made
+    * structural rather than left to how wide the ROB happens to be. */
+  val ExcDtlbToken = 0x100
 
   /** VPN of the translation request currently outstanding (latched on request fire).
     * Also the source of the unwired-DUT identity default just below. */
@@ -1126,6 +1141,58 @@ class ExceptionUnit(
     * `RobPlugin.coreHaltedIn` through the top-level wiring. See F_HALT. */
   val fsXlateFault = RegInit(False); fsXlateFault.simPublic()
 
+  // ══ PTEST: A REAL TABLE SEARCH ════════════════════════════════════════════════
+  // 2026-09-17. This used to be `MMUSR := (An & pageMask) | 1` UNCONDITIONALLY --
+  // never consulting the ATC, the TTRs or the tables, and reporting R=1 (resident)
+  // even with the MMU enabled and the page absent. A Unix fault handler PTESTs the
+  // faulting address to tell NOT-PRESENT from a PROTECTION violation; the old code
+  // answered "present, no protection" every single time, confidently and wrongly.
+  // Under Mac OS nothing calls PTEST on the boot path (the ROM's only user is the
+  // 7.0.1 VM code at image offset 0x27a476, `movec %d0,%dfc; ptestw %a0@;
+  // movec %mmusr,%d0`), which is why it was invisible. Under A/UX it is on the
+  // page-fault path.
+  //
+  // WHY A SEPARATE SEARCH, AND NOT THE ATC OR THE WALKER:
+  //   * The ATC CANNOT answer. `TlbEntry` caches {ppn, writeProt, supervisor,
+  //     cacheMode, modified} -- it has no G, U0 or U1, which MMUSR must report.
+  //     Widening the entry would put 3 more bits x 32 entries x 2 TLBs into the
+  //     hitEntry way-mux, i.e. cost on the LOOKUP path, for a rare instruction.
+  //   * Sharing `TableWalker` would need a second requester arbitrating for a
+  //     single-outstanding walker that the LSU miss path owns.
+  //   * This FSM already has a physical-address load port (`ldoVld`/`dcLoadRsp`)
+  //     that it uses for vector fetches and RTE frame pops, and it runs
+  //     COMMIT-SERIALIZED with the pipeline drained. Reading the three descriptors
+  //     here costs the translation datapath NOTHING -- no new port, no wider entry,
+  //     no arbitration, not one gate on the ATC hit cone. The index arithmetic is
+  //     shared with the walker via `MmuDesc.rootOffset/ptrOffset/pageOffset` so the
+  //     two searches cannot drift.
+  //
+  // WHAT IT DELIBERATELY DOES NOT DO -- it must not disturb the machine it measures:
+  //   * NO ATC FILL. The MC68040 UM's PTEST description is not unambiguous to me on
+  //     whether a table search performed by PTEST loads the ATC, so this takes the
+  //     conservative side: not installing is always SAFE (at worst a later access
+  //     re-walks), whereas installing when the architecture does not would be a real
+  //     behavioural change that could mask a bug in the fill path. Stated here rather
+  //     than asserted as manual fact.
+  //   * NO U/M DESCRIPTOR WRITEBACK. A probe must not mark a page used or modified;
+  //     the whole point of PTESTing an address is to ask about it without touching
+  //     it. (This is also why PTESTR and PTESTW are handled IDENTICALLY here: the one
+  //     architectural difference between them is PTESTW's ability to set M, which is
+  //     exactly the side effect being withheld. The MMUSR they produce is the same.)
+  //   * NO EVICTION and no walker traffic at all.
+  //
+  // FUNCTION CODE: from DFC, not from the current privilege level. That is real
+  // hardware behaviour and the 7.0.1 VM code depends on it -- it loads DFC
+  // immediately before the PTEST. FC[2] selects SRP vs URP and is the ATC's FC2;
+  // FC[1:0] selects INSTRUCTION space (0b10) vs DATA space (0b01), which is what
+  // picks ITT0/ITT1 over DTT0/DTT1 for the transparent-translation check.
+  val ptVa       = Reg(UInt(32 bits)) init 0        // the VA being probed
+  val ptSuper    = RegInit(False)                   // FC[2]
+  val ptDescAddr = Reg(UInt(32 bits)) init 0        // PA of the descriptor to read
+  val ptLevel    = Reg(UInt(2 bits)) init 0         // 0 = root, 1 = pointer, 2 = page
+  val ptWriteProt= RegInit(False)                   // W accumulated down the search
+  ptVa.simPublic(); ptLevel.simPublic()
+
   // ══ REAL DTLB TRANSLATION FOR THE ENTRY FRAME / VECTOR FETCH / RTE POP ═════════
   // 2026-09-09. Until now EVERY access this sequencer made outside the FSAVE/FRESTORE
   // path was IDENTITY-PHYSICAL: `ldoPaddr` defaulted to `ldoVaddr` and
@@ -1394,6 +1461,11 @@ class ExceptionUnit(
     // it. Distinct from and complementary to S_DRAIN, which waits for the D-cache to be
     // idle BEFORE the walk starts.
     val S_MAINTWAIT = new State
+    // Task #198 rework (2026-09-17): PTEST's REAL table search. Three levels, each a
+    // request state + a wait state, reusing the load-issue registers every other
+    // memory-touching state in this FSM already uses. See the PTEST arm of S_APPLY.
+    val S_PTREQ   = new State   // issue one descriptor read at `ptDescAddr`
+    val S_PTWAIT  = new State   // await it; advance a level or compose MMUSR
     val S_REDIR   = new State
     // ── Task 11: FSAVE / FRESTORE state-frame transfer ────────────────────────────
     // Same two-state REQ/WAIT shape as every other memory step in this FSM
@@ -2509,22 +2581,54 @@ class ExceptionUnit(
           sysFlushAllValid := True
         }
         is(skOrd(m68k040.decode.SysKind.PTEST)) {   // PTEST : (An) -> MMUSR
-          // This core's MMU has no real per-page R/W/CM/fault status to probe (same
-          // "stub MMU" limitation PFLUSH/PFLUSHA already lean on). When the MMU is
-          // disabled — the only configuration the ported corpus's ptest_w_an exercises
-          // — PA=VA (identity) and the page is always "resident" (R=1), which is
-          // architecturally EXACT for that configuration, not an approximation.
-          // MMUSR := (An & page-mask) | R(=1); every other MMUSR status bit (B/G/U0/
-          // U1/S/CM/M/W/T) reads 0 (no real translation-fault/write-protect/CM
-          // probing modeled). sysCapVal carries An's value (write direction, exactly
-          // like MOVE_USP's An->USP arm — see MicroOpAssembler's PTEST case).
-          // Task #195: the page mask itself is TCR.P-dependent (0xFFFFF000 for 4K,
-          // 0xFFFFE000 for 8K) — previously hardcoded 4K-only, dormant only because
-          // the ported corpus's ptest_w_an only exercises the MMU-disabled identity
-          // case (page mask is irrelevant there; PA=VA regardless of mask).
-          val ptestPageMask = Mux(mmuCtrl.pageSize8K, U(0xFFFFE000L, 32 bits), U(0xFFFFF000L, 32 bits))
-          mmuCtrl.setMmusr.valid   := True
-          mmuCtrl.setMmusr.payload := (sysCapVal.asUInt & ptestPageMask) | U(1, 32 bits)
+          // A REAL probe now -- see the `ptVa` block above for the full rationale and
+          // for what this deliberately does NOT do. `sysCapVal` carries An's value
+          // (write direction, exactly like MOVE_USP's An->USP arm).
+          //
+          // Three answers can be produced WITHOUT any memory access, and are, so the
+          // common cases cost one cycle exactly as before:
+          //   1. a TTR hit          -> T = 1, R = 1, PA = VA, CM from the TTR
+          //   2. paged translation off -> identity, R = 1
+          //   3. otherwise          -> start the real three-level table search
+          val ptReqVa   = sysCapVal.asUInt
+          val ptFc      = ss.dfc
+          val ptIsSuper = ptFc(2)
+          // FC[1:0]: 0b10 = INSTRUCTION space (ITT0/ITT1), anything else = DATA space
+          // (DTT0/DTT1). A 68040 has two independent TTR pairs and PTEST must consult
+          // the one its function code names.
+          val ptIsInsn  = ptFc(1) && !ptFc(0)
+          val ptTtA     = Mux(ptIsInsn, mmuCtrl.itt0, mmuCtrl.dtt0)
+          val ptTtB     = Mux(ptIsInsn, mmuCtrl.itt1, mmuCtrl.dtt1)
+          val ptVaHi8   = ptReqVa(31 downto 24)
+          val ptTt0Hit  = m68k040.mmu.TtMatch.hit(ptTtA, ptVaHi8, ptIsSuper)
+          val ptTt1Hit  = !ptTt0Hit && m68k040.mmu.TtMatch.hit(ptTtB, ptVaHi8, ptIsSuper)
+          val ptTtHit   = ptTt0Hit || ptTt1Hit
+          val ptTtReg   = Mux(ptTt0Hit, ptTtA, ptTtB)
+
+          ptVa        := ptReqVa
+          ptSuper     := ptIsSuper
+          ptWriteProt := False
+          ptLevel     := 0
+
+          when(ptTtHit) {
+            mmuCtrl.setMmusr.valid   := True
+            mmuCtrl.setMmusr.payload := m68k040.mmu.MmuSr
+              .transparent(ptReqVa, ptTtReg(6 downto 5).asBits).asUInt
+          } elsewhen(!mmuCtrl.mmuEnable) {
+            // Paged translation disabled: PA = VA and the page is trivially
+            // "resident". ARCHITECTURALLY EXACT for this configuration rather than an
+            // approximation, and it is the case the ported corpus's `ptest_w_an`
+            // exercises -- preserved bit-for-bit, including the TCR.P-dependent page
+            // mask (0xFFFFF000 at 4 KB, 0xFFFFE000 at 8 KB).
+            val ptestPageMask = Mux(mmuCtrl.pageSize8K, U(0xFFFFE000L, 32 bits),
+                                                        U(0xFFFFF000L, 32 bits))
+            mmuCtrl.setMmusr.valid   := True
+            mmuCtrl.setMmusr.payload := (ptReqVa & ptestPageMask) | U(1, 32 bits)
+          } otherwise {
+            // Root descriptor address = (SRP or URP, chosen by FC[2]) + rootIdx*4.
+            ptDescAddr := Mux(ptIsSuper, mmuCtrl.srp, mmuCtrl.urp) +
+                          m68k040.mmu.MmuDesc.rootOffset(ptReqVa(31 downto 12)).resize(32)
+          }
         }
         is(skOrd(m68k040.decode.SysKind.FMOVE_FPCTRL)) { // FMOVE(M) <ea> <-> FPCR/FPSR/FPIAR
           // sysCapRc[2:0] is the register-select mask {FPCR, FPSR, FPIAR} (ext[12:10],
@@ -2675,6 +2779,14 @@ class ExceptionUnit(
         goto(F_XREQ)
       } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.FRESTORE)) {
         goto(F_RXREQ)
+      } elsewhen(sysCapKind === skOrd(m68k040.decode.SysKind.PTEST) &&
+                 mmuCtrl.mmuEnable && !mmuCtrl.setMmusr.valid) {
+        // PTEST needs a real table search: paged translation is on AND the arm above
+        // did not already answer from a TTR hit (which is what leaves `setMmusr.valid`
+        // low). Same placement rule as FSAVE/FRESTORE -- the transition must live out
+        // here, because a `goto` inside a switch arm is overridden by this later,
+        // unconditional one.
+        goto(S_PTREQ)
       } otherwise {
         goto(S_REDIR)
       }
@@ -2722,6 +2834,79 @@ class ExceptionUnit(
     // so ss.a7 / ss.srSys reflect the new state. Pulse the obs (post-state sysByte +
     // re-banked A7) + write the int PRF arch-15 with the re-banked A7 (a MOVE-to-SR S
     // flip switches the active bank), and redirect to the next instruction (serialize).
+    // ── PTEST table search: one descriptor read per level ────────────────────────
+    // Reads go out on the SAME registered load port the vector fetch and the RTE
+    // frame pops use, at an ALREADY-PHYSICAL address (a descriptor address IS a
+    // physical address -- SRP/URP and every `tblNextBase` are physical, exactly as
+    // TableWalker treats them), so no translation request is involved and this can
+    // never recurse into the DTLB.
+    //
+    // WHY THE UNTAGGED `dcLoadRsp` IS SAFE HERE. `dcLoadRsp` is a shared, UNTAGGED
+    // Flow read alongside `LsEuPlugin`'s ordinary load pipe, and `E_VECWAIT`/
+    // `R_SRWAIT`/etc. sample it completely unqualified -- a stale response owed to a
+    // flushed LS load can be captured as this unit's own. That hazard is closed for
+    // every sysOp by `S_DRAIN`, which gates `goto(S_APPLY)` on `sqDrained &&
+    // dcQuiesced`; PTEST reaches these states ONLY through S_APPLY, hence only
+    // through S_DRAIN, so the D-cache is already quiesced and no response can be
+    // outstanding to anyone else when the first descriptor read issues. The same
+    // argument the CPUSH/CINV maintenance path relies on, and the reason these two
+    // states need no tag of their own.
+    S_PTREQ.whenIsActive {
+      ldoVld   := True
+      ldoVaddr := ptDescAddr
+      ldoPaddr := ptDescAddr
+      ldoSize  := Size.LONG
+      when(dcLoadCmd.fire) { goto(S_PTWAIT) }
+    }
+    S_PTWAIT.whenIsActive {
+      when(dcLoadRsp.valid) {
+        val d = dcLoadRsp.payload.data
+        // A descriptor read that bus-errored sets B and clears R: the search could not
+        // be completed, which is a DIFFERENT answer from "the page is not present" and
+        // a handler must be able to tell them apart.
+        when(dcLoadRsp.payload.fault) {
+          mmuCtrl.setMmusr.valid   := True
+          mmuCtrl.setMmusr.payload :=
+            m68k040.mmu.MmuSr.notResident(ptWriteProt, busError = True).asUInt
+          goto(S_REDIR)
+        } elsewhen(ptLevel === U(2, 2 bits)) {
+          // ---- LEAF: compose the answer ----
+          // INDIRECT (PDT = 0b10) is not supported by this core's walker either, and is
+          // reported the same way the walker treats it: not resident.
+          val leafOk = m68k040.mmu.MmuDesc.pgResident(d)
+          val w      = ptWriteProt | m68k040.mmu.MmuDesc.pgWriteProt(d)
+          // PA assembly mirrors `LsEuPlugin.s1Paddr` EXACTLY, 8 KB mode included (the
+          // descriptor's bit 12 is architecturally undefined at 8 KB, so PA[12] comes
+          // from the untranslated VA) -- so the PA PTEST reports is the PA a real
+          // access to that address would use, not a second opinion about it.
+          val pa = Mux(mmuCtrl.pageSize8K,
+            (m68k040.mmu.MmuDesc.pgPpn(d)(19 downto 1) ## ptVa(12 downto 0)).asUInt,
+            (m68k040.mmu.MmuDesc.pgPpn(d) ## ptVa(11 downto 0)).asUInt)
+          mmuCtrl.setMmusr.valid := True
+          mmuCtrl.setMmusr.payload := Mux(leafOk,
+            m68k040.mmu.MmuSr.fromPageDesc(pa, d, w, resident = True),
+            m68k040.mmu.MmuSr.notResident(w, busError = False)).asUInt
+          goto(S_REDIR)
+        } otherwise {
+          // ---- ROOT / POINTER level ----
+          when(!m68k040.mmu.MmuDesc.tblResident(d)) {
+            mmuCtrl.setMmusr.valid := True
+            mmuCtrl.setMmusr.payload := m68k040.mmu.MmuSr.notResident(
+              ptWriteProt | m68k040.mmu.MmuDesc.tblWriteProt(d), busError = False).asUInt
+            goto(S_REDIR)
+          } otherwise {
+            ptWriteProt := ptWriteProt | m68k040.mmu.MmuDesc.tblWriteProt(d)
+            ptLevel     := ptLevel + 1
+            val base = m68k040.mmu.MmuDesc.tblNextBase(d)
+            val off  = Mux(ptLevel === U(0, 2 bits),
+              m68k040.mmu.MmuDesc.ptrOffset(ptVa(31 downto 12)).resize(9),
+              m68k040.mmu.MmuDesc.pageOffset(ptVa(31 downto 12), mmuCtrl.pageSize8K).resize(9))
+            ptDescAddr := base + off.resize(32)
+            goto(S_PTREQ)
+          }
+        }
+      }
+    }
     S_REDIR.whenIsActive {
       // Re-bank A7 in the int PRF: ss.a7 = Mux(s, Mux(m, msp, isp), usp) with the
       // POST-write (S,M). The

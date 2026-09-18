@@ -1005,10 +1005,14 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
           cd.waitSampling()
         }
       }
+      // Eight rotating ids at the top of the space, clear of the small ids this test
+      // uses elsewhere (was the literal `40 + (i % 8)`, out of range once the ROB
+      // became 32 deep).
+      val leaRobIds = m68k040.TestRobIds.highBlock(8)
       fork {
         var i = 0
         while (!doneFlag.get()) {
-          issueLea(dut, cd, basePreg = 12, robId = 40 + (i % 8))
+          issueLea(dut, cd, basePreg = 12, robId = leaRobIds(i % leaRobIds.size))
           i += 1
         }
       }

@@ -232,7 +232,7 @@ class TableWalker extends Component {
         rUmValid := False
         // root descriptor address = rootPtr + rootIdx*4
         val rootBase = io.req.rootPtr
-        val rootOff  = (io.req.vpn(19 downto 13) ## U(0, 2 bits)).asUInt   // rootIdx(7)*4
+        val rootOff  = MmuDesc.rootOffset(io.req.vpn)                      // rootIdx(7)*4
         descAddr := rootBase + rootOff.resize(32)
         cmdSent  := False
         descSplitIdx := 0        // no split-read carry into this walk
@@ -255,7 +255,7 @@ class TableWalker extends Component {
           accWriteProt := accWriteProt | MmuDesc.tblWriteProt(d)
           // pointer descriptor address = nextBase + ptrIdx*4
           val base = MmuDesc.tblNextBase(d)
-          val off  = (reqReg.vpn(12 downto 6) ## U(0, 2 bits)).asUInt      // ptrIdx(7)*4
+          val off  = MmuDesc.ptrOffset(reqReg.vpn)                         // ptrIdx(7)*4
           descAddr := base + off.resize(32)
           cmdSent := False
           goto(RD_PTR)
@@ -282,9 +282,7 @@ class TableWalker extends Component {
           // (vpn(0)) moves from "top bit of the page index" to "top bit of the page
           // offset" when TCR.P=1. Both branches are computed to the SAME 8-bit width
           // (zero-extended) so the Mux/resize below is unaffected by page size.
-          val off4k = (reqReg.vpn(5 downto 0) ## U(0, 2 bits)).asUInt         // pageIdx(6)*4
-          val off8k = (U(0, 1 bits) ## reqReg.vpn(5 downto 1) ## U(0, 2 bits)).asUInt // pageIdx(5)*4
-          val off   = Mux(reqReg.is8K, off8k, off4k)
+          val off   = MmuDesc.pageOffset(reqReg.vpn, reqReg.is8K)
           descAddr := base + off.resize(32)
           cmdSent := False
           goto(RD_PAGE)

@@ -7,6 +7,31 @@ case class UmWriteAlloc() extends Bundle {
   val robId   = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val addr    = UInt(32 bits)   // byte address of the descriptor byte to RMW
   val newByte = Bits(8 bits)    // new value of that byte (old | set-bits)
+  /** BORN COMMITTED -- for a producer that has NO owning robId at all.
+    *
+    * The commit mechanism below marks an entry architectural when the ROB retires
+    * the robId it was tagged with. That needs the write to HAVE an owning
+    * instruction. Two producers in this core do not:
+    *
+    *   * an INSTRUCTION FETCH walk (`ItlbPlugin`). The I-side translation request
+    *     carries {vpn, supervisor, write} and nothing else -- a fetch happens
+    *     before rename, so no robId exists yet. It was hardwired to 0, i.e. the
+    *     write became architectural whenever whatever instruction happened to hold
+    *     robId 0 retired: an arbitrary time, under an unrelated identity.
+    *   * an EXCEPTION-episode walk (`ExceptionUnit` through the D side), tagged
+    *     with `lsEu.xlateRobId` -- whatever robId the squashed LS pipe last held.
+    *
+    * `preCommitted` says "this producer has no owner; do not wait for one". The
+    * entry is committed at allocation, drains in order through the same RMW path,
+    * and is immune to flush (the flush block below keeps committed entries), which
+    * is precisely the right lifetime for a write that no instruction owns.
+    *
+    * It does NOT weaken the speculation gating: the caller still refuses to
+    * allocate at all for a walk that was poisoned mid-flight (`walkUmPoison` /
+    * `walkFlushPoison` / `flushAll`). What changes is only WHEN a clean walk's
+    * update becomes architectural -- deterministically, instead of on a borrowed
+    * identity's retirement. */
+  val preCommitted = Bool()
 }
 
 /** A drained U/M descriptor write request: the queue presents the oldest committed
@@ -156,7 +181,8 @@ class UmWriteQueue(depth: Int = 4) extends Component {
   when(io.alloc.valid && !io.flush) {
     assert(!io.full, "UmWriteQueue allocation attempted while full")
     valids(tail)    := True
-    committed(tail) := False
+    // Born committed when the producer has no owning robId -- see `preCommitted`.
+    committed(tail) := io.alloc.payload.preCommitted
     dead(tail)      := False
     robIds(tail)    := io.alloc.payload.robId
     addrs(tail)     := io.alloc.payload.addr

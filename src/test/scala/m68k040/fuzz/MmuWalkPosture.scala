@@ -225,6 +225,17 @@ final class PostureProbe {
     * fabricate a map gap out of nothing (it did, on the first run of this suite). */
   var inFlightWalksAtEnd = 0L
 
+  /** Peak value of `LsEuPlugin.quiesceBlockedWalker`: cycles on which a table walker
+    * WANTED a D-cache port while the exception sequencer's maintenance quiesce window
+    * (`quiesceHold`) was denying grants.
+    *
+    * This exists to answer a REACHABILITY question, not a correctness one. LsEuPlugin
+    * already asserts `!(quiesceHold && (ldGrantOk || stGrantOk))` -- but an assertion
+    * that never sees the circumstance it guards is indistinguishable from one that
+    * holds, so `quiesceHold` could be dead and every suite would still be green. A
+    * non-zero value here is the evidence that the guarded window is genuinely entered. */
+  var quiesceBlockedWalker = 0L
+
   var itlbWalkReads = 0L    // walker descriptor READS (root/pointer/leaf) on the I side
   var dtlbWalkReads = 0L
   var itlbWalkStarts = 0L   // ROOT-level reads == number of walks begun

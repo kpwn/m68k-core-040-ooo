@@ -224,20 +224,43 @@ case class TranslationRsp() extends Bundle {
   * D-side is an elastic request/response pipeline: the LSU may launch a new VPN
   * while the preceding registered response is consumed. */
 object DTranslationToken {
-  // LsEuPlugin composition: {backendEpoch, splitPhase, robId[5:0]}.
+  // LsEuPlugin composition: {pad, backendEpoch, splitPhase, robId[5:0]}.
   /** Bits reserved for the robId, FIXED AT 6 and deliberately independent of
     * Global.ROB_ID_W -- same contract as DLoadToken.RobIdBits. A smaller ROB pads into
-    * this field so the composition and the $80 reservation stay bit-identical. */
+    * this field so the composition and every reserved value stay bit-identical.
+    * `Global.robTag` takes this as a real parameter; it is not decoration. */
   val RobIdBits = 6
-  //
-  // Task 11 reserves the value $80 for the serializing commit-side ExceptionUnit's own
-  // FSAVE/FRESTORE state-frame translations, mirroring the sibling `DLoadToken`
-  // convention ("[7] source (0 = LS ROB, 1 = serializing exception unit)"). That
-  // reservation is a naming convention, not an exclusion — the LS pipe can in principle
-  // form the same 8-bit value — but the two producers are time-multiplexed and can never
-  // have a request in flight simultaneously (see ExceptionUnit.ExcDtlbToken for the full
-  // structural argument).
-  val Width = 8
+
+  /** NINE bits, so bit 8 is a SOURCE bit no LS-pipe token can ever set.
+    *
+    * WHY THIS IS NOT EIGHT (2026-09-18). The LS composition is
+    * `{backendEpoch, splitPhase, robId[5:0]}` = exactly 8 bits, so at Width = 8 the
+    * epoch occupies bit 7 and the LS pipe CAN form 0x80 -- the value reserved for
+    * `ExceptionUnit.ExcDtlbToken`. The old text here called that "a naming convention,
+    * not an exclusion", and it was right: nothing made the collision impossible. It
+    * merely happened to be unreachable for a while, because `robTag` padded at the top
+    * and a 5-bit `ROB_ID_W_DEFAULT` left the composition one bit short of bit 7.
+    *
+    * That is an accidental guarantee, and this campaign exists because accidental
+    * guarantees keep turning into defects: four MMU config-latch faults masked only by
+    * a `doFlush -> umFlush -> walkUmPoison` chain nobody asserted; `RobIdBits` itself
+    * documented as load-bearing in two files with zero readers. Restoring the
+    * documented layout would have SPENT this one -- correct against the docs, and
+    * exactly the trade that produces the next finding.
+    *
+    * At nine bits the composition still occupies bits 7:0 and `robTag`'s top pad makes
+    * bit 8 structurally zero for every LS token, so `ExcDtlbToken` = 0x100 is
+    * unreachable BY CONSTRUCTION, the way `DLoadToken`'s 0x80/0x81/0x82 already are
+    * (all four of its callers pass a constant False as the top bit).
+    *
+    * COST, measured rather than assumed: this token is stored in no Vec and no Mem --
+    * three scalar registers widen by one bit (`DtlbPlugin.missReqReg.token`,
+    * `DtlbPlugin.walkToken`, `LsEuPlugin.txToken`), i.e. +3 flops. Its two consumers
+    * are equalities (`LsEuPlugin.txTokenMatch`, `ExceptionUnit.dxRspMine`) and a 9-input
+    * equality occupies the same two LUT6 levels as an 8-input one, so no depth is added.
+    * It is NOT the D-cache early-probe CAM's token -- that is `DLoadToken`, unchanged at
+    * 8 bits -- so none of the CAM's six compares are touched. */
+  val Width = 9
 }
 case class DTranslationCmd() extends Bundle {
   val vpn        = UInt(20 bits)

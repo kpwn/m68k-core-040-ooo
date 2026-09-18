@@ -245,6 +245,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // ── DTLB U/M deferred-write queue wiring (mirrors top/FullCoreSynth) ──
       val dtlb = host[m68k040.mmu.DtlbPlugin]
       dtlb.umAccessRobId := lsEu.xlateRobId
+      // ...and: is this translation the COMMIT-TIME EXCEPTION SEQUENCER's? Its accesses
+      // share this DTLB port while `excActive` is held, and they own no robId -- the
+      // `xlateRobId` above is the squashed LS pipe's. Such a walk's U/M descriptor write
+      // is born committed instead of waiting for an identity it borrowed.
+      dtlb.umAccessPreCommitted := rob.logic.excActive
       dtlb.umCommitValid := rob.logic.retire0
       dtlb.umCommitBValid := rob.logic.retire1
       dtlb.umCommitBId    := rob.logic.h1
@@ -252,7 +257,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb.umFlush       := host[RedirectService].doFlush
       // ── ITLB U deferred-write queue wiring (U-only; mirrors top/FullCoreSynth) ──
       val itlb = host[m68k040.mmu.ItlbPlugin]
-      itlb.umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
       itlb.umCommitValid := rob.logic.retire0
       itlb.umCommitBValid := rob.logic.retire1
       itlb.umCommitBId    := rob.logic.h1

@@ -28,6 +28,17 @@ class ItlbProbePlugin extends FiberPlugin {
     val flush       = in Bool ()
     val pflusha     = in Bool ()
     val walkDone    = out Bool ()
+    // Additive observation port (2026-09-17): the cycle in which a miss is CAPTURED
+    // but the walker has not started yet. `ItlbFlushPoisonSpec` needs it to place a
+    // PFLUSHA in the PRE-LAUNCH straddle position; nothing else reads it.
+    val missCaptured = out Bool ()
+    /** Walk LAUNCH pulses. Two assertions below used to count descriptor-port ARs as a
+      * proxy for "how many walks happened"; that proxy stopped being valid once the
+      * I-side U-write became born-committed (`UmWriteAlloc.preCommitted`) and therefore
+      * actually DRAINS, because the drain's read-modify-write shares this very port.
+      * Counting launches measures what those assertions NAME, and cannot be confused by
+      * a legitimate descriptor write. */
+    val walkStart = out Bool ()
     xlate.req.valid      := reqIn.valid
     xlate.req.vpn        := reqIn.vpn
     xlate.req.supervisor := reqIn.supervisor
@@ -36,12 +47,13 @@ class ItlbProbePlugin extends FiberPlugin {
     rspOut.ppn       := xlate.rsp.ppn
     rspOut.cacheMode := xlate.rsp.cacheMode
     rspOut.fault     := xlate.rsp.fault
-    itlb.umAccessRobId := accessRobId
     itlb.umCommitValid := commitValid
     itlb.umCommitId    := commitId
     itlb.umFlush       := flush
     itlb.flushAll      := pflusha
     walkDone           := itlb.logic.walker.io.done
+    missCaptured       := itlb.logic.missReqReg.valid
+    walkStart          := itlb.logic.walker.io.start
   }
 }
 
@@ -178,8 +190,10 @@ class ItlbSpec extends AnyFunSuite {
       // miss) must launch EXACTLY ONE walk -> EXACTLY 3 reads (root/ptr/page), no
       // double-walk and no dropped miss.
       var arCount = 0
+      var walkStarts = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
+        if (dut.probe.logic.walkStart.toBoolean) walkStarts += 1 } }
 
       // present the miss and HOLD it valid throughout (the registered trigger must
       // still pulse start exactly once even with the live req held high).
@@ -197,7 +211,9 @@ class ItlbSpec extends AnyFunSuite {
 
       // keep holding the (now-resolved) request a few cycles: no spurious re-walk.
       cd.waitSampling(8)
-      assert(arCount == 3, s"no re-walk while the resolved req stays valid; got $arCount ARs")
+      assert(walkStarts == 1,
+        s"no re-walk while the resolved req stays valid; got $walkStarts walk launches " +
+        s"($arCount descriptor-port ARs -- a born-committed U write legitimately adds one)")
     }
   }
 
@@ -222,8 +238,10 @@ class ItlbSpec extends AnyFunSuite {
       cd.waitSampling(2)
 
       var arCount = 0
+      var walkStarts = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
+        if (dut.probe.logic.walkStart.toBoolean) walkStarts += 1 } }
 
       val (r1, p1, f1) = lookup(dut, cd, vpnOf(va))
       assert(r1 && !f1, "first lookup resolves without fault")
@@ -235,7 +253,9 @@ class ItlbSpec extends AnyFunSuite {
 
       val (r2, p2, f2) = lookup(dut, cd, vpnOf(va))
       assert(r2 && !f2 && p2 == 0xABCDEL, "second lookup hits with correct ppn")
-      assert(arCount == afterFirst, s"TLB hit must issue no walk: $afterFirst -> $arCount")
+      assert(walkStarts == 1,
+        s"TLB hit must issue no walk: got $walkStarts walk launches ($afterFirst -> $arCount ARs, " +
+        s"the extra one being the U-write drain's RMW read, not a walk)")
       dut.probe.logic.reqIn.valid #= false
       cd.waitSampling(2)
 
@@ -291,12 +311,19 @@ class ItlbSpec extends AnyFunSuite {
       cd.waitSampling(2)
 
       var arCount = 0
+      var walkStarts = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1 } }
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
+        if (dut.probe.logic.walkStart.toBoolean) walkStarts += 1 } }
 
-      // Fetch (robId 40): wait until the walk is genuinely active, then squash
+      // Two distinct ids for the two fetches below. Were the literals 40/41, which ran
+      // off the end of a 32-deep ROB and aborted this test at stimulus time -- so C6 has
+      // been carried as a known behavioural red while none of its behaviour ever ran.
+      val c6Ids = m68k040.TestRobIds.highBlock(2)
+
+      // Fetch (first id): wait until the walk is genuinely active, then squash
       // before completion -- the exact collision C6 describes.
-      dut.probe.logic.accessRobId #= 40
+      dut.probe.logic.accessRobId #= c6Ids(0)
       dut.probe.logic.reqIn.valid #= true
       dut.probe.logic.reqIn.vpn   #= vpnOf(va)
       dut.probe.logic.reqIn.write #= false
@@ -319,7 +346,7 @@ class ItlbSpec extends AnyFunSuite {
       // Part 1: recycling/committing the SAME robId later (as if an unrelated
       // later instruction reused it) must NOT drain a spurious descriptor write.
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 40
+      dut.probe.logic.commitId #= c6Ids(0)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       cd.waitSampling(30)
@@ -331,7 +358,7 @@ class ItlbSpec extends AnyFunSuite {
       // must perform a real re-walk -- neither the TLB nor the 1-entry result
       // latch may still be serving the poisoned walk's cached result.
       val beforeSecond = arCount
-      dut.probe.logic.accessRobId #= 41
+      dut.probe.logic.accessRobId #= c6Ids(1)
       val (r2, p2, f2) = lookup(dut, cd, vpnOf(va))
       assert(r2 && !f2 && p2 == 0x33333L, "second fetch to the same page must still resolve correctly")
       assert(arCount > beforeSecond,
@@ -341,7 +368,7 @@ class ItlbSpec extends AnyFunSuite {
       cd.waitSampling(2)
 
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 41
+      dut.probe.logic.commitId #= c6Ids(1)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       guard = 0

@@ -157,11 +157,74 @@ class ByteLaneSplitSpec extends AnyFunSuite {
 
   test("extract tripwire exempts a wrapping access whose data is NOT consumed", VerilatorTest) {
     // Slot A of an LS EU cross-line split pair: presented at the ORIGINAL crossing
-    // offset/size purely to obtain `DLoadRsp.line` (`DLoadCmd.lineOnly`). The wrap is
-    // real here and deliberately harmless, so the tripwire must not fire.
+    // offset/size purely to obtain `DLoadRsp.line` (`DLoadCmd.lineOnly`), so the
+    // tripwire must not fire. Its `.data` is a don't-care by contract -- which is
+    // what makes the 2026-09-17 hardware change below safe for this caller.
     driveWrap(15, Size.WORD, used = false) { dut =>
-      assert(dut.value.toBigInt == ((BigInt(0xAF) << 8) | BigInt(0xA0)),
-        "the wrap itself must be unchanged -- this is a tripwire, not a behaviour change")
+      assert(dut.value.toBigInt == ((BigInt(0xAF) << 8) | BigInt(0x00)),
+        "the out-of-line byte must read ZERO, not the line's own head byte")
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 2026-09-17: THE WRAP IS NOW CLOSED IN HARDWARE TOO.
+  //
+  // The tripwire above is `GenerationFlags.simulation`, so on silicon a crossing
+  // access still returned the line's OWN HEAD BYTES -- data that is plausible,
+  // aliased to real memory, and therefore silently wrong. That is exactly the
+  // shape of the wrong-PC-on-RTE defect: a longword assembled half from the
+  // exception frame and half from the top of the same line still looks like an
+  // address.
+  //
+  // extract() now ties the wrap-reachable mux inputs to a constant zero, which is
+  // exact (every legal offset/size reads an index the wrap cannot produce) and
+  // free (a mux input becomes a literal). These tests are the fail-before /
+  // pass-after evidence: each asserts the byte that wraps reads 0x00 and, just as
+  // importantly, that the IN-LINE bytes are untouched.
+  //
+  // `used = false` throughout: the point is the DATA, and with used = true the
+  // tripwire kills the run before the value can be read.
+  // ───────────────────────────────────────────────────────────────────────────
+  // (label, off, size, expected 32-bit value) -- line bytes are 0xA0 + index.
+  // The label is spelled out rather than interpolated from `size`: a SpinalHDL
+  // enum element has no useful toString outside elaboration, so `s"$size"` gives
+  // "null" for every case and ScalaTest then rejects the suite for duplicate
+  // test names.
+  private def wrapCases = Seq(
+    ("WORD@15", 15, Size.WORD, (BigInt(0xAF) << 8)),                          // 1 byte past
+    ("LONG@15", 15, Size.LONG, (BigInt(0xAF) << 24)),                         // 3 bytes past
+    ("LONG@14", 14, Size.LONG, (BigInt(0xAE) << 24) | (BigInt(0xAF) << 16)),  // 2 bytes past
+    ("LONG@13", 13, Size.LONG,
+      (BigInt(0xAD) << 24) | (BigInt(0xAE) << 16) | (BigInt(0xAF) << 8))      // 1 byte past
+  )
+
+  for ((label, off, size, exp) <- wrapCases) {
+    test(s"extract returns ZERO, not the line head, for a wrapping $label", VerilatorTest) {
+      driveWrap(off, size, used = false) { dut =>
+        assert(dut.value.toBigInt == exp,
+          f"$label value=0x${dut.value.toBigInt}%x expected 0x$exp%x -- " +
+          "a wrapped lane must read 0x00; reading the line's own head byte is the " +
+          "silent-wrong-data defect this closes")
+      }
+    }
+  }
+
+  // ...and every NON-wrapping offset must be bit-identical to the old behaviour.
+  // This is the half that proves the fix is exact rather than merely safe.
+  test("extract is unchanged for every non-wrapping offset/size", VerilatorTest) {
+    M68kSim().withVerilator.compile(new WrapDut).doSim { dut =>
+      dut.line #= wrapLine; dut.used #= false
+      dut.clockDomain.forkStimulus(10)
+      def model(off: Int, n: Int): BigInt =
+        (0 until n).foldLeft(BigInt(0))((acc, k) => (acc << 8) | BigInt(0xA0 + off + k))
+      for ((label, size, n) <- Seq(("BYTE", Size.BYTE, 1), ("WORD", Size.WORD, 2),
+                                   ("LONG", Size.LONG, 4));
+           off <- 0 to (16 - n)) {
+        dut.off #= off; dut.size #= size
+        dut.clockDomain.waitSampling(2)
+        assert(dut.value.toBigInt == model(off, n),
+          f"off=$off%d size=$label got 0x${dut.value.toBigInt}%x want 0x${model(off, n)}%x")
+      }
     }
   }
 

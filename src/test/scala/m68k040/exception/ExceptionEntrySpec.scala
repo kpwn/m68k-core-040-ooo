@@ -48,7 +48,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       xlate.req.payload.vpn        := U(0, 20 bits)
       xlate.req.payload.supervisor := False
       xlate.req.payload.write      := False
-      xlate.req.payload.token      := U(0, 8 bits)
+      xlate.req.payload.token      := U(0, m68k040.cache.DTranslationToken.Width bits)
       xlate.rsp.ready              := True
       dc.loadCmd.valid   := exc.dcLoadCmd.valid
       dc.loadCmd.payload := exc.dcLoadCmd.payload

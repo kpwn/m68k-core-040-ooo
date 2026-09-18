@@ -28,7 +28,14 @@ import spinal.lib.misc.plugin.FiberPlugin
   * walk root is selected per-access from the request's own supervisor bit. */
 class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
-                 banks: Int = Tlb.DefaultBanks) extends FiberPlugin
+                 banks: Int = Tlb.DefaultBanks,
+                 /** THE NEGATIVE CONTROL for the per-search cache-mode latch. Defaults true and
+           * nothing in `src/main` passes false, so it folds away with no netlist difference.
+           * False restores the pre-fix behaviour -- the drain's store re-reads the LIVE
+           * policy instead of the value latched at arming -- which is what let a CACR.DE
+           * write land between a drain's re-read and its store. See
+           * `WalkerDcacheClient.walkCmodePolicy` and `WalkDrainCacheModeSpec`. */
+                 latchDrainCmode: Boolean = true) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -44,11 +51,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   var _walkStore:    Stream[DStoreCmd] = null
   var _walkStoreAck: Bool = null
   var _walkStoreErr: Bool = null
+  var _walkCmodePolicy: CacheMode.C = null
   override def walkLoadCmd:  Stream[DLoadCmd]  = _walkLoadCmd
   override def walkLoadRsp:  Flow[DLoadRsp]    = _walkLoadRsp
   override def walkStore:    Stream[DStoreCmd] = _walkStore
   override def walkStoreAck: Bool = _walkStoreAck
   override def walkStoreErr: Bool = _walkStoreErr
+  override def walkCmodePolicy: CacheMode.C = _walkCmodePolicy
 
   during setup {
     // Allocate the service ports in the plugin's own scope (deterministic — avoids
@@ -58,6 +67,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // U/M queue hooks (sibling-driven; default-idle in logic via allowOverride so a
     // standalone DUT that doesn't wire them still elaborates).
     umAccessRobId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+    umAccessPreCommitted = Bool()
     umCommitValid = Bool()
     umCommitId    = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid = Bool()
@@ -69,6 +79,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStore    = Stream(DStoreCmd())
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
+    _walkCmodePolicy = CacheMode()
   }
 
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
@@ -77,6 +88,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   //  - umCommit      : ROB retired this robId (mark the queued U/M write committable)
   //  - umFlush       : mispredict squash (discard speculative U/M writes)
   var umAccessRobId: UInt = null
+  /** "The access being translated belongs to a COMMIT-TIME EXCEPTION EPISODE, which is
+    * non-speculative by construction; its descriptor write has no owning robId and must
+    * not wait for one."
+    *
+    * The ExceptionUnit's own frame/vector/RTE accesses are translated through this same
+    * DTLB port while `excActive` is held. A write-walk for one of them queues a U/M
+    * descriptor write tagged with `lsEu.xlateRobId` -- whatever robId the SQUASHED LS
+    * pipe last held, which has no relationship to the exception. The entry then commits
+    * at an arbitrary time or, more often, is discarded by the next flush, so the M bit
+    * frequently never reaches memory. `ExceptionUnit.scala` has carried a comment naming
+    * exactly this fix since 2026-09-09; this is it.
+    *
+    * DEFAULTS FALSE, so every standalone DTLB DUT (UmWriteSpec,
+    * WalkerDescriptorCoherencySpec) is bit-for-bit unchanged and needs no new wiring. */
+  var umAccessPreCommitted: Bool = null
   var umCommitValid: Bool = null
   var umCommitId:    UInt = null
   var umCommitBValid: Bool = null   // retire slot 1 (dual-retire) — see UmWriteQueue.commitB
@@ -110,6 +136,21 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // `DcacheClientMemAgent` to these ports instead, which is why they are simPublic.
     _walkLoadCmd.valid   := walker.io.loadCmd.valid
     _walkLoadCmd.payload := walker.io.loadCmd.payload
+    // Driven by the arbiter; WRITETHROUGH is the inert standalone-DUT default, the
+    // same value the arbiter used to stamp unconditionally.
+    _walkCmodePolicy.allowOverride; _walkCmodePolicy := CacheMode.WRITETHROUGH
+    // The WALKER's own descriptor reads take the LIVE policy: a read does not
+    // mutate, so nothing downstream depends on two reads agreeing.
+    //
+    // `allowOverride` because `_walkLoadCmd.payload` was just assigned as a WHOLE
+    // BUNDLE above: SpinalHDL's no-latch/no-override check rejects an unconditional
+    // field override of a just-assigned bundle as a complete assignment overlap (the
+    // same gotcha `LsEuPlugin`'s walker legs document, which is why THEY assign field
+    // by field). The `when(drainNeedRead)` override further down does not need it --
+    // a CONDITIONAL override of an unconditionally assigned signal is ordinary
+    // last-assignment-wins.
+    _walkLoadCmd.payload.cacheMode.allowOverride
+    _walkLoadCmd.payload.cacheMode := _walkCmodePolicy
     _walkLoadCmd.ready.allowOverride; _walkLoadCmd.ready := False
     walker.io.loadCmd.ready := _walkLoadCmd.ready
     _walkLoadRsp.valid.allowOverride;   _walkLoadRsp.valid := False
@@ -126,6 +167,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // U/M queue hooks: default-idle (allowOverride) so a standalone DUT elaborates;
     // the LS-cluster wiring OVERRIDES them.
     umAccessRobId.allowOverride; umAccessRobId := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
+    umAccessPreCommitted.allowOverride; umAccessPreCommitted := False
     umCommitValid.allowOverride; umCommitValid := False
     umCommitId.allowOverride;    umCommitId    := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     umCommitBValid.allowOverride; umCommitBValid := False
@@ -166,7 +208,109 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // commit-time signal. No tag bit, no comparator widening, no extra way-mux
     // level, zero added depth on the hit cone.
     val pageSizeRekey = ctrl.setPageSize.valid && (ctrl.setPageSize.payload =/= ctrl.pageSize8K)
-    val atcFlush      = flushAll || pageSizeRekey
+    // ── FOURTH INSTANCE OF THE SAME FAMILY (2026-09-17): TC.E ────────────────────
+    // The response mux below selects its arm at `_req.fire` -- `when(ttHit) ...
+    // elsewhen(!mmuEnable) ... elsewhen(tlbHit)` -- and REGISTERS the result. The
+    // chosen arm therefore records the `mmuEnable` of the CAPTURE cycle, while the
+    // consumer receives the payload one or more cycles later. A MOVEC to TC that
+    // clears TC.E in between leaves a TRANSLATED PA being delivered to an access that,
+    // by then, should be identity-mapped -- and that access is necessarily YOUNGER
+    // than the MOVEC, because MOVEC retires at the ROB head, so every older access has
+    // already completed.
+    //
+    // Masked today by the same incidental chain as the root case: the sysOp retire
+    // pulses a redirect that squashes younger ops. Nothing names it, nothing asserts
+    // it. `pageSizeRekey` already kills a pending response on a TC.P change (it feeds
+    // `atcFlush`, and the flush block clears `rspValid`); an E-only change did not.
+    //
+    // Deliberately a SEPARATE term from `pageSizeRekey` rather than folded into it:
+    // `pageSizeRekey` is what `OFF_MMU_REKEY_COUNT` counts, and that CSR means "TCR.P
+    // changed". Widening it would silently change what a hardware reading reports.
+    //
+    // COST: one XNOR into the existing OR. Same net, no new depth. Over-invalidating
+    // on an E toggle is free in practice -- the ROM toggles TC.E a handful of times in
+    // the whole boot.
+    val mmuEnableChange = ctrl.setEnable.valid && (ctrl.setEnable.payload =/= ctrl.mmuEnable)
+    mmuEnableChange.simPublic()
+    // ── "WE SHOULD NOT DEPEND ON PFLUSHA" (owner directive, 2026-09-17) ──────────
+    // A ROOT WRITE INVALIDATES THE ATC. `rootChanged` (above) only stops a walk that
+    // is ALREADY IN FLIGHT from installing a result from the old tree; it does nothing
+    // about entries that are ALREADY RESIDENT. On real 68040 those survive a MOVEC to
+    // SRP/URP and software is required to PFLUSH. Under the owner's rule the hardware
+    // must not mistranslate when software omits that flush, so the array is emptied on
+    // the write instead.
+    //
+    // THIS IS REACHABLE IN CONFORMING SOFTWARE TOO, which is the stronger argument.
+    // 7.0.1's MMU restore at image offset 0x27a4bc does:
+    //     movec %d0,%tc ; movec %d0,%urp ; movec %d0,%srp ; <four TTR writes> ; pflusha
+    // The roots change at 0x27a4c4/c8 and the PFLUSHA is eight instructions later at
+    // 0x27a4ee. Every fetch and every data access in that window is translated with the
+    // NEW roots installed and the OLD entries still resident -- a window the program
+    // cannot close, because the architecture's contract is "flush AFTER". Flushing at
+    // the write closes it.
+    //
+    // ON `valid` RATHER THAN A VALUE COMPARE: deliberately. Two extra OR inputs on a
+    // net that already exists, versus two 32-bit comparators; and a root rewritten to
+    // its own current value is so rare that spending area to avoid a harmless flush
+    // would be the wrong trade. Over-invalidation costs re-walks, never correctness.
+    //
+    // CAN THIS BREAK CONFORMING SOFTWARE? No. A conforming program writes the root and
+    // then PFLUSHes; it now gets two flushes instead of one, which is indistinguishable
+    // except in timing. A program could only notice the difference by DEPENDING on
+    // stale entries surviving a root write, and the architecture explicitly does not
+    // permit that dependence -- there is no conforming program this can break.
+    val rootWrite     = ctrl.setSrp.valid || ctrl.setUrp.valid
+    // A TTR WRITE WITHDRAWS ANY PENDING RESPONSE (owner rule, 2026-09-17).
+    //
+    // TTRs do NOT leave stale ATC entries -- a transparent hit is checked BEFORE the
+    // array and never fills it, so covering a region cannot be shadowed by an old
+    // entry and uncovering one cannot expose an entry that was never created. The
+    // hazard is the REGISTERED RESPONSE, the same shape as the TC.E case: the response
+    // mux picks its arm at `_req.fire` and latches `{ppn, cacheMode}`. A TTR write
+    // before that payload is consumed leaves either
+    //   * a STALE CACHE MODE -- an access marked cacheable when the new TTR says
+    //     inhibited. That is the exact shape of the DAFB MMIO bug documented at
+    //     `ttHit` above: a burst refill issued against an AXI-lite-only slave, which
+    //     SLVERRs every beat; or
+    //   * a STALE ARM -- "TTR hit, PA = VA" for a region the new TTR no longer covers,
+    //     which should have gone to the tables. A real mistranslation.
+    //
+    // Only THIS side's pair is watched: a D-side response's cache mode comes from
+    // DTT0/DTT1 and an I-side's from ITT0/ITT1, so gating on the other pair would only
+    // add flushes that cannot fix anything.
+    val ttrWrite      = ctrl.setDtt0.valid || ctrl.setDtt1.valid
+    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange || rootWrite || ttrWrite
+    // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
+    // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
+    // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root
+    // it started under. If software then writes SRP/URP -- MOVEC, control register
+    // 0x806/0x807 -- while that walk is still reading descriptors, the walk completes
+    // against a tree that is NO LONGER INSTALLED and installs the result in the ATC.
+    //
+    // Today that is masked INCIDENTALLY: a sysOp retire pulses a redirect, the redirect
+    // raises `doFlush`, `doFlush` drives `umFlush`, and `umFlush` sets `walkUmPoison`
+    // which happens to gate `tlb.io.fillValid`. Nothing asserts that chain, nothing
+    // names it, and an incidental mask that nobody asserted is EXACTLY how the I-side
+    // `walkFlushPoison` gap survived: its absence was masked the same way until a test
+    // put a PFLUSHA in the window and watched a pre-flush translation get installed.
+    //
+    // THE PATTERN, which is why this is worth naming: the walk LATCHES some piece of
+    // MMU configuration at launch and a consumer RE-DERIVES it live. Three defects in
+    // this family have now been found within a day -- TCR.P re-keying the ATC key, the
+    // ITLB's missing walk-flush poison, and this. Anywhere else configuration is
+    // latched at miss time and re-read live is a candidate for a fourth.
+    //
+    // COST: one flop and an OR, off the lookup path. Self-healing exactly like
+    // `walkFlushPoison`: suppressing the fill costs one re-walk under the NEW root,
+    // which is the answer the access should have had.
+    // NOTE (2026-09-17): now largely SUBSUMED by `rootWrite` feeding `atcFlush`
+    // below, which also poisons an in-flight walk via `flushPoisonArm`. Kept --
+    // one flop -- because it names the property directly and holds even if the
+    // flush term is ever narrowed; it is a second line, not dead code.
+    val rootChanged = RegInit(False)
+    rootChanged.simPublic()
+    when(walker.io.start) { rootChanged := False }
+    when(ctrl.setSrp.valid || ctrl.setUrp.valid) { rootChanged := True }
     pageSizeRekey.simPublic()
     val urp       = ctrl.urp
     val srp       = ctrl.srp
@@ -280,6 +424,35 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     when(_rsp.fire) { rspValid := False }
 
+    // ── TRIPWIRE: NO MISS CAPTURE ON AN ATC-FLUSH CYCLE (race audit, 2026-09-18) ──
+    // `_req.ready`'s `&& !atcFlush` above is not only response-withdrawal: it is ALSO
+    // the D side's structural exclusion against capturing a miss in the same cycle an
+    // MMU control register is written. Nothing said so, and no test pinned it, so a
+    // future narrowing of that term for timing would silently reintroduce the ITLB
+    // defect fixed on 2026-09-18 on THIS side.
+    //
+    // THE SHAPE, if it were ever reopened. The capture arm below writes `missPending`
+    // and clears `walkFlushPoison`; `flushPoisonArm` reads `missPending` as a REGISTER,
+    // i.e. its PRE-capture value. A miss captured beside an `atcFlush` would therefore
+    // carry NO poison at all, while `missReqReg.is8K` and `walkKey(_req.payload.vpn)`
+    // hold the PRE-write TCR.P and `walker.io.req.rootPtr` reads the POST-write root at
+    // launch. The fill then files a result under a key form no later lookup produces --
+    // a one-hot ATC hit on the wrong physical page, with no fault, invisible to
+    // `Tlb.dbgHitCount`. That is `TlbPageSizeRekeySpec`'s defect through a one-cycle
+    // window, and it is exactly what `ItlbCaptureRaceSpec` measures on the I side.
+    //
+    // Assert the exclusion instead of trusting the reader to re-derive it. Zero
+    // hardware; pruned from every netlist.
+    GenerationFlags.simulation {
+      assert(!(_req.fire && atcFlush),
+        "DtlbPlugin: a translation request FIRED on an ATC-flush cycle. The capture arm " +
+        "clears walkFlushPoison while flushPoisonArm still reads the pre-capture " +
+        "missPending, so that walk carries no poison and installs a translation derived " +
+        "from the PRE-write TC/roots under a stale key form. `_req.ready` must keep its " +
+        "`&& !atcFlush` term -- see ItlbCaptureRaceSpec for the measured I-side twin.",
+        FAILURE)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the Dcache valids → walker cone).
     //
@@ -312,6 +485,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       val is8K  = Reg(Bool())
       val token = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
       val robId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+      val preCommitted = Reg(Bool())
     }
     // Task #210 (MC68040 UM S3.3): "If the page is not write protected and the
     // modified bit of the ATC entry is clear, a table search proceeds to set the
@@ -381,6 +555,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
         missReqReg.is8K  := is8K
         missReqReg.token := _req.payload.token
         missReqReg.robId := umAccessRobId
+        missReqReg.preCommitted := umAccessPreCommitted
         missPending      := True
         walkFlushPoison  := False
         walkUmPoison     := False
@@ -424,12 +599,15 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkSup  = Reg(Bool())
     val walkToken = Reg(UInt(m68k040.cache.DTranslationToken.Width bits))
     val walkRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))   // robId of the access that triggered the walk
+    /** ...and whether that access was an exception episode's, which owns no robId. */
+    val walkPreCommitted = RegInit(False)
     when(walker.io.start) {
       walkVpn   := missReqReg.vpn
       walkIs8K  := missReqReg.is8K
       walkSup   := missReqReg.sup
       walkToken := missReqReg.token
       walkRobId := missReqReg.robId
+      walkPreCommitted := missReqReg.preCommitted
     }
 
     // On walk completion: latch the result and (if no fault) fill the TLB.
@@ -495,7 +673,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // exactly the same real 3-level table search a first-time cold miss pays --
       // and that re-walk (assuming no second flush collision) will correctly queue
       // and, once its own instruction commits, drain BOTH U and M.
-      when(!walker.io.rsp.fault && !walkFlushPoison && !atcFlush && !walkUmPoison) {
+      when(!walker.io.rsp.fault && !walkFlushPoison && !atcFlush && !walkUmPoison &&
+           !rootChanged) {
         tlb.io.fillValid := True
       }
       // sim-only taps for the walker->TLB fill (see the `simPublic` block above).
@@ -516,15 +695,22 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // PFLUSHA clears the response slot and prevents a pre-flush in-flight walk from
     // refilling the just-invalidated ATC. Branch/exception flush may retain a
     // speculative resident fill; the tagged response is discarded by the LSU epoch.
+    // The flush-poison ARM condition, named ONCE so the debug probe below cannot
+    // drift from the behaviour it claims to report (`OFF_MMU_DPOISON_COUNT`).
+    // Identical to the `elsewhen(missPending)` arm it replaces: a PFLUSHA landing
+    // on a walk that has already LAUNCHED (the `missReqReg.valid` pre-launch case
+    // is killed outright instead, one line down).
+
+    val flushPoisonArm = atcFlush && missPending && !missReqReg.valid
+    flushPoisonArm.simPublic()
     when(atcFlush) {
       rspValid := False
       when(missReqReg.valid) {
         missReqReg.valid := False
         missPending      := False
-      } elsewhen(missPending) {
-        walkFlushPoison := True
       }
     }
+    when(flushPoisonArm) { walkFlushPoison := True }
     // A speculative resident translation may still fill after a backend squash,
     // but its architectural deferred U/M write belongs to the killed ROB entry and
     // must never be allocated after the one-cycle flush pulse has passed.
@@ -548,6 +734,11 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
+    // The D side normally has a REAL owner: `umAccessRobId` is `lsEu.xlateRobId`, the
+    // robId of the access that triggered the walk. The ONE exception -- literally -- is
+    // a walk for an access made by the commit-time exception sequencer, which owns no
+    // robId; see `umAccessPreCommitted`.
+    umq.io.alloc.payload.preCommitted := walkPreCommitted
     umq.io.alloc.payload.addr   := walker.io.rsp.umWrite.addr
     umq.io.alloc.payload.newByte:= walker.io.rsp.umWrite.newByte
     umq.io.commit.valid   := umCommitValid
@@ -619,6 +810,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
     val drainDropAck  = RegInit(False)
+    /** The descriptor cache-mode policy in force when THIS drain armed. */
+    val drainCmode    = Reg(CacheMode()) init CacheMode.WRITETHROUGH; drainCmode.simPublic()
     drainDropAck := False
 
     // `drainArmingNow` is COMBINATIONAL on purpose. `drainNeedRead` is a register, so
@@ -640,6 +833,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainRdAddr   := umq.io.drain.payload.addr
       drainOffReg   := drainByteOff
       drainSetBits  := umq.io.drain.payload.newByte & UmSetMask
+      // LATCH the policy for this drain. The re-read and the merged store that
+      // follows it are one read-modify-write and MUST agree: see
+      // `WalkerDcacheClient.walkCmodePolicy` for the DE 1->0 lost-M mechanism.
+      drainCmode    := _walkCmodePolicy
     }
 
     // Drain owns the walker's descriptor-read port for exactly one transaction.
@@ -661,7 +858,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // Both overwritten by the arbiter with the same fixed policy the walker's own
       // reads get; these are the inert standalone-DUT defaults, exactly as in
       // TableWalker.
-      _walkLoadCmd.payload.cacheMode := CacheMode.WRITETHROUGH
+      _walkLoadCmd.payload.cacheMode := drainCmode
       _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_DTLB,
                                           m68k040.cache.DLoadToken.Width bits)
     }
@@ -717,7 +914,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // reads use (`CACR.DE ? WRITETHROUGH : INHIBITED`). A per-half cache mode is
     // forbidden: the read and the write halves of one table search must agree, or the
     // read can hit an array copy the write never updated.
-    _walkStore.payload.cacheMode  := CacheMode.WRITETHROUGH
+    _walkStore.payload.cacheMode  := (if (latchDrainCmode) drainCmode else _walkCmodePolicy)
     // NOT on the SQ's at-head precise path: this store belongs to no ROB entry's
     // precise fault reporting, and marking it precise would route a bus error into the
     // SQ's `sqFaultCompletion` against an unrelated robId.

@@ -268,14 +268,20 @@ class UmWriteSpec extends AnyFunSuite {
         if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) arCount += 1
       } }
 
+      // Four distinct ids used in sequence by the two shapes below. Were the literals
+      // 30/31/32/33 -- the last two ran off the end of a 32-deep ROB and aborted the run
+      // at stimulus time, so this test has been reported as a behavioural red while none
+      // of its behaviour ever executed.
+      val c1Ids = m68k040.TestRobIds.highBlock(4)
+
       // ---- M-loss shape: a poisoned WRITE walk ----
       val vaW = 0x02001000L
       val pageAddrW = buildTable(mem, vaW, ppn = 0x11111L)
-      flushMidWalk(vaW, write = true, robId = 30, () => arCount)
+      flushMidWalk(vaW, write = true, robId = c1Ids(0), () => arCount)
       assert(mem.peekByte(pageAddrW + 3) == 0x01, "poisoned write walk must not have drained U/M")
 
       val beforeSecondW = arCount
-      dut.probe.logic.accessRobId #= 31
+      dut.probe.logic.accessRobId #= c1Ids(1)
       dut.probe.logic.reqIn.valid #= true
       dut.probe.logic.reqIn.vpn #= vpnOf(vaW)
       dut.probe.logic.reqIn.write #= true
@@ -290,7 +296,7 @@ class UmWriteSpec extends AnyFunSuite {
         s"already-set): ARs $beforeSecondW -> $arCount")
 
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 31
+      dut.probe.logic.commitId #= c1Ids(1)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       guard = 0
@@ -301,11 +307,11 @@ class UmWriteSpec extends AnyFunSuite {
       // ---- U-loss shape: a poisoned READ (cold-miss) walk ----
       val vaR = 0x02002000L
       val pageAddrR = buildTable(mem, vaR, ppn = 0x22222L)
-      flushMidWalk(vaR, write = false, robId = 32, () => arCount)
+      flushMidWalk(vaR, write = false, robId = c1Ids(2), () => arCount)
       assert(mem.peekByte(pageAddrR + 3) == 0x01, "poisoned read walk must not have drained U")
 
       val beforeSecondR = arCount
-      dut.probe.logic.accessRobId #= 33
+      dut.probe.logic.accessRobId #= c1Ids(3)
       dut.probe.logic.reqIn.valid #= true
       dut.probe.logic.reqIn.vpn #= vpnOf(vaR)
       dut.probe.logic.reqIn.write #= false
@@ -320,7 +326,7 @@ class UmWriteSpec extends AnyFunSuite {
         s"as already-resident with U silently lost): ARs $beforeSecondR -> $arCount")
 
       dut.probe.logic.commitValid #= true
-      dut.probe.logic.commitId #= 33
+      dut.probe.logic.commitId #= c1Ids(3)
       cd.waitSampling()
       dut.probe.logic.commitValid #= false
       guard = 0

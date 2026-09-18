@@ -53,11 +53,35 @@ object Global {
     * The `if` is a SCALA-level test, not a mux: when no padding is needed this returns the
     * identical node graph the hand-written `##` produced, so the generated Verilog at the
     * default depth is byte-for-byte unchanged. */
-  def robTag(hi: spinal.core.Bits, id: spinal.core.UInt, w: Int): spinal.core.UInt = {
+  /** Compose a cross-module transaction tag as `{pad, hi, robId}`.
+    *
+    * `robIdBits` is the width the TAG FORMAT reserves for the robId, which is NOT
+    * `ROB_ID_W_DEFAULT`: `DLoadToken.RobIdBits` / `DTranslationToken.RobIdBits` are
+    * fixed at 6 precisely so the layout (and every reserved value such as
+    * `DLoadToken.EXC` = 0x80) stays bit-identical as the ROB is resized. A narrower
+    * ROB zero-extends INTO that field; it does not shift `hi` down on top of it.
+    *
+    * THE BUG THIS PARAMETER FIXES (race audit, 2026-09-18). This function used to pad
+    * only at the TOP -- `B(0, w - core) ## hi ## id` -- so a 5-bit `ROB_ID_W_DEFAULT`
+    * put `hi` one place LOWER than both token files documented. `RobIdBits` was
+    * declared in two files, described in both as load-bearing ("the layout, and every
+    * reserved value, stay bit-identical"), and READ BY NOTHING. The divergence was
+    * invisible in RTL because every producer and every consumer used this same helper
+    * and therefore shifted together; it surfaced only as four `m68k040.ls` tests whose
+    * expected tokens were written against the documented layout (71 -> 39, 75 -> 43,
+    * 77 -> 45, 150 -> 86 -- in each case exactly "the bit above robId moved down one").
+    *
+    * A written guarantee that nothing enforces is the same defect class as the ITLB
+    * capture race this audit fixed, so the field width is now a real input. */
+  def robTag(hi: spinal.core.Bits, id: spinal.core.UInt, w: Int, robIdBits: Int): spinal.core.UInt = {
     import spinal.core._
-    val core = hi ## id.asBits
+    require(id.getWidth <= robIdBits,
+      s"robTag: a ${id.getWidth}-bit robId does not fit the ${robIdBits}-bit field the tag " +
+      s"format reserves for it")
+    val idField = id.asBits.resize(robIdBits)
+    val core = hi ## idField
     require(core.getWidth <= w,
-      s"robTag: {hi=${hi.getWidth}, robId=${id.getWidth}} = ${core.getWidth} bits does not " +
+      s"robTag: {hi=${hi.getWidth}, robIdField=$robIdBits} = ${core.getWidth} bits does not " +
       s"fit in a $w-bit tag")
     (if (core.getWidth == w) core else B(0, w - core.getWidth bits) ## core).asUInt
   }

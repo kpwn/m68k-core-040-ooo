@@ -258,7 +258,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     dut.robHeadIn #= 0
     dut.robHeadValidIn #= false
     dut.irqPendingIn #= false
-    dut.fwdRobIn #= 63
+    dut.fwdRobIn #= m68k040.TestRobIds.maxId
     dut.fwdAddrIn #= 0
     dut.fwdSizeIn #= Size.BYTE
     dut.bridge.logic.boundaryReady #= true
@@ -374,7 +374,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       if (flushAtOutstanding > 0 && outstanding.nonEmpty) {
         val d = outstanding.front
         val req = reqByAddr(d.paddr)
-        dut.fwdRobIn #= 63
+        dut.fwdRobIn #= m68k040.TestRobIds.maxId
         dut.fwdAddrIn #= req.paddr
         dut.fwdSizeIn #= req.size
       } else {
@@ -558,7 +558,7 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
       val stores = Seq(split, sameLine)
       stores.foreach(alloc(dut, cd, _))
       commitTailFirst(dut, cd, stores)
-      dut.fwdRobIn #= 63
+      dut.fwdRobIn #= m68k040.TestRobIds.maxId
       dut.fwdAddrIn #= lineB
       dut.fwdSizeIn #= Size.WORD
       val tr = runTrace(dut, cd, expectedAcks = 3, headRob = split.robId)
@@ -584,13 +584,17 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
   test("COPYBACK miss and WRITETHROUGH descriptors form ordered barriers", VerilatorTest) {
     compiled.doSim("missWtBarriers") { dut =>
       val (cd, mem) = initDut(dut)
-      val hitA  = StoreReq(30, 0x4000L, BigInt("a0a1a2a3", 16))
-      val missB = StoreReq(31, 0x5100L, BigInt("b0b1b2b3", 16))
-      val hitC  = StoreReq(32, 0x4020L, BigInt("c0c1c2c3", 16))
-      val hitD  = StoreReq(33, 0x4030L, BigInt("d0d1d2d3", 16))
-      val hitE  = StoreReq(34, 0x4040L, BigInt("e0e1e2e3", 16))
-      val wtF   = StoreReq(35, 0x4050L, BigInt("f0f1f2f3", 16), mode = CacheMode.WRITETHROUGH)
-      val hitG  = StoreReq(36, 0x4060L, BigInt("01020304", 16))
+      // ALL SEVEN from one block: `hitA`/`missB` used to be literals 30/31, which are in
+      // range but adjacent to the block -- taking only five derived ids collided with them
+      // and destroyed the ascending == program-order property the barrier check rests on.
+      val ids   = m68k040.TestRobIds.highBlock(7)
+      val hitA  = StoreReq(ids(0), 0x4000L, BigInt("a0a1a2a3", 16))
+      val missB = StoreReq(ids(1), 0x5100L, BigInt("b0b1b2b3", 16))
+      val hitC  = StoreReq(ids(2), 0x4020L, BigInt("c0c1c2c3", 16))
+      val hitD  = StoreReq(ids(3), 0x4030L, BigInt("d0d1d2d3", 16))
+      val hitE  = StoreReq(ids(4), 0x4040L, BigInt("e0e1e2e3", 16))
+      val wtF   = StoreReq(ids(5), 0x4050L, BigInt("f0f1f2f3", 16), mode = CacheMode.WRITETHROUGH)
+      val hitG  = StoreReq(ids(6), 0x4060L, BigInt("01020304", 16))
       val stores = Seq(hitA, missB, hitC, hitD, hitE, wtF, hitG)
       warm(dut, cd, mem, Seq(hitA.paddr, hitC.paddr, hitD.paddr, hitE.paddr,
                              wtF.paddr, hitG.paddr))
@@ -623,9 +627,10 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
   test("a precise descriptor serializes younger drains and completes on its own ack", VerilatorTest) {
     compiled.doSim("preciseBarrier") { dut =>
       val (cd, mem) = initDut(dut)
-      val fastA = StoreReq(40, 0x6000L, BigInt("10111213", 16))
-      val preciseB = StoreReq(41, 0x6010L, BigInt("20212223", 16), precise = true)
-      val fastC = StoreReq(42, 0x6020L, BigInt("30313233", 16))
+      val ids   = m68k040.TestRobIds.highBlock(3)   // ascending == program order
+      val fastA = StoreReq(ids(0), 0x6000L, BigInt("10111213", 16))
+      val preciseB = StoreReq(ids(1), 0x6010L, BigInt("20212223", 16), precise = true)
+      val fastC = StoreReq(ids(2), 0x6020L, BigInt("30313233", 16))
       val stores = Seq(fastA, preciseB, fastC)
       warm(dut, cd, mem, stores.map(_.paddr))
       stores.foreach(alloc(dut, cd, _))
@@ -649,11 +654,14 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
   test("flush preserves committed accepted descriptors until their in-order acks", VerilatorTest) {
     compiled.doSim("flushCommittedInFlight") { dut =>
       val (cd, mem) = initDut(dut)
+      // Four ascending ids: three committed, then the speculative one YOUNGEST of all
+      // (the flush-keep rule under test is about age, so the order is load-bearing).
+      val ids = m68k040.TestRobIds.highBlock(4)
       val committed = (0 until 3).map { i =>
-        StoreReq(robId = 48 + i, paddr = 0x7000L + i * 0x10L,
+        StoreReq(robId = ids(i), paddr = 0x7000L + i * 0x10L,
                  data = BigInt(0x51525354L + i * 0x1010101L))
       }
-      val speculative = StoreReq(55, 0x7100L, BigInt("deadbeef", 16))
+      val speculative = StoreReq(ids(3), 0x7100L, BigInt("deadbeef", 16))
       val stores = committed :+ speculative
       warm(dut, cd, mem, stores.map(_.paddr))
       stores.foreach(alloc(dut, cd, _))

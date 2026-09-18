@@ -72,8 +72,16 @@ class ItlbFlushPoisonSpec extends AnyFunSuite {
     pokeWord(mem, pagt + pageIdx(va) * 4, ((ppn << 12) & 0xfffff000L) | 0x9L)
   }
 
-  test("PFLUSHA during an in-flight ITLB walk must not install the pre-flush translation",
-       VerilatorTest) {
+  /** @param straddle "mid" | "prelaunch" | "atdone" -- WHERE the one-cycle PFLUSHA
+    *   pulse lands relative to the walk. Under Mac OS a root change is
+    *   `_SwapMMUMode`, occasional; under A/UX it is every context switch, so every
+    *   straddle position is reached routinely and each needs its own coverage.
+    *   "prelaunch" is deliberately included even though it is expected to be safe by
+    *   a DIFFERENT mechanism (the walk has not started, so it launches under the NEW
+    *   root and never reads the old tree at all) -- that is reasoning, and reasoning
+    *   about this exact interaction is what produced the I-side gap in the first
+    *   place. */
+  private def body(straddle: String): Unit = {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
@@ -108,8 +116,17 @@ class ItlbFlushPoisonSpec extends AnyFunSuite {
       dut.probe.logic.reqIn.vpn   #= vpnOf(va)
       dut.probe.logic.reqIn.supervisor #= true
       var g = 0
-      while (arCount < 1 && g < 200) { cd.waitSampling(); g += 1 }
-      assert(arCount >= 1, "the walk must have started before the flush")
+      straddle match {
+        case "prelaunch" =>
+          while (!dut.probe.logic.missCaptured.toBoolean && g < 200) { cd.waitSampling(); g += 1 }
+          assert(dut.probe.logic.missCaptured.toBoolean, "never observed the pre-launch cycle")
+        case "mid" =>
+          while (arCount < 1 && g < 200) { cd.waitSampling(); g += 1 }
+          assert(arCount >= 1, "the walk must have started before the flush")
+        case "atdone" =>
+          while (!dut.probe.logic.walkDone.toBoolean && g < 400) { cd.waitSampling(); g += 1 }
+          assert(dut.probe.logic.walkDone.toBoolean, "never observed walker.done")
+      }
 
       // ---- _SwapMMUMode retires: new root installed, then PFLUSHA ----
       dut.ctrl.logic.srp #= ROOT_B
@@ -129,8 +146,7 @@ class ItlbFlushPoisonSpec extends AnyFunSuite {
       val arAfterWalk = arCount
       info(s"walk started before flush (ARs at flush = $arAtFlush), completed after it " +
            s"(ARs after = $arAfterWalk)")
-      assert(arAtFlush < 3 || arAfterWalk > arAtFlush,
-             s"the walk must genuinely straddle the PFLUSHA (ARs at flush=$arAtFlush, after=$arAfterWalk)")
+      info(s"[$straddle] ARs at flush=$arAtFlush, after=$arAfterWalk")
 
       // ---- the fetch re-issues after the swap. It must RE-WALK the NEW tree. ----
       dut.probe.logic.reqIn.valid #= true
@@ -144,15 +160,37 @@ class ItlbFlushPoisonSpec extends AnyFunSuite {
       val ppn   = dut.probe.logic.rspOut.ppn.toLong
       val fault = dut.probe.logic.rspOut.fault.toBoolean
       val walksAfter = arCount - arAfterWalk
-      info(f"post-PFLUSHA fetch of vpn 0x${vpnOf(va)}%05x -> ppn 0x$ppn%05x " +
+      info(f"[$straddle] post-PFLUSHA fetch of vpn 0x${vpnOf(va)}%05x -> ppn 0x$ppn%05x " +
            f"(new tree says 0x$ppnB%05x, PRE-FLUSH tree said 0x$ppnA%05x), " +
            f"fault=$fault, re-walk reads=$walksAfter")
       assert(ready, "the post-flush fetch must resolve")
       assert(!fault, "no fault either way")
+      // A re-walk must happen SOMEWHERE after the flush -- but not necessarily on the
+      // final request. With the fetch request still asserted across the flush, the I
+      // side legitimately re-walks immediately (under the NEW root) and the later
+      // request then hits that FRESH entry with zero reads. Measured in `[atdone]`:
+      // ARs 3 -> 6 inside the window, then 0 on the re-request. Counting only the
+      // final request's reads would call that a stale hit, which it is not; what
+      // matters is that no PRE-flush entry survived to answer, and the PPN check
+      // below is what proves that.
+      val totalReWalk = (arAfterWalk - arAtFlush) + walksAfter
+      assert(totalReWalk > 0,
+        f"[$straddle] a re-walk must occur after the flush; no entry may simply survive it " +
+        f"(in-window=${arAfterWalk - arAtFlush}, on-request=$walksAfter)")
       assert(ppn == ppnB,
-        f"STALE TRANSLATION SURVIVED PFLUSHA: vpn 0x${vpnOf(va)}%05x served ppn 0x$ppn%05x " +
+        f"[$straddle] STALE TRANSLATION SURVIVED PFLUSHA: vpn 0x${vpnOf(va)}%05x served ppn 0x$ppn%05x " +
         f"from the PRE-FLUSH page tables; the post-swap tree maps it to 0x$ppnB%05x. " +
         f"re-walk reads after the flush = $walksAfter")
     }
+  }
+
+  test("I side: PFLUSHA mid-walk must not install the pre-flush translation", VerilatorTest) {
+    body("mid")
+  }
+  test("I side: PFLUSHA in the pre-launch cycle must not install the pre-flush translation", VerilatorTest) {
+    body("prelaunch")
+  }
+  test("I side: PFLUSHA in the walk-completion cycle must not install the pre-flush translation", VerilatorTest) {
+    body("atdone")
   }
 }

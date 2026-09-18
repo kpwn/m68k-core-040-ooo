@@ -23,7 +23,7 @@ class DtlbCrossPageTracePlugin extends FiberPlugin {
 
     val reqFire  = out Bool ()
     val reqVpn   = out UInt (20 bits)
-    val reqToken = out UInt (8 bits)
+    val reqToken = out UInt (m68k040.cache.DTranslationToken.Width bits)
     val reqWrite = out Bool ()
     reqFire  := xlate.req.fire
     reqVpn   := xlate.req.payload.vpn
@@ -32,7 +32,7 @@ class DtlbCrossPageTracePlugin extends FiberPlugin {
 
     val rspFire      = out Bool ()
     val rspPpn       = out UInt (20 bits)
-    val rspToken     = out UInt (8 bits)
+    val rspToken     = out UInt (m68k040.cache.DTranslationToken.Width bits)
     val rspFault     = out Bool ()
     val rspCacheMode = out(CacheMode())
     rspFire      := xlate.rsp.fire
@@ -43,7 +43,7 @@ class DtlbCrossPageTracePlugin extends FiberPlugin {
 
     val cancelValid = out Bool ()
     val cancelAll   = out Bool ()
-    val cancelToken = out UInt (8 bits)
+    val cancelToken = out UInt (m68k040.cache.DLoadToken.Width bits)
     cancelValid := dcache.loadProbeCancel.valid
     cancelAll   := dcache.loadProbeCancel.payload.all
     cancelToken := dcache.loadProbeCancel.payload.token

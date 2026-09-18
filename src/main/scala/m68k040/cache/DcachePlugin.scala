@@ -295,6 +295,39 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val earlyProbeTokens  = Vec.fill(earlyProbeDepth)(Reg(UInt(DLoadToken.Width bits)))
     val earlyProbeVaddrs  = Vec.fill(earlyProbeDepth)(Reg(UInt(32 bits)))
     val earlyProbeData    = Vec.fill(earlyProbeDepth)(Reg(Bits(32 bits)))
+    // ── PHYSICAL TAG OF THE ENTRY (2026-09-17, backlog item 7) ───────────────
+    //
+    // ⚠ WRITTEN WHERE THE HIT IS DECIDED, NOT AT ALLOCATION.  The obvious place
+    // is the allocation site, from the probe's `paddrHint` -- and that is WRONG,
+    // measured: LsEuSpec "load hit (second load same line)" and
+    // LsEuFastPreciseSpec "VIPT slice B" both go red with `earlyConsumeSeen was
+    // false`, because the LS EU hard-wires `paddrHint` to 0 (it launches the
+    // probe in the SAME cycle as the DTLB request, so nothing has been translated
+    // yet) and the tag compare then fails for EVERY real probe, silently
+    // disabling the whole fast path.
+    //
+    // The tag a hit is genuinely decided with is the one `probeReadHitVec`
+    // selects: `probeResolveTagIn` (the translated address, arriving later on the
+    // resolve port) when the resolve matches this read, else `probeReadTag`.  It
+    // is captured into `probeLineTag` on the same edge as `probeLineHit`, off the
+    // SAME Mux, so the recorded tag and the hit can never disagree.
+    // The CAM below used to match on token + VIRTUAL address ONLY, and NOTHING
+    // re-checked the PHYSICAL address at consume time.  The entry's data was
+    // captured against `probeReadTag`, i.e. the probe's `paddrHint`; the command
+    // that later claims it carries its own, independently translated `paddr`.  A
+    // probe and its command are two different points in time, so those two need
+    // not agree -- and when they disagree the fast path served a value read from
+    // a DIFFERENT physical line, at the right virtual address, with nothing to
+    // say so.  The file already documents the hazard (the `probeReadTag ===
+    // probeResolveTagIn` assert above), but the only protection was that
+    // simulation-only assert.
+    //
+    // The entry now REMEMBERS the physical tag its data was read with, and the
+    // match requires it to equal the command's tag.  A mismatch simply means the
+    // probe does not own this command: the entry stays put and the command takes
+    // the ordinary S1 read, which is always correct.  There is no path from a
+    // mismatch to wrong data.
+    val earlyProbeTags    = Vec.fill(earlyProbeDepth)(Reg(UInt(tagBits bits)))
 
     // Read metadata: valid in the cycle the synchronous BRAM output belongs to the
     // probe. Line metadata: one extra register cut keeps BRAM->way-select separate
@@ -310,6 +343,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val probeLineValid = RegInit(False)
     val probeLineSlot  = Reg(UInt(earlyProbePtrW bits))
     val probeLineHit   = RegInit(False)
+    // backlog item 7: the PHYSICAL TAG this probe's hit was actually decided with,
+    // carried one stage alongside the hit itself.  See the earlyProbeTags note.
+    val probeLineTag   = Reg(UInt(tagBits bits))
     val probeLineLine  = Reg(Bits(128 bits))
     val probeLineOff   = Reg(UInt(offBits bits))
     val probeLineSize  = Reg(Size())
@@ -728,6 +764,21 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // drives (see the note just below), so the OR-ed line is computed and never
       // read. Free at ways = 4; see `OneHotSafe`.
       probeLineHit  := OneHotSafe.exactlyOne(probeReadHitVec)
+      // backlog item 7: record the tag the hit above was DECIDED with -- the same
+      // Mux `probeReadHitVec` itself selects on, so the two cannot disagree.  The
+      // resolved arm carries `probeResolveTagIn`, the genuinely translated address
+      // from the resolve port; the read arm carries `probeReadTag` (from
+      // `paddrHint`), which only a producer that sets `resolved` supplies.
+      //
+      // MERGE NOTE (integration): the two sides of this hunk are ORTHOGONAL and both
+      // are kept. The fail-safe decides WHETHER the probe hit; the Mux records WHICH
+      // TAG that decision was made with. On a multi-hot the fail-safe forces
+      // `probeLineHit := False`, so `probeLineTag` becomes a don't-care exactly as
+      // `probeLineLine` already is -- the fail-safe strictly narrows the set of
+      // inputs for which this tag is ever consumed. Do NOT key the Mux on
+      // `paddrHint`: that is hard-wired 0 (the probe launches in the same cycle as
+      // the DTLB request) and silently disables the whole fast path.
+      probeLineTag  := Mux(probeResolveMatchesRead, probeResolveTagIn, probeReadTag)
       // FMax: one-hot way mux instead of `rdData(OHToUInt(probeReadHitVec))`. The binary
       // round trip costs a level -- Vivado builds it as an `OHToUInt` reduction, then a
       // shared select decode broadcast to all 128 bits, then the per-bit mux -- and this
@@ -752,6 +803,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     when(probeLineValid && earlyProbeValids(probeLineSlot)) {
       earlyProbeReadies(probeLineSlot) := True
       earlyProbeHits(probeLineSlot)    := probeLineHit
+      earlyProbeTags(probeLineSlot)    := probeLineTag   // backlog item 7
       earlyProbeData(probeLineSlot)    := DcacheByteLane.extract(
         probeLineLine, probeLineOff, probeLineSize, !probeLineNeedsLine)
     }
@@ -763,10 +815,27 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val earlyProbePresentVec = Vec(Bool(), earlyProbeDepth)
     val earlyProbeMatchVec   = Vec(Bool(), earlyProbeDepth)
     val earlyProbeSetWriteVec = Vec(Bool(), earlyProbeDepth)
+    val earlyProbeTagOkVec    = Vec(Bool(), earlyProbeDepth)   // backlog item 7
     for (i <- 0 until earlyProbeDepth) {
+      // OWNERSHIP is token + VA, and deliberately NOT the physical tag.  This
+      // vector answers "does this entry belong to this command", which decides
+      // whether the entry is CONSUMED and freed -- and an unresolved probe
+      // carries a meaningless `paddrHint`, so requiring a tag match here would
+      // orphan its entry forever (measured: DcacheSpec "VIPT D2: an unresolved
+      // probe is consumed safely through the ordinary hit pipe" fails).  The
+      // physical-tag check belongs on the HIT qualifier instead -- see
+      // earlyProbeTagOkVec below.
       earlyProbePresentVec(i) := earlyProbeValids(i) &&
                                  (earlyProbeTokens(i) === loadCmdPort.payload.token) &&
                                  (earlyProbeVaddrs(i) === cmdVaddr)
+      // backlog item 7: does this entry's DATA belong to the physical line the
+      // command is actually asking for?  `cmdTag` is the command's own
+      // translation (`loadCmd.paddr`); `earlyProbeTags(i)` is the translation the
+      // entry's data was read with.  A mismatch means the probe does not answer
+      // this command: the entry is still consumed (ownership above is
+      // unaffected), but the command takes the ordinary S1 read, which is always
+      // correct.  There is no path from a mismatch to wrong data.
+      earlyProbeTagOkVec(i) := (earlyProbeTags(i) === cmdTag)
       earlyProbeMatchVec(i) := earlyProbePresentVec(i) && earlyProbeReadies(i)
       // A held result is a snapshot of the array read. Any intervening real write
       // to its virtual set can stale it before the tagged command arrives.
@@ -861,7 +930,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // one-hot premise directly instead of leaving it as an unchecked comment.
     val earlyProbeHitVec       = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) {
+      // backlog item 7: `earlyProbeTagOkVec(i)` joins the per-entry fold rather
+      // than being ANDed on afterwards, so it costs an INPUT on a LUT that had
+      // one spare (five terms -> six, still one LUT6) instead of a level.  The
+      // tagBits-wide compare that feeds it is SHORTER than the 32-bit VA compare
+      // already inside `earlyProbeMatchVec(i)` and runs beside it, so it cannot
+      // extend this cone -- which this file records as the core's longest.
       earlyProbeHitVec(i) := earlyProbeMatchVec(i) && earlyProbeHits(i) &&
+                             earlyProbeTagOkVec(i) &&
                              !earlyProbeSetWriteVec(i) && !earlyProbeStale(i)
     }
     val earlyProbeHit          = earlyProbeHitVec.asBits.orR
@@ -870,12 +946,42 @@ class DcachePlugin(val socketMerged: Boolean = false,
         "DcachePlugin: early-probe match vector is multi-hot (duplicate token+VA entries)",
         FAILURE)
       assert(earlyProbeHit === (earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
+                                earlyProbeTagOkVec(earlyProbeMatchIdx) &&
                                 !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
                                 !earlyProbeStale(earlyProbeMatchIdx)),
         "DcachePlugin: earlyProbeHit drifted from its original index-then-select definition",
         FAILURE)
     }
-    val earlyProbeHitData      = earlyProbeData(earlyProbeMatchIdx)
+    // ── DATA SELECT: one-hot, not index-then-select (2026-09-17, item 7) ─────
+    // The comment block above admits, in so many words, that this line was the
+    // one place multi-hotness could still do damage: "`earlyProbeHitData` --
+    // unchanged here -- would then serve that unrelated entry's data", because
+    // `OHToUInt` on a multi-hot vector ORs the set indices together and can name
+    // an entry that matches NOTHING (0b00110 -> index 3).  Leaving the only
+    // protection as a simulation assert means the silicon behaviour on a
+    // multi-hot vector is "serve an arbitrary unrelated line".
+    //
+    // Selecting one-hot from `earlyProbeHitVec` closes that: every entry the
+    // vector can now name is one that matched this command's token, VA and
+    // physical tag, so the worst case degrades from "an unrelated entry's data"
+    // to "one of several entries that are all for this exact address".
+    // `OHMasking.first` makes the choice deterministic rather than an OR of the
+    // candidates' data (which is what a bare `MuxOH` would give).
+    //
+    // EQUIVALENCE for the cases the design admits:
+    //   - `earlyProbeHitVec` one-hot at i: `first` is the identity, `MuxOH`
+    //     yields entry i -- and `matchVec` one-hot at i means
+    //     `earlyProbeMatchIdx` was exactly i.  Bit-identical.
+    //   - `earlyProbeHitVec` all zero: yields 0 where the old form yielded some
+    //     entry's stale data.  Proven don't-care -- `earlyProbeHitData` is
+    //     consumed only under `useEarlyProbe`, which requires `earlyProbeHit`,
+    //     which IS `earlyProbeHitVec.orR`.
+    //
+    // NOT on the critical path: this feeds `ldS2DirectData`, a register input.
+    // `earlyProbeHit` -> `useEarlyProbe` -> the ready chain, which this file
+    // records as the core's longest cone, is untouched.
+    val earlyProbeSelOh        = OHMasking.first(earlyProbeHitVec.asBits)
+    val earlyProbeHitData      = MuxOH(earlyProbeSelOh, earlyProbeData)
     // `!ldS1Valid` is a REAL structural conflict, not a conservative gate: the
     // useEarlyProbe consume arm below (`elsewhen(loadCmdPort.fire && useEarlyProbe)`)
     // writes ldS2Valid/ldS2Hit/ldS2Direct/ldS2DirectData/ldS2Line directly, and so
@@ -1668,6 +1774,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
             earlyProbeHits(earlyProbeAllocIdx)    := False
             earlyProbeTokens(earlyProbeAllocIdx)  := loadProbePort.payload.token
             earlyProbeVaddrs(earlyProbeAllocIdx)  := loadProbePort.payload.vaddr
+            // backlog item 7: `earlyProbeTags` is deliberately NOT written here.
+            // At ALLOCATION the only physical address in hand is `paddrHint`, and
+            // that is the wrong one -- the LS EU hard-wires it to 0 (it launches
+            // this probe in the same cycle as the DTLB request, so nothing has been
+            // translated yet).  The tag the hit is genuinely decided with arrives
+            // LATER, on the resolve port, and is captured with the hit itself.
             // Task pea-cache-evict-2026-08-19 fix: a freshly (re)allocated entry's
             // sticky staleness must not carry over from whatever this physical slot
             // held before -- reset it here, elaborated AFTER (and so overriding on

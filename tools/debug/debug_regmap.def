@@ -246,9 +246,15 @@ REG OFF_MULTIHOT_DTLB     0x01048 RO    2 0x00000000 First DTLB multi-hot: looke
 # carries ONE live collision: `OFF_MULTIHOT_STATUS` sits at 0x01030 on this branch and
 # `OFF_STALL_ABSORB` sits at 0x01030 on `fix/arbiter-reset-wedge` (core b989571c). Two
 # different registers, one offset, two branches -- whoever merges those has to resolve
-# it DELIBERATELY. This block therefore starts at 0x01080 and leaves 0x0104C-0x0107C
-# entirely unallocated, so it cannot become a third party to that collision and so the
-# resolver has room to relocate either claimant without moving anything else.
+# it DELIBERATELY. This block therefore starts at 0x01080 and left 0x0104C-0x0107C
+# unallocated, so it cannot become a third party to that collision and so the resolver
+# has room to relocate either claimant without moving anything else.
+#
+# UPDATE (integration of `fix/walk-cachemode-ownership`): that reserve was USED as
+# intended. The MMU translation-key probes now hold 0x0104C-0x0105C (see their own
+# block further down, which is out of numeric order in this file on purpose -- the
+# generator sorts by offset, and keeping each block's rationale contiguous with its
+# records is worth more than a monotone listing). 0x01060-0x0107C remains free.
 #
 # WHY A SEPARATE CYCLE/INSTRUCTION PAIR instead of making OFF_CYCLE_*/OFF_INST_*
 # clearable. Both of those have documented lifetimes that clearing would DESTROY:
@@ -305,6 +311,41 @@ REG OFF_PERF_ITLB_WALK    0x010A4 RO    2 0x00000000 Windowed ITLB table walks S
 REG OFF_PERF_STALL_RETIRE 0x010A8 RO    2 0x00000000 Windowed cycles with the ROB NON-EMPTY and zero macros retired: the top-line stall count.
 REG OFF_PERF_STALL_DC     0x010AC RO    2 0x00000000 Windowed cycles with the D-cache busy (DcachePlugin `busy`, the same bit OFF_STALL_DC[1] reports).
 REG OFF_PERF_STALL_WALK   0x010B0 RO    2 0x00000000 Windowed cycles with EITHER table walker out of IDLE. Read against OFF_PERF_STALL_RETIRE to see how much of the stall is MMU.
+
+# ---------------------------------------------- MMU translation-key probes --
+# WHY THESE EXIST. Two defects found on 2026-09-17 both produce the same thing:
+# a correct virtual address translated to the WRONG physical page, delivered as
+# a CLEAN ONE-HOT ATC hit with no fault -- so the multi-hot fail-safe and the
+# duplicate-fill tripwire are both blind to them, and nothing in the existing
+# register set can say whether either mechanism fired on a given boot.
+#
+#   (1) TCR.P RE-KEYING. `Dtlb/ItlbPlugin.tlbKey` derives the ATC array key from
+#       the LIVE TCR.P while a resident entry's key came from the TCR.P at ITS
+#       fill; a TCR.P change re-interprets every resident key (a 4 KB entry for
+#       VPN v becomes a one-hot match for the 8 KB lookup of VPN 2v, i.e. VA*2).
+#   (2) PFLUSHA-DURING-WALK. A walk already in flight when PFLUSHA retires used
+#       to complete and install its PRE-FLUSH translation (I-side; the D-side
+#       already had `walkFlushPoison`). That is the ROM's `_SwapMMUMode` shape,
+#       and under A/UX it is every context switch.
+#
+# Both are fixed, but the probes stay: they are the only way to say whether the
+# preconditions occur AT ALL on a given boot, and a zero here is a real answer
+# (with the PRESENT bits below proving it is not a dead probe).
+#
+# LIFETIME: `CsrArea` runs in `dbgCd`, whose reset is the debug POR, NOT the
+# socket reset this block can request -- so these survive a CPU/VIO reset and
+# clear only on debug POR or an explicit OFF_MMU_PROBE_CTL write. That is
+# deliberate: a warm reset must not silently erase the evidence of the boot that
+# went wrong. Clear them at the START of a trial so the trial reports its own
+# window.
+#
+# A concurrent event WINS over a concurrent clear (clear is applied first, the
+# set second), so evidence is never silently lost by a badly timed poll.
+REG OFF_MMU_PROBE_STATUS  0x0104C RO    2 0x00000000 Sticky MMU translation-key probe bits; see the bit list in DebugCtrlPlugin.
+REG OFF_MMU_REKEY_COUNT   0x01050 RO    2 0x00000000 Saturating count of TCR.P changes that re-keyed the ATC.
+REG OFF_MMU_IPOISON_COUNT 0x01054 RO    2 0x00000000 Saturating count of PFLUSHA-on-in-flight-walk events, I side.
+REG OFF_MMU_DPOISON_COUNT 0x01058 RO    2 0x00000000 Saturating count of PFLUSHA-on-in-flight-walk events, D side.
+REG OFF_MMU_PROBE_CTL     0x0105C W1P   2 0x00000000 Write bit0 clears the four registers above. Reads zero.
 
 # ------------------------------------------- architectural write shadows --
 BLK OFF_ARCH_D            0x02000 8 0x04 RW 3 Architectural shadow D0-D7.

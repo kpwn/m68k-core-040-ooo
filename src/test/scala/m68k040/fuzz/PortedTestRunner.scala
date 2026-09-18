@@ -386,6 +386,11 @@ object PortedTestRunner {
         }
         cd.onSamplings {
           probe.cycles += 1
+          // Saturating counter inside the DUT, so the peak IS the final value; read it
+          // every cycle rather than once at the end so a program that trips its sentinel
+          // early still reports what it reached.
+          val qBlocked = dut.lsEu.logic.quiesceBlockedWalker.toLong
+          if (qBlocked > probe.quiesceBlockedWalker) probe.quiesceBlockedWalker = qBlocked
           if (dut.icache.logic.axi.ar.valid.toBoolean && dut.icache.logic.axi.ar.ready.toBoolean) {
             probe.iAxiAr += 1
             probe.touchedBlocks += MmuWalkPosture.blockOf(dut.icache.logic.axi.ar.payload.addr.toLong)

@@ -26,7 +26,7 @@ class DTranslationTracePlugin extends FiberPlugin {
     val reqReady = out Bool ()
     val reqFire  = out Bool ()
     val reqVpn   = out UInt (20 bits)
-    val reqToken = out UInt (8 bits)
+    val reqToken = out UInt (m68k040.cache.DTranslationToken.Width bits)
     reqValid := xlate.req.valid
     reqReady := xlate.req.ready
     reqFire  := xlate.req.fire
@@ -37,7 +37,7 @@ class DTranslationTracePlugin extends FiberPlugin {
     val rspReady     = out Bool ()
     val rspFire      = out Bool ()
     val rspPpn       = out UInt (20 bits)
-    val rspToken     = out UInt (8 bits)
+    val rspToken     = out UInt (m68k040.cache.DTranslationToken.Width bits)
     val rspFault     = out Bool ()
     val rspCacheMode = out(CacheMode())
     rspValid     := xlate.rsp.valid
@@ -388,7 +388,8 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
 
       // The fault case uses a sentinel destination to prove that a tagged ATC
       // fault completes the ROB entry but cannot produce a cache command/writeback.
-      val faultRob = 45
+      // Distinct from every id used above (8, 9 and 16..23) -- the top of the space.
+      val faultRob = m68k040.TestRobIds.highBlock(1).head
       val faultPdst = 40
       val sentinel = 0x5aa55aa5L
       seed(dut, cd, preg = 12, data = faultVa)

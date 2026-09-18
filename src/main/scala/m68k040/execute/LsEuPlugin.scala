@@ -509,9 +509,31 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //   * The read half and the write half use the SAME expression from the SAME
     //     signal. A per-half mode would let a read hit an array copy the write never
     //     updated.
+    //
+    // ── FIXED (race audit, 2026-09-18). The bullet above said "the read half and the
+    // write half use the SAME expression from the SAME signal", which is SPATIAL
+    // agreement; the invariant needs TEMPORAL agreement. This was a LIVE `CACR.DE` read
+    // sampled independently by the load leg and the store leg, and one table search spans
+    // both -- three descriptor reads, the deferred U/M drain's re-read, then that drain's
+    // merged store -- with a MOVEC to CACR free to retire anywhere inside it. Worse,
+    // `quiesceHold` made the split MORE likely: a CACR write is a sysOp whose
+    // `S_DRAIN`/`S_APPLY` deny the walker a fresh STORE grant, so a drain that had already
+    // completed its re-read under the old DE was parked until after the write landed and
+    // then stamped with the new mode. DE 1->0 left the descriptor line ALLOCATED by the
+    // WRITETHROUGH re-read holding the pre-update byte while the INHIBITED store updated
+    // only memory -- M lost, and a dirty page later evicted as clean.
+    //
+    // The fix moves the stamp to the client, which is the only place that knows which
+    // accesses form one read-modify-write. See `WalkerDcacheClient.walkCmodePolicy`.
     val walkCacheMode = Mux(cacheCtrl.map(_.dcacheEnabled).getOrElse(False),
                             m68k040.cache.CacheMode.WRITETHROUGH,
                             m68k040.cache.CacheMode.INHIBITED)
+    // EXPORT the policy; do not stamp it onto the legs. Each TLB plugin uses it live for
+    // the walker's own (read-only) descriptor fetches and LATCHES it for the U/M drain's
+    // read-modify-write pair, which is the only part of a table search that mutates and
+    // therefore the only part that needs the two halves to agree ACROSS CYCLES rather
+    // than merely come from the same net. See `WalkerDcacheClient.walkCmodePolicy`.
+    walkClients.foreach(_.foreach(_.walkCmodePolicy := walkCacheMode))
 
     // ── Load-response ownership FIFO ───────────────────────────────────────────────
     // Depth 8, which is the real bound and not a round number: the aligned ring is 4
@@ -1445,9 +1467,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // a documented encoding is not something a perf refactor gets to change silently.
     dcache.loadCmd.payload.token := Mux(
       useSplitCmd,
-      m68k040.Global.robTag(False ## llReg.bDone, llReg.robId, m68k040.cache.DLoadToken.Width),
+      m68k040.Global.robTag(False ## llReg.bDone, llReg.robId, m68k040.cache.DLoadToken.Width,
+                            m68k040.cache.DLoadToken.RobIdBits),
       m68k040.Global.robTag(False ## (alignedCmd.twoAccess && alignedCmd.splitSecond),
-       alignedCmd.bk.robId, m68k040.cache.DLoadToken.Width))
+       alignedCmd.bk.robId, m68k040.cache.DLoadToken.Width, m68k040.cache.DLoadToken.RobIdBits))
     // 2026-09-09 line-wrap tripwire (see `DLoadCmd.lineOnly`): BOTH halves of a
     // cross-line split pair consume `loadRsp.line`, never `loadRsp.data` -- slot A is
     // deliberately presented at the ORIGINAL crossing offset/size. Flagging them here
@@ -1603,7 +1626,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val reqDrvWrite  = Mux(reqFromSplit,
       txCtx.memOp === MemOp.STORE, tCtx.memOp === MemOp.STORE)
     val reqDrvRobId  = Mux(reqFromSplit, txCtx.robId, tCtx.robId)
-    val reqDrvToken  = m68k040.Global.robTag(xlateEpoch ## reqFromSplit, reqDrvRobId, DTranslationToken.Width)
+    val reqDrvToken  = m68k040.Global.robTag(xlateEpoch ## reqFromSplit, reqDrvRobId, DTranslationToken.Width,
+                                                DTranslationToken.RobIdBits)
     val tIsLoad  = tCtx.memOp === MemOp.LOAD
     val tIsStore = tCtx.memOp === MemOp.STORE
     val tIsMem   = tIsLoad || tIsStore
@@ -1649,7 +1673,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val probeCancelToken = UInt(m68k040.cache.DLoadToken.Width bits)
     probeCancel := False
     probeCancelToken := U(0, m68k040.cache.DLoadToken.Width bits)
-    val reqProbeToken = m68k040.Global.robTag(False ## False, tCtx.robId, m68k040.cache.DLoadToken.Width)
+    val reqProbeToken = m68k040.Global.robTag(False ## False, tCtx.robId, m68k040.cache.DLoadToken.Width,
+                                              m68k040.cache.DLoadToken.RobIdBits)
 
     dcache.loadProbe.valid         := probeWanted && xlate.req.ready
     dcache.loadProbe.payload.vaddr := tCtx.vaddr
@@ -2464,10 +2489,51 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // and completes the instruction as a fault HERE, exactly like the aligned
     // (non-split) fault arm; slot B is never sent for that case, so it can never
     // reach this block at all.
-    val splitMergeLine = Reg(Bits(128 bits))
+    //
+    // ── CHECKED, NOT ARGUED (2026-09-17, backlog item 9) ─────────────────────
+    // Everything above is an ARGUMENT, and the register it defends had no valid
+    // bit, no pairing tag, no reset and no squash clear.  Its correctness rested
+    // entirely on a coupling that is implicit and lives somewhere else: the only
+    // thing stopping a LATER pair's slot B merging against a PREVIOUS pair's
+    // residual line is that a flush poisons BOTH halves, so slot B's own capture
+    // is skipped too.  That coupling is in `alignedPoisoned`'s bookkeeping, not
+    // in the merge, and nothing here would notice if it broke -- a longword
+    // assembled from two unrelated lines still looks like an address, which is
+    // precisely the shape of the wrong-PC-on-RTE defect.
+    //
+    // Three things make it self-defending instead:
+    //
+    //  1. A VALID bit, set when slot A captures and cleared when slot B consumes.
+    //  2. A PAIRING TAG -- the pair's robId.  Slot A and slot B are two halves of
+    //     ONE instruction, so their `bk.robId` is the same; a slot B whose robId
+    //     does not match the line in the register is, by construction, not the
+    //     partner of whatever put it there.
+    //  3. A SQUASH CLEAR.  On `sqFlushSig` the line is zeroed and the valid bit
+    //     dropped, so a stale line cannot outlive the flush that orphaned it even
+    //     if the poison coupling ever stops holding.  Clearing to a CONSTANT is
+    //     what makes the residue deterministic rather than another instruction's
+    //     data, and it is free: `when(cond) { reg := 0 }` maps to the flops' own
+    //     synchronous-reset pin, not to 128 LUTs of mux on their D.
+    //
+    // The pairing check itself is a simulation assertion rather than a hardware
+    // mux, deliberately: a mismatch means the ring's send/response ordering has
+    // ALREADY desynced, which is a deeper bug than this register, and gating the
+    // merge on it in hardware would cost a 128-bit mux on the merge path to
+    // substitute one wrong answer for another.  What hardware guarantees is the
+    // part that actually reduces harm -- that the residue after a squash is a
+    // known constant, not a previous instruction's line.
+    val splitMergeLine  = Reg(Bits(128 bits)) init B(0, 128 bits)
+    val splitMergeValid = RegInit(False)
+    val splitMergeRob   = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
+    // Test-visibility only (LsEuSplitRingSpec's squash-clear fence); no-op for
+    // synthesis, same idiom as DcachePlugin's `earlyProbeStale.simPublic()`.
+    splitMergeLine.simPublic()
+    splitMergeValid.simPublic()
     when(alignedRspFire && !alignedRspIsPoison) {
       when(alignedRspIsSplitA && !dcache.loadRsp.payload.fault) {
-        splitMergeLine := dcache.loadRsp.payload.line
+        splitMergeLine  := dcache.loadRsp.payload.line
+        splitMergeValid := True
+        splitMergeRob   := alignedRspEntry.bk.robId
       } otherwise {
         val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
                                         !alignedRspEntry.bk.xlateSup
@@ -2478,15 +2544,42 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           // Slot B: merge slot A's captured line with this cycle's own line using
           // the ORIGINAL access offset/size (mirrors the old bkFsm WAIT_B arm's
           // `extractCross(lineA, loadRsp.line, llReg.vaddr(3:0), llReg.size)`).
+          //
+          // backlog item 9: the line being merged must be THIS pair's slot A, and
+          // it must still be there.  Both are invariants of the ring's ordering,
+          // so they are CHECKED every time the merge runs rather than left as the
+          // paragraph above.
+          GenerationFlags.simulation {
+            assert(splitMergeValid,
+              "LsEuPlugin: split slot B merged against an EMPTY splitMergeLine -- " +
+              "slot A never captured, or a squash cleared it and slot B was not " +
+              "poisoned with it. The merged longword would be half constant zero.",
+              FAILURE)
+            assert(!splitMergeValid || (splitMergeRob === alignedRspEntry.bk.robId),
+              "LsEuPlugin: split slot B merged against ANOTHER PAIR's line " +
+              "(splitMergeRob != this entry's robId) -- the aligned ring's " +
+              "send/response ordering has desynced. The merged longword is " +
+              "assembled from two unrelated lines.",
+              FAILURE)
+          }
           val merged = m68k040.cache.DcacheByteLane.extractCross(
             splitMergeLine, dcache.loadRsp.payload.line,
             alignedRspEntry.mergeOff, alignedRspEntry.size)
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
+          splitMergeValid := False   // consumed
         } otherwise {
           captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
                                 alignedRspEntry.size)
         }
       }
+    }
+    // backlog item 9: a squash orphans whatever slot A left here.  Elaborated
+    // AFTER the capture above so it wins on the edge a flush and a slot-A
+    // response coincide -- that response is being poisoned anyway.  The 128-bit
+    // clear costs no LUTs (it is the flops' synchronous-reset pin).
+    when(sqFlushSig) {
+      splitMergeLine  := B(0, 128 bits)
+      splitMergeValid := False
     }
 
     // ── SPLIT-ACCESS REPLAY FSM: owns the cold two-line D-cache access ─────────
@@ -2696,7 +2789,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // concrete downstream resource is unable to consume; accept-last turnover keeps
     // a resident same-page aligned stream at II=1 after fill.
     def cancelProbeFor(robId: UInt): Unit = {
-      val token = m68k040.Global.robTag(False ## False, robId, m68k040.cache.DLoadToken.Width)
+      val token = m68k040.Global.robTag(False ## False, robId, m68k040.cache.DLoadToken.Width,
+                                        m68k040.cache.DLoadToken.RobIdBits)
       probeCancel      := True
       probeCancelToken := token
     }
@@ -3046,7 +3140,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     dcache.loadProbeResolve.valid := txRspFire && !xlateFault && !txSecond &&
                                      (txCtx.memOp === MemOp.LOAD) && !txCtx.twoAccess
     dcache.loadProbeResolve.payload.token :=
-      m68k040.Global.robTag(False ## False, txCtx.robId, m68k040.cache.DLoadToken.Width)
+      m68k040.Global.robTag(False ## False, txCtx.robId, m68k040.cache.DLoadToken.Width,
+                            m68k040.cache.DLoadToken.RobIdBits)
     dcache.loadProbeResolve.payload.paddr := s1Paddr
     dcache.loadProbeResolve.payload.cacheMode := txEffectiveCmode
 
@@ -3674,9 +3769,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.loadCmd.payload.vaddr := walkLdSel.vaddr
       dcache.loadCmd.payload.paddr := walkLdSel.paddr
       dcache.loadCmd.payload.size  := walkLdSel.size
-      // W1/W2/W3: the FIXED architectural policy, stamped here and nowhere else. The
-      // walker's own drive of this field is an inert default that never reaches the cache.
-      dcache.loadCmd.payload.cacheMode := walkCacheMode
+      // W1/W2/W3, REVISED (race audit, 2026-09-18): the policy is EXPORTED to the client
+      // (`walkCmodePolicy`, driven where `walkCacheMode` is defined) and the client stamps
+      // its own payload -- live for a descriptor read, latched for the U/M drain's RMW
+      // pair. Stamping here re-derived `CACR.DE` independently at this leg and at the
+      // store leg below, which is spatial agreement but not temporal agreement across the
+      // hundreds of cycles one table search spans.
+      dcache.loadCmd.payload.cacheMode := walkLdSel.cacheMode
       // W25: a RESERVED token per walker, never a don't-care. A don't-care token could
       // match a live early-probe entry on token AND vaddr and silently answer this
       // descriptor read out of that probe's captured data.
@@ -3705,8 +3804,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dcache.store.payload.strb     := walkStSel.strb
       dcache.store.payload.lineData := walkStSel.lineData
       dcache.store.payload.precise  := walkStSel.precise
-      // W3: the SAME fixed policy expression the read half uses, from the same signal.
-      dcache.store.payload.cacheMode := walkCacheMode
+      // W3: the client latched this at drain-arm time so it is the SAME value its own
+      // re-read used -- the guarantee the old "same expression, same signal" wording
+      // claimed but could not provide, because the two legs fire in different cycles.
+      dcache.store.payload.cacheMode := walkStSel.cacheMode
     }
 
     // ── Grant machine, LOAD direction ──────────────────────────────────────────────
@@ -3985,6 +4086,40 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       assert(!(quiesceHold && (ldGrantOk || stGrantOk)),
         "LsEuPlugin: a table walker was granted a D-cache port during the exception " +
         "sequencer's maintenance quiesce window", FAILURE)
+
+      // ── REACHABILITY, because the assertion above cannot tell you it is idle ──────
+      // The race audit classified this pair UNKNOWN rather than HANDLED, and the reason
+      // is worth keeping at the site: nothing establishes that the guarded condition is
+      // ever ENTERED. An assertion that is never evaluated under the circumstance it
+      // guards is indistinguishable from one that holds, so `quiesceHold` could have
+      // been dead for a release and every run would still be green.
+      //
+      // This counts the cycles a walker actually WANTED a port while the hold was
+      // active -- the precondition the assertion exists to make safe. A directed run
+      // (MMU on with real table walks, plus a CPUSH/CINV so the sequencer reaches
+      // `S_DRAIN`/`S_APPLY`/`S_MAINTWAIT`) can then assert this is NON-ZERO, which is
+      // what turns the UNKNOWN into a HANDLED.
+      //
+      // `walkLdReq`/`walkStReq` are existing nets already tapped into
+      // `dbgStallGrantPack(20..23)`, so this adds no new signal; the counter is
+      // simulation-only and pruned from every netlist.
+    }
+
+    // ── REACHABILITY COUNTER (see the tripwire block above) ──────────────────────
+    // Declared at AREA level, not inside the `GenerationFlags.simulation` block, and
+    // that is the whole point: a `val` inside that block is a local, so nothing outside
+    // could ever read it and the counter would be write-only -- useless for the one job
+    // it has, which is letting a directed run ASSERT the window was reached.
+    // `GenerationFlags.simulation { ... }` RETURNS its value, so the register is still
+    // elaborated only in simulation and pruned from every netlist; this is the idiom
+    // `StoreQueue.fsNbytesA`/`fsPaddrHiA` already use for exactly this reason.
+    val quiesceBlockedWalker = GenerationFlags.simulation {
+      val c = Reg(UInt(16 bits)) init 0
+      when(quiesceHold && (walkLdReq.orR || walkStReq.orR) && c =/= U(0xffff, 16 bits)) {
+        c := c + 1
+      }
+      c.simPublic()
+      c
     }
 
     // W23: `excLoadCmdReady` was UNCONDITIONAL. `ExceptionUnit` computes
