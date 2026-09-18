@@ -728,6 +728,14 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // the synthesised netlist.
     drainNeedRead.simPublic(); drainReadPend.simPublic()
     drainArmed.simPublic();    drainAckWait.simPublic()
+    // sim-only visibility: COUNT WALKS, DO NOT COUNT DESCRIPTOR-PORT TRANSACTIONS.
+    // `walkLoadCmd` carries the three descriptor reads of a table search AND the U-bit
+    // read-modify-write read the drain block above issues afterwards, so a transaction
+    // count is NOT a walk count -- it reads one high per queued U write. Two `ItlbSpec`
+    // assertions were re-pointed at this signal by `053e93f7` for exactly that reason;
+    // `IcacheParallelViptSpec` and `FetchAlignResidentCadenceSpec` used the same proxy
+    // and are re-pointed here. simPublic does not affect the synthesised netlist.
+    walker.io.start.simPublic()
     val drainSetBits  = Reg(Bits(8 bits))
     val drainRdAddr   = Reg(UInt(32 bits))
     val drainOffReg   = Reg(UInt(4 bits))
