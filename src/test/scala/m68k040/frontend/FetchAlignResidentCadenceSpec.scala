@@ -72,6 +72,32 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
   private val VirtPage = 0x00402000L
   private val PhysPage = 0x00800000L
 
+  /** The descriptor-port transactions ONE cold table search for `VirtPage` produces.
+    *
+    * NOT three. `walkLoadCmd` is the ITLB walker's D-cache CLIENT port, and it carries
+    * two different things: the three descriptor READS of the table search, and then the
+    * read half of the U-bit READ-MODIFY-WRITE that the deferred U/M write queue drains
+    * afterwards. The leaf descriptor planted below has U clear, so a clean walk
+    * legitimately queues a U write, and since `053e93f7` the I-side entry is born
+    * committed (an instruction fetch is translated before rename, so it owns no robId)
+    * and therefore drains unaided -- in a DUT like this one, which has no ROB and never
+    * pulses a commit, it previously waited forever and the 4th transaction never
+    * appeared. `0x1200b` is `PageTable + pageIdx*4 + 3`: byte 3 of the leaf descriptor,
+    * which is where U (bit 3) lives in a big-endian long.
+    *
+    * Spelling the sequence out, rather than bumping a `== 3` to a `== 4`, keeps the
+    * U-drain read NAMED. A bumped constant would also have been satisfied by a second
+    * root-descriptor read or a re-walk of a different VPN, which is the failure this
+    * assertion exists to catch -- so the walk count itself is asserted separately, off
+    * `walker.io.start`, which is the property this test actually means. */
+  private val ColdWalkPortTxns: Seq[Long] = {
+    val rootIdx = ((VirtPage >> 25) & 0x7f).toInt
+    val ptrIdx  = ((VirtPage >> 18) & 0x7f).toInt
+    val pageIdx = ((VirtPage >> 12) & 0x3f).toInt
+    val leaf    = PageTable + pageIdx * 4L
+    Seq(Root + rootIdx * 4L, PtrTable + ptrIdx * 4L, leaf, leaf + 3L)
+  }
+
   private def pokeWordBe(mem: m68k040.sim.DcacheClientMemAgent, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >> (8 * (3 - i))) & 0xff).toInt)
@@ -131,6 +157,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       var cycle = 0
       var iArCount = 0
       var walkArCount = 0
+      var walkStarts = 0
       val walkArs = ArrayBuffer.empty[Long]
       var capture = false
       val commands = ArrayBuffer.empty[FetchEvent]
@@ -144,6 +171,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
           walkArCount += 1
           walkArs += dut.walkPort.logic.cmd.payload.paddr.toLong
         }
+        if (dut.itlb.logic.walker.io.start.toBoolean) walkStarts += 1
         if (capture) {
           if (dut.obs.logic.cmdValid.toBoolean && dut.obs.logic.cmdReady.toBoolean)
             commands += FetchEvent(cycle, dut.obs.logic.cmdPc.toLong)
@@ -183,9 +211,12 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         }
         cd.waitSampling(2)
       }
-      assert(walkArCount == 3,
-        s"one VPN must require exactly one three-level ITLB walk, got " +
-          s"${walkArs.map(a => f"0x$a%x")}")
+      assert(walkStarts == 1,
+        s"one VPN must require exactly one three-level ITLB walk, got $walkStarts walk " +
+          s"launches (walk-port transactions: ${walkArs.map(a => f"0x$a%x")})")
+      assert(walkArs.toSeq == ColdWalkPortTxns,
+        s"walk-port transactions ${walkArs.map(a => f"0x$a%x")} != the expected cold " +
+          s"search + U-drain RMW read ${ColdWalkPortTxns.map(a => f"0x$a%x")}")
 
       // Phase A: clean resident restart. The first useful packet is N+4, then eight
       // two-wide, two-word groups must fire on eight consecutive cycles. This consumes
@@ -196,6 +227,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       commands.clear(); responses.clear(); groups.clear()
       val iArBeforeA = iArCount
       val walkArBeforeA = walkArCount
+      val walkStartsBeforeA = walkStarts
       capture = true
       dut.probe.logic.feedOut.ready #= true
       await(cd, 80, "eight useful resident groups") { groups.size >= 8 }
@@ -217,8 +249,9 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       }
       assert(iArCount == iArBeforeA,
         s"resident phase A issued an I-cache refill: $iArBeforeA -> $iArCount")
-      assert(walkArCount == walkArBeforeA,
-        s"resident phase A re-walked a hot ITLB entry: $walkArBeforeA -> $walkArCount")
+      assert(walkStarts == walkStartsBeforeA && walkArCount == walkArBeforeA,
+        s"resident phase A re-walked a hot ITLB entry: walk launches $walkStartsBeforeA " +
+          s"-> $walkStarts, walk-port transactions $walkArBeforeA -> $walkArCount")
 
       // The first three target commands/responses are the unthrottled pipeline fill.
       // They must be II=1 and associated in order at fixed latency two.
@@ -261,6 +294,7 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
       val commandMarker = commands.size
       val iArBeforeB = iArCount
       val walkArBeforeB = walkArCount
+      val walkStartsBeforeB = walkStarts
 
       await(cd, 80, "eight useful target groups after redirect") {
         groups.size >= groupMarker + 8
@@ -290,8 +324,9 @@ class FetchAlignResidentCadenceSpec extends AnyFunSuite {
         f"collision setup failed: redirect-edge command 0x$bornStalePc%x was not old-path")
       assert(iArCount == iArBeforeB,
         s"resident phase B issued an I-cache refill: $iArBeforeB -> $iArCount")
-      assert(walkArCount == walkArBeforeB,
-        s"resident phase B re-walked the ITLB: $walkArBeforeB -> $walkArCount")
+      assert(walkStarts == walkStartsBeforeB && walkArCount == walkArBeforeB,
+        s"resident phase B re-walked the ITLB: walk launches $walkStartsBeforeB -> " +
+          s"$walkStarts, walk-port transactions $walkArBeforeB -> $walkArCount")
     }
   }
 }

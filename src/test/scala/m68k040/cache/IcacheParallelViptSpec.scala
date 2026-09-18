@@ -73,6 +73,32 @@ class IcacheParallelViptSpec extends AnyFunSuite {
   private val VirtPage  = 0x00402000L
   private val PhysPage  = 0x00800000L
 
+  /** The descriptor-port transactions ONE cold table search for `VirtPage` produces.
+    *
+    * NOT three. `walkLoadCmd` is the ITLB walker's D-cache CLIENT port, and it carries
+    * two different things: the three descriptor READS of the table search, and then the
+    * read half of the U-bit READ-MODIFY-WRITE that the deferred U/M write queue drains
+    * afterwards. The leaf descriptors these tests plant have U clear, so a clean walk
+    * legitimately queues a U write, and since `053e93f7` the I-side entry is born
+    * committed (an instruction fetch is translated before rename, so it owns no robId)
+    * and therefore drains unaided -- in a DUT like this one, which has no ROB and never
+    * pulses a commit, it previously waited forever and the 4th transaction never
+    * appeared. `0x1200b` is `PageTable + pageIdx*4 + 3`: byte 3 of the leaf descriptor,
+    * which is where U (bit 3) lives in a big-endian long.
+    *
+    * Spelling the sequence out, rather than bumping a `== 3` to a `== 4`, keeps the
+    * U-drain read NAMED. A bumped constant would also have been satisfied by a second
+    * root-descriptor read or a re-walk of a different VPN, which is the failure this
+    * assertion exists to catch -- so the walk count itself is asserted separately, off
+    * `walker.io.start`, which is the property these tests actually mean. */
+  private val ColdWalkPortTxns: Seq[Long] = {
+    val rootIdx = ((VirtPage >> 25) & 0x7f).toInt
+    val ptrIdx  = ((VirtPage >> 18) & 0x7f).toInt
+    val pageIdx = ((VirtPage >> 12) & 0x3f).toInt
+    val leaf    = PageTable + pageIdx * 4L
+    Seq(Root + rootIdx * 4L, PtrTable + ptrIdx * 4L, leaf, leaf + 3L)
+  }
+
   private def pokeWordBe(mem: m68k040.sim.DcacheClientMemAgent, addr: Long, word: Long): Unit =
     for (i <- 0 until 4)
       mem.pokeByte(addr + i, ((word >> (8 * (3 - i))) & 0xff).toInt)
@@ -123,13 +149,15 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       dut.ic.logic.invalidateAll #= false
       dut.priv.logic.supervisorIn #= true
       val arTrace = scala.collection.mutable.ArrayBuffer[(Int, Long)]()
-      var walkArCount = 0
+      val walkPortTxns = scala.collection.mutable.ArrayBuffer[Long]()
+      var walkStarts = 0
       cd.onSamplings {
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           arTrace += ((dut.ic.logic.axi.ar.payload.id.toInt,
             dut.ic.logic.axi.ar.payload.addr.toLong))
         if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean)
-          walkArCount += 1
+          walkPortTxns += dut.walkPort.logic.cmd.payload.paddr.toLong
+        if (dut.itlb.logic.walker.io.start.toBoolean) walkStarts += 1
       }
 
       cd.waitSampling(5)
@@ -148,8 +176,12 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         assert(arTrace.contains((id, expected)),
           f"silent ID$id did not inherit translated PPN: expected 0x$expected%x trace=$arTrace")
       }
-      assert(walkArCount == 3,
-        s"same-page speculation triggered an extra ITLB walk: $walkArCount descriptor reads")
+      assert(walkStarts == 1,
+        s"same-page speculation triggered an extra ITLB walk: $walkStarts walk launches " +
+          s"(walk-port transactions: ${walkPortTxns.map(a => f"0x$a%x")})")
+      assert(walkPortTxns.toSeq == ColdWalkPortTxns,
+        s"walk-port transactions ${walkPortTxns.map(a => f"0x$a%x")} != the expected cold " +
+          s"search + U-drain RMW read ${ColdWalkPortTxns.map(a => f"0x$a%x")}")
 
       val demandBefore = arTrace.count(_._1 == AxiIds.I_DEMAND)
       assert(fetchData(dut, cd, VirtPage + 0x40L) == IcacheSim.window64(PhysPage + 0x40L))
@@ -203,14 +235,19 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       var cycle = 0
       var iArCount = 0
       var walkArCount = 0
+      var walkStarts = 0
+      val walkPortTxns = scala.collection.mutable.ArrayBuffer[Long]()
       var rspCount = 0
       var coldUnresolvedCycles = 0
       cd.onSamplings {
         cycle += 1
         if (dut.ic.logic.axi.ar.valid.toBoolean && dut.ic.logic.axi.ar.ready.toBoolean)
           iArCount += 1
-        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean)
+        if (dut.walkPort.logic.cmd.valid.toBoolean && dut.walkPort.logic.cmd.ready.toBoolean) {
           walkArCount += 1
+          walkPortTxns += dut.walkPort.logic.cmd.payload.paddr.toLong
+        }
+        if (dut.itlb.logic.walker.io.start.toBoolean) walkStarts += 1
         if (dut.probe.logic.rspOut.valid.toBoolean) rspCount += 1
         if (dut.probe.logic.cmdIn.valid.toBoolean && !dut.ic.logic.xlateReadyDbg.toBoolean) {
           coldUnresolvedCycles += 1
@@ -231,9 +268,15 @@ class IcacheParallelViptSpec extends AnyFunSuite {
       cd.waitSampling(4)
       val iArBefore = iArCount
       val walkArBefore = walkArCount
+      val walkStartsBefore = walkStarts
       val rspBefore = rspCount
       assert(iArBefore == 1, s"warm setup expected one demand refill, got $iArBefore")
-      assert(walkArBefore == 3, s"warm setup expected one three-level walk, got $walkArBefore")
+      assert(walkStartsBefore == 1,
+        s"warm setup expected one three-level walk, got $walkStartsBefore walk launches " +
+          s"(walk-port transactions: ${walkPortTxns.map(a => f"0x$a%x")})")
+      assert(walkPortTxns.toSeq == ColdWalkPortTxns,
+        s"walk-port transactions ${walkPortTxns.map(a => f"0x$a%x")} != the expected cold " +
+          s"search + U-drain RMW read ${ColdWalkPortTxns.map(a => f"0x$a%x")}")
       assert(coldUnresolvedCycles > 0,
         "setup never observed a live ITLB miss, so the parallel VIPT check was vacuous")
 
@@ -266,10 +309,11 @@ class IcacheParallelViptSpec extends AnyFunSuite {
         "the permission fault must be identified as ATC/MMU, not bus")
       assert(iArCount == iArBefore,
         s"the faulting fetch launched an I-cache refill: $iArBefore -> $iArCount")
-      assert(walkArCount > walkArBefore,
+      assert(walkStarts > walkStartsBefore,
         s"the USER fetch MUST have walked -- its address space has no resident entry, " +
           s"and answering it from the SUPERVISOR-tagged one would be reading the wrong " +
-          s"tree (ARs $walkArBefore -> $walkArCount)")
+          s"tree (walk launches $walkStartsBefore -> $walkStarts, walk-port transactions " +
+          s"$walkArBefore -> $walkArCount)")
       assert(rspCount == rspBefore + 1,
         s"the permission command produced ${rspCount - rspBefore} responses")
       cd.waitSampling(4)
