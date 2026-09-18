@@ -132,10 +132,22 @@ class PredecodeFpLenSpec extends AnyFunSuite {
       // Reserved <ea> encodings (mode 7 regs 5/6/7) -> eaExt rejects -> 1-word F-line trap.
       chk(0xF23D, 0x4022, 0x0000, 1, "cpGEN with reserved <ea> mode7/reg5")
       chk(0xF23F, 0x4022, 0x0000, 1, "cpGEN with reserved <ea> mode7/reg7")
-      // FScc / FBcc / FSAVE / FRESTORE (opword bits[8:6] != 000) are NOT cpGEN.
-      chk(0xF240, 0x0000, 0x0000, 1, "FScc  (type 001)")
-      chk(0xF280, 0x0000, 0x0000, 1, "FBcc.W (type 010)")
-      chk(0xF2C0, 0x0000, 0x0000, 1, "FBcc.L (type 011)")
+      // FScc / FBcc / FSAVE / FRESTORE (opword bits[8:6] != 000) are NOT cpGEN -- but they
+      // are no longer UNFRAMED either. The three expectations below used to read `1` from
+      // when this file was written, i.e. before PredecodeWord grew its `fpScc` / `fpBcc`
+      // arms; a 1-word frame on any of them fetches the CONDITION WORD or the DISPLACEMENT
+      // as the next opword (see those arms' own comments). Corrected 2026-09-18 against the
+      // ASSEMBLER, not against the RTL -- `m68k-linux-gnu-as -m68040 -m68881` emits:
+      //     fseq  %d0   ->  f240 0001            = 2 words  (opword + condition word)
+      //     fbeq  lbl   ->  f281 fffe            = 2 words  (opword + disp16)
+      //     fbeq.l lbl  ->  f2c1 ffff fff8       = 3 words  (opword + disp32)
+      // (M68000PRM: every cpID-001 type-001 encoding carries a mandatory coprocessor
+      // CONDITION word after the opword; FBcc type 010/011 carry disp16/disp32 instead.)
+      chk(0xF240, 0x0000, 0x0000, 2, "FScc Dn (type 001): opword + condition word")
+      chk(0xF280, 0x0000, 0x0000, 2, "FBcc.W (type 010): opword + disp16")
+      chk(0xF2C0, 0x0000, 0x0000, 3, "FBcc.L (type 011): opword + disp32")
+      // FSAVE Dn is not a legal FSAVE <ea> (control-alterable only); the 1-word framing is
+      // the F-line trap framing, and the trap stacks the FAULTING pc, so it is sound.
       chk(0xF300, 0x0000, 0x0000, 1, "FSAVE-band opword (bit 8 set -- Task 9/11)")
       // The pre-existing carve-outs are unchanged.
       chk(0xF27F, 0x0000, 0x0000, 4, "FSF (xxx).L")

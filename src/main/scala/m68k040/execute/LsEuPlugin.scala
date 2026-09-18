@@ -1162,6 +1162,31 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val twoAccess = RegInit(False)
       val bDone     = RegInit(False)   // slot A launched; now presenting slot B (cross)
     }
+    // ── Why the tag (2026-09-18) ────────────────────────────────────────────────
+    // The comment above records that the split-launch arm that used to WRITE
+    // vaddr/paddr/addrB/paddrB/size/cmode/cmodeB/robId was removed, and that an `init`
+    // was added so "SpinalHDL does not reject the register as never-assigned". An init
+    // alone does NOT satisfy that check: SpinalHDL still raises UNASSIGNED REGISTER and
+    // asks for exactly this tag. Because these are still READ (by the equally dead
+    // `bkFsm`, e.g. `captureCompletionDesc(bkCtx, result, llReg.size)`) they survive
+    // pruning, so the check fires -- but ONLY when the design is elaborated with
+    // `.includeSimulation` (`M68kSim()`), which is why the SYNTHESIS flow builds fine
+    // and every full-core SIMULATION harness does not.
+    //
+    // Effect on hardware: NONE. A register with an init and no driver is a constant
+    // either way; the tag only tells SpinalHDL the absence of a driver is intentional.
+    // Without it, `FuzzCoreDut` -- the DUT behind BOTH the 933-program ported corpus
+    // (`PortedTestRunner.compiled`) and the Musashi lock-step fuzzer
+    // (`FuzzRunner.compiled`) -- fails elaboration with 20 errors, so neither whole-core
+    // correctness net can run at all.
+    llReg.vaddr.allowUnsetRegToAvoidLatch
+    llReg.paddr.allowUnsetRegToAvoidLatch
+    llReg.addrB.allowUnsetRegToAvoidLatch
+    llReg.paddrB.allowUnsetRegToAvoidLatch
+    llReg.size.allowUnsetRegToAvoidLatch
+    llReg.cmode.allowUnsetRegToAvoidLatch
+    llReg.cmodeB.allowUnsetRegToAvoidLatch
+    llReg.robId.allowUnsetRegToAvoidLatch
 
     // ── BACK-STAGE completion descriptor (spec §3.2(c)) ──────────────────────
     // Everything `captureCompletion`/`captureFault` read from `u1`/`s1Ctx`/`xlate`
@@ -1206,6 +1231,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // from the P4 split-launch arm) was removed by this task, so it needs an
     // explicit zero init to remain a legal (if now permanently-idle) register.
     val bkCtx      = RegInit(BkCtx().getZero)
+    // Dead alongside `bkFsm`/`llReg`: `captureBkCtx(bkCtx, ...)` was its only writer and
+    // was removed with the split-launch arm, while `captureCompletionDesc`/
+    // `captureFaultDesc` still READ it from the (unreachable) back-stage FSM -- so it is
+    // never pruned and SpinalHDL raises UNASSIGNED REGISTER for every field. See the
+    // block comment on `llReg`'s identical tags above; behaviour-neutral, and required
+    // for any `.includeSimulation` elaboration of a full core to succeed at all.
+    bkCtx.flatten.foreach(_.allowUnsetRegToAvoidLatch)
     // Rare split replay occupied. Aligned requests never set this bit; their untagged
     // response association is owned by the ordered descriptor ring below.
     val bkBusy     = RegInit(False); bkBusy.simPublic()

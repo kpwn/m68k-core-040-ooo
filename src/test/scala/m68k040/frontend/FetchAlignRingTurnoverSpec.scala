@@ -74,11 +74,22 @@ class FetchAlignRingTurnoverSpec extends AnyFunSuite {
     dut.fa.logic.resume.payload #= 0
   }
 
+  /** `FetchRsp.data` is RAW, byte-ADDRESS-ordered cache data: FetchAlignPlugin runs every
+    * 16-bit lane through `IcacheInstructionOrder.opword` (`raw(7 downto 0) ## raw(15 downto
+    * 8)`) before it enters the instruction buffer, exactly as the real I-cache refill does.
+    * A harness that packs numeric opwords straight into the lanes therefore feeds the DUT
+    * BYTE-SWAPPED instructions. Swap here so the words this fixture asserts on are the
+    * words the design actually sees. (2026-09-18: this is why the opword assertions in this
+    * file were red -- the PCs, drop order and ring behaviour they exercise were always
+    * correct; only the payload bytes were reversed.)
+    */
+  private def rspLane(word: Int): Int = ((word & 0xff) << 8) | ((word >> 8) & 0xff)
+
   /** Inject four one-word MOVEQ packets. `firstId` makes every word unique. */
   private def driveRsp(dut: Dut, pc: Long, firstId: Int): Unit = {
     val words = (0 until 4).map(i => 0x7000 | ((firstId + i) & 0xff))
     val data = words.zipWithIndex.foldLeft(BigInt(0)) { case (acc, (word, lane)) =>
-      acc | (BigInt(word & 0xffff) << (lane * 16))
+      acc | (BigInt(rspLane(word) & 0xffff) << (lane * 16))
     }
     dut.fetch.logic.rspIn.valid #= true
     dut.fetch.logic.rspIn.payload.pc #= pc

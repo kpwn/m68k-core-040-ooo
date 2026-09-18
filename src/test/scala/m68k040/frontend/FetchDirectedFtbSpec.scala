@@ -175,13 +175,24 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     dut.fa.logic.redirect.valid #= false
   }
 
+  /** `FetchRsp.data` is RAW, byte-ADDRESS-ordered cache data: FetchAlignPlugin runs every
+    * 16-bit lane through `IcacheInstructionOrder.opword` (`raw(7 downto 0) ## raw(15 downto
+    * 8)`) before it enters the instruction buffer, exactly as the real I-cache refill does.
+    * A harness that packs numeric opwords straight into the lanes therefore feeds the DUT
+    * BYTE-SWAPPED instructions. Swap here so the words this fixture asserts on are the
+    * words the design actually sees. (2026-09-18: this is why the opword assertions in this
+    * file were red -- the PCs, drop order and ring behaviour they exercise were always
+    * correct; only the payload bytes were reversed.)
+    */
+  private def rspLane(word: Int): Int = ((word & 0xff) << 8) | ((word >> 8) & 0xff)
+
   private def driveRsp(dut: Dut, cd: ClockDomain, pc: Long, words: Seq[Int],
                        lens: Seq[Int] = Seq.fill(4)(1), fault: Boolean = false,
                        atc: Boolean = false): Unit = {
     require(words.length == 4)
     require(lens.length == 4)
     val data = words.zipWithIndex.foldLeft(BigInt(0)) { case (acc, (word, lane)) =>
-      acc | (BigInt(word & 0xffff) << (lane * 16))
+      acc | (BigInt(rspLane(word) & 0xffff) << (lane * 16))
     }
     val r = dut.fetch.logic.rspIn
     r.valid #= true

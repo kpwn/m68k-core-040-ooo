@@ -557,7 +557,55 @@ object PredecodeRef {
         // model can express and are covered by PredecodeFpLenSpec's directed vectors
         // instead -- see that file.
         else if (((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0) CP(simple = true, lenWords = 2)
-        else CP(simple = true, lenWords = 1)
+        else {
+          // The rest of the cpID-001 space. These lengths are OPWORD-ONLY (or, for FScc /
+          // FSAVE / FRESTORE, opword + an <ea> whose extension count this model can derive
+          // because the sweep drives extW = extW2 = 0, so no brief-vs-full-format ambiguity
+          // arises). Added 2026-09-18: without them this model returned 1 for every one of
+          // them, and PredecodeRefSpec's exhaustive 65536-opword sweep -- which ABORTS AT
+          // THE FIRST MISMATCH -- stopped dead at 0xF240, so the ENTIRE line-F space above
+          // that opword had never actually been compared against the RTL at all.
+          //
+          // Verified against `m68k-linux-gnu-as -m68040 -m68881` output (M68000PRM:
+          // every type-001 encoding carries a mandatory coprocessor condition word):
+          //   fseq %d0     -> f240 0001            2 words   FScc    <ea> = Dn
+          //   fdbeq %d0,l  -> f248 0001 fffe       3 words   FDBcc
+          //   ftrapf       -> f27c 0000            2 words   FTRAPcc, no operand
+          //   ftrapf.w #x  -> f27a 0000 1234       3 words   FTRAPcc.W
+          //   ftrapf.l #x  -> f27b 0000 1234 5678  4 words   FTRAPcc.L
+          //   fbeq lbl     -> f281 fffe            2 words   FBcc.W
+          //   fbeq.l lbl   -> f2c1 ffff fff8       3 words   FBcc.L
+          // cpID MUST be 001 (the FPU). Everything else in line F -- notably the
+          // 68851/68030 PMMU coprocessor space at cpID 000 (0xF0xx/0xF1xx, e.g. PScc
+          // 0xF040, PBcc, PSAVE/PRESTORE) -- is NOT a 68040 instruction and keeps the
+          // one-word F-line trap framing. PredecodeWord gates `fpScc`/`fpBcc`/
+          // `fpSaveRest` on `op(11 downto 9) === 001` for exactly this reason; omitting
+          // the guard here made this model claim len=2 for 0xF040.
+          val cpId = (op >> 9) & 0x7
+          val typ  = (op >> 6) & 0x7
+          val mode = (op >> 3) & 0x7
+          val reg  = op & 0x7
+          if (cpId != 1) CP(simple = true, lenWords = 1)
+          else if (typ == 1) {                               // FScc / FDBcc / FTRAPcc
+            if (mode == 1) CP(simple = true, lenWords = 3)                 // FDBcc + disp16
+            else if (mode == 7 && reg >= 2) reg match {                    // FTRAPcc
+              case 4 => CP(simple = true, lenWords = 2)                    //   no operand
+              case 2 => CP(simple = true, lenWords = 3)                    //   #data16
+              case 3 => CP(simple = true, lenWords = 4)                    //   #data32
+              case _ => CP(simple = true, lenWords = 1)                    //   reserved -> trap
+            } else eaExt(mode, reg, sizeL = false, allowImm = false) match {
+              case Some(e) => CP(simple = true, lenWords = 2 + e)          // FScc <ea>
+              case None    => CP(simple = true, lenWords = 1)
+            }
+          } else if (((op >> 7) & 0x3) == 1) {          // FBcc.W (010) / FBcc.L (011)
+            CP(simple = true, lenWords = if (((op >> 6) & 1) == 1) 3 else 2)
+          } else if (typ == 4 || typ == 5) {            // FSAVE / FRESTORE
+            eaExt(mode, reg, sizeL = false, allowImm = false) match {
+              case Some(e) => CP(simple = true, lenWords = 1 + e)
+              case None    => CP(simple = true, lenWords = 1)
+            }
+          } else CP(simple = true, lenWords = 1)
+        }
       case _ => COMPLEX
     }
   }

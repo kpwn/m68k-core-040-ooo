@@ -226,11 +226,42 @@ class PredecodeRefSpec extends AnyFunSuite {
       // and PredecodeRef.classify's own cpGEN case always answers as if extW=0 -- see
       // that case's comment). Every other line-F opword (including the two literal
       // carve-outs, both OUTSIDE the cpGEN bit pattern) is unaffected.
-      val isCpGen = ((op >> 9) & 0x7) == 1 && ((op >> 6) & 0x7) == 0
+      // 2026-09-18: the `else 1` tail was STALE. PredecodeWord has framed the rest of
+      // the cpID-001 space since the FScc / FBcc / FSAVE-FRESTORE arms landed, and a
+      // 1-word frame on any of them fetches the CONDITION WORD or the DISPLACEMENT as
+      // the next opword. Expectations below are the ASSEMBLER's, not the RTL's --
+      // `m68k-linux-gnu-as -m68040 -m68881` emits:
+      //   fseq %d0     -> f240 0001            2 words   FScc <ea>=Dn (opword + cond word)
+      //   fdbeq %d0,l  -> f248 0001 fffe       3 words   FDBcc
+      //   ftrapf       -> f27c 0000            2 words   FTRAPcc, no operand
+      //   ftrapf.w #x  -> f27a 0000 1234       3 words   FTRAPcc.W
+      //   ftrapf.l #x  -> f27b 0000 1234 5678  4 words   FTRAPcc.L
+      //   fbeq lbl     -> f281 fffe            2 words   FBcc.W
+      //   fbeq.l lbl   -> f2c1 ffff fff8       3 words   FBcc.L
+      // cpID != 001 (the 68851/68030 PMMU space at 0xF0xx/0xF1xx) is NOT a 68040
+      // instruction and keeps the one-word F-line trap framing.
+      val cpId    = (op >> 9) & 0x7
+      val typ     = (op >> 6) & 0x7
+      val mode    = (op >> 3) & 0x7
+      val reg     = op & 0x7
+      val isCpGen = cpId == 1 && typ == 0
+      def eaExtLen: Option[Int] = PredecodeRef.eaExt(mode, reg, sizeL = false, allowImm = false)
       val expectedLen =
         if (op == 0xF27F) 4
         else if ((op & 0xFFF8) == 0xF620) 2
         else if (isCpGen) 2
+        else if (cpId != 1) 1
+        else if (typ == 1) {                                   // FScc / FDBcc / FTRAPcc
+          if (mode == 1) 3                                     //   FDBcc + disp16
+          else if (mode == 7 && reg >= 2) reg match {           //   FTRAPcc
+            case 4 => 2
+            case 2 => 3
+            case 3 => 4
+            case _ => 1
+          } else eaExtLen.map(2 + _).getOrElse(1)               //   FScc <ea>
+        }
+        else if (((op >> 7) & 0x3) == 1) (if (((op >> 6) & 1) == 1) 3 else 2)  // FBcc.W/.L
+        else if (typ == 4 || typ == 5) eaExtLen.map(1 + _).getOrElse(1)        // FSAVE/FRESTORE
         else 1
       assert(classify(op) == cp(true, expectedLen),
         f"line-F op=0x$op%04x expected len=$expectedLen")
