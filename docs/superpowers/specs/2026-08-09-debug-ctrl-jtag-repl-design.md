@@ -751,6 +751,32 @@ services, not by reaching into implementation internals.
 
 ---
 
+### 9.4 Passive fetch-word check (2026-09-18)
+
+Append capability bit 25 `fetch_word_check` and registers `0x1800..0x1814`
+defined by `debug_regmap.def`. This optional diagnostic observes
+`host[DecodeFeedService]` accepted packets, including speculative packets; it
+does not imply retirement. It never drives stream ready, halt, flush, recovery,
+or any architectural state. There are no new Global keys.
+
+Host disables CTL bit0, programs exact virtual PC and expected low-16-bit opcode,
+then writes CTL=3 to clear and enable. Registered copies of both accepted packet
+lanes feed the comparator; slot1 requires its own valid qualifier. Fault packets
+are excluded. SEEN saturates at 0xffffffff and counts selected-PC observations,
+including correct words, so zero cannot masquerade as a clean observation.
+The first differing opcode latches HIT_PC, HIT_WORD `{expected, observed}`, and
+CTL bit1; CTL bit2 records the lane (slot0 wins simultaneous mismatches).
+Later packets cannot overwrite the captured mismatch. Reprogram only disabled.
+CTL clear is strobe-qualified, wins over a simultaneous capture, and leaves
+PC/WORD configuration unchanged. CPU reset clears pending samples, evidence and
+SEEN while preserving configuration/enable; config wipe clears all state.
+
+Built only with enabled debug, stage >=5, enabled optional history, and an actual
+DecodeFeedService producer. Otherwise its feature bit is clear and all offsets
+are RAZ/WI. This is an opcode/virtual-PC association observer, not an ATC probe
+or an instruction-memory coherence oracle: the host must establish that the
+selected PC should hold the expected immutable instruction in that context.
+
 ## 10. Reset and CDC
 
 ### 10.1 Reset domains

@@ -145,6 +145,12 @@ set ::dbg::OFF(OFF_PERF_ITLB_WALK) 0x010A4
 set ::dbg::OFF(OFF_PERF_STALL_RETIRE) 0x010A8
 set ::dbg::OFF(OFF_PERF_STALL_DC) 0x010AC
 set ::dbg::OFF(OFF_PERF_STALL_WALK) 0x010B0
+set ::dbg::OFF(OFF_FETCH_CHECK_CTL) 0x01800
+set ::dbg::OFF(OFF_FETCH_CHECK_PC) 0x01804
+set ::dbg::OFF(OFF_FETCH_CHECK_WORD) 0x01808
+set ::dbg::OFF(OFF_FETCH_CHECK_HIT_PC) 0x0180C
+set ::dbg::OFF(OFF_FETCH_CHECK_HIT_WORD) 0x01810
+set ::dbg::OFF(OFF_FETCH_CHECK_SEEN) 0x01814
 set ::dbg::OFF(OFF_ARCH_D0) 0x02000
 set ::dbg::OFF(OFF_ARCH_D1) 0x02004
 set ::dbg::OFF(OFF_ARCH_D2) 0x02008
@@ -287,6 +293,8 @@ set ::dbg::FEAT_BIT(stop_status_v2) 23
 set ::dbg::FEAT_STAGE(stop_status_v2) 2
 set ::dbg::FEAT_BIT(branch_ring) 24
 set ::dbg::FEAT_STAGE(branch_ring) 3
+set ::dbg::FEAT_BIT(fetch_word_check) 25
+set ::dbg::FEAT_STAGE(fetch_word_check) 5
 
 set ::dbg::PORT_DIR(dbg_axi_awaddr) IN
 set ::dbg::PORT_WIDTH(dbg_axi_awaddr) 20

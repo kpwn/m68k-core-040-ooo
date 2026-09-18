@@ -448,6 +448,15 @@ FEAT macro_retire_count    22  2 OFF_INST_* and halt-after count macro-instructi
 FEAT stop_status_v2        23  2 Effective halt means commit recovery and stable architectural state.
 FEAT branch_ring           24  3 Retired-branch history ring present.
 
+# Read-only execution observer; append-only namespace, no stop/recovery effects.
+REG OFF_FETCH_CHECK_CTL   0x01800 MIXED 5 0x00000000 Write bit0 enable, bit1 clear capture/count; read bit0 enabled, bit1 mismatch captured, bit2 slot.
+REG OFF_FETCH_CHECK_PC    0x01804 RW 5 0x00000000 Exact virtual PC to observe; program while disabled.
+REG OFF_FETCH_CHECK_WORD  0x01808 RW 5 0x00000000 Expected opcode in low 16 bits; program while disabled.
+REG OFF_FETCH_CHECK_HIT_PC 0x0180C RO 5 0x00000000 First mismatching accepted fetch packet PC.
+REG OFF_FETCH_CHECK_HIT_WORD 0x01810 RO 5 0x00000000 Captured expected opcode [31:16], observed opcode [15:0].
+REG OFF_FETCH_CHECK_SEEN  0x01814 RO 5 0x00000000 Saturating count of accepted nonfault packets at selected PC, including matches.
+FEAT fetch_word_check      25 5 Passive accepted-fetch PC/opcode comparator and first-mismatch capture.
+
 # ------------------------------------------------------------ socket ports --
 # Verbatim from macqd700-soc/rtl/soc/cpu_socket.vh:145-176. DIR is from the
 # CPU's point of view. These names are forced onto the generated Verilog via

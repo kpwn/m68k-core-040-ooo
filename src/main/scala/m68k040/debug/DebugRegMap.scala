@@ -145,6 +145,12 @@ object DebugRegMap {
   val OFF_PERF_STALL_RETIRE: Int = 0x010A8
   val OFF_PERF_STALL_DC: Int = 0x010AC
   val OFF_PERF_STALL_WALK: Int = 0x010B0
+  val OFF_FETCH_CHECK_CTL: Int = 0x01800
+  val OFF_FETCH_CHECK_PC: Int = 0x01804
+  val OFF_FETCH_CHECK_WORD: Int = 0x01808
+  val OFF_FETCH_CHECK_HIT_PC: Int = 0x0180C
+  val OFF_FETCH_CHECK_HIT_WORD: Int = 0x01810
+  val OFF_FETCH_CHECK_SEEN: Int = 0x01814
   val OFF_ARCH_D0: Int = 0x02000
   val OFF_ARCH_D1: Int = 0x02004
   val OFF_ARCH_D2: Int = 0x02008
@@ -363,6 +369,12 @@ object DebugRegMap {
     ("OFF_PERF_STALL_RETIRE", 0x010A8),
     ("OFF_PERF_STALL_DC", 0x010AC),
     ("OFF_PERF_STALL_WALK", 0x010B0),
+    ("OFF_FETCH_CHECK_CTL", 0x01800),
+    ("OFF_FETCH_CHECK_PC", 0x01804),
+    ("OFF_FETCH_CHECK_WORD", 0x01808),
+    ("OFF_FETCH_CHECK_HIT_PC", 0x0180C),
+    ("OFF_FETCH_CHECK_HIT_WORD", 0x01810),
+    ("OFF_FETCH_CHECK_SEEN", 0x01814),
     ("OFF_ARCH_D0", 0x02000),
     ("OFF_ARCH_D1", 0x02004),
     ("OFF_ARCH_D2", 0x02008),
@@ -483,6 +495,7 @@ object DebugRegMap {
     ("macro_retire_count", 22, 2),
     ("stop_status_v2", 23, 2),
     ("branch_ring", 24, 3),
+    ("fetch_word_check", 25, 5),
   )
 
   /** OR of (1 << bit) for every feature this stage genuinely implements.

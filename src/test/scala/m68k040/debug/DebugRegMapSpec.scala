@@ -76,7 +76,9 @@ class DebugRegMapSpec extends AnyFunSuite {
   test("the definition file is present and non-trivial") {
     val (offsets, feats, consts, ports) = parsed
     assert(offsets.size >= 100, s"only ${offsets.size} offsets parsed from $defPath")
-    assert(feats.size == 25, s"expected 25 feature bits, got ${feats.size}")
+    assert(feats.size == 26, s"expected 26 feature bits, got ${feats.size}")
+    assert(feats.contains(("fetch_word_check", 25, 5)),
+      "passive fetch capture must append bit 25 without renumbering earlier features")
     assert(consts.size >= 7, s"only ${consts.size} constants")
     assert(ports.size == 22, s"expected 22 socket ports, got ${ports.size}")
   }

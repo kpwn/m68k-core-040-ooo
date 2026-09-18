@@ -186,6 +186,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     // mistake this register exists to prevent.
     val excCountHistory = if (enable && stage >= 2) host.get[DebugHistoryService] else None
     val frontendDebug = if (enable && stage >= 5) host.get[FrontendDebugMatchService] else None
+    val fetchFeed = if (historyEnabled && stage >= 5)
+      host.get[m68k040.services.DecodeFeedService] else None
 
     // 2026-09-05 walker-stall observability (p141). `host.get` (Option), not
     // `host[...]`, for exactly the reason the `dbgCommit` comment above gives:
@@ -211,6 +213,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val mhIcache    = if (enable) host.get[m68k040.cache.IcachePlugin] else None
     val historyBuilt = historyEnabled && debugHistory.nonEmpty
     val unavailableFeatures = Set("dcache_probe") ++
+      (if (fetchFeed.nonEmpty) Set.empty[String] else Set("fetch_word_check")) ++
       (if (historyBuilt) Set.empty[String] else Set("pc_trace", "exc_ring", "branch_ring")) ++
       (if (debugMemory.nonEmpty) Set.empty[String] else Set("cache_maint_only")) ++
       (if (frontendDebug.nonEmpty) Set.empty[String] else Set("break_pc_multi")) ++
@@ -972,6 +975,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val cpuRstQ     = RegInit(True)
       cpuRstQ := cpuRstLevel
       val cpuRstEvent = cpuRstLevel && !cpuRstQ; cpuRstEvent.simPublic()
+      val fetchCheck = fetchFeed.map(f => new FetchWordCheck(f, cpuRstLevel))
 
       /** Surviving 16-bit count of observed CPU-reset edges. SATURATES: zero means "no
         * reset observed since the last clear" and must not be reachable by wraparound
@@ -1623,6 +1627,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_CYCLE_LO) { rdCount := cycleCount(31 downto 0).asBits }
           is(DebugRegMap.OFF_CYCLE_HI) { rdCount := cycleCount(63 downto 32).asBits }
           is(DebugRegMap.OFF_INST_LO) { rdCount := macroCount(31 downto 0).asBits }
+          fetchCheck.foreach { f =>
+            is(DebugRegMap.OFF_FETCH_CHECK_CTL) {
+              rdCount := B(0, 29 bits) ## f.slot ## f.hit ## f.enabled
+            }
+            is(DebugRegMap.OFF_FETCH_CHECK_PC) { rdCount := f.pc.asBits }
+            is(DebugRegMap.OFF_FETCH_CHECK_WORD) { rdCount := f.expected.resize(32) }
+            is(DebugRegMap.OFF_FETCH_CHECK_HIT_PC) { rdCount := f.hitPc.asBits }
+            is(DebugRegMap.OFF_FETCH_CHECK_HIT_WORD) { rdCount := f.hitWord }
+            is(DebugRegMap.OFF_FETCH_CHECK_SEEN) { rdCount := f.seen.asBits }
+          }
           is(DebugRegMap.OFF_INST_HI) { rdCount := macroCount(63 downto 32).asBits }
           // Live, free-running, never halt-captured -- see excCountReg above.
           is(DebugRegMap.OFF_EXC_COUNT) { rdCount := excCount }
@@ -1762,6 +1776,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // response, which the FSM above already produces unconditionally.
       when(doWrite) {
         switch(awAddr) {
+          fetchCheck.foreach { f =>
+            is(DebugRegMap.OFF_FETCH_CHECK_CTL) {
+              when(wStrb(0)) { f.enabled := wData(0); f.clear := wData(1) }
+            }
+            is(DebugRegMap.OFF_FETCH_CHECK_PC) { f.pc := merged(f.pc.asBits).asUInt }
+            is(DebugRegMap.OFF_FETCH_CHECK_WORD) {
+              f.expected := merged(f.expected.resize(32))(15 downto 0)
+            }
+          }
           // Clear the multi-hot evidence latches. Modelled on OFF_HALT_CTL bit 2 (the
           // sticky reason/report clear): one write-strobe-qualified data bit, no
           // read-modify-write, and the rest of the word -- which is the read-side
@@ -1947,6 +1970,9 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // clear cold-reset hold or the init-done override, because the deployed wipe does
       // not either and feature bit 2 must mean the same thing on both cores (spec 15.3).
       when(cfgWipe) {
+        fetchCheck.foreach { f =>
+          f.enabled := False; f.pc := 0; f.expected := 0; f.clear := True
+        }
         ramWindow := U(DebugRegMap.RAM_WINDOW_LG2_POR, 6 bits)
         mon       := U(DebugRegMap.MON_SENSE_POR, 7 bits)
         if (stage >= 3) {

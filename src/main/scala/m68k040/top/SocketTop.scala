@@ -523,8 +523,12 @@ object GenSocketTopVerilog {
           s"DBG_BUILD_ID must be hexadecimal (got '$s')")
         BigInt(hex, 16)
     }
-    M68kSpinalConfig(targetDirectory = "generated")
+    // Optional output directory lets diagnostic elaborations preserve the exact
+    // generated sources/checkpoint inputs of an already-running implementation.
+    require(args.length <= 1, "usage: GenSocketTopVerilog [output-directory]")
+    val outputDirectory = args.headOption.getOrElse("generated")
+    M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId))
-    println("Generated generated/M68kSocketTop.v")
+    println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }
