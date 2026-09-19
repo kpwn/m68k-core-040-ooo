@@ -1,0 +1,2 @@
+# Unified diff context intentionally retains upstream whitespace.
+/tools/musashi/patches/*.patch -whitespace

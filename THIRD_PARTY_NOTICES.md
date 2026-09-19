@@ -9,10 +9,10 @@ distribution materials. These notices repair omissions; they are not legal clear
 NaxRiscv: Copyright Charles Papon, MIT, retained in LICENSE.
 https://github.com/SpinalHDL/NaxRiscv
 
-Musashi core: Copyright Karl Stenerud, MIT, retained in applicable source headers.
-Recorded upstream snapshot:
+Musashi is an optional upstream submodule, not bundled source in this revision.
+Users fetch it directly from:
 https://github.com/kstenerud/Musashi/tree/313ebf1bd9f4d0d93341eb5ce21fd8a119e9dbdd
-Do not apply MIT indiscriminately to every bundled file.
+Upstream terms govern that dependency; our MIT grant does not relicense it.
 
 ## SoftFloat Release 2b adaptations
 
@@ -30,15 +30,22 @@ headers. Its nonstandard terms remain applicable; this is not relicensing
 under MIT or the different license of SoftFloat Release 3.
 https://www.jhauser.us/arithmetic/SoftFloat.html
 
-## Open: older MAME-derived PMMU/FPU in the host oracle
+## Host oracle: external dependency and local patch
 
-tools/musashi/musashi/m68kmmu.h carries a MAME copyright/restrictions header,
-crediting R. Belmont and Nicola Salmoria and the MAME Team. m68kfpu.c also
-needs exact-origin review. A modern MAME file's BSD header alone does not
-establish the license of every contribution in these older vendored copies.
-Redistribution clearance remains unresolved. These files are host verification
-code, not directly compiled into FPGA RTL. Do not describe the entire oracle
-as MIT or BSD until this is resolved.
+The older upstream PMMU/FPU files are no longer bundled in this revision.
+They are fetched from Musashi by an explicit submodule initialization.
+Do not include that checkout or compiled oracle in our release packages.
+This addresses our current source-packaging issue without claiming to resolve
+upstream's licensing or removing copies in previously published Git history.
+
+Our own tools/musashi/patches/lockstep.patch remains distributed here.
+It contains Musashi context (Copyright Karl Stenerud, MIT) and locally adapted
+MAME exception-frame code. MAME's src/devices/cpu/m68000/m68kcpu.h credits
+Karl Stenerud under BSD-3-Clause; preserve LICENSES/MAME-BSD-3-Clause.txt
+for those portions. Local integration changes are MIT. These notices apply
+to the patch, not a blanket license assertion for the fetched upstream tree.
+Reference: https://github.com/mamedev/mame/blob/mame0287/src/devices/cpu/m68000/m68kcpu.h
+Musashi's original MIT notice is retained in LICENSES/Musashi-MIT.txt.
 
 ## Other components
 
@@ -46,4 +53,3 @@ Build tools and dependencies retain their own terms. Review copied/generated
 library content separately; use of a tool alone does not establish inclusion
 of all its code. The SoC, Taxi Ethernet, firmware and FPGA vendor IP have
 separate terms not covered by this repository's MIT grant.
-

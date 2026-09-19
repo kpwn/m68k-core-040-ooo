@@ -1,0 +1,286 @@
+--- a/m68k_in.c
++++ b/m68k_in.c
+@@ -9290,6 +9290,34 @@
+ 				CPU_INSTR_MODE = INSTRUCTION_YES;
+ 				CPU_RUN_MODE = RUN_MODE_NORMAL;
+ 				return;
++			case 7: /* 68040 access error (format-$7, 30-word frame) */
++				/* Ported from MAME's m68k RTE: restore SR + PC, then discard the
++				 * remaining 28 words of the format-$7 frame. PC is the faulting
++				 * instruction's PC, so execution RE-EXECUTES it (the handler has
++				 * fixed the mapping). No hardware re-run / continuation. */
++				new_sr = m68ki_pull_16();
++				new_pc = m68ki_pull_32();
++				m68ki_fake_pull_16();	/* $06: format word */
++				m68ki_fake_pull_32();	/* $08: effective address */
++				m68ki_fake_pull_16();	/* $0c: special status word */
++				m68ki_fake_pull_16();	/* $0e: wb3s */
++				m68ki_fake_pull_16();	/* $10: wb2s */
++				m68ki_fake_pull_16();	/* $12: wb1s */
++				m68ki_fake_pull_32();	/* $14: data fault address */
++				m68ki_fake_pull_32();	/* $18: wb3a */
++				m68ki_fake_pull_32();	/* $1c: wb3d */
++				m68ki_fake_pull_32();	/* $20: wb2a */
++				m68ki_fake_pull_32();	/* $24: wb2d */
++				m68ki_fake_pull_32();	/* $28: wb1a */
++				m68ki_fake_pull_32();	/* $2c: wb1d/pd0 */
++				m68ki_fake_pull_32();	/* $30: pd1 */
++				m68ki_fake_pull_32();	/* $34: pd2 */
++				m68ki_fake_pull_32();	/* $38: pd3 */
++				m68ki_jump(new_pc);
++				m68ki_set_sr(new_sr);
++				CPU_INSTR_MODE = INSTRUCTION_YES;
++				CPU_RUN_MODE = RUN_MODE_NORMAL;
++				return;
+ 		}
+ 		/* Not handling long or short bus fault */
+ 		CPU_INSTR_MODE = INSTRUCTION_YES;
+--- a/m68kconf.h
++++ b/m68kconf.h
+@@ -108,7 +108,7 @@
+  * auto-clear when the interrupt is serviced.
+  */
+ #ifndef M68K_EMULATE_INT_ACK
+-#define M68K_EMULATE_INT_ACK        M68K_OPT_OFF
++#define M68K_EMULATE_INT_ACK        M68K_OPT_ON
+ #define M68K_INT_ACK_CALLBACK(A)    your_int_ack_handler_function(A)
+ #endif
+ 
+@@ -125,7 +125,7 @@
+ /* If ON, the CPU will monitor the trace flags and take trace exceptions
+  */
+ #ifndef M68K_EMULATE_TRACE
+-#define M68K_EMULATE_TRACE          M68K_OPT_OFF
++#define M68K_EMULATE_TRACE          M68K_OPT_ON
+ #endif
+ 
+ 
+--- a/m68kcpu.c
++++ b/m68kcpu.c
+@@ -94,6 +94,37 @@
+ 
+ jmp_buf m68ki_bus_error_jmp_buf;
+ 
++/* Set by m68ki_exception_bus_error (68040 access fault) so the execute loop ENDS
++ * the current m68k_execute call right after delivery, with PC = the handler entry.
++ * This makes a bus-error access fault a DISCRETE trace step (matching our RTL's
++ * commit-time exception entry), rather than folding the handler's first instruction
++ * into the faulting step. Only the 040 access-fault path sets it; programs that
++ * never fault are byte-for-byte unchanged. */
++int m68ki_bus_error_step_break = 0;
++
++/* PROJECT PATCH (m68k-core-040-ooo), same family as m68ki_bus_error_step_break above.
++ *
++ * When set, m68k_execute() runs AT MOST ONE instruction, regardless of how many clock
++ * cycles that instruction charges. MusashiRef::step_one() sets it for the duration of
++ * its own m68k_execute(1) call and clears it afterwards, so the non-trace bulk-run path
++ * (assembleAndRun) is byte-for-byte unchanged.
++ *
++ * WHY: m68k_execute()'s loop condition is `GET_CYCLES() > 0`, so an instruction that
++ * charges ZERO cycles does not end the timeslice and the loop silently executes the NEXT
++ * instruction too -- collapsing two architectural instructions into one trace step and
++ * making the lock-step PC sequence skip an instruction boundary. That is not
++ * hypothetical: in the vendored m68kfpu.c's fpgen_rm_reg switch, `case 0x01` (Fsint =
++ * FINT) and `case 0x03` (FsintRZ = FINTRZ) are the ONLY two handlers that omit
++ * USE_CYCLES -- every one of their ~20 siblings has it -- and CYC_INSTRUCTION[] charges
++ * nothing for the cpGEN F-line opwords, so `fint.x` + `fintrz.x` traced as a single
++ * step (found by FpuLockStepSpec's FINT-vs-FINTRZ test, 2026-08-16).
++ *
++ * Fixed here rather than by inventing a USE_CYCLES value for those two handlers: the
++ * step-granularity guarantee is what every trace caller already assumes, this makes it
++ * true for ANY zero-cycle handler (present or future, including after a re-vendor), and
++ * it does not require guessing at 68040 FINT timing. */
++int m68ki_one_instr_per_execute = 0;
++
+ /* Used by shift & rotate instructions */
+ const uint8 m68ki_shift_8_table[65] =
+ {
+@@ -982,9 +1013,19 @@
+ 		m68ki_check_bus_error_trap();
+ 
+ 		/* Main loop.  Keep going until we run out of clock cycles */
++		int m68ki_instrs_run = 0;
+ 		do
+ 		{
+ 			int i;
++			/* Single-step mode (see m68ki_one_instr_per_execute): stop after exactly
++			 * one instruction even if it charged zero cycles. Checked BEFORE the
++			 * instruction is read, so the second instruction is never executed. */
++			if (m68ki_one_instr_per_execute && m68ki_instrs_run >= 1) break;
++			/* A 68040 access fault (bus error) just delivered via longjmp -> end
++			 * this execute call now, with PC = the handler entry, so the fault is a
++			 * DISCRETE trace step (do NOT run the handler's first instruction in the
++			 * same step). Cleared here. */
++			if (m68ki_bus_error_step_break) { m68ki_bus_error_step_break = 0; break; }
+ 			/* Set tracing accodring to T1. (T0 is done inside instruction) */
+ 			m68ki_trace_t1(); /* auto-disable (see m68kcpu.h) */
+ 
+@@ -1006,6 +1047,7 @@
+ 			REG_IR = m68ki_read_imm_16();
+ 			m68ki_instruction_jump_table[REG_IR]();
+ 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
++			m68ki_instrs_run++;
+ 
+ 			/* Trace m68k_exception, if necessary */
+ 			m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
+--- a/m68kcpu.h
++++ b/m68kcpu.h
+@@ -1030,6 +1030,14 @@
+ extern uint           m68ki_aerr_address;
+ extern uint           m68ki_aerr_write_mode;
+ extern uint           m68ki_aerr_fc;
++extern int            m68ki_bus_error_step_break;
++/* Project patch: when set, m68k_execute() runs at most ONE instruction regardless of
++ * its cycle cost. Set/cleared by MusashiRef::step_one(). See m68kcpu.c for the full
++ * rationale (zero-cycle FINT/FINTRZ collapsing two instructions into one trace step). */
++extern int            m68ki_one_instr_per_execute;
++/* Set by the opcode-prefetch path to mark an INSTRUCTION fetch for the grafted
++ * oracle MMU (program space). Defined in m68k_ref.cpp. */
++extern volatile unsigned int g_mmu_instr_fetch;
+ 
+ /* Forward declarations to keep some of the macros happy */
+ static inline uint m68ki_read_16_fc (uint address, uint fc);
+@@ -1068,6 +1076,9 @@
+ #if M68K_EMULATE_PREFETCH
+ {
+ 	uint result;
++	/* INSTRUCTION-FETCH window: tell the grafted oracle MMU these reads are program
++	 * space (so the I-side of the one MMU translates + faults with a program SSW). */
++	g_mmu_instr_fetch = 1;
+ 	if(REG_PC != CPU_PREF_ADDR)
+ 	{
+ 		CPU_PREF_ADDR = REG_PC;
+@@ -1077,11 +1088,18 @@
+ 	REG_PC += 2;
+ 	CPU_PREF_ADDR = REG_PC;
+ 	CPU_PREF_DATA = m68k_read_immediate_16(ADDRESS_68K(CPU_PREF_ADDR));
++	g_mmu_instr_fetch = 0;
+ 	return result;
+ }
+ #else
+ 	REG_PC += 2;
+-	return m68k_read_immediate_16(ADDRESS_68K(REG_PC-2));
++	{
++		uint r;
++		g_mmu_instr_fetch = 1;
++		r = m68k_read_immediate_16(ADDRESS_68K(REG_PC-2));
++		g_mmu_instr_fetch = 0;
++		return r;
++	}
+ #endif /* M68K_EMULATE_PREFETCH */
+ }
+ 
+@@ -1106,6 +1124,7 @@
+ 	m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
+ 	m68ki_check_address_error(REG_PC, MODE_READ, FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
+ 
++	g_mmu_instr_fetch = 1;
+ 	if(REG_PC != CPU_PREF_ADDR)
+ 	{
+ 		CPU_PREF_ADDR = REG_PC;
+@@ -1120,13 +1139,20 @@
+ 	REG_PC += 2;
+ 	CPU_PREF_ADDR = REG_PC;
+ 	CPU_PREF_DATA = m68k_read_immediate_16(ADDRESS_68K(CPU_PREF_ADDR));
++	g_mmu_instr_fetch = 0;
+ 
+ 	return temp_val;
+ #else
+ 	m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
+ 	m68ki_check_address_error(REG_PC, MODE_READ, FLAG_S | FUNCTION_CODE_USER_PROGRAM); /* auto-disable (see m68kcpu.h) */
+ 	REG_PC += 4;
+-	return m68k_read_immediate_32(ADDRESS_68K(REG_PC-4));
++	{
++		uint r;
++		g_mmu_instr_fetch = 1;
++		r = m68k_read_immediate_32(ADDRESS_68K(REG_PC-4));
++		g_mmu_instr_fetch = 0;
++		return r;
++	}
+ #endif /* M68K_EMULATE_PREFETCH */
+ }
+ 
+@@ -1934,6 +1960,55 @@
+ #define m68ki_check_bus_error_trap() setjmp(m68ki_bus_error_jmp_buf)
+ 
+ /* Exception for bus error */
++/* Format 7 stack frame (68040 access error).
++ *
++ * Ported BYTE-FOR-BYTE from MAME's legacy m68k core
++ * (src/devices/cpu/m68000/m68kcpu.h: m68ki_stack_frame_0111) so this Musashi
++ * runner is the byte-for-byte oracle for our RTL's format-$7 delivery. Pushed
++ * LAST->FIRST (predecrement), so in memory ASCENDING from the final SSP the 30
++ * words (0x3C bytes) are:
++ *   [SSP+0x00] SR ; [+0x02] PC ; [+0x06] 0x7000|(vec<<2) ;
++ *   [+0x08] effective address ; [+0x0C] SSW = (in_mmu?0x400:0)|fc|(rw<<8) ;
++ *   [+0x0E] internal (long+word, zero) ; [+0x14] fault address ;
++ *   [+0x18] internal (9 longs, zero).
++ * rw: 1 = read, 0 = write (matches m68ki_aerr_write_mode). fc: 3-bit FC.
++ */
++static inline void m68ki_stack_frame_0111(uint sr, uint vector, uint pc, uint fault_address, uint rw, uint fc, uint in_mmu)
++{
++	/* INTERNAL REGISTERS (18 words) */
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++	m68ki_push_32(0);
++
++	/* FAULT ADDRESS (2 words) */
++	m68ki_push_32(fault_address);
++
++	/* INTERNAL REGISTERS (3 words) */
++	m68ki_push_32(0);
++	m68ki_push_16(0);
++
++	/* SPECIAL STATUS REGISTER (1 word) */
++	m68ki_push_16((in_mmu ? 0x400 : 0) | (fc & 7) | ((rw & 1) << 8));
++
++	/* EFFECTIVE ADDRESS (2 words) */
++	m68ki_push_32(fault_address);
++
++	/* 0111, VECTOR OFFSET (1 word) */
++	m68ki_push_16(0x7000 | (vector<<2));
++
++	/* PROGRAM COUNTER (2 words) */
++	m68ki_push_32(pc);
++
++	/* STATUS REGISTER (1 word) */
++	m68ki_push_16(sr);
++}
++
+ static inline void m68ki_exception_bus_error(void)
+ {
+ 	int i;
+@@ -1959,8 +2034,25 @@
+ 
+ 	uint sr = m68ki_init_exception();
+ 
+-	/* Note: This is implemented for 68010 only! */
+-	m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
++	if(CPU_TYPE_IS_040_PLUS(CPU_TYPE))
++	{
++		/* 68040: format-$7 access-error frame (MAME-matched). The faulting
++		 * instruction PC is REG_PPC; the access address / rw / fc come from the
++		 * m68ki_aerr_* globals set when the access faulted (the MMU walk in the
++		 * runner pulses the bus error with these set). in_mmu=1 (MMU-originated). */
++		m68ki_stack_frame_0111(sr, EXCEPTION_BUS_ERROR, REG_PPC,
++			m68ki_aerr_address, m68ki_aerr_write_mode ? 1 : 0, m68ki_aerr_fc, 1);
++		/* Make the access fault a DISCRETE trace step (PC = handler entry); the
++		 * execute loop breaks after the longjmp re-entry instead of folding the
++		 * handler's first instruction into this step. Mirrors our RTL's commit-time
++		 * exception-entry observation. */
++		m68ki_bus_error_step_break = 1;
++	}
++	else
++	{
++		/* Note: This is implemented for 68010 only! */
++		m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
++	}
+ 
+ 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
+ 

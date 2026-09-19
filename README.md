@@ -142,8 +142,10 @@ Three independent layers, because each catches what the others miss:
 1. **Unit specs** (`src/test/scala`) — per-plugin behaviour, 274 specs.
 2. **Ported program corpus** (`src/test/resources/m68kooo-ported-tests/asm`) — 921
    real 68k programs run to a sentinel, many derived from live hardware failures.
-3. **Musashi lock-step** — instruction-by-instruction comparison against a vendored
-   reference interpreter (`tools/musashi`).
+3. **Musashi lock-step** — instruction-by-instruction comparison against an optional
+   upstream reference interpreter (`tools/musashi`). Initialize it with
+   `git submodule update --init tools/musashi/musashi`, then `make musashi`.
+   Builds apply our integration patch to an ignored copy, keeping the submodule clean.
 
 ⚠ The reference is not always right. Several corpus tests encoded *Musashi bugs* and
 had to be re-pointed at the architecture — for example FMOVEM.L control-register

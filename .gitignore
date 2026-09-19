@@ -84,3 +84,7 @@ exp*/**/*.dcp
 *.STOPPED.md
 # Agent-framework task reports: development process state, not project documentation.
 .superpowers/
+/tools/musashi/.build/
+/tools/musashi/*.o
+/tools/musashi/*.a
+/tools/musashi/musashi_run
