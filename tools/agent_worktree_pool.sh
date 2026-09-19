@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pool_root="${M68K040_WORKTREE_POOL:-/home/qwertyoruiop/m68k-core-040-ooo-worktrees}"
+pool_root="${M68K040_WORKTREE_POOL:-${repo_root}-worktrees}"
 pool_size="${M68K040_WORKTREE_POOL_SIZE:-10}"
 lock_file="${pool_root}/.pool.lock"
 

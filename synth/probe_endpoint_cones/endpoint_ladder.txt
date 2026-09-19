@@ -1,8 +1,0 @@
-rung  WNS(ns)   delta   worst startpoint -> endpoint (endpoint cone retired each rung)
-   0   -1.472  +0.000   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_sbNzvc_busy_reg[8]/D
-   1   -1.463  +0.009   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_lines_7_ways_0_triggers_reg[9]/D
-   2   -1.461  +0.002   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_sbInt_busy_reg[42]/D
-   3   -1.460  +0.001   FetchAlignPlugin_logic_ftqHead_reg[0]/C -> FetchAlignPlugin_logic_p0LiveReg_lenWords_reg[0]/D
-   4   -1.458  +0.002   FetchAlignPlugin_logic_stalled_reg/C -> IcachePlugin_logic_commitBeat_reg[0]_rep__5_replica/D
-   5   -1.454  +0.004   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> IssueQueuePlugin_logic_lines_4_ways_0_triggers_reg[0]/D
-   6   -1.451  +0.003   DcachePlugin_logic_stS2Payload_paddr_reg[5]/C -> DcachePlugin_logic_dataMem_3_reg_1/ADDRARDADDR[12]

@@ -24,6 +24,11 @@ EOF
 git -C "$repo" add tools/agent_worktree_pool.sh payload .agent-reservation
 git -C "$repo" commit -qm "historical tracked reservation"
 
+# The default pool is adjacent to the checkout, not a developer's home path.
+env -u M68K040_WORKTREE_POOL M68K040_WORKTREE_POOL_SIZE=1 \
+  "$repo/tools/agent_worktree_pool.sh" init
+[[ -f "${repo}-worktrees/agent-01/.git" ]]
+
 # Reproduce slots created while the released marker was still tracked, then
 # leave an untracked synthesis artifact in the first one.
 M68K040_WORKTREE_POOL="$pool" M68K040_WORKTREE_POOL_SIZE=2 \

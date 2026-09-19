@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import regmap  # noqa: E402
 
-SOC = os.environ.get("MACQD700_SOC", "/home/qwertyoruiop/macqd700-soc")
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+SOC = os.environ.get("MACQD700_SOC", os.path.join(os.path.dirname(REPO_ROOT), "macqd700-soc"))
 RTL = os.path.join(SOC, "cpu/rtl/core/debug/debug_ctrl.v")
 FAKE = os.path.join(SOC, "tb/tests/host/fake_jtag_repl.py")
 SOCKET = os.path.join(SOC, "rtl/soc/cpu_socket.vh")

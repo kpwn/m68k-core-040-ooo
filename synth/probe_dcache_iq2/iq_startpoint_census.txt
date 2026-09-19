@@ -1,4 +1,0 @@
-paths  worstSlack  startpoint family   (into sbNzvc_busy / sbInt_busy)
-    61    -1.472  DcachePlugin_logic_stS2Payload_paddr_reg
-     3    -1.208  RobPlugin_logic_doFlushReg_reg
-     2    -1.378  IssueQueuePlugin_logic_lines_0_ways_1_sel_reg

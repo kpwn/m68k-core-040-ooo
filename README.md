@@ -36,13 +36,14 @@ Quadra 700 SoC, executing the stock Q700 ROM unmodified (*except for timing issu
 |---|---|
 | Target | MC68040 user + supervisor, FPU, MMU |
 | Language | SpinalHDL (Scala), elaborated to Verilog |
-| Scale | ~108 source files, ~56k lines |
-| Verification | 274 ScalaTest specs · 921 assembled 68k programs · Musashi lock-step |
-| Silicon | Xilinx KU5P, timing-closed. Design target **200 MHz**; deployed at 100 MHz in the Quadra 700 SoC to leave slack for debug instrumentation |
+| Scale | 117 main Scala source files (2026-09-19 snapshot) |
+| Verification | ScalaTest unit/integration suites · 933 ported assembly programs · Musashi lock-step |
+| Silicon | Xilinx KU5P; board-tested **200 MHz** Quadra 700 SoC image |
 | Boots | Mac OS to the Finder on the stock Quadra 700 ROM |
 
-The core is under active development. Known defects and deliberate deviations are
-tracked in `docs/BUG_*.md` and `docs/KNOWN_DEVIATION_*.md` rather than hidden — see
+The core is under active development. Defect investigations and deliberate deviations
+are recorded in `docs/BUG_*.md` and `docs/KNOWN_DEVIATION_*.md`; these include historical
+reports, not only currently open issues — see
 [Known gaps](#known-gaps).
 
 ## Architecture
@@ -69,11 +70,11 @@ FetchAlign ─ BTB/FTB/gshare/RAS ─ Icache ─ Predecode
 
 ### Clocking
 
-The core is designed for **200 MHz** and the RTL is written to that target. The
-Quadra 700 SoC currently instantiates it at **100 MHz** deliberately — the extra slack
-absorbs the debug instrumentation (trace rings, halt lanes, VIO probes, JTAG-AXI debug
-window) that the bring-up campaign depends on. The 100 MHz figure is a deployment
-choice, not the core's ceiling.
+The core targets **200 MHz**. The
+[2026-09-19 Quadra 700 SoC release](https://github.com/kpwn/macqd700-soc/releases/tag/200mhz-20260919)
+runs the CPU at 200 MHz with a 50 MHz peripheral bus. Earlier bring-up images used
+100 MHz. Timing closure belongs to a particular routed build and configuration;
+it is not a guarantee for every integration or subsequent source revision.
 
 Key structures (`Config.scala` defaults): ROB 64, 50 physical integer registers,
 separate NZVC/X/FPCC rename files, 8-deep load and store queues, L1I 16 KB 4-way
@@ -103,9 +104,16 @@ make compile        # sbt compile
 make test-fast      # fast gate (excludes slow/verilator/board tags)
 make test           # full suite
 make verilog        # elaborate generated/M68kCore.v
+make check-publication # reject tracked build debris and firmware images
 ```
 
 `sbt` may not be on PATH; invoke as `make SBT=~/sbt/bin/sbt <target>`.
+The fast gate still needs the simulation toolchain for untagged simulation tests;
+it is not a Scala-only check. Full tests / Verilator campaigns must be serialized
+with other heavy runs (see AGENTS.md).
+
+`make verilog` generates the minimal framework top, not the integrated CPU.
+See [synthesis tooling](synth/README.md) for full-core/socket elaboration.
 
 The ported-program corpus runs under `PortedM68kOooSpec`. To run a subset, point it at
 a directory of `.s` files:
@@ -139,8 +147,8 @@ tools/         Musashi reference build, worktree pool, gates
 
 Three independent layers, because each catches what the others miss:
 
-1. **Unit specs** (`src/test/scala`) — per-plugin behaviour, 274 specs.
-2. **Ported program corpus** (`src/test/resources/m68kooo-ported-tests/asm`) — 921
+1. **Unit/integration specs** (`src/test/scala`) — per-plugin and full-core behaviour.
+2. **Ported program corpus** (`src/test/resources/m68kooo-ported-tests/asm`) — 933
    real 68k programs run to a sentinel, many derived from live hardware failures.
 3. **Musashi lock-step** — instruction-by-instruction comparison against an optional
    upstream reference interpreter (`tools/musashi`). Initialize it with
@@ -157,13 +165,20 @@ core disagree, check the PRM and the ROM before assuming the core is wrong.
 
 Tracked in-tree rather than hidden:
 
-- `docs/BUG_*.md` — open defects with reproductions.
+- `docs/BUG_*.md` — defect investigations with reproductions; some describe fixed revisions.
 - `docs/KNOWN_DEVIATION_*.md` — deliberate, documented divergences from the 68040.
-- FSAVE's displaced/absolute EA forms (`(d16,An)`, `(xxx).W/.L`) are not implemented
-  and take the vector-11 trap; the register-indirect forms the FPSP uses are.
+
+Historical reports must be checked against the current RTL and regression tests.
+For example, the older FSAVE/FRESTORE computed-EA limitation is no longer current:
+those forms now use the shared EA-computation path.
 
 ## Design documents
 
 - Architecture: `docs/superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md`
 - ISA completion / microcode: `docs/superpowers/specs/2026-06-12-isa-completion-microcode-architecture-design.md`
 - Plans and campaign notes: `docs/superpowers/`
+
+See [the documentation index](docs/README.md) for current entry points and
+[the cleanup record](docs/repository_cleanup.md) for removed historical artifacts.
+Original contributions are MIT; [third-party notices](THIRD_PARTY_NOTICES.md)
+describe the dependencies and exceptions.

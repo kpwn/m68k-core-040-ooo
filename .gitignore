@@ -88,3 +88,15 @@ exp*/**/*.dcp
 /tools/musashi/*.o
 /tools/musashi/*.a
 /tools/musashi/musashi_run
+
+# Raw timing probe output; concise historical summaries stay versioned.
+/synth/probe_*/*.txt
+!/synth/probe_*/*summary.txt
+*.bit
+*.ltx
+*.bin
+*.rom
+*.o
+*.a
+.env
+.env.*

@@ -1,9 +1,13 @@
 SBT ?= sbt
 
-.PHONY: compile test-fast test verilog clean musashi test-verilator
+.PHONY: compile test-fast test verilog clean musashi test-verilator check-publication
 
 compile:
 	$(SBT) compile
+
+check-publication:
+	python3 tools/test_check_publication.py
+	python3 tools/check_publication.py
 
 test-fast:
 	$(SBT) fastTest
