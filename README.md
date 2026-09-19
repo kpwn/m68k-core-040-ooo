@@ -1,8 +1,14 @@
 === BEGIN HUMAN ===
 
-This is a vibecoded core that tries to faithfully implement a high-performance 68040 core in SpinalHDL.
+This is a vibecoded core that tries to faithfully implement a high-performance 68040 core in SpinalHDL. 
+
+There is a Macintosh Quadra 700-ish SoC sister repo at: https://github.com/kpwn/macqd700-soc
+
+
 I'm using this as a benchmark for LLM model capabilities in the face of large complex projects, and this was in my bucket list
-of things to do within my lifetime for a long while now. I'll probably still end up rewriting this manually at some point just for the fun
+of things to do within my lifetime for a long while now. 
+
+I'll probably still end up rewriting this manually at some point just for the fun 
 of it, but yeah - i went into this not expecting a LLM to actually succeed.
 
 The core is heavily inspired by NaxRiscv by Dolu1990 and his copyright (MIT, (c) Charles Papon) applies on this project due to being the reference core.
