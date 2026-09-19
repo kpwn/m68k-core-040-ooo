@@ -173,3 +173,47 @@ rename, NOT on the PRF ports (owner constraint respected) — size banks with he
   narrowing only shrinks the S2 registers.
 - Exact bypass-network and cold-Mem LUT counts (items 1, 4) — derived from port/width arithmetic.
 - Item 6's hit-case IPC neutrality (depends on the skid being occupancy-registered).
+
+---
+
+## Item 13 — register the L2C array read address (ATTEMPTED 2026-09-15, FAILED, reverted)
+
+**Why it is worth doing.** After items 3+6, the CPU is no longer where the failing
+paths are. Violated-path ownership on the post-items-3+6 netlist (60-path sample,
+`Default` route): **20 u_ddr, 12 u_l2c, 10 u_pb_s1_cdc, 10 u_scsi** vs only **8 in
+u_cpu** (5 IcachePlugin, 2 FetchAlignPlugin, 1 RenameStage) — and NONE in the LSU,
+IQ or D-cache. `u_l2c/.../mem_reg_uram_5/ADDR_A[6]` sits at -0.758.
+`l2c_ctrl.v:752-758` already measured the mechanism: the `tags_raddr` driver at
+fo=64 with **1.332 ns of ROUTE against 0.097 ns of logic** — 24% of the failing
+path, pure distance, because the arrays are 100% of this device's URAM and span
+the die. `max_fanout = 10` replication helped but cannot shorten a wire.
+
+**What I tried and why it is WRONG.** Inserting one free-running register between
+the `tags_raddr` mux and both arrays, then widening the Critical-7 `inst_hist`
+window 2 -> 3 deep and the skew re-read `rr_q` 1 -> 2 deep to match the new
+read-to-resolve distance. Result: **`L2C_TAGS ASSERT: set 546 tag 0 left valid in
+BOTH way 0 and way 1`** (a duplicate-way install — silent data corruption) plus
+`same_id_ordering` FAIL ("second completion is B's (hit) data"). Baseline is
+65 PASS / 0 FAIL; reverted and re-confirmed 65/0.
+
+**The reason.** `tags_raddr = rr_start_c ? req_set : (do_accept_c ? cur_set : q_set)`
+selects on control state valid in the SAME cycle the array is read. Registering the
+address alone makes the array read at T+1 with an address chosen from T's control
+state, while `q_set`/`cur_set` and the accept decision have already advanced — so
+stage 2 resolves against a snapshot that is not its own request's. Widening the
+hazard windows does not fix that; it is an alignment break, not a window shortage.
+
+**What the correct fix requires.** A genuine extra PIPELINE STAGE, not a register
+insertion: the request tracking that consumes the array output must be delayed by
+the same cycle the address is, so the resolve stage still sees the read issued for
+its own request. That means carrying {set, way-select, request identity} alongside
+the registered address and re-deriving stage 2's view from the delayed copy, then
+re-auditing `arr_ce_c` (it clock-enables tq_* and l2c_data's second register and
+must not hold the new first stage), `rr_start_c`/`rr_busy_c`, and the
+`accept_slot_c` term. Budget it as a pipeline restructure of `l2c_ctrl.v` with the
+ten tb-l2c* benches as the gate, not as a one-line timing tweak.
+
+**Test gate (baselines captured 2026-09-15):** tb-l2c 65/0, tb-l2c-chain 4/0,
+tb-l2c-mut 65/0, tb-l2c-stress 7/0, tb-l2c-bypass-all 4/0, tb-l2c-bypdepth 65/0.
+tb-l2c-sctr prints statistics, no verdict line. The hazard paths ARE exercised:
+tb-l2c reports "set-hazard refusals 25981, skew re-reads 450".

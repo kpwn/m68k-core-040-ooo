@@ -399,6 +399,28 @@ busy-clear is WRONG for them -- re-adding the `!slowFire` discrimination that
 > borrowed EU read port -- and the port goes too.
 
 
+> ### ⛔ CORRECTION 2026-09-14: the READ half is REFUTED. Writes only.
+>
+> The area figures below stand, but the DELAY half was never measured and it decides
+> everything. Cutting 14 reads to 6 requires SHARING ports across EUs -- a crossbar in
+> the operand-read path. Measured like-for-like (6W, 14R, 6 bypasses, crossbar the only
+> variable, `PRF_PROBE_CROSSBAR=6`):
+>
+> | | LUT | OOC WNS |
+> |---|---|---|
+> | 14 dedicated reads | 8053 | **3.395** |
+> | 6 shared + crossbar | 4459 | **2.893** |
+> | delta | -3594 (-45%) | **-0.502 ns** |
+>
+> **The crossbar saves 45% of PRF area and costs 0.5 ns of slack.** The 200 MHz SoC is
+> short by ~0.45 ns, so this trades away MORE than the whole deficit in exactly the
+> currency we lack. Area win real, irrelevant.
+>
+> So: **WRITE ports remain the prize** (the A7 merge removed the 6th for 900 LUT at
+> ZERO delay, because exclusivity-based merging adds no mux to a read path; §4a's
+> reservation extends it). **READ ports are cheap to keep and expensive to share --
+> do not pursue 14 -> 6.**
+
 > ### ⭐⭐ THE PRIZE IS THE WHOLE PORT SHAPE, NOT JUST THE WRITES (measured 2026-09-13)
 >
 > The int PRF as built is **14 reads x 6 writes = 6471 LUT / 3940 LUTRAM**. Measured

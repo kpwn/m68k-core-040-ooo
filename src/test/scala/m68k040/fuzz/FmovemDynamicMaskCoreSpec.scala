@@ -87,12 +87,34 @@ class FmovemDynamicMaskCoreSpec extends AnyFunSuite {
   }
 
   test("dynamic FMOVEM with real MMU walks and copyback cache", VerilatorTest) {
+    val source = program(Seq(0,1,0x80,0x55,0xaa,0xff))
     val result = MmuWalkDriver.runWithRealTables("fmovem_dynamic_mmu_a7",
-      program(Seq(0,1,0x80,0x55,0xaa,0xff)),300000L,allowBkptCompletion=false)
+      source,300000L,allowBkptCompletion=false)
     assert(result.outcome == PortedPass, s"translated FMOVEM failed: ${result.outcome}")
     assert(result.probe.itlbWalkStarts > 0 && result.probe.dtlbWalkStarts > 0,
       s"both translation ports must walk: ${result.probe.summary}")
     assert(result.probe.walkStores > 0 && result.probe.dcLoadHits > 0,
       s"descriptor updates and cache hits must be exercised: ${result.probe.summary}")
+
+    // Change a physical address bit while leaving the instruction's virtual
+    // stack/frame address unchanged. Scalar image checks use the ordinary LSU,
+    // so a cold store/load pair both ignoring the PPN cannot cancel out.
+    val virtualPage = 0x21000L
+    val physicalPage = 0x121000L
+    val leaf = result.map.leafTableBase(MmuWalkPosture.blockOf(virtualPage))
+    val descriptorAddress = leaf + ((virtualPage >>> 12) & 0x3fL) * 4
+    val remapped = result.map.copy(descriptors = result.map.descriptors.map {
+      case (address, _) if address == descriptorAddress =>
+        address -> MmuWalkPosture.pageDesc(physicalPage,MmuWalkPosture.CmCopyback)
+      case other => other
+    })
+    assert(remapped.descriptors != result.map.descriptors)
+    val probe = new PostureProbe
+    val outcome = PortedTestRunner.run("fmovem_dynamic_nonidentity_a7",source,300000L,
+      cachePosture=CachePosture.ForceMmuWalkCopyback(remapped),probe=probe,
+      allowBkptCompletion=false)
+    assert(outcome == PortedPass, s"nonidentity cold transfer failed: $outcome")
+    assert(probe.touchedBlocks.contains(MmuWalkPosture.blockOf(physicalPage)),
+      s"translated physical frame was never accessed: ${probe.summary}")
   }
 }
