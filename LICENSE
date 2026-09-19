@@ -1,3 +1,12 @@
+Licensing scope
+===============
+
+The project's original contributions are offered under MIT below.
+Third-party material retains its own terms; see THIRD_PARTY_NOTICES.md.
+In particular, SoftFloat Release 2b adaptations are NOT covered solely by
+MIT, and the vendored Musashi PMMU/FPU provenance review remains open.
+This is not a blanket relicensing of dependency code.
+
 MIT License
 
 Copyright (c) 2026 qwertyoruiop

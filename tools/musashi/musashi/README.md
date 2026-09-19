@@ -9,7 +9,9 @@ and fuzzing.
 - Repository: https://github.com/kstenerud/Musashi
 - Commit:     `313ebf1bd9f4d0d93341eb5ce21fd8a119e9dbdd`
 - Version:    3.32
-- License:    MIT (see `m68kconf.h` header — Copyright Karl Stenerud)
+- License:    mixed; Musashi core files carry Karl Stenerud's MIT notice,
+  SoftFloat 2b carries its own terms, and the older MAME-derived PMMU/FPU
+  provenance requires review. See `../../../THIRD_PARTY_NOTICES.md`.
 
 ## Files
 
@@ -38,4 +40,5 @@ The parent `Makefile` (at `tb/models/Makefile`) drives the build:
 Musashi is small (< 1 MB of source) and has no runtime dependencies
 beyond libc + softfloat.  Vendoring avoids a network fetch at build
 time and pins the exact version we co-simulate against.  The full
-MIT license text is carried in the file headers and re-stated above.
+MIT license text for the core is carried in its file headers. It must not
+be taken as the license of every file in this directory.

@@ -1,10 +1,12 @@
 # Musashi reference model (lock-step oracle)
 
-The lock-step harness (spec ch 11) compares architectural state against Musashi
-at every retired instruction. Reuse the integration already built in the sibling
-repo rather than rebuilding:
+The vendored snapshot records upstream kstenerud/Musashi commit
+`313ebf1bd9f4d0d93341eb5ce21fd8a119e9dbdd` in `musashi/README.md`.
+It is a host-side verification oracle, not synthesized into the CPU.
+Local adaptations are present; that hash does not identify every current byte.
 
-    cp -r /home/qwertyoruiop/m68k-core-030-inorder/tools/musashi/* .
-
-Then follow that copy's build instructions. This directory is the vendoring point;
-the lock-step bridge is implemented in the verification-harness plan, not here.
+Do not refresh it by copying an arbitrary sibling workspace. Retain all
+upstream notices and record the source revision and changes.
+The directory is not uniformly MIT: SoftFloat Release 2b has separate terms,
+and the older MAME-derived PMMU/FPU code needs provenance review.
+See `../../THIRD_PARTY_NOTICES.md`.
