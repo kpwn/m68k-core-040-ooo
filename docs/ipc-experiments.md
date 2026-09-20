@@ -11,6 +11,12 @@ it as a research candidate and log each specific timing repair and its IPC cost.
 The [fifteen design alternatives](ipc-design-options.md) are evaluated proposals,
 not fifteen implemented or benchmarked improvements.
 
+Execution policy: IPC/correctness work and synthesis are separate queues. Pin
+each tested candidate and its measurements, synthesize candidates one at a time,
+and continue developing other proposals while routing runs. Do not block the
+next IPC experiment on a synthesis result. A failed timing candidate enters a
+repair queue; only final acceptance requires the routed timing gate.
+
 For each new experiment record:
 
 - Baseline and candidate revisions, dirty changes if any, and option settings.
@@ -18,6 +24,104 @@ For each new experiment record:
 - Baseline/candidate IPC and percentage change for each workload, including regressions.
 - Correctness checks, test results and reproducible commands.
 - Matched routed timing and area, or explicitly pending; acceptance/rejection.
+
+## Dhrystone board windows and pipeline profiling — 2026-09-21
+
+User-confirmed Dhrystone, running throughout. Live build ID `462a4dc1`, matching
+`ipc-100mhz/build/vivado/fpga_top.ltx`; build metadata specifies 100 MHz, detailed
+counters and IPC ILA enabled. This is the earlier diagnostic CPU, not the new
+LSU candidates. No CPU reset, halt, reload or memory write was performed.
+Snapshots briefly freeze performance counters only and restore their previous
+run state. Windows below count actual running counter cycles, not JTAG overhead.
+
+| Window | Cycles | Macros | IPC | Head load wait | Head store wait | IQ-blocked dispatch | ROB-full / ROB-blocked dispatch |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 300,034,022 | 67,307,899 | 0.224334 | 17.776% | 27.878% | 55.496% | 0 / 0 |
+| 2 | 299,856,320 | 66,866,247 | 0.222994 | 17.369% | 27.912% | 55.418% | 0 / 0 |
+| 3 | 299,915,342 | 71,798,667 | 0.239396 | 16.256% | 29.888% | 58.925% | 0 / 0 |
+| 4 | 299,904,352 | 69,047,560 | 0.230232 | 17.091% | 28.683% | 57.151% | 6 / 7 cycles |
+
+These are **full-system windows while Dhrystone runs**, not PC-filtered user-code
+measurements. All show zero halted/exception-FSM cycles. Head classification says
+which incomplete operation blocks retirement; it does not identify the underlying
+reason (cache miss, dependency, precise-store policy, queueing, etc.). The almost
+absent ROB-capacity stalls lower the immediate priority of enlarging/recycling
+ROB storage; they do not prove bulk retirement has no benefit.
+
+Window 4 additionally recorded 14,570,022 BTB-eligible retired branches,
+2,730,181 non-return mispredict redirects and 543,700 return redirects. The
+non-return miss/BTB-branch ratio is about 18.74%; **do not divide total misses
+including returns by this branch counter**. Return retirement count is absent,
+so whole-branch accuracy is not established by these board counters. There were
+86,498 D-cache load misses, 16,253 I-cache demand misses, 7,766 DTLB walks and
+4,280 ITLB walks. D-cache busy was 1,616,091 cycles; walker busy 244,522.
+Cache/walker busy predicates are not the same as LSU/head-wait predicates.
+
+Live configuration: `TC=0000c000`, `CACR=80008000`,
+`DTT0/ITT0=f900c060`, `DTT1/ITT1=807fc040`, `SRP=03fffa00`, `URP=00000000`.
+Translation is enabled; don't treat host physical reads as arbitrary CPU virtual
+reads or infer every data page's cache policy from CACR alone.
+
+Eight immediate ILA captures each contain 1,024 consecutive 100 MHz cycles,
+10.24 us each, with gaps between captures. All passed one-hot event-partition
+and same-edge macro-probe/event consistency checks. Across their 8,192 sampled
+cycles: 1,690 macros (IPC 0.206299), 52.869% IQ-blocked dispatch, 19.995% head-load
+wait and 25.085% head-store wait; no ROB-capacity block. Individual IPC spans
+0.096680–0.286133. Some captures include ROM/system PCs, consistent with the
+full-system workload and variation; this sample is not a replacement for the
+three-second counter windows. Recurring no-macro gaps include 68 cycles between
+retired PCs `03bd6910` and `03bd6912`, and 22 cycles between `03be19cc` and
+`03be19c2`. Bracketing PCs are **not** proof of which instruction caused a gap.
+
+Raw board evidence is in the persistent `/tmp/jtag_out`, window markers
+`DHRYSTONE_WINDOW_1..3` and `DHRYSTONE_FULL_WINDOW_4`, and
+`/tmp/dhrystone_20260921_0030_0.csv` through `_7.csv`. The read-only analyzer
+`tools/analyze_ipc_ila.py` validates the schema and reports each capture separately.
+Its four unit tests cover counts, boundary gaps, invalid probes/partitions and
+truncated captures. No raw board logs are added to the repository.
+
+### Matched simulation profiles
+
+Baseline `4cc38032` plus test-only instrumentation; all optional LSU candidates
+off. Same `l2:5:70` model, seeds 1/17. Discard setup and 16 loop iterations
+(deep-backlog: four; independent ALU: first 32 macros). Twenty runs compare
+instrumentation off/on: **all ten pairs have exactly identical macros/cycles**.
+Register results are checked for the loop, alternating, backlog and call kernels.
+
+| Kernel | Seed | Warm macros / cycles | IPC | Retired branches / misses | Accuracy | Head-incomplete cycles | Completed younger backlog cycles | Dual retire with >2 complete prefix | Structural branch-pair opportunities |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hot loop | 1,17 | 336 / 252 | 1.333333 | 84 / 1 | 98.810% | 0 | 0 | 0 | 0 |
+| alternating | 1 | 132 / 135 | 0.977778 | 48 / 2 | 95.833% | 21 | 0 | 11 | 28 |
+| alternating | 17 | 132 / 234 | 0.564103 | 48 / 11 | 77.083% | 44 | 3 | 6 | 23 |
+| synthetic backlog | 1,17 | 360 / 425 | 0.847059 | 32 / 8 | 75.000% | 173 | 138 | 113 | 17 |
+| copyback call/return | 1,17 | 672 / 1342 | 0.500745 | 252 / 1 | 99.603% | 671 | 671 | 168 | 168 |
+| independent ALU | 1,17 | 396 / 267 | 1.483146 | 0 / 0 | N/A | 9 | 0 | 0 | 0 |
+
+None exhausted pair allocation capacity. Completed prefixes are not automatically
+eligible for bulk commit; structural branch-pair opportunities still need precise
+state/trace/debug eligibility. The seed-dependent alternating-branch result needs
+longer warm-up and history/recovery investigation, not a blanket claim of 95%
+accuracy. The synthetic backlog is intentionally an upper-bound stress pattern.
+
+The first profiler test correctly failed its expected call/return denominator:
+the existing `debugBranchRetire` stream emits BTB training, excluding returns.
+The corrected profiler joins branch-completion metadata to actual retirement,
+including returns, and checks the BTB stream as a subset. Raw ROB pressure is
+delayed one sampling edge to match registered commit observations, with assertions
+checking alignment. Branches are included by exact macro ordinal so partially
+included boundary cycles cannot pollute the denominator. Kind 2 identifies
+non-BTB control flow (returns in this corpus), not a new predictor event.
+
+Reproduce:
+
+```sh
+IPC_MEM=l2:5:70 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.bench.PipelineProfileSpec'
+python3 tools/test_analyze_ipc_ila.py
+python3 tools/analyze_ipc_ila.py /tmp/dhrystone_20260921_0030_{0,1,2,3,4,5,6,7}.csv
+```
+
+Simulation log: `/tmp/pipeline-profile-all-branches.log`. These are measurement
+changes with zero IPC effect, not newly implemented performance improvements.
 
 ## Load latency candidates — 2026-09-20
 

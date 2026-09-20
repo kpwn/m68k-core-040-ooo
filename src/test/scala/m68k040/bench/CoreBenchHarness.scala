@@ -418,6 +418,28 @@ trait CoreBenchHarness extends AnyFunSuite {
   }
 
   // ── per-kernel measurement result ───────────────────────────────────────────
+  final case class RetiredBranchStats(pc: Long, branchType: Int, retired: Int,
+                                      taken: Int, misses: Int)
+  final case class RobCycle(occupancy: Int = 0, completePrefix: Int = 0,
+                           completeYounger: Int = 0, headIncomplete: Boolean = false,
+                           retires: Int = 0, branchPairPotential: Boolean = false,
+                           headPc: Long = 0L)
+  final case class PipelineProfile(branches: Vector[RetiredBranchStats],
+                                   rob: Vector[RobCycle], robDepth: Int) {
+    def retiredBranches: Int = branches.map(_.retired).sum
+    def branchMisses: Int = branches.map(_.misses).sum
+    // Aggregate prediction failure (direction OR target), not direction-only.
+    def branchAccuracy: Option[Double] = if (retiredBranches == 0) None
+      else Some(100.0 * (retiredBranches - branchMisses) / retiredBranches)
+    def meanOccupancy: Double = rob.map(_.occupancy).sum.toDouble / rob.size
+    def noPairCapacityCycles: Int = rob.count(_.occupancy > robDepth - 2)
+    def headIncompleteCycles: Int = rob.count(_.headIncomplete)
+    def nonemptyNoRetireCycles: Int = rob.count(s => s.occupancy > 0 && s.retires == 0)
+    def completedBacklogCycles: Int = rob.count(s => s.headIncomplete && s.completeYounger > 0)
+    def dualWithExtraCompleteCycles: Int = rob.count(s => s.retires == 2 && s.completePrefix > 2)
+    def branchPairPotentialCycles: Int = rob.count(_.branchPairPotential)
+  }
+
   final case class IpcResult(
       name: String,
       retiredInstrs: Int,   // MACRO instructions (cracked-load temps dropped)
@@ -462,7 +484,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       ldRspCycles: Seq[Long] = Nil,
       lsWbCycles:  Seq[Long] = Nil,
       // Actual SQ-forward completions in the IPC cycle window, not raw query hits.
-      sqForwardCompletions: Int = 0
+      sqForwardCompletions: Int = 0,
+      pipelineProfile: Option[PipelineProfile] = None
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -524,7 +547,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                           // see `assertChasePremise`.
                           zeroFillData: Boolean = false,
                           warmupInstrs: Int = 0,
-                          verifyRetirement: Seq[m68k040.lockstep.CommitObservation] => Unit = _ => ())
+                          verifyRetirement: Seq[m68k040.lockstep.CommitObservation] => Unit = _ => (),
+                          profileRetirement: Boolean = false)
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
@@ -567,6 +591,17 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Overlapping diagnostic predicates, sliced to the exact IPC window below.
       val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
+      val robHisto = ArrayBuffer.empty[RobCycle]
+      // Branch events are retained by macro ordinal, not just cycle inclusion:
+      // a warm-up/stop boundary can bisect a dual-retirement cycle.
+      val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean)]
+      // debugBranchRetire is a BTB-training stream: it deliberately EXCLUDES
+      // returns. Join ALL branch completions to actual branch retirement instead.
+      // Kind 2 below means non-BTB control flow (returns in the current corpus),
+      // not a fabricated direction-predictor or BTB event.
+      val branchCompletions = scala.collection.mutable.HashMap.empty[Int, (Long, Int, Boolean, Boolean)]
+      var precedingRetiredBranch: Option[(Long, Int, Boolean, Boolean)] = None
+      var precedingRobCycle = RobCycle()
       var countedMacros = 0
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
@@ -650,6 +685,12 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       cd.onSamplings {
         telemCycle += 1
+        if (k.profileRetirement && dut.rob.logic.branchCompletion.valid.toBoolean) {
+          val b = dut.rob.logic.branchCompletion.payload
+          branchCompletions(b.robId.toInt) = ((b.btbPc.toLong & 0xffffffffL,
+            if (b.isBranch.toBoolean) b.brType.toInt else 2,
+            b.btbTaken.toBoolean, b.mispredict.toBoolean))
+        }
         if (dut.rob.logic.branchCompletion.valid.toBoolean &&
             dut.rob.logic.branchCompletion.payload.mispredict.toBoolean)
           misResolveCycle(dut.rob.logic.branchCompletion.payload.robId.toInt) = telemCycle
@@ -747,8 +788,53 @@ trait CoreBenchHarness extends AnyFunSuite {
           val c = dut.rob.logic.commitObs(kk)
           if (c.fire.toBoolean) {
             val id = c.robId.toInt
+            val slotEmittedBefore = handle.emitted
             handle.onCommit(id, c.pc.toLong & 0xffffffffL)
+            if (k.profileRetirement && kk == 0 && precedingRetiredBranch.nonEmpty) {
+              val b = precedingRetiredBranch.get
+              assert(handle.emitted == slotEmittedBefore + 1,
+                "a retired branch must correspond to exactly one emitted macro")
+              assert(b._1 == precedingRobCycle.headPc,
+                "registered branch event is not aligned with the preceding ROB head")
+              if (handle.emitted > k.warmupInstrs && handle.emitted <= k.retiredInstrs)
+                branchEvents += b
+            }
           }
+        }
+        if (k.profileRetirement) {
+          val obsRetires = (0 until 2).count(dut.rob.logic.commitObs(_).fire.toBoolean)
+          assert(obsRetires == precedingRobCycle.retires,
+            "ROB pressure and registered commit observations differ by more than one sampling edge")
+          assert(!dut.rob.logic.debugBranchRetire.valid.toBoolean ||
+            dut.rob.logic.commitObs(0).fire.toBoolean,
+            "branch retirement event without slot-0 retirement")
+          assert(dut.rob.logic.debugBranchRetire.valid.toBoolean ==
+            precedingRetiredBranch.exists(_._2 != 2), "BTB retirement subset disagrees with all-branch stream")
+          // commitObs is registered one cycle after the raw retirement decision.
+          // Delay pressure snapshots too, so they describe the very same IPC edges.
+          robHisto += precedingRobCycle
+          val rob = dut.rob.logic
+          val occupancy = rob.count.toInt
+          val head = rob.head.toInt
+          val complete = (0 until occupancy).map(i => rob.completes((head + i) % rob.depth).toBoolean)
+          val rawRetires = (if (rob.retire0.toBoolean) 1 else 0) +
+            (if (rob.retire1.toBoolean) 1 else 0)
+          precedingRetiredBranch = if (rob.retire0.toBoolean && rob.p0.retireAlone.toBoolean) {
+            val b = branchCompletions.getOrElse(head,
+              fail(s"retiring branch at ROB $head without its completion metadata"))
+            assert(b._4 == rob.mispredictStore(head).toBoolean)
+            Some(b)
+          } else None
+          if (rob.flushing.toBoolean) branchCompletions.clear()
+          // A structural opportunity, NOT proof of legal dual commit: precise
+          // stops, trace and cold-path eligibility still need the RTL audit.
+          val branchPairPotential = rawRetires == 1 && occupancy > 1 && complete(1) &&
+            rob.p0.retireAlone.toBoolean && !rob.mispredictStore(head).toBoolean &&
+            !rob.p1.retireAlone.toBoolean && !rob.faultedStore((head + 1) % rob.depth).toBoolean &&
+            !rob.p1.needsSup.toBoolean && !rob.p1.sysOp.toBoolean && !rob.p1.isRte.toBoolean
+          precedingRobCycle = RobCycle(occupancy, complete.takeWhile(identity).size,
+            complete.drop(1).count(identity), complete.headOption.contains(false), rawRetires,
+            branchPairPotential, if (occupancy > 0) rob.p0.pc.toLong & 0xffffffffL else 0L)
         }
         // Exception channel: not exercised by these kernels, but feed it for safety.
         locally {
@@ -952,12 +1038,33 @@ trait CoreBenchHarness extends AnyFunSuite {
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
 
+      val pipelineProfile = if (!k.profileRetirement) None else {
+        val branches = branchEvents.groupBy(e => (e._1, e._2)).toVector.sortBy(_._1).map {
+          case ((pc, kind), events) =>
+            RetiredBranchStats(pc, kind, events.size, events.count(_._3), events.count(_._4))
+        }
+        val profile = PipelineProfile(branches, robHisto.slice(lo, hi + 1).toVector, dut.rob.logic.depth)
+        assert(profile.rob.size == windowCycles)
+        println(f"[pipeline-window] ${k.name} macros=$windowRetired cycles=$windowCycles " +
+          f"branches=${profile.retiredBranches} misses=${profile.branchMisses} " +
+          f"MPKI=${1000.0 * profile.branchMisses / windowRetired}%.3f " +
+          f"meanRob=${profile.meanOccupancy}%.2f noPairCapacity=${profile.noPairCapacityCycles} " +
+          s"headIncomplete=${profile.headIncompleteCycles} nonemptyNoRetire=${profile.nonemptyNoRetireCycles} " +
+          s"completedBacklog=${profile.completedBacklogCycles} dualWithExtraComplete=${profile.dualWithExtraCompleteCycles} " +
+          s"branchPairPotential=${profile.branchPairPotentialCycles}")
+        branches.foreach { b =>
+          println(f"[retired-branch-window] ${k.name} pc=0x${b.pc}%08x type=${b.branchType} " +
+            s"retired=${b.retired} taken=${b.taken} misses=${b.misses}")
+        }
+        Some(profile)
+      }
+
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,
         flushToCommit.toVector,
         ldCmdCycles.toVector, ldCmdAddrs.toVector, ldRspCycles.toVector, lsWbCycles.toVector,
-        sqForwardHisto.slice(lo, hi + 1).count(identity))
+        sqForwardHisto.slice(lo, hi + 1).count(identity), pipelineProfile)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
