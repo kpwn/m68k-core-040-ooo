@@ -583,6 +583,14 @@ corresponding `LOCKSTEP_...` variables for the oracle. Synthesis options are
 enables the required training support. Both are distinct from unconditional
 `--defer-slot1-conditional`. No board was halted, reset or loaded.
 
+The baseline/training/selective core-only timing matrix is pinned to
+`918b1a8e66f5a5da70e5190fe6948f06a0a0e7dd` and queued as
+`m68k-slot1-training-918b1a8e.service`, artifacts
+`/tmp/slot1-training-gate.yGdUUB`. It waits for the prior all-deferral matrix and
+then uses the shared Vivado mutex, the same 5 ns recipe and three post-route
+rounds. The existing `build-logs` tmux pane follows all three arms. No timing or
+area result is claimed yet, and this queue does not block subsequent IPC work.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style
