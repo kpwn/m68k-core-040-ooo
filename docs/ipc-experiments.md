@@ -104,7 +104,7 @@ All six baseline simulations passed. Local evidence:
 
 ## Aligned-longword to subword forwarding — 2026-09-20
 
-Candidate: aligned-LONG producer forwarding based on `c41424f4`, option
+Candidate: `839e4322`, aligned-LONG producer forwarding based on `c41424f4`, option
 `sqSubwordForwarding`; other latency options off. Same warmed 80-iteration
 measurement, L2/DDR model and seeds 1/17 as above. Byte offsets 0–3 and word
 offsets 0–2 are tested; registers start with nonzero upper bits so the independent
@@ -150,6 +150,12 @@ gate passes: 381 tests passed, zero failed, two ignored (2026-09-21).
 Evidence: `/tmp/sq-subword-final-unit.log`, `/tmp/sq-subword-final-ipc.log`,
 `/tmp/sq-subword-oracle-baseline-fixed.log`, `/tmp/sq-subword-oracle-fixed.log`,
 `/tmp/sq-subword-corpus.log` and `/tmp/sq-subword-fast.log`.
+
+Matched baseline/subword routed timing is queued at pinned revision `839e4322`
+in `/tmp/sq-forward-gate.jVqSkW/`, unit `m68k-sq-subword-839e4322.service`.
+It waits for the existing latency matrix to finish, then uses the shared Vivado
+mutex. Both arms use the same 5 ns OOC recipe and three post-route rounds;
+results are pending. The existing `build-logs:0` window follows both jobs.
 
 ```sh
 IPC_SQ_SUBWORD=1 IPC_MEM=l2:5:70 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.bench.LsFallThroughIpcSpec'
