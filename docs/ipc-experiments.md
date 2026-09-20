@@ -465,6 +465,14 @@ Use `IPC_DEFER_CONDITIONAL=1` for the pipeline/LSU benchmarks,
 `LOCKSTEP_DEFER_CONDITIONAL=1` for the oracle and `--defer-slot1-conditional`
 for core synthesis. Defaults remain unchanged. Timing and board gains unverified.
 
+Pinned candidate `1d50abbc` is queued for matched baseline/deferred core routing
+in `/tmp/defer-conditional-gate.v4Jqc4`, systemd unit
+`m68k-defer-conditional-1d50abbc.service`. It waits for the entire subword matrix,
+then runs its two arms serially under the shared Vivado mutex, 5 ns constraint
+and three post-route rounds. The existing `build-logs:0` tmux window follows
+the active forwarding arm and this queued matrix. IPC development need not wait
+for these timing results.
+
 ### Integration boundary and next LSU work
 
 The experimental flags currently reach the full-core test/OOC generator only.
