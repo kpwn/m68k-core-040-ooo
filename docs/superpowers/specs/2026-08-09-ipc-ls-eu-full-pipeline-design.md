@@ -1,9 +1,10 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
 **2026-09-20 resident-latency experiment:** `docs/ls-hit-latency.md` specifies an
-optional descriptor enqueue/send fall-through, retaining response allocation and
-all P4 permission checks. It is disabled by default pending timing signoff; the
-registered descriptor path described below remains the baseline.
+optional descriptor enqueue/send fall-through and guaranteed next-cycle integer
+wakeup, retaining response allocation, all P4 permission checks and registered
+data writeback. Both are disabled by default pending timing signoff; the
+registered descriptor and wakeup paths described below remain the baseline.
 
 **2026-09-20 memory-dependency amendment (implementation in progress):**
 `docs/memory-dependencies.md` defines the replacement for NG1/NG3's strict LS

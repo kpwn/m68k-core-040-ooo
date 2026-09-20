@@ -507,7 +507,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
-    val lsEu   = new LsEuPlugin
+    val lsEu   = new LsEuPlugin(
+      alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
+      earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

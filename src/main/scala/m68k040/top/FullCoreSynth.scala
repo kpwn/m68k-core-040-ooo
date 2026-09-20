@@ -807,14 +807,16 @@ object GenFullCoreSynthVerilog {
     * is a byte-for-byte no-op of this change. */
   def buildWith(dbgBuildId: BigInt, vioEnable: Boolean, outputName: String,
                 debugEnable: Boolean = true, debugStage: Int = 2,
-                alignedLoadFallThrough: Boolean = false): Unit = {
+                alignedLoadFallThrough: Boolean = false,
+                earlyLsIntWakeup: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
         val eu0 = new AluEuPlugin
         val eu1 = new AluEuPlugin
         val branchEu = new BranchEuPlugin
-        val lsEu = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough)
+        val lsEu = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
+          earlyIntWakeup = earlyLsIntWakeup)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
@@ -867,10 +869,11 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.isEmpty || args.toSeq == Seq("--aligned-load-fall-through"),
-      "expected no arguments or --aligned-load-fall-through")
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup")),
+      "expected --aligned-load-fall-through and/or --early-ls-int-wakeup")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
-      alignedLoadFallThrough = args.nonEmpty)
+      alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
+      earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"))
   }
 }
 

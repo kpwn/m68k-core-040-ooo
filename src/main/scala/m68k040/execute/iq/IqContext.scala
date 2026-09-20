@@ -151,8 +151,11 @@ trait IssueQueueService {
     * selected now is guaranteed to leave the registered issue stage next cycle. */
   def aluFastAcceptNext: Vec[Bool]
   def flushPort: Bool
-  /** Dynamic-completion wakeup (variant A): the LS EU broadcasts the pdst of a
-    * just-completed load; slots reading that physreg become ready. */
+  /** LS integer-result wakeup: the producer broadcasts a physical destination
+    * whose writeback is available now, or guaranteed on the next cycle when
+    * earlyIntWakeup is enabled. Registered dependency clear and issue selection
+    * must keep every consumer's operand capture after that writeback. This is
+    * not a speculative cache-hit prediction. */
   def lsWakeup: Flow[UInt]
   /** Dynamic-completion NZVC wakeup: the LS EU broadcasts the pNzvcDst of a
     * just-completed NZVC-writing store (a MOVE-to-memory store) or RTR CCR-restore;

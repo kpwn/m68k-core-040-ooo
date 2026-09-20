@@ -22,9 +22,9 @@ trait LsEuService {
                                // a long-latency head); missing this slot loses the store
   def sqFlush: Bool            // mispredict squash
   def sqDrained: Bool          // no committed/speculative store remains in the SQ
-  // Dynamic load-wakeup broadcast: valid (with the produced pdst) the cycle a LOAD
-  // completes and its data is in the PRF. Registered alongside the completion stage
-  // so consumers do not have to reach into the (now-pipelined) internal s1 context.
+  // Integer-result wakeup: normally registered alongside writeback. The optional
+  // earlyIntWakeup path announces a guaranteed next-cycle writeback instead;
+  // consumers must preserve the IQ's registered wake/select timing contract.
   def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
   // Dynamic NZVC-wakeup broadcast: valid (with the produced pNzvcDst) the cycle a STORE
   // that writes NZVC (a MOVE-to-memory store) — or an RTR CCR-restore — completes and
@@ -97,7 +97,8 @@ case class LsFault() extends Bundle {
   *                        is ~5 ms at 200 MHz. */
 class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val walkerWedgeLimit: Int = 1 << 20,
-                 val alignedLoadFallThrough: Boolean = false) extends FiberPlugin with LsEuService {
+                 val alignedLoadFallThrough: Boolean = false,
+                 val earlyIntWakeup: Boolean = false) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -1780,6 +1781,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // at the cost of ONE extra completion-latency cycle (lock-step is latency-
     // agnostic). All comp* are RegInit/Reg (no uninit fanout).
     val compValid     = RegInit(False)
+    // Announce only an already-selected successful result. The IQ has a
+    // registered dependency clear followed by registered issue selection, so a
+    // consumer reaches operand capture after the ordinary writeback register.
+    val nextIntWake = Flow(UInt(6 bits))
+    nextIntWake.valid := False
+    nextIntWake.payload := 0
     val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
@@ -1989,6 +1996,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // An side-effect). A CCR-restore load produces no int reg -> no (stale-pdst) wakeup.
       compWakes     := ((ctx.memOp === MemOp.LOAD) && !ctx.ccrRestore) ||
                        ctx.stkPush || ctx.leaAddr || (ctx.autoStoreAn && ctx.pdstValid)
+      nextIntWake.valid := ctx.pdstValid && !ctx.ccrRestore &&
+        ((ctx.memOp === MemOp.LOAD) || ctx.stkPush || ctx.leaAddr || ctx.autoStoreAn)
+      nextIntWake.payload := ctx.pdst
       compStkPush   := ctx.stkPush
       compCcrRestore := ctx.ccrRestore
       // Drop the commit record of an EA-auto store that is an RMW/CLR AUXILIARY store:
@@ -2071,6 +2081,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       compPdstValid  := ctx.pdstValid
       compIsLoad     := True
       compWakes      := ctx.wakes
+      nextIntWake.valid := ctx.pdstValid && ctx.wakes
+      nextIntWake.payload := ctx.pdst
       compStkPush    := False           // store-only marker; unreachable from RESOLVE
       compCcrRestore := ctx.ccrRestore
       compEaAutoDrop := False           // requires isStore
@@ -2491,8 +2503,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     xByp.data    := xW.data
     // Dynamic load-wakeup: a completing LOAD or a STACK-PUSH store (both produce an
     // int physreg) broadcasts; a plain store completes too but writes no register.
-    wakeupPort.valid   := compValid && compWakes && compPdstValid && !compIsFault
-    wakeupPort.payload := compPdst
+    val registeredIntWake = compValid && compWakes && compPdstValid && !compIsFault
+    wakeupPort.valid   := (if(earlyIntWakeup) nextIntWake.valid else registeredIntWake)
+    wakeupPort.payload := (if(earlyIntWakeup) nextIntWake.payload else compPdst)
+    GenerationFlags.simulation {
+      val announced = RegNext(nextIntWake.valid) init False
+      val announcedDst = RegNextWhen(nextIntWake.payload, nextIntWake.valid)
+      assert(announced === registeredIntWake,
+        "LsEuPlugin: early integer wakeup did not match next-cycle writeback", FAILURE)
+      when(announced) {
+        assert(announcedDst === compPdst,
+          "LsEuPlugin: early integer wakeup announced the wrong physical register", FAILURE)
+      }
+    }
     // Dynamic NZVC-wakeup: a completing NZVC-writing LS op (a memory MOVE or an
     // RTR CCR-restore) broadcasts its pNzvcDst the cycle its NZVC lands in the PRF. The IQ
     // holds a flag-reader of that NZVC until this fires (the static scoreboard cannot —
@@ -3519,6 +3542,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         compPdstValid  := e.pdstValid
         compIsLoad     := False
         compWakes      := e.wakes
+        nextIntWake.valid := e.pdstValid && e.wakes
+        nextIntWake.payload := e.pdst
         compStkPush    := e.stkPush
         compCcrRestore := False
         compEaAutoDrop := e.eaAutoDrop

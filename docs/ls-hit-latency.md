@@ -1,5 +1,24 @@
 # Resident-load latency experiment
 
+## Guaranteed next-cycle integer wakeup candidate
+
+An additional, separately disabled option announces successful LS integer
+writeback one cycle before the existing registered writeback stage. It is not a
+cache-hit prediction: the completion arbiter has already selected a successful
+result, and that exact physical destination will be written in the next cycle.
+The data, flag, ROB-completion and architectural-retirement paths do not move.
+
+This relies on the IQ's registered dependency clear and registered selection:
+an awakened consumer cannot reach operand capture before that writeback. Pending
+dispatch dependencies must observe the same guarantee. Faults and orphaned
+precise stores never announce a result; flush retains normal IQ cancellation.
+A cycle-by-cycle simulation assertion checks each announcement against actual
+next-cycle writeback eligibility and destination. Full-core tests must exercise
+this contract; direct LSU latency alone cannot validate earlier scheduling.
+
+The possible cost is a longer wakeup-tag/control path into the IQ. Do not enable
+this option by default without its own routed timing comparison.
+
 Status: candidate, disabled by default until correctness and timing gates pass.
 Baseline: 4363ae59, eight LSU-acceptance-to-completion cycles for warm aligned
 loads with resident nonidentity DTLB mappings; initiation interval one cycle.
@@ -32,8 +51,8 @@ LSU latency; this fixture does not include IQ wakeup/selection overhead.
 
 With fall-through enabled, all ten split-ring tests and fourteen fast/precise
 tests pass, including descriptor saturation, flush poisoning, inhibited accesses,
-faulting split halves and reordered/chaotic memory responses. Full-system IPC and
-routed timing remain unmeasured for this candidate.
+faulting split halves and reordered/chaotic memory responses. Board IPC and
+routed timing remain unverified for this candidate.
 
 The matched timing experiment is `bash synth/run_ls_latency_gate.sh <commit>`.
 It creates fresh baseline/candidate worktrees at the same commit, generates the
@@ -67,3 +86,41 @@ the baseline and 10 in the candidate. The remaining gaps include initial misses
 and branch recovery. This corroborates that the one-cycle LSU saving survives
 the IQ/wakeup/retirement machinery. It does not establish a Dhrystone gain or
 preserved Fmax; the matched timing run remains a separate required gate.
+
+## Combined wakeup and fall-through experiment
+
+The same full-core test now compares all four combinations of the two options.
+With both enabled, the measured retirement windows are:
+
+| Kernel | Seed | Retired | Baseline cycles | Combined cycles | IPC gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dependent pointer chase | 1 | 388 | 2889 | 2369 | 21.95% |
+| Dependent pointer chase | 17 | 388 | 2887 | 2374 | 21.61% |
+| Independent loads | 1 | 481 | 689 | 586 | 17.58% |
+| Independent loads | 17 | 481 | 693 | 590 | 17.46% |
+| Same-line disjoint store/load | 1 | 244 | 303 | 278 | 8.99% |
+| Same-line disjoint store/load | 17 | 244 | 307 | 282 | 8.87% |
+
+For each seed, 253 dependent command gaps fall from 11 to 9 cycles. Earlier
+wakeup alone gives 2625/2630 pointer-chase cycles; fall-through alone gives
+2626/2631. All 24 kernel/seed/mode simulations pass, including the next-cycle
+writeback assertion. This remains microbenchmark evidence, not board performance
+or routed timing signoff. Both options remain disabled by default.
+
+Eight selected `ExecuteLockStepSpec` cases also pass with both
+`LOCKSTEP_LS_FALLTHROUGH=1` and `LOCKSTEP_LS_EARLY_WAKEUP=1`: integer MOVE/MOVEA,
+partial-overlap forwarding, cross-line load/store, LEA, PEA, interrupt/RTE
+recovery, and long inhibited-store bursts with normal and slow memory.
+The 24 split-ring and fast/precise LSU regression cases also pass with the
+announcement/writeback assertion active (their wakeup output remains registered).
+The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes:
+381 succeeded, zero failed, two ignored.
+
+The original matched run's baseline at `ab849ea7` completed core OOC routing:
+setup WNS +0.011 ns, hold WHS +0.023 ns, pulse-width slack +1.958 ns, with zero
+failing endpoints in all three categories. Its candidate arm is still pending;
+this baseline result says nothing yet about the optimizations' timing impact.
+
+The timing launcher accepts `LS_LATENCY_MODES="baseline combined"` for a matched
+comparison including `--early-ls-int-wakeup`; `earlywake` and `fallthrough` are
+also available as individual arms.

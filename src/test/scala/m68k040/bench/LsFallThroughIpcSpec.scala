@@ -35,8 +35,10 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
       stream.copy(src = stream.src + guard, copybackDtt = true),
       mixed.copy(src = mixed.src + guard))
     val seeds = Seq(1, 17)
-    val results = Seq(false, true).map { enabled =>
-      val compiled = M68kSim().withVerilator.compile(new FullCoreDut(alignedLoadFallThrough = enabled))
+    val modes = Seq((false, false), (true, false), (false, true), (true, true))
+    val results = modes.map { case (enabled, earlyWake) =>
+      val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
+        alignedLoadFallThrough = enabled, earlyLsIntWakeup = earlyWake))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k, seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
@@ -47,24 +49,24 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
               f"pointer chase diverged at load $n: address=0x$addr%x")
           }
         }
-        println(f"LS_FULL_CORE fallThrough=$enabled seed=$seed kernel=${k.name} " +
+        println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f")
         if(k.name == pointerChain.name) {
           val gaps = r.ldCmdCycles.sliding(2).collect { case Seq(a, b) => b - a }.toSeq
-          println(s"LS_FULL_CORE_LOAD_SPACING fallThrough=$enabled seed=$seed " +
+          println(s"LS_FULL_CORE_LOAD_SPACING fallThrough=$enabled earlyWake=$earlyWake seed=$seed " +
             gaps.groupBy(identity).toSeq.sortBy(_._1).map { case (gap, xs) => s"$gap:${xs.size}" }.mkString(","))
         }
         (k.name, seed) -> r
       }).toMap
     }
-    for(seed <- seeds) {
+    for(seed <- seeds; mode <- 1 until modes.size) {
       val before = results(0)((pointerChain.name, seed))
-      val after = results(1)((pointerChain.name, seed))
+      val after = results(mode)((pointerChain.name, seed))
       assert(after.retiredInstrs == before.retiredInstrs,
         "matched pointer chase windows retired different instruction counts")
       assert(after.windowCycles < before.windowCycles,
         s"shorter LSU path did not improve dependent-load full-core IPC for seed $seed")
-      println(f"LS_FULL_CORE_GAIN seed=$seed pointerChase=${after.ipc / before.ipc - 1}%.6f")
+      println(f"LS_FULL_CORE_GAIN mode=${modes(mode)} seed=$seed pointerChase=${after.ipc / before.ipc - 1}%.6f")
     }
   }
 }
