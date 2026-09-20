@@ -60,7 +60,7 @@ class DTranslationTracePlugin extends FiberPlugin {
   * access checks that the tagged fault response still completes precisely without
   * a cache command or destination write. */
 class DtlbViptChangedVpnSpec extends AnyFunSuite {
-  class Dut extends Component {
+  class Dut(allowHints: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param     = new ParamPlugin(M68kParams())
@@ -69,7 +69,7 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
     val rfX       = new RegFilePluginX
     val ctrl      = new MmuControlPlugin
     val dtlb      = new DtlbPlugin()
-    val dcache    = new DcachePlugin()
+    val dcache    = new DcachePlugin(allowPretranslatedProbeHints = allowHints)
     val cacheCtrl = new CacheControlStubPlugin
     val eu        = new LsEuPlugin
     val src       = new LsEuSourcePlugin
@@ -201,8 +201,11 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
   private def consecutive(xs: Seq[Int], count: Int): Boolean =
     xs.size == count && xs.sliding(2).forall { case Seq(a, b) => b == a + 1 }
 
-  test("resident changed-VPN DTLB and VIPT hits retain exact tokens at II=1", VerilatorTest) {
-    M68kSim().withVerilator.compile(new Dut).doSim { dut =>
+  // False is the FPGA socket setting. Both settings must use the translated
+  // resolve path, since the real LSU never supplies a pretranslated hint.
+  for (allowHints <- Seq(false, true)) {
+  test(s"resident changed-VPN DTLB and VIPT hits retain exact tokens at II=1 (hints=$allowHints)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new Dut(allowHints)).doSim { dut =>
       val (cd, dataMem, pageMem) = initDut(dut)
 
       // Different low VPN bits select different DTLB banks.  Different virtual-set
@@ -306,6 +309,8 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         val probeFire = dut.dcache.logic.loadProbePort.valid.toBoolean &&
                         dut.dcache.logic.loadProbePort.ready.toBoolean
         if (probeFire) {
+          assert(!dut.dcache.logic.loadProbePort.payload.resolved.toBoolean,
+            "the LSU must qualify its early array read with the later translated resolve")
           probeCycles += cycle
           probeVpns += (dut.dcache.logic.loadProbePort.payload.vaddr.toLong >>> 12) & 0xfffffL
           probeTokens += dut.dcache.logic.loadProbePort.payload.token.toInt
@@ -461,6 +466,11 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         s"issue=$issueCycles req=$reqCycles rsp=$rspCycles probe=$probeCycles " +
         s"parallel=$parallelCycles enq=$enqCycles cmd=$cmdCycles " +
         s"earlyUse=$earlyUseCycles completion=$completionCycles")
+      println(s"VIPT hints=$allowHints: issue=$issueCycles probe=$probeCycles " +
+        s"resolve=$rspCycles cacheCmd=$cmdCycles earlyUse=$earlyUseCycles " +
+        s"completion=$completionCycles; issue-to-completion=" +
+        completionCycles.zip(issueCycles).map { case (done, issue) => done - issue })
     }
+  }
   }
 }

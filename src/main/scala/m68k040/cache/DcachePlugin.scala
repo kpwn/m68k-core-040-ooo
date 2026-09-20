@@ -40,7 +40,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
 class DcachePlugin(val socketMerged: Boolean = false,
-                   val earlyViptEnabled: Boolean = true) extends FiberPlugin with DcacheService {
+                   val allowPretranslatedProbeHints: Boolean = true) extends FiberPlugin with DcacheService {
+  // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
+  // path always reads the virtual set alongside the DTLB request, then qualifies
+  // that read through loadProbeResolve with the translated physical address.
 
   private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
@@ -721,7 +724,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // That was a live risk until 2026-09-09: the field was named `paddr` and the LS
     // EU pre-filled it with `tCtx.vaddr`, so setting `resolved := True` read as a
     // one-line optimisation. Inert then (the LS EU hard-wires `resolved` False, and
-    // the compile-time `earlyViptEnabled` gate ANDs with it, so flipping THAT alone
+    // the compile-time `allowPretranslatedProbeHints` gate ANDs with it, so flipping THAT alone
     // is inert too) -- but harmless only under an identity map, and a silent
     // false-hit generator under any real one, which is the exact failure class this
     // cache has spent months chasing. `DcacheSpec`'s VIPT slice-B tests DO exercise
@@ -1816,7 +1819,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             probeReadTag    := loadProbePort.payload.paddrHint(31 downto offBits + setBits)
             probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
             probeReadSize   := loadProbePort.payload.size
-            probeReadUsable := (if (earlyViptEnabled) {
+            probeReadUsable := (if (allowPretranslatedProbeHints) {
               loadProbePort.payload.resolved &&
                 !loadProbePort.payload.needsLine &&
                 (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)

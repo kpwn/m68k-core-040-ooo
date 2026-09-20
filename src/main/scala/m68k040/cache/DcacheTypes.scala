@@ -55,7 +55,7 @@ object DLoadToken {
   * Until 2026-09-09 this field was named `paddr` and its one IN-CORE producer
   * assigned it `tCtx.vaddr` -- a VIRTUAL address in a field the cache tags with.
   * Inert, because that producer also hard-wires `resolved` False and it gates every
-  * consumer (and note the compile-time `earlyViptEnabled` gate ANDs with `resolved`,
+  * hint consumer (the `allowPretranslatedProbeHints` gate ANDs with `resolved`,
   * so flipping THAT alone is inert too -- both halves have to change). But a trap:
   * setting `resolved := True` would have silently turned virtual addresses into
   * physical tag comparisons. Harmless under an identity map; a silent FALSE-HIT

@@ -7,6 +7,19 @@ address/data readiness, physical-byte disambiguation and non-blocking retry.
 The existing ordered path remains active until integration and its gates pass.
 NG2's single LS issue port and NG4's in-order cache-response association remain.
 
+**Socket VIPT configuration clarification (2026-09-20):** The socket already
+uses the parallel DTLB/virtual-set-read path qualified by `DLoadProbeResolve`.
+The former `earlyViptEnabled=false` setting disabled only physical-address hints
+supplied at probe launch, not translated resolve or early-result consumption.
+That parameter is now named `allowPretranslatedProbeHints`; the socket keeps it
+false because the LSU does not have a translation at probe launch. The changed-VPN
+integration regression exercises both settings and requires early consumption.
+With warm nonidentity translations and alternating resident lines, both settings
+measure eight cycles from LSU acceptance to completion, with one completion per
+cycle: probe at +2, translated response at +3, cache command/early consume at +6,
+completion at +8. This is a directed simulation measurement, not a board average;
+renaming the hint control does not change the datapath or improve its latency.
+
 **Status**: IMPLEMENTING. D-cache slices A/B/C, the D1 elastic LS front, and the
 D2 four-entry tokenized VIPT-result queue are implemented and simulation-gated.
 Accept-last P1/P2/P3/P4 stages, four aligned descriptors, and four early results

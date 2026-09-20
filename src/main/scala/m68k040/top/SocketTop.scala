@@ -111,10 +111,10 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new ItlbPlugin(),
       new DtlbPlugin(),
       icache,
-      // Keep the optional early VIPT snapshot path out of the FPGA socket while
-      // isolating the live-board wrong-set response observed during ROM boot.
-      // Resolved loads retain the ordinary translated D-cache path.
-      new DcachePlugin(socketMerged = true, earlyViptEnabled = false),
+      // Early virtual-set reads ARE enabled: the DTLB response qualifies them
+      // through loadProbeResolve. Only pretranslated hints at probe launch are
+      // disabled; the LSU has no physical address at that point.
+      new DcachePlugin(socketMerged = true, allowPretranslatedProbeHints = false),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
       new m68k040.frontend.RasPlugin(),
