@@ -558,6 +558,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // End at the requested macro count, excluding guard-code retirements while
       // the harness waits for final stores to drain.
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
+      // Overlapping diagnostic predicates, sliced to the exact IPC window below.
+      val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
       var countedMacros = 0
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
@@ -749,6 +751,16 @@ trait CoreBenchHarness extends AnyFunSuite {
 
         val macrosThisCycle = scala.math.min(handle.emitted - emittedBefore,
           k.retiredInstrs - countedMacros)
+        val lsSlots = dut.iq.logic.slots.filter(s => s.sel.toBoolean &&
+          s.hot.cluster.toEnum == m68k040.isa.Cluster.LS &&
+          (s.hot.memOp.toEnum != m68k040.isa.MemOp.NONE || s.hot.leaAddr.toBoolean))
+        val oldestBlocked = lsSlots.headOption.exists(s => !s.ready.toBoolean)
+        val blockedStore = oldestBlocked &&
+          lsSlots.head.hot.memOp.toEnum == m68k040.isa.MemOp.STORE
+        val youngerReadyLoad = oldestBlocked && lsSlots.drop(1).exists(s =>
+          s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
+        lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
+          dut.iq.logic.lsSkidValid.toBoolean))
         countedMacros += macrosThisCycle
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
@@ -918,6 +930,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       // instructions retired across exactly these cycles.
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
+      val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
+      println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
+        s"oldestUnready=${lsOrderWindow.count(_._1)} " +
+        s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
+        s"youngerReadyLoadBlocked=${lsOrderWindow.count(_._3)} " +
+        s"skidOccupied=${lsOrderWindow.count(_._4)}")
       assert(windowRetired == n,
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected $n")
       val activeCycles  = windowHisto.count(_ >= 1)

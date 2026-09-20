@@ -164,3 +164,51 @@ These are short full-core windows including warm-up, not system-level Dhrystone
 results. No default RTL setting changed in this expanded measurement pass.
 The required fast gate was rerun after the histogram fix and corpus expansion:
 381 passed, zero failed, two ignored.
+
+## Diagnosing remaining store-side stalls
+
+The comparison additionally includes copyback variants of `load/store` and
+`mixed`, plus a directed delayed-store-data kernel. The latter warms two distinct
+lines, computes store data with DIVU.W, stores to `0x4600`, and loads from
+`0x4610`. The address ranges cannot overlap; division delays the store's data,
+not its address. This is a baseline for future memory-order integration, not a
+claim that letting this load pass will remove the divider throughput limit.
+
+The simulation-only `[ls-order-window]` diagnostic uses the exact same first-to-
+requested-last macro window as IPC. It counts overlapping predicates: oldest LS
+entry unready, oldest entry an unready store, any younger ready load behind that
+entry, and LS skid occupancy. These describe speculative IQ state, not mutually
+exclusive stall attribution or physical-address disambiguation. No production
+counters or scheduling logic are added.
+
+In the ideal-memory baseline, seed 17's delayed-store kernel spends 2,084 of
+2,163 cycles with an unready oldest store and a younger ready load. All 32 stores
+hit L1D, with zero drain-backpressure cycles. Conversely, the copyback load/store
+and mixed baselines have no oldest-unready cycles: their 290/326 instructions
+take 345–350/332 cycles. The MMU-off variants' much lower IPC must not be
+mistaken for copyback-store performance on the board.
+
+All 208 runs (13 kernels × two seeds × four option modes × two memory models)
+pass. With both optimizations, ideal-memory copyback load/store improves
+5.18–5.42% and mixed-copyback improves 6.07–6.75%; with modeled L2/DDR those gains
+are 4.24–4.49% and 4.85%, respectively. The divider-bound directed kernel gains
+only about 0.09%, as expected while strict memory ordering remains unchanged.
+The fast gate passes after adding these diagnostics and kernels: 381 passed,
+zero failed, two ignored.
+
+## Timing investigation: descriptor fall-through
+
+The `ab849ea7` fall-through arm reports -1.252 ns at post-route round zero
+and -1.175 ns after round one;
+subsequent physical optimization is still running. This is not an acceptable
+200 MHz result. Its synthesis timing report identifies a 25-level path from
+`RobPlugin_logic_head_reg[2]` to the D-cache dirty-memory read register, through
+`alignedFallThrough`, load-address selection and early-probe matching. The
+fall-through permission currently selects payload bits as well as gating valid,
+putting late store-age/barrier logic ahead of address-dependent cache work.
+
+A follow-up should separate payload selection (registered ring pointer/occupancy
+state) from transaction permission, retaining all valid-side checks. That is a
+candidate timing repair, not yet implemented or proven. The queued matched run
+now includes baseline, early-wakeup-only and combined configurations so the
+wakeup optimization can be evaluated independently of the fall-through risk.

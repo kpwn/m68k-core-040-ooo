@@ -10,6 +10,13 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
   // predicted fall-through at loop warm-up must encounter harmless code, not
   // random memory instructions that contaminate the access-order measurement.
   private val guard = " ; .LlatencyGuard: bra.s .LlatencyGuard ; .rept 64 ; nop ; .endr"
+  private def delayedStore: Kernel = {
+    val setup = Seq("moveq #3,%d1", "move.l 0x4600,%d2", "move.l 0x4610,%d3")
+    val body = Seq.fill(32)(Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
+      "move.l %d0,0x4600", "move.l 0x4610,%d3", "addq.l #1,%d3")).flatten
+    Kernel("delayed-store-disjoint-load", (setup ++ body).mkString(" ; ") + guard,
+      setup.size + body.size, copybackDtt = true)
+  }
   private def pointerChain: Kernel = {
     val iters = 64
     val setup = Seq("lea 0x4000,%a0", s"moveq #$iters,%d7",
@@ -35,7 +42,9 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
       stream.copy(src = stream.src + guard, copybackDtt = true),
       mixed.copy(src = mixed.src + guard)) ++
       Seq(kDependentAlu, kIndependentAlu, kHotLoop, kLoadStore, kMixed,
-        kStoreStream, kCallReturn).map(k => k.copy(src = k.src + guard))
+        kStoreStream, kCallReturn).map(k => k.copy(src = k.src + guard)) ++
+      Seq(kLoadStore, kMixed).map(k => k.copy(name = k.name + "-copyback",
+        src = k.src + guard, copybackDtt = true)) ++ Seq(delayedStore)
     val seeds = Seq(1, 17)
     val modes = Seq((false, false), (true, false), (false, true), (true, true))
     val results = modes.map { case (enabled, earlyWake) =>

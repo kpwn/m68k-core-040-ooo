@@ -244,6 +244,8 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // (Every field these taps expose is in the HOT record, so the split costs no
     // observability -- the ad-hoc slot traces past investigations relied on still work.)
     slots.foreach { s => s.sel.simPublic(); s.hot.robId.simPublic(); s.hot.op.simPublic()
+      s.hot.cluster.simPublic(); s.hot.memOp.simPublic(); s.hot.leaAddr.simPublic()
+      s.ready.simPublic()
       // The per-class `s.lsWait`/`s.cplxWait`/`s.cplxNzvcWait` taps are now sim-only
       // OR-views of `dynWait`, published at their point of definition in the slot Area.
       s.dynWait.simPublic(); s.dynWaitAny.simPublic()
