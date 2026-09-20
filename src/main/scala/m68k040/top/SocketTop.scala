@@ -58,7 +58,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * the brief's own sketch has it -- only the newer `VioProbePlugin` addition is excluded. */
 class M68kSocketTop(p: M68kParams = M68kParams(),
                     dbgBuildId: BigInt = 0,
-                    debugStage: Int = 5) extends Component {
+                    debugStage: Int = 5,
+                    detailedPerf: Boolean = false) extends Component {
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
 
@@ -99,9 +100,10 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val iplAck = new IplAckPlugin(enable = true)
     val periph = new PeripheralResetPlugin(enable = true,
                                            gateDispatch = SocketTopConfig.OPEN1_GATE_DISPATCH)
-    val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage)
+    val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage,
+      detailedPerf = detailedPerf)
 
-    val core = new M68kCore(exposeDebugPorts = true, plugins = Seq[FiberPlugin](
+    val core = new M68kCore(exposeDebugPorts = true, detailedPerf = detailedPerf, plugins = Seq[FiberPlugin](
       new ParamPlugin(p),
       new MmuControlPlugin(),
       new m68k040.execute.FpuControlPlugin(),
@@ -120,8 +122,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true),
       new m68k040.decode.DecodeStage(),
       new m68k040.rename.RenameStage(),
-      new m68k040.dispatch.DispatchPlugin(),
-      new m68k040.rob.RobPlugin(),
+      new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
+      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf),
       new m68k040.execute.iq.IssueQueuePlugin(),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
@@ -157,6 +159,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   val cpu_ipl = in UInt (3 bits)
   val ipl_ack = out Bool ()
   val cpu_peripheral_reset = out Bool ()
+  val perf_trace = if (detailedPerf) Some(out(Bits(95 bits))) else None
+  Fiber.build { perf_trace.foreach(_ := socket.core.perfTrace.get) }
   val dbg_axi = slave(DbgAxiLite(DebugRegMap.DBG_AW, DebugRegMap.DBG_DW))
   dbg_axi.setName("dbg_axi")
   val cpu_cold_reset_pulse = out Bool ()
@@ -527,8 +531,13 @@ object GenSocketTopVerilog {
     // generated sources/checkpoint inputs of an already-running implementation.
     require(args.length <= 1, "usage: GenSocketTopVerilog [output-directory]")
     val outputDirectory = args.headOption.getOrElse("generated")
+    val detailedPerf = sys.env.getOrElse("PERF_DETAIL_ENABLE", "0") match {
+      case "0" => false
+      case "1" => true
+      case value => throw new IllegalArgumentException(s"PERF_DETAIL_ENABLE must be 0 or 1, got $value")
+    }
     M68kSpinalConfig(targetDirectory = outputDirectory)
-      .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId))
+      .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId, detailedPerf = detailedPerf))
     println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }

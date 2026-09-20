@@ -22,13 +22,22 @@ import spinal.lib.misc.plugin.FiberPlugin
   * patches, and leaving the mechanism wired in as dead capability invited
   * accidental future use. Do not reintroduce it -- if a ROM loop measures CPU
   * speed on purpose, patch the ROM's calibration constants instead. */
-class DispatchPlugin extends FiberPlugin {
+class DispatchPlugin(val detailedPerf: Boolean = false) extends FiberPlugin
+    with m68k040.services.DispatchPerfDetailService {
+  private var perfEventsWire: Option[Bits] = None
+  during setup {
+    if (detailedPerf) perfEventsWire = Some(Bits(m68k040.services.PerfDetail.DispatchCount bits))
+  }
+  override def dispatchPerfEvents: Option[Bits] = perfEventsWire
   val logic = during build new Area {
     val ren = host[RenameUopService]
     val rob = host[RobAllocService]
     val iq  = host[IssueQueueService]
 
     val fire = ren.uops.valid && rob.allocReady && iq.push.ready
+    val perfEvents = if (detailedPerf) Some(m68k040.services.PerfDetail.dispatchEvents(
+      ren.uops.valid, rob.allocReady, iq.push.ready, ren.uop1Valid)) else None
+    perfEventsWire.foreach(_ := perfEvents.get)
     ren.uops.ready := rob.allocReady && iq.push.ready
 
     // drive ROB alloc

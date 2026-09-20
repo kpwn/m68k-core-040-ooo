@@ -311,6 +311,8 @@ REG OFF_PERF_ITLB_WALK    0x010A4 RO    2 0x00000000 Windowed ITLB table walks S
 REG OFF_PERF_STALL_RETIRE 0x010A8 RO    2 0x00000000 Windowed cycles with the ROB NON-EMPTY and zero macros retired: the top-line stall count.
 REG OFF_PERF_STALL_DC     0x010AC RO    2 0x00000000 Windowed cycles with the D-cache busy (DcachePlugin `busy`, the same bit OFF_STALL_DC[1] reports).
 REG OFF_PERF_STALL_WALK   0x010B0 RO    2 0x00000000 Windowed cycles with EITHER table walker out of IDLE. Read against OFF_PERF_STALL_RETIRE to see how much of the stall is MMU.
+REG OFF_PERF_DETAIL_CAP   0x010B4 RO    2 0x00000000 Optional detail counters: D1 magic, version 1, ROB count, dispatch count; zero when disabled.
+REG OFF_PERF_DETAIL_BASE  0x01100 RO    2 0x00000000 Detail counter array, 32-bit words; layout in PerfDetailService.scala. Shares PERF_CTL clear/run/freeze.
 
 # ---------------------------------------------- MMU translation-key probes --
 # WHY THESE EXIST. Two defects found on 2026-09-17 both produce the same thing:

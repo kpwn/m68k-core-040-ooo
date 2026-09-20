@@ -43,7 +43,17 @@ object DebugHaltReasonCode {
   *
   * retireAlone entries (branches, for now) retire 1-wide.
   */
-class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService {
+class RobPlugin(val detailedPerf: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService {
+  private var perfEventsWire: Option[Bits] = None
+  private var perfRetirementWire: Option[Bits] = None
+  during setup {
+    if (detailedPerf) {
+      perfEventsWire = Some(Bits(m68k040.services.PerfDetail.RobCount bits))
+      perfRetirementWire = Some(Bits(66 bits))
+    }
+  }
+  override def robPerfEvents: Option[Bits] = perfEventsWire
+  override def robPerfRetirement: Option[Bits] = perfRetirementWire
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -2675,6 +2685,40 @@ class RobPlugin extends FiberPlugin with CommitTraceService with RobAllocService
     }
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
+
+    // Entire diagnostic tag RAM and event cone disappear when disabled.
+    // Capture classification on allocation, including both lanes and ROB reuse;
+    // these tags have no fanout into functional control.
+    val perfDetail = if (detailedPerf) Some(new Area {
+      import m68k040.services.{PerfDetail, RobPerfState}
+      import m68k040.isa.{MemOp, Cluster}
+      val tags = Mem(UInt(3 bits), depth)
+      for (slot <- 0 until 2) {
+        val u = allocUopVec(slot)
+        val tag = UInt(3 bits); tag := PerfDetail.Other
+        when(u.isReturn) { tag := PerfDetail.Return }
+        .elsewhen(u.memOp === MemOp.LOAD) { tag := PerfDetail.Load }
+        .elsewhen(u.memOp === MemOp.STORE) { tag := PerfDetail.Store }
+        .elsewhen(u.isBranch || u.ibranch) { tag := PerfDetail.Branch }
+        .elsewhen(u.cluster === Cluster.CPLX) { tag := PerfDetail.Complex }
+        tags.write((tail + slot).resized, tag, if (slot == 0) alloc0 else alloc1)
+      }
+      val state = RobPerfState()
+      state.nonempty := count =/= 0; state.second := count > 1; state.full := count === depth
+      state.retire0 := retire0; state.retire1 := retire1
+      state.complete0 := completes(h0); state.complete1 := completes(h1)
+      state.flushing := flushing; state.halted := coreHalted || debugHalted || stopped
+      state.exceptionActive := excActive
+      state.last0 := p0.last; state.last1 := p1.last
+      state.alone0 := p0.retireAlone; state.alone1 := p1.retireAlone
+      state.redirect := branchRedirect; state.mispredict := mispredictStore(h0)
+      state.kind := tags.readAsync(h0)
+      val events = PerfDetail.robEvents(state)
+      val retirement = (retire1 && p1.last).asBits ## (retire0 && p0.last).asBits ## p1.pc.asBits ## p0.pc.asBits
+      perfEventsWire.get := events
+      perfRetirementWire.get := retirement
+      events.simPublic()
+    }) else None
     // Drive the forward-declared committed-S (the privilege check gates on it).
     committedS := exc.ss.s
     // PrivilegeService's SFC/DFC half -- combinational passthrough of the two

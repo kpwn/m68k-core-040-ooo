@@ -257,9 +257,10 @@ class PerfCounterSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
     val alloc = new RobAllocDriverPlugin
-    val rob = new RobPlugin
+    val rob = new RobPlugin(detailedPerf = true)
     val commit = new RenameCommitSinkPlugin
-    val dbg = new DebugCtrlPlugin(buildId = BigInt(0x50450001L), porCycles = 4, stage = 2)
+    val dbg = new DebugCtrlPlugin(buildId = BigInt(0x50450001L), porCycles = 4, stage = 2,
+      detailedPerf = true)
     db.on {
       host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), rsrc, alloc, rob, commit, dbg))
     }
@@ -350,6 +351,12 @@ class PerfCounterSpec extends AnyFunSuite {
       DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlFreeze)
       cd.waitSampling(4)
       val w1 = readAll(b, cd)
+      assert(u(DbgAxiDriver.read(b, cd, OFF_PERF_DETAIL_CAP)) == 0xd1011700L)
+      val detail = (0 until 23).map(n => u(DbgAxiDriver.read(b, cd, OFF_PERF_DETAIL_BASE + 4*n)))
+      assert(detail.take(12).sum == w1("cycle_lo"), "ROB partition covers every measured cycle")
+      assert(detail(1) + 2*detail(2) == 2, "two uops retired")
+      assert(detail(13) + 2*detail(14) == 2, "two macro boundaries retired")
+      assert(detail.slice(3, 12).sum == w1("stall_retire"), "same ROB nonempty/no-retire window")
       val instAfter = u(DbgAxiDriver.read(b, cd, OFF_INST_LO))
       val freeDelta = instAfter - instBefore
       println(s"[perf-rob] window1 inst=${w1("inst_lo")} (free-running delta $freeDelta) " +

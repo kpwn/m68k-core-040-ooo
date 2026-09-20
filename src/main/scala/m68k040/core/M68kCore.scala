@@ -23,12 +23,22 @@ import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
   *   whose ONLY job is to re-drive these values onto real `out` ports of
   *   THIS component -- which a parent CAN legally read (SpinalHDL rule:
   *   "a port of a direct child component"). */
-class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false) extends Component {
+class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false,
+              detailedPerf: Boolean = false) extends Component {
   setDefinitionName("M68kCore")
   private val database = new Database
   private val host = database on (new PluginHost)
   database.on {
     host.asHostOf(plugins)
+  }
+
+  val perfTrace = if (detailedPerf) Some(out(Bits(95 bits))) else None
+  Fiber.build {
+    perfTrace.foreach { trace =>
+      val rob = host[m68k040.services.RobPerfDetailService]
+      val dispatch = host[m68k040.services.DispatchPerfDetailService]
+      trace := dispatch.dispatchPerfEvents.get ## rob.robPerfEvents.get ## rob.robPerfRetirement.get
+    }
   }
 
   val dbg040 = if (exposeDebugPorts) new Area {

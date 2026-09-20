@@ -60,7 +60,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                       val porCycles: Int     = DebugRegMap.POR_CYCLES_DEFAULT,
                       val stage:     Int     = 1,
                       val enable:    Boolean = true,
-                      val historyDepth: Int  = 32) extends FiberPlugin
+                      val historyDepth: Int  = 32,
+                      val detailedPerf: Boolean = false) extends FiberPlugin
                       with m68k040.services.DebugIrqInjectService {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
@@ -712,6 +713,20 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         else U(0, 32 bits)
       val perfCycle       = if (perfBuilt) perfCounter64(U(1, 1 bits)) else U(0, 64 bits)
       val perfInst        = if (perfBuilt) perfCounter64(perfEvtInst) else U(0, 64 bits)
+
+      // Optional diagnostic producers are accessed only through services. All
+      // events use the same one-cycle tap / RUN alignment as the baseline set.
+      val detailRob = if (perfBuilt && detailedPerf)
+        host.get[m68k040.services.RobPerfDetailService].flatMap(_.robPerfEvents) else None
+      val detailDispatch = if (perfBuilt && detailedPerf)
+        host.get[m68k040.services.DispatchPerfDetailService].flatMap(_.dispatchPerfEvents) else None
+      val detailCounters = (detailRob.toSeq ++ detailDispatch.toSeq).flatMap { events =>
+        (0 until events.getWidth).map(bit => perfCounter(perfTap(Some(events(bit)))))
+      }
+      // Version 1, independent producer counts. Zero means absent, never idle.
+      val detailCap = if (!detailedPerf || !perfBuilt) BigInt(0) else
+        BigInt(0xD1010000L | (detailRob.map(_.getWidth).getOrElse(0) << 8) |
+          detailDispatch.map(_.getWidth).getOrElse(0))
 
       // ── OFF_PERF_CTL read word ────────────────────────────────────────────────
       // [20:16] is the PRODUCER PRESENCE bitmap and it is the anti-dead-probe device at
@@ -1687,6 +1702,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           is(DebugRegMap.OFF_PERF_STALL_RETIRE) { rdCount := perfStallRetire.asBits }
           is(DebugRegMap.OFF_PERF_STALL_DC)     { rdCount := perfStallDc.asBits }
           is(DebugRegMap.OFF_PERF_STALL_WALK)   { rdCount := perfStallWalk.asBits }
+          is(DebugRegMap.OFF_PERF_DETAIL_CAP) { rdCount := B(detailCap, 32 bits) }
+          for ((counter, index) <- detailCounters.zipWithIndex) {
+            is(DebugRegMap.OFF_PERF_DETAIL_BASE + index * 4) { rdCount := counter.asBits }
+          }
           // ── MMU translation-key probes (live; no halt required) ───────────────
           // OFF_MMU_PROBE_CTL is WRITE-ONLY (W1P) and deliberately has NO read arm:
           // it reads back as zero from the region default, which is what the map
