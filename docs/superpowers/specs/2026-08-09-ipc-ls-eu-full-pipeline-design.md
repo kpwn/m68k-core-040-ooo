@@ -1,5 +1,12 @@
 # IPC push: a genuine LS EU pipeline — replacing the one-µop-at-a-time FSM (design)
 
+**2026-09-20 memory-dependency amendment (implementation in progress):**
+`docs/memory-dependencies.md` defines the replacement for NG1/NG3's strict LS
+issue/completion ordering. It requires dispatch-time tracking, separate store
+address/data readiness, physical-byte disambiguation and non-blocking retry.
+The existing ordered path remains active until integration and its gates pass.
+NG2's single LS issue port and NG4's in-order cache-response association remain.
+
 **Status**: IMPLEMENTING. D-cache slices A/B/C, the D1 elastic LS front, and the
 D2 four-entry tokenized VIPT-result queue are implemented and simulation-gated.
 Accept-last P1/P2/P3/P4 stages, four aligned descriptors, and four early results
