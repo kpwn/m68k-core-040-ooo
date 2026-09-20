@@ -96,7 +96,8 @@ case class LsFault() extends Bundle {
   *                        a false halt would be far worse than a late report.) 2^20 cycles
   *                        is ~5 ms at 200 MHz. */
 class LsEuPlugin(val walkerAgeLimit: Int = 64,
-                 val walkerWedgeLimit: Int = 1 << 20) extends FiberPlugin with LsEuService {
+                 val walkerWedgeLimit: Int = 1 << 20,
+                 val alignedLoadFallThrough: Boolean = false) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -1465,7 +1466,27 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // costs nothing once `bkBusy` is a constant (synthesis removes the dead mux arm),
     // and keeps this diff from having to touch every downstream reference of
     // `loadVaddr`/`loadPaddr` for no functional gain.
-    val alignedCmd = alignedMem(alignedSendPtr)
+    // A P4 load with no older unsent command may send while allocating its
+    // response descriptor. Admission remains the existing P4 decision: no SQ
+    // forward, unresolved dependency, inhibited access or split can take this arm.
+    // Never use ready to select the payload; a refused offer becomes a normal
+    // queued command with the same token and payload on the following cycle.
+    val alignedFallThrough = if (alignedLoadFallThrough) {
+      alignedEnq && !alignedFull && (alignedSendPtr === alignedPushPtr) &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    } else False
+    alignedFallThrough.simPublic()
+    val alignedCmd = AlignedLoadCtx()
+    alignedCmd := alignedMem(alignedSendPtr)
+    when(alignedFallThrough) {
+      alignedCmd.vaddr := p4Ctx.xlate.front.vaddr
+      alignedCmd.paddr := p4Ctx.xlate.paddr
+      alignedCmd.size := p4Ctx.xlate.front.size
+      alignedCmd.cmode := p4Ctx.xlate.cmode
+      alignedCmd.twoAccess := False
+      alignedCmd.splitSecond := False
+      alignedCmd.bk.robId := p4Ctx.xlate.front.robId
+    }
     val useSplitCmd = bkBusy
     val loadVaddr = UInt(32 bits)
     val loadPaddr = UInt(32 bits)
@@ -1480,7 +1501,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // never references `valid`, so an unqualified `alignedSendValid && ready` would
     // advance the ring past an entry whose command was never actually presented.
     val coreLsGrant     = (ldOwner === U(OWNER_CORE, 2 bits)) && !excLoadCmdValid
-    val coreLsLoadReq   = Mux(useSplitCmd, llReg.valid, alignedSendValid)
+    val coreLsLoadReq   = Mux(useSplitCmd, llReg.valid, alignedSendValid || alignedFallThrough)
     val coreLsLoadAdmit = coreLsLoadReq && coreLsGrant && !ldFifoFull
     dcache.loadCmd.valid         := coreLsLoadAdmit
     dcache.loadCmd.payload.vaddr := loadVaddr
@@ -1510,7 +1531,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // other requester (the exception sequencer, the table walker) instead of being
     // weakened to tolerate this one legitimate producer.
     dcache.loadCmd.payload.lineOnly := Mux(useSplitCmd, True, alignedCmd.twoAccess)
-    val alignedCmdFire = alignedSendValid && coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
+    val alignedCmdFire = (alignedSendValid || alignedFallThrough) &&
+                          coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
+    val alignedFallThroughFire = alignedFallThrough && alignedCmdFire
     alignedCmdFire.simPublic()
 
     // ---- store split (byte-lane) for the SQ entry ----
@@ -2211,7 +2234,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dst.splitSecond := False
       dst.mergeOff    := U(0, 4 bits)
       alignedValid(alignedPushPtr)    := True
-      alignedSent(alignedPushPtr)     := False
+      alignedSent(alignedPushPtr)     := alignedFallThroughFire
       alignedPoisoned(alignedPushPtr) := sqFlushSig
       alignedPushPtr                  := alignedPushPtr + 1
     }
@@ -2292,6 +2315,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // rather than left to be inferred from a hang. It is the invariant the switch above
     // exists to maintain, so it is checked here rather than trusted.
     GenerationFlags.simulation {
+      when(alignedFallThrough) {
+        assert(!alignedSendValid && alignedEnq && !alignedEnqSplit && !sqFlushSig,
+          "LsEuPlugin: fall-through collided with an older command, split or flush", FAILURE)
+      }
       assert(alignedCount === CountOne(alignedValid).resize(alignedCount.getWidth),
         "LsEuPlugin: alignedCount desynchronised from the aligned-ring occupancy " +
         "(popcount of alignedValid). The counter gates admission (alignedFull / " +

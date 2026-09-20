@@ -60,7 +60,7 @@ class DTranslationTracePlugin extends FiberPlugin {
   * access checks that the tagged fault response still completes precisely without
   * a cache command or destination write. */
 class DtlbViptChangedVpnSpec extends AnyFunSuite {
-  class Dut(allowHints: Boolean) extends Component {
+  class Dut(allowHints: Boolean, fallThrough: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param     = new ParamPlugin(M68kParams())
@@ -71,7 +71,7 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
     val dtlb      = new DtlbPlugin()
     val dcache    = new DcachePlugin(allowPretranslatedProbeHints = allowHints)
     val cacheCtrl = new CacheControlStubPlugin
-    val eu        = new LsEuPlugin
+    val eu        = new LsEuPlugin(alignedLoadFallThrough = fallThrough)
     val src       = new LsEuSourcePlugin
     val wire      = new TbPreciseDrainWirePlugin(eu)
     val trace     = new DTranslationTracePlugin
@@ -203,9 +203,9 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
 
   // False is the FPGA socket setting. Both settings must use the translated
   // resolve path, since the real LSU never supplies a pretranslated hint.
-  for (allowHints <- Seq(false, true)) {
-  test(s"resident changed-VPN DTLB and VIPT hits retain exact tokens at II=1 (hints=$allowHints)", VerilatorTest) {
-    M68kSim().withVerilator.compile(new Dut(allowHints)).doSim { dut =>
+  for (allowHints <- Seq(false, true); fallThrough <- Seq(false, true)) {
+  test(s"resident changed-VPN DTLB and VIPT hits retain exact tokens at II=1 (hints=$allowHints, fallThrough=$fallThrough)", VerilatorTest) {
+    M68kSim().withVerilator.compile(new Dut(allowHints, fallThrough)).doSim { dut =>
       val (cd, dataMem, pageMem) = initDut(dut)
 
       // Different low VPN bits select different DTLB banks.  Different virtual-set
@@ -466,10 +466,57 @@ class DtlbViptChangedVpnSpec extends AnyFunSuite {
         s"issue=$issueCycles req=$reqCycles rsp=$rspCycles probe=$probeCycles " +
         s"parallel=$parallelCycles enq=$enqCycles cmd=$cmdCycles " +
         s"earlyUse=$earlyUseCycles completion=$completionCycles")
-      println(s"VIPT hints=$allowHints: issue=$issueCycles probe=$probeCycles " +
+      val latencies = completionCycles.zip(issueCycles).map { case (done, issue) => done - issue }
+      assert(latencies.forall(_ == (if(fallThrough) 7 else 8)),
+        s"resident load latency: fallThrough=$fallThrough, cycles=$latencies")
+      println(s"VIPT hints=$allowHints fallThrough=$fallThrough: issue=$issueCycles probe=$probeCycles " +
         s"resolve=$rspCycles cacheCmd=$cmdCycles earlyUse=$earlyUseCycles " +
         s"completion=$completionCycles; issue-to-completion=" +
         completionCycles.zip(issueCycles).map { case (done, issue) => done - issue })
+
+      // Dependent pointer chase through the real integer PRF: each returned
+      // address is the next load's source. This measures the LSU path, not IQ
+      // scheduling latency; the source fixture issues after writeback is visible.
+      val chainVaA = vaLineA + 0x100
+      val chainVaB = vaLineB + 0x100
+      val chainPaA = paLineA + 0x100
+      val chainPaB = paLineB + 0x100
+      for ((pa, next) <- Seq(chainPaA -> chainVaB, chainPaB -> chainVaA);
+           b <- 0 until 16) {
+        dataMem.pokeByte(pa + b, if(b < 4) ((next >>> (24 - b * 8)) & 255).toInt else 0)
+      }
+      seed(dut, cd, preg = 41, data = chainVaA)
+      issueLoad(dut, cd, basePreg = 41, displacement = 0, pdst = 42, robId = 2)
+      waitNormalCompletion(dut, cd, robId = 2); cd.waitSampling(3)
+      seed(dut, cd, preg = 41, data = chainVaB)
+      issueLoad(dut, cd, basePreg = 41, displacement = 0, pdst = 42, robId = 3)
+      waitNormalCompletion(dut, cd, robId = 3); cd.waitSampling(3)
+      seed(dut, cd, preg = 41, data = chainVaA)
+      val chainLatencies = scala.collection.mutable.ArrayBuffer.empty[Int]
+      for (n <- 0 until 16) {
+        val robId = n + 4
+        driveLoad(dut, basePreg = 41, displacement = 0, pdst = 41, robId = robId)
+        var accepted = -1; var completed = -1; var elapsed = 0
+        while(completed < 0 && elapsed < 100) {
+          sleep(1)
+          val fire = dut.src.logic.iValid.toBoolean && dut.src.logic.iReady.toBoolean
+          if(fire) accepted = elapsed
+          if(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == robId) {
+            assert(!dut.src.logic.fValid.toBoolean)
+            completed = elapsed
+          }
+          cd.waitSampling()
+          if(fire) dut.src.logic.iValid #= false
+          elapsed += 1
+        }
+        assert(accepted >= 0 && completed >= 0, s"pointer chase stopped at load $n")
+        chainLatencies += completed - accepted
+        assert(readPreg(dut, 41) == BigInt(if((n & 1) == 0) chainVaB else chainVaA),
+          s"pointer chase used the wrong physical line at load $n")
+      }
+      assert(chainLatencies.forall(_ == (if(fallThrough) 7 else 8)),
+        s"dependent resident LSU latency: $chainLatencies")
+      println(s"DEPENDENT_LSU_LATENCY fallThrough=$fallThrough cycles=$chainLatencies")
     }
   }
   }

@@ -50,7 +50,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     val dtlb      = new DtlbPlugin()
     val dcache    = new DcachePlugin()
     val cacheCtrl = new CacheControlStubPlugin
-    val eu        = new LsEuPlugin
+    val eu        = new LsEuPlugin(alignedLoadFallThrough = true)
     val src       = new LsEuSourcePlugin
     val wire      = new TbPreciseDrainWirePlugin(eu)
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, ctrl, dtlb, dcache, cacheCtrl, eu, src, wire)) }
