@@ -102,8 +102,9 @@ correct. Violations are review-blocking.
  EX   ALU/shift/mul/div │ complex-mode AGU │ AGU+DTLB+D$+SQ │ microcode seq
  VAL  (LS only) hit/translation/permission/forwarding validation → replay or commit-ok
             └───────────────────────────────────────────────────────────────┘
- CMT  instruction-level retire (2-wide), RAT/CCR/PC update, physreg release,
+ CMT  instruction-level retire (2-wide), RAT/CCR/PC update, queue physreg release,
       store-queue drain, precise exception/interrupt boundary
+ FREE recycle committed old physical IDs (one cycle after CMT)
 ```
 
 Mispredict/exception flush: dual-RAM RAT location bits reset to *committed* in 1 cycle; ROB tail
@@ -130,7 +131,11 @@ pointers, MMUSR) — is read/written only by **serializing** instructions at the
 - **Int PRF:** `PHYS_INT_REGS` (baseline **48**) × 32b.
 - **NZVC-PRF:** `PHYS_NZVC_REGS` (baseline **16**) × 4b.
 - **X-PRF:** `PHYS_X_REGS` (baseline **16**) × 1b.
-- Separate freelists per PRF. Release at commit using the ROB's old-mapping fields.
+- Separate freelists per PRF. Commit records the ROB's old-mapping fields in a
+  two-lane reclamation stage; physical IDs become reusable one cycle later.
+  Committed RAT and committed-allocation accounting remain immediate. See
+  [registered reclamation](../../deferred-register-reclamation.md)
+  for recovery ordering and the capacity invariant.
 
 ### 4.3 Dual-RAM RAT
 

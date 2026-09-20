@@ -91,9 +91,11 @@ class FreelistSpec extends AnyFunSuite {
       assert(dut.count.toInt == countBefore,
         s"push concurrent with flush should be dropped at the raw component level: " +
         s"count before=$countBefore after=${dut.count.toInt}")
+      // Inspect only the occupied ring. Walking 60 entries would underflow the
+      // 32-entry pool and interpret uninitialized RAM as valid allocated IDs.
       // id 5 never becomes poppable (it was never actually returned to the pool).
       var seen = false; var i = 0
-      while (!seen && i < 60) {
+      while (!seen && i < countBefore) {
         if (dut.io.pop(0).id.toInt == 5) seen = true
         else { dut.io.pop(0).take #= true; dut.clockDomain.waitSampling(); dut.io.pop(0).take #= false; sleep(1) }
         i += 1

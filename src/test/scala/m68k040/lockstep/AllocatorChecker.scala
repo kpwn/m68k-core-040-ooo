@@ -21,10 +21,10 @@ import scala.collection.mutable
   * firing. The shadow therefore tracks which pops are still speculative:
   *
   *  - pop  (take && initDone && !flush): assert !busy, set busy, enqueue as speculative.
-  *  - push (valid && initDone && !flush): assert busy, clear busy, and retire ONE
-  *    speculative pop -- the RTL's `commHead += pushCount` says committed pops and
-  *    pushes advance 1:1 (`Freelist.scala:191-193`).
-  *  - flush: free every still-speculative pop (exactly `head - commHead` of them).
+  *  - push (valid && initDone && !flush): retire ONE speculative pop and queue
+  *    the old ID for next-cycle reclamation. This mirrors immediate commHead.
+  *  - next cycle: free the queued IDs, including on a flush cycle.
+  *  - flush: also free every still-speculative pop (head - commHead of them).
   *
   * Note the push payload is the retiring writer's OLD pdst, which is unrelated to the id
   * being retired from the speculative queue; the dequeue is pure accounting.
@@ -34,33 +34,50 @@ final class FreelistShadow(val name: String, physCount: Int, archCount: Int) {
   // Ids 0..archCount-1 are the initial committed arch mapping: allocated, never free.
   for (i <- 0 until archCount) busy(i) = true
   private val spec = mutable.Queue[Int]()
+  private var pending = Vector.empty[Int]
   val errors = mutable.ArrayBuffer[String]()
 
   private def err(msg: String): Unit = if (errors.size < 8) errors += s"[$name] $msg"
 
   def onCycle(cycle: Long, initDone: Boolean, flush: Boolean,
               pops: Seq[(Boolean, Int)], pushes: Seq[(Boolean, Int)]): Unit = {
-    if (!initDone) return
+    if (!initDone) {
+      for (id <- busy.indices) busy(id) = id < archCount
+      spec.clear()
+      pending = Vector.empty
+      return
+    }
+    // Pop IDs must already be available before this edge; reclamation at this
+    // edge cannot justify early reuse. Defer pop bookkeeping until after commit
+    // removes the oldest speculative entries.
+    if (!flush) for ((t, id) <- pops if t) {
+      if (id >= physCount) err(f"pop of out-of-range phys id $id at cycle $cycle")
+      else if (busy(id)) err(f"Double alloc: phys $id allocated while already busy (cycle $cycle)")
+    }
+    for (id <- pending) {
+      if (id >= physCount) err(f"reclaim of out-of-range phys id $id at cycle $cycle")
+      else {
+        if (!busy(id)) err(f"Double free: phys $id freed while already free (cycle $cycle)")
+        busy(id) = false
+      }
+    }
+    pending = Vector.empty
     if (flush) {
       while (spec.nonEmpty) { val id = spec.dequeue(); busy(id) = false }
       return   // pops/pushes are architecturally impossible on a flush cycle (RTL gates them)
     }
-    // Free before alloc within a cycle, matching NaxRiscv's preCycle ordering: a
-    // same-cycle free+alloc of one id is legal (the RTL cannot do it -- a pushed id lands
-    // at `tail`, a popped id comes from `head` -- but the ordering makes the checker
-    // insensitive to that being true).
     for ((v, id) <- pushes if v) {
       if (id >= physCount) err(f"push of out-of-range phys id $id at cycle $cycle")
       else {
-        if (!busy(id)) err(f"Double free: phys $id freed while already free (cycle $cycle)")
-        busy(id) = false
+        if (!busy(id) || pending.contains(id))
+          err(f"Double free: phys $id queued while already free or pending (cycle $cycle)")
+        pending :+= id
         if (spec.nonEmpty) spec.dequeue()
       }
     }
     for ((t, id) <- pops if t) {
       if (id >= physCount) err(f"pop of out-of-range phys id $id at cycle $cycle")
       else {
-        if (busy(id)) err(f"Double alloc: phys $id allocated while already busy (cycle $cycle)")
         busy(id) = true
         spec.enqueue(id)
       }

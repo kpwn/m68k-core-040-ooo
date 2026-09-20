@@ -106,7 +106,8 @@ class RenameStage extends FiberPlugin with RenameUopService with RenameCommitSer
       fpccRat.io.commits(w).valid := False
       fpccRat.io.commits(w).payload.assignDontCare()
     }
-    // Close the freelist loop: free old pdsts of retired instructions.
+    // Commit records enter each freelist's one-cycle reclamation stage. The
+    // committed-pop boundary advances now; old pdsts become available next cycle.
     for (k <- 0 until 2) {
       intFree.io.push(k).valid   := commitPorts(k).valid && commitPorts(k).intWrite
       intFree.io.push(k).payload := commitPorts(k).intOld

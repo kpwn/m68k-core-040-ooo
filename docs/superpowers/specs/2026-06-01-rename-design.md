@@ -1,6 +1,7 @@
 # Rename Slice 1 — Integer + Split-CCR Register Rename — Design
 
-**Status:** Draft for review
+**Status:** Historical design; reclamation timing updated by
+[registered reclamation](../../deferred-register-reclamation.md).
 **Date:** 2026-06-01
 **Parent spec:** `docs/superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md` (ch 3 Rename, 4.2 PRF, 4.3 dual-RAM RAT, 4.6 split CCR; **invariant #2 FMax 250 MHz / no high-fanout**, #3 plugin boundaries)
 **Builds on:** merged decode (`DecodeUopService` — 2-wide `DecodedUop` stream).
