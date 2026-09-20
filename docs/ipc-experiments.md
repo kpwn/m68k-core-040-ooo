@@ -153,17 +153,17 @@ Candidate history and disposition:
 | --- | --- | --- |
 | Descriptor fall-through, `ab849ea7` | Load-side gain; no copyback store/load gain alone | Rejected for 200 MHz in original form: matched baseline WNS +0.011 ns, candidate −1.160 ns, 3,275 setup failures. LUTs 93,896 → 92,618. |
 | Guaranteed early integer wake, `5c971456`, measured at `b99636f4` | See early-wake column | Matched core OOC 200 MHz pass: WNS +0.030 ns, WHS +0.021 ns, no failing endpoints; default off pending integration. |
-| Combined fall-through + early wake | See combined column and full-corpus ranges | Repaired combined implementation in timing queue; default off. |
-| Payload-selection timing repair, `b99636f4` | **0% change:** all 104 benchmark rows have identical macro and cycle counts before/after | Timing pending; no Fmax recovery claimed. |
+| Combined fall-through + early wake | See combined column and full-corpus ranges | Repaired implementation passes core OOC 200 MHz: WNS +0.002 ns, WHS +0.021 ns; default off pending integration. |
+| Payload-selection timing repair, `b99636f4` | **0% change:** all 104 benchmark rows have identical macro and cycle counts before/after | Combined implementation now passes the matched core OOC gate; no isolated fall-through-only timing result claimed. |
 | Macro-counter correction, `b0eeabaa` | Measurement correction, not an RTL speedup; removed extra call/return counts | Use corrected figures only. |
 | Warm-window harness extension, based on `b99636f4` | **0% change:** all 104 existing benchmark rows unchanged with default warm-up 0 | Test-only change; new baseline below. |
 
 Timing above is core out-of-context at 5 ns on `xcku5p-ffvb676-2-e`, not complete
 SoC signoff. Hold and pulse width passed in the original fall-through run.
-The repaired baseline/early-wake/combined matrix is still running.
+The repaired baseline/early-wake/combined matrix has completed.
 
-Update, 2026-09-21: baseline and early-wake modes at pinned `b99636f4` have
-finished; combined is still running. Baseline/early-wake routed resource counts
+Update, 2026-09-21: all three modes at pinned `b99636f4` have
+finished. Baseline/early-wake routed resource counts
 are respectively 93,896/94,283 LUTs (+387, about 0.41%), 38,740/38,727 FFs, and
 37/37 BRAM tiles. Baseline setup/hold slack is +0.011/+0.023 ns; early-wake is
 +0.030/+0.021 ns. Both have zero setup/hold/pulse-width failing endpoints and
@@ -173,6 +173,15 @@ meet this 200 MHz gate with a small LUT increase; the 19 ps WNS difference is no
 claimed as a reproducible Fmax improvement. Reports are `fullcore_route_timing.rpt`
 and `fullcore_route_util.rpt` under the matrix's `baseline/synth` and
 `earlywake/synth` directories.
+
+Combined mode finished at 00:41 local: 92,814 LUTs (1,082 fewer than baseline,
+about 1.15%), 38,733 FFs, 37 BRAM tiles. Setup/hold/pulse-width slack is
++0.002/+0.021/+1.958 ns, with zero failing endpoints. Report paths are under
+`combined/synth`. The repaired combined candidate retains its measured IPC gains
+while passing the core timing screen and reducing LUT use; the 2 ps setup margin
+is very small and does not establish full-SoC closure or board correctness.
+This is why the IPC-positive mechanism was retained after its original timing
+failure instead of being abandoned.
 
 Correctness: repaired RTL passed 28 focused LSU cases, 29 selected oracle cases,
 104 L2/DDR benchmark configurations, and the fast gate (381 passed, two ignored).
@@ -287,6 +296,63 @@ LOCKSTEP_SQ_SUBWORD=1 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt
 Build monitoring uses the single tmux window `build-logs:0`; reuse it for future
 build logs instead of creating per-build windows. Keep the active Codex window
 separate and untouched.
+
+## Correct-branch dual retirement — 2026-09-21
+
+Prototype based on `0ba42930`, default-off `pairCorrectBranch`, relaxes only the
+slot-0 correct, macro-final branch barrier. Slot 1 must remain a non-branch and
+pass all existing precise-state/cold-path gates. No extra predictor training
+port or out-of-order architectural visibility is introduced. All earlier LSU
+options are off in this experiment.
+
+Matched warmed windows, seeds 1/17, L2 hit 5 cycles / DDR 70 cycles:
+
+| Kernel | Macros | Baseline cycles | Paired cycles | Baseline → paired IPC |
+| --- | ---: | ---: | ---: | --- |
+| Hot loop | 336 | 252 | 252 | 1.333333 → 1.333333 |
+| Alternating branch, seed 1 | 132 | 135 | 136 | 0.977778 → 0.970588 |
+| Alternating branch, seed 17 | 132 | 234 | 235 | 0.564103 → 0.561702 |
+| Deep backlog | 360 | 425 | 426 | 0.847059 → 0.845070 |
+| Copyback call/return | 672 | 1342 | 1342 | 0.500745 → 0.500745 |
+| Independent ALU | 396 | 267 | 267 | 1.483146 → 1.483146 |
+| Alternating branch, long | 2112 | 2170 | 2169 | 0.973272 → 0.973721 |
+| Deep backlog, long | 2520 | 2660 | 2661 | 0.947368 → 0.947012 |
+
+Both seeds agree except where explicitly separated. The long alternating test
+warms 128 of 512 iterations; the long backlog test warms 16 of 128. All 28
+instrumentation-off/on controls have identical cycles and checked final values.
+The option actually pairs 168 branches in the call/return window, 421 in the
+long alternating window and 168 in the long backlog window. Yet the call/return
+runtime is unchanged: exposed head-incomplete cycles rise from 671 to 755 as
+pairing advances retirement into the next wait. Pair counts alone overstate the
+opportunity.
+
+The one-cycle differences are recorded, not rounded away: short alternating
+windows begin one cycle earlier and finish on the same cycle; backlog windows
+begin two cycles earlier and finish one earlier. The long alternating window
+begins at the same cycle and finishes one earlier. These results do not establish
+a meaningful steady-state throughput improvement. **Park this version, leave it
+off by default, and do not queue synthesis ahead of IPC-positive candidates.**
+This does not rule out wider/bulk retirement under a different bottleneck.
+
+Branch misses are identical with the option off/on. Longer alternating windows
+converge across seeds to 25/768 misses (96.745% accuracy), unlike the short window's
+2/48 versus 11/48. Long backlog remains 29/224 (87.054%). These synthetic results
+are not representative-workload branch-accuracy signoff.
+
+Correctness: 18 directed off/on ROB simulations pass (correct/mispredict,
+successor branch/fault/privilege/system/RTE, macro boundary, debug stop), including
+one training event and final next-PC checks. Five enabled-option oracle tests
+pass (BSR/RTS, interleaved redirects, stale BTB, RTD, conditional branch after RTE).
+Fast gate passes: 382 tests, zero failures, two ignored. No synthesis or board gain is
+claimed for this candidate.
+
+Evidence: `/tmp/branch-pair-unit.log`, `/tmp/branch-pair-baseline-long.log`,
+`/tmp/branch-pair-candidate-long.log`, `/tmp/branch-pair-oracle.log`,
+`/tmp/branch-pair-fast.log`. Reproduce the profile with
+`IPC_MEM=l2:5:70 sbt 'testOnly m68k040.bench.PipelineProfileSpec'`, then repeat
+with `IPC_PAIR_BRANCH=1`. The printed `baselineCycles` is the instrumentation-off
+control of the **same RTL option**, not the other RTL arm; compare separate logs.
 
 ## Next investigations requested — 2026-09-21
 

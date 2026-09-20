@@ -333,7 +333,8 @@ trait CoreBenchHarness extends AnyFunSuite {
 
   class FullCoreDut(alignedLoadFallThrough: Boolean = false,
                     earlyLsIntWakeup: Boolean = false,
-                    sqSubwordForwarding: Boolean = false) extends Component {
+                    sqSubwordForwarding: Boolean = false,
+                    pairCorrectBranch: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -357,7 +358,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val dec    = new DecodeStage
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
-    val rob    = new RobPlugin
+    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
     val iq     = new IssueQueuePlugin
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
@@ -423,9 +424,10 @@ trait CoreBenchHarness extends AnyFunSuite {
   final case class RobCycle(occupancy: Int = 0, completePrefix: Int = 0,
                            completeYounger: Int = 0, headIncomplete: Boolean = false,
                            retires: Int = 0, branchPairPotential: Boolean = false,
-                           headPc: Long = 0L)
+                           headPc: Long = 0L, pairedBranch: Boolean = false)
   final case class PipelineProfile(branches: Vector[RetiredBranchStats],
-                                   rob: Vector[RobCycle], robDepth: Int) {
+                                   rob: Vector[RobCycle], robDepth: Int,
+                                   firstCycle: Int, lastCycle: Int) {
     def retiredBranches: Int = branches.map(_.retired).sum
     def branchMisses: Int = branches.map(_.misses).sum
     // Aggregate prediction failure (direction OR target), not direction-only.
@@ -438,6 +440,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     def completedBacklogCycles: Int = rob.count(s => s.headIncomplete && s.completeYounger > 0)
     def dualWithExtraCompleteCycles: Int = rob.count(s => s.retires == 2 && s.completePrefix > 2)
     def branchPairPotentialCycles: Int = rob.count(_.branchPairPotential)
+    def pairedBranchCycles: Int = rob.count(_.pairedBranch)
   }
 
   final case class IpcResult(
@@ -834,7 +837,8 @@ trait CoreBenchHarness extends AnyFunSuite {
             !rob.p1.needsSup.toBoolean && !rob.p1.sysOp.toBoolean && !rob.p1.isRte.toBoolean
           precedingRobCycle = RobCycle(occupancy, complete.takeWhile(identity).size,
             complete.drop(1).count(identity), complete.headOption.contains(false), rawRetires,
-            branchPairPotential, if (occupancy > 0) rob.p0.pc.toLong & 0xffffffffL else 0L)
+            branchPairPotential, if (occupancy > 0) rob.p0.pc.toLong & 0xffffffffL else 0L,
+            rawRetires == 2 && rob.p0.retireAlone.toBoolean)
         }
         // Exception channel: not exercised by these kernels, but feed it for safety.
         locally {
@@ -1043,7 +1047,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           case ((pc, kind), events) =>
             RetiredBranchStats(pc, kind, events.size, events.count(_._3), events.count(_._4))
         }
-        val profile = PipelineProfile(branches, robHisto.slice(lo, hi + 1).toVector, dut.rob.logic.depth)
+        val profile = PipelineProfile(branches, robHisto.slice(lo, hi + 1).toVector, dut.rob.logic.depth, lo, hi)
         assert(profile.rob.size == windowCycles)
         println(f"[pipeline-window] ${k.name} macros=$windowRetired cycles=$windowCycles " +
           f"branches=${profile.retiredBranches} misses=${profile.branchMisses} " +

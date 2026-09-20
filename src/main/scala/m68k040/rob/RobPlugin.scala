@@ -41,9 +41,11 @@ object DebugHaltReasonCode {
   *   (commit committed-RAT + free old pdsts) and exposes CommitTrace + commitObs.
   * - Flush: squash all in-flight entries (tail := head, count := 0).
   *
-  * retireAlone entries (branches, for now) retire 1-wide.
+  * retireAlone entries (branches, for now) retire 1-wide by default; the optional
+  * correct-head-branch experiment allows one eligible non-branch successor.
   */
-class RobPlugin(val detailedPerf: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService {
+class RobPlugin(val detailedPerf: Boolean = false,
+                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService {
   private var perfEventsWire: Option[Bits] = None
   private var perfRetirementWire: Option[Bits] = None
   during setup {
@@ -1300,7 +1302,13 @@ class RobPlugin(val detailedPerf: Boolean = false) extends FiberPlugin with Comm
       // way costs nothing and removes any ambiguity.
       h0PreciseCompletedSticky := True
     }
-    val retire1 = retire0 && (count > 1) && completes(h1) && !p0.retireAlone && !p1.retireAlone &&
+    // Optional hot-path relaxation: only a resolved correct branch in slot 0,
+    // ending its macro. Slot 1 remains non-branch, preserving one training port.
+    // All precise-state and debug/trace barriers below are unchanged.
+    val headAllowsPair = if (pairCorrectBranch)
+      !p0.retireAlone || (!mispredictStore(h0) && p0.last)
+    else !p0.retireAlone
+    val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
                   !(haltAfterArmedIn && h0IsMacroLast) &&
@@ -2311,7 +2319,8 @@ class RobPlugin(val detailedPerf: Boolean = false) extends FiberPlugin with Comm
     //
     // It cannot happen today: `phtValidStore` is written ONLY by `branchCompletion`, a
     // branch µop has `isBranch` hence `retireAlone` (see the alloc write), and `retire1`
-    // requires `!p0.retireAlone && !p1.retireAlone`. But that chain was backed only by a
+    // always requires `!p1.retireAlone`, even with optional correct-head-branch pairing.
+    // But that chain was backed only by a
     // comment ("branches are retireAlone → always slot 0"), and it spans three files. A
     // future µop that reaches the branch EU without `isBranch`, or a relaxation of
     // `retire1`, reopens it with no other symptom. Sim-only, zero netlist cost.

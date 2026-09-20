@@ -118,8 +118,12 @@ The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes:
 
 The original matched run's baseline at `ab849ea7` completed core OOC routing:
 setup WNS +0.011 ns, hold WHS +0.023 ns, pulse-width slack +1.958 ns, with zero
-failing endpoints in all three categories. Its candidate arm is still pending;
-this baseline result says nothing yet about the optimizations' timing impact.
+failing endpoints in all three categories. The original fall-through candidate
+later failed setup; the repaired `b99636f4` combined candidate subsequently passed
+at +0.002 ns setup / +0.021 ns hold, with 1,082 fewer LUTs than baseline and
+unchanged measured IPC versus its pre-repair implementation. Early wake alone
+passed at +0.030 ns setup. These are core OOC results, not full-SoC signoff;
+see the [experiment ledger](ipc-experiments.md) for matched reports and counts.
 
 The timing launcher accepts `LS_LATENCY_MODES="baseline combined"` for a matched
 comparison including `--early-ls-int-wakeup`; `earlywake` and `fallthrough` are

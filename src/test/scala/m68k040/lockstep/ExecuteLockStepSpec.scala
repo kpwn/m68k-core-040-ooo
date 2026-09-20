@@ -502,7 +502,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dec    = new DecodeStage
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
-    val rob    = new RobPlugin
+    val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
     val iq     = new IssueQueuePlugin
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin

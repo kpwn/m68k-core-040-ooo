@@ -70,3 +70,25 @@ timing and area. No benefit is claimed before these measurements.
 Related primary research: [Checkpoint Processing and Recovery (MICRO 2003)](https://www.microarch.org/micro36/html/pdf/akkary-CheckpointProcessing.pdf)
 studies checkpoint-based bulk retirement and register reclamation. The proposal
 here is a smaller ROB-preserving experiment, not an implementation of that paper.
+
+## Optional correct-branch pairing experiment
+
+`pairCorrectBranch` defaults off. When enabled, a completed, non-faulting,
+correctly predicted slot-0 branch that closes its macro may retire with an
+otherwise-eligible slot-1 non-branch. This amends only the blanket rule that a
+branch in slot 0 always excludes a second retiree. A slot-1 branch is still
+forbidden, so BTB/PHT/history updates retain exactly one slot-0 producer.
+
+Mispredicts, incomplete or exceptional successors, privileged/system/RTE paths,
+precise-store boundaries, trace, single-step and pending debug-stop rules retain
+their existing gates. Branch target completion must already have arrived. Do not
+replace the resolved mispredict bit with a speculative prediction-confidence bit.
+Both ordinary commit/free lanes and their last-writer ordering remain unchanged.
+The architectural resume PC and final flag state must include the second retiree;
+the branch's training record must still name slot 0, even as head advances by two.
+
+This is a controlled comparison with prepared bulk retirement, not permission
+for out-of-order architectural visibility. Required checks include exact BTB/PHT
+updates, correct/mispredicted branches, return/A7 updates, successor exceptions,
+debug/trace boundaries and matched warmed IPC. Synthesis is queued separately
+after correctness/IPC testing; a simulation pass does not establish 200 MHz.

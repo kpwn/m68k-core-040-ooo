@@ -809,7 +809,8 @@ object GenFullCoreSynthVerilog {
                 debugEnable: Boolean = true, debugStage: Int = 2,
                 alignedLoadFallThrough: Boolean = false,
                 earlyLsIntWakeup: Boolean = false,
-                sqSubwordForwarding: Boolean = false): Unit = {
+                sqSubwordForwarding: Boolean = false,
+                pairCorrectBranch: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -841,7 +842,7 @@ object GenFullCoreSynthVerilog {
           new DecodeStage(),
           new RenameStage(),
           new DispatchPlugin(),
-          new RobPlugin(),
+          new RobPlugin(pairCorrectBranch = pairCorrectBranch),
           new IssueQueuePlugin(),
           eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
@@ -870,12 +871,13 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding")),
-      "expected --aligned-load-fall-through, --early-ls-int-wakeup and/or --sq-subword-forwarding")
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch")),
+      "expected --aligned-load-fall-through, --early-ls-int-wakeup, --sq-subword-forwarding and/or --pair-correct-branch")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
       earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"),
-      sqSubwordForwarding = args.contains("--sq-subword-forwarding"))
+      sqSubwordForwarding = args.contains("--sq-subword-forwarding"),
+      pairCorrectBranch = args.contains("--pair-correct-branch"))
   }
 }
 

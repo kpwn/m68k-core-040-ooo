@@ -153,7 +153,13 @@ without adding a second training port. Audit next-PC, T0 trace and single-step
 assumptions explicitly. Precompute branch eligibility if its resolution flags
 lengthen the retirement gate.
 **Experiment:** hot loops and branch-heavy code, count otherwise-eligible pairs
-lost to `retireAlone`, then matched IPC. **Priority: high, potentially cheap.**
+lost to `retireAlone`, then matched IPC. **Priority: parked after the first experiment.**
+The optional `pairCorrectBranch` prototype successfully pairs 168 branches in the
+call/return window but saves zero cycles. Seven kernels, two seeds, including
+longer warmed branch/backlog windows, show at most a one-cycle window difference
+in either direction. See `ipc-experiments.md`; structural pairing opportunities
+are not equivalent to throughput gains. Default remains off, with no timing run
+queued for this version.
 
 ### 7. Compact retirement records for selected cracked macros
 
@@ -265,7 +271,10 @@ load timing; a pipeline stage that returns the gained cycle is not a repair.
 **Cost / timing repair:** consolidate duplicate descriptors/rechecks where proven
 redundant. Existing fall-through and early-wake candidates are the starting point,
 not a claim that the whole path is solved. The original fall-through missed timing;
-the payload-select repair retained every measured cycle count and is being routed.
+the payload-select repair retained every measured cycle count. Matched core-only
+routing at `b99636f4` passed 200 MHz: baseline +11 ps, early-wake +30 ps, combined
++2 ps setup slack, all with zero hold/pulse failures. Combined uses 1,082 fewer
+LUTs than baseline. This is not integrated-SoC timing or board validation.
 **Experiment:** pointer recurrence, independent loads, calls/returns, L1 misses,
 same IPC windows and end-to-end critical path. **Priority: high, already in progress.**
 

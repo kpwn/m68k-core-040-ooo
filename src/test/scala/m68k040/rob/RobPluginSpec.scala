@@ -29,12 +29,12 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ── Simple DUT: fake rename source + rob + fake commit sink + trace sink ──────
-  class SimpleDut extends Component {
+  class SimpleDut(pairCorrectBranch: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
     val drv  = new RobAllocDriverPlugin
-    val rob  = new RobPlugin
+    val rob  = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
     val csink = new RenameCommitSinkPlugin
     val tsink = new CommitTraceSinkPlugin
     val cacheCtrl = new CacheControlSinkPlugin
@@ -166,6 +166,68 @@ class RobPluginSpec extends AnyFunSuite {
       // head advances by 2 -> after this cycle ROB empty
       cd.waitSampling()
       assert(dut.rob.logic.count.toInt == 0, s"count after 2-wide retire = ${dut.rob.logic.count.toInt}")
+    }
+  }
+
+  test("optional correct-branch pairing retains single training and cold barriers") {
+    for (enabled <- Seq(false, true)) {
+      val compiled = M68kSim().compile(new SimpleDut(pairCorrectBranch = enabled))
+      for (scenario <- Seq("correct", "mispredict", "next-branch", "next-fault",
+        "next-privileged", "next-system", "next-rte", "not-macro-last", "debug-stop")) {
+        compiled.doSim(s"pair_${enabled}_$scenario", 1) { dut =>
+          val cd = dut.clockDomain; cd.forkStimulus(10)
+          initSimple(dut, cd)
+          dut.rob.logic.branchCompletion.valid #= false
+          pokeRu(dut.rsrc.logic.src.payload(0), pc = 0x100, isBranch = true,
+            firstOfInstr = true, lastOfInstr = scenario != "not-macro-last")
+          val next = dut.rsrc.logic.src.payload(1)
+          pokeRu(next, pc = 0x200, dstArch = 4, pdst = 21, pdstValid = true,
+            pdstOld = 4, isBranch = scenario == "next-branch", firstOfInstr = true)
+          if (scenario == "next-fault") { next.faulted #= true; next.faultVector #= 4 }
+          if (scenario == "next-privileged") next.needsSupervisor #= true
+          if (scenario == "next-system") next.sysOp #= true
+          if (scenario == "next-rte") next.isRte #= true
+          dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+          cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+          dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+          cd.waitSampling()
+          markComplete(dut, 1)
+          cd.waitSampling(); clearComplete(dut)
+          if (scenario == "debug-stop") dut.rob.logic.debugStopRequestIn #= true
+          val bc = dut.rob.logic.branchCompletion
+          bc.valid #= true
+          bc.payload.robId #= 0; bc.payload.mispredict #= (scenario == "mispredict")
+          bc.payload.nextPc #= 0x200
+          bc.payload.isBranch #= true; bc.payload.btbPc #= 0x100
+          bc.payload.btbTaken #= true; bc.payload.btbTarget #= 0x200
+          bc.payload.brType #= 0; bc.payload.btbLen #= 1
+          bc.payload.phtValid #= true; bc.payload.phtIndex #= 7
+          cd.waitSampling(); bc.valid #= false
+          cd.waitSamplingWhere(dut.tsink.logic.fireOut(0).toBoolean)
+          val shouldPair = enabled && scenario == "correct"
+          assert(dut.tsink.logic.fireOut(1).toBoolean == shouldPair,
+            s"enabled=$enabled scenario=$scenario unexpected second retirement")
+          assert(dut.tsink.logic.traceOut(0).pc.toLong == 0x200)
+          if (shouldPair) {
+            assert(dut.csink.logic.commitValidOut(1).toBoolean)
+            assert(dut.csink.logic.commitOldOut(1).toInt == 4)
+            assert(dut.tsink.logic.traceOut(1).pc.toLong == 0x202)
+          }
+          cd.waitSampling()
+          assert(dut.rob.logic.btbUpdateFlow.valid.toBoolean)
+          assert(dut.rob.logic.btbUpdateFlow.payload.pc.toLong == 0x100)
+          assert(dut.rob.logic.btbUpdateFlow.payload.target.toLong == 0x200)
+          assert(dut.rob.logic.gshareUpdateFlow.valid.toBoolean)
+          assert(dut.rob.logic.gshareUpdateFlow.payload.index.toInt == 7)
+          if (shouldPair) {
+            assert(dut.rob.logic.count.toInt == 0)
+            assert(dut.rob.logic.debugLivePcReg.toLong == 0x202)
+            cd.waitSampling()
+            assert(!dut.rob.logic.btbUpdateFlow.valid.toBoolean)
+            assert(!dut.rob.logic.gshareUpdateFlow.valid.toBoolean)
+          }
+        }
+      }
     }
   }
 

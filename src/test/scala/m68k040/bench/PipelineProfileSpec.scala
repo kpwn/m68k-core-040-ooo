@@ -23,9 +23,18 @@ class PipelineProfileSpec extends CoreBenchHarness {
     val calls = kCallReturn.copy(copybackDtt = true, warmupInstrs = 5 + 16 * 8,
       verifyRetirement = checkRegisters(0 -> 100L, 2 -> 0L, 3 -> 100L, 7 -> 0L))
     val independent = kIndependentAlu.copy(warmupInstrs = 32)
+    val alternatingLong = kBranchy.copy(name = "branchy-long",
+      src = kBranchy.src.replace("moveq #40,%d7", "move.l #512,%d7"),
+      retiredInstrs = 5 + 512 * 11 / 2, warmupInstrs = 5 + 128 * 11 / 2,
+      verifyRetirement = checkRegisters(0 -> 256L, 6 -> 0L, 7 -> 0L))
+    val backlogLong = kDeepBacklog.copy(name = "deep-backlog-long",
+      src = kDeepBacklog.src.replace("moveq #20,%d7", "move.l #128,%d7"),
+      retiredInstrs = 7 + 128 * 45 / 2, warmupInstrs = 7 + 16 * 45 / 2,
+      verifyRetirement = checkRegisters(0 -> 64L, 2 -> 0L, 7 -> 0L))
     val cases = Seq(hot -> 84, alternating -> 48, backlog -> 32,
-      calls -> 252, independent -> 0)
-    val compiled = M68kSim().withVerilator.compile(new FullCoreDut)
+      calls -> 252, independent -> 0, alternatingLong -> 768, backlogLong -> 224)
+    val pairBranches = sys.env.get("IPC_PAIR_BRANCH").contains("1")
+    val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,
@@ -39,8 +48,12 @@ class PipelineProfileSpec extends CoreBenchHarness {
       assert(p.rob.forall(s => s.completePrefix <= s.occupancy && s.completeYounger < math.max(1, s.occupancy)))
       assert(p.branches.forall(b => b.misses <= b.retired && b.taken <= b.retired))
       if (expectedBranches == 0) assert(p.branchAccuracy.isEmpty)
+      if (!pairBranches) assert(p.pairedBranchCycles == 0)
+      if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
+        s"pairBranches=$pairBranches " +
+        s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +
         s"macros=${measured.retiredInstrs} baselineCycles=${control.windowCycles} cycles=${measured.windowCycles} " +
         f"IPC=${measured.ipc}%.6f branches=${p.retiredBranches} misses=${p.branchMisses} accuracy=$accuracy " +
         s"noPairCapacity=${p.noPairCapacityCycles} headIncomplete=${p.headIncompleteCycles} " +
