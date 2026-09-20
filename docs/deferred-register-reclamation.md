@@ -34,6 +34,8 @@ Added cost is two ID/valid registers per class; reuse latency increases one cycl
 
 Status: investigation requested, not implemented. This is distinct from the
 registered two-lane reclamation above and from a PNR safety frontier.
+The [design-alternatives evaluation](ipc-design-options.md) compares this proposal
+with wider retirement, checkpoint schemes and changes that remove head stalls.
 
 The proposed side buffer prepares a contiguous retirement batch while its oldest
 instruction is blocked. Fold destination mappings in program order into a shadow

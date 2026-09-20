@@ -6,6 +6,7 @@ Start with the [core README](../README.md) for build commands and board status.
 - [ISA completion and microcode](superpowers/specs/2026-06-12-isa-completion-microcode-architecture-design.md)
 - [Debug trace taps](debug-trace-taps.md)
 - [IPC experiment ledger](ipc-experiments.md)
+- [IPC at 200 MHz: fifteen design alternatives](ipc-design-options.md)
 - [Memory-dependency design and integration status](memory-dependencies.md)
 - [Synthesis tooling](../synth/README.md)
 - [Third-party notices](../THIRD_PARTY_NOTICES.md)

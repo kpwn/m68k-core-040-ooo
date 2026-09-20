@@ -5,6 +5,12 @@ experiments. Before/after measurements must use the same workload, seeds,
 memory configuration and retirement window. An unmeasured candidate is pending,
 not an improvement. Simulation IPC is not board IPC or proof of preserved Fmax.
 
+Selection policy: prefer lower complexity and higher useful throughput at routed
+200 MHz. A first timing miss does not discard an IPC-positive mechanism: retain
+it as a research candidate and log each specific timing repair and its IPC cost.
+The [fifteen design alternatives](ipc-design-options.md) are evaluated proposals,
+not fifteen implemented or benchmarked improvements.
+
 For each new experiment record:
 
 - Baseline and candidate revisions, dirty changes if any, and option settings.
@@ -42,7 +48,7 @@ Candidate history and disposition:
 | Candidate | IPC result | Timing / disposition |
 | --- | --- | --- |
 | Descriptor fall-through, `ab849ea7` | Load-side gain; no copyback store/load gain alone | Rejected for 200 MHz in original form: matched baseline WNS +0.011 ns, candidate −1.160 ns, 3,275 setup failures. LUTs 93,896 → 92,618. |
-| Guaranteed early integer wake, `5c971456` | See early-wake column | Routed result pending; default off. |
+| Guaranteed early integer wake, `5c971456`, measured at `b99636f4` | See early-wake column | Matched core OOC 200 MHz pass: WNS +0.030 ns, WHS +0.021 ns, no failing endpoints; default off pending integration. |
 | Combined fall-through + early wake | See combined column and full-corpus ranges | Repaired combined implementation in timing queue; default off. |
 | Payload-selection timing repair, `b99636f4` | **0% change:** all 104 benchmark rows have identical macro and cycle counts before/after | Timing pending; no Fmax recovery claimed. |
 | Macro-counter correction, `b0eeabaa` | Measurement correction, not an RTL speedup; removed extra call/return counts | Use corrected figures only. |
@@ -51,6 +57,18 @@ Candidate history and disposition:
 Timing above is core out-of-context at 5 ns on `xcku5p-ffvb676-2-e`, not complete
 SoC signoff. Hold and pulse width passed in the original fall-through run.
 The repaired baseline/early-wake/combined matrix is still running.
+
+Update, 2026-09-21: baseline and early-wake modes at pinned `b99636f4` have
+finished; combined is still running. Baseline/early-wake routed resource counts
+are respectively 93,896/94,283 LUTs (+387, about 0.41%), 38,740/38,727 FFs, and
+37/37 BRAM tiles. Baseline setup/hold slack is +0.011/+0.023 ns; early-wake is
++0.030/+0.021 ns. Both have zero setup/hold/pulse-width failing endpoints and
++1.958 ns minimum pulse-width slack. These are matched core-only reports, not
+board or SoC signoff. They demonstrate an IPC-positive early-wake candidate can
+meet this 200 MHz gate with a small LUT increase; the 19 ps WNS difference is not
+claimed as a reproducible Fmax improvement. Reports are `fullcore_route_timing.rpt`
+and `fullcore_route_util.rpt` under the matrix's `baseline/synth` and
+`earlywake/synth` directories.
 
 Correctness: repaired RTL passed 28 focused LSU cases, 29 selected oracle cases,
 104 L2/DDR benchmark configurations, and the fast gate (381 passed, two ignored).
