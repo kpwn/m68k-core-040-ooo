@@ -9,7 +9,7 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
   // The I-side model deliberately randomizes bytes outside the image. A
   // predicted fall-through at loop warm-up must encounter harmless code, not
   // random memory instructions that contaminate the access-order measurement.
-  private val guard = " ; .Lend: bra.s .Lend ; .rept 64 ; nop ; .endr"
+  private val guard = " ; .LlatencyGuard: bra.s .LlatencyGuard ; .rept 64 ; nop ; .endr"
   private def pointerChain: Kernel = {
     val iters = 64
     val setup = Seq("lea 0x4000,%a0", s"moveq #$iters,%d7",
@@ -33,7 +33,9 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
     val mixed = kSameLineCopyback
     val kernels = Seq(pointerChain,
       stream.copy(src = stream.src + guard, copybackDtt = true),
-      mixed.copy(src = mixed.src + guard))
+      mixed.copy(src = mixed.src + guard)) ++
+      Seq(kDependentAlu, kIndependentAlu, kHotLoop, kLoadStore, kMixed,
+        kStoreStream, kCallReturn).map(k => k.copy(src = k.src + guard))
     val seeds = Seq(1, 17)
     val modes = Seq((false, false), (true, false), (false, true), (true, true))
     val results = modes.map { case (enabled, earlyWake) =>
@@ -59,14 +61,16 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         (k.name, seed) -> r
       }).toMap
     }
-    for(seed <- seeds; mode <- 1 until modes.size) {
-      val before = results(0)((pointerChain.name, seed))
-      val after = results(mode)((pointerChain.name, seed))
+    for(k <- kernels; seed <- seeds; mode <- 1 until modes.size) {
+      val before = results(0)((k.name, seed))
+      val after = results(mode)((k.name, seed))
       assert(after.retiredInstrs == before.retiredInstrs,
-        "matched pointer chase windows retired different instruction counts")
-      assert(after.windowCycles < before.windowCycles,
-        s"shorter LSU path did not improve dependent-load full-core IPC for seed $seed")
-      println(f"LS_FULL_CORE_GAIN mode=${modes(mode)} seed=$seed pointerChase=${after.ipc / before.ipc - 1}%.6f")
+        s"matched ${k.name} windows retired different instruction counts")
+      if(k.name == pointerChain.name) {
+        assert(after.windowCycles < before.windowCycles,
+          s"shorter LSU path did not improve dependent-load full-core IPC for seed $seed")
+      }
+      println(f"LS_FULL_CORE_GAIN mode=${modes(mode)} seed=$seed kernel=${k.name} gain=${after.ipc / before.ipc - 1}%.6f memory=$memLabel")
     }
   }
 }

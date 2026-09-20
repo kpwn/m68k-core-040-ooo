@@ -124,3 +124,43 @@ this baseline result says nothing yet about the optimizations' timing impact.
 The timing launcher accepts `LS_LATENCY_MODES="baseline combined"` for a matched
 comparison including `--early-ls-int-wakeup`; `earlywake` and `fallthrough` are
 also available as individual arms.
+
+## Broader correctness and performance coverage
+
+An additional 25 selected lock-step cases pass with both options enabled,
+covering MOVEM addressing/unaligned accesses, page crossings and partial faults,
+page-fault and write-protect recovery, partial-register loads and DIVREM across
+mispredictions. These complement, rather than replace, the earlier eight cases.
+
+The IPC comparison now includes ten kernels, two seeds and all four option
+combinations. Broader coverage exposed a measurement defect: the histogram
+excluded temporary loads but failed to honor the oracle's drop/keep markers,
+counting BSR's internal stack push as an additional instruction. It now derives
+each cycle's macro count directly from `WhiteboxCapture.emitted` and ends at the
+requested instruction boundary, excluding later guard/drain retirements. Every
+run asserts the exact macro count, and every A/B comparison requires equal counts.
+
+All 80 ideal-memory simulations pass. The original three load-focused results
+above are unchanged by the counter fix. Combined-option call/return gains are
+11.41–12.53% over 805 architectural instructions; dependent/independent ALU,
+hot-loop, same-address load/store and mixed kernels are unchanged. Store-stream
+improvement is only about 0.21%. This is evidence that the load optimizations do
+not solve every IPC bottleneck; store dependency tracking remains separate work.
+
+All 80 simulations also pass with `IPC_MEM=l2:5:70` (modeled 5-cycle L2 hits,
+70-cycle DDR, applied to both instruction and data memory). Combined-option
+gains across seeds 1 and 17 are:
+
+| Kernel | IPC gain with modeled L2/DDR |
+| --- | ---: |
+| Dependent pointer chase | 21.10–21.34% |
+| Independent loads | 15.85–15.92% |
+| Same-line disjoint store/load | 7.46–8.38% |
+| Call/return | 8.27–10.40% |
+| Store stream | 0.16% |
+| ALU, hot loop, same-address load/store, mixed | 0% |
+
+These are short full-core windows including warm-up, not system-level Dhrystone
+results. No default RTL setting changed in this expanded measurement pass.
+The required fast gate was rerun after the histogram fix and corpus expansion:
+381 passed, zero failed, two ignored.

@@ -553,12 +553,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       val handle = new WhiteboxCapture.Handle
 
       // Per-cycle MACRO-commit histogram, trimmed to [first-commit, last-commit]
-      // after the run (steady-state). To get a MACRO (not µop) histogram we mirror
-      // WhiteboxCapture's temp-only rule: a cracked-load temp µop (dstArch >= 16,
-      // int-write only, no flags) is the leading load of a [load, op] crack and is
-      // NOT counted as a macro instruction. We classify each committing robId by
-      // the persistent writeback observed for it (writeback may precede commit).
+      // after the run. Use WhiteboxCapture's authoritative emitted count, including
+      // drop/keep markers for stack pushes and other multi-uop instructions.
+      // End at the requested macro count, excluding guard-code retirements while
+      // the harness waits for final stores to drain.
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
+      var countedMacros = 0
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
@@ -569,7 +569,6 @@ trait CoreBenchHarness extends AnyFunSuite {
       val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
       var firstCommitCycle = -1L
       var lastCommitCycle  = -1L
-      val wbMap = scala.collection.mutable.HashMap[Int, WhiteboxCapture.Wb]()
 
       // COPYBACK-store throughput observability.  Count real handshakes at every
       // boundary; a valid pulse is deliberately not enough now that SQ -> D-cache
@@ -620,11 +619,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       var ftbFrameDeclines  = 0
       var ftbBusyDeclines   = 0
 
-      def isTempOnly(wb: WhiteboxCapture.Wb): Boolean =
-        wb.intWrite && wb.dstArch >= 16 && !wb.nzvcWrite && !wb.xWrite
-
-      // Snapshot one EU writeback this cycle: record in wbMap (for macro-classify)
-      // AND feed the lock-step handle (authoritative macro count, sanity).
+      // Feed the lock-step handle, which also owns macro classification.
       def snapWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
         val wb = WhiteboxCapture.Wb(
           dstArch   = w.dstArch.toInt,
@@ -641,7 +636,6 @@ trait CoreBenchHarness extends AnyFunSuite {
           // and reading RMW kernels ~2x.
           divRem     = w.divRem.toBoolean,
           keepCommit = w.keepCommit.toBoolean)
-        wbMap(w.robId.toInt) = wb
         handle.onWb(w.robId.toInt, wb)
       }
 
@@ -716,7 +710,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
             val wb = WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)
-            handle.onWb(bw.robId.toInt, wb); wbMap(bw.robId.toInt) = wb
+            handle.onWb(bw.robId.toInt, wb)
           }
         }
         // Precise-path store completion (Task P2.5): the SQ's at-head drain fires
@@ -729,7 +723,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           val sc = dut.lsEu.sqCompletionPort
           if (sc.valid.toBoolean) {
             val wb = WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)
-            handle.onWb(sc.payload.toInt, wb); wbMap(sc.payload.toInt) = wb
+            handle.onWb(sc.payload.toInt, wb)
           }
         }
 
@@ -739,16 +733,11 @@ trait CoreBenchHarness extends AnyFunSuite {
           flushToCommit += (telemCycle - flushPendingCycle).toInt
           flushPendingCycle = -1L
         }
-        var macrosThisCycle = 0
+        val emittedBefore = handle.emitted
         for (kk <- 0 until 2) {
           val c = dut.rob.logic.commitObs(kk)
           if (c.fire.toBoolean) {
             val id = c.robId.toInt
-            val isMacro = wbMap.get(id) match {
-              case Some(w) => !isTempOnly(w)
-              case None    => true // no writeback seen (e.g. store µop) -> macro
-            }
-            if (isMacro) macrosThisCycle += 1
             handle.onCommit(id, c.pc.toLong & 0xffffffffL)
           }
         }
@@ -758,6 +747,9 @@ trait CoreBenchHarness extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, 0x27, -1L)
         }
 
+        val macrosThisCycle = scala.math.min(handle.emitted - emittedBefore,
+          k.retiredInstrs - countedMacros)
+        countedMacros += macrosThisCycle
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
           lastCommitCycle = totalCycles
@@ -926,6 +918,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // instructions retired across exactly these cycles.
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
+      assert(windowRetired == n,
+        s"[${k.name}] macro histogram counted $windowRetired instructions, expected $n")
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
 
