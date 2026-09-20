@@ -1174,9 +1174,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // the fetch-directed FTB/FTQ (task #126) instead of a speculative BTB read — a 4-bit
     // register compare rather than a 9-way RAM lookup. We still do NOT defer a
     // predicted-NOT-taken slot1 conditional (only slot0's GHR bit shifts if both slot0
-    // and slot1 are conditionals emitted the same cycle; slot1's history bit is lost —
-    // a pure ACCURACY imperfection, not a correctness bug, since each conditional
-    // carries its OWN fetch-time phtIndex down for the retire-time train).
+    // and slot1 are conditionals emitted the same cycle). Slot1 has no prediction
+    // metadata at all: it neither shifts history nor trains the PHT. This is an
+    // accuracy limitation, not architectural corruption; branch execution checks
+    // its implicit not-taken prediction. See the inert-tag invariant below.
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -1568,8 +1569,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // condBtbHit0, not the taken-only fallback detector/action), with the predicted bit.
     // We shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
     // next cycle (slot1WouldFtq / slot1WouldRasPred); a slot1 not-taken conditional that co-emits with slot0
-    // simply loses its GHR bit (accept-corruption — its carried phtIndex still trains the
-    // right entry at retire, so correctness is unaffected). The lookup index used the GHR
+    // has neither a GHR bit nor a PHT training index (slot1's prediction tag is inert).
+    // The slot0 lookup index used the GHR
     // BEFORE this shift; the carried phtIndex (stamped above) matches. The GHR IS now
     // repaired on a commit flush -- see GsharePlugin's `ghrArch`/`flushRepair`; this
     // shift set and the `phtValid` stamp set above are deliberately identical so that

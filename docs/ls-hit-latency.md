@@ -239,5 +239,6 @@ replay collision and exactly-once completion assertions remain intact and pass.
 
 The payload repair passes all 28 focused LSU cases, 29 selected oracle cases and
 the 381-test fast gate. All 104 L2/DDR-model benchmark rows have exactly the same
-retired counts and cycle counts before and after the repair. Routed timing is
-still required; identical simulated performance does not prove Fmax preservation.
+retired counts and cycle counts before and after the repair. The matched core-only
+route subsequently passed 200 MHz (combined +2 ps setup); integrated-SoC timing
+and board validation remain required.

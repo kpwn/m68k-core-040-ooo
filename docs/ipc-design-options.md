@@ -1,7 +1,8 @@
 # IPC at 200 MHz: design alternatives
 
-Status: proposal evaluation, not an implementation or a measured speedup.
-RTL inspected at `86273cde`; measurements already obtained are recorded in
+Status: proposal evaluation with individually identified prototype results below;
+the list as a whole is not an implementation or a measured speedup.
+Initial RTL audit at `86273cde`, updated through `982e0b3d`; measurements are recorded in
 [the experiment ledger](ipc-experiments.md). These proposals do not change the
 current architecture contract. Each selected implementation needs its own spec
 amendment and correctness tests first.
@@ -285,6 +286,14 @@ direction, cold startup and history timing. Audit history repair against the
 existing two-tier redirect before growing predictor tables. Then compare modest
 hash/history changes, a small loop predictor, or a compact hybrid only for the
 remaining measured patterns. Separate accuracy from redirect/recovery latency.
+
+The first full-core diagnosis now identifies two concrete leads (see the ledger):
+late repair overwrites conditional-history bits from a Tier-1-refetched frontend
+that Tier 2 keeps, and slot-1 conditionals have inert prediction/training tags.
+In long backlog, all 28 inner-branch misses are untrained instances; in long
+alternating code only four of 24 are. First compare simple slot-1 conditional
+deferral through the existing predictor port, then repair retained history under
+an explicit recovery contract. Neither has an implementation gain yet.
 
 **Cost / timing repair:** deleting redundant repair/stall machinery may beat a
 larger predictor. Registered token-tagged lookup and local history checkpoints

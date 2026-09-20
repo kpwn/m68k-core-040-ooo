@@ -354,6 +354,60 @@ Evidence: `/tmp/branch-pair-unit.log`, `/tmp/branch-pair-baseline-long.log`,
 with `IPC_PAIR_BRANCH=1`. The printed `baselineCycles` is the instrumentation-off
 control of the **same RTL option**, not the other RTL arm; compare separate logs.
 
+## Branch-history and missing-training diagnosis — 2026-09-21
+
+Simulation-only observations on the default RTL at `982e0b3d`, same seven kernels,
+seeds 1/17 and warmed L2/DDR windows as above. No prediction mechanism changed.
+Every macro/cycle count matches the prior disabled-pairing arm. New observations
+are checked against instrumentation-off controls and separate retired-branch
+denominators; the optional detailed event trace is bounded to 1,200 events/run.
+
+Two distinct problems must not be conflated:
+
+1. **Retained frontend history is overwritten.** In the long backlog window,
+   all 28 repairs follow a new conditional-history emission after Tier 1. Tier 2
+   keeps the refetched frontend (`earlySuppressFe`), but the delayed repair installs
+   retirement-only history, omitting that retained emission. No same-edge shift
+   is needed to reproduce the loss. For example, seed 1 emits a taken loop branch
+   at cycle 244, keeps the frontend at 252, and repairs `ghr=3` to `ghrArch=0` at
+   253. That branch trains at 260, so it was not discarded by Tier 2. This falsifies
+   the old comment that refetch latency prevents a legitimate history/repair race.
+   It does not establish an architectural-state failure or quantify the IPC gain
+   from repairing it.
+2. **Slot-1 conditionals can bypass direction prediction and never train it.**
+   Long backlog's inner branch at `0x40800038` retires 112 times, taken 56 times,
+   but only 28 instances carry PHT training metadata. All 28 misses lack it.
+   Its loop branch trains all 112 instances and misses only the final exit.
+   Aligner zeroes both prediction records; FetchAlign stamps only slot 0 and
+   explicitly keeps slot 1's tag inert. Earlier comments claiming slot 1 still
+   trained its carried PHT index were incorrect. This is a concrete admission
+   limitation to investigate before simply enlarging the predictor.
+
+Long alternating branch at `0x40800012` trains 274/384 instances, with 24 misses,
+four untrained. Its loop branch trains 384/384 and misses once. Thus omitted
+training alone does not explain all prediction failures. The long alternating
+window has no repair-after-retained-shift events, unlike the backlog window.
+Both seeds reproduce these counts. All results here are synthetic simulations,
+not claims about the cause of every live-board misprediction.
+
+Next controlled candidate: defer a slot-1 integer conditional branch to slot 0,
+reusing the existing single prediction/training port. This may trade decode
+pairing for fewer misses; measure both effects rather than assuming a win.
+Do not restore the deleted wide speculative BTB lookup just to test the idea.
+Separately, history recovery needs a retained-frontend contract (including older
+redirect replacement and unrelated flushes); blindly repairing from architectural
+history at Tier 1 would omit unresolved older branches and is not a valid fix.
+
+Validation: all 28 matched profile/control runs pass; the required fast gate
+passes 382 tests, zero failures, two ignored. The synthesized logic is unchanged
+by this diagnostic pass; production-source edits correct misleading comments.
+Evidence: `/tmp/branch-history-profile.log`, `/tmp/branch-history-training.log`,
+`/tmp/branch-history-fast.log`.
+Reproduce with `IPC_GHR_TRACE=deep-backlog-long-profile IPC_MEM=l2:5:70` and
+`testOnly m68k040.bench.PipelineProfileSpec`. `history-window` counts are cycle-windowed;
+`retired-branch-window` counts use macro ordinals; `GHR_EVENT`/`GHR_BRANCH` detail
+includes warm-up and must not be reported as window-only counts.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

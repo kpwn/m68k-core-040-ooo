@@ -106,8 +106,9 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     // One cycle wide and already a flop at the source (RobPlugin's `doFlushReg`). It is
     // consumed ONLY through `repairArm = RegNext(flushRepair)` below, so this plugin adds
     // NO combinational term to the redirect / ftbBlocked cone: the repair deliberately
-    // lands TWO cycles after the flush, which is free because a redirect already costs a
-    // full refetch (measured flush->first-commit distance is ~13 cycles).
+    // lands TWO cycles after the flush. This was originally justified by a full refetch;
+    // Tier-1 redirect can now preserve an already-refetched frontend across Tier 2.
+    // See the measured recovery limitation at repairArm below.
     val flushRepair = Bool();        flushRepair.allowOverride; flushRepair := False
 
     // ---- combinational read: phtTaken (>=2) + the 11-bit index, per query PC ----
@@ -200,8 +201,12 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     }
     val repairArm = RegNext(flushRepair) init False; repairArm.simPublic()
     // Repair WINS over a same-cycle speculative shift (whole-GHR overwrite semantics).
-    // It cannot race a legitimate correct-path branch in practice: the refetch after a
-    // redirect is an order of magnitude longer than the two cycles of repair latency.
+    // Known performance limitation: Tier 1 can emit conditional history before Tier 2
+    // preserves that frontend. This overwrite then deletes those retained speculative
+    // bits. PipelineProfileSpec's history-window/IPC_GHR_TRACE observations reproduce
+    // it; flush->first-retire latency does NOT prove fetch->history-shift separation.
+    // Repair must distinguish a kept frontend from a discarded one before changing
+    // this behavior. Branch execution still checks predictions for correctness.
     when(repairArm) {
       ghr := ghrArch
     }

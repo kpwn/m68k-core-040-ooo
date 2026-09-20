@@ -47,6 +47,8 @@ class PipelineProfileSpec extends CoreBenchHarness {
       assert(p.rob.size == measured.windowCycles)
       assert(p.rob.forall(s => s.completePrefix <= s.occupancy && s.completeYounger < math.max(1, s.occupancy)))
       assert(p.branches.forall(b => b.misses <= b.retired && b.taken <= b.retired))
+      assert(p.branches.forall(b => b.phtTrained <= b.retired &&
+        b.untrainedMisses <= b.misses && b.untrainedMisses <= b.retired - b.phtTrained))
       if (expectedBranches == 0) assert(p.branchAccuracy.isEmpty)
       if (!pairBranches) assert(p.pairedBranchCycles == 0)
       if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)

@@ -260,6 +260,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       gsh.logic.flushRepair   := doFlush
       gsh.gshareUpdate.valid   := rob.logic.gshareUpdateFlow.valid
       gsh.gshareUpdate.payload := rob.logic.gshareUpdateFlow.payload
+      // Test-only observation: does late whole-history repair overlap branches
+      // fetched after Tier 1, whose frontend survives the Tier-2 rollback?
+      spinal.core.sim.SimPublic(gsh.logic.shiftValid, gsh.logic.shiftDir,
+        gsh.logic.queryPc0, gsh.logic.flushRepair)
 
       val dc    = host[DcacheService]
       val exc   = rob.logic.exc
@@ -420,7 +424,8 @@ trait CoreBenchHarness extends AnyFunSuite {
 
   // ── per-kernel measurement result ───────────────────────────────────────────
   final case class RetiredBranchStats(pc: Long, branchType: Int, retired: Int,
-                                      taken: Int, misses: Int)
+                                      taken: Int, misses: Int, phtTrained: Int,
+                                      untrainedMisses: Int)
   final case class RobCycle(occupancy: Int = 0, completePrefix: Int = 0,
                            completeYounger: Int = 0, headIncomplete: Boolean = false,
                            retires: Int = 0, branchPairPotential: Boolean = false,
@@ -597,13 +602,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       val robHisto = ArrayBuffer.empty[RobCycle]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
-      val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean)]
+      val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean, Boolean)]
       // debugBranchRetire is a BTB-training stream: it deliberately EXCLUDES
       // returns. Join ALL branch completions to actual branch retirement instead.
       // Kind 2 below means non-BTB control flow (returns in the current corpus),
       // not a fabricated direction-predictor or BTB event.
-      val branchCompletions = scala.collection.mutable.HashMap.empty[Int, (Long, Int, Boolean, Boolean)]
-      var precedingRetiredBranch: Option[(Long, Int, Boolean, Boolean)] = None
+      val branchCompletions = scala.collection.mutable.HashMap.empty[Int, (Long, Int, Boolean, Boolean, Boolean)]
+      var precedingRetiredBranch: Option[(Long, Int, Boolean, Boolean, Boolean)] = None
       var precedingRobCycle = RobCycle()
       var countedMacros = 0
       var totalCycles = 0L
@@ -665,6 +670,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       var ftbDirDeclines    = 0
       var ftbFrameDeclines  = 0
       var ftbBusyDeclines   = 0
+      val historyTraceOn = sys.env.get("IPC_GHR_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
+      val historyHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
+      var historyTraceEvents = 0
+      var shiftsAfterEarly = 0
+      var trackingEarly = false
+      var precedingKeptFrontend = false
 
       // Feed the lock-step handle, which also owns macro classification.
       def snapWb(w: m68k040.execute.WbObs): Unit = if (w.valid.toBoolean) {
@@ -692,7 +703,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           val b = dut.rob.logic.branchCompletion.payload
           branchCompletions(b.robId.toInt) = ((b.btbPc.toLong & 0xffffffffL,
             if (b.isBranch.toBoolean) b.brType.toInt else 2,
-            b.btbTaken.toBoolean, b.mispredict.toBoolean))
+            b.btbTaken.toBoolean, b.mispredict.toBoolean, b.phtValid.toBoolean))
         }
         if (dut.rob.logic.branchCompletion.valid.toBoolean &&
             dut.rob.logic.branchCompletion.payload.mispredict.toBoolean)
@@ -723,6 +734,34 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (dut.fa.logic.ftbDeclineDirection.toBoolean) ftbDirDeclines += 1
         if (dut.fa.logic.ftbDeclineFraming.toBoolean) ftbFrameDeclines += 1
         if (dut.fa.logic.ftbDeclineBlocked.toBoolean) ftbBusyDeclines += 1
+        if (k.profileRetirement) {
+          val gs = dut.gsh.logic
+          val shifting = gs.shiftValid.toBoolean
+          val repairing = gs.repairArm.toBoolean
+          val early = dut.rob.logic.earlyFire.toBoolean
+          val kept = dut.rob.logic.earlySuppressFe.toBoolean
+          // The early redirect edge itself discards the old frontend. Count only
+          // later emissions, and restart for an older redirect superseding it.
+          if (early) { shiftsAfterEarly = 0; trackingEarly = true }
+          else if (trackingEarly && shifting) shiftsAfterEarly += 1
+          historyHisto += ((repairing, repairing && shifting,
+            shifting && dut.rob.logic.earlyPend.toBoolean,
+            repairing && precedingKeptFrontend && shiftsAfterEarly > 0))
+          if (historyTraceOn && (early || kept || shifting || repairing || gs.upd.valid.toBoolean)) {
+            if (historyTraceEvents < 1200) {
+              println(f"GHR_EVENT kernel=${k.name} cycle=$telemCycle " +
+                f"ghr=0x${gs.ghr.toInt}%04x arch=0x${gs.ghrArch.toInt}%04x " +
+                s"early=$early kept=$kept repair=$repairing shift=$shifting " +
+                s"dir=${gs.shiftDir.toBoolean} afterEarly=$shiftsAfterEarly " +
+                f"pc=0x${gs.queryPc0.toLong}%08x index=${gs.phtIndex0.toInt} " +
+                s"update=${gs.upd.valid.toBoolean} updateIndex=${gs.upd.payload.index.toInt} " +
+                s"updateTaken=${gs.upd.payload.taken.toBoolean}")
+            }
+            historyTraceEvents += 1
+          }
+          if (repairing) trackingEarly = false
+          precedingKeptFrontend = kept
+        }
         if (k.copybackDtt) {
           if (dut.lsEu.issuePort.valid.toBoolean) lsIssueValidCyc += 1
           if (dut.lsEu.issuePort.valid.toBoolean &&
@@ -801,6 +840,11 @@ trait CoreBenchHarness extends AnyFunSuite {
                 "registered branch event is not aligned with the preceding ROB head")
               if (handle.emitted > k.warmupInstrs && handle.emitted <= k.retiredInstrs)
                 branchEvents += b
+              if (historyTraceOn && historyTraceEvents < 1200) {
+                println(f"GHR_BRANCH kernel=${k.name} cycle=$telemCycle pc=0x${b._1}%08x " +
+                  s"type=${b._2} taken=${b._3} miss=${b._4} phtValid=${b._5}")
+                historyTraceEvents += 1
+              }
             }
           }
         }
@@ -1045,7 +1089,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       val pipelineProfile = if (!k.profileRetirement) None else {
         val branches = branchEvents.groupBy(e => (e._1, e._2)).toVector.sortBy(_._1).map {
           case ((pc, kind), events) =>
-            RetiredBranchStats(pc, kind, events.size, events.count(_._3), events.count(_._4))
+            RetiredBranchStats(pc, kind, events.size, events.count(_._3), events.count(_._4),
+              events.count(_._5), events.count(e => e._4 && !e._5))
         }
         val profile = PipelineProfile(branches, robHisto.slice(lo, hi + 1).toVector, dut.rob.logic.depth, lo, hi)
         assert(profile.rob.size == windowCycles)
@@ -1058,8 +1103,16 @@ trait CoreBenchHarness extends AnyFunSuite {
           s"branchPairPotential=${profile.branchPairPotentialCycles}")
         branches.foreach { b =>
           println(f"[retired-branch-window] ${k.name} pc=0x${b.pc}%08x type=${b.branchType} " +
-            s"retired=${b.retired} taken=${b.taken} misses=${b.misses}")
+            s"retired=${b.retired} taken=${b.taken} misses=${b.misses} " +
+            s"phtTrained=${b.phtTrained} untrainedMisses=${b.untrainedMisses}")
         }
+        val historyWindow = historyHisto.slice(lo, hi + 1)
+        assert(historyWindow.size == windowCycles)
+        println(s"[history-window] ${k.name} cycles=$windowCycles " +
+          s"repairs=${historyWindow.count(_._1)} sameEdgeShift=${historyWindow.count(_._2)} " +
+          s"earlyPendingShifts=${historyWindow.count(_._3)} " +
+          s"keptFrontendRepairAfterShifts=${historyWindow.count(_._4)} " +
+          s"wholeRunTraceEvents=$historyTraceEvents")
         Some(profile)
       }
 
