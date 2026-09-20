@@ -198,17 +198,37 @@ zero failed, two ignored.
 
 ## Timing investigation: descriptor fall-through
 
-The `ab849ea7` fall-through arm reports -1.252 ns at post-route round zero
-and -1.175 ns after round one;
-subsequent physical optimization is still running. This is not an acceptable
-200 MHz result. Its synthesis timing report identifies a 25-level path from
+The `ab849ea7` fall-through arm finished at -1.160 ns after three post-route
+rounds (3,275 failing setup endpoints, TNS -1196.957 ns). Hold and pulse width
+pass at +0.019/+1.958 ns. This is not an acceptable 200 MHz result.
+The routed worst path starts at P4's ROB-id register and ends at the D-cache
+dirty-memory read register. Its synthesis timing report identifies a 25-level path from
 `RobPlugin_logic_head_reg[2]` to the D-cache dirty-memory read register, through
 `alignedFallThrough`, load-address selection and early-probe matching. The
 fall-through permission currently selects payload bits as well as gating valid,
 putting late store-age/barrier logic ahead of address-dependent cache work.
 
-A follow-up should separate payload selection (registered ring pointer/occupancy
-state) from transaction permission, retaining all valid-side checks. That is a
-candidate timing repair, not yet implemented or proven. The queued matched run
-now includes baseline, early-wakeup-only and combined configurations so the
-wakeup optimization can be evaluated independently of the fall-through risk.
+The follow-up separates payload selection (registered ring pointer/occupancy
+state) from transaction permission, retaining all valid-side checks. This is
+implemented as an unproven timing repair. Its matched timing run must include
+baseline, early-wakeup-only and repaired-combined configurations.
+
+### Payload-selection repair contract
+
+When fall-through is enabled, select P4's command payload whenever the send and
+push pointers coincide and the descriptor ring is not full. Those conditions
+depend only on registered ring state. They imply that no queued unsent command
+can be selected at the same time; simulation must assert this invariant.
+Transaction valid retains the original enqueue, cacheability, forwarding,
+barrier, ownership and flush qualifications. Selecting an invalid P4 payload
+does not authorize a read. Every valid command must therefore have exactly the
+same payload, token and handshake cycle as before this repair. Responses and
+descriptor allocation are unchanged. This does not assert that the remaining
+valid-side path will meet timing; it removes only the late payload-mux control.
+
+An initial regression exposed an invalid fixture encoding: `issueLea` used
+`MemOp.LOAD` with `leaAddr=true`, whereas the decoder uses `MemOp.NONE`.
+The malformed train launched probes while completing as LEA, eventually leaving
+duplicate probe tokens. The test now uses the real encoding and asserts no
+translation fires during its LEA-only phase. Its original mandatory precise-
+replay collision and exactly-once completion assertions remain intact and pass.

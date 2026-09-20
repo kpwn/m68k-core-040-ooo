@@ -1472,14 +1472,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // forward, unresolved dependency, inhibited access or split can take this arm.
     // Never use ready to select the payload; a refused offer becomes a normal
     // queued command with the same token and payload on the following cycle.
-    val alignedFallThrough = if (alignedLoadFallThrough) {
-      alignedEnq && !alignedFull && (alignedSendPtr === alignedPushPtr) &&
-        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    // Select address/token from registered ring state, not the late enqueue
+    // permission. Otherwise ROB-age/barrier logic precedes the cache probe CAM
+    // and tag/dirty read even though those payload bits already live in P4.
+    val alignedFallThroughSelect = if (alignedLoadFallThrough) {
+      !alignedFull && (alignedSendPtr === alignedPushPtr)
     } else False
+    val alignedFallThrough = alignedFallThroughSelect && alignedEnq &&
+      (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
     alignedFallThrough.simPublic()
     val alignedCmd = AlignedLoadCtx()
     alignedCmd := alignedMem(alignedSendPtr)
-    when(alignedFallThrough) {
+    when(alignedFallThroughSelect) {
       alignedCmd.vaddr := p4Ctx.xlate.front.vaddr
       alignedCmd.paddr := p4Ctx.xlate.paddr
       alignedCmd.size := p4Ctx.xlate.front.size
@@ -1487,6 +1491,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedCmd.twoAccess := False
       alignedCmd.splitSecond := False
       alignedCmd.bk.robId := p4Ctx.xlate.front.robId
+    }
+    GenerationFlags.simulation {
+      assert(!(alignedFallThroughSelect && alignedSendValid),
+        "LsEuPlugin: fall-through payload selected over a queued command", FAILURE)
     }
     val useSplitCmd = bkBusy
     val loadVaddr = UInt(32 bits)

@@ -218,7 +218,9 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
     * seed), period-3 stream of `liveCompletionFires` pulses to collide against. */
   def issueLea(dut: Dut, cd: ClockDomain, basePreg: Int, robId: Int): Unit = {
     val s = dut.src.logic
-    s.iValid #= true; s.iMemOp #= MemOp.LOAD; s.iSize #= Size.LONG
+    // Match MicroOpAssembler's LEA encoding. LOAD+leaAddr spuriously requests
+    // translations/probes while the direct-completion arm treats it as LEA.
+    s.iValid #= true; s.iMemOp #= MemOp.NONE; s.iSize #= Size.LONG
     s.iPsrcA #= basePreg; s.iPsrcAValid #= true
     s.iPsrcB #= 0; s.iPsrcBValid #= false
     s.iImm #= 0
@@ -1026,6 +1028,8 @@ class LsEuFastPreciseSpec extends AnyFunSuite {
       var n = 0
       val maxCycles = 4000
       while (seenCounts.keySet.size < numStores && n < maxCycles) {
+        assert(!dut.eu.logic.normalReqFire.toBoolean,
+          "LEA-only completion traffic must not issue a translation/cache probe")
         val wantsApply =
           (dut.eu.logic.pendApply.toInt == dut.eu.logic.pendReady.toInt && dut.eu.logic.sq.io.sqCompletion.valid.toBoolean) ||
           (dut.eu.logic.pendApply.toInt != dut.eu.logic.pendReady.toInt)
