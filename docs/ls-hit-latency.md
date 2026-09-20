@@ -41,3 +41,29 @@ same `M68kFullCoreSynth` configuration with only `--aligned-load-fall-through`
 differing, and runs the existing 200 MHz post-route recipe serially under the
 Vivado mutex. Logs, netlist hashes and checkpoints remain in the printed temporary
 directory. This is a core OOC screen, not SoC board timing signoff.
+
+## Full-core simulation comparison
+
+`LsFallThroughIpcSpec` runs the real frontend, rename, IQ, LSU and ROB with the
+option off/on, seeds 1 and 17, transparent cacheable mappings and the default
+ideal-memory model. Its pointer chase alternates two explicitly initialized
+nonzero pointers, checking every accepted data address. A harmless branch/NOP
+guard prevents speculative execution into randomized memory beyond the program
+image from contaminating the measurement. The windows below include setup and
+cache warm-up, from first through last counted retirement; these are not board
+measurements or isolated steady-state-only windows.
+
+| Kernel | Seed | Retired | Baseline cycles | Candidate cycles | IPC gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dependent pointer chase | 1 | 388 | 2889 | 2626 | 10.02% |
+| Dependent pointer chase | 17 | 388 | 2887 | 2631 | 9.73% |
+| Independent loads | 1 | 481 | 689 | 638 | 7.99% |
+| Independent loads | 17 | 481 | 693 | 642 | 7.94% |
+| Same-line disjoint store/load | 1 | 244 | 303 | 292 | 3.77% |
+| Same-line disjoint store/load | 17 | 244 | 307 | 296 | 3.72% |
+
+For both seeds, 253 dependent command-to-command gaps are exactly 11 cycles in
+the baseline and 10 in the candidate. The remaining gaps include initial misses
+and branch recovery. This corroborates that the one-cycle LSU saving survives
+the IQ/wakeup/retirement machinery. It does not establish a Dhrystone gain or
+preserved Fmax; the matched timing run remains a separate required gate.

@@ -331,7 +331,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     }
   }
 
-  class FullCoreDut extends Component {
+  class FullCoreDut(alignedLoadFallThrough: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -360,7 +360,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
-    val lsEu   = new LsEuPlugin
+    val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

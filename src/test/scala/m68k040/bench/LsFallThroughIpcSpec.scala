@@ -1,0 +1,70 @@
+package m68k040.bench
+
+import m68k040.{M68kSim, VerilatorTest}
+
+/** Matched full-core experiment, including the real IQ and ROB. This is not a
+  * whole-system performance claim: kernels use transparent cacheable mappings
+  * and the harness's explicit simulation memory model. */
+class LsFallThroughIpcSpec extends CoreBenchHarness {
+  // The I-side model deliberately randomizes bytes outside the image. A
+  // predicted fall-through at loop warm-up must encounter harmless code, not
+  // random memory instructions that contaminate the access-order measurement.
+  private val guard = " ; .Lend: bra.s .Lend ; .rept 64 ; nop ; .endr"
+  private def pointerChain: Kernel = {
+    val iters = 64
+    val setup = Seq("lea 0x4000,%a0", s"moveq #$iters,%d7",
+      "movea.l (%a0),%a0", "movea.l (%a0),%a0")
+    val body = Seq.fill(4)("movea.l (%a0),%a0").mkString(" ; ")
+    Kernel("fallthrough-pointer-chain",
+      setup.mkString(" ; ") + " ; .Lchase: " + body +
+        " ; subq.l #1,%d7 ; bne.s .Lchase" + guard,
+      setup.size + iters * 6, copybackDtt = true,
+      prepMem = m => {
+        for ((addr, next) <- Seq(0x4000L -> 0x4010L, 0x4010L -> 0x4000L);
+             b <- 0 until 16) {
+          m.dmem.pokeByte(addr + b,
+            if(b < 4) ((next >>> (24 - 8 * b)) & 255).toInt else 0)
+        }
+      })
+  }
+
+  test("fall-through improves full-core dependent-load IPC without changing access order", VerilatorTest) {
+    val stream = kLoadStream
+    val mixed = kSameLineCopyback
+    val kernels = Seq(pointerChain,
+      stream.copy(src = stream.src + guard, copybackDtt = true),
+      mixed.copy(src = mixed.src + guard))
+    val seeds = Seq(1, 17)
+    val results = Seq(false, true).map { enabled =>
+      val compiled = M68kSim().withVerilator.compile(new FullCoreDut(alignedLoadFallThrough = enabled))
+      (for(k <- kernels; seed <- seeds) yield {
+        val r = runKernel(compiled, k, seed)
+        assert(r.retiredInstrs >= k.retiredInstrs)
+        if(k.name == pointerChain.name) {
+          assert(r.ldCmdAddrs.size >= 258, s"pointer chase did not execute its loads: ${r.ldCmdAddrs.size}")
+          r.ldCmdAddrs.zipWithIndex.foreach { case (addr, n) =>
+            assert(addr == (if((n & 1) == 0) 0x4000L else 0x4010L),
+              f"pointer chase diverged at load $n: address=0x$addr%x")
+          }
+        }
+        println(f"LS_FULL_CORE fallThrough=$enabled seed=$seed kernel=${k.name} " +
+          f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f")
+        if(k.name == pointerChain.name) {
+          val gaps = r.ldCmdCycles.sliding(2).collect { case Seq(a, b) => b - a }.toSeq
+          println(s"LS_FULL_CORE_LOAD_SPACING fallThrough=$enabled seed=$seed " +
+            gaps.groupBy(identity).toSeq.sortBy(_._1).map { case (gap, xs) => s"$gap:${xs.size}" }.mkString(","))
+        }
+        (k.name, seed) -> r
+      }).toMap
+    }
+    for(seed <- seeds) {
+      val before = results(0)((pointerChain.name, seed))
+      val after = results(1)((pointerChain.name, seed))
+      assert(after.retiredInstrs == before.retiredInstrs,
+        "matched pointer chase windows retired different instruction counts")
+      assert(after.windowCycles < before.windowCycles,
+        s"shorter LSU path did not improve dependent-load full-core IPC for seed $seed")
+      println(f"LS_FULL_CORE_GAIN seed=$seed pointerChase=${after.ipc / before.ipc - 1}%.6f")
+    }
+  }
+}
