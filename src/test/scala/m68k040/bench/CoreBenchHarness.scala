@@ -519,12 +519,15 @@ trait CoreBenchHarness extends AnyFunSuite {
                           // did what the kernel claims. Kernels that depend on loaded values
                           // MUST set this, and MUST additionally assert the premise held --
                           // see `assertChasePremise`.
-                          zeroFillData: Boolean = false)
+                          zeroFillData: Boolean = false,
+                          warmupInstrs: Int = 0,
+                          verifyRetirement: Seq[m68k040.lockstep.CommitObservation] => Unit = _ => ())
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
   def runKernel(compiled: SimCompiled[FullCoreDut], k: Kernel,
                 seed: Int = IpcBenchSpec.simSeed): IpcResult = {
+    require(k.warmupInstrs >= 0 && k.warmupInstrs < k.retiredInstrs)
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val image = ProgramAssembler.assemble(k.src, loadAddr) match {
       case Right(i)  => i
@@ -749,8 +752,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           if (c.fire.toBoolean) handle.onExcCommit(c.pc.toLong & 0xffffffffL, 0x27, -1L)
         }
 
-        val macrosThisCycle = scala.math.min(handle.emitted - emittedBefore,
+        val acceptedMacros = scala.math.min(handle.emitted - emittedBefore,
           k.retiredInstrs - countedMacros)
+        val macrosThisCycle = scala.math.max(0, countedMacros + acceptedMacros - k.warmupInstrs) -
+          scala.math.max(0, countedMacros - k.warmupInstrs)
         val lsSlots = dut.iq.logic.slots.filter(s => s.sel.toBoolean &&
           s.hot.cluster.toEnum == m68k040.isa.Cluster.LS &&
           (s.hot.memOp.toEnum != m68k040.isa.MemOp.NONE || s.hot.leaAddr.toBoolean))
@@ -761,7 +766,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
         lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
           dut.iq.logic.lsSkidValid.toBoolean))
-        countedMacros += macrosThisCycle
+        countedMacros += acceptedMacros
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
           lastCommitCycle = totalCycles
@@ -919,6 +924,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         f"[${k.name}] only ${handle.result.size}/$n macro-instructions retired within $cap cycles " +
         f"(${cap.toDouble / scala.math.max(handle.result.size, 1)}%.1f cyc/macro achieved). A TRUNCATED run " +
         f"still yields a plausible-looking differential, so this is a hard failure, not a warning.")
+      k.verifyRetirement(handle.result.take(n))
 
       // ── Build the steady-state window from the histogram ──────────────────────
       // Use the FIRST..LAST macro-commit span. The histogram is per-cycle; trim to
@@ -936,8 +942,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
         s"youngerReadyLoadBlocked=${lsOrderWindow.count(_._3)} " +
         s"skidOccupied=${lsOrderWindow.count(_._4)}")
-      assert(windowRetired == n,
-        s"[${k.name}] macro histogram counted $windowRetired instructions, expected $n")
+      assert(windowRetired == n - k.warmupInstrs,
+        s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
 

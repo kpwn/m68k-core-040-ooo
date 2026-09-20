@@ -7,6 +7,25 @@ they require oldest-occupied-LS-only selection. Architectural retirement remains
 strictly in order. No load-value prediction or memory-order violation rollback
 is introduced by this change.
 
+## Execution and retirement separation
+
+Ordinary cacheable stores execute in the speculative domain: resolve translation
+and permissions, capture address/byte mask/data in the SQ, and expose the resident
+entry to younger-load forwarding on the next cycle. They do not wait to become
+ROB head. In-order retirement authorizes draining; draining into D-cache may
+follow later while the entry remains resident and forwardable. Backpressure is
+an SQ-capacity condition, not a reason to put D-cache acceptance on retirement's
+critical path. Architectural faults must be resolved before irreversible commit;
+device accesses and other precise/irreversible operations retain separate rules.
+
+Load/SQ ordering queries should use stable allocation-age metadata rather than
+combinational distances from the live ROB head. Wrap, flush, ROB-slot reuse and
+committed-but-undrained stores must be covered explicitly; a bare signed compare
+of existing wrapping ROB indices is not sufficient. Already committed or
+irrevocable stores remain older than speculative queries even across reuse.
+The current standalone checker/tracker still uses head-relative ROB ages; this
+requirement is pending integration work, not a claim that it is already met.
+
 ## Required ownership and lifetime
 
 Memory operations must be represented before they can be overtaken: reserve a

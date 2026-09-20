@@ -232,3 +232,8 @@ The malformed train launched probes while completing as LEA, eventually leaving
 duplicate probe tokens. The test now uses the real encoding and asserts no
 translation fires during its LEA-only phase. Its original mandatory precise-
 replay collision and exactly-once completion assertions remain intact and pass.
+
+The payload repair passes all 28 focused LSU cases, 29 selected oracle cases and
+the 381-test fast gate. All 104 L2/DDR-model benchmark rows have exactly the same
+retired counts and cycle counts before and after the repair. Routed timing is
+still required; identical simulated performance does not prove Fmax preservation.
