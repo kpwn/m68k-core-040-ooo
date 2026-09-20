@@ -810,7 +810,8 @@ object GenFullCoreSynthVerilog {
                 alignedLoadFallThrough: Boolean = false,
                 earlyLsIntWakeup: Boolean = false,
                 sqSubwordForwarding: Boolean = false,
-                pairCorrectBranch: Boolean = false): Unit = {
+                pairCorrectBranch: Boolean = false,
+                deferSlot1Conditional: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -838,7 +839,7 @@ object GenFullCoreSynthVerilog {
           new FtbPlugin(),
           new m68k040.frontend.RasPlugin(),
           new m68k040.frontend.GsharePlugin(),
-          new FetchAlignPlugin(enableFetchDirected = true),
+          new FetchAlignPlugin(enableFetchDirected = true, deferSlot1Conditional = deferSlot1Conditional),
           new DecodeStage(),
           new RenameStage(),
           new DispatchPlugin(),
@@ -871,13 +872,14 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch")),
-      "expected --aligned-load-fall-through, --early-ls-int-wakeup, --sq-subword-forwarding and/or --pair-correct-branch")
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional")),
+      "expected --aligned-load-fall-through, --early-ls-int-wakeup, --sq-subword-forwarding, --pair-correct-branch and/or --defer-slot1-conditional")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
       earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"),
       sqSubwordForwarding = args.contains("--sq-subword-forwarding"),
-      pairCorrectBranch = args.contains("--pair-correct-branch"))
+      pairCorrectBranch = args.contains("--pair-correct-branch"),
+      deferSlot1Conditional = args.contains("--defer-slot1-conditional"))
   }
 }
 

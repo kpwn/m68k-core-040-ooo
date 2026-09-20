@@ -34,7 +34,9 @@ class PipelineProfileSpec extends CoreBenchHarness {
     val cases = Seq(hot -> 84, alternating -> 48, backlog -> 32,
       calls -> 252, independent -> 0, alternatingLong -> 768, backlogLong -> 224)
     val pairBranches = sys.env.get("IPC_PAIR_BRANCH").contains("1")
-    val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches))
+    val deferConditionals = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1")
+    val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches,
+      deferSlot1Conditional = deferConditionals))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,
@@ -54,7 +56,7 @@ class PipelineProfileSpec extends CoreBenchHarness {
       if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
-        s"pairBranches=$pairBranches " +
+        s"pairBranches=$pairBranches deferConditionals=$deferConditionals " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +
         s"macros=${measured.retiredInstrs} baselineCycles=${control.windowCycles} cycles=${measured.windowCycles} " +
         f"IPC=${measured.ipc}%.6f branches=${p.retiredBranches} misses=${p.branchMisses} accuracy=$accuracy " +

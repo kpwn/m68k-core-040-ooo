@@ -12,11 +12,11 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 class FetchAlignSpec extends AnyFunSuite {
-  class Dut extends Component {
+  class Dut(deferSlot1Conditional: Boolean = false) extends Component {
     val db = new Database
     val host = db on (new PluginHost)
     val ic = new IcachePlugin
-    val fa = new FetchAlignPlugin
+    val fa = new FetchAlignPlugin(deferSlot1Conditional = deferSlot1Conditional)
     val probe = new DecodeFeedProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), new IdentityTranslationPlugin, ic, fa, probe)) }
@@ -24,6 +24,59 @@ class FetchAlignSpec extends AnyFunSuite {
   def redirect(dut: Dut, cd: ClockDomain, pc: Long): Unit = {
     dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= pc
     cd.waitSampling(); dut.fa.logic.redirect.valid #= false
+  }
+
+  test("optional conditional deferral preserves words, PCs and backpressure", VerilatorTest) {
+    val cases = (2 to 15).map(c => (s"cc$c", Seq((0x6000 | (c << 8) | 2)), true, 0)) ++
+      Seq(("word-cross-line", Seq(0x6700, 0x0010), true, 30),
+        ("long-cross-line", Seq(0x67ff, 0x0000, 0x0010), true, 30),
+        ("bra", Seq(0x6002), false, 0), ("bsr", Seq(0x6102), false, 0),
+        ("alu", Seq(0x7201), false, 0))
+    for (enabled <- Seq(false, true)) {
+      val compiled = SimConfig.withVerilator.compile(new Dut(enabled))
+      for ((name, opwords, conditional, pad) <- cases) {
+        compiled.doSim(s"defer_${enabled}_$name", 1) { dut =>
+          val cd = dut.clockDomain; cd.forkStimulus(10)
+          val base = 0x6000L
+          val start = base + pad * 2
+          val branchPc = start + 2
+          val following = branchPc + opwords.size * 2
+          IcacheSim.attachMemoryWithWords(dut.ic.logic.axi, cd, base,
+            Seq.fill(pad)(0x7000) ++ Seq(0x7000) ++ opwords ++ Seq.fill(12)(0x7402))
+          val feed = dut.probe.logic.feedOut
+          feed.ready #= false
+          dut.fa.logic.resume.valid #= false; dut.fa.logic.redirect.valid #= false
+          cd.waitSampling(2); redirect(dut, cd, start)
+          cd.waitSamplingWhere(feed.valid.toBoolean)
+          for (_ <- 0 until 3) {
+            assert(feed.payload(0).pc.toLong == start)
+            if (enabled && conditional) assert(!dut.probe.logic.s1v.toBoolean)
+            if (pad == 0 && !(enabled && conditional)) assert(dut.probe.logic.s1v.toBoolean)
+            cd.waitSampling()
+          }
+          val seen = scala.collection.mutable.ArrayBuffer.empty[Long]
+          feed.ready #= true
+          var guard = 0
+          while (seen.size < 6 && guard < 200) {
+            cd.waitSampling(); guard += 1
+            if (feed.valid.toBoolean) {
+              for (slot <- 0 until (if (dut.probe.logic.s1v.toBoolean) 2 else 1)) {
+                val packet = feed.payload(slot)
+                val pc = packet.pc.toLong
+                seen += pc
+                if (pc == branchPc) {
+                  if (enabled && conditional) assert(slot == 0)
+                  assert(packet.lenWords.toInt == opwords.size)
+                  for (i <- opwords.indices) assert(packet.words(i).toInt == opwords(i))
+                }
+              }
+            }
+          }
+          assert(seen.take(6).toSeq == Seq(start, branchPc, following,
+            following + 2, following + 4, following + 6), s"$name enabled=$enabled PCs=$seen")
+        }
+      }
+    }
   }
 
   test("2-wide stream of 1-word simple ops, correct PCs", VerilatorTest) {

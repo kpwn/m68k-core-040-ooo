@@ -284,9 +284,11 @@ Evidence: `/tmp/sq-subword-final-unit.log`, `/tmp/sq-subword-final-ipc.log`,
 
 Matched baseline/subword routed timing is queued at pinned revision `839e4322`
 in `/tmp/sq-forward-gate.jVqSkW/`, unit `m68k-sq-subword-839e4322.service`.
-It waits for the existing latency matrix to finish, then uses the shared Vivado
-mutex. Both arms use the same 5 ns OOC recipe and three post-route rounds;
-results are pending. The existing `build-logs:0` window follows both jobs.
+It uses the shared Vivado mutex after the earlier latency matrix. Both arms use
+the same 5 ns core-only recipe and three post-route rounds. Baseline has completed:
+setup +11 ps, hold +23 ps, pulse +1.958 ns, zero failing endpoints; 93,896 LUTs,
+38,740 FFs and 37 BRAM tiles. The subword arm is now running; candidate timing
+and area remain unmeasured. The existing `build-logs:0` window follows both jobs.
 
 ```sh
 IPC_SQ_SUBWORD=1 IPC_MEM=l2:5:70 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.bench.LsFallThroughIpcSpec'
@@ -407,6 +409,87 @@ Reproduce with `IPC_GHR_TRACE=deep-backlog-long-profile IPC_MEM=l2:5:70` and
 `testOnly m68k040.bench.PipelineProfileSpec`. `history-window` counts are cycle-windowed;
 `retired-branch-window` counts use macro ordinals; `GHR_EVENT`/`GHR_BRANCH` detail
 includes warm-up and must not be reported as window-only counts.
+
+## Single-port conditional admission — 2026-09-21
+
+Default-off `deferSlot1Conditional`, based on `fbbdbcf8`. A slot-1 integer Bcc
+uses the existing deferral path to become slot 0, where the current predictor
+can supply both direction and training metadata. No second prediction/training
+port, table or history checkpoint is added. This version does not repair the
+retained-frontend history issue above. Other experimental options are off.
+
+Matched warmed L2/DDR windows, seeds 1/17:
+
+| Kernel | Macros | Baseline → candidate cycles | Baseline → candidate IPC | Branch misses |
+| --- | ---: | --- | --- | --- |
+| Hot loop | 336 | 252 → 252 | 1.333333 → 1.333333 | 1 → 1 / 84 |
+| Alternating, seed 1 | 132 | 135 → 138 | 0.977778 → 0.956522 | 2 → 2 / 48 |
+| Alternating, seed 17 | 132 | 234 → 138 | 0.564103 → 0.956522 | 11 → 2 / 48 |
+| Deep backlog | 360 | 425 → 395 | 0.847059 → 0.911392 | 8 → 6 / 32 |
+| Copyback call/return | 672 | 1342 → 1342 | 0.500745 → 0.500745 | 1 → 1 / 252 |
+| Independent ALU | 396 | 267 → 267 | 1.483146 → 1.483146 | no branches |
+| Alternating, long | 2112 | 2170 → 2304 | 0.973272 → 0.916667 | 25 → 1 / 768 |
+| Deep backlog, long | 2520 | 2660 → 2285 | 0.947368 → 1.102845 | 29 → 4 / 224 |
+
+Both seeds agree except where separated. Long backlog improves **16.41% IPC**
+and reaches 98.214% accuracy. Long alternating reaches 99.870% accuracy but
+**regresses 5.82% IPC**: admission serialization costs more than the saved misses.
+Do not call accuracy alone a performance improvement or enable this globally
+from these synthetic tests. The short-window seed-17 gain is warm-up-sensitive.
+
+Combining with `pairCorrectBranch` does not recover the tight-loop regression:
+long alternating remains 2304 cycles despite 192 actual branch pairs. Long
+backlog becomes 2286 cycles (one more than admission alone), with 218 pairs.
+Keep pairing off; no throughput benefit has been established for that combination.
+
+Correctness so far: 38 directed frontend simulations pass (all 14 Bcc conditions,
+word/long displacements crossing a cache line, BRA/BSR/non-branch controls, held
+backpressure, exact PCs and words, both switch positions). Both 28-run profiled
+experiments pass their instrumentation-off controls and final-value checks.
+Seven enabled-option oracle cases pass: calls/returns, mispredict recovery,
+BTB staleness, DBRA, MOVEM frontend resume, wrong-path inhibited loads and
+post-RTE condition codes. The broader matched corpus passes all 104 configurations
+per arm: 96 cycle counts are identical; eight hot-loop cases (four LSU option
+combinations, two seeds) improve from 326 to 317 cycles, including startup.
+The warmed hot-loop window above is unchanged. All macro counts match. The
+earlier LSU-option gains remain intact; do not describe this cold-start difference
+as a resident-loop throughput gain. The final fast gate passes: 382 tests,
+zero failures, two ignored.
+
+Evidence: `/tmp/branch-history-training.log` (baseline),
+`/tmp/defer-conditional-ipc.log`, `/tmp/defer-conditional-pair-ipc.log`,
+`/tmp/defer-conditional-unit.log`, `/tmp/defer-conditional-oracle.log`,
+`/tmp/defer-conditional-corpus-baseline.log`,
+`/tmp/defer-conditional-corpus-candidate.log`, `/tmp/defer-conditional-fast.log`.
+Use `IPC_DEFER_CONDITIONAL=1` for the pipeline/LSU benchmarks,
+`LOCKSTEP_DEFER_CONDITIONAL=1` for the oracle and `--defer-slot1-conditional`
+for core synthesis. Defaults remain unchanged. Timing and board gains unverified.
+
+### Integration boundary and next LSU work
+
+The experimental flags currently reach the full-core test/OOC generator only.
+`M68kSocketTop` still instantiates default `LsEuPlugin`, `FetchAlignPlugin` and
+`RobPlugin`; therefore **a normal SoC rebuild does not enable these candidates**.
+Before board validation, expose explicit socket/build configuration, record it in
+the SoC build identity, run socket/reset/translated-cache checks, and route the
+integrated SoC. Do not substitute the separate core timing result for that work.
+
+The fresh LSU corpus still exposes the intended dependency bottleneck: the
+delayed-store/disjoint-load control spends 2,084 cycles with a ready younger load
+blocked behind unready store data. Address operands and store data must become
+independently ready; changing oldest-occupied LS selection to oldest-ready alone
+remains unsafe. Current `LsEuPlugin` reads base/index/data together and captures
+them into S1; actual SQ allocation happens later at P3 and also arbitrates the
+shared completion port. A dispatch reservation by itself supplies neither an
+address-disambiguation proof nor a guaranteed completion/data-publication slot.
+
+The next integration must account for pending stores before SQ data publication,
+retain independent address/data readiness, and let a denied load release/retry
+its LSU resource so the older producer can progress. Preserve committed-store
+identities across ROB wrap. Use conservative low-page-offset disjointness only
+with proven access spans and serialization attributes; unknown/device/split
+cases keep the existing ordering. The standalone tracker is still not a CPU
+implementation, and no memory-reordering gain is claimed here.
 
 ## Next investigations requested — 2026-09-21
 

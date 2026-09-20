@@ -32,7 +32,8 @@ case class FetchTargetQueueEntry() extends Bundle {
   val isCond   = Bool()
 }
 
-class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
+class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
+                       deferSlot1Conditional: Boolean = false)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -1204,6 +1205,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // never reaches the slot0 RAS-predict and every return mispredicts (the flush the
     // RAS is meant to remove). The opword classification only needs slot1's opword.
     val s1op       = res.slot1.words(0)
+    // Optional single-port admission experiment: Bcc conditions 2..15 use the
+    // existing slot-0 predictor next cycle. No extra BTB read or prediction tag.
+    val slot1WouldCondPred = if (deferSlot1Conditional)
+      res.slot0Valid && res.slot1Valid && res.slot1.simple &&
+        (s1op(15 downto 12) === B"4'h6") && (s1op(11 downto 8).asUInt >= U(2, 4 bits))
+    else False
     val s1IsRts    = s1op === B"16'h4E75"
     val s1IsRtr    = s1op === B"16'h4E77"
     val s1IsReturn = res.slot1Valid && res.slot1.simple && (s1IsRts || s1IsRtr)
@@ -1263,7 +1270,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldRasPred || slot1WouldFtq || ftqConfirm) {
+    when(slot0Predicted || slot1WouldRasPred || slot1WouldCondPred || slot1WouldFtq || ftqConfirm) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -1389,7 +1396,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32)
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldRasPred ||
+    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
                         slot1WouldFtq || ftqConfirm
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision

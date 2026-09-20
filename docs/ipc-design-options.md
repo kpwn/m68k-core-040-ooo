@@ -293,7 +293,35 @@ that Tier 2 keeps, and slot-1 conditionals have inert prediction/training tags.
 In long backlog, all 28 inner-branch misses are untrained instances; in long
 alternating code only four of 24 are. First compare simple slot-1 conditional
 deferral through the existing predictor port, then repair retained history under
-an explicit recovery contract. Neither has an implementation gain yet.
+an explicit recovery contract. The first deferral prototype now improves long
+backlog IPC by 16.41%, but loses 5.82% on the long tight alternating loop despite
+improving its accuracy to 99.870%. Keep it default-off and preserve both results.
+Correct-branch retirement pairing does not remove that regression. History repair
+has no implementation gain yet.
+
+**Next simplification to compare:** allow an unpredicted slot-1 conditional to
+carry a not-taken history/training record through the *existing* single tag-write
+port when slot 0 has no record. Defer only on a tag-port conflict (and retain the
+existing FTQ taken-branch deferral). This could retain training without every
+extra decode cycle, but does not guarantee fewer misses: a taken branch missed
+by the FTQ would still execute from an implicit not-taken prediction. It needs an
+explicit lane-selection contract in DecodeStage, one tag allocation/history event
+per emitted packet, fault/flush tests, and a real slot-1 index source. In current
+top-level wiring `gsPhtIndex1` is still its default zero, so merely setting slot-1
+`phtValid` would train the wrong counter. Route any new inter-plugin data through
+a service, not an internal-field shortcut. This alternative remains unimplemented.
+
+Local NaxRiscv reference checked at `9f452d50560d02fb391bc8039f5453c54e0911af`:
+`prediction/DecoderPredictionPlugin.scala` supplies masked history events for
+each decode lane; `prediction/HistoryPlugin.scala` orders those pushes and
+restores instruction-associated ROB history plus the resolved branch outcome on
+reschedule. Its `GSharePlugin.scala` carries counter context through alignment
+and supports a registered memory read with write bypass. The applicable lesson is
+explicit event coverage and recovery-point ownership, not copying its complete
+predictor. Our single-record port and retained frontend require their own contract.
+Compare a bounded retained-history suffix against full per-instruction snapshots;
+neither may infer 16 history bits from the folded 11-bit PHT index. A full snapshot
+also needs coverage for unpredicted/tag-zero branches, not just PHT-trained ones.
 
 **Cost / timing repair:** deleting redundant repair/stall machinery may beat a
 larger predictor. Registered token-tagged lookup and local history checkpoints
@@ -303,6 +331,25 @@ waits for retirement; they need allocation recovery, not just a copied RAT.
 **Experiment:** per-PC retired-branch accuracy, MPKI, lost cycles and macro IPC
 in identical warmed windows. Target >=95% on representative workloads, not a
 guarantee for arbitrary unpredictable branches. **Priority: high.**
+
+## Controlled frontend amendment: single-port conditional admission
+
+`deferSlot1Conditional` is a default-off experiment. An integer Bcc (opcode
+`0x6xxx`, condition 2–15) that would emit in slot 1 is deferred to slot 0.
+Suppress both its feed-valid lane and consumption of its words, using the same
+existing deferral mechanism as returns and FTQ-confirmed branches. The next
+accepted packet must still name the deferred instruction, including word/long
+displacements and fetch-window crossings. Backpressure must not consume it.
+BRA, BSR, DBcc, floating-point branches and non-branches retain their old rules.
+
+There is still one prediction-tag allocation, one history shift and one eventual
+training event per cycle. Slot 1 remains prediction-inert. The existing slot-0
+BTB/PHT lookup handles the deferred branch; cold BTB misses retain conservative
+not-taken prediction. This is not a second predictor port, a wider decoder, or
+a change to architectural execution/retirement. History-repair behavior is
+unchanged so its contribution can be tested independently. Compare matched warm
+IPC and trained/missed branch counts before queuing timing; retain any decode
+throughput regression in the ledger.
 
 ## Other possibilities considered
 

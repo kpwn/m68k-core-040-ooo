@@ -338,7 +338,8 @@ trait CoreBenchHarness extends AnyFunSuite {
   class FullCoreDut(alignedLoadFallThrough: Boolean = false,
                     earlyLsIntWakeup: Boolean = false,
                     sqSubwordForwarding: Boolean = false,
-                    pairCorrectBranch: Boolean = false) extends Component {
+                    pairCorrectBranch: Boolean = false,
+                    deferSlot1Conditional: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -358,7 +359,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
     val gsh    = new m68k040.frontend.GsharePlugin
-    val fa     = new FetchAlignPlugin(enableFetchDirected = true)
+    val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+      deferSlot1Conditional = deferSlot1Conditional)
     val dec    = new DecodeStage
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
