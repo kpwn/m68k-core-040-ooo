@@ -35,8 +35,11 @@ class PipelineProfileSpec extends CoreBenchHarness {
       calls -> 252, independent -> 0, alternatingLong -> 768, backlogLong -> 224)
     val pairBranches = sys.env.get("IPC_PAIR_BRANCH").contains("1")
     val deferConditionals = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1")
+    val deferTaken = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1")
+    val trainSlot1 = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || deferTaken
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches,
-      deferSlot1Conditional = deferConditionals))
+      deferSlot1Conditional = deferConditionals, trainSlot1Conditional = trainSlot1,
+      deferTakenSlot1Conditional = deferTaken))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,
@@ -51,12 +54,15 @@ class PipelineProfileSpec extends CoreBenchHarness {
       assert(p.branches.forall(b => b.misses <= b.retired && b.taken <= b.retired))
       assert(p.branches.forall(b => b.phtTrained <= b.retired &&
         b.untrainedMisses <= b.misses && b.untrainedMisses <= b.retired - b.phtTrained))
+      if (trainSlot1 && kernel.name.endsWith("-long"))
+        assert(p.branches.forall(b => b.phtTrained == b.retired),
+          "warmed conditional branches must retain all training metadata")
       if (expectedBranches == 0) assert(p.branchAccuracy.isEmpty)
       if (!pairBranches) assert(p.pairedBranchCycles == 0)
       if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
-        s"pairBranches=$pairBranches deferConditionals=$deferConditionals " +
+        s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +
         s"macros=${measured.retiredInstrs} baselineCycles=${control.windowCycles} cycles=${measured.windowCycles} " +
         f"IPC=${measured.ipc}%.6f branches=${p.retiredBranches} misses=${p.branchMisses} accuracy=$accuracy " +

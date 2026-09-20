@@ -299,17 +299,20 @@ improving its accuracy to 99.870%. Keep it default-off and preserve both results
 Correct-branch retirement pairing does not remove that regression. History repair
 has no implementation gain yet.
 
-**Next simplification to compare:** allow an unpredicted slot-1 conditional to
+**Implemented, default-off comparison:** allow an unpredicted slot-1 conditional to
 carry a not-taken history/training record through the *existing* single tag-write
 port when slot 0 has no record. Defer only on a tag-port conflict (and retain the
 existing FTQ taken-branch deferral). This could retain training without every
 extra decode cycle, but does not guarantee fewer misses: a taken branch missed
 by the FTQ would still execute from an implicit not-taken prediction. It needs an
 explicit lane-selection contract in DecodeStage, one tag allocation/history event
-per emitted packet, fault/flush tests, and a real slot-1 index source. In current
-top-level wiring `gsPhtIndex1` is still its default zero, so merely setting slot-1
-`phtValid` would train the wrong counter. Route any new inter-plugin data through
-a service, not an internal-field shortcut. This alternative remains unimplemented.
+per emitted packet, fault/flush tests, and a real slot-1 index source. The prototype
+now uses the Gshare-owned secondary lookup service, not an inert aligner default
+or an internal-field shortcut. Training alone improves the long alternating
+window by 2.75% but leaves long backlog unchanged. Additionally deferring PHT-taken
+slot-1 branches retains the alternating gain and improves long backlog by 16.41%.
+The short alternating seed-1 window regresses 2.17%; keep that result visible.
+These are checked synthetic windows, not representative-workload or timing signoff.
 
 Local NaxRiscv reference checked at `9f452d50560d02fb391bc8039f5453c54e0911af`:
 `prediction/DecoderPredictionPlugin.scala` supplies masked history events for
@@ -350,6 +353,38 @@ a change to architectural execution/retirement. History-repair behavior is
 unchanged so its contribution can be tested independently. Compare matched warm
 IPC and trained/missed branch counts before queuing timing; retain any decode
 throughput regression in the ledger.
+
+## Controlled frontend amendment: slot-1 training through one record port
+
+`trainSlot1Conditional` defaults off and is mutually exclusive with unconditional
+slot-1 Bcc deferral. If a simple slot-1 Bcc is actually emitted and slot 0 has no
+prediction record, give it the existing implicit not-taken prediction, one
+nonzero prediction tag, and its current secondary Gshare index. Shift one false
+history bit on that feed handshake. A tagged slot-0 conditional instead defers
+the slot-1 Bcc: two history shifts or two record writes are never required.
+Existing taken FTQ/BTB/RAS suppression remains authoritative. Fault draining
+must not introduce an unmatched history/training event.
+
+Gshare owns the secondary-index service; FetchAlign consumes it rather than an
+unwired default or another plugin's internals. Decode's optional lane selector
+chooses the sole tagged valid packet for the existing idempotent table write.
+The table, tag lifetime bound, read ports and retire-time training port do not
+grow. Assertions reject simultaneous tagged lanes and a tagged slot 1 fed into
+a decoder without this capability. Predictor misreads still undergo normal
+branch resolution; this experiment does not change architectural commit.
+
+Check exact lane/tag/index association through backpressure, recovery and tag
+wrap, history-event coverage, cold/unknown-target branches, and matched IPC.
+An extra false history bit without its matching carried training index is not
+an acceptable approximation. The late-repair issue remains a separate change.
+
+A separate `deferTakenSlot1Conditional` refinement requires this training mode.
+It also defers when the secondary PHT direction is taken, using slot 0's target
+lookup on the following cycle; not-taken branches still co-emit and train.
+This retains a secondary PHT read that may otherwise be pruned (area/timing must
+be measured), but does not reinstate the removed multiway secondary BTB read.
+Cold BTB misses remain conservative; no target or architectural outcome is
+invented from a direction bit alone. Measure this arm independently.
 
 ## Other possibilities considered
 

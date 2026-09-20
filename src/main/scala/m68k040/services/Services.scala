@@ -308,6 +308,13 @@ trait GshareWindowService {
   def windowRsp: Flow[GshareWindowRsp]
 }
 
+/** GsharePlugin is the sole producer. Index for the existing secondary-PC
+  * query, before this cycle's speculative history shift. No extra table port. */
+trait GshareSecondaryLookupService {
+  def secondaryPhtIndex: UInt
+  def secondaryPhtTaken: Bool
+}
+
 /** Retire-time gshare PHT update (direction predictor, slice 3). The ROB drives this
   * from a retiring CONDITIONAL branch that carried a fetch-time `phtIndex`; the
   * GsharePlugin consumes it to train `pht[index]` toward the resolved direction

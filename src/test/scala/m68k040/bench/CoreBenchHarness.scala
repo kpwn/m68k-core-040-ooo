@@ -339,7 +339,9 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyLsIntWakeup: Boolean = false,
                     sqSubwordForwarding: Boolean = false,
                     pairCorrectBranch: Boolean = false,
-                    deferSlot1Conditional: Boolean = false) extends Component {
+                    deferSlot1Conditional: Boolean = false,
+                    trainSlot1Conditional: Boolean = false,
+                    deferTakenSlot1Conditional: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -360,8 +362,9 @@ trait CoreBenchHarness extends AnyFunSuite {
     val ras    = new m68k040.frontend.RasPlugin
     val gsh    = new m68k040.frontend.GsharePlugin
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
-      deferSlot1Conditional = deferSlot1Conditional)
-    val dec    = new DecodeStage
+      deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
+      deferTakenSlot1Conditional = deferTakenSlot1Conditional)
+    val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional)
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch)

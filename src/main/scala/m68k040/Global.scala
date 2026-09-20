@@ -177,9 +177,9 @@ object Global {
     * and the IQ are untouched -- this narrows the DECODE record only).
     *
     * NO ALLOCATOR, NO FREE LIST, NO STALL. Tag 0 is reserved and means "inert" (no
-    * prediction: a non-predicted packet, slot 1 -- which the Aligner/FetchAlignPlugin never
-    * stamp a prediction onto -- and every FSM/microcode-emitted uop, all of which drove
-    * predTaken=False before this change too, so they are bit-identical). Tags 1..DEPTH-1 are
+    * prediction: a non-predicted packet and every FSM/microcode-emitted uop).
+    * Slot 1 is inert by default; optional single-port training assigns it a tag
+    * only when slot 0 has none, preserving <=1 allocation per group. Tags 1..DEPTH-1 are
     * handed out by a wrapping counter in FetchAlignPlugin that advances ONLY when a packet
     * actually carries a prediction.
     *

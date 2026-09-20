@@ -287,8 +287,13 @@ in `/tmp/sq-forward-gate.jVqSkW/`, unit `m68k-sq-subword-839e4322.service`.
 It uses the shared Vivado mutex after the earlier latency matrix. Both arms use
 the same 5 ns core-only recipe and three post-route rounds. Baseline has completed:
 setup +11 ps, hold +23 ps, pulse +1.958 ns, zero failing endpoints; 93,896 LUTs,
-38,740 FFs and 37 BRAM tiles. The subword arm is now running; candidate timing
-and area remain unmeasured. The existing `build-logs:0` window follows both jobs.
+38,740 FFs and 37 BRAM tiles. The subword arm subsequently passed: **+85 ps setup,
++23 ps hold, +1.958 ns pulse**, zero failures; **92,949 LUTs, 38,701 FFs, 37 BRAM
+tiles**. That is 947 fewer LUTs and 39 fewer FFs in this matched whole-core route,
+not an estimate from source lines. This is core-only validation, not full-SoC
+closure or a measured board improvement. Combining it with other candidates
+still needs integrated timing; independent margins/area gains do not add.
+The existing `build-logs:0` window follows the serialized timing queue.
 
 ```sh
 IPC_SQ_SUBWORD=1 IPC_MEM=l2:5:70 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.bench.LsFallThroughIpcSpec'
@@ -498,6 +503,85 @@ identities across ROB wrap. Use conservative low-page-offset disjointness only
 with proven access spans and serialization attributes; unknown/device/split
 cases keep the existing ordering. The standalone tracker is still not a CPU
 implementation, and no memory-reordering gain is claimed here.
+
+## Slot-1 training and selective taken deferral — 2026-09-21
+
+Two default-off arms based on `53bb53f7`:
+
+- `trainSlot1Conditional` gives a co-emitted integer Bcc its implicit not-taken
+  history/training record, using the sole prediction-tag/table-write port when
+  slot 0 has no record. Conflicts defer slot 1. The secondary index comes through
+  the Gshare-owned service, not the previously unwired index input.
+- `deferTakenSlot1Conditional` additionally defers a secondary PHT-taken prediction
+  to slot 0 for the existing target lookup. Not-taken branches retain pairing.
+  This retains an additional PHT read that may be pruned in the baseline; no
+  second BTB target lookup, tag allocator, history-shift port or training-write
+  port is added. Route/area costs remain to be measured.
+
+Same warmed macro windows, L2 hit 5 / DDR 70, seeds 1/17; all other experimental
+options off. The table keeps cold-training sensitivity and losses visible:
+
+| Kernel | Macros | Baseline cycles | Training-only cycles | Selective cycles |
+| --- | ---: | ---: | ---: | ---: |
+| Hot loop | 336 | 252 | 252 | 252 |
+| Alternating, seed 1 | 132 | 135 | 135 | 138 |
+| Alternating, seed 17 | 132 | 234 | 135 | 138 |
+| Deep backlog | 360 | 425 | 395 | 395 |
+| Copyback call/return | 672 | 1342 | 1342 | 1342 |
+| Independent ALU | 396 | 267 | 267 | 267 |
+| Alternating, long | 2112 | 2170 | 2112 | 2112 |
+| Deep backlog, long | 2520 | 2660 | 2660 | 2285 |
+
+Both seeds agree except where separated. Training-only fixes the long alternating
+branch's missing metadata: all 384 instances train, zero inner-branch misses,
+one loop-exit miss. IPC rises **0.973272 → 1.000000 (+2.75%)**, accuracy 99.870%.
+But long backlog remains **0.947368 IPC**, 29/224 misses (87.054%) despite every
+branch now training. Training coverage is necessary but not sufficient: this arm
+still issues an implicit not-taken prediction when a slot-1 target is unavailable.
+
+Selective deferral retains the alternating-loop result and improves long backlog
+to **1.102845 IPC (+16.41%)**, 4/224 misses (98.214%). This removes the previous
+all-deferral version's 5.82% warmed tight-loop regression. The shorter seed-1
+alternating window still regresses **0.977778 → 0.956522 (−2.17%)**; do not claim
+universal improvement or representative-workload accuracy signoff. The late
+retained-frontend history repair is unchanged and still needs separate work.
+
+Both profiled arms pass their matched instrumentation-off controls and register
+checks. The updated profile explicitly requires complete training metadata for
+every branch in the two long warmed windows. Simulation assertions require
+one history event per emitted PHT record and no two tagged lanes per write port.
+Directed decode tests exercise off/training/selective-not-taken/selective-taken
+policies, moving nonzero indices, backpressure and 80 branches across the 63-tag
+wrap; they compare the exact expanded record to the originating feed packet.
+Both modes pass the ten recovery/oracle cases including I/D-side inhibited-memory
+rules. The selective mode's broader LSU corpus passes all 104 matched rows:
+96 are cycle-identical, while eight hot-loop startup cases improve 326 to 317
+cycles (404 macros). These eight span both seeds and all four LS latency-option
+combinations; warmed hot-loop timing remains unchanged. No rows are missing.
+
+The added 80-iteration cracked-RMW/tag-wrap test initially failed its final-memory
+check with both the baseline and selective modes. It incorrectly used the default
+static source-line count as a dynamic retirement bound, stopping inside the loop
+while the memory oracle ran to completion. The corrected explicit bound is
+367 + alignment-padding macros. Baseline, training-only and selective modes now
+all pass at each of three alignments, with the final memory check retained and
+explicit loop-completion assertions. This was a test-window defect, not evidence
+of a predictor-induced memory regression. The final four-policy metadata/tag-wrap
+test also passes. The required fast-gate rerun after this test correction passes
+all 382 tests (two ignored), with no failed or aborted suites.
+
+Evidence: `/tmp/train-slot1-ipc.log`, `/tmp/train-slot1-checked-ipc.log`,
+`/tmp/train-slot1-selective-ipc.log`, `/tmp/train-slot1-records.log`,
+`/tmp/train-slot1-selective-records.log`, `/tmp/train-slot1-oracle.log`.
+Further evidence: `/tmp/train-slot1-selective-corpus.log`,
+`/tmp/train-slot1-rmw-baseline-short.log` (reproduced invalid-window failure),
+`/tmp/train-slot1-rmw-{baseline,training,selective}-full.log`,
+`/tmp/train-slot1-records-final.log`, `/tmp/train-slot1-fast-final.log`.
+Use `IPC_TRAIN_SLOT1=1` or `IPC_DEFER_TAKEN_SLOT1=1` for the bench and the
+corresponding `LOCKSTEP_...` variables for the oracle. Synthesis options are
+`--train-slot1-conditional` and `--defer-taken-slot1-conditional`; the latter
+enables the required training support. Both are distinct from unconditional
+`--defer-slot1-conditional`. No board was halted, reset or loaded.
 
 ## Next investigations requested — 2026-09-21
 

@@ -499,8 +499,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val ras    = new m68k040.frontend.RasPlugin
     val gsh    = new m68k040.frontend.GsharePlugin
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
-      deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"))
-    val dec    = new DecodeStage
+      deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
+      trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
+      deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
+    val dec    = new DecodeStage(allowSlot1Prediction =
+      sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
@@ -5790,6 +5793,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ".Lbr: add.l %d1,%d6 ; and.l %d4,%d6 ; beq.s .Lskip ; add.l %d1,%d0 ; " +
       ".Lskip: sub.l %d1,%d7 ; bne.s .Lbr ; moveq #9,%d2",
       nInstr = -1)
+  }
+
+  test("lock-step: conditional training after cracked RMW across tag wrap", VerilatorTest) {
+    for (padding <- 0 until 3) {
+      val setup = Seq.fill(padding)("nop") ++ Seq(
+        "move.l #0x3000,%a0", "moveq #0,%d0", "move.l %d0,(%a0)",
+        "moveq #80,%d7", "moveq #0,%d3")
+      val body = Seq(".Lrmw: eori.l #1,(%a0)", "beq.s .Lskip",
+        "addq.l #1,%d3", ".Lskip: subq.l #1,%d7", "bne.s .Lrmw",
+        "move.l (%a0),%d4", "moveq #9,%d5")
+      runLockStep(s"conditional-rmw-wrap-$padding", (setup ++ body).mkString(" ; "),
+        // Five setup macros, four per iteration, the conditional increment
+        // on 40 odd iterations, and two final macros. The default source-line
+        // count stops inside the loop and cannot be compared to FINAL memory.
+        nInstr = 367 + padding, checkMem = Seq(0x3000L),
+        afterRun = (_, oracle) => {
+          assert(oracle.last.d(3) == 40, "RMW loop must execute all 80 iterations")
+          assert(oracle.last.d(4) == 0 && oracle.last.d(7) == 0)
+        })
+    }
   }
 
   test("lock-step: backward bne.s loop (one backward taken)", VerilatorTest) {

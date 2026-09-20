@@ -1,7 +1,7 @@
 package m68k040.frontend
 
 import m68k040.Global
-import m68k040.services.{FtbLookupCmd, GshareUpdateService, GshareWindowRsp, GshareWindowService}
+import m68k040.services.{FtbLookupCmd, GshareUpdateService, GshareWindowRsp, GshareWindowService, GshareSecondaryLookupService}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -50,7 +50,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * The branch EU still verifies every direction/target, so a gshare miss remains a pure
   * perf loss. */
-class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindowService {
+class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
@@ -60,6 +60,8 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
   override def gshareUpdate: Flow[m68k040.services.GshareUpdate] = updateFlow
   override def windowCmd: Flow[FtbLookupCmd] = windowCmdFlow
   override def windowRsp: Flow[GshareWindowRsp] = windowRspFlow
+  override def secondaryPhtIndex: UInt = logic.phtIndex1
+  override def secondaryPhtTaken: Bool = logic.phtTaken1
 
   val logic = during build new Area {
     val ghrBits    = Global.GHR_BITS.get

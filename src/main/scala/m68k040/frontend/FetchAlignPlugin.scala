@@ -33,11 +33,17 @@ case class FetchTargetQueueEntry() extends Bundle {
 }
 
 class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
-                       deferSlot1Conditional: Boolean = false)
+                       deferSlot1Conditional: Boolean = false,
+                       trainSlot1Conditional: Boolean = false,
+                       deferTakenSlot1Conditional: Boolean = false)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
     "FTQ depth must be a positive power of two")
+  require(!(deferSlot1Conditional && trainSlot1Conditional),
+    "choose either conditional deferral or single-port slot-1 training")
+  require(!deferTakenSlot1Conditional || trainSlot1Conditional,
+    "selective taken deferral requires slot-1 training")
 
   val logic = during build new Area {
     // Driven by the top level from the CPUSH/CINV I-cache invalidate pulse (the same
@@ -1175,10 +1181,11 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // the fetch-directed FTB/FTQ (task #126) instead of a speculative BTB read — a 4-bit
     // register compare rather than a 9-way RAM lookup. We still do NOT defer a
     // predicted-NOT-taken slot1 conditional (only slot0's GHR bit shifts if both slot0
-    // and slot1 are conditionals emitted the same cycle). Slot1 has no prediction
+    // and slot1 are conditionals emitted the same cycle). By default slot1 has no prediction
     // metadata at all: it neither shifts history nor trains the PHT. This is an
     // accuracy limitation, not architectural corruption; branch execution checks
-    // its implicit not-taken prediction. See the inert-tag invariant below.
+    // its implicit not-taken prediction. Optional training/admission experiments
+    // below change this while preserving the single-record-write contract.
 
     // ── RAS classification of the EMITTED slot0 (slice 2) ────────────────────────
     // isCall / isReturn are recomputed from the emitted slot0 opword (already in the
@@ -1207,10 +1214,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val s1op       = res.slot1.words(0)
     // Optional single-port admission experiment: Bcc conditions 2..15 use the
     // existing slot-0 predictor next cycle. No extra BTB read or prediction tag.
-    val slot1WouldCondPred = if (deferSlot1Conditional)
+    val slot1IsConditional = if (deferSlot1Conditional || trainSlot1Conditional)
       res.slot0Valid && res.slot1Valid && res.slot1.simple &&
         (s1op(15 downto 12) === B"4'h6") && (s1op(11 downto 8).asUInt >= U(2, 4 bits))
     else False
+    val slot1WouldCondPred = if (deferSlot1Conditional) slot1IsConditional
+      else if (trainSlot1Conditional) slot1IsConditional && (condBtbHit0 ||
+        (if (deferTakenSlot1Conditional) host[m68k040.services.GshareSecondaryLookupService].secondaryPhtTaken else False))
+      else False
     val s1IsRts    = s1op === B"16'h4E75"
     val s1IsRtr    = s1op === B"16'h4E77"
     val s1IsReturn = res.slot1Valid && res.slot1.simple && (s1IsRts || s1IsRtr)
@@ -1316,25 +1327,39 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     //
     // Only a packet that actually carries a prediction consumes a tag, and the counter
     // advances only when such a packet is CONSUMED (`feed.fire`), so the wrapping distance
-    // is measured in predicted packets, not cycles. Everything else -- slot 1 (which never
-    // carries a prediction: `Aligner` zeroes its four fields and nothing here overrides
-    // them), a non-predicted slot 0, and the synthetic faulted packet -- gets the reserved
-    // inert tag 0.
+    // is measured in predicted packets, not cycles. Default slot1, unpredicted slot0
+    // and synthetic fault packets keep inert tag 0. Optional slot1 training uses
+    // the one record only when slot0 has none, so allocations stay <=1 per group.
     val brPredCtr = Reg(UInt(Global.BR_PRED_TAG_W bits)) init 1
     val brPredLive0 = feed.payload(0).predTaken || feed.payload(0).phtValid
+    val brPredLive1 = if (trainSlot1Conditional)
+      slot1IsConditional && slot1ValidOut && !faultHold && !brPredLive0
+    else False
+    if (trainSlot1Conditional) {
+      when(brPredLive1) {
+        feed.payload(1).phtValid := True
+        feed.payload(1).phtIndex := host[m68k040.services.GshareSecondaryLookupService].secondaryPhtIndex
+      }
+      feed.payload(1).brPredTag.allowOverride
+      feed.payload(1).brPredTag := Mux(brPredLive1, brPredCtr, U(0, Global.BR_PRED_TAG_W bits))
+    }
     feed.payload(0).brPredTag.allowOverride   // unconditional re-drive over `:= res.slot0`
     feed.payload(0).brPredTag := Mux(brPredLive0, brPredCtr, U(0, Global.BR_PRED_TAG_W bits))
-    // slot 1 keeps the Aligner's inert 0 -- deliberately NOT re-driven here.
-    when(feed.fire && brPredLive0) {
+    // Without the training option slot1 retains the Aligner's inert zero tag.
+    when(feed.fire && (brPredLive0 || brPredLive1)) {
       brPredCtr := Mux(brPredCtr === U(Global.BR_PRED_TABLE_DEPTH - 1, Global.BR_PRED_TAG_W bits),
                        U(1, Global.BR_PRED_TAG_W bits), brPredCtr + 1)
     }
-    // The invariant the "slot1 is always inert" half of the scheme rests on. Checked live
-    // rather than trusted: if a future front-end change ever predicts slot 1, this fires
-    // instead of silently handing slot 1 a stale slot-0 record.
+    // Check the selected single-record policy live, rather than silently handing
+    // slot1 a stale slot0 record or requiring a second table write.
     GenerationFlags.simulation {
-      assert(!(feed.valid && slot1ValidOut && (feed.payload(1).predTaken || feed.payload(1).phtValid)),
-        "FetchAlign: slot1 must never carry a branch prediction (the side-channel tag reserves 0 for it)")
+      if (trainSlot1Conditional) {
+        assert(!(feed.valid && brPredLive0 && brPredLive1), "FetchAlign: two prediction records share one write port")
+        assert(!(feed.valid && slot1ValidOut && feed.payload(1).predTaken), "FetchAlign: slot1 training must remain not-taken")
+      } else {
+        assert(!(feed.valid && slot1ValidOut && (feed.payload(1).predTaken || feed.payload(1).phtValid)),
+          "FetchAlign: slot1 must never carry a branch prediction (the side-channel tag reserves 0 for it)")
+      }
     }
 
     // Gate feed low while STOP-quiesced so no buffered successor word is dispatched /
@@ -1574,9 +1599,10 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // ── gshare GHR speculative shift (slice 3) ──────────────────────────────────
     // Shift the GHR on the emitted slot0 predicted CONDITIONAL (taken OR not — gated on
     // condBtbHit0, not the taken-only fallback detector/action), with the predicted bit.
-    // We shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
+    // By default we shift for slot0 only: a slot1-predicted-TAKEN conditional is deferred to slot0
     // next cycle (slot1WouldFtq / slot1WouldRasPred); a slot1 not-taken conditional that co-emits with slot0
-    // has neither a GHR bit nor a PHT training index (slot1's prediction tag is inert).
+    // has neither a GHR bit nor a PHT training index. Optional slot1 training
+    // instead stamps one record and shifts its implicit not-taken bit below.
     // The slot0 lookup index used the GHR
     // BEFORE this shift; the carried phtIndex (stamped above) matches. The GHR IS now
     // repaired on a commit flush -- see GsharePlugin's `ghrArch`/`flushRepair`; this
@@ -1584,8 +1610,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // repair installs a bit-exact history.
     val ftqConfirmCond = ftqConfirmFire && ftqHeadE.isCond
     gsShiftValid := ftqConfirmCond ||
-                    (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm)
-    gsShiftDir   := Mux(ftqConfirmCond, True, slot0PredTaken)
+                    (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm) ||
+                    (feed.fire && brPredLive1)
+    gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0PredTaken))
+    GenerationFlags.simulation {
+      if (trainSlot1Conditional) when(feed.fire) {
+        assert(gsShiftValid === (feed.payload(0).phtValid ||
+          (slot1ValidOut && feed.payload(1).phtValid)),
+          "FetchAlign: history event and carried training record disagree")
+        when(brPredLive1) { assert(!gsShiftDir, "slot-1 implicit prediction must shift not-taken") }
+      }
+    }
 
     // ── RAS push/pop bookkeeping (slice 2) ───────────────────────────────────────
     // On the cycle the emitted slot0 fires (NOT a faulted packet): a call pushes its

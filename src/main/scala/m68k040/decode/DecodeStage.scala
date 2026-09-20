@@ -30,7 +30,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   * The skid is flushed by the same `pipeFlush` as the queue so a wrong-path group
   * held in the register is squashed on a mispredict/exception redirect.
   */
-class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+class DecodeStage(allowSlot1Prediction: Boolean = false) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
@@ -533,7 +533,19 @@ class DecodeStage extends FiberPlugin with DecodeUopService with FrontendDebugMa
       val mem   = Mem(Bits(recW bits), depth)
       mem.addAttribute("ram_style", "distributed")
 
-      val wrPkt  = fed.payload.packets(0)
+      val wrPkt = if (allowSlot1Prediction)
+        Mux(fed.payload.slot1Valid && (fed.payload.packets(1).brPredTag =/= 0),
+          fed.payload.packets(1), fed.payload.packets(0))
+      else fed.payload.packets(0)
+      GenerationFlags.simulation {
+        val tagged1 = fed.payload.slot1Valid && (fed.payload.packets(1).brPredTag =/= 0)
+        if (allowSlot1Prediction) {
+          assert(!(fed.valid && tagged1 && (fed.payload.packets(0).brPredTag =/= 0)),
+            "DecodeStage: two tagged packets require more than one prediction write")
+        } else {
+          assert(!(fed.valid && tagged1), "DecodeStage: slot-1 prediction capability disabled")
+        }
+      }
       val wrTag  = wrPkt.brPredTag
       val wrRec  = BranchPredRec()
       wrRec.predTaken := wrPkt.predTaken; wrRec.predTarget := wrPkt.predTarget
