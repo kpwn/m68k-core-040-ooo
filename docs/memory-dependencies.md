@@ -26,6 +26,48 @@ irrevocable stores remain older than speculative queries even across reuse.
 The current standalone checker/tracker still uses head-relative ROB ages; this
 requirement is pending integration work, not a claim that it is already met.
 
+### Reservation-backed early store readiness
+
+Separate SQ capacity reservation from payload publication. Reserving a slot
+consumes a credit and gives the store an allocation identity; the reserved slot
+is not a forwarding hit until address, attributes, byte coverage and data have
+been published. Capacity accounting includes reserved-but-unfilled entries.
+Flush cancels speculative reservations without reclaiming committed/irrevocable
+entries, and a delayed publication cannot fill a reused reservation.
+
+An early memory-dependency wake may announce a guaranteed future publication:
+reserve capacity at least one stage before filling, resolve translation and
+permissions, and ensure the load cannot reach forwarding lookup before the
+promised fill edge. If store data arrives through an already-guaranteed PRF
+writeback, its read/capture edge must be included in this timing proof. This is
+not a prediction of translation success, operand arrival or queue readiness.
+
+SQ capacity alone is insufficient in the current LSU: P3 fast-store allocation
+also waits when an older completion wins the shared completion port. The
+integrated path must decouple payload publication from that arbitration using
+reserved completion-buffer capacity, or explicitly reserve the completion slot
+too. An announced wake may not be revoked merely because that port became busy.
+Flush must squash the announcement and its speculative consumers coherently;
+inhibited/precise and unsupported split paths retain their existing handling.
+
+Required tests include full SQ with reservations, simultaneous reserve/fill/drain,
+older completion collisions, producer-data backpressure, translation faults,
+flush on each reservation/publication edge, and stale identity rejection. Assert
+that every live early-wake promise publishes the correct store by its deadline,
+and that no dependent load reads cache while that promised store is unresolved.
+This reservation-backed path is a design requirement, not integrated RTL yet.
+
+Reference checked against local NaxRiscv revision
+`9f452d50560d02fb391bc8039f5453c54e0911af`,
+`src/main/scala/naxriscv/lsu/LsuPlugin.scala`: `store.allocate` reserves SQ
+identities at dispatch, independently of address and store-data readiness.
+`store.readData.arbitration` sets `loadedAhead` before the following read stage
+writes SQ data memory; `load.sqWakes` uses translated-address plus that ahead
+bit to release waiting loads. A separate registered `loadedDone` qualifies
+later consumers requiring completed data. The transferable mechanism is the
+separation of capacity, promised readiness and actual data availability, not
+NaxRiscv's speculative memory-order rollback policy.
+
 ## Required ownership and lifetime
 
 Memory operations must be represented before they can be overtaken: reserve a
@@ -43,6 +85,21 @@ record. The old physical store-data register must not be recycled before its
 data has been captured.
 
 ## Conservative load permission
+
+### Optional resident-SQ subword forwarding
+
+Before memory-order-table integration, `sqSubwordForwarding` may independently
+enable byte/word forwarding from a naturally aligned, non-split LONG store.
+Both accesses must lie in the same physical four-byte word; a word load at byte
+offset 3 is excluded. Select the youngest older overlapping entry first. Only
+that entry may supply the result: a younger partial overwrite still stalls.
+Extract the requested bytes in 68040 big-endian order and return them in the low
+bits, leaving the LSU's existing sign/partial-register handling unchanged.
+
+Device barriers, age qualification, commit/drain, flush and all split accesses
+retain their existing rules. This is address-verified forwarding of data already
+captured in the SQ, not PRF renaming or speculative issue past unknown addresses.
+The option defaults off pending matched IPC, correctness and routed timing gates.
 
 The dependency checker consumes a snapshot of older live memory records and a
 fully translated load. Compare physical 16-byte line tags and byte masks, not

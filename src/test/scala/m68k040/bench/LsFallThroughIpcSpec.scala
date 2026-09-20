@@ -49,7 +49,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
     val modes = Seq((false, false), (true, false), (false, true), (true, true))
     val results = modes.map { case (enabled, earlyWake) =>
       val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
-        alignedLoadFallThrough = enabled, earlyLsIntWakeup = earlyWake))
+        alignedLoadFallThrough = enabled, earlyLsIntWakeup = earlyWake,
+        sqSubwordForwarding = sys.env.get("IPC_SQ_SUBWORD").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k, seed)
         assert(r.retiredInstrs >= k.retiredInstrs)

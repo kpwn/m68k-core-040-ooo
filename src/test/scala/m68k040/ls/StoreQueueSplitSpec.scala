@@ -16,6 +16,24 @@ import org.scalatest.funsuite.AnyFunSuite
   * popping only after BOTH are drain-ACKed. Flush drops both. */
 class StoreQueueSplitSpec extends AnyFunSuite {
 
+  test("optional subword path excludes split producers and independently translated split queries", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true)).doSim { dut =>
+      val cd = initDut(dut)
+      allocSplit(dut, cd, 4, 0x10e, 2, 0x900, 2, data = 0x89abcdefL)
+      setQuery(dut, 6, 0x900, Size.BYTE)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false
+      allocAligned(dut, cd, 4, 0x900, 0x89abcdefL, Size.LONG)
+      setQuery(dut, 6, 0x10f, Size.WORD, splitB = true, paddrB = 0x900)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean,
+        "query's second physical fragment must still block, never become a subword hit")
+    }
+  }
+
   /** Alloc a SPLIT store: slot A at paddrA (nbytesA), slot B at paddrB (nbytesB).
     * strb/lineData are no longer alloc-time inputs (task #252) -- StoreQueue derives
     * them at drain from (paddr low nibble, size, data); with `data #= 0` here (this

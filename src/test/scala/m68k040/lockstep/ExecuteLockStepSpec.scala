@@ -509,7 +509,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(
       alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
-      earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"))
+      earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
+      sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -5885,6 +5886,29 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("st-ld-subword",
       "move.l #0x12345678,%d0 ; move.l %d0,0x2000 ; moveq #0,%d1 ; move.w 0x2002,%d1",
       checkMem = Seq(0x2000L), checkSpan = 4)
+  }
+
+  test("lock-step: copyback subword forwarding checks byte lanes, partial registers and CCR", VerilatorTest) {
+    val setup = Seq(
+      "move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0",
+      "move.l #0xC000,%d7", "movec %d7,%tc",
+      "lea 0x2000,%a0", "move.l #0x55667788,%d1")
+    val body = for(data <- Seq(0x89abcdefL, 0x008000ffL, 0L, 0xffffffffL);
+      (suffix, offset) <- Seq("b" -> 0, "b" -> 1, "b" -> 2, "b" -> 3,
+      "w" -> 0, "w" -> 1, "w" -> 2)) yield Seq(
+      s"move.l #0x${data.toHexString},%d0", "move.l %d0,(%a0)",
+      s"move.$suffix $offset(%a0),%d1") ++
+        (if(suffix == "w") Seq("move.l %d0,(%a0)", s"movea.w $offset(%a0),%a2") else Nil)
+    var forwards = 0
+    // checkMem reads backing RAM, not dirty L1D. Four new same-set lines evict
+    // the target from the four-way copyback cache before that external check.
+    val evict = (1 to 4).map(k => s"move.l #0,0x${(0x2000 + k * 0x800).toHexString}")
+    runLockStep("copyback-subword-forward", (setup ++ body.flatten ++ evict).mkString(" ; "),
+      checkMem = Seq(0x2000L), checkSpan = 4,
+      perCycle = dut => { if(dut.lsEu.logic.p4CompletionFire.toBoolean) forwards += 1 })
+    if(sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"))
+      assert(forwards > 0, "oracle test never exercised the new forwarding path")
   }
 
   // ── MOVE-to/from-memory CCR (the bug fix) ──────────────────────────────────

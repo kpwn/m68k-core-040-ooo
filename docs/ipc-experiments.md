@@ -101,3 +101,81 @@ JAVA_OPTS='-Xmx6G -Xms512M' make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast
 
 All six baseline simulations passed. Local evidence:
 `/tmp/store-load-prf-baseline.log`.
+
+## Aligned-longword to subword forwarding — 2026-09-20
+
+Candidate: aligned-LONG producer forwarding based on `c41424f4`, option
+`sqSubwordForwarding`; other latency options off. Same warmed 80-iteration
+measurement, L2/DDR model and seeds 1/17 as above. Byte offsets 0–3 and word
+offsets 0–2 are tested; registers start with nonzero upper bits so the independent
+value checker covers partial-register preservation. Baseline/candidate differ
+only by the forwarding option, not the program or window.
+
+Matched run (64 configurations, all value checks passed, reproduced after
+adding cycle-windowed forwarding-completion counters):
+
+| Workload | Macros | Baseline cycles / IPC | Candidate cycles / IPC | IPC change |
+| --- | --- | --- | --- | --- |
+| One chain, byte or word reload | 400 | 1680 / 0.238095 | 880 / 0.454545 | +90.91% |
+| Four chains, byte or word reload | 1120 | 5200 / 0.215385 | 1104 / 1.014493 | +371.01% |
+| One chain, exact long reload | 400 | 880 / 0.454545 | 880 / 0.454545 | 0% |
+| Four chains, exact long reload | 1120 | 1104 / 1.014493 | 1104 / 1.014493 | 0% |
+
+Both seeds and every listed byte/word offset agree. This is a targeted
+microbenchmark gain, not a Dhrystone or whole-system claim. The option removes
+the drain wait for supported resident-SQ subword loads; it does not relax IQ
+ordering or implement PRF forwarding. Full timing/area are **unmeasured**;
+default remains off. Correctness: 34 SQ/split tests passed, including 1,152
+randomized byte/word/long queries, wrap/flush/device/younger-overwrite checks,
+and exclusion of split producers and independently translated split queries.
+The initial new wrap test used a hard-coded ROB width and failed in its fixture;
+it now derives the wrap from the actual port width.
+
+The measured windows contain 80 actual forward completions for one chain and
+319 for four chains with the option on; subword controls contain zero. These
+are completion events within the retirement-cycle window, not an assertion
+that each event belongs to a macro retiring within that same window.
+
+Eight enabled-option oracle cases pass, including byte lanes, preserved upper
+register bits, MOVEA.W sign extension, CCR, partial overwrites, split MOVEMs and
+wrong-path inhibited loads. The new oracle case initially compared backing RAM
+against dirty copyback data without evicting it; it failed with the option both
+off and on. Four same-set stores now evict the target before checking memory;
+both configurations pass without weakening register, CCR or memory checks.
+The broader 104-configuration corpus passes with subword forwarding enabled,
+including all four combinations of the earlier latency options. Every macro
+and cycle count matches the previous disabled-option corpus exactly. The fast
+gate passes: 381 tests passed, zero failed, two ignored (2026-09-21).
+
+Evidence: `/tmp/sq-subword-final-unit.log`, `/tmp/sq-subword-final-ipc.log`,
+`/tmp/sq-subword-oracle-baseline-fixed.log`, `/tmp/sq-subword-oracle-fixed.log`,
+`/tmp/sq-subword-corpus.log` and `/tmp/sq-subword-fast.log`.
+
+```sh
+IPC_SQ_SUBWORD=1 IPC_MEM=l2:5:70 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.bench.LsFallThroughIpcSpec'
+LOCKSTEP_SQ_SUBWORD=1 JAVA_OPTS='-Xmx6G -Xms512M' /home/qwertyoruiop/sbt/bin/sbt 'testOnly m68k040.lockstep.ExecuteLockStepSpec -- -z "subword forwarding" -z "partial-overlap" -z "overlapping sub-word" -z "MOVEM.L round trip" -z "spec-mmio D-side"'
+```
+
+Build monitoring uses the single tmux window `build-logs:0`; reuse it for future
+build logs instead of creating per-build windows. Keep the active Codex window
+separate and untouched.
+
+## Next investigations requested — 2026-09-21
+
+After the current LSU work, investigate branch prediction and a BOOM-style
+point-of-no-return frontier. Neither has a new implementation or measured gain
+in this entry.
+
+- Branch prediction: use matched retired-branch windows, distinguish conditional
+  direction errors from target/return errors and cold starts, and report both
+  accuracy per branch and mispredictions per instruction. Aim for at least 95%
+  on representative measured workloads, with IPC and routed Fmax comparisons.
+- PNR: evaluate relaxing execution/resource constraints ahead of architectural
+  retirement, not assuming arbitrary out-of-order architectural commit is safe.
+  [BOOM's ROB documentation](https://docs.boom-core.org/en/latest/sections/reorder-buffer.html#point-of-no-return-pnr)
+  describes a non-speculative frontier ahead of commit, used for coprocessor
+  issue; its commit stage still retires in order and only authorizes stores to
+  reach memory after commit. Audit our late memory/FPU faults, interrupts,
+  debug recovery, 68040 macro boundaries and physical-register lifetimes before
+  adopting analogous guarantees. Any true commit relaxation needs its own
+  architecture amendment and precise-state proof.

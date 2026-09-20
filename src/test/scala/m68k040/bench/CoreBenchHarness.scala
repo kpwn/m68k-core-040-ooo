@@ -332,7 +332,8 @@ trait CoreBenchHarness extends AnyFunSuite {
   }
 
   class FullCoreDut(alignedLoadFallThrough: Boolean = false,
-                    earlyLsIntWakeup: Boolean = false) extends Component {
+                    earlyLsIntWakeup: Boolean = false,
+                    sqSubwordForwarding: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -362,7 +363,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
-      earlyIntWakeup = earlyLsIntWakeup)
+      earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -459,7 +460,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       // addresses means the chain derailed and the run measured nothing it claims.
       ldCmdAddrs: Seq[Long] = Nil,
       ldRspCycles: Seq[Long] = Nil,
-      lsWbCycles:  Seq[Long] = Nil
+      lsWbCycles:  Seq[Long] = Nil,
+      // Actual SQ-forward completions in the IPC cycle window, not raw query hits.
+      sqForwardCompletions: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -563,6 +566,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
       // Overlapping diagnostic predicates, sliced to the exact IPC window below.
       val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
+      val sqForwardHisto = ArrayBuffer.empty[Boolean]
       var countedMacros = 0
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
@@ -766,6 +770,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
         lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
           dut.iq.logic.lsSkidValid.toBoolean))
+        sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         countedMacros += acceptedMacros
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
@@ -951,7 +956,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,
         flushToCommit.toVector,
-        ldCmdCycles.toVector, ldCmdAddrs.toVector, ldRspCycles.toVector, lsWbCycles.toVector)
+        ldCmdCycles.toVector, ldCmdAddrs.toVector, ldRspCycles.toVector, lsWbCycles.toVector,
+        sqForwardHisto.slice(lo, hi + 1).count(identity))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")

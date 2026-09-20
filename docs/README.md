@@ -5,6 +5,8 @@ Start with the [core README](../README.md) for build commands and board status.
 - [Architecture and invariants](superpowers/specs/2026-05-31-m68k-040-ooo-architecture-design.md)
 - [ISA completion and microcode](superpowers/specs/2026-06-12-isa-completion-microcode-architecture-design.md)
 - [Debug trace taps](debug-trace-taps.md)
+- [IPC experiment ledger](ipc-experiments.md)
+- [Memory-dependency design and integration status](memory-dependencies.md)
 - [Synthesis tooling](../synth/README.md)
 - [Third-party notices](../THIRD_PARTY_NOTICES.md)
 - [Repository cleanup and historical recovery](repository_cleanup.md)

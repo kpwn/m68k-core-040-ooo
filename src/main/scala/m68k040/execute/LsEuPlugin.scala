@@ -98,7 +98,8 @@ case class LsFault() extends Bundle {
 class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val walkerWedgeLimit: Int = 1 << 20,
                  val alignedLoadFallThrough: Boolean = false,
-                 val earlyIntWakeup: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyIntWakeup: Boolean = false,
+                 val sqSubwordForwarding: Boolean = false) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -577,7 +578,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                        ldFifoEmpty && !ldFifoFull
 
     // ---- store queue instance ----
-    val sq = new StoreQueue(8)
+    val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding)
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     sq.io.flush  := sqFlushSig
@@ -2889,7 +2890,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // already-launched cache/split response. A stalled SQ overlap is re-queried from
     // P4 (the query mux above selects it) until the older store drains.
     val p4CanLeave       = Bool(); p4CanLeave := False
-    val p4CompletionFire = Bool(); p4CompletionFire := False
+    val p4CompletionFire = Bool(); p4CompletionFire := False; p4CompletionFire.simPublic()
     val p4Front          = p4Ctx.xlate.front
 
     // ── Cache-inhibited accesses are PRECISE, in both directions ────────────────

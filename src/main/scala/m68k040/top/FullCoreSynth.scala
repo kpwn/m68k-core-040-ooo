@@ -808,7 +808,8 @@ object GenFullCoreSynthVerilog {
   def buildWith(dbgBuildId: BigInt, vioEnable: Boolean, outputName: String,
                 debugEnable: Boolean = true, debugStage: Int = 2,
                 alignedLoadFallThrough: Boolean = false,
-                earlyLsIntWakeup: Boolean = false): Unit = {
+                earlyLsIntWakeup: Boolean = false,
+                sqSubwordForwarding: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -816,7 +817,7 @@ object GenFullCoreSynthVerilog {
         val eu1 = new AluEuPlugin
         val branchEu = new BranchEuPlugin
         val lsEu = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
-          earlyIntWakeup = earlyLsIntWakeup)
+          earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
@@ -869,11 +870,12 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup")),
-      "expected --aligned-load-fall-through and/or --early-ls-int-wakeup")
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding")),
+      "expected --aligned-load-fall-through, --early-ls-int-wakeup and/or --sq-subword-forwarding")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
-      earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"))
+      earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"),
+      sqSubwordForwarding = args.contains("--sq-subword-forwarding"))
   }
 }
 

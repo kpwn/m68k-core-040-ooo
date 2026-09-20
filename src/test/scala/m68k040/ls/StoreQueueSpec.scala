@@ -9,6 +9,84 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class StoreQueueSpec extends AnyFunSuite {
 
+  test("optional subword forwarding matches big-endian byte model at every offset", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true)).doSim { dut =>
+      val cd = initDut(dut)
+      val random = new scala.util.Random(0x53514657L)
+      for(round <- 0 until 64) {
+        dut.io.flush #= true
+        cd.waitSampling()
+        dut.io.flush #= false
+        val base = 0x100L + 4 * random.nextInt(16)
+        val data = random.nextLong() & 0xffffffffL
+        alloc(dut, cd, 4, base, data, Size.LONG,
+          cacheMode = m68k040.cache.CacheMode.COPYBACK)
+        for(offset <- -1 to 4; (size, bytes) <- Seq(Size.BYTE -> 1, Size.WORD -> 2, Size.LONG -> 4)) {
+          setQuery(dut, 6, base + offset, size,
+            splitB = ((base + offset) & 15) + bytes > 16,
+            paddrB = ((base + offset) & ~15L) + 16)
+          sleep(1)
+          val contained = offset >= 0 && offset + bytes <= 4
+          val overlap = offset < 4 && offset + bytes > 0
+          assert(dut.io.fwd.rsp.hit.toBoolean == contained,
+            s"round=$round offset=$offset bytes=$bytes hit")
+          assert(dut.io.fwd.rsp.stall.toBoolean == (overlap && !contained))
+          if(contained) {
+            val expected = (0 until bytes).foldLeft(0L) { (v, b) =>
+              (v << 8) | ((data >>> (24 - 8 * (offset + b))) & 255)
+            }
+            assert(dut.io.fwd.rsp.data.toLong == expected,
+              f"offset=$offset bytes=$bytes data=$data%x expected=$expected%x")
+          }
+        }
+      }
+    }
+  }
+
+  test("subword forwarding preserves younger-overwrite, wrap, device and flush rules", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true)).doSim { dut =>
+      val cd = initDut(dut)
+      val wrap = 1 << dut.io.robHeadIn.getWidth
+      dut.io.robHeadIn #= wrap - 4
+      alloc(dut, cd, wrap - 2, 0x100, 0x89abcdefL, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      setQuery(dut, 1, 0x101, Size.WORD)
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0xabcd)
+      alloc(dut, cd, 0, 0x102, 0x55, Size.BYTE,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      setQuery(dut, 1, 0x101, Size.WORD)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean,
+        "younger partial overwrite must block the older covering store")
+      setQuery(dut, 1, 0x102, Size.BYTE)
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0x55)
+      setQuery(dut, wrap - 1, 0x102, Size.BYTE)
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0xcd,
+        "query preceding the overwrite must see the older longword")
+      setQuery(dut, 1, 0x100, Size.BYTE, inhibited = true)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.serial.toBoolean)
+      dut.io.drain.ready #= false
+      commit(dut, cd, wrap - 2)
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false
+      dut.io.robHeadIn #= 2
+      setQuery(dut, 3, 0x102, Size.BYTE)
+      sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0xcd,
+        "committed producer survives flush and remains forwardable")
+      alloc(dut, cd, 2, 0x200, 0x55, Size.BYTE,
+        cacheMode = m68k040.cache.CacheMode.INHIBITED)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.serial.toBoolean,
+        "nonoverlapping older device store must suppress subword forwarding")
+    }
+  }
+
   def alloc(dut: StoreQueue, cd: ClockDomain, robId: Int, paddr: Long, data: Long, size: SpinalEnumElement[Size.type],
             vaddr: Long = -1, cacheMode: SpinalEnumElement[m68k040.cache.CacheMode.type] = m68k040.cache.CacheMode.WRITETHROUGH,
             supervisor: Boolean = false, precise: Boolean = false): Unit = {

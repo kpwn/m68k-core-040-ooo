@@ -90,11 +90,12 @@ case class SqFwdRsp() extends Bundle {
   *             untouched. Same pointer discipline as the ROB/freelist.
   *  - fwd    : load forward check. Among entries OLDER than query.robId (ROB
   *             circular order), address-overlapping: full same-size overlap ->
-  *             hit+data (youngest such); partial/ambiguous -> stall.
+  *             hit+data (youngest such); partial/ambiguous -> stall. Optional
+  *             subword forwarding also covers byte/word loads within aligned LONGs.
   *
   * All state is RegInit (no uninit Regs); counts are hardware sums (no
   * when-gated Scala-var counters). */
-class StoreQueue(depth: Int = 8) extends Component {
+class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Component {
   require(isPow2(depth))
   val ptrW = log2Up(depth)
 
@@ -512,7 +513,8 @@ class StoreQueue(depth: Int = 8) extends Component {
   // A younger load checks BOTH slot A [paddrA, +nbytesA) and (if validB) slot B
   // [paddrB, +nbytesB) of every older store. A full single-slot forward is taken
   // ONLY for an exact addr+size match against a NON-split store's slot A (the
-  // aligned fast path, unchanged). Any overlap with slot B, or a partial overlap,
+  // aligned fast path, unchanged), or the optional contained subword case below.
+  // Any overlap with slot B, or an unsupported partial overlap,
   // STALLS (the cross load waits for the store to drain to memory then re-reads).
   val q          = io.fwd.query
   // ── Query-side geometry: line + 19-bit byte-lane span. NO ARITHMETIC. ─────────
@@ -569,7 +571,15 @@ class StoreQueue(depth: Int = 8) extends Component {
     // the old form gave too (an entry at the same address with the same length would
     // itself have been split, hence `validB`, hence excluded).
     val geomFull = !validBs(i) && sameLineA && (maskAs(i).resize(19) === qSpan)
-    val full     = ent && geomFull
+    // Deliberately limited to aligned LONG producers: byte extraction is then
+    // shared after winner selection, with no per-entry barrel shifter or adder.
+    val geomSubword = if(subwordForwarding) {
+      !validBs(i) && !q.splitB && sizes(i) === Size.LONG &&
+        paddrs(i)(1 downto 0) === 0 && sameLineA &&
+        paddrs(i)(3 downto 2) === q.paddr(3 downto 2) &&
+        (q.size === Size.BYTE || (q.size === Size.WORD && q.paddr(1 downto 0) =/= 3))
+    } else False
+    val full     = ent && (geomFull || geomSubword)
     val partial  = overlap && !full
     val inhibitedStore = ent &&
       ((cacheModes(i) === CacheMode.INHIBITED) ||
@@ -767,6 +777,7 @@ class StoreQueue(depth: Int = 8) extends Component {
   val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)))
   case class Cand() extends Bundle {
     val valid = Bool(); val full = Bool(); val dist = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits); val data = Bits(32 bits)
+    val subword = Bool()
   }
   val cands = (0 until depth).map { i =>
     val c = Cand()
@@ -774,6 +785,7 @@ class StoreQueue(depth: Int = 8) extends Component {
     c.full  := perEntry(i).full
     c.dist  := ageDist(i)
     c.data  := datas(i)
+    c.subword := perEntry(i).geomSubword
     c
   }
   val best = cands.reduceBalancedTree { (a, b) =>
@@ -805,6 +817,15 @@ class StoreQueue(depth: Int = 8) extends Component {
   // the DEVICE, never echo an older store's data out of this ring.
   io.fwd.rsp.hit   := fullValid && !serialStall
   io.fwd.rsp.data  := best.data
+  if(subwordForwarding) {
+    val byteData = Vec(best.data(31 downto 24), best.data(23 downto 16),
+      best.data(15 downto 8), best.data(7 downto 0))(q.paddr(1 downto 0))
+    val wordData = Vec(best.data(31 downto 16), best.data(23 downto 8),
+      best.data(15 downto 0), B(0, 16 bits))(q.paddr(1 downto 0))
+    when(best.subword) {
+      io.fwd.rsp.data := Mux(q.size === Size.BYTE, byteData.resize(32), wordData.resize(32))
+    }
+  }
   io.fwd.rsp.serial := serialStall
   // DELIBERATELY NOT `|| serialStall`.  Driving the boundary as a forwarding STALL
   // made the LS-EU re-query from p4 every cycle until the older store drained --
