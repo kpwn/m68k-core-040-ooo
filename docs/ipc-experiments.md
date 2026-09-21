@@ -681,17 +681,29 @@ across both seeds and all four load-latency option combinations
 382 tests (two ignored, zero failed/aborted), including the final rerun in
 `/tmp/retained-history-fast-final.log`. Use `IPC_RETAIN_HISTORY=1` in benchmarks,
 `LOCKSTEP_RETAIN_HISTORY=1` in the oracle, or `--retain-redirect-history` in the
-core generator. The option remains off in production; routed timing, integrated
-SoC timing and board IPC are not established.
+core generator. The option remains off in production; integrated SoC timing and
+board IPC are not established.
 
 The incremental selective/retained core timing comparison is pinned to
 `4c012cdcc691042ff0b44448dc1ec4c477064fb4`, unit
 `m68k-retained-history-4c012cdc.service`, artifacts
-`/tmp/retained-history-gate.EaS8V5`. It waits for the full slot-1 matrix, then
-routes both arms serially under the shared Vivado mutex at 5 ns with three
+`/tmp/retained-history-gate.EaS8V5`. It waited for the full slot-1 matrix, then
+routed both arms serially under the shared Vivado mutex at 5 ns with three
 post-route rounds. Both arms enable selective taken deferral; only the second
 enables history preservation. The existing `build-logs:0` pane follows this
 queue and its predecessors; the running Codex pane is untouched.
+
+Completed 04:31 Europe/Rome: the selective baseline reproduces **−0.280 ns**
+setup slack, while selective plus retained history **passes routed 200 MHz**:
+WNS **+0.017 ns**, WHS **+0.021 ns**, WPWS **+1.958 ns**, zero setup/hold/pulse
+failing endpoints. Routed LUTs 93,830→93,883; FFs 38,732→38,782; BRAM tiles
+37→37. Reports are the respective `synth/fullcore_route_timing.rpt` and
+`synth/fullcore_route_util.rpt`. This qualifies the measured retained-history
+combination at the core gate, not the standalone selective option, a whole-SoC
+build, or its as-yet-unrouted composition with the newer LSU candidates. The
+different routed outcome does not prove a structural repair to the baseline's
+cold FPU/exception/control cones; the final margin is only 17 ps. The serialized
+queue has advanced to the early-store-address pair while IPC development continues.
 
 ## Memory-order ownership groundwork — 2026-09-21
 
@@ -1033,7 +1045,7 @@ Artifacts: `/tmp/sq-reserve-gate.sU6Lpv`; the existing `build-logs:0` pane follo
 both elaboration and implementation logs. This queue does not stall the next IPC
 experiment, and no timing result is available yet.
 
-Next dependency experiment to evaluate: move late-data ownership from P3 into
+Follow-on dependency experiment (now implemented below): move late-data ownership from P3 into
 the reserved SQ entry, reusing its stored address/data and adding only the source
 tag and minimal store-completion metadata. An independent late-data reader could
 then fill/complete the store while P3 serves younger known-disjoint loads. Keep
@@ -1041,8 +1053,92 @@ oldest-LS address issue initially, so no load overtakes an unknown older address
 known overlap with unavailable data remains a real wait. This could avoid a
 duplicate address table for that subset, but requires a spec amendment, a precise
 completion/flush/lifetime design and actual bypass/liveness tests. It is not
-implemented or a substitute for evaluating the remaining broader dependency,
+part of the P3-owned implementation or a substitute for evaluating the remaining broader dependency,
 reservation-backed wakeup and retry requirements.
+
+## Independent late-store ownership and known-address load bypass — 2026-09-21
+
+Default-off `detachLateStore`, layered on early-store-address execution and SQ
+reservation. The [memory-dependency specification](memory-dependencies.md) now
+permits this bounded alternative to duplicating dispatch address metadata: keep
+oldest-LS address issue, translate the older store fully, reserve its SQ entry,
+then let P3 serve younger accesses while one independent owner waits for data.
+Only source/completion metadata and four retained NZVC bits leave P3; no extra
+PRF port, duplicate address table or store-data buffer is added. A second pending
+store waits conservatively. Full/partial/physical-alias overlaps still consult
+the SQ, and inhibited accesses retain their existing ordering/commit rules.
+
+The owner fills SQ on its qualified PRF read edge even if completion loses to
+an already-launched cache response or precise-store replay. It retains NZVC and
+completes later, without publishing twice. New front completions yield to this
+owner, avoiding a deadlock when a younger overlapping load occupies P4. Flush
+cancels owner and reservation together; readiness is not inherited on reuse.
+This is actual known-address load bypass, **not** unknown-address speculation,
+general oldest-ready LS selection, an integrated dispatch tracker, or a guaranteed
+advance wakeup. Production defaults stay off.
+
+Matched full-core comparison: P3 reservation baseline versus detached owner,
+both with direct long MOVE fusion and early store address, `l2:5:70`, seeds 1/17,
+and four combinations of the older aligned-load fall-through/early-wakeup options.
+The corpus now has 17 kernels, adding a recurrence where a disjoint younger load
+feeds the next divide. All **136 macro counts match: 28 improve, 108 are identical,
+zero new regressions**. All 128 pre-existing baseline rows reproduce the prior
+P3-reservation run exactly. The earlier direct-load-fusion regressions against the
+original baseline remain part of the cumulative assessment.
+
+| Kernel, both older load options | Macros | P3-owner cycles (seed 1 / 17) | Detached cycles | Incremental IPC gain |
+| --- | ---: | ---: | ---: | ---: |
+| delayed store / disjoint-load recurrence | 100 | 2559 / 2558 | 2245 / 2244 | +13.987% / +13.993% |
+| delayed store + disjoint load | 163 | 2156 / 2157 | 2151 / 2152 | +0.232% / +0.232% |
+| rotate → store → load recurrence | 130 | 339 / 338 | 333 / 333 | +1.802% / +1.502% |
+| load → store recurrence | 130 | 347 / 346 | 343 / 342 | +1.166% / +1.170% |
+
+Without aligned-load fall-through the new disjoint recurrence goes 2591→2245
+cycles (+15.412% IPC). Each such run observes **32 younger load completions before
+their older detached stores capture data**; the older disjoint kernel observes
+31. Instrumentation compares both live ROB IDs relative to head, not a signed
+half-range subtraction. No board-speedup claim follows from these synthetic tests.
+
+Logs: `/tmp/sq-detach-baseline-ipc.log` and
+`/tmp/sq-detach-candidate-ipc.log`. Reproduce with `IPC_RESERVE_LATE_STORE=1
+IPC_EARLY_STORE_ADDRESS=1 IPC_FUSE_LONG_MOVE_LOADS=1 IPC_MEM=l2:5:70` and
+`testOnly m68k040.bench.LsFallThroughIpcSpec`; add `IPC_DETACH_LATE_STORE=1`
+only to the candidate. The initial directed attempt failed to compile because
+the new context used an unqualified `Size()`; qualifying the existing enum fixed
+that test/build error (`/tmp/sq-detach-initial-ipc.log`). Its rerun passed all 32
+selected windows (`/tmp/sq-detach-initial-ipc-v2.log`), before the full comparison.
+
+Fourteen selected combined-option oracle tests already pass
+(`/tmp/sq-detach-oracle.log`): data/CCR/subwords, aliases, split physical pages,
+device ordering, observed unfilled-reservation redirect cancellation, precise
+page faults/retry, direct-load/A7 trap handling and wrong-path MMIO. The alias test
+maps two virtual pages to the same physical page in **both** RTL and Musashi;
+the new optional oracle-MMU argument avoids treating virtual aliases as disjoint
+oracle storage. The split case wraps its second physical fragment to the start
+of that same page. The device case observes the younger inhibited load parked
+behind the owner and exactly one eventual device read.
+
+The full-capacity/different-source test passes and asserts both owner capture
+with all eight SQ slots occupied and another pending source waiting in P3.
+The first contention test failed its coverage assertion: only three detached
+publications occurred and none collided with a back response. No data mismatch
+was reported (`/tmp/sq-detach-oracle-capacity.log`); no RTL was changed for this
+failure. Repeating warm loops at different phases exercised two collisions and
+recoveries. That run passes **53** selected oracle tests, including IRQ, NMI,
+nested interrupts, varied precise-drain response timing and write-protect faults
+(`/tmp/sq-detach-oracle-capacity-v2.log`); the four new P3-owner controls also pass
+(`/tmp/sq-detach-oracle-control-v2.log`).
+
+The final contention fixture uses `0x80000000 / 0xffff`, producing packed
+`0x80008000`, so a held completion must retain a nonzero N flag. It observes
+**51 publications, three contended captures and three retained completions**,
+checking each resumed ROB identity and NZVC=8 as well as architectural oracle
+results. All four new tests pass with detach enabled and disabled
+(`/tmp/sq-detach-oracle-capacity-v3.log`,
+`/tmp/sq-detach-oracle-control-v3.log`). The required fast gate passes **384**
+tests, two ignored, no failed or aborted suites; the exact final-source rerun
+also passes (`/tmp/sq-detach-final-fast-v3.log`). Timing/area remain pending, with a
+matched core routing pair to follow the P3-reservation pair.
 
 ## Next investigations requested — 2026-09-21
 

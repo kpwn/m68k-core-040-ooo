@@ -28,6 +28,20 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         assert((lastD0.archRegWrite & 0xffffffffL) == 0x7fffL)
       })
   }
+  private def delayedDisjointRecurrence: Kernel = {
+    val setup = Seq("moveq #1,%d1", "move.l #0x7fff,0x4610",
+      "move.l 0x4610,%d0", "move.l 0x4600,%d3")
+    // The disjoint load supplies the NEXT divide. It may execute before this
+    // iteration's store gets data, but must not clobber that store's old PRF source.
+    val body = Seq.fill(32)(Seq("divu.w %d1,%d0", "move.l %d0,0x4600",
+      "move.l 0x4610,%d0")).flatten
+    Kernel("delayed-store-disjoint-recurrence", (setup ++ body).mkString(" ; ") + guard,
+      setup.size + body.size, copybackDtt = true,
+      verifyRetirement = obs => {
+        val lastD0 = obs.filter(o => o.archRegValid && o.archRegId == 0).last
+        assert((lastD0.archRegWrite & 0xffffffffL) == 0x7fffL)
+      })
+  }
   private def shortStoreRecurrence(loadProducer: Boolean): Kernel = {
     val setup = Seq("move.l #0x13579bdf,%d0", "move.l %d0,0x4620")
     val producer = if(loadProducer) "move.l 0x4620,%d0" else "rol.l #1,%d0"
@@ -69,7 +83,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         kStoreStream, kCallReturn).map(k => k.copy(src = k.src + guard)) ++
       Seq(kLoadStore, kMixed).map(k => k.copy(name = k.name + "-copyback",
         src = k.src + guard, copybackDtt = true)) ++ Seq(delayedStore, delayedStoreRecurrence,
-          shortStoreRecurrence(loadProducer = false), shortStoreRecurrence(loadProducer = true))
+          shortStoreRecurrence(loadProducer = false), shortStoreRecurrence(loadProducer = true),
+          delayedDisjointRecurrence)
     val kernels = sys.env.get("IPC_KERNEL_REGEX") match {
       case Some(pattern) => allKernels.filter(k => k.name.matches(pattern))
       case None => allKernels
@@ -87,7 +102,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1"),
         earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"),
         fuseLongMoveLoads = sys.env.get("IPC_FUSE_LONG_MOVE_LOADS").contains("1"),
-        reserveLateStore = sys.env.get("IPC_RESERVE_LATE_STORE").contains("1")))
+        reserveLateStore = sys.env.get("IPC_RESERVE_LATE_STORE").contains("1"),
+        detachLateStore = sys.env.get("IPC_DETACH_LATE_STORE").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
@@ -98,6 +114,10 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
           assert(r.reservedStores == r.lateStoreCaptures && r.reservedPublishes == r.reservedStores,
             "every delayed-data store in this cacheable kernel must reserve and publish exactly once")
         }
+        if(sys.env.get("IPC_DETACH_LATE_STORE").contains("1") &&
+          k.name == "delayed-store-disjoint-recurrence")
+          assert(r.detachedLoadOvertakes > 0,
+            "no younger disjoint load completed before the detached store acquired data")
         if(k.name == pointerChain.name) {
           assert(r.ldCmdAddrs.size >= 258, s"pointer chase did not execute its loads: ${r.ldCmdAddrs.size}")
           r.ldCmdAddrs.zipWithIndex.foreach { case (addr, n) =>
@@ -107,7 +127,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         }
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures} " +
-          s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds}")
+          s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds} " +
+          s"detachedLoadOvertakes=${r.detachedLoadOvertakes}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +

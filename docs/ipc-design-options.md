@@ -277,9 +277,14 @@ Intermediate result before direct-load fusion: default-off early store address e
 load bypass, passes 128 matched full-core cases. Divide-fed and rotate-fed
 store/load recurrences improve 4.34–6.21%; the load-fed recurrence is unchanged
 and never takes late capture. There are no measured cycle regressions. It reuses
-the existing PRF read port and P3 data fields; independent SQ publication/retry
-and routed timing remain unfinished. See the experiment ledger for exact windows
-and gates, not a board-speedup claim.
+the existing PRF read port and P3 data fields. The subsequent default-off detached
+owner experiment permits actual younger-disjoint-load bypass after translation
+and SQ reservation, without a duplicate address table. All 136 matched windows
+retain macro counts: 28 improve, 108 are identical, none newly regress. The new
+disjoint-load recurrence gains 13.99% with both older load optimizations. This
+does not permit bypass past an unknown address or integrate the general dispatch
+tracker/retry mechanism. See the experiment ledger for gates and pending routing,
+not a board-speedup claim.
 
 ### 13. Reserved SQ slots and guaranteed early store-data wake
 
@@ -302,10 +307,16 @@ cycle later. With direct-load fusion plus early store address as the baseline,
 regressions. Load-fed recurrence gains another 17.00–17.05%; rotate-fed recurrence
 11.21–11.24%. Full-capacity fallback and redirect cancellation are observed and
 checked against the oracle. The source tag/P3 owner is canceled synchronously;
-no asynchronous response uses the bare SQ slot. P3 still holds completion
-metadata, and shared completion contention is not reserved ahead: **no guaranteed
-early wake or independent younger-load bypass is implemented yet**. Routing is
-pending. Detailed evidence and remaining work are in the experiment ledger.
+no asynchronous response uses the bare SQ slot.
+
+The follow-on detached-owner option moves only source/completion metadata out of
+P3; addresses and data remain in the existing SQ. Publication can proceed even
+when completion loses arbitration, and younger disjoint loads actually bypass.
+It has one independent pending owner and reuses the existing PRF port. **No
+guaranteed advance memory wake is emitted yet.** Evaluate publication-edge
+forwarding and guaranteed lookup readiness next, preserving overlap/device/flush
+safety and measuring the added data-path timing. Routing remains pending; detailed
+evidence and remaining capacity/retry work are in the experiment ledger.
 
 ### 14. Shorter resident L1D path without a long permission cone
 

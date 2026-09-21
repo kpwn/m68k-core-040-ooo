@@ -102,7 +102,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
 
   val io = new Bundle {
     val alloc    = slave(Flow(SqAlloc()))
-    // Local synchronous reservation owner: LSU P3. Flush cancels that owner;
+    // Local synchronous reservation owner: LSU P3 or its detached record. Flush cancels that owner;
     // this slot index must never be used for an outstanding asynchronous reply.
     val reserveOnly = if(reserveLateStore) in Bool() else null
     val allocSlot = if(reserveLateStore) out(UInt(ptrW bits)) else null

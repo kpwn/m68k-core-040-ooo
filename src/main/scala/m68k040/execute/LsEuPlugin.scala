@@ -100,7 +100,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val alignedLoadFallThrough: Boolean = false,
                  val earlyIntWakeup: Boolean = false,
                  val sqSubwordForwarding: Boolean = false,
-                 val reserveLateStore: Boolean = false) extends FiberPlugin with LsEuService {
+                 val reserveLateStore: Boolean = false,
+                 val detachLateStore: Boolean = false) extends FiberPlugin with LsEuService {
+  require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -271,6 +273,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
   val logic = during build new Area {
     val lateStoreData = host.get[m68k040.services.LateStoreDataService].flatMap(_.lateStoreData)
+    require(!detachLateStore || lateStoreData.nonEmpty,
+      "detached late stores require the early-store-address readiness service")
     val dcache = host[DcacheService]
     val xlate  = host[DTranslationService]
     // The current architectural S bit (ROB-owned) — a normal LOAD/STORE's DTLB
@@ -1809,6 +1813,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val compPdst      = Reg(UInt(6 bits))
     val compPdstValid = RegInit(False)
     val compIsLoad    = RegInit(False)   // load (writes a reg + wakes) vs store
+    compIsLoad.simPublic()
     // A STACK-PUSH store produces an int reg (the predecremented A7) — unlike a plain
     // store. It must write the int PRF AND broadcast a wakeup (a consumer of the new
     // A7 — e.g. a following push/pop — waits on it). `compWakes` gates the wakeup for
@@ -1860,6 +1865,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // flags the entry (vector 2) for precise delivery at retire. RegInit(False) so an
     // unfaulted access never spuriously flags. Captured alongside the comp* stage.
     val compIsFault   = RegInit(False)
+    compIsFault.simPublic()
     val compFaultAddr = Reg(UInt(32 bits))
     val compFaultWr   = RegInit(False)
     val compFaultSize = Reg(UInt(2 bits))
@@ -2896,6 +2902,74 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       probeCancelToken := token
     }
 
+    // One synchronous owner for a translated, SQ-resident store waiting on data.
+    // Address/data remain in the SQ. These few fields are all a plain MOVE store
+    // needs to finish independently of P3; no integer result or extra PRF port.
+    val detachedStore = if(detachLateStore) Some(new Area {
+      case class Context() extends Bundle {
+        val slot = UInt(sq.ptrW bits)
+        val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+        val dataTag = UInt(6 bits)
+        val size = m68k040.isa.Size()
+        val writesNzvc = Bool()
+        val nzvcDst = UInt(nzvcW.address.getWidth bits)
+        val crackDrop = Bool()
+        val keepCommit = Bool()
+      }
+      val reserve = Flow(Context())
+      val valid = RegInit(False)
+      val ctx = Reg(Context())
+      val captured = RegInit(False)
+      val nzvc = Reg(Bits(4 bits))
+      val query = lateStoreData.get
+      val readyPrior = RegNext(valid && !captured && query.queryReady &&
+        !sqFlushSig && !excActive) init False
+      val capture = valid && !captured && readyPrior && !sqFlushSig && !excActive
+      val complete = valid && (captured || capture) && !backCompFires &&
+        !preciseReplayClaimsComp && !sqFlushSig && !excActive
+      when(capture) {
+        rdData.addr := ctx.dataTag
+        nzvc := moveNzvc(rdData.data, ctx.size)
+        captured := True
+      }
+      when(complete) {
+        liveCompletionFires := True
+        compValid := True
+        compRobId := ctx.robId
+        compData := 0
+        compPdst := 0; compPdstValid := False
+        compIsLoad := False; compWakes := False
+        compStkPush := False; compCcrRestore := False; compEaAutoDrop := False
+        compRmwStore := !ctx.writesNzvc
+        compCrackDrop := ctx.crackDrop; compKeepCommit := ctx.keepCommit
+        compDstArch := 0
+        compNzvc := Mux(capture, moveNzvc(rdData.data, ctx.size), nzvc)
+        compNzvcWrite := ctx.writesNzvc; compNzvcDst := ctx.nzvcDst
+        compX := False; compXWrite := False; compXDst := 0
+        compIsFault := False
+        valid := False
+        readyPrior := False
+      }
+      when(reserve.valid) {
+        valid := True; captured := False; ctx := reserve.payload
+        readyPrior := False
+      }
+      when(sqFlushSig || excActive) { valid := False; readyPrior := False }
+      GenerationFlags.simulation {
+        when(reserve.valid) { assert(!valid, "detached store owner overrun", FAILURE) }
+        when(capture) {
+          assert(query.queryReady, "detached store source readiness revoked", FAILURE)
+          assert(!issuePort.fire, "detached store capture collided with issue", FAILURE)
+        }
+      }
+      valid.simPublic(); captured.simPublic(); ctx.robId.simPublic()
+      capture.simPublic(); complete.simPublic()
+    }) else None
+    val detachedStoreValid = detachedStore.map(_.valid).getOrElse(False)
+    val detachedStoreCapture = detachedStore.map(_.capture).getOrElse(False)
+    val detachedStoreComplete = detachedStore.map(_.complete).getOrElse(False)
+    detachedStoreValid.simPublic(); detachedStoreCapture.simPublic(); detachedStoreComplete.simPublic()
+
     // P4 is oldest among the unlaunched front stages, so it has first claim after an
     // already-launched cache/split response. A stalled SQ overlap is re-queried from
     // P4 (the query mux above selects it) until the older store drains.
@@ -2986,7 +3060,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // `sq.io.barrier.olderInhibitedStore` would, so this adds no new wait condition).
       val mustRetry    = p4Ctx.fwdStall || (p4Ctx.fwdHit && p4Front.twoAccess) || p4Ctx.fwdSerial
       when(fullForward) {
-        when(backCompFires || preciseReplayClaimsComp) {
+        when(backCompFires || preciseReplayClaimsComp || detachedStoreComplete) {
           frontCompHeld := True
         } otherwise {
           captureCompletionFront(p4Front, p4Ctx.fwdData)
@@ -3122,17 +3196,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p3IsLoad         = p3Front.memOp === MemOp.LOAD
     val p3IsStore        = p3Front.memOp === MemOp.STORE
     val p3LateDataPending = lateStoreData.map(_ => p3Front.lateDataPending).getOrElse(False)
-    val p3Reserved = if(reserveLateStore) RegInit(False) else False
+    val p3Reserved = if(reserveLateStore && !detachLateStore) RegInit(False) else False
     val p3ReservationFire = Bool(); p3ReservationFire := False
     val p3ReservedPublish = Bool()
     if(!reserveLateStore) p3ReservedPublish := False
-    val lateDataCapture = Bool()
-    if (lateStoreData.isEmpty) lateDataCapture := False
+    val p3LateDataCapture = Bool()
+    if (lateStoreData.isEmpty) p3LateDataCapture := False
+    val lateDataCapture = p3LateDataCapture || detachedStoreCapture
     lateStoreData.foreach { p =>
-      p.queryTag := p3Front.lateDataTag
+      p.queryTag := detachedStore.map(d => Mux(d.valid, d.ctx.dataTag, p3Front.lateDataTag))
+        .getOrElse(p3Front.lateDataTag)
       // One registered clear cycle after the producer's busy bit clears. This
       // covers next-cycle LS early wakeups before reusing the data read port.
-      val readyPrior = RegNext(p3Valid && p3LateDataPending && p.queryReady &&
+      val readyPrior = RegNext(p3Valid && p3LateDataPending && !detachedStoreValid && p.queryReady &&
         !sqFlushSig && !excActive) init False
       // A reserved store may now leave on its capture edge. Its readiness must
       // not qualify a different pending source replacing P3 on that same edge.
@@ -3140,16 +3216,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // The live source cannot be reallocated before this store completes. Once
       // qualified, readiness cannot revoke; keep the wide busy lookup off the
       // read-port arbitration/issue-ready cone.
-      lateDataCapture := p3Valid && p3LateDataPending && readyPrior &&
+      p3LateDataCapture := p3Valid && p3LateDataPending && !detachedStoreValid && readyPrior &&
         !sqFlushSig && !excActive
-      when(lateDataCapture) {
+      when(p3LateDataCapture) {
         rdData.addr := p3Front.lateDataTag
         p3Ctx.front.storeData := rdData.data
         p3Ctx.front.storeNzvc := moveNzvc(rdData.data, p3Front.size)
         p3Ctx.front.lateDataPending := False
       }
       GenerationFlags.simulation {
-        when(lateDataCapture) {
+        when(p3LateDataCapture) {
           assert(p.queryReady, "late store source readiness revoked before capture", FAILURE)
           assert(!issuePort.fire, "late store capture collided with a new data-port reader", FAILURE)
         }
@@ -3158,33 +3234,56 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
             !u0.stkPush && u0.eaAuto === m68k040.decode.EaAuto.NONE && !u0.movesAliasStore,
             "late store data issued on an unsupported operation", FAILURE)
         }
-        when(p3Valid && p3LateDataPending && !lateDataCapture) {
+        when(p3Valid && p3LateDataPending && !p3LateDataCapture) {
           assert((!sq.io.alloc.valid || p3ReservationFire) && !p3CompletionFire,
             "store published before its late data capture", FAILURE)
         }
       }
     }
     lateDataCapture.simPublic(); p3LateDataPending.simPublic()
-    val olderThanP3Comp  = backCompFires || preciseReplayClaimsComp || p4CompletionFire
+    val olderThanP3Comp  = backCompFires || preciseReplayClaimsComp || detachedStoreComplete || p4CompletionFire
     if(reserveLateStore) {
-      val reservedSlot = Reg(UInt(sq.ptrW bits))
       sq.io.reserveOnly := p3ReservationFire
       sq.io.publish.valid := p3ReservedPublish
-      sq.io.publish.slot := reservedSlot
-      sq.io.publish.robId := p3Front.robId
       sq.io.publish.data := rdData.data
-      when(p3ReservationFire) {
-        p3Reserved := True
-        reservedSlot := sq.io.allocSlot
+      if(detachLateStore) {
+        val d = detachedStore.get
+        d.reserve.valid := p3ReservationFire
+        d.reserve.slot := sq.io.allocSlot
+        d.reserve.robId := p3Front.robId
+        d.reserve.dataTag := p3Front.lateDataTag
+        d.reserve.size := p3Front.size
+        d.reserve.writesNzvc := p3Front.writesNzvc
+        d.reserve.nzvcDst := p3Front.pNzvcDst
+        d.reserve.crackDrop := p3Front.crackDrop
+        d.reserve.keepCommit := p3Front.keepCommit
+        GenerationFlags.simulation {
+          when(d.reserve.valid) {
+            assert(!p3Front.pdstValid && !p3Front.stkPush && !p3Front.autoStoreAn &&
+              !p3Front.ccrRestore && !p3Front.writesX && !p3Front.leaAddr,
+              "detached completion omitted an architectural store side effect", FAILURE)
+          }
+        }
+        sq.io.publish.slot := d.ctx.slot
+        sq.io.publish.robId := d.ctx.robId
+        p3ReservedPublish := d.capture
+      } else {
+        val reservedSlot = Reg(UInt(sq.ptrW bits))
+        sq.io.publish.slot := reservedSlot
+        sq.io.publish.robId := p3Front.robId
+        when(p3ReservationFire) {
+          p3Reserved := True
+          reservedSlot := sq.io.allocSlot
+        }
+        when(p3CanLeave || sqFlushSig || excActive) { p3Reserved := False }
+        p3ReservedPublish := p3Reserved && p3LateDataCapture
       }
-      when(p3CanLeave || sqFlushSig || excActive) { p3Reserved := False }
-      p3ReservedPublish := p3Reserved && lateDataCapture
       GenerationFlags.simulation {
         when(p3Reserved) {
           assert(p3Valid && p3IsStore && fastStore && !storePrivBlocked,
             "LSU: SQ reservation escaped its P3 store owner", FAILURE)
         }
-        when(p3ReservedPublish) {
+        when(p3ReservedPublish && !Bool(detachLateStore)) {
           assert(!sq.io.alloc.valid, "LSU: reserved data fill duplicated SQ allocation", FAILURE)
         }
       }
@@ -3193,14 +3292,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     when(p3Valid && !sqFlushSig && !excActive) {
       when(p3IsStore) {
         when(p3Reserved) {
-          when(!p3LateDataPending || lateDataCapture) {
+          when(!p3LateDataPending || p3LateDataCapture) {
             when(olderThanP3Comp) {
               frontCompHeld := True
             } otherwise {
               // The data has either been captured already, or is being written
               // directly into the reserved SQ entry on this very edge.
               captureCompletionFront(p3Front, B(0, 32 bits))
-              when(lateDataCapture) { compNzvc := moveNzvc(rdData.data, p3Front.size) }
+              when(p3LateDataCapture) { compNzvc := moveNzvc(rdData.data, p3Front.size) }
               p3CompletionFire := True
               p3CanLeave := True
             }
@@ -3209,10 +3308,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           // Address has resolved; preserve ordering until data is resident.
           // If capacity only appears on the capture edge, use the ordinary
           // captured-data path next cycle; never create an unfillable reservation.
-          if(reserveLateStore) when(fastStore && !storePrivBlocked && !sq.io.full && !lateDataCapture) {
+          if(reserveLateStore) when(fastStore && !storePrivBlocked && !sq.io.full &&
+            !p3LateDataCapture && !detachedStoreValid) {
             sq.io.alloc.valid := True
             sq.io.alloc.payload.precise := False
             p3ReservationFire := True
+            if(detachLateStore) p3CanLeave := True
           }
         } elsewhen(storePrivBlocked) {
           when(olderThanP3Comp) {
@@ -3258,7 +3359,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val txTokenMatch     = xlate.rsp.payload.token === txToken
     val txMatchedRsp     = txValid && txWaitingRsp && xlate.rsp.valid && txTokenMatch
     val txFirstSplitRsp  = !txSecond && txCtx.twoAccess
-    val olderThanTxComp  = backCompFires || preciseReplayClaimsComp ||
+    val olderThanTxComp  = backCompFires || preciseReplayClaimsComp || detachedStoreComplete ||
                            p4CompletionFire || p3CompletionFire
     val txCanConsumeRsp  = Bool(); txCanConsumeRsp := False
     when(txMatchedRsp && !sqFlushSig && !excActive) {
@@ -3441,7 +3542,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // leave only on a real command handshake; LEA/non-memory retain their shallow
     // direct completion path.
     val tCanLeave       = Bool(); tCanLeave := False
-    val olderThanTComp = backCompFires || preciseReplayClaimsComp ||
+    val olderThanTComp = backCompFires || preciseReplayClaimsComp || detachedStoreComplete ||
                          p4CompletionFire || p3CompletionFire
 
     when(tValid && !sqFlushSig && !excActive) {

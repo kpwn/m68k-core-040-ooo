@@ -517,7 +517,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
       earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
       sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
-      reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"))
+      reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
+      detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -730,7 +731,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                   // runs and still prints its divergence -- loudly -- but does not fail
                   // the test. Remove the argument when the RTL is fixed; the test then
                   // becomes the regression test. Never add one of these without a doc.
-                  structuralKnownGap: Option[String] = None): Unit = {
+                  structuralKnownGap: Option[String] = None,
+                  // Physical synonyms require the oracle to translate too. The
+                  // existing checkMem helper compares virtual-address write maps;
+                  // use register/CCR observations with this explicit mapping.
+                  oracleMmu: Option[Musashi.MmuConfig] = None): Unit = {
+    require(oracleMmu.isEmpty || checkMem.isEmpty,
+      "oracleMmu uses register checks; checkMem currently assumes an untranslated oracle write map")
     val loadAddr = ProgramAssembler.DefaultLoadAddress
 
     // Oracle trace (Musashi). Bounds itself at maxCycles/sentinel. `initialSr` (when set)
@@ -739,7 +746,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // the program can switch to M=1 without first writing %sp (avoiding the phys-15
     // rename that would break the exc FSM's hardcoded arch-15 write path).
     val oracleSteps: Vector[OracleStep] = Musashi.assembleAndTrace(src, initialSr = initialSr,
-                                                                   initialMsp = initialMsp) match {
+                                                                   initialMsp = initialMsp, mmu = oracleMmu) match {
       case Right(v)  => v
       case Left(err) => fail(s"[$name] Musashi.assembleAndTrace failed: ${err.reason}")
     }
@@ -5966,6 +5973,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if(dut.lsEu.logic.p3ReservedPublish.toBoolean) publications += 1
           if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean)
             completionHolds += 1
+          dut.lsEu.logic.detachedStore.foreach { d =>
+            if(d.valid.toBoolean && (d.capture.toBoolean || d.captured.toBoolean) &&
+              !d.complete.toBoolean) completionHolds += 1
+          }
         })
       if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
         assert(captures > 0, "oracle corpus did not exercise late store data")
@@ -6013,11 +6024,128 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     runLockStep("late-sq-reservation-squash", (setup ++ body ++ evict).mkString(" ; "),
       nInstr = setup.size + 12 * 4 + evict.size, checkMem = Seq(0x3000L), maxCycles = 30000,
       perCycle = dut => {
-        if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.p3LateDataPending.toBoolean &&
-          dut.lsEu.sqFlushSig.toBoolean) canceled += 1
+        val heldUnfilled = (dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.p3LateDataPending.toBoolean) ||
+          dut.lsEu.logic.detachedStore.exists(d => d.valid.toBoolean && !d.captured.toBoolean)
+        if(heldUnfilled && dut.lsEu.sqFlushSig.toBoolean) canceled += 1
       }, afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x11223344L))
     if(sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"))
       assert(canceled > 0, "redirect corpus did not cancel an unfilled SQ reservation")
+  }
+
+  test("lock-step: detached store data respects physical aliases and split overlap", VerilatorTest) {
+    val setup = Seq("move.l #0,0x2000", "move.l #0,0x2004", "move.l #0,0x2ffc",
+      "move.l 0x3000,%d4", "move.l 0x3004,%d5", "moveq #3,%d1")
+    val body = for(suffix <- Seq("b", "w", "l"); offset <- Seq(0, 1, 3)) yield Seq(
+      "move.l #0x10000,%d0", "divu.w %d1,%d0",
+      s"move.$suffix %d0,0x${(0x2000 + offset).toHexString}",
+      "move.l 0x3000,%d4", "seq %d6", "move.l 0x3004,%d5")
+    val split = Seq("move.l #0x10000,%d0", "divu.w %d1,%d0", "move.l %d0,0x2fff",
+      "move.l 0x3000,%d4", "move.l 0x2ffc,%d5")
+    val oraclePt = Seq(MMU_ROOT -> (MMU_PTRT | 2L), MMU_PTRT -> (MMU_PAGT | 2L),
+      (MMU_PAGT + 2 * 4) -> 0x42001L, (MMU_PAGT + 3 * 4) -> 0x42001L)
+    var reservations = 0; var illegalOvertakes = 0
+    runLockStep("detached-store-physical-alias", (setup ++ body.flatten ++ split).mkString(" ; "),
+      mmuMap = Some(0x2000L -> 0x42L), extraMmuPages = Seq(0x3000L -> 0x42L),
+      oracleMmu = Some(Musashi.MmuConfig(MMU_ROOT, 0x2000L, 0x4000L, oraclePt)),
+      maxCycles = 40000, perCycle = dut => {
+        if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1
+        dut.lsEu.logic.detachedStore.foreach { d =>
+          val mask = (1 << d.ctx.robId.getWidth) - 1
+          val head = dut.rob.logic.h0.toInt
+          if(d.valid.toBoolean && !d.captured.toBoolean && !d.capture.toBoolean &&
+            dut.lsEu.logic.compValid.toBoolean && dut.lsEu.logic.compIsLoad.toBoolean &&
+            (((dut.lsEu.logic.compRobId.toInt - head) & mask) > ((d.ctx.robId.toInt - head) & mask)))
+            illegalOvertakes += 1
+        }
+      })
+    if(sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1")) assert(reservations > 0)
+    assert(illegalOvertakes == 0, "an aliasing load completed before the older store acquired data")
+  }
+
+  test("lock-step: detached store data orders a younger inhibited read", VerilatorTest) {
+    val src = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x5000E040,%d7", "movec %d7,%dtt1",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "move.l #0x11223344,0x50001000", "moveq #3,%d1", "move.l #0x10000,%d0",
+      "divu.w %d1,%d0", "move.l %d0,0x3000", "move.l 0x50001000,%d4")
+    var parked = 0; var reads = 0; var reservations = 0
+    runLockStep("detached-store-device-order", src.mkString(" ; "), maxCycles = 30000,
+      perCycle = dut => {
+        if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1
+        val owner = dut.lsEu.logic.detachedStore.exists(_.valid.toBoolean)
+        if(owner && dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Inhibited.toBoolean)
+          parked += 1
+        val cmd = dut.dcache.logic.loadCmdPort
+        if(cmd.valid.toBoolean && cmd.ready.toBoolean && cmd.paddr.toLong == 0x50001000L) {
+          reads += 1
+          assert(!owner, "inhibited read launched ahead of the detached store's completion")
+        }
+      }, afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x11223344L))
+    assert(reads == 1, "device read must reach memory exactly once")
+    if(sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"))
+      assert(reservations > 0 && parked > 0, "device read never waited behind a detached store")
+  }
+
+  test("lock-step: detached store data progresses with a full SQ and a different pending source", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "moveq #3,%d1", "move.l #0x11223344,%d2", "move.l #0x10000,%d0", "move.l #0x20000,%d3",
+      "divu.w %d1,%d0", "divu.w %d1,%d3", "move.l %d0,0x3000")
+    val body = (1 until 8).map(n => s"move.l %d2,0x${(0x3000 + 4 * n).toHexString}") ++
+      Seq("move.l %d3,0x3020", "move.l 0x3000,%d4", "move.l 0x3020,%d5")
+    val evict = for(line <- Seq(0x3000, 0x3010, 0x3020); n <- 1 to 4)
+      yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+    var fullCaptures = 0; var otherSourceWaits = 0
+    runLockStep("detached-store-full-progress", (setup ++ body ++ evict).mkString(" ; "),
+      checkMem = (0 to 8).map(n => 0x3000L + 4 * n), checkSpan = 4, maxCycles = 30000,
+      perCycle = dut => dut.lsEu.logic.detachedStore.foreach { d =>
+        if(d.capture.toBoolean && dut.lsEu.logic.sq.io.full.toBoolean) fullCaptures += 1
+        if(d.valid.toBoolean && dut.lsEu.logic.p3Valid.toBoolean &&
+          dut.lsEu.logic.p3LateDataPending.toBoolean) otherSourceWaits += 1
+      }, afterRun = (_, oracle) => {
+        assert(oracle.last.d(4) == 0x00015555L && oracle.last.d(5) == 0x0002aaaaL)
+      })
+    if(sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"))
+      assert(fullCaptures > 0 && otherSourceWaits > 0,
+        s"owner-capacity/second-source liveness not exercised: fills=$fullCaptures waits=$otherSourceWaits")
+  }
+
+  test("lock-step: detached store data retains completion across back-response contention", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "move.l #0xffff,%d1", "lea 0x4200,%a1", "move.l %a1,(%a1)", "move.l (%a1),%a1")
+    // Vary the phase of a dependent, resident load stream against the independent
+    // divide producer. Actual cache response completions retain priority over the
+    // detached store, whose SQ publication must not depend on that arbitration.
+    // Repeat each phase so cold instruction fetch does not hide the race.
+    val body = (0 until 8).flatMap { phase =>
+      // 0x80000000 / 0xffff packs remainder/quotient as 0x80008000:
+      // the store must retain nonzero N, not an accidentally correct zero CCR.
+      Seq("moveq #7,%d6", s".Lcontention$phase: move.l #0x80000000,%d0", "divu.w %d1,%d0",
+        "move.l %d0,0x3000", "seq %d4") ++ Seq.fill(phase)("nop") ++
+        Seq.fill(12)("move.l (%a1),%a1") ++
+        Seq("move.l 0x3000,%d5", s"dbf %d6,.Lcontention$phase")
+    }
+    var heldCaptures = 0; var retainedCompletions = 0; var publications = 0
+    var retainedRob: Option[Int] = None
+    runLockStep("detached-store-completion-contention", (setup ++ body).mkString(" ; "),
+      nInstr = setup.size + (0 until 8).map(phase => 1 + 8 * (18 + phase)).sum,
+      maxCycles = 100000, perCycle = dut => dut.lsEu.logic.detachedStore.foreach { d =>
+        retainedRob.foreach { id =>
+          assert(dut.lsEu.logic.compValid.toBoolean && dut.lsEu.logic.compRobId.toInt == id &&
+            dut.lsEu.logic.compNzvcWrite.toBoolean && dut.lsEu.logic.compNzvc.toInt == 8,
+            "held detached completion lost its store's N flag or ROB identity")
+        }
+        retainedRob = if(d.captured.toBoolean && d.complete.toBoolean) Some(d.ctx.robId.toInt) else None
+        if(d.capture.toBoolean) publications += 1
+        if(d.capture.toBoolean && !d.complete.toBoolean) heldCaptures += 1
+        if(d.captured.toBoolean && d.complete.toBoolean) retainedCompletions += 1
+      })
+    if(sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1")) {
+      println(s"DETACHED_CONTENTION publications=$publications held=$heldCaptures recovered=$retainedCompletions")
+      assert(heldCaptures > 0 && retainedCompletions == heldCaptures,
+        "detached completion contention and retained-NZVC recovery were not exercised")
+    }
   }
 
   test("lock-step: early store address is squashed behind mispredicted branches", VerilatorTest) {

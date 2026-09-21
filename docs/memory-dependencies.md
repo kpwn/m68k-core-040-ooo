@@ -76,6 +76,51 @@ NaxRiscv's speculative memory-order rollback policy.
 
 ## Required ownership and lifetime
 
+### Known-address bypass without a duplicate address table
+
+Default-off `detachLateStore` builds on `earlyStoreAddress` and `reserveLateStore`.
+Keep oldest-LS address issue: a younger load cannot pass an older memory operation
+whose address/translation has not reached P3. Once a fast ordinary store has both
+translated fragments/attributes and an SQ slot, its unavailable data need not hold
+P3. The SQ already owns its byte-overlap and serialization metadata; reusing it
+avoids a second copy of that state for this subset. This amends the blanket
+dispatch-record prerequisite **only for ordered address issue with an already
+resident SQ entry**. It does not authorize oldest-ready IQ selection or bypass
+past an unknown older address. The standalone dispatch table remains disabled.
+
+One optional LSU-owned pending-store record retains SQ slot, ROB identity, source
+physical tag, size, NZVC destination/write qualification and crack/commit markers.
+It does not replicate address or store data. Reserve only when that record is
+free; its admission does not depend on same-cycle completion. After reservation,
+P3 can serve younger memory operations. Data readiness is queried through the
+existing IQ service and qualified for a full registered cycle. The existing PRF
+data port fills the SQ; issue is held only on that capture edge. Retain four NZVC
+bits if the shared completion port is occupied, not another copy of store data.
+In-order retirement pins the source register until the store completes.
+
+Already-launched cache responses and older precise-store replay keep priority.
+A ready detached completion then takes priority over new front completions, which
+can hold. Data publication is independent of completion-port contention, but no
+advance wake promise is emitted yet. A younger overlapping load re-queries the SQ;
+the independent late-data reader must progress even when P3/P4 are held. A younger
+disjoint cacheable load may launch and complete before the store has data. Device
+loads still require commit-side authorization and older-store drain. Split and
+partial overlap use both real physical fragments and existing conservative rules.
+
+Flush cancels the pending record and its uncommitted SQ entry on the same edge;
+no PRF capture, SQ fill or completion may escape after cancellation. This is a
+synchronous owner, not an asynchronous response ticket. Do not reuse an owner's
+qualified readiness for its successor. A second pending store may wait in P3 but
+cannot take the only readiness-query/read port away from the detached owner.
+This one-record capacity is an experiment to compare against multiple SQ-owned
+pending records, not a throughput claim or the final general retry mechanism.
+
+Required integration evidence: observe a younger disjoint load completing before
+data publication; prevent stale/partial/split/physical-alias reads; check full SQ
+and occupied owner progress; retain precise faults, device ordering, flags and
+source lifetimes across redirects, reuse and delayed completion. Report matched
+IPC against P3-owned reservation, including any regression and capacity limits.
+
 ### Controlled intermediate experiment: reserve P3's late-data SQ slot
 
 Default-off `reserveLateStore` lets an ordinary fast store whose translated

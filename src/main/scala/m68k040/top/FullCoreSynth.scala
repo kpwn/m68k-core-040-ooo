@@ -817,7 +817,8 @@ object GenFullCoreSynthVerilog {
                 retainRedirectHistory: Boolean = false,
                 earlyStoreAddress: Boolean = false,
                 fuseLongMoveLoads: Boolean = false,
-                reserveLateStore: Boolean = false): Unit = {
+                reserveLateStore: Boolean = false,
+                detachLateStore: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -826,7 +827,7 @@ object GenFullCoreSynthVerilog {
         val branchEu = new BranchEuPlugin
         val lsEu = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
           earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
-          reserveLateStore = reserveLateStore)
+          reserveLateStore = reserveLateStore, detachLateStore = detachLateStore)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
@@ -881,7 +882,7 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store")),
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store")),
       "unknown FullCoreSynth experiment option")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
@@ -894,7 +895,8 @@ object GenFullCoreSynthVerilog {
       retainRedirectHistory = args.contains("--retain-redirect-history"),
       earlyStoreAddress = args.contains("--early-store-address"),
       fuseLongMoveLoads = args.contains("--fuse-long-move-loads"),
-      reserveLateStore = args.contains("--reserve-late-store"))
+      reserveLateStore = args.contains("--reserve-late-store"),
+      detachLateStore = args.contains("--detach-late-store"))
   }
 }
 

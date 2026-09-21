@@ -345,7 +345,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     retainRedirectHistory: Boolean = false,
                     earlyStoreAddress: Boolean = false,
                     fuseLongMoveLoads: Boolean = false,
-                    reserveLateStore: Boolean = false) extends Component {
+                    reserveLateStore: Boolean = false,
+                    detachLateStore: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -379,7 +380,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
-      reserveLateStore = reserveLateStore)
+      reserveLateStore = reserveLateStore, detachLateStore = detachLateStore)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -508,7 +509,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       lateStoreCaptures: Int = 0,
       reservedStores: Int = 0,
       reservedPublishes: Int = 0,
-      reservedCompletionHolds: Int = 0
+      reservedCompletionHolds: Int = 0,
+      detachedLoadOvertakes: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -616,6 +618,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
+      val detachedOvertakeHisto = ArrayBuffer.empty[Boolean]
       val robHisto = ArrayBuffer.empty[RobCycle]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
@@ -960,6 +963,14 @@ trait CoreBenchHarness extends AnyFunSuite {
         reserveStoreHisto += ((dut.lsEu.logic.p3ReservationFire.toBoolean,
           dut.lsEu.logic.p3ReservedPublish.toBoolean,
           dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean))
+        detachedOvertakeHisto += dut.lsEu.logic.detachedStore.exists { d =>
+          val mask = (1 << d.ctx.robId.getWidth) - 1
+          val head = dut.rob.logic.h0.toInt
+          d.valid.toBoolean && !d.captured.toBoolean && !d.capture.toBoolean &&
+            dut.lsEu.logic.compValid.toBoolean && dut.lsEu.logic.compIsLoad.toBoolean &&
+            !dut.lsEu.logic.compIsFault.toBoolean &&
+            (((dut.lsEu.logic.compRobId.toInt - head) & mask) > ((d.ctx.robId.toInt - head) & mask))
+        }
         countedMacros += acceptedMacros
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
@@ -1185,7 +1196,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         lateStoreHisto.slice(lo, hi + 1).count(identity),
         reserveStoreHisto.slice(lo, hi + 1).count(_._1),
         reserveStoreHisto.slice(lo, hi + 1).count(_._2),
-        reserveStoreHisto.slice(lo, hi + 1).count(_._3))
+        reserveStoreHisto.slice(lo, hi + 1).count(_._3),
+        detachedOvertakeHisto.slice(lo, hi + 1).count(identity))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
