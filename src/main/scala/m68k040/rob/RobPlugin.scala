@@ -45,7 +45,12 @@ object DebugHaltReasonCode {
   * correct-head-branch experiment allows one eligible non-branch successor.
   */
 class RobPlugin(val detailedPerf: Boolean = false,
-                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService {
+                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
+  private var retirementWires: Vec[Flow[UInt]] = null
+  override def retiredRobIds: Vec[Flow[UInt]] = retirementWires
+  during setup {
+    retirementWires = Vec.fill(4)(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+  }
   private var historyStartWire: Bool = null
   private var historyKeepWire: Bool = null
   override def historyEpochStart: Bool = historyStartWire
@@ -1634,6 +1639,14 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // decision needs exc.ss.s.)
 
     val retiredThisCycle = (retire1 ? U(2) | (retire0 ? U(1) | U(0))).resize(count.getWidth)
+    retirementWires(0).valid := retire0
+    retirementWires(0).payload := h0
+    retirementWires(1).valid := retire1
+    retirementWires(1).payload := h1
+    for (lane <- 2 until retirementWires.length) {
+      retirementWires(lane).valid := False
+      retirementWires(lane).payload := 0
+    }
 
     // ── Passive alloc interface (driven by DispatchPlugin) ──────────────────────
     // Plain-wire service convention: the ROB EXPOSES these via RobAllocService;

@@ -1365,10 +1365,11 @@ mechanism. The service exposes its actual lane count; the standalone test driver
 uses that count rather than truncating it to two. The current ROB explicitly
 rejects four lanes until all retirement consumers are integrated.
 
-The source audit identifies not just maps/frees and SQ, but **both I/D page-table
-U/M write queues**, committed CCR's same-edge precise-store bypass, system/FP
+The source audit identifies not just maps/frees and SQ, but the shared **page-table
+U/M queue interface**, committed CCR's same-edge precise-store bypass, system/FP
 state, debug stop/restart/count and complete observation streams as consumers.
-These must not lose lanes 2/3. A narrow in-order retirement-span service is a
+Normal D-side queue entries need every lane; I-side fetch entries retain their
+ownerless/precommitted lifetime, as clarified below. A narrow in-order retirement-span service is a
 candidate for queue authorization; it must identify exact retiring ROB IDs across
 wrap and retain flush semantics. It is not implemented in this prerequisite.
 
@@ -1395,6 +1396,64 @@ enable contiguous four-wide ordinary retirement with conservative cold boundarie
 Compare it against the same LSU/predictor baseline before implementing prepared
 shadow-map publication. The latter remains an independent required experiment,
 not something this prerequisite or prefix histograms have demonstrated.
+
+## Retirement consumers: same-edge upper-lane notices — 2026-09-21
+
+Added a ROB-owned `RobRetirementService` with four setup-allocated ID/valid
+lanes. The unchanged two-wide ROB publishes its existing first two notices and
+ties the upper pair idle. No new Global producer or delayed commit decision is
+introduced. SQ and both shared U/M queue instances accept the upper pair through
+the service; existing first-pair wiring is preserved during migration. Standalone
+queues without the service retain the two-input specialization. The components
+reuse equality matching, not a new wrap-range comparator or queue state.
+
+Ownership clarification from the source audit: normal D-side U/M writes are
+ROB-owned, but I-side fetch U writes and exception-episode D writes are already
+`preCommitted`. They must retain that ownerless lifetime, not wait for an
+arbitrary retired ROB ID. Updated the earlier checklist accordingly.
+
+**56 tests pass** across SQ, split SQ, U/M queue and walker integration
+(`/tmp/wide-queue-correctness.log`). New controls exercise one-to-four same-edge
+retire notices followed immediately by flush, ROB wrap and all physical SQ head
+positions, including unfilled younger reservations canceled by recovery. U/M
+tests cover all four lanes, full queues, dead holes before committed survivors,
+precommitted entries, held drain offers, reuse and reset. A real DTLB-walker test
+publishes owned writes in lanes 2/3 and confirms both descriptor bytes update
+after next-cycle flush. The default full-core profile reproduces all **14** prior
+macro/cycle/branch/miss tuples exactly (`/tmp/wide-queue-default-ipc.log` against
+`/tmp/wide-rename-default-ipc.log`). The required fast gate passes **384 tests**,
+two ignored, with no failed or aborted suites (`/tmp/wide-queue-fast.log`). This is not
+four-wide full-core IPC; ROB decision, architectural state folds and observations
+remain the next integration boundary.
+
+## Early store-address routed result — 2026-09-21
+
+The pinned `12c23962` two-arm core-only gate is complete at 5 ns, three post-route
+rounds (`/tmp/early-store-address-gate.sHxiPV`). Both arms enable the older load
+fall-through and early-wake options; only the candidate enables early store
+address. Baseline WNS **+0.017 ns**, candidate **−0.106 ns**, candidate TNS
+−4.263 ns over 102 setup endpoints. Candidate hold **+0.016 ns** and pulse
+**+1.958 ns**, with zero hold/pulse failing endpoints. LUTs 94,244 → 94,520,
+FFs 38,751 → 38,804, BRAM tiles unchanged at 37. Candidate post-route WNS evolves
+−0.214 / −0.118 / −0.114 / −0.106 ns. This is a timing miss, not 200 MHz signoff;
+retain the already-measured IPC-positive candidate. The serial queue has advanced
+to direct long MOVE load fusion, without stopping IPC work.
+
+The worst path is ALU1 opcode state → arithmetic/flags → live
+`ccrCompletion(1)` bypass → committed CCR, 18 logic levels, 5.086 ns data delay
+(3.617 ns routing). Other failing families include decode expansion/immediates,
+P3 size → P4 retry, fetch stall → I-cache prefetch enable, aligned-load admission
+→ cache metadata, and P4 ROB ID → IQ dynamic-wait/cache write controls. This is
+not evidence that all misses lie in the new store-address logic.
+
+Concrete repair lead for the retirement integration: ALU `ccrObs` is already
+aligned to its real completion, unlike the late precise-SQ case that motivated
+the live flag bypass. Audit/prove which completion sources actually require
+same-cycle retirement bypass before widening that fold. If only the precise LS
+source can arrive late, retaining its bypass while removing redundant ALU paths
+would shorten this cone without adding a recurrence cycle. This is a hypothesis,
+not an implemented repair or permission to remove the precise-store safeguard.
+The other failing cones still require their own timing evidence.
 
 ## Next investigations requested — 2026-09-21
 

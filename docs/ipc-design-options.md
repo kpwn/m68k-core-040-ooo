@@ -91,6 +91,12 @@ The ROB remains two-wide and rejects that interface until the remaining consumer
 are adapted. See [the integration contract](retirement-bandwidth.md); there is
 no four-wide full-core IPC or timing result yet.
 
+The SQ and shared U/M queue interfaces now accept the extra same-edge notices
+through a ROB-owned service, with tested next-cycle flush survival and real
+DTLB-walker coverage. Upper notices remain idle in the two-wide core. Architectural
+state folding and full ROB/observation integration are still open; do not infer a
+wider-retirement result from these component tests.
+
 ### 2. Pipelined retirement lookahead and eligibility certificates
 
 Read and classify the next 4–8 entries ahead of consumption, retaining prepared

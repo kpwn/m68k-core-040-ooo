@@ -43,11 +43,14 @@ Before enabling it in a full core, update and verify all of:
 - single-step, breakpoints, halt-after and recovery PC selection;
 - lossless commit observations, history and performance counters.
 
-The current source audit also identifies I- and D-side **page-table U/M write
-queues** as retirement consumers, even for instructions without an SQ entry.
-Both expose only `commit`/`commitB`. Omitting lanes 2/3 there would leave pending
-updates uncommitted or misassociate them after ROB-ID reuse. Widen their notices
-alongside SQ authorization; cacheable/no-MMU microbenchmarks cannot validate this.
+The current source audit also identifies **page-table U/M write queues** as
+retirement consumers, even for instructions without an SQ entry. Both instances
+expose `commit`/`commitB`, but their ownership differs: normal D-side updates have
+a real ROB owner; current I-side fetch updates and exception-episode D-side
+updates are born committed and must not borrow a retiring instruction's identity.
+Missing lanes 2/3 would affect owned D-side updates. Extend the shared queue
+interface without changing the ownerless/precommitted lifetime; cacheable/no-MMU
+microbenchmarks cannot validate this.
 
 | Consumer | Current implementation to generalize |
 | --- | --- |
@@ -63,6 +66,23 @@ Production and test backend wiring must use an explicit ROB-owned service for
 new lane events, rather than adding more cross-plugin reads of `rob.logic`.
 The present ROB rejects a four-lane rename interface at elaboration until these
 consumers and precise boundary rules are implemented together.
+
+## Retirement event service
+
+`RobRetirementService` has one producer, `RobPlugin`, and exposes four ordinary
+retirement ID/valid lanes allocated during plugin setup. Lane order is program
+order and valids form a prefix. The baseline drives its original first two
+events and ties lanes 2/3 idle. This avoids a build-order cycle with the MMUs.
+It does not add a Global key, a second commit decision, or a register stage.
+
+SQ and both U/M queue instances accept additional same-edge notices through this
+service when it exists. Standalone units without a ROB retain their legacy two
+inputs. Existing lane-0/1 wiring stays unchanged during this migration; new
+events never access ROB internals. Each queue has an explicit two/four-input
+specialization and reuses its existing equality matching, rather than introducing
+a new ROB-wrap range comparator. All four must mark before a next-cycle flush.
+Queue allocation, dead-hole handling, reset, draining and precommitted semantics
+are unchanged. An unfilled SQ reservation still cannot receive any commit lane.
 
 Then compare actual warmed IPC against two-wide retirement on both the original
 and improved LSU/predictor configurations, before queueing synthesis. Completed

@@ -53,8 +53,9 @@ case class UmWriteDrain() extends Bundle {
   *   - flush  : speculative (uncommitted) entries are discarded -> never written
   * Mirrors the StoreQueue commit-drain/flush discipline (all state RegInit; the
   * count is a hardware sum; flush rolls the tail back past the youngest committed). */
-class UmWriteQueue(depth: Int = 4) extends Component {
+class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
   require(isPow2(depth))
+  require(retireWidth == 2 || retireWidth == 4)
   val ptrW = log2Up(depth)
 
   val io = new Bundle {
@@ -63,6 +64,8 @@ class UmWriteQueue(depth: Int = 4) extends Component {
     // Slot-1 retire commit (a tagged op can dual-retire at h1 behind a long-latency
     // head; both retire slots must mark the SAME cycle — see StoreQueue.commitB).
     val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+    val commitExtra = if(retireWidth > 2)
+      Vec.fill(retireWidth - 2)(slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))) else null
     val flush    = in Bool ()
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()
@@ -168,13 +171,12 @@ class UmWriteQueue(depth: Int = 4) extends Component {
   }
 
   // ---- commit: mark the matching valid entry committed ----
-  when(io.commit.valid) {
-    for (i <- 0 until depth)
-      when(valids(i) && (robIds(i) === io.commit.payload)) { committed(i) := True }
-  }
-  when(io.commitB.valid) {
-    for (i <- 0 until depth)
-      when(valids(i) && (robIds(i) === io.commitB.payload)) { committed(i) := True }
+  val commitNotices = Seq(io.commit, io.commitB) ++
+    (if(retireWidth > 2) io.commitExtra.toSeq else Seq.empty)
+  for (i <- 0 until depth) {
+    when(valids(i) && commitNotices.map(c => c.valid && c.payload === robIds(i)).reduce(_ || _)) {
+      committed(i) := True
+    }
   }
 
   // ---- alloc: push at tail (speculative) ----

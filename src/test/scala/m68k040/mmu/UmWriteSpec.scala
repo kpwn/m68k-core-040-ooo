@@ -54,14 +54,25 @@ class UmProbePlugin extends FiberPlugin {
   *  - a queued write that is FLUSHED (mispredict) is discarded -> memory unchanged */
 class UmWriteSpec extends AnyFunSuite {
 
-  class Dut extends Component {
+  // Sole retirement producer in this standalone walker DUT; deliberately no ROB.
+  class RetirementDriver extends FiberPlugin with m68k040.services.RobRetirementService {
+    private var ports: Vec[Flow[UInt]] = null
+    override def retiredRobIds: Vec[Flow[UInt]] = ports
+    during setup {
+      ports = Vec.fill(4)(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+      ports.foreach { p => in(p.valid); in(p.payload) }
+    }
+  }
+
+  class Dut(wideRetirement: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val ctrl = new MmuControlPlugin()
     val dtlb = new DtlbPlugin()
     val probe = new UmProbePlugin()
+    val retirement = if(wideRetirement) Some(new RetirementDriver) else None
     val walkPort = new m68k040.sim.WalkerDcacheSimIo(dtlb, "dtlbWalk")
-    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort)) }
+    db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ctrl, dtlb, probe, walkPort) ++ retirement.toSeq) }
     // The table walker is a DcacheService CLIENT now, not an AXI master. This DUT hosts
     // no DcachePlugin, so it exposes the walker's client port pair as its own IO and lets
     // `DcacheClientMemAgent` answer it out of a SparseMemory -- the direct replacement for
@@ -113,12 +124,32 @@ class UmWriteSpec extends AnyFunSuite {
     dut.probe.logic.commitValid #= false; dut.probe.logic.commitId #= 0
     dut.probe.logic.flush #= false
     dut.probe.logic.pflusha #= false
+    dut.retirement.foreach(_.retiredRobIds.foreach { c => c.valid #= false; c.payload #= 0 })
     cd.waitSampling(4)
     dut.ctrl.logic.mmuEnable #= true
     dut.ctrl.logic.urp   #= ROOT
     dut.ctrl.logic.srp   #= ROOT
     cd.waitSampling(2)
     (cd, mem)
+  }
+
+  test("wide retirement service commits DTLB-owned U/M writes in lanes two and three before flush", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut(wideRetirement = true)).doSim { dut =>
+      SimTimeout(1000000)
+      val (cd, mem) = init(dut)
+      val pages = Seq(0x00802000L, 0x00803000L)
+      val descriptors = pages.zipWithIndex.map { case (va, i) => buildTable(mem, va, 0x12300L + i) }
+      pages.zip(Seq(31, 0)).foreach { case (va, id) => walk(dut, cd, va, write = true, robId = id) }
+      descriptors.foreach(p => assert(mem.peekByte(p + 3) == 0x01))
+      val notices = dut.retirement.get.retiredRobIds
+      notices(2).valid #= true; notices(2).payload #= 31
+      notices(3).valid #= true; notices(3).payload #= 0
+      cd.waitSampling(); notices.foreach(_.valid #= false)
+      dut.probe.logic.flush #= true; cd.waitSampling(); dut.probe.logic.flush #= false
+      cd.waitSampling(80)
+      descriptors.foreach(p => assert(mem.peekByte(p + 3) == 0x19,
+        "upper-lane retirement must survive recovery and update the descriptor"))
+    }
   }
 
   test("write-access walk queues U+M; commit drains -> descriptor byte updated", VerilatorTest) {

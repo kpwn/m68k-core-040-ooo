@@ -20,6 +20,14 @@ trait RenameCommitService {
   def flushPort:   Bool
 }
 
+/** Ordinary in-order retirement notices. PRODUCER: RobPlugin exclusively.
+  * Four setup-allocated lanes; unused upper lanes are idle in the two-wide core.
+  * No delayed authorization: queue consumers must mark on the retirement edge.
+  * See docs/retirement-bandwidth.md. */
+trait RobRetirementService {
+  def retiredRobIds: Vec[Flow[UInt]]
+}
+
 /** Rename-owned committed architectural mappings for coherent debug access.
   *
   * These are the committed RAT entries only; speculative location/bypass state is

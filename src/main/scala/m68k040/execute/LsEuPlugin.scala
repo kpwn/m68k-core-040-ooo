@@ -585,10 +585,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                        ldFifoEmpty && !ldFifoFull
 
     // ---- store queue instance ----
+    val retirement = host.get[m68k040.services.RobRetirementService]
     val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding,
-      reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish)
+      reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish,
+      retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
+    retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
+      sq.io.commitExtra(lane - 2) << r.retiredRobIds(lane))
     sq.io.flush  := sqFlushSig
     // Ordinary SQ traffic owns the elastic store command by default.  The
     // exception sequencer may override it below only after quiescing the SQ; when

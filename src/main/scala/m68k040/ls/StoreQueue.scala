@@ -98,8 +98,9 @@ case class SqFwdRsp() extends Bundle {
   * when-gated Scala-var counters). */
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
-                 forwardOnPublish: Boolean = false) extends Component {
+                 forwardOnPublish: Boolean = false, retireWidth: Int = 2) extends Component {
   require(isPow2(depth))
+  require(retireWidth == 2 || retireWidth == 4)
   require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
   val ptrW = log2Up(depth)
 
@@ -121,6 +122,8 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     // Marking a cycle LATE is unsafe — a flush arriving the next cycle would squash
     // the already-retired store — so both retire slots must mark in the retire cycle.
     val commitB  = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+    val commitExtra = if(retireWidth > 2)
+      Vec.fill(retireWidth - 2)(slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))) else null
     val flush    = in(Bool())
     val drain    = master(Stream(DStoreCmd()))
     // Terminal acknowledgement for the oldest accepted half. `drain` is a real
@@ -870,14 +873,13 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // ordinary address hazards remain a stall here.
   io.fwd.rsp.stall := (anyPartial || anySameLine) && !fullValid
 
-  // ---- commit: mark the matching valid entry committed (either retire slot) ----
-  when(io.commit.valid) {
-    for (i <- 0 until depth)
-      when(valids(i) && (robIds(i) === io.commit.payload)) { committed(i) := True }
-  }
-  when(io.commitB.valid) {
-    for (i <- 0 until depth)
-      when(valids(i) && (robIds(i) === io.commitB.payload)) { committed(i) := True }
+  // Every ordinary retirement lane authorizes its store on this same edge.
+  val commitNotices = Seq(io.commit, io.commitB) ++
+    (if(retireWidth > 2) io.commitExtra.toSeq else Seq.empty)
+  val commitMatches = Vec((0 until depth).map(i =>
+    commitNotices.map(c => c.valid && c.payload === robIds(i)).reduce(_ || _)))
+  for (i <- 0 until depth) {
+    when(valids(i) && commitMatches(i)) { committed(i) := True }
   }
 
   // ---- alloc: push at tail (speculative) ----
@@ -897,8 +899,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       for(i <- 0 until depth) {
         when(valids(i) && !dataReady(i)) {
           assert(!committed(i), "StoreQueue: unfilled reservation committed", FAILURE)
-          assert(!(io.commit.valid && io.commit.payload === robIds(i)) &&
-                 !(io.commitB.valid && io.commitB.payload === robIds(i)),
+          assert(!commitMatches(i),
             "StoreQueue: commit notice preceded reserved data publication", FAILURE)
         }
       }

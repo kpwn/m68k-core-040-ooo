@@ -721,7 +721,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // newByte}; the entry drains at the triggering instruction's commit (RMW the
     // descriptor byte over this same AXI bus) and is discarded on a flush. NOT
     // performed speculatively.
-    val umq = new UmWriteQueue(4)
+    val retirement = host.get[m68k040.services.RobRetirementService]
+    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
+    retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
+      umq.io.commitExtra(lane - 2) << r.retiredRobIds(lane))
     umq.io.full.simPublic()   // sim-only: a full queue withholds the walker's admission credit
     umq.io.drain.valid.simPublic()   // sim-only: is there an entry waiting to drain?
     umQueueFull := umq.io.full

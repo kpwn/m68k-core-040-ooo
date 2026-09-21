@@ -628,10 +628,13 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // refill the array/latch it was just cleared out of (DtlbPlugin's identical arm).
     when(flushPoisonArm) { walkFlushPoison := True }
 
-    // ---- deferred U descriptor-write queue (U-only on fetch; drained at commit) ----
-    // A non-faulting walk that needs to set U pushes {robId, addr, newByte}; the
-    // entry drains at the fetching instruction's commit and is discarded on a flush.
-    val umq = new UmWriteQueue(4)
+    // ---- deferred U descriptor-write queue (U-only on fetch; born committed) ----
+    // Clean fetch walks have no ROB owner; their precommitted lifetime below is
+    // unchanged by widening the shared queue's ordinary retirement interface.
+    val retirement = host.get[m68k040.services.RobRetirementService]
+    val umq = new UmWriteQueue(4, retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
+    retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
+      umq.io.commitExtra(lane - 2) << r.retiredRobIds(lane))
     umq.io.full.simPublic()   // sim-only: a full queue withholds the walker's admission credit
     umq.io.drain.valid.simPublic()   // sim-only: is there an entry waiting to drain?
     umQueueFull := umq.io.full

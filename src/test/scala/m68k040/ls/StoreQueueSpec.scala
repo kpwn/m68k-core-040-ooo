@@ -9,6 +9,57 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class StoreQueueSpec extends AnyFunSuite {
 
+  for(reserved <- Seq(false, true)) test(s"four retirement lanes survive immediate flush and ROB wrap reserved=$reserved", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = reserved,
+      retireWidth = 4)).doSim { dut =>
+      SimTimeout(1000000)
+      val cd = initDut(dut)
+      val heads = scala.collection.mutable.Set.empty[Int]
+      for(round <- 0 until 64) {
+        heads += dut.head.toInt
+        val base = (30 + 3 * round) & 31
+        val count = 1 + round % 4
+        dut.io.robHeadIn #= base; dut.io.robHeadValidIn #= true
+        dut.io.drain.ready #= false
+        for(i <- 0 until count + 2) {
+          sleep(1)
+          val slot = if(reserved) dut.io.allocSlot.toInt else 0
+          if(reserved) dut.io.reserveOnly #= true
+          alloc(dut, cd, (base + i) & 31, 0x100 + 16 * i, 0x1000 + i, Size.LONG,
+            cacheMode = m68k040.cache.CacheMode.COPYBACK)
+          if(reserved && i < count) {
+            dut.io.publish.valid #= true; dut.io.publish.slot #= slot
+            dut.io.publish.robId #= ((base + i) & 31); dut.io.publish.data #= (0x1000 + i)
+            cd.waitSampling(); dut.io.publish.valid #= false
+          }
+        }
+        if(reserved) dut.io.reserveOnly #= false
+        for((c, lane) <- dut.commitNotices.zipWithIndex) {
+          c.valid #= (lane < count); c.payload #= ((base + lane) & 31)
+        }
+        cd.waitSampling(); dut.commitNotices.foreach(_.valid #= false)
+        // No grace cycle: every newly architectural store must already survive.
+        dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false
+        dut.io.drain.ready #= true
+        val seen = scala.collection.mutable.ArrayBuffer.empty[Long]
+        var outstanding = 0
+        for(_ <- 0 until 80) {
+          sleep(1)
+          val accept = dut.io.drain.valid.toBoolean
+          if(accept) seen += dut.io.drain.payload.paddr.toLong
+          val ack = outstanding > 0
+          dut.io.drainAck #= ack
+          cd.waitSampling()
+          outstanding += (if(accept) 1 else 0) - (if(ack) 1 else 0)
+        }
+        dut.io.drainAck #= false; sleep(1)
+        assert(seen.toVector == Vector.tabulate(count)(i => 0x100L + 16 * i))
+        assert(dut.io.empty.toBoolean && outstanding == 0)
+      }
+      assert(heads.size == 8)
+    }
+  }
+
   for(unfilled <- Seq(false, true)) test(s"youngest SQ match survives committed ROB-index reuse unfilled=$unfilled", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = unfilled)).doSim { dut =>
       val cd = initDut(dut)
@@ -442,6 +493,9 @@ class StoreQueueSpec extends AnyFunSuite {
     }
     dut.io.commit.valid #= false
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
+    if(dut.io.commitExtra != null) dut.io.commitExtra.foreach { c =>
+      c.valid #= false; c.payload #= 0
+    }
     dut.io.flush #= false
     dut.io.drain.ready #= true
     dut.io.drainAck #= false
