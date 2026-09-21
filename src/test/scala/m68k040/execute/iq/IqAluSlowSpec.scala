@@ -38,6 +38,13 @@ class IqAluSlowSpec extends AnyFunSuite {
       slot.readsX #= false; slot.writesX #= false
       slot.pXSrc #= 0; slot.pXDst #= 0
       slot.isShift #= false
+      // These ALU-only tests must not acquire random FP dependencies from
+      // uninitialized top-level inputs in the shared source harness.
+      slot.pFpSrcA #= 0; slot.psrcAFpValid #= false
+      slot.pFpSrcB #= 0; slot.psrcBFpValid #= false
+      slot.pFpDst #= 0; slot.pFpDstValid #= false
+      slot.pFpccSrc #= 0; slot.readsFpcc #= false
+      slot.pFpccDst #= 0; slot.writesFpcc #= false
     }
     dut.sink.logic.ready0 #= true
     dut.sink.logic.ready1 #= true
@@ -48,6 +55,8 @@ class IqAluSlowSpec extends AnyFunSuite {
     s2.aluSlowWakeupPdst #= 0; s2.aluSlowWakeupPdstV #= false
     s2.aluSlowWakeupNzvc #= 0; s2.aluSlowWakeupNzvcV #= false
     s2.aluSlowWakeupX #= 0; s2.aluSlowWakeupXV #= false
+    s2.cplxFpWakeupValid #= false; s2.cplxFpWakeupTag #= 0
+    s2.cplxFpccWakeupValid #= false; s2.cplxFpccWakeupTag #= 0
   }
 
   def issued(dut: Dut, rob: Int): Boolean = {
