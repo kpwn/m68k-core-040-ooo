@@ -2731,3 +2731,8 @@ shell is suspended, with automatic resume on the SoC runner's exit. Logs
 `/tmp/ipc-v2-soc100-{build,generation,lint}.log`, followed in the existing
 `build-logs:0.0` pane alongside the active arm. No board reset/reload or SPI/SD
 write; final timing/DRC, local ADB patch and explicit load permission remain.
+
+The v2 100 MHz retry passed generation, top/real-MIG lint and all profile/source/
+reset checks, acquired the Vivado mutex, and advanced beyond the formerly failing
+profile guard into real CPU socket regeneration. The implementation job is now
+running, not merely waiting in the physical queue.
