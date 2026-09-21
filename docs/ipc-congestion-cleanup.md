@@ -499,3 +499,22 @@ The timing-audit Tcl mock test passes. The required CPU fast gate passed
 again after this work: 390 passed, 2 ignored, zero failures, in
 `/tmp/ipc-cleanup-shared-merge-core-fast.log`. This is not a substitute for
 the pending real Vivado timing audit or the separate matched SoC tests.
+
+## Strict-timing candidate preflight ready
+
+Initialized the strict-timing SoC worktree's CPU submodule locally at the
+unchanged tested `1cb2401f` pin, then ran a fresh production generation and
+both `lint-fpga-top` and `lint-realmig` with Ethernet and detailed counters.
+The 200 MHz core / 50 MHz PB throughput-v2 profile, post-route-exit, storage
+reset pairing and synthesis-source guards all pass. The preflight also checks
+the matched L2/chain/PRAM receipts and rejects a restored multicycle command
+in `fpga_top.xdc`. Neither SoC nor CPU tracked files are dirty afterwards.
+
+Runner: `/tmp/prepare-ipc-cleanup-strict-soc200.sh`; service
+`m68k-ipc-cleanup-strict-soc200-preflight.service` exited successfully at
+18:19:43 CEST. Logs: `/tmp/ipc-cleanup-strict-soc200-{preflight,generation,lint}.log`;
+netlist hash: `/tmp/ipc-cleanup-strict-soc200-netlist.sha256`.
+This is generation/lint only, not a launched or completed implementation.
+The three-arm L2 physical comparison and strict routed audits remain queued;
+choose the next full implementation from that evidence. The live CSR+PRAM
+run was not interrupted and has progressed through detailed placement.
