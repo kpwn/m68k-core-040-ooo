@@ -200,7 +200,8 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // line-granular width the comments above and below still reason in.
     val PRED_BITS_PER_LINE = PRED_BITS_PER_WORD * 32
     // Slice I2 (per-beat predecode): one AXI beat is 32 bytes = 16 words of a 32-word
-    // line, so the single classify group is 16 wide and is used TWICE per refill.
+    // line. Baseline classification is 16-wide; eight-wide sharing preserves this
+    // array-write geometry (see docs/icache-predecode-sharing.md).
     val WORDS_PER_BEAT     = 16
     val PRED_BITS_PER_BEAT = PRED_BITS_PER_WORD * WORDS_PER_BEAT
 
@@ -663,8 +664,25 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // these become fabric flops, lineReg has been re-created under a different name.
     val fillLoQ = fillLo.readSync(installIdx)
     val fillHiQ = fillHi.readSync(installIdx)
+    installIdx.simPublic()
     KeepAttribute(fillLoQ)
     KeepAttribute(fillHiQ)
+    // Eight-wide mode prepares lower-half metadata on accepted AXI beats.
+    // A busy installer wins the shared classifier; that beat is still accepted
+    // and its missing metadata is computed locally at installation instead.
+    // Each validity bit is replaced on EVERY owned beat, so recycled slots
+    // cannot inherit an older occupant's early result. No data-array copy.
+    val earlyPred = if (predecodeWords == 8) new Area {
+      val lo = Mem(Bits(8 * PRED_BITS_PER_WORD bits), MSHR_N)
+      val hi = Mem(Bits(8 * PRED_BITS_PER_WORD bits), MSHR_N)
+      val loValid = Vec.fill(MSHR_N)(RegInit(False))
+      val hiValid = Vec.fill(MSHR_N)(RegInit(False))
+      val loQ = lo.readSync(installIdx)
+      val hiQ = hi.readSync(installIdx)
+      val fallbackUpper = RegInit(False)
+      val fallbackLower = Reg(Bits(8 * PRED_BITS_PER_WORD bits))
+      loValid.simPublic(); hiValid.simPublic(); fallbackUpper.simPublic()
+    } else null
     // M2b: the DATA half of the narrowed bypass (the predecode half is Task 7's
     // `bypPred`). 64 flops replace `lineReg`'s 512 for the INHIBITED/poisoned replay.
     // See `bypPred`'s declaration above for the shared capture-window equivalence and
@@ -1053,7 +1071,7 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // Each window-chunk is 4*PRED_BITS_PER_WORD bits (was the hardcoded 16 = 4*4 when
     // ChunkPredecode was 4 bits); each of the 4 per-window entries is PRED_BITS_PER_WORD
     // bits (was the hardcoded 4).
-    /** Slice I2 (MSHR design doc §6.4, option I-b) — classify the 16 words of ONE beat.
+    /** Classify a contiguous eight- or sixteen-word chunk, with three-word lookahead.
       *
       * WAS: a single 32-way unrolled group inside PREDECODE, i.e. 32 independent
       * instances of a ~860-line combinational decode tree (order 860 EA-length
@@ -1062,7 +1080,7 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       * §11.Q8) and it is also the structural obstacle to I-side MSHRs, because it
       * needs the WHOLE line present in one cycle.
       *
-      * NOW: ONE 16-instance group, elaborated once and USED TWICE — on PREDECODE's
+      * BASELINE: ONE 16-instance group, elaborated once and USED TWICE — on PREDECODE's
       * commitBeat==0 cycle for the low beat and on its commitBeat==1 cycle for the
       * high beat. PREDECODE already dwelt exactly 2 cycles (the single-write-port
       * lineMem commit, see below), so this is a **2x instance cut at exactly today's
@@ -1087,12 +1105,17 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       * beat's worth of predecode held for one cycle so a whole-line packed value could
       * be assembled combinationally; M1b deleted that staging register by writing the
       * bypass register's two halves directly, one per dwell cycle, and M2a narrowed
-      * that register to a single window (`bypPred`). NET NEW STATE: zero.
+      * that register to a single window (`bypPred`). Baseline net new state: zero.
       *
-      * `beat`      : the beat being classified (one entry-half of the MSHR line file).
-      * `nextLo`    : the NEXT beat's low 3 words, supplying the lookahead for this
-      *               beat's last 3 words.
-      * `nextValid` : whether `nextLo` is real data. False for the LAST beat of a line,
+      * EIGHT-WIDE OPTION: the same helper elaborates eight classifiers shared by
+      * accepted AXI lower halves and installer upper halves. Contention falls back
+      * to local lower-half staging. The separate sharing spec accounts for added
+      * per-MSHR metadata and the two-to-four-cycle install schedule; neither the
+      * AXI width nor cached metadata changes.
+      *
+      * `beat`      : the contiguous chunk being classified.
+      * `nextLo`    : the NEXT 3 words, supplying lookahead for the chunk's tail.
+      * `nextValid` : whether `nextLo` is real data. False for the LAST chunk of a line,
       *               where the lookahead genuinely runs past the line end — the same
       *               `extWValid = false` boundary discipline the whole-line predecode
       *               already used (the F5 fix), which makes `classify` reject as
@@ -1107,17 +1130,19 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       * three validity FLAGS the whole-line scheme did. Only the final 3 words of the
       * line see `valid = false`, which is exactly the case that already existed. */
     def classifyBeat(beat: Bits, nextLo: Bits, nextValid: Bool): Bits = {
+      val chunkWords = beat.getBitsWidth / 16
+      require(chunkWords == 8 || chunkWords == 16)
       val rawW  = beat.subdivideIn(16 bits)   // raw bytes, index 0 = lowest addr
       val rawNx = nextLo.subdivideIn(16 bits) // 3 raw words of the next beat
       // Predecode consumes numeric big-endian 68k opwords, while the cache arrays
       // deliberately retain byte-address-invariant memory data.
-      val w  = Vec((0 until WORDS_PER_BEAT).map(i => IcacheInstructionOrder.opword(rawW(i))))
+      val w  = Vec((0 until chunkWords).map(i => IcacheInstructionOrder.opword(rawW(i))))
       val nx = Vec((0 until 3).map(i => IcacheInstructionOrder.opword(rawNx(i))))
       def word(i: Int): Bits =
-        if (i < WORDS_PER_BEAT) w(i) else Mux(nextValid, nx(i - WORDS_PER_BEAT), B(0, 16 bits))
+        if (i < chunkWords) w(i) else Mux(nextValid, nx(i - chunkWords), B(0, 16 bits))
       def wordValid(i: Int): Bool =
-        if (i < WORDS_PER_BEAT) True else nextValid
-      Vec((0 until WORDS_PER_BEAT).map { i =>
+        if (i < chunkWords) True else nextValid
+      Vec((0 until chunkWords).map { i =>
         PredecodeWord.classify(
           w(i), word(i + 1), word(i + 2), word(i + 3),
           extWValid  = wordValid(i + 1),
@@ -1326,6 +1351,10 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     val refillDone        = Bool()   // driven by the datapath, read by the FSM
     val refillErr         = Bool()
     val predActive        = Bool(); predActive        := False
+    // True when this cycle supplies a complete beat's metadata. Eight-wide
+    // fallback may first need one lower-half preparation cycle.
+    val predBeatDone      = Bool()
+    predBeatDone.simPublic()
     // M2b: `PF_PRED` is merged into `PREDECODE`, so "which kind of install is this
     // dwell?" can no longer be a state identity -- it becomes a REGISTER, written by
     // whichever arm entered INSTALL_ARM and stable for the whole dwell. `predIsPf` is
@@ -1962,7 +1991,7 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
           fillArrayWrActive := True
           lookupTick(canStartFill = false)
         }
-        when(commitBeat === U(1, 1 bits)) {
+        when(commitBeat === U(1, 1 bits) && predBeatDone) {
           when(predIsPfReg) {
             // M2c: freed by MSHR index. `pfInstallIdx` (a second, slot-relative copy of
             // the same number `installIdx` already holds) is deleted. Guarded by
@@ -2680,9 +2709,9 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     }
 
     // ---- predecode dwell: classify both beats, then commit the arrays ----
-    // ── Slice I2: ONE 16-instance classify group, used on BOTH cycles of the dwell
-    // (commitBeat 0 = low beat, commitBeat 1 = high beat). See `classifyBeat` above for
-    // the full rationale and the equivalence argument.
+    // One shared classifier group: baseline sixteen-wide, optional eight-wide.
+    // commitBeat selects low/high beat, advancing only when metadata is complete.
+    // See `classifyBeat` and docs/icache-predecode-sharing.md for the schedule.
     //
     // M2b: the dwell classifies out of the MSHR line file, not out of `lineReg`. The
     // file is split Lo/Hi precisely so classifyBeat's cross-beat lookahead (the low
@@ -2701,7 +2730,42 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     val isLoBeat  = commitBeat === U(0, 1 bits)
     val beatSrc   = Mux(isLoBeat, fillLoQ, fillHiQ)
     val beatNext3 = Mux(isLoBeat, fillHiQ(47 downto 0), B(0, 48 bits))
-    val beatPred  = classifyBeat(beatSrc, beatNext3, isLoBeat)
+    val beatPred = if (predecodeWords == 16) {
+      predBeatDone := True
+      classifyBeat(beatSrc, beatNext3, isLoBeat)
+    } else {
+      val lowerReady = Mux(isLoBeat, earlyPred.loValid(installIdx), earlyPred.hiValid(installIdx))
+      predBeatDone := lowerReady || earlyPred.fallbackUpper
+      val installChunk = Mux(predBeatDone, beatSrc(255 downto 128), beatSrc(127 downto 0))
+      val installNext = Mux(predBeatDone, beatNext3, beatSrc(175 downto 128))
+      // Exactly ONE eight-instance classifier group, used by either owner.
+      // The first eight words' lookahead is wholly within their AXI beat.
+      val chunk = Mux(predActive, installChunk, axi.r.payload.data(127 downto 0))
+      val next = Mux(predActive, installNext, axi.r.payload.data(175 downto 128))
+      val nextValid = !predActive || !predBeatDone || isLoBeat
+      val chunkPred = classifyBeat(chunk, next, nextValid)
+      val prepareEarly = rFire && !predActive
+      earlyPred.lo.write(rIdx, chunkPred, enable = prepareEarly && !mshrBeat(rIdx))
+      earlyPred.hi.write(rIdx, chunkPred, enable = prepareEarly && mshrBeat(rIdx))
+      when(rFire) {
+        when(!mshrBeat(rIdx)) {
+          earlyPred.loValid(rIdx) := !predActive
+        } otherwise {
+          earlyPred.hiValid(rIdx) := !predActive
+        }
+      }
+      when(predActive) {
+        when(!predBeatDone) {
+          earlyPred.fallbackLower := chunkPred
+          earlyPred.fallbackUpper := True
+        } otherwise {
+          earlyPred.fallbackUpper := False
+        }
+      }
+      val lowerPred = Mux(lowerReady,
+        Mux(isLoBeat, earlyPred.loQ, earlyPred.hiQ), earlyPred.fallbackLower)
+      chunkPred ## lowerPred
+    }
 
     when(predActive) {
       // An INHIBITED-mode fetch never allocates a line — no tag/valid write, no
@@ -2727,16 +2791,20 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       // declaration for the full equivalence, write/read-ordering and missPC-
       // immutability arguments (they cover `bypWindow` identically -- same predicate,
       // same lane index, same cycle).
-      when(commitBeat === missPC(5).asUInt) {
+      when(predBeatDone && commitBeat === missPC(5).asUInt) {
         bypWindow := beatSrc.subdivideIn(64 bits)(missPC(4 downto 3))
         bypPred   := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
       }
-      when(isLoBeat) {
+      val penultimatePhase = if (predecodeWords == 16) isLoBeat else
+        (isLoBeat && predBeatDone && earlyPred.hiValid(installIdx)) ||
+          (!isLoBeat && !predBeatDone)
+      when(penultimatePhase) {
         // DEBUG only: the cycle immediately BEFORE the allocation write. Its one
         // consumer, IcacheSpec's invalidate-race test, self-checks the pairing by
         // re-reading `dbgAllocCommitCycle` on the next sampling point.
         dbgAllocCommitPending := doAllocate
-      } otherwise {
+      }
+      when(!isLoBeat && predBeatDone) {
         // The tag/valid commit still happens on commitBeat==1 only. Nothing downstream
         // shifts: REPLAY is entered the cycle AFTER commitBeat==1 either way.
         dbgAllocCommitCycle := doAllocate
@@ -2775,7 +2843,7 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
           victim(installSet) := victim(installSet) + 1
         }
       }
-      when(doAllocate) {
+      when(doAllocate && predBeatDone) {
         for (w <- 0 until ways) {
           when(installWay === U(w, wayBits bits)) {
             // M1: ONE write, ONE call site (a SECOND Mem.write call site breaks
@@ -2789,16 +2857,19 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
           }
         }
       }
-      // Exactly two consecutive PREDECODE cycles: this one-bit counter wraps
-      // back to zero as the FSM exits, for both demand and speculative installs.
-      // No install-start clear is needed; reset still initializes it to zero.
-      commitBeat := commitBeat + 1
+      // Two complete-beat writes. Eight-wide mode only adds a preparation
+      // cycle when this beat missed early predecode due to installer contention.
+      // The counter still wraps on the FSM's exit, without an install-start clear.
+      when(predBeatDone) { commitBeat := commitBeat + 1 }
     }
 
     GenerationFlags.simulation {
       when(!predActive) {
         assert(commitBeat === U(0, 1 bits),
-          "I-cache install phase must be zero outside the two-beat PREDECODE dwell")
+          "I-cache install phase must be zero outside the PREDECODE dwell")
+        if (predecodeWords == 8) {
+          assert(!earlyPred.fallbackUpper, "I-cache half-beat phase escaped its installer")
+        }
       }
     }
 

@@ -39,6 +39,13 @@ an older occupant. Reset clears the validity bits; metadata contents need no res
 The only local staging holds a lower half computed during fallback. Existing
 fill data is not duplicated.
 
+Storage accounting matters even though cached metadata is unchanged. With the
+current nine-bit `ChunkPredecode` and five MSHRs, the temporary memories hold
+720 bits total (two 72-bit by five-entry arrays). Their synchronous read outputs
+add 144 register bits, fallback staging 72, and validity/phase 11: 947 logical
+state bits before synthesis mapping. Do not describe the sharing as free or
+assume those small arrays map to BRAM; inspect implementation utilization.
+
 Each classifier still sees the same three extension words and validity flags
 as whole-line predecode. Crossing an eight-word boundary must not introduce
 ambiguity. Only lookahead beyond word 31 is unavailable. Both refill beats
@@ -68,3 +75,48 @@ tests, hot-loop and refill-heavy IPC measurements, generated-RTL checks for
 eight actual classifier instances, required fast tests, production lint and
 serialized matched 200 MHz SoC implementation. Keep a logically correct option
 after a timing miss only with a concrete repair hypothesis; no timing waivers.
+
+## Initial simulation evidence (2026-09-21)
+
+Matched board-byte-copy microbenchmarks (32/128 bytes, with/without readback,
+baseline/combined socket options, seeds 1/17): all sixteen retirement windows
+have exactly unchanged cycle counts, IPC, branch/mispredict counts and SQ
+reservation/publication counts. These reproduce a board-observed instruction
+shape; they are not measurements of the complete Mac Dhrystone executable.
+
+Refill-heavy full-core measurements use combined throughput options, reduced
+debug, and the same L2-hit=5/DDR=70 cycle model for both modes. Linear code
+executes 8 KiB of MOVEQ instructions; sparse chains execute two instructions
+per 64-byte line across 32 KiB in sequential or fixed-seed shuffled order.
+Every architectural result and the sparse traversal order are checked.
+
+| Workload | Seed | 16-way cycles | 8-way cycles | IPC change |
+| --- | ---: | ---: | ---: | ---: |
+| Linear 8 KiB | 1 | 2897 | 2897 | 0.000% |
+| Linear 8 KiB | 17 | 2880 | 2883 | -0.104% |
+| Sparse sequential 32 KiB | 1 | 11745 | 11745 | 0.000% |
+| Sparse sequential 32 KiB | 17 | 11699 | 11773 | -0.629% |
+| Sparse shuffled 32 KiB | 1 | 21776 | 21747 | +0.133% |
+| Sparse shuffled 32 KiB | 17 | 22115 | 22310 | -0.874% |
+
+The paired directed test compares 665 fetched windows byte-for-byte and
+metadata-bit-for-metadata-bit, with independent byte expectations, extension
+patterns across all boundaries, consecutive/gapped returns, reused MSHRs and
+natural classifier contention. Uncontended installations take two cycles;
+two accepted responses during another owner's install cause exactly two
+fallback cycles. Generated standalone RTL contains sixteen/eight copies of
+the classifier's FPU-immediate case table respectively, confirming the sharing.
+This is structural evidence, not a synthesized LUT or routing result.
+
+Logs: `/tmp/ipc-predecode8-paired.log`, baseline
+`/tmp/ipc-predecode8-ipc-before.log`. The final eight-way cache regression passed
+72 tests, including invalidation in all four fallback phases; default sixteen-way
+passed all 70 existing cache tests. Required `make SBT=~/sbt/bin/sbt test-fast`
+passed in both configurations: 396 succeeded, two ignored, zero failures/aborts.
+Both production generations passed with throughput-v2, reduced debug and detailed
+counters enabled. Full socket RTL contains 17/9 copies of the classifier's table
+(sixteen/eight refill instances plus one unchanged frontend classifier).
+Source receipts and gate results are in `/tmp/ipc-predecode8-final-gates.log`,
+`/tmp/ipc-predecode8-candidate.sha256`, `/tmp/ipc-predecode8-netlists.sha256`.
+Production SoC lint and physical comparison remain separate acceptance gates;
+passing these measurements alone does not approve a release.

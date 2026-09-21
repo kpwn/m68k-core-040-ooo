@@ -1447,11 +1447,15 @@ class IcachePrefetchSpec extends AnyFunSuite {
         val predActive = dut.icache.logic.predActive.toBoolean
         val commitBeat = dut.icache.logic.commitBeat.toInt
         assert(commitBeat == expectedCommitBeat,
-          s"install phase changed outside its two-beat dwell: expected=$expectedCommitBeat actual=$commitBeat")
+          s"install beat advanced without complete metadata: expected=$expectedCommitBeat actual=$commitBeat")
         if (predActive) {
-          if (dut.icache.logic.predIsPf.toBoolean) prefetchCommitBeats += 1
-          else demandCommitBeats += 1
-          expectedCommitBeat ^= 1
+          if (dut.icache.logic.predBeatDone.toBoolean) {
+            if (dut.icache.logic.predIsPf.toBoolean) prefetchCommitBeats += 1
+            else demandCommitBeats += 1
+            expectedCommitBeat ^= 1
+          } else {
+            assert(dut.icache.predecodeWords == 8, "baseline unexpectedly staged a half-beat")
+          }
         } else {
           assert(commitBeat == 0, "idle installer retained a partial beat")
         }
