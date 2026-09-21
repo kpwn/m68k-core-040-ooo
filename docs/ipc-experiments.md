@@ -1140,6 +1140,24 @@ tests, two ignored, no failed or aborted suites; the exact final-source rerun
 also passes (`/tmp/sq-detach-final-fast-v3.log`). Timing/area remain pending, with a
 matched core routing pair to follow the P3-reservation pair.
 
+Implementation: `876e58f53693dba771204946ef2bb74980ae0710`. Unit
+`m68k-sq-detach-876e58f5.service` is queued behind P3 reservation, with shared
+Vivado mutex, 5 ns and three post-route rounds. Both pinned arms enable aligned
+load fall-through, early integer wakeup, direct long MOVE fusion, early store
+address and late-store SQ reservation; only the candidate adds
+`--detach-late-store`. Artifacts: `/tmp/sq-detach-gate.97VroC`. The existing
+`build-logs:0` pane follows both arms' elaboration and implementation logs, along
+with its previous queue. No board reset, halt, reload or measurement was performed.
+
+Next dependency-latency experiment: let a waiting P4 overlap query use **actual
+same-edge SQ publication** rather than waiting for `dataReady` to register and
+then re-querying. Preserve youngest-overlap priority and byte masks; do not let
+a younger partial match expose older data, or bypass device/flush rules. This
+would be publication-edge forwarding, not an advance wake guarantee. Its likely
+timing risk is PRF data → SQ selection → P4; investigate registered address-match
+preselection if necessary without restoring the cycle it tries to remove. Keep
+the single-owner capacity limitation and broader retry work visible.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style
