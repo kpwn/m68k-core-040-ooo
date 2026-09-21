@@ -2736,3 +2736,31 @@ The v2 100 MHz retry passed generation, top/real-MIG lint and all profile/source
 reset checks, acquired the Vivado mutex, and advanced beyond the formerly failing
 profile guard into real CPU socket regeneration. The implementation job is now
 running, not merely waiting in the physical queue.
+
+### Queued 200 MHz candidate without capture IP — 2026-09-21
+
+User requested another 200 MHz SoC build with the IPC ILA and nonessential
+diagnostic logic removed, keeping counters where possible. CPU remains exactly
+`ca3f31da7f04cdfbcbc7199d4ce7683e35638403`, throughput-v2. New isolated SoC
+worktree `/home/qwertyoruiop/macqd700-soc-worktrees/ipc-v2-200mhz-lean`, branch
+`perf/ipc-v2-200mhz-lean`, pin `eb7d5dddb035932cc90177e8d561ef8e6e346425`.
+Tracked configuration: `synth/profiles/throughput-v2-200mhz-lean.env`.
+
+IPC ILA, legacy ILA and SCSI trace ring are OFF. Detailed performance counters
+remain ON, with JTAG AXI for readout and VIO for existing reset/debug controls.
+VIO is required by the current real-board/debug-artifact safety gates; this
+build does not bypass those guards. Ethernet remains ON, Ethernet debug and
+PCIe remain OFF; no CMD25 or CPU algorithm changes. The unused IPC trace output
+can be pruned when the ILA consumer is absent. Do not claim a routed area saving
+until synthesis/implementation reports establish it.
+
+Service `m68k-ipc-v2-soc200-lean.service`, runner
+`/tmp/run-ipc-v2-soc200-lean.sh`, logs
+`/tmp/ipc-v2-soc200-lean-{build,generation,lint}.log`. Generation/lint run in the
+isolated worktree; physical implementation waits on the same global Vivado mutex
+currently held by the 100 MHz build. This runner does not suspend/resume another
+controller or interrupt the active 100 MHz job. The existing `build-logs:0.0`
+pane follows both SoC jobs. Post-build manifest checks require counters on,
+IPC ILA/SCSI trace off, 200 MHz core clock, and the retained debug access.
+Profile/source/reset checks pass; the unchanged CPU pin has its passing
+388-test fast gate. No auto-load, board reset or SPI/SD writes are queued.
