@@ -381,3 +381,48 @@ After the constant-alias correction the required repository fast gate passed:
 `/tmp/ipc-cleanup-routing-constants-fast.log`. The Tcl alias regression and
 cell-census smoke test also passed. Full real-design PIP reconciliation is
 still unverified until a scan completes.
+
+## L2 install payload: remove a duplicate registered line
+
+SoC candidate `07dde55ed980feb3ce5b8c1222426570c7d2105d`, branch
+`perf/l2-install-payload-cleanup`, worktree `ipc-v2-l2-install-cleanup`,
+is based on the queued CSR+PRAM source `616d8fa`. It replaces the separate
+512-bit `inst_data` register with the existing `act_line` register. In
+S_INSTALL and S_SWR the same primary/replay byte merge previously updated
+both registers on the edge raising `inst_valid`. Successor states do not
+modify `act_line` through the consuming edge; a new S_SCAN snapshot happens
+only after install-valid is low. Invalid install payload is unspecified.
+No valid, strobe, tag, dirty-state, request or response sequencing changes.
+The public L2 interface contract now documents that existing pulse timing.
+
+`tb_l2c.v` retains an independent, old-style registered install-data shadow:
+it captures the pre-edge active line and applies dynamic byte writes, then
+compares every valid install payload. This checker was first run against
+the unchanged baseline before testing the register-removal candidate.
+
+Matched baseline/candidate results:
+
+- `tb-l2c`: 68 directed tests pass in both.
+- `tb-l2c-stress`: five fixed seeds, 100000 operations each, pass in both.
+- All printed cycle/throughput/hazard/stall counters match exactly, including
+  partial writes, replay merges, fill errors and reset-mid-traffic cases.
+- `tb-l2c-chain`: four integration cases pass in both; eight concurrent fills
+  take 414 cycles versus 1995 serialized, unchanged, with eight ARs accepted
+  before the first R response and peak MIG queue occupancy eight.
+- `tb-l2c-wstream`: the complete serialized and pipelined throughput tables
+  match exactly. These are model cycles, not newly measured board IPC.
+
+Logs: `/tmp/ipc-cleanup-l2-install-{before,after}.log` and
+`/tmp/ipc-cleanup-l2-install-chain-{before,after}.log`. Removing a 512-bit RTL
+register does NOT yet prove a 512-FF physical saving or routing improvement:
+the surviving active-line drivers take on its loads. Matched Vivado OOC
+synthesis is queued under the existing mutex as
+`m68k-ipc-cleanup-l2-install-synth.service`, using source-pin and correctness
+receipt checks. Output: `/tmp/ipc-cleanup-l2-install-synth/`; log:
+`/tmp/ipc-cleanup-l2-install-synth.log`. This does not interrupt CSR+PRAM or
+replace its source pin. Do not accept the change on OOC counts alone; a
+full routed SoC comparison remains required. No board access was performed.
+The unchanged CPU cleanup worktree also passes the required fast gate again:
+390 passed, 2 ignored, zero failures (`/tmp/ipc-cleanup-l2-install-core-fast.log`).
+That core gate does not exercise the SoC RTL; the matched L2/chain tests above
+are the correctness and cycle evidence for this change.
