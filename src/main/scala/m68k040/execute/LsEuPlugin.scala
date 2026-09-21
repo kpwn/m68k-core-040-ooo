@@ -2997,15 +2997,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         val pending = StreamFifo(Context(), detachedStoreEntries - 1)
         pending.io.flush := sqFlushSig || excActive
         // Occupancy, not pop.valid: a synchronous FIFO may be fetching its head.
-        val direct = !valid && pending.io.occupancy === 0
-        reserveReady := direct || pending.io.push.ready
+        val tailEmpty = pending.io.occupancy === 0
+        val direct = (!valid || complete) && tailEmpty
+        // Reserve real tail capacity even if completion loses arbitration.
+        reserveReady := (!valid && tailEmpty) || pending.io.push.ready
         pending.io.push.valid := reserve.valid && !direct
         pending.io.push.payload := reserve.payload
         pending.io.pop.ready := (!valid || complete) && !sqFlushSig && !excActive
         queuedAdmission := pending.io.push.fire
         admitHead.valid := pending.io.pop.fire || (reserve.valid && direct)
         admitHead.payload := pending.io.pop.payload
-        when(direct) { admitHead.payload := reserve.payload }
+        // Only the narrow enable depends on completion, not the context mux.
+        when(tailEmpty) { admitHead.payload := reserve.payload }
         pending.io.occupancy.simPublic()
         GenerationFlags.simulation {
           when(reserve.valid) { assert(reserveReady, "late store context FIFO overrun", FAILURE) }

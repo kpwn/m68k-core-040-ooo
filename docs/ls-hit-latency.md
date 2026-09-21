@@ -18,6 +18,15 @@ queued context, including while the FIFO read is pending. Reset/flush cancel all
 contexts together with their uncommitted SQ reservations. No external producer
 retains a context after cancellation. Store sources remain live until completion.
 
+Empty-tail turnover experiment: an already-admissible context may replace the
+active owner on its completion edge when the tail occupancy is zero. Admission
+capacity must remain independent of completion: if completion loses arbitration,
+the same admitted context fits in the tail instead. Select the incoming payload
+using registered tail emptiness, not the completion signal. A replacement still
+clears readiness qualification; it must never capture the new source using the
+previous owner's readiness. Compare against the pinned queued-context baseline
+before retaining this bypass.
+
 Compare one, two and four owners with matched full-core IPC. Require actual
 multiple-owner occupancy and disjoint-load progress, plus full-capacity, alias,
 flush, source-reuse and completion-contention correctness coverage. Reject added

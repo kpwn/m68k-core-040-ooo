@@ -1927,8 +1927,9 @@ two-instruction assumption. It remains failing and unresolved; do not claim the
 whole sweep passed or silently enlarge its window. Evidence:
 `/tmp/ls-queued-odd-ssp-fixed-{1,4}.log`. A bounded regression separately exercises
 the repeated-RTS boundary at boot offsets 0/2/4, without excluding or marking the
-original whole-sweep test ignored. Resolving the remaining acceptance-schedule
-fixture and completing full regression are outstanding acceptance work.
+original whole-sweep test ignored. Tracing the remaining IRQ acceptance schedule
+and completing full regression are outstanding acceptance work. Reproduction in
+both capacities alone does not establish that the delayed acceptance is legal.
 
 The source-reuse test was also strengthened to change each iteration's producer
 values, so repeated constants cannot hide stale data after slot reuse. Its v2
@@ -2050,6 +2051,68 @@ capacity differs. The script uses fresh detached worktrees, netlist SHA-256s and
 the shared Vivado mutex. The existing `build-logs` tmux pane follows these logs.
 This is queued screening, not a timing result or functional acceptance; the
 shared IRQ boundary-33 issue remains open. No board reset, halt or reload occurred.
+
+## Empty-tail detached-context turnover — 2026-09-21
+
+Baseline: `b4c99f82` (queued contexts), documentation-only HEAD `573a303a`.
+An already-admissible new context can directly replace a completing active owner
+when the FIFO tail is empty. Readiness still depends on actual tail capacity,
+not same-cycle completion credit. If the old owner loses completion arbitration,
+the new context enters the tail normally. Tail emptiness selects the context
+payload; completion affects only the narrow handoff enable. Every replacement
+clears readiness qualification. One-owner RTL is unchanged.
+
+The first matched four-owner broad corpus passes all **136 windows**. Against
+the original four-owner version, **four improve, 132 are identical, none regress**.
+The four early-integer-wakeup short-store/load recurrence cases recover their
+one lost cycle (287/286 to 286/285 with either fall-through mode), without changing
+macro counts. Actual tail admissions fall from 60 to two in these windows; most
+handoffs now avoid the tail, but this is only a one-cycle finite-window IPC gain,
+not a steady-state throughput claim. The no-early-wakeup cases stay at 344/343.
+Evidence: `/tmp/ls-turnover-corpus-4.log` versus `/tmp/ls-queued-corpus-4.log`.
+The expanded **84-run target passes**. Compared with the committed queued-context
+version, 82 windows are identical and two improve: four-owner load/four-store
+disjoint recurrence is **607→598 cycles** at both seeds (+1.505% IPC), keeping
+240 measured macros and zero overtakes. This is 39.30% higher IPC than the original
+one-owner 833-cycle target. Two-owner target windows and all one-owner controls
+are unchanged. Evidence: `/tmp/ls-turnover-targeted.log` versus
+`/tmp/ls-queued-targeted-ipc-v2.log`. The two-owner broad corpus also passes and
+matches all **136 windows exactly** against its original queued-context version
+(`/tmp/ls-turnover-corpus-2.log` versus `/tmp/ls-queued-corpus-2.log`). Thus neither
+capacity introduces a regression in the measured corpus; the handoff specifically
+repairs the four-owner tail penalty and improves its larger load-fed burst.
+Each two/four-owner selected correctness set passes **48 tests**, including changing
+source/slot reuse (120 queued admissions, 144 captures), 16 multi-owner redirect
+cancellations, back-response contention, alias/split and precise-I/O controls,
+faults, NZVC, repeated-RTS IRQ, CCR/RTE and overflow/DIVREM. Evidence:
+`/tmp/ls-turnover-oracle-{2,4}.log`. Production four-owner RTL generation also
+passes (`/tmp/ls-turnover-production.log`); it is not a synthesis result. The
+serialized mandatory `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` passes
+**387 tests, two ignored, zero failures** (`/tmp/ls-turnover-fast.log`). The
+separate shared boundary-33 sweep is not covered by these passes.
+
+Next correctness diagnostic: trace the actual IPL assertion, `p0.first`,
+`irqPreemptArmed`, `inhibitedLoadBusySig`, exception state and retired macro PCs
+at boundary 33. The RTL intentionally holds inhibited-load busy through its
+retirement and prevents new first-uop inhibited launches while an IRQ is armed;
+those safety conditions must not be removed just to satisfy a two-instruction
+fixture window. Conversely, a missing macro-first marker or stale busy qualifier
+must not be hidden by widening that window. Keep full register/CCR/frame/local
+memory comparison when matching the independently observed accepted boundary.
+
+### Publication-forward timing completed in the background
+
+Pinned `3f53a39b` publication-forwarding now completes its core-only routed
+comparison: baseline **−0.073 ns**, candidate **+0.045 ns**, at a real 5.000 ns
+constraint. The candidate has **zero setup, hold or pulse-width violations**,
+hold slack +0.019 ns and pulse-width slack +1.958 ns. LUTs **94,769→93,917**;
+FFs **38,759→38,761**; BRAM tiles remain 37. Worst candidate path is ALU opcode
+bit 0 to LSU completion NZVC bit 2, 21 levels, 63.96% routing. This confirms
+core-only timing for the earlier IPC-positive publication-forward candidate;
+it does not establish queued-context, early-NZVC, integrated SoC or board timing.
+Artifacts: `/tmp/sq-publish-gate.GHXuam/{baseline,published}-summary.txt`,
+`published/synth/fullcore_route_{timing,util}.rpt`. The recovery service exits
+successfully; the serialized early-NZVC comparison has advanced next.
 
 ## Next investigations requested — 2026-09-21
 

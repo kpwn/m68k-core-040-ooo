@@ -380,6 +380,16 @@ All 84 expanded target windows pass, as do 37 focused correctness tests, the
 13-test bounded set at each capacity and the 387-test fast gate. A shared baseline
 odd-SSP IRQ-schedule failure remains unresolved; this is not full acceptance.
 
+Follow-up empty-tail turnover removes the four-owner one-cycle regressions:
+four broad windows improve, 132 are unchanged, none regress versus its original
+implementation. The two-owner corpus stays identical in all 136 windows. In the
+84-run target, four-owner load/four-store disjoint recurrence improves again,
+607 to 598 cycles; the other 82 windows are unchanged. This uses the same active
+context and tail, with no new stored state or PRF port. It does not borrow a
+same-cycle completion credit. Each capacity passes the 48-test focused
+correctness set, and production generation and the 387-test fast gate pass.
+Routing of this handoff revision remains pending; see the ledger for evidence.
+
 Completed narrow audit: `issuePort.ready` blocks **all** new LSU issues on a late-data
 capture edge, although base and index use separate PRF read ports from store
 data. The tested ordinary-load overlap saves no end-to-end cycles across 136
