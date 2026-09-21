@@ -1,5 +1,55 @@
 # Throughput-v2 congestion cleanup
 
+## Debug architectural-apply address predecode (2026-09-21)
+
+Isolated follow-up on CPU `388adc9c`, branch `perf/debug-apply-predecode`,
+reserved cleanup-pool agent-05. It is NOT in the running/queued SoC sources.
+The strict audit of the routed CSR+PRAM image exposed an AW-address-to-IQ
+path at -2.064 ns: 18 logic levels and 7.380 ns data delay, of which 5.927 ns
+is routing and 2.312 ns is the first address net alone. The path traverses
+architectural-apply priority and MMU/LSU control. Audit source:
+`/tmp/ipc-cleanup-debug-timing-csr_pram/address_setup.rpt`.
+
+Capture the full `OFF_ARCH_APPLY` address match on the same accepted AW edge
+as `awAddr`, following the existing `awIsHaltAfter` pattern. Use this one
+registered bit in START/CLEAR with the existing registered AW/W pending,
+response, data and strobe bits. No command/application edge, response delay,
+reset owner, service interface, Global key, or normal pipeline stage changes.
+The six-input START/CLEAR forms avoid placing a wide address comparator
+after a high-fanout address flop and before the exported apply-control cone.
+A simulation assertion checks the captured match against the original
+full-address expression whenever an AW is pending. Physical benefit remains
+unproven until implemented; one added RTL bit is not a synthesized count.
+
+The new directed test passed on unchanged RTL first, then the candidate
+passed all 25 tests across apply-decode, AXI, reset and ROB integration
+suites. The test covers independent AW/W order, simultaneous arrival,
+poisoned live inputs after capture, byte strobes, unaligned/high-address
+aliases, and attempts to replace/replay a command during B backpressure.
+Logs: `/tmp/ipc-cleanup-debug-apply-{before,after}.log`.
+
+Fresh matched `BoardStringCopyIpcSpec` runs at `IPC_MEM=l2:5:70`, with both
+early-store options enabled, match all 16 before/after rows exactly at
+19:58:59 CEST: cycles, retired macros, branches/misses, reservations and
+publications. Logs: `/tmp/ipc-cleanup-debug-apply-ipc-{before,after}.log`.
+That benchmark's FullCoreDut does not instantiate DebugCtrlPlugin; this is
+a normal-core regression control, not coverage of live debug commands or
+proof of physical timing. The focused ROB/MMU integration tests exercise
+the changed control path. The first required fast gate completed 391 tests
+with 7 C++ compilation failures: the filesystem had only 35 MiB available,
+and each failure reports `No space left on device`, not a simulation mismatch.
+After removing 332 generated precompiled headers from completed agent-01/04
+simulation workspaces (24.8 GiB; source, results and FPGA artifacts preserved),
+the unchanged-source full rerun passed all 391 tests, 2 ignored, no aborted
+suites or failures at 20:05:19 CEST. Logs:
+`/tmp/ipc-cleanup-debug-apply-fast.log` (failed infrastructure run),
+`/tmp/ipc-cleanup-debug-apply-fast-r2.log` (passing complete rerun).
+The earlier validation service remains failed as an accurate record of its
+original disk-space failure; the rerun was a separate foreground job, exit 0.
+Source receipt: `/tmp/ipc-cleanup-debug-apply-validation.sha256`, rechecked
+after the passing gate. No test assertions or RTL were changed to obtain the
+pass.
+
 Baseline: SoC `9048d47e`, CPU `ca3f31da`, 200 MHz, Ethernet and detailed
 counters enabled; IPC ILA and SCSI trace disabled. The user reports 100k
 Dhrystones/s (51k at 100 MHz). The loaded test image is not timing-closed:

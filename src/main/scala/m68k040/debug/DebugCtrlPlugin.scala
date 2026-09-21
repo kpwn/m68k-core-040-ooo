@@ -281,6 +281,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * substitution, not an approximation -- no cycle of behaviour moves. */
       val awIsHaltAfter = RegInit(False); awIsHaltAfter.simPublic()
 
+      // Architectural apply has another combinational export: applyStart takes
+      // priority over the busy apply FSM, including its MMU/system-write phase.
+      // A strict 200 MHz route traced awAddr -> apply priority -> MMU/LSU -> IQ
+      // at -2.064 ns, with 2.312 ns on the first address net alone. Capture this
+      // full-address match alongside awAddr, without moving the write edge.
+      val awIsArchApply = RegInit(False); awIsArchApply.simPublic()
+
       /** FMAX companion to `awIsHaltAfter`: `wStrb.orR` precomputed on the edge that
         * captures `wStrb`. Together the two turn `haltAfterInvalidate` into a single
         * LUT6 over five flops (`awPend`, `wPend`, `bPend`, `awIsHaltAfter`, `wStrbAny`)
@@ -871,6 +878,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         // Same edge, same source word -- see `awIsHaltAfter`'s declaration.
         awIsHaltAfter := (dbgAxi.awaddr === DebugRegMap.OFF_HALT_AFTER_LO) ||
                          (dbgAxi.awaddr === DebugRegMap.OFF_HALT_AFTER_HI)
+        awIsArchApply := dbgAxi.awaddr === DebugRegMap.OFF_ARCH_APPLY
       }
       when(dbgAxi.wvalid  && dbgAxi.wready)  {
         wPend := True; wData := dbgAxi.wdata; wStrb := dbgAxi.wstrb
@@ -1301,9 +1309,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       }
 
       if (stage >= 3) {
-        val applyStart = doWrite && (awAddr === DebugRegMap.OFF_ARCH_APPLY) &&
+        // Like haltAfterInvalidate, keep the cold-path command to six registered
+        // inputs rather than the shared doWrite net plus a wide address decode.
+        val applyStart = awPend && wPend && !bPend && awIsArchApply &&
           wStrb(0) && wData(0)
-        val applyClear = doWrite && (awAddr === DebugRegMap.OFF_ARCH_APPLY) &&
+        val applyClear = awPend && wPend && !bPend && awIsArchApply &&
           wStrb(0) && wData(1)
         val applyCapable = Bool(debugIntWrite != null && debugNzvcWrite != null &&
           debugXWrite != null && committedMap.nonEmpty && dbgSystem.nonEmpty)
@@ -2052,6 +2062,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       }
 
       GenerationFlags.simulation {
+        when(awPend) {
+          assert(awIsArchApply === (awAddr === DebugRegMap.OFF_ARCH_APPLY),
+            "DebugCtrlPlugin: accepted apply address decode diverged", FAILURE)
+        }
         // "CPU reset cannot change surviving debug configuration" (spec section 13).
         // The only legal movers of this vector are an applied AXI write and a cfg wipe.
         // `ctrlInitDoneOvr` is deliberately ABSENT: spec 15.1 classifies it as CPU-coupled
