@@ -2578,6 +2578,12 @@ Mandatory `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` passes:
 four-context/postincrement/subword profile with only the new qualifier toggled,
 after the already-queued postincrement comparison. No timing result yet.
 
+Candidate pin `626a0debb11a50e26a6a15cd04389095f94b1218`; matched gate queued as
+`m68k-store-data-timing-gate.service`, artifacts `/tmp/store-data-gate.uHJWYd`.
+It waits for `m68k-auto-store-timing-gate.service`, generates isolated pinned
+baseline/earlydata worktrees, and retains the global Vivado mutex. The existing
+`build-logs:0.0` pane now follows the active context-capacity baseline run.
+
 ### Combined 100 MHz SoC loaded — 2026-09-21
 
 SoC `6b10354af8e8a43eed7ec5c3b5f184eee4964f11`, CPU
