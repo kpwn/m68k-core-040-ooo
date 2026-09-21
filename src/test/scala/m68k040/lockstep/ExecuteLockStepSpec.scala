@@ -524,7 +524,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
       detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
       forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
-      earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"))
+      earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
+      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -6191,6 +6192,66 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(reads == 1, "device read must reach memory exactly once")
     if(sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"))
       assert(reservations > 0 && parked > 0, "device read never waited behind a detached store")
+  }
+
+  test("lock-step: queued detached stores preserve sources, byte overlaps and context reuse", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "moveq #3,%d1")
+    // Change each lifetime's values: repeating constants could hide a stale
+    // context or SQ slot after the ROB/SQ/FIFO indices wrap.
+    val body = (0 until 24).flatMap(n => Seq(
+      s"move.l #0x${(0x10000 + 3 * n).toHexString},%d0",
+      s"move.l #0x${(0x20000 + 3 * n).toHexString},%d3",
+      "divu.w %d1,%d0", "divu.w %d1,%d3",
+      "move.l %d0,0x3000", "move.l %d3,0x3004", "move.w %d0,0x3006",
+      "move.b %d3,0x3001", "move.l %d3,0x3008", "move.l %d0,0x300c",
+      "seq %d6", "move.l 0x3000,%d4", "move.l 0x3004,%d5", "move.l 0x3008,%d2",
+      "move.l 0x300c,%d0"))
+    var queued = 0; var captures = 0
+    runLockStep("queued-store-sources-overlap", (setup ++ body).mkString(" ; "),
+      maxCycles = 100000, perCycle = dut => dut.lsEu.logic.detachedStore.foreach { d =>
+        if(d.queuedAdmission.toBoolean) queued += 1
+        if(d.capture.toBoolean) captures += 1
+      }, afterRun = (_, oracle) => {
+        assert(oracle.last.d(4) == 0x00c1556cL)
+        assert(oracle.last.d(5) == 0x0002556cL)
+        assert(oracle.last.d(2) == 0x0002aac1L && oracle.last.d(0) == 0x0001556cL)
+      })
+    if(sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").exists(_.toInt > 1))
+      assert(queued > 24 && captures > queued,
+        s"queued context/source reuse not exercised: queued=$queued captures=$captures")
+    println(s"QUEUED_SOURCE_ORACLE queued=$queued captures=$captures")
+  }
+
+  test("lock-step: queued detached stores cancel all owners on redirect", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "move.l #0x11223344,0x3000", "move.l #0x55667788,0x3004",
+      "move.l #0x12345678,0x3008", "moveq #3,%d1", "move.l #0x10000,%d2")
+    val body = (0 until 16).flatMap(n => Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
+      s"bne.w .LqueuedSkip$n", "divu.w %d1,%d2", "move.l %d2,0x3000",
+      "move.l %d2,0x3004", "move.l %d2,0x3008",
+      s".LqueuedSkip$n: move.l 0x3000,%d4", "move.l 0x3004,%d5", "move.l 0x3008,%d6"))
+    var pending = 0; var canceledMultiple = 0
+    runLockStep("queued-store-redirect", (setup ++ body).mkString(" ; "),
+      nInstr = setup.size + 16 * 6, maxCycles = 100000,
+      perCycle = dut => dut.lsEu.logic.detachedStore.foreach { d =>
+        if(dut.lsEu.sqFlushSig.toBoolean) {
+          if(pending > 1) canceledMultiple += 1
+          pending = 0
+        } else {
+          if(dut.lsEu.logic.p3ReservationFire.toBoolean) pending += 1
+          if(d.complete.toBoolean) pending -= 1
+          assert(pending >= 0, "canceled detached store completed after redirect")
+        }
+      }, afterRun = (_, oracle) => {
+        assert(oracle.last.d(4) == 0x11223344L && oracle.last.d(5) == 0x55667788L &&
+          oracle.last.d(6) == 0x12345678L)
+      })
+    if(sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").exists(_.toInt > 1))
+      assert(canceledMultiple > 0, "redirect never canceled multiple pending store owners")
+    println(s"QUEUED_REDIRECT_ORACLE canceledMultiple=$canceledMultiple")
   }
 
   test("lock-step: detached store data progresses with a full SQ and a different pending source", VerilatorTest) {
@@ -12956,18 +13017,26 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // retry window must walk THIS sequence, because only here do adjacent positions mean
     // adjacent program boundaries.
     //
-    // ⚠️ ORACLE LIMITATION, read before touching this (cost a full investigation on
-    // 2026-09-16). The oracle is `Musashi.assembleAndTrace(..., irqEvents = Seq((pc, lvl)))`
-    // -- the interrupt is named by a PROGRAM COUNTER. This stretch RE-ENTERS pcs: the
-    // program has three `.short 0xa06e` A-line traps sharing one handler, and `sub1: rts`
-    // is entered twice (`jsr (%a1)` then `bsr.s sub1`). For any pc visited more than once
-    // the oracle takes the interrupt at its FIRST visit and there is NO way to ask it for
-    // the second -- so "before the SECOND visit of sub1's rts" is a boundary this oracle
-    // simply cannot express, and a DUT that legitimately lands there can match NO oracle.
-    // Keep the IPL poke keyed on MACRO retirement (see runIrqLockStep) so the DUT does not
-    // get pushed onto such a boundary in the first place.
+    // The PC-only oracle event normally names the FIRST visit. This program calls
+    // sub1 twice and re-enters its A-line handler, so retain occurrence identities
+    // in the permitted boundary window. For a later visit, precede the IRQ with a
+    // zero-level event at a first-visited PC between the previous and desired visit.
+    // That marker changes no architectural state; it arms the queued PC event only
+    // after the earlier visit. Both trace and final-memory oracle use this schedule.
     val boundarySeq = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc)
     val boundaryPcs = boundarySeq.distinct
+    def eventsAt(plainIndex: Int): Seq[(Long, Int)] = {
+      val pc = plain(plainIndex).pc
+      val previous = plain.take(plainIndex).lastIndexWhere(_.pc == pc)
+      if(previous < 0) Seq(pc -> level)
+      else {
+        val marker = (previous + 1 until plainIndex).reverse.find { n =>
+          !plain.take(n).exists(_.pc == plain(n).pc)
+        }
+        assert(marker.nonEmpty, f"[$tag] cannot uniquely arm repeated IRQ boundary 0x$pc%08x")
+        Seq(plain(marker.get).pc -> 0, pc -> level)
+      }
+    }
     val a6 = plain(firstOdd).a(6)
     val locals = Seq(a6 - 7, a6 - 5, a6 - 66, a6 - 65)
     // The interrupt entry is the first step AT OR AFTER the requested boundary whose SR
@@ -13011,43 +13080,44 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // chosen, the lock-step against it is exact and full-length and the frame/locals
       // memory comparison still runs.
       //
-      // PROGRAM-RELATIVE (fixed 2026-09-16). This window used to be index arithmetic over
-      // the `.distinct` list, so "i+1" was the next DISTINCT pc, not the next PROGRAM
-      // boundary -- wherever the stretch re-entered a pc (the shared A-line handler,
-      // `sub1`'s rts) the distinct list SKIPPED boundaries and an i±2 list window did not
-      // cover the i±1 program window. It now walks `boundarySeq`, where adjacent positions
-      // really are adjacent boundaries; `.distinct` at the end only removes duplicate
-      // SIMULATIONS, it no longer distorts adjacency.
+      // Keep the existing +/-2 PROGRAM-boundary limit, including occurrence identity.
+      // Deduplicating PCs here would collapse the two visits of sub1's RTS again.
       val pos = boundarySeq.indexOf(pc)
-      val windowPcs = (((pos to (pos + 2)) ++ ((pos - 1) to (pos - 2) by -1))
-                        .filter(j => j >= 0 && j < boundarySeq.size).map(boundarySeq)).distinct
+      val windowPositions = ((pos to (pos + 2)) ++ ((pos - 1) to (pos - 2) by -1))
+        .filter(j => j >= 0 && j < boundarySeq.size).distinct
       var matchedAt = -1
       var lastErr: org.scalatest.exceptions.TestFailedException = null
-      for (pcJ <- windowPcs if matchedAt < 0) {
-        val j = boundaryPcs.indexOf(pcJ)
-        val trJ = if (j == i) withIrq else Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pcJ, level)))
+      for (j <- windowPositions if matchedAt < 0) {
+        val pcJ = boundarySeq(j)
+        val eventsJ = eventsAt(firstOdd - 1 + j)
+        val trJ = if (j == pos) withIrq else Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = eventsJ)
                                                  .getOrElse(fail(s"[$tag] oracle (irq@$pcJ)"))
         val kJ  = trJ.indexWhere(_.pc == endPc)
         val fbJ = frameBaseOf(trJ, pcJ)
         try {
-          runIrqLockStep(f"$tag-b$i${if (j == i) "" else s"-late$j"}", src,
+          runIrqLockStep(s"$tag-b$i-at$j", src,
                          nInstr = (kJ + 1) min trJ.size, irqEvents = Seq((pc, level)), initialSr = 0x2700,
-                         oracleIrqEvents = if (j == i) None else Some(Seq((pcJ, level))),
+                         oracleIrqEvents = Some(eventsJ),
                          checkMem = (fbJ - 4 until fbJ + 8) ++ locals, checkSpan = 1,
                          dcfg = dcfg, cacr = cacr, a7ProbeLag = true, maxCycles = 60000)
           matchedAt = j
         } catch {
           case e: org.scalatest.exceptions.TestFailedException =>
             lastErr = e
-            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against the boundary-$j oracle (frame base 0x$fbJ%08x): ${e.getMessage.take(360)}")
+            println(f"[$tag] boundary $i (0x$pc%08x): no exact match against program-position $j oracle (frame base 0x$fbJ%08x): ${e.getMessage.take(360)}")
         }
       }
       assert(matchedAt >= 0,
         f"[$tag] boundary $i (0x$pc%08x): the DUT lock-stepped against NONE of the " +
-        f"oracles at pcs ${windowPcs.map(w => f"0x$w%08x").mkString("/")}. " +
+        f"oracles at positions ${windowPositions.mkString("/")}. " +
         f"Last failure: ${if (lastErr == null) "?" else lastErr.getMessage}")
-      if (matchedAt != i) println(f"[$tag] boundary $i matched the boundary-$matchedAt oracle (offset ${matchedAt - i})")
+      if (matchedAt != pos) println(s"[$tag] boundary $i matched program-position $matchedAt (offset ${matchedAt - pos})")
     }
+  }
+  test("odd-ssp: repeated RTS IRQ boundary uses a uniquely armed oracle event", VerilatorTest) {
+    for(k <- Seq(0, 2, 4))
+      oddSspIrqSweep(s"odd-ssp-repeated-rts-$k", k, 1, Seq("nop"), Seq("nop"),
+        onlyBoundaries = Some(Seq(20)))
   }
   for (k <- 0 until 16 by 2) {
     test(s"odd-ssp: level-1 IRQ at every boundary of the LINK #-75 stretch, boot-$k, plain handlers", VerilatorTest) {

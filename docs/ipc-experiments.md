@@ -1843,6 +1843,204 @@ Vivado mutex. The already-running publication baseline was left untouched;
 and performs the same guarded recovery only if its exit code is 127. Both reuse
 the existing artifact directories and the existing `build-logs:0` log window.
 
+## Queued detached-store contexts — 2026-09-21
+
+Baseline: `98565c72`, including early LSU NZVC wakeup. The audit found that a
+second translated store waiting on data holds P3 solely because the detached
+completion owner is occupied. A bounded FIFO now optionally queues additional
+source/completion contexts. Address issue and SQ allocation remain ordered;
+addresses, byte masks and data are not duplicated. One existing readiness lookup
+and one PRF read port process contexts oldest first. Context replacement clears
+readiness qualification and held NZVC; flush/reset clear the entire owner queue.
+The default remains one owner. See [the contract](ls-hit-latency.md).
+
+The four-owner generated RTL contains a three-entry, 23-bit synchronous-read
+tail memory plus FIFO control/read registers; this is **not** a measured BRAM or
+area claim. Two owners use the one-entry FIFO specialization. Admission does not
+borrow a completion-edge credit. Empty-queue admission still directly installs
+the active context, preserving the old first-store latency.
+
+### Targeted matched IPC
+
+`LsQueuedStoreIpcSpec` compares one, two and four owners with all retained LSU
+options, selective slot-1 prediction and retained history, ordinary two-wide
+retirement, `IPC_MEM=l2:5:70`, seeds 1/17. Each unrolled recurrence runs 48
+iterations with eight warm-up iterations excluded. A divide feeds 1/2/4/8 stores,
+followed by a disjoint or aliasing load feeding the next divide. Both seeds give
+the same counts below; all final D0 values are checked.
+
+| Stores / following load | Measured macros | One owner cycles | Two owners | Four owners |
+|---|---:|---:|---:|---:|
+| 1 / disjoint | 120 | 2617 | 2617 | 2617 |
+| 1 / alias | 120 | 2852 | 2852 | 2852 |
+| 2 / disjoint | 160 | 3012 | 2619 | 2619 |
+| 2 / alias | 160 | 2972 | 2853 | 2853 |
+| 4 / disjoint | 240 | 3252 | 3053 | 2623 |
+| 4 / alias | 240 | 3212 | 3013 | 2857 |
+| 8 / disjoint | 400 | 3612 | 3373 | 3255 |
+| 8 / alias | 400 | 3652 | 3373 | 3255 |
+
+All **48 runs pass**. Each larger capacity improves 12 matched windows, leaves
+four unchanged and regresses none. The two-store disjoint recurrence improves
+15.01% IPC; the four-store disjoint recurrence improves 23.98% with four owners.
+These gains include actual queued admissions and younger-load overtakes, not
+merely reduced owner occupancy. Aliasing controls have zero load overtakes;
+they benefit from faster store completion, not illegal alias bypass. The
+eight-store runs fill the eight-entry SQ and do not gain actual disjoint-load
+overtakes at these context capacities. No representative workload, board or
+routed timing speedup is inferred from these targeted kernels.
+Evidence: `/tmp/ls-queued-targeted-ipc.log`.
+
+New strict-oracle controls cover different divide-produced source registers,
+overlapping byte/word/long stores and repeated context/ROB reuse, plus redirects
+canceling multiple wrong-path store reservations. Their one-owner baseline
+passes both tests (`/tmp/ls-queued-oracle-baseline.log`). Candidate and broader
+regression results are recorded below when complete.
+
+### IRQ fixture findings and incomplete broad run
+
+The initial broad four-owner selection included every test containing `IRQ`,
+including long legacy stack-boundary matrices. Before stopping that run, **58
+tests passed and three odd-SSP sweeps failed**, at boot offsets 0/2/4. Completed
+checks included mixed-source queue use (120 queued admissions / 144 captures),
+16 multi-owner redirect cancellations, aliases/splits, full SQ, retained-NZVC
+completion contention, page/write-protection faults, device-read exact-once,
+long interrupt storms, CCR/RTE and A7 byte-stack checks. Some storm tests use
+architectural invariants rather than Musashi. This is **not a full-suite pass**.
+Evidence: `/tmp/ls-queued-oracle-4.log`.
+
+An exact matched one/four-owner reproduction fails at the same first odd-SSP
+boundary (`/tmp/ls-queued-odd-ssp-{1,4}.log`). The DUT accepts the interrupt on
+the **second** visit to a shared RTS PC; the fixture's PC-only oracle event takes
+the interrupt on its first visit. The existing +/-2 program-boundary range
+already contains that second visit, but its occurrence identity was discarded.
+The fixture now retains program positions and arms a repeated-PC oracle event
+with an existing zero-level IRQ event at a first-visited intervening PC. This
+changes no DUT logic, introduces no oracle-engine change and does not widen the
+permitted window or relax register/CCR/frame/local-memory comparison. The same
+qualified event sequence is used for the trace and final memory oracle.
+
+Both capacities now match the original boundary 20, including exact frame and
+local-memory checks. Continuing the whole boot-0 sweep exposes a **further shared
+baseline failure at boundary 33**: IRQ acceptance occurs beyond the fixture's
+two-instruction assumption. It remains failing and unresolved; do not claim the
+whole sweep passed or silently enlarge its window. Evidence:
+`/tmp/ls-queued-odd-ssp-fixed-{1,4}.log`. A bounded regression separately exercises
+the repeated-RTS boundary at boot offsets 0/2/4, without excluding or marking the
+original whole-sweep test ignored. Resolving the remaining acceptance-schedule
+fixture and completing full regression are outstanding acceptance work.
+
+The source-reuse test was also strengthened to change each iteration's producer
+values, so repeated constants cannot hide stale data after slot reuse. Its v2
+checks and the repeated-RTS regression are rerun at all three capacities. The
+first concurrent fast-gate attempt was stopped on discovering that `test-fast`
+contains untagged Verilator tests; it is not counted as a pass. The final run is
+serialized with the other simulator jobs.
+
+The strengthened bounded set passes **13 tests at each of one/two/four owners**
+(`/tmp/ls-queued-oracle-v2-{1,2,4}.log`): changing-value source reuse, redirect
+cancellation, the repeated-RTS regression at three boot offsets, overflow/DIVREM
+and instruction-length overflow controls. Two/four owners each observe 120 queued
+admissions, 144 publications and 16 multi-owner cancellations in the new controls.
+These results do not erase the separate whole-sweep boundary-33 failure.
+
+The first four-owner broad corpus completes all 136 windows: **4 improve, 128
+unchanged, 4 regress**, with identical macro counts. Without early integer wakeup,
+the load-fed store recurrence saves four total cycles (348/347→344/343, +1.16%).
+With it, the same recurrence loses one cycle (286/285→287/286, −0.35%), with either
+fall-through setting. The other 128 windows are unchanged. This is a small
+finite-window regression, not evidence of a sustained loss; likewise the four
+saved cycles are not a general throughput claim. Evidence:
+`/tmp/ls-queued-corpus-4.log`. The fresh one-owner control completes all 136
+windows and exactly reproduces the prior NZVC baseline's macro/cycle tuples
+(`/tmp/ls-queued-corpus-1.log` versus `/tmp/ls-nzvc-corpus-candidate.log`).
+
+The two-owner broad run also completes 136 windows: **4 improve, 132 unchanged,
+none regress** (`/tmp/ls-queued-corpus-2.log`). It keeps the four-cycle improvement
+without early integer wakeup and exactly matches the old early-wakeup recurrence.
+Its simpler single-entry tail is therefore the initial implementation front-runner,
+while four owners retain a larger gain on the divide/four-store target. Neither
+is enabled by default or claimed as a representative system speedup.
+
+The final four-owner focused selection passes **37 tests**, covering queued/late
+stores, forwarding and alias controls, precise I/O, page/write-protection faults,
+direct long MOVE, NZVC, RTR and CCR/RTE behavior
+(`/tmp/ls-queued-oracle-focused-4.log`). The one/four-owner branch/retirement
+profiles match all **16 windows** exactly in macro counts, cycles, retired
+branches and misses (`/tmp/ls-queued-profile-{1,4}.log`). Production four-owner
+RTL generation passes (`/tmp/ls-queued-production.log`); this is elaboration,
+not synthesis or timing closure. The serialized mandatory default-feature gate
+(`make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast`) passes **387 tests, two
+ignored, zero failures** (`/tmp/ls-queued-final-fast.log`).
+
+A follow-up targeted test adds resident-load producers and pointer-dependent
+next loads, with one/two/four stores and disjoint/aliasing controls. Both seeds
+give the same results; final D0 and A0 values are checked:
+
+| Load-fed stores / following load | Measured macros | One owner cycles | Two owners | Four owners |
+|---|---:|---:|---:|---:|
+| 1 / disjoint | 120 | 432 | 432 | 432 |
+| 1 / alias | 120 | 472 | 472 | 472 |
+| 2 / disjoint | 160 | 593 | 473 | 473 |
+| 2 / alias | 160 | 592 | 473 | 473 |
+| 4 / disjoint | 240 | 833 | 634 | 607 |
+| 4 / alias | 240 | 832 | 633 | 595 |
+
+All **84 expanded target runs pass**, including the original 48 divide-fed runs.
+Each larger capacity now has **20 improved, eight unchanged, zero regressed**
+matched windows. Two owners improve the load/two-store disjoint recurrence by
+25.37% IPC and load/four-store disjoint recurrence by 31.39%; four owners improve
+the latter by 37.23% and its aliasing counterpart by 39.83%. These load-fed cases
+have **zero measured younger-load overtakes** at every capacity: the gain is
+store handling, not demonstrated load bypass. Queued admissions are observed for
+two/four-store cases, while single-store controls never queue and remain unchanged.
+Evidence: `/tmp/ls-queued-targeted-ipc-v2.log`. Two owners remain the simpler
+front-runner; four owners are a measured burst-throughput tradeoff, retaining the
+separate one-cycle broad-corpus regressions. Neither is a board speedup claim.
+
+A concrete **unimplemented** queue repair lead is empty-tail
+head turnover: when context capacity is already reserved, an incoming context
+could directly replace a completing active owner instead of making a synchronous
+FIFO round trip. Admission must still use registered capacity, not completion-edge
+credit, and every replacement must clear readiness qualification. Compare cycles
+before adopting it; do not hide the current regression behind that proposal.
+
+### Background timing queue
+
+The publication-forward comparison's baseline at pinned `3f53a39b` completed
+at **−0.073 ns** setup slack (`/tmp/sq-publish-gate.GHXuam/baseline-summary.txt`).
+Its wrapper then hit the previously identified missing-`rg` exit 127; the guarded
+recovery reused that completed baseline and generated only the missing candidate.
+The detached-store candidate and publication candidate remain serial under the
+shared Vivado mutex, followed by the matched early-NZVC comparison. This baseline
+is not the new queued-context candidate and not integrated SoC timing.
+
+That baseline has 137 setup-failing endpoints (TNS −5.023 ns), hold +0.028 ns,
+pulse-width +1.958 ns, 94,769 LUTs, 38,759 FFs and 37 BRAM tiles. Its worst path
+is fetched slot-1 opcode bit 3 to packed-uop immediate bit 30, 15 logic levels,
+68.25% routing. The generated net names connect it to static bit-field EA
+displacement/PC-relative address, byte offset and spill-byte `+4` arithmetic.
+A concrete **unimplemented** repair lead is factoring the small constant/offset
+sums before the wide address addition, or moving cold EA preparation across an
+existing cut without adding a hot-path stage. Verify the exact bit-field/PC-relative
+semantics and matched IPC rather than assuming reassociation changes mapping.
+The next path is SQ ROB-ID through forwarding/control to D-cache valid-RAM address
+at −0.072 ns (21 levels, 67.37% routing); fixing only decode may expose that path.
+Reports: the baseline's `synth/fullcore_route_{timing,util}.rpt`.
+
+The older single-detached-owner comparison subsequently completed at pinned
+`876e58f5`: baseline **+0.050 ns**, detached **−0.102 ns**, TNS −12.277 ns / 347
+setup-failing endpoints, hold +0.026 ns, pulse-width +1.958 ns. LUTs
+94,078→94,417; FFs 38,779→38,749; BRAM tiles remain 37. Its worst path is
+`RobPlugin_logic_head_reg[1]` to `FpuControlPlugin_logic_uiSrcOperand_reg[30]`,
+16 levels and 70.71% routing. Preserve the measured IPC-positive candidate;
+an explicit cold FPU exception-operand capture phase is a repair lead, subject
+to proving that source tags/values remain owned until capture and recovery.
+No hot-path bubble should be added merely to repair this exceptional path.
+Artifacts: `/tmp/sq-detach-gate.97VroC/{baseline,detached}-summary.txt` and
+the detached arm's `synth/fullcore_route_{timing,util}.rpt`. The recovery unit
+finished successfully; publication-forwarding now holds the Vivado mutex.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

@@ -186,6 +186,19 @@ cannot take the only readiness-query/read port away from the detached owner.
 This one-record capacity is an experiment to compare against multiple SQ-owned
 pending records, not a throughput claim or the final general retry mechanism.
 
+Optional `detachedStoreEntries > 1` adds a bounded FIFO of the same completion
+metadata behind the active record; the default is still one. Admission requires
+free context capacity as well as a real SQ reservation. The readiness query names
+only the active oldest record, not a newly queued tail, so tail admission must not
+sample that query's readiness. A FIFO head replaces the active record only after
+its completion (or while the active record is empty), clearing captured flags and
+readiness qualification. A direct admission may not bypass FIFO occupancy, even
+if its synchronous read has not produced a valid output yet. Reset and flush clear
+all records together; queued sources remain pinned by their incomplete stores.
+The FIFO introduces no additional address/data table, PRF port, associative-ready
+search or unknown-address bypass. See the bounded-capacity experiment in
+[the load-latency contract](ls-hit-latency.md) and matched results in the ledger.
+
 Required integration evidence: observe a younger disjoint load completing before
 data publication; prevent stale/partial/split/physical-alias reads; check full SQ
 and occupied owner progress; retain precise faults, device ordering, flags and

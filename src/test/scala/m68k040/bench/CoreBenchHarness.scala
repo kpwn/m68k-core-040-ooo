@@ -348,7 +348,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     reserveLateStore: Boolean = false,
                     detachLateStore: Boolean = false,
                     forwardOnPublish: Boolean = false,
-                    earlyLsNzvcWakeup: Boolean = false) extends Component {
+                    earlyLsNzvcWakeup: Boolean = false,
+                    detachedStoreEntries: Int = 1) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -386,7 +387,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
-      forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup)
+      forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
+      detachedStoreEntries = detachedStoreEntries)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -526,7 +528,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       ownerWaitWithSqFull: Int = 0,
       captureIssueCandidates: Int = 0,
       captureLoadOpportunities: Int = 0,
-      captureLoadOverlaps: Int = 0
+      captureLoadOverlaps: Int = 0,
+      queuedStoreAdmissions: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -637,6 +640,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val detachedOvertakeHisto = ArrayBuffer.empty[Boolean]
       val publicationForwardHisto = ArrayBuffer.empty[Boolean]
       val readyAdmissionHisto = ArrayBuffer.empty[Boolean]
+      val queuedAdmissionHisto = ArrayBuffer.empty[Boolean]
       val pendingOwnerWaitHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val captureIssueHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val robHisto = ArrayBuffer.empty[RobCycle]
@@ -995,6 +999,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean))
         publicationForwardHisto += dut.lsEu.logic.sq.publishForwardHit.toBoolean
         readyAdmissionHisto += dut.lsEu.logic.detachedStore.exists(_.readyAdmission.toBoolean)
+        queuedAdmissionHisto += dut.lsEu.logic.detachedStore.exists(_.queuedAdmission.toBoolean)
         val waitingOnOwner = dut.lsEu.logic.detachedStore.exists { d =>
           d.valid.toBoolean && dut.lsEu.logic.p3Valid.toBoolean &&
             dut.lsEu.logic.p3LateDataPending.toBoolean
@@ -1246,7 +1251,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._3),
         captureIssueHisto.slice(lo, hi + 1).count(_._1),
         captureIssueHisto.slice(lo, hi + 1).count(_._2),
-        captureIssueHisto.slice(lo, hi + 1).count(_._3))
+        captureIssueHisto.slice(lo, hi + 1).count(_._3),
+        queuedAdmissionHisto.slice(lo, hi + 1).count(identity))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")

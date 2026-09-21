@@ -1,5 +1,30 @@
 # Resident-load latency experiment
 
+## Queued late-store completion owners (experiment)
+
+Keep the existing single detached owner as the default. An optional bounded FIFO
+may retain additional translated, cacheable, ordinary store completion contexts
+behind it. Only SQ slot/ROB identity, source tag, size and completion flags are
+queued; the SQ remains the sole address, byte-mask and data owner. Address issue
+and SQ allocation stay ordered. Unknown addresses, unfilled overlapping stores,
+inhibited accesses and unsupported store forms retain their existing barriers.
+
+The oldest context alone uses the existing readiness query and PRF read port.
+Every head replacement clears the registered readiness qualification and captured
+NZVC state. Publication still precedes completion and back responses retain
+completion priority. An admission must have both an SQ slot and context capacity;
+do not depend on same-cycle completion credit. New admissions may not bypass a
+queued context, including while the FIFO read is pending. Reset/flush cancel all
+contexts together with their uncommitted SQ reservations. No external producer
+retains a context after cancellation. Store sources remain live until completion.
+
+Compare one, two and four owners with matched full-core IPC. Require actual
+multiple-owner occupancy and disjoint-load progress, plus full-capacity, alias,
+flush, source-reuse and completion-contention correctness coverage. Reject added
+machinery if it produces no useful throughput gain. This is a bounded extension
+of known-address bypass, not generic out-of-order address issue or a memory-order
+replay implementation. Physical acceptance remains a separate 200 MHz gate.
+
 ## Guaranteed next-cycle NZVC wakeup candidate
 
 An independent default-off option applies the selected-completion guarantee to

@@ -358,6 +358,28 @@ shortcut was removed. Ready-admission and overlapping owner/P4/full-SQ counters
 remain. In the load-fed recurrence every owner-wait cycle overlaps a forwarding
 stall; owner occupancy alone is not evidence that more slots would help.
 
+The subsequent bounded-capacity experiment queues only source/completion records
+behind that existing owner, still using one readiness query and PRF read port.
+Address issue remains ordered and SQ ownership is unchanged. The first 48 matched
+targeted runs compare one/two/four owners: each larger capacity improves 12 windows
+and leaves four unchanged. Two-store/disjoint-load recurrence improves 15.01%;
+four-store/disjoint-load improves 23.98% with four owners. Single-store controls
+remain unchanged. This justifies broader correctness and IPC testing; it is not
+evidence for associative out-of-order data capture or unrestricted LS issue.
+The four-owner tail contains only three 23-bit records, not duplicated SQ data.
+Resource inference, routed 200 MHz and board gains are not established.
+The broader 136-window run favors **two owners** as the simpler first candidate:
+four small improvements and 132 unchanged windows, versus four improvements,
+128 unchanged and four one-cycle regressions for four owners. The larger targeted
+four-store gain is retained as a separate tradeoff. The resident-load extension
+also passes: two owners improve the two-store disjoint recurrence by 25.37%
+and four-store disjoint recurrence by 31.39%. Four owners improve the latter by
+37.23%, at the cost of the separate broad-corpus regressions. These load-fed gains
+have no measured younger-load overtakes; they come from faster store handling.
+All 84 expanded target windows pass, as do 37 focused correctness tests, the
+13-test bounded set at each capacity and the 387-test fast gate. A shared baseline
+odd-SSP IRQ-schedule failure remains unresolved; this is not full acceptance.
+
 Completed narrow audit: `issuePort.ready` blocks **all** new LSU issues on a late-data
 capture edge, although base and index use separate PRF read ports from store
 data. The tested ordinary-load overlap saves no end-to-end cycles across 136

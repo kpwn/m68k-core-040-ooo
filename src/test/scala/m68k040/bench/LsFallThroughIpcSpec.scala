@@ -105,7 +105,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         reserveLateStore = sys.env.get("IPC_RESERVE_LATE_STORE").contains("1"),
         detachLateStore = sys.env.get("IPC_DETACH_LATE_STORE").contains("1"),
         forwardOnPublish = sys.env.get("IPC_FORWARD_ON_PUBLISH").contains("1"),
-        earlyLsNzvcWakeup = sys.env.get("IPC_LS_EARLY_NZVC").contains("1")))
+        earlyLsNzvcWakeup = sys.env.get("IPC_LS_EARLY_NZVC").contains("1"),
+        detachedStoreEntries = sys.env.get("IPC_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1)))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
@@ -138,7 +139,7 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
           s"readyAdmissions=${r.readyStoreAdmissions} ownerWaits=${r.pendingStoreOwnerWaits} " +
           s"ownerWaitP4=${r.ownerWaitWithP4Overlap} ownerWaitSqFull=${r.ownerWaitWithSqFull} " +
           s"captureCandidates=${r.captureIssueCandidates} captureLoadOpportunities=${r.captureLoadOpportunities} " +
-          s"captureLoadOverlaps=${r.captureLoadOverlaps}")
+          s"captureLoadOverlaps=${r.captureLoadOverlaps} queuedAdmissions=${r.queuedStoreAdmissions}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +

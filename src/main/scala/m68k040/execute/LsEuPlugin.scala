@@ -102,8 +102,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val reserveLateStore: Boolean = false,
                  val detachLateStore: Boolean = false,
                  val forwardOnPublish: Boolean = false,
-                 val earlyNzvcWakeup: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyNzvcWakeup: Boolean = false,
+                 val detachedStoreEntries: Int = 1) extends FiberPlugin with LsEuService {
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
+  require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
+  require(detachedStoreEntries == 1 || detachLateStore,
+    "queued late store contexts require detached stores")
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -2932,7 +2936,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       probeCancelToken := token
     }
 
-    // One synchronous owner for a translated, SQ-resident store waiting on data.
+    // Synchronous owners for translated, SQ-resident stores waiting on data.
     // Address/data remain in the SQ. These few fields are all a plain MOVE store
     // needs to finish independently of P3; no integer result or extra PRF port.
     val detachedStore = if(detachLateStore) Some(new Area {
@@ -2951,6 +2955,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val ctx = Reg(Context())
       val captured = RegInit(False)
       val nzvc = Reg(Bits(4 bits))
+      val admitHead = Flow(Context())
+      val reserveReady = Bool()
+      val queuedAdmission = Bool()
       val query = lateStoreData.get
       val readyPrior = RegNext(valid && !captured && query.queryReady &&
         !sqFlushSig && !excActive) init False
@@ -2982,16 +2989,43 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         valid := False
         readyPrior := False
       }
-      when(reserve.valid) {
-        valid := True; captured := False; ctx := reserve.payload
+      if(detachedStoreEntries == 1) {
+        reserveReady := !valid
+        admitHead := reserve
+        queuedAdmission := False
+      } else {
+        val pending = StreamFifo(Context(), detachedStoreEntries - 1)
+        pending.io.flush := sqFlushSig || excActive
+        // Occupancy, not pop.valid: a synchronous FIFO may be fetching its head.
+        val direct = !valid && pending.io.occupancy === 0
+        reserveReady := direct || pending.io.push.ready
+        pending.io.push.valid := reserve.valid && !direct
+        pending.io.push.payload := reserve.payload
+        pending.io.pop.ready := (!valid || complete) && !sqFlushSig && !excActive
+        queuedAdmission := pending.io.push.fire
+        admitHead.valid := pending.io.pop.fire || (reserve.valid && direct)
+        admitHead.payload := pending.io.pop.payload
+        when(direct) { admitHead.payload := reserve.payload }
+        pending.io.occupancy.simPublic()
+        GenerationFlags.simulation {
+          when(reserve.valid) { assert(reserveReady, "late store context FIFO overrun", FAILURE) }
+          when(pending.io.pop.fire) {
+            assert(!direct, "queued late store context bypassed by admission", FAILURE)
+          }
+        }
+      }
+      when(admitHead.valid) {
+        valid := True; captured := False; ctx := admitHead.payload
         readyPrior := False
       }
       when(sqFlushSig || excActive) { valid := False; readyPrior := False }
       GenerationFlags.simulation {
         when(reserve.valid) {
-          assert(!valid, "detached store owner overrun", FAILURE)
-          assert(query.queryTag === reserve.dataTag,
-            "detached store admission inherited a different source's readiness", FAILURE)
+          assert(reserveReady, "detached store owner overrun", FAILURE)
+          if(detachedStoreEntries == 1) {
+            assert(query.queryTag === reserve.dataTag,
+              "detached store admission inherited a different source's readiness", FAILURE)
+          }
         }
         when(capture) {
           assert(query.queryReady, "detached store source readiness revoked", FAILURE)
@@ -3003,8 +3037,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       capture.simPublic(); complete.simPublic()
       // Simulation-only observability: count the opportunity separately from
       // actual capture. The evaluated qualification-transfer variant had no IPC gain.
-      val readyAdmission = reserve.valid && query.queryReady
+      val readyAdmission = reserve.valid && !valid && !queuedAdmission && query.queryReady
       readyAdmission.simPublic()
+      queuedAdmission.simPublic(); reserveReady.simPublic()
     }) else None
     val detachedStoreValid = detachedStore.map(_.valid).getOrElse(False)
     val detachedStoreCapture = detachedStore.map(_.capture).getOrElse(False)
@@ -3351,7 +3386,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           // If capacity only appears on the capture edge, use the ordinary
           // captured-data path next cycle; never create an unfillable reservation.
           if(reserveLateStore) when(fastStore && !storePrivBlocked && !sq.io.full &&
-            !p3LateDataCapture && !detachedStoreValid) {
+            !p3LateDataCapture && detachedStore.map(_.reserveReady).getOrElse(True)) {
             sq.io.alloc.valid := True
             sq.io.alloc.payload.precise := False
             p3ReservationFire := True
