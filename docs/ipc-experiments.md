@@ -2700,3 +2700,34 @@ perf; emitted RTL contains both postincrement detached context and next-ready
 qualification. Top-level/real-MIG lint, reset-pairing and synthesis-source checks
 all pass. Service is waiting on the active physical run's mutex, with the queued
 core controller parent stopped and its current arm still progressing.
+
+### 200 MHz launch failure and 100 MHz v2 retry — 2026-09-21
+
+The 200 MHz service failed at 12:27:20, immediately after acquiring Vivado:
+SoC `synth/vivado.tcl` still accepted only baseline/throughput-v1 and rejected
+`throughput-v2`. This was missed build-flow wiring, NOT setup/hold failure.
+No synthesis, placement or routing ran for that SoC attempt; its successful
+Verilator lint did not exercise the Tcl profile guard. The service exit trap
+resumed the core timing queue correctly. Preserve the original failed log at
+`/tmp/ipc-candidate-soc200-build.log`; it provides no 200 MHz timing evidence.
+
+User requested a 100 MHz run. New isolated worktree
+`/home/qwertyoruiop/macqd700-soc-worktrees/ipc-v2-100mhz`, branch
+`perf/ipc-v2-100mhz`, SoC pin `6f74550f5f828f050f325c5a362353546f16f468`.
+CPU remains exactly `ca3f31da7f04cdfbcbc7199d4ce7683e35638403` (388-test fast
+gate already passed; no CPU source change). Fixed the Vivado allowlist and added
+`tools/test_cpu_ipc_profile.tcl`, which evaluates the actual flow guards without
+Vivado: baseline/v1/v2/default acceptance, stub restrictions and misspelling
+rejection, 11 cases passing. The test reproduces the old v2 failure against the
+preserved pre-fix script (`/tmp/ipc-v2-profile-before-fix.log`). Both Makefile
+synth and impl depend on this check before acquiring Vivado. Source/reset checks
+pass. Future 200 MHz attempts must include this fix, not retry the old pin.
+
+Service `m68k-ipc-v2-soc100.service` started 12:50 with runner
+`/tmp/run-ipc-v2-soc100.sh`. Full 100 MHz throughput-v2 candidate, same Ethernet,
+ILA/perf/debug/storage features and no incremental implementation. It is
+prioritized after the active four-context core arm; only that queue's parent
+shell is suspended, with automatic resume on the SoC runner's exit. Logs
+`/tmp/ipc-v2-soc100-{build,generation,lint}.log`, followed in the existing
+`build-logs:0.0` pane alongside the active arm. No board reset/reload or SPI/SD
+write; final timing/DRC, local ADB patch and explicit load permission remain.
