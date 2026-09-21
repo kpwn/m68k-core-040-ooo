@@ -386,6 +386,34 @@ be measured), but does not reinstate the removed multiway secondary BTB read.
 Cold BTB misses remain conservative; no target or architectural outcome is
 invented from a direction bit alone. Measure this arm independently.
 
+### Controlled experiment: retain the refetched conditional-history suffix
+
+`retainRedirectHistory` is default-off and independent of slot-1 admission.
+ROB supplies a setup-allocated service identifying the actual Tier-1 redirect
+and its exact Tier-2 frontend-retention decision (including the exception-active
+veto). Gshare records only the predicted conditional bits emitted after the
+latest Tier-1 redirect, plus a saturating count up to GHR width. An older branch
+replacing that redirect starts a new suffix. This is bounded history metadata,
+not an architectural checkpoint or a new retirement/training path.
+
+At the existing delayed repair, a kept frontend receives architectural history
+through the retired redirecting branch followed by its retained suffix, including
+a same-cycle new shift. A discarded frontend receives the existing architectural
+repair. Invalidation clears the suffix; an unrelated flush cancels it. No history
+is copied from architectural state at Tier 1, when older branches can still be
+unretired. No PHT counter or carried training index is changed retroactively.
+
+Check zero/one/more-than-GHR-width suffixes, redirect replacement, unrelated
+flushes, reset/invalidation, same-cycle repair/shift, and full-core recovery. The
+early redirect's edge can still emit an old-path conditional, but DecodeStage's
+flush wins over capturing that packet, so it must be excluded from the suffix.
+The first full-core run exposed this edge and rejected an overly strict assertion
+that no shift could occur; the suffix start already has priority over appending.
+Later normal predicted redirects and FTQ corrections do not flush already-emitted DecodeUop records and
+must not restart this suffix. A new whole-frontend flush must do so. The measured
+gain and added mux/count logic must be compared against the disabled mode before
+queuing timing. This amendment authorizes the experiment, not acceptance.
+
 ## Other possibilities considered
 
 - **A larger ROB/PRF/SQ:** useful control experiments, not an assumed solution.

@@ -45,10 +45,16 @@ object DebugHaltReasonCode {
   * correct-head-branch experiment allows one eligible non-branch successor.
   */
 class RobPlugin(val detailedPerf: Boolean = false,
-                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService {
+                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService {
+  private var historyStartWire: Bool = null
+  private var historyKeepWire: Bool = null
+  override def historyEpochStart: Bool = historyStartWire
+  override def historyKeepOnFlush: Bool = historyKeepWire
   private var perfEventsWire: Option[Bits] = None
   private var perfRetirementWire: Option[Bits] = None
   during setup {
+    historyStartWire = Bool()
+    historyKeepWire = Bool()
     if (detailedPerf) {
       perfEventsWire = Some(Bits(m68k040.services.PerfDetail.RobCount bits))
       perfRetirementWire = Some(Bits(66 bits))
@@ -3320,6 +3326,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
       !exc.redirectValid && !debugRecoverEnter && !debugPcApply
     val earlySuppressFe = RegNext(earlyHit) init False
     earlySuppressFe.simPublic()
+    historyStartWire := earlyFire
+    historyKeepWire := earlySuppressFe && !excActive
 
     // ── Flush (squash all in-flight) — pointer-only, driven by the registered ─────
     // redirect pulse OR the test flush port.

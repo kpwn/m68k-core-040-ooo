@@ -50,7 +50,7 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * The branch EU still verifies every direction/target, so a gshare miss remains a pure
   * perf loss. */
-class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
+class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
@@ -211,6 +211,21 @@ class GsharePlugin extends FiberPlugin with GshareUpdateService with GshareWindo
     // this behavior. Branch execution still checks predictions for correctness.
     when(repairArm) {
       ghr := ghrArch
+    }
+    val retainedRepair = if (retainRedirectHistory) Some(new RetainedHistoryRepair(ghrBits)) else None
+    retainedRepair.foreach { repair =>
+      val recovery = host[m68k040.services.PredictorHistoryRecoveryService]
+      repair.io.start := recovery.historyEpochStart
+      repair.io.flush := flushRepair
+      repair.io.keep := recovery.historyKeepOnFlush
+      repair.io.repair := repairArm
+      repair.io.invalidate := invalidateAll
+      repair.io.shift := shiftValid
+      repair.io.direction := shiftDir
+      repair.io.arch := ghrArch
+      when(repairArm) { ghr := repair.io.value }
+      // FetchAlign can emit an old-path packet on the redirect edge. Decode's
+      // flush wins over that capture; the suffix's start likewise wins over shift.
     }
     // ---- invalidateAll: clear BOTH histories (PHT left as-is; it self-retrains) ----
     // Last, so it beats the repair: the repair would otherwise reinstall the pre-clear

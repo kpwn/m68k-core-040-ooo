@@ -37,9 +37,10 @@ class PipelineProfileSpec extends CoreBenchHarness {
     val deferConditionals = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1")
     val deferTaken = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1")
     val trainSlot1 = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || deferTaken
+    val retainHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1")
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches,
       deferSlot1Conditional = deferConditionals, trainSlot1Conditional = trainSlot1,
-      deferTakenSlot1Conditional = deferTaken))
+      deferTakenSlot1Conditional = deferTaken, retainRedirectHistory = retainHistory))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,
@@ -62,7 +63,7 @@ class PipelineProfileSpec extends CoreBenchHarness {
       if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
-        s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken " +
+        s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken retainHistory=$retainHistory " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +
         s"macros=${measured.retiredInstrs} baselineCycles=${control.windowCycles} cycles=${measured.windowCycles} " +
         f"IPC=${measured.ipc}%.6f branches=${p.retiredBranches} misses=${p.branchMisses} accuracy=$accuracy " +

@@ -67,6 +67,14 @@ trait RedirectService {
   def flushPc: UInt
 }
 
+/** RobPlugin is the sole producer. Tier-1 starts a new frontend history suffix;
+  * keep is valid with the registered commit flush and includes the exception veto.
+  * Setup-allocated wires avoid a predictor -> ROB -> frontend build dependency. */
+trait PredictorHistoryRecoveryService {
+  def historyEpochStart: Bool
+  def historyKeepOnFlush: Bool
+}
+
 /** ROB-owned STOP/fatal-halt state localized at the frontend boundary.
   *
   * `active` is the current architectural state (`stopped || coreHalted`) and is

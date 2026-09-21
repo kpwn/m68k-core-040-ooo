@@ -341,7 +341,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     pairCorrectBranch: Boolean = false,
                     deferSlot1Conditional: Boolean = false,
                     trainSlot1Conditional: Boolean = false,
-                    deferTakenSlot1Conditional: Boolean = false) extends Component {
+                    deferTakenSlot1Conditional: Boolean = false,
+                    retainRedirectHistory: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -360,7 +361,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
-    val gsh    = new m68k040.frontend.GsharePlugin
+    val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional)
@@ -661,6 +662,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       var flushPendingCycle = -1L
       var feedFires         = 0
       var telemCycle        = 0L
+      var historyCheckEnabled = false
+      var historyExpectedNext = Option.empty[Int]
+      var historyModelSuffix = Vector.empty[Boolean]
+      var historyModelActive = false
+      var historyModelKeep = false
+      var historyCheckedRepairs = 0
       var t1PendFeedValid   = 0
       var t1PendFeedReady   = 0
       var t1PendFeedFire    = 0
@@ -745,6 +752,34 @@ trait CoreBenchHarness extends AnyFunSuite {
           val repairing = gs.repairArm.toBoolean
           val early = dut.rob.logic.earlyFire.toBoolean
           val kept = dut.rob.logic.earlySuppressFe.toBoolean
+          if (historyCheckEnabled && gs.retainedRepair.nonEmpty) {
+            // Independent event-stream model, not the helper's internal count or
+            // suffix. Check actual GHR on the following edge, across the full run.
+            historyExpectedNext.foreach { expected =>
+              assert(gs.ghr.toInt == expected,
+                f"${k.name} GHR cycle=$telemCycle got=0x${gs.ghr.toInt}%04x expected=0x$expected%04x")
+            }
+            val invalidating = dut.icache.logic.invalidateAll.toBoolean
+            val flushing = dut.rob.logic.doFlushReg.toBoolean
+            val retain = kept && !dut.rob.logic.excActive.toBoolean
+            val direction = gs.shiftDir.toBoolean
+            val retained = historyModelActive && historyModelKeep && !early && !invalidating
+            def push(h: Int, b: Boolean): Int = ((h << 1) | (if (b) 1 else 0)) & 65535
+            val emitted = if (shifting) Vector(direction) else Vector.empty[Boolean]
+            historyExpectedNext = Some(if (invalidating) 0
+              else if (repairing && retained) {
+                historyCheckedRepairs += 1
+                (historyModelSuffix ++ emitted).foldLeft(gs.ghrArch.toInt)(push)
+              } else if (repairing) gs.ghrArch.toInt
+              else if (shifting) push(gs.ghr.toInt, direction)
+              else gs.ghr.toInt)
+            if (historyModelActive && shifting)
+              historyModelSuffix = (historyModelSuffix :+ direction).takeRight(16)
+            if (repairing || (flushing && !retain)) historyModelActive = false
+            if (early) { historyModelActive = true; historyModelSuffix = Vector.empty }
+            if (invalidating) { historyModelActive = false; historyModelSuffix = Vector.empty }
+            historyModelKeep = flushing && retain
+          }
           // The early redirect edge itself discards the old frontend. Count only
           // later emissions, and restart for an older redirect superseding it.
           if (early) { shiftsAfterEarly = 0; trackingEarly = true }
@@ -982,6 +1017,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      historyCheckEnabled = true // forkStimulus reset and explicit invalidation have completed
 
       // Program architectural controls only AFTER forkStimulus's reset has
       // completed.  Programming these beside the initial port defaults silently
@@ -1118,6 +1154,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           s"earlyPendingShifts=${historyWindow.count(_._3)} " +
           s"keptFrontendRepairAfterShifts=${historyWindow.count(_._4)} " +
           s"wholeRunTraceEvents=$historyTraceEvents")
+        if (dut.gsh.logic.retainedRepair.nonEmpty) {
+          println(s"[history-check] ${k.name} fullRunRebasedRepairs=$historyCheckedRepairs")
+          if (k.name.startsWith("deep-backlog")) assert(historyCheckedRepairs > 0)
+        }
         Some(profile)
       }
 

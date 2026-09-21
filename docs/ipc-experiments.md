@@ -591,6 +591,73 @@ then uses the shared Vivado mutex, the same 5 ns recipe and three post-route
 rounds. The existing `build-logs` tmux pane follows all three arms. No timing or
 area result is claimed yet, and this queue does not block subsequent IPC work.
 
+## Retained frontend history repair — 2026-09-21
+
+Default-off `retainRedirectHistory`, based on `eeb60f14`, keeps the bounded
+conditional-history suffix emitted after Tier-1 redirect when Tier 2 keeps that
+frontend. It rebases the suffix on architectural history at the existing delayed
+repair. Replacement redirects discard the old suffix; unrelated flushes and
+invalidation retain the conservative behavior. No architectural checkpoint,
+retirement port or PHT training write is added. The design contract is in
+`ipc-design-options.md`.
+
+Three matched arms isolate history alone, history plus slot-1 training, and
+history plus selective taken deferral. Seeds 1/17, L2 hit 5 / DDR 70, the same
+warmed macro windows and instrumentation-off controls as the previous entry:
+
+| Kernel | Macros | Selective cycles | Selective + history cycles | Misses / branches, before → after |
+| --- | ---: | ---: | ---: | --- |
+| Hot loop | 336 | 252 | 252 | 1 → 1 / 84 |
+| Alternating, short | 132 | 138 | 138 | 2 → 2 / 48 |
+| Deep backlog, short | 360 | 395 | 380 | 6 → 5 / 32 |
+| Copyback call/return | 672 | 1342 | 1342 | 1 → 1 / 252 |
+| Independent ALU | 396 | 267 | 267 | no branches |
+| Alternating, long | 2112 | 2112 | 2112 | 1 → 1 / 768 |
+| Deep backlog, long | 2520 | 2285 | 2240 | 4 → 1 / 224 |
+
+Both seeds agree. The incremental gains over selective deferral are **3.95%**
+and **2.01% IPC** on the short and long backlog windows. Long-backlog IPC is
+**1.125000**, up **18.75%** from the original 0.947368 baseline, with **99.554%**
+branch accuracy. Other windows are unchanged versus selective deferral. Its
+earlier short-alternating seed-1 regression versus the original baseline remains;
+the experiment is not universally beneficial or representative-workload signoff.
+History alone produces **no changed warmed cycle/miss counts**. History plus
+training-only improves the short backlog from 395 to 365 cycles (**8.22% IPC**),
+6 → 4 misses / 32 branches, on both seeds; its other twelve rows, including the
+long backlog, are unchanged. Keep this short-window result separate from the
+selective arm's sustained long-window gain.
+
+All three 28-run profiled arms pass final-register checks and exact
+instrumentation-off cycle comparisons. An independent event-stream model checks
+the actual GHR cycle by cycle through full runs, without reading the helper's
+suffix/count state. The long backlog requires observed retained repairs. Eleven
+combined-option oracle cases pass, covering recovery, BTB staleness, DBRA,
+calls/returns, cracked-RMW/tag wrap, MOVEM resume, wrong-path inhibited loads and
+post-RTE condition codes.
+
+The initial full-core test rejected an incorrect assertion that no history shift
+could coincide with Tier 1: FetchAlign can still emit an old-path packet then,
+while DecodeStage's flush discards it. The helper already gives a new epoch
+priority over appending that event. The assertion was removed, the contract
+clarified, and the directed test extended. A subsequent checker-only failure
+read an unexposed simulator signal; the checker now observes the exposed source
+signals, without changing hardware to satisfy the test. Neither failure is
+reported as a passing run or as an architectural core failure.
+
+Evidence: `/tmp/retained-history-checked-ipc-v2.log`,
+`/tmp/retained-history-training-ipc.log`, `/tmp/retained-history-selective-ipc.log`,
+`/tmp/retained-history-oracle.log`. The expanded directed test passes, including
+same-edge redirect replacement/repair, saturation and discarded suffixes
+(`/tmp/retained-history-unit-final.log`). All **104** broader LSU corpus rows
+pass and are cycle- and macro-identical to the previous selective candidate,
+across both seeds and all four load-latency option combinations
+(`/tmp/retained-history-selective-corpus.log`). Both fast gates pass all
+382 tests (two ignored, zero failed/aborted), including the final rerun in
+`/tmp/retained-history-fast-final.log`. Use `IPC_RETAIN_HISTORY=1` in benchmarks,
+`LOCKSTEP_RETAIN_HISTORY=1` in the oracle, or `--retain-redirect-history` in the
+core generator. The option remains off in production; routed timing, integrated
+SoC timing and board IPC are not established.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

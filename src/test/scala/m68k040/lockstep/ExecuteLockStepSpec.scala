@@ -497,7 +497,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
-    val gsh    = new m68k040.frontend.GsharePlugin
+    val gsh    = new m68k040.frontend.GsharePlugin(
+      retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),

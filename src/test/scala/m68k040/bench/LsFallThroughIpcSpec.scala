@@ -53,7 +53,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         sqSubwordForwarding = sys.env.get("IPC_SQ_SUBWORD").contains("1"),
         deferSlot1Conditional = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1"),
         trainSlot1Conditional = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
-        deferTakenSlot1Conditional = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1")))
+        deferTakenSlot1Conditional = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
+        retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k, seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
