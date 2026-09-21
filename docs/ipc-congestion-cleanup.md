@@ -318,3 +318,66 @@ Repository fast gate after tooling changes: 390 passed, 2 ignored, zero
 failures (`/tmp/ipc-cleanup-routing-tools-fast.log`). The active IQ/L2 run has
 entered `route_design -directive Explore`; router-initial timing is not a
 completed routing result and must not be reported as closure.
+
+## IQ/L2 route crash and shared-constant census correction
+
+The IQ/L2 `Explore` route terminated with SIGSEGV at Phase 11.1.1
+`Leaf ClockOpt Init`, after Phase 9 route verification succeeded. The service
+is terminal (`ExecMainStatus=2`, underlying make error 139), not stalled.
+Only synthesis and placement checkpoints survived. Its last intermediate
+timing was WNS -0.335 ns, TNS -82.911 ns, WHS +0.010 ns: these are NOT a
+final routed result and cannot establish improvement or closure. MIG
+`Route 35-4578` warnings also occur in the loaded-baseline recovery log
+(10 occurrences versus 5 in this crashed run); they are not newly introduced.
+
+CSR+PRAM retains implementation priority and acquired the shared mutex.
+A separate `m68k-ipc-cleanup-soc200-recover-aggressive.service` is queued behind
+it. `/tmp/run-ipc-cleanup-soc200-recover-aggressive.sh` verifies the IQ/L2
+source pin plus flow/placement SHA256s, then restores placement, replays the
+original pre-route optimization and tries `AggressiveExplore`. Outputs go to
+`ipc-v2-l2-cleanup/build/vivado-recover-aggressive`, preserving the original
+run. There is no RTL, clock or timing-exception change. The recovery produces
+checkpoints/reports only; it does not emit/program a bitstream. This is a
+netlist-dependent workaround attempt, not a proven fix for ClockOpt crashes.
+The reused `build-logs:0.0` pane follows CSR+PRAM and recovery logs.
+
+The first real baseline routing census exposed physical constant aliases:
+separate GND nets each returned the same 113745-PIP/119768-node tree. Logical
+net-name canonicalization alone therefore does not make constant trees unique.
+Its partial per-net output is retained, but its totals must not be used.
+The scanner now unions all constant-net PIPs once and reports that shared cost
+in the summary; constant nets have explicit `NA` footprints and are excluded
+from per-driver/owner/family rankings. Nonconstant nets retain normal attribution.
+The full-design PIP reconciliation remains mandatory. A new mocked alias
+regression passes. One bounded baseline retry is arranged before CSR+PRAM
+implementation, in `/tmp/ipc-cleanup-cell-baseline-routing-r2`; the original
+scan and retry each keep the five-minute scan budget. Actual completion and
+the reconciliation result are still pending.
+
+The completed synthesis primitive censuses attribute the mapping spread as
+follows (LUT1..LUT6 primitive objects after opening the synthesis DCP, NOT
+physical packed LUT sites): IQ 7790 -> 7619 (-171); decode 21641 -> 22588
+(+947); ROB 9066 -> 9382 (+316); D-cache 7022 -> 7261 (+239); FPU/Div EU
+13634 -> 13343 (-291); L2 MSHR 6676 -> 5588 (-1088). These use name-based
+ownership and must not be mixed with `report_utilization` packed-LUT counts.
+Rechecked `git diff ca3f31da ef243e3e -- src/main`: the IQ flush assignment
+removal is the ONLY CPU RTL change. Thus the CPU-wide increase is not confined
+to the edited IQ; netlist-wide mapping/optimization changes need to be judged
+by routed results, not by blaming the changed module's local LUT count.
+
+First real scan terminated at its 300-second budget after 30117 nets. The
+constant-corrected retry is live but also slower than a whole-design scan
+within five minutes. A separate read-only service,
+`m68k-ipc-cleanup-baseline-routing-full.service`, waits for both CSR+PRAM and
+IQ/L2 recovery to terminate before acquiring the same Vivado mutex. It skips
+itself if the bounded retry already produced a reconciled summary; otherwise
+it scans the loaded baseline with a 1800-second loop budget into the fresh
+`/tmp/ipc-cleanup-cell-baseline-routing-full` directory. This preserves build
+priority and makes the promised complete census an actual queued task, not
+an interpretation of partial totals. Log:
+`/tmp/ipc-cleanup-baseline-routing-full.log`. No board access is involved.
+After the constant-alias correction the required repository fast gate passed:
+390 tests, 2 ignored, zero failures, in
+`/tmp/ipc-cleanup-routing-constants-fast.log`. The Tcl alias regression and
+cell-census smoke test also passed. Full real-design PIP reconciliation is
+still unverified until a scan completes.

@@ -70,9 +70,11 @@ namespace eval routing_pressure {
         set owners [dict create]
         set drivers [dict create]
         set families [dict create]
+        set constant_nets {}
+        set constant_loads 0
         set total_pips 0
         set fd [open $output/nets.tsv w]
-        puts $fd "net\tdriver\tdriver_ref\towner\tclass\tloads\tpips\tnodes\ttiles"
+        puts $fd "net\tdriver\tdriver_ref\towner\tclass\tloads\tpips\tnodes\ttiles\taccounting"
         foreach net $nets {
             if {$max_seconds > 0 && [clock seconds]-$started > $max_seconds} {
                 close $fd
@@ -99,13 +101,23 @@ namespace eval routing_pressure {
                 set group UNATTRIBUTED
             }
             set kind [route_class $ref]
+            # Vivado returns the SAME physical constant tree for many logically
+            # distinct GND/VCC nets (observed on the real routed SoC). Canonical
+            # hierarchy names do not deduplicate those trees. Account their
+            # routing once, as a shared design resource, never against a cell.
+            if {$kind eq "constant"} {
+                lappend constant_nets $net
+                incr constant_loads $loads
+                puts $fd [join [list $name $driver $ref $group $kind $loads NA NA NA shared_constant] \t]
+                continue
+            }
             set pips [llength [get_pips -quiet -of_objects $net]]
             set nodes [get_nodes -quiet -of_objects $net]
             set node_count [llength $nodes]
             set tiles 0
             if {$node_count} {set tiles [llength [get_tiles -quiet -of_objects $nodes]]}
             incr total_pips $pips
-            puts $fd [join [list $name $driver $ref $group $kind $loads $pips $node_count $tiles] \t]
+            puts $fd [join [list $name $driver $ref $group $kind $loads $pips $node_count $tiles per_net] \t]
             accumulate owners [list $group $kind] $loads $pips $node_count
             # Do not collapse all undriven/multiple-source nets into a fake cell.
             set driver_key [expr {$driver eq "" ? "NET:$name" : $driver}]
@@ -117,6 +129,11 @@ namespace eval routing_pressure {
             }
         }
         close $fd
+        set constant_pips 0
+        if {[llength $constant_nets]} {
+            set constant_pips [llength [get_pips -quiet -of_objects $constant_nets]]
+        }
+        incr total_pips $constant_pips
         if {$total_pips == 0} {error "No routed PIPs found; do not interpret an unrouted checkpoint as zero pressure"}
         # Cross-check against all hierarchy segments: catches alias double counts
         # and a query that silently omits routing below hierarchical boundaries.
@@ -131,6 +148,10 @@ namespace eval routing_pressure {
         puts $fd "checkpoint=$checkpoint"
         puts $fd "canonical_nets=[dict size $seen]"
         puts $fd "pip_assignments=$total_pips"
+        puts $fd "shared_constant_nets=[llength $constant_nets]"
+        puts $fd "shared_constant_loads=$constant_loads"
+        puts $fd "shared_constant_pips=$constant_pips"
+        puts $fd "Constant trees are counted once globally, excluded from driver/owner/family rankings; per-net NA is not zero."
         puts $fd "Counts are routed-resource proxies, not wire length or congestion causation."
         puts $fd "Owner/family names are heuristic. Global/constant networks are separate."
         puts $fd "Tile counts are unique per net only; never sum them as distinct occupied tiles."
