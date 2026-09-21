@@ -824,7 +824,8 @@ object GenFullCoreSynthVerilog {
                 preparedRetireEntries: Int = 0,
                 earlyLsNzvcWakeup: Boolean = false,
                 detachedStoreEntries: Int = 1,
-                earlyAutoStoreAddress: Boolean = false): Unit = {
+                earlyAutoStoreAddress: Boolean = false,
+                earlyStoreDataWake: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -835,7 +836,8 @@ object GenFullCoreSynthVerilog {
           earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
           reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
           forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
-          detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress)
+          detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
+          earlyStoreDataWake = earlyStoreDataWake)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
@@ -894,7 +896,7 @@ object GenFullCoreSynthVerilog {
     val preparedOptions = Map("--prepared-retire-4" -> 4, "--prepared-retire-8" -> 8, "--prepared-retire-16" -> 16)
     val storeOptions = Map("--detached-stores-2" -> 2, "--detached-stores-4" -> 4)
     require(args.count(storeOptions.contains) <= 1, "select only one detached store capacity")
-    require(args.forall(Set("--retire-four", "--aligned-load-fall-through", "--early-ls-int-wakeup", "--early-ls-nzvc-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish", "--early-auto-store-address") ++ preparedOptions.keySet ++ storeOptions.keySet),
+    require(args.forall(Set("--retire-four", "--aligned-load-fall-through", "--early-ls-int-wakeup", "--early-ls-nzvc-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish", "--early-auto-store-address", "--early-store-data-wake") ++ preparedOptions.keySet ++ storeOptions.keySet),
       "unknown FullCoreSynth experiment option")
     require(args.count(a => preparedOptions.contains(a) || a == "--retire-four") <= 1,
       "select only one retirement experiment")
@@ -916,7 +918,8 @@ object GenFullCoreSynthVerilog {
       forwardOnPublish = args.contains("--forward-on-publish"),
       earlyLsNzvcWakeup = args.contains("--early-ls-nzvc-wakeup"),
       detachedStoreEntries = args.flatMap(storeOptions.get).headOption.getOrElse(1),
-      earlyAutoStoreAddress = args.contains("--early-auto-store-address"))
+      earlyAutoStoreAddress = args.contains("--early-auto-store-address"),
+      earlyStoreDataWake = args.contains("--early-store-data-wake"))
   }
 }
 

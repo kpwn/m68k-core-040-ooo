@@ -350,7 +350,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     forwardOnPublish: Boolean = false,
                     earlyLsNzvcWakeup: Boolean = false,
                     detachedStoreEntries: Int = 1,
-                    earlyAutoStoreAddress: Boolean = false) extends Component {
+                    earlyAutoStoreAddress: Boolean = false,
+                    earlyStoreDataWake: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -390,7 +391,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
-      detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress)
+      detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
+      earlyStoreDataWake = earlyStoreDataWake)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

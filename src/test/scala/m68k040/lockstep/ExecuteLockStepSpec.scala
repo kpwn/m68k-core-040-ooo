@@ -527,7 +527,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
       earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
       detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
-      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"))
+      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
+      earlyStoreDataWake = sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -6062,10 +6063,18 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
       var captures = 0; var reservations = 0; var publications = 0; var completionHolds = 0
       var readyAdmissions = 0
+      var wakeQualifiedCaptures = 0
+      var priorWakeTag: Option[Int] = None
       runLockStep(s"early-store-data-$copyback", (setup ++ body.flatten ++ evict).mkString(" ; "),
         checkMem = Seq(0x3000L, 0x3010L), checkSpan = 16, maxCycles = 100000,
         perCycle = dut => {
           if(dut.lsEu.logic.lateDataCapture.toBoolean) captures += 1
+          dut.iq.lateStoreData.foreach { p =>
+            if(dut.lsEu.logic.lateDataCapture.toBoolean && priorWakeTag.contains(p.queryTag.toInt))
+              wakeQualifiedCaptures += 1
+            priorWakeTag = if(p.queryReadyNext.toBoolean && !p.queryReady.toBoolean)
+              Some(p.queryTag.toInt) else None
+          }
           if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1
           if(dut.lsEu.logic.p3ReservedPublish.toBoolean) publications += 1
           if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean)
@@ -6078,6 +6087,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         })
       if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
         assert(captures > 0, "oracle corpus did not exercise late store data")
+      if(sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1")) {
+        assert(wakeQualifiedCaptures > 0, "oracle corpus did not capture from next-cycle readiness")
+        println(s"EARLY_DATA_WAKE_ORACLE copyback=$copyback captures=$wakeQualifiedCaptures")
+      }
       if(sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1")) {
         assert(reservations == publications)
         if(copyback) assert(reservations > 0) else assert(reservations == 0)

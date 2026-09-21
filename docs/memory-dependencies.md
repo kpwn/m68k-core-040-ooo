@@ -58,6 +58,25 @@ the optional candidate earns functional, IPC and 200 MHz acceptance.
 
 ### Reservation-backed early store readiness
 
+Optional `earlyStoreDataWake` qualifies the existing registered store-data
+read-port reservation from a matching guaranteed producer wakeup, rather than
+waiting for its busy bitmap to clear first. IQ remains the sole readiness
+producer: `queryReady` means registered readiness; `queryReadyNext` additionally
+accepts a matching LS or CPLX wake for its busy producer class. The latter promises that
+the source is readable next cycle, including the existing PRF writeback bypass.
+LS early wakeups promise next-cycle writeback; ordinary LS and CPLX wakeups
+announce current writeback. Slow ALU announces TWO cycles ahead, so its busy bit
+must first clear normally: it cannot use this one-cycle qualification shortcut.
+A wake for one class must not bypass a different class's busy bit.
+
+Both detached and P3-held late-data owners retain their qualification register,
+flush/exception veto, exclusive data read-port ownership and source-tag lifetime.
+Admission/turnover clears qualification so it cannot migrate to another store.
+Capture must still assert registered readiness at its actual read edge. No new
+data path, completion port, memory-dependency prediction or architectural
+completion is introduced. The option defaults off pending matched correctness,
+IPC and physical gates; it does not modify the pinned SoC build.
+
 Separate SQ capacity reservation from payload publication. Reserving a slot
 consumes a credit and gives the store an allocation identity; the reserved slot
 is not a forwarding hit until address, attributes, byte coverage and data have

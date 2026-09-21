@@ -104,7 +104,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val forwardOnPublish: Boolean = false,
                  val earlyNzvcWakeup: Boolean = false,
                  val detachedStoreEntries: Int = 1,
-                 val earlyAutoStoreAddress: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyAutoStoreAddress: Boolean = false,
+                 val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
@@ -2966,7 +2967,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val reserveReady = Bool()
       val queuedAdmission = Bool()
       val query = lateStoreData.get
-      val readyPrior = RegNext(valid && !captured && query.queryReady &&
+      val sourceReady = if(earlyStoreDataWake) query.queryReadyNext else query.queryReady
+      val readyPrior = RegNext(valid && !captured && sourceReady &&
         !sqFlushSig && !excActive) init False
       val capture = valid && !captured && readyPrior && !sqFlushSig && !excActive
       val complete = valid && (captured || capture) && !backCompFires &&
@@ -3299,9 +3301,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     lateStoreData.foreach { p =>
       p.queryTag := detachedStore.map(d => Mux(d.valid, d.ctx.dataTag, p3Front.lateDataTag))
         .getOrElse(p3Front.lateDataTag)
-      // One registered clear cycle after the producer's busy bit clears. This
-      // covers next-cycle LS early wakeups before reusing the data read port.
-      val readyPrior = RegNext(p3Valid && p3LateDataPending && !detachedStoreValid && p.queryReady &&
+      // Retain a registered ownership cut. The optional wake-qualified promise
+      // permits capture on guaranteed writeback, using the existing PRF bypass.
+      val sourceReady = if(earlyStoreDataWake) p.queryReadyNext else p.queryReady
+      val readyPrior = RegNext(p3Valid && p3LateDataPending && !detachedStoreValid && sourceReady &&
         !sqFlushSig && !excActive) init False
       // A reserved store may now leave on its capture edge. Its readiness must
       // not qualify a different pending source replacing P3 on that same edge.

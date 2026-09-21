@@ -50,7 +50,8 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
       for (length <- Seq(32, 128); verify <- Seq(false, true)) yield copyKernel(length, verify)
     val results = Seq(false, true).map { combined =>
       val earlyAuto = combined && sys.env.get("IPC_EARLY_AUTO_STORE").contains("1")
-      println(s"BOARD_COPY_PROFILE combined=$combined earlyAuto=$earlyAuto traceOnly=$traceOnly")
+      val earlyDataWake = combined && sys.env.get("IPC_EARLY_STORE_DATA_WAKE").contains("1")
+      println(s"BOARD_COPY_PROFILE combined=$combined earlyAuto=$earlyAuto earlyDataWake=$earlyDataWake traceOnly=$traceOnly")
       val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
         alignedLoadFallThrough = combined, earlyLsIntWakeup = combined,
         sqSubwordForwarding = combined, earlyStoreAddress = combined,
@@ -58,7 +59,8 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
         detachLateStore = combined, forwardOnPublish = combined,
         earlyLsNzvcWakeup = combined, detachedStoreEntries = if (combined) 4 else 1,
         trainSlot1Conditional = combined, deferTakenSlot1Conditional = combined,
-        retainRedirectHistory = combined, earlyAutoStoreAddress = earlyAuto))
+        retainRedirectHistory = combined, earlyAutoStoreAddress = earlyAuto,
+        earlyStoreDataWake = earlyDataWake))
       (for (kernel <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, kernel, seed)
         if (earlyAuto) assert(r.reservedStores > 0 && r.reservedPublishes > 0,

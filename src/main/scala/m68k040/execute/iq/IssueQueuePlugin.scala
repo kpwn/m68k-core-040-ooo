@@ -440,6 +440,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
     lateStorePorts.foreach { p =>
       p.queryReady := !(lsBusy | cplxBusy | aluSlowIntBusy)(p.queryTag)
+      val lsWoke = lsWakeupPort.valid && lsWakeupPort.payload === p.queryTag
+      val cplxWoke = cplxWakeupPort.valid && cplxWakeupPort.payload === p.queryTag
+      // The consumer registers this promise before reading. LS may announce a
+      // next-cycle write; CPLX is already writing. Slow ALU wakes TWO cycles
+      // before its write, so retain the registered-clear delay for that class.
+      p.queryReadyNext := (!lsBusy(p.queryTag) || lsWoke) &&
+        (!cplxBusy(p.queryTag) || cplxWoke) && !aluSlowIntBusy(p.queryTag)
+      p.queryTag.simPublic(); p.queryReady.simPublic(); p.queryReadyNext.simPublic()
     }
 
     // cplxFpBusy[p] => FP physreg p is produced by an in-flight (not-yet-completed) CPLX

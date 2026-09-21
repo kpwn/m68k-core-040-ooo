@@ -2522,3 +2522,81 @@ matching guaranteed producer wakeup as well as the already-ready map, preserving
 same-cycle PRF write/bypass, tag lifetime, read-port exclusion and squash safety.
 Do not remove the register or predict readiness without proving those contracts.
 This is a proposed follow-up, not part of `80f408b2` or the pinned SoC.
+
+### Wake-qualified late store-data capture — 2026-09-21
+
+Implemented the follow-up as default-off `earlyStoreDataWake`, exposed through
+`--early-store-data-wake`, `IPC_EARLY_STORE_DATA_WAKE=1` and
+`LOCKSTEP_EARLY_STORE_DATA_WAKE=1`. IQ alone produces `queryReadyNext`; LSU keeps
+its registered qualification and existing read port. Matching LS/CPLX wakes may
+qualify capture before the registered busy bit clears. Inspection found that
+slow ALU announces TWO cycles before writeback, so it explicitly retains the
+old delay. Both detached and P3-held owners use the new optional qualification.
+Tag lifetime, flush/exception veto, admission reset and port-exclusion assertions
+remain. No change to the SoC throughput-v1 pin.
+
+Matched L2:5/DDR:70 copy results versus the postincrement candidate:
+
+| Copy window | Macros | Prior cycles | New cycles | IPC gain |
+| --- | ---: | ---: | ---: | ---: |
+| 32 bytes, seed 1 | 102 | 384 | 360 | 6.67% |
+| 32 bytes, seed 17 | 102 | 381 | 360 | 5.83% |
+| 128 bytes, seed 1 | 486 | 2058 | 1945 | 5.81% |
+| 128 bytes, seed 17 | 486 | 2046 | 1945 | 5.19% |
+
+Readback windows: 428→409/403 cycles for 32 bytes, 2214/2208→2104/2098
+for 128 bytes. All 16 runs pass, checking every copied byte, NUL and final
+pointers (`/tmp/early-store-data-copy.log` versus
+`/tmp/board-copy-auto-store-full.log`). The initial bounded probe is
+`/tmp/early-store-data-copy-probe.log`; the full matrix uses the final
+slow-ALU-safe qualifier.
+
+All 29 selected oracle tests pass (`/tmp/early-store-data-oracle.log`, 11:35
+local), including 16 precise-mode and 12 copyback-mode captures immediately
+following a matching early qualification, asserted nonzero. Existing shift,
+divide, load, byte/word/long, crossing, protection, redirect, device and IRQ
+cases remain checked. Completion-contention coverage observes three held
+publications and three recovered completions with correct identity/NZVC.
+
+All 136 broad IPC runs pass (`/tmp/early-store-data-ipc.log`, 11:38:32).
+Compared with `/tmp/auto-store-ipc.log`, 36 improve and 100 are unchanged;
+none regress. For the actual combined mode alone: 10,986 macros in
+35,995→35,925 cycles, **0.305209→0.305804 IPC (+0.195%)**, eight gains and
+26 unchanged. Do not blend alternate option profiles into that aggregate.
+The divide-fed recurrence improves 2336→2304 cycles. The short load/store
+recurrence stays at 286/285 cycles with early LS wake already enabled, despite
+less owner waiting; without early LS wake it improves 344/343→286/285.
+Earlier qualification does not remove context admission, issue throughput or
+shared completion constraints. In particular the first C188 reservation cannot
+inherit readiness on its admission edge: its C190 publication/C191 load wake
+remain unchanged. This is not a claim that every producer-to-load chain is now
+one cycle. The final broad log contains the cycle trace for both seeds/modes.
+
+Mandatory `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` passes:
+388 tests, two ignored, zero failures (`/tmp/early-store-data-fast.log`,
+11:42:08 local). Matched 200 MHz physical gate will compare this same
+four-context/postincrement/subword profile with only the new qualifier toggled,
+after the already-queued postincrement comparison. No timing result yet.
+
+### Combined 100 MHz SoC loaded — 2026-09-21
+
+SoC `6b10354af8e8a43eed7ec5c3b5f184eee4964f11`, CPU
+`8fab36144b9181828a6d234346c2d02c4c277eed`, throughput-v1, Ethernet/perf/ILA
+enabled. Final reports: setup +0.034 ns, hold +0.010 ns, pulse 0.000 ns,
+zero setup/hold/pulse failures; 44 bus-skew constraints, minimum +2.451 ns.
+DRC warning classes/counts match baseline, no errors/critical DRC. Existing
+external-I/O/duplicate-clock warnings remain; no unconstrained internal endpoints
+were reported by the build agent. Routed LUT 153,976→153,297 (−679),
+FF 95,193→95,475 (+282), BRAM/URAM unchanged. This is a 100 MHz SoC result,
+not a 200 MHz signoff.
+
+Local ADB-patched bitstream was loaded through the existing leased JTAG session;
+readback confirms build ID `0x6b10354a` and the expected probes. No SPI or SD
+write. Build log `/tmp/ipc-candidate-soc100-build.log`, programming transcript
+`/tmp/ipc-candidate-soc100-load.log`. The host tail/awk reader buffered the
+completed reply; stopped that reader after independently verifying programming
+and READY in `/tmp/jtag_out`. This did not repeat programming; lease released.
+The build agent stopped before sending the load, so root completed the already
+authorized volatile load. User asked to restart Dhrystone before matched counter
+windows. No post-load IPC claim yet. Proposals 19/20 and the subsequent IRQ
+boundary correction are not included in this older, deliberately pinned image.

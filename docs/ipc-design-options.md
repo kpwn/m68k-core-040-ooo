@@ -759,6 +759,25 @@ Keep split/device/privileged and predecrement cases on their
 existing conservative paths. This is not the complete memory-dependency tracker
 or a claim of a one-cycle store-producer-to-load-result path.
 
+## 20. Qualify late store-data capture from guaranteed producer wakeup
+
+Default-off `earlyStoreDataWake` reuses the existing registered read-port owner.
+IQ accepts matching LS or CPLX wakes before the registered busy bit clears;
+LSU captures on the next cycle using the existing PRF bypass. No new data queue,
+PRF port or speculative memory-order prediction. Slow ALU wakes two cycles ahead
+and therefore deliberately keeps its existing registered-clear qualification.
+Flush, context admission/turnover and data-port exclusions are unchanged.
+
+After proposal 19, matched board-derived copy windows improve another 5.19–6.67%
+(32 bytes: 384/381→360 cycles; 128 bytes: 2058/2046→1945). All readback variants
+pass too. The prior 34-case combined corpus improves 0.195% overall: eight gains,
+26 unchanged, no regressions. The short load/store recurrence is unchanged with
+LS early wake already enabled: readiness is not its only remaining bottleneck.
+Twenty-nine selected oracle cases pass, including actual wake-qualified capture,
+slow producers, split/precise fallback, redirects and completion contention.
+Physical gating and board measurement are separate acceptance steps, not implied
+by these simulated gains. The current SoC image does not contain this option.
+
 ## Primary references
 
 - [BOOM ROB and PNR](https://docs.boom-core.org/en/latest/sections/reorder-buffer.html):
