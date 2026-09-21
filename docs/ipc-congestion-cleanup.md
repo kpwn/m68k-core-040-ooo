@@ -276,3 +276,45 @@ ns); pulse-width slack is zero in both. These are placement estimates, NOT the
 original routed -0.249 ns result and NOT proof of a routed improvement.
 Keep both candidates and wait for the actual routed reports before deciding
 whether the extra synthesized CPU LUTs are worthwhile.
+
+## Expanded routed-resource attribution
+
+`synth/routing_pressure.tcl` exports `routing_pressure::run <route.dcp> <out>`
+for read-only use under the existing Vivado mutex. It scans all canonical nets,
+not only the highest-fanout nets, and writes `nets.tsv`, `drivers.tsv`,
+`owners.tsv`, `families.tsv`, and `summary.txt`. Metrics are load count,
+routed PIPs/nodes, and per-net tile footprint. Driver and full net names remain
+available for manual review. Bus families normalize numeric bracket indices
+only; synthesized LUT instance numbers are not collapsed into fictitious buses.
+
+Global-buffer, constant, external and multiple-driver nets are separate classes.
+Ownership uses the last surviving plugin prefix rather than the first containing
+hierarchy. This matters because synthesis moves, for example, D-cache cells
+under `LsEuPlugin_logic_sq` and debug cells under PRF RAM hierarchy. Both naming
+and bus grouping remain heuristics, not proof of logical ownership or causation.
+
+Net aliases are canonicalized across hierarchy. The sum of per-net PIP counts
+must equal the unique PIPs queried across all net segments; a mismatch aborts
+the ranking rather than silently counting a tree twice or omitting its child
+segments. Zero routed PIPs are also an error. These counts measure resource
+footprints, not physical wire length, local available routing capacity, or
+which net caused another net's timing failure. Never sum per-net tile counts
+as if they were distinct occupied tiles for a module.
+
+`tools/test_routing_pressure.tcl` passes mocked tests for driver ownership,
+hierarchy alias deduplication, global classification, multi-driver preservation,
+wide-bus grouping, reconciliation failures and unrouted-design rejection.
+That is Tcl/unit evidence only, not actual Vivado API validation. The serialized
+cell-census hook will run the real baseline and IQ/L2 routed scans before the
+next SoC implementation, using the completed recovery checkpoint for the original
+baseline. Output directories: `/tmp/ipc-cleanup-cell-{baseline,iq_l2}-routing`.
+Missing routed checkpoints and failed scans are reported explicitly; they do not
+prevent the already-gated CSR+PRAM build from starting. Actual scan results are
+still pending. A default five-minute scan budget bounds the diagnostic delay;
+timeout leaves an explicitly incomplete raw TSV and no completed ranking. A
+fresh output directory is required to prevent stale-summary reuse. No RTL,
+clocks or timing exceptions changed for this tooling.
+Repository fast gate after tooling changes: 390 passed, 2 ignored, zero
+failures (`/tmp/ipc-cleanup-routing-tools-fast.log`). The active IQ/L2 run has
+entered `route_design -directive Explore`; router-initial timing is not a
+completed routing result and must not be reported as closure.
