@@ -196,10 +196,12 @@ Service `m68k-ipc-csr-cleanup-soc200.service`, runner
 `/tmp/ipc-csr-cleanup-soc200-{build,generation,lint}.log`.
 Production generation, both SoC lint modes, post-route early-exit tests,
 IPC-profile guards, storage reset pairing, and synthesis-source checks passed.
-The live runner is waiting on `/var/tmp/m68k-ooo-vivado.lock`, behind the IQ/L2
-implementation; do not start a competing synthesis or restart it merely
-because it is waiting. Both build streams use the existing build-log tmux pane.
-No programming/reset operation is included in either runner.
+This CSR-only runner reached the Vivado mutex, then was deliberately stopped
+while its sole child was still `flock`, before any Vivado launch. The replacement
+CSR+PRAM candidate below carries the same CPU pin and adds the existing, tested
+PRAM BRAM implementation. Preserve this worktree and its lint/generation logs
+for a separate CSR-only comparison if needed. No programming/reset operation
+is included in either runner.
 
 Before the CSR implementation begins, the same serialized runner requests a
 read-only primitive census of the original and IQ/L2 synthesized checkpoints.
@@ -216,3 +218,61 @@ resource footprints and congestion against the loaded baseline. Do not select
 the IQ cleanup on its RTL simplicity alone, or the CSR change on its tests
 alone. If the current IQ/L2 implementation worsens routing, preserve its report
 and test a variant retaining the L2/CSR savings without the IQ flush change.
+
+## Recover the previously unintegrated PRAM BRAM cleanup
+
+The active IQ/L2 build and original CSR-only queue still used flop-based PRAM.
+Existing SoC commit `a689a42f0cee2e289b17bee1d015cf0696cce982` on
+`perf/pram-bram` had already implemented the user's accepted 256-byte clear
+sweep, with synchronous dual-port RAM and restore backpressure. Its earlier
+matched synthesis completed, although its documentation still said queued.
+The unchanged RTC source compares as 4058 -> 205 LUTs and 2208 -> 146 FFs,
+with one READ_FIRST RAMB18. These are matched OOC figures; the integrated
+flop-based RTC is 1705 LUTs/2210 FFs and needs its own after measurement.
+
+Cherry-picked that implementation into a separate SoC worktree:
+`ipc-v2-csr-pram-cleanup`, branch `perf/csr-pram-routing-cleanup`, pin
+`616d8fa682e9eb95f59882608754260a86d3fdef`. CPU remains
+`1cb2401f6b77c8e8b55fd5593e405b75d6596875`; no new CPU RTL or profile change.
+Fresh `make tb-rtc tb-pram-bram-cdc tb-pram-sd tb-pram-sd-populated
+tb-pram-sd-autoload` passes: 21 RTC cases, both CDC ratios/phases, 14 persistence
+cases per default image and two autoload cases. Log:
+`/tmp/ipc-cleanup-pram-integration-tests.log`. Tests cover all bytes, read/write
+collisions, reset during clear, restore during clear, and restore during reset.
+
+Replacement service: `m68k-ipc-csr-pram-cleanup-soc200-r2.service`;
+runner `/tmp/run-ipc-csr-pram-cleanup-soc200-r2.sh`; logs
+`/tmp/ipc-csr-pram-cleanup-soc200-r2-{build,generation,lint}.log`.
+It performs fresh production generation and both SoC lint modes before waiting
+behind the unchanged IQ/L2 implementation. It retains the read-only cell census
+ahead of implementation, the same 200/50 MHz clocks, ETH/counters/reset controls,
+and disabled ILA/trace settings. The active build was not interrupted; the
+CSR-only queued service is intentionally inactive, not crashed. The build-log
+tmux pane follows the active and replacement build streams.
+
+The first replacement runner had a script-generation error: JavaScript string
+replacement interpreted a shell-regex dollar/apostrophe sequence as replacement
+syntax and duplicated script text. It was stopped while waiting on the mutex,
+before Vivado launched; its missing-SBT/generation errors are not RTL failures.
+The corrected r2 runner uses literal replacement, exact-string test receipts,
+and explicit throughput-v2/200/50 MHz profile assertions. Original error logs
+remain under the unsuffixed name. Do not confuse them with the r2 build.
+The r2 generation, both SoC lint modes and all profile/reset/source checks now
+pass; the live r2 service is waiting on the Vivado mutex. This is a verified
+queue wait, not a second concurrent implementation.
+
+No new IPC result is claimed: this adds only PRAM clear/read-interface latency,
+not CPU pipeline latency, and preserves the tested CPU candidate. Require the
+integrated BRAM inference and routing result before accepting physical benefit.
+No board reset, programming, flash, or storage write has been performed.
+
+## IQ/L2 placement checkpoint
+
+The active IQ/L2 candidate completed placement and entered pre-route physical
+optimization. At the same `timing_place.rpt` stage, original lean-200 versus
+IQ/L2 is WNS -1.846 -> -0.509 ns, TNS -2226.868 -> -374.695 ns, setup failing
+endpoints 6856 -> 2617. Hold remains negative before routing (-0.396 -> -0.416
+ns); pulse-width slack is zero in both. These are placement estimates, NOT the
+original routed -0.249 ns result and NOT proof of a routed improvement.
+Keep both candidates and wait for the actual routed reports before deciding
+whether the extra synthesized CPU LUTs are worthwhile.
