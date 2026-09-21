@@ -10,9 +10,14 @@ import spinal.lib.misc.plugin.FiberPlugin
 class CommitTraceSinkPlugin extends FiberPlugin {
   val logic = during build new Area {
     val ct = host[CommitTraceService]
-    val traceOut = out(Vec(CommitTrace(), 2))
-    val fireOut  = out(Vec(Bool(), 2))
+    val traceOut = out(Vec(CommitTrace(), ct.trace.length))
+    val fireOut  = out(Vec(Bool(), ct.trace.length))
     traceOut := ct.trace
     fireOut  := ct.traceFire
+    val retirement = host.get[m68k040.services.RobRetirementService].map { service =>
+      val observed = out(cloneOf(service.retiredRobIds))
+      observed := service.retiredRobIds
+      observed
+    }
   }
 }

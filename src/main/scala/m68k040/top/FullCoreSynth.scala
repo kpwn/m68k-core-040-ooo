@@ -761,9 +761,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     val eu0Res = out(RegNext(eu0.intW.data))   // EU0 int result -> anchors datapath+PRF
     val eu1Res = out(RegNext(eu1.intW.data))
     val ct = host[CommitTraceService]
-    val traceOut = out(Vec.fill(2)(m68k040.types.CommitTrace()))
-    val fireOut  = out(Vec.fill(2)(Bool()))
-    for (k <- 0 until 2) {
+    val traceOut = out(Vec.fill(ct.trace.length)(m68k040.types.CommitTrace()))
+    val fireOut  = out(Vec.fill(ct.trace.length)(Bool()))
+    for (k <- ct.trace.indices) {
       traceOut(k) := RegNext(ct.trace(k))
       fireOut(k)  := RegNext(ct.traceFire(k)) init False
     }
@@ -819,7 +819,8 @@ object GenFullCoreSynthVerilog {
                 fuseLongMoveLoads: Boolean = false,
                 reserveLateStore: Boolean = false,
                 detachLateStore: Boolean = false,
-                forwardOnPublish: Boolean = false): Unit = {
+                forwardOnPublish: Boolean = false,
+                retireWidth: Int = 2): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -853,7 +854,7 @@ object GenFullCoreSynthVerilog {
             trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional),
           new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
             fuseLongMoveLoads = fuseLongMoveLoads),
-          new RenameStage(),
+          new RenameStage(retireWidth = retireWidth),
           new DispatchPlugin(),
           new RobPlugin(pairCorrectBranch = pairCorrectBranch),
           new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress),
@@ -884,9 +885,10 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish")),
+    require(args.forall(Set("--retire-four", "--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish")),
       "unknown FullCoreSynth experiment option")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
+      retireWidth = if (args.contains("--retire-four")) 4 else 2,
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
       earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"),
       sqSubwordForwarding = args.contains("--sq-subword-forwarding"),

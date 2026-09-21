@@ -290,53 +290,45 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val wStrbAny = RegInit(False); wStrbAny.simPublic()
 
       // ── 32-entry committed forensic histories ───────────────────────────────
-      // PC storage is split even/odd so a dual-macro retire writes each synchronous
+      // PC storage is banked by retirement width so a batch writes each synchronous
       // memory at most once while preserving program order. Branch and exception
       // families are architecturally single-event-per-cycle and use one 128-bit word.
       val pcTraceHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val branchRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val excRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
-      val pcTraceEven = if (historyBuilt)
-        (Mem(Bits(32 bits), 16) init Vector.fill(16)(B(0, 32 bits))) else null
-      val pcTraceOdd = if (historyBuilt)
-        (Mem(Bits(32 bits), 16) init Vector.fill(16)(B(0, 32 bits))) else null
+      val pcBanks = debugHistory.map(_.macroRetirePc.length).getOrElse(2)
+      require(Set(2, 4)(pcBanks))
+      val pcBankBits = log2Up(pcBanks)
+      val pcTraceBanks = if (historyBuilt) Seq.fill(pcBanks)(
+        Mem(Bits(32 bits), 32 / pcBanks) init Vector.fill(32 / pcBanks)(B(0, 32 bits))) else Seq.empty
       val branchRing = if (historyBuilt)
         (Mem(Bits(128 bits), 32) init Vector.fill(32)(B(0, 128 bits))) else null
       val excRing = if (historyBuilt)
         (Mem(Bits(128 bits), 32) init Vector.fill(32)(B(0, 128 bits))) else null
       if (historyBuilt) {
-        pcTraceEven.addAttribute("ram_style", "block")
-        pcTraceOdd.addAttribute("ram_style", "block")
+        pcTraceBanks.foreach(_.addAttribute("ram_style", "block"))
         branchRing.addAttribute("ram_style", "block")
         excRing.addAttribute("ram_style", "block")
 
         val h = debugHistory.get
-        val pc0 = h.macroRetirePc(0)
-        val pc1 = h.macroRetirePc(1)
-        val pcCount = pc0.valid.asUInt.resize(2) + pc1.valid.asUInt.resize(2)
-        val firstPc = Mux(pc0.valid, pc0.payload, pc1.payload).asBits
-        val secondPc = pc1.payload.asBits
-        val nextPcIndex = (pcTraceHead + 1).resized
-        val evenWrite = Bool(); val oddWrite = Bool()
-        val evenAddr = UInt(4 bits); val oddAddr = UInt(4 bits)
-        val evenData = Bits(32 bits); val oddData = Bits(32 bits)
-        evenWrite := False; oddWrite := False
-        evenAddr := pcTraceHead(4 downto 1); oddAddr := pcTraceHead(4 downto 1)
-        evenData := firstPc; oddData := firstPc
-        when(pcCount === 1) {
-          when(pcTraceHead(0)) { oddWrite := True }.otherwise { evenWrite := True }
-        }.elsewhen(pcCount === 2) {
-          when(pcTraceHead(0)) {
-            oddWrite := True; oddData := firstPc
-            evenWrite := True; evenAddr := nextPcIndex(4 downto 1); evenData := secondPc
-          }.otherwise {
-            evenWrite := True; evenData := firstPc
-            oddWrite := True; oddAddr := nextPcIndex(4 downto 1); oddData := secondPc
-          }
+        // Compact sparse macro-last events in age order, then bank by position.
+        // A batch contains at most one write per bank, including ring wrap.
+        val positions = h.macroRetirePc.scanLeft(pcTraceHead) { (pos, pc) =>
+          (pos + pc.valid.asUInt.resize(5)).resize(5)
         }
-        pcTraceEven.write(evenAddr, evenData, evenWrite)
-        pcTraceOdd.write(oddAddr, oddData, oddWrite)
-        when(pcCount =/= 0) { pcTraceHead := pcTraceHead + pcCount.resized }
+        for (bank <- 0 until pcBanks) {
+          val enable = Bool(); enable := False
+          val addr = UInt((5 - pcBankBits) bits); addr := 0
+          val data = Bits(32 bits); data := 0
+          for (lane <- 0 until pcBanks) {
+            val pc = h.macroRetirePc(lane)
+            when(pc.valid && positions(lane)(pcBankBits - 1 downto 0) === bank) {
+              enable := True; addr := positions(lane)(4 downto pcBankBits); data := pc.payload.asBits
+            }
+          }
+          pcTraceBanks(bank).write(addr, data, enable)
+        }
+        pcTraceHead := positions.last
 
         val br = h.branchRetire
         val brMeta = B(0, 28 bits) ## br.payload.branchType.asBits ##
@@ -680,15 +672,15 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // merge into one edge either.
       val perfLvlDtlbWalk = if (perfBuilt) stallDtlb.map(t => RegNext(!t.logic.walker.io.dbgPack(0)) init False) else None
       val perfLvlItlbWalk = if (perfBuilt) stallItlb.map(t => RegNext(!t.logic.walker.io.dbgPack(0)) init False) else None
-      /** Retired macros this cycle, 0/1/2, from the SAME `macroRetirePc` Flows the PC
+      /** Retired macros this cycle, 0..retireWidth, from the SAME `macroRetirePc` Flows the PC
         * trace ring records. Cross-checkable against OFF_INST_LO by construction, which
         * is how `PerfCounterSpec` proves this lane is not fabricating numbers. */
       val perfEvtInst = if (perfBuilt) {
         val live = excCountHistory.map(h =>
-          h.macroRetirePc(0).valid.asUInt.resize(2) + h.macroRetirePc(1).valid.asUInt.resize(2)
-        ).getOrElse(U(0, 2 bits))
+          h.macroRetirePc.map(_.valid.asUInt.resize(3)).reduce(_ + _)
+        ).getOrElse(U(0, 3 bits))
         RegNext(live) init 0
-      } else U(0, 2 bits)
+      } else U(0, 3 bits)
 
       // ── The counters ──────────────────────────────────────────────────────────
       // Each is a named `val` so SpinalHDL's val-name reflection gives it a real
@@ -852,16 +844,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
 
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
-      val historyReadPcOdd = if (historyBuilt) RegInit(False) else False
+      val historyReadPcBank = if (historyBuilt) Reg(UInt(pcBankBits bits)) init 0 else U(0, pcBankBits bits)
       val pcReadIndex = ((arAddr - DebugRegMap.OFF_PC_TRACE_BODY) >> 2).resize(5)
       val excReadIndex = ((arAddr - DebugRegMap.OFF_EXC_RING_BODY) >> 4).resize(5)
       val branchReadIndex = ((arAddr - DebugRegMap.OFF_BRANCH_RING_BODY) >> 4).resize(5)
-      val pcEvenRead = if (historyBuilt)
-        pcTraceEven.readSync(pcReadIndex(4 downto 1), historyReadIssue && pcBodyRead && !pcReadIndex(0))
-        else B(0, 32 bits)
-      val pcOddRead = if (historyBuilt)
-        pcTraceOdd.readSync(pcReadIndex(4 downto 1), historyReadIssue && pcBodyRead && pcReadIndex(0))
-        else B(0, 32 bits)
+      val pcBankReads = if (historyBuilt) Vec(pcTraceBanks.zipWithIndex.map { case (mem, bank) =>
+        mem.readSync(pcReadIndex(4 downto pcBankBits), historyReadIssue && pcBodyRead &&
+          (pcReadIndex(pcBankBits - 1 downto 0) === bank))
+      }) else Vec.fill(pcBanks)(B(0, 32 bits))
       val excBodyWord = if (historyBuilt)
         excRing.readSync(excReadIndex, historyReadIssue && excBodyRead) else B(0, 128 bits)
       val branchBodyWord = if (historyBuilt)
@@ -939,7 +929,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         if (historyBuilt) when(historyBodyRead) {
           historyReadKind := Mux(pcBodyRead, U(0, 2 bits), Mux(excBodyRead, U(1, 2 bits), U(2, 2 bits)))
           historyReadWord := arAddr(3 downto 2)
-          historyReadPcOdd := pcReadIndex(0)
+          historyReadPcBank := pcReadIndex(pcBankBits - 1 downto 0)
         }
       }
       /** READ STAGE 2. The response word. Exactly one of the six per-region partial
@@ -955,7 +945,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         val historyWord = Bits(DebugRegMap.DBG_DW bits)
         historyWord := B(0, DebugRegMap.DBG_DW bits)
         switch(historyReadKind) {
-          is(U(0, 2 bits)) { historyWord := Mux(historyReadPcOdd, pcOddRead, pcEvenRead) }
+          is(U(0, 2 bits)) { historyWord := pcBankReads(historyReadPcBank) }
           is(U(1, 2 bits)) { historyWord := excBodyWord.subdivideIn(32 bits)(historyReadWord) }
           is(U(2, 2 bits)) { historyWord := branchBodyWord.subdivideIn(32 bits)(historyReadWord) }
         }

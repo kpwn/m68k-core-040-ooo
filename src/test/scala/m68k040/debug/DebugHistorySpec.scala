@@ -8,10 +8,10 @@ import spinal.lib.misc.database.Database
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 
 class DebugHistorySpec extends AnyFunSuite {
-  class Dut(depth: Int = 32) extends Component {
+  class Dut(depth: Int = 32, retireWidth: Int = 2) extends Component {
     val db = new Database
     val host = db on (new PluginHost)
-    val history = new DebugHistoryStubPlugin
+    val history = new DebugHistoryStubPlugin(retireWidth)
     val dbg = new DebugCtrlPlugin(porCycles = 4, stage = 3, historyDepth = depth)
     db.on { host.asHostOf(Seq[FiberPlugin](history, dbg)) }
     def axi = dbg.logic.dbgAxi
@@ -98,6 +98,38 @@ class DebugHistorySpec extends AnyFunSuite {
         assert(DbgAxiDriver.read(dut.axi, cd, exBase + 8) == 0x50000000L + event * 8)
         assert(DbgAxiDriver.read(dut.axi, cd, exBase + 12) == 0x60000000L + event * 16)
       }
+    }
+  }
+
+  test("four-wide PC history compacts sparse macro boundaries and wraps every bank") {
+    M68kSim().compile(new Dut(retireWidth = 4)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      DbgAxiDriver.idle(dut.axi)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.history.logic.pcValid.foreach(_ #= false)
+      dut.history.logic.branchValid #= false; dut.history.logic.exceptionValid #= false
+      cd.waitSampling(20)
+      val expected = Array.fill[Long](32)(0L)
+      var head = 0
+      var sequence = 0L
+      for (round <- 0 until 4; mask <- 0 until 16) {
+        for (lane <- 0 until 4) {
+          val valid = (mask & (1 << lane)) != 0
+          dut.history.logic.pcValid(lane) #= valid
+          dut.history.logic.pc(lane) #= 0x10000000L + sequence * 2
+          if (valid) {
+            expected(head) = 0x10000000L + sequence * 2
+            head = (head + 1) % 32; sequence += 1
+          }
+        }
+        cd.waitSampling()
+      }
+      dut.history.logic.pcValid.foreach(_ #= false)
+      cd.waitSampling(2)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_PC_TRACE_HEAD) == head)
+      assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_PERF_INST_LO) == sequence)
+      for (index <- 0 until 32)
+        assert(DbgAxiDriver.read(dut.axi, cd, DebugRegMap.OFF_PC_TRACE_BODY + index * 4) == expected(index))
     }
   }
 

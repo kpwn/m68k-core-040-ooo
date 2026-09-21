@@ -506,7 +506,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dec    = new DecodeStage(allowSlot1Prediction =
       sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       fuseLongMoveLoads = sys.env.get("LOCKSTEP_FUSE_LONG_MOVE_LOADS").contains("1"))
-    val ren    = new RenameStage
+    val ren    = new RenameStage(retireWidth = sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2))
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
@@ -873,8 +873,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             handle.onWb(fc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
           }
         }
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) {
             commitCount += 1
             if (sys.env.contains("CR_RAW")) {
@@ -1375,6 +1375,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             dut.intCtrl.logic.iackAvec   #= avec
             dut.intCtrl.logic.iackVector #= vectorIn
           }
+          for (lane <- 2 until dut.rob.logic.retireWidth) {
+            val pc = dut.rob.logic.commitPcs(lane).toLong & 0xffffffffL
+            if (dut.rob.logic.retireLanes(lane).toBoolean && eventPcs.contains(pc) && !firedEvents.contains(pc)) {
+              firedEvents += pc
+              dut.intCtrl.logic.iplIn #= levelByPc(pc)
+              dut.intCtrl.logic.iackAvec #= avec
+              dut.intCtrl.logic.iackVector #= vectorIn
+            }
+          }
           // ── p167: the predecessor may commit through the SYSOP/EXCEPTION port ──
           // A serializing commit-time op (MOVE-to-SR, MOVE-to-USP, MOVEC, RTE, a trap
           // entry) does NOT appear on retire0/retire1 -- it commits on `commitObs(2)`.
@@ -1398,8 +1407,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             }
           }
         }
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) {
             commitCount += 1
             val pc = c.pc.toLong & 0xffffffffL
@@ -4641,8 +4650,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         // store's completion, so synthesize a no-op Wb here too.
         val sc = dut.lsEu.sqCompletionPort
         if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean)
             handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL, c.sysByte.toInt & 0xff, c.a7.toLong & 0xffffffffL,
               msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -6555,7 +6564,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       var guard = 0
       while (guard < 1500 && committed < 4) {
         if (dut.itlb.logic.faultSeen.toBoolean) faulted = true
-        for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) committed += 1
+        for (c <- dut.rob.logic.ordinaryCommitObs) if (c.fire.toBoolean) committed += 1
         cd.waitSampling(); guard += 1
       }
     }
@@ -7322,8 +7331,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -7527,8 +7536,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -7658,8 +7667,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // precise store's completion, so synthesize a no-op Wb here too.
       val sc = dut.lsEu.sqCompletionPort
       if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false))
-      for (k <- 0 until 2) {
-        val c = dut.rob.logic.commitObs(k)
+      for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+        val c = dut.rob.logic.ordinaryCommitObs(k)
         if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
           sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
           msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -9453,8 +9462,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -9724,8 +9733,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -9950,8 +9959,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         captureBranch()
         captureSq()
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
@@ -10984,8 +10993,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cap         = 20000
       while (trace.size < targetCommits && guard < cap) {
         cd.waitSampling(); guard += 1
-        for (k <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(k)
           if (c.fire.toBoolean) trace += ((guard, k, c.pc.toLong & 0xffffffffL))
         }
         val ce = dut.rob.logic.commitObs(2)
@@ -11151,7 +11160,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         }
         // Independently confirm the fetch really was WRONG-PATH: no retired
         // (architectural) PC may ever land in the window.
-        for (k <- 0 until 3) {
+        for (k <- dut.rob.logic.commitObs.indices) {
           val c = dut.rob.logic.commitObs(k)
           if (c.fire.toBoolean) {
             val pc = c.pc.toLong & 0xffffffffL
@@ -11310,7 +11319,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         // NON-VACUITY: the wrong-path inhibited load must actually reach the launch gate.
         if (dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Inhibited.toBoolean)
           sawInhibitedAtGate = true
-        for (k <- 0 until 2) if (dut.rob.logic.commitObs(k).fire.toBoolean) commits += 1
+        for (c <- dut.rob.logic.ordinaryCommitObs) if (c.fire.toBoolean) commits += 1
       }
     }
     (arHits.toVector, arTotal, sawInhibitedAtGate, commits)
@@ -11926,8 +11935,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             iOutstanding -= id
           }
         }
-        for (k <- 0 until 2) {
-          val o = dut.rob.logic.commitObs(k)
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val o = dut.rob.logic.ordinaryCommitObs(k)
           // per-MACRO count: the commit obs fires per uop and the writer is a 2-uop macro
           if (o.fire.toBoolean && o.macroLast.toBoolean && (o.pc.toLong & 0xffffffffL) == writerPc) writerRetires += 1
         }
@@ -12382,7 +12391,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
-      val obs = dut.rob.logic.commitObs
+      val obs = dut.rob.logic.ordinaryCommitObs
       // instruction start addresses: a1(6) d0(6) nop*4(8) -> store at +20 (2 bytes) -> moveq at +30 -> move.b d0,d2 at +40
       val storePc = loadAddr + 20; val moveqPc = loadAddr + 30; val aluPc = loadAddr + 40
       var cyc = 0
@@ -12397,7 +12406,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           trace += f"cyc=$cyc RETIRE0 head=$h nzvcWrStore(head)=${dut.rob.logic.nzvcWrStore(h).toBoolean} nzvcValStore(head)=0x${dut.rob.logic.nzvcValStore(h).toInt}%x committedCcr=0x$ccr%02x" +
                    (if (dut.rob.logic.retire1.toBoolean) f" +RETIRE1 h1=${(h + 1) % 64} nzvcWrStore(h1)=${dut.rob.logic.nzvcWrStore((h + 1) % 64).toBoolean}" else "")
         }
-        for (i <- 0 until 2) if (obs(i).fire.toBoolean) {
+        for (i <- obs.indices) if (obs(i).fire.toBoolean) {
           val nextPc = obs(i).pc.toLong & 0xffffffffL
           trace += f"cyc=$cyc retire slot$i nextPc=0x$nextPc%08x committedCcr=0x$ccr%02x"
           if (nextPc == storePc + 2) storeRetireCyc = cyc
@@ -12707,7 +12716,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val obs = dut.rob.logic.commitObs
       while (cyc < budget && !goodSeen && !badSeen) {
         cd.waitSampling(); cyc += 1
-        for (i <- 0 until 3) if (obs(i).fire.toBoolean) {
+        for (i <- obs.indices) if (obs(i).fire.toBoolean) {
           recentPcs += f"0x${obs(i).pc.toLong & 0xffffffffL}%08x${if (i == 2) "x" else ""}"
           if (recentPcs.size > 12) recentPcs.remove(0)
         }
@@ -13045,8 +13054,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.eu0.logic.wbObs); captureWb(dut.eu1.logic.wbObs); captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
         locally { val bw = dut.branchEu.logic.wbObs; if (bw.valid.toBoolean) handle.onWb(bw.robId.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)) }
         locally { val sc = dut.lsEu.sqCompletionPort; if (sc.valid.toBoolean) handle.onWb(sc.payload.toInt, WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)) }
-        for (kk <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(kk)
+        for (kk <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(kk)
           if (c.fire.toBoolean) handle.onCommit(c.robId.toInt, c.pc.toLong & 0xffffffffL,
             sysByte = c.sysByte.toInt & 0xff, a7 = c.a7.toLong & 0xffffffffL,
             msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,

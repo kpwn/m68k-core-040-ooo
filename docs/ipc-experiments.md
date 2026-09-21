@@ -1455,6 +1455,88 @@ would shorten this cone without adding a recurrence cycle. This is a hypothesis,
 not an implemented repair or permission to remove the precise-store safeguard.
 The other failing cones still require their own timing evidence.
 
+## Four-wide retirement full-core control — 2026-09-21
+
+Implemented the actual optional four-wide ROB, not just completed-prefix
+profiling. Rename/dispatch allocation stays two-wide. The ROB consumes a safe
+contiguous prefix and publishes all map/free, SQ/U/M, CCR, system-capture,
+FP-ever-executed and PC updates. Same-edge precise-store CCR bypass is retained.
+Branches remain on the one training port; system/privileged/RTE upper entries,
+armed debug stops and trace retain conservative behavior. A marked breakpoint
+now also blocks lane 1 (previously that guard existed only at the head), as well
+as the new upper lanes. Directed tests also exposed a manual halt retiring one
+macro too far when a cracked macro ended in lane 1: normal boundary detection
+previously checked only lane 0. It now includes both conservative stop lanes and
+uses the completed macro's restart PC. Macro histories compact into two/four banks; counters,
+VIO and ordinary commit observations include all lanes. Exception observation
+channel 2 is preserved for existing exception-only observers. The old detailed
+two-lane ILA format explicitly rejects four-wide elaboration.
+
+Controls: `IPC_RETIRE_WIDTH=2/4` for the benchmark harness,
+`LOCKSTEP_RETIRE_WIDTH=4` for the oracle harness, and `--retire-four` for core
+generation. All default to two. These are experimental options, not a board
+configuration change. No new Global producer or rollback mechanism is added.
+
+Matched warmed windows, seeds 1/17, L2 hit 5 cycles / DDR 70 cycles. `Composed`
+is the seven LSU options plus selective taken-slot-1 deferral/training and retained
+redirect history, with subword forwarding and correct-branch pairing disabled.
+Each run has an instrumentation-disabled control with identical macro/cycle
+counts. All 14 new default two-wide macro/cycle/branch/miss tuples exactly match
+the earlier queue-prerequisite baseline.
+
+| Kernel | Macros | Original 2-wide | Original 4-wide | Composed 2-wide | Composed 4-wide |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hot loop | 336 | 252 | 252 | 252 | 252 |
+| Short alternating, seeds 1 / 17 | 132 | 135 / 234 | 135 / 234 | 138 | 138 |
+| Short backlog | 360 | 425 | 415 | 380 | 376 |
+| Copyback call/return | 672 | 1,342 | 1,341 | 1,174 | 1,173 |
+| Independent ALU | 396 | 267 | 267 | 267 | 267 |
+| Long alternating | 2,112 | 2,170 | 2,170 | 2,112 | 2,112 |
+| Long backlog, seeds 1 / 17 | 2,520 | 2,660 | 3,204 / 3,360 | 2,240 | 2,240 |
+
+The original long-backlog misses rise from 29/224 to 74/224 and 90/224. This is
+an observed interaction with prediction/recovery timing, not proof of the exact
+predictor root cause. With the improved predictor, both widths retain one miss
+out of 224 and the same throughput. The four-wide composed long window exercises
+112 three-entry and **336 four-entry** retirement cycles: this is not an unexercised
+feature. The short composed window gains **1.064% IPC**; call/return's one-cycle
+gain is just **0.085%** and may include window-boundary quantization. There is no
+general throughput improvement demonstrated here, despite real catch-up bursts.
+In the composed long-backlog window, mean ROB occupancy falls 21.471→19.038,
+but head-incomplete cycles rise 672→1,008 while IPC is identical. Faster draining
+exposes the next blocked head earlier; the stalled-head counter alone is not a
+throughput score. Neither width exhausts the ROB's two-allocation capacity in
+these measured windows.
+
+Logs: `/tmp/wide-rob-base-and-directed.log`, `/tmp/wide-rob-four-ipc.log`,
+`/tmp/wide-rob-composed-2-ipc.log`, `/tmp/wide-rob-composed-4-ipc.log`. All four
+profile suites pass. Correctness results are recorded below. No synthesis is
+queued for this low-gain control; the existing
+LSU queue continues independently. No routed four-wide, integrated SoC or board
+result is claimed. Prepared shadow-map publication remains a separate required
+experiment, not disproven by this control, but it must show a benefit that simpler
+catch-up bandwidth did not deliver in these windows.
+
+The four-wide composed correctness run passes **30** bounded integer/memory/
+exception oracle tests and **28** FP oracle tests, including IRQ entry/RTE,
+nonresident/write-protected mappings, physical aliases, SQ generation/flush and
+source lifetime, precise-store same-edge CCR folding, CHK fault flags and control
+register captures. Three new directed ROB tests cover all seven barrier kinds at
+every lane, breakpoint stop PCs, manual/halt-after stops at every macro boundary
+at both widths, 20 full bursts across ROB wrap, FP/FPCC notices, macro counters
+and youngest/restart PCs. The history suite passes four tests, including every
+four-lane sparse macro mask, wrap and exact instruction-count readback.
+`/tmp/wide-rob-correctness.log` records the ROB/oracle runs and successful
+four-wide production RTL generation; `/tmp/wide-rob-base-and-directed.log`
+records the history tests. RTL generation is not synthesis or timing closure.
+The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes
+**385 tests**, two ignored, with no failed or aborted suites
+(`/tmp/wide-rob-fast.log`).
+After the debug-boundary fix, final default two-wide and composed four-wide
+profile reruns reproduce all 14 respective macro/cycle/branch/miss tuples
+exactly; the four-wide retirement histograms also match
+(`/tmp/wide-rob-final-default-ipc.log`, `/tmp/wide-rob-final-composed-ipc.log`).
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

@@ -74,7 +74,10 @@ class PipelineProfileSpec extends CoreBenchHarness {
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
       val prefixHistogram = p.rob.groupBy(_.completePrefix).toSeq.sortBy(_._1)
         .map { case (prefix, cycles) => s"$prefix:${cycles.size}" }.mkString(",")
+      val retireHistogram = p.rob.groupBy(_.retires).toSeq.sortBy(_._1)
+        .map { case (width, cycles) => s"$width:${cycles.size}" }.mkString(",")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
+        s"retireWidth=${sys.env.getOrElse("IPC_RETIRE_WIDTH", "2")} retireHistogram=$retireHistogram " +
         s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken retainHistory=$retainHistory " +
         s"lsFlags=${lsFlags.collect { case (name, true) => name }.toSeq.sorted.mkString(",")} " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +

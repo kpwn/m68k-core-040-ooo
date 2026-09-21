@@ -41,26 +41,26 @@ class RobAllocDriverPlugin extends FiberPlugin {
 
 /** Test-only: CONSUMES RenameCommitService from RobPlugin, exposing commit ports
   * + flush as top-level IO so the test can observe retire-driven commit/free. */
-class RenameCommitSinkPlugin extends FiberPlugin with RenameCommitService {
+class RenameCommitSinkPlugin(retireWidth: Int = 2) extends FiberPlugin with RenameCommitService {
   val logic = during build new Area {
     // Directionless service wires (RobPlugin drives these).
-    val commits = Vec.fill(2)(Flow(m68k040.rob.CommitSlot()))
+    val commits = Vec.fill(retireWidth)(Flow(m68k040.rob.CommitSlot()))
     val flushP  = Bool()
     // Mirror to top-level outputs for observation.
-    val commitValidOut = out(Vec(Bool(), 2))
-    val commitArchOut  = out(Vec(UInt(5 bits), 2))
-    val commitOldOut   = out(Vec(UInt(6 bits), 2))
+    val commitValidOut = out(Vec(Bool(), retireWidth))
+    val commitArchOut  = out(Vec(UInt(5 bits), retireWidth))
+    val commitOldOut   = out(Vec(UInt(6 bits), retireWidth))
     // FP data + FPCC commit fields (2026-08-16 FP-commit-path fix): the ROB is the
     // ONLY producer of these, so a directed test needs them observable to prove the
     // rename identity really threads RobPayload -> CommitSlot.
-    val commitFpArchOut  = out(Vec(UInt(3 bits), 2))
-    val commitFpNewOut   = out(Vec(UInt(4 bits), 2))
-    val commitFpOldOut   = out(Vec(UInt(4 bits), 2))
-    val commitFpWrOut    = out(Vec(Bool(), 2))
-    val commitFpccNewOut = out(Vec(UInt(4 bits), 2))
-    val commitFpccOldOut = out(Vec(UInt(4 bits), 2))
-    val commitFpccWrOut  = out(Vec(Bool(), 2))
-    for (k <- 0 until 2) {
+    val commitFpArchOut  = out(Vec(UInt(3 bits), retireWidth))
+    val commitFpNewOut   = out(Vec(UInt(4 bits), retireWidth))
+    val commitFpOldOut   = out(Vec(UInt(4 bits), retireWidth))
+    val commitFpWrOut    = out(Vec(Bool(), retireWidth))
+    val commitFpccNewOut = out(Vec(UInt(4 bits), retireWidth))
+    val commitFpccOldOut = out(Vec(UInt(4 bits), retireWidth))
+    val commitFpccWrOut  = out(Vec(Bool(), retireWidth))
+    for (k <- 0 until retireWidth) {
       commitValidOut(k) := commits(k).valid
       commitArchOut(k)  := commits(k).intArch
       commitOldOut(k)   := commits(k).intOld

@@ -97,8 +97,9 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
       // gives it priority with no explicit priority-encoder chain.
       val pcLatch      = Reg(UInt(32 bits)) init 0
       val pcLatchValid = RegInit(False)
-      when(ct.traceFire(0)) { pcLatch := ct.trace(0).pc; pcLatchValid := True }
-      when(ct.traceFire(1)) { pcLatch := ct.trace(1).pc; pcLatchValid := True }
+      for (lane <- ct.trace.indices) when(ct.traceFire(lane)) {
+        pcLatch := ct.trace(lane).pc; pcLatchValid := True
+      }
       pcLatch.simPublic(); pcLatchValid.simPublic()
 
       // ── V13: saturating retire counter ───────────────────────────────────────────
@@ -109,7 +110,7 @@ class VioProbePlugin(val enable: Boolean = false, val buildId: BigInt = 0) exten
       // own comment forbids. The guard here is `< max - n` instead, so a dual retire at
       // (max-1) saturates cleanly to max rather than wrapping to 0/1.
       val retireCount = Reg(UInt(32 bits)) init 0
-      val n    = U(0, 2 bits) +^ ct.traceFire(0).asUInt +^ ct.traceFire(1).asUInt   // 0, 1 or 2
+      val n = ct.traceFire.map(_.asUInt.resize(log2Up(ct.trace.length + 1))).reduce(_ + _)
       val maxU = U(0xFFFFFFFFL, 32 bits)
       when(retireCount < (maxU - n.resize(32 bits))) {
         retireCount := retireCount + n.resize(32 bits)

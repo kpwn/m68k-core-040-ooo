@@ -32,12 +32,12 @@ object DebugHaltReasonCode {
   // OFF_PCRANGE_COUNT / OFF_A7ODD_COUNT tell the two lanes apart at the host.
 }
 
-/** RobPlugin: instruction-level reorder buffer ring with 2-wide in-order retire.
+/** RobPlugin: instruction-level reorder buffer ring with two/four-wide in-order retire.
   *
   * - Alloc: PASSIVE RobAllocService — DispatchPlugin takes robIds and drives the
   *   alloc-fire/uop/slot1 wires; the ROB writes the ring slots.
   * - Completion: two external completion.Flow(robId) ports mark entries done.
-  * - Retire: in-order, up to 2/cycle, drives RenameCommitService.commitPorts
+  * - Retire: in-order, width owned by RenameCommitService.commitPorts
   *   (commit committed-RAT + free old pdsts) and exposes CommitTrace + commitObs.
   * - Flush: squash all in-flight entries (tail := head, count := 0).
   *
@@ -344,8 +344,10 @@ class RobPlugin(val detailedPerf: Boolean = false,
 
   val logic = during build new Area {
     val rc = host[RenameCommitService]
-    require(rc.commitPorts.length == 2,
-      "four-lane rename commit requires the full ROB retirement-bandwidth integration")
+    val retireWidth = rc.commitPorts.length
+    require(Set(2, 4)(retireWidth))
+    require(!detailedPerf || retireWidth == 2,
+      "the detailed ILA retirement format supports two lanes only")
     // External interrupt inputs (simple protocol). The recognition logic (Task 3)
     // compares iplIn vs the SR I-mask and selects the vector; here (Task 2) we
     // mirror them simPublic so a directed test sees the inputs reach the ROB. The
@@ -1040,6 +1042,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val h1 = head + 1
     val p0 = payload.readAsync(h0)
     val p1 = payload.readAsync(h1)
+    val retireIds = Seq(h0, h1) ++ (2 until retireWidth).map(i => (head + i).resized)
+    val retirePayloads = Seq(p0, p1) ++ retireIds.drop(2).map(payload.readAsync(_))
     // debug-only, task B2: expose the raw payload read (incl. the 8 LUT-reduction-B1
     // folded fields) so a directed test can round-trip-verify them directly instead of
     // only through derived consumers (rteRetire/sysRetire/privViolation/...). Zero
@@ -1322,15 +1326,30 @@ class RobPlugin(val detailedPerf: Boolean = false,
       !p0.retireAlone || (!mispredictStore(h0) && p0.last)
     else !p0.retireAlone
     val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
-                  !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp &&
+                  !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp && !p1.debugBreakValid &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
                   !(haltAfterArmedIn && h0IsMacroLast) &&
-                  !((debugStopRequestIn || (debugHaltState === DebugHaltState.STOP_PENDING)) &&
+                  !((debugStopRequestIn || a7OddStopReq || pcRangeStopReq ||
+                    (debugHaltState === DebugHaltState.STOP_PENDING)) &&
                     h0IsMacroLast) &&
                   !((debugHaltState === DebugHaltState.STEP_RUNNING) && h0IsMacroLast)
-    val debugMacroCountInc =
-      (retire0 && p0.last).asUInt.resize(2) +
-      (retire1 && p1.last).asUInt.resize(2)
+    // Extra bandwidth is for ordinary execution. Keep the existing precise
+    // debug/trace boundary path and the single branch-training port unchanged.
+    val retireLanes = Seq(retire0, retire1) ++ (2 until retireWidth).map(_ => Bool())
+    for (lane <- 2 until retireWidth) {
+      val p = retirePayloads(lane)
+      val id = retireIds(lane)
+      retireLanes(lane) := retireLanes(lane - 1) && (count > lane) && completes(id) &&
+        !faultedStore(id) && !p.retireAlone && !p.isRte && !p.needsSup && !p.sysOp &&
+        !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
+        !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
+        !haltA7OddEnIn && !haltPcRangeEnIn &&
+        (debugHaltState === DebugHaltState.RUNNING)
+    }
+    retireLanes.foreach(_.simPublic())
+    val debugMacroCountInc = retireLanes.zip(retirePayloads)
+      .map { case (r, p) => (r && p.last).asUInt.resize(log2Up(retireWidth + 1)) }.reduce(_ + _)
+    debugMacroCountInc.simPublic()
 
     // Ordinary manual/halt-after stops are post-commit. The macro at the head when
     // the request is sampled completes in full; the slot-1 guard above prevents the
@@ -1340,7 +1359,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val debugStopActive = debugStopRequestIn || a7OddStopReq || pcRangeStopReq || haltAfterDue ||
       (debugHaltState === DebugHaltState.STOP_PENDING)
     val debugSequencerBoundaryHit = Bool() // driven below from the completed redirect
-    val debugNormalBoundaryHit = retire0 && h0IsMacroLast
+    // The tail of a cracked macro may be lane 1. Waiting for a lane-0 last
+    // would consume the next macro before acknowledging a manual stop.
+    val debugNormalBoundaryHit = (retire0 && p0.last) || (retire1 && p1.last)
     // With no ROB work and no exception/system sequencer active, the core is already at
     // a clean macro boundary. Without this arm a manual request sampled between fetch
     // bursts entered STOP_PENDING forever waiting for a retirement that quiescing had
@@ -1530,9 +1551,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     debugLastPcReg.simPublic()
     when(retire1)      { debugLastPcReg := p1.pc }
       .elsewhen(retire0) { debugLastPcReg := p0.pc }
+    for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+      debugLastPcReg := retirePayloads(lane).pc
+    }
 
     // Task 9b: the capture itself. Slot = destination temp - T0 (the transfer's position
-    // in the register list). Both retire slots are handled, and the two writes can never
+    // in the register list). All retire slots are handled, and the writes can never
     // target the same slot:
     //   - within one program the capture rows carry distinct temps (T0/T1/T2), and
     //   - two DIFFERENT programs' capture rows can never be h0/h1 in the same cycle,
@@ -1542,12 +1566,18 @@ class RobPlugin(val detailedPerf: Boolean = false,
     def sysAuxSlotOf(arch: UInt): UInt = (arch - U(m68k040.decode.MicroOpAssembler.T0, 5 bits)).resize(2)
     when(retire0 && (p0.sysKind === sysAuxCapKind)) { sysAux(sysAuxSlotOf(p0.archRegId)) := sysValStore(h0) }
     when(retire1 && (p1.sysKind === sysAuxCapKind)) { sysAux(sysAuxSlotOf(p1.archRegId)) := sysValStore(h1) }
+    for (lane <- 2 until retireWidth) {
+      val p = retirePayloads(lane)
+      when(retireLanes(lane) && (p.sysKind === sysAuxCapKind)) {
+        sysAux(sysAuxSlotOf(p.archRegId)) := sysValStore(retireIds(lane))
+      }
+    }
 
-    val traceVec     = Vec(CommitTrace(), 2)
-    val traceFireVec = Vec(Bool(), 2)
+    val traceVec     = Vec(CommitTrace(), retireWidth)
+    val traceFireVec = Vec(Bool(), retireWidth)
 
     // defaults
-    for (k <- 0 until 2) {
+    for (k <- 0 until retireWidth) {
       rc.commitPorts(k).valid := False
       rc.commitPorts(k).payload.assignDontCare()
       // FP/FPCC commit-field IDLE defaults. `driveCommit` below overrides them with the
@@ -1614,11 +1644,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val nextPcRd1 = nextPcMem.readAsync(h1)
     val commitPc0 = Mux(p0.retireAlone, nextPcRd0, p0.predNextPc)
     val commitPc1 = Mux(p1.retireAlone, nextPcRd1, p1.predNextPc)
-    val debugMacroRetirePc = Vec.fill(2)(Flow(UInt(32 bits)))
-    debugMacroRetirePc(0).valid := retire0 && p0.last
-    debugMacroRetirePc(0).payload := p0.pc
-    debugMacroRetirePc(1).valid := retire1 && p1.last
-    debugMacroRetirePc(1).payload := p1.pc
+    val commitPcs = Seq(commitPc0, commitPc1) ++ retirePayloads.drop(2).map(_.predNextPc)
+    commitPcs.foreach(_.simPublic())
+    val debugMacroRetirePc = Vec.fill(retireWidth)(Flow(UInt(32 bits)))
+    for (lane <- 0 until retireWidth) {
+      debugMacroRetirePc(lane).valid := retireLanes(lane) && retirePayloads(lane).last
+      debugMacroRetirePc(lane).payload := retirePayloads(lane).pc
+    }
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
     // RAW retire event (not `commitObs`, which is ANOTHER RegNext cycle behind --
@@ -1629,23 +1661,27 @@ class RobPlugin(val detailedPerf: Boolean = false,
     commitPc0.simPublic(); commitPc1.simPublic()
     when(retire0) { driveCommit(0, p0, commitPc0) }
     when(retire1) { driveCommit(1, p1, commitPc1) }
+    for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+      driveCommit(lane, retirePayloads(lane), commitPcs(lane))
+    }
     // Keep a meaningful restart point even when the ROB drains completely before a
     // later debug request arrives. Slot 1 is younger and therefore wins when it closes
     // a second macro in the same cycle.
     when(retire0 && p0.last) { debugLivePcReg := commitPc0 }
     when(retire1 && p1.last) { debugLivePcReg := commitPc1 }
+    for (lane <- 2 until retireWidth) when(retireLanes(lane) && retirePayloads(lane).last) {
+      debugLivePcReg := commitPcs(lane)
+    }
     // (A commit-time SYSTEM op READ commits its dst arch->pdst mapping at the trigger —
     // driven AFTER the exc unit is built, see `sysReadCommit` below, since the S=1
     // decision needs exc.ss.s.)
 
-    val retiredThisCycle = (retire1 ? U(2) | (retire0 ? U(1) | U(0))).resize(count.getWidth)
-    retirementWires(0).valid := retire0
-    retirementWires(0).payload := h0
-    retirementWires(1).valid := retire1
-    retirementWires(1).payload := h1
-    for (lane <- 2 until retirementWires.length) {
-      retirementWires(lane).valid := False
-      retirementWires(lane).payload := 0
+    val retiredThisCycle = UInt(count.getWidth bits)
+    retiredThisCycle := 0
+    for (lane <- 0 until retireWidth) when(retireLanes(lane)) { retiredThisCycle := lane + 1 }
+    for (lane <- retirementWires.indices) {
+      retirementWires(lane).valid := (if (lane < retireWidth) retireLanes(lane) else False)
+      retirementWires(lane).payload := (if (lane < retireWidth) retireIds(lane) else U(0, robIdW bits))
     }
 
     // ── Passive alloc interface (driven by DispatchPlugin) ──────────────────────
@@ -2025,8 +2061,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
                     (alloc1 && (sysCapTag(k) === (tail + 1)))
       // The tagged entry retired normally (the FPCTRL_CAP case; a sysOp head never takes
       // retire0/retire1 — it leaves via `sysRetire` -> exception FSM -> flush).
-      val retired = (retire0 && (sysCapTag(k) === h0)) ||
-                    (retire1 && (sysCapTag(k) === h1))
+      val retired = retireLanes.zip(retireIds)
+        .map { case (r, id) => r && (sysCapTag(k) === id) }.reduce(_ || _)
       val take0 = sysCapTake0 && sysCapSel0(k)
       val take1 = sysCapTake1 && Mux(sysCapTake0, sysCapSel1(k), sysCapSel0(k))
       // `flushing` squashes the ENTIRE ROB (`tail := head; count := 0`), so every slot's
@@ -2177,7 +2213,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     }
 
     // ── Retire-side state update (head advance; validity is count-derived) ──────
-    head := head + Mux(retire1, U(2, robIdW bits), Mux(retire0, U(1, robIdW bits), U(0, robIdW bits)))
+    head := head + retiredThisCycle.resized
 
     // ── count update (alloc + retire) ──────────────────────────────────────────
     val countNext = count + allocThisCycle - retiredThisCycle
@@ -2346,8 +2382,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // future µop that reaches the branch EU without `isBranch`, or a relaxation of
     // `retire1`, reopens it with no other symptom. Sim-only, zero netlist cost.
     GenerationFlags.simulation {
-      assert(!(retire1 && phtValidStore(h1)),
-        "RobPlugin: a phtValid branch retired in slot 1 -- its gshare history bit was " +
+      for (lane <- 1 until retireWidth) assert(!(retireLanes(lane) && phtValidStore(retireIds(lane))),
+        "RobPlugin: a phtValid branch retired outside slot 0 -- its gshare history bit was " +
         "dropped (the single update port is slot-0 only), so ghrArch has silently " +
         "diverged from the speculative GHR and every commit-flush repair now installs " +
         "a history shifted by one bit", FAILURE)
@@ -2471,12 +2507,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // standalone ROB/exception unit tests don't drive ccrCompletion and don't check
     // the stacked CCR; the full-core wiring drives it from the EUs).
     val committedCcr = RegInit(U(0, 5 bits)); committedCcr.simPublic()
-    val ccrAfter0 = UInt(5 bits); ccrAfter0 := committedCcr
-    when(retire0 && nzvcWrStore(h0)) { ccrAfter0(3 downto 0) := nzvcValStore(h0) }
-    when(retire0 && xWrStore(h0))    { ccrAfter0(4)          := xValStore(h0) }
-    val ccrAfter1 = UInt(5 bits); ccrAfter1 := ccrAfter0
-    when(retire1 && nzvcWrStore(h1)) { ccrAfter1(3 downto 0) := nzvcValStore(h1) }
-    when(retire1 && xWrStore(h1))    { ccrAfter1(4)          := xValStore(h1) }
+    val ccrAfter = Vec.fill(retireWidth)(UInt(5 bits))
+    val ccrAfter0 = ccrAfter(0)
+    val ccrAfter1 = ccrAfter(1)
     // SAME-CYCLE FLAG BYPASS (2026-09-09, the "interrupt after a MOVE to memory restores the
     // handler's flags" defect). A store that completes through the StoreQueue's precise /
     // deferred path is marked complete by `sqCompletionPort` COMBINATIONALLY (LsEuPlugin's
@@ -2488,17 +2521,18 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // followed by an IRQ RTE'd with the handler's CCR; measured directly by the
     // `committedCcr shadow` test: the wbObs for the head fires in the retire cycle). Fold the
     // live port when it names the retiring head, same-cycle -- zero latency change.
-    for (c <- ccrCompletion) {
-      when(retire0 && c.valid && c.payload.robId === h0) {
-        when(c.payload.nzvcWrite) { ccrAfter0(3 downto 0) := c.payload.nzvc }
-        when(c.payload.xWrite)    { ccrAfter0(4)          := c.payload.x }
-      }
-      when(retire1 && c.valid && c.payload.robId === h1) {
-        when(c.payload.nzvcWrite) { ccrAfter1(3 downto 0) := c.payload.nzvc }
-        when(c.payload.xWrite)    { ccrAfter1(4)          := c.payload.x }
+    for (lane <- 0 until retireWidth) {
+      val id = retireIds(lane)
+      val after = ccrAfter(lane)
+      after := (if (lane == 0) committedCcr else ccrAfter(lane - 1))
+      when(retireLanes(lane) && nzvcWrStore(id)) { after(3 downto 0) := nzvcValStore(id) }
+      when(retireLanes(lane) && xWrStore(id)) { after(4) := xValStore(id) }
+      for (c <- ccrCompletion) when(retireLanes(lane) && c.valid && c.payload.robId === id) {
+        when(c.payload.nzvcWrite) { after(3 downto 0) := c.payload.nzvc }
+        when(c.payload.xWrite) { after(4) := c.payload.x }
       }
     }
-    committedCcr := ccrAfter1
+    committedCcr := ccrAfter.last
     // (MOVE-to-SR's absolute full-CCR write to committedCcr is applied AFTER the exc
     // unit is built — see `exc.obsSetCcr5Valid` override below.)
 
@@ -2598,8 +2632,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // must let that clear beat this set. (They cannot actually collide -- retirement is
     // blocked for the whole serializing episode -- so this is defence in depth.)
     if (fpuCtrl != null) {
-      when((rc.commitPorts(0).valid && rc.commitPorts(0).fpWrite) ||
-           (rc.commitPorts(1).valid && rc.commitPorts(1).fpWrite)) {
+      when(rc.commitPorts.map(c => c.valid && c.fpWrite).reduce(_ || _)) {
         fpuCtrl.setEverExecuted.valid   := True
         fpuCtrl.setEverExecuted.payload := True
       }
@@ -3180,7 +3213,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
                          Mux(branchRedirect, nextPcRd0,
                          Mux(debugBreakpointBoundaryHit, p0.pc,
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
-                         Mux(debugHaltState === DebugHaltState.STEP_RUNNING, debugStepRestartPc,
+                         Mux(debugNormalBoundaryHit || (debugHaltState === DebugHaltState.STEP_RUNNING), debugStepRestartPc,
                          Mux(count === 0, debugLivePcReg, p0.predNextPc))))))
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
@@ -3378,7 +3411,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // `headReady` (a new sysOp variant, a new FSM-driven commit, etc.) trips
     // immediately here instead of silently leaking a physical register.
     GenerationFlags.simulation {
-      assert(!(flushing && (rc.commitPorts(0).valid || rc.commitPorts(1).valid)),
+      assert(!(flushing && rc.commitPorts.map(_.valid).reduce(_ || _)),
         "RobPlugin: a commitPorts.valid was presented while flushing was asserted -- " +
         "the corresponding Freelist push would be silently dropped by its !io.flush gate",
         FAILURE)
@@ -3447,7 +3480,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // `GenerationFlags.simulation` block -- which is already true of its sole
     // consumer above.
     val commitObs = GenerationFlags.simulation {
-      val obs = Vec(CommitObs(), 3); obs.simPublic()
+      // Preserve channel 2 for existing exception-only observers (e.g. IACK).
+      // Ordinary observers use ordinaryCommitObs below, including lanes 2/3.
+      val obs = Vec(CommitObs(), retireWidth + 1); obs.simPublic()
       obs(0).fire := RegNext(retire0) init False; obs(0).robId := RegNext(h0); obs(0).pc := RegNext(commitPc0)
       obs(0).sysByte := RegNext(exc.ss.srSys); obs(0).a7 := RegNext(exc.ss.a7); obs(0).isInterrupt := False
       obs(0).ccrFold := 0; obs(0).ccrFoldValid := False
@@ -3458,6 +3493,15 @@ class RobPlugin(val detailedPerf: Boolean = false,
       obs(1).ccrFold := 0; obs(1).ccrFoldValid := False
       obs(1).setCcr5 := 0; obs(1).setCcr5Valid := False
       obs(1).macroLast := RegNext(p1.last) init False
+      for (lane <- 2 until retireWidth) {
+        val o = obs(lane + 1)
+        o.fire := RegNext(retireLanes(lane)) init False
+        o.robId := RegNext(retireIds(lane)); o.pc := RegNext(commitPcs(lane))
+        o.sysByte := RegNext(exc.ss.srSys); o.a7 := RegNext(exc.ss.a7)
+        o.isInterrupt := False; o.ccrFold := 0; o.ccrFoldValid := False
+        o.setCcr5 := 0; o.setCcr5Valid := False
+        o.macroLast := RegNext(retirePayloads(lane).last) init False
+      }
       // Exception / RTE commit (handler-entry or restored PC + post-event sysByte/A7).
       // For a FAULT entry where the faulting head wrote flags (CHK), carry its NZVC fold
       // so the whitebox folds it (the faulting µop's Wb never retires normally).
@@ -3477,6 +3521,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // a cracked macro's trailing µop -- the whitebox never consults macroLast there.
       obs(2).macroLast := True
       obs
+    }
+    val ordinaryCommitObs = GenerationFlags.simulation {
+      (0 until retireWidth).map(lane => commitObs(if (lane < 2) lane else lane + 1))
     }
 
     // ── A7-ODD TRIPWIRE (2026-09-09, the p164 odd-SSP boot defect) ──────────────────
@@ -3511,6 +3558,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val last1    = Reg(UInt(32 bits)) init 0
       when(retire0 && retire1) { last0 := p1.pc; last1 := p0.pc }
         .elsewhen(retire0)     { last0 := p0.pc; last1 := last0 }
+      for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+        last0 := retirePayloads(lane).pc; last1 := retirePayloads(lane - 1).pc
+      }
       val pcNow    = Mux(retire1, p1.pc, Mux(retire0, p0.pc, U(0, 32 bits)))
       val run      = Reg(UInt(16 bits)) init 0
       when(!odd) { run := 0 }
@@ -3555,6 +3605,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val last1    = Reg(UInt(32 bits)) init 0
       when(retire0 && retire1) { last0 := p1.pc; last1 := p0.pc }
         .elsewhen(retire0)     { last0 := p0.pc; last1 := last0 }
+      for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+        last0 := retirePayloads(lane).pc; last1 := retirePayloads(lane - 1).pc
+      }
       val pc0      = Reg(UInt(32 bits)) init 0
       val pc1      = Reg(UInt(32 bits)) init 0
       val pc2      = Reg(UInt(32 bits)) init 0
@@ -3590,6 +3643,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
         for (i <- 7 downto 1) { ringPc(i) := ringPc(i - 1); ringX(i) := ringX(i - 1) }
         ringPc(0) := p0.pc; ringX(0) := False
       }
+      for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+        for (i <- 7 to (lane + 1) by -1) {
+          ringPc(i) := ringPc(i - lane - 1); ringX(i) := ringX(i - lane - 1)
+        }
+        for (i <- 0 to lane) { ringPc(i) := retirePayloads(lane - i).pc; ringX(i) := False }
+      }
       when(exc.obsFire) {
         for (i <- 7 downto 1) { ringPc(i) := ringPc(i - 1); ringX(i) := ringX(i - 1) }
         ringPc(0) := exc.obsPc; ringX(0) := True
@@ -3607,6 +3666,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
         traceN := traceN + 1
         report(Seq("[A7-TRACE] cyc=", cyc, " retire pc0=", p0.pc, " r0=", retire0, " pc1=", p1.pc, " r1=", retire1,
                    " excObs=", exc.obsFire, " excPc=", exc.obsPc, " a7=", a7))
+        for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
+          report(Seq(s"[A7-TRACE] extra lane $lane pc=", retirePayloads(lane).pc))
+        }
       }
       when((odd || oddPrev) && (a7 =/= a7Prev) && traceN < 6000) {
         report(Seq("[A7-TRACE] cyc=", cyc, " A7 ", a7Prev, " -> ", a7, " srSys=", exc.ss.srSys))

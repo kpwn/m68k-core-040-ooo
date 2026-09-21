@@ -1,6 +1,6 @@
 # Retirement bandwidth experiments
 
-Status: implementing prerequisites for the four-wide control experiment in
+Status: optional four-wide control experiment implemented and simulated for
 [proposal 1](ipc-design-options.md). Production retirement remains two-wide.
 This amendment permits an explicit two- or four-lane rename commit interface;
 it does not authorize a ROB head advance without the corresponding side effects.
@@ -64,8 +64,16 @@ microbenchmarks cannot validate this.
 
 Production and test backend wiring must use an explicit ROB-owned service for
 new lane events, rather than adding more cross-plugin reads of `rob.logic`.
-The present ROB rejects a four-lane rename interface at elaboration until these
-consumers and precise boundary rules are implemented together.
+The lane count comes from the rename service. Upper lanes accept ordinary,
+completed, non-faulting entries only; branches remain on the existing training
+path, and system/privileged/RTE entries cannot occupy upper lanes. Armed debug
+stops, stepping and trace preserve the original two-lane boundary path. Normal
+macro counts, committed state and observations include all selected lanes.
+Manual stop detection must include a macro ending in the second lane, not just
+at the head. The restart PC is that completed macro's next PC. A marked
+breakpoint may not retire in any lane; older entries may finish before it stops.
+The optional two-lane detailed ILA format is not supported by the four-wide
+experiment; elaboration rejects that combination rather than truncating records.
 
 ## Retirement event service
 

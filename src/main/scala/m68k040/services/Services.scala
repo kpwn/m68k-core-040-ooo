@@ -59,8 +59,8 @@ trait SerializedMemoryContextService {
 
 /** ROB exposes; lock-step harness / sinks consume. Up to 2 retired instr/cycle. */
 trait CommitTraceService {
-  def trace:     Vec[CommitTrace]   // length 2
-  def traceFire: Vec[Bool]          // length 2
+  def trace:     Vec[CommitTrace]   // retirement width: 2 or 4
+  def traceFire: Vec[Bool]          // same length as trace
 }
 
 /** Produced by the redirect/flush owner (commit/branch); consumed by frontend. */
@@ -243,7 +243,7 @@ case class DebugExceptionEvent() extends Bundle {
   * after the entry sequencer has installed the handler PC and final architectural state.
   * PRODUCER: `RobPlugin` (exactly one). */
 trait DebugHistoryService {
-  def macroRetirePc: Vec[Flow[UInt]] // two program-ordered retire slots
+  def macroRetirePc: Vec[Flow[UInt]] // two or four program-ordered retire slots
   def branchRetire: Flow[DebugBranchEvent]
   def exceptionEntry: Flow[DebugExceptionEvent]
 }

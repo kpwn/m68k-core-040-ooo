@@ -19,9 +19,9 @@ import spinal.lib.misc.plugin.FiberPlugin
 class SynthProbePlugin extends FiberPlugin {
   val logic = during build new Area {
     val ct = host[CommitTraceService]
-    val traceOut = out(Vec.fill(2)(CommitTrace()))
-    val fireOut  = out(Vec.fill(2)(Bool()))
-    for (k <- 0 until 2) {
+    val traceOut = out(Vec.fill(ct.trace.length)(CommitTrace()))
+    val fireOut  = out(Vec.fill(ct.trace.length)(Bool()))
+    for (k <- ct.trace.indices) {
       traceOut(k) := RegNext(ct.trace(k))
       fireOut(k)  := RegNext(ct.traceFire(k)) init False
     }

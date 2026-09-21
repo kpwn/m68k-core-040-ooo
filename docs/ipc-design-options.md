@@ -85,17 +85,17 @@ eight-wide ports everywhere. Preserve every committed event under backpressure.
 **Experiment:** 2/4-wide matched runs, completed-prefix histogram, actual
 dispatch-blocked cycles saved, area and routed paths. **Priority: high as a control.**
 
-Implementation has started at the rename/commit boundary: optional four-lane
-committed-map updates and registered free records, still with two-wide allocation.
-The ROB remains two-wide and rejects that interface until the remaining consumers
-are adapted. See [the integration contract](retirement-bandwidth.md); there is
-no four-wide full-core IPC or timing result yet.
-
-The SQ and shared U/M queue interfaces now accept the extra same-edge notices
-through a ROB-owned service, with tested next-cycle flush survival and real
-DTLB-walker coverage. Upper notices remain idle in the two-wide core. Architectural
-state folding and full ROB/observation integration are still open; do not infer a
-wider-retirement result from these component tests.
+The actual four-wide control now runs in the full-core simulation, with ordered
+map/free, SQ and owned U/M authorization, CCR/PC/system/FP updates and lossless
+observations. See [the integration contract](retirement-bandwidth.md) and
+[matched results](ipc-experiments.md#four-wide-retirement-full-core-control--2026-09-21).
+Production remains two-wide. With the improved LSU/predictor, the long backlog
+window retires four entries on 336 cycles but takes the same 2,240 cycles as the
+two-wide control. Short backlog improves 380→376 cycles and call/return improves
+1,174→1,173; the other windows are unchanged. Without the predictor improvements,
+the long backlog regresses badly with increased misses. **Lower priority as an
+optimization; retain as the measured control for prepared retirement.** There is
+no four-wide routed timing or board result.
 
 ### 2. Pipelined retirement lookahead and eligibility certificates
 

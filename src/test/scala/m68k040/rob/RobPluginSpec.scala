@@ -29,13 +29,13 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ── Simple DUT: fake rename source + rob + fake commit sink + trace sink ──────
-  class SimpleDut(pairCorrectBranch: Boolean = false) extends Component {
+  class SimpleDut(pairCorrectBranch: Boolean = false, retireWidth: Int = 2) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
     val drv  = new RobAllocDriverPlugin
     val rob  = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
-    val csink = new RenameCommitSinkPlugin
+    val csink = new RenameCommitSinkPlugin(retireWidth)
     val tsink = new CommitTraceSinkPlugin
     val cacheCtrl = new CacheControlSinkPlugin
     val dsink = new DebugCommitSinkPlugin
@@ -124,6 +124,151 @@ class RobPluginSpec extends AnyFunSuite {
   def waitUntil(cd: ClockDomain, cond: => Boolean, max: Int = 200): Unit = {
     var n = 0
     while (!cond) { assert(n < max, "waitUntil timed out"); n += 1; cd.waitSampling() }
+  }
+
+  test("four-wide retirement publishes only the safe prefix at every barrier lane", VerilatorTest) {
+    val compiled = M68kSim().withVerilator.compile(new SimpleDut(retireWidth = 4))
+    for (kind <- Seq("incomplete", "fault", "branch", "privileged", "system", "rte", "breakpoint");
+         barrier <- 0 until 4) {
+      compiled.doSim(s"wide_${kind}_$barrier") { dut =>
+        val cd = dut.clockDomain; cd.forkStimulus(10)
+        initSimple(dut, cd)
+        for (pair <- 0 until 2) {
+          for (slot <- 0 until 2) {
+            val lane = pair * 2 + slot
+            val u = dut.rsrc.logic.src.payload(slot)
+            pokeRu(u, pc = 0x100 + lane * 2, dstArch = lane, pdst = 20 + lane,
+              pdstValid = true, pdstOld = lane, firstOfInstr = true,
+              isBranch = lane == barrier && kind == "branch",
+              debugBreakValid = lane == barrier && kind == "breakpoint")
+            if (lane == barrier) kind match {
+              case "fault" => u.faulted #= true; u.faultVector #= 4
+              case "privileged" => u.needsSupervisor #= true
+              case "system" => u.sysOp #= true
+              case "rte" => u.isRte #= true
+              case _ =>
+            }
+          }
+          dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+          cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+          dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+          cd.waitSampling()
+        }
+        for (id <- 3 to 0 by -1 if !(kind == "incomplete" && id == barrier)) {
+          markComplete(dut, id); cd.waitSampling(); clearComplete(dut)
+        }
+        sleep(1)
+        // A privileged ordinary instruction is legal at the supervisor head;
+        // branches similarly retire alone there. Both must block an upper lane.
+        val expected = if (barrier == 0 && kind == "branch") 1
+          else if (barrier == 0 && kind == "privileged") 4 else barrier
+        val fired = dut.rob.logic.retireLanes.map(_.toBoolean)
+        assert(fired == (0 until 4).map(_ < expected), s"$kind at $barrier: $fired")
+        for (lane <- 0 until expected) {
+          assert(dut.csink.logic.commitValidOut(lane).toBoolean)
+          assert(dut.csink.logic.commitArchOut(lane).toInt == lane)
+          assert(dut.tsink.logic.retirement.get(lane).payload.toInt == lane)
+        }
+        if (kind == "breakpoint") {
+          waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
+          assert(dut.dsink.logic.macroCountOut.toBigInt == barrier)
+          assert(dut.dsink.logic.livePcOut.toLong == 0x100 + barrier * 2)
+          assert(dut.rob.logic.count.toInt == 0)
+        }
+      }
+    }
+  }
+
+  test("four-wide debug stops preserve every macro boundary", VerilatorTest) {
+    for (width <- Seq(2, 4)) {
+      val compiled = M68kSim().withVerilator.compile(new SimpleDut(retireWidth = width))
+      for (kind <- Seq("manual", "halt-after"); lastLane <- 0 until 4) {
+        compiled.doSim(s"wide_${kind}_last_$lastLane") { dut =>
+          val cd = dut.clockDomain; cd.forkStimulus(10)
+          initSimple(dut, cd)
+          for (pair <- 0 until 2) {
+            for (slot <- 0 until 2) {
+              val lane = pair * 2 + slot
+              pokeRu(dut.rsrc.logic.src.payload(slot),
+                pc = if (lane <= lastLane) 0x100 else 0x200,
+                firstOfInstr = lane == 0 || lane == lastLane + 1,
+                lastOfInstr = lane == lastLane || lane == 3)
+            }
+            dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+            cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+            dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+            cd.waitSampling()
+          }
+          if (kind == "manual") dut.rob.logic.debugStopRequestIn #= true
+          else {
+            dut.rob.logic.haltAfterTargetIn #= 1
+            dut.rob.logic.haltAfterEpochIn #= 1
+            dut.rob.logic.haltAfterArmedIn #= true
+          }
+          cd.waitSampling(4)
+          for (lane <- 3 to 0 by -1) {
+            markComplete(dut, lane); cd.waitSampling(); clearComplete(dut)
+          }
+          waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
+          assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
+          assert(dut.dsink.logic.livePcOut.toLong == 0x102)
+          assert(dut.rob.logic.count.toInt == 0)
+        }
+      }
+    }
+  }
+
+  test("four-wide retirement wraps the ROB and preserves macro count and youngest PC", VerilatorTest) {
+    M68kSim().withVerilator.compile(new SimpleDut(retireWidth = 4)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      var macros = 0
+      for (batch <- 0 until 20) {
+        val baseId = dut.rob.logic.head.toInt
+        for (pair <- 0 until 2) {
+          for (slot <- 0 until 2) {
+            val lane = pair * 2 + slot
+            pokeRu(dut.rsrc.logic.src.payload(slot), pc = 0x100 + 8 * batch + 2 * lane,
+              dstArch = lane, pdst = 20 + lane, pdstValid = true, pdstOld = lane,
+              firstOfInstr = true, lastOfInstr = lane % 2 == batch % 2)
+            val u = dut.rsrc.logic.src.payload(slot)
+            u.pFpDstValid #= true; u.fpDstArch #= lane
+            u.pFpDst #= 8 + lane; u.pFpOld #= lane
+            u.writesFpcc #= true; u.pFpccDst #= 8 + lane; u.pFpccOld #= lane
+          }
+          dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+          cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+          dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+          cd.waitSampling()
+        }
+        for (lane <- 3 to 0 by -1) {
+          markComplete(dut, (baseId + lane) % 32); cd.waitSampling(); clearComplete(dut)
+        }
+        sleep(1)
+        assert(dut.rob.logic.retireLanes.forall(_.toBoolean), s"batch $batch did not retire four")
+        assert(dut.rob.logic.debugMacroCountInc.toInt == 2)
+        for (lane <- 0 until 4) {
+          assert(dut.tsink.logic.retirement.get(lane).valid.toBoolean)
+          assert(dut.tsink.logic.retirement.get(lane).payload.toInt == (baseId + lane) % 32)
+          assert(dut.tsink.logic.traceOut(lane).pc.toLong == 0x102 + 8 * batch + 2 * lane)
+          assert(dut.csink.logic.commitFpWrOut(lane).toBoolean)
+          assert(dut.csink.logic.commitFpArchOut(lane).toInt == lane)
+          assert(dut.csink.logic.commitFpNewOut(lane).toInt == 8 + lane)
+          assert(dut.csink.logic.commitFpOldOut(lane).toInt == lane)
+          assert(dut.csink.logic.commitFpccWrOut(lane).toBoolean)
+          assert(dut.csink.logic.commitFpccNewOut(lane).toInt == 8 + lane)
+          assert(dut.csink.logic.commitFpccOldOut(lane).toInt == lane)
+        }
+        cd.waitSampling(); sleep(1); macros += 2
+        assert(dut.rob.logic.count.toInt == 0)
+        assert(dut.rob.logic.head.toInt == (baseId + 4) % 32)
+        assert(dut.rob.logic.debugMacroCountReg.toBigInt == macros)
+        assert(dut.rob.logic.debugLastPcReg.toLong == 0x106 + 8 * batch)
+        val lastMacroLane = if (batch % 2 == 0) 2 else 3
+        assert(dut.rob.logic.debugLivePcReg.toLong == 0x102 + 8 * batch + 2 * lastMacroLane)
+        assert(dut.rob.logic.ordinaryCommitObs.forall(_.fire.toBoolean))
+      }
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────

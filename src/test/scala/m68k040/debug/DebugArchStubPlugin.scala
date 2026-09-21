@@ -96,12 +96,12 @@ class DebugMemoryStubPlugin extends FiberPlugin with DebugMemoryService {
   override def request(cmd: spinal.lib.Flow[DebugMemoryCommand]): Unit = cmdWire := cmd
 }
 
-class DebugHistoryStubPlugin extends FiberPlugin with DebugHistoryService {
+class DebugHistoryStubPlugin(retireWidth: Int = 2) extends FiberPlugin with DebugHistoryService {
   val logic = during build new Area {
-    val pcValid = in(Vec.fill(2)(Bool()))
-    val pc = in(Vec.fill(2)(UInt(32 bits)))
-    val macroPc = Vec.fill(2)(spinal.lib.Flow(UInt(32 bits)))
-    for (i <- 0 until 2) { macroPc(i).valid := pcValid(i); macroPc(i).payload := pc(i) }
+    val pcValid = in(Vec.fill(retireWidth)(Bool()))
+    val pc = in(Vec.fill(retireWidth)(UInt(32 bits)))
+    val macroPc = Vec.fill(retireWidth)(spinal.lib.Flow(UInt(32 bits)))
+    for (i <- 0 until retireWidth) { macroPc(i).valid := pcValid(i); macroPc(i).payload := pc(i) }
 
     val branchValid = in(Bool())
     val branchPc = in(UInt(32 bits)); val branchNextPc = in(UInt(32 bits))

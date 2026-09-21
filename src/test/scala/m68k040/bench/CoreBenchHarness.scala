@@ -372,7 +372,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       deferTakenSlot1Conditional = deferTakenSlot1Conditional)
     val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
       fuseLongMoveLoads = fuseLongMoveLoads)
-    val ren    = new RenameStage
+    val ren    = new RenameStage(retireWidth = sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2))
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress)
@@ -885,13 +885,13 @@ trait CoreBenchHarness extends AnyFunSuite {
 
         // Count MACRO commits this cycle from the two normal commit ports.
         if (flushPendingCycle >= 0 && telemCycle > flushPendingCycle &&
-            (0 until 2).exists(dut.rob.logic.commitObs(_).fire.toBoolean)) {
+            dut.rob.logic.ordinaryCommitObs.exists(_.fire.toBoolean)) {
           flushToCommit += (telemCycle - flushPendingCycle).toInt
           flushPendingCycle = -1L
         }
         val emittedBefore = handle.emitted
-        for (kk <- 0 until 2) {
-          val c = dut.rob.logic.commitObs(kk)
+        for (kk <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val c = dut.rob.logic.ordinaryCommitObs(kk)
           if (c.fire.toBoolean) {
             val id = c.robId.toInt
             val slotEmittedBefore = handle.emitted
@@ -913,7 +913,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           }
         }
         if (k.profileRetirement) {
-          val obsRetires = (0 until 2).count(dut.rob.logic.commitObs(_).fire.toBoolean)
+          val obsRetires = dut.rob.logic.ordinaryCommitObs.count(_.fire.toBoolean)
           assert(obsRetires == precedingRobCycle.retires,
             "ROB pressure and registered commit observations differ by more than one sampling edge")
           assert(!dut.rob.logic.debugBranchRetire.valid.toBoolean ||
@@ -928,8 +928,7 @@ trait CoreBenchHarness extends AnyFunSuite {
           val occupancy = rob.count.toInt
           val head = rob.head.toInt
           val complete = (0 until occupancy).map(i => rob.completes((head + i) % rob.depth).toBoolean)
-          val rawRetires = (if (rob.retire0.toBoolean) 1 else 0) +
-            (if (rob.retire1.toBoolean) 1 else 0)
+          val rawRetires = rob.retireLanes.count(_.toBoolean)
           precedingRetiredBranch = if (rob.retire0.toBoolean && rob.p0.retireAlone.toBoolean) {
             val b = branchCompletions.getOrElse(head,
               fail(s"retiring branch at ROB $head without its completion metadata"))
