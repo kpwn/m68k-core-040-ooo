@@ -1858,7 +1858,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
           installWay    := mshrWay(pfInstallMshr)
           missPC        := mshrPa(pfInstallMshr)
           missCacheable := True
-          commitBeat    := U(0, 1 bits)
+          // commitBeat is already zero outside PREDECODE. Do not put this
+          // fetch/translation-dependent install-start condition on its D input.
           predIsPfReg   := True
           goto(INSTALL_ARM)
         }
@@ -2787,9 +2788,16 @@ class IcachePlugin extends FiberPlugin with FetchService {
           }
         }
       }
+      // Exactly two consecutive PREDECODE cycles: this one-bit counter wraps
+      // back to zero as the FSM exits, for both demand and speculative installs.
+      // No install-start clear is needed; reset still initializes it to zero.
       commitBeat := commitBeat + 1
-      when(!isLoBeat) {
-        commitBeat := U(0, 1 bits)   // reset for the NEXT fill's predecode dwell
+    }
+
+    GenerationFlags.simulation {
+      when(!predActive) {
+        assert(commitBeat === U(0, 1 bits),
+          "I-cache install phase must be zero outside the two-beat PREDECODE dwell")
       }
     }
 

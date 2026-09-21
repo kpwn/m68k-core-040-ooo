@@ -1426,7 +1426,7 @@ class IcachePrefetchSpec extends AnyFunSuite {
   // mirrors the check in the testbench, so the property is asserted from two
   // independent places (RTL `assert` and Scala), not one.
   test("M2b: missPC is immutable across the whole PREDECODE dwell", VerilatorTest) {
-    simConfig.compile(new Dut).doSim("m2b-misspc-immutable") { dut =>
+    simConfig.compile(new Dut).doSim("m2b-misspc-immutable", seed = 559387700) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       IcacheSim.attachMemory(dut.icache.logic.axi, cd, base = 0L, size = 0x10000)
@@ -1440,7 +1440,21 @@ class IcachePrefetchSpec extends AnyFunSuite {
       var lockedCycles = 0
       var prevMissPc   = BigInt(-1)
       var prevLocked   = false
+      var expectedCommitBeat = 0
+      var demandCommitBeats = 0
+      var prefetchCommitBeats = 0
       cd.onSamplings {
+        val predActive = dut.icache.logic.predActive.toBoolean
+        val commitBeat = dut.icache.logic.commitBeat.toInt
+        assert(commitBeat == expectedCommitBeat,
+          s"install phase changed outside its two-beat dwell: expected=$expectedCommitBeat actual=$commitBeat")
+        if (predActive) {
+          if (dut.icache.logic.predIsPf.toBoolean) prefetchCommitBeats += 1
+          else demandCommitBeats += 1
+          expectedCommitBeat ^= 1
+        } else {
+          assert(commitBeat == 0, "idle installer retained a partial beat")
+        }
         val locked = dut.icache.logic.dbgMissPcLocked.toBoolean
         val pc     = dut.icache.logic.missPC.toBigInt
         if (locked) {
@@ -1480,6 +1494,10 @@ class IcachePrefetchSpec extends AnyFunSuite {
       assert(lockedCycles >= 100,
         s"the missPC-immutability assertion covered only $lockedCycles cycles -- its " +
         s"guard has collapsed and it is now passing vacuously")
+      assert(demandCommitBeats >= 2 && prefetchCommitBeats >= 2,
+        s"both install modes must be covered: demand=$demandCommitBeats prefetch=$prefetchCommitBeats")
+      assert(expectedCommitBeat == 0, "test ended during a partial install")
+      println(s"ICACHE_COMMIT_PHASE demand=$demandCommitBeats prefetch=$prefetchCommitBeats locked=$lockedCycles")
     }
   }
 
