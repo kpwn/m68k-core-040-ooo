@@ -1045,7 +1045,7 @@ broader SQ and split-SQ regressions pass **36 tests**, including the two new
 reservation tests (`/tmp/sq-reserve-regression.log`). Use
 `IPC_RESERVE_LATE_STORE=1`, `LOCKSTEP_RESERVE_LATE_STORE=1`, or
 `--reserve-late-store`, together with early store address execution. Production
-defaults remain off; no route or board improvement is claimed yet.
+defaults remain off; no board improvement is claimed.
 
 Implementation: `6d8a7a7de491f1e9a10ff74dabc33e67a2411571`. Unit
 `m68k-sq-reserve-6d8a7a7d.service` queues matched core routing behind direct-load
@@ -1055,7 +1055,16 @@ and direct long MOVE loads; only the candidate enables late-store SQ reservation
 Thus the baseline also gates the previously untimed fusion/early-store combination.
 Artifacts: `/tmp/sq-reserve-gate.sU6Lpv`; the existing `build-logs:0` pane follows
 both elaboration and implementation logs. This queue does not stall the next IPC
-experiment, and no timing result is available yet.
+experiment.
+
+Completed routing: the combined baseline misses setup at **−0.169 ns**
+(TNS −19.043 ns, 278 endpoints); the reserved candidate meets **+0.050 ns**
+setup, **+0.010 ns** hold and **+1.958 ns** pulse width, zero failing endpoints.
+Routed LUTs are 93,618 → 94,078, FFs 38,762 → 38,779, BRAM tiles 37 → 37.
+This qualifies the pinned reservation combination at core-only 200 MHz; it does
+not establish that reservation alone repairs a specific critical path, nor
+qualify later detached/publication/retirement changes or the integrated SoC.
+The serial queue has advanced to the detached-owner comparison.
 
 Follow-on dependency experiment (now implemented below): move late-data ownership from P3 into
 the reserved SQ entry, reusing its stored address/data and adding only the source
@@ -1674,6 +1683,59 @@ Reproduction switches: `IPC_PREPARED_RETIRE=4|8|16`,
 `LOCKSTEP_PREPARED_RETIRE=4|8|16`, or `GenFullCoreSynthVerilog
 --prepared-retire-4|--prepared-retire-8|--prepared-retire-16`. Select only one
 retirement experiment; defaults remain ordinary two-wide.
+
+## Late store-data capture versus load issue — 2026-09-21
+
+Measured the unconditional `!lateDataCapture` issue interlock. Store-data capture
+uses `rdData`, whereas a plain load uses independent base/index ports. The trial
+allowed LOADs without source-B, auto-update, stack/CCR restore, alternate-space,
+supervisor, LEA or alias-store behavior to issue concurrently. It added no state
+or read port and did not change SQ ordering, translation or completion priority.
+The existing source-ready assertions remained, with a qualified issue-exclusion
+assertion and new assertions checking actual `rdData` ownership.
+
+Both arms enable direct long MOVE loads, early store address, SQ reservation,
+detached ownership and publication-edge forwarding. The corpus is the same
+17 kernels × two seeds (1/17) × four fall-through/early-wakeup combinations,
+with `l2:5:70`, first-to-last retired-macro windows and ordinary two-wide retirement.
+The telemetry-only baseline exactly reproduces all **136** macro/cycle tuples
+from `/tmp/sq-publish-candidate-ipc-v2.log`.
+
+**Result: 136 unchanged, zero improvements, zero regressions.** All macro counts
+match. In the load-fed store recurrence with early integer wakeup, the baseline
+has 55 eligible blocked-load edges per window. The candidate performs two actual
+capture/load overlaps, but remains **286 / 285 cycles for 130 macros** at seeds
+1 / 17, with or without aligned fall-through. Both retain 64 captures,
+reservations and publications, 61 publication-forward hits, and 60 owner-wait
+cycles coinciding with P4 occupancy. All other windows have no eligible overlaps.
+There are eight actual overlaps across the entire candidate corpus. An upstream
+issue opportunity does not translate into a saved end-to-end cycle here.
+
+Evidence: `/tmp/capture-overlap-{baseline,candidate}-ipc.log`; the scoped trial
+diff is `/tmp/capture-overlap-evaluated.patch`. Bench architectural end-value,
+address-order, reservation/publication and RTL assertion checks pass in both
+arms. This was an IPC screening experiment, **not** a completed full oracle or
+physical timing qualification. A drafted additional oracle test was withdrawn
+without being run when the candidate showed no IPC benefit; no coverage from
+that draft is claimed.
+
+Disposition: remove the functional option and its plumbing, preserving only
+simulation opportunity counters and data-port ownership assertions. No synthesis
+job is warranted for this zero-gain variant. Next attribute P4 forwarding/retry
+and completion-port conflicts: the retry path registers a fresh SQ answer before
+consuming it, while a detached store's completion has priority over a forwarded
+load. Removing that delay or announcing readiness earlier needs guaranteed
+completion availability, not merely SQ space. These are follow-up hypotheses,
+not measured improvements or permission to weaken precise exception ordering.
+
+The final restored-interlock rerun (`/tmp/capture-overlap-final-ipc.log`) passes
+and exactly reproduces all 136 baseline macro/cycle tuples and all three capture
+telemetry fields. A separate RTL audit identified proposal 17 in the alternatives
+ledger: selected-completion NZVC wakeup still lags the optional integer wakeup by
+one cycle. It is not implemented or measured in this experiment.
+The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes
+**387 tests**, two ignored, zero failed or aborted suites
+(`/tmp/capture-overlap-final-fast.log`). No board operation was performed.
 
 ## Next investigations requested — 2026-09-21
 

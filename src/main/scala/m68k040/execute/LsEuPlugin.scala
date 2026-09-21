@@ -682,6 +682,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
     // ---- S0: read operands ----
     val u0 = issuePort.payload.uop
+    // Observability for the evaluated (not retained) capture/issue overlap.
+    // These loads use separate base/index PRF ports, but overlapping capture did
+    // not improve the matched IPC corpus. See docs/ipc-experiments.md.
+    val captureLoadEligible = (u0.memOp === MemOp.LOAD) && !u0.psrcBValid &&
+      (u0.eaAuto === m68k040.decode.EaAuto.NONE) && !u0.stkPush && !u0.ccrRestore &&
+      !u0.altAddrSpace && !u0.needsSupervisor && !u0.leaAddr && !u0.movesAliasStore
     rdBase.addr := u0.psrcA
     rdData.addr := u0.psrcB
     // Address = base + disp. Absolute / PC-relative EAs carry NO base register
@@ -2969,6 +2975,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         when(capture) {
           assert(query.queryReady, "detached store source readiness revoked", FAILURE)
           assert(!issuePort.fire, "detached store capture collided with issue", FAILURE)
+          assert(rdData.addr === ctx.dataTag, "detached store lost ownership of its PRF data port", FAILURE)
         }
       }
       valid.simPublic(); captured.simPublic(); ctx.robId.simPublic()
@@ -3241,6 +3248,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         when(p3LateDataCapture) {
           assert(p.queryReady, "late store source readiness revoked before capture", FAILURE)
           assert(!issuePort.fire, "late store capture collided with a new data-port reader", FAILURE)
+          assert(rdData.addr === p3Front.lateDataTag, "P3 store lost ownership of its PRF data port", FAILURE)
         }
         when(issuePort.fire && p.issuePending) {
           assert(u0.memOp === MemOp.STORE && u0.psrcBValid && !u0.pdstValid &&
@@ -3577,6 +3585,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // before. A flush invalidates every unlaunched stage in one edge.
     val s1ToT   = s1Valid && tReady
     val s1Ready = !s1Valid || s1ToT
+    val captureIssueCandidate = issuePort.valid && s1Ready && !sqFlushSig && !excActive && lateDataCapture
+    val captureLoadOpportunity = captureIssueCandidate && captureLoadEligible
+    val captureLoadOverlap = captureLoadOpportunity && issuePort.ready
+    captureIssueCandidate.simPublic(); captureLoadOpportunity.simPublic(); captureLoadOverlap.simPublic()
     issuePort.ready := s1Ready && !sqFlushSig && !excActive && !lateDataCapture
 
     // Oldest-to-youngest valid updates, then accept-last replacements. Later writes

@@ -32,6 +32,30 @@ This removes the head-relative subtractors and avoids a wrapping age counter
 whose oldest live record could survive indefinitely. At eight entries the order
 state is 28 bits, not a duplicated full 64-bit relation matrix.
 
+### Controlled experiment: load issue during late store-data capture
+
+Disposition: evaluated and removed. All 136 matched macro/cycle counts were
+unchanged despite observed overlap; only opportunity counters and port-ownership
+assertions remain. The following describes the tested hypothesis, not enabled RTL.
+
+Measure the current blanket `!lateDataCapture` LSU issue interlock before
+changing it. The pending store owns only `rdData`; a load's base/index operands
+use independent ports. The initial optional overlap candidate is a LOAD with no
+source-B read, no auto-update, stack/CCR restore, alternate-space, privileged,
+LEA or alias-store behavior. Translation, permissions, SQ ordering and split
+handling still run through their existing stages. Do not add a read port,
+owner, memory-dependency prediction or wake promise.
+
+For this subset, `s1Data`/`storeData` and `storeNzvc` are unused: load completion
+uses returned load data and its flags; only STORE may allocate the SQ payload.
+All other incoming operations still wait on the capture edge. The existing
+store owner keeps exclusive control of `rdData` and publishes exactly once;
+flush/exception ownership veto both actions. Assert the overlap classification
+and check matched IPC, actual overlap count, source lifetimes, aliased forwarding,
+faults, redirects and full-SQ behavior. An observed blocked edge is an opportunity,
+not proof of a saved end-to-end cycle. Default behavior remains unchanged until
+the optional candidate earns functional, IPC and 200 MHz acceptance.
+
 ### Reservation-backed early store readiness
 
 Separate SQ capacity reservation from payload publication. Reserving a slot

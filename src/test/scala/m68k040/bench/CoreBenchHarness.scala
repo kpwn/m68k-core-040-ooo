@@ -522,7 +522,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       readyStoreAdmissions: Int = 0,
       pendingStoreOwnerWaits: Int = 0,
       ownerWaitWithP4Overlap: Int = 0,
-      ownerWaitWithSqFull: Int = 0
+      ownerWaitWithSqFull: Int = 0,
+      captureIssueCandidates: Int = 0,
+      captureLoadOpportunities: Int = 0,
+      captureLoadOverlaps: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -634,6 +637,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val publicationForwardHisto = ArrayBuffer.empty[Boolean]
       val readyAdmissionHisto = ArrayBuffer.empty[Boolean]
       val pendingOwnerWaitHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
+      val captureIssueHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val robHisto = ArrayBuffer.empty[RobCycle]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
@@ -978,6 +982,8 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.iq.logic.lsSkidValid.toBoolean))
         sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         lateStoreHisto += dut.lsEu.logic.lateDataCapture.toBoolean
+        captureIssueHisto += ((dut.lsEu.logic.captureIssueCandidate.toBoolean,
+          dut.lsEu.logic.captureLoadOpportunity.toBoolean, dut.lsEu.logic.captureLoadOverlap.toBoolean))
         reserveStoreHisto += ((dut.lsEu.logic.p3ReservationFire.toBoolean,
           dut.lsEu.logic.p3ReservedPublish.toBoolean,
           dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean))
@@ -1231,7 +1237,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         readyAdmissionHisto.slice(lo, hi + 1).count(identity),
         pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._1),
         pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._2),
-        pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._3))
+        pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._3),
+        captureIssueHisto.slice(lo, hi + 1).count(_._1),
+        captureIssueHisto.slice(lo, hi + 1).count(_._2),
+        captureIssueHisto.slice(lo, hi + 1).count(_._3))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")

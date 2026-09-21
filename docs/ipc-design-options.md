@@ -358,14 +358,17 @@ shortcut was removed. Ready-admission and overlapping owner/P4/full-SQ counters
 remain. In the load-fed recurrence every owner-wait cycle overlaps a forwarding
 stall; owner occupancy alone is not evidence that more slots would help.
 
-Next narrow audit: `issuePort.ready` blocks **all** new LSU issues on a late-data
+Completed narrow audit: `issuePort.ready` blocks **all** new LSU issues on a late-data
 capture edge, although base and index use separate PRF read ports from store
-data. Attribute actual blocked issues first, then test whether ordinary loads
-whose entire downstream path ignores the captured store-data operand can overlap
-that edge. Preserve the data-port exclusion for stores and every unproven cold or
-compound operation; assert the classification and source lifetime. This may remove
-an unnecessary interlock without another owner or PRF port, but is only a proposal
-and has no measured gain yet.
+data. The tested ordinary-load overlap saves no end-to-end cycles across 136
+matched windows, despite actual concurrent capture/issue. The functional option
+was removed; retain only opportunity counters and ownership assertions. The
+load-fed recurrence has 55 blocked-load opportunities in the baseline but just
+two overlaps in the candidate, with identical 286/285-cycle windows. Removing
+an upstream interlock is not enough when the downstream recurrence still waits.
+This rules out that simple change for the measured corpus, not every possible
+load/capture scheduling policy. Continue attribution of forwarding/retry latency
+and completion-port conflicts before adding an advance-wakeup guarantee.
 
 ### 14. Shorter resident L1D path without a long permission cone
 
@@ -560,6 +563,31 @@ queuing timing. This amendment authorizes the experiment, not acceptance.
 - **Moving hot execution to another clock / false-path constraints:** not a way to
   satisfy the 200 MHz requirement. Real multicycle interfaces need explicit
   protocols and throughput accounting; functional paths stay constrained.
+
+### 17. Wake LSU-produced condition-code dependents at selected completion
+
+The optional integer early-wakeup path already announces an irrevocably selected
+LSU result before its registered writeback, but `wakeupNzvcPort` still broadcasts
+only from `compValid && compNzvcWrite && !compIsFault`. Thus a MOVE-to-memory,
+flag-producing load or CCR-restore dependency may wait an extra cycle even when
+the winning completion and destination are already known. Audit the IQ's dynamic
+NZVC dependency clear and registered issue/operand capture before mirroring the
+integer guarantee for flags. This is a local RTL finding, not an IPC measurement.
+
+Use the existing wakeup service/port: no predictor, extra register-file port or
+speculative flag value. Cover front/back completion, detached stores and precise
+deferred replay; fault, orphan and flush paths must never announce a stale tag.
+Assert that each announcement exactly matches next-cycle valid NZVC writeback
+and destination, preserving same-cycle physical-tag allocation priority.
+Keep X/FPCC and unproven cold paths unchanged initially.
+
+**Experiment:** store→Scc/branch, load→branch and mixed data/flag recurrences,
+normal profile controls, strict CCR/exception/IRQ oracle comparisons. Attribute
+cycles waiting only for LS flags, and report accuracy separately from shorter
+branch-resolution latency. **Cost / timing repair:** the announcement adds a
+control fanout from selected completion into IQ dependency state; keep NZVC data
+registered and do not bypass arbitration. Compare routed paths if IPC improves.
+**Priority: high as a small, directly testable dependency-latency candidate.**
 
 ## BRAM-rich, fabric-limited implementation choices
 

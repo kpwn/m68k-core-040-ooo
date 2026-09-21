@@ -108,6 +108,7 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
+        assert(r.captureLoadOverlaps == 0, "capture exclusion allowed a load to issue")
         if(sys.env.get("IPC_FORWARD_ON_PUBLISH").contains("1") &&
           sys.env.get("IPC_DETACH_LATE_STORE").contains("1") && k.name.startsWith("short-store-"))
           assert(r.publicationForwards > 0, "recurrence did not use publication-edge forwarding")
@@ -134,7 +135,9 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
           s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds} " +
           s"detachedLoadOvertakes=${r.detachedLoadOvertakes} publicationForwards=${r.publicationForwards} " +
           s"readyAdmissions=${r.readyStoreAdmissions} ownerWaits=${r.pendingStoreOwnerWaits} " +
-          s"ownerWaitP4=${r.ownerWaitWithP4Overlap} ownerWaitSqFull=${r.ownerWaitWithSqFull}")
+          s"ownerWaitP4=${r.ownerWaitWithP4Overlap} ownerWaitSqFull=${r.ownerWaitWithSqFull} " +
+          s"captureCandidates=${r.captureIssueCandidates} captureLoadOpportunities=${r.captureLoadOpportunities} " +
+          s"captureLoadOverlaps=${r.captureLoadOverlaps}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +
