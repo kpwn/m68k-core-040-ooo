@@ -2764,3 +2764,30 @@ pane follows both SoC jobs. Post-build manifest checks require counters on,
 IPC ILA/SCSI trace off, 200 MHz core clock, and the retained debug access.
 Profile/source/reset checks pass; the unchanged CPU pin has its passing
 388-test fast gate. No auto-load, board reset or SPI/SD writes are queued.
+
+### Stop post-route optimization on closure — 2026-09-21
+
+User identified unnecessary passes after WNS +0.032 / WHS +0.008. Root cause:
+the setup-plateau `continue` preceded the setup-and-hold success check, so a
+hold-only improvement never reached the exit. Also, successful hold repair could
+be rejected for having less positive margin than the initial state. Both success
+checks now precede relative-gain/rollback decisions. Unclosed plateaus retain the
+bounded directive schedule; failed repairs still restore their checkpoint.
+
+`tools/test_post_route_exit.tcl` executes the actual Tcl control block against
+mock timing/tool calls, not a duplicated decision function. Twelve cases pass:
+already closed, hold-only closure, setup closure, smaller positive setup, zero
+slack, successful repair, unclosed setup/hold plateaus, failed-repair rollback,
+optimizer error, bounded exhaustion and final hold repair. Against the old flow
+the exact +0.032/−0.120→+0.032/+0.008 case fails, observing six optimizer calls
+instead of one (`/tmp/post-route-exit-before-fix.log`). The check is an `impl`
+prerequisite and runs during queued-build preflight as well.
+
+Stopped only the old reduced-debug 200 MHz controller while it waited in
+`flock`; no active Vivado run was stopped. Updated SoC pin
+`9048d47e6d9e3962f44083400e220caee9a9b6df`, same CPU/config, requeued as
+`m68k-ipc-v2-soc200-lean-r2.service`, same runner/logs/tmux. The running 100 MHz
+process had already parsed its old loop; it finished six passes with unchanged
+WNS +0.032 / WHS +0.008. Its final timing summary has zero setup/hold/pulse
+failures, WPWS 0.000. Remaining artifact/DRC/skew checks and programming are
+separate from this corrected loop exit.
