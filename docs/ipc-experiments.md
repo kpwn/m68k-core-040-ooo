@@ -2694,3 +2694,9 @@ timing/DRC and local ADB patch remain required before any load, which needs
 fresh permission. The Mac stays on build `6b10354a`; no SPI/SD writes or
 automatic programming are part of this job. Started/preflight is not routed
 timing acceptance or a completed bitstream.
+
+Preflight completed: socket generation reports `throughput-v2` with detailed
+perf; emitted RTL contains both postincrement detached context and next-ready
+qualification. Top-level/real-MIG lint, reset-pairing and synthesis-source checks
+all pass. Service is waiting on the active physical run's mutex, with the queued
+core controller parent stopped and its current arm still progressing.
