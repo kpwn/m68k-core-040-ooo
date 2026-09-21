@@ -2606,3 +2606,10 @@ The build agent stopped before sending the load, so root completed the already
 authorized volatile load. User asked to restart Dhrystone before matched counter
 windows. No post-load IPC claim yet. Proposals 19/20 and the subsequent IRQ
 boundary correction are not included in this older, deliberately pinned image.
+
+Post-load acquisition at 11:45 was invalidated: user clarified Dhrystone was
+not running. Do NOT compare `/tmp/ipc-dhrystone-after-candidate-20260921.log`
+or its matching CSV with the Dhrystone baseline, despite the raw script's
+incorrect `workload=user-confirmed` label. Correction is preserved in the
+matching `.INVALID.txt` sidecar. No CPU halt/reset; counters restored and lease
+released. A fresh uniquely named acquisition requires running confirmation.
