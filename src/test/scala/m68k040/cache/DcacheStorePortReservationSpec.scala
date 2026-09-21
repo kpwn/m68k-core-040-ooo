@@ -135,6 +135,8 @@ class DcacheStorePortReservationSpec extends AnyFunSuite {
     * measured from. */
   final class PipeTrace {
     val s2Cycles   = ArrayBuffer[(Int, Long)]()
+    val enabledReads = ArrayBuffer[(Int, Int)]()
+    var disabledNonzeroAddress = 0
     var gapOneFwd  = 0    // stS2UsesS3Line fired (the one-cycle-gap forward)
     var sameLineHold = 0  // stS1SameLineAsS3 fired (the two-cycle-gap hold)
     var advances   = 0
@@ -152,6 +154,9 @@ class DcacheStorePortReservationSpec extends AnyFunSuite {
       while (true) {
         cd.waitSampling(); sleep(1)
         t.cycles += 1
+        if (dut.dcache.logic.rdEn.toBoolean)
+          t.enabledReads += ((t.cycles, dut.dcache.logic.rdSet.toInt))
+        else if (dut.dcache.logic.rdSet.toInt != 0) t.disabledNonzeroAddress += 1
         if (dut.dcache.logic.stS2Valid.toBoolean)
           t.s2Cycles += ((t.cycles, dut.dcache.logic.stS2Payload.paddr.toLong))
         // `stS2UsesS3Line` is NOT qualified by `stS2Valid` in the RTL (it is only
@@ -244,6 +249,41 @@ class DcacheStorePortReservationSpec extends AnyFunSuite {
       assert(mem.peekByte(base + i) == memByte(base + i),
         f"untouched line byte +$i was corrupted by the RMW merge")
     t
+  }
+
+  for (demand <- Seq(false, true)) {
+    test(s"enabled RAM address trace stays deterministic across base-address cleanup: probeDemand=$demand",
+         VerilatorTest) {
+      sharedCompiled.doSim(seed = 0x5e7add) { dut =>
+        val (cd, mem) = initDut(dut)
+        val t = startTrace(dut, cd)
+        val bases = (0 until 12).map(i => 0xA120L + i * 0x30L)
+        for (base <- bases) {
+          preload(mem, base, 16)
+          load(dut, cd, base, Size.LONG, CacheMode.COPYBACK)
+        }
+        val stopDemand = if (demand) startProbeDemand(dut, cd) else () => ()
+        for ((base, index) <- bases.zipWithIndex) fireByteStore(dut, cd, base, 0x80 + index)
+        cd.waitSampling(40)
+        stopDemand()
+        for ((base, index) <- bases.zipWithIndex) {
+          maintPulse(dut, cd, push = true, invalidate = false, SCOPE_LINE, SEL_DC, base)
+          maintWait(dut, cd)
+          cd.waitSampling(3)
+          assert(mem.peekByte(base) == 0x80 + index)
+          assert(load(dut, cd, base, Size.BYTE, CacheMode.COPYBACK) == 0x80 + index)
+        }
+        cd.waitSampling(12)
+        assert(t.advances == bases.size && t.enabledReads.size > bases.size * 2,
+          "trace must exercise stores, loads and maintenance")
+        println(s"DCACHE_READ_PORT_TRACE demand=$demand cycles=${t.cycles} " +
+          s"advances=${t.advances} denials=${t.denials} reads=${t.enabledReads.mkString(",")} " +
+          s"stores=${t.s2Cycles.mkString(",")}")
+        // Deliberately excluded from the equivalence row: disabled-port addresses
+        // are allowed to change and cannot affect the synchronous memory outputs.
+        println(s"DCACHE_DISABLED_ADDRESS demand=$demand nonzero=${t.disabledNonzeroAddress}")
+      }
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
