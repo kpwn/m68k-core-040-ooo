@@ -426,3 +426,76 @@ The unchanged CPU cleanup worktree also passes the required fast gate again:
 390 passed, 2 ignored, zero failures (`/tmp/ipc-cleanup-l2-install-core-fast.log`).
 That core gate does not exercise the SoC RTL; the matched L2/chain tests above
 are the correctness and cycle evidence for this change.
+
+## Shared L2 merge input and integrated CSR+PRAM synthesis
+
+Separate SoC candidate `35bd9417976a6bfdf0c63e030bda96806a9c5737` in
+`ipc-v2-l2-shared-merge-cleanup` builds on the install-register removal. It
+selects primary/replay data, byte strobes and quadrant once before the four
+fixed merge lanes, instead of maintaining a primary and replay update arm
+for each lane. The write qualification remains exactly `!rst && !fill_err &&
+(S_SWR || (S_INSTALL && primary_write))`; S_SCAN's snapshot is mutually
+exclusive. No state, registers, interface cycles or queue capacity are added.
+
+The same 68 directed tests, five 100000-operation seeds, four CDC/MIG chain
+tests and streaming-write tables pass and match the original baseline's
+printed cycle/correctness results exactly. The independent registered install
+shadow remains enabled. Log: `/tmp/ipc-cleanup-l2-shared-merge-tests.log`.
+The queued OOC Tcl now compares three pinned arms: baseline, register removal,
+and shared merge. The third source pin/cleanliness is checked in Tcl; the
+first two are checked by its existing shell runner. The job was verified to
+be waiting solely on `flock` before its not-yet-loaded Tcl was updated.
+
+CSR+PRAM's completed integrated synthesis (not placement/routing) reports:
+
+| Metric | IQ/L2 | CSR+PRAM | Delta |
+|---|---:|---:|---:|
+| Whole-SoC LUTs | 157545 | 155363 | -2182 |
+| Whole-SoC FFs | 93292 | 91303 | -1989 |
+| RTC LUTs | 1705 | 194 | -1511 |
+| RTC FFs | 2210 | 146 | -2064 |
+| RTC RAMB18 | 0 | 1 | +1 |
+| CPU LUTs | 100326 | 102171 | +1845 |
+| PRAM SD hierarchy LUTs | 3220 | 836 | -2384 |
+
+These are the matching `report_utilization` synthesis reports, not the
+primitive census. Hierarchical mapping shifts substantially; do not attribute
+all whole-design changes to a local source edit or infer routed benefit from
+the totals. The new L2 register/shared-input variants are NOT in this build.
+
+## Debug CSR timing exceptions: acceptance blocker to audit
+
+Linking the CSR+PRAM netlist produced new `Constraints 18-401` warnings because
+the old `*rData_reg*` wildcard now also matches combinational cells. Examining
+the rules revealed a more important pre-existing issue: `fpga_top.xdc` gives
+four setup cycles / three hold cycles to CSR address sources and response
+sinks based only on the slow JTAG request rate. That does not match the RTL.
+`doRead` can capture regional words on the edge after AR acceptance, and
+`readStage2` captures rData on the immediately following edge. `doWrite` can
+apply on the edge after AW and W acceptance. Holding the address through a
+slow response does not move those FIRST capture edges. Existing
+`DebugCtrlReadDecodeSpec` tests the read schedule directly.
+
+SoC branch `fix/debug-csr-single-cycle-timing`, worktree
+`ipc-v2-debug-strict-timing`, commit `211a43f3e4059b39118756fec154fefc6bc1dc3c`,
+removes the four exceptions and documents the real schedule. It includes the
+two newly tested L2 variants but is not yet implemented. The running source
+and its existing reports remain unchanged for comparison. Do not accept a
+timing-closed claim based only on those old exceptions.
+
+`synth/debug_csr_timing_audit.tcl` opens an existing route read-only and overlays
+normal one-cycle setup / zero-cycle hold requirements on actual sequential
+address/response cells, retaining independent CDC rules. It emits original
+and strict timing, exception-precedence, and focused address/response setup
+and hold reports. Review those actual reports before claiming the overlay
+worked or that timing passes; Tcl mock tests cannot establish Vivado precedence.
+The Tcl test covers the four overlay commands, sequential filtering, missing
+register rejection and output preservation. The queued L2 OOC session will
+audit the loaded baseline and any available CSR+PRAM/IQ-L2 routed checkpoints
+after synthesis; missing routes or errors are reported explicitly. Outputs:
+`/tmp/ipc-cleanup-debug-timing-{baseline,csr_pram,iq_l2}`. No DCP/bitstream is
+overwritten and no board access occurs.
+The timing-audit Tcl mock test passes. The required CPU fast gate passed
+again after this work: 390 passed, 2 ignored, zero failures, in
+`/tmp/ipc-cleanup-shared-merge-core-fast.log`. This is not a substitute for
+the pending real Vivado timing audit or the separate matched SoC tests.
