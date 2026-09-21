@@ -2492,3 +2492,33 @@ The next gate compares the same four-context combined core with the postincremen
 option off/on; SoC sources and the live board are unchanged. A bounded
 `short-store-load-recurrence` trace is running after the completed validation
 sequence to resolve producer-data, publication, load completion and wakeup edges.
+
+Candidate committed as `80f408b224d7ddfbd5d5ddb3587b25a85bb20cf6`. Matched
+200 MHz gate queued as `m68k-auto-store-timing-gate.service`, artifacts
+`/tmp/auto-store-gate.DYMWvp`, after `m68k-ls-queued-turnover-gate.service`.
+Both arms use the same four-context profile with subword forwarding; only
+`--early-auto-store-address` differs. The global Vivado mutex remains in use.
+Queued is not synthesized, routed or signed off.
+
+The bounded recurrence trace passes all eight mode/seed runs
+(`/tmp/store-load-wake-trace.log`, 11:20:12 local). In the full combined mode,
+seed 1, it directly records this uncontended chain:
+
+| Cycle | Event |
+| ---: | --- |
+| 188 | Producer load selects integer wakeup for physical register 21 |
+| 189 | Producer load ROB 2 writes register 21 |
+| 190 | Reserved store ROB 3 publishes; dependent load ROB 4 sees publication-edge SQ hit |
+| 191 | Load ROB 4 selects completion and integer wakeup for register 22 |
+| 192 | Load ROB 4 writes register 22 |
+
+Thus a translated waiting load already announces readiness one cycle after SQ
+publication when completion is uncontended. This is two cycles after the store
+source's physical value becomes available, not a one-cycle total producer chain.
+The extra source-readiness cycle is visible in RTL: IQ's `queryReady` reads the
+registered dynamic busy maps, then the LSU registers `readyPrior` before using
+its existing PRF read port. Next experiment: qualify that register with the
+matching guaranteed producer wakeup as well as the already-ready map, preserving
+same-cycle PRF write/bypass, tag lifetime, read-port exclusion and squash safety.
+Do not remove the register or predict readiness without proving those contracts.
+This is a proposed follow-up, not part of `80f408b2` or the pinned SoC.
