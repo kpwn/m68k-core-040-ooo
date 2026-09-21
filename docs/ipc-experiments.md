@@ -2425,3 +2425,70 @@ next-cycle PRF write, not the original store's data-production event. The next
 experiment should distinguish producer-data→SQ-publication, publication→load
 completion, and load-completion→consumer-issue intervals; shortening one is not
 evidence that the entire chain is one cycle. No one-cycle implementation claim yet.
+
+### Sep 21: remove the postincrement-store admission restriction
+
+Baseline is `445a2f3d`, containing the exact decoder replay, paired board-loop IPC
+and passing 388-test fast gate. The pinned SoC build remains separate and unchanged.
+
+Bounded `IPC_LS_EVENTS=board-byte-copy` simulation traces now join LS issue PC/ROB
+identity, SQ reserve/publication, forwarding and completion. A short diagnostic
+run is selected by `IPC_BOARD_COPY_TRACE=1`; it does not replace the default full
+copy/readback matrix. Logs `/tmp/board-copy-ls-events.log` and
+`/tmp/board-copy-auto-store-probe.log`. Query hits are raw observations, not an
+accepted-load count; use `forwardComplete` for actual P4 completions.
+
+Important finding: previous combined steady iterations take 20 cycles and do
+not use SQ forwarding for the pointer loads. The intervening byte postincrement
+store waits for its source in IQ and blocks otherwise-ready younger loads;
+by the time they query the SQ, the pointer store has already drained. Thus simply
+speeding up an SQ-hit path would miss the main measured opportunity.
+
+Default-off `earlyAutoStoreAddress` admits ordinary postincrement MOVE stores
+once their address sources are ready. It extends the existing detached context
+by the precomputed An result, physical destination, architectural destination and
+valid bit (44 logical payload bits per context; not a routed area estimate).
+Integer/NZVC results still publish only at selected normal completion. No new
+PRF port, data array, early architectural update or second completion owner.
+The IQ classifier, LSU guards and design contract change together. Enable with
+`IPC_EARLY_AUTO_STORE=1`, `LOCKSTEP_EARLY_AUTO_STORE=1`, or core generator option
+`--early-auto-store-address`, alongside early store address/reserve/detach.
+The SoC throughput-v1 profile is deliberately unchanged.
+
+Matched full-core L2:5/DDR:70 results, same kernels and seeds as the previous
+combined profile (`/tmp/board-copy-ipc.log` versus
+`/tmp/board-copy-auto-store-full.log`):
+
+| Copy window | Macros | Previous cycles | Candidate cycles | IPC gain |
+| --- | ---: | ---: | ---: | ---: |
+| 32 bytes, seed 1 | 102 | 553 | 384 | 44.01% |
+| 32 bytes, seed 17 | 102 | 549 | 381 | 44.09% |
+| 128 bytes, seed 1 | 486 | 2871 | 2058 | 39.50% |
+| 128 bytes, seed 17 | 486 | 2868 | 2046 | 40.18% |
+
+The four paired readback cases improve 36.68–38.55%; all 16 full runs pass,
+including every copied byte, NUL and final source/destination pointers. The
+candidate observes 25/121 actual reservation/publication events in the respective
+steady windows, asserted nonzero by the benchmark. Baseline no-feature cycles
+are unchanged. The trace now shows 14-cycle steady iterations and real pointer
+SQ forwards. This is simulated board-derived code, not a new board measurement.
+
+The initial oracle run passed architectural state but failed final memory in
+the new A7 test: the independent final-memory oracle kept executing past the
+program with A7 pointing into the checked data page. Added an explicit stop loop
+and kept the same compared macro prefix and byte checks. Preserved failed log:
+`/tmp/auto-store-oracle-before-stop.log`. Rerun passes **29 selected oracle tests**
+(`/tmp/auto-store-oracle.log`), including 12 delayed postincrement captures in
+both cacheable and precise modes; copyback reserves/publishes eight, precise
+mode reserves none. Byte/word/long, A0/A7 byte stride, line crossing, cancellation,
+write-protection, device ordering and IRQ/CCR cases are covered. No failure was
+waived. The broad 136-case IPC run passes with **all cycle counts identical** to
+`/tmp/irq-boundary-ipc.log` (`/tmp/auto-store-ipc.log`, completed 11:14:16 local).
+Its existing kernels do not expose this postincrement-store restriction; the
+unchanged 0.305209 aggregate must not be presented as the new copy-loop IPC.
+The mandatory fast gate passes **388 tests, two ignored, zero failures** at
+11:17:56 local (`/tmp/auto-store-fast.log`). Physical timing remains untested.
+The next gate compares the same four-context combined core with the postincrement
+option off/on; SoC sources and the live board are unchanged. A bounded
+`short-store-load-recurrence` trace is running after the completed validation
+sequence to resolve producer-data, publication, load completion and wakeup edges.

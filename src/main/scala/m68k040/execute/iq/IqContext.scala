@@ -105,7 +105,8 @@ case class IqHot() extends Bundle {
   /** Project the wide dispatch record onto the hot fields. The ONLY writer of an IqHot,
     * so the hot copy and the cold Mem row are written from the same source in the same
     * cycle and can never disagree. */
-  def assignFrom(ctx: IqContext, way: Bool): Unit = {
+  def assignFrom(ctx: IqContext, way: Bool): Unit = assignFrom(ctx, way, false)
+  def assignFrom(ctx: IqContext, way: Bool, earlyAutoStoreAddress: Boolean): Unit = {
     val u = ctx.uop
     psrcA := u.psrcA; psrcAValid := u.psrcAValid
     psrcB := u.psrcB; psrcBValid := u.psrcBValid
@@ -120,9 +121,11 @@ case class IqHot() extends Bundle {
     isAluSlow         := m68k040.decode.DecOp.isAluSlow(u.op)
     canEarlyStoreData := u.cluster === m68k040.isa.Cluster.LS &&
       u.memOp === m68k040.isa.MemOp.STORE && u.op === m68k040.decode.DecOp.MOVE &&
-      u.psrcBValid && !u.stkPush && u.eaAuto === m68k040.decode.EaAuto.NONE &&
+      u.psrcBValid && !u.stkPush &&
+      ((u.eaAuto === m68k040.decode.EaAuto.NONE && !u.pdstValid) ||
+        (Bool(earlyAutoStoreAddress) && u.eaAuto === m68k040.decode.EaAuto.POSTINC && u.pdstValid)) &&
       !u.movesAliasStore && !u.altAddrSpace && !u.needsSupervisor && !u.sysOp &&
-      !u.pdstValid && !u.leaAddr
+      !u.leaAddr
     srcBRegDespiteImm := (u.op === m68k040.decode.DecOp.PACK)     ||
                          (u.op === m68k040.decode.DecOp.UNPK)     ||
                          (u.op === m68k040.decode.DecOp.BITFIELD) ||

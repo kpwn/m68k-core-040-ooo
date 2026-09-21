@@ -44,8 +44,13 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
   }
 
   test("board byte-copy dependency shape compares baseline and combined socket options", VerilatorTest) {
-    val kernels = for (length <- Seq(32, 128); verify <- Seq(false, true)) yield copyKernel(length, verify)
+    val traceOnly = sys.env.get("IPC_BOARD_COPY_TRACE").contains("1")
+    val seeds = if (traceOnly) Seq(1) else Seq(1, 17)
+    val kernels = if (traceOnly) Seq(copyKernel(32, false)) else
+      for (length <- Seq(32, 128); verify <- Seq(false, true)) yield copyKernel(length, verify)
     val results = Seq(false, true).map { combined =>
+      val earlyAuto = combined && sys.env.get("IPC_EARLY_AUTO_STORE").contains("1")
+      println(s"BOARD_COPY_PROFILE combined=$combined earlyAuto=$earlyAuto traceOnly=$traceOnly")
       val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
         alignedLoadFallThrough = combined, earlyLsIntWakeup = combined,
         sqSubwordForwarding = combined, earlyStoreAddress = combined,
@@ -53,16 +58,19 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
         detachLateStore = combined, forwardOnPublish = combined,
         earlyLsNzvcWakeup = combined, detachedStoreEntries = if (combined) 4 else 1,
         trainSlot1Conditional = combined, deferTakenSlot1Conditional = combined,
-        retainRedirectHistory = combined))
-      (for (kernel <- kernels; seed <- Seq(1, 17)) yield {
+        retainRedirectHistory = combined, earlyAutoStoreAddress = earlyAuto))
+      (for (kernel <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, kernel, seed)
+        if (earlyAuto) assert(r.reservedStores > 0 && r.reservedPublishes > 0,
+          "postincrement-store benchmark never exercised reservation/publication")
         println(f"BOARD_COPY_IPC combined=$combined kernel=${kernel.name} seed=$seed " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f " +
-          s"branches=${r.pipelineProfile.get.retiredBranches} misses=${r.pipelineProfile.get.branchMisses} memory=$memLabel")
+          s"branches=${r.pipelineProfile.get.retiredBranches} misses=${r.pipelineProfile.get.branchMisses} " +
+          s"reserved=${r.reservedStores} published=${r.reservedPublishes} memory=$memLabel")
         (kernel.name, seed) -> r
       }).toMap
     }
-    for (kernel <- kernels; seed <- Seq(1, 17)) {
+    for (kernel <- kernels; seed <- seeds) {
       val before = results(0)((kernel.name, seed)); val after = results(1)((kernel.name, seed))
       assert(before.retiredInstrs == after.retiredInstrs)
       println(f"BOARD_COPY_GAIN kernel=${kernel.name} seed=$seed gain=${after.ipc / before.ipc - 1}%.6f")

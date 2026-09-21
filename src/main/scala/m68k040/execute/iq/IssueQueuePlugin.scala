@@ -84,8 +84,10 @@ object DynWait {
   val cplxFpccBits = Seq(FPCC)
 }
 
-class IssueQueuePlugin(val earlyStoreAddress: Boolean = false) extends FiberPlugin
+class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
+                       val earlyAutoStoreAddress: Boolean = false) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
+  require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
   override def lateStoreData = lateStorePorts
   val slotCount = 16
@@ -999,8 +1001,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false) extends FiberPlug
     // sharing structural instead of a duplicated pair that could drift.
     val pushUop0 = pushPort.payload(0).uop      // wide record: cold-Mem write data + sim taps only
     val pushUop1 = pushPort.payload(1).uop
-    val pushHot0 = IqHot(); pushHot0.assignFrom(pushPort.payload(0), way = False)
-    val pushHot1 = IqHot(); pushHot1.assignFrom(pushPort.payload(1), way = True)
+    val pushHot0 = IqHot(); pushHot0.assignFrom(pushPort.payload(0), way = False, earlyAutoStoreAddress = earlyAutoStoreAddress)
+    val pushHot1 = IqHot(); pushHot1.assignFrom(pushPort.payload(1), way = True, earlyAutoStoreAddress = earlyAutoStoreAddress)
     val push0IsAluSlow = isAluSlowProducer(pushHot0)
     val push1IsAluSlow = isAluSlowProducer(pushHot1)
     // debug-only (task #141 X-flag/scoreboard leak investigation)
@@ -1688,7 +1690,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false) extends FiberPlug
         fsCtx(slot1Prio) := pushPort.payload(1); fsWay(slot1Prio) := True
       }
       for (i <- 0 until slotCount) {
-        val proj = IqHot(); proj.assignFrom(fsCtx(i), fsWay(i))
+        val proj = IqHot(); proj.assignFrom(fsCtx(i), fsWay(i), earlyAutoStoreAddress)
         when(slots(i).sel) {
           assert(slots(i).hot === proj,
             s"IQ cold-split: slot $i narrow record diverged from the full-context shadow")

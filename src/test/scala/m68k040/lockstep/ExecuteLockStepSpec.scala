@@ -513,7 +513,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap)
-    val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
+    val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
+      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"))
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -525,7 +526,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
       forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
       earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
-      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1))
+      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
+      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -6083,6 +6085,56 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           s"publications=$publications completionHolds=$completionHolds readyAdmissions=$readyAdmissions")
       }
     }
+  }
+
+  test("lock-step: early postincrement stores preserve An, A7 byte stride, data and CCR", VerilatorTest) {
+    for (copyback <- Seq(false, true)) {
+      val setup = (if(copyback) Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+        "move.l #0x400FE020,%d7", "movec %d7,%itt0",
+        "move.l #0xC000,%d7", "movec %d7,%tc") else Nil) ++
+        (0 until 8).map(n => s"move.l #0,0x${(0x3000 + n * 4).toHexString}")
+      val body = for (an <- Seq("a0", "a7"); suffix <- Seq("b", "w", "l");
+                      offset <- Seq(0, 15)) yield
+        Seq(s"lea 0x${(0x3000 + offset).toHexString},%$an", "moveq #3,%d1",
+          "move.l #0x10000,%d0", "divu.w %d1,%d0", s"move.$suffix %d0,(%$an)+",
+          "seq %d5", s"move.l %$an,%d6", s"move.$suffix 0x${(0x3000 + offset).toHexString},%d4")
+      val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
+        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      var captures = 0; var reservations = 0; var publications = 0
+      val program = setup ++ body.flatten ++ evict
+      // A7 deliberately points into the checked data page. Stop explicitly:
+      // the oracle's final-memory run continues beyond the compared prefix,
+      // and falling into unmapped instructions would stack faults onto our data.
+      runLockStep(s"early-postinc-$copyback", program.mkString(" ; ") + " ; .LautoDone: bra.s .LautoDone",
+        nInstr = program.size,
+        checkMem = Seq(0x3000L, 0x3010L), checkSpan = 16, maxCycles = 100000,
+        perCycle = dut => {
+          if(dut.lsEu.logic.lateDataCapture.toBoolean) captures += 1
+          if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1
+          if(dut.lsEu.logic.p3ReservedPublish.toBoolean) publications += 1
+        })
+      if(sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1")) {
+        assert(captures > 0, "postincrement stores never captured late data")
+        assert(reservations == publications)
+        if(copyback) assert(reservations > 0) else assert(reservations == 0)
+      }
+      println(s"AUTO_STORE_ORACLE copyback=$copyback captures=$captures reservations=$reservations publications=$publications")
+    }
+  }
+
+  test("lock-step: early postincrement stores cancel their An update on redirect", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "lea 0x3000,%a0", "move.l #0x11223344,(%a0)", "moveq #3,%d1")
+    val body = (0 until 12).flatMap(n => Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
+      s"bne.w .LautoSkip$n", "move.l %d0,(%a0)+", s".LautoSkip$n: move.l %a0,%d4"))
+    var reservations = 0
+    runLockStep("early-postinc-squash", (setup ++ body).mkString(" ; "),
+      nInstr = setup.size + 12 * 4, maxCycles = 30000,
+      perCycle = dut => { if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1 },
+      afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x3000L))
+    if(sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"))
+      assert(reservations > 0, "wrong-path postincrement stores never reserved")
   }
 
   test("lock-step: late SQ reservation keeps youngest data across committed ROB generations", VerilatorTest) {

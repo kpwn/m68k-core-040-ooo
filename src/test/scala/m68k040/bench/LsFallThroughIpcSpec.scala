@@ -106,7 +106,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         detachLateStore = sys.env.get("IPC_DETACH_LATE_STORE").contains("1"),
         forwardOnPublish = sys.env.get("IPC_FORWARD_ON_PUBLISH").contains("1"),
         earlyLsNzvcWakeup = sys.env.get("IPC_LS_EARLY_NZVC").contains("1"),
-        detachedStoreEntries = sys.env.get("IPC_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1)))
+        detachedStoreEntries = sys.env.get("IPC_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
+        earlyAutoStoreAddress = sys.env.get("IPC_EARLY_AUTO_STORE").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)

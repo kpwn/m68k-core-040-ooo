@@ -117,6 +117,26 @@ entries participate. This uses the existing FIFO pointers, not another age table
 or counter. A future out-of-order SQ allocation policy must replace this rule
 explicitly; the current oldest-LS-address issue and reservation paths retain it.
 
+### Controlled extension: late-data postincrement stores
+
+The default-off `earlyAutoStoreAddress` experiment admits ordinary MOVE stores
+with `(An)+` addressing to the same early-address path. All non-data operands
+must be ready; translation, permission and cache mode resolve normally. No
+postincrement value is published merely because the SQ slot is reserved.
+Cacheable fast stores may detach only after reserving a real SQ entry. Extend
+that entry's existing completion context with its destination physical and
+architectural register and already-computed An result; publish the integer
+result and NZVC together through the existing arbitrated completion stage when
+store data is captured. Thus dependent loads may pass the *reserved* store,
+but consumers of the updated An still wait for its guaranteed completion.
+
+No extra PRF read/write port, store-data copy, memory-order table or new early
+wakeup promise. Precise/device/split/fault cases keep ordinary P3/deferred
+completion. Flush discards uncommitted context and SQ reservation together.
+Exclude predecrement, stack pushes, MOVES, alternate-space and privileged/system
+forms in this experiment. Test byte copies including NUL, final An values,
+postincrement aliasing and squashes, with matched IPC against unchanged options.
+
 ### Forward on the actual SQ publication edge
 
 Default-off `forwardOnPublish` requires late-store SQ reservation. An existing

@@ -349,7 +349,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     detachLateStore: Boolean = false,
                     forwardOnPublish: Boolean = false,
                     earlyLsNzvcWakeup: Boolean = false,
-                    detachedStoreEntries: Int = 1) extends Component {
+                    detachedStoreEntries: Int = 1,
+                    earlyAutoStoreAddress: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -380,7 +381,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap)
-    val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress)
+    val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
+      earlyAutoStoreAddress = earlyAutoStoreAddress)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -388,7 +390,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
-      detachedStoreEntries = detachedStoreEntries)
+      detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -659,6 +661,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
       val traceLines = ArrayBuffer.empty[String]
+      val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val ldCmdAddrs  = ArrayBuffer.empty[Long]  // D$ load physical addresses (premise check)
       val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
@@ -749,6 +752,34 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       cd.onSamplings {
         telemCycle += 1
+        if (lsEventsOn && telemCycle <= 1400) {
+          val ls = dut.lsEu.logic
+          def event(s: String): Unit = println(s"LS_EVENT kernel=${k.name} cycle=$telemCycle $s")
+          if (dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean) {
+            val p = dut.lsEu.issuePort.payload
+            event(f"issue rob=${p.robId.toInt} pc=${p.uop.pc.toLong}%08x " +
+              s"mem=${p.uop.memOp.toEnum} srcB=${p.uop.psrcB.toInt} dst=${p.uop.pdst.toInt}")
+          }
+          if (ls.sq.io.alloc.valid.toBoolean)
+            event(f"alloc rob=${ls.sq.io.alloc.robId.toInt} pa=${ls.sq.io.alloc.paddr.toLong}%08x " +
+              s"reserved=${ls.p3ReservationFire.toBoolean}")
+          if (dut.lsEu.reserveLateStore && ls.sq.io.publish.valid.toBoolean)
+            event(s"publish rob=${ls.sq.io.publish.robId.toInt} slot=${ls.sq.io.publish.slot.toInt}")
+          if ((ls.p3Valid.toBoolean || ls.p4Valid.toBoolean) && ls.sq.io.fwd.rsp.hit.toBoolean)
+            event(f"forward rob=${ls.sq.io.fwd.query.robId.toInt} pa=${ls.sq.io.fwd.query.paddr.toLong}%08x " +
+              s"publishHit=${ls.sq.publishForwardHit.toBoolean}")
+          if (ls.p4CompletionFire.toBoolean)
+            event(s"forwardComplete rob=${ls.p4Ctx.xlate.front.robId.toInt}")
+          if (ls.nextIntWake.valid.toBoolean)
+            event(s"intWakeSelected dst=${ls.nextIntWake.payload.toInt}")
+          if (ls.wbObs.valid.toBoolean)
+            event(s"lsWb rob=${ls.wbObs.robId.toInt} intWrite=${ls.wbObs.intWrite.toBoolean} dst=${ls.compPdst.toInt}")
+          for ((eu, lane) <- Seq(dut.eu0, dut.eu1).zipWithIndex if eu.logic.wbObs.valid.toBoolean) {
+            val w = eu.logic.wbObs
+            event(f"aluWb lane=$lane rob=${w.robId.toInt} arch=${w.dstArch.toInt} data=${w.result.toLong}%08x")
+          }
+          if (ls.sq.io.flush.toBoolean) event("flush")
+        }
         if (k.profileRetirement && dut.rob.logic.branchCompletion.valid.toBoolean) {
           val b = dut.rob.logic.branchCompletion.payload
           branchCompletions(b.robId.toInt) = ((b.btbPc.toLong & 0xffffffffL,

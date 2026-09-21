@@ -741,6 +741,24 @@ pending pairs first; do not delay ordinary draining merely to manufacture merges
 Even perfect elimination of pointer cache writes leaves its load/add/forwarding
 recurrence and the byte store's A1/NZVC results intact.
 
+## 19. Reserve postincrement stores before their data arrives
+
+Default-off `earlyAutoStoreAddress` prototype extends the existing late-store
+path rather than building a second memory scheduler. The actual Dhrystone byte
+copy emits a load followed by a STORE with An/NZVC results. The old early-address
+classification excludes that store, leaving younger pointer loads blocked in IQ
+until the byte arrives. Carry the precomputed An result in the existing detached
+context, reserve a real translated SQ slot, then complete An/NZVC via the existing
+arbitrated port when data arrives. No speculative An wakeup at reservation.
+
+Measured preliminary board-derived simulation: 32-byte copy 553→384 cycles,
+128-byte copy 2871→2058 (seed 1), versus the previous combined profile. Full
+copy/readback matrix, 29 selected oracle tests and 388-test fast gate pass; all
+136 prior corpus cycle counts are unchanged. Routed timing is pending.
+Keep split/device/privileged and predecrement cases on their
+existing conservative paths. This is not the complete memory-dependency tracker
+or a claim of a one-cycle store-producer-to-load-result path.
+
 ## Primary references
 
 - [BOOM ROB and PNR](https://docs.boom-core.org/en/latest/sections/reorder-buffer.html):

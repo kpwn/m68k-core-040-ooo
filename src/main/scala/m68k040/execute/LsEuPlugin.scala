@@ -103,7 +103,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val detachLateStore: Boolean = false,
                  val forwardOnPublish: Boolean = false,
                  val earlyNzvcWakeup: Boolean = false,
-                 val detachedStoreEntries: Int = 1) extends FiberPlugin with LsEuService {
+                 val detachedStoreEntries: Int = 1,
+                 val earlyAutoStoreAddress: Boolean = false) extends FiberPlugin with LsEuService {
+  require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
   require(detachedStoreEntries == 1 || detachLateStore,
@@ -2937,8 +2939,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     }
 
     // Synchronous owners for translated, SQ-resident stores waiting on data.
-    // Address/data remain in the SQ. These few fields are all a plain MOVE store
-    // needs to finish independently of P3; no integer result or extra PRF port.
+    // Address/data remain in the SQ. The optional postincrement extension carries
+    // the already-computed An result through this same completion owner, using
+    // the existing integer write port. Plain-store profiles omit those fields.
     val detachedStore = if(detachLateStore) Some(new Area {
       case class Context() extends Bundle {
         val slot = UInt(sq.ptrW bits)
@@ -2949,6 +2952,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         val nzvcDst = UInt(nzvcW.address.getWidth bits)
         val crackDrop = Bool()
         val keepCommit = Bool()
+        val autoAn = if(earlyAutoStoreAddress) Bool() else null
+        val anResult = if(earlyAutoStoreAddress) Bits(32 bits) else null
+        val pdst = if(earlyAutoStoreAddress) UInt(6 bits) else null
+        val dstArch = if(earlyAutoStoreAddress) UInt(5 bits) else null
       }
       val reserve = Flow(Context())
       val valid = RegInit(False)
@@ -2964,6 +2971,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val capture = valid && !captured && readyPrior && !sqFlushSig && !excActive
       val complete = valid && (captured || capture) && !backCompFires &&
         !preciseReplayClaimsComp && !sqFlushSig && !excActive
+      val hasAnResult = if(earlyAutoStoreAddress) ctx.autoAn else False
       when(capture) {
         rdData.addr := ctx.dataTag
         nzvc := moveNzvc(rdData.data, ctx.size)
@@ -2973,19 +2981,25 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         liveCompletionFires := True
         compValid := True
         compRobId := ctx.robId
-        compData := 0
-        compPdst := 0; compPdstValid := False
-        compIsLoad := False; compWakes := False
-        compStkPush := False; compCcrRestore := False; compEaAutoDrop := False
-        compRmwStore := !ctx.writesNzvc
+        compData := (if(earlyAutoStoreAddress) ctx.anResult else B(0, 32 bits))
+        compPdst := (if(earlyAutoStoreAddress) ctx.pdst else U(0, 6 bits))
+        compPdstValid := hasAnResult
+        compIsLoad := False; compWakes := hasAnResult
+        compStkPush := False; compCcrRestore := False
+        compEaAutoDrop := hasAnResult && !ctx.writesNzvc
+        compRmwStore := !hasAnResult && !ctx.writesNzvc
         compCrackDrop := ctx.crackDrop; compKeepCommit := ctx.keepCommit
-        compDstArch := 0
+        compDstArch := (if(earlyAutoStoreAddress) ctx.dstArch else U(0, 5 bits))
         compNzvc := Mux(capture, moveNzvc(rdData.data, ctx.size), nzvc)
         compNzvcWrite := ctx.writesNzvc; compNzvcDst := ctx.nzvcDst
         nextNzvcWake.valid := ctx.writesNzvc
         nextNzvcWake.payload := ctx.nzvcDst
         compX := False; compXWrite := False; compXDst := 0
         compIsFault := False
+        if(earlyAutoStoreAddress) {
+          nextIntWake.valid := ctx.autoAn
+          nextIntWake.payload := ctx.pdst
+        }
         valid := False
         readyPrior := False
       }
@@ -3310,8 +3324,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           assert(rdData.addr === p3Front.lateDataTag, "P3 store lost ownership of its PRF data port", FAILURE)
         }
         when(issuePort.fire && p.issuePending) {
-          assert(u0.memOp === MemOp.STORE && u0.psrcBValid && !u0.pdstValid &&
-            !u0.stkPush && u0.eaAuto === m68k040.decode.EaAuto.NONE && !u0.movesAliasStore,
+          assert(u0.memOp === MemOp.STORE && u0.psrcBValid &&
+            ((!u0.pdstValid && u0.eaAuto === m68k040.decode.EaAuto.NONE) ||
+             (Bool(earlyAutoStoreAddress) && u0.pdstValid && u0.eaAuto === m68k040.decode.EaAuto.POSTINC)) &&
+            !u0.stkPush && !u0.movesAliasStore,
             "late store data issued on an unsupported operation", FAILURE)
         }
         when(p3Valid && p3LateDataPending && !p3LateDataCapture) {
@@ -3337,9 +3353,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         d.reserve.nzvcDst := p3Front.pNzvcDst
         d.reserve.crackDrop := p3Front.crackDrop
         d.reserve.keepCommit := p3Front.keepCommit
+        if(earlyAutoStoreAddress) {
+          d.reserve.autoAn := p3Front.autoStoreAn && p3Front.pdstValid
+          d.reserve.anResult := p3Front.anWb
+          d.reserve.pdst := p3Front.pdst
+          d.reserve.dstArch := p3Front.dstArch
+        }
         GenerationFlags.simulation {
           when(d.reserve.valid) {
-            assert(!p3Front.pdstValid && !p3Front.stkPush && !p3Front.autoStoreAn &&
+            assert(((!p3Front.pdstValid && !p3Front.autoStoreAn) ||
+              (Bool(earlyAutoStoreAddress) && p3Front.pdstValid && p3Front.autoStoreAn)) && !p3Front.stkPush &&
               !p3Front.ccrRestore && !p3Front.writesX && !p3Front.leaAddr,
               "detached completion omitted an architectural store side effect", FAILURE)
           }
@@ -3389,6 +3412,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           // If capacity only appears on the capture edge, use the ordinary
           // captured-data path next cycle; never create an unfillable reservation.
           if(reserveLateStore) when(fastStore && !storePrivBlocked && !sq.io.full &&
+            !(p3Front.autoStoreAn && p3Front.twoAccess) &&
             !p3LateDataCapture && detachedStore.map(_.reserveReady).getOrElse(True)) {
             sq.io.alloc.valid := True
             sq.io.alloc.payload.precise := False
@@ -3887,6 +3911,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     u1.eaAuto.simPublic(); isLoad.simPublic(); isStore.simPublic()
     sq.io.fwd.query.robId.simPublic()
     sq.io.fwd.rsp.hit.simPublic(); sq.io.fwd.rsp.stall.simPublic()
+    // Bounded simulation event traces join producer tags, SQ publication and
+    // forwarded-load completion. These taps add no hardware state or ports.
+    issuePort.payload.uop.pc.simPublic(); issuePort.payload.uop.memOp.simPublic()
+    issuePort.payload.uop.psrcB.simPublic(); issuePort.payload.uop.pdst.simPublic()
+    sq.io.fwd.query.paddr.simPublic()
+    if(reserveLateStore) sq.io.publish.simPublic()
+    nextIntWake.simPublic(); compPdst.simPublic()
 
     // ---- wbObs (sim-only whitebox) ----
     // Driven straight from the registered completion stage (already a register), so
