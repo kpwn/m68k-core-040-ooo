@@ -67,7 +67,7 @@ throughput exceeding dispatch. Conversely, a nonempty ROB with no retirement
 does not prove retire bandwidth is the bottleneck: the head may simply be waiting
 for a load, dependency, fault handling or another execution result.
 
-## Fifteen concrete proposals
+## Concrete proposals
 
 Priority is an initial engineering judgement, not a measured ranking. Options
 1–5 are alternative retirement implementations; do not stack all of them.
@@ -125,6 +125,15 @@ PRFs. The map is small; accounting for frees, stores, CCR values and boundaries 
 the real work. Map identity alone does not update the ROB's committed CCR value.
 **Experiment:** 4/8/16-entry caps; compare actual IPC against four-wide retirement,
 including short stalls where preparation cannot get ahead. **Priority: high.**
+
+The default-off 4/8/16 prototype is now implemented and measured with an actual
+shadow-map image. [Results and contract](ipc-experiments.md#prepared-shadow-map-retirement--2026-09-21)
+show real batches but no gain on the composed long-backlog window; the best short
+window improves 380→375 cycles. Even a synthetic divider/ROB-pressure window saves
+only 1/3/7 cycles across the three caps, with unchanged ROB-full cycles. Retain the
+experiment, but **lower its implementation priority behind dependency latency and
+prediction** until a representative recurring bottleneck benefits. No timing,
+area, SoC or board acceptance is implied.
 
 ### 4. Rename-time epoch snapshots
 
@@ -349,6 +358,15 @@ shortcut was removed. Ready-admission and overlapping owner/P4/full-SQ counters
 remain. In the load-fed recurrence every owner-wait cycle overlaps a forwarding
 stall; owner occupancy alone is not evidence that more slots would help.
 
+Next narrow audit: `issuePort.ready` blocks **all** new LSU issues on a late-data
+capture edge, although base and index use separate PRF read ports from store
+data. Attribute actual blocked issues first, then test whether ordinary loads
+whose entire downstream path ignores the captured store-data operand can overlap
+that edge. Preserve the data-port exclusion for stores and every unproven cold or
+compound operation; assert the classification and source lifetime. This may remove
+an unnecessary interlock without another owner or PRF port, but is only a proposal
+and has no measured gain yet.
+
 ### 14. Shorter resident L1D path without a long permission cone
 
 Overlap safe index/data work with translation and separate early payload choice
@@ -430,6 +448,24 @@ waits for retirement; they need allocation recovery, not just a copied RAT.
 **Experiment:** per-PC retired-branch accuracy, MPKI, lost cycles and macro IPC
 in identical warmed windows. Target >=95% on representative workloads, not a
 guarantee for arbitrary unpredictable branches. **Priority: high.**
+
+### 16. Admit rename by actual destination demand
+
+The current `RenameStage.freeReady` unconditionally requires two free entries
+in **all five** physical-register classes, even when the offered packet writes
+none in an exhausted class or only needs one entry. Before adding PRF capacity,
+measure cycles where this conservative rule alone rejects a safe packet. A
+two-lane demand count can admit only the classes and counts actually allocated.
+This is an RTL-audit proposal, not implemented or an observed IPC gain.
+
+**Cost / timing repair:** avoid moving decoded destination flags onto a long
+freelist→rename→dispatch ready path. Carry compact demand metadata at an existing
+stage boundary if needed; do not add a steady-state rename bubble. The same
+acceptance predicate must gate input ready, output valid and every allocation,
+so no pool underflows and no held packet dispatches twice. Check unused/one/two
+destinations in each class, mixed packets, flush and resource-pressure recovery.
+**Priority: medium pending attributed rename-stall measurements; simpler than
+early-free reference tracking if it addresses the measured pressure.**
 
 ## Controlled frontend amendment: single-port conditional admission
 

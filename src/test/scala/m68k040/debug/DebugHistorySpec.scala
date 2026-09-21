@@ -101,8 +101,8 @@ class DebugHistorySpec extends AnyFunSuite {
     }
   }
 
-  test("four-wide PC history compacts sparse macro boundaries and wraps every bank") {
-    M68kSim().compile(new Dut(retireWidth = 4)).doSim { dut =>
+  for (width <- Seq(4, 8, 16)) test(s"$width-wide PC history compacts sparse macro boundaries and wraps every bank") {
+    M68kSim().compile(new Dut(retireWidth = width)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       DbgAxiDriver.idle(dut.axi)
       dut.dbg.logic.initDoneSeen #= false
@@ -112,8 +112,10 @@ class DebugHistorySpec extends AnyFunSuite {
       val expected = Array.fill[Long](32)(0L)
       var head = 0
       var sequence = 0L
-      for (round <- 0 until 4; mask <- 0 until 16) {
-        for (lane <- 0 until 4) {
+      val masks = if (width == 4) 0 until 16
+        else Seq(0, (1 << width) - 1, 0x55, 0xaa) ++ (0 until width).map(1 << _)
+      for (round <- 0 until 4; mask <- masks) {
+        for (lane <- 0 until width) {
           val valid = (mask & (1 << lane)) != 0
           dut.history.logic.pcValid(lane) #= valid
           dut.history.logic.pc(lane) #= 0x10000000L + sequence * 2

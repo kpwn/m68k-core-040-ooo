@@ -20,8 +20,21 @@ trait RenameCommitService {
   def flushPort:   Bool
 }
 
+/** Unpublished map preparation. Sole producer/port owner: RenameStage; the ROB
+  * drives decisions through this service. No architectural effects before publish.
+  * See docs/prepared-retirement.md. */
+case class PreparedCommitPort() extends Bundle {
+  val begin, abort, publish = Bool()
+  val writes = Vec.fill(2)(Flow(CommitSlot()))
+  val resourcePressure = Bool() // RenameStage produces; ROB may seal a partial batch.
+}
+trait PreparedCommitService {
+  def preparedCommit: Option[PreparedCommitPort]
+}
+
 /** Ordinary in-order retirement notices. PRODUCER: RobPlugin exclusively.
-  * Four setup-allocated lanes; unused upper lanes are idle in the two-wide core.
+  * At least four setup-allocated lanes (up to the prepared cap when enabled);
+  * unused upper lanes are idle in the two-wide core.
   * No delayed authorization: queue consumers must mark on the retirement edge.
   * See docs/retirement-bandwidth.md. */
 trait RobRetirementService {

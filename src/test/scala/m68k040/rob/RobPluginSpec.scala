@@ -29,13 +29,15 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ── Simple DUT: fake rename source + rob + fake commit sink + trace sink ──────
-  class SimpleDut(pairCorrectBranch: Boolean = false, retireWidth: Int = 2) extends Component {
+  class SimpleDut(pairCorrectBranch: Boolean = false, retireWidth: Int = 2,
+                  prepared: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
     val drv  = new RobAllocDriverPlugin
-    val rob  = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
-    val csink = new RenameCommitSinkPlugin(retireWidth)
+    val rob  = new RobPlugin(pairCorrectBranch = pairCorrectBranch,
+      preparedRetireEntries = if (prepared) retireWidth else 0)
+    val csink = new RenameCommitSinkPlugin(retireWidth, prepared)
     val tsink = new CommitTraceSinkPlugin
     val cacheCtrl = new CacheControlSinkPlugin
     val dsink = new DebugCommitSinkPlugin
@@ -105,6 +107,7 @@ class RobPluginSpec extends AnyFunSuite {
     dut.rob.logic.haltAfterArmedIn #= false
     dut.rob.logic.haltAfterInvalidateIn #= false
     dut.rob.logic.haltExceptionMaskIn #= 0
+    dut.csink.logic.preparation.foreach(_.pressure #= false)
     cd.waitSampling()
   }
 
@@ -124,6 +127,145 @@ class RobPluginSpec extends AnyFunSuite {
   def waitUntil(cd: ClockDomain, cond: => Boolean, max: Int = 200): Unit = {
     var n = 0
     while (!cond) { assert(n < max, "waitUntil timed out"); n += 1; cd.waitSampling() }
+  }
+
+  test("prepared retirement retains its fixed endpoint across ordinary retirement and ROB wrap", VerilatorTest) {
+    for (width <- Seq(4, 8, 16)) {
+      M68kSim().withVerilator.compile(new SimpleDut(retireWidth = width, prepared = true)).doSim { dut =>
+        val cd = dut.clockDomain; cd.forkStimulus(10)
+        initSimple(dut, cd)
+        val batch = dut.rob.logic.preparedBatch.get
+        var macros = 0
+        for (round <- 0 until 12) {
+          val base = dut.rob.logic.head.toInt
+          // Four-wide needs one ordinary prefix retire, the larger caps use two.
+          val consumed = if (width == 4) 1 else 2
+          for (pair <- 0 until width / 2) {
+            for (slot <- 0 until 2) {
+              val lane = pair * 2 + slot
+              pokeRu(dut.rsrc.logic.src.payload(slot), pc = 0x100 + 2 * (macros + lane),
+                dstArch = lane % 16, pdst = 20 + lane, pdstValid = true,
+                pdstOld = lane, firstOfInstr = true)
+            }
+            dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+            cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+            dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+            cd.waitSampling()
+          }
+          waitUntil(cd, batch.ready.toBoolean); sleep(1)
+          assert(batch.target.toInt == width)
+          assert(!dut.csink.logic.commitValidOut.exists(_.toBoolean))
+          for (lane <- (consumed - 1) to 0 by -1) {
+            markComplete(dut, (base + lane) % 32); cd.waitSampling(); clearComplete(dut)
+          }
+          sleep(1)
+          assert(dut.rob.logic.retireLanes.count(_.toBoolean) == consumed)
+          assert(!batch.fire.toBoolean)
+          cd.waitSampling(); sleep(1)
+          assert(batch.active.toBoolean && batch.ready.toBoolean)
+          assert(batch.base.toInt == (base + consumed) % 32)
+          assert(batch.target.toInt == width - consumed)
+          for (lane <- (width - 1) to consumed by -1) {
+            markComplete(dut, (base + lane) % 32); cd.waitSampling(); clearComplete(dut)
+          }
+          sleep(1)
+          assert(batch.fire.toBoolean)
+          assert(dut.rob.logic.retireLanes.count(_.toBoolean) == width - consumed)
+          for (lane <- 0 until width - consumed) {
+            assert(dut.tsink.logic.retirement.get(lane).valid.toBoolean)
+            assert(dut.tsink.logic.retirement.get(lane).payload.toInt == (base + consumed + lane) % 32)
+            assert(dut.csink.logic.commitArchOut(lane).toInt == (consumed + lane) % 16)
+          }
+          cd.waitSampling(); sleep(1); macros += width
+          assert(!batch.active.toBoolean)
+          assert(dut.rob.logic.count.toInt == 0)
+          assert(dut.dsink.logic.macroCountOut.toBigInt == macros)
+          assert(dut.dsink.logic.livePcOut.toLong == 0x100 + 2 * macros)
+        }
+      }
+    }
+  }
+
+  test("prepared retirement stops at barriers and cancels unpublished work on flush", VerilatorTest) {
+    val compiled = M68kSim().withVerilator.compile(new SimpleDut(retireWidth = 8, prepared = true))
+    for (kind <- Seq("incomplete", "fault", "branch", "privileged", "system", "rte", "breakpoint", "flush");
+         barrier <- 1 until 8) {
+      compiled.doSim(s"prepared_${kind}_$barrier") { dut =>
+        val cd = dut.clockDomain; cd.forkStimulus(10)
+        initSimple(dut, cd)
+        val batch = dut.rob.logic.preparedBatch.get
+        for (pair <- 0 until 4) {
+          for (slot <- 0 until 2) {
+            val lane = 2 * pair + slot
+            val u = dut.rsrc.logic.src.payload(slot)
+            pokeRu(u, pc = 0x100 + lane * 2, firstOfInstr = true,
+              isBranch = lane == barrier && kind == "branch",
+              debugBreakValid = lane == barrier && kind == "breakpoint")
+            if (lane == barrier) kind match {
+              case "fault" => u.faulted #= true; u.faultVector #= 4
+              case "privileged" => u.needsSupervisor #= true
+              case "system" => u.sysOp #= true
+              case "rte" => u.isRte #= true
+              case _ =>
+            }
+          }
+          dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+          cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+          dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+          cd.waitSampling()
+        }
+        cd.waitSampling(6); sleep(1)
+        if (kind == "flush") {
+          assert(batch.ready.toBoolean)
+          dut.rob.logic.flush.valid #= true
+          cd.waitSampling(); dut.rob.logic.flush.valid #= false; sleep(1)
+          assert(!batch.active.toBoolean && !batch.fire.toBoolean)
+          assert(dut.rob.logic.count.toInt == 0)
+        } else {
+          for (lane <- 7 to 0 by -1 if !(kind == "incomplete" && lane == barrier)) {
+            markComplete(dut, lane); cd.waitSampling(); clearComplete(dut)
+          }
+          sleep(1)
+          val expected = if (kind == "incomplete") scala.math.min(2, barrier) else barrier
+          assert(dut.rob.logic.retireLanes.count(_.toBoolean) == expected, s"$kind at $barrier")
+          assert(batch.fire.toBoolean == (kind != "incomplete" && barrier >= 3))
+        }
+      }
+    }
+  }
+
+  test("prepared retirement seals partial macros under resource pressure and honors a later debug stop", VerilatorTest) {
+    M68kSim().withVerilator.compile(new SimpleDut(retireWidth = 8, prepared = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      val batch = dut.rob.logic.preparedBatch.get
+      for (pair <- 0 until 3) {
+        for (slot <- 0 until 2) {
+          val lane = pair * 2 + slot
+          pokeRu(dut.rsrc.logic.src.payload(slot), pc = if (lane < 4) 0x100 else 0x200,
+            firstOfInstr = lane == 0 || lane == 4, lastOfInstr = lane == 3)
+        }
+        dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+        cd.waitSampling()
+      }
+      cd.waitSampling(5); sleep(1)
+      assert(!batch.active.toBoolean, "partial window should not start without pressure")
+      dut.csink.logic.preparation.get.pressure #= true
+      waitUntil(cd, batch.ready.toBoolean); sleep(1)
+      assert(batch.target.toInt == 4, "trailing incomplete macro entered the batch")
+      dut.rob.logic.debugStopRequestIn #= true
+      cd.waitSampling(2); sleep(1)
+      assert(!batch.active.toBoolean && !batch.fire.toBoolean)
+      for (lane <- 5 to 0 by -1) {
+        markComplete(dut, lane); cd.waitSampling(); clearComplete(dut)
+      }
+      waitUntil(cd, dut.dsink.logic.effectiveHaltOut.toBoolean)
+      assert(dut.dsink.logic.macroCountOut.toBigInt == 1)
+      assert(dut.dsink.logic.livePcOut.toLong == 0x102)
+      assert(dut.rob.logic.count.toInt == 0)
+    }
   }
 
   test("four-wide retirement publishes only the safe prefix at every barrier lane", VerilatorTest) {

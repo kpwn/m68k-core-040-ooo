@@ -41,10 +41,17 @@ class RobAllocDriverPlugin extends FiberPlugin {
 
 /** Test-only: CONSUMES RenameCommitService from RobPlugin, exposing commit ports
   * + flush as top-level IO so the test can observe retire-driven commit/free. */
-class RenameCommitSinkPlugin(retireWidth: Int = 2) extends FiberPlugin with RenameCommitService {
+class RenameCommitSinkPlugin(retireWidth: Int = 2, prepared: Boolean = false) extends FiberPlugin
+    with RenameCommitService with m68k040.services.PreparedCommitService {
   val logic = during build new Area {
     // Directionless service wires (RobPlugin drives these).
     val commits = Vec.fill(retireWidth)(Flow(m68k040.rob.CommitSlot()))
+    val preparation = if (prepared) Some(new Area {
+      val port = m68k040.services.PreparedCommitPort()
+      val pressure = in Bool()
+      port.resourcePressure := pressure
+      port.simPublic()
+    }) else None
     val flushP  = Bool()
     // Mirror to top-level outputs for observation.
     val commitValidOut = out(Vec(Bool(), retireWidth))
@@ -77,6 +84,7 @@ class RenameCommitSinkPlugin(retireWidth: Int = 2) extends FiberPlugin with Rena
   }
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commits
   override def flushPort:   Bool                  = logic.flushP
+  override def preparedCommit = logic.preparation.map(_.port)
 }
 
 /** Test-only: exposes CacheControlService as top-level IO for SpinalSim.

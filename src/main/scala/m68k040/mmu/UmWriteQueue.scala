@@ -55,7 +55,7 @@ case class UmWriteDrain() extends Bundle {
   * count is a hardware sum; flush rolls the tail back past the youngest committed). */
 class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
   require(isPow2(depth))
-  require(retireWidth == 2 || retireWidth == 4)
+  require(Set(2, 4, 8, 16)(retireWidth))
   val ptrW = log2Up(depth)
 
   val io = new Bundle {

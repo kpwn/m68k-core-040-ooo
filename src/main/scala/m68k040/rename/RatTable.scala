@@ -3,6 +3,11 @@ package m68k040.rename
 import spinal.core._
 import spinal.lib._
 
+case class RatMapWrite(archDepth: Int, physIdWidth: Int) extends Bundle {
+  val addr = UInt(log2Up(archDepth) bits)
+  val data = UInt(physIdWidth bits)
+}
+
 /** Dual register-file Register Alias Table with O(1) rollback.
   *
   * Two register Vecs: specReg (written speculatively), commReg (written on
@@ -25,7 +30,8 @@ case class RatTable(
     archDepth:   Int,
     writePorts:  Int,
     commitPorts: Int,
-    readPorts:   Int
+    readPorts:   Int,
+    prepared: Boolean = false
 ) extends Component {
 
   val io = new Bundle {
@@ -50,7 +56,12 @@ case class RatTable(
     // speculative remap). Surfaced as an output so a parent (e.g. the exception unit's
     // live committed-A7 readback) can read an architectural mapping across the hierarchy.
     val committedPhys = out Vec (UInt(physIdWidth bits), archDepth)
+    val prepareBegin = if (prepared) in(Bool()) else null
+    val prepareAbort = if (prepared) in(Bool()) else null
+    val publish = if (prepared) in(Bool()) else null
+    val prepare = if (prepared) Vec.fill(2)(slave(Flow(RatMapWrite(archDepth, physIdWidth)))) else null
   }
+
 
   // ── Speculative / committed storage (REGISTER Vecs, NOT Mem) ────────────────
   // Previously these were 2-write-port + readAsync Mems. A multi-write async-read
@@ -81,6 +92,27 @@ case class RatTable(
       }
     }
   }
+
+  // Preparation changes no architectural/speculative lookup and releases no
+  // resource. Seed from the committed image, then fold two age-ordered records.
+  val preparation = if (prepared) Some(new Area {
+    val valid = RegInit(False)
+    val shadow = Vec.fill(archDepth)(Reg(UInt(physIdWidth bits)))
+    val publish = io.publish && valid && !io.prepareAbort && !io.rollback
+    for (a <- 0 until archDepth) {
+      val next = UInt(physIdWidth bits)
+      next := Mux(io.prepareBegin, commReg(a), shadow(a))
+      for (w <- io.prepare) when(w.valid && w.addr === a) { next := w.data }
+      when(io.prepareBegin || io.prepare.map(_.valid).reduce(_ || _)) { shadow(a) := next }
+      when(publish) { commReg(a) := shadow(a) }
+    }
+    when(io.prepareBegin) { valid := True }
+    when(io.prepareAbort || io.rollback || io.publish) { valid := False }
+    assert(!publish || !io.commits.map(_.valid).reduce(_ || _),
+      "prepared RAT publication collided with an ordinary map write")
+    assert(!(io.publish && !io.prepareAbort && !io.rollback) || valid,
+      "RAT publication without a prepared image")
+  }) else None
 
   // ── Location register (1 bit per arch register) ───────────────────────────
   // Bit a = 1  →  specReg holds current mapping for arch reg a

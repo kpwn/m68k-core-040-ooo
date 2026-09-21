@@ -21,5 +21,14 @@ class RenameCommitDriverPlugin extends FiberPlugin {
       rc.commitPorts(k).valid   := cmd(k).valid
       rc.commitPorts(k).payload := cmd(k).payload
     }
+    val preparation = host.get[m68k040.services.PreparedCommitService].flatMap(_.preparedCommit).map { port =>
+      new Area {
+        val begin, abort, publish = in(Bool())
+        val writes = Vec.fill(2)(slave(Flow(CommitSlot())))
+        val pressure = out(Bool()); pressure := port.resourcePressure
+        port.begin := begin; port.abort := abort; port.publish := publish
+        port.writes := writes
+      }
+    }
   }
 }

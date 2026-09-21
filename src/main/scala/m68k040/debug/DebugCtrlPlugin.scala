@@ -297,7 +297,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val branchRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val excRingHead = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val pcBanks = debugHistory.map(_.macroRetirePc.length).getOrElse(2)
-      require(Set(2, 4)(pcBanks))
+      require(Set(2, 4, 8, 16)(pcBanks))
       val pcBankBits = log2Up(pcBanks)
       val pcTraceBanks = if (historyBuilt) Seq.fill(pcBanks)(
         Mem(Bits(32 bits), 32 / pcBanks) init Vector.fill(32 / pcBanks)(B(0, 32 bits))) else Seq.empty
@@ -677,10 +677,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * is how `PerfCounterSpec` proves this lane is not fabricating numbers. */
       val perfEvtInst = if (perfBuilt) {
         val live = excCountHistory.map(h =>
-          h.macroRetirePc.map(_.valid.asUInt.resize(3)).reduce(_ + _)
-        ).getOrElse(U(0, 3 bits))
+          h.macroRetirePc.map(_.valid.asUInt.resize(log2Up(h.macroRetirePc.length + 1))).reduce(_ + _)
+        ).getOrElse(U(0, 2 bits))
         RegNext(live) init 0
-      } else U(0, 3 bits)
+      } else U(0, 2 bits)
 
       // ── The counters ──────────────────────────────────────────────────────────
       // Each is a named `val` so SpinalHDL's val-name reflection gives it a real

@@ -372,9 +372,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       deferTakenSlot1Conditional = deferTakenSlot1Conditional)
     val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
       fuseLongMoveLoads = fuseLongMoveLoads)
-    val ren    = new RenameStage(retireWidth = sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2))
+    val preparedCap = sys.env.get("IPC_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
+    val ren    = new RenameStage(
+      retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
+      preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
-    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch)
+    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
@@ -443,7 +446,9 @@ trait CoreBenchHarness extends AnyFunSuite {
   final case class RobCycle(occupancy: Int = 0, completePrefix: Int = 0,
                            completeYounger: Int = 0, headIncomplete: Boolean = false,
                            retires: Int = 0, branchPairPotential: Boolean = false,
-                           headPc: Long = 0L, pairedBranch: Boolean = false)
+                           headPc: Long = 0L, pairedBranch: Boolean = false,
+                           prepareStart: Boolean = false, prepareAbort: Boolean = false,
+                           preparedPublish: Int = 0)
   final case class PipelineProfile(branches: Vector[RetiredBranchStats],
                                    rob: Vector[RobCycle], robDepth: Int,
                                    firstCycle: Int, lastCycle: Int) {
@@ -942,10 +947,14 @@ trait CoreBenchHarness extends AnyFunSuite {
             rob.p0.retireAlone.toBoolean && !rob.mispredictStore(head).toBoolean &&
             !rob.p1.retireAlone.toBoolean && !rob.faultedStore((head + 1) % rob.depth).toBoolean &&
             !rob.p1.needsSup.toBoolean && !rob.p1.sysOp.toBoolean && !rob.p1.isRte.toBoolean
+          val preparation = rob.preparedBatch.map(b =>
+            (b.start.toBoolean, b.active.toBoolean && b.abort.toBoolean,
+              if (b.fire.toBoolean) b.target.toInt else 0)).getOrElse((false, false, 0))
           precedingRobCycle = RobCycle(occupancy, complete.takeWhile(identity).size,
             complete.drop(1).count(identity), complete.headOption.contains(false), rawRetires,
             branchPairPotential, if (occupancy > 0) rob.p0.pc.toLong & 0xffffffffL else 0L,
-            rawRetires == 2 && rob.p0.retireAlone.toBoolean)
+            rawRetires == 2 && rob.p0.retireAlone.toBoolean,
+            preparation._1, preparation._2, preparation._3)
         }
         // Exception channel: not exercised by these kernels, but feed it for safety.
         locally {

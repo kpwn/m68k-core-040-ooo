@@ -20,26 +20,29 @@ import spinal.lib.misc.plugin.FiberPlugin
   * - flush: rollback all RATs + flush all freelists.
   * - commit: minimal int-RAT commit port (updates committed mapping).
   */
-class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopService with RenameCommitService
-    with CommittedMapService with CommittedFpMapService {
-  require(retireWidth == 2 || retireWidth == 4, "rename commit width must be 2 or 4")
+class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = false)
+    extends FiberPlugin with RenameUopService with RenameCommitService
+    with CommittedMapService with CommittedFpMapService with m68k040.services.PreparedCommitService {
+  require(if (preparedRetirement) Set(4, 8, 16)(retireWidth) else Set(2, 4)(retireWidth),
+    "ordinary retirement supports 2/4 lanes; prepared publication supports caps 4/8/16")
 
   val logic = during build new Area {
     val du = host[DecodeUopService]
+    val mapCommitWidth = if (preparedRetirement) 2 else retireWidth
 
     // ── RATs (int RAT: 4 srcA/B reads + 2 srcC reads + 2 dst-old reads = 8 ports) ──
     // srcC is the DIVU.L/DIVS.L 64/32 dividend-high (Dr) source (per slot).
-    val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = retireWidth, readPorts = 8)
-    val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = retireWidth, readPorts = 2)
-    val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = retireWidth, readPorts = 2)
+    val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = mapCommitWidth, readPorts = 8, prepared = preparedRetirement)
+    val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
+    val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
     // FP data RAT (8 arch FP0-FP7, 16 physical). Read-port budget (6): FP macro-ops
     // need at most 2 sources (dyadic FADD/FSUB/FMUL/FDIV) + 1 dst-old read (freelist
     // WAW bookkeeping) per slot -- 2 slots x (2 src + 1 dst-old) = 6, provisioned even
     // though the CPLX cluster can only ISSUE one FP op/cycle (decode/rename still
     // processes 2 macro-ops/cycle and both could be FP-sourced this cycle).
-    val fpRat   = RatTable(physIdWidth = 4, archDepth = 8, writePorts = 2, commitPorts = retireWidth, readPorts = 6)
+    val fpRat   = RatTable(physIdWidth = 4, archDepth = 8, writePorts = 2, commitPorts = mapCommitWidth, readPorts = 6, prepared = preparedRetirement)
     // FPCC RAT (N/Z/I/NAN, archDepth=1 -- mirrors nzvcRat/xRat exactly).
-    val fpccRat = RatTable(physIdWidth = 4, archDepth = 1, writePorts = 2, commitPorts = retireWidth, readPorts = 2)
+    val fpccRat = RatTable(physIdWidth = 4, archDepth = 1, writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
     // sim-only debug visibility (directed rename-only test, RenameStageFpSpec):
     // committedPhys has no other consumer in this task (no ExceptionUnit-style
     // reader exists yet for FP/FPCC), so it would otherwise be pruned from the
@@ -77,6 +80,7 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
     // poke them in sim (simPublic).
     val flush = Bool()
     val commitPorts = Vec.fill(retireWidth)(Flow(CommitSlot()))
+    val preparedPort = if (preparedRetirement) Some(m68k040.services.PreparedCommitPort()) else None
     spinal.core.sim.SimPublic(commitPorts)   // sim-only debug (bf3c bring-up)
 
     // ── Committed-identity init ────────────────────────────────────────────────
@@ -95,7 +99,7 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
     }
 
     // ── Default flow valids for commit ports (driven by the init/commit mux) ───
-    for (w <- 0 until retireWidth) {
+    for (w <- 0 until mapCommitWidth) {
       intRat.io.commits(w).valid  := False
       intRat.io.commits(w).payload.assignDontCare()
       nzvcRat.io.commits(w).valid := False
@@ -148,6 +152,7 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
     // almost immediately once Task 8 gave writesFp a real producer.
     val freeReady = intFree.io.popReady && nzvcFree.io.popReady && xFree.io.popReady &&
                     fpFree.io.popReady && fpccFree.io.popReady
+    preparedPort.foreach(_.resourcePressure := !freeReady)
     // freeReady must gate the OUTPUT valid as well as the input ready. Otherwise a
     // downstream consumer (DispatchPlugin) that does not itself observe freeReady
     // could fire on uopsPort while du.uops does NOT fire (freeReady low) — the
@@ -481,7 +486,7 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
     // Additional int/FP commit lanes are not init-muxed. Lane order is age
     // order; RatTable's highest-valid-lane priority preserves dense WAW batches.
     when(initDone) {
-      for (k <- 1 until retireWidth) {
+      for (k <- 1 until mapCommitWidth) {
         intRat.io.commits(k).valid := commitPorts(k).valid && commitPorts(k).intWrite
         intRat.io.commits(k).addr  := commitPorts(k).intArch
         intRat.io.commits(k).data  := commitPorts(k).intNew
@@ -490,7 +495,7 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
         fpRat.io.commits(k).data  := commitPorts(k).fpNew
       }
     }
-    for (k <- 0 until retireWidth) {
+    for (k <- 0 until mapCommitWidth) {
       // Lane 0 is init-muxed; the remaining lanes have no identity-seed writes.
       val gate = if (k == 0) initDone else True
       when(gate) {
@@ -504,6 +509,32 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
         fpccRat.io.commits(k).addr  := 0
         fpccRat.io.commits(k).data  := commitPorts(k).fpccNew
       }
+    }
+
+    preparedPort.foreach { port =>
+      val rats = Seq(intRat, nzvcRat, xRat, fpRat, fpccRat)
+      for ((rat, bank) <- rats.zipWithIndex) {
+        rat.io.prepareBegin := port.begin
+        rat.io.prepareAbort := port.abort
+        rat.io.publish := port.publish
+        for (lane <- 0 until 2) {
+          val p = port.writes(lane).payload
+          val w = rat.io.prepare(lane)
+          val (write, addr, data) = bank match {
+            case 0 => (p.intWrite, p.intArch, p.intNew)
+            case 1 => (p.nzvcWrite, U(0, 0 bits), p.nzvcNew)
+            case 2 => (p.xWrite, U(0, 0 bits), p.xNew)
+            case 3 => (p.fpWrite, p.fpArchDst, p.fpNew)
+            case 4 => (p.fpccWrite, U(0, 0 bits), p.fpccNew)
+          }
+          w.valid := port.writes(lane).valid && write
+          w.addr := addr.resized; w.data := data.resized
+        }
+        // Whole-image publication replaces normal map writes; every free record
+        // still travels through commitPorts and the registered reclamation lanes.
+        when(port.publish) { rat.io.commits.foreach(_.valid := False) }
+      }
+      assert(!port.begin || initDone, "map preparation before rename initialization")
     }
 
     // Flush-able pipeline register (rename -> dispatch boundary). Squashed by the
@@ -555,5 +586,6 @@ class RenameStage(val retireWidth: Int = 2) extends FiberPlugin with RenameUopSe
   override def fpPhys: Vec[UInt] = logic.fpRat.io.committedPhys
 
   override def commitPorts: Vec[Flow[CommitSlot]] = logic.commitPorts
+  override def preparedCommit = logic.preparedPort
   override def flushPort:   Bool                  = logic.flush
 }

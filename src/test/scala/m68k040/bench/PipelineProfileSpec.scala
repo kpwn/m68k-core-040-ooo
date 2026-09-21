@@ -31,8 +31,23 @@ class PipelineProfileSpec extends CoreBenchHarness {
       src = kDeepBacklog.src.replace("moveq #20,%d7", "move.l #128,%d7"),
       retiredInstrs = 7 + 128 * 45 / 2, warmupInstrs = 7 + 16 * 45 / 2,
       verifyRetirement = checkRegisters(0 -> 64L, 2 -> 0L, 7 -> 0L))
-    val cases = Seq(hot -> 84, alternating -> 48, backlog -> 32,
-      calls -> 252, independent -> 0, alternatingLong -> 768, backlogLong -> 224)
+    // Synthetic retirement-pressure control, NOT representative code. A long
+    // divider at the head lets >16 no-CCR ADDA operations complete behind it.
+    // Unlike the short shift chain, this can actually exhaust allocation space.
+    val dividerSetup = Seq("moveq #64,%d7", "moveq #1,%d1", "moveq #0,%d2", "moveq #3,%d3") ++
+      (0 until 6).map(i => s"move.l #0,%a$i")
+    val dividerBody = Seq("divu.w %d3,%d2") ++
+      (0 until 24).map(i => s"add.l %d1,%a${i % 6}") ++ Seq("sub.l %d1,%d7", "bne.s .Ldivback")
+    val dividerBacklog = Kernel("divider-backlog",
+      dividerSetup.mkString(" ; ") + " ; .Ldivback: " + dividerBody.mkString(" ; "),
+      retiredInstrs = dividerSetup.size + 64 * dividerBody.size,
+      warmupInstrs = dividerSetup.size + 16 * dividerBody.size,
+      verifyRetirement = obs => checkRegisters((Seq(2 -> 0L, 7 -> 0L) ++ (8 until 14).map(_ -> 256L)): _*)(obs))
+    val allCases = Seq(hot -> 84, alternating -> 48, backlog -> 32,
+      calls -> 252, independent -> 0, alternatingLong -> 768, backlogLong -> 224, dividerBacklog -> 48)
+    val selected = sys.env.get("IPC_PROFILE_KERNELS").map(_.split(",").toSet)
+    selected.foreach(names => require(names.subsetOf(allCases.map(_._1.name).toSet), "unknown profile kernel"))
+    val cases = allCases.filter { case (kernel, _) => selected.forall(_(kernel.name)) }
     val pairBranches = sys.env.get("IPC_PAIR_BRANCH").contains("1")
     val deferConditionals = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1")
     val deferTaken = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1")
@@ -76,8 +91,25 @@ class PipelineProfileSpec extends CoreBenchHarness {
         .map { case (prefix, cycles) => s"$prefix:${cycles.size}" }.mkString(",")
       val retireHistogram = p.rob.groupBy(_.retires).toSeq.sortBy(_._1)
         .map { case (width, cycles) => s"$width:${cycles.size}" }.mkString(",")
+      val publishHistogram = p.rob.filter(_.preparedPublish != 0).groupBy(_.preparedPublish)
+        .toSeq.sortBy(_._1).map { case (size, cycles) => s"$size:${cycles.size}" }.mkString(",")
+      if (kernel.name == "divider-backlog") {
+        // All body instructions are register-direct two-byte encodings. Measure
+        // recurring divider retirement separately from the final backlog drain.
+        val dividerPc = p.branches.head.pc - 2 * (dividerBody.size - 1)
+        val divisions = p.rob.zipWithIndex.collect {
+          case (s, cycle) if s.retires > 0 && s.headPc == dividerPc => cycle
+        }
+        assert(divisions.size == expectedBranches, "divider cadence denominator drifted")
+        val cadence = divisions.sliding(2).map(xs => xs(1) - xs(0)).toVector
+          .groupBy(identity).toSeq.sortBy(_._1).map { case (gap, events) => s"$gap:${events.size}" }.mkString(",")
+        println(s"DIVIDER_RECURRENCE seed=$seed preparedCap=${sys.env.getOrElse("IPC_PREPARED_RETIRE", "0")} " +
+          s"divisions=${divisions.size} cycleGaps=$cadence")
+      }
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
-        s"retireWidth=${sys.env.getOrElse("IPC_RETIRE_WIDTH", "2")} retireHistogram=$retireHistogram " +
+        s"retireWidth=${sys.env.get("IPC_PREPARED_RETIRE").filter(_ != "0").getOrElse(sys.env.getOrElse("IPC_RETIRE_WIDTH", "2"))} retireHistogram=$retireHistogram " +
+        s"preparedCap=${sys.env.getOrElse("IPC_PREPARED_RETIRE", "0")} " +
+        s"prepareStarts=${p.rob.count(_.prepareStart)} prepareAborts=${p.rob.count(_.prepareAbort)} preparedPublishes=$publishHistogram " +
         s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken retainHistory=$retainHistory " +
         s"lsFlags=${lsFlags.collect { case (name, true) => name }.toSeq.sorted.mkString(",")} " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +

@@ -45,11 +45,13 @@ object DebugHaltReasonCode {
   * correct-head-branch experiment allows one eligible non-branch successor.
   */
 class RobPlugin(val detailedPerf: Boolean = false,
-                val pairCorrectBranch: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
+                val pairCorrectBranch: Boolean = false,
+                val preparedRetireEntries: Int = 0) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
+  require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
   override def retiredRobIds: Vec[Flow[UInt]] = retirementWires
   during setup {
-    retirementWires = Vec.fill(4)(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+    retirementWires = Vec.fill(scala.math.max(4, preparedRetireEntries))(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
   }
   private var historyStartWire: Bool = null
   private var historyKeepWire: Bool = null
@@ -345,7 +347,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
   val logic = during build new Area {
     val rc = host[RenameCommitService]
     val retireWidth = rc.commitPorts.length
-    require(Set(2, 4)(retireWidth))
+    require(if (preparedRetireEntries == 0) Set(2, 4)(retireWidth) else retireWidth == preparedRetireEntries)
+    val preparedPort = host.get[m68k040.services.PreparedCommitService].flatMap(_.preparedCommit)
+    require(preparedPort.isDefined == (preparedRetireEntries != 0), "ROB and rename preparation modes disagree")
     require(!detailedPerf || retireWidth == 2,
       "the detailed ILA retirement format supports two lanes only")
     // External interrupt inputs (simple protocol). The recognition logic (Task 3)
@@ -1038,6 +1042,15 @@ class RobPlugin(val detailedPerf: Boolean = false,
     }
 
     // ── Commit / retire (combinational, read at head) ──────────────────────────
+    def commitSlotOf(p: RobPayload): CommitSlot = {
+      val c = CommitSlot()
+      c.intArch := p.archRegId; c.intNew := p.intNew; c.intOld := p.intOld; c.intWrite := p.intWrite
+      c.nzvcNew := p.nzvcNew; c.nzvcOld := p.nzvcOld; c.nzvcWrite := p.nzvcWrite
+      c.xNew := p.xNew; c.xOld := p.xOld; c.xWrite := p.xWrite
+      c.fpArchDst := p.fpArchDst; c.fpNew := p.fpNew; c.fpOld := p.fpOld; c.fpWrite := p.fpWrite
+      c.fpccNew := p.fpccNew; c.fpccOld := p.fpccOld; c.fpccWrite := p.fpccWrite
+      c
+    }
     val h0 = head
     val h1 = head + 1
     val p0 = payload.readAsync(h0)
@@ -1336,10 +1349,77 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Extra bandwidth is for ordinary execution. Keep the existing precise
     // debug/trace boundary path and the single branch-training port unchanged.
     val retireLanes = Seq(retire0, retire1) ++ (2 until retireWidth).map(_ => Bool())
+    val preparedBatch = if (preparedRetireEntries != 0) Some(new Area {
+      val port = preparedPort.get
+      val active = RegInit(False); val ready = RegInit(False)
+      val base = Reg(UInt(robIdW bits)) init 0
+      val target = Reg(UInt(log2Up(retireWidth + 1) bits)) init 0
+      val cursor = Reg(UInt(log2Up(retireWidth + 1) bits)) init 0
+      val contextOk = !p0.retireAlone && !h0TraceArmed && !haltAfterArmedIn &&
+        !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
+        !haltA7OddEnIn && !haltPcRangeEnIn && (debugHaltState === DebugHaltState.RUNNING)
+      val ordinary = retirePayloads.zip(retireIds).zipWithIndex.map { case ((p, id), lane) =>
+        (count > lane) && !faultedStore(id) && !p.retireAlone && !p.isRte &&
+          !p.needsSup && !p.sysOp && !p.debugBreakValid
+      }
+      val prefix = ordinary.scanLeft(True: Bool)(_ && _).tail
+      val targetNow = UInt(log2Up(retireWidth + 1) bits); targetNow := 0
+      for (lane <- 0 until retireWidth) when(prefix(lane) && retirePayloads(lane).last) {
+        targetNow := lane + 1
+      }
+      val allReady = (0 until retireWidth).map { lane =>
+        (target <= lane) || (ordinary(lane) && completes(retireIds(lane)) &&
+          ((retirePayloads(lane).sysKind =/= sysAuxCapKind) || sysValRdyStore(retireIds(lane))))
+      }.reduce(_ && _)
+      val fire = active && ready && (base === head) && (target >= 3) && retire1 && contextOk && allReady
+      val advance = Mux(retire1, U(2), Mux(retire0, U(1), U(0))).resize(target.getWidth)
+      val abort = flushing || !contextOk || (active && retire0 && !fire && (advance >= target))
+      val start = !active && !retire0 && !flushing && excIdle && !stopped && !coreHalted &&
+        !interruptPending && contextOk && (count > 0) && !completes(h0) && (targetNow >= 3) &&
+        ((count >= retireWidth) || port.resourcePressure)
+      val preparing = start || (active && !ready && !abort)
+      val offset = Mux(start, U(0, cursor.getWidth bits), cursor)
+      val limit = Mux(start, targetNow, target)
+      val readBase = Mux(start, head, base)
+      val preparedCount = UInt(cursor.getWidth bits)
+      preparedCount := 0
+      when(active && !ready && !abort) {
+        preparedCount := Mux((target - cursor) >= 2, U(2), U(1)).resized
+      }
+      port.begin := start; port.abort := abort; port.publish := fire
+      for (lane <- 0 until 2) {
+        val id = (readBase + offset.resize(robIdW) + lane).resize(robIdW)
+        val p = payload.readAsync(id)
+        port.writes(lane).valid := preparing && ((offset + lane) < limit)
+        port.writes(lane).payload := commitSlotOf(p)
+      }
+      when(start) {
+        active := True; ready := False; base := head; target := targetNow; cursor := 2
+      }.elsewhen(active && !abort && !fire) {
+        // The complete image remains correct when its oldest updates become
+        // architectural normally. Keep its endpoint fixed, moving only the
+        // remaining interval and the cursor relative to that interval.
+        base := base + advance.resized
+        target := target - advance
+        cursor := cursor + preparedCount - advance
+        when((cursor + preparedCount) >= target) { ready := True }
+      }
+      when(abort || fire) { active := False; ready := False }
+      active.simPublic(); ready.simPublic(); base.simPublic(); target.simPublic()
+      cursor.simPublic(); start.simPublic(); fire.simPublic(); abort.simPublic()
+      assert(!fire || ((target >= 3) && (count >= target)), "invalid prepared retirement span")
+      assert(!active || (cursor <= target), "preparation cursor passed its fixed endpoint")
+      assert(!fire || (cursor === target), "publication before the entire map image was prepared")
+      assert(!active || (base === head), "prepared map no longer owns the live ROB prefix")
+      assert(!(active && !abort && !fire) || (cursor + preparedCount >= advance),
+        "ordinary retirement overtook map preparation")
+    }) else None
     for (lane <- 2 until retireWidth) {
       val p = retirePayloads(lane)
       val id = retireIds(lane)
-      retireLanes(lane) := retireLanes(lane - 1) && (count > lane) && completes(id) &&
+      if (preparedBatch.nonEmpty) {
+        retireLanes(lane) := preparedBatch.get.fire && (preparedBatch.get.target > lane)
+      } else retireLanes(lane) := retireLanes(lane - 1) && (count > lane) && completes(id) &&
         !faultedStore(id) && !p.retireAlone && !p.isRte && !p.needsSup && !p.sysOp &&
         !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
         !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
@@ -1600,23 +1680,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
 
     def driveCommit(k: Int, p: RobPayload, commitPc: UInt): Unit = {
       rc.commitPorts(k).valid     := True
-      rc.commitPorts(k).intArch   := p.archRegId
-      rc.commitPorts(k).intNew    := p.intNew
-      rc.commitPorts(k).intOld    := p.intOld
-      rc.commitPorts(k).intWrite  := p.intWrite
-      rc.commitPorts(k).nzvcNew   := p.nzvcNew
-      rc.commitPorts(k).nzvcOld   := p.nzvcOld
-      rc.commitPorts(k).nzvcWrite := p.nzvcWrite
-      rc.commitPorts(k).xNew      := p.xNew
-      rc.commitPorts(k).xOld      := p.xOld
-      rc.commitPorts(k).xWrite    := p.xWrite
-      rc.commitPorts(k).fpArchDst := p.fpArchDst
-      rc.commitPorts(k).fpNew     := p.fpNew
-      rc.commitPorts(k).fpOld     := p.fpOld
-      rc.commitPorts(k).fpWrite   := p.fpWrite
-      rc.commitPorts(k).fpccNew   := p.fpccNew
-      rc.commitPorts(k).fpccOld   := p.fpccOld
-      rc.commitPorts(k).fpccWrite := p.fpccWrite
+      rc.commitPorts(k).payload := commitSlotOf(p)
 
       traceFireVec(k)          := True
       traceVec(k).fire         := True
@@ -3647,7 +3711,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
         for (i <- 7 to (lane + 1) by -1) {
           ringPc(i) := ringPc(i - lane - 1); ringX(i) := ringX(i - lane - 1)
         }
-        for (i <- 0 to lane) { ringPc(i) := retirePayloads(lane - i).pc; ringX(i) := False }
+        for (i <- 0 until scala.math.min(8, lane + 1)) { ringPc(i) := retirePayloads(lane - i).pc; ringX(i) := False }
       }
       when(exc.obsFire) {
         for (i <- 7 downto 1) { ringPc(i) := ringPc(i - 1); ringX(i) := ringX(i - 1) }

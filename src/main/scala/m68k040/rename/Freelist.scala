@@ -41,7 +41,12 @@ case class Freelist(
   // at 2^ptrW, so the RAM must be that deep or pointers past physCount address out
   // of range. The ring only ever holds <= freeN free ids, so the extra capacity is
   // unused — it just keeps the binary pointer wrap consistent with the RAM depth.
-  val ram = Mem(UInt(idW bits), 1 << ptrW)
+  // The experimental 16-wide path exceeds the XOR multiwrite lowering's port
+  // limit. Consecutive compacted writes are conflict-free in low-bit banks.
+  val banked = pushPorts >= 16
+  require(!banked || pushPorts == 16)
+  val ram = if (!banked) Mem(UInt(idW bits), 1 << ptrW) else null
+  val popAddresses = Vec(UInt(ptrW bits), popPorts)
 
   // ── Pointers ──────────────────────────────────────────────────────────────
   val head  = Reg(UInt(ptrW   bits)) init 0
@@ -116,7 +121,7 @@ case class Freelist(
   // on one physical register -> stale-operand corruption). Same class for the push writes
   // below (their when(initDone && !io.flush) was equally ignored). ALL Mem writes here
   // now carry their COMPLETE condition in the explicit enable, at top scope.
-  ram.write(
+  if (!banked) ram.write(
     address = initCounter.resized,
     data    = (U(archCount, idW bits) + initCounter).resized,
     enable  = !initDone
@@ -157,7 +162,8 @@ case class Freelist(
     val lowerTakes =
       if (k == 0) U(0, log2Up(popPorts + 1) bits)
       else (0 until k).map(j => io.pop(j).take.asUInt.resize(log2Up(popPorts + 1))).reduce(_ +^ _)
-    io.pop(k).id := ram.readAsync((head + lowerTakes.resized).resized)
+    popAddresses(k) := (head + lowerTakes.resized).resized
+    if (!banked) io.pop(k).id := ram.readAsync(popAddresses(k))
   }
 
   // ── Pop / architectural-commit updates (not reclamation) ────────────────
@@ -195,7 +201,7 @@ case class Freelist(
       dbgPushAddr(j) := (tail + lowerValids.resized).resized
       // COMPLETE explicit enable (see the init-write gotcha note above): the when-scope
       // condition must be repeated here — Mem.write's explicit enable ignores the scope.
-      ram.write(
+      if (!banked) ram.write(
         address = dbgPushAddr(j),
         data    = reclaim(j).payload,
         enable  = initDone && reclaim(j).valid
@@ -204,4 +210,39 @@ case class Freelist(
 
     tail := (tail + reclaimCount.resized).resized
   }
+
+  val stripedRing = if (banked) Some(new Area {
+    val bankBits = log2Up(pushPorts)
+    val depth = (1 << ptrW) / pushPorts
+    require(depth >= 1)
+    val reads = Vec.fill(popPorts)(Vec(UInt(idW bits), pushPorts))
+    for (bank <- 0 until pushPorts) {
+      val address = UInt(log2Up(depth) bits)
+      val data = UInt(idW bits)
+      val enable = Bool()
+      address := (initCounter >> bankBits).resized
+      data := (U(archCount, idW bits) + initCounter).resized
+      enable := !initDone && (initCounter(bankBits - 1 downto 0) === bank)
+      for (lane <- 0 until pushPorts) {
+        when(initDone && reclaim(lane).valid &&
+          (dbgPushAddr(lane)(bankBits - 1 downto 0) === bank)) {
+          address := (dbgPushAddr(lane) >> bankBits).resized
+          data := reclaim(lane).payload
+          enable := True
+        }
+      }
+      if (depth == 1) {
+        val entry = Reg(UInt(idW bits))
+        when(enable) { entry := data }
+        for (port <- 0 until popPorts) reads(port)(bank) := entry
+      } else {
+        val entries = Mem(UInt(idW bits), depth)
+        entries.write(address, data, enable)
+        for (port <- 0 until popPorts)
+          reads(port)(bank) := entries.readAsync((popAddresses(port) >> bankBits).resized)
+      }
+    }
+    for (port <- 0 until popPorts)
+      io.pop(port).id := reads(port)(popAddresses(port)(bankBits - 1 downto 0))
+  }) else None
 }

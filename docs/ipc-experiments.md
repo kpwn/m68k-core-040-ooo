@@ -951,9 +951,21 @@ comparison, using the shared Vivado mutex, 5 ns and three post-route rounds.
 Both arms enable aligned-load fall-through and early integer wakeup; only the
 candidate enables direct longword MOVE loads. Early store address is off here
 to isolate fusion. Artifacts: `/tmp/fused-long-move-gate.5pIIgG`; the existing
-`build-logs:0` pane follows both elaboration and implementation logs. No routed
-result is available yet, and the combined fusion/early-store configuration will
-still need its own timing gate.
+`build-logs:0` pane follows both elaboration and implementation logs. The matched
+core-only run has now finished: baseline **+0.017 ns**, fusion **−0.275 ns** setup;
+fusion has TNS −100.626 ns across 936 failing setup endpoints, hold **+0.023 ns**
+and pulse **+1.958 ns**, with no hold/pulse failures. Routed LUTs decrease
+94,244→93,504 and FFs 38,751→38,693; the setup miss is not evidence of higher
+total utilization. The worst reported family is LS aligned-descriptor count →
+probe arbitration/read-slot logic → D-cache BRAM address (16 logic levels,
+74.0% routing delay). Other near-worst paths are ROB head → FPU unimplemented
+operand capture and ALU result bypass → LS index capture. Preserve the positive
+IPC version. Repair candidates are early registered admission/slot selection
+with explicit consume-and-replace ownership, and a registered cold FPU operand
+capture phase; do not add a resident-load recurrence cycle without remeasuring.
+These are proposed repairs, not implemented or verified fixes. The combined
+fusion/early-store configuration still needs its own timing gate. The serialized
+SQ-reservation comparison has started next.
 Use `IPC_FUSE_LONG_MOVE_LOADS=1`, `LOCKSTEP_FUSE_LONG_MOVE_LOADS=1`, or
 `--fuse-long-move-loads`. Production SocketTop remains unchanged. No board was
 halted, reset or reloaded; no board IPC or SoC timing gain is claimed.
@@ -1536,6 +1548,132 @@ After the debug-boundary fix, final default two-wide and composed four-wide
 profile reruns reproduce all 14 respective macro/cycle/branch/miss tuples
 exactly; the four-wide retirement histograms also match
 (`/tmp/wide-rob-final-default-ipc.log`, `/tmp/wide-rob-final-composed-ipc.log`).
+
+## Prepared shadow-map retirement — 2026-09-21
+
+Actual default-off prototype, not a renamed wider same-cycle RAT write path.
+Two preparation lanes fold five architectural maps into one unpublished image;
+publication swaps the complete image while preserving every commit/free/queue/
+CCR/PC/debug event. Caps 4/8/16 are explicit alternatives, production remains
+two-wide. [Contract and limitations](prepared-retirement.md).
+
+The first cap-8 attempt canceled on every ordinary retirement, produced **zero**
+batch publications and reproduced all fourteen original two-wide cycle counts
+(`/tmp/prepared-retire-8-ipc.log`). That is a failed mechanism exercise, not an
+IPC validation of batching. The revised implementation freezes the endpoint but
+retains its shadow image across ordinary consumption of the prefix: those older
+updates have simply become architectural. It never withholds ordinary retirement
+to complete preparation. Flush/debug cancellation invalidates the image.
+
+The initial cap-16 freelist could not elaborate: sixteen return ports plus the
+initialization write exceeded the XOR multiwrite lowering's read-port limit.
+The experimental cap-16 ring now uses sixteen conflict-free low-address banks,
+multiplexing initialization onto each bank's one write port. Small single-entry
+banks are registers. Pointer recovery and one-cycle free visibility are unchanged.
+This is **not** a BRAM/area claim or the proposed narrow reclamation FIFO.
+
+Composed LSU/predictor, seeds 1/17, L2 hit 5 / DDR 70, matched warmed macro windows:
+
+| Kernel | Macros | Ordinary 2 | Ordinary 4 | Prepared 4 | Prepared 8 | Prepared 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hot loop | 336 | 252 | 252 | 252 | 252 | 252 |
+| Short alternating | 132 | 138 | 138 | 138 | 138 | 138 |
+| Short backlog | 360 | 380 | 376 | 380 | 375 | 376 |
+| Copyback call/return | 672 | 1,174 | 1,173 | 1,174 | 1,174 | 1,174 |
+| Independent ALU | 396 | 267 | 267 | 267 | 267 | 267 |
+| Long alternating | 2,112 | 2,112 | 2,112 | 2,112 | 2,112 | 2,112 |
+| Long backlog | 2,520 | 2,240 | 2,240 | 2,240 | 2,240 | 2,240 |
+| Divider backlog (synthetic pressure) | 1,296 | 3,304 | 3,298 | 3,303 | 3,301 | 3,297 |
+
+Both seeds agree in these composed windows. Long-backlog batch histograms are
+56 three-entry publications at cap 4, 112 six-entry publications at cap 8, and
+112 thirteen-entry publications at cap 16. The mechanism is genuinely exercised,
+but larger batches do not improve that window's throughput. Cap 8's short-backlog
+gain is **1.333% IPC**, 0.947368→0.960000, with unchanged branch misses. Do not
+extrapolate it to sustained code or board performance.
+
+The divider control deliberately creates a long head stall followed by 24 ADDA
+instructions; its warmed window has 2,633 cycles without two-entry ROB capacity.
+Every retirement alternative retains exactly that count. Ordinary four-wide
+retires four on 288 cycles; prepared caps 4/8/16 each publish 48 full-cap batches.
+The measured whole-window gains shorten the final drain rather than the recurring
+divide bottleneck: the original and composed two-wide controls and measured
+cap-16 arms all retire the 48 divisions at exactly **70-cycle intervals** (47
+intervals per window, both seeds). The best seven-cycle difference is therefore
+not a steady-state speedup. Final cadence evidence is in
+`/tmp/prepared-retirement-final-{default,cadence}.log` and
+`/tmp/retirement-matrix-prepared16-pressure.log`.
+Preparation starts/publications can straddle a warmed-window boundary, so 47
+starts with 48 publications is expected and does not imply a duplicated batch.
+
+The original predictor configuration exposes the same timing-sensitive regression
+seen in the four-wide control. Short backlog takes 425/417/415 cycles at prepared
+caps 4/8/16 versus 425 two-wide; the original long backlog takes 2,660/2,966/
+3,364 cycles at seed 1 and 2,660/2,966/3,173 at seed 17. Long-window misses are
+29/57/89 (seed 1) and 29/57/73 (seed 17), all out of 224 branches, versus 29
+two-wide. The other ten original kernel/seed pairs outside the backlog kernels
+retain their earlier cycle and miss counts. These are observed prediction/recovery
+interactions, not proof of the exact predictor cause. Do not hide them behind the
+composed configuration's cleaner result. Original-arm evidence also includes
+`/tmp/retirement-matrix-prepared{4,16}-original.log`.
+
+Profile evidence: `/tmp/prepared-retire-8-{prefix,composed}-ipc.log`,
+`/tmp/prepared-retire-16-composed-ipc.log`,
+`/tmp/prepared-retire-pressure-baseline.log`, and
+`/tmp/retirement-matrix-{four-composed,prepared4-composed,prepared8-pressure,prepared16-pressure}.log`.
+Every measured arm has a matching instrumentation-off control; the log field
+`baselineCycles` denotes that same-configuration control, **not** the two-wide
+comparison in the table. All macros/register checks and retired-branch denominator
+checks must pass. Wider retirement is in micro-ops; IPC always counts macros.
+
+Priority: preserve the prototype and controls, but do not add more reclamation/
+checkpoint machinery on the strength of these small or absent gains. Investigate
+the actual recurring dependency and prediction losses next. Prepared caps are
+not routed, integrated into the SoC, or verified on the board.
+
+The first cap-16 oracle gate passed 31 cases but exposed two fixture assumptions
+(`/tmp/prepared-retirement-final-correctness.log`). Four NOPs did not separate two
+flag controls: both retired in one fourteen-entry batch, correctly leaving the
+younger N flag rather than the intermediate Z flag. Padding by a maximum batch
+width restores the intended test of the real committed CCR on the observation
+edge. The ROM-pop IRQ fixture already triggers on **raw** retire signals, but a
+single batch can legally pass more than its assumed one extra macro boundary.
+Its wide-mode recheck derives acceptance from the last emitted architectural
+macro at interrupt entry, not the DUT's stacked PC, bounds it to the remaining
+pop-chain boundaries, requires exactly one raised/accepted IRQ, and asks Musashi
+for that event schedule. PC/SR/CCR/register/A7 and memory comparisons remain
+strict, and the longer window includes handler and RTE even after all pops.
+Requested/accepted PCs are logged; this mode is **not** exact-boundary coverage.
+The ordinary two/four-wide fixture retains its original scheduling and retry.
+Both corrected cases pass, including all fifteen cache/timing/postincrement IRQ
+combinations (`/tmp/prepared-retirement-fixture-recheck.log`). No CPU semantics
+were changed to make those fixture assumptions hold.
+
+Correctness: three directed ROB tests pass, covering caps 4/8/16 with ordinary
+prefix consumption and repeated ROB wrap, seven barrier types across upper
+positions, flush cancellation, resource-pressure partial sealing, macro endpoints
+and a later debug stop. Twenty-three freelist/map/history tests pass, including
+2,500 fixed-seed allocator steps per class/width, one-cycle reclamation across
+flush/reset, sparse/wide WAW frees, all five map classes, ordinary prefix commits
+before image publication, canceled images and 4/8/16-bank PC history readback.
+The cap-16 composed oracle run passes 33 integer/memory/exception tests across
+the initial run and two fixture rechecks, plus all 28 FP tests (two existing
+ignored cases). Cap-16 production RTL generation passes; this is **not synthesis**.
+Logs: `/tmp/prepared-retirement-final-correctness.log` and
+`/tmp/prepared-retirement-fixture-recheck.log`.
+
+The final default-mode profile rerun reproduces all fourteen previous
+macro/cycle/branch/miss tuples exactly; the new divider control adds two checked
+rows. Both corrected fixtures also pass in unchanged two-wide mode
+(`/tmp/prepared-retirement-final-default.log`). No board action was taken.
+The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes
+**387 tests**, two ignored, zero failed or aborted suites
+(`/tmp/prepared-retirement-final-fast.log`).
+
+Reproduction switches: `IPC_PREPARED_RETIRE=4|8|16`,
+`LOCKSTEP_PREPARED_RETIRE=4|8|16`, or `GenFullCoreSynthVerilog
+--prepared-retire-4|--prepared-retire-8|--prepared-retire-16`. Select only one
+retirement experiment; defaults remain ordinary two-wide.
 
 ## Next investigations requested — 2026-09-21
 

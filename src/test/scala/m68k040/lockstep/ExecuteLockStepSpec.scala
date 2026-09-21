@@ -506,9 +506,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dec    = new DecodeStage(allowSlot1Prediction =
       sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       fuseLongMoveLoads = sys.env.get("LOCKSTEP_FUSE_LONG_MOVE_LOADS").contains("1"))
-    val ren    = new RenameStage(retireWidth = sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2))
+    val preparedCap = sys.env.get("LOCKSTEP_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
+    val ren    = new RenameStage(
+      retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
+      preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
-    val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
+    val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
+      preparedRetireEntries = preparedCap)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
@@ -1225,10 +1229,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                      // port (`RegNext` of a live PRF readback). See LockStep.compare's
                      // `a7ProbeLag` doc; default false keeps every existing call site strict.
                      a7ProbeLag: Boolean = false,
+                     // Opt-in single-IRQ wide-retirement fixture. Record the last
+                     // committed MACRO's next PC at entry, independently of the
+                     // exception unit's stacked PC, then ask Musashi to inject at
+                     // that boundary. No state/value/frame comparison is relaxed.
+                     allowedAcceptedIrqPcs: Set[Long] = Set.empty,
                      maxCycles: Int = 6000): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val ackVector = if (avec) None else Some(vectorIn)
-    val oracleMem: Map[Long, Int] =
+    require(allowedAcceptedIrqPcs.isEmpty || (irqEvents.size == 1 && irqEvents.head._2 != 7 && oracleIrqEvents.isEmpty))
+    val nominalOracleMem: Map[Long, Int] =
       if (checkMem.nonEmpty) Musashi.assembleAndRun(src, irqEvents = oracleIrqEvents.getOrElse(irqEvents),
                                                     interruptAckVector = ackVector, initialSr = Some(initialSr)) match {
         case Right(st) => st.memoryWrites
@@ -1248,7 +1258,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     assert(oracleSteps.size >= nInstr,
       s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $nInstr")
-    val oracle = oracleSteps.take(nInstr)
+    val nominalOracle = oracleSteps.take(nInstr)
     // Root-cause fix (post-Task-P2.5 lock-step investigation), NMI-specific extra
     // lead time: level 7 can NEVER be recognized via the direct `iplIn > mask`
     // compare when mask is also 7 (7 > 7 is false, by 68k design -- NMI is
@@ -1285,6 +1295,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       var wbCount = 0; var commitCount = 0
       // Pending IRQ to assert + a one-shot guard so we drive a single edge per event.
       val firedEvents = scala.collection.mutable.Set[Long]()
+      val acceptedIrqPcs = scala.collection.mutable.ArrayBuffer.empty[Long]
 
       // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
       // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
@@ -1440,6 +1451,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                 msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
                 isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             } else {
+              if (allowedAcceptedIrqPcs.nonEmpty) {
+                assert(firedEvents.size == 1 && acceptedIrqPcs.isEmpty,
+                  "wide IRQ fixture must raise and accept exactly one interrupt")
+                assert(handle.result.nonEmpty, "IRQ entry without an architectural predecessor")
+                val boundary = handle.result.last.pc & 0xffffffffL
+                assert(allowedAcceptedIrqPcs(boundary), f"unexpected IRQ acceptance boundary 0x$boundary%08x")
+                acceptedIrqPcs += boundary
+                println(f"[$name] requested IRQ @0x${irqEvents.head._1}%08x; accepted after committed macro @0x$boundary%08x")
+              }
               // Drop the IRQ line on the entry commit (one-shot edge): the interrupt
               // is taken, the mask is raised; a re-fire after RTE must not loop.
               dut.intCtrl.logic.iplIn #= 0
@@ -1498,6 +1518,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(handle.result.size >= nInstr,
         s"[$name] only ${handle.result.size}/$nInstr instructions committed within $cap cycles")
 
+      val acceptedEvents = if (allowedAcceptedIrqPcs.nonEmpty) {
+        assert(acceptedIrqPcs.size == 1, "wide IRQ fixture never accepted its interrupt")
+        Some(Seq(acceptedIrqPcs.head -> irqEvents.head._2))
+      } else None
+      val oracle = acceptedEvents.map { events =>
+        val steps = Musashi.assembleAndTrace(src, irqEvents = events, interruptAckVector = ackVector,
+          initialSr = Some(initialSr), initialMsp = initialMsp)
+          .getOrElse(fail(s"[$name] accepted-boundary oracle failed"))
+        assert(steps.size >= nInstr)
+        steps.take(nInstr)
+      }.getOrElse(nominalOracle)
+      val oracleMem = if (checkMem.nonEmpty && acceptedEvents.nonEmpty)
+        Musashi.assembleAndRun(src, irqEvents = acceptedEvents.get, interruptAckVector = ackVector,
+          initialSr = Some(initialSr)).getOrElse(fail(s"[$name] accepted-boundary memory oracle failed")).memoryWrites
+      else nominalOracleMem
       val res = LockStep.compare(handle.result.take(nInstr), oracle, a7ProbeLag = a7ProbeLag)
       if (!res.ok) {
         // ── Failure dump ──────────────────────────────────────────────────────────────
@@ -12363,8 +12398,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // exception entry stacks) around the retire of a flag-writing STORE vs an ALU op.
   test("committedCcr shadow: a MOVE-to-memory's NZVC must be folded by the cycle after its retire", VerilatorTest) {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
-    val src = "move.l #0x00003000,%a1 ; move.l #0xff,%d0 ; nop ; nop ; nop ; nop ; move.b %d0,(%a1) ; nop ; nop ; nop ; nop ; " +
-      "moveq #0,%d1 ; nop ; nop ; nop ; nop ; move.b %d0,%d2 ; nop ; nop ; nop ; nop ; end: bra.s end"
+    val spacing = scala.math.max(4, sys.env.get("LOCKSTEP_PREPARED_RETIRE").map(_.toInt).getOrElse(0))
+    val nops = Seq.fill(spacing)("nop").mkString(" ; ")
+    val src = s"move.l #0x00003000,%a1 ; move.l #0xff,%d0 ; $nops ; move.b %d0,(%a1) ; $nops ; " +
+      s"moveq #0,%d1 ; $nops ; move.b %d0,%d2 ; $nops ; end: bra.s end"
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => fail(s"[ccr-shadow] ProgramAssembler.assemble failed: ${err.reason}")
@@ -12392,8 +12429,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
       val obs = dut.rob.logic.ordinaryCommitObs
-      // instruction start addresses: a1(6) d0(6) nop*4(8) -> store at +20 (2 bytes) -> moveq at +30 -> move.b d0,d2 at +40
-      val storePc = loadAddr + 20; val moveqPc = loadAddr + 30; val aluPc = loadAddr + 40
+      // Separate flag writers by at least one maximum retirement group; four
+      // NOPs alone allow both controls in the SAME cap-16 publication.
+      val storePc = loadAddr + 12 + 2 * spacing
+      val moveqPc = storePc + 2 + 2 * spacing; val aluPc = moveqPc + 2 + 2 * spacing
       var cyc = 0
       while (cyc < 600) {
         cd.waitSampling(); cyc += 1
@@ -12415,7 +12454,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         }
         // the obs fires the cycle AFTER the retire, and committedCcr is registered off that
         // retire cycle: sample it at the obs cycle itself (== retire + 1), before the next
-        // flag-writing instruction (4 NOPs later) can fold on top.
+        // flag-writing instruction (one full retirement width later) can fold on top.
         if (storeRetireCyc > 0 && cyc == storeRetireCyc) ccrAfterStore = ccr
         if (moveqRetireCyc > 0 && cyc == moveqRetireCyc) ccrAfterMoveq = ccr
         if (aluRetireCyc > 0 && cyc == aluRetireCyc)     ccrAfterAlu = ccr
@@ -13231,21 +13270,34 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val k = withIrq.indexWhere(_.pc == endPc)
       assert(k > popPcs.size, f"[a7-popchain] IRQ at 0x$pc%08x was NOT taken (reached `loop` at step $k)")
       val n = (k + 1) min withIrq.size
-      val exact = try {
-        runIrqLockStep(f"a7-popchain-$dname-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
-                       avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4,
-                       dcfg = dcfg, cacr = cacrVal, maxCycles = 40000); true
-      } catch { case _: org.scalatest.exceptions.TestFailedException => false }
-      if (!exact) {
-        val pc2 = nextPc(pc)
-        val withIrq2 = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc2, 5)))
-          .getOrElse(fail(s"[a7-popchain] oracle (irq@$pc2) failed"))
-        val k2 = withIrq2.indexWhere(_.pc == endPc)
-        println(f"[a7-popchain/$dname] boundary $i (0x$pc%08x) not exact; re-checking against the boundary-${i + 1} oracle (0x$pc2%08x)")
-        runIrqLockStep(f"a7-popchain-$dname-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
-                       irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
-                       oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4,
-                       dcfg = dcfg, cacr = cacrVal, maxCycles = 40000)
+      val widePrepared = sys.env.get("LOCKSTEP_PREPARED_RETIRE").exists(_.toInt > 4)
+      if (widePrepared) {
+        // Reactive stimulus cannot interrupt the middle of a same-edge batch.
+        // Compare at the ACTUAL architectural boundary, inferred from the
+        // retirement stream, not from the DUT's potentially faulty stacked PC.
+        // Twenty macros include handler + RTE even if acceptance follows all pops.
+        // Log requested versus accepted PCs: this is not exact-boundary coverage.
+        runIrqLockStep(f"a7-popchain-$dname-b$i-wide", src, nInstr = 20,
+          irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
+          checkMem = pins, checkSpan = 4, dcfg = dcfg, cacr = cacrVal, maxCycles = 40000,
+          allowedAcceptedIrqPcs = (popPcs.drop(i) :+ endPc).toSet)
+      } else {
+        val exact = try {
+          runIrqLockStep(f"a7-popchain-$dname-b$i", src, nInstr = n, irqEvents = Seq((pc, 5)),
+                         avec = true, initialSr = 0x2000, checkMem = pins, checkSpan = 4,
+                         dcfg = dcfg, cacr = cacrVal, maxCycles = 40000); true
+        } catch { case _: org.scalatest.exceptions.TestFailedException => false }
+        if (!exact) {
+          val pc2 = nextPc(pc)
+          val withIrq2 = Musashi.assembleAndTrace(src, initialSr = Some(0x2000), irqEvents = Seq((pc2, 5)))
+            .getOrElse(fail(s"[a7-popchain] oracle (irq@$pc2) failed"))
+          val k2 = withIrq2.indexWhere(_.pc == endPc)
+          println(f"[a7-popchain/$dname] boundary $i (0x$pc%08x) not exact; re-checking against the boundary-${i + 1} oracle (0x$pc2%08x)")
+          runIrqLockStep(f"a7-popchain-$dname-b$i-late", src, nInstr = (k2 + 1) min withIrq2.size,
+                         irqEvents = Seq((pc, 5)), avec = true, initialSr = 0x2000,
+                         oracleIrqEvents = Some(Seq((pc2, 5))), checkMem = pins, checkSpan = 4,
+                         dcfg = dcfg, cacr = cacrVal, maxCycles = 40000)
+        }
       }
     }
   }

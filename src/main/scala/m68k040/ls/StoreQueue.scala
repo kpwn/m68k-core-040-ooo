@@ -100,7 +100,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
                  forwardOnPublish: Boolean = false, retireWidth: Int = 2) extends Component {
   require(isPow2(depth))
-  require(retireWidth == 2 || retireWidth == 4)
+  require(Set(2, 4, 8, 16)(retireWidth))
   require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
   val ptrW = log2Up(depth)
 

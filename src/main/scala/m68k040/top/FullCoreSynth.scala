@@ -820,7 +820,8 @@ object GenFullCoreSynthVerilog {
                 reserveLateStore: Boolean = false,
                 detachLateStore: Boolean = false,
                 forwardOnPublish: Boolean = false,
-                retireWidth: Int = 2): Unit = {
+                retireWidth: Int = 2,
+                preparedRetireEntries: Int = 0): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -854,9 +855,10 @@ object GenFullCoreSynthVerilog {
             trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional),
           new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
             fuseLongMoveLoads = fuseLongMoveLoads),
-          new RenameStage(retireWidth = retireWidth),
+          new RenameStage(retireWidth = if (preparedRetireEntries == 0) retireWidth else preparedRetireEntries,
+            preparedRetirement = preparedRetireEntries != 0),
           new DispatchPlugin(),
-          new RobPlugin(pairCorrectBranch = pairCorrectBranch),
+          new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries),
           new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress),
           eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
@@ -885,10 +887,14 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--retire-four", "--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish")),
+    val preparedOptions = Map("--prepared-retire-4" -> 4, "--prepared-retire-8" -> 8, "--prepared-retire-16" -> 16)
+    require(args.forall(Set("--retire-four", "--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads", "--reserve-late-store", "--detach-late-store", "--forward-on-publish") ++ preparedOptions.keySet),
       "unknown FullCoreSynth experiment option")
+    require(args.count(a => preparedOptions.contains(a) || a == "--retire-four") <= 1,
+      "select only one retirement experiment")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       retireWidth = if (args.contains("--retire-four")) 4 else 2,
+      preparedRetireEntries = args.flatMap(preparedOptions.get).headOption.getOrElse(0),
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
       earlyLsIntWakeup = args.contains("--early-ls-int-wakeup"),
       sqSubwordForwarding = args.contains("--sq-subword-forwarding"),

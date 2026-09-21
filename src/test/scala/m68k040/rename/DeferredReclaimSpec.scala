@@ -9,7 +9,7 @@ class DeferredReclaimSpec extends AnyFunSuite {
   // NZVC, X and FPCC use the same 16/1 component specialization.
   for ((name, physical, architectural) <- Seq(
     ("integer", m68k040.Global.PHYS_INT_REGS_DEFAULT, m68k040.isa.Isa.ARCH_INT_REGS),
-    ("NZVC/X/FPCC", 16, 1), ("FP", 16, 8)); width <- Seq(2, 4)) {
+    ("NZVC/X/FPCC", 16, 1), ("FP", 16, 8)); width <- Seq(2, 4, 8, 16)) {
     test(s"$name $width-wide delayed reclaim: WAW, flush, wrap, full/empty and reset", VerilatorTest) {
       M68kSim().withVerilator.compile(Freelist(physical, architectural, 2, width)).doSim { dut =>
         val cd = dut.clockDomain
@@ -91,9 +91,10 @@ class DeferredReclaimSpec extends AnyFunSuite {
 
         // A full batch contains allocations from more than one rename edge.
         // No intermediate WAW free may be lost when only the last map survives.
-        for (_ <- 0 until width / 2) step(alloc = 2)
-        step(retire = width)
-        assert(pending.size == width)
+        val batchSize = math.min(width, (physical - architectural) / 2 * 2)
+        for (_ <- 0 until batchSize / 2) step(alloc = 2)
+        step(retire = batchSize, sparse = true)
+        assert(pending.size == batchSize)
         step(flush = true)
         step(flush = true)
 
