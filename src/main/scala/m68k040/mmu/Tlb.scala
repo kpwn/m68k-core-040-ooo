@@ -47,8 +47,8 @@ object Tlb {
   *   bank = vpn[bankBits-1:0]
   *   set  = vpn[bankBits+setBits-1:bankBits]
   *   tag  = vpn[19:bankBits+setBits]
-  * Lookup is a SHALLOW per-bank way-mux (NOT a deep CAM): the bank is selected
-  * combinationally and only that bank's `ways` tags are compared — FPGA-friendly.
+  * Lookup selects one flattened bank/set row per way (NOT a full CAM): only
+  * that row's `ways` tags are compared. Storage and fill remain banked.
   *
   * Ports (plain wires, driven/read by the owning plugin):
   *  - lookup : drive `lookupVpn`; read `hit` / `hitEntry` (combinational, 1-cycle).
@@ -158,20 +158,31 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val lkSet  = setOf(io.lookupVpn)
   val lkTag  = tagOf(io.lookupVpn)
 
-  // Shallow per-bank way-mux: select the bank's entries, compare only `ways` tags.
+  // Select bank/set together, rather than muxing every set of a bank first.
+  // Row order is bank-major; omit the helper's synthetic bit for singleton axes.
+  // This changes only mux topology, not storage, lookup latency or fill/purge.
+  val lkRow = if (bankBits == 0) lkSet
+              else if (setBits == 0) lkBank
+              else (lkBank ## lkSet).asUInt
+  def lookupRow[T <: Data](rows: Vec[Vec[Vec[T]]], way: Int): T = {
+    val flat = Vec(for (b <- 0 until banks; s <- 0 until nSets) yield rows(b)(way)(s))
+    if (banks * nSets == 1) flat(0) else flat(lkRow)
+  }
+
+  // Select one row, then compare only `ways` tags (same four as before).
   val hitVec = Vec(Bool(), ways)
   val entVec = Vec(TlbEntry(), ways)
   for (w <- 0 until ways) {
-    val v = valids(lkBank)(w)(lkSet)
-    val t = tags(lkBank)(w)(lkSet)
-    hitVec(w) := v && (t === lkTag) && (tagSup(lkBank)(w)(lkSet) === io.lookupSup)
+    val v = lookupRow(valids, w)
+    val t = lookupRow(tags, w)
+    hitVec(w) := v && (t === lkTag) && (lookupRow(tagSup, w) === io.lookupSup)
     val e = TlbEntry()
     e.vpnTag     := t
-    e.ppn        := ppns(lkBank)(w)(lkSet)
-    e.writeProt  := wProt(lkBank)(w)(lkSet)
-    e.supervisor := sup(lkBank)(w)(lkSet)
-    e.cacheMode  := cmode(lkBank)(w)(lkSet)
-    e.modified   := modif(lkBank)(w)(lkSet)
+    e.ppn        := lookupRow(ppns, w)
+    e.writeProt  := lookupRow(wProt, w)
+    e.supervisor := lookupRow(sup, w)
+    e.cacheMode  := lookupRow(cmode, w)
+    e.modified   := lookupRow(modif, w)
     entVec(w) := e
   }
   // ── MULTI-HOT FAIL-SAFE (2026-09-17) ────────────────────────────────────────
