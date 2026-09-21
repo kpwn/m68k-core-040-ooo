@@ -7,7 +7,7 @@ import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileS
   RegFileReadPort, RegFileWritePort}
 import spinal.core._
 import spinal.core.sim._
-import spinal.lib.slave
+import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
 /** The CPU-side debug/control AXI4-Lite slave (design spec
@@ -913,8 +913,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       _irqInjectAck   = irqInjectAck
 
       when(dbgAxi.arvalid && dbgAxi.arready) { arPend := True; arAddr := dbgAxi.araddr }
-      /** READ STAGE 1. High for exactly one cycle, the cycle in which the captured
-        * address is DECODED: the per-region partial words, the live-register physical
+      /** READ STAGE 1. High for exactly one cycle, when the captured word selects
+        * sample their live sources: the per-region partial words, live-register physical
         * address and the history-body kind/word are all latched on this edge. Spec
         * section 11 rule 1 ("keep the CSR read mux off any combinational path leaving
         * this block") and spec 3.1 ("the implementation is free of the legacy fixed
@@ -1454,330 +1454,328 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       def ramWindowWord: Bits = B(0, 26 bits) ## ramWindow.asBits
       def monSenseWord:  Bits = B(0, 25 bits) ## mon.asBits
 
-      // ── Read mux: a TWO-STAGE pipeline (FMax, 2026-09-17) ─────────────────────────
-      // Stage 1's CSR values are added by Tasks 8-10. The default arm is the whole
-      // contract for every offset this stage does not implement: spec 3.2 -- "It must
-      // reserve them, return zero for absent functions, and never repurpose them."
+      // Decode each implemented word on the AR capture edge, before the wide
+      // read mux. Binary arAddr bits previously drove >1000 routed loads each.
+      // Local registered selects keep that decode out of the data-selection cycle.
+      // arAddr remains for history-body and live-PRF addressing.
       //
-      // WHY THIS IS SPLIT. The mux used to be ONE `switch(arAddr)` with ~100 arms whose
-      // result landed directly in `rData`, i.e. a ~20-bit comparison against ~100
-      // constants followed by a ~100:1 32-bit mux, in a single cycle -- the
-      // `csr_arAddr_reg => csr_rData_reg` family (23 endpoints, worst -0.208 ns at
-      // 200 MHz). Worse, several of its SOURCES are themselves late combinational packs
-      // of live core state (`DcachePlugin.dbgStallDcPack`, `LsEuPlugin.dbgStallGrantPack`
-      // -- see their registered copies above) or, in the case of the live integer
-      // registers, a walk through the committed RAT into a physical-register-file read.
-      //
-      // The mux is now partitioned by ADDRESS REGION -- the regions the register map
-      // already has -- with one registered partial word per region. Exactly one region
-      // can match a given address (every offset in `DebugRegMap` is unique and every arm
-      // below lists a distinct one), and a region that does not match holds zero, so
-      // stage 2's OR of the six partial words reproduces the old single `switch`
-      // EXACTLY, including its "unlisted offset reads zero" contract.
-      //
-      // Cost: 6 x 32 flops, and reads take one more cycle to answer (RVALID one cycle
-      // later). Debug CSR reads arrive over JTAG at human speed and every driver in the
-      // tree -- `DbgAxiDriver`, `tools/jtag_repl.tcl`, the Vivado JTAG-to-AXI master --
-      // is handshake-driven, never fixed-latency. History-body reads ALREADY took this
-      // extra cycle (`historyReadPending`); this change simply makes every read uniform.
-      when(doRead) {
-        // ── Region 0: 0x00000-0x000FF, identity / control / halt / SoC config ───────
-        rdCore := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
-          is(DebugRegMap.OFF_VERSION) {
-            rdCore := B(DebugRegMap.VERSION_VALUE, DebugRegMap.DBG_DW bits)
+      // Only the ADDRESS is decoded early. Values are still sampled at doRead;
+      // the six regional words and the response register retain their existing
+      // latency, reset domain and backpressure behavior. Unlisted/unaligned
+      // addresses select no word and therefore return zero.
+      private val readOffsets = scala.collection.mutable.Set.empty[Int]
+      class ReadRegion extends Area {
+        private val words = scala.collection.mutable.ArrayBuffer.empty[Bits]
+        def at(offset: Int)(word: => Bits): Unit = {
+          require(readOffsets.add(offset), f"Duplicate debug read offset 0x$offset%05x")
+          val selected = RegInit(False)
+          when(dbgAxi.arvalid && dbgAxi.arready) {
+            selected := dbgAxi.araddr === offset
           }
-          is(DebugRegMap.OFF_BUILD_ID) {
-            rdCore := B(buildId, DebugRegMap.DBG_DW bits)
-          }
-          is(DebugRegMap.OFF_FEATURES) {
-            // NOT a literal: computed from the STAGE column of debug_regmap.def, so a
-            // build cannot advertise a bit whose behaviour it has not built (spec 3.4).
-            rdCore := B(advertisedFeatures, DebugRegMap.DBG_DW bits)
-          }
-          is(DebugRegMap.OFF_CAP_TRACE) {
-            val depth = if (historyBuilt) historyDepth else 0
-            rdCore := B(depth, 16 bits) ## B(depth, 16 bits)
-          }
-          is(DebugRegMap.OFF_CAP_TRACE2) {
-            val depth = if (historyBuilt) historyDepth else 0
-            rdCore := B(0, 16 bits) ## B(depth, 16 bits)
-          }
-          is(DebugRegMap.OFF_CONTROL) {
-            rdCore := controlWord
-          }
-          is(DebugRegMap.OFF_PC)      { rdCore := livePc.asBits }
-          is(DebugRegMap.OFF_LAST_PC) { rdCore := lastPc.asBits }
-          is(DebugRegMap.OFF_HALT_AFTER_LO) { rdCore := haltAfterTarget(31 downto 0).asBits }
-          is(DebugRegMap.OFF_HALT_AFTER_HI) { rdCore := haltAfterTarget(63 downto 32).asBits }
-          if (stage >= 5) {
-            is(DebugRegMap.OFF_BREAK_PC0) { rdCore := breakPc(0).asBits }
-            is(DebugRegMap.OFF_BREAK_PC1) { rdCore := breakPc(1).asBits }
-            is(DebugRegMap.OFF_BREAK_PC2) { rdCore := breakPc(2).asBits }
-            is(DebugRegMap.OFF_BREAK_PC3) { rdCore := breakPc(3).asBits }
-            is(DebugRegMap.OFF_BREAK_PC_CTRL) { rdCore := B(0, 28 bits) ## breakPcEnable }
-            is(DebugRegMap.OFF_BP_SKIP_ONCE) { rdCore := B(0, 28 bits) ## breakSkipOnce }
-            for (i <- 0 until 8) {
-              is(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) { rdCore := haltExceptionMask(i) }
-            }
-          }
-          is(DebugRegMap.OFF_HALT_CTL) {
-            rdCore := B(0, 31 bits) ## haltAfterArmed
-          }
-          is(DebugRegMap.OFF_HALT_REASON) {
-            rdCore := B(0, 29 bits) ##
-              dbgCommit.map(_.haltReasonDebug).getOrElse(U(0, 3 bits)).asBits
-          }
-          is(DebugRegMap.OFF_HALT_HIT_PC) {
-            rdCore := dbgCommit.map(_.haltHitPc.asBits).getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_EXC_VEC) {
-            rdCore := dbgCommit.map(s => s.haltExceptionVector.resize(32).asBits)
-              .getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_EXC_PC) {
-            rdCore := dbgCommit.map(_.haltExceptionPc.asBits).getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_EXC_FAULT_ADDR) {
-            rdCore := dbgCommit.map(_.haltExceptionFaultAddress.asBits).getOrElse(B(0, 32 bits))
-          }
-          // 2026-09-09: these two have been RESERVED in the regmap since Stage 1 with
-          // nothing driving them, which is why the REPL always printed `dbl_fault=0` even
-          // on a core that had double-faulted. Now backed by `ExceptionUnit.dblFaultPc` /
-          // `dblFaultVec` -- the PC of the instruction whose exception processing hit a
-          // bus error on its handler-vector read, and the vector it was fetching (the
-          // faulting table address is VBR + vec*4). Both stay 0 until a double fault.
-          is(DebugRegMap.OFF_DBL_FAULT_PC) {
-            rdCore := dbgCommit.map(_.dblFaultPc.asBits).getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_DBL_FAULT_VEC) {
-            rdCore := dbgCommit.map(s => s.dblFaultVec.resize(32).asBits).getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_HALT_HIT_INST_LO) {
-            rdCore := haltHitInstCount(31 downto 0).asBits
-          }
-          is(DebugRegMap.OFF_HALT_HIT_INST_HI) {
-            rdCore := haltHitInstCount(63 downto 32).asBits
-          }
-          is(DebugRegMap.OFF_STATUS) {
-            rdCore := B(0, 27 bits) ##
-                      automaticHalt ##    // bit 4  auto-halt latched
-                      !effectiveHalt ##   // bit 3  running (inverse of halted)
-                      initDoneLatched ##  // bit 2  init-done seen
-                      dbgCommit.map(_.exceptionPending).getOrElse(False) ## // bit 1
-                      effectiveHalt       // bit 0  effective coherent halt
-          }
-          is(DebugRegMap.OFF_RAM_WINDOW_LG2) { rdCore := ramWindowWord }
-          is(DebugRegMap.OFF_MON_SENSE)      { rdCore := monSenseWord }
-          is(DebugRegMap.OFF_DBG_RESET_CTL) {
-            // Deployed layout (debug_ctrl.v:1411): {cpu_reset_count_r, 16'd0}.
-            rdCore := cpuResetCount.asBits ## B(0, 16 bits)
-          }
+          words += word.andMask(selected)
         }
+        def value: Bits = words.toSeq.reduceBalancedTree(_ | _)
+      }
 
-        // ── Region 1: 0x00100-0x00FFF + 0x00200 block, halt lanes / cache maint ─────
-        rdLane := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
-          if (stage >= 5) {
-            is(DebugRegMap.OFF_A7ODD_CTL) { rdLane := a7OddCtl }
-            is(DebugRegMap.OFF_PCRANGE_CTL) { rdLane := pcRangeCtl }
-            is(DebugRegMap.OFF_PCRANGE_LO)  { rdLane := pcRangeLo }
-            is(DebugRegMap.OFF_PCRANGE_HI)  { rdLane := pcRangeHi }
-            is(DebugRegMap.OFF_PCRANGE_PC0) {
-              rdLane := dbgCommit.map(_.pcRangePc0.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_PCRANGE_PC1) {
-              rdLane := dbgCommit.map(_.pcRangePc1.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_PCRANGE_PC2) {
-              rdLane := dbgCommit.map(_.pcRangePc2.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_PCRANGE_COUNT) {
-              rdLane := dbgCommit.map(s => B(0, 16 bits) ## s.pcRangeCount.asBits)
-                .getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_A7ODD_PC0) {
-              rdLane := dbgCommit.map(_.a7OddPc0.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_A7ODD_PC1) {
-              rdLane := dbgCommit.map(_.a7OddPc1.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_A7ODD_PC2) {
-              rdLane := dbgCommit.map(_.a7OddPc2.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_A7ODD_VALUE) {
-              rdLane := dbgCommit.map(_.a7OddValue.asBits).getOrElse(B(0, 32 bits)) }
-            is(DebugRegMap.OFF_A7ODD_COUNT) {
-              rdLane := dbgCommit.map(s => B(0, 16 bits) ## s.a7OddEpisodes.asBits)
-                .getOrElse(B(0, 32 bits)) }
-          }
-          // 2026-09-09: the fatal-halt ATTRIBUTION. `OFF_HALT_REASON` reports the debug
-          // domain's coarse code and collapses every fatal cause to FATAL(4); this is
-          // `RobPlugin.haltReason`, the sticky first-wins `socket.HaltReason` value that
-          // says WHICH producer halted the core. Without it a fatal halt on hardware is
-          // unattributable without an ENABLE_ILA bitstream.
-          is(DebugRegMap.OFF_HALT_KIND) {
-            rdLane := dbgCommit.map(s => s.haltKind.resize(32).asBits).getOrElse(B(0, 32 bits))
-          }
-          is(DebugRegMap.OFF_DCACHE_OP) {
-            rdLane := B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
-              cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
-          }
-          is(DebugRegMap.OFF_ICACHE_OP) {
-            rdLane := B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
-              cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
-          }
+      // ── Region 0: 0x00000-0x000FF, identity / control / halt / SoC config ───────
+      val readCore = new ReadRegion {
+        at(DebugRegMap.OFF_VERSION) {
+          B(DebugRegMap.VERSION_VALUE, DebugRegMap.DBG_DW bits)
         }
-
-        // ── Region 2: 0x01000-0x01FFF, free-running counters and stall packs ────────
-        rdCount := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
-          // Free-running core_clk cycle count -- see cycleCountReg above. This is
-          // the frequency probe; it advances whenever the clock does, halted or
-          // not, so a pair of reads a known interval apart MEASURES the core
-          // clock instead of restating what the build asked for.
-          is(DebugRegMap.OFF_CYCLE_LO) { rdCount := cycleCount(31 downto 0).asBits }
-          is(DebugRegMap.OFF_CYCLE_HI) { rdCount := cycleCount(63 downto 32).asBits }
-          is(DebugRegMap.OFF_INST_LO) { rdCount := macroCount(31 downto 0).asBits }
-          fetchCheck.foreach { f =>
-            is(DebugRegMap.OFF_FETCH_CHECK_CTL) {
-              rdCount := B(0, 29 bits) ## f.slot ## f.hit ## f.enabled
-            }
-            is(DebugRegMap.OFF_FETCH_CHECK_PC) { rdCount := f.pc.asBits }
-            is(DebugRegMap.OFF_FETCH_CHECK_WORD) { rdCount := f.expected.resize(32) }
-            is(DebugRegMap.OFF_FETCH_CHECK_HIT_PC) { rdCount := f.hitPc.asBits }
-            is(DebugRegMap.OFF_FETCH_CHECK_HIT_WORD) { rdCount := f.hitWord }
-            is(DebugRegMap.OFF_FETCH_CHECK_SEEN) { rdCount := f.seen.asBits }
-          }
-          is(DebugRegMap.OFF_INST_HI) { rdCount := macroCount(63 downto 32).asBits }
-          // Live, free-running, never halt-captured -- see excCountReg above.
-          is(DebugRegMap.OFF_EXC_COUNT) { rdCount := excCount }
-          // ── p141 walker-stall state (live; no halt required) ──────────────────
-          // Read these ALONGSIDE OFF_INST_LO/HI: the wedge is identified by the
-          // retire count being frozen, and these four words say what it is frozen
-          // ON. See DebugRegMap's OFF_STALL_* comment for why they live here in
-          // the counter block rather than the halt-captured arch block.
-          // The four packs are read from their REGISTERED copies (see above): they are
-          // deep combinational packs of live core state and belong nowhere near a mux.
-          is(DebugRegMap.OFF_STALL_ARB)   { rdCount := stallArbPackReg }
-          is(DebugRegMap.OFF_STALL_DC)    { rdCount := stallDcPackReg }
-          is(DebugRegMap.OFF_STALL_GRANT) { rdCount := stallGrantPackReg }
-          is(DebugRegMap.OFF_STALL_EXC)   { rdCount := stallExcPackReg }
-          is(DebugRegMap.OFF_STALL_WALK)  { rdCount := stallWalkPackReg }
-          // Multi-hot evidence (2026-09-17). Region 2 so it is LIVE -- no halt required
-          // -- for the same reason the p141 stall words are: a multi-hot may well be part
-          // of why a halt never lands.
-          is(DebugRegMap.OFF_MULTIHOT_STATUS)   { rdCount := multiHotStatusReg }
-          is(DebugRegMap.OFF_MULTIHOT_IC)       { rdCount := multiHotAddrRegs(0) }
-          is(DebugRegMap.OFF_MULTIHOT_DCLOAD)   { rdCount := multiHotAddrRegs(1) }
-          is(DebugRegMap.OFF_MULTIHOT_DCPROBE)  { rdCount := multiHotAddrRegs(2) }
-          is(DebugRegMap.OFF_MULTIHOT_DCSTORE)  { rdCount := multiHotAddrRegs(3) }
-          is(DebugRegMap.OFF_MULTIHOT_ITLB)     { rdCount := multiHotAddrRegs(4) }
-          is(DebugRegMap.OFF_MULTIHOT_DTLB)     { rdCount := multiHotAddrRegs(5) }
-          // ── Windowed performance counters (2026-09-17) ────────────────────────
-          // Region 2 so they are LIVE -- no halt required. A halt would itself change
-          // the numbers, which for a performance counter is the one thing that must not
-          // happen; the FREEZE bit in OFF_PERF_CTL is how a window is made read-stable,
-          // not a halt.
-          //
-          // OFF_MISPRED_COUNT / OFF_FLUSH_COUNT were DECLARED at Stage 1 and never
-          // driven ("zero until a real producer exists"). They are served here. Their
-          // offsets do not move: a host that has been reading them all along starts
-          // getting truth from the same address.
-          is(DebugRegMap.OFF_MISPRED_COUNT)     { rdCount := perfMispred.asBits }
-          is(DebugRegMap.OFF_FLUSH_COUNT)       { rdCount := perfFlush.asBits }
-          is(DebugRegMap.OFF_PERF_CTL)          { rdCount := perfCtlWord }
-          is(DebugRegMap.OFF_PERF_CYCLE_LO)     { rdCount := perfCycle(31 downto 0).asBits }
-          is(DebugRegMap.OFF_PERF_CYCLE_HI)     { rdCount := perfCycle(63 downto 32).asBits }
-          is(DebugRegMap.OFF_PERF_INST_LO)      { rdCount := perfInst(31 downto 0).asBits }
-          is(DebugRegMap.OFF_PERF_INST_HI)      { rdCount := perfInst(63 downto 32).asBits }
-          is(DebugRegMap.OFF_PERF_BRANCH)       { rdCount := perfBranch.asBits }
-          is(DebugRegMap.OFF_PERF_DC_MISS)      { rdCount := perfDcMiss.asBits }
-          is(DebugRegMap.OFF_PERF_IC_MISS)      { rdCount := perfIcMiss.asBits }
-          is(DebugRegMap.OFF_PERF_DTLB_WALK)    { rdCount := perfDtlbWalk.asBits }
-          is(DebugRegMap.OFF_PERF_ITLB_WALK)    { rdCount := perfItlbWalk.asBits }
-          is(DebugRegMap.OFF_PERF_STALL_RETIRE) { rdCount := perfStallRetire.asBits }
-          is(DebugRegMap.OFF_PERF_STALL_DC)     { rdCount := perfStallDc.asBits }
-          is(DebugRegMap.OFF_PERF_STALL_WALK)   { rdCount := perfStallWalk.asBits }
-          is(DebugRegMap.OFF_PERF_DETAIL_CAP) { rdCount := B(detailCap, 32 bits) }
-          for ((counter, index) <- detailCounters.zipWithIndex) {
-            is(DebugRegMap.OFF_PERF_DETAIL_BASE + index * 4) { rdCount := counter.asBits }
-          }
-          // ── MMU translation-key probes (live; no halt required) ───────────────
-          // OFF_MMU_PROBE_CTL is WRITE-ONLY (W1P) and deliberately has NO read arm:
-          // it reads back as zero from the region default, which is what the map
-          // promises. Its clear is decoded in the WRITE switch below -- putting a
-          // clear in a read switch elaborates cleanly, reads back perfectly and does
-          // nothing, which is the exact trap this comment exists to flag.
-          is(DebugRegMap.OFF_MMU_PROBE_STATUS)  { rdCount := mmuProbeStatus }
-          is(DebugRegMap.OFF_MMU_REKEY_COUNT)   { rdCount := mmuRekeyCount.asBits }
-          is(DebugRegMap.OFF_MMU_IPOISON_COUNT) { rdCount := mmuPoisonCountI.asBits }
-          is(DebugRegMap.OFF_MMU_DPOISON_COUNT) { rdCount := mmuPoisonCountD.asBits }
+        at(DebugRegMap.OFF_BUILD_ID) {
+          B(buildId, DebugRegMap.DBG_DW bits)
         }
-
-        // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
-        rdArch := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
+        at(DebugRegMap.OFF_FEATURES) {
+          // NOT a literal: computed from the STAGE column of debug_regmap.def, so a
+          // build cannot advertise a bit whose behaviour it has not built (spec 3.4).
+          B(advertisedFeatures, DebugRegMap.DBG_DW bits)
+        }
+        at(DebugRegMap.OFF_CAP_TRACE) {
+          val depth = if (historyBuilt) historyDepth else 0
+          B(depth, 16 bits) ## B(depth, 16 bits)
+        }
+        at(DebugRegMap.OFF_CAP_TRACE2) {
+          val depth = if (historyBuilt) historyDepth else 0
+          B(0, 16 bits) ## B(depth, 16 bits)
+        }
+        at(DebugRegMap.OFF_CONTROL) {
+          controlWord
+        }
+        at(DebugRegMap.OFF_PC)      { livePc.asBits }
+        at(DebugRegMap.OFF_LAST_PC) { lastPc.asBits }
+        at(DebugRegMap.OFF_HALT_AFTER_LO) { haltAfterTarget(31 downto 0).asBits }
+        at(DebugRegMap.OFF_HALT_AFTER_HI) { haltAfterTarget(63 downto 32).asBits }
+        if (stage >= 5) {
+          at(DebugRegMap.OFF_BREAK_PC0) { breakPc(0).asBits }
+          at(DebugRegMap.OFF_BREAK_PC1) { breakPc(1).asBits }
+          at(DebugRegMap.OFF_BREAK_PC2) { breakPc(2).asBits }
+          at(DebugRegMap.OFF_BREAK_PC3) { breakPc(3).asBits }
+          at(DebugRegMap.OFF_BREAK_PC_CTRL) { B(0, 28 bits) ## breakPcEnable }
+          at(DebugRegMap.OFF_BP_SKIP_ONCE) { B(0, 28 bits) ## breakSkipOnce }
           for (i <- 0 until 8) {
-            is(DebugRegMap.OFF_ARCH_D0 + i * 4) { rdArch := archWord(i) }
-            is(DebugRegMap.OFF_ARCH_A0 + i * 4) { rdArch := archWord(8 + i) }
-          }
-          is(DebugRegMap.OFF_ARCH_USP)  { rdArch := archWord(16) }
-          is(DebugRegMap.OFF_ARCH_SSP)  { rdArch := archWord(17) }
-          is(DebugRegMap.OFF_ARCH_ISP)  { rdArch := archWord(18) }
-          is(DebugRegMap.OFF_ARCH_SR)   { rdArch := archWord(19) }
-          is(DebugRegMap.OFF_ARCH_VBR)  { rdArch := archWord(20) }
-          is(DebugRegMap.OFF_ARCH_CACR) { rdArch := archWord(21) }
-          is(DebugRegMap.OFF_ARCH_TC)   { rdArch := archWord(22) }
-          is(DebugRegMap.OFF_ARCH_ITT0) { rdArch := archWord(23) }
-          is(DebugRegMap.OFF_ARCH_ITT1) { rdArch := archWord(24) }
-          is(DebugRegMap.OFF_ARCH_DTT0) { rdArch := archWord(25) }
-          is(DebugRegMap.OFF_ARCH_DTT1) { rdArch := archWord(26) }
-          is(DebugRegMap.OFF_ARCH_URP)  { rdArch := archWord(27) }
-          is(DebugRegMap.OFF_ARCH_SRP)  { rdArch := archWord(28) }
-          is(DebugRegMap.OFF_ARCH_PC)   { rdArch := archWord(29) }
-          is(DebugRegMap.OFF_ARCH_SFC)  { rdArch := archWord(30) }
-          is(DebugRegMap.OFF_ARCH_DFC)  { rdArch := archWord(31) }
-          is(DebugRegMap.OFF_ARCH_APPLY) {
-            rdArch := B(0, 31 bits) ## archApplyBusy
-          }
-          is(DebugRegMap.OFF_ARCH_STATUS) {
-            rdArch := B(0, 29 bits) ## archApplyRejected ## archApplyDone ## archApplyBusy
+            at(DebugRegMap.OFF_HALT_EXC_MASK0 + i * 4) { haltExceptionMask(i) }
           }
         }
+        at(DebugRegMap.OFF_HALT_CTL) {
+          B(0, 31 bits) ## haltAfterArmed
+        }
+        at(DebugRegMap.OFF_HALT_REASON) {
+          B(0, 29 bits) ##
+            dbgCommit.map(_.haltReasonDebug).getOrElse(U(0, 3 bits)).asBits
+        }
+        at(DebugRegMap.OFF_HALT_HIT_PC) {
+          dbgCommit.map(_.haltHitPc.asBits).getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_EXC_VEC) {
+          dbgCommit.map(s => s.haltExceptionVector.resize(32).asBits)
+            .getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_EXC_PC) {
+          dbgCommit.map(_.haltExceptionPc.asBits).getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_EXC_FAULT_ADDR) {
+          dbgCommit.map(_.haltExceptionFaultAddress.asBits).getOrElse(B(0, 32 bits))
+        }
+        // 2026-09-09: these two have been RESERVED in the regmap since Stage 1 with
+        // nothing driving them, which is why the REPL always printed `dbl_fault=0` even
+        // on a core that had double-faulted. Now backed by `ExceptionUnit.dblFaultPc` /
+        // `dblFaultVec` -- the PC of the instruction whose exception processing hit a
+        // bus error on its handler-vector read, and the vector it was fetching (the
+        // faulting table address is VBR + vec*4). Both stay 0 until a double fault.
+        at(DebugRegMap.OFF_DBL_FAULT_PC) {
+          dbgCommit.map(_.dblFaultPc.asBits).getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_DBL_FAULT_VEC) {
+          dbgCommit.map(s => s.dblFaultVec.resize(32).asBits).getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_HALT_HIT_INST_LO) {
+          haltHitInstCount(31 downto 0).asBits
+        }
+        at(DebugRegMap.OFF_HALT_HIT_INST_HI) {
+          haltHitInstCount(63 downto 32).asBits
+        }
+        at(DebugRegMap.OFF_STATUS) {
+          B(0, 27 bits) ##
+                    automaticHalt ##    // bit 4  auto-halt latched
+                    !effectiveHalt ##   // bit 3  running (inverse of halted)
+                    initDoneLatched ##  // bit 2  init-done seen
+                    dbgCommit.map(_.exceptionPending).getOrElse(False) ## // bit 1
+                    effectiveHalt       // bit 0  effective coherent halt
+        }
+        at(DebugRegMap.OFF_RAM_WINDOW_LG2) { ramWindowWord }
+        at(DebugRegMap.OFF_MON_SENSE)      { monSenseWord }
+        at(DebugRegMap.OFF_DBG_RESET_CTL) {
+          // Deployed layout (debug_ctrl.v:1411): {cpu_reset_count_r, 16'd0}.
+          cpuResetCount.asBits ## B(0, 16 bits)
+        }
+      }
 
-        // ── Region 4: 0x02100-0x02FFF, LIVE architectural state ─────────────────────
-        // The integer-register offsets (OFF_LIVE_A7, OFF_LIVE_DREG*, OFF_LIVE_AREG*)
-        // are deliberately ABSENT here: they are answered by the registered PRF read
-        // (`readIsLiveInt` / `liveIntPhysAddr`), which is what takes the committed-RAT
-        // walk and the physical-register-file read off `arAddr`'s combinational cone.
-        rdLive := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
-          is(DebugRegMap.OFF_LIVE_VBR)   { rdLive := dbgSystem.map(_.vbr.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_SR)    { rdLive := dbgSystem.map(s => s.sr.resize(32).asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_USP)   { rdLive := dbgSystem.map(_.usp.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_TC)   { rdLive := dbgSystem.map(_.tc.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_DTT0) { rdLive := dbgSystem.map(_.dtt0.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_DTT1) { rdLive := dbgSystem.map(_.dtt1.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_ITT0) { rdLive := dbgSystem.map(_.itt0.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_ITT1) { rdLive := dbgSystem.map(_.itt1.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_SRP)  { rdLive := dbgSystem.map(_.srp.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_MMU_URP)  { rdLive := dbgSystem.map(_.urp.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_SSP)   { rdLive := dbgSystem.map(_.msp.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_ISP)   { rdLive := dbgSystem.map(_.isp.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_CACR)  { rdLive := dbgSystem.map(_.cacr.asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_SFC)   { rdLive := dbgSystem.map(s => s.sfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_DFC)   { rdLive := dbgSystem.map(s => s.dfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
-          is(DebugRegMap.OFF_LIVE_PC)    { rdLive := livePc.asBits }
-          is(DebugRegMap.OFF_LIVE_MMUSR) { rdLive := dbgSystem.map(_.mmusr.asBits).getOrElse(B(0, 32 bits)) }
+      // ── Region 1: 0x00100-0x00FFF + 0x00200 block, halt lanes / cache maint ─────
+      val readLane = new ReadRegion {
+        if (stage >= 5) {
+          at(DebugRegMap.OFF_A7ODD_CTL) { a7OddCtl }
+          at(DebugRegMap.OFF_PCRANGE_CTL) { pcRangeCtl }
+          at(DebugRegMap.OFF_PCRANGE_LO)  { pcRangeLo }
+          at(DebugRegMap.OFF_PCRANGE_HI)  { pcRangeHi }
+          at(DebugRegMap.OFF_PCRANGE_PC0) {
+            dbgCommit.map(_.pcRangePc0.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_PCRANGE_PC1) {
+            dbgCommit.map(_.pcRangePc1.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_PCRANGE_PC2) {
+            dbgCommit.map(_.pcRangePc2.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_PCRANGE_COUNT) {
+            dbgCommit.map(s => B(0, 16 bits) ## s.pcRangeCount.asBits)
+              .getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_A7ODD_PC0) {
+            dbgCommit.map(_.a7OddPc0.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_A7ODD_PC1) {
+            dbgCommit.map(_.a7OddPc1.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_A7ODD_PC2) {
+            dbgCommit.map(_.a7OddPc2.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_A7ODD_VALUE) {
+            dbgCommit.map(_.a7OddValue.asBits).getOrElse(B(0, 32 bits)) }
+          at(DebugRegMap.OFF_A7ODD_COUNT) {
+            dbgCommit.map(s => B(0, 16 bits) ## s.a7OddEpisodes.asBits)
+              .getOrElse(B(0, 32 bits)) }
         }
+        // 2026-09-09: the fatal-halt ATTRIBUTION. `OFF_HALT_REASON` reports the debug
+        // domain's coarse code and collapses every fatal cause to FATAL(4); this is
+        // `RobPlugin.haltReason`, the sticky first-wins `socket.HaltReason` value that
+        // says WHICH producer halted the core. Without it a fatal halt on hardware is
+        // unattributable without an ENABLE_ILA bitstream.
+        at(DebugRegMap.OFF_HALT_KIND) {
+          dbgCommit.map(s => s.haltKind.resize(32).asBits).getOrElse(B(0, 32 bits))
+        }
+        at(DebugRegMap.OFF_DCACHE_OP) {
+          B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
+            cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
+        }
+        at(DebugRegMap.OFF_ICACHE_OP) {
+          B(0, 26 bits) ## cacheOpError ## cacheOpRejected ##
+            cacheOpSel.asBits ## cacheOpDone ## cacheOpBusy
+        }
+      }
 
-        // ── Region 5: 0x11000 / 0x13000 / 0x15000, forensic ring HEADS ──────────────
-        rdHead := B(0, DebugRegMap.DBG_DW bits)
-        switch(arAddr) {
-          is(DebugRegMap.OFF_PC_TRACE_HEAD) {
-            rdHead := pcTraceHead.resize(32).asBits
+      // ── Region 2: 0x01000-0x01FFF, free-running counters and stall packs ────────
+      val readCount = new ReadRegion {
+        // Free-running core_clk cycle count -- see cycleCountReg above. This is
+        // the frequency probe; it advances whenever the clock does, halted or
+        // not, so a pair of reads a known interval apart MEASURES the core
+        // clock instead of restating what the build asked for.
+        at(DebugRegMap.OFF_CYCLE_LO) { cycleCount(31 downto 0).asBits }
+        at(DebugRegMap.OFF_CYCLE_HI) { cycleCount(63 downto 32).asBits }
+        at(DebugRegMap.OFF_INST_LO) { macroCount(31 downto 0).asBits }
+        fetchCheck.foreach { f =>
+          at(DebugRegMap.OFF_FETCH_CHECK_CTL) {
+            B(0, 29 bits) ## f.slot ## f.hit ## f.enabled
           }
-          is(DebugRegMap.OFF_EXC_RING_HEAD) {
-            rdHead := excRingHead.resize(32).asBits
-          }
-          is(DebugRegMap.OFF_BRANCH_RING_HEAD) {
-            rdHead := branchRingHead.resize(32).asBits
-          }
+          at(DebugRegMap.OFF_FETCH_CHECK_PC) { f.pc.asBits }
+          at(DebugRegMap.OFF_FETCH_CHECK_WORD) { f.expected.resize(32) }
+          at(DebugRegMap.OFF_FETCH_CHECK_HIT_PC) { f.hitPc.asBits }
+          at(DebugRegMap.OFF_FETCH_CHECK_HIT_WORD) { f.hitWord }
+          at(DebugRegMap.OFF_FETCH_CHECK_SEEN) { f.seen.asBits }
         }
+        at(DebugRegMap.OFF_INST_HI) { macroCount(63 downto 32).asBits }
+        // Live, free-running, never halt-captured -- see excCountReg above.
+        at(DebugRegMap.OFF_EXC_COUNT) { excCount }
+        // ── p141 walker-stall state (live; no halt required) ──────────────────
+        // Read these ALONGSIDE OFF_INST_LO/HI: the wedge is identified by the
+        // retire count being frozen, and these four words say what it is frozen
+        // ON. See DebugRegMap's OFF_STALL_* comment for why they live here in
+        // the counter block rather than the halt-captured arch block.
+        // The four packs are read from their REGISTERED copies (see above): they are
+        // deep combinational packs of live core state and belong nowhere near a mux.
+        at(DebugRegMap.OFF_STALL_ARB)   { stallArbPackReg }
+        at(DebugRegMap.OFF_STALL_DC)    { stallDcPackReg }
+        at(DebugRegMap.OFF_STALL_GRANT) { stallGrantPackReg }
+        at(DebugRegMap.OFF_STALL_EXC)   { stallExcPackReg }
+        at(DebugRegMap.OFF_STALL_WALK)  { stallWalkPackReg }
+        // Multi-hot evidence (2026-09-17). Region 2 so it is LIVE -- no halt required
+        // -- for the same reason the p141 stall words are: a multi-hot may well be part
+        // of why a halt never lands.
+        at(DebugRegMap.OFF_MULTIHOT_STATUS)   { multiHotStatusReg }
+        at(DebugRegMap.OFF_MULTIHOT_IC)       { multiHotAddrRegs(0) }
+        at(DebugRegMap.OFF_MULTIHOT_DCLOAD)   { multiHotAddrRegs(1) }
+        at(DebugRegMap.OFF_MULTIHOT_DCPROBE)  { multiHotAddrRegs(2) }
+        at(DebugRegMap.OFF_MULTIHOT_DCSTORE)  { multiHotAddrRegs(3) }
+        at(DebugRegMap.OFF_MULTIHOT_ITLB)     { multiHotAddrRegs(4) }
+        at(DebugRegMap.OFF_MULTIHOT_DTLB)     { multiHotAddrRegs(5) }
+        // ── Windowed performance counters (2026-09-17) ────────────────────────
+        // Region 2 so they are LIVE -- no halt required. A halt would itself change
+        // the numbers, which for a performance counter is the one thing that must not
+        // happen; the FREEZE bit in OFF_PERF_CTL is how a window is made read-stable,
+        // not a halt.
+        //
+        // OFF_MISPRED_COUNT / OFF_FLUSH_COUNT were DECLARED at Stage 1 and never
+        // driven ("zero until a real producer exists"). They are served here. Their
+        // offsets do not move: a host that has been reading them all along starts
+        // getting truth from the same address.
+        at(DebugRegMap.OFF_MISPRED_COUNT)     { perfMispred.asBits }
+        at(DebugRegMap.OFF_FLUSH_COUNT)       { perfFlush.asBits }
+        at(DebugRegMap.OFF_PERF_CTL)          { perfCtlWord }
+        at(DebugRegMap.OFF_PERF_CYCLE_LO)     { perfCycle(31 downto 0).asBits }
+        at(DebugRegMap.OFF_PERF_CYCLE_HI)     { perfCycle(63 downto 32).asBits }
+        at(DebugRegMap.OFF_PERF_INST_LO)      { perfInst(31 downto 0).asBits }
+        at(DebugRegMap.OFF_PERF_INST_HI)      { perfInst(63 downto 32).asBits }
+        at(DebugRegMap.OFF_PERF_BRANCH)       { perfBranch.asBits }
+        at(DebugRegMap.OFF_PERF_DC_MISS)      { perfDcMiss.asBits }
+        at(DebugRegMap.OFF_PERF_IC_MISS)      { perfIcMiss.asBits }
+        at(DebugRegMap.OFF_PERF_DTLB_WALK)    { perfDtlbWalk.asBits }
+        at(DebugRegMap.OFF_PERF_ITLB_WALK)    { perfItlbWalk.asBits }
+        at(DebugRegMap.OFF_PERF_STALL_RETIRE) { perfStallRetire.asBits }
+        at(DebugRegMap.OFF_PERF_STALL_DC)     { perfStallDc.asBits }
+        at(DebugRegMap.OFF_PERF_STALL_WALK)   { perfStallWalk.asBits }
+        at(DebugRegMap.OFF_PERF_DETAIL_CAP) { B(detailCap, 32 bits) }
+        for ((counter, index) <- detailCounters.zipWithIndex) {
+          at(DebugRegMap.OFF_PERF_DETAIL_BASE + index * 4) { counter.asBits }
+        }
+        // ── MMU translation-key probes (live; no halt required) ───────────────
+        // OFF_MMU_PROBE_CTL is WRITE-ONLY (W1P) and deliberately has NO read arm:
+        // it reads back as zero from the region default, which is what the map
+        // promises. Its clear is decoded in the WRITE switch below -- putting a
+        // clear in a read switch elaborates cleanly, reads back perfectly and does
+        // nothing, which is the exact trap this comment exists to flag.
+        at(DebugRegMap.OFF_MMU_PROBE_STATUS)  { mmuProbeStatus }
+        at(DebugRegMap.OFF_MMU_REKEY_COUNT)   { mmuRekeyCount.asBits }
+        at(DebugRegMap.OFF_MMU_IPOISON_COUNT) { mmuPoisonCountI.asBits }
+        at(DebugRegMap.OFF_MMU_DPOISON_COUNT) { mmuPoisonCountD.asBits }
+      }
+
+      // ── Region 3: 0x02000-0x020FF, halted architectural write shadows ───────────
+      val readArch = new ReadRegion {
+        for (i <- 0 until 8) {
+          at(DebugRegMap.OFF_ARCH_D0 + i * 4) { archWord(i) }
+          at(DebugRegMap.OFF_ARCH_A0 + i * 4) { archWord(8 + i) }
+        }
+        at(DebugRegMap.OFF_ARCH_USP)  { archWord(16) }
+        at(DebugRegMap.OFF_ARCH_SSP)  { archWord(17) }
+        at(DebugRegMap.OFF_ARCH_ISP)  { archWord(18) }
+        at(DebugRegMap.OFF_ARCH_SR)   { archWord(19) }
+        at(DebugRegMap.OFF_ARCH_VBR)  { archWord(20) }
+        at(DebugRegMap.OFF_ARCH_CACR) { archWord(21) }
+        at(DebugRegMap.OFF_ARCH_TC)   { archWord(22) }
+        at(DebugRegMap.OFF_ARCH_ITT0) { archWord(23) }
+        at(DebugRegMap.OFF_ARCH_ITT1) { archWord(24) }
+        at(DebugRegMap.OFF_ARCH_DTT0) { archWord(25) }
+        at(DebugRegMap.OFF_ARCH_DTT1) { archWord(26) }
+        at(DebugRegMap.OFF_ARCH_URP)  { archWord(27) }
+        at(DebugRegMap.OFF_ARCH_SRP)  { archWord(28) }
+        at(DebugRegMap.OFF_ARCH_PC)   { archWord(29) }
+        at(DebugRegMap.OFF_ARCH_SFC)  { archWord(30) }
+        at(DebugRegMap.OFF_ARCH_DFC)  { archWord(31) }
+        at(DebugRegMap.OFF_ARCH_APPLY) {
+          B(0, 31 bits) ## archApplyBusy
+        }
+        at(DebugRegMap.OFF_ARCH_STATUS) {
+          B(0, 29 bits) ## archApplyRejected ## archApplyDone ## archApplyBusy
+        }
+      }
+
+      // ── Region 4: 0x02100-0x02FFF, LIVE architectural state ─────────────────────
+      // The integer-register offsets (OFF_LIVE_A7, OFF_LIVE_DREG*, OFF_LIVE_AREG*)
+      // are deliberately ABSENT here: they are answered by the registered PRF read
+      // (`readIsLiveInt` / `liveIntPhysAddr`), which is what takes the committed-RAT
+      // walk and the physical-register-file read off `arAddr`'s combinational cone.
+      val readLive = new ReadRegion {
+        at(DebugRegMap.OFF_LIVE_VBR)   { dbgSystem.map(_.vbr.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_SR)    { dbgSystem.map(s => s.sr.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_USP)   { dbgSystem.map(_.usp.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_TC)   { dbgSystem.map(_.tc.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_DTT0) { dbgSystem.map(_.dtt0.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_DTT1) { dbgSystem.map(_.dtt1.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_ITT0) { dbgSystem.map(_.itt0.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_ITT1) { dbgSystem.map(_.itt1.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_SRP)  { dbgSystem.map(_.srp.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_MMU_URP)  { dbgSystem.map(_.urp.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_SSP)   { dbgSystem.map(_.msp.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_ISP)   { dbgSystem.map(_.isp.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_CACR)  { dbgSystem.map(_.cacr.asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_SFC)   { dbgSystem.map(s => s.sfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_DFC)   { dbgSystem.map(s => s.dfc.resize(32).asBits).getOrElse(B(0, 32 bits)) }
+        at(DebugRegMap.OFF_LIVE_PC)    { livePc.asBits }
+        at(DebugRegMap.OFF_LIVE_MMUSR) { dbgSystem.map(_.mmusr.asBits).getOrElse(B(0, 32 bits)) }
+      }
+
+      // ── Region 5: 0x11000 / 0x13000 / 0x15000, forensic ring HEADS ──────────────
+      val readHead = new ReadRegion {
+        at(DebugRegMap.OFF_PC_TRACE_HEAD) {
+          pcTraceHead.resize(32).asBits
+        }
+        at(DebugRegMap.OFF_EXC_RING_HEAD) {
+          excRingHead.resize(32).asBits
+        }
+        at(DebugRegMap.OFF_BRANCH_RING_HEAD) {
+          branchRingHead.resize(32).asBits
+        }
+      }
+
+      when(doRead) {
+        rdCore := readCore.value
+        rdLane := readLane.value
+        rdCount := readCount.value
+        rdArch := readArch.value
+        rdLive := readLive.value
+        rdHead := readHead.value
       }
 
       // ── Write decode ──────────────────────────────────────────────────────────────
