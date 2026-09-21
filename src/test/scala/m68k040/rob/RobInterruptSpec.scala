@@ -1,6 +1,6 @@
 package m68k040.rob
 
-import m68k040.{M68kParams, M68kSim}
+import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
 import m68k040.decode.DecOp
 import m68k040.exception.InterruptControlPlugin
@@ -21,14 +21,14 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class RobInterruptSpec extends AnyFunSuite {
 
-  class Dut extends Component {
+  class Dut(retireWidth: Int = 2, prepared: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val intCtrl = new InterruptControlPlugin
     val rsrc = new RenameUopSourcePlugin
     val drv  = new RobAllocDriverPlugin
-    val rob  = new RobPlugin
-    val csink = new RenameCommitSinkPlugin
+    val rob  = new RobPlugin(preparedRetireEntries = if (prepared) retireWidth else 0)
+    val csink = new RenameCommitSinkPlugin(retireWidth, prepared)
     val tsink = new CommitTraceSinkPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()), intCtrl, rsrc, drv, rob, csink, tsink)) }
@@ -42,7 +42,8 @@ class RobInterruptSpec extends AnyFunSuite {
       pdst: Int = 0, pdstValid: Boolean = false, pdstOld: Int = 0,
       isBranch: Boolean = false,
       faulted: Boolean = false, faultVector: Int = 0,
-      firstOfInstr: Boolean = true
+      firstOfInstr: Boolean = true,
+      lastOfInstr: Boolean = true
   ): Unit = {
     u.valid #= valid
     u.pc #= pc
@@ -70,6 +71,8 @@ class RobInterruptSpec extends AnyFunSuite {
     u.isCondTrap #= false
     u.sswInstr #= false
     u.firstOfInstr #= firstOfInstr
+    u.lastOfInstr #= lastOfInstr
+    u.needsSupervisor #= false
   }
 
   def init(dut: Dut, cd: ClockDomain): Unit = {
@@ -81,6 +84,7 @@ class RobInterruptSpec extends AnyFunSuite {
     dut.intCtrl.logic.iplIn #= 0
     dut.intCtrl.logic.iackAvec #= false
     dut.intCtrl.logic.iackVector #= 0
+    dut.csink.logic.preparation.foreach(_.pressure #= false)
     pokeRu(dut.rsrc.logic.src.payload(0))
     pokeRu(dut.rsrc.logic.src.payload(1))
     cd.waitSampling(3)
@@ -215,6 +219,67 @@ class RobInterruptSpec extends AnyFunSuite {
       dut.intCtrl.logic.iplIn #= 5
       dut.intCtrl.logic.iackAvec #= true
       assertNeverPending(dut, cd)
+    }
+  }
+
+  test("active IRQ preserves the next macro at every ordinary and prepared lane boundary", VerilatorTest) {
+    for ((width, prepared) <- Seq((2, false), (4, false), (8, true))) {
+      val compiled = M68kSim().withVerilator.compile(new Dut(width, prepared))
+      for (boundary <- 1 until width; (level, mask) <- Seq((1, 0), (2, 2), (7, 7))) {
+        compiled.doSim(s"irq_lane_${width}_${prepared}_${boundary}_${level}") { dut =>
+          val cd = dut.clockDomain; cd.forkStimulus(10)
+          init(dut, cd); setMask(dut, cd, mask)
+          // The first part is the unretired tail of the current macro. Each
+          // following entry is a complete younger macro. Keep head incomplete
+          // until every younger entry (and any prepared image) is ready.
+          for (pair <- 0 until width / 2) {
+            for (slot <- 0 until 2) {
+              val lane = pair * 2 + slot
+              pokeRu(dut.rsrc.logic.src.payload(slot),
+                pc = if (lane < boundary) 0x100 else 0x200 + lane * 2,
+                firstOfInstr = lane >= boundary, lastOfInstr = lane >= boundary - 1)
+            }
+            dut.rsrc.logic.src.valid #= true; dut.rsrc.logic.u1v #= true
+            cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+            dut.rsrc.logic.src.valid #= false; dut.rsrc.logic.u1v #= false
+            cd.waitSampling()
+          }
+          cd.waitSampling(width + 2); sleep(1)
+          if (prepared) assert(dut.rob.logic.preparedBatch.get.ready.toBoolean)
+          dut.intCtrl.logic.iplIn #= level
+          dut.intCtrl.logic.iackAvec #= true
+          cd.waitSampling(2)
+          for (lane <- width - 1 to 0 by -1) {
+            dut.rob.logic.completion(0).valid #= true
+            dut.rob.logic.completion(0).payload #= lane
+            cd.waitSampling()
+            dut.rob.logic.completion(0).valid #= false
+          }
+          sleep(1)
+          val active = level == 7 || level > mask
+          if (!active) {
+            assert(dut.rob.logic.retireLanes.count(_.toBoolean) == width,
+              "masked IRQ reduced normal or prepared retirement bandwidth")
+          } else {
+            if (prepared) {
+              assert(!dut.rob.logic.preparedBatch.get.active.toBoolean)
+              assert(!dut.rob.logic.preparedBatch.get.fire.toBoolean)
+            }
+            var retired = 0
+            var cycles = 0
+            while (!dut.rob.logic.interruptPending.toBoolean && cycles < width + 4) {
+              val n = dut.rob.logic.retireLanes.count(_.toBoolean)
+              assert(retired + n <= boundary, "retired into younger macro with active IRQ")
+              retired += n
+              cd.waitSampling(); sleep(1); cycles += 1
+            }
+            assert(retired == boundary, s"current macro tail not completed: $retired/$boundary")
+            assert(dut.rob.logic.interruptPending.toBoolean, "next first-uop head was skipped")
+            assert(dut.rob.logic.interruptPc.toLong == 0x200 + boundary * 2)
+            assert(dut.rob.logic.retireLanes.forall(!_.toBoolean))
+          }
+        }
+      }
     }
   }
 }

@@ -41,3 +41,27 @@ handler runs (mask now >= level -> same/lower IRQ held); RTE -> restore SR(mask)
 - `interruptPending` vs the existing `exceptionPending`/`faultRetire` into the FSM entry: both feed `entryTrigger` — interrupt is a 2nd async source; encode the entry kind (fault vs interrupt) so the FSM applies the I-mask-update + the simple-protocol vector select only for interrupts.
 - Lock-step vector modeling: the harness drives `iackAvec`/`iackVector` to match what it told Musashi (`cb_int_ack`: autovector default / `set_interrupt_ack_response`); no handshake to model (simple protocol).
 - `iplIn` sampling/synchronization: sample at commit; a registered input (no async metastability concern in lock-step; a real SoC would add a synchronizer — note but out of scope).
+
+## 6. Retirement-boundary preservation (2026-09-21 amendment)
+
+An unmasked level-sensitive request, or the existing latched level-7 NMI,
+must not lose every recognition opportunity because a multi-uop retirement
+group straddles instruction boundaries. While either request is active, finish
+the macro already being retired, but do not retire a younger macro in the same
+cycle. Its first uop must remain available as ROB head for the existing precise
+recognition gate on a subsequent cycle. This is a combinational cold-path
+retirement limit, not a new exception-entry path or a second pending-IRQ latch.
+
+Apply the limit to all ordinary retirement widths. Prepared bulk publication
+is conservatively aborted/disabled while the request is active; ordinary
+retirement may still finish the current macro. No architectural map may publish
+updates beyond the actual retired prefix. Masked requests do not limit retire.
+
+Keep recognition's existing fault/trace/RTE/system/debug priorities and
+precise-store/inhibited-load busy gates. The boundary limit does not recognize
+an IRQ while a device operation is in flight, shorten required draining, or
+change frame contents. With no active request, retirement and IPC are unchanged.
+
+Verify the observed odd-SSP LINK boundary-33 failure with its exact register,
+CCR, frame and memory comparisons unchanged; cover multi-uop straddling,
+masked IRQs, NMI, precise memory and wider/prepared retirement separately.

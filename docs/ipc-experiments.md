@@ -2252,3 +2252,77 @@ two ignored, zero failures**, `/tmp/ipc-post-board-preflight-fast.log`, complete
 still fails its original exact comparison; its failure has not been waived or
 converted to a pass. The next safe investigation is a directed boundary barrier
 prototype, separately gated and IPC-compared before any integration decision.
+
+### IRQ-boundary barrier prototype
+
+The prototype finishes the current macro but prevents a retirement group from
+crossing into the next macro while an unmasked level/NMI request is active.
+It reuses the existing request condition, adds no pending-state register,
+preserves the precise-memory recognition gates and conservatively aborts
+prepared publication. The interrupt design contract has been amended.
+
+Original failing boundary-33 now passes its unchanged exact oracle comparison
+(`/tmp/irq-boundary33-barrier.log`), recognizing at 408000a6 rather than skipping
+through 408000b2. The composed profile passes **29 selected oracle tests**,
+including the complete boot-0 LINK boundary sweep, repeated RTS, precise-device
+IRQ replay, CCR/RTE storms and the selected store/forwarding controls
+(`/tmp/irq-boundary-composed-oracle.log`). Ordinary four-wide and prepared-eight
+boundary-33 runs each pass (`/tmp/irq-boundary-{four,prepared8}-oracle.log`).
+**12 unit/race tests pass** (`/tmp/irq-boundary-unit.log`), including a new
+33-scenario test spanning every lane boundary for 2/4/prepared8 retirement,
+unmasked IRQ, masked control, NMI and prepared-image cancellation.
+
+Matched no-IRQ IPC: **all 136 cases identical** to the pre-barrier composed
+profile (`/tmp/irq-boundary-ipc.log` versus `/tmp/ipc-socket-composed-corpus.log`).
+Required fast gate passes **388 tests, two ignored, zero failures** at 10:39:19
+local (`/tmp/irq-boundary-fast.log`). No timing claim or board inclusion: the
+delegated SoC build remains pinned to `8fab3614`/`6b10354`.
+
+### Board-derived byte-copy benchmark preparation
+
+User reconfirmed Dhrystone running. Read-only DDR sampling and a supervisor
+page-table walk locate the frequent trace PCs in this dependency chain:
+
+```asm
+movea.l 12(a6),a0
+addq.l  #1,12(a6)
+move.b  (a0),(a1)+
+bne.s   loop
+```
+
+Observed opcodes at 03be19c2 are `206e 000c 52ae 000c 12d0 66f4`, independently
+decoded with GNU m68k objdump. TC=c000; descriptor reads are
+03fffa04→03ff760a, 03ff77bc→03ff060a, 03ff0640→03be0039, establishing the sampled
+supervisor VA=PA=03be19c2 mapping. Logs `/tmp/ipc-dhrystone-{hotcode,translation}.log`.
+The running I-cache debug probe timed out; it supplied **no cache contents or
+residency evidence**, and no halt/cache maintenance was performed. JTAG released.
+
+`BoardStringCopyIpcSpec` reproduces this four-instruction dependency shape with
+32/128-byte deterministic nonzero patterns plus NUL, two seeds, baseline versus
+the complete socket option set. Paired readback variants check every copied
+byte, while both variants check the final source/destination pointers. Eight
+iterations are excluded as warmup. This is not the full Dhrystone executable or
+an exact board memory-layout replay; no speedup is claimed before it runs.
+
+The previously reported combined synthetic aggregate uses only the both-enabled
+fall-through/early-wakeup mode: **10,986 macros / 35,995 cycles = 0.305209 IPC**,
+17 kernels × two seeds. It is not an average across four alternative core modes.
+A fresh no-feature control using the same kernels/memory/seeds is queued after
+the IRQ gates (`m68k-ipc-fresh-baseline.service`); the board-loop experiment follows
+serially (`m68k-board-copy-ipc.service`). This will provide a matched aggregate
+comparison, not an invalid comparison against board Dhrystone's 0.233693 IPC.
+
+The actual board ILA gives a concrete target: the copy-loop load PC repeats with
+**24-cycle spacing in 25 of 26 observed intervals** (one interval is 43 cycles).
+Within each ordinary iteration, the RMW pointer increment retires six cycles
+after the pointer load, the byte copy eleven cycles after that, then the branch
+three cycles later; the next iteration starts four cycles later. Thus this
+observed four-macro loop sustains about **0.167 macro IPC / 24 cycles per byte**
+on the baseline, distinct from whole-window Dhrystone IPC. In capture cycles
+[24,643), 619 cycles contain 100 macro retirements, 250 head-store stalls,
+85 head-load stalls, 50 head-branch stalls and one misprediction. This window
+provides no evidence of a retirement-width limit (zero ROB-full cycles).
+
+At the user's explicit request, `/root/ipc_soc100_finish` owns the live SoC job,
+artifact/timing audit, local ADB patch and authorized volatile load. Parent owns
+serial simulations and IPC RTL work; no concurrent parent board access.

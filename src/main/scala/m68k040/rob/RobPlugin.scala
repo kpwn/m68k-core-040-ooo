@@ -1219,6 +1219,11 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // `interruptPending` is FORWARD-DECLARED here (retire0 gates on it) and DRIVEN
     // after the exc unit is built (it reads the SR I-mask from exc.ss.srSys).
     val interruptPending = Bool(); interruptPending.simPublic()
+    // Preserve a first-uop head for IRQ recognition when retire lanes would
+    // otherwise straddle successive macros forever. Driven below from the
+    // existing unmasked-level/NMI request, independently of recognition's
+    // first-uop and precise-memory gates. No additional pending state.
+    val irqBoundaryHold = Bool(); irqBoundaryHold.simPublic()
     val interruptLevel = UInt(3 bits)
     interruptLevel := Mux(nmiPending, U(7, 3 bits), iplIn); interruptLevel.simPublic()
     // Simple-protocol vector: autovector (24+level) or the vectored input.
@@ -1339,6 +1344,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       !p0.retireAlone || (!mispredictStore(h0) && p0.last)
     else !p0.retireAlone
     val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
+                  !(irqBoundaryHold && p0.last) &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp && !p1.debugBreakValid &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
                   !(haltAfterArmedIn && h0IsMacroLast) &&
@@ -1356,6 +1362,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val target = Reg(UInt(log2Up(retireWidth + 1) bits)) init 0
       val cursor = Reg(UInt(log2Up(retireWidth + 1) bits)) init 0
       val contextOk = !p0.retireAlone && !h0TraceArmed && !haltAfterArmedIn &&
+        !irqBoundaryHold &&
         !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
         !haltA7OddEnIn && !haltPcRangeEnIn && (debugHaltState === DebugHaltState.RUNNING)
       val ordinary = retirePayloads.zip(retireIds).zipWithIndex.map { case ((p, id), lane) =>
@@ -1420,6 +1427,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       if (preparedBatch.nonEmpty) {
         retireLanes(lane) := preparedBatch.get.fire && (preparedBatch.get.target > lane)
       } else retireLanes(lane) := retireLanes(lane - 1) && (count > lane) && completes(id) &&
+        !(irqBoundaryHold && retirePayloads.take(lane).map(_.last).reduce(_ || _)) &&
         !faultedStore(id) && !p.retireAlone && !p.isRte && !p.needsSup && !p.sysOp &&
         !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
         !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
@@ -2943,6 +2951,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
     val iplActive = (iplIn > maskI) || nmiPending
+    irqBoundaryHold := iplActive
     iplActive.simPublic()
     // Normal recognition: a first-µop non-faulted/non-RTE/non-sysOp head is present. When
     // STOPPED the ROB is empty (count==0, no head) and the IRQ must wake the halted core
