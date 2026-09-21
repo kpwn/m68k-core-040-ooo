@@ -61,7 +61,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
                       val stage:     Int     = 1,
                       val enable:    Boolean = true,
                       val historyDepth: Int  = 32,
-                      val detailedPerf: Boolean = false) extends FiberPlugin
+                      val detailedPerf: Boolean = false,
+                      val pcRangeEnable: Boolean = true) extends FiberPlugin
                       with m68k040.services.DebugIrqInjectService {
   require(porCycles >= 1, s"DebugCtrlPlugin: porCycles must be >= 1 (got $porCycles)")
   require(stage >= 1, s"DebugCtrlPlugin: stage must be >= 1 (got $stage)")
@@ -1103,13 +1104,16 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // A7-ODD halt lane control (bit 0 enable, bits 31:16 threshold); debug reset
       // domain like the masks, so it survives the CPU resets a boot trial issues.
       val a7OddCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
-      val pcRangeCtl = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
-      val pcRangeLo  = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
-      val pcRangeHi  = if (stage >= 5) Reg(Bits(32 bits)) init 0 else null
+      // Reduced debug retains these addresses as zero/ignore stubs, without flops.
+      val pcRangeCtl = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
+      val pcRangeLo  = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
+      val pcRangeHi  = if (stage >= 5 && pcRangeEnable) Reg(Bits(32 bits)) init 0 else B(0, 32 bits)
       if (stage >= 5) {
         breakPc.simPublic(); breakPcEnable.simPublic(); breakSkipOnce.simPublic()
         haltExceptionMask.simPublic(); a7OddCtl.simPublic()
-        pcRangeCtl.simPublic(); pcRangeLo.simPublic(); pcRangeHi.simPublic()
+        if (pcRangeEnable) {
+          pcRangeCtl.simPublic(); pcRangeLo.simPublic(); pcRangeHi.simPublic()
+        }
         frontendDebug.foreach { matcher =>
           when(matcher.skipConsumed.orR) {
             breakSkipOnce := breakSkipOnce & ~matcher.skipConsumed
@@ -1906,13 +1910,13 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               when(wStrb.orR) { a7OddCtl := merged(a7OddCtl).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_CTL) {
-              when(wStrb.orR) { pcRangeCtl := merged(pcRangeCtl).asBits }
+              if (pcRangeEnable) when(wStrb.orR) { pcRangeCtl := merged(pcRangeCtl).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_LO) {
-              when(wStrb.orR) { pcRangeLo := merged(pcRangeLo).asBits }
+              if (pcRangeEnable) when(wStrb.orR) { pcRangeLo := merged(pcRangeLo).asBits }
             }
             is(DebugRegMap.OFF_PCRANGE_HI) {
-              when(wStrb.orR) { pcRangeHi := merged(pcRangeHi).asBits }
+              if (pcRangeEnable) when(wStrb.orR) { pcRangeHi := merged(pcRangeHi).asBits }
             }
           }
           is(DebugRegMap.OFF_HALT_CTL) {

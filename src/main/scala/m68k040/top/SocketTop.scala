@@ -61,7 +61,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
                     debugStage: Int = 5,
                     detailedPerf: Boolean = false,
                     ipcThroughput: Boolean = false,
-                    ipcLateStore: Boolean = false) extends Component {
+                    ipcLateStore: Boolean = false,
+                    pcRangeEnable: Boolean = true) extends Component {
   require(!ipcLateStore || ipcThroughput, "late-store socket profile requires throughput options")
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
@@ -109,7 +110,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val periph = new PeripheralResetPlugin(enable = true,
                                            gateDispatch = SocketTopConfig.OPEN1_GATE_DISPATCH)
     val dbgCtrl = new DebugCtrlPlugin(buildId = dbgBuildId, stage = debugStage,
-      detailedPerf = detailedPerf)
+      detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable)
 
     val core = new M68kCore(exposeDebugPorts = true, detailedPerf = detailedPerf, plugins = Seq[FiberPlugin](
       new ParamPlugin(p),
@@ -133,7 +134,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
-      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf),
+      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
         earlyAutoStoreAddress = ipcLateStore),
       eu0, eu1, branchEu, lsEu, divEu,
@@ -540,6 +541,15 @@ object SocketIpcProfile {
   }
 }
 
+/** Build-time debug selection, independent of the execution/IPC profile. */
+object SocketDebugProfile {
+  def pcRangeEnabled(name: String): Boolean = name match {
+    case "full" => true
+    case "reduced" => false
+    case other => throw new IllegalArgumentException(s"Unknown CPU_DEBUG_PROFILE: $other")
+  }
+}
+
 object GenSocketTopVerilog {
   def main(args: Array[String]): Unit = {
     val dbgBuildId: BigInt = sys.env.get("DBG_BUILD_ID") match {
@@ -561,11 +571,13 @@ object GenSocketTopVerilog {
     }
     val ipcProfile = sys.env.getOrElse("CPU_IPC_PROFILE", "baseline")
     val ipcThroughput = SocketIpcProfile.enabled(ipcProfile)
-    println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf")
+    val debugProfile = sys.env.getOrElse("CPU_DEBUG_PROFILE", "full")
+    val pcRangeEnable = SocketDebugProfile.pcRangeEnabled(debugProfile)
+    println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf CPU_DEBUG_PROFILE=$debugProfile")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
-        ipcLateStore = SocketIpcProfile.lateStore(ipcProfile)))
+        ipcLateStore = SocketIpcProfile.lateStore(ipcProfile), pcRangeEnable = pcRangeEnable))
     println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }

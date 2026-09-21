@@ -45,6 +45,9 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
 
   test("board byte-copy dependency shape compares baseline and combined socket options", VerilatorTest) {
     val traceOnly = sys.env.get("IPC_BOARD_COPY_TRACE").contains("1")
+    val debugProfile = sys.env.getOrElse("CPU_DEBUG_PROFILE", "full")
+    val pcRangeEnable = m68k040.top.SocketDebugProfile.pcRangeEnabled(debugProfile)
+    println(s"BOARD_COPY_DEBUG_PROFILE=$debugProfile")
     val seeds = if (traceOnly) Seq(1) else Seq(1, 17)
     val kernels = if (traceOnly) Seq(copyKernel(32, false)) else
       for (length <- Seq(32, 128); verify <- Seq(false, true)) yield copyKernel(length, verify)
@@ -60,7 +63,7 @@ class BoardStringCopyIpcSpec extends CoreBenchHarness {
         earlyLsNzvcWakeup = combined, detachedStoreEntries = if (combined) 4 else 1,
         trainSlot1Conditional = combined, deferTakenSlot1Conditional = combined,
         retainRedirectHistory = combined, earlyAutoStoreAddress = earlyAuto,
-        earlyStoreDataWake = earlyDataWake))
+        earlyStoreDataWake = earlyDataWake, pcRangeEnable = pcRangeEnable))
       (for (kernel <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, kernel, seed)
         if (earlyAuto) assert(r.reservedStores > 0 && r.reservedPublishes > 0,

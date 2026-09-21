@@ -351,7 +351,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyLsNzvcWakeup: Boolean = false,
                     detachedStoreEntries: Int = 1,
                     earlyAutoStoreAddress: Boolean = false,
-                    earlyStoreDataWake: Boolean = false) extends Component {
+                    earlyStoreDataWake: Boolean = false,
+                    pcRangeEnable: Boolean = true) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -381,7 +382,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
-    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap)
+    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
+      pcRangeEnable = pcRangeEnable)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress)
     val eu0    = new AluEuPlugin

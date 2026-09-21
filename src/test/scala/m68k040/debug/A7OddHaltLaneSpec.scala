@@ -27,12 +27,12 @@ import spinal.lib.misc.database.Database
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 
 class A7OddHaltLaneSpec extends AnyFunSuite {
-  class Dut extends Component {
+  class Dut(pcRangeEnable: Boolean = true) extends Component {
     val db = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
     val alloc = new RobAllocDriverPlugin
-    val rob = new RobPlugin
+    val rob = new RobPlugin(pcRangeEnable = pcRangeEnable)
     val mmu = new MmuControlPlugin
     val commit = new RenameCommitSinkPlugin
     val intRf = new DebugIntRfStubPlugin
@@ -40,7 +40,7 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
     val xRf = new DebugXRfStubPlugin
     val maps = new DebugCommittedMapStubPlugin
     val memory = new DebugMemoryStubPlugin
-    val dbg = new DebugCtrlPlugin(porCycles = 4, stage = 5)
+    val dbg = new DebugCtrlPlugin(porCycles = 4, stage = 5, pcRangeEnable = pcRangeEnable)
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), mmu, rsrc, alloc,
       rob, commit, intRf, nzvcRf, xRf, maps, memory, dbg)) }
     def axi: DbgAxiLite = dbg.logic.dbgAxi
@@ -173,6 +173,33 @@ class A7OddHaltLaneSpec extends AnyFunSuite {
       cd.waitSampling(60)
       assert(!halted(dut, cd), "halted while the lane was disabled")
       assert(rd(dut, cd, DebugRegMap.OFF_A7ODD_COUNT) == 2L, "episodes counted while disabled")
+    }
+  }
+
+  test("reduced debug omits PC-range hardware, ignores range writes, and preserves manual and A7 halt") {
+    M68kSim().compile(new Dut(pcRangeEnable = false)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      init(dut, cd)
+      assert(dut.rob.logic.pcRangeLane == null, "range capture hardware was elaborated")
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_LO, 0)
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_HI, 0xffffffffL)
+      wr(dut, cd, DebugRegMap.OFF_PCRANGE_CTL, 1)
+      for (off <- Seq(DebugRegMap.OFF_PCRANGE_CTL, DebugRegMap.OFF_PCRANGE_LO,
+        DebugRegMap.OFF_PCRANGE_HI, DebugRegMap.OFF_PCRANGE_PC0,
+        DebugRegMap.OFF_PCRANGE_PC1, DebugRegMap.OFF_PCRANGE_PC2, DebugRegMap.OFF_PCRANGE_COUNT)) {
+        assert(rd(dut, cd, off) == 0, s"disabled range register $off did not read zero")
+      }
+      for (pc <- Seq(0L, 0x1000L, 0x00a54cfaL, 0xfffffffeL)) retireOne(dut, cd, pc)
+      assert(!halted(dut, cd), "disabled range hardware stopped retirement")
+      wr(dut, cd, DebugRegMap.OFF_CONTROL, 1)
+      waitHalt(dut, cd, expect = true, "manual halt without range hardware")
+      wr(dut, cd, DebugRegMap.OFF_CONTROL, 0)
+      waitHalt(dut, cd, expect = false, "manual resume without range hardware")
+      wr(dut, cd, DebugRegMap.OFF_A7ODD_CTL, 1)
+      dut.rob.logic.exc.ss.isp #= 0x003ff1b5L
+      waitHalt(dut, cd, expect = true, "A7 halt without range hardware")
+      assert(rd(dut, cd, DebugRegMap.OFF_HALT_REASON) == DebugHaltReasonCode.A7_ODD)
     }
   }
 

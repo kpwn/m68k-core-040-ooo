@@ -46,7 +46,8 @@ object DebugHaltReasonCode {
   */
 class RobPlugin(val detailedPerf: Boolean = false,
                 val pairCorrectBranch: Boolean = false,
-                val preparedRetireEntries: Int = 0) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
+                val preparedRetireEntries: Int = 0,
+                val pcRangeEnable: Boolean = true) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
   override def retiredRobIds: Vec[Flow[UInt]] = retirementWires
@@ -3669,7 +3670,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // but a RANGE can. The stop rides the same MANUAL-stop path as the A7 lane, so the
     // halt lands on a clean macro boundary with the retire-PC ring still holding the
     // instructions that jumped there.
-    val pcRangeLane = new Area {
+    val pcRangeLane = if (pcRangeEnable) new Area {
       val hit0     = retire0 && (p0.pc >= haltPcRangeLoIn) && (p0.pc <= haltPcRangeHiIn)
       val hit1     = retire1 && (p1.pc >= haltPcRangeLoIn) && (p1.pc <= haltPcRangeHiIn)
       val hit      = haltPcRangeEnIn && (hit0 || hit1)
@@ -3694,7 +3695,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
       pc0.simPublic(); pc1.simPublic(); pc2.simPublic(); count.simPublic()
       req.simPublic(); hit.simPublic()
     }
-    pcRangeStopReq := pcRangeLane.req
+    else null
+    pcRangeStopReq := (if (pcRangeEnable) pcRangeLane.req else False)
 
     if (sys.env.contains("CPU040_A7_TRIPWIRE")) new Area {
       val a7      = exc.ss.a7
@@ -3797,14 +3799,16 @@ class RobPlugin(val detailedPerf: Boolean = false,
   override def a7OddValue:    UInt = logic.a7OddLane.value
   override def a7OddEpisodes: UInt = logic.a7OddLane.episodes
   override def configurePcRangeHalt(enable: Bool, lo: UInt, hi: UInt): Unit = {
-    logic.haltPcRangeEnIn := enable
-    logic.haltPcRangeLoIn := lo
-    logic.haltPcRangeHiIn := hi
+    if (pcRangeEnable) {
+      logic.haltPcRangeEnIn := enable
+      logic.haltPcRangeLoIn := lo
+      logic.haltPcRangeHiIn := hi
+    }
   }
-  override def pcRangePc0:   UInt = logic.pcRangeLane.pc0
-  override def pcRangePc1:   UInt = logic.pcRangeLane.pc1
-  override def pcRangePc2:   UInt = logic.pcRangeLane.pc2
-  override def pcRangeCount: UInt = logic.pcRangeLane.count
+  override def pcRangePc0:   UInt = if (pcRangeEnable) logic.pcRangeLane.pc0 else U(0, 32 bits)
+  override def pcRangePc1:   UInt = if (pcRangeEnable) logic.pcRangeLane.pc1 else U(0, 32 bits)
+  override def pcRangePc2:   UInt = if (pcRangeEnable) logic.pcRangeLane.pc2 else U(0, 32 bits)
+  override def pcRangeCount: UInt = if (pcRangeEnable) logic.pcRangeLane.count else U(0, 16 bits)
 
   override def sr: UInt = logic.debugSystemSr
   override def vbr: UInt = logic.exc.ss.vbr
