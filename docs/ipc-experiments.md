@@ -1023,6 +1023,16 @@ reservation tests (`/tmp/sq-reserve-regression.log`). Use
 `--reserve-late-store`, together with early store address execution. Production
 defaults remain off; no route or board improvement is claimed yet.
 
+Implementation: `6d8a7a7de491f1e9a10ff74dabc33e67a2411571`. Unit
+`m68k-sq-reserve-6d8a7a7d.service` queues matched core routing behind direct-load
+fusion, using the shared Vivado mutex, 5 ns and three post-route rounds. Both
+arms enable aligned-load fall-through, early integer wakeup, early store address
+and direct long MOVE loads; only the candidate enables late-store SQ reservation.
+Thus the baseline also gates the previously untimed fusion/early-store combination.
+Artifacts: `/tmp/sq-reserve-gate.sU6Lpv`; the existing `build-logs:0` pane follows
+both elaboration and implementation logs. This queue does not stall the next IPC
+experiment, and no timing result is available yet.
+
 Next dependency experiment to evaluate: move late-data ownership from P3 into
 the reserved SQ entry, reusing its stored address/data and adding only the source
 tag and minimal store-completion metadata. An independent late-data reader could
