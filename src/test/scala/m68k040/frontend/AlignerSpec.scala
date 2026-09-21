@@ -17,7 +17,8 @@ class AlignerSpec extends AnyFunSuite {
     // inside `Aligner.align`; it is registered in FetchAlignPlugin and passed in.
     val p0LiveReg = in(ChunkPredecode())
     val res       = out(Aligner.Result())
-    res := Aligner.align(headPc, words, preds, avail, p0LiveReg)
+    res := Aligner.align(headPc, words, preds, avail, p0LiveReg,
+      headPcHiP1 = Some(headPc(31 downto 5) + 1))
   }
   // `setAll` also drives every ChunkPredecode field (incl. the new `ambiguousLine`, which
   // must default False so the existing tests exercise the plain `preds(0)` path) and puts
@@ -35,6 +36,29 @@ class AlignerSpec extends AnyFunSuite {
   }
   def setP0Live(dut: Dut, simple: Boolean, len: Int, ambiguous: Boolean): Unit = {
     dut.p0LiveReg.simple #= simple; dut.p0LiveReg.lenWords #= len; dut.p0LiveReg.ambiguousLine #= ambiguous
+  }
+
+  test("slot1 PC preserves low-field carry and 32-bit wrap for baked and resolved lengths", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val bases = Seq(0L, 0x20L, 0x7fffffe0L, 0x80000000L, 0xffffffe0L)
+      for (base <- bases; low <- 0 until 32; len <- 1 until Aligner.WINDOW;
+           resolved <- Seq(false, true)) {
+        val pc = base + low
+        dut.headPc #= pc
+        setAll(dut, simple = true, len = 1)
+        setPred(dut, 0, simple = true, len = if (resolved) 1 else len,
+          ambiguous = resolved)
+        setP0Live(dut, simple = true, len = len, ambiguous = false)
+        dut.avail #= Aligner.WINDOW
+        sleep(1)
+        assert(dut.res.slot0Valid.toBoolean && dut.res.slot1Valid.toBoolean,
+          s"missing packet pc=$pc len=$len resolved=$resolved")
+        assert(dut.res.slot0.pc.toLong == pc)
+        assert(dut.res.slot1.pc.toLong == ((pc + 2L * len) & 0xffffffffL),
+          s"slot1 PC pc=$pc len=$len resolved=$resolved")
+        assert(dut.res.shiftWords.toInt == len + 1)
+      }
+    }
   }
 
   test("two adjacent 1-word simple ops -> 2-wide", VerilatorTest) {

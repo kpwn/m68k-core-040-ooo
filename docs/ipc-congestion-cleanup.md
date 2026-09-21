@@ -518,3 +518,43 @@ This is generation/lint only, not a launched or completed implementation.
 The three-arm L2 physical comparison and strict routed audits remain queued;
 choose the next full implementation from that evidence. The live CSR+PRAM
 run was not interrupted and has progressed through detailed placement.
+
+## Slot-1 PC carry cleanup: correctness and matched IPC pass
+
+Isolated branch `perf/slot1-pc-carry-cleanup` in cleanup-pool `agent-03`
+reuses FetchAlign's existing `decodePcHiP1` companion for the aligner's
+slot-1 PC. The late predecode length now enters a six-bit low-PC add;
+its carry selects the unchanged or preincremented upper 27 bits. No new
+state, cycle, prediction policy, or service/database key is introduced.
+Standalone aligner callers may retain the original full-width addition.
+The frontend's existing companion invariant remains checked, with a new
+simulation-only comparison against full-width addition on valid slot-1 PCs.
+
+Motivation is the CSR+PRAM placement report's worst path: IBuf head pointer
+through predecode length, a four-CARRY8 slot-1 PC addition, Gshare PHT lookup
+and prediction control to predictPending. Its -0.482 ns placement slack
+and 22 levels are NOT routed timing or proof of global congestion causality.
+
+The new boundary test passed on unchanged RTL first (10 aligner tests),
+then with the split-PC implementation (18 tests across Aligner, FetchAlign,
+resident cadence and ring turnover). The sweep covers all 32 low-PC values,
+five upper-PC cases including 32-bit wrap, lengths 1..9, and both baked and
+live-resolved ambiguous head lengths: 2880 cases. Logs:
+`/tmp/ipc-cleanup-slot1-pc-{before,after}.log`.
+
+Matched full-core board-copy windows and the required CPU fast gate completed
+successfully under `m68k-ipc-cleanup-slot1-pc-validation.service` at
+18:45:44 CEST. The reference is clean
+`cf87715b` (same CPU RTL as 1cb2401f); the candidate's source/test checksums
+are recorded and checked by `/tmp/run-ipc-cleanup-slot1-pc-validation.sh`.
+Both arms use IPC_MEM=l2:5:70, early auto-store reservation and early store
+data wakeup, testing all 16 profile/kernel/seed windows. Cycle, retirement,
+branch, miss and reservation/publication rows match exactly. In particular,
+the combined 32-byte copy remains 102 retired macros / 360 cycles, and the
+128-byte copy remains 486 / 1945 cycles for both seeds. Logs are
+`/tmp/ipc-cleanup-slot1-pc-ipc-{before,after}.log`. The fast gate reports
+390 passed, 2 ignored and no failed/aborted tests in
+`/tmp/ipc-cleanup-slot1-pc-fast.log`; source checksums were verified afterwards.
+This supports zero measured IPC cost in these simulation windows, not a
+board-performance or physical-timing improvement. Physical evaluation is
+still pending; no source pin in a running or queued SoC build has changed.

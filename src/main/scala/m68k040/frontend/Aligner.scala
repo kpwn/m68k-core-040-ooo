@@ -21,9 +21,11 @@ object Aligner {
     * #202 comment block below, and FetchAlignPlugin's `p0LiveReg` for the mechanism +
     * its head-window-change invalidation). Guaranteed by construction to be EITHER
     * bit-identical to a same-cycle `PredecodeWord.classify()` of THIS cycle's
-    * `words`/`avail`, OR `ambiguousLine=True` ("not resolved yet" -> stall). */
+    * `words`/`avail`, OR `ambiguousLine=True` ("not resolved yet" -> stall).
+    * Optional `headPcHiP1` must equal headPc(31:5)+1 modulo 27 bits; the frontend
+    * already maintains this companion register for its own PC advance. */
   def align(headPc: UInt, words: Vec[Bits], preds: Vec[ChunkPredecode], avail: UInt,
-            p0LiveReg: ChunkPredecode): Result = {
+            p0LiveReg: ChunkPredecode, headPcHiP1: Option[UInt] = None): Result = {
     val r = Result()
 
     // Default-assign all packet fields to don't-care first
@@ -88,6 +90,23 @@ object Aligner {
     // already-multi-cycle-tolerant ambiguous-head case.
     val p0 = Mux(preds(0).ambiguousLine, p0LiveReg, preds(0))
     val L0 = p0.lenWords  // UInt(4 bits)
+    // Keep the late predecode length out of the upper-PC carry chain before
+    // the slot-1 predictor lookup. L0 is four bits, so its byte increment is
+    // at most 30: the upper 27 PC bits can only stay put or advance by one.
+    // No added register/cycle; standalone callers may keep the full-width form.
+    val slot1Pc = headPcHiP1 match {
+      case Some(hiP1) =>
+        require(hiP1.getWidth == 27)
+        val low = headPc(4 downto 0).resize(6) + (L0.resize(6) |<< 1)
+        Mux(low(5), hiP1, headPc(31 downto 5)) @@ low(4 downto 0)
+      case None => headPc + (L0.resize(32) |<< 1)
+    }
+    GenerationFlags.simulation {
+      when(r.slot1Valid) {
+        assert(slot1Pc === headPc + (L0.resize(32) |<< 1),
+          "Aligner: split-field slot1 PC differs from full-width addition", FAILURE)
+      }
+    }
 
     when(avail === 0) {
       // keep defaults: stall, nothing valid
@@ -256,7 +275,7 @@ object Aligner {
 
         when(slot1Ok) {
           // Slot1 = simple packet
-          r.slot1.pc := headPc + (L0.resize(32) |<< 1)
+          r.slot1.pc := slot1Pc
           for (i <- 0 until WINDOW) {
             // `words` is a WINDOW(10)-element Vec, whose dynamic index must be EXACTLY
             // log2Up(WINDOW)=4 bits wide (SpinalHDL errors on an over-wide Vec index) —
