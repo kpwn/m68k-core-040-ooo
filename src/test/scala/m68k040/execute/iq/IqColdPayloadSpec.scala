@@ -201,7 +201,9 @@ class IqColdPayloadSpec extends AnyFunSuite {
       // disturbed by any of this; in the NEW design port 3 holds only {robId, coldWay} and
       // re-reads the cold row combinationally on every one of these cycles -- so if a row
       // could be overwritten out from under a stalled port, this is where it shows.
-      var rob = 20
+      // Stay within the configured five-bit ROB id range without reusing the
+      // parked row 7: twenty distinct rows 8..27 preserve the same churn.
+      var rob = 8
       for (_ <- 0 until 10) {
         pushPair(dut, (rob, Alu), Some((rob + 1, Alu)))
         rob += 2
