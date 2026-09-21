@@ -248,7 +248,8 @@ class AluFastSlowSpec extends AnyFunSuite {
       idle(dut); cd.waitSampling(6)
 
       for (i <- 0 until 4) {
-        issueLslImm(dut, pa = 3, count = i + 1, pdst = 20 + i, robId = 40 + i)
+        // ROB IDs are five bits; keep killed IDs distinct from the setup/reuse IDs.
+        issueLslImm(dut, pa = 3, count = i + 1, pdst = 20 + i, robId = 8 + i)
         sleep(1); assert(dut.src.logic.iReady.toBoolean)
         cd.waitSampling(); sleep(1)
       }
@@ -268,10 +269,10 @@ class AluFastSlowSpec extends AnyFunSuite {
       dut.src.logic.iFlush #= false
 
       // Immediately reuse one destination.  No killed slow result may overwrite it.
-      issueMoveq(dut, 0xA5, pdst = 20, robId = 50); cd.waitSampling(); sleep(1); idle(dut)
+      issueMoveq(dut, 0xA5, pdst = 20, robId = 12); cd.waitSampling(); sleep(1); idle(dut)
       for (_ <- 0 until 10) {
         assert(!dut.src.logic.slowWakeValid.toBoolean, "stale slow wakeup escaped after flush")
-        assert(!(dut.src.logic.cValid.toBoolean && (40 until 44).contains(dut.src.logic.cRob.toInt)),
+        assert(!(dut.src.logic.cValid.toBoolean && (8 until 12).contains(dut.src.logic.cRob.toInt)),
           s"stale slow completion escaped after flush: rob=${dut.src.logic.cRob.toInt}")
         cd.waitSampling(); sleep(1)
       }
