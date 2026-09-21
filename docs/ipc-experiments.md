@@ -806,10 +806,16 @@ the nine recovery tests above use that final form.
 
 Use `IPC_EARLY_STORE_ADDRESS=1`, `LOCKSTEP_EARLY_STORE_ADDRESS=1`, or the core
 generator's `--early-store-address`. Production SocketTop remains unchanged.
-The required fast gate passes **384 tests**, two ignored, zero failed/aborted
-(`/tmp/early-store-address-fast.log`); a repeat is in progress after the short-source
-simulations. Routed timing disposition is pending; no integrated SoC timing or
-board improvement is established. Full memory-order
+Both required fast-gate runs pass **384 tests**, two ignored, zero failed/aborted
+(`/tmp/early-store-address-fast.log`, `/tmp/early-store-address-fast-final.log`).
+The implementation is pinned at `12c23962dcbba03218c49b2e33fa24dfba80aa48`.
+Unit `m68k-early-store-address-12c23962.service` queues matched baseline/early arms
+behind the retained-history comparison, using the shared Vivado mutex, 5 ns and
+three post-route rounds. Both arms enable aligned-load fall-through and early
+load integer wakeup; only the candidate enables early store address issue.
+Artifacts: `/tmp/early-store-address-gate.sHxiPV`, followed by the existing
+`build-logs:0` pane alongside the earlier jobs. No timing outcome is known yet;
+no integrated SoC timing or board improvement is established. Full memory-order
 ticket lifecycle, independent load retry/bypass, SQ reservation and guaranteed
 early memory wakeup remain separate unfinished work.
 
