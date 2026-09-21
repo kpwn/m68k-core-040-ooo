@@ -85,9 +85,10 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         trainSlot1Conditional = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
         deferTakenSlot1Conditional = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
         retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1"),
-        earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1")))
+        earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"),
+        fuseLongMoveLoads = sys.env.get("IPC_FUSE_LONG_MOVE_LOADS").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
-        val r = runKernel(compiled, k, seed)
+        val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
         if(k.name.startsWith("delayed-store-") && sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"))
           assert(r.lateStoreCaptures == 32, "all 32 delayed stores must use late capture")
@@ -100,6 +101,16 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         }
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures}")
+        r.pipelineProfile.foreach { p =>
+          println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
+            s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +
+            s"uops=${p.rob.map(_.retires).sum} headIncomplete=${p.headIncompleteCycles} noRetire=${p.nonemptyNoRetireCycles} " +
+            s"meanOccupancy=${p.meanOccupancy} noPairCapacity=${p.noPairCapacityCycles}")
+          val headWait = p.rob.filter(_.headIncomplete).groupBy(_.headPc).toSeq.sortBy(_._1)
+          println("LS_FULL_HEAD_WAIT " + headWait.map { case (pc, samples) =>
+            f"$pc%08x:${samples.size}"
+          }.mkString(","))
+        }
         if(k.name == pointerChain.name) {
           val gaps = r.ldCmdCycles.sliding(2).collect { case Seq(a, b) => b - a }.toSeq
           println(s"LS_FULL_CORE_LOAD_SPACING fallThrough=$enabled earlyWake=$earlyWake seed=$seed " +

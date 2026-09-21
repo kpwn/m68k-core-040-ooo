@@ -929,9 +929,12 @@ object MicroOpAssembler {
       o.dstEa := EaDecoder.decode(dstEaField, s.size, shiftedWordsFor(pkt.words, dstShift))
       o
     })
-  def assemble(pkt: DecodePacket, offIn: Offload): AssembledUops = assembleImpl(pkt, Some(offIn))
+  def assemble(pkt: DecodePacket, offIn: Offload,
+               fuseLongMoveLoads: Boolean = false): AssembledUops =
+    assembleImpl(pkt, Some(offIn), fuseLongMoveLoads)
 
-  private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload]): AssembledUops = {
+  private def assembleImpl(pkt: DecodePacket, offIn: Option[Offload],
+                           fuseLongMoveLoads: Boolean = false): AssembledUops = {
     val out = AssembledUops()
     out.fpImmAlloc := False            // overridden ONLY by the `F<op>.<fmt> #imm,FPn` arm below
     out.fpWideImm  := B(0, 80 bits)
@@ -4450,6 +4453,18 @@ object MicroOpAssembler {
       out.uops(0) := ldUop
       out.uops(1) := Mux(srcAuto, anUpdUop, opUop)
       out.uops(2) := opUop
+      if (fuseLongMoveLoads) {
+        // Direct full-width MOVE destination: the LSU already produces both
+        // the loaded data and MOVE NZVC. Preserve the old path for partial
+        // writes, EA auto-update and every non-MOVE/system operation.
+        when(spec.op === DecOp.MOVE && spec.size === Size.LONG && !srcAuto &&
+             !spec.sysOp && !spec.microcoded && opUop.dstValid &&
+             (dstEa.klass === EaClass.DATAREG || dstEa.klass === EaClass.ADDRREG)) {
+          out.count := 1
+          out.uops(0).dstReg := opUop.dstReg
+          out.uops(0).writesNzvc := opUop.writesNzvc
+        }
+      }
     } elsewhen(bfDyn) {
       // Bit-field DYNAMIC offset/width -> [BFRESOLVE -> T0] [BITFIELD bfDynamic (reads T0)].
       out.count   := 2

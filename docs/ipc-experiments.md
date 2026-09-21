@@ -602,8 +602,13 @@ The baseline/training/selective core-only timing matrix is pinned to
 `m68k-slot1-training-918b1a8e.service`, artifacts
 `/tmp/slot1-training-gate.yGdUUB`. It waits for the prior all-deferral matrix and
 then uses the shared Vivado mutex, the same 5 ns recipe and three post-route
-rounds. The existing `build-logs` tmux pane follows all three arms. No timing or
-area result is claimed yet, and this queue does not block subsequent IPC work.
+rounds. The existing `build-logs` tmux pane follows all three arms. Baseline and
+training-only have finished: WNS **+0.011 / +0.042 ns**, WHS **+0.023 / +0.023 ns**,
+WPWS **+1.958 / +1.958 ns**, all zero setup/hold/pulse failing endpoints. Routed
+LUTs **93,896 / 93,668**, FFs **38,740 / 38,770**, BRAM tiles **37 / 37**.
+This is a core-only 200 MHz pass, not SoC timing or board-performance signoff.
+Authoritative reports are each arm's `synth/fullcore_route_{timing,util}.rpt`.
+The selective arm is still running; this queue does not block subsequent IPC work.
 
 ## Retained frontend history repair — 2026-09-21
 
@@ -818,6 +823,113 @@ Artifacts: `/tmp/early-store-address-gate.sHxiPV`, followed by the existing
 no integrated SoC timing or board improvement is established. Full memory-order
 ticket lifecycle, independent load retry/bypass, SQ reservation and guaranteed
 early memory wakeup remain separate unfinished work.
+
+## Direct longword MOVE loads — 2026-09-21
+
+Based on `92859a1e`; default-off `fuseLongMoveLoads` removes the ordinary
+`LOAD -> T0; MOVE T0 -> Dn/An` crack for non-auto-update longword MOVE loads.
+It emits one LS micro-op with the original address operands and the final MOVE's
+integer destination/flag declaration. Existing LSU forwarding, load completion,
+translation and fault paths already support that shape: **no LSU datapath,
+PRF port, queue or speculative state is added**. Byte/word merges, EA auto-update,
+special operations and non-MOVE consumers remain unchanged. The design amendment
+under proposal 7 spells out eligibility and precise-state requirements.
+
+Initial full-core comparison uses the same 16 kernels, `l2:5:70`, seeds 1/17,
+first-through-last macro windows and four load-latency option combinations as the
+early-store experiment. Early store address, predictor experiments and subword
+forwarding are off. Against the prior baseline's 128 rows, **84 improve, 38 are
+unchanged, six regress**; all macro counts match. These are macro IPC results,
+not an improvement manufactured by counting fewer micro-ops as instructions.
+
+| Kernel | Macros | Baseline cycles, both load options (seed 1 / 17) | Fused cycles | IPC change |
+| --- | ---: | ---: | ---: | ---: |
+| pointer chain | 388 | 2436 / 2432 | 2172 / 2174 | +12.15% / +11.87% |
+| load stream | 481 | 650 / 647 | 525 / 524 | +23.81% / +23.47% |
+| same-line copyback | 244 | 335 / 334 | 304 / 303 | +10.20% / +10.23% |
+| load/store, precise | 290 | 1599 / 1616 | 1498 / 1490 | +6.74% / +8.46% |
+| mixed, precise | 326 | 792 / 798 | 808 / 798 | **−1.98%** / unchanged |
+| store stream | 488 | 632 / 627 | 625 / 628 | +1.12% / **−0.159%** |
+| mixed, copyback | 326 | 371 / 371 | 357 / 357 | +3.92% / +3.92% |
+| short load→store recurrence | 130 | 669 / 668 | 607 / 606 | +10.21% / +10.23% |
+
+Without either older load option, load-stream IPC improves **37.62–37.91%** and
+pointer-chain IPC **9.83–9.87%**. The precise mixed seed-1 loss repeats in all four
+modes; the one-cycle store-stream seed-17 loss occurs in the two early-wakeup
+modes. No loss is omitted from the six-regression count. Exact rows are in
+`/tmp/fused-long-move-ipc.log`, compared with
+`/tmp/early-store-address-corpus-baseline.log` and
+`/tmp/early-store-short-baseline.log`. The fresh disabled 128-row rerun
+(`/tmp/fused-long-move-disabled-ipc.log`) exactly matches those original macro
+counts and cycles. Pointer-chain demand spacing falls from nine to eight cycles
+with both older load options (253 intervals at each dominant spacing); this is
+the measured recurrence interval, not an isolated cache-pipeline latency.
+
+Fusion plus early store address also passes all 128 rows
+(`/tmp/fused-long-move-combined-ipc.log`): versus fusion alone, **32 improve and
+96 are unchanged, with no additional regressions**. Versus the disabled baseline,
+the same 84 improve, 38 stay equal and six regress. With both older load options:
+
+| Recurrence | Macros | Disabled cycles (seed 1 / 17) | Fusion only | Fusion + early store address | Combined IPC gain over disabled |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| divide → store → load | 98 | 2543 / 2541 | 2541 / 2539 | 2431 / 2431 | +4.61% / +4.52% |
+| rotate → store → load | 130 | 497 / 496 | 467 / 466 | 377 / 376 | +31.83% / +31.91% |
+| load → store recurrence | 130 | 669 / 668 | 607 / 606 | 406 / 405 | +64.78% / +64.94% |
+
+Both short recurrences now record 64 late-data captures (two stores per iteration).
+Removing the intervening ALU copy exposes the load-produced dynamic dependency
+to early store address execution; early address alone recorded zero late captures
+in the load-fed recurrence. These are small synthetic chains, not Dhrystone gains.
+
+Mixed-case cycle profiling reproduces the original measurements exactly
+(`/tmp/fused-long-move-mixed-baseline.log`,
+`/tmp/fused-long-move-mixed-candidate.log`). Both retire 326 macros and 40 branches,
+with **zero branch misses** inside the window. Fusion removes 40 micro-ops
+(366 → 326), and reduces mean ROB occupancy from about 17.0 to 14.9. For seed 1,
+head-incomplete/no-retirement cycles increase 549 → 565, accounting for the
+16-cycle regression; seed 17 stays at 555. All head-incomplete samples occur at
+the repeated load PCs. Neither arm records retirement-pair capacity stalls.
+This localizes the observed loss to load completion waiting, not branch recovery
+or a need for wider retire; it does not yet identify the cause of the changed
+memory-service schedule. Keep the regression visible pending that investigation.
+
+The directed decoder test covers 448 eligible source/destination combinations,
+the same combinations with fetch faults, and bit-identical excluded byte/word,
+auto-update, register/immediate, memory-destination, non-MOVE and privileged forms
+(`/tmp/fused-long-move-decode-v2.log`). Its first compile had test-only missing
+type qualification and enum-driver errors (`/tmp/fused-long-move-decode.log`),
+fixed without changing production bundles.
+
+Twenty-five selected oracle tests pass with fusion plus both load-latency options
+(`/tmp/fused-long-move-oracle.log`), including direct data/NZVC/alias cases,
+inhibited/copyback memory with delayed reads, split loads, indexed forms, redirects,
+IRQ/CCR recovery, page/store-fault recovery and wrong-path device reads. Four
+new/extended tests also pass with fusion off, and six pass with fusion **plus
+early store address and both load options**: delayed store data/squash, direct
+load values/flags/aliasing, nonadjacent physical-page splits, and both nonresident
+load/store fault → mapping handler → RTE → retry
+(`/tmp/fused-long-move-oracle-control-v2.log`,
+`/tmp/fused-long-move-combined-oracle-v2.log`). The separate direct A7 load → trap
+entry → RTE case passes both disabled and combined configurations
+(`/tmp/fused-long-move-a7-control.log`, `/tmp/fused-long-move-a7-enabled.log`).
+
+The new faulting-load check initially diverged with fusion both enabled and
+disabled. Root cause was the existing fixture: the oracle's missing leaf defaulted
+to `0xffffffff`, a **resident, write-protected** page, whereas RTL explicitly got
+zero/nonresident. The old store case happened to fault for the wrong reason;
+the load correctly did not fault in that mismatched oracle setup. Explicitly
+preloading the oracle leaf to zero fixes the premise, without relaxing frame,
+destination, flag or retry assertions. Preserve the failed evidence in
+`/tmp/fused-long-move-combined-oracle.log` and
+`/tmp/fused-long-move-oracle-control.log`; the standalone oracle reproduction is
+`/tmp/fused-load-fault-repro.Wwmclb`.
+
+Both required fast gates pass 384 tests, two ignored, zero failed/aborted
+(`/tmp/fused-long-move-fast.log`, `/tmp/fused-long-move-fast-final.log`).
+Routed timing is pending.
+Use `IPC_FUSE_LONG_MOVE_LOADS=1`, `LOCKSTEP_FUSE_LONG_MOVE_LOADS=1`, or
+`--fuse-long-move-loads`. Production SocketTop remains unchanged. No board was
+halted, reset or reloaded; no board IPC or SoC timing gain is claimed.
 
 ## Next investigations requested — 2026-09-21
 

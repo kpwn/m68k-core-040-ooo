@@ -815,7 +815,8 @@ object GenFullCoreSynthVerilog {
                 trainSlot1Conditional: Boolean = false,
                 deferTakenSlot1Conditional: Boolean = false,
                 retainRedirectHistory: Boolean = false,
-                earlyStoreAddress: Boolean = false): Unit = {
+                earlyStoreAddress: Boolean = false,
+                fuseLongMoveLoads: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -845,7 +846,8 @@ object GenFullCoreSynthVerilog {
           new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory),
           new FetchAlignPlugin(enableFetchDirected = true, deferSlot1Conditional = deferSlot1Conditional,
             trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional),
-          new DecodeStage(allowSlot1Prediction = trainSlot1Conditional),
+          new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
+            fuseLongMoveLoads = fuseLongMoveLoads),
           new RenameStage(),
           new DispatchPlugin(),
           new RobPlugin(pairCorrectBranch = pairCorrectBranch),
@@ -877,7 +879,7 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address")),
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address", "--fuse-long-move-loads")),
       "unknown FullCoreSynth experiment option")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
@@ -888,7 +890,8 @@ object GenFullCoreSynthVerilog {
       trainSlot1Conditional = args.contains("--train-slot1-conditional") || args.contains("--defer-taken-slot1-conditional"),
       deferTakenSlot1Conditional = args.contains("--defer-taken-slot1-conditional"),
       retainRedirectHistory = args.contains("--retain-redirect-history"),
-      earlyStoreAddress = args.contains("--early-store-address"))
+      earlyStoreAddress = args.contains("--early-store-address"),
+      fuseLongMoveLoads = args.contains("--fuse-long-move-loads"))
   }
 }
 

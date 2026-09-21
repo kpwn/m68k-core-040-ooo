@@ -343,7 +343,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     trainSlot1Conditional: Boolean = false,
                     deferTakenSlot1Conditional: Boolean = false,
                     retainRedirectHistory: Boolean = false,
-                    earlyStoreAddress: Boolean = false) extends Component {
+                    earlyStoreAddress: Boolean = false,
+                    fuseLongMoveLoads: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -366,7 +367,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional)
-    val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional)
+    val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
+      fuseLongMoveLoads = fuseLongMoveLoads)
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch)

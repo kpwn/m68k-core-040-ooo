@@ -176,6 +176,31 @@ Bank final-destination data rather than create a large combinational gather.
 **Experiment:** dynamic uops/macros and ROB bytes saved, plus fault at every
 micro-op boundary. **Priority: medium if hot cracking consumes meaningful capacity.**
 
+#### Controlled experiment: direct longword MOVE loads
+
+Default-off `fuseLongMoveLoads` replaces the ordinary non-auto-update
+`MOVE.L <memory>,Dn` / `MOVEA.L <memory>,An` load-to-temporary plus ALU-copy
+crack with one LS micro-op. Keep the existing load EA, displacement, index,
+translation/fault handling and memory ordering. Its integer destination and
+NZVC-write declaration come from the original final MOVE micro-op. MOVEA keeps
+NZVC unchanged; neither form writes X. The existing LSU completion paths already
+produce full-width data and sized MOVE flags, including SQ forwards and split
+loads, so this experiment adds no execution port or speculative state.
+
+The one load is both first and last of the macro, carries the original PC/length,
+and publishes only after successful completion. A fault must leave the old
+integer and flag mappings architectural, with the same exception PC and frame.
+Byte/word partial-register merges, source auto-update, memory-to-memory MOVE,
+RMW, privileged/system, microcoded and non-MOVE operations keep their cracks.
+Decoder admission still takes priority over this optimization. Validate decode
+eligibility/exclusions, every LSU completion route, immediate dependent integer
+and condition-code consumers, destination/base/index aliasing, line/page splits,
+fault/IRQ/trace/debug recovery, and tag wrap. Compare useful macro IPC, not uop
+throughput; fewer uops are not themselves evidence of improved performance.
+
+This is an experiment under proposal 7, not wider or out-of-order retirement,
+and is independent of the pending memory-dependency/SQ-reservation work.
+
 ### 8. BOOM-style point-of-no-return frontier
 
 Track the oldest operation that can still redirect or fault. Past that safety

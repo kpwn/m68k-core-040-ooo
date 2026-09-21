@@ -504,7 +504,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
     val dec    = new DecodeStage(allowSlot1Prediction =
-      sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
+      sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
+      fuseLongMoveLoads = sys.env.get("LOCKSTEP_FUSE_LONG_MOVE_LOADS").contains("1"))
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
@@ -6024,6 +6025,52 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       checkMem = Seq(0x2000L, 0x2004L))
   }
 
+  test("lock-step: direct long MOVE loads preserve data, flags and aliased EA sources", VerilatorTest) {
+    for(copyback <- Seq(false, true)) {
+      val setup = (if(copyback) Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+        "move.l #0x400FE020,%d7", "movec %d7,%itt0",
+        "move.l #0xC000,%d7", "movec %d7,%tc") else Nil) ++
+        (for(base <- Seq(0x3000, 0x3010, 0x5000, 0x5010, 0x6000); word <- 0 until 4)
+          yield s"move.l #0,0x${(base + word * 4).toHexString}") ++ Seq("moveq #0,%d5")
+      val body = for(value <- Seq("0", "0x80000000", "0x13579bdf", "0xffffffff");
+                     offset <- Seq(0, 1, 12, 15)) yield Seq(
+        s"lea 0x${(0x3000 + offset).toHexString},%a0", s"move.l #$value,%d2",
+        "move.l %d2,(%a0)", "move.l (%a0),%d0", "seq %d3", "smi %d4",
+        "add.l %d0,%d5", "movea.l (%a0),%a1", "seq %d6", "move.l %d0,0x5000")
+      val aliases = Seq("lea 0x6000,%a0", "move.l #0x12345678,4(%a0)",
+        "moveq #4,%d1", "move.l (%a0,%d1.l),%d1", // destination is the old EA index
+        "move.l #0x6000,(%a0)", "movea.l (%a0),%a0", // destination is the old EA base
+        "move.l (%a0),%d0", "add.l %d1,%d0", "move.l %d0,0x5010")
+      val evict = for(line <- Seq(0x3000, 0x3010, 0x5000, 0x5010, 0x6000); n <- 1 to 4)
+        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      runLockStep(s"direct-long-load-$copyback", (setup ++ body.flatten ++ aliases ++ evict).mkString(" ; "),
+        checkMem = Seq(0x3000L, 0x3010L, 0x5000L, 0x5010L, 0x6000L), checkSpan = 16,
+        maxCycles = 100000, dcfg = m68k040.sim.L2Sweeps.l2DramSlow)
+    }
+  }
+
+  test("lock-step: direct long MOVE loads cross nonadjacent physical pages", VerilatorTest) {
+    runLockStep("direct-long-page-split",
+      "move.l #0x11223344,0x2ffc ; move.l #0x55667788,0x3000 ; " +
+      "move.l 0x2fff,%d1 ; seq %d3 ; move.l 0x2ffe,%d2 ; smi %d4 ; " +
+      "movea.l 0x2ffd,%a0 ; move.l %a0,%d0",
+      mmuMap = Some(0x2000L -> 0x42L), extraMmuPages = Seq(0x3000L -> 0x57L),
+      maxCycles = 30000, dcfg = m68k040.sim.L2Sweeps.l2DramSlow,
+      afterRun = (_, oracle) => {
+        assert(oracle.last.d(0) == 0x22334455L)
+        assert(oracle.last.d(1) == 0x44556677L && oracle.last.d(2) == 0x33445566L)
+      })
+  }
+
+  test("lock-step: direct long MOVE loads into A7 survive trap entry and RTE", VerilatorTest) {
+    runLockStep("direct-long-load-a7-trap",
+      "move.l #0x000f0000,0x3000 ; movea.l 0x3000,%sp ; " +
+      "move.l #handler,%d0 ; move.l %d0,0x90 ; trap #4 ; " +
+      "moveq #7,%d3 ; loop: bra loop ; handler: moveq #9,%d4 ; rte",
+      nInstr = 8, checkMem = Seq(0x3000L),
+      afterRun = (_, oracle) => assert(oracle.last.a(7) == 0x000f0000L))
+  }
+
   test("lock-step: two loads + add", VerilatorTest) {
     // Two cracked loads feeding an add: D2 = mem[0x2000] + mem[0x2004] = 10 + 20 = 30.
     // Each load immediately follows its producing store so it resolves via the
@@ -6979,7 +7026,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // both the RTL walker and the oracle shim agree it's a valid resident mapping.
   // The resulting PPN (0x01000, NOT the original 0x42) is what the retried store
   // actually lands at — `dataPPN` below is updated to match.
-  test("lock-step: page fault (non-resident) -> handler maps -> RTE -> resume", VerilatorTest) {
+  for(loadInsteadOfStore <- Seq(false, true))
+  test(s"lock-step: page fault (non-resident) ${if(loadInsteadOfStore) "load" else "store"} -> handler maps -> RTE -> resume", VerilatorTest) {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val PTRT = 0x00081000L
     val PAGA = 0x00082000L
@@ -6991,20 +7039,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
     // The program (identical for RTL + oracle). Handler writes pageA[2] a resident
     // descriptor (see the byte-palindrome comment above) then RTE -> the faulting
-    // store re-executes.
+    // access re-executes. The load variant tests faulting direct MOVE completion,
+    // old destination/CCR preservation on the fault, and the retry's new value.
     val src =
       "move.l #handler,%d1 ; move.l %d1,0x8 ; " +        // vector 2 (access fault) @ 0x8
-      "moveq #42,%d0 ; move.l %d0,0x2000 ; " +           // FAULTS, then re-runs after RTE
+      "moveq #42,%d0 ; " +
+      (if(loadInsteadOfStore) "move.l 0x2000,%d0 ; " else "move.l %d0,0x2000 ; ") +
       "loop: bra loop ; " +
       "handler: move.l #0x01000001,%d1 ; move.l %d1,0x82008 ; rte"
-    val nInstr = 8  // vec-imm, vec-store, store(fault->reexec after handler), handler-imm, handler-store, rte, store(reexec), bra
+    val nInstr = 8  // three setup instructions, fault, three handler instructions, retried access
 
-    // Oracle: window = the data page only; preload the resident root[0] + ptr[0]
-    // descriptors the VA-0x2000 walk needs (handler writes the leaf pageA[2]).
+    // Oracle: explicitly make pageA[2] nonresident, matching the RTL setup.
+    // Unwritten oracle memory is 0xff: that is a resident, write-protected leaf,
+    // which accidentally faulted the old STORE case but permits a supervisor READ.
     def le(v: Long): Long = v & 0xffffffffL
     val oraclePt = Seq(
       0x80000L -> ((PTRT & 0xfffffff0L) | 0x2L),   // root[0] -> ptr resident
-      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L))   // ptr[0]  -> pageA resident
+      PTRT     -> ((PAGA & 0xfffffff0L) | 0x2L),   // ptr[0]  -> pageA resident
+      (PAGA + 2 * 4) -> 0L) ++                   // pageA[2] explicitly NON-RESIDENT
+      (if(loadInsteadOfStore) Seq((dataPPN << 12) -> 0x81121281L) else Nil)
     val mmu = Some(Musashi.MmuConfig(rootPtr = 0x80000L, dataLo = 0x2000L, dataHi = 0x3000L, ptPreload = oraclePt))
 
     val oracleSteps = Musashi.assembleAndTrace(src, mmu = mmu, maxCycles = 20000) match {
@@ -7078,6 +7131,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Task #194: BIG-ENDIAN byte order (byte at the lowest address = the descriptor's
       // MSB) — matches TableWalker.selectWord's corrected convention. Kept the name.
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
+      if(loadInsteadOfStore) pokeLE(dataPPN << 12, 0x81121281L)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)   // root[0] -> ptr resident
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)   // ptr[0]  -> pageA resident
       pokeLE(PTRT + 2 * 4,    (PAGC & 0xfffffff0L) | 0x2L)   // ptr[2]  -> pageC resident
@@ -7156,7 +7210,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(pk32(fb + 2) == 0x4080000cL, f"[pagefault] frame PC=0x${pk32(fb + 2)}%08x expected the faulting-instr PC 0x4080000c")
       assert(pk16(fb + 6) == 0x7008, f"[pagefault] frame fmt/vec=0x${pk16(fb + 6)}%04x expected 0x7008")
       assert(pk32(fb + 8) == 0x2000L, f"[pagefault] frame EA=0x${pk32(fb + 8)}%08x expected 0x2000")
-      assert(pk16(fb + 0xc) == 0x0405, f"[pagefault] frame SSW=0x${pk16(fb + 0xc)}%04x expected 0x0405")
+      val expectedSsw = if(loadInsteadOfStore) 0x0505 else 0x0405
+      assert(pk16(fb + 0xc) == expectedSsw,
+        f"[pagefault] frame SSW=0x${pk16(fb + 0xc)}%04x expected 0x$expectedSsw%04x")
       assert(pk32(fb + 0x14) == 0x2000L, f"[pagefault] frame faultAddr=0x${pk32(fb + 0x14)}%08x expected 0x2000")
 
       val res = LockStep.compare(handle.result.take(nInstr), oracle)
@@ -7164,10 +7220,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         s"[pagefault] lock-step diverged: ${res.firstDivergence.map(_.toString).getOrElse("?")} " +
           s"(matched ${res.matched}, dut commits ${handle.result.size}, oracle steps $nInstr)")
 
-      // The re-executed store landed at the mapped PA 0x42000 (value 42 = 0x2a).
+      // The retried access uses the handler-installed dataPPN mapping.
       cd.waitSampling(200)
       val pa = (dataPPN << 12) | (0x2000L & 0xfffL)
-      assert(dmem.peekByte(pa + 3) == 0x2a,
+      if(loadInsteadOfStore) {
+        assert(oracle.last.d(0) == 0x81121281L, "retried load must replace the old destination")
+        assert(dmem.peekByte(pa + 3) == 0x81, "retried load must not change memory")
+      } else assert(dmem.peekByte(pa + 3) == 0x2a,
         f"[pagefault] re-executed store must land 0x2a at PA 0x${pa + 3}%08x (got 0x${dmem.peekByte(pa + 3)}%02x)")
     }
   }

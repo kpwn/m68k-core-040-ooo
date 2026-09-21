@@ -30,7 +30,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * The skid is flushed by the same `pipeFlush` as the queue so a wrong-path group
   * held in the register is squashed on a mispredict/exception redirect.
   */
-class DecodeStage(allowSlot1Prediction: Boolean = false) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+class DecodeStage(allowSlot1Prediction: Boolean = false,
+                  fuseLongMoveLoads: Boolean = false) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
@@ -290,8 +291,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false) extends FiberPlugin wit
     // preserved.) A 3-µop SLOT1 (after a <=2-µop slot0) is likewise stashed + replayed.
     // ANGLE E: pass the REGISTERED (offloaded) per-slot OpSpec into the assembler so the
     // deep masked-pattern table is NOT re-evaluated on the post-register critical arc.
-    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0))
-    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1))
+    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0), fuseLongMoveLoads)
+    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1), fuseLongMoveLoads)
 
     // Stash for a deferred slot1. FMax: stash the ALREADY-DECODED slot1 µops (computed
     // from a1raw, no second MicroOpAssembler instance) — the replay cycle reads these
