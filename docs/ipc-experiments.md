@@ -2657,3 +2657,40 @@ that local IPC ratio as the overall improvement. Its seven retirements at
 `03be19c2` yield six consecutive 20-cycle copy-loop intervals, versus the prior
 24-cycle steady baseline; this agrees with the pre-postincrement simulation.
 The two newer store experiments are NOT included in this board result.
+
+### Direct 200 MHz integrated candidate — 2026-09-21
+
+User requested going straight to a 200 MHz SoC, rather than another 100 MHz
+image. Added explicit socket `throughput-v2`: v1 plus postincrement late-store
+reservation and wake-qualified data capture. V1/default behavior remains
+unchanged. IQ/LSU enable the matching postincrement contract; the socket has no
+new external signals. CPU pin `ca3f31da7f04cdfbcbc7199d4ce7683e35638403` also
+includes the already-validated precise IRQ macro-boundary fix. Profile selection
+tests cover baseline/v1/v2 and reject unknown settings. Mandatory fast gate:
+388 passed, two ignored, zero failures at 12:19:19
+(`/tmp/ipc-throughput-v2-fast.log`). Earlier 29-case oracle and 136-case IPC
+results apply to this same option combination, not a new timing claim.
+
+Isolated SoC worktree
+`/home/qwertyoruiop/macqd700-soc-worktrees/ipc-candidates-200mhz`, branch
+`perf/ipc-candidates-200mhz`, pin `d3b19b2dfa7168265caf303ba4ef860801d32c8d`.
+Service `m68k-ipc-candidate-soc200.service` started 12:20 local; runner
+`/tmp/run-ipc-candidate-soc200.sh`. Core/fabric target 200 MHz, peripheral clock
+50 MHz, real cached MIG, Ethernet, detailed counters, IPC ILA, VIO/JTAG AXI
+and SCSI trace retained; PCIe off, CMD25 off. No incremental implementation.
+Existing AggressiveExplore route/post-route flow retained. Netlist generation,
+top/real-MIG lint, reset-pairing and synthesis-source checks precede synthesis.
+
+Priority: suspend ONLY the context-capacity queue's parent shell, not its active
+two-context arm/Vivado child. Once that arm releases the global mutex, the full
+SoC takes the next physical slot instead of waiting for all remaining core A/B
+comparisons. The SoC runner resumes that parent on exit (including failure),
+allowing the pending four-context/postincrement/wakeup comparisons to continue.
+This is build scheduling, not a paused goal. No running implementation was killed.
+
+Logs `/tmp/ipc-candidate-soc200-{build,generation,lint}.log`; the existing
+`build-logs:0.0` pane follows the full-SoC job and the active core arm. Final
+timing/DRC and local ADB patch remain required before any load, which needs
+fresh permission. The Mac stays on build `6b10354a`; no SPI/SD writes or
+automatic programming are part of this job. Started/preflight is not routed
+timing acceptance or a completed bitstream.
