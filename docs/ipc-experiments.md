@@ -2326,3 +2326,102 @@ provides no evidence of a retirement-width limit (zero ROB-full cycles).
 At the user's explicit request, `/root/ipc_soc100_finish` owns the live SoC job,
 artifact/timing audit, local ADB patch and authorized volatile load. Parent owns
 serial simulations and IPC RTL work; no concurrent parent board access.
+
+### Sep 21: matched control, board-copy results and cracked uops
+
+Fresh no-feature corpus completed: 136 cases across the four fall-through/wakeup
+settings pass (`/tmp/ipc-fresh-baseline-corpus.log`). Compare only the 34 fully
+disabled cases against the composed profile's 34 both-enabled cases, using the
+same 17 kernels, seeds 1/17 and L2 5-cycle / DDR 70-cycle model:
+
+| Profile | Macros | Cycles | Aggregate macro IPC |
+| --- | ---: | ---: | ---: |
+| Fresh baseline | 10,986 | 41,809 | 0.262766 |
+| Combined | 10,986 | 35,995 | 0.305209 |
+
+Aggregate gain **16.1522%**; 27 cases improve, six unchanged, one regresses:
+`mixed`, seed 1, 792→808 cycles (about 1.98% lower IPC). This is a matched
+synthetic comparison, not a Dhrystone or integrated-board result.
+
+`BoardStringCopyIpcSpec` passes all 16 runs (two profiles, two lengths, two
+readback choices, two seeds), including byte-for-byte destination and pointer
+checks. Non-readback windows, after eight warmup iterations:
+
+| Length / seed | Window macros | Baseline cycles / IPC | Combined cycles / IPC |
+| --- | ---: | ---: | ---: |
+| 32 / 1 | 102 | 645 / 0.158140 | 553 / 0.184448 |
+| 32 / 17 | 102 | 646 / 0.157895 | 549 / 0.185792 |
+| 128 / 1 | 486 | 3338 / 0.145596 | 2871 / 0.169279 |
+| 128 / 17 | 486 | 3333 / 0.145815 | 2868 / 0.169456 |
+
+IPC gains 16.2–17.7%; the separate readback variants also improve 16.7–17.9%.
+Log `/tmp/board-copy-ipc.log`. These windows include loop exit and final pointer
+reads; they are not an exact per-iteration latency or the original executable.
+Both profiles still perform the same number of stores: 67 or 259 including
+initialization. Both peak at two SQ residents and one accepted drain. The
+128-byte/seed-1 oldest-store-unready window shrinks 2641→2172 cycles, but remains
+large. This motivates dependency-latency work, not an assertion that SQ capacity
+or retirement width is the limiting resource.
+
+`BoardLoopDecodeTraceSpec` replays the exact board-read opwords at 03be19c2
+through I-cache, fetch alignment, DecodeStage and the rename-facing uop queue.
+The trace uses cold/not-taken prediction to emit one sequential pass. It is
+decoded RTL output, not a live-board uop/PRF-tag capture. The initial combined
+fixture lacked the required secondary prediction service; adding a test-owned
+cold prediction provider fixes the fixture, with no production RTL change.
+Both profiles now pass (`/tmp/board-loop-decode.log`). Actual sequence:
+
+```text
+PC 03be19c2 MOVEA.L 12(A6),A0
+  baseline: LOAD.L [A6+12] -> T0; MOVE.L T0 -> A0
+  combined: LOAD.L [A6+12] -> A0
+PC 03be19c6 ADDQ.L #1,12(A6)
+  LOAD.L [A6+12] -> T0
+  ADD.L T0,#1 -> T1, NZVC, X
+  STORE.L T1 -> [A6+12]
+PC 03be19ca MOVE.B (A0),(A1)+
+  LOAD.B [A0] -> T0
+  STORE.B T0 -> [A1], A1 := A1+1, NZVC
+PC 03be19cc BNE.S 03be19c2
+  BRANCH using NZVC from the byte store
+```
+
+Four macros become **eight baseline uops, seven combined uops**. T0/T1 are
+logical renamed temporaries, not one physical register reused serially across
+all these instances. Both profiles retain five LS uops per iteration. The byte
+store produces both the architectural A1 update and the branch's flag input;
+dropping a redundant memory transaction cannot drop these results. The baseline
+eight-uop count independently agrees with the board ILA's 200 retired uops per
+100 macro instructions in the selected steady-loop window.
+
+Store coalescing is recorded as proposal 18, with a conservative committed,
+adjacent, unpresented COPYBACK-only first experiment. No RTL implementation or
+speedup claim. Pointer stores in this loop are nonadjacent in store order, so the
+minimal cheap version would not directly merge them.
+
+Physical queue update: the independent early-NZVC core gate completed with
+WNS +0.004 ns, hold +0.024 ns, pulse +1.958 ns, zero failing endpoints; baseline
+0.000/+0.019/+1.958 ns. Reports under `/tmp/ls-nzvc-gate.cM6rEn/`. This is core
+timing only. The delegated pinned 100 MHz SoC build acquired the global mutex
+at 10:44:25 local and started; no new board performance result yet.
+
+Required post-test fast gate passes **388 tests, two ignored, zero failures**
+at 10:52:41 local (`/tmp/board-loop-fast.log`). No production RTL changes in this
+measurement/trace addition.
+
+User's next priority: next-cycle wakeup of a load dependent on a store. Define
+the measured event precisely: known youngest overlapping older store, full byte
+coverage, resolved permission/cacheability, reserved SQ ownership, data becoming
+available, and a guaranteed forwarding/completion resource. Then wake the load
+without waiting for ROB retirement or cache drain. Address-unknown, partial or
+multi-store coverage, device, split and fault cases remain conservative.
+
+Current `forwardOnPublish` bypass already makes newly published store data
+available to an SQ query in that cycle. It does **not** implement a tagged memory
+dependency wakeup into the IQ. LS still selects the oldest occupied LS uop;
+forward results are captured at P3→P4 or a P4 retry, then completion is selected
+from the registered verdict. `earlyIntWakeup` announces that selected completion's
+next-cycle PRF write, not the original store's data-production event. The next
+experiment should distinguish producer-data→SQ-publication, publication→load
+completion, and load-completion→consumer-issue intervals; shortening one is not
+evidence that the entire chain is one cycle. No one-cycle implementation claim yet.

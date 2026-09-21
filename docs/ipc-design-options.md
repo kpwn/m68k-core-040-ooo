@@ -715,6 +715,32 @@ on publication, and wrapped/reused identities. Existing special commit paths mus
 observe the same architectural image. Service ownership and one-producer Global
 rules still apply; a side buffer must not become a second uncontrolled commit owner.
 
+## 18. Conservative committed-store coalescing
+
+User-proposed, not implemented or timed. Start with consecutive, committed,
+data-ready, aligned same-size COPYBACK stores to exactly the same physical word,
+before either is presented on the cache's drain Stream. Exclude precise/device,
+split, atomic and ordering-boundary cases. Keep the youngest value and account
+for both architectural stores without inventing a cache acknowledgement. A
+single-neighbor comparison is preferable to a full-SQ associative merge search.
+Already-presented payloads must remain stable even under backpressure; accepted
+writes cannot be cancelled. Translation/permission/fault checking, flag and
+address-register results are not removed by dropping a redundant memory write.
+
+Do not overwrite an older speculative store with younger data: intervening loads
+may require the older value, and a squash or exception may discard the younger
+store. Coalescing adjacent bytes with masks is a separate expansion, not the
+initial implementation. Nonadjacent coalescing needs an explicit memory-ordering
+argument and must not move a younger value across externally observable accesses.
+
+The board-derived copy loop is not an obvious win for this minimal proposal:
+each repeated pointer store is separated by a destination-byte store, and the
+next iteration consumes the pointer value. The baseline and combined simulation
+both peak at only two resident SQ entries and one accepted drain. Measure eligible
+pending pairs first; do not delay ordinary draining merely to manufacture merges.
+Even perfect elimination of pointer cache writes leaves its load/add/forwarding
+recurrence and the byte store's A1/NZVC results intact.
+
 ## Primary references
 
 - [BOOM ROB and PNR](https://docs.boom-core.org/en/latest/sections/reorder-buffer.html):
