@@ -147,8 +147,9 @@ class IssueQueueSpec extends AnyFunSuite {
       for (cyc <- 0 until 20) {
         // robIds 0..15 across the first 8 cycles; later cycles repeat but never
         // fire (queue full), so they are harmless.
-        val a = (cyc * 2) % 64
-        val b = (cyc * 2 + 1) % 64
+        val ids = 1 << dut.source.logic.s0.robId.getWidth
+        val a = (cyc * 2) % ids
+        val b = (cyc * 2 + 1) % ids
         setPush(dut, valid = true, slot1Valid = true, a, b)
         cd.waitSampling()
       }
@@ -186,9 +187,9 @@ class IssueQueueSpec extends AnyFunSuite {
       dut.sink.logic.ready0 #= false
       dut.sink.logic.ready1 #= false
 
-      // Push 4 uops (robIds 40..43) over 2 cycles (robId is 6 bits, 0..63).
-      setPush(dut, valid = true, slot1Valid = true, 40, 41); cd.waitSampling()
-      setPush(dut, valid = true, slot1Valid = true, 42, 43); cd.waitSampling()
+      // Keep IDs within the current default 32-entry ROB's five-bit domain.
+      setPush(dut, valid = true, slot1Valid = true, 8, 9); cd.waitSampling()
+      setPush(dut, valid = true, slot1Valid = true, 10, 11); cd.waitSampling()
       setPush(dut, valid = false, slot1Valid = false, 0, 0); cd.waitSampling()
 
       // Flush for one cycle.
@@ -202,7 +203,7 @@ class IssueQueueSpec extends AnyFunSuite {
       dut.sink.logic.ready1 #= true
       for (_ <- 0 until 6) {
         val s = dut.sink.logic
-        val flushedSet = Set(40, 41, 42, 43)
+        val flushedSet = Set(8, 9, 10, 11)
         if (s.v0.toBoolean) assert(!flushedSet.contains(s.rob0.toInt), s"flushed uop ${s.rob0.toInt} issued on port0")
         if (s.v1.toBoolean) assert(!flushedSet.contains(s.rob1.toInt), s"flushed uop ${s.rob1.toInt} issued on port1")
         cd.waitSampling()
@@ -210,7 +211,7 @@ class IssueQueueSpec extends AnyFunSuite {
 
       // Push 2 fresh uops; assert they issue.
       val got = ArrayBuffer[Int]()
-      setPush(dut, valid = true, slot1Valid = true, 50, 51); cd.waitSampling()
+      setPush(dut, valid = true, slot1Valid = true, 24, 25); cd.waitSampling()
       setPush(dut, valid = false, slot1Valid = false, 0, 0)
       for (_ <- 0 until 6) {
         val s = dut.sink.logic
@@ -218,7 +219,65 @@ class IssueQueueSpec extends AnyFunSuite {
         if (s.v1.toBoolean) got += s.rob1.toInt
         cd.waitSampling()
       }
-      assert(got.contains(50) && got.contains(51), s"fresh uops did not issue, got ${got.mkString(",")}")
+      assert(got.contains(24) && got.contains(25), s"fresh uops did not issue, got ${got.mkString(",")}")
+    }
+  }
+
+  test("flush invalidates nonzero dependency masks even with simultaneous push and slot reuse", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      idle(dut)
+      cd.waitSampling(2)
+
+      // Fill with producer/consumer pairs while execution is backpressured.
+      // Unlike the independent-uop flush test, this leaves live static triggers.
+      for (pair <- 0 until 6) {
+        assert(dut.source.logic.pushReady.toBoolean)
+        pushUops(dut,
+          Some(UopSpec(pair * 2, pdstValid = true, pdst = pair + 1)),
+          Some(UopSpec(pair * 2 + 1, psrcAValid = true, psrcA = pair + 1)))
+        cd.waitSampling()
+      }
+      pushUops(dut, None, None)
+      cd.waitSampling()
+      val slots = dut.iq.logic.lines.flatMap(_.ways)
+      assert(slots.exists(s => s.sel.toBoolean && s.triggers.toBigInt != 0),
+        "test did not leave any occupied static dependency masks")
+
+      // A concurrent push must lose to flush, including any entries already
+      // sitting in registered issue stages. Neither may leak to an EU.
+      pushUops(dut, Some(UopSpec(0)), Some(UopSpec(1)))
+      dut.source.logic.flush #= true
+      dut.sink.logic.ready0 #= true
+      dut.sink.logic.ready1 #= true
+      sleep(1)
+      assert(issuedThisCycle(dut).isEmpty, "wrong-path issue on flush cycle")
+      cd.waitSampling()
+      pushUops(dut, None, None)
+      dut.source.logic.flush #= false
+      sleep(1)
+      assert(slots.forall(s => !s.sel.toBoolean), "flush left occupied slots")
+
+      // More than one queue's worth of fresh dependent pairs shifts through all
+      // former positions. No old trigger or scoreboard owner may block them.
+      val got = ArrayBuffer[Int]()
+      var pair = 0
+      for (_ <- 0 until 100) {
+        got ++= issuedThisCycle(dut)
+        if (pair < 10 && dut.source.logic.pushReady.toBoolean) {
+          pushUops(dut,
+            Some(UopSpec(12 + pair * 2, pdstValid = true, pdst = pair + 1)),
+            Some(UopSpec(13 + pair * 2, psrcAValid = true, psrcA = pair + 1)))
+          pair += 1
+        } else pushUops(dut, None, None)
+        cd.waitSampling()
+        sleep(1)
+      }
+      assert(pair == 10)
+      assert(got.sorted == (12 until 32), s"missing, duplicate or wrong-path issue: $got")
+      for (producer <- 12 until 32 by 2)
+        assert(got.indexOf(producer) < got.indexOf(producer + 1), "dependency order lost")
     }
   }
 

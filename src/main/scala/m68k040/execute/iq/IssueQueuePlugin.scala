@@ -1728,7 +1728,12 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     when(flushSignal) {
       lines.foreach(_.ways.foreach { w =>
         w.sel      := False
-        w.triggers := 0
+        // Trigger bits are payload of the occupied slot, not occupancy state.
+        // All consumers qualify them with sel, and both insertion and compaction
+        // overwrite the complete mask alongside that slot's new sel/hot record.
+        // Clearing them here only broadcasts ROB flush into every triangular
+        // dependency-mask flop. Keep the same-cycle issue gates and scoreboard
+        // clears below: those DO carry architectural/producer ownership.
       })
       count := 0
       sbInt.busy  := 0
