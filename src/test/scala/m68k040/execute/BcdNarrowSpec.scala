@@ -54,6 +54,19 @@ class BcdNarrowSpec extends AnyFunSuite {
     (byte, (n << 3) | (z << 2) | (v << 1) | (if (carry) 1 else 0), carry)
   }
 
+  private def nbcdReference(byte: Int, x: Int, oldZ: Int): (Int, Int, Boolean) = {
+    var r = (0x9a - byte - x) & 255
+    if (r == 0x9a) (byte, 8 | (oldZ << 2), false)
+    else {
+      val before = r
+      if ((r & 15) == 10) r = ((r & 240) + 16) & 255
+      val n = (r >> 7) & 1
+      val v = ((~before & r) >> 7) & 1
+      val z = if (oldZ != 0 && r == 0) 1 else 0
+      (r, (n << 3) | (z << 2) | (v << 1) | 1, true)
+    }
+  }
+
   test("actual BCD cone matches unsigned32 for all byte pairs, X, Z and NBCD", VerilatorTest) {
     SimConfig.withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
@@ -84,7 +97,8 @@ class BcdNarrowSpec extends AnyFunSuite {
         p.x #= (x != 0); p.oldZ #= (z != 0)
         p.subtract #= subtract; p.nbcd #= nbcd
         cd.waitSampling(); sleep(1)
-        val (byte, flags, carry) = reference(if (nbcd) 0 else dx, dy, x, z, subtract)
+        val (byte, flags, carry) = if (nbcd) nbcdReference(dy, x, z)
+                                  else reference(dx, dy, x, z, subtract)
         val expected = (BigInt(upper | byte) << 5) | BigInt((flags << 1) | (if (carry) 1 else 0))
         val actual = p.observed.toBigInt
         assert(actual == expected,

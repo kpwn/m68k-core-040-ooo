@@ -303,13 +303,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // pre-masking. See docs/bcd-narrow-intermediates.md and the exhaustive real-cone
     // oracle test, including invalid digits. Nine bits is NOT enough for addition.
     //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
-    // NBCD (task #159) reuses this SAME cone (bcdSub=True, the subtract formula) with
-    // `dx` forced to the constant 0 (Musashi: res = 0 - dst - X): srcA still carries Dn
-    // (for the .B-merge upper-24 preserve via s1Src1) and srcB also carries Dn (dy), but
-    // the "dx" operand position in the formula is overridden to 0 regardless of s1Src1.
+    // NBCD has a distinct byte correction/flag rule (below), not SBCD(0,dy,X).
+    // Keep opcode selection after arithmetic, out of the add/sub operand path.
     val isNbcd = u1.op === DecOp.NBCD
     val isBcd = u1.op === DecOp.BCD || isNbcd
-    val dx    = Mux(isNbcd, U(0, 8 bits), s1Src1(7 downto 0).asUInt)
+    val dx    = s1Src1(7 downto 0).asUInt
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
     val bcdWidth = 10
@@ -341,12 +339,22 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val sRes8  = sFix(7 downto 0)                            // res = MASK_OUT_ABOVE_8(res)
     val sV     = (sVraw(7) & sRes8(7))                       // FLAG_V &= res8; CCR V = bit7
     val sN     = sRes8(7)                                    // FLAG_N = NFLAG_8(res)
-    // ── select by bcdSub; C=X=decimal carry/borrow; Z is CLEAR-ONLY (FLAG_Z |= res). ──
-    val bcdRes8  = Mux(u1.bcdSub, sRes8, aRes8)
-    val bcdCarry = Mux(u1.bcdSub, sBorrow, aCarry)
-    val bcdN     = Mux(u1.bcdSub, sN, aN)
-    val bcdV     = Mux(u1.bcdSub, sV, aV)
-    val bcdZ     = s1Nzvc(2) && (bcdRes8 === 0)              // Z := Z_old && res8==0
+    // NBCD's byte-wide oracle semantics. The no-change case preserves old Z
+    // even for invalid operand ff with X=1; N still observes raw 9a (N=1).
+    val nRaw = U(0x9a, 8 bits) - dy - xin.resize(8)
+    val nNoChange = nRaw === U(0x9a, 8 bits)
+    val nAdjusted = Mux(nRaw(3 downto 0) === U(0xa, 4 bits),
+      (nRaw & U(0xf0, 8 bits)) + U(0x10, 8 bits), nRaw)
+    val nRes8 = Mux(nNoChange, dy, nAdjusted)
+    val nN = Mux(nNoChange, nRaw(7), nAdjusted(7))
+    val nV = !nNoChange && !nRaw(7) && nAdjusted(7)
+
+    // Select after arithmetic; keep ABCD/SBCD carry, flags and Z unchanged.
+    val bcdRes8  = Mux(isNbcd, nRes8, Mux(u1.bcdSub, sRes8, aRes8))
+    val bcdCarry = Mux(isNbcd, !nNoChange, Mux(u1.bcdSub, sBorrow, aCarry))
+    val bcdN     = Mux(isNbcd, nN, Mux(u1.bcdSub, sN, aN))
+    val bcdV     = Mux(isNbcd, nV, Mux(u1.bcdSub, sV, aV))
+    val bcdZ     = s1Nzvc(2) && ((isNbcd && nNoChange) || (bcdRes8 === 0))
     val bcdNzvc  = bcdN ## bcdZ ## bcdV ## bcdCarry          // {N,Z,V,C}
 
     // ── PACK/UNPK datapath (register forms, no CCR effect) ──────────────────────

@@ -288,7 +288,8 @@ desired — out of scope here.)
   crack; deferred to the general `-(An)`/`(An)+` addressing work (MOVEM).
 - **NBCD memory-EA forms** (`0100 1000 00 mmmrrr`, line 4) — the BCD negate's RMW
   forms remain a separate microcode slice. The later register-only slice has landed:
-  `NBCD Dn` is exactly `0x4800–0x4807`, reuses this datapath with `dst=0`, and predecodes
+  `NBCD Dn` is exactly `0x4800–0x4807`, uses the dedicated byte-wide correction
+  described in `../../bcd-narrow-intermediates.md`, and predecodes
   as simple/one-word; do not widen that rule to the deferred memory partition.
 - **PACK/UNPK** (68020 BCD pack/unpack) — separate, later.
 

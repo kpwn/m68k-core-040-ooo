@@ -430,9 +430,8 @@ object OperationDecoder {
         // predecode framing + assembler RMW-crack wiring, not attempted this slice).
         // srcA=srcB=Dn (EASRC, mode 000 -> DATAREG -> both read the SAME register): srcA
         // is the .B-merge upper-24 source (sizeMerged always reads s1Src1), srcB supplies
-        // the "dy" operand the SBCD datapath subtracts. AluEuPlugin forces the SBCD
-        // formula's "dx" (normally s1Src1, Dx) to the constant 0 when op==NBCD, reusing
-        // the bcdSub=True (subtract) cone verbatim otherwise. Flags mirror SBCD exactly.
+        // the byte operand for AluEuPlugin's dedicated NBCD correction. Its oracle
+        // flags are not identical to SBCD(0,Dn,X), especially in the no-change case.
         when(opword(15 downto 3) === B"13'b0100100000000") {
           o.illegal := False
           o.op := DecOp.NBCD; o.size := Size.BYTE

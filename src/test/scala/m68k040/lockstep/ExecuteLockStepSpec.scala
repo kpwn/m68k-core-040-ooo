@@ -3514,7 +3514,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x44556601,%d1", "move #4,%ccr", "nbcd %d1",
       "move.l #0x77889999,%d2", "move #0x14,%ccr", "nbcd %d2",
       "move.l #0xaabbccff,%d3", "move #0x10,%ccr", "nbcd %d3",
-      "move.l #0xddeeff80,%d4", "move #0,%ccr", "nbcd %d4"
+      "move.l #0xddeeff80,%d4", "move #0,%ccr", "nbcd %d4",
+      "move.l #0x334455ff,%d5", "move #0x14,%ccr", "nbcd %d5"
     ).mkString(" ; "))
   }
 

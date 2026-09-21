@@ -21,7 +21,8 @@ modulo 1024 are 762..1023, all greater than 0x99, just as their modulo-2^32
 representatives are. Likewise negative low differences still compare >9.
 The final correction and V/N only require the low eight bits; modulo 1024 and
 modulo 2^32 preserve them equally. Clear-only Z and decimal C/X are unchanged.
-NBCD uses dx=0 and is included in the subtraction domain.
+The legacy NBCD implementation used dx=0 and is included in that equivalence
+domain; the later NBCD correction below intentionally supersedes that behavior.
 
 This is not permission to mask intermediates to a byte/nibble or to discard
 the host oracle's N/V behavior. The former wide-lane algorithm remains the
@@ -59,3 +60,28 @@ The continuing gate runner `/tmp/run-ipc-bcd-narrow-gates.sh` adds all BCD
 lock-step cases, including NBCD register/CCR checks, then required fast tests,
 matched IPC and production generation. Its source hash includes production
 RTL and all changed tests. Physical timing/area benefit remains unproven.
+
+## NBCD correction and removal of early opcode mux
+
+The new full-core NBCD check fails on both 10-bit and original 32-bit RTL:
+NBCD of zero with CCR=4 returns CCR=4 versus oracle CCR=12. The original
+sharing assumption was wrong: NBCD is not the oracle's SBCD(0, operand, X).
+Evidence `/tmp/ipc-bcd-narrow-nbcd-wide-reference.log`; all 16 existing
+ABCD/SBCD lock-step cases pass. The stopped build gate did not launch synthesis.
+
+Correct NBCD in a separate follow-up change. Let r=(0x9a-byte-X) modulo 256.
+If r=0x9a, preserve the operand and old Z, clear V/C/X, and set N from r[7].
+Otherwise adjust a low nibble equal to 0xa by clearing it and adding 0x10
+modulo 256; write that byte, compute N from its bit 7, V from complement of
+the original r AND corrected result bit 7, clear-only Z, and set C/X.
+This matches the local host oracle's dedicated NBCD operation, including the
+invalid ff+X=1 no-change case. No memory-form/decode change.
+
+Compute this small byte path in parallel and select it at the result/flags.
+The generic ABCD/SBCD operands can then read srcA directly, deleting the
+early `isNbcd ? 0 : srcA` mux from the critical arithmetic cone. This adds a
+small cold combinational expression, not state or cycles. Keep the 10-bit
+ABCD/SBCD proof intact; replace only the exhaustive NBCD test reference with
+the dedicated oracle semantics. Unlike narrowing alone, this intentionally
+corrects NBCD flags/invalid-digit behavior; do not claim complete NBCD parity
+with the old implementation. Run the full exhaustive and lock-step gates again.
