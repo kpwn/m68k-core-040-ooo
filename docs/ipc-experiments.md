@@ -926,7 +926,15 @@ destination, flag or retry assertions. Preserve the failed evidence in
 
 Both required fast gates pass 384 tests, two ignored, zero failed/aborted
 (`/tmp/fused-long-move-fast.log`, `/tmp/fused-long-move-fast-final.log`).
-Routed timing is pending.
+Implementation: `387bd3fc3f98521cfbb28060e0180ef8151b8fd9`. Matched routed
+timing is queued as `m68k-fused-long-move-387bd3fc.service`, behind the early-store
+comparison, using the shared Vivado mutex, 5 ns and three post-route rounds.
+Both arms enable aligned-load fall-through and early integer wakeup; only the
+candidate enables direct longword MOVE loads. Early store address is off here
+to isolate fusion. Artifacts: `/tmp/fused-long-move-gate.5pIIgG`; the existing
+`build-logs:0` pane follows both elaboration and implementation logs. No routed
+result is available yet, and the combined fusion/early-store configuration will
+still need its own timing gate.
 Use `IPC_FUSE_LONG_MOVE_LOADS=1`, `LOCKSTEP_FUSE_LONG_MOVE_LOADS=1`, or
 `--fuse-long-move-loads`. Production SocketTop remains unchanged. No board was
 halted, reset or reloaded; no board IPC or SoC timing gain is claimed.
