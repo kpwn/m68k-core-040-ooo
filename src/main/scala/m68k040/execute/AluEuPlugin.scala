@@ -297,9 +297,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Transcribed verbatim from tools/musashi/musashi/m68k_in.c m68k_op_abcd_8_rr /
     // m68k_op_sbcd_8_rr. `res` is a C `uint` (32-bit unsigned): the low-nibble sum/diff
     // can wrap negative (SBCD) into a huge value, which makes the `>9` / `>0x99` tests
-    // and the corrections behave decimally. We mirror that with 32-bit UInt lanes (no
-    // pre-masking — the un-masked intermediate is what the C compares). Widths are kept
-    // at Musashi's 32 bits deliberately (the lock-step is the arbiter; not hand-narrowed).
+    // and the corrections behave decimally. Ten unsigned bits preserve the original
+    // 32-bit comparisons and low result bits: add-full is 0..517, subtract-full is
+    // -262..249 (negative values wrap above 0x99 at either width). No byte/nibble
+    // pre-masking. See docs/bcd-narrow-intermediates.md and the exhaustive real-cone
+    // oracle test, including invalid digits. Nine bits is NOT enough for addition.
     //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
     // NBCD (task #159) reuses this SAME cone (bcdSub=True, the subtract formula) with
     // `dx` forced to the constant 0 (Musashi: res = 0 - dst - X): srcA still carries Dn
@@ -310,14 +312,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val dx    = Mux(isNbcd, U(0, 8 bits), s1Src1(7 downto 0).asUInt)
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
-    val dxLo  = dx(3 downto 0).resize(32)                    // LOW_NIBBLE(dst)
-    val dyLo  = dy(3 downto 0).resize(32)                    // LOW_NIBBLE(src)
-    val dxHi  = (dx & U"8'h_f0").resize(32)                  // HIGH_NIBBLE(dst)
-    val dyHi  = (dy & U"8'h_f0").resize(32)                  // HIGH_NIBBLE(src)
+    val bcdWidth = 10
+    val dxLo  = dx(3 downto 0).resize(bcdWidth)              // LOW_NIBBLE(dst)
+    val dyLo  = dy(3 downto 0).resize(bcdWidth)              // LOW_NIBBLE(src)
+    val dxHi  = (dx & U"8'h_f0").resize(bcdWidth)            // HIGH_NIBBLE(dst)
+    val dyHi  = (dy & U"8'h_f0").resize(bcdWidth)            // HIGH_NIBBLE(src)
     // ── ABCD (add): res = lo(src)+lo(dst)+X; Vraw=~res; if(res>9) res+=6;
     //    res += hi(src)+hi(dst); C=X=(res>0x99); if(C) res-=0xA0; V=bit7(Vraw&res);
     //    N=bit7(res); res8=res&0xff. ──
-    val aLoSum = (dxLo + dyLo + xin.resize(32))              // 0..0x13
+    val aLoSum = (dxLo + dyLo + xin.resize(bcdWidth))        // 0..0x1f, including invalid digits
     val aVraw  = ~aLoSum                                      // FLAG_V = ~res (part I)
     val aAdj   = Mux(aLoSum > 9, aLoSum + 6, aLoSum)
     val aFull  = aAdj + dxHi + dyHi
@@ -329,7 +332,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ── SBCD (subtract): res = lo(dst)-lo(src)-X (unsigned wrap); Vraw=~res;
     //    if(res>9) res-=6; res += hi(dst)-hi(src); C=X=(res>0x99); if(C) res+=0xA0;
     //    res8=res&0xff (BEFORE V/N here); V=bit7(Vraw&res8); N=bit7(res8). ──
-    val sLoSub = (dxLo - dyLo - xin.resize(32))             // wraps in 32-bit unsigned
+    val sLoSub = (dxLo - dyLo - xin.resize(bcdWidth))        // wraps in unsigned ten-bit lane
     val sVraw  = ~sLoSub                                     // FLAG_V = ~res (part I)
     val sAdj   = Mux(sLoSub > 9, sLoSub - 6, sLoSub)
     val sFull  = sAdj + dxHi - dyHi

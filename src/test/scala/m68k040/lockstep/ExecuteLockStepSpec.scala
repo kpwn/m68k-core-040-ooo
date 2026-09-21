@@ -3508,6 +3508,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     ).mkString(" ; "))
   }
 
+  test("lock-step: NBCD register widths, full flags and upper-byte preservation", VerilatorTest) {
+    runLockStep("nbcd-width", Seq(
+      "move.l #0x11223300,%d0", "move #4,%ccr", "nbcd %d0",
+      "move.l #0x44556601,%d1", "move #4,%ccr", "nbcd %d1",
+      "move.l #0x77889999,%d2", "move #0x14,%ccr", "nbcd %d2",
+      "move.l #0xaabbccff,%d3", "move #0x10,%ccr", "nbcd %d3",
+      "move.l #0xddeeff80,%d4", "move #0,%ccr", "nbcd %d4"
+    ).mkString(" ; "))
+  }
+
   // Multi-byte packed-BCD subtract (X ripples the borrow between bytes).
   test("lock-step: SBCD 4-digit multi-byte chain (borrow ripple)", VerilatorTest) {
     runLockStep("sbcd-chain", Seq(

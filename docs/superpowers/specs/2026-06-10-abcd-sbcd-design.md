@@ -146,13 +146,18 @@ lock-step is the oracle. The algorithm below is transcribed directly from Musash
 register-to-register forms), so the implementer reproduces it exactly, including the
 documented-as-"undefined" N and V.
 
-Let `dx = src1[7:0]`, `dy = src2[7:0]`, `xin = X`. Work in a **wide unsigned lane** (≥9 bits;
+Let `dx = src1[7:0]`, `dy = src2[7:0]`, `xin = X`. Work in a **wide unsigned lane** (≥10 bits;
 SBCD's subtraction wraps in unsigned and must be allowed to — see notes) so the corrections
 and the `>0x99` test see the **un-masked** intermediate, exactly like Musashi's `uint res`.
 
+2026-09-22 width clarification: invalid BCD digits make the raw low sum reach
+31, adjusted low sum 37 and full sum 517, so nine bits is insufficient. Ten
+bits preserves the original unsigned-32 output/flag semantics over every byte
+input; see `../../bcd-narrow-intermediates.md` for the bounds and validation gate.
+
 **ABCD (add)** — from Musashi `m68k_op_abcd_8_rr`:
 ```
-res  = (dy & 0x0f) + (dx & 0x0f) + xin       // LOW_NIBBLE(src)+LOW_NIBBLE(dst)+X  (0..0x13)
+res  = (dy & 0x0f) + (dx & 0x0f) + xin       // LOW_NIBBLE(src)+LOW_NIBBLE(dst)+X  (0..0x1f)
 Vraw = ~res                                   // FLAG_V = ~res   (V part I, full width)
 if (res > 9)  res += 6                         // low-nibble decimal adjust
 res += (dy & 0xf0) + (dx & 0xf0)               // + HIGH_NIBBLE(src)+HIGH_NIBBLE(dst)
@@ -192,7 +197,7 @@ read the pre-mask `res`. **This asymmetry is real and must be preserved** (risk 
 **Critical corner-case notes (carried verbatim from Musashi; the implementer must match):**
 
 1. **`res > 9` uses the RAW binary nibble sum/difference, NOT a masked nibble.** For ABCD
-   `res` here is `(dy&0xf)+(dx&0xf)+X` (0..0x13), so a nibble sum 10..0x13 (half-carry) AND
+   `res` here is `(dy&0xf)+(dx&0xf)+X` (0..0x1f), so a nibble sum above 9 (half-carry) AND
    any low-nibble value 10..15 from invalid-BCD inputs both trigger `+6`. For SBCD the
    subtraction wraps in unsigned, so a borrow yields a very large `res` which is `> 9` and
    triggers `-6`. **Do NOT pre-mask to a nibble** — that breaks the invalid-BCD and SBCD
