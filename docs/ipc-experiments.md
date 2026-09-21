@@ -2100,6 +2100,16 @@ fixture window. Conversely, a missing macro-first marker or stale busy qualifier
 must not be hidden by widening that window. Keep full register/CCR/frame/local
 memory comparison when matching the independently observed accepted boundary.
 
+Implementation committed as `f6df3ecf`. After validation, the still-waiting
+`b4c99f82` physical screening was superseded before it created any arm or launched
+Vivado (its artifact directory remained empty). The replacement is
+`m68k-ls-queued-turnover-gate.service`, pinned to
+`f6df3ecf009c6580107e8911cfc5076bc5f3ad7c`, artifacts
+`/tmp/ls-turnover-gate.Pe092A`. It runs fresh matched one/two/four-owner arms after
+early NZVC, under the same Vivado mutex, comparing the refined queue rather than
+spending physical runs on its superseded handoff. Both source revisions and all
+before/after simulation results remain preserved. No board actions occurred.
+
 ### Publication-forward timing completed in the background
 
 Pinned `3f53a39b` publication-forwarding now completes its core-only routed
