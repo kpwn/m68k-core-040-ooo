@@ -5,20 +5,24 @@ import org.scalatest.funsuite.AnyFunSuite
 import spinal.core.sim._
 
 class MemoryDependencyTrackerSpec extends AnyFunSuite {
-  test("fixed-seed lifecycle model checks concurrent notices and stale tickets") {
-    M68kSim().compile(new MemoryDependencyTracker(4)).doSim { d =>
-      SimTimeout(100000)
-      val cd = d.clockDomain; cd.forkStimulus(10)
+  for (entries <- Seq(2, 4, 8)) test(s"fixed-seed lifecycle model checks concurrent notices and stale tickets; entries=$entries") {
+    M68kSim().compile(new MemoryDependencyTracker(entries)).doSim { d =>
+      SimTimeout(1000000)
+      // Each transition queries every live slot plus two stale identities with
+      // one-nanosecond settling. Keep the entire sweep and next input setup
+      // before the next active edge, including the eight-entry configuration.
+      val cd = d.clockDomain; cd.forkStimulus(100)
       val rng = new scala.util.Random(0x68040dL)
       val robMask = (1 << m68k040.Global.ROB_ID_W_DEFAULT) - 1
       case class Ticket(slot: Int, generation: BigInt)
-      case class Record(ticket: Ticket, robId: Int, store: Boolean,
+      case class Record(ticket: Ticket, age: Long, store: Boolean,
                         serial: Boolean, known: Boolean = false, data: Boolean = false,
                         committed: Boolean = false, irreversible: Boolean = false,
                         canceled: Boolean = false, bytes: Set[Int] = Set.empty)
-      val records = Array.fill[Option[Record]](4)(None)
-      val generations = Array.fill[BigInt](4)(0)
+      val records = Array.fill[Option[Record]](entries)(None)
+      val generations = Array.fill[BigInt](entries)(0)
       val history = scala.collection.mutable.ArrayBuffer.empty[Ticket]
+      var nextAge = 0L
       def drive(p: MemoryOrderTicket, t: Ticket): Unit = {
         p.slot #= t.slot; p.generation #= t.generation
       }
@@ -27,10 +31,10 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
         d.io.address.valid #= false; d.io.dataReady.valid #= false
         d.io.commit.foreach(_.valid #= false); d.io.release.foreach(_.valid #= false)
         d.io.irreversible.valid #= false; d.io.flush #= false
-        d.io.query.valid #= false; d.io.atCommit #= false; d.io.robHead #= 0
+        d.io.query.valid #= false; d.io.atCommit #= false
       }
       def ticket(): Ticket = if (history.nonEmpty && rng.nextInt(4) != 0)
-        history(rng.nextInt(history.size)) else Ticket(rng.nextInt(4), BigInt(rng.nextInt(20)))
+        history(rng.nextInt(history.size)) else Ticket(rng.nextInt(entries), BigInt(rng.nextInt(20)))
       def notice(p: spinal.lib.Flow[MemoryOrderTicket]): Option[Ticket] = {
         val t = if(rng.nextBoolean()) Some(ticket()) else None
         p.valid #= t.nonEmpty; t.foreach(drive(p.payload, _)); t
@@ -38,7 +42,6 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
       clear(); cd.waitSampling(5); sleep(1)
       for (cycle <- 0 until 2048) {
         clear()
-        val head = rng.nextInt(robMask + 1); d.io.robHead #= head
         val flush = rng.nextInt(13) == 0; d.io.flush #= flush
         val commits = d.io.commit.map(notice).toSeq.flatten
         val releases = d.io.release.map(notice).toSeq.flatten
@@ -57,6 +60,8 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
           d.io.address.fragments(n).mask #= pieces(n)._2
         }
         val reserve = rng.nextBoolean(); val two = rng.nextBoolean()
+        // Deliberately arbitrary/reused ROB IDs: order must come from allocation,
+        // never numeric ID order or a sampled live ROB head.
         val allocations = Seq.fill(2)((rng.nextInt(robMask + 1), rng.nextBoolean(), rng.nextInt(7) == 0))
         d.io.reserve.valid #= reserve; d.io.reserveSecond #= two
         for (n <- 0 until 2) {
@@ -88,10 +93,11 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
         if(reserve && ready) for(n <- 0 until (if(two) 2 else 1)) {
           val slot = free(n); generations(slot) += 1
           val t = Ticket(slot, generations(slot)); history += t
-          val (id, store, serial) = allocations(n)
-          records(slot) = Some(Record(t, id, store, serial))
+          val (_, store, serial) = allocations(n)
+          records(slot) = Some(Record(t, nextAge, store, serial))
+          nextAge += 1
         }
-        cd.waitSampling(); sleep(1); clear(); d.io.robHead #= head
+        cd.waitSampling(); sleep(1); clear()
         // Query several current and stale identities after each state transition.
         for(t <- Seq(ticket(), ticket()) ++ records.toSeq.flatten.map(_.ticket)) {
           val atCommit = rng.nextBoolean()
@@ -102,8 +108,7 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
           var unknown = 0; var barrier = 0; var overlap = 0; var waiting = 0
           q.filterNot(_.store).foreach { query =>
             records.toSeq.flatten.filter(r => !r.canceled && r.ticket != query.ticket &&
-              (r.committed || r.irreversible ||
-                ((r.robId - head) & robMask) < ((query.robId - head) & robMask))).foreach { r =>
+              (r.committed || r.irreversible || r.age < query.age)).foreach { r =>
               val bit = 1 << r.ticket.slot
               if(!r.known) unknown |= bit
               if(r.serial || query.serial) barrier |= bit
@@ -133,7 +138,7 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
       d.io.commit.foreach(_.valid #= false); d.io.release.foreach(_.valid #= false)
       d.io.irreversible.valid #= false; d.io.flush #= false
       val lastRobId = (1 << m68k040.Global.ROB_ID_W_DEFAULT) - 1
-      d.io.query.valid #= false; d.io.robHead #= (lastRobId - 1); d.io.atCommit #= false
+      d.io.query.valid #= false; d.io.atCommit #= false
       cd.waitSampling(5)
       type Ticket = (Int, BigInt)
       def put(p: MemoryOrderTicket, t: Ticket): Unit = { p.slot #= t._1; p.generation #= t._2 }
@@ -195,7 +200,6 @@ class MemoryDependencyTrackerSpec extends AnyFunSuite {
       assert(!d.io.queryPresent.toBoolean)
       assert(!d.io.reserve.ready.toBoolean)
       release(load); release(wrapped); release(last)
-      d.io.robHead #= (lastRobId - 1)
       val reused = reserve(lastRobId - 1, false).head
       assert(reused._1 == load._1 && reused._2 != load._2)
       address(reused, 11, 1); query(reused)

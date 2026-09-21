@@ -7,6 +7,7 @@ import m68k040.rename.RenamedUop
 import m68k040.decode.DecOp
 import m68k040.isa.{Cluster, Size}
 import m68k040.execute.iq.{IssueQueuePlugin, IqSinkPlugin, IssueQueueService}
+import m68k040.ls.{MemoryOrderPlugin, MemoryOrderService, MemoryOrderTicket}
 import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
@@ -29,7 +30,44 @@ class DispatchSpec extends AnyFunSuite {
     }
   }
 
-  class Dut extends Component {
+  class OrderDriverPlugin extends FiberPlugin {
+    val logic = during build new Area {
+      val order = host[MemoryOrderService].memoryOrder
+      val flush = in Bool()
+      val release = Vec.fill(2)(slave(Flow(MemoryOrderTicket(2))))
+      order.flush := flush
+      for (n <- 0 until 2) order.release(n) << release(n)
+      order.address.valid := False
+      order.address.payload.assignFromBits(B(0, order.address.payload.getBitsWidth bits))
+      order.dataReady.valid := False
+      order.dataReady.payload.assignFromBits(B(0, order.dataReady.payload.getBitsWidth bits))
+      for (c <- order.commit) {
+        c.valid := False; c.payload.assignFromBits(B(0, c.payload.getBitsWidth bits))
+      }
+      order.irreversible.valid := False
+      order.irreversible.payload.assignFromBits(B(0, order.irreversible.payload.getBitsWidth bits))
+      order.query.valid := False
+      order.query.payload.assignFromBits(B(0, order.query.payload.getBitsWidth bits))
+      order.atCommit := False
+      val fire = out Bool(); fire := order.reserve.fire
+      val robFire = out Bool(); robFire := host[m68k040.services.RobAllocService].allocFire
+      val iqFire = out Bool(); iqFire := host[IssueQueueService].push.fire
+      val robReady = out Bool(); robReady := host[m68k040.services.RobAllocService].allocReady
+      val iqReady = out Bool(); iqReady := host[IssueQueueService].push.ready
+      val second = out Bool(); second := order.reserveSecond
+      val ids = out(Vec(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits), 2))
+      val stores = out Bits(2 bits)
+      val tickets = out(Vec(MemoryOrderTicket(2), 2)); tickets := order.tickets
+      for (n <- 0 until 2) {
+        ids(n) := order.reserve.payload(n).robId
+        stores(n) := order.reserve.payload(n).store
+      }
+      val occupied = out Bits(4 bits); occupied := order.occupied
+      val canceled = out Bits(4 bits); canceled := order.canceled
+    }
+  }
+
+  class Dut(withMemoryOrder: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val rsrc = new RenameUopSourcePlugin
@@ -39,8 +77,11 @@ class DispatchSpec extends AnyFunSuite {
     val sink = new IqSinkPlugin
     val ftie = new IqFlushTiePlugin
     val csink = new RenameCommitSinkPlugin
+    val memoryOrder = if (withMemoryOrder) Some(new MemoryOrderPlugin(4)) else None
+    val orderDriver = if (withMemoryOrder) Some(new OrderDriverPlugin) else None
     db.on { host.asHostOf(Seq[FiberPlugin](
-      new ParamPlugin(M68kParams()), rsrc, rob, disp, iq, sink, ftie, csink)) }
+      new ParamPlugin(M68kParams()), rsrc, rob, disp, iq, sink, ftie, csink) ++
+      memoryOrder.toSeq ++ orderDriver.toSeq) }
   }
 
   /** Poke a RenamedUop slot. dst written to an int physreg (so it has a real op). */
@@ -102,6 +143,13 @@ class DispatchSpec extends AnyFunSuite {
     dut.rob.logic.flush.valid #= false
     dut.sink.logic.ready0 #= true
     dut.sink.logic.ready1 #= true
+    dut.sink.logic.ready3 #= true
+    dut.orderDriver.foreach { driver =>
+      driver.logic.flush #= false
+      driver.logic.release.foreach { r =>
+        r.valid #= false; r.payload.slot #= 0; r.payload.generation #= 0
+      }
+    }
     cd.waitSampling()
   }
 
@@ -117,6 +165,124 @@ class DispatchSpec extends AnyFunSuite {
       }
     }
     issued
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  test("memory reservations share the ROB/IQ transaction and compact lane one", VerilatorTest) {
+    M68kSim().withVerilator.compile(new Dut(withMemoryOrder = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      init(dut, cd); cd.waitSampling(5); sleep(1)
+      val order = dut.orderDriver.get.logic
+      type Ticket = (Int, BigInt)
+      def edge(): Unit = { cd.waitSampling(); sleep(1) }
+      def packet(a: m68k040.isa.MemOp.E, b: m68k040.isa.MemOp.E,
+                 second: Boolean = true): Unit = {
+        for ((op, n) <- Seq(a, b).zipWithIndex) {
+          val u = dut.rsrc.logic.src.payload(n)
+          pokeRu(u, pdstValid = false)
+          u.cluster #= (if(op == m68k040.isa.MemOp.NONE) Cluster.INT else Cluster.LS)
+          u.memOp #= op
+        }
+        dut.rsrc.logic.u1v #= second
+        dut.rsrc.logic.src.valid #= true
+        sleep(1)
+      }
+      def push(expectedMemoryIds: Seq[Int], expectedStores: Int): Seq[Ticket] = {
+        var wait = 0
+        while (!dut.rsrc.logic.src.ready.toBoolean && wait < 30) { edge(); wait += 1 }
+        assert(dut.rsrc.logic.src.ready.toBoolean, "unexpected dispatch backpressure")
+        assert(order.fire.toBoolean == expectedMemoryIds.nonEmpty)
+        assert(order.robFire.toBoolean)
+        assert(order.iqFire.toBoolean)
+        val ts = expectedMemoryIds.indices.map { n =>
+          assert(order.ids(n).toInt == expectedMemoryIds(n))
+          (order.tickets(n).slot.toInt, order.tickets(n).generation.toBigInt)
+        }
+        if(expectedMemoryIds.nonEmpty) {
+          assert(order.second.toBoolean == (expectedMemoryIds.size == 2))
+          assert((order.stores.toInt & ((1 << expectedMemoryIds.size) - 1)) == expectedStores)
+        }
+        edge(); dut.rsrc.logic.src.valid #= false; sleep(1)
+        ts
+      }
+      import m68k040.isa.MemOp.{NONE, LOAD, STORE}
+      packet(NONE, STORE)
+      val first = push(Seq(1), 1).head // Lane 1 memory retains ROB ID 1, not 0.
+      packet(LOAD, STORE)
+      val pair = push(Seq(2, 3), 2)
+      packet(STORE, LOAD, second = false)
+      val fourth = push(Seq(4), 1).head // Invalid lane 1 must not reserve.
+      assert(order.occupied.toInt == 15)
+
+      // A full memory table must block ROB and IQ together, not consume one side.
+      packet(LOAD, STORE)
+      val tail = dut.rob.logic.tail.toInt
+      for (_ <- 0 until 8) {
+        assert(!dut.rsrc.logic.src.ready.toBoolean && !order.fire.toBoolean)
+        assert(!order.robFire.toBoolean && !order.iqFire.toBoolean)
+        edge(); assert(dut.rob.logic.tail.toInt == tail)
+      }
+      packet(NONE, NONE)
+      push(Seq.empty, 0) // Non-memory pair does not need table space.
+      assert(order.occupied.toInt == 15)
+
+      // Even non-memory dispatch is canceled on the flush edge.
+      packet(NONE, NONE)
+      order.flush #= true; sleep(1)
+      assert(!dut.rsrc.logic.src.ready.toBoolean && !order.fire.toBoolean)
+      assert(!order.robFire.toBoolean && !order.iqFire.toBoolean)
+      edge(); dut.rsrc.logic.src.valid #= false; order.flush #= false; sleep(1)
+      assert(order.canceled.toInt == 15)
+      assert(order.occupied.toInt == 15, "flush cannot reuse undrained reservations")
+
+      // Release proves the client has drained old responses; stale releases must
+      // not release a subsequently reused ticket.
+      def release(t: Ticket): Unit = {
+        order.release(0).payload.slot #= t._1
+        order.release(0).payload.generation #= t._2
+        order.release(0).valid #= true; edge(); order.release(0).valid #= false; sleep(1)
+      }
+      release(first)
+      packet(LOAD, STORE)
+      for (_ <- 0 until 3) {
+        assert(!dut.rsrc.logic.src.ready.toBoolean && !order.fire.toBoolean,
+          "one free record cannot accept a two-memory pair")
+        edge(); assert(order.occupied.toInt == (15 & ~(1 << first._1)))
+      }
+      packet(NONE, LOAD)
+      val replacement = push(Seq(tail + 3), 0).head
+      assert(replacement._1 == first._1 && replacement._2 != first._2)
+      release(first)
+      assert(order.occupied.toInt == 15)
+      (pair ++ Seq(fourth, replacement)).foreach(release)
+      assert(order.occupied.toInt == 0)
+      dut.rsrc.logic.src.valid #= false
+      for (_ <- 0 until 4) { edge(); assert(order.occupied.toInt == 0) }
+
+      // Test the other two sides of the atomic handshake with the memory
+      // table EMPTY: neither an IQ stall nor ROB exhaustion may leak a ticket.
+      dut.sink.logic.ready0 #= false; dut.sink.logic.ready1 #= false
+      packet(NONE, NONE)
+      for (_ <- 0 until 40) edge()
+      assert(!order.iqReady.toBoolean && order.robReady.toBoolean)
+      packet(LOAD, STORE)
+      for (_ <- 0 until 6) {
+        assert(!order.fire.toBoolean && !order.robFire.toBoolean && !order.iqFire.toBoolean)
+        edge(); assert(order.occupied.toInt == 0)
+      }
+      dut.rsrc.logic.src.valid #= false
+      dut.sink.logic.ready0 #= true; dut.sink.logic.ready1 #= true
+      for (_ <- 0 until 30) edge()
+      packet(NONE, NONE)
+      for (_ <- 0 until 100) edge()
+      assert(!order.robReady.toBoolean && order.iqReady.toBoolean)
+      packet(STORE, LOAD)
+      for (_ <- 0 until 6) {
+        assert(!order.fire.toBoolean && !order.robFire.toBoolean && !order.iqFire.toBoolean)
+        edge(); assert(order.occupied.toInt == 0)
+      }
+      dut.rsrc.logic.src.valid #= false
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -199,7 +365,7 @@ class DispatchSpec extends AnyFunSuite {
       dut.rsrc.logic.src.valid #= false
       cd.waitSampling()
       // IQ is now full (slots can't drain, sink not ready) -> push.ready low ->
-      // ren.uops.ready must be low even though the ROB still has room (count<16<62).
+      // ren.uops.ready must be low even though the ROB still has room.
       assert(dut.rob.logic.count.toInt <= 16, s"ROB count = ${dut.rob.logic.count.toInt} (room remains)")
       dut.rsrc.logic.src.valid #= true
       sleep(1)
@@ -214,9 +380,10 @@ class DispatchSpec extends AnyFunSuite {
       // --- ROB full: complete nothing, never let entries retire, keep pushing
       // single-wide until the ROB fills (count reaches depth-1). The IQ drains
       // freely (sink ready), so the ONLY back-pressure source is the ROB.
+      val robLimit = dut.rob.logic.depth - 1
       var allocs = 0
       cyc = 0
-      while (dut.rob.logic.count.toInt < 62 && cyc < 400) {
+      while (dut.rob.logic.count.toInt < robLimit && cyc < 400) {
         pokeRu(dut.rsrc.logic.src.payload(0), pc = allocs * 2, dstArch = allocs % 8, pdst = 20 + (allocs % 8), pdstOld = allocs % 8)
         dut.rsrc.logic.src.valid #= true
         dut.rsrc.logic.u1v #= false
@@ -226,8 +393,8 @@ class DispatchSpec extends AnyFunSuite {
       }
       dut.rsrc.logic.src.valid #= false
       cd.waitSampling()
-      assert(dut.rob.logic.count.toInt >= 62, s"ROB did not fill: count=${dut.rob.logic.count.toInt}")
-      // ROB allocReady = count <= depth-2 = 62 -> at count>=63 it's low; ensure
+      assert(dut.rob.logic.count.toInt >= robLimit, s"ROB did not fill: count=${dut.rob.logic.count.toInt}")
+      // ROB allocReady = count <= depth-2 -> at count=depth-1 it's low; ensure
       // we are at the boundary where another 2-wide push is refused.
       dut.rsrc.logic.src.valid #= true
       dut.rsrc.logic.u1v #= true

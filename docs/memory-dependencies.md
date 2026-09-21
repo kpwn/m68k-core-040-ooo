@@ -23,8 +23,14 @@ combinational distances from the live ROB head. Wrap, flush, ROB-slot reuse and
 committed-but-undrained stores must be covered explicitly; a bare signed compare
 of existing wrapping ROB indices is not sufficient. Already committed or
 irrevocable stores remain older than speculative queries even across reuse.
-The current standalone checker/tracker still uses head-relative ROB ages; this
-requirement is pending integration work, not a claim that it is already met.
+The tracker records pairwise allocation order, independently of ROB IDs and the
+moving ROB head. For N slots this requires N*(N-1)/2 bits: allocate rewrites only
+the relations involving the new slots, with lane 0 preceding lane 1. Release
+does not reorder survivors; reuse overwrites the reused slot's relations before
+it can be queried. Occupancy and cancellation still qualify every comparison.
+This removes the head-relative subtractors and avoids a wrapping age counter
+whose oldest live record could survive indefinitely. At eight entries the order
+state is 28 bits, not a duplicated full 64-bit relation matrix.
 
 ### Reservation-backed early store readiness
 
@@ -159,8 +165,25 @@ structure. A standalone predicate test is not proof of CPU integration.
 
 ## Implementation boundary
 
-`MemoryDependencyCheck` and `MemoryDependencyTracker` are standalone RTL blocks;
-no CPU plugin instantiates them yet. The tracker supports atomic one/two-entry
+### Dispatch ownership step
+
+`MemoryOrderPlugin` is the sole owner of the dependency table and its typed
+service. `DispatchPlugin` optionally consumes that service and reserves records
+on the **same** fire as ROB/IQ allocation. Only LS-cluster LOAD/STORE operations
+reserve; an isolated memory operation in lane 1 is compacted into reservation
+lane 0 while retaining its real ROB ID. Two memory operations preserve program
+order. No reservation is consumed when rename is invalid, either destination
+is blocked, the table is full, or a flush is active. Non-memory pairs need no
+table capacity but must still respect flush cancellation.
+
+This step is verified with the real dispatch plugin and table plugin. It is not
+enabled in a full CPU until LSU publication, release, cancellation-drain and
+retry ownership are connected; merely reserving records is not memory
+disambiguation. The future LSU uses tickets for all delayed notices. No new
+Global key or plugin-internal cross-reference is authorized by this step.
+
+`MemoryOrderPlugin` now instantiates `MemoryDependencyTracker` and its checker;
+no full-core builder installs that plugin yet. The tracker supports atomic one/two-entry
 reservation, independent address/data publication, two commit/release notices,
 and flush cancellation. Tickets have a slot and 32-bit allocation generation.
 Generation matching rejects stale updates; the owner must still drain outstanding
@@ -171,14 +194,17 @@ quiesce/reset response producers before accepting new reservations. Tickets do
 not make a partial reset with surviving old responses safe. Address/data notices
 refer to an existing reservation, not one allocating on that same clock edge.
 
-Verification includes 4,096 fixed-seed physical-byte comparisons and 2,048
-fixed-seed lifecycle transitions, plus directed split, overlap, saturation,
+Verification includes 4,096 fixed-seed physical-byte comparisons and 6,144
+fixed-seed lifecycle transitions across 2/4/8-entry tables, plus directed split, overlap, saturation,
 commit-with-flush, stale-ticket, ROB-wrap, irreversible and reset cases.
 
 Remaining CPU integration, in dependency order:
 
-1. Add a table-owning plugin/service and atomic reservation to `DispatchPlugin`.
-   Carry allocation tickets through IQ cold payload and every LSU transaction.
+1. Connect the table-owning plugin/service and atomic dispatch reservation to the
+   full CPU. Carry allocation tickets through IQ cold payload and every LSU
+   transaction, or specify a lifetime-safe lookup at the initial issue boundary
+   before carrying tickets through every delayed transaction. The latter must
+   prove no bare-ROB-ID lookup can bind a late response to a reused allocation.
 2. Split store address readiness from store data readiness in `IssueQueuePlugin`
    without publishing completion/wakeup or freeing a source too early. Keep
    locked, maintenance, exception and other unsupported operations serial.

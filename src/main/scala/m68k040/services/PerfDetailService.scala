@@ -61,13 +61,17 @@ object PerfDetail {
     e
   }
 
-  def dispatchEvents(valid: Bool, robReady: Bool, iqReady: Bool, second: Bool): Bits = {
+  // Optional downstream admission must never count as an accepted transaction.
+  // The six-counter ABI has no memory-table-stall category; that experimental
+  // reason remains unclassified, not mislabeled as IQ/ROB backpressure.
+  def dispatchEvents(valid: Bool, robReady: Bool, iqReady: Bool, second: Bool,
+                     admissionReady: Bool = True): Bits = {
     val e = Bits(DispatchCount bits)
     e(0) := !valid
     e(1) := valid && !robReady
     e(2) := valid && robReady && !iqReady
-    e(3) := valid && robReady && iqReady && !second
-    e(4) := valid && robReady && iqReady && second
+    e(3) := valid && robReady && iqReady && admissionReady && !second
+    e(4) := valid && robReady && iqReady && admissionReady && second
     e(5) := valid && !robReady && !iqReady
     e
   }

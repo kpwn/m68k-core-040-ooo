@@ -478,6 +478,20 @@ and three post-route rounds. The existing `build-logs:0` tmux window follows
 the active forwarding arm and this queued matrix. IPC development need not wait
 for these timing results.
 
+The all-deferral matrix completed at 02:21 on 2026-09-21. Final route reports
+(`{baseline,deferred}/synth/fullcore_route_{timing,util}.rpt`) show:
+
+| Arm | Setup WNS | Hold WHS | Pulse WPWS | LUT | FF | BRAM tiles |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | +0.011 ns | +0.023 ns | +1.958 ns | 93,896 | 38,740 | 37 |
+| All conditional deferral | +0.001 ns | +0.032 ns | +1.958 ns | 93,483 | 38,695 | 37 |
+
+Both have zero setup, hold and pulse-width failing endpoints. This candidate
+passes the core-only 200 MHz gate with only 1 ps setup margin and 413 fewer LUTs,
+but retains its measured 5.82% warmed alternating-loop IPC regression. Keep it
+as a measured comparison, not the preferred predictor policy. The selective
+training matrix has now started; its results are separate and still pending.
+
 ### Integration boundary and next LSU work
 
 The experimental flags currently reach the full-core test/OOC generator only.
@@ -666,6 +680,59 @@ routes both arms serially under the shared Vivado mutex at 5 ns with three
 post-route rounds. Both arms enable selective taken deferral; only the second
 enables history preservation. The existing `build-logs:0` pane follows this
 queue and its predecessors; the running Codex pane is untouched.
+
+## Memory-order ownership groundwork — 2026-09-21
+
+Based on `13f9c850`; this advances proposal 12, not a load-bypass IPC candidate.
+The table no longer derives age from wrapping ROB IDs relative to the live head.
+One bit per unordered slot pair records allocation order; an eight-entry table
+uses 28 order bits. Releasing a record does not reorder survivors, and reusing
+a slot replaces its relations. There is no finite age-counter wrap assumption.
+Ticket generation and drain-before-release rules are unchanged.
+
+`MemoryOrderPlugin` is the sole table/service owner. The real `DispatchPlugin`
+optionally includes table capacity in the atomic rename/ROB/IQ handshake,
+compacting a lane-1-only memory operation without changing its ROB identity.
+Directed testing uses real ROB and IQ plugins, not just a duplicate handshake
+formula. It covers single/two-memory packets, an invalid second lane, full table,
+one-free-slot/two-required refusal, non-memory admission with a full table,
+flush cancellation, drained release, stale-ticket reuse, IQ-full and ROB-full.
+Optional admission also qualifies detailed-perf acceptance counts; the existing
+six-counter ABI does not gain a memory-stall category or mislabel it as IQ stall.
+That extra reason must be accounted for before a full-core measured integration.
+
+The first dispatch test compile used obsolete internal signal names; its test
+observability now uses the public services. Running the previously existing
+dispatch suite exposed a separate stale 64-entry ROB assumption: it expected
+62 allocations from the current 32-entry ROB, which correctly stopped at 31.
+The test now derives its bound from configured depth. The reservation test itself
+passed before and after that correction. Evidence includes
+`/tmp/memory-order-dispatch.log`, `/tmp/memory-order-dispatch-gates.log` (failures),
+and `/tmp/memory-order-dispatch-gates-v2.log` (all seven tests passing).
+
+Full-core control: with no memory-order plugin installed, all fourteen warmed
+kernel/seed rows match the prior baseline exactly in macros, cycles and misses
+(`/tmp/memory-order-disabled-ipc.log` versus `/tmp/branch-history-training.log`).
+This verifies the disabled path only. There is **no enabled full-core bypass IPC,
+timing, area or board result**. The expanded directed gates pass all twelve
+tests, including 6,144 fixed-seed lifecycle transitions over 2/4/8-entry tables
+and the detailed-counter admission checks
+(`/tmp/memory-order-final-directed-v2.log`). The first eight-entry run exposed
+testbench scheduling: its per-record query sweep could cross the next clock
+edge before checking the next transaction. Widening the test clock period keeps
+all combinational queries and next-input setup between active edges; no RTL or
+expected-value weakening was needed. The failing run remains in
+`/tmp/memory-order-final-directed.log`. The final full-core rerun again matches
+all fourteen control rows exactly (`/tmp/memory-order-final-disabled-ipc.log`).
+The required final fast gate passes **384 tests**, two ignored, zero failed or
+aborted (`/tmp/memory-order-fast-final.log`).
+No synthesis job is queued for this incomplete integration.
+
+Still required for the actual throughput change: independently issue store
+address/data, carry allocation tickets through delayed work, publish final
+translated spans/attributes, release or retry denied loads without blocking the
+older producer, and guarantee SQ/completion capacity before early wakeup. Do not
+install the table in a CPU merely to accumulate reservations without those owners.
 
 ## Next investigations requested — 2026-09-21
 

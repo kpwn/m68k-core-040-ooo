@@ -52,14 +52,16 @@ class PerfDetailSpec extends AnyFunSuite {
   class Dut extends Component {
     val state = in(RobPerfState())
     val dispatch = in(Bits(4 bits))
+    val admissionReady = in Bool()
     val robEvents = out(Bits(PerfDetail.RobCount bits))
     val dispatchEvents = out(Bits(PerfDetail.DispatchCount bits))
     robEvents := PerfDetail.robEvents(state)
-    dispatchEvents := PerfDetail.dispatchEvents(dispatch(0), dispatch(1), dispatch(2), dispatch(3))
+    dispatchEvents := PerfDetail.dispatchEvents(dispatch(0), dispatch(1), dispatch(2), dispatch(3), admissionReady)
   }
   test("exclusive ROB/dispatch partitions and overlapping retirement diagnostics") {
     M68kSim().compile(new Dut).doSim { d =>
       val rng = new scala.util.Random(0x68040)
+      d.admissionReady #= true
       for (_ <- 0 until 4096) {
         val b = Array.fill(17)(rng.nextBoolean())
         val kind = rng.nextInt(8)
@@ -92,6 +94,16 @@ class PerfDetailSpec extends AnyFunSuite {
         val expected = if ((dispatch & 1) == 0) 0 else if ((dispatch & 2) == 0) 1
           else if ((dispatch & 4) == 0) 2 else if ((dispatch & 8) == 0) 3 else 4
         assert((d.dispatchEvents.toInt & 31) == (1 << expected))
+        assert(((d.dispatchEvents.toInt & 32) != 0) == ((dispatch & 7) == 1))
+      }
+      // Extra admission blocks may leave the old reason partition empty, but
+      // must not fabricate accepts or misattribute a stall to the IQ/ROB.
+      d.admissionReady #= false
+      for (dispatch <- 0 until 16) {
+        d.dispatch #= dispatch; sleep(1)
+        val expected = if ((dispatch & 1) == 0) 1 else if ((dispatch & 2) == 0) 2
+          else if ((dispatch & 4) == 0) 4 else 0
+        assert((d.dispatchEvents.toInt & 31) == expected)
         assert(((d.dispatchEvents.toInt & 32) != 0) == ((dispatch & 7) == 1))
       }
     }
