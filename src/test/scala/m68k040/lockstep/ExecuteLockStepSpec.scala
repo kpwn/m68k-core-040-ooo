@@ -217,7 +217,6 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // BackendWiringPlugin). See m68k040.top.SpeculativeFetchGate.
       m68k040.top.SpeculativeFetchGate.wire(host)
       lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
-      lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
       // The dynamic wakeup must fire ONLY for a completing LOAD (it produces a
       // physreg). A STORE also completes (to retire) but writes NO register; its
       // s1Ctx.uop.pdst is stale/garbage and could spuriously match a consumer's

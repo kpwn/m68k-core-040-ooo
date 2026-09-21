@@ -139,7 +139,6 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // BackendWiringPlugin). See m68k040.top.SpeculativeFetchGate.
     m68k040.top.SpeculativeFetchGate.wire(host)
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
-    lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid

@@ -47,11 +47,14 @@ object DebugHaltReasonCode {
 class RobPlugin(val detailedPerf: Boolean = false,
                 val pairCorrectBranch: Boolean = false,
                 val preparedRetireEntries: Int = 0,
-                val pcRangeEnable: Boolean = true) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService {
+                val pcRangeEnable: Boolean = true) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
+  private var haltAfterLoadHoldWire: Bool = null
+  override def haltAfterLoadHold: Bool = haltAfterLoadHoldWire
   override def retiredRobIds: Vec[Flow[UInt]] = retirementWires
   during setup {
+    haltAfterLoadHoldWire = Bool()
     retirementWires = Vec.fill(scala.math.max(4, preparedRetireEntries))(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
   }
   private var historyStartWire: Bool = null
@@ -1110,6 +1113,17 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // needed to sample the new count and register the wide comparison result.
     val haltAfterRetireBlock = haltAfterArmedIn &&
       (!haltAfterCmpArmedReg || haltAfterComparePending)
+
+    // The LSU needs a conservative launch interlock, not precise halt ownership.
+    // Removing epoch/write-invalidate qualification here cuts a measured debug
+    // CSR -> LSU ready -> IQ wakeup cone. Keep the exact ROB decision above intact.
+    haltAfterLoadHoldWire := m68k040.debug.HaltAfterLoadGuard(
+      haltAfterArmedIn, haltAfterCmpArmedReg, haltAfterComparePending, haltAfterCmpHitReg)
+    haltAfterLoadHoldWire.simPublic()
+    GenerationFlags.simulation {
+      assert(!(haltAfterDue || haltAfterRetireBlock) || haltAfterLoadHoldWire,
+        "halt-after load interlock must dominate the precise retirement guard")
+    }
 
     val debugStepBoundaryHit = Bool() // driven after retire/boundary classification
     val debugBreakpointBoundaryHit = Bool()

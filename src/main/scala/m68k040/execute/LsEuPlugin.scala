@@ -186,11 +186,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var preciseDrainBusySig: Bool = null
   // ── Inhibited-load preemption interlock (task: interrupt/trace/debug-auto-halt
   // preempting an already-bus-active inhibited LOAD) ──
-  // `debugHaltImminentIn`: True the cycle a debug automatic-halt boundary (halt-
-  // after-N-macros) is about to apply to the CURRENT ROB head -- i.e. RobPlugin's
-  // own `haltAfterDue || haltAfterRetireBlock`, the EXACT pair already gating
-  // `retire0`. Mirrors `irqPreemptPendingIn` (an async external event) but for a
-  // fully PREDICTABLE internal one: the debug session's own retire-count target.
+  // `debugHaltImminentIn`: conservative halt-after launch interlock from the
+  // ROB-owned DebugLoadPreemptService. Dominates the precise retirement guard;
+  // may additionally hold an inhibited read while configuration refreshes.
+  // Does not authorize a halt and does not gate ordinary cacheable loads.
   var debugHaltImminentIn: Bool = null
   // `inhibitedLoadBusySig`: True from the cycle an INHIBITED load's bus command
   // launches until the LAUNCHING UOP RETIRES (it leaves the ROB head) -- see
@@ -352,9 +351,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     robHeadIn.allowOverride;           robHeadIn := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     robHeadValidIn.allowOverride;      robHeadValidIn := False
     irqPreemptPendingIn.allowOverride; irqPreemptPendingIn := False
-    // A DUT with no RobPlugin (most standalone LS tests) never has a debug-auto-
-    // halt session armed -- idle-default False, matching `irqPreemptPendingIn`.
-    debugHaltImminentIn.allowOverride; debugHaltImminentIn := False
+    // Use the public ROB service, never its implementation fields. Standalone
+    // LS tests without that producer retain the idle/explicit-injection default.
+    debugHaltImminentIn.allowOverride
+    debugHaltImminentIn := host.get[m68k040.services.DebugLoadPreemptService]
+      .map(_.haltAfterLoadHold).getOrElse(False)
     // Debug-only taps (zero synth impact, matches every other tap in this file):
     // a standalone LS-EU-only DUT (no real RobPlugin) needs to sim-poke these
     // directly to exercise the precise-drain path (e.g. the `liveCompletionFires`
@@ -3126,10 +3127,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //     pending this cycle (mirrors StoreQueue's own `headPreciseReady` term
     //     exactly -- see StoreQueue.scala:270). Covers the case where preemption is
     //     recognized BEFORE this load would otherwise launch.
-    //   * `debugHaltImminentIn` -- a debug automatic-halt (`haltAfterDue ||
-    //     haltAfterRetireBlock`) is due for the CURRENT head. This is the EXACT
-    //     pair already gating RobPlugin's own `retire0` for the halt-after
-    //     successor; without it here, the successor could still launch its device
+    //   * `debugHaltImminentIn` -- a conservative SUPERSET of the ROB's precise
+    //     `haltAfterDue || haltAfterRetireBlock` guard. Without it here, the
+    //     halt-after successor could still launch its device
     //     read one cycle before `haltAfterDue` itself becomes true (a RegNext-
     //     delayed comparison), then get discarded by the debug-recover flush that
     //     follows -- same double-read hazard, different trigger.
@@ -3139,10 +3139,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // narrower race -- closed by `inhibitedLoadBusySig` gating the ROB's own
     // interrupt/trace RECOGNITION below, not by anything here (this gate guards
     // only the LAUNCH decision itself). No such after-the-fact race exists
-    // for the debug-auto-halt source: `debugHaltImminentIn` cannot even light up
-    // for THIS head before the head itself becomes valid, so there is no earlier-
-    // launch window to protect against — see the class-level doc comment on
-    // `debugHaltImminentIn`.
+    // for the normal debug-auto-halt countdown: comparison refresh is blocked
+    // before the successor can launch. Extra conservative assertion during target
+    // reprogramming only postpones launch; precise halt ownership stays in the ROB.
     val p4PreemptSafe = !irqPreemptPendingIn && !debugHaltImminentIn
     val p4LaunchOk  = Mux(p4Inhibited,
                           p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe,

@@ -41,6 +41,15 @@ trait RobRetirementService {
   def retiredRobIds: Vec[Flow[UInt]]
 }
 
+/** Conservative halt-after interlock for launching cache-inhibited loads.
+  * PRODUCER: RobPlugin exclusively. CONSUMER: LsEuPlugin.
+  * Must dominate the precise halt-after due/compare-pending retirement guard.
+  * Extra assertion during configuration refresh is allowed; this is never halt
+  * authorization and must not gate ordinary cacheable loads. */
+trait DebugLoadPreemptService {
+  def haltAfterLoadHold: Bool
+}
+
 /** Rename-owned committed architectural mappings for coherent debug access.
   *
   * These are the committed RAT entries only; speculative location/bypass state is

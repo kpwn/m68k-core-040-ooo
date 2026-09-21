@@ -115,7 +115,6 @@ trait CoreBenchHarness extends AnyFunSuite {
       // BackendWiringPlugin). See m68k040.top.SpeculativeFetchGate.
       m68k040.top.SpeculativeFetchGate.wire(host)
       lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
-      lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
 
       // CPLX (DivEu) wiring (mirrors top/FullCoreSynth).
       divEu.issue << iq.issue(4)

@@ -528,6 +528,13 @@ halt-after is armed, dual retirement may not cross from a completed macro into i
 successor. A target-write invalidation is observed on the accepted write edge, before a
 result from the superseded epoch can acquire halt ownership.
 
+The inhibited-load launch interlock may conservatively dominate that precise
+retirement guard. It must never miss a pending/due halt-after boundary; a stale
+comparison may only postpone a device read until configuration refreshes. It
+must not authorize halt ownership or stall ordinary cacheable loads. The
+ROB-owned `DebugLoadPreemptService` exports this guard without putting epoch
+validation on LSU flow control; see `docs/debug-load-guard.md`.
+
 Halt-on-exception uses the 256-bit deployed mask and stops at completed handler entry.
 The exception descriptor (vector, fault PC, fault address) is captured atomically with
 the event and remains stable until acknowledged.

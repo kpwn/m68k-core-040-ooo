@@ -1056,7 +1056,7 @@ class RobPluginSpec extends AnyFunSuite {
       // The ROB allocates sequentially; we track the next robId to complete and
       // chase the tail with a small lag so entries become complete and retire,
       // freeing old pdsts back to the freelist (closing the loop).
-      val robIdW = 6
+      val robIdW = dut.rob.logic.completion(0).payload.getWidth
       val mask = (1 << robIdW) - 1
       // Drive a long MOVEQ-like stream: each uop writes a rotating D reg (single-wide
       // dispatch keeps the markComplete chase simple and deterministic).
@@ -2446,6 +2446,37 @@ class RobPluginSpec extends AnyFunSuite {
       assert(dut.dsink.logic.haltReasonDebugOut.toInt == DebugHaltReasonCode.NONE)
       assert(dut.dsink.logic.effectiveHaltOut.toBoolean)
       assert(dut.rob.logic.debugHaltState.toEnum == DebugHaltState.HALTED)
+    }
+  }
+
+  test("halt-after load service conservatively covers target and epoch refresh") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      val rng = new scala.util.Random(0xdeb6a7)
+      var extraHolds = 0
+      for (cycle <- 0 until 256) {
+        dut.rob.logic.haltAfterArmedIn #= rng.nextBoolean()
+        dut.rob.logic.haltAfterInvalidateIn #= rng.nextBoolean()
+        dut.rob.logic.haltAfterEpochIn #= rng.nextInt(256)
+        dut.rob.logic.haltAfterTargetIn #= (if (rng.nextBoolean()) 0 else 10)
+        sleep(1)
+        val hold = dut.rob.haltAfterLoadHold.toBoolean
+        val armed = dut.rob.logic.haltAfterArmedIn.toBoolean
+        val cmpArmed = dut.rob.logic.haltAfterCmpArmedReg.toBoolean
+        val pending = dut.rob.logic.haltAfterComparePending.toBoolean
+        val hit = dut.rob.logic.haltAfterCmpHitReg.toBoolean
+        val precise = dut.rob.logic.haltAfterDue.toBoolean ||
+          (armed && (!cmpArmed || pending))
+        assert(hold == (armed && (!cmpArmed || pending || hit)), s"cycle $cycle")
+        assert(!precise || hold, s"unsafe service export at cycle $cycle")
+        if (hold && !precise) extraHolds += 1
+        cd.waitSampling()
+      }
+      assert(extraHolds > 0, "must exercise conservative configuration-refresh holds")
+      dut.rob.logic.haltAfterArmedIn #= false
+      sleep(1)
+      assert(!dut.rob.haltAfterLoadHold.toBoolean, "disarm must release immediately")
     }
   }
 

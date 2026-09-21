@@ -345,16 +345,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // either. See SpeculativeFetchGate for the predicate and why it is the right
     // re-expression of "at the ROB head" for something that has no ROB entry yet.
     SpeculativeFetchGate.wire(host)
-    // A debug automatic-halt (halt-after-N-macros) about to apply to the CURRENT
-    // ROB head must ALSO stop an inhibited load at that head from launching its
-    // device read -- the exact pair (`haltAfterDue || haltAfterRetireBlock`)
-    // already gating RobPlugin's own `retire0` for this same successor. Without
-    // this, the successor could launch its device read up to one cycle before
-    // `haltAfterDue` itself becomes true (a RegNext-delayed comparison against the
-    // macro-retire counter), then get discarded by the debug-recover flush that
-    // follows -- the same silent double-device-read hazard as an interrupt
-    // preempting an in-flight load, just triggered by the debug session instead.
-    lsEu.debugHaltImminentIn := rob.logic.haltAfterDue || rob.logic.haltAfterRetireBlock
+    // Halt-after device-read interlocking is consumed directly by LsEuPlugin
+    // through DebugLoadPreemptService; do not rebuild its precise ROB cone here.
 
     // ---- CPLX (DivEu) wiring: issue port 4 -> DivEu; completion (port 3) + dynamic
     // wakeup + euFault (CHK vec6 / DIV0 vec5). ----
