@@ -56,7 +56,7 @@ class IcacheParallelViptSpec extends AnyFunSuite {
     val ctrl  = new MmuControlPlugin
     val priv  = new TestPrivilegePlugin
     val itlb  = new ItlbPlugin()
-    val ic    = new IcachePlugin
+    val ic    = new IcachePlugin(IcachePredecodeConfig.fromEnvironment)
     val probe = new FetchProbePlugin
     val walkPort = new m68k040.sim.WalkerDcacheSimIo(itlb, "itlbWalk")
     db.on { host.asHostOf(Seq[FiberPlugin](

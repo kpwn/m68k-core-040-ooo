@@ -62,7 +62,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
                     detailedPerf: Boolean = false,
                     ipcThroughput: Boolean = false,
                     ipcLateStore: Boolean = false,
-                    pcRangeEnable: Boolean = true) extends Component {
+                    pcRangeEnable: Boolean = true,
+                    icachePredecodeWords: Int = 16) extends Component {
   require(!ipcLateStore || ipcThroughput, "late-store socket profile requires throughput options")
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
@@ -104,7 +105,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1,
       earlyAutoStoreAddress = ipcLateStore, earlyStoreDataWake = ipcLateStore)
     val divEu = new m68k040.execute.DivEuPlugin
-    val icache = new IcachePlugin()
+    val icache = new IcachePlugin(icachePredecodeWords)
     val merge  = new AxiDMergePlugin()
     val iplAck = new IplAckPlugin(enable = true)
     val periph = new PeripheralResetPlugin(enable = true,
@@ -573,11 +574,14 @@ object GenSocketTopVerilog {
     val ipcThroughput = SocketIpcProfile.enabled(ipcProfile)
     val debugProfile = sys.env.getOrElse("CPU_DEBUG_PROFILE", "full")
     val pcRangeEnable = SocketDebugProfile.pcRangeEnabled(debugProfile)
+    val icachePredecodeWords = m68k040.cache.IcachePredecodeConfig.fromEnvironment
+    println(s"ICACHE_PREDECODE_WORDS=$icachePredecodeWords")
     println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf CPU_DEBUG_PROFILE=$debugProfile")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
-        ipcLateStore = SocketIpcProfile.lateStore(ipcProfile), pcRangeEnable = pcRangeEnable))
+        ipcLateStore = SocketIpcProfile.lateStore(ipcProfile), pcRangeEnable = pcRangeEnable,
+        icachePredecodeWords = icachePredecodeWords))
     println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }

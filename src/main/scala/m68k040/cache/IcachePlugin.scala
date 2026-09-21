@@ -18,7 +18,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * FSM: IDLE → REFILL → REPLAY → IDLE.
   */
-class IcachePlugin extends FiberPlugin with FetchService {
+class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchService {
+  require(predecodeWords == 8 || predecodeWords == 16)
 
   // ---- geometry (single source of truth) ----
   private val geo          = CacheGeometry.l1i040

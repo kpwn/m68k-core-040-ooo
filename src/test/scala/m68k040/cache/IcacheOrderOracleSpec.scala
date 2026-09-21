@@ -110,7 +110,7 @@ class IcacheOrderOracleSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = xlateFactory
-    val icache = new IcachePlugin
+    val icache = new IcachePlugin(IcachePredecodeConfig.fromEnvironment)
     val probe  = new FetchProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, icache, probe)) }
   }

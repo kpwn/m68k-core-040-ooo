@@ -351,7 +351,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     detachedStoreEntries: Int = 1,
                     earlyAutoStoreAddress: Boolean = false,
                     earlyStoreDataWake: Boolean = false,
-                    pcRangeEnable: Boolean = true) extends Component {
+                    pcRangeEnable: Boolean = true,
+                    icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -365,7 +366,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val intCtrl = new m68k040.exception.InterruptControlPlugin
     val itlb   = new ItlbPlugin()
     val dtlb   = new DtlbPlugin()
-    val icache = new IcachePlugin
+    val icache = new IcachePlugin(icachePredecodeWords)
     val dcache = new DcachePlugin()
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin

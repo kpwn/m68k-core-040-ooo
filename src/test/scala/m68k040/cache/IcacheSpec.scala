@@ -47,7 +47,7 @@ class IcacheSpec extends AnyFunSuite {
 
     val param  = new ParamPlugin(M68kParams())
     val xlate  = xlateFactory
-    val icache = new IcachePlugin
+    val icache = new IcachePlugin(IcachePredecodeConfig.fromEnvironment)
     val probe  = new FetchProbePlugin   // exposes cmdIn/rspOut top-level IO
     // Last in the list: its `during build` reads `icache.logic`, so `icache`'s own Area
     // must already exist (the same ordering FullCoreSynth's BackendWiringPlugin relies on).
