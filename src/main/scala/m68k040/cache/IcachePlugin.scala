@@ -1838,19 +1838,21 @@ class IcachePlugin extends FiberPlugin with FetchService {
         // frozen "miss" would allocate a SECOND way for a line that has become resident
         // (a 2-hot `s1HitVec`).
         //
-        // HONEST STATUS: **redundant today, and deliberately kept.** SG-1's accept gate
-        // already implies it -- `pfInstallAny` requires `mshrValid` on the installing
-        // entry, so if that entry's set equalled `lookupSet` then `pfLookupSetBusy` would
-        // be high, `pfAcceptOk` low, and `cmdPort.fire` low; the term is therefore
-        // provably never True as the file stands, and no test can distinguish its
-        // presence (confirmed: mutating it out changes nothing). It is kept because the
-        // hold's correctness DEPENDS on that implication, SG-1 is explicitly flagged as
-        // conservative and re-measured by Task 14's IPC gate, and a future relaxation of
-        // `pfAcceptOk` would silently re-open this window with no local warning. Cost is
-        // a 6-bit compare in an FSM transition condition -- `cmdPort.fire` is a FANOUT of
-        // the accept cone, not an input to it, so `cmdPort.ready` is not lengthened.
-        val pfInstallSetConflict = cmdPort.fire && (mshrSet(pfInstallMshr) === lookupSet)
-        when(pfInstallAny && !demandFillStart && !pfInstallSetConflict) {
+        // SG-1 already enforces this exclusion: the selected install entry is valid,
+        // so a same-set command sees pfLookupSetBusy and cannot fire. Keep the proof
+        // obligation as assertions rather than feeding the live translation/accept
+        // cone into every installer register and the FSM. A future relaxation of
+        // SG-1 must re-establish this property, not merely delete these assertions.
+        GenerationFlags.simulation {
+          when(pfInstallAny) {
+            assert(mshrValid(pfInstallMshr), "I-cache installer selected a non-live slot")
+            when(mshrSet(pfInstallMshr) === lookupSet) {
+              assert(pfLookupSetBusy, "I-cache selected install set escaped SG-1 ownership")
+              assert(!cmdPort.fire, "I-cache accepted a command into its pending install set")
+            }
+          }
+        }
+        when(pfInstallAny && !demandFillStart) {
           installIdx    := pfInstallMshr
           installSet    := mshrSet(pfInstallMshr)
           installWay    := mshrWay(pfInstallMshr)
@@ -2049,8 +2051,8 @@ class IcachePlugin extends FiberPlugin with FetchService {
     //   - `tagQ`/`validsQ` are frozen (their only enable is `cmdPort.fire`, which the
     //     closed gate forbids). That is EXACT rather than merely stable, because
     //     nothing can install into `s0Set` during the hold: the running install is
-    //     excluded by `setBlocked` if it started after the accept and by IDLE's
-    //     `pfInstallSetConflict` guard if it started on the accept cycle, and any other
+    //     excluded by `setBlocked` if it started after the accept and by SG-1's
+    //     `!pfLookupSetBusy` gate if it started on the accept cycle, and any other
     //     speculative slot is excluded by SG-1's `!pfLookupSetBusy` at accept time plus
     //     the allocator's `!s1Unresolved` freeze during the hold.
     //   - `victim(s0Set)` likewise cannot advance (it advances only for `installSet`).
