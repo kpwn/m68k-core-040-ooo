@@ -2613,3 +2613,47 @@ or its matching CSV with the Dhrystone baseline, despite the raw script's
 incorrect `workload=user-confirmed` label. Correction is preserved in the
 matching `.INVALID.txt` sidecar. No CPU halt/reset; counters restored and lease
 released. A fresh uniquely named acquisition requires running confirmation.
+
+### Confirmed Dhrystone board comparison — 2026-09-21 11:47
+
+User explicitly confirmed Dhrystone running, then reported **46k Dhrystones/s
+at 100 MHz versus 35–36k previously (+27.8–31.4%)**. Fresh acquisition verifies
+build `6b10354a`: `/tmp/ipc-dhrystone-confirmed-after-20260921.log` and matching
+CSV. Three one-second running-counter windows, same counter protocol as baseline
+`462a4dc1`; snapshots freeze counters only, never the CPU. Restored original
+counter enable and released JTAG. Earlier invalid acquisition remains excluded.
+
+| Window | Core cycles | Retired macros | IPC |
+| --- | ---: | ---: | ---: |
+| 0 | 100157885 | 30076445 | 0.300290 |
+| 1 | 100192428 | 29974769 | 0.299172 |
+| 2 | 100184044 | 29838228 | 0.297834 |
+
+Weighted IPC **0.233692867→0.299098722 (+27.99%)**: baseline 70,264,443
+macros / 300,670,037 cycles; candidate 89,889,442 / 300,534,357. This is a
+user-confirmed full-system Dhrystone window, not an isolated-PC counter filter.
+
+| Weighted metric | Baseline | Combined candidate |
+| --- | ---: | ---: |
+| Mispredictions per 1000 retired instructions | 44.448 | 26.047 |
+| Head-load stall cycles | 16.853% | 14.246% |
+| Head-store stall cycles | 29.084% | 31.016% |
+| Head-branch stall cycles | 3.078% | 2.089% |
+| Head-other stall cycles | 9.928% | 5.514% |
+| ROB empty | 6.476% | 4.866% |
+| Dispatch blocked by IQ | 57.752% | 57.224% |
+| ROB full | 0% | 0% |
+
+MPKI is per instruction, NOT per branch, and does not establish 95% predictor
+accuracy. Return mispredictions increased from about 8.06 to 9.54 per thousand
+instructions while other mispredictions fell substantially; retain that regression
+in future predictor evaluation. Store-head share increased but store-stall cycles
+per retired instruction decreased; percentages alone are not a latency regression.
+Store waiting and IQ pressure remain the main visible opportunities.
+
+Immediate nonintrusive ILA contains 1024 cycles / 382 retired macros, local IPC
+0.373047. It sampled a different mix from the baseline capture, so do not claim
+that local IPC ratio as the overall improvement. Its seven retirements at
+`03be19c2` yield six consecutive 20-cycle copy-loop intervals, versus the prior
+24-cycle steady baseline; this agrees with the pre-postincrement simulation.
+The two newer store experiments are NOT included in this board result.
