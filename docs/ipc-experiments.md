@@ -2177,3 +2177,24 @@ not stale memory-busy state, but does not yet prove a precise-state defect or
 justify widening the oracle's acceptance window. `IRQ_GATE_TRACE` and
 `ODD_SSP_BOUNDARIES` only bound diagnostics; defaults and checks are unchanged.
 This baseline-shared failure is not represented as fixed by the candidate.
+
+Board candidate pins: CPU `8fab36144b9181828a6d234346c2d02c4c277eed`, SoC
+`6b10354af8e8a43eed7ec5c3b5f184eee4964f11`. SoC workspace
+`/home/qwertyoruiop/macqd700-soc-worktrees/ipc-candidates-100mhz`, service
+`m68k-ipc-candidate-soc100.service`, runner `/tmp/run-ipc-candidate-soc100.sh`.
+Full top-level Ethernet/performance/ILA lint and real-MIG lint pass, as do
+storage-reset pairing and synthesis source-list checks. The initial lint
+attempt hit only Taxi unnamed-generate style warnings: placing the existing
+Ethernet lint exception after `-Wall` fixes the command, with no RTL change.
+Logs `/tmp/ipc-candidate-soc100-{build,generation,lint}.log`; existing tmux
+`build-logs` follows them. At 10:13 local the job waits on the shared Vivado
+mutex behind the running early-NZVC physical arm. It holds that mutex throughout
+implementation, using a separate inner Make lock to avoid recursive locking.
+No board programming has occurred. Verify full timing and locally patch ADB
+firmware before the user-authorized volatile load; do not flash SPI or touch SD.
+
+Additional composed-profile IPC matrix is running serially after the fast gate:
+`/tmp/ipc-socket-composed-corpus.log`, with subword forwarding plus retained
+history/selective prediction, all LSU options and four contexts. Compare by
+kernel/seed/fall-through/early-wakeup against `/tmp/ls-turnover-corpus-4.log`;
+do not mistake different knob combinations for matched results.
