@@ -180,3 +180,39 @@ The debug word-decode candidate is NOT included in these counts.
 
 Reports: `build/vivado/reports/utilization_synth.rpt` in the
 `ipc-v2-200mhz-lean` and `ipc-v2-l2-cleanup` SoC worktrees.
+
+## Integrated CSR candidate queued
+
+CPU `1cb2401f6b77c8e8b55fd5593e405b75d6596875`; SoC
+`8be2850a99968071b5aac9bd114c89afa0a6743a`, branch
+`perf/csr-read-decode-cleanup`, worktree `ipc-v2-csr-cleanup`.
+The sole SoC change from the running IQ/L2 build is the CPU submodule pin.
+The CPU adds the tested static CSR word-decode change, with no execution-path
+or performance-profile changes. Both candidates retain ETH, detailed counters,
+VIO and JTAG AXI; IPC/legacy ILAs and storage trace remain off.
+
+Service `m68k-ipc-csr-cleanup-soc200.service`, runner
+`/tmp/run-ipc-csr-cleanup-soc200.sh`, logs
+`/tmp/ipc-csr-cleanup-soc200-{build,generation,lint}.log`.
+Production generation, both SoC lint modes, post-route early-exit tests,
+IPC-profile guards, storage reset pairing, and synthesis-source checks passed.
+The live runner is waiting on `/var/tmp/m68k-ooo-vivado.lock`, behind the IQ/L2
+implementation; do not start a competing synthesis or restart it merely
+because it is waiting. Both build streams use the existing build-log tmux pane.
+No programming/reset operation is included in either runner.
+
+Before the CSR implementation begins, the same serialized runner requests a
+read-only primitive census of the original and IQ/L2 synthesized checkpoints.
+Outputs: `/tmp/ipc-cleanup-cell-{baseline,iq_l2}.tsv`, matching `.log` files;
+script `/tmp/ipc-cleanup-cell-census.tcl`. It groups primitive types by surviving
+plugin-name prefixes and SoC hierarchy, explicitly retaining unattributed CPU
+cells. This is heuristic ownership, not a causal attribution or a count of
+physically packed LUT sites. A Tcl smoke test covers grouping/aggregation;
+the actual Vivado census has not run yet. Its failure is logged independently
+and does not prevent the already-gated CSR implementation from starting.
+
+Next physical decision: compare routed WNS/TNS/failing endpoints, hold, routing
+resource footprints and congestion against the loaded baseline. Do not select
+the IQ cleanup on its RTL simplicity alone, or the CSR change on its tests
+alone. If the current IQ/L2 implementation worsens routing, preserve its report
+and test a variant retaining the L2/CSR savings without the IQ flush change.
