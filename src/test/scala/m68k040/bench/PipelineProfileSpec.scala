@@ -65,7 +65,8 @@ class PipelineProfileSpec extends CoreBenchHarness {
       alignedLoadFallThrough = lsFlags("fallThrough"), earlyLsIntWakeup = lsFlags("earlyWake"),
       sqSubwordForwarding = lsFlags("subword"), earlyStoreAddress = lsFlags("earlyStore"),
       fuseLongMoveLoads = lsFlags("fusion"), reserveLateStore = lsFlags("reserve"),
-      detachLateStore = lsFlags("detach"), forwardOnPublish = lsFlags("publish")))
+      detachLateStore = lsFlags("detach"), forwardOnPublish = lsFlags("publish"),
+      earlyLsNzvcWakeup = sys.env.get("IPC_LS_EARLY_NZVC").contains("1")))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,

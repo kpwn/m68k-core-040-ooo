@@ -523,7 +523,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
       reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
       detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
-      forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"))
+      forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
+      earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -5988,6 +5989,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       perCycle = dut => { if(dut.lsEu.logic.p4CompletionFire.toBoolean) forwards += 1 })
     if(sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"))
       assert(forwards > 0, "oracle test never exercised the new forwarding path")
+  }
+
+  test("lock-step: LSU NZVC wakeup preserves alternating flags and partial Scc destinations", VerilatorTest) {
+    for(copyback <- Seq(false, true)) {
+      val setup = (if(copyback) Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+        "move.l #0x5000E040,%d7", "movec %d7,%dtt1",
+        "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc") else Nil) ++
+        Seq("lea 0x4600,%a0", "moveq #0,%d0", "move.l %d0,(%a0)") ++
+        (1 to 5).map(n => s"move.l #0x13579bdf,%d$n")
+      val recurrence = Seq.fill(64)(Seq("move.l (%a0),%d0", "seq %d0", "move.l %d0,(%a0)",
+        "sne %d2", "smi %d3", "spl %d4")).flatten
+      val lanes = for(value <- Seq("0", "0x80000000", "0xffffffff", "0x00800080");
+        size <- Seq("b", "w", "l")) yield Seq(s"move.l #$value,%d0",
+          s"move.$size %d0,15(%a0)", "seq %d2", "smi %d3",
+          s"move.$size 15(%a0),%d1", "seq %d4", "smi %d5")
+      val evict = for(line <- Seq(0x4600, 0x4610); n <- 1 to 4)
+        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      // Eight cold eviction stores at DDR=70 can outlive the harness's fixed
+      // 200-cycle memory-check delay. An architecturally ordered inhibited write
+      // and read wait for that older traffic; do not mask a mismatch with a timer.
+      val drain = Seq("move.l #0,0x50001000", "move.l 0x50001000,%d6")
+      var wakes = 0
+      runLockStep(s"ls-nzvc-wakeup-$copyback", (setup ++ recurrence ++ lanes.flatten ++ evict ++ drain).mkString(" ; "),
+        checkMem = Seq(0x4600L, 0x460fL), checkSpan = 4, maxCycles = 100000,
+        dcfg = m68k040.sim.AxiMemModelConfig(latency =
+          m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 5, dramCycles = 70)),
+        perCycle = dut => { if(dut.iq.lsNzvcWakeupPort.valid.toBoolean) wakes += 1 })
+      assert(wakes >= 128, "flag-dependent corpus did not exercise LSU NZVC wakeup")
+      println(s"LS_NZVC_ORACLE copyback=$copyback wakes=$wakes")
+    }
   }
 
   test("lock-step: early store address preserves late data, byte lanes and CCR", VerilatorTest) {

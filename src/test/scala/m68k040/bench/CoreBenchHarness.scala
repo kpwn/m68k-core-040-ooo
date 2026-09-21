@@ -347,7 +347,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     fuseLongMoveLoads: Boolean = false,
                     reserveLateStore: Boolean = false,
                     detachLateStore: Boolean = false,
-                    forwardOnPublish: Boolean = false) extends Component {
+                    forwardOnPublish: Boolean = false,
+                    earlyLsNzvcWakeup: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -385,7 +386,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
-      forwardOnPublish = forwardOnPublish)
+      forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -869,12 +870,17 @@ trait CoreBenchHarness extends AnyFunSuite {
         // restriction "NO DIV/MUL/CHK". Observing it is what makes the long-latency
         // EU benchmarks (and FPU) measurable at all.
         snapWb(dut.divEu.logic.wbObs)
-        // Branch EU writeback: no register/flag write — record a non-temp (it is a
-        // macro instruction) and feed the handle so its commit-join succeeds.
+        // Branch-EU Scc/DBcc and RTS/RTR also write an integer register. Preserve
+        // those observations just as ExecuteLockStepSpec does; a no-op placeholder
+        // hides Scc results and makes a last-register check report the prior load.
         locally {
           val bw = dut.branchEu.logic.wbObs
           if (bw.valid.toBoolean) {
-            val wb = WhiteboxCapture.Wb(0, 0L, false, 0, false, 0, false)
+            val writes = bw.anWrite.toBoolean
+            val wb = WhiteboxCapture.Wb(
+              if(writes) bw.anArch.toInt else 0,
+              if(writes) bw.anData.toLong & 0xffffffffL else 0L,
+              writes, 0, false, 0, false, keepCommit = bw.keepCommit.toBoolean)
             handle.onWb(bw.robId.toInt, wb)
           }
         }

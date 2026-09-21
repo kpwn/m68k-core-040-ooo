@@ -1737,6 +1737,112 @@ The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes
 **387 tests**, two ignored, zero failed or aborted suites
 (`/tmp/capture-overlap-final-fast.log`). No board operation was performed.
 
+## Selected-completion NZVC wakeup — 2026-09-21
+
+Default-off `earlyNzvcWakeup` reuses the existing LSU→IQ NZVC readiness port to
+announce an already-selected successful completion one cycle before its normal
+registered flag writeback. It is independent of integer early wakeup. Front,
+back, detached-store and precise-replay winners supply the destination; faults
+and orphan replays do not announce. No flag data, retirement, SQ authorization,
+X/FPCC timing, queue or PRF port changes. The cycle-by-cycle assertion requires
+exact next-cycle valid/write destination agreement. Contract:
+[resident-load latency](ls-hit-latency.md#guaranteed-next-cycle-nzvc-wakeup-candidate).
+
+`LsNzvcWakeIpcSpec` runs six controls, seeds 1/17, `IPC_MEM=l2:5:70`, with all
+retained LSU options plus selective slot-1 prediction and retained history in
+both arms. Retirement remains ordinary two-wide. Recurrences execute 96
+iterations and exclude the first 16; branch controls execute 64 and exclude 16.
+IPC counts architectural macros, not uops. All end-value and branch-denominator
+checks pass in both arms (`/tmp/ls-nzvc-targeted-ipc-v2.log`):
+
+| Control | Measured macros | Before cycles (1 / 17) | Early NZVC cycles | IPC change |
+| --- | ---: | ---: | ---: | ---: |
+| copyback store → Scc | 160 | 636 / 636 | 556 / 556 | +14.39% |
+| copyback load → Scc → store | 240 | 799 / 799 | 719 / 719 | +11.13% |
+| precise store → Scc | 160 | 1731 / 1713 | 1652 / 1646 | +4.78% / +4.07% |
+| precise load → Scc → store | 240 | 1336 / 1339 | 1334 / 1339 | +0.15% / unchanged |
+| independent load → branch, zero/nonzero | 240 | 192 / 192 | 192 / 192 | unchanged |
+
+The copyback recurrences save exactly one cycle per measured iteration. Both
+load/branch controls retain one miss out of 96 retired branches; there is no
+measured accuracy improvement. Seven of twelve matched control/seed pairs
+improve, five are unchanged, none regress. These isolate a flag-dependency
+latency reduction, **not representative Dhrystone or board performance**.
+
+The initial run exposed a benchmark-observer defect, not a reason to change CPU
+semantics: it replaced every branch-EU writeback with a no-op, losing Scc/DBcc and
+RTS/RTR integer writes. `CoreBenchHarness` now records the existing `BrWbObs`
+integer write, value, destination and keep-commit marker, matching the oracle
+harness. The strict final-register check remains; without the correction the
+load/Scc recurrence reports its penultimate load value instead of the Scc result.
+Initial failure evidence: `/tmp/ls-nzvc-targeted-ipc.log`.
+
+The new strict flag/partial-register oracle test passes in both precise and
+copyback modes, disabled and enabled. Its first disabled copyback run checked
+backing RAM before eight cold eviction stores had drained at DDR=70: the fixed
+200-cycle harness delay was insufficient. An architecturally ordered inhibited
+write/read now completes after the eviction sequence, retaining the exact memory
+comparison rather than increasing a timing constant. Evidence:
+`/tmp/ls-nzvc-oracle-baseline{,-v2}.log`. The enabled broader run passes **49
+tests** (`/tmp/ls-nzvc-oracle-candidate.log`), including real late-store capture,
+full SQ, physical aliases, splits, retained completion, redirect cancellation,
+nonresident/write-protected page recovery, RTR, CCR/IRQ storms and the ROM A7 pop
+chain. The device-read IRQ stress observes 150 actual reads for 150 retired
+loads. All next-cycle readiness/tag assertions remain active.
+
+The initial broad 136-window LSU candidate run passes: **12 improve, 124 are
+unchanged, none regress** versus the previous publication-forward baseline.
+All macro counts match. With early integer wakeup, divide→store→load is
+2,367→2,336 cycles for 98 macros at both seeds and either fall-through setting
+(+1.33% IPC). All eight delayed-store/disjoint-load recurrence windows save one
+total cycle; the other 124 windows are unchanged. This also has a concrete flag
+dependency: `OperationDecoder` sets `readsNzvc` for DIV.W, and `DivEuPlugin`
+captures old NZVC for overflow preservation. The following divide therefore
+waits on the load's flags even though this kernel's divides do not overflow.
+Evidence: `/tmp/ls-nzvc-corpus-candidate.log`. The fresh disabled rerun
+(`/tmp/ls-nzvc-corpus-disabled.log`) passes and exactly reproduces all 136
+previous macro/cycle tuples, including the observer correction. Branch profiles
+separately check composition with prediction: all **16 warmed profile windows**
+retain identical macro counts, cycles, branch counts and misses with the option
+off/on, and each profile matches its instrumentation-off control. The set includes
+long alternating branches, long retirement backlog, calls and divider backlog;
+no new gain is claimed there. Evidence: `/tmp/ls-nzvc-profile-{0,1}.log`.
+
+Ten additional overflow/DIVREM oracle tests pass, including old N/Z/C preservation
+and misprediction recovery. The full composed production RTL generator accepts
+`--early-ls-nzvc-wakeup` and completes successfully; this is elaboration, not a
+physical timing result (`/tmp/ls-nzvc-overflow-production.log`). Together with
+the earlier run, 59 selected oracle tests pass for the enabled candidate.
+
+Reproduction switches: `IPC_LS_EARLY_NZVC=1`, `LOCKSTEP_LS_EARLY_NZVC=1`, or
+`GenFullCoreSynthVerilog --early-ls-nzvc-wakeup`. Defaults remain off. Broad IPC,
+profile, fast-gate and routing results must be recorded separately; targeted
+recurrence gains alone do not qualify the candidate for the board.
+
+The required `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` gate passes
+**387 tests**, two ignored, zero failed or aborted suites
+(`/tmp/ls-nzvc-final-fast.log`). The candidate remains disabled by default.
+Matched routing is queued as `m68k-ls-nzvc-gate.service`, artifacts
+`/tmp/ls-nzvc-gate.cM6rEn`: both arms use the full retained LSU combination,
+selective slot-1 deferral/training and retained history, with ordinary two-wide
+retirement; only the candidate enables early NZVC wakeup. It uses the shared
+Vivado mutex, the existing 5 ns / three-post-route-round recipe, and the existing
+build-log window. No routed result, whole-SoC closure or board improvement is
+claimed. No board operation was performed during this experiment.
+
+### Timing-runner recovery during this experiment
+
+The detached-owner baseline completed at +0.050 ns, reproducing the prior
+reservation result, but its systemd wrapper then exited 127 because `rg` was not
+on the daemon's PATH. The native route was complete; it was not restarted.
+`m68k-sq-detach-resume-876e58f5.service` verifies the pinned baseline commit,
+netlist checksum and terminal signoff, extracts its summary with an absolute
+system-tool path, and builds only the missing detached candidate under the same
+Vivado mutex. The already-running publication baseline was left untouched;
+`m68k-sq-publish-resume-3f53a39b.service` waits for that original wrapper to end
+and performs the same guarded recovery only if its exit code is 127. Both reuse
+the existing artifact directories and the existing `build-logs:0` log window.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

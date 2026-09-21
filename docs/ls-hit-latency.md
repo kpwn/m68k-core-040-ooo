@@ -1,5 +1,28 @@
 # Resident-load latency experiment
 
+## Guaranteed next-cycle NZVC wakeup candidate
+
+An independent default-off option applies the selected-completion guarantee to
+LSU-produced NZVC. Announce the physical flag destination only when the successful
+front, back, detached-store or precise-replay completion has won arbitration and
+will write that destination in the next cycle. Preserve the existing registered
+NZVC value/writeback, ROB completion and architectural CCR paths. Do not predict
+store data arrival, memory response success or future completion-port availability.
+
+IQ dynamic NZVC dependencies clear into registers before registered issue and
+operand capture; a newly pushed consumer must use the same announcement. Fresh
+physical-tag allocation retains priority over a wake for the prior lifetime.
+Faults and orphan replays announce nothing; ordinary IQ flush squashes consumers.
+Cycle-by-cycle assertions require exact next-cycle NZVC write eligibility and tag
+matching, including back-to-back completions. X and FPCC timing is unchanged.
+
+Measure store→Scc, load→Scc and load→branch recurrences against the same core with
+the option disabled, plus the existing broad LSU and branch-profile controls.
+Verify NZVC values/partial registers, aliases, precise stores, split/fault/flush,
+IRQ and RTE against the oracle. A latency benefit is not branch accuracy or board
+IPC. Retain only with useful measured IPC and pursue a separate routed 200 MHz
+comparison; adding tag/control fanout to the IQ remains a timing risk.
+
 ## Guaranteed next-cycle integer wakeup candidate
 
 An additional, separately disabled option announces successful LS integer

@@ -26,11 +26,10 @@ trait LsEuService {
   // earlyIntWakeup path announces a guaranteed next-cycle writeback instead;
   // consumers must preserve the IQ's registered wake/select timing contract.
   def wakeup: Flow[UInt]       // pdst of a completing load (valid only when it writes a reg)
-  // Dynamic NZVC-wakeup broadcast: valid (with the produced pNzvcDst) the cycle a STORE
-  // that writes NZVC (a MOVE-to-memory store) — or an RTR CCR-restore — completes and
-  // its NZVC is in the PRF. A flag-reader (e.g. a bit-op's RMW µop) of such an in-flight
-  // LS-produced NZVC waits on this (the static IQ scoreboard cannot clear it: an LS op
-  // issues on the LS port, generating no static latency-1 ALU/branch wakeup event).
+  // NZVC readiness: normally alongside PRF writeback; optional earlyNzvcWakeup
+  // announces its guaranteed next-cycle write instead, under the same registered
+  // IQ wake/select contract as integer early wakeup. Applies to NZVC-writing loads,
+  // stores and CCR restore, not a speculative prediction of their completion.
   def wakeupNzvc: Flow[UInt]   // pNzvcDst of a completing NZVC-writing LS op
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
@@ -102,7 +101,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val sqSubwordForwarding: Boolean = false,
                  val reserveLateStore: Boolean = false,
                  val detachLateStore: Boolean = false,
-                 val forwardOnPublish: Boolean = false) extends FiberPlugin with LsEuService {
+                 val forwardOnPublish: Boolean = false,
+                 val earlyNzvcWakeup: Boolean = false) extends FiberPlugin with LsEuService {
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
@@ -1817,6 +1817,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val nextIntWake = Flow(UInt(6 bits))
     nextIntWake.valid := False
     nextIntWake.payload := 0
+    // Same irrevocable selected-completion contract, independently selectable.
+    // Flag data stays in compNzvc; this port carries readiness and identity only.
+    val nextNzvcWake = Flow(UInt(4 bits))
+    nextNzvcWake.valid := False
+    nextNzvcWake.payload := 0
     val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     compValid.simPublic(); compRobId.simPublic() // debug-only, task #139 finding #1; zero synth impact
     val compData      = Reg(Bits(32 bits))
@@ -2057,6 +2062,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                                moveNzvc(result, ctx.size), ctx.storeNzvc))
       compNzvcWrite := ctx.writesNzvc
       compNzvcDst   := ctx.pNzvcDst
+      nextNzvcWake.valid := ctx.writesNzvc
+      nextNzvcWake.payload := ctx.pNzvcDst
       compX         := result(4)
       compXWrite    := ctx.writesX
       compXDst      := ctx.pXDst
@@ -2132,6 +2139,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       compNzvc       := Mux(ctx.ccrRestore, result(3 downto 0), moveNzvc(result, size))
       compNzvcWrite  := ctx.writesNzvc
       compNzvcDst    := ctx.pNzvcDst
+      nextNzvcWake.valid := ctx.writesNzvc
+      nextNzvcWake.payload := ctx.pNzvcDst
       compX          := result(4)
       compXWrite     := ctx.writesX
       compXDst       := ctx.pXDst
@@ -2552,12 +2561,22 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           "LsEuPlugin: early integer wakeup announced the wrong physical register", FAILURE)
       }
     }
-    // Dynamic NZVC-wakeup: a completing NZVC-writing LS op (a memory MOVE or an
-    // RTR CCR-restore) broadcasts its pNzvcDst the cycle its NZVC lands in the PRF. The IQ
-    // holds a flag-reader of that NZVC until this fires (the static scoreboard cannot —
-    // an LS op generates no static ALU/branch wakeup event).
-    wakeupNzvcPort.valid   := compValid && compNzvcWrite && !compIsFault
-    wakeupNzvcPort.payload := compNzvcDst
+    // Dynamic NZVC-wakeup: normally broadcast at PRF writeback, optionally on
+    // irrevocable selection of that next-cycle write. IQ dependency clear and
+    // issue stay registered; NZVC data and architectural completion do not move.
+    val registeredNzvcWake = compValid && compNzvcWrite && !compIsFault
+    wakeupNzvcPort.valid   := (if(earlyNzvcWakeup) nextNzvcWake.valid else registeredNzvcWake)
+    wakeupNzvcPort.payload := (if(earlyNzvcWakeup) nextNzvcWake.payload else compNzvcDst)
+    GenerationFlags.simulation {
+      val announced = RegNext(nextNzvcWake.valid) init False
+      val announcedDst = RegNextWhen(nextNzvcWake.payload, nextNzvcWake.valid)
+      assert(announced === registeredNzvcWake,
+        "LsEuPlugin: early NZVC wakeup did not match next-cycle writeback", FAILURE)
+      when(announced) {
+        assert(announcedDst === compNzvcDst,
+          "LsEuPlugin: early NZVC wakeup announced the wrong physical register", FAILURE)
+      }
+    }
     // MMU access-fault completion (registered, alongside the comp* stage).
     faultCompletionPort.valid           := compValid && compIsFault
     faultCompletionPort.payload.robId   := compRobId
@@ -2956,6 +2975,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         compDstArch := 0
         compNzvc := Mux(capture, moveNzvc(rdData.data, ctx.size), nzvc)
         compNzvcWrite := ctx.writesNzvc; compNzvcDst := ctx.nzvcDst
+        nextNzvcWake.valid := ctx.writesNzvc
+        nextNzvcWake.payload := ctx.nzvcDst
         compX := False; compXWrite := False; compXDst := 0
         compIsFault := False
         valid := False
@@ -3789,6 +3810,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         compNzvc       := e.nzvc
         compNzvcWrite  := e.nzvcWrite
         compNzvcDst    := e.nzvcDst
+        nextNzvcWake.valid := e.nzvcWrite
+        nextNzvcWake.payload := e.nzvcDst
         compX          := False
         compXWrite     := False
         compIsFault    := False

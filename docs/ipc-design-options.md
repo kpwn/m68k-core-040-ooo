@@ -567,12 +567,22 @@ queuing timing. This amendment authorizes the experiment, not acceptance.
 ### 17. Wake LSU-produced condition-code dependents at selected completion
 
 The optional integer early-wakeup path already announces an irrevocably selected
-LSU result before its registered writeback, but `wakeupNzvcPort` still broadcasts
+LSU result before its registered writeback, but by default `wakeupNzvcPort` broadcasts
 only from `compValid && compNzvcWrite && !compIsFault`. Thus a MOVE-to-memory,
 flag-producing load or CCR-restore dependency may wait an extra cycle even when
 the winning completion and destination are already known. Audit the IQ's dynamic
 NZVC dependency clear and registered issue/operand capture before mirroring the
-integer guarantee for flags. This is a local RTL finding, not an IPC measurement.
+integer guarantee for flags.
+
+The default-off `earlyNzvcWakeup` prototype now implements that guarantee on the
+existing port. Targeted full-core, warmed comparisons at `l2:5:70`, seeds 1/17,
+save 80 cycles over 80 copyback recurrences: store→Scc is 636→556 cycles (+14.39%
+IPC) and load→Scc→store is 799→719 (+11.13%). Independent load/branch windows
+are unchanged, including branch counts and misses. These are recurrence controls,
+not representative-workload or board gains. Forty-nine selected oracle tests
+pass, including precise/fast stores, split/fault/flush and IRQ/CCR recovery.
+Broader profiles and routed timing remain separate gates; see the experiment
+ledger for complete results and regressions.
 
 Use the existing wakeup service/port: no predictor, extra register-file port or
 speculative flag value. Cover front/back completion, detached stores and precise
