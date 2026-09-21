@@ -1,5 +1,18 @@
 # Resident-load latency experiment
 
+## Socket diagnostic profile
+
+`CPU_IPC_PROFILE=throughput-v1` explicitly selects the measured load descriptor,
+integer/flag wakeup, direct long MOVE, early store address, SQ reservation,
+publication/subword forwarding and four-context detached-store options in the
+real socket. It also enables selective slot-1 training/deferral and retained
+redirect history. Ordinary retirement stays two-wide. `baseline` remains the
+default; unknown names fail elaboration. Both retain the socket's existing
+byte order, reset/AXI response ownership, translation and peripheral ordering.
+The SoC build metadata must name the profile and pinned CPU revision. First board
+comparison is a 100 MHz diagnostic with detailed counters/ILA, not 200 MHz
+acceptance. Combined correctness, socket checks and integrated timing are gates.
+
 ## Queued late-store completion owners (experiment)
 
 Keep the existing single detached owner as the default. An optional bounded FIFO

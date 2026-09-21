@@ -125,7 +125,7 @@ def check_fullcore(regen):
     return not FAILURES
 
 
-def check_socket(path):
+def check_socket(path, detailed_perf=False):
     if not os.path.exists(path):
         print("SKIP  no socket netlist at %s (expected until Task 13)" % path)
         return True
@@ -184,7 +184,30 @@ def check_socket(path):
         r"^(clk|rst|axi_i_\w+|axi_d_\w+|dbg_axi_\w+|cpu_ipl|ipl_ack|"
         r"cpu_cold_reset_pulse|cpu_cold_reset_hold|cpu_ram_window_lg2|cpu_mon_sense|"
         r"init_done_seen|cpu_peripheral_reset)$")
-    strays = sorted(n for n in ports if not allowed.match(n))
+    if detailed_perf:
+        check("detailed performance trace is output[95]",
+              ports.get("perf_trace") == ("output", 95), repr(ports.get("perf_trace")))
+    # Existing SocketTop group-7 ILA exports; keep an explicit schema rather
+    # than accepting arbitrary dbg040_* additions at the socket boundary.
+    debug_widths = {}
+    for width, names in {
+        1: "normalIrqGate flushing excIdle iplActive branchRedirect p0First "
+           "preciseDrainBusyIn inhibitedLoadBusyIn interruptPending rasPredValid "
+           "btbPredHitComb btbUpdValid ftbRspValid ftbRspHit ftbRspFramedOk "
+           "ftbCmdValid ftqConfirm",
+        4: "ftqHeadBrLen", 6: "ftqCount", 7: "rasCount",
+        32: "headPc rasPredTarget btbPredTargetComb btbUpdPc btbUpdTarget "
+            "ftbRspTarget ftbCmdWindowPc decodePc ftqHeadBrPc ftqHeadTarget "
+            "stallDc stallExc stallGrant stallWalk macroCountLo",
+    }.items():
+        for name in names.split():
+            debug_widths["dbg040_" + name] = ("output", width)
+    debug_changed = sorted(n for n, shape in debug_widths.items() if ports.get(n) != shape)
+    check("group-7 debug exports retain their explicit direction and width",
+          not debug_changed, repr(debug_changed))
+    strays = sorted(n for n in ports if not allowed.match(n)
+                    and n not in debug_widths
+                    and not (detailed_perf and n == "perf_trace"))
     check("D23: the socket top exports ONLY cpu_socket.vh ports", not strays, repr(strays))
     return not FAILURES
 
@@ -194,10 +217,12 @@ def main():
     ap.add_argument("--regen", action="store_true",
                     help="rewrite the golden port list from the current netlist")
     ap.add_argument("--socket", default=os.path.join(REPO, "generated", "M68kSocketTop.v"))
+    ap.add_argument("--detailed-perf", action="store_true",
+                    help="require the optional 95-bit socket performance trace")
     args = ap.parse_args()
     check_fullcore(args.regen)
     if not args.regen:
-        check_socket(args.socket)
+        check_socket(args.socket, args.detailed_perf)
     if FAILURES:
         sys.stderr.write("\n%d check(s) FAILED\n" % len(FAILURES))
         return 1

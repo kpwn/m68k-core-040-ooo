@@ -1298,6 +1298,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Pending IRQ to assert + a one-shot guard so we drive a single edge per event.
       val firedEvents = scala.collection.mutable.Set[Long]()
       val acceptedIrqPcs = scala.collection.mutable.ArrayBuffer.empty[Long]
+      var irqGateSamples = 0
 
       // `secondDst`: this EU's `divRem` records are genuine SECOND architectural
       // destinations (DIVREM -> Dr, MULHI -> Dh) and must still be compared -- see
@@ -1315,6 +1316,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       cd.onSamplings {
+        if(sys.env.contains("IRQ_GATE_TRACE") && firedEvents.nonEmpty &&
+            dut.intCtrl.logic.iplIn.toInt != 0 && irqGateSamples < 256) {
+          irqGateSamples += 1
+          val r = dut.rob.logic
+          val lastMacro = handle.result.lastOption.map(_.pc).getOrElse(0L)
+          println(f"[$name] IRQ_GATE t=${simTime()} pc=${r.interruptPc.toLong}%08x " +
+            s"head=${r.head.toInt} count=${r.count.toInt} first=${r.p0.first.toBoolean} " +
+            s"ipl=${dut.intCtrl.logic.iplIn.toInt} mask=${r.exc.ss.srSys.toInt & 7} " +
+            s"irq=${r.interruptPending.toBoolean} gate=${r.normalIrqGate.toBoolean} " +
+            s"armed=${r.irqPreemptArmed.toBoolean} loadBusy=${r.inhibitedLoadBusyIn.toBoolean} " +
+            s"storeBusy=${r.preciseDrainBusyIn.toBoolean} idle=${r.excIdle.toBoolean} " +
+            s"flush=${r.flushing.toBoolean} retire=${r.retire0.toBoolean}/${r.retire1.toBoolean} " +
+            f"lastMacro=$lastMacro%08x")
+        }
         captureWb(dut.eu0.logic.wbObs)
         captureWb(dut.eu1.logic.wbObs)
         captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true);
@@ -13050,7 +13065,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       assert(j > from, f"[$tag] interrupt entry not found in the oracle trace after 0x$atPc%08x")
       tr(j).a(7)
     }
-    val chosen = onlyBoundaries.map(sel => sel.map(boundaryPcs(_))).getOrElse(boundaryPcs)
+    val selectedBoundaries = onlyBoundaries.orElse(sys.env.get("ODD_SSP_BOUNDARIES")
+      .map(_.split(",").toSeq.map(_.toInt)))
+    val chosen = selectedBoundaries.map(sel => sel.map(boundaryPcs(_))).getOrElse(boundaryPcs)
     for ((pc, i0) <- chosen.zipWithIndex) {
       val i = boundaryPcs.indexOf(pc)
       val withIrq = Musashi.assembleAndTrace(src, initialSr = Some(0x2700), irqEvents = Seq((pc, level))) match {

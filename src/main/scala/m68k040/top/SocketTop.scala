@@ -59,7 +59,8 @@ import spinal.lib.misc.plugin.FiberPlugin
 class M68kSocketTop(p: M68kParams = M68kParams(),
                     dbgBuildId: BigInt = 0,
                     debugStage: Int = 5,
-                    detailedPerf: Boolean = false) extends Component {
+                    detailedPerf: Boolean = false,
+                    ipcThroughput: Boolean = false) extends Component {
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
 
@@ -93,7 +94,11 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val eu0 = new m68k040.execute.AluEuPlugin
     val eu1 = new m68k040.execute.AluEuPlugin
     val branchEu = new m68k040.execute.BranchEuPlugin
-    val lsEu = new m68k040.execute.LsEuPlugin
+    val lsEu = new m68k040.execute.LsEuPlugin(
+      alignedLoadFallThrough = ipcThroughput, earlyIntWakeup = ipcThroughput,
+      sqSubwordForwarding = ipcThroughput, reserveLateStore = ipcThroughput,
+      detachLateStore = ipcThroughput, forwardOnPublish = ipcThroughput,
+      earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin()
     val merge  = new AxiDMergePlugin()
@@ -118,13 +123,15 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
       new m68k040.frontend.RasPlugin(),
-      new m68k040.frontend.GsharePlugin(),
-      new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true),
-      new m68k040.decode.DecodeStage(),
+      new m68k040.frontend.GsharePlugin(retainRedirectHistory = ipcThroughput),
+      new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true,
+        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput),
+      new m68k040.decode.DecodeStage(allowSlot1Prediction = ipcThroughput,
+        fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
       new m68k040.rob.RobPlugin(detailedPerf = detailedPerf),
-      new m68k040.execute.iq.IssueQueuePlugin(),
+      new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
@@ -517,6 +524,14 @@ object SocketTopConfig {
   val OPEN1_GATE_DISPATCH: Boolean = false
 }
 
+object SocketIpcProfile {
+  def enabled(name: String): Boolean = name match {
+    case "baseline" => false
+    case "throughput-v1" => true
+    case other => throw new IllegalArgumentException(s"Unknown CPU_IPC_PROFILE: $other")
+  }
+}
+
 object GenSocketTopVerilog {
   def main(args: Array[String]): Unit = {
     val dbgBuildId: BigInt = sys.env.get("DBG_BUILD_ID") match {
@@ -536,8 +551,12 @@ object GenSocketTopVerilog {
       case "1" => true
       case value => throw new IllegalArgumentException(s"PERF_DETAIL_ENABLE must be 0 or 1, got $value")
     }
+    val ipcProfile = sys.env.getOrElse("CPU_IPC_PROFILE", "baseline")
+    val ipcThroughput = SocketIpcProfile.enabled(ipcProfile)
+    println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf")
     M68kSpinalConfig(targetDirectory = outputDirectory)
-      .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId, detailedPerf = detailedPerf))
+      .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
+        detailedPerf = detailedPerf, ipcThroughput = ipcThroughput))
     println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }

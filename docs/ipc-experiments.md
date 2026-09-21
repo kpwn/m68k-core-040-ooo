@@ -2141,5 +2141,39 @@ in this entry.
   issue; its commit stage still retires in order and only authorizes stores to
   reach memory after commit. Audit our late memory/FPU faults, interrupts,
   debug recovery, 68040 macro boundaries and physical-register lifetimes before
-  adopting analogous guarantees. Any true commit relaxation needs its own
-  architecture amendment and precise-state proof.
+adopting analogous guarantees. Any true commit relaxation needs its own
+architecture amendment and precise-state proof.
+
+## Integrated 100 MHz diagnostic candidate — 2026-09-21
+
+User requested a combined board build rather than more proposal screening.
+`CPU_IPC_PROFILE=throughput-v1` now wires the measured LSU fall-through, early
+integer/NZVC wakeups, early store address, long-MOVE fusion, subword forwarding,
+late-SQ reservation, detached stores, publication forwarding and four-context
+queue into the real socket. Selective slot-1 prediction and retained redirect
+history are enabled together. Retirement remains ordinary two-wide. Defaults
+remain baseline; unknown profile names fail. The SoC records profile and CPU
+revision in build metadata. The 100 MHz diagnostic SoC baseline is `462a4dc`;
+retain its Ethernet, counters, ILA and storage settings for comparison.
+
+Composed profile (including subword forwarding): **56 selected oracle tests
+pass**, `/tmp/ipc-socket-oracle.log`. Socket/reset/debug tests: **73 pass**,
+`/tmp/ipc-socket-reset-tests.log`. Actual detailed socket RTL generation passes,
+`/tmp/ipc-socket-generation.log`. The structural checker now explicitly checks
+the existing group-7 debug port schema and opt-in 95-bit performance trace;
+the frozen full-core port baseline is unchanged. Generated candidate passes
+(`/tmp/ipc-socket-structure.log`). These are not new board performance results
+or integrated timing acceptance.
+
+Mandatory `make SBT=/home/qwertyoruiop/sbt/bin/sbt test-fast` passes **388 tests,
+two ignored, zero failures**, `/tmp/ipc-socket-fast.log` (10:10:47 local).
+
+The separate odd-SSP IRQ boundary-33 issue remains open. Bounded tracing
+(`/tmp/irq-boundary33-gates-1.log`) shows load-busy and precise-drain-busy false
+throughout deferral. ROB head remains non-first while dual retirement advances
+from PCs 408000a2 through 408000ae; recognition occurs at first-uop head
+408000b2. This points toward macro boundaries crossed by retirement lane 1,
+not stale memory-busy state, but does not yet prove a precise-state defect or
+justify widening the oracle's acceptance window. `IRQ_GATE_TRACE` and
+`ODD_SSP_BOUNDARIES` only bound diagnostics; defaults and checks are unchanged.
+This baseline-shared failure is not represented as fixed by the candidate.
