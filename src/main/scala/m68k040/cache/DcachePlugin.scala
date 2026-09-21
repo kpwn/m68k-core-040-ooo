@@ -256,7 +256,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // so each Mem has exactly one sync-read (=> simple-dual-port BRAM).
     val rdSet = UInt(setBits bits)
     val rdEn  = Bool()
-    rdSet := U(0, setBits bits)
+    // Base address is assigned from the registered store descriptor below.
+    // It need not be zero when rdEn is false: all four arrays share that enable.
     rdEn  := False
     rdEn.simPublic()
     rdSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
@@ -1508,21 +1509,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
     // ---- shared read-port arbitration (FMax: keep the live load-accept cone OUT
     // of the high-fanout BRAM read-address net) ----
-    // The store drives the read address as the BASE (off the REGISTERED stS1Payload —
-    // a clean flop->BRAM-address arc). The LOAD FSM below OVERRIDES rdSet/rdEn LAST
-    // (last-assignment wins) on a load-accept / REPLAY, so the load keeps priority.
-    // Crucially the load-vs-store select on the rdSet net is ONLY `loadCmdPort.fire /
-    // REPLAY` (the same cone baseline already had on the dataMem read address) — the
-    // store base adds NO arbiter cone to that fo=high net. The "did the store actually
-    // get the port?" question (loadUsesPort) feeds ONLY the low-fanout stS2Valid
-    // control register, NOT the BRAM address — breaking the post-route critical path
-    // (loadCmdPort.ready -> arbiter -> tag/dataMem read-address).
-    // A load-miss decision may speculatively repoint the read port at this S1
-    // descriptor; only the S1->S2 valid capture is held below. Keeping the raw
-    // address drive independent of combinational load hit/miss avoids a
-    // tag-BRAM-result -> next BRAM-address timing cone.
+    // The store supplies the unconditional BASE address from registered stS1Payload.
+    // Eligibility/hazards gate rdEn, not this high-fanout BRAM address. Later
+    // probe/load/shadow/replay/maintenance owners override BOTH address and enable,
+    // preserving their existing priority. If nobody overrides, an enabled read
+    // still requires exactly the old store predicate and uses exactly stS1Set.
+    // Only disabled-port addresses differ; no consumer uses them without rdEn.
+    rdSet := stS1Set
     when(stS1Valid && !storeMissBarrier && !loadMissStoreBarrier) {
-      rdSet := stS1Set
       rdEn  := True
     }
 
@@ -3279,6 +3273,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
           "maintenance walk owned the shared array read port -- loadPortReserved is " +
           "not a superset of fsm.loadUsesPort",
         FAILURE)
+      // Address-only cleanup: absent an overriding owner, the read enable is
+      // still the original store eligibility predicate and enabled addresses
+      // still identify that store. These checks add no synthesized logic.
+      when(!fsm.loadUsesPort && !maintUsesPort) {
+        assert(rdEn === (stS1Valid && !storeMissBarrier && !loadMissStoreBarrier),
+          "DcachePlugin: store-base cleanup changed shared read eligibility", FAILURE)
+        when(rdEn) {
+          assert(rdSet === stS1Set,
+            "DcachePlugin: enabled store-base read used a different set", FAILURE)
+        }
+      }
     }
 
     when(stS1Advance) { storeReadOwed := False }
