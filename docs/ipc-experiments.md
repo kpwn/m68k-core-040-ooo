@@ -658,6 +658,15 @@ across both seeds and all four load-latency option combinations
 core generator. The option remains off in production; routed timing, integrated
 SoC timing and board IPC are not established.
 
+The incremental selective/retained core timing comparison is pinned to
+`4c012cdcc691042ff0b44448dc1ec4c477064fb4`, unit
+`m68k-retained-history-4c012cdc.service`, artifacts
+`/tmp/retained-history-gate.EaS8V5`. It waits for the full slot-1 matrix, then
+routes both arms serially under the shared Vivado mutex at 5 ns with three
+post-route rounds. Both arms enable selective taken deferral; only the second
+enables history preservation. The existing `build-logs:0` pane follows this
+queue and its predecessors; the running Codex pane is untouched.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style
