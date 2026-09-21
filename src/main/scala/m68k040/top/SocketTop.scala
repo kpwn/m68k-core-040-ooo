@@ -60,7 +60,9 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
                     dbgBuildId: BigInt = 0,
                     debugStage: Int = 5,
                     detailedPerf: Boolean = false,
-                    ipcThroughput: Boolean = false) extends Component {
+                    ipcThroughput: Boolean = false,
+                    ipcLateStore: Boolean = false) extends Component {
+  require(!ipcLateStore || ipcThroughput, "late-store socket profile requires throughput options")
   setDefinitionName("M68kSocketTop")
   noIoPrefix()
 
@@ -98,7 +100,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       alignedLoadFallThrough = ipcThroughput, earlyIntWakeup = ipcThroughput,
       sqSubwordForwarding = ipcThroughput, reserveLateStore = ipcThroughput,
       detachLateStore = ipcThroughput, forwardOnPublish = ipcThroughput,
-      earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1)
+      earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1,
+      earlyAutoStoreAddress = ipcLateStore, earlyStoreDataWake = ipcLateStore)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin()
     val merge  = new AxiDMergePlugin()
@@ -131,7 +134,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
       new m68k040.rob.RobPlugin(detailedPerf = detailedPerf),
-      new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput),
+      new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
+        earlyAutoStoreAddress = ipcLateStore),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
@@ -527,8 +531,12 @@ object SocketTopConfig {
 object SocketIpcProfile {
   def enabled(name: String): Boolean = name match {
     case "baseline" => false
-    case "throughput-v1" => true
+    case "throughput-v1" | "throughput-v2" => true
     case other => throw new IllegalArgumentException(s"Unknown CPU_IPC_PROFILE: $other")
+  }
+  def lateStore(name: String): Boolean = {
+    enabled(name) // Validate even when queried independently.
+    name == "throughput-v2"
   }
 }
 
@@ -556,7 +564,8 @@ object GenSocketTopVerilog {
     println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
-        detailedPerf = detailedPerf, ipcThroughput = ipcThroughput))
+        detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
+        ipcLateStore = SocketIpcProfile.lateStore(ipcProfile)))
     println(s"Generated $outputDirectory/M68kSocketTop.v")
   }
 }

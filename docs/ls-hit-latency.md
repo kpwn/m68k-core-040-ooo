@@ -13,6 +13,15 @@ The SoC build metadata must name the profile and pinned CPU revision. First boar
 comparison is a 100 MHz diagnostic with detailed counters/ILA, not 200 MHz
 acceptance. Combined correctness, socket checks and integrated timing are gates.
 
+`CPU_IPC_PROFILE=throughput-v2` adds the validated postincrement late-store
+reservation and wake-qualified data capture experiments to v1. Both IQ and LSU
+enable the matching postincrement contract; only LSU opts into earlier data
+qualification. V1 remains unchanged for repeatable comparisons. The v2 SoC
+candidate targets 200 MHz directly at the user's request, with the same Ethernet,
+debug and performance features; selecting the profile does not imply timing
+closure. The current CPU revision also contains the precise IRQ macro-boundary
+fix. No new external socket signals or architectural ordering changes.
+
 ## Queued late-store completion owners (experiment)
 
 Keep the existing single detached owner as the default. An optional bounded FIFO
