@@ -233,6 +233,24 @@ class FpuControlWiringSpec extends AnyFunSuite {
       s"an ENABLED OPERR must vector to $VecOperr; saw ${r.sawVector}")
   }
 
+  test("integer narrowing range boundaries route OPERR only when enabled", VerilatorTest) {
+    for ((fmt, limit) <- Seq(("b", 128), ("w", 32768))) {
+      def store(value: Int): Seq[String] = Seq("movea.l #0x3000,%a0",
+        s"fmove.l #$value,%fp0", s"fmove.$fmt %fp0,(%a0)")
+      val enabled = run(prog(setFpcr(ExcOperr) ++ store(limit)),
+        name = s"narrow-$fmt-operr-enabled")
+      assert(enabled.sawVector == VecOperr, s".$fmt positive limit must trap: $enabled")
+      assert((enabled.fpsr.toInt & ExcOperr) != 0)
+      val disabled = run(prog(store(limit)), name = s"narrow-$fmt-operr-disabled")
+      assert(disabled.sawVector < 0, s".$fmt disabled OPERR must not trap: $disabled")
+      assert((disabled.fpsr.toInt & (ExcOperr | AexcIop)) == (ExcOperr | AexcIop))
+      val negativeLimit = run(prog(setFpcr(ExcOperr) ++ store(-limit)),
+        name = s"narrow-$fmt-negative-limit")
+      assert(negativeLimit.sawVector < 0, s".$fmt negative limit must fit: $negativeLimit")
+      assert((negativeLimit.fpsr.toInt & (ExcOperr | AexcIop)) == 0)
+    }
+  }
+
   test("0.0/0.0 with traps disabled accrues OPERR into AEXC.IOP and does not vector",
        VerilatorTest) {
     val r = run(prog(Seq("fmove.l #0,%fp0", "fdiv.x %fp0,%fp0")), name = "operr-disabled")

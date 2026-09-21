@@ -192,6 +192,54 @@ class FpNarrowPackSpec extends AnyFunSuite {
     }
   }
 
+  test("FpNarrowPack: integer range boundaries preserve words flags and one-cycle latency", VerilatorTest) {
+    dut.doSim("integer-range-boundaries", 0x68040200) { d =>
+      d.clockDomain.forkStimulus(10); d.clockDomain.waitSampling(3)
+      // Exact dyadic inputs n/4; independent integer arithmetic computes rounding,
+      // saturation and narrow-range flags rather than using FpRefModel here.
+      def quarterExt(n: BigInt, sign: Int): BigInt = {
+        if (n == 0) BigInt(sign) << 79
+        else ext(0x3FFF + n.bitLength - 3, n << (64 - n.bitLength), sign)
+      }
+      val centers = Seq(BigInt(0), BigInt(128), BigInt(32768),
+        BigInt(1) << 31, BigInt(1) << 32, BigInt(1) << 33)
+      val quarters = centers.flatMap(c => (-8 to 8).map(i => c * 4 + i))
+        .filter(_ >= 0).distinct
+      var digest = 0xcbf29ce484222325L
+      var vectors = 0
+      for (q <- quarters; sign <- 0 to 1; rm <- 0 to 3;
+           fmt <- Seq(FmtL, FmtW, FmtB); chunk <- 0 to 2) {
+        val whole = q / 4; val fraction = (q % 4).toInt
+        val increment = rm match {
+          case 0 => fraction > 2 || (fraction == 2 && whole.testBit(0))
+          case 1 => false
+          case 2 => sign == 1 && fraction != 0
+          case 3 => sign == 0 && fraction != 0
+        }
+        val magnitude = whole + (if (increment) 1 else 0)
+        val signed = if (sign == 1) -magnitude else magnitude
+        val min32 = -(BigInt(1) << 31); val max32 = (BigInt(1) << 31) - 1
+        val overflow = signed < min32 || signed > max32
+        val saturated = signed.max(min32).min(max32)
+        val narrow = (fmt == FmtW && (saturated < -32768 || saturated > 32767)) ||
+          (fmt == FmtB && (saturated < -128 || saturated > 127))
+        val expected = Got(saturated & ((BigInt(1) << 32) - 1), false,
+          chunk == 0 && (overflow || narrow), false, false,
+          chunk == 0 && !overflow && fraction != 0)
+        val got = run(d, quarterExt(q, sign), fmt, chunk, rm)
+        assert(got == expected,
+          s"quarter=$q sign=$sign rm=$rm fmt=$fmt chunk=$chunk got=$got expected=$expected")
+        assert(!d.io.exc.dz.toBoolean)
+        val flags = (if (got.operr) 1L else 0L) | (if (got.inex) 2L else 0L)
+        digest = (digest ^ got.word.toLong) * 0x100000001b3L
+        digest = (digest ^ flags) * 0x100000001b3L
+        vectors += 1
+      }
+      println(s"FP_NARROW_RANGE_TRACE vectors=$vectors latency=${FpNarrowPack.Latency} " +
+        s"digest=${java.lang.Long.toUnsignedString(digest, 16)}")
+    }
+  }
+
   test("FpNarrowPack: randomised sweep against the SoftFloat reference", VerilatorTest) {
     dut.doSim("sweep") { d =>
       d.clockDomain.forkStimulus(10); d.clockDomain.waitSampling(3)
