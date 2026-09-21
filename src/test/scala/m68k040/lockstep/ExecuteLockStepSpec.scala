@@ -1323,6 +1323,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val lastMacro = handle.result.lastOption.map(_.pc).getOrElse(0L)
           println(f"[$name] IRQ_GATE t=${simTime()} pc=${r.interruptPc.toLong}%08x " +
             s"head=${r.head.toInt} count=${r.count.toInt} first=${r.p0.first.toBoolean} " +
+            f"p0=${r.p0.pc.toLong}%08x/${r.p0.last.toBoolean} " +
+            f"p1=${r.p1.pc.toLong}%08x/${r.p1.first.toBoolean}/${r.p1.last.toBoolean} " +
             s"ipl=${dut.intCtrl.logic.iplIn.toInt} mask=${r.exc.ss.srSys.toInt & 7} " +
             s"irq=${r.interruptPending.toBoolean} gate=${r.normalIrqGate.toBoolean} " +
             s"armed=${r.irqPreemptArmed.toBoolean} loadBusy=${r.inhibitedLoadBusyIn.toBoolean} " +

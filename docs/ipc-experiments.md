@@ -2198,3 +2198,57 @@ Additional composed-profile IPC matrix is running serially after the fast gate:
 history/selective prediction, all LSU options and four contexts. Compare by
 kernel/seed/fall-through/early-wakeup against `/tmp/ls-turnover-corpus-4.log`;
 do not mistake different knob combinations for matched results.
+
+### Composed-profile simulation and fresh board baseline
+
+The additional simulation matrix completes successfully. Against the recorded
+four-context LSU corpus, the composed subword/predictor configuration has **8
+improvements, 128 identical cases, zero regressions**, matched by kernel, seed,
+fall-through and early-integer-wakeup mode. All eight changed cases are the hot
+loop: **326→317 cycles (+2.84% IPC)**, for both seeds in all four mode combinations.
+This measures the composition, not an isolated attribution to either added knob.
+The socket uses the both-enabled mode. No broad board speedup is inferred.
+
+At 10:15 local a nonintrusive pre-load sample on live build `462a4dc1` measured
+0.104879/0.104965/0.104838 IPC. The user subsequently confirmed Dhrystone was
+**not running**; those samples must not be used as its baseline. The matching
+1024-cycle ILA captured 90 macros and predominantly PCs around 0007bbxx.
+Raw results remain in `/tmp/jtag_out`, from `BEFORE_CANDIDATE build=` through
+the exact `IPC_BEFORE_CANDIDATE_DONE_20260921` line; capture is
+`/tmp/ipc-before-candidate-20260921.csv`. The first shell collector accidentally
+matched the echoed Tcl source's sentinel string; it did not interrupt the Tcl
+experiment. Matching the full sentinel line fixes collection. No reset/halt.
+
+The user restarted and confirmed Dhrystone at 10:19. Fresh live-build-verified
+one-second windows, `/tmp/ipc-dhrystone-before-candidate-20260921.log`:
+
+| Window | Counted cycles | Retired macros | IPC | Head load | Head store | IQ blocked |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 100,218,040 | 23,063,857 | 0.230137 | 17.418% | 27.889% | 56.907% |
+| 1 | 100,198,686 | 23,205,408 | 0.231594 | 16.716% | 29.422% | 57.260% |
+| 2 | 100,253,311 | 23,995,178 | 0.239345 | 16.424% | 29.940% | 59.086% |
+
+ROB-full count is zero in all three windows. Saved ILA:
+`/tmp/ipc-dhrystone-before-candidate-20260921.csv`, 1024 consecutive cycles,
+200 retired macros (0.195312 IPC in this short sample), 334 head-store cycles,
+161 head-load cycles, 660 IQ-blocked cycles, zero ROB-full cycles. Frequent PCs
+03be19c2/19c6/19ca/19cc repeat 27 times each. The ILA window is not the one-second
+counter denominator and must not be concatenated with it. JTAG lease released;
+the board remains running. The user has authorized the later candidate load.
+
+The boundary-33 lane trace now confirms the deferral mechanism:
+`/tmp/irq-boundary33-lanes.log`. With IPL1 unmasked and no device/drain busy,
+lane 0 retires a last/non-first uop while lane 1 retires the first uop of the next
+macro, repeatedly at 408000a2→a6→aa→ae. Recognition waits until a first uop
+finally becomes head at 408000b2. This is evidence of a skipped recognition
+opportunity, not evidence of stale A7 data. No production fix is included in
+the pinned board candidate. Investigate a cold-path macro-boundary retirement
+barrier for active unmasked IRQ/NMI, including wider/prepared retirement;
+preserve existing fault priority and precise-memory draining.
+
+The lane-trace-only test change passes the mandatory fast gate: **388 tests,
+two ignored, zero failures**, `/tmp/ipc-post-board-preflight-fast.log`, completed
+10:22:15 local. It does not change the pinned CPU/SoC build. The IRQ reproducer
+still fails its original exact comparison; its failure has not been waived or
+converted to a pass. The next safe investigation is a directed boundary barrier
+prototype, separately gated and IPC-compared before any integration decision.
