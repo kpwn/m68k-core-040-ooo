@@ -1241,6 +1241,17 @@ ignored, no failures/aborted suites (`/tmp/sq-publish-fast.log`). Routed timing
 remains pending. Retain the candidate if timing needs repair rather than
 discarding the measured latency gain.
 
+Implementation: `3f53a39be5e5e3b9440c33bebc09c3bc6f945ab1`. Unit
+`m68k-sq-publish-3f53a39b.service` queues two pinned core routing arms behind the
+detached-owner pair, under the shared mutex at 5 ns with three post-route rounds.
+Both arms include the generation-safe SQ winner fix and all measured detached
+owner prerequisites; only the candidate enables `--forward-on-publish`. The
+preceding pinned detached run supplies the pre-fix timing/area reference for the
+corrected baseline. Earlier pinned runs remain useful measurements, but final
+integration must include this correctness fix. Artifacts:
+`/tmp/sq-publish-gate.GHXuam`; existing `build-logs:0` follows both arms and the
+prior queue. No board intervention or board IPC measurement was performed.
+
 Next simple latency question: when an owner is reserved, it currently discards
 the source-readiness qualification being observed for that very P3 store. If the
 source becomes ready during address resolution, the new owner may wait an extra
