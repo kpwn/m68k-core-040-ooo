@@ -446,12 +446,14 @@ object Microcode {
     val SzCtx, SzLong, SzWord, SzByte, SzHost = newElement()
   }
 
-  /** Hardware mirror of `Desc` (one ROM row). Every `Desc` field appears here,
-    * same name, hardware-typed: `SpinalEnum`s above for `UOp`/`Mem`/`Auto`/`Sel`/
+  /** Hardware encoding of `Desc` (one ROM row). Fields are hardware-typed:
+    * `SpinalEnum`s above for `UOp`/`Mem`/`Auto`/`Sel`/
     * `Sz`, `Bool()` for each `Boolean` field, `UInt` sized to the field's actual
     * used range for the one `Int` field (`bfStoreForm`). Plus the 4 `UCasOp`
     * payload fields described on `UOpHw` above (not a `Desc` field itself — `Desc`
     * only has `uop: UOp`, and `UCasOp`'s payload rides inside that one Scala value).
+    * `effectiveImm` replaces the raw `Desc.imm` selector at the same width:
+    * host-op -> SMiImm, other enabled immediate -> original selector, else SNone.
     *
     * Width note (`bfStoreForm`, `casForm`): both sized `UInt(3 bits)`, verified
     * against real call-site usage, not guessed:
@@ -475,7 +477,7 @@ object Microcode {
     val srcC = SelHw()    // 3rd operand: BFINS insert source (Dn2) for the RES/LO4 compute
     val dst  = SelHw()
     val useImm = Bool()
-    val imm    = SelHw()  // when useImm, the imm comes from this selector
+    val effectiveImm = SelHw() // already includes host-op override and disabled-zero selection
     val sz     = SzHw()   // explicit µop size (SzCtx = ctx.size, the BCD default)
     val writesFlags = Bool()  // reads X+old-Z, writes NZVCX (the op µop)
     val nzvcOnly    = Bool()  // writes NZVC only (X UNTOUCHED, no NZVC/X read) — CMPM
@@ -508,7 +510,8 @@ object Microcode {
     val casDropCommit = Bool()
   }
 
-  /** Compile-time `Desc` -> hardware-literal `DescBits`, a direct 1:1 field mapping.
+  /** Compile-time `Desc` -> hardware-literal `DescBits`. Most fields map 1:1;
+    * effectiveImm folds the row-constant host-op/useImm choices into its selector.
     * Runs at Scala elaboration time (called once per ROM row when building the
     * `Mem`'s initial content in Task A2) — every field is assigned a literal
     * (constant) hardware value, so the result is safe to use as `Mem` initial
@@ -638,7 +641,9 @@ object Microcode {
     b.srcB := sel(d.srcB)
     b.srcC := sel(d.srcC)
     b.dst  := sel(d.dst)
-    b.imm  := sel(d.imm)
+    // These choices depend only on the ROM row, not on the live context. Encode
+    // them once here instead of placing two wide muxes after the BRAM read.
+    b.effectiveImm := sel(if (d.uop == UMiHostOp) SMiImm else if (d.useImm) d.imm else SNone)
 
     b.sz := (d.sz match {
       case SzCtx  => SzHw.SzCtx
@@ -3415,17 +3420,17 @@ object Microcode {
       u.dstReg  := dstReg;  u.dstValid  := dstV
     }
     // ── useImm / imm / srcBValid / flags — assigned ONCE per row (runtime `when` on d.uop) ──
-    // The `useImm ? selImm(d.imm) : 0` value is IDENTICAL in the three non-UMiHostOp arms
-    // below, so it is hoisted here (one shared selector mux instead of three) — a pure
-    // common-subexpression hoist, no behavior change.
-    val immVal = Mux(d.useImm, selImmHw(d.imm, ctx), B(0, 32 bits))
+    // descToBits has already folded the host-op override and disabled-immediate
+    // zero selection into this same-width ROM field. useImm below still has its
+    // original meaning; a host op's immediate value is ctx.miHostImm even when
+    // ctx.miOtherIsImm is false. No context-dependent decision is precomputed.
+    u.imm := selImmHw(d.effectiveImm, ctx)
     when(d.uop === UOpHw.UMiHostOp) {
       // The host ALU/MOVE/unary op. srcB is the ROM-selected register (ST1 for MOVE-src's
       // moved value; SMiOther for an ALU other-Dn) UNLESS the other operand is an immediate
       // (line-0 imm op -> useImm, srcB not read). A unary single-EA op (CLR/NEG/NOT/TST) has
       // no other operand (miOtherValid False -> the SMiOther srcB is not read). Flags from ctx.
       u.useImm     := ctx.miOtherIsImm
-      u.imm        := ctx.miHostImm
       u.srcBValid  := Mux(ctx.miOtherIsImm, False, srcBV)
       u.readsNzvc  := ctx.miRNzvc
       u.readsX     := ctx.miRX
@@ -3441,7 +3446,6 @@ object Microcode {
       // rows). An intermediate host-load to T1 (ALU-src/RMW) writes NO flags (the host op
       // µop owns them) -> miMoveFlags False on those rows.
       u.useImm     := d.useImm
-      u.imm        := immVal
       u.srcBValid  := srcBV
       u.readsNzvc  := False
       u.readsX     := False
@@ -3456,7 +3460,6 @@ object Microcode {
       // always-present sibling fields on DescBits, valid only in this arm; the original's
       // `d.uop.asInstanceOf[UCasOp]` has no hardware equivalent and needs none.)
       u.useImm     := d.useImm
-      u.imm        := immVal
       u.srcBValid  := srcBV
       u.readsNzvc  := d.casReadsNzvc
       u.readsX     := False
@@ -3468,7 +3471,6 @@ object Microcode {
       // (nzvcOnly) writes NZVC only (no NZVC/X read, X UNTOUCHED — like a register CMP).
       // Other rows: no flags.
       u.useImm     := d.useImm
-      u.imm        := immVal
       u.srcBValid  := srcBV
       u.readsNzvc  := d.writesFlags || (d.uop === UOpHw.UMiScc)
       u.readsX     := d.writesFlags

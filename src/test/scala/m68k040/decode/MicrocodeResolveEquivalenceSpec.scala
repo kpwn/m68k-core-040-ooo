@@ -18,9 +18,10 @@ import scala.util.Random
   * `DecodeStage.logic.ucRomMem` and hand it to the RUNTIME-hardware `Microcode
   * .resolveFromBits(DescBits, ctx, valid)` (Task A3).
   *
-  * `resolveFromBits` is a pure type-level transcription of `resolve` (Scala `match` ->
+  * `resolveFromBits` started as a type-level transcription of `resolve` (Scala `match` ->
   * `switch`, `if/else` -> `when/elsewhen`, value-`if` -> `Mux`, case-object `==` -> enum
-  * `===`). Nothing enforces that transcription's fidelity except this test, so this test IS
+  * `===`). Row-constant choices may now be folded by `descToBits` (effective immediate
+  * selection), but the software resolver remains unchanged. This test protects fidelity:
   * the gate: for EVERY row of `Microcode.rom`, both functions are elaborated against a SHARED
   * `Ctx` input port and their `DecodedUop.asBits` compared, over a directed + randomized
   * sweep of `Ctx`.
