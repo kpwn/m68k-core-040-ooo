@@ -103,10 +103,14 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"),
         fuseLongMoveLoads = sys.env.get("IPC_FUSE_LONG_MOVE_LOADS").contains("1"),
         reserveLateStore = sys.env.get("IPC_RESERVE_LATE_STORE").contains("1"),
-        detachLateStore = sys.env.get("IPC_DETACH_LATE_STORE").contains("1")))
+        detachLateStore = sys.env.get("IPC_DETACH_LATE_STORE").contains("1"),
+        forwardOnPublish = sys.env.get("IPC_FORWARD_ON_PUBLISH").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
+        if(sys.env.get("IPC_FORWARD_ON_PUBLISH").contains("1") &&
+          sys.env.get("IPC_DETACH_LATE_STORE").contains("1") && k.name.startsWith("short-store-"))
+          assert(r.publicationForwards > 0, "recurrence did not use publication-edge forwarding")
         if(k.name.startsWith("delayed-store-") && sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"))
           assert(r.lateStoreCaptures == 32, "all 32 delayed stores must use late capture")
         if(sys.env.get("IPC_RESERVE_LATE_STORE").contains("1") &&
@@ -128,7 +132,7 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures} " +
           s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds} " +
-          s"detachedLoadOvertakes=${r.detachedLoadOvertakes}")
+          s"detachedLoadOvertakes=${r.detachedLoadOvertakes} publicationForwards=${r.publicationForwards}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +

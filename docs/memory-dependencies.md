@@ -76,6 +76,47 @@ NaxRiscv's speculative memory-order rollback policy.
 
 ## Required ownership and lifetime
 
+### SQ winner selection across retired ROB generations
+
+SQ allocation remains in program order, and its ring preserves allocation order
+until final drain acknowledgement. Among eligible overlapping entries, choose
+the youngest by **SQ allocation position**, not by wrapping distance from the
+load's ROB index. A committed-but-undrained entry can survive one or more ROB
+generations; its old numerical ID must never override a younger overwrite or
+younger unfilled reservation. Live-query eligibility still treats committed
+entries as older unconditionally and compares live uncommitted entries in the
+current head-anchored ROB window.
+
+The ring's modular `(slot - SQ head)` rank is sufficient: its ordering among
+surviving entries does not change when the oldest entry drains, and only valid
+entries participate. This uses the existing FIFO pointers, not another age table
+or counter. A future out-of-order SQ allocation policy must replace this rule
+explicitly; the current oldest-LS-address issue and reservation paths retain it.
+
+### Forward on the actual SQ publication edge
+
+Default-off `forwardOnPublish` requires late-store SQ reservation. An existing
+reserved entry may satisfy a forwarding query on the same edge its data is
+actually published, without waiting for its registered data-ready bit. This is
+not an advance readiness promise: publication valid, slot and ROB identity must
+match a live, unfilled entry, with flush absent. Its address and attributes were
+already translated and captured at reservation. Drain/retirement still require
+the registered filled state; no architectural visibility is advanced.
+
+Keep the existing youngest-overlapping-store selection, including partial and
+split overlaps. Publication only qualifies that entry's data availability; it
+must not override a younger covering/partial/unfilled store or an inhibited
+serialization boundary. Select the common publication data after the existing
+winner tree, then use the normal big-endian extraction. P4 can register the new
+verdict/data on the fill edge and complete the load on its following edge. The
+shared completion port may still delay either instruction independently.
+
+Required evidence: same-edge hit/data before the SQ clock edge; youngest-match,
+subword, split-page, inhibited, simultaneous allocation and flush behavior; and
+observed full-core use with matched IPC. The new PRF-to-forward-data path must
+undergo its own routed timing comparison and repair if necessary. No duplicate
+store data array, prediction or additional PRF read port is introduced.
+
 ### Known-address bypass without a duplicate address table
 
 Default-off `detachLateStore` builds on `earlyStoreAddress` and `reserveLateStore`.

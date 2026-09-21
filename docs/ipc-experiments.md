@@ -1149,7 +1149,7 @@ address and late-store SQ reservation; only the candidate adds
 `build-logs:0` pane follows both arms' elaboration and implementation logs, along
 with its previous queue. No board reset, halt, reload or measurement was performed.
 
-Next dependency-latency experiment: let a waiting P4 overlap query use **actual
+Follow-on dependency-latency experiment (implemented below): let a waiting P4 overlap query use **actual
 same-edge SQ publication** rather than waiting for `dataReady` to register and
 then re-querying. Preserve youngest-overlap priority and byte masks; do not let
 a younger partial match expose older data, or bypass device/flush rules. This
@@ -1157,6 +1157,97 @@ would be publication-edge forwarding, not an advance wake guarantee. Its likely
 timing risk is PRF data → SQ selection → P4; investigate registered address-match
 preselection if necessary without restoring the cycle it tries to remove. Keep
 the single-owner capacity limitation and broader retry work visible.
+
+## Publication-edge forwarding and SQ generation-safe winner selection — 2026-09-21
+
+Default-off `forwardOnPublish` requires SQ reservation. A matching live unfilled
+entry can satisfy the forwarding query on its **actual** publication edge, so a
+waiting P4 load registers the new verdict/data without an extra data-ready/re-query
+cycle. The common publication-data mux is placed after the existing winner tree,
+then uses normal big-endian extraction; there is no new storage or PRF port.
+Publication identity, residency and flush qualify availability. Youngest overlap,
+partial/split hazards and inhibited serialization remain mandatory. This is not
+an advance wake promise; completion still arbitrates normally.
+
+This review found a separate pre-existing correctness defect in winner selection.
+`ent` correctly recognized committed entries as older than any live load, but the
+winner tree then ranked those entries by wrapping `query.robId - store.robId`.
+An old committed-but-undrained store could survive ROB reuse and appear closer to
+the query than a genuinely younger overwrite. Two directed reproducers fail with
+the old selection (`/tmp/sq-committed-reuse-repro.log`): the ordinary path forwards
+old data over a newer ready store, and reservation mode forwards old data through
+a newer **unfilled** store. The ordinary reproducer has all optional features off;
+this is not caused by publication forwarding. There is no evidence attributing
+any previous board crash to this defect.
+
+The fix ranks eligible matches by existing SQ allocation position `(slot-head)`,
+selecting the greatest rank. Allocation and drain are FIFO ordered, so this stays
+correct across ROB generations and physical SQ wrap, without extra age state.
+The rank shrinks from five bits to three for the eight-entry queue. Live-load age
+eligibility is unchanged. The spec explicitly retains ordered SQ allocation;
+future out-of-order allocation would need a different age rule.
+
+All **42 SQ/split tests pass** (`/tmp/sq-publish-regression.log`). New coverage
+includes both formerly failing stale-generation cases, 64 seeded sequences that
+exercise every physical SQ head position, full/partial/unfilled younger matches,
+and 256 random byte/word/long publication checks in each enabled/disabled arm.
+The latter checks before the actual clock edge, verifies big-endian data, crosses
+ROB index zero, and tests inhibited queries. Additional cases cover younger
+ready/partial/unfilled overrides, independently translated split overlap and
+same-edge flush cancellation. The original three publication tests also pass
+before the rank fix (`/tmp/sq-publish-directed.log`).
+
+The first 136-case publication comparison, before the independent rank repair,
+has **24 improvements, 112 identical results, no regressions** versus detached
+ownership: `/tmp/sq-publish-candidate-ipc.log` versus
+`/tmp/sq-detach-candidate-ipc.log`. The repaired baseline now passes all 136 cases
+and exactly reproduces the previous detached-owner macros/cycles
+(`/tmp/sq-publish-baseline-ipc.log`): the correctness fix has zero measured IPC
+effect in this corpus. The final repaired candidate also passes and reproduces
+all 136 pre-repair candidate macro/cycle counts exactly
+(`/tmp/sq-publish-candidate-ipc-v2.log`). Thus the final matched comparison still
+has **24 improvements, 112 unchanged, no new regressions**. The earlier fusion
+regressions against the original baseline remain in the cumulative assessment.
+The expanded combined-option oracle run passes **65 tests**
+(`/tmp/sq-publish-oracle.log`), including a CPU slow-write test for misleading
+committed ROB generations. That test varies 0–31 NOPs between two same-address
+WT stores with 1000-cycle memory response latency, observes a live query where
+the old rank would select the wrong generation, and checks all architectural
+registers/flags against Musashi. Other cases cover physical aliases, split pages,
+full SQ, source handoff, retained nonzero flags across completion contention,
+redirect cancellation, device ordering, IRQ/NMI, precise-drain races and page
+faults/retry. The same 32-program generation test also passes with **all optional
+features off**, again observing a misleading old rank
+(`/tmp/sq-generation-default-oracle.log`). All six subword-composition oracle
+controls also pass (`/tmp/sq-publish-subword-oracle.log`), retaining the three
+observed completion-contention/recovery events with NZVC=8.
+
+Final incremental results with both older load optimizations:
+
+| Kernel | Macros | Detached cycles (seed 1 / 17) | Publication cycles | IPC gain |
+| --- | ---: | ---: | ---: | ---: |
+| divide → store → load recurrence | 98 | 2399 / 2399 | 2367 / 2367 | +1.352% |
+| rotate → store → load recurrence | 130 | 333 / 333 | 304 / 304 | +9.539% |
+| load → store recurrence | 130 | 343 / 342 | 286 / 285 | +19.930% / +20.000% |
+
+Those runs observe 32, 31 and 61 actual publication-edge forwarding hits,
+respectively. The disjoint-load and non-store kernels are unchanged. These are
+matched synthetic first-to-last macro windows (`l2:5:70`, seeds 1/17, four older
+load-option combinations), not a board claim. Use `IPC_FORWARD_ON_PUBLISH=1`,
+`LOCKSTEP_FORWARD_ON_PUBLISH=1`, or `--forward-on-publish` alongside reservation;
+the measured combination also enables detached ownership, direct long MOVE
+fusion and early store address. The required fast gate passes **384 tests**, two
+ignored, no failures/aborted suites (`/tmp/sq-publish-fast.log`). Routed timing
+remains pending. Retain the candidate if timing needs repair rather than
+discarding the measured latency gain.
+
+Next simple latency question: when an owner is reserved, it currently discards
+the source-readiness qualification being observed for that very P3 store. If the
+source becomes ready during address resolution, the new owner may wait an extra
+cycle merely to restart the same registered qualification. Test safe transfer of
+that decision on admission, using the same source tag and existing register,
+without adding speculative readiness or another PRF port. Also quantify how often
+one pending owner blocks another ready address before expanding owner capacity.
 
 ## Next investigations requested — 2026-09-21
 

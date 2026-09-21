@@ -9,6 +9,168 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class StoreQueueSpec extends AnyFunSuite {
 
+  for(unfilled <- Seq(false, true)) test(s"youngest SQ match survives committed ROB-index reuse unfilled=$unfilled", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = unfilled)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      alloc(dut, cd, 2, 0x100, 0x11111111L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      commit(dut, cd, 2)
+      // The committed store can outlive an entire ROB generation while its drain
+      // is backpressured. A later live store at index 1 is younger than it even
+      // though query-index distance ranks the old index 2 as "closer" to index 3.
+      dut.io.robHeadIn #= 1; dut.io.robHeadValidIn #= true
+      if(unfilled) dut.io.reserveOnly #= true
+      alloc(dut, cd, 1, 0x100, 0x22222222L, Size.LONG,
+        cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      if(unfilled) dut.io.reserveOnly #= false
+      setQuery(dut, 3, 0x100, Size.LONG); sleep(1)
+      if(unfilled) assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean,
+        "old committed data escaped through a younger unfilled overwrite")
+      else assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0x22222222L,
+        "forwarding selected an old committed ROB-index generation")
+    }
+  }
+
+  test("SQ allocation rank survives all physical head positions and stale committed generations", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = true,
+      forwardOnPublish = true)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      val random = new scala.util.Random(0x53514147L)
+      val heads = scala.collection.mutable.Set.empty[Int]
+      for(round <- 0 until 64) {
+        heads += dut.head.toInt
+        val robHead = random.nextInt(32)
+        val query = (robHead + 10) & 31
+        for((id, data) <- Seq(query -> 0x11111111L, ((query - 1) & 31) -> 0x33333333L)) {
+          alloc(dut, cd, id, 0x100, data, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+          commit(dut, cd, id)
+        }
+        dut.io.robHeadIn #= robHead; dut.io.robHeadValidIn #= true
+        val liveId = (robHead + 1) & 31
+        val partial = round % 3 == 0
+        val unfilled = round % 2 == 0
+        val data = random.nextLong() & 0xffffffffL
+        sleep(1)
+        val slot = dut.io.allocSlot.toInt
+        dut.io.reserveOnly #= unfilled
+        alloc(dut, cd, liveId, if(partial) 0x101 else 0x100, data,
+          if(partial) Size.BYTE else Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+        dut.io.reserveOnly #= false
+        setQuery(dut, query, 0x100, Size.LONG); sleep(1)
+        assert(dut.io.fwd.rsp.hit.toBoolean == (!partial && !unfilled))
+        assert(dut.io.fwd.rsp.stall.toBoolean == (partial || unfilled))
+        if(!partial && !unfilled) assert(dut.io.fwd.rsp.data.toLong == data)
+        if(unfilled) {
+          dut.io.publish.valid #= true
+          dut.io.publish.slot #= slot; dut.io.publish.robId #= liveId; dut.io.publish.data #= data
+          sleep(1)
+          assert(dut.io.fwd.rsp.hit.toBoolean == !partial)
+          if(!partial) assert(dut.io.fwd.rsp.data.toLong == data)
+          cd.waitSampling(); dut.io.publish.valid #= false
+        }
+        commit(dut, cd, liveId)
+        dut.io.drain.ready #= true
+        var outstanding = 0; var acceptedCount = 0
+        for(_ <- 0 until 100) {
+          sleep(1)
+          val accepted = dut.io.drain.valid.toBoolean
+          val ack = outstanding > 0
+          dut.io.drainAck #= ack
+          cd.waitSampling()
+          if(accepted) acceptedCount += 1
+          outstanding += (if(accepted) 1 else 0) - (if(ack) 1 else 0)
+        }
+        dut.io.drainAck #= false; dut.io.drain.ready #= false; sleep(1)
+        assert(dut.io.empty.toBoolean && outstanding == 0 && acceptedCount == 3)
+      }
+      assert(heads.size == 8, "test never exercised every physical SQ head position")
+    }
+  }
+
+  for(enabled <- Seq(false, true)) test(s"publication-edge forwarding byte model enabled=$enabled", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true,
+      reserveLateStore = true, forwardOnPublish = enabled)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      dut.io.robHeadIn #= 30; dut.io.robHeadValidIn #= true
+      val random = new scala.util.Random(0x50554246L)
+      val queries = (0 to 3).map(_ -> Size.BYTE) ++ (0 to 2).map(_ -> Size.WORD) ++ Seq(0 -> Size.LONG)
+      for(round <- 0 until 32; (offset, size) <- queries) {
+        dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false
+        sleep(1)
+        val slot = dut.io.allocSlot.toInt
+        dut.io.reserveOnly #= true
+        alloc(dut, cd, 31, 0x100, 0xdeadbeefL, Size.LONG,
+          cacheMode = m68k040.cache.CacheMode.COPYBACK)
+        dut.io.reserveOnly #= false
+        setQuery(dut, 1, 0x100 + offset, size) // live ROB age crosses index zero
+        sleep(1)
+        assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+        val data = random.nextLong() & 0xffffffffL
+        val bytes = if(size == Size.BYTE) 1 else if(size == Size.WORD) 2 else 4
+        val expected = (0 until bytes).foldLeft(0L)((v, b) =>
+          (v << 8) | ((data >>> (24 - 8 * (offset + b))) & 255))
+        dut.io.publish.valid #= true
+        dut.io.publish.slot #= slot; dut.io.publish.robId #= 31; dut.io.publish.data #= data
+        sleep(1) // deliberately before the publication clock edge
+        assert(dut.io.fwd.rsp.hit.toBoolean == enabled)
+        assert(dut.io.fwd.rsp.stall.toBoolean == !enabled)
+        assert(dut.publishForwardHit.toBoolean == enabled)
+        if(enabled) assert(dut.io.fwd.rsp.data.toLong == expected)
+        dut.io.fwd.query.inhibited #= true; sleep(1)
+        assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.serial.toBoolean)
+        dut.io.fwd.query.inhibited #= false
+        cd.waitSampling(); dut.io.publish.valid #= false; sleep(1)
+        assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == expected)
+        assert(!dut.publishForwardHit.toBoolean)
+      }
+    }
+  }
+
+  test("publication-edge forwarding preserves youngest overlap and flush cancellation", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = true,
+      forwardOnPublish = true)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      for(youngPartial <- Seq(false, true); youngUnfilled <- Seq(false, true)) {
+        dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false; sleep(1)
+        val oldSlot = dut.io.allocSlot.toInt
+        dut.io.reserveOnly #= true
+        alloc(dut, cd, 2, 0x100, 0, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+        dut.io.reserveOnly #= youngUnfilled
+        alloc(dut, cd, 3, if(youngPartial) 0x101 else 0x100, 0x11223344L,
+          if(youngPartial) Size.BYTE else Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+        dut.io.reserveOnly #= false
+        setQuery(dut, 4, 0x100, Size.LONG)
+        dut.io.publish.valid #= true
+        dut.io.publish.slot #= oldSlot; dut.io.publish.robId #= 2; dut.io.publish.data #= 0x89abcdefL
+        sleep(1)
+        assert(!dut.publishForwardHit.toBoolean, "older publication overrode younger overlap")
+        assert(dut.io.fwd.rsp.hit.toBoolean == (!youngPartial && !youngUnfilled))
+        if(dut.io.fwd.rsp.hit.toBoolean) assert(dut.io.fwd.rsp.data.toLong == 0x11223344L)
+        else assert(dut.io.fwd.rsp.stall.toBoolean)
+        cd.waitSampling(); dut.io.publish.valid #= false
+      }
+      dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false; sleep(1)
+      val slot = dut.io.allocSlot.toInt
+      dut.io.reserveOnly #= true
+      alloc(dut, cd, 2, 0x100, 0, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      dut.io.reserveOnly #= false
+      dut.io.publish.valid #= true
+      dut.io.publish.slot #= slot; dut.io.publish.robId #= 2; dut.io.publish.data #= 0x89abcdefL
+      // Independently translated second query fragment overlaps the publication.
+      setQuery(dut, 4, 0x20f, Size.LONG, splitB = true, paddrB = 0x100)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+      setQuery(dut, 4, 0x100, Size.LONG); dut.io.flush #= true; sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.publishForwardHit.toBoolean)
+      cd.waitSampling(); dut.io.publish.valid #= false; dut.io.flush #= false; sleep(1)
+      assert(dut.io.empty.toBoolean && !dut.io.fwd.rsp.hit.toBoolean)
+    }
+  }
+
   test("late SQ reservations consume capacity, block forwarding, and fill in place", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true,
       reserveLateStore = true)).doSim { dut =>

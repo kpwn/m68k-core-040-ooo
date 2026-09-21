@@ -101,7 +101,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyIntWakeup: Boolean = false,
                  val sqSubwordForwarding: Boolean = false,
                  val reserveLateStore: Boolean = false,
-                 val detachLateStore: Boolean = false) extends FiberPlugin with LsEuService {
+                 val detachLateStore: Boolean = false,
+                 val forwardOnPublish: Boolean = false) extends FiberPlugin with LsEuService {
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
@@ -585,7 +586,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
     // ---- store queue instance ----
     val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding,
-      reserveLateStore = reserveLateStore)
+      reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish)
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     sq.io.flush  := sqFlushSig

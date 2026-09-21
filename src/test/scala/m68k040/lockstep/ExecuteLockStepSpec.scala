@@ -518,7 +518,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
       sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
       reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
-      detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"))
+      detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
+      forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -5987,6 +5988,35 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           s"publications=$publications completionHolds=$completionHolds")
       }
     }
+  }
+
+  test("lock-step: late SQ reservation keeps youngest data across committed ROB generations", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE000,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc")
+    val slowWrites = m68k040.sim.AxiMemModelConfig(latency =
+      m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 1000, dramCycles = 1000))
+    var oldRankWouldWin = 0
+    for(padding <- 0 until 32) {
+      val src = setup ++ Seq("move.l #0x11111111,%d0", "move.l %d0,0x3000") ++
+        Seq.fill(padding)("nop") ++ Seq("move.l #0x22222222,%d0", "move.l %d0,0x3000",
+          "move.l 0x3000,%d4")
+      runLockStep(s"sq-live-retired-generations-$padding", src.mkString(" ; "),
+        dcfg = slowWrites, maxCycles = 10000, perCycle = dut => {
+          val sq = dut.lsEu.logic.sq
+          val live = (0 until 8).filter(i => sq.valids(i).toBoolean)
+          if(dut.lsEu.logic.p3Valid.toBoolean && live.size == 2) {
+            val head = sq.head.toInt
+            val next = (head + 1) & 7
+            val q = sq.io.fwd.query.robId.toInt
+            val old = sq.robIds(head).toInt
+            val young = sq.robIds(next).toInt
+            if(sq.committed(head).toBoolean && q != young && q != old &&
+              ((q - old) & 31) <= ((q - young) & 31)) oldRankWouldWin += 1
+          }
+        }, afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x22222222L))
+    }
+    assert(oldRankWouldWin > 0, "CPU test never overlapped distinct SQ generations with misleading ROB ranks")
+    println(s"SQ_RETIRED_GENERATIONS oldRankWouldWin=$oldRankWouldWin")
   }
 
   test("lock-step: late SQ reservation falls back safely when data arrives while full", VerilatorTest) {

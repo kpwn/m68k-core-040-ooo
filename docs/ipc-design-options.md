@@ -313,10 +313,17 @@ The follow-on detached-owner option moves only source/completion metadata out of
 P3; addresses and data remain in the existing SQ. Publication can proceed even
 when completion loses arbitration, and younger disjoint loads actually bypass.
 It has one independent pending owner and reuses the existing PRF port. **No
-guaranteed advance memory wake is emitted yet.** Evaluate publication-edge
-forwarding and guaranteed lookup readiness next, preserving overlap/device/flush
-safety and measuring the added data-path timing. Routing remains pending; detailed
-evidence and remaining capacity/retry work are in the experiment ledger.
+guaranteed advance memory wake is emitted yet.** The next optional experiment
+forwards on actual SQ publication: initial 136 matched cases yield 24 improvements,
+112 unchanged, none worse; load-fed recurrence gains another 19.93–20.00% with
+both older load optimizations. It also exposed a pre-existing ROB-generation
+winner-selection bug, now fixed with existing SQ FIFO position rather than
+wrapping ROB distance. The repaired disabled arm reproduces all 136 earlier
+cycles exactly; the final candidate also reproduces all its pre-repair counts.
+The 65-test combined-option oracle run, default-generation control, six subword
+composition controls, 42 SQ/split tests and 384-test fast gate pass. Routing remains
+pending. Details and the remaining advance-wakeup/capacity/retry work are in the
+experiment ledger.
 
 ### 14. Shorter resident L1D path without a long permission cone
 
@@ -352,8 +359,8 @@ deferral through the existing predictor port, then repair retained history under
 an explicit recovery contract. The first deferral prototype now improves long
 backlog IPC by 16.41%, but loses 5.82% on the long tight alternating loop despite
 improving its accuracy to 99.870%. Keep it default-off and preserve both results.
-Correct-branch retirement pairing does not remove that regression. History repair
-has no implementation gain yet.
+Correct-branch retirement pairing does not remove that regression. This initial
+all-conditional-deferral comparison does not include history repair.
 
 **Implemented, default-off comparison:** allow an unpredicted slot-1 conditional to
 carry a not-taken history/training record through the *existing* single tag-write
@@ -369,6 +376,15 @@ window by 2.75% but leaves long backlog unchanged. Additionally deferring PHT-ta
 slot-1 branches retains the alternating gain and improves long backlog by 16.41%.
 The short alternating seed-1 window regresses 2.17%; keep that result visible.
 These are checked synthetic windows, not representative-workload or timing signoff.
+
+**Retained-history follow-on:** preserving the valid post-redirect frontend history
+suffix on top of selective deferral reduces the long backlog window from 2285 to
+2240 cycles (+2.01% incremental IPC), and misses from 4 to 1 out of 224 branches
+(99.554% accuracy in that synthetic window). Core-only routed timing passes at
+200 MHz: +17 ps setup, +21 ps hold, zero setup/hold/pulse failures; 93,883 LUTs,
+38,782 FFs, 37 BRAM tiles. The matched selective-only baseline misses by 280 ps.
+This does not establish representative board accuracy, combined LSU timing, or
+whole-SoC closure; the short-alternating regression remains in the record.
 
 Local NaxRiscv reference checked at `9f452d50560d02fb391bc8039f5453c54e0911af`:
 `prediction/DecoderPredictionPlugin.scala` supplies masked history events for

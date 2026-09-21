@@ -88,16 +88,19 @@ case class SqFwdRsp() extends Bundle {
   *             misplaced_0d00.md Part 37). Every other (truly still-speculative,
   *             never-launched) entry is squashed and never drains -> memory
   *             untouched. Same pointer discipline as the ROB/freelist.
-  *  - fwd    : load forward check. Among entries OLDER than query.robId (ROB
-  *             circular order), address-overlapping: full same-size overlap ->
-  *             hit+data (youngest such); partial/ambiguous -> stall. Optional
+  *  - fwd    : load forward check. Eligible entries are committed or older in
+  *             the live ROB window. Select the youngest address overlap by SQ
+  *             allocation order, which survives retired ROB-index reuse:
+  *             full same-size overlap -> hit+data; partial/ambiguous -> stall. Optional
   *             subword forwarding also covers byte/word loads within aligned LONGs.
   *
   * All state is RegInit (no uninit Regs); counts are hardware sums (no
   * when-gated Scala-var counters). */
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
-                 reserveLateStore: Boolean = false) extends Component {
+                 reserveLateStore: Boolean = false,
+                 forwardOnPublish: Boolean = false) extends Component {
   require(isPow2(depth))
+  require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
   val ptrW = log2Up(depth)
 
   val io = new Bundle {
@@ -591,7 +594,10 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
         paddrs(i)(3 downto 2) === q.paddr(3 downto 2) &&
         (q.size === Size.BYTE || (q.size === Size.WORD && q.paddr(1 downto 0) =/= 3))
     } else False
-    val full     = ent && (geomFull || geomSubword) && hasData(U(i, ptrW bits))
+    val publishing = if(forwardOnPublish) io.publish.valid && !io.flush &&
+      io.publish.slot === U(i, ptrW bits) && io.publish.robId === robIds(i) &&
+      valids(i) && !dataReady(i) else False
+    val full     = ent && (geomFull || geomSubword) && (hasData(U(i, ptrW bits)) || publishing)
     val partial  = overlap && !full
     val inhibitedStore = ent &&
       ((cacheModes(i) === CacheMode.INHIBITED) ||
@@ -777,8 +783,14 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     }
   }
 
-  // youngest older overlapping entry: among ALL overlapping matches (full OR
-  // partial), the one closest (in ROB age) to the query. ONE reduce tree carrying
+  // Youngest older overlapping entry: among ALL eligible matches (full OR
+  // partial), the last in SQ allocation order. A committed entry can outlive a
+  // ROB generation, so distance from the query's wrapping ROB index is NOT an
+  // ordering key (an old committed index can equal the new load's index).
+  // Allocation/drain are FIFO ordered; modular position from the SQ head is
+  // exact for every valid resident entry, including a full ring and flush reuse.
+  // The existing perEntry.ent still decides whether each store predates the load.
+  // ONE reduce tree carrying
   // whether that youngest-overlapping entry is a FULL overlap. A clean forward is
   // possible iff the YOUNGEST overlapping store fully covers the query: a younger
   // partial store (e.g. a split store's slot B overwriting some query bytes) would
@@ -786,10 +798,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // single tree (same depth as the prior youngest-full select), avoiding a serial
   // dependency on a separately-reduced `best.dist` (which regressed FMax).
   val anyPartial = perEntry.map(_.partial).orR
-  val ageDist    = Vec((0 until depth).map(i => (q.robId - robIds(i))(m68k040.Global.ROB_ID_W_DEFAULT - 1 downto 0)))
+  val ageDist    = Vec((0 until depth).map(i => U(i, ptrW bits) - head))
   case class Cand() extends Bundle {
-    val valid = Bool(); val full = Bool(); val dist = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits); val data = Bits(32 bits)
+    val valid = Bool(); val full = Bool(); val dist = UInt(ptrW bits); val data = Bits(32 bits)
     val subword = Bool()
+    val publishing = Bool()
   }
   val cands = (0 until depth).map { i =>
     val c = Cand()
@@ -798,15 +811,19 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     c.dist  := ageDist(i)
     c.data  := datas(i)
     c.subword := perEntry(i).geomSubword
+    c.publishing := perEntry(i).publishing
     c
   }
   val best = cands.reduceBalancedTree { (a, b) =>
     val o = Cand()
-    // prefer the valid one; if both valid, the smaller dist (younger store)
-    when(a.valid && (!b.valid || (a.dist <= b.dist))) { o := a } otherwise { o := b }
+    // Prefer the valid one; if both valid, the larger allocation rank is younger.
+    when(a.valid && (!b.valid || (a.dist >= b.dist))) { o := a } otherwise { o := b }
     o
   }
   val fullValid = best.valid && best.full
+  // One common late-data mux after winner selection, not eight 32-bit muxes
+  // ahead of the reduction tree. Geometry/age still select the youngest match.
+  val forwardData = if(forwardOnPublish) Mux(best.publishing, io.publish.data, best.data) else best.data
   // Same-line hazard: any older in-flight WRITETHROUGH store to the load's cache line
   // forces a stall (the refill-stale-line hole above), UNLESS we can cleanly FULL-forward
   // the exact bytes (then we have the data and never touch the cache). A byte-partial
@@ -828,12 +845,14 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // Suppress the forward across a serialization boundary: a device read must reach
   // the DEVICE, never echo an older store's data out of this ring.
   io.fwd.rsp.hit   := fullValid && !serialStall
-  io.fwd.rsp.data  := best.data
+  io.fwd.rsp.data  := forwardData
+  val publishForwardHit = if(forwardOnPublish) io.fwd.rsp.hit && best.publishing else False
+  publishForwardHit.simPublic()
   if(subwordForwarding) {
-    val byteData = Vec(best.data(31 downto 24), best.data(23 downto 16),
-      best.data(15 downto 8), best.data(7 downto 0))(q.paddr(1 downto 0))
-    val wordData = Vec(best.data(31 downto 16), best.data(23 downto 8),
-      best.data(15 downto 0), B(0, 16 bits))(q.paddr(1 downto 0))
+    val byteData = Vec(forwardData(31 downto 24), forwardData(23 downto 16),
+      forwardData(15 downto 8), forwardData(7 downto 0))(q.paddr(1 downto 0))
+    val wordData = Vec(forwardData(31 downto 16), forwardData(23 downto 8),
+      forwardData(15 downto 0), B(0, 16 bits))(q.paddr(1 downto 0))
     when(best.subword) {
       io.fwd.rsp.data := Mux(q.size === Size.BYTE, byteData.resize(32), wordData.resize(32))
     }
