@@ -86,12 +86,18 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         deferTakenSlot1Conditional = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
         retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1"),
         earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"),
-        fuseLongMoveLoads = sys.env.get("IPC_FUSE_LONG_MOVE_LOADS").contains("1")))
+        fuseLongMoveLoads = sys.env.get("IPC_FUSE_LONG_MOVE_LOADS").contains("1"),
+        reserveLateStore = sys.env.get("IPC_RESERVE_LATE_STORE").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k.copy(profileRetirement = sys.env.get("IPC_PROFILE").contains("1")), seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
         if(k.name.startsWith("delayed-store-") && sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"))
           assert(r.lateStoreCaptures == 32, "all 32 delayed stores must use late capture")
+        if(sys.env.get("IPC_RESERVE_LATE_STORE").contains("1") &&
+          (k.name.startsWith("delayed-store-") || k.name.startsWith("short-store-"))) {
+          assert(r.reservedStores == r.lateStoreCaptures && r.reservedPublishes == r.reservedStores,
+            "every delayed-data store in this cacheable kernel must reserve and publish exactly once")
+        }
         if(k.name == pointerChain.name) {
           assert(r.ldCmdAddrs.size >= 258, s"pointer chase did not execute its loads: ${r.ldCmdAddrs.size}")
           r.ldCmdAddrs.zipWithIndex.foreach { case (addr, n) =>
@@ -100,7 +106,8 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
           }
         }
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
-          f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures}")
+          f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures} " +
+          s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +

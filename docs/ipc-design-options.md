@@ -273,7 +273,7 @@ load must release the LSU front so the older store can progress.
 **Experiment:** delayed-store/disjoint-load, overlap, aliases and cold barriers;
 full-core IPC after integration, not just checker tests. **Priority: high.**
 
-Intermediate result: default-off early store address execution, still without
+Intermediate result before direct-load fusion: default-off early store address execution, still without
 load bypass, passes 128 matched full-core cases. Divide-fed and rotate-fed
 store/load recurrences improve 4.34–6.21%; the load-fed recurrence is unchanged
 and never takes late capture. There are no measured cycle regressions. It reuses
@@ -294,6 +294,18 @@ Address-verified PRF-tag forwarding is a variant to test against ordinary SQ dat
 not automatically better: extra PRF ports and source lifetime may outweigh a mux.
 **Experiment:** one-chain latency and multi-chain throughput, saturation/flush/
 arbitration assertions, matched routing. **Priority: high; directly requested.**
+
+Intermediate implementation: P3-owned late-data SQ reservation writes the data
+directly on its existing PRF capture edge, instead of staging and allocating one
+cycle later. With direct-load fusion plus early store address as the baseline,
+128 matched cases produce 32 improvements and 96 identical results, with no new
+regressions. Load-fed recurrence gains another 17.00–17.05%; rotate-fed recurrence
+11.21–11.24%. Full-capacity fallback and redirect cancellation are observed and
+checked against the oracle. The source tag/P3 owner is canceled synchronously;
+no asynchronous response uses the bare SQ slot. P3 still holds completion
+metadata, and shared completion contention is not reserved ahead: **no guaranteed
+early wake or independent younger-load bypass is implemented yet**. Routing is
+pending. Detailed evidence and remaining work are in the experiment ledger.
 
 ### 14. Shorter resident L1D path without a long permission cone
 

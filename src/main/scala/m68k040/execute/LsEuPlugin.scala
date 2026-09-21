@@ -99,7 +99,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val walkerWedgeLimit: Int = 1 << 20,
                  val alignedLoadFallThrough: Boolean = false,
                  val earlyIntWakeup: Boolean = false,
-                 val sqSubwordForwarding: Boolean = false) extends FiberPlugin with LsEuService {
+                 val sqSubwordForwarding: Boolean = false,
+                 val reserveLateStore: Boolean = false) extends FiberPlugin with LsEuService {
   // ─────────────────────────────────────────────────────────────────────────
   // D1 elastic LS front (spec `2026-08-09-ipc-ls-eu-full-pipeline-design.md`):
   // P1 owns the full issue context and registered operands; P2 launches DTLB+VIPT;
@@ -579,7 +580,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                        ldFifoEmpty && !ldFifoFull
 
     // ---- store queue instance ----
-    val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding)
+    val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding,
+      reserveLateStore = reserveLateStore)
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     sq.io.flush  := sqFlushSig
@@ -3120,6 +3122,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p3IsLoad         = p3Front.memOp === MemOp.LOAD
     val p3IsStore        = p3Front.memOp === MemOp.STORE
     val p3LateDataPending = lateStoreData.map(_ => p3Front.lateDataPending).getOrElse(False)
+    val p3Reserved = if(reserveLateStore) RegInit(False) else False
+    val p3ReservationFire = Bool(); p3ReservationFire := False
+    val p3ReservedPublish = Bool()
+    if(!reserveLateStore) p3ReservedPublish := False
     val lateDataCapture = Bool()
     if (lateStoreData.isEmpty) lateDataCapture := False
     lateStoreData.foreach { p =>
@@ -3128,6 +3134,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // covers next-cycle LS early wakeups before reusing the data read port.
       val readyPrior = RegNext(p3Valid && p3LateDataPending && p.queryReady &&
         !sqFlushSig && !excActive) init False
+      // A reserved store may now leave on its capture edge. Its readiness must
+      // not qualify a different pending source replacing P3 on that same edge.
+      if(reserveLateStore) when(p3CanLeave) { readyPrior := False }
       // The live source cannot be reallocated before this store completes. Once
       // qualified, readiness cannot revoke; keep the wide busy lookup off the
       // read-port arbitration/issue-ready cone.
@@ -3149,18 +3158,62 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
             !u0.stkPush && u0.eaAuto === m68k040.decode.EaAuto.NONE && !u0.movesAliasStore,
             "late store data issued on an unsupported operation", FAILURE)
         }
-        when(p3Valid && p3LateDataPending) {
-          assert(!sq.io.alloc.valid && !p3CompletionFire,
+        when(p3Valid && p3LateDataPending && !lateDataCapture) {
+          assert((!sq.io.alloc.valid || p3ReservationFire) && !p3CompletionFire,
             "store published before its late data capture", FAILURE)
         }
       }
     }
     lateDataCapture.simPublic(); p3LateDataPending.simPublic()
     val olderThanP3Comp  = backCompFires || preciseReplayClaimsComp || p4CompletionFire
+    if(reserveLateStore) {
+      val reservedSlot = Reg(UInt(sq.ptrW bits))
+      sq.io.reserveOnly := p3ReservationFire
+      sq.io.publish.valid := p3ReservedPublish
+      sq.io.publish.slot := reservedSlot
+      sq.io.publish.robId := p3Front.robId
+      sq.io.publish.data := rdData.data
+      when(p3ReservationFire) {
+        p3Reserved := True
+        reservedSlot := sq.io.allocSlot
+      }
+      when(p3CanLeave || sqFlushSig || excActive) { p3Reserved := False }
+      p3ReservedPublish := p3Reserved && lateDataCapture
+      GenerationFlags.simulation {
+        when(p3Reserved) {
+          assert(p3Valid && p3IsStore && fastStore && !storePrivBlocked,
+            "LSU: SQ reservation escaped its P3 store owner", FAILURE)
+        }
+        when(p3ReservedPublish) {
+          assert(!sq.io.alloc.valid, "LSU: reserved data fill duplicated SQ allocation", FAILURE)
+        }
+      }
+    }
+    p3ReservationFire.simPublic(); p3ReservedPublish.simPublic(); p3Reserved.simPublic()
     when(p3Valid && !sqFlushSig && !excActive) {
       when(p3IsStore) {
-        when(p3LateDataPending) {
+        when(p3Reserved) {
+          when(!p3LateDataPending || lateDataCapture) {
+            when(olderThanP3Comp) {
+              frontCompHeld := True
+            } otherwise {
+              // The data has either been captured already, or is being written
+              // directly into the reserved SQ entry on this very edge.
+              captureCompletionFront(p3Front, B(0, 32 bits))
+              when(lateDataCapture) { compNzvc := moveNzvc(rdData.data, p3Front.size) }
+              p3CompletionFire := True
+              p3CanLeave := True
+            }
+          }
+        } elsewhen(p3LateDataPending) {
           // Address has resolved; preserve ordering until data is resident.
+          // If capacity only appears on the capture edge, use the ordinary
+          // captured-data path next cycle; never create an unfillable reservation.
+          if(reserveLateStore) when(fastStore && !storePrivBlocked && !sq.io.full && !lateDataCapture) {
+            sq.io.alloc.valid := True
+            sq.io.alloc.payload.precise := False
+            p3ReservationFire := True
+          }
         } elsewhen(storePrivBlocked) {
           when(olderThanP3Comp) {
             frontCompHeld := True

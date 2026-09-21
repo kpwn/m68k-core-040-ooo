@@ -76,6 +76,35 @@ NaxRiscv's speculative memory-order rollback policy.
 
 ## Required ownership and lifetime
 
+### Controlled intermediate experiment: reserve P3's late-data SQ slot
+
+Default-off `reserveLateStore` lets an ordinary fast store whose translated
+address is already in P3 reserve its SQ entry before its data arrives. The usual
+allocation port writes the complete address/attribute metadata and advances the
+ring, but marks its data unavailable. This consumes real SQ capacity. A matching
+overlap must stall, not forward the old data-array contents; the youngest older
+overlapping entry still wins. An unavailable entry may neither commit nor drain.
+
+P3 remains the sole owner of the reservation until data publication and completion.
+It retains its slot index; no delayed/asynchronous publication is allowed after
+that P3 context is canceled or replaced. On the existing qualified late-data
+capture cycle, write the existing PRF read value directly into the reserved SQ
+entry. If completion arbitration is free, complete and leave P3 on that edge;
+otherwise retain the captured data/flags in the existing P3 context and complete
+later without allocating or publishing a second time. Capacity cannot revoke
+publication once reserved. Older completions still win the shared completion
+port: this intermediate experiment does **not** announce a guaranteed early wake.
+
+Flush cancels P3 ownership and its uncommitted reservation together; publication
+is suppressed on flush. No generation-free slot identity may escape this local,
+synchronous lifetime. Dispatch reservations with independent retries/outstanding
+responses still require the full memory-order tickets described below. Precise,
+inhibited, privilege-blocked stores and translation faults retain the old path.
+Stores without late data use ordinary allocate-with-data. Validate full capacity,
+overlapping unfilled entries, fill/allocate/drain concurrency, cancellation/reuse,
+completion contention, flags, splits and precise-store fallback. This removes a
+late-data staging bubble but does not yet enable younger-load bypass.
+
 ### Controlled intermediate experiment: early store address, ordered publication
 
 `earlyStoreAddress` is default-off. It separates address/data readiness before

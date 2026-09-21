@@ -95,12 +95,22 @@ case class SqFwdRsp() extends Bundle {
   *
   * All state is RegInit (no uninit Regs); counts are hardware sums (no
   * when-gated Scala-var counters). */
-class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Component {
+class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
+                 reserveLateStore: Boolean = false) extends Component {
   require(isPow2(depth))
   val ptrW = log2Up(depth)
 
   val io = new Bundle {
     val alloc    = slave(Flow(SqAlloc()))
+    // Local synchronous reservation owner: LSU P3. Flush cancels that owner;
+    // this slot index must never be used for an outstanding asynchronous reply.
+    val reserveOnly = if(reserveLateStore) in Bool() else null
+    val allocSlot = if(reserveLateStore) out(UInt(ptrW bits)) else null
+    val publish = if(reserveLateStore) slave(Flow(new Bundle {
+      val slot = UInt(ptrW bits)
+      val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+      val data = Bits(32 bits)
+    })) else null
     val fwd      = new Bundle { val query = in(SqFwdQuery()); val rsp = out(SqFwdRsp()) }
     val commit   = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
     // Second same-cycle commit port: a store can retire in EITHER slot of the 2-wide
@@ -156,6 +166,8 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Com
 
   // ---- ring storage (all RegInit) ----
   val valids    = Vec.fill(depth)(RegInit(False))
+  val dataReady = if(reserveLateStore) Vec.fill(depth)(RegInit(False)) else null
+  def hasData(slot: UInt): Bool = if(reserveLateStore) dataReady(slot) else True
   val committed = Vec.fill(depth)(RegInit(False))
   val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)))
   val paddrs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
@@ -431,7 +443,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Com
   // a deadlock, not a precision measure). Its slot A has already hit memory; the only
   // correct thing left to do is let it finish.
   val headOrphan = valids(head) && orphans(head) && precises(head)
-  val headPreciseReady = valids(head) && !committed(head) && precises(head) &&
+  val headPreciseReady = valids(head) && hasData(head) && !committed(head) && precises(head) &&
                          Mux(headOrphan, True,
                              (robIds(head) === io.robHeadIn) && io.robHeadValidIn &&
                              !io.irqPreemptPendingIn) &&
@@ -450,7 +462,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Com
   val sendMode = CacheMode()
   sendMode := Mux(sendPhaseB, cacheModesB(sendPtr), cacheModes(sendPtr))
   val sendPrecise = precises(sendPtr)
-  val sendCommitted = valids(sendPtr) && committed(sendPtr) && !io.flush
+  val sendCommitted = valids(sendPtr) && hasData(sendPtr) && committed(sendPtr) && !io.flush
   val sendAtHead = sendPtr === head
   val noAccepted = acceptedHalves === 0
   // Task (WT-pipelining): WRITETHROUGH joins COPYBACK here. Both share the exact
@@ -579,7 +591,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Com
         paddrs(i)(3 downto 2) === q.paddr(3 downto 2) &&
         (q.size === Size.BYTE || (q.size === Size.WORD && q.paddr(1 downto 0) =/= 3))
     } else False
-    val full     = ent && (geomFull || geomSubword)
+    val full     = ent && (geomFull || geomSubword) && hasData(U(i, ptrW bits))
     val partial  = overlap && !full
     val inhibitedStore = ent &&
       ((cacheModes(i) === CacheMode.INHIBITED) ||
@@ -850,7 +862,31 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false) extends Com
   }
 
   // ---- alloc: push at tail (speculative) ----
+  if(reserveLateStore) {
+    io.allocSlot := tail
+    when(io.publish.valid && !io.flush) {
+      val slot = io.publish.slot
+      datas(slot) := io.publish.data
+      dataReady(slot) := True
+      assert(valids(slot) && !dataReady(slot) && robIds(slot) === io.publish.robId,
+        "StoreQueue: late publication lost its reserved owner", FAILURE)
+    }
+    GenerationFlags.simulation {
+      when(io.alloc.valid && io.reserveOnly && !io.flush) {
+        assert(!io.alloc.precise, "StoreQueue: precise store cannot reserve without data", FAILURE)
+      }
+      for(i <- 0 until depth) {
+        when(valids(i) && !dataReady(i)) {
+          assert(!committed(i), "StoreQueue: unfilled reservation committed", FAILURE)
+          assert(!(io.commit.valid && io.commit.payload === robIds(i)) &&
+                 !(io.commitB.valid && io.commitB.payload === robIds(i)),
+            "StoreQueue: commit notice preceded reserved data publication", FAILURE)
+        }
+      }
+    }
+  }
   when(io.alloc.valid && !io.flush) {
+    if(reserveLateStore) dataReady(tail) := !io.reserveOnly
     valids(tail)    := True
     committed(tail) := False
     robIds(tail)    := io.alloc.payload.robId

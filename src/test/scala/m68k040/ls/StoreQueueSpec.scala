@@ -9,6 +9,107 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class StoreQueueSpec extends AnyFunSuite {
 
+  test("late SQ reservations consume capacity, block forwarding, and fill in place", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true,
+      reserveLateStore = true)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      val random = new scala.util.Random(0x52535645L)
+      for(round <- 0 until 32) {
+        dut.io.flush #= true; cd.waitSampling(); dut.io.flush #= false
+        val slots = (0 until 8).map { i =>
+          sleep(1)
+          val slot = dut.io.allocSlot.toInt
+          dut.io.reserveOnly #= true
+          alloc(dut, cd, 2 + i, 0x100, 0xdeadbeefL, Size.LONG,
+            cacheMode = m68k040.cache.CacheMode.COPYBACK)
+          dut.io.reserveOnly #= false
+          slot
+        }
+        sleep(1)
+        assert(dut.io.full.toBoolean && !dut.io.empty.toBoolean)
+        assert(!dut.io.drain.valid.toBoolean)
+        setQuery(dut, 12, 0x101, Size.WORD)
+        sleep(1)
+        assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+        // Older data must never escape through the youngest unfilled overwrite.
+        for(i <- 0 until 8) {
+          val data = random.nextLong() & 0xffffffffL
+          dut.io.publish.valid #= true
+          dut.io.publish.slot #= slots(i); dut.io.publish.robId #= 2 + i
+          dut.io.publish.data #= data
+          cd.waitSampling(); dut.io.publish.valid #= false; sleep(1)
+          assert(dut.io.full.toBoolean, "fill must not allocate or release a second slot")
+          if(i == 7) {
+            assert(dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean)
+            assert(dut.io.fwd.rsp.data.toLong == ((data >>> 8) & 0xffffL))
+          } else assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+        }
+      }
+    }
+  }
+
+  test("late SQ fill can coincide with allocation, and flush cancels its synchronous owner", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8, reserveLateStore = true)).doSim { dut =>
+      val cd = initDut(dut)
+      dut.io.drain.ready #= false
+      dut.io.reserveOnly #= true
+      alloc(dut, cd, 2, 0x100, 0, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      dut.io.reserveOnly #= false
+      dut.io.publish.valid #= true
+      dut.io.publish.slot #= 0; dut.io.publish.robId #= 2; dut.io.publish.data #= 0x12345678L
+      alloc(dut, cd, 3, 0x200, 0xabcdef01L, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      dut.io.publish.valid #= false
+      setQuery(dut, 8, 0x100, Size.LONG); sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0x12345678L)
+      setQuery(dut, 8, 0x200, Size.LONG); sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0xabcdef01L)
+      commit(dut, cd, 2)
+      dut.io.reserveOnly #= true
+      alloc(dut, cd, 4, 0x100, 0, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      dut.io.reserveOnly #= false
+      dut.io.publish.valid #= true
+      dut.io.publish.slot #= 2; dut.io.publish.robId #= 4; dut.io.publish.data #= 0xfedcba98L
+      dut.io.flush #= true
+      cd.waitSampling()
+      dut.io.flush #= false; dut.io.publish.valid #= false
+      setQuery(dut, 8, 0x100, Size.LONG); sleep(1)
+      assert(dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.data.toLong == 0x12345678L,
+        "flush must retain the committed predecessor, canceling both younger entries")
+      // Reuse the rolled-back tail with a new synchronous owner, not an old reply.
+      dut.io.reserveOnly #= true; sleep(1)
+      val newSlot = dut.io.allocSlot.toInt
+      alloc(dut, cd, 5, 0x100, 0, Size.LONG, cacheMode = m68k040.cache.CacheMode.COPYBACK)
+      dut.io.reserveOnly #= false
+      setQuery(dut, 8, 0x100, Size.LONG); sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && dut.io.fwd.rsp.stall.toBoolean)
+      dut.io.publish.valid #= true
+      dut.io.publish.slot #= newSlot; dut.io.publish.robId #= 5; dut.io.publish.data #= 0x55667788L
+      cd.waitSampling(); dut.io.publish.valid #= false
+      commit(dut, cd, 5)
+      val seen = scala.collection.mutable.ArrayBuffer.empty[Long]
+      cd.onSamplings {
+        if(dut.io.drain.valid.toBoolean && dut.io.drain.ready.toBoolean)
+          seen += dut.io.drain.data.toLong
+      }
+      // Count every accepted beat, including adjacent-cycle pipelined commands.
+      // The legacy waitSamplingWhere helper misses the second of such a pair.
+      dut.io.drain.ready #= true
+      var outstanding = 0
+      for(_ <- 0 until 100) {
+        sleep(1)
+        val accepted = dut.io.drain.valid.toBoolean
+        val ack = outstanding > 0
+        dut.io.drainAck #= ack
+        cd.waitSampling()
+        outstanding += (if(accepted) 1 else 0) - (if(ack) 1 else 0)
+      }
+      dut.io.drainAck #= false; sleep(1)
+      assert(dut.io.empty.toBoolean, "both committed filled entries must drain within 100 cycles")
+      assert(seen.toSeq == Seq(0x12345678L, 0x55667788L))
+    }
+  }
+
   test("optional subword forwarding matches big-endian byte model at every offset", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true)).doSim { dut =>
       val cd = initDut(dut)
@@ -172,6 +273,11 @@ class StoreQueueSpec extends AnyFunSuite {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
     dut.io.alloc.valid #= false
+    if(dut.io.reserveOnly != null) {
+      dut.io.reserveOnly #= false
+      dut.io.publish.valid #= false
+      dut.io.publish.slot #= 0; dut.io.publish.robId #= 0; dut.io.publish.data #= 0
+    }
     dut.io.commit.valid #= false
     dut.io.commitB.valid #= false; dut.io.commitB.payload #= 0
     dut.io.flush #= false

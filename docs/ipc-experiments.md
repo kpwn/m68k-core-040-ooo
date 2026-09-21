@@ -608,7 +608,14 @@ WPWS **+1.958 / +1.958 ns**, all zero setup/hold/pulse failing endpoints. Routed
 LUTs **93,896 / 93,668**, FFs **38,740 / 38,770**, BRAM tiles **37 / 37**.
 This is a core-only 200 MHz pass, not SoC timing or board-performance signoff.
 Authoritative reports are each arm's `synth/fullcore_route_{timing,util}.rpt`.
-The selective arm is still running; this queue does not block subsequent IPC work.
+The selective arm subsequently finished with WNS **−0.280 ns**, 1,418 setup-failing
+endpoints (TNS −127.236 ns), WHS **+0.020 ns**, WPWS **+1.958 ns**, and no hold/pulse
+failures. It uses 93,830 LUTs, 38,732 FFs and 37 BRAM tiles. The worst reported path
+is ROB head → payload/FP-immediate reads → FPU unimplemented operand capture;
+other reported families involve LS ownership/exception quiescence and frontend
+quiesce/fetch-PC. This is not evidence that the PHT update itself needs a pipeline
+cut. Preserve the IPC-positive candidate while investigating those actual cones;
+the retained-history comparison now runs next and does not block IPC development.
 
 ## Retained frontend history repair — 2026-09-21
 
@@ -938,6 +945,94 @@ still need its own timing gate.
 Use `IPC_FUSE_LONG_MOVE_LOADS=1`, `LOCKSTEP_FUSE_LONG_MOVE_LOADS=1`, or
 `--fuse-long-move-loads`. Production SocketTop remains unchanged. No board was
 halted, reset or reloaded; no board IPC or SoC timing gain is claimed.
+
+## Early SQ reservation for late store data — 2026-09-21
+
+Based on `a086a37c`. Default-off `reserveLateStore` gives the already-translated
+P3 fast store a real SQ slot before its operand arrives. Address/attributes use
+the existing allocation port and data uses the existing SQ array. Eight data-ready
+bits, a three-bit owner slot and one owner-valid bit distinguish reservation from
+publication. An unfilled entry consumes capacity, participates in overlap/age
+selection, but cannot forward stale array contents or drain. No additional PRF
+read port or store-data buffer is introduced.
+
+The qualified late-data capture writes directly to the reserved entry and may
+complete the store on that edge, eliminating the intervening P3-data staging
+cycle. Completion collision still holds P3; its existing data/NZVC fields retain
+the capture, and later completion never allocates/publishes again. Flush cancels
+the synchronous P3 owner and its uncommitted reservation together. If SQ capacity
+first appears on the capture edge, retain the ordinary captured-data allocation
+path: reserving then would leave no subsequent late-capture event to fill it.
+The registered readiness qualifier is cleared on departure so a replacing P3
+store cannot inherit its predecessor's ready decision. Precise/inhibited and
+privilege-blocked stores retain the original path.
+
+This is a **P3-owned reservation**, not dispatch SQ allocation, independent load
+retry or a guaranteed early memory wakeup. The shared completion port is not
+reserved ahead, so no wake promise is announced. The full memory-order ticket
+lifecycle/bypass work remains incomplete; see the amendment in
+[memory dependencies](memory-dependencies.md).
+
+Matched full-core comparison enables direct long MOVE loads and early store
+address in both arms. It retains the same 16 kernels, `l2:5:70`, seeds 1/17,
+first-to-last macro windows and four older load-option combinations. Against
+`/tmp/fused-long-move-combined-ipc.log`, all **128 macro counts match: 32 improve,
+96 are unchanged, no additional regressions**. The six prior fusion regressions
+against the original baseline remain; do not erase them from the cumulative
+assessment. Candidate: `/tmp/sq-reserve-corpus.log`. The fresh disabled rerun
+(`/tmp/sq-reserve-disabled-corpus.log`) passes and reproduces all 128 previous
+macro counts and cycle counts exactly. With both older load options:
+
+| Kernel | Macros | Before cycles (seed 1 / 17) | Reserved cycles | Incremental IPC gain |
+| --- | ---: | ---: | ---: | ---: |
+| divide → store → load recurrence | 98 | 2431 / 2431 | 2399 / 2399 | +1.33% / +1.33% |
+| rotate → store → load recurrence | 130 | 377 / 376 | 339 / 338 | +11.21% / +11.24% |
+| load → store recurrence | 130 | 406 / 405 | 347 / 346 | +17.00% / +17.05% |
+| delayed store + disjoint load | 163 | 2157 / 2158 | 2156 / 2157 | about +0.046% |
+
+The divider-bound disjoint case saves only one total cycle, not one per store.
+Every delayed-producer run records 32 reservations/publications; every short
+recurrence records 64. Test assertions match those against actual captures.
+These figures describe synthetic recurrence/throughput tests, not board Dhrystone.
+
+Directed SQ tests pass 256 full-capacity reservations with pseudorandom fill data,
+youngest-unfilled overlap suppression including subwords, simultaneous fill and
+allocation, same-edge flush/publication, committed preservation, owner cancellation,
+tail reuse and subsequent ordered drain (`/tmp/sq-reserve-directed-v2.log`).
+The first attempt used the existing single-command drain-ack helper, which misses
+adjacent pipelined commands, and was terminated while waiting for the missing
+ack (`/tmp/sq-reserve-directed.log`). The new test counts every accepted command
+and checks drain completion within 100 cycles; no RTL was relaxed for this fix.
+
+Thirteen selected combined-option oracle tests pass
+(`/tmp/sq-reserve-oracle-v2.log`), including a full SQ while late data arrives,
+redirect cancellation of an **observed unfilled reservation**, flags/byte lanes,
+split accesses, page-fault mapping/RTE/retry, A7 trap/RTE and wrong-path MMIO.
+The data/CCR test observes 21 reservations and 21 publications in copyback mode,
+one reserved completion-hold cycle, and zero reservations in inhibited mode.
+The first oracle invocation and its queued control failed to compile because a
+test referenced the existing flush signal under `logic` instead of its actual
+plugin-level location (`/tmp/sq-reserve-oracle.log`,
+`/tmp/sq-reserve-full-squash-control.log`); only that test reference was corrected.
+The two new full-capacity/redirect oracle controls also pass with reservation off
+(`/tmp/sq-reserve-full-squash-control-v2.log`). The required fast gate passes
+**384 tests**, two ignored, zero failed/aborted (`/tmp/sq-reserve-fast.log`). The
+broader SQ and split-SQ regressions pass **36 tests**, including the two new
+reservation tests (`/tmp/sq-reserve-regression.log`). Use
+`IPC_RESERVE_LATE_STORE=1`, `LOCKSTEP_RESERVE_LATE_STORE=1`, or
+`--reserve-late-store`, together with early store address execution. Production
+defaults remain off; no route or board improvement is claimed yet.
+
+Next dependency experiment to evaluate: move late-data ownership from P3 into
+the reserved SQ entry, reusing its stored address/data and adding only the source
+tag and minimal store-completion metadata. An independent late-data reader could
+then fill/complete the store while P3 serves younger known-disjoint loads. Keep
+oldest-LS address issue initially, so no load overtakes an unknown older address;
+known overlap with unavailable data remains a real wait. This could avoid a
+duplicate address table for that subset, but requires a spec amendment, a precise
+completion/flush/lifetime design and actual bypass/liveness tests. It is not
+implemented or a substitute for evaluating the remaining broader dependency,
+reservation-backed wakeup and retry requirements.
 
 ## Next investigations requested — 2026-09-21
 

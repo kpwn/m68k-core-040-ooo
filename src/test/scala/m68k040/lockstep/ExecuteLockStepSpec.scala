@@ -516,7 +516,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val lsEu   = new LsEuPlugin(
       alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
       earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
-      sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"))
+      sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
+      reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -5956,13 +5957,67 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // both halves of the line-crossing stores, after eviction.
       val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
         yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
-      var captures = 0
+      var captures = 0; var reservations = 0; var publications = 0; var completionHolds = 0
       runLockStep(s"early-store-data-$copyback", (setup ++ body.flatten ++ evict).mkString(" ; "),
         checkMem = Seq(0x3000L, 0x3010L), checkSpan = 16, maxCycles = 100000,
-        perCycle = dut => { if(dut.lsEu.logic.lateDataCapture.toBoolean) captures += 1 })
+        perCycle = dut => {
+          if(dut.lsEu.logic.lateDataCapture.toBoolean) captures += 1
+          if(dut.lsEu.logic.p3ReservationFire.toBoolean) reservations += 1
+          if(dut.lsEu.logic.p3ReservedPublish.toBoolean) publications += 1
+          if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean)
+            completionHolds += 1
+        })
       if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
         assert(captures > 0, "oracle corpus did not exercise late store data")
+      if(sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1")) {
+        assert(reservations == publications)
+        if(copyback) assert(reservations > 0) else assert(reservations == 0)
+        println(s"RESERVE_ORACLE copyback=$copyback captures=$captures reservations=$reservations " +
+          s"publications=$publications completionHolds=$completionHolds")
+      }
     }
+  }
+
+  test("lock-step: late SQ reservation falls back safely when data arrives while full", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "moveq #3,%d1", "move.l #0x11223344,%d2", "move.l #0x10000,%d0", "divu.w %d1,%d0")
+    val stores = (0 until 8).map(n => s"move.l %d2,0x${(0x3000 + 4 * n).toHexString}") ++
+      Seq("move.l %d0,0x3020", "seq %d3", "move.l 0x3020,%d4")
+    val evict = for(line <- Seq(0x3000, 0x3010, 0x3020); n <- 1 to 4)
+      yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+    var fullPending = 0; var fullCaptures = 0
+    runLockStep("late-sq-full-fallback", (setup ++ stores ++ evict).mkString(" ; "),
+      checkMem = (0 to 8).map(n => 0x3000L + 4 * n), checkSpan = 4,
+      maxCycles = 30000, perCycle = dut => {
+        if(dut.lsEu.logic.sq.io.full.toBoolean && dut.lsEu.logic.p3Valid.toBoolean &&
+          dut.lsEu.logic.p3LateDataPending.toBoolean) fullPending += 1
+        if(dut.lsEu.logic.sq.io.full.toBoolean && dut.lsEu.logic.lateDataCapture.toBoolean)
+          fullCaptures += 1
+      })
+    if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1")) {
+      assert(fullPending > 0 && fullCaptures > 0,
+        s"full-capacity fallback was not exercised: pending=$fullPending captures=$fullCaptures")
+    }
+  }
+
+  test("lock-step: late SQ reservation is canceled before data publication on redirect", VerilatorTest) {
+    val setup = Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+      "move.l #0x400FE020,%d7", "movec %d7,%itt0", "move.l #0xC000,%d7", "movec %d7,%tc",
+      "lea 0x3000,%a0", "move.l #0x11223344,(%a0)", "moveq #3,%d1", "move.l #0x10000,%d2")
+    val body = (0 until 12).flatMap(n => Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
+      s"bne.w .LreserveSkip$n", "divu.w %d1,%d2", "move.l %d2,(%a0)",
+      s".LreserveSkip$n: move.l (%a0),%d4"))
+    val evict = (1 to 4).map(n => s"move.l #0,0x${(0x3000 + n * 0x800).toHexString}")
+    var canceled = 0
+    runLockStep("late-sq-reservation-squash", (setup ++ body ++ evict).mkString(" ; "),
+      nInstr = setup.size + 12 * 4 + evict.size, checkMem = Seq(0x3000L), maxCycles = 30000,
+      perCycle = dut => {
+        if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.p3LateDataPending.toBoolean &&
+          dut.lsEu.sqFlushSig.toBoolean) canceled += 1
+      }, afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x11223344L))
+    if(sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"))
+      assert(canceled > 0, "redirect corpus did not cancel an unfilled SQ reservation")
   }
 
   test("lock-step: early store address is squashed behind mispredicted branches", VerilatorTest) {

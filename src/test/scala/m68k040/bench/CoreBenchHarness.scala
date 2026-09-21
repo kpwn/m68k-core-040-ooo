@@ -344,7 +344,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     deferTakenSlot1Conditional: Boolean = false,
                     retainRedirectHistory: Boolean = false,
                     earlyStoreAddress: Boolean = false,
-                    fuseLongMoveLoads: Boolean = false) extends Component {
+                    fuseLongMoveLoads: Boolean = false,
+                    reserveLateStore: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -377,7 +378,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
-      earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding)
+      earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
+      reserveLateStore = reserveLateStore)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -503,7 +505,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Actual SQ-forward completions in the IPC cycle window, not raw query hits.
       sqForwardCompletions: Int = 0,
       pipelineProfile: Option[PipelineProfile] = None,
-      lateStoreCaptures: Int = 0
+      lateStoreCaptures: Int = 0,
+      reservedStores: Int = 0,
+      reservedPublishes: Int = 0,
+      reservedCompletionHolds: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -610,6 +615,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
+      val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val robHisto = ArrayBuffer.empty[RobCycle]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
@@ -951,6 +957,9 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.iq.logic.lsSkidValid.toBoolean))
         sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         lateStoreHisto += dut.lsEu.logic.lateDataCapture.toBoolean
+        reserveStoreHisto += ((dut.lsEu.logic.p3ReservationFire.toBoolean,
+          dut.lsEu.logic.p3ReservedPublish.toBoolean,
+          dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean))
         countedMacros += acceptedMacros
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
@@ -1173,7 +1182,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         flushToCommit.toVector,
         ldCmdCycles.toVector, ldCmdAddrs.toVector, ldRspCycles.toVector, lsWbCycles.toVector,
         sqForwardHisto.slice(lo, hi + 1).count(identity), pipelineProfile,
-        lateStoreHisto.slice(lo, hi + 1).count(identity))
+        lateStoreHisto.slice(lo, hi + 1).count(identity),
+        reserveStoreHisto.slice(lo, hi + 1).count(_._1),
+        reserveStoreHisto.slice(lo, hi + 1).count(_._2),
+        reserveStoreHisto.slice(lo, hi + 1).count(_._3))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
