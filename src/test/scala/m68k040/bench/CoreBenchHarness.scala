@@ -513,7 +513,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       reservedPublishes: Int = 0,
       reservedCompletionHolds: Int = 0,
       detachedLoadOvertakes: Int = 0,
-      publicationForwards: Int = 0
+      publicationForwards: Int = 0,
+      readyStoreAdmissions: Int = 0,
+      pendingStoreOwnerWaits: Int = 0,
+      ownerWaitWithP4Overlap: Int = 0,
+      ownerWaitWithSqFull: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -623,6 +627,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val detachedOvertakeHisto = ArrayBuffer.empty[Boolean]
       val publicationForwardHisto = ArrayBuffer.empty[Boolean]
+      val readyAdmissionHisto = ArrayBuffer.empty[Boolean]
+      val pendingOwnerWaitHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val robHisto = ArrayBuffer.empty[RobCycle]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
@@ -968,6 +974,16 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.lsEu.logic.p3ReservedPublish.toBoolean,
           dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean))
         publicationForwardHisto += dut.lsEu.logic.sq.publishForwardHit.toBoolean
+        readyAdmissionHisto += dut.lsEu.logic.detachedStore.exists(_.readyAdmission.toBoolean)
+        val waitingOnOwner = dut.lsEu.logic.detachedStore.exists { d =>
+          d.valid.toBoolean && dut.lsEu.logic.p3Valid.toBoolean &&
+            dut.lsEu.logic.p3LateDataPending.toBoolean
+        }
+        // These predicates overlap: an occupied owner is not necessarily the
+        // unique bottleneck, nor does it prove the second source is already ready.
+        pendingOwnerWaitHisto += ((waitingOnOwner,
+          waitingOnOwner && dut.lsEu.logic.p4Valid.toBoolean && dut.lsEu.logic.p4Ctx.fwdStall.toBoolean,
+          waitingOnOwner && dut.lsEu.logic.sq.io.full.toBoolean))
         detachedOvertakeHisto += dut.lsEu.logic.detachedStore.exists { d =>
           val mask = (1 << d.ctx.robId.getWidth) - 1
           val head = dut.rob.logic.h0.toInt
@@ -1203,7 +1219,11 @@ trait CoreBenchHarness extends AnyFunSuite {
         reserveStoreHisto.slice(lo, hi + 1).count(_._2),
         reserveStoreHisto.slice(lo, hi + 1).count(_._3),
         detachedOvertakeHisto.slice(lo, hi + 1).count(identity),
-        publicationForwardHisto.slice(lo, hi + 1).count(identity))
+        publicationForwardHisto.slice(lo, hi + 1).count(identity),
+        readyAdmissionHisto.slice(lo, hi + 1).count(identity),
+        pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._1),
+        pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._2),
+        pendingOwnerWaitHisto.slice(lo, hi + 1).count(_._3))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")

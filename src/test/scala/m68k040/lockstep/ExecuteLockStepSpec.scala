@@ -5966,6 +5966,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
         yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
       var captures = 0; var reservations = 0; var publications = 0; var completionHolds = 0
+      var readyAdmissions = 0
       runLockStep(s"early-store-data-$copyback", (setup ++ body.flatten ++ evict).mkString(" ; "),
         checkMem = Seq(0x3000L, 0x3010L), checkSpan = 16, maxCycles = 100000,
         perCycle = dut => {
@@ -5975,6 +5976,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           if(dut.lsEu.logic.p3Reserved.toBoolean && dut.lsEu.logic.frontCompHeld.toBoolean)
             completionHolds += 1
           dut.lsEu.logic.detachedStore.foreach { d =>
+            if(d.readyAdmission.toBoolean) readyAdmissions += 1
             if(d.valid.toBoolean && (d.capture.toBoolean || d.captured.toBoolean) &&
               !d.complete.toBoolean) completionHolds += 1
           }
@@ -5985,7 +5987,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         assert(reservations == publications)
         if(copyback) assert(reservations > 0) else assert(reservations == 0)
         println(s"RESERVE_ORACLE copyback=$copyback captures=$captures reservations=$reservations " +
-          s"publications=$publications completionHolds=$completionHolds")
+          s"publications=$publications completionHolds=$completionHolds readyAdmissions=$readyAdmissions")
       }
     }
   }

@@ -162,6 +162,12 @@ in either direction. See `ipc-experiments.md`; structural pairing opportunities
 are not equivalent to throughput gains. Default remains off, with no timing run
 queued for this version.
 
+Re-tested after composing the LSU and retained-history improvements: call/return
+is faster (1342 to 1174 cycles), but pairing still saves no cycles. It increases
+head-incomplete observations from 503 to 587 by exposing the next blocked head
+earlier. Long backlog is 2240 cycles without pairing and 2241 with it. Keep this
+option parked; neither stall counts nor pair counts establish useful throughput.
+
 ### 7. Compact retirement records for selected cracked macros
 
 Keep execution micro-ops where needed, but represent a hot multi-uop instruction
@@ -324,6 +330,12 @@ The 65-test combined-option oracle run, default-generation control, six subword
 composition controls, 42 SQ/split tests and 384-test fast gate pass. Routing remains
 pending. Details and the remaining advance-wakeup/capacity/retry work are in the
 experiment ledger.
+
+Transferring source-readiness qualification on owner admission was also tested:
+all 136 windows retain exactly the same macro/cycle counts, so the functional
+shortcut was removed. Ready-admission and overlapping owner/P4/full-SQ counters
+remain. In the load-fed recurrence every owner-wait cycle overlaps a forwarding
+stall; owner occupancy alone is not evidence that more slots would help.
 
 ### 14. Shorter resident L1D path without a long permission cone
 

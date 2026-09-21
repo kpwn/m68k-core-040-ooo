@@ -1260,6 +1260,92 @@ that decision on admission, using the same source tag and existing register,
 without adding speculative readiness or another PRF port. Also quantify how often
 one pending owner blocks another ready address before expanding owner capacity.
 
+## Store readiness on owner admission — 2026-09-21 (not retained)
+
+Tested transferring the existing source-readiness query into `readyPrior` when
+the detached owner reserves its slot, instead of clearing that register. This
+uses the same source tag and registered qualification, with no extra port/state.
+All **136 matched macro/cycle counts are identical** to the publication-forwarding
+candidate: no IPC gain and no regression. The experiment was removed; admission
+still clears `readyPrior`. No routing job is warranted for this zero-gain change.
+
+Evidence: `/tmp/sq-admission-ipc.log`,
+`/tmp/sq-admission-instrumented-ipc.log`, and
+`/tmp/sq-admission-restored-ipc.log` each reproduce every macro/cycle count in
+`/tmp/sq-publish-candidate-ipc-v2.log`. The prototype passes 65 combined-option
+oracle tests, six subword-composition controls and the 384-test fast gate
+(`/tmp/sq-admission-oracle.log`, `/tmp/sq-admission-subword-oracle.log`,
+`/tmp/sq-admission-fast.log`). The early-data copyback oracle exercises six
+ready-on-admission events and checks their next-cycle captures. After restoring
+the original qualification, all eight targeted reservation/detachment oracle
+tests pass (`/tmp/sq-admission-restored-oracle.log`).
+
+Retained diagnostics count ready admissions and cycles with a pending P3 store
+behind an occupied owner, including overlap with P4 forwarding stalls and SQ
+fullness. These are overlapping observations, not exclusive stall attribution.
+With both older load optimizations, the rotate recurrence sees only one ready
+admission per window; the load-fed recurrence sees none. All 60 owner-wait cycles
+in the load-fed case also have a P4 forwarding stall. The divide recurrence's
+2224–2225 owner-wait cycles likewise overlap P4 stalls. The disjoint recurrence
+has 2106–2107 owner-wait cycles without that overlap, but this alone does not
+prove a second owner would improve IPC: the next source may still depend on the
+current recurrence. Keep the source-identity assertion, but require an actual
+matched benefit before adding capacity.
+
+## Composed LSU / prediction / retirement profiles — 2026-09-21
+
+Re-ran the seven pipeline-profile kernels at seeds 1/17 with `l2:5:70`, using
+exact warmed macro windows and an instrumentation-disabled matched control for
+every run. Four configurations, 28 runs each, pass the same register-result,
+branch-denominator and instrumentation-cycle checks. The test now accepts the
+existing LSU feature flags and reports occupancy and completed-prefix histograms.
+This is a composition measurement, not a new RTL optimization.
+
+`LSU` enables fall-through, early integer wake, direct long MOVE load fusion,
+early store address, late reservation, detached ownership and publication-edge
+forwarding. Subword forwarding remains off in these arms. `Prediction` adds
+slot-1 training/selective taken deferral and retained redirect history. `Pair`
+additionally enables correct-branch retirement pairing.
+
+| Warm kernel | Macros | Baseline cycles | LSU | LSU + prediction | + pair |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hot loop | 336 | 252 | 252 | 252 | 252 |
+| alternating, seed 1 | 132 | 135 | 135 | 138 | 139 |
+| alternating, seed 17 | 132 | 234 | 234 | 138 | 139 |
+| short backlog | 360 | 425 | 425 | 380 | 381 |
+| copyback call/return | 672 | 1342 | 1174 | 1174 | 1174 |
+| independent ALU | 396 | 267 | 267 | 267 | 267 |
+| long alternating | 2112 | 2170 | 2170 | 2112 | 2112 |
+| long backlog | 2520 | 2660 | 2660 | 2240 | 2241 |
+
+Both seeds agree except where split above. Call/return gains **14.310% IPC**
+(0.500745 to 0.572402), with head-incomplete cycles dropping 671 to 503. Long
+backlog gains **18.750% IPC** (0.947368 to 1.125000); misses fall 29 to 1 of 224
+retired branches. Long alternating gains **2.746%**, with 1/768 misses. The short
+alternating seed-1 regression remains **2.174%**. These accuracy figures are not
+representative Dhrystone coverage or proof of the overall 95% target.
+
+Pairing again supplies no throughput gain: its call/return cycles remain 1174,
+despite actually pairing branches. Head-incomplete cycles rise from 503 to 587
+because the next incomplete head is exposed earlier; this is not an IPC loss.
+Thus head-stall counts alone cannot rank retirement policies. All four arms have
+zero cycles without room for a pair of ROB allocations. Mean occupancy in the
+unpaired long backlog rises from 18.144 to 21.471 while IPC improves, illustrating
+that higher occupancy is not itself a regression. Completed-prefix histograms
+still expose a wider-retirement opportunity, but neither prove eligibility nor
+predict a speedup. Actual wider/prepared-retirement experiments remain open.
+
+Logs: `/tmp/composed-ipc-baseline.log`, `/tmp/composed-ipc-lsu.log`,
+`/tmp/composed-ipc-predictor.log`, `/tmp/composed-ipc-paired.log`.
+The required fast gate passes 384 tests, two ignored
+(`/tmp/composed-ipc-fast.log`). A broader combined LSU/prediction oracle run is
+in progress in `/tmp/composed-ipc-oracle.log`, including IRQ storms, redirects,
+translation faults, source lifetime and SQ recovery. Do not count this run as
+passed until its final suite result is recorded.
+No board intervention was performed. This combined configuration has not yet
+passed routed core or integrated-SoC timing; individual feature timing passes
+must not be substituted for composition signoff.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

@@ -2957,7 +2957,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
       when(sqFlushSig || excActive) { valid := False; readyPrior := False }
       GenerationFlags.simulation {
-        when(reserve.valid) { assert(!valid, "detached store owner overrun", FAILURE) }
+        when(reserve.valid) {
+          assert(!valid, "detached store owner overrun", FAILURE)
+          assert(query.queryTag === reserve.dataTag,
+            "detached store admission inherited a different source's readiness", FAILURE)
+        }
         when(capture) {
           assert(query.queryReady, "detached store source readiness revoked", FAILURE)
           assert(!issuePort.fire, "detached store capture collided with issue", FAILURE)
@@ -2965,6 +2969,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
       valid.simPublic(); captured.simPublic(); ctx.robId.simPublic()
       capture.simPublic(); complete.simPublic()
+      // Simulation-only observability: count the opportunity separately from
+      // actual capture. The evaluated qualification-transfer variant had no IPC gain.
+      val readyAdmission = reserve.valid && query.queryReady
+      readyAdmission.simPublic()
     }) else None
     val detachedStoreValid = detachedStore.map(_.valid).getOrElse(False)
     val detachedStoreCapture = detachedStore.map(_.capture).getOrElse(False)

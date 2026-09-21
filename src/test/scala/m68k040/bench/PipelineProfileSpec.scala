@@ -38,9 +38,19 @@ class PipelineProfileSpec extends CoreBenchHarness {
     val deferTaken = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1")
     val trainSlot1 = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || deferTaken
     val retainHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1")
+    val lsFlags = Seq(
+      "fallThrough" -> "IPC_LS_FALLTHROUGH", "earlyWake" -> "IPC_LS_EARLY_WAKEUP",
+      "subword" -> "IPC_SQ_SUBWORD", "earlyStore" -> "IPC_EARLY_STORE_ADDRESS",
+      "fusion" -> "IPC_FUSE_LONG_MOVE_LOADS", "reserve" -> "IPC_RESERVE_LATE_STORE",
+      "detach" -> "IPC_DETACH_LATE_STORE", "publish" -> "IPC_FORWARD_ON_PUBLISH")
+      .map { case (name, env) => name -> sys.env.get(env).contains("1") }.toMap
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(pairCorrectBranch = pairBranches,
       deferSlot1Conditional = deferConditionals, trainSlot1Conditional = trainSlot1,
-      deferTakenSlot1Conditional = deferTaken, retainRedirectHistory = retainHistory))
+      deferTakenSlot1Conditional = deferTaken, retainRedirectHistory = retainHistory,
+      alignedLoadFallThrough = lsFlags("fallThrough"), earlyLsIntWakeup = lsFlags("earlyWake"),
+      sqSubwordForwarding = lsFlags("subword"), earlyStoreAddress = lsFlags("earlyStore"),
+      fuseLongMoveLoads = lsFlags("fusion"), reserveLateStore = lsFlags("reserve"),
+      detachLateStore = lsFlags("detach"), forwardOnPublish = lsFlags("publish")))
     for ((kernel, expectedBranches) <- cases; seed <- Seq(1, 17)) {
       val control = runKernel(compiled, kernel.copy(name = s"${kernel.name}-control"), seed)
       val measured = runKernel(compiled,
@@ -62,14 +72,18 @@ class PipelineProfileSpec extends CoreBenchHarness {
       if (!pairBranches) assert(p.pairedBranchCycles == 0)
       if (pairBranches && kernel.name == "call-return") assert(p.pairedBranchCycles > 0)
       val accuracy = p.branchAccuracy.map(a => f"$a%.3f").getOrElse("NA")
+      val prefixHistogram = p.rob.groupBy(_.completePrefix).toSeq.sortBy(_._1)
+        .map { case (prefix, cycles) => s"$prefix:${cycles.size}" }.mkString(",")
       println(f"PIPELINE_PROFILE kernel=${kernel.name} seed=$seed " +
         s"pairBranches=$pairBranches deferConditionals=$deferConditionals trainSlot1=$trainSlot1 deferTaken=$deferTaken retainHistory=$retainHistory " +
+        s"lsFlags=${lsFlags.collect { case (name, true) => name }.toSeq.sorted.mkString(",")} " +
         s"first=${p.firstCycle} last=${p.lastCycle} pairedBranchCycles=${p.pairedBranchCycles} " +
         s"macros=${measured.retiredInstrs} baselineCycles=${control.windowCycles} cycles=${measured.windowCycles} " +
         f"IPC=${measured.ipc}%.6f branches=${p.retiredBranches} misses=${p.branchMisses} accuracy=$accuracy " +
         s"noPairCapacity=${p.noPairCapacityCycles} headIncomplete=${p.headIncompleteCycles} " +
         s"completedBacklog=${p.completedBacklogCycles} dualWithExtraComplete=${p.dualWithExtraCompleteCycles} " +
-        s"branchPairPotential=${p.branchPairPotentialCycles} memory=$memLabel")
+        s"branchPairPotential=${p.branchPairPotentialCycles} " +
+        f"meanOccupancy=${p.meanOccupancy}%.3f completePrefix=$prefixHistogram memory=$memLabel")
     }
   }
 }

@@ -132,7 +132,9 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
           f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures} " +
           s"reserved=${r.reservedStores} published=${r.reservedPublishes} completionHolds=${r.reservedCompletionHolds} " +
-          s"detachedLoadOvertakes=${r.detachedLoadOvertakes} publicationForwards=${r.publicationForwards}")
+          s"detachedLoadOvertakes=${r.detachedLoadOvertakes} publicationForwards=${r.publicationForwards} " +
+          s"readyAdmissions=${r.readyStoreAdmissions} ownerWaits=${r.pendingStoreOwnerWaits} " +
+          s"ownerWaitP4=${r.ownerWaitWithP4Overlap} ownerWaitSqFull=${r.ownerWaitWithSqFull}")
         r.pipelineProfile.foreach { p =>
           println(s"LS_FULL_PROFILE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
             s"first=${p.firstCycle} last=${p.lastCycle} branches=${p.retiredBranches} misses=${p.branchMisses} " +

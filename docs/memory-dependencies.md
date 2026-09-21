@@ -139,6 +139,12 @@ data port fills the SQ; issue is held only on that capture edge. Retain four NZV
 bits if the shared completion port is occupied, not another copy of store data.
 In-order retirement pins the source register until the store completes.
 
+The shared readiness query must name the source being admitted; assert that
+identity explicitly. Transferring its current result into the new owner was
+evaluated, but had no measured IPC gain in 136 windows and is not retained.
+Qualification still starts from false on admission; no prior owner's readiness
+may be inherited. See the experiment ledger for the measured opportunity rate.
+
 Already-launched cache responses and older precise-store replay keep priority.
 A ready detached completion then takes priority over new front completions, which
 can hold. Data publication is independent of completion-port contention, but no
