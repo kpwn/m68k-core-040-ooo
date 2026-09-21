@@ -371,7 +371,7 @@ within five minutes. A separate read-only service,
 `m68k-ipc-cleanup-baseline-routing-full.service`, waits for both CSR+PRAM and
 IQ/L2 recovery to terminate before acquiring the same Vivado mutex. It skips
 itself if the bounded retry already produced a reconciled summary; otherwise
-it scans the loaded baseline with a 1800-second loop budget into the fresh
+it scans the loaded baseline with a 3600-second loop budget into the fresh
 `/tmp/ipc-cleanup-cell-baseline-routing-full` directory. This preserves build
 priority and makes the promised complete census an actual queued task, not
 an interpretation of partial totals. Log:
