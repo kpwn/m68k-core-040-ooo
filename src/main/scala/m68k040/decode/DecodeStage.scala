@@ -311,6 +311,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val stashFpPend = Reg(Bool()) init False
     val stashFpVal  = Reg(Bits(80 bits))
 
+    // All five stash-valid setters below require an empty stash and capture the
+    // same a1raw payload. Invalid contents are unobservable: capture them early
+    // instead of routing late crack/engine arbitration to every payload CE.
+    // Keep validity/flush qualification below unchanged; hold ALL fields together
+    // while valid, including the FP immediate awaiting its side-table allocation.
+    when(!stashValid) {
+      stashCount := a1raw.count
+      stashUops := a1raw.uops
+      stashFpPend := a1raw.fpImmAlloc
+      stashFpVal := a1raw.fpWideImm
+    }
+
     val slot1Is3 = a1raw.count === U(3, 2 bits)
     val slot0Is3 = a0.count === U(3, 2 bits)
 
@@ -3096,9 +3108,6 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
       } elsewhen(deferSlot1 && fed.valid) {
         stashValid  := True                  // defer slot1 to next cycle (3-µop slot0 or slot1)
-        stashCount  := a1raw.count
-        for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
-          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
       }
     }
     // ── MOVEM FSM transitions ───────────────────────────────────────────────────
@@ -3179,9 +3188,6 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid  := True
-          stashCount  := a1raw.count
-          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
-          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
       // Empty mask: no moves (count 0 -> An unchanged); finish immediately (but the slot1
@@ -3304,9 +3310,6 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           ucPendSpecReg := fed.payload.specs(1).spec
         } otherwise {
           stashValid  := True
-          stashCount  := a1raw.count
-          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
-          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
       // Empty list (design doc §2): architecturally a no-op (no memory traffic, An
@@ -3418,9 +3421,6 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid := True
-          stashCount := a1raw.count
-          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
-          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
     } elsewhen(ucActive) {
@@ -3469,9 +3469,6 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
         } otherwise {
           stashValid := True
-          stashCount := a1raw.count
-          for (i <- 0 until 3) { stashUops(i) := a1raw.uops(i) }
-          stashFpPend := a1raw.fpImmAlloc; stashFpVal := a1raw.fpWideImm
         }
       }
     } elsewhen(movepActive) {
