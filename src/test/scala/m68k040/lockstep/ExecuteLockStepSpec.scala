@@ -508,7 +508,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val ren    = new RenameStage
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"))
-    val iq     = new IssueQueuePlugin
+    val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -5934,6 +5934,49 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       perCycle = dut => { if(dut.lsEu.logic.p4CompletionFire.toBoolean) forwards += 1 })
     if(sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"))
       assert(forwards > 0, "oracle test never exercised the new forwarding path")
+  }
+
+  test("lock-step: early store address preserves late data, byte lanes and CCR", VerilatorTest) {
+    for (copyback <- Seq(false, true)) {
+      val setup = (if(copyback) Seq("move.l #0x000FE020,%d7", "movec %d7,%dtt0",
+        "move.l #0x400FE020,%d7", "movec %d7,%itt0",
+        "move.l #0xC000,%d7", "movec %d7,%tc") else Nil) ++
+        (0 until 8).map(n => s"move.l #0,0x${(0x3000 + n * 4).toHexString}")
+      val producers = Seq(
+        Seq("moveq #3,%d1", "move.l #0x10000,%d0", "divu.w %d1,%d0"),
+        Seq("moveq #3,%d1", "moveq #0,%d0", "divu.w %d1,%d0"),
+        Seq("move.l #0x80000001,%d0", "lsl.l #1,%d0"),
+        Seq("move.l #0x89abcdef,%d2", "move.l %d2,0x5000", "move.l 0x5000,%d0"))
+      val body = for (producer <- producers; suffix <- Seq("b", "w", "l"); offset <- Seq(12, 15)) yield
+        Seq(s"lea 0x${(0x3000 + offset).toHexString},%a0", "moveq #0,%d5",
+          "move.l #0x55667788,%d4") ++ producer ++
+          Seq(s"move.$suffix %d0,(%a0)", "seq %d5", s"move.$suffix (%a0),%d4")
+      // Backing-memory comparison must observe dirty copyback lines, including
+      // both halves of the line-crossing stores, after eviction.
+      val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
+        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      var captures = 0
+      runLockStep(s"early-store-data-$copyback", (setup ++ body.flatten ++ evict).mkString(" ; "),
+        checkMem = Seq(0x3000L, 0x3010L), checkSpan = 16, maxCycles = 100000,
+        perCycle = dut => { if(dut.lsEu.logic.lateDataCapture.toBoolean) captures += 1 })
+      if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
+        assert(captures > 0, "oracle corpus did not exercise late store data")
+    }
+  }
+
+  test("lock-step: early store address is squashed behind mispredicted branches", VerilatorTest) {
+    val setup = Seq("lea 0x3000,%a0", "move.l #0x11223344,(%a0)", "moveq #3,%d1")
+    val body = (0 until 12).flatMap(n => Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
+      s"bne.w .LlateSkip$n", "move.l %d0,(%a0)", s".LlateSkip$n: move.l (%a0),%d4"))
+    var pendingCycles = 0
+    runLockStep("early-store-data-squash", (setup ++ body).mkString(" ; "),
+      nInstr = setup.size + 12 * 4, checkMem = Seq(0x3000L), maxCycles = 30000,
+      perCycle = dut => {
+        if(dut.lsEu.logic.p3Valid.toBoolean && dut.lsEu.logic.p3LateDataPending.toBoolean)
+          pendingCycles += 1
+      }, afterRun = (_, oracle) => assert(oracle.last.d(4) == 0x11223344L))
+    if(sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"))
+      assert(pendingCycles > 0, "squash corpus did not execute an early store address")
   }
 
   // ── MOVE-to/from-memory CCR (the bug fix) ──────────────────────────────────

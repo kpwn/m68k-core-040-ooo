@@ -84,7 +84,10 @@ object DynWait {
   val cplxFpccBits = Seq(FPCC)
 }
 
-class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
+class IssueQueuePlugin(val earlyStoreAddress: Boolean = false) extends FiberPlugin
+    with IssueQueueService with m68k040.services.LateStoreDataService {
+  private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
+  override def lateStoreData = lateStorePorts
   val slotCount = 16
   val wayCount  = 2
   val lineCount = 8 // slotCount / wayCount
@@ -116,6 +119,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
   override def cplxFpccWakeup: Flow[UInt] = cplxFpccWakeupPort
 
   during setup {
+    if (earlyStoreAddress) lateStorePorts = Some(m68k040.services.LateStoreDataPorts())
     pushPort      = Stream(Vec(IqContext(), wayCount))
     pushSlot1Port = Bool()
     // 5 issue ports: 0,1 = ALU (non-branch, non-LS, non-CPLX), 2 = branch, 3 = LS,
@@ -432,6 +436,9 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val aluSlowIntBusy  = Reg(Bits(physIntN bits)) init 0
     val aluSlowNzvcBusy = Reg(Bits(16 bits)) init 0
     val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
+    lateStorePorts.foreach { p =>
+      p.queryReady := !(lsBusy | cplxBusy | aluSlowIntBusy)(p.queryTag)
+    }
 
     // cplxFpBusy[p] => FP physreg p is produced by an in-flight (not-yet-completed) CPLX
     // FP op. A reader of p is held NOT-ready until cplxFpWakeup(p). SEPARATE from cplxBusy
@@ -563,7 +570,17 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     // LS = isLs; CPLX = isCplx (CHK + DIV -> DivEu).
     val aluReady = B(slots.map(s => s.ready && !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)))
     val brReady  = B(slots.map(s => s.ready &&  s.hot.isBranch))
-    val lsReady  = B(slots.map(s => s.ready &&  isLs(s.hot)))
+    val lsFullyReady = B(slots.map(s => s.ready && isLs(s.hot)))
+    val storeAddressReady = if (earlyStoreAddress) {
+      val dataMask = (BigInt(1) << DynWait.LS_B) | (BigInt(1) << DynWait.CPLX_B) |
+        (BigInt(1) << DynWait.SLOW_B)
+      B(slots.zipWithIndex.map { case (s, i) =>
+        s.sel && s.hot.canEarlyStoreData &&
+          (if (i == 0) True else s.triggers(i - 1 downto 0) === 0) &&
+          !(s.dynWait & ~B(dataMask, DynWait.width bits)).orR
+      })
+    } else B(0, slotCount bits)
+    val lsReady = lsFullyReady | storeAddressReady
     val cplxReady= B(slots.map(s => s.ready &&  isCplx(s.hot)))
     val hots = Vec(slots.map(_.hot))
 
@@ -606,6 +623,7 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     val lsSkidValid = RegInit(False)
     lsSkidValid.simPublic()
     val ohL = ohLoldest & lsReady & B(slotCount bits, default -> !lsSkidValid)
+    val lsSelectedLateData = (ohL & ~lsFullyReady).orR
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop
     // writes only the quotient and hands the remainder to its trailing DIVREM crack µop
@@ -848,6 +866,16 @@ class IssueQueuePlugin extends FiberPlugin with IssueQueueService {
     when(flushSignal) {
       lsSkidValid := False
       lsIssValid  := False
+    }
+    lateStorePorts.foreach { p =>
+      val skidPending = RegInit(False)
+      val issuePending = RegInit(False)
+      when(lsPiped.ready) {
+        issuePending := Mux(lsSkidValid, skidPending, lsSelectedLateData)
+      }
+      when(selPorts(3).fire) { skidPending := lsSelectedLateData }
+      when(flushSignal) { skidPending := False; issuePending := False }
+      p.issuePending := issuePending
     }
     GenerationFlags.simulation {
       // The two forward sources are exclusive by the `ohL` mask; a violation here would

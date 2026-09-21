@@ -76,6 +76,40 @@ NaxRiscv's speculative memory-order rollback policy.
 
 ## Required ownership and lifetime
 
+### Controlled intermediate experiment: early store address, ordered publication
+
+`earlyStoreAddress` is default-off. It separates address/data readiness before
+enabling overtaking loads: the oldest LS operation remains the only issue
+candidate, but an ordinary register-to-memory MOVE may issue with only its
+dynamic srcB dependency outstanding. All static triggers, base/index and other
+dynamic dependencies must already be clear. Stack, auto-update, alternate-space,
+privileged and non-MOVE forms remain on the original path.
+
+IQ owns an optional `LateStoreDataService`: the pending-data bit follows the
+existing LS skid/issue registers exactly, and an LSU-supplied physical source tag
+queries the IQ's persistent dynamic scoreboards. This is not a new producer of
+register-ready state. LSU carries the source tag and pending bit through its
+owned front contexts while calculating/translating the address. P3 holds that
+store until data is captured, so younger loads cannot pass it or miss its SQ
+entry. No memory-dependency bypass or early wake promise is implied.
+
+Once the busy query is clear, wait one additional registered cycle before
+capturing PRF data, including the existing next-cycle LS early-wakeup contract.
+Reuse the existing store-data PRF read port and block new LSU issue only on the
+capture cycle. Update P3's existing data/NZVC fields and clear its pending bit;
+allocation/completion may happen on the following cycle under the existing SQ
+capacity and completion arbitration. Do not add a replicated PRF read port or a
+second data buffer. An already-ready store follows the unchanged path.
+
+In-order retirement prevents younger overwrites from reclaiming this store's
+physical source before capture. Flush/exception ownership cancels pending front
+contexts and readiness qualification. Translation faults retain normal precise
+delivery and must never publish the unready data. Validate delayed DIV/shift/load
+producers, srcA/srcC dependencies, skid/backpressure, NZVC, flush/reuse, split and
+inhibited accesses, and both positions of the LS early-integer-wakeup option.
+This experiment is a step toward independent address/data execution, not a
+replacement for the full reservation/dependency/retry integration above.
+
 Memory operations must be represented before they can be overtaken: reserve a
 memory-order record at dispatch, atomically with ROB/IQ allocation. A store's
 address readiness and data readiness are independent. Address generation and

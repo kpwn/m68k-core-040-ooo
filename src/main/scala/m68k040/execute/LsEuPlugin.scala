@@ -269,6 +269,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   }
 
   val logic = during build new Area {
+    val lateStoreData = host.get[m68k040.services.LateStoreDataService].flatMap(_.lateStoreData)
     val dcache = host[DcacheService]
     val xlate  = host[DTranslationService]
     // The current architectural S bit (ROB-owned) — a normal LOAD/STORE's DTLB
@@ -735,6 +736,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     s1Ctx.robId.simPublic() // debug-only observability, task #139 finding #1 investigation; zero synth impact
     val s1Base  = Reg(UInt(32 bits))
     val s1Data  = Reg(Bits(32 bits))
+    val s1LateData = lateStoreData.map(p => RegNextWhen(p.issuePending, issuePort.fire) init False)
     // Registered scaled index term (brief-format indexed EA): 0 for a non-indexed access.
     val s1Index = Reg(UInt(32 bits))
     val u1 = s1Ctx.uop
@@ -889,6 +891,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // The full 300+ bit RenamedUop stays in P1; P2/P3/P4 replicate this pruned token
     // instead, keeping the area cost of three simultaneously-resident accesses bounded.
     case class FrontPipeCtx() extends Bundle {
+      val lateDataPending = if (lateStoreData.nonEmpty) Bool() else null
+      val lateDataTag = if (lateStoreData.nonEmpty) UInt(6 bits) else null
       val robId           = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
       val vaddr           = UInt(32 bits)
       val addrB           = UInt(32 bits)
@@ -1926,6 +1930,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // successful (non-faulting) probe never turns into a real second access.
       dst.addrB           := Mux(movemCrosses, movemCrossAddr, s1AddrB)
       dst.storeData       := s1StoreData
+      lateStoreData.foreach { _ =>
+        dst.lateDataPending := s1LateData.get
+        dst.lateDataTag := u1.psrcB
+      }
       dst.anWb            := s1AnWb
       dst.storeNzvc       := storeNzvc
       dst.size            := u1.size
@@ -3111,10 +3119,49 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p3Front          = p3Ctx.front
     val p3IsLoad         = p3Front.memOp === MemOp.LOAD
     val p3IsStore        = p3Front.memOp === MemOp.STORE
+    val p3LateDataPending = lateStoreData.map(_ => p3Front.lateDataPending).getOrElse(False)
+    val lateDataCapture = Bool()
+    if (lateStoreData.isEmpty) lateDataCapture := False
+    lateStoreData.foreach { p =>
+      p.queryTag := p3Front.lateDataTag
+      // One registered clear cycle after the producer's busy bit clears. This
+      // covers next-cycle LS early wakeups before reusing the data read port.
+      val readyPrior = RegNext(p3Valid && p3LateDataPending && p.queryReady &&
+        !sqFlushSig && !excActive) init False
+      // The live source cannot be reallocated before this store completes. Once
+      // qualified, readiness cannot revoke; keep the wide busy lookup off the
+      // read-port arbitration/issue-ready cone.
+      lateDataCapture := p3Valid && p3LateDataPending && readyPrior &&
+        !sqFlushSig && !excActive
+      when(lateDataCapture) {
+        rdData.addr := p3Front.lateDataTag
+        p3Ctx.front.storeData := rdData.data
+        p3Ctx.front.storeNzvc := moveNzvc(rdData.data, p3Front.size)
+        p3Ctx.front.lateDataPending := False
+      }
+      GenerationFlags.simulation {
+        when(lateDataCapture) {
+          assert(p.queryReady, "late store source readiness revoked before capture", FAILURE)
+          assert(!issuePort.fire, "late store capture collided with a new data-port reader", FAILURE)
+        }
+        when(issuePort.fire && p.issuePending) {
+          assert(u0.memOp === MemOp.STORE && u0.psrcBValid && !u0.pdstValid &&
+            !u0.stkPush && u0.eaAuto === m68k040.decode.EaAuto.NONE && !u0.movesAliasStore,
+            "late store data issued on an unsupported operation", FAILURE)
+        }
+        when(p3Valid && p3LateDataPending) {
+          assert(!sq.io.alloc.valid && !p3CompletionFire,
+            "store published before its late data capture", FAILURE)
+        }
+      }
+    }
+    lateDataCapture.simPublic(); p3LateDataPending.simPublic()
     val olderThanP3Comp  = backCompFires || preciseReplayClaimsComp || p4CompletionFire
     when(p3Valid && !sqFlushSig && !excActive) {
       when(p3IsStore) {
-        when(storePrivBlocked) {
+        when(p3LateDataPending) {
+          // Address has resolved; preserve ordering until data is resident.
+        } elsewhen(storePrivBlocked) {
           when(olderThanP3Comp) {
             frontCompHeld := True
           } otherwise {
@@ -3363,7 +3410,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // before. A flush invalidates every unlaunched stage in one edge.
     val s1ToT   = s1Valid && tReady
     val s1Ready = !s1Valid || s1ToT
-    issuePort.ready := s1Ready && !sqFlushSig && !excActive
+    issuePort.ready := s1Ready && !sqFlushSig && !excActive && !lateDataCapture
 
     // Oldest-to-youngest valid updates, then accept-last replacements. Later writes
     // intentionally win when a stage consumes and accepts on the same edge.

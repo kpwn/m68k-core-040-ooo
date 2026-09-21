@@ -17,6 +17,30 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
     Kernel("delayed-store-disjoint-load", (setup ++ body).mkString(" ; ") + guard,
       setup.size + body.size, copybackDtt = true)
   }
+  private def delayedStoreRecurrence: Kernel = {
+    val setup = Seq("moveq #1,%d1", "move.l #0x7fff,%d0")
+    val body = Seq.fill(32)(Seq("divu.w %d1,%d0", "move.l %d0,0x4600",
+      "move.l 0x4600,%d0")).flatten
+    Kernel("delayed-store-recurrence", (setup ++ body).mkString(" ; ") + guard,
+      setup.size + body.size, copybackDtt = true,
+      verifyRetirement = obs => {
+        val lastD0 = obs.filter(o => o.archRegValid && o.archRegId == 0).last
+        assert((lastD0.archRegWrite & 0xffffffffL) == 0x7fffL)
+      })
+  }
+  private def shortStoreRecurrence(loadProducer: Boolean): Kernel = {
+    val setup = Seq("move.l #0x13579bdf,%d0", "move.l %d0,0x4620")
+    val producer = if(loadProducer) "move.l 0x4620,%d0" else "rol.l #1,%d0"
+    val body = Seq.fill(32)(Seq(producer, "move.l %d0,0x4600",
+      "move.l 0x4600,%d0", "move.l %d0,0x4620")).flatten
+    Kernel(if(loadProducer) "short-store-load-recurrence" else "short-store-shift-recurrence",
+      (setup ++ body).mkString(" ; ") + guard,
+      setup.size + body.size, copybackDtt = true,
+      verifyRetirement = obs => {
+        val lastD0 = obs.filter(o => o.archRegValid && o.archRegId == 0).last
+        assert((lastD0.archRegWrite & 0xffffffffL) == 0x13579bdfL)
+      })
+  }
   private def pointerChain: Kernel = {
     val iters = 64
     val setup = Seq("lea 0x4000,%a0", s"moveq #$iters,%d7",
@@ -38,13 +62,19 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
   test("fall-through improves full-core dependent-load IPC without changing access order", VerilatorTest) {
     val stream = kLoadStream
     val mixed = kSameLineCopyback
-    val kernels = Seq(pointerChain,
+    val allKernels = Seq(pointerChain,
       stream.copy(src = stream.src + guard, copybackDtt = true),
       mixed.copy(src = mixed.src + guard)) ++
       Seq(kDependentAlu, kIndependentAlu, kHotLoop, kLoadStore, kMixed,
         kStoreStream, kCallReturn).map(k => k.copy(src = k.src + guard)) ++
       Seq(kLoadStore, kMixed).map(k => k.copy(name = k.name + "-copyback",
-        src = k.src + guard, copybackDtt = true)) ++ Seq(delayedStore)
+        src = k.src + guard, copybackDtt = true)) ++ Seq(delayedStore, delayedStoreRecurrence,
+          shortStoreRecurrence(loadProducer = false), shortStoreRecurrence(loadProducer = true))
+    val kernels = sys.env.get("IPC_KERNEL_REGEX") match {
+      case Some(pattern) => allKernels.filter(k => k.name.matches(pattern))
+      case None => allKernels
+    }
+    require(kernels.nonEmpty, "IPC_KERNEL_REGEX matched no kernels")
     val seeds = Seq(1, 17)
     val modes = Seq((false, false), (true, false), (false, true), (true, true))
     val results = modes.map { case (enabled, earlyWake) =>
@@ -54,10 +84,13 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
         deferSlot1Conditional = sys.env.get("IPC_DEFER_CONDITIONAL").contains("1"),
         trainSlot1Conditional = sys.env.get("IPC_TRAIN_SLOT1").contains("1") || sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
         deferTakenSlot1Conditional = sys.env.get("IPC_DEFER_TAKEN_SLOT1").contains("1"),
-        retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1")))
+        retainRedirectHistory = sys.env.get("IPC_RETAIN_HISTORY").contains("1"),
+        earlyStoreAddress = sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1")))
       (for(k <- kernels; seed <- seeds) yield {
         val r = runKernel(compiled, k, seed)
         assert(r.retiredInstrs >= k.retiredInstrs)
+        if(k.name.startsWith("delayed-store-") && sys.env.get("IPC_EARLY_STORE_ADDRESS").contains("1"))
+          assert(r.lateStoreCaptures == 32, "all 32 delayed stores must use late capture")
         if(k.name == pointerChain.name) {
           assert(r.ldCmdAddrs.size >= 258, s"pointer chase did not execute its loads: ${r.ldCmdAddrs.size}")
           r.ldCmdAddrs.zipWithIndex.foreach { case (addr, n) =>
@@ -66,7 +99,7 @@ class LsFallThroughIpcSpec extends CoreBenchHarness {
           }
         }
         println(f"LS_FULL_CORE fallThrough=$enabled earlyWake=$earlyWake seed=$seed kernel=${k.name} " +
-          f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f")
+          f"retired=${r.retiredInstrs} cycles=${r.windowCycles} IPC=${r.ipc}%.6f lateStoreCaptures=${r.lateStoreCaptures}")
         if(k.name == pointerChain.name) {
           val gaps = r.ldCmdCycles.sliding(2).collect { case Seq(a, b) => b - a }.toSeq
           println(s"LS_FULL_CORE_LOAD_SPACING fallThrough=$enabled earlyWake=$earlyWake seed=$seed " +

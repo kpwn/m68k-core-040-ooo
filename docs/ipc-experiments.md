@@ -734,6 +734,85 @@ translated spans/attributes, release or retry denied loads without blocking the
 older producer, and guarantee SQ/completion capacity before early wakeup. Do not
 install the table in a CPU merely to accumulate reservations without those owners.
 
+## Early store address, ordered late-data publication — 2026-09-21
+
+Based on `8bedea22`; default-off `earlyStoreAddress` advances proposal 12 without
+yet allowing younger loads to overtake a store. Ordinary register-to-memory MOVE
+may start address calculation/translation while only its dynamic data operand
+is outstanding. All address/static dependencies must be ready. The existing P3
+token waits for a registered IQ readiness query, reuses the store-data PRF port,
+and captures into its existing data/NZVC fields. Publication follows through the
+normal SQ/completion arbitration. There is no extra PRF read port, data buffer,
+early completion, or speculative architectural write. See the precise eligibility
+and lifetime contract in [memory dependencies](memory-dependencies.md).
+
+Matched initial corpus: `l2:5:70`, seeds 1/17, all four combinations of aligned
+load fall-through and early load integer wakeup. Predictor experiments and SQ
+subword forwarding are off. These are full-kernel windows including setup, not
+the warmed predictor windows above. **112 pairs: 96 unchanged, 16 improved,
+zero regressions**, identical macro counts. Twelve kernels are unchanged across
+all modes/seeds. All 32 delayed stores in each of the two new delayed-producer
+kernels actually use late capture; a test assertion prevents a silent fallback.
+
+| Kernel | Load options | Macros | Baseline cycles (seed 1 / 17) | Candidate cycles (both seeds) | IPC gain |
+| --- | --- | ---: | ---: | ---: | ---: |
+| divide → store → load recurrence | neither / fall-through only | 98 | 2574 / 2572 | 2465 | 4.42% / 4.34% |
+| divide → store → load recurrence | early wake / both | 98 | 2543 / 2541 | 2433 | 4.52% / 4.44% |
+| delayed store + disjoint load | neither | 163 | 2163 / 2163 | 2161 | 0.093% |
+| delayed store + disjoint load | fall-through / early wake | 163 | 2162 / 2162 | 2160 | 0.093% |
+| delayed store + disjoint load | both | 163 | 2161 / 2161 | 2159 | 0.093% |
+
+The divider-bound disjoint case gains only two total cycles; do not multiply that
+by 32 stores or claim that early address issue provides load bypass. The recurrence
+isolates a latency benefit but is not a Dhrystone or whole-system improvement.
+Evidence: `/tmp/early-store-address-corpus-baseline.log` and
+`/tmp/early-store-address-corpus-candidate.log`.
+
+The additional short-source comparison also passes: **16 pairs, eight improved,
+eight unchanged**, no regressions. All retire 130 macros, with identical final
+register results. Rotate-fed recurrence costs 527 → 498/497 cycles without early
+load wakeup (seeds 1/17), and 497/496 → 468/467 with it: **5.82–6.21% IPC gain**.
+Fall-through does not change these figures. Every rotate-fed run observes 32 late
+captures. Load-fed recurrence is unchanged: 731/730 cycles without early wakeup,
+669/668 with it, and **zero late captures**. Thus this load-fed case does not prove
+the new path improves common load→store chains; ordinary MOVE loads still crack
+through an internal temporary and an ALU move. Do not attribute its unchanged
+result to a tested late-capture latency. Evidence:
+`/tmp/early-store-short-baseline.log` and `/tmp/early-store-short-candidate.log`.
+Together the two comparisons cover **128 pairs: 24 improved, 104 unchanged**.
+`IPC_KERNEL_REGEX='short-store-.*'` reproduces the additional comparison;
+`IPC_KERNEL_REGEX` rejects an empty selection, and unset runs retain all kernels.
+
+Directed IQ off/on tests pass dependency gating, held issue/skid identity under
+compaction/backpressure, persistent readiness, flush and reused IDs
+(`/tmp/early-store-address-iq.log`). New full-core oracle tests check DIV, shift
+and load producers; byte/word/long stores including line crossing; flags;
+inhibited versus copyback memory; and wrong-path stores behind branch recovery
+(`/tmp/early-store-address-oracle.log`). The final RTL also passes nine selected
+oracle tests with early load wakeup enabled, including both new cases, interleaved
+redirects, write protection, nonresident page recovery, IRQ, speculative device
+loads, divide-by-zero and split loads (`/tmp/early-store-address-recovery.log`).
+These are selected gates, not a claim that every exception/store interleaving is
+exhaustively tested.
+
+The first elaboration rejected duplicate unconditional assignments to the capture
+signal; compile-time enabled/disabled construction now gives it one driver.
+The failed run remains `/tmp/early-store-address-ipc.log`; the repaired original
+104-row corpus passed in `/tmp/early-store-address-ipc-v2.log`. A later timing-minded
+cleanup removed a redundant live busy-query term from capture/issue arbitration:
+the registered ready decision is irrevocable while this store owns its physical
+source. A simulation assertion checks that contract. All 112 matched rows and
+the nine recovery tests above use that final form.
+
+Use `IPC_EARLY_STORE_ADDRESS=1`, `LOCKSTEP_EARLY_STORE_ADDRESS=1`, or the core
+generator's `--early-store-address`. Production SocketTop remains unchanged.
+The required fast gate passes **384 tests**, two ignored, zero failed/aborted
+(`/tmp/early-store-address-fast.log`); a repeat is in progress after the short-source
+simulations. Routed timing disposition is pending; no integrated SoC timing or
+board improvement is established. Full memory-order
+ticket lifecycle, independent load retry/bypass, SQ reservation and guaranteed
+early memory wakeup remain separate unfinished work.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style

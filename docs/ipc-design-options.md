@@ -248,6 +248,14 @@ load must release the LSU front so the older store can progress.
 **Experiment:** delayed-store/disjoint-load, overlap, aliases and cold barriers;
 full-core IPC after integration, not just checker tests. **Priority: high.**
 
+Intermediate result: default-off early store address execution, still without
+load bypass, passes 128 matched full-core cases. Divide-fed and rotate-fed
+store/load recurrences improve 4.34–6.21%; the load-fed recurrence is unchanged
+and never takes late capture. There are no measured cycle regressions. It reuses
+the existing PRF read port and P3 data fields; independent SQ publication/retry
+and routed timing remain unfinished. See the experiment ledger for exact windows
+and gates, not a board-speedup claim.
+
 ### 13. Reserved SQ slots and guaranteed early store-data wake
 
 Reserve SQ capacity before publication; wake a dependent load early only when

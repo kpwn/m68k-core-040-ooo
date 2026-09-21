@@ -77,6 +77,9 @@ case class IqHot() extends Bundle {
   val isAluSlow         = Bool()
   val srcBRegDespiteImm = Bool()
   val isDivFam          = Bool()
+  // Eligibility for the optional address-before-data store path. Decode once at
+  // dispatch; the hot select cone only consumes this bit.
+  val canEarlyStoreData = Bool()
   val cluster  = m68k040.isa.Cluster()
   val memOp    = m68k040.isa.MemOp()
   val leaAddr  = Bool()
@@ -115,6 +118,11 @@ case class IqHot() extends Bundle {
     op := u.op; cluster := u.cluster; memOp := u.memOp
     // Scheduling classes, derived ONCE here instead of in every slot's cone.
     isAluSlow         := m68k040.decode.DecOp.isAluSlow(u.op)
+    canEarlyStoreData := u.cluster === m68k040.isa.Cluster.LS &&
+      u.memOp === m68k040.isa.MemOp.STORE && u.op === m68k040.decode.DecOp.MOVE &&
+      u.psrcBValid && !u.stkPush && u.eaAuto === m68k040.decode.EaAuto.NONE &&
+      !u.movesAliasStore && !u.altAddrSpace && !u.needsSupervisor && !u.sysOp &&
+      !u.pdstValid && !u.leaAddr
     srcBRegDespiteImm := (u.op === m68k040.decode.DecOp.PACK)     ||
                          (u.op === m68k040.decode.DecOp.UNPK)     ||
                          (u.op === m68k040.decode.DecOp.BITFIELD) ||

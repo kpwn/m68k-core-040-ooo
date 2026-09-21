@@ -814,7 +814,8 @@ object GenFullCoreSynthVerilog {
                 deferSlot1Conditional: Boolean = false,
                 trainSlot1Conditional: Boolean = false,
                 deferTakenSlot1Conditional: Boolean = false,
-                retainRedirectHistory: Boolean = false): Unit = {
+                retainRedirectHistory: Boolean = false,
+                earlyStoreAddress: Boolean = false): Unit = {
     val p = M68kParams()
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
@@ -848,7 +849,7 @@ object GenFullCoreSynthVerilog {
           new RenameStage(),
           new DispatchPlugin(),
           new RobPlugin(pairCorrectBranch = pairCorrectBranch),
-          new IssueQueuePlugin(),
+          new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress),
           eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
@@ -876,7 +877,7 @@ object GenFullCoreSynthVerilog {
   }
 
   def main(args: Array[String]): Unit = {
-    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history")),
+    require(args.forall(Set("--aligned-load-fall-through", "--early-ls-int-wakeup", "--sq-subword-forwarding", "--pair-correct-branch", "--defer-slot1-conditional", "--train-slot1-conditional", "--defer-taken-slot1-conditional", "--retain-redirect-history", "--early-store-address")),
       "unknown FullCoreSynth experiment option")
     buildWith(readDbgBuildIdEnv(), vioEnable = false, outputName = "M68kFullCoreSynth",
       alignedLoadFallThrough = args.contains("--aligned-load-fall-through"),
@@ -886,7 +887,8 @@ object GenFullCoreSynthVerilog {
       deferSlot1Conditional = args.contains("--defer-slot1-conditional"),
       trainSlot1Conditional = args.contains("--train-slot1-conditional") || args.contains("--defer-taken-slot1-conditional"),
       deferTakenSlot1Conditional = args.contains("--defer-taken-slot1-conditional"),
-      retainRedirectHistory = args.contains("--retain-redirect-history"))
+      retainRedirectHistory = args.contains("--retain-redirect-history"),
+      earlyStoreAddress = args.contains("--early-store-address"))
   }
 }
 
