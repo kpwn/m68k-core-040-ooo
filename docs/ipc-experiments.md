@@ -2041,6 +2041,16 @@ Artifacts: `/tmp/sq-detach-gate.97VroC/{baseline,detached}-summary.txt` and
 the detached arm's `synth/fullcore_route_{timing,util}.rpt`. The recovery unit
 finished successfully; publication-forwarding now holds the Vivado mutex.
 
+The queued-context implementation is committed as `b4c99f82`. A matched
+one/two/four-owner core-only physical screening is queued behind early NZVC:
+`m68k-ls-queued-gate.service`, `/tmp/ls-queued-gate.xtEogz`, pinned to
+`b4c99f8261052a0d067a82c6123de12d2e213c1b`. Every arm uses the composed LSU and
+selective-predictor/history options with ordinary two-wide retirement; only owner
+capacity differs. The script uses fresh detached worktrees, netlist SHA-256s and
+the shared Vivado mutex. The existing `build-logs` tmux pane follows these logs.
+This is queued screening, not a timing result or functional acceptance; the
+shared IRQ boundary-33 issue remains open. No board reset, halt or reload occurred.
+
 ## Next investigations requested — 2026-09-21
 
 After the current LSU work, investigate branch prediction and a BOOM-style
