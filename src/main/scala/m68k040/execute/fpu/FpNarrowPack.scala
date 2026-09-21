@@ -296,9 +296,18 @@ class FpNarrowPack extends Component {
     // SoftFloat returns from the invalid arm BEFORE the inexact test, so an overflowing
     // conversion raises OPERR only.
     val intInex   = !intOvf && r.intRbNz
-    val intSigned = intVal.asSInt
-    val outOfWord = (intSigned > S(32767, 32 bits)) || (intSigned < S(-32768, 32 bits))
-    val outOfByte = (intSigned > S(127, 32 bits))   || (intSigned < S(-128, 32 bits))
+    // Compare the rounded magnitude directly, in parallel with sign fix-up.
+    // A negative N-bit integer may have magnitude exactly 2^(N-1), but no
+    // larger; a positive one must be smaller. 32-bit saturation is outside
+    // both narrow ranges, so high magnitude bits also cover that case.
+    // This removes negate -> signed-compare carry chains from FP OPERR/issue
+    // control without changing intVal, inexact, register count or latency.
+    def outsideSignedWidth(width: Int): Bool =
+      r.intHiNz || r.intLow32(31 downto width).orR ||
+        (r.intLow32(width - 1) &&
+          (!r.intSign || r.intLow32(width - 2 downto 0).orR))
+    val outOfWord = outsideSignedWidth(16)
+    val outOfByte = outsideSignedWidth(8)
 
     // ── packFloatN, without the wide add. SoftFloat's `(exp<<23) + zSig` relies on the
     // significand carrying INTO the exponent field: the pre-round significand is confined
