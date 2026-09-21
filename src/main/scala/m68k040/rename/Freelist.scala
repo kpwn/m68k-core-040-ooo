@@ -182,7 +182,7 @@ case class Freelist(
     count    := (count - takeCount.resized + reclaimCount.resized).resized
   }
 
-  // Drain every cycle, even during flush. Two lanes in / two lanes out means
+  // Drain every cycle, even during flush. Equal input/output lane counts mean
   // no queue-full state or commit backpressure. Valid bits reset to empty.
   when(initDone) {
 

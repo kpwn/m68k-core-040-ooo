@@ -9,9 +9,9 @@ class DeferredReclaimSpec extends AnyFunSuite {
   // NZVC, X and FPCC use the same 16/1 component specialization.
   for ((name, physical, architectural) <- Seq(
     ("integer", m68k040.Global.PHYS_INT_REGS_DEFAULT, m68k040.isa.Isa.ARCH_INT_REGS),
-    ("NZVC/X/FPCC", 16, 1), ("FP", 16, 8))) {
-    test(s"$name delayed reclaim: WAW, flush, wrap, full/empty and reset", VerilatorTest) {
-      M68kSim().withVerilator.compile(Freelist(physical, architectural, 2, 2)).doSim { dut =>
+    ("NZVC/X/FPCC", 16, 1), ("FP", 16, 8)); width <- Seq(2, 4)) {
+    test(s"$name $width-wide delayed reclaim: WAW, flush, wrap, full/empty and reset", VerilatorTest) {
+      M68kSim().withVerilator.compile(Freelist(physical, architectural, 2, width)).doSim { dut =>
         val cd = dut.clockDomain
         cd.forkStimulus(10)
         dut.io.flush #= false
@@ -27,7 +27,7 @@ class DeferredReclaimSpec extends AnyFunSuite {
         var cycles = 0
         def step(alloc: Int = 0, retire: Int = 0, flush: Boolean = false,
                  sparse: Boolean = false, illegalPush: Boolean = false): Unit = {
-          assert(alloc <= 2 && retire <= inflight.size)
+          assert(alloc <= 2 && retire <= math.min(width, inflight.size))
           assert(!flush || (alloc == 0 && retire == 0))
           assert(alloc == 0 || available.size >= 2)
           dut.io.flush #= flush
@@ -44,7 +44,8 @@ class DeferredReclaimSpec extends AnyFunSuite {
             val (arch, id) = inflight.dequeue()
             val old = committed(arch)
             committed(arch) = id
-            val lane = if (retire == 1 && sparse) 1 else i
+            // Exercise every sparse position while retaining age order.
+            val lane = if (sparse) width - retire + i else i
             dut.io.push(lane).valid #= true
             dut.io.push(lane).payload #= old
             old
@@ -88,6 +89,14 @@ class DeferredReclaimSpec extends AnyFunSuite {
         assert(dut.io.popReady.toBoolean)
         step(flush = true)
 
+        // A full batch contains allocations from more than one rename edge.
+        // No intermediate WAW free may be lost when only the last map survives.
+        for (_ <- 0 until width / 2) step(alloc = 2)
+        step(retire = width)
+        assert(pending.size == width)
+        step(flush = true)
+        step(flush = true)
+
         // Full two-wide throughput across many pointer wraps, with no bubbles
         // in either commit or allocation once the two-entry stream is primed.
         step(alloc = 2)
@@ -98,7 +107,7 @@ class DeferredReclaimSpec extends AnyFunSuite {
         for (_ <- 0 until 2500) {
           val flush = rng.nextInt(19) == 0
           val alloc = if (flush || available.size < 2) 0 else rng.nextInt(3)
-          val retire = if (flush) 0 else rng.nextInt(math.min(2, inflight.size) + 1)
+          val retire = if (flush) 0 else rng.nextInt(math.min(width, inflight.size) + 1)
           step(alloc, retire, flush, sparse = rng.nextBoolean())
         }
         step(flush = true)

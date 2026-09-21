@@ -85,6 +85,12 @@ eight-wide ports everywhere. Preserve every committed event under backpressure.
 **Experiment:** 2/4-wide matched runs, completed-prefix histogram, actual
 dispatch-blocked cycles saved, area and routed paths. **Priority: high as a control.**
 
+Implementation has started at the rename/commit boundary: optional four-lane
+committed-map updates and registered free records, still with two-wide allocation.
+The ROB remains two-wide and rejects that interface until the remaining consumers
+are adapted. See [the integration contract](retirement-bandwidth.md); there is
+no four-wide full-core IPC or timing result yet.
+
 ### 2. Pipelined retirement lookahead and eligibility certificates
 
 Read and classify the next 4–8 entries ahead of consumption, retaining prepared

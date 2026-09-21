@@ -13,9 +13,10 @@ import spinal.lib.{Stream, Flow}
   * A plugin implements a trait and registers via addService(this); consumers
   * resolve it with host[ServiceName]. Grown as real plugins are added. */
 
-/** Rename exposes; ROB drives. commitPorts = 2-wide retire commit+free; flushPort = rollback. */
+/** Rename exposes; ROB drives every lane in age order. Default two-wide;
+  * experimental four-lane contract: docs/retirement-bandwidth.md. */
 trait RenameCommitService {
-  def commitPorts: Vec[Flow[CommitSlot]]   // length 2
+  def commitPorts: Vec[Flow[CommitSlot]]   // length owned by RenameStage
   def flushPort:   Bool
 }
 

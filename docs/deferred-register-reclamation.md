@@ -5,6 +5,10 @@ updates and the freelist's committed-allocation pointer advance on the original
 commit edge. Only recycling the old physical register is delayed by one cycle.
 This supersedes the same-edge push description in the original rename spec.
 
+The optional rename-side four-lane interface is specified in
+[retirement bandwidth](retirement-bandwidth.md). It scales this same reclamation
+contract; it is not yet enabled by the ROB or a full-core four-wide IPC result.
+
 Each of the integer, NZVC, X, FP and FPCC freelists holds two registered
 `valid/id` reclamation lanes. The stage accepts two lanes every cycle and drains
 two lanes every cycle without backpressure. No architectural destination or

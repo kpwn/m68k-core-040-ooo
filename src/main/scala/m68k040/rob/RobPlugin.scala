@@ -339,6 +339,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
 
   val logic = during build new Area {
     val rc = host[RenameCommitService]
+    require(rc.commitPorts.length == 2,
+      "four-lane rename commit requires the full ROB retirement-bandwidth integration")
     // External interrupt inputs (simple protocol). The recognition logic (Task 3)
     // compares iplIn vs the SR I-mask and selects the vector; here (Task 2) we
     // mirror them simPublic so a directed test sees the inputs reach the ROB. The

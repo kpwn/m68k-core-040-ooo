@@ -16,8 +16,8 @@ class RenameCommitDriverPlugin extends FiberPlugin {
     val flushIn = in Bool ()
     rc.flushPort := flushIn
 
-    val cmd = Vec.fill(2)(slave(Flow(CommitSlot())))
-    for (k <- 0 until 2) {
+    val cmd = Vec.fill(rc.commitPorts.length)(slave(Flow(CommitSlot())))
+    for (k <- cmd.indices) {
       rc.commitPorts(k).valid   := cmd(k).valid
       rc.commitPorts(k).payload := cmd(k).payload
     }

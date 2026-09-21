@@ -1338,13 +1338,63 @@ predict a speedup. Actual wider/prepared-retirement experiments remain open.
 Logs: `/tmp/composed-ipc-baseline.log`, `/tmp/composed-ipc-lsu.log`,
 `/tmp/composed-ipc-predictor.log`, `/tmp/composed-ipc-paired.log`.
 The required fast gate passes 384 tests, two ignored
-(`/tmp/composed-ipc-fast.log`). A broader combined LSU/prediction oracle run is
-in progress in `/tmp/composed-ipc-oracle.log`, including IRQ storms, redirects,
-translation faults, source lifetime and SQ recovery. Do not count this run as
-passed until its final suite result is recorded.
+(`/tmp/composed-ipc-fast.log`). The broad combined LSU/prediction oracle filter
+also selected the long interrupt-storm sweep. It was deliberately interrupted
+after 41 completed passing test cases, with no observed failure, while running
+the long MMU-on/xbar storm (`/tmp/composed-ipc-oracle.log`). This is **not a suite
+pass**. A bounded filter selecting the named lock-step IRQ/fault cases plus
+branch, source-lifetime and SQ recovery checks passes **25 tests** in
+`/tmp/composed-ipc-bounded-oracle.log`. The stopped run is retained as additional
+partial evidence, not counted as another completed suite.
 No board intervention was performed. This combined configuration has not yet
 passed routed core or integrated-SoC timing; individual feature timing passes
 must not be substituted for composition signoff.
+
+## Four-wide retirement control: rename-side prerequisite — 2026-09-21
+
+The composition profiles do not settle wider/prepared retirement: removing the
+one-branch pairing restriction did not change throughput, but a four-wide ROB
+was never exercised. Started that control experiment with an explicit
+[retirement-bandwidth amendment](retirement-bandwidth.md).
+
+`RenameStage(retireWidth = 4)` now sizes all five committed-map interfaces and
+their one-cycle reclamation lanes to four while leaving speculative rename and
+allocation two-wide. Default remains two. The existing RAT last-writer ordering
+and free-ring compaction are reused; there is no new checkpoint or rollback
+mechanism. The service exposes its actual lane count; the standalone test driver
+uses that count rather than truncating it to two. The current ROB explicitly
+rejects four lanes until all retirement consumers are integrated.
+
+The source audit identifies not just maps/frees and SQ, but **both I/D page-table
+U/M write queues**, committed CCR's same-edge precise-store bypass, system/FP
+state, debug stop/restart/count and complete observation streams as consumers.
+These must not lose lanes 2/3. A narrow in-order retirement-span service is a
+candidate for queue authorization; it must identify exact retiring ROB IDs across
+wrap and retain flush semantics. It is not implemented in this prerequisite.
+
+The default full-core control reproduces all **14** warmed profile windows'
+macro counts, cycle counts, branch denominators and misses exactly relative to
+`/tmp/composed-ipc-baseline.log` (`/tmp/wide-rename-default-ipc.log`). This is the
+expected zero-effect control, **not four-wide IPC**. The final expanded standalone
+run passes **eight tests** (`/tmp/wide-rename-burst-correctness.log`): two hosted
+rename tests cover all commit-lane masks, 32 two-lane and 128 four-lane batches,
+dense WAW chains, distinct destinations, selective register-class writes,
+discarded younger mappings and reset with pending frees. They also test two
+consecutive maximum-width publications, with the four-wide FP pool completely
+allocated before retirement begins. Every committed mapping and reclamation
+record is checked. Six free-ring tests cover the three register-class shapes at
+widths 2/4, including 15,000 seeded random cycles plus directed wrap, saturation,
+flush and reset cases. The first fast gate passes **384 tests**, two ignored
+(`/tmp/wide-rename-fast.log`); the final rerun also passes **384 tests**, two
+ignored (`/tmp/wide-rename-final-fast.log`).
+Do not queue synthesis for this plumbing; obtain full-core four-wide IPC first.
+
+Next implementation boundary: expose ROB-owned retirement events via a service,
+adapt queue authorization and all architectural/observation side effects, then
+enable contiguous four-wide ordinary retirement with conservative cold boundaries.
+Compare it against the same LSU/predictor baseline before implementing prepared
+shadow-map publication. The latter remains an independent required experiment,
+not something this prerequisite or prefix histograms have demonstrated.
 
 ## Next investigations requested — 2026-09-21
 
