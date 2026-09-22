@@ -108,15 +108,17 @@ class RasPlugin extends FiberPlugin {
     val cntBits = log2Up(entries) + 1        // occupancy 0..entries (saturating)
 
     // ---- storage: a 16x32 register Vec (1-cycle combinational read; tiny) ----
-    // RegInit so SpinalSim does not seed-randomize the contents (a head read of an
-    // entry while count claims it valid would otherwise be flaky garbage).
-    val ras   = Vec.fill(entries)(RegInit(U(0, 32 bits)))
+    // Payload has no reset: count owns visibility. A push writes its row before
+    // making it occupied; a restore copies data and occupancy from one checkpoint.
+    // Empty predTarget is unspecified and FetchAlign qualifies it with predValid.
+    // Keep every pointer/count/save-arm reset (docs/ras-payload-reset.md).
+    val ras   = Vec.fill(entries)(Reg(UInt(32 bits)))
     val rasSp = RegInit(U(0, spBits bits))   // speculative top-of-stack (next push slot)
     val count = RegInit(U(0, cntBits bits))  // saturating occupancy (0..entries)
     rasSp.simPublic(); count.simPublic()
 
     // ---- checkpoint shadow (rollback-on-flush, see the class doc comment) ----
-    val ckRas   = Vec.fill(entries)(RegInit(U(0, 32 bits)))
+    val ckRas   = Vec.fill(entries)(Reg(UInt(32 bits)))
     val ckRasSp = RegInit(U(0, spBits bits))
     val ckCount = RegInit(U(0, cntBits bits))
     ckRasSp.simPublic(); ckCount.simPublic()
