@@ -63,25 +63,10 @@ class InstructionBuffer extends Component {
 
   val IDXW = log2Up(BUF_WORDS)   // physical slot index width
 
-  // Registers. `entries` are RegInit'd to a benign zero value: SpinalSim randomizes
-  // uninit Regs per-seed, and the head barrel-rotate reads HEAD_WORDS slots
-  // combinationally (gating the OUT-of-window ones to 0), so an uninit slot that the
-  // rotate transiently reads (then muxes away) would otherwise be seed-random garbage
-  // -> flaky lock-step. Deterministic reset makes the buffer seed-stable.
-  val entries = Vec.fill(BUF_WORDS) {
-    val e = Reg(IbEntry())
-    e.word init 0
-    e.pred.simple init False
-    e.pred.lenWords init 0
-    e.pred.ambiguousLine init False
-    // FMax Lever B: deterministic reset value, same reasoning as the fields above (an
-    // uninitialised Reg randomises per-seed in sim and makes lock-step flaky). BYTE, not
-    // LONG: `word init 0` pairs it with opword 0x0000 = `ORI.B #imm,D0`, and
-    // `OperationDecoder.decode(0x0000).size === Size.BYTE` — so the reset state satisfies
-    // the pairing invariant `pred.size === decode(word).size` rather than violating it.
-    e.pred.size init m68k040.isa.Size.BYTE
-    e
-  }
+  // Occupancy owns payload visibility: a push writes word and metadata together.
+  // Keep pointer/count reset and the exact zero/BYTE/false output defaults below;
+  // unused physical slots themselves need no reset (docs/ibuf-payload-reset.md).
+  val entries = Vec.fill(BUF_WORDS)(Reg(IbEntry()))
   val count   = Reg(UInt(log2Up(BUF_WORDS + 1) bits)) init 0
   val headPtr = Reg(UInt(IDXW bits)) init 0
   spinal.core.sim.SimPublic(count)
