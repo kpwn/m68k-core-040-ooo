@@ -16,6 +16,19 @@ import org.scalatest.funsuite.AnyFunSuite
   * popping only after BOTH are drain-ACKed. Flush drops both. */
 class StoreQueueSplitSpec extends AnyFunSuite {
 
+  test("split query does not overlap the untranslated adjacent physical line", VerilatorTest) {
+    M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
+      val cd = initDut(dut)
+      allocAligned(dut, cd, 4, 0x110, 0x89abcdefL, Size.LONG)
+      setQuery(dut, 6, 0x10f, Size.LONG, splitB = true, paddrB = 0x900)
+      sleep(1)
+      assert(!dut.io.fwd.rsp.hit.toBoolean && !dut.io.fwd.rsp.stall.toBoolean,
+        "the load reads 0x10f and 0x900..902, not the physical bytes 0x110..112")
+      println("SQ_SPLIT_TRANSLATED_GEOMETRY_OUTPUT_PASS")
+      cd.waitSampling(2) // Also exercise the independent interval-shadow assertions.
+    }
+  }
+
   test("optional subword path excludes split producers and independently translated split queries", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8, subwordForwarding = true)).doSim { dut =>
       val cd = initDut(dut)

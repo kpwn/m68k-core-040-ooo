@@ -745,7 +745,12 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // reason the tripwire stays quiet.
   GenerationFlags.simulation {
     val qBytesRef    = sizeBytes(q.size)
-    val qHiRef       = q.paddr + qBytesRef
+    // Bound the first physical fragment at its line end. A split query's
+    // remaining bytes live at q.paddrB, not necessarily in the adjacent physical
+    // line; counting them here creates a false overlap in this reference only.
+    val qRoomRef     = U(16, 5 bits) - q.paddr(3 downto 0).resize(5)
+    val qOwnBytesRef = Mux(qBytesRef.resize(5) < qRoomRef, qBytesRef.resize(5), qRoomRef)
+    val qHiRef       = q.paddr + qOwnBytesRef
     val qWrap        = (q.paddr +^ qBytesRef).msb
     val qSpillBytes  = CountOne(qMaskNext).resize(3 bits)
     val qHiBRef      = q.paddrB + qSpillBytes
