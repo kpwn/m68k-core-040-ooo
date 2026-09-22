@@ -971,12 +971,35 @@ class ExceptionUnit(
   when(dcLoadCmd.fire) {
     ldoValidReg := False
   }
-  when(ldoVld && !ldoValidReg) {
-    ldoValidReg := True
+  // FMax (routed WNS limiter, 2026-09-22): the enable on the ~69 PAYLOAD flops is
+  // now `!ldoValidReg` alone; `ldoVld` reaches only the single `ldoValidReg` flop.
+  //
+  // Measured on the routed dcache-read-base checkpoint, the design's worst setup path
+  // was `RobPlugin_logic_exc_frameBase_reg[2]/C -> RobPlugin_logic_exc_ldoPaddrReg_reg[30]/CE`
+  // at -0.142 ns: 12 logic levels including four CARRY8s, 76.8% routing, with 1.36 ns
+  // of the 4.886 ns sitting in two nets (`exc_frameBase_reg_n_0_[2]` fo=31 at 0.782 ns
+  // and `when_ExceptionUnit_l2109_20` fo=25 at 0.580 ns). `ldoVld` is the FSM's deep
+  // frame-address cone, and it was driving the CE pin of every payload bit.
+  //
+  // WHY THIS IS EXACTLY EQUIVALENT, not an approximation. The payload registers have
+  // exactly ONE reader each -- `dcLoadCmd.payload.{vaddr,paddr,size,cacheMode}` -- and
+  // `dcLoadCmd.valid := ldoValidReg`, so the payload is architecturally observable only
+  // while `ldoValidReg` is set. `ldoValidReg` is set only here and cleared only by
+  // `dcLoadCmd.fire`, and the two are mutually exclusive (fire requires the valid this
+  // arm requires to be low). On the cycle the valid is set, `!ldoValidReg` is true, so
+  // the payload latches exactly the values the old gated form latched. While the valid
+  // is held awaiting the handshake, `!ldoValidReg` is false, so the payload is HELD --
+  // preserving the "capture once and hold until the actual handshake" contract above,
+  // which is why an unconditional capture would NOT be sound here. Writes on the
+  // remaining cycles (valid low, no request) are architecturally dead.
+  when(!ldoValidReg) {
     ldoVaddrReg := ldoVaddr
     ldoPaddrReg := ldoPaddr
     ldoSizeReg  := ldoSize
     ldoCmodeReg := commandCacheMode
+    when(ldoVld) {
+      ldoValidReg := True
+    }
   }
 
 
