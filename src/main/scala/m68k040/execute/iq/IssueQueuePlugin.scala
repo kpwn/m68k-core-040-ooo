@@ -315,22 +315,51 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
 
     val slotIdxW = log2Up(slotCount) // 4 bits
 
+    // The compacting slot array moves; producer-position entries do not. One
+    // shared line epoch replaces a decrement of every scoreboard row on push.
+    // See docs/iq-static-position.md for the modular-position invariant.
+    require(wayCount == 2 && slotCount == (1 << slotIdxW))
+    val positionEpoch = Reg(UInt(log2Up(lineCount) bits)) init 0
+    val nextPositionEpoch = positionEpoch + 1
+    when(pushPort.fire) { positionEpoch := nextPositionEpoch }
+    def slotAtEpoch(position: UInt, epoch: UInt): UInt =
+      ((position(slotIdxW - 1 downto 1) - epoch).asBits ## position(0)).asUInt
+
     // ---- Scoreboards (one per reg class).
     // RELIED-UPON INVARIANT: at most ONE in-flight producer per physical register
     // pre-commit. Rename allocates a unique pdst for every writer and does not
     // reuse a physreg until the prior mapping commits, so a physreg has at most
-    // one un-issued producer in the queue at a time. Both `physToSlot` (a single
+    // one un-issued producer in the queue at a time. Both `physToPosition` (a single
     // producer slot per physreg) and the push-before-issue-clear ordering within
     // a cycle (push sets busy[p] then issue may clear busy of an OLDER mapping)
     // are correct ONLY under this invariant. If a physreg could have two in-flight
-    // producers, physToSlot would alias and a dependent could track the wrong one.
-    // Scheme (b): store the producer's
-    // CURRENT slot index per physreg; shift stored indices by wayCount on every
-    // compaction (slots march toward 0). busy[p] => physreg p has an in-flight
-    // producer occupying slot physToSlot[p]. ----
+    // producers, physToPosition would alias and a dependent could track the wrong one.
+    // busy[p] => the producer occupies slotAtEpoch(physToPosition[p], positionEpoch).
+    // Only insertion writes positions; compaction changes the shared epoch.
     class Scoreboard(depth: Int) extends Area {
       val busy       = Reg(Bits(depth bits)) init 0
-      val physToSlot = Reg(Vec(UInt(slotIdxW bits), depth))
+      val physToPosition = Reg(Vec(UInt(slotIdxW bits), depth))
+      val legacyPhysToSlot = GenerationFlags.simulation {
+        Reg(Vec(UInt(slotIdxW bits), depth))
+      }
+      GenerationFlags.simulation {
+        for (p <- 0 until depth) {
+          when(pushPort.fire) {
+            legacyPhysToSlot(p) := (legacyPhysToSlot(p) - wayCount).resize(slotIdxW)
+          }
+          when(busy(p)) {
+            assert(slotAtEpoch(physToPosition(p), positionEpoch) === legacyPhysToSlot(p),
+              "IQ stationary position differs from legacy compacted slot")
+          }
+        }
+      }
+      def insert(physreg: UInt, way: Int): Unit = {
+        // (14 + way) + 2*(E+1) == 2*E + way modulo 16.
+        physToPosition(physreg) := (positionEpoch.asBits ## B(way, 1 bits)).asUInt
+        GenerationFlags.simulation {
+          legacyPhysToSlot(physreg) := slotCount - wayCount + way
+        }
+      }
     }
     // Int scoreboard width = the physical int register count (parametric; was a
     // hardcoded 48 — became 50 when the 2 temp arch regs T0/T1 widened the int
@@ -353,8 +382,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
     sbNzvc.busy.simPublic()  // debug-only (task #141)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
-    sbX.busy.simPublic(); sbX.physToSlot.simPublic()  // debug-only (task #141 X-flag hang investigation)
-    sbInt.busy.simPublic(); sbInt.physToSlot.simPublic()  // debug-only (task #141)
+    sbX.busy.simPublic(); sbX.physToPosition.simPublic()
+    sbInt.busy.simPublic(); sbInt.physToPosition.simPublic(); positionEpoch.simPublic()
     // FP-DATA / FPCC static scoreboards. Both rename classes have 16 physical entries
     // (spec Decisions 4+6), so both are 4-bit-tag/16-deep, exactly like sbNzvc/sbX.
     // NOTE (see this task's scope note): today EVERY FP producer is CPLX and therefore
@@ -379,7 +408,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     //         carries its slot, so any trigger referencing it clears. Its slot is freed.
     //   C+1 : the clear of `sb*.busy(P.dst)` is only NOW being written (visible at C+2),
     //         so the raw register still reads BUSY. A consumer uop pushed at C+1 would
-    //         latch a static trigger at `physToSlot(P.dst) - wayCount` -- but P's slot is
+    //         latch a static trigger at P's post-compaction slot -- but P's slot is
     //         gone and `events` at C+1 no longer carries it, so that trigger's ONLY
     //         clearing event has already passed. The consumer waits forever.
     //
@@ -950,7 +979,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     //
     // Task #141 fix (2nd half): LS (port 3) and CPLX (port 4) MUST be included too, for
     // the same reason as ohB above. Per the push-time logic just above, a static sb*
-    // scoreboard slot (and its physToSlot-derived trigger) CAN be recorded for a producer
+    // scoreboard position (and its decoded slot trigger) CAN be recorded for a producer
     // that fires on port 3 or 4: LS's own int/NZVC dsts always route to the dynamic
     // lsBusy/lsNzvcBusy bitmaps instead (so ohL is a harmless no-op event source in
     // practice today), but CPLX's NZVC dst (e.g. CMP2/CHK2) has no dynamic-tracker
@@ -968,11 +997,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // `slot1Prio` (== slot0Prio+1). A producer dependency is ALWAYS on an older
     // (lower-index) slot, so it fits in the dependent's trigger width.
     //
-    // A push always coincides with a compaction shift (slots march down by
-    // wayCount). The scoreboard holds the producer's CURRENT (pre-shift) slot;
-    // next cycle (when our freshly-written triggers take effect) the producer
-    // sits at slot-wayCount, so a dependency on an existing producer references
-    // bit (producerSlot - wayCount). Intra-push (slot1 reads slot0's dst)
+    // A push always coincides with a compaction shift. Decode stationary producer
+    // positions using the NEXT epoch, since freshly-written triggers take effect
+    // after that shift. Intra-push (slot1 reads slot0's dst)
     // references slot0's final position (slot0Prio) directly, no shift offset.
     val slot0Prio = (lineCount - 1) * wayCount     // 14
     val slot1Prio = slot0Prio + 1                  // 15
@@ -980,8 +1007,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // Build the trigger Bits for a pushed slot of the given priority width.
     def trigInit(uop: IqHot, width: Int): Bits = {
       val t = B(0, width bits)
-      def dep(busy: Bits, physToSlot: Vec[UInt], physreg: UInt, reads: Bool): Unit = {
-        val producerSlot = (physToSlot(physreg) - wayCount).resize(slotIdxW)
+      def dep(busy: Bits, positions: Vec[UInt], physreg: UInt, reads: Bool): Unit = {
+        val producerSlot = slotAtEpoch(positions(physreg), nextPositionEpoch)
         when(reads && busy(physreg)) {
           // bit index < this slot's priority (older), so in range.
           t(producerSlot) := True
@@ -990,14 +1017,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // `sb*BusyEff`, NOT the raw `sb*.busy`: the retimed (C+1) scoreboard clear MUST be
       // bypassed in here or a uop pushed exactly one cycle after its producer's issue
       // latches a trigger that can never clear -> deadlock. See the bypass declaration.
-      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcA, uop.psrcAValid)
-      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcB, srcBIsReg(uop))
-      dep(sbIntBusyEff,  sbInt.physToSlot,  uop.psrcC, uop.psrcCValid)
-      dep(sbNzvcBusyEff, sbNzvc.physToSlot, uop.pNzvcSrc, uop.readsNzvc)
-      dep(sbXBusyEff,    sbX.physToSlot,    uop.pXSrc, uop.readsX)
-      dep(sbFpBusyEff,   sbFp.physToSlot,   uop.pFpSrcA,  uop.psrcAFpValid)
-      dep(sbFpBusyEff,   sbFp.physToSlot,   uop.pFpSrcB,  uop.psrcBFpValid)
-      dep(sbFpccBusyEff, sbFpcc.physToSlot, uop.pFpccSrc, uop.readsFpcc)
+      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcA, uop.psrcAValid)
+      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcB, srcBIsReg(uop))
+      dep(sbIntBusyEff,  sbInt.physToPosition,  uop.psrcC, uop.psrcCValid)
+      dep(sbNzvcBusyEff, sbNzvc.physToPosition, uop.pNzvcSrc, uop.readsNzvc)
+      dep(sbXBusyEff,    sbX.physToPosition,    uop.pXSrc, uop.readsX)
+      dep(sbFpBusyEff,   sbFp.physToPosition,   uop.pFpSrcA,  uop.psrcAFpValid)
+      dep(sbFpBusyEff,   sbFp.physToPosition,   uop.pFpSrcB,  uop.psrcBFpValid)
+      dep(sbFpccBusyEff, sbFpcc.physToPosition, uop.pFpccSrc, uop.readsFpcc)
       t
     }
 
@@ -1387,17 +1414,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     }
 
     // ---- Scoreboard maintenance ----
-    // Compaction shifts every still-busy producer's stored slot down by wayCount.
-    when(pushPort.fire) {
-      def shift(sb: Scoreboard): Unit = {
-        for (p <- 0 until sb.physToSlot.length) {
-          sb.physToSlot(p) := (sb.physToSlot(p) - wayCount).resize(slotIdxW)
-        }
-      }
-      shift(sbInt); shift(sbNzvc); shift(sbX); shift(sbFp); shift(sbFpcc)
-    }
-    // On push, record each newly-pushed producer's dst -> its landing slot + busy.
-    // (Written after the shift above so the fresh slot wins for that physreg.)
+    // Compaction advances positionEpoch only. Each position row is written
+    // solely when a new producer for that physical register is inserted.
     // An LS LOAD producer is tracked in lsBusy (dynamic wakeup), NOT sbInt (static
     // latency-1). All other int producers go in sbInt as before.
     val push0IsLs = isLs(pushHot0)
@@ -1426,50 +1444,50 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         when(push0IsLs)       { lsBusy(pushHot0.pdst) := True }
           .elsewhen(push0IsCplxProd) { cplxBusy(pushHot0.pdst) := True }
           .elsewhen(push0IsAluSlow)  { aluSlowIntBusy(pushHot0.pdst) := True }
-          .otherwise    { sbInt.busy(pushHot0.pdst) := True; sbInt.physToSlot(pushHot0.pdst) := slot0Prio }
+          .otherwise    { sbInt.busy(pushHot0.pdst) := True; sbInt.insert(pushHot0.pdst, 0) }
       }
       when(pushHot0.writesNzvc) {
         when(push0IsAluSlow) { aluSlowNzvcBusy(pushHot0.pNzvcDst) := True }
           .elsewhen(push0IsLsNzvc) { lsNzvcBusy(pushHot0.pNzvcDst) := True }
           .elsewhen(push0IsCplxNzvc) { cplxNzvcBusy(pushHot0.pNzvcDst) := True }
-          .otherwise { sbNzvc.busy(pushHot0.pNzvcDst) := True; sbNzvc.physToSlot(pushHot0.pNzvcDst) := slot0Prio }
+          .otherwise { sbNzvc.busy(pushHot0.pNzvcDst) := True; sbNzvc.insert(pushHot0.pNzvcDst, 0) }
       }
       when(pushHot0.writesX) {
         when(push0IsAluSlow) { aluSlowXBusy(pushHot0.pXDst) := True }
-          .otherwise { sbX.busy(pushHot0.pXDst) := True; sbX.physToSlot(pushHot0.pXDst) := slot0Prio }
+          .otherwise { sbX.busy(pushHot0.pXDst) := True; sbX.insert(pushHot0.pXDst, 0) }
       }
       when(pushHot0.pFpDstValid) {
         when(push0IsCplxFp) { cplxFpBusy(pushHot0.pFpDst) := True }
-          .otherwise { sbFp.busy(pushHot0.pFpDst) := True; sbFp.physToSlot(pushHot0.pFpDst) := slot0Prio }
+          .otherwise { sbFp.busy(pushHot0.pFpDst) := True; sbFp.insert(pushHot0.pFpDst, 0) }
       }
       when(pushHot0.writesFpcc) {
         when(push0IsCplxFpcc) { cplxFpccBusy(pushHot0.pFpccDst) := True }
-          .otherwise { sbFpcc.busy(pushHot0.pFpccDst) := True; sbFpcc.physToSlot(pushHot0.pFpccDst) := slot0Prio }
+          .otherwise { sbFpcc.busy(pushHot0.pFpccDst) := True; sbFpcc.insert(pushHot0.pFpccDst, 0) }
       }
       when(pushSlot1Port) {
         when(pushHot1.pdstValid) {
           when(push1IsLs)       { lsBusy(pushHot1.pdst) := True }
             .elsewhen(push1IsCplxProd) { cplxBusy(pushHot1.pdst) := True }
             .elsewhen(push1IsAluSlow)  { aluSlowIntBusy(pushHot1.pdst) := True }
-            .otherwise    { sbInt.busy(pushHot1.pdst) := True; sbInt.physToSlot(pushHot1.pdst) := slot1Prio }
+            .otherwise    { sbInt.busy(pushHot1.pdst) := True; sbInt.insert(pushHot1.pdst, 1) }
         }
         when(pushHot1.writesNzvc) {
           when(push1IsAluSlow) { aluSlowNzvcBusy(pushHot1.pNzvcDst) := True }
             .elsewhen(push1IsLsNzvc) { lsNzvcBusy(pushHot1.pNzvcDst) := True }
             .elsewhen(push1IsCplxNzvc) { cplxNzvcBusy(pushHot1.pNzvcDst) := True }
-            .otherwise { sbNzvc.busy(pushHot1.pNzvcDst) := True; sbNzvc.physToSlot(pushHot1.pNzvcDst) := slot1Prio }
+            .otherwise { sbNzvc.busy(pushHot1.pNzvcDst) := True; sbNzvc.insert(pushHot1.pNzvcDst, 1) }
         }
         when(pushHot1.writesX) {
           when(push1IsAluSlow) { aluSlowXBusy(pushHot1.pXDst) := True }
-            .otherwise { sbX.busy(pushHot1.pXDst) := True; sbX.physToSlot(pushHot1.pXDst) := slot1Prio }
+            .otherwise { sbX.busy(pushHot1.pXDst) := True; sbX.insert(pushHot1.pXDst, 1) }
         }
         when(pushHot1.pFpDstValid) {
           when(push1IsCplxFp) { cplxFpBusy(pushHot1.pFpDst) := True }
-            .otherwise { sbFp.busy(pushHot1.pFpDst) := True; sbFp.physToSlot(pushHot1.pFpDst) := slot1Prio }
+            .otherwise { sbFp.busy(pushHot1.pFpDst) := True; sbFp.insert(pushHot1.pFpDst, 1) }
         }
         when(pushHot1.writesFpcc) {
           when(push1IsCplxFpcc) { cplxFpccBusy(pushHot1.pFpccDst) := True }
-            .otherwise { sbFpcc.busy(pushHot1.pFpccDst) := True; sbFpcc.physToSlot(pushHot1.pFpccDst) := slot1Prio }
+            .otherwise { sbFpcc.busy(pushHot1.pFpccDst) := True; sbFpcc.insert(pushHot1.pFpccDst, 1) }
         }
       }
     }
@@ -1520,7 +1538,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // producer the clear below targets a bit its own push left at 0, and under the
     // ALREADY-RELIED-UPON one-producer-per-physreg invariant (:148-159) no OTHER
     // in-flight producer owns that bit either -- the clear is a genuine no-op. This
-    // introduces NO new invariant: it leans on exactly the one `physToSlot` and the
+    // introduces NO new invariant: it leans on exactly the one `physToPosition` and the
     // push/clear intra-cycle ordering already require.
     //
     // Consistency check (the decisive one): the LS, CPLX-int, LS-NZVC and CPLX-NZVC

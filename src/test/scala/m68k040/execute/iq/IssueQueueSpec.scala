@@ -12,6 +12,107 @@ import org.scalatest.funsuite.AnyFunSuite
 import scala.collection.mutable.ArrayBuffer
 
 class IssueQueueSpec extends AnyFunSuite {
+  test("stationary position seeded cycle parity across wraps and flushes", VerilatorTest) {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      idle(dut)
+      dut.sink.logic.ready3 #= true
+      dut.source.logic.lsWakeupValid #= false; dut.source.logic.lsWakeupPdst #= 0
+      dut.source.logic.aluSlowWakeupValid #= false
+      dut.source.logic.aluSlowWakeupPdst #= 0; dut.source.logic.aluSlowWakeupPdstV #= false
+      dut.source.logic.aluSlowWakeupNzvc #= 0; dut.source.logic.aluSlowWakeupNzvcV #= false
+      dut.source.logic.aluSlowWakeupX #= 0; dut.source.logic.aluSlowWakeupXV #= false
+      dut.source.logic.cplxFpWakeupValid #= false; dut.source.logic.cplxFpWakeupTag #= 0
+      dut.source.logic.cplxFpccWakeupValid #= false; dut.source.logic.cplxFpccWakeupTag #= 0
+      for (s <- Seq(dut.source.logic.s0, dut.source.logic.s1)) {
+        s.pFpSrcA #= 0; s.psrcAFpValid #= false
+        s.pFpSrcB #= 0; s.psrcBFpValid #= false
+        s.pFpDst #= 0; s.pFpDstValid #= false
+        s.pFpccSrc #= 0; s.readsFpcc #= false
+        s.pFpccDst #= 0; s.writesFpcc #= false
+      }
+      cd.waitSampling(5)
+      val rng = new scala.util.Random(0x51a710L)
+      val digest = java.security.MessageDigest.getInstance("SHA-256")
+      var cycles = 0
+      var pushes = 0
+      var issued = 0
+      var flushes = 0
+      for (batch <- 0 until 160) {
+        var next = 0
+        val seen = scala.collection.mutable.Set.empty[Int]
+        val dependent = Array.tabulate(16)(i => i > 0 && rng.nextBoolean())
+        val flushed = batch % 7 == 3
+        var done = false
+        var localCycles = 0
+        while (!done && localCycles < 250) {
+          cd.waitFallingEdge()
+          val flush = flushed && next >= 8
+          val offer = !flush && next < 16 && rng.nextInt(5) != 0
+          val pair = next < 15 && rng.nextBoolean()
+          def uop(i: Int) = UopSpec(rob = i, pdstValid = true, pdst = i,
+            psrcAValid = dependent(i) && batch % 5 == 0, psrcA = math.max(0, i - 1),
+            readsNzvc = dependent(i) && batch % 5 == 1, writesNzvc = true,
+            pNzvcSrc = math.max(0, i - 1), pNzvcDst = i,
+            readsX = dependent(i) && batch % 5 == 2, writesX = true,
+            pXSrc = math.max(0, i - 1), pXDst = i)
+          pushUops(dut, if (offer) Some(uop(next)) else None,
+            if (offer && pair) Some(uop(next + 1)) else None)
+          // Exercise the two static FP scoreboards too, independently of the
+          // dynamic CPLX FP paths covered by IqFpSpec. Synthetic IQ payloads
+          // may write all classes; each physical tag has only one producer.
+          for ((s, way) <- Seq(dut.source.logic.s0, dut.source.logic.s1).zipWithIndex) {
+            val i = math.min(next + way, 15)
+            s.pFpSrcA #= math.max(0, i - 1)
+            s.psrcAFpValid #= (dependent(i) && batch % 5 == 3)
+            s.pFpDst #= i; s.pFpDstValid #= true
+            s.pFpccSrc #= math.max(0, i - 1)
+            s.readsFpcc #= (dependent(i) && batch % 5 == 4)
+            s.pFpccDst #= i; s.writesFpcc #= true
+          }
+          dut.source.logic.flush #= flush
+          // Stall at the production ALU look-ahead interface. Arbitrarily holding
+          // an already selected latency-one producer at the output would violate
+          // the static-trigger contract rather than test queue backpressure.
+          dut.sink.logic.ready0 #= true
+          dut.sink.logic.ready1 #= true
+          dut.source.logic.aluFastAccept0 #= (rng.nextInt(4) != 0)
+          dut.source.logic.aluFastAccept1 #= (rng.nextInt(4) != 0)
+          sleep(1)
+          val accept = offer && dut.source.logic.pushReady.toBoolean
+          val fires = Seq(
+            (dut.sink.logic.v0.toBoolean && dut.sink.logic.ready0.toBoolean, dut.sink.logic.rob0.toInt),
+            (dut.sink.logic.v1.toBoolean && dut.sink.logic.ready1.toBoolean, dut.sink.logic.rob1.toInt))
+            .collect { case (true, id) => id }
+          if (!flush) {
+            fires.foreach { id =>
+              assert(id < next, s"issue before push: batch=$batch id=$id next=$next")
+              assert(!seen(id), s"duplicate issue: batch=$batch id=$id")
+              if (dependent(id)) assert(seen(id - 1), s"early dependent: batch=$batch id=$id")
+            }
+            fires.foreach(seen.add)
+            issued += fires.size
+          } else assert(fires.isEmpty, "flush must suppress issue")
+          digest.update(s"$batch:$localCycles:${dut.source.logic.pushReady.toBoolean}:$accept:$pair:$flush:${fires.mkString(",")}\n".getBytes("UTF-8"))
+          if (accept) { next += (if (pair) 2 else 1); pushes += 1 }
+          cd.waitRisingEdge(); sleep(1)
+          cycles += 1; localCycles += 1
+          done = flush || (next == 16 && seen.size == 16)
+          if (flush) flushes += 1
+        }
+        assert(done, s"queue failed to drain in batch=$batch next=$next seen=$seen")
+        // Let all delayed scoreboard clears settle before reusing physical tags.
+        cd.waitFallingEdge()
+        dut.source.logic.pushValid #= false
+        dut.source.logic.flush #= false
+        cd.waitSampling(4)
+      }
+      val hash = digest.digest().map(b => f"${b & 255}%02x").mkString
+      println(s"IQ_STATIC_POSITION_TRACE cycles=$cycles pushes=$pushes issued=$issued flushes=$flushes sha256=$hash")
+    }
+  }
+
   class Dut extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
