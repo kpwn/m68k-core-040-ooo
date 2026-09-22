@@ -94,8 +94,8 @@ case class SqFwdRsp() extends Bundle {
   *             full same-size overlap -> hit+data; partial/ambiguous -> stall. Optional
   *             subword forwarding also covers byte/word loads within aligned LONGs.
   *
-  * All state is RegInit (no uninit Regs); counts are hardware sums (no
-  * when-gated Scala-var counters). */
+  * Control state resets; payload is written at allocation before validity owns
+  * it. Counts are hardware sums (no when-gated Scala-var counters). */
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
                  forwardOnPublish: Boolean = false, retireWidth: Int = 2) extends Component {
@@ -170,14 +170,17 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     val sqCompletionOrphan  = out(Bool())
   }
 
-  // ---- ring storage (all RegInit) ----
+  // ---- ring storage ----
+  // Payload has no reset: allocation writes it before validity exposes it;
+  // late reservations additionally require data-ready/publication qualification.
+  // Keep all control/classification resets (docs/sq-payload-reset.md).
   val valids    = Vec.fill(depth)(RegInit(False))
   val dataReady = if(reserveLateStore) Vec.fill(depth)(RegInit(False)) else null
   def hasData(slot: UInt): Bool = if(reserveLateStore) dataReady(slot) else True
   val committed = Vec.fill(depth)(RegInit(False))
   val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)))
-  val paddrs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
-  val datas     = Vec.fill(depth)(RegInit(B(0, 32 bits)))
+  val paddrs    = Vec.fill(depth)(Reg(UInt(32 bits)))
+  val datas     = Vec.fill(depth)(Reg(Bits(32 bits)))
   val sizes     = Vec.fill(depth)(RegInit(Size.BYTE()))
   // slot-A explicit-strobe drain (split stores). The covered byte count that used to
   // live alongside it is gone -- the forward overlap test is byte-lane masks now, and
@@ -251,13 +254,13 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // test (now covering the paddrB-based spill case too) against them every
   // cycle, is declared immediately below and checked after `perEntry`. That is
   // the permanent, executable proof of everything claimed in this comment.
-  val maskAs     = Vec.fill(depth)(RegInit(B(1, 16 bits)))
+  val maskAs     = Vec.fill(depth)(Reg(Bits(16 bits)))
   // optional slot B (second half of a split store)
   val validBs   = Vec.fill(depth)(RegInit(False))
-  val paddrBs   = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  val paddrBs   = Vec.fill(depth)(Reg(UInt(32 bits)))
   // (strbB/lineDataB are DERIVED at drain time -- see the drain-present mux below;
   // no per-entry storage needed at all now, task #252.)
-  val maskBs     = Vec.fill(depth)(RegInit(B(0, 16 bits)))
+  val maskBs     = Vec.fill(depth)(Reg(Bits(16 bits)))
 
   // ── Forward-overlap equivalence tripwire: SIM-ONLY shadow of the OLD structure ──
   // These four reproduce, bit for bit, the `nbytesAs`/`nbytesBs`/`paddrHiAs`/
@@ -294,8 +297,8 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // for this entry, at head, is observed). All inert until later P2 tasks wire
   // consumers -- populated at alloc below, same indexing convention as the
   // existing per-entry Vecs. ----
-  val vaddrAs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
-  val vaddrBs    = Vec.fill(depth)(RegInit(U(0, 32 bits)))
+  val vaddrAs    = Vec.fill(depth)(Reg(UInt(32 bits)))
+  val vaddrBs    = Vec.fill(depth)(Reg(UInt(32 bits)))
   val cacheModes = Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
   val cacheModesB= Vec.fill(depth)(RegInit(CacheMode.WRITETHROUGH))
   val supervisors= Vec.fill(depth)(RegInit(False))
