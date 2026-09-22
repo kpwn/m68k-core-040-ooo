@@ -63,7 +63,22 @@ Data-side access to slot space already works; only *execution* is missing.
 - Only ever present a non-withdrawable request.
 - Never replay.
 
-### Principal open question: the fetch granule
+### Fetch granule — RESOLVED
+
+Instructions are always 16-bit aligned, which settles the shape. A cache-inhibited
+fetch reads the **longword containing the PC** (`addr = pc & ~3`) and uses the
+frontend's EXISTING leading-word drop to discard the half before the PC:
+`drop = pc[1]`, pushing `n = 2 - drop` words. Both mechanisms are already in
+place and need no widening — `cmdDrop`/`pendingDrop`/`ringDrop` already carry a
+2-bit drop for exactly this purpose (`cmdDrop := target(2 downto 1)`), and
+`io.push.payload.n` is `UInt(3 bits)` admitting 0..4 with `FetchAlign` charging a
+full 4-word window as a safe upper bound regardless. So a 1- or 2-word push from
+a 32-bit device read costs no interface, capacity or reservation change.
+
+The word straddling a longword boundary is therefore never a special case: the
+next fetch simply starts at the next longword with `drop = 0`.
+
+### Former open question: the fetch granule
 
 The frontend's window is 8 bytes (`cmdWindowPc = pc(31 downto 3) @@ U(0,3)`) and
 the IBuf push carries up to 4 words. A 32-bit device read returns 2 words, i.e.
