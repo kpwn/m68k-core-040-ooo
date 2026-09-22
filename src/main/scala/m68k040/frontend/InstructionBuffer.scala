@@ -99,20 +99,28 @@ class InstructionBuffer extends Component {
 
   // --- write the (up to PUSH_WORDS) pushed entries into their tail slots ---
   // Each physical slot is written iff a push fires AND some pushed word j maps to it.
-  // We compute, per slot, the matching j (if any) and its enable. The push window is
-  // contiguous starting at tailBase, so at most one j hits each slot.
+  // The push window is contiguous starting at tailBase, so at most one j hits each slot.
+  //
+  // FMax/area (docs/ibuf-write-decode.md): the address is decoded ONCE, not once per
+  // (slot, word) pair. The previous form computed `(tailBase + j) mod BUF_WORDS` inside
+  // the per-slot loop, which is independent of `s`, so it emitted EIGHTY copies of that
+  // add + compare-and-subtract wrap (`_zz_when_InstructionBuffer_l125` ..`_79`), each
+  // with its own 5-bit equality against a constant slot index. Because the four write
+  // targets are consecutive,
+  //
+  //     (tailBase + j) mod BUF_WORDS === s   <=>   tailBase === (s - j) mod BUF_WORDS
+  //
+  // and `s`/`j` are Scala loop constants, so `(s - j) mod BUF_WORDS` is a compile-time
+  // index into a SINGLE one-hot decode of `tailBase`. The per-word rotation is pure
+  // wiring. `tailBase` is already `< BUF_WORDS` by its own wrap above, so the one-hot is
+  // exact over the entire legal range. Same write set, same data, same cycle.
+  val tailOneHot = UIntToOh(tailBase, BUF_WORDS)
+  val pushLenOk  = Vec(Bool(), PUSH_WORDS)
+  for (j <- 0 until PUSH_WORDS) pushLenOk(j) := U(j) < io.push.payload.n
   for (s <- 0 until BUF_WORDS) {
     when(io.push.fire) {
       for (j <- 0 until PUSH_WORDS) {
-        // physical slot for pushed word j = (tailBase + j) mod BUF_WORDS
-        val phys = UInt(IDXW bits)
-        val tb = (tailBase +^ j)
-        when(tb >= BUF_WORDS) {
-          phys := (tb - BUF_WORDS).resize(IDXW)
-        } .otherwise {
-          phys := tb.resize(IDXW)
-        }
-        when((U(j) < io.push.payload.n) && (phys === s)) {
+        when(tailOneHot(((s - j) + BUF_WORDS) % BUF_WORDS) && pushLenOk(j)) {
           entries(s).word                := io.push.payload.words(j)
           entries(s).pred.simple         := io.push.payload.preds(j).simple
           entries(s).pred.lenWords       := io.push.payload.preds(j).lenWords
