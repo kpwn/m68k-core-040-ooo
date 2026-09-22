@@ -50,7 +50,7 @@ case class IqHot() extends Bundle {
   val pFpSrcB  = UInt(fpW bits);   val psrcBFpValid  = Bool()
   val pFpccSrc = UInt(fpW bits);   val readsFpcc     = Bool()
 
-  // ---- Class / select-mask fields. cluster/memOp/leaAddr are `isLs`/`isCplx`. ----
+  // ---- Class / select-mask fields. Store the answers used by the IQ. ----
   //
   // The IQ SCHEDULES; it does not execute. Every question it used to ask of `op` was a
   // latency/dependency-CLASS question, so those answers are precomputed ONCE on the push
@@ -85,6 +85,12 @@ case class IqHot() extends Bundle {
   val leaAddr  = Bool()
   val isBranch = Bool()
   val useImm   = Bool()
+  // Functional predicates. The original cluster/memOp/leaAddr and B-read
+  // qualifiers remain available for simulation checks, but have no functional
+  // reader after insertion, so synthesis can prune their shifting payload bits.
+  val isLsClass   = Bool()
+  val isCplxClass = Bool()
+  val srcBRead    = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -130,6 +136,10 @@ case class IqHot() extends Bundle {
                          (u.op === m68k040.decode.DecOp.UNPK)     ||
                          (u.op === m68k040.decode.DecOp.BITFIELD) ||
                          (u.op === m68k040.decode.DecOp.BFRESOLVE)
+    isLsClass := u.cluster === m68k040.isa.Cluster.LS &&
+      (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
+    isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
+    srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm

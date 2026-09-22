@@ -245,6 +245,26 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       }
     }
     val slots = lines.flatMap(_.ways) // index == priority
+    GenerationFlags.simulation {
+      // Independent old formulas, evaluated from the stored raw fields. This
+      // checks classification through insertion, compaction and slot reuse,
+      // not merely that assignFrom agrees with another call to itself.
+      for (s <- slots) {
+        val h = s.hot
+        val oldLs = h.cluster === m68k040.isa.Cluster.LS &&
+          (h.memOp =/= m68k040.isa.MemOp.NONE || h.leaAddr)
+        val oldCplx = h.cluster === m68k040.isa.Cluster.CPLX
+        val oldBException = h.op === m68k040.decode.DecOp.PACK ||
+          h.op === m68k040.decode.DecOp.UNPK || h.op === m68k040.decode.DecOp.BITFIELD ||
+          h.op === m68k040.decode.DecOp.BFRESOLVE
+        val oldBRead = h.psrcBValid && (!h.useImm || oldLs || oldBException)
+        when(s.sel) {
+          assert(h.isLsClass === oldLs, "IQ hot predicate: LS class mismatch")
+          assert(h.isCplxClass === oldCplx, "IQ hot predicate: CPLX class mismatch")
+          assert(h.srcBRead === oldBRead, "IQ hot predicate: B register-read mismatch")
+        }
+      }
+    }
     // ---- debug-only observability (task #139 finding #1 investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     // (Every field these taps expose is in the HOT record, so the split costs no
@@ -492,10 +512,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // LS class predicate: cluster == LS and a real memory op OR a LEA address-generate
     // (leaAddr, memOp NONE — it rides the LS-EU AGU to compute the EA address with no
     // memory access).
-    def isLs(u: IqHot): Bool =
-      (u.cluster === m68k040.isa.Cluster.LS) && ((u.memOp =/= m68k040.isa.MemOp.NONE) || u.leaAddr)
+    def isLs(u: IqHot): Bool = u.isLsClass
     // CPLX (DivEu) class predicate: cluster == CPLX (CHK + DIV).
-    def isCplx(u: IqHot): Bool = u.cluster === m68k040.isa.Cluster.CPLX
+    def isCplx(u: IqHot): Bool = u.isCplxClass
     // A CPLX *producer* with dynamic latency = a DIV that writes a physreg. CHK writes
     // nothing (no producer). Only such producers populate cplxBusy / drive cplxWakeup.
     def isCplxProducer(u: IqHot): Bool = isCplx(u) && u.pdstValid
@@ -551,10 +570,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // in imm) but psrcB = width-Dn (Dw form) is likewise live (srcAValid=Do already gates
     // psrcA the normal way).
     //
-    // All four exceptions ask ONE question -- "does this uop read psrcB as a register even
-    // though useImm is set?" -- so they are one precomputed flag, `srcBRegDespiteImm`,
-    // rather than four helpers each re-deriving it from `op` in this cone.
-    def srcBIsReg(u: IqHot): Bool = u.psrcBValid && (!u.useImm || isLs(u) || u.srcBRegDespiteImm)
+    // Precompute the entire answer once in IqHot.assignFrom. The stored hot
+    // record then needs one live bit instead of repeatedly decoding these
+    // qualifiers at every queue slot, including its dynamic-wakeup cone.
+    def srcBIsReg(u: IqHot): Bool = u.srcBRead
 
     // ---- Occupancy / back-pressure ----
     // Back-pressure is gated on LINE 0 BEING EMPTY, not on a count proxy.
