@@ -2907,3 +2907,60 @@ converts an invariant violation from a HANG into a SILENT WRONG-VALUE issue.
 The remaining four cycles are not behind the cache: they are the IQ's two
 registers plus S0 and S1. Shortening them is an FMax trade, not a speculation
 problem, and the design currently closes 200 MHz with 3 ps of margin.
+
+### Are there pipeline stages to merge? Measured: no, and the reason matters
+
+Per-stage worst setup slack on the routed 200 MHz release build (5.000 ns period),
+taken from the checkpoint rather than inferred:
+
+| stage | slack (ns) | datapath (ns) | logic levels |
+| --- | ---: | ---: | ---: |
+| LsEu P4 | 0.050 | 4.784 | 14 |
+| LsEu completion | 0.083 | 4.863 | 20 |
+| IQ slot dynWait | 0.099 | 4.835 | 15 |
+| LsEu S1 | 0.131 | 4.657 | 9 |
+| IQ slot triggers | 0.158 | 4.527 | 10 |
+| IQ slot sel | 0.221 | 4.425 | 9 |
+| Dcache S1 | 0.305 | 4.418 | 8 |
+| IQ readyReg | 0.318 | 4.510 | 3 |
+| IQ lsSkid | 0.440 | 4.464 | 3 |
+| LsEu P3 | 0.442 | 4.432 | 3 |
+| AluEu | 0.053 | 4.744 | 10 |
+| whole CPU | 0.046 | 4.818 | 21 |
+
+Every stage sits at 91-99% of the period; the most slack anywhere is 0.44 ns.
+Merging two stages sums their datapaths, and the cheapest pair in the load-to-use
+loop, P3 + P4, is 4.432 + 4.784 = 9.2 ns against a 5.0 ns budget. There is no
+slack-rich stage to absorb a neighbour.
+
+The reason is the one the FMax campaign already found. P3, lsSkid and readyReg
+carry THREE logic levels each and still burn ~4.45 ns, so ~4.2 ns of each is
+wire. The pipeline is 14 deep because it is wire-bound, not because the work
+needs 14 steps, and `socket_core` is ~95k FLAT LUTs with no component boundaries
+for the placer. Stage merging is therefore downstream of the area/hierarchy work,
+not an independent lever.
+
+### L2-hit latency speculation: a real window, thin expected value
+
+Unlike L1 (which answers in ONE cycle, leaving nothing to speculate into), an L1
+miss that hits L2 takes 11-13 cycles measured, and DRAM shows up as an 84-cycle
+bucket holding 66 of 2,050 loads. So there are 10+ cycles to schedule a consumer
+into. With replay-by-flush:
+
+    gain = missRate x 4 cycles       = 0.15 x 4   = +0.60 cycles/load
+    cost = dramRate x recovery       = 0.032 x 14 = -0.45 cycles/load
+    net                                            ~ +0.15 cycles/load
+
+Roughly break-even -- better than L1 speculation (-1.25) but not worth the
+machinery alone. Two changes would make it clearly positive:
+
+  1. Don't speculate, ASK. An early L2 hit/latency indication would make the wake
+     EXACT, exactly as `earlyIntWakeup` already is for L1 -- no replay, full
+     +0.6. Needs an l2c_ctrl.v signal and a CPU-side port, so it crosses the
+     core/SoC boundary.
+  2. Selective replay: re-arm the dependent's `dynWait` bit instead of flushing.
+     Needs the dependence-tracked re-issue chain costed above.
+
+Note the asymmetry: speculation helps only the ~15% of loads that miss, whereas a
+shorter pipeline helps the ~85% that hit. Both are gated on the same wire
+domination, so area and hierarchy precede both.
