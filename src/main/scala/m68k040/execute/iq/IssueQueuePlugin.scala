@@ -720,6 +720,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     }
     val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed
                else ohLoldest & lsReady) & B(slotCount bits, default -> !lsSkidValid)
+    // Diagnostic: does the relaxed select actually pick a DIFFERENT slot than the
+    // original oldest-only rule would? A regression on a kernel whose every LS slot is
+    // ready should be impossible if this never fires, so measure it rather than argue.
+    val lsBypassFired = Bool()
+    lsBypassFired := (if (!loadBypassUnreadyLoad) False
+                      else ohL.orR && (ohL =/= ((ohLoldest & lsReady) &
+                                                B(slotCount bits, default -> !lsSkidValid))))
+    lsBypassFired.simPublic()
     val lsSelectedLateData = (ohL & ~lsFullyReady).orR
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop

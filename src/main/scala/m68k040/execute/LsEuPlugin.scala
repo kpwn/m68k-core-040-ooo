@@ -2597,9 +2597,24 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Single assignment: a default `:= False` followed by an unconditional reassignment
     // is an assignment overlap SpinalHDL rejects outright.
     val s1AnEarlyFire: Bool = if (!earlyAutoAnWriteback) False else {
-      val s1AnEarlyCandidate = s1Valid && (u1.memOp === MemOp.STORE) &&
-        (u1.eaAuto =/= m68k040.decode.EaAuto.NONE) && u1.pdstValid &&
-        !u1.stkPush && !u1.movesAliasStore && !u1.ccrRestore
+      // THREE uop kinds write an int result that is an address computed from a register
+      // plus a CONSTANT, with no dependence on the memory access, yet all three wait for
+      // LS completion to write it:
+      //   autoStoreAn  the (An)+/-(An) store's An update      -> s1AnWb
+      //   stkPush      bsr/jsr/link's predecremented A7       -> s1Va   (completion: ctx.vaddr)
+      //   leaAddr      LEA's effective address                -> s1Va   (no memory access AT ALL)
+      // stkPush matters because bsr's A7 update feeds rts's pop address, which is the
+      // call/return recurrence: kCallReturn spends 31 cycles per iteration on 8 macros
+      // with only 4 mispredict resolutions in 100 iterations, and oldestUnready on 2,864
+      // of 3,115 cycles. LEA matters because it is address arithmetic queued behind a
+      // memory pipeline for no reason at all.
+      val s1AnEarlyCandidate = s1Valid && u1.pdstValid && !u1.ccrRestore &&
+        !u1.movesAliasStore &&
+        (u1.leaAddr || u1.stkPush ||
+         ((u1.memOp === MemOp.STORE) && (u1.eaAuto =/= m68k040.decode.EaAuto.NONE)))
+      // Mirror completion's selection EXACTLY (leaAddr, then stkPush, then autoStoreAn),
+      // so the early write is the same value and stays idempotent.
+      val s1EarlyVal = Mux(u1.leaAddr || u1.stkPush, s1Va.asBits, s1AnWb)
       // Conservative: require the shared write port AND the single wakeup port to be
       // idle this cycle. Both are driven from the completion stage, which does not
       // depend on S1, so reading them here is not a combinational loop.
@@ -2608,10 +2623,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val fire = s1AnEarlyCandidate && !compWritePending && !compWakePending
       anEarlyW.valid   := fire
       anEarlyW.address := u1.pdst
-      anEarlyW.data    := s1AnWb
+      anEarlyW.data    := s1EarlyVal
       anEarlyByp.valid   := fire
       anEarlyByp.address := u1.pdst
-      anEarlyByp.data    := s1AnWb
+      anEarlyByp.data    := s1EarlyVal
       fire
     }
 
