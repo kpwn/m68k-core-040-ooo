@@ -2791,3 +2791,61 @@ process had already parsed its old loop; it finished six passes with unchanged
 WNS +0.032 / WHS +0.008. Its final timing summary has zero setup/hold/pulse
 failures, WPWS 0.000. Remaining artifact/DRC/skew checks and programming are
 separate from this corrected loop exit.
+
+### Real-world latency profile: the store An fold, and a load-bypass regression — 2026-09-23
+
+Two changes, measured on the calibrated Dhrystone kernel family under
+`IPC_MEM=l2` with the board's `throughput-v2` profile, seed pinned to 12345.
+Baseline for every number below is that configuration with both flags off.
+
+**`LS_EARLY_AN=1` — write a POSTINC store's An at S1 (LsEuPlugin). No regression.**
+
+| kernel | cycles off | cycles on | IPC change |
+| --- | ---: | ---: | ---: |
+| dhrystone-x0-byteStIncX4-cb | 94,039 | 69,652 | +35.0% |
+| dhrystone-x0-byteX4-cb | 94,039 | 70,285 | +34.4% |
+| dhrystone-x0 | 35,220 | 33,863 | +4.3% |
+| dhrystone-x4 | 38,907 | 38,399 | +1.4% |
+| dhrystone-x0-byteSplit | 36,843 | 36,276 | +1.5% |
+| 29 other kernels | | | unchanged |
+
+An auto-update store carried its An write on its otherwise-unused int dst, which
+resolves only at LS completion, so `An := An + delta` waited behind a memory
+access. The source EA never did this (separate `anUpdUop`), and that asymmetry
+was the whole cost: with the store postincrementing and the load not, four byte
+copies cost 94,039 cycles; with the load postincrementing and the store not,
+70,285. The store side was all of it. After the change the store-postinc form
+costs 69,652 against a displaced-plus-addq ideal of 67,457.
+
+**`IQ_LOAD_BYPASS=1` — let a load pass an older unready LOAD. One regression, unexplained.**
+
+| kernel | cycles off | cycles on | IPC change |
+| --- | ---: | ---: | ---: |
+| dhrystone-x0-cb | 27,617 | 25,700 | +7.5% |
+| load-stream | 516 | 592 | **-12.8%** |
+
+The gain is where predicted: before the change a younger READY load sat behind an
+older unready LS uop for 22,999 of 27,617 cycles, and only 1,535 of those had a
+STORE at the head, so 93% of the blockage was load-behind-load, which has no
+hazard to disambiguate.
+
+The `load-stream` regression is NOT understood and the flag must not ship until it
+is. That kernel is six INDEPENDENT absolute-addressed loads plus loop control, so
+every LS slot should be ready and the relaxed select should pick the same slot as
+the original — yet the cycle count moves and dual-issue falls 17.2% to 15.0%.
+Isolated to this flag: `LS_EARLY_AN` alone leaves `load-stream` and
+`store-stream` bit-identical. The plausible mechanism is that out-of-order LS
+issue disturbs an access order that matched the D-cache's spatial locality (the
+six addresses span two 16-byte lines), but that is a hypothesis, not a
+measurement.
+
+Both flags default OFF and both pass `make test-fast` (396 succeeded, 0 failed,
+2 ignored), together and separately.
+
+Retired by these measurements, recorded so they are not re-attempted: issue-queue
+capacity and head-of-line blocking are NOT an IPC lever (dispatch blocked 77% of
+cycles with 5.73 of 16 slots free, but blocking collapses to 8% when independent
+work exists, with no RTL change -- the queue is only blocked when there is nothing
+else to dispatch); and store throughput is not one either (the 6.62 cycles/store
+figure came from `copybackDtt=false`, which makes every store write-through --
+the copyback cost is 1.22).
