@@ -857,7 +857,14 @@ object GenFullCoreSynthVerilog {
             preparedRetirement = preparedRetireEntries != 0),
           new DispatchPlugin(),
           new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries),
-          new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress, earlyAutoStoreAddress = earlyAutoStoreAddress),
+          // IQ_LOAD_BYPASS=1 lets a LOAD pass an older UNREADY LOAD in LS selection.
+          // Env-read rather than a constructor parameter so every existing correctness
+          // spec that builds this core can be run against it unmodified -- validating an
+          // ordering relaxation is the whole point, and it must not require editing each
+          // suite. Default OFF: unset leaves the shipped core bit-identical.
+          new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
+            earlyAutoStoreAddress = earlyAutoStoreAddress,
+            loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1")),
           eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),

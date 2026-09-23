@@ -85,7 +85,8 @@ object DynWait {
 }
 
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
-                       val earlyAutoStoreAddress: Boolean = false) extends FiberPlugin
+                       val earlyAutoStoreAddress: Boolean = false,
+                       val loadBypassUnreadyLoad: Boolean = false) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
@@ -680,7 +681,45 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // OR in the pipe exclusive) and the skid's own uop is what the pipe forwards.
     val lsSkidValid = RegInit(False)
     lsSkidValid.simPublic()
-    val ohL = ohLoldest & lsReady & B(slotCount bits, default -> !lsSkidValid)
+    // ---- OPTIONAL: let a LOAD pass an older UNREADY LOAD (loadBypassUnreadyLoad) ----
+    // The oldest-occupied-LS-only rule above exists for ONE hazard, stated in its own
+    // comment: an older STORE must have allocated into the SQ before a younger access to
+    // the same address disambiguates. That argument binds only when the blocking op is a
+    // STORE. Two LOADS have no hazard between them at all -- no address comparison, no
+    // disambiguation, nothing to get wrong -- so a ready load waiting behind an unready
+    // load is pure lost overlap.
+    //
+    // MEASURED on the calibrated Dhrystone kernel (IPC_MEM=l2, board profile): a younger
+    // READY load sits behind an older unready LS op for 22,999 of 27,617 cycles, and of
+    // the 23,006 blocked cycles only 1,535 have a STORE at the head. So 93% of the
+    // blockage is load-behind-load, which this relaxes.
+    //
+    // WHAT IS NOT RELAXED. A STORE still may not pass ANY older unready LS op: past a
+    // store it would be WAW, and past a load it would break the anti-dependence (the
+    // load must read the old value). So stores keep the original rule exactly, and only
+    // loads gain the bypass -- over older LOADS only.
+    val ohLrelaxed = if (!loadBypassUnreadyLoad) ohLoldest else {
+      val lsStoreUnready = Vec(slots.map(s =>
+        s.sel && isLs(s.hot) && (s.hot.memOp === m68k040.isa.MemOp.STORE) && !s.ready))
+      val lsAnyUnready = Vec(slots.map(s => s.sel && isLs(s.hot) && !s.ready))
+      // EXCLUSIVE prefix: "some strictly-older slot holds an unready store / LS op".
+      val olderUnreadyStore = Vec(Bool(), slotCount)
+      val olderUnreadyLs    = Vec(Bool(), slotCount)
+      olderUnreadyStore(0) := False
+      olderUnreadyLs(0)    := False
+      for (i <- 1 until slotCount) {
+        olderUnreadyStore(i) := olderUnreadyStore(i - 1) || lsStoreUnready(i - 1)
+        olderUnreadyLs(i)    := olderUnreadyLs(i - 1)    || lsAnyUnready(i - 1)
+      }
+      val eligible = B((0 until slotCount).map { i =>
+        val s = slots(i)
+        val isStore = s.hot.memOp === m68k040.isa.MemOp.STORE
+        s.sel && isLs(s.hot) && Mux(isStore, !olderUnreadyLs(i), !olderUnreadyStore(i))
+      })
+      OHMasking.first(eligible & lsReady)
+    }
+    val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed
+               else ohLoldest & lsReady) & B(slotCount bits, default -> !lsSkidValid)
     val lsSelectedLateData = (ohL & ~lsFullyReady).orR
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop

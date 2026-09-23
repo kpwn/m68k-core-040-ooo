@@ -88,6 +88,8 @@ class IpcBenchSpec extends CoreBenchHarness {
         earlyStoreAddress = true, fuseLongMoveLoads = true, reserveLateStore = true,
         detachLateStore = true, forwardOnPublish = true, earlyLsNzvcWakeup = true,
         detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
+        // IQ_LOAD_BYPASS=1 lets a load pass an older UNREADY LOAD (stores stay ordered).
+        loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`

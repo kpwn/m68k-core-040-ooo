@@ -351,6 +351,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     detachedStoreEntries: Int = 1,
                     earlyAutoStoreAddress: Boolean = false,
                     earlyStoreDataWake: Boolean = false,
+                    loadBypassUnreadyLoad: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -385,7 +386,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
       pcRangeEnable = pcRangeEnable)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
-      earlyAutoStoreAddress = earlyAutoStoreAddress)
+      earlyAutoStoreAddress = earlyAutoStoreAddress,
+      loadBypassUnreadyLoad = loadBypassUnreadyLoad)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
