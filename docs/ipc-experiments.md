@@ -2857,3 +2857,53 @@ work exists, with no RTL change -- the queue is only blocked when there is nothi
 else to dispatch); and store throughput is not one either (the 6.62 cycles/store
 figure came from `copybackDtt=false`, which makes every store write-through --
 the copyback cost is 1.22).
+
+**Extended to stack pushes and LEA — +34.1% on call/return, no regression.**
+
+`compData` at LS completion selects between four things: `leaAddr` -> the computed
+address, `stkPush` -> the computed address, `autoStoreAn` -> the An update, and
+otherwise the loaded value. Only the last genuinely depends on memory. All three
+others are a register plus a constant, and all three were waiting for the memory
+pipeline. With all three moved to S1:
+
+| kernel | cycles before | cycles after | IPC change |
+| --- | ---: | ---: | ---: |
+| call-return | 3,115 | 2,324 | +34.1% |
+| 33 other kernels | | | unchanged |
+
+Seed-robust: 2,324 / 2,323 / 2,270 at seeds 12345 / 999 / 4242.
+
+call/return was never a prediction problem, which the telemetry said before any
+change: FOUR mispredict resolutions in 100 iterations, against the oldest LS uop
+being unready on 2,864 of 3,115 cycles. `bsr` pushes the return address through an
+A7 predecrement store, so every call serialised on a memory-pipeline traversal to
+compute A7 - 4, and `rts`'s pop address waited on it.
+
+That completes this family: the four `compData` cases are now the three early ones
+plus the loaded value, and there is nothing left in it to move.
+
+### Load-hit speculation with replay: measured NOT worth it
+
+For completeness, since it is the obvious next idea for load-to-use. The 6.0-cycle
+dependent link decomposes as cmd(0) / rsp(1) / writeback + IQ dependency-clear
+register(2) / IQ issue-select register(3) / S0(4) / S1(5) / next cmd(6).
+`earlyIntWakeup` already announces a guaranteed next-cycle writeback, so it fires
+at cycle 1 -- the exact cycle the hit becomes known, not speculatively. Speculation
+could only move that to cycle 0, so the entire prize is ONE cycle of six.
+
+Against that, this kernel misses L1 on 13-16% of loads and `flush2commit` measures
+recovery at ~14 cycles, so a replay-by-flush costs
+
+    0.85 x (+1) - 0.15 x (14) = -1.25 cycles per load
+
+a clear net loss. Hit speculation pays when multi-cycle cache latency is being
+hidden; with an L1 that answers in ONE cycle there is no window to speculate into.
+Selective replay -- re-arming just the dependent's `dynWait` bit without flushing
+younger uops -- would change the arithmetic, but a consumer that has issued has
+already forwarded to its own consumers, so it needs a dependence-tracked re-issue
+chain, and IssueQueuePlugin is explicit that weakening the per-source wait bits
+converts an invariant violation from a HANG into a SILENT WRONG-VALUE issue.
+
+The remaining four cycles are not behind the cache: they are the IQ's two
+registers plus S0 and S1. Shortening them is an FMax trade, not a speculation
+problem, and the design currently closes 200 MHz with 3 ps of margin.
