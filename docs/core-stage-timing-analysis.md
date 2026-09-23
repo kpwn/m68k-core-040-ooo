@@ -223,3 +223,32 @@ is relieved (CPU worst 0.046 vs design 0.003), and the L2C cone is a placement
 problem whose obvious remedy is already on the rejected list. That makes the
 area/hierarchy work -- `socket_core` at ~95k FLAT LUTs with no component boundaries
 -- the gating item for every remaining slack lever, not an alternative to them.
+
+## VALIDATED: routed 200 MHz build with the levers in, 2026-09-24
+
+soc 44ed563 / cpu ac6281a4, build_id 0x44ed5637, throughput-v2, ETH on,
+AggressiveExplore via the split flow.
+
+| | pre-change | with the levers |
+| --- | ---: | ---: |
+| WNS | +0.003 | **+0.030** |
+| failing setup | 0 / 342,273 | 0 / 342,416 |
+| WHS | +0.009 | +0.006 |
+| failing hold | 0 | 0 |
+| WPWS | 0.000 | 0.000 |
+| failing pulse-width | 0 | 0 |
+
+Post-route phys_opt was skipped ("timing already met"). Setup margin is 10x the
+previous build's while carrying the IPC work -- so the levers are not a slack/IPC
+trade here, they are both.
+
+Entering the router, placement was also better: WNS -0.366 with 1,926 failing setup
+endpoints against -0.545 and 2,656 before, i.e. +179 ps and 730 fewer failures,
+which is what relieving 6,324 reset-constrained endpoints looks like. Hold entered
+deeper negative (-0.883 vs -0.396) and the router still closed it.
+
+Both levers are confirmed PRESENT in the generated netlist rather than assumed:
+`ohLrelaxed`/`eligible` (the relaxed LS select) appear 171/139 times and
+`anEarlyW`/`s1AnEarlyFire` 9 times. The `olderUnreadyStore`/`olderUnreadyLs` Vec
+names do NOT appear -- SpinalHDL flattens them -- so grep for the surviving names,
+not the Scala ones, when checking this.
