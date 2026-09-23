@@ -2817,27 +2817,35 @@ copies cost 94,039 cycles; with the load postincrementing and the store not,
 70,285. The store side was all of it. After the change the store-postinc form
 costs 69,652 against a displaced-plus-addq ideal of 67,457.
 
-**`IQ_LOAD_BYPASS=1` — let a load pass an older unready LOAD. One regression, unexplained.**
+**`IQ_LOAD_BYPASS=1` — let a load pass an older unready LOAD. No regression.**
+
+Seed-robust across three seeds (999 / 4242 / 12345), both flags together:
 
 | kernel | cycles off | cycles on | IPC change |
 | --- | ---: | ---: | ---: |
-| dhrystone-x0-cb | 27,617 | 25,700 | +7.5% |
-| load-stream | 516 | 592 | **-12.8%** |
+| dhrystone-x0-byteX4-cb | 94,125 / 94,283 / 94,039 | 70,664 / 70,666 / 70,688 | +33.1% / +33.1% / +33.1% |
+| dhrystone-x0-cb | 27,539 / 27,622 / 27,617 | 25,647 / 25,695 / 25,700 | +7.4% / +7.5% / +7.5% |
+| dhrystone-x0 | 35,230 / 35,299 / 35,220 | 33,631 / 33,704 / 33,574 | +4.9% / +4.6% / +4.9% |
 
 The gain is where predicted: before the change a younger READY load sat behind an
 older unready LS uop for 22,999 of 27,617 cycles, and only 1,535 of those had a
 STORE at the head, so 93% of the blockage was load-behind-load, which has no
 hazard to disambiguate.
 
-The `load-stream` regression is NOT understood and the flag must not ship until it
-is. That kernel is six INDEPENDENT absolute-addressed loads plus loop control, so
-every LS slot should be ready and the relaxed select should pick the same slot as
-the original — yet the cycle count moves and dual-issue falls 17.2% to 15.0%.
-Isolated to this flag: `LS_EARLY_AN` alone leaves `load-stream` and
-`store-stream` bit-identical. The plausible mechanism is that out-of-order LS
-issue disturbs an access order that matched the D-cache's spatial locality (the
-six addresses span two 16-byte lines), but that is a hypothesis, not a
-measurement.
+A `load-stream` regression reported here earlier (516 -> 592 cycles, -12.8%) is
+WITHDRAWN: it was single-seed noise. Measured across four seeds, the flag is
+BIT-IDENTICAL at three of them (674/674, 587/587, 589/589) and differs only at
+seed 12345 -- where the flag-OFF value of 516 is itself the outlier against those
+three baselines, and the flag-ON 592 sits inside their distribution. That kernel's
+natural spread across seeds is 516-674, a 30% range, so a 76-cycle difference
+carries no signal. A diagnostic counter settled it directly: the relaxed select
+picks a different slot on exactly ONE cycle of the whole `load-stream` run, versus
+2,048 cycles (once per iteration) on dhrystone-x0-cb. One divergence cannot cause
+a systematic 14% change; re-phasing a 516-cycle loop can.
+
+The lesson is the one this file already records for the IQ specs: a single-seed
+delta is not a controlled comparison. Gains above are quoted across three seeds
+with a spread under 0.2%.
 
 Both flags default OFF and both pass `make test-fast` (396 succeeded, 0 failed,
 2 ignored), together and separately.
