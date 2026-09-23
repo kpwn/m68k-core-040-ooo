@@ -650,6 +650,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       val pendingOwnerWaitHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val captureIssueHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
       val robHisto = ArrayBuffer.empty[RobCycle]
+      // IQ head-of-line telemetry (IQ_HOL=1). `push.ready` is gated on the OLDEST
+      // line being empty -- lines(0).ways.map(!selComb).reduce(_&&_) -- so one
+      // long-residency uop in slot 0/1 refuses every push no matter how many of the
+      // 16 slots are free. That is indistinguishable from capacity exhaustion in the
+      // board's `blocked_iq` counter, and the two want opposite fixes. The
+      // discriminator is the FREE-SLOT COUNT during blocked cycles.
+      // (occupancy, line0Occupied, oldestOccupiedReady, cluster, memOp)
+      val iqHolHisto = ArrayBuffer.empty[(Int, Boolean, Boolean, String, String)]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
       val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean, Boolean)]
@@ -666,6 +674,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
       val traceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
+      val iqHolOn = sys.env.get("IQ_HOL").contains("1")
       val ldCmdAddrs  = ArrayBuffer.empty[Long]  // D$ load physical addresses (premise check)
       val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
@@ -1025,6 +1034,15 @@ trait CoreBenchHarness extends AnyFunSuite {
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
         lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
           dut.iq.logic.lsSkidValid.toBoolean))
+        if (iqHolOn) {
+          val allSlots = dut.iq.logic.slots
+          val occ = allSlots.count(_.sel.toBoolean)
+          val s0 = allSlots(0); val s1 = allSlots(1)
+          val oldest = if (s0.sel.toBoolean) Some(s0) else if (s1.sel.toBoolean) Some(s1) else None
+          iqHolHisto += ((occ, oldest.isDefined, oldest.forall(_.ready.toBoolean),
+            oldest.map(_.hot.cluster.toEnum.toString).getOrElse("none"),
+            oldest.map(_.hot.memOp.toEnum.toString).getOrElse("none")))
+        }
         sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         lateStoreHisto += dut.lsEu.logic.lateDataCapture.toBoolean
         captureIssueHisto += ((dut.lsEu.logic.captureIssueCandidate.toBoolean,
@@ -1224,6 +1242,44 @@ trait CoreBenchHarness extends AnyFunSuite {
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
       val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
+      if (iqHolOn) {
+        // Same window the IPC number uses, capped to the last 1000 cycles so the
+        // sample is steady-state rather than including pipeline fill.
+        val full = iqHolHisto.slice(lo, hi + 1)
+        val w = if (full.size > 1000) full.takeRight(1000) else full
+        val blocked = w.filter(_._2)
+        val meanFree = if (blocked.isEmpty) 0.0
+                       else blocked.map(t => 16 - t._1).sum.toDouble / blocked.size
+        val notReady = blocked.count(!_._3)
+        val minFree = if (blocked.isEmpty) 0 else blocked.map(t => 16 - t._1).min
+        println(f"[iq-hol] ${k.name} sampled=${w.size} line0Occupied=${blocked.size} " +
+          f"(${100.0 * blocked.size / scala.math.max(1, w.size)}%.1f%%) " +
+          f"meanFreeSlotsWhenBlocked=$meanFree%.2f/16 minFree=$minFree " +
+          f"oldestUnready=$notReady (${100.0 * notReady / scala.math.max(1, blocked.size)}%.1f%% of blocked)")
+        println(s"[iq-hol] ${k.name} occupancyHist=" +
+          w.groupBy(_._1).view.mapValues(_.size).toSeq.sortBy(_._1).mkString(","))
+        println(s"[iq-hol] ${k.name} blockerCluster=" +
+          blocked.groupBy(_._4).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(",") +
+          " blockerMemOp=" +
+          blocked.groupBy(_._5).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(","))
+        // Where the dependent-chain link actually goes. The extraAlu sweep shows this
+        // workload is chain-bound, so per-link latency -- not issue capacity -- sets IPC.
+        // Pairing cmd[i] with rsp[i] assumes in-order responses, which holds for a serial
+        // chase (at most one load outstanding); maxDcOutstanding is printed so that
+        // assumption is visible rather than implied.
+        val nPairs = scala.math.min(ldCmdCycles.size, ldRspCycles.size)
+        if (nPairs > 8) {
+          val rt = (0 until nPairs).map(i => ldRspCycles(i) - ldCmdCycles(i)).filter(_ >= 0)
+          val nWb = scala.math.min(nPairs, lsWbCycles.size)
+          val use = (0 until nWb).map(i => lsWbCycles(i) - ldCmdCycles(i)).filter(_ >= 0)
+          def med(v: Seq[Long]): Long = if (v.isEmpty) -1L else v.sorted.apply(v.size / 2)
+          val rtMean = if (rt.isEmpty) 0.0 else rt.sum.toDouble / rt.size
+          println(f"[ld-lat] ${k.name} loads=$nPairs cmd->rsp median=${med(rt)} mean=$rtMean%.2f " +
+            f"cmd->writeback median=${med(use)} maxDcOutstanding=$maxDcOutstanding")
+          println(s"[ld-lat] ${k.name} cmd->rsp hist=" +
+            rt.groupBy(identity).view.mapValues(_.size).toSeq.sortBy(_._1).take(14).mkString(","))
+        }
+      }
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +
         s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
@@ -1525,6 +1581,131 @@ trait CoreBenchHarness extends AnyFunSuite {
   //         the first iteration every access is an L1D HIT — this measures hit
   //         throughput, not refill latency.
   //     Per iter: 6 loads + subq + bne = 8 macros.
+  /** Dhrystone-shaped kernel for the real-world latency profile.
+    *
+    * The existing kernels do not reproduce the board's dispatch behaviour: measured
+    * under IPC_MEM=l2 they hold 2-9 of the 16 IQ slots and block dispatch at most
+    * 38.6% of cycles, against 57.2% `blocked_iq` on the board running Dhrystone. The
+    * difference is the shape of the memory dependence, not the memory model:
+    *   - `kChaseLoop` is zero-filled, so its "chase" reloads ONE line forever -- a
+    *     load-to-use latency probe with a resident working set.
+    *   - `kLoadStream` issues six INDEPENDENT loads, which overlap.
+    * Dhrystone does neither. It dereferences a record pointer, then reads a field
+    * THROUGH that pointer, so two dependent L1 misses serialise per iteration, and
+    * it does that over a working set larger than the 8 KiB L1D.
+    *
+    * So this walks a SHUFFLED 16 KiB cycle of 1024 sixteen-byte records -- twice the
+    * cache, one record per line, in an order no stride prefetcher can follow -- and
+    * per iteration does: chase the pointer, load the record's field through it,
+    * consume that field in the ALU, copy two string bytes, and do one independent
+    * increment. The increment and the copy are register-independent of the chase, so
+    * they are exactly the work a machine that is NOT head-of-line blocked would
+    * overlap with the misses.
+    *
+    * `verifyChase` asserts the walk really happened: a derailed chain (loaded value
+    * not a valid record pointer) would collapse to a handful of lines and every
+    * number measured here would be meaningless.
+    */
+  /** Pure pointer chase: isolates LOAD-TO-USE latency, the quantity that sets IPC on
+    * chain-bound code.
+    *
+    * The dhrystone sweep showed this workload is chain-bound (8 extra independent ALU
+    * ops per iteration doubled retired work for 10.5% more cycles), and the D-cache
+    * measurement showed 84% of its loads return in ONE cycle. So the ~10 cycles per
+    * dependent link are not cache latency -- they are the LS pipeline plus wakeup plus
+    * re-issue. This kernel removes everything else so cycles/iteration IS that number.
+    *
+    * The record set is sized to FIT: 512 x 16 B over 128 sets is 4 per set against 4
+    * ways, so the walk is L1-resident by construction and the measurement is the
+    * hit-path load-to-use, not a miss.
+    */
+  def kChasePure(records: Int = 512, iters: Int = 2048): Kernel = {
+    val RecBase = 0x10000L
+    val RecBytes = 16
+    val order = { val rng = new scala.util.Random(0x5eed); rng.shuffle((0 until records).toVector) }
+    val prep: MemHandles => Unit = { h =>
+      for (i <- 0 until records) {
+        val here = RecBase + order(i) * RecBytes
+        val next = RecBase + order((i + 1) % records) * RecBytes
+        h.dmem.pokeByte(here + 0, ((next >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(here + 1, ((next >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(here + 2, ((next >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(here + 3, (next & 0xff).toInt)
+      }
+    }
+    val setup = Seq(f"lea 0x$RecBase%x,%%a0", s"move.l #$iters,%d7")
+    val body  = Seq("move.l (%a0),%a0", "subq.l #1,%d7", "bne.s .Lchase")
+    val src = (setup ++ Seq(".Lchase: " + body.mkString(" ; "))).mkString(" ; ")
+    Kernel("chase-pure", src, setup.size + iters * body.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + records * body.size)
+  }
+
+  def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0): Kernel = {
+    val RecBase  = 0x10000L
+    val RecBytes = 16
+    val StrSrc   = 0x20000L
+    val StrDst   = 0x28000L
+
+    // WHY THESE SIZES. The point is L1-miss / L2-HIT, which is where the board
+    // actually runs: `records * 16 B` = 8 KiB is exactly L1D's capacity (8 KiB,
+    // 4-way, 16 B lines), so a cyclic walk thrashes L1 by construction, while the
+    // whole set is only 128 of the L2 model's 64 B lines and stays resident.
+    //
+    // The first pass through the cycle is all COLD, and the latency model charges
+    // dramCycles(40) + fill for a line it has not seen (`l2Lines.contains`). An
+    // earlier version of this kernel walked 200 records of a 1024-record cycle, so
+    // EVERY access was a first touch and it measured cold DRAM -- 94 cycles per
+    // iteration and IPC 0.075, which is not the board's regime. `warmupInstrs`
+    // excludes exactly one full cold walk so the measured window is warm.
+    val order = {
+      val rng = new scala.util.Random(0x5eed)
+      rng.shuffle((0 until records).toVector)
+    }
+
+    val prep: MemHandles => Unit = { h =>
+      for (i <- 0 until records) {
+        val here = RecBase + order(i) * RecBytes
+        val next = RecBase + order((i + 1) % records) * RecBytes
+        // m68k is big-endian: most significant byte first.
+        h.dmem.pokeByte(here + 0, ((next >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(here + 1, ((next >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(here + 2, ((next >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(here + 3, (next & 0xff).toInt)
+        h.dmem.pokeByte(here + 4, 0); h.dmem.pokeByte(here + 5, 0)
+        h.dmem.pokeByte(here + 6, 0); h.dmem.pokeByte(here + 7, 1)
+      }
+      // The string source is re-read cyclically; keep it inside one page.
+      for (i <- 0 until 4096) h.dmem.pokeByte(StrSrc + i, 0x41 + (i % 26))
+    }
+
+    // `extraAlu` adds independent ALU work per iteration. It is the DISCRIMINATOR
+    // between the two possible readings of the blocked-dispatch measurement:
+    //   chain-bound  -- cycles/iteration is set by the serial dependent-load chain,
+    //                   dispatch has spare capacity, and added independent work is
+    //                   absorbed for free (cycles flat, IPC rises).
+    //   dispatch-bound -- the head-of-line block genuinely turns work away, so added
+    //                   independent work cannot be absorbed (cycles grow, IPC flat).
+    // Only in the second case does unblocking `push.ready` buy throughput.
+    val extras = (0 until extraAlu).map(i => s"addq.l #1,%d${3 + (i % 3)}")
+    val setup = Seq(
+      f"lea 0x$RecBase%x,%%a0", f"lea 0x$StrSrc%x,%%a2", f"lea 0x$StrDst%x,%%a3",
+      "moveq #0,%d1", "moveq #0,%d2", "moveq #0,%d3", "moveq #0,%d4", "moveq #0,%d5",
+      s"move.l #$iters,%d7")
+    val body = Seq(
+      "move.l (%a0),%a0",        // chase: dependent load INTO the address register
+      "move.l 4(%a0),%d0",       // field read THROUGH the chased pointer
+      "add.l %d0,%d1",           // consume the loaded field
+      "move.b (%a2)+,(%a3)+",    // string copy, independent of the chase
+      "addq.l #1,%d2") ++ extras ++ Seq(
+      "subq.l #1,%d7", "bne.s .Ldhry")
+    val perIter = body.size
+    val src = (setup ++ Seq(".Ldhry: " + body.mkString(" ; "))).mkString(" ; ")
+    Kernel(s"dhrystone-x$extraAlu", src, setup.size + iters * perIter,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + records * perIter)   // one full cold walk
+  }
+
   def kLoadStream: Kernel = {
     val iters = 60
     val addrs = Seq(0x4000, 0x4004, 0x4008, 0x400c, 0x4010, 0x4014)

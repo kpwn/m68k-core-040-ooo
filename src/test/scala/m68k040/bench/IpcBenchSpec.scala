@@ -58,14 +58,35 @@ class IpcBenchSpec extends CoreBenchHarness {
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
       kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kDeepBacklog,
-      kHotLoop, kMixed, kCallReturn)
+      kHotLoop, kMixed, kCallReturn, kDhrystone(), kDhrystone(extraAlu = 4), kDhrystone(extraAlu = 8), kChasePure())
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
       case None      => allKernels
     }
 
-    val compiled = M68kSim().withVerilator.compile(new FullCoreDut)
+    // IPC_V2=1 builds the DUT the BOARD ships: SocketIpcProfile."throughput-v2"
+    // turns every LS/front-end option on (SocketTop.scala `enabled` returns true for
+    // it, and `lateStore` adds the postincrement reservation). The suite's historical
+    // default is `new FullCoreDut` with every option FALSE, i.e. the baseline core --
+    // so an unqualified number from here is NOT comparable to a board counter.
+    val v2 = sys.env.get("IPC_V2").contains("1")
+    val compiled = M68kSim().withVerilator.compile(
+      if (!v2) new FullCoreDut
+      else new FullCoreDut(
+        alignedLoadFallThrough = true, earlyLsIntWakeup = true, sqSubwordForwarding = true,
+        pairCorrectBranch = true, retainRedirectHistory = true,
+        trainSlot1Conditional = true,
+        earlyStoreAddress = true, fuseLongMoveLoads = true, reserveLateStore = true,
+        detachLateStore = true, forwardOnPublish = true, earlyLsNzvcWakeup = true,
+        detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
+        // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
+        // the only validated FullCoreDut options the shipped profile does not set.
+        // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`
+        // REQUIRES it. So the only valid addition to the shipped profile is taken-only
+        // deferral on top of training, which is what this A/B toggles.
+        deferTakenSlot1Conditional = sys.env.get("IPC_V2_DEFER").contains("1")))
+    println(s"  core profile: ${if (v2) "throughput-v2 (board)" else "baseline (all options off)"}")
     val results = kernels.map(k => runKernel(compiled, k))
 
     // ── Print the table ───────────────────────────────────────────────────────
