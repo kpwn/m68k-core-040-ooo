@@ -829,6 +829,10 @@ object GenFullCoreSynthVerilog {
           reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
           forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
           detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
+          // LS_EARLY_AN=1: write/wake a POSTINC store's An at S1 instead of completion.
+          // Env-read for the same reason as IQ_LOAD_BYPASS -- validating it must not
+          // require editing every correctness suite. Default OFF.
+          earlyAutoAnWriteback = sys.env.get("LS_EARLY_AN").contains("1"),
           earlyStoreDataWake = earlyStoreDataWake)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](

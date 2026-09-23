@@ -352,6 +352,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyAutoStoreAddress: Boolean = false,
                     earlyStoreDataWake: Boolean = false,
                     loadBypassUnreadyLoad: Boolean = false,
+                    earlyAutoAnWriteback: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -396,6 +397,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
+      earlyAutoAnWriteback = earlyAutoAnWriteback,
       earlyStoreDataWake = earlyStoreDataWake)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
@@ -1725,6 +1727,27 @@ trait CoreBenchHarness extends AnyFunSuite {
         case "byteSplit"  => Seq("move.b (%a2)+,%d6", "move.b %d6,(%a3)+")
         case "byteAbs"    => Seq("move.b 0x20000,%d6", "move.b %d6,0x28000")
         // Split byteAbs into its halves: which side costs the 7.66 cycles?
+        // Four copies, postincrement: iteration N+1's addresses depend on N's updates.
+        case "byteX4"     => Seq.fill(4)("move.b (%a2)+,(%a3)+")
+        // The SAME four copies with fixed displacements off a base bumped once. The
+        // per-copy loop-carried address dependence is gone; the copies are independent.
+        // If this is materially faster per copy, the postincrement update is sitting on
+        // the critical path even though it needs only An, never the loaded data.
+        case "byteDispX4" => Seq("move.b 0(%a2),0(%a3)", "move.b 1(%a2),1(%a3)",
+                                 "move.b 2(%a2),2(%a3)", "move.b 3(%a2),3(%a3)",
+                                 "addq.l #4,%a2", "addq.l #4,%a3")
+        // Which side's An auto-update is on the critical path? Same four copies, with
+        // the postincrement on only ONE side and an explicit addq for the other. The
+        // store's An rides the store uop and writes back at LS COMPLETION (autoStoreAn);
+        // the load's does not. If only the store-postinc variant is slow, that writeback
+        // timing is the cost and moving it to S1 -- where base+delta is already known --
+        // is the fix.
+        case "byteLdIncX4" => Seq("move.b (%a2)+,0(%a3)", "move.b (%a2)+,1(%a3)",
+                                  "move.b (%a2)+,2(%a3)", "move.b (%a2)+,3(%a3)",
+                                  "addq.l #4,%a3")
+        case "byteStIncX4" => Seq("move.b 0(%a2),(%a3)+", "move.b 1(%a2),(%a3)+",
+                                  "move.b 2(%a2),(%a3)+", "move.b 3(%a2),(%a3)+",
+                                  "addq.l #4,%a2")
         case "byteLoadOnly"  => Seq("move.b 0x20000,%d6")
         case "byteStoreOnly" => Seq("move.b %d2,0x28000")
         case "longStoreOnly" => Seq("move.l %d2,0x28000")

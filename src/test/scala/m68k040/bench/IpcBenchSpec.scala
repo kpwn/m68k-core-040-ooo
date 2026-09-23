@@ -66,7 +66,11 @@ class IpcBenchSpec extends CoreBenchHarness {
       kDhrystone(strCopy = false, copyback = true),
       kDhrystone(copyStyle = "byteAbs", copyback = true),
       kDhrystone(copyStyle = "byteSplit", copyback = true),
-      kDhrystone(copyStyle = "byteLoadOnly", copyback = true))
+      kDhrystone(copyStyle = "byteLoadOnly", copyback = true),
+      kDhrystone(copyStyle = "byteX4", copyback = true),
+      kDhrystone(copyStyle = "byteDispX4", copyback = true),
+      kDhrystone(copyStyle = "byteLdIncX4", copyback = true),
+      kDhrystone(copyStyle = "byteStIncX4", copyback = true))
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
@@ -90,6 +94,7 @@ class IpcBenchSpec extends CoreBenchHarness {
         detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
         // IQ_LOAD_BYPASS=1 lets a load pass an older UNREADY LOAD (stores stay ordered).
         loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1"),
+        earlyAutoAnWriteback = sys.env.get("LS_EARLY_AN").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`

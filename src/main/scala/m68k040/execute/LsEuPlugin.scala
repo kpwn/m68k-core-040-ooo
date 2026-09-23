@@ -105,6 +105,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyNzvcWakeup: Boolean = false,
                  val detachedStoreEntries: Int = 1,
                  val earlyAutoStoreAddress: Boolean = false,
+                 val earlyAutoAnWriteback: Boolean = false,
                  val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
@@ -130,6 +131,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
+  var anEarlyW:   RegFileWritePort  = null
+  var anEarlyByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null
   var nzvcByp: RegFileBypassPort = null
   // X-flag write/bypass for the RTR CCR-restore load (X := loaded[4]).
@@ -263,8 +266,27 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     rdBase = irf.newRead()
     rdData = irf.newRead()
     rdIndex = irf.newRead()   // brief-format indexed EA: the index register Xn (psrcC)
-    intW   = irf.newWrite(latency = 1)
+    // MEASURED (real-latency profile): a POSTINC store's An update rides the store uop
+    // and writes back at LS COMPLETION, though its value is s1Base + eaDelta -- a
+    // register read plus a CONSTANT, with no dependence on the memory access at all.
+    // The SOURCE-EA An update does not do this (it rides a separate ADD uop), and the
+    // difference is the whole cost: four byte copies took 81,813 cycles with the store
+    // postincrementing versus 70,665 with only the load doing so, and the store-only
+    // variant was cycle-identical to both-postincrement. That is 13.6% on copy-heavy
+    // code, which is what Dhrystone's strcpy/strcmp are made of.
+    //
+    // `earlyAutoAnWriteback` writes (and wakes) that An at S1 instead. The early write
+    // SHARES the completion port's key deliberately: same-key requests merge into one
+    // physical port, so this costs no PRF storage -- and the alternative, a distinct
+    // key, would make two physical ports that must never target one register in a
+    // cycle, which is exactly the silent-corruption precondition RegFilePlugin warns
+    // about. Completion keeps the higher priority, so it can never be displaced.
+    intW   = irf.newWrite(latency = 1, sharingKey = "lsIntWb", priority = 1)
     intByp = irf.newBypass()
+    if (earlyAutoAnWriteback) {
+      anEarlyW   = irf.newWrite(latency = 1, sharingKey = "lsIntWb", priority = 0)
+      anEarlyByp = irf.newBypass()
+    }
     // MOVE-to-memory sets NZVC (impl (a)): the LS EU writes the NZVC PRF + bypass at
     // store completion. rename allocates the store µop a unique pNzvcDst, so this
     // distinct physical write port never collides with the ALU EUs' NZVC writers.
@@ -828,6 +850,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // write-back itself commits this cycle; reuse it as the store data instead of
     // inventing a second adder.
     val s1StoreData = Mux(u1.movesAliasStore, s1AnWb, s1Data)
+
 
     // ---- AGU cross-line / cross-page detection (S1, off s1Va) ----
     // The cross-detection / next-line base USED to be computed in S0 off the
@@ -2557,8 +2580,47 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Dynamic load-wakeup: a completing LOAD or a STACK-PUSH store (both produce an
     // int physreg) broadcasts; a plain store completes too but writes no register.
     val registeredIntWake = compValid && compWakes && compPdstValid && !compIsFault
-    wakeupPort.valid   := (if(earlyIntWakeup) nextIntWake.valid else registeredIntWake)
-    wakeupPort.payload := (if(earlyIntWakeup) nextIntWake.payload else compPdst)
+    // ── EARLY An WRITE-BACK for an auto-update STORE (earlyAutoAnWriteback) ──────
+    // s1AnWb above is already the exact value the completion stage will commit for this
+    // uop, so writing it here writes the SAME value to the SAME renamed physical
+    // register -- idempotent. That is what makes this safe without touching the
+    // completion path at all: rename guarantees a unique pdst per in-flight writer, so
+    // there is no WAW with anyone else, and the two writes cannot collide with each
+    // other in one cycle because they share one physical port.
+    //
+    // The WAKEUP is the part that must be conditional. A low-priority request loses
+    // arbitration SILENTLY (RegFilePlugin: "within a group the highest-priority valid
+    // request wins"), so waking a consumer on a cycle where the early write was dropped
+    // would let it read a stale register. The early wake therefore fires only when this
+    // cycle is provably free -- no completion write and no completion wake -- and
+    // otherwise the uop simply falls back to the existing completion write and wake.
+    // Single assignment: a default `:= False` followed by an unconditional reassignment
+    // is an assignment overlap SpinalHDL rejects outright.
+    val s1AnEarlyFire: Bool = if (!earlyAutoAnWriteback) False else {
+      val s1AnEarlyCandidate = s1Valid && (u1.memOp === MemOp.STORE) &&
+        (u1.eaAuto =/= m68k040.decode.EaAuto.NONE) && u1.pdstValid &&
+        !u1.stkPush && !u1.movesAliasStore && !u1.ccrRestore
+      // Conservative: require the shared write port AND the single wakeup port to be
+      // idle this cycle. Both are driven from the completion stage, which does not
+      // depend on S1, so reading them here is not a combinational loop.
+      val compWritePending = compValid && compPdstValid && !compIsFault
+      val compWakePending  = if (earlyIntWakeup) nextIntWake.valid else registeredIntWake
+      val fire = s1AnEarlyCandidate && !compWritePending && !compWakePending
+      anEarlyW.valid   := fire
+      anEarlyW.address := u1.pdst
+      anEarlyW.data    := s1AnWb
+      anEarlyByp.valid   := fire
+      anEarlyByp.address := u1.pdst
+      anEarlyByp.data    := s1AnWb
+      fire
+    }
+
+    // The early An wake is exclusive with the completion wake by construction:
+    // s1AnEarlyFire is gated on the completion wake being idle this cycle.
+    wakeupPort.valid   := (if(earlyIntWakeup) nextIntWake.valid else registeredIntWake) ||
+                          s1AnEarlyFire
+    wakeupPort.payload := Mux(s1AnEarlyFire, u1.pdst,
+                              (if(earlyIntWakeup) nextIntWake.payload else compPdst))
     GenerationFlags.simulation {
       val announced = RegNext(nextIntWake.valid) init False
       val announcedDst = RegNextWhen(nextIntWake.payload, nextIntWake.valid)
