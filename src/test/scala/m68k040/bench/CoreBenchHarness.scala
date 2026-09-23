@@ -1279,6 +1279,15 @@ trait CoreBenchHarness extends AnyFunSuite {
           println(s"[ld-lat] ${k.name} cmd->rsp hist=" +
             rt.groupBy(identity).view.mapValues(_.size).toSeq.sortBy(_._1).take(14).mkString(","))
         }
+        // Store path. A single store costs 6.6 cycles/iteration and a LONG store costs
+        // exactly the same as a BYTE store, so it is not subword read-modify-write.
+        // These counters separate the two remaining explanations: the SQ filling
+        // (capacity, which back-pressures dispatch through the `memoryReady` gate that
+        // no dispatch perf bucket counts) from the drain being slow (throughput).
+        println(f"[st-path] ${k.name} sqAlloc=$sqAllocFires sqDrain=$sqDrainFires " +
+          f"drainBlockedCyc=$drainBlockedCyc dcStoreFires=$dcStoreFires dcStoreAcks=$dcStoreAcks " +
+          f"hits=$dcStoreHits misses=$dcStoreMisses maxSqResident=$maxSqResident maxSqAccepted=$maxSqAccepted " +
+          f"maxDcOutstanding=$maxDcOutstanding")
       }
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +
@@ -1641,7 +1650,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       warmupInstrs = setup.size + records * body.size)
   }
 
-  def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0): Kernel = {
+  def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0,
+                 strCopy: Boolean = true, copyStyle: String = "byteMemMem",
+                 copyback: Boolean = false): Kernel = {
     val RecBase  = 0x10000L
     val RecBytes = 16
     val StrSrc   = 0x20000L
@@ -1695,13 +1706,38 @@ trait CoreBenchHarness extends AnyFunSuite {
     val body = Seq(
       "move.l (%a0),%a0",        // chase: dependent load INTO the address register
       "move.l 4(%a0),%d0",       // field read THROUGH the chased pointer
-      "add.l %d0,%d1",           // consume the loaded field
-      "move.b (%a2)+,(%a3)+",    // string copy, independent of the chase
+      "add.l %d0,%d1") ++            // consume the loaded field
+      // The byte copy is a load AND a store, both independent of the chase. Dropping
+      // it isolates how much of the iteration the STORE side costs: the chain accounts
+      // for 2 links, and whatever remains is this plus loop control. The board's
+      // head_store counter is 31%, so this is worth separating rather than assuming.
+      (if (!strCopy) Nil else copyStyle match {
+        // Decompose the 10.45 cycles/iteration that one byte copy costs.
+        //   byteMemMem : the 68k string primitive -- memory-to-memory, both postinc
+        //   longMemMem : same shape, LONG -- isolates subword/read-modify-write cost
+        //   byteSplit  : the same work as two instructions through a register --
+        //                isolates the cost of cracking a mem-to-mem move
+        //   byteAbs    : absolute addressing -- isolates the postincrement updates
+        case "byteMemMem" => Seq("move.b (%a2)+,(%a3)+")
+        case "longMemMem" => Seq("move.l (%a2)+,(%a3)+")
+        case "byteSplit"  => Seq("move.b (%a2)+,%d6", "move.b %d6,(%a3)+")
+        case "byteAbs"    => Seq("move.b 0x20000,%d6", "move.b %d6,0x28000")
+        // Split byteAbs into its halves: which side costs the 7.66 cycles?
+        case "byteLoadOnly"  => Seq("move.b 0x20000,%d6")
+        case "byteStoreOnly" => Seq("move.b %d2,0x28000")
+        case "longStoreOnly" => Seq("move.l %d2,0x28000")
+        case other        => throw new IllegalArgumentException(s"copyStyle: $other")
+      }) ++ Seq(
       "addq.l #1,%d2") ++ extras ++ Seq(
       "subq.l #1,%d7", "bne.s .Ldhry")
     val perIter = body.size
     val src = (setup ++ Seq(".Ldhry: " + body.mkString(" ; "))).mkString(" ; ")
-    Kernel(s"dhrystone-x$extraAlu", src, setup.size + iters * perIter,
+    // copybackDtt supplies COPYBACK translation. WITHOUT it every store is precise /
+    // write-through, which is a BENCH artifact and not what the Mac runs -- the recorded
+    // gap is ~12.4 cycles precise vs ~1.31 copyback. A store-cost number measured with
+    // this false does not describe the real machine.
+    Kernel(s"dhrystone-x$extraAlu${if (strCopy) (if (copyStyle == "byteMemMem") "" else "-" + copyStyle) else "-nocopy"}${if (copyback) "-cb" else ""}", src, setup.size + iters * perIter,
+      copybackDtt = copyback,
       zeroFillData = true, prepMem = prep,
       warmupInstrs = setup.size + records * perIter)   // one full cold walk
   }

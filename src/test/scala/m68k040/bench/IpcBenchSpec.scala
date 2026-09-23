@@ -58,7 +58,15 @@ class IpcBenchSpec extends CoreBenchHarness {
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
       kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kDeepBacklog,
-      kHotLoop, kMixed, kCallReturn, kDhrystone(), kDhrystone(extraAlu = 4), kDhrystone(extraAlu = 8), kChasePure())
+      kHotLoop, kMixed, kCallReturn, kDhrystone(), kDhrystone(extraAlu = 4), kDhrystone(extraAlu = 8), kChasePure(), kDhrystone(strCopy = false),
+      kDhrystone(copyStyle = "longMemMem"), kDhrystone(copyStyle = "byteSplit"),
+      kDhrystone(copyStyle = "byteAbs"), kDhrystone(copyStyle = "byteLoadOnly"),
+      kDhrystone(copyStyle = "byteStoreOnly"), kDhrystone(copyStyle = "longStoreOnly"),
+      kDhrystone(copyback = true), kDhrystone(copyStyle = "byteStoreOnly", copyback = true),
+      kDhrystone(strCopy = false, copyback = true),
+      kDhrystone(copyStyle = "byteAbs", copyback = true),
+      kDhrystone(copyStyle = "byteSplit", copyback = true),
+      kDhrystone(copyStyle = "byteLoadOnly", copyback = true))
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
