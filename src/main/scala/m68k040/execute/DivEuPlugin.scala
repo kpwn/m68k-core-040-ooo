@@ -286,6 +286,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     rdA = irf.newRead()   // CHK: Dn ; DIV: dividend low (Dq)
     rdB = irf.newRead()   // CHK: bound ; DIV: divisor (when register)
     rdH = irf.newRead()   // DIV64: dividend high (Dr)
+    // Zero hits in the four-kernel sweep and under test-fast, but see AluEuPlugin's
+    // note: that proved nothing for the slow-ALU bypass either. Not marked deadProbe.
     intW = irf.newWrite(latency = 1); intByp = irf.newBypass()
     val nz = host[NzvcRegFileService]
     nzvcW = nz.newWrite(latency = 1); nzvcByp = nz.newBypass()

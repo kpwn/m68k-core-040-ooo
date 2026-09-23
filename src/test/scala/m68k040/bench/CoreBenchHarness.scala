@@ -679,6 +679,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       val traceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val iqHolOn = sys.env.get("IQ_HOL").contains("1")
+      // BYP_LIVE=1: which int-PRF bypass sources actually carry traffic? Each one is a
+      // comparator + mux input in EVERY operand read, on the core's tightest datapath.
+      val bypLiveOn = sys.env.get("BYP_LIVE").contains("1")
       val ldCmdAddrs  = ArrayBuffer.empty[Long]  // D$ load physical addresses (premise check)
       val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
@@ -704,6 +707,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxSqAccepted     = 0
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
+      var lsBypassFires     = 0
+      val bypLiveCount      = Array.fill(16)(0)
+      var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
+      val nzvcLiveCount     = Array.fill(16)(0)
       // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
       // simPublic ROB signals; they do not perturb the DUT.
       // THE instrument for a two-tier reschedule, and it is deliberately NOT the
@@ -1038,6 +1045,18 @@ trait CoreBenchHarness extends AnyFunSuite {
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
         lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
           dut.iq.logic.lsSkidValid.toBoolean))
+        if (dut.iq.logic.lsBypassFired.toBoolean) lsBypassFires += 1
+        if (bypLiveOn) {
+          val v = dut.rfInt.logic.bypLive
+          for (i <- 0 until v.length) if (v(i).toBoolean) bypLiveCount(i) += 1
+          val vn = dut.rfNzvc.logic.bypLive
+          for (i <- 0 until vn.length) if (vn(i).toBoolean) nzvcLiveCount(i) += 1
+        }
+        if (bypLiveOn) {
+          if (dut.eu0.intWs.valid.toBoolean) aluSlowWr0 += 1
+          if (dut.eu1.intWs.valid.toBoolean) aluSlowWr1 += 1
+          if (dut.eu0.intW.valid.toBoolean)  aluFastWr0 += 1
+        }
         if (iqHolOn) {
           val allSlots = dut.iq.logic.slots
           val occ = allSlots.count(_.sel.toBoolean)
@@ -1288,6 +1307,12 @@ trait CoreBenchHarness extends AnyFunSuite {
         // These counters separate the two remaining explanations: the SQ filling
         // (capacity, which back-pressures dispatch through the `memoryReady` gate that
         // no dispatch perf bucket counts) from the drain being slow (throughput).
+        println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires")
+        if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
+          nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
+        if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1")
+        if (bypLiveOn) println(s"[byp-live] ${k.name} intBypassHitCycles=" +
+          bypLiveCount.take(dut.rfInt.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
         println(f"[st-path] ${k.name} sqAlloc=$sqAllocFires sqDrain=$sqDrainFires " +
           f"drainBlockedCyc=$drainBlockedCyc dcStoreFires=$dcStoreFires dcStoreAcks=$dcStoreAcks " +
           f"hits=$dcStoreHits misses=$dcStoreMisses maxSqResident=$maxSqResident maxSqAccepted=$maxSqAccepted " +

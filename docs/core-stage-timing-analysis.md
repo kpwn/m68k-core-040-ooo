@@ -72,3 +72,56 @@ needs either
 
 Ordering follows: relieve the control cones (`exc_activeReg` first -- it limits two
 of the load-to-use stages), then re-measure, and only then consider a fold.
+
+## Is NZVC affecting us? The file no; the flag COMPUTATION yes, it is the critical path
+
+| structure | slack | levels | limiting source |
+| --- | ---: | ---: | --- |
+| RegFilePluginNzvc (the file) | 0.312 | 3 | boot reset, not a datapath |
+| paths OUT of the NZVC file | none under 1.0 ns | | nothing reading flags is tight |
+| LsEu NZVC logic | 0.083 | **20** | AluEu `s1RdB[17]` |
+| AluEu NZVC logic | 0.301 | 17 | AluEu `s1Src1` |
+| Rob NZVC logic | 0.148 | 15 | AluEu `s1Ctx_uop_op` |
+
+The flag REGISTER FILE is clear -- zero endpoints under 1.0 ns are sourced from it,
+despite costing 1,081 LUTs for a 4-bit payload (the W x R replication overhead
+dominates a narrow file). What is tight is flag GENERATION: 15, 17 and 20 logic
+levels, the deepest combinational cones in the core. The 20-level LS one at 0.083 ns
+is the same path this document lists as "LsEu completion", so the CPU's critical
+path is the LS-side NZVC computation for MOVE-to-memory.
+
+There is precedent for the fix in the ALU: AluEuPlugin already notes a "24-level
+s1Src2 -> NZVC cone, so it uses the retimed S1-through-S3 path". The ALU's flag cone
+was split across three stages; the LS side still computes its flags in one shot at
+completion (`moveNzvc(s1Data, size)` -> `storeNzvc` -> `compNzvc`). Retiming the LS
+flag computation the way the ALU's already is would split the core's critical path.
+
+## NEAR MISS: three bypasses that look dead, are not, and the gate does not cover them
+
+Recorded because a green gate nearly justified deleting live forwarding paths.
+
+The int-PRF bypass-liveness probe (`RegFilePlugin.bypLive`, sim-only) recorded ZERO
+hits on both AluEu instances' SLOW-path bypass and on DivEu's, across four diverse
+kernels (dependent-ALU, mixed, call-return, dhrystone). Marked `deadProbe = true`,
+the FULL 396-test `test-fast` gate then passed with no assertion -- which reads as
+proof they are dead.
+
+They are not. `shift-stream` fires the slow-path int bypass 35 times
+(eu0slowWrites=238, eu1slowWrites=123) and its NZVC/X siblings 16 and 15 times.
+Neither the four-kernel sweep nor test-fast contains a dependent consumer behind a
+SLOW-path ALU op, which is the only thing that bypass serves -- and AluEuPlugin's own
+S1a-broadcast note says exactly that it must: "consumer's S0 read lands exactly on
+S3, which is the cycle intByps forwards the result. Not early, not late."
+
+Two conclusions:
+  * Do not delete those bypasses. The comment is right and the probe was under-covered.
+  * `test-fast` has a COVERAGE HOLE: no dependent edge behind a slow ALU op. A
+    forwarding change validated only against it would pass while silently breaking
+    every shift/rotate dependent edge -- the silent-wrong-value class RegFilePlugin's
+    own precondition comment warns about.
+
+The one bypass that WAS safely removed (the early-An write-back's, see
+`perf(ls): drop the early-An bypass port`) rests on a different argument: its write
+has latency 1 and the early wake plus the IQ's two registers put the consumer's read
+at N+2, so the PRF read serves it -- and removing it was measured bit-identical on
+every kernel, including the ones that exercise it.

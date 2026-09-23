@@ -1,6 +1,7 @@
 package m68k040.execute.regfile
 
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 import scala.collection.mutable.ArrayBuffer
@@ -231,6 +232,20 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
     // comment: if two sources ever matched one address the OR would silently merge two
     // values into garbage -- the same silent-corruption class the multi-write lowering
     // warns about, which is exactly why it is worth asserting rather than assuming.
+    // Sim-only liveness probe, one Bool per bypass source, ORed across every read port.
+    // Each bypass source costs an address comparator plus a mux input in EVERY operand
+    // read, and that mux is on the core's tightest datapath (operand read -> AluEu
+    // s1Src2, 10 logic levels, 0.080 ns slack on the routed 200 MHz build). So knowing
+    // WHICH sources actually carry traffic is a direct lever on forwarding depth.
+    // Zero synth impact: declared inside GenerationFlags.simulation.
+    val bypLive = GenerationFlags.simulation {
+      val v = Vec(Bool(), bypasses.size)
+      v.foreach(_ := False)
+      v.foreach(_.allowOverride)
+      v.foreach(_.simPublic())
+      v
+    }
+    val bypHitAcc = Array.fill(bypasses.size)(ArrayBuffer[Bool]())
     for ((r, noByp) <- reads) {
       val rfData = ram.readAsync(r.addr)
       if (noByp || bypasses.isEmpty) {
@@ -241,6 +256,7 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
         val bypData = bypasses.zip(hits).map { case (b, h) => b.data.andMask(h) }.reduceBalancedTree(_ | _)
         r.data := Mux(anyHit, bypData, rfData)
         GenerationFlags.simulation {
+          for ((h, i) <- hits.zipWithIndex) bypHitAcc(i) += h
           for ((h, i) <- hits.zipWithIndex if bypassDeadProbe(i)) {
             assert(!h,
               s"RegFile ${spec.name}: bypass source #$i is marked deadProbe but HIT a " +
@@ -251,6 +267,11 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
             "distinct-physical-register precondition is broken and the OR-reduce would " +
             "merge two values into garbage", FAILURE)
         }
+      }
+    }
+    GenerationFlags.simulation {
+      for (i <- bypasses.indices if bypHitAcc(i).nonEmpty) {
+        bypLive(i) := bypHitAcc(i).reduceBalancedTree(_ || _)
       }
     }
   }

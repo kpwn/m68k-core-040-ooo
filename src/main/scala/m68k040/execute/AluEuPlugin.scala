@@ -139,6 +139,16 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // to the CPLX cluster; CASOP has not, and it still needs three int sources.
     rdC = irf.newRead()
     intW = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); intByp = irf.newBypass()
+    // DO NOT mark this bypass deadProbe and delete it. It LOOKS dead and is not.
+    // Measured 2026-09-24: the bypass-liveness probe recorded zero hits across
+    // dependent-ALU / mixed / call-return / dhrystone AND the full 396-test `test-fast`
+    // gate passed with deadProbe asserted on it -- yet `shift-stream` fires it 35 times
+    // (eu0slowWrites=238, eu1slowWrites=123), and the NZVC/X siblings 16 and 15 times.
+    // Neither that four-kernel sweep nor test-fast contains a dependent consumer behind
+    // a SLOW-path ALU op, which is the only thing this bypass serves -- see the S1a
+    // broadcast note further down ("consumer's S0 read lands exactly on S3, which is the
+    // cycle intByps forwards the result"). Deleting it on a green gate would have been a
+    // silent wrong-value on every shift/rotate dependent edge.
     intWs = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 0); intByps = irf.newBypass()
     val nz = host[NzvcRegFileService]
     nzvcW = nz.newWrite(latency = 1, sharingKey = wbKey, priority = 1); nzvcByp = nz.newBypass()
@@ -767,6 +777,13 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     xWs.valid     := slowFire && u3.writesX;    xWs.address    := u3.pXDst;     xWs.data    := B(slowX)
     // ---- S3: SLOW bypass (forwards to a dependent reading the cycle S3 commits) ----
     intByps.valid  := intWs.valid;  intByps.address  := intWs.address;  intByps.data  := intWs.data
+    // Probe: is the SLOW write port active at all? The bypass-liveness probe recorded
+    // zero hits on intByps across 396 tests, which CONTRADICTS the design note above
+    // ("consumer's S0 read lands exactly on S3, which is the cycle intByps forwards").
+    // Either the suite never has a dependent consumer behind a slow op, or intWs itself
+    // never fires. Distinguishing those decides whether the bypass is removable or
+    // load-bearing-but-untested, so measure instead of assuming.
+    GenerationFlags.simulation { intWs.valid.simPublic(); intW.valid.simPublic() }
     nzvcByps.valid := nzvcWs.valid; nzvcByps.address := nzvcWs.address; nzvcByps.data := nzvcWs.data
     xByps.valid    := xWs.valid;    xByps.address    := xWs.address;    xByps.data    := xWs.data
 
