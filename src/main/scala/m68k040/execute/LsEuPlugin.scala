@@ -132,7 +132,6 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var intW: RegFileWritePort = null
   var intByp: RegFileBypassPort = null
   var anEarlyW:   RegFileWritePort  = null
-  var anEarlyByp: RegFileBypassPort = null
   var nzvcW: RegFileWritePort = null
   var nzvcByp: RegFileBypassPort = null
   // X-flag write/bypass for the RTR CCR-restore load (X := loaded[4]).
@@ -284,8 +283,17 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     intW   = irf.newWrite(latency = 1, sharingKey = "lsIntWb", priority = 1)
     intByp = irf.newBypass()
     if (earlyAutoAnWriteback) {
-      anEarlyW   = irf.newWrite(latency = 1, sharingKey = "lsIntWb", priority = 0)
-      anEarlyByp = irf.newBypass()
+      // NO BYPASS PORT, deliberately. Every bypass source is an address comparator
+      // plus a mux input in EVERY operand read, and the int PRF already has six
+      // (AluEu0 x2, AluEu1 x2, LsEu, DivEu); the routed build shows operand reads
+      // reaching AluEu s1Src2 through that mux at 10 logic levels with 0.080 ns of
+      // slack, so widening it is directly against tightening forwarding.
+      // It is also unnecessary: this write has latency 1, so the value is in the PRF
+      // at N+1, while the early wake fires at N and the IQ's registered
+      // dependency-clear plus registered select put the consumer's operand read at
+      // N+2 at the earliest -- the same contract `earlyIntWakeup` already documents
+      // ("a consumer reaches operand capture after the ordinary writeback register").
+      anEarlyW = irf.newWrite(latency = 1, sharingKey = "lsIntWb", priority = 0)
     }
     // MOVE-to-memory sets NZVC (impl (a)): the LS EU writes the NZVC PRF + bypass at
     // store completion. rename allocates the store µop a unique pNzvcDst, so this
@@ -2624,9 +2632,6 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       anEarlyW.valid   := fire
       anEarlyW.address := u1.pdst
       anEarlyW.data    := s1EarlyVal
-      anEarlyByp.valid   := fire
-      anEarlyByp.address := u1.pdst
-      anEarlyByp.data    := s1EarlyVal
       fire
     }
 
