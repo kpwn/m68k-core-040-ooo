@@ -173,3 +173,53 @@ design WNS -- the binding constraint is the L2 controller's tag write-enable con
 which already carries its own FMax history (see l2c_ctrl.v's 2026-09-15 note on
 `tag_match_c -> l2c_pri8 -> tw_en -> WEA`). Slack work starts there; CPU-path work
 only pays once that is relieved, or as headroom for a future fold.
+
+## Lever-by-lever disposition
+
+Every lever this analysis identified, with what was done and -- where not -- the
+specific blocking reason rather than a judgement call.
+
+IMPLEMENTED (all gate-clean at 396 succeeded / 0 failed / 2 ignored):
+
+| lever | result |
+| --- | --- |
+| IQ: load may pass an older unready LOAD | +7.5% calibrated Dhrystone, seed-robust |
+| LS: early An write-back at S1 (auto-update store, stack push, LEA) | +34.1% call/return, +33.1% copy-dense |
+| Both wired into SocketTop's throughput-v2 | they were NOT reaching the SoC before |
+| SoC: registered CPU reset (`cpu_rst_core`) | 6,324 endpoints off a sub-0.5 ns constraint |
+| LS: drop the early-An PRF bypass port | forwarding mux 7 -> 6 sources, bit-identical IPC |
+
+NOT IMPLEMENTED, each with a specific reason:
+
+* **L2C tag write-enable (the design's actual WNS limiter, 0.003 ns).** The cone
+  walks 72 CLB rows -- SLICE_X76Y35 (req_addr) through X72Y51/55/73, X74Y79,
+  X72Y82, X58Y107 to RAMB36_X4Y21 -- so it is placement spread, not RTL depth, and
+  pinning only the tag BRAMs would not fix the logic spread between. Pblocks were
+  already evaluated and rejected on this design (2026-09-16), and l2c_ctrl.v carries
+  two rounds of prior FMax work on this exact cone (see its 2026-09-15 note on
+  `tag_match_c -> l2c_pri8 -> tw_en -> WEA`, and the one-level WEA decode).
+
+* **LS NZVC retiming (the CPU's critical path, 20 levels).** Sound in principle --
+  94% of LS-produced flags are never forwarded -- but `compNzvc` has SIX write sites
+  and feeds `wbObs.nzvc`, the lockstep commit observation. Retiming it requires
+  re-aligning the whitebox capture, and getting that subtly wrong produces silent
+  lockstep drift. Not a change to make without dedicated validation.
+
+* **`exc_activeReg` fan-out** (limits AluEu 0.080 and LsEu S1 0.158). Already
+  replicated by the tool -- the routed path starts at `exc_activeReg_reg_rep__1` --
+  so the residual is route distance, not fanout. Registering it at consumers is a
+  correctness change to a squash level, not a timing transform.
+
+* **The oldest IQ slot's `dynWait[14]`** (limits four IQ stages). The bit is FP_B,
+  i.e. an FP dependency bit sitting in the readiness cone of every slot even on
+  integer code -- but the readiness NOR is ~2 levels; the depth is the 16-slot
+  select priority cone behind it, which prior work already narrowed ~7x.
+
+* **`moveNzvc` depth.** Already optimal shape: the three zero-tests are computed in
+  parallel and muxed by size, ~3 levels of the 20.
+
+The ordering that follows: CPU-path work cannot move design WNS until the L2C cone
+is relieved (CPU worst 0.046 vs design 0.003), and the L2C cone is a placement
+problem whose obvious remedy is already on the rejected list. That makes the
+area/hierarchy work -- `socket_core` at ~95k FLAT LUTs with no component boundaries
+-- the gating item for every remaining slack lever, not an alternative to them.
