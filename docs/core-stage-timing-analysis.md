@@ -125,3 +125,51 @@ The one bypass that WAS safely removed (the early-An write-back's, see
 has latency 1 and the early wake plus the IQ's two registers put the consumer's read
 at N+2, so the PRF read serves it -- and removing it was measured bit-identical on
 every kernel, including the ones that exercise it.
+
+## Does most code depend on NZVC? Measured: LS-produced flags are 94% dead
+
+The question was whether timing on the flag path can be loosened because most
+instructions do not consume flags. Measured with a sim-only bypass-liveness probe
+(who WRITES flags) against the NZVC forwarding probe (whose flags are READ):
+
+| kernel | LS flag writes | LS flags forwarded | never forwarded |
+| --- | ---: | ---: | ---: |
+| dhrystone-x0-cb | 4,096 | 256 | 94% |
+| store-stream | 369 | 23 | 94% |
+| load/store | 192 | 12 | 94% |
+| branchy | 0 | 0 | -- |
+| call-return | 0 | 0 | -- |
+
+LS produces 36% of all flag writes on Dhrystone (every memory MOVE sets NZVC), but
+94% are overwritten unread. On the BRANCH-heavy kernels LS-produced flags are
+consumed ZERO times: every branch takes its flags from the ALU, whose cone is
+already retimed across S1-S3.
+
+So the premise holds, but the implementation is retiming, NOT a timing exception.
+`set_multicycle_path` on the flag write would be unsound: the tool must assume the
+earliest possible reader, and a dependent Bcc can be that reader. Retiming makes the
+extra cycle REAL, and the IQ's existing `readsNzvc` wait bit plus the NZVC wakeup
+then keep a consumer correct automatically -- it simply waits one cycle longer in
+the rare case it exists.
+
+The target is specific. The core's critical path is
+
+    AluEu s1RdB_1_reg[17]  ->  LsEu compNzvc_reg[2]
+    4.863 ns, 20 levels (CARRY8 x2 = the ALU's own adder), 70% route
+
+i.e. ALU arithmetic + forwarding bypass + late store-data capture + `moveNzvc`, all
+in ONE cycle. Splitting it costs one cycle of flag latency on move-to-memory ->
+conditional-branch chains, which the table above says is close to free.
+
+## BUT: the CPU is not the FMax limiter -- the L2 cache is
+
+Before spending effort on any CPU path, note where the design's WNS actually is:
+
+    u_l2c/g_active.u_ctrl/req_addr_reg[21]  ->  u_tags/g_way[6].mem_reg_bram_1/WEA[1]
+    0.003 ns, 4.278 ns datapath, logic 0.820 (19%) route 3.458 (81%), 13 levels
+
+The CPU's worst path is 0.046 ns. So improving ANY CPU path below 0.046 buys ZERO
+design WNS -- the binding constraint is the L2 controller's tag write-enable cone,
+which already carries its own FMax history (see l2c_ctrl.v's 2026-09-15 note on
+`tag_match_c -> l2c_pri8 -> tw_en -> WEA`). Slack work starts there; CPU-path work
+only pays once that is relieved, or as headroom for a future fold.

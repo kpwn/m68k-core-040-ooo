@@ -711,6 +711,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val bypLiveCount      = Array.fill(16)(0)
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
+      var lsNzvcWrites      = 0
       // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
       // simPublic ROB signals; they do not perturb the DUT.
       // THE instrument for a two-tier reschedule, and it is deliberately NOT the
@@ -1053,6 +1054,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           for (i <- 0 until vn.length) if (vn(i).toBoolean) nzvcLiveCount(i) += 1
         }
         if (bypLiveOn) {
+          // Who PRODUCES flags: the LS side (move-to-memory) or the ALU? The LS flag
+          // cone is the core's critical path at 20 levels; retiming it costs one cycle
+          // of flag latency, so its value depends on how rare LS-produced flags are.
+          if (dut.lsEu.logic.compNzvcWrite.toBoolean) lsNzvcWrites += 1
           if (dut.eu0.intWs.valid.toBoolean) aluSlowWr0 += 1
           if (dut.eu1.intWs.valid.toBoolean) aluSlowWr1 += 1
           if (dut.eu0.intW.valid.toBoolean)  aluFastWr0 += 1
@@ -1310,7 +1315,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
-        if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1")
+        if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1 lsNzvcWrites=$lsNzvcWrites")
         if (bypLiveOn) println(s"[byp-live] ${k.name} intBypassHitCycles=" +
           bypLiveCount.take(dut.rfInt.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
         println(f"[st-path] ${k.name} sqAlloc=$sqAllocFires sqDrain=$sqDrainFires " +
