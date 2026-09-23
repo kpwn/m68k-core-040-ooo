@@ -103,7 +103,14 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       sqSubwordForwarding = ipcThroughput, reserveLateStore = ipcThroughput,
       detachLateStore = ipcThroughput, forwardOnPublish = ipcThroughput,
       earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1,
-      earlyAutoStoreAddress = ipcLateStore, earlyStoreDataWake = ipcLateStore)
+      earlyAutoStoreAddress = ipcLateStore, earlyStoreDataWake = ipcLateStore,
+      // Early An write-back at S1 instead of LS completion. An auto-update store, a
+      // stack push and LEA all write an int result that is a register plus a CONSTANT,
+      // yet all three waited for the memory pipeline. Measured under the board's
+      // throughput-v2 profile with IPC_MEM=l2: +34.1% on call/return (bsr's A7 feeds
+      // rts's pop address) and -13.6% cycles on copy-dense code, seed-robust across
+      // three seeds, zero regressions across 34 kernels.
+      earlyAutoAnWriteback = ipcThroughput)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin(icachePredecodeWords)
     val merge  = new AxiDMergePlugin()
@@ -137,7 +144,13 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
       new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
-        earlyAutoStoreAddress = ipcLateStore),
+        earlyAutoStoreAddress = ipcLateStore,
+        // Let a LOAD pass an older UNREADY LOAD. The oldest-occupied-LS-only rule exists
+        // for store->load disambiguation, which binds only when the blocker is a STORE;
+        // two loads have no hazard. Measured 93% of the blockage was load-behind-load,
+        // and relaxing it is +7.5% on the calibrated Dhrystone kernel. Stores stay fully
+        // ordered.
+        loadBypassUnreadyLoad = ipcThroughput),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
