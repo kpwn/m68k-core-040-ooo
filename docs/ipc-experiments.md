@@ -2964,3 +2964,56 @@ machinery alone. Two changes would make it clearly positive:
 Note the asymmetry: speculation helps only the ~15% of loads that miss, whereas a
 shorter pipeline helps the ~85% that hit. Both are gated on the same wire
 domination, so area and hierarchy precede both.
+
+### CORRECTION: the shallow stages are limited by control broadcasts, not their own logic
+
+The per-stage table above is MISLEADING for the three 3-logic-level stages, and the
+conclusion drawn from it ("every stage is 91-99% utilised, nothing to merge") was
+wrong for exactly those stages. Their worst path is not a datapath hop at all.
+
+All three reported the same startpoint, SLICE_X50Y11, with endpoints 138-204 CLB
+rows away -- because the path being reported was
+`u_boot_fsm/rom_loaded_reg -> <reg>/CLR`, the CPU RESET distribution into
+asynchronous clear pins, 91% route with a BUFGCE and two LUT6s. Re-measured
+excluding reset-sourced paths:
+
+| stage | datapath slack | levels | real limiter source |
+| --- | ---: | ---: | --- |
+| IQ readyReg | 0.367 | 4 | DebugCtrlPlugin csr_ctrlColdHold |
+| IQ lsSkid | 0.489 | 4 | DebugCtrlPlugin csr_ctrlColdHold |
+| LsEu P3 | 0.490 | 4 | DebugCtrlPlugin csr_ctrlColdHold |
+| IQ slot sel | 0.221 | 9 | RobPlugin doFlushReg |
+| LsEu S1 | 0.131 | 9 | RobPlugin doFlushReg |
+| LsEu P4 | 0.050 | 14 | LsEuPlugin p3Ctx_paddr -- a genuine datapath |
+
+So merging the shallow stages would not help: their limiter is a long-distance
+CONTROL broadcast, which a merge does not shorten. Only P4 is datapath-limited.
+
+The three broadcasts, sized:
+
+| signal | worst slack | endpoints < 0.5 ns | note |
+| --- | ---: | ---: | --- |
+| boot_fsm rom_loaded | 0.283 | 6,324 | -> async CLR, net also drives led_OBUF[1] |
+| debug csr_ctrlColdHold | 0.332 | 4,695 | -> cpu_cold_reset_hold -> async CLR |
+| RobPlugin doFlushReg | 0.053 | 833 | already replicated 3x (fanout 83/134/14) |
+
+Two findings follow.
+
+A WIDE ASYNCHRONOUS RESET IS A PLACEMENT STRAITJACKET. `rom_loaded` and the debug
+`csr_ctrlColdHold` converge on `cpu_cold_reset_hold`, which drives the async CLR of
+6,000-8,500 core registers with 6,324 inside 0.5 ns. It is NOT the WNS limiter
+(0.283 against the design's 0.003), so it costs nothing directly -- its cost is
+forcing thousands of registers to sit within ~4.7 ns of the boot FSM, which shapes
+placement of the whole core. This campaign already measured placement variance at
+±0.4 ns, larger than any single RTL lever, so relieving it is plausibly the biggest
+remaining FMax lever -- and FMax headroom is what gates stage merging, load-to-use
+and 250 MHz. Half of it is a DEBUG signal, which may lag by standing policy, so
+pipelining `csr_ctrlColdHold` is close to free; the other half is converting these
+pipeline registers from async CLR to synchronous reset, which removes the CLR path
+from fabric timing entirely.
+
+THE CPU'S CRITICAL PATH IS A FLUSH BROADCAST, NOT A DATAPATH: doFlushReg ->
+AluEuPlugin_logic_s1Src2_1_reg[2]/D, 0.053 ns at 10 logic levels, essentially the
+whole-CPU worst of 0.046. It is already replicated three ways, so further
+replication has diminishing returns; the lever is the same one recorded for
+GHR flush-restore -- anything that can observe the flush a cycle later should.
