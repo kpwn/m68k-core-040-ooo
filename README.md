@@ -4,7 +4,6 @@ This is a vibecoded core that tries to faithfully implement a high-performance 6
 
 There is a Macintosh Quadra 700-ish SoC sister repo at: https://github.com/kpwn/macqd700-soc
 
-
 I'm using this as a benchmark for LLM model capabilities in the face of large complex projects, and this was in my bucket list
 of things to do within my lifetime for a long while now. 
 
@@ -15,7 +14,10 @@ The core is heavily inspired by NaxRiscv by Dolu1990 and his copyright (MIT, (c)
 
 = https://github.com/SpinalHDL/NaxRiscv
 
-This core likely has many flaws and bugs; I know of several that are triggerable by running common Macintosh applications, mostly around FPU.
+This core likely has many flaws and bugs; I know of several that are triggerable by running common Macintosh applications, mostly around FPU. (EDIT: known ones have mostly been fixed in recent changes; CPU probably still has plenty of non-known flaws :) )
+
+In recent benchmarks we achieved roughly 0.3 IPC while running Dhrystone. Our branch prediction had a roughly 25% mispredict rate under that benchmark: not great, but at 200MHz it's roughly 5 times a real 25MHz 68040. Ultimate goal is to get >1IPC in Dhrystone, bringing us to a core 50% faster than the real thing clock-per-clock. Specific microbenchmarks show our IPC is at most ~1.9, consistent with the 2-wide retire we have going on.
+
 It's stable and correct enough to boot System 7.0.1 and System 7.5.3; A/UX, Amiga etc. hasn't been tried yet but I'd assume this has applications in that space.
 
 The core does NOT model a real 68040 from the bus perspective: instead AXI is used to allow for multiple OoO memory transactions in-flight.
