@@ -441,6 +441,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // REFILL for REPLAY to deliver directly (no line was allocated, so a
     // re-launched "hit" read would only find garbage/stale BRAM contents).
     val missLine  = Reg(Bits(128 bits))
+    /** RESPONSE IDENTITY of the missing access: the refill/inhibited/bus-fault
+      * responses are built from the `miss*` family rather than the S1/S2 pipe, so
+      * they carry their own copy of the requesting command's token. */
+    val missToken = Reg(UInt(DLoadToken.Width bits))
     // Task P4.2: does this in-flight refill service a store-drain miss (True)
     // or an ordinary load miss (False)? Distinguishes REPLAY's write-allocate
     // merge path from the load-fill/direct-response paths above.
@@ -603,6 +607,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // register a "hit" that would suppress the refill it architecturally needs.
     val ldS1Cmode = Reg(CacheMode())
     val ldS1Paddr = Reg(UInt(32 bits))   // physical addr (refill base on a miss)
+    // RESPONSE IDENTITY (DLoadRsp.token): the token of the command that launched this
+    // S1 read, carried to the response so a consumer can tell WHICH request answered.
+    val ldS1Token = Reg(UInt(DLoadToken.Width bits))
     ldS1Valid := False                   // default; armed on an accept below
 
     // Throughput slice C0: one bounded replay slot for the request accepted on the
@@ -1122,12 +1129,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2LineOnly = RegInit(False)
     val ldS2Direct = RegInit(False)
     val ldS2DirectData = Reg(Bits(32 bits))
+    val ldS2Token = Reg(UInt(DLoadToken.Width bits))
     ldS2Valid := ldS1Valid
     ldS2Hit   := ldS1Hit
     ldS2Line  := ldS1Line
     ldS2Off   := ldS1Off
     ldS2Size  := ldS1Size
     ldS2LineOnly := ldS1LineOnly
+    ldS2Token := ldS1Token
     ldS2Direct := False
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
@@ -1143,6 +1152,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
     loadRspPort.payload.fault := busFaultResp
+    // The miss-path responses (inhibited read, bus fault) answer the command whose
+    // token was latched into `missToken`; every other response comes down the S1/S2
+    // pipe, early-probe direct hits included (the direct arm overrides `ldS2Token`).
+    loadRspPort.payload.token := Mux(inhibitedResp || busFaultResp, missToken, ldS2Token)
 
     // ---- STORE drain (elastic S0 / S1 read / S2 compare / S3 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -1863,6 +1876,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Tag      := loadShadowCmd.paddr(31 downto offBits + setBits)
           ldS1Off      := loadShadowCmd.vaddr(offBits - 1 downto 0)
           ldS1Size     := loadShadowCmd.size
+          ldS1Token    := loadShadowCmd.token
           ldS1LineOnly := loadShadowCmd.lineOnly
           ldS1Cmode    := loadShadowCmd.cacheMode
           ldS1Paddr    := loadShadowCmd.paddr
@@ -1884,6 +1898,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS2Hit        := True
           ldS2Direct     := True
           ldS2DirectData := earlyProbeHitData
+          ldS2Token      := loadCmdPort.payload.token
           ldS2Line       := B(0, 128 bits)
           ldS2Off        := cmdOff
           ldS2Size       := loadCmdPort.payload.size
@@ -1897,6 +1912,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Tag      := cmdTag
           ldS1Off      := cmdOff
           ldS1Size     := loadCmdPort.payload.size
+          ldS1Token    := loadCmdPort.payload.token
           ldS1LineOnly := loadCmdPort.payload.lineOnly
           ldS1Cmode    := loadCmdPort.payload.cacheMode
           // Translation faults are consumed before a command is emitted. The only
@@ -1917,6 +1933,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
+          missToken := ldS1Token
           missLineOnly := ldS1LineOnly
           missCmode := ldS1Cmode
           // D25's clamp, applied where the range ENTERS the sequencer rather than where it
@@ -2040,6 +2057,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missTag   := pTag
           missOff   := pendingStorePaddr(offBits - 1 downto 0)
           missSize  := Size.LONG
+          // A store miss produces no LOAD response; the token is set only so the
+          // register never carries a stale load's identity into a later inspection.
+          missToken := U(0, DLoadToken.Width bits)
           // A store-miss refill's response data is never consumed as a value.
           missLineOnly := True
           missCmode := CacheMode.COPYBACK
@@ -2377,6 +2397,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
         }
       }
     }
+
+    // Sim-only observability for the HIT-UNDER-MISS study: which FSM state refuses a
+    // presented load. Only refusals taken while the FSM is off IDLE (a refill or an
+    // eviction writeback) are what hit-under-miss could recover; refusals inside IDLE
+    // are same-cycle port arbitration against a store or a maintenance walk, which is
+    // a different fix. Booleans, not the encoded state, so the bench needs no enum map.
+    val dbgFsmIdle = GenerationFlags.simulation {
+      val b = Bool(); b := fsm.isActive(fsm.IDLE); b.simPublic(); b
+    }
+    val dbgFsmRefill = GenerationFlags.simulation {
+      val b = Bool(); b := fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.EVICT_WR); b.simPublic(); b
+    }
+    val dbgFsmReplay = GenerationFlags.simulation {
+      val b = Bool(); b := fsm.isActive(fsm.REPLAY); b.simPublic(); b
+    }
+
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Task P5.4: cache-maintenance (CPUSH / CINV) walk engine

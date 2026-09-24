@@ -1,6 +1,6 @@
 package m68k040.execute
 
-import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd, DTranslationToken}
+import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd, DTranslationToken, DLoadToken}
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
@@ -432,7 +432,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // their own sites: the early-VIPT probe hand-over (see `probeCancelAll` below) and
     // the maintenance quiesce (`quiesceHold`).
     //
-    // RESPONSE IDENTITY. `DLoadRsp` carries no token -- responses are matched
+    // RESPONSE IDENTITY. `DLoadRsp` now carries the answered command's token (see
+    // its bundle doc); historically it did not, and responses were matched
     // POSITIONALLY today, by the aligned ring's own pointer. Adding a second concurrent
     // load client therefore needs an out-of-band identity, which is the `ldFifo` below:
     // a tag pushed on every accepted `loadCmd` and popped in lockstep with every
@@ -605,8 +606,40 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // the pop below advances the pointer.
     val ldRspTag = ldFifoTags(ldFifoPopPtr(log2Up(ldFifoDepth) - 1 downto 0))
     ldRspTag.simPublic()
-    val coreLsRspValid  = dcache.loadRsp.valid && (ldRspTag === U(LDTAG_CORE_LS, 2 bits))
-    val coreExcRspValid = dcache.loadRsp.valid && (ldRspTag === U(LDTAG_CORE_EXC, 2 bits))
+    // Class decode is by TOKEN, not by FIFO position -- see `ldRspTokClass` below and
+    // `DLoadRsp.token`. The positional head (`ldRspTag`) is retained purely as the
+    // cross-check the assert below pins, because position stops naming the responding
+    // request the moment the cache completes one out of order. `ldFifoOcc` remains the
+    // flow-control counter (one push per admitted load, one pop per response); only the
+    // per-entry CLASS is no longer read positionally.
+
+    // ── RESPONSE IDENTITY: the token now rides the response (DLoadRsp.token) ────────
+    // The class above is still decoded POSITIONALLY, from the FIFO head. `DLoadRsp`
+    // now also carries the token of the command it answers, and the token encoding
+    // ALREADY names the requester class (bit7 set => one of the three reserved ids;
+    // clear => a core-LS robId). So the two are redundant *while* responses are in
+    // order, and they diverge the moment one is completed out of order.
+    //
+    // This assert pins the token plumbing against the contract that currently holds,
+    // BEFORE any consumer is switched over to it: every response's token must decode
+    // to the same class the positional pop produced. It is the cheap proof that the
+    // token is captured at the right places (ordinary S1 accept, shadow relaunch,
+    // early-probe direct hit, and the miss/inhibited/bus-fault path), which is exactly
+    // what an out-of-order completion would silently get wrong.
+    val ldRspTok      = dcache.loadRsp.payload.token
+    val ldRspTokClass = UInt(2 bits)
+    ldRspTokClass := U(LDTAG_CORE_LS, 2 bits)
+    when(ldRspTok === U(DLoadToken.EXC,       DLoadToken.Width bits)) { ldRspTokClass := U(LDTAG_CORE_EXC, 2 bits) }
+    when(ldRspTok === U(DLoadToken.WALK_ITLB, DLoadToken.Width bits)) { ldRspTokClass := U(LDTAG_ITLB,     2 bits) }
+    when(ldRspTok === U(DLoadToken.WALK_DTLB, DLoadToken.Width bits)) { ldRspTokClass := U(LDTAG_DTLB,     2 bits) }
+    ldRspTok.simPublic(); ldRspTokClass.simPublic()
+    GenerationFlags.simulation {
+      assert(!dcache.loadRsp.valid || (ldRspTokClass === ldRspTag),
+        "LsEuPlugin: DLoadRsp.token class disagrees with the positional ldFifoTags head",
+        FAILURE)
+    }
+    val coreLsRspValid  = dcache.loadRsp.valid && (ldRspTokClass === U(LDTAG_CORE_LS, 2 bits))
+    val coreExcRspValid = dcache.loadRsp.valid && (ldRspTokClass === U(LDTAG_CORE_EXC, 2 bits))
 
     // ── Exception-sequencer load bookkeeping ───────────────────────────────────────
     // `exc.dcLoadRsp` is wired at the top level STRAIGHT off `dcache.loadRsp`, with no
@@ -4461,7 +4494,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         // The staged request is what the admission logic saw, so the grant goes back to
         // the STAGE, not to the walker directly (the stage forwards the release).
         walkLdStaged(i).ready := dcache.loadCmd.ready && walkerLoadAdmit(i)
-        c.walkLoadRsp.valid   := dcache.loadRsp.valid && (ldRspTag === U(tagI, 2 bits))
+        c.walkLoadRsp.valid   := dcache.loadRsp.valid && (ldRspTokClass === U(tagI, 2 bits))
         c.walkLoadRsp.payload := dcache.loadRsp.payload
         c.walkStore.ready     := dcache.store.ready && walkerStoreAdmit(i)
         c.walkStoreAck        := dcache.storeAck && walkStOutstanding &&

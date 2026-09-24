@@ -684,6 +684,15 @@ trait CoreBenchHarness extends AnyFunSuite {
       val bypLiveOn = sys.env.get("BYP_LIVE").contains("1")
       val ldCmdAddrs  = ArrayBuffer.empty[Long]  // D$ load physical addresses (premise check)
       val ldCmdCycles = ArrayBuffer.empty[Long]  // D$ load command accepted
+      // Per-load cycles spent PRESENTED-AND-REFUSED while the D$ FSM was off IDLE in a
+      // refill/evict. Paired with that same load's post-accept cmd->rsp latency, this
+      // separates the cycles hit-under-miss could actually recover (the load turned out
+      // to HIT, so accepting it early would have completed it inside the refill window)
+      // from cycles it could not (the load missed too and would have queued anyway).
+      val ldRefillWaits = ArrayBuffer.empty[Long]
+      var pendRefillWait = 0L
+      val ldRefillSameLine = ArrayBuffer.empty[Int]
+      var lastAcceptedLine = -1L
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
       val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
       var firstCommitCycle = -1L
@@ -712,6 +721,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
       var lsNzvcWrites      = 0
+      var dcLoadPresented   = 0; var dcLoadRefused = 0
+      var dcRefusedRefill   = 0; var dcRefusedReplay = 0; var dcRefusedIdle = 0
       // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
       // simPublic ROB signals; they do not perturb the DUT.
       // THE instrument for a two-tier reschedule, and it is deliberately NOT the
@@ -1057,6 +1068,22 @@ trait CoreBenchHarness extends AnyFunSuite {
           // Who PRODUCES flags: the LS side (move-to-memory) or the ALU? The LS flag
           // cone is the core's critical path at 20 levels; retiming it costs one cycle
           // of flag latency, so its value depends on how rare LS-produced flags are.
+          // HIT-UNDER-MISS opportunity. The D-cache leaves IDLE on a miss edge and
+          // captures younger requests "for ordered replay", so during a refill it
+          // REFUSES loads. Cycles with a load presented and refused are exactly what
+          // hit-under-miss would recover -- an upper bound, since some of those loads
+          // would themselves miss. An L1D HIT also proves the access is cacheable (a
+          // device read can never hit), which is what makes the reorder safe where the
+          // IQ-level relaxation was not.
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean) {
+            dcLoadPresented += 1
+            if (!dut.dcache.logic.loadCmdPort.ready.toBoolean) {
+              dcLoadRefused += 1
+              if (dut.dcache.logic.dbgFsmRefill.toBoolean)      dcRefusedRefill += 1
+              else if (dut.dcache.logic.dbgFsmReplay.toBoolean) dcRefusedReplay += 1
+              else if (dut.dcache.logic.dbgFsmIdle.toBoolean)   dcRefusedIdle += 1
+            }
+          }
           if (dut.lsEu.logic.compNzvcWrite.toBoolean) lsNzvcWrites += 1
           if (dut.eu0.intWs.valid.toBoolean) aluSlowWr0 += 1
           if (dut.eu1.intWs.valid.toBoolean) aluSlowWr1 += 1
@@ -1137,6 +1164,19 @@ trait CoreBenchHarness extends AnyFunSuite {
             dut.dcache.logic.loadCmdPort.ready.toBoolean) {
           ldCmdCycles += telemCycle
           ldCmdAddrs  += (dut.dcache.logic.loadCmdPort.payload.paddr.toLong & 0xffffffffL)
+          ldRefillWaits += pendRefillWait
+          // Was this load in the SAME 64B line as the load that caused the refill it
+          // waited behind? If so it HITS ONLY BECAUSE IT WAITED -- the refill is what
+          // put its data in the array -- and hit-under-miss could not have completed it
+          // early. (`move.l 4(%a0),%d0` right after `move.l (%a0),%a0` is exactly this.)
+          // Only different-line waiters are genuinely recoverable.
+          val thisLine = (dut.dcache.logic.loadCmdPort.payload.paddr.toLong & 0xffffffffL) >> 6
+          ldRefillSameLine += (if (pendRefillWait > 0 && thisLine == lastAcceptedLine) 1 else 0)
+          lastAcceptedLine = thisLine
+          pendRefillWait = 0L
+        } else if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+                   dut.dcache.logic.dbgFsmRefill.toBoolean) {
+          pendRefillWait += 1
         }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
@@ -1304,6 +1344,20 @@ trait CoreBenchHarness extends AnyFunSuite {
           val rtMean = if (rt.isEmpty) 0.0 else rt.sum.toDouble / rt.size
           println(f"[ld-lat] ${k.name} loads=$nPairs cmd->rsp median=${med(rt)} mean=$rtMean%.2f " +
             f"cmd->writeback median=${med(use)} maxDcOutstanding=$maxDcOutstanding")
+          val nW = scala.math.min(nPairs, ldRefillWaits.size)
+          val waitHit  = (0 until nW).filter(i => ldRspCycles(i) - ldCmdCycles(i) <= 2)
+          val waitMiss = (0 until nW).filter(i => ldRspCycles(i) - ldCmdCycles(i) >  2)
+          val hitSame  = waitHit.filter(i => ldRefillSameLine(i) == 1)
+          val hitDiff  = waitHit.filter(i => ldRefillSameLine(i) == 0)
+          println(f"[hum-line] ${k.name} waitedThenHIT-sameLineAsRefill=${hitSame.map(ldRefillWaits).sum} " +
+            f"(${hitSame.size} loads, NOT recoverable: the refill is what made them hit) " +
+            f"waitedThenHIT-differentLine=${hitDiff.map(ldRefillWaits).sum} (${hitDiff.size} loads, RECOVERABLE) " +
+            f"= ${100.0 * hitDiff.map(ldRefillWaits).sum / scala.math.max(1L, windowCycles)}%.1f%% of window")
+          println(f"[hum-split] ${k.name} loadsWaitingBehindRefill=${(0 until nW).count(ldRefillWaits(_) > 0)}/$nW " +
+            f"recoverableCycles(waitedThenHIT)=${waitHit.map(ldRefillWaits).sum} " +
+            f"overWaitedThenMISS=${waitMiss.map(ldRefillWaits).sum} " +
+            f"windowCycles=$windowCycles " +
+            f"(recoverable = ${100.0 * waitHit.map(ldRefillWaits).sum / scala.math.max(1L, windowCycles)}%.1f%% of window)")
           println(s"[ld-lat] ${k.name} cmd->rsp hist=" +
             rt.groupBy(identity).view.mapValues(_.size).toSeq.sortBy(_._1).take(14).mkString(","))
         }
@@ -1315,6 +1369,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
+        if (bypLiveOn) println(f"[hum] ${k.name} loadPresentedCycles=$dcLoadPresented refusedCycles=$dcLoadRefused " +
+          f"(${100.0 * dcLoadRefused / scala.math.max(1, dcLoadPresented)}%.1f%% of presented) " +
+          f"refill=$dcRefusedRefill replay=$dcRefusedReplay idleArb=$dcRefusedIdle windowCycles=$windowCycles")
         if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1 lsNzvcWrites=$lsNzvcWrites")
         if (bypLiveOn) println(s"[byp-live] ${k.name} intBypassHitCycles=" +
           bypLiveCount.take(dut.rfInt.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))

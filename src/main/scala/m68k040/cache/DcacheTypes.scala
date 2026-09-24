@@ -168,6 +168,21 @@ case class DLoadRsp() extends Bundle {
   val data  = Bits(32 bits)
   val line  = Bits(128 bits)
   val fault = Bool()
+  /** RESPONSE IDENTITY: the `DLoadCmd.token` of the request this response answers.
+    *
+    * Responses used to be matched POSITIONALLY -- the LS EU's `ldFifoTags` popped a
+    * requester class per response, relying on the cache's in-order response contract.
+    * That contract is what forbade completing a younger load ahead of an older one,
+    * and it is the sole reason a load that HITS has to wait out an unrelated refill:
+    * there was no way to say which request a response belonged to.
+    *
+    * The identity was already there on the command side and already rode through the
+    * cache -- the same token the early-probe CAM matches on -- it simply never reached
+    * the response. Carrying it here is what makes out-of-order completion expressible;
+    * see `DLoadToken` for the encoding (bits5:0 = robId, 0x80/0x81/0x82 reserved for
+    * the exception sequencer and the two table walkers), which already distinguishes
+    * every requester class `ldFifoTags` used to reconstruct by position. */
+  val token = UInt(DLoadToken.Width bits)
 }
 
 /** Store command from the SQ drain: a PHYSICAL address (already translated),
