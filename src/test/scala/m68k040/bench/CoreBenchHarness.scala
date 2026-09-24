@@ -721,6 +721,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
       var lsNzvcWrites      = 0
+      var decFires = 0; var decDualFires = 0
       var oooWbFires = 0; var oooParkedCyc = 0
       var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
       var dcLoadPresented   = 0; var dcLoadRefused = 0
@@ -1126,6 +1127,14 @@ trait CoreBenchHarness extends AnyFunSuite {
               dut.dcache.logic.dbgFsmRefill.toBoolean) humProbeLaunchInRefill += 1
           if (dut.lsEu.logic.alignedEarlyWbFire.toBoolean) oooWbFires += 1
           if ((0 until 4).exists(i => dut.lsEu.logic.alignedDone(i).toBoolean)) oooParkedCyc += 1
+          // DUAL DECODE rate. `slot1Ok` in Aligner.scala requires the SECOND instruction to
+          // be `p1.simple && !p1.ambiguousLine`, so any complex/microcoded instruction in
+          // slot 1 drops the group to single-issue at the very front of the machine. This
+          // measures how often that costs us, before touching the aligner.
+          if (dut.dec.logic.fed.valid.toBoolean && dut.dec.logic.fed.ready.toBoolean) {
+            decFires += 1
+            if (dut.dec.logic.fed.payload.slot1Valid.toBoolean) decDualFires += 1
+          }
           if (dut.lsEu.logic.compNzvcWrite.toBoolean) lsNzvcWrites += 1
           if (dut.eu0.intWs.valid.toBoolean) aluSlowWr0 += 1
           if (dut.eu1.intWs.valid.toBoolean) aluSlowWr1 += 1
@@ -1423,6 +1432,8 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"avgValidEntries=${humEntriesValid.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
           f"avgReadyEntries=${humEntriesReady.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
           f"probeOffered=$humProbeOffered credit=$humProbeCredit launched=$humProbeLaunched storeClaim=$humStoreClaim")
+        println(f"[dual-dec] ${k.name} decodeGroups=$decFires dualGroups=$decDualFires " +
+          f"(${100.0 * decDualFires / scala.math.max(1, decFires)}%.1f%% of groups carried a slot1)")
         println(s"[ooo] ${k.name} earlyWritebackFires=$oooWbFires cyclesWithAParkedResponse=$oooParkedCyc " +
           s"acceptsDuringRefill=$humAcceptsInRefill probeLaunchesDuringRefill=$humProbeLaunchInRefill")
         if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1 lsNzvcWrites=$lsNzvcWrites")

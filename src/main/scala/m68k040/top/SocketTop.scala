@@ -595,13 +595,33 @@ object GenSocketTopVerilog {
       case "1" => true
       case value => throw new IllegalArgumentException(s"PERF_DETAIL_ENABLE must be 0 or 1, got $value")
     }
-    val ipcProfile = sys.env.getOrElse("CPU_IPC_PROFILE", "baseline")
+    // ⚠️ THE DEFAULT IS THE FAST CORE. It used to be "baseline", which disables the
+    // ENTIRE throughput knob set this file gates on `ipcThroughput` --
+    // alignedLoadFallThrough, earlyIntWakeup, sqSubwordForwarding, reserveLateStore,
+    // detachLateStore, forwardOnPublish, earlyNzvcWakeup, detachedStoreEntries=4,
+    // earlyAutoAnWriteback, and the frontend's retainRedirectHistory /
+    // trainSlot1Conditional / deferTakenSlot1Conditional. A bitstream built without the
+    // env var set was therefore ~3x SLOWER on Dhrystone (measured 2026-09-24: 110K ->
+    // 35K Dhrystones/s) with nothing in the flow saying so. Three board measurements
+    // were wrongly attributed to a CPU refactor before that was found.
+    //
+    // There is no reason for the slow configuration to be what you get by forgetting a
+    // variable. Ask for `baseline` explicitly if you want it.
+    val ipcProfile = sys.env.getOrElse("CPU_IPC_PROFILE", "throughput-v2")
     val ipcThroughput = SocketIpcProfile.enabled(ipcProfile)
     val debugProfile = sys.env.getOrElse("CPU_DEBUG_PROFILE", "full")
     val pcRangeEnable = SocketDebugProfile.pcRangeEnabled(debugProfile)
     val icachePredecodeWords = m68k040.cache.IcachePredecodeConfig.fromEnvironment
     println(s"ICACHE_PREDECODE_WORDS=$icachePredecodeWords")
     println(s"CPU_IPC_PROFILE=$ipcProfile PERF_DETAIL_ENABLE=$detailedPerf CPU_DEBUG_PROFILE=$debugProfile")
+    // Print the shipping knobs too. Grepping the generated Verilog for a signal name is
+    // NOT a usable provenance check -- SpinalHDL renames/optimises those away, so an
+    // absent name proves nothing about what was built. The generator saying what it built
+    // is the only cheap check that cannot lie.
+    println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
+            s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
+            s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
+            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

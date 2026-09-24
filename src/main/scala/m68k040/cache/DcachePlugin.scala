@@ -65,7 +65,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      *
                      * The requester must additionally have said it attributes replies by
                      * `DLoadRsp.token` rather than by arrival order (`DLoadCmd.ooOk`). */
-                   val hitUnderMiss: Boolean = true,
+                   val hitUnderMiss: Boolean = m68k040.top.ShippingCoreConfig.dcacheHitUnderMiss,
                    /** HIT UNDER MISS, second stage: accept a command during a refill with a
                      * REAL S1 array read, not only from an already-resolved early-probe
                      * entry.
@@ -90,7 +90,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * `loadCmdPort.ready` and a second S1 launch site, both on the cone this
                      * file records as the core's longest -- so it can be dropped on its own
                      * if it costs 200 MHz closure. */
-                   val hitUnderMissRead: Boolean = true) extends FiberPlugin with DcacheService {
+                   val hitUnderMissRead: Boolean = m68k040.top.ShippingCoreConfig.dcacheHitUnderMissRead)
+    extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
   // that read through loadProbeResolve with the translated physical address.
