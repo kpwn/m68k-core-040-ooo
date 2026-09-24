@@ -158,6 +158,29 @@ case class DLoadCmd() extends Bundle {
     * it no longer catches a real unguarded consumer. Purely a verification contract:
     * no synthesised logic reads it. */
   val lineOnly  = Bool()
+  /** THE REQUESTER PERMITS AN OUT-OF-ORDER COMPLETION of this access.
+    *
+    * The cache may serve this command ahead of an older, still-outstanding one when
+    * it can do so with no shared state -- i.e. from an early-probe entry that already
+    * holds a physical-tag-qualified hit. `DLoadRsp.token` is what lets the requester
+    * attribute the reply, so this bit is the requester's statement that it actually
+    * DOES attribute by token rather than by arrival order.
+    *
+    * Set ONLY by the LS EU's ordinary single-access aligned-ring loads. Left False by:
+    *   - both halves of a cross-line split pair, which must merge in order;
+    *   - the commit-side exception sequencer (token 0x80);
+    *   - both table walkers (0x81/0x82), whose descriptor reads are one half of a
+    *     read-modify-write that must not be reordered.
+    * Those consumers still match by token, but they are single-outstanding and
+    * order-sensitive, so nothing is gained by reordering them and the ordering
+    * guarantees they rely on stay intact by construction.
+    *
+    * NOT a cacheability statement and NOT sufficient on its own: the cache additionally
+    * requires the early-probe hit, which is what proves this access is cacheable (an
+    * inhibited device read can never hit), and the older access being in a refill,
+    * which proves the same of it. Both cacheable is what makes the reorder legal
+    * against the cache-inhibited access ordering the 68040 guarantees. */
+  val ooOk      = Bool()
 }
 
 /** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is

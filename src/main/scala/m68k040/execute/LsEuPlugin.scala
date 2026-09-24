@@ -1406,6 +1406,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val alignedValid    = Vec.fill(alignedDepth)(RegInit(False))
     val alignedSent     = Vec.fill(alignedDepth)(RegInit(False))
     val alignedPoisoned = Vec.fill(alignedDepth)(RegInit(False))
+    // ── PARKED RESPONSE (out-of-order data return, in-order completion) ────────────
+    // The cache may answer an `ooOk` command ahead of an older outstanding one when it
+    // can do so from an early-probe entry (see `DLoadCmd.ooOk`). Such a response is
+    // attributed by `DLoadRsp.token` to its own ring entry and PARKED there; the ring
+    // still completes strictly in ring order, so the PRF write, the completion port,
+    // the split-pair merge and the ROB all keep seeing loads finish in program order.
+    // What the reorder buys is not latency on the reordered load -- it is that the LS
+    // pipe and the cache stop standing still for the duration of someone else's refill.
+    val alignedDone   = Vec.fill(alignedDepth)(RegInit(False))
+    val alignedRData  = Vec.fill(alignedDepth)(Reg(Bits(32 bits)))
+    val alignedRLine  = Vec.fill(alignedDepth)(Reg(Bits(128 bits)))
+    val alignedRFault = Vec.fill(alignedDepth)(RegInit(False))
+    alignedDone.foreach(_.simPublic())
     val alignedPushPtr  = Reg(UInt(alignedPtrW bits)) init 0
     val alignedSendPtr  = Reg(UInt(alignedPtrW bits)) init 0
     val alignedRspPtr   = Reg(UInt(alignedPtrW bits)) init 0
@@ -1484,7 +1497,34 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                            !alignedSendHeld
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
-    val alignedRspFire  = alignedRspValid && coreLsRspValid
+    // Which ring entry does THIS cycle's response answer? By token, not by position.
+    // An entry's token is built exactly as its command was (`loadCmd.payload.token`
+    // below): bit6 = the split half, bits5:0 = the robId.
+    def alignedTokenOf(e: AlignedLoadCtx): UInt =
+      m68k040.Global.robTag(False ## (e.twoAccess && e.splitSecond), e.bk.robId,
+                            DLoadToken.Width, DLoadToken.RobIdBits)
+    val alignedRspMatchVec = Vec(Bool(), alignedDepth)
+    for (i <- 0 until alignedDepth) {
+      alignedRspMatchVec(i) := coreLsRspValid && alignedValid(i) && alignedSent(i) &&
+                               !alignedDone(i) && (alignedTokenOf(alignedMem(i)) === ldRspTok)
+    }
+    // The head's own response is consumed LIVE, so the ordinary in-order path keeps
+    // exactly today's latency -- nothing is parked and re-read a cycle later. A parked
+    // head can still arise (a response that landed while `bkBusy` held `alignedRspValid`
+    // low, which the old `alignedRspValid && coreLsRspValid` form would have DROPPED),
+    // and it pops from the parked copy.
+    val alignedHeadLive = alignedRspMatchVec(alignedRspPtr)
+    val alignedRspFire  = alignedRspValid && (alignedHeadLive || alignedDone(alignedRspPtr))
+    // The response fields the ring path consumes: live off the port for the head,
+    // otherwise the parked copy.
+    val alignedRspData  = Mux(alignedHeadLive, dcache.loadRsp.payload.data,  alignedRData(alignedRspPtr))
+    val alignedRspLine  = Mux(alignedHeadLive, dcache.loadRsp.payload.line,  alignedRLine(alignedRspPtr))
+    val alignedRspFault = Mux(alignedHeadLive, dcache.loadRsp.payload.fault, alignedRFault(alignedRspPtr))
+    alignedRspMatchVec.foreach(_.simPublic()); alignedHeadLive.simPublic()
+    GenerationFlags.simulation {
+      assert(CountOne(alignedRspMatchVec.asBits) <= U(1),
+        "LsEuPlugin: aligned-ring response token matched more than one entry", FAILURE)
+    }
     val alignedCanEnq   = !bkBusy && (!alignedFull || alignedRspFire)
     // A split pair needs TWO free slots this cycle (accounting for a same-cycle
     // pop exactly like `alignedCanEnq` does for one). This is the actual fix for
@@ -1634,6 +1674,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // other requester (the exception sequencer, the table walker) instead of being
     // weakened to tolerate this one legitimate producer.
     dcache.loadCmd.payload.lineOnly := Mux(useSplitCmd, True, alignedCmd.twoAccess)
+    // OUT-OF-ORDER PERMISSION (`DLoadCmd.ooOk`): only an ordinary SINGLE-access ring
+    // load. Both halves of a cross-line split pair must merge in order -- slot A's
+    // line is held in `splitMergeLine` for slot B -- so neither half may be reordered
+    // against the other, and `lineOnly` above marks exactly that set.
+    dcache.loadCmd.payload.ooOk     := !useSplitCmd && !alignedCmd.twoAccess
     val alignedCmdFire = (alignedSendValid || alignedFallThrough) &&
                           coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
     val alignedFallThroughFire = alignedFallThrough && alignedCmdFire
@@ -2301,7 +2346,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // ordinary way (poisoned) once its own response arrives.
     val alignedRspIsSplitA = alignedRspEntry.twoAccess && !alignedRspEntry.splitSecond
     val alignedRspAbortsPair = alignedRspFire && alignedRspIsSplitA &&
-                               dcache.loadRsp.payload.fault && !alignedRspIsPoison
+                               alignedRspFault && !alignedRspIsPoison
     alignedRspAbortsPair.simPublic()
     // True iff this response CONCLUDES the whole instruction's cache activity: an
     // ordinary (non-split) entry always concludes on its one response; a split
@@ -2311,7 +2356,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // claim the stage) and to clear `inhibitedLoadBusySig`'s busy flag only once
     // the FULL split instruction -- not just its first half -- has resolved.
     val alignedRspTerminal = !alignedRspEntry.twoAccess || alignedRspEntry.splitSecond ||
-                             dcache.loadRsp.payload.fault
+                             alignedRspFault
     alignedRspTerminal.simPublic()
     when(alignedRspAbortsPair) {
       // At this exact cycle `alignedSendPtr` is guaranteed to equal
@@ -2335,13 +2380,31 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedSent(alignedRspPtr)      := False
       alignedPoisoned(alignedRspPtr)  := False
       alignedValid(alignedRspPtr + 1) := False
+      alignedDone(alignedRspPtr)       := False
+      alignedDone(alignedRspPtr + 1)   := False
       alignedRspPtr                    := alignedRspPtr + 2
       alignedSendPtr                   := alignedRspPtr + 2
     } elsewhen(alignedRspFire) {
       alignedValid(alignedRspPtr)    := False
       alignedSent(alignedRspPtr)     := False
       alignedPoisoned(alignedRspPtr) := False
+      alignedDone(alignedRspPtr)     := False
       alignedRspPtr                  := alignedRspPtr + 1
+    }
+    // PARK a matched response that is not being consumed live this cycle: either it
+    // answers an entry behind the head (the out-of-order case this exists for), or it
+    // answers the head on a cycle the head cannot pop. Written AFTER the pop arms so
+    // the pop's `alignedDone := False` cannot strand a response that arrives on the
+    // very cycle its own entry retires -- that combination is impossible (a matched
+    // entry has `!alignedDone`, and the head pops live in the same cycle it matches),
+    // but the ordering makes the park the winner rather than relying on that argument.
+    for (i <- 0 until alignedDepth) {
+      when(alignedRspMatchVec(i) && !((alignedRspPtr === U(i, alignedPtrW bits)) && alignedRspFire)) {
+        alignedDone(i)   := True
+        alignedRData(i)  := dcache.loadRsp.payload.data
+        alignedRLine(i)  := dcache.loadRsp.payload.line
+        alignedRFault(i) := dcache.loadRsp.payload.fault
+      }
     }
     when(alignedCmdFire) {
       alignedSent(alignedSendPtr) := True
@@ -2365,6 +2428,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedValid(alignedPushPtr)    := True
       alignedSent(alignedPushPtr)     := alignedFallThroughFire
       alignedPoisoned(alignedPushPtr) := sqFlushSig
+      alignedDone(alignedPushPtr)     := False
       alignedPushPtr                  := alignedPushPtr + 1
     }
     // Split-load pair push: slot A at `alignedPushPtr`, slot B immediately behind
@@ -2395,6 +2459,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedValid(idxA)    := True; alignedValid(idxB)    := True
       alignedSent(idxA)     := False; alignedSent(idxB)     := False
       alignedPoisoned(idxA) := sqFlushSig; alignedPoisoned(idxB) := sqFlushSig
+      alignedDone(idxA)     := False;      alignedDone(idxB)     := False
       alignedPushPtr         := alignedPushPtr + 2
     }
     // The selector is `push-kind ## response`. Every reachable combination has an arm:
@@ -2790,14 +2855,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     splitMergeLine.simPublic()
     splitMergeValid.simPublic()
     when(alignedRspFire && !alignedRspIsPoison) {
-      when(alignedRspIsSplitA && !dcache.loadRsp.payload.fault) {
-        splitMergeLine  := dcache.loadRsp.payload.line
+      when(alignedRspIsSplitA && !alignedRspFault) {
+        splitMergeLine  := alignedRspLine
         splitMergeValid := True
         splitMergeRob   := alignedRspEntry.bk.robId
       } otherwise {
         val suppressForLaterPrivCheck = alignedRspEntry.bk.needsSupervisor &&
                                         !alignedRspEntry.bk.xlateSup
-        when(dcache.loadRsp.payload.fault && !suppressForLaterPrivCheck) {
+        when(alignedRspFault && !suppressForLaterPrivCheck) {
           captureFaultDesc(alignedRspEntry.bk, alignedRspEntry.vaddr,
                            alignedRspEntry.size, atc = false)
         } elsewhen(alignedRspEntry.twoAccess && alignedRspEntry.splitSecond) {
@@ -2823,12 +2888,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
               FAILURE)
           }
           val merged = m68k040.cache.DcacheByteLane.extractCross(
-            splitMergeLine, dcache.loadRsp.payload.line,
+            splitMergeLine, alignedRspLine,
             alignedRspEntry.mergeOff, alignedRspEntry.size)
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
           splitMergeValid := False   // consumed
         } otherwise {
-          captureCompletionDesc(alignedRspEntry.bk, dcache.loadRsp.payload.data,
+          captureCompletionDesc(alignedRspEntry.bk, alignedRspData,
                                 alignedRspEntry.size)
         }
       }
@@ -4165,6 +4230,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // so its commands must NOT be exempt from the extract wrap tripwire. Explicit
       // (not inherited from the LS branch above, whose value tracks the aligned ring).
       dcache.loadCmd.payload.lineOnly := False
+      dcache.loadCmd.payload.ooOk     := False
       // (Historically this said "identity-physical, matching dcStore's exc-path
       // cacheMode". The address half of that is obsolete as of 2026-09-09 -- the
       // sequencer's loads carry a real DTLB-translated PA now. The CACHE MODE half
@@ -4328,6 +4394,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // inherit the LS branch's `lineOnly` (which tracks the aligned ring and would
       // silently exempt the walker from the `DcacheByteLane.extract` wrap tripwire).
       dcache.loadCmd.payload.lineOnly := False
+      dcache.loadCmd.payload.ooOk     := False
     }
 
     // ── Store leg ──────────────────────────────────────────────────────────────────

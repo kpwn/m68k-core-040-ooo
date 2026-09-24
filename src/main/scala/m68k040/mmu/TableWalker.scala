@@ -151,6 +151,8 @@ class TableWalker extends Component {
   // Descriptor reads consume `loadRsp.data`, never the raw line -- keep the
   // `DcacheByteLane.extract` wrap tripwire live for this path (`DLoadCmd.lineOnly`).
   io.loadCmd.payload.lineOnly := False
+  // A descriptor read is one half of a U/M read-modify-write: never reordered.
+  io.loadCmd.payload.ooOk     := False
   // Overwritten by the arbiter (W1/W2): the descriptor fetch's own cache mode is a
   // fixed architectural policy this component cannot see. WRITETHROUGH is the inert
   // default so a standalone DUT with no arbiter still sees a well-defined value.

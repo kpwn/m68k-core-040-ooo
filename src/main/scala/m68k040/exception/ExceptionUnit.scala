@@ -959,6 +959,8 @@ class ExceptionUnit(
   // Every exception-sequencer load consumes `loadRsp.data`; none reads the raw line.
   // (see `DLoadCmd.lineOnly` -- keeps the extract wrap tripwire live for this path)
   dcLoadCmd.payload.lineOnly := False
+  // The commit-side sequencer is single-outstanding and order-sensitive.
+  dcLoadCmd.payload.ooOk     := False
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
   // NOTE: this particular field is currently INERT in every integrated DUT --

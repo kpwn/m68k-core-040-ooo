@@ -858,6 +858,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _walkLoadCmd.payload.paddr     := drainRdAddr
       _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
       _walkLoadCmd.payload.lineOnly  := False
+      _walkLoadCmd.payload.ooOk      := False
       // Both overwritten by the arbiter with the same fixed policy the walker's own
       // reads get; these are the inert standalone-DUT defaults, exactly as in
       // TableWalker.

@@ -786,6 +786,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _walkLoadCmd.payload.paddr     := drainRdAddr
       _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
       _walkLoadCmd.payload.lineOnly  := False
+      _walkLoadCmd.payload.ooOk      := False
       _walkLoadCmd.payload.cacheMode := drainCmode
       _walkLoadCmd.payload.token     := U(m68k040.cache.DLoadToken.WALK_ITLB,
                                           m68k040.cache.DLoadToken.Width bits)
