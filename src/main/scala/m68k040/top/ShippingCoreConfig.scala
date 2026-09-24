@@ -14,33 +14,33 @@ package m68k040.top
   * bench or test DUT wants to vary must be varied explicitly and named in the test, never
   * by diverging from these values. */
 object ShippingCoreConfig {
-  /** D-cache: serve a resolved command from its early-probe entry while the FSM refills
-    * for an older, provably cacheable access. See `DcachePlugin.hitUnderMiss`.
+  /** D-cache: serve a resolved command from its already-decided early-probe entry while
+    * the FSM refills for an older, provably cacheable access. See
+    * `DcachePlugin.hitUnderMiss`.
     *
-    * ⛔ OFF: MEASURED SILICON-NEUTRAL AND IT COSTS 200 MHz CLOSURE.
-    *
-    * Sim liked it -- +4.6% on `dhrystone-x0-cb` and +9.0% on `byteSplit-cb`, seed-robust
-    * over four seeds, and it holds at the shorter `l2:3:35` latency too, so it is not an
-    * artefact of the memory model. But on the board it measured PARITY: 55K Dhrystones/s
-    * at 100 MHz with it on, exactly half the 110K the same CPU scores at 200 MHz without
-    * it. The sim kernel is a synthetic approximation (chain load + byte copy + counters)
-    * calibrated to match the baseline's cycles-per-iteration; that makes it a good model
-    * of the BASELINE and says nothing about whether a change transfers to real Dhrystone,
-    * which is dominated by procedure calls, string compares and switches.
-    *
-    * And it is not free: at a genuine 200 MHz constraint the design enters routing at
-    * WNS -0.740 with 9,214 failing endpoints (known-good: -0.430 / 3,507) and post-route
-    * phys_opt recovers only to about -0.27, where the known-good build reaches +0.001.
-    * The arms add drivers to `loadCmdPort.ready` and a second S1 launch site, both on the
-    * cone `DcachePlugin` records as the core's longest.
-    *
-    * No measured gain and a real FMax cost is not a trade worth making. The plumbing
-    * stays (it is inert and it fixed a latent `REPLAY` identity bug); only the arms are
-    * disabled. Re-enable only against a board measurement that actually moves. */
-  val dcacheHitUnderMiss: Boolean = false
+    * ON. This arm touches NO array: it reads no tag/data port, issues no AXI, and lands
+    * in the registered S2 stage. So it cannot widen the `rdEn` cone that sets the design's
+    * critical path (below). Worth +4.0% on `dhrystone-x0-cb` in sim.
+    */
+  val dcacheHitUnderMiss: Boolean = true
 
-  /** D-cache: additionally accept such a command with a REAL S1 array read, parking an
-    * S1 miss in the bounded replay slot. See `DcachePlugin.hitUnderMissRead`.
-    * ⛔ OFF for the same reason as `dcacheHitUnderMiss` above. */
+  /** D-cache: additionally accept such a command with a REAL S1 array read, parking an S1
+    * miss in the bounded replay slot. See `DcachePlugin.hitUnderMissRead`.
+    *
+    * ⛔ OFF, ON CRITICAL-PATH EVIDENCE. The routed 200 MHz worst path is
+    *
+    *     DcachePlugin_logic_tagMem_3_reg/CLKARDCLK  ->  tagMem_2_reg/ENARDEN
+    *     12 logic levels, 1.781 ns logic + 2.822 ns route, slack -0.198
+    *
+    * i.e. a tag-array READ RESULT feeding the tag array's own READ ENABLE next cycle --
+    * the `rdEn` cone. This arm is the only part of hit-under-miss that drives `rdEn`
+    * (it is the one that performs a real array read), so it widens precisely that cone.
+    *
+    * And it is the cheap half of the feature: probe-only reaches 26,552 cycles on
+    * `dhrystone-x0-cb` (+4.0%) and this arm only takes it to 26,322 (+0.9% more). Paying
+    * critical-path width for 0.9% is the wrong trade when the design is 198 ps short.
+    *
+    * The code stays (it is correct, and it carries the REPLAY identity fix and the
+    * miss-park handler); only the arm is disabled. */
   val dcacheHitUnderMissRead: Boolean = false
 }
