@@ -721,8 +721,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
       var lsNzvcWrites      = 0
+      var oooWbFires = 0; var oooParkedCyc = 0
+      var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
       var dcLoadPresented   = 0; var dcLoadRefused = 0
       var dcRefusedRefill   = 0; var dcRefusedReplay = 0; var dcRefusedIdle = 0
+      var humEntriesValid = 0; var humEntriesReady = 0; var humProbeOffered = 0
+      var humProbeCredit = 0; var humProbeLaunched = 0; var humStoreClaim = 0
+      var humNoEntry = 0; var humEntryNoHit = 0; var humS1Busy = 0; var humNotOoOk = 0; var humOtherTerm = 0
       // Two-tier reschedule telemetry (2026-09-04). Sim-only reads of already-
       // simPublic ROB signals; they do not perturb the DUT.
       // THE instrument for a two-tier reschedule, and it is deliberately NOT the
@@ -1079,11 +1084,37 @@ trait CoreBenchHarness extends AnyFunSuite {
             dcLoadPresented += 1
             if (!dut.dcache.logic.loadCmdPort.ready.toBoolean) {
               dcLoadRefused += 1
-              if (dut.dcache.logic.dbgFsmRefill.toBoolean)      dcRefusedRefill += 1
+              if (dut.dcache.logic.dbgFsmRefill.toBoolean) {
+                dcRefusedRefill += 1
+                // Which term of the hit-under-miss accept arm is refusing this cycle?
+                if (!dut.dcache.logic.earlyProbeOwnsCmd.toBoolean) {
+                  humNoEntry += 1
+                  val nV = (0 until 5).count(i => dut.dcache.logic.earlyProbeValids(i).toBoolean)
+                  val nR = (0 until 5).count(i => dut.dcache.logic.earlyProbeReadies(i).toBoolean)
+                  humEntriesValid += nV; humEntriesReady += nR
+                  if (dut.dcache.logic.loadProbePort.valid.toBoolean) humProbeOffered += 1
+                  if (dut.dcache.logic.loadProbePort.ready.toBoolean) humProbeCredit += 1
+                  if (dut.dcache.logic.loadProbeLaunch.toBoolean) humProbeLaunched += 1
+                  if (dut.dcache.logic.storeClaimReg.toBoolean) humStoreClaim += 1
+                }
+                else if (!dut.dcache.logic.earlyProbeHit.toBoolean)  humEntryNoHit += 1
+                else if (!dut.dcache.logic.useEarlyProbe.toBoolean)  humS1Busy += 1
+                else if (!dut.dcache.logic.loadCmdPort.payload.ooOk.toBoolean) humNotOoOk += 1
+                else humOtherTerm += 1
+              }
               else if (dut.dcache.logic.dbgFsmReplay.toBoolean) dcRefusedReplay += 1
               else if (dut.dcache.logic.dbgFsmIdle.toBoolean)   dcRefusedIdle += 1
             }
           }
+          // Is the OUT-OF-ORDER writeback actually firing, or is the gain only the pipe
+          // unblocking with an in-order writeback? These separate the two.
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean &&
+              dut.dcache.logic.dbgFsmRefill.toBoolean) humAcceptsInRefill += 1
+          if (dut.dcache.logic.loadProbeLaunch.toBoolean &&
+              dut.dcache.logic.dbgFsmRefill.toBoolean) humProbeLaunchInRefill += 1
+          if (dut.lsEu.logic.alignedEarlyWbFire.toBoolean) oooWbFires += 1
+          if ((0 until 4).exists(i => dut.lsEu.logic.alignedDone(i).toBoolean)) oooParkedCyc += 1
           if (dut.lsEu.logic.compNzvcWrite.toBoolean) lsNzvcWrites += 1
           if (dut.eu0.intWs.valid.toBoolean) aluSlowWr0 += 1
           if (dut.eu1.intWs.valid.toBoolean) aluSlowWr1 += 1
@@ -1372,6 +1403,14 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (bypLiveOn) println(f"[hum] ${k.name} loadPresentedCycles=$dcLoadPresented refusedCycles=$dcLoadRefused " +
           f"(${100.0 * dcLoadRefused / scala.math.max(1, dcLoadPresented)}%.1f%% of presented) " +
           f"refill=$dcRefusedRefill replay=$dcRefusedReplay idleArb=$dcRefusedIdle windowCycles=$windowCycles")
+        if (bypLiveOn) println(s"[hum-why] ${k.name} ofRefillRefused: noProbeEntry=$humNoEntry " +
+          s"entryButNoHit=$humEntryNoHit s1Busy=$humS1Busy notOoOk=$humNotOoOk otherTerm=$humOtherTerm")
+        if (bypLiveOn) println(f"[hum-why2] ${k.name} onNoEntryCycles=$humNoEntry " +
+          f"avgValidEntries=${humEntriesValid.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
+          f"avgReadyEntries=${humEntriesReady.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
+          f"probeOffered=$humProbeOffered credit=$humProbeCredit launched=$humProbeLaunched storeClaim=$humStoreClaim")
+        println(s"[ooo] ${k.name} earlyWritebackFires=$oooWbFires cyclesWithAParkedResponse=$oooParkedCyc " +
+          s"acceptsDuringRefill=$humAcceptsInRefill probeLaunchesDuringRefill=$humProbeLaunchInRefill")
         if (bypLiveOn) println(s"[alu-wr] ${k.name} eu0fastWrites=$aluFastWr0 eu0slowWrites=$aluSlowWr0 eu1slowWrites=$aluSlowWr1 lsNzvcWrites=$lsNzvcWrites")
         if (bypLiveOn) println(s"[byp-live] ${k.name} intBypassHitCycles=" +
           bypLiveCount.take(dut.rfInt.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))

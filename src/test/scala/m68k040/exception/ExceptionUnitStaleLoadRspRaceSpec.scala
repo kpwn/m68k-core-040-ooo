@@ -117,6 +117,8 @@ class ExceptionUnitStaleLoadRspRaceSpec extends AnyFunSuite {
       // Neither requester here reads the raw line (see `DLoadCmd.lineOnly`).
       dc.loadCmd.payload.lineOnly  := False
       dc.loadCmd.payload.ooOk      := False
+      dc.loadCmd.payload.rid       := U(0, m68k040.cache.DLoadRid.Width bits)
+      dc.loadCmd.payload.ridValid  := False
       injReady            := dc.loadCmd.ready && injValid
       exc.dcLoadCmd.ready := dc.loadCmd.ready && !injValid
 

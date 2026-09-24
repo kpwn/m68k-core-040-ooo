@@ -20,6 +20,12 @@ import spinal.core._
   *   0x81  WALK_ITLB  the ITLB table walker's descriptor reads
   *   0x82  WALK_DTLB  the DTLB table walker's descriptor reads
   */
+/** Width of `DLoadCmd.rid`/`DLoadRsp.rid`, the requester-side slot identity. Sized for
+  * the LS EU's aligned-load ring (4 entries); `LsEuPlugin` requires the two agree. */
+object DLoadRid {
+  val Width = 2
+}
+
 object DLoadToken {
   val Width = 8
   /** Bits the token reserves for the robId. FIXED AT 6 and deliberately INDEPENDENT of
@@ -181,6 +187,20 @@ case class DLoadCmd() extends Bundle {
     * which proves the same of it. Both cacheable is what makes the reorder legal
     * against the cache-inhibited access ordering the 68040 guarantees. */
   val ooOk      = Bool()
+  /** REQUESTER-SIDE SLOT ID, echoed back verbatim on `DLoadRsp.rid`.
+    *
+    * `token` cannot serve as the response's identity: it is documented as "one per
+    * in-flight ROB id", and a robId does not uniquely name a REQUESTER SLOT -- which is
+    * why `DcachePlugin`'s own early-probe CAM has to qualify the token with the virtual
+    * address as well. An identity that is only probably unique is useless for
+    * attributing load data, so the requester supplies its own slot index and the cache
+    * echoes it: a decode of `rid` is one-hot by construction, with no compare at all.
+    *
+    * `ridValid` says the id means something -- set by the LS EU's aligned-ring path
+    * (both ordinary and split entries), left False by the serial `llReg` split path,
+    * the exception sequencer and the table walkers, none of which are ring slots. */
+  val rid       = UInt(DLoadRid.Width bits)
+  val ridValid  = Bool()
 }
 
 /** Load response: size-extracted (byte-lane, big-endian) data + fault. `line` is
@@ -206,6 +226,10 @@ case class DLoadRsp() extends Bundle {
     * the exception sequencer and the two table walkers), which already distinguishes
     * every requester class `ldFifoTags` used to reconstruct by position. */
   val token = UInt(DLoadToken.Width bits)
+  /** The requester's own slot id, echoed from `DLoadCmd.rid`. See its doc: this, not
+    * `token`, is what uniquely names the request a response answers. */
+  val rid      = UInt(DLoadRid.Width bits)
+  val ridValid = Bool()
 }
 
 /** Store command from the SQ drain: a PHYSICAL address (already translated),

@@ -153,6 +153,8 @@ class TableWalker extends Component {
   io.loadCmd.payload.lineOnly := False
   // A descriptor read is one half of a U/M read-modify-write: never reordered.
   io.loadCmd.payload.ooOk     := False
+  io.loadCmd.payload.rid      := U(0, m68k040.cache.DLoadRid.Width bits)
+  io.loadCmd.payload.ridValid := False
   // Overwritten by the arbiter (W1/W2): the descriptor fetch's own cache mode is a
   // fixed architectural policy this component cannot see. WRITETHROUGH is the inert
   // default so a standalone DUT with no arbiter still sees a well-defined value.

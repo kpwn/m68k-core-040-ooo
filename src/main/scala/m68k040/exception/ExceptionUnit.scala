@@ -961,6 +961,8 @@ class ExceptionUnit(
   dcLoadCmd.payload.lineOnly := False
   // The commit-side sequencer is single-outstanding and order-sensitive.
   dcLoadCmd.payload.ooOk     := False
+  dcLoadCmd.payload.rid      := U(0, m68k040.cache.DLoadRid.Width bits)
+  dcLoadCmd.payload.ridValid := False
   // Identity-physical, same rationale (and same DE=0 fix) as dcStore.payload.cacheMode
   // above -- this is in fact the ALLOCATING half of that coherency hole.
   // NOTE: this particular field is currently INERT in every integrated DUT --

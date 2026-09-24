@@ -1,6 +1,6 @@
 package m68k040.execute
 
-import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd, DTranslationToken, DLoadToken}
+import m68k040.cache.{DcacheService, DLoadCmd, DStoreCmd, DTranslationToken, DLoadToken, DLoadRid}
 import m68k040.execute.iq.IqContext
 import m68k040.execute.regfile.{IntRegFileService, NzvcRegFileService, XRegFileService, RegFileReadPort, RegFileWritePort, RegFileBypassPort}
 import m68k040.isa.MemOp
@@ -1415,10 +1415,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // What the reorder buys is not latency on the reordered load -- it is that the LS
     // pipe and the cache stop standing still for the duration of someone else's refill.
     val alignedDone   = Vec.fill(alignedDepth)(RegInit(False))
+    // WRITEBACK ALREADY PERFORMED for this entry. Renaming means two independent loads'
+    // PRF writes have NO ordering requirement -- each writes its own physical register
+    // and wakes its consumers by `pdst` -- so an entry whose data has arrived may write
+    // back and wake immediately, out of ring order. The ring slot itself is still
+    // released in order (pure bookkeeping), which is what keeps the split pair's
+    // contiguity invariants and the deadlock tripwire intact. This bit is what stops
+    // the in-order release from writing the PRF a SECOND time.
+    val alignedWb     = Vec.fill(alignedDepth)(RegInit(False))
     val alignedRData  = Vec.fill(alignedDepth)(Reg(Bits(32 bits)))
     val alignedRLine  = Vec.fill(alignedDepth)(Reg(Bits(128 bits)))
     val alignedRFault = Vec.fill(alignedDepth)(RegInit(False))
-    alignedDone.foreach(_.simPublic())
+    alignedDone.foreach(_.simPublic()); alignedWb.foreach(_.simPublic())
     val alignedPushPtr  = Reg(UInt(alignedPtrW bits)) init 0
     val alignedSendPtr  = Reg(UInt(alignedPtrW bits)) init 0
     val alignedRspPtr   = Reg(UInt(alignedPtrW bits)) init 0
@@ -1497,16 +1505,21 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                            !alignedSendHeld
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
-    // Which ring entry does THIS cycle's response answer? By token, not by position.
-    // An entry's token is built exactly as its command was (`loadCmd.payload.token`
-    // below): bit6 = the split half, bits5:0 = the robId.
-    def alignedTokenOf(e: AlignedLoadCtx): UInt =
-      m68k040.Global.robTag(False ## (e.twoAccess && e.splitSecond), e.bk.robId,
-                            DLoadToken.Width, DLoadToken.RobIdBits)
+    // Which ring entry does THIS cycle's response answer? By the slot id the command
+    // carried, echoed back on the response -- a DECODE, so one-hot by construction.
+    //
+    // This was first written as a token compare, and the one-hot tripwire below caught
+    // it immediately on `load-stream`: `DLoadToken` is documented as "one per in-flight
+    // ROB id", which does not uniquely name a ring SLOT (it is why the cache's own
+    // early-probe CAM has to qualify the token with the virtual address as well). An
+    // identity that is only probably unique cannot be used to attribute load data.
+    require(DLoadRid.Width == alignedPtrW,
+      s"DLoadRid.Width (${DLoadRid.Width}) must match the aligned ring's index width ($alignedPtrW)")
     val alignedRspMatchVec = Vec(Bool(), alignedDepth)
     for (i <- 0 until alignedDepth) {
-      alignedRspMatchVec(i) := coreLsRspValid && alignedValid(i) && alignedSent(i) &&
-                               !alignedDone(i) && (alignedTokenOf(alignedMem(i)) === ldRspTok)
+      alignedRspMatchVec(i) := coreLsRspValid && dcache.loadRsp.payload.ridValid &&
+                               (dcache.loadRsp.payload.rid === U(i, alignedPtrW bits)) &&
+                               alignedValid(i) && alignedSent(i) && !alignedDone(i)
     }
     // The head's own response is consumed LIVE, so the ordinary in-order path keeps
     // exactly today's latency -- nothing is parked and re-read a cycle later. A parked
@@ -1679,6 +1692,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // line is held in `splitMergeLine` for slot B -- so neither half may be reordered
     // against the other, and `lineOnly` above marks exactly that set.
     dcache.loadCmd.payload.ooOk     := !useSplitCmd && !alignedCmd.twoAccess
+    // The response identity: the ring slot this command was sent from. A decode of it
+    // is one-hot by construction, which `token` is not -- see `DLoadCmd.rid`. The
+    // serial `llReg` split path is not a ring slot, so it leaves the id meaningless.
+    dcache.loadCmd.payload.rid      := alignedSendPtr
+    dcache.loadCmd.payload.ridValid := !useSplitCmd
     val alignedCmdFire = (alignedSendValid || alignedFallThrough) &&
                           coreLsGrant && !ldFifoFull && dcache.loadCmd.ready
     val alignedFallThroughFire = alignedFallThrough && alignedCmdFire
@@ -2345,6 +2363,44 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // becomes sendable the ordinary way once slot A pops and is discarded the
     // ordinary way (poisoned) once its own response arrives.
     val alignedRspIsSplitA = alignedRspEntry.twoAccess && !alignedRspEntry.splitSecond
+    // ── EARLY (OUT-OF-RING-ORDER) WRITEBACK ────────────────────────────────────────
+    // An entry whose data has arrived writes the PRF and wakes its consumers now,
+    // without waiting to reach the response head. Renaming makes that safe: the write
+    // targets this load's own physical register and the wakeup is by `pdst`, so two
+    // independent loads' writebacks have no ordering relationship at all.
+    //
+    // The exclusions are all about keeping something OTHER than the register write in
+    // order, and each one is load-bearing:
+    //   - `twoAccess`: a split pair merges through `splitMergeLine`, which is a single
+    //     register whose correctness rests on the pair's two halves being the next
+    //     thing sent and the next response processed. Those never carry `ooOk` either.
+    //   - `alignedRFault`: a FAULT must be reported by the OLDEST faulting access, so a
+    //     faulting entry always waits for the head. This is what keeps exceptions
+    //     precise while register writes go out of order.
+    //   - `needsSupervisor && !xlateSup`: this entry owes a later privilege check, whose
+    //     suppression logic lives in the head arm.
+    //   - poisoned / `sqFlushSig`: a squashed entry must never write back.
+    //   - the head itself: it completes through the ordinary arm below.
+    val alignedEarlyWbVec = Vec(Bool(), alignedDepth)
+    for (i <- 0 until alignedDepth) {
+      val e = alignedMem(i)
+      alignedEarlyWbVec(i) := alignedValid(i) && alignedDone(i) && !alignedWb(i) &&
+                              !alignedPoisoned(i) && !sqFlushSig && !alignedRFault(i) &&
+                              !e.twoAccess && !(e.bk.needsSupervisor && !e.bk.xlateSup) &&
+                              (alignedRspPtr =/= U(i, alignedPtrW bits))
+    }
+    val alignedEarlyWbOh  = OHMasking.first(alignedEarlyWbVec.asBits)
+    val alignedEarlyWbIdx = OHToUInt(alignedEarlyWbOh)
+    val alignedEarlyWbAny = alignedEarlyWbVec.asBits.orR
+    alignedEarlyWbVec.foreach(_.simPublic()); alignedEarlyWbAny.simPublic()
+    // Exclusivity with the serial `llReg`/bk completion path is STRUCTURAL rather than
+    // a reference to `bkCompletes` (which is declared far below): the bk path only runs
+    // while `bkBusy` is set, and `alignedRspValid` already excludes that window. So
+    // gating on `!bkBusy` makes the two provably unable to drive comp* in one cycle,
+    // without a forward reference.
+    val alignedEarlyWbFire = alignedEarlyWbAny && !bkBusy &&
+                             !(alignedRspFire && !alignedRspIsPoison)
+    alignedEarlyWbFire.simPublic()
     val alignedRspAbortsPair = alignedRspFire && alignedRspIsSplitA &&
                                alignedRspFault && !alignedRspIsPoison
     alignedRspAbortsPair.simPublic()
@@ -2382,6 +2438,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedValid(alignedRspPtr + 1) := False
       alignedDone(alignedRspPtr)       := False
       alignedDone(alignedRspPtr + 1)   := False
+      alignedWb(alignedRspPtr)         := False
+      alignedWb(alignedRspPtr + 1)     := False
       alignedRspPtr                    := alignedRspPtr + 2
       alignedSendPtr                   := alignedRspPtr + 2
     } elsewhen(alignedRspFire) {
@@ -2389,6 +2447,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedSent(alignedRspPtr)     := False
       alignedPoisoned(alignedRspPtr) := False
       alignedDone(alignedRspPtr)     := False
+      alignedWb(alignedRspPtr)       := False
       alignedRspPtr                  := alignedRspPtr + 1
     }
     // PARK a matched response that is not being consumed live this cycle: either it
@@ -2429,6 +2488,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedSent(alignedPushPtr)     := alignedFallThroughFire
       alignedPoisoned(alignedPushPtr) := sqFlushSig
       alignedDone(alignedPushPtr)     := False
+      alignedWb(alignedPushPtr)       := False
       alignedPushPtr                  := alignedPushPtr + 1
     }
     // Split-load pair push: slot A at `alignedPushPtr`, slot B immediately behind
@@ -2460,6 +2520,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedSent(idxA)     := False; alignedSent(idxB)     := False
       alignedPoisoned(idxA) := sqFlushSig; alignedPoisoned(idxB) := sqFlushSig
       alignedDone(idxA)     := False;      alignedDone(idxB)     := False
+      alignedWb(idxA)       := False;      alignedWb(idxB)       := False
       alignedPushPtr         := alignedPushPtr + 2
     }
     // The selector is `push-kind ## response`. Every reachable combination has an arm:
@@ -2892,11 +2953,25 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
             alignedRspEntry.mergeOff, alignedRspEntry.size)
           captureCompletionDesc(alignedRspEntry.bk, merged, alignedRspEntry.size)
           splitMergeValid := False   // consumed
-        } otherwise {
+        } elsewhen(!alignedWb(alignedRspPtr)) {
+          // The ordinary single-access completion -- UNLESS this entry already wrote
+          // back out of ring order, in which case its PRF write and wakeup have
+          // happened and this cycle only releases the ring slot. Writing again would
+          // double-write the physical register and re-wake its consumers.
           captureCompletionDesc(alignedRspEntry.bk, alignedRspData,
                                 alignedRspEntry.size)
         }
       }
+    }
+    // OUT-OF-ORDER WRITEBACK. A parked entry behind the head writes the PRF and wakes
+    // its consumers now; its ring slot is still released in order by the arm above,
+    // which then skips the capture because `alignedWb` is set. Elaborated after the
+    // head arm and gated on `!alignedRspFire`, so the two can never drive comp* in the
+    // same cycle -- the head always wins the shared stage.
+    when(alignedEarlyWbFire) {
+      val e = alignedMem(alignedEarlyWbIdx)
+      captureCompletionDesc(e.bk, alignedRData(alignedEarlyWbIdx), e.size)
+      alignedWb(alignedEarlyWbIdx) := True
     }
     // backlog item 9: a squash orphans whatever slot A left here.  Elaborated
     // AFTER the capture above so it wins on the edge a flush and a slot-A
@@ -3005,8 +3080,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // slot B's later merge -- so it must NOT claim the stage either, or an
     // unrelated front completion due the same cycle would be wrongly held for a
     // cycle that never actually produced a completion.
+    // An early writeback claims the shared completion stage exactly like a head
+    // completion does, so a front completion yields to it and a precise-store replay
+    // retries -- otherwise two writers would drive comp* in one cycle. The head has
+    // priority: it is the oldest, it is on the critical path, and a fault can only ever
+    // be reported from it. See `alignedEarlyWbFire` at the ring for the exclusivity.
     val backCompFires = (bkCompletes && !bkPoisoned) ||
-                        (alignedRspFire && !alignedRspIsPoison && alignedRspTerminal)
+                        (alignedRspFire && !alignedRspIsPoison && alignedRspTerminal) ||
+                        alignedEarlyWbFire
     backCompFires.simPublic()
 
     // A precise store only enters this replay stream once it has reached the ROB
@@ -4231,6 +4312,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // (not inherited from the LS branch above, whose value tracks the aligned ring).
       dcache.loadCmd.payload.lineOnly := False
       dcache.loadCmd.payload.ooOk     := False
+      dcache.loadCmd.payload.ridValid := False
       // (Historically this said "identity-physical, matching dcStore's exc-path
       // cacheMode". The address half of that is obsolete as of 2026-09-09 -- the
       // sequencer's loads carry a real DTLB-translated PA now. The CACHE MODE half
@@ -4395,6 +4477,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // silently exempt the walker from the `DcacheByteLane.extract` wrap tripwire).
       dcache.loadCmd.payload.lineOnly := False
       dcache.loadCmd.payload.ooOk     := False
+      dcache.loadCmd.payload.ridValid := False
     }
 
     // ── Store leg ──────────────────────────────────────────────────────────────────

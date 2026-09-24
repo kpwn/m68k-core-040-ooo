@@ -1,6 +1,6 @@
 package m68k040.mmu
 
-import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp, DStoreCmd, DTranslationCmd, DTranslationRsp}
+import m68k040.cache.{CacheMode, DLoadCmd, DLoadRid, DLoadRsp, DStoreCmd, DTranslationCmd, DTranslationRsp}
 import m68k040.services.{DTranslationService, DtlbWalkerDcacheClient, MmuControlService}
 import spinal.core._
 import spinal.core.sim._
@@ -859,6 +859,8 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       _walkLoadCmd.payload.size      := m68k040.isa.Size.BYTE
       _walkLoadCmd.payload.lineOnly  := False
       _walkLoadCmd.payload.ooOk      := False
+      _walkLoadCmd.payload.rid       := U(0, DLoadRid.Width bits)
+      _walkLoadCmd.payload.ridValid  := False
       // Both overwritten by the arbiter with the same fixed policy the walker's own
       // reads get; these are the inert standalone-DUT defaults, exactly as in
       // TableWalker.

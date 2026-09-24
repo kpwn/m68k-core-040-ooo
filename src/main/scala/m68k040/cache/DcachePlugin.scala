@@ -40,7 +40,32 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   read only `ldS1Hit`). One uniform extra cycle of load-to-use latency.
   * Valids: register array. Victim: register array. */
 class DcachePlugin(val socketMerged: Boolean = false,
-                   val allowPretranslatedProbeHints: Boolean = true) extends FiberPlugin with DcacheService {
+                   val allowPretranslatedProbeHints: Boolean = true,
+                   /** HIT UNDER MISS. Serve a command from its already-resolved early-probe
+                     * entry while the FSM is refilling or evicting for an OLDER access,
+                     * instead of refusing every command until the FSM returns to IDLE.
+                     *
+                     * Why this is legal, and why it is legal HERE and not at the issue
+                     * queue: the older access being in a refill proves the older access is
+                     * CACHEABLE (a cache-inhibited device read never refills), and the
+                     * early-probe hit proves the same of the younger one (an inhibited read
+                     * can never hit). Both cacheable is what makes reordering them legal
+                     * against the access ordering the 68040 guarantees for cache-inhibited
+                     * accesses. At the issue queue neither fact is known -- the address is
+                     * not even translated yet -- which is why relaxing the order there
+                     * wedged real hardware.
+                     *
+                     * Why it costs the refill nothing: the `useEarlyProbe` arm reads NO
+                     * array (`rdEn`/`loadUsesPort` untouched), issues no AXI, and lands in
+                     * the registered S2 response stage, whose valid is driven outside the
+                     * FSM entirely. And an entry whose set the refill writes is already
+                     * invalidated for it -- `earlyProbeSetWriteVec` sets
+                     * `earlyProbeStale`, and `earlyProbeHitVec` requires both clear -- so
+                     * the refill cannot be observed half-done through this path.
+                     *
+                     * The requester must additionally have said it attributes replies by
+                     * `DLoadRsp.token` rather than by arrival order (`DLoadCmd.ooOk`). */
+                   val hitUnderMiss: Boolean = true) extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
   // that read through loadProbeResolve with the translated physical address.
@@ -445,6 +470,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * responses are built from the `miss*` family rather than the S1/S2 pipe, so
       * they carry their own copy of the requesting command's token. */
     val missToken = Reg(UInt(DLoadToken.Width bits))
+    val missRid   = Reg(UInt(DLoadRid.Width bits))
+    val missRidV  = RegInit(False)
     // Task P4.2: does this in-flight refill service a store-drain miss (True)
     // or an ordinary load miss (False)? Distinguishes REPLAY's write-allocate
     // merge path from the load-fill/direct-response paths above.
@@ -610,6 +637,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // RESPONSE IDENTITY (DLoadRsp.token): the token of the command that launched this
     // S1 read, carried to the response so a consumer can tell WHICH request answered.
     val ldS1Token = Reg(UInt(DLoadToken.Width bits))
+    val ldS1Rid   = Reg(UInt(DLoadRid.Width bits))
+    val ldS1RidV  = RegInit(False)
     ldS1Valid := False                   // default; armed on an accept below
 
     // Throughput slice C0: one bounded replay slot for the request accepted on the
@@ -1026,6 +1055,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // the rest of the burst. Cost of a disruption: one stall cycle for the ONE
     // command caught on the conflicting edge, not a lasting mode change.
     val useEarlyProbe          = earlyProbeHit && !ldS1Valid
+    // Hit-under-miss diagnosis: which term of the accept arm is refusing.
+    earlyProbeHit.simPublic(); useEarlyProbe.simPublic(); earlyProbeOwnsCmd.simPublic()
+    earlyProbeTokenPresent.simPublic()
     val earlyProbeConflict     = earlyProbeHit && ldS1Valid
     val earlyProbeFreeVec      = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) earlyProbeFreeVec(i) := !earlyProbeValids(i)
@@ -1130,6 +1162,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2Direct = RegInit(False)
     val ldS2DirectData = Reg(Bits(32 bits))
     val ldS2Token = Reg(UInt(DLoadToken.Width bits))
+    val ldS2Rid   = Reg(UInt(DLoadRid.Width bits))
+    val ldS2RidV  = RegInit(False)
     ldS2Valid := ldS1Valid
     ldS2Hit   := ldS1Hit
     ldS2Line  := ldS1Line
@@ -1137,6 +1171,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     ldS2Size  := ldS1Size
     ldS2LineOnly := ldS1LineOnly
     ldS2Token := ldS1Token
+    ldS2Rid   := ldS1Rid
+    ldS2RidV  := ldS1RidV
     ldS2Direct := False
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
@@ -1156,6 +1192,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // token was latched into `missToken`; every other response comes down the S1/S2
     // pipe, early-probe direct hits included (the direct arm overrides `ldS2Token`).
     loadRspPort.payload.token := Mux(inhibitedResp || busFaultResp, missToken, ldS2Token)
+    loadRspPort.payload.rid      := Mux(inhibitedResp || busFaultResp, missRid,  ldS2Rid)
+    loadRspPort.payload.ridValid := Mux(inhibitedResp || busFaultResp, missRidV, ldS2RidV)
 
     // ---- STORE drain (elastic S0 / S1 read / S2 compare / S3 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -1694,9 +1732,177 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // leaves IDLE on the miss edge. This is a bounded two-operation miss window,
       // not unbounded hit-under-miss state, and needs no response tag or line buffer.
 
+      // ── HIT UNDER MISS (see `DcachePlugin(hitUnderMiss)`) ─────────────────────
+      // Serve a resolved command from its already-decided early-probe entry while this
+      // FSM is busy refilling/evicting for an OLDER, provably CACHEABLE access. The arm
+      // is the same `useEarlyProbe` fast path IDLE uses -- no array read, no AXI, no
+      // shared state -- so it neither disturbs the refill nor can observe it half-done
+      // (`earlyProbeStale`/`earlyProbeSetWriteVec` already retire any entry whose set
+      // the refill writes). The requester must attribute by token (`ooOk`).
+      //
+      // `!storeReadOwed`/`!stS1Valid` are NOT needed here the way IDLE needs them: this
+      // path touches no read port to contend for.
+      // ⚠ `missCmode =/= INHIBITED` IS LOAD-BEARING, TWICE OVER.
+      //
+      // SOUNDNESS. "The older access is in a refill" does NOT by itself prove the older
+      // access is cacheable: an INHIBITED (MMIO) access also transits EVICT_WR/REFILL,
+      // because that is where its AXI read is issued (it merely allocates no way,
+      // `doAllocate=False`). Serving a younger load ahead of an in-flight DEVICE read is
+      // precisely the reordering the 68040's cache-inhibited access ordering forbids --
+      // the same hazard that wedged the issue-queue relaxation on real hardware. This
+      // term is what makes the older access provably cacheable.
+      //
+      // STRUCTURAL. An inhibited access RESPONDS from inside REFILL (`inhibitedResp`,
+      // built off the `miss*` family), and `loadRspPort.valid` is a single Flow. A
+      // direct hit served in that same cycle would be silently dropped by the payload
+      // mux, which prefers `inhibitedResp`. Excluding inhibited in-flight accesses means
+      // that collision cannot arise. `!busFaultResp` covers the remaining producer: a
+      // cacheable refill that takes an AXI error responds from here too.
+      def hitUnderMissAccept(): Unit = if (hitUnderMiss) {
+        // THE SHADOW IS NOT A BLANKET BLOCKER, it is a second older access to qualify.
+        // It holds the command accepted on the miss edge, awaiting in-order replay, and
+        // it stays valid for the WHOLE refill -- so excluding it outright closed this arm
+        // for every cycle it exists to serve (measured: refill-refused cycles barely
+        // moved, 21,451 -> 20,333). What it needs is the same proof as the refilling
+        // access: reordering past it is legal exactly when it too is provably CACHEABLE,
+        // and its own command carries the cache mode to test.
+        val shadowReorderable = !loadShadowValid ||
+                                (loadShadowCmd.cacheMode =/= CacheMode.INHIBITED)
+        loadCmdPort.ready := useEarlyProbe && loadCmdPort.payload.ooOk &&
+                             (missCmode =/= CacheMode.INHIBITED) && !busFaultResp &&
+                             !resetSweepBusy && !maintBusyReg && shadowReorderable &&
+                             (!earlyProbeTokenPresent || earlyProbeOwnsCmd)
+        when(loadCmdPort.fire) {
+          ldS2Valid      := True
+          ldS2Hit        := True
+          ldS2Direct     := True
+          ldS2DirectData := earlyProbeHitData
+          ldS2Token      := loadCmdPort.payload.token
+          ldS2Rid        := loadCmdPort.payload.rid
+          ldS2RidV       := loadCmdPort.payload.ridValid
+          ldS2Line       := B(0, 128 bits)
+          ldS2Off        := cmdOff
+          ldS2Size       := loadCmdPort.payload.size
+          when(earlyProbeOwnsCmd) {
+            earlyProbeValids(earlyProbeMatchIdx)  := False
+            earlyProbeReadies(earlyProbeMatchIdx) := False
+          }
+        }
+      }
+
       // Whether the load FSM uses the shared read port THIS cycle (set in the
       // load-accept and REPLAY arms below). The store arbiter reads this to defer.
       val loadUsesPort = False
+
+      // Factored out of IDLE so the refill states can launch a probe too: the probe
+      // is a side-effect-free array READ plus a queue allocation, and REFILL/EVICT_WR
+      // use the shared read port for nothing (only IDLE, REPLAY, the store pipe and
+      // the walker drive `rdSet`/`rdEn`). Allocation ALREADY defends itself against a
+      // concurrent refill write -- `allocRacesArrayWrite` compares the new probe's
+      // target set against `missArrayWrite`/`missSet` and marks the entry stale -- so
+      // launching during a refill cannot capture a half-written line.
+      //
+      // Without this, hit-under-miss is nearly worthless: the credit could only admit
+      // probes in IDLE, so a refill window could serve only the entries resolved
+      // BEFORE the miss (measured: 21,451 -> 18,759 refused cycles, +1.5% IPC).
+      def probeLaunchArm(): Unit = {
+          val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
+                               !pendingStoreMiss && !maintBusyReg &&
+                               !storeClaimReg &&
+                               !(ldS1Valid && !ldS1Hit) &&
+                               !(storeReadOwed && stS1Valid)
+          // 2026-09-14 (plan item 6): this expression USED TO BE `loadProbePort.ready`
+          // itself -- the tag BRAM's current output (`ldS1Hit`, through
+          // `!(ldS1Valid && !ldS1Hit)`) and the token+VA CAM (`useEarlyProbe`) reached
+          // the LS EU's `normalReqArm` (fanout 170) and, in the SAME cycle, `tCanLeave ->
+          // tReady -> s1Ready -> issuePort.ready -> IQ selPorts(3).ready -> slot fire ->
+          // the triggers/scoreboard/compaction clock enables of all 16 IQ slots`: 3,336
+          // of the 3,856 failing endpoints on the routed 200 MHz build. The port's ready
+          // is now the registered credit `probeReadyReg`; this is the LAUNCH predicate
+          // for a probe the credit already admitted. Everything the credit can know one
+          // cycle ahead (FSM state, the shadow slot, a pending store miss, maintenance,
+          // the owed store read, a free queue entry) it already folded into the ready,
+          // so a `fire` normally launches. The two terms it cannot know ahead -- an
+          // older load MISSING in S1 right now, and a resolved command taking the read
+          // port right now -- DROP the probe instead (`loadProbePort.fire &&
+          // !loadProbeLaunch`): nothing is allocated, and the resolved command later
+          // takes the ordinary S1 read. Both are the exact events after which the old
+          // design stalled P2 for at least one cycle, and a load that stalls one cycle
+          // to keep a probe worth exactly one cycle of latency gains nothing.
+          val probeLaunchOk = probeAdmitBase && earlyProbeSlotAndPortFree
+          loadProbeLaunch := loadProbePort.fire && probeLaunchOk
+          GenerationFlags.simulation {
+            // The credit's contract: an admitted probe always finds a free entry, so the
+            // consume-and-replace reuse below is never the reason a launch succeeds.
+            assert(!loadProbePort.fire || earlyProbeHasFree,
+              "DcachePlugin: the registered probe credit admitted a probe with no free " +
+                "queue entry -- the next-state replica of earlyProbeValids is wrong",
+              FAILURE)
+          }
+          when(loadProbeLaunch) {
+            val canceledAtLaunch = loadProbeCancelPort.valid &&
+                                   (loadProbeCancelPort.payload.all ||
+                                    (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
+            rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+            rdEn         := True
+            loadUsesPort := True
+            when(!canceledAtLaunch) {
+              earlyProbeValids(earlyProbeAllocIdx)  := True
+              earlyProbeReadies(earlyProbeAllocIdx) := False
+              earlyProbeHits(earlyProbeAllocIdx)    := False
+              earlyProbeTokens(earlyProbeAllocIdx)  := loadProbePort.payload.token
+              earlyProbeVaddrs(earlyProbeAllocIdx)  := loadProbePort.payload.vaddr
+              // backlog item 7: `earlyProbeTags` is deliberately NOT written here.
+              // At ALLOCATION the only physical address in hand is `paddrHint`, and
+              // that is the wrong one -- the LS EU hard-wires it to 0 (it launches
+              // this probe in the same cycle as the DTLB request, so nothing has been
+              // translated yet).  The tag the hit is genuinely decided with arrives
+              // LATER, on the resolve port, and is captured with the hit itself.
+              // Task pea-cache-evict-2026-08-19 fix: a freshly (re)allocated entry's
+              // sticky staleness must not carry over from whatever this physical slot
+              // held before -- reset it here, elaborated AFTER (and so overriding on
+              // the shared reuse-same-cycle edge) the generic per-cycle sticky-set
+              // loop above. `earlyProbeSetWriteVec(earlyProbeAllocIdx)` itself is NOT
+              // usable for this: it still compares against the OLD occupant's
+              // `earlyProbeVaddrs` (this same block overwrites that register only for
+              // the FOLLOWING cycle), so a write racing THIS NEW probe's own address
+              // on THIS SAME launch cycle would go undetected by it. Check the new
+              // probe's own target set directly instead -- this is the exact
+              // "read-launch-vs-S3-write, same cycle" hazard `stS1SameLineAsS3`
+              // patches for the store side, mirrored here for the probe's own launch.
+              //
+              // FMax fix (WNS-regression follow-up): the original revision of this
+              // check scanned the raw per-way `wrEn`/`wrSet` write-port vectors (a
+              // 4-way OR of per-way ANDs), adding a brand-new consumer directly onto
+              // those already widely-fanned-out physical BRAM write-port nets. There
+              // are only ever TWO distinct writers of those ports in any one cycle --
+              // the store-S3 RMW write (`stS3ArrayWrite`/`stS3Set`, already read one
+              // screen down by `stS1SameLineAsS3` for the store side's own mirror-image
+              // hazard) and the REFILL/REPLAY array write (`missArrayWrite`/`missSet`,
+              // both of its two drive sites target `missSet` exclusively -- see their
+              // declarations). Comparing against those two already-compact (valid, set)
+              // pairs instead is exactly equivalent (same coverage: any write, from
+              // either possible source, to this probe's target set) but never touches
+              // `wrEn`/`wrSet` at all.
+              val allocTargetSet = loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+              val allocRacesArrayWrite = (stS3ArrayWrite && (stS3Set === allocTargetSet)) ||
+                                         (missArrayWrite && (missSet === allocTargetSet))
+              earlyProbeStale(earlyProbeAllocIdx) := allocRacesArrayWrite
+              probeReadValid  := True
+              probeReadSlot   := earlyProbeAllocIdx
+              probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
+              probeReadTag    := loadProbePort.payload.paddrHint(31 downto offBits + setBits)
+              probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
+              probeReadSize   := loadProbePort.payload.size
+              probeReadUsable := (if (allowPretranslatedProbeHints) {
+                loadProbePort.payload.resolved &&
+                  !loadProbePort.payload.needsLine &&
+                  (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
+              } else False)
+              probeReadNeedsLine := loadProbePort.payload.needsLine
+            }
+          }
+      }
 
       IDLE.whenIsActive {
         busy := False
@@ -1738,102 +1944,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // relationship that credit's contract rests on. `storeClaimReg` is the strictly
         // stronger, purely REGISTERED addition, and it is the one the store arbiter
         // relies on for exclusion.
-        val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
-                             !pendingStoreMiss && !maintBusyReg &&
-                             !storeClaimReg &&
-                             !(ldS1Valid && !ldS1Hit) &&
-                             !(storeReadOwed && stS1Valid)
-        // 2026-09-14 (plan item 6): this expression USED TO BE `loadProbePort.ready`
-        // itself -- the tag BRAM's current output (`ldS1Hit`, through
-        // `!(ldS1Valid && !ldS1Hit)`) and the token+VA CAM (`useEarlyProbe`) reached
-        // the LS EU's `normalReqArm` (fanout 170) and, in the SAME cycle, `tCanLeave ->
-        // tReady -> s1Ready -> issuePort.ready -> IQ selPorts(3).ready -> slot fire ->
-        // the triggers/scoreboard/compaction clock enables of all 16 IQ slots`: 3,336
-        // of the 3,856 failing endpoints on the routed 200 MHz build. The port's ready
-        // is now the registered credit `probeReadyReg`; this is the LAUNCH predicate
-        // for a probe the credit already admitted. Everything the credit can know one
-        // cycle ahead (FSM state, the shadow slot, a pending store miss, maintenance,
-        // the owed store read, a free queue entry) it already folded into the ready,
-        // so a `fire` normally launches. The two terms it cannot know ahead -- an
-        // older load MISSING in S1 right now, and a resolved command taking the read
-        // port right now -- DROP the probe instead (`loadProbePort.fire &&
-        // !loadProbeLaunch`): nothing is allocated, and the resolved command later
-        // takes the ordinary S1 read. Both are the exact events after which the old
-        // design stalled P2 for at least one cycle, and a load that stalls one cycle
-        // to keep a probe worth exactly one cycle of latency gains nothing.
-        val probeLaunchOk = probeAdmitBase && earlyProbeSlotAndPortFree
-        loadProbeLaunch := loadProbePort.fire && probeLaunchOk
-        GenerationFlags.simulation {
-          // The credit's contract: an admitted probe always finds a free entry, so the
-          // consume-and-replace reuse below is never the reason a launch succeeds.
-          assert(!loadProbePort.fire || earlyProbeHasFree,
-            "DcachePlugin: the registered probe credit admitted a probe with no free " +
-              "queue entry -- the next-state replica of earlyProbeValids is wrong",
-            FAILURE)
-        }
-        when(loadProbeLaunch) {
-          val canceledAtLaunch = loadProbeCancelPort.valid &&
-                                 (loadProbeCancelPort.payload.all ||
-                                  (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
-          rdSet        := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-          rdEn         := True
-          loadUsesPort := True
-          when(!canceledAtLaunch) {
-            earlyProbeValids(earlyProbeAllocIdx)  := True
-            earlyProbeReadies(earlyProbeAllocIdx) := False
-            earlyProbeHits(earlyProbeAllocIdx)    := False
-            earlyProbeTokens(earlyProbeAllocIdx)  := loadProbePort.payload.token
-            earlyProbeVaddrs(earlyProbeAllocIdx)  := loadProbePort.payload.vaddr
-            // backlog item 7: `earlyProbeTags` is deliberately NOT written here.
-            // At ALLOCATION the only physical address in hand is `paddrHint`, and
-            // that is the wrong one -- the LS EU hard-wires it to 0 (it launches
-            // this probe in the same cycle as the DTLB request, so nothing has been
-            // translated yet).  The tag the hit is genuinely decided with arrives
-            // LATER, on the resolve port, and is captured with the hit itself.
-            // Task pea-cache-evict-2026-08-19 fix: a freshly (re)allocated entry's
-            // sticky staleness must not carry over from whatever this physical slot
-            // held before -- reset it here, elaborated AFTER (and so overriding on
-            // the shared reuse-same-cycle edge) the generic per-cycle sticky-set
-            // loop above. `earlyProbeSetWriteVec(earlyProbeAllocIdx)` itself is NOT
-            // usable for this: it still compares against the OLD occupant's
-            // `earlyProbeVaddrs` (this same block overwrites that register only for
-            // the FOLLOWING cycle), so a write racing THIS NEW probe's own address
-            // on THIS SAME launch cycle would go undetected by it. Check the new
-            // probe's own target set directly instead -- this is the exact
-            // "read-launch-vs-S3-write, same cycle" hazard `stS1SameLineAsS3`
-            // patches for the store side, mirrored here for the probe's own launch.
-            //
-            // FMax fix (WNS-regression follow-up): the original revision of this
-            // check scanned the raw per-way `wrEn`/`wrSet` write-port vectors (a
-            // 4-way OR of per-way ANDs), adding a brand-new consumer directly onto
-            // those already widely-fanned-out physical BRAM write-port nets. There
-            // are only ever TWO distinct writers of those ports in any one cycle --
-            // the store-S3 RMW write (`stS3ArrayWrite`/`stS3Set`, already read one
-            // screen down by `stS1SameLineAsS3` for the store side's own mirror-image
-            // hazard) and the REFILL/REPLAY array write (`missArrayWrite`/`missSet`,
-            // both of its two drive sites target `missSet` exclusively -- see their
-            // declarations). Comparing against those two already-compact (valid, set)
-            // pairs instead is exactly equivalent (same coverage: any write, from
-            // either possible source, to this probe's target set) but never touches
-            // `wrEn`/`wrSet` at all.
-            val allocTargetSet = loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-            val allocRacesArrayWrite = (stS3ArrayWrite && (stS3Set === allocTargetSet)) ||
-                                       (missArrayWrite && (missSet === allocTargetSet))
-            earlyProbeStale(earlyProbeAllocIdx) := allocRacesArrayWrite
-            probeReadValid  := True
-            probeReadSlot   := earlyProbeAllocIdx
-            probeReadSet    := loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-            probeReadTag    := loadProbePort.payload.paddrHint(31 downto offBits + setBits)
-            probeReadOff    := loadProbePort.payload.vaddr(offBits - 1 downto 0)
-            probeReadSize   := loadProbePort.payload.size
-            probeReadUsable := (if (allowPretranslatedProbeHints) {
-              loadProbePort.payload.resolved &&
-                !loadProbePort.payload.needsLine &&
-                (loadProbePort.payload.cacheMode =/= CacheMode.INHIBITED)
-            } else False)
-            probeReadNeedsLine := loadProbePort.payload.needsLine
-          }
-        }
+        // The probe LAUNCH arm lives at state-machine scope (see its own comment)
+        // so the refill states can call it too; calling it HERE keeps IDLE's
+        // hardware exactly where it was.
+        probeLaunchArm()
 
         // A command which owns a pre-existing probe is old work, so maintenance's
         // WAIT phase must let it drain. New commands remain blocked for the entire
@@ -1877,6 +1991,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Off      := loadShadowCmd.vaddr(offBits - 1 downto 0)
           ldS1Size     := loadShadowCmd.size
           ldS1Token    := loadShadowCmd.token
+          ldS1Rid      := loadShadowCmd.rid
+          ldS1RidV     := loadShadowCmd.ridValid
           ldS1LineOnly := loadShadowCmd.lineOnly
           ldS1Cmode    := loadShadowCmd.cacheMode
           ldS1Paddr    := loadShadowCmd.paddr
@@ -1899,6 +2015,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS2Direct     := True
           ldS2DirectData := earlyProbeHitData
           ldS2Token      := loadCmdPort.payload.token
+          ldS2Rid        := loadCmdPort.payload.rid
+          ldS2RidV       := loadCmdPort.payload.ridValid
           ldS2Line       := B(0, 128 bits)
           ldS2Off        := cmdOff
           ldS2Size       := loadCmdPort.payload.size
@@ -1913,6 +2031,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Off      := cmdOff
           ldS1Size     := loadCmdPort.payload.size
           ldS1Token    := loadCmdPort.payload.token
+          ldS1Rid      := loadCmdPort.payload.rid
+          ldS1RidV     := loadCmdPort.payload.ridValid
           ldS1LineOnly := loadCmdPort.payload.lineOnly
           ldS1Cmode    := loadCmdPort.payload.cacheMode
           // Translation faults are consumed before a command is emitted. The only
@@ -1934,6 +2054,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missOff   := ldS1Off
           missSize  := ldS1Size
           missToken := ldS1Token
+          missRid   := ldS1Rid
+          missRidV  := ldS1RidV
           missLineOnly := ldS1LineOnly
           missCmode := ldS1Cmode
           // D25's clamp, applied where the range ENTERS the sequencer rather than where it
@@ -2060,6 +2182,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // A store miss produces no LOAD response; the token is set only so the
           // register never carries a stale load's identity into a later inspection.
           missToken := U(0, DLoadToken.Width bits)
+          missRidV  := False
           // A store-miss refill's response data is never consumed as a value.
           missLineOnly := True
           missCmode := CacheMode.COPYBACK
@@ -2118,6 +2241,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // tagged id=2 and keeps waiting; it never needs to guess or retry a
       // kickoff because nothing can now corrupt its own payload registers.
       EVICT_WR.whenIsActive {
+        hitUnderMissAccept()
+        if (hitUnderMiss) probeLaunchArm()
         busy := True
         val evictAddr = (victimEvictTag ## missSet ## U(0, offBits bits)).asUInt
         // POST-P5.4-REVIEW: `&& !maintAxiPairOpen` extends revision 3's bidirectional
@@ -2164,6 +2289,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
 
       REFILL.whenIsActive {
+        hitUnderMissAccept()
+        if (hitUnderMiss) probeLaunchArm()
         busy := True
         // Refill from the PHYSICAL line base (the access was already translated;
         // missPaddr holds the resolved physical address). Under identity == vaddr.
@@ -3424,10 +3551,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // the maintenance clear, one cycle later out of reset), and the two dropped cases
     // trade a one-cycle P2 stall for a one-cycle-longer load on the same instruction.
     val probeIdleNext = Bool()
+    /** The states in which the credit may admit a probe. IDLE always; the refill states
+      * too under `hitUnderMiss`, because a probe there is a read of a port those states
+      * do not use, and its allocation already self-invalidates against the refill's own
+      * array write (`allocRacesArrayWrite`). */
+    val probeAdmitNext = Bool()
     // `fsm.enumOf` resolves against a map populated only when the state machine is
     // built (ExceptionUnit.scala's `activeReg` has the same deferral); `postBuild` is
     // SpinalHDL's hook for reading `stateNext` once the FSM exists.
-    fsm.postBuild { probeIdleNext := (fsm.stateNext === fsm.enumOf(fsm.IDLE)) }
+    fsm.postBuild {
+      probeIdleNext := (fsm.stateNext === fsm.enumOf(fsm.IDLE))
+      probeAdmitNext := probeIdleNext || (if (hitUnderMiss) {
+        (fsm.stateNext === fsm.enumOf(fsm.REFILL)) || (fsm.stateNext === fsm.enumOf(fsm.EVICT_WR))
+      } else False)
+    }
 
     val loadShadowValidNext = loadShadowCaptureEv || (loadShadowValid && !loadShadowLaunchEv)
     // Mirror the two `storeReadOwed` writers above (`when(stS1Advance) := False` then
@@ -3499,7 +3636,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * worst-case path to that family -- it removes the 28-level combinational one. */
     storeClaimReg := stS1ValidNext && (!loadProbePort.valid || storeReadOwedNext)
 
-    probeReadyReg := probeIdleNext &&
+    // The credit may now admit a probe while the FSM is REFILLING/EVICTING, not only
+    // in IDLE -- that is what makes hit-under-miss worth anything, since otherwise a
+    // refill window can only serve entries resolved before the miss began.
+    probeReadyReg := probeAdmitNext &&
                      !resetSweepBusy &&
                      !loadShadowValidNext &&
                      !(pendingStoreMiss || storeMissDiscovered) &&
