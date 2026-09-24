@@ -145,12 +145,24 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
         earlyAutoStoreAddress = ipcLateStore,
-        // Let a LOAD pass an older UNREADY LOAD. The oldest-occupied-LS-only rule exists
-        // for store->load disambiguation, which binds only when the blocker is a STORE;
-        // two loads have no hazard. Measured 93% of the blockage was load-behind-load,
-        // and relaxing it is +7.5% on the calibrated Dhrystone kernel. Stores stay fully
-        // ordered.
-        loadBypassUnreadyLoad = ipcThroughput),
+        // loadBypassUnreadyLoad is DISABLED. It WEDGED THE BOARD (2026-09-24): PC frozen
+        // at 0x0000315c, zero exceptions, halt-kind NONE -- the ROB head waiting on a
+        // memory op that never completed. It measured +7.5% on the calibrated Dhrystone
+        // kernel and passed test-fast (396/0/2), and it is still WRONG.
+        //
+        // The reasoning that justified it -- "two loads have no hazard between them, so
+        // nothing needs disambiguating" -- is false twice over. Cache-inhibited device
+        // reads must not be reordered AT ALL, and inhibited-ness is not even knowable at
+        // the IQ because it needs translation. And the rule being relaxed says why in its
+        // own comment: "single LS EU + single SQ-drain port make in-order LS issue the
+        // natural (and PREVIOUSLY ASSUMED) discipline" -- the inhibited barriers, the SQ
+        // ordering checks and olderInhibitedStore all assume pipe arrival order IS program
+        // order. Relaxing the IQ select breaks that globally, not just for MMIO.
+        //
+        // Do not re-enable without an ordering mechanism that survives translation --
+        // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
+        // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
+        loadBypassUnreadyLoad = false),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
