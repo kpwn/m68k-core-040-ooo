@@ -65,7 +65,32 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      *
                      * The requester must additionally have said it attributes replies by
                      * `DLoadRsp.token` rather than by arrival order (`DLoadCmd.ooOk`). */
-                   val hitUnderMiss: Boolean = true) extends FiberPlugin with DcacheService {
+                   val hitUnderMiss: Boolean = true,
+                   /** HIT UNDER MISS, second stage: accept a command during a refill with a
+                     * REAL S1 array read, not only from an already-resolved early-probe
+                     * entry.
+                     *
+                     * Measured need: with the probe-only arm, 18,788 of the 20,333 cycles
+                     * still refused during a refill have NO owning probe entry. The refused
+                     * command head-blocks the LS front pipe, so nothing behind it can offer
+                     * a probe, and its own probe was dropped on the miss-discovery cycle
+                     * (`probeAdmitBase`'s `!(ldS1Valid && !ldS1Hit)`). Those cycles are
+                     * unreachable from the probe queue by construction.
+                     *
+                     * This is the arm the file's IDLE comment says is impossible -- "a load
+                     * MISS has no handler ... `ldS1Valid` would self-clear with no response
+                     * ever sent, hanging the LS EU forever. A load HIT would still resolve
+                     * fine, but there's no way to know that before accepting." The answer is
+                     * not to know in advance but to GIVE the miss a handler: the bounded
+                     * replay slot (`loadShadowCmd`) that already exists for exactly this
+                     * shape. Accept only while that slot is free, and on an S1 miss park
+                     * there for ordered replay instead of dropping the request.
+                     *
+                     * Separate from `hitUnderMiss` because it adds drivers to
+                     * `loadCmdPort.ready` and a second S1 launch site, both on the cone this
+                     * file records as the core's longest -- so it can be dropped on its own
+                     * if it costs 200 MHz closure. */
+                   val hitUnderMissRead: Boolean = true) extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
   // that read through loadProbeResolve with the translated physical address.
@@ -470,6 +495,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * responses are built from the `miss*` family rather than the S1/S2 pipe, so
       * they carry their own copy of the requesting command's token. */
     val missToken = Reg(UInt(DLoadToken.Width bits))
+    missSet.simPublic()   // hit-under-miss diagnosis: the set the refill is filling
     val missRid   = Reg(UInt(DLoadRid.Width bits))
     val missRidV  = RegInit(False)
     // Task P4.2: does this in-flight refill service a store-drain miss (True)
@@ -1758,6 +1784,44 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // mux, which prefers `inhibitedResp`. Excluding inhibited in-flight accesses means
       // that collision cannot arise. `!busFaultResp` covers the remaining producer: a
       // cacheable refill that takes an AXI error responds from here too.
+      // THE MISS HANDLER `hitUnderMissRead` needs, as its own def because the read can
+      // resolve in a DIFFERENT state than the one that accepted it. A read accepted on
+      // the last REFILL cycle resolves in REPLAY -- and with the handler living only in
+      // the accepting states, that request was silently DROPPED: no response, and the LS
+      // EU waits on it forever (observed as a `dhrystone-x0-cb` hang, which the directed
+      // cache and LS suites do not reach because they never combine a dirty eviction with
+      // a load accepted mid-refill).
+      //
+      // A hit needs nothing here: it flows into S2 and responds on its own, since
+      // `loadRspPort.valid` is driven outside the FSM.
+      def humS1MissPark(): Unit = if (hitUnderMissRead) {
+        // THE MISS HANDLER this arm needs. A read launched above resolves here one cycle
+        // later, still inside the refill. A hit flows into S2 and responds as usual
+        // (`loadRspPort.valid` is driven outside the FSM). A miss is parked in the very
+        // slot the file already describes as "one bounded replay slot for the request
+        // accepted on the exact cycle an older S1 probe discovers a miss" -- the same
+        // shape, one state later -- and is relaunched in order from IDLE, where the
+        // ordinary miss handling then gives it its own refill.
+        //
+        // Only the low `vaddr` bits are reconstructed because only those are read back:
+        // the relaunch takes its set and offset from `loadShadowCmd.vaddr` and its tag
+        // from `.paddr`. The upper vaddr bits are not consulted by any shadow consumer.
+
+          when(ldS1Valid && !ldS1Hit) {
+            loadShadowCmd.vaddr     := (U(0, 32 - offBits - setBits bits) ## ldS1Set ## ldS1Off).asUInt
+            loadShadowCmd.paddr     := ldS1Paddr
+            loadShadowCmd.size      := ldS1Size
+            loadShadowCmd.cacheMode := ldS1Cmode
+            loadShadowCmd.token     := ldS1Token
+            loadShadowCmd.rid       := ldS1Rid
+            loadShadowCmd.ridValid  := ldS1RidV
+            loadShadowCmd.lineOnly  := ldS1LineOnly
+            loadShadowCmd.ooOk      := True
+            loadShadowValid         := True
+            loadShadowCaptureEv     := True
+          }
+      }
+
       def hitUnderMissAccept(): Unit = if (hitUnderMiss) {
         // THE SHADOW IS NOT A BLANKET BLOCKER, it is a second older access to qualify.
         // It holds the command accepted on the miss edge, awaiting in-order replay, and
@@ -1768,11 +1832,64 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // and its own command carries the cache mode to test.
         val shadowReorderable = !loadShadowValid ||
                                 (loadShadowCmd.cacheMode =/= CacheMode.INHIBITED)
-        loadCmdPort.ready := useEarlyProbe && loadCmdPort.payload.ooOk &&
-                             (missCmode =/= CacheMode.INHIBITED) && !busFaultResp &&
-                             !resetSweepBusy && !maintBusyReg && shadowReorderable &&
-                             (!earlyProbeTokenPresent || earlyProbeOwnsCmd)
-        when(loadCmdPort.fire) {
+        val humCommon = loadCmdPort.payload.ooOk &&
+                        (missCmode =/= CacheMode.INHIBITED) && !busFaultResp &&
+                        !resetSweepBusy && !maintBusyReg
+        // ── ARM 2: accept with a REAL S1 read ─────────────────────────────────────
+        // For the 18,788 cycles the probe-only arm cannot reach (no owning entry; see
+        // `hitUnderMissRead`). Conditions beyond the common ones:
+        //   - the replay slot must be FREE, because an S1 miss discovered here has to go
+        //     somewhere; that is the handler whose absence made this arm "impossible".
+        //   - S1 itself must be free (one read in flight), so this sustains one accept
+        //     every other cycle rather than one per cycle.
+        //   - NEVER the set the refill is filling. A partially-filled line must not be
+        //     tag-compared: refusing that set outright is the conservative form of the
+        //     same hazard the probe path handles by marking an entry stale, and it costs
+        //     nothing real -- an access to that set is about to hit anyway once the
+        //     refill lands.
+        //   - the command itself must be cacheable. An INHIBITED access needs a refill
+        //     it cannot get here, and reordering a device read is the hazard this whole
+        //     design exists to avoid.
+        //   - the shared read port must be free of the store pipe, exactly as IDLE
+        //     arbitrates it.
+        val humReadOk = if (!hitUnderMissRead) False else
+          humCommon && !useEarlyProbe && !loadShadowValid && !ldS1Valid &&
+          !pendingStoreMiss && !storeMissDiscovered &&
+          (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
+          (cmdSet =/= missSet) &&
+          !storeClaimReg && !(storeReadOwed && stS1Valid) &&
+          (!earlyProbeTokenPresent || earlyProbeOwnsCmd)
+        loadCmdPort.ready := (useEarlyProbe && humCommon && shadowReorderable &&
+                              (!earlyProbeTokenPresent || earlyProbeOwnsCmd)) || humReadOk
+        when(loadCmdPort.fire && humReadOk) {
+          rdSet        := cmdSet
+          rdEn         := True
+          loadUsesPort := True
+          ldS1Valid    := True
+          ldS1Set      := cmdSet
+          ldS1Tag      := cmdTag
+          ldS1Off      := cmdOff
+          ldS1Size     := loadCmdPort.payload.size
+          ldS1Token    := loadCmdPort.payload.token
+          ldS1Rid      := loadCmdPort.payload.rid
+          ldS1RidV     := loadCmdPort.payload.ridValid
+          ldS1LineOnly := loadCmdPort.payload.lineOnly
+          ldS1Cmode    := loadCmdPort.payload.cacheMode
+          ldS1Paddr    := loadCmdPort.payload.paddr
+          // DISCARD any queued probe entry this command owns, exactly as IDLE's ordinary
+          // read arm does. Required, not tidiness: the registered credit's next-state
+          // replica (`earlyProbeValidsNext`'s `consumeClr`) is written as
+          // `loadCmdPort.fire && earlyProbeOwnsCmd` with NO state qualifier, so a fire
+          // here that left the entry standing makes the replica drift from the register
+          // -- which its own assert catches immediately.
+          when(earlyProbeOwnsCmd &&
+               !(loadProbeLaunch && earlyProbeReusesConsume &&
+                 (earlyProbeAllocIdx === earlyProbeMatchIdx))) {
+            earlyProbeValids(earlyProbeMatchIdx)  := False
+            earlyProbeReadies(earlyProbeMatchIdx) := False
+          }
+        }
+        when(loadCmdPort.fire && !humReadOk) {
           ldS2Valid      := True
           ldS2Hit        := True
           ldS2Direct     := True
@@ -2242,6 +2359,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // kickoff because nothing can now corrupt its own payload registers.
       EVICT_WR.whenIsActive {
         hitUnderMissAccept()
+        humS1MissPark()
         if (hitUnderMiss) probeLaunchArm()
         busy := True
         val evictAddr = (victimEvictTag ## missSet ## U(0, offBits bits)).asUInt
@@ -2290,6 +2408,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
       REFILL.whenIsActive {
         hitUnderMissAccept()
+        humS1MissPark()
         if (hitUnderMiss) probeLaunchArm()
         busy := True
         // Refill from the PHYSICAL line base (the access was already translated;
@@ -2435,6 +2554,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
 
       REPLAY.whenIsActive {
+        // A read accepted on the last refill cycle resolves HERE. Park a miss (the
+        // relaunch below is deferred while `ldS1Valid` is set, so nothing is clobbered).
+        humS1MissPark()
         busy := True
         when(missFault) {
           when(refillReqIsStore) {
@@ -2503,6 +2625,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
             // makes that claim falsifiable rather than merely asserted.
             storeDrainHoldFired := True
           }
+        } elsewhen(ldS1Valid) {
+          // ⚠ THERE IS ONLY ONE S1 SLOT. Under `hitUnderMissRead` a command accepted
+          // during the refill can still be resolving in S1 on the cycle this state
+          // wants to relaunch the just-filled line -- and this relaunch overwrites every
+          // ldS1 register. That would hand the refilled load's response the OTHER
+          // access's identity and silently drop one of the two, which the LS EU waits on
+          // forever (observed directly: `dhrystone-x0-cb` hung with no response).
+          //
+          // Wait one cycle instead. `ldS1Valid` is a single-cycle arm, so this is a
+          // one-cycle hold, not a loop -- and deliberately no `goto(IDLE)`, the same
+          // "retry the SAME cycle's work next cycle" shape the store-request branch
+          // above uses.
         } otherwise {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
           // into the response register one cycle later via the ldS1 path. (No array
@@ -2519,6 +2653,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1LineOnly := missLineOnly
           ldS1Cmode    := missCmode
           ldS1Paddr    := missPaddr
+          // THE RESPONSE IDENTITY, which this site used to inherit by accident. Every
+          // other S1 launch stamps it; this one did not, and was correct only because
+          // nothing else wrote `ldS1Token`/`ldS1Rid` between the miss and the replay --
+          // so they still held the missing load's own values. `hitUnderMissRead` breaks
+          // that accident by launching another read in between, so the identity is now
+          // stamped explicitly from the `miss*` copy captured at the miss.
+          ldS1Token    := missToken
+          ldS1Rid      := missRid
+          ldS1RidV     := missRidV
           loadMissStoreBarrier := False
           goto(IDLE)
         }

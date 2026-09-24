@@ -725,6 +725,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
       var dcLoadPresented   = 0; var dcLoadRefused = 0
       var dcRefusedRefill   = 0; var dcRefusedReplay = 0; var dcRefusedIdle = 0
+      var hum2Shadow = 0; var hum2S1 = 0; var hum2StoreMiss = 0; var hum2SameSet = 0
+      var hum2StoreClaim = 0; var hum2Other = 0
       var humEntriesValid = 0; var humEntriesReady = 0; var humProbeOffered = 0
       var humProbeCredit = 0; var humProbeLaunched = 0; var humStoreClaim = 0
       var humNoEntry = 0; var humEntryNoHit = 0; var humS1Busy = 0; var humNotOoOk = 0; var humOtherTerm = 0
@@ -1089,6 +1091,15 @@ trait CoreBenchHarness extends AnyFunSuite {
                 // Which term of the hit-under-miss accept arm is refusing this cycle?
                 if (!dut.dcache.logic.earlyProbeOwnsCmd.toBoolean) {
                   humNoEntry += 1
+                  // Which term of the REAL-READ arm (arm 2) refuses this cycle? Checked in
+                  // the arm's own order so each cycle is attributed to one blocker.
+                  if (dut.dcache.logic.loadShadowValid.toBoolean) hum2Shadow += 1
+                  else if (dut.dcache.logic.ldS1Valid.toBoolean) hum2S1 += 1
+                  else if (dut.dcache.logic.pendingStoreMiss.toBoolean) hum2StoreMiss += 1
+                  else if (((dut.dcache.logic.loadCmdPort.payload.vaddr.toLong >> 4) & 0x7f) ==
+                           dut.dcache.logic.missSet.toLong) hum2SameSet += 1
+                  else if (dut.dcache.logic.storeClaimReg.toBoolean) hum2StoreClaim += 1
+                  else hum2Other += 1
                   val nV = (0 until 5).count(i => dut.dcache.logic.earlyProbeValids(i).toBoolean)
                   val nR = (0 until 5).count(i => dut.dcache.logic.earlyProbeReadies(i).toBoolean)
                   humEntriesValid += nV; humEntriesReady += nR
@@ -1405,6 +1416,9 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"refill=$dcRefusedRefill replay=$dcRefusedReplay idleArb=$dcRefusedIdle windowCycles=$windowCycles")
         if (bypLiveOn) println(s"[hum-why] ${k.name} ofRefillRefused: noProbeEntry=$humNoEntry " +
           s"entryButNoHit=$humEntryNoHit s1Busy=$humS1Busy notOoOk=$humNotOoOk otherTerm=$humOtherTerm")
+        if (bypLiveOn) println(s"[hum-why3] ${k.name} realReadArmBlockedBy: shadowBusy=$hum2Shadow " +
+          s"s1Busy=$hum2S1 pendingStoreMiss=$hum2StoreMiss sameSetAsRefill=$hum2SameSet " +
+          s"storeClaimsPort=$hum2StoreClaim other=$hum2Other")
         if (bypLiveOn) println(f"[hum-why2] ${k.name} onNoEntryCycles=$humNoEntry " +
           f"avgValidEntries=${humEntriesValid.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
           f"avgReadyEntries=${humEntriesReady.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
