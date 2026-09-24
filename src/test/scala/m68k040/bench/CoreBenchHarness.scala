@@ -721,6 +721,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
       var lsNzvcWrites      = 0
+      var brTotal = 0; var brMis = 0; var brMisNoPred = 0; var brMisWrongDir = 0; var brNoPred = 0
+      val brMisByType = scala.collection.mutable.Map.empty[Int, Int]
       var decFires = 0; var decDualFires = 0
       var oooWbFires = 0; var oooParkedCyc = 0
       var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
@@ -829,6 +831,27 @@ trait CoreBenchHarness extends AnyFunSuite {
           branchCompletions(b.robId.toInt) = ((b.btbPc.toLong & 0xffffffffL,
             if (b.isBranch.toBoolean) b.brType.toInt else 2,
             b.btbTaken.toBoolean, b.mispredict.toBoolean, b.phtValid.toBoolean))
+        }
+        // MISPREDICT ATTRIBUTION. Silicon shows 68 mispredicts per 1000 instructions on the
+        // boot workload (~9.6% of all cycles in recovery), which is far worse than a working
+        // gshare should give. `phtValid` says whether a prediction EXISTED: a mispredict with
+        // phtValid=false was never predicted at all (defaulted), which is a COVERAGE problem,
+        // while phtValid=true is a direction problem in the predictor itself. They need
+        // completely different fixes, so measure the split before touching either.
+        if (dut.rob.logic.branchCompletion.valid.toBoolean) {
+          val bc = dut.rob.logic.branchCompletion.payload
+          if (bc.isBranch.toBoolean) {
+            brTotal += 1
+            val mis = bc.mispredict.toBoolean
+            val pv  = bc.phtValid.toBoolean
+            if (mis) {
+              brMis += 1
+              if (!pv) brMisNoPred += 1 else brMisWrongDir += 1
+              val t = bc.brType.toInt
+              brMisByType(t) = brMisByType.getOrElse(t, 0) + 1
+            }
+            if (!pv) brNoPred += 1
+          }
         }
         if (dut.rob.logic.branchCompletion.valid.toBoolean &&
             dut.rob.logic.branchCompletion.payload.mispredict.toBoolean)
@@ -1432,6 +1455,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"avgValidEntries=${humEntriesValid.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
           f"avgReadyEntries=${humEntriesReady.toDouble / scala.math.max(1, humNoEntry)}%.2f " +
           f"probeOffered=$humProbeOffered credit=$humProbeCredit launched=$humProbeLaunched storeClaim=$humStoreClaim")
+        println(f"[br] ${k.name} branches=$brTotal mispredicts=$brMis " +
+          f"(${100.0 * brMis / scala.math.max(1, brTotal)}%.1f%%) noPrediction=$brNoPred " +
+          f"| mis-because-unpredicted=$brMisNoPred mis-because-wrong-direction=$brMisWrongDir " +
+          f"| byType=${brMisByType.toSeq.sortBy(-_._2).mkString(",")}")
         println(f"[dual-dec] ${k.name} decodeGroups=$decFires dualGroups=$decDualFires " +
           f"(${100.0 * decDualFires / scala.math.max(1, decFires)}%.1f%% of groups carried a slot1)")
         println(s"[ooo] ${k.name} earlyWritebackFires=$oooWbFires cyclesWithAParkedResponse=$oooParkedCyc " +
