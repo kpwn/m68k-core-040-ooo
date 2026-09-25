@@ -122,7 +122,6 @@ class InstructionBuffer extends Component {
       for (j <- 0 until PUSH_WORDS) {
         when(tailOneHot(((s - j) + BUF_WORDS) % BUF_WORDS) && pushLenOk(j)) {
           entries(s).word                := io.push.payload.words(j)
-          entries(s).pred.simple         := io.push.payload.preds(j).simple
           entries(s).pred.lenWords       := io.push.payload.preds(j).lenWords
           entries(s).pred.ambiguousLine  := io.push.payload.preds(j).ambiguousLine
           entries(s).pred.size           := io.push.payload.preds(j).size   // FMax Lever B
@@ -160,7 +159,6 @@ class InstructionBuffer extends Component {
       io.headPred(i) := entries(phys).pred
     } .otherwise {
       io.head(i)                     := 0
-      io.headPred(i).simple          := False
       io.headPred(i).lenWords        := 0
       io.headPred(i).ambiguousLine   := False
       // FMax Lever B: this default is LOAD-BEARING and must be BYTE, not LONG. It pairs
