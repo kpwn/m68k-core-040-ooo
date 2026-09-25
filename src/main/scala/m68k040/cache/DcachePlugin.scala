@@ -1924,10 +1924,33 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // probes in IDLE, so a refill window could serve only the entries resolved
       // BEFORE the miss (measured: 21,451 -> 18,759 refused cycles, +1.5% IPC).
       def probeLaunchArm(): Unit = {
+          // ⚠️ `ldS1Hit` IS DELIBERATELY *NOT* IN THIS PREDICATE ANY MORE.
+          //
+          // It used to carry `!(ldS1Valid && !ldS1Hit)`, i.e. "do not launch a probe on the
+          // cycle an older load is discovering a MISS in S1". `ldS1Hit` is the registered
+          // TAG-COMPARE output, and this predicate drives `rdEn` -- the tag array's own read
+          // enable. That made a tag READ RESULT feed the tag array's READ ENABLE one cycle
+          // later, which is precisely the routed 200 MHz worst path:
+          //
+          //     DcachePlugin_logic_tagMem_3_reg/CLKARDCLK -> tagMem_2_reg/ENARDEN
+          //     12 logic levels, 1.781 ns logic + 2.822 ns route (61% route), slack -0.198
+          //
+          // Dropping the term is safe, and the gate was an OPTIMISATION rather than a
+          // correctness requirement:
+          //   - A probe is a side-effect-free array read. Launching one on the miss-discovery
+          //     cycle cannot disturb the miss: the victim snapshot taken in the miss arm reads
+          //     `rdTag(vw)`/`rdData(vw)`, which are the REGISTERED outputs of the read issued
+          //     one cycle EARLIER, so repointing `rdSet` now only changes the output next
+          //     cycle.
+          //   - The entry it allocates already defends itself against the refill that follows:
+          //     `allocRacesArrayWrite` compares the new probe's target set against
+          //     `missArrayWrite`/`missSet` and marks it stale, and `earlyProbeHitVec` requires
+          //     `!stale && !setWrite`. A stale entry simply falls back to the ordinary S1 read.
+          //   - Worst case the probe is wasted work (its command may never consume it), which
+          //     costs a queue entry, not correctness.
           val probeAdmitBase = !resetSweepBusy && !loadShadowValid &&
                                !pendingStoreMiss && !maintBusyReg &&
                                !storeClaimReg &&
-                               !(ldS1Valid && !ldS1Hit) &&
                                !(storeReadOwed && stS1Valid)
           // 2026-09-14 (plan item 6): this expression USED TO BE `loadProbePort.ready`
           // itself -- the tag BRAM's current output (`ldS1Hit`, through
