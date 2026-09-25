@@ -939,6 +939,19 @@ object MicroOpAssembler {
     out.fpImmAlloc := False            // overridden ONLY by the `F<op>.<fmt> #imm,FPn` arm below
     out.fpWideImm  := B(0, 80 bits)
     val op  = pkt.words(0)
+
+    // ── ONE shared LONG-size re-decode of the shifted word view ──────────────────
+    // DIV.L, MUL.L and BFm each re-decoded the source EA with BYTE-IDENTICAL
+    // arguments -- `(op[5:0], Size.LONG, Vec(words(0), words(2), words(3)))` -- and
+    // their own comments said so ("reuses the same EaDecoder call shape as DIV.L").
+    // Three calls build three copies of a full EA-format decoder (base/disp/index/imm,
+    // 32-bit disp), and `assemble` is instantiated ONCE PER ISSUE SLOT, so it was six
+    // copies of the same pure function of the same inputs. One `val`, three readers.
+    // The op classes are mutually exclusive, so nothing is shared BETWEEN live uops --
+    // this only stops the same constant function being built repeatedly.
+    // `c2SrcEa` is deliberately NOT folded in: it passes `c2Size`, not `Size.LONG`.
+    val longShiftedSrcEa = EaDecoder.decode(
+      op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
     // FMax Lever B: the no-offload fallback is reached ONLY from the standalone
     // `assemble(pkt)` overload, whose callers (~14 unit specs) hand-build `DecodePacket`s
     // and leave `pkt.size` unassigned. It must therefore derive the size from the decoder
@@ -3151,7 +3164,7 @@ object MicroOpAssembler {
     // The DIV.L divisor is 32-bit -> re-decode the source EA at LONG size (so an
     // immediate divisor consumes 2 extension words / is the full 32-bit value). The
     // ext word is words(1); the EA's own extension words follow at words(2..).
-    val divlSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val divlSrcEa = longShiftedSrcEa   // shared; see `longShiftedSrcEa`
     // Divisor EA reuses divlSrcEa (op[5:0]); reg/imm/memSimple.
     val divlDivisorIsImm = divlSrcEa.klass === EaClass.IMM
     val divlDivisorIsReg = (divlSrcEa.klass === EaClass.DATAREG) || (divlSrcEa.klass === EaClass.ADDRREG)
@@ -3336,7 +3349,7 @@ object MicroOpAssembler {
     // The MUL.L multiplier is 32-bit -> re-decode the source EA at LONG size (reuses
     // the same EaDecoder call shape as DIV.L; the ext word is words(1), the EA's own
     // extension words follow at words(2..)).
-    val mullSrcEa = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val mullSrcEa = longShiftedSrcEa   // shared; see `longShiftedSrcEa`
     val mullMulIsImm = mullSrcEa.klass === EaClass.IMM
     val mullMulIsReg = (mullSrcEa.klass === EaClass.DATAREG) || (mullSrcEa.klass === EaClass.ADDRREG)
     val mullMulIsMem = mullSrcEa.klass === EaClass.MEMSIMPLE
@@ -3470,7 +3483,7 @@ object MicroOpAssembler {
     // The funnel + datapath run on the ALU EU (the slow BITFIELD pipe). DYNAMIC offset/
     // width on mem forms is deferred (the OperationDecoder mem arm gates Do/Dw out by only
     // naming the op; here bfMem ignores Do/Dw — slice 3a is STATIC only).
-    val bfmEaDec = EaDecoder.decode(op(5 downto 0), Size.LONG, Vec(pkt.words(0), pkt.words(2), pkt.words(3)))
+    val bfmEaDec = longShiftedSrcEa   // shared; see `longShiftedSrcEa`
     // CONTROL modes only (MEMSIMPLE, no auto-update). (An)+/-(An) (autoMode != NONE) and
     // reg-direct/#imm are rejected -> illegal (vector 4).
     // Task #199 (bf_pcrel_idx_traps_alive): an INDEXED PC-relative EA — brief-format
