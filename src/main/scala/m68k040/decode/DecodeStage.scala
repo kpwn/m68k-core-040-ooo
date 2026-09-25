@@ -1518,6 +1518,11 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       case 2 => Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
       case 3 => a1raw.uops(1)
     }
+    // Hoisted ONCE. `normUop` is a `def` that BUILDS a Mux, so every call site
+    // instantiates another copy; the dead-slot rewiring below references slots 1-3 from
+    // the FSM branches too, which would otherwise quadruple that logic.
+    val normUops = (0 until 4).map(normUop)
+
     // The NORMAL head pushes when: a stash is being replayed (the head is the stash,
     // regardless of what slot0 in the HELD next group is — even a MOVEM that waits), OR a
     // fresh slot0 that is NOT a MOVEM and no slot1 MOVEM is pending. A slot0 MOVEM (when not
@@ -2856,40 +2861,47 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         pushProduced.payload.uops(1) := movemUop1
         pushProduced.payload.count   := movemNumThisCycle
       }
-      pushProduced.payload.uops(2) := movemAnUop      // unused (count <= 2)
-      pushProduced.payload.uops(3) := movemAnUop
+      // DEAD SLOTS. count <= 2 here, so slots 2/3 never reach the ring (the push gate
+      // below is `i < count`). Driving them from the FSM uop put a 5th 32-bit-per-field
+      // source on their bundle mux for nothing; sourcing them from the SAME expression
+      // the normal path uses makes slots 2/3 mux-free -- the value is still never read.
+      pushProduced.payload.uops(2) := normUops(2)
+      pushProduced.payload.uops(3) := normUops(3)
     } elsewhen(ucActive) {
       // µcode SEQUENCER drive: emit the resolved ROM µop at ucPc (1/cycle in v1).
       pushProduced.valid           := True
       pushProduced.payload.uops(0) := ucCurUop
-      pushProduced.payload.uops(1) := ucCurUop
-      pushProduced.payload.uops(2) := ucCurUop
-      pushProduced.payload.uops(3) := ucCurUop
+      // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
+      pushProduced.payload.uops(1) := normUops(1)
+      pushProduced.payload.uops(2) := normUops(2)
+      pushProduced.payload.uops(3) := normUops(3)
       pushProduced.payload.count   := U(1, 3 bits)
     } elsewhen(movepActive) {
       // MOVEP FSM drive: emit the per-step byte LOAD/STORE + shift/and/or µop (1/cycle).
       pushProduced.valid           := True
       pushProduced.payload.uops(0) := movepUop
-      pushProduced.payload.uops(1) := movepUop
-      pushProduced.payload.uops(2) := movepUop
-      pushProduced.payload.uops(3) := movepUop
+      // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
+      pushProduced.payload.uops(1) := normUops(1)
+      pushProduced.payload.uops(2) := normUops(2)
+      pushProduced.payload.uops(3) := normUops(3)
       pushProduced.payload.count   := U(1, 3 bits)
     } elsewhen(fmovemxActive) {
       // FMOVEM.X data-list FSM drive: one sub-phase µop/cycle (a chunk LOAD for phases
       // 0-2, the FP issue row for phase 3).
       pushProduced.valid           := True
       pushProduced.payload.uops(0) := fmovemxCurUop
-      pushProduced.payload.uops(1) := fmovemxCurUop
-      pushProduced.payload.uops(2) := fmovemxCurUop
-      pushProduced.payload.uops(3) := fmovemxCurUop
+      // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
+      pushProduced.payload.uops(1) := normUops(1)
+      pushProduced.payload.uops(2) := normUops(2)
+      pushProduced.payload.uops(3) := normUops(3)
       pushProduced.payload.count   := U(1, 3 bits)
     } otherwise {
       normalPushSel                := True
       pushProduced.valid           := normalHeadValid
-      pushProduced.payload.uops(0) := normUop(0)
-      pushProduced.payload.uops(1) := normUop(1)
-      pushProduced.payload.uops(2) := normUop(2)
-      pushProduced.payload.uops(3) := normUop(3)
+      pushProduced.payload.uops(0) := normUops(0)
+      pushProduced.payload.uops(1) := normUops(1)
+      pushProduced.payload.uops(2) := normUops(2)
+      pushProduced.payload.uops(3) := normUops(3)
       pushProduced.payload.count   := totalCount
       // FP wide-immediate side table: stamp the entry tag into the head uop's `imm`
       // (the assembler zeroed it; useImm=False on these rows so nothing reads it as a
@@ -2937,9 +2949,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // never executed fire `debugSkipConsumeNow` and burn the one-shot
       // `breakSkipOnce` ack -- so a later, REAL hit on that breakpoint would be
       // skipped instead of halting. It was latent rather than visible because the FSM
-      // builders fill the dead slots with a COPY of slot 0, making the spurious match
-      // agree with the real one; the normal path, where dead slots hold stale crack
-      // results, could always mis-consume.
+      // builders used to fill the dead slots with a COPY of slot 0, making the spurious
+      // match agree with the real one; the normal path, where dead slots hold stale
+      // crack results, could always mis-consume.
       val slotLive = pushReg.valid && (U(i, 3 bits) < pushReg.payload.count)
       val matchBits = Bits(4 bits)
       for (slot <- 0 until 4)
