@@ -113,7 +113,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
   // so the deep MicroOpAssembler decode cone ends at a register and the ring write
   // consumes only registered signals (kills the decode-cone half of the push critical arc).
   case class PushPayload() extends Bundle {
-    val uops  = Vec(DecodedUop(), 4)
+    // The NARROW decode record: `imm` rides the {mode, payload} narrow-carry encoding
+    // (decode/ImmEnc.scala), re-expanded at the POP boundary below.
+    val uops  = Vec(DecodedUop(ImmEnc.WIDTH), 4)
     val count = UInt(3 bits)
   }
 
@@ -294,13 +296,69 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0), fuseLongMoveLoads)
     val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1), fuseLongMoveLoads)
 
+    // ── WIDE-IMMEDIATE side banks (Global.WIDE_IMM_TABLE_DEPTH) ─────────────────
+    // Third member of the FP_IMM / BR_PRED side-table family, and the reason the decode
+    // record can carry `imm` as ImmEnc.WIDTH bits instead of 32. Two banks, because the
+    // decode stage has two kinds of uop producer with two different stability properties
+    // -- see decode/ImmEnc.scala for the full argument, and Global.WIDE_IMM_TABLE_DEPTH
+    // for the depth bound that the sim assertions at the bottom of this Area check live.
+    val wideImm = new Area {
+      val depth = Global.WIDE_IMM_TABLE_DEPTH
+
+      // GROUP bank -- every uop the MicroOpAssembler cracks. 6 slots = {packet0 crack
+      // position 0..2, packet1 crack position 0..2}; the write is a pure function of
+      // `fed` so it is IDEMPOTENT for as long as the packet sits there (no edge
+      // detection, no free list, no stall). Tag advances on `fed.fire`.
+      val grpTag = RegInit(U(0, ImmEnc.TAG_W bits))
+      val grpMem = Mem(Bits(ImmEnc.GRP_ENTRY_W bits), depth)
+      grpMem.addAttribute("ram_style", "distributed")
+      val grpData = Bits(ImmEnc.GRP_ENTRY_W bits)
+      for (pk <- 0 until 2; q <- 0 until ImmEnc.GRP_UOPS_PER_PACKET) {
+        val sl = ImmEnc.grpSel(pk, q)
+        grpData(32 * sl + 31 downto 32 * sl) := (if (pk == 0) a0 else a1raw).uops(q).imm
+      }
+      grpMem.write(address = grpTag, data = grpData, enable = fed.valid)
+      when(fed.fire) { grpTag := (grpTag + 1).resized }
+
+      // PUSH bank -- the MOVEM / MOVEP / FMOVEM.X / microcode sequencers, which HOLD
+      // `fed` and emit a DIFFERENT uop each cycle from the SAME group (so the group
+      // write above does not describe them). 2 slots: MOVEM pushes a register PAIR,
+      // every other sequencer pushes one uop. Tag advances on each such push, and those
+      // uops never reach the slot1 stash, so the entry only has to survive
+      // pushReg -> queue -> pop. Driven at the push chain below.
+      val pushTag  = RegInit(U(0, ImmEnc.TAG_W bits))
+      val pushMem  = Mem(Bits(ImmEnc.PUSH_ENTRY_W bits), depth)
+      pushMem.addAttribute("ram_style", "distributed")
+      val pushData = Bits(ImmEnc.PUSH_ENTRY_W bits)
+      val pushWr   = Bool()
+      pushMem.write(address = pushTag, data = pushData, enable = pushWr)
+      when(pushWr) { pushTag := (pushTag + 1).resized }
+
+      /** 32-bit architectural uop -> narrow decode record, GROUP bank. */
+      def grp(u: DecodedUop, pk: Int, pos: Int): DecodedUop =
+        DecodedUop.withImm(u, ImmEnc.wide(grpTag, ImmEnc.grpSel(pk, pos)))
+      /** 32-bit architectural uop -> narrow decode record, PUSH bank. */
+      def push(u: DecodedUop, slot: Int): DecodedUop =
+        DecodedUop.withImm(u, ImmEnc.wideP(pushTag, slot))
+      /** Narrow decode record -> the 32 bits rename/the IQ/the EUs expect. */
+      def widen(u: DecodedUop): DecodedUop = {
+        val tag = ImmEnc.tagOf(u.imm)
+        DecodedUop.withImm(u, ImmEnc.expand(u.imm, grpMem.readAsync(tag), pushMem.readAsync(tag)))
+      }
+    }
+
+    // The two packets' cracks, narrowed once here. Everything downstream of this point
+    // (the stash, `normUops`, `pushReg`, the MicroOpQueue ring) carries ImmEnc.WIDTH.
+    val a0n = Vec((0 until 3).map(i => wideImm.grp(a0.uops(i), 0, i)))
+    val a1n = Vec((0 until 3).map(i => wideImm.grp(a1raw.uops(i), 1, i)))
+
     // Stash for a deferred slot1. FMax: stash the ALREADY-DECODED slot1 µops (computed
     // from a1raw, no second MicroOpAssembler instance) — the replay cycle reads these
     // REGISTERS instead of re-assembling, keeping the decode-crack cone off the queue-
     // push critical arc. Carries the slot1 µop COUNT (1..3) so a replayed slot1 of any
     // length is emitted correctly.
     val stashValid = RegInit(False)
-    val stashUops  = Reg(Vec(DecodedUop(), 3))
+    val stashUops  = Reg(Vec(DecodedUop(ImmEnc.WIDTH), 3))
     val stashCount = Reg(UInt(2 bits))
     when(pipeFlush) { stashValid := False }
     // FP wide-immediate side table (plan item 3): a stashed slot1 that is an
@@ -318,7 +376,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // while valid, including the FP immediate awaiting its side-table allocation.
     when(!stashValid) {
       stashCount := a1raw.count
-      stashUops := a1raw.uops
+      stashUops := a1n
       stashFpPend := a1raw.fpImmAlloc
       stashFpVal := a1raw.fpWideImm
     }
@@ -582,7 +640,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
 
     // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
     // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3).
-    def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0.uops(i))
+    def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0n(i))
 
     val totalCount = (nCur +^ n1).resize(3)            // 1..4
 
@@ -1514,9 +1572,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // ── Normal (non-MOVEM) push production ──────────────────────────────────────
     def normUop(i: Int): DecodedUop = i match {
       case 0 => headUop(0)
-      case 1 => Mux(nCur >= U(2), headUop(1), a1raw.uops(0))
-      case 2 => Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1raw.uops(0), a1raw.uops(1)))
-      case 3 => a1raw.uops(1)
+      case 1 => Mux(nCur >= U(2), headUop(1), a1n(0))
+      case 2 => Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1n(0), a1n(1)))
+      case 3 => a1n(1)
     }
     // Hoisted ONCE. `normUop` is a `def` that BUILDS a Mux, so every call site
     // instantiates another copy; the dead-slot rewiring below references slots 1-3 from
@@ -2846,19 +2904,37 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // True exactly when the `otherwise` (normal head) arm of the chain below is selected:
     // the FP wide-immediate table allocates only for that arm.
     val normalPushSel = Bool(); normalPushSel := False
+    // PUSH-bank write data: the 32-bit immediate of the uop each FSM arm puts in push
+    // slot 0/1 this cycle (slot k of the entry <-> the uop stamped `ImmEnc.wideP(_, k)`).
+    // Driven arm-by-arm alongside the uops themselves so the two cannot drift.
+    val pushWide = Vec(Bits(32 bits), ImmEnc.PUSH_SLOTS)
+    pushWide.foreach(_ := B(0, 32 bits))
+    // The sequencer uops, narrowed into the decode record. Hoisted OUT of the arm chain
+    // below: `wideImm.push` DECLARES a bundle, and a bundle declared inside a `when` and
+    // assigned only there trips SpinalHDL's no-latch check. Pure field renames + the
+    // narrow `imm`, so the duplicates cost wires, not logic.
+    val nMovemSnap = (0 until 2).map(k => wideImm.push(movemSnapUop, k))
+    val nMovemAn   = (0 until 2).map(k => wideImm.push(movemAnUop, k))
+    val nMovemPair = Seq(wideImm.push(movemUop0, 0), wideImm.push(movemUop1, 1))
+    val nUcCur     = wideImm.push(ucCurUop, 0)
+    val nMovepCur  = wideImm.push(movepUop, 0)
+    val nFmovemxCur= wideImm.push(fmovemxCurUop, 0)
     when(movemActive) {
       pushProduced.valid           := True
       when(movemSnapPhase) {
-        pushProduced.payload.uops(0) := movemSnapUop
-        pushProduced.payload.uops(1) := movemSnapUop
+        pushProduced.payload.uops(0) := nMovemSnap(0)
+        pushProduced.payload.uops(1) := nMovemSnap(1)
+        pushWide(0) := movemSnapUop.imm; pushWide(1) := movemSnapUop.imm
         pushProduced.payload.count   := U(1, 3 bits)
       } elsewhen(movemAnUpdPhase) {
-        pushProduced.payload.uops(0) := movemAnUop
-        pushProduced.payload.uops(1) := movemAnUop
+        pushProduced.payload.uops(0) := nMovemAn(0)
+        pushProduced.payload.uops(1) := nMovemAn(1)
+        pushWide(0) := movemAnUop.imm;  pushWide(1) := movemAnUop.imm
         pushProduced.payload.count   := U(1, 3 bits)
       } otherwise {
-        pushProduced.payload.uops(0) := movemUop0
-        pushProduced.payload.uops(1) := movemUop1
+        pushProduced.payload.uops(0) := nMovemPair(0)
+        pushProduced.payload.uops(1) := nMovemPair(1)
+        pushWide(0) := movemUop0.imm;   pushWide(1) := movemUop1.imm
         pushProduced.payload.count   := movemNumThisCycle
       }
       // DEAD SLOTS. count <= 2 here, so slots 2/3 never reach the ring (the push gate
@@ -2870,7 +2946,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     } elsewhen(ucActive) {
       // µcode SEQUENCER drive: emit the resolved ROM µop at ucPc (1/cycle in v1).
       pushProduced.valid           := True
-      pushProduced.payload.uops(0) := ucCurUop
+      pushProduced.payload.uops(0) := nUcCur
+      pushWide(0) := ucCurUop.imm
       // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
       pushProduced.payload.uops(1) := normUops(1)
       pushProduced.payload.uops(2) := normUops(2)
@@ -2879,7 +2956,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     } elsewhen(movepActive) {
       // MOVEP FSM drive: emit the per-step byte LOAD/STORE + shift/and/or µop (1/cycle).
       pushProduced.valid           := True
-      pushProduced.payload.uops(0) := movepUop
+      pushProduced.payload.uops(0) := nMovepCur
+      pushWide(0) := movepUop.imm
       // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
       pushProduced.payload.uops(1) := normUops(1)
       pushProduced.payload.uops(2) := normUops(2)
@@ -2889,7 +2967,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // FMOVEM.X data-list FSM drive: one sub-phase µop/cycle (a chunk LOAD for phases
       // 0-2, the FP issue row for phase 3).
       pushProduced.valid           := True
-      pushProduced.payload.uops(0) := fmovemxCurUop
+      pushProduced.payload.uops(0) := nFmovemxCur
+      pushWide(0) := fmovemxCurUop.imm
       // DEAD SLOTS (count = 1): same argument as the MOVEM branch above.
       pushProduced.payload.uops(1) := normUops(1)
       pushProduced.payload.uops(2) := normUops(2)
@@ -2907,10 +2986,15 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // (the assembler zeroed it; useImm=False on these rows so nothing reads it as a
       // value). The table write itself fires with `allocFire` below.
       when(fpImmTable.headPend) {
-        pushProduced.payload.uops(0).imm := fpImmTable.allocIdx.resize(32).asBits
+        // ZEXT-encoded, so `fpImmTable.tagOf` still reads the index off `imm[tagW-1:0]`.
+        pushProduced.payload.uops(0).imm := ImmEnc.zext(fpImmTable.allocIdx)
       }
     }
     fpImmTable.allocFire := normalPushSel && pushProduced.valid && pushProduced.ready && fpImmTable.headPend
+    // The PUSH bank allocates exactly when a SEQUENCER arm above lands a uop in pushReg.
+    for (k <- 0 until ImmEnc.PUSH_SLOTS)
+      wideImm.pushData(32 * k + 31 downto 32 * k) := pushWide(k)
+    wideImm.pushWr   := pushProduced.valid && pushProduced.ready && !normalPushSel
 
 
     // P1: register the produced push. The deep `assemble` cone ends at pushReg's input;
@@ -3548,7 +3632,15 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     }
 
     // ── Rename-facing output ───────────────────────────────────────────────────
-    val uopsOut = queue.io.pop
+    // `imm` comes off the ring in the narrow-carry encoding and is re-expanded HERE, the
+    // one boundary between the decode record and the architectural record. `DecodeUopService`
+    // still hands rename a 32-bit `DecodedUop.imm`, so rename, the IQ, the ROB and every EU
+    // are untouched by the decode-side narrowing (exactly what `brPredTable` did for the 45
+    // prediction bits, one line below).
+    val uopsOut = Stream(Vec(DecodedUop(), 2))
+    uopsOut.valid       := queue.io.pop.valid
+    queue.io.pop.ready  := uopsOut.ready
+    for (k <- 0 until 2) uopsOut.payload(k) := wideImm.widen(queue.io.pop.payload(k))
     val uop1Sig = queue.io.pop1Valid
     // Re-expand each popped uop's branch-prediction tag into the record rename copies onto
     // `RenamedUop` (which still carries the four fields verbatim, so rename, the IQ, the
@@ -3588,6 +3680,42 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           "wrapping tag counter lapped a LIVE prediction record (see Global.BR_PRED_TABLE_DEPTH)")
       assertFresh(uopsOut.payload(0).brPredTag, uopsOut.valid)
       assertFresh(uopsOut.payload(1).brPredTag, uopsOut.valid && uop1Sig)
+    }
+
+    // ── Wide-immediate bank tag-reuse watchdog (SIM ONLY) ──────────────────────
+    // The SAME argument, and the same failure mode, as the brPredTable watchdog above:
+    // the only way either wide-immediate bank can be silently wrong is a wrapping tag
+    // counter lapping an entry whose uop has not popped yet, and the symptom would be a
+    // uop executing ANOTHER uop's 32-bit immediate -- i.e. a wrong address, which is this
+    // project's signature silent-corruption shape. Global.WIDE_IMM_TABLE_DEPTH argues it
+    // cannot happen; this makes the argument a live check so a future change that breaks
+    // the bound STOPS the simulation.
+    //
+    // `allocSeq` counts ALLOCATIONS, not cycles: the GROUP write is idempotent while a
+    // packet is merely held in `fed`, and only `fed.fire` advances that bank's tag.
+    GenerationFlags.simulation {
+      def watchdog(name: String, tag: UInt, alloc: Bool, mode: Int): Unit = {
+        val depth    = Global.WIDE_IMM_TABLE_DEPTH
+        val allocSeq = Reg(UInt(32 bits)) init 0
+        val seqAtWr  = Vec.fill(depth)(Reg(UInt(32 bits)) init 0)
+        when(alloc) {
+          allocSeq := allocSeq + 1
+          for (e <- 0 until depth) {
+            when(tag === U(e, ImmEnc.TAG_W bits)) { seqAtWr(e) := allocSeq + 1 }
+          }
+        }
+        for (k <- 0 until 2) {
+          val u    = queue.io.pop.payload(k)
+          val live = queue.io.pop.valid && (if (k == 0) True else uop1Sig) &&
+                     (ImmEnc.modeOf(u.imm).asUInt === U(mode, ImmEnc.MODE_W bits))
+          val rdTag = ImmEnc.tagOf(u.imm)
+          assert(!(live && ((allocSeq - seqAtWr(rdTag)) >= U(depth - 1, 32 bits))),
+            s"$name: a popped uop read an entry older than the whole bank -- the wrapping " +
+            "tag counter lapped a LIVE wide immediate (see Global.WIDE_IMM_TABLE_DEPTH)")
+        }
+      }
+      watchdog("WideImmGrpBank",  wideImm.grpTag,  fed.fire,        ImmEnc.WIDE)
+      watchdog("WideImmPushBank", wideImm.pushTag, wideImm.pushWr,  ImmEnc.WIDEP)
     }
   }
 

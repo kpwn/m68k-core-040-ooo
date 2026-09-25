@@ -20,6 +20,10 @@ import spinal.lib._
   * Implementation: a ring (depth power-of-two), banked 4-way into per-bank
   * `Mem(DecodedUop)` (`ram_style`=distributed, single write port + 2 async read
   * ports per bank -- see the area-fold comment at `banks`/`bankMems` below).
+  * The ring stores the NARROW decode record (`DecodedUop(ImmEnc.WIDTH)`): `imm` rides as
+  * the {mode, payload} narrow-carry encoding, re-expanded by DecodeStage at the POP
+  * boundary. See decode/ImmEnc.scala.
+  *
   * head/tail/count are RegInit (no uninit Regs). Push writes are COMPACTED at the
   * tail (the v-th valid µop lands at tail+v) using HARDWARE sums (no when-gated
   * Scala vars). Pop reads head and head+1 combinationally (async); on fire head
@@ -33,10 +37,10 @@ class MicroOpQueue(depth: Int = 16) extends Component {
     val push = new Bundle {
       val valid = in Bool ()
       val count = in UInt (3 bits)               // 0..4 valid µops in `uops`
-      val uops  = in Vec (DecodedUop(), 4)
+      val uops  = in Vec (DecodedUop(ImmEnc.WIDTH), 4)
       val ready = out Bool ()
     }
-    val pop      = master(Stream(Vec(DecodedUop(), 2)))
+    val pop      = master(Stream(Vec(DecodedUop(ImmEnc.WIDTH), 2)))
     val pop1Valid= out Bool ()
     val flush    = in Bool ()
   }
@@ -47,7 +51,7 @@ class MicroOpQueue(depth: Int = 16) extends Component {
   //
   // ── Area fold (LUT-count-reduction-broad-review-2026-08-15, "MicroOpQueue flop-ring
   // -> per-bank LUTRAM"): WAS `Vec.fill(rows)(RegInit(...))` per bank -- 16 rows x
-  // widthOf(DecodedUop()) bits of flops total (measured 7,197 FF bits via netlist
+  // widthOf(DecodedUop) bits of flops total (measured 7,197 FF bits via netlist
   // census), the largest area item in this file's plugin, sitting in the decode
   // pblock (83.6% CLB LUT-utilization, the tightest-packed region in the design).
   //
@@ -89,9 +93,9 @@ class MicroOpQueue(depth: Int = 16) extends Component {
   def bankOf(addr: UInt): UInt = addr(1 downto 0)
   def rowOf(addr: UInt):  UInt = addr(ptrW - 1 downto 2)
   def zeroUop(): DecodedUop = {
-    val u = DecodedUop(); u.assignFromBits(B(0, widthOf(DecodedUop()) bits)); u
+    val u = DecodedUop(ImmEnc.WIDTH); u.assignFromBits(B(0, widthOf(DecodedUop(ImmEnc.WIDTH)) bits)); u
   }
-  val bankMems = Seq.fill(banks)(Mem(DecodedUop(), rows))
+  val bankMems = Seq.fill(banks)(Mem(DecodedUop(ImmEnc.WIDTH), rows))
   bankMems.foreach(_.addAttribute("ram_style", "distributed"))
 
   val head  = RegInit(U(0, ptrW   bits))   // oldest µop

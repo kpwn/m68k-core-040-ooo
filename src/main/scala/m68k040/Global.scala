@@ -193,25 +193,46 @@ object Global {
     * (`BrPredTable: ...`) that fails loudly if an entry is ever read after that many
     * allocations, so the failure mode is a stopped simulation, not a silently wrong
     * predicted-vs-actual verdict. */
-  /** WIDE-IMMEDIATE side table (the third member of the FP_IMM / BR_PRED family).
+  /** WIDE-IMMEDIATE side banks (the third member of the FP_IMM / BR_PRED family).
     *
-    * `DecodedUop.imm` carries {2-bit mode, 16-bit payload} instead of a 32-bit value --
-    * see `decode/ImmEnc.scala` for the census that motivated it (6,699 LUT, 52% of the
-    * decode record, ~195 LUT/bit with NO free ride on the high half) and the measured
-    * -2,249 LUT ceiling. Values that do not fit (abs.L, #imm.L, PC-relative folds) live
-    * here and the uop carries {tag, sel}.
+    * The DECODE RECORD -- `PushPayload`, DecodeStage's slot1 stash and the MicroOpQueue
+    * ring, all `DecodedUop(ImmEnc.WIDTH)` -- carries `imm` as {2-bit mode, 16-bit payload}
+    * instead of a 32-bit value; see `decode/ImmEnc.scala` for the census that motivated it
+    * (6,699 LUT, 52% of the decode record, ~195 LUT/bit with NO free ride on the high half)
+    * and the measured -2,249 LUT ceiling. The 32-bit values live in the two banks below and
+    * the uop carries {tag, sel}; DecodeStage re-expands at the MicroOpQueue POP boundary, so
+    * `DecodeUopService` still hands rename a 32-bit `DecodedUop.imm` and rename, the IQ, the
+    * ROB and every EU are UNCHANGED.
     *
-    * ONE ENTRY PER FED GROUP, holding the four wide values a group can produce:
-    * {packet0 src, packet0 dst, packet1 src, packet1 dst}. A wide immediate is a stable
-    * combinational function of the packet, so the write is IDEMPOTENT for as long as the
-    * packet sits in `fed` -- no edge detection, no free list, no stall, exactly
-    * BR_PRED_TABLE_DEPTH's argument. A squashed uop never pops, so a flush reclaims
-    * nothing.
+    * GROUP BANK -- one entry per fed group, holding one 32-bit slot per (packet, crack
+    * POSITION): {packet0 uop 0..2, packet1 uop 0..2} = 6 x 32 bits. Indexing by crack
+    * position rather than by "which builder produced this immediate" is what keeps the bank
+    * small AND makes the scheme total -- every cracked uop occupies exactly one position of
+    * exactly one packet (AssembledUops.count <= 3), so no two live uops can contend for a
+    * slot and NO per-site "is this immediate narrow enough?" reasoning is needed anywhere in
+    * MicroOpAssembler. A cracked uop's immediate is a stable combinational function of the
+    * packet, so the write is IDEMPOTENT for as long as the packet sits in `fed` -- no edge
+    * detection, no free list, no stall, exactly BR_PRED_TABLE_DEPTH's argument. The tag
+    * advances on `fed.fire`. A squashed uop never pops, so a flush reclaims nothing.
     *
-    * DEPTH BOUND: an entry must survive from its group's `fed.fire` until that group's
-    * uops POP. The uops in flight are {pushReg <=4, stash <=3, queue <=16} = at most 23,
-    * so at most 23 groups can be live; 32 entries is a 1.4x margin. DecodeStage carries
-    * the same live assertion `brPredTable` does. */
+    * PUSH BANK -- one entry per MOVEM / MOVEP / FMOVEM.X / microcode PUSH cycle, 2 x 32
+    * bits. Those sequencers HOLD `fed` and emit a DIFFERENT uop every cycle out of the SAME
+    * group, so their immediates are NOT a function of the group and the idempotent group
+    * write cannot describe them. They push at most 2 uops per cycle (MOVEM's register pair;
+    * every other sequencer pushes 1) and they never use the slot1 stash, so a bank indexed
+    * by a counter advanced on each such push covers them exactly.
+    *
+    * DEPTH BOUND (why a wrapping counter cannot hand out a tag whose entry is still live):
+    *   GROUP: an entry must survive from its group's `fed.fire` until that group's uops POP.
+    *   `fed.ready` is gated on `!stashValid`, so a group cannot be consumed while a deferred
+    *   slot1 of an EARLIER group is still parked in the stash; the groups that can allocate
+    *   in the window are therefore exactly the ones whose uops are still in {pushReg <= 4,
+    *   stash <= 3, queue <= 16} = at most 23 uops, i.e. at most 23 groups.
+    *   PUSH: an entry must survive from its push until that uop pops, i.e. at most
+    *   1 (pushReg) + 16 (queue) = 17 pushes.
+    * 32 entries is a 1.4x / 1.9x margin. DecodeStage carries the same live assertion
+    * `brPredTable` does (`WideImmGrpBank` / `WideImmPushBank`), so the failure mode is a
+    * stopped simulation, not a silently wrong 32-bit address. */
   val WIDE_IMM_TABLE_DEPTH: Int = 32
   def WIDE_IMM_TAG_W: Int       = spinal.core.log2Up(WIDE_IMM_TABLE_DEPTH)
 

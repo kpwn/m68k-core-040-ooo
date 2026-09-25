@@ -379,7 +379,7 @@ object SysKind extends SpinalEnum {
 /** Pre-rename µop: the decode→rename contract. Architectural operands
   * (D0-7 = 0..7, A0-7 = 8..15, T0/T1 temps = 16/17). Reg ids are 5 bits so the
   * cracker's temp targets fit. Rename maps these to physical MicroOp fields. */
-case class DecodedUop() extends Bundle {
+case class DecodedUop(immW: Int = 32) extends Bundle {
   val valid        = Bool()
   val pc           = UInt(32 bits)
   // ── Instruction LENGTH, not the post-PC ─────────────────────────────────────
@@ -433,7 +433,16 @@ case class DecodedUop() extends Bundle {
   //       useImm=False explicitly). The two isBranch µops that DO reach the EU without a
   //       displacement, Scc and TRAPcc/TRAPV (isCondTrap), have `redirect` forced False
   //       there, so `relTarget` is never consulted for them at all.
-  val useImm       = Bool();       val imm       = Bits(32 bits)
+  // ── `imm` WIDTH is a BUNDLE PARAMETER (`immW`), not a constant ───────────────
+  // The default, 32, is the ARCHITECTURAL width every producer (MicroOpAssembler, the
+  // microcode engine, the MOVEM/MOVEP/FMOVEM FSMs) and every consumer (rename, the IQ,
+  // the EUs) speaks. The DECODE RECORD -- PushPayload, DecodeStage's slot1 stash and the
+  // MicroOpQueue ring -- instantiates the SAME bundle with `immW = ImmEnc.WIDTH` (18) and
+  // carries the narrow-carry encoding instead; DecodeStage converts at the two boundaries
+  // (`ImmEnc`-encode on the way into the record, `ImmEnc.expand` at the POP). See
+  // decode/ImmEnc.scala for the census that motivated it and for the two side banks.
+  // Use `DecodedUop.copyNoImm` to move every OTHER field between the two widths.
+  val useImm       = Bool();       val imm       = Bits(immW bits)
   val readsNzvc    = Bool();       val readsX    = Bool()
   val writesNzvc   = Bool();       val writesX   = Bool()
   val isBranch     = Bool()
@@ -871,6 +880,35 @@ case class DecodedUop() extends Bundle {
     readsFpcc := False; writesFpcc := False
     fpuOp     := 0; fpSrcKind := FpSrcKind.FPREG
     fpSrcFmt  := 0
+  }
+}
+
+object DecodedUop {
+  /** Copy every field EXCEPT `imm` between two `DecodedUop`s of different `immW`.
+    *
+    * Name-matched over `Bundle.elements` and moved as raw bits (`asBits` /
+    * `assignFromBits`), so a field added to the bundle later is carried across this
+    * boundary automatically -- there is deliberately NO field list here to forget to
+    * update, and a name/width mismatch is an elaboration error, not a silent drop. */
+  def copyNoImm(dst: DecodedUop, src: DecodedUop): Unit = {
+    val from = src.elements.toMap
+    for ((name, d) <- dst.elements if name != "imm") {
+      val s = from.getOrElse(name,
+        throw new Exception(s"DecodedUop.copyNoImm: source has no field `$name`"))
+      require(widthOf(d) == widthOf(s),
+        s"DecodedUop.copyNoImm: width mismatch on `$name` (${widthOf(d)} vs ${widthOf(s)})")
+      d.assignFromBits(s.asBits)
+    }
+  }
+
+  /** `src` with its `imm` field replaced by `imm`; the result's `immW` is `imm`'s width.
+    * The ONE way DecodeStage moves a uop between the 32-bit architectural record and the
+    * narrow-carry decode record (see decode/ImmEnc.scala). */
+  def withImm(src: DecodedUop, imm: Bits): DecodedUop = {
+    val d = DecodedUop(imm.getWidth)
+    copyNoImm(d, src)
+    d.imm := imm
+    d
   }
 }
 
