@@ -193,6 +193,28 @@ object Global {
     * (`BrPredTable: ...`) that fails loudly if an entry is ever read after that many
     * allocations, so the failure mode is a stopped simulation, not a silently wrong
     * predicted-vs-actual verdict. */
+  /** WIDE-IMMEDIATE side table (the third member of the FP_IMM / BR_PRED family).
+    *
+    * `DecodedUop.imm` carries {2-bit mode, 16-bit payload} instead of a 32-bit value --
+    * see `decode/ImmEnc.scala` for the census that motivated it (6,699 LUT, 52% of the
+    * decode record, ~195 LUT/bit with NO free ride on the high half) and the measured
+    * -2,249 LUT ceiling. Values that do not fit (abs.L, #imm.L, PC-relative folds) live
+    * here and the uop carries {tag, sel}.
+    *
+    * ONE ENTRY PER FED GROUP, holding the four wide values a group can produce:
+    * {packet0 src, packet0 dst, packet1 src, packet1 dst}. A wide immediate is a stable
+    * combinational function of the packet, so the write is IDEMPOTENT for as long as the
+    * packet sits in `fed` -- no edge detection, no free list, no stall, exactly
+    * BR_PRED_TABLE_DEPTH's argument. A squashed uop never pops, so a flush reclaims
+    * nothing.
+    *
+    * DEPTH BOUND: an entry must survive from its group's `fed.fire` until that group's
+    * uops POP. The uops in flight are {pushReg <=4, stash <=3, queue <=16} = at most 23,
+    * so at most 23 groups can be live; 32 entries is a 1.4x margin. DecodeStage carries
+    * the same live assertion `brPredTable` does. */
+  val WIDE_IMM_TABLE_DEPTH: Int = 32
+  def WIDE_IMM_TAG_W: Int       = spinal.core.log2Up(WIDE_IMM_TABLE_DEPTH)
+
   val BR_PRED_TABLE_DEPTH: Int = 64
   def BR_PRED_TAG_W: Int       = spinal.core.log2Up(BR_PRED_TABLE_DEPTH)
 }
