@@ -2931,9 +2931,19 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val pushOut = cloneOf(queue.io.push.uops)
     pushOut := pushReg.payload.uops
     for (i <- 0 until 4) {
+      // COUNT-GATED. `pushReg` always carries 4 slots but only `count` of them are
+      // pushed (the ring write below is `i < count`), so slots >= count hold whatever
+      // the unselected builder left there. Matching them anyway let a slot that is
+      // never executed fire `debugSkipConsumeNow` and burn the one-shot
+      // `breakSkipOnce` ack -- so a later, REAL hit on that breakpoint would be
+      // skipped instead of halting. It was latent rather than visible because the FSM
+      // builders fill the dead slots with a COPY of slot 0, making the spurious match
+      // agree with the real one; the normal path, where dead slots hold stale crack
+      // results, could always mis-consume.
+      val slotLive = pushReg.valid && (U(i, 3 bits) < pushReg.payload.count)
       val matchBits = Bits(4 bits)
       for (slot <- 0 until 4)
-        matchBits(slot) := debugBreakEn(slot) &&
+        matchBits(slot) := slotLive && debugBreakEn(slot) &&
           (pushReg.payload.uops(i).pc === debugBreakPcs(slot))
       val firstMatch = OHMasking.first(matchBits)
       val matchSlot = OHToUInt(firstMatch).resize(2)
