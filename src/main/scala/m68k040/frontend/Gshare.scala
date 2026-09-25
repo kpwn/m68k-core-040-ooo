@@ -94,7 +94,26 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     val pht = Mem(UInt(2 bits), phtEntries) init Seq.fill(phtEntries)(U(2, 2 bits))
 
     // ---- index helper (combinational) ----
-    def indexOf(pc: UInt): UInt = fold(pc(31 downto 1)) ^ fold(ghr)
+    // HISTORY LENGTH USED IN THE INDEX IS CAPPED AT `idxBits`.
+    //
+    // It used to fold the whole `ghrBits`-wide GHR (16) into an `idxBits`-wide (11) index.
+    // That over-histories a 2048-entry table: a static branch's predictions scatter across
+    // 2^16 history contexts competing for 2^11 slots, so each counter is trained by a
+    // diluted mixture of contexts and saturates towards noise. The classic gshare sizing
+    // heuristic is history length ~ log2(entries), i.e. 11 here, not 16.
+    //
+    // This is aimed at the machine's LARGEST measured stall: silicon `perf` counters put
+    // branch mispredicts at 76.7 per 1000 retired instructions on the boot workload
+    // (sd 0.95% over three runs) which at ~12.9 cycles recovery is ~1 cycle per
+    // instruction, about 14% of all cycles -- more than the D-cache. `mispred/kinst` is a
+    // direct counter ratio, so unlike IPC this change is resolvable on the board.
+    //
+    // Purely local: the index WIDTH is unchanged, so none of the ~15 places that hardcode
+    // an 11-bit PHT index need touching (attempting to resize the table instead needs a
+    // parameterisation refactor -- see the frozen-width note in docs/memory).
+    val idxHistBits = scala.math.min(ghrBits, idxBits)
+    def foldedHistory: UInt = fold(ghr(idxHistBits - 1 downto 0))
+    def indexOf(pc: UInt): UInt = fold(pc(31 downto 1)) ^ foldedHistory
 
     // ---- ports (directionless plain wires, idle-defaulted with concrete zeros) ----
     val queryPc0    = UInt(32 bits); queryPc0.allowOverride;    queryPc0    := U(0, 32 bits)
