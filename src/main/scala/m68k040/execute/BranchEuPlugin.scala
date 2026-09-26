@@ -451,7 +451,42 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       val taken   = Bool()
       val redirect= Bool()
       val nextPc  = UInt(32 bits)
+      // ── MISPREDICT ATTRIBUTION (2026-09-26, branch-prediction track) ──────────
+      // `mispredict` above is ONE verdict over THREE independent failure modes, and
+      // the shipped silicon counters cannot separate them: OFF_PERF_MISPRED_UNCOND /
+      // _COND split only by brType, and BOTH are sourced from `debugBranchRetire`,
+      // which is gated on `isBtbBranch` and therefore EXCLUDES RETURNS entirely --
+      // while OFF_MISPRED_COUNT (`branchRedirect`) counts returns too. So a
+      // return/RAS bucket exists that neither class counter sees.
+      //
+      // These fields let a sim classify each mispredict exactly:
+      //   no prediction  : predTaken=0 on a resolved-taken branch  (BTB/FTB coverage)
+      //   wrong direction: predTaken =/= redirect                  (gshare / bimodal)
+      //   wrong target   : predTaken==redirect==1, predTarget=/=target (last-target BTB)
+      // and `ibranch`/`isReturn`/`btbTrained`/`phtValid` say WHICH predictor owned it.
+      // Pure wires off signals this stage already computes -- no new logic level, and
+      // nothing in hardware reads them (the same discipline as the fields above).
+      val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+      val mispredict = Bool()
+      val predTaken  = Bool()
+      val predTarget = UInt(32 bits)
+      val actTarget  = UInt(32 bits)
+      val ibranch    = Bool()
+      val isReturn   = Bool()
+      val phtValid   = Bool()
+      val brType     = UInt(2 bits)
+      val btbTrained = Bool()
     }
+    brDbg.robId      := s1Ctx.robId
+    brDbg.mispredict := s1Valid && mispredict
+    brDbg.predTaken  := u1.predTaken
+    brDbg.predTarget := u1.predTarget
+    brDbg.actTarget  := actualTarget
+    brDbg.ibranch    := u1.ibranch
+    brDbg.isReturn   := isReturn
+    brDbg.phtValid   := s1Valid && u1.phtValid
+    brDbg.brType     := brType
+    brDbg.btbTrained := isBtbBranch
     brDbg.valid    := s1Valid
     brDbg.pc       := u1.pc
     brDbg.cond     := u1.cond

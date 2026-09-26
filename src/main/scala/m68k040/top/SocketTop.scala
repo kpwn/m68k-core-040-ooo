@@ -137,7 +137,9 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new m68k040.frontend.RasPlugin(),
       new m68k040.frontend.GsharePlugin(retainRedirectHistory = ipcThroughput),
       new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true,
-        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput),
+        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput,
+        computeDirectTargets = ShippingCoreConfig.computeDirectTargets,
+        deferSlot1Uncond = ShippingCoreConfig.deferSlot1Uncond),
       new m68k040.decode.DecodeStage(allowSlot1Prediction = ipcThroughput,
         fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
@@ -621,7 +623,9 @@ object GenSocketTopVerilog {
     println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
-            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
+            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
+            s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
+            s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
