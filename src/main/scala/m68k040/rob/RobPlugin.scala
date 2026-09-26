@@ -47,7 +47,8 @@ object DebugHaltReasonCode {
 class RobPlugin(val detailedPerf: Boolean = false,
                 val pairCorrectBranch: Boolean = false,
                 val preparedRetireEntries: Int = 0,
-                val pcRangeEnable: Boolean = true) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
+                val pcRangeEnable: Boolean = true,
+                val lsOooIssue: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
   private var haltAfterLoadHoldWire: Bool = null
@@ -470,8 +471,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // cacheable access had ALREADY launched. Same discipline as `mispredictStore`:
     // RegInit(False) plus an alloc-time reset, so a never-allocated or re-used index reads
     // "no violation" rather than a stale True.
-    val orderViolated = Vec.fill(depth)(RegInit(False))
-    orderViolated.foreach(_.simPublic())
+    // Elaborated ONLY when the feature is on. Without the `if`, 32 registers plus a 32:1
+    // read mux plus the `orderRedirect` term all land in the flush path of a build that can
+    // never set them -- functionally inert but structurally present, which makes a knob-OFF
+    // netlist differ from master and contaminates every OFF baseline taken against it.
+    val orderViolated = if (!lsOooIssue) null else {
+      val v = Vec.fill(depth)(RegInit(False)); v.foreach(_.simPublic()); v
+    }
     mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
     // ── LUT-reduction ROB-fold Slice B (2026-08-08 area spec §5) ────────────────
     // WAS `Vec.fill(depth)(Reg(UInt(32 bits)))` (2048 FF + a 64:1 read mux per bit at
@@ -885,7 +891,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val lsOrderViolation = Flow(UInt(robIdW bits))
     lsOrderViolation.valid.allowOverride;   lsOrderViolation.valid := False
     lsOrderViolation.payload.allowOverride; lsOrderViolation.payload := U(0, robIdW bits)
-    lsOrderViolation.simPublic()
+    if (lsOooIssue) lsOrderViolation.simPublic()
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
     lsFaultCompletion.valid.allowOverride;            lsFaultCompletion.valid := False
     lsFaultCompletion.payload.robId.allowOverride;    lsFaultCompletion.payload.robId := U(0, robIdW bits)
@@ -2207,12 +2213,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     }
     // Latched BEFORE the alloc resets below so a same-cycle alloc to this index wins,
     // exactly as `mispredictStore`'s alloc-priority discipline requires.
-    when(lsOrderViolation.valid) { orderViolated(lsOrderViolation.payload) := True }
+    if (lsOooIssue) when(lsOrderViolation.valid) { orderViolated(lsOrderViolation.payload) := True }
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
-      orderViolated(tail) := False
+      if (lsOooIssue) orderViolated(tail) := False
       branchTakenStore(tail) := False
       btbIsBranchStore(tail) := False
       phtValidStore(tail)   := False
@@ -2240,7 +2246,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
-      orderViolated(tail + 1) := False
+      if (lsOooIssue) orderViolated(tail + 1) := False
       branchTakenStore(tail + 1) := False
       btbIsBranchStore(tail + 1) := False
       phtValidStore(tail + 1)   := False
@@ -3317,8 +3323,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Defined HERE, above `debugRestartPc`, because that mux READS it. A forward reference
     // would still compile -- this is a template body, not a method -- and would silently
     // bind `null`, so the ordering is load-bearing rather than stylistic.
-    val orderRedirect = retire0 && orderViolated(h0) && p0.last && (count > 1)
-    orderRedirect.simPublic()
+    val orderRedirect: Bool = if (!lsOooIssue) False else {
+      val r = retire0 && orderViolated(h0) && p0.last && (count > 1); r.simPublic(); r
+    }
     val debugStepRestartPc = Mux(retire1 && p1.last, p1.predNextPc, p0.predNextPc)
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
