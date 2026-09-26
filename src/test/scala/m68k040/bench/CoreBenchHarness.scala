@@ -2291,18 +2291,24 @@ trait CoreBenchHarness extends AnyFunSuite {
   def kBrCapacity(sites: Int = 256, iters: Int = 8, label: String = "br-cap"): Kernel = {
     val setup = Seq("lea 0x00300000,%sp", s"move.l #$iters,%d7", "moveq #1,%d1",
                     "moveq #0,%d0", "moveq #0,%d2")
-    // 6 bytes per site (two 2-byte ALU ops + a 2-byte bra.s) => the branch PCs
-    // advance 3 words at a time, which is coprime with the BTB/FTB index width.
+    // 6 bytes per site => the branch PCs advance 3 words at a time, which is coprime
+    // with any power-of-two index width, so the sites spread uniformly over the table
+    // instead of aliasing into a fraction of it (a 4-byte stride would only ever reach
+    // half the sets and would overstate the conflict).
+    //
+    // The hop JUMPS OVER a dead `add.l %d1,%d2`, and not merely to the next instruction,
+    // for two reasons. Encoding: a `bra.s` whose displacement is ZERO is the .W escape,
+    // so a byte branch to pc+2 does not assemble at all. Measurement: `%d2` then counts
+    // exactly the hops that FELL THROUGH, so `d2 == 0` proves every one of the
+    // `sites * iters` branches was actually taken.
     val chain = (0 until sites).map { i =>
-      s".Lc$i: add.l %d1,%d0 ; add.l %d1,%d2 ; bra.s .Lc${i + 1}"
+      s".Lc$i: add.l %d1,%d0 ; bra.s .Lc${i + 1} ; add.l %d1,%d2"
     }
     val src = (setup ++ chain ++ Seq(
       s".Lc$sites: subq.l #1,%d7 ; bne.w .Lc0", ".Lcend: bra.s .Lcend")).mkString(" ; ")
-    // Per iteration: sites * 3 macros + subq + bne.
-    Kernel(label, src, setup.size + iters * (sites * 3 + 2),
-      // Both accumulators are bumped once per site per iteration, so either one being
-      // short means the chain skipped a hop.
-      verifyRetirement = brProbeExpect(0 -> (iters.toLong * sites), 2 -> (iters.toLong * sites)))
+    // Per iteration: sites * (add + bra) + subq + bne. The skipped add never retires.
+    Kernel(label, src, setup.size + iters * (sites * 2 + 2),
+      verifyRetirement = brProbeExpect(0 -> (iters.toLong * sites), 2 -> 0L))
   }
 
   /** RETURN-ADDRESS-STACK probe: `depth` nested `bsr`/`rts` pairs per iteration.
