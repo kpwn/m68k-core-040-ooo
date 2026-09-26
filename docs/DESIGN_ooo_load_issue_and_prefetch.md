@@ -77,7 +77,32 @@ no writeback, no ROB completion; the demand load replays in order
 - ⛔ **The kill is mandatory.** A refill to MMIO reads a device register — pops a
   FIFO, clears a status bit. That is the DMA/polling shape that wedged the board.
   An L1 *lookup* is harmless; the *bus transaction* is not.
-- ✅ **Table walks for a prefetch are ALLOWED, and may be PRECISE** (owner decision).
+### The side-effect rule (keep the machinery reusable)
+
+**A prefetch may have exactly the side effects its backing instruction would have
+had. A prefetch with NO backing instruction may have NONE.**
+
+Side effects are therefore a property of the REQUEST, not of "prefetch" as a
+mechanism. Carry a `demandBacked` bit on the prefetch request and gate on it, so the
+same machinery serves a future sequential/stride prefetcher without being unsafe:
+
+| | DEMAND-BACKED (a dispatched load is blocked) | SPECULATIVE (predicted address, no instruction) |
+|---|---|---|
+| table walk | allowed, PRECISE | **no walk** — drop on a DTLB miss |
+| sets U | **yes, and it is correct** | **never** |
+| refill on cacheable miss | yes | yes |
+| bus access when INHIBITED | never | never |
+| fault delivery | never (deferred to demand issue) | never |
+
+The asymmetry is the whole point: a demand-backed prefetch is the SAME access the
+load will make, merely early, so it may touch page tables exactly as that load
+would. A speculative prefetch is a GUESS — walking a guessed address would mark
+pages Used that nothing ever accessed, and could walk arbitrary page tables on a
+bad prediction. Marking U there is not "a harmless mistake", it is unbacked state
+change, and it is also the thing that makes a predictor hard to reason about later.
+
+- ✅ **Table walks for a DEMAND-BACKED prefetch are ALLOWED, and may be PRECISE**
+  (owner decision).
   The prefetch is for a load that is ALREADY DISPATCHED and sitting in the IQ -- not
   a wrong-path guess -- so it will execute unless a flush kills it. The walk is
   therefore the SAME walk the demand load would perform, just early: setting **U** is
