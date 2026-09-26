@@ -162,7 +162,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
-        loadBypassUnreadyLoad = false),
+        loadBypassUnreadyLoad = SocketTopConfig.LS_OOO_ISSUE),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
@@ -553,6 +553,14 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   * task's choice -- it is the only value that elaborates at all. */
 object SocketTopConfig {
   val OPEN1_GATE_DISPATCH: Boolean = false
+  /** OUT-OF-ORDER LS ISSUE (`IssueQueuePlugin.loadBypassUnreadyLoad`): an LS slot may be
+    * selected unless a strictly older LS slot holds an unready STORE. Relaxes the
+    * oldest-occupied-only rule while keeping inhibited accesses as two-way barriers.
+    *
+    * A BUILD-TIME SWITCH defaulted OFF. `LS_OOO_ISSUE=1` turns it on for a build; flip the
+    * default here once it is board-proven. It is reported in SHIPPING_CONFIG so a build can
+    * always be identified afterwards -- the lesson from `SPEC_LOAD_WAKEUP`, which could not. */
+  val LS_OOO_ISSUE: Boolean = sys.env.get("LS_OOO_ISSUE").contains("1")
 }
 
 object SocketIpcProfile {
@@ -618,7 +626,8 @@ object GenSocketTopVerilog {
     // NOT a usable provenance check -- SpinalHDL renames/optimises those away, so an
     // absent name proves nothing about what was built. The generator saying what it built
     // is the only cheap check that cannot lie.
-    println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
+    println(s"SHIPPING_CONFIG lsOooIssue=${SocketTopConfig.LS_OOO_ISSUE} " +
+            s"ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
