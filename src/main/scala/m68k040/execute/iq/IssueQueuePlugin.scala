@@ -460,26 +460,6 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val sbFpBusyEff   = sbFp.busy   & ~sbFpClr
     val sbFpccBusyEff = sbFpcc.busy & ~sbFpccClr
 
-    // ── EFFECTIVE LS WAKE for the dependency clear (`specLoadWakeup`) ───────────────
-    // ONE payload for both announces, resolved before it fans out to the 16 slots. THE
-    // REAL ANNOUNCE ALWAYS WINS: it is an irrevocable promise of a writeback, and dropping
-    // it would leave a consumer's wait bit set with nothing left to clear it -- a hang.
-    // Dropping a SPECULATIVE announce is free by comparison: the LS EU holds it for every
-    // cycle the load occupies P4, so the very next cycle re-announces, and if the load has
-    // left P4 the consumer simply waits for the confirm exactly as it does today.
-    //
-    // `lsSpecOnly` says this cycle's effective wake is the SPECULATIVE one, and it is what
-    // restricts the clear to LS-class slots and keeps store data (LS_B) out. Both are
-    // shallow (a flop-driven announce plus one AND), so the deep `lsWakeup` arc gains a
-    // single mux level here rather than a comparator at every slot.
-    val lsSpecOnly: Bool = if (!specLoadWakeup) False
-                           else lsWakeupSpecPort.valid && !lsWakeupPort.valid
-    val lsWakeEffValid: Bool = if (!specLoadWakeup) lsWakeupPort.valid
-                               else lsWakeupPort.valid || lsWakeupSpecPort.valid
-    val lsWakeEffPayload: UInt = if (!specLoadWakeup) lsWakeupPort.payload
-                                 else Mux(lsWakeupPort.valid, lsWakeupPort.payload,
-                                          lsWakeupSpecPort.payload)
-
     // ---- Dynamic-completion (variant A) LS scoreboard ----
     // lsBusy[p] => int physreg p is produced by an in-flight LS LOAD that has NOT
     // yet completed. A consumer reading such a physreg is held NOT-ready until the
@@ -1020,12 +1000,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // faulting load and raises its exception.
     val specPendEff: Bits = if (!specLoadWakeup) B(0, physIntN bits) else {
       val pend  = Reg(Bits(physIntN bits)) init 0
-      // `lsSpecOnly`, not `lsWakeupSpecPort.valid`: on a cycle the real announce wins, the
-      // speculative clear did not happen either, so arming a hold for it would be tracking
-      // a release that was never granted. (It would be harmless -- nothing was released, and
-      // the confirm clears the bit -- but the two must agree or the invariant stops being
-      // checkable.) This feeds a register, so the extra term costs no path depth.
-      val setOh = UIntToOh(lsWakeupSpecPort.payload, physIntN).andMask(lsSpecOnly)
+      val setOh = UIntToOh(lsWakeupSpecPort.payload, physIntN).andMask(lsWakeupSpecPort.valid)
       // The CONFIRM is the ordinary `lsWakeup` port, not a third one: it is already the
       // announce every consumer's dependency clear keys off, it is irrevocable, and it
       // fires for exactly the pdst this port predicted. Its `earlyAutoAnWriteback` arm
@@ -1561,41 +1536,29 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val dynClear = Vec(slots.map { s =>
       val u = s.hot
       val c = Bits(DynWait.width bits)
-      val lsW   = lsWakeEffValid
+      val lsW   = lsWakeupPort.valid
       val cpW   = cplxWakeupPort.valid
-      // ── SPECULATIVE LS clear (`specLoadWakeup`) ────────────────────────────────────
-      // `isLs(u)` is the WHOLE safety argument, not a refinement of it: only the LS port
-      // re-checks the prediction before a uop reaches its EU (`lsSpecBlocked`), and only
-      // the LS port issues strictly in program order, which is what makes holding a uop
-      // there deadlock-free. Releasing an ALU/branch/CPLX consumer on this port would let
-      // it capture a physical register the load has not written -- silent corruption, not
-      // a lost cycle.
-      //
-      // ADDRESS OPERANDS ONLY. `psrcB` on an LS uop is STORE DATA, and it stays out: that
-      // dependency already has a one-cycle-early release inside the EU
-      // (`LateStoreDataPorts.queryReadyNext`, on the REAL wake), and `earlyStoreAddress` is
-      // built on a store being selectable while LS_B is still set -- so speculating on it
-      // would make the re-check block exactly the early-address issue that option exists
-      // to allow.
-      //
-      // WHY THIS RIDES ONE SHARED COMPARATOR (`lsWakeEff*`) INSTEAD OF ADDING A SECOND.
-      // The first version ORed a second 6-bit compare against the speculative payload into
-      // each of these bits. That is 32 extra comparators (16 slots x 2 sources) hung on
-      // `lsWakeup.payload` -- which is LATE, because `s1AnEarlyFire` feeds it -- and the
-      // arc `nextIntWake -> s1AnEarlyFire -> lsWakeup.payload -> compare -> dynWait ->
-      // dynWaitAny` is already one of the tightest in the machine. Measured post-synthesis
-      // at 200 MHz: WNS -1.186 ns against the reference -0.284, all of it on that one arc
-      // (the reference's own worst CPU path is -0.235). Merging the two announces into one
-      // effective payload BEFORE the fanout keeps the per-slot structure bit-for-bit the
-      // shape it already had: one comparator, with the speculative qualifier folded in
-      // beside `lsW`/`psrcAValid` in the same LUT.
-      val lsRealOnly: Bool = if (!specLoadWakeup) True else !lsSpecOnly
-      def lsClr(read: Bool, tag: UInt, spec: Boolean): Bool = {
-        val eligible = if (!specLoadWakeup) True
-                       else if (spec) isLs(u) || lsRealOnly
-                       else lsRealOnly
-        lsW && read && eligible && (tag === lsWakeEffPayload)
-      }
+      // SPECULATIVE LS clear (`specLoadWakeup`). Gated on `isLs(u)` -- and that gate is
+      // the WHOLE safety argument, not a refinement of it. Only the LS port re-checks the
+      // prediction before the uop reaches its EU (see `lsSpecBlocked`), and only the LS
+      // port issues strictly in program order, which is what makes holding a uop there
+      // deadlock-free. Releasing an ALU/branch/CPLX consumer on this port would let it
+      // capture a physical register the load has not written: silent corruption, not a
+      // lost cycle. `isLs` reads the stored `isLsClass` flop, so this adds no opcode
+      // decode to the clear cone. Idle (False) when the option is off.
+      val lsSpecW = if (!specLoadWakeup) False else lsWakeupSpecPort.valid && isLs(u)
+      // ADDRESS OPERANDS ONLY (psrcA = base, psrcC = index). `psrcB` on an LS uop is
+      // STORE DATA, and it deliberately stays out of this: the store-data dependency
+      // already has its own one-cycle-early release inside the EU
+      // (`LateStoreDataPorts.queryReadyNext`, gated on the REAL `lsWakeup`), and
+      // `earlyStoreAddress` is built on a store being SELECTABLE while LS_B is still set.
+      // Speculating on LS_B would make the re-check below block exactly the early-address
+      // issue that option exists to allow -- a regression, for a dependency that is not on
+      // the address chain this whole mechanism targets. It also keeps the re-check to two
+      // physical-register lookups instead of three.
+      def lsClr(read: Bool, tag: UInt, spec: Boolean): Bool =
+        (lsW && read && (tag === lsWakeupPort.payload)) ||
+          (if (!spec) False else lsSpecW && read && (tag === lsWakeupSpecPort.payload))
       c(DynWait.LS_A)      := lsClr(u.psrcAValid, u.psrcA, spec = true)
       c(DynWait.LS_B)      := lsClr(srcBIsReg(u),  u.psrcB, spec = false)
       c(DynWait.LS_C)      := lsClr(u.psrcCValid, u.psrcC, spec = true)
