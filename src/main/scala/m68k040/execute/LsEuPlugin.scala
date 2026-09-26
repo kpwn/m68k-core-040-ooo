@@ -3494,53 +3494,57 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val p4Ready = !p4Valid || p4CanLeave
 
     // ── SPECULATIVE LOAD WAKEUP (`specLoadWakeup`) ─────────────────────────────────
-    // Announce the pdst of an ordinary aligned load ONE CYCLE EARLY -- in the cycle it is
-    // handed to the D-cache (`alignedEnq`, which under `alignedLoadFallThrough` is also
-    // the cycle `dcache.loadCmd` fires) rather than in the cycle its response arrives.
+    // Announce the pdst of an ordinary aligned cacheable load ONE CYCLE EARLY -- while it
+    // sits in P4, the cycle before its D-cache response could arrive -- instead of waiting
+    // for `wakeup`'s guaranteed-next-cycle announce.
     //
-    // WHAT IS ALREADY KNOWN HERE, and therefore NOT being predicted: the DTLB translation
-    // SUCCEEDED (a faulting translation completes in the front path and never reaches
-    // `alignedEnq`); the access is aligned and single-line (`alignedEnq`, not
-    // `alignedEnqSplit`); the SQ holds no overlapping store (a full forward completed in
-    // the front path; a partial overlap is still retrying in `mustRetry`); the page is
-    // CACHEABLE (`!p4Inhibited`); no flush or exception hand-off is in progress
-    // (`alignedEnq` is inside `when(p4Valid && !sqFlushSig && !excActive)`).
+    // WHAT IS ALREADY KNOWN HERE, and therefore NOT predicted: the DTLB translation
+    // SUCCEEDED (a faulting translation completes in the XLATE stage via
+    // `captureFaultFront` and never reaches P4 at all); the access is aligned and
+    // single-line (`!twoAccess`); the page is CACHEABLE. THE ONE THING PREDICTED is that
+    // the D-cache answers next cycle, i.e. an L1 hit. MEASURED on `chase-pure`
+    // (L1-resident by construction): 1535 of 2052 loads answer in exactly 1 cycle.
     //
-    // THE ONE THING PREDICTED is that the D-cache answers NEXT cycle, i.e. an L1 hit.
-    // MEASURED on `chase-pure` (L1-resident by construction): 1535 of 2052 loads answer
-    // in exactly 1 cycle. A miss, or a refill whose AXI response errors, breaks it.
+    // ═══ THE PREDICATE IS DELIBERATELY SHALLOW, AND THAT IS A TIMING FIX, NOT A STYLE
+    // CHOICE ═══════════════════════════════════════════════════════════════════════════
+    // The first version gated this on `alignedEnq` -- "the cycle the load is actually handed
+    // to the ring" -- which reads exactly right and cost 2.5 ns of FMax. `alignedEnq` sits
+    // under `p4LaunchOk`, and that pulls in `p4AtRobHead` (a robId compare against the ROB
+    // head), `sq.io.barrier.olderInhibitedStore`, `irqPreemptPendingIn`,
+    // `debugHaltImminentIn` and `alignedCanEnq`. Feeding that into the IQ's per-slot
+    // dynamic-wait CLEAR -- a tight reg-to-reg path across all 16 slots -- produced a
+    // single 31-logic-level cone
+    //   `p4Ctx_xlate_front_robId_reg -> ... -> IssueQueuePlugin lines_*_dynWaitAny_reg`
+    // at post-synthesis WNS -2.832 ns against the reference's -0.284, with 9,700 failing
+    // endpoints against 241. Every other failing path in that build was a pre-existing
+    // MIG/ETH/SD CDC path at -0.373 or better: ONE cone, all of the damage.
     //
-    // WHY THIS IS SAFE. This port only makes a consumer SELECTABLE; the IQ holds it at
-    // the LS issue register until `wakeup` -- the existing irrevocable announce -- fires
-    // for the same pdst. On a miss the consumer simply waits there (exactly the cycles it
-    // would have waited in the queue); on a FAULT `wakeup` never fires for that pdst and
-    // the consumer is never released at all, which is bit-for-bit today's behaviour
-    // (a faulted load never clears `lsBusy` either). No wrong value can be captured
-    // because nothing downstream of the hold ever sees the uop.
+    // So this reads ONLY flop outputs of the P4 context -- one or two LUT levels, the same
+    // depth as the ordinary `wakeup` port it rides beside -- and drops the launch gating
+    // entirely. That is sound because the IQ's re-check pins a released consumer to the
+    // CONFIRM, whatever cycle the confirm lands on: announcing before the load has actually
+    // launched (a still-retrying SQ-overlap query, a full ring, an inhibited-store barrier)
+    // only lengthens the hold. Announcing EARLY is always safe here; announcing DEEP is not.
+    //
+    // Consequences of dropping the gating, both benign:
+    //   * the announce is held for as many cycles as the load occupies P4. Setting the
+    //     outstanding bit is idempotent, so a repeated announce is a no-op.
+    //   * a load that turns out to be a FULL SQ FORWARD completes in the front path and
+    //     confirms in the SAME cycle this announces. The IQ applies the clear after the set
+    //     (`(pend | set) & ~clr`), so the confirm wins and no hold is ever armed -- which is
+    //     correct: the value really is written.
     //
     // `needsSupervisor && !supervisor` is excluded because such an entry owes a later
-    // privilege check and is barred from the ring's out-of-order early writeback; the
-    // prediction would simply be wrong for the whole extra wait.
+    // privilege check and is barred from the ring's out-of-order early writeback, so the
+    // prediction would be wrong for the whole extra wait. It is a flop like the rest.
     val specWakeFire: Bool = if (!specLoadWakeup) False else {
-      alignedEnq && !p4Inhibited && (p4Front.memOp === MemOp.LOAD) &&
-        p4Front.pdstValid && !p4Front.ccrRestore &&
-        !(p4Front.needsSupervisor && !p4Front.supervisor)
+      p4Valid && (p4Front.memOp === MemOp.LOAD) && p4Front.pdstValid &&
+        !p4Front.ccrRestore && !p4Front.twoAccess &&
+        !(p4Front.needsSupervisor && !p4Front.supervisor) &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
     }
     wakeupSpecPort.valid   := specWakeFire
     wakeupSpecPort.payload := p4Front.pdst
-    GenerationFlags.simulation {
-      if (specLoadWakeup) {
-        // The speculative announce must never COINCIDE with the confirm for the same pdst:
-        // the IQ's re-check would then see the bit set and cleared in one cycle and the
-        // hold would depend on which update won. Rename makes it impossible (two in-flight
-        // writers never share a pdst), so assert it rather than handle it.
-        when(specWakeFire && wakeupPort.valid) {
-          assert(wakeupPort.payload =/= p4Front.pdst,
-            "LsEuPlugin: speculative load wakeup announced the pdst the confirm is " +
-              "retiring in the same cycle", FAILURE)
-        }
-      }
-    }
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of
