@@ -240,12 +240,86 @@ the uop. Then:
   cannot be restarted at its own PC without re-running the macro's earlier side effects,
   which is the `inhibited-load-irq-replay` hazard. Already priced at 0.49pp.
 
+### CORRECTION (2026-09-26, on trying to implement candidate 3): its price was WRONG
+
+Candidate 3 as priced above **does not work**, and the error is in the mechanism, not the
+gate count. It said "when it reaches the ROB head the ROB flushes and restarts at its own
+PC". **The marked op can never reach the ROB head -- that IS the deadlock.** `retire0`
+requires `completes(h0)`, the marked op never completes, and the head is held by the older
+op stuck behind P4. A `replayAtHead(h0)` term can therefore never fire. The park-guard half
+(the IQ bypass bit) is still right; the recovery half is not.
+
+The corrected form has to fire the flush EARLY, before the op is at the head. That is
+exactly what `RobPlugin.scala:2396-2420` records as investigated in depth and found UNSAFE
+to bolt on:
+
+> `RatTable.io.rollback` / `Freelist.io.flush` are each a SINGLE GLOBAL "restore to the
+> committed shadow" [...] There is no existing hook to roll back "only what's younger than
+> robId X" while leaving [head, X) untouched. Firing today's `flushing` (doFlushReg) EARLY,
+> before the branch reaches head, therefore ALSO discards every not-yet-retired OLDER entry
+> [...] Redirecting instead to the current committed PC avoids that corruption but
+> degenerates into "eagerly squash everything in flight" [...] A real fix needs actual
+> per-branch (or small-N) RAT/Freelist checkpoint+restore [...] properly scoped as its own
+> follow-up.
+
+And the safe variant it names (restart at the committed PC, squashing everything in flight)
+carries a second problem this bug cannot dodge: the restart PC is then the HEAD's PC, and
+the head is not the marked op. The head can be a MID-MACRO uop whose earlier siblings have
+already retired -- e.g. in a mem-dest RMW crack (load, op, store) the load and the ALU op
+retire and the STORE is left as the head. Restarting at that macro's PC re-executes the
+retired load and the An auto-update: the `inhibited-load-irq-replay` corruption family
+verbatim. A macro-boundary-safe restart PC at an ARBITRARY head does not exist in this ROB.
+Note the asymmetry with `bafd348b`: its `firstOfInstr` precondition guarantees the *marked*
+op is a macro boundary, which is what `orderRedirect` needs, and says nothing about the
+head.
+
+**Revised price for candidate 3: not ~40 flop bits. It is the per-robId RAT/Freelist
+checkpoint+restore lift that `RobPlugin` explicitly scopes as its own follow-up, plus a
+macro-boundary-safe arbitrary-head restart PC that does not exist.** A project, not a
+guard, and squarely inside the most defect-dense path in the core.
+
+### Candidate 4 -- P3<->P4 SWAP (zero new state, and still not sufficient)
+
+Worth recording because it is the cheapest thing that looks like it works. P3's register has
+exactly ONE write source today (`p3Ctx := txOut`); P4's capture is `p4Ctx.xlate := p3Ctx`.
+So "let `p3ToP4` fire even when P4 holds a parked inhibited op, and write the parked op back
+into P3" is one extra enabling term plus one extra source on the P3 write: **zero new flop
+bits**, ~243 LUT6 for the 2:1 mux, on the stage with the MOST slack in the LS pipe
+(0.442-0.490 ns) and on its register-to-register write path. The discarded `fwd*` verdict
+costs nothing -- the op re-queries from P3, which `p4RetryQ` already does routinely. The
+D-cache early-probe token is armed at P2 (`probeWanted = normalReqArm && tIsLoad`) and keyed
+by token+vaddr, so it survives the round trip exactly as it survives parking today.
+
+**It is still not sufficient.** One swap lets exactly ONE older op past. With two inhibited
+ops parked -- which the reproducer's two device loads per iteration produce -- the machine
+re-deadlocks one stage further back: P4 holds the older parked inhibited op, P3 holds a
+younger op that must not overtake it, and the op older than BOTH is in P2T needing a P3 that
+the younger op occupies.
+
+That generalises, and it is the real constraint on every candidate: **letting N older ops
+overtake a parked inhibited op requires N slots of somewhere-else to put the parked op, and
+N is bounded only by the LS pipe depth.** A swap is a 1-deep reorder buffer implemented
+in-place. Depth 4 is the requirement for all of them; candidate 1 is the honest way to spend
+it.
+
 ### Verdict
 
-**Cheapest: candidate 3, by an order of magnitude** -- ~40 flop bits and ~2 LUTs against
-candidate 1's 436 bits and ~130 LUTs, and it is the only one of the three that makes the
-P4 cone SHORTER instead of longer. It is also the smallest conceptual change: a guard
-that forbids the one park that is unsafe, rather than a new buffer or a new flush mode.
+**SUPERSEDED by the CORRECTION above.** What follows was the verdict before candidate 3's
+mechanism was checked; it is kept because its tie-breaker reasoning still stands and now
+selects candidate 1.
+
+~~**Cheapest: candidate 3, by an order of magnitude**~~ -- candidate 3 does not work as
+priced. **RECOMMENDED: candidate 1, the depth-4 side buffer.** It is the only one of the
+four that is simultaneously sound, self-contained in the LS EU, and clear of the
+precise-state/replay family: 436 flop bits (+0.48% of the core's 90,105), ~130 LUT, and it
+DOES widen the P4 cone -- which is now a cost to accept rather than a reason to prefer
+something else, because the alternatives are a ROB checkpoint project (3) or an
+insufficient reorder depth (4).
+
+**The tie-breaker reasoning below is what now selects it.** Its FIRST clause favoured
+candidate 3 on the P4 cone; with candidate 3 gone, the SECOND clause decides, and it points
+at candidate 1: it keeps every change inside the LS EU and touches no precise-state
+machinery.
 
 **If 1 and 3 were close, the tie-breaker is which side of the P4 cone the change lands
 on.** P4 has 0.050 ns of slack at 14 levels and is the only datapath-limited stage in the
@@ -256,7 +330,7 @@ ROB's don't-commit/flush path -- the same family that produced `inhibited-load-i
 and the FSAVE/CCR silent-corruption classes. An owner who weights correctness risk above
 timing should take candidate 1 despite the cone.
 
-### NOT IMPLEMENTED, and why
+### NOT IMPLEMENTED, and why (pre-correction reasoning; the correction above is the current one)
 
 Candidate 3 is small in gates but it spans three plugins (IQ bypass bit, LS EU P4 guard,
 ROB replay-at-head) and its risk sits in the ROB precise-state path, which cannot be
