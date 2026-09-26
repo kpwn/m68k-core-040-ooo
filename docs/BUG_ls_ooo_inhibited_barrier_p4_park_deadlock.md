@@ -1,7 +1,11 @@
 # BUG: with `lsOooIssue` ON, the inhibited memory barrier PARKS IN P4 and starves the
 # ROB head -- the third instance of one circular wait
 
-**Status**: OPEN. Reproducer committed and RED BY DESIGN with the knob ON:
+**Status**: OPEN, and **PRE-EXISTING -- not caused by the barrier work**. Reproduced on
+`aa312145` (before `b4fc15db`) with the IQ relaxation alone and no barrier code present;
+see the measured table below. Likely the mechanism behind the recorded silicon wedge
+attributed to `loadBypassUnreadyLoad`. Reproducer committed and RED BY DESIGN with the knob
+ON:
 `src/test/scala/m68k040/fuzz/LsOooInhibitedOrderSpec.scala` (tagged `VerilatorTest`, so
 it is not in `test-fast`). The shipping default (`FUZZ_LS_OOO` unset / `lsOooIssue =
 false`) is unaffected and the spec PASSES there. No RTL fix yet; the candidates are
@@ -67,8 +71,9 @@ different in-order structure:
 
 | attempt | in-order structure the waiter occupied | symptom |
 | --- | --- | --- |
-| pre-`dbff8619` | the ring SEND pointer | 3 corpus programs hang, "parked in P2 for 20000 cycles" |
-| `dbff8619` (current) | the P4 stage itself | this bug |
+| **pre-barrier, i.e. `aa312145` and master** | **the P4 stage itself** | **this bug -- see below, it is PRE-EXISTING** |
+| pre-`dbff8619` (barrier, first revision) | the ring SEND pointer | 3 corpus programs hang, "parked in P2 for 20000 cycles" |
+| `dbff8619` (current) | the P4 stage itself, still | this bug, unchanged |
 
 ## Why the knob OFF is immune, and why this is not an exotic corner
 
@@ -100,6 +105,53 @@ them to complete. Same cycle, fourth edge.
 
 So the waiter must be out of the ring's send order **and** out of its completion order.
 That is what "a side buffer" has to mean; a ring slot is not one.
+
+## MEASURED: the P4 edge is PRE-EXISTING, and it gives the silicon wedge a mechanism
+
+The barrier work is **exonerated as the cause**. The head gate is already on `aa312145`
+(the commit before `b4fc15db`):
+
+    aa312145 LsEuPlugin.scala:3367  val p4AtRobHead = robHeadValidIn && (p4Front.robId === robHeadIn)
+    aa312145 LsEuPlugin.scala:3407  val p4LaunchOk  = Mux(p4Inhibited,
+    aa312145 LsEuPlugin.scala:3408      p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe, ...)
+
+Reproduced there directly. Branch `probe/p4-park-deadlock-aa312145` (commit `85f2b70b`,
+NOT for merge) carries `LsOooInhibitedOrderSpec` and its two sim taps on top of
+`aa312145`, with its two `orderViolationPort` references removed because that port does not
+exist until `b4fc15db`, plus one harness line -- `new IssueQueuePlugin(loadBypassUnreadyLoad
+= fuzzLsOoo)` -- which is the only way to reach the relaxation at all, since
+`loadBypassUnreadyLoad` defaults to FALSE and nothing on that commit turns it on. On
+`aa312145`, `LsEuPlugin` has no `lsOooIssue` parameter, so `FUZZ_LS_OOO=1` there arms the
+**IQ relaxation alone** -- strictly less than on the branch, where the same variable also
+arms the LS-side barrier.
+
+| build | `loadBypassUnreadyLoad` | result |
+| --- | --- | --- |
+| `aa312145` + probe | ON | **DEADLOCK**, same shape, same robIds, same cycle |
+| `aa312145` + probe | OFF (default) | PASS, 229 cycles |
+| `perf/ooo-load-issue` `92a89e98` | ON | DEADLOCK |
+| `perf/ooo-load-issue` `92a89e98` | OFF (default) | PASS, 229 cycles |
+
+The knob-ON dump on `aa312145` is byte-identical in every live field
+(`head=3 s1(rob=11) t(rob=9) tx(rob=5) p3(rob=3) p4(rob=7)`, `p4Inhibited=true`,
+`p4AtRobHead=false`, ring empty, SQ empty, `loadBusy=false`, trip at cycle 5031); only
+never-written ring-slot registers differ, which is simulator randomisation of invalid
+entries. The knob-OFF numbers are identical on both commits down to the launch cycles and
+robIds -- an independent second measurement that the barrier costs nothing on this program.
+
+**So the barrier did not introduce this. It inherited it.** What `dbff8619` fixed was a
+SECOND edge of the same cycle that its own earlier revision had added at the ring send; the
+P4 edge predates the whole barrier and is in master today, reachable the moment
+`loadBypassUnreadyLoad` is enabled.
+
+**This gives the board finding a mechanism.** `loadBypassUnreadyLoad` is recorded as the
+SOLE wedge on silicon and recorded as NOT rescued by a hit gate. Both halves follow: the
+deadlock is about which op OCCUPIES P4, not about whether that op hits, so a hit gate
+cannot touch it; and a device access sitting behind an older in-flight LS op wedges with no
+barrier code present at all. The wedge therefore has a mechanism and a candidate fix rather
+than a standing prohibition -- but note this is a SIM mechanism that MATCHES the recorded
+silicon symptom, not a silicon confirmation. Confirming it on the board needs a build with
+the relaxation on, which is the owner's call.
 
 ## Candidates, priced at elaboration level (2026-09-26, no Vivado -- the lock was held)
 
