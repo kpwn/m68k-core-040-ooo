@@ -1583,6 +1583,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       ((alignedCount <= U(alignedDepth - 2, alignedCount.getWidth bits)) ||
        ((alignedCount === U(alignedDepth - 1, alignedCount.getWidth bits)) && alignedRspFire))
     alignedCount.simPublic(); alignedFull.simPublic(); alignedEnq.simPublic()
+    // Sim-only ring observability for the directed inhibited-ordering test
+    // (LsOooInhibitedOrderSpec): it must check, AT THE LAUNCH CYCLE, that no
+    // program-OLDER entry is still resident -- which needs per-entry robId and the
+    // poison bit, not just an occupancy count. (`alignedValid`/`alignedSent` are
+    // already tapped a few lines below.) Taps only; zero synth cost -- both signals
+    // are already READ by `lsOooViolation`, so nothing is kept alive that synthesis
+    // would otherwise prune.
+    alignedPoisoned.foreach(_.simPublic())
+    alignedMem.foreach(_.bk.robId.simPublic())
     alignedSendValid.simPublic(); alignedRspFire.simPublic(); alignedEnqSplit.simPublic()
     alignedCanEnqSplit.simPublic(); alignedSendHeld.simPublic()
     // Ring bookkeeping observability: needed to diagnose a SEND-side stall from a
