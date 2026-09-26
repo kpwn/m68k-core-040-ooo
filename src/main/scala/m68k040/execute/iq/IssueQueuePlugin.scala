@@ -968,62 +968,45 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // cycle earlier than the non-speculative path can ever manage, and not one cycle
     // earlier than the data exists.
     //
-    // `specPend[p]` is the prediction's outstanding-set: set by the speculative announce,
-    // cleared by the real one. THE CLEAR IS PURELY REGISTERED -- there is deliberately no
-    // same-cycle "the confirm is firing now, let it through" bypass, and an earlier revision
-    // that had one was WRONG in a way worth recording, because it cost three lock-step
-    // divergences (`fx-mi-cmp-src`, `fx-mi-movea-src`, `fx-mi-alu-order`: dut A2=0xffff867a
-    // against oracle 0xffffdead, i.e. a load from an address built out of a register that
-    // had not been written yet).
+    // THE OUTSTANDING-SET IS `lsBusy`, NOT A NEW BITMAP -- and that is the third timing
+    // lesson of this mechanism, not a tidy-up. An earlier revision kept its own `specPend`
+    // register, set by the speculative announce and cleared by the real one. The clear was
+    // `UIntToOh(lsWakeup.payload, physIntN)`: a 54-output decoder in which every output is a
+    // LUT of all six payload bits, so it added FIFTY-FOUR loads to each bit of
+    // `lsWakeup.payload` -- a net that is already late (`s1AnEarlyFire` feeds it) and already
+    // high-fanout (the 16 slots' clear comparators). Measured fanout on that bit went to 73,
+    // and its own net delay to 0.264 ns, dragging the whole `-> dynWaitAny` arc with it.
     //
-    // The confirm (`lsWakeup` under `earlyIntWakeup`) announces a writeback that lands in
-    // the PRF bypass the NEXT cycle, not this one. So the cycle to release a consumer in is
-    // the cycle AFTER the confirm -- which is exactly what a registered clear gives, for
-    // free. The bypass looked free because it is unreachable on a HIT (the consumer cannot
-    // reach this register before the confirm; the announce is only one cycle ahead), and
-    // `chase-pure` is 99.6% hits, so it measured perfectly and was silently wrong. It is
-    // reachable on a MISS, where the consumer is already parked here when the confirm
-    // finally arrives -- and there it released the uop one cycle early, straight into a
-    // stale register read.
+    // `lsBusy` is that set already. It means exactly "physreg p is produced by an in-flight
+    // LS load that has not completed", it is SET AT PUSH (earlier and broader than any
+    // announce, which only makes the check more conservative) and it is cleared by
+    // `when(lsWakeup.valid) { lsBusy(payload) := False }` -- the same 6-to-54 decoder,
+    // already present in the shipped design, with no new load on the payload at all.
     //
-    // Nothing is lost: on the hit path the register has already cleared by the time the
-    // consumer arrives, so the full speculated cycle is still won.
+    // The equivalence is exact where it matters. A consumer only reaches this register if
+    // its dependency was cleared, and there are only two ways that happens: the REAL wake,
+    // after which `lsBusy(p)` is already 0 and the uop passes straight through; or the
+    // SPECULATIVE announce, after which `lsBusy(p)` is still 1 and the uop is held. So
+    // `lsBusy(psrc)` is 1 precisely when the release was speculative and unconfirmed --
+    // which is the whole question this gate asks.
     //
-    // A uop whose sources are still pending is simply NOT PRESENTED: `lsPiped.valid` drops
-    // and the register does not advance, so nothing downstream ever sees it and no wrong
-    // value can be captured. Cost of a broken prediction = the cycles the consumer would
-    // have spent waiting in the queue anyway. On a FAULTING load the confirm never comes
-    // and the consumer is held until the flush -- which is exactly today's behaviour for a
-    // faulted load (its `lsBusy` bit is never cleared either), and it cannot deadlock: the
-    // held uop is younger than the load, every older LS uop has already issued (in-order
-    // LS select), and no other issue port is affected, so the ROB head always reaches the
-    // faulting load and raises its exception.
-    val specPendEff: Bits = if (!specLoadWakeup) B(0, physIntN bits) else {
-      val pend  = Reg(Bits(physIntN bits)) init 0
-      val setOh = UIntToOh(lsWakeupSpecPort.payload, physIntN).andMask(lsWakeupSpecPort.valid)
-      // The CONFIRM is the ordinary `lsWakeup` port, not a third one: it is already the
-      // announce every consumer's dependency clear keys off, it is irrevocable, and it
-      // fires for exactly the pdst this port predicted. Its `earlyAutoAnWriteback` arm
-      // announces a register that is never speculatively woken, so an extra clear from it
-      // is at worst a no-op.
-      val clrOh = UIntToOh(lsWakeupPort.payload, physIntN).andMask(lsWakeupPort.valid)
-      pend := (pend | setOh) & ~clrOh
-      // A flush retires every speculative announce: the ring entries it poisons will
-      // never produce a confirm, and the physical registers they named are rolled back
-      // and re-handed out by the freelist. Leaving a bit set would block an unrelated
-      // future consumer forever.
-      when(flushSignal) { pend := B(0, physIntN bits) }
-      pend.simPublic()
-      pend
-    }
+    // The clear being purely REGISTERED is the correctness point, and an earlier revision
+    // that bypassed it cost three lock-step divergences. The confirm announces a writeback
+    // that reaches the PRF bypass the NEXT cycle, so the cycle to release in is the cycle
+    // AFTER the confirm -- which a registered clear gives for free. On a HIT the register
+    // has already cleared by the time the consumer arrives (the announce runs only one
+    // cycle ahead), so the full speculated cycle is still won; on a MISS the consumer is
+    // parked here and leaves on the cycle the bypass actually carries the value.
     val lsSpecBlocked: Bool = if (!specLoadWakeup) False else {
       val u = lsIssHot
       // Mirrors the speculative clear EXACTLY -- the same two operands, with the same
       // read-qualifier each. That correspondence is the invariant: a source released
-      // speculatively above is re-checked here, and nothing else is checked (a `psrcB`
-      // still held by `lsBusy` must stay the EU's business, not this gate's).
-      val b = lsIssValid && ((u.psrcAValid && specPendEff(u.psrcA)) ||
-                             (u.psrcCValid && specPendEff(u.psrcC)))
+      // speculatively above is re-checked here, and nothing else is checked. `psrcB` is
+      // absent on purpose: store DATA is never speculated, so a `psrcB` still held by
+      // `lsBusy` is the EU's business (`queryReady`), not this gate's -- checking it here
+      // would block the `earlyStoreAddress` issue that is supposed to happen.
+      val b = lsIssValid && ((u.psrcAValid && lsBusy(u.psrcA)) ||
+                             (u.psrcCValid && lsBusy(u.psrcC)))
       b.simPublic()
       b
     }
