@@ -77,12 +77,16 @@ no writeback, no ROB completion; the demand load replays in order
 - ⛔ **The kill is mandatory.** A refill to MMIO reads a device register — pops a
   FIFO, clears a status bit. That is the DMA/polling shape that wedged the board.
   An L1 *lookup* is harmless; the *bus transaction* is not.
-- ✅ **Speculative table walks for loads are ALLOWED** (owner decision): a walk for
-  a load sets only the **U** bit (M is write-side), and a spuriously-Used page only
-  makes the replacement algorithm keep it longer. Performance, not correctness.
-- ⚠️ But the walk MUST be **non-faulting**: a blocked load's address may be
-  not-present or wrong-path garbage. Abort silently, kill the prefetch; the demand
-  load faults properly when it really issues.
+- ✅ **Table walks for a prefetch are ALLOWED, and may be PRECISE** (owner decision).
+  The prefetch is for a load that is ALREADY DISPATCHED and sitting in the IQ -- not
+  a wrong-path guess -- so it will execute unless a flush kills it. The walk is
+  therefore the SAME walk the demand load would perform, just early: setting **U** is
+  correct, not a tolerated error (M is write-side and does not arise for a load).
+- ⚠️ The one thing that must NOT be early is **FAULT DELIVERY**. A mispredict flush
+  can still remove the load, and an exception is not droppable the way a prefetch is.
+  So: walk precisely, but on a not-present descriptor or a bus error, kill the
+  prefetch silently and let the demand load raise the fault when it really issues.
+  Never deliver an exception on a prefetch's behalf.
 - ⚠️ A **demand walk must always win arbitration** over a speculative one. The
   descriptor port is 1-deep and this path has bitten twice: the deferred U/M drain
   once REVERTED software's page-table writes (stale descriptor byte rewritten
