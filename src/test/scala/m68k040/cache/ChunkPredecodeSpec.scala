@@ -5,7 +5,7 @@ import spinal.lib._
 import org.scalatest.funsuite.AnyFunSuite
 
 class ChunkPredecodeSpec extends AnyFunSuite {
-  test("ChunkPredecode is 9 bits; FetchRsp carries 4 of them") {
+  test("ChunkPredecode is 8 bits; FetchRsp carries 4 of them") {
     SpinalConfig().generateVerilog(new Component {
       val c = ChunkPredecode()
       assert(c.simple.isInstanceOf[Bool])
@@ -29,7 +29,14 @@ class ChunkPredecodeSpec extends AnyFunSuite {
       // `IcachePlugin`'s UFA_W therefore moves 384 -> 400 bits; the plugin itself needs
       // no edit (every width there derives from `ChunkPredecode().getBitsWidth`).
       assert(c.ctrlXfer.isInstanceOf[Bool])
-      assert(c.asBits.getWidth == 9)
+      // NARROWED 9->8 bits (2026-09-26): `simple` is DERIVED, not stored. Every producer
+      // in PredecodeWord set it in lockstep with `lenWords` -- the only `simple := False`
+      // was the default, paired with the only `lenWords := 0`, and all 74 other sites set
+      // True next to a non-zero length -- so `simple === (lenWords =/= 0)` by construction.
+      // That reverses the 384 -> 400 step the `ctrlXfer` note above describes: UFA_W is
+      // back to 384, the last width before the measured BRAM cliff.
+      assert(c.simple != null)   // still readable, now as a derived accessor
+      assert(c.asBits.getWidth == 8)
       val r = master(Flow(FetchRsp()))
       r.valid := False
       r.payload.assignDontCare()
