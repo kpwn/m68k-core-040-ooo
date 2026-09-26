@@ -94,6 +94,9 @@ class IpcBenchSpec extends CoreBenchHarness {
         detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
         // IQ_LOAD_BYPASS=1 lets a load pass an older UNREADY LOAD (stores stay ordered).
         loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1"),
+        // IQ_STORE_BYPASS=1 additionally lets a STORE pass an older unready LOAD, keeping
+        // store-store order. Fixes the starvation the load-only relaxation measured.
+        storeBypassUnreadyLoad = sys.env.get("IQ_STORE_BYPASS").contains("1"),
         earlyAutoAnWriteback = sys.env.get("LS_EARLY_AN").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.

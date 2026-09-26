@@ -86,7 +86,8 @@ object DynWait {
 
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
-                       val loadBypassUnreadyLoad: Boolean = false) extends FiberPlugin
+                       val loadBypassUnreadyLoad: Boolean = false,
+                       val storeBypassUnreadyLoad: Boolean = false) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
@@ -711,10 +712,36 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         olderUnreadyStore(i) := olderUnreadyStore(i - 1) || lsStoreUnready(i - 1)
         olderUnreadyLs(i)    := olderUnreadyLs(i - 1)    || lsAnyUnready(i - 1)
       }
+      // ── STORE FAIRNESS (`storeBypassUnreadyLoad`) ──────────────────────────────
+      // The asymmetry in the ORIGINAL rule is what starves stores, and it is measurable:
+      // a LOAD may pass an older unready load, but a STORE is blocked by ANY older unready
+      // LS op -- including an older unready LOAD. So younger loads stream past a store that
+      // is itself pinned behind a load. Measured under the original rule on dhrystone-x0
+      // (IPC_MEM=l2:5:70): `oldestStoreUnready` 15,500 -> 20,668 (+33%) and total cycles
+      // +3.10%, i.e. the load win was more than cancelled by the store loss on a machine
+      // with ONE LS EU and ONE SQ-drain port.
+      //
+      // WHY LETTING A STORE PASS AN OLDER UNREADY LOAD IS SAFE, against the anti-dependence
+      // ("the load must read the old value") that the comment above cites as the reason for
+      // the stricter rule. That reason is superseded by machinery that now exists:
+      //   1. a store is visible to memory only at SQ DRAIN, which happens at COMMIT in
+      //      program order -- so allocating its SQ entry early publishes nothing early; and
+      //   2. the only path by which the older load could observe it is the SQ FORWARD, and
+      //      that is already age-filtered -- StoreQueue's `fwd` takes entries "committed or
+      //      older in the live ROB window", so a YOUNGER resident store cannot forward to an
+      //      older load at all.
+      // The anti-dependence is therefore enforced by the forward age filter, not by issue
+      // order, and issue order is free to relax. Store-STORE order is still preserved
+      // (`!olderUnreadyStore`), which is what SQ allocation order needs.
+      //
+      // Costs nothing: `olderUnreadyStore` is the prefix the load arm already uses, so this
+      // selects an existing signal rather than computing a new one -- and with both arms on
+      // the same prefix the `Mux` and the whole `olderUnreadyLs` chain become dead.
       val eligible = B((0 until slotCount).map { i =>
         val s = slots(i)
         val isStore = s.hot.memOp === m68k040.isa.MemOp.STORE
-        s.sel && isLs(s.hot) && Mux(isStore, !olderUnreadyLs(i), !olderUnreadyStore(i))
+        val storeArm = if (storeBypassUnreadyLoad) !olderUnreadyStore(i) else !olderUnreadyLs(i)
+        s.sel && isLs(s.hot) && Mux(isStore, storeArm, !olderUnreadyStore(i))
       })
       OHMasking.first(eligible & lsReady)
     }
