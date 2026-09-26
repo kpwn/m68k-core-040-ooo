@@ -110,7 +110,21 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       // throughput-v2 profile with IPC_MEM=l2: +34.1% on call/return (bsr's A7 feeds
       // rts's pop address) and -13.6% cycles on copy-dense code, seed-robust across
       // three seeds, zero regressions across 34 kernels.
-      earlyAutoAnWriteback = ipcThroughput)
+      earlyAutoAnWriteback = ipcThroughput,
+      // SPECULATIVE LOAD WAKEUP. Announce an aligned, cacheable, already-translated
+      // load's pdst at CACHE LAUNCH rather than at its response -- one cycle earlier than
+      // `earlyIntWakeup`'s irrevocable announce, and therefore a prediction that the
+      // access hits L1. The released consumer is held at the IQ's LS issue register until
+      // the real announce confirms it, so a miss costs the cycles it would have cost
+      // anyway and a FAULT leaves the consumer unissued exactly as today. Only LS-class
+      // consumers are released, which is what makes the hold deadlock-free (LS issue is
+      // strictly in program order).
+      //
+      // NOT loadBypassUnreadyLoad: nothing is reordered here. LS issue order, the SQ
+      // forward, the inhibited-store barriers and `olderInhibitedStore` all see exactly
+      // the sequence they see today; the only change is WHEN a consumer becomes
+      // selectable, and every consumer still reaches its EU strictly after the writeback.
+      specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin(icachePredecodeWords)
     val merge  = new AxiDMergePlugin()
@@ -162,7 +176,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
-        loadBypassUnreadyLoad = false),
+        loadBypassUnreadyLoad = false,
+        specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
@@ -553,6 +568,17 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   * task's choice -- it is the only value that elaborates at all. */
 object SocketTopConfig {
   val OPEN1_GATE_DISPATCH: Boolean = false
+  /** SPECULATIVE LOAD WAKEUP (`LsEuPlugin.specLoadWakeup` + `IssueQueuePlugin`'s
+    * matching re-check). Announces an aligned cacheable load's destination one cycle
+    * early -- at cache launch rather than at the response -- predicting an L1 hit, and
+    * holds the released LS-class consumer at the IQ's LS issue register until the real
+    * announce confirms it.
+    *
+    * A BUILD-TIME SWITCH, defaulted OFF exactly like `earlyIntWakeup` was, so the shipped
+    * bitstream can be A/B'd against the reference without a revert. Flip it to true here
+    * (not by editing the plugin) once it is board-proven; leave it false until then.
+    * `SPEC_LOAD_WAKEUP=1` in the environment overrides it for a one-off build. */
+  val SPEC_LOAD_WAKEUP: Boolean = sys.env.get("SPEC_LOAD_WAKEUP").contains("1")
 }
 
 object SocketIpcProfile {

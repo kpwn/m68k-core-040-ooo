@@ -141,6 +141,11 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
+    // SPECULATIVE load wakeup (idle unless the LS EU's `specLoadWakeup` is on). One
+    // cycle earlier than `wakeup` and a cache-hit PREDICTION; the IQ re-checks it
+    // against `wakeup` before any consumer reaches an EU.
+    iq.lsWakeupSpec.valid   := lsEu.wakeupSpec.valid
+    iq.lsWakeupSpec.payload := lsEu.wakeupSpec.payload
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
     iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
     lsEu.sqCommit.valid   := rob.logic.retire0

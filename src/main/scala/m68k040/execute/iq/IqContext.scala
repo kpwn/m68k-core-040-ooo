@@ -178,6 +178,20 @@ trait IssueQueueService {
     * must keep every consumer's operand capture after that writeback. This is
     * not a speculative cache-hit prediction. */
   def lsWakeup: Flow[UInt]
+  /** SPECULATIVE LS integer wakeup (optional; idle unless the LS EU's `specLoadWakeup`
+    * is on). The producer broadcasts the pdst of a load it has just handed to the
+    * D-cache -- one cycle before `lsWakeup`'s guaranteed-next-cycle announce for the
+    * same pdst, and therefore a PREDICTION (L1 hit) rather than a promise.
+    *
+    * `lsWakeup` still fires for that pdst when the result is real, and that firing is
+    * the CONFIRM. This port may only release LS-CLASS consumers, which the queue then
+    * holds at its LS issue register until the confirm arrives; anything else would let a
+    * consumer capture a register the load has not written. Deadlock-freedom rests on LS
+    * issue being strictly in program order: a held consumer is younger than the load it
+    * waits on, every older LS uop has already issued, and no other class's port is
+    * touched -- so the ROB head always reaches the load, even when the load FAULTS and
+    * the confirm never comes at all. */
+  def lsWakeupSpec: Flow[UInt]
   /** LS NZVC readiness, separate from integer lsWakeup: an operation may produce
     * either or both. Writeback is available now, or guaranteed next cycle with
     * earlyNzvcWakeup. As for lsWakeup, registered dependency clear and selection

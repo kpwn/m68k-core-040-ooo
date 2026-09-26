@@ -31,6 +31,21 @@ trait LsEuService {
   // IQ wake/select contract as integer early wakeup. Applies to NZVC-writing loads,
   // stores and CCR restore, not a speculative prediction of their completion.
   def wakeupNzvc: Flow[UInt]   // pNzvcDst of a completing NZVC-writing LS op
+  // SPECULATIVE integer-result wakeup (`specLoadWakeup`, default OFF). Fires at the
+  // cycle an aligned, cacheable, translated LOAD is handed to the D-cache -- ONE cycle
+  // BEFORE `wakeup`'s irrevocable next-cycle-writeback announce, and therefore a
+  // PREDICTION (that the access hits L1 and returns next cycle) rather than a promise.
+  //
+  // It is NOT a substitute for `wakeup`: `wakeup` still fires for the same pdst when the
+  // result is genuinely committed, and that later firing is what CONFIRMS this one. A
+  // consumer released by this port must be held at a re-check stage that gates on the
+  // confirm, so a broken prediction costs cycles and never a wrong value. The IQ owns
+  // that re-check (see IssueQueuePlugin's `specPend` / `lsSpecBlocked`), and it releases
+  // ONLY LS-class consumers -- the single class whose issue is strictly in program order,
+  // which is what makes the hold provably deadlock-free.
+  //
+  // Idle (never valid) unless `specLoadWakeup` is set.
+  def wakeupSpec: Flow[UInt]
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -106,7 +121,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val detachedStoreEntries: Int = 1,
                  val earlyAutoStoreAddress: Boolean = false,
                  val earlyAutoAnWriteback: Boolean = false,
-                 val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyStoreDataWake: Boolean = false,
+                 val specLoadWakeup: Boolean = false) extends FiberPlugin with LsEuService {
+  // A speculative wake is only ever USEFUL one cycle ahead of the early (irrevocable)
+  // announce; without `earlyIntWakeup` the ordinary announce is itself a cycle later and
+  // the speculative port would be two cycles ahead of a writeback nothing re-checks
+  // against in between. Require the pairing rather than silently shipping the wider gap.
+  require(!specLoadWakeup || earlyIntWakeup,
+    "speculative load wakeup requires earlyIntWakeup (the confirm port)")
+  require(!specLoadWakeup || alignedLoadFallThrough,
+    "speculative load wakeup assumes the aligned-ring fall-through launch")
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
@@ -126,6 +150,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
+  var wakeupSpecPort: Flow[UInt]   = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
@@ -146,6 +171,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def sqDrained: Bool          = sqEmptySig
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
+  override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -259,6 +285,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
+    wakeupSpecPort = Flow(UInt(6 bits))   // pdst of a load PREDICTED to write back next cycle
+    wakeupSpecPort.simPublic()
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
@@ -3462,6 +3490,55 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
     }
     val p4Ready = !p4Valid || p4CanLeave
+
+    // ── SPECULATIVE LOAD WAKEUP (`specLoadWakeup`) ─────────────────────────────────
+    // Announce the pdst of an ordinary aligned load ONE CYCLE EARLY -- in the cycle it is
+    // handed to the D-cache (`alignedEnq`, which under `alignedLoadFallThrough` is also
+    // the cycle `dcache.loadCmd` fires) rather than in the cycle its response arrives.
+    //
+    // WHAT IS ALREADY KNOWN HERE, and therefore NOT being predicted: the DTLB translation
+    // SUCCEEDED (a faulting translation completes in the front path and never reaches
+    // `alignedEnq`); the access is aligned and single-line (`alignedEnq`, not
+    // `alignedEnqSplit`); the SQ holds no overlapping store (a full forward completed in
+    // the front path; a partial overlap is still retrying in `mustRetry`); the page is
+    // CACHEABLE (`!p4Inhibited`); no flush or exception hand-off is in progress
+    // (`alignedEnq` is inside `when(p4Valid && !sqFlushSig && !excActive)`).
+    //
+    // THE ONE THING PREDICTED is that the D-cache answers NEXT cycle, i.e. an L1 hit.
+    // MEASURED on `chase-pure` (L1-resident by construction): 1535 of 2052 loads answer
+    // in exactly 1 cycle. A miss, or a refill whose AXI response errors, breaks it.
+    //
+    // WHY THIS IS SAFE. This port only makes a consumer SELECTABLE; the IQ holds it at
+    // the LS issue register until `wakeup` -- the existing irrevocable announce -- fires
+    // for the same pdst. On a miss the consumer simply waits there (exactly the cycles it
+    // would have waited in the queue); on a FAULT `wakeup` never fires for that pdst and
+    // the consumer is never released at all, which is bit-for-bit today's behaviour
+    // (a faulted load never clears `lsBusy` either). No wrong value can be captured
+    // because nothing downstream of the hold ever sees the uop.
+    //
+    // `needsSupervisor && !supervisor` is excluded because such an entry owes a later
+    // privilege check and is barred from the ring's out-of-order early writeback; the
+    // prediction would simply be wrong for the whole extra wait.
+    val specWakeFire: Bool = if (!specLoadWakeup) False else {
+      alignedEnq && !p4Inhibited && (p4Front.memOp === MemOp.LOAD) &&
+        p4Front.pdstValid && !p4Front.ccrRestore &&
+        !(p4Front.needsSupervisor && !p4Front.supervisor)
+    }
+    wakeupSpecPort.valid   := specWakeFire
+    wakeupSpecPort.payload := p4Front.pdst
+    GenerationFlags.simulation {
+      if (specLoadWakeup) {
+        // A speculative announce MUST be followed, eventually, by the real one for the
+        // same pdst (or by a flush). Tracking "eventually" needs the consumer's own
+        // liveness watchdog (IssueQueuePlugin owns it); what is checkable HERE is that
+        // the port never announces a pdst the load does not actually write.
+        when(specWakeFire) {
+          assert(p4Front.pdstValid,
+            "LsEuPlugin: speculative load wakeup announced a load with no destination",
+            FAILURE)
+        }
+      }
+    }
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of

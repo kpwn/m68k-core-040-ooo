@@ -86,7 +86,8 @@ object DynWait {
 
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
-                       val loadBypassUnreadyLoad: Boolean = false) extends FiberPlugin
+                       val loadBypassUnreadyLoad: Boolean = false,
+                       val specLoadWakeup: Boolean = false) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
@@ -101,6 +102,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
   var aluFastAcceptNextPorts: Vec[Bool]       = null
   var flushSignal   : Bool                   = null
   var lsWakeupPort  : Flow[UInt]             = null
+  var lsWakeupSpecPort: Flow[UInt]           = null
   var lsNzvcWakeupPort: Flow[UInt]           = null
   var cplxWakeupPort: Flow[UInt]             = null
   var cplxNzvcWakeupPort: Flow[UInt]         = null
@@ -114,6 +116,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
   override def aluFastAcceptNext: Vec[Bool]   = aluFastAcceptNextPorts
   override def flushPort: Bool               = flushSignal
   override def lsWakeup: Flow[UInt]          = lsWakeupPort
+  override def lsWakeupSpec: Flow[UInt]      = lsWakeupSpecPort
   override def lsNzvcWakeup: Flow[UInt]      = lsNzvcWakeupPort
   override def cplxWakeup: Flow[UInt]        = cplxWakeupPort
   override def cplxNzvcWakeup: Flow[UInt]    = cplxNzvcWakeupPort
@@ -131,6 +134,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     aluFastAcceptNextPorts = Vec.fill(2)(Bool())
     flushSignal   = Bool()
     lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
+    lsWakeupSpecPort = Flow(UInt(6 bits)) // carries a PREDICTED-next-cycle load pdst
     lsNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed NZVC-writing-store pNzvcDst
     cplxWakeupPort= Flow(UInt(6 bits))   // carries a completed-DIV pdst
     cplxNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed CPLX flag-writer's pNzvcDst (task #167)
@@ -147,6 +151,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     lsWakeupPort.valid.allowOverride;   lsWakeupPort.valid   := False
     lsWakeupPort.payload.allowOverride; lsWakeupPort.payload := U(0, 6 bits)
     lsWakeupPort.simPublic()
+    lsWakeupSpecPort.valid.allowOverride;   lsWakeupSpecPort.valid   := False
+    lsWakeupSpecPort.payload.allowOverride; lsWakeupSpecPort.payload := U(0, 6 bits)
+    lsWakeupSpecPort.simPublic()
     lsNzvcWakeupPort.valid.allowOverride;   lsNzvcWakeupPort.valid   := False
     lsNzvcWakeupPort.payload.allowOverride; lsNzvcWakeupPort.payload := U(0, 4 bits)
     lsNzvcWakeupPort.simPublic()
@@ -949,7 +956,67 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val lsIssValid  = RegInit(False)
     val lsIssHot    = Reg(IqHot())
     val lsPiped     = Stream(IqHot())
-    lsPiped.valid   := lsIssValid
+
+    // ═══ SPECULATIVE-WAKEUP RE-CHECK (`specLoadWakeup`) ════════════════════════════
+    //
+    // `lsWakeupSpec` clears an LS-class consumer's dependency one cycle before the LS EU
+    // knows whether the load actually hit, so the consumer arrives HERE -- in the LS issue
+    // register, with its PRF read address presented but not yet captured -- in the same
+    // cycle the real (irrevocable) `lsWakeup` announce is expected. That is the whole
+    // point of the earliness: on a hit the confirm is live in this very cycle, the uop
+    // fires, and its operand read lands exactly on the LS EU's writeback bypass. One
+    // cycle earlier than the non-speculative path can ever manage, and not one cycle
+    // earlier than the data exists.
+    //
+    // `specPend[p]` is the prediction's outstanding-set: set by the speculative announce,
+    // cleared by the real one. `specPendEff` additionally forgives the confirm firing THIS
+    // cycle -- without that same-cycle bypass the hold would cost back the exact cycle the
+    // speculation bought (the confirm is registered, the bypass value is not).
+    //
+    // A uop whose sources are still pending is simply NOT PRESENTED: `lsPiped.valid` drops
+    // and the register does not advance, so nothing downstream ever sees it and no wrong
+    // value can be captured. Cost of a broken prediction = the cycles the consumer would
+    // have spent waiting in the queue anyway. On a FAULTING load the confirm never comes
+    // and the consumer is held until the flush -- which is exactly today's behaviour for a
+    // faulted load (its `lsBusy` bit is never cleared either), and it cannot deadlock: the
+    // held uop is younger than the load, every older LS uop has already issued (in-order
+    // LS select), and no other issue port is affected, so the ROB head always reaches the
+    // faulting load and raises its exception.
+    val specPendEff: Bits = if (!specLoadWakeup) B(0, physIntN bits) else {
+      val pend  = Reg(Bits(physIntN bits)) init 0
+      val setOh = UIntToOh(lsWakeupSpecPort.payload, physIntN).andMask(lsWakeupSpecPort.valid)
+      // The CONFIRM is the ordinary `lsWakeup` port, not a third one: it is already the
+      // announce every consumer's dependency clear keys off, it is irrevocable, and it
+      // fires for exactly the pdst this port predicted. Its `earlyAutoAnWriteback` arm
+      // announces a register that is never speculatively woken, so an extra clear from it
+      // is at worst a no-op.
+      val clrOh = UIntToOh(lsWakeupPort.payload, physIntN).andMask(lsWakeupPort.valid)
+      pend := (pend | setOh) & ~clrOh
+      // A flush retires every speculative announce: the ring entries it poisons will
+      // never produce a confirm, and the physical registers they named are rolled back
+      // and re-handed out by the freelist. Leaving a bit set would block an unrelated
+      // future consumer forever.
+      when(flushSignal) { pend := B(0, physIntN bits) }
+      pend.simPublic()
+      pend & ~clrOh
+    }
+    val lsSpecBlocked: Bool = if (!specLoadWakeup) False else {
+      val u = lsIssHot
+      // Mirrors the speculative clear EXACTLY -- the same two operands, with the same
+      // read-qualifier each. That correspondence is the invariant: a source released
+      // speculatively above is re-checked here, and nothing else is checked (a `psrcB`
+      // still held by `lsBusy` must stay the EU's business, not this gate's).
+      val b = lsIssValid && ((u.psrcAValid && specPendEff(u.psrcA)) ||
+                             (u.psrcCValid && specPendEff(u.psrcC)))
+      b.simPublic()
+      b
+    }
+    // The register advances (loads the next uop, frees the skid) only when the EU takes
+    // the current one AND the current one was allowed to be presented. Reading the EU's
+    // `ready` while presenting `valid = 0` would otherwise overwrite the held uop.
+    val lsAdvance = lsPiped.ready && !lsSpecBlocked
+
+    lsPiped.valid   := lsIssValid && !lsSpecBlocked
     lsPiped.payload := lsIssHot
     selPorts(3).ready := !lsSkidValid
     // Forward source into the issue register: the skid when it holds (the select is
@@ -959,14 +1026,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val lsFwdValid = selPorts(3).valid || lsSkidValid
     val lsFwdHot   = IqHot()
     lsFwdHot.assignFromBits(selPorts(3).payload.asBits | lsSkidHot.asBits.andMask(lsSkidValid))
-    when(lsPiped.ready) {                       // m2sPipe(collapsBubble = false) load rule
+    when(lsAdvance) {                           // m2sPipe(collapsBubble = false) load rule
       lsIssValid := lsFwdValid
       lsIssHot   := lsFwdHot
       lsSkidValid := False                      // whatever the skid held has moved on
     }
     when(selPorts(3).fire) {
       lsSkidHot := selPorts(3).payload          // always: the last fired payload (sbClear)
-      when(!lsPiped.ready) { lsSkidValid := True }
+      when(!lsAdvance) { lsSkidValid := True }
     }
     when(flushSignal) {
       lsSkidValid := False
@@ -975,7 +1042,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     lateStorePorts.foreach { p =>
       val skidPending = RegInit(False)
       val issuePending = RegInit(False)
-      when(lsPiped.ready) {
+      when(lsAdvance) {
         issuePending := Mux(lsSkidValid, skidPending, lsSelectedLateData)
       }
       when(selPorts(3).fire) { skidPending := lsSelectedLateData }
@@ -990,6 +1057,17 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // LIVENESS (2026-09-15): the skid drains the first cycle the LS EU is ready or a
       // flush lands; a uop parked in it for 20000 cycles means the EU's front never
       // freed -- a no-forward-progress bug, named at the IQ rather than as a timeout.
+      if (specLoadWakeup) {
+        // LIVENESS: a speculative hold ends on the confirm or on a flush. 20000 cycles of
+        // holding means neither happened -- the exact hang class this mechanism's safety
+        // argument rules out -- so name it here rather than as a distant timeout.
+        val specHeldCycles = Reg(UInt(16 bits)) init 0
+        when(lsSpecBlocked) { specHeldCycles := specHeldCycles + 1 } otherwise { specHeldCycles := 0 }
+        assert(specHeldCycles < U(20000, 16 bits),
+          "IssueQueuePlugin: an LS uop has been held by the speculative-wakeup re-check " +
+            "for 20000 cycles -- no confirm and no flush; no forward progress",
+          FAILURE)
+      }
       val skidHeldCycles = Reg(UInt(16 bits)) init 0
       when(lsSkidValid) { skidHeldCycles := skidHeldCycles + 1 } otherwise { skidHeldCycles := 0 }
       assert(skidHeldCycles < U(20000, 16 bits),
@@ -1444,9 +1522,30 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       val c = Bits(DynWait.width bits)
       val lsW   = lsWakeupPort.valid
       val cpW   = cplxWakeupPort.valid
-      c(DynWait.LS_A)      := lsW && u.psrcAValid && (u.psrcA === lsWakeupPort.payload)
-      c(DynWait.LS_B)      := lsW && srcBIsReg(u) && (u.psrcB === lsWakeupPort.payload)
-      c(DynWait.LS_C)      := lsW && u.psrcCValid && (u.psrcC === lsWakeupPort.payload)
+      // SPECULATIVE LS clear (`specLoadWakeup`). Gated on `isLs(u)` -- and that gate is
+      // the WHOLE safety argument, not a refinement of it. Only the LS port re-checks the
+      // prediction before the uop reaches its EU (see `lsSpecBlocked`), and only the LS
+      // port issues strictly in program order, which is what makes holding a uop there
+      // deadlock-free. Releasing an ALU/branch/CPLX consumer on this port would let it
+      // capture a physical register the load has not written: silent corruption, not a
+      // lost cycle. `isLs` reads the stored `isLsClass` flop, so this adds no opcode
+      // decode to the clear cone. Idle (False) when the option is off.
+      val lsSpecW = if (!specLoadWakeup) False else lsWakeupSpecPort.valid && isLs(u)
+      // ADDRESS OPERANDS ONLY (psrcA = base, psrcC = index). `psrcB` on an LS uop is
+      // STORE DATA, and it deliberately stays out of this: the store-data dependency
+      // already has its own one-cycle-early release inside the EU
+      // (`LateStoreDataPorts.queryReadyNext`, gated on the REAL `lsWakeup`), and
+      // `earlyStoreAddress` is built on a store being SELECTABLE while LS_B is still set.
+      // Speculating on LS_B would make the re-check below block exactly the early-address
+      // issue that option exists to allow -- a regression, for a dependency that is not on
+      // the address chain this whole mechanism targets. It also keeps the re-check to two
+      // physical-register lookups instead of three.
+      def lsClr(read: Bool, tag: UInt, spec: Boolean): Bool =
+        (lsW && read && (tag === lsWakeupPort.payload)) ||
+          (if (!spec) False else lsSpecW && read && (tag === lsWakeupSpecPort.payload))
+      c(DynWait.LS_A)      := lsClr(u.psrcAValid, u.psrcA, spec = true)
+      c(DynWait.LS_B)      := lsClr(srcBIsReg(u),  u.psrcB, spec = false)
+      c(DynWait.LS_C)      := lsClr(u.psrcCValid, u.psrcC, spec = true)
       c(DynWait.CPLX_A)    := cpW && u.psrcAValid && (u.psrcA === cplxWakeupPort.payload)
       c(DynWait.CPLX_B)    := cpW && srcBIsReg(u) && (u.psrcB === cplxWakeupPort.payload)
       c(DynWait.CPLX_C)    := cpW && u.psrcCValid && (u.psrcC === cplxWakeupPort.payload)
@@ -1799,7 +1898,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         // else from the live select -- the same source rule the real pipe applies.
         val fsPiped = if (k == 3) {
           val fsSkid = RegNextWhen(MuxOH(ohL, fsCtx), selPorts(3).fire)
-          RegNextWhen(Mux(lsSkidValid, fsSkid, MuxOH(ohL, fsCtx)), lsPiped.ready)
+          RegNextWhen(Mux(lsSkidValid, fsSkid, MuxOH(ohL, fsCtx)), lsAdvance)
         } else RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
         when(pipedPorts(k).valid) {
           assert(issuePorts(k).payload === fsPiped,
