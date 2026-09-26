@@ -1346,6 +1346,17 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     spinal.core.sim.SimPublic(slot0ComputedPred, slot1WouldUncond, s0RelTarget)
 
     val slot0Predicted    = slot0IsPred || rasPredictSlot0 || slot0ComputedPred
+    // ── ONE slot-1 suppression predicate ────────────────────────────────────────
+    // Suppressing slot1 has TWO obligations that must never disagree: drop it from the
+    // emitted packet (`slot1ValidOut`), and consume only slot0's words from the
+    // instruction buffer (`effShift` / `decodePcNext`). These used to be two separately
+    // maintained term lists, and adding `slot1WouldUncond` to only the first one silently
+    // SHIFTED THE DEFERRED BRANCH OUT OF THE BUFFER -- the instruction vanished from the
+    // stream, `br-ind` executed a different program entirely and its self-check caught
+    // `d0 = 0` instead of 1024. The `effShift` comment had warned about exactly this.
+    // So the predicate is defined ONCE, here, and both consumers read it.
+    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
+                        slot1WouldFtq || slot1WouldUncond || ftqConfirm
     val predictedThisEmit = slot0Predicted && !ftqConfirm
     val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget,
                             Mux(slot0ComputedPred, s0RelTarget, btbPredTarget0))
@@ -1376,8 +1387,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldRasPred || slot1WouldCondPred || slot1WouldFtq ||
-         slot1WouldUncond || ftqConfirm) {
+    when(suppressSlot1) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -1517,8 +1527,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
-                        slot1WouldFtq || ftqConfirm
+    // `suppressSlot1` is declared at the slot-1 deferral site above, with the ONE term
+    // list both this consume and the `slot1ValidOut` drop read (see its comment: keeping
+    // two lists is what loses a deferred branch).
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision
     // (BTB/RAS prediction cones) muxes the 32-bit ADD RESULT instead of the adder's addend.
