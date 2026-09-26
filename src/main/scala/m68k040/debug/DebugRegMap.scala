@@ -240,6 +240,22 @@ object DebugRegMap {
   val OFF_RTS_SNAP_CLEAR: Int = 0x03040
   val OFF_PC_TRACE_BODY: Int = 0x10000
   val OFF_PC_TRACE_HEAD: Int = 0x11000
+  /** READ PROTOCOL for the two 16-byte-per-entry rings below (EXC and BRANCH):
+    *
+    * READ WORD 0 OF AN ENTRY FIRST, then words 1..3 of that same entry. A 128-bit entry
+    * needs four bus reads; the ring is written by a RUNNING CPU and turns over every
+    * `historyDepth` events, so on silicon it is rewritten hundreds of times between two
+    * consecutive JTAG reads. `DebugCtrlPlugin` therefore SNAPSHOTS the whole entry when
+    * word 0 is read and answers words 1..3 of that index from the snapshot; word 0 is the
+    * identifying field for exactly this reason (the exception's vector, the branch's own
+    * PC). Read the words in any other order, or skip word 0, and the words you get were
+    * sampled at different times and describe different events -- measured on the board at
+    * 100 MHz (build_id 0xD01DBDC5) as a `beq.s`'s PC reported with an `rts`'s target.
+    *
+    * A dump is still a SAMPLE, not a window: the ring keeps turning over while it is
+    * read, so the entries of one dump need not be consecutive events, and `*_RING_HEAD`
+    * read before the sweep is already stale by the end of it. Halt the CPU first if the
+    * window itself has to be contiguous. */
   val OFF_EXC_RING_BODY: Int = 0x12000
   val OFF_EXC_RING_HEAD: Int = 0x13000
   val OFF_BRANCH_RING_BODY: Int = 0x14000

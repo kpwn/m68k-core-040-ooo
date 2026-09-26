@@ -853,6 +853,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadPcBank = if (historyBuilt) Reg(UInt(pcBankBits bits)) init 0 else U(0, pcBankBits bits)
+      /** Stage-1 capture of the 128-bit ring entry index this read addresses. It is the
+        * TAG of the entry snapshot below: without it a reader that reads word 0 of one
+        * entry and word 1 of another would be served the first entry's word 1. */
+      val historyReadRingIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val pcReadIndex = ((arAddr - DebugRegMap.OFF_PC_TRACE_BODY) >> 2).resize(5)
       val excReadIndex = ((arAddr - DebugRegMap.OFF_EXC_RING_BODY) >> 4).resize(5)
       val branchReadIndex = ((arAddr - DebugRegMap.OFF_BRANCH_RING_BODY) >> 4).resize(5)
@@ -864,6 +868,74 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         excRing.readSync(excReadIndex, historyReadIssue && excBodyRead) else B(0, 128 bits)
       val branchBodyWord = if (historyBuilt)
         branchRing.readSync(branchReadIndex, historyReadIssue && branchBodyRead) else B(0, 128 bits)
+
+      /* ── ATOMIC 128-bit ring entry reads (2026-09-27) ──────────────────────────────
+       *
+       * A branch-ring or exception-ring ENTRY is 128 bits and the bus is 32, so a reader
+       * takes it in four INDEPENDENT AXI transactions. The rings are written by a LIVE
+       * CPU: the branch ring turns over every `historyDepth` retired branches, which on
+       * silicon is microseconds, while two consecutive JTAG reads are milliseconds apart.
+       * Every word therefore came from a different event and the reader stitched four
+       * unrelated events into one plausible line -- measured on the board at 100 MHz
+       * (build_id 0xD01DBDC5) as `pc=0x027de060` (a `beq.s`) reported with
+       * `next=0x027d30da`, the return address of an `rts` four branches later, and one PC
+       * reported with three different `next` values. Nothing was skewed in the producer:
+       * `RobPlugin` holds every field of an event in one `branchTrainMem` row and the
+       * `*Ring.write` above lands all 128 bits in one cycle. The read tore it apart.
+       *
+       * THE ENTRY IS NOW LATCHED WHOLE. Reading WORD 0 of an entry snapshots all 128 bits
+       * of it, tagged with its index; words 1..3 of that same index are answered from the
+       * snapshot instead of from the (meanwhile-overwritten) memory. The reader's contract
+       * is therefore "read word 0 first, then the rest" -- which is what
+       * `tools/jtag_repl.tcl`'s `last-branches` and `exc-ring` already do, and what the
+       * `DebugRegMap` word order was designed for (word 0 is the identifying field: the
+       * branch's own PC, the exception's vector).
+       *
+       * IT CANNOT SKEW AGAIN because there is no longer any path by which two words of
+       * one reported entry come from two different memory reads: words 1..3 are SLICES OF
+       * ONE REGISTER that was loaded from ONE synchronous read of ONE ring row. The tag
+       * comparison is what makes that safe under any read order -- a mismatched index
+       * falls back to the live memory, i.e. to the old behaviour, rather than silently
+       * serving another entry's tail.
+       *
+       * A stale snapshot is still possible and is deliberate: if the entry is overwritten
+       * after word 0 was read, words 1..3 report the event word 0 named, not the newer
+       * one. That is the LAGGING-BUT-COHERENT posture debug instrumentation is allowed
+       * (spec: "may lag by cycles, must never cost a logic level"); it is confined to the
+       * debug read mux's stage 2 and touches no functional cone.
+       *
+       * COST: 2 x (128 flops + a 5-bit tag), one extra 4:1 32-bit mux and one 2:1 32-bit
+       * mux per ring in the stage-2 read path. */
+      val excSnap = if (historyBuilt) Reg(Bits(128 bits)) init 0 else B(0, 128 bits)
+      val excSnapIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      // The tag is only meaningful once a word-0 read has loaded it. Without this bit,
+      // index 0 would alias the reset value of `*SnapIdx` and a word-1 read of entry 0
+      // taken BEFORE any word-0 read would be answered from an all-zero snapshot -- a
+      // register that reads zero and lies, which is the exact failure class this whole
+      // change exists to remove.
+      val excSnapValid = if (historyBuilt) RegInit(False) else False
+      val branchSnap = if (historyBuilt) Reg(Bits(128 bits)) init 0 else B(0, 128 bits)
+      val branchSnapIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      val branchSnapValid = if (historyBuilt) RegInit(False) else False
+      if (historyBuilt) {
+        // `readStage2` is the cycle the memory read answers; `historyReadWord === 0`
+        // makes word 0 the capture point for the whole entry.
+        when(readStage2 && readIsHistory && historyReadWord === 0) {
+          when(historyReadKind === U(1, 2 bits)) {
+            excSnap := excBodyWord; excSnapIdx := historyReadRingIdx; excSnapValid := True
+          }
+          when(historyReadKind === U(2, 2 bits)) {
+            branchSnap := branchBodyWord; branchSnapIdx := historyReadRingIdx
+            branchSnapValid := True
+          }
+        }
+      }
+      /** Word `historyReadWord` of the addressed entry: from the snapshot for words 1..3
+        * of the entry word 0 was last read from, else straight from the ring memory. */
+      def ringWord(live: Bits, snap: Bits, snapIdx: UInt, snapValid: Bool): Bits =
+        Mux(snapValid && historyReadWord =/= 0 && snapIdx === historyReadRingIdx,
+            snap.subdivideIn(32 bits)(historyReadWord),
+            live.subdivideIn(32 bits)(historyReadWord))
 
       dbgAxi.awready := !awPend && !bPend && !dbgRst
       dbgAxi.wready  := !wPend  && !bPend && !dbgRst
@@ -939,6 +1011,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           historyReadKind := Mux(pcBodyRead, U(0, 2 bits), Mux(excBodyRead, U(1, 2 bits), U(2, 2 bits)))
           historyReadWord := arAddr(3 downto 2)
           historyReadPcBank := pcReadIndex(pcBankBits - 1 downto 0)
+          historyReadRingIdx := Mux(excBodyRead, excReadIndex, branchReadIndex)
         }
       }
       /** READ STAGE 2. The response word. Exactly one of the six per-region partial
@@ -955,8 +1028,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         historyWord := B(0, DebugRegMap.DBG_DW bits)
         switch(historyReadKind) {
           is(U(0, 2 bits)) { historyWord := pcBankReads(historyReadPcBank) }
-          is(U(1, 2 bits)) { historyWord := excBodyWord.subdivideIn(32 bits)(historyReadWord) }
-          is(U(2, 2 bits)) { historyWord := branchBodyWord.subdivideIn(32 bits)(historyReadWord) }
+          is(U(1, 2 bits)) {
+            historyWord := ringWord(excBodyWord, excSnap, excSnapIdx, excSnapValid)
+          }
+          is(U(2, 2 bits)) {
+            historyWord := ringWord(branchBodyWord, branchSnap, branchSnapIdx, branchSnapValid)
+          }
         }
         rData := Mux(readIsHistory, historyWord,
                  Mux(readIsLiveInt, liveIntWord,
