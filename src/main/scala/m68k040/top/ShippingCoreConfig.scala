@@ -79,4 +79,37 @@ object ShippingCoreConfig {
     * `SHIPPING_CONFIG`. */
   val deferSlot1Uncond: Boolean =
     sys.env.get("CPU_DEFER_SLOT1_UNCOND").contains("1")
+
+  // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
+  // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
+  //
+  //   probe        OFF    compute   defer    both      cycles OFF -> both
+  //   br-cap      1615      1250     1615       7      22239 -> 9025   (-59.4%)
+  //   br-cap-fit   561       545       66       2      10340 -> 5854   (-43.4%)
+  //   br-patt      601       600      305     304      13206 -> 10799  (-18.2%)
+  //   br-ras-fit    18         4       18       2      72990 -> 72806
+  //   br-ras      1066      1019     1066    1026      86147 -> 85740
+  //   br-ind      2050      2050     2049    2049      51894 -> 51894
+  //   br-ind-2     678       678      678     678      30494 -> 30494
+  //   aggregate   6589      6146     5797    4068 (149.0 -> 92.0 MPKI, -38.3%)
+  //
+  // NEITHER FLAG WORKS ALONE, and the `br-cap` pair is why:
+  //  - `br-cap-fit` FITS the 128-entry BTB and still mispredicted 27% of its branches.
+  //    Deferral alone takes that 561 -> 66. So ~88% of it was never capacity at all --
+  //    it was branches landing in SLOT 1, where nothing predicts them.
+  //  - `br-cap` EXCEEDS the BTB. Deferral alone changes NOTHING (1615 -> 1615):
+  //    handing a slot-1 branch to slot0 is useless when the table has no entry for it.
+  //    Computation alone gets -23%. Together: -99.6%.
+  // Deferral gives the branch a predictor; computation gives it a target.
+  //
+  // ⚠️ ZERO effect on `br-ind`/`br-ind-2` (indirect targets) and ~none on `br-ras`
+  // (returns) -- correctly, since neither flag touches those. Those are the two buckets
+  // that remain, and after this change they are 55% (returns) and 37% (indirect
+  // targets) of what is left; conditional direction is 8%.
+  //
+  // ⚠️ NO REGRESSION on any of the 11 kernels, including the four workload-shaped
+  // references -- but those references also show NO GAIN (`dhrystone-x0-cb` is
+  // 0.21 MPKI and 3 mispredicts total), which is exactly the recorded bench-stall-mix
+  // blind spot. A sim cycle win on a probe is NOT a board win. `mispredicts/kinst` on
+  // silicon (~0.95% noise floor) is the only thing that can rank these.
 }
