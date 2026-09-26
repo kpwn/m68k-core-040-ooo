@@ -59,6 +59,14 @@ class BranchPredictIpcSpec extends CoreBenchHarness {
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
       alignedLoadFallThrough = true, earlyLsIntWakeup = true, sqSubwordForwarding = true,
       pairCorrectBranch = true, retainRedirectHistory = true, trainSlot1Conditional = true,
+      // MUST be set: `SocketTop` gives throughput-v2 BOTH slot-1 knobs
+      // (`deferTakenSlot1Conditional = ipcThroughput`), and without it a slot-1
+      // conditional carries only the IMPLICIT NOT-TAKEN record `brPredLive1` stamps --
+      // so a slot-1 TAKEN conditional mispredicts 100% of the time and shows up in
+      // `[br-attr]` as `cond-dir-gshare`, i.e. as a gshare direction error that is
+      // really a slot-1 coverage hole. `IpcBenchSpec`'s IPC_V2 path leaves this to
+      // IPC_V2_DEFER and is therefore NOT the board's frontend either.
+      deferTakenSlot1Conditional = true,
       earlyStoreAddress = true, fuseLongMoveLoads = true, reserveLateStore = true,
       detachLateStore = true, forwardOnPublish = true, earlyLsNzvcWakeup = true,
       detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
