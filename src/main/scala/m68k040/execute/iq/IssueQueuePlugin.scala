@@ -1529,7 +1529,15 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // capture a physical register the load has not written: silent corruption, not a
       // lost cycle. `isLs` reads the stored `isLsClass` flop, so this adds no opcode
       // decode to the clear cone. Idle (False) when the option is off.
-      val lsSpecW = if (!specLoadWakeup) False else lsWakeupSpecPort.valid && isLs(u)
+      // `isLsLoad`, not `isLs`: LOAD consumers only. Excluding STORES is a MEASURED IPC
+      // decision, not extra caution. `store-stream` regressed +12.7% with stores included,
+      // and the counters say why -- `drainBlockedCyc 0 -> 86`, `maxSqResident 7 -> 8`: the
+      // feature does not slow stores down, it feeds a DRAIN-BOUND queue faster, so getting
+      // a store's address earlier only buys more time waiting at the SQ. The win is in
+      // load-to-load address chains (`chase-pure` -12.5%), which this keeps. LEA is
+      // excluded with them (memOp NONE) -- it touches no memory and feeds no queue, so it
+      // has nothing to gain here either.
+      val lsSpecW = if (!specLoadWakeup) False else lsWakeupSpecPort.valid && u.isLsLoad
       // ADDRESS OPERANDS ONLY (psrcA = base, psrcC = index). `psrcB` on an LS uop is
       // STORE DATA, and it deliberately stays out of this: the store-data dependency
       // already has its own one-cycle-early release inside the EU

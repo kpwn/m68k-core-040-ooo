@@ -91,6 +91,14 @@ case class IqHot() extends Bundle {
   val isLsClass   = Bool()
   val isCplxClass = Bool()
   val srcBRead    = Bool()
+  // An LS-class uop that is specifically a LOAD -- not a store, and not a LEA
+  // address-generate (`memOp === NONE`). The ONLY reader is the speculative-wakeup clear,
+  // which releases a consumer before the producing load is known to have hit; restricting
+  // it to loads is what keeps a STORE's address off the speculative path. Precomputed here
+  // rather than tested as `isLsClass && memOp === LOAD` in the clear, for the reason this
+  // record exists at all: the clear is a tight reg-to-reg path replicated across all 16
+  // slots, and it should read one flop, not decode an enum.
+  val isLsLoad    = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -140,6 +148,7 @@ case class IqHot() extends Bundle {
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
     srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
+    isLsLoad := isLsClass && (u.memOp === m68k040.isa.MemOp.LOAD)
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm
