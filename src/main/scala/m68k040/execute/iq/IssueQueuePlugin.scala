@@ -87,7 +87,7 @@ object DynWait {
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
                        val loadBypassUnreadyLoad: Boolean = false,
-                       val lsOooFirstOfInstrOnly: Boolean = false) extends FiberPlugin
+                       ) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
@@ -764,7 +764,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // Requiring a bypassing uop to be FIRST of its instruction removes the case outright:
       // every older LS uop is then in a strictly older macro. Only uops that actually
       // overtake something pay it -- `!olderUnreadyLs` means nothing was overtaken.
-      val intraMacroOk: Bits = if (!lsOooFirstOfInstrOnly) B((BigInt(1) << slotCount) - 1, slotCount bits) else {
+      // UNCONDITIONAL: the inhibited barrier's RECOVERY depends on it (see RobPlugin's
+      // `orderRedirect` -- the restart PC is only a macro boundary if the violator is not a
+      // retired sibling uop of the inhibited op's own macro). Priced at 0.49pp aggregate.
+      val intraMacroOk: Bits = {
         val lsAnyUnready = (0 until slotCount).map(i => lsPresent(i) && !slots(i).ready)
         var incA = lsAnyUnready.toIndexedSeq
         var dA = 1

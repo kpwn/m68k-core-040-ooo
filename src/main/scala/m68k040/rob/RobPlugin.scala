@@ -465,6 +465,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // bit and can spuriously flush (a branch that completes via the normal port).
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
+    // ── LS ORDER VIOLATION (out-of-order LS issue) ─────────────────────────────────────
+    // Set when the LS EU reports that this entry resolved INHIBITED while a program-YOUNGER
+    // cacheable access had ALREADY launched. Same discipline as `mispredictStore`:
+    // RegInit(False) plus an alloc-time reset, so a never-allocated or re-used index reads
+    // "no violation" rather than a stale True.
+    val orderViolated = Vec.fill(depth)(RegInit(False))
+    orderViolated.foreach(_.simPublic())
     mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
     // ── LUT-reduction ROB-fold Slice B (2026-08-08 area spec §5) ────────────────
     // WAS `Vec.fill(depth)(Reg(UInt(32 bits)))` (2048 FF + a 64:1 read mux per bit at
@@ -873,6 +880,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     }
     // LS access-fault completion (driven by the LS-cluster wiring, like
     // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
+    // LS order-violation report (driven by the LS-cluster wiring, like lsFaultCompletion).
+    // Default-idle so a standalone DUT elaborates and the in-order build is untouched.
+    val lsOrderViolation = Flow(UInt(robIdW bits))
+    lsOrderViolation.valid.allowOverride;   lsOrderViolation.valid := False
+    lsOrderViolation.payload.allowOverride; lsOrderViolation.payload := U(0, robIdW bits)
+    lsOrderViolation.simPublic()
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
     lsFaultCompletion.valid.allowOverride;            lsFaultCompletion.valid := False
     lsFaultCompletion.payload.robId.allowOverride;    lsFaultCompletion.payload.robId := U(0, robIdW bits)
@@ -2192,10 +2205,14 @@ class RobPlugin(val detailedPerf: Boolean = false,
         }
       }
     }
+    // Latched BEFORE the alloc resets below so a same-cycle alloc to this index wins,
+    // exactly as `mispredictStore`'s alloc-priority discipline requires.
+    when(lsOrderViolation.valid) { orderViolated(lsOrderViolation.payload) := True }
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      orderViolated(tail) := False
       branchTakenStore(tail) := False
       btbIsBranchStore(tail) := False
       phtValidStore(tail)   := False
@@ -2223,6 +2240,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      orderViolated(tail + 1) := False
       branchTakenStore(tail + 1) := False
       btbIsBranchStore(tail + 1) := False
       phtValidStore(tail + 1)   := False
@@ -3296,13 +3314,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // their sequencer installs its redirect PC; treating that pulse as a boundary
     // prevents STOP_PENDING from parking halfway through architectural state update.
     debugSequencerBoundaryHit := exc.redirectValid
+    // Defined HERE, above `debugRestartPc`, because that mux READS it. A forward reference
+    // would still compile -- this is a template body, not a method -- and would silently
+    // bind `null`, so the ordering is load-bearing rather than stylistic.
+    val orderRedirect = retire0 && orderViolated(h0) && p0.last && (count > 1)
+    orderRedirect.simPublic()
     val debugStepRestartPc = Mux(retire1 && p1.last, p1.predNextPc, p0.predNextPc)
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
+                         Mux(orderRedirect, p1.pc,
                          Mux(debugBreakpointBoundaryHit, p0.pc,
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
                          Mux(debugNormalBoundaryHit || (debugHaltState === DebugHaltState.STEP_RUNNING), debugStepRestartPc,
-                         Mux(count === 0, debugLivePcReg, p0.predNextPc))))))
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))))))
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
     // consumer empty and does not release the debug halt.
@@ -3316,9 +3340,28 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // fatal) path, which this gate does not otherwise cover.
     val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid &&
       !preciseDrainBusyIn
-    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
+    // ── LS ORDER-VIOLATION REDIRECT ────────────────────────────────────────────────
+    // Restart at the PC of the OLDEST SQUASHED instruction, which is `p1.pc` -- the ROB
+    // already restarts this way for interrupts ("`payload.pc` = the head INSTRUCTION's PC =
+    // the stacked PC ... re-executed after RTE"), so no `nextPcMem` write is needed and that
+    // Mem keeps its single writer.
+    //
+    // `p0.last` IS REQUIRED, not defensive. A 3-uop crack (mem-dest RMW: load, op, store)
+    // can sit at the head mid-macro -- the hazard recorded at `h0IsMacroLast`, where a
+    // ring-occupancy form of macro detection was tried and was WRONG for exactly this shape.
+    // Restarting at `p1.pc` is only a macro boundary once h0 is the LAST uop of its macro;
+    // otherwise `p1` is a sibling uop and restarting there would re-execute part of the
+    // macro, including the device access itself -- the `inhibited-load-irq-replay` bug.
+    // The IQ's matching precondition (a bypassing uop must be FIRST of its instruction)
+    // is what guarantees the violator is not a sibling that has already retired by then.
+    //
+    // `count > 1` because the violator must still be resident to be squashed; it is younger
+    // than a retiring h0 and cannot have retired, so this holds whenever the bit is set --
+    // gated anyway so `p1` is never an uninitialised-Mem read.
+    doFlushReg := branchRedirect || orderRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
+    when(orderRedirect)     { flushPcReg := p1.pc }
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
     // ── ONE expression for the debug restart PC (2026-09-18 race audit) ──────────
     // This arm used to REBUILD the mux above with only three of its arms, and the two

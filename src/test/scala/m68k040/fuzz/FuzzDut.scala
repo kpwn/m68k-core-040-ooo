@@ -123,6 +123,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.issue << iq.issue(3)
     rob.logic.completion(2).valid   := lsEu.completion.valid
     rob.logic.completion(2).payload := lsEu.completion.payload
+    // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+    // whose barrier a younger already-launched access violated. Recovered at retire.
+    rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+    rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -385,11 +389,15 @@ class FuzzCoreDut extends Component {
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
   val rob    = new RobPlugin
-  val iq     = new IssueQueuePlugin
+  // FUZZ_LS_OOO=1 turns on out-of-order LS issue (the relaxed select) TOGETHER with the
+  // LS-side inhibited two-way barrier. They must move together: the relaxation without the
+  // barrier is what wedged the board as `loadBypassUnreadyLoad`.
+  private val fuzzLsOoo = sys.env.get("FUZZ_LS_OOO").contains("1")
+  val iq     = new IssueQueuePlugin(loadBypassUnreadyLoad = fuzzLsOoo)
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
-  val lsEu   = new LsEuPlugin
+  val lsEu   = new LsEuPlugin(lsOooIssue = fuzzLsOoo)
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc

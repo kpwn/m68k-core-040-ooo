@@ -99,6 +99,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+      // whose barrier a younger already-launched access violated. Recovered at retire.
+      rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+      rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -352,7 +356,6 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyAutoStoreAddress: Boolean = false,
                     earlyStoreDataWake: Boolean = false,
                     loadBypassUnreadyLoad: Boolean = false,
-                    lsOooFirstOfInstrOnly: Boolean = false,
                     earlyAutoAnWriteback: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
@@ -389,8 +392,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       pcRangeEnable = pcRangeEnable)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
-      loadBypassUnreadyLoad = loadBypassUnreadyLoad,
-      lsOooFirstOfInstrOnly = lsOooFirstOfInstrOnly)
+      loadBypassUnreadyLoad = loadBypassUnreadyLoad)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -400,7 +402,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
       earlyAutoAnWriteback = earlyAutoAnWriteback,
-      earlyStoreDataWake = earlyStoreDataWake)
+      earlyStoreDataWake = earlyStoreDataWake,
+      lsOooIssue = loadBypassUnreadyLoad)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

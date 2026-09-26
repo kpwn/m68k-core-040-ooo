@@ -31,6 +31,13 @@ trait LsEuService {
   // IQ wake/select contract as integer early wakeup. Applies to NZVC-writing loads,
   // stores and CCR restore, not a speculative prediction of their completion.
   def wakeupNzvc: Flow[UInt]   // pNzvcDst of a completing NZVC-writing LS op
+  // ORDER VIOLATION (out-of-order LS issue only). Fires when an op resolves INHIBITED at
+  // P4 while a program-YOUNGER cacheable access has ALREADY launched into the D-cache --
+  // the one case the inhibited barrier cannot prevent, because cacheability is unknowable
+  // until translation. The ROB records it per entry and, when that entry retires at a
+  // macro boundary, flushes everything younger so the wrongly-ordered access re-executes.
+  // A cacheable refill is side-effect free, so the squashed access leaves no trace.
+  def orderViolation: Flow[UInt]  // robId of the inhibited op whose barrier was violated
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -106,7 +113,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val detachedStoreEntries: Int = 1,
                  val earlyAutoStoreAddress: Boolean = false,
                  val earlyAutoAnWriteback: Boolean = false,
-                 val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyStoreDataWake: Boolean = false,
+                 val lsOooIssue: Boolean = false) extends FiberPlugin with LsEuService {
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
@@ -126,6 +134,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
+  var orderViolationPort: Flow[UInt] = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
@@ -146,6 +155,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def sqDrained: Bool          = sqEmptySig
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
+  override def orderViolation: Flow[UInt] = orderViolationPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -259,6 +269,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
+    orderViolationPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    orderViolationPort.simPublic()
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
@@ -1500,9 +1512,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // register randomization spuriously hold even an ORDINARY (non-split) send.
     val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
                           alignedMem(alignedSendPtr).splitSecond && alignedSlotAPending
+    // ── INHIBITED BARRIER, "AFTER" SIDE, PRE-LAUNCH WINDOW (`lsOooIssue`) ──────────
+    // Driven far below, once `p4Inhibited` exists; default False so the shipped in-order
+    // build is untouched. Blocks the ring from SENDING an entry that is program-YOUNGER
+    // than an op which has resolved INHIBITED at P4 but not yet launched.
+    val lsOooBarrierHoldSend = Bool(); lsOooBarrierHoldSend := False
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
-                           !alignedSendHeld
+                           !alignedSendHeld && !lsOooBarrierHoldSend
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
     // Which ring entry does THIS cycle's response answer? By the slot id the command
@@ -3462,6 +3479,64 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
     }
     val p4Ready = !p4Valid || p4CanLeave
+
+    // ═══ INHIBITED ACCESSES ARE TWO-WAY MEMORY BARRIERS (`lsOooIssue`) ═════════════════
+    // Out-of-order LS issue may let a younger CACHEABLE load overtake an older LS op, and
+    // cacheability is unknowable at issue (nothing is translated there) -- which is exactly
+    // why `loadBypassUnreadyLoad` wedged the board and a hit gate could not rescue it. The
+    // decision therefore lives HERE, one stage later, where the cache mode IS known.
+    //
+    // THE "BEFORE" HALF IS ALREADY FREE, and needs no code: `p4LaunchOk` holds every
+    // inhibited op until `p4AtRobHead`, and at the ROB head every program-older
+    // instruction has already retired -- strictly stronger than "no older LS ticket
+    // unresolved".
+    //
+    // THE "AFTER" HALF, POST-LAUNCH, ALSO NEEDS NO COMPARATOR. Because an inhibited op only
+    // launches at the head, once it is in flight every other in-flight LS op is necessarily
+    // younger, so `inhibitedLoadBusySig` is age-correct by construction; and for inhibited
+    // STORES `sq.io.barrier.olderInhibitedStore` already gates P4 launch and is already
+    // age-qualified.
+    //
+    // WHAT IS LEFT is the PRE-LAUNCH window: the op has resolved inhibited at P4 and is
+    // waiting to become the head. A younger ring entry must not send during it. An OLDER
+    // one MUST still be allowed to -- it has to complete and retire for the inhibited op to
+    // reach the head at all, so blocking the whole ring deadlocks. That is the identical
+    // trap StoreQueue's `barrierEnt` comment records ("gating on whole-ring occupancy would
+    // deadlock ... Only OLDER entries gate"), so this mirrors its head-anchored compare
+    // rather than inventing one.
+    //
+    // ONLY AN INHIBITED **LOAD** CAN REACH THIS CASE, which is what keeps it to one
+    // comparator. Under the relaxed rule a younger LS op can never issue before an older
+    // STORE: it may not pass an older UNREADY store (the eligibility prefix), and it cannot
+    // outrank an older READY store either, because the select is `OHMasking.first` over
+    // `eligible & lsReady` and therefore takes the oldest. So no younger access is ever
+    // ahead of an older store, and the inhibited-store direction cannot be violated.
+    def lsOlderThan(a: UInt, b: UInt): Bool = {
+      val w = m68k040.Global.ROB_ID_W_DEFAULT
+      ((a - robHeadIn)(w - 1 downto 0)) < ((b - robHeadIn)(w - 1 downto 0))
+    }
+    val p4InhibBarrier = if (!lsOooIssue) False else p4Valid && p4Inhibited && robHeadValidIn
+    // A POISONED entry is deliberately never blocked: it is a flush leftover that must drain
+    // for the ring to advance, and it produces no architectural effect. (A flush clears
+    // `p4Valid` too, so the barrier drops with it -- this is belt and braces.)
+    lsOooBarrierHoldSend := (if (!lsOooIssue) False else {
+      val e = alignedMem(alignedSendPtr)
+      p4InhibBarrier && !alignedPoisoned(alignedSendPtr) &&
+        !lsOlderThan(e.bk.robId, p4Front.robId)
+    })
+    // VIOLATION: a younger entry that has ALREADY been sent. Unpreventable by definition --
+    // it launched before the barrier was discoverable -- so it is recorded and recovered at
+    // retire instead. Reported every cycle the condition holds; the ROB latches it per entry.
+    val lsOooViolation = if (!lsOooIssue) False else {
+      val anyYoungerSent = (0 until alignedDepth).map { i =>
+        alignedValid(i) && alignedSent(i) && !alignedPoisoned(i) &&
+          !lsOlderThan(alignedMem(i).bk.robId, p4Front.robId)
+      }.reduce(_ || _)
+      p4InhibBarrier && anyYoungerSent
+    }
+    orderViolationPort.valid   := lsOooViolation
+    orderViolationPort.payload := p4Front.robId
+    lsOooBarrierHoldSend.simPublic(); lsOooViolation.simPublic()
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of

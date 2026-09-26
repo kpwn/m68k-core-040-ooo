@@ -110,7 +110,9 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       // throughput-v2 profile with IPC_MEM=l2: +34.1% on call/return (bsr's A7 feeds
       // rts's pop address) and -13.6% cycles on copy-dense code, seed-robust across
       // three seeds, zero regressions across 34 kernels.
-      earlyAutoAnWriteback = ipcThroughput)
+      earlyAutoAnWriteback = ipcThroughput,
+      // Out-of-order LS issue needs the LS-side inhibited barrier; same switch as the IQ.
+      lsOooIssue = SocketTopConfig.LS_OOO_ISSUE)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin(icachePredecodeWords)
     val merge  = new AxiDMergePlugin()
