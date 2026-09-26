@@ -1512,18 +1512,32 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // register randomization spuriously hold even an ORDINARY (non-split) send.
     val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
                           alignedMem(alignedSendPtr).splitSecond && alignedSlotAPending
-    // ── INHIBITED BARRIER, "AFTER" SIDE, PRE-LAUNCH WINDOW (`lsOooIssue`) ──────────
-    // Driven far below, once `p4Inhibited` exists; default False so the shipped in-order
-    // build is untouched. Blocks the ring from SENDING an entry that is program-YOUNGER
-    // than an op which has resolved INHIBITED at P4 but not yet launched.
-    // NO default assignment. A `:= False` here followed by the single unconditional
-    // assignment below is an ASSIGNMENT OVERLAP that SpinalHDL rejects outright -- the
-    // same trap `s1AnEarlyFire`'s comment records in this file. Declared unassigned and
-    // driven EXACTLY ONCE further down; reading a wire before its assignment is fine.
-    val lsOooBarrierHoldSend = Bool()
+    // ── WHY THE INHIBITED BARRIER DOES NOT GATE THIS SEND ─────────────────────────
+    // An earlier revision blocked the ring from SENDING an entry program-YOUNGER than an op
+    // that had resolved INHIBITED at P4, letting OLDER entries through. The decision was
+    // correctly age-qualified and it DEADLOCKED anyway, in sim, on three corpus programs
+    // (`bcc_after_push_vector_rts_trampoline`, `bf_memind_dyn_straddle`,
+    // `bit_ops_full_memind`), tripping "a memory op has been parked in P2 for 20000 cycles
+    // without launching".
+    //
+    // The transport, not the decision, is the problem: the ring sends STRICTLY IN ORDER from
+    // a single advancing `alignedSendPtr`. Relaxed LS issue lets a younger load reach P4
+    // first, so ring order is NOT program order and a younger entry can sit AHEAD of an
+    // older one. Blocking that younger entry at the send pointer also blocks the older entry
+    // BEHIND it, which therefore never completes, never retires, and so the inhibited op
+    // never reaches `p4AtRobHead` and the barrier never lifts. Circular wait.
+    // "Only OLDER entries gate" is meaningless if older entries cannot be REACHED.
+    //
+    // So nothing is blocked here at all. The pre-launch half of the barrier is enforced by
+    // RECOVERY instead (see `lsOooViolation` below): every resident ring entry is treated as
+    // a violation and the inhibited op's retire flushes everything younger. That is
+    // deadlock-free BY CONSTRUCTION rather than by argument -- no send can ever be held --
+    // and it is sound because a cacheable refill is side-effect free and the flush discards
+    // the register result. Older entries are untouched: they retire BEFORE the inhibited op,
+    // so a younger-only flush cannot reach them.
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
-                           !alignedSendHeld && !lsOooBarrierHoldSend
+                           !alignedSendHeld
     val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
     // Which ring entry does THIS cycle's response answer? By the slot id the command
@@ -3520,27 +3534,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       ((a - robHeadIn)(w - 1 downto 0)) < ((b - robHeadIn)(w - 1 downto 0))
     }
     val p4InhibBarrier = if (!lsOooIssue) False else p4Valid && p4Inhibited && robHeadValidIn
-    // A POISONED entry is deliberately never blocked: it is a flush leftover that must drain
-    // for the ring to advance, and it produces no architectural effect. (A flush clears
-    // `p4Valid` too, so the barrier drops with it -- this is belt and braces.)
-    lsOooBarrierHoldSend := (if (!lsOooIssue) False else {
-      val e = alignedMem(alignedSendPtr)
-      p4InhibBarrier && !alignedPoisoned(alignedSendPtr) &&
-        !lsOlderThan(e.bk.robId, p4Front.robId)
-    })
-    // VIOLATION: a younger entry that has ALREADY been sent. Unpreventable by definition --
-    // it launched before the barrier was discoverable -- so it is recorded and recovered at
-    // retire instead. Reported every cycle the condition holds; the ROB latches it per entry.
+    // VIOLATION: any resident ring entry that is program-YOUNGER than the inhibited op.
+    // Deliberately NOT restricted to entries already `alignedSent`: since no send is held
+    // any more, an unsent younger entry WILL launch before the inhibited op does, so it is a
+    // violation in waiting. Reporting it now rather than racing its send keeps the condition
+    // monotonic and the recovery single-shot.
+    //
+    // Poisoned entries are excluded: they are flush leftovers with no architectural effect.
     val lsOooViolation = if (!lsOooIssue) False else {
-      val anyYoungerSent = (0 until alignedDepth).map { i =>
-        alignedValid(i) && alignedSent(i) && !alignedPoisoned(i) &&
+      val anyYounger = (0 until alignedDepth).map { i =>
+        alignedValid(i) && !alignedPoisoned(i) &&
           !lsOlderThan(alignedMem(i).bk.robId, p4Front.robId)
       }.reduce(_ || _)
-      p4InhibBarrier && anyYoungerSent
+      p4InhibBarrier && anyYounger
     }
     orderViolationPort.valid   := lsOooViolation
     orderViolationPort.payload := p4Front.robId
-    lsOooBarrierHoldSend.simPublic(); lsOooViolation.simPublic()
+    if (lsOooIssue) lsOooViolation.simPublic()
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of
