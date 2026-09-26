@@ -644,8 +644,19 @@ object GenSocketTopVerilog {
     // NOT a usable provenance check -- SpinalHDL renames/optimises those away, so an
     // absent name proves nothing about what was built. The generator saying what it built
     // is the only cheap check that cannot lie.
+    // `specLoadWakeup` is HERE and not only in the SoC's `cpu040.provenance` because that
+    // file records the profile env vars the Makefile names explicitly and nothing else --
+    // so a build made with SPEC_LOAD_WAKEUP=1 was indistinguishable from one without it.
+    // That cost a real investigation: the flag reaches the generator through make's
+    // environment -> the flock'd shell -> Vivado's process env -> Tcl `::env` ->
+    // `synth/vivado.tcl`'s `exec env ... sbt runMain GenSocketTopVerilog`, which is four
+    // hops of inference and nothing observable at the end of it. And the artifacts cannot
+    // settle it after the fact: `lsSpecBlocked`, `lsAdvance` and `specWakeFire` are all
+    // absent from `reports/timing_synth.rpt` -- as are the BASELINE signals `lsBusy` and
+    // `lsSkid`, which is the proof that a missing name there means nothing at all.
     println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
+            s"specLoadWakeup=${ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
