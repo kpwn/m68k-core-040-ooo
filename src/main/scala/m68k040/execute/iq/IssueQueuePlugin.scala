@@ -86,7 +86,8 @@ object DynWait {
 
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
-                       val loadBypassUnreadyLoad: Boolean = false) extends FiberPlugin
+                       val loadBypassUnreadyLoad: Boolean = false,
+                       val lsOooFirstOfInstrOnly: Boolean = false) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
@@ -751,7 +752,31 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         if (i == 0) False else inc(i - 1)))
       // `lsPresent` is `s.sel && isLs(s.hot)` and is already built above for `ohLoldest`,
       // so eligibility is one 16-bit AND-NOT rather than a fresh per-slot qualifier.
-      val eligible = lsPresent & ~olderUnreadyStore.asBits
+      // ── INTRA-MACRO RESTRICTION (`lsOooFirstOfInstrOnly`) ─────────────────────────
+      // Needed to make the inhibited-barrier violation RECOVERABLE. Recovery restarts at
+      // the PC of the oldest SQUASHED entry, so that PC must be a macro boundary; and the
+      // flush can only be taken when the inhibited op is at `p0.last` (RobPlugin's
+      // `h0IsMacroLast`, an alloc-time fact). If a violator were a younger uop of the
+      // inhibited op's OWN macro, it would already have retired by `p0.last` and the squash
+      // could not reach it -- and restarting earlier would re-execute the device access,
+      // which is the `inhibited-load-irq-replay` bug (replay re-pops the 53C96).
+      //
+      // Requiring a bypassing uop to be FIRST of its instruction removes the case outright:
+      // every older LS uop is then in a strictly older macro. Only uops that actually
+      // overtake something pay it -- `!olderUnreadyLs` means nothing was overtaken.
+      val intraMacroOk: Bits = if (!lsOooFirstOfInstrOnly) B((BigInt(1) << slotCount) - 1, slotCount bits) else {
+        val lsAnyUnready = (0 until slotCount).map(i => lsPresent(i) && !slots(i).ready)
+        var incA = lsAnyUnready.toIndexedSeq
+        var dA = 1
+        while (dA < slotCount) {
+          val prev = incA
+          incA = (0 until slotCount).map(i => if (i >= dA) prev(i) || prev(i - dA) else prev(i))
+          dA <<= 1
+        }
+        B((0 until slotCount).map(i =>
+          (if (i == 0) True else !incA(i - 1)) || slots(i).hot.firstOfInstr))
+      }
+      val eligible = lsPresent & ~olderUnreadyStore.asBits & intraMacroOk
       OHMasking.first(eligible & lsReady)
     }
     val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed
