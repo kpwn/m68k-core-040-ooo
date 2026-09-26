@@ -224,6 +224,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // before its real producing load lands. Gate on pdstValid.
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
+      // Speculative (cache-hit-predicted) load wakeup; idle unless LOCKSTEP_SPEC_WAKE=1.
+      iq.lsWakeupSpec.valid   := lsEu.wakeupSpec.valid
+      iq.lsWakeupSpec.payload := lsEu.wakeupSpec.payload
       iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
       iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       // ROB retire (slot 0) -> SQ commit; doFlush -> SQ flush (squash speculative).
@@ -513,11 +516,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
-      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"))
+      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
+      specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"))
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(
+      specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
       alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
       earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
       sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),

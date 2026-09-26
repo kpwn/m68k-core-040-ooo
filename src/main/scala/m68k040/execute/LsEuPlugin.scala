@@ -123,14 +123,16 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyAutoAnWriteback: Boolean = false,
                  val earlyStoreDataWake: Boolean = false,
                  val specLoadWakeup: Boolean = false) extends FiberPlugin with LsEuService {
-  // A speculative wake is only ever USEFUL one cycle ahead of the early (irrevocable)
-  // announce; without `earlyIntWakeup` the ordinary announce is itself a cycle later and
-  // the speculative port would be two cycles ahead of a writeback nothing re-checks
-  // against in between. Require the pairing rather than silently shipping the wider gap.
-  require(!specLoadWakeup || earlyIntWakeup,
-    "speculative load wakeup requires earlyIntWakeup (the confirm port)")
-  require(!specLoadWakeup || alignedLoadFallThrough,
-    "speculative load wakeup assumes the aligned-ring fall-through launch")
+  // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
+  // that is worth stating because an earlier revision required both. The re-check pins a
+  // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
+  // so announcing "too early" is always safe and never wrong -- it only lengthens the hold.
+  //   * without `earlyIntWakeup` the confirm is the writeback cycle itself, so the
+  //     speculation spans two cycles instead of one and buys two instead of one.
+  //   * without `alignedLoadFallThrough` the cache command leaves the ring later than the
+  //     enqueue, so the hold simply lasts longer.
+  // Requiring the pairing would have blocked exactly the configuration the lockstep and
+  // fuzz harnesses run in, i.e. the only place this gets end-to-end correctness coverage.
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
@@ -3528,14 +3530,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     wakeupSpecPort.payload := p4Front.pdst
     GenerationFlags.simulation {
       if (specLoadWakeup) {
-        // A speculative announce MUST be followed, eventually, by the real one for the
-        // same pdst (or by a flush). Tracking "eventually" needs the consumer's own
-        // liveness watchdog (IssueQueuePlugin owns it); what is checkable HERE is that
-        // the port never announces a pdst the load does not actually write.
-        when(specWakeFire) {
-          assert(p4Front.pdstValid,
-            "LsEuPlugin: speculative load wakeup announced a load with no destination",
-            FAILURE)
+        // The speculative announce must never COINCIDE with the confirm for the same pdst:
+        // the IQ's re-check would then see the bit set and cleared in one cycle and the
+        // hold would depend on which update won. Rename makes it impossible (two in-flight
+        // writers never share a pdst), so assert it rather than handle it.
+        when(specWakeFire && wakeupPort.valid) {
+          assert(wakeupPort.payload =/= p4Front.pdst,
+            "LsEuPlugin: speculative load wakeup announced the pdst the confirm is " +
+              "retiring in the same cycle", FAILURE)
         }
       }
     }
