@@ -1516,7 +1516,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Driven far below, once `p4Inhibited` exists; default False so the shipped in-order
     // build is untouched. Blocks the ring from SENDING an entry that is program-YOUNGER
     // than an op which has resolved INHIBITED at P4 but not yet launched.
-    val lsOooBarrierHoldSend = Bool(); lsOooBarrierHoldSend := False
+    // NO default assignment. A `:= False` here followed by the single unconditional
+    // assignment below is an ASSIGNMENT OVERLAP that SpinalHDL rejects outright -- the
+    // same trap `s1AnEarlyFire`'s comment records in this file. Declared unassigned and
+    // driven EXACTLY ONCE further down; reading a wire before its assignment is fine.
+    val lsOooBarrierHoldSend = Bool()
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
                            !alignedSendHeld && !lsOooBarrierHoldSend
