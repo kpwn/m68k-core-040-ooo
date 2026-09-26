@@ -390,11 +390,16 @@ class FuzzCoreDut extends Component {
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
   val rob    = new RobPlugin
-  val iq     = new IssueQueuePlugin
+  // FUZZ_SPEC_WAKE=1 turns on speculative (cache-hit-predicted) load wakeup in BOTH the
+  // IQ and the LS EU. Env-read rather than a constructor parameter so the whole fuzz /
+  // lockstep corpus can be replayed against it unmodified -- that corpus is where a
+  // released-too-early consumer would show up as a real architectural divergence.
+  private val fuzzSpecWake = sys.env.get("FUZZ_SPEC_WAKE").contains("1")
+  val iq     = new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake)
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
-  val lsEu   = new LsEuPlugin
+  val lsEu   = new LsEuPlugin(specLoadWakeup = fuzzSpecWake)
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc

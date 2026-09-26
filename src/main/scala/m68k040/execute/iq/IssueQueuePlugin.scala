@@ -969,9 +969,25 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // earlier than the data exists.
     //
     // `specPend[p]` is the prediction's outstanding-set: set by the speculative announce,
-    // cleared by the real one. `specPendEff` additionally forgives the confirm firing THIS
-    // cycle -- without that same-cycle bypass the hold would cost back the exact cycle the
-    // speculation bought (the confirm is registered, the bypass value is not).
+    // cleared by the real one. THE CLEAR IS PURELY REGISTERED -- there is deliberately no
+    // same-cycle "the confirm is firing now, let it through" bypass, and an earlier revision
+    // that had one was WRONG in a way worth recording, because it cost three lock-step
+    // divergences (`fx-mi-cmp-src`, `fx-mi-movea-src`, `fx-mi-alu-order`: dut A2=0xffff867a
+    // against oracle 0xffffdead, i.e. a load from an address built out of a register that
+    // had not been written yet).
+    //
+    // The confirm (`lsWakeup` under `earlyIntWakeup`) announces a writeback that lands in
+    // the PRF bypass the NEXT cycle, not this one. So the cycle to release a consumer in is
+    // the cycle AFTER the confirm -- which is exactly what a registered clear gives, for
+    // free. The bypass looked free because it is unreachable on a HIT (the consumer cannot
+    // reach this register before the confirm; the announce is only one cycle ahead), and
+    // `chase-pure` is 99.6% hits, so it measured perfectly and was silently wrong. It is
+    // reachable on a MISS, where the consumer is already parked here when the confirm
+    // finally arrives -- and there it released the uop one cycle early, straight into a
+    // stale register read.
+    //
+    // Nothing is lost: on the hit path the register has already cleared by the time the
+    // consumer arrives, so the full speculated cycle is still won.
     //
     // A uop whose sources are still pending is simply NOT PRESENTED: `lsPiped.valid` drops
     // and the register does not advance, so nothing downstream ever sees it and no wrong
@@ -998,7 +1014,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // future consumer forever.
       when(flushSignal) { pend := B(0, physIntN bits) }
       pend.simPublic()
-      pend & ~clrOh
+      pend
     }
     val lsSpecBlocked: Bool = if (!specLoadWakeup) False else {
       val u = lsIssHot
