@@ -1945,6 +1945,104 @@ trait CoreBenchHarness extends AnyFunSuite {
       warmupInstrs = setup.size + records * perIter)   // one full cold walk
   }
 
+  /** MEMCPY BANDWIDTH probe -- the instrument this corpus has never had.
+    *
+    * The project's goal is a core with high parallelism and high BANDWIDTH, and
+    * nothing here measures bandwidth. `load-stream`'s ENTIRE working set is TWO
+    * LINES; every other kernel fits comfortably inside the 8 KB L1. So the bench has
+    * never once asked how many BYTES PER CYCLE this machine can move.
+    *
+    * SIZING IS THE DESIGN. L1D is 8 KB, 4-way, 16-byte lines; the SoC L2 is 2 MB,
+    * 8-way, 64-byte lines (`l2c_data.v:4`). A working set that EXCEEDS L1 but FITS IN
+    * L2 puts every access in the regime that matters for memory-level parallelism:
+    * every load misses L1 and hits L2, and because the L2 line is 4x the L1 line a
+    * sequential stream takes FOUR consecutive L1 misses per L2 line -- all serialised
+    * today, since D-side MLP is measured at exactly 1.000 mean AND 1 max at every
+    * injected miss rate up to 100%.
+    *
+    * Little's Law is why this is the D-side MSHR lever's instrument:
+    *
+    *     bandwidth = bytes_per_miss x MLP / miss_latency
+    *
+    * At MLP 1, 16 bytes and ~10 cycles per miss that is ~1.6 B/cycle -- and NO
+    * workload can beat it however well it streams. **Report BYTES PER CYCLE**, not
+    * only a cycle delta: a cycle delta on a fixed copy hides which term moved.
+    *
+    * `passes` is load-bearing, not padding. A SINGLE pass touches every line for the
+    * first time, so every miss is compulsory and goes to DRAM -- that measures DRAM
+    * streaming, not the L2-hit regime. Pass 1 is therefore charged to `warmupInstrs`
+    * and passes 2..N are the measurement, where the region is L2-resident but still
+    * far too big for L1.
+    *
+    * ⚠️ `copybackDtt = true` is MANDATORY here, not a variant. Under the default
+    * `copybackDtt = false` EVERY store is PRECISE (~12.4 cycles against ~1.31), which
+    * turns a bandwidth bench into a store-latency bench -- the default that has
+    * already produced two wrong conclusions in this project.
+    *
+    * The body is `move.l (%a0)+,(%a1)+` x4 = exactly ONE 16-byte L1 line per
+    * iteration, so iterations map 1:1 onto L1 lines. Loop control is `subq.l`/`bne.s`
+    * DELIBERATELY rather than `dbra`, so this kernel does not confound with the
+    * slot-1 DBcc deferral lever.
+    *
+    * Verification is real, not a liveness check: `prepMem` fills the source so every
+    * long CONTAINS ITS OWN ADDRESS, and the epilogue loads the LAST copied long.
+    * `d0 == Src + bytes - 4` proves the data actually moved AND landed at the right
+    * offset; `d7 == 0` proves the inner loop ran to completion. A copy that shifted
+    * by one long, or stopped early, fails both.
+    *
+    * NOTE on MOVE16: the 68040's dedicated cache-line-move instruction is microcoded
+    * here into 4 LONG transfers (`Microcode.scala:2417`), i.e. 8 D-cache accesses per
+    * 16 bytes, so a MOVE16-based copy is NOT currently a faster path and this
+    * `move.l` loop is the fair baseline. */
+  def kMemcpy(bytes: Int = 16384, passes: Int = 4, label: String = "memcpy-16k"): Kernel = {
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded; need at least one measured pass")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a          // every long contains its own address
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move.l (%a0)+,(%a1)+", "move.l (%a0)+,(%a1)+",
+                    "move.l (%a0)+,(%a1)+", "move.l (%a0)+,(%a1)+",
+                    "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(label, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      // Pass 1 is the compulsory-miss / L2 warm pass and is NOT measured.
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        // d0 = the LAST copied long, which prepMem made equal to its own SOURCE
+        // address: proves the data really moved and landed at the right offset,
+        // not merely that the loop ran. d7 = 0 proves the inner loop completed.
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"memcpy: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + bytes - 4) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"memcpy copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        assert(lastOf(7) == 0L, s"memcpy inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
   def kLoadStream: Kernel = {
     val iters = 60
     val addrs = Seq(0x4000, 0x4004, 0x4008, 0x400c, 0x4010, 0x4014)
