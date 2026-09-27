@@ -12,7 +12,38 @@ package m68k040.top
   *
   * Rule: a knob that differs between sim and the shipping build is a BUG. Anything a
   * bench or test DUT wants to vary must be varied explicitly and named in the test, never
-  * by diverging from these values. */
+  * by diverging from these values.
+  *
+  * ⛔ SECOND RULE, ADDED 2026-09-27 AFTER IT COST A BOARD NUMBER:
+  *
+  *     A flag that is default-OFF *PENDING MEASUREMENT* must have an env override, or it
+  *     cannot be measured -- and the attempt will SILENTLY PRODUCE A BASELINE. A
+  *     settled-decision constant does not need one, provided it PRINTS.
+  *
+  * This is narrower than "every flag needs an override", and the narrowness is the point.
+  * `dcacheHitUnderMiss = true` is a settled decision: it prints in `SHIPPING_CONFIG`, and
+  * nobody is going to A/B it. `rasBranchRepair` and `dcacheHitUnderMissRead` are the other
+  * shape entirely -- each says "OFF pending a board measurement" in its own comment, which
+  * is a standing invitation to build one ON.
+  *
+  * WHAT HAPPENED. `rasBranchRepair` was a hardcoded `false` with that invitation in its
+  * comment. A `CPU_RAS_BRANCH_REPAIR=1` build was made, measured at 55,534.6
+  * Dhrystones/sec on silicon, and attributed to the RAS repair. The variable was silently
+  * ignored: that bitstream was a BASELINE, its own provenance line said
+  * `rasBranchRepair=false`, and the number had to be withdrawn. `build_id` could not have
+  * caught it -- it reads 0xD01DBDC5 on three different bitstreams -- so the provenance
+  * line is the only discriminator there is.
+  *
+  * This is the FOURTH instance in this core of "the shipping configuration is not the
+  * tested configuration", after `icMaintFlush` (wired in one top only), `RobPlugin(
+  * lsOooIssue)` (set in no sim harness) and `alignedLoadFallThrough` (true on the board,
+  * false in every fuzz DUT).
+  *
+  * ✅ AND THE CHECK THAT CATCHES IT, which costs one extra generation: after adding an
+  * override, GENERATE TWICE -- once with the variable set, once without -- and DIFF THE
+  * `SHIPPING_CONFIG` LINE. "The variable is accepted" is not the same claim as "the
+  * variable reaches the netlist", and only the second one is worth anything. Both flags
+  * below have been round-tripped that way. */
 object ShippingCoreConfig {
   /** D-cache: serve a resolved command from its already-decided early-probe entry while
     * the FSM refills for an older, provably cacheable access. See
@@ -21,7 +52,10 @@ object ShippingCoreConfig {
     * ON. This arm touches NO array: it reads no tag/data port, issues no AXI, and lands
     * in the registered S2 stage. So it cannot widen the `rdEn` cone that sets the design's
     * critical path (below). Worth +4.0% on `dhrystone-x0-cb` in sim.
-    */
+    *
+    * NO ENV OVERRIDE, DELIBERATELY, and that is the second rule above applied rather than
+    * forgotten: this is a SETTLED DECISION, not a knob pending measurement. It prints in
+    * `SHIPPING_CONFIG`, which is the whole obligation such a constant has. */
   val dcacheHitUnderMiss: Boolean = true
 
   /** D-cache: additionally accept such a command with a REAL S1 array read, parking an S1
@@ -41,8 +75,21 @@ object ShippingCoreConfig {
     * critical-path width for 0.9% is the wrong trade when the design is 198 ps short.
     *
     * The code stays (it is correct, and it carries the REPLAY identity fix and the
-    * miss-park handler); only the arm is disabled. */
-  val dcacheHitUnderMissRead: Boolean = false
+    * miss-park handler); only the arm is disabled.
+    *
+    * ⚠️ HAD NO ENV OVERRIDE until 2026-09-27, and it is the exact shape that had just cost
+    * a board number on `rasBranchRepair`: default-OFF *pending measurement*, with no way to
+    * build it ON but an RTL edit. Anyone A/B-ing it would have got a plausible number from
+    * a bitstream that does not contain the feature. `CPU_DCACHE_HIT_UNDER_MISS_READ=1`
+    * enables it; default stays OFF, the value is echoed in `SHIPPING_CONFIG`, and the
+    * override has been round-tripped through two generations (see the second rule above).
+    *
+    * ⚠️ AND WHEN IT IS MEASURED, MEASURE FMAX, NOT ONLY CYCLES. The reason it is off is a
+    * ROUTED critical path, so a cycle win on the bench is not the question -- the question
+    * is whether the `rdEn` cone still closes at 200 MHz. A build that gains 0.9% cycles
+    * and loses the clock is a loss. */
+  val dcacheHitUnderMissRead: Boolean =
+    sys.env.get("CPU_DCACHE_HIT_UNDER_MISS_READ").contains("1")
 
   /** RAS: on a mispredict redirect, re-apply the flushing branch's OWN return-address-stack
     * effect after the checkpoint restore. See `RasPlugin.branchRepair` for the mechanism
