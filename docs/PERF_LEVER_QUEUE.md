@@ -191,34 +191,25 @@ Order of work, cheapest first:
 397 bits** — 384 is the last free width and a 9th predecode bit costs +2 tiles. Check
 width efficiency before widening anything into a tile.
 
-## Lever 10 — age-matrix IQ, judged on FANOUT not area (reopened 2026-09-27)
+## Lever 10 — age-matrix IQ: CLOSED, dead on area AND on fanout (2026-09-27)
 
-I closed this on the wrong criterion. The measured **+3,487 LUT (+2.25%)** is real and 4x
-the ~800 LUT noise floor — but the change was never proposed as an area win. Its claim:
+Reopened on the fanout claim, then measured at 200 MHz with congestion reports:
 
-- **`push.fire`'s direct flop-bit fanout inside the IQ drops 2,746 -> 994** (-64%),
-  split across 8 per-line enables
-- **IPC is bit-identical**, so there is no performance risk to weigh against the cost
-- FFs are free here (~21% utilised); it spends +406
-- and on THIS design **area anti-correlates with WNS**: the area-only netlist was 5,048
-  LUT SMALLER than m20 and closed WORSE. Congestion is pin DENSITY, and Vivado's own
-  remedy (`CELL_BLOAT_FACTOR`) makes designs BIGGER. So +3,487 LUT is not evidence
-  against a congestion lever — it is the expected shape of one.
+| | OFF | ON |
+|---|---|---|
+| WNS | −0.283 | −0.273 (**+0.010 ns — 40x below the ±0.4 ns netlist sensitivity**) |
+| congestion level | **5** | **5** |
+| character | Short, East + West | Long, North |
+| wire/cell | 2.787 / 3.161 | 2.348 / **4.023** |
+| attributed to | socket_core 80%, **`LsEuPlugin_logic_sq` 16%/14%** | socket_core 56%/65%, **`LsEuPlugin_logic_sq` 32%/28%** |
 
-**It is UNMEASURED on its own claim, not dead.** The 100 MHz lane cannot judge it: both
-arms close trivially there, so lane WNS says nothing about the tight constraint.
+**`IssueQueuePlugin` does not appear in the congestion attribution at all, in either
+arm.** The change cuts IQ fanout in a block that is not congested. Level stays 5; the
+hotspot just moves. Dead on both counts — do not revisit.
 
-⚠️ **And a naive 200 MHz WNS A/B is also weak**: netlist sensitivity on this design is
-**±0.4 ns**, and the two arms ARE different netlists, so a single WNS pair cannot be
-distinguished from that sensitivity unless the effect is large. What would convince:
-1. **post-place congestion** (`report_design_analysis -congestion`, per-region levels) —
-   directly the quantity the fanout claim is about, and far less lottery-prone than WNS;
-2. **the specific endpoints** — does the IQ select cone's slack improve, and does
-   `push.fire` leave the worst-path list? A targeted improvement is credible where a
-   global WNS delta is not;
-3. WNS only as corroboration, never as the sole evidence.
-
-Running: `build/iqam200_{off,on}` at 200 MHz, congestion-first.
+✅ **Carry-forward: the congestion lives in the STORE QUEUE** (`LsEuPlugin_logic_sq`,
+in every congested window of both arms, share growing 16% → 32%). That is where to
+look if congestion is ever the target.
 
 ## Measured DEAD — do not revisit
 
