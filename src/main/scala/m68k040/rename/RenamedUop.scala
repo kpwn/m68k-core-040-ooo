@@ -36,6 +36,10 @@ case class RenamedUop() extends Bundle {
   // RTD, independent of anInc (RTD's anInc is always 0, see DecodedUop.isReturn's
   // doc). Consumed by BranchEuPlugin's BTB/FTB training-exclusion. Threaded.
   val isReturn     = Bool()
+  // Architectural-CALL classification (RAS flush-repair): True for the BRANCH µop of a
+  // BSR/JSR. Consumed by BranchEuPlugin, which forwards it on its completion port so the
+  // ROB can hand the RAS the push a `checkpointRestore` reverts. Threaded from decode.
+  val isCall       = Bool()
   // Stack-push store (BSR/JSR): addr = psrcA - sizeBytes; data = imm; int dst (A7)
   // := the predecremented address. Threaded from decode.
   val stkPush      = Bool()

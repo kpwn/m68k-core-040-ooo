@@ -335,6 +335,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // starts at a flop Q with the whole period in front of it.
       ras.logic.checkpointSave    := rob.logic.countIsZero
       ras.logic.checkpointRestore := rasCheckpointRestore
+      // RAS flush-repair (RasPlugin `branchRepair`) -- LOCKSTEP_RAS_BRANCH_REPAIR=1.
+      require(rob.rasBranchRepair == ras.branchRepair, "rasBranchRepair must agree")
+      if (rob.rasBranchRepair) {
+        ras.logic.repairValid := rob.logic.earlyFire
+        ras.logic.repairKind  := rob.logic.rasRepairKind
+        ras.logic.repairData  := rob.logic.rasRepairData
+      }
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -498,7 +505,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin
+    val ras    = new m68k040.frontend.RasPlugin(
+      branchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"))
     val gsh    = new m68k040.frontend.GsharePlugin(
       retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
@@ -514,7 +522,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
-      preparedRetireEntries = preparedCap)
+      preparedRetireEntries = preparedCap,
+      rasBranchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"))
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"))

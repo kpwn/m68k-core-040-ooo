@@ -31,6 +31,14 @@ class RasPluginSpec extends AnyFunSuite {
       ras.logic.invalidateAll    := iInval
       ras.logic.checkpointSave   := iCkSave
       ras.logic.checkpointRestore := iCkRestore
+      // branchRepair ports (see RasPlugin's class comment). Driven unconditionally: with
+      // the option OFF they are inert wires, so every pre-existing test is unaffected.
+      val iRepairValid = in Bool ()
+      val iRepairKind  = in UInt (RasRepair.W bits)
+      val iRepairData  = in UInt (32 bits)
+      ras.logic.repairValid := iRepairValid
+      ras.logic.repairKind  := iRepairKind
+      ras.logic.repairData  := iRepairData
       val oPredValid  = out(Bool());        oPredValid  := ras.logic.predValid
       val oPredTarget = out(UInt(32 bits)); oPredTarget := ras.logic.predTarget
       val oRasSp = out(UInt(ras.logic.spBits bits)); oRasSp := ras.logic.rasSp
@@ -38,10 +46,10 @@ class RasPluginSpec extends AnyFunSuite {
     }
   }
 
-  class RasDut extends Component {
+  class RasDut(branchRepair: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
-    val ras  = new RasPlugin
+    val ras  = new RasPlugin(branchRepair = branchRepair)
     val wire = new RasWirePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), ras, wire)) }
   }
@@ -53,6 +61,9 @@ class RasPluginSpec extends AnyFunSuite {
     dut.wire.logic.iInval     #= false
     dut.wire.logic.iCkSave    #= false
     dut.wire.logic.iCkRestore #= false
+    dut.wire.logic.iRepairValid #= false
+    dut.wire.logic.iRepairKind  #= RasRepair.NONE
+    dut.wire.logic.iRepairData  #= 0
     cd.waitSampling()
   }
 
@@ -86,6 +97,21 @@ class RasPluginSpec extends AnyFunSuite {
     dut.wire.logic.iPopValid #= true
     cd.waitSampling()
     dut.wire.logic.iPopValid #= false
+  }
+
+  /** The REDIRECT a mispredicting branch causes, exactly as the wiring layer presents it:
+    * `checkpointRestore` and the three `branchRepair` ports are asserted on the SAME cycle
+    * (the RAS itself delays the repair by one flop so it reads the restored stack -- see
+    * RasPlugin's class comment), then two cycles pass for restore + repair to land. */
+  def redirect(dut: RasDut, cd: ClockDomain, kind: Int, data: Long): Unit = {
+    dut.wire.logic.iCkRestore   #= true
+    dut.wire.logic.iRepairValid #= true
+    dut.wire.logic.iRepairKind  #= kind
+    dut.wire.logic.iRepairData  #= data
+    cd.waitSampling()
+    dut.wire.logic.iCkRestore   #= false
+    dut.wire.logic.iRepairValid #= false
+    cd.waitSampling(2)
   }
 
   test("empty RAS predicts nothing (no-predict on underflow)", VerilatorTest) {
@@ -254,6 +280,108 @@ class RasPluginSpec extends AnyFunSuite {
       restore(dut, cd)
       sleep(1)
       assert(predict(dut) == (true, 0x2000L), "restoring the same steady-state checkpoint is a no-op")
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  //  branchRepair: THE MISPREDICTED CALL'S OWN PUSH (2026-09-27)
+  //
+  //  The defect these pin is measured, not argued: the flush a mispredicting branch
+  //  causes rolls the RAS back to a checkpoint that PREDATES that branch, so when the
+  //  branch IS the call its own -- already architectural -- push is reverted and the
+  //  callee's `rts` gets no prediction at all. On the `br-ind` probe that is 1024 of
+  //  2050 retired mispredicts: EVERY mispredicted call costs TWO.
+  //
+  //  Each test below states the property at the predictor's own output (`predTarget` IS
+  //  what the callee's `rts` will be predicted with), and each FAILS with branchRepair
+  //  off -- the first two assert the value the un-repaired RAS cannot produce, and the
+  //  idempotence test asserts the stack depth a blind re-push would get wrong.
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  test("branchRepair: a mispredicted CALL keeps its own push, so the callee's rts predicts", VerilatorTest) {
+    SimConfig.withVerilator.compile(new RasDut(branchRepair = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      // An older, correct-path call is already on the stack.
+      push(dut, cd, 0xA000)
+      // The ROB drains -> the checkpoint is refreshed HERE, i.e. BEFORE the call below.
+      // This is the wiring layer's `rob.countIsZero` proxy and it is the whole defect:
+      // on this front-end-starved machine the ROB is empty most cycles, so the
+      // checkpoint is fresh -- but it is never fresh enough to include the branch the
+      // flush is FOR.
+      save(dut, cd)
+      cd.waitSampling(2)
+      // THE CALL: `jsr (%a0)` at 0x1230, so its fall-through (the return address it also
+      // pushed on the real stack) is 0x1234. The frontend pushes it at fetch.
+      push(dut, cd, 0x1234)
+      // Wrong path: the BTB's stale target sent fetch somewhere else, and it fetched
+      // another call before the mispredict was discovered.
+      push(dut, cd, 0x9999)
+      sleep(1)
+      assert(predict(dut) == (true, 0x9999L), "the wrong-path push is visible before the redirect")
+      // The branch EU resolves the call: wrong target -> redirect. Restore + repair.
+      redirect(dut, cd, RasRepair.CALL, 0x1234)
+      assert(predict(dut) == (true, 0x1234L),
+        s"after a mispredicted CALL the top of stack must be the call's own return address " +
+        s"0x1234 (got 0x${predict(dut)._2.toHexString}) -- this IS the callee's rts prediction")
+      // And the stack below it is intact, so the CALLER's return still predicts too.
+      pop(dut, cd); sleep(1)
+      assert(predict(dut) == (true, 0xA000L), "the caller's own return address is still below it")
+    }
+  }
+
+  test("branchRepair is IDEMPOTENT: a checkpoint that already holds the push is not double-pushed", VerilatorTest) {
+    SimConfig.withVerilator.compile(new RasDut(branchRepair = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      push(dut, cd, 0xA000)
+      push(dut, cd, 0x1234)          // the call's fetch-time push
+      save(dut, cd)                  // the ROB drained AFTER it -> the checkpoint HAS it
+      cd.waitSampling(2)
+      push(dut, cd, 0x9999)          // wrong path
+      redirect(dut, cd, RasRepair.CALL, 0x1234)
+      val (sp, count) = spCount(dut)
+      assert(predict(dut) == (true, 0x1234L), "top of stack is the call's return address")
+      assert(count == 2, s"the push must NOT be applied twice (count=$count, want 2) -- a blind " +
+        "re-push would leave the stack one deep and move the second mispredict to the CALLER's rts")
+      assert(sp == 2, s"sp must match the two live entries (got $sp)")
+      pop(dut, cd); sleep(1)
+      assert(predict(dut) == (true, 0xA000L), "and the entry below is the caller's, not a duplicate")
+    }
+  }
+
+  test("branchRepair: a mispredicted RETURN keeps its own pop, so the caller's rts predicts", VerilatorTest) {
+    SimConfig.withVerilator.compile(new RasDut(branchRepair = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      push(dut, cd, 0xA000)          // the caller's return address
+      push(dut, cd, 0x1234)          // the callee's return address
+      save(dut, cd)                  // the ROB drains -> checkpoint = both entries
+      cd.waitSampling(2)
+      // The callee's `rts` is RAS-predicted to 0x1234 and pops. It mispredicts (the real
+      // return address on the stack differs -- a stale entry, or a non-LIFO return), so a
+      // redirect follows. WITHOUT the repair the restore puts 0x1234 BACK, and the
+      // CALLER's later rts then pops the callee's address and mispredicts in its turn.
+      pop(dut, cd)
+      sleep(1)
+      assert(predict(dut) == (true, 0xA000L), "the pop is visible before the redirect")
+      redirect(dut, cd, RasRepair.RET, 0x1234)
+      val (_, count) = spCount(dut)
+      assert(count == 1, s"the return's own pop must survive the restore (count=$count, want 1)")
+      assert(predict(dut) == (true, 0xA000L),
+        s"the caller's return address must be on top, not the callee's " +
+        s"(got 0x${predict(dut)._2.toHexString})")
+    }
+  }
+
+  test("branchRepair: a redirect for a branch that is NEITHER a call nor a return only restores", VerilatorTest) {
+    SimConfig.withVerilator.compile(new RasDut(branchRepair = true)).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+      push(dut, cd, 0xA000)
+      save(dut, cd)
+      cd.waitSampling(2)
+      push(dut, cd, 0x9999)          // wrong-path call, fetched past a mispredicted Bcc
+      redirect(dut, cd, RasRepair.NONE, 0)
+      val (sp, count) = spCount(dut)
+      assert((sp, count) == (1L, 1L), s"kind=NONE must leave the plain restore alone (sp=$sp count=$count)")
+      assert(predict(dut) == (true, 0xA000L), "the restored correct-path top is unchanged")
     }
   }
 }

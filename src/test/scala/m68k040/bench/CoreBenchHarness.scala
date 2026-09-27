@@ -238,6 +238,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       // starts at a flop Q with the whole period in front of it.
       rasP.logic.checkpointSave    := rob.logic.countIsZero
       rasP.logic.checkpointRestore := rasCheckpointRestore
+      // RAS flush-repair (RasPlugin `branchRepair`) -- same three bare register Qs the
+      // shipping wiring drives; see BackendWiringPlugin.
+      require(rob.rasBranchRepair == rasP.branchRepair, "rasBranchRepair must agree")
+      if (rob.rasBranchRepair) {
+        rasP.logic.repairValid := rob.logic.earlyFire
+        rasP.logic.repairKind  := rob.logic.rasRepairKind
+        rasP.logic.repairData  := rob.logic.rasRepairData
+      }
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -359,6 +367,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     loadBypassUnreadyLoad: Boolean = false,
                     earlyAutoAnWriteback: Boolean = false,
                     specLoadWakeup: Boolean = false,
+                    rasBranchRepair: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -378,7 +387,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin
+    val ras    = new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
     val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
@@ -391,7 +400,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
-      pcRangeEnable = pcRangeEnable)
+      pcRangeEnable = pcRangeEnable, rasBranchRepair = rasBranchRepair)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
@@ -559,7 +568,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       // show misses near zero over its measured window -- if it does not, the kernel is
       // measuring cold refills instead of the recurrence it claims.
       dcLoadLookups: Int = 0,
-      dcLoadMisses: Int = 0
+      dcLoadMisses: Int = 0,
+      // RETIRED mispredicts: one per `RobPlugin.branchRedirect` pulse, i.e. exactly what
+      // the board's `OFF_MISPRED_COUNT` counts (a mispredicting branch reaching the ROB
+      // head), and NOT the branch EU's completion-time count, which includes wrong-path
+      // branches that never retire. This is the primary metric for any predictor change.
+      retiredMispredicts: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -1587,7 +1601,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         captureIssueHisto.slice(lo, hi + 1).count(_._3),
         queuedAdmissionHisto.slice(lo, hi + 1).count(identity),
         dcLdLookupHisto.slice(lo, hi + 1).count(identity),
-        dcLdMissHisto.slice(lo, hi + 1).count(identity))
+        dcLdMissHisto.slice(lo, hi + 1).count(identity),
+        t2BranchRedirects)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")

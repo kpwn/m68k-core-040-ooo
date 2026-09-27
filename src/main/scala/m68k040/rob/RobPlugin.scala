@@ -47,7 +47,11 @@ object DebugHaltReasonCode {
 class RobPlugin(val detailedPerf: Boolean = false,
                 val pairCorrectBranch: Boolean = false,
                 val preparedRetireEntries: Int = 0,
-                val pcRangeEnable: Boolean = true) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
+                val pcRangeEnable: Boolean = true,
+                /** Forward the flushing branch's own RAS push/pop to RasPlugin's
+                  * `branchRepair` ports. DEFAULT OFF; both plugins must agree (checked in
+                  * BackendWiringPlugin). See RasPlugin's class comment. */
+                val rasBranchRepair: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
   private var haltAfterLoadHoldWire: Bool = null
@@ -428,6 +432,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
     branchCompletion.payload.btbLen.allowOverride;     branchCompletion.payload.btbLen := U(0, 4 bits)
     branchCompletion.payload.phtValid.allowOverride;   branchCompletion.payload.phtValid := False
     branchCompletion.payload.phtIndex.allowOverride;   branchCompletion.payload.phtIndex := U(0, 11 bits)
+    branchCompletion.payload.rasKind.allowOverride;    branchCompletion.payload.rasKind := U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits)
+    branchCompletion.payload.rasData.allowOverride;    branchCompletion.payload.rasData := U(0, 32 bits)
     branchCompletion.simPublic()
 
     // ── Retire-time BTB update output (BtbUpdateService) ────────────────────────
@@ -3425,6 +3431,25 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val earlyRobId = Reg(UInt(robIdW bits)) init 0
     val earlyPcReg = Reg(UInt(32 bits))     init 0
     earlyRobId.simPublic(); earlyPcReg.simPublic()
+    // ── RAS flush-repair carry (RasPlugin `branchRepair`) ────────────────────────
+    // The RAS restore that a redirect triggers rolls the stack back to a checkpoint that
+    // PREDATES the mispredicting branch, so a mispredicted call loses its own -- already
+    // architectural -- push and its callee's `rts` then has no prediction at all. These
+    // two registers carry that branch's own RAS delta alongside `earlyPcReg`, latched by
+    // the SAME `earlyArm` decision, so during `earlyFire` they describe exactly the branch
+    // being redirected for (identical discipline to `earlyPcReg`, which `faRedir` reads on
+    // that cycle). Consumed as BARE REGISTER Qs by the frontend -- RasPlugin puts another
+    // flop in front of the action -- so nothing is added to the redirect cone.
+    //
+    // TIER 1 ONLY, on purpose. When Tier 1 owns the redirect, Tier 2 suppresses the
+    // frontend flush (`earlySuppressFe`) and therefore the RAS restore too, so one repair
+    // covers the whole event. The residual is a Tier-2 flush that Tier 1 never armed for
+    // (an exception or debug event won the arbitration, or the robId/PC confirm failed):
+    // there the RAS falls back to today's behaviour. Measured as a bounded residual by
+    // `RasBranchRepairIpcSpec`, not assumed.
+    val rasRepairKind = if (rasBranchRepair) Reg(UInt(m68k040.frontend.RasRepair.W bits)) init U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits) else null
+    val rasRepairData = if (rasBranchRepair) Reg(UInt(32 bits)) init 0 else null
+    if (rasBranchRepair) { rasRepairKind.simPublic(); rasRepairData.simPublic() }
 
     // Oldest-wins arbitration, NaxRiscv `CommitPlugin.scala:118-144`. Age is
     // `robId - head` mod 64, the same wraparound-safe idiom `faultWin` uses at the
@@ -3444,6 +3469,10 @@ class RobPlugin(val detailedPerf: Boolean = false,
       earlyPend  := True
       earlyRobId := branchCompletion.payload.robId
       earlyPcReg := branchCompletion.payload.nextPc
+      if (rasBranchRepair) {
+        rasRepairKind := branchCompletion.payload.rasKind
+        rasRepairData := branchCompletion.payload.rasData
+      }
     }
     // Tier 2 releases the halt. Registered assignment => `earlyPend` still reads
     // True on the `flushing` cycle itself (see the note above). Placed AFTER the

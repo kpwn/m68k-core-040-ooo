@@ -2895,6 +2895,7 @@ object Microcode {
     u.isBranch := Bool(d.uop == UMiBranchFinal || d.uop == UMiScc); u.ibranch := Bool(d.uop == UMiBranchFinal)
     u.stkPush  := Bool(d.uop == UMiPushFinal);   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
+    u.isCall   := False   // ... and never a call either (see DecodedUop.isCall)
     u.cond := (if (d.uop == UMiScc) ctx.opword(11 downto 8) else B(0, 4 bits))
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
@@ -3482,6 +3483,7 @@ object Microcode {
     u.isBranch := (d.uop === UOpHw.UMiBranchFinal) || (d.uop === UOpHw.UMiScc); u.ibranch := d.uop === UOpHw.UMiBranchFinal
     u.stkPush  := d.uop === UOpHw.UMiPushFinal;   u.anInc   := 0
     u.isReturn := False   // µcode UMiBranchFinal is a plain indirect branch, never a return
+    u.isCall   := False   // ... and never a call either (see DecodedUop.isCall)
     u.cond := Mux(d.uop === UOpHw.UMiScc, ctx.opword(11 downto 8), B(0, 4 bits))
     // bfIllegal: deliver a vector-4 ILLEGAL (the out-of-scope Do=1-at-abs-EA dynamic
     // RMW/INS forms route here — trap, NOT silent-wrong).
