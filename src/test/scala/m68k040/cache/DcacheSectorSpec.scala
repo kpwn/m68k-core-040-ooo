@@ -66,6 +66,10 @@ class DcacheSectorSpec extends AnyFunSuite {
   // vacuously by taking the REPLAY array relaunch instead.
   private lazy val sectoredDut =
     M68kSim().withVerilator.compile(new Dut(sectored = true, fillForward = true))
+  /** The UNSECTORED arm, built only for the capacity probe below -- the one measurement
+    * that is meaningless without both arms in the same units. */
+  private lazy val flatDut =
+    M68kSim().withVerilator.compile(new Dut(sectored = false, fillForward = true))
 
   /** A distinctive per-address byte so a wrong-sector read is unmistakable rather than
     * plausibly-zero. */
@@ -75,6 +79,8 @@ class DcacheSectorSpec extends AnyFunSuite {
 
   private val SECTOR = 16
   private val LINE   = 64
+  /** Sectors per line in the sectored arm; used only by the capacity probe. */
+  private val nSecTest = LINE / SECTOR
 
   private def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
@@ -347,6 +353,98 @@ class DcacheSectorSpec extends AnyFunSuite {
         s"DIRTY sibling sector -- reintroducing, through the fill path, exactly the " +
         s"silent write loss that sectoring exists to prevent.")
     }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────
+  // 3c. SIZING THE OWNER-ACCEPTED COST: the scattered-access capacity regression.
+  // ───────────────────────────────────────────────────────────────────────────────
+  /** The amendment records this as a KNOWN, RATIFIED cost ("memory bandwidth is
+    * valuable") and explicitly not a gate -- but also says an accepted cost of UNKNOWN
+    * SIZE is harder to trade away later, and that the corpus cannot show it because no
+    * scattered kernel has a footprint larger than L1. That coverage hole is real at the
+    * CORE level, but it does not apply here: the D-cache DUT can be driven directly, so
+    * the cost is measurable now instead of waiting for a new core kernel.
+    *
+    * ⚠ WHY THE PATTERN MUST BE SCATTERED AND NOT STRIDED. A uniform 64-byte stride
+    * measures NOTHING: in the unsectored arm the set index is `paddr[10:4]`, so a
+    * stride of 64 steps the set by 4 and touches only 32 of the 128 sets -- giving it
+    * 32 x 4 x 16 B = 2 KB of usable capacity, which is EXACTLY what the sectored arm has
+    * (32 sets x 4 ways x 16 useful bytes). The two arms tie, and the regression is
+    * invisible. It only appears when the addresses spread across all sets, i.e. when
+    * they are scattered. Getting this wrong would have produced a confident "sectoring
+    * is free" from a probe that structurally could not see the cost.
+    *
+    * The prediction from the geometry is 4x: one tag now covers 64 bytes, so a workload
+    * touching ONE sector per line gets 128 x 16 B = 2 KB of effective capacity instead
+    * of 512 x 16 B = 8 KB. */
+  private def scatterMissRate(compiled: spinal.core.sim.SimCompiled[Dut], tag: String): Double = {
+    var rate = 0.0
+    compiled.doSim(s"scatter-capacity-$tag") { d =>
+      val (cd, mem) = initDut(d)
+      // 256 distinct 64-byte lines, one 16-byte sector touched in each, scattered over a
+      // 64 KB span. A FIXED shuffle, not a random one, so both arms see the identical
+      // address sequence and the comparison is a matched pair.
+      val span  = 0x10000
+      val base  = 0x80000L
+      // ⚠ THE SECTOR INDEX MUST BE INDEPENDENT OF THE LINE INDEX. The first version of
+      // this probe used `(l % 4) * SECTOR`, which is a FUNCTION of `l` -- and in the
+      // unsectored arm the set is `paddr[10:4] = 4*(l mod 32) + sec`, so a correlated
+      // `sec` collapses the address set onto only 32 of the 128 sets, oversubscribing
+      // them 2:1 and driving BOTH arms to a 100% pass-2 miss rate. The probe then
+      // reported a +0.0 pp "regression" from two saturated arms. With `sec` drawn
+      // independently the expression spans all 128 unsectored sets, while the sectored
+      // arm's line index stays `paddr[10:6] = l mod 32` -- 32 sets x 4 ways = 128 line
+      // slots for 256 distinct lines. THAT asymmetry is the thing being measured.
+      val rng   = new scala.util.Random(12345)
+      val lines = rng.shuffle((0 until span / LINE).toList).take(256)
+      val addrs = lines.map(l => base + l.toLong * LINE + rng.nextInt(nSecTest) * SECTOR)
+      for (a <- addrs) fillMem(mem, a, 4)
+      // Pass 1 warms; pass 2 is measured.
+      for (a <- addrs) assert(load(d, cd, a) == memLong(a), f"pass 1 wrong at 0x$a%x")
+      var misses = 0
+      for (a <- addrs) {
+        val n = countAr(d, cd) { assert(load(d, cd, a) == memLong(a), f"pass 2 wrong at 0x$a%x") }
+        if (n > 0) misses += 1
+      }
+      rate = 100.0 * misses / addrs.size
+      println(f"[d3-burst-capacity] $tag: pass-2 miss rate ${rate}%.1f%% " +
+              f"(${misses}/${addrs.size} of 256 scattered 16-byte sectors over a 64 KB span)")
+    }
+    rate
+  }
+
+  test("SIZED: the scattered-access capacity regression sectoring accepts", VerilatorTest) {
+    val flat = scatterMissRate(flatDut, "unsectored")
+    val sect = scatterMissRate(sectoredDut, "sectored")
+    println(f"[d3-burst-capacity] REGRESSION: ${flat}%.1f%% -> ${sect}%.1f%% pass-2 miss " +
+            f"rate, i.e. ${sect - flat}%+.1f pp on a scattered working set. Predicted from " +
+            f"the geometry: the sectored arm has 128 x 16 B = 2 KB of effective capacity " +
+            f"for a one-sector-per-line pattern against the unsectored arm's " +
+            f"512 x 16 B = 8 KB, so up to 4x worse.")
+    // Asserted as a DIRECTION with a floor, not a point value: the number is the
+    // deliverable (an accepted cost, now sized), while the assert exists only so a
+    // future change that silently removes the regression -- or silently makes it total
+    // -- is noticed. A tight band here would be a maintenance burden with no customer.
+    assert(sect >= flat,
+      f"the sectored arm must not MISS LESS than the unsectored one on a scattered " +
+      f"working set ($sect%% vs $flat%%); if it does, this probe is not measuring " +
+      f"capacity and the number above must not be quoted.")
+    // ⚠ THE SATURATION CONTROL, and it is the assert that matters. A probe whose
+    // UNSECTORED arm also misses is above the capacity limit of BOTH arms and measures
+    // nothing -- the first version of this test did exactly that and printed a
+    // confident "+0.0 pp" from 100% against 100%. The unsectored arm has 512 sector
+    // slots for 256 scattered sectors, so it MUST mostly hit; if it does not, the
+    // address set is not spread over its 128 sets and no number here may be quoted.
+    assert(flat < 50.0,
+      f"SATURATED PROBE: the UNSECTORED arm misses $flat%% on pass 2, but 256 scattered " +
+      f"16-byte sectors fit its 512 sector slots comfortably. Both arms are above their " +
+      f"capacity limit, so the printed regression is meaningless. This is the failure " +
+      f"the correlated-sector-index bug produced; check the set spread first.")
+    assert(sect > flat + 10.0,
+      f"the sectored arm's scattered miss rate ($sect%%) is not meaningfully worse than " +
+      f"the unsectored arm's ($flat%%), but 256 distinct 64-byte lines cannot fit 128 " +
+      f"line slots. Either the probe is not reaching the capacity limit or the tag array " +
+      f"is not actually line-indexed.")
   }
 
   // ───────────────────────────────────────────────────────────────────────────────
