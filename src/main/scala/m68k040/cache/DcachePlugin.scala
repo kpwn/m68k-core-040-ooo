@@ -1443,6 +1443,42 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // final line yet and must remain parked until the load refill/replay finishes.
     // This prevents a post-snapshot S3 write from being silently replaced by the
     // refill while EVICT_WR writes the pre-store victim image to memory.
+    //
+    // ── 🎯 THIS BLANKET BARRIER IS THE MEMCPY BANDWIDTH LIMIT, AND THE RATIFIED ──
+    // ── D3 INVARIANT IS SPECIFIED TO REPLACE IT. Read before optimising either. ──
+    // MEASURED (2026-09-27, `MemcpyBandwidthSpec` under `IPC_MEM=l2:5:60:4096`): a
+    // 16-byte-line copy costs 48.8 cycles, flat across a 4x working-set change and
+    // both seeds -- a structural serialisation, not a capacity effect. It is THREE
+    // strictly-ordered memory trips per line:
+    //   T1  source line load miss -> refill
+    //   T2  destination line store miss -> COPYBACK write-allocate refill
+    //   T3  writeback of the dirty destination line when it is later evicted
+    // T1 and T2 have NO data dependence on each other, yet they cannot overlap --
+    // and the reason is NOT only that there is one refill MSHR. It is that
+    // `storePipeHeld` (below) includes `loadMissDiscovered` and THIS register, so the
+    // whole store pipe is frozen for the duration of a load refill and T2's miss is
+    // not even DISCOVERED until T1 has finished.
+    //
+    // That matters because it says which form of slice D2 is cheap. A second miss
+    // discovered by a second S1 LOAD read needs `hitUnderMissRead`, which is OFF on
+    // routed 200 MHz evidence (it is the only arm that drives `rdEn`, the cone that
+    // sets the critical path -- see `ShippingCoreConfig.dcacheHitUnderMissRead`). But
+    // T2's miss is discovered by the STORE pipe: `pendingStoreMiss` is latched in a
+    // `when(stS2Valid)` block at MODULE scope, outside the load FSM, and touches the
+    // load `rdEn` cone not at all. So "one load-refill MSHR + one store-write-allocate
+    // MSHR" is a form of D2 that does not re-open the timing question that disabled
+    // `hitUnderMissRead`.
+    //
+    // And unblocking it is NOT an invention. This barrier is blanket where the hazard
+    // is per-SET: it fires for ANY store in S1, but the loss it prevents requires the
+    // store to target the very line being evicted. The MSHR design doc's §5.3 lists
+    // exactly this as the second of three hazards its D3 invariant ("at most one
+    // outstanding fill per SET") subsumes -- "replace its hand-rolled hold with D3's
+    // set-exclusion" -- and notes the same design flags today's version as a
+    // pre-existing bug. So the sequence is: D3 set-exclusion first, then this blanket
+    // hold becomes a per-set one, and only then is T1/T2 overlap reachable.
+    // ⚠ It still buys nothing END-TO-END until the SoC crossbar is multi-outstanding
+    // per master port (`macqd700-soc`, `docs/xbar_multi_outstanding_reads_design.md`).
     val loadMissStoreBarrier = RegInit(False)
     val refillNeedsStoreDrain = Bool(); refillNeedsStoreDrain := False
     storeOutstanding.simPublic(); serialStoreInFlight.simPublic(); storeMissBarrier.simPublic()
