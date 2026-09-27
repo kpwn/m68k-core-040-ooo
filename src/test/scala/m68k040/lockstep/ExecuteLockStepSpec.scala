@@ -512,6 +512,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val gsh    = new m68k040.frontend.GsharePlugin(
       retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+      // The two front-end prediction flags of `perf/track5-branch`; see the note in
+      // FuzzDut. Default OFF, so an unset environment is the same DUT as before.
+      computeDirectTargets = sys.env.get("LOCKSTEP_COMPUTE_DIRECT_TARGETS").contains("1"),
+      deferSlot1Uncond = sys.env.get("LOCKSTEP_DEFER_SLOT1_UNCOND").contains("1"),
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))

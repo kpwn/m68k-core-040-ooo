@@ -397,7 +397,15 @@ class FuzzCoreDut extends Component {
   val ras    = new m68k040.frontend.RasPlugin(
     branchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"))
   val gsh    = new m68k040.frontend.GsharePlugin
-  val fa     = new FetchAlignPlugin(enableFetchDirected = true)
+  // The two FRONT-END prediction flags of `perf/track5-branch`. They were wired into
+  // `FullCoreSynth`/`SocketTop`/`CoreBenchHarness` only, so the corpus -- the one place an
+  // architectural divergence from a front-end redirect would show up -- had NO way to turn
+  // them on. Env-read for the same reason as FUZZ_SPEC_WAKE: the whole corpus can be
+  // replayed against them unmodified. Both default OFF, so an unset environment builds the
+  // bit-identical DUT as before.
+  val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+    computeDirectTargets = sys.env.get("FUZZ_COMPUTE_DIRECT_TARGETS").contains("1"),
+    deferSlot1Uncond = sys.env.get("FUZZ_DEFER_SLOT1_UNCOND").contains("1"))
   val dec    = new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
