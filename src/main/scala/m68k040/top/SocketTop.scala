@@ -124,7 +124,9 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       // forward, the inhibited-store barriers and `olderInhibitedStore` all see exactly
       // the sequence they see today; the only change is WHEN a consumer becomes
       // selectable, and every consumer still reaches its EU strictly after the writeback.
-      specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP)
+      specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP,
+      // Out-of-order LS issue needs the LS-side inhibited barrier; same switch as the IQ.
+      lsOooIssue = SocketTopConfig.LS_OOO_ISSUE)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = new IcachePlugin(icachePredecodeWords)
     val merge  = new AxiDMergePlugin()
@@ -156,7 +158,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
-      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
+      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+        lsOooIssue = SocketTopConfig.LS_OOO_ISSUE),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
         earlyAutoStoreAddress = ipcLateStore,
         // loadBypassUnreadyLoad is DISABLED. It WEDGED THE BOARD (2026-09-24): PC frozen
@@ -176,7 +179,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
-        loadBypassUnreadyLoad = false,
+        loadBypassUnreadyLoad = SocketTopConfig.LS_OOO_ISSUE,
         specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
@@ -579,6 +582,15 @@ object SocketTopConfig {
     * (not by editing the plugin) once it is board-proven; leave it false until then.
     * `SPEC_LOAD_WAKEUP=1` in the environment overrides it for a one-off build. */
   val SPEC_LOAD_WAKEUP: Boolean = sys.env.get("SPEC_LOAD_WAKEUP").contains("1")
+
+  /** OUT-OF-ORDER LS ISSUE (`IssueQueuePlugin.loadBypassUnreadyLoad`): an LS slot may be
+    * selected unless a strictly older LS slot holds an unready STORE. Relaxes the
+    * oldest-occupied-only rule while keeping inhibited accesses as two-way barriers.
+    *
+    * A BUILD-TIME SWITCH defaulted OFF. `LS_OOO_ISSUE=1` turns it on for a build; flip the
+    * default here once it is board-proven. It is reported in SHIPPING_CONFIG so a build can
+    * always be identified afterwards -- the lesson from `SPEC_LOAD_WAKEUP`, which could not. */
+  val LS_OOO_ISSUE: Boolean = sys.env.get("LS_OOO_ISSUE").contains("1")
 }
 
 object SocketIpcProfile {
@@ -654,7 +666,8 @@ object GenSocketTopVerilog {
     // settle it after the fact: `lsSpecBlocked`, `lsAdvance` and `specWakeFire` are all
     // absent from `reports/timing_synth.rpt` -- as are the BASELINE signals `lsBusy` and
     // `lsSkid`, which is the proof that a missing name there means nothing at all.
-    println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
+    println(s"SHIPPING_CONFIG lsOooIssue=${SocketTopConfig.LS_OOO_ISSUE} " +
+            s"ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"specLoadWakeup=${ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
