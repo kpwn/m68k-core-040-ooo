@@ -374,6 +374,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     rasBranchRepair: Boolean = false,
                     computeDirectTargets: Boolean = false,
                     deferSlot1Uncond: Boolean = false,
+                    deferSlot1Dbcc: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -398,7 +399,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional,
-      computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond)
+      computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
+      deferSlot1Dbcc = deferSlot1Dbcc)
     val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
       fuseLongMoveLoads = fuseLongMoveLoads)
     val preparedCap = sys.env.get("IPC_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
@@ -2578,6 +2580,37 @@ trait CoreBenchHarness extends AnyFunSuite {
       warmupInstrs = setup.size + tabInit.size,
       // Every handler adds d1(=1) to d0, so d0 == iters iff the dispatch actually
       // reached a handler on every iteration.
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** DBcc SLOT-1 COVERAGE probe: the canonical 68k counted loop, `add ; dbra`.
+    *
+    * `add.l %d1,%d0` is 2 bytes and `dbra %d7,.L` is 4, so the two emit as slot0 +
+    * slot1 in ONE cycle -- which puts the LOOP-CLOSING branch in SLOT 1, where nothing
+    * predicts it. DBcc is line-5, so neither `slot1WouldUncond` (line-6 unconditional)
+    * nor `slot1IsConditional` (line-6, cond >= 2) matches it, and it is not JSR/JMP nor
+    * RTS/RTR. It is emitted with no prediction from anywhere, falls through, and
+    * mispredicts on every iteration that should have looped.
+    *
+    * ⛔ The bench had NO DBcc IN IT AT ALL before this probe -- the fifth measured
+    * coverage hole in this corpus, after zero A6/A7 operands, zero store->load pairs,
+    * zero load->compare->branch chains and 25 total suite mispredicts. A lever aimed at
+    * DBcc would have measured an exact null against the old corpus and been called dead.
+    *
+    * `dbra` loops while `Dn != -1` AFTER the decrement, so `d7 = iters - 1` runs the
+    * body exactly `iters` times. Each pass adds d1(=1) to d0, so `d0 == iters` iff every
+    * iteration actually executed -- which also catches a deferral that drops the
+    * instruction out of the buffer instead of re-emitting it (the `slot1WouldUncond`
+    * two-list bug, caught that way by `br-ind`'s own check). */
+  def kBrDbcc(iters: Int = 1024, label: String = "br-dbcc"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", "moveq #1,%d1", "moveq #0,%d0",
+                    s"move.l #${iters - 1},%d7")
+    val body  = Seq("add.l %d1,%d0", "dbra %d7,.Ldb")
+    val src = (setup ++ Seq(".Ldb: " + body.mkString(" ; "),
+      ".Ldbend: bra.s .Ldbend")).mkString(" ; ")
+    // Per iteration: the add + the dbra = 2 macros.
+    Kernel(label, src, setup.size + iters * 2,
+      warmupInstrs = setup.size,
       verifyRetirement = brProbeExpect(0 -> iters.toLong))
   }
 
