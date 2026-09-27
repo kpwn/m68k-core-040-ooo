@@ -106,10 +106,24 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val detachedStoreEntries: Int = 1,
                  val earlyAutoStoreAddress: Boolean = false,
                  val earlyAutoAnWriteback: Boolean = false,
-                 val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyStoreDataWake: Boolean = false,
+                 /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
+                   * ring below -- see `pendDepth`). Default comes from
+                   * `ShippingCoreConfig.storeQueueDepth` so sim and the shipping build
+                   * cannot diverge; see that knob's comment for the congestion argument
+                   * and the capacity caveat. */
+                 val sqDepth: Int = m68k040.top.ShippingCoreConfig.storeQueueDepth,
+                 /** See `ShippingCoreConfig.sqNarrowDrainMerge`. */
+                 val sqNarrowDrainMerge: Boolean = m68k040.top.ShippingCoreConfig.sqNarrowDrainMerge)
+    extends FiberPlugin with LsEuService {
+  require(isPow2(sqDepth) && sqDepth >= 4 && sqDepth <= 16,
+    s"store-queue depth must be a power of two in 4..16, got $sqDepth")
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
+  require(detachedStoreEntries <= sqDepth,
+    s"detached late-store contexts ($detachedStoreEntries) each hold an SQ reservation, " +
+    s"so they cannot outnumber the ring's $sqDepth slots")
   require(detachedStoreEntries == 1 || detachLateStore,
     "queued late store contexts require detached stores")
   // ─────────────────────────────────────────────────────────────────────────
@@ -657,9 +671,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
 
     // ---- store queue instance ----
     val retirement = host.get[m68k040.services.RobRetirementService]
-    val sq = new StoreQueue(8, subwordForwarding = sqSubwordForwarding,
+    val sq = new StoreQueue(sqDepth, subwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish,
-      retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2))
+      retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
+      narrowDrainMerge = sqNarrowDrainMerge)
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
@@ -2631,7 +2646,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       val nzvcWrite  = Bool()
       val nzvcDst    = UInt(nzvcW.address.getWidth bits)
     }
-    val pendDepth = 8   // == StoreQueue(8)'s own depth; see comment above
+    val pendDepth = sqDepth   // == the StoreQueue's own depth; see comment above
     val pendMem   = Vec.fill(pendDepth)(Reg(PendingStoreWb()))
     val pendFault = Vec.fill(pendDepth)(RegInit(False))
     // Latched verbatim from `sq.io.sqFaultCompletion.payload` the cycle it fires
