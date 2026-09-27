@@ -30,7 +30,26 @@ class StrcmpIpcSpec extends CoreBenchHarness {
     * carries an extra issue-queue option adds its arms to `extraArms` and changes
     * NOTHING else in this file -- that is the whole point of the indirection, so this
     * kernel can be cherry-picked onto any feature branch and measured there. */
-  protected def extraArms: Seq[(String, () => FullCoreDut)] = Nil
+  protected def extraArms: Seq[(String, () => FullCoreDut)] = Seq(
+    // `specLoadWakeup` on the BASELINE core: the minimal controlled pair. Nothing else
+    // differs, so a delta is the announce and nothing else.
+    "specwake" -> (() => new FullCoreDut(specLoadWakeup = true)),
+    // And the pair the BOARD would actually ship: the throughput-v2 option set the socket
+    // build turns on, with and without the announce. Select it with
+    // STRCMP_ARMS=v2,v2-specwake so `v2` becomes the baseline the delta is taken against
+    // -- a v2 arm measured against the all-options-off baseline attributes nothing.
+    "v2"          -> (() => v2Dut(specWake = false)),
+    "v2-specwake" -> (() => v2Dut(specWake = true)))
+
+  /** The board's `throughput-v2` option set (SocketTop `ipcThroughput` + `lateStore`),
+    * mirroring `IpcBenchSpec`'s IPC_V2=1 DUT so the two suites' arms are the same core. */
+  private def v2Dut(specWake: Boolean): FullCoreDut = new FullCoreDut(
+    alignedLoadFallThrough = true, earlyLsIntWakeup = true, sqSubwordForwarding = true,
+    pairCorrectBranch = true, retainRedirectHistory = true, trainSlot1Conditional = true,
+    earlyStoreAddress = true, fuseLongMoveLoads = true, reserveLateStore = true,
+    detachLateStore = true, forwardOnPublish = true, earlyLsNzvcWakeup = true,
+    detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
+    specLoadWakeup = specWake)
 
   private def allArms: Seq[(String, () => FullCoreDut)] =
     Seq[(String, () => FullCoreDut)]("off" -> (() => new FullCoreDut())) ++
