@@ -55,6 +55,47 @@ ITLB walks ~11% — ~45% in the front end, against 6.1% D-cache and 6.7% walk.
 **Almost all IPC work in this campaign has been back-end.** It optimises the ~8%
 where the ROB is busy and stuck.
 
+### Replicated 2026-09-27 on `lane100_lsw0`, with the phase verified from the SCREEN
+
+The earlier "Dhrystone only" column was carved out of a mixed session. This one is a
+**Dhrystone-only window by construction**: Speedometer's Benchmark Mix dialog set to
+`Dhrystones Iter. = 25` with every other test at 1, sampled as cumulative counters and
+differenced across the plateau. Attribution is not a counter fingerprint — a captured
+frame mid-window shows the red run-marker on `Dhrystones/sec` at `Itr. 16`, every other
+row still holding its stale value.
+
+| | earlier session | **`lsw0`, verified** |
+|---|---:|---:|
+| IPC | 0.3613 | **0.3532** |
+| mispredicts / kinst | 21.41 | **25.53** |
+| flushes / kinst | — | **25.57** |
+| retired BTB-eligible branches / kinst | — | **210.99** |
+| I-cache misses / kinst | 0.19 | **0.187** |
+| D-cache misses / kinst | 1.17 | **1.147** |
+| DTLB / ITLB walks per kinst | 0.04 | **0.068 / 0.061** |
+| retire stall | 52.22% | **52.58%** |
+| D-cache stall / walk stall | 0.83% / 0.08% | **0.80% / 0.09%** |
+
+21.64 s wall, 2,111,618,465 cycles, 745,871,262 instructions, **97.6 MHz effective** —
+which independently confirms the clock. Idle reference on the same bitstream: IPC 0.1211.
+
+Three things this pins down:
+
+1. **The memory system is not the Dhrystone lever.** D-cache stall + walk stall together
+   are **0.89% of cycles**. Anything justified by Dhrystone D-cache behaviour is chasing
+   under one percent.
+2. **Mispredicts are.** 25.53/kinst at ~12.9 cycles of recovery each is **~0.33 cycles per
+   instruction of the 2.83 actually spent — about 11.6% of all cycles**, thirteen times the
+   entire memory system. `flushes ~= mispredicts` (25.57 vs 25.53) means essentially every
+   mispredict costs a whole-ROB squash.
+3. **Dhrystone is branch-dense**: 211 BTB-eligible retired branches per kinst — better than
+   one in five instructions — mispredicting at **12.10%** (upper bound, see the denominator
+   caveat in the `perf` output).
+
+⚠️ The **KWhetstones** row reads **0.000** on every run. That is the FPU benchmark returning
+nothing, not a fast result, and it is consistent with the known FP defects. Unmeasured —
+flagged here so no one reads the Average as an all-round figure.
+
 ## Area: track as we go, cut at the end
 
 **Plan (owner, 2026-09-27): track area in the 100 MHz lane as each lever lands, then
