@@ -67,6 +67,21 @@ by summing, for every signal, the referenced width at every right-hand-side use 
 | barrier residency | 136 | 1.0% |
 | flush keep-scan | 22 | 0.2% |
 
+Module boundary, for the same reason the merge payload matters below: **65 ports,
+591 bits** (36 in / 285 bits, 29 out / 306 bits), of which
+
+| port group | bits |
+|---|---:|
+| `drain` (incl. `lineData` 128 + `strb` 16) | **216** |
+| `alloc` | 182 |
+| `fwd` (query 73 + rsp 35) | 108 |
+| `sqFaultCompletion` | 43 |
+| everything else (barrier 7, commit 6+6, sqCompletion 6, robHeadIn 5, 11 singles) | 42 |
+
+**The drain command is 37% of the module's I/O bits and 144 of its 216 bits are the merge
+payload alone** — 24% of the whole boundary for something the consumer can re-derive
+(section 5).
+
 Answering the question as posed — address compare vs age network vs data mux vs barrier:
 
 * **The address compare matrix is the pin-dense all-to-all structure: 32 x 28-bit line
@@ -162,7 +177,8 @@ four byte-lane derivations are **redundant, not merely expensive**:
   `useStrb = false` path, from the payload's own `paddr(3:0)`, `size` and `data`.
 
 So a split store's slot A can present `useStrb = false` like every aligned store already
-does. The AXI sub-beat extent agrees as well: `stEndSz = MmioCover.clampedEnd(off, n)` is
+does, and the D-cache reconstructs a bit-identical merge from 38 bits of payload it
+already holds. The AXI sub-beat extent agrees as well: `stEndSz = MmioCover.clampedEnd(off, n)` is
 clamped at 16, so for a split slot A (offset 13..15) the size-derived range `[off, 16)`
 equals the strobe-run range — and DcachePlugin's existing permanent assert at the
 `!useStrb` INHIBITED site now machine-checks that for split slot A too.
@@ -184,6 +200,26 @@ store, not a crash).
   expected to move a congestion level on its own.
 * Semantics-preserving: it changes the ENCODING of the drain command, never what forwards
   and never which bytes reach memory.
+
+**What it does NOT buy, and the follow-up that would.** After this change the SQ drives
+`lineData[127:24]` and `strb[15:3]` as constant zero on BOTH phases, so 117 of the 144
+merge bits stop leaving the module. They do not stop existing downstream: the D-cache
+store port is a three-way priority mux (SQ drain / exception store / **table walker**,
+`LsEuPlugin.scala:4506-4517`), and the walker drives a real `useStrb = true` payload with
+its own one-hot strobe and 128-bit `lineData` (`DtlbPlugin.scala:914-916` sets
+`data := 0` and puts the descriptor straight into `lineData`). So the port and the
+D-cache's four registered `DStoreCmd` stages (`s0Payload`, `stS1Payload`, `stS2Payload`,
+`stS3Payload`) stay fully live.
+
+If the walker were converted to the same local path — it writes 4 bytes at `addr[3:0]`,
+which is exactly `storeData(addr[3:0], LONG, data)` / `storeStrb(addr[3:0], LONG)` — then
+`strb`/`lineData` could leave `DStoreCmd` outright: **-117 wires on the interface between
+the two blocks that BOTH appear in the congested windows, and ~470 D-cache pipeline FFs
+that Vivado would constant-propagate away.** That is a materially bigger lever than
+anything inside the SQ. It was not done here because it lands in the MMU descriptor
+writeback path — the U/M drain family with its own defect history — and because it needs
+the ExceptionUnit's `dcStore` audited on the same edge. Next in this queue, gated by
+`mmuwalk` + the U/M drain suite rather than by the LS corpus.
 
 ### `storeQueueDepth` (`SQ_DEPTH=<n>`) — a calibration arm, NOT a shipping candidate
 
@@ -208,11 +244,15 @@ two rings cannot desynchronise.
 
 1. **The SQ is 5% of socket_core's LUTs.** Its whole reducible content is ~12% of itself.
    Congestion level 5 is not going to be fixed inside it.
-2. **The real pin-density structure in that window is the integer PRF**:
+2. **The next reduction is the `DStoreCmd` merge payload, not the SQ**: 117 of its 144
+   bits are already constant from the SQ's side after this lever; converting the table
+   walker to the local derivation would take them off the interface and out of the
+   D-cache's four registered store stages. See section 5.
+3. **The real pin-density structure in that window is the integer PRF**:
    `RegFilePluginInt_logic_ram`, 9,957 LUT (4,584 of them LUTRAM), ~10% of the device,
    with six 6-bit address nets at ~971 sinks each — ~5,800 sink pins from six nets, versus
    the SQ's widest net at 32 sinks per bit. That is the next lever.
-3. **Attribute by name, then check the name.** Two of the three widest nets "in the SQ"
+4. **Attribute by name, then check the name.** Two of the three widest nets "in the SQ"
    are a ROB pointer and a LUTRAM address port. `-flatten_hierarchy rebuilt` makes the
    hierarchy in a routed checkpoint advisory for combinational cells; the FF count is the
    check that the boundary is real at all.

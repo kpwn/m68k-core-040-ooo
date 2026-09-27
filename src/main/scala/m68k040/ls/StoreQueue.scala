@@ -564,9 +564,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
 
   // Slot B's strobe: lane k (k < 3) is covered iff absolute position 16+k is still
   // inside the access, i.e. `16 + k < off + n`. Three 5-bit magnitude terms, no decode.
-  val sendNBytesB = sizeBytes(sizes(sendPtr))
-  val sendEndB    = sendStOff.resize(5 bits) +^ sendNBytesB    // 6-bit, 0..19
+  // Scoped inside the `narrowDrainMerge` arm so the OFF arm's emitted RTL stays
+  // byte-identical to the parent's (modulo SpinalHDL's line-number-derived names).
   val sendStrbBNarrow = if(!narrowDrainMerge) null else {
+    val sendNBytesB = sizeBytes(sizes(sendPtr))
+    val sendEndB    = sendStOff.resize(5 bits) +^ sendNBytesB    // 6-bit, 0..19
     val b = Bits(16 bits)
     b := B(0, 16 bits)
     for (k <- 0 until 3) b(k) := sendEndB > U(16 + k, sendEndB.getWidth bits)
