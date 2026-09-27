@@ -635,6 +635,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       }
       val handle = new WhiteboxCapture.Handle
+      // Sim-only cache-miss injection + MLP/miss-rate instrumentation. Inert (and a
+      // single boolean test per cycle) unless IPC_INJ_D/IPC_INJ_I/IPC_MISS_STATS is set.
+      val missInj = MissInjector.maybeNew(dut, k.name)
 
       // Per-cycle MACRO-commit histogram, trimmed to [first-commit, last-commit]
       // after the run. Use WhiteboxCapture's authoritative emitted count, including
@@ -798,6 +801,7 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       cd.onSamplings {
         telemCycle += 1
+        missInj.onCycle()
         if (lsEventsOn && telemCycle <= 1400) {
           val ls = dut.lsEu.logic
           def event(s: String): Unit = println(s"LS_EVENT kernel=${k.name} cycle=$telemCycle $s")
@@ -1515,6 +1519,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         Some(profile)
       }
 
+      missInj.publish(windowCycles, windowRetired)
+      MissInjector.archDump(k.name, handle.result)
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,

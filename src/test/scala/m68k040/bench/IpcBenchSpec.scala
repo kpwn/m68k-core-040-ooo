@@ -112,6 +112,7 @@ class IpcBenchSpec extends CoreBenchHarness {
     println("  IPC = retired macro-instructions / window-cycles")
     println(s"  memory model: $memLabel")
     println(s"  sim seed: ${IpcBenchSpec.simSeed}")
+    println(s"  miss injection: ${MissInjector.label}")
     println("  dual%(act) = cycles retiring 2 / commit-active cycles (backend ILP)")
     println("  dual%(win) = cycles retiring 2 / all window cycles")
     println("  active%    = cycles retiring >=1 / all window cycles (backend occupancy)")
@@ -135,6 +136,9 @@ class IpcBenchSpec extends CoreBenchHarness {
         s"declineFrame=${r.ftbFrameDeclines} declineBlocked=${r.ftbBusyDeclines}")
     }
     println()
+    // Sim-only miss-injection / MLP report (empty and silent unless IPC_INJ_D,
+    // IPC_INJ_I or IPC_MISS_STATS is set). See MissInjector.
+    MissInjector.report()
 
     val depO = results.find(_.name == "dependent-ALU")
     val indO = results.find(_.name == "independent-ALU")
