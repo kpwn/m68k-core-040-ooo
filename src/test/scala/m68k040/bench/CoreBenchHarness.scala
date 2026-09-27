@@ -368,6 +368,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyAutoAnWriteback: Boolean = false,
                     specLoadWakeup: Boolean = false,
                     rasBranchRepair: Boolean = false,
+                    computeDirectTargets: Boolean = false,
+                    deferSlot1Uncond: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -391,7 +393,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
-      deferTakenSlot1Conditional = deferTakenSlot1Conditional)
+      deferTakenSlot1Conditional = deferTakenSlot1Conditional,
+      computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond)
     val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
       fuseLongMoveLoads = fuseLongMoveLoads)
     val preparedCap = sys.env.get("IPC_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
@@ -765,6 +768,29 @@ trait CoreBenchHarness extends AnyFunSuite {
       var lsNzvcWrites      = 0
       var brTotal = 0; var brMis = 0; var brMisNoPred = 0; var brMisWrongDir = 0; var brNoPred = 0
       val brMisByType = scala.collection.mutable.Map.empty[Int, Int]
+      // ── RETIRE-ACCURATE MISPREDICT ATTRIBUTION (`[br-attr]`) ────────────────────
+      // The counters above sample the branch EU's COMPLETION, so they count WRONG-PATH
+      // branches that never retire -- the board's counters do not. These count exactly
+      // what silicon counts (`branchRedirect` = retire of a mispredicting branch) and
+      // then classify it with the BranchEu attribution fields, joined by robId.
+      //
+      // The classification the shipped board counters CANNOT make:
+      //  - returns are in `branchRedirect` (OFF_MISPRED_COUNT) but in NEITHER class
+      //    counter, because both come from `debugBranchRetire` (gated `isBtbBranch`).
+      //  - "no prediction at all" (BTB/FTB coverage) is indistinguishable from
+      //    "predicted the wrong way" (gshare) inside OFF_PERF_MISPRED_COND.
+      //  - "last-target BTB was stale" (the thing an indirect predictor fixes) is
+      //    indistinguishable from "BTB missed" inside OFF_PERF_MISPRED_UNCOND.
+      // brDbg snapshot per robId: (misp, predTaken, predTarget, actTarget, taken,
+      //                            ibranch, isReturn, phtValid, brType, btbTrained, pc)
+      val brAttrPend = scala.collection.mutable.HashMap.empty[Int,
+        (Boolean, Boolean, Long, Long, Boolean, Boolean, Boolean, Boolean, Int, Boolean, Long)]
+      var raTotalBranches = 0      // retired BTB-trainable branches (== the board's OFF_PERF_BRANCH)
+      var raTotalMis = 0           // retired mispredicts (== the board's OFF_MISPRED_COUNT)
+      var raUnattributed = 0       // no brDbg snapshot for the retiring robId (should be 0)
+      val raBucket = scala.collection.mutable.Map.empty[String, Int]
+      val raMisPc  = scala.collection.mutable.Map.empty[Long, (String, Int)]
+      def raAdd(b: String): Unit = raBucket(b) = raBucket.getOrElse(b, 0) + 1
       var decFires = 0; var decDualFires = 0
       var oooWbFires = 0; var oooParkedCyc = 0
       var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
@@ -901,6 +927,47 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (dut.rob.logic.branchRedirect.toBoolean)
           misResolveCycle.remove(dut.rob.logic.head.toInt)
             .foreach(c => resolveToRetire += (telemCycle - c).toInt)
+        // ── `[br-attr]`: snapshot every branch resolution, classify at RETIRE ──────
+        val brDbgNow = dut.branchEu.logic.brDbg
+        if (brDbgNow.valid.toBoolean)
+          brAttrPend(brDbgNow.robId.toInt) = (brDbgNow.mispredict.toBoolean,
+            brDbgNow.predTaken.toBoolean,
+            brDbgNow.predTarget.toLong & 0xffffffffL, brDbgNow.actTarget.toLong & 0xffffffffL,
+            brDbgNow.redirect.toBoolean, brDbgNow.ibranch.toBoolean, brDbgNow.isReturn.toBoolean,
+            brDbgNow.phtValid.toBoolean, brDbgNow.brType.toInt, brDbgNow.btbTrained.toBoolean,
+            brDbgNow.pc.toLong & 0xffffffffL)
+        if (dut.rob.logic.debugBranchRetire.valid.toBoolean) raTotalBranches += 1
+        if (dut.rob.logic.branchRedirect.toBoolean) {
+          raTotalMis += 1
+          brAttrPend.get(dut.rob.logic.head.toInt) match {
+            case None => raUnattributed += 1
+            case Some((_, predTaken, predTgt, actTgt, actTaken, ibr, isRet, phtV, bt, trained, pc)) =>
+              // Exactly the three independent failure modes of BranchEu's `mispredict`
+              // formula: (predTaken =/= actualTaken) || (actualTaken && tgt mismatch).
+              val dirWrong = predTaken != actTaken
+              val bucket =
+                if (!trained) {
+                  // Not BTB-trainable: a return (RAS), or a faulting/odd-target transfer.
+                  if (isRet) { if (!predTaken) "ret-nopred" else "ret-wrongtgt" } else "other-notrained"
+                } else if (bt == 1) {
+                  // Unconditional: direction is never in doubt (always resolved taken),
+                  // so a mispredict is either NO prediction (BTB/FTB coverage) or a STALE
+                  // TARGET. Split indirect (JMP/JSR (An)) from relative (BRA/BSR).
+                  val kind = if (ibr) "ind" else "rel"
+                  if (dirWrong) s"uncond-$kind-nopred" else s"uncond-$kind-wrongtgt"
+                } else {
+                  // Conditional: direction, or (rarely) a correct direction with a stale
+                  // target. `phtValid` says whether gshare owned the direction at all.
+                  if (dirWrong) (if (phtV) "cond-dir-gshare" else "cond-dir-nopred")
+                  else "cond-wrongtgt"
+                }
+              raAdd(bucket)
+              val prev = raMisPc.getOrElse(pc, (bucket, 0))
+              raMisPc(pc) = (bucket, prev._2 + 1)
+              if (predTgt == actTgt && !dirWrong) raAdd("ZZ-inconsistent")
+          }
+          brAttrPend.remove(dut.rob.logic.head.toInt)
+        }
         // Recovery latency: cycles from the retire-gated flush pulse to the next
         // macro commit. THIS is the term an early PC redirect is supposed to
         // shorten; it is what an aggregate IPC delta is made of, one flush at a
@@ -1535,6 +1602,30 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"drainBlockedCyc=$drainBlockedCyc dcStoreFires=$dcStoreFires dcStoreAcks=$dcStoreAcks " +
           f"hits=$dcStoreHits misses=$dcStoreMisses maxSqResident=$maxSqResident maxSqAccepted=$maxSqAccepted " +
           f"maxDcOutstanding=$maxDcOutstanding")
+      }
+      // ── `[br-attr]`: the retire-accurate mispredict attribution ─────────────────
+      // MPKI here is over the FULL run (raTotalMis / total retired macros), not the
+      // steady-state window, so it is directly comparable to the board's
+      // OFF_MISPRED_COUNT / retired-instruction ratio.
+      {
+        val mpki = 1000.0 * raTotalMis / scala.math.max(1, countedMacros)
+        val classSum = raBucket.toSeq.filter { case (b, _) => b.startsWith("uncond-") || b.startsWith("cond-") }.map(_._2).sum
+        println(f"[br-attr] ${k.name} retiredMacros=$countedMacros retiredTrainableBranches=$raTotalBranches " +
+          f"retiredMispredicts=$raTotalMis MPKI=$mpki%.2f " +
+          f"misRateOfTrainable=${100.0 * classSum / scala.math.max(1, raTotalBranches)}%.1f%% " +
+          f"unattributed=$raUnattributed")
+        println(s"[br-attr] ${k.name} buckets=" +
+          (if (raBucket.isEmpty) "-" else raBucket.toSeq.sortBy(-_._2).map { case (b, c) =>
+            f"$b=$c(${100.0 * c / scala.math.max(1, raTotalMis)}%.0f%%)" }.mkString(" ")))
+        // The gap the board's two class counters cannot see: `branchRedirect` counts
+        // returns, `debugBranchRetire` does not, so returns fall out of BOTH.
+        val retMis = raBucket.getOrElse("ret-nopred", 0) + raBucket.getOrElse("ret-wrongtgt", 0)
+        println(f"[br-attr] ${k.name} boardCounterGap: total=$raTotalMis " +
+          f"uncond+cond=$classSum invisibleToBothClassCounters=${raTotalMis - classSum} " +
+          f"(ofWhichReturns=$retMis)")
+        if (raMisPc.nonEmpty)
+          println(s"[br-attr-pc] ${k.name} " + raMisPc.toSeq.sortBy(-_._2._2).take(8)
+            .map { case (pc, (b, c)) => f"0x$pc%08x:$b=$c" }.mkString(" "))
       }
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +
@@ -2398,4 +2489,179 @@ trait CoreBenchHarness extends AnyFunSuite {
       yield kStrcmp(mode, copyback)
 
 
+  //  BRANCH-PREDICTION PROBES (2026-09-26)
+  //
+  //  WHY THESE EXIST. Silicon `perf` puts branch mispredicts at 24-77 per 1000
+  //  retired instructions (~11-14% of all cycles), the second-largest stall in the
+  //  machine. The pre-existing kernels above retire TWENTY-FIVE mispredicts in
+  //  total across the whole suite (1.49 MPKI aggregate, and 3 of those in every
+  //  kernel are just the cold-start and loop-exit branches) -- so a predictor
+  //  change of any size is inside the sampling noise, and `perf(btb): 128 -> 512`
+  //  correctly recorded "THIS CANNOT BE VALIDATED IN THE BENCH".
+  //
+  //  Each probe below isolates ONE failure mode of the fetch-time predictor and
+  //  drives it to ~1000 retired mispredicts, so `[br-attr]` can rank the buckets
+  //  and an A/B has statistical power. They are SYNTHETIC UPPER BOUNDS, not a model
+  //  of the Mac workload: read them as "how much does this mechanism cost when it
+  //  is the whole workload", and pair each with its `-fit` control (the same kernel
+  //  sized to fit the existing structure), which is what proves the probe is
+  //  measuring the structure and not something else.
+  //
+  //  Every probe sets %sp explicitly. SpinalSim randomises the PRF, so a kernel
+  //  that pushes without initialising A7 writes to a random address (see the
+  //  odd-ssp/a7 lockstep note); at 0x00300000 the stack is clear of the record
+  //  data at 0x10000-0x30000 and of the code at 0x40800000.
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  /** The branch probes below are self-checking. A computed-target or predictor change
+    * that is WRONG about a branch is only a perf loss in principle (the branch EU
+    * verifies every direction and target), but "only a perf loss" is a claim, not a
+    * measurement -- so each probe states the exact architectural register value its
+    * control flow must produce, and the harness fails if the run took a different path.
+    * This is the same discipline `assertChasePremise` applies to the pointer chase. */
+  private def brProbeExpect(expect: (Int, Long)*)(
+      obs: Seq[m68k040.lockstep.CommitObservation]): Unit =
+    expect.foreach { case (reg, want) =>
+      val writes = obs.filter(o => o.archRegValid && o.archRegId == reg)
+      assert(writes.nonEmpty, s"branch probe: register $reg was never written")
+      val got = writes.last.archRegWrite & 0xffffffffL
+      assert(got == want,
+        f"branch probe took the wrong control-flow path: d$reg = 0x$got%x, expected 0x$want%x")
+    }
+
+  /** INDIRECT-TARGET probe: ONE `jsr (%a0)` site whose target cycles through
+    * `handlers` distinct leaves, the address loaded from a table in memory.
+    *
+    * This is the Mac OS dispatch shape (A-line trap table / jump table / `jsr (An)`
+    * through a loaded pointer) and it is the one the frontend CANNOT predict by
+    * construction: the BTB/FTB hold ONE last-seen target per entry, so at a site
+    * whose target changes every execution the stored target is always the PREVIOUS
+    * handler. Expect ~100% mispredict on the indirect and ~0 on everything else.
+    *
+    * The target sequence is a FIXED CYCLE of period `handlers`, i.e. perfectly
+    * predictable from 5+ bits of global history while being 0% predictable from the
+    * last target. That makes this kernel the CEILING measurement for an
+    * ITTAGE/cascaded indirect predictor, not an average case.
+    *
+    * The table is built by the kernel itself (`lea .Lh<i>,%a0` + an absolute store)
+    * because the assembled code image is attached to the I-side AXI only -- code
+    * addresses are not readable through the D-cache, so a `prepMem` cannot know
+    * them. Those 2*handlers stores are counted as warm-up. */
+  def kBrIndirect(handlers: Int = 32, iters: Int = 1024, label: String = "br-ind"): Kernel = {
+    require(handlers >= 2 && (handlers & (handlers - 1)) == 0, "handlers must be a power of two")
+    val Tab  = 0x30000L
+    val mask = handlers * 4 - 1
+    val setup = Seq("lea 0x00300000,%sp", f"lea 0x$Tab%x,%%a2", "moveq #0,%d2",
+                    f"move.l #$mask,%%d3", "moveq #1,%d1", "moveq #0,%d0",
+                    s"move.l #$iters,%d7")
+    val tabInit = (0 until handlers).flatMap(i =>
+      Seq(s"lea .Lh$i,%a0", f"move.l %%a0,0x${Tab + i * 4}%x"))
+    val body = Seq("move.l (%a2,%d2.l),%a0", "addq.l #4,%d2", "and.l %d3,%d2",
+                   "jsr (%a0)", "subq.l #1,%d7", "bne.s .Lbri")
+    val handlerCode = (0 until handlers).map(i => s".Lh$i: add.l %d1,%d0 ; rts")
+    val src = (setup ++ tabInit ++ Seq(".Lbri: " + body.mkString(" ; "),
+      ".Lbriend: bra.s .Lbriend") ++ handlerCode).mkString(" ; ")
+    // Per iteration: 6 loop macros + the handler's add + rts = 8.
+    Kernel(label, src, setup.size + tabInit.size + iters * 8,
+      warmupInstrs = setup.size + tabInit.size,
+      // Every handler adds d1(=1) to d0, so d0 == iters iff the dispatch actually
+      // reached a handler on every iteration.
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** BTB/FTB CAPACITY probe: `sites` distinct always-taken `bra.s` hops, each at a
+    * 6-byte stride, walked in a loop.
+    *
+    * A taken BRA has a FIXED PC-relative target that the BTB learns on first sight,
+    * so it can only mispredict if its entry was EVICTED. The BTB is DIRECT-MAPPED on
+    * `pc[1+log2(entries) : 1]`, so `sites` branches at a 6-byte stride land on
+    * `min(sites, entries)` distinct indices (stride 3 in word units is coprime with
+    * any power of two, so the indices are spread uniformly rather than aliased into
+    * a fraction of the table -- a 4-byte stride would only ever reach half the
+    * table and would overstate the conflict).
+    *
+    * `sites > entries` therefore thrashes and every hop mispredicts; `br-cap-fit`
+    * (sites <= entries) is the control and must stay near zero. The pair is what
+    * makes a BTB resize measurable here at all. */
+  def kBrCapacity(sites: Int = 256, iters: Int = 8, label: String = "br-cap"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", s"move.l #$iters,%d7", "moveq #1,%d1",
+                    "moveq #0,%d0", "moveq #0,%d2")
+    // 6 bytes per site => the branch PCs advance 3 words at a time, which is coprime
+    // with any power-of-two index width, so the sites spread uniformly over the table
+    // instead of aliasing into a fraction of it (a 4-byte stride would only ever reach
+    // half the sets and would overstate the conflict).
+    //
+    // The hop JUMPS OVER a dead `add.l %d1,%d2`, and not merely to the next instruction,
+    // for two reasons. Encoding: a `bra.s` whose displacement is ZERO is the .W escape,
+    // so a byte branch to pc+2 does not assemble at all. Measurement: `%d2` then counts
+    // exactly the hops that FELL THROUGH, so `d2 == 0` proves every one of the
+    // `sites * iters` branches was actually taken.
+    val chain = (0 until sites).map { i =>
+      s".Lc$i: add.l %d1,%d0 ; bra.s .Lc${i + 1} ; add.l %d1,%d2"
+    }
+    val src = (setup ++ chain ++ Seq(
+      s".Lc$sites: subq.l #1,%d7 ; bne.w .Lc0", ".Lcend: bra.s .Lcend")).mkString(" ; ")
+    // Per iteration: sites * (add + bra) + subq + bne. The skipped add never retires.
+    Kernel(label, src, setup.size + iters * (sites * 2 + 2),
+      verifyRetirement = brProbeExpect(0 -> (iters.toLong * sites), 2 -> 0L))
+  }
+
+  /** RETURN-ADDRESS-STACK probe: `depth` nested `bsr`/`rts` pairs per iteration.
+    *
+    * The RAS is a 16-entry circular buffer (`Global.RAS_ENTRIES`). Nesting DEEPER
+    * than that overwrites the oldest entries, so the outermost `depth - 16` returns
+    * of every iteration pop a wrong address and mispredict. `br-ras-fit` nests
+    * inside the RAS and is the control.
+    *
+    * These mispredicts are the bucket NEITHER shipped board class counter can see:
+    * `OFF_PERF_MISPRED_UNCOND`/`_COND` both come from `debugBranchRetire`, which is
+    * gated on `isBtbBranch` and deliberately excludes returns, while
+    * `OFF_MISPRED_COUNT` (`branchRedirect`) counts them. `[br-attr]`'s
+    * `boardCounterGap` line is the sim-side view of that difference. */
+  def kBrReturn(depth: Int = 24, iters: Int = 128, label: String = "br-ras"): Kernel = {
+    require(depth >= 2)
+    val setup = Seq("lea 0x00300000,%sp", s"move.l #$iters,%d7", "moveq #1,%d1",
+                    "moveq #0,%d0")
+    val loop = ".Lrt: bsr .Lf0 ; subq.l #1,%d7 ; bne.s .Lrt"
+    val frames = (0 until depth - 1).map(i => s".Lf$i: bsr .Lf${i + 1} ; rts") :+
+                 s".Lf${depth - 1}: add.l %d1,%d0 ; rts"
+    val src = (setup ++ Seq(loop, ".Lrtend: bra.s .Lrtend") ++ frames).mkString(" ; ")
+    // Per iteration: bsr + subq + bne = 3, then (depth-1) x (bsr + rts) = 2(depth-1),
+    // then the leaf's add + rts = 2.
+    Kernel(label, src, setup.size + iters * (2 * depth + 3),
+      // Only the innermost frame adds, so d0 == iters iff every nest reached the leaf
+      // AND every return came back to the right place.
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** gshare DIRECTION probe: a conditional whose direction follows a fixed 32-bit
+    * pattern, read out one bit per iteration by `rol.l #1` (which rotates the top
+    * bit into C, so `bcs.s` takes the branch exactly on the pattern's 1 bits).
+    *
+    * A per-PC bimodal counter cannot do better than the pattern's bias (~50% here)
+    * because it is ONE counter for all 32 positions. gshare CAN be perfect: 5 bits
+    * of global history uniquely identify the position in a period-32 sequence, and
+    * the index folds 11 history bits. So this probe is a direct test of whether the
+    * GHR path actually works end to end -- speculative shift, retire-time
+    * `ghrArch`, and the flush repair -- not just of table sizing. A residual
+    * mispredict rate near the pattern's bias means the history is not reaching the
+    * index; near zero means gshare is doing its job and conditional direction is
+    * NOT where the remaining stall lives. */
+  def kBrPattern(pattern: Int = 0x6a5c93d2, iters: Int = 1024): Kernel = {
+    require(iters % 32 == 0, "iters must be a whole number of pattern periods")
+    val ones = Integer.bitCount(pattern)
+    val setup = Seq("lea 0x00300000,%sp", f"move.l #0x$pattern%08x,%%d6",
+                    s"move.l #$iters,%d7", "moveq #1,%d1", "moveq #0,%d0", "moveq #0,%d2")
+    val body = ".Lcp: rol.l #1,%d6 ; bcs.s .Lcp1 ; add.l %d1,%d0 ; bra.s .Lcp2 ; " +
+               ".Lcp1: add.l %d1,%d2 ; .Lcp2: subq.l #1,%d7 ; bne.s .Lcp"
+    val src = (setup ++ Seq(body, ".Lcpend: bra.s .Lcpend")).mkString(" ; ")
+    // Taken path (pattern bit 1): rol, bcs, add, subq, bne = 5 macros.
+    // Not-taken path (bit 0):     rol, bcs, add, bra, subq, bne = 6 macros.
+    val perPeriod = ones * 5 + (32 - ones) * 6
+    Kernel("br-patt", src, setup.size + (iters / 32) * perPeriod,
+      // d2 counts the pattern's 1 bits (branch taken), d0 its 0 bits: the pair pins the
+      // exact sequence of directions the run executed.
+      verifyRetirement = brProbeExpect(
+        2 -> (ones.toLong * (iters / 32)), 0 -> ((32 - ones).toLong * (iters / 32))))
+  }
 }

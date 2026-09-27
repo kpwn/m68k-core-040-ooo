@@ -53,6 +53,34 @@ import spinal.lib.misc.plugin.FiberPlugin
   * improvement, though not a per-branch-precise one (see the checkpointSave/Restore
   * port doc below for the full soundness argument).
   *
+  * ⛔ MEASURED COST OF "not per-branch-precise" (2026-09-26, `BranchPredictIpcSpec`).
+  * The imprecision is not a small residual: it makes EVERY MISPREDICTED CALL COST TWO
+  * MISPREDICTS -- its own, and its callee's return.
+  *
+  * The flush fires at the mispredicting branch's RETIRE, so when the branch IS the call
+  * (a `jsr (An)` whose target the BTB could not know), the call's own push is by then
+  * ARCHITECTURAL. `checkpointRestore` reverts it anyway, because the checkpoint predates
+  * it -- and `checkpointSave` cannot help, since `rob.count === 0` next becomes true
+  * right AFTER the flush, re-saving the already-reverted state. The callee's `rts` then
+  * finds no prediction at all.
+  *
+  * On the `br-ind` probe (one `jsr (%a0)`, 32 targets in a fixed cycle) that is exactly
+  * 1024 of 2050 retired mispredicts -- FIFTY PERCENT, in a kernel whose only genuine
+  * unpredictability is the indirect target. `br-ind-2` (2 targets) shows the same
+  * coupling at 200 of 678. And the bucket is INVISIBLE to both shipped board class
+  * counters: `OFF_PERF_MISPRED_UNCOND`/`_COND` come from `debugBranchRetire`, which is
+  * gated on `isBtbBranch` and excludes returns, while `OFF_MISPRED_COUNT` counts them --
+  * so `MISPRED_COUNT - (UNCOND + COND)` reads it on silicon today, no rebuild needed.
+  *
+  * Neither "keep" nor "restore" can be right here, so this needs REAL recovery, and the
+  * shape is already proven in this codebase one plugin over: GsharePlugin's `ghrArch` is
+  * a RETIRE-TIME architectural history that the flush copies wholesale into the
+  * speculative register. The RAS wants the same thing -- an architectural shadow stack
+  * updated when a call or a return RETIRES -- which is the "per-instruction retire-linked
+  * commit signal ... real ROB-side plumbing" this comment declares out of scope below.
+  * It is the ranked next step, not a nice-to-have: `rob.count === 0` is the wrong proxy
+  * precisely in the case that matters.
+  *
   * Content, not just the pointer: a NAIVE version of this fix would checkpoint only
   * `rasSp`/`count` (the pointer/occupancy), reasoning that entries below a restored
   * `rasSp` are untouched "real" data that just becomes reachable again. That

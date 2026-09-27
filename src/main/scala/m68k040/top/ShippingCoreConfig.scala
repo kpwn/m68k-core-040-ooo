@@ -56,4 +56,72 @@ object ShippingCoreConfig {
     * claim; `mispredicts/kinst` on silicon is the measurement, and returns are 34.5% of
     * the board's mispredicts against 3.9% for conditional direction. */
   val rasBranchRepair: Boolean = false
+  /** Front-end: COMPUTE a PC-relative unconditional branch's target from the
+    * displacement already in the aligner slot, instead of only ever recalling one from
+    * the BTB/FTB. See `FetchAlignPlugin.computeDirectTargets` for the mechanism and the
+    * soundness gates.
+    *
+    * OFF BY DEFAULT, pending a board measurement. Everything about it is cheap --
+    * one 32-bit adder plus an extra input on an existing mux, no table, no BRAM, no
+    * predecode widening -- and it reaches only the DATA input of `predictTargetReg`, so
+    * it adds no term to the combinational redirect / `ftbBlocked` cone. But it makes the
+    * front end redirect on branches it previously left for the branch EU, and the only
+    * thing that can rank it against the board's real branch footprint is
+    * `mispredicts/kinst` read on silicon (~0.95% noise floor); the bench's kernels
+    * cannot, which is why `BranchPredictIpcSpec`'s `br-cap` probe exists.
+    *
+    * Enable at generation time with `CPU_COMPUTE_DIRECT_TARGETS=1`; the value is echoed
+    * in the `SHIPPING_CONFIG` line. */
+  val computeDirectTargets: Boolean =
+    sys.env.get("CPU_COMPUTE_DIRECT_TARGETS").contains("1")
+
+  /** Front-end: DEFER an UNCONDITIONAL control transfer that lands in SLOT 1, so it
+    * becomes slot 0 next cycle and the decode-time BTB / RAS / computed-target paths can
+    * see it at all. See `FetchAlignPlugin.deferSlot1Uncond`.
+    *
+    * OFF BY DEFAULT, pending a board measurement. A slot-1 branch has no decode-time
+    * predictor (the slot-1 BTB read was deleted as the design's #1 failing setup cone)
+    * and the FTB that replaced its deferral holds ONE branch per 8-byte window, so two
+    * control transfers in one window leave one of them predicted by nothing. Deferral
+    * costs ONE fetch cycle and is unambiguously right for an UNCONDITIONAL (taken by
+    * definition); it is deliberately NOT extended to conditionals, where a not-taken
+    * fall-through is already free -- that case has its own knobs.
+    *
+    * Enable at generation time with `CPU_DEFER_SLOT1_UNCOND=1`; echoed in
+    * `SHIPPING_CONFIG`. */
+  val deferSlot1Uncond: Boolean =
+    sys.env.get("CPU_DEFER_SLOT1_UNCOND").contains("1")
+
+  // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
+  // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
+  //
+  //   probe        OFF    compute   defer    both      cycles OFF -> both
+  //   br-cap      1615      1250     1615       7      22239 -> 9025   (-59.4%)
+  //   br-cap-fit   561       545       66       2      10340 -> 5854   (-43.4%)
+  //   br-patt      601       600      305     304      13206 -> 10799  (-18.2%)
+  //   br-ras-fit    18         4       18       2      72990 -> 72806
+  //   br-ras      1066      1019     1066    1026      86147 -> 85740
+  //   br-ind      2050      2050     2049    2049      51894 -> 51894
+  //   br-ind-2     678       678      678     678      30494 -> 30494
+  //   aggregate   6589      6146     5797    4068 (149.0 -> 92.0 MPKI, -38.3%)
+  //
+  // NEITHER FLAG WORKS ALONE, and the `br-cap` pair is why:
+  //  - `br-cap-fit` FITS the 128-entry BTB and still mispredicted 27% of its branches.
+  //    Deferral alone takes that 561 -> 66. So ~88% of it was never capacity at all --
+  //    it was branches landing in SLOT 1, where nothing predicts them.
+  //  - `br-cap` EXCEEDS the BTB. Deferral alone changes NOTHING (1615 -> 1615):
+  //    handing a slot-1 branch to slot0 is useless when the table has no entry for it.
+  //    Computation alone gets -23%. Together: -99.6%.
+  // Deferral gives the branch a predictor; computation gives it a target.
+  //
+  // ⚠️ ZERO effect on `br-ind`/`br-ind-2` (indirect targets) and ~none on `br-ras`
+  // (returns) -- correctly, since neither flag touches those. Those are the two buckets
+  // that remain, and after this change they are 55% (returns) and 37% (indirect
+  // targets) of what is left; conditional direction is 8%.
+  //
+  // ⚠️ NO REGRESSION on any of the 11 kernels, including the four workload-shaped
+  // references -- but those references also show NO GAIN (`dhrystone-x0-cb` is
+  // 0.21 MPKI and 3 mispredicts total), which is exactly the recorded bench-stall-mix
+  // blind spot. A sim cycle win on a probe is NOT a board win. `mispredicts/kinst` on
+  // silicon (~0.95% noise floor) is the only thing that can rank these.
 }
