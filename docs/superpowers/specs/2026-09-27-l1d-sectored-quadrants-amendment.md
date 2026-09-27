@@ -1,6 +1,19 @@
 # Amendment: L1D as 64-byte lines with 16-byte SECTORS (quadrants)
 
-**Status:** proposal, owner-originated 2026-09-27. **Not ratified.** Filed because
+**Status: RATIFIED by the owner 2026-09-27 — BUILD IT.** The capacity trade below
+was put to them explicitly and **accepted**:
+
+> *"we can probably go ahead with 64b lines even if it's worse right ahead; memory
+> bandwidth is valuable"*
+
+The scattered-access capacity regression is therefore a **known, accepted cost**,
+not an open question, and it does **not** gate the build. It is still worth
+MEASURING — an accepted cost of unknown size is harder to trade away later — so the
+large-footprint scattered kernel runs in parallel and **nothing waits on it**.
+Plain sectoring first; hold Seznec decoupling in reserve for if the measured
+regression proves worth a few bits per sector to undo.
+
+Filed because
 `AGENTS.md` fixes architecture to the design doc and the ratified MSHR design
 (`2026-07-30-mshr-multi-outstanding-design-proposal.md`) does **not** consider
 sectoring. This amends its decision **D4 / §11.Q2** (`D3-BURST`).
@@ -79,13 +92,13 @@ sectored cache is the IBM 360/85, Liptay 1968 — the first commercial cache, wh
 sectored precisely to hold tag cost down.) If plain sectoring measures a real
 scattered-access regression, this is the known fix.
 
-## ⛔ Coverage hole this exposes (the sixth found in this corpus)
+## Coverage hole this exposes (the sixth) — measure it, do not gate on it
 
 **There is no scattered-access kernel with a footprint larger than L1.**
 `chase-128`'s working set is ~2 KB and fits. So the corpus **cannot see the
 capacity regression** and sectoring would measure as free when it is not. A
-large-footprint pointer-chase kernel is a **prerequisite** for evaluating this,
-not a follow-up. Prior holes: zero A6/A7 operands, zero store->load pairs, zero
+large-footprint pointer-chase kernel is therefore needed to SIZE the accepted cost.
+Per the ratification above it is **not a gate** — it runs in parallel. Prior holes: zero A6/A7 operands, zero store->load pairs, zero
 load->compare->branch chains, 25 total suite mispredicts vs the board's 24.4 MPKI,
 zero DBcc instructions.
 
