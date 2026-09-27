@@ -63,6 +63,12 @@ class MissInjectionSweepSpec extends CoreBenchHarness {
     val allKernels = Seq(
       kChasePure(records = 128, iters = 512).copy(name = "chase-128"),
       kLoadStream, kMixed, kBranchy, kHotLoop,
+      // `dhry-cb-128` is the -cb variant sized to be affordable in a sweep: the same
+      // kernel as `dhrystone--cb`, with a 128-record footprint and a 128-record cold
+      // walk excluded by `warmupInstrs`, so what is measured is steady state. Note its
+      // copy DESTINATION goes dirty and is therefore immune to D injection by design --
+      // the `dirty` skip count in the report says how much of the stream that is.
+      kDhrystone(records = 128, iters = 512, copyback = true).copy(name = "dhry-cb-128"),
       kChasePure(), kDhrystone(copyback = true), kDhrystone())
     val kernels = envList("INJ_KERNELS") match {
       case Some(names) =>
