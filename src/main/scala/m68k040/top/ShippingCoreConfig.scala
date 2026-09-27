@@ -104,4 +104,23 @@ object ShippingCoreConfig {
     * negative result in this Part is vacuous"), so the upper bound is a sanity rail
     * that has now been genuinely moved -- which is information, not noise. */
   val dcacheFillForward: Boolean = envFlag("CPU_DCACHE_FILL_FORWARD", false)
+
+  /** D-cache: SECTORED 64-byte L1D lines -- four 16-byte SECTORS per line, each with its
+    * own valid AND dirty bit. See `DcachePlugin.sectoredL1d` for the mechanism and
+    * `docs/superpowers/specs/2026-09-27-l1d-sectored-quadrants-amendment.md` for the
+    * ratified spec. This is slice `D3-BURST` (decision D4 / SS11.Q2 of the MSHR design
+    * proposal), never bare "D3" -- `D3-SET` is the unrelated one-fill-per-set invariant.
+    *
+    * WHY SECTORS AND NOT PLAIN 64-BYTE LINES, in one sentence: the 68040's architectural
+    * cache line is 16 bytes, so `CINVL` on address A must discard exactly those 16 bytes;
+    * at an unsectored 64-byte line it would discard 64 and silently drop up to 48 bytes
+    * of dirty data the programmer never asked to lose. Per-16-byte dirty sectors are what
+    * make the widening CORRECT, not merely cheaper. (`CPUSHL` has the mirror problem but
+    * is safe -- over-pushing writes back correct data and costs only time.)
+    *
+    * OFF pending measurement. The KNOWN, OWNER-ACCEPTED cost is a scattered-access
+    * capacity regression: one tag now covers 64 bytes, so a workload touching one sector
+    * per line gets 2 KB of effective capacity instead of 8 KB. The owner ratified that
+    * trade explicitly ("memory bandwidth is valuable"); it is not a gate. */
+  val dcacheSectored: Boolean = envFlag("CPU_DCACHE_SECTORED", false)
 }

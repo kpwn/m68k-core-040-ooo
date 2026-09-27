@@ -162,21 +162,138 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * at zero injection is -0.62%/-0.85% cycles, and `chase-128` is
                      * BIT-IDENTICAL (its steady state takes no D-miss at all -- the correct
                      * negative control for this lever). */
-                   val fillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward)
+                   val fillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
+                   /** ── SLICE `D3-BURST`: SECTORED 64-BYTE LINES ────────────────────────
+                     *
+                     * ⚠ NAMING (plan rule GC9): this is `D3-BURST` -- decision D4 / §11.Q2
+                     * of `docs/superpowers/specs/2026-07-30-mshr-multi-outstanding-design-
+                     * proposal.md`, as amended by `2026-09-27-l1d-sectored-quadrants-
+                     * amendment.md`. NEVER bare "D3": `D3-SET` is the unrelated
+                     * one-outstanding-fill-per-set invariant, and conflating them is a
+                     * review defect.
+                     *
+                     * The L1D line becomes 64 bytes divided into FOUR 16-BYTE SECTORS, each
+                     * carrying its OWN valid and dirty bit. Geometry stays 8 KB / 4-way, so
+                     * there are 32 sets of 4 ways of 4 sectors.
+                     *
+                     * ── WHY SECTORS AND NOT PLAIN 64-BYTE LINES (the load-bearing reason) ─
+                     * `CINVL` BECOMES DATA-DESTROYING AT AN UNSECTORED 64-BYTE LINE. The
+                     * 68040's architectural cache line is 16 bytes, so `CINVL` on address A
+                     * is specified to discard exactly the 16 bytes containing A. At a 64-byte
+                     * line it would discard 64, silently dropping up to 48 bytes of dirty
+                     * data the programmer never asked to lose -- software doing DMA-buffer
+                     * invalidation at architectural granularity would lose neighbouring
+                     * stores. `CPUSHL` has the mirror problem but is SAFE (over-pushing
+                     * writes back correct data and costs only time). Per-16-byte dirty
+                     * sectors are therefore what make the widening CORRECT, not merely
+                     * cheaper. `DcacheSectorSpec`'s directed test is written to FAIL on an
+                     * unsectored 64-byte line.
+                     *
+                     * ── THE IMPLEMENTATION IS A REINTERPRETATION, NOT A REBUILD ──────────
+                     * The decisive arithmetic: at 4-way 8 KB, 64-byte lines give offBits 6
+                     * and setBits 5 with `tagBits` UNCHANGED at 21 and `offBits+setBits`
+                     * unchanged at 11 (the tag is `paddr[31:11]` either way). So:
+                     *
+                     *   - the tag VALUE and every address slice derived from it are
+                     *     bit-identical, which is why the maintenance engine's hardcoded
+                     *     page-scope bit positions (`rdTag(31 downto 2) === target(31 downto
+                     *     13)`) need NO change at all;
+                     *   - the SECTOR SLOT index `{set[4:0], sector[1:0]}` is exactly today's
+                     *     7-bit `set` field, so `dataMem`/`validsMem`/`dirtysMem` keep their
+                     *     128-deep x 128-bit / 1-bit shape, every "line" bundle field stays
+                     *     128 bits, and every byte-merge loop stays 16 wide. `LsEuPlugin`
+                     *     and its 4-deep line ring need no change whatsoever, and
+                     *     `StoreQueue`'s `sameLine` stall does NOT coarsen 4x (the D3-BURST
+                     *     assessment's §2.5 risk) because the SQ's unit is 16 bytes and 16
+                     *     bytes is still exactly one sector.
+                     *
+                     * Only THREE things actually change:
+                     *   1. `tagMem` and `victim` become LINE-indexed (32 deep, addressed by
+                     *      `lineOf(set)`), so one tag covers four sector slots. Tag+state
+                     *      storage falls from 11,776 to 3,712 bits.
+                     *   2. A LINE miss (no way's tag matches) evicts every DIRTY SECTOR of
+                     *      the victim line, then fills all four sectors with ONE 4-beat AXI
+                     *      burst. That burst is the bandwidth lever: a sequential stream
+                     *      takes one refill transaction per 64 bytes instead of four.
+                     *   3. A SECTOR miss (some way's tag DOES match, but that sector's valid
+                     *      bit is clear) fills ONLY the demanded sector with today's exact
+                     *      single-beat transaction, and evicts nothing. This split is what
+                     *      makes partial validity safe: a full-line refetch into a
+                     *      tag-matching way would overwrite a DIRTY sibling sector and lose
+                     *      the write. Partial validity is reachable exactly two ways -- a
+                     *      `CINVL` of one sector, and (later) a no-fetch full-sector store
+                     *      allocate.
+                     *
+                     * ── CRITICAL-SECTOR SELECTION IS MANDATORY, NOT OPTIONAL ─────────────
+                     * `fillForward` above extracts the load's data from the beat carrying
+                     * `r.last`. At `len = 0` that beat IS the whole line, so it is trivially
+                     * correct. At `len = 3` it is the WRONG BEAT and every miss would return
+                     * the bytes of the line's LAST sector. So the burst arm latches
+                     * `missLine` from the beat whose index equals the DEMANDED sector
+                     * (`missSet`'s low bits), not from `r.last`. AXI WRAP is not available to
+                     * do this the conventional way -- the real L2 SLVERRs FIXED and WRAP
+                     * (`l2c_ctrl.v:26-37`) -- so the burst is a plain INCR from the line base
+                     * and the selection is by beat index. That costs the demanded sector's
+                     * position in the burst (0-3 beats of extra latency, 1.5 on average)
+                     * and keeps the transaction-count win, which is the larger term. */
+                   val sectored: Boolean = m68k040.top.ShippingCoreConfig.dcacheSectored)
     extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
   // that read through loadProbeResolve with the translated physical address.
 
+  // `geo` describes the SECTOR, which is the unit of data storage, of maintenance and
+  // of every "line"-named interface in this file -- 16 bytes, unchanged in both arms.
+  // Sectoring groups four of these slots under one tag; see `lineGeo` below.
   private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
   geo.requireViptSafe(4096, "L1D")
   private val ways    = geo.ways
   private val sets    = geo.sets
   private val tagBits = geo.tagBits          // 21
-  private val setBits = geo.indexBits        // 7
-  private val offBits = geo.offsetBits       // 4
+  private val setBits = geo.indexBits        // 7  -- the SECTOR-SLOT index width
+  private val offBits = geo.offsetBits       // 4  -- offset within a 16-byte sector
   private val wayBits = log2Up(ways)
+
+  // ---- SECTORED-LINE grouping (slice `D3-BURST`, see `sectored` above) ----
+  /** Sectors per line: 4 when sectored, 1 otherwise (in which case every expression
+    * below collapses, at ELABORATION time, to exactly today's hardware). */
+  private val nSec       = if (sectored) 4 else 1
+  private val secBits    = log2Up(nSec)              // 2 or 0
+  /** Tag-array depth: 32 sectored, 128 flat. */
+  private val lineSets   = sets >> secBits
+  private val lineSetBits = setBits - secBits        // 5 or 7
+  /** The ARCHITECTURAL line the 68040 defines, and the unit `CINVL`/`CPUSHL`/`MOVE16`
+    * work on. It is the SECTOR, in both arms -- that is the whole point of sectoring. */
+  private val archLineBytes = 1 << offBits           // 16, both arms
+  /** The physical line the cache tags and replaces. */
+  private val lineBytes  = archLineBytes << secBits  // 64 or 16
+  if (sectored) {
+    // Restate the amendment's arithmetic as a build-time check rather than a comment,
+    // because the "tagBits is unchanged at 21" property is what lets the maintenance
+    // engine's hardcoded page-scope bit positions stay untouched.
+    val lineGeo = CacheGeometry(cacheBytes = 8192, lineBytes = lineBytes, ways = ways,
+                                indexingPolicy = CacheIndexingPolicy.Vipt)
+    lineGeo.requireViptSafe(4096, "L1D(sectored)")
+    require(lineGeo.tagBits == tagBits,
+      s"D3-BURST: sectoring must not move the tag (${lineGeo.tagBits} vs $tagBits)")
+    require(lineGeo.indexBits == lineSetBits,
+      s"D3-BURST: tag-array index width mismatch (${lineGeo.indexBits} vs $lineSetBits)")
+    require(lineGeo.sets == lineSets, "D3-BURST: tag-array depth mismatch")
+  }
+  /** The LINE index inside a sector-slot index. Identity when unsectored, so every
+    * `tagMem`/`victim` access below elaborates to exactly today's expression. */
+  private def lineOf(set: UInt): UInt =
+    if (secBits == 0) set else set(setBits - 1 downto secBits)
+  /** The SECTOR index inside a sector-slot index. */
+  private def secOf(set: UInt): UInt =
+    if (secBits == 0) U(0, 1 bits) else set(secBits - 1 downto 0)
+  /** Sector-slot index of sector `sec` inside the line holding `set`. */
+  /** By-NAME in `sec`: unsectored the sector index does not exist at all (its register
+    * is `null`, so the OFF netlist declares nothing), and a by-value parameter would
+    * force the caller to have one. */
+  private def slotOf(set: UInt, sec: => UInt): UInt =
+    if (secBits == 0) set else (lineOf(set) ## sec.resize(secBits)).asUInt
 
   val axiCfg = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 4)
 
@@ -253,7 +370,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // the exact structure the placer's congestion dump names (ldS1Tag_reg / tagMem_
     // spinal_port1 nets, iter_100_CongestedCLBsAndNets.txt) -- force BRAM (95% free
     // budget) to both decongest the hot corridor and remove ~192 LUTRAM LUTs/way.
-    val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), sets).addAttribute("ram_style", "block"))
+    // Slice `D3-BURST`: LINE-indexed, so one tag covers `nSec` sector slots. `lineSets`
+    // is `sets` when unsectored, which is today's declaration exactly.
+    val tagMem  = Seq.fill(ways)(Mem(UInt(tagBits bits), lineSets).addAttribute("ram_style", "block"))
     // Task #240 (D2.1, LUT-reduction slice): valids/dirtys folded from per-way
     // Vec.fill(ways)(Vec.fill(sets)(RegInit(False))) flop arrays (128 x 4 x 2 =
     // 1,024 FF, behind wide dynamic-index read muxes at every consumer) into
@@ -273,6 +392,29 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // registers reset, letting a new boot hit data from the previous one.
     val validsMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
     val dirtysMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    // ── Slice `D3-BURST`: "some sector of this LINE, in this way, MAY be dirty" ────
+    // A sectored line has up to `nSec` independently dirty sectors, so the
+    // evict-or-not decision at miss-detect needs the OR of them -- and the shared read
+    // port yields only ONE sector's `dirtysMem` bit per cycle. This is that OR, kept as
+    // its own line-indexed bit rather than widening `dirtysMem` (which would turn all
+    // six of its writer sites into read-modify-writes).
+    //
+    // ⚠ IT IS CONSERVATIVE IN EXACTLY ONE DIRECTION, and that asymmetry is what makes
+    // it sound: it is set True on EVERY event that dirties any sector, and cleared only
+    // where every sector is provably clean (the reset sweep, and a FULL-LINE allocate,
+    // which writes all `nSec` sectors clean in one burst). The three sites that make a
+    // sector clean WITHOUT knowing about its siblings -- maintenance CHECK-invalidate,
+    // maintenance WRB-clean and the multi-hot duplicate purge -- deliberately leave it
+    // set. So False PROVES no sector is dirty (which is the direction correctness
+    // depends on: a wrong False loses a write), while True merely permits an eviction
+    // walk that finds nothing to push and costs a few cycles and no bus traffic.
+    //
+    // Elaborated only when sectored: unsectored, `dirtysMem`'s own bit already IS the
+    // line's dirty state and this would be a duplicate array with an identical value.
+    val lineDirtyMem: Seq[Mem[Bool]] =
+      if (!sectored) Nil
+      else Seq.fill(ways)(Mem(Bool(), lineSets) init Vector.fill(lineSets)(False))
+    for (w <- 0 until ways) if (sectored) lineDirtyMem(w).simPublic()
     // test-visibility only (DcacheSpec/DcacheDrainRefillRaceSpec peek dirtysMem(w)
     // via the sim-side Mem.getBigInt(addr) API, the same idiom IcachePlugin already
     // uses for tagMem/lineMem, see IcachePlugin.scala's own `.simPublic()` loop);
@@ -286,7 +428,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // duplicate through the BACKDOOR, because the reachable producers of one were
     // closed and a repair mechanism has to be tested against the state it repairs.
     for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic(); tagMem(w).simPublic() }
-    val victim  = Vec.fill(sets)(RegInit(U(0, wayBits bits)))
+    // Slice `D3-BURST`: replacement is per LINE, so this is LINE-indexed too.
+    val victim  = Vec.fill(lineSets)(RegInit(U(0, wayBits bits)))
     // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
     // merely at FPGA configuration); one set is invalidated per cycle after reset
     // releases. Request acceptance and maintenance quiescence are gated below until
@@ -324,6 +467,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val dirtysWrEn   = Vec.fill(ways)(False)
     val dirtysWrSet  = Vec.fill(ways)(U(0, setBits bits))
     val dirtysWrData = Vec.fill(ways)(False)
+    // Slice `D3-BURST`: same muxed-write-port idiom for `lineDirtyMem`. Deliberately a
+    // SEPARATE enable from `dirtysWrEn`, because the two disagree at three sites by
+    // design (see `lineDirtyMem`'s declaration): a maintenance invalidate clears the
+    // sector's dirty bit while leaving the line's conservative OR set.
+    // ⚠ `Seq` + `Nil`, NOT `Vec.fill(ways)(False)`: a Vec of False literals is REAL
+    // HARDWARE (four dead wires each), and the round-trip netlist diff against the
+    // pre-change baseline caught exactly that -- the same trap `fillFwdResp`'s
+    // declaration records ("an always-declared `fillFwdResp` tied to False left a dead
+    // wire and an `|| 1'b0` term in the OFF netlist"). Every use site below is already
+    // inside an `if (sectored)`, so the null is never dereferenced. (SpinalHDL's `Vec`
+    // is not a Scala `Seq`, so `Nil`/`IndexedSeq.empty` will not type-check here.)
+    val lineDirtyWrEn:   Vec[Bool] = if (!sectored) null else Vec.fill(ways)(False)
+    val lineDirtyWrSet:  Vec[UInt] = if (!sectored) null else Vec.fill(ways)(U(0, lineSetBits bits))
+    val lineDirtyWrData: Vec[Bool] = if (!sectored) null else Vec.fill(ways)(False)
     // Task #255: per-writer vote vectors -- the same "review-added collision
     // detector" idiom as `diagFaultKind0Fires`/`diagFaultKind1Fires` far below
     // (plain default-False signals, driven unconditionally at each real writer
@@ -358,6 +515,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
         dirtysWrData(w) := False
         validsVoteW0(w) := True
         dirtysVoteD0(w) := True
+        if (sectored) {
+          lineDirtyWrEn(w)   := True
+          lineDirtyWrSet(w)  := lineOf(resetSweepSet)
+          lineDirtyWrData(w) := False
+        }
       }
       when(resetSweepSet === U(sets - 1, setBits bits)) {
         resetSweepBusy := False
@@ -367,9 +529,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     }
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
-      tagMem(w).write(wrSet(w), wrTag(w), wrTagEn(w))
+      tagMem(w).write(lineOf(wrSet(w)), wrTag(w), wrTagEn(w))
       validsMem(w).write(validsWrSet(w), validsWrData(w), validsWrEn(w))
       dirtysMem(w).write(dirtysWrSet(w), dirtysWrData(w), dirtysWrEn(w))
+      if (sectored)
+        lineDirtyMem(w).write(lineDirtyWrSet(w), lineDirtyWrData(w), lineDirtyWrEn(w))
     }
 
     // ---- shared synchronous read port per way (S0 launch -> S1 result) ----
@@ -385,12 +549,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     rdEn.simPublic()
     rdSet.simPublic()   // DEBUG (pea-cache-evict-2026-08-19 investigation), temporary
     val rdData  = Vec(dataMem.map(_.readSync(rdSet, rdEn)))
-    val rdTag   = Vec(tagMem.map(_.readSync(rdSet, rdEn)))
+    // Slice `D3-BURST`: the tag read rides the SAME `rdSet`/`rdEn` port as before --
+    // only the low `secBits` are dropped, because those select the sector WITHIN the
+    // tagged line and every sector of a line shares one tag.
+    val rdTag   = Vec(tagMem.map(_.readSync(lineOf(rdSet), rdEn)))
     // Task #240 (D2.1): rdValid/rdDirty ride the SAME rdSet/rdEn port as rdTag/
     // rdData -- every consumer below reads rdValid(w)/rdDirty(w) at the exact same
     // address+cycle it already reads rdTag(w)/rdData(w) at (verified per call site).
     val rdValid = Vec(validsMem.map(_.readSync(rdSet, rdEn)))
     val rdDirty = Vec(dirtysMem.map(_.readSync(rdSet, rdEn)))
+    /** Slice `D3-BURST`: rides the SAME `rdSet`/`rdEn` port, line-indexed like `rdTag`.
+      * Hard-False unsectored, where `rdDirty` already is the line's dirty state. */
+    val rdLineDirty: Vec[Bool] =
+      if (!sectored) null
+      else Vec(lineDirtyMem.map(_.readSync(lineOf(rdSet), rdEn)))
 
     // ---- tokenized early VIPT result queue ----
     // A probe reserves one small entry and launches the virtual-set BRAM read in
@@ -574,6 +746,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // encodes that fact).
     val victimEvictTag  = Reg(UInt(tagBits bits))
     val victimEvictLine = Reg(Bits(128 bits))
+
+    // ── Slice `D3-BURST`: sectored-line miss state ───────────────────────────────
+    /** This miss allocates a whole 64-byte LINE (a 4-beat burst that fills all four
+      * sectors) rather than one 16-byte SECTOR. False for a SECTOR miss (a tag-matching
+      * way whose demanded sector is invalid) and for every INHIBITED access. Always
+      * False -- and elaborated away -- when unsectored. */
+    val refillFullLine: Bool = if (!sectored) null else { val r = RegInit(False); r.simPublic(); r }
+    /** Which beat of the burst the next accepted R beat is. Also the sector index that
+      * beat's data belongs to, because the burst is a plain INCR from the line base. */
+    val refillBeat: UInt = if (!sectored) null else { val r = Reg(UInt(secBits bits)) init 0; r.simPublic(); r }
+    /** EVICTION WALK cursor: which sector of the victim line is being examined/pushed.
+      * A sectored line can have up to `nSec` INDEPENDENTLY dirty sectors, so an eviction
+      * is a walk, not a single beat -- the one genuinely new piece of control this slice
+      * adds. Each dirty sector is pushed as its own 16-byte, architecturally-correct
+      * transaction; a clean sector costs two cycles and no bus traffic. */
+    val evictSec: UInt = if (!sectored) null else { val r = Reg(UInt(secBits bits)) init 0; r.simPublic(); r }
     val arSent    = Reg(Bool()) init False
     // Task #189 (bus error): latched across REFILL->REPLAY — did the AXI read
     // response for this refill come back with a non-OKAY resp (SLVERR/DECERR, e.g.
@@ -654,6 +842,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val pendingVictimDirty = Reg(Bool())
     val pendingVictimTag   = Reg(UInt(tagBits bits))
     val pendingVictimLine  = Reg(Bits(128 bits))
+    /** Slice `D3-BURST`: was the latched store miss a LINE miss (burst-fill all `nSec`
+      * sectors) or a SECTOR miss (fill one)? Latched at store-S2 alongside
+      * `pendingVictim*` for exactly the same reason those are -- see their comment. */
+    val pendingStoreFullLine:  Bool = if (!sectored) null else RegInit(False)
     val storeAllocAckReg   = Bool(); storeAllocAckReg := False
     // test-visibility only (FMax Lever F's positive-control sweep in
     // DcacheDrainRefillRaceSpec counts merge acks); already a live driver of
@@ -807,6 +999,35 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS1Hit     = OneHotSafe.exactlyOne(ldS1HitVec)
     val ldS1HitWay  = OHToUInt(ldS1HitVec)
     ldS1MultiHot.simPublic()
+
+    // ── Slice `D3-BURST`: SECTOR MISS vs LINE MISS ───────────────────────────────
+    // A miss whose TAG nevertheless matches a resident way is a SECTOR miss: that way
+    // already holds this 64-byte line, and only the demanded 16-byte sector's valid bit
+    // is clear. It must be filled with a SINGLE-SECTOR transaction and must NOT evict,
+    // because a full-line refetch into a tag-matching way would overwrite a DIRTY
+    // SIBLING SECTOR and silently lose that write -- which is exactly the data loss
+    // sectoring exists to prevent, reintroduced through the fill path.
+    //
+    // Reachable exactly two ways: a `CINVL` of one sector of a line whose siblings stay
+    // resident, and (later) a no-fetch full-sector store allocate. It is deliberately
+    // NOT gated on "some sibling is valid": tagMem is never cleared by the reset sweep
+    // (valid=False makes its payload unreachable, which is why that is sound), so a
+    // cold way can hold a garbage tag that matches. Taking the single-sector path on
+    // such a 1-in-2^21 coincidence is CORRECT, merely less eager -- one sector is
+    // filled and the line's other three stay invalid until they are demanded.
+    //
+    // `OHMasking.first` rather than `OHToUInt`: a multi-hot TAG match is possible for
+    // the same reason `ldS1MultiHot` exists, and unlike the hit path this vector feeds
+    // a WAY SELECT for an array write, where an OR-ed index would corrupt an unrelated
+    // way. First-match is arbitrary but always a way that genuinely holds the tag.
+    val (ldS1SectorMiss, ldS1SectorWay): (Bool, UInt) =
+      if (!sectored) (null, null)
+      else {
+        val v = Vec(Bool(), ways)
+        for (w <- 0 until ways) v(w) := ldS1Cacheable && (rdTag(w) === ldS1Tag)
+        v.simPublic()
+        (v.asBits.orR, OHToUInt(OHMasking.first(v.asBits)))
+      }
     // DEBUG (task #189 investigation, temporary): sim-only visibility.
     ldS1Valid.simPublic(); ldS1Set.simPublic(); ldS1Tag.simPublic(); ldS1Off.simPublic()
     ldS1Size.simPublic(); ldS1Hit.simPublic(); ldS1HitWay.simPublic()
@@ -1018,8 +1239,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // equivalent coverage (same two possible physical sources) without adding
       // fanout to `wrEn`/`wrSet` themselves.
       val setBitsOf = earlyProbeVaddrs(i)(offBits + setBits - 1 downto offBits)
+      // Slice `D3-BURST`: the refill term is LINE-granular for the same reason
+      // `refillWriteHold` is -- a full-line refill writes four sector slots, and
+      // comparing only the demanded one would leave a probe on a sibling sector of the
+      // refilled line un-retired. Strictly more conservative than before (more probes
+      // fall back to the ordinary S1 read, none fewer). The store term stays exact: a
+      // store writes exactly one sector slot in both arms.
       earlyProbeSetWriteVec(i) := (storeArrayWrite && (storeArrayWriteSet === setBitsOf)) ||
-                                   (missArrayWrite && (missSet === setBitsOf))
+                                   (missArrayWrite &&
+                                     (if (!sectored) missSet === setBitsOf
+                                      else lineOf(missSet) === lineOf(setBitsOf)))
     }
     // Task pea-cache-evict-2026-08-19 fix: `earlyProbeSetWriteVec` above is a purely
     // COMBINATIONAL, THIS-CYCLE-ONLY check -- despite this block's own comment
@@ -1707,6 +1936,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // MISS, which takes the write-allocate / write-through miss path; unlike the load
     // and fetch sides that path always COMPLETES on the bus, so it cannot livelock
     // even before the purge below.
+    // Slice `D3-BURST`: the store-side twin of `ldS1TagHitVec` -- see there for why a
+    // tag-matching miss must fill one sector and evict nothing.
+    val (stS2SectorMiss, stS2SectorWay): (Bool, UInt) =
+      if (!sectored) (null, null)
+      else {
+        val v = Vec(Bool(), ways)
+        for (w <- 0 until ways) v(w) := rdTag(w) === stS2Tag
+        v.simPublic()
+        (v.asBits.orR, OHToUInt(OHMasking.first(v.asBits)))
+      }
     val stS2MultiHot  = OneHotSafe.multiHot(stS2HitVec)
     val stS2HitAny    = OneHotSafe.exactlyOne(stS2HitVec)
     val stS2HitWay    = OHToUInt(stS2HitVec)
@@ -1815,9 +2054,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // term's same-line generality is now the ACTUAL, load-bearing protection for that
     // exact race (a same-line load-refill landing during a COPYBACK store's S1/S2
     // hit-write window) -- verified directly against this RTL, not assumed.
+    // ⚠ Slice `D3-BURST`: these two SET COMPARES MUST BE LINE-GRANULAR WHEN SECTORED.
+    // A full-line refill writes FOUR sector slots (`{line, 0..3}`), not one, so an exact
+    // compare against `missSet` -- the DEMANDED sector only -- leaves a store drain to a
+    // DIFFERENT sector of the SAME line unprotected, and that is precisely the hazard
+    // this interlock exists for: the store's registered tag-read would not see the
+    // refill, and S2 would then merge into a way the refill has re-tagged (write-through:
+    // cached-line corruption; copyback: a LOST STORE, silently discarded by refill
+    // priority). Coarsening to the line is strictly stronger and costs only a few held
+    // cycles on same-line collisions; the store side, as before, gets ZERO new logic.
+    def refillSetCollide(s: UInt): Bool =
+      if (!sectored) s === missSet else lineOf(s) === lineOf(missSet)
     val refillWriteHold = (stS1Valid && !storeMissBarrier && !loadMissStoreBarrier &&
-                           (stS1Set === missSet)) ||
-                          (stS2Valid && (stS2Set === missSet)) ||
+                           refillSetCollide(stS1Set)) ||
+                          (stS2Valid && refillSetCollide(stS2Set)) ||
                           // NOTE: this 3rd (same-way) term only means anything
                           // while `victimWay` holds a currently-relevant value,
                           // i.e. during REFILL/REPLAY immediately after a
@@ -1903,6 +2153,34 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val EVICT_WR = new State
       val REFILL   = new State
       val REPLAY   = new State
+      // ── Slice `D3-BURST`: the EVICTION WALK ──────────────────────────────────────
+      // A sectored line can hold up to `nSec` INDEPENDENTLY dirty 16-byte sectors, and
+      // the shared array read port yields one sector per cycle -- so evicting a line is
+      // a WALK, not the single latched beat it is at a 16-byte line. These two states
+      // are the only new control this slice adds. `EVICT_RD` launches sector
+      // `evictSec`'s read; `EVICT_CK` judges the landed result and either hands that one
+      // sector to `EVICT_WR` (which is otherwise UNCHANGED, and still the only AXI write
+      // issuer on this path) or steps to the next sector. A clean sector costs two
+      // cycles and no bus traffic; the walk pushes exactly the dirty bytes and never
+      // more, which is why `CPUSHL`-style over-pushing cannot happen here.
+      //
+      // Elaborated only when sectored, so the unsectored FSM keeps exactly today's four
+      // states and today's `goto(EVICT_WR) -> goto(REFILL)` edge.
+      val EVICT_RD = if (sectored) new State else null
+      val EVICT_CK = if (sectored) new State else null
+      /** Step to the next sector of the victim line, or fall through to the refill once
+        * every sector has been examined. Shared by `EVICT_CK` (clean or invalid sector,
+        * nothing to push) and `EVICT_WR` (sector pushed, its own B acked) so the two
+        * cannot drift apart on the wrap condition. Never called unsectored. */
+      def evictAdvance(): Unit = {
+        when(evictSec === U(nSec - 1, secBits bits)) {
+          evictSec := U(0, secBits bits)
+          goto(REFILL)
+        } otherwise {
+          evictSec := evictSec + 1
+          goto(EVICT_RD)
+        }
+      }
 
       // Throughput slices A+C0: S2 is a frozen response snapshot (no RAM/AXI use),
       // and the one-entry `loadShadowCmd` above closes the remaining S1 miss shadow.
@@ -2376,7 +2654,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // relative to the old async hit-detect is latency-agnostic). A same-
           // cycle load miss takes priority over a pending store-drain miss
           // (mirrors this file's existing load>store read-port precedent).
-          val vw = victim(ldS1Set)
+          // ── Slice `D3-BURST`: SECTOR miss vs LINE miss ─────────────────────────
+          // A SECTOR miss reuses the tag-matching way and fills ONE sector; a LINE
+          // miss takes the round-robin victim, evicts its dirty sectors and fills all
+          // `nSec`. `ldS1SectorMiss` is hard-False unsectored, so `vw` and the two
+          // flags below all collapse to today's expressions at elaboration time.
+          val vw = if (!sectored) victim(ldS1Set)
+                   else Mux(ldS1SectorMiss, ldS1SectorWay, victim(lineOf(ldS1Set)))
+          if (sectored) {
+            refillFullLine := ldS1Cacheable && !ldS1SectorMiss
+            refillBeat     := U(0, secBits bits)
+            evictSec       := U(0, secBits bits)
+          }
           missPaddr := ldS1Paddr
           missSet   := ldS1Set
           if (fillForward) missMultiHot := ldS1MultiHot
@@ -2449,10 +2738,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val victimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === ldS1Set) &&
             (stS3WriteWayD1 === vw)
           loadVictimFromS3Dbg := victimFromS3 || victimFromS3D1
-          val victimDirtyNow = rdDirty(vw) ||
+          // Slice `D3-BURST`: `rdLineDirty(vw)` replaces `rdDirty(vw)` because the
+          // victim LINE can have dirty sectors other than the demanded one, and the
+          // shared read port yields only the demanded sector's own bit. It is hard-False
+          // unsectored, where `rdDirty(vw)` alone is already the whole line's state.
+          val victimDirtyNow = (if (sectored) rdLineDirty(vw) else rdDirty(vw)) ||
             (victimFromS3 && stS3Copyback) ||
             (victimFromS3D1 && stS3WriteCopybackD1)
-          val evictThis = victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
+          // A SECTOR miss displaces NOTHING -- the way already holds this very line --
+          // so it must not evict. Evicting there would also be the bug sectoring
+          // exists to prevent: it would push and then the refill would overwrite a
+          // DIRTY SIBLING sector of the line we are filling into.
+          val evictThis =
+            if (!sectored) victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
+            else victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED) && !ldS1SectorMiss
           victimEvictTag  := Mux(victimFromS3, stS3Tag,
             Mux(victimFromS3D1, stS3WriteTagD1, rdTag(vw)))
           victimEvictLine := Mux(victimFromS3, stS3MergedLine,
@@ -2474,7 +2773,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // baseline DcacheSpec regression run, not by the new hazard test).
           when(evictThis) {
             evictAwDone := False; evictWDone := False
-            goto(EVICT_WR)
+            // Slice `D3-BURST`: enter the WALK, not the beat. `EVICT_CK` re-reads each
+            // sector from the array, so nothing here needs to latch a line payload --
+            // `victimEvictTag` (captured above) is shared by all `nSec` sectors because
+            // they are, by definition, sectors of ONE tagged line.
+            if (sectored) goto(EVICT_RD) else goto(EVICT_WR)
           } otherwise { goto(REFILL) }
         } .elsewhen(pendingStoreMiss && !maintWalking) {
           // A pending COPYBACK drain-miss (latched at store-S2, Step 2 above) --
@@ -2525,13 +2828,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
           victimWay       := pendingVictimWay
           victimEvictTag  := pendingVictimTag
           victimEvictLine := pendingVictimLine
+          if (sectored) {
+            refillFullLine := pendingStoreFullLine
+            refillBeat     := U(0, secBits bits)
+            evictSec       := U(0, secBits bits)
+          }
           refillReqIsStore := True
           pendingStoreMiss := False
           arSent    := False
           busy      := True
           when(pendingVictimDirty) {
             evictAwDone := False; evictWDone := False
-            goto(EVICT_WR)
+            if (sectored) goto(EVICT_RD) else goto(EVICT_WR)
           } otherwise { goto(REFILL) }
         }
       }
@@ -2578,7 +2886,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
         humS1MissPark()
         if (hitUnderMiss) probeLaunchArm()
         busy := True
-        val evictAddr = (victimEvictTag ## missSet ## U(0, offBits bits)).asUInt
+        // Slice `D3-BURST`: the walk's CURRENT sector, not the demanded one. All `nSec`
+        // sectors share `victimEvictTag` by definition (one tag per line), and the low
+        // `secBits` of the index come from the walk cursor. Unsectored this is
+        // `victimEvictTag ## missSet ## 0` exactly, since `slotOf` is the identity.
+        val evictAddr = (victimEvictTag ## slotOf(missSet, evictSec) ## U(0, offBits bits)).asUInt
         // POST-P5.4-REVIEW: `&& !maintAxiPairOpen` extends revision 3's bidirectional
         // gate to the THIRD AXI write issuer this file has grown -- the cache-
         // maintenance walk's `WRB` writeback. `WRB` already gates itself off on
@@ -2615,10 +2927,89 @@ class DcachePlugin(val socketMerged: Boolean = false,
             // `axi.r.ready := !refillWriteHold`) that is the actual array-write
             // site needing the interlock, and that gate applies regardless of
             // which state was active immediately before REFILL.
-            goto(REFILL)
+            if (!sectored) {
+              goto(REFILL)
+            } else {
+              // Slice `D3-BURST`: this sector is pushed; step the walk.
+              evictAdvance()
+            }
           }
           // else: either no B this cycle, or it's the store's own (id=1) --
           // ignore it and keep waiting for OUR OWN id=2 ack.
+        }
+      }
+
+      // ── Slice `D3-BURST`: the eviction walk's two new states ─────────────────────
+      if (sectored) {
+        EVICT_RD.whenIsActive {
+          // ⚠ NO `probeLaunchArm()` HERE, and none in `EVICT_CK` either -- unlike
+          // `REFILL`/`EVICT_WR`, `EVICT_RD` genuinely USES the shared array read port, so
+          // a probe launched in this cycle would have its `rdSet`/`rdEn` silently
+          // overridden by the walk's own read (the walk's assignment is later, so it
+          // wins) while the probe's queue entry still believed its read had landed. That
+          // is the same silent wrong-data shape POST-P5.4-REVIEW records for the
+          // maintenance walk. `probeAdmitNext` correspondingly does NOT list these two
+          // states, so no credit is ever issued for them in the first place.
+          // `hitUnderMissAccept()` is absent for the same reason: it drives `rdSet`/`rdEn`
+          // (under `hitUnderMissRead`) and `loadCmdPort.ready`, so accepting a command
+          // here would redirect its S1 read to the walk's own address. With it omitted
+          // `loadCmdPort.ready` simply stays low and the command waits -- which is what
+          // `EVICT_WR` did before hit-under-miss existed. SpinalHDL's
+          // `PhaseCheck_noLatchNoOverride` enforces this rather than leaving it to review:
+          // the walk's unconditional `rdSet :=` COMPLETELY OVERLAPS the accept arm's, and
+          // that is an elaboration error, not a warning.
+          //
+          // `humS1MissPark()` IS kept: it touches no port, and dropping it would strand a
+          // command accepted one state earlier under `hitUnderMissRead` -- the exact hang
+          // that function's own comment records.
+          humS1MissPark()
+          busy := True
+          // Launch this sector's read on the SHARED port and CLAIM it, exactly as the
+          // maintenance walk's own `READ` state does (`maintUsesPort`). Without the
+          // claim a store that reached S1 would have its read silently redirected here
+          // and still advance to S2 believing its own read had landed -- the bug
+          // POST-P5.4-REVIEW records against the maintenance walk, in this same shape.
+          rdSet        := slotOf(missSet, evictSec)
+          rdEn         := True
+          loadUsesPort := True
+          goto(EVICT_CK)
+        }
+
+        EVICT_CK.whenIsActive {
+          hitUnderMissAccept()
+          humS1MissPark()
+          busy := True
+          val vwSlot = slotOf(missSet, evictSec)
+          // ⚠ THE SAME-CYCLE STORE-S3 BYPASS IS STILL REQUIRED, and for the same reason
+          // the miss-detect site needs it: `loadMissStoreBarrier` bars NEW store reads
+          // from S1, but a store already in S2/S3 when the miss was discovered still
+          // lands its array write, and this read is two or more cycles LATER. Without
+          // the bypass that store's bytes are in neither the array read nor the pushed
+          // beat, and the eviction writes back the PRE-STORE line -- a silently lost
+          // committed store, which is exactly the failure `victimFromS3` was added for.
+          val evFromS3   = stS3ArrayWrite && (stS3Set === vwSlot) && (stS3Way === victimWay)
+          val evFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === vwSlot) &&
+                           (stS3WriteWayD1 === victimWay)
+          // `rdDirty(victimWay)` etc.: the same dynamic-index-into-a-per-way Vec idiom
+          // the miss-detect and store-S2 victim sites already use (`rdDirty(vw)`,
+          // `rdDirty(pVw)`).
+          val secDirty = rdDirty(victimWay) ||
+                         (evFromS3 && stS3Copyback) || (evFromS3D1 && stS3WriteCopybackD1)
+          val secValid = rdValid(victimWay) || evFromS3 || evFromS3D1
+          // A sector is pushed only if it is BOTH dirty and valid. The `valid` term is
+          // not decoration: `lineDirtyMem` is deliberately conservative (see its
+          // declaration), so the walk can be entered for a line whose dirty sectors were
+          // since invalidated by a `CINVL`, and an invalid slot's data RAM contents are
+          // architecturally meaningless -- pushing them would write garbage to memory.
+          when(secDirty && secValid) {
+            victimEvictLine := Mux(evFromS3, stS3MergedLine,
+              Mux(evFromS3D1, stS3WriteLineD1, rdData(victimWay)))
+            evictAwDone := False
+            evictWDone  := False
+            goto(EVICT_WR)
+          } otherwise {
+            evictAdvance()
+          }
         }
       }
 
@@ -2630,6 +3021,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // Refill from the PHYSICAL line base (the access was already translated;
         // missPaddr holds the resolved physical address). Under identity == vaddr.
         val lineBase = (missPaddr(31 downto offBits) ## U(0, offBits bits)).asUInt
+        // ── Slice `D3-BURST`: the 4-beat, 64-byte-aligned burst base and length ──────
+        // A LINE miss reads the whole 64-byte line as ONE `len = nSec-1` INCR burst from
+        // the LINE base; a SECTOR miss and every INHIBITED access keep today's `len = 0`
+        // single beat at the sector base. AXI WRAP would give true critical-word-FIRST
+        // but the real L2 SLVERRs FIXED and WRAP (`l2c_ctrl.v:26-37`), so this is plain
+        // INCR and the demanded sector is selected BY BEAT INDEX below.
+        val refillAddr: UInt =
+          if (!sectored) lineBase
+          else Mux(refillFullLine,
+                   (missPaddr(31 downto offBits + secBits) ## U(0, offBits + secBits bits)).asUInt,
+                   lineBase)
 
         // ── D4/D24/D30: INHIBITED accesses get a REAL AxSIZE and a byte-granular address
         // The cacheable path below is bit-identical to before: one len=0/size=4 beat at the
@@ -2654,9 +3056,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
         when(!arSent) {
           axi.ar.valid         := True
-          axi.ar.payload.addr  := Mux(inhib, subAddr, lineBase)
+          axi.ar.payload.addr  := Mux(inhib, subAddr, refillAddr)
           axi.ar.payload.id    := U(AxiIds.dRefill(0), AxiIds.ID_W bits)
-          axi.ar.payload.len   := U(0, 8 bits)
+          // A Scala `if`, not `Mux(inhib, 0, Mux(refillFullLine, 0, 0))`: the latter
+          // leaves a live `(cond ? 8'h0 : 8'h0)` ternary in the unsectored netlist, which
+          // the round-trip diff against the pre-change baseline flagged.
+          if (!sectored) axi.ar.payload.len := U(0, 8 bits)
+          else axi.ar.payload.len := Mux(inhib || !refillFullLine,
+                                         U(0, 8 bits), U(nSec - 1, 8 bits))
           axi.ar.payload.size  := Mux(inhib, subLog2.resize(3 bits), U(4, 3 bits))
           axi.ar.payload.burst := Axi4.burst.INCR
           when(axi.ar.ready) { arSent := True }
@@ -2689,25 +3096,48 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // not) so REPLAY's inhibitedResp path has real data to hand back.
           val respErr    = axi.r.payload.resp =/= Axi4.resp.OKAY
           val doAllocate = !respErr && (missCmode =/= CacheMode.INHIBITED)
+          // Slice `D3-BURST`: each beat of the burst installs its OWN sector slot. The
+          // burst is a plain INCR from the line base, so beat index == sector index.
+          val allocSlot: UInt =
+            if (!sectored) missSet
+            else Mux(refillFullLine, slotOf(missSet, refillBeat), missSet)
           when(doAllocate) {
             for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
               wrEn(w)    := True
-              wrSet(w)   := missSet
+              wrSet(w)   := allocSlot
               wrData(w)  := axi.r.payload.data
               wrTagEn(w) := True
               wrTag(w)   := missTag
               validsWrEn(w)   := True
-              validsWrSet(w)  := missSet
+              validsWrSet(w)  := allocSlot
               validsWrData(w) := True
               dirtysWrEn(w)   := True
-              dirtysWrSet(w)  := missSet
+              dirtysWrSet(w)  := allocSlot
               dirtysWrData(w) := False   // a fresh allocate is always clean until
                                              // the write-allocate merge below (or a
                                              // later hit) dirties it
               validsVoteW1(w) := True    // Task #255 exclusivity tripwire (W1/D1)
               dirtysVoteD1(w) := True
+              // Slice `D3-BURST`: a FULL-LINE allocate writes every sector clean, so it
+              // is the one place other than the reset sweep that can prove the line's
+              // conservative dirty OR is False. A SECTOR fill cannot -- its siblings are
+              // untouched and one of them may be dirty -- so it leaves the bit alone.
+              if (sectored) when(refillFullLine) {
+                lineDirtyWrEn(w)   := True
+                lineDirtyWrSet(w)  := lineOf(missSet)
+                lineDirtyWrData(w) := False
+              }
             }
-            victim(missSet) := victim(missSet) + 1
+            // Slice `D3-BURST`: replacement is per LINE, and a SECTOR fill displaced
+            // nothing, so it must not advance the round robin (doing so would make a
+            // CINVL'd sector's refill steal an unrelated way on the NEXT line miss).
+            if (!sectored) {
+              victim(missSet) := victim(missSet) + 1
+            } else when(refillFullLine && (refillBeat === U(0, secBits bits))) {
+              // ONCE per burst, not once per beat: four increments at wayBits=2 would
+              // wrap to zero and freeze the round robin entirely.
+              victim(lineOf(missSet)) := victim(lineOf(missSet)) + 1
+            }
             missArrayWrite  := True
           }
           when(inhib) {
@@ -2746,9 +3176,38 @@ class DcachePlugin(val socketMerged: Boolean = false,
               arSent     := False                      // arm the next sub-transaction
             }
           } otherwise {
-            missLine  := axi.r.payload.data
-            missFault := respErr
-            goto(REPLAY)
+            if (!sectored) {
+              missLine  := axi.r.payload.data
+              missFault := respErr
+              goto(REPLAY)
+            } else {
+              // ── ⛔ CRITICAL-SECTOR SELECTION -- MANDATORY, NOT AN OPTIMISATION ─────
+              // `fillForward` (and `inhibitedResp`, and REPLAY's write-allocate merge)
+              // all consume `missLine` as "the bytes the access asked for". At `len = 0`
+              // the beat carrying `r.last` IS the whole line, so latching every beat
+              // left the right one. At `len = 3` the last beat is the line's LAST
+              // sector, and latching it would return the wrong 16 bytes on EVERY
+              // line-miss load. So latch ONLY the beat whose index equals the DEMANDED
+              // sector. This is the hard dependency slice D1.2 recorded when it landed.
+              val isCriticalBeat = !refillFullLine || (refillBeat === secOf(missSet))
+              when(isCriticalBeat) { missLine := axi.r.payload.data }
+              // Accumulate across the burst, overwriting on the first beat so neither
+              // miss-detect site needs a new `missFault := False` (the load site already
+              // has one for its INHIBITED path; the store site deliberately does not).
+              missFault := Mux(refillBeat === U(0, secBits bits), respErr, missFault || respErr)
+              // ⚠ LEAVE ONLY ON `r.last`, NEVER ON `respErr`. A `len = 0` refill could
+              // leave on an error because the erroring beat WAS the last one; a burst
+              // cannot -- the slave still owes the remaining beats and abandoning them
+              // strands them on the R channel to be mis-attributed to the NEXT
+              // transaction that borrows this id. `doAllocate` is already per-beat
+              // (`!respErr`), so the good sectors of a partly-erroring line install and
+              // the erroring sector simply stays invalid and re-misses later.
+              when(axi.r.payload.last) {
+                goto(REPLAY)
+              } otherwise {
+                refillBeat := refillBeat + 1
+              }
+            }
           }
         }
 
@@ -2830,6 +3289,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
               dirtysWrSet(w)  := missSet
               dirtysWrData(w) := True
               dirtysVoteD2(w) := True    // Task #255 exclusivity tripwire (D2)
+              if (sectored) {            // slice `D3-BURST`: the line's conservative OR
+                lineDirtyWrEn(w)   := True
+                lineDirtyWrSet(w)  := lineOf(missSet)
+                lineDirtyWrData(w) := True
+              }
             }
             storeAllocAckReg := True
             missArrayWrite   := True
@@ -2895,7 +3359,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val b = Bool(); b := fsm.isActive(fsm.IDLE); b.simPublic(); b
     }
     val dbgFsmRefill = GenerationFlags.simulation {
-      val b = Bool(); b := fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.EVICT_WR); b.simPublic(); b
+      val b = Bool()
+      if (!sectored) b := fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.EVICT_WR)
+      else b := fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.EVICT_WR) ||
+                fsm.isActive(fsm.EVICT_RD) || fsm.isActive(fsm.EVICT_CK)
+      b.simPublic(); b
     }
     val dbgFsmReplay = GenerationFlags.simulation {
       val b = Bool(); b := fsm.isActive(fsm.REPLAY); b.simPublic(); b
@@ -3922,6 +4390,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // SpinalHDL's hook for reading `stateNext` once the FSM exists.
     fsm.postBuild {
       probeIdleNext := (fsm.stateNext === fsm.enumOf(fsm.IDLE))
+      // Slice `D3-BURST`: `EVICT_RD`/`EVICT_CK` are DELIBERATELY ABSENT. `EVICT_RD` uses
+      // the shared read port (see its own comment), so the "a probe there is a read of a
+      // port those states do not use" premise above does not hold for it; `EVICT_CK` is
+      // excluded with it so the credit and the launch arms list exactly the same states.
       probeAdmitNext := probeIdleNext || (if (hitUnderMiss) {
         (fsm.stateNext === fsm.enumOf(fsm.REFILL)) || (fsm.stateNext === fsm.enumOf(fsm.EVICT_WR))
       } else False)
@@ -4182,16 +4654,30 @@ class DcachePlugin(val socketMerged: Boolean = false,
         pendingMergeStrb  := stS2MergeStrb
         // Task P4.3 Finding 1 fix: lock the victim way/dirty/tag/line HERE, not at
         // the eventual IDLE pickup cycle -- see the `pendingVictim*` decl comment.
-        val pVw = victim(stS2Set)
+        // Slice `D3-BURST`: a tag-matching store miss is a SECTOR miss into that way
+        // (fill one sector, evict nothing); otherwise it is a LINE miss into the
+        // round-robin victim of the LINE. Collapses to today's expression unsectored.
+        val pVw = if (!sectored) victim(stS2Set)
+                  else Mux(stS2SectorMiss, stS2SectorWay, victim(lineOf(stS2Set)))
+        // No separate `pendingStoreSectorWay`: `pVw` above already folds the
+        // tag-matching way in and `pendingVictimWay := pVw` carries it, so a second
+        // register holding the same value would be written and never read.
+        if (sectored) pendingStoreFullLine := !stS2SectorMiss
         val pVictimFromS3 = stS3ArrayWrite && (stS3Set === stS2Set) &&
           (stS3Way === pVw)
         val pVictimFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) &&
           (stS3WriteWayD1 === pVw)
         storeVictimFromS3Dbg := pVictimFromS3 || pVictimFromS3D1
         pendingVictimWay   := pVw
-        pendingVictimDirty := rdDirty(pVw) ||
+        // Slice `D3-BURST`: see the load-side twin -- the victim LINE's conservative
+        // dirty OR, and a SECTOR miss displaces nothing so it never evicts.
+        pendingVictimDirty := (if (sectored) rdLineDirty(pVw) else rdDirty(pVw)) ||
           (pVictimFromS3 && stS3Copyback) ||
           (pVictimFromS3D1 && stS3WriteCopybackD1)
+        // A SECTOR miss displaces nothing, so it must never evict. A separate
+        // later-assignment-wins clear rather than an `&& !stS2SectorMiss` term, so the
+        // unsectored netlist keeps today's expression with no extra AND gate.
+        if (sectored) when(stS2SectorMiss) { pendingVictimDirty := False }
         pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
           Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))
         pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine,
@@ -4218,6 +4704,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
             dirtysWrSet(w)  := stS3Set
             dirtysWrData(w) := True
             dirtysVoteD5(w) := True   // Task #255 exclusivity tripwire (D5)
+            if (sectored) {           // slice `D3-BURST`: the line's conservative OR
+              lineDirtyWrEn(w)   := True
+              lineDirtyWrSet(w)  := lineOf(stS3Set)
+              lineDirtyWrData(w) := True
+            }
           }
         }
         storeArrayWrite    := True
@@ -4721,7 +5212,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
       *
       * Costs nothing to carry: these are seven previously-zero bits of an already-
       * exported 32-bit pack, no new ports, no new state, no datapath consumer. */
-    dbgStallDcPack(26 downto 25) := Mux(fsm.isActive(fsm.EVICT_WR), B("01"),
+    // The unsectored arm keeps the ORIGINAL inline expression verbatim rather than a
+    // named `dbgEvicting` alias: the alias is logically identical hardware, but it emits
+    // one extra named `wire` and the round-trip netlist gate for this slice is stated
+    // without qualification, so it must be exact.
+    dbgStallDcPack(26 downto 25) := Mux(
+      if (!sectored) fsm.isActive(fsm.EVICT_WR)
+      else fsm.isActive(fsm.EVICT_WR) || fsm.isActive(fsm.EVICT_RD) ||
+           fsm.isActive(fsm.EVICT_CK), B("01"),
                                     Mux(fsm.isActive(fsm.REFILL),   B("10"),
                                     Mux(fsm.isActive(fsm.REPLAY),   B("11"), B("00"))))
     dbgStallDcPack(27) := arSent
