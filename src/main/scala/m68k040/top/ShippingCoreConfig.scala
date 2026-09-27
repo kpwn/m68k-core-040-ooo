@@ -43,4 +43,34 @@ object ShippingCoreConfig {
     * The code stays (it is correct, and it carries the REPLAY identity fix and the
     * miss-park handler); only the arm is disabled. */
   val dcacheHitUnderMissRead: Boolean = false
+
+  /** ITLB victim buffer depth — 0 disables it and elaborates NO hardware.
+    *
+    * ⛔ DEFAULT OFF, PENDING A BOARD MEASUREMENT. The sizing is trace-driven (real
+    * System 7.5.3, per-instruction logical PCs out of MAME, `TC = 0x0000C000` so 8 KB
+    * pages and all four TTRs zero): the shipping 32-entry array walks **10.25 times
+    * per kinst** and a 32-entry victim buffer of its own evictions removes **73.9%** of
+    * those walks, which is the infinite-ITLB floor. See `ItlbPlugin`'s class comment
+    * for the full table and why a victim buffer beats both more ways and more sets.
+    *
+    * It is OFF rather than ON because the CYCLE value is bounded, not measured: the
+    * board's `OFF_PERF_STALL_WALK` is the OR of both walkers' busy cycles and reads
+    * 6.7% of all cycles, which caps the whole I+D walk bucket and puts the ITLB's
+    * share at 3.0-5.4% depending on how much the two walkers overlap. `ITLB_VICTIM=32`
+    * in the environment builds it for a one-off A/B. The counter that settles it is
+    * `OFF_PERF_ITLB_WALK` (0x010A4) — already in every bitstream, never yet read.
+    *
+    * ⚠️ This lever CANNOT be measured on Dhrystone: the board's Dhrystone-only window
+    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder. */
+  val itlbVictimEntries: Int = sys.env.get("ITLB_VICTIM") match {
+    case Some(s) =>
+      val n = try s.toInt catch {
+        case _: NumberFormatException =>
+          throw new IllegalArgumentException(s"ITLB_VICTIM must be an integer, got '$s'")
+      }
+      require(n == 0 || (n >= 2 && n <= 64),
+        s"ITLB_VICTIM must be 0 (off) or 2..64, got $n")
+      n
+    case None => 0
+  }
 }

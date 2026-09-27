@@ -372,7 +372,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     // explicit `require` in ExceptionUnit).
     val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
-    val itlb   = new ItlbPlugin()
+    val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
     val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin(icachePredecodeWords)
     val dcache = new DcachePlugin()

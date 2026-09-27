@@ -50,10 +50,55 @@ import spinal.lib.misc.plugin.FiberPlugin
   *   deleting the term -- fails the `false` arm too, which a textual revert could
   *   never catch.
   */
+/** `victimEntries` — the ITLB VICTIM BUFFER (lever: ITLB walk reduction, 2026-09-27).
+  *
+  * WHY. The board says the machine is front-end starved (ROB empty 75-84% of the
+  * time) and an ITLB miss stops the front end dead: the response mux drives
+  * `_rsp.ready := False`, which is one of the terms of `IcachePlugin`'s
+  * `cmdPort.ready`, so the fetch command is never accepted, no MSHR is allocated and
+  * the whole `FetchAlignPlugin` ring back-pressures until the 3-level walk returns.
+  *
+  * WHAT IT COSTS TODAY, MEASURED. A trace-driven model of THIS array's exact geometry
+  * (32 entries, 4-way, 2 banks, round-robin, 8 KB key) fed the real logical
+  * instruction stream of System 7.5.3 — captured per-instruction out of MAME with
+  * `TC = 0x0000C000` (E=1, P=1) and all four TTRs zero, i.e. every fetch consults the
+  * ITLB — walks **10.25 times per kinst** over 8.45 M instructions (3.47 on a boot
+  * window, 6.25 launching the Finder, **17.89 on the Finder idle loop**). Of those
+  * walks only 0.2% are compulsory and 25.8% are PFLUSHA refills: **73.9% are
+  * capacity/conflict replacements**, i.e. entries this array threw away and then
+  * immediately needed again.
+  *
+  * WHY A VICTIM BUFFER AND NOT MORE WAYS OR MORE SETS. Same model, same stream:
+  *   32e/4w/2b RR (shipping)            10.254 walks/kinst
+  *   32e/8w/2b RR  (double associativity) 9.114   -11%
+  *   64e/4w/2b RR  (the real '040 size)   4.778   -53%   + a level on the LOOKUP mux
+  *   32e + 24-entry victim                2.815   -72%
+  *   32e + 32-entry victim                2.677   -74%   == the infinite-TLB floor
+  * A fully-associative buffer of the array's own EVICTIONS reaches the floor at 32
+  * entries and saturates there (48 entries measures the same), it beats doubling the
+  * array outright, and — the point — it is probed only on an L1 MISS, so it adds
+  * nothing to the lookup path that already carries this core's 22-level
+  * `fetchPc -> ITLB lookupVpn -> Icache s0Ppn` cone. FIFO replacement measures the
+  * same as LRU at every size (2.677 vs 2.676 at 32), so the buffer keeps no age state
+  * at all: one ring pointer.
+  *
+  * ARCHITECTURALLY INVISIBLE, AND UNLIKE A PREFETCH IT HAS NO U-BIT PROBLEM. Every
+  * entry here was installed by a real demand walk that already performed its table
+  * search and set U in memory; promoting it back is a cache-to-cache move, not a
+  * search. There is no speculative entry, no new fault surface, and no new walker
+  * requester — which is exactly what makes this cheaper than the speculative ITLB
+  * prefetch scoped in `docs/superpowers/specs/2026-09-03-walker-dcache-routing-revalidation-and-itlb-prefetch-design.md`
+  * (§9.2/§9.3's S1-S10 all fall away). `atcFlush` clears it with the array, so
+  * PFLUSHA / TCR.P re-key / root writes / TTR writes are covered by construction.
+  *
+  * DEFAULT OFF (`victimEntries = 0`) elaborates NO hardware: every term folds to a
+  * constant and the netlist is bit-identical to before this change.
+  */
 class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
                  banks: Int = Tlb.DefaultBanks,
-                 captureGateOnFlush: Boolean = true) extends FiberPlugin
+                 captureGateOnFlush: Boolean = true,
+                 victimEntries: Int = 0) extends FiberPlugin
     with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
@@ -113,7 +158,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var flushAll:      Bool = null
 
   val logic = during build new Area {
-    val tlb    = new Tlb(entries, ways, banks)
+    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0)
     // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
     // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
     // override it from its write decode, and so a DUT that wires nothing still
@@ -358,6 +403,67 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     val tlbHit   = tlb.io.hit
     val tlbEntry = tlb.io.hitEntry
 
+    // ── ITLB VICTIM BUFFER (see the class comment for the measurement) ──────────
+    // Fully associative over `victimEntries`, FIFO replacement (one ring pointer, no
+    // age state -- measured indistinguishable from LRU on the real stream). Probed
+    // ONLY on an L1 miss, and the probe's only consumers are a register enable and
+    // the array's write data, so nothing here lands on `_rsp.ppn`/`s0Ppn`.
+    //
+    // EXCLUSIVE with the array by construction: an entry enters only as an L1
+    // EVICTION (`tlb.io.evictValid`) and leaves the moment it is promoted back, so no
+    // key is ever valid in both. `OHMasking.first` is used for the payload select
+    // anyway -- same discipline as `Tlb`'s own fill -- so even a duplicate could only
+    // pick a way that really matched, never OR two payloads together.
+    require(victimEntries == 0 || victimEntries >= 2,
+      s"ItlbPlugin.victimEntries must be 0 (off) or >= 2, got $victimEntries")
+    val vic = new Area {
+      val enabled = victimEntries > 0
+      val n       = if (enabled) victimEntries else 1
+      val valids  = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val keys    = if (enabled) Vec.fill(n)(Reg(UInt(Tlb.VpnBits bits))) else null
+      val supTag  = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val ppn     = if (enabled) Vec.fill(n)(Reg(UInt(20 bits)))        else null
+      val wProt   = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val pgSup   = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val cmode   = if (enabled) Vec.fill(n)(RegInit(CacheMode.WRITETHROUGH)) else null
+      val modif   = if (enabled) Vec.fill(n)(RegInit(False))            else null
+      val ptr     = if (enabled) Reg(UInt(log2Up(n) bits)) init 0       else null
+
+      val lkKey  = if (enabled) tlbKey(_req.vpn) else null
+      val hitVec = if (enabled) Vec((0 until n).map(i =>
+                     valids(i) && (keys(i) === lkKey) && (supTag(i) === _req.supervisor)))
+                   else null
+      val hit    = if (enabled) hitVec.orR else null
+      val hitOh  = if (enabled) OHMasking.first(hitVec) else null
+      val hitIdx = if (enabled) OHToUInt(hitOh) else null
+      val entry  = if (enabled) {
+        val e = TlbEntry()
+        e.vpnTag     := 0
+        e.ppn        := MuxOH(hitOh, ppn)
+        e.writeProt  := MuxOH(hitOh, wProt)
+        e.supervisor := MuxOH(hitOh, pgSup)
+        e.cacheMode  := MuxOH(hitOh, cmode)
+        e.modified   := MuxOH(hitOh, modif)
+        e
+      } else null
+      // Sim-only telemetry: a promote is the event this whole structure exists to
+      // create, and a test that cannot see it cannot tell "the buffer works" from
+      // "the buffer is never exercised" -- the live-but-unexercised-knob failure this
+      // project has already been bitten by.
+      // `allowOverride` + a False default: the real driver is the promote condition
+      // below, which cannot be written here because it reads `missPending` /
+      // `missReqReg`, both declared after this Area. Same pattern as
+      // `dbgMultiHotClear` above -- a default-driven plugin-local wire, never a bundle
+      // field, so it does not cross the AGENTS.md bundle-override rule.
+      val promote = if (enabled) {
+        val w = Bool(); w.allowOverride; w := False; w.simPublic(); w
+      } else null
+      // No hardware counter: `promote` is `simPublic`, so a test counts its cycles in
+      // `onSamplings` for free. A 32-bit counter here would be 32 flops and an adder in
+      // the SHIPPING netlist for something only simulation reads.
+      if (enabled) { hit.simPublic() }
+    }
+
     // ---- result latch (serves the cycle(s) around a walk completion + faults) ----
     val latchValid  = RegInit(False)
     val latchVpn    = Reg(UInt(20 bits))
@@ -413,9 +519,19 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     //
     // COST: one input to an AND that already has six, in parallel with the deep
     // `tlbHit` cone that sets this expression's delay. No new level on the hit path.
-    val needWalk   = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
-                     !walker.io.busy && !walker.io.done &&
-                     (if (captureGateOnFlush) !atcFlush else True)
+    // `needWalkRaw` is the condition "this fetch has no translation and the walker
+    // could take it". The victim buffer splits it: if the buffer holds the entry the
+    // walk is REPLACED by a one-cycle promote back into the array (`vic.promote`), and
+    // only a genuine miss in both structures starts a table search.
+    // A `def`, not a `val`: it is elaborated exactly once in each arm below, and
+    // keeping it out of the signal namespace is what makes the victim-buffer-OFF
+    // netlist byte-for-byte identical to one built without this feature (verified by
+    // generating both and diffing).
+    def needWalkExpr = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
+                       !walker.io.busy && !walker.io.done &&
+                       (if (captureGateOnFlush) !atcFlush else True)
+    val needWalkRaw = if (vic.enabled) needWalkExpr else null
+    val needWalk    = if (vic.enabled) needWalkRaw && !vic.hit else needWalkExpr
 
     // ─────────────────────────────────────────────────────────────────────────
     // FMax: REGISTER the miss→walker TRIGGER (sever the _req/tlbHit → walker cone).
@@ -555,9 +671,32 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // rewrite while a walk is in flight cannot file the result under a key the
     // lookup that requested it would never form -- the pre-fix code had this
     // property for free (the key was computed once, at capture) and it is kept.
-    tlb.io.fillVpn   := tlbKeyOf(walkVpn, walkIs8K)
-    tlb.io.fillSup   := walkSup
-    tlb.io.fillEntry := fe
+    // A victim promote and a walk completion both write the array. They cannot
+    // coincide -- `needWalkRaw` requires `!walker.io.done` -- but the mux is given the
+    // walk priority regardless so a future change cannot silently make the promote win.
+    if (vic.enabled) {
+      tlb.io.fillVpn   := Mux(vic.promote, vic.lkKey,       tlbKeyOf(walkVpn, walkIs8K))
+      tlb.io.fillSup   := Mux(vic.promote, _req.supervisor, walkSup)
+      tlb.io.fillEntry := Mux(vic.promote, vic.entry,       fe)
+    } else {
+      tlb.io.fillVpn   := tlbKeyOf(walkVpn, walkIs8K)
+      tlb.io.fillSup   := walkSup
+      tlb.io.fillEntry := fe
+    }
+    // The promote itself: an L1 miss the buffer can answer, with no walk in flight and
+    // none pending launch. Costs the stalled fetch ONE cycle -- the next lookup is an
+    // ordinary array hit -- against the ~3-round-trip walk it replaces. Deliberately
+    // does NOT add a leg to the response mux: `_rsp.ppn` feeds `s0Ppn`, the far end of
+    // the core's worst setup path, and one cycle is not worth a level there.
+    if (vic.enabled) {
+      // `!atcFlush` is redundant in the shipping configuration (`needWalkRaw` already
+      // carries it via `captureGateOnFlush`) but NOT in the `captureGateOnFlush = false`
+      // negative-control DUT, where without it a promote could install into an array
+      // that is being invalidated in the same cycle. The walk-completion fill guards
+      // itself the same way; matching it keeps the two fill sources symmetric.
+      vic.promote := needWalkRaw && vic.hit && !missPending && !missReqReg.valid && !atcFlush
+      when(vic.promote) { tlb.io.fillValid := True }
+    }
     when(walker.io.done) {
       missPending := False
       // A PFLUSHA-poisoned walk must not seed the sticky latch AT ALL (unlike the
@@ -605,6 +744,49 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // itself reads `latchMatch` and stays suppressed that same cycle, so no
     // redundant walk is attempted while the response is being served), never long
     // enough to be observed as a real cache hit by anything else.
+    // ── victim buffer: insert on eviction, consume on promote ───────────────────
+    // The ONLY way in is an L1 allocation over a valid way (`tlb.io.evictValid`), so
+    // the buffer can never hold anything the array did not hold first -- in particular
+    // it can never hold a poisoned walk's result, because a poisoned walk never fills
+    // the array at all. On a promote the slot the hit came from takes the way the
+    // promote itself just displaced (a SWAP): without that, the displaced entry is lost
+    // and the buffer measures -32% instead of -74% (verified as a negative control in
+    // the trace model).
+    if (vic.enabled) {
+      val insSlot = Mux(vic.promote, vic.hitIdx, vic.ptr)
+      when(tlb.io.evictValid) {
+        vic.valids(insSlot) := True
+        vic.keys(insSlot)   := tlb.io.evictVpn
+        vic.supTag(insSlot) := tlb.io.evictSup
+        vic.ppn(insSlot)    := tlb.io.evictEntry.ppn
+        vic.wProt(insSlot)  := tlb.io.evictEntry.writeProt
+        vic.pgSup(insSlot)  := tlb.io.evictEntry.supervisor
+        vic.cmode(insSlot)  := tlb.io.evictEntry.cacheMode
+        vic.modif(insSlot)  := tlb.io.evictEntry.modified
+        // A promote reuses its own slot, so it must not churn the ring pointer.
+        when(!vic.promote) { vic.ptr := vic.ptr + 1 }
+      }
+      // Promote into a COLD array way (nothing evicted): the entry now lives in the
+      // array, so drop it here and keep the two structures exclusive.
+      when(vic.promote && !tlb.io.evictValid) { vic.valids(vic.hitIdx) := False }
+      // PFLUSHA / TCR.P re-key / root write / TTR write: the array is cleared through
+      // `tlb.io.invalidateAll` and the latch just below; the buffer is a third cache of
+      // the same descriptors and must go with them. Priority-last so it beats the
+      // insert above in the same cycle.
+      when(atcFlush) {
+        vic.valids.foreach(_ := False)
+        vic.ptr := 0
+      }
+      // The exclusivity claim above is an INVARIANT, so it is asserted rather than
+      // assumed: two valid slots with the same key would make `hitVec` multi-hot.
+      GenerationFlags.simulation {
+        assert(CountOne(vic.hitVec) <= 1,
+          "ITLB victim buffer multi-hot: the same key is valid in two slots")
+        assert(!(vic.promote && tlbHit),
+          "ITLB victim promote fired on an array HIT")
+      }
+    }
+
     val poisonedLatchExpire = RegNext(walker.io.done && walkUmPoison, init = False)
     when(poisonedLatchExpire) { latchValid := False }
     // On a flush (the commit-time access-fault squash), invalidate the latch so a

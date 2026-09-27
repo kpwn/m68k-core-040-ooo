@@ -377,7 +377,11 @@ class FuzzCoreDut extends Component {
   // explicit `require` in ExceptionUnit).
   val fpuCtl = new m68k040.execute.FpuControlPlugin
   val intCtrl = new m68k040.exception.InterruptControlPlugin
-  val itlb   = new ItlbPlugin()
+  // Reads the SHIPPING knob so `ITLB_VICTIM=32` exercises the victim buffer through
+  // the ported corpus too. Default 0 = no hardware, so the default corpus run is
+  // unchanged. (`ShippingCoreConfig` rule: a knob that differs between sim and the
+  // shipping build is a bug.)
+  val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
   val dtlb   = new DtlbPlugin()
   val icache = new IcachePlugin
   val dcache = new DcachePlugin()
