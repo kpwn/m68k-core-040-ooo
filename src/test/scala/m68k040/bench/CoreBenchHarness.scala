@@ -263,6 +263,16 @@ trait CoreBenchHarness extends AnyFunSuite {
       // fetched after Tier 1, whose frontend survives the Tier-2 rollback?
       spinal.core.sim.SimPublic(gsh.logic.shiftValid, gsh.logic.shiftDir,
         gsh.logic.queryPc0, gsh.logic.flushRepair)
+      // Test-only observation for the STALL BUDGET's `walk` category. The board's
+      // OFF_PERF_STALL_WALK counts `perfLvlDtlbWalk || perfLvlItlbWalk`, each of which is
+      // `RegNext(!walker.io.dbgPack(0))` = `RegNext(!fsm.isActive(IDLE))` -- and
+      // `TableWalker.io.busy` is DEFINED as `!fsm.isActive(fsm.IDLE)` (TableWalker.scala:356),
+      // the identical term. Tapping `io.busy` therefore matches the board counter's
+      // definition exactly without adding a second copy of the expression. These are
+      // nested-component ports, so they need an explicit SimPublic to survive Verilator;
+      // this is a TEST harness, so nothing here reaches the synthesized core.
+      spinal.core.sim.SimPublic(host[DtlbPlugin].logic.walker.io.busy,
+        host[ItlbPlugin].logic.walker.io.busy)
 
       val dc    = host[DcacheService]
       val exc   = rob.logic.exc
@@ -480,6 +490,83 @@ trait CoreBenchHarness extends AnyFunSuite {
     def pairedBranchCycles: Int = rob.count(_.pairedBranch)
   }
 
+  /** PER-KERNEL CYCLE DECOMPOSITION ("stall budget"), sim-only and OPT-IN via
+    * `IPC_STALL_BUDGET=1`.
+    *
+    * WHY THIS EXISTS. Three separate levers were recorded as "no effect" because the
+    * only thing the bench reported was WINDOW CYCLES, and cycles were bit-identical:
+    * ALU-class speculative wakeup (2,048-3,106 deferred selects granted), the announce
+    * family (gap bucket ~3,900 -> ~30 windows), and the confirm-rate lever (0.0% ->
+    * 46.4%). "The mechanism did nothing" and "the mechanism removed its stall and a
+    * different one became binding" are DIFFERENT findings with different next steps, and
+    * a single cycle count cannot tell them apart. This decomposition can.
+    *
+    * BOARD PARITY IS THE POINT. Every category below mirrors a `DebugCtrlPlugin` perf
+    * counter TERM FOR TERM, including its quirks, so a sim A/B and a silicon `perf`
+    * capture can finally be compared category by category:
+    *
+    *   retireStall  = `perfStallRetire`      = `perfLvlRobBusy && !perfLvlRetire`
+    *                                          (`DebugCtrlPlugin.scala:705`)
+    *   retireCycles = `perfLvlRetire`        = `rob.retire0` ONLY. This is the board's
+    *                  quirk and it is PRESERVED: it is an ANY-retire level, not a macro
+    *                  commit and not a dual-retire count. It therefore differs from
+    *                  `IpcResult.activeCycles` (macro-granular, cracked temps dropped);
+    *                  both are reported so the gap is visible instead of assumed.
+    *   robEmpty     = `rob.count === 0`. The board can only DERIVE this
+    *                  (`cycles - stallRetire - cyclesWithARetire`); here it is measured
+    *                  directly, which is also what makes the closure assertion possible.
+    *   dcStall      = `OFF_PERF_STALL_DC`    = `stallDcPackReg(1)` = `DcachePlugin.busy`
+    *   walkStall    = `OFF_PERF_STALL_WALK`  = either table walker out of IDLE
+    *
+    * ALIGNMENT. Every board tap is a `RegNext` of its level (`perfTap`), and the
+    * harness's own commit histogram is likewise built from the REGISTERED
+    * `ordinaryCommitObs`. So each level here is sampled and then recorded ONE sampling
+    * edge later -- the same one-cycle delay `precedingRobCycle` already applies -- which
+    * makes these counts both board-faithful AND index-aligned with `histo`, i.e. with
+    * the IPC window itself.
+    *
+    * WHAT CLOSES AND WHAT DOES NOT. `robEmpty` / `retireStall` / `retireCycles` is a
+    * genuine PARTITION of the window: `retire0` implies `count > 0` (it is gated on
+    * `headReady`, which is `(count > 0) && ...`, `RobPlugin.scala:1177`), so the three
+    * are mutually exclusive and exhaustive. `runKernel` ASSERTS that they sum to the
+    * window -- a decomposition that does not close is not a decomposition.
+    * `dcStall` and `walkStall` are OVERLAPPING OVERLAYS, exactly as they are on the
+    * board: the D-cache can be busy on a cycle that also retires. They are reported
+    * alongside the partition, never inside it, and the retire-stall intersections
+    * (`retireStallWithDc` / `retireStallWithWalk`) are what attribute the stall. */
+  final case class StallBudget(
+      cycles: Int,          // window cycles -- must equal the partition's sum
+      robEmpty: Int,        // PARTITION: rob.count === 0 (front-end starvation)
+      retireStall: Int,     // PARTITION: rob busy, retire0 low  == perfStallRetire
+      retireCycles: Int,    // PARTITION: retire0 high           == perfLvlRetire
+      retire1Cycles: Int,   // sim-exact: exactly one retire lane fired
+      retire2Cycles: Int,   // sim-exact: two or more retire lanes fired
+      retiredUops: Int,     // sim-exact: retire lanes fired, summed over the window
+      dcStall: Int,         // OVERLAY: DcachePlugin.busy       == OFF_PERF_STALL_DC
+      walkStall: Int,       // OVERLAY: either walker off IDLE  == OFF_PERF_STALL_WALK
+      retireStallWithDc: Int,   // retireStall AND the D-cache was busy
+      retireStallWithWalk: Int, // retireStall AND a walker was running
+      robEmptyWithDc: Int) {    // robEmpty AND the D-cache was busy (I-side vs D-side)
+    /** Zero iff the partition closes to the window. Reported, never fudged. */
+    def residual: Int = cycles - robEmpty - retireStall - retireCycles
+    def closes: Boolean = residual == 0
+    private def pct(x: Int): Double = if (cycles == 0) 0.0 else 100.0 * x / cycles
+    def robEmptyPct: Double    = pct(robEmpty)
+    def retireStallPct: Double = pct(retireStall)
+    def retirePct: Double      = pct(retireCycles)
+    def dcStallPct: Double     = pct(dcStall)
+    def walkStallPct: Double   = pct(walkStall)
+    /** Board-comparable one-liner: the five terms a silicon `perf` capture prints. */
+    def line(name: String): String =
+      f"[stall-budget] $name cycles=$cycles " +
+      f"robEmpty=$robEmpty (${robEmptyPct}%.1f%%) " +
+      f"retireStall=$retireStall (${retireStallPct}%.1f%%) " +
+      f"retire=$retireCycles (${retirePct}%.1f%%) " +
+      f"residual=$residual | retire1=$retire1Cycles retire2=$retire2Cycles uops=$retiredUops " +
+      f"| overlay dcStall=$dcStall (${dcStallPct}%.1f%%) walkStall=$walkStall (${walkStallPct}%.1f%%) " +
+      f"retireStall&dc=$retireStallWithDc retireStall&walk=$retireStallWithWalk robEmpty&dc=$robEmptyWithDc"
+  }
+
   final case class IpcResult(
       name: String,
       retiredInstrs: Int,   // MACRO instructions (cracked-load temps dropped)
@@ -539,7 +626,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       captureIssueCandidates: Int = 0,
       captureLoadOpportunities: Int = 0,
       captureLoadOverlaps: Int = 0,
-      queuedStoreAdmissions: Int = 0
+      queuedStoreAdmissions: Int = 0,
+      // OPT-IN per-kernel cycle decomposition; `None` unless IPC_STALL_BUDGET=1, so
+      // every existing caller and every default report is untouched. See `StallBudget`.
+      stallBudget: Option[StallBudget] = None
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -679,6 +769,20 @@ trait CoreBenchHarness extends AnyFunSuite {
       val traceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val iqHolOn = sys.env.get("IQ_HOL").contains("1")
+      // IPC_STALL_BUDGET=1: collect the per-cycle STALL BUDGET (see `StallBudget`).
+      // OFF by default so neither the default report nor the default sim runtime moves.
+      // Collection is pure observation of already-simPublic levels -- it cannot perturb
+      // the DUT, so cycles are bit-identical with it on or off (verified, not assumed).
+      val stallBudgetOn = sys.env.get("IPC_STALL_BUDGET").contains("1")
+      // One packed Int per cycle keeps this cheap next to the existing per-cycle
+      // histograms: bits[3:0] retire lanes fired, [4] ROB busy, [5] D-cache busy,
+      // [6] a table walker off IDLE.
+      val budgetHisto = ArrayBuffer.empty[Int]
+      // The board's `perfTap` REGISTERS every level before counting it, and the commit
+      // histogram is built from the REGISTERED `ordinaryCommitObs`. Hold this cycle's
+      // raw sample and record it on the NEXT edge, so the budget is both board-faithful
+      // and index-aligned with `histo` (identical treatment to `precedingRobCycle`).
+      var pendingBudget = 0
       // BYP_LIVE=1: which int-PRF bypass sources actually carry traffic? Each one is a
       // comparator + mux input in EVERY operand read, on the core's tightest datapath.
       val bypLiveOn = sys.env.get("BYP_LIVE").contains("1")
@@ -1254,6 +1358,30 @@ trait CoreBenchHarness extends AnyFunSuite {
         }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
+        if (stallBudgetOn) {
+          // Record the PREVIOUS edge's sample (the board's registered tap), then take
+          // this edge's. Exactly one append per sampling, so `budgetHisto` indexes the
+          // same cycles `histo` does and the IPC window slices both identically.
+          budgetHisto += pendingBudget
+          val rob = dut.rob.logic
+          val lanes = rob.retireLanes.count(_.toBoolean)
+          val robBusy = rob.count.toInt != 0
+          // Bit 1 of `dbgStallDcPack` IS `DcachePlugin.busy` -- the very signal the board's
+          // OFF_PERF_STALL_DC counts through `stallDcPackReg(1)` (DcachePlugin.scala:2904,
+          // DebugCtrlPlugin.scala:710), so this is the same term, not a re-derivation.
+          val dcBusy = ((dut.dcache.logic.dbgStallDcPack.toBigInt >> 1) & 1) == 1
+          val walkBusy = dut.dtlb.logic.walker.io.busy.toBoolean ||
+                         dut.itlb.logic.walker.io.busy.toBoolean
+          // `retire0` is read as ITS OWN bit rather than inferred from `lanes > 0`: the
+          // board's `perfLvlRetire` taps `rob.logic.retire0` literally, and under
+          // IPC_PREPARED_RETIRE the wider lanes are driven by `preparedBatch.fire`
+          // instead of the `retireLanes(lane-1)` chain, so the two are not the same
+          // expression in every configuration.
+          val retire0 = rob.retireLanes(0).toBoolean
+          pendingBudget = (lanes & 0xf) |
+            (if (robBusy) 0x10 else 0) | (if (dcBusy) 0x20 else 0) |
+            (if (walkBusy) 0x40 else 0) | (if (retire0) 0x80 else 0)
+        }
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -1481,6 +1609,50 @@ trait CoreBenchHarness extends AnyFunSuite {
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
 
+      // ── STALL BUDGET: reduce the per-cycle samples over the SAME IPC window ─────
+      val stallBudget = if (!stallBudgetOn) None else {
+        val w = budgetHisto.slice(lo, hi + 1)
+        assert(w.size == windowCycles,
+          s"[${k.name}] stall-budget samples=${w.size} but the IPC window is $windowCycles " +
+          "cycles -- the budget is not describing the window it claims to")
+        def lanes(s: Int): Int = s & 0xf
+        def robBusy(s: Int): Boolean   = (s & 0x10) != 0
+        def dcBusy(s: Int): Boolean    = (s & 0x20) != 0
+        def walkBusy(s: Int): Boolean  = (s & 0x40) != 0
+        def retire0(s: Int): Boolean   = (s & 0x80) != 0
+        val b = StallBudget(
+          cycles              = windowCycles,
+          robEmpty            = w.count(s => !robBusy(s)),
+          retireStall         = w.count(s => robBusy(s) && !retire0(s)),
+          retireCycles        = w.count(retire0),
+          retire1Cycles       = w.count(s => lanes(s) == 1),
+          retire2Cycles       = w.count(s => lanes(s) >= 2),
+          retiredUops         = w.map(lanes).sum,
+          dcStall             = w.count(dcBusy),
+          walkStall           = w.count(walkBusy),
+          retireStallWithDc   = w.count(s => robBusy(s) && !retire0(s) && dcBusy(s)),
+          retireStallWithWalk = w.count(s => robBusy(s) && !retire0(s) && walkBusy(s)),
+          robEmptyWithDc      = w.count(s => !robBusy(s) && dcBusy(s)))
+        // A decomposition that does not close is not a decomposition. `retire0` is gated
+        // on `headReady` = `(count > 0) && ...`, so the three buckets are mutually
+        // exclusive AND exhaustive by construction; a non-zero residual means the
+        // sampling itself drifted and every number above is suspect.
+        assert(b.closes,
+          s"[${k.name}] stall budget does not close: cycles=${b.cycles} " +
+          s"robEmpty=${b.robEmpty} retireStall=${b.retireStall} retire=${b.retireCycles} " +
+          s"residual=${b.residual}")
+        println(b.line(k.name))
+        // The board can only BOUND macro throughput; sim knows it exactly. Print both
+        // views of "did something retire" so their difference (uop retires that carry no
+        // macro -- cracked load temps, stack pushes, RMW tails) is visible rather than
+        // silently conflated when a sim number is set beside a board counter.
+        println(f"[stall-budget-macro] ${k.name} boardRetireCycles=${b.retireCycles} " +
+          f"macroActiveCycles=$activeCycles macroDualCycles=$dualCycles " +
+          f"macroRetired=$windowRetired uopsRetired=${b.retiredUops} " +
+          f"ipc=${windowRetired.toDouble / windowCycles}%.4f")
+        Some(b)
+      }
+
       val pipelineProfile = if (!k.profileRetirement) None else {
         val branches = branchEvents.groupBy(e => (e._1, e._2)).toVector.sortBy(_._1).map {
           case ((pc, kind), events) =>
@@ -1534,7 +1706,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         captureIssueHisto.slice(lo, hi + 1).count(_._1),
         captureIssueHisto.slice(lo, hi + 1).count(_._2),
         captureIssueHisto.slice(lo, hi + 1).count(_._3),
-        queuedAdmissionHisto.slice(lo, hi + 1).count(identity))
+        queuedAdmissionHisto.slice(lo, hi + 1).count(identity),
+        stallBudget)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
