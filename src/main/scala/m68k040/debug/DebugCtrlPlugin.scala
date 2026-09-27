@@ -668,6 +668,37 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfLvlRobBusy = perfTap(stallRob.map(_.logic.count =/= 0))
       val perfLvlRetire  = perfTap(stallRob.map(_.logic.retire0))
       val perfEvtBranch  = perfTap(excCountHistory.map(_.branchRetire.valid))
+      // ── MISPREDICT CLASS (2026-09-27) ─────────────────────────────────────────
+      // `brType` is 0 = CONDITIONAL (Bcc/DBcc), 1 = UNCONDITIONAL (BRA/BSR/JMP/JSR).
+      // That encoding is OWNED by `BtbEntry` in `m68k040.frontend.Btb` -- see its
+      // "brType : 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR)" and the
+      // `entry.brType === U(1)` force-taken arm -- and travels unchanged through
+      // `BtbUpdate` and `DebugBranchEvent`. Read it there, not from memory.
+      //
+      // SOURCE AND ITS CONSEQUENCE. These are fed from `branchRetire`, the SAME Flow
+      // `perfEvtBranch` uses, which is gated by the BTB-update decision and therefore
+      // sees BTB-ELIGIBLE branches only. `perfEvtMispred` above is deliberately fed
+      // from the ROB's `branchRedirect` instead, which sees EVERY mispredicting branch.
+      // So UNCOND + COND is LESS than OFF_MISPRED_COUNT and the residual is the
+      // mispredict traffic on branches the fetch-time predictor never covered --
+      // returns, and slot-1 branches, which have no predictor at all. That gap is the
+      // MEASUREMENT this pair exists to make possible; it is not a discrepancy, and it
+      // is not a broken counter. See the OFF_PERF_MISPRED_* block in
+      // `tools/debug/debug_regmap.def` for the arithmetic spelled out.
+      //
+      // NO LOGIC LEVEL IS ADDED TO ANY FUNCTIONAL CONE. Every term is already a
+      // register output in the ROB (`btbUpdateFlow.valid` is a RegNext,
+      // `debugBranchMispredict` a RegNextWhen, `brType` the `branchTrainMem` readSync
+      // output), and the sink is `perfTap`'s own new flop. The new combinational path is
+      // reg -> LUT -> new reg, one level, with no existing path lengthened: the taps
+      // only add fanout loads, exactly like `perfStallRetire`'s LUT2 over two taps.
+      private def branchClass(uncond: Boolean): Option[Bool] =
+        excCountHistory.map { h =>
+          h.branchRetire.valid && h.branchRetire.payload.mispredicted &&
+            h.branchRetire.payload.branchType === U(if (uncond) 1 else 0, 2 bits)
+        }
+      val perfEvtMispredUncond = perfTap(branchClass(uncond = true))
+      val perfEvtMispredCond   = perfTap(branchClass(uncond = false))
       val perfEvtDcMiss  = perfTap(stallDcache.map(_.logic.loadMissDiscovered))
       // I-cache: `s1Unresolved` is a LEVEL held from miss discovery until the fill is
       // dispatched, so it is edge-detected. It cannot merge two misses: `cmdPort.ready`
@@ -696,6 +727,8 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfMispred     = if (perfBuilt) perfCounter(perfEvtMispred) else U(0, 32 bits)
       val perfFlush       = if (perfBuilt) perfCounter(perfEvtFlush) else U(0, 32 bits)
       val perfBranch      = if (perfBuilt) perfCounter(perfEvtBranch) else U(0, 32 bits)
+      val perfMispredUncond = if (perfBuilt) perfCounter(perfEvtMispredUncond) else U(0, 32 bits)
+      val perfMispredCond   = if (perfBuilt) perfCounter(perfEvtMispredCond) else U(0, 32 bits)
       val perfDcMiss      = if (perfBuilt) perfCounter(perfEvtDcMiss) else U(0, 32 bits)
       val perfIcMiss      = if (perfBuilt) perfCounter(perfRise(perfLvlIcMiss)) else U(0, 32 bits)
       val perfDtlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlDtlbWalk)) else U(0, 32 bits)
@@ -740,9 +773,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfPresentDtlb = perfBuilt && stallDtlb.nonEmpty
       val perfPresentItlb = perfBuilt && stallItlb.nonEmpty
       /** LOGICAL counters, not words: cycle and inst are one counter each despite
-        * occupying a LO/HI pair. 12 when this block is built, 0 when it is not -- so a
-        * host reading 0 here knows the block is absent rather than merely idle. */
-      val perfNumCounters = if (perfBuilt) 12 else 0
+        * occupying a LO/HI pair. 14 when this block is built (12 before the two
+        * mispredict-class counters of 2026-09-27), 0 when it is not -- so a host reading
+        * 0 here knows the block is absent rather than merely idle. */
+      val perfNumCounters = if (perfBuilt) 14 else 0
       val perfCtlWord: Bits =
         B(0, 11 bits) ##                   // [31:21] reserved zero
         Bool(perfPresentItlb) ##           // [20]
@@ -1769,6 +1803,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_PERF_INST_LO)      { perfInst(31 downto 0).asBits }
         at(DebugRegMap.OFF_PERF_INST_HI)      { perfInst(63 downto 32).asBits }
         at(DebugRegMap.OFF_PERF_BRANCH)       { perfBranch.asBits }
+        // The two class counters do NOT sum to OFF_MISPRED_COUNT -- different source,
+        // deliberately. The residual sizes the uncovered class; see their block in
+        // `tools/debug/debug_regmap.def` and the producer comment above.
+        at(DebugRegMap.OFF_PERF_MISPRED_UNCOND) { perfMispredUncond.asBits }
+        at(DebugRegMap.OFF_PERF_MISPRED_COND)   { perfMispredCond.asBits }
         at(DebugRegMap.OFF_PERF_DC_MISS)      { perfDcMiss.asBits }
         at(DebugRegMap.OFF_PERF_IC_MISS)      { perfIcMiss.asBits }
         at(DebugRegMap.OFF_PERF_DTLB_WALK)    { perfDtlbWalk.asBits }
