@@ -549,6 +549,32 @@ trait CoreBenchHarness extends AnyFunSuite {
       robEmptyWithDc: Int) {    // robEmpty AND the D-cache was busy (I-side vs D-side)
     /** Zero iff the partition closes to the window. Reported, never fudged. */
     def residual: Int = cycles - robEmpty - retireStall - retireCycles
+    /** Uops beyond what a 2-wide retire can explain; 0 unless IPC_RETIRE_WIDTH widened it. */
+    def wideRetireUops: Int = retiredUops - retire1Cycles - 2 * retire2Cycles
+    /** THE CONSERVATION TEST -- "did the gain exist, or was it never there?"
+      *
+      * On a kernel that is never front-end starved (`robEmpty == 0`) with a 2-wide retire,
+      * the budget is not merely a decomposition, it is an exact ACCOUNTING IDENTITY:
+      *
+      *     cycles = retireStall + retire1 + retire2        (the partition)
+      *     uops   = retire1 + 2*retire2                   (a 2-wide retire)
+      *  => cycles = retireStall + uops - retire2
+      *
+      * `uops` is fixed by the program. So for such a kernel a lever that cuts retire-stall
+      * and gives back the SAME NUMBER of dual-retire cycles is cycle-neutral BY
+      * CONSTRUCTION -- the two deltas are literally the same cycles counted once as a
+      * stall and once as an extra single-retire cycle. There is no unrealised gain to
+      * chase, and "it worked but something ate it" is the wrong reading.
+      *
+      * Conversely a lever that cuts retire-stall and HOLDS retire2 MUST move cycles. If it
+      * does not, something genuinely absorbed the gain and that is worth attacking.
+      *
+      * This is the cheap discriminator the bench previously lacked: read
+      * `d(retireStall)` against `d(retire2)` before writing a single line of RTL.
+      * `None` when the preconditions do not hold, rather than a number that means nothing. */
+    def conservationResidual: Option[Int] =
+      if (robEmpty != 0 || wideRetireUops != 0) None
+      else Some(cycles - (retireStall + retiredUops - retire2Cycles))
     def closes: Boolean = residual == 0
     private def pct(x: Int): Double = if (cycles == 0) 0.0 else 100.0 * x / cycles
     def robEmptyPct: Double    = pct(robEmpty)
@@ -564,7 +590,15 @@ trait CoreBenchHarness extends AnyFunSuite {
       f"retire=$retireCycles (${retirePct}%.1f%%) " +
       f"residual=$residual | retire1=$retire1Cycles retire2=$retire2Cycles uops=$retiredUops " +
       f"| overlay dcStall=$dcStall (${dcStallPct}%.1f%%) walkStall=$walkStall (${walkStallPct}%.1f%%) " +
-      f"retireStall&dc=$retireStallWithDc retireStall&walk=$retireStallWithWalk robEmpty&dc=$robEmptyWithDc"
+      f"retireStall&dc=$retireStallWithDc retireStall&walk=$retireStallWithWalk robEmpty&dc=$robEmptyWithDc" +
+      // See `conservationResidual`: `conserved` marks a kernel where cycles are pinned to
+      // `retireStall + uops - retire2`, so a retire-stall win paid for by dual-retire is
+      // cycle-neutral BY CONSTRUCTION and there is nothing eaten to recover.
+      (conservationResidual match {
+        case Some(0) => " | conserved (cycles == retireStall + uops - retire2)"
+        case Some(r) => s" | CONSERVATION BROKEN residual=$r"
+        case None    => ""
+      })
   }
 
   final case class IpcResult(
@@ -774,6 +808,35 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Collection is pure observation of already-simPublic levels -- it cannot perturb
       // the DUT, so cycles are bit-identical with it on or off (verified, not assumed).
       val stallBudgetOn = sys.env.get("IPC_STALL_BUDGET").contains("1")
+      // IPC_PAIR_CENSUS=1: WHY did a cycle retire ONE instead of TWO?
+      //
+      // The stall budget found a lever (IQ_SPEC_ALU on dhrystone-x0-byteAbs-cb) that cut
+      // retire-stall 8.2% and handed every recovered cycle straight back as LOST DUAL
+      // RETIRE -- 1,519 pair cycles became 3,038 singles at bit-identical cycles and
+      // bit-identical uop count. "Cycles neutral" therefore splits two ways, and only one
+      // is worth attacking: the pair was NOT THERE / NOT READY (an arrival-order effect,
+      // a design consequence), or the pair was present and complete and THE GATE DECLINED
+      // IT (an accident, and recoverable). This census answers exactly that.
+      //
+      // Buckets follow `retire1`'s OWN conjunction order (RobPlugin.scala:1361-1368) so
+      // every blocked cycle is charged to exactly one term and the attribution is the
+      // RTL's, not a re-derivation:
+      //   0 paired          retire1 fired
+      //   1 noSecondEntry   count <= 1          -- nothing behind the head to pair with
+      //   2 h1NotComplete   !completes(h1)      -- the younger uop has not executed yet
+      //   3 h1LateByOne     as 2, and h1 completes on the VERY NEXT cycle: the pair was
+      //                     split by ONE cycle of arrival order, nothing more
+      //   4 headForbidsPair !headAllowsPair     -- p0 must retire alone (GATE)
+      //   5 h1RetireAlone   p1.retireAlone      -- h1 must retire alone (GATE)
+      //   6 h1Serializing   faulted/RTE/sup/sysOp/debugBreak on h1
+      //   7 irqBoundary     irqBoundaryHold && p0.last
+      //   8 h0TraceOrPrecise h0TraceArmed || h0PreciseCompletedSticky
+      //   9 other           the residue (sysAuxRdy1, halt/step/stop terms)
+      // Buckets 1-3 are ARRIVAL ORDER. Buckets 4-9 are A GATE SAYING NO.
+      val pairCensusOn = sys.env.get("IPC_PAIR_CENSUS").contains("1")
+      val censusHisto = ArrayBuffer.empty[Int]
+      // (bucket, the ROB index of h1) held one edge, so bucket 2 can be refined to 3.
+      var pendingCensus = (-1, 0)
       // One packed Int per cycle keeps this cheap next to the existing per-cycle
       // histograms: bits[3:0] retire lanes fired, [4] ROB busy, [5] D-cache busy,
       // [6] a table walker off IDLE.
@@ -1358,6 +1421,35 @@ trait CoreBenchHarness extends AnyFunSuite {
         }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
+        if (pairCensusOn) {
+          val rob = dut.rob.logic
+          // Refine the HELD bucket first: a `h1NotComplete` whose h1 has completed by NOW
+          // was blocked by ONE cycle of arrival order, not by anything structural.
+          val (heldBucket, heldH1) = pendingCensus
+          val refined = if (heldBucket == 2 && rob.completes(heldH1).toBoolean) 3 else heldBucket
+          if (refined >= 0) censusHisto += refined else censusHisto += -1
+          val depth = rob.depth
+          val h0 = rob.h0.toInt
+          val h1 = (h0 + 1) % depth
+          val count = rob.count.toInt
+          val r0 = rob.retireLanes(0).toBoolean
+          val r1 = rob.retireLanes(1).toBoolean
+          val bucket =
+            if (!r0) -1
+            else if (r1) 0
+            else if (count <= 1) 1
+            else if (!rob.completes(h1).toBoolean) 2
+            else if (!(!rob.p0.retireAlone.toBoolean ||
+                       (!rob.mispredictStore(h0).toBoolean && rob.p0.last.toBoolean))) 4
+            else if (rob.p1.retireAlone.toBoolean) 5
+            else if (rob.faultedStore(h1).toBoolean || rob.p1.isRte.toBoolean ||
+                     rob.p1.needsSup.toBoolean || rob.p1.sysOp.toBoolean ||
+                     rob.p1.debugBreakValid.toBoolean) 6
+            else if (rob.irqBoundaryHold.toBoolean && rob.p0.last.toBoolean) 7
+            else if (rob.h0TraceArmed.toBoolean || rob.h0PreciseCompletedSticky.toBoolean) 8
+            else 9
+          pendingCensus = (bucket, h1)
+        }
         if (stallBudgetOn) {
           // Record the PREVIOUS edge's sample (the board's registered tap), then take
           // this edge's. Exactly one append per sampling, so `budgetHisto` indexes the
@@ -1608,6 +1700,29 @@ trait CoreBenchHarness extends AnyFunSuite {
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
+
+      // ── PAIR CENSUS: why did a retiring cycle retire ONE and not TWO? ───────────
+      if (pairCensusOn) {
+        val w = censusHisto.slice(lo, hi + 1)
+        assert(w.size == windowCycles,
+          s"[${k.name}] pair-census samples=${w.size} but the IPC window is $windowCycles")
+        val names = Vector("paired", "noSecondEntry", "h1NotComplete", "h1LateByOne",
+          "headForbidsPair", "h1RetireAlone", "h1Serializing", "irqBoundary",
+          "h0TraceOrPrecise", "other")
+        val n = (0 until 10).map(b => w.count(_ == b))
+        val retiring = n.sum
+        // ARRIVAL ORDER (1..3) vs A GATE SAYING NO (4..9) -- the constraint/accident split.
+        val arrival = n(1) + n(2) + n(3)
+        val gated   = (4 until 10).map(n).sum
+        assert(retiring + w.count(_ < 0) == windowCycles,
+          s"[${k.name}] pair census does not close: retiring=$retiring idle=${w.count(_ < 0)}")
+        println(f"[pair-census] ${k.name} cycles=$windowCycles retiringCycles=$retiring " +
+          f"paired=${n(0)} single=${retiring - n(0)} " +
+          f"| ARRIVAL-ORDER=$arrival (noSecondEntry=${n(1)} h1NotComplete=${n(2)} " +
+          f"h1LateByOne=${n(3)}) " +
+          f"| GATE-SAID-NO=$gated (headForbidsPair=${n(4)} h1RetireAlone=${n(5)} " +
+          f"h1Serializing=${n(6)} irqBoundary=${n(7)} h0TraceOrPrecise=${n(8)} other=${n(9)})")
+      }
 
       // ── STALL BUDGET: reduce the per-cycle samples over the SAME IPC window ─────
       val stallBudget = if (!stallBudgetOn) None else {
