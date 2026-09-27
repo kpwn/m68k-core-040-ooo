@@ -235,7 +235,57 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * (`l2c_ctrl.v:26-37`) -- so the burst is a plain INCR from the line base
                      * and the selection is by beat index. That costs the demanded sector's
                      * position in the burst (0-3 beats of extra latency, 1.5 on average)
-                     * and keeps the transaction-count win, which is the larger term. */
+                     * and keeps the transaction-count win, which is the larger term.
+                     *
+                     * ── WHAT IT IS WORTH, MEASURED, AGAINST A PREDICTION RECORDED FIRST ──
+                     * `MemcpyBandwidthSpec`, `IPC_MEM=l2:5:60:4096`, memcpy-16k, both seeds:
+                     *     OFF 149,929 / 150,015 cyc      0.3278 / 0.3276 copy-B/cyc
+                     *     ON  138,173 / 138,079 cyc      0.3557 / 0.3560 copy-B/cyc
+                     *     = -7.84% cycles, +8.51% bandwidth (48.81 -> 44.98 cyc per
+                     *       16-byte line). Two seeds agree to 0.08%.
+                     *
+                     * THE MECHANISM DELIVERED EXACTLY WHAT IT PROMISED, and that is the
+                     * interesting part. The bench's own L2 counters say READ transactions
+                     * fell from 8,197 to 2,053 -- **3.99x**, the designed 4x to within a
+                     * rounding -- with `misses=513` IDENTICAL in both arms, so the
+                     * footprint did not move and no compulsory miss was traded away.
+                     *
+                     * ⚠ AND THE PREDICTION WAS STILL WRONG BY 8x. It was +62-77%, from a
+                     * transaction-count model that priced a transaction at ~16 cycles by
+                     * dividing TOTAL loop cycles by transaction count -- which charges
+                     * instruction execution and the single-MSHR FSM excursion to the bus.
+                     * Removing 6,144 of 8,192 read transactions bought 11,756 cycles, i.e.
+                     * ~2 cycles of program time each, a sixth of the model's figure.
+                     * `MemcpyBandwidthSpec`'s pre-recorded falsifier named this outcome in
+                     * advance: "if the win is < +10%, the bottleneck is NOT transaction
+                     * count".
+                     *
+                     * SO DO NOT PRICE THE NEXT D-SIDE LEVER OFF TRANSACTION COUNT. After
+                     * this slice the copy loop still runs at **4.4% of the 128-bit bus**
+                     * (0.3557 copy-B/cyc of 16 B/cyc), spending ~45 cycles per 16 bytes to
+                     * retire ~6 instructions. It is bound by the serialised load->store
+                     * dependency through a one-MSHR D-cache and the precise-store drain,
+                     * NOT by bus occupancy. The design doc's "MLP 4 saturates the bus"
+                     * arithmetic is about the BUS and is correct; the loop is nowhere near
+                     * it. Attribute the 45 cycles before building another burst.
+                     *
+                     * ── THE ACCEPTED COST, NOW SIZED ─────────────────────────────────────
+                     * `DcacheSectorSpec`'s capacity probe: pass-2 miss rate on 256 scattered
+                     * 16-byte sectors over a 64 KB span goes **18.8% -> 100.0% (+81.3 pp)**.
+                     * One tag covering 64 bytes leaves 128 x 16 B = 2 KB of effective
+                     * capacity for a one-sector-per-line pattern against 512 x 16 B = 8 KB.
+                     * The owner ratified this trade explicitly and it is not a gate, but it
+                     * is severe on scattered access and Seznec decoupling (ISCA 1994) is the
+                     * known fix if it ever needs undoing.
+                     *
+                     * ── STORAGE, MEASURED FROM THE NETLIST, CORRECTING THE AMENDMENT ─────
+                     * Tag+state falls 11,776 -> **3,840** bits = **-67.4%**, not the
+                     * amendment's predicted -68.5%/3,712. The +128-bit difference is exactly
+                     * `lineDirtyMem`, which the amendment's arithmetic could not anticipate
+                     * because it assumed nothing beyond per-sector valid+dirty is needed --
+                     * whereas a single-sector read port means the evict-or-not decision
+                     * needs the line's dirty OR as its own bit. Per-way data bytes are
+                     * unchanged at 2,048, so the 2 KB set-aliasing stride does not move. */
                    val sectored: Boolean = m68k040.top.ShippingCoreConfig.dcacheSectored)
     extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
