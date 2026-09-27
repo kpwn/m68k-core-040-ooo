@@ -99,6 +99,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+      // whose barrier a younger already-launched access violated. Recovered at retire.
+      rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+      rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -402,8 +406,15 @@ trait CoreBenchHarness extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
+    // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+    // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+    // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+    // from one switch; every SIM harness omitted it, so the recovery had never been
+    // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+    // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
-      pcRangeEnable = pcRangeEnable, rasBranchRepair = rasBranchRepair)
+      pcRangeEnable = pcRangeEnable, rasBranchRepair = rasBranchRepair,
+      lsOooIssue = loadBypassUnreadyLoad)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
@@ -418,7 +429,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
       earlyAutoAnWriteback = earlyAutoAnWriteback,
       earlyStoreDataWake = earlyStoreDataWake,
-      specLoadWakeup = specLoadWakeup)
+      specLoadWakeup = specLoadWakeup,
+      lsOooIssue = loadBypassUnreadyLoad)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

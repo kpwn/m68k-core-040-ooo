@@ -46,6 +46,13 @@ trait LsEuService {
   //
   // Idle (never valid) unless `specLoadWakeup` is set.
   def wakeupSpec: Flow[UInt]
+  // ORDER VIOLATION (out-of-order LS issue only). Fires when an op resolves INHIBITED at
+  // P4 while a program-YOUNGER cacheable access has ALREADY launched into the D-cache --
+  // the one case the inhibited barrier cannot prevent, because cacheability is unknowable
+  // until translation. The ROB records it per entry and, when that entry retires at a
+  // macro boundary, flushes everything younger so the wrongly-ordered access re-executes.
+  // A cacheable refill is side-effect free, so the squashed access leaves no trace.
+  def orderViolation: Flow[UInt]  // robId of the inhibited op whose barrier was violated
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -122,7 +129,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyAutoStoreAddress: Boolean = false,
                  val earlyAutoAnWriteback: Boolean = false,
                  val earlyStoreDataWake: Boolean = false,
-                 val specLoadWakeup: Boolean = false) extends FiberPlugin with LsEuService {
+                 val specLoadWakeup: Boolean = false,
+                 val lsOooIssue: Boolean = false) extends FiberPlugin with LsEuService {
   // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
   // that is worth stating because an earlier revision required both. The re-check pins a
   // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
@@ -153,6 +161,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
   var wakeupSpecPort: Flow[UInt]   = null
+  var orderViolationPort: Flow[UInt] = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
@@ -174,6 +183,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
+  override def orderViolation: Flow[UInt] = orderViolationPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -289,6 +299,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     wakeupSpecPort = Flow(UInt(6 bits))   // pdst of a load PREDICTED to write back next cycle
     wakeupSpecPort.simPublic()
+    orderViolationPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    orderViolationPort.simPublic()
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
@@ -1463,6 +1475,59 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val alignedCount    = Reg(UInt(log2Up(alignedDepth + 1) bits)) init 0
     val alignedEnq      = Bool(); alignedEnq := False        // single-descriptor push (ordinary aligned load)
     val alignedEnqSplit = Bool(); alignedEnqSplit := False   // two-descriptor push (split-load pair)
+
+    // ═══ INHIBITED PARK BUFFER (`lsOooIssue` only) ═════════════════════════════════════
+    // THE DEADLOCK THIS EXISTS TO BREAK. An inhibited op waits at P4 for `p4AtRobHead`.
+    // With relaxed LS issue a YOUNGER op can reach P4 first, and then the op that IS the
+    // head sits behind it in P3 and can never pass -- `p4Ready = !p4Valid || p4CanLeave`,
+    // `p4CanLeave` needs `p4LaunchOk`, and for an inhibited op that needs `p4AtRobHead`.
+    // Circular wait; measured, with the dump, in
+    // `docs/BUG_ls_ooo_inhibited_barrier_p4_park_deadlock.md`. The waiter must therefore
+    // VACATE P4, not wait in it.
+    //
+    // ⚠️ WHY DEPTH 4 AND NOT 1 -- do not "optimise" this back down. The general constraint
+    // is: LETTING N OLDER OPS OVERTAKE A PARKED INHIBITED OP NEEDS N SLOTS OF
+    // SOMEWHERE-ELSE TO PUT IT, AND N IS BOUNDED ONLY BY THE LS PIPE DEPTH (S1/P2/P2T/P3).
+    // Every cheaper scheme is a 1-deep reorder buffer wearing a different hat and every
+    // one of them re-deadlocks ONE STAGE FURTHER BACK:
+    //   * a P3<->P4 SWAP (zero new flops) lets exactly ONE older op past; with two
+    //     inhibited ops parked -- which two device reads in one loop body produce -- P4
+    //     holds the older parked op, P3 holds a younger op that must not overtake it, and
+    //     the op older than both is in P2T needing the P3 that younger op occupies;
+    //   * letting the ring SEND skip the entry fails too, because ring COMPLETION is
+    //     strictly in-order (`alignedRspPtr`) and the inhibited entry -- enqueued first,
+    //     since it reached P4 first -- sits AT the completion pointer;
+    //   * a retire-triggered replay cannot fire at all: the op never reaches the head,
+    //     which IS the deadlock.
+    // So depth tracks the pipe, not the observed worst case.
+    //
+    // WHAT IT HOLDS: the finished `AlignedLoadCtx`, i.e. exactly what the ring enqueue
+    // consumes. The SQ forward verdict is deliberately NOT kept -- an op only reaches the
+    // launch gate once its verdict says "no forward", so there is nothing to preserve.
+    //
+    // NOT IN THE RING AND NOT IN THE PIPE: that is the whole point. A parked entry is
+    // outside the send pointer AND outside the completion pointer, so it obstructs
+    // nothing, and nothing obstructs it -- it waits only on the ROB head, which the ops it
+    // no longer blocks are now free to deliver.
+    private val parkDepth = alignedDepth
+    val parkValid = if (!lsOooIssue) null else Vec.fill(parkDepth)(RegInit(False))
+    val parkMem   = if (!lsOooIssue) null else Vec.fill(parkDepth)(Reg(AlignedLoadCtx()))
+    // STICKY "a program-YOUNGER access reached the bus while I was parked" -- the
+    // pre-launch half of the two-way barrier, which the park would otherwise lose. Set on
+    // the SEND event rather than on ring residency: a younger entry that is poisoned and
+    // dropped never reaches a device, so it is not a violation, and marking on the actual
+    // bus event is both tighter and impossible to miss.
+    val parkSaw   = if (!lsOooIssue) null else Vec.fill(parkDepth)(RegInit(False))
+    if (lsOooIssue) {
+      parkValid.foreach(_.simPublic()); parkSaw.foreach(_.simPublic())
+      parkMem.foreach(_.bk.robId.simPublic())
+    }
+    // Control, forward-declared: both are driven at the P4 launch gate ~1900 lines below,
+    // where `p4Inhibited` / `p4AtRobHead` / the SQ barrier verdict exist.
+    val parkAdmit    = Bool(); parkAdmit := False
+    val parkAdmitIdx = UInt(log2Up(parkDepth) bits); parkAdmitIdx := 0
+    val parkDrain    = Bool(); parkDrain := False
+    val parkDrainIdx = UInt(log2Up(parkDepth) bits); parkDrainIdx := 0
     val alignedFull     = alignedCount === alignedDepth
     val alignedEmpty    = alignedCount === 0
     // Slot B may not be SENT until its own slot A (provably the entry immediately
@@ -1530,6 +1595,29 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // register randomization spuriously hold even an ORDINARY (non-split) send.
     val alignedSendHeld = alignedValid(alignedSendPtr) && alignedMem(alignedSendPtr).twoAccess &&
                           alignedMem(alignedSendPtr).splitSecond && alignedSlotAPending
+    // ── WHY THE INHIBITED BARRIER DOES NOT GATE THIS SEND ─────────────────────────
+    // An earlier revision blocked the ring from SENDING an entry program-YOUNGER than an op
+    // that had resolved INHIBITED at P4, letting OLDER entries through. The decision was
+    // correctly age-qualified and it DEADLOCKED anyway, in sim, on three corpus programs
+    // (`bcc_after_push_vector_rts_trampoline`, `bf_memind_dyn_straddle`,
+    // `bit_ops_full_memind`), tripping "a memory op has been parked in P2 for 20000 cycles
+    // without launching".
+    //
+    // The transport, not the decision, is the problem: the ring sends STRICTLY IN ORDER from
+    // a single advancing `alignedSendPtr`. Relaxed LS issue lets a younger load reach P4
+    // first, so ring order is NOT program order and a younger entry can sit AHEAD of an
+    // older one. Blocking that younger entry at the send pointer also blocks the older entry
+    // BEHIND it, which therefore never completes, never retires, and so the inhibited op
+    // never reaches `p4AtRobHead` and the barrier never lifts. Circular wait.
+    // "Only OLDER entries gate" is meaningless if older entries cannot be REACHED.
+    //
+    // So nothing is blocked here at all. The pre-launch half of the barrier is enforced by
+    // RECOVERY instead (see `lsOooViolation` below): every resident ring entry is treated as
+    // a violation and the inhibited op's retire flushes everything younger. That is
+    // deadlock-free BY CONSTRUCTION rather than by argument -- no send can ever be held --
+    // and it is sound because a cacheable refill is side-effect free and the flush discards
+    // the register result. Older entries are untouched: they retire BEFORE the inhibited op,
+    // so a younger-only flush cannot reach them.
     val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
                            !alignedSendHeld
@@ -1578,6 +1666,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       ((alignedCount <= U(alignedDepth - 2, alignedCount.getWidth bits)) ||
        ((alignedCount === U(alignedDepth - 1, alignedCount.getWidth bits)) && alignedRspFire))
     alignedCount.simPublic(); alignedFull.simPublic(); alignedEnq.simPublic()
+    // Sim-only ring observability for the directed inhibited-ordering test
+    // (LsOooInhibitedOrderSpec): it must check, AT THE LAUNCH CYCLE, that no
+    // program-OLDER entry is still resident -- which needs per-entry robId and the
+    // poison bit, not just an occupancy count. (`alignedValid`/`alignedSent` are
+    // already tapped a few lines below.) Taps only; zero synth cost -- both signals
+    // are already READ by `lsOooViolation`, so nothing is kept alive that synthesis
+    // would otherwise prune.
+    alignedPoisoned.foreach(_.simPublic())
+    alignedMem.foreach(_.bk.robId.simPublic())
     alignedSendValid.simPublic(); alignedRspFire.simPublic(); alignedEnqSplit.simPublic()
     alignedCanEnqSplit.simPublic(); alignedSendHeld.simPublic()
     // Ring bookkeeping observability: needed to diagnose a SEND-side stall from a
@@ -1655,7 +1752,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val alignedFallThroughSelect = if (alignedLoadFallThrough) {
       !alignedFull && (alignedSendPtr === alignedPushPtr)
     } else False
-    val alignedFallThrough = alignedFallThroughSelect && alignedEnq &&
+    // ⚠️ THE FALL-THROUGH ARM IS ONLY VALID WHEN **P4** IS THE PUSH SOURCE. `alignedEnq` is
+    // shared: a PARK DRAIN (`lsOooIssue`) asserts it too, and its payload comes from the
+    // park, not from P4. Without excluding it, a drain cycle with the ring empty at the send
+    // pointer sends a command ASSEMBLED FROM WHATEVER P4 HAPPENS TO HOLD, and marks the
+    // freshly-pushed DEVICE descriptor `alignedSent` -- so the device read never reaches the
+    // bus at all, and the device entry takes the bogus command's response (`rid` is
+    // `alignedSendPtr`). MEASURED, not theorised: with `alignedLoadFallThrough` ON -- which
+    // is the SHIPPING `SocketTop` setting (`= ipcThroughput`), while every fuzz DUT left it
+    // at its default FALSE -- `LsOooInhibitedOrderSpec` lost 3 of its 8 device reads and
+    // failed assertion A (device 0xffff0100 launched 3 times, expected 4).
+    val alignedEnqFromP4 = if (lsOooIssue) alignedEnq && !parkDrain else alignedEnq
+    val alignedFallThrough = alignedFallThroughSelect && alignedEnqFromP4 &&
       (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
     alignedFallThrough.simPublic()
     val alignedCmd = AlignedLoadCtx()
@@ -2504,6 +2612,52 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         when(alignedValid(i)) { alignedPoisoned(i) := True }
       }
     }
+    if (lsOooIssue) {
+      // ADMIT: capture P4's descriptor into the chosen free slot. Identical field-for-field
+      // to the ordinary ring push above, because it IS the same descriptor -- only its
+      // destination differs.
+      when(parkAdmit) {
+        val dst = parkMem(parkAdmitIdx)
+        captureBkCtx(dst.bk, p4Ctx.xlate.front)
+        dst.vaddr := p4Ctx.xlate.front.vaddr
+        dst.paddr := p4Ctx.xlate.paddr
+        dst.size  := p4Ctx.xlate.front.size
+        dst.cmode := p4Ctx.xlate.cmode
+        dst.twoAccess   := False
+        dst.splitSecond := False
+        dst.mergeOff    := U(0, 4 bits)
+        parkValid(parkAdmitIdx) := True
+        parkSaw(parkAdmitIdx)   := False
+      }
+      // STICKY YOUNGER-REACHED-THE-BUS. One compare per slot against the entry actually
+      // being sent, head-anchored -- the same form `StoreQueue.olderThan` uses. Written
+      // here rather than at the violation site so it cannot be missed by a send that
+      // happens on a cycle the violation logic is not looking.
+      when(alignedCmdFire) {
+        // `alignedCmd`, NOT `alignedMem(alignedSendPtr)`. On a FALL-THROUGH fire the slot at
+        // `alignedSendPtr` has not been written yet (it is written this same cycle), so the
+        // memory still holds the PREVIOUS occupant -- an OLDER robId -- which makes
+        // `sentIsOlder` true and silently DROPS the mark. `alignedCmd` is exactly what the
+        // command port presents on both paths (it is overridden from P4 under
+        // `alignedFallThroughSelect`), so it is the only correct source here.
+        val sentRob = alignedCmd.bk.robId
+        val w = m68k040.Global.ROB_ID_W_DEFAULT
+        for (i <- 0 until parkDepth) {
+          val sentIsOlder = ((sentRob - robHeadIn)(w - 1 downto 0)) <
+                            ((parkMem(i).bk.robId - robHeadIn)(w - 1 downto 0))
+          when(parkValid(i) && !sentIsOlder) { parkSaw(i) := True }
+        }
+      }
+      // DRAIN: the slot has been pushed into the ring this cycle; release it. Ordered
+      // AFTER the admit arm so an admit and a drain of the SAME index in one cycle cannot
+      // resurrect a freed slot -- they are mutually exclusive anyway (the admitted op is
+      // not the head, the drained one is), and the ordering makes that independent of the
+      // exclusion argument.
+      when(parkDrain) { parkValid(parkDrainIdx) := False }
+      // A parked op has NOT launched, so a flush simply drops it -- there is no device
+      // side effect to account for and nothing in the ring to poison.
+      when(sqFlushSig) { parkValid.foreach(_ := False) }
+    }
     when(alignedEnq) {
       val dst = alignedMem(alignedPushPtr)
       captureBkCtx(dst.bk, p4Ctx.xlate.front)
@@ -2514,6 +2668,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dst.twoAccess   := False
       dst.splitSecond := False
       dst.mergeOff    := U(0, 4 bits)
+      // A park drain reuses THIS push event verbatim and only redirects the payload, so
+      // every piece of ring bookkeeping below -- `alignedCount`, `alignedPushPtr`,
+      // valid/sent/poisoned/done/wb -- is shared and cannot drift. That is deliberate:
+      // a separate push path would duplicate the `alignedCount` selector, whose
+      // under-enumeration is the recorded silent ring-leak that pins `alignedFull` high
+      // on an empty ring (`cpush_split_fault_ring_leak.s`).
+      if (lsOooIssue) when(parkDrain) { dst := parkMem(parkDrainIdx) }
       alignedValid(alignedPushPtr)    := True
       alignedSent(alignedPushPtr)     := alignedFallThroughFire
       alignedPoisoned(alignedPushPtr) := sqFlushSig
@@ -3407,7 +3568,32 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //   * ordinary:  an older inhibited store is precise and drains when IT is the ROB
     //     head, which it reaches because a younger parked load never prevents an older
     //     instruction from retiring.  `olderInhibitedStore` therefore clears.
-    sq.io.barrier.robId := p4Front.robId
+    // ── PARK DRAIN ARBITRATION ────────────────────────────────────────────────────
+    // A parked entry is ready to leave exactly when it is the ROB HEAD: at the head every
+    // program-older instruction has already retired, which is the same condition
+    // `p4LaunchOk` waits for and strictly stronger than "no older LS ticket unresolved".
+    // The match is against `robHeadIn`, so it is ONE-HOT by construction (robIds are
+    // unique among in-flight ops) -- no age-priority encoder is needed.
+    val parkHit = if (!lsOooIssue) null else (0 until parkDepth).map { i =>
+      parkValid(i) && robHeadValidIn && (parkMem(i).bk.robId === robHeadIn)
+    }
+    val parkOwnsBarrier = if (!lsOooIssue) False else parkHit.reduce(_ || _)
+    val parkSelIdx = if (!lsOooIssue) U(0) else OHToUInt(OHMasking.first(Vec(parkHit)))
+    // THE BARRIER QUERY IS SHARED, so the drain TAKES it and P4 stands down for those
+    // cycles (`p4LaunchOk` below is forced False). Age-safe with no starvation argument
+    // needed: the draining entry is the ROB HEAD, so whatever sits in P4 is necessarily
+    // YOUNGER and cannot be starving anything older. The alternative -- muxing the query
+    // while letting P4 still act on the result -- would hand P4 a verdict computed for a
+    // different robId, which is the silent-reorder class, not a stall.
+    sq.io.barrier.robId := Mux(parkOwnsBarrier, robHeadIn, p4Front.robId)
+    // Free-slot pick for admission. Lowest free index; the park is random-access, so no
+    // ordering is implied and none is needed -- drain is by head match, not by position.
+    val parkFreeVec = if (!lsOooIssue) null else Vec((0 until parkDepth).map(i => !parkValid(i)))
+    val parkHasFree = if (!lsOooIssue) False else parkFreeVec.reduce(_ || _)
+    val parkFreeIdx = if (!lsOooIssue) U(0) else OHToUInt(OHMasking.first(parkFreeVec))
+    if (lsOooIssue) { parkOwnsBarrier.simPublic(); parkHasFree.simPublic()
+                      parkDrain.simPublic(); parkDrainIdx.simPublic()
+                      parkAdmit.simPublic(); parkAdmitIdx.simPublic() }
     // ── Preemption interlock (post-f5f9fe13 hardening) ──────────────────────────
     // Reaching the ROB head is necessary but not SUFFICIENT for a device read to be
     // safe to launch: two more sources can still discard this exact head on a LATER
@@ -3434,9 +3620,26 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // before the successor can launch. Extra conservative assertion during target
     // reprogramming only postpones launch; precise halt ownership stays in the ROB.
     val p4PreemptSafe = !irqPreemptPendingIn && !debugHaltImminentIn
-    val p4LaunchOk  = Mux(p4Inhibited,
+    val p4LaunchOk  = !parkOwnsBarrier && Mux(p4Inhibited,
                           p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe,
                           !sq.io.barrier.olderInhibitedStore)
+    // The drain itself: reuse the ORDINARY ring push event, so all ring bookkeeping is
+    // shared (see the note at `when(alignedEnq)`). Every gate here is one the same op
+    // would have faced at P4, evaluated now for the head instead.
+    //   TERMINATION: `olderStore` is age-qualified and every older store is COMMITTED at
+    //   the head, and committed entries drain unconditionally at the SQ ring head; ring
+    //   room appears because the younger entries occupying it are already sent and their
+    //   responses pop in ring order; `p4PreemptSafe` is live. So no gate here can be held
+    //   by anything this entry is itself blocking -- which is the property the two earlier
+    //   attempts at this barrier lacked.
+    if (lsOooIssue) {
+      when(parkOwnsBarrier && !sq.io.barrier.olderStore && p4PreemptSafe &&
+           alignedCanEnq && !sqFlushSig && !excActive) {
+        alignedEnq   := True
+        parkDrain    := True
+        parkDrainIdx := parkSelIdx
+      }
+    }
     p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
     when(p4Valid && !sqFlushSig && !excActive) {
       val fullForward = p4Ctx.fwdHit && !p4Front.twoAccess
@@ -3488,6 +3691,34 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
             p4CanLeave      := True
           }
         }
+        } otherwise {
+          // ── VACATE P4 INSTEAD OF WAITING IN IT ────────────────────────────────────
+          // This is the fix. An inhibited op that is not yet the head moves to the park
+          // and P4 is released the same cycle, so the older op behind it in P3 can pass.
+          //
+          // LIMITATION, DELIBERATE AND TRIPWIRED, NOT SILENT: a SPLIT inhibited access
+          // (misaligned device access crossing a line or page) is not parked -- it needs
+          // two ADJACENT slots to preserve the split pair's contiguity invariant, which
+          // this random-access park does not provide. Such an access keeps today's
+          // in-P4 wait, so it remains exposed to the same deadlock. The
+          // `GenerationFlags.simulation` tripwire below fires if that case ever arises
+          // with an older LS op upstream, so the gap is LOUD rather than silent, and it
+          // is measured by every suite rather than argued.
+          //
+          // NOTE ON THE CANDIDATE-3 PARK GUARD (an IQ "I bypassed an older un-issued LS
+          // op" bit, which would admit only the ops that actually need it): NOT
+          // implemented, and not half-implemented either. It is still sound, but here it
+          // would only reduce park PRESSURE -- it is not needed for correctness, because
+          // parking every non-head inhibited op is strictly safer than parking none. The
+          // tripwire measures whether pressure is ever a problem; if it never fires, the
+          // guard buys nothing and should stay out.
+          if (lsOooIssue) {
+            when(p4Inhibited && !p4AtRobHead && !p4Front.twoAccess && parkHasFree) {
+              parkAdmit    := True
+              parkAdmitIdx := parkFreeIdx
+              p4CanLeave   := True
+            }
+          }
         }
       }
     }
@@ -3545,6 +3776,93 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     }
     wakeupSpecPort.valid   := specWakeFire
     wakeupSpecPort.payload := p4Front.pdst
+    // ═══ INHIBITED ACCESSES ARE TWO-WAY MEMORY BARRIERS (`lsOooIssue`) ═════════════════
+    // Out-of-order LS issue may let a younger CACHEABLE load overtake an older LS op, and
+    // cacheability is unknowable at issue (nothing is translated there) -- which is exactly
+    // why `loadBypassUnreadyLoad` wedged the board and a hit gate could not rescue it. The
+    // decision therefore lives HERE, one stage later, where the cache mode IS known.
+    //
+    // THE "BEFORE" HALF IS ALREADY FREE, and needs no code: `p4LaunchOk` holds every
+    // inhibited op until `p4AtRobHead`, and at the ROB head every program-older
+    // instruction has already retired -- strictly stronger than "no older LS ticket
+    // unresolved".
+    //
+    // THE "AFTER" HALF, POST-LAUNCH, ALSO NEEDS NO COMPARATOR. Because an inhibited op only
+    // launches at the head, once it is in flight every other in-flight LS op is necessarily
+    // younger, so `inhibitedLoadBusySig` is age-correct by construction; and for inhibited
+    // STORES `sq.io.barrier.olderInhibitedStore` already gates P4 launch and is already
+    // age-qualified.
+    //
+    // WHAT IS LEFT is the PRE-LAUNCH window: the op has resolved inhibited at P4 and is
+    // waiting to become the head. A younger ring entry must not send during it. An OLDER
+    // one MUST still be allowed to -- it has to complete and retire for the inhibited op to
+    // reach the head at all, so blocking the whole ring deadlocks. That is the identical
+    // trap StoreQueue's `barrierEnt` comment records ("gating on whole-ring occupancy would
+    // deadlock ... Only OLDER entries gate"), so this mirrors its head-anchored compare
+    // rather than inventing one.
+    //
+    // ONLY AN INHIBITED **LOAD** CAN REACH THIS CASE, which is what keeps it to one
+    // comparator. Under the relaxed rule a younger LS op can never issue before an older
+    // STORE: it may not pass an older UNREADY store (the eligibility prefix), and it cannot
+    // outrank an older READY store either, because the select is `OHMasking.first` over
+    // `eligible & lsReady` and therefore takes the oldest. So no younger access is ever
+    // ahead of an older store, and the inhibited-store direction cannot be violated.
+    def lsOlderThan(a: UInt, b: UInt): Bool = {
+      val w = m68k040.Global.ROB_ID_W_DEFAULT
+      ((a - robHeadIn)(w - 1 downto 0)) < ((b - robHeadIn)(w - 1 downto 0))
+    }
+    val p4InhibBarrier = if (!lsOooIssue) False else p4Valid && p4Inhibited && robHeadValidIn
+    // VIOLATION: any resident ring entry that is program-YOUNGER than the inhibited op.
+    // Deliberately NOT restricted to entries already `alignedSent`: since no send is held
+    // any more, an unsent younger entry WILL launch before the inhibited op does, so it is a
+    // violation in waiting. Reporting it now rather than racing its send keeps the condition
+    // monotonic and the recovery single-shot.
+    //
+    // Poisoned entries are excluded: they are flush leftovers with no architectural effect.
+    val lsOooViolation = if (!lsOooIssue) False else {
+      val anyYounger = (0 until alignedDepth).map { i =>
+        alignedValid(i) && !alignedPoisoned(i) &&
+          !lsOlderThan(alignedMem(i).bk.robId, p4Front.robId)
+      }.reduce(_ || _)
+      p4InhibBarrier && anyYounger
+    }
+    // A PARKED entry's violation is carried by its sticky `parkSaw` bit and reported at
+    // DRAIN -- the last moment before it launches, and therefore before it can retire.
+    // Without this the park would silently LOSE the pre-launch half of the barrier, since
+    // `p4InhibBarrier` only speaks for an op still resident in P4.
+    val parkViolation = if (!lsOooIssue) False else parkDrain && parkSaw(parkDrainIdx)
+    // The park wins the shared port. Its entry is the OLDER op and is launching NOW, so
+    // its report cannot be deferred; a P4-resident violator's condition is monotonic while
+    // it stays resident, so it is simply re-reported on the next cycle.
+    orderViolationPort.valid   := parkViolation || lsOooViolation
+    orderViolationPort.payload := (if (!lsOooIssue) p4Front.robId
+                                   else Mux(parkViolation, parkMem(parkDrainIdx).bk.robId,
+                                            p4Front.robId))
+    if (lsOooIssue) { lsOooViolation.simPublic(); parkViolation.simPublic() }
+
+    // ── TRIPWIRE: the one case the park does not cover ────────────────────────────────
+    // A SPLIT inhibited access still waits in P4 (it needs two adjacent park slots), and
+    // so does any inhibited access that arrives with the park full. Either is only a
+    // DEADLOCK if a program-OLDER LS op is upstream of P4 and therefore behind it. Assert
+    // on exactly that, so the residual gap is measured by every suite instead of argued.
+    if (lsOooIssue) GenerationFlags.simulation {
+      val w = m68k040.Global.ROB_ID_W_DEFAULT
+      def olderThanP4(v: Bool, r: UInt): Bool =
+        v && (((r - robHeadIn)(w - 1 downto 0)) < ((p4Front.robId - robHeadIn)(w - 1 downto 0)))
+      val olderUpstream = olderThanP4(s1Valid, s1Ctx.robId) ||
+                          olderThanP4(tValid, tCtx.robId) ||
+                          olderThanP4(txValid, txCtx.robId) ||
+                          olderThanP4(p3Valid, p3Ctx.front.robId)
+      val stuckInP4 = p4Valid && p4Inhibited && !p4AtRobHead && robHeadValidIn &&
+                      (p4Front.twoAccess || !parkHasFree)
+      val wedgeArmed = RegInit(U(0, 16 bits))
+      when(stuckInP4 && olderUpstream) { wedgeArmed := wedgeArmed + 1 } otherwise { wedgeArmed := 0 }
+      assert(wedgeArmed < U(4096, 16 bits),
+        "LsEuPlugin: an inhibited op is stuck in P4 with a program-OLDER LS op upstream and " +
+        "no park slot (split access, or park full) -- the P4-park deadlock is still reachable",
+        FAILURE)
+      wedgeArmed.simPublic()
+    }
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of

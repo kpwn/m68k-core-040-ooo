@@ -51,7 +51,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
                 /** Forward the flushing branch's own RAS push/pop to RasPlugin's
                   * `branchRepair` ports. DEFAULT OFF; both plugins must agree (checked in
                   * BackendWiringPlugin). See RasPlugin's class comment. */
-                val rasBranchRepair: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
+                val rasBranchRepair: Boolean = false,
+                val lsOooIssue: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var retirementWires: Vec[Flow[UInt]] = null
   private var haltAfterLoadHoldWire: Bool = null
@@ -471,6 +472,18 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // bit and can spuriously flush (a branch that completes via the normal port).
     // Reset per-alloc below (mirrors `completes`), with alloc-priority on a reused index.
     val mispredictStore = Vec.fill(depth)(RegInit(False))
+    // ── LS ORDER VIOLATION (out-of-order LS issue) ─────────────────────────────────────
+    // Set when the LS EU reports that this entry resolved INHIBITED while a program-YOUNGER
+    // cacheable access had ALREADY launched. Same discipline as `mispredictStore`:
+    // RegInit(False) plus an alloc-time reset, so a never-allocated or re-used index reads
+    // "no violation" rather than a stale True.
+    // Elaborated ONLY when the feature is on. Without the `if`, 32 registers plus a 32:1
+    // read mux plus the `orderRedirect` term all land in the flush path of a build that can
+    // never set them -- functionally inert but structurally present, which makes a knob-OFF
+    // netlist differ from master and contaminates every OFF baseline taken against it.
+    val orderViolated = if (!lsOooIssue) null else {
+      val v = Vec.fill(depth)(RegInit(False)); v.foreach(_.simPublic()); v
+    }
     mispredictStore.foreach(_.simPublic()) // debug-only observability, task #139 investigation; zero synth impact
     // ── LUT-reduction ROB-fold Slice B (2026-08-08 area spec §5) ────────────────
     // WAS `Vec.fill(depth)(Reg(UInt(32 bits)))` (2048 FF + a 64:1 read mux per bit at
@@ -879,6 +892,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     }
     // LS access-fault completion (driven by the LS-cluster wiring, like
     // branchCompletion). Default-idle (allowOverride) so a standalone DUT elaborates.
+    // LS order-violation report (driven by the LS-cluster wiring, like lsFaultCompletion).
+    // Default-idle so a standalone DUT elaborates and the in-order build is untouched.
+    val lsOrderViolation = Flow(UInt(robIdW bits))
+    lsOrderViolation.valid.allowOverride;   lsOrderViolation.valid := False
+    lsOrderViolation.payload.allowOverride; lsOrderViolation.payload := U(0, robIdW bits)
+    if (lsOooIssue) lsOrderViolation.simPublic()
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
     lsFaultCompletion.valid.allowOverride;            lsFaultCompletion.valid := False
     lsFaultCompletion.payload.robId.allowOverride;    lsFaultCompletion.payload.robId := U(0, robIdW bits)
@@ -1361,10 +1380,53 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Optional hot-path relaxation: only a resolved correct branch in slot 0,
     // ending its macro. Slot 1 remains non-branch, preserving one training port.
     // All precise-state and debug/trace barriers below are unchanged.
+    // ── MACRO-SPANNING LS ORDER-VIOLATION MARK (`lsOooIssue`) ──────────────────────
+    // WHY A STICKY AND NOT A PER-UOP MARK. `orderRedirect` below needs `p0.last` (restarting
+    // at `p1.pc` is only a macro boundary once the head is its macro's LAST uop), while the
+    // mark is produced for whichever uop actually did the offending access -- typically the
+    // FIRST. For any instruction that cracks into more than one uop those two predicates are
+    // MUTUALLY EXCLUSIVE, so the recovery could never fire: measured, `orderViolated(7)` set
+    // with `head == 7` and `orderRedirect` flat, on a 2-uop `move.l (An),Dn`.
+    //
+    // The ROB retires STRICTLY IN ORDER and a macro's uops are CONTIGUOUS, so ONE register is
+    // enough to carry "a violation was marked somewhere in the macro now retiring" from any
+    // uop to its last one. No per-uop state, no propagation, and nothing needs to know the
+    // macro's last robId at MARKING time -- which is what made a per-uop scheme awkward.
+    //
+    // It also drops the `firstOfInstr` requirement: first, middle or last all work. That
+    // matters because the LS EU's park marks EVERY non-head inhibited op, not only the
+    // bypassing ones the IQ precondition covers.
+    val macroViolatedSticky = if (!lsOooIssue) null else RegInit(False)
+    val macroViolationPending: Bool =
+      if (!lsOooIssue) False else orderViolated(h0) || macroViolatedSticky
+    if (lsOooIssue) { macroViolatedSticky.simPublic(); macroViolationPending.simPublic() }
     val headAllowsPair = if (pairCorrectBranch)
       !p0.retireAlone || (!mispredictStore(h0) && p0.last)
     else !p0.retireAlone
+    // ── DEFECT FIX: a DUAL RETIRE must not run alongside an order redirect ─────────────
+    // `orderRedirect` restarts at `p1.pc` and NOTHING here used to suppress `retire1`
+    // (`headAllowsPair` has no `orderViolated` term). So on a pair retire h1 COMMITTED and
+    // the machine then restarted at h1's own PC, re-executing an instruction whose
+    // architectural effects were already committed -- silent corruption for a store or an
+    // auto-update, the `inhibited-load-irq-replay` shape. It was latent only because
+    // `orderRedirect` has never fired in any build (`RobPlugin(lsOooIssue)` was set nowhere),
+    // and it would have gone live the moment the mark conflict above was repaired.
+    //
+    // WHY SUPPRESS RATHER THAN HANDLE THE PAIR -- do not "simplify" this back. Handling it
+    // means redirecting to the entry AFTER h1, i.e. `p2`, and `payload` is read at `h0` and
+    // `h1` ONLY (`p0 = payload.readAsync(h0)`, `p1 = payload.readAsync(h1)`), so it would
+    // need a THIRD read port on that Mem. Suppression costs one AND term and no port: the
+    // macro's last uop then retires ALONE on the next cycle with `p0.last` true and `p1` the
+    // next macro, the redirect fires normally, and the cost is ONE cycle on a rare event.
+    //
+    // Deliberately unconditional in `macroViolationPending` rather than case-split on
+    // `p0.last || p1.last`: a violating macro is 1-3 uops, so at most two pair slots are
+    // lost per violation, and an unconditional term cannot miss a case. Both shapes are real
+    // -- h0 marked and h1 the macro's last uop, AND h0 itself last with h1 the NEXT macro's
+    // first uop, which is the one that corrupts.
+    val orderPairOk: Bool = if (!lsOooIssue) True else !macroViolationPending
     val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
+                  orderPairOk &&
                   !(irqBoundaryHold && p0.last) &&
                   !faultedStore(h1) && !p1.isRte && !p1.needsSup && !p1.sysOp && !p1.debugBreakValid &&
                   !h0TraceArmed && !h0PreciseCompletedSticky && sysAuxRdy1 &&
@@ -1375,6 +1437,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
                   !((debugHaltState === DebugHaltState.STEP_RUNNING) && h0IsMacroLast)
     // Extra bandwidth is for ordinary execution. Keep the existing precise
     // debug/trace boundary path and the single branch-training port unchanged.
+    if (lsOooIssue) {
+      // Carry the mark forward to the macro's last uop; consume it there. The two arms are
+      // mutually exclusive on `p0.last`, and `flushing` drops it because the whole ROB
+      // (including the marked macro) is squashed.
+      when(retire0 && orderViolated(h0) && !p0.last) { macroViolatedSticky := True }
+      when((retire0 && p0.last) || flushing)         { macroViolatedSticky := False }
+    }
     val retireLanes = Seq(retire0, retire1) ++ (2 until retireWidth).map(_ => Bool())
     val preparedBatch = if (preparedRetireEntries != 0) Some(new Area {
       val port = preparedPort.get
@@ -2198,10 +2267,15 @@ class RobPlugin(val detailedPerf: Boolean = false,
         }
       }
     }
+    // Latched BEFORE the alloc resets below so a same-cycle alloc to this index wins,
+    // exactly as `mispredictStore`'s alloc-priority discipline requires.
+    if (lsOooIssue) when(lsOrderViolation.valid) { orderViolated(lsOrderViolation.payload) := True }
+    if (lsOooIssue) orderViolated.foreach(_.simPublic())   // sim-only: recovery-rate diagnosis
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False
       mispredictStore(tail) := False
+      if (lsOooIssue) orderViolated(tail) := False
       branchTakenStore(tail) := False
       btbIsBranchStore(tail) := False
       phtValidStore(tail)   := False
@@ -2229,6 +2303,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       payload.write(tail + 1, payloadFrom(allocUopVec(1)))
       completes(tail + 1)       := False
       mispredictStore(tail + 1) := False
+      if (lsOooIssue) orderViolated(tail + 1) := False
       branchTakenStore(tail + 1) := False
       btbIsBranchStore(tail + 1) := False
       phtValidStore(tail + 1)   := False
@@ -3302,13 +3377,40 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // their sequencer installs its redirect PC; treating that pulse as a boundary
     // prevents STOP_PENDING from parking halfway through architectural state update.
     debugSequencerBoundaryHit := exc.redirectValid
+    // Defined HERE, above `debugRestartPc`, because that mux READS it. A forward reference
+    // would still compile -- this is a template body, not a method -- and would silently
+    // bind `null`, so the ordering is load-bearing rather than stylistic.
+    val orderRedirect: Bool = if (!lsOooIssue) False else {
+      // `macroViolationPending` = marked on THIS uop, or inherited from an earlier uop of the
+      // same macro. See its definition for why one sticky register is sufficient.
+      // `!branchRedirect` -- REQUIRED, and only required once the mark spans a macro. Before
+      // the sticky, `orderRedirect` needed `orderViolated(h0)` with h0 the marked uop ITSELF,
+      // and a branch uop never performs an inhibited access, so the conjunction was
+      // structurally impossible. With the macro-spanning mark it is reachable: a macro whose
+      // memory uop is marked and whose LAST uop is a mispredicting branch (`jmp/jsr (An)`,
+      // `rts`, `dbcc` -- the memory-indirect control-transfer shapes) sets both. And
+      // `flushPcReg`'s when-chain puts `orderRedirect` AFTER `branchRedirect`, so it would
+      // OVERRIDE the branch's resolved target with `p1.pc`, the fall-through -- wrong-path
+      // execution. Note `debugRestartPc`'s own mux already orders `branchRedirect` above
+      // `orderRedirect`; the two were inconsistent, harmlessly, only because the conjunction
+      // could not occur.
+      //
+      // Dropping the redirect here loses NOTHING: the branch flush fires anyway
+      // (`doFlushReg` has both terms), restarts at the resolved target, and discards every
+      // entry younger than h0 -- which is a SUPERSET of what the order redirect discards. The
+      // sticky is cleared by `flushing` on the same cycle. Identical reasoning makes
+      // `exc.redirectValid` safe to let win, which `flushPcReg` already does.
+      val r = retire0 && macroViolationPending && p0.last && (count > 1) && !branchRedirect
+      r.simPublic(); r
+    }
     val debugStepRestartPc = Mux(retire1 && p1.last, p1.predNextPc, p0.predNextPc)
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
+                         Mux(orderRedirect, p1.pc,
                          Mux(debugBreakpointBoundaryHit, p0.pc,
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
                          Mux(debugNormalBoundaryHit || (debugHaltState === DebugHaltState.STEP_RUNNING), debugStepRestartPc,
-                         Mux(count === 0, debugLivePcReg, p0.predNextPc))))))
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))))))
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
     // consumer empty and does not release the debug halt.
@@ -3322,9 +3424,28 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // fatal) path, which this gate does not otherwise cover.
     val debugPcApply = debugSystemApplyIn.valid && debugSystemApplyIn.payload.pcValid &&
       !preciseDrainBusyIn
-    doFlushReg := branchRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
+    // ── LS ORDER-VIOLATION REDIRECT ────────────────────────────────────────────────
+    // Restart at the PC of the OLDEST SQUASHED instruction, which is `p1.pc` -- the ROB
+    // already restarts this way for interrupts ("`payload.pc` = the head INSTRUCTION's PC =
+    // the stacked PC ... re-executed after RTE"), so no `nextPcMem` write is needed and that
+    // Mem keeps its single writer.
+    //
+    // `p0.last` IS REQUIRED, not defensive. A 3-uop crack (mem-dest RMW: load, op, store)
+    // can sit at the head mid-macro -- the hazard recorded at `h0IsMacroLast`, where a
+    // ring-occupancy form of macro detection was tried and was WRONG for exactly this shape.
+    // Restarting at `p1.pc` is only a macro boundary once h0 is the LAST uop of its macro;
+    // otherwise `p1` is a sibling uop and restarting there would re-execute part of the
+    // macro, including the device access itself -- the `inhibited-load-irq-replay` bug.
+    // The IQ's matching precondition (a bypassing uop must be FIRST of its instruction)
+    // is what guarantees the violator is not a sibling that has already retired by then.
+    //
+    // `count > 1` because the violator must still be resident to be squashed; it is younger
+    // than a retiring h0 and cannot have retired, so this holds whenever the bit is set --
+    // gated anyway so `p1` is never an uninitialised-Mem read.
+    doFlushReg := branchRedirect || orderRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
+    when(orderRedirect)     { flushPcReg := p1.pc }
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
     // ── ONE expression for the debug restart PC (2026-09-18 race audit) ──────────
     // This arm used to REBUILD the mux above with only three of its arms, and the two

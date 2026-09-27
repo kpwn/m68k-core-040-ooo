@@ -323,6 +323,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.completion(2).payload := lsEu.completion.payload
     // MMU access-fault completion -> ROB (flags the entry vector 2 + faultAddr/SSW
     // for precise format-$7 delivery at retire).
+    // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+    // whose barrier a younger already-launched access violated. Recovered at retire.
+    rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+    rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // Precise-path SQ<->ROB loop (Task P2.5): SQ completion/fault-completion ->
