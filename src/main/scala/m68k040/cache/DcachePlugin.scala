@@ -4105,6 +4105,37 @@ class DcachePlugin(val socketMerged: Boolean = false,
       when(stS2Copyback && !stS2HitAny) {
         // COPYBACK MISS: post-commit write-allocate, off the retire path entirely.
         // No AXI beat is issued directly from S2 -- the refill engine issues the AR.
+        //
+        // ── 🎯 ON A PURE STREAMING STORE THIS FETCH IS ENTIRELY WASTED, and there is
+        // ── in-tree precedent for eliminating it. NOT BUILT; scoped here, not done.
+        // A copy's destination line is overwritten in full, so the 16 bytes this refill
+        // fetches are discarded immediately. Measured share: `MemcpyBandwidthSpec` shows
+        // 48.8 cycles per 16-byte line as THREE serialised trips -- source load miss,
+        // this write-allocate, and the later dirty writeback -- so removing this one
+        // outright is worth about a third of the copy, ~48.8 -> ~32.8 cyc/line, i.e.
+        // roughly +49% streaming bandwidth. That is the largest single number in the
+        // D-side bandwidth analysis.
+        //
+        // IS IT ARCHITECTURALLY ALLOWED? YES, when the store covers the WHOLE line with
+        // every byte strobe set: the fetched bytes are all discarded, the resulting line
+        // is dirty, and it is written back in full -- so no observer can distinguish
+        // allocate-without-fetch from fetch-then-overwrite. The L2 ALREADY DOES EXACTLY
+        // THIS one level down ("FULL-LINE WRITE, NO FILL", `l2c_ctrl.v:171-185`), and
+        // chose ALLOCATE-WITHOUT-FETCH over write-through/no-allocate for the coherency
+        // reason that applies here too. Its measured motivation: not doing it was "a 4x
+        // tax on streaming writes" on the boot RAM-zero path. The copyback design
+        // (§"COPYBACK miss at drain") already treats allocation policy as "purely a
+        // traffic/locality tuning knob", not an architectural requirement.
+        //
+        // WHY IT IS NOT A SMALL CHANGE HERE. A 16-byte line on a 32-bit architectural
+        // store means ONE store never covers a line -- the widest single store is LONG.
+        // Full-line coverage therefore needs four consecutive stores MERGED before the
+        // allocate decision, i.e. a write-combining buffer, which is a real feature and
+        // not a gate on this `when`. The one shortcut: MOVE16 is architecturally a
+        // 16-byte line move and is currently microcoded into 4 LONG transfers
+        // (`Microcode.scala`, "rows 242..251 ... 4 LONG transfers"), so a one-store
+        // MOVE16 would cover a whole line in one operation and make this reachable
+        // without a combining buffer at all. Both are out of scope here.
         stAwDone := True
         stWDone  := True
         pendingStoreMiss  := True
