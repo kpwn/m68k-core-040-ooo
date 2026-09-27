@@ -695,6 +695,18 @@ separate defect with its own root cause, in LSU-stress programs under copyback a
 page-table walks, and it is the obvious next thing to investigate for anyone trying to turn
 `LS_OOO_ISSUE` on. The knob stays default-OFF.
 
+> ⛔ **RETRACTED 2026-09-28 by `7dff52b7`: the "NOT fixed here" half of the paragraph above no
+> longer holds.** The root cause was found and it is ONE TERM in `IssueQueuePlugin`; all six
+> reds are green. Everything else in this section stands unchanged and is what made the fix
+> findable -- the attribution to the relaxation alone, the four-way controlled table, the
+> byte-identical sentinels, and the observation that only the copyback and mmuwalk postures
+> fail. See **ROOT-CAUSED AND FIXED** at the end of this file.
+>
+> So the relaxation now has **no known unfixed blocker**. That is NOT the same as
+> "ship it": the barrier's recovery cost is still priced only on a device-polling
+> microprogram (~20.9 cycles x N, +62% there), and no board build with the knob on has ever
+> been run. The knob stays default-OFF -- now pending MEASUREMENT, not pending a defect.
+
 ## FIXED (2026-09-27): the recovery now FIRES -- sticky macro bit + `retire1` suppression
 
 Defect 2 (the mark/redirect predicate conflict) and defect 3 (the dual-retire
@@ -827,3 +839,79 @@ investigations.
 The park's own residual gap is the SPLIT inhibited access and the park-full case, both of which
 keep today's in-P4 wait and are covered by the `GenerationFlags.simulation` tripwire at
 `wedgeArmed`. The tripwire did not fire in any of these runs.
+
+## ROOT-CAUSED AND FIXED (2026-09-28, `7dff52b7`): the store barrier was READINESS, not OCCUPANCY
+
+The six-red delta above is **one term**. `IssueQueuePlugin`'s relaxed LS eligibility phrased its
+barrier as *"no strictly older **UNREADY** store"*:
+
+    val lsStoreUnready = ... lsPresent(i) && (memOp === STORE) && !s.ready
+
+The invariant it exists to protect is the one the oldest-only rule states in its own comment:
+**every older store must have ALLOCATED ITS ADDRESS INTO THE SQ before any younger access
+disambiguates.** "Unready" is the wrong proxy for that. A store that is READY but has **not yet
+been SELECTED** is equally invisible to the SQ-forward query -- and `eligible` carries a SECOND
+term that can withhold selection from exactly such a store: `intraMacroOk`, which was added
+later, by `313ec0e0`/`bafd348b`, to make this very barrier's recovery work.
+
+Reachable case, three occupied slots, slot index == age order:
+
+| slot | contents | why |
+| --- | --- | --- |
+| 0 | unready LOAD | sets `lsAnyUnready(0)`, so `incA(1)` is set |
+| 1 | **READY** STORE, `!firstOfInstr` | `intraMacroOk(1) = !incA(0) \|\| first = FALSE` -> **INELIGIBLE**; and `lsStoreUnready(1) = FALSE` because it IS ready, so it barriered **nothing** |
+| 2 | READY LOAD, `firstOfInstr` | `intraMacroOk(2) = TRUE`, `olderUnreadyStore(2) = FALSE` -> **ELIGIBLE and selected** |
+
+The younger load issues ahead of an older, unissued, unallocated store; it queries the SQ,
+misses the forward, and reads **stale memory**. Architectural registers still match (the value
+feeds an unchecked temp), so only final memory is wrong -- the "dropped store" race, verbatim,
+which is why the sentinels are data-comparison failures and not faults.
+
+**Why exactly those three programs.** `!firstOfInstr` is not an exotic corner: it is the store
+uop of EVERY cracked read-modify-write macro (`add.l %d0,(%a1)+`) and of `move mem,mem`.
+`add_mem_postinc_rmw` is built entirely out of the former; `store_forward_matrix` scenario 22
+(sentinel `0xfa110016`) is a store then a load to one indexed address; `memind_full_matrix`
+cells 02/03 are a pointer load feeding a dependent load. And it explains the posture
+dependence that this file already recorded but could not account for: under the default posture
+every store is PRECISE and drains at the ROB head one at a time, which serialises the window
+the race needs; `copybackDtt=true` removes that serialisation, and the MMU-walk posture widens
+it with variable-latency loads.
+
+### The fix
+
+Phrase the barrier as **OCCUPANCY**: drop `&& !s.ready`.
+
+    val lsStorePresent = ... lsPresent(i) && (memOp === STORE)
+
+**IPC-neutral by construction, not a trade.** There is exactly ONE LS issue port, and the
+select is `OHMasking.first(eligible & lsReady)` -- the OLDEST candidate. So whenever an older
+store is ready AND eligible it already wins the port, and the younger load already could not
+have issued that cycle. The only behaviour removed is the bypass of an older store that is
+ready but WITHHELD by another eligibility term, which is precisely the corrupting case.
+
+### Measured, matched control on one tree
+
+Nine registrations, `FUZZ_LS_OOO=1` in both arms -- the same selection this file's four-way
+table used (`-z add_mem_postinc_rmw -z memind_full_matrix -z store_forward_matrix`):
+
+| arm | succeeded / failed |
+| --- | ---: |
+| barrier on READINESS (control) | **3 / 6** -- the identical six names |
+| barrier on OCCUPANCY (`7dff52b7`) | **9 / 0** |
+
+The functional diff is the one removed term; everything else in the commit is renames and
+comment, and all of it is inside the `if (!loadBypassUnreadyLoad) ... else { }` branch, so a
+knob-OFF build is textually unreachable from the change.
+
+### ⚠️ The generalisation, because this is the second time an added term widened the hazard
+
+`intraMacroOk` was correct in itself and was added for a real reason. It broke this barrier
+because the barrier was phrased as a property of the older slot's **READINESS**, and a new
+eligibility term changes whether a ready slot is **SELECTED**. Any future term that can
+withhold selection from an older LS slot re-opens the same hole on the same day it lands.
+**Phrase the barrier as OCCUPANCY and it is immune to every such term** -- that is the durable
+part of this fix, not the one-line diff.
+
+Same family as this file's own `alignedEnq` lesson ("sharing an event is safe; sharing an event
+whose consumers infer the SOURCE from it is not"): both are a second consumer silently changing
+the meaning of a predicate the first consumer still trusts.
