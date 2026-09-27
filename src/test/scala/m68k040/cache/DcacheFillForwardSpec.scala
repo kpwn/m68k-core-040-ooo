@@ -111,7 +111,11 @@ class DcacheFillForwardSpec extends AnyFunSuite {
         if (dut.dcache.logic.dbgFsmReplay.toBoolean) "RP" else "",
         if (dut.dcache.logic.axi.ar.valid.toBoolean) "AR" else "",
         if (dut.dcache.logic.axi.r.valid.toBoolean && dut.dcache.logic.axi.r.ready.toBoolean) "Rb" else "",
-        if (dut.dcache.logic.fillFwdResp.toBoolean) "FF" else "",
+        // `fillFwdResp` is NOT read here on purpose. With the flag OFF it is a `False`
+        // LITERAL rather than a signal (so the flag-OFF netlist carries no dead wire --
+        // see `DcachePlugin.missMultiHot`), and this spec builds BOTH arms, so reading it
+        // raises a SimError in the OFF arm. `**RSP**` is the marker the test asserts on
+        // anyway; which mechanism produced it is decided by the arm, not observed.
         if (dut.probe.logic.loadRspOut.valid.toBoolean) "**RSP**" else "").filter(_.nonEmpty)
       if (rBeatAt < 0 && dut.dcache.logic.axi.r.valid.toBoolean &&
           dut.dcache.logic.axi.r.ready.toBoolean) rBeatAt = n

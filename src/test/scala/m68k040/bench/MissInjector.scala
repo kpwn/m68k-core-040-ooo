@@ -218,8 +218,78 @@ object MissInjector {
   /** Collected across the whole suite run (one entry per kernel invocation). */
   val collected: mutable.ArrayBuffer[Stats] = mutable.ArrayBuffer.empty
 
+  /** ── MAKE THE ACHIEVED-RATE RULE AN ASSERTION, NOT A CONVENTION ─────────────
+    * The rule above ("compare the achieved D/kI between arms BEFORE comparing cycles")
+    * is worth nothing if it depends on a human remembering to look -- and it has
+    * already been broken once in this repo's history, in a direction that made a lever
+    * look better than it is.
+    *
+    * `rateLines` emits one machine-readable row per measurement, and `INJ_EXPECT`
+    * takes those rows back in from the OTHER arm of an A/B and HARD-FAILS when an
+    * achieved rate has moved. So the procedure is:
+    *
+    *   arm A:  ...testOnly ...MissInjectionSweepSpec | grep MISSINJ_RATE > /tmp/a.rates
+    *   arm B:  INJ_EXPECT=/tmp/a.rates ...testOnly ...MissInjectionSweepSpec
+    *
+    * and arm B FAILS if the injector delivered a different amount of work, instead of
+    * quietly reporting a cycle delta that mixes a lever with a workload change.
+    * `INJ_EXPECT_TOL` is the permitted relative drift, default 2%.
+    *
+    * NOTE this is a GUARD, not the fix. The real fix is a rate-CONTROLLED injector
+    * (steal toward a target count per retired instruction, closed-loop, instead of a
+    * target eligibility fraction) so the arms match by construction. That does not
+    * exist yet; this makes its absence loud instead of silent. */
+  private def rateKey(s: Stats): String = s"${s.point}|${s.kernel}"
+
+  def rateLines: Seq[String] =
+    collected.toSeq.map(s => f"MISSINJ_RATE ${rateKey(s)}%s d=${s.dMissPerK}%.4f i=${s.iMissPerK}%.4f")
+
+  def checkExpectedRates(): Unit = {
+    val path = sys.env.get("INJ_EXPECT").filter(_.nonEmpty).getOrElse(return)
+    val tol = sys.env.get("INJ_EXPECT_TOL").filter(_.nonEmpty).map(_.toDouble).getOrElse(0.02)
+    val want = scala.io.Source.fromFile(path).getLines()
+      .filter(_.contains("MISSINJ_RATE")).map { l =>
+        val t = l.trim.split("\\s+")
+        // MISSINJ_RATE <point>|<kernel> d=<x> i=<y>
+        (t(1), t(2).stripPrefix("d=").toDouble, t(3).stripPrefix("i=").toDouble)
+      }.toVector
+    require(want.nonEmpty, s"INJ_EXPECT=$path contained no MISSINJ_RATE rows")
+    // Several seeds share one (point, kernel); compare the MEAN, which is what a curve
+    // is read off anyway, and report every offender rather than the first.
+    val gotBy = collected.groupBy(rateKey)
+    val bad = scala.collection.mutable.ArrayBuffer.empty[String]
+    for ((k, wd, wi) <- want.groupBy(_._1).map { case (k, v) =>
+           (k, v.map(_._2).sum / v.size, v.map(_._3).sum / v.size) }) {
+      gotBy.get(k) match {
+        case None => bad += s"$k: present in the baseline, MISSING from this run"
+        case Some(rows) =>
+          val gd = rows.map(_.dMissPerK).sum / rows.size
+          val gi = rows.map(_.iMissPerK).sum / rows.size
+          def off(w: Double, g: Double) = math.abs(g - w) > tol * math.max(1e-9, math.abs(w))
+          if (off(wd, gd) || off(wi, gi))
+            bad += f"$k%s: D/kI $wd%.3f -> $gd%.3f, I/kI $wi%.3f -> $gi%.3f"
+      }
+    }
+    if (bad.nonEmpty) {
+      println()
+      println("=" * 100)
+      println("  ⛔ ACHIEVED INJECTION RATE MOVED BETWEEN ARMS -- every cycle delta in this")
+      println("  A/B mixes the lever with a WORKLOAD CHANGE and is VOID. See MissInjector's")
+      println("  header: the injector's achieved rate is coupled to D-cache timing.")
+      bad.foreach(b => println(s"    $b"))
+      println("=" * 100)
+      throw new AssertionError(
+        s"injection rate moved on ${bad.size} (point,kernel) pair(s) beyond ${tol * 100}%; " +
+        s"the arms were not given the same amount of work (INJ_EXPECT=$path)")
+    }
+    println(f"  [inj-rate] achieved rates match the ${want.size}%d baseline row(s) " +
+            f"within ${tol * 100}%.1f%% -- the arms are comparable")
+  }
+
   def report(): Unit = {
     if (collected.isEmpty) return
+    rateLines.foreach(println)
+    checkExpectedRates()
     println()
     println("=" * 148)
     println(s"  MISS INJECTION / MLP  --  injection: $label")
