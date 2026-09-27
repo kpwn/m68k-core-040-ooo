@@ -70,7 +70,15 @@ class PerfCounterSpec extends AnyFunSuite {
     OFF_PERF_ITLB_WALK    -> "itlb_walk",
     OFF_PERF_STALL_RETIRE -> "stall_retire",
     OFF_PERF_STALL_DC     -> "stall_dc",
-    OFF_PERF_STALL_WALK   -> "stall_walk").map { case (o, n) => (o, n) }
+    OFF_PERF_STALL_WALK   -> "stall_walk",
+    // I-cache prefetch coverage. `OFF_IC_PREFETCH_CTL` is deliberately NOT in this
+    // list: it is a CONTROL, not a counter, it is not cleared by OFF_PERF_CTL bit 0,
+    // and asserting it reads zero after a clear would assert the opposite of its
+    // contract.
+    OFF_PERF_IC_PF_ISSUED -> "ic_pf_issued",
+    OFF_PERF_IC_PF_USED   -> "ic_pf_used",
+    OFF_PERF_IC_MISS_SEQ  -> "ic_miss_seq",
+    OFF_PERF_IC_PF_LATE   -> "ic_pf_late").map { case (o, n) => (o, n) }
 
   private val AllWords: Seq[(Int, String)] =
     Counters32 ++ Seq(
@@ -147,8 +155,9 @@ class PerfCounterSpec extends AnyFunSuite {
       val c0 = ctl(b, cd)
       println(s"[perf-csr] $c0")
       assertPerfFeatureWithheld(b, cd, "the producerless standalone fixture")
-      assert(c0.nCounters == 14,
-        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 14. " +
+      assert(c0.nCounters == 18,
+        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 18 " +
+        "(12 + the 2 mispredict-class + the 4 I-cache prefetch counters). " +
         "The host uses this to decide whether the block exists at all; a wrong value " +
         "makes it either refuse a real block or print a table for an absent one.")
       assert(c0.run, "RUN must be 1 out of debug POR so a build behaves like the " +
@@ -193,7 +202,11 @@ class PerfCounterSpec extends AnyFunSuite {
         ("itlb_walk",    0x77770007L, v => csr.perfItlbWalk    #= BigInt(v)),
         ("stall_retire", 0x88880008L, v => csr.perfStallRetire #= BigInt(v)),
         ("stall_dc",     0x99990009L, v => csr.perfStallDc     #= BigInt(v)),
-        ("stall_walk",   0xAAAA000AL, v => csr.perfStallWalk   #= BigInt(v)))
+        ("stall_walk",   0xAAAA000AL, v => csr.perfStallWalk   #= BigInt(v)),
+        ("ic_pf_issued", 0xBBBB000BL, v => csr.perfIcPfIssued   #= BigInt(v)),
+        ("ic_pf_used",   0xCCCC000CL, v => csr.perfIcPfUsed     #= BigInt(v)),
+        ("ic_miss_seq",  0xDDDD000DL, v => csr.perfIcMissSeq    #= BigInt(v)),
+        ("ic_pf_late",   0xEEEE000EL, v => csr.perfIcPfLate     #= BigInt(v)))
       val seedOffsets = Counters32.map(_._1)
       assert(seeds.map(_._1) == Counters32.map(_._2),
         s"the seed table and Counters32 have drifted apart: ${seeds.map(_._1)} vs " +
@@ -731,6 +744,267 @@ class PerfCounterSpec extends AnyFunSuite {
       assert(hits == 0L,
         s"OFF_PERF_DC_MISS = $hits when re-reading four lines that are already resident. " +
         "The lane is counting accesses, not misses.")
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // 3b. I-CACHE PREFETCH: THE RUNTIME TOGGLE AND THE COVERAGE PAIR.
+  //
+  // This test asserts CLASSIFICATION, not motion. "The counter moved" is satisfied by
+  // a counter wired to the wrong event, and the wrong event here is easy to reach:
+  // count every AR instead of the speculative ones, or count every hit instead of the
+  // hits on prefetched lines, and both registers still look alive. So each of the four
+  // windows below pins a DIFFERENT cell of the truth table:
+  //
+  //   A  prefetch OFF, three cold demand fetches  -> ISSUED 0, USED 0, IC_MISS 3
+  //        "a demand miss counts in NEITHER" -- and, on the same DUT, the toggle has a
+  //        measurable EFFECT rather than just a read-back.
+  //   B  prefetch ON, ONE cold demand fetch       -> ISSUED > 0, USED 0
+  //        "issued and never used counts in ONE and not the other" -- the wasted-
+  //        bandwidth case, which is the one the board needs to be able to see.
+  //   C  demand-fetch the five lines ahead        -> USED + IC_MISS == 5, EXACTLY
+  //        Every one of those lines is either resident from a prefetch (a hit, so USED)
+  //        or not yet prefetched (a demand miss, so IC_MISS). The sum is a conservation
+  //        law, so it cannot be satisfied by a counter that merely moves.
+  //   D  re-fetch the SAME five lines             -> USED 0, IC_MISS 0
+  //        "at most one USED per install": the provenance mark is consumed by the first
+  //        demand hit, so the very hits that counted in C must NOT count again.
+  //
+  // Two more windows pin the DIAGNOSIS counters, and they get conservation laws of their
+  // own rather than "it moved":
+  //   E  prefetch OFF, FOUR CONSECUTIVE cold lines -> IC_MISS_SEQ == IC_MISS - 1, EXACTLY
+  //        In a run of N consecutive cold lines exactly N-1 misses are the previous
+  //        miss's line + 64; the first is not, because what preceded it was not its
+  //        predecessor line. Window A's three SCATTERED cold lines are the other half:
+  //        IC_MISS_SEQ must be 0 there. A lane wired to "any miss" passes neither.
+  //   F  prefetch ON, a TIGHT back-to-back walk    -> PF_LATE > 0
+  //        while PF_LATE is EXACTLY 0 in every prefetch-OFF window, by construction: no
+  //        speculative slot can own a set, so a nonzero reading there would mean the lane
+  //        is counting general demand stalls rather than prefetch collisions.
+  //
+  // MUTATION-VERIFIED, not merely written -- see the task report. Dropping the
+  // speculative-id test from `IcachePlugin.pfArIssued` makes window A read ISSUED 3;
+  // dropping `pfFilledQ(w)` from `pfHitUsefulS1` makes window D read USED 5.
+  // ══════════════════════════════════════════════════════════════════════════════
+  test("I-cache prefetch: the debug-bus toggle works and the coverage pair CLASSIFIES",
+       VerilatorTest) {
+    M68kSim().compile(new CachePerfDut).doSim("perf_ic_prefetch", 1) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      IcacheSim.attachMemory(dut.icache.logic.axi, cd, 0L, 0x10000)
+      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val b = dut.axi
+      DbgAxiDriver.idle(b)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.dProbe.logic.loadCmdIn.valid #= false
+      dut.dProbe.logic.loadProbeIn.valid #= false
+      dut.dProbe.logic.loadProbeCancelIn.valid #= false
+      dut.dProbe.logic.loadProbeCancelIn.payload.all #= false
+      dut.dProbe.logic.storeIn.valid #= false
+      dut.dProbe.logic.maintCmdIn.valid #= false
+      dut.dProbe.logic.maintCmdIn.payload.push #= false
+      dut.dProbe.logic.maintCmdIn.payload.invalidate #= false
+      dut.dProbe.logic.maintCmdIn.payload.scope #= 0
+      dut.dProbe.logic.maintCmdIn.payload.sel #= 0
+      dut.dProbe.logic.maintCmdIn.payload.addr #= 0
+      dut.iProbe.logic.cmdIn.valid #= false
+      dut.iProbe.logic.cmdIn.payload.pc #= 0
+      dut.icache.logic.invalidateAll #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
+
+      def iFetch(pc: Long): Unit = {
+        val p = dut.iProbe.logic
+        p.cmdIn.valid #= true
+        p.cmdIn.payload.pc #= pc
+        cd.waitSamplingWhere(p.cmdIn.ready.toBoolean && p.cmdIn.valid.toBoolean)
+        p.cmdIn.valid #= false
+        cd.waitSamplingWhere(p.rspOut.valid.toBoolean)
+      }
+      def pfCtl: Long = u(DbgAxiDriver.read(b, cd, OFF_IC_PREFETCH_CTL))
+      def win(): Map[String, Long] = { DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlFreeze)
+                                       cd.waitSampling(4); readAll(b, cd) }
+      def startWin(): Unit = { DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlClearRun)
+                               cd.waitSampling(4) }
+
+      // ── the toggle: POR state, then a write, read back over the REAL dbg_axi ─────
+      val ctl0 = pfCtl
+      println(f"[ic-pf] OFF_IC_PREFETCH_CTL at POR = 0x$ctl0%08x")
+      assert((ctl0 & 0x4L) != 0L,
+        f"OFF_IC_PREFETCH_CTL bit2 (IcachePlugin present) is clear on a DUT that hosts " +
+        f"an IcachePlugin (read 0x$ctl0%08x). Without that bit a host cannot tell " +
+        f"'prefetch is off' from 'there is no I-cache', and bit0 reading 0 means both.")
+      assert((ctl0 & 0x1L) != 0L,
+        f"OFF_IC_PREFETCH_CTL bit0 = 0 at POR (read 0x$ctl0%08x): `prefetchEnable` is " +
+        f"RegInit(True) unless DBG_IC_PREFETCH_DISABLE=1 was set for this elaboration, " +
+        f"so a zero here means the read-back is not reaching the I-cache's flop at all.")
+      assert((ctl0 & 0x2L) == 0L,
+        f"OFF_IC_PREFETCH_CTL bit1 (debug bus owns the level) is already set at POR " +
+        f"(read 0x$ctl0%08x). Nothing has written it yet; a sticky bit that starts set " +
+        f"means the build-time DBG_IC_PREFETCH_DISABLE default is being overridden by " +
+        f"a register that has never been told what to say.")
+
+      DbgAxiDriver.write(b, cd, OFF_IC_PREFETCH_CTL, 0L)
+      cd.waitSampling(6)
+      val ctlOff = pfCtl
+      println(f"[ic-pf] after writing 0: 0x$ctlOff%08x")
+      assert((ctlOff & 0x3L) == 0x2L,
+        f"after writing OFF_IC_PREFETCH_CTL = 0 the register reads 0x$ctlOff%08x; " +
+        f"expected bit0 = 0 (prefetch now off) and bit1 = 1 (the debug bus has taken " +
+        f"ownership). A write arm that lands in the READ switch reads back perfectly " +
+        f"and never fires -- that is exactly what happened to the multi-hot clear.")
+
+      // ── WINDOW A: prefetch OFF. A demand miss must count in NEITHER lane. ───────
+      startWin()
+      val aAddrs = Seq(0x2000L, 0x2400L, 0x2800L)
+      for (a <- aAddrs) iFetch(a)
+      cd.waitSampling(200)
+      val wa = win()
+      println(s"[ic-pf] A (prefetch OFF): ic_miss=${wa("ic_miss")} " +
+              s"issued=${wa("ic_pf_issued")} used=${wa("ic_pf_used")}")
+      assert(wa("ic_miss") == aAddrs.length.toLong,
+        s"OFF_PERF_IC_MISS = ${wa("ic_miss")} after ${aAddrs.length} cold demand fetches")
+      assert(wa("ic_pf_issued") == 0L,
+        s"OFF_PERF_IC_PF_ISSUED = ${wa("ic_pf_issued")} with the prefetcher DISABLED " +
+        s"over a window containing only ${aAddrs.length} demand misses. Either the " +
+        s"debug-bus toggle does not reach `prefetchEnable` (the read-back lied), or " +
+        s"this lane is counting DEMAND fill bursts as prefetches -- which would make " +
+        s"every coverage number on the board a restatement of the miss count.")
+      assert(wa("ic_pf_used") == 0L,
+        s"OFF_PERF_IC_PF_USED = ${wa("ic_pf_used")} over a window with no prefetch at " +
+        s"all. A demand miss must count in NEITHER prefetch lane.")
+      assert(wa("ic_pf_late") == 0L,
+        s"OFF_PERF_IC_PF_LATE = ${wa("ic_pf_late")} with the prefetcher DISABLED. No " +
+        s"speculative slot can own a set in this window, so this lane must be EXACTLY " +
+        s"zero. A nonzero reading means it is counting general demand stalls -- and it " +
+        s"would then look large on the board for reasons that have nothing to do with " +
+        s"prefetch, which is the whole question it exists to answer.")
+      assert(wa("ic_miss_seq") == 0L,
+        s"OFF_PERF_IC_MISS_SEQ = ${wa("ic_miss_seq")} over ${aAddrs.length} cold fetches " +
+        s"0x400 apart. NONE of them is the previous miss's line + 64, so a lane that " +
+        s"counts anything here is counting misses rather than SEQUENTIAL misses -- and " +
+        s"IC_MISS_SEQ/IC_MISS would then read 1.0 on any workload and greenlight nothing.")
+
+      // ── WINDOW B: prefetch ON, one cold fetch. ISSUED > 0 and USED == 0. ────────
+      DbgAxiDriver.write(b, cd, OFF_IC_PREFETCH_CTL, 1L)
+      cd.waitSampling(6)
+      val ctlOn = pfCtl
+      assert((ctlOn & 0x3L) == 0x3L,
+        f"after writing OFF_IC_PREFETCH_CTL = 1 the register reads 0x$ctlOn%08x; " +
+        f"expected bit0 = 1 (prefetch back on) and bit1 = 1 (still owned)")
+
+      val base = 0x4000L                       // page-aligned: the 5-line window stays in-page
+      val ahead = (1 to 5).map(i => base + i * 64L)
+      startWin()
+      iFetch(base)
+      cd.waitSampling(2000)                    // let the frontier run to its limit
+      val wb = win()
+      println(s"[ic-pf] B (one cold fetch, prefetch ON): ic_miss=${wb("ic_miss")} " +
+              s"issued=${wb("ic_pf_issued")} used=${wb("ic_pf_used")}")
+      assert(wb("ic_miss") == 1L,
+        s"OFF_PERF_IC_MISS = ${wb("ic_miss")} after exactly one cold DEMAND fetch. " +
+        s"Speculative fills must not reach the demand-miss lane.")
+      assert(wb("ic_pf_issued") >= 2L,
+        s"OFF_PERF_IC_PF_ISSUED = ${wb("ic_pf_issued")} after one cold demand fetch " +
+        s"opened a five-line window with the prefetcher ON. A frontier that never " +
+        s"advances is 'architecturally invisible' in exactly the way that silently " +
+        s"deletes the feature -- and a lane that reads zero here cannot tell the two " +
+        s"apart from a dead probe.")
+      assert(wb("ic_pf_used") == 0L,
+        s"OFF_PERF_IC_PF_USED = ${wb("ic_pf_used")} over a window in which the only " +
+        s"demand fetch MISSED and no prefetched line was ever demand-fetched. This is " +
+        s"the wasted-bandwidth case: ISSUED must count it and USED must not.")
+
+      // ── WINDOW C: demand-fetch the five lines ahead. USED + IC_MISS == 5. ───────
+      startWin()
+      for (a <- ahead) iFetch(a)
+      cd.waitSampling(300)
+      val wc = win()
+      println(s"[ic-pf] C (fetch the 5 lines ahead): ic_miss=${wc("ic_miss")} " +
+              s"issued=${wc("ic_pf_issued")} used=${wc("ic_pf_used")}")
+      assert(wc("ic_pf_used") + wc("ic_miss") == ahead.length.toLong,
+        s"USED (${wc("ic_pf_used")}) + IC_MISS (${wc("ic_miss")}) = " +
+        s"${wc("ic_pf_used") + wc("ic_miss")}, expected exactly ${ahead.length}. Each of " +
+        s"those ${ahead.length} demand fetches is EITHER a hit on a line a prefetch " +
+        s"installed (USED) OR a demand miss (IC_MISS) -- never both and never neither. " +
+        s"This conservation law is what a counter wired to the wrong event fails; " +
+        s"'the number went up' is not.")
+      assert(wc("ic_pf_used") >= 2L,
+        s"OFF_PERF_IC_PF_USED = ${wc("ic_pf_used")} after demand-fetching " +
+        s"${ahead.length} lines the prefetcher had 2000 cycles to install. The sum " +
+        s"assertion above would also pass with USED = 0 and every line missing, so " +
+        s"this is the non-vacuity half: without it the test proves nothing about USED.")
+
+      // ── WINDOW D: re-fetch the same lines. AT MOST ONE USED PER INSTALL. ────────
+      startWin()
+      for (a <- ahead) iFetch(a)
+      cd.waitSampling(300)
+      val wd = win()
+      println(s"[ic-pf] D (re-fetch the same 5 lines): ic_miss=${wd("ic_miss")} " +
+              s"issued=${wd("ic_pf_issued")} used=${wd("ic_pf_used")}")
+      assert(wd("ic_miss") == 0L,
+        s"OFF_PERF_IC_MISS = ${wd("ic_miss")} re-fetching ${ahead.length} lines that " +
+        s"are all resident; every one of these is a hit")
+      assert(wd("ic_pf_used") == 0L,
+        s"OFF_PERF_IC_PF_USED = ${wd("ic_pf_used")} re-fetching lines that were ALREADY " +
+        s"demand-hit in the previous window. The provenance mark is consumed by the " +
+        s"FIRST demand hit, so a re-hit must not re-count -- otherwise USED is a hit " +
+        s"counter wearing a coverage counter's name and USED/ISSUED can exceed 1.")
+
+      // ── WINDOW E: IC_MISS_SEQ == IC_MISS - 1 over a consecutive cold run. ───────
+      // Prefetch is turned back OFF for this window, and that is REQUIRED, not tidy: with
+      // it on, the frontier would install lines 1..4 of the run off the first demand miss
+      // and they would be HITS, so there would be no miss stream left to classify.
+      DbgAxiDriver.write(b, cd, OFF_IC_PREFETCH_CTL, 0L)
+      cd.waitSampling(6)
+      assert((pfCtl & 0x1L) == 0L, "prefetch must be OFF again for the IC_MISS_SEQ window")
+      val runBase = 0x6000L
+      val run = (0 until 4).map(i => runBase + i * 64L)
+      startWin()
+      for (a <- run) iFetch(a)
+      cd.waitSampling(200)
+      val we = win()
+      println(s"[ic-pf] E (4 consecutive cold lines, prefetch OFF): ic_miss=${we("ic_miss")} " +
+              s"seq=${we("ic_miss_seq")} issued=${we("ic_pf_issued")} late=${we("ic_pf_late")}")
+      assert(we("ic_miss") == run.length.toLong,
+        s"OFF_PERF_IC_MISS = ${we("ic_miss")} over ${run.length} cold consecutive lines " +
+        s"with the prefetcher off; every one of them must miss")
+      assert(we("ic_miss_seq") == run.length.toLong - 1L,
+        s"OFF_PERF_IC_MISS_SEQ = ${we("ic_miss_seq")} over a run of ${run.length} " +
+        s"CONSECUTIVE cold lines; expected EXACTLY ${run.length - 1}. In a run of N " +
+        s"consecutive misses exactly N-1 are the previous miss's line + 64 -- the first " +
+        s"is not, because what preceded it was not its predecessor line. That is a " +
+        s"conservation law: a lane that counted every miss would read ${run.length}, and " +
+        s"one that counted none would read 0. This ratio is the number that decides " +
+        s"whether fetch-directed prefetch has a market at all, so it has to be exact.")
+      assert(we("ic_pf_issued") == 0L && we("ic_pf_late") == 0L,
+        s"prefetch is OFF in this window but issued=${we("ic_pf_issued")} " +
+        s"late=${we("ic_pf_late")}")
+
+      // ── WINDOW F: PF_LATE fires when a demand collides with an in-flight fill. ──
+      // A TIGHT walk, deliberately: no `waitSampling` between fetches, so each demand
+      // arrives while the frontier opened by the previous one is still filling. That is
+      // the whole condition PF_LATE names -- a demand offered, translation ready, and a
+      // speculative slot owning the set it wants.
+      DbgAxiDriver.write(b, cd, OFF_IC_PREFETCH_CTL, 1L)
+      cd.waitSampling(6)
+      assert((pfCtl & 0x1L) == 1L, "prefetch must be ON again for the PF_LATE window")
+      startWin()
+      for (i <- 0 until 8) iFetch(0x8000L + i * 64L)
+      cd.waitSampling(50)
+      val wf = win()
+      println(s"[ic-pf] F (tight 8-line walk, prefetch ON): ic_miss=${wf("ic_miss")} " +
+              s"seq=${wf("ic_miss_seq")} issued=${wf("ic_pf_issued")} " +
+              s"used=${wf("ic_pf_used")} late=${wf("ic_pf_late")}")
+      assert(wf("ic_pf_late") > 0L,
+        s"OFF_PERF_IC_PF_LATE = 0 across a walk of 8 consecutive lines issued back to " +
+        s"back with the prefetcher ON, in which ${wf("ic_pf_issued")} speculative fills " +
+        s"were started. A demand fetch must have been held on a speculative fill at " +
+        s"least once; a lane that reads zero HERE cannot be told apart from a dead probe, " +
+        s"and the board would read 'prefetch is never late' about a prefetcher it has " +
+        s"never actually watched.")
+      assert(wf("ic_pf_late") <= wf("cycle_lo"),
+        s"PF_LATE (${wf("ic_pf_late")}) exceeds the window's own cycle count " +
+        s"(${wf("cycle_lo")}): it is a CYCLE lane and cannot outrun the clock")
     }
   }
 

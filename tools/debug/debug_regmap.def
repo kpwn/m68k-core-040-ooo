@@ -339,6 +339,123 @@ REG OFF_PERF_DETAIL_CAP   0x010B4 RO    2 0x00000000 Optional detail counters: D
 # a zero with no producer AND no decode, presented as a working measurement.
 REG OFF_PERF_MISPRED_UNCOND 0x010B8 RO  2 0x00000000 Windowed mispredicts on BTB-eligible UNCONDITIONAL branches (brType=1: BRA/BSR/JMP/JSR). With COND, does NOT sum to OFF_MISPRED_COUNT -- see the note above; the residual is the uncovered class.
 REG OFF_PERF_MISPRED_COND 0x010BC RO    2 0x00000000 Windowed mispredicts on BTB-eligible CONDITIONAL branches (brType=0: Bcc/DBcc) = gshare direction errors. With UNCOND, does NOT sum to OFF_MISPRED_COUNT -- see the note above.
+
+# ---- I-cache next-line prefetch: RUNTIME CONTROL + COVERAGE (2026-09-27) -------
+# WHY. A board `perf` window over a real session (boot + Finder + benchmarks, 54.6G
+# cycles) reports 32.16 I-cache DEMAND misses per kinst with retire-stall at only
+# 7.59% -- i.e. the ROB is EMPTY most of the time and the machine is FRONT-END
+# STARVED, not back-end stalled. `IcachePlugin` has carried a next-line prefetcher
+# with its own MSHR, default ON, since slice I3. Those 32.16 misses/kinst are
+# therefore what the prefetcher FAILS to cover -- and nothing in this map could say
+# by how much, or even whether it was running.
+#
+# THREE REGISTERS, ONE QUESTION EACH:
+#   * OFF_IC_PREFETCH_CTL   -- is it on, and turn it off/on WITHOUT A REBUILD.
+#     `prefetchEnable` was runtime-SHAPED (a RegInit with simPublic) but not
+#     runtime-REACHABLE, so an on/off comparison needed two bitstreams -- and two
+#     bitstreams differ by a placement lottery worth more than the effect. One
+#     bitstream, one toggle.
+#   * OFF_PERF_IC_PF_ISSUED -- what it COST: speculative fill bursts on the bus.
+#   * OFF_PERF_IC_PF_USED   -- what it BOUGHT: demand fetches that hit a line a
+#     prefetch installed and nothing else had touched.
+#
+# ...and two that say what to DO about the answer:
+#   * OFF_PERF_IC_MISS_SEQ  -- the CEILING: how much of the miss stream a next-line
+#     frontier could EVER have reached.
+#   * OFF_PERF_IC_PF_LATE   -- the TIMELINESS confound: cycles a demand fetch waited
+#     on an in-flight speculative fill.
+#
+# READ THE PAIR, NEVER EITHER ALONE. USED/ISSUED is the coverage fraction;
+# ISSUED-USED is wasted bandwidth, and bandwidth contention with demand fills is a
+# real risk on a starved front end. USED/IC_MISS sizes the remaining headroom.
+#
+# THE DECISION TABLE THESE FOUR ANSWER, because four counters that do not resolve to a
+# decision are four more numbers to argue about:
+#   * IC_MISS_SEQ / IC_MISS near 1  -> the miss stream IS mostly sequential. Next-line
+#     is the right shape and the problem is timeliness or capacity, NOT direction. A
+#     fetch-directed prefetcher has almost no market; do not build one.
+#   * IC_MISS_SEQ / IC_MISS small   -> most misses are reached by a CONTROL TRANSFER that
+#     no next-line frontier can cross. IC_MISS - IC_MISS_SEQ is the market, and it is the
+#     UPPER bound: a fetch-directed scheme reuses the same predictor, so it can only
+#     capture the part of that market reached through a CORRECTLY predicted transfer.
+#   * PF_LATE large with USED large -> the prefetcher picks the right lines and still
+#     makes the demand wait. The fix is DEPTH (issue earlier / more speculative MSHRs),
+#     not a different prefetch address.
+#   * PF_LATE ~0 with USED small    -> the prefetcher is simply fetching the wrong lines.
+# PF_LATE is EXACTLY ZERO whenever prefetch is disabled, by construction (no speculative
+# slot can own a set), which is also how a host proves the lane is not counting general
+# demand stalls.
+#
+# EXACT DEFINITIONS, because a performance counter's whole value is that its
+# definition is not negotiable after the fact:
+#   * ISSUED counts the AXI AR handshake for a SPECULATIVE id (AxiIds.I_SPEC_BASE..),
+#     one per 64-byte burst. It is the BUS event, so a speculative fill later poisoned
+#     by an invalidate, or one that returns a bus error, is counted ISSUED and can
+#     never be counted USED. ISSUED-USED is thus "wasted bandwidth", NOT "installed
+#     and unused"; the two differ by the (small) poison/error tail.
+#   * USED counts `IcachePlugin.pfHitUseful`: a demand lookup HIT a way whose
+#     per-(way,set) prefetch-provenance mark was still set. The mark is written FALSE
+#     by a demand install into the same way/set, cleared by the first demand hit, and
+#     cleared by invalidateAll -- so it is AT MOST ONE per install, a re-hit of the
+#     same line does not re-count, and a DEMAND miss counts in NEITHER register.
+#   * USED <= ISSUED holds in the LIMIT, not at the window edges: a line prefetched
+#     BEFORE a window can be used INSIDE it. Over a long window that is noise; over a
+#     short one USED > ISSUED is possible and is not a bug.
+#
+# SAME WINDOW, SAME LATENCY DISCIPLINE as every counter above: every one is fed from a
+# REGISTERED copy of its event, all four are zeroed by OFF_PERF_CTL bit 0 and frozen by
+# bit 1, and all four read zero with the ICACHE producer bit (OFF_PERF_CTL[18]) clear.
+# OFF_PERF_CTL[15:8] therefore reports 16, not 12.
+#   * PF_ISSUED / PF_USED are direct-pulse lanes: 1 cycle, like MISPRED and DC_MISS.
+#   * IC_MISS_SEQ is an edge-detected lane: 2 cycles, and it shares ONE rise detector
+#     with OFF_PERF_IC_MISS rather than instantiating a second. That is deliberate --
+#     the two lanes are edges of the SAME signal at the SAME depth, which is what makes
+#     SEQ/MISS a meaningful ratio instead of two numbers a cycle apart (with separate
+#     detectors a short window could report SEQ > MISS).
+#   * PF_LATE is a LEVEL lane at 1 cycle: its producer `heldOnSetBusyQ` is already a
+#     register in the I-cache with the correct idle polarity, so it needs no tap -- the
+#     same reason OFF_PERF_STALL_DC reuses its already-registered source.
+# The "previous miss line" register behind IC_MISS_SEQ is deliberately NOT cleared by
+# OFF_PERF_CTL bit 0: it describes the MACHINE, not the window. Zeroing it would make
+# the first miss of every window unclassifiable rather than merely edge-approximate.
+#
+# OFF_IC_PREFETCH_CTL IS A CONTROL, NOT A COUNTER: it is deliberately NOT cleared by
+# OFF_PERF_CTL bit 0. Zeroing a window must never change the machine being measured.
+#
+# ---- ADDRESS CHOICE: 0x010B8/0x010BC ARE TAKEN, 0x010C0-0x010CC ARE RESERVED. ----
+# This block was FIRST written at 0x010B8-0x010C0 and MOVED to 0x010D0 on 2026-09-27,
+# because `fix/brring-skew` (core a31dd04b, branched off the same aa312145) had already
+# claimed the first two of those words:
+#
+#     0x010B8  OFF_PERF_MISPRED_UNCOND   \  the mispredict-CLASS counters --
+#     0x010BC  OFF_PERF_MISPRED_COND     /   they own these offsets, do not reuse them
+#
+# Both branches gated green in isolation, because neither elaboration can see the
+# other's .def -- a frozen-offset map only detects a collision inside ONE file. The
+# consequence was not an error but something worse: `tools/jtag_repl.tcl` already reads
+# 0x010B8/0x010BC as the mispredict classes, so a prefetch CONTROL word parked there
+# would have rendered on the host as "uncond mispredicts" -- a plausible-looking number
+# that means something else entirely. This project has been burned by exactly that once
+# already (see the dead-probe family on `wedge-status` and OFF_CYCLE_LO).
+#
+# 0x010C0-0x010CC (four words) IS LEFT DELIBERATELY FREE, as growing room for the
+# mispredict-class block: the attribution it serves has more classes than two (RETURN
+# and INDIRECT are 34.5% and 22.7% of board mispredicts), and the resolver of the next
+# collision should not have to move a block that is already deployed. This block
+# therefore starts at 0x010D0, on a 16-byte boundary, and runs to 0x010E0 -- clear of
+# OFF_PERF_DETAIL_BASE at 0x01100 as well. The whole I-cache prefetch block is
+# 0x010D0-0x010E0 (five words: CTL, PF_ISSUED, PF_USED, IC_MISS_SEQ, PF_LATE);
+# 0x010E4-0x010FC remains free.
+#
+# THE RULE THIS RESTATES: before adding anything to the 0x01000 block, check the .def of
+# every LIVE sibling branch (`git show <rev>:tools/debug/debug_regmap.def`), not just
+# this file. A frozen offset is reserved forever -- across branches, not only within
+# one.
+REG OFF_IC_PREFETCH_CTL   0x010D0 MIXED 2 0x00000001 I-cache next-line prefetch control. Write bit0 = desired prefetchEnable (the first write takes ownership from the build-time DBG_IC_PREFETCH_DISABLE default and holds it). Read bit0 = live prefetchEnable (1-cycle lag), bit1 = debug bus has taken ownership, bit2 = IcachePlugin present. NOT affected by OFF_PERF_CTL clear.
+REG OFF_PERF_IC_PF_ISSUED 0x010D4 RO    2 0x00000000 Windowed speculative (prefetch) I-cache fill bursts ISSUED on AXI -- one per 64-byte read. The bandwidth cost. Includes fills later poisoned or errored.
+REG OFF_PERF_IC_PF_USED   0x010D8 RO    2 0x00000000 Windowed prefetched lines subsequently USED: a demand fetch hit a line a prefetch installed and nothing else had touched. At most one per install. Read against OFF_PERF_IC_PF_ISSUED for coverage and against OFF_PERF_IC_MISS for remaining headroom.
+REG OFF_PERF_IC_MISS_SEQ  0x010DC RO    2 0x00000000 Windowed demand misses whose line is the PREVIOUS demand miss's line + 64. Next-line prefetch's EXACT CEILING: OFF_PERF_IC_MISS minus this is the entire addressable market of any fetch-directed scheme.
+REG OFF_PERF_IC_PF_LATE   0x010E0 RO    2 0x00000000 Windowed CYCLES on which a demand fetch was offered, its translation was ready, and a SPECULATIVE fill owned the set it wanted -- so it could not be accepted. "Right line, too late". Read against OFF_PERF_IC_PF_USED to tell a DEPTH problem from a DIRECTION one.
 REG OFF_PERF_DETAIL_BASE  0x01100 RO    2 0x00000000 Detail counter array, 32-bit words; layout in PerfDetailService.scala. Shares PERF_CTL clear/run/freeze.
 
 # ---------------------------------------------- MMU translation-key probes --
