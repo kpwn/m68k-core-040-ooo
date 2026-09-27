@@ -2614,6 +2614,42 @@ trait CoreBenchHarness extends AnyFunSuite {
       verifyRetirement = brProbeExpect(0 -> iters.toLong))
   }
 
+  /** DBcc SLOT-1 probe, TWO BRANCHES PER WINDOW -- the case `br-dbcc` does NOT reach.
+    *
+    * `br-dbcc` (above) turned out to be already covered: with ONE branch in its 8-byte
+    * window the FTB holds it, `slot1WouldFtq` defers it to slot 0, and gshare predicts
+    * it -- measured 3 mispredicts in 1024 iterations, IPC 0.989 (~1 macro/cycle, i.e.
+    * the pair never issued together because the deferral already fired). That is the
+    * existing mechanism working, and no DBcc lever can improve on it.
+    *
+    * The uncovered case is the one `br-ind` shows for `jsr`+`bne`: the FTB holds ONE
+    * branch per EIGHT-BYTE WINDOW, so a window with TWO control transfers leaves the
+    * second predicted by nothing. Here:
+    *
+    *   .Lds: beq.s .Lnever   (2 bytes, NEVER taken -- `moveq #1,%d2` leaves Z=0)
+    *         dbra  %d7,.Lds  (4 bytes)
+    *
+    * Both live in one window. `ftqAt0` points at the `beq`, so `slot1WouldFtq` cannot
+    * defer the `dbra`, which emits in SLOT 1 with no prediction and falls through on a
+    * loop that should have been taken. The `beq` is correctly predicted NOT-taken, so
+    * `slot0IsPred` stays low and the deferral predicate is reachable.
+    *
+    * Verified on d7. ⚠️ `DBcc` is a WORD operation -- it decrements and tests only the
+    * LOW 16 BITS of Dn -- so starting from `move.l #iters-1` an exhausted loop leaves
+    * d7 = 0x0000FFFF, NOT 0xFFFFFFFF. Reaching 0xFFFF means exactly `iters` decrements
+    * happened, so it catches an early exit through the `beq` AND a deferral that drops
+    * the instruction instead of re-emitting it. */
+  def kBrDbccPair(iters: Int = 1024, label: String = "br-dbcc-2"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", "moveq #0,%d0",
+                    s"move.l #${iters - 1},%d7", "moveq #1,%d2")
+    val src = (setup ++ Seq(".Lds: beq.s .Lnever ; dbra %d7,.Lds",
+      ".Lnever: bra.s .Lnever")).mkString(" ; ")
+    // Per iteration: the never-taken beq + the dbra = 2 macros.
+    Kernel(label, src, setup.size + iters * 2,
+      warmupInstrs = setup.size,
+      verifyRetirement = brProbeExpect(7 -> 0x0000FFFFL))
+  }
+
   /** BTB/FTB CAPACITY probe: `sites` distinct always-taken `bra.s` hops, each at a
     * 6-byte stride, walked in a loop.
     *

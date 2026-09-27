@@ -48,7 +48,10 @@ class BranchPredictIpcSpec extends CoreBenchHarness {
       kBrPattern(iters = 1024),
       // DBcc in SLOT 1: the canonical `add ; dbra` counted loop. Predicted by nothing
       // until `deferSlot1Dbcc` moves it to slot 0.
-      kBrDbcc(iters = 1024))
+      kBrDbcc(iters = 1024),
+      // ...and the TWO-branches-per-window case the FTB cannot cover, which is the
+      // only place a DBcc actually reaches slot 1 unpredicted.
+      kBrDbccPair(iters = 1024))
     // The kernels the IPC brief asks to report, so the probes are read next to the
     // workload-shaped numbers rather than in isolation.
     val reference = Seq(kBranchy, kHotLoop, kCallReturn, kDhrystone(copyback = true))
