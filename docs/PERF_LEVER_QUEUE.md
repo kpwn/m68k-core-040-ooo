@@ -131,6 +131,8 @@ FFs flat.
 | — | LS OoO park + recovery | ✅ **gated 396/396**, `68a89f88` | `orderRedirects` **0 → 7**, ~20.9 cyc each, **cost ONE flop bit**; lock-step reds 22 → 17. ⛔ the relaxation itself is still blocked by a **third pre-existing** corpus defect |
 | 11 | store-queue congestion (`sqNarrowDrainMerge`) | ✅ **gated 396/396**, `59ecd9a0` | ~400 LUT, **2,123 RTL lines deleted**; IPC **bit-identical, 34 kernels x 2 seeds**; corpus + lock-step identical name-for-name. ⛔ **module CEILING reached** — the whole SQ is 4,722 LUT ~ 5% of socket_core, so nothing confined to it can move congestion level 5 |
 | 12 | PRF write/read port merge (`PINS_PRF_FMAN_SHARE` + `PINS_PRF_SLOWREAD`) | ✅ **gated 396/396 both arms** | crosses the LVT `coreCount` step **only in combination**: 96 -> **80 cells (-21.6%)**, **-1,112..-1,168 LUTRAM**. FMAN deletes one of six write-address broadcasts outright = **-16.7% of the `ADDRH` sink pins** |
+| 13 | slot-1 coverage completion (DBcc / FBcc / BRA.L) | 🔄 in flight | `slot1WouldUncond` misses **7.26% of ROM control transfers**; DBcc is 3.41% STATIC and far higher dynamic (loop-closing). ⛔ RTD/RTE deliberately excluded — slot 0 cannot predict them either, so deferral costs a slot and buys nothing |
+| 14 | explicit `DBcc` loop predictor (owner, 2026-09-27) | 📋 QUEUED — **gated behind #13** | **80.8% of ROM DBcc are `DBF`/`DBT`: pure counted loops, outcome is the counter alone.** Removes the once-per-loop EXIT mispredict gshare cannot get |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -339,3 +341,40 @@ not a result. The two real targets are the **integer PRF** (9,957 LUT, 4,584 LUT
 
    🎯 Open lead, unsized: `load/store` has **96 of 289 retiring cycles blocked by
    `h0PreciseCompletedSticky`** — pairs present AND complete, and declined.
+
+
+## Lever 14 — an explicit predictor for `DBcc` (owner's idea, 2026-09-27)
+
+**Why this ISA is a good target.** A general loop predictor (the loop component of
+TAGE-SC-L; the Pentium M loop detector) has to *detect* that a branch is a counted loop.
+The 68k declares it in the opcode, and the ROM census says the declaration is nearly
+always the useful one:
+
+| form | share of ROM DBcc | behaviour |
+|---|---:|---|
+| **`DBF` / `DBRA`** | **78.8%** | condition constant-false -> taken iff `Dn != -1` after decrement: **a pure counted loop** |
+| `DBT` | 2.1% | condition constant-true -> **never loops**, statically not-taken, zero state |
+| data-dependent (`DBNE`, `DBEQ`, ...) | 19.2% | genuine conditional, needs the normal predictor |
+
+**80.8% carry no data-dependent condition at all.** A small table holding
+(tag, trip count, current count, confidence) predicts the **loop exit** exactly for a
+stable trip count. gshare structurally cannot: it mispredicts once per loop execution,
+which on the short loops typical of ROM string/block code is a 12-33% mispredict rate on
+that branch.
+
+**It also dodges a frozen parameter.** `gshareEntries` is stuck at 2048 with the 11-bit
+index hardcoded in ~15 sites, and deriving it from `Global` breaks elaboration. A
+separate small table avoids that entirely. Size precedent in-tree: `brPredTable` is
+**68 LUT**.
+
+### ⛔ ORDERING: this is gated behind lever 13, and building it first would measure a null
+
+The attribution is **38.7% no-predict-relative-uncond / 34.5% returns / 22.7% indirect /
+only 3.9% DIRECTION**. A loop predictor attacks the direction bucket, i.e. the smallest
+one, and today would read as noise.
+
+That is an artifact of the coverage hole, not a verdict: **a slot-1 `DBcc` has no
+prediction at all, so its mispredicts are counted as COVERAGE, not direction.** Closing
+coverage (lever 13) moves them into the direction bucket as loop-*exit* mispredicts —
+exactly what this lever then removes. Re-read the attribution after 13 lands before
+sizing this. Same discipline as `#7 gates #5`.
