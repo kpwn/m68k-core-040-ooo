@@ -54,8 +54,15 @@ object ShippingCoreConfig {
     * fix is a pure predictor change -- the branch EU verifies every direction and target,
     * so a wrong guess is a perf loss and never a wrong result. But "a perf loss only" is a
     * claim; `mispredicts/kinst` on silicon is the measurement, and returns are 34.5% of
-    * the board's mispredicts against 3.9% for conditional direction. */
-  val rasBranchRepair: Boolean = false
+    * the board's mispredicts against 3.9% for conditional direction.
+    *
+    * ⚠️ HAD NO ENV OVERRIDE (fixed 2026-09-27, integration of the gated levers). This was
+    * a hardcoded `false`, which meant "the build turns it on" was not a thing a build
+    * could do -- flipping it needed an RTL edit, and an RTL edit is not a provenance a
+    * build log can carry. `CPU_RAS_BRANCH_REPAIR=1` now enables it exactly like the two
+    * frontend flags below, and the value is echoed in `SHIPPING_CONFIG`. */
+  val rasBranchRepair: Boolean =
+    sys.env.get("CPU_RAS_BRANCH_REPAIR").contains("1")
   /** Front-end: COMPUTE a PC-relative unconditional branch's target from the
     * displacement already in the aligner slot, instead of only ever recalling one from
     * the BTB/FTB. See `FetchAlignPlugin.computeDirectTargets` for the mechanism and the
