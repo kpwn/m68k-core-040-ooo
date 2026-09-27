@@ -517,8 +517,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * ordinary relaunch. The multi-hot path is a rare read-side fail-safe, so paying
       * back the 2 cycles there costs nothing measurable -- and the alternative would be
       * to answer from `missLine` without knowing whether a dirty duplicate exists,
-      * which cannot be known without the very array read fill-forward exists to skip. */
-    val missMultiHot = RegInit(False)
+      * which cannot be known without the very array read fill-forward exists to skip.
+      *
+      * ELABORATED ONLY WHEN THE FLAG IS ON. `RegInit(False)` unconditionally would leave
+      * a real flop in the flag-OFF netlist that nothing reads -- which a generate-twice
+      * netlist diff CAUGHT after the commit message had already claimed the OFF arm
+      * "elaborates today's hardware exactly". It now does: off, this is a `False`
+      * literal and both write sites are Scala-conditional. */
+    val missMultiHot: Bool = if (fillForward) RegInit(False) else False
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
     val missSize  = Reg(Size())
@@ -1264,11 +1270,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // wins), which is exactly why this is a generalisation of an existing mechanism
     // rather than a new response path. Hard-False when the flag is off, so the
     // response mux below degenerates to today's expression and the netlist to today's.
-    val fillFwdResp = Bool(); fillFwdResp := False
-    fillFwdResp.simPublic()
-    /** The response mux's `missLine` source is now shared by two pulses. Naming it
-      * once keeps the two muxes below from drifting apart. */
-    val missLineResp = inhibitedResp || fillFwdResp
+    // Elaborated only when the flag is ON, for the same netlist-identity reason as
+    // `missMultiHot`: an always-declared `fillFwdResp` tied to False left a dead wire
+    // and an `|| 1'b0` term in the OFF netlist.
+    val fillFwdResp: Bool = if (!fillForward) False else {
+      val b = Bool(); b := False; b.simPublic(); b
+    }
+    /** The response mux's `missLine` source is shared by two pulses when fill-forward
+      * is on, and is exactly `inhibitedResp` when it is off. Naming it once keeps the
+      * muxes below from drifting apart. */
+    val missLineResp: Bool = if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp
 
     // ---- LOAD S2 (registered post-hit-detect response build) ----
     // FMax closure Slice 2 (2026-08-07): the old S1 response build (way-select ->
@@ -2368,7 +2379,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val vw = victim(ldS1Set)
           missPaddr := ldS1Paddr
           missSet   := ldS1Set
-          missMultiHot := ldS1MultiHot
+          if (fillForward) missMultiHot := ldS1MultiHot
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
@@ -2497,7 +2508,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missSet   := pSet
           // A write-allocate refill never produces a load response, but the flag must
           // not survive from an earlier load miss into this context.
-          missMultiHot := False
+          if (fillForward) missMultiHot := False
           missTag   := pTag
           missOff   := pendingStorePaddr(offBits - 1 downto 0)
           missSize  := Size.LONG
