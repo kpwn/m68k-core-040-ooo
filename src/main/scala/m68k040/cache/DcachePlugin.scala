@@ -470,6 +470,28 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
     val missSet   = Reg(UInt(setBits bits))
+    /** ── FILL-FORWARD CARVE-OUT: was this miss a MULTI-HOT fail-safe miss? ──────
+      * A duplicate-tag (multi-hot) S1 result forces a MISS on purpose
+      * (`OneHotSafe.exactlyOne`), and the duplicate is repaired by `dupPurgeFire`,
+      * which clears only the CLEAN matching ways and deliberately SPARES a DIRTY one
+      * (`DcacheMultiHotFailSafeSpec`: clearing it "would turn a read-side glitch into
+      * permanent, silent WRITE-side data loss"). So after such a miss a dirty way may
+      * still hold the only copy of a committed store, and the refill's own beat --
+      * `missLine`, straight from memory -- is STALE with respect to it.
+      *
+      * MEASURED, not anticipated: with fill-forward unconditional,
+      * `DcacheMultiHotFailSafeSpec`'s "the purge spares a DIRTY matching way" test
+      * returned 0x23282d32 where 0xcafebabe had been committed, and left TWO matching
+      * ways instead of one. The REPLAY relaunch that fill-forward replaces is what
+      * drives the repair to completion: it re-reads the set, purges the newly-allocated
+      * clean duplicate in turn, and ends on the way that actually holds the data.
+      *
+      * So fill-forward is suppressed for exactly this case and the miss takes the
+      * ordinary relaunch. The multi-hot path is a rare read-side fail-safe, so paying
+      * back the 2 cycles there costs nothing measurable -- and the alternative would be
+      * to answer from `missLine` without knowing whether a dirty duplicate exists,
+      * which cannot be known without the very array read fill-forward exists to skip. */
+    val missMultiHot = RegInit(False)
     val missTag   = Reg(UInt(tagBits bits))
     val missOff   = Reg(UInt(offBits bits))
     val missSize  = Reg(Size())
@@ -1917,6 +1939,40 @@ class DcachePlugin(val socketMerged: Boolean = false,
           }
       }
 
+      /** REPLAY's ORDINARY miss completion: re-launch the read for the just-filled
+        * line and resolve it as a guaranteed hit through S1 -> S2, delivering the
+        * response one cycle later via the ldS1 path. (No array WRITE here -- just a
+        * read relaunch -- so `refillWriteHold`, which guards the write port, does not
+        * apply.)
+        *
+        * Hoisted into a def because slice D1.2 gives REPLAY a second, FASTER completion
+        * (`fillFwdResp`) while the multi-hot carve-out (`missMultiHot`) still has to
+        * fall back to THIS one -- two callers, so it must not be duplicated. */
+      def replayRelaunch(): Unit = {
+        rdSet        := missSet
+        rdEn         := True
+        loadUsesPort := True
+        ldS1Valid    := True
+        ldS1Set      := missSet
+        ldS1Tag      := missTag
+        ldS1Off      := missOff
+        ldS1Size     := missSize
+        ldS1LineOnly := missLineOnly
+        ldS1Cmode    := missCmode
+        ldS1Paddr    := missPaddr
+        // THE RESPONSE IDENTITY, which this site used to inherit by accident. Every
+        // other S1 launch stamps it; this one did not, and was correct only because
+        // nothing else wrote `ldS1Token`/`ldS1Rid` between the miss and the replay --
+        // so they still held the missing load's own values. `hitUnderMissRead` breaks
+        // that accident by launching another read in between, so the identity is now
+        // stamped explicitly from the `miss*` copy captured at the miss.
+        ldS1Token    := missToken
+        ldS1Rid      := missRid
+        ldS1RidV     := missRidV
+        loadMissStoreBarrier := False
+        goto(IDLE)
+      }
+
       def hitUnderMissAccept(): Unit = if (hitUnderMiss) {
         // THE SHADOW IS NOT A BLANKET BLOCKER, it is a second older access to qualify.
         // It holds the command accepted on the miss edge, awaiting in-order replay, and
@@ -2285,6 +2341,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val vw = victim(ldS1Set)
           missPaddr := ldS1Paddr
           missSet   := ldS1Set
+          missMultiHot := ldS1MultiHot
           missTag   := ldS1Tag
           missOff   := ldS1Off
           missSize  := ldS1Size
@@ -2411,6 +2468,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val pTag = pendingStorePaddr(31 downto offBits + setBits)
           missPaddr := pendingStorePaddr
           missSet   := pSet
+          // A write-allocate refill never produces a load response, but the flag must
+          // not survive from an earlier load miss into this context.
+          missMultiHot := False
           missTag   := pTag
           missOff   := pendingStorePaddr(offBits - 1 downto 0)
           missSize  := Size.LONG
@@ -2771,38 +2831,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // cycle) is the idiom the write-allocate branch above already uses; dropping
           // the pulse instead would leave the LS EU waiting on a response forever,
           // which is the failure mode `humS1MissPark`'s comment records from a real hang.
-          when(!ldS2Resp) {
+          // SECOND CARVE-OUT: a multi-hot fail-safe miss must take the relaunch, because
+          // `missLine` (memory) may be stale against a spared DIRTY duplicate way. See
+          // `missMultiHot`'s declaration for the measured stale-data failure.
+          when(missMultiHot) {
+            replayRelaunch()
+          } elsewhen(!ldS2Resp) {
             fillFwdResp          := True
             loadMissStoreBarrier := False
             goto(IDLE)
           }
         } else {
-          // Re-launch the read for the just-filled line; resolve as a guaranteed hit
-          // into the response register one cycle later via the ldS1 path. (No array
-          // WRITE here — just a read relaunch — so `refillWriteHold`, which guards
-          // the write port, does not apply to this branch.)
-          rdSet        := missSet
-          rdEn         := True
-          loadUsesPort := True
-          ldS1Valid    := True
-          ldS1Set      := missSet
-          ldS1Tag      := missTag
-          ldS1Off      := missOff
-          ldS1Size     := missSize
-          ldS1LineOnly := missLineOnly
-          ldS1Cmode    := missCmode
-          ldS1Paddr    := missPaddr
-          // THE RESPONSE IDENTITY, which this site used to inherit by accident. Every
-          // other S1 launch stamps it; this one did not, and was correct only because
-          // nothing else wrote `ldS1Token`/`ldS1Rid` between the miss and the replay --
-          // so they still held the missing load's own values. `hitUnderMissRead` breaks
-          // that accident by launching another read in between, so the identity is now
-          // stamped explicitly from the `miss*` copy captured at the miss.
-          ldS1Token    := missToken
-          ldS1Rid      := missRid
-          ldS1RidV     := missRidV
-          loadMissStoreBarrier := False
-          goto(IDLE)
+          replayRelaunch()
         }
         }
       }
