@@ -240,6 +240,30 @@ level or its attribution, the SQ is exonerated and the search should move to the
 `pendDepth` (the lock-step `pendMem` replay ring) is derived from the same value so the
 two rings cannot desynchronise.
 
+## 5b. Gate results for `sqNarrowDrainMerge`
+
+* **`make test-fast`: 396 / 396, zero failures** (306 suites, 2 ignored) — the expected
+  count exactly. Note that `M68kSim` sets `includeSimulation`, so the slot-B equivalence
+  tripwire is live in every one of those 396 tests, not just in the store-focused ones.
+* **IPC A/B, `IPC_V2=1` (the shipped throughput-v2 profile), per kernel, two seeds:**
+
+| | kernels | differing | total window cycles OFF | ON | delta |
+|---|---:|---:|---:|---:|---:|
+| `IPC_SEED=1` | 34 | **0** | 616,383 | 616,383 | **0** |
+| `IPC_SEED=7` | 34 | **0** | 616,792 | 616,792 | **0** |
+
+  Bit-identical on every kernel including all twelve `-cb` variants, retired-instruction
+  counts included. That is the target, not a tolerance.
+* **Emitted-netlist verification of the two arms** (`GenFullCoreSynthVerilog`,
+  `M68kFullCoreSynth.v` line counts): master `aa312145` 421,433 / this branch OFF 421,433
+  / this branch ON 419,310. `diff master OFF` is the git-hash comment plus SpinalHDL's
+  line-number-derived signal names and nothing else, so the OFF arm is the parent design;
+  the ON arm is 2,123 lines smaller, which is the lever actually deleting RTL rather than
+  a flag that reads as set and does nothing.
+* Corpus (`PortedM68kOooSpec`, `ExecuteLockStepSpec`, OFF and ON, compared as failing SETS
+  name-for-name) — see the table appended below when it lands. Both are ~8 h per arm
+  because the harness elaborates and Verilator-compiles a fresh DUT per test.
+
 ## 6. Carry-forward
 
 1. **The SQ is 5% of socket_core's LUTs.** Its whole reducible content is ~12% of itself.
