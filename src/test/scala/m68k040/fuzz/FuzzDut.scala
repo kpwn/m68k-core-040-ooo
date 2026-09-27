@@ -141,6 +141,11 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.irqPreemptPendingIn := rob.logic.interruptPending || rob.logic.tracePendingFire
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
+    // SPECULATIVE load wakeup (idle unless the LS EU's `specLoadWakeup` is on). One
+    // cycle earlier than `wakeup` and a cache-hit PREDICTION; the IQ re-checks it
+    // against `wakeup` before any consumer reaches an EU.
+    iq.lsWakeupSpec.valid   := lsEu.wakeupSpec.valid
+    iq.lsWakeupSpec.payload := lsEu.wakeupSpec.payload
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
     iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
     lsEu.sqCommit.valid   := rob.logic.retire0
@@ -385,11 +390,16 @@ class FuzzCoreDut extends Component {
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
   val rob    = new RobPlugin
-  val iq     = new IssueQueuePlugin
+  // FUZZ_SPEC_WAKE=1 turns on speculative (cache-hit-predicted) load wakeup in BOTH the
+  // IQ and the LS EU. Env-read rather than a constructor parameter so the whole fuzz /
+  // lockstep corpus can be replayed against it unmodified -- that corpus is where a
+  // released-too-early consumer would show up as a real architectural divergence.
+  private val fuzzSpecWake = sys.env.get("FUZZ_SPEC_WAKE").contains("1")
+  val iq     = new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake)
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
-  val lsEu   = new LsEuPlugin
+  val lsEu   = new LsEuPlugin(specLoadWakeup = fuzzSpecWake)
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc

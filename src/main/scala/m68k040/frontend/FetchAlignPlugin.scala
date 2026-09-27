@@ -489,7 +489,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // `words.foreach(_ := 0)` default-drive on the line above, and `decode(0x0000).size`
     // is `Size.BYTE` (`ORI.B #imm,D0`). See ChunkPredecode.size.
     ibuf.io.push.payload.preds.foreach { p =>
-      p.simple := False; p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE
+      p.lenWords := 0; p.ambiguousLine := False; p.size := m68k040.isa.Size.BYTE
       // Fail-closed: an un-pushed predecode slot never enables a prediction.
       p.ctrlXfer := False }
     ibuf.io.push.payload.n := 0
@@ -855,7 +855,6 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
           when(U(j) < nWords) {
             val srcIdx = (startWord + U(j, 2 bits)).resize(2)
             ibuf.io.push.payload.words(j)                 := rspWords(srcIdx)
-            ibuf.io.push.payload.preds(j).simple          := rspPreds(srcIdx).simple
             ibuf.io.push.payload.preds(j).lenWords        := rspPreds(srcIdx).lenWords
             ibuf.io.push.payload.preds(j).ambiguousLine   := rspPreds(srcIdx).ambiguousLine
             // FMax Lever B: indexed by the SAME `srcIdx` as `words(j)` above, which is what
@@ -992,7 +991,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     spinal.core.sim.SimPublic(ftqDiff, ftqDelta, ftqNear, ftqAt0, spliceWords, availEff)
 
     val p0LiveReg = Reg(ChunkPredecode())
-    p0LiveReg.simple        init False
+    // `simple` is derived from `lenWords` now (see ChunkPredecode), so it has no reset of
+    // its own -- `lenWords init 0` already makes it read False out of reset.
     p0LiveReg.lenWords      init 0
     p0LiveReg.ambiguousLine init True    // reset state must never read as "already resolved"
     // `p0LiveReg.ctrlXfer` gets the SAME treatment as `.size` (see the task #250 note
@@ -1071,7 +1071,6 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // assign. `.size` is deliberately left undriven here (see the field's own comment
     // above): leaving `p0LiveClassified.size` unconsumed lets synthesis prune the whole
     // size-decode subtree of this `classify()` call along with the now-constant register.
-    p0LiveReg.simple        := p0LiveClassified.simple
     p0LiveReg.lenWords      := p0LiveClassified.lenWords
     p0LiveReg.ambiguousLine := p0LiveClassified.ambiguousLine
     // task #242: the content-immutability threshold widens from `cnt<4` to `cnt<7` to

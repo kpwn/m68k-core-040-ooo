@@ -143,6 +143,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       }
       iq.lsWakeup.valid   := lsEu.wakeup.valid
       iq.lsWakeup.payload := lsEu.wakeup.payload
+      // SPECULATIVE load wakeup (idle unless the LS EU's `specLoadWakeup` is on). One
+      // cycle earlier than `wakeup` and a cache-hit PREDICTION; the IQ re-checks it
+      // against `wakeup` before any consumer reaches an EU.
+      iq.lsWakeupSpec.valid   := lsEu.wakeupSpec.valid
+      iq.lsWakeupSpec.payload := lsEu.wakeupSpec.payload
       iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
       iq.lsNzvcWakeup.payload := lsEu.wakeupNzvc.payload
       lsEu.sqCommit.valid   := rob.logic.retire0
@@ -357,6 +362,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                       * explicitly here rather than taken from `ShippingCoreConfig`, per
                       * that file's rule that a bench must vary a knob by NAME. */
                     dcacheFillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
+                    specLoadWakeup: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -392,7 +398,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       pcRangeEnable = pcRangeEnable)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
-      loadBypassUnreadyLoad = loadBypassUnreadyLoad)
+      loadBypassUnreadyLoad = loadBypassUnreadyLoad,
+      specLoadWakeup = specLoadWakeup)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -402,7 +409,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
       earlyAutoAnWriteback = earlyAutoAnWriteback,
-      earlyStoreDataWake = earlyStoreDataWake)
+      earlyStoreDataWake = earlyStoreDataWake,
+      specLoadWakeup = specLoadWakeup)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

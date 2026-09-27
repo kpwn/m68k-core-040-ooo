@@ -28,7 +28,17 @@ object IcacheInstructionOrder {
   * unreachable length (same "ucEntry 5->6->7" width-growth precedent as the microcode
   * ROM). */
 case class ChunkPredecode() extends Bundle {
-  val simple   = Bool()
+  // `simple` is DERIVED, not stored. Every producer in PredecodeWord set it in lockstep
+  // with `lenWords` -- the ONLY `simple := False` in the file is the default, paired with
+  // the ONLY `lenWords := 0`, and all 74 other sites set True alongside a non-zero length.
+  // So `simple === (lenWords =/= 0)` holds by construction, and storing it was a wasted
+  // bit PER WORD in the BRAM-resident predecode record.
+  //
+  // WHY IT MATTERS MORE THAN ONE BIT: the unified fetch array carries, per way per beat,
+  // 256 instruction bits + PRED_BITS_PER_WORD * WORDS_PER_BEAT(16) predecode bits. At 9
+  // bits/word that is 256 + 144 = 400, which is PAST the measured BRAM width cliff; at 8
+  // it is exactly 384, the last free width. The bit was buying nothing and costing tiles.
+  def simple: Bool = lenWords =/= 0
   val lenWords = UInt(4 bits)
   // task #202 (I-cache-line-boundary predecode gap): True iff `simple`/`lenWords` were
   // computed by GUESSING (the "assume brief when unknown" fallback in PredecodeWord's

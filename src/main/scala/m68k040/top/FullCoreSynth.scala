@@ -391,6 +391,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // register), so consumers don't reach into the (now-pipelined) internal context.
     iq.lsWakeup.valid   := lsEu.wakeup.valid
     iq.lsWakeup.payload := lsEu.wakeup.payload
+    // SPECULATIVE load wakeup (idle unless the LS EU's `specLoadWakeup` is on). One
+    // cycle earlier than `wakeup` and a cache-hit PREDICTION; the IQ re-checks it
+    // against `wakeup` before any consumer reaches an EU.
+    iq.lsWakeupSpec.valid   := lsEu.wakeupSpec.valid
+    iq.lsWakeupSpec.payload := lsEu.wakeupSpec.payload
     // Dynamic NZVC wakeup: a completing NZVC-writing LS store (MOVE-to-mem) wakes a
     // flag-reader of its NZVC (e.g. a bit-op RMW µop). Mirrors the int load wakeup.
     iq.lsNzvcWakeup.valid   := lsEu.wakeupNzvc.valid
@@ -824,6 +829,11 @@ object GenFullCoreSynthVerilog {
         val eu0 = new AluEuPlugin
         val eu1 = new AluEuPlugin
         val branchEu = new BranchEuPlugin
+        // LS_SPEC_WAKE=1 requires the throughput pairing (`earlyIntWakeup` +
+        // `alignedLoadFallThrough`); a baseline-profile build silently ignores it rather
+        // than failing an unrelated suite's elaboration.
+        val specLoadWake = sys.env.get("LS_SPEC_WAKE").contains("1") &&
+          earlyLsIntWakeup && alignedLoadFallThrough
         val lsEu = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
           earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
           reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
@@ -833,7 +843,11 @@ object GenFullCoreSynthVerilog {
           // Env-read for the same reason as IQ_LOAD_BYPASS -- validating it must not
           // require editing every correctness suite. Default OFF.
           earlyAutoAnWriteback = sys.env.get("LS_EARLY_AN").contains("1"),
-          earlyStoreDataWake = earlyStoreDataWake)
+          earlyStoreDataWake = earlyStoreDataWake,
+          // LS_SPEC_WAKE=1: speculative (cache-hit-predicted) load wakeup. Env-read for
+          // the same reason as IQ_LOAD_BYPASS / LS_EARLY_AN -- validating it must not
+          // require editing every correctness suite. Default OFF.
+          specLoadWakeup = specLoadWake)
         val divEu = new DivEuPlugin
         new M68kCore(Seq[FiberPlugin](
           new ParamPlugin(p),
@@ -868,7 +882,8 @@ object GenFullCoreSynthVerilog {
           // suite. Default OFF: unset leaves the shipped core bit-identical.
           new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
             earlyAutoStoreAddress = earlyAutoStoreAddress,
-            loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1")),
+            loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1"),
+            specLoadWakeup = specLoadWake),
           eu0, eu1, branchEu, lsEu, divEu,
           new RegFilePluginInt(),
           new RegFilePluginNzvc(),
