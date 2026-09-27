@@ -15,3 +15,7 @@ removed 5,048 LUT with zero IPC cost.
 |---|---|---:|---:|---:|---:|---:|---|
 | 09-27 | br0 (baseline) | 144831 | 94972 | 90798 | 172 | 0.023 | master+track5, both branch flags OFF |
 | 09-27 | br5 | 146001 | 95813 | 90785 | 172 | 0.039 | +computeDirectTargets +deferSlot1Uncond |
+| 09-27 | icpf | 147124 | 96979 | 91284 | 172 | 0.050 |  |
+| 09-27 | lsw0 | 146118 | 95919 | 90827 | 172 | 0.079 |  |
+| 09-27 | lsw1 | 145315 | 95176 | 90864 | 172 | 0.005 | SPEC_LOAD_WAKEUP=1 |
+| 09-27 | ras1 | 147008 | 96855 | 90861 | 172 | 0.057 | CPU_RAS_BRANCH_REPAIR=1 |

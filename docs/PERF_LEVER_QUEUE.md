@@ -88,6 +88,8 @@ FFs flat.
 | 8 | `alignedDone` → `alignedEarlyWbFire` | ⛔ **DEAD** | captured its bucket exactly (+524 grants = 528 OoO writebacks); gap≥2 across all 14 kernels **~3,900 → ~30**; cycles **bit-identical at both seeds**. With lever 6 the announce now reaches W−1 for essentially every hit — **the ceiling — and nothing moves.** |
 | 9 | BRAM as an implicit mux | 🔄 in flight | 10,322 LUTRAM in the core against 36 RAMB36; constraint is read latency, not storage |
 | — | LS OoO park + recovery | ✅ **gated 396/396**, `68a89f88` | `orderRedirects` **0 → 7**, ~20.9 cyc each, **cost ONE flop bit**; lock-step reds 22 → 17. ⛔ the relaxation itself is still blocked by a **third pre-existing** corpus defect |
+| 11 | store-queue congestion (`sqNarrowDrainMerge`) | ✅ **gated 396/396**, `59ecd9a0` | ~400 LUT, **2,123 RTL lines deleted**; IPC **bit-identical, 34 kernels x 2 seeds**; corpus + lock-step identical name-for-name. ⛔ **module CEILING reached** — the whole SQ is 4,722 LUT ~ 5% of socket_core, so nothing confined to it can move congestion level 5 |
+| 12 | PRF write/read port merge (`PINS_PRF_FMAN_SHARE` + `PINS_PRF_SLOWREAD`) | ✅ **gated 396/396 both arms** | crosses the LVT `coreCount` step **only in combination**: 96 -> **80 cells (-21.6%)**, **-1,112..-1,168 LUTRAM**. FMAN deletes one of six write-address broadcasts outright = **-16.7% of the `ADDRH` sink pins** |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -207,9 +209,18 @@ Reopened on the fanout claim, then measured at 200 MHz with congestion reports:
 arm.** The change cuts IQ fanout in a block that is not congested. Level stays 5; the
 hotspot just moves. Dead on both counts — do not revisit.
 
-✅ **Carry-forward: the congestion lives in the STORE QUEUE** (`LsEuPlugin_logic_sq`,
-in every congested window of both arms, share growing 16% → 32%). That is where to
-look if congestion is ever the target.
+⛔ **Carry-forward CORRECTED 2026-09-27.** The store queue is in every congested window,
+but module share is an **upper bound**, not an attribution: the widest net inside it is
+`qLineB` at **≤32 sinks/bit**, while `ADDRH[0..5]` at **971 fanout** — the net actually
+visible in those windows — belongs to the **integer PRF**, not the SQ. The SQ's registers
+do check out as its own (1,710 predicted vs 1,713 measured), and its address-compare
+matrix is 20.2% of the module against the age network's ~3.8%, so **banking is impossible**
+(ring position *is* program order). Whether shrinking the module moves congestion at all
+is **still being measured** — the `SQ_DEPTH=4` calibration arm is in placement; the
+structural argument (4,722 LUT ~ 5% of socket_core) says it cannot, but that is arithmetic,
+not a result. The two real targets are the **integer PRF** (9,957 LUT, 4,584 LUTRAM,
+~10% of the device, ~5,800 sink pins — lever 12) and the **`DStoreCmd` merge payload**
+(**−117 wires between two blocks that both appear in congested windows**).
 
 ## Measured DEAD — do not revisit
 
