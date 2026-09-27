@@ -539,7 +539,19 @@ trait CoreBenchHarness extends AnyFunSuite {
       captureIssueCandidates: Int = 0,
       captureLoadOpportunities: Int = 0,
       captureLoadOverlaps: Int = 0,
-      queuedStoreAdmissions: Int = 0
+      queuedStoreAdmissions: Int = 0,
+      // ── D-cache LOAD miss census (window-sliced) ─────────────────────────────
+      // `dcLoadMisses` counts cycles of `ldS1Valid && !ldS1Hit`, which is the very term
+      // that TRIGGERS a refill, so it is a real miss count. `dcLoadLookups` counts
+      // `ldS1Valid` and is NOT the load count: an EARLY-PROBE hit satisfies a load with
+      // `useEarlyProbe = earlyProbeHit && !ldS1Valid` and never reaches S1, so the S1
+      // lookup stream is only the loads that took the ordinary read path. Use
+      // `ldCmdAddrs.size` (accepted loads) as the denominator; `dcLoadLookups` is kept
+      // only so the two populations can be told apart. A cache-RESIDENT benchmark must
+      // show misses near zero over its measured window -- if it does not, the kernel is
+      // measuring cold refills instead of the recurrence it claims.
+      dcLoadLookups: Int = 0,
+      dcLoadMisses: Int = 0
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -694,6 +706,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       val ldRefillSameLine = ArrayBuffer.empty[Int]
       var lastAcceptedLine = -1L
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
+      // Per-cycle D-cache load tag-compare outcome, kept as parallel per-cycle streams
+      // so they can be sliced by the SAME steady-state window the IPC number uses.
+      val dcLdLookupHisto = ArrayBuffer.empty[Boolean]
+      val dcLdMissHisto   = ArrayBuffer.empty[Boolean]
       val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
       var firstCommitCycle = -1L
       var lastCommitCycle  = -1L
@@ -1254,6 +1270,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
+        val ldLookup = dut.dcache.logic.ldS1Valid.toBoolean
+        dcLdLookupHisto += ldLookup
+        dcLdMissHisto   += (ldLookup && !dut.dcache.logic.ldS1Hit.toBoolean)
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -1534,7 +1553,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         captureIssueHisto.slice(lo, hi + 1).count(_._1),
         captureIssueHisto.slice(lo, hi + 1).count(_._2),
         captureIssueHisto.slice(lo, hi + 1).count(_._3),
-        queuedAdmissionHisto.slice(lo, hi + 1).count(identity))
+        queuedAdmissionHisto.slice(lo, hi + 1).count(identity),
+        dcLdLookupHisto.slice(lo, hi + 1).count(identity),
+        dcLdMissHisto.slice(lo, hi + 1).count(identity))
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
@@ -2100,5 +2121,234 @@ trait CoreBenchHarness extends AnyFunSuite {
     //   leaf-rts] = 8 * iters.
     Kernel("call-return", src, setup.size + iters * 8)
   }
+
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Track 6 — strcmp: a byte LOAD -> COMPARE -> CONDITIONAL BRANCH recurrence
+  // ══════════════════════════════════════════════════════════════════════════════
+  // The board's Dhrystone window spends ~52% of its cycles with the ROB non-empty
+  // and nothing retiring while the D-cache stalls only 0.83% (dc-miss 1.17/kinst),
+  // i.e. the loads HIT and the machine is waiting on LATENCY, not on memory. PC
+  // sampling put 14 of 40 samples in one 60-byte window, which disassembled to a
+  // byte-at-a-time strcmp:
+  //
+  //     tstb  %a2@              <- LOAD
+  //     bnes  .Lnext
+  //     ...                     (equal-and-NUL exit)
+  //   .Lnext:
+  //     addql #1,%a2
+  //     addql #1,%a3
+  //     moveb %a2@,%d0          <- LOAD
+  //     cmpb  %a3@,%d0          <- LOAD + COMPARE, consumes d0
+  //     beqs  .Ltop             <- BRANCH, consumes the compare
+  //
+  // This suite had NOTHING of that shape: a mechanical sweep of the whole bench
+  // package finds exactly ONE compare, `cmp.l %d6,%d0`, with a REGISTER source, and
+  // the only byte traffic is `move.b (%a2)+,(%a3)+` -- strcpy, not strcmp. So the
+  // per-iteration recurrence
+  //     pointer increment -> LOAD -> ALU compare -> conditional branch -> increment
+  // was unrepresented, and so was the ALU-class consumer of a load: in
+  // `cmp.b (%a3),%d0` the consumer of the cracked load is the CMP, not an address.
+  //
+  // The kernels below reproduce that loop, its rotation, and its two taken branches
+  // per iteration. They are LOAD-ONLY (no stores at all), so `copybackDtt` cannot
+  // change what they measure through the precise-store path -- the `-cb` variants
+  // exist so the posture is stated rather than assumed, and both are reported.
+  //
+  // Opt-in via IPC_STRCMP_KERNELS=1 so the default IpcBenchSpec aggregate stays
+  // byte-identical to every earlier run.
+
+  private val StrcmpPairs     = 64      // distinct string pairs in the table
+  // TWO passes over the SAME table. The first is entirely inside `warmupInstrs`, so by
+  // the time the measured window opens every string line AND every pointer-table line
+  // has been touched once and the run is cache-RESIDENT -- which is the board's regime
+  // (dc-miss 1.17/kinst, dc-stall 0.83%). Measured over a single pass instead, the
+  // window pays ~100 COMPULSORY refills for first-touching its own data, which is not
+  // what the board does and would have made this a memory benchmark.
+  private val StrcmpPasses    = 2
+  private val StrcmpSlotBytes = 13      // bytes reserved per string (unaligned stride)
+  private val StrcmpAStr      = 0x00003000L
+  private val StrcmpBStr      = 0x00003400L
+  private val StrcmpTable     = 0x00003800L
+  private val StrcmpConst     = 0x41    // the constant byte the matched control compares against
+  private val StrcmpFiller    = 0x2e
+
+  /** The pair table: two NUL-capable byte images per pair.
+    *
+    *  - mode "mem" / "reg": string B is a buffer of ONE REPEATED BYTE (`StrcmpConst`).
+    *    That is what makes an EXACT control possible: comparing `s[k]` against `B[k]`
+    *    and comparing `s[k]` against a register holding the same constant produce the
+    *    SAME flags, so the two kernels retire the same instructions in the same order
+    *    with the same branch outcomes, and the memory operand on the compare is the
+    *    ONLY difference. (Constant DATA changes nothing microarchitecturally: the load
+    *    is a real byte load through a real incrementing pointer over its own lines.)
+    *  - mode "pair": both strings vary and one pair in five is fully equal, so the
+    *    NUL-exit path through `tst.b (%a2)` runs too. No exact control exists for this
+    *    one; it is the realism/branch-behaviour reference.
+    *
+    * First-difference positions come from a fixed LCG rather than a short cycle, so
+    * the exit branch is not learnable by a bounded global history. */
+  private def strcmpData(mode: String): Vector[(Vector[Int], Vector[Int])] = {
+    var x = 0x13579bdfL
+    def next(n: Int): Int = { x = (x * 1103515245L + 12345L) & 0x7fffffffL; ((x >>> 9) % n).toInt }
+    val out = ArrayBuffer.empty[(Vector[Int], Vector[Int])]
+    for (_ <- 0 until StrcmpPairs) {
+      val m = 2 + next(11)                       // first-difference / NUL index, 2..12
+      val equalPair = mode == "pair" && next(5) == 0
+      if (mode == "pair") {
+        val prefix = Vector.tabulate(m)(_ => 0x21 + next(0x5d))   // never 0
+        if (equalPair) {
+          val s = prefix :+ 0
+          out += ((s, s))
+        } else {
+          val av = prefix :+ (0x21 + next(0x5d))
+          val delta = 1 + next(0x10)
+          val bLast = if (av(m) + delta <= 0xfe) av(m) + delta else av(m) - delta
+          out += ((av, prefix :+ bLast))
+        }
+      } else {
+        // The differing byte straddles the constant in BOTH directions so `bcs`
+        // (the sign leg) is itself data-dependent and not learnable either.
+        val diff = if (next(2) == 0) StrcmpConst - (1 + next(0x20))
+                   else              StrcmpConst + (1 + next(0x20))
+        out += ((Vector.fill(m)(StrcmpConst) :+ diff,
+                 Vector.fill(StrcmpSlotBytes)(StrcmpConst)))
+      }
+    }
+    out.toVector
+  }
+
+  /** EXACT architectural trace of one pair through the loop below: retired macro
+    * count and the d3 result the kernel must leave behind. Written as an interpreter
+    * over the very same control flow, not as a closed-form formula, so the count the
+    * harness runs to cannot silently drift from the assembly. */
+  private def strcmpPairTrace(a: Vector[Int], b: Vector[Int]): (Int, Int) = {
+    var n = 4                     // movea, movea, lea, bra .LscNext
+    var k = 0
+    var res = 0
+    var done = false
+    while (!done) {
+      n += 5                      // addq, addq, move.b, cmp, beq
+      if (a(k) != b(k)) {
+        n += 3                    // move.b, cmp, bcs
+        if (a(k) < b(k)) { n += 1; res = -1 }   // bcs TAKEN  -> moveq #-1,%d3
+        else             { n += 2; res =  1 }   // moveq #1,%d3 ; bra .LscOut
+        done = true
+      } else {
+        n += 2                    // tst.b (%a2) ; bne
+        if (a(k) == 0) { n += 2; res = 0; done = true }  // moveq #0,%d3 ; bra .LscOut
+        else k += 1
+      }
+    }
+    n += 3                        // add.l %d3,%d2 ; subq.l #1,%d7 ; bne.w .LscPair
+    (n, res)
+  }
+
+  /** The loop, in the board's rotation: the NUL test at the top, the two pointer
+    * increments and the memory-operand compare at the bottom, both branches TAKEN on
+    * a continuing iteration. `mode == "reg"` is the matched control: the compare's
+    * source is a register instead of `(%a3)`, the pointer increment on %a3 is KEPT so
+    * the instruction sequence and the address arithmetic are unchanged, and the only
+    * thing that goes away is the load the compare depends on.
+    *
+    * What that control does NOT remove: `move.b (%a2),%d0` still feeds the compare, so
+    * an ALU consumer of a load survives in the control too. The mem/reg delta is
+    * therefore the cost of the COMPARE'S OWN memory operand -- the second load in the
+    * iteration, and the compare having to wait on two producers instead of one -- not
+    * the whole load-to-ALU-use cost. Read it as the marginal term, not as a zero. */
+  private def strcmpSrc(mode: String): String = {
+    val cmp = if (mode == "reg") "cmp.b %d1,%d0" else "cmp.b (%a3),%d0"
+    val setup = Seq("moveq #0,%d2", f"moveq #0x$StrcmpConst%x,%%d1",
+                    s"moveq #$StrcmpPasses,%d6")
+    val body = Seq(
+      f".LscPass: lea 0x$StrcmpTable%x,%%a4",
+      s"moveq #$StrcmpPairs,%d7",
+      ".LscPair: movea.l (%a4),%a2",     // pre-decremented source pointer
+      "movea.l 4(%a4),%a3",              // pre-decremented compare pointer
+      "lea 8(%a4),%a4",
+      "bra.s .LscNext",
+      ".LscTop: tst.b (%a2)",            // LOAD -> branch (the NUL test)
+      "bne.s .LscNext",
+      "moveq #0,%d3",
+      "bra.s .LscOut",
+      ".LscNext: addq.l #1,%a2",
+      "addq.l #1,%a3",
+      "move.b (%a2),%d0",                // LOAD
+      cmp,                               // LOAD + COMPARE, consumes d0
+      "beq.s .LscTop",                   // BRANCH, consumes the compare
+      "move.b (%a2),%d0",                // mismatch tail: recover the sign
+      cmp,
+      "bcs.s .LscNeg",
+      "moveq #1,%d3",
+      "bra.s .LscOut",
+      ".LscNeg: moveq #-1,%d3",
+      ".LscOut: add.l %d3,%d2",
+      "subq.l #1,%d7",
+      "bne.w .LscPair",
+      "subq.l #1,%d6",
+      "bne.w .LscPass")
+    (setup ++ body).mkString(" ; ") +
+      " ; .LscStop: bra.s .LscStop ; .rept 64 ; nop ; .endr"
+  }
+
+  /** `mode` is "mem" (memory-operand compare), "reg" (the matched register-operand
+    * control) or "pair" (both strings real, NUL exits included). */
+  def kStrcmp(mode: String, copyback: Boolean): Kernel = {
+    require(Set("mem", "reg", "pair").contains(mode), s"bad strcmp mode $mode")
+    val data    = strcmpData(mode)
+    val traces  = data.map { case (a, b) => strcmpPairTrace(a, b) }
+    val setupN  = 3                                   // moveq d2, moveq d1, moveq d6
+    val passN   = 2 + traces.map(_._1).sum + 2        // lea/moveq d7 ... subq d6/bne
+    val total   = setupN + StrcmpPasses * passN
+    val warmup  = setupN + passN                      // the whole first (warming) pass
+    val results = Vector.fill(StrcmpPasses)(traces.map(_._2)).flatten
+    val name    = s"strcmp-$mode${if (copyback) "-cb" else ""}"
+    Kernel(name, strcmpSrc(mode), total,
+      copybackDtt = copyback,
+      zeroFillData = true,
+      warmupInstrs = warmup,
+      prepMem = m => {
+        for (i <- 0 until StrcmpPairs) {
+          val (a, b) = data(i)
+          val aAddr = StrcmpAStr + i * StrcmpSlotBytes
+          val bAddr = StrcmpBStr + i * StrcmpSlotBytes
+          for (j <- 0 until StrcmpSlotBytes) {
+            m.dmem.pokeByte(aAddr + j, if (j < a.size) a(j) else StrcmpFiller)
+            m.dmem.pokeByte(bAddr + j, if (j < b.size) b(j) else StrcmpFiller)
+          }
+          // The loop increments BEFORE its first load, so the table holds ptr-1.
+          for ((base, ptr) <- Seq(0 -> (aAddr - 1), 4 -> (bAddr - 1)))
+            for (byte <- 0 until 4)
+              m.dmem.pokeByte(StrcmpTable + i * 8 + base + byte,
+                ((ptr >> (8 * (3 - byte))) & 0xff).toInt)
+        }
+      },
+      // ARCHITECTURAL check, not a retire count: `runKernel` stops after N macros
+      // WHATEVER THEY ARE, so a vanished branch can leave the count intact. d3 carries
+      // one -1/0/+1 per pair and d2 their running sum, so the full write streams of
+      // both pin every load, every compare outcome and every branch decision.
+      verifyRetirement = obs => {
+        def writes(reg: Int): Seq[Long] =
+          obs.filter(o => o.archRegValid && o.archRegId == reg).map(_.archRegWrite & 0xffffffffL)
+        val d3 = writes(3)
+        val want3 = results.map(_.toLong & 0xffffffffL)
+        assert(d3.size == want3.size,
+          s"[$name] d3 produced ${d3.size} pair results, expected ${want3.size} " +
+          "-- the loop structure changed, not just its timing")
+        assert(d3 == want3, s"[$name] pair result stream differs:\n  got  $d3\n  want $want3")
+        val d2 = writes(2)
+        val want2 = results.scanLeft(0)(_ + _).map(_.toLong & 0xffffffffL)
+        assert(d2 == want2, s"[$name] accumulator stream differs:\n  got  $d2\n  want $want2")
+      },
+      profileRetirement = true)
+  }
+
+  /** Opt-in (IPC_STRCMP_KERNELS=1) strcmp coverage kernels: the faithful shape, its
+    * exactly matched register-operand control, and the fully varied both-strings-real
+    * variant -- each in the default and the COPYBACK posture. */
+  def strcmpKernels: Seq[Kernel] =
+    for (copyback <- Seq(false, true); mode <- Seq("mem", "reg", "pair"))
+      yield kStrcmp(mode, copyback)
+
 
 }

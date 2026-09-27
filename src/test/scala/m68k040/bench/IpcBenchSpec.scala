@@ -70,7 +70,11 @@ class IpcBenchSpec extends CoreBenchHarness {
       kDhrystone(copyStyle = "byteX4", copyback = true),
       kDhrystone(copyStyle = "byteDispX4", copyback = true),
       kDhrystone(copyStyle = "byteLdIncX4", copyback = true),
-      kDhrystone(copyStyle = "byteStIncX4", copyback = true))
+      kDhrystone(copyStyle = "byteStIncX4", copyback = true)) ++
+      // IPC_STRCMP_KERNELS=1 appends the Track 6 strcmp kernels (load -> compare ->
+      // conditional branch, the shape the board spends its retire stall in and this
+      // suite had none of). Opt-in, so the default aggregate stays byte-identical.
+      (if (sys.env.get("IPC_STRCMP_KERNELS").contains("1")) strcmpKernels else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
