@@ -199,8 +199,13 @@ width efficiency before widening anything into a tile.
   never the head of a dependence chain through its address. `frame-loads-a6` hits IPC
   1.000. ROM is 31.4% A7/A6-relative and it still cannot pay.
 - **ALU-class speculative wakeup** — flat on 14 kernels AND on the strcmp shape.
-- **Age-matrix IQ** — area-neutral; compaction costs zero logic, `OHMasking.first` is
-  ~32 LUT. The case is fanout (2,746 → 994), not area.
+- **Age-matrix IQ** — **MEASURED +3,487 LUT (+2.25%)** in a controlled synth A/B
+  (154,764 → 158,251 fpga_top; socket_core +3,485; FF +406 vs the predicted +378).
+  The track predicted "a wash to maybe a few hundred better" and was wrong by ~3,500
+  LUT: **elaboration flop-counting does not predict LUT cost.** The surviving fanout
+  argument (`push.fire` 2,746 → 994) would have to be worth 3,487 LUT in routed WNS,
+  which is not demonstrable on a design where neither WNS metric attributes a sub-0.5 ns
+  change. IPC was bit-identical, so nothing is lost by dropping it.
 - **BTB capacity growth** — `br-cap-fit` FITS the BTB and still mispredicted 27%;
   ~88% of that was slot-1 coverage, not capacity.
 - **Route-directive sweep** — every alternative worse than `AggressiveExplore`
