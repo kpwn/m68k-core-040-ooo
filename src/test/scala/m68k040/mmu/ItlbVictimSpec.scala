@@ -162,6 +162,84 @@ class ItlbVictimSpec extends AnyFunSuite {
       f"promote returned 0x${on.retouchPpn}%x, the walk returned 0x${off.retouchPpn}%x")
   }
 
+  test("ITLB victim buffer: 30 pages cycled through one 4-way row -- every promote returns its OWN translation", VerilatorTest) {
+    // One promote proves the wiring; it does not prove the ADDRESSING. This walks 40
+    // distinct pages through the same 4-way row so the 32-slot ring wraps more than once,
+    // and checks the PPN on every access. A decoder or ring-pointer error that a single
+    // promote cannot see -- one slot shadowing another, a write landing in the wrong slot,
+    // the FIFO pointer not wrapping -- shows up here as a wrong PPN, not as a slow walk.
+    // 40 VPNs all congruent to 0 mod 8 (so key[2:0] == 0 and they all index row 0), laid
+    // out as 5 pointer-table slots x 8 page-table slots. The stride MUST cross pointer
+    // slots: `pageIdx` is only 6 bits, so a flat stride of 8 wraps after 8 pages and five
+    // of these VPNs would silently share one descriptor slot -- which is exactly what the
+    // first cut of this test did, and it read back another page's PPN on the very first
+    // access.
+    // ⚠️ N MUST FIT in 4 array ways + 32 buffer slots. A cyclic scan of 40 distinct pages
+    // over 36 entries under FIFO/round-robin is the classic pathological case and produces
+    // ZERO promotes -- every entry is evicted exactly one access before it is needed again.
+    // Measured here at N=40: 0 promotes, 120 walks. That is a real property of the
+    // structure, not a defect, and it is also why the buffer pays so well on the Finder
+    // idle loop (a conflict-heavy working set that FITS) and much less on boot.
+    val N = 30
+    val vs = (0 until N).map(i => 0x400L + (i % 8) * 8 + (i / 8) * 64)
+    val ps = (0 until N).map(i => 0x6000L + i)
+    assert(vs.distinct.size == N, "the stress VPNs must be distinct")
+    assert(vs.forall(v => (v & 7) == 0), "every stress VPN must index row 0")
+    var walks = 0; var promotes = 0; var accesses = 0
+    SimConfig.withVerilator.compile(new Dut(32)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new DcacheClientMemAgent(dut.walkPort, cd)
+      dut.probe.logic.reqIn.valid #= false
+      dut.probe.logic.reqIn.vpn #= 0
+      dut.probe.logic.reqIn.write #= false
+      dut.probe.logic.reqIn.supervisor #= true
+      dut.probe.logic.accessRobId #= 0
+      dut.probe.logic.commitValid #= false
+      dut.probe.logic.commitId #= 0
+      dut.probe.logic.flush #= false
+      dut.probe.logic.pflusha #= false
+      cd.waitSampling(4)
+      // One page table per pointer slot (64 entries x 4 B = 0x100 bytes apart).
+      for (i <- 0 until N) {
+        val va = vs(i) << 12
+        pokeWord(mem, ROOT + rootIdx(va) * 4, (PTRT & 0xfffffff0L) | 0x3L)
+        val pagT = PAGT + (i / 8) * 0x100
+        pokeWord(mem, PTRT + ptrIdx(va) * 4, (pagT & 0xfffffff0L) | 0x3L)
+        pokeWord(mem, pagT + pageIdx(va) * 4, ((ps(i) << 12) & 0xfffff000L) | 0x1L)
+      }
+      dut.ctrl.logic.mmuEnable #= true
+      dut.ctrl.logic.urp #= ROOT
+      dut.ctrl.logic.srp #= ROOT
+      cd.waitSampling(2)
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.probe.logic.walkStart.toBoolean) walks += 1
+          if (dut.itlb.logic.vic.promote.toBoolean) promotes += 1
+        }
+      }
+      // Three passes: pass 1 is all compulsory, passes 2 and 3 must hit the array or be
+      // promoted out of the buffer -- never mistranslated.
+      for (pass <- 0 until 3; i <- 0 until N) {
+        val (ppn, fault) = lookupUntilReady(dut, cd, vs(i))
+        accesses += 1
+        assert(!fault, s"pass $pass page $i faulted")
+        assert(ppn == ps(i),
+          f"pass $pass page $i (vpn 0x${vs(i)}%x): got ppn 0x$ppn%x, want 0x${ps(i)}%x")
+      }
+    }
+    assert(accesses == 3 * N, s"expected ${3 * N} accesses, saw $accesses")
+    // The buffer must actually have been exercised -- and the ring must have wrapped, so
+    // more promotes than it has slots.
+    assert(promotes > 32,
+      s"expected more promotes than the ring has slots (>32), saw $promotes")
+    // And it must have saved real walks: 40 pages through 4 ways + 32 buffer slots means
+    // 3 passes cannot possibly cost 3*40 walks.
+    assert(walks < 3 * N, s"expected fewer than ${3 * N} walks, saw $walks")
+    info(s"$N-page ring stress: ${3 * N} accesses, $walks walks, $promotes promotes")
+  }
+
   test("ITLB victim buffer: PFLUSHA clears it -- a promote must not survive a flush", VerilatorTest) {
     // The buffer is a third cache of the same page-table descriptors (array, sticky
     // walk-result latch, buffer). PFLUSHA clears the first two; if it did not clear the
