@@ -44,6 +44,29 @@ import spinal.core.sim._
   * ⚠ IPC_MEM DEFAULTS TO ZERO-LATENCY IDEAL MEMORY. Under that model a forced miss
   * costs almost nothing, so the sweep measures the cache's own occupancy cost and
   * not a memory stall. Always state which memory model a number came from.
+  *
+  * ── WHAT THE FIRST SWEEP FOUND (2026-09-27, IPC_MEM=l2, 2 seeds) ─────────────
+  * THE CALIBRATION, on `chase-128` (the one kernel whose footprint is large enough
+  * for the requested percentage to be delivered): requested 2% -> 2.6 D-misses/kI,
+  * 5% -> 5.2, 10% -> 12.2, 20% -> 27.8, 40% -> 72.9, 70% -> 168.8, 100% -> 332.5,
+  * from a baseline of ZERO. So on that kernel D≈6% reproduces the board's Dhrystone
+  * window (8.2/kI) and D≈18% reproduces the board's real OS workload (24.4/kI). The
+  * I side needs a much larger percentage for the same rate because it depends on the
+  * loop's CODE footprint: I≈40-55% lands on the board's 23.9-32.2/kI.
+  *
+  * THE D-SIDE NEVER OVERLAPS TWO MISSES. Mean AXI reads outstanding on the D bus is
+  * 1.000, and the MAXIMUM is 1, at EVERY rate up to 100% injection, on every kernel,
+  * on both the baseline and the shipped throughput-v2 profile. That is not a
+  * measurement artefact, it is `DcachePlugin`'s one refill MSHR (`AxiIds.dRefill`
+  * reserves 0..3 and says "only 0 is used while N_MSHR == 1"). Any lever whose
+  * mechanism is "overlap this miss with that one" therefore has NOTHING to overlap
+  * with on the D side today, at any miss rate. Read that before costing one.
+  *
+  * THE I SIDE DOES OVERLAP -- AND INJECTION DESTROYS IT. I-side MLP is 1.9-3.2 with
+  * five MSHR slots, and it FALLS towards 1.1 as the I-miss rate rises: the overlap
+  * comes from the next-line prefetcher running ahead, and demand misses crowd it out
+  * of its slots. So an I-side lever measured on a clean bench is measured in the one
+  * regime where the prefetcher has room.
   */
 class MissInjectionSweepSpec extends CoreBenchHarness {
 
