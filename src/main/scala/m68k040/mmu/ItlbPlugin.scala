@@ -82,6 +82,14 @@ import spinal.lib.misc.plugin.FiberPlugin
   * same as LRU at every size (2.677 vs 2.676 at 32), so the buffer keeps no age state
   * at all: one ring pointer.
   *
+  * ⚠️ PER PHASE, because the aggregate rests on one of them: Finder idle 17.887 -> 1.198
+  * (**-93.3%**), Finder launch 6.254 -> 4.739 (-24.2%), boot 3.473 -> 2.942 (-15.3%).
+  * That spread is mechanism: PFLUSHA flushes this buffer with the array, so where PFLUSHA
+  * is frequent (boot 150/Minst, launch 264/Minst) most walks are flush refills it cannot
+  * help, and where it is rare (idle, 38/Minst) the walks are conflict-dominated and it
+  * removes nearly all of them. The value is concentrated in steady-state interactive
+  * behaviour.
+  *
   * ARCHITECTURALLY INVISIBLE, AND UNLIKE A PREFETCH IT HAS NO U-BIT PROBLEM. Every
   * entry here was installed by a real demand walk that already performed its table
   * search and set U in memory; promoting it back is a cache-to-cache move, not a

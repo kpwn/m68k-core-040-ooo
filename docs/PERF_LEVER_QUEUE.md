@@ -148,7 +148,7 @@ FFs flat.
 | 12 | PRF write/read port merge (`PINS_PRF_FMAN_SHARE` + `PINS_PRF_SLOWREAD`) | ✅ **gated 396/396 both arms** | crosses the LVT `coreCount` step **only in combination**: 96 -> **80 cells (-21.6%)**, **-1,112..-1,168 LUTRAM**. FMAN deletes one of six write-address broadcasts outright = **-16.7% of the `ADDRH` sink pins** |
 | 13 | slot-1 coverage completion (DBcc / FBcc / BRA.L) | 🔄 in flight | `slot1WouldUncond` misses **7.26% of ROM control transfers**; DBcc is 3.41% STATIC and far higher dynamic (loop-closing). ⛔ RTD/RTE deliberately excluded — slot 0 cannot predict them either, so deferral costs a slot and buys nothing |
 | 14 | explicit `DBcc` loop predictor (owner, 2026-09-27) | 📋 QUEUED — **gated behind #13** | **80.8% of ROM DBcc are `DBF`/`DBT`: pure counted loops, outcome is the counter alone.** Removes the once-per-loop EXIT mispredict gshare cannot get |
-| 15 | **ITLB victim buffer** (`ITLB_VICTIM=32`) | ✅ **BUILT, gated 396/396 both arms**, default OFF | trace-driven on real 7.5.3: **10.25 ITLB walks/kinst**, 73.9% of them capacity/conflict; a 32-entry FIFO victim buffer removes **−73.9%**, which IS the infinite-ITLB floor. OFF netlist **byte-identical**; ON adds **~1,509 flop bits**. Worth **2.2-4.0% of cycles** on boot/Finder and **exactly nothing on Dhrystone** (0.061 walks/kinst there) |
+| 15 | **ITLB victim buffer** (`ITLB_VICTIM=32`) | ✅ **BUILT, gated 396/396 both arms**, default OFF | trace-driven on real 7.5.3: **10.25 ITLB walks/kinst**, 73.9% of them capacity/conflict; a 32-entry FIFO victim buffer removes **−73.9%** aggregate = the infinite-ITLB floor, but **−93.3% on Finder IDLE** vs only −15/−24% on boot/launch (PFLUSHA flushes the buffer too). OFF netlist **byte-identical**; ON adds **~1,509 flop bits**. Worth **2.2-4.0% of cycles** and **exactly nothing on Dhrystone** (0.061 walks/kinst there) |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -293,9 +293,25 @@ instructions:
 | 32e + 48-entry victim buffer | 2.672 | −74% (saturated) |
 | 128e/4w/2b RR == infinite ITLB | 2.672 | −74% |
 
-Per phase, shipping geometry: boot **3.47**, Finder launch **6.25**, **Finder idle 17.89**
-walks/kinst. Composition of the 86,627 walks: **183 compulsory (0.2%)**, 22,393 PFLUSHA
-refills (25.8%), **64,051 capacity/conflict (73.9%)**.
+Composition of the 86,627 walks: **183 compulsory (0.2%)**, 22,393 PFLUSHA refills
+(25.8%), **64,051 capacity/conflict (73.9%)**.
+
+⚠️ **PER PHASE, because the aggregate rests on one of them** (measurement rule 3):
+
+| phase | shipping | + victim 16 | + victim 24 | **+ victim 32** | PFLUSHA/Minst |
+|---|---:|---:|---:|---:|---:|
+| boot (t=10) | 3.473 | 2.950 (−15.1%) | 2.942 (−15.3%) | **2.942 (−15.3%)** | 150.4 |
+| Finder launch (t=21.5) | 6.254 | 4.803 (−23.2%) | 4.751 (−24.0%) | **4.739 (−24.2%)** | 263.8 |
+| **Finder idle (t=40)** | **17.887** | 5.983 (−66.5%) | 1.520 (−91.5%) | **1.198 (−93.3%)** | 38.3 |
+| aggregate (equal instruction weight) | 10.254 | 4.707 | 2.815 | **2.677 (−73.9%)** | — |
+
+**The aggregate −73.9% is carried by the idle phase, and that is mechanism, not luck:**
+the buffer is flushed by PFLUSHA along with the array, so where PFLUSHA is frequent
+(boot, app launch) most walks are flush refills it cannot help, and where PFLUSHA is rare
+(the steady-state idle loop) the walks are conflict-dominated and it removes almost all of
+them. So the value is concentrated in **steady-state interactive behaviour — which is
+where the machine is actually used** — while boot and launch still get 15-24%. Quote the
+phase, never the aggregate alone.
 
 Three things decide the design:
 - **A 32-entry victim buffer reaches the infinite-ITLB floor and beats doubling the array
@@ -338,6 +354,75 @@ count by **zero**, because the array is refilled in the same cycle the latch is.
   metric that moves unambiguously is `OFF_PERF_ITLB_WALK` (0x010A4), predicted 10.25 →
   2.68 per kinst — a 3.8x change, far outside any noise floor. Read that counter with
   `IC_MISS`/`MISPRED` alongside so the phase can be shown to match.
+
+## Lever 5 re-sized 2026-09-27 — FDIP's market is real, but two thirds of it is software wiping the cache
+
+Same real-7.5.3 trace and method as lever 15 (see its section for the validation and the
+lower-bound caveat). Modelling our L1I exactly — 16 KiB, 64 sets x 4 ways x 64 B, RR,
+plus the in-tree next-line prefetcher (`seedPfWindow`, depth 5, clamped to the 4 KiB
+page) — and, crucially, **including the workload's own `cpusha both`**, the Finder idle
+demand-miss stream decomposes as:
+
+| bucket | share of demand misses | of which SEQ |
+|---|---:|---:|
+| compulsory (line never touched in the window) | 0.2% | 0.8% |
+| **post-invalidate** (line was RESIDENT when a `cpusha both` wiped the cache) | **28.5%** | 1.8% |
+| replacement (capacity / conflict) | 71.3% | 0.0% |
+| **`IC_MISS_SEQ` equivalent, all buckets** | **0.5%** | — |
+
+**That 0.5% independently corroborates the board's 4.5%** from a completely different
+instrument, on the number lever 5's go/no-go rests on: the residual really is
+overwhelmingly non-sequential, and next-line structurally cannot reach it.
+
+**But the capacity sweep says the replacement bucket is not what it looks like.** Same
+stream, same invalidates, prefetch on:
+
+| L1I geometry | I-miss/kinst | vs shipping |
+|---|---:|---:|
+| **16 KiB 64s x 4w RR — SHIPPING** | **41.77** | — |
+| 16 KiB 64s x 4w **LRU** | 48.67 | **+16.5% — LRU is WORSE than round-robin here** |
+| 16 KiB 32s x 8w RR | 41.16 | −1.5% |
+| 16 KiB 16s x 16w RR | 39.94 | −4.4% |
+| 32 KiB 128s x 4w RR | 34.23 | −18.0% |
+| 32 KiB 64s x 8w RR | 32.17 | −23.0% |
+| 64 KiB 256s x 4w RR | 29.34 | −29.8% |
+| **256 KiB — near-infinite** | **28.04** | **−32.9%** |
+
+**A near-infinite I-cache removes only a third of the misses.** The floor of 28/kinst is
+the workload re-fetching its own working set after each of its 771 wholesale invalidates
+(one every ~4,600 instructions; ~129 distinct lines ≈ 8 KiB touched per interval). So:
+
+- **~67% of L1I demand misses at Finder idle are software-driven wholesale-invalidate
+  refills.** No cache geometry removes them, and FDIP cannot remove them either — it can
+  only fetch them EARLIER.
+- **~33% are capacity/conflict**, and associativity is nearly worthless against them
+  (8-way −1.5%, 16-way −4.4%) while SIZE is not (32 KiB −18%). ⚠️ The caches are already
+  32 of 35 RAMB36, so 32 KiB needs the BRAM budget checked first.
+- **Round-robin beats LRU by 16.5%** on this stream. Do not "improve" the replacement
+  policy without measuring it.
+
+### Why this makes an FDIP number LESS worth producing right now, not more
+
+A 68040 `CPUSHA` invalidates the CPU's own L1s; it does not invalidate the SoC's 2 MB L2.
+So the dominant miss population — the post-invalidate refills — is **L2-resident and
+cheap**, and fetching it earlier is worth far less per miss than the DRAM latency a
+sizing run would implicitly assume. The value of FDIP therefore hinges on the **L2
+hit/miss split of `IC_MISS`**, which is:
+
+- **not measurable in sim today** — `AxiMemModel`'s L2 is an unbounded never-evicted set,
+  so every line hits at 5 cycles after first touch and only compulsory misses see
+  `dramCycles`; and
+- **not measured on the board** — lever 3 added `IC_MISS`/`PF_*`/`IC_MISS_SEQ`/`PF_LATE`
+  but nothing splits them by L2 residency.
+
+Add that split to lever 5's sizing plan (it is not in items 1-4 today). Until it exists,
+an FDIP sim IPC figure is measured against a memory system that is simultaneously too
+kind (infinite L2) and too harsh (`crossbarSingleOutstanding = false` overstating
+overlap, against a real crossbar that is single-outstanding per master port) — two errors
+in opposite directions that must not be assumed to cancel.
+
+⛔ And the standing blocker is unchanged: **#7 gates #5**, and `rasBranchRepair` is still
+default OFF and unmerged.
 
 ## Lever 9 — BRAM as a mux, not just as storage (owner, 2026-09-27)
 
