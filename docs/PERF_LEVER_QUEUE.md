@@ -93,6 +93,53 @@ mispredict source and a fetch redirect, so fix the double-mispredict-per-call fi
 FDIP gets measured against a handicapped predictor.
 **#3 gates #5** too: know what next-line already covers before crediting FDIP with it.
 
+## Lever 9 — BRAM as a mux, not just as storage (owner, 2026-09-27)
+
+**"we can start using more bram where we can to remove load from LUTs" + "bram is also
+an implicit mux".** The second half is the point: a BRAM read port IS an addressed
+multiplexer, so moving a structure into BRAM absorbs its SELECTION logic as well as its
+storage. That meets the census head-on — the core is **49% LUT6 selection logic and
+only 1.2% carry**, so fan-in and payload width are where the LUTs are, and BRAM buys
+selection with a hard macro.
+
+⚠️ **URAM is entirely spoken for by the L2C** — the budget is RAMB36. Core currently
+uses **36**; whole design 172.
+
+Measured inventory (from `lane100_br5`):
+
+| structure | LUTRAM | total LUT in scope | RAMB36 |
+|---|---:|---:|---:|
+| `RegFilePluginInt_logic_ram` | 4,848 | **8,050** | 0 |
+| `DecodeStage_logic_queue` | 1,024 | 3,976 | 0 |
+| `RegFilePluginFp_logic_ram` | 504 | 1,123 | 0 |
+| socket_core total | 10,322 | 95,813 | 36 |
+
+The ~3,200 logic LUTs above the LUTRAM count in the int PRF scope are its read/bypass
+mux network — that is the part the "implicit mux" argument reclaims, so the prize
+there is nearer 8k than 4.8k.
+
+**The binding constraint is not storage, it is read latency.** The core has **44
+`readAsync` sites** against 15 `readSync`, plus 9 explicit `ram_style="distributed"`
+and 4 `"block"`. `RegFilePlugin` is `ram.readAsync(r.addr)` with a bypass mux over it —
+async read is exactly why it is LUTRAM, and BRAM/URAM cannot do async. Converting one
+means **the address must be produced one cycle earlier**, i.e. reading at SELECT rather
+than at issue. That is a pipeline change, not an attribute.
+
+Order of work, cheapest first:
+1. **Free:** the 6 `readSync` Mems with no `ram_style` (`IcachePlugin` x5,
+   `FpCheapPipe` x1) — already synchronous, so forcing `block` has no pipeline impact.
+2. **Free-ish:** audit the 9 explicit `"distributed"` choices — deliberate, or inherited?
+3. **Real work:** hoist an address a stage to convert a `readAsync` consumer. Start with
+   the ROB payload reads at `h0`/`h1`, not the PRF.
+4. **Speculative synergy, unproven:** the speculative-wakeup machinery already exists to
+   present the PRF read address one cycle early. If generalised from a speculative trick
+   to a structural "read at select", a sync BRAM read lands exactly where today's async
+   read does. Attractive, and entirely unvalidated.
+
+⚠️ BRAM is not free in every dimension: the I-cache line width has a **BRAM cliff at
+397 bits** — 384 is the last free width and a 9th predecode bit costs +2 tiles. Check
+width efficiency before widening anything into a tile.
+
 ## Measured DEAD — do not revisit
 
 - **Memory renaming / store-to-load bypass** — the satisfiable loads are the machine's
