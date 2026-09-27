@@ -300,6 +300,56 @@ class DcacheSectorSpec extends AnyFunSuite {
   }
 
   // ───────────────────────────────────────────────────────────────────────────────
+  // 3b. THE SPLIT ITSELF, at the mechanism level.
+  // ───────────────────────────────────────────────────────────────────────────────
+  test("a SECTOR miss issues ONE single-beat transaction, not a burst", VerilatorTest) {
+    sectoredDut.doSim("sector-miss-is-single-beat") { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x62000L
+      fillMem(mem, base, LINE)
+
+      // Cold LINE miss: one AR, and it must carry len = 3.
+      var lineLen = -1
+      val w1 = fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean)
+            lineLen = dut.dcache.logic.axi.ar.payload.len.toInt
+        }
+      }
+      assert(load(dut, cd, base + 2 * SECTOR) == memLong(base + 2 * SECTOR))
+      cd.waitSampling(4); w1.terminate()
+      assert(lineLen == 3,
+        s"a LINE miss must be a 4-beat burst (len = 3); saw len = $lineLen. len = 0 means " +
+        s"`refillFullLine` never reached the AR and the whole bandwidth mechanism is off.")
+
+      // Now make ONE sector of that resident line invalid, and re-touch it. That is a
+      // SECTOR miss: it must be a single beat, because a 4-beat burst here would
+      // overwrite the line's other three sectors -- the exact data-loss the split exists
+      // to prevent, and what `CINVL discards ONE 16-byte sector...` catches behaviourally.
+      maint(dut, cd, push = false, invalidate = true, scope = 1, addr = base + 1 * SECTOR)
+      var secLen = -1
+      var arCount = 0
+      val w2 = fork {
+        while (true) {
+          cd.waitSampling()
+          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) {
+            secLen = dut.dcache.logic.axi.ar.payload.len.toInt; arCount += 1
+          }
+        }
+      }
+      assert(load(dut, cd, base + 1 * SECTOR) == memLong(base + 1 * SECTOR))
+      cd.waitSampling(4); w2.terminate()
+      assert(arCount == 1, s"a sector miss must be exactly ONE transaction; counted $arCount")
+      assert(secLen == 0,
+        s"a SECTOR miss must be a SINGLE BEAT (len = 0); saw len = $secLen. A burst here " +
+        s"refetches the whole line into a way that already holds it, overwriting any " +
+        s"DIRTY sibling sector -- reintroducing, through the fill path, exactly the " +
+        s"silent write loss that sectoring exists to prevent.")
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────
   // 4. THE EVICTION WALK.
   // ───────────────────────────────────────────────────────────────────────────────
   test("evicting a line writes back exactly its DIRTY sectors and leaves the clean " +
