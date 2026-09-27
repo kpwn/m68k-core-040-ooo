@@ -161,7 +161,7 @@ FFs flat.
 | 12 | PRF write/read port merge (`PINS_PRF_FMAN_SHARE` + `PINS_PRF_SLOWREAD`) | ✅ **gated 396/396 both arms** | crosses the LVT `coreCount` step **only in combination**: 96 -> **80 cells (-21.6%)**, **-1,112..-1,168 LUTRAM**. FMAN deletes one of six write-address broadcasts outright = **-16.7% of the `ADDRH` sink pins** |
 | 13 | slot-1 coverage completion (DBcc / FBcc / BRA.L) | 🔄 in flight | `slot1WouldUncond` misses **7.26% of ROM control transfers**; DBcc is 3.41% STATIC and far higher dynamic (loop-closing). ⛔ RTD/RTE deliberately excluded — slot 0 cannot predict them either, so deferral costs a slot and buys nothing |
 | 14 | explicit `DBcc` loop predictor (owner, 2026-09-27) | 📋 QUEUED — **gated behind #13** | **80.8% of ROM DBcc are `DBF`/`DBT`: pure counted loops, outcome is the counter alone.** Removes the once-per-loop EXIT mispredict gshare cannot get |
-| 15 | **ITLB victim buffer** (`ITLB_VICTIM=32`) | ✅ **BUILT, gated 396/396 both arms**, default OFF | trace-driven on real 7.5.3: **10.25 ITLB walks/kinst**, 73.9% of them capacity/conflict; a 32-entry FIFO victim buffer removes **−73.9%** aggregate = the infinite-ITLB floor, but **−93.3% on Finder IDLE** vs only −15/−24% on boot/launch (PFLUSHA flushes the buffer too). OFF netlist **byte-identical**; ON adds **~1,509 flop bits**. Worth **2.2-4.0% of cycles** and **exactly nothing on Dhrystone** (0.061 walks/kinst there) |
+| 15 | **ITLB victim buffer** (`ITLB_VICTIM=32`) | ✅ **BUILT, gated 396/396 both arms, area measured**, default OFF | trace-driven on real 7.5.3: **10.25 ITLB walks/kinst**, 73.9% of them capacity/conflict; a 32-entry FIFO victim buffer removes **−73.9%** aggregate = the infinite-ITLB floor, but **−93.3% on Finder IDLE** vs only −15/−24% on boot/launch (PFLUSHA flushes the buffer too). OFF netlist **byte-identical**; ON adds **+1,451 FF / no measurable LUTs**. Worth **~2.2% of session cycles, ~3.4% at Finder idle** and **exactly nothing on Dhrystone** (0.061 walks/kinst there) |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -320,8 +320,9 @@ Composition of the 86,627 walks: **183 compulsory (0.2%)**, 22,393 PFLUSHA refil
 
 At the corroborated **17.2 cycles per walk** that is **3.0% of all cycles** on the mixed
 session and **3.65% on Finder idle**, of which the buffer recovers **73.9% / 93.3%** —
-i.e. **≈2.2% of session cycles and ≈3.4% of Finder-idle cycles**, for ~1,509 flop bits and
-no shipping LUTs at all while the flag is off.
+i.e. **≈2.2% of session cycles and ≈3.4% of Finder-idle cycles**, for a measured **+1,451
+flops and no measurable LUTs**, and for literally nothing at all while the flag is off (the
+OFF netlist is byte-identical).
 
 **The aggregate −73.9% is carried by the idle phase, and that is mechanism, not luck:**
 the buffer is flushed by PFLUSHA along with the array, so where PFLUSHA is frequent
@@ -362,7 +363,11 @@ count by **zero**, because the array is refilled in the same cycle the latch is.
   itself behind `reportEvictions`, so a TLB with no buffer behind it grows no ports.
 - ON adds **~1,509 flop bits** (32 × 46 of state + a 5-bit ring pointer) and **zero**
   hardware counters — `vic.promote` is `simPublic` and tests count it in `onSamplings`.
-  ⚠️ Per rule 7 that is a sanity check, NOT an area measurement.
+  ✅ **Measured at 100 MHz (synth-only, both arms, provenance round-tripped):
+  socket_core FF +1,451 and total LUT −237, i.e. NO MEASURABLE LUT COST** — the LUT delta
+  is negative and well inside the ~800 LUT floor, LUTRAM/BRAM/DSP all unchanged. See
+  `docs/PERF_AREA_LEDGER.md`'s synth-only sub-table, including why the per-module rows of
+  the two reports must not be read against each other.
 - `ItlbVictimSpec` is a **paired** test: the `victimEntries = 0` arm must show the walk
   (fail-before) and the ON arm must show zero walks, one promote, and **the same PPN**;
   plus PFLUSHA must clear the buffer or the re-touch would be answered out of the
