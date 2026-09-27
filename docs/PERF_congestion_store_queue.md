@@ -260,9 +260,24 @@ two rings cannot desynchronise.
   line-number-derived signal names and nothing else, so the OFF arm is the parent design;
   the ON arm is 2,123 lines smaller, which is the lever actually deleting RTL rather than
   a flag that reads as set and does nothing.
-* Corpus (`PortedM68kOooSpec`, `ExecuteLockStepSpec`, OFF and ON, compared as failing SETS
-  name-for-name) — see the table appended below when it lands. Both are ~8 h per arm
-  because the harness elaborates and Verilator-compiles a fresh DUT per test.
+* **Corpus, OFF and ON, compared as failing SETS name-for-name — both IDENTICAL:**
+
+| spec | run | succeeded | failed OFF | failed ON | set comparison |
+|---|---:|---:|---:|---:|---|
+| `PortedM68kOooSpec` | 1022 | 1010 | 12 | 12 | **identical, name-for-name** |
+| `ExecuteLockStepSpec` | 702 | 690 | 12 | 12 | **identical, name-for-name** |
+
+  The 12 ported reds are the known families and nothing else: seven FPU
+  (`fpu_fmovem_x_an_indirect` / `_pcdi` / `_roundtrip`, `fpu_fmovem_multi`,
+  `fpu_fmove_fp_to_ea_matrix`, `fpu_fsave_frestore_idle_roundtrip`), three
+  `ported-sweep-copyback` repeats of the FMOVEM.X ones, plus
+  `exc_partial_macro_move_mem_mem`, `mmu_atc_write_hit_sets_modified` and
+  `rom_scc_mmio_btst_dbf_timeout`. The 12 lockstep reds are eleven `odd-ssp` IRQ-boundary
+  cases (the uninit-registers-vs-randomised-PRF class) plus
+  `lock-step: LSU NZVC wakeup preserves alternating flags and partial Scc destinations`.
+  Run with the checked-in manifests (`cache-mode-sweep-list.txt`,
+  `mmu-walk-sweep-list.txt`); ~1.5 h and ~3.5 h per arm respectively, because the harness
+  elaborates and Verilator-compiles a fresh DUT per test.
 
 ## 6. Carry-forward
 
