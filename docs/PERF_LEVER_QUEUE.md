@@ -77,16 +77,17 @@ FFs flat.
 
 | # | lever | state | evidence |
 |---|---|---|---|
-| 1 | strcmp bench kernel + ALU-arm re-test | ✅ gated 396/396, `677eaf2f` | byte-identical to the board loop; both spec arms exactly flat |
-| — | branch-ring torn read + class counters | ✅ gated 400/400, `a31dd04b` | fail-before on master: 10/32 branch, 15/32 exc entries stitched |
-| 2 | LS spec wakeup rebased onto master | in flight | −5.10% / 14 kernels; base was OLD master `a204565f` |
-| 3 | I-cache prefetch instrumentation | in flight | next-line prefetcher EXISTS; `prefetchEnable` unreachable from the debug bus |
-| 4 | D-side speculative prefetch | queued — **size first** | `DcachePlugin` has ZERO prefetch machinery; design already in `DESIGN_ooo_load_issue_and_prefetch.md` |
-| 5 | Fetch-directed prefetch (FDIP) | queued | next-line cannot cross a taken branch; at 92 mispred/kinst coverage is structurally capped |
-| 6 | announce timing for the early-probe path | queued | ceiling **17.0-19.7%** of cycles, **0.0%** captured |
-| 7 | RAS architectural shadow | queued | **a defect**: every mispredicted call costs TWO mispredicts (1024/2050 in `br-ind`) |
-| 8 | `alignedDone` → `alignedEarlyWbFire` | queued | free one-cycle-early wake on the parked path |
-| — | LS OoO park + recovery | in flight | separate standing goal; unblocks `loadBypassUnreadyLoad` |
+| 1 | strcmp bench kernel + ALU-arm re-test | ✅ **gated 396/396**, `677eaf2f` | byte-identical to the board loop; both spec arms exactly flat |
+| — | branch-ring torn read + class counters | ✅ **gated 400/400**, `a31dd04b` | fail-before on master: 10/32 branch, 15/32 exc entries stitched |
+| 2 | LS spec wakeup rebased onto master | ✅ **gated 396/396**, `462e189c` | **−1.84% (34 kernels)**, −5.10% on the historical 14, `chase-pure` −12.50%; **area-free** (its A/B swing is inside the ~800 LUT noise floor); 3 kernels regress |
+| 3 | I-cache prefetch instrumentation + FDIP counters | ✅ **gated 396/396**, `e8149e24` | `+425` flop bits; **zero nets added inside `IcachePlugin`**; 5 mutations verified |
+| 4 | D-side speculative prefetch | ⛔ **DEAD**, `907b4016` | +6.2% misses removed at **206% of the bus**; Finder phase **−126.8%**; ceiling 1.8% not 13% |
+| 5 | Fetch-directed prefetch (FDIP) | ⏸ **blocked on one board session** | `IC_MISS − IC_MISS_SEQ` is its entire market; `lane100_icpf` bitstream is built and ADB-patched |
+| 6 | announce timing for the early-probe path | 🔄 in flight | ceiling **17.0–19.7%** of cycles, **0.0%** captured |
+| 7 | RAS architectural shadow | ✅ **gated 396/396**, `81f196ee` | **2.008 → 1.008 mispredicts/iter (−49.8%)**, IPC 0.168→0.258, **+69 flop bits**. The retire-time shadow stack **cannot work here** — Tier-1 `earlyFire` redirects before the ROB head and Tier 2 suppresses the later flush |
+| 8 | `alignedDone` → `alignedEarlyWbFire` | 🔄 folded into 6 | free one-cycle-early wake on the parked path |
+| 9 | BRAM as an implicit mux | 🔄 in flight | 10,322 LUTRAM in the core against 36 RAMB36; constraint is read latency, not storage |
+| — | LS OoO park + recovery | ✅ **gated 396/396**, `68a89f88` | `orderRedirects` **0 → 7**, ~20.9 cyc each, **cost ONE flop bit**; lock-step reds 22 → 17. ⛔ the relaxation itself is still blocked by a **third pre-existing** corpus defect |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -224,6 +225,14 @@ width efficiency before widening anything into a tile.
 5. **Assert on architectural register values, not retire counts.** `runKernel` runs
    until N macros retire WHATEVER THEY ARE — a harness bug let a branch vanish and
    every check still passed.
-6. **Check the bench even CONTAINS the shape.** Four coverage holes found in one week:
+6. **The LUT noise floor of this flow is ~800 LUT** — measured 2026-09-27: a change of
+   **+1 assign and +0 flop bits** produced an **803 LUT swing** between two builds
+   (`lsw0` 146,118 vs `lsw1` 145,315). Do not claim an area result below that. It also
+   recalibrates the ledger: the age-matrix's +3,487 is 4x the floor and real; the branch
+   flags' +1,170 is only ~1.5x and weaker than first presented.
+7. **Elaboration flop counts are NOT an area measurement.** Three times now they have
+   predicted flops accurately and LUTs badly (age matrix: predicted "a wash", measured
+   **+3,487 LUT**). Use them as a sanity check only.
+8. **Check the bench even CONTAINS the shape.** Four coverage holes found in one week:
    zero A6/A7 operands, zero store→load pairs, zero load→compare→branch chains, and 25
    total suite mispredicts against the board's 24.4 MPKI.
