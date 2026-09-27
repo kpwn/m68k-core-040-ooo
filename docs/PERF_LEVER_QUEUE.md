@@ -191,6 +191,35 @@ Order of work, cheapest first:
 397 bits** — 384 is the last free width and a 9th predecode bit costs +2 tiles. Check
 width efficiency before widening anything into a tile.
 
+## Lever 10 — age-matrix IQ, judged on FANOUT not area (reopened 2026-09-27)
+
+I closed this on the wrong criterion. The measured **+3,487 LUT (+2.25%)** is real and 4x
+the ~800 LUT noise floor — but the change was never proposed as an area win. Its claim:
+
+- **`push.fire`'s direct flop-bit fanout inside the IQ drops 2,746 -> 994** (-64%),
+  split across 8 per-line enables
+- **IPC is bit-identical**, so there is no performance risk to weigh against the cost
+- FFs are free here (~21% utilised); it spends +406
+- and on THIS design **area anti-correlates with WNS**: the area-only netlist was 5,048
+  LUT SMALLER than m20 and closed WORSE. Congestion is pin DENSITY, and Vivado's own
+  remedy (`CELL_BLOAT_FACTOR`) makes designs BIGGER. So +3,487 LUT is not evidence
+  against a congestion lever — it is the expected shape of one.
+
+**It is UNMEASURED on its own claim, not dead.** The 100 MHz lane cannot judge it: both
+arms close trivially there, so lane WNS says nothing about the tight constraint.
+
+⚠️ **And a naive 200 MHz WNS A/B is also weak**: netlist sensitivity on this design is
+**±0.4 ns**, and the two arms ARE different netlists, so a single WNS pair cannot be
+distinguished from that sensitivity unless the effect is large. What would convince:
+1. **post-place congestion** (`report_design_analysis -congestion`, per-region levels) —
+   directly the quantity the fanout claim is about, and far less lottery-prone than WNS;
+2. **the specific endpoints** — does the IQ select cone's slack improve, and does
+   `push.fire` leave the worst-path list? A targeted improvement is credible where a
+   global WNS delta is not;
+3. WNS only as corroboration, never as the sole evidence.
+
+Running: `build/iqam200_{off,on}` at 200 MHz, congestion-first.
+
 ## Measured DEAD — do not revisit
 
 - **Memory renaming / store-to-load bypass** — the satisfiable loads are the machine's
@@ -200,13 +229,10 @@ width efficiency before widening anything into a tile.
   never the head of a dependence chain through its address. `frame-loads-a6` hits IPC
   1.000. ROM is 31.4% A7/A6-relative and it still cannot pay.
 - **ALU-class speculative wakeup** — flat on 14 kernels AND on the strcmp shape.
-- **Age-matrix IQ** — **MEASURED +3,487 LUT (+2.25%)** in a controlled synth A/B
-  (154,764 → 158,251 fpga_top; socket_core +3,485; FF +406 vs the predicted +378).
-  The track predicted "a wash to maybe a few hundred better" and was wrong by ~3,500
-  LUT: **elaboration flop-counting does not predict LUT cost.** The surviving fanout
-  argument (`push.fire` 2,746 → 994) would have to be worth 3,487 LUT in routed WNS,
-  which is not demonstrable on a design where neither WNS metric attributes a sub-0.5 ns
-  change. IPC was bit-identical, so nothing is lost by dropping it.
+- ~~**Age-matrix IQ**~~ — **MOVED BACK TO OPEN 2026-09-27, see lever 10.** It was listed
+  dead on a +3,487 LUT measurement, but **area was never its claim** — fanout was, and on
+  this design area has ANTI-correlated with WNS across three builds.
+
 - **BTB capacity growth** — `br-cap-fit` FITS the BTB and still mispredicted 27%;
   ~88% of that was slot-1 coverage, not capacity.
 - **Route-directive sweep** — every alternative worse than `AggressiveExplore`
