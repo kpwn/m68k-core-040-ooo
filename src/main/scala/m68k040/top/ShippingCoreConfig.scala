@@ -78,5 +78,30 @@ object ShippingCoreConfig {
     * windows). The second effect -- every miss stops consuming the shared tag/data
     * read port a second time -- is OCCUPANCY, is unsized, and must be reported
     * separately rather than folded into the latency claim. */
+  /** ⛔ ONE GATE ITEM STANDS BETWEEN THIS AND SHIPPING ON, and it is a real
+    * behavioural change rather than a flaky test. `ExecuteLockStepSpec`'s
+    * "p127 CONTROL: the D-side zero latency really widens the precise-drain window"
+    * reports a widest precise-drain window of **7 cycles with the flag OFF and 16 with
+    * it ON**, against a calibration band of [1, 12] -- so the ON arm fails it.
+    *
+    * The cause is explainable and was confirmed by running both arms: fill-forward
+    * makes the LOAD side two cycles faster, so the ROB head reaches a precise store
+    * sooner, and that store then parks at the head for LONGER waiting on its own AXI B.
+    * Stall MOVES from load-response into precise-drain wait; it is not created.
+    *
+    * Why that matters beyond the test: the precise path is ~12.4 cycles per store
+    * against ~1.31 on the fast path, and the bench's own default (`copybackDtt = false`)
+    * makes EVERY store precise. That is consistent with what was measured -- memcpy
+    * (`copybackDtt = true`) gained 4.35%, while `dhry-cb-128` gained only 0.62-0.85%.
+    * So this lever's value is a function of how much of the store stream is precise,
+    * and on a fully-precise workload some of the load-side saving is handed straight
+    * back.
+    *
+    * DO NOT widen that band to make the gate green. Either size the precise-drain
+    * interaction and re-derive the band from the new timing, or make the band
+    * config-relative. The band's own message says it exists to catch the window being
+    * BELOW the floor ("the dcfg D-side latency did NOT take effect and every p127
+    * negative result in this Part is vacuous"), so the upper bound is a sanity rail
+    * that has now been genuinely moved -- which is information, not noise. */
   val dcacheFillForward: Boolean = envFlag("CPU_DCACHE_FILL_FORWARD", false)
 }
