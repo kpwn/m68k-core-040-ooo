@@ -90,7 +90,52 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * `loadCmdPort.ready` and a second S1 launch site, both on the cone this
                      * file records as the core's longest -- so it can be dropped on its own
                      * if it costs 200 MHz closure. */
-                   val hitUnderMissRead: Boolean = m68k040.top.ShippingCoreConfig.dcacheHitUnderMissRead)
+                   val hitUnderMissRead: Boolean = m68k040.top.ShippingCoreConfig.dcacheHitUnderMissRead,
+                   /** FILL-FORWARD (ratified slice D1.2; design doc §5.4, implementation plan
+                     * Task D1.2). Deliver a cacheable load miss's response DIRECTLY from the
+                     * refill beat already latched in `missLine`, instead of re-reading the
+                     * line the refill just wrote.
+                     *
+                     * WHAT IT REPLACES. Today REPLAY re-arms `rdSet`/`rdEn`/`ldS1Valid` for
+                     * the just-filled line and lets the response fall out of the ordinary
+                     * S1 -> S2 path. Counting from the cycle the R beat is consumed (N):
+                     * REFILL allocates at N, REPLAY relaunches the read at N+1, S1 resolves
+                     * the (guaranteed) hit at N+2, and S2 responds at N+3. Fill-forward
+                     * responds at N+1 -- so it removes EXACTLY 2 cycles from every cacheable
+                     * load miss, and the directed test asserts that exact number rather than
+                     * a percentage.
+                     *
+                     * THE MECHANISM ALREADY EXISTS AND IS ONLY GENERALISED HERE. The
+                     * non-allocating INHIBITED path does precisely this: REPLAY pulses
+                     * `inhibitedResp` and the response mux extracts from `missLine`
+                     * (`loadRspPort.payload.data`/`.line`). This adds a third one-cycle
+                     * pulse of the same shape for the CACHEABLE, successfully-allocated
+                     * case. No new state, no new register, no FSM restructuring.
+                     *
+                     * NO CRITICAL-WORD-FIRST DEPENDENCY. `len = 0` at a 16-byte line on a
+                     * 128-bit bus: the single beat IS the whole line, so the beat that
+                     * carries `r.last` is trivially the demanded one. (Implementation plan
+                     * §"deferred" warns this stops being true at `len = 3`; if the line is
+                     * ever widened, this path needs a critical-word selection first.)
+                     *
+                     * THE ONE HAZARD, and why the guard below is not decoration:
+                     * `loadRspPort` is a single `Flow`. `hitUnderMiss`'s probe arm registers
+                     * its hit straight into S2 from inside REFILL/EVICT_WR, so a probe
+                     * accepted on cycle N produces `ldS2Resp` at N+1 -- the very cycle
+                     * fill-forward wants to respond. Today that collision is unreachable
+                     * (the cacheable response is at N+3, and the probe arm is disabled
+                     * during an INHIBITED refill by `humCommon`'s `missCmode =/= INHIBITED`
+                     * term). Fill-forward makes it reachable, so REPLAY holds the pulse for
+                     * one cycle when `ldS2Resp` occupies the port -- the same
+                     * "retry the SAME cycle's work next cycle" shape the write-allocate
+                     * branch already uses, and never a drop.
+                     *
+                     * The two cycles it saves are latency; it ALSO stops every miss
+                     * consuming the shared tag/data read port a second time, which is
+                     * occupancy. Those are separate effects and must be reported
+                     * separately -- the occupancy argument must not be allowed to carry the
+                     * latency claim. */
+                   val fillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward)
     extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
@@ -1163,6 +1208,19 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val inhibitedResp = Bool(); inhibitedResp := False
     inhibitedResp.simPublic()   // DEBUG, temporary (mirrors busFaultResp)
 
+    // Slice D1.2 FILL-FORWARD (see `DcachePlugin.fillForward`): the CACHEABLE,
+    // successfully-allocated miss's response, delivered from `missLine` instead of by
+    // re-reading the line the refill just wrote. Same one-cycle-pulse shape as
+    // `inhibitedResp` above and driven from the same place (REPLAY, later-assignment-
+    // wins), which is exactly why this is a generalisation of an existing mechanism
+    // rather than a new response path. Hard-False when the flag is off, so the
+    // response mux below degenerates to today's expression and the netlist to today's.
+    val fillFwdResp = Bool(); fillFwdResp := False
+    fillFwdResp.simPublic()
+    /** The response mux's `missLine` source is now shared by two pulses. Naming it
+      * once keeps the two muxes below from drifting apart. */
+    val missLineResp = inhibitedResp || fillFwdResp
+
     // ---- LOAD S2 (registered post-hit-detect response build) ----
     // FMax closure Slice 2 (2026-08-07): the old S1 response build (way-select ->
     // byte-lane extract -> loadRspPort) was one flat ~13-level combinational cone
@@ -1204,23 +1262,23 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
-    loadRspPort.valid         := ldS2Resp || busFaultResp || inhibitedResp
-    loadRspPort.payload.data  := Mux(inhibitedResp,
+    loadRspPort.valid         := ldS2Resp || busFaultResp || missLineResp
+    loadRspPort.payload.data  := Mux(missLineResp,
                                       DcacheByteLane.extract(missLine, missOff, missSize,
-                                                             inhibitedResp && !missLineOnly),
+                                                             missLineResp && !missLineOnly),
                                       Mux(ldS2Direct, ldS2DirectData,
                                           DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size,
                                                                  ldS2Resp && !ldS2Direct && !ldS2LineOnly)))
-    loadRspPort.payload.line  := Mux(inhibitedResp, missLine, ldS2Line)
+    loadRspPort.payload.line  := Mux(missLineResp, missLine, ldS2Line)
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
     loadRspPort.payload.fault := busFaultResp
     // The miss-path responses (inhibited read, bus fault) answer the command whose
     // token was latched into `missToken`; every other response comes down the S1/S2
     // pipe, early-probe direct hits included (the direct arm overrides `ldS2Token`).
-    loadRspPort.payload.token := Mux(inhibitedResp || busFaultResp, missToken, ldS2Token)
-    loadRspPort.payload.rid      := Mux(inhibitedResp || busFaultResp, missRid,  ldS2Rid)
-    loadRspPort.payload.ridValid := Mux(inhibitedResp || busFaultResp, missRidV, ldS2RidV)
+    loadRspPort.payload.token := Mux(missLineResp || busFaultResp, missToken, ldS2Token)
+    loadRspPort.payload.rid      := Mux(missLineResp || busFaultResp, missRid,  ldS2Rid)
+    loadRspPort.payload.ridValid := Mux(missLineResp || busFaultResp, missRidV, ldS2RidV)
 
     // ---- STORE drain (elastic S0 / S1 read / S2 compare / S3 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -2662,6 +2720,27 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // "retry the SAME cycle's work next cycle" shape the store-request branch
           // above uses.
         } otherwise {
+        if (fillForward) {
+          // ── SLICE D1.2: FILL-FORWARD ────────────────────────────────────────────
+          // The line is already allocated (REFILL did the array write last cycle) AND
+          // the beat is already in `missLine`. Re-reading the array to get the bytes
+          // back out is pure overhead: respond from `missLine` and go straight to IDLE.
+          // Saves EXACTLY 2 cycles (see `DcachePlugin.fillForward` for the cycle count)
+          // and leaves the shared tag/data read port free.
+          //
+          // THE GUARD IS LOAD-BEARING. `loadRspPort` is one Flow, and `hitUnderMiss`'s
+          // probe arm registers its hit into S2 from inside REFILL -- so a probe
+          // accepted on the last refill cycle makes `ldS2Resp` true on exactly this
+          // cycle. Holding for one cycle (no `goto(IDLE)`, retry the same work next
+          // cycle) is the idiom the write-allocate branch above already uses; dropping
+          // the pulse instead would leave the LS EU waiting on a response forever,
+          // which is the failure mode `humS1MissPark`'s comment records from a real hang.
+          when(!ldS2Resp) {
+            fillFwdResp          := True
+            loadMissStoreBarrier := False
+            goto(IDLE)
+          }
+        } else {
           // Re-launch the read for the just-filled line; resolve as a guaranteed hit
           // into the response register one cycle later via the ldS1 path. (No array
           // WRITE here — just a read relaunch — so `refillWriteHold`, which guards
@@ -2688,6 +2767,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1RidV     := missRidV
           loadMissStoreBarrier := False
           goto(IDLE)
+        }
         }
       }
     }
