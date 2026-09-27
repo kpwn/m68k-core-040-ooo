@@ -353,6 +353,10 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyStoreDataWake: Boolean = false,
                     loadBypassUnreadyLoad: Boolean = false,
                     earlyAutoAnWriteback: Boolean = false,
+                    /** Slice D1.2 fill-forward (`DcachePlugin.fillForward`). Named
+                      * explicitly here rather than taken from `ShippingCoreConfig`, per
+                      * that file's rule that a bench must vary a knob by NAME. */
+                    dcacheFillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -369,7 +373,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val itlb   = new ItlbPlugin()
     val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin(icachePredecodeWords)
-    val dcache = new DcachePlugin()
+    val dcache = new DcachePlugin(fillForward = dcacheFillForward)
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin
@@ -434,10 +438,18 @@ trait CoreBenchHarness extends AnyFunSuite {
     case None | Some("") | Some("zero") => AxiMemModelConfig()
     case Some(spec) =>
       val parts = spec.split(':')
-      require(parts(0) == "l2", s"unknown IPC_MEM=$spec (expected 'zero' or 'l2[:hit[:dram]]')")
+      require(parts(0) == "l2",
+        s"unknown IPC_MEM=$spec (expected 'zero' or 'l2[:hit[:dram[:sets]]]')")
       val hit  = if (parts.length > 1) parts(1).toInt else 5
       val dram = if (parts.length > 2) parts(2).toInt else 70
-      AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram))
+      // FOURTH field: L2 SET COUNT. 0 (the default) is the historical UNBOUNDED L2 --
+      // a residency set that is never evicted, so after one touch every line hits at
+      // `hitCycles` forever and `dramCycles` only reaches COMPULSORY misses. Pass 4096
+      // for the real 2 MB 8-way L2 (`l2c_defs.vh:25-32`). Any measurement of a lever
+      // whose mechanism is "hide memory latency" must state which of the two it used.
+      val sets = if (parts.length > 3) parts(3).toInt else 0
+      AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit,
+        dramCycles = dram, sets = sets))
   }
   // Five live 64-byte I-cache lines occupy ten beats on the core's 256-bit AXI.
   // Keep the legacy D-side capacity unchanged, but do not let the shared model's
@@ -446,7 +458,10 @@ trait CoreBenchHarness extends AnyFunSuite {
     maxPendingBeats = scala.math.max(memCfg.maxPendingBeats, 2 * (1 + AxiIds.I_SPEC_SLOTS)))
   def memLabel: String =
     if (!memCfg.latency.enabled) "zero-latency (ideal memory)"
-    else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line"
+    else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line" +
+      (if (memCfg.latency.finiteCapacity)
+         f", L2 ${memCfg.latency.capacityBytes / 1024}%d KiB ${memCfg.latency.ways}%d-way tree-PLRU"
+       else ", L2 UNBOUNDED (never evicts -- dramCycles reaches compulsory misses ONLY)")
 
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Unit = {
     AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes, cfg = iMemCfg)
@@ -1475,6 +1490,16 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"drainBlockedCyc=$drainBlockedCyc dcStoreFires=$dcStoreFires dcStoreAcks=$dcStoreAcks " +
           f"hits=$dcStoreHits misses=$dcStoreMisses maxSqResident=$maxSqResident maxSqAccepted=$maxSqAccepted " +
           f"maxDcOutstanding=$maxDcOutstanding")
+      }
+      // ── L2 COVERAGE. `evict=0` is a FINDING, not a pass: a kernel whose working set
+      // fits the 2 MB L2 never takes a DRAM-latency miss, so it cannot measure any
+      // lever whose mechanism is "hide a long miss". Printed only for the finite model,
+      // because under the unbounded one the answer is 0 by construction.
+      if (memCfg.latency.finiteCapacity) {
+        val st = dmem.stats
+        println(f"[l2] ${k.name}%s hits=${st.l2Hits}%d misses=${st.l2Misses}%d " +
+          f"merges=${st.l2SecondaryMerges}%d evictions=${st.l2Evictions}%d " +
+          f"missRate=${100.0 * st.l2Misses / scala.math.max(1L, st.l2Hits + st.l2Misses)}%.2f%%")
       }
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +

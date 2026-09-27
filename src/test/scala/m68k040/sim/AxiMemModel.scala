@@ -59,8 +59,54 @@ case class L2LatencyModel(
   fillFixedCycles: Int = 4,
   interBeatGap: Int = 1,
   l2Mshrs: Int = 8,
-  secondaryPerMshr: Int = 4
-)
+  secondaryPerMshr: Int = 4,
+  /** ── L2 CAPACITY. `sets = 0` means UNBOUNDED, which is what this model did from
+    * the day it was written until 2026-09-27 and is therefore the default: the
+    * residency image was a `mutable.Set[Long]` that was inserted into and NEVER
+    * evicted, so after one touch a line hit at `hitCycles` for the rest of the run
+    * and `dramCycles` only ever applied to COMPULSORY misses.
+    *
+    * ⚠ WHY THAT IS NOT A DETAIL. A warmed-up kernel under an unbounded L2 has
+    * essentially NO long-latency misses left, so it has almost no latency to
+    * overlap -- and any multi-outstanding / MLP lever measured against it reads
+    * near-zero for a MODELLING reason rather than an architectural one. A null
+    * measured at `sets = 0` is not evidence about the machine.
+    *
+    * `sets = 4096, ways = 8, lineBytes = 64` is the REAL L2 (2 MB), verified in
+    * `macqd700-soc/rtl/soc/l2c_defs.vh:25-32` (`L2C_WAYS 8`, `L2C_SETS 4096`,
+    * `L2C_LINE_BYTES 64`, `L2C_SET_BITS 12`, `L2C_TAG_BITS 14`) and
+    * `l2c_data.v:4` ("(64 B lines) = 256 KB/way x 8 ways = 2 MB total").
+    * Replacement is 8-way TREE-PLRU, ported function-for-function from
+    * `macqd700-soc/rtl/soc/l2c_plru_funcs.vh` (`l2c_plru_victim` /
+    * `l2c_plru_next`, used by `l2c_victim_sel.v`) rather than approximated by LRU.
+    *
+    * ⛔ MEASURED COVERAGE RESULT, 2026-09-27, and it is why a finite L2 does NOT by
+    * itself repair the corpus: at `sets = 4096, ways = 8` every bench kernel reported
+    * `evictions = 0`. `chase-128`, `dhry-cb-128` and `load-stream` take 32-49 L2 misses
+    * each over a whole run and ALL of them are COMPULSORY -- their working sets fit the
+    * 2 MB L2 outright, several times over. So `dramCycles` still reaches only cold
+    * misses, exactly as it did under the unbounded model; the difference is that now
+    * the `l2Evictions` counter SAYS SO instead of the fact being invisible.
+    * The corpus, not the model, is the remaining gap: measuring anything that depends
+    * on DRAM-latency misses needs a kernel whose working set EXCEEDS 2 MB, and the
+    * bench has none. (Treat a zero-eviction run as a coverage finding to report, not
+    * as a null result about the machine.)
+    *
+    * KNOWN LIMIT, stated so no number leans on it: this capacity image is READ-SIDE
+    * only. The real L2 is write-back/WRITE-ALLOCATE, so a store stream installs and
+    * evicts lines too; `AxiWriteEngine` is a separate object with no shared L2 state
+    * and does not. So a measured L2 miss rate here UNDERSTATES the pollution a real
+    * store stream causes. */
+  sets: Int = 0,
+  ways: Int = 8
+) {
+  require(sets >= 0, s"L2LatencyModel.sets = $sets must be >= 0 (0 = unbounded)")
+  require(sets == 0 || (Integer.bitCount(sets) == 1), s"L2LatencyModel.sets = $sets must be a power of two")
+  require(sets == 0 || ways == 8,
+    s"L2LatencyModel.ways = $ways: the ported tree-PLRU (l2c_plru_funcs.vh) is 8-way only")
+  def finiteCapacity: Boolean = sets > 0
+  def capacityBytes: Long = sets.toLong * ways.toLong * lineBytes.toLong
+}
 
 /** Full configuration of one attached memory model instance.
   *
@@ -172,12 +218,17 @@ class AxiMemStats(idWidth: Int) {
   var l2Hits = 0L
   var l2Misses = 0L
   var l2SecondaryMerges = 0L
+  /** Capacity evictions in the finite-L2 model. ZERO means the working set fit, which
+    * is itself a coverage finding: a kernel that never evicts an L2 line cannot
+    * measure anything that depends on a DRAM-latency miss. */
+  var l2Evictions = 0L
   var maxConcurrentReads = 0
   def totalAr: Long = arCount.sum
   def totalAw: Long = awCount.sum
   def reset(): Unit = {
     for (i <- 0 until nIds) { arCount(i) = 0L; awCount(i) = 0L }
     rBeats = 0L; wBeats = 0L; l2Hits = 0L; l2Misses = 0L; l2SecondaryMerges = 0L
+    l2Evictions = 0L
     maxConcurrentReads = 0
   }
 }
@@ -307,9 +358,82 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
   // The ID whose burst is currently mid-flight on R. Cleared on `last`. Enforces
   // "no cross-ID interleaving INSIDE a burst" for every mode except IllegalInterleave.
   private var lockedId: Int = -1
-  // L2 model state: lines currently resident, and in-flight primary misses.
+  // ── L2 model state: lines currently resident, and in-flight primary misses ──
+  // Residency has TWO representations and the config picks one (see
+  // `L2LatencyModel.sets`):
+  //   sets == 0  UNBOUNDED -- the historical `mutable.Set[Long]`, never evicted.
+  //   sets  > 0  a real SETS x WAYS tag array with 8-way tree-PLRU replacement,
+  //              ported from `macqd700-soc/rtl/soc/l2c_plru_funcs.vh`.
+  // The unbounded path is kept byte-for-byte so that `sets == 0` runs are bit-identical
+  // to every measurement taken before 2026-09-27.
   private val l2Lines = mutable.Set[Long]()
   private val l2InFlightLines = mutable.Map[Long, Long]()   // line -> readyAt
+  private val l2Fin   = cfg.latency.finiteCapacity
+  private val l2Sets  = if (l2Fin) cfg.latency.sets else 0
+  private val l2Ways  = if (l2Fin) cfg.latency.ways else 0
+  /** Tag array, `-1L` = invalid. Indexed [set][way], holding the LINE ADDRESS (not a
+    * truncated tag) so no tag-width arithmetic can go wrong here. */
+  private val l2Tag   = if (l2Fin) Array.fill(l2Sets, l2Ways)(-1L) else Array.empty[Array[Long]]
+  /** 7-bit tree-PLRU vector per set, exactly the `t[6:0]` of `l2c_plru_funcs.vh`. */
+  private val l2Plru  = if (l2Fin) Array.fill(l2Sets)(0) else Array.empty[Int]
+
+  private def l2SetOf(line: Long): Int =
+    ((line / cfg.latency.lineBytes) % l2Sets).toInt
+
+  /** `l2c_plru_victim` (`l2c_plru_funcs.vh:24-33`), transcribed. */
+  private def plruVictim(t: Int): Int = {
+    def bit(i: Int) = (t >>> i) & 1
+    val w2 = bit(0)
+    val w1 = if (w2 == 1) bit(2) else bit(1)
+    val w0 = if (w2 == 1) { if (w1 == 1) 1 - bit(6) else 1 - bit(5) }
+             else         { if (w1 == 1) 1 - bit(4) else 1 - bit(3) }
+    (w2 << 2) | (w1 << 1) | w0
+  }
+
+  /** `l2c_plru_next` (`l2c_plru_funcs.vh:35-60`), transcribed -- including the leaf
+    * bits' OPPOSITE polarity, which that file's own comment warns about. */
+  private def plruNext(t: Int, way: Int): Int = {
+    def set(v: Int, i: Int, b: Int) = if (b == 1) v | (1 << i) else v & ~(1 << i)
+    val w2 = (way >>> 2) & 1; val w1 = (way >>> 1) & 1; val w0 = way & 1
+    var nt = t
+    if (w2 == 0) {
+      nt = set(nt, 0, 1)
+      if (w1 == 0) { nt = set(nt, 1, 1); nt = set(nt, 3, w0) }
+      else         { nt = set(nt, 1, 0); nt = set(nt, 4, w0) }
+    } else {
+      nt = set(nt, 0, 0)
+      if (w1 == 0) { nt = set(nt, 2, 1); nt = set(nt, 5, w0) }
+      else         { nt = set(nt, 2, 0); nt = set(nt, 6, w0) }
+    }
+    nt
+  }
+
+  /** Is `line` resident? On a hit in the finite model, the access TOUCHES the way --
+    * which is what makes PLRU mean anything. */
+  private def l2Resident(line: Long): Boolean = {
+    if (!l2Fin) return l2Lines.contains(line)
+    val s = l2SetOf(line)
+    var w = 0
+    while (w < l2Ways) {
+      if (l2Tag(s)(w) == line) { l2Plru(s) = plruNext(l2Plru(s), w); return true }
+      w += 1
+    }
+    false
+  }
+
+  /** Install a completed fill. Finite model: prefer an invalid way, else evict the
+    * tree-PLRU victim. The evicted line simply stops being resident -- this model has
+    * no dirty bit, so an eviction costs no bus traffic here (see `L2LatencyModel.sets`
+    * for why that is a stated limit rather than an oversight). */
+  private def l2Install(line: Long): Unit = {
+    if (!l2Fin) { l2Lines += line; return }
+    val s = l2SetOf(line)
+    var w = 0; var victim = -1
+    while (w < l2Ways && victim < 0) { if (l2Tag(s)(w) == -1L) victim = w; w += 1 }
+    if (victim < 0) { victim = plruVictim(l2Plru(s)); stats.l2Evictions += 1 }
+    l2Tag(s)(victim) = line
+    l2Plru(s) = plruNext(l2Plru(s), victim)
+  }
 
   private def totalPendingBeats: Int = queues.map(_.size).sum
 
@@ -344,7 +468,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     val L = cfg.latency
     if (!L.enabled) return (0L, None)
     val line = addr & ~(L.lineBytes.toLong - 1)
-    if (l2Lines.contains(line)) { stats.l2Hits += 1; (L.hitCycles.toLong, None) }
+    if (l2Resident(line)) { stats.l2Hits += 1; (L.hitCycles.toLong, None) }
     else l2InFlightLines.get(line) match {
       case Some(t) =>
         // Same-line secondary merge onto an already-in-flight primary miss
@@ -447,7 +571,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
         // `latencyFor`'s doc comment). Skipped on a bus-error response, matching the
         // real L2's `fill_err` skip of `inst_valid` (`l2c_mshr.v` S_INSTALL).
         if (!b.bad) b.installLine.foreach { line =>
-          l2Lines += line
+          l2Install(line)
           l2InFlightLines.remove(line)
         }
         if (busConfig.useId)   r.id   #= b.id

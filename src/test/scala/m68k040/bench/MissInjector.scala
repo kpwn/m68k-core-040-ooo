@@ -81,6 +81,31 @@ import scala.collection.mutable
   *   - STEALING A WAY ALSO PERTURBS REPLACEMENT. A freed way changes which line the
   *     next victim is, so a few misses are collateral rather than injected. Again:
   *     measured, not assumed.
+  *
+  * ── ⛔⛔ THE ACHIEVED RATE IS COUPLED TO D-CACHE TIMING. DO NOT A/B A D-CACHE ──
+  * ── CHANGE WITH INJECTION ON WITHOUT CHECKING THE RATES MATCHED FIRST. ──────
+  * MEASURED, 2026-09-27, while A/B-ing slice D1.2 (fill-forward, `DcachePlugin`):
+  * the SAME injection percentage produced DIFFERENT achieved miss rates in the two
+  * arms -- aggregate 25.26 vs 20.75 D-misses/kI at identical `INJ_POINTS` and seeds,
+  * and on `chase-128` the requested D6/D18 achieved 6.94/13.89 in one arm and
+  * exactly 0.00 in the other. Every injected row of that comparison is therefore
+  * VOID: the arms differ in how much work they were given, not only in how fast they
+  * did it, and the faster-looking arm was also the less-injected one.
+  *
+  * The mechanism is this object's own steal TIMING argument, quoted above: "a demand
+  * miss ends with the cache RE-LAUNCHING the access against the freshly-installed
+  * line -- D-cache REPLAY ... so the FIRST S1 hit a line sees after a refill is that
+  * replay". Fill-forward answers the miss from the refill beat and never re-launches,
+  * so that replay hit -- the nomination this injector was designed around -- does not
+  * happen. Any D-cache change that alters which accesses appear as `ldS1Valid &&
+  * ldS1Hit` (the nomination event) or how much time the load FSM spends in
+  * `dbgFsmIdle` (the drain window) moves the achieved rate.
+  *
+  * RULE, the same one the board A/B rule states for silicon: compare the ACHIEVED
+  * `D/kI` column between arms BEFORE comparing cycles, and treat the zero-injection
+  * (`D0/I0`) rows as the only arms guaranteed matched. If injected arms must be
+  * compared, the injector needs a rate-controlled mode (steal to a target count, not
+  * to a target eligibility) -- that does not exist yet.
   */
 object MissInjector {
 
@@ -164,6 +189,14 @@ object MissInjector {
       robEmptyCycles: Long, retireStallCycles: Long,
       stallDcacheCycles: Long, stallWalkCycles: Long,
       dcRefusedInRefill: Long,
+      // ── THE D2 MLP CEILING (see `MLP CEILING` below). Cycles a presented load spent
+      // REFUSED while a refill was in flight, split by what it would have taken to
+      // serve it. `Ceil*Stall` counts only the subset where the ROB was also stalled,
+      // which is the honest upper bound on recoverable cycles.
+      ceilHitCyc: Long, ceilMergeCyc: Long, ceilSameSetCyc: Long, ceilMshrCyc: Long,
+      ceilHitStall: Long, ceilMergeStall: Long, ceilSameSetStall: Long, ceilMshrStall: Long,
+      ceilMergeEvents: Long, ceilMshrEvents: Long, ceilSameSetEvents: Long,
+      ceilInhibited: Long, ceilNoInflight: Long,
       // injection accounting
       dSteals: Long, dStealsSkippedDirty: Long, iSteals: Long,
       cycles: Long) {
@@ -227,6 +260,42 @@ object MissInjector {
       f"${dSum.toDouble / math.max(1, dBusy)}%6.3f[${collected.map(_.dOutstandingMax).max}%d] " +
       f"${iSum.toDouble / math.max(1, iBusy)}%6.3f[${collected.map(_.iOutstandingMax).max}%d]")
     println("=" * 148)
+    // ── THE D2 MLP CEILING ────────────────────────────────────────────────────
+    // `classifyRefusal` explains the four classes. Read `mshr%` FIRST: it is the only
+    // column a second MSHR plus a multi-outstanding crossbar can collect, and it is a
+    // generous UPPER bound (it assumes the overlap is perfect and free).
+    println()
+    println("=" * 148)
+    println("  D2 MLP CEILING -- refused-during-refill cycles, split by WHAT WOULD SERVE THEM")
+    println("  hit%    line IS resident -- hitUnderMissRead's prize (OFF today), NOT D2's; no bus needed")
+    println("  merge%  SAME line as the in-flight refill -- secondary-miss MERGE; NO second AXI, pays on TODAY's fabric")
+    println("  sset%   different line, SAME set -- the ratified D3 invariant FORBIDS overlapping these")
+    println("  mshr%   different set -- THE D2 PRIZE, and the ONLY class that needs the crossbar reworked")
+    println("  *Stl%   the same split restricted to cycles the ROB was also stalled = the honest bound")
+    println("  ev      distinct refusal EVENTS (a contiguous refusal of one line counts once)")
+    println("=" * 148)
+    println(f"${"point"}%-10s ${"kernel"}%-24s ${"refus%"}%7s ${"hit%"}%6s ${"merge%"}%7s ${"sset%"}%6s ${"mshr%"}%6s " +
+      f"| ${"hitStl%"}%7s ${"mrgStl%"}%7s ${"ssStl%"}%6s ${"mshStl%"}%7s | ${"mrgEv"}%6s ${"mshEv"}%6s ${"ssEv"}%5s ${"inh"}%5s ${"noAR"}%5s")
+    println("-" * 148)
+    for (s <- collected) {
+      println(f"${s.point}%-10s ${s.kernel}%-24s ${s.pct(s.dcRefusedInRefill)}%7.2f " +
+        f"${s.pct(s.ceilHitCyc)}%6.2f ${s.pct(s.ceilMergeCyc)}%7.2f ${s.pct(s.ceilSameSetCyc)}%6.2f ${s.pct(s.ceilMshrCyc)}%6.2f " +
+        f"| ${s.pct(s.ceilHitStall)}%7.2f ${s.pct(s.ceilMergeStall)}%7.2f ${s.pct(s.ceilSameSetStall)}%6.2f ${s.pct(s.ceilMshrStall)}%7.2f " +
+        f"| ${s.ceilMergeEvents}%6d ${s.ceilMshrEvents}%6d ${s.ceilSameSetEvents}%5d ${s.ceilInhibited}%5d ${s.ceilNoInflight}%5d")
+    }
+    println("-" * 148)
+    locally {
+      val tc = math.max(1L, collected.map(_.cycles).sum)
+      def p(f: Stats => Long): Double = 100.0 * collected.map(f).sum / tc
+      println(f"${"AGGREGATE"}%-35s ${p(_.dcRefusedInRefill)}%7.2f ${p(_.ceilHitCyc)}%6.2f ${p(_.ceilMergeCyc)}%7.2f " +
+        f"${p(_.ceilSameSetCyc)}%6.2f ${p(_.ceilMshrCyc)}%6.2f | ${p(_.ceilHitStall)}%7.2f ${p(_.ceilMergeStall)}%7.2f " +
+        f"${p(_.ceilSameSetStall)}%6.2f ${p(_.ceilMshrStall)}%7.2f | ${collected.map(_.ceilMergeEvents).sum}%6d " +
+        f"${collected.map(_.ceilMshrEvents).sum}%6d ${collected.map(_.ceilSameSetEvents).sum}%5d " +
+        f"${collected.map(_.ceilInhibited).sum}%5d ${collected.map(_.ceilNoInflight).sum}%5d")
+      println("  BOARD BOUND on any of this: D-cache stall is 6.1% of cycles on the real OS")
+      println("  workload and 0.80% on Dhrystone. A ceiling far above that is measuring something else.")
+    }
+    println("=" * 148)
     val dirty = collected.map(_.dStealsSkippedDirty).sum
     println(f"  D steals skipped because the line was DIRTY: $dirty " +
       f"(a copyback kernel's store destination is immune to injection by design)")
@@ -288,7 +357,7 @@ object MissInjector {
     // to 1152 windowed macros reported 112 D-misses/kI for a kernel whose steady state
     // misses essentially ZERO. Snapshotting at the window's first and last committing
     // cycle makes every rate below a genuine steady-state rate.
-    private val NC = 16
+    private val NC = 29
     private val D_LOAD_MISS = 0; private val D_STORE_MISS = 1; private val I_MISS = 2
     private val D_AR = 3;        private val I_AR = 4
     private val D_OUT_SUM = 5;   private val D_BUSY = 6
@@ -297,6 +366,14 @@ object MissInjector {
     private val STALL_DC = 11;   private val STALL_WALK = 12
     private val REFUSED = 13
     private val D_STEAL = 14;    private val I_STEAL = 15
+    // ── MLP CEILING ─────────────────────────────────────────────────────────────
+    private val CEIL_HIT_C = 16; private val CEIL_MERGE_C = 17
+    private val CEIL_SS_C  = 18; private val CEIL_MSHR_C  = 19
+    private val CEIL_HIT_S = 20; private val CEIL_MERGE_S = 21
+    private val CEIL_SS_S  = 22; private val CEIL_MSHR_S  = 23
+    private val CEIL_MERGE_E = 24; private val CEIL_MSHR_E = 25
+    private val CEIL_SS_E    = 26
+    private val CEIL_INHIB   = 27; private val CEIL_NOINFL = 28
     private val c      = Array.fill(NC)(0L)
     private var cStart = Array.fill(NC)(0L)
     private var cEnd   = Array.fill(NC)(0L)
@@ -310,10 +387,77 @@ object MissInjector {
     private val dPend = mutable.Queue.empty[(Int, Int, Long)]
     private val iPend = mutable.Queue.empty[(Int, Int, Long)]
 
+    // ── MLP CEILING state ────────────────────────────────────────────────────
+    // The D master's in-flight read line, tracked off the CHANNEL so no RTL signal
+    // has to be made public for it: latched at AR fire, released at R.last.
+    private var dInflightLine = -1L
+    private var dInflightArmed = false
+    // Event de-duplication: a refusal that persists for N cycles is ONE event.
+    private var lastCeilLine = -2L
+    private var lastCeilCls = -1
+    private var lastCeilCycle = -10L
+
     private def dLine(tag: Long, set: Int): Long =
       (tag << (dSetBits + dOffBits)) | (set.toLong << dOffBits)
     private def iLine(tag: Long, set: Int): Long =
       (tag << (iSetBits + iOffBits)) | (set.toLong << iOffBits)
+
+    /** ── THE D2 MLP CEILING ──────────────────────────────────────────────────
+      * Classify a load that the D-cache REFUSED while a refill was in flight by what
+      * it would take to serve it. This is the whole point: "the D side never overlaps
+      * two misses" is a fact about the MACHINE, but the PRIZE is the subset of those
+      * refused cycles that a second MSHR could actually have recovered -- and that
+      * subset is decided by the relation between the presented line and the in-flight
+      * one, plus whether the presented line is resident at all.
+      *
+      * The residency test is an ORACLE: the tag and valid arrays are read directly
+      * from the testbench, so "would this have hit?" is answered exactly rather than
+      * inferred. Four classes, and they mean four DIFFERENT engineering programmes:
+      *
+      *   HIT      the line IS resident. `hitUnderMiss` (probe arm, ON) exists for
+      *            exactly this and needs no bus concurrency; a refusal here means the
+      *            probe path could not claim it (no owning entry), which is what
+      *            `hitUnderMissRead` -- OFF on critical-path evidence -- would fix.
+      *            NOT a D2 prize.
+      *   MERGE    not resident, and it is THE SAME LINE the refill is already
+      *            fetching. Serving it needs a secondary-miss merge (plan §4.1(i),
+      *            M1/M2/M3) and NO second AXI transaction -- so it pays on TODAY's
+      *            single-outstanding crossbar. NOT contingent on the SoC.
+      *   SAMESET  not resident, a different line in the SAME set. The ratified D3
+      *            invariant ("one outstanding fill per cache SET") forbids overlapping
+      *            these, so this is prize that D2 as specified CANNOT collect.
+      *   MSHR     not resident, a different set. THE D2 PRIZE, and the only class that
+      *            needs both N_MSHR > 1 and a multi-outstanding crossbar.
+      */
+    private def classifyRefusal(robStalled: Boolean): Unit = {
+      val cmode = dc.loadCmdPort.payload.cacheMode.toEnum
+      if (cmode == m68k040.cache.CacheMode.INHIBITED) { c(CEIL_INHIB) += 1; return }
+      if (!dInflightArmed) { c(CEIL_NOINFL) += 1; return }
+      val paddr = dc.loadCmdPort.payload.paddr.toLong
+      val line  = paddr >>> dOffBits
+      val set   = ((paddr >>> dOffBits) & ((1L << dSetBits) - 1)).toInt
+      val tag   = paddr >>> (dOffBits + dSetBits)
+      var resident = false
+      var w = 0
+      while (w < dWays) {
+        if (dc.validsMem(w).getBigInt(set) != 0 && dc.tagMem(w).getBigInt(set).toLong == tag)
+          resident = true
+        w += 1
+      }
+      val inflSet = (dInflightLine & ((1L << dSetBits) - 1)).toInt
+      val cls =
+        if (resident) 0
+        else if (line == dInflightLine) 1
+        else if (set == inflSet) 2
+        else 3
+      c(Array(CEIL_HIT_C, CEIL_MERGE_C, CEIL_SS_C, CEIL_MSHR_C)(cls)) += 1
+      if (robStalled) c(Array(CEIL_HIT_S, CEIL_MERGE_S, CEIL_SS_S, CEIL_MSHR_S)(cls)) += 1
+      // One EVENT per contiguous refusal of the same line in the same class.
+      if (cls != 0 && (line != lastCeilLine || cls != lastCeilCls || cycle != lastCeilCycle + 1)) {
+        c(cls match { case 1 => CEIL_MERGE_E; case 2 => CEIL_SS_E; case _ => CEIL_MSHR_E }) += 1
+      }
+      lastCeilLine = line; lastCeilCls = cls; lastCeilCycle = cycle
+    }
 
     /** Called once per sampled cycle from `CoreBenchHarness.runKernel`. */
     def onCycle(): Unit = {
@@ -322,9 +466,14 @@ object MissInjector {
       epoch = cycle / epochCycles
 
       // ── bus-level accounting: misses and MLP, D and I, uniformly ─────────────
-      if (dc.axi.ar.valid.toBoolean && dc.axi.ar.ready.toBoolean) { c(D_AR) += 1; dOut += 1 }
-      if (dc.axi.r.valid.toBoolean && dc.axi.r.ready.toBoolean && dc.axi.r.payload.last.toBoolean)
+      if (dc.axi.ar.valid.toBoolean && dc.axi.ar.ready.toBoolean) {
+        c(D_AR) += 1; dOut += 1
+        dInflightLine = (dc.axi.ar.payload.addr.toLong >>> dOffBits); dInflightArmed = true
+      }
+      if (dc.axi.r.valid.toBoolean && dc.axi.r.ready.toBoolean && dc.axi.r.payload.last.toBoolean) {
         dOut = math.max(0, dOut - 1)
+        if (dOut == 0) dInflightArmed = false
+      }
       if (dOut > 0) {
         c(D_BUSY) += 1; c(D_OUT_SUM) += dOut
         if (windowOpened && dOut > dOutMaxWin) dOutMaxWin = dOut
@@ -356,8 +505,10 @@ object MissInjector {
         if (dcBusy) c(STALL_DC) += 1
       }
       if (dut.dtlb.logic.missPending.toBoolean) c(STALL_WALK) += 1
-      if (dcBusy && dc.loadCmdPort.valid.toBoolean && !dc.loadCmdPort.ready.toBoolean)
+      if (dcBusy && dc.loadCmdPort.valid.toBoolean && !dc.loadCmdPort.ready.toBoolean) {
         c(REFUSED) += 1
+        classifyRefusal(robCount != 0 && !retiring)
+      }
 
       if (!injecting || cycle < armAfter) return
 
@@ -450,6 +601,9 @@ object MissInjector {
         d(D_LOAD_MISS), d(D_STORE_MISS), d(I_MISS), d(D_AR), d(I_AR),
         d(D_OUT_SUM), dOutMaxWin, d(D_BUSY), d(I_OUT_SUM), iOutMaxWin, d(I_BUSY),
         d(ROB_EMPTY), d(RETIRE_STALL), d(STALL_DC), d(STALL_WALK), d(REFUSED),
+        d(CEIL_HIT_C), d(CEIL_MERGE_C), d(CEIL_SS_C), d(CEIL_MSHR_C),
+        d(CEIL_HIT_S), d(CEIL_MERGE_S), d(CEIL_SS_S), d(CEIL_MSHR_S),
+        d(CEIL_MERGE_E), d(CEIL_MSHR_E), d(CEIL_SS_E), d(CEIL_INHIB), d(CEIL_NOINFL),
         d(D_STEAL), dSkipDirty, d(I_STEAL), windowCycles)
     }
   }
