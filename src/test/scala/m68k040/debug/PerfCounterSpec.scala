@@ -62,6 +62,8 @@ class PerfCounterSpec extends AnyFunSuite {
     OFF_MISPRED_COUNT     -> "mispred",
     OFF_FLUSH_COUNT       -> "flush",
     OFF_PERF_BRANCH       -> "branch",
+    OFF_PERF_MISPRED_UNCOND -> "mispred_uncond",
+    OFF_PERF_MISPRED_COND -> "mispred_cond",
     OFF_PERF_DC_MISS      -> "dc_miss",
     OFF_PERF_IC_MISS      -> "ic_miss",
     OFF_PERF_DTLB_WALK    -> "dtlb_walk",
@@ -145,8 +147,8 @@ class PerfCounterSpec extends AnyFunSuite {
       val c0 = ctl(b, cd)
       println(s"[perf-csr] $c0")
       assertPerfFeatureWithheld(b, cd, "the producerless standalone fixture")
-      assert(c0.nCounters == 12,
-        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 12. " +
+      assert(c0.nCounters == 14,
+        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 14. " +
         "The host uses this to decide whether the block exists at all; a wrong value " +
         "makes it either refuse a real block or print a table for an absent one.")
       assert(c0.run, "RUN must be 1 out of debug POR so a build behaves like the " +
@@ -180,6 +182,11 @@ class PerfCounterSpec extends AnyFunSuite {
         ("mispred",      0x11110001L, v => csr.perfMispred     #= BigInt(v)),
         ("flush",        0x22220002L, v => csr.perfFlush       #= BigInt(v)),
         ("branch",       0x33330003L, v => csr.perfBranch      #= BigInt(v)),
+        // Positionally zipped with `Counters32` via `seedOffsets(idx)` -- these two must
+        // stay in the same place in BOTH lists or the aliasing check silently compares
+        // the wrong pair.
+        ("mispred_uncond", 0xBBBB000BL, v => csr.perfMispredUncond #= BigInt(v)),
+        ("mispred_cond", 0xCCCC000CL, v => csr.perfMispredCond   #= BigInt(v)),
         ("dc_miss",      0x44440004L, v => csr.perfDcMiss      #= BigInt(v)),
         ("ic_miss",      0x55550005L, v => csr.perfIcMiss      #= BigInt(v)),
         ("dtlb_walk",    0x66660006L, v => csr.perfDtlbWalk    #= BigInt(v)),
@@ -188,6 +195,10 @@ class PerfCounterSpec extends AnyFunSuite {
         ("stall_dc",     0x99990009L, v => csr.perfStallDc     #= BigInt(v)),
         ("stall_walk",   0xAAAA000AL, v => csr.perfStallWalk   #= BigInt(v)))
       val seedOffsets = Counters32.map(_._1)
+      assert(seeds.map(_._1) == Counters32.map(_._2),
+        s"the seed table and Counters32 have drifted apart: ${seeds.map(_._1)} vs " +
+        s"${Counters32.map(_._2)}. `seedOffsets(idx)` zips them BY POSITION, so a " +
+        "mismatch would seed one counter and read another and still pass.")
 
       for (((nm, seed, poke), idx) <- seeds.zipWithIndex) {
         poke(seed)
@@ -415,6 +426,11 @@ class PerfCounterSpec extends AnyFunSuite {
       dut.rob.logic.branchCompletion.payload.mispredict #= true
       dut.rob.logic.branchCompletion.payload.isBranch #= true
       dut.rob.logic.branchCompletion.payload.nextPc #= 0xBEEF
+      // brType MUST be poked: it is an input pin of this fixture, and the class counters
+      // below key on it. Leaving it at whatever the simulator randomised would make the
+      // bucket assertion a coin flip. 1 = UNCONDITIONAL (BRA/BSR/JMP/JSR) per BtbEntry in
+      // m68k040.frontend.Btb.
+      dut.rob.logic.branchCompletion.payload.brType #= 1
       cd.waitSampling()
       dut.rob.logic.branchCompletion.valid #= false
       guard = 0
@@ -436,6 +452,17 @@ class PerfCounterSpec extends AnyFunSuite {
         s"OFF_FLUSH_COUNT = ${w2("flush")} after exactly one global flush")
       assert(w2("branch") == 1L,
         s"OFF_PERF_BRANCH = ${w2("branch")} after one BTB-eligible branch retired")
+      // CLASSIFICATION against the REAL ROB, not a stub: the one mispredicting branch was
+      // brType=1, so it belongs in the UNCOND bucket and nowhere else.
+      assert(w2("mispred_uncond") == 1L && w2("mispred_cond") == 0L,
+        s"the retired mispredict was brType=1 (unconditional) but the class counters read " +
+        s"uncond=${w2("mispred_uncond")} cond=${w2("mispred_cond")}")
+      // Here the two sources HAPPEN to agree, because this single branch is BTB-eligible.
+      // That is not the general case and must not be read as one: see the non-summing
+      // property asserted in the mispredict-class test and documented in the .def.
+      assert(w2("mispred_uncond") + w2("mispred_cond") == w2("mispred"),
+        "with exactly one BTB-eligible mispredicting branch the class sum and " +
+        "OFF_MISPRED_COUNT coincide; they do NOT in general")
 
       // The CLEAR between the two windows really separated them: window 2 did not
       // inherit window 1's two macros.
@@ -443,6 +470,119 @@ class PerfCounterSpec extends AnyFunSuite {
         s"window 2 saw ${w2("inst_lo")} retired macros; expected exactly the one branch. " +
         "A larger number means the CLEAR between windows did not take, and every " +
         "'precise path' measurement would be contaminated by everything before it.")
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // 2b. MISPREDICT CLASSIFICATION. Not "the counters move" -- WHICH BUCKET each event
+  //     lands in, and that the two do NOT sum to OFF_MISPRED_COUNT.
+  // ══════════════════════════════════════════════════════════════════════════════
+  /** Just the debug block plus a DebugHistoryService, so `branchRetire` is a poked
+    * input and every (mispredicted, brType) combination can be driven exactly. The
+    * classification is a property of the event stream, not of the ROB, so this is the
+    * fixture that can state it without also having to make a real ROB produce one
+    * conditional and one unconditional mispredict. No RobPlugin here, so
+    * OFF_MISPRED_COUNT (fed from `branchRedirect`) stays at zero throughout -- which is
+    * itself the strongest possible statement of the non-summing property. */
+  class BranchClassPerfDut extends Component {
+    val db = new Database
+    val host = db on (new PluginHost)
+    val history = new DebugHistoryStubPlugin(2)
+    val dbg = new DebugCtrlPlugin(buildId = BigInt(0x50450004L), porCycles = 4, stage = 2)
+    db.on { host.asHostOf(Seq[FiberPlugin](history, dbg)) }
+    def axi: DbgAxiLite = dbg.logic.dbgAxi
+  }
+
+  test("mispredict class counters bucket by brType, and deliberately do NOT sum to MISPRED") {
+    M68kSim().compile(new BranchClassPerfDut).doSim("perf_mispred_class", 1) { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      val b = dut.axi
+      DbgAxiDriver.idle(b)
+      dut.dbg.logic.initDoneSeen #= false
+      dut.history.logic.pcValid.foreach(_ #= false)
+      dut.history.logic.branchValid #= false
+      dut.history.logic.exceptionValid #= false
+      cd.waitSampling(30)
+
+      /** One retired-branch event, one cycle wide, with an idle cycle after it so the
+        * counter is proven to count an EDGE and not a level. */
+      def branchEvent(mispredicted: Boolean, brType: Int): Unit = {
+        dut.history.logic.branchValid #= true
+        dut.history.logic.branchPc #= 0x1000L
+        dut.history.logic.branchNextPc #= 0x2000L
+        dut.history.logic.branchTaken #= true
+        dut.history.logic.branchMispredicted #= mispredicted
+        dut.history.logic.branchType #= brType
+        cd.waitSampling()
+        dut.history.logic.branchValid #= false
+        cd.waitSampling()
+      }
+
+      // brType encoding is owned by BtbEntry in m68k040.frontend.Btb:
+      //   "brType : 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR)".
+      val Cond = 0
+      val Uncond = 1
+
+      DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlClearRun)
+      cd.waitSampling(4)
+      assertAllZeroExceptCycle(b, cd)
+
+      // 5 conditional mispredicts, 3 unconditional mispredicts, and -- the classifier's
+      // real test -- 7 CORRECTLY PREDICTED branches of both types, which must land in
+      // NEITHER bucket. A counter keyed on `valid && brType` alone, forgetting
+      // `mispredicted`, passes every "the counter moved" check and reports 15/15 here.
+      for (_ <- 0 until 5) branchEvent(mispredicted = true,  brType = Cond)
+      for (_ <- 0 until 3) branchEvent(mispredicted = true,  brType = Uncond)
+      for (_ <- 0 until 4) branchEvent(mispredicted = false, brType = Cond)
+      for (_ <- 0 until 3) branchEvent(mispredicted = false, brType = Uncond)
+      cd.waitSampling(6)
+      DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlFreeze)
+      cd.waitSampling(4)
+
+      val w = readAll(b, cd)
+      println(s"[perf-class] uncond=${w("mispred_uncond")} cond=${w("mispred_cond")} " +
+              s"branch=${w("branch")} mispred=${w("mispred")}")
+      assert(w("mispred_cond") == 5L,
+        s"OFF_PERF_MISPRED_COND = ${w("mispred_cond")} after 5 CONDITIONAL mispredicts " +
+        s"(brType=0) and 3 unconditional ones; expected exactly 5. A wrong number here " +
+        "misattributes the campaign's biggest lever to the wrong predictor.")
+      assert(w("mispred_uncond") == 3L,
+        s"OFF_PERF_MISPRED_UNCOND = ${w("mispred_uncond")} after 3 UNCONDITIONAL " +
+        s"mispredicts (brType=1) and 5 conditional ones; expected exactly 3")
+      assert(w("mispred_cond") + w("mispred_uncond") == 8L,
+        "the 7 CORRECTLY PREDICTED branches must land in neither bucket; " +
+        s"cond=${w("mispred_cond")} + uncond=${w("mispred_uncond")} should be 8, not 15")
+      assert(w("branch") == 15L,
+        s"OFF_PERF_BRANCH = ${w("branch")} after 15 retired BTB-eligible branches -- the " +
+        "class counters and the denominator must come from the same event stream or a " +
+        "rate computed from them is meaningless")
+
+      // ── THE NON-SUMMING PROPERTY, asserted ────────────────────────────────────
+      // OFF_MISPRED_COUNT is fed from RobPlugin.branchRedirect, which is absent here, so
+      // it reads zero while 8 class-attributed mispredicts were counted. That is the
+      // extreme form of the property the .def documents: the two sources are DIFFERENT,
+      // the class counters see BTB-eligible branches only, and the residual
+      // `MISPRED_COUNT - (UNCOND + COND)` is a measurement of the uncovered class rather
+      // than a sign that something is broken. A future change that "fixed" the sum by
+      // re-sourcing these two from `branchRedirect` would destroy the attribution, and it
+      // would fail HERE.
+      assert(w("mispred") == 0L,
+        s"OFF_MISPRED_COUNT = ${w("mispred")} in a DUT with no RobPlugin. If this ever " +
+        "tracks the class counters, they have been re-sourced from the same signal and " +
+        "the residual that sizes the uncovered branch class is gone.")
+
+      // A clear really separates windows for the new lanes too.
+      DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlClearRun)
+      cd.waitSampling(4)
+      assertAllZeroExceptCycle(b, cd)
+      branchEvent(mispredicted = true, brType = Uncond)
+      cd.waitSampling(6)
+      DbgAxiDriver.write(b, cd, OFF_PERF_CTL, CtlFreeze)
+      cd.waitSampling(4)
+      val w2 = readAll(b, cd)
+      assert(w2("mispred_uncond") == 1L && w2("mispred_cond") == 0L,
+        s"window 2 saw one unconditional mispredict; got uncond=${w2("mispred_uncond")} " +
+        s"cond=${w2("mispred_cond")}")
     }
   }
 

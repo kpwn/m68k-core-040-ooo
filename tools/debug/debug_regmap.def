@@ -312,6 +312,33 @@ REG OFF_PERF_STALL_RETIRE 0x010A8 RO    2 0x00000000 Windowed cycles with the RO
 REG OFF_PERF_STALL_DC     0x010AC RO    2 0x00000000 Windowed cycles with the D-cache busy (DcachePlugin `busy`, the same bit OFF_STALL_DC[1] reports).
 REG OFF_PERF_STALL_WALK   0x010B0 RO    2 0x00000000 Windowed cycles with EITHER table walker out of IDLE. Read against OFF_PERF_STALL_RETIRE to see how much of the stall is MMU.
 REG OFF_PERF_DETAIL_CAP   0x010B4 RO    2 0x00000000 Optional detail counters: D1 magic, version 1, ROB count, dispatch count; zero when disabled.
+# MISPREDICT CLASS COUNTERS (2026-09-27). Which KIND of branch is mispredicting is the
+# question the campaign needs answered and the only one no board register could answer:
+# OFF_MISPRED_COUNT gives the total and the retired-branch ring gives individual events,
+# but nothing bucketed them. brType is 0 = CONDITIONAL (Bcc/DBcc) and 1 = UNCONDITIONAL
+# (BRA/BSR/JMP/JSR) -- the encoding is defined by BtbEntry in
+# src/main/scala/m68k040/frontend/Btb.scala, which is where to check it, not from memory.
+#
+# THEY DO NOT SUM TO OFF_MISPRED_COUNT, AND THAT IS THE POINT.
+#
+# These two are fed from the retired-branch debug Flow, which is gated by the BTB-update
+# decision: it sees BTB-ELIGIBLE branches only. OFF_MISPRED_COUNT is fed from the ROB's
+# commit-time `branchRedirect` and sees EVERY mispredicting branch. So
+#
+#     OFF_MISPRED_COUNT - (UNCOND + COND)  =  mispredicts on branches the fetch-time
+#                                             predictor never covered at all
+#
+# and that residual is a MEASUREMENT, not a discrepancy -- it is the free sizer for the
+# uncovered class (returns, and slot-1 branches, which have no predictor). Sim attribution
+# on 2026-09-26 put 34.5% of mispredicts on RETURNS and 38.7% on no-predict relative
+# unconditionals; this residual is how to confirm that on silicon.
+#
+# A READER WHO SEES THE SUM NOT MATCH MUST REACH "the gap is the answer", NOT "the
+# counters are broken". The opposite assumption has already been made out loud about a
+# build in which these two offsets were not even in this file and read as a map hole --
+# a zero with no producer AND no decode, presented as a working measurement.
+REG OFF_PERF_MISPRED_UNCOND 0x010B8 RO  2 0x00000000 Windowed mispredicts on BTB-eligible UNCONDITIONAL branches (brType=1: BRA/BSR/JMP/JSR). With COND, does NOT sum to OFF_MISPRED_COUNT -- see the note above; the residual is the uncovered class.
+REG OFF_PERF_MISPRED_COND 0x010BC RO    2 0x00000000 Windowed mispredicts on BTB-eligible CONDITIONAL branches (brType=0: Bcc/DBcc) = gshare direction errors. With UNCOND, does NOT sum to OFF_MISPRED_COUNT -- see the note above.
 REG OFF_PERF_DETAIL_BASE  0x01100 RO    2 0x00000000 Detail counter array, 32-bit words; layout in PerfDetailService.scala. Shares PERF_CTL clear/run/freeze.
 
 # ---------------------------------------------- MMU translation-key probes --
@@ -416,11 +443,37 @@ REG OFF_RTS_SNAP_W4       0x0303C RO    9 0x00000000 Legacy RTS snapshot word 4;
 REG OFF_RTS_SNAP_CLEAR    0x03040 W1P   9 0x00000000 Legacy RTS snapshot clear; reserved.
 
 # ------------------------------------------------------ optional ring RAMs --
-RANGE OFF_PC_TRACE_BODY   0x10000 0x1000 RO 3 PC trace ring body.
+# READ PROTOCOL for the two 16-byte-per-entry rings (EXC and BRANCH): READ WORD 0
+# OF AN ENTRY FIRST, then words 1..3 of that SAME entry.
+#
+# A 128-bit entry needs four bus reads, and the ring is written by a RUNNING CPU:
+# it turns over every `historyDepth` events, which on silicon is microseconds,
+# while two consecutive JTAG reads are milliseconds apart. Before 2026-09-27 each
+# word therefore came from a DIFFERENT event and the reader stitched four unrelated
+# events into one plausible line -- measured at 100 MHz on build_id 0xD01DBDC5 as
+# `pc=0x027de060` (a `beq.s`, successors 0x027de050 and 0x027de062) reported with
+# `next=0x027d30da`, the return address of an `rts` four branches later, and one PC
+# reported with three different `next` values.
+#
+# DebugCtrlPlugin now SNAPSHOTS the whole 128-bit entry when word 0 is read, tagged
+# with its index, and answers words 1..3 of that index from the snapshot. Word 0 is
+# the identifying field for exactly this reason (the exception's vector, the
+# branch's own PC). Read the words in any other order, or skip word 0, and the tag
+# misses: you are served the LIVE memory, i.e. words sampled at different times
+# that describe different events. A mismatched tag deliberately falls back to live
+# rather than silently serving another entry's tail.
+#
+# A DUMP IS A SAMPLE, NOT A WINDOW, and that is still true with atomic entries: the
+# ring keeps turning over while it is being read, so the entries of one dump need
+# not be consecutive events, and a *_RING_HEAD read before the sweep is already
+# stale by the end of it. Halt the CPU first if the WINDOW itself has to be
+# contiguous. A tool that prints a running ring as if it were a trace, with no halt
+# requirement and no warning, is presenting a sample as a measurement.
+RANGE OFF_PC_TRACE_BODY   0x10000 0x1000 RO 3 PC trace ring body. One 32-bit PC per entry, so no read-atomicity question arises.
 REG   OFF_PC_TRACE_HEAD   0x11000 RO 3 0x00000000 PC trace ring head pointer.
-RANGE OFF_EXC_RING_BODY   0x12000 0x1000 RO 3 Exception ring body.
+RANGE OFF_EXC_RING_BODY   0x12000 0x1000 RO 3 Exception ring body, 16 B/entry {vector, exceptionPc, faultAddress, handlerPc}. READ WORD 0 FIRST -- see the read-protocol note above.
 REG   OFF_EXC_RING_HEAD   0x13000 RO 3 0x00000000 Exception ring head pointer.
-RANGE OFF_BRANCH_RING_BODY 0x14000 0x1000 RO 3 Retired-branch ring body.
+RANGE OFF_BRANCH_RING_BODY 0x14000 0x1000 RO 3 Retired-branch ring body, 16 B/entry {pc, nextPc, meta, 0} with meta[0]=taken [1]=mispredicted [3:2]=brType. READ WORD 0 FIRST -- see the read-protocol note above.
 REG   OFF_BRANCH_RING_HEAD 0x15000 RO 3 0x00000000 Retired-branch ring head pointer.
 
 # ---------------------------------------------------------- feature bitmap --

@@ -1003,6 +1003,112 @@ class RobPluginSpec extends AnyFunSuite {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
+  /** RULES OUT a ROB-side field skew behind the board's torn branch-ring entries
+    * (2026-09-27). The existing "BTB training carries exact branch length" test above
+    * varies only `pc` and `len` per event: `nextPc` is a constant 0x8000, `taken` a
+    * constant True, `brType` a constant 1 and `mispredicted` a constant False, so a
+    * defect that paired one event's `pc` with another event's `nextPc`/`taken`/
+    * `brType`/`mispredicted` would pass it unseen. Here EVERY field of
+    * `debugBranchRetire` is a distinct function of the event index, over more than one
+    * ROB turn, with a non-branch retiring between every pair of branches (the
+    * `branchTrainMem` read enable is `retire0` -- EVERY retirement, not just a
+    * branch's -- so a non-branch retiring in the answer cycle is the shape that would
+    * re-point the read port under the payload). A mispredicting branch closes the test
+    * so the `mispredicted` bit is checked against BOTH values. */
+  test("every debugBranchRetire field comes from ONE branch event") {
+    M68kSim().compile(new SimpleDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      initSimple(dut, cd)
+      dut.rob.logic.branchCompletion.valid #= false
+
+      def evPc(i: Int): Long     = 0x4000L + i * 16
+      def evLen(i: Int): Int     = 1 + (i % 4)
+      def evTaken(i: Int)        = (i % 3) != 0
+      def evTarget(i: Int): Long = 0x00080000L + i * 32
+      def evType(i: Int): Int    = i % 4
+      def evNext(i: Int): Long   = if (evTaken(i)) evTarget(i) else evPc(i) + 2L * evLen(i)
+
+      def alloc(pc: Long, isBranch: Boolean): Int = {
+        val id = dut.rob.logic.tail.toInt
+        pokeRu(dut.rsrc.logic.src.payload(0), pc = pc, dstArch = 0,
+          pdstValid = false, isBranch = isBranch)
+        dut.rsrc.logic.src.valid #= true
+        dut.rsrc.logic.u1v #= false
+        cd.waitSamplingWhere(dut.rsrc.logic.src.ready.toBoolean)
+        dut.rsrc.logic.src.valid #= false
+        id
+      }
+
+      def completeBranch(id: Int, i: Int, mispredict: Boolean): Unit = {
+        val bc = dut.rob.logic.branchCompletion
+        bc.valid #= true
+        bc.payload.robId #= id
+        bc.payload.mispredict #= mispredict
+        bc.payload.nextPc #= evNext(i)
+        bc.payload.isBranch #= true
+        bc.payload.btbPc #= evPc(i)
+        bc.payload.btbTaken #= evTaken(i)
+        bc.payload.btbTarget #= evTarget(i)
+        bc.payload.brType #= evType(i)
+        bc.payload.btbLen #= evLen(i)
+        bc.payload.phtValid #= false
+        bc.payload.phtIndex #= 0
+        cd.waitSampling()
+        bc.valid #= false
+      }
+
+      /** Wait for the retired-branch debug pulse and check the WHOLE tuple against
+        * event `i`. Any field taken from a different event fails here, and the message
+        * names which field and which event it actually described. */
+      def awaitEvent(i: Int, mispredict: Boolean): Unit = {
+        var cycles = 0
+        while (!dut.rob.logic.debugBranchRetire.valid.toBoolean) {
+          assert(cycles < 16, s"no debugBranchRetire pulse for event $i")
+          cycles += 1
+          cd.waitSampling()
+        }
+        val h = dut.rob.logic.debugBranchRetire.payload
+        val got = (h.pc.toLong, h.nextPc.toLong, h.taken.toBoolean,
+                   h.mispredicted.toBoolean, h.branchType.toInt)
+        val want = (evPc(i), evNext(i), evTaken(i), mispredict, evType(i))
+        assert(got == want,
+          f"event $i: debugBranchRetire = (pc=0x${got._1}%x next=0x${got._2}%x " +
+            f"taken=${got._3} mispred=${got._4} type=${got._5}), expected " +
+            f"(pc=0x${want._1}%x next=0x${want._2}%x taken=${want._3} " +
+            f"mispred=${want._4} type=${want._5})")
+        cd.waitSampling()
+      }
+
+      val depth = M68kParams().robDepth
+      var events = 0
+      for (i <- 0 until depth + 5) {
+        val id = alloc(evPc(i), isBranch = true)
+        cd.waitSampling()
+        completeBranch(id, i, mispredict = false)
+        awaitEvent(i, mispredict = false)
+        // A NON-branch retirement between branches: `retire0` pulses (re-pointing the
+        // branchTrainMem read port) with no branch payload behind it.
+        val filler = alloc(0x70000L + i * 8, isBranch = false)
+        markComplete(dut, filler)
+        cd.waitSampling()
+        clearComplete(dut)
+        waitUntil(cd, dut.rob.logic.count.toInt == 0)
+        assert(!dut.rob.logic.debugBranchRetire.valid.toBoolean,
+          s"a non-branch retirement must not emit a branch debug event (after event $i)")
+        events += 1
+      }
+      assert(events == depth + 5)
+
+      // The mispredicting case: same coherence requirement with `mispredicted` set.
+      val mi = depth + 5
+      val mid = alloc(evPc(mi), isBranch = true)
+      cd.waitSampling()
+      completeBranch(mid, mi, mispredict = true)
+      awaitEvent(mi, mispredict = true)
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
   test("CacheControlService.dcacheEnabled mirrors ss.cacr(31) combinationally") {
     M68kSim().compile(new SimpleDut).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
