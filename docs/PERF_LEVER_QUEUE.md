@@ -50,7 +50,22 @@ Board `perf`, 100 MHz, `build_id=0xD01DBDC5`, two windows from one session:
 Retire is 0/1/2 per cycle, so from 9.32G retired in 54.6G cycles at 7.59% retire
 stall, **the ROB is EMPTY 75-84% of the time** on the real workload (Dhrystone:
 12-30%). Rough attribution: mispredict recovery ~20% of cycles, I-cache refill ~14%,
-ITLB walks ~11% — ~45% in the front end, against 6.1% D-cache and 6.7% walk.
+ITLB walks ~3% — ~37% in the front end, against 6.1% D-cache and 6.7% walk.
+
+⛔ **CORRECTED 2026-09-28. The "ITLB ~11%" in this table was WRONG and self-inconsistent**
+— it sat next to a 6.7% walk-stall figure it exceeded. `OFF_PERF_STALL_WALK` is
+`perfLvlDtlbWalk || perfLvlItlbWalk`, the **UNION of BOTH walkers**
+(`DebugCtrlPlugin.scala:712-714`), so 6.7% caps the whole I+D walk bucket and an 11% ITLB
+share is arithmetically impossible. Triangulated three ways, the real figure is **~3.0% of
+all cycles (3.65% on Finder idle)**: 6.7% ÷ (10.25 ITLB + 12.63 DTLB walks/kinst) = **17.2
+cycles/walk**, against a structural floor of ~14-15, and it **closes** —
+(10.25+12.63) x 17.2 = 389 cycles/kinst versus the 392.8 that 6.7% reports, so the two
+walkers barely overlap and the bucket is fully accounted for.
+
+This also retracts the in-tree "220+ cycles of completely dead frontend" per walk: that
+assumed a private AXI port and 70-cycle DDR, but the walker has been a `DcacheService`
+client since 2026-09-04. **`OFF_PERF_ITLB_WALK` (0x010A4) is in every bitstream and has
+never been read** — one register read settles it on silicon.
 
 **Almost all IPC work in this campaign has been back-end.** It optimises the ~8%
 where the ROB is busy and stuck.
