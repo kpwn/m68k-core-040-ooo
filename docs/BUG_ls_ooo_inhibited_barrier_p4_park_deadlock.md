@@ -694,3 +694,95 @@ deadlock and the silicon wedge -- and unlike the deadlock it is NOT fixed here.*
 separate defect with its own root cause, in LSU-stress programs under copyback and real
 page-table walks, and it is the obvious next thing to investigate for anyone trying to turn
 `LS_OOO_ISSUE` on. The knob stays default-OFF.
+
+## FIXED (2026-09-27): the recovery now FIRES -- sticky macro bit + `retire1` suppression
+
+Defect 2 (the mark/redirect predicate conflict) and defect 3 (the dual-retire
+re-execution) are both fixed, as priced above: ONE register, one extra input on the
+`orderRedirect` AND, one suppression term on `retire1`.
+
+### A THIRD hazard, created by the macro-spanning mark itself -- `!branchRedirect`
+
+Before the sticky, `orderRedirect` needed `orderViolated(h0)` with h0 the marked uop ITSELF,
+and a branch uop never performs an inhibited access, so "marked AND mispredicting" was
+structurally impossible. A macro-spanning mark makes it reachable: a macro whose memory uop is
+marked and whose LAST uop is a mispredicting branch -- `jmp`/`jsr (An)`, `rts`, `dbcc`, the
+memory-indirect control-transfer shapes -- sets both. `flushPcReg`'s when-chain places
+`orderRedirect` AFTER `branchRedirect`, so it would OVERRIDE the branch's resolved target with
+`p1.pc`, the fall-through: wrong-path execution. Note `debugRestartPc`'s own mux already orders
+`branchRedirect` above `orderRedirect`; the two were inconsistent, harmlessly, only because the
+conjunction could not occur.
+
+Dropping the redirect there loses nothing. The branch flush fires anyway (`doFlushReg` carries
+both terms), restarts at the resolved target, and discards every entry younger than h0 -- a
+SUPERSET of what the order redirect discards -- and `flushing` clears the sticky on the same
+cycle. The identical argument is why letting `exc.redirectValid` win, which `flushPcReg`
+already does, is safe too.
+
+**Measured: the term changes nothing on this program** (371 cycles, `orderRedirects=7`,
+byte-identical report), so the conjunction does not arise here. It is a guard against a
+reachable shape, not a fix for an observed one.
+
+### The `retire1` suppression covers every retire width and BOTH retire modes
+
+Checked in the RTL rather than assumed:
+
+* `retireWidth > 2`, ordinary path: `retireLanes(lane) := retireLanes(lane - 1) && ...`, a
+  chain -- blocking lane 1 blocks every wider lane.
+* prepared retirement: `preparedBatch.fire` already contains `retire1` as a term, so the
+  batch is suppressed with it.
+
+### Measured, knob ON, with `alignedLoadFallThrough` ON (the shipping combination)
+
+| | knob OFF | park only | park + recovery |
+| --- | ---: | ---: | ---: |
+| result | PASS | PASS | **PASS** |
+| cycles to sentinel | 229 | 225 | **371** |
+| inhibited launches / AXI device ARs | 8 / 8 | 8 / 8 | 8 / 8 |
+| flushes | 3 | 3 | 9 |
+| `orderViolations` | 0 | 6 | 7 |
+| `orderRedirects` | 0 | 0 | **7** |
+| `overlapAny` / `overlapBus` (non-fatal) | 8 / 2 | 1 / 0 | 0 / 0 |
+| A / B / C / D / D0 / E | clean | clean | clean |
+
+The device access stream is IDENTICAL in all three columns -- the same eight reads, the same
+two addresses, the same program order, the same robIds (7, 11, 20, 24, 1, 5, 14, 18). The
+recovery changes WHEN the program touches the device, never WHAT it touches.
+
+### THE AFFORDABILITY NUMBER -- the one this file listed as UNMEASURED and UNMEASURABLE
+
+**7 recoveries for 8 device reads over 4 loop iterations: 371 - 225 = 146 cycles, i.e. ~20.9
+cycles per recovery and +62.0% over the knob-OFF baseline of 229.**
+
+Read it as close to a worst case, not a typical mix: the program is a device-polling loop with
+two device reads per iteration and the data pointer recomputed in between, which is exactly
+the register-allocation shape that makes the relaxation put a younger op into P4 first. But it
+is a real number where there was none, and it says plainly that **the barrier is not free once
+it is actually enforced.**
+
+The lever, if that cost ever needs to come down, is the one thing the park deliberately left
+out: candidate 3's IQ "I bypassed an older un-issued LS op" bit. The park currently admits
+EVERY non-head inhibited op, which is strictly safer but marks more than it must; the guard
+would admit only the ops that actually need parking, and every park that never happens is a
+violation that never needs recovering. It is still not needed for correctness.
+
+### Termination, since a redirect could otherwise re-arm itself
+
+The redirect fires when the MARKED macro retires -- so by then the parked device access has
+already launched and retired. The younger ops that raced ahead re-execute with nothing older
+parked, cannot be marked again, and make progress. Measured: 7 redirects, sentinel reached.
+
+### Cost, measured not estimated
+
+`M68kSocketTop` synthesised flop bits: 101,898 (`LS_OOO_ISSUE` off, the shipping default) ->
+102,486 (on, with the park) -> **102,487** (on, with the park and the recovery). The recovery
+is **exactly ONE flop bit**. On `M68kFullCoreSynth` (which has no `lsOooIssue` parameter, so it
+is the knob-OFF build) the flop-bit count and the `always`-block count are IDENTICAL before and
+after, and the only netlist additions are two constant wires,
+`assign RobPlugin_logic_macroViolationPending = 1'b0` and
+`assign RobPlugin_logic_orderPairOk = 1'b1`, which fold away.
+
+Byte-identical Verilog is unattainable for any edit to `RobPlugin.scala`: SpinalHDL embeds
+source line numbers in generated signal names, so adding a comment renames hundreds of wires.
+Flop bits, `always` blocks and the set of non-constant assigns are the meaningful invariants,
+and all three are unchanged.
