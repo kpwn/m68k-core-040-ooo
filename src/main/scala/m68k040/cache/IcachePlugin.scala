@@ -141,6 +141,47 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     prefetchEnable.simPublic()
     prefetchEnable := prefetchEnable
 
+    // ---- RUNTIME write path for `prefetchEnable` (2026-09-27) ---------------------
+    // The register above was runtime-SHAPED but not runtime-REACHABLE: `simPublic()`
+    // reaches it from a testbench and `DBG_IC_PREFETCH_DISABLE` reaches it from a
+    // SEPARATE bitstream, so on silicon the ONLY way to compare prefetch on/off was to
+    // build twice -- and the two builds then differ by a placement lottery worth more
+    // than the effect (see the project's own "neither WNS metric attributes a sub-0.5ns
+    // change" finding). One bitstream, one toggle, is the difference between a
+    // measurement and a guess.
+    //
+    // THE TRAP IS THE ONE THE COMMENT ABOVE ALREADY NAMES, AND IT IS NOT RE-INTRODUCED:
+    // these are NOT `in Bool()`. An `in Bool()` created inside this Area becomes a port
+    // of the TOP-LEVEL component, where `default(...)` has no parent to apply at, so
+    // every full-core testbench silently reads 0 -- prefetch dead in exactly the runs
+    // that measure it (confirmed once already). These are plain internal wires with
+    // `allowOverride` and a False default, i.e. the IDENTICAL pattern
+    // `dbgMultiHotClear` below already uses for a DebugCtrlPlugin reach-in: a DUT that
+    // wires nothing keeps this register's own elaboration-time default, bit-identical
+    // to before.
+    //
+    // STICKY-LEVEL, NOT PULSE, by the driver's construction (DebugCtrlPlugin holds
+    // `icPfForce` from the first write onward). A level cannot be missed, and it makes
+    // the read-back unambiguous: what the host reads IS this flop.
+    //
+    // FMAX -- READ THIS BEFORE BLAMING A WNS MOVE ON IT. The `pfWindowHasCandidate`
+    // expression that consumes `prefetchEnable` is BYTE-IDENTICAL in the emitted
+    // Verilog before and after this edit; only the flop's own driver changed. But the
+    // consequence is real and is stated rather than hidden: with a self-loop as its only
+    // driver Vivado constant-folded this flop to 1 and DELETED the term, and it can no
+    // longer do that. So the allocator's final AND goes from FOUR live inputs
+    // (pfSeqValid, icacheEnabled, the limit compare, the page compare) to FIVE. Five
+    // inputs still fit ONE LUT6, so no logic LEVEL is added -- and the endpoint matters,
+    // because `FetchAlignPlugin`'s own measurement names
+    // `IcachePlugin_logic_pfNextPa_reg[*]/CE` as the destination of the core's ten worst
+    // setup paths on `build/vivado200_allfix` (-1.524 ns, 24 levels). This edit does not
+    // lengthen that cone; it does stop one of its inputs being free. If the owner's build
+    // shows movement there, THIS is the term to look at first.
+    // Nothing else in the machine reads these two wires.
+    val dbgPrefetchWrEn  = Bool(); dbgPrefetchWrEn.allowOverride;  dbgPrefetchWrEn  := False
+    val dbgPrefetchWrVal = Bool(); dbgPrefetchWrVal.allowOverride; dbgPrefetchWrVal := False
+    when(dbgPrefetchWrEn) { prefetchEnable := dbgPrefetchWrVal }
+
     // ---- resolve TranslationService ----
     val xlate = host[TranslationService]
     // The current architectural S bit (ROB-owned, same signal the privilege-violation
@@ -234,18 +275,34 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // this bit. Cleared on a demand fill of the same way/set, on the first demand hit,
     // and by invalidateAll.
     //
-    // Task #251: this array's ONLY consumer anywhere in the design is the
-    // `pfHitUseful` telemetry chain below (pfFilled -> pfFilledQ -> pfHitUsefulS1 ->
-    // pfHitUseful), which itself has exactly ONE reader in the whole repo --
-    // IcachePrefetchSpec's "M4: pfHitUseful telemetry" test. A 4-way x 64-set register
-    // array (256 flops) existing solely to feed one testbench counter directly
-    // contradicts this file's own adjacent principle a few hundred lines below ("the
-    // core must not carry measurement-only registers"). `pfFilled` is null outside a
-    // `GenerationFlags.simulation` elaboration (see M68kSim.scala / RobPlugin's
-    // `pcStore` for the same idiom) -- every read/write site below is itself wrapped
-    // in its own `GenerationFlags.simulation { ... }` block, so it must never be
-    // referenced unguarded.
-    val pfFilled = GenerationFlags.simulation { Vec.fill(ways)(Vec.fill(sets)(RegInit(False))) }
+    // ── HISTORY, AND WHY THIS IS SYNTHESISED AGAIN (2026-09-27) ───────────────────
+    // Task #251 made this array `GenerationFlags.simulation`-only, and was right at the
+    // time: its ONLY consumer was the `pfHitUseful` chain below (pfFilled -> pfFilledQ
+    // -> pfHitUsefulS1 -> pfHitUseful) whose ONLY reader was one testbench counter, so
+    // 256 flops were carrying a measurement nobody on silicon could read.
+    //
+    // It is unconditional again because that consumer changed. `OFF_PERF_IC_PF_USED` in
+    // the windowed perf block now reads this chain over `dbg_axi`, which is the whole
+    // point: the board reports 32.16 I-cache DEMAND misses per kinst over a real
+    // session, and the next-line prefetcher that is supposed to be covering them has
+    // never been measured on silicon at all. `ISSUED` alone cannot say whether a
+    // prefetch paid; only "a demand fetch hit a line a prefetch installed and nothing
+    // else had touched" can, and that predicate is per-(way,set) state -- there is no
+    // cheaper EXACT formulation of it.
+    //
+    // COST, stated rather than waved at: ways x sets = 4 x 64 = 256 flops, with the
+    // SAME write structure as the `valids` array immediately above (one set-decoded
+    // install write + one all-clear), plus one extra clear port at S1. The D input is a
+    // constant on every port, so each bit is a flop with enable logic and no data mux.
+    // FFs are the resource this design is NOT short of (24.5% used against 78.8% LUTs).
+    //
+    // NOT ON ANY CRITICAL PATH, by construction: the install write is addressed by
+    // `installSet`/`installWay` (both registers, inside the PREDECODE dwell), and the
+    // S1 clear is addressed by `s0Set` (a register) and enabled by `s1HitVec &&
+    // pfFilledQ` -- which reaches a flop ENABLE and nothing else, so it cannot extend
+    // `s1HitVec`'s own arc. The one thing it costs `s1HitVec` is fan-out, which is what
+    // Task 11 already accepted when it moved this clear from S0 to S1.
+    val pfFilled = Vec.fill(ways)(Vec.fill(sets)(RegInit(False)))
 
     // DEBUG (icache-corruption-fix task, temporary — mirrors DcachePlugin's
     // ldS1Valid/stS2Valid.simPublic() DEBUG hooks): exposes the raw shared arrays
@@ -263,11 +320,10 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     val anyInvalidate = invalidateAll || maintInvalidateAll
     when(anyInvalidate) {
       for (w <- 0 until ways; s <- 0 until sets) valids(w)(s) := False
-      // Task #251: sim-only clear of the sim-only pfFilled array -- see its
-      // declaration above.
-      GenerationFlags.simulation {
-        for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
-      }
+      // The prefetch-provenance marks die with the lines they describe: an invalidated
+      // line was never "used", and leaving the mark set would let a LATER demand fill
+      // into the same way/set be miscounted as a prefetch hit.
+      for (w <- 0 until ways; s <- 0 until sets) pfFilled(w)(s) := False
     }
 
     // ---- live parallel-VIPT lookup context (binding amendment 2026-08-10) ----
@@ -867,11 +923,10 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // shape this task exists to remove from the accept cone. Capturing the four bits
     // and clearing at S1 off `s1HitVec` costs 4 flops and no accept-cone logic.
     //
-    // Task #251: sim-only, same as `pfFilled` -- this shadow register exists purely to
-    // stage `pfFilled` reads for the sim-only telemetry chain, so it is gated the same
-    // way. Null outside `GenerationFlags.simulation`; every reference below is itself
-    // guarded.
-    val pfFilledQ = GenerationFlags.simulation { Reg(Vec(Bool(), ways)) }
+    // 2026-09-27: unconditional again, together with `pfFilled` -- see that array's
+    // declaration for why (the chain now feeds `OFF_PERF_IC_PF_USED` on the debug bus,
+    // not just one testbench). Four flops.
+    val pfFilledQ = Reg(Vec(Bool(), ways))
     s0Valid := False   // default each cycle; armed on cmdPort.fire / REPLAY / FAULT,
                        // and HELD by the S1 miss dispatch below the FSM
     // Sim-only visibility for `IcacheVerdictShadowSpec` (and, from Task 11, for the
@@ -1038,14 +1093,15 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // the `pfFilled` clear is real state. `!s0Replay` excludes the synthetic REPLAY/
     // FAULT contexts, whose `s1HitVec`/`pfFilledQ`/`s0Set` are stale.
     //
-    // Task #251: the whole block is sim-only (it reads/writes `pfFilled`/`pfFilledQ`,
-    // both null outside `GenerationFlags.simulation`). `pfHitUsefulS1` is declared
-    // INSIDE the gate too -- referencing it unguarded (as the pre-#251 code did, with
-    // an unconditional `Bool()` default-False declaration outside the gate) would
-    // dereference a value real synthesis never even computes a meaningful default for
-    // once the source registers are gone. `pfHitUseful` below (its one external reader)
-    // is gated the same way.
-    val pfHitUsefulS1 = GenerationFlags.simulation {
+    // 2026-09-27: unconditional again (it was `GenerationFlags.simulation`-only under
+    // Task #251). This wire IS the "prefetch was USED" event that `OFF_PERF_IC_PF_USED`
+    // counts, so it has to exist in the bitstream. AT MOST ONE PULSE PER PREFETCH, by
+    // construction: `pfFilled` is cleared on the same cycle it pulses, and `s1HitVec` is
+    // asserted one-hot-or-zero just above, so `hu` cannot fire twice for one install and
+    // cannot fire twice in one cycle. A DEMAND install writes the mark FALSE (see the
+    // install site), so a demand miss can never produce this event -- which is exactly
+    // the classification `PerfCounterSpec`'s "the coverage pair CLASSIFIES" test pins.
+    val pfHitUsefulS1 = {
       val hu = Bool(); hu := False
       when(s0Valid && !s0Replay && !s0Fault) {
         for (w <- 0 until ways) when(s1HitVec(w) && pfFilledQ(w)) {
@@ -1371,24 +1427,19 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     val predIsPf          = Bool(); predIsPf          := predIsPfReg
     predActive.simPublic(); predIsPf.simPublic(); commitBeat.simPublic()
     val fillArrayWrActive = Bool(); fillArrayWrActive := False
-    // Slice I3 telemetry: pure wires (zero flops, zero synthesis cost) that a
-    // testbench counts to derive design doc §8.3's "prefetch issued / useful /
-    // wasted". Deliberately NOT synthesised counters -- the core must not carry
-    // measurement-only registers.
+    // Slice I3 telemetry: a pure wire (zero flops) that a testbench counts to derive
+    // design doc §8.3's "prefetch issued / useful / wasted".
     // M3b: driven from the S1 telemetry block near the verdict (it needs `s1HitVec`,
     // which is computed there). Kept as a wire under this name so every testbench that
     // counts it is untouched.
     //
-    // Task #251: `pfHitUsefulS1` is now itself sim-only (see its declaration), so this
-    // must be gated the same way. `IcachePrefetchSpec`'s M4 test reads
-    // `dut.icache.logic.pfHitUseful` under `SimConfig.withVerilator`, whose DEFAULT
-    // `_spinalConfig` already calls `.includeSimulation` (unlike `M68kSpinalConfig()`,
-    // which `FullCoreSynth`/`GenFullCoreSynthVerilog` use un-simulation-flagged) --
-    // confirmed from the SpinalHDL 1.14.1 `SpinalSimConfig` companion object's default
-    // constructor, so the test's assertion power is unaffected.
-    val pfHitUseful = GenerationFlags.simulation {
-      val hu = Bool(); hu := pfHitUsefulS1; hu.simPublic(); hu
-    }
+    // 2026-09-27: un-gated (it was `GenerationFlags.simulation`-only under Task #251).
+    // THE COUNTER THIS FEEDS IS NOT IN THIS PLUGIN. DebugCtrlPlugin taps this wire with
+    // one flop of its own (`perfTap`) and counts the registered copy, so the I-cache
+    // still carries no counter and this wire still costs nothing beyond fan-out. What
+    // changed is only that the wire must now EXIST outside simulation, because its
+    // reader is the debug bus rather than a testbench. See `pfFilled`'s declaration.
+    val pfHitUseful = { val hu = Bool(); hu := pfHitUsefulS1; hu.simPublic(); hu }
     val demandFillStart = Bool(); demandFillStart := False
     // M3b: the demand fill is dispatched from S1, textually BELOW the FSM. This is the
     // request wire the plan's implementer note prefers over `fsm.forceGoto` -- it keeps
@@ -1817,13 +1868,12 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
             validsQ(w)   := lookupValids(w)
           }
           // M3b: same enable, same index (`lookupSet`) as the tag/valid capture above,
-          // so the four bits belong to the same set the verdict is computed for. Task
-          // #251: split out of that loop and sim-gated -- `pfFilledQ`/`pfFilled` are
-          // both sim-only telemetry plumbing now (see their declarations), whereas
-          // `tagQ`/`validsQ` remain real synthesized state the verdict depends on.
-          GenerationFlags.simulation {
-            for (w <- 0 until ways) pfFilledQ(w) := pfFilled(w)(lookupSet)
-          }
+          // so the four bits belong to the same set the verdict is computed for.
+          // Kept as its own loop (not merged with `tagQ`/`validsQ`) because these four
+          // bits are provenance TELEMETRY while those are state the verdict depends on.
+          // The read address is `lookupSet`, the same virtual index the tag/valid
+          // capture already uses, so this adds no new address decode to the accept cone.
+          for (w <- 0 until ways) pfFilledQ(w) := pfFilled(w)(lookupSet)
           // M4 (Task 12): the frontier seed / window-kill that stood HERE is deleted.
           // It was the LAST live-translation consumer outside the S0 capture: it read
           // `lookupFault`, `lookupCacheable` AND `lookupPaddr`, and it drove the clock
@@ -2564,6 +2614,29 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       mshrArSentGen(arHoldId.resize(mshrIdxBits)) := mshrGen(arHoldId.resize(mshrIdxBits))
     }
 
+    // ---- "prefetch ISSUED": one pulse per speculative 64-byte AXI burst ------------
+    // Tapped at the AR handshake, not at the MSHR allocation, deliberately. What the
+    // board needs to know about a prefetch that is never used is BANDWIDTH -- a fill
+    // burst that contended with a demand fill on the same port -- and an allocation
+    // without an AR has cost nothing yet. One AR here is exactly one 64-byte read
+    // (`len=1`, `size=5`, two 256-bit beats), so this counter is directly convertible to
+    // bytes.
+    //
+    // ZERO ADDED LOGIC DEPTH AND ZERO NEW SOURCES. `axi.ar.fire` already exists (two
+    // other consumers above), `arHoldValid`/`arHoldId` are registers, and `AxiIds.I_DEMAND`
+    // is 0, so the whole event is `arHoldValid && ar.ready && arHoldId.orR`. Its only
+    // reader is DebugCtrlPlugin's `perfTap`, i.e. a flop D input: the expression starts
+    // at flop outputs and ends at a flop input.
+    //
+    // CONSEQUENCE TO STATE OUT LOUD: ISSUED counts the BUS event, so a speculative fill
+    // that is later POISONED by an invalidate landing mid-fill, or that returns a bus
+    // error, is counted ISSUED and can never be counted USED -- correctly, because its
+    // bandwidth was spent. ISSUED - USED is therefore "wasted bandwidth" and NOT
+    // "installed but unused"; the two differ by the poison/error tail.
+    val pfArIssued = Bool()
+    pfArIssued := axi.ar.fire && (arHoldId =/= U(AxiIds.I_DEMAND, AxiIds.ID_W bits))
+    pfArIssued.simPublic()
+
     // Route every R beat solely by RID -- and after M2c the RID IS the MSHR index, so
     // there is no per-path index arithmetic left at all.
     val rIdx = axi.r.payload.id.resize(mshrIdxBits)
@@ -2830,12 +2903,13 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
                 valids(w)(installSet) := True
               }
               // Telemetry only: record whether the installed line arrived through a
-              // silent speculative ID. Demand installation clears the marker; window
-              // allocation does not depend on it. Task #251: sim-only, see `pfFilled`'s
-              // declaration.
-              GenerationFlags.simulation {
-                pfFilled(w)(installSet) := predIsPf && !anyInvalidate
-              }
+              // silent speculative ID. Demand installation clears the marker (the write
+              // is UNCONDITIONAL on an allocate, so `predIsPf` False stores False) --
+              // which is what makes "nothing else had touched it" exact rather than
+              // approximate, and what makes a DEMAND miss count in neither of the two
+              // prefetch counters. Window allocation does not depend on this bit.
+              // 2026-09-27: un-gated, see `pfFilled`'s declaration.
+              pfFilled(w)(installSet) := predIsPf && !anyInvalidate
             }
           }
         }
