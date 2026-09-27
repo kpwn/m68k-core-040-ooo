@@ -99,6 +99,11 @@ class IpcBenchSpec extends CoreBenchHarness {
         // IQ_LOAD_BYPASS=1 lets a load pass an older UNREADY LOAD (stores stay ordered).
         loadBypassUnreadyLoad = sys.env.get("IQ_LOAD_BYPASS").contains("1"),
         earlyAutoAnWriteback = sys.env.get("LS_EARLY_AN").contains("1"),
+        // LS_SPEC_WAKE=1 announces an aligned cacheable load's pdst at CACHE LAUNCH --
+        // one cycle before the irrevocable announce, i.e. a cache-hit PREDICTION. The IQ
+        // holds the released (LS-class-only) consumer at its issue register until the real
+        // announce confirms it, so a miss costs cycles and never a value. Default OFF.
+        specLoadWakeup = sys.env.get("LS_SPEC_WAKE").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`

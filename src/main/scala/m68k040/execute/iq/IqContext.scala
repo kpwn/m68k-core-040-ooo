@@ -91,6 +91,14 @@ case class IqHot() extends Bundle {
   val isLsClass   = Bool()
   val isCplxClass = Bool()
   val srcBRead    = Bool()
+  // An LS-class uop that is specifically a LOAD -- not a store, and not a LEA
+  // address-generate (`memOp === NONE`). The ONLY reader is the speculative-wakeup clear,
+  // which releases a consumer before the producing load is known to have hit; restricting
+  // it to loads is what keeps a STORE's address off the speculative path. Precomputed here
+  // rather than tested as `isLsClass && memOp === LOAD` in the clear, for the reason this
+  // record exists at all: the clear is a tight reg-to-reg path replicated across all 16
+  // slots, and it should read one flop, not decode an enum.
+  val isLsLoad    = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -140,6 +148,7 @@ case class IqHot() extends Bundle {
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
     srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
+    isLsLoad := isLsClass && (u.memOp === m68k040.isa.MemOp.LOAD)
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm
@@ -178,6 +187,20 @@ trait IssueQueueService {
     * must keep every consumer's operand capture after that writeback. This is
     * not a speculative cache-hit prediction. */
   def lsWakeup: Flow[UInt]
+  /** SPECULATIVE LS integer wakeup (optional; idle unless the LS EU's `specLoadWakeup`
+    * is on). The producer broadcasts the pdst of a load it has just handed to the
+    * D-cache -- one cycle before `lsWakeup`'s guaranteed-next-cycle announce for the
+    * same pdst, and therefore a PREDICTION (L1 hit) rather than a promise.
+    *
+    * `lsWakeup` still fires for that pdst when the result is real, and that firing is
+    * the CONFIRM. This port may only release LS-CLASS consumers, which the queue then
+    * holds at its LS issue register until the confirm arrives; anything else would let a
+    * consumer capture a register the load has not written. Deadlock-freedom rests on LS
+    * issue being strictly in program order: a held consumer is younger than the load it
+    * waits on, every older LS uop has already issued, and no other class's port is
+    * touched -- so the ROB head always reaches the load, even when the load FAULTS and
+    * the confirm never comes at all. */
+  def lsWakeupSpec: Flow[UInt]
   /** LS NZVC readiness, separate from integer lsWakeup: an operation may produce
     * either or both. Writeback is available now, or guaranteed next cycle with
     * earlyNzvcWakeup. As for lsWakeup, registered dependency clear and selection

@@ -31,6 +31,21 @@ trait LsEuService {
   // IQ wake/select contract as integer early wakeup. Applies to NZVC-writing loads,
   // stores and CCR restore, not a speculative prediction of their completion.
   def wakeupNzvc: Flow[UInt]   // pNzvcDst of a completing NZVC-writing LS op
+  // SPECULATIVE integer-result wakeup (`specLoadWakeup`, default OFF). Fires at the
+  // cycle an aligned, cacheable, translated LOAD is handed to the D-cache -- ONE cycle
+  // BEFORE `wakeup`'s irrevocable next-cycle-writeback announce, and therefore a
+  // PREDICTION (that the access hits L1 and returns next cycle) rather than a promise.
+  //
+  // It is NOT a substitute for `wakeup`: `wakeup` still fires for the same pdst when the
+  // result is genuinely committed, and that later firing is what CONFIRMS this one. A
+  // consumer released by this port must be held at a re-check stage that gates on the
+  // confirm, so a broken prediction costs cycles and never a wrong value. The IQ owns
+  // that re-check (see IssueQueuePlugin's `specPend` / `lsSpecBlocked`), and it releases
+  // ONLY LS-class consumers -- the single class whose issue is strictly in program order,
+  // which is what makes the hold provably deadlock-free.
+  //
+  // Idle (never valid) unless `specLoadWakeup` is set.
+  def wakeupSpec: Flow[UInt]
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -106,7 +121,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val detachedStoreEntries: Int = 1,
                  val earlyAutoStoreAddress: Boolean = false,
                  val earlyAutoAnWriteback: Boolean = false,
-                 val earlyStoreDataWake: Boolean = false) extends FiberPlugin with LsEuService {
+                 val earlyStoreDataWake: Boolean = false,
+                 val specLoadWakeup: Boolean = false) extends FiberPlugin with LsEuService {
+  // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
+  // that is worth stating because an earlier revision required both. The re-check pins a
+  // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
+  // so announcing "too early" is always safe and never wrong -- it only lengthens the hold.
+  //   * without `earlyIntWakeup` the confirm is the writeback cycle itself, so the
+  //     speculation spans two cycles instead of one and buys two instead of one.
+  //   * without `alignedLoadFallThrough` the cache command leaves the ring later than the
+  //     enqueue, so the hold simply lasts longer.
+  // Requiring the pairing would have blocked exactly the configuration the lockstep and
+  // fuzz harnesses run in, i.e. the only place this gets end-to-end correctness coverage.
   require(!earlyAutoStoreAddress || detachLateStore)
   require(!detachLateStore || reserveLateStore, "detached late stores require SQ reservation")
   require(detachedStoreEntries >= 1 && detachedStoreEntries <= 8)
@@ -126,6 +152,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var sqFlushSig: Bool             = null
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
+  var wakeupSpecPort: Flow[UInt]   = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
@@ -146,6 +173,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def sqDrained: Bool          = sqEmptySig
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
+  override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -259,6 +287,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
+    wakeupSpecPort = Flow(UInt(6 bits))   // pdst of a load PREDICTED to write back next cycle
+    wakeupSpecPort.simPublic()
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
@@ -3462,6 +3492,59 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
     }
     val p4Ready = !p4Valid || p4CanLeave
+
+    // ── SPECULATIVE LOAD WAKEUP (`specLoadWakeup`) ─────────────────────────────────
+    // Announce the pdst of an ordinary aligned cacheable load ONE CYCLE EARLY -- while it
+    // sits in P4, the cycle before its D-cache response could arrive -- instead of waiting
+    // for `wakeup`'s guaranteed-next-cycle announce.
+    //
+    // WHAT IS ALREADY KNOWN HERE, and therefore NOT predicted: the DTLB translation
+    // SUCCEEDED (a faulting translation completes in the XLATE stage via
+    // `captureFaultFront` and never reaches P4 at all); the access is aligned and
+    // single-line (`!twoAccess`); the page is CACHEABLE. THE ONE THING PREDICTED is that
+    // the D-cache answers next cycle, i.e. an L1 hit. MEASURED on `chase-pure`
+    // (L1-resident by construction): 1535 of 2052 loads answer in exactly 1 cycle.
+    //
+    // ═══ THE PREDICATE IS DELIBERATELY SHALLOW, AND THAT IS A TIMING FIX, NOT A STYLE
+    // CHOICE ═══════════════════════════════════════════════════════════════════════════
+    // The first version gated this on `alignedEnq` -- "the cycle the load is actually handed
+    // to the ring" -- which reads exactly right and cost 2.5 ns of FMax. `alignedEnq` sits
+    // under `p4LaunchOk`, and that pulls in `p4AtRobHead` (a robId compare against the ROB
+    // head), `sq.io.barrier.olderInhibitedStore`, `irqPreemptPendingIn`,
+    // `debugHaltImminentIn` and `alignedCanEnq`. Feeding that into the IQ's per-slot
+    // dynamic-wait CLEAR -- a tight reg-to-reg path across all 16 slots -- produced a
+    // single 31-logic-level cone
+    //   `p4Ctx_xlate_front_robId_reg -> ... -> IssueQueuePlugin lines_*_dynWaitAny_reg`
+    // at post-synthesis WNS -2.832 ns against the reference's -0.284, with 9,700 failing
+    // endpoints against 241. Every other failing path in that build was a pre-existing
+    // MIG/ETH/SD CDC path at -0.373 or better: ONE cone, all of the damage.
+    //
+    // So this reads ONLY flop outputs of the P4 context -- one or two LUT levels, the same
+    // depth as the ordinary `wakeup` port it rides beside -- and drops the launch gating
+    // entirely. That is sound because the IQ's re-check pins a released consumer to the
+    // CONFIRM, whatever cycle the confirm lands on: announcing before the load has actually
+    // launched (a still-retrying SQ-overlap query, a full ring, an inhibited-store barrier)
+    // only lengthens the hold. Announcing EARLY is always safe here; announcing DEEP is not.
+    //
+    // Consequences of dropping the gating, both benign:
+    //   * the announce is held for as many cycles as the load occupies P4. Setting the
+    //     outstanding bit is idempotent, so a repeated announce is a no-op.
+    //   * a load that turns out to be a FULL SQ FORWARD completes in the front path and
+    //     confirms in the SAME cycle this announces. The IQ applies the clear after the set
+    //     (`(pend | set) & ~clr`), so the confirm wins and no hold is ever armed -- which is
+    //     correct: the value really is written.
+    //
+    // `needsSupervisor && !supervisor` is excluded because such an entry owes a later
+    // privilege check and is barred from the ring's out-of-order early writeback, so the
+    // prediction would be wrong for the whole extra wait. It is a flop like the rest.
+    val specWakeFire: Bool = if (!specLoadWakeup) False else {
+      p4Valid && (p4Front.memOp === MemOp.LOAD) && p4Front.pdstValid &&
+        !p4Front.ccrRestore && !p4Front.twoAccess &&
+        !(p4Front.needsSupervisor && !p4Front.supervisor) &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    }
+    wakeupSpecPort.valid   := specWakeFire
+    wakeupSpecPort.payload := p4Front.pdst
 
     // ── inhibitedLoadBusySig: registered launch-through-consumption-plus-one-cycle
     // busy for an INHIBITED load's bus transaction -- the load-side mirror of
