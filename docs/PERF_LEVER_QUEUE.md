@@ -93,6 +93,56 @@ mispredict source and a fetch redirect, so fix the double-mispredict-per-call fi
 FDIP gets measured against a handicapped predictor.
 **#3 gates #5** too: know what next-line already covers before crediting FDIP with it.
 
+## Lever 5 refined — FDIP: the go/no-go is ONE counter, and FDIP is NOT next
+
+Measured/derived while instrumenting the existing prefetcher:
+
+- **The structural cap, quantified from board numbers.** 32.16 I-misses/kinst = one new
+  line every **31.1 instructions**, against a mispredict every **10.9** (1000/92.14).
+  The stream is redirected **~3x between consecutive line first-touches** — before
+  counting correctly-predicted taken branches, which next-line also cannot cross.
+  Next-line's runway is shorter than its stride.
+- **The FTQ already exists and is ON.** `FetchAlignPlugin(enableFetchDirected = true)`
+  (`FullCoreSynth.scala:856`), 32-entry `ftqMem` of `{brPc, brLen, target, phtIdx,
+  isCond}`, pushed at prediction/redirect time and popped at align/decode confirm. So
+  the predicted **target is already a registered value on the fetch side**, and the
+  cheap form of FDP is NOT a second predictor — it is letting `seedPfWindow` take the
+  predicted-target line as a SECOND seed (~100 flops mirroring the frontier registers,
+  plus arbitration for the existing 4 speculative MSHRs). No extra BTB/gshare port.
+- **But the FTQ is fetch->decode bookkeeping, not run-ahead** — its entries describe
+  branches fetch has already PASSED. The cheap form buys one fetch latency at each taken
+  branch; it fixes "next-line cannot cross a taken branch" and is not true run-ahead.
+  Real run-ahead needs the predictor queried with a PC fetch has not reached = a second
+  port. In-tree plans to cost that:
+  `docs/superpowers/plans/2026-08-09-ipc-fetch-directed-btb-implementation-plan.md`.
+
+**Sizing, cheapest first — do 1-3 and then STOP and decide:**
+1. **Free, one bitstream, no RTL:** with the new `OFF_IC_PREFETCH_CTL` toggle, run a
+   session prefetch ON then OFF and read IC_MISS / PF_ISSUED / PF_USED / PERF_BRANCH /
+   MISPRED_COUNT / CYCLE / INST. coverage = `USED/(USED+IC_MISS)`; waste =
+   `1 - USED/ISSUED`; benefit = `IC_MISS(off) - IC_MISS(on)`. **Decision rule:** high
+   coverage with IC_MISS still ~32/kinst -> the misses are cold/capacity and FDP is the
+   WRONG lever; high waste -> direction-limited, FDP both fixes it and recovers bandwidth.
+2. **`IC_MISS_SEQ` — ~40 LUT, and it IS the go/no-go.** Demand misses whose line ==
+   previous demand line + 64. That is next-line's exact ceiling, so **FDP's entire
+   addressable market is `IC_MISS - IC_MISS_SEQ`.** One registered compare at `s1Disp`.
+3. **`PF_LATE`** — cycles a demand fetch was held on an in-flight speculative fill
+   (`heldOnSetBusy` already exists, registered). Without it, high coverage hides "right
+   line, too late", whose fix is depth, not direction.
+4. Only if 1-3 say *direction*: a two-pass Verilator oracle (record the demand-line
+   sequence, replay with the prefetcher fed that future k lines ahead) bounds what ANY
+   FDP can claim — **driven by ROM boot + Finder, not the 25 kernels**, on `-cb`.
+
+**Why FDP is not next:** 96% of mispredicts are predictor COVERAGE holes (38.7%
+relative-unconditional with no predictor, 34.5% returns, 22.7% indirect; only 3.9%
+direction). FDP follows the same predictor, so it is wrong exactly where fetch is wrong
+and degenerates to next-line precisely where next-line already fails. Fix coverage
+first — larger lever (~20% of cycles) and the precondition for FDP to have a correct
+stream. ⚠️ And `pfNextPa_reg[*]/CE` — the prefetch frontier's clock enable — is already
+the destination of the core's **ten worst setup paths** (−1.524 ns, 24 levels,
+`FetchAlignPlugin.scala:68-78`), i.e. the most FMax-hostile place in the design to add a
+second frontier.
+
 ## Lever 9 — BRAM as a mux, not just as storage (owner, 2026-09-27)
 
 **"we can start using more bram where we can to remove load from LUTs" + "bram is also
