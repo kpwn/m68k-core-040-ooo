@@ -243,12 +243,24 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      *     ON  138,173 / 138,079 cyc      0.3557 / 0.3560 copy-B/cyc
                      *     = -7.84% cycles, +8.51% bandwidth (48.81 -> 44.98 cyc per
                      *       16-byte line). Two seeds agree to 0.08%.
+                     * And the STREAMING CONTROL, memcpy-64k, whose working set is 8x past
+                     * L1 rather than 2x:
+                     *     OFF 199,724 cyc  0.3281 copy-B/cyc
+                     *     ON  184,201 cyc  0.3558 copy-B/cyc   = -7.77% / +8.44%
+                     * Both arms are working-set-INDEPENDENT to within 0.03% (0.3278 vs
+                     * 0.3281 OFF, 0.3557 vs 0.3558 ON), so this is a streaming property and
+                     * not an artifact of a set that half-fits -- and that independence is
+                     * itself evidence the bottleneck is per-access, not capacity.
                      *
                      * THE MECHANISM DELIVERED EXACTLY WHAT IT PROMISED, and that is the
                      * interesting part. The bench's own L2 counters say READ transactions
                      * fell from 8,197 to 2,053 -- **3.99x**, the designed 4x to within a
                      * rounding -- with `misses=513` IDENTICAL in both arms, so the
-                     * footprint did not move and no compulsory miss was traded away.
+                     * footprint did not move and no compulsory miss was traded away. The
+                     * 64k control says the same: 16,387 -> 4,099 reads (**3.998x**) with
+                     * `misses=2,049` identical. ⚠ `missRate` RISES (6.26% -> 24.99%) purely
+                     * because the DENOMINATOR shrank 4x; the numerator is unchanged. Quote
+                     * the absolute miss count here, never the rate.
                      *
                      * ⚠ AND THE PREDICTION WAS STILL WRONG BY 8x. It was +62-77%, from a
                      * transaction-count model that priced a transaction at ~16 cycles by
