@@ -134,7 +134,34 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * consuming the shared tag/data read port a second time, which is
                      * occupancy. Those are separate effects and must be reported
                      * separately -- the occupancy argument must not be allowed to carry the
-                     * latency claim. */
+                     * latency claim.
+                     *
+                     * ── WHAT IT IS ACTUALLY WORTH, MEASURED, AND AGAINST A PREDICTION ──
+                     * MADE BEFORE THE MEASUREMENT (which is why the agreement means
+                     * something): `MemcpyBandwidthSpec`, `IPC_MEM=l2:5:60:4096`,
+                     * memcpy-16k seed 1 --
+                     *     OFF 149,929 cyc -> ON 143,673 cyc      -4.17% cycles
+                     *     48.81 -> 46.77 cycles per 16-byte line  saving 2.04 cyc/line
+                     *     0.3278 -> 0.3421 copy-bytes/cycle       +4.35% bandwidth
+                     *                                             (32.8 -> 34.2 MB/s @100MHz)
+                     * The PREDICTION was 46.80 cyc/line / +4.3%, derived from the memcpy
+                     * decomposition (see `loadMissStoreBarrier`): a copy is THREE serialised
+                     * trips per line and fill-forward helps exactly ONE of them -- the source
+                     * load refill. The measured saving of 2.04 cyc/line is one refill's worth,
+                     * not three, so the measurement independently CONFIRMS that decomposition:
+                     * had fill-forward reached T2 (write-allocate) or T3 (writeback) the saving
+                     * would have been 4 or 6 cycles per line.
+                     *
+                     * ⚠ AND THE LATENCY FRAMING BADLY UNDERSTATES IT. Against the board's
+                     * D-cache stall (24.43 D-miss/kinst at CPI 5.862) the same 2 cycles is
+                     * ~0.83% of cycles -- below the board's noise floor. The difference is
+                     * that on a bandwidth-bound stream nothing is hidden: 2 cycles come off
+                     * the DENOMINATOR of `bytes x MLP / cycles_per_miss`, so the same change
+                     * is worth 4.35% there and ~0.3% on Dhrystone. Quote the regime with the
+                     * number. On the cache-resident corpus it is smaller still: `dhry-cb-128`
+                     * at zero injection is -0.62%/-0.85% cycles, and `chase-128` is
+                     * BIT-IDENTICAL (its steady state takes no D-miss at all -- the correct
+                     * negative control for this lever). */
                    val fillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward)
     extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
