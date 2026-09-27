@@ -305,3 +305,37 @@ not a result. The two real targets are the **integer PRF** (9,957 LUT, 4,584 LUT
 8. **Check the bench even CONTAINS the shape.** Four coverage holes found in one week:
    zero A6/A7 operands, zero store→load pairs, zero load→compare→branch chains, and 25
    total suite mispredicts against the board's 24.4 MPKI.
+9. **The stall budget is an ACCOUNTING IDENTITY, not a decomposition — check conservation
+   before writing RTL.** On a kernel that is never front-end starved (`robEmpty == 0`)
+   with a 2-wide retire, `uops` is fixed by the program, so:
+
+   ```
+   cycles = retireStall + retire1 + retire2       uops = retire1 + 2*retire2
+      =>   Δcycles = ΔretireStall − Δretire2
+   ```
+
+   **A lever that cuts retire-stall and gives back the same number of dual-retire cycles
+   is cycle-neutral BY CONSTRUCTION.** Both deltas are the same cycles, counted once as a
+   stall and once as an extra single-retire cycle. Read the test as:
+
+   - both fall together → **CONSERVED. The gain never existed — stop.**
+   - stall falls, `retire2` holds → cycles *must* fall; if they did not, something really
+     absorbed it — **attack that.**
+
+   `StallBudget.conservationResidual` ships it; `[stall-budget]` prints `conserved` when
+   the identity binds and returns `None` when the preconditions fail. Verified by
+   reproducing all eight `-cb` cycle deltas from two of its own terms.
+
+   ⛔ **This retracts the "retire-stall −8.2% win cancelled out" reading of
+   `byteAbs-cb`.** ΔStall −1,519 with ΔRetire2 −1,519 is a bucket swap, not a gain in
+   transit. Apply the same test to the two other "works, but blocked" levers —
+   `dcacheHitUnderMissRead` and `loadBypassUnreadyLoad`.
+
+   A pair census on the same kernel also shows the retire stage **declines nothing**:
+   every lost pair is `h1LateByOne`, `headForbidsPair` is **0 on both arms**, and
+   GATE-SAID-NO is bit-identical at 1,536. The pair is *not available*, not refused — so
+   the remaining ~5.2% needs h1 to **complete** earlier, which is execution bandwidth,
+   not a retire gate.
+
+   🎯 Open lead, unsized: `load/store` has **96 of 289 retiring cycles blocked by
+   `h0PreciseCompletedSticky`** — pairs present AND complete, and declined.
