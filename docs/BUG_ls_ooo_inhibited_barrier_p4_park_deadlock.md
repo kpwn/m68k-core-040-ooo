@@ -1,7 +1,12 @@
 # BUG: with `lsOooIssue` ON, the inhibited memory barrier PARKS IN P4 and starves the
 # ROB head -- the third instance of one circular wait
 
-**Status**: OPEN, and **PRE-EXISTING -- not caused by the barrier work**. Reproduced on
+**Status**: **FIXED** (the deadlock) by the depth-4 INHIBITED PARK BUFFER in `LsEuPlugin`,
+behind the existing default-OFF `lsOooIssue` knob. `LsOooInhibitedOrderSpec` is now GREEN
+with the knob ON. Two further defects found while gating it are recorded at the bottom and
+are NOT fixed: the barrier's recovery half had never been wired in any sim harness, and it
+is dead for multi-uop macros. The bug was **PRE-EXISTING -- not caused by the barrier
+work**. Reproduced on
 `aa312145` (before `b4fc15db`) with the IQ relaxation alone and no barrier code present;
 see the measured table below. Likely the mechanism behind the recorded silicon wedge
 attributed to `loadBypassUnreadyLoad`. Reproducer committed and RED BY DESIGN with the knob
@@ -379,3 +384,313 @@ software-visible direction (inhibited store then younger access) already has a r
 comparator in `olderInhibitedStore` and measures zero violations; and the TTR in use is
 CM=11, cache-inhibited NONSERIALIZED. Making it fatal is a spec change with an IPC number
 attached, not a test edit.
+
+
+## THE FIX (2026-09-26): a depth-4 inhibited park buffer
+
+`LsEuPlugin`, inside `if (lsOooIssue)` so a knob-OFF build is bit-identical. An inhibited op
+that reaches P4 and is not yet the ROB head is written into a 4-entry park holding the
+finished `AlignedLoadCtx`, and **P4 is released the same cycle**, so the older op behind it
+in P3 can pass. The parked entry drains into the ring when its robId matches `robHeadIn` --
+a one-hot match, since robIds are unique among in-flight ops, so no age-priority encoder is
+needed.
+
+Why it cannot re-deadlock: a parked entry is outside the ring's SEND pointer and outside its
+COMPLETION pointer and outside the pipe, so it obstructs nothing; and every gate it waits on
+(`olderStore` age-qualified, ring room, `p4PreemptSafe`) is released by ops it no longer
+blocks.
+
+Implementation notes that matter:
+
+* **The drain reuses the ordinary `alignedEnq` push event and only redirects the payload.**
+  All ring bookkeeping -- `alignedCount`, `alignedPushPtr`, valid/sent/poisoned/done/wb --
+  is therefore shared and cannot drift. A separate push path would have duplicated the
+  `alignedCount` selector, whose under-enumeration is the recorded silent ring leak that
+  pins `alignedFull` high on an empty ring (`cpush_split_fault_ring_leak.s`).
+* **The barrier query is taken, not muxed-and-shared.** When a parked entry is ready, it
+  owns `sq.io.barrier.robId` and `p4LaunchOk` is forced False for those cycles. Age-safe
+  with no starvation argument: the draining entry is the ROB head, so whatever is in P4 is
+  necessarily younger. Muxing the query while letting P4 still act on the result would hand
+  P4 a verdict computed for a different robId -- the silent-reorder class, not a stall.
+* **The pre-launch barrier half is preserved by a sticky per-slot bit.** `parkSaw(i)` is set
+  when a program-younger ring entry actually SENDS while slot i is parked, and reported on
+  `orderViolationPort` at drain. Marking on the bus event rather than on ring residency is
+  tighter (a poisoned entry never reaches a device, so it is not a violation) and cannot be
+  missed by a send on a cycle the violation logic is not looking.
+* **DELIBERATE, TRIPWIRED LIMITATION**: a SPLIT inhibited access (misaligned device access
+  crossing a line or page) is not parked -- it needs two ADJACENT slots to preserve the
+  split pair's contiguity invariant, which this random-access park does not provide -- and
+  neither is any inhibited access arriving with the park full. Both keep today's in-P4 wait
+  and remain exposed. A `GenerationFlags.simulation` assert fires if either happens with a
+  program-OLDER LS op upstream, so the residual gap is LOUD and measured by every suite
+  rather than argued.
+* **Candidate 3's park guard (an IQ "I bypassed an older un-issued LS op" bit) is NOT
+  implemented, and not half-implemented.** It is still sound, but here it would only reduce
+  park PRESSURE; it is not needed for correctness, because parking every non-head inhibited
+  op is strictly safer than parking none. The tripwire measures whether pressure is ever a
+  problem. If it never fires, the guard buys nothing and should stay out.
+
+### Measured
+
+`testOnly m68k040.fuzz.LsOooInhibitedOrderSpec`:
+
+| | knob OFF (shipping default) | knob ON |
+| --- | ---: | ---: |
+| result | PASS | **PASS** (was DEADLOCK) |
+| cycles to sentinel | 229 | **225** |
+| inhibited launches / AXI device ARs | 8 / 8 | 8 / 8 |
+| cacheable launches | 14 | 15 |
+| A / B / C / D / D0 / E | clean | clean |
+| `orderViolations` | 0 | **6** (all 6 from the park) |
+| `orderRedirects` | 0 | **0** |
+| `flushes` | 3 | 3 |
+| `overlapAny` / `overlapBus` (non-fatal) | 8 / 2 | 1 / 0 |
+
+`OldestLsProgress` is unchanged and still the criterion. The non-vacuity guards pass in both
+columns. The knob-ON run is 4 cycles FASTER than knob-OFF and the non-fatal overlap metric
+improves 8->1, because the park frees P4 earlier than the old in-place wait did.
+
+### THE AFFORDABILITY NUMBER, and why it is not the whole answer
+
+**`orderViolations = 6` over 4 loop iterations (~1.5 per iteration, 8 device reads), and
+`orderRedirects = 0`.** So the barrier costs **zero cycles today** -- but not because there
+was nothing to recover. It costs zero because the recovery never fires, for the reason in
+the next section. If the recovery is repaired, the cost on this program would be up to 6
+flushes per 4 iterations, and THAT is the number that decides affordability on device-heavy
+code. It remains unmeasured.
+
+## FOUND WHILE GATING (2026-09-26), NOT FIXED: two defects in the pre-existing recovery
+
+### 1. `RobPlugin(lsOooIssue = ...)` was never set in ANY simulation harness
+
+The barrier's recovery half -- `orderViolated` / `orderRedirect` -- lives in `RobPlugin`
+behind its own `lsOooIssue` parameter. `SocketTop` correctly drives `LsEuPlugin`,
+`RobPlugin` and `IssueQueuePlugin` from one switch (`SocketTopConfig.LS_OOO_ISSUE`). Every
+SIM harness set it on the LS EU and the IQ and **omitted the ROB**:
+
+    FuzzCoreDut          lsEu ✓  iq ✓  rob ✗
+    CoreBenchHarness     lsEu ✓  iq ✓  rob ✗
+    ExecuteLockStepSpec  lsEu ✓  iq ✓  rob ✗
+
+With it False the LS EU's `orderViolation` port is wired but IGNORED, so **the recovery had
+zero simulation coverage** -- the same shape as the CPUSH `icMaintFlush` fix that was wired
+only in `FullCoreSynth`. Fixed in all three harnesses (test-side only; every default stays
+OFF).
+
+### 2. The recovery is DEAD for multi-uop macros -- its precondition contradicts the marker's
+
+`orderRedirect = retire0 && orderViolated(h0) && p0.last && (count > 1)`. The IQ's matching
+precondition is that a bypassing uop must be **FIRST** of its instruction (quoted in
+`orderRedirect`'s own comment). For any instruction that cracks into more than one uop those
+two are **mutually exclusive**: the violator is always first, and the recovery demands last.
+
+Measured, knob ON: `orderViolated(7)` is set from cycle 61 onward with `head == 7`, and
+`orderRedirect` never asserts. `retire0` must fire (the head advances and the program
+completes), `count > 1` holds (the loop continues), and the mark is present -- so `p0.last`
+is the only false term. `move.l (An),Dn` is a 2-uop macro in this core: the five loop-body
+loads occupy robIds 3,5,7,9,11, spaced by 2, and the violator is the first of its pair.
+
+**Consequence: the barrier's pre-launch half is currently NOT ENFORCED.** Violations are
+detected and marked correctly and then dropped. This is pre-existing -- it is a property of
+`dbff8619`'s recovery, not of the park, which only made the marks reachable in sim for the
+first time. Repairing it is the same territory as candidate 3 (a restart PC that is a macro
+boundary for something other than the head), so it is NOT attempted here.
+
+### 3. `orderRedirect` re-executes a just-committed instruction on a DUAL RETIRE
+
+Found while pricing the repair for defect 2. `orderRedirect` restarts at `p1.pc` and nothing
+suppresses `retire1`:
+
+    orderRedirect = retire0 && orderViolated(h0) && p0.last && (count > 1)
+    when(orderRedirect) { flushPcReg := p1.pc }
+
+    retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && ...
+
+`headAllowsPair` has no `orderViolated` term. So when h0 and h1 retire in the SAME cycle and
+h0 is a marked macro-last uop, h1 **commits** and the machine then restarts at `p1.pc` --
+h1's own PC -- re-executing an instruction whose architectural effects have already been
+committed. For a store or an auto-update that is silent corruption, and it is the
+`inhibited-load-irq-replay` shape again.
+
+**It is LATENT TODAY only because `orderRedirect` has never fired in any build**
+(`RobPlugin(lsOooIssue)` was never set anywhere -- see defect 1). It is recorded here as a
+defect in its own right, independent of whether any fix ships, because it would GO LIVE the
+moment anyone repairs the defect-2 mark conflict without noticing the pair case -- which is
+exactly the sequence a reader of defect 2 alone would follow.
+
+## PRICED (2026-09-26): repairing defect 2 with a STICKY MACRO BIT -- it works, ~1 flop bit
+
+The proposal is to make the marking predicate and the recovery predicate coincide instead of
+excluding each other. Not by propagating a per-uop mark, but by a single register that spans
+the macro currently retiring:
+
+    when(retire0 && orderViolated(h0) && !p0.last) { macroViolatedSticky := True }
+    orderRedirect = retire0 && (orderViolated(h0) || macroViolatedSticky) && p0.last &&
+                    (count > 1)
+    when((retire0 && p0.last) || flushing) { macroViolatedSticky := False }
+
+Sound because the ROB retires STRICTLY IN ORDER and a macro's uops are CONTIGUOUS, so one
+bit is enough to carry "somewhere in the macro now retiring, a violation was marked" from any
+uop to the last one. The three questions, answered:
+
+1. **Carrier / bits.** No per-uop state and no new carrier: **ONE flop bit**, plus one extra
+   input on the `orderRedirect` AND and one suppression term on `retire1` (below). The mark
+   itself keeps living in the existing `orderViolated` Vec. Nothing has to know the macro's
+   last robId at marking time, which is what made per-uop propagation awkward.
+2. **Is the macro's last uop still in flight when the mark is set?** YES, and the argument is
+   independent of which uop is marked. The mark is produced while the marked uop has not even
+   COMPLETED (it is parked, or resident at P4), and retire requires completion -- so the
+   marked uop has not retired, and every LATER uop of its macro is younger still. A sibling
+   can therefore never have retired ahead of the mark. Note this also removes the
+   `firstOfInstr` requirement entirely: first, middle or last all work, which is what makes
+   it fit the park, since the park marks EVERY non-head inhibited op and not only bypassing
+   ones.
+3. **Does the restart PC exist?** YES, and this is the whole difference from candidate 3.
+   With h0 the macro's LAST uop, `p1` is the next macro's FIRST uop, so `p1.pc` is an
+   ordinary macro boundary -- and it is already read and already used by today's
+   `when(orderRedirect) { flushPcReg := p1.pc }`. No new `payload` read port, no
+   arbitrary-head PC, and nothing has to roll back to a mid-macro point, so the per-robId
+   RAT/Freelist checkpoint problem does not arise at all.
+
+**The dual-retire case is why `retire1` must be suppressed, not handled.** If h0 (marked,
+not last) and h1 (last) retire together, the sticky register cannot be set in time -- it is a
+register, and the pair retires in one cycle. Handling the pair instead would mean redirecting
+to the entry AFTER h1, which is `p2` -- and `payload` is read at `h0` and `h1` only
+(`p0 = payload.readAsync(h0)`, `p1 = payload.readAsync(h1)`), so it would need a THIRD read
+port on that Mem. Suppressing `retire1` when a marked macro's last uop is in the pair costs
+one AND term and no port: the last uop then retires alone on the next cycle with `p0.last`
+true and `p1` the next macro, the redirect fires normally, and the cost is ONE cycle. This
+also fixes defect 3 as a side effect, since the suppression is exactly the missing
+`orderViolated` term in the pair gate.
+
+Verdict: **NOT candidate-3 territory.** ~1 flop bit, two AND terms, no new read port, no
+rollback machinery. The earlier "macro-boundary restart PC for something other than the head"
+framing was wrong: by deferring the redirect to the macro's LAST uop the head IS a macro
+boundary, which is the observation that dissolves the problem.
+
+## FOUND WHILE GATING (2026-09-27): the park was BROKEN in the only build that can ship it
+
+**The park LOST DEVICE READS as originally written, and no simulation could see it.** Found by
+inspection of the fall-through arm, then reproduced.
+
+`LsEuPlugin`'s optional `alignedLoadFallThrough` arm lets a P4 load send its command in the
+same cycle it allocates its ring descriptor. Its enable is
+
+    alignedFallThrough = alignedFallThroughSelect && alignedEnq &&
+                         (p4Ctx.xlate.cmode =/= INHIBITED)
+
+and its payload is taken from **P4** (`alignedCmd` is overridden under
+`alignedFallThroughSelect`). The park drain asserts the *same shared* `alignedEnq` — that
+sharing is deliberate, so all ring bookkeeping stays in one place — but its payload comes from
+the **park**, not from P4. So on a drain cycle with the ring empty at the send pointer:
+
+1. the device descriptor is written into the ring slot, and
+   `alignedSent(alignedPushPtr) := alignedFallThroughFire` marks it **already sent**;
+2. the command actually presented on the bus is assembled from whatever **P4** holds;
+3. `rid === alignedSendPtr` points at the device entry, so that bogus command's response is
+   delivered to the device load.
+
+Net effect: the device read **never reaches the bus**, and the device load completes with
+another access's data. Silent corruption plus a dropped device access.
+
+### Why no test could see it, and this is the same shape as the CPUSH `icMaintFlush` hole
+
+| build | `alignedLoadFallThrough` | `lsOooIssue` reachable? |
+| --- | --- | --- |
+| `SocketTop` (the SHIPPING build) | **`= ipcThroughput`, i.e. TRUE on the board** | YES (`LS_OOO_ISSUE`) |
+| `FuzzCoreDut` (reproducer + whole ported corpus) | default **FALSE** | yes |
+| `CoreBenchHarness` | caller-supplied, default FALSE | yes |
+| `FullCoreSynth` | `--aligned-load-fall-through` flag, default FALSE | no `lsOooIssue` param |
+
+`SocketTop` is the **only** place `lsOooIssue` can be turned on, and it is the only place the
+fall-through is on. So the one configuration in which the park can ever ship was the one
+configuration nothing simulated. Every green run above was taken with the fall-through OFF.
+
+### Measured, both directions
+
+    FUZZ_LS_OOO=1 sbt "testOnly m68k040.fuzz.LsOooInhibitedOrderSpec"
+
+| park as first written | fall-through | result |
+| --- | --- | --- |
+| unfixed | OFF (old fuzz default) | PASS, 225 cyc, 8 inhibited launches / 8 AXI device ARs |
+| unfixed | **ON (shipping)** | **FAIL — assertion A: device `0xffff0100` launched 3 times, expected 4**; `inhibLaunches=5 axiDevReads=5`, i.e. **3 of 8 device reads LOST**, 214 cyc |
+| fixed | ON (shipping) | **PASS, 225 cyc, 8 / 8**, `orderViolations=6` (all park), A/B/C/D/D0/E clean |
+| fixed | OFF | PASS, 225 cyc, 8 / 8 — unchanged |
+
+### The two fixes
+
+1. **`alignedEnqFromP4`** — the fall-through arm is only valid when **P4** is the push source:
+   `if (lsOooIssue) alignedEnq && !parkDrain else alignedEnq`. A drained entry then simply
+   sends from the ring on a later cycle, which is the ordinary path (inhibited accesses are
+   excluded from the fall-through anyway, which is what the pre-existing `cmode` term is for).
+   The post-drain cycle cannot re-trigger the select, because `alignedPushPtr` has advanced
+   past `alignedSendPtr` — so the existing
+   `assert(!(alignedFallThroughSelect && alignedSendValid))` stays satisfied.
+2. **`parkSaw`'s comparand** — it compared against `alignedMem(alignedSendPtr).bk.robId`. On a
+   fall-through fire that slot **has not been written yet** (it is written the same cycle), so
+   the memory still holds the previous occupant — an OLDER robId — which makes `sentIsOlder`
+   true and **silently drops the mark**. It must use `alignedCmd.bk.robId`, which is exactly
+   what the command port presents on both paths. So the pre-launch half was also
+   under-reporting, in the direction that loses violations.
+
+### And the coverage that makes them testable
+
+`FuzzCoreDut` now defaults `alignedLoadFallThrough` to the LS-OoO switch
+(`FUZZ_LS_FALLTHROUGH` overrides), so the knob-ON DUT matches the shipping combination and the
+risky configuration is the one the corpus exercises. The shipping default (`FUZZ_LS_OOO`
+unset) is unchanged: fall-through stays OFF there, exactly as before.
+
+**Generalisation worth keeping.** The park deliberately shares `alignedEnq` with P4 so that
+ring bookkeeping cannot drift — and that sharing is precisely what let a *second* consumer of
+`alignedEnq` mis-attribute the push to P4. Sharing an event is safe; sharing an event whose
+consumers infer the SOURCE from it is not. Any future consumer of `alignedEnq` has to ask
+which of the two sources fired.
+
+## CORPUS GATE (2026-09-27): the knob-ON red set, and what owns each red
+
+Full `PortedM68kOooSpec` (1,022 registered tests: 974 programs + the cache-mode and MMU-walk
+sweeps), run twice on the SAME tree, once at the shipping default and once with the knob on:
+
+| run | `FUZZ_LS_OOO` | succeeded | failed |
+| --- | --- | ---: | ---: |
+| CONTROL | unset (shipping default) | 1,010 | 12 |
+| knob ON (fall-through ON) | 1 | 1,004 | 18 |
+
+**Every one of the control's 12 reds is also red with the knob on, with the identical sentinel
+word** -- `exc_partial_macro_move_mem_mem` (`0xbad0a008`, documented as a standing baseline red
+needing A3 multi-access restartability), `mmu_atc_write_hit_sets_modified` (`0xdead0903`),
+`rom_scc_mmio_btst_dbf_timeout`, and the FPU family (`fpu_fmove_fp_to_ea_matrix`,
+`fpu_fmovem_multi`, `fpu_fmovem_x_an_indirect` / `_pcdi` / `_roundtrip`,
+`fpu_fsave_frestore_idle_roundtrip`, plus their copyback-sweep variants).
+
+### The 6-red DELTA is the RELAXATION, and it is PRE-EXISTING -- not the park
+
+The knob-ON run adds exactly six, which are THREE programs in the two cached sweep postures:
+
+    ported-sweep-copyback: add_mem_postinc_rmw      ported-sweep-mmuwalk: add_mem_postinc_rmw
+    ported-sweep-copyback: memind_full_matrix       ported-sweep-mmuwalk: memind_full_matrix
+    ported-sweep-copyback: store_forward_matrix     ported-sweep-mmuwalk: store_forward_matrix
+
+Note the AS-WRITTEN variants of all three PASS; only the copyback and MMU-walk sweep postures
+fail. Attributed by a four-way controlled run over exactly those nine selected tests
+(`-z add_mem_postinc_rmw -z memind_full_matrix -z store_forward_matrix`):
+
+| LsEuPlugin | `FUZZ_LS_OOO` | `alignedLoadFallThrough` | succeeded / failed |
+| --- | --- | --- | ---: |
+| park + fall-through fix | OFF | ON | **9 / 0** |
+| park + fall-through fix | ON | OFF | 3 / 6 |
+| park + fall-through fix | ON | ON | 3 / 6 |
+| **HEAD (no park, no fix)** | **ON** | OFF | **3 / 6 -- SAME SET** |
+
+The failure sentinels are IDENTICAL across the three failing columns
+(`0xdead0002`, `0xdead0009`, `0xdeadbeef` x2, `0xfa110016` x2). So:
+
+* the park does not cause them, and does not change them;
+* the fall-through does not cause them (knob OFF with the fall-through ON is 9/0);
+* **`loadBypassUnreadyLoad` alone does**, on master's own LS EU.
+
+**This is a THIRD independent reason the relaxation cannot ship as-is, alongside the P4-park
+deadlock and the silicon wedge -- and unlike the deadlock it is NOT fixed here.** It is a
+separate defect with its own root cause, in LSU-stress programs under copyback and real
+page-table walks, and it is the obvious next thing to investigate for anyone trying to turn
+`LS_OOO_ISSUE` on. The knob stays default-OFF.

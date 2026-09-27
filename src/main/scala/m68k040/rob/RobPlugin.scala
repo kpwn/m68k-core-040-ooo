@@ -2214,6 +2214,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Latched BEFORE the alloc resets below so a same-cycle alloc to this index wins,
     // exactly as `mispredictStore`'s alloc-priority discipline requires.
     if (lsOooIssue) when(lsOrderViolation.valid) { orderViolated(lsOrderViolation.payload) := True }
+    if (lsOooIssue) orderViolated.foreach(_.simPublic())   // sim-only: recovery-rate diagnosis
     when(alloc0) {
       payload.write(tail, payloadFrom(allocUopVec(0)))
       completes(tail)       := False

@@ -275,6 +275,11 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
       val violD         = mutable.ArrayBuffer.empty[String]
       val violD0        = mutable.ArrayBuffer.empty[String]
       var orderViolations = 0
+      var orderRedirects  = 0   // the barrier's RECOVERY actually firing, not just marking
+      var violFromPark = 0
+      var violFromP4   = 0
+      val markLog = mutable.ArrayBuffer.empty[String]
+      val markedRetired = mutable.ArrayBuffer.empty[String]
       var flushes         = 0
       val lc  = dut.dcache.logic.loadCmdPort
       val ax  = dut.dcache.logic.axi
@@ -327,8 +332,14 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         progress.failure.foreach { m => dumpLs("stuck"); fail(s"(1b) $m") }
 
         if (dut.rob.logic.doFlushReg.toBoolean) flushes += 1
-        if (dut.lsEu.orderViolationPort.valid.toBoolean) orderViolations += 1
-
+        if (lsOoo && dut.rob.logic.orderRedirect.toBoolean) orderRedirects += 1
+        if (lsOoo && dut.lsEu.orderViolationPort.valid.toBoolean) {
+          val r = dut.lsEu.orderViolationPort.payload.toBigInt
+          val fromPark = ls.parkViolation.toBoolean
+          orderViolations += 1
+          if (fromPark) violFromPark += 1 else violFromP4 += 1
+          markLog += f"cyc=$cycles rob=$r ${if (fromPark) "PARK" else "P4"}"
+        }
         // AXI reads to device space
         if (ax.ar.valid.toBoolean && ax.ar.ready.toBoolean) {
           val a = ax.ar.payload.addr.toBigInt
@@ -340,12 +351,28 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         // -- strictly stronger than "no older ring entry is resident" -- and its
         // companion `olderStore` covers the drained-SQ half. Reading either at the ring
         // SEND cycle reads a different op's gate (see the sampling note in the header).
-        if (ls.p4Inhibited.toBoolean &&
-            (ls.alignedEnq.toBoolean || ls.alignedEnqSplit.toBoolean)) {
-          if (!ls.p4AtRobHead.toBoolean)
-            violD0 += f"cyc=$cycles inhibited op enqueued while NOT the ROB head"
-          if (ls.sq.io.barrier.olderStore.toBoolean)
-            violD0 += f"cyc=$cycles inhibited op enqueued with an older store resident"
+        // SECOND SAMPLING FIX, same class as the one in the header note. The ring
+        // enqueue now has TWO sources: P4 directly, and a PARK DRAIN. On a drain cycle
+        // P4 holds a DIFFERENT op, so `p4AtRobHead`/`p4Inhibited` describe that other op
+        // and reading them attributes the wrong gate -- exactly the mistake the first
+        // version of assertion D made one stage over. The property asserted is unchanged
+        // ("an inhibited access is enqueued only under a satisfied head gate"); only the
+        // signals that name the op differ per source. Note the real guarantee is
+        // independently checked by D at the SEND cycle (robId == head, no older ring
+        // entry resident), which does not depend on this attribution at all.
+        if (ls.alignedEnq.toBoolean || ls.alignedEnqSplit.toBoolean) {
+          val fromPark = lsOoo && ls.parkDrain.toBoolean
+          if (fromPark) {
+            if (!ls.parkOwnsBarrier.toBoolean)
+              violD0 += f"cyc=$cycles park drain with NO parked entry at the ROB head"
+            if (ls.sq.io.barrier.olderStore.toBoolean)
+              violD0 += f"cyc=$cycles park drain with an older store resident"
+          } else if (ls.p4Inhibited.toBoolean) {
+            if (!ls.p4AtRobHead.toBoolean)
+              violD0 += f"cyc=$cycles inhibited op enqueued from P4 while NOT the ROB head"
+            if (ls.sq.io.barrier.olderStore.toBoolean)
+              violD0 += f"cyc=$cycles inhibited op enqueued from P4 with an older store resident"
+          }
         }
 
         // cache launch stream
@@ -452,6 +479,7 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         f"[ls-ooo-inhib] FUZZ_LS_OOO=$lsOoo cycles=$cycles sentinel=$sentinelSeen " +
         f"inhibLaunches=${launches.size} axiDevReads=${axiDevReads.size} " +
         f"cacheableLaunches=$cacheableLaunches flushes=$flushes orderViolations=$orderViolations " +
+        f"orderRedirects=$orderRedirects violFromPark=$violFromPark violFromP4=$violFromP4 " +
         f"violC(inhibited,FATAL)=${violCInhib.size} overlapAny=${overlapAny.size} " +
         f"overlapBus=${overlapBus.size} violD=${violD.size} violD0=${violD0.size}"
       println(report)
@@ -462,6 +490,7 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         overlapAny.take(8).mkString("\n  "))
       if (violCInhib.nonEmpty) println("[ls-ooo-inhib] violC(inhibited) first 8:\n  " + violCInhib.take(8).mkString("\n  "))
       if (violD.nonEmpty)      println("[ls-ooo-inhib] violD first 8:\n  " + violD.take(8).mkString("\n  "))
+      println("[ls-ooo-inhib] marks: " + markLog.mkString(" "))
       if (violD0.nonEmpty)     println("[ls-ooo-inhib] violD0 first 8:\n  " + violD0.take(8).mkString("\n  "))
 
       assert(sentinelSeen, s"program did not reach its sentinel in $cycles cycles (hang?) -- $report")

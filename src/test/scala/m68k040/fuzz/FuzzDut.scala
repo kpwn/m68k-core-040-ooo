@@ -388,16 +388,31 @@ class FuzzCoreDut extends Component {
   val dec    = new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
-  val rob    = new RobPlugin
+  private val fuzzLsOoo = sys.env.get("FUZZ_LS_OOO").contains("1")
+  // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+  // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+  // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+  // from one switch; every SIM harness omitted it, so the recovery had never been
+  // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+  // wired only in FullCoreSynth and had zero sim coverage.
+  val rob    = new RobPlugin(lsOooIssue = fuzzLsOoo)
   // FUZZ_LS_OOO=1 turns on out-of-order LS issue (the relaxed select) TOGETHER with the
   // LS-side inhibited two-way barrier. They must move together: the relaxation without the
   // barrier is what wedged the board as `loadBypassUnreadyLoad`.
-  private val fuzzLsOoo = sys.env.get("FUZZ_LS_OOO").contains("1")
   val iq     = new IssueQueuePlugin(loadBypassUnreadyLoad = fuzzLsOoo)
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
-  val lsEu   = new LsEuPlugin(lsOooIssue = fuzzLsOoo)
+  // SHIPPING-MATCHED COVERAGE. `SocketTop` sets `alignedLoadFallThrough = ipcThroughput`
+  // (true on the board), and `LS_OOO_ISSUE` can only be on in that same build -- so the ONLY
+  // configuration in which the park can ship has the fall-through ON, and every fuzz DUT left
+  // it at its default FALSE. That gap hid a lost-device-read defect (see the note at
+  // `alignedEnqFromP4` in LsEuPlugin). Default it to the LS-OoO switch so the risky
+  // combination is the one that gets tested; `FUZZ_LS_FALLTHROUGH` overrides either way when
+  // a run needs the two knobs separated.
+  private val fuzzFallThrough =
+    sys.env.get("FUZZ_LS_FALLTHROUGH").map(_ == "1").getOrElse(fuzzLsOoo)
+  val lsEu   = new LsEuPlugin(lsOooIssue = fuzzLsOoo, alignedLoadFallThrough = fuzzFallThrough)
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc

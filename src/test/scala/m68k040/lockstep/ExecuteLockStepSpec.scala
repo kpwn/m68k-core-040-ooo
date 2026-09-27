@@ -512,8 +512,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
+    // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+    // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+    // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+    // from one switch; every SIM harness omitted it, so the recovery had never been
+    // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+    // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
-      preparedRetireEntries = preparedCap)
+      preparedRetireEntries = preparedCap,
+      lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
       // LOCKSTEP_LS_OOO=1: out-of-order LS issue + the LS inhibited barrier, together.
