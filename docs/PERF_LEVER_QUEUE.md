@@ -424,6 +424,51 @@ in opposite directions that must not be assumed to cancel.
 ⛔ And the standing blocker is unchanged: **#7 gates #5**, and `rasBranchRepair` is still
 default OFF and unmerged.
 
+### ⛔ THE I-SIDE DOES NOT TRAVERSE THE CROSSBAR — verified in the SoC RTL 2026-09-27
+
+Stated because it has now been got wrong twice, in both directions, and it changes what
+an I-side sizing run is allowed to assume. Verified end to end in `macqd700-soc-public`:
+
+| stage | limit | source |
+|---|---|---|
+| `IcachePlugin` MSHR file | **5** (1 demand + 4 speculative, 5 distinct AXI IDs) | `IcachePlugin.scala`, `AxiIds.I_DEMAND=0`, `I_SPEC_BASE..I_SPEC_LAST=1..4` |
+| CPU → fabric | **dedicated 256-bit `f_axi_*` port on `l2c`, NEVER `axi_xbar.v`** | `fpga_top_ddr.vh:141` ("never through axi_xbar.v"), bind at `:275` (task #269 "Level A"); `l2c_ctrl.v:419` |
+| fetch-port AR accept | 1 active + **1-entry pre-latch** (`f_arready = !fetch_ar_pend_v`, `l2c_ctrl.v:434`) | throttles ISSUE RATE, not concurrency — the active slot frees when the burst's beats are walked into the L2 pipeline, not when data returns (`fetch_ar_act_free_c`, `:508`) |
+| L2 lookup | shared with the LSU's AR, round-robin with `fetch_favor` | `l2c_ctrl.v:575,587` |
+| L2 MSHRs | **8 primary, up to 4 same-line secondary each**, ARs issuable on consecutive clocks, MSHR index carried as the AXI read ID | `l2c_mshr.v:46-52` |
+| MIG bridge | 8 outstanding | ditto |
+
+**So the binding limit on I-side memory-level parallelism is the CPU's own 5 MSHRs, not
+the fabric.** Consequences for any I-side measurement:
+
+- ⛔ **`crossbarSingleOutstanding = true` is the WRONG model for the I side.** It models a
+  per-master-port limiter that is not in the I path at all. It is the honest config for
+  the **D** side, which *is* the crossbar's M0 master. An I-side arm run under it
+  understates what the fabric allows.
+- The fetch path was ALSO once 1-deep and it was already found and fixed: `l2c_ctrl.v:411-423`
+  records that `f_arready = !fetch_ar_have` had *"re-serialised the CPU's 5-MSHR instruction
+  prefetcher down to one fetch in flight"*, closed 2026-09-02 by the pre-latch, described
+  as *"the single limiter between a 5-deep prefetcher above and 8 MSHRs / an 8-outstanding
+  MIG bridge below"*. Do not re-derive that as a live limit.
+
+**`axi_xbar.v:1340`'s "slot 2 is the CPU instruction fetch" describes a configuration no
+cpu040 build uses.** When `L2C_ENABLE` is defined the xbar's M2 is tied **permanently
+idle** (`m2_idle_arvalid = 1'b0`, `fpga_top_xbar.vh:247-292,447-482`), and
+`synth/vivado.tcl` forces `L2C_ENABLE` on for every cpu040 build (the Makefile also calls
+it non-optional, since the M2 fallback is 128-bit against `AXI_I_DW = 256`). In the
+`L2C_ENABLE`-undefined fallback there is no cpu040 at all — `cpu_stub` ties `axi_i_arvalid`
+low. **So `rs_state[2]` carries no traffic in any shipping build, and `cpu_rd_busy`
+reflects slot 0 (the LSU) alone.** It is not "I-fetch to non-L2 space": ROM-mirror fetches
+also use the direct port, folded locally by `ifa_araddr_folded`, with out-of-window
+fetches getting a local DECERR from `ifetch_window_guard`.
+
+⚠️ **Safety coupling, quoted because it is load-bearing** (`fpga_top_xbar.vh:262-285`):
+because I-fetch bypasses the crossbar and **the crossbar holds the only decode of the
+`0x5000_0000` peripheral window**, a speculative instruction fetch cannot reach a device
+register — which is why cpu040 ships with `IcachePlugin(iFetchCanReachMmio = false)`. If
+`ifa_*` is ever rerouted through the crossbar, **the CPU must be rebuilt with
+`iFetchCanReachMmio = true`** or speculative fetch gains a path to read-to-clear registers.
+
 ## Lever 9 — BRAM as a mux, not just as storage (owner, 2026-09-27)
 
 **"we can start using more bram where we can to remove load from LUTs" + "bram is also
