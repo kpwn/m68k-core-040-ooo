@@ -786,3 +786,44 @@ Byte-identical Verilog is unattainable for any edit to `RobPlugin.scala`: Spinal
 source line numbers in generated signal names, so adding a comment renames hundreds of wires.
 Flop bits, `always` blocks and the set of non-constant assigns are the meaningful invariants,
 and all three are unchanged.
+
+## LOCK-STEP GATE (2026-09-27): the park fixes 5 tests and breaks none
+
+`ExecuteLockStepSpec` (703 tests) with `LOCKSTEP_LS_OOO`, on three LsEuPlugin revisions:
+
+| LsEuPlugin | `LOCKSTEP_LS_OOO` | succeeded | failed |
+| --- | --- | ---: | ---: |
+| park + fall-through fix | OFF (shipping default) | 690 | 12 |
+| **HEAD (no park)** | **ON** | 680 | **22** |
+| **park + fall-through fix** | **ON** | 685 | **17** |
+| park + fall-through fix + sticky recovery | ON | 685 | 17 (identical set) |
+
+**The park turns FIVE lock-step tests from red to green and introduces ZERO new ones** (the
+"only with the park" side of the diff is empty). The five are precisely the inhibited-access
+shapes the P4 park exists for:
+
+    a7-byte: every byte form, D-cache OFF (all accesses inhibited) + realistic D-side timing
+    p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side dram60,    CACR DE0
+    p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side storeSlow, CACR DE0
+    p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side xbar,      CACR DE0
+    p163 pic-header NIL store: ROM 0x40831b04 chain x6, D-side zero,      CACR DE0
+
+"D-cache OFF (all accesses inhibited)" is the P4-park deadlock's own territory, and the four
+`p163` variants differ only in D-side timing -- one defect, four timings. This is INDEPENDENT
+confirmation of the fix beyond the single reproducer, on programs written for entirely unrelated
+investigations.
+
+### The residual 17, and what owns them
+
+* **16 x `odd-ssp: level-1/level-7 IRQ at every boundary of the LINK #-75 stretch`.** Red in
+  BOTH knob postures -- 11 shared with the knob-OFF run, 6 ON-only, 1 OFF-only -- so the family
+  is not knob-attributable; the LS issue order shifts WHICH boot offsets trip it. That is the
+  recorded uninit-register-vs-randomised-PRF harness artifact (Musashi zeroes registers,
+  SpinalSim randomises the PRF), whose membership is timing-sensitive by construction.
+* **1 x `lock-step: LSU NZVC wakeup ...`** -- a NON-VACUITY coverage assert ("86 was not
+  greater than or equal to 128 flag-dependent corpus did not exercise LSU NZVC wakeup"), not a
+  divergence. It fails in the knob-OFF run too, and on HEAD.
+
+The park's own residual gap is the SPLIT inhibited access and the park-full case, both of which
+keep today's in-P4 wait and are covered by the `GenerationFlags.simulation` tripwire at
+`wedgeArmed`. The tripwire did not fire in any of these runs.
