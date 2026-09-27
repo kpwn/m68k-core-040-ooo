@@ -55,6 +55,24 @@ ITLB walks ~11% — ~45% in the front end, against 6.1% D-cache and 6.7% walk.
 **Almost all IPC work in this campaign has been back-end.** It optimises the ~8%
 where the ROB is busy and stuck.
 
+## Area: track as we go, cut at the end
+
+**Plan (owner, 2026-09-27): track area in the 100 MHz lane as each lever lands, then
+do a dedicated area-reduction pass once they are all implemented.** Running ledger:
+`docs/PERF_AREA_LEDGER.md`, appended automatically by the lane script so it cannot be
+forgotten. Area inside the lane is exact; comparing a lane row to a 200 MHz build is
+not (see above).
+
+Why the cut-later order is right: shrinking LUTs can WORSEN timing, because congestion
+is pin DENSITY rather than area — Vivado's own remedy (`CELL_BLOAT_FACTOR`) makes
+designs bigger, and area anti-correlated with WNS across three builds of this design.
+So an area pass aimed at 200 MHz closure is only meaningful once the feature set is
+frozen. Precedent: the last area campaign removed **5,048 LUT with zero IPC cost**
+(152,093 → 147,045 at 200 MHz).
+
+Known cost so far: Track 5's two branch flags are **+1,170 LUT (+0.81%)**, zero BRAM,
+FFs flat.
+
 ## The queue
 
 | # | lever | state | evidence |
