@@ -231,6 +231,7 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
       r.ibranch      := dec.ibranch
       r.anInc        := dec.anInc
       r.isReturn     := dec.isReturn
+      r.isCall       := dec.isCall
       r.stkPush      := dec.stkPush
       r.eaAuto       := dec.eaAuto
       r.eaDelta      := dec.eaDelta

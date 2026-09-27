@@ -238,6 +238,13 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // starts at a flop Q with the whole period in front of it.
     ras.logic.checkpointSave    := rob.logic.countIsZero
     ras.logic.checkpointRestore := rasCheckpointRestore
+    // RAS flush-repair (RasPlugin `branchRepair`) -- FUZZ_RAS_BRANCH_REPAIR=1.
+    require(rob.rasBranchRepair == ras.branchRepair, "rasBranchRepair must agree")
+    if (rob.rasBranchRepair) {
+      ras.logic.repairValid := rob.logic.earlyFire
+      ras.logic.repairKind  := rob.logic.rasRepairKind
+      ras.logic.repairData  := rob.logic.rasRepairData
+    }
 
     val gsh   = host[m68k040.frontend.GsharePlugin]
     gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
@@ -378,13 +385,15 @@ class FuzzCoreDut extends Component {
   val dcache = new DcachePlugin()
   val btb    = new m68k040.frontend.BtbPlugin
   val ftb    = new m68k040.frontend.FtbPlugin
-  val ras    = new m68k040.frontend.RasPlugin
+  val ras    = new m68k040.frontend.RasPlugin(
+    branchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"))
   val gsh    = new m68k040.frontend.GsharePlugin
   val fa     = new FetchAlignPlugin(enableFetchDirected = true)
   val dec    = new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
-  val rob    = new RobPlugin
+  val rob    = new RobPlugin(
+    rasBranchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"))
   val iq     = new IssueQueuePlugin
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin

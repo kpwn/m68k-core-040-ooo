@@ -218,6 +218,21 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // starts at a flop Q with the whole period in front of it.
     ras.logic.checkpointSave    := rob.logic.countIsZero
     ras.logic.checkpointRestore := rasCheckpointRestore
+    // RAS flush-repair (RasPlugin `branchRepair`, default OFF). The restore above rolls
+    // the stack back past the mispredicting branch itself, so a mispredicted CALL loses
+    // its own already-architectural push and its callee's `rts` mispredicts too. These
+    // three wires hand the RAS that one delta back. All THREE are bare register Qs
+    // (`earlyFire` is a register; the two carry registers are latched by the same
+    // `earlyArm`), and RasPlugin consumes them behind one more flop, so this adds nothing
+    // to the redirect / `ftbBlocked` cone -- the standing rule for predictor recovery.
+    require(rob.rasBranchRepair == ras.branchRepair,
+      "RobPlugin.rasBranchRepair and RasPlugin.branchRepair must agree " +
+      s"(rob=${rob.rasBranchRepair}, ras=${ras.branchRepair})")
+    if (rob.rasBranchRepair) {
+      ras.logic.repairValid := rob.logic.earlyFire
+      ras.logic.repairKind  := rob.logic.rasRepairKind
+      ras.logic.repairData  := rob.logic.rasRepairData
+    }
     // ── gshare direction predictor (slice 3) ────────────────────────────────────
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
     // + brType into FetchAlign so it can form condBtbHit and source the conditional
@@ -851,7 +866,7 @@ object GenFullCoreSynthVerilog {
           new DcachePlugin(),
           new BtbPlugin(),
           new FtbPlugin(),
-          new m68k040.frontend.RasPlugin(),
+          new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair),
           new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory),
           new FetchAlignPlugin(enableFetchDirected = true, deferSlot1Conditional = deferSlot1Conditional,
             trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional),
@@ -860,7 +875,8 @@ object GenFullCoreSynthVerilog {
           new RenameStage(retireWidth = if (preparedRetireEntries == 0) retireWidth else preparedRetireEntries,
             preparedRetirement = preparedRetireEntries != 0),
           new DispatchPlugin(),
-          new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries),
+          new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries,
+            rasBranchRepair = ShippingCoreConfig.rasBranchRepair),
           // IQ_LOAD_BYPASS=1 lets a LOAD pass an older UNREADY LOAD in LS selection.
           // Env-read rather than a constructor parameter so every existing correctness
           // spec that builds this core can be run against it unmodified -- validating an

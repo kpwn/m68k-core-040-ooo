@@ -134,7 +134,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new DcachePlugin(socketMerged = true, allowPretranslatedProbeHints = false),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
-      new m68k040.frontend.RasPlugin(),
+      new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair),
       new m68k040.frontend.GsharePlugin(retainRedirectHistory = ipcThroughput),
       new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true,
         trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput),
@@ -142,7 +142,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
-      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
+      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+        rasBranchRepair = ShippingCoreConfig.rasBranchRepair),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
         earlyAutoStoreAddress = ipcLateStore,
         // loadBypassUnreadyLoad is DISABLED. It WEDGED THE BOARD (2026-09-24): PC frozen
@@ -621,7 +622,8 @@ object GenSocketTopVerilog {
     println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
-            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
+            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
+            s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

@@ -26,6 +26,13 @@ case class BranchCompletion() extends Bundle {
   // ── gshare PHT-update fields (slice 3) ──
   val phtValid   = Bool()         // a CONDITIONAL gshare-predicted branch (train pht[phtIndex])
   val phtIndex   = UInt(11 bits)  // the carried fetch-time folded-XOR index the lookup read
+  // ── RAS flush-repair carry (slice 2, RasPlugin `branchRepair`) ──
+  // What the FETCH-side RAS did for THIS branch, so a flush that rolls the RAS back to a
+  // checkpoint predating it can put that one entry back (see RasPlugin's class comment:
+  // a mispredicted call otherwise costs TWO mispredicts, its own and its callee's `rts`).
+  // Pure wires off signals S1 already computes; nothing reads them when the option is off.
+  val rasKind    = UInt(m68k040.frontend.RasRepair.W bits)  // NONE / CALL / RET
+  val rasData    = UInt(32 bits)  // CALL: the call's fall-through PC. RET: the predicted target.
 }
 
 /** Execute-time conditional fault completion (generalized from the original TRAPV-
@@ -389,6 +396,19 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // the resolved direction (btbTaken == actualTaken, already driven above).
     completionPort.payload.phtValid  := s1Valid && u1.phtValid
     completionPort.payload.phtIndex  := u1.phtIndex
+    // RAS flush-repair carry (slice 2). A CALL's fetch-time push is `fallThruPc` (the
+    // aligner pushes `slotPc + lenWords*2`, which IS this µop's `nextPc` -- the same value
+    // the crack's push STORE writes to the real stack). A RETURN only popped the RAS if it
+    // was actually RAS-predicted, and a return's `predTaken` can come from nowhere else
+    // (the BTB/FTB never learn returns -- see `isBtbBranch` above), so `predTaken` is the
+    // exact "the frontend popped for this one" bit. Not gated on `mispredict`: the ROB
+    // reads this only for a branch that goes on to flush.
+    val rasIsCall = u1.isCall
+    val rasIsPop  = isReturn && u1.predTaken
+    completionPort.payload.rasKind := Mux(rasIsCall, U(m68k040.frontend.RasRepair.CALL, m68k040.frontend.RasRepair.W bits),
+                                     Mux(rasIsPop,  U(m68k040.frontend.RasRepair.RET,  m68k040.frontend.RasRepair.W bits),
+                                                    U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits)))
+    completionPort.payload.rasData := Mux(rasIsCall, fallThruPc, u1.predTarget)
 
     // ---- S1: branch-EU int write (RTS/RTR postinc A7, OR Scc/DBcc Dn write) ----
     // Three mutually-exclusive int-write sources, all to the renamed pdst:

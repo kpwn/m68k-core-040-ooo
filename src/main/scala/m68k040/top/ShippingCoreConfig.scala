@@ -43,4 +43,17 @@ object ShippingCoreConfig {
     * The code stays (it is correct, and it carries the REPLAY identity fix and the
     * miss-park handler); only the arm is disabled. */
   val dcacheHitUnderMissRead: Boolean = false
+
+  /** RAS: on a mispredict redirect, re-apply the flushing branch's OWN return-address-stack
+    * effect after the checkpoint restore. See `RasPlugin.branchRepair` for the mechanism
+    * and for why a retire-time architectural shadow stack cannot do this job here.
+    *
+    * ⛔ OFF pending a board measurement, exactly like the two frontend prediction flags.
+    * The defect it fixes is measured (`br-ind`: 1024 of 2050 retired mispredicts are the
+    * callee returns of mispredicted calls, i.e. EVERY mispredicted call costs two) and the
+    * fix is a pure predictor change -- the branch EU verifies every direction and target,
+    * so a wrong guess is a perf loss and never a wrong result. But "a perf loss only" is a
+    * claim; `mispredicts/kinst` on silicon is the measurement, and returns are 34.5% of
+    * the board's mispredicts against 3.9% for conditional direction. */
+  val rasBranchRepair: Boolean = false
 }
