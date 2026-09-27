@@ -258,10 +258,25 @@ but module share is an **upper bound**, not an attribution: the widest net insid
 visible in those windows — belongs to the **integer PRF**, not the SQ. The SQ's registers
 do check out as its own (1,710 predicted vs 1,713 measured), and its address-compare
 matrix is 20.2% of the module against the age network's ~3.8%, so **banking is impossible**
-(ring position *is* program order). Whether shrinking the module moves congestion at all
-is **still being measured** — the `SQ_DEPTH=4` calibration arm is in placement; the
-structural argument (4,722 LUT ~ 5% of socket_core) says it cannot, but that is arithmetic,
-not a result. The two real targets are the **integer PRF** (9,957 LUT, 4,584 LUTRAM,
+(ring position *is* program order).
+
+⛔ **MEASURED 2026-09-28, and it REFUTES the structural argument.** The `SQ_DEPTH=4`
+calibration arm (a −45% store queue) came back and **module-local shrinking DOES move
+congestion**: `report_design_analysis -congestion` run through the *identical* path on both
+routed checkpoints gives **base = 2 level-5 windows (East + West), `SQ_DEPTH=4` = ZERO**
+("No congestion windows are found above level 5"). The claim that "nothing confined to this
+module can move congestion level 5" — mine, from the 4,722 LUT ≈ 5%-of-socket_core
+arithmetic — was **wrong**, and it was wrong in the direction arithmetic usually is: it
+reasoned about area when congestion is pin density.
+
+⚠️ But it is **not a lever**, for two independent reasons. **WNS got WORSE, −0.283 →
+−0.649** — and that 0.366 ns sits *inside* the ±0.4 ns post-route netlist sensitivity, so it
+is not attributable either way; what is certain is that removing the congestion bought no
+timing. And `SQ_DEPTH=4` is **not cycle-neutral** (three kernels use 7 of 8 entries), so it
+was only ever a probe of whether the direction exists. It does. It just does not pay.
+
+This is the third build in this campaign where **area and WNS moved in opposite directions**,
+which is now a pattern rather than a curiosity. The two real targets are the **integer PRF** (9,957 LUT, 4,584 LUTRAM,
 ~10% of the device, ~5,800 sink pins — lever 12) and the **`DStoreCmd` merge payload**
 (**−117 wires between two blocks that both appear in congested windows**).
 
