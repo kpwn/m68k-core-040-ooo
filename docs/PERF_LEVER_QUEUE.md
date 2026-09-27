@@ -67,6 +67,19 @@ board: that figure assumed a private AXI port and the bench's 70-cycle DDR, and 
 **`OFF_PERF_ITLB_WALK` (0x010A4) exists in every bitstream and has never been read** —
 one register read settles this outright.
 
+✅ **AND THE ARITHMETIC CLOSES, from a third independent direction.** A walk's duration is
+bounded from below by structure: 1 cycle miss capture + 1 capture→start + 1 IDLE→RD_ROOT +
+3 × [1 cycle `m2sPipe` walker-request stage + **2 cycles cmd→rsp**, the exact, separately
+measured latency of a walker descriptor read through the D-cache load port (2026-09-05;
+`LsEuPlugin.scala:3471` demuxes the walker response combinationally off
+`dcache.loadRsp.valid`)] + 1 FINISH + 1 IDLE→hit = **≈14-15 cycles with zero arbitration
+wait and every descriptor in L1D**. The board-derived figure is **17.2**, two to three
+cycles above that floor — exactly the room arbitration against CORE-LS and the other
+walker needs. And at 17.2 the union closes on the sum: (10.25 + 12.63) × 17.2 = **389
+cycles/kinst against the 392.8 the 6.7% counter reports**, i.e. the two walkers barely
+overlap and the whole measured walk bucket is accounted for. **So take the LOW end: the
+ITLB is ~3.0% of all cycles (3.65% on Finder idle), not 5.4% and certainly not 11%.**
+
 **Almost all IPC work in this campaign has been back-end.** It optimises the ~8%
 where the ROB is busy and stuck.
 
@@ -304,6 +317,11 @@ Composition of the 86,627 walks: **183 compulsory (0.2%)**, 22,393 PFLUSHA refil
 | Finder launch (t=21.5) | 6.254 | 4.803 (−23.2%) | 4.751 (−24.0%) | **4.739 (−24.2%)** | 263.8 |
 | **Finder idle (t=40)** | **17.887** | 5.983 (−66.5%) | 1.520 (−91.5%) | **1.198 (−93.3%)** | 38.3 |
 | aggregate (equal instruction weight) | 10.254 | 4.707 | 2.815 | **2.677 (−73.9%)** | — |
+
+At the corroborated **17.2 cycles per walk** that is **3.0% of all cycles** on the mixed
+session and **3.65% on Finder idle**, of which the buffer recovers **73.9% / 93.3%** —
+i.e. **≈2.2% of session cycles and ≈3.4% of Finder-idle cycles**, for ~1,509 flop bits and
+no shipping LUTs at all while the flag is off.
 
 **The aggregate −73.9% is carried by the idle phase, and that is mechanism, not luck:**
 the buffer is flushed by PFLUSHA along with the array, so where PFLUSHA is frequent

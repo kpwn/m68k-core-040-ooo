@@ -99,6 +99,22 @@ import spinal.lib.misc.plugin.FiberPlugin
   * (§9.2/§9.3's S1-S10 all fall away). `atcFlush` clears it with the array, so
   * PFLUSHA / TCR.P re-key / root writes / TTR writes are covered by construction.
   *
+  * WHAT IT IS WORTH, and the three lines that triangulate it. `OFF_PERF_STALL_WALK` is
+  * the OR of BOTH walkers' busy cycles and reads 6.7% of all cycles on the board, which
+  * caps the entire I+D walk bucket; with the board's DTLB rate (12.63 walks/kinst) and the
+  * ITLB rate above that bounds one walk at 17.2 cycles of walker-busy. Independently, a
+  * walk's structural floor is ~14-15 cycles (1 capture + 1 start + 1 IDLE->RD_ROOT + 3 x
+  * [1 `m2sPipe` stage + the separately measured **2 cycles cmd->rsp** of a walker
+  * descriptor read through the D-cache load port] + FINISH + IDLE->hit), so 17.2 is two to
+  * three cycles of arbitration above the floor -- and at 17.2 the union closes on the sum:
+  * (10.25 + 12.63) x 17.2 = 389 cycles/kinst against the 392.8 that counter reports. So
+  * the ITLB is **~3.0% of all cycles (3.65% on Finder idle)**, and this buffer recovers
+  * 73.9% / 93.3% of it = **~2.2% / ~3.4% of cycles**.
+  *
+  * ⛔ NOT measurable on Dhrystone: the board's Dhrystone-only window walks the ITLB 0.061
+  * times per kinst. The metric that moves is `OFF_PERF_ITLB_WALK` (0x010A4), predicted
+  * 10.25 -> 2.68 per kinst.
+  *
   * DEFAULT OFF (`victimEntries = 0`) elaborates NO hardware: every term folds to a
   * constant and the netlist is bit-identical to before this change.
   */
