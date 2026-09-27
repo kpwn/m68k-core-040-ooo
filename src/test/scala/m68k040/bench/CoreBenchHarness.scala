@@ -1207,6 +1207,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
           lastCommitCycle = totalCycles
+          missInj.markCommit()   // takes the miss/MLP counters over the SAME window
         }
         // MB_TRACE=<kernel-name-prefix>: dump a per-cycle table of every LOAD-path
         // pipeline stage, so the cost of a load can be attributed to named stages and

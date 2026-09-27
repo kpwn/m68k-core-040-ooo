@@ -46,17 +46,24 @@ import scala.collection.mutable
   * Eligibility is a pure function of the LINE address (plus a salt and an epoch),
   * so within an epoch the same lines miss every time and a loop genuinely re-misses
   * -- the behaviour a per-access coin flip cannot produce. The epoch term
-  * (`IPC_INJ_EPOCH` cycles, default 512) rotates WHICH lines are eligible over
-  * time. That is not cosmetic: the kernels have working sets of a handful of lines,
-  * so a fixed hash quantises the achievable rate to 0%, 25%, 50%... Rotating the
-  * eligible subset makes the rate a continuous knob while keeping it deterministic
-  * and re-missable inside each epoch.
+  * (`IPC_INJ_EPOCH` cycles, default 64) rotates WHICH lines are eligible over time.
+  * That is not cosmetic, it is what makes the knob usable at all. `load-stream`
+  * touches exactly TWO 16-byte lines, so a fixed hash quantises its achievable miss
+  * rate to 0%, 50% or 100% and nothing between -- MEASURED: with a 512-cycle epoch,
+  * requested 5%, 10% and 25% all produced byte-identical runs with ZERO steals, and
+  * 50% produced a tenth of the rate 100% did. A short epoch gives many independent
+  * draws per run, so the achieved rate converges on the requested one while the
+  * eligible subset still holds still for several loop iterations at a time.
+  *
+  * The epoch is therefore a MEASUREMENT parameter, not a detail: a run shorter than
+  * a few dozen epochs cannot deliver the requested rate, whatever it asks for. That
+  * is why the achieved rate is always reported next to the requested one.
   *
   * ── KNOBS ────────────────────────────────────────────────────────────────────
   *   IPC_INJ_D=<0..100>   percent of the D-cache line-address space forced to miss
   *   IPC_INJ_I=<0..100>   percent of the I-cache line-address space forced to miss
   *   IPC_INJ_SEED=<int>   hash salt (default 1); changes WHICH lines, not how many
-  *   IPC_INJ_EPOCH=<int>  eligibility rotation period in cycles (default 512)
+  *   IPC_INJ_EPOCH=<int>  eligibility rotation period in cycles (default 64)
   *   IPC_MISS_STATS=1     report miss rates / MLP / stall split with NO injection
   *
   * Everything is OFF unless one of those is set, and `onCycle` returns on a single
@@ -97,8 +104,11 @@ object MissInjector {
   var salt: Int = envInt("IPC_INJ_SEED", 1)
   /** A label for the current sweep point, carried into every `Stats` row. */
   var tag: String = ""
-  val epochCycles: Int = math.max(1, envInt("IPC_INJ_EPOCH", 512))
-  val statsOnly: Boolean = sys.env.get("IPC_MISS_STATS").contains("1")
+  val epochCycles: Int = math.max(1, envInt("IPC_INJ_EPOCH", 64))
+  /** Report miss rates / MLP / stall split even with injection OFF. A `var` so the
+    * sweep can force it on: the D0/I0 baseline row is the whole point of a curve, and
+    * without it the sweep has nothing to compare against. */
+  var statsOnly: Boolean = sys.env.get("IPC_MISS_STATS").contains("1")
   def injecting: Boolean = dPct > 0 || iPct > 0
   def enabled: Boolean = injecting || statsOnly
 
@@ -271,18 +281,31 @@ object MissInjector {
     // arm only after the harness's reset + explicit I-cache invalidate window
     private val armAfter = 140
 
-    private var dLoadMisses = 0L; private var dStoreMisses = 0L
-    private var iDemandMisses = 0L; private var iUnresolvedPrev = false
-    private var dArFires = 0L; private var iArFires = 0L
-    private var dOut = 0; private var dOutSum = 0L; private var dOutMax = 0; private var dBusy = 0L
-    private var iOutSum = 0L; private var iOutMax = 0; private var iBusy = 0L
-    private var robEmpty = 0L; private var retireStall = 0L
-    private var stallDcache = 0L; private var stallWalk = 0L
-    private var refusedInRefill = 0L
-    private var dSteals = 0L; private var dSkipDirty = 0L; private var iSteals = 0L
+    // ── COUNTERS AS AN ARRAY, so the MEASUREMENT WINDOW can be taken as a delta ──
+    // This is not tidiness. Counting over the whole run while dividing by the WINDOW's
+    // retired count silently inflated every rate: `chase-128`'s cold pass is 128 misses
+    // that `warmupInstrs` deliberately excludes from the window, and attributing them
+    // to 1152 windowed macros reported 112 D-misses/kI for a kernel whose steady state
+    // misses essentially ZERO. Snapshotting at the window's first and last committing
+    // cycle makes every rate below a genuine steady-state rate.
+    private val NC = 16
+    private val D_LOAD_MISS = 0; private val D_STORE_MISS = 1; private val I_MISS = 2
+    private val D_AR = 3;        private val I_AR = 4
+    private val D_OUT_SUM = 5;   private val D_BUSY = 6
+    private val I_OUT_SUM = 7;   private val I_BUSY = 8
+    private val ROB_EMPTY = 9;   private val RETIRE_STALL = 10
+    private val STALL_DC = 11;   private val STALL_WALK = 12
+    private val REFUSED = 13
+    private val D_STEAL = 14;    private val I_STEAL = 15
+    private val c      = Array.fill(NC)(0L)
+    private var cStart = Array.fill(NC)(0L)
+    private var cEnd   = Array.fill(NC)(0L)
+    private var windowOpened = false
+    private var dSkipDirty = 0L
+    private var dOutMaxWin = 0; private var iOutMaxWin = 0
+    private var dOut = 0
+    private var iUnresolvedPrev = false
 
-    // (set, way, tag) nominations awaiting a safe steal window. Bounded: overflow
-    // drops the newest nomination, which costs rate, never correctness.
     private val PendCap = 8
     private val dPend = mutable.Queue.empty[(Int, Int, Long)]
     private val iPend = mutable.Queue.empty[(Int, Int, Long)]
@@ -299,36 +322,42 @@ object MissInjector {
       epoch = cycle / epochCycles
 
       // ── bus-level accounting: misses and MLP, D and I, uniformly ─────────────
-      if (dc.axi.ar.valid.toBoolean && dc.axi.ar.ready.toBoolean) { dArFires += 1; dOut += 1 }
+      if (dc.axi.ar.valid.toBoolean && dc.axi.ar.ready.toBoolean) { c(D_AR) += 1; dOut += 1 }
       if (dc.axi.r.valid.toBoolean && dc.axi.r.ready.toBoolean && dc.axi.r.payload.last.toBoolean)
         dOut = math.max(0, dOut - 1)
-      if (dOut > 0) { dBusy += 1; dOutSum += dOut; if (dOut > dOutMax) dOutMax = dOut }
+      if (dOut > 0) {
+        c(D_BUSY) += 1; c(D_OUT_SUM) += dOut
+        if (windowOpened && dOut > dOutMaxWin) dOutMaxWin = dOut
+      }
 
-      if (ic.axi.ar.valid.toBoolean && ic.axi.ar.ready.toBoolean) iArFires += 1
-      // The I-cache tracks its own per-ID outstanding bits (one per MSHR slot), so
-      // its MLP is read directly rather than reconstructed from the channel.
+      if (ic.axi.ar.valid.toBoolean && ic.axi.ar.ready.toBoolean) c(I_AR) += 1
+      // The I-cache tracks its own per-ID outstanding bits (one per MSHR slot), so its
+      // MLP is read directly rather than reconstructed from the channel.
       val iOut = ic.arOutstanding.count(_.toBoolean)
-      if (iOut > 0) { iBusy += 1; iOutSum += iOut; if (iOut > iOutMax) iOutMax = iOut }
+      if (iOut > 0) {
+        c(I_BUSY) += 1; c(I_OUT_SUM) += iOut
+        if (windowOpened && iOut > iOutMaxWin) iOutMaxWin = iOut
+      }
 
       // ── demand misses ────────────────────────────────────────────────────────
-      if (dc.loadMissDiscovered.toBoolean) dLoadMisses += 1
-      if (dc.storeMissDiscovered.toBoolean) dStoreMisses += 1
+      if (dc.loadMissDiscovered.toBoolean) c(D_LOAD_MISS) += 1
+      if (dc.storeMissDiscovered.toBoolean) c(D_STORE_MISS) += 1
       val iUnres = ic.s1Unresolved.toBoolean
-      if (iUnres && !iUnresolvedPrev) iDemandMisses += 1
+      if (iUnres && !iUnresolvedPrev) c(I_MISS) += 1
       iUnresolvedPrev = iUnres
 
       // ── coarse stall split ───────────────────────────────────────────────────
       val robCount = dut.rob.logic.count.toInt
       val retiring = dut.rob.logic.retire0.toBoolean
       val dcBusy = dc.dbgFsmRefill.toBoolean || dc.dbgFsmReplay.toBoolean
-      if (robCount == 0) robEmpty += 1
+      if (robCount == 0) c(ROB_EMPTY) += 1
       else if (!retiring) {
-        retireStall += 1
-        if (dcBusy) stallDcache += 1
+        c(RETIRE_STALL) += 1
+        if (dcBusy) c(STALL_DC) += 1
       }
-      if (dut.dtlb.logic.missPending.toBoolean) stallWalk += 1
+      if (dut.dtlb.logic.missPending.toBoolean) c(STALL_WALK) += 1
       if (dcBusy && dc.loadCmdPort.valid.toBoolean && !dc.loadCmdPort.ready.toBoolean)
-        refusedInRefill += 1
+        c(REFUSED) += 1
 
       if (!injecting || cycle < armAfter) return
 
@@ -374,7 +403,7 @@ object MissInjector {
             // this feature could change an architectural result, and the check is
             // what makes it impossible rather than unlikely.
             if (dc.dirtysMem(way).getBigInt(set) != 0) dSkipDirty += 1
-            else { dc.validsMem(way).setBigInt(set, BigInt(0)); dSteals += 1 }
+            else { dc.validsMem(way).setBigInt(set, BigInt(0)); c(D_STEAL) += 1 }
           }
         }
       }
@@ -397,19 +426,31 @@ object MissInjector {
           val (set, way, tag) = iPend.dequeue()
           if (ic.tagMem(way).getBigInt(set).toLong == tag && ic.valids(way)(set).toBoolean) {
             ic.valids(way)(set) #= false
-            iSteals += 1
+            c(I_STEAL) += 1
           }
         }
       }
     }
 
+    /** Called from the harness on every cycle that COMMITS a windowed macro. The first
+      * such cycle opens the measurement window; the last one closes it. */
+    def markCommit(): Unit = {
+      if (!enabled) return
+      if (!windowOpened) { windowOpened = true; cStart = c.clone() }
+      cEnd = c.clone()
+    }
+
     def publish(windowCycles: Long, retired: Long): Unit = {
       if (!enabled) return
+      // No windowed commit ever landed (a filtered or wedged run): fall back to the
+      // whole run rather than reporting zeros that look like a clean result.
+      val (a, b) = if (windowOpened) (cStart, cEnd) else (Array.fill(NC)(0L), c)
+      def d(i: Int): Long = b(i) - a(i)
       collected += Stats(if (tag.nonEmpty) tag else label, kernel, windowCycles, retired,
-        dLoadMisses, dStoreMisses, iDemandMisses, dArFires, iArFires,
-        dOutSum, dOutMax, dBusy, iOutSum, iOutMax, iBusy,
-        robEmpty, retireStall, stallDcache, stallWalk, refusedInRefill,
-        dSteals, dSkipDirty, iSteals, cycle)
+        d(D_LOAD_MISS), d(D_STORE_MISS), d(I_MISS), d(D_AR), d(I_AR),
+        d(D_OUT_SUM), dOutMaxWin, d(D_BUSY), d(I_OUT_SUM), iOutMaxWin, d(I_BUSY),
+        d(ROB_EMPTY), d(RETIRE_STALL), d(STALL_DC), d(STALL_WALK), d(REFUSED),
+        d(D_STEAL), dSkipDirty, d(I_STEAL), windowCycles)
     }
   }
 }
