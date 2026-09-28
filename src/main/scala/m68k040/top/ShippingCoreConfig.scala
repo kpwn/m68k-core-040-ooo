@@ -411,4 +411,21 @@ object ShippingCoreConfig {
     *
     * `SQ_NARROW_MERGE=1` turns it on for an A/B without editing every DUT. */
   val sqNarrowDrainMerge: Boolean = envFlag("SQ_NARROW_MERGE", false)
+
+  /** I-cache next-line PREFETCH, reset value of `IcachePlugin.prefetchEnable`.
+    *
+    * ✅ ON. Board-measured: demand I-misses HALVE (127.9 -> 61.2 per kinst) for +2.6%
+    * IPC, coverage 86.3%. This is a settled decision, not a knob pending measurement.
+    *
+    * ⛔ BUT IT HAS A BUILD-TIME OFF SWITCH, AND THAT SWITCH WAS INVISIBLE. The plugin
+    * reads `DBG_IC_PREFETCH_DISABLE` directly to start the register False for a
+    * demand-fetch-only diagnostic bitstream -- a REAL netlist change (the RegInit's
+    * reset value) that appeared NOWHERE in the build log. A diagnostic image and a
+    * shipping image were therefore indistinguishable by their own provenance, which is
+    * the same defect class as the withdrawn `rasBranchRepair` number. Centralised here
+    * (integration merge, 2026-09-28) so `SHIPPING_CONFIG` reports it.
+    *
+    * Note the INVERTED sense of the variable: it is a DISABLE, kept that way so every
+    * existing build and testbench that does not set it is bit-identical to before. */
+  val icachePrefetch: Boolean = !envFlag("DBG_IC_PREFETCH_DISABLE", false)
 }

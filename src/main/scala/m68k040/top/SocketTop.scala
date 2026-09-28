@@ -693,7 +693,8 @@ object GenSocketTopVerilog {
             // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
             // own log -- the same gap that cost the withdrawn `rasBranchRepair` number.
             s"storeQueueDepth=${ShippingCoreConfig.storeQueueDepth} " +
-            s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge}")
+            s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge} " +
+            s"icachePrefetch=${ShippingCoreConfig.icachePrefetch}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

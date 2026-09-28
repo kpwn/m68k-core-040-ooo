@@ -133,10 +133,11 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // Read once at elaboration time, same `sys.env` pattern as
     // `SocketTop.scala`'s `DBG_BUILD_ID` / `FullCoreSynth.scala`'s
     // `readDbgBuildIdEnv`.
-    val icPrefetchDefaultOn: Boolean = sys.env.get("DBG_IC_PREFETCH_DISABLE") match {
-      case Some("1") => false
-      case _         => true
-    }
+    // Read from `ShippingCoreConfig` rather than `sys.env` directly, so the value the
+    // `SHIPPING_CONFIG` provenance line prints and the value this register resets to are
+    // THE SAME EXPRESSION. Two independent parses of one variable is how a build log
+    // comes to disagree with its own netlist.
+    val icPrefetchDefaultOn: Boolean = m68k040.top.ShippingCoreConfig.icachePrefetch
     val prefetchEnable = RegInit(if (icPrefetchDefaultOn) True else False)
     prefetchEnable.simPublic()
     prefetchEnable := prefetchEnable
