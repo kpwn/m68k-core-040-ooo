@@ -297,6 +297,37 @@ which is now a pattern rather than a curiosity. The two real targets are the **i
 ~10% of the device, ~5,800 sink pins — lever 12) and the **`DStoreCmd` merge payload**
 (**−117 wires between two blocks that both appear in congested windows**).
 
+## ⛔ THE TWO D-SIDE BANDWIDTH LEVERS ARE SUB-ADDITIVE — NEVER SUM THEM
+
+Measured 2x2, `memcpy-16k`, `IPC_MEM=l2:5:60:4096` (`863b45cb`):
+
+| arm | copy-B/cyc | vs baseline |
+|---|---:|---:|
+| baseline | 0.32793 | — |
+| + sectored 64 B lines | 0.35600 | **+8.56%** |
+| + fill-forward | 0.34215 | **+4.34%** |
+| **both** | 0.35975 | **+9.70%** |
+
+Additive would be +12.90%, multiplicative +13.27%. **Measured +9.70%.**
+
+**And the shortfall is PREDICTED BY THE MECHANISM, not fitted to the data.** Fill-forward
+saves a fixed **2 cycles per cacheable MISS**; sectoring removes **3.99x of the misses**; so
+fill-forward should retain about a quarter of its value. Its marginal contribution on top of
+sectoring is **measured +1.05% against +1.09% predicted — a 0.04 pp fit.** That is
+independent confirmation of the same story the L2 transaction counters told.
+
+⛔ **So `+8.5%` and `+4.35%` MUST NOT BE SUMMED ANYWHERE.** `+4.35%` is a *no-sectoring*
+number. Fill-forward remains worth shipping — it costs no area and it helps the regimes
+sectoring does not — but if sectoring ships, its streaming case is ~4x weaker than its
+recorded headline.
+
+✅ **Instrument note, recorded as a pair:** the bandwidth bench is **fully deterministic** —
+the sectored arm came back **bit-identical across two separate worktrees** on every shared
+point. `maxBusy` varied **2-6 cycles between runs of one netlist**. Same tree, two
+instruments, opposite reproducibility; knowing which one a claim rests on is what settled
+the p127 question. Also: fill-forward's standalone **+4.34% reproduces its documented
++4.35% to 0.01 pp**, so the baseline was not drifting.
+
 ## Measured DEAD — do not revisit
 
 - **Memory renaming / store-to-load bypass** — the satisfiable loads are the machine's
