@@ -668,12 +668,124 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfLvlRobBusy = perfTap(stallRob.map(_.logic.count =/= 0))
       val perfLvlRetire  = perfTap(stallRob.map(_.logic.retire0))
       val perfEvtBranch  = perfTap(excCountHistory.map(_.branchRetire.valid))
+      // ── MISPREDICT CLASS (2026-09-27) ─────────────────────────────────────────
+      // `brType` is 0 = CONDITIONAL (Bcc/DBcc), 1 = UNCONDITIONAL (BRA/BSR/JMP/JSR).
+      // That encoding is OWNED by `BtbEntry` in `m68k040.frontend.Btb` -- see its
+      // "brType : 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR)" and the
+      // `entry.brType === U(1)` force-taken arm -- and travels unchanged through
+      // `BtbUpdate` and `DebugBranchEvent`. Read it there, not from memory.
+      //
+      // SOURCE AND ITS CONSEQUENCE. These are fed from `branchRetire`, the SAME Flow
+      // `perfEvtBranch` uses, which is gated by the BTB-update decision and therefore
+      // sees BTB-ELIGIBLE branches only. `perfEvtMispred` above is deliberately fed
+      // from the ROB's `branchRedirect` instead, which sees EVERY mispredicting branch.
+      // So UNCOND + COND is LESS than OFF_MISPRED_COUNT and the residual is the
+      // mispredict traffic on branches the fetch-time predictor never covered --
+      // returns, and slot-1 branches, which have no predictor at all. That gap is the
+      // MEASUREMENT this pair exists to make possible; it is not a discrepancy, and it
+      // is not a broken counter. See the OFF_PERF_MISPRED_* block in
+      // `tools/debug/debug_regmap.def` for the arithmetic spelled out.
+      //
+      // NO LOGIC LEVEL IS ADDED TO ANY FUNCTIONAL CONE. Every term is already a
+      // register output in the ROB (`btbUpdateFlow.valid` is a RegNext,
+      // `debugBranchMispredict` a RegNextWhen, `brType` the `branchTrainMem` readSync
+      // output), and the sink is `perfTap`'s own new flop. The new combinational path is
+      // reg -> LUT -> new reg, one level, with no existing path lengthened: the taps
+      // only add fanout loads, exactly like `perfStallRetire`'s LUT2 over two taps.
+      private def branchClass(uncond: Boolean): Option[Bool] =
+        excCountHistory.map { h =>
+          h.branchRetire.valid && h.branchRetire.payload.mispredicted &&
+            h.branchRetire.payload.branchType === U(if (uncond) 1 else 0, 2 bits)
+        }
+      val perfEvtMispredUncond = perfTap(branchClass(uncond = true))
+      val perfEvtMispredCond   = perfTap(branchClass(uncond = false))
       val perfEvtDcMiss  = perfTap(stallDcache.map(_.logic.loadMissDiscovered))
       // I-cache: `s1Unresolved` is a LEVEL held from miss discovery until the fill is
       // dispatched, so it is edge-detected. It cannot merge two misses: `cmdPort.ready`
       // is gated by `!s1Unresolved`, so no younger command can be accepted behind an
       // unresolved miss and the level always returns low between two of them.
       val perfLvlIcMiss  = if (perfBuilt) mhIcache.map(i => RegNext(i.logic.s1Unresolved) init False) else None
+      // I-cache PREFETCH coverage (2026-09-27). Both are already one-cycle PULSES in the
+      // I-cache, so they take the plain one-flop `perfTap` -- no edge detection, hence
+      // the 1-cycle direct-pulse latency class, not the 2-cycle edge-detected one.
+      //   ISSUED: `pfArIssued` = the AXI AR handshake for a speculative id. One per
+      //     64-byte speculative burst, i.e. the BANDWIDTH the prefetcher spends.
+      //   USED:   `pfHitUseful` = a demand lookup hit a line a prefetch installed and
+      //     nothing else had touched. At most one per install (the provenance mark is
+      //     cleared on the same cycle it fires), so a re-hit does not re-count and a
+      //     DEMAND miss counts in neither lane.
+      // Both sources are wires in `IcachePlugin.logic`, read through the same `host.get`
+      // reach-in this file already uses for `s1Unresolved` and the multi-hot packs.
+      val perfEvtIcPfIssued = perfTap(mhIcache.map(_.logic.pfArIssued))
+      val perfEvtIcPfUsed   = perfTap(mhIcache.map(_.logic.pfHitUseful))
+
+      // ── IC_MISS_SEQ: NEXT-LINE PREFETCH'S EXACT CEILING (2026-09-27) ────────────
+      // A demand miss whose line is the PREVIOUS demand miss's line + 64. That is the
+      // complete set of misses a next-line frontier could EVER have covered, so
+      // `IC_MISS - IC_MISS_SEQ` is the entire addressable market of any fetch-directed
+      // scheme -- one counter that decides a feature instead of a study that guesses.
+      //
+      // ONE SHARED RISE DETECTOR. `perfRise` instantiates a `RegNext` of its own on every
+      // call, so calling it twice on `perfLvlIcMiss` would build TWO previous-state flops
+      // and two independent edge detectors. Hoisted into this val so IC_MISS and
+      // IC_MISS_SEQ are, by construction, edges of the SAME signal at the SAME depth --
+      // which is what makes their RATIO meaningful. (A `perfRise` per lane would put them
+      // one flop apart and let a short window report SEQ > MISS.)
+      val perfEvtIcMiss = if (perfBuilt) perfRise(perfLvlIcMiss) else False
+      /** The missing line NUMBER (physical address bits 31:6), so "+64 bytes" is "+1".
+        *
+        * ZERO NEW LOGIC IN THE I-CACHE, DELIBERATELY. `IcachePlugin.s1Line` is already a
+        * plain 32-bit REGISTER (`s1Line := s0Ppn ## s0Set ## 0`, assigned unconditionally),
+        * so this comparator hangs off flop outputs and terminates in this area's flops.
+        * The whole detector lives HERE and adds not one gate to the I-cache -- which is the
+        * point: `IcachePlugin_logic_pfNextPa_reg[*]/CE` is the destination of the core's ten
+        * worst setup paths (FetchAlignPlugin records -1.524 ns / 24 levels on
+        * `build/vivado200_allfix`), and a diagnostic must not go near it. `s1Line` is not on
+        * that arc -- the arc runs through the LIVE ITLB verdict into `mshrPa` -- so the only
+        * cost here is one extra fan-out load per bit on a register bank that is not on it.
+        *
+        * ALIGNMENT. `perfLvlIcMiss` is `RegNext(s1Unresolved)`, so `perfEvtIcMiss` fires one
+        * cycle after the miss is discovered -- exactly the cycle on which `s1Line` has
+        * latched that miss's line. The event and the datum are therefore the same age and
+        * neither needs a tap. */
+      val icMissLine = mhIcache.map(_.logic.s1Line(31 downto 6))
+      val icPrevMissLine  = if (perfBuilt) Reg(UInt(26 bits)) init 0 else U(0, 26 bits)
+      /** No previous miss yet: the FIRST miss out of reset has no predecessor and must not
+        * be classified against a reset-value zero. Deliberately NOT cleared by `perfClear`
+        * -- it describes the machine, not the window, and zeroing it would make the first
+        * miss of every window unclassifiable instead of merely edge-approximate. */
+      val icPrevMissValid = if (perfBuilt) RegInit(False) else False
+      val perfEvtIcMissSeq = if (perfBuilt) icMissLine.map { line =>
+        val seq = perfEvtIcMiss && icPrevMissValid && (line === (icPrevMissLine + 1))
+        when(perfEvtIcMiss) { icPrevMissLine := line; icPrevMissValid := True }
+        seq
+      }.getOrElse(False) else False
+
+      // ── PF_LATE: "right line, TOO LATE" -- the timeliness confound ──────────────
+      // CYCLES on which a demand fetch was offered, its translation was ready, and a
+      // SPECULATIVE slot owned the set it wanted -- so the command could not be accepted.
+      // Without this, a high USED/ISSUED can hide a prefetcher that fetches the right
+      // lines and still makes the demand wait, whose fix is DEPTH (issue earlier, more
+      // MSHRs) rather than DIRECTION (a different prefetch address). Reading it against
+      // OFF_PERF_IC_PF_USED is what separates those two answers.
+      //
+      // Counts BOTH shapes of collision, and that is intended: the speculative owner may be
+      // fetching the very line the demand wants (a late but correct prefetch) or a
+      // different line in the same set (a harmful one). Either way the prefetcher is what
+      // made the demand wait, which is the quantity a bandwidth/timeliness decision needs.
+      //
+      // NO TAP, ON THIS FILE'S OWN PRECEDENT. `heldOnSetBusyQ` is already
+      // `RegNext(heldOnSetBusy)` inside the I-cache with `init False` -- a registered copy
+      // whose reset value is the correct idle polarity, exactly the condition under which
+      // `perfStallDc` above reuses `stallDcPackReg(1)` instead of adding a tap of its own.
+      // So this lane is ONE flop deep like the other stall lanes, not two, and costs zero
+      // additional flops.
+      val perfLvlIcPfLate = mhIcache.map(_.logic.heldOnSetBusyQ).getOrElse(False)
+      /** Live read-back of `IcachePlugin.prefetchEnable`, one flop behind. Registered
+        * rather than read straight into the AR-decoded read mux for the same reason every
+        * other producer tap is: the read mux is wide and its select cone is long, and a
+        * measurement register must never be the thing that makes it longer. */
+      val icPfEnableLive = perfTap(mhIcache.map(_.logic.prefetchEnable))
       // Table walkers: `dbgPack(0)` is `fsm.isActive(IDLE)`, so the tap inverts it and
       // its reset value is "idle" -- no spurious start edge out of reset. A walk always
       // returns through IDLE (FINISH -> IDLE -> start), so back-to-back walks cannot
@@ -696,8 +808,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfMispred     = if (perfBuilt) perfCounter(perfEvtMispred) else U(0, 32 bits)
       val perfFlush       = if (perfBuilt) perfCounter(perfEvtFlush) else U(0, 32 bits)
       val perfBranch      = if (perfBuilt) perfCounter(perfEvtBranch) else U(0, 32 bits)
+      val perfMispredUncond = if (perfBuilt) perfCounter(perfEvtMispredUncond) else U(0, 32 bits)
+      val perfMispredCond   = if (perfBuilt) perfCounter(perfEvtMispredCond) else U(0, 32 bits)
       val perfDcMiss      = if (perfBuilt) perfCounter(perfEvtDcMiss) else U(0, 32 bits)
-      val perfIcMiss      = if (perfBuilt) perfCounter(perfRise(perfLvlIcMiss)) else U(0, 32 bits)
+      val perfIcMiss      = if (perfBuilt) perfCounter(perfEvtIcMiss) else U(0, 32 bits)
+      val perfIcMissSeq   = if (perfBuilt) perfCounter(perfEvtIcMissSeq) else U(0, 32 bits)
+      val perfIcPfIssued  = if (perfBuilt) perfCounter(perfEvtIcPfIssued) else U(0, 32 bits)
+      val perfIcPfUsed    = if (perfBuilt) perfCounter(perfEvtIcPfUsed) else U(0, 32 bits)
+      val perfIcPfLate    = if (perfBuilt) perfCounter(perfLvlIcPfLate) else U(0, 32 bits)
       val perfDtlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlDtlbWalk)) else U(0, 32 bits)
       val perfItlbWalk    = if (perfBuilt) perfCounter(perfRise(perfLvlItlbWalk)) else U(0, 32 bits)
       // The top-line stall: ROB non-empty and nothing retired. Both terms are taps, so
@@ -740,9 +858,46 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfPresentDtlb = perfBuilt && stallDtlb.nonEmpty
       val perfPresentItlb = perfBuilt && stallItlb.nonEmpty
       /** LOGICAL counters, not words: cycle and inst are one counter each despite
-        * occupying a LO/HI pair. 12 when this block is built, 0 when it is not -- so a
-        * host reading 0 here knows the block is absent rather than merely idle. */
-      val perfNumCounters = if (perfBuilt) 12 else 0
+        * occupying a LO/HI pair. 18 when this block is built: 12 through 2026-09-26, plus
+        * the two mispredict-CLASS counters (MISPRED_UNCOND/_COND) and the four I-cache
+        * prefetch counters (PF_ISSUED, PF_USED, IC_MISS_SEQ, PF_LATE), all added
+        * 2026-09-27 on two separate branches. 0 when the block is not built -- so a host
+        * reading 0 here knows the block is absent rather than merely idle. */
+      val perfNumCounters = if (perfBuilt) 18 else 0
+
+      // ── OFF_IC_PREFETCH_CTL: runtime on/off for the I-cache next-line prefetcher ──
+      // `IcachePlugin.prefetchEnable` was runtime-SHAPED but not runtime-REACHABLE:
+      // `simPublic()` reaches it from a testbench and `DBG_IC_PREFETCH_DISABLE` reaches
+      // it from a SEPARATE bitstream, so an on/off comparison on silicon meant two
+      // builds -- and two builds differ by a placement lottery worth more than the
+      // effect being measured. This is the runtime path.
+      //
+      // TAKE-OWNERSHIP-ON-FIRST-WRITE, and that shape is the point. `icPfForce` is
+      // sticky: until the host writes this register the I-cache keeps its OWN
+      // elaboration-time default, so a build that set `DBG_IC_PREFETCH_DISABLE` still
+      // comes up disabled and every DUT that wires nothing is bit-identical to before.
+      // After the first write the debug side holds the level CONTINUOUSLY rather than
+      // pulsing it, which is what makes the read-back trustworthy: a pulse can be
+      // missed and then the host is reading its own intent instead of the machine.
+      //
+      // DELIBERATELY NOT CLEARED BY `perfClear`. Every counter above is; this is a
+      // control, and zeroing a measurement window must never change the machine being
+      // measured.
+      val icPfEnable = if (perfBuilt) RegInit(True) else True
+      val icPfForce  = if (perfBuilt) RegInit(False) else False
+      if (perfBuilt) { icPfEnable.simPublic(); icPfForce.simPublic() }
+      /** [0] live prefetchEnable (from the I-cache's own flop, one cycle behind), [1] the
+        * debug bus has taken ownership, [2] IcachePlugin present in this build.
+        *
+        * BIT 2 IS THE ANTI-DEAD-PROBE BIT, for the same reason OFF_PERF_CTL[20:16]
+        * exists: with no I-cache in the build bit 0 reads 0, which is indistinguishable
+        * from "prefetch is off". Bit 2 tells the host which zero it is looking at. */
+      val icPfCtlWord: Bits =
+        B(0, 29 bits) ##                   // [31:3] reserved zero
+        Bool(perfPresentIc) ##             // [2]    producer present
+        icPfForce ##                       // [1]    debug bus owns the level
+        icPfEnableLive                     // [0]    live prefetchEnable, 1-cycle lag
+
       val perfCtlWord: Bits =
         B(0, 11 bits) ##                   // [31:21] reserved zero
         Bool(perfPresentItlb) ##           // [20]
@@ -853,6 +1008,10 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val historyReadKind = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadWord = if (historyBuilt) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val historyReadPcBank = if (historyBuilt) Reg(UInt(pcBankBits bits)) init 0 else U(0, pcBankBits bits)
+      /** Stage-1 capture of the 128-bit ring entry index this read addresses. It is the
+        * TAG of the entry snapshot below: without it a reader that reads word 0 of one
+        * entry and word 1 of another would be served the first entry's word 1. */
+      val historyReadRingIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
       val pcReadIndex = ((arAddr - DebugRegMap.OFF_PC_TRACE_BODY) >> 2).resize(5)
       val excReadIndex = ((arAddr - DebugRegMap.OFF_EXC_RING_BODY) >> 4).resize(5)
       val branchReadIndex = ((arAddr - DebugRegMap.OFF_BRANCH_RING_BODY) >> 4).resize(5)
@@ -864,6 +1023,74 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         excRing.readSync(excReadIndex, historyReadIssue && excBodyRead) else B(0, 128 bits)
       val branchBodyWord = if (historyBuilt)
         branchRing.readSync(branchReadIndex, historyReadIssue && branchBodyRead) else B(0, 128 bits)
+
+      /* ── ATOMIC 128-bit ring entry reads (2026-09-27) ──────────────────────────────
+       *
+       * A branch-ring or exception-ring ENTRY is 128 bits and the bus is 32, so a reader
+       * takes it in four INDEPENDENT AXI transactions. The rings are written by a LIVE
+       * CPU: the branch ring turns over every `historyDepth` retired branches, which on
+       * silicon is microseconds, while two consecutive JTAG reads are milliseconds apart.
+       * Every word therefore came from a different event and the reader stitched four
+       * unrelated events into one plausible line -- measured on the board at 100 MHz
+       * (build_id 0xD01DBDC5) as `pc=0x027de060` (a `beq.s`) reported with
+       * `next=0x027d30da`, the return address of an `rts` four branches later, and one PC
+       * reported with three different `next` values. Nothing was skewed in the producer:
+       * `RobPlugin` holds every field of an event in one `branchTrainMem` row and the
+       * `*Ring.write` above lands all 128 bits in one cycle. The read tore it apart.
+       *
+       * THE ENTRY IS NOW LATCHED WHOLE. Reading WORD 0 of an entry snapshots all 128 bits
+       * of it, tagged with its index; words 1..3 of that same index are answered from the
+       * snapshot instead of from the (meanwhile-overwritten) memory. The reader's contract
+       * is therefore "read word 0 first, then the rest" -- which is what
+       * `tools/jtag_repl.tcl`'s `last-branches` and `exc-ring` already do, and what the
+       * `DebugRegMap` word order was designed for (word 0 is the identifying field: the
+       * branch's own PC, the exception's vector).
+       *
+       * IT CANNOT SKEW AGAIN because there is no longer any path by which two words of
+       * one reported entry come from two different memory reads: words 1..3 are SLICES OF
+       * ONE REGISTER that was loaded from ONE synchronous read of ONE ring row. The tag
+       * comparison is what makes that safe under any read order -- a mismatched index
+       * falls back to the live memory, i.e. to the old behaviour, rather than silently
+       * serving another entry's tail.
+       *
+       * A stale snapshot is still possible and is deliberate: if the entry is overwritten
+       * after word 0 was read, words 1..3 report the event word 0 named, not the newer
+       * one. That is the LAGGING-BUT-COHERENT posture debug instrumentation is allowed
+       * (spec: "may lag by cycles, must never cost a logic level"); it is confined to the
+       * debug read mux's stage 2 and touches no functional cone.
+       *
+       * COST: 2 x (128 flops + a 5-bit tag), one extra 4:1 32-bit mux and one 2:1 32-bit
+       * mux per ring in the stage-2 read path. */
+      val excSnap = if (historyBuilt) Reg(Bits(128 bits)) init 0 else B(0, 128 bits)
+      val excSnapIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      // The tag is only meaningful once a word-0 read has loaded it. Without this bit,
+      // index 0 would alias the reset value of `*SnapIdx` and a word-1 read of entry 0
+      // taken BEFORE any word-0 read would be answered from an all-zero snapshot -- a
+      // register that reads zero and lies, which is the exact failure class this whole
+      // change exists to remove.
+      val excSnapValid = if (historyBuilt) RegInit(False) else False
+      val branchSnap = if (historyBuilt) Reg(Bits(128 bits)) init 0 else B(0, 128 bits)
+      val branchSnapIdx = if (historyBuilt) Reg(UInt(5 bits)) init 0 else U(0, 5 bits)
+      val branchSnapValid = if (historyBuilt) RegInit(False) else False
+      if (historyBuilt) {
+        // `readStage2` is the cycle the memory read answers; `historyReadWord === 0`
+        // makes word 0 the capture point for the whole entry.
+        when(readStage2 && readIsHistory && historyReadWord === 0) {
+          when(historyReadKind === U(1, 2 bits)) {
+            excSnap := excBodyWord; excSnapIdx := historyReadRingIdx; excSnapValid := True
+          }
+          when(historyReadKind === U(2, 2 bits)) {
+            branchSnap := branchBodyWord; branchSnapIdx := historyReadRingIdx
+            branchSnapValid := True
+          }
+        }
+      }
+      /** Word `historyReadWord` of the addressed entry: from the snapshot for words 1..3
+        * of the entry word 0 was last read from, else straight from the ring memory. */
+      def ringWord(live: Bits, snap: Bits, snapIdx: UInt, snapValid: Bool): Bits =
+        Mux(snapValid && historyReadWord =/= 0 && snapIdx === historyReadRingIdx,
+            snap.subdivideIn(32 bits)(historyReadWord),
+            live.subdivideIn(32 bits)(historyReadWord))
 
       dbgAxi.awready := !awPend && !bPend && !dbgRst
       dbgAxi.wready  := !wPend  && !bPend && !dbgRst
@@ -939,6 +1166,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           historyReadKind := Mux(pcBodyRead, U(0, 2 bits), Mux(excBodyRead, U(1, 2 bits), U(2, 2 bits)))
           historyReadWord := arAddr(3 downto 2)
           historyReadPcBank := pcReadIndex(pcBankBits - 1 downto 0)
+          historyReadRingIdx := Mux(excBodyRead, excReadIndex, branchReadIndex)
         }
       }
       /** READ STAGE 2. The response word. Exactly one of the six per-region partial
@@ -955,8 +1183,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         historyWord := B(0, DebugRegMap.DBG_DW bits)
         switch(historyReadKind) {
           is(U(0, 2 bits)) { historyWord := pcBankReads(historyReadPcBank) }
-          is(U(1, 2 bits)) { historyWord := excBodyWord.subdivideIn(32 bits)(historyReadWord) }
-          is(U(2, 2 bits)) { historyWord := branchBodyWord.subdivideIn(32 bits)(historyReadWord) }
+          is(U(1, 2 bits)) {
+            historyWord := ringWord(excBodyWord, excSnap, excSnapIdx, excSnapValid)
+          }
+          is(U(2, 2 bits)) {
+            historyWord := ringWord(branchBodyWord, branchSnap, branchSnapIdx, branchSnapValid)
+          }
         }
         rData := Mux(readIsHistory, historyWord,
                  Mux(readIsLiveInt, liveIntWord,
@@ -1692,6 +1924,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_PERF_INST_LO)      { perfInst(31 downto 0).asBits }
         at(DebugRegMap.OFF_PERF_INST_HI)      { perfInst(63 downto 32).asBits }
         at(DebugRegMap.OFF_PERF_BRANCH)       { perfBranch.asBits }
+        // The two class counters do NOT sum to OFF_MISPRED_COUNT -- different source,
+        // deliberately. The residual sizes the uncovered class; see their block in
+        // `tools/debug/debug_regmap.def` and the producer comment above.
+        at(DebugRegMap.OFF_PERF_MISPRED_UNCOND) { perfMispredUncond.asBits }
+        at(DebugRegMap.OFF_PERF_MISPRED_COND)   { perfMispredCond.asBits }
         at(DebugRegMap.OFF_PERF_DC_MISS)      { perfDcMiss.asBits }
         at(DebugRegMap.OFF_PERF_IC_MISS)      { perfIcMiss.asBits }
         at(DebugRegMap.OFF_PERF_DTLB_WALK)    { perfDtlbWalk.asBits }
@@ -1700,6 +1937,17 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         at(DebugRegMap.OFF_PERF_STALL_DC)     { perfStallDc.asBits }
         at(DebugRegMap.OFF_PERF_STALL_WALK)   { perfStallWalk.asBits }
         at(DebugRegMap.OFF_PERF_DETAIL_CAP) { B(detailCap, 32 bits) }
+        // I-cache prefetch: the control's read-back, then the coverage pair. Read the
+        // two counters TOGETHER -- USED/ISSUED is coverage, ISSUED-USED is wasted
+        // bandwidth, and neither number means anything alone.
+        at(DebugRegMap.OFF_IC_PREFETCH_CTL)   { icPfCtlWord }
+        at(DebugRegMap.OFF_PERF_IC_PF_ISSUED) { perfIcPfIssued.asBits }
+        at(DebugRegMap.OFF_PERF_IC_PF_USED)   { perfIcPfUsed.asBits }
+        // The two diagnosis counters. IC_MISS_SEQ against OFF_PERF_IC_MISS says how much
+        // of the miss stream a next-line frontier could EVER reach; PF_LATE says whether
+        // the prefetches that DID land arrived in time.
+        at(DebugRegMap.OFF_PERF_IC_MISS_SEQ)  { perfIcMissSeq.asBits }
+        at(DebugRegMap.OFF_PERF_IC_PF_LATE)   { perfIcPfLate.asBits }
         for ((counter, index) <- detailCounters.zipWithIndex) {
           at(DebugRegMap.OFF_PERF_DETAIL_BASE + index * 4) { counter.asBits }
         }
@@ -1843,6 +2091,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             if (stage >= 2) when(wStrb(0)) {
               perfRun := wData(1)
               when(wData(0)) { perfClear := True }
+            }
+          }
+          // IT BELONGS HERE, IN `switch(awAddr)` UNDER `when(doWrite)`, AND NOWHERE
+          // ELSE -- the same rule `perfClear`'s declaration records. The multi-hot clear
+          // was first written into a READ-region `switch(arAddr)`, where it elaborated
+          // cleanly, emitted no warning, read back perfectly and silently never fired.
+          // `PerfCounterSpec`'s "the coverage pair CLASSIFIES" test checks the toggle's EFFECT on
+          // the counters, not only its read-back, for exactly that reason.
+          is(DebugRegMap.OFF_IC_PREFETCH_CTL) {
+            if (stage >= 2) when(wStrb(0)) {
+              icPfEnable := wData(0)
+              icPfForce  := True
             }
           }
           is(DebugRegMap.OFF_CONTROL) {
@@ -2152,6 +2412,25 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       // same reach-in this file already uses to READ their packs; `dbgCd` shares
       // `coreCd.clock` (only the reset differs), so this is not a clock crossing.
       val mhClear = csr.multiHotClearRequest && !dbgRst
+      // OFF_IC_PREFETCH_CTL -> IcachePlugin.prefetchEnable. Same reach-in, same
+      // `&& !dbgRst` rule as `mhClear` just below: the CPU domain can leave reset before
+      // this reset-less debug POR generator finishes, and a transient must never silently
+      // disable the prefetcher in the very run that is measuring it. Dropping the force
+      // during dbgRst hands the level back to the I-cache's own default, which is ON --
+      // the safe direction (a build behaves as it did before this register existed).
+      //
+      // NOT A CLOCK CROSSING: `dbgCd` is `coreCd.clock` with a different reset and is
+      // `setSynchronousWith(coreCd)`, so this is the same edge.
+      //
+      // NOT AN `in Bool()` ON THE I-CACHE: see `IcachePlugin.scala`'s own comment at
+      // `dbgPrefetchWrEn`. An `in Bool()` created inside that plugin's Area becomes a
+      // TOP-LEVEL port whose `default(...)` has no parent to apply at, so every
+      // full-core testbench reads it as 0 and prefetch goes dead in exactly the runs
+      // that measure it. That was confirmed once already and is not being re-introduced.
+      mhIcache.foreach { ic =>
+        ic.logic.dbgPrefetchWrEn  := csr.icPfForce && !dbgRst
+        ic.logic.dbgPrefetchWrVal := csr.icPfEnable
+      }
       mhIcache.foreach(_.logic.dbgMultiHotClear := mhClear)
       stallDcache.foreach(_.logic.dbgMultiHotClear := mhClear)
       stallItlb.foreach(_.logic.dbgMultiHotClear := mhClear)

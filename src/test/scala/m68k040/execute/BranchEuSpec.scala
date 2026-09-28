@@ -41,6 +41,10 @@ class BranchEuSourcePlugin extends FiberPlugin {
     // (ibranch, isReturn, but anInc=0 -- the exact shape that used to be misclassified).
     val iIbranch    = in Bool ()
     val iIsReturn   = in Bool ()
+    // RAS flush-repair carry: `isCall` marks the BRANCH µop of a BSR/JSR (see
+    // DecodedUop.isCall). Driven independently so the rasKind/rasData carry can be
+    // exercised for a call, a RAS-predicted return, and neither.
+    val iIsCall     = in Bool ()
     val iAnInc      = in UInt (3 bits)
     val iPdstValid  = in Bool ()
 
@@ -57,6 +61,7 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.unimplemented:= False
     uop.anInc := iAnInc; uop.stkPush := False; uop.ccrRestore := False
     uop.isReturn     := iIsReturn
+    uop.isCall       := iIsCall
     uop.dstArch      := 0
     uop.psrcA        := 0; uop.psrcAValid := False
     uop.psrcB        := 0; uop.psrcBValid := False
@@ -80,9 +85,13 @@ class BranchEuSourcePlugin extends FiberPlugin {
     uop.isScc        := False
     uop.isDbcc       := False
     uop.faultUsesNextPc := False
-    // Fetch-time prediction: NOT predicted (predictor-inert) -> mispredict == taken.
-    uop.predTaken    := False
-    uop.predTarget   := 0
+    // Fetch-time prediction: driven so the RAS-repair carry's "the frontend actually
+    // popped for this return" term (`isReturn && predTaken`) is reachable. Both default
+    // to the predictor-inert values, so mispredict == taken as before.
+    val iPredTaken   = in Bool ()
+    val iPredTarget  = in UInt (32 bits)
+    uop.predTaken    := iPredTaken
+    uop.predTarget   := iPredTarget
     uop.lenWords     := 1
     ctx.robId        := iRobId
 
@@ -108,6 +117,9 @@ class BranchEuSourcePlugin extends FiberPlugin {
     // (via the shared BtbUpdateService), so exercising it here at the EU boundary
     // covers both training targets without needing two separate harnesses.
     val cIsBranch   = out Bool ();        cIsBranch   := eu.completion.payload.isBranch
+    // RAS flush-repair carry (RasPlugin `branchRepair`): NONE/CALL/RET + the entry.
+    val cRasKind    = out UInt (m68k040.frontend.RasRepair.W bits); cRasKind := eu.completion.payload.rasKind
+    val cRasData    = out UInt (32 bits); cRasData := eu.completion.payload.rasData
   }
 }
 
@@ -179,6 +191,7 @@ class BranchEuSpec extends AnyFunSuite {
       s.wValid #= false; s.wAddr #= 0; s.wData #= 0
       s.iCond #= 0; s.iPc #= 0; s.iDisp #= 0; s.iPNzvcSrc #= 0; s.iRobId #= 0
       s.iIbranch #= false; s.iIsReturn #= false; s.iAnInc #= 0; s.iPdstValid #= false
+      s.iIsCall #= false; s.iPredTaken #= false; s.iPredTarget #= 0
       cd.waitSampling(80) // PRF init-zero sweep
 
       // We use NZVC physreg addresses 0..15, each preloaded with its own value
@@ -267,6 +280,7 @@ class BranchEuSpec extends AnyFunSuite {
       s.wValid #= false; s.wAddr #= 0; s.wData #= 0
       s.iCond #= 0; s.iPc #= 0; s.iDisp #= 0; s.iPNzvcSrc #= 0; s.iRobId #= 0
       s.iIbranch #= false; s.iIsReturn #= false; s.iAnInc #= 0; s.iPdstValid #= false
+      s.iIsCall #= false; s.iPredTaken #= false; s.iPredTarget #= 0
       cd.waitSampling(80) // PRF init-zero sweep
 
       case class Case(name: String, isReturn: Boolean, anInc: Int, pdstValid: Boolean,

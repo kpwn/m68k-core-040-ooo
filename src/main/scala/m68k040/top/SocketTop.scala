@@ -150,15 +150,18 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new DcachePlugin(socketMerged = true, allowPretranslatedProbeHints = false),
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
-      new m68k040.frontend.RasPlugin(),
+      new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair),
       new m68k040.frontend.GsharePlugin(retainRedirectHistory = ipcThroughput),
       new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true,
-        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput),
+        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput,
+        computeDirectTargets = ShippingCoreConfig.computeDirectTargets,
+        deferSlot1Uncond = ShippingCoreConfig.deferSlot1Uncond),
       new m68k040.decode.DecodeStage(allowSlot1Prediction = ipcThroughput,
         fuseLongMoveLoads = ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
       new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+        rasBranchRepair = ShippingCoreConfig.rasBranchRepair,
         lsOooIssue = SocketTopConfig.LS_OOO_ISSUE),
       new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
         earlyAutoStoreAddress = ipcLateStore,
@@ -179,6 +182,11 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
+        // ⛔ STILL OFF BY DEFAULT. `LS_OOO_ISSUE` is `sys.env` and unset, so this is
+        // `false` in every ordinary build; the knob exists only so the park+recovery code
+        // above can be exercised. A THIRD independent corpus defect (a 6-red delta on
+        // `add_mem_postinc_rmw` / `memind_full_matrix` / `store_forward_matrix`, which
+        // reproduces on HEAD's own LsEuPlugin with no park present) blocks turning it on.
         loadBypassUnreadyLoad = SocketTopConfig.LS_OOO_ISSUE,
         specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP),
       eu0, eu1, branchEu, lsEu, divEu,
@@ -673,7 +681,10 @@ object GenSocketTopVerilog {
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
             s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
-            s"dcacheSectored=${ShippingCoreConfig.dcacheSectored}")
+            s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
+            s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+            s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
+            s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

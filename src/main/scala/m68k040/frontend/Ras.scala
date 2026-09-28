@@ -53,6 +53,34 @@ import spinal.lib.misc.plugin.FiberPlugin
   * improvement, though not a per-branch-precise one (see the checkpointSave/Restore
   * port doc below for the full soundness argument).
   *
+  * ⛔ MEASURED COST OF "not per-branch-precise" (2026-09-26, `BranchPredictIpcSpec`).
+  * The imprecision is not a small residual: it makes EVERY MISPREDICTED CALL COST TWO
+  * MISPREDICTS -- its own, and its callee's return.
+  *
+  * The flush fires at the mispredicting branch's RETIRE, so when the branch IS the call
+  * (a `jsr (An)` whose target the BTB could not know), the call's own push is by then
+  * ARCHITECTURAL. `checkpointRestore` reverts it anyway, because the checkpoint predates
+  * it -- and `checkpointSave` cannot help, since `rob.count === 0` next becomes true
+  * right AFTER the flush, re-saving the already-reverted state. The callee's `rts` then
+  * finds no prediction at all.
+  *
+  * On the `br-ind` probe (one `jsr (%a0)`, 32 targets in a fixed cycle) that is exactly
+  * 1024 of 2050 retired mispredicts -- FIFTY PERCENT, in a kernel whose only genuine
+  * unpredictability is the indirect target. `br-ind-2` (2 targets) shows the same
+  * coupling at 200 of 678. And the bucket is INVISIBLE to both shipped board class
+  * counters: `OFF_PERF_MISPRED_UNCOND`/`_COND` come from `debugBranchRetire`, which is
+  * gated on `isBtbBranch` and excludes returns, while `OFF_MISPRED_COUNT` counts them --
+  * so `MISPRED_COUNT - (UNCOND + COND)` reads it on silicon today, no rebuild needed.
+  *
+  * Neither "keep" nor "restore" can be right here, so this needs REAL recovery, and the
+  * shape is already proven in this codebase one plugin over: GsharePlugin's `ghrArch` is
+  * a RETIRE-TIME architectural history that the flush copies wholesale into the
+  * speculative register. The RAS wants the same thing -- an architectural shadow stack
+  * updated when a call or a return RETIRES -- which is the "per-instruction retire-linked
+  * commit signal ... real ROB-side plumbing" this comment declares out of scope below.
+  * It is the ranked next step, not a nice-to-have: `rob.count === 0` is the wrong proxy
+  * precisely in the case that matters.
+  *
   * Content, not just the pointer: a NAIVE version of this fix would checkpoint only
   * `rasSp`/`count` (the pointer/occupancy), reasoning that entries below a restored
   * `rasSp` are untouched "real" data that just becomes reachable again. That
@@ -98,8 +126,66 @@ import spinal.lib.misc.plugin.FiberPlugin
   *    point is to keep the ROB->frontend route purely register-to-register).
   *
   * At most ONE push OR one pop per cycle (an instruction is a call XOR a return, and
-  * the aligner emits at most one predicted-redirecting slot/cycle) -> single-ported. */
-class RasPlugin extends FiberPlugin {
+  * the aligner emits at most one predicted-redirecting slot/cycle) -> single-ported.
+  *
+  * ════════════════════════════════════════════════════════════════════════════════════
+  * `branchRepair` (2026-09-27, DEFAULT OFF): RE-APPLY THE FLUSHING BRANCH'S OWN EFFECT
+  * ════════════════════════════════════════════════════════════════════════════════════
+  * The measured defect above is that `checkpointRestore` reverts a push that was already
+  * ARCHITECTURAL, because the flush fires at the mispredicting branch's own recovery and
+  * the checkpoint predates that branch. The missing state is therefore EXACTLY ONE
+  * ENTRY -- the flushing branch's own push (a mispredicted call) or its own pop (a
+  * mispredicted, RAS-predicted return) -- and `branchRepair` puts it back:
+  *
+  *   repairValid/repairKind/repairData : driven from the ROB, one cycle before the repair
+  *     is applied. `kind` is CALL (re-push `data` = the call's fall-through PC) or RET
+  *     (re-pop the entry whose address is `data` = the target the RAS predicted).
+  *
+  * WHY NOT A FULL RETIRE-TIME ARCHITECTURAL SHADOW STACK (the `ghrArch` idiom the defect
+  * note names). Measured on this core, a shadow stack CANNOT repair the dominant flush
+  * path. The ROB's Tier-1 reschedule (`earlyFire`) redirects fetch at the branch's
+  * RESOLUTION, i.e. BEFORE it reaches the head -- which is exactly why GsharePlugin's
+  * `flushRepair` is wired to `doFlush` and deliberately NOT to `earlyFire` ("Tier 1 fires
+  * BEFORE the mispredicting branch reaches the ROB head, so the architectural GHR does
+  * not yet hold that branch's bit"). A retire-time RAS shadow has the same hole, and it
+  * is not a corner: when Tier 1 owns the redirect, Tier 2 SUPPRESSES the frontend flush
+  * (`earlySuppressFe`), so the RAS restore never happens again and there is no later
+  * chance to repair. Worse, a shadow stack restored at Tier 1 would DELETE the pushes of
+  * older, correct-path calls that are still in flight. So the repair has to be the
+  * flushing branch's own delta, applied wherever the restore itself fires -- which is
+  * Skadron/Ahuja/Martonosi/Clark's finding (MICRO-31, 1998) that a SMALL amount of repair
+  * state recovers most of the loss, in the shape this pipeline can actually deliver.
+  * A shadow stack remains complementary (it would make the RESTORE SOURCE more recent
+  * than the last ROB drain) but it is not what fixes the double mispredict.
+  *
+  * IDEMPOTENT BY CONSTRUCTION, not "push one more". The repair states an invariant --
+  * "the top of stack is this call's return address" / "this return's entry is gone" --
+  * and compares against the live `predTarget` before acting. That matters: the checkpoint
+  * is refreshed whenever the ROB drains, and on this front-end-starved machine the ROB is
+  * empty most cycles, so the checkpoint CAN already contain the call's push (a drain in
+  * the few cycles between the call's fetch-time push and its dispatch). A blind push
+  * would then leave the stack one entry too deep and simply move the second mispredict to
+  * the CALLER's return. The compare costs one 32-bit equality against a mux that already
+  * exists (`predTarget` is the predictor's own combinational read).
+  *
+  * TIMING. Every port is a bare register Q on the ROB side, and this module consumes them
+  * behind one more flop (`rp.arm`), so `branchRepair` adds NOTHING to the redirect /
+  * `ftbBlocked` cone -- the standing rule for predictor recovery on this core ("register
+  * the event, then repair"; see GsharePlugin's `repairArm`). The repair therefore lands
+  * one cycle AFTER the restore, which is also what makes it read the RESTORED stack.
+  *
+  * A restore on the repair cycle WINS (its block is placed last), so the repair is
+  * dropped rather than applied to a state it was not computed against. */
+object RasRepair {
+  val W    = 2
+  val NONE = 0
+  /** Re-push `data` (the call's fall-through PC) unless it is already the top of stack. */
+  val CALL = 1
+  /** Re-pop `data` (the return target the RAS predicted) if it is back on top. */
+  val RET  = 2
+}
+
+class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
 
   val logic = during build new Area {
     val entries = Global.RAS_ENTRIES.get
@@ -130,6 +216,13 @@ class RasPlugin extends FiberPlugin {
     val invalidateAll = Bool();    invalidateAll.allowOverride; invalidateAll := False
     val checkpointSave    = Bool(); checkpointSave.allowOverride;    checkpointSave    := False
     val checkpointRestore = Bool(); checkpointRestore.allowOverride; checkpointRestore := False
+    // ---- branchRepair ports (see the class doc). Declared unconditionally so every
+    //      wiring layer compiles either way; with the option OFF nothing reads them and
+    //      they prune to nothing. Idle-defaulted, like every other port here. ----
+    val repairValid = Bool();                 repairValid.allowOverride; repairValid := False
+    val repairKind  = UInt(RasRepair.W bits);  repairKind.allowOverride;  repairKind  := U(RasRepair.NONE, RasRepair.W bits)
+    val repairData  = UInt(32 bits);           repairData.allowOverride;  repairData  := U(0, 32 bits)
+    repairValid.simPublic(); repairKind.simPublic(); repairData.simPublic()
     // sim-only debug visibility (directed lock-step RAS-prediction-accuracy tests):
     // these otherwise have no OTHER reason to stay a stable, prunable-proof handle.
     pushValid.simPublic(); pushRetPc.simPublic(); popValid.simPublic()
@@ -170,6 +263,37 @@ class RasPlugin extends FiberPlugin {
     }
     rasSp := nextRasSp
     count := nextCount
+
+    // ---- branchRepair: re-apply the FLUSHING branch's own push/pop (see class doc) ----
+    // Placed after `rasSp := nextRasSp` / `count := nextCount` (so it overrides a
+    // same-cycle fetch push/pop, which cannot occur anyway -- the redirect has just
+    // squashed the frontend) and BEFORE invalidateAll/checkpointRestore, so both of
+    // those still win.
+    val rp = if (branchRepair) new Area {
+      // One flop between the port and the action: the port is a register Q on the ROB
+      // side, `checkpointRestore` fires on the cycle the port is asserted, and the
+      // restored state is therefore what `ras`/`rasSp`/`count` HOLD on this arm cycle.
+      val arm  = RegNext(repairValid && repairKind =/= U(RasRepair.NONE, RasRepair.W bits)) init False
+      val kind = RegNextWhen(repairKind, repairValid) init U(RasRepair.NONE, RasRepair.W bits)
+      val data = RegNextWhen(repairData, repairValid) init U(0, 32 bits)
+      arm.simPublic(); kind.simPublic(); data.simPublic()
+      // `predValid`/`predTarget` ARE the predictor's answer for the next return, so
+      // comparing against them states the repair's invariant directly (and reuses the
+      // existing top-of-stack mux rather than adding a second read).
+      val topIsData = predValid && (predTarget === data)
+      val doPush = arm && (kind === U(RasRepair.CALL, RasRepair.W bits)) && !topIsData
+      val doPop  = arm && (kind === U(RasRepair.RET,  RasRepair.W bits)) && topIsData
+      doPush.simPublic(); doPop.simPublic()
+      when(doPush) {
+        ras(rasSp) := data
+        rasSp      := rasSp + U(1, spBits bits)
+        when(count =/= cntMax) { count := count + U(1, cntBits bits) }
+      }
+      when(doPop) {
+        rasSp := rasSp - U(1, spBits bits)
+        count := count - U(1, cntBits bits)   // topIsData implies count =/= 0
+      }
+    } else null
 
     // ---- invalidateAll: clear occupancy (and the pointer) on an I-cache flush ----
     when(invalidateAll) {

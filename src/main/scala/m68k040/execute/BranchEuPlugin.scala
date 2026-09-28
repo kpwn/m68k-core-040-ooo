@@ -26,6 +26,13 @@ case class BranchCompletion() extends Bundle {
   // ── gshare PHT-update fields (slice 3) ──
   val phtValid   = Bool()         // a CONDITIONAL gshare-predicted branch (train pht[phtIndex])
   val phtIndex   = UInt(11 bits)  // the carried fetch-time folded-XOR index the lookup read
+  // ── RAS flush-repair carry (slice 2, RasPlugin `branchRepair`) ──
+  // What the FETCH-side RAS did for THIS branch, so a flush that rolls the RAS back to a
+  // checkpoint predating it can put that one entry back (see RasPlugin's class comment:
+  // a mispredicted call otherwise costs TWO mispredicts, its own and its callee's `rts`).
+  // Pure wires off signals S1 already computes; nothing reads them when the option is off.
+  val rasKind    = UInt(m68k040.frontend.RasRepair.W bits)  // NONE / CALL / RET
+  val rasData    = UInt(32 bits)  // CALL: the call's fall-through PC. RET: the predicted target.
 }
 
 /** Execute-time conditional fault completion (generalized from the original TRAPV-
@@ -389,6 +396,19 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // the resolved direction (btbTaken == actualTaken, already driven above).
     completionPort.payload.phtValid  := s1Valid && u1.phtValid
     completionPort.payload.phtIndex  := u1.phtIndex
+    // RAS flush-repair carry (slice 2). A CALL's fetch-time push is `fallThruPc` (the
+    // aligner pushes `slotPc + lenWords*2`, which IS this µop's `nextPc` -- the same value
+    // the crack's push STORE writes to the real stack). A RETURN only popped the RAS if it
+    // was actually RAS-predicted, and a return's `predTaken` can come from nowhere else
+    // (the BTB/FTB never learn returns -- see `isBtbBranch` above), so `predTaken` is the
+    // exact "the frontend popped for this one" bit. Not gated on `mispredict`: the ROB
+    // reads this only for a branch that goes on to flush.
+    val rasIsCall = u1.isCall
+    val rasIsPop  = isReturn && u1.predTaken
+    completionPort.payload.rasKind := Mux(rasIsCall, U(m68k040.frontend.RasRepair.CALL, m68k040.frontend.RasRepair.W bits),
+                                     Mux(rasIsPop,  U(m68k040.frontend.RasRepair.RET,  m68k040.frontend.RasRepair.W bits),
+                                                    U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits)))
+    completionPort.payload.rasData := Mux(rasIsCall, fallThruPc, u1.predTarget)
 
     // ---- S1: branch-EU int write (RTS/RTR postinc A7, OR Scc/DBcc Dn write) ----
     // Three mutually-exclusive int-write sources, all to the renamed pdst:
@@ -451,7 +471,42 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
       val taken   = Bool()
       val redirect= Bool()
       val nextPc  = UInt(32 bits)
+      // ── MISPREDICT ATTRIBUTION (2026-09-26, branch-prediction track) ──────────
+      // `mispredict` above is ONE verdict over THREE independent failure modes, and
+      // the shipped silicon counters cannot separate them: OFF_PERF_MISPRED_UNCOND /
+      // _COND split only by brType, and BOTH are sourced from `debugBranchRetire`,
+      // which is gated on `isBtbBranch` and therefore EXCLUDES RETURNS entirely --
+      // while OFF_MISPRED_COUNT (`branchRedirect`) counts returns too. So a
+      // return/RAS bucket exists that neither class counter sees.
+      //
+      // These fields let a sim classify each mispredict exactly:
+      //   no prediction  : predTaken=0 on a resolved-taken branch  (BTB/FTB coverage)
+      //   wrong direction: predTaken =/= redirect                  (gshare / bimodal)
+      //   wrong target   : predTaken==redirect==1, predTarget=/=target (last-target BTB)
+      // and `ibranch`/`isReturn`/`btbTrained`/`phtValid` say WHICH predictor owned it.
+      // Pure wires off signals this stage already computes -- no new logic level, and
+      // nothing in hardware reads them (the same discipline as the fields above).
+      val robId      = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
+      val mispredict = Bool()
+      val predTaken  = Bool()
+      val predTarget = UInt(32 bits)
+      val actTarget  = UInt(32 bits)
+      val ibranch    = Bool()
+      val isReturn   = Bool()
+      val phtValid   = Bool()
+      val brType     = UInt(2 bits)
+      val btbTrained = Bool()
     }
+    brDbg.robId      := s1Ctx.robId
+    brDbg.mispredict := s1Valid && mispredict
+    brDbg.predTaken  := u1.predTaken
+    brDbg.predTarget := u1.predTarget
+    brDbg.actTarget  := actualTarget
+    brDbg.ibranch    := u1.ibranch
+    brDbg.isReturn   := isReturn
+    brDbg.phtValid   := s1Valid && u1.phtValid
+    brDbg.brType     := brType
+    brDbg.btbTrained := isBtbBranch
     brDbg.valid    := s1Valid
     brDbg.pc       := u1.pc
     brDbg.cond     := u1.cond

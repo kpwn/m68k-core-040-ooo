@@ -70,7 +70,11 @@ class IpcBenchSpec extends CoreBenchHarness {
       kDhrystone(copyStyle = "byteX4", copyback = true),
       kDhrystone(copyStyle = "byteDispX4", copyback = true),
       kDhrystone(copyStyle = "byteLdIncX4", copyback = true),
-      kDhrystone(copyStyle = "byteStIncX4", copyback = true))
+      kDhrystone(copyStyle = "byteStIncX4", copyback = true)) ++
+      // IPC_STRCMP_KERNELS=1 appends the Track 6 strcmp kernels (load -> compare ->
+      // conditional branch, the shape the board spends its retire stall in and this
+      // suite had none of). Opt-in, so the default aggregate stays byte-identical.
+      (if (sys.env.get("IPC_STRCMP_KERNELS").contains("1")) strcmpKernels else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
@@ -100,6 +104,16 @@ class IpcBenchSpec extends CoreBenchHarness {
         // holds the released (LS-class-only) consumer at its issue register until the real
         // announce confirms it, so a miss costs cycles and never a value. Default OFF.
         specLoadWakeup = sys.env.get("LS_SPEC_WAKE").contains("1"),
+        // THE COMBINATION UNDER GATE (2026-09-27). The three other individually-gated
+        // levers of this campaign, so the COMBINED core can be A/B'd against the same
+        // `throughput-v2` baseline in ONE suite, per kernel, on the `-cb` postures. They
+        // had a probe suite each (`RasBranchRepairIpcSpec`, `BranchPredictIpcSpec`) and no
+        // way to be measured TOGETHER on the workload-shaped kernels -- which is the whole
+        // reason features that pass individually still have to be gated as a set.
+        // All default OFF, so an unset environment reproduces every earlier run exactly.
+        rasBranchRepair = sys.env.get("RAS_BRANCH_REPAIR").contains("1"),
+        computeDirectTargets = sys.env.get("COMPUTE_DIRECT_TARGETS").contains("1"),
+        deferSlot1Uncond = sys.env.get("DEFER_SLOT1_UNCOND").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`

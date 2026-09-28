@@ -337,6 +337,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // starts at a flop Q with the whole period in front of it.
       ras.logic.checkpointSave    := rob.logic.countIsZero
       ras.logic.checkpointRestore := rasCheckpointRestore
+      // RAS flush-repair (RasPlugin `branchRepair`) -- LOCKSTEP_RAS_BRANCH_REPAIR=1.
+      require(rob.rasBranchRepair == ras.branchRepair, "rasBranchRepair must agree")
+      if (rob.rasBranchRepair) {
+        ras.logic.repairValid := rob.logic.earlyFire
+        ras.logic.repairKind  := rob.logic.rasRepairKind
+        ras.logic.repairData  := rob.logic.rasRepairData
+      }
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -500,10 +507,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val dcache = new DcachePlugin()
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin
+    val ras    = new m68k040.frontend.RasPlugin(
+      branchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"))
     val gsh    = new m68k040.frontend.GsharePlugin(
       retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+      // The two front-end prediction flags of `perf/track5-branch`; see the note in
+      // FuzzDut. Default OFF, so an unset environment is the same DUT as before.
+      computeDirectTargets = sys.env.get("LOCKSTEP_COMPUTE_DIRECT_TARGETS").contains("1"),
+      deferSlot1Uncond = sys.env.get("LOCKSTEP_DEFER_SLOT1_UNCOND").contains("1"),
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
@@ -523,6 +535,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap,
+      rasBranchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
