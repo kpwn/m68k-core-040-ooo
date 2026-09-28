@@ -878,7 +878,7 @@ object GenFullCoreSynthVerilog {
           // `logic` Area has to have elaborated by then or those accessors are still null.
           new m68k040.execute.FpuControlPlugin(),
           new m68k040.exception.InterruptControlPlugin(),
-          new ItlbPlugin(),
+          new ItlbPlugin(victimEntries = ShippingCoreConfig.itlbVictimEntries),
           new DtlbPlugin(),
           new IcachePlugin(),
           new DcachePlugin(),

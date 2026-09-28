@@ -141,7 +141,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new MmuControlPlugin(),
       new m68k040.execute.FpuControlPlugin(),
       new m68k040.exception.InterruptControlPlugin(),
-      new ItlbPlugin(),
+      new ItlbPlugin(victimEntries = ShippingCoreConfig.itlbVictimEntries),
       new DtlbPlugin(),
       icache,
       // Early virtual-set reads ARE enabled: the DTLB response qualifies them
@@ -686,7 +686,8 @@ object GenSocketTopVerilog {
             s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
-            s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc}")
+            s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
+            s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

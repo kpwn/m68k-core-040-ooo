@@ -67,6 +67,34 @@ assumed a private AXI port and 70-cycle DDR, but the walker has been a `DcacheSe
 client since 2026-09-04. **`OFF_PERF_ITLB_WALK` (0x010A4) is in every bitstream and has
 never been read** — one register read settles it on silicon.
 
+⛔ **CORRECTION 2026-09-27 — the "ITLB walks ~11%" figure above is REFUTED by this very
+session's own counter, and the honest number is 3.0-5.4%.** `OFF_PERF_STALL_WALK`
+(0x010B0) is **`perfLvlDtlbWalk || perfLvlItlbWalk`** (`DebugCtrlPlugin.scala:712-714`)
+— the UNION of the two walkers' busy cycles, not the D side alone. It reads **6.7%**, so
+that one number is a hard cap on the WHOLE I+D walk bucket and an 11% ITLB share is
+arithmetically impossible. Combining it with the measured DTLB rate (12.63 walks/kinst)
+and a trace-measured ITLB rate (10.25/kinst, see lever 15) bounds a walk at **17.2
+cycles of walker-busy if the two walkers never overlap and 31.1 if they always do**,
+putting the ITLB's own share at **3.0% (no overlap) to 5.4% (full overlap)**. That also
+retracts the walker design doc's "220+ cycles of completely dead frontend" for the
+board: that figure assumed a private AXI port and the bench's 70-cycle DDR, and since
+2026-09-04 the walker is a `DcacheService` client whose descriptor reads hit L1D/L2.
+**`OFF_PERF_ITLB_WALK` (0x010A4) exists in every bitstream and has never been read** —
+one register read settles this outright.
+
+✅ **AND THE ARITHMETIC CLOSES, from a third independent direction.** A walk's duration is
+bounded from below by structure: 1 cycle miss capture + 1 capture→start + 1 IDLE→RD_ROOT +
+3 × [1 cycle `m2sPipe` walker-request stage + **2 cycles cmd→rsp**, the exact, separately
+measured latency of a walker descriptor read through the D-cache load port (2026-09-05;
+`LsEuPlugin.scala:3471` demuxes the walker response combinationally off
+`dcache.loadRsp.valid`)] + 1 FINISH + 1 IDLE→hit = **≈14-15 cycles with zero arbitration
+wait and every descriptor in L1D**. The board-derived figure is **17.2**, two to three
+cycles above that floor — exactly the room arbitration against CORE-LS and the other
+walker needs. And at 17.2 the union closes on the sum: (10.25 + 12.63) × 17.2 = **389
+cycles/kinst against the 392.8 the 6.7% counter reports**, i.e. the two walkers barely
+overlap and the whole measured walk bucket is accounted for. **So take the LOW end: the
+ITLB is ~3.0% of all cycles (3.65% on Finder idle), not 5.4% and certainly not 11%.**
+
 **Almost all IPC work in this campaign has been back-end.** It optimises the ~8%
 where the ROB is busy and stuck.
 
@@ -206,6 +234,296 @@ stream. ⚠️ And `pfNextPa_reg[*]/CE` — the prefetch frontier's clock enable
 the destination of the core's **ten worst setup paths** (−1.524 ns, 24 levels,
 `FetchAlignPlugin.scala:68-78`), i.e. the most FMax-hostile place in the design to add a
 second frontier.
+
+## Lever 15 — ITLB victim buffer, and the trace method that sized it (2026-09-27)
+
+**The ITLB had never been touched by this campaign, and it could not be: `IpcBenchSpec`
+produces exactly ZERO ITLB walks in every kernel** — the MMU is off except the two
+`copybackDtt` ones, and those configure match-all transparent translation, so no kernel
+ever walks. The walker design doc calls this out as a blocking prerequisite and expects
+the answer to require building an MMU-enabled harness. It does not: the real workload is
+available without one.
+
+### How it was measured — a real System 7.5.3 instruction trace, and what validates it
+
+MAME's `macqd700` with the project's `hd753.chd`, traced through the debugger's
+per-instruction hook (`manager.machine.debugger:command("trace …")` armed from Lua at a
+chosen sim time). Three phase-attributed windows of **1 emulated second each**, 8.45 M
+instructions total: a boot window (t=10), the Finder coming up (t=21.5, `CurApName`
+flips to `"Finder"` at t=21.48) and the Finder idle loop (t=40).
+
+Machine state read live out of the running guest at t=40, which is what makes the model
+match the array:
+
+| | value | consequence |
+|---|---|---|
+| `TC` | **0x0000C000** | E=1, **P=1 ⇒ 8 KB pages**, so the ITLB key is `vpn>>1` (`ItlbPlugin.tlbKeyOf`) |
+| `SRP` / `URP` | 0x003FDC00 / **0** | supervisor-only translation; **URP is never rewritten after boot, so `rootWrite`'s whole-ATC flush is INERT on this workload** |
+| `ITT0/1`, `DTT0/1` | **all 0** | no TTR ever hits ⇒ **every instruction fetch consults the ITLB** |
+| `CACR` | 0x80008000 | DE+IE |
+
+⚠️ **The trace is a LOWER bound on fetch-side pressure, because MAME is in-order and
+non-speculative.** Validated against the one I-side quantity the board has measured
+(`lane100_icpf`, Finder idle, IC_MISS 127.93/kinst prefetch OFF → 61.24 ON):
+
+| model of our 16 KiB/4-way/64 B L1I, idle1 window | I-miss/kinst |
+|---|---:|
+| demand only | 46.82 |
+| demand + `cpusha both` invalidates | **71.39** (board OFF: 127.93) |
+| + next-line prefetch + invalidates | **41.77** (board ON: 61.24) |
+| modelled prefetch benefit | **−41%** (board: **−52%**) |
+
+So the method lands within ~1.8x on the absolute rate and within 11 points on the
+prefetcher's *relative* benefit. The residual is wrong-path fetch (169 mispred/kinst at
+idle) plus fetch run-ahead. **Trust its ratios, not its absolute rates.**
+
+### 🎯 NEW, and it reframes the whole I-side: the workload INVALIDATES BOTH L1s constantly
+
+Counted in the traces, per million instructions:
+
+| | Finder idle | boot | Finder launch |
+|---|---:|---:|---:|
+| **`cpusha both`** (pushes AND invalidates L1I+L1D — single ROM site 0x40885032) | **214.8** | 100.1 | 108.1 |
+| `cpushl` | 421.2 | 301.7 | 707.7 |
+| **`pflusha`** (wipes both ATCs — single ROM site 0x40803F80) | **38.3** | 150.4 | 263.8 |
+| `ptest` | 213 | 160 | 411 |
+
+**One whole-cache invalidate every ~4,650 instructions at idle**, and it accounts for
+**+24.6 I-miss/kinst** — over half of the demand-only model's misses. Two consequences:
+
+1. A large part of the board's I-miss residual is **compulsory-after-invalidate**, not
+   capacity and not direction. That matters for lever 5: `IC_MISS − IC_MISS_SEQ` counts
+   those first-touches as "non-sequential market", and FDIP cannot make a line that was
+   just invalidated appear any earlier than the predictor reaches it.
+2. ⛔ **`icMaintFlush` is being exercised ~215 times per Minst on the real workload** —
+   and it is the path whose incompleteness is already a recorded defect with **zero sim
+   coverage** (`f10f1ce5`, wired only in `FullCoreSynth`). This is not a rare corner.
+
+Also settled cheaply, both as NEGATIVE results: the guest uses **only `pflusha`**, never
+`pflush (An)`/`pflushn`/`pflushan` (all 136/406/580 occurrences disassemble as `pflusha`
+from one site), so `OperationDecoder`'s collapse of the whole PFLUSH family onto
+`SysKind.PFLUSHA` **costs nothing here**; and URP is never rewritten, so `rootWrite`'s
+flush costs nothing either. Both were plausible over-flush levers; both are dead.
+
+### What the array actually does, and why a victim buffer rather than a bigger array
+
+Model mirrors `Tlb.scala` exactly (key `vpn>>1`, `bank=key[0]`, `set=key[2:1]`, 4 ways,
+round-robin advanced only on allocation, `atcFlush` on every `pflusha`). 8.45 M
+instructions:
+
+| geometry | walks/kinst | vs shipping |
+|---|---:|---:|
+| **32e/4w/2b RR — SHIPPING** | **10.254** | — |
+| 32e/4w/2b LRU | 9.440 | −8% |
+| 32e/8w/2b RR (double associativity) | 9.114 | −11% |
+| index XOR-fold `key^key>>3` (≈3 LUT2, free) | 8.668 | −16% |
+| 64e/4w/2b RR (**the real MC68040 ATC size**) | 4.778 | −53% |
+| 32e + **24**-entry victim buffer | 2.815 | −72% |
+| **32e + 32-entry victim buffer** | **2.677** | **−74%** |
+| 32e + 48-entry victim buffer | 2.672 | −74% (saturated) |
+| 128e/4w/2b RR == infinite ITLB | 2.672 | −74% |
+
+Composition of the 86,627 walks: **183 compulsory (0.2%)**, 22,393 PFLUSHA refills
+(25.8%), **64,051 capacity/conflict (73.9%)**.
+
+⚠️ **PER PHASE, because the aggregate rests on one of them** (measurement rule 3):
+
+| phase | shipping | + victim 16 | + victim 24 | **+ victim 32** | PFLUSHA/Minst |
+|---|---:|---:|---:|---:|---:|
+| boot (t=10) | 3.473 | 2.950 (−15.1%) | 2.942 (−15.3%) | **2.942 (−15.3%)** | 150.4 |
+| Finder launch (t=21.5) | 6.254 | 4.803 (−23.2%) | 4.751 (−24.0%) | **4.739 (−24.2%)** | 263.8 |
+| **Finder idle (t=40)** | **17.887** | 5.983 (−66.5%) | 1.520 (−91.5%) | **1.198 (−93.3%)** | 38.3 |
+| aggregate (equal instruction weight) | 10.254 | 4.707 | 2.815 | **2.677 (−73.9%)** | — |
+
+At the corroborated **17.2 cycles per walk** that is **3.0% of all cycles** on the mixed
+session and **3.65% on Finder idle**, of which the buffer recovers **73.9% / 93.3%** —
+i.e. **≈2.2% of session cycles and ≈3.4% of Finder-idle cycles**, for a measured **+1,451
+flops and no measurable LUTs**, and for literally nothing at all while the flag is off (the
+OFF netlist is byte-identical).
+
+**The aggregate −73.9% is carried by the idle phase, and that is mechanism, not luck:**
+the buffer is flushed by PFLUSHA along with the array, so where PFLUSHA is frequent
+(boot, app launch) most walks are flush refills it cannot help, and where PFLUSHA is rare
+(the steady-state idle loop) the walks are conflict-dominated and it removes almost all of
+them. So the value is concentrated in **steady-state interactive behaviour — which is
+where the machine is actually used** — while boot and launch still get 15-24%. Quote the
+phase, never the aggregate alone.
+
+Three things decide the design:
+- **A 32-entry victim buffer reaches the infinite-ITLB floor and beats doubling the array
+  outright** (−74% vs −53%), because it is fully associative where the array's 8 rows are
+  the problem.
+- **FIFO replacement measures the same as LRU at every size** (2.677 vs 2.676 at 32), so
+  the buffer keeps no age state: one ring pointer.
+- **It is probed only on an L1 MISS**, so it adds nothing to `fetchPc → ITLB lookupVpn →
+  Icache s0Ppn` — this core's 22-level worst path. A promote costs the already-stalled
+  fetch **one cycle** (the next lookup is an ordinary array hit) instead of three
+  dependent descriptor reads; deliberately NOT a new leg on the response mux.
+
+Unlike the speculative ITLB prefetch scoped in
+`docs/superpowers/specs/2026-09-03-walker-dcache-routing-revalidation-and-itlb-prefetch-design.md`,
+**every §9.3 side-effect (S1-S10) falls away**: each entry was installed by a real demand
+walk that already set U in memory, so a promote is a cache-to-cache move and not a table
+search. No speculative bit, no new fault surface, no fifth walker requester, no `LdRspTag`
+widening. That doc's §9.5 option (c) — "reuse the existing 1-entry sticky walk-result
+latch" — is separately **measured worthless**: adding it to the model changes the walk
+count by **zero**, because the array is refilled in the same cycle the latch is.
+
+### State, gates, and what it is NOT
+
+- `ShippingCoreConfig.itlbVictimEntries`, **default 0**, `ITLB_VICTIM=<n>` overrides;
+  printed in the `SHIPPING_CONFIG` provenance line. Threaded into both tops AND into
+  `FuzzDut` / `ExecuteLockStepSpec` / `CoreBenchHarness`, so the corpus can exercise it.
+- **OFF is byte-identical** to the pre-change netlist: generated both and diffed
+  `M68kSocketTop.v` — 0 differing lines after normalising SpinalHDL's source-line-derived
+  signal names (`when_…_lNNN`), which encode no logic. `Tlb`'s new eviction report is
+  itself behind `reportEvictions`, so a TLB with no buffer behind it grows no ports.
+- ON adds **~1,509 flop bits** (32 × 46 of state + a 5-bit ring pointer) and **zero**
+  hardware counters — `vic.promote` is `simPublic` and tests count it in `onSamplings`.
+  ✅ **Measured at 100 MHz (synth-only, both arms, provenance round-tripped):
+  socket_core FF +1,451 and total LUT −237, i.e. NO MEASURABLE LUT COST** — the LUT delta
+  is negative and well inside the ~800 LUT floor, LUTRAM/BRAM/DSP all unchanged. See
+  `docs/PERF_AREA_LEDGER.md`'s synth-only sub-table, including why the per-module rows of
+  the two reports must not be read against each other.
+- **Ported corpus (`PortedM68kOooSpec`): 1010 ok / 12 failed in BOTH arms, IDENTICAL
+  name-for-name** — the known FMOVEM.X family, `mmu_atc_write_hit_sets_modified`,
+  `exc_partial_macro_move_mem_mem` and `rom_scc_mmio_btst_dbf_timeout`, all already in the
+  defect register. ✅ **And it is not a null test of this lever: 39 `ported-sweep-mmuwalk`
+  programs ran**, i.e. the `ForceMmuWalkCopyback` posture with all four TTRs zero, real
+  identity page tables and `TC.E`+`CACR.DE|IE` on, where every cold-TLB instruction fetch
+  runs a genuine root→pointer→page walk. **All 39 pass in both arms**, and not one of the 12
+  reds carries the `ported-sweep-mmuwalk` prefix. That posture is the only thing in the
+  regression suite that walks the ITLB at all, so it is what makes this gate informative.
+- **`ExecuteLockStepSpec`: 690 ok / 12 failed / 1 ignored in BOTH arms, and the 12 failures
+  are IDENTICAL NAME-FOR-NAME** (not merely equal in count) — 11 of the documented
+  `odd-ssp` "level-1/level-7 IRQ at every boundary of the LINK #-75 stretch" family plus
+  `lock-step: LSU NZVC wakeup preserves alternating flags and partial Scc destinations`.
+  Those are the known pre-existing reds (uninitialised registers vs a randomised PRF), and
+  since the OFF netlist is byte-identical to master the OFF arm *is* master's result, which
+  makes it a sound reference for the comparison.
+- `ItlbVictimSpec` is a **paired** test: the `victimEntries = 0` arm must show the walk
+  (fail-before) and the ON arm must show zero walks, one promote, and **the same PPN**;
+  plus PFLUSHA must clear the buffer or the re-touch would be answered out of the
+  pre-flush address map.
+- ⛔ **This lever cannot be measured on Dhrystone.** The board's Dhrystone-only window
+  walks the ITLB **0.061 times per kinst**. Its workload is boot and the Finder, and the
+  metric that moves unambiguously is `OFF_PERF_ITLB_WALK` (0x010A4), predicted 10.25 →
+  2.68 per kinst — a 3.8x change, far outside any noise floor. Read that counter with
+  `IC_MISS`/`MISPRED` alongside so the phase can be shown to match.
+
+## Lever 5 re-sized 2026-09-27 — FDIP's market is real, but two thirds of it is software wiping the cache
+
+Same real-7.5.3 trace and method as lever 15 (see its section for the validation and the
+lower-bound caveat). Modelling our L1I exactly — 16 KiB, 64 sets x 4 ways x 64 B, RR,
+plus the in-tree next-line prefetcher (`seedPfWindow`, depth 5, clamped to the 4 KiB
+page) — and, crucially, **including the workload's own `cpusha both`**, the Finder idle
+demand-miss stream decomposes as:
+
+| bucket | share of demand misses | of which SEQ |
+|---|---:|---:|
+| compulsory (line never touched in the window) | 0.2% | 0.8% |
+| **post-invalidate** (line was RESIDENT when a `cpusha both` wiped the cache) | **28.5%** | 1.8% |
+| replacement (capacity / conflict) | 71.3% | 0.0% |
+| **`IC_MISS_SEQ` equivalent, all buckets** | **0.5%** | — |
+
+**That 0.5% independently corroborates the board's 4.5%** from a completely different
+instrument, on the number lever 5's go/no-go rests on: the residual really is
+overwhelmingly non-sequential, and next-line structurally cannot reach it.
+
+**But the capacity sweep says the replacement bucket is not what it looks like.** Same
+stream, same invalidates, prefetch on:
+
+| L1I geometry | I-miss/kinst | vs shipping |
+|---|---:|---:|
+| **16 KiB 64s x 4w RR — SHIPPING** | **41.77** | — |
+| 16 KiB 64s x 4w **LRU** | 48.67 | **+16.5% — LRU is WORSE than round-robin here** |
+| 16 KiB 32s x 8w RR | 41.16 | −1.5% |
+| 16 KiB 16s x 16w RR | 39.94 | −4.4% |
+| 32 KiB 128s x 4w RR | 34.23 | −18.0% |
+| 32 KiB 64s x 8w RR | 32.17 | −23.0% |
+| 64 KiB 256s x 4w RR | 29.34 | −29.8% |
+| **256 KiB — near-infinite** | **28.04** | **−32.9%** |
+
+**A near-infinite I-cache removes only a third of the misses.** The floor of 28/kinst is
+the workload re-fetching its own working set after each of its 771 wholesale invalidates
+(one every ~4,600 instructions; ~129 distinct lines ≈ 8 KiB touched per interval). So:
+
+- **~67% of L1I demand misses at Finder idle are software-driven wholesale-invalidate
+  refills.** No cache geometry removes them, and FDIP cannot remove them either — it can
+  only fetch them EARLIER.
+- **~33% are capacity/conflict**, and associativity is nearly worthless against them
+  (8-way −1.5%, 16-way −4.4%) while SIZE is not (32 KiB −18%). ⚠️ The caches are already
+  32 of 35 RAMB36, so 32 KiB needs the BRAM budget checked first.
+- **Round-robin beats LRU by 16.5%** on this stream. Do not "improve" the replacement
+  policy without measuring it.
+
+### Why this makes an FDIP number LESS worth producing right now, not more
+
+A 68040 `CPUSHA` invalidates the CPU's own L1s; it does not invalidate the SoC's 2 MB L2.
+So the dominant miss population — the post-invalidate refills — is **L2-resident and
+cheap**, and fetching it earlier is worth far less per miss than the DRAM latency a
+sizing run would implicitly assume. The value of FDIP therefore hinges on the **L2
+hit/miss split of `IC_MISS`**, which is:
+
+- **not measurable in sim today** — `AxiMemModel`'s L2 is an unbounded never-evicted set,
+  so every line hits at 5 cycles after first touch and only compulsory misses see
+  `dramCycles`; and
+- **not measured on the board** — lever 3 added `IC_MISS`/`PF_*`/`IC_MISS_SEQ`/`PF_LATE`
+  but nothing splits them by L2 residency.
+
+Add that split to lever 5's sizing plan (it is not in items 1-4 today). Until it exists,
+an FDIP sim IPC figure is measured against a memory system that is simultaneously too
+kind (infinite L2) and too harsh (`crossbarSingleOutstanding = false` overstating
+overlap, against a real crossbar that is single-outstanding per master port) — two errors
+in opposite directions that must not be assumed to cancel.
+
+⛔ And the standing blocker is unchanged: **#7 gates #5**, and `rasBranchRepair` is still
+default OFF and unmerged.
+
+### ⛔ THE I-SIDE DOES NOT TRAVERSE THE CROSSBAR — verified in the SoC RTL 2026-09-27
+
+Stated because it has now been got wrong twice, in both directions, and it changes what
+an I-side sizing run is allowed to assume. Verified end to end in `macqd700-soc-public`:
+
+| stage | limit | source |
+|---|---|---|
+| `IcachePlugin` MSHR file | **5** (1 demand + 4 speculative, 5 distinct AXI IDs) | `IcachePlugin.scala`, `AxiIds.I_DEMAND=0`, `I_SPEC_BASE..I_SPEC_LAST=1..4` |
+| CPU → fabric | **dedicated 256-bit `f_axi_*` port on `l2c`, NEVER `axi_xbar.v`** | `fpga_top_ddr.vh:141` ("never through axi_xbar.v"), bind at `:275` (task #269 "Level A"); `l2c_ctrl.v:419` |
+| fetch-port AR accept | 1 active + **1-entry pre-latch** (`f_arready = !fetch_ar_pend_v`, `l2c_ctrl.v:434`) | throttles ISSUE RATE, not concurrency — the active slot frees when the burst's beats are walked into the L2 pipeline, not when data returns (`fetch_ar_act_free_c`, `:508`) |
+| L2 lookup | shared with the LSU's AR, round-robin with `fetch_favor` | `l2c_ctrl.v:575,587` |
+| L2 MSHRs | **8 primary, up to 4 same-line secondary each**, ARs issuable on consecutive clocks, MSHR index carried as the AXI read ID | `l2c_mshr.v:46-52` |
+| MIG bridge | 8 outstanding | ditto |
+
+**So the binding limit on I-side memory-level parallelism is the CPU's own 5 MSHRs, not
+the fabric.** Consequences for any I-side measurement:
+
+- ⛔ **`crossbarSingleOutstanding = true` is the WRONG model for the I side.** It models a
+  per-master-port limiter that is not in the I path at all. It is the honest config for
+  the **D** side, which *is* the crossbar's M0 master. An I-side arm run under it
+  understates what the fabric allows.
+- The fetch path was ALSO once 1-deep and it was already found and fixed: `l2c_ctrl.v:411-423`
+  records that `f_arready = !fetch_ar_have` had *"re-serialised the CPU's 5-MSHR instruction
+  prefetcher down to one fetch in flight"*, closed 2026-09-02 by the pre-latch, described
+  as *"the single limiter between a 5-deep prefetcher above and 8 MSHRs / an 8-outstanding
+  MIG bridge below"*. Do not re-derive that as a live limit.
+
+**`axi_xbar.v:1340`'s "slot 2 is the CPU instruction fetch" describes a configuration no
+cpu040 build uses.** When `L2C_ENABLE` is defined the xbar's M2 is tied **permanently
+idle** (`m2_idle_arvalid = 1'b0`, `fpga_top_xbar.vh:247-292,447-482`), and
+`synth/vivado.tcl` forces `L2C_ENABLE` on for every cpu040 build (the Makefile also calls
+it non-optional, since the M2 fallback is 128-bit against `AXI_I_DW = 256`). In the
+`L2C_ENABLE`-undefined fallback there is no cpu040 at all — `cpu_stub` ties `axi_i_arvalid`
+low. **So `rs_state[2]` carries no traffic in any shipping build, and `cpu_rd_busy`
+reflects slot 0 (the LSU) alone.** It is not "I-fetch to non-L2 space": ROM-mirror fetches
+also use the direct port, folded locally by `ifa_araddr_folded`, with out-of-window
+fetches getting a local DECERR from `ifetch_window_guard`.
+
+⚠️ **Safety coupling, quoted because it is load-bearing** (`fpga_top_xbar.vh:262-285`):
+because I-fetch bypasses the crossbar and **the crossbar holds the only decode of the
+`0x5000_0000` peripheral window**, a speculative instruction fetch cannot reach a device
+register — which is why cpu040 ships with `IcachePlugin(iFetchCanReachMmio = false)`. If
+`ifa_*` is ever rerouted through the crossbar, **the CPU must be rebuilt with
+`iFetchCanReachMmio = true`** or speculative fetch gains a path to read-to-clear registers.
 
 ## Lever 9 — BRAM as a mux, not just as storage (owner, 2026-09-27)
 

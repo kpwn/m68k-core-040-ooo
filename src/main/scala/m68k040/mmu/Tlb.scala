@@ -63,7 +63,8 @@ object Tlb {
   * see the fill block. */
 class Tlb(entries: Int = Tlb.DefaultEntries,
           ways: Int = Tlb.DefaultWays,
-          banks: Int = Tlb.DefaultBanks) extends Component {
+          banks: Int = Tlb.DefaultBanks,
+          reportEvictions: Boolean = false) extends Component {
   require(isPow2(banks), "banks must be a power of two")
   require(isPow2(ways), "ways must be a power of two")
   require(entries % (ways * banks) == 0, "entries must divide evenly into ways*banks")
@@ -88,6 +89,22 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val fillEntry = in(TlbEntry())
 
     val invalidateAll = in Bool ()
+
+    // ── EVICTION REPORT (for a second-level / victim buffer) ───────────────────
+    // High for exactly the cycle a fill ALLOCATES over a way that was valid, i.e.
+    // the one event that loses a live translation. Carries the full key (VPN + FC2)
+    // and payload of the way being overwritten, so an owner can keep it somewhere
+    // cheaper than a walk. A replace-in-place fill (`flResident`) loses nothing and
+    // does NOT report. Combinational off the fill decode that already exists -- it
+    // adds a way-mux over the fill row, and nothing at all to the LOOKUP cone that
+    // `io.hit` sits in.
+    // Gated by `reportEvictions` so a TLB with no victim buffer behind it elaborates
+    // NO ports and NO way-mux: the default build is bit-identical to one without this
+    // feature, which is the bar a default-OFF flag has to clear here.
+    val evictValid = if (reportEvictions) out Bool ()                  else null
+    val evictVpn   = if (reportEvictions) out UInt (Tlb.VpnBits bits)  else null
+    val evictSup   = if (reportEvictions) out Bool ()                  else null
+    val evictEntry = if (reportEvictions) out(TlbEntry())              else null
 
     // ── MULTI-HOT EVIDENCE, readable over JTAG (DebugRegMap.OFF_MULTIHOT_*) ─────
     // `Tlb` is a real Component, so unlike the caches -- whose probes are plain vals
@@ -305,6 +322,47 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     // must not, or an M-refresh would still churn the victim and evict a live way for
     // no reason.
     when(!flResident) { victim(flBank)(flSet) := flWay + 1 }
+  }
+
+  // ---- eviction report ----
+  // Read the way about to be overwritten, out of the SAME (flBank, flSet) row the
+  // fill decode already selected. `flWay` is the round-robin victim on an allocation
+  // and the resident way on a replace-in-place; only the former can lose anything,
+  // which is why `evictValid` carries `!flResident`.
+  if (reportEvictions) {
+    def fillRow[T <: Data](rows: Vec[Vec[Vec[T]]], way: Int): T = {
+      val flat = Vec(for (b <- 0 until banks) yield rows(b)(way)(flSet))
+      if (banks == 1) flat(0) else flat(flBank)
+    }
+    val evValidVec = Vec(Bool(), ways)
+    val evSupVec   = Vec(Bool(), ways)
+    val evTagVec   = Vec(UInt(tagBits bits), ways)
+    val evEntVec   = Vec(TlbEntry(), ways)
+    for (w <- 0 until ways) {
+      evValidVec(w) := fillRow(valids, w)
+      evSupVec(w)   := fillRow(tagSup, w)
+      evTagVec(w)   := fillRow(tags, w)
+      val e = TlbEntry()
+      e.vpnTag     := fillRow(tags, w)
+      e.ppn        := fillRow(ppns, w)
+      e.writeProt  := fillRow(wProt, w)
+      e.supervisor := fillRow(sup, w)
+      e.cacheMode  := fillRow(cmode, w)
+      e.modified   := fillRow(modif, w)
+      evEntVec(w) := e
+    }
+    io.evictValid := io.fillValid && !flResident && evValidVec(flWay)
+    io.evictSup   := evSupVec(flWay)
+    io.evictEntry := evEntVec(flWay)
+    // Reassemble the key the evicted way was filed under: vpn = tag ## set ## bank
+    // (the exact inverse of `tagOf`/`setOf`/`bankOf`). The row is the fill row, so its
+    // set and bank are `flSet`/`flBank` by construction.
+    io.evictVpn := {
+      val tag = evTagVec(flWay)
+      val withSet  = if (setBits == 0) tag.asBits else (tag ## flSet)
+      val withBank = if (bankBits == 0) withSet else (withSet ## flBank)
+      withBank.asUInt.resize(Tlb.VpnBits)
+    }
   }
 
   // ---- invalidateAll (priority clear) ----
