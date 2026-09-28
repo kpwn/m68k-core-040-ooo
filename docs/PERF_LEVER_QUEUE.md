@@ -513,6 +513,17 @@ No-write-allocate stage 1 (`perf/dside-mshr2` `fdb80094`), `IPC_MEM=l2:5:60:4096
 
 **+3.66%**, against a recorded prediction of +13..25% — the falsifier fired, marginally.
 
+✅ **Replicated on an independent working set**, so it is a streaming property and not a
+half-fitting-set artifact:
+
+| kernel | OFF | ON | delta |
+|---|---|---|---|
+| `memcpy-16k` (2x L1) | 149,794 / 149,825 | 144,521 / 144,583 | **+3.66% / +3.63%** |
+| `memcpy-64k` (8x L1) | 199,757 / 199,670 | 192,792 / 192,574 | **+3.60% / +3.69%** |
+
+Four runs spanning a **4x-vs-8x-L1** working-set change and two seeds land in
+**+3.60…+3.69% — a spread of 0.09 percentage points.**
+
 **The mechanism is confirmed EXACTLY, which is what makes the shortfall the real result:**
 
 - **L2 reads 8,197 -> 4,102 — HALVED.** The write-allocate fill is gone.
