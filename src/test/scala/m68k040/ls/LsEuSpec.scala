@@ -99,7 +99,18 @@ class LsEuSpec extends AnyFunSuite {
     s.iValid #= false
   }
 
-  def waitCompletion(dut: Dut, cd: ClockDomain, robId: Int, maxCycles: Int = 60): Boolean = {
+  /** ⚠ 120, NOT 60. The old budget was marginal against slice `D3-BURST`
+    * (`DcachePlugin.sectored`), where a 64-byte line miss legitimately costs up to ~14
+    * cycles more than a 16-byte one: three extra R beats for the burst, up to three more
+    * for the demanded sector's position within it, and up to eight for the eviction walk
+    * over the victim line's four sectors. At 60 the sectored arm reported "load completion
+    * must fire ... was false" on three tests; at 400 all seven pass, so it is a BUDGET
+    * ASSUMPTION and not a hang (that diagnostic is the reason this comment can say so).
+    * 120 keeps roughly 4x headroom over the observed sectored latency while staying tight
+    * enough to still catch a genuine hang -- which is the only thing this budget is for.
+    * Do not raise it further without re-running the 400-cycle diagnostic: a budget that
+    * cannot fail stops being a test. */
+  def waitCompletion(dut: Dut, cd: ClockDomain, robId: Int, maxCycles: Int = 120): Boolean = {
     var saw = false
     var n = 0
     while (!saw && n < maxCycles) {

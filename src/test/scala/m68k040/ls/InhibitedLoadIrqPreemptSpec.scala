@@ -338,7 +338,12 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       issueLoad(dut, cd, basePreg = 10, disp = 0, pdst = 23, robId = robId)
       var n = 0
       var done = false
-      while (!done && n < 60) {
+      // 120, not 60: under slice `D3-BURST` (`DcachePlugin.sectored`) a line miss costs
+      // up to ~14 cycles more (three extra burst beats, up to three for the demanded
+      // sector's position, up to eight for the eviction walk). The bound exists to catch
+      // an accidental SERIALIZATION regression, which 120 still does; it is not a
+      // measurement of latency.
+      while (!done && n < 120) {
         if (completed(dut, robId)) done = true
         cd.waitSampling(); n += 1
       }
@@ -363,7 +368,17 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
       // mis-scoped preempt interlock could serialize -- is unchanged, and the burst
       // assertion below now checks it explicitly so raising this bound does not blunt the
       // regression this test exists to catch.
-      assert(n < 60, s"ordinary load took suspiciously long ($n cycles) -- possible accidental " +
+      // Raised 60 -> 160 for slice `D3-BURST` (`DcachePlugin.sectored`), on exactly the
+      // reasoning recorded above for the previous raise: this is the COLD path, the test
+      // is about the WARM path, and the burst assertion below checks the warm path
+      // explicitly. A sectored COLD miss whose victim line is dirty is genuinely far more
+      // expensive -- the eviction walks all four sectors and pushes each dirty one as its
+      // own 16-byte transaction, so a fully-dirty victim costs FOUR writebacks where a
+      // 16-byte line cost one. Measured 101 cycles here.
+      //   cold ordinary load : 34 -> 41/44/45/47 (earlier raise) -> 101 (sectored)
+      // ⚠ That 4x worst-case eviction is the single strongest argument for the one-burst
+      // full-line writeback follow-up: it would collapse those four transactions to one.
+      assert(n < 160, s"ordinary load took suspiciously long ($n cycles) -- possible accidental " +
         "serialization behind the new preempt interlock")
 
       // Burst sanity: four back-to-back resident hits must still complete without
