@@ -110,3 +110,56 @@ If fanout on those control nets is the limiter, then replicating `doFlushReg` an
 without changing IPC or area materially. If the tail does not move, the limiter is
 route congestion in the destination structures and replication will not help --
 in which case see `area-vs-density-congestion`.
+
+
+---
+
+## ⛔ THE PREFETCH-ALLOCATE RETIME IS DEAD (2026-09-29) — and so is its successor idea
+
+I proposed registering the prefetch-allocate conjunction as "free by construction".
+**Both that lever and the follow-up it suggested are dead.** Recorded so neither is
+re-derived.
+
+### 1. The retime: already analysed and rejected IN THE SOURCE
+
+The full path was extracted from `timing_summary.rpt` rather than reasoned about:
+
+    Gshare pht_port4[1] -> FtbPlugin brType -> IcachePlugin s0Ppn -> ITLB CAM (hitVec_11)
+      -> s0Cacheable -> lookupPageCacheable -> cmdPort_ready1 -> pfNextPa -> mshrPa_2/CE
+
+It runs **through `s0Cacheable`**, i.e. through `s0KillsWindowQ` — which is a **SAFETY
+GATE, not a convenience**. `IcachePlugin.scala:2327` documents it at length: it bounds a
+faulting/non-cacheable page to **at most ONE speculative line**, and that bound is
+**mutation-verified** — "deleting `!s0KillsWindowQ` below re-opens T+1 and the test fails
+with `RULE-P1 BOUND VIOLATED: 2 speculative ARs`" (`IcachePrefetchSpec` P1 residual,
+recorded in `IcacheMutationProofSpec` under M6).
+
+The same comment enumerates three closures and rejects each — on **design intent**
+(putting the live verdict back in the allocator cone is the one arc M4 exists to delete,
+spec §5.4), on **cost** (a verdict-free `!cmdPort.fire` gate permanently starves the
+prefetcher), and on **cost/benefit** (allocate-then-retract needs a new MSHR lifecycle
+transition and cannot recall an AXI burst anyway).
+
+**A prefetch allocate is latency-tolerant; its SAFETY GATE is not.** That is the
+distinction my "free by construction" argument missed.
+
+### 2. The `exactlyOne` idea it suggested: dead on geometry
+
+The path's cells are named `_zz_io_dbgMultiHotVpn_*` and produce `hitVec_11`, which looked
+like a debug output costing fetch-path time. It is not — those cells build the **real CAM
+hit vector**; the naming follows a shared cone. This is the second confirmation this
+session of the standing rule **never verify a netlist by grepping signal names**.
+
+I then supposed `io.hit = OneHotSafe.exactlyOne(hitVec)` (= `orR && !multiHot`, where
+`multiHot` is all `C(n,2)` pairwise ANDs) was a carry chain worth deleting. **It is not:
+`hitVec` is `ways` wide and `Tlb.DefaultWays = 4`** — the TLB's 32 entries are
+4 ways x 2 banks x 4 rows, so `multiHot` is **6 AND terms**, about one LUT. I had taken
+"32-entry ITLB CAM" from memory and assumed the compare was 32 wide.
+
+### What is actually true about this path
+
+It is the frontend's documented longest cone, it is known, and it **closed** in this build
+(+0.003 ns). `FetchAlignPlugin.scala:55-100` already retimed the one arc that was
+retimable (`icMaintFlush`, worth 1.129 ns of pure prefix) and returned the endpoint to its
+structural level. There is no missed lever here — the tail is a wall, and this is one
+brick of it that has already been worked.
