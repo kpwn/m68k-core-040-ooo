@@ -98,7 +98,8 @@ case class SqFwdRsp() extends Bundle {
   * it. Counts are hardware sums (no when-gated Scala-var counters). */
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
-                 forwardOnPublish: Boolean = false, retireWidth: Int = 2) extends Component {
+                 forwardOnPublish: Boolean = false, retireWidth: Int = 2,
+                 narrowDrainMerge: Boolean = false) extends Component {
   require(isPow2(depth))
   require(Set(2, 4, 8, 16)(retireWidth))
   require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
@@ -504,17 +505,127 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // offset of its own — see LsEuPlugin's `stOff`, the original alloc-time source of
   // this exact math).
   val sendStOff = paddrs(sendPtr)(3 downto 0)
-  val sendStrbA = m68k040.cache.DcacheByteLane.storeStrbA(sendStOff, sizes(sendPtr))
-  val sendDataA = m68k040.cache.DcacheByteLane.storeDataA(sendStOff, sizes(sendPtr), datas(sendPtr))
-  val sendStrbB = m68k040.cache.DcacheByteLane.storeStrbB(sendStOff, sizes(sendPtr))
-  val sendDataB = m68k040.cache.DcacheByteLane.storeDataB(sendStOff, sizes(sendPtr), datas(sendPtr))
+  // ── `narrowDrainMerge` (routing-congestion lever, 2026-09-27) ────────────────────
+  // The four byte-lane derivations below are 14.5% of this module's RTL pin-bit load
+  // (1,930 of 13,324) -- the second-largest structure in it after the forward compare
+  // matrix -- and two of them are REDUNDANT, not merely expensive:
+  //
+  //   1. `storeStrbA(off,size) === storeStrb(off,size)`, identically, for every input.
+  //      `storeStrb` builds `bits(i) = (i >= off) && (i < off +^ n)` over i in [0,16),
+  //      so the `i < 16` bound is already the `pos < 16` guard `storeStrbA` applies --
+  //      the widening `+^` is what makes the two agree at off+n == 16 as well.
+  //   2. On the lanes that strobe enables, `storeDataA(off,size,data)` and
+  //      `storeData(off,size,data)` carry the same bytes. `storeData` writes lane
+  //      `(off+k) mod 16`; `storeDataA` writes lane `off+k` only while `off+k < 16`.
+  //      They therefore differ ONLY on lanes `(off+k-16)` for the spilled bytes, and
+  //      those lanes are exactly the ones `storeStrbA` leaves CLEAR, so the merge
+  //      (`Mux(strb(i), mergeByte(i), oldByte(i))`, DcachePlugin S2/S3) cannot observe
+  //      the difference.
+  //
+  // And `DcachePlugin` ALREADY computes both of those locally, at S2 and at S3, for the
+  // `useStrb = false` path (`DcacheByteLane.storeStrb/storeData` off `stS2Off`/`stS3Off`
+  // = the payload's OWN `paddr(3:0)`, and the payload's own `size`/`data`). So slot A of
+  // a SPLIT store can simply present `useStrb = false` like every aligned store already
+  // does, and the D-cache reconstructs a bit-identical merge from 38 bits it already has
+  // instead of 144 bits crossing this module's boundary.
+  //
+  // The AXI sub-beat extent is the one other `useStrb` consumer and it agrees too:
+  // `stEndSz = MmioCover.clampedEnd(off, n)` is CLAMPED at 16, so for a split slot A
+  // (off 13..15) the size-derived range [off, 16) equals the strobe-run range the
+  // `useStrb = true` arm computes. DcachePlugin's own permanent assert at the
+  // `!useStrb` INHIBITED site is what machine-checks that, and this lever simply brings
+  // split slot A under it.
+  //
+  // Slot B genuinely cannot use the local path -- its `paddr` is the next LINE BASE
+  // (offset 0) and its `size` is driven as a flat LONG whatever its true 1..3-byte
+  // extent (see DcachePlugin's normative note at `stStartSz`) -- so it keeps an
+  // explicit strobe. But it does not need a 16-lane dynamic decode for it: a split
+  // occurs only at slot-A offsets 13..15 with size WORD/LONG, so slot B covers at most
+  // lanes 0..2 and each of those lanes has at most 3 possible source bytes. The
+  // specialised form below is that enumeration, Scala-unrolled over the six
+  // (offset, size) combinations that can spill at all.
+  //
+  // A sim-only tripwire immediately after asserts the specialised pair is bit-identical
+  // to `DcacheByteLane.storeStrbB`/`storeDataB` on EVERY cycle -- same discipline as the
+  // `fsNbytesA`/`fsPaddrHiA` forward-geometry shadows above, for the same reason: the
+  // failure mode is a silently wrong store, not a crash.
+  val sendStrbA = if(narrowDrainMerge) null else
+    m68k040.cache.DcacheByteLane.storeStrbA(sendStOff, sizes(sendPtr))
+  val sendDataA = if(narrowDrainMerge) null else
+    m68k040.cache.DcacheByteLane.storeDataA(sendStOff, sizes(sendPtr), datas(sendPtr))
+
+  /** Big-endian byte `j` of an access of `size` (j = 0 is the byte living at the
+    * access's own offset). Mirrors `DcacheByteLane`'s private `valueByte`; only the
+    * STATIC (Scala-`Int`) index form is needed here, so it is a plain slice. */
+  private def accessByte(size: Int, data: Bits, j: Int): Bits = size match {
+    case 2 => if (j == 0) data(15 downto 8) else data(7 downto 0)
+    case 4 => data(31 - 8 * j downto 24 - 8 * j)
+  }
+
+  // Slot B's strobe: lane k (k < 3) is covered iff absolute position 16+k is still
+  // inside the access, i.e. `16 + k < off + n`. Three 5-bit magnitude terms, no decode.
+  // Scoped inside the `narrowDrainMerge` arm so the OFF arm's emitted RTL stays
+  // byte-identical to the parent's (modulo SpinalHDL's line-number-derived names).
+  val sendStrbBNarrow = if(!narrowDrainMerge) null else {
+    val sendNBytesB = sizeBytes(sizes(sendPtr))
+    val sendEndB    = sendStOff.resize(5 bits) +^ sendNBytesB    // 6-bit, 0..19
+    val b = Bits(16 bits)
+    b := B(0, 16 bits)
+    for (k <- 0 until 3) b(k) := sendEndB > U(16 + k, sendEndB.getWidth bits)
+    b
+  }
+  // Slot B's merge data: lane k carries access byte `16 + k - off`, enumerated over the
+  // only (off, size) pairs that can spill (off 13..15 x WORD/LONG). Lanes 3..15 stay
+  // zero, exactly as `storeDataB` leaves them, so the tripwire below can compare the
+  // whole 128 bits rather than only the enabled lanes.
+  val sendDataBNarrow = if(!narrowDrainMerge) null else {
+    val lanes = Vec(Bits(8 bits), 16)
+    for (i <- 0 until 16) lanes(i) := B(0, 8 bits)
+    for (k <- 0 until 3) {
+      for ((szEnum, szBytes) <- Seq((Size.WORD, 2), (Size.LONG, 4))) {
+        for (off <- 13 to 15) {
+          val j = 16 + k - off
+          if (j >= 1 && j < szBytes)
+            when(sizes(sendPtr) === szEnum && sendStOff === U(off, 4 bits)) {
+              lanes(k) := accessByte(szBytes, datas(sendPtr), j)
+            }
+        }
+      }
+    }
+    lanes.asBits
+  }
+  val sendStrbB = if(narrowDrainMerge) sendStrbBNarrow else
+    m68k040.cache.DcacheByteLane.storeStrbB(sendStOff, sizes(sendPtr))
+  val sendDataB = if(narrowDrainMerge) sendDataBNarrow else
+    m68k040.cache.DcacheByteLane.storeDataB(sendStOff, sizes(sendPtr), datas(sendPtr))
+  if(narrowDrainMerge) GenerationFlags.simulation {
+    val refStrbB = m68k040.cache.DcacheByteLane.storeStrbB(sendStOff, sizes(sendPtr))
+    val refDataB = m68k040.cache.DcacheByteLane.storeDataB(sendStOff, sizes(sendPtr), datas(sendPtr))
+    assert(sendStrbBNarrow === refStrbB,
+      "StoreQueue: narrow slot-B drain strobe disagrees with DcacheByteLane.storeStrbB " +
+      "-- a split store's second half would write the wrong bytes",
+      FAILURE)
+    assert(sendDataBNarrow === refDataB,
+      "StoreQueue: narrow slot-B drain data disagrees with DcacheByteLane.storeDataB " +
+      "-- a split store's second half would write the wrong values",
+      FAILURE)
+  }
   when(!sendPhaseB) {
     io.drain.payload.paddr    := paddrs(sendPtr)
     io.drain.payload.data     := datas(sendPtr)
     io.drain.payload.size     := sizes(sendPtr)
-    io.drain.payload.useStrb  := useStrbAs(sendPtr)
-    io.drain.payload.strb     := sendStrbA
-    io.drain.payload.lineData := sendDataA
+    if(narrowDrainMerge) {
+      // Slot A joins the ordinary aligned-store path: the D-cache re-derives an
+      // identical merge locally (proof above). `useStrbAs` keeps being written at alloc
+      // so the two arms stay diffable, but nothing reads it here any more.
+      io.drain.payload.useStrb  := False
+      io.drain.payload.strb     := B(0, 16 bits)
+      io.drain.payload.lineData := B(0, 128 bits)
+    } else {
+      io.drain.payload.useStrb  := useStrbAs(sendPtr)
+      io.drain.payload.strb     := sendStrbA
+      io.drain.payload.lineData := sendDataA
+    }
     io.drain.payload.cacheMode := cacheModes(sendPtr)
     io.drain.payload.precise  := precises(sendPtr)
   } otherwise {

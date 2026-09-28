@@ -687,7 +687,13 @@ object GenSocketTopVerilog {
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
-            s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries}")
+            s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
+            // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
+            // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
+            // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
+            // own log -- the same gap that cost the withdrawn `rasBranchRepair` number.
+            s"storeQueueDepth=${ShippingCoreConfig.storeQueueDepth} " +
+            s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
