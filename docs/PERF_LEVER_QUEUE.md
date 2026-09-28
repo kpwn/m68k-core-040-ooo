@@ -448,6 +448,58 @@ is zero in every arm, so the P4 park and the barrier recovery contribute nothing
 that also means the recovery's ~20.9-cycle cost is **still unpriced**, because these kernels
 never exercise it.
 
+## ⏸ DEMAND-BACKED PREFETCH FOR BARRIERED LOADS — PARKED at 0.36%, not killed
+
+Sized with **no RTL** (`perf/ooo-demand-prefetch` `78e9f750`), `IQ_LOAD_BYPASS=1`,
+`IPC_MEM_XBAR=1`, 34 kernels, **seeds agreeing to 0.01 pp**:
+
+| bound | seed 1 | seed 17 |
+|---|---:|---:|
+| LOOSE — all `cmd→rsp` latency over the hit floor | 12.31% | 12.30% |
+| **TIGHT — only loads that were THEMSELVES the refill owner** | **0.36%** | **0.35%** |
+
+⛔ **The two populations are ANTI-correlated, 25x fewer than chance.** Expected joint loads
+if independent: **7,374. Observed: 295.** `byteX4-cb` carries 7,679 blocked loads *and*
+1,536 true L1 misses in one window, expects 1,280 joint, and observes **ZERO** — as do all
+four `X4-cb` kernels and `longMemMem`. **This is NOT a coverage hole**: both halves are
+abundant (54,505 / 10,303); the overlap is absent.
+
+**Being barriered behind an older store is a strong NEGATIVE predictor of missing L1.** The
+in-tree warning that *"resolvable loads and stalling loads are near-disjoint by
+construction"* therefore **transfers to the dynamic signal** — checked rather than assumed,
+and it held. A slower L2 does not rescue it: `min(blocked, penalty)` is capped by the
+blocked window (11-23 cycles), so even at DRAM latency the ceiling is ~0.58%.
+
+⏸ **PARKED, NOT DEAD, and the distinction is evidence-based.** The design doc's own table
+says Dhrystone ~ nil and OS boot substantial, and this bench mispredicts 0.2% where the
+board burns ~9.6% of cycles on recovery. Judging it here would repeat the **branch-flag
+false negative** — sim said zero, silicon said **+3.06%**. The telemetry ships, so re-sizing
+on a miss-bearing workload is a re-run, not a rebuild.
+
+### ⭐ The MSHR question, answered STRUCTURALLY rather than by measurement
+
+**Present the prefetch once, never queue, never retry — if `loadCmd.ready` is low, drop it.**
+`ready` is low exactly while the cache is busy, so a prefetch **can only start when the MSHR
+is free, by construction.** It cannot steal the single MSHR from an in-flight demand miss,
+and steady-state bus transactions are **unchanged** (the line prefetched is the line
+demanded). The only extra traffic is a prefetch whose backing load is later flushed — the
+one way this could still die like the dead stride prefetcher at 206% of bus, and the bench
+(0.2% mispredicts) **cannot size it**.
+
+### ⛔ Three traps the ratified design did not state
+
+1. **A prefetch MUST use a new reserved `DLoadToken.PREFETCH = 0x83`** — never the load's
+   own `robId` token, or the later demand load can be answered from the prefetch's **stale
+   early-probe entry** via `earlyProbeOwnsCmd`. **Silent wrong data.**
+2. **The INHIBITED kill cannot live in the cache.** `loadMissDiscovered`
+   (`DcachePlugin.scala:1579`) has **no cacheability term**, and an INHIBITED access can
+   never hit (`:689`), so it **always** enters `REFILL`; cacheability gates only allocation.
+   Gate at `p3Ctx.cmode` instead. ⚠️ And with `mmuEnable=0` and no TTR match the DTLB reports
+   **WRITETHROUGH = cacheable for EVERY address** (`DtlbPlugin.scala:536-539`).
+3. **The design doc's SPECULATIVE column is not implementable today** — `DTranslationCmd` is
+   `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
+   `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
+
 ## ⛔ THE "7% vs 70%" MOB MARKET: BOTH FIGURES WERE MISAPPLIED — the answer is a BOUND
 
 Two numbers for the same population disagreed by 10x. Neither was wrong as measured; both
