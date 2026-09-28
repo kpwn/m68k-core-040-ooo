@@ -150,6 +150,7 @@ FFs flat.
 | 14 | explicit `DBcc` loop predictor (owner, 2026-09-27) | 📋 QUEUED — **gated behind #13** | **80.8% of ROM DBcc are `DBF`/`DBT`: pure counted loops, outcome is the counter alone.** Removes the once-per-loop EXIT mispredict gshare cannot get |
 | 15 | ITLB victim buffer (32-entry, `itlbVictimEntries`) | ✅ **FULLY GATED** `perf/itlb-victim-buffer` `626cd6b1` — `test-fast` **396/0/2** (master lineage, NOT 400), mmu **66/66**, lockstep **690/12/1** and corpus **1010/12** both **identical name-for-name**, OFF netlist byte-identical | ITLB walks **10.25 → 2.68/kinst (−73.9%)** aggregate, Finder idle **17.89 → 1.20 (−93.3%)** = the infinite-ITLB floor. **≈2.2% of session cycles, ≈3.4% of Finder-idle.** Area: **+1,451 FF, LUT −229 (noise, inside the ~800 floor)**, LUTRAM/BRAM/DSP unchanged — flops are the spare resource here (LUT-bound 78.8%, FF 24.5%). OFF netlist **byte-identical**. ⚠️ measured on a real 7.5.3 MAME trace (8.45M insts), because `IpcBenchSpec` has **ZERO** ITLB walks. ✅ **The corpus gate is NON-VACUOUS and that had to be proven**: 39 `ported-sweep-mmuwalk` programs ran (`ForceMmuWalkCopyback`, all four TTRs zero, real identity page tables) so every cold-TLB fetch performs a genuine root→pointer→page walk — **all 39 pass in both arms and none of the 12 reds carries that prefix**. That posture is the ONLY thing in the whole regression suite that walks the ITLB; without it the ON arm would have been an exact null |
 | 16 | sectored 64 B L1D lines (`CPU_DCACHE_SECTORED`) | ✅ **gated 396/396 + corpus/lockstep identical name-for-name**, `perf/l1d-sector64` | **+8.51% / +8.67% / +8.44% bandwidth** (16k two seeds, 64k control): L2 read transactions **3.99x / 3.998x fewer** with compulsory misses **IDENTICAL**, so nothing was traded away. Storage **−67.4% (3,840 bits)**. OFF netlist structurally identical. ⛔ **Prediction was +62–77%, measured +8.5% — wrong by 8x**, and the pre-recorded falsifier fired verbatim: a transaction costs **~2 cycles, not ~16**. **After this slice the copy loop is still at 4.4% of the 128-bit bus** (~45 cyc / 16 B for ~6 instructions) — **load→store dependency bound through a ONE-MSHR D-cache, not bus bound. Do not price the next D-side lever off transaction count; attribute those 45 cycles first.** Found **3 data-loss defects** (burst write-hold x2, multi-hot tag). ✅ **AREA MEASURED**, matched 100 MHz lane pair `sect0`/`sect1`: total LUT **146,097 -> 146,034 (-63)**, logic LUT 95,935 -> 95,906 (-29), **FF 90,781 -> 90,622 (-159)**, BRAM **168 unchanged** — i.e. **AREA-NEUTRAL**, everything far inside the ~800 LUT floor. The -67.4% tag/state storage saving does NOT appear as a large LUT drop because LUTRAM packs 32-64 bits per LUT (~124 LUT equivalent), partly offset by the new burst-fill and eviction-walk FSM. ⚠️ WNS 0.041 -> 0.089 is NOT a result: this lane pins `ROUTE_DIRECTIVE=Default`/`POST_ROUTE_PHYSOPT_MAX=0` and its own header says WNS is not to be read from it |
+| 17 | `MOVE16` as a single wide 16-byte access | 🔄 **MEASURED, NOT BUILT** — oracle on `perf/move16-wide`; semantics established from the M68040UM | See the dedicated section below. **The brief's premise was false**: MOVE16 as microcoded today is **already +35.3%** faster than the `move.l` copy loop, so the lever is **+10.3%**, not 4x |
 
 **#7 gates #5.** FDIP's yield is bounded by prediction accuracy; returns are both a
 mispredict source and a fetch redirect, so fix the double-mispredict-per-call first or
@@ -345,6 +346,179 @@ the p127 question. Also: fill-forward's standalone **+4.34% reproduces its docum
   ~88% of that was slot-1 coverage, not capacity.
 - **Route-directive sweep** — every alternative worse than `AggressiveExplore`
   (−0.233); `MoreGlobalIterations` by 0.4 ns.
+
+## Lever 17 — `MOVE16` as one wide access: MEASURED WITHOUT RTL, and the premise was wrong
+
+Measured on `perf/move16-wide` (`a700b79c` + test-only additions), `IPC_MEM=l2:5:60:4096`,
+seeds 1 and 17, via `Move16OracleSpec` + `kMemcpyQuads`/`kMemcpyMove16`. Every arm has
+**`dAR` = 2.001 and `dAW` = 0.938 per 16-byte line**, so the memory-system control holds
+exactly across the whole sweep. Reproducibility 0.03-0.25% between seeds.
+
+### ⛔ COVERAGE HOLE #7, and it had a WRONG COMMENT attached
+
+**The IPC/bench corpus contained ZERO `MOVE16` instructions** — only a comment in
+`CoreBenchHarness.kMemcpy` asserting *"a MOVE16-based copy is NOT currently a faster path
+and this `move.l` loop is the fair baseline."* **That claim is false by 35%.** The comment is
+why nobody ever measured it. Prior holes: zero A6/A7 operands, zero store→load pairs, zero
+load→compare→branch chains, 25 suite mispredicts vs the board's 24.4 MPKI, zero DBcc, no
+scattered kernel larger than L1.
+
+### Streaming, 16 KB, 3 measured passes (3,072 lines)
+
+| kernel | D-cache acc/line | order | cyc/line | 16 B/cyc | vs `move.l` |
+|---|---:|---|---:|---:|---:|
+| `memcpy-16k` — `move.l (a0)+,(a1)+` x4 | 8 | L,S x4 | **48.819** | 0.3277 | ref |
+| `memcpy-q4` — displacement x4 + 2 `lea` | 8 | L,S x4 | 54.685 | 0.2926 | −10.7% |
+| `memcpy-q2` | 4 | L,S x2 | 40.680 | (0.3933) | +20.0% |
+| `memcpy-q1` — **the wide-MOVE16 proxy** | **2** | L,S | **32.712** | **(0.4891)** | **+49.2%** |
+| `memcpy-m16` — **MOVE16 as microcoded TODAY** | 8 | L,L,S,S x2 | **36.091** | 0.4433 | **+35.3%** |
+
+⚠️ **Read the `16 B/cyc` column carefully.** `q4`/`m16`/`memcpy-16k` really do move all 16
+bytes of every line, so for them it is the measured `copyB/cyc` the spec prints. `q2` and
+`q1` deliberately move only 8 and 4 bytes per line — the spec prints **0.1969** and
+**0.1223** for them — so their column entries are **parenthesised PROJECTIONS**: `16 /
+cyc-per-line`, i.e. the bandwidth an instruction with that access count would reach if it
+moved the whole line. That projection is the point of the oracle, and it is sound here
+because the datapath is 128 bits wide either way (`DLoadRsp.line`, `DStoreCmd.lineData`)
+and the fills/writebacks are byte-count-independent — but it is a projection, not a
+measurement of 16 bytes moved.
+
+✅ **`q1` is a CONSERVATIVE proxy, not an optimistic one.** Its body is 5 macros / 6 uops /
+14 bytes (1 load, 1 store, 2 `lea`, `subq`, `bne`); a wide-`MOVE16` body is 3 macros / **the
+same 6 uops** / 8 bytes (1 wide load, 1 wide store, 2 dropped address ADDs, `subq`, `bne`),
+with the same single load→store dependency and the same 2 accesses. The wide form is
+strictly denser in the 8-byte fetch window, so it should land at or below 32.712.
+
+### L1-resident, 2 KB (`dAW=0`, zero fills in the measured window) — pure LS-pipeline cost
+
+| kernel | acc/line | order | cyc/line |
+|---|---:|---|---:|
+| `l1res-q4` | 8 | L,S x4 | 28.268 |
+| `l1res-q2` | 4 | L,S x2 | 14.267 |
+| `l1res-q1` | 2 | L,S | **7.728** |
+| `l1res-m16` (today's microcode) | 8 | L,L,S,S x2 | 18.247 |
+| `l1res-m16` + all-loads-first reorder | 8 | L,L,L,L,S,S,S,S | **15.734** |
+
+### 🎯 THE 48.8 CYCLES, ATTRIBUTED — which lever 16 asked for and nobody supplied
+
+`streaming − L1-resident`, per arm: **q4 26.417, q2 26.413, q1 24.984, m16 17.844**. So
+**within one access ORDERING and at high access counts** the memory system is a near-exact
+additive constant:
+
+```
+cyc/line  =  LS-pipeline(accesses)  +  26.415   (2 L1 fills + 0.94 writeback, ONE MSHR)
+48.819    =  22.404                 +  26.415
+```
+
+⚠️ **Two honest caveats, both of which I nearly cherry-picked past.** (1) q4 and q2 agree
+to **0.004 cycles** across a 2x change in access count, but **q1's adder is 24.984 — 5.4%
+lower**. Fewer accesses contend less with the fill machinery, so the adder is not a true
+constant; it drifts down as accesses are removed, which makes the q1 projection slightly
+*conservative* again. (2) The adder is **not** ordering-invariant at all — see the m16 row
+and the warning below.
+
+and the L1-resident series is linear at **~3.4 cycles per narrow D-cache access**
+(`(28.268−7.728)/6 = 3.42`), **not ~1 cycle**. The single LS issue port
+(`IssueQueuePlugin.scala:726`) is therefore **not** the binding term — 8 accesses occupy
+16.4% of the cycles but *cost* 46% of them, because each access is ~3.4 cycles of
+serialised progress through a single-ported D-cache whose store drain is **refused in
+113,106 of the 129,490 cycles it has data to give (87.3%)**.
+
+⛔ **The constant adder is a property of ONE ORDERING, not of the kernel.** MOVE16's
+L,L,S,S grouping gets an adder of only **17.84** (36.091 − 18.247). Interleaving loads and
+stores is what lets the source fill and the destination write-allocate fill **overlap**
+through the single MSHR. Do not carry 26.415 across an ordering change.
+
+### ⛔ MY PRE-RECORDED FALSIFIER FIRED (recorded in `Move16OracleSpec` before the first run)
+
+Predicted **+12%** (range 5-20%), falsifier at **≥ 35%**. Measured **+49.2%** against the
+`move.l` loop. The model was wrong by ~4x because it priced an access at ~1 cycle and
+assumed miss latency dominated; the LS pipeline is 46% of the loop, not 16%.
+
+### ⛔ ...AND THE OPPOSITE ERROR: the honest number is +10.3%, not +49%
+
+**The ROM's `BlockMove` fast path already uses `MOVE16 (Ax)+,(Ay)+`**
+(`docs/AUDIT_narrow_ea_carveouts.md` §7: `0x40884482`/`0x40884490`/`0x40884496`). So the
+baseline for real block copy is **`memcpy-m16` = 36.091**, not the `move.l` loop. Against
+that, a wide MOVE16 is **32.712 → +10.3%**. The `move.l`-relative **+49.2%** is only
+available to software that is not already using MOVE16.
+
+That also kills the brief's arithmetic: a wide MOVE16 reaches **0.489 copyB/cyc = 48.9 MB/s
+at 100 MHz**. A copy both reads and writes, so the 128-bit master's copy ceiling is
+8 copy-B/cyc = 0.8 GB/s at 100 MHz (the same denominator the sectoring spec used for its
+4.1%); that puts a wide MOVE16 at **6.1% of the bus, up from 4.1%** — **not the 800 MB/s
+the "8 memory ops → 2, so 2 B/cyc → 8 B/cyc" model predicts.** The floor that model
+computes is real; it simply is not the binding constraint. After the change,
+**7.7 of 32.7 cycles are pipeline and 25.0 are the one-MSHR memory system (76%)**. GB/s
+lives in MLP and transfer granularity, not in the LS port.
+
+### ⛔ all-loads-first microcode reorder: MEASURED, and it is a REGRESSION — do not build it
+
+A pure row reorder of `MOVE16_ENTRY` to L,L,L,L,S,S,S,S (the existing `ST2`/`ST3` temps,
+`romSize` and every other entry number unchanged, **zero area**) is **13.8% FASTER
+in-cache** (18.247 → 15.734, bit-identical both seeds) and **4.4% SLOWER streaming**
+(36.091 → 37.745). Streaming is the case that matters for a copy loop. Closed.
+
+### Semantics — established from the M68040 User's Manual, and the oracle is the obstacle
+
+| | documented MC68040 | Musashi = this core |
+|---|---|---|
+| extent | *"the lines are aligned to 16-byte boundaries"*; UM §7.4.2 line read is *"a block of four long words, aligned to a 16-byte memory boundary"* with the device wrapping A3/A2 | **raw, unmasked** 4 LONGs at `An+0/4/8/12` |
+| `Ax == Ay` | UM instruction-summary **note 7** + errata `MC68040DE_D` item 5: *"the address register is only incremented once, and the line is copied over itself"* → **+16** | **+32** |
+| cache | UM §4.3.3: *"Accesses by the MOVE16 instruction also do not allocate cache lines in the data cache for either read or write misses... Write hits invalidate a matching line and perform an external access."* | ordinary loads/stores: allocates on read miss, **write-allocates** on write miss |
+
+**`move16_basic.s` stages 2 and 3 ASSERT both of the first two deviations** (stage 2 guards
+`0x00020300` specifically to prove no aligned-down write happened; stage 3 asserts `+32`).
+They are the only two assertions in the whole corpus that block architectural conformance,
+`handle_deref_rmw_count.s`'s three MOVE16 sites are all 16-byte aligned, and **lock-step
+generates no MOVE16 at all**.
+
+✅ **But conformance does NOT have to be touched to build the fast path.** Treat MOVE16 as a
+**16-byte-wide access** and the existing cross-line split machinery covers Musashi's
+unmasked semantics exactly: aligned → 1 access, misaligned → 2 (slot A + slot B), against 4
+today. `DcacheByteLane.storeStrbA/storeStrbB/storeDataA/storeDataB/extractCross` are
+already generic per-byte loops over `k` gated by `kActive(size,k)`; only the loop bound and
+a 128-bit `data` input change. So **no spec amendment, no test change, strictly fewer
+accesses in both cases.**
+
+### What it costs, and who owns what
+
+`DLoadRsp.line` is **already 128 bits** and `DStoreCmd.{strb,lineData}` are **already
+16/128 bits**, so the wide datapath exists. The gap is exactly what the brief said:
+`StoreQueue`'s entry `data` is **32 bits** and `storeStrbA` derives the strobe from
+`Size ∈ {BYTE,WORD,LONG}`, so **4 of 16 bits is the widest strobe anything can present**,
+and **nothing coalesces** (`sqNarrowDrainMerge` is not in this lineage and deleted logic
+rather than adding a coalescer).
+
+- **Mine** — `Microcode.scala` (10 rows → 4: one wide load, one wide store, two address
+  ADDs), a `wide16` `DescBits`/uop bit (~30-40 flops over ~15 carriers, +252 ROM bits),
+  `LsEuPlugin` staging (2 x 128 bits = **+256 flops**; the `twoAccess` FSM already makes ONE
+  uop perform TWO translated accesses, which is the exact skeleton needed).
+- **Needs routing — `StoreQueue`**: `SqAlloc.wide` (+1 bit), `maskAs := 0xFFFF` when wide
+  (the overlap network is **already a 16-bit byte mask**, so no widening there), and a drain
+  override for `strb`/`lineData`. Either **+768 flops** (128-bit per-entry data) or
+  **+128 wires** from the LSU into the drain mux — and that block is named in the
+  `DStoreCmd`-payload congestion finding, so prefer the flops.
+- **Needs routing — `DcachePlugin`**: recognise `strb === 0xFFFF` on a COPYBACK store miss
+  and skip the write-allocate refill. **This is where the remaining prize is**: it removes
+  one of the two serialised fills, i.e. part of the 25.0-cycle memory term that is 76% of
+  the post-change loop. It is also what the UM says MOVE16 must do anyway. **Unmeasured —
+  do not sum it with +10.3%** (and note the two existing D-side levers are sub-additive).
+
+### 🎯 HOW TO SIZE no-write-allocate CHEAPLY, BEFORE building it
+
+Same trick as this lever's own oracle — no RTL. Add two one-access-per-line kernels over
+the same 16 KB footprint:
+
+* **load-only**: one `move.l (a0),d0` per 16-byte line → 1 fill, 0 writeback, 1 access.
+* **store-only**: one `move.l d0,(a1)` per 16-byte line → 1 **write-allocate** fill,
+  ~1 writeback, 1 access.
+
+`store-only − load-only` is the measured cost of the destination-side write-allocate fill
+plus its writeback — i.e. an upper bound on what a full-line no-allocate store can remove,
+priced from measured per-operation costs rather than from a transaction count. Do that
+before quoting any figure for it.
+
 
 ## Measurement rules these levers are judged by
 
