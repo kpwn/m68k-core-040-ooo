@@ -965,3 +965,55 @@ prediction at all, so its mispredicts are counted as COVERAGE, not direction.** 
 coverage (lever 13) moves them into the direction bucket as loop-*exit* mispredicts —
 exactly what this lever then removes. Re-read the attribution after 13 lands before
 sizing this. Same discipline as `#7 gates #5`.
+
+---
+
+## L2 writeback parallelism: MEASURED, and it is expensive (2026-09-28)
+
+Owner's question: "we should maybe ensure l2 miss / writeback parallelism, since that
+will be the bandwidth limit going to DDR."
+
+`MemcpyBandwidthSpec`, `IPC_MEM=l2:<hit>:<ddr>:<sets>`, `IPC_MISS_STATS=1`, memcpy-64k,
+seeds 1/17, isolated worktree `l2evict` @ `c4ed1fc7`:
+
+| L2 | sets | misses | **evictions** | merges | missRate | copy B/cyc | cycles |
+|---|---|---|---|---|---|---|---|
+| 2048 KiB | 4096 | 2,049 | **0** | 0 | 12.50% | 0.3281 | 199,724 |
+| 32 KiB | 64 | 4,099 | **3,586** | 0 | 25.01% | **0.2027** | 323,343 |
+
+Turning the writeback path on costs **-38.2% copy bandwidth / +61.9% cycles**.
+
+Marginal cost: `(323,343 - 199,724) / ((4,099+3,586) - 2,049) = 123,619 / 5,636 =`
+**21.9 cycles per extra DDR transaction, against a 60-cycle DDR.** So writebacks are
+*partly* overlapped (not 60) but are a long way from free (not ~0). On its face this
+says the miss/writeback parallelism the owner asked about is real, and missing.
+
+### CONFOUND -- do not act on the above yet
+
+Shrinking the L2 changed **two** things at once: misses 2,049 -> 4,099 *and* evictions
+0 -> 3,586. The 21.9 cyc/transaction figure charges both to one number and cannot
+attribute the cost to the writeback path specifically.
+
+Worse, the one latency datum we have is a **null of unknown validity**: in the 2 MB arm,
+DDR 70 -> 60 cyc moved copy bandwidth 0.3279 -> 0.3281 (~0.0%, ~158 cycles where naive
+serialisation predicts 2,049 x 10 = 20,490). Either DDR latency is ~99% hidden in that
+regime, **or the `ddr` field of `IPC_MEM` is not wired** and every L2 number we have is
+latency-insensitive for a trivial reason. The `sets` field is proven live (it moved
+evictions and missRate); the `ddr` field is NOT.
+
+Per the standing rule -- *the instrument ran, told you nothing, and nothing announced
+it* -- this is instance 7 and it gets a control before it gets a conclusion.
+
+### Control in flight
+
+- `l2:5:240:4096` vs `l2:5:60:4096` -- 4x DDR latency in the **no-eviction** regime.
+  Prediction if the knob is wired and latency is genuinely hidden: small but non-zero.
+  If EXACTLY flat at 4x, the knob is dead and the 70-vs-60 null is meaningless.
+- `l2:5:240:64` vs `l2:5:60:64` -- 4x DDR latency in the **eviction** regime.
+  Prediction if writebacks serialise behind misses: cycles scale with DDR latency.
+  If flat, the limit is structural occupancy (queue/MSHR depth), not latency, and the
+  fix is depth, not overlap.
+
+Falsifier for "writeback parallelism is the lever": if the eviction arm is flat under
+4x DDR latency, then adding miss/writeback overlap buys nothing and the real limit is
+the number of outstanding transactions the L2 will hold.
