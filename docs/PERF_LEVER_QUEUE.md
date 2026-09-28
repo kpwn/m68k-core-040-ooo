@@ -417,6 +417,37 @@ not quote 26.8% as the expected gain — it is the ceiling.
 path this is a **conformance fix that happens to be the largest bandwidth lever measured** —
 our MOVE16 currently allocates and write-allocates, which documented silicon does not.
 
+## ✅ LS-OoO ISSUE — COMPLETE GATE TABLE (only area + board outstanding)
+
+| gate | result |
+|---|---|
+| `test-fast` | **396 / 0 / 2** — exact count |
+| ported corpus | **1,010 / 12 both arms, EXACT SET MATCH**, 87 sweep registrations each |
+| `ExecuteLockStepSpec` | OFF **12**, ON **17** — **name-for-name, ZERO unclassified** |
+| IPC | **−11.265% cycles / +12.7%**, both seeds, **16 kernels improved, 0 regressed** |
+| attribution | `orderRedirects = 0` on all 34 kernels, both arms |
+| instrument validity | `IQ_HOL=1` proven **print-only** (cycles bit-identical) |
+| area / board | ⛔ **outstanding** |
+
+**The lock-step 5-red delta is fully accounted for**, which is why it had to be compared by
+name and not by count:
+
+| arm | total | `odd-ssp` LINK `#-75` | NZVC non-vacuity assert | **unclassified** |
+|---|---:|---:|---:|---:|
+| knob-OFF | 12 | 11 | 1 | **0** |
+| knob-ON | 17 | 16 | 1 | **0** |
+
+6 ON-only / 1 OFF-only / 11 shared, **all `odd-ssp`**. That family is red in BOTH postures and
+its membership is timing-sensitive **by construction** — Musashi zeroes registers while
+SpinalSim randomises the PRF, so a word write leaves garbage uppers and which boot offsets
+trip depends on LS issue timing. Three independent levers have now moved it in both
+directions. The NZVC entry fails knob-OFF too.
+
+✅ **Attribution is closed: the +12.7% is the IQ SELECT RELAXATION ALONE.** `orderRedirects`
+is zero in every arm, so the P4 park and the barrier recovery contribute nothing to it — and
+that also means the recovery's ~20.9-cycle cost is **still unpriced**, because these kernels
+never exercise it.
+
 ## ⛔ THE "7% vs 70%" MOB MARKET: BOTH FIGURES WERE MISAPPLIED — the answer is a BOUND
 
 Two numbers for the same population disagreed by 10x. Neither was wrong as measured; both
