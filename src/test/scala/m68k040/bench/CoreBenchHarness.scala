@@ -2065,10 +2065,16 @@ trait CoreBenchHarness extends AnyFunSuite {
     * offset; `d7 == 0` proves the inner loop ran to completion. A copy that shifted
     * by one long, or stopped early, fails both.
     *
-    * NOTE on MOVE16: the 68040's dedicated cache-line-move instruction is microcoded
-    * here into 4 LONG transfers (`Microcode.scala:2417`), i.e. 8 D-cache accesses per
-    * 16 bytes, so a MOVE16-based copy is NOT currently a faster path and this
-    * `move.l` loop is the fair baseline. */
+    * ⛔ CORRECTED 2026-09-28. This comment used to claim "a MOVE16-based copy is NOT
+    * currently a faster path and this `move.l` loop is the fair baseline". **MEASURED
+    * FALSE by 35%**: `kMemcpyMove16` runs the SAME 8 D-cache accesses per 16 bytes in
+    * **36.084 cyc/line against this loop's 48.819** (`Move16OracleSpec`, both seeds),
+    * because MOVE16's microcode issues L,L,S,S rather than this loop's L,S,L,S and the
+    * interleave lets the source fill and the destination write-allocate fill overlap
+    * through the single refill MSHR. And the ROM's own `BlockMove` uses MOVE16, so for
+    * real block copy **`kMemcpyMove16` is the fair baseline and this loop is not**.
+    * See `docs/PERF_LEVER_QUEUE.md` lever 17. The wrong comment is why the corpus
+    * contained zero MOVE16 instructions for as long as it did. */
   def kMemcpy(bytes: Int = 16384, passes: Int = 4, label: String = "memcpy-16k"): Kernel = {
     require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
     require(passes >= 2, "pass 1 is the L2 warm-up and is excluded; need at least one measured pass")
@@ -2117,6 +2123,139 @@ trait CoreBenchHarness extends AnyFunSuite {
         assert(lastOf(7) == 0L, s"memcpy inner loop did not complete: d7 = ${lastOf(7)}")
       })
   }
+
+  /** ── MOVE16 LEVER: the MEMORY-OP-COUNT ORACLE (2026-09-28) ────────────────────
+    *
+    * `kMemcpyQuads(q)` copies `q` of the four longs of every 16-byte line and skips
+    * the rest, advancing both pointers by 16 with one `lea` pair per line. For
+    * q = 1/2/4 the LINE FOOTPRINT, the L1 MISS COUNT, the destination
+    * write-allocate fetches and the dirty writebacks are all IDENTICAL -- a 16-byte
+    * L1 line is fetched whole on first touch and written back whole because there
+    * is ONE dirty bit per line -- while the number of D-cache ACCESSES per line is
+    * exactly `2*q`. So the q=1 -> q=4 slope MEASURES the marginal cycle cost of an
+    * LS-pipe access at constant memory-system behaviour, which is the entire
+    * mechanism a single-access `MOVE16` can attack. It needs no RTL and it BOUNDS
+    * the lever before it is built, which is what `docs/PERF_LEVER_QUEUE.md` demands
+    * after a transaction-count model missed lever 16 by 8x.
+    *
+    * q=4 is the same work as `kMemcpy` written in the displacement form with one
+    * `lea` pair, so the three points differ ONLY in the number of `move.l`s; it is
+    * also the cross-check against `kMemcpy`'s post-increment form.
+    *
+    * Verification is the same real check `kMemcpy` uses (every source long contains
+    * its own address), aimed at the LAST long this variant actually copies -- so a
+    * copy that shifted, stopped early, or skipped the wrong quad still fails.
+    */
+  def kMemcpyQuads(quads: Int, bytes: Int = 16384, passes: Int = 4,
+                   label: String = null): Kernel = {
+    require(quads >= 1 && quads <= 4, "quads must be 1..4")
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-q$quads-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val moves = (0 until quads).map(i => s"move.l ${i * 4}(%a0),${i * 4}(%a1)")
+    val body  = moves ++ Seq("lea 16(%a0),%a0", "lea 16(%a1),%a1",
+                             "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    // The last long this variant really copies: line (iters-1), quad (quads-1).
+    val lastOff = bytes - 16 + (quads - 1) * 4
+    val epi   = Seq(f"move.l 0x${Dst + lastOff}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + lastOff) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+  /** `MOVE16 (Ax)+,(Ay)+` copy loop -- the SAME 16 bytes per iteration as `kMemcpy`
+    * in ONE instruction instead of four, and with the pointer bumps folded in
+    * (`move16` post-increments both by 16 unconditionally).
+    *
+    * As microcoded TODAY (`Microcode.scala`'s `MOVE16_ENTRY`, rows 242..251) this is
+    * 4 LONG loads + 4 LONG stores + 2 dropped address ADDs = the SAME EIGHT D-cache
+    * accesses per line the `move.l` loop performs, from TWELVE uops instead of ten.
+    * So against `kMemcpy`/`kMemcpyQuads(4)` this kernel isolates the INSTRUCTION-COUNT
+    * and decode-bandwidth half of the lever with the memory-op count held constant,
+    * and it is the fail-before control for making MOVE16 a single wide access.
+    *
+    * Both operands are 16-byte aligned here, which is the only case where a
+    * line-wide implementation and Musashi's non-masking four-LONG semantics agree.
+    */
+  def kMemcpyMove16(bytes: Int = 16384, passes: Int = 4,
+                    label: String = null): Kernel = {
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    require(Src % 16 == 0 && Dst % 16 == 0, "MOVE16 operands must be line aligned")
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-m16-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move16 (%a0)+,(%a1)+", "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + bytes - 4) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
 
   def kLoadStream: Kernel = {
     val iters = 60
