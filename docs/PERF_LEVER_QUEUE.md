@@ -976,12 +976,31 @@ will be the bandwidth limit going to DDR."
 `MemcpyBandwidthSpec`, `IPC_MEM=l2:<hit>:<ddr>:<sets>`, `IPC_MISS_STATS=1`, memcpy-64k,
 seeds 1/17, isolated worktree `l2evict` @ `c4ed1fc7`:
 
-| L2 | sets | misses | **evictions** | merges | missRate | copy B/cyc | cycles |
+| kernel | L2 | misses | **evictions** | missRate | copy B/cyc | cycles | seeds |
 |---|---|---|---|---|---|---|---|
-| 2048 KiB | 4096 | 2,049 | **0** | 0 | 12.50% | 0.3281 | 199,724 |
-| 32 KiB | 64 | 4,099 | **3,586** | 0 | 25.01% | **0.2027** | 323,343 |
+| memcpy-64k | 2048 KiB | 2,049 | **0** | 12.50% | 0.3281 / 0.3282 | 199,724 | 1, 17 |
+| memcpy-64k | 32 KiB | 4,099 | **3,586** | 25.01% | **0.2027** | 323,343 | **1 only** |
+| memcpy-16k | 2048 KiB | -- | **0** | -- | 0.3278 / 0.3276 | 149,929 | 1, 17 |
+| memcpy-16k | 32 KiB | 532 | **19** | 6.49% | 0.3255 / 0.3252 | 150,984 | 1, 17 |
 
-Turning the writeback path on costs **-38.2% copy bandwidth / +61.9% cycles**.
+Turning the writeback path on costs **-38.2% copy bandwidth / +61.9% cycles** on
+memcpy-64k.
+
+⚠️ **CORRECTION (self-caught):** the 32 KiB memcpy-64k figure is **one seed**, not two --
+that arm was still running when it was first read, and a still-running log was grepped.
+The seed spread everywhere else in this table is <=0.1%, so the effect is not in danger,
+but the number is single-seed until the arm lands.
+
+✅ **The internal DOSE-RESPONSE control is the strong evidence here, not the cross-config
+pair.** Same run, same config, two kernels:
+
+    memcpy-16k:    19 evictions  ->  -0.7%   (0.3277 -> 0.3254, both seeds)
+    memcpy-64k: 3,586 evictions  -> -38.2%   (0.3281 -> 0.2027, one seed)
+
+A 189x difference in eviction count tracks a 55x difference in penalty, within one
+configuration sweep. `memcpy-16k` fits the 32 KiB L2 and so acts as a built-in null:
+it holds the small-L2 config fixed while removing only the evictions. That controls for
+"32 KiB is just slower for some other reason" in a way the 2 MB-vs-32 KiB pair cannot.
 
 Marginal cost: `(323,343 - 199,724) / ((4,099+3,586) - 2,049) = 123,619 / 5,636 =`
 **21.9 cycles per extra DDR transaction, against a 60-cycle DDR.** So writebacks are
