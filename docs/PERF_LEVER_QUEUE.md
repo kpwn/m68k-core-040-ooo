@@ -368,6 +368,13 @@ count by **zero**, because the array is refilled in the same cycle the latch is.
   is negative and well inside the ~800 LUT floor, LUTRAM/BRAM/DSP all unchanged. See
   `docs/PERF_AREA_LEDGER.md`'s synth-only sub-table, including why the per-module rows of
   the two reports must not be read against each other.
+- **`ExecuteLockStepSpec`: 690 ok / 12 failed / 1 ignored in BOTH arms, and the 12 failures
+  are IDENTICAL NAME-FOR-NAME** (not merely equal in count) — 11 of the documented
+  `odd-ssp` "level-1/level-7 IRQ at every boundary of the LINK #-75 stretch" family plus
+  `lock-step: LSU NZVC wakeup preserves alternating flags and partial Scc destinations`.
+  Those are the known pre-existing reds (uninitialised registers vs a randomised PRF), and
+  since the OFF netlist is byte-identical to master the OFF arm *is* master's result, which
+  makes it a sound reference for the comparison.
 - `ItlbVictimSpec` is a **paired** test: the `victimEntries = 0` arm must show the walk
   (fail-before) and the ON arm must show zero walks, one promote, and **the same PPN**;
   plus PFLUSHA must clear the buffer or the re-touch would be answered out of the
