@@ -39,8 +39,19 @@ is a very different risk profile from a static address split where a mis-decode 
   `axi_xbar.v`"* (bind `:275`, task #269). `l2c_ctrl.v:419` agrees from the other side.
 - `l2c.v` exposes exactly three interfaces: `s_axi_*` (read **+ write**, from the crossbar),
   **`f_axi_*` (READ-ONLY — `ar`/`r`, no `aw`)**, and `m_axi_*` (downstream to DDR).
-- ⛔ **So `f_axi_*` cannot be reused for D**: no write channels, and D does writebacks. The D
-  hot path needs a **fourth interface, `d_axi_*`, read+write**.
+- ⛔ **CORRECTED 2026-09-28: the D hot port should be READ-ONLY, a structural clone of
+  `f_axi_*`.** I originally wrote that it needs read+write "because D does writebacks". That
+  is wrong, for three measured reasons: (a) **the ceiling is on READS** — two cacheable reads
+  per line is what the fabric will not carry; (b) **the crossbar already overlaps a read with
+  a write** (`rs_state` and `ws_state` are separate state and `req_rd_*` carries no write-side
+  term), so leaving writebacks on the cold path costs nothing; (c) a read+write port would
+  duplicate the **entire L2 write front door** — the `aw_*` header door, the
+  `cur_wdata`/`cur_wstrb` muxes whose non-gather arm is literally `s_wdata`, a ~576 FF
+  gather, a second exactly-matching `s_wready`, **and a W-owner lock** (AXI4 has no WID,
+  `l2c.v:508-514`). Also a framing correction: the **L2's** dirty-line writeback is
+  *internal* (`victim_push_*` -> `l2c_victim`), not something the port carries.
+  So: cacheable D **reads** go direct; L1D writebacks, write-through stores and all inhibited
+  traffic stay on the crossbar.
 - ⚠️ **The failure mode is already on record.** `l2c_ctrl.v:411-423`: the fetch-side AR
   tracker was originally single-burst-in-flight and *"re-serialised the CPU's 5-MSHR
   instruction prefetcher down to one fetch in flight"*, fixed 2026-09-02 with a one-entry
@@ -73,8 +84,15 @@ command (`DcacheTypes.scala:93/112/127`), so the information is present — but 
 
 ## Open questions — these are the work, not the port itself
 
-1. **Cross-path ordering.** An inhibited access is a barrier; a cacheable access on the hot
-   path must not slip past one on the cold path. The core enforces inhibited ordering
+1. **Cross-path ordering — ANSWERED, and it moves a slice.** (a) The split **weakens nothing
+   that exists today**: read-vs-write is already unordered, and cacheable-vs-inhibited *reads*
+   are serialised by the core's single-excursion load FSM. (b) It becomes load-bearing **the
+   moment `N_MSHR > 1`** — so **slice D4 (INHIBITED serialisation + `dQuiesce`) is a HARD
+   PREREQUISITE of D2, not the tail item §9 sequences after it. That needs a spec amendment.**
+   (c) Writeback-vs-refill same-line is solved by a per-line AR gate, already built.
+
+   Original wording, retained for context: an inhibited access is a barrier; a cacheable
+   access on the hot path must not slip past one on the cold path. The core enforces inhibited ordering
    internally today, but that becomes load-bearing **across two physical paths**. ⚠️ This
    core has a documented *"config LATCHED at one point, RE-DERIVED live at another"* MMU
    defect family — **four defects, one root cause, all giving a clean one-hot hit with no
