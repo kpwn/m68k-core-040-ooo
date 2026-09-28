@@ -427,7 +427,8 @@ our MOVE16 currently allocates and write-allocates, which documented silicon doe
 | IPC | **−11.265% cycles / +12.7%**, both seeds, **16 kernels improved, 0 regressed** |
 | attribution | `orderRedirects = 0` on all 34 kernels, both arms |
 | instrument validity | `IQ_HOL=1` proven **print-only** (cycles bit-identical) |
-| area / board | ⛔ **outstanding** |
+| **area (100 MHz matched pair)** | **+1,421 LUT total / +1,091 `socket_core` / +475 FF** — `lsooo0` 145,687 -> `lsooo1` 147,108. **ABOVE the ~800 LUT floor, so this one is REAL, not noise** |
+| board | ⛔ **outstanding** |
 
 **The lock-step 5-red delta is fully accounted for**, which is why it had to be compared by
 name and not by count:
