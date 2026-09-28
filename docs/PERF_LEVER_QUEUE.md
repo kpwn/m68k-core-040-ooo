@@ -297,6 +297,46 @@ which is now a pattern rather than a curiosity. The two real targets are the **i
 ~10% of the device, ~5,800 sink pins — lever 12) and the **`DStoreCmd` merge payload**
 (**−117 wires between two blocks that both appear in congested windows**).
 
+## ⛔ "ONE LS PORT x 4 BYTES/INSTRUCTION IS THE BANDWIDTH CEILING" — REFUTED 2026-09-28
+
+I argued that the copy loop was bound by LS-port occupancy: 16 bytes costs 4 loads + 4
+stores = 8 memory ops, one LS issue port, therefore a hard 200 MB/s floor, therefore a wide
+`MOVE16` (2 ops instead of 8) buys 4x and reaches the bus. **Measured, that is wrong.**
+
+**`MOVE16` as microcoded TODAY is already +35.3% faster than the `move.l` loop** — 36.091
+vs 48.819 cycles per 16-byte line — **on exactly the same 8 accesses.** Its microcode issues
+**L,L,S,S** where the `move.l` loop issues **L,S,L,S**, and that interleave lets two
+serialised fills overlap through the single MSHR. So operation COUNT was never the binding
+term; operation ORDER was.
+
+Consequences:
+
+- A wide `MOVE16` is worth **+10.3%**, not 4x — and that is the honest figure, because the
+  Q700 ROM's `BlockMove` **already uses MOVE16**, so the `move.l` loop is not the baseline
+  real code runs. It reaches **6.1% of the 128-bit bus**, up from 4.1%. Not 800 MB/s.
+- **The real ceiling is the ONE-MSHR memory system.** After a wide `MOVE16`, **76% of the
+  loop is memory.** Attribution of the 48.819: **22.404 pipe + 26.415 memory** (2 fills +
+  0.94 writeback through one MSHR). An issue-port model says the LS pipe is 16% of the loop;
+  measured it is **46%**.
+- An all-loads-first microcode reorder (zero area) was built and measured: **13.8% faster
+  in-cache, 4.4% SLOWER streaming. Closed.**
+
+⛔ **Coverage hole #7: the corpus contained ZERO `MOVE16` instructions**, so none of this was
+visible. Now closed, and the in-tree comment that implied MOVE16 was slow is corrected.
+
+### ⚠️ THREE MOVE16 SEMANTIC DIVERGENCES from documented silicon (all Musashi's)
+
+| | documented MC68040 | this core |
+|---|---|---|
+| extent | UM §7.4.2: a 16-byte **ALIGNED** line; device wraps A3/A2 | raw unmasked 4 LONGs at `An+0/4/8/12` |
+| `Ax==Ay` | UM note 7 + errata `MC68040DE_D` item 5: increments **once (+16)** | **+32** |
+| cache | UM §4.3.3: MOVE16 **does NOT allocate** for read or write misses | allocates, and **write-allocates** |
+
+The third matters for bandwidth: our MOVE16 pollutes the cache and performs a write-allocate
+that the architecture says should not happen. The fast wide form does **not** require
+breaking conformance — a 16-byte-wide access with the existing cross-line split reproduces
+Musashi's exact semantics in 1 access (aligned) or 2 (misaligned) instead of 4.
+
 ## ⛔ THE TWO D-SIDE BANDWIDTH LEVERS ARE SUB-ADDITIVE — NEVER SUM THEM
 
 Measured 2x2, `memcpy-16k`, `IPC_MEM=l2:5:60:4096` (`863b45cb`):
