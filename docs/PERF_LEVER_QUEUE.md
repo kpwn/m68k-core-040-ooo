@@ -822,6 +822,145 @@ instruments, opposite reproducibility; knowing which one a claim rests on is wha
 the p127 question. Also: fill-forward's standalone **+4.34% reproduces its documented
 +4.35% to 0.01 pp**, so the baseline was not drifting.
 
+## ✅ THE INTEGRATION MERGE `integ/all-shippable` — RE-GATED AS A COMBINATION (2026-09-28)
+
+Every gated improvement the campaign decided to ship, merged onto one branch and
+**re-measured as a combination** — because a merged tree is a new configuration and none
+of the individual measurements transfer to it.
+
+`integ/all-shippable` `1a8ddf3a`, worktree `integ2`. Source hashes, highest value first:
+
+| merged | source | brings |
+|---|---|---|
+| `integ/all-gated` | `5015dad7` | the **only silicon-proven win**: the two branch-coverage flags, **+3.06% on the board** (55,300 → 56,993.8 Dhry/s); plus `rasBranchRepair`, load-only `specLoadWakeup` |
+| `perf/slot1-coverage` | `881b9ec3` | slot-1 `DBcc` deferral (−98.7% mispredicts on its shape) |
+| `perf/itlb-victim-buffer` | `626cd6b1` | ITLB victim buffer, −73.9% walks, +1,451 FF, no measurable LUT |
+| `perf/sq-congestion` | `59ecd9a0` | SQ narrow drain merge (~400 LUT), `SQ_DEPTH` knob |
+| (already in) | | LS-OoO issue **+12.7%**, sectored 64 B lines **+8.56%**, MOVE16 oracle, stall budget |
+
+`perf/dside-mshr2` is **deliberately excluded**: its headline change measured **−0.72%**.
+
+### The provenance line is the deliverable, and three flags were NOT on it
+
+`SHIPPING_CONFIG` now carries **16 fields**. Each source branch appended its own flags to
+the same closing string, so a naive conflict resolution silently drops one branch's
+provenance — the failure family with **four instances on record** in this core, one of
+which cost a withdrawn silicon number. Every flag was round-tripped: generate twice, diff
+the line **and** the netlist.
+
+| flag | env override | default | line | netlist |
+|---|---|---|---|---|
+| `lsOooIssue` | `LS_OOO_ISSUE` | false | ✅ | ✅ +167 reg bits |
+| `specLoadWakeup` | `SPEC_LOAD_WAKEUP` | false | ✅ | ✅ |
+| `dcacheHitUnderMiss` | none (settled) | **true** | ✅ | prints only |
+| `dcacheHitUnderMissRead` | `CPU_DCACHE_HIT_UNDER_MISS_READ` **or** `CPU_DCACHE_HUM_READ` | false | ✅ both | ✅ **byte-identical to each other** |
+| `dcacheFillForward` | `CPU_DCACHE_FILL_FORWARD` | false | ✅ | ✅ |
+| `dcacheSectored` | `CPU_DCACHE_SECTORED` | false | ✅ | ✅ −69 reg bits, +21 always |
+| `rasBranchRepair` | `CPU_RAS_BRANCH_REPAIR` | false | ✅ | ✅ +8 reg bits |
+| `computeDirectTargets` | `CPU_COMPUTE_DIRECT_TARGETS` | false | ✅ | ✅ `1'b0` → real predicate |
+| `deferSlot1Uncond` | `CPU_DEFER_SLOT1_UNCOND` | false | ✅ | ✅ `1'b0` → real predicate |
+| `deferSlot1Dbcc` | `CPU_DEFER_SLOT1_DBCC` | false | ✅ | ✅ `1'b0` → real predicate |
+| `itlbVictimEntries` | `ITLB_VICTIM` | 0 | ✅ | ✅ +849 reg bits, **+1 module** |
+| `storeQueueDepth` | `SQ_DEPTH` | 8 | ⚠️ **ADDED** | ✅ −207 reg bits at 4 |
+| `sqNarrowDrainMerge` | `SQ_NARROW_MERGE` | false | ⚠️ **ADDED** | ✅ −84 reg bits |
+| `icachePrefetch` | `DBG_IC_PREFETCH_DISABLE` (inverted) | **true** | ⚠️ **ADDED** | ✅ RegInit `1'b1`→`1'b0` |
+
+⛔ **`dcacheHitUnderMissRead` had TWO env names.** It was given an override independently on
+two branches — `CPU_DCACHE_HUM_READ` and `CPU_DCACHE_HIT_UNDER_MISS_READ`. Picking a side
+makes the other name a silent no-op. **Both are read**; the two produce byte-identical
+netlists.
+
+⛔ **Three flags reached `ShippingCoreConfig` without reaching the print.** `SQ_DEPTH` and
+`SQ_NARROW_MERGE` came that way from `perf/sq-congestion`. Worse, `DBG_IC_PREFETCH_DISABLE`
+was read **directly in `IcachePlugin`** and changes a RegInit's reset value — a real netlist
+change, on a feature that is **ON and worth a board-measured +2.6%**, with a diagnostic
+bitstream indistinguishable from a shipping one in its own log. Now centralised and printed.
+
+✅ A typo is a **hard error**: `CPU_DEFER_SLOT1_DBCC=ture` → `IllegalArgumentException`,
+not a silent baseline. All 11 booleans + `ITLB_VICTIM=32` elaborate together.
+
+### Cost of the merge at DEFAULT (everything off)
+
+**+930 flop bits, +8,690 wire bits, +16 always blocks, 0 new modules** against `8c2866ce`.
+Not free, and all of it is `integ/all-gated`'s **debug instrumentation** — the branch and
+exception rings, the mispredict class counters, the I-prefetch CSRs — plus the `isCall` uop
+field `rasBranchRepair` needs. **No gated feature is live:** `slot0ComputedPred`,
+`slot1WouldUncond` and `slot1WouldDbcc` are all hard-wired `1'b0` in the default netlist.
+
+### Gate results — the COMBINATION, not the parts
+
+| gate | pre-merge `8c2866ce` | merged `1a8ddf3a` | verdict |
+|---|---|---|---|
+| `test-fast` | **396**/0/2 | **400**/0/2 | +4, **explained by name** |
+| ported corpus (933 programs) | 1010 pass / **12** fail | 1010 pass / **12** fail | **failing sets IDENTICAL name-for-name**, 0 new, 0 tests lost |
+| `ExecuteLockStepSpec` | 679 / **12** / 1 | 691 / **12** / 1 | **same 12 reds name-for-name**; **+12 new tests, all passing** |
+| `ItlbVictimSpec` | (absent) | 3/3 both arms | ON arm: 90 accesses → 30 walks + 58 promotes |
+
+**The +4 in `test-fast` is exactly** `DebugRingAtomicitySpec` (2), `PerfCounterSpec`
+(mispredict class counters), `RobPluginSpec` (`debugBranchRetire` is ONE event) — the
+ring-tearing and class-counter work. The other **6** new tests are `VerilatorTest`-tagged
+and excluded, which is why the number is 400 and not 406.
+
+⚠️ **AND THAT IS A COVERAGE FINDING:** `ItlbVictimSpec` is 3/3 Verilator-tagged, so
+`test-fast` **never exercises the ITLB victim buffer at all**. A "gated 396/396 both arms"
+claim on that branch said nothing about the feature. Run it explicitly.
+
+Comparisons are an **explicit Python set comparison**, never `comm` — `comm` fails silently
+under a locale collation mismatch and prints an empty "did not reproduce" section that is a
+failed comparison, not a green result.
+
+### IPC of the combination: **−13.6% cycles**, and it is NOT the sum of the parts
+
+`IpcBenchSpec`, `IPC_V2=1`, `IPC_MEM=l2:5:60:4096`, all 34 kernels, two seeds, OFF vs
+every lever ON **on the same merged tree**:
+
+| | seed 1 | seed 17 |
+|---|---:|---:|
+| **cycle-weighted aggregate** | **−13.63%** | **−13.36%** |
+| unweighted mean | −8.03% | — |
+| median | −2.91% | — |
+
+Best: `dhrystone-x0-byteAbs-cb` **−38.9%**, `byteSplit-cb` **−36.0%**,
+`byteStoreOnly-cb` −22.4%, `byteLoadOnly` −18.8%, `dhrystone-x0-cb` −15.3%,
+`chase-pure` −12.5%.
+
+⛔ **DO NOT SUM.** LS-OoO alone is +12.7%, sectored lines +8.56%, the branch flags +3.06% on
+silicon. Summed they predict well over 25%. **Measured: 13.6%.** Sub-additivity is the rule
+in this machine, not the exception (see the D-side 2x2 below).
+
+⚠️ **Three kernels REGRESS, and only one of them is real:**
+
+| kernel | Δ s1 | Δ s17 | OFF-arm seed noise | verdict |
+|---|---:|---:|---:|---|
+| `same-line-copyback` | +7.29% | +6.16% | −0.58% | **REAL, +6.7%** |
+| `load-stream` | +4.59% | +2.18% | **+13.25%** | sign reproduces, **magnitude unresolvable** |
+| `load/store` | +2.58% | +1.10% | **+6.15%** | sign reproduces, **magnitude unresolvable** |
+
+The seed-noise column is the **OFF arm against itself** at seeds 1 and 17 — identical RTL.
+The two kernels that look like the worse regressions are the two with the largest seed
+noise in the whole suite. `same-line-copyback` has essentially none, so its +6.7% is the
+one regression that must be explained before this ships.
+
+### D-side 2x2 re-measured on the merged tree — the levers survived the merge exactly
+
+`memcpy-16k`, `IPC_MEM=l2:5:60:4096`, two seeds, copy-B/cyc:
+
+| arm | s1 | s17 | vs baseline | recorded |
+|---|---:|---:|---:|---:|
+| baseline | 0.3278 | 0.3276 | — | 0.32793 |
+| + fill-forward | 0.3421 | 0.3422 | **+4.36% / +4.46%** | +4.34% |
+| + sectored | 0.3557 | 0.3560 | **+8.51% / +8.67%** | +8.56% |
+| **both** | 0.3603 | 0.3598 | **+9.91% / +9.83%** | +9.70% |
+
+All three reproduce their recorded figures to within 0.2 pp on a tree that merged four
+branches into them — which is the point of re-measuring rather than inheriting.
+
+**And the sub-additivity holds on the merged tree:** additive would be **+12.87%**,
+measured **+9.91%**. Fill-forward's marginal contribution on top of sectoring is
+**+1.29 pp** (8.51 → 9.91), against the ~+1.09 pp the mechanism predicts from sectoring
+removing 3.99x of the misses fill-forward saves 2 cycles on. Same story, same order of
+magnitude, on a differently-composed core.
+
 ## Measured DEAD — do not revisit
 
 - **Memory renaming / store-to-load bypass** — the satisfiable loads are the machine's
