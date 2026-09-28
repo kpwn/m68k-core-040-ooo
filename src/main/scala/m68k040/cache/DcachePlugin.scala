@@ -281,6 +281,35 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * arithmetic is about the BUS and is correct; the loop is nowhere near
                      * it. Attribute the 45 cycles before building another burst.
                      *
+                     * ── ⛔ DO NOT ADD THIS LEVER'S PERCENTAGE TO `fillForward`'S ─────────
+                     * Full 2x2 over both flags, 4 points per arm (2 kernels x 2 seeds),
+                     * means of `copy-B/cyc`:
+                     *     baseline            0.32793
+                     *     +sectored           0.35600     +8.56%
+                     *     +fillForward        0.34215     +4.34%   (its doc says +4.35%
+                     *                                               -- reproduces to 0.01pp)
+                     *     both                0.35975     +9.70%
+                     * Additive would be +12.90%, multiplicative +13.27%. Measured +9.70%.
+                     * THE TWO LEVERS ARE STRONGLY SUB-ADDITIVE, and quantitatively so:
+                     * fill-forward's MARGINAL value on top of sectoring is **+1.05%**,
+                     * against **+1.09% predicted** from "fill-forward saves a fixed 2 cycles
+                     * per cacheable MISS, and sectoring removes 3.99x of the misses". A
+                     * 0.04pp fit on a prediction derived from the mechanism, not fitted to
+                     * the data.
+                     *
+                     * CONSEQUENCE, and it is a shipping decision rather than trivia: if
+                     * sectoring ships, `fillForward`'s streaming case weakens by ~4x. It is
+                     * still worth having -- it costs no area and it helps the regimes
+                     * sectoring does not -- but its headline +4.35% is a
+                     * NO-SECTORING number and must be quoted with that condition.
+                     *
+                     * (Also worth contrasting with the p127 note in `ShippingCoreConfig`:
+                     * these 16 bench points are fully DETERMINISTIC -- the sectored arm
+                     * reproduced bit-identically across two different worktrees -- whereas
+                     * `ExecuteLockStepSpec`'s `maxBusy` varied 2-6 cycles between runs of one
+                     * netlist. Same tree, two instruments, opposite reproducibility; know
+                     * which one a claim rests on.)
+                     *
                      * ── THE ACCEPTED COST, NOW SIZED ─────────────────────────────────────
                      * `DcacheSectorSpec`'s capacity probe: pass-2 miss rate on 256 scattered
                      * 16-byte sectors over a 64 KB span goes **18.8% -> 100.0% (+81.3 pp)**.
