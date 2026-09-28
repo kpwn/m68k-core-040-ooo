@@ -113,6 +113,42 @@ command (`DcacheTypes.scala:93/112/127`), so the information is present — but 
    not a fix for anything currently broken — and `iFetchCanReachMmio` must flip in the same
    change, never independently.
 
+## L2C redesign — what "min latency, max throughput on the direct ports" actually requires
+
+Owner, 2026-09-28: *"we can probably redesign L2C to accommodate for this; ideally we want
+min latency and max throughput on the direct ports, letting the axi bus also access L2C
+(for dma or inhibited accesses to l2c)."*
+
+**Measured starting point, from the RTL:**
+
+- **No banking.** `grep -c bank rtl/soc/l2c_data.v` = **0**. 2 MB / 8-way / 4096 sets sits
+  behind ONE lookup pipeline.
+- **A global accept gate**: `accept_slot_c = pipe_adv_c && !rr_busy_c && !rr_start_c`
+  (`l2c_ctrl.v:745`). While that refill machine is busy the L2 accepts **nothing, from any
+  port** — so one requester's miss stalls another requester's **hit**.
+- 8 MSHRs + up to 4 same-line secondary merges each (32 in flight) already exist and are
+  reachable in principle — the D side delivers **1**.
+
+**So the three things a redesign needs, in dependency order:**
+
+1. **Bank by set index.** Independent-set accesses proceed in parallel. This is the
+   throughput lever and it is entirely absent today.
+2. **Per-port priority**, so a direct (hot) port is not queued behind DMA on the cold path.
+   Latency on the hot ports is the goal; the cold path is explicitly allowed to be slower.
+3. **Decouple the accept gate** so a refill in flight does not block an unrelated hit. This
+   is the single change most likely to deliver "min latency" on its own.
+
+⭐ **DMA reaching L2C is a COHERENCY REQUIREMENT, not a convenience.** If DMA wrote around
+the cache the CPU would read stale lines. That is an independent reason the cold path must
+terminate **at** the L2 rather than beside it, and it means the cold path can never simply
+be deleted in favour of two direct ports.
+
+⚠️ **Scale.** This is the L2's core datapath, in the SoC repo, alongside a core-side
+cacheability demux and a new `d_axi_*` interface — a coordinated two-repo change. **Size it
+before committing**, and note the standing local lesson: a transaction-count model
+overpredicted a D-side lever by **8x** on this very loop, because it priced a transaction at
+~16 cycles when one costs ~2. Price from measured per-operation costs.
+
 ## Future: the cold path as a 68040-style bus
 
 Once the cold path carries only device traffic, converting it from AXI to a **native
