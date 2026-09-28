@@ -65,11 +65,43 @@ consistent with `200mhz-closed-fullcore` (80.4% wire).
    issue select -- the exact structure on the far end of `doFlushReg`'s 4 tightest
    paths. Shipping it into a 0.000 ns design will not close unless it stays off those
    nets. Price it against THIS tail, not against an area number.
-3. **One path looks spurious and is worth a look on its own merits:**
-   `GsharePlugin pht_spinal_port4_reg[1]` -> `IcachePlugin mshrPa_*_reg[*]/CE`, five
-   times. There is no plausible dataflow from a PHT read port to an I-cache MSHR
-   address's clock enable. That smells like a shared/merged enable term coupling two
-   unrelated structures. If it is spurious, breaking it is free fmax.
+3. **CORRECTION -- the Gshare -> `mshrPa/CE` path is NOT spurious.** I first read it as
+   a merged enable term coupling two unrelated structures. It is real dataflow, and the
+   tree already documents it: `FetchAlignPlugin.scala:55-100` records the frontend's
+   longest cone as
+
+       ftbBlocked -> applyNow -> live ITLB CAM/permission -> L1I cacheability
+                  -> speculative prefetch installer control
+                  -> mshrPa -> IcachePlugin_logic_pfNextPa_reg[*]/CE
+
+   and calls that tail "pre-existing and structural". `mshrPa_{2,3}` are the *prefetch*
+   slots (`mshrPa(pfFreeMshr)`, `IcachePlugin.scala:2346`), so their CE is the
+   prefetch-ALLOCATE enable, a six-way conjunction:
+
+       pfWindowHasCandidate && !anyInvalidate && !demandFillStart
+         && !pfWindowUpdate && !demandStuckQ && !s0KillsWindowQ    ... then pfHasFree
+
+   with `s0KillsWindowQ = s0Valid && !s0Replay && (s0Fault || !s0Cacheable)` dragging
+   the ITLB/cacheability cone in. Gshare reaches it through the prediction that forms
+   the fetch window. There is no free win from "unhooking" anything.
+
+### The lever this actually exposes: RETIME THE PREFETCH ALLOCATE ENABLE
+
+The prefetch allocate is the one consumer in that cone where **a cycle of latency is
+free by construction** -- a prefetch issued one cycle later is still a prefetch, and
+nothing architectural observes when it was allocated. That is a strictly stronger
+version of the argument this tree has already used twice, for `quiesce` and for
+`icMaintFlush` (`FetchAlignPlugin.scala:55-100`: "WHY ONE CYCLE OF LATENCY IS FREE").
+
+Cost: registering the conjunction is a handful of flops and no logic levels.
+Prize: it removes 5 of the ~110 sub-0.020 ns paths, and it is the *only* hub in the
+table whose consumer is provably latency-tolerant -- `doFlushReg`, the exception FSM
+and `missCmode` are all correctness-critical arms that cannot simply be delayed.
+
+⚠️ The one thing to check: the elsewhen chain at `IcachePlugin.scala:2329-2350` also
+advances `pfNextPa` on the non-allocating arms, so the retime must move **all** the
+arms together or the window walks out of step with the allocation -- the same
+"partial cut" trap the `icMaintFlush` note names as "the one thing NOT to do here".
 
 ## Falsifier for claim 1
 
