@@ -337,6 +337,53 @@ that the architecture says should not happen. The fast wide form does **not** re
 breaking conformance — a 16-byte-wide access with the existing cross-line split reproduces
 Musashi's exact semantics in 1 access (aligned) or 2 (misaligned) instead of 4.
 
+## ✅ LS-OoO ISSUE: +12.7% IPC, ATTRIBUTED — and the correctness fix is FREE
+
+Three-arm measurement, 34 kernels, two seeds, `IPC_V2=1`, all on one tree at one commit.
+
+| arm | cycles s1 / s7 | IPC |
+|---|---:|---:|
+| `off` | 616,383 / 616,792 | 0.441 / 0.440 |
+| `on-fixed` (occupancy barrier) | **546,950 / 547,253** | **0.497 / 0.496** |
+| `on-defect` (readiness barrier) | **546,950 / 547,253** | **0.497 / 0.496** |
+
+**−11.28% cycles, +12.7% IPC.** Per-kernel on seed 1: **16 of 33 improved >0.5%, ZERO
+regressed**, largest single kernel only 14.5% of the saving. The pre-registered structural
+prediction `off <= on-fixed` held on all 33.
+
+**The instrument validated itself before being trusted.** `IQ_HOL=1` only *prints* the
+`[ls-bypass]` counters (sampling is ungated, in the per-cycle loop), but that had to be
+proven rather than assumed: `off +HOL` reproduced **616,383 exactly** and `on-fixed +HOL`
+**546,950 exactly**, so the flag is provably print-only and its counters apply to the
+numbers above.
+
+### Attribution, from the counters
+
+- **`orderRedirects = 0` in every arm** ⇒ the P4 park and barrier recovery contributed
+  **nothing**. The gain is the relaxation itself, not the park.
+- **`relaxedSelectDifferedCycles = 33,588 across 22 of 34 kernels`** ⇒ the relaxed select
+  genuinely fired, heavily. This is not a lever that failed to engage.
+
+### ⛔ THE CORRECTNESS FIX COSTS EXACTLY ZERO — and the MOB is UNMEASURED, not zero
+
+`on-defect` and `on-fixed` are **bit-identical at both seeds**, and
+`relaxedSelectDifferedCycles` is **identical (33,588) in both arms**. Two conclusions, one
+of which is a non-result and must not be reported as one:
+
+1. ✅ **Occupancy costs nothing over readiness.** The barrier fix that closed all six corpus
+   reds is free. It also means the historical `+7.5%` / `−9.18%` / `−14.17%` figures were
+   **NOT inflated by the corrupting bypasses** — the defect bought no speed.
+2. ⛔ **The MOB's upper bound is UNMEASURED.** By the pre-registered coverage gate
+   `delta_k = relaxedSelectDifferedCycles(on-defect) − (on-fixed)`, a kernel with
+   `delta_k = 0` is **uninformative, not a null**. Here `delta_k = 0` on *every* kernel: the
+   specific convoy (unready LS -> ready non-`firstOfInstr` STORE -> ready LOAD) never occurs
+   in these 34 kernels, even though the general relaxation fires constantly. **An
+   unmeasurable upper bound is not a small one.**
+
+⚠️ Still unpriced: the barrier's recovery cost. `orderRedirects = 0` means these kernels
+never exercise it, so the only number in existence remains ~20.9 cycles x N on a
+device-polling microprogram.
+
 ## ⛔ THE TWO D-SIDE BANDWIDTH LEVERS ARE SUB-ADDITIVE — NEVER SUM THEM
 
 Measured 2x2, `memcpy-16k`, `IPC_MEM=l2:5:60:4096` (`863b45cb`):
