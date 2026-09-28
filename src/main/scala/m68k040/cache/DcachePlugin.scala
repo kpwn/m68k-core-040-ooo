@@ -1078,17 +1078,35 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // such a 1-in-2^21 coincidence is CORRECT, merely less eager -- one sector is
     // filled and the line's other three stay invalid until they are demanded.
     //
-    // `OHMasking.first` rather than `OHToUInt`: a multi-hot TAG match is possible for
-    // the same reason `ldS1MultiHot` exists, and unlike the hit path this vector feeds
-    // a WAY SELECT for an array write, where an OR-ed index would corrupt an unrelated
-    // way. First-match is arbitrary but always a way that genuinely holds the tag.
+    // ⛔ `exactlyOne`, NOT `orR` -- A MULTI-HOT TAG MATCH MUST NOT BE A SECTOR MISS, and
+    // getting this wrong is a SILENT WRONG-DATA BUG rather than a performance detail.
+    //
+    // MEASURED, by `DcacheMultiHotFailSafeSpec`'s "the purge spares a DIRTY matching way"
+    // against the first version of this code: the load returned 0x23282d32 where
+    // 0xcafebabe had been committed -- the SAME wrong value, from the SAME test, that
+    // `missMultiHot`'s declaration records from when fill-forward was unconditional.
+    //
+    // WHY. When two ways hold the same tag, the duplicate purge deliberately SPARES a
+    // DIRTY matching way (clearing it "would turn a read-side glitch into permanent,
+    // silent WRITE-side data loss"), so that way can hold the only copy of a committed
+    // store. `orR` made such a miss a SECTOR miss -- whose entire purpose is to allocate
+    // into a way that already holds the tag -- so the refill overwrote the spared dirty
+    // duplicate with memory's stale bytes and the store was gone. Picking the way with
+    // `OHMasking.first` does NOT help: first-match is still one of the duplicates, and
+    // which one is arbitrary.
+    //
+    // With `exactlyOne` a multi-hot falls through to the ordinary LINE-miss path -- the
+    // round-robin victim, the `missMultiHot` fill-forward carve-out and the `dupPurgeFire`
+    // repair -- exactly as it did before this slice. The single-tag-match case, the only
+    // one where "this way already holds this line" is actually true, is unaffected, so
+    // `OHToUInt` is now safe here for the same reason it is safe for `ldS1HitWay`.
     val (ldS1SectorMiss, ldS1SectorWay): (Bool, UInt) =
       if (!sectored) (null, null)
       else {
         val v = Vec(Bool(), ways)
         for (w <- 0 until ways) v(w) := ldS1Cacheable && (rdTag(w) === ldS1Tag)
         v.simPublic()
-        (v.asBits.orR, OHToUInt(OHMasking.first(v.asBits)))
+        (OneHotSafe.exactlyOne(v), OHToUInt(v))
       }
     // DEBUG (task #189 investigation, temporary): sim-only visibility.
     ldS1Valid.simPublic(); ldS1Set.simPublic(); ldS1Tag.simPublic(); ldS1Off.simPublic()
@@ -1998,15 +2016,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // MISS, which takes the write-allocate / write-through miss path; unlike the load
     // and fetch sides that path always COMPLETES on the bus, so it cannot livelock
     // even before the purge below.
-    // Slice `D3-BURST`: the store-side twin of `ldS1TagHitVec` -- see there for why a
-    // tag-matching miss must fill one sector and evict nothing.
+    // Slice `D3-BURST`: the store-side twin -- see the load side for why a tag-matching
+    // miss fills one sector and evicts nothing, and for why this is `exactlyOne` and NOT
+    // `orR` (a multi-hot tag match allocating into a spared DIRTY duplicate way is a
+    // silent lost store, measured by `DcacheMultiHotFailSafeSpec`).
     val (stS2SectorMiss, stS2SectorWay): (Bool, UInt) =
       if (!sectored) (null, null)
       else {
         val v = Vec(Bool(), ways)
         for (w <- 0 until ways) v(w) := rdTag(w) === stS2Tag
         v.simPublic()
-        (v.asBits.orR, OHToUInt(OHMasking.first(v.asBits)))
+        (OneHotSafe.exactlyOne(v), OHToUInt(v))
       }
     val stS2MultiHot  = OneHotSafe.multiHot(stS2HitVec)
     val stS2HitAny    = OneHotSafe.exactlyOne(stS2HitVec)

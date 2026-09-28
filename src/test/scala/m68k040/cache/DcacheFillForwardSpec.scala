@@ -37,7 +37,18 @@ class DcacheFillForwardSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
     val xlate   = new DIdentityTranslationPlugin
-    val dcache  = new DcachePlugin(fillForward = fillForward)
+    // `sectored = false` PINNED EXPLICITLY, per `ShippingCoreConfig`'s own rule that a
+    // test must vary what it varies BY NAME and never by diverging from the shipping
+    // values. This spec asserts EXACT cycle counts (OFF = 3, ON = 1) derived from a
+    // SINGLE-BEAT refill: at a 16-byte line the one R beat is the whole line, so
+    // "R beat -> response" is the post-data overhead and nothing else. Under slice
+    // `D3-BURST` a line miss is a 4-beat burst and the first R beat is up to three beats
+    // before the demanded sector's, so the same interval measures the burst as well
+    // (observed: 18 cycles, not 3). That is not a regression in fill-forward -- it is a
+    // different quantity. Sectored fill-forward correctness has its own coverage in
+    // `DcacheSectorSpec` ("returns the DEMANDED sector's bytes, from every one of the
+    // four beat positions"), which is the property that actually matters there.
+    val dcache  = new DcachePlugin(fillForward = fillForward, sectored = false)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl)) }
