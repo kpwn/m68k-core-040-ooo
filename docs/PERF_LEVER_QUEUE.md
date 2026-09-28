@@ -373,7 +373,11 @@ of which is a non-result and must not be reported as one:
 1. ✅ **Occupancy costs nothing over readiness.** The barrier fix that closed all six corpus
    reds is free. It also means the historical `+7.5%` / `−9.18%` / `−14.17%` figures were
    **NOT inflated by the corrupting bypasses** — the defect bought no speed.
-2. ⛔ **The MOB's upper bound is UNMEASURED.** By the pre-registered coverage gate
+2. ⛔ **The MOB's upper bound is UNMEASURED — and the three arms bracket the WRONG SET.**
+   `on-defect` and `on-fixed` differ *only* for a store that is **ready but withheld** by
+   `intraMacroOk`; they treat an **unready** store **identically** (both block). The MOB's
+   market is precisely the *unready* store — the unresolved address. So this experiment
+   says nothing about disambiguation, whatever it measures. By the pre-registered gate
    `delta_k = relaxedSelectDifferedCycles(on-defect) − (on-fixed)`, a kernel with
    `delta_k = 0` is **uninformative, not a null**. Here `delta_k = 0` on *every* kernel: the
    specific convoy (unready LS -> ready non-`firstOfInstr` STORE -> ready LOAD) never occurs
@@ -412,6 +416,30 @@ not quote 26.8% as the expected gain — it is the ceiling.
 ✅ **And the M68040 UM says `MOVE16` must not allocate anyway** (§4.3.3), so for the MOVE16
 path this is a **conformance fix that happens to be the largest bandwidth lever measured** —
 our MOVE16 currently allocates and write-allocates, which documented silicon does not.
+
+## ⛔ THE "7% vs 70%" MOB MARKET: BOTH FIGURES WERE MISAPPLIED — the answer is a BOUND
+
+Two numbers for the same population disagreed by 10x. Neither was wrong as measured; both
+were used for something they do not measure.
+
+- **~7% is a SINGLE-KERNEL figure generalised to a corpus.** 1,535 of 22,999 cycles with a
+  store at the head, measured on one calibrated Dhrystone kernel, was used to argue the MOB
+  is the wrong build corpus-wide. Withdrawn by its own author.
+- **70% is a CATEGORY ERROR (mine).** `oldestStoreUnready` counts "the oldest LS slot is an
+  unready store" **regardless of whether a younger ready load is blocked**. Dividing it by
+  `youngerReadyLoadBlocked` divides two different predicates.
+
+**No counter reports the intersection**, so today it can only be BOUNDED:
+
+| arm | `oldestUnready` | `oldestStoreUnready` | `youngerReadyLoadBlocked` | intersection |
+|---|---:|---:|---:|---|
+| `off` | 440,366 | 184,308 | 352,419 | **[96,361 … 184,308] = 27.3–52.3%** |
+| `on-fixed` | 380,077 | 134,298 | 191,933 | [0 … 134,298] = 0–70% |
+
+✅ **The `off` arm's hard LOWER bound of ≥27.3% already refutes ~7% as a corpus figure.**
+Settling it exactly needs one extra term in the `[ls-order-window]` histogram tuple —
+sim-only, no RTL. (Deliberately not added mid-flight: a harness recompile between arms
+would have built one arm against a different harness than its own controls.)
 
 ## ⛔ THE TWO D-SIDE BANDWIDTH LEVERS ARE SUB-ADDITIVE — NEVER SUM THEM
 
