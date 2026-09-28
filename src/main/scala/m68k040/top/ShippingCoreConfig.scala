@@ -275,6 +275,25 @@ object ShippingCoreConfig {
   val deferSlot1Uncond: Boolean =
     envFlag("CPU_DEFER_SLOT1_UNCOND", false)
 
+  /** Front-end: DEFER a slot-1 `DBcc` -- the 68k loop-closing branch -- so it becomes
+    * slot 0 next cycle, where the BTB (whose `brType=0` is literally "Bcc/DBcc") can
+    * predict it. See `FetchAlignPlugin.deferSlot1Dbcc`.
+    *
+    * OFF BY DEFAULT, pending a measurement. This is the hole `deferSlot1Uncond` leaves:
+    * DBcc is line-5, so neither the line-6 unconditional predicate nor the line-6
+    * conditional one matches it, and it is not JSR/JMP/RTS/RTR either. A slot-1 DBcc is
+    * predicted by NOTHING and falls through -- on a loop that should have been taken.
+    * ROM census: DBcc is 3.41% of control-transfer-shaped words STATICALLY, and a
+    * loop-closing branch executes once per iteration.
+    *
+    * DBT is excluded in the predicate: it never loops, so deferring it costs an issue
+    * slot for no prediction. Same reason RTD/RTE stay out of `deferSlot1Uncond`.
+    *
+    * Enable at generation time with `CPU_DEFER_SLOT1_DBCC=1`; echoed in
+    * `SHIPPING_CONFIG`. */
+  val deferSlot1Dbcc: Boolean =
+    envFlag("CPU_DEFER_SLOT1_DBCC", false)
+
   // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
   // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
   //

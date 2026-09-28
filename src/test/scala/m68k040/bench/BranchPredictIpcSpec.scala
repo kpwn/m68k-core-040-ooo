@@ -45,7 +45,13 @@ class BranchPredictIpcSpec extends CoreBenchHarness {
       kBrReturn(depth = 24, iters = 128),
       kBrReturn(depth = 8, iters = 384, label = "br-ras-fit"),
       // gshare direction: a period-32 pattern a bimodal counter cannot learn.
-      kBrPattern(iters = 1024))
+      kBrPattern(iters = 1024),
+      // DBcc in SLOT 1: the canonical `add ; dbra` counted loop. Predicted by nothing
+      // until `deferSlot1Dbcc` moves it to slot 0.
+      kBrDbcc(iters = 1024),
+      // ...and the TWO-branches-per-window case the FTB cannot cover, which is the
+      // only place a DBcc actually reaches slot 1 unpredicted.
+      kBrDbccPair(iters = 1024))
     // The kernels the IPC brief asks to report, so the probes are read next to the
     // workload-shaped numbers rather than in isolation.
     val reference = Seq(kBranchy, kHotLoop, kCallReturn, kDhrystone(copyback = true))
@@ -55,7 +61,8 @@ class BranchPredictIpcSpec extends CoreBenchHarness {
     // `M68kSim` build each, so the only difference is that flag.
     val computeOn = sys.env.get("BR_COMPUTE_TARGETS").contains("1")
     val deferOn   = sys.env.get("BR_DEFER_SLOT1_UNCOND").contains("1")
-    println(s"  BRANCH_PROBE_CONFIG computeDirectTargets=$computeOn deferSlot1Uncond=$deferOn")
+    val dbccOn    = sys.env.get("BR_DEFER_SLOT1_DBCC").contains("1")
+    println(s"  BRANCH_PROBE_CONFIG computeDirectTargets=$computeOn deferSlot1Uncond=$deferOn deferSlot1Dbcc=$dbccOn")
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(
       alignedLoadFallThrough = true, earlyLsIntWakeup = true, sqSubwordForwarding = true,
       pairCorrectBranch = true, retainRedirectHistory = true, trainSlot1Conditional = true,
@@ -70,12 +77,13 @@ class BranchPredictIpcSpec extends CoreBenchHarness {
       earlyStoreAddress = true, fuseLongMoveLoads = true, reserveLateStore = true,
       detachLateStore = true, forwardOnPublish = true, earlyLsNzvcWakeup = true,
       detachedStoreEntries = 4, earlyAutoStoreAddress = true, earlyStoreDataWake = true,
-      computeDirectTargets = computeOn, deferSlot1Uncond = deferOn))
+      computeDirectTargets = computeOn, deferSlot1Uncond = deferOn,
+      deferSlot1Dbcc = dbccOn))
 
     val results = (probes ++ reference).map(k => k.name -> runKernel(compiled, k))
     println()
     println("=" * 88)
-    println(s"  branch-prediction probes, computeDirectTargets=$computeOn deferSlot1Uncond=$deferOn")
+    println(s"  branch-prediction probes, computeDirectTargets=$computeOn deferSlot1Uncond=$deferOn deferSlot1Dbcc=$dbccOn")
     println("  see the [br-attr] lines above for the per-bucket attribution")
     println("=" * 88)
     println(f"${"kernel"}%-18s ${"retired"}%8s ${"cycles"}%8s ${"IPC"}%7s")

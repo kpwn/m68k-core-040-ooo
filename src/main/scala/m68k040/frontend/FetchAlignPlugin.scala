@@ -37,7 +37,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        trainSlot1Conditional: Boolean = false,
                        deferTakenSlot1Conditional: Boolean = false,
                        computeDirectTargets: Boolean = false,
-                       deferSlot1Uncond: Boolean = false)
+                       deferSlot1Uncond: Boolean = false,
+                       deferSlot1Dbcc: Boolean = false)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -1344,6 +1345,40 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       else False
     spinal.core.sim.SimPublic(slot0ComputedPred, slot1WouldUncond, s0RelTarget)
 
+    // ── SLOT-1 DBcc COVERAGE ────────────────────────────────────────────────────
+    // DBcc is the 68k loop-closing instruction and NONE of the predicates above match
+    // it: it is line-5, so `s1RelIsUncond` (line-6) misses it, `slot1IsConditional`
+    // (line-6, cond>=2) misses it, and it is neither JSR/JMP nor RTS/RTR. A DBcc in
+    // slot 1 therefore emits with NO prediction from anywhere and falls through --
+    // mispredicting on every iteration it should have looped. Only `slot1WouldFtq` can
+    // catch it, and then only by luck of window placement.
+    //
+    // ROM census (420DBFF3, whole image): DBcc is 3.41% of control-transfer-shaped
+    // words. That STATIC share understates it badly -- a loop-closing branch executes
+    // once per ITERATION, so its dynamic weight is a multiple of its static count.
+    //
+    // ⛔ `DBT` IS EXCLUDED, and that exclusion is the whole subtlety. DBcc semantics are
+    // "if cc TRUE -> fall through WITHOUT decrementing; else decrement and branch while
+    // Dn != -1". So DBT (cond 0000, condition always true) NEVER loops -- it is an
+    // unconditional fall-through. Deferring it would cost an issue slot and buy exactly
+    // nothing. Same trap keeps RTD/RTE out of `slot1WouldUncond`: slot 0 has no
+    // predictor for those either (`s0IsReturn` is RTS||RTR only), so deferring them
+    // pays a cycle for no prediction. DBF/DBRA (cond 0001) is 78.8% of ROM DBcc and is
+    // the pure counted loop -- outcome depends on the counter alone.
+    //
+    // Affordability is the threshold `slot1WouldUncond` already argues: deferral costs
+    // ONE fetch cycle against a ~13-cycle commit-time refill, so it pays whenever the
+    // branch is taken more than ~1/13 of the time. A counted loop of N iterations is
+    // taken (N-1)/N -- at least 50% for any loop that loops at all.
+    val s1IsDbccOp = (s1op(15 downto 12) === B"4'h5") && (s1op(7 downto 3) === B"5'b11001")
+    val s1IsDbt    = s1op(11 downto 8) === B"4'h0"
+    val slot1WouldDbcc = if (deferSlot1Dbcc)
+        s1IsDbccOp && !s1IsDbt &&
+        res.slot1Valid && res.slot1.simple &&
+        res.slot0Valid && !slot0IsPred && !rasPredictSlot0 && !slot0ComputedPred
+      else False
+    spinal.core.sim.SimPublic(slot1WouldDbcc)
+
     val slot0Predicted    = slot0IsPred || rasPredictSlot0 || slot0ComputedPred
     // ── ONE slot-1 suppression predicate ────────────────────────────────────────
     // Suppressing slot1 has TWO obligations that must never disagree: drop it from the
@@ -1355,7 +1390,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // `d0 = 0` instead of 1024. The `effShift` comment had warned about exactly this.
     // So the predicate is defined ONCE, here, and both consumers read it.
     val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
-                        slot1WouldFtq || slot1WouldUncond || ftqConfirm
+                        slot1WouldFtq || slot1WouldUncond || slot1WouldDbcc || ftqConfirm
     val predictedThisEmit = slot0Predicted && !ftqConfirm
     val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget,
                             Mux(slot0ComputedPred, s0RelTarget, btbPredTarget0))
