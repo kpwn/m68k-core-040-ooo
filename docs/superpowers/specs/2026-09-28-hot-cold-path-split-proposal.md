@@ -86,9 +86,32 @@ command (`DcacheTypes.scala:93/112/127`), so the information is present — but 
    genuinely needs MMIO, so it cannot take that route — work out the equivalent invariant.
 4. **Boot / pre-MMU.** Before `TC.E` and the TTRs are armed, what is the routing default?
    (See the TC.E-arm entry in the MMU defect family.)
-5. **Does the I side need a cold path at all?** Today `iFetchCanReachMmio = false` forbids
-   it outright and ROM-mirror fetches are folded onto the direct port. Symmetry is elegant;
-   whether it is *needed* is unestablished. Do not build it on aesthetics.
+5. **Does the I side need a cold path at all? — ANSWERED: yes, but for DeclROMs, and NOT
+   out of the box.** (Owner, 2026-09-28: *"it would be good to provide a cold path for
+   declroms to I side but it may not be needed out of the box."*)
+
+   NuBus declaration ROMs contain `sExec` blocks the Slot Manager **executes**, in
+   uncacheable slot space — which is exactly what `iFetchCanReachMmio = false` forbids.
+
+   ⭐ **The key insight is why that guard exists.** `ifetch_window_guard.v` was added
+   2026-09-09 because **the hot path has NO address decode**: `l2c` forwards
+   `f_axi_araddr` with no window check and the DDR side serves `addr mod 64 MB`, so a ROM
+   slot-scan fetch to NuBus `0xFB0493AA` returned memory-test filler **and the CPU executed
+   it** — the root of the odd-SSP / store-at-0 / vector-table crash family
+   ([[ifetch-window-guard-fix-2026-09-09]]). The guard converts out-of-window fetches to a
+   local DECERR, and its own note records the intent: *"the ROM's slot scan now takes bus
+   errors in the first seconds (a real Q700 does), no execution in slot space."*
+
+   **The crossbar HAS the decode the hot path lacks.** So an I-side cold path does not
+   weaken the guard — it makes the decision **per-slot instead of blanket**: an empty slot
+   still DECERRs (correct, and what real hardware does), while a slot with a card present
+   becomes fetchable.
+
+   ⛔ **Therefore: build it when there is a consumer, not before.** With no NuBus cards
+   emulated, every slot fetch *should* DECERR, which the guard already does, more cheaply
+   and with no new port. The I cold path is an **enabler for emulated cards with DeclROMs**,
+   not a fix for anything currently broken — and `iFetchCanReachMmio` must flip in the same
+   change, never independently.
 
 ## Future: the cold path as a 68040-style bus
 
