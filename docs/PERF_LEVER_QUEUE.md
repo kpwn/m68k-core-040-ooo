@@ -501,6 +501,43 @@ one way this could still die like the dead stride prefetcher at 206% of bus, and
    `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
    `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
 
+## ⛔⛔ D-SIDE READ TRAFFIC HALVED, BANDWIDTH MOVED 3.66% — the loop is NOT traffic-bound
+
+No-write-allocate stage 1 (`perf/dside-mshr2` `fdb80094`), `IPC_MEM=l2:5:60:4096`,
+**`IPC_MEM_XBAR=1`** (today's fabric), zero new flop bits:
+
+| | cycles s1 / s17 | copy-B/cyc | cyc/line |
+|---|---|---:|---:|
+| OFF | 149,794 / 149,825 | 0.3281 | 48.76 |
+| **ON** | 144,521 / 144,583 | **0.3401 / 0.3400** | **47.04** |
+
+**+3.66%**, against a recorded prediction of +13..25% — the falsifier fired, marginally.
+
+**The mechanism is confirmed EXACTLY, which is what makes the shortfall the real result:**
+
+- **L2 reads 8,197 -> 4,102 — HALVED.** The write-allocate fill is gone.
+- store `s3Hit` **12,288 -> 0** — lines are never allocated, as intended.
+- `drainBlockedCyc` 113,161 -> 60,350 — **−47%**; the barriers genuinely went away.
+- `oldestUnready` **−5,242 = the ENTIRE cycle delta.** Retired counts identical.
+
+⛔ **So: half the D-side read traffic removed bought 3.66%.** Together with lever 17's
+**−0.72%** for removing the writeback serialisation, **two independent measurements now
+agree that at 16-byte lines this loop is NOT memory-TRAFFIC bound.** `oldestUnready` is
+**83% of cycles** — load-side latency plus ~6 instructions per line at 47 cycles.
+
+🎯 **8 B/cycle is NOT reachable by removing memory operations.** It needs **load-side MLP**
+(`N_MSHR > 1` behind the direct L2 port) **and more bytes per instruction**.
+
+**Price the next D-side lever against `oldestUnready`, NOT against transaction count** —
+that is the same trap that cost lever 16 an 8x error, one level up.
+
+✅ Corroborating evidence the bus has headroom: stage 1 trades 1 fill + 1 writeback for
+**FOUR partial write-throughs** — *twice* the transactions — and is still 3.66% faster.
+
+⚠️ Counter artifact: `[store-path] miss=` reads `storeMissDiscovered`, hardwired False on
+this path. **`miss=0` means "no write-allocate started", NOT "no store missed"** — `s3Hit=0`
+is the honest column.
+
 ## ⛔ THE "7% vs 70%" MOB MARKET: BOTH FIGURES WERE MISAPPLIED — the answer is a BOUND
 
 Two numbers for the same population disagreed by 10x. Neither was wrong as measured; both
