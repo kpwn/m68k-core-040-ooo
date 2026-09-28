@@ -501,6 +501,62 @@ one way this could still die like the dead stride prefetcher at 206% of bus, and
    `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
    `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
 
+## ⛔⛔ THE BENCH CANNOT DETECT WRONG DATA — 1 of 16 kernels checks its result
+
+Found while auditing a suspicious win. `CoreBenchHarness` asserts only
+`handle.result.size >= n` — **"at least n macros retired"** — and **exactly ONE of sixteen
+kernels defines `verifyRetirement`** (`kMemcpy`). **Every Dhrystone `-cb` variant is
+measured with no data check whatsoever.**
+
+So an IPC number from this bench says the machine *retired enough instructions*, not that it
+**computed the right answer**. Every cycle result in this document rests on that, and the
+lock-step and ported-corpus suites — which *do* check state against Musashi — are the only
+instruments that can judge correctness.
+
+### The win that exposed it, and why it is still not proven
+
+No-write-allocate's **locality control fired exactly as predicted**: every `-cb` Dhrystone
+variant got *faster* from **losing** write-allocate —
+
+| kernel | delta |
+|---|---:|
+| `same-line-copyback` | **−12.22%** |
+| `load/store` | **−7.16%** |
+| `byteLdIncX4-cb` / `byteStIncX4-cb` / `byteX4-cb` / `byteDispX4-cb` | −5.36 / −5.26 / −5.25 / −5.23% |
+| `dhrystone-x0-cb` | −4.85% |
+| `call-return` | **+2.86%** (worst regression) |
+
+✅ **Negative control passes**: `chase-pure`, `deep-backlog`, `hot-loop`, `shift-mixed`,
+`shift-stream`, `dhrystone-x0-nocopy` and `-nocopy-cb` are **all exactly ±0.00%** — seven
+kernels with no COPYBACK store miss, provably inert.
+
+### ⛔ AND THE NEW HAZARD TEST WENT GREEN VACUOUSLY
+
+`DcacheNoWriteAllocateSpec` (store -> load the same line, gaps 0/2/20) passed **3/3, 12/12
+pairs correct** — and then the author asked what would have made it red. **Nothing could.**
+`AxiMemModel` holds a deliberate **WRITE-BEFORE-B** invariant: *"the bytes are applied to
+`mem` at the moment a W beat is paired with its AW … latency applies to WHEN B IS DRIVEN,
+never to when the bytes land"* — precisely so the harness cannot invent a store->load race.
+
+**In sim a later read ALWAYS sees the store, so the read-overtakes-write hazard is
+unreachable and the green clears nothing.** Resolved in both directions: **in sim the ~5% is
+real** (corruption cannot be the mechanism), and **on silicon it is unsafe until the RAW
+guard exists**, which no sim result can establish. Flag stays OFF.
+
+### 🎯 THE RULE, now with both halves
+
+> **An instrument must be shown to have EMITTED — and a green test must be shown to have
+> been CAPABLE OF FAILING.**
+>
+> Ask *"what would have made this red?"* before citing it. If the answer is **"nothing in
+> this harness"**, it is documentation, not evidence.
+
+Five instances now: `MissInjector.report()` uncalled from `MemcpyBandwidthSpec`; the
+`[ls-bypass]` counters behind an unset `IQ_HOL` print gate; `comm` failing under locale
+collation and printing an empty section; a CINVL mutation that failed to fail; and this.
+**All present as a null or a pass — the most expensive disguise, because both are normally
+believed.**
+
 ## ⛔⛔ D-SIDE READ TRAFFIC HALVED, BANDWIDTH MOVED 3.66% — the loop is NOT traffic-bound
 
 No-write-allocate stage 1 (`perf/dside-mshr2` `fdb80094`), `IPC_MEM=l2:5:60:4096`,
