@@ -501,6 +501,66 @@ one way this could still die like the dead stride prefetcher at 206% of bus, and
    `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
    `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
 
+## ✅ INTEGRATION MERGE COMPLETE AND RE-GATED — `integ/all-shippable` `c4ed1fc7`
+
+Combined IPC **−13.63% / −13.36% cycles** (seeds 1/17, cycle-weighted, 34 kernels). **Not
+the sum of the parts** — LS-OoO +12.7%, sectored +8.56% and the branch flags' +3.06% silicon
+would predict >25%. Best kernels: `byteAbs-cb` −38.9%, `byteSplit-cb` −36.0%,
+`dhrystone-x0-cb` −15.3%, `chase-pure` −12.5%.
+
+| gate | pre-merge | merged | verdict |
+|---|---|---|---|
+| `test-fast` | 396/0/2 | **400/0/2** | +4, **explained by NAME** |
+| ported corpus | 1010 / 12 | 1010 / 12 | **identical name-for-name**, 0 new, 0 lost |
+| `ExecuteLockStepSpec` | 679/12/1 | 691/12/1 | same 12 reds, **+12 new tests all pass** |
+
+The +4 is exactly `DebugRingAtomicitySpec` x2, `PerfCounterSpec` class counters and
+`RobPluginSpec`'s one-event `debugBranchRetire`; the other 6 new tests are Verilator-tagged,
+which is why it is 400 and not 406. D-side 2x2 re-measured on the merged tree: every cell
+**within 0.2 pp** of its recorded value, sub-additivity intact.
+
+### ⛔ FIFTH INSTANCE of "the shipping config is not the tested config" — caught in the merge
+
+**16 `SHIPPING_CONFIG` fields, every one round-tripped** (generated twice, provenance line
+*and* netlist diffed structurally). Three findings:
+
+1. **`dcacheHitUnderMissRead` had TWO env names** — `CPU_DCACHE_HUM_READ` on HEAD and
+   `CPU_DCACHE_HIT_UNDER_MISS_READ` on all-gated. **Picking a side would have made the other
+   a silent no-op.** Both are now read; they produce byte-identical netlists.
+2. **Three flags were in `ShippingCoreConfig` but NOT in the print** — `SQ_DEPTH`,
+   `SQ_NARROW_MERGE`, and the serious one: **`DBG_IC_PREFETCH_DISABLE`**, read directly by
+   `IcachePlugin`, flipping a `RegInit` reset value `1'b1`->`1'b0`. **A real netlist change,
+   on a feature that is ON and worth a board-measured +2.6%, producing a diagnostic bitstream
+   INDISTINGUISHABLE FROM A SHIPPING ONE IN ITS OWN LOG.**
+3. ✅ A typo now **hard-errors** (`CPU_DEFER_SLOT1_DBCC=ture` raises, rather than silently
+   yielding a baseline).
+
+Default-OFF verified structurally: `slot0ComputedPred`, `slot1WouldUncond` and
+`slot1WouldDbcc` are all hard-wired `1'b0` in the default netlist. Default-build cost
+**+930 flop bits, +8,690 wire bits, 0 new modules** — all of it all-gated's debug rings,
+class counters and I-prefetch CSRs.
+
+### ⛔ SIXTH VACUITY INSTANCE: a lever's headline gate said nothing about its own feature
+
+**`ItlbVictimSpec` is Verilator-tagged, so `test-fast` never exercises the ITLB victim
+buffer.** That branch's *"gated 396/396 both arms"* — which I relayed — was true and
+**uninformative about the feature it was gating**. It passes when run explicitly (3/3, both
+arms). Same class as the five above: **the instrument ran and told you nothing.**
+
+### ⚠️ ONE REAL REGRESSION, separated from two fake ones by a seed control
+
+- **`same-line-copyback` +6.7%** — reproduces on **both** seeds against only **−0.58%**
+  OFF-arm seed noise. **Real, and the one gate item not to ship past.** Note it is also the
+  kernel most sensitive to no-write-allocate (−12.22% there), so the two interact.
+- `load-stream` (+3.4%) and `load/store` (+1.8%) reproduce **in sign only**: their kernels
+  carry **+13.25%** and **+6.15%** seed noise in the OFF arm *against itself*. **Magnitudes
+  unresolvable — do not quote them.**
+
+⚠️ `IPC_MEM_XBAR` was **not** taken from `dside-mshr2`, so these numbers are on
+`crossbarSingleOutstanding=false` — the same instrument every prior figure in this lineage
+used, which is what makes them comparable, but **the realistic single-outstanding fabric is
+not covered**.
+
 ## ⛔⛔ THE BENCH CANNOT DETECT WRONG DATA — 1 of 16 kernels checks its result
 
 Found while auditing a suspicious win. `CoreBenchHarness` asserts only
