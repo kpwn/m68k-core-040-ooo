@@ -384,6 +384,35 @@ of which is a non-result and must not be reported as one:
 never exercise it, so the only number in existence remains ~20.9 cycles x N on a
 device-polling microprogram.
 
+## 🎯 NO-WRITE-ALLOCATE PRICED, NO RTL: the destination fill costs 9.7 cycles per line
+
+Measured with the one-access-per-line oracle (`kLineOneAccess` + `WriteAllocateSizeSpec`),
+same 16 KB footprint, `IPC_MEM=l2:5:60:4096`, `copybackDtt=true`:
+
+| kernel | per line | cyc/line s1 / s17 |
+|---|---|---:|
+| **load-only** `move.l (a0),d1` | 1 fill, 0 writeback | 11.024 / 11.015 |
+| **store-only** `move.l d0,(a0)` | 1 **write-allocate** fill, ~1 writeback | 20.710 / 20.745 |
+| **DELTA** | the destination-side cost | **9.686 / 9.730** |
+
+Seeds agree to **0.45%**. Both kernels retire an identical 12,300 instructions and make
+exactly **one access per 16-byte line**, so the difference isolates the destination side.
+
+**Against the loops that matter that is large:** 9.7 cycles is **26.8% of the 36.091-cycle
+`MOVE16` loop** and 21.5% of the 45-cycle sectored+fill-forward loop — bigger than sectored
+lines (+8.5%), fill-forward (+4.3%) and a wide `MOVE16` (+10.3%) individually.
+
+⚠️ **It is an UPPER BOUND, and the gap matters.** The delta contains the write-allocate fill
+**plus the writeback the dirtied line later causes**. A no-allocate store still has to get
+the data to memory, so it removes the fill and *some* of the writeback, not all of it. Do
+not quote 26.8% as the expected gain — it is the ceiling.
+
+⛔ **Do not sum it with the other D-side levers**, which are measured sub-additive.
+
+✅ **And the M68040 UM says `MOVE16` must not allocate anyway** (§4.3.3), so for the MOVE16
+path this is a **conformance fix that happens to be the largest bandwidth lever measured** —
+our MOVE16 currently allocates and write-allocates, which documented silicon does not.
+
 ## ⛔ THE TWO D-SIDE BANDWIDTH LEVERS ARE SUB-ADDITIVE — NEVER SUM THEM
 
 Measured 2x2, `memcpy-16k`, `IPC_MEM=l2:5:60:4096` (`863b45cb`):
