@@ -114,6 +114,12 @@ class IpcBenchSpec extends CoreBenchHarness {
         rasBranchRepair = sys.env.get("RAS_BRANCH_REPAIR").contains("1"),
         computeDirectTargets = sys.env.get("COMPUTE_DIRECT_TARGETS").contains("1"),
         deferSlot1Uncond = sys.env.get("DEFER_SLOT1_UNCOND").contains("1"),
+        // DEFER_SLOT1_DBCC=1 -- added by the integration merge. `perf/slot1-coverage`
+        // wired its lever into `BranchPredictIpcSpec` (as `BR_DEFER_SLOT1_DBCC`) only,
+        // so the COMBINATION could not be measured on the workload-shaped kernels at
+        // all: the one suite that runs `dhrystone`/`strcmp` had no way to turn it on.
+        // Default OFF, so an unset environment reproduces every earlier run exactly.
+        deferSlot1Dbcc = sys.env.get("DEFER_SLOT1_DBCC").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`
