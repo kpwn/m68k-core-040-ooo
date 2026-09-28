@@ -501,7 +501,15 @@ one way this could still die like the dead stride prefetcher at 206% of bus, and
    `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
    `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
 
-## ⛔⛔⛔ D-SIDE MLP IS CAPPED AT 1 BY THE ISSUE QUEUE — not the cache, not the fabric
+## ⛔ RETRACTED — "the issue queue caps MLP" was WRONG. See the 2x2 below.
+
+The section that follows is **superseded**. `lsBypassFired = 0` in **all four** arms of an
+issue-order x relaxation 2x2, with the knob verified plumbed — so the IQ relaxation never
+fired, and the cap is **downstream of the IQ**, in what the LS/D-cache path will serve
+during a refill. Retained because its measurement is sound and its *conclusion* is the
+instructive error.
+
+## ⛔⛔⛔ (SUPERSEDED) D-side MLP is capped at 1 by the issue queue
 
 **The D2 prize is 0.04% of cycles.** Measured with a no-RTL hook over six already-`simPublic`
 signals — `memcpy-16k`, `IPC_MEM=l2:5:60:4096`, **`IPC_MEM_XBAR=1`**, lever 1 ON — counting
@@ -567,6 +575,63 @@ with the flag ON before treating `N_MSHR > 1` or step 2's MLP case as dead.
 > **Check the MACHINE IS CONFIGURED TO EXHIBIT the shape before believing a null.**
 > A lever measured on a machine whose *other* flags forbid its mechanism reads as dead and
 > is not. Same disguise as a coverage hole, different cause.
+
+## 🎯🎯 INSTRUCTION ORDER IS WORTH +20.1% WITH ZERO HARDWARE — and the prize is MERGE, not MSHR
+
+2x2 over issue order x the LS-OoO relaxation, same 16 KB, same bytes, lever 1 ON:
+
+| arm | cycles | retired | refill cyc | probe MISS in refill | …**diff set** | `lsBypassFired` | copy-B/cyc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| interleaved `L,S,L,S` / in-order | 144,521 | 18,448 | 49,032 | 110 | 65 | 0 | 0.3401 |
+| interleaved / **LS-OoO** | 144,521 | 18,448 | 49,032 | 110 | 65 | **0** | 0.3401 |
+| **grouped `L,L,L,L,S,S,S,S`** / in-order | **120,337** | 30,736 | 49,102 | **44,442** | **0** | 0 | **0.4085** |
+| grouped / **LS-OoO** | 120,337 | 30,736 | 49,102 | 44,442 | 0 | **0** | 0.4085 |
+
+### ⛔ Why the IQ conclusion was wrong: the relaxation NEVER FIRED, in any arm
+
+`lsBypassFired = 0` everywhere, knob verified plumbed. **Two different reasons:**
+
+- **Interleaved — it CANNOT fire.** A load is eligible only when no strictly-older unready
+  **STORE** precedes it (`Mux(isStore, !olderUnreadyLs(i), !olderUnreadyStore(i))`), and
+  `L,S,L,S…` always has one. **The in-tree relaxation is load-behind-LOAD; a copy loop is
+  load-behind-STORE.** Load-passing-an-unready-store is memory **disambiguation** — the full
+  MOB, not the relaxation we have.
+- **Grouped — it NEED not fire.** The loads are all ready, so the IQ never blocks.
+
+### 🎯 (b) Order alone beats every D-side RTL lever built
+
+**0.3401 -> 0.4085 copy-B/cyc, +20.1%, zero hardware** — against no-write-allocate +3.7%,
+sectored lines +8.5%, fill-forward +4.3%, wide MOVE16 +10.3%. And it does that **while
+executing 67% MORE instructions** (10 per 16 B vs 6, because `move.l (a0)+,(a1)+` is one
+memory-to-memory instruction and splitting it costs two). **That gap is independent proof
+the interleaved loop is STALL-bound, not instruction-bound.** Data verified.
+
+### 🎯 (c) The customer is the SAME-LINE MERGE class — and it needs no SoC change
+
+In grouped order a younger load's probe has resolved and **missed on 44,442 of 49,102 refill
+cycles — 90.5%.** The probe queue is **full**, not empty. But **`diffSet = 0`**: every one is
+the **same line** already being fetched, because four grouped loads are consecutive longs
+inside one 16-byte line.
+
+So **`D3-SET` forbids 100% of them and a second MSHR has nothing to do even here.** They are
+exactly the **secondary-miss merge** (M1/M2/M3) — which requires **no second AXI
+transaction** and is **not contingent on the crossbar or the L2 port**.
+
+**Consequences:** steps 2 and 3 stay unjustified, but for a better reason — *the parallelism
+this machine can expose is same-line, and merging serves it for free*. Price next:
+**(i) secondary-miss merge, (ii) emitting the `L,L,S,S` shape** (MOVE16 coverage, or
+unrolling the copy paths) — **and only together**, since the merge has 110 customer-cycles on
+the interleaved order versus 90.5% of refill cycles on the grouped one. That is
+microcode/codegen, not RTL — and it is already why MOVE16's microcode is ~35% faster on the
+same eight accesses.
+
+### 🎯 THE RULE THIS ADDS
+
+> **Measure that the MECHANISM FIRED, not that the flag was set.**
+
+It caught the same agent twice: once when the flag was off, and again *inside the fix*, where
+the flag was on and the mechanism **still could not fire**. Only a `lsBypassFired` counter in
+the instrument revealed it.
 
 ## ✅ INTEGRATION MERGE COMPLETE AND RE-GATED — `integ/all-shippable` `c4ed1fc7`
 
