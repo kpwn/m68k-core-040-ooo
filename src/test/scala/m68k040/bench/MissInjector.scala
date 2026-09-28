@@ -1,0 +1,680 @@
+package m68k040.bench
+
+import spinal.core.sim._
+
+import java.security.MessageDigest
+import java.nio.file.{Files, Paths}
+
+import scala.collection.mutable
+
+/** SIM-ONLY cache-miss injection + memory-level-parallelism instrumentation.
+  *
+  * ── WHY ──────────────────────────────────────────────────────────────────────
+  * Every kernel in the IPC corpus is cache-RESIDENT. Measured, on this harness:
+  * `strcmp` takes ZERO D-cache misses; `dhrystone-x0-cb` takes ~1.2 D-misses and
+  * ~0.2 I-misses per thousand instructions. The BOARD, running a real OS
+  * workload, takes 24.4 D-misses and 32.2 I-misses per kilo-instruction -- about
+  * twenty times more. So hit-under-miss, speculative load wakeup, out-of-order
+  * load issue and prefetch all have nothing to work on in this bench, and every
+  * sim verdict on them is suspect in the same direction (understated).
+  *
+  * ── MECHANISM: A SIM-SIDE LINE STEALER, NOT AN RTL HIT-GATE ──────────────────
+  * There is deliberately NO RTL in this feature. Injection works by clearing the
+  * VALID bit of a resident line from the testbench, which is exactly what the
+  * architected CINV maintenance operation does. The next access to that line then
+  * takes an ORDINARY cold miss through the cache's own, already-proven miss path:
+  * no new hit-gate, no new refill mode, no new state, and nothing in the D-cache's
+  * or I-cache's critical cone. Two consequences matter:
+  *
+  *   1. ZERO SYNTH COST IS STRUCTURAL, NOT ARGUED. `src/main` is untouched, so the
+  *      emitted netlist is byte-identical by construction (see the report).
+  *   2. ARCHITECTURALLY INERT BY CONSTRUCTION. A line is stolen only when it is
+  *      VALID and CLEAN, so memory already holds exactly the bytes the cache held.
+  *      The refill returns the same data, later. DIRTY lines are never stolen --
+  *      stealing one would silently revert the store that dirtied it, which is the
+  *      bug this design avoids by never having the option.
+  *
+  * Timing of the steal is what makes the rate stable at ~100% of eligible accesses
+  * rather than alternating hit/miss. A demand miss ends with the cache RE-LAUNCHING
+  * the access against the freshly-installed line -- D-cache REPLAY, I-cache
+  * `s0Replay` -- so the FIRST S1 hit a line sees after a refill is that replay, not a
+  * new demand access. Stealing on every eligible S1 hit therefore leaves the line
+  * invalid again before the next real access arrives, and cannot livelock: the steal
+  * strictly FOLLOWS the hit that resolved the refill.
+  *
+  * ── SELECTION: ADDRESS HASH, NOT PER-ACCESS RNG ──────────────────────────────
+  * Eligibility is a pure function of the LINE address (plus a salt and an epoch),
+  * so within an epoch the same lines miss every time and a loop genuinely re-misses
+  * -- the behaviour a per-access coin flip cannot produce. The epoch term
+  * (`IPC_INJ_EPOCH` cycles, default 64) rotates WHICH lines are eligible over time.
+  * That is not cosmetic, it is what makes the knob usable at all. `load-stream`
+  * touches exactly TWO 16-byte lines, so a fixed hash quantises its achievable miss
+  * rate to 0%, 50% or 100% and nothing between -- MEASURED: with a 512-cycle epoch,
+  * requested 5%, 10% and 25% all produced byte-identical runs with ZERO steals, and
+  * 50% produced a tenth of the rate 100% did. A short epoch gives many independent
+  * draws per run, so the achieved rate converges on the requested one while the
+  * eligible subset still holds still for several loop iterations at a time.
+  *
+  * The epoch is therefore a MEASUREMENT parameter, not a detail: a run shorter than
+  * a few dozen epochs cannot deliver the requested rate, whatever it asks for. That
+  * is why the achieved rate is always reported next to the requested one.
+  *
+  * ── KNOBS ────────────────────────────────────────────────────────────────────
+  *   IPC_INJ_D=<0..100>   percent of the D-cache line-address space forced to miss
+  *   IPC_INJ_I=<0..100>   percent of the I-cache line-address space forced to miss
+  *   IPC_INJ_SEED=<int>   hash salt (default 1); changes WHICH lines, not how many
+  *   IPC_INJ_EPOCH=<int>  eligibility rotation period in cycles (default 64)
+  *   IPC_MISS_STATS=1     report miss rates / MLP / stall split with NO injection
+  *
+  * Everything is OFF unless one of those is set, and `onCycle` returns on a single
+  * boolean when off -- so the default `IpcBenchSpec` run is bit-identical.
+  *
+  * ── KNOWN, DELIBERATE LIMITS (do not read a number here as more than it is) ──
+  *   - STORE-DIRTIED LINES ARE IMMUNE. A copyback kernel's destination buffer goes
+  *     dirty and stays resident, so D-injection reaches the LOAD stream and not the
+  *     store stream. The levers this exists to test are load-latency levers, but a
+  *     store-miss lever cannot be measured with this knob.
+  *   - THE D-CACHE'S EARLY-PROBE ENTRIES LEAK. A probe that already latched its line
+  *     serves that line after the steal (same, correct bytes). That costs rate, not
+  *     soundness, and it is why the achieved rate is always MEASURED and reported
+  *     rather than assumed equal to the requested percentage.
+  *   - STEALING A WAY ALSO PERTURBS REPLACEMENT. A freed way changes which line the
+  *     next victim is, so a few misses are collateral rather than injected. Again:
+  *     measured, not assumed.
+  *
+  * ── ⛔⛔ THE ACHIEVED RATE IS COUPLED TO D-CACHE TIMING. DO NOT A/B A D-CACHE ──
+  * ── CHANGE WITH INJECTION ON WITHOUT CHECKING THE RATES MATCHED FIRST. ──────
+  * MEASURED, 2026-09-27, while A/B-ing slice D1.2 (fill-forward, `DcachePlugin`):
+  * the SAME injection percentage produced DIFFERENT achieved miss rates in the two
+  * arms -- aggregate 25.26 vs 20.75 D-misses/kI at identical `INJ_POINTS` and seeds,
+  * and on `chase-128` the requested D6/D18 achieved 6.94/13.89 in one arm and
+  * exactly 0.00 in the other. Every injected row of that comparison is therefore
+  * VOID: the arms differ in how much work they were given, not only in how fast they
+  * did it, and the faster-looking arm was also the less-injected one.
+  *
+  * The mechanism is this object's own steal TIMING argument, quoted above: "a demand
+  * miss ends with the cache RE-LAUNCHING the access against the freshly-installed
+  * line -- D-cache REPLAY ... so the FIRST S1 hit a line sees after a refill is that
+  * replay". Fill-forward answers the miss from the refill beat and never re-launches,
+  * so that replay hit -- the nomination this injector was designed around -- does not
+  * happen. Any D-cache change that alters which accesses appear as `ldS1Valid &&
+  * ldS1Hit` (the nomination event) or how much time the load FSM spends in
+  * `dbgFsmIdle` (the drain window) moves the achieved rate.
+  *
+  * RULE, the same one the board A/B rule states for silicon: compare the ACHIEVED
+  * `D/kI` column between arms BEFORE comparing cycles, and treat the zero-injection
+  * (`D0/I0`) rows as the only arms guaranteed matched. If injected arms must be
+  * compared, the injector needs a rate-controlled mode (steal to a target count, not
+  * to a target eligibility) -- that does not exist yet.
+  */
+object MissInjector {
+
+  /** D-cache geometry (DcachePlugin: 8 KiB, 16 B lines, 4 ways). */
+  private val dWays = 4
+  private val dOffBits = 4
+  private val dSetBits = 7
+  /** I-cache geometry (CacheGeometry.l1i040: 16 KiB, 64 B lines, 4 ways). */
+  private val iWays = 4
+  private val iOffBits = 6
+  private val iSetBits = 6
+
+  private def envInt(name: String, dflt: Int): Int =
+    sys.env.get(name).filter(_.nonEmpty).map(_.trim.toInt).getOrElse(dflt)
+
+  /** Requested injection percentages. `var`, not `val`, so `MissInjectionSweepSpec`
+    * can walk a CURVE inside one Verilator build instead of paying an elaboration per
+    * sweep point. `IpcBenchSpec` and every other suite just take the env defaults. */
+  var dPct: Int = envInt("IPC_INJ_D", 0)
+  var iPct: Int = envInt("IPC_INJ_I", 0)
+  var salt: Int = envInt("IPC_INJ_SEED", 1)
+  /** A label for the current sweep point, carried into every `Stats` row. */
+  var tag: String = ""
+  val epochCycles: Int = math.max(1, envInt("IPC_INJ_EPOCH", 64))
+  /** Report miss rates / MLP / stall split even with injection OFF. A `var` so the
+    * sweep can force it on: the D0/I0 baseline row is the whole point of a curve, and
+    * without it the sweep has nothing to compare against. */
+  var statsOnly: Boolean = sys.env.get("IPC_MISS_STATS").contains("1")
+  def injecting: Boolean = dPct > 0 || iPct > 0
+  def enabled: Boolean = injecting || statsOnly
+
+  require(dPct >= 0 && dPct <= 100, s"IPC_INJ_D=$dPct out of 0..100")
+  require(iPct >= 0 && iPct <= 100, s"IPC_INJ_I=$iPct out of 0..100")
+
+  /** Point the injector at a new rate. Called between sweep points only -- never
+    * inside a run, so a run is always a single, reproducible configuration. */
+  def configure(d: Int, i: Int, label: String = ""): Unit = {
+    require(d >= 0 && d <= 100 && i >= 0 && i <= 100, s"injection rate out of 0..100: D=$d I=$i")
+    dPct = d; iPct = i
+    tag = if (label.nonEmpty) label else f"D$d%d/I$i%d"
+  }
+
+  def label: String =
+    if (!enabled) "off"
+    else s"D=${dPct}% I=${iPct}% salt=$salt epoch=${epochCycles}cyc" +
+      (if (!injecting) " (stats only)" else "")
+
+  /** SplitMix64-style finalizer. Deterministic, and it mixes the low line-address
+    * bits that a set-index-shaped hash would throw away. */
+  private def mix(x: Long): Long = {
+    var h = x * 0x9E3779B97F4A7C15L
+    h ^= h >>> 30; h *= 0xBF58476D1CE4E5B9L
+    h ^= h >>> 27; h *= 0x94D049BB133111EBL
+    h ^= h >>> 31
+    h
+  }
+
+  private val Denom = 1 << 16
+
+  private def eligible(lineAddr: Long, epoch: Long, pct: Int): Boolean = {
+    if (pct <= 0) return false
+    if (pct >= 100) return true
+    val h = mix(lineAddr * 0x100000001L + epoch * 0x2545F4914F6CDD1DL + salt)
+    ((h >>> 41) & (Denom - 1)) < (pct.toLong * Denom / 100)
+  }
+
+  /** Per-kernel measurement, published for the suite to print after the run. */
+  final case class Stats(
+      point: String,
+      kernel: String,
+      windowCycles: Long,
+      retired: Long,
+      // demand misses
+      dLoadMisses: Long, dStoreMisses: Long, iDemandMisses: Long,
+      // bus traffic (D: refills+inhibited+walk reads; I: demand + prefetch)
+      dArFires: Long, iArFires: Long,
+      // memory-level parallelism, sampled every cycle over the whole run
+      dOutstandingSum: Long, dOutstandingMax: Int, dBusyCycles: Long,
+      iOutstandingSum: Long, iOutstandingMax: Int, iBusyCycles: Long,
+      // coarse stall split (see the note in `report`)
+      robEmptyCycles: Long, retireStallCycles: Long,
+      stallDcacheCycles: Long, stallWalkCycles: Long,
+      dcRefusedInRefill: Long,
+      // ── THE D2 MLP CEILING (see `MLP CEILING` below). Cycles a presented load spent
+      // REFUSED while a refill was in flight, split by what it would have taken to
+      // serve it. `Ceil*Stall` counts only the subset where the ROB was also stalled,
+      // which is the honest upper bound on recoverable cycles.
+      ceilHitCyc: Long, ceilMergeCyc: Long, ceilSameSetCyc: Long, ceilMshrCyc: Long,
+      ceilHitStall: Long, ceilMergeStall: Long, ceilSameSetStall: Long, ceilMshrStall: Long,
+      ceilMergeEvents: Long, ceilMshrEvents: Long, ceilSameSetEvents: Long,
+      ceilInhibited: Long, ceilNoInflight: Long,
+      // injection accounting
+      dSteals: Long, dStealsSkippedDirty: Long, iSteals: Long,
+      cycles: Long) {
+    private def perK(n: Long): Double = if (retired == 0) 0.0 else 1000.0 * n / retired
+    def dMissPerK: Double = perK(dLoadMisses + dStoreMisses)
+    def iMissPerK: Double = perK(iDemandMisses)
+    def dRefillPerK: Double = perK(dArFires)
+    def iFetchPerK: Double = perK(iArFires)
+    /** MLP over cycles with at least one transaction outstanding -- the honest
+      * denominator for "when the machine is missing, how many misses overlap". */
+    def dMlpBusy: Double = if (dBusyCycles == 0) 0.0 else dOutstandingSum.toDouble / dBusyCycles
+    def iMlpBusy: Double = if (iBusyCycles == 0) 0.0 else iOutstandingSum.toDouble / iBusyCycles
+    /** MLP over ALL cycles -- the memory-system utilisation figure. */
+    def dMlpAll: Double = if (cycles == 0) 0.0 else dOutstandingSum.toDouble / cycles
+    def iMlpAll: Double = if (cycles == 0) 0.0 else iOutstandingSum.toDouble / cycles
+    def pct(n: Long): Double = if (cycles == 0) 0.0 else 100.0 * n / cycles
+  }
+
+  /** Collected across the whole suite run (one entry per kernel invocation). */
+  val collected: mutable.ArrayBuffer[Stats] = mutable.ArrayBuffer.empty
+
+  /** ── MAKE THE ACHIEVED-RATE RULE AN ASSERTION, NOT A CONVENTION ─────────────
+    * The rule above ("compare the achieved D/kI between arms BEFORE comparing cycles")
+    * is worth nothing if it depends on a human remembering to look -- and it has
+    * already been broken once in this repo's history, in a direction that made a lever
+    * look better than it is.
+    *
+    * `rateLines` emits one machine-readable row per measurement, and `INJ_EXPECT`
+    * takes those rows back in from the OTHER arm of an A/B and HARD-FAILS when an
+    * achieved rate has moved. So the procedure is:
+    *
+    *   arm A:  ...testOnly ...MissInjectionSweepSpec | grep MISSINJ_RATE > /tmp/a.rates
+    *   arm B:  INJ_EXPECT=/tmp/a.rates ...testOnly ...MissInjectionSweepSpec
+    *
+    * and arm B FAILS if the injector delivered a different amount of work, instead of
+    * quietly reporting a cycle delta that mixes a lever with a workload change.
+    * `INJ_EXPECT_TOL` is the permitted relative drift, default 2%.
+    *
+    * NOTE this is a GUARD, not the fix. The real fix is a rate-CONTROLLED injector
+    * (steal toward a target count per retired instruction, closed-loop, instead of a
+    * target eligibility fraction) so the arms match by construction. That does not
+    * exist yet; this makes its absence loud instead of silent. */
+  private def rateKey(s: Stats): String = s"${s.point}|${s.kernel}"
+
+  def rateLines: Seq[String] =
+    collected.toSeq.map(s => f"MISSINJ_RATE ${rateKey(s)}%s d=${s.dMissPerK}%.4f i=${s.iMissPerK}%.4f")
+
+  def checkExpectedRates(): Unit = {
+    val path = sys.env.get("INJ_EXPECT").filter(_.nonEmpty).getOrElse(return)
+    val tol = sys.env.get("INJ_EXPECT_TOL").filter(_.nonEmpty).map(_.toDouble).getOrElse(0.02)
+    val want = scala.io.Source.fromFile(path).getLines()
+      .filter(_.contains("MISSINJ_RATE")).map { l =>
+        val t = l.trim.split("\\s+")
+        // MISSINJ_RATE <point>|<kernel> d=<x> i=<y>
+        (t(1), t(2).stripPrefix("d=").toDouble, t(3).stripPrefix("i=").toDouble)
+      }.toVector
+    require(want.nonEmpty, s"INJ_EXPECT=$path contained no MISSINJ_RATE rows")
+    // Several seeds share one (point, kernel); compare the MEAN, which is what a curve
+    // is read off anyway, and report every offender rather than the first.
+    val gotBy = collected.groupBy(rateKey)
+    val bad = scala.collection.mutable.ArrayBuffer.empty[String]
+    for ((k, wd, wi) <- want.groupBy(_._1).map { case (k, v) =>
+           (k, v.map(_._2).sum / v.size, v.map(_._3).sum / v.size) }) {
+      gotBy.get(k) match {
+        case None => bad += s"$k: present in the baseline, MISSING from this run"
+        case Some(rows) =>
+          val gd = rows.map(_.dMissPerK).sum / rows.size
+          val gi = rows.map(_.iMissPerK).sum / rows.size
+          def off(w: Double, g: Double) = math.abs(g - w) > tol * math.max(1e-9, math.abs(w))
+          if (off(wd, gd) || off(wi, gi))
+            bad += f"$k%s: D/kI $wd%.3f -> $gd%.3f, I/kI $wi%.3f -> $gi%.3f"
+      }
+    }
+    if (bad.nonEmpty) {
+      println()
+      println("=" * 100)
+      println("  ⛔ ACHIEVED INJECTION RATE MOVED BETWEEN ARMS -- every cycle delta in this")
+      println("  A/B mixes the lever with a WORKLOAD CHANGE and is VOID. See MissInjector's")
+      println("  header: the injector's achieved rate is coupled to D-cache timing.")
+      bad.foreach(b => println(s"    $b"))
+      println("=" * 100)
+      throw new AssertionError(
+        s"injection rate moved on ${bad.size} (point,kernel) pair(s) beyond ${tol * 100}%; " +
+        s"the arms were not given the same amount of work (INJ_EXPECT=$path)")
+    }
+    println(f"  [inj-rate] achieved rates match the ${want.size}%d baseline row(s) " +
+            f"within ${tol * 100}%.1f%% -- the arms are comparable")
+  }
+
+  def report(): Unit = {
+    if (collected.isEmpty) return
+    rateLines.foreach(println)
+    checkExpectedRates()
+    println()
+    println("=" * 148)
+    println(s"  MISS INJECTION / MLP  --  injection: $label")
+    println("  D/kI,I/kI  = DEMAND misses per 1000 retired macros (board, real OS workload: D 24.4, I 32.2)")
+    println("  Dax/kI,Iax/kI = AXI READ transactions per 1000 macros (D: refills+inhibited+walk; I: demand+prefetch)")
+    println("  MLP     = mean AXI read transactions outstanding, over BUSY cycles (max in brackets)")
+    println("  D-side MLP is capped at 1.0 BY CONSTRUCTION: DcachePlugin has ONE refill MSHR")
+    println("  (AxiIds.dRefill reserves 0..3, 'only 0 is used while N_MSHR == 1').")
+    println("  stall split is COARSE and NOT the board's counter definitions -- see the note below.")
+    println("=" * 148)
+    println(f"${"point"}%-10s ${"kernel"}%-24s ${"retd"}%7s ${"cyc"}%7s ${"IPC"}%5s " +
+      f"${"D/kI"}%6s ${"Dax/kI"}%7s ${"I/kI"}%6s ${"Iax/kI"}%7s ${"Dmlp"}%11s ${"Imlp"}%11s " +
+      f"${"robE%"}%6s ${"rStl%"}%6s ${"dc%"}%5s ${"refus%"}%6s ${"steals"}%12s")
+    println("-" * 148)
+    for (s <- collected) {
+      val ipc = if (s.windowCycles == 0) 0.0 else s.retired.toDouble / s.windowCycles
+      println(f"${s.point}%-10s ${s.kernel}%-24s ${s.retired}%7d ${s.windowCycles}%7d $ipc%5.3f " +
+        f"${s.dMissPerK}%6.2f ${s.dRefillPerK}%7.2f ${s.iMissPerK}%6.2f ${s.iFetchPerK}%7.2f " +
+        f"${s.dMlpBusy}%6.3f[${s.dOutstandingMax}%d] ${s.iMlpBusy}%6.3f[${s.iOutstandingMax}%d] " +
+        f"${s.pct(s.robEmptyCycles)}%6.1f ${s.pct(s.retireStallCycles)}%6.1f " +
+        f"${s.pct(s.stallDcacheCycles)}%5.1f ${s.pct(s.dcRefusedInRefill)}%6.1f " +
+        f"${s.dSteals}%5dD/${s.iSteals}%dI")
+    }
+    println("-" * 148)
+    val retd = collected.map(_.retired).sum
+    val cyc  = collected.map(_.windowCycles).sum
+    val dm   = collected.map(s => s.dLoadMisses + s.dStoreMisses).sum
+    val im   = collected.map(_.iDemandMisses).sum
+    val dSum = collected.map(_.dOutstandingSum).sum
+    val dBusy= collected.map(_.dBusyCycles).sum
+    val iSum = collected.map(_.iOutstandingSum).sum
+    val iBusy= collected.map(_.iBusyCycles).sum
+    val dax = collected.map(_.dArFires).sum
+    val iax = collected.map(_.iArFires).sum
+    println(f"${"AGGREGATE"}%-35s $retd%7d $cyc%7d ${retd.toDouble / math.max(1, cyc)}%5.3f " +
+      f"${1000.0 * dm / math.max(1, retd)}%6.2f ${1000.0 * dax / math.max(1, retd)}%7.2f " +
+      f"${1000.0 * im / math.max(1, retd)}%6.2f ${1000.0 * iax / math.max(1, retd)}%7.2f " +
+      f"${dSum.toDouble / math.max(1, dBusy)}%6.3f[${collected.map(_.dOutstandingMax).max}%d] " +
+      f"${iSum.toDouble / math.max(1, iBusy)}%6.3f[${collected.map(_.iOutstandingMax).max}%d]")
+    println("=" * 148)
+    // ── THE D2 MLP CEILING ────────────────────────────────────────────────────
+    // `classifyRefusal` explains the four classes. Read `mshr%` FIRST: it is the only
+    // column a second MSHR plus a multi-outstanding crossbar can collect, and it is a
+    // generous UPPER bound (it assumes the overlap is perfect and free).
+    println()
+    println("=" * 148)
+    println("  D2 MLP CEILING -- refused-during-refill cycles, split by WHAT WOULD SERVE THEM")
+    println("  hit%    line IS resident -- hitUnderMissRead's prize (OFF today), NOT D2's; no bus needed")
+    println("  merge%  SAME line as the in-flight refill -- secondary-miss MERGE; NO second AXI, pays on TODAY's fabric")
+    println("  sset%   different line, SAME set -- the ratified D3 invariant FORBIDS overlapping these")
+    println("  mshr%   different set -- THE D2 PRIZE, and the ONLY class that needs the crossbar reworked")
+    println("  *Stl%   the same split restricted to cycles the ROB was also stalled = the honest bound")
+    println("  ev      distinct refusal EVENTS (a contiguous refusal of one line counts once)")
+    println("=" * 148)
+    println(f"${"point"}%-10s ${"kernel"}%-24s ${"refus%"}%7s ${"hit%"}%6s ${"merge%"}%7s ${"sset%"}%6s ${"mshr%"}%6s " +
+      f"| ${"hitStl%"}%7s ${"mrgStl%"}%7s ${"ssStl%"}%6s ${"mshStl%"}%7s | ${"mrgEv"}%6s ${"mshEv"}%6s ${"ssEv"}%5s ${"inh"}%5s ${"noAR"}%5s")
+    println("-" * 148)
+    for (s <- collected) {
+      println(f"${s.point}%-10s ${s.kernel}%-24s ${s.pct(s.dcRefusedInRefill)}%7.2f " +
+        f"${s.pct(s.ceilHitCyc)}%6.2f ${s.pct(s.ceilMergeCyc)}%7.2f ${s.pct(s.ceilSameSetCyc)}%6.2f ${s.pct(s.ceilMshrCyc)}%6.2f " +
+        f"| ${s.pct(s.ceilHitStall)}%7.2f ${s.pct(s.ceilMergeStall)}%7.2f ${s.pct(s.ceilSameSetStall)}%6.2f ${s.pct(s.ceilMshrStall)}%7.2f " +
+        f"| ${s.ceilMergeEvents}%6d ${s.ceilMshrEvents}%6d ${s.ceilSameSetEvents}%5d ${s.ceilInhibited}%5d ${s.ceilNoInflight}%5d")
+    }
+    println("-" * 148)
+    locally {
+      val tc = math.max(1L, collected.map(_.cycles).sum)
+      def p(f: Stats => Long): Double = 100.0 * collected.map(f).sum / tc
+      println(f"${"AGGREGATE"}%-35s ${p(_.dcRefusedInRefill)}%7.2f ${p(_.ceilHitCyc)}%6.2f ${p(_.ceilMergeCyc)}%7.2f " +
+        f"${p(_.ceilSameSetCyc)}%6.2f ${p(_.ceilMshrCyc)}%6.2f | ${p(_.ceilHitStall)}%7.2f ${p(_.ceilMergeStall)}%7.2f " +
+        f"${p(_.ceilSameSetStall)}%6.2f ${p(_.ceilMshrStall)}%7.2f | ${collected.map(_.ceilMergeEvents).sum}%6d " +
+        f"${collected.map(_.ceilMshrEvents).sum}%6d ${collected.map(_.ceilSameSetEvents).sum}%5d " +
+        f"${collected.map(_.ceilInhibited).sum}%5d ${collected.map(_.ceilNoInflight).sum}%5d")
+      println("  BOARD BOUND on any of this: D-cache stall is 6.1% of cycles on the real OS")
+      println("  workload and 0.80% on Dhrystone. A ceiling far above that is measuring something else.")
+    }
+    println("=" * 148)
+    val dirty = collected.map(_.dStealsSkippedDirty).sum
+    println(f"  D steals skipped because the line was DIRTY: $dirty " +
+      f"(a copyback kernel's store destination is immune to injection by design)")
+    println("  NOTE the stall split above is a coarse three-way read of already-simPublic")
+    println("  signals (ROB empty / ROB non-empty with no retire / of those, D-cache FSM in a")
+    println("  refill or replay). It is NOT the board's retire-stall / stall-dcache /")
+    println("  stall-walk counter definitions; replace it with the stall-budget")
+    println("  decomposition when that lands, and do not compare these columns to board counters.")
+    println("=" * 148)
+  }
+
+  /** Optional directory for the ARCHITECTURAL-EQUIVALENCE A/B (IPC_ARCH_DUMP=<dir>).
+    *
+    * Injection is a TIMING perturbation and nothing else, and this is how that claim
+    * is checked rather than asserted: the committed architectural stream -- PC, the
+    * architectural register written and its value, CCR/SR, and every committed memory
+    * address and datum -- is dumped per kernel and digested. Two runs that differ only
+    * in injection must produce the SAME digest on every kernel. A digest that moves is
+    * either a bug in the injector or a latent bug it has exposed; the dumped stream is
+    * there so the first differing commit can be found instead of guessed at.
+    */
+  val archDumpDir: Option[String] = sys.env.get("IPC_ARCH_DUMP").filter(_.nonEmpty)
+
+  def archDump(kernel: String, obs: Seq[m68k040.lockstep.CommitObservation]): Unit =
+    archDumpDir.foreach { dir =>
+      val md = MessageDigest.getInstance("SHA-256")
+      val sb = new StringBuilder
+      for (o <- obs) {
+        val line = f"${o.pc}%08x r${o.archRegId}%02d=${o.archRegWrite}%08x v=${o.archRegValid} " +
+          f"ccr=${o.ccr}%02x sr=${o.sr}%04x mem=${o.memAddr}%08x/${o.memData}%08x w=${o.memWrite}\n"
+        sb ++= line
+        md.update(line.getBytes("UTF-8"))
+      }
+      val pt = (if (tag.nonEmpty) tag else label).replace('/', '-').replace('%', 'p').replace(' ', '_')
+      val safe = kernel.replace('/', '_')
+      Files.createDirectories(Paths.get(dir))
+      Files.write(Paths.get(dir, s"$safe@$pt.arch"), sb.toString.getBytes("UTF-8"))
+      val hex = md.digest().map(b => f"$b%02x").mkString
+      println(s"[arch] point=${if (tag.nonEmpty) tag else label} kernel=$kernel commits=${obs.size} sha256=$hex")
+    }
+
+  def maybeNew(dut: CoreBenchHarness#FullCoreDut, kernel: String): Instance =
+    new Instance(dut, kernel)
+
+  /** One per `doSim`. Cheap when disabled: `onCycle` exits on `enabled`. */
+  final class Instance(dut: CoreBenchHarness#FullCoreDut, kernel: String) {
+    private val dc = dut.dcache.logic
+    private val ic = dut.icache.logic
+
+    private var cycle = 0L
+    private var epoch = 0L
+    // arm only after the harness's reset + explicit I-cache invalidate window
+    private val armAfter = 140
+
+    // ── COUNTERS AS AN ARRAY, so the MEASUREMENT WINDOW can be taken as a delta ──
+    // This is not tidiness. Counting over the whole run while dividing by the WINDOW's
+    // retired count silently inflated every rate: `chase-128`'s cold pass is 128 misses
+    // that `warmupInstrs` deliberately excludes from the window, and attributing them
+    // to 1152 windowed macros reported 112 D-misses/kI for a kernel whose steady state
+    // misses essentially ZERO. Snapshotting at the window's first and last committing
+    // cycle makes every rate below a genuine steady-state rate.
+    private val NC = 29
+    private val D_LOAD_MISS = 0; private val D_STORE_MISS = 1; private val I_MISS = 2
+    private val D_AR = 3;        private val I_AR = 4
+    private val D_OUT_SUM = 5;   private val D_BUSY = 6
+    private val I_OUT_SUM = 7;   private val I_BUSY = 8
+    private val ROB_EMPTY = 9;   private val RETIRE_STALL = 10
+    private val STALL_DC = 11;   private val STALL_WALK = 12
+    private val REFUSED = 13
+    private val D_STEAL = 14;    private val I_STEAL = 15
+    // ── MLP CEILING ─────────────────────────────────────────────────────────────
+    private val CEIL_HIT_C = 16; private val CEIL_MERGE_C = 17
+    private val CEIL_SS_C  = 18; private val CEIL_MSHR_C  = 19
+    private val CEIL_HIT_S = 20; private val CEIL_MERGE_S = 21
+    private val CEIL_SS_S  = 22; private val CEIL_MSHR_S  = 23
+    private val CEIL_MERGE_E = 24; private val CEIL_MSHR_E = 25
+    private val CEIL_SS_E    = 26
+    private val CEIL_INHIB   = 27; private val CEIL_NOINFL = 28
+    private val c      = Array.fill(NC)(0L)
+    private var cStart = Array.fill(NC)(0L)
+    private var cEnd   = Array.fill(NC)(0L)
+    private var windowOpened = false
+    private var dSkipDirty = 0L
+    private var dOutMaxWin = 0; private var iOutMaxWin = 0
+    private var dOut = 0
+    private var iUnresolvedPrev = false
+
+    private val PendCap = 8
+    private val dPend = mutable.Queue.empty[(Int, Int, Long)]
+    private val iPend = mutable.Queue.empty[(Int, Int, Long)]
+
+    // ── MLP CEILING state ────────────────────────────────────────────────────
+    // The D master's in-flight read line, tracked off the CHANNEL so no RTL signal
+    // has to be made public for it: latched at AR fire, released at R.last.
+    private var dInflightLine = -1L
+    private var dInflightArmed = false
+    // Event de-duplication: a refusal that persists for N cycles is ONE event.
+    private var lastCeilLine = -2L
+    private var lastCeilCls = -1
+    private var lastCeilCycle = -10L
+
+    private def dLine(tag: Long, set: Int): Long =
+      (tag << (dSetBits + dOffBits)) | (set.toLong << dOffBits)
+    private def iLine(tag: Long, set: Int): Long =
+      (tag << (iSetBits + iOffBits)) | (set.toLong << iOffBits)
+
+    /** ── THE D2 MLP CEILING ──────────────────────────────────────────────────
+      * Classify a load that the D-cache REFUSED while a refill was in flight by what
+      * it would take to serve it. This is the whole point: "the D side never overlaps
+      * two misses" is a fact about the MACHINE, but the PRIZE is the subset of those
+      * refused cycles that a second MSHR could actually have recovered -- and that
+      * subset is decided by the relation between the presented line and the in-flight
+      * one, plus whether the presented line is resident at all.
+      *
+      * The residency test is an ORACLE: the tag and valid arrays are read directly
+      * from the testbench, so "would this have hit?" is answered exactly rather than
+      * inferred. Four classes, and they mean four DIFFERENT engineering programmes:
+      *
+      *   HIT      the line IS resident. `hitUnderMiss` (probe arm, ON) exists for
+      *            exactly this and needs no bus concurrency; a refusal here means the
+      *            probe path could not claim it (no owning entry), which is what
+      *            `hitUnderMissRead` -- OFF on critical-path evidence -- would fix.
+      *            NOT a D2 prize.
+      *   MERGE    not resident, and it is THE SAME LINE the refill is already
+      *            fetching. Serving it needs a secondary-miss merge (plan §4.1(i),
+      *            M1/M2/M3) and NO second AXI transaction -- so it pays on TODAY's
+      *            single-outstanding crossbar. NOT contingent on the SoC.
+      *   SAMESET  not resident, a different line in the SAME set. The ratified D3
+      *            invariant ("one outstanding fill per cache SET") forbids overlapping
+      *            these, so this is prize that D2 as specified CANNOT collect.
+      *   MSHR     not resident, a different set. THE D2 PRIZE, and the only class that
+      *            needs both N_MSHR > 1 and a multi-outstanding crossbar.
+      */
+    private def classifyRefusal(robStalled: Boolean): Unit = {
+      val cmode = dc.loadCmdPort.payload.cacheMode.toEnum
+      if (cmode == m68k040.cache.CacheMode.INHIBITED) { c(CEIL_INHIB) += 1; return }
+      if (!dInflightArmed) { c(CEIL_NOINFL) += 1; return }
+      val paddr = dc.loadCmdPort.payload.paddr.toLong
+      val line  = paddr >>> dOffBits
+      val set   = ((paddr >>> dOffBits) & ((1L << dSetBits) - 1)).toInt
+      val tag   = paddr >>> (dOffBits + dSetBits)
+      var resident = false
+      var w = 0
+      while (w < dWays) {
+        if (dc.validsMem(w).getBigInt(set) != 0 && dc.tagMem(w).getBigInt(set).toLong == tag)
+          resident = true
+        w += 1
+      }
+      val inflSet = (dInflightLine & ((1L << dSetBits) - 1)).toInt
+      val cls =
+        if (resident) 0
+        else if (line == dInflightLine) 1
+        else if (set == inflSet) 2
+        else 3
+      c(Array(CEIL_HIT_C, CEIL_MERGE_C, CEIL_SS_C, CEIL_MSHR_C)(cls)) += 1
+      if (robStalled) c(Array(CEIL_HIT_S, CEIL_MERGE_S, CEIL_SS_S, CEIL_MSHR_S)(cls)) += 1
+      // One EVENT per contiguous refusal of the same line in the same class.
+      if (cls != 0 && (line != lastCeilLine || cls != lastCeilCls || cycle != lastCeilCycle + 1)) {
+        c(cls match { case 1 => CEIL_MERGE_E; case 2 => CEIL_SS_E; case _ => CEIL_MSHR_E }) += 1
+      }
+      lastCeilLine = line; lastCeilCls = cls; lastCeilCycle = cycle
+    }
+
+    /** Called once per sampled cycle from `CoreBenchHarness.runKernel`. */
+    def onCycle(): Unit = {
+      if (!enabled) return
+      cycle += 1
+      epoch = cycle / epochCycles
+
+      // ── bus-level accounting: misses and MLP, D and I, uniformly ─────────────
+      if (dc.axi.ar.valid.toBoolean && dc.axi.ar.ready.toBoolean) {
+        c(D_AR) += 1; dOut += 1
+        dInflightLine = (dc.axi.ar.payload.addr.toLong >>> dOffBits); dInflightArmed = true
+      }
+      if (dc.axi.r.valid.toBoolean && dc.axi.r.ready.toBoolean && dc.axi.r.payload.last.toBoolean) {
+        dOut = math.max(0, dOut - 1)
+        if (dOut == 0) dInflightArmed = false
+      }
+      if (dOut > 0) {
+        c(D_BUSY) += 1; c(D_OUT_SUM) += dOut
+        if (windowOpened && dOut > dOutMaxWin) dOutMaxWin = dOut
+      }
+
+      if (ic.axi.ar.valid.toBoolean && ic.axi.ar.ready.toBoolean) c(I_AR) += 1
+      // The I-cache tracks its own per-ID outstanding bits (one per MSHR slot), so its
+      // MLP is read directly rather than reconstructed from the channel.
+      val iOut = ic.arOutstanding.count(_.toBoolean)
+      if (iOut > 0) {
+        c(I_BUSY) += 1; c(I_OUT_SUM) += iOut
+        if (windowOpened && iOut > iOutMaxWin) iOutMaxWin = iOut
+      }
+
+      // ── demand misses ────────────────────────────────────────────────────────
+      if (dc.loadMissDiscovered.toBoolean) c(D_LOAD_MISS) += 1
+      if (dc.storeMissDiscovered.toBoolean) c(D_STORE_MISS) += 1
+      val iUnres = ic.s1Unresolved.toBoolean
+      if (iUnres && !iUnresolvedPrev) c(I_MISS) += 1
+      iUnresolvedPrev = iUnres
+
+      // ── coarse stall split ───────────────────────────────────────────────────
+      val robCount = dut.rob.logic.count.toInt
+      val retiring = dut.rob.logic.retire0.toBoolean
+      val dcBusy = dc.dbgFsmRefill.toBoolean || dc.dbgFsmReplay.toBoolean
+      if (robCount == 0) c(ROB_EMPTY) += 1
+      else if (!retiring) {
+        c(RETIRE_STALL) += 1
+        if (dcBusy) c(STALL_DC) += 1
+      }
+      if (dut.dtlb.logic.missPending.toBoolean) c(STALL_WALK) += 1
+      if (dcBusy && dc.loadCmdPort.valid.toBoolean && !dc.loadCmdPort.ready.toBoolean) {
+        c(REFUSED) += 1
+        classifyRefusal(robCount != 0 && !retiring)
+      }
+
+      if (!injecting || cycle < armAfter) return
+
+      // ── LINE STEALING ────────────────────────────────────────────────────────
+      // Observe first, steal later. A line is NOMINATED when an eligible access HITS
+      // it, and the steal is EXECUTED only in a window where nothing else can be
+      // touching that valid bit. Splitting the two is not fastidiousness:
+      //
+      //   * A demand miss ends by RE-LAUNCHING the access against the freshly
+      //     installed line (D-cache REPLAY, I-cache `s0Replay`), so the hit that
+      //     retires a refill happens while the fill machinery is still live. That
+      //     hit is exactly the one worth stealing on -- steal there and the line is
+      //     invalid again before the next real access -- but poking the array in
+      //     that cycle would race the RTL's own allocate write.
+      //   * Worse, on the I side, clearing a valid bit in the window between the
+      //     install and the replay's tag capture makes the replay miss with
+      //     `s0Replay` SET, which IcachePlugin documents as an infinite refill loop
+      //     rather than an ordinary miss. The drain window forbids that by
+      //     construction: it requires the demand MSHR to be idle.
+      //
+      // The queues are tiny and lossy on purpose. A dropped nomination costs
+      // injection RATE, which is measured; it can never cost soundness.
+      if (dPct > 0) {
+        if (dc.ldS1Valid.toBoolean && dc.ldS1Hit.toBoolean) {
+          val way = dc.ldS1HitWay.toInt
+          if (way >= 0 && way < dWays) {
+            val set = dc.ldS1Set.toInt
+            val tag = dc.ldS1Tag.toLong
+            if (eligible(dLine(tag, set), epoch, dPct) && dPend.size < PendCap)
+              dPend.enqueue((set, way, tag))
+          }
+        }
+        // Drain window: load FSM in IDLE (so no refill, eviction or replay is live),
+        // no reset sweep, no maintenance walk, and no store array write in flight.
+        if (dPend.nonEmpty && dc.dbgFsmIdle.toBoolean && !dc.resetSweepBusy.toBoolean &&
+            !dc.maintBusyReg.toBoolean && !dc.stS2ArrayWrite.toBoolean &&
+            !dc.stS3ArrayWrite.toBoolean) {
+          val (set, way, tag) = dPend.dequeue()
+          if (dc.tagMem(way).getBigInt(set).toLong == tag &&
+              dc.validsMem(way).getBigInt(set) != 0) {
+            // A DIRTY line is never stolen: memory does not hold its bytes, so the
+            // refill that followed would return pre-store data. That is the one way
+            // this feature could change an architectural result, and the check is
+            // what makes it impossible rather than unlikely.
+            if (dc.dirtysMem(way).getBigInt(set) != 0) dSkipDirty += 1
+            else { dc.validsMem(way).setBigInt(set, BigInt(0)); c(D_STEAL) += 1 }
+          }
+        }
+      }
+
+      if (iPct > 0) {
+        if (ic.s0Valid.toBoolean && ic.s1Hit.toBoolean) {
+          var way = -1; var w = 0
+          while (w < iWays) { if (ic.s1HitVec(w).toBoolean) way = w; w += 1 }
+          if (way >= 0) {
+            val set = ic.s0Set.toInt
+            val tag = ic.s0Ppn.toLong
+            if (eligible(iLine(tag, set), epoch, iPct) && iPend.size < PendCap)
+              iPend.enqueue((set, way, tag))
+          }
+        }
+        // Drain window: the DEMAND MSHR must be idle, so no replay can be in flight,
+        // and the current S1 context must not itself be a replay. An I-cache line is
+        // never dirty, so there is no writeback hazard to check.
+        if (iPend.nonEmpty && !ic.mshrValid(0).toBoolean && !ic.s0Replay.toBoolean) {
+          val (set, way, tag) = iPend.dequeue()
+          if (ic.tagMem(way).getBigInt(set).toLong == tag && ic.valids(way)(set).toBoolean) {
+            ic.valids(way)(set) #= false
+            c(I_STEAL) += 1
+          }
+        }
+      }
+    }
+
+    /** Called from the harness on every cycle that COMMITS a windowed macro. The first
+      * such cycle opens the measurement window; the last one closes it. */
+    def markCommit(): Unit = {
+      if (!enabled) return
+      if (!windowOpened) { windowOpened = true; cStart = c.clone() }
+      cEnd = c.clone()
+    }
+
+    def publish(windowCycles: Long, retired: Long): Unit = {
+      if (!enabled) return
+      // No windowed commit ever landed (a filtered or wedged run): fall back to the
+      // whole run rather than reporting zeros that look like a clean result.
+      val (a, b) = if (windowOpened) (cStart, cEnd) else (Array.fill(NC)(0L), c)
+      def d(i: Int): Long = b(i) - a(i)
+      collected += Stats(if (tag.nonEmpty) tag else label, kernel, windowCycles, retired,
+        d(D_LOAD_MISS), d(D_STORE_MISS), d(I_MISS), d(D_AR), d(I_AR),
+        d(D_OUT_SUM), dOutMaxWin, d(D_BUSY), d(I_OUT_SUM), iOutMaxWin, d(I_BUSY),
+        d(ROB_EMPTY), d(RETIRE_STALL), d(STALL_DC), d(STALL_WALK), d(REFUSED),
+        d(CEIL_HIT_C), d(CEIL_MERGE_C), d(CEIL_SS_C), d(CEIL_MSHR_C),
+        d(CEIL_HIT_S), d(CEIL_MERGE_S), d(CEIL_SS_S), d(CEIL_MSHR_S),
+        d(CEIL_MERGE_E), d(CEIL_MSHR_E), d(CEIL_SS_E), d(CEIL_INHIB), d(CEIL_NOINFL),
+        d(D_STEAL), dSkipDirty, d(I_STEAL), windowCycles)
+    }
+  }
+}

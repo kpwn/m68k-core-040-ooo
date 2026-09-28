@@ -223,7 +223,19 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // test survives small, legitimate changes in refill latency.
   // ------------------------------------------------------------------------------
   val SET_A = 20L                     // refill target set
-  val SET_B = 21L                     // store target set (DIFFERENT set, SAME way 0)
+  // ⚠ SET_B MUST BE AT LEAST 4 SIXTEEN-BYTE SETS AWAY FROM SET_A, not merely different.
+  // This was 21 -- adjacent -- which makes the whole scenario UNCONSTRUCTIBLE under
+  // slice `D3-BURST` (`DcachePlugin.sectored`): a 64-byte line covers four consecutive
+  // 16-byte sets, so `SET_A * 16` and `SET_B * 16` land in the SAME LINE, the warm-up's
+  // `load(addrB)` HITS the line `load(addrA(0))` already installed instead of allocating
+  // way 0 of a separate set, and "same WAY, DIFFERENT set" degenerates into "same line".
+  // The spec then failed its OWN sanity checks (two racing ARs instead of one; no dirty
+  // way) rather than its hazard assertions -- i.e. it stopped testing the hazard.
+  // 24 is four sets away, so SET_A and SET_B are different sets in the 16-byte geometry
+  // AND different 64-byte lines in the sectored one, and the scenario is built correctly
+  // in both. This is a strictly stronger stimulus, not a weakened assertion.
+  val SET_B = 24L                     // store target set (DIFFERENT set AND different
+                                      // 64-byte line, SAME way 0)
   def addrA(k: Long): Long = SET_A * 16L + k * 0x800L
   val addrB = SET_B * 16L
 

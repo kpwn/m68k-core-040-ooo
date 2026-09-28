@@ -671,7 +671,9 @@ object GenSocketTopVerilog {
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"specLoadWakeup=${ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
-            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
+            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
+            s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
+            s"dcacheSectored=${ShippingCoreConfig.dcacheSectored}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

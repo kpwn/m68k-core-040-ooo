@@ -212,7 +212,10 @@ class LsBackendInjectSpec extends AnyFunSuite {
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
       val base = 0x6000L
-      for (i <- 0 until 16) mem.pokeByte(base + i, memByte(base + i))
+      // 64, not 16: a sectored miss installs the whole 64-byte line, so the bytes beyond
+      // the first 16 must be the spec's own pattern rather than PRNG-filled SparseMemory
+      // garbage. Content-neutral -- `memByte` is the same value `expected()` predicts.
+      for (i <- 0 until 64) mem.pokeByte((base & ~0x3fL) + i, memByte((base & ~0x3fL) + i))
 
       // capture LS EU writeback (the forwarded load result) by robId
       val lsWb = scala.collection.mutable.Map[Int, Long]()
@@ -313,8 +316,17 @@ class LsBackendInjectSpec extends AnyFunSuite {
         useImm = true, imm = 0, psrcA = 10, psrcAValid = true,
         pdst = 22, pdstValid = true, pdstOld = 6, dstArch = 6,
         writesNzvc = true, pNzvcDst = 6))
-      cd.waitSampling(30)
+      // ⚠ A BOUNDED POLL, NOT A FIXED `waitSampling(30)`. Under slice `D3-BURST`
+      // (`DcachePlugin.sectored`) this cold descriptor load is a 64-byte line miss --
+      // a four-beat burst, plus up to four sector writebacks if its victim is dirty --
+      // which does not fit 30 cycles, and the spec then reported `saw None` (no
+      // writeback at all) as if the value were wrong. Polling asserts the same property
+      // without encoding a line size, and it FLIP-FLOPPED between otherwise identical
+      // runs before this change, which is how a fixed wait sitting on a latency
+      // boundary presents.
       val ringLoadRobId = 6
+      var wbWait = 0
+      while (!lsWb.contains(ringLoadRobId) && wbWait < 200) { cd.waitSampling(); wbWait += 1 }
       assert(lsWb.get(ringLoadRobId).contains(0xCAFE0001L),
         s"aligned descriptor load must return CAFE0001; saw ${lsWb.get(ringLoadRobId).map(_.toHexString)}")
       assert(lsNzvc.get(ringLoadRobId).contains(0x8),

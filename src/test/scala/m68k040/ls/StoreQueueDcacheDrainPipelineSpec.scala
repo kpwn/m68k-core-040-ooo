@@ -272,8 +272,18 @@ class StoreQueueDcacheDrainPipelineSpec extends AnyFunSuite {
     (cd, mem)
   }
 
+  /** ⚠ ZEROES THE WHOLE 64-BYTE LINE, not just the 16-byte one the caller names.
+    *
+    * THE FILL GRANULARITY IS A DUT PROPERTY, NOT A TEST PROPERTY. Under slice
+    * `D3-BURST` (`DcachePlugin.sectored`) a miss installs 64 bytes, so `warm`'s
+    * zero-then-load loop used to cache a LATER line's bytes -- still PRNG-filled
+    * SparseMemory garbage -- before the loop got round to zeroing them; the load for
+    * that line then HIT the stale garbage and the warm assertion failed on five tests
+    * ("warm line 0x00002010 was not zero"). Zeroing the enclosing 64-byte line makes a
+    * burst fill able to bring in nothing but zeros, whatever the loop order and whatever
+    * the line size. */
   private def preloadZero(mem: BehavioralMemAgent, line: Long): Unit =
-    for (i <- 0 until 16) mem.pokeByte((line & ~0xfL) + i, 0)
+    for (i <- 0 until 64) mem.pokeByte((line & ~0x3fL) + i, 0)
 
   private def load(dut: Dut, cd: ClockDomain, addr: Long,
                    size: SpinalEnumElement[Size.type] = Size.LONG): BigInt = {
