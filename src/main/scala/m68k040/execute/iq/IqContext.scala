@@ -91,6 +91,12 @@ case class IqHot() extends Bundle {
   val isLsClass   = Bool()
   val isCplxClass = Bool()
   val srcBRead    = Bool()
+  // FIRST µop of its macro-instruction. Read ONLY by the relaxed LS eligibility, to keep
+  // out-of-order LS issue from reordering WITHIN a macro: if a bypassing uop is the first
+  // of its instruction then every older LS uop belongs to a strictly older macro, which is
+  // the precondition that makes the inhibited-barrier violation RECOVERABLE (the restart
+  // PC must be a macro boundary -- see RobPlugin's `h0IsMacroLast`).
+  val firstOfInstr = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -140,6 +146,7 @@ case class IqHot() extends Bundle {
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
     srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
+    firstOfInstr := u.firstOfInstr
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm

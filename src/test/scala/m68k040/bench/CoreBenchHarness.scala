@@ -99,6 +99,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+      // whose barrier a younger already-launched access violated. Recovered at retire.
+      rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+      rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -390,8 +394,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
+    // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+    // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+    // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+    // from one switch; every SIM harness omitted it, so the recovery had never been
+    // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+    // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
-      pcRangeEnable = pcRangeEnable)
+      pcRangeEnable = pcRangeEnable, lsOooIssue = loadBypassUnreadyLoad)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
@@ -406,7 +416,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
       earlyAutoAnWriteback = earlyAutoAnWriteback,
       earlyStoreDataWake = earlyStoreDataWake,
-      specLoadWakeup = specLoadWakeup)
+      specLoadWakeup = specLoadWakeup,
+      lsOooIssue = loadBypassUnreadyLoad)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -669,7 +680,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       // board's `blocked_iq` counter, and the two want opposite fixes. The
       // discriminator is the FREE-SLOT COUNT during blocked cycles.
       // (occupancy, line0Occupied, oldestOccupiedReady, cluster, memOp)
-      val iqHolHisto = ArrayBuffer.empty[(Int, Boolean, Boolean, String, String)]
+      // 6th field: the blocking slot's `lsWait` (OR of its LS_A/LS_B/LS_C dynamic-wait
+      // bits) -- "this consumer is stalled on an in-flight LS LOAD". Crossing it with the
+      // consumer's own CLUSTER is what sizes speculative wakeup: the shipped mechanism can
+      // only release LS-class consumers, so `lsWait && !isLs` is the part it cannot reach.
+      val iqHolHisto = ArrayBuffer.empty[(Int, Boolean, Boolean, String, String, Boolean)]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
       val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean, Boolean)]
@@ -1178,7 +1193,8 @@ trait CoreBenchHarness extends AnyFunSuite {
           val oldest = if (s0.sel.toBoolean) Some(s0) else if (s1.sel.toBoolean) Some(s1) else None
           iqHolHisto += ((occ, oldest.isDefined, oldest.forall(_.ready.toBoolean),
             oldest.map(_.hot.cluster.toEnum.toString).getOrElse("none"),
-            oldest.map(_.hot.memOp.toEnum.toString).getOrElse("none")))
+            oldest.map(_.hot.memOp.toEnum.toString).getOrElse("none"),
+            oldest.exists(_.lsWait.toBoolean)))
         }
         sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         lateStoreHisto += dut.lsEu.logic.lateDataCapture.toBoolean
@@ -1412,6 +1428,25 @@ trait CoreBenchHarness extends AnyFunSuite {
           blocked.groupBy(_._4).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(",") +
           " blockerMemOp=" +
           blocked.groupBy(_._5).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(","))
+        // ── SIZING FOR SPECULATIVE LOAD WAKEUP ────────────────────────────────────
+        // Split the head-of-line STALLED cycles by what the stalled consumer is waiting
+        // for and what CLASS it is. `specLoadWakeup` releases LS-class consumers only, so:
+        //   lsWait & LS      the part the shipped mechanism can already reach
+        //   lsWait & non-LS  the part an ALU-consumer extension would reach
+        //   !lsWait          stalled on something else entirely (slow-ALU, DIV, flags) --
+        //                    not addressable by this feature at any scope
+        // Measured OFF, this sizes the prize before anything is built.
+        val stalled = blocked.filter(!_._3)
+        val lsWaitLs    = stalled.count(t => t._6 && t._4.startsWith("LS"))
+        val lsWaitOther = stalled.count(t => t._6 && !t._4.startsWith("LS"))
+        val noLsWait    = stalled.count(!_._6)
+        def pct(n: Int) = 100.0 * n / scala.math.max(1, stalled.size)
+        println(f"[hol-dep] ${k.name} headStalled=${stalled.size} " +
+          f"waitingOnLOAD-LSconsumer=$lsWaitLs (${pct(lsWaitLs)}%.1f%%) " +
+          f"waitingOnLOAD-nonLSconsumer=$lsWaitOther (${pct(lsWaitOther)}%.1f%%) " +
+          f"notWaitingOnLoad=$noLsWait (${pct(noLsWait)}%.1f%%)")
+        println(s"[hol-dep] ${k.name} stalledLoadWaitersByCluster=" +
+          stalled.filter(_._6).groupBy(_._4).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(","))
         // Where the dependent-chain link actually goes. The extraAlu sweep shows this
         // workload is chain-bound, so per-link latency -- not issue capacity -- sets IPC.
         // Pairing cmd[i] with rsp[i] assumes in-order responses, which holds for a serial

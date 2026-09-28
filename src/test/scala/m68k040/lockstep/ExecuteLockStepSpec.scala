@@ -201,6 +201,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       rob.logic.completion(2).payload := lsEu.completion.payload
       // MMU access-fault completion -> ROB (flags the entry vector 2 + faultAddr/SSW
       // for precise format-$7 delivery at retire).
+      rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+      rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -513,11 +515,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
+    // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+    // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+    // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+    // from one switch; every SIM harness omitted it, so the recovery had never been
+    // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+    // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
-      preparedRetireEntries = preparedCap)
+      preparedRetireEntries = preparedCap,
+      lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
-      specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"))
+      specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
+      // LOCKSTEP_LS_OOO=1: out-of-order LS issue + the LS inhibited barrier, together.
+      loadBypassUnreadyLoad = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
@@ -532,7 +543,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
       detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
-      earlyStoreDataWake = sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1"))
+      earlyStoreDataWake = sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1"),
+      lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc

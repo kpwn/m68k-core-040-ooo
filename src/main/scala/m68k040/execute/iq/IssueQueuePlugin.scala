@@ -706,23 +706,132 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // load must read the old value). So stores keep the original rule exactly, and only
     // loads gain the bypass -- over older LOADS only.
     val ohLrelaxed = if (!loadBypassUnreadyLoad) ohLoldest else {
-      val lsStoreUnready = Vec(slots.map(s =>
-        s.sel && isLs(s.hot) && (s.hot.memOp === m68k040.isa.MemOp.STORE) && !s.ready))
-      val lsAnyUnready = Vec(slots.map(s => s.sel && isLs(s.hot) && !s.ready))
-      // EXCLUSIVE prefix: "some strictly-older slot holds an unready store / LS op".
-      val olderUnreadyStore = Vec(Bool(), slotCount)
-      val olderUnreadyLs    = Vec(Bool(), slotCount)
-      olderUnreadyStore(0) := False
-      olderUnreadyLs(0)    := False
-      for (i <- 1 until slotCount) {
-        olderUnreadyStore(i) := olderUnreadyStore(i - 1) || lsStoreUnready(i - 1)
-        olderUnreadyLs(i)    := olderUnreadyLs(i - 1)    || lsAnyUnready(i - 1)
-      }
-      val eligible = B((0 until slotCount).map { i =>
+      // ── RELAXED LS ELIGIBILITY: one prefix, log depth ──────────────────────────────
+      //
+      // THE RULE. An LS slot is eligible iff no STRICTLY OLDER LS slot holds a STORE that has
+      // not yet issued. That single condition covers both directions the original two-armed
+      // rule spelled out separately:
+      //   a LOAD may pass an older unready LOAD   (no hazard exists between two loads);
+      //   a LOAD may NOT pass an older unissued STORE (the real disambiguation hazard -- the
+      //     store has not allocated its address into the SQ, so nothing can prove
+      //     non-aliasing; see the "PRESENT, NOT UNREADY" block below for why the barrier is
+      //     occupancy and not readiness -- that distinction is a silent-corruption defect);
+      //   a STORE may not pass an older unissued STORE (SQ allocation order).
+      //
+      // WHY A STORE MAY NOW PASS AN OLDER UNREADY LOAD, which the previous rule forbade.
+      // Its stated reason was the anti-dependence: "past a load it would break the
+      // anti-dependence (the load must read the old value)". That reason is superseded by
+      // machinery that exists today:
+      //   1. a store becomes visible to memory only at SQ DRAIN, and the drain runs at
+      //      COMMIT in program order -- so allocating an SQ entry early publishes nothing
+      //      early, and the older load still retires first; and
+      //   2. the only path by which the older load could OBSERVE the younger store is the
+      //      SQ FORWARD, and that is already age-filtered: StoreQueue's `fwd` considers
+      //      entries "committed or older in the live ROB window" (StoreQueue.scala:91), so
+      //      a younger resident store cannot forward to an older load at all.
+      // The anti-dependence is therefore enforced by the forward's AGE FILTER, which is
+      // independent of issue order -- so issue order is free to relax while WAR stays safe.
+      // MEASURED worth on copyback kernels (IPC_SEED pinned): dhrystone-x0-cb -7.02% ->
+      // -9.18%, and byteStoreOnly-cb 0.00% -> -14.17%, i.e. on a store-bound copy it is
+      // the ONLY thing that moves at all.
+      //
+      // WHY ONE PREFIX AND WHY LOG DEPTH. The rule collapsing to a single condition is
+      // what lets the whole `Mux`, the per-slot `isStore` test and the entire second
+      // (`olderUnreadyLs`) chain disappear. What remains is computed as a LOG-DEPTH
+      // exclusive prefix OR, not the serial chain this started as:
+      // `pfx(i) := pfx(i-1) || x(i-1)` over 16 slots is 15 LOGIC LEVELS, and its input is
+      // `!s.ready` -- itself derived (`sel && triggers==0 && !dynWaitAny`), not a flop --
+      // so it appended 15 levels to the machine's hottest cone. Recursive doubling is 4.
+      //
+      // ═══ THE BARRIER IS "OLDER STORE **PRESENT**", NOT "OLDER STORE **UNREADY**" ═══════
+      // This term used to carry `&& !s.ready`, and that was the root cause of the SIX corpus
+      // reds that blocked this whole relaxation (`add_mem_postinc_rmw`, `memind_full_matrix`,
+      // `store_forward_matrix`, each in the copyback AND mmuwalk sweeps -- see
+      // docs/BUG_ls_ooo_inhibited_barrier_p4_park_deadlock.md's "CORPUS GATE" section, which
+      // attributed them to `loadBypassUnreadyLoad` alone on master's own LS EU and left the
+      // root cause open).
+      //
+      // The invariant being protected is the one the oldest-only rule's own comment states:
+      // EVERY OLDER STORE MUST HAVE ALLOCATED ITS ADDRESS INTO THE SQ BEFORE ANY YOUNGER
+      // ACCESS DISAMBIGUATES. "Unready" is the wrong proxy for that. An older store that is
+      // READY but has NOT YET BEEN SELECTED is equally invisible to the SQ-forward query, and
+      // `eligible` has a SECOND term that can withhold selection from it -- `intraMacroOk`
+      // below. The reachable case, all three slots occupied and slot index == age order:
+      //
+      //   slot0  unready LOAD              (=> lsAnyUnready(0), so incA(1) is set)
+      //   slot1  READY STORE, !firstOfInstr  => intraMacroOk(1) = !incA(0) || first = FALSE
+      //                                        => INELIGIBLE, and the OLD `lsStoreUnready(1)`
+      //                                           was FALSE because it IS ready -- so under
+      //                                           the old rule it barriered NOTHING
+      //   slot2  READY LOAD,   firstOfInstr  => intraMacroOk(2) = TRUE, old olderUnreadyStore(2)
+      //                                        = FALSE  => ELIGIBLE and selected
+      //
+      // So the younger load issues ahead of an older, unissued, unallocated store: it queries
+      // the SQ, misses the forward, and reads STALE MEMORY. Architectural registers still
+      // match (the value feeds an unchecked temp), so only final memory is wrong -- the
+      // "dropped store" race, verbatim. `!firstOfInstr` is not exotic: it is the store uop of
+      // EVERY cracked read-modify-write macro (`add.l %d0,(%a1)+`) and of `move mem,mem`,
+      // which is precisely what the three failing programs are built out of.
+      //
+      // Dropping `!s.ready` is IPC-NEUTRAL by construction, not a trade: there is exactly ONE
+      // LS issue port, and `OHMasking.first` over `eligible & lsReady` takes the OLDEST
+      // candidate -- so whenever an older store is ready AND eligible it already wins the
+      // port and the younger load already could not issue that cycle. The only behaviour this
+      // removes is the bypass of an older store that is ready but WITHHELD by another
+      // eligibility term, which is exactly the corrupting case. It also makes this prefix's
+      // input a pure flop function (`sel`, `memOp`) instead of the derived `!s.ready` the
+      // paragraph above complains about.
+      //
+      // ⚠️ GENERALISATION, because this is the second time an added eligibility term has
+      // silently widened this hazard: any FUTURE term that can withhold selection from an
+      // older LS slot re-opens it if the barrier is phrased as a property of that slot's
+      // READINESS. Phrase the barrier as OCCUPANCY and it is immune to every such term.
+      val lsStorePresent = (0 until slotCount).map { i =>
         val s = slots(i)
-        val isStore = s.hot.memOp === m68k040.isa.MemOp.STORE
-        s.sel && isLs(s.hot) && Mux(isStore, !olderUnreadyLs(i), !olderUnreadyStore(i))
-      })
+        lsPresent(i) && (s.hot.memOp === m68k040.isa.MemOp.STORE)
+      }
+      // Exclusive prefix OR by recursive doubling: `inc(i) = OR x(0..i)` in
+      // ceil(log2(16)) = 4 levels, then shifted by one to make it exclusive. Shared
+      // across all 16 outputs, so it is one structure rather than 16 reductions.
+      var inc = lsStorePresent.toIndexedSeq
+      var d = 1
+      while (d < slotCount) {
+        val prev = inc
+        inc = (0 until slotCount).map(i => if (i >= d) prev(i) || prev(i - d) else prev(i))
+        d <<= 1
+      }
+      val olderStorePresent = Vec((0 until slotCount).map(i =>
+        if (i == 0) False else inc(i - 1)))
+      // `lsPresent` is `s.sel && isLs(s.hot)` and is already built above for `ohLoldest`,
+      // so eligibility is one 16-bit AND-NOT rather than a fresh per-slot qualifier.
+      // ── INTRA-MACRO RESTRICTION (`lsOooFirstOfInstrOnly`) ─────────────────────────
+      // Needed to make the inhibited-barrier violation RECOVERABLE. Recovery restarts at
+      // the PC of the oldest SQUASHED entry, so that PC must be a macro boundary; and the
+      // flush can only be taken when the inhibited op is at `p0.last` (RobPlugin's
+      // `h0IsMacroLast`, an alloc-time fact). If a violator were a younger uop of the
+      // inhibited op's OWN macro, it would already have retired by `p0.last` and the squash
+      // could not reach it -- and restarting earlier would re-execute the device access,
+      // which is the `inhibited-load-irq-replay` bug (replay re-pops the 53C96).
+      //
+      // Requiring a bypassing uop to be FIRST of its instruction removes the case outright:
+      // every older LS uop is then in a strictly older macro. Only uops that actually
+      // overtake something pay it -- `!olderUnreadyLs` means nothing was overtaken.
+      // UNCONDITIONAL: the inhibited barrier's RECOVERY depends on it (see RobPlugin's
+      // `orderRedirect` -- the restart PC is only a macro boundary if the violator is not a
+      // retired sibling uop of the inhibited op's own macro). Priced at 0.49pp aggregate.
+      val intraMacroOk: Bits = {
+        val lsAnyUnready = (0 until slotCount).map(i => lsPresent(i) && !slots(i).ready)
+        var incA = lsAnyUnready.toIndexedSeq
+        var dA = 1
+        while (dA < slotCount) {
+          val prev = incA
+          incA = (0 until slotCount).map(i => if (i >= dA) prev(i) || prev(i - dA) else prev(i))
+          dA <<= 1
+        }
+        B((0 until slotCount).map(i =>
+          (if (i == 0) True else !incA(i - 1)) || slots(i).hot.firstOfInstr))
+      }
+      val eligible = lsPresent & ~olderStorePresent.asBits & intraMacroOk
       OHMasking.first(eligible & lsReady)
     }
     val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed
