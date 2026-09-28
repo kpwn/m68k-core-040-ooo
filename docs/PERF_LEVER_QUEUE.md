@@ -368,6 +368,15 @@ count by **zero**, because the array is refilled in the same cycle the latch is.
   is negative and well inside the ~800 LUT floor, LUTRAM/BRAM/DSP all unchanged. See
   `docs/PERF_AREA_LEDGER.md`'s synth-only sub-table, including why the per-module rows of
   the two reports must not be read against each other.
+- **Ported corpus (`PortedM68kOooSpec`): 1010 ok / 12 failed in BOTH arms, IDENTICAL
+  name-for-name** — the known FMOVEM.X family, `mmu_atc_write_hit_sets_modified`,
+  `exc_partial_macro_move_mem_mem` and `rom_scc_mmio_btst_dbf_timeout`, all already in the
+  defect register. ✅ **And it is not a null test of this lever: 39 `ported-sweep-mmuwalk`
+  programs ran**, i.e. the `ForceMmuWalkCopyback` posture with all four TTRs zero, real
+  identity page tables and `TC.E`+`CACR.DE|IE` on, where every cold-TLB instruction fetch
+  runs a genuine root→pointer→page walk. **All 39 pass in both arms**, and not one of the 12
+  reds carries the `ported-sweep-mmuwalk` prefix. That posture is the only thing in the
+  regression suite that walks the ITLB at all, so it is what makes this gate informative.
 - **`ExecuteLockStepSpec`: 690 ok / 12 failed / 1 ignored in BOTH arms, and the 12 failures
   are IDENTICAL NAME-FOR-NAME** (not merely equal in count) — 11 of the documented
   `odd-ssp` "level-1/level-7 IRQ at every boundary of the LINK #-75 stretch" family plus
