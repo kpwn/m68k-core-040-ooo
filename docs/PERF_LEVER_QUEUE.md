@@ -556,6 +556,18 @@ unblocks any of this** — and it is already prototyped at **+12.7% IPC**, corpu
 **So LS-OoO issue is not one lever among several. It is the PREREQUISITE for the entire
 memory-side program.** Its +12.7% is the smaller half of its value.
 
+⚠️ **AND THE 0.04% ITSELF NEEDS RE-MEASURING, because it was taken with
+`loadBypassUnreadyLoad` OFF** — i.e. with LS issue strictly in program order, **which is the
+very cap the number is measuring.** The probe queue is empty during refills *because the IQ
+will not select past a stalled load*, which is exactly what `LS_OOO_ISSUE` relaxes. Re-run
+with the flag ON before treating `N_MSHR > 1` or step 2's MLP case as dead.
+
+🎯 **NEW RULE, sibling of "check the bench CONTAINS the shape":**
+
+> **Check the MACHINE IS CONFIGURED TO EXHIBIT the shape before believing a null.**
+> A lever measured on a machine whose *other* flags forbid its mechanism reads as dead and
+> is not. Same disguise as a coverage hole, different cause.
+
 ## ✅ INTEGRATION MERGE COMPLETE AND RE-GATED — `integ/all-shippable` `c4ed1fc7`
 
 Combined IPC **−13.63% / −13.36% cycles** (seeds 1/17, cycle-weighted, 34 kernels). **Not
