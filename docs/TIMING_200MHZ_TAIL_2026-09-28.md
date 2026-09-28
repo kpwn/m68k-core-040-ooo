@@ -1,0 +1,80 @@
+# 200 MHz closure on `integ/all-shippable`, and what the tight tail is made of
+
+Build: `macqd700-soc-public/build/lane200_integoff`, route directive `AggressiveExplore`.
+CPU provenance: `cpu040_sha=c4ed1fc7` (`integ/all-shippable` head), `dirty=no`,
+`target_freq_mhz=200`, `core_clk_hz=200_000_000`, `cpu_ipc_profile=throughput-v2`.
+
+`SHIPPING_CONFIG` (read from the build log, per the four-instance rule -- this is the
+**flags-OFF arm**, i.e. the baseline for the new levers):
+
+    lsOooIssue=false ipcThroughput=true ipcLateStore=true specLoadWakeup=false
+    dcacheHitUnderMiss=true dcacheHitUnderMissRead=false dcacheFillForward=false
+    dcacheSectored=false rasBranchRepair=false computeDirectTargets=false
+    deferSlot1Uncond=false deferSlot1Dbcc=false itlbVictimEntries=0
+    storeQueueDepth=8 sqNarrowDrainMerge=false icachePrefetch=true
+
+## Result: closed, with EXACTLY ZERO margin
+
+    WNS  +0.000 ns   TNS 0.000   0 failing of 345,675 setup endpoints
+    WHS  +0.000 ns   THS 0.000   0 failing of 344,827 hold endpoints
+    WPWS +0.000 ns               0 failing of 114,295 pulse-width endpoints
+    "All user specified timing constraints are met."
+
+Clocks are genuinely constrained: `core_mmcm_clkout0` = 5.000 ns / 200 MHz,
+`checking no_clock (0)`, 0 register pins with no clock. All 2,915 detailed paths MET,
+none violated. So the zeros are a real result, not an unconstrained-design artifact
+and not a failed parse -- `fpga_top.buildinfo.resume`'s `wns=0.000` is faithful.
+
+**This is worse than both prior closures (+0.007, +0.010).** Zero margin is not
+shippable-by-inspection, and per `neither-wns-metric-attributes-small-effects`, a
+0.000 here cannot be compared to a +0.007 there at all. Treat it as "route found an
+answer at this netlist", nothing more.
+
+## The tail is CONTROL BROADCAST, not datapath
+
+Five paths sit at exactly 0.000. **One is the SONIC TX DMA; four are `u_cpu/socket_core`.**
+(The SONIC path is merely the first one the report prints -- it does not own the tail.
+I initially read it as the binding module and that was wrong.)
+
+Slack distribution below 0.020 ns: 5 @ 0.000, then a dense tail -- 21 paths at 0.017
+alone, ~110 paths under 0.020 ns. The design is not limited by one path; it is limited
+by a *wall* of near-identical ones, which is why placement variance has always beaten
+single-path levers here.
+
+Recurring source->destination hubs in that wall, all of the same SHAPE -- a control
+register fanning out to a wide **clock-enable or reset** pin, never a datapath D pin:
+
+| Source (fanout hub) | Destination | Paths <=0.020 |
+|---|---|---|
+| `RobPlugin_logic_doFlushReg_reg` | `IssueQueuePlugin ... triggers_reg[0]/CE`, `selPorts_1_rData_robId/D` | 4 |
+| `DcachePlugin_logic_tagMem_{0,3}_reg/CLKARDCLK` | `victimEvictLine_reg[*]/CE`, `maint_wbLineReg_reg[*]/CE` | 7 |
+| `GsharePlugin_logic_pht_spinal_port4_reg[1]` | `IcachePlugin_logic_mshrPa_{2,3}_reg[*]/CE` | 5 |
+| `RobPlugin_logic_exc_fsm_stateReg_reg[1]_rep__1` | `DtlbPlugin ... token_reg[*]/CE` | 3 |
+| `DcachePlugin_logic_missCmode_reg[0]` | `LsEuPlugin_logic_s1Base_reg[20]/R`, IQ `dynWaitAny/D` | 2 |
+
+Worst path profile: **14 logic levels, 4.876 ns of 5.000 ns, route 3.680 ns = 75.5%**
+(logic only 24.5%). Clock skew -0.001 ns, uncertainty 0.061 ns. Route-dominated,
+consistent with `200mhz-closed-fullcore` (80.4% wire).
+
+### Consequences
+
+1. **The lever that matters for fmax is FANOUT on control nets, not area.** This is the
+   same conclusion as `compaction-is-free-ohmasking-is-cheap` ("the win is fanout"),
+   now confirmed from the *binding* paths rather than from a count.
+2. **GOAL.txt step 0 is at risk.** LS-OoO issue costs +1,421 LUT and touches the IQ's
+   issue select -- the exact structure on the far end of `doFlushReg`'s 4 tightest
+   paths. Shipping it into a 0.000 ns design will not close unless it stays off those
+   nets. Price it against THIS tail, not against an area number.
+3. **One path looks spurious and is worth a look on its own merits:**
+   `GsharePlugin pht_spinal_port4_reg[1]` -> `IcachePlugin mshrPa_*_reg[*]/CE`, five
+   times. There is no plausible dataflow from a PHT read port to an I-cache MSHR
+   address's clock enable. That smells like a shared/merged enable term coupling two
+   unrelated structures. If it is spurious, breaking it is free fmax.
+
+## Falsifier for claim 1
+
+If fanout on those control nets is the limiter, then replicating `doFlushReg` and
+`missCmode` (a flop each, no logic) should move those specific endpoints off the tail
+without changing IPC or area materially. If the tail does not move, the limiter is
+route congestion in the destination structures and replication will not help --
+in which case see `area-vs-density-congestion`.
