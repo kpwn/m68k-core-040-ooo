@@ -501,6 +501,61 @@ one way this could still die like the dead stride prefetcher at 206% of bus, and
    `{vpn, supervisor, write, token}`, with no lookup-only bit and no no-fill path in
    `DtlbPlugin`. Build `demandBacked`, but a stride prefetcher cannot simply flip it.
 
+## ⛔⛔⛔ D-SIDE MLP IS CAPPED AT 1 BY THE ISSUE QUEUE — not the cache, not the fabric
+
+**The D2 prize is 0.04% of cycles.** Measured with a no-RTL hook over six already-`simPublic`
+signals — `memcpy-16k`, `IPC_MEM=l2:5:60:4096`, **`IPC_MEM_XBAR=1`**, lever 1 ON — counting
+cycles where the FSM is refilling **and** a younger load's probe has already resolved to a
+miss, which is the exact customer a second MSHR would serve:
+
+| | cycles | share |
+|---|---:|---:|
+| window | 144,521 | |
+| FSM refilling | 49,032 | **33.9%** |
+| …probe entry merely **VALID** | **116** | 0.2% of refill cycles |
+| …probe **resolved and MISSED** | 110 | 0.08% of all |
+| …and **different set** (D3-legal) | **65** | **0.04% of all** |
+
+⭐ **Read the second row.** Across 49,032 refill cycles a probe entry is valid at all on
+**116**. The probe queue is **EMPTY during refills — the D-cache is never OFFERED a second
+load.**
+
+**Root cause, and it is upstream of everything we have been measuring:**
+`IssueQueuePlugin` selects `OHMasking.first(lsPresent)` — the **oldest occupied LS slot,
+ready or not** — then ANDs `lsReady`. **LS issue is strictly in program order; nothing
+younger may pass a stalled load.**
+
+> **D-side MLP is capped at 1 by the ISSUE QUEUE — not by `N_MSHR`, not by the crossbar, and
+> not by `MAX_BULK_AHEAD`.**
+
+### This re-prices the entire bandwidth program
+
+- **`N_MSHR > 1` (step 3): DEAD** until LS issue is out-of-order. `D4` and `D3-SET` keep
+  their independent merits (correctness; deleting a blanket barrier) but are **no longer
+  prerequisites for anything**.
+- **The direct L2C port (step 2): its MLP justification is GONE.** It was scoped to carry
+  *concurrent* cacheable reads and the core cannot produce them. A **latency** justification
+  may survive — fewer hops than the crossbar — but that is a **different claim requiring its
+  own measurement**, and it must not inherit the MLP argument.
+- **The L2 global accept gate (step 4) is UNAFFECTED and is now the only memory-side item
+  left**, because it is a pure latency lever: one refill blocking every port's hits costs
+  even at MLP 1.
+- ✅ **`oldestUnready` = 83% is explained.** Every "more memory parallelism" lever to date —
+  including both measured today — was priced against a machine that **structurally cannot
+  use parallelism**.
+
+### 🎯 And the unblocker is already built, gated, and sitting default-OFF
+
+`docs/DESIGN_ooo_load_issue_and_prefetch.md` §1.5 states the in-order property and concludes
+"no IQ change is needed for out-of-order load **completion**" — true, and irrelevant: the
+binding constraint is out-of-order **ISSUE**. The design proposal's §10 Alternative A,
+rejected as *"the genuinely larger IPC lever… rejected for now"*, **is the only thing that
+unblocks any of this** — and it is already prototyped at **+12.7% IPC**, corpus-gated
+1,010/12 with identical sets, and merged into `integ/all-shippable`.
+
+**So LS-OoO issue is not one lever among several. It is the PREREQUISITE for the entire
+memory-side program.** Its +12.7% is the smaller half of its value.
+
 ## ✅ INTEGRATION MERGE COMPLETE AND RE-GATED — `integ/all-shippable` `c4ed1fc7`
 
 Combined IPC **−13.63% / −13.36% cycles** (seeds 1/17, cycle-weighted, 34 kernels). **Not
