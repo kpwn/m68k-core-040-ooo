@@ -163,3 +163,57 @@ It is the frontend's documented longest cone, it is known, and it **closed** in 
 retimable (`icMaintFlush`, worth 1.129 ns of pure prefix) and returned the endpoint to its
 structural level. There is no missed lever here — the tail is a wall, and this is one
 brick of it that has already been worked.
+
+---
+
+## ⛔⛔ THE FLAGS-ON ARM DOES NOT CLOSE: WNS −2.882 ns (2026-09-29)
+
+`build/lane200_integon`, same tree (`c4ed1fc7`), same flow, same 200 MHz constraint as
+the +0.000 OFF arm. Nine flags ON, `lsOooIssue` deliberately excluded.
+
+    WNS  -2.882 ns   TNS -37,401.688   41,267 failing of 348,254 setup endpoints
+    WHS  +0.000 ns   0 failing hold
+    "Timing constraints are not met."
+
+−2.882 ns against a 5.000 ns period is a **~127 MHz** design. This is not marginal and no
+placement lottery explains it: the OFF arm on the same tree closed at **+0.000**.
+
+### Worst path, and the attribution
+
+    FetchAlignPlugin_logic_icMaintFlushArm_reg/C  ->  ItlbPlugin_logic_vic_ppn_13_reg[4]/D
+    8.067 ns data path, 22 levels, route 5.952 ns (73.8%)
+
+Among the reported violated paths, CPU-side destinations are dominated by
+`ItlbPlugin_logic_vic_ppn` (28) and `ItlbPlugin_logic_vic_keys` (19), and the dominant
+CPU-side source is `icMaintFlushArm` (50). Post-route `phys_opt` spent its entire run
+emitting `Physopt 32-953 Path group WNS did not improve` on `vic_*`/`victim_*` nets.
+
+**Prime suspect: `ITLB_VICTIM=32`.** It adds 32 victim entries whose PPN and key registers
+must all be reached by `icMaintFlushArm` — a signal that was itself registered
+specifically to SHORTEN the frontend cone (`FetchAlignPlugin.scala:55-100`). This is the
+exact "control register driving a wide enable/reset" shape this document already
+identified as the tail's owner, now loaded with 32 new destinations.
+
+⚠️ **NOT YET ATTRIBUTED.** Nine flags changed in one build. The evidence above is strong
+but it is one configuration, and this project's own rule is that a merged tree is a new
+configuration. `lane200_integon2` is building now with **`ITLB_VICTIM` removed and the
+other eight flags unchanged** — it either closes (ITLB victim buffer is the sole cause,
+and we get a Dhrystone-measurable arm) or it does not (bisect the remaining eight).
+
+### MY ERROR IN CONSTRUCTING THE SET
+
+`ITLB_VICTIM=32` is the correct *value* — 32 entries is the documented sizing that removes
+73.9% of walks. **Including the lever at all was the mistake.** Its own flag comment says:
+
+> *"⛔ DEFAULT OFF, PENDING A BOARD MEASUREMENT ... ⚠️ This lever CANNOT be measured on
+> Dhrystone: the board's Dhrystone-only window walks the ITLB **0.061 times per kinst**.
+> Its workload is boot and the Finder."*
+
+So it was bundled into a **Dhrystone-targeted shipping candidate** despite (a) being unable
+to show a gain on that benchmark, (b) being explicitly held OFF pending a board
+measurement, and (c) never having been timed at 200 MHz — its recorded cost was
+"+1,451 FF, no measurable LUT", which is an AREA figure, and
+[[area-vs-density-congestion]] is precisely the warning that area does not predict timing.
+
+**Rule for the next ON set: a flag whose own comment says it cannot be measured by the
+benchmark the build targets does not belong in that build.**
