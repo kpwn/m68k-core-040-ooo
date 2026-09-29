@@ -99,7 +99,11 @@ case class SqFwdRsp() extends Bundle {
 class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  reserveLateStore: Boolean = false,
                  forwardOnPublish: Boolean = false, retireWidth: Int = 2,
-                 narrowDrainMerge: Boolean = false) extends Component {
+                 narrowDrainMerge: Boolean = false,
+                 /** D4 (`ShippingCoreConfig.inhibitedFullBarrier`): gate an INHIBITED precise
+                   * drain on `io.inhibLaunchOk` and export `io.inhibHeadHold`. False
+                   * elaborates neither port and leaves this component unchanged. */
+                 inhibitedFullBarrier: Boolean = false) extends Component {
   require(isPow2(depth))
   require(Set(2, 4, 8, 16)(retireWidth))
   require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
@@ -169,6 +173,15 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     //                        ROB entry, so its replay must be DISCARDED, not applied.
     val flushKeptPrecise    = out(Bool())
     val sqCompletionOrphan  = out(Bool())
+    // ---- D4: inhibited-store barrier handshake with the LS EU (flag-gated) ----------
+    //   `inhibLaunchOk`: the LS EU's "the D side is quiet and the walkers are fenced"
+    //                    verdict. An INHIBITED head may start its (first-half) precise
+    //                    drain only while this is high.
+    //   `inhibHeadHold`: an INHIBITED precise store is at the ring head AND either is the
+    //                    ROB head with no preemption pending (about to launch) or is
+    //                    already draining. The LS EU fences the table walkers on it.
+    val inhibLaunchOk = if (inhibitedFullBarrier) in(Bool()) else null
+    val inhibHeadHold = if (inhibitedFullBarrier) out(Bool()) else null
   }
 
   // ---- ring storage ----
@@ -491,7 +504,31 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // `sendPipelined` regardless of this term.
   val sendPipelined = !sendPrecise &&
     (sendMode === CacheMode.COPYBACK || sendMode === CacheMode.WRITETHROUGH)
-  val sendPreciseReady = sendAtHead && headPreciseReady && noAccepted
+  // ── D4: THE "BEFORE" HALF FOR AN INHIBITED STORE ───────────────────────────────
+  // At the ROB head every older instruction has retired and, the ring being FIFO, every
+  // older store has already popped (on its own terminal ack) -- so the only things left
+  // to wait for are OTHER D-side transactions: a table walker's refill or U/M write, a
+  // refill tail, a maintenance push. `inhibLaunchOk` is the LS EU's verdict on exactly
+  // those. Gated on the FIRST half only: between slot A's ack and slot B's launch nothing
+  // else can enter (younger loads are held by `olderInhibitedStore`, younger stores are
+  // uncommitted, walkers stay fenced by `inhibHeadHold`), so re-waiting on B would only
+  // add latency. NOT applied to an ORPHAN head: its slot A has already hit memory, the
+  // commit-side exception FSM waits for it, and holding it would be the deadlock
+  // `headOrphan`'s own comment warns about.
+  // (Elaborated only under the flag -- the OFF netlist gains not even a constant.)
+  val headIsInhibited: Bool = if (!inhibitedFullBarrier) null else
+    (cacheModes(head) === CacheMode.INHIBITED) ||
+    (validBs(head) && (cacheModesB(head) === CacheMode.INHIBITED))
+  // `inhibDrainOffered`: once the gated drain has been PRESENTED it stays presented until
+  // it fires (or a flush drops the entry) -- `drain` is a real Stream, and a valid that
+  // fell without a fire because `inhibLaunchOk` moved would be a protocol violation.
+  val inhibDrainOffered: Bool = if (!inhibitedFullBarrier) null else RegInit(False)
+  /** SIM-ONLY (null in synthesis): inhibited precise drains started, first half only. */
+  val d4StoreLaunches: UInt = if (!inhibitedFullBarrier) null else
+    GenerationFlags.simulation { val r = RegInit(U(0, 32 bits)); r.simPublic(); r }
+  val sendPreciseReady = if (!inhibitedFullBarrier) sendAtHead && headPreciseReady && noAccepted
+    else sendAtHead && headPreciseReady && noAccepted &&
+         (!headIsInhibited || headOrphan || sendPhaseB || io.inhibLaunchOk || inhibDrainOffered)
   val sendSerialReady = sendCommitted && sendAtHead && noAccepted
   io.drain.valid := Mux(sendPipelined, sendCommitted,
     Mux(sendPrecise, sendPreciseReady, sendSerialReady))
@@ -1195,6 +1232,24 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   when(preciseLaunch) { preciseDrainBusyReg := True }
     .elsewhen(preciseFinalAckD) { preciseDrainBusyReg := False }
   io.preciseDrainBusy := preciseDrainBusyReg
+
+  // D4: the walker fence. PENDING = about to be allowed to launch (same head/preempt terms
+  // `headPreciseReady` uses, so the fence never outlives a preemption that will flush this
+  // entry); IN FLIGHT = `preciseDrainBusyReg` for an inhibited head (the entry stays the
+  // ring head until its terminal ack pops it, so `headIsInhibited` names the draining op).
+  if (inhibitedFullBarrier) {
+    when(io.drain.valid && !io.drain.ready && sendPrecise && headIsInhibited && !sendPhaseB) {
+      inhibDrainOffered := True
+    }
+    when(io.drain.fire || io.flush) { inhibDrainOffered := False }
+    val pendingAtHead = valids(head) && headIsInhibited && precises(head) && !committed(head) &&
+                        !orphans(head) && io.robHeadValidIn &&
+                        (robIds(head) === io.robHeadIn) && !io.irqPreemptPendingIn && !io.flush
+    io.inhibHeadHold := pendingAtHead || (preciseDrainBusyReg && headIsInhibited)
+    val inhibStoreLaunch = preciseLaunch && headIsInhibited && !sendPhaseB
+    inhibStoreLaunch.simPublic(); io.inhibHeadHold.simPublic()
+    if (d4StoreLaunches != null) when(inhibStoreLaunch) { d4StoreLaunches := d4StoreLaunches + 1 }
+  }
 
   // Protocol and precise-path priority invariants. A serial/precise half may only
   // launch with no older accepted half; an ack can never exist without occupancy.

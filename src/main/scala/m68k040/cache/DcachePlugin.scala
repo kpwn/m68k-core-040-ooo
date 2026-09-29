@@ -327,7 +327,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * whereas a single-sector read port means the evict-or-not decision
                      * needs the line's dirty OR as its own bit. Per-way data bytes are
                      * unchanged at 2,048, so the 2 KB set-aliasing stride does not move. */
-                   val sectored: Boolean = m68k040.top.ShippingCoreConfig.dcacheSectored)
+                   val sectored: Boolean = m68k040.top.ShippingCoreConfig.dcacheSectored,
+                   /** D4: elaborate `busQuiesced` (see `DcacheService.busQuiesced`). Defaults
+                     * to the shipping flag so every harness that builds the LS EU with the
+                     * barrier on also builds its producer; a mismatch fails elaboration
+                     * loudly (the LS EU would read a null) rather than silently. */
+                   val exportBusQuiesced: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
     extends FiberPlugin with DcacheService {
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
@@ -820,6 +825,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // direct-response path both see the SAME cacheability the missing access
     // actually had (not a live signal that could have moved on).
     val missCmode = Reg(CacheMode())
+    missCmode.simPublic()   // D4 bus monitor: classifies a refill-id AR as inhibited or not
     val victimWay = Reg(UInt(wayBits bits))
     victimWay.simPublic()   // test-visibility only (DcacheDrainRefillRaceSpec's
     // same-way-collision coincidence check); no-op for synthesis.
@@ -1713,6 +1719,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val stSubP      = Reg(UInt(offBits bits)) init 0
     val stSubEnd    = Reg(UInt(offBits + 1 bits)) init 0
     val stSubActive = RegInit(False)    // this drain is an INHIBITED covered sequence
+    stSubActive.simPublic()   // D4 bus monitor: classifies a D_STORE AW as inhibited or not
     val stSubErr    = RegInit(False)    // OR of every sub-transaction's B response
     // Task #236 fix: the store-side mirror of `subLog2Reg` above -- `stSubLog2` used to be
     // an UNCONDITIONAL top-level `val` (not even gated behind `stSubActive`), recomputing
@@ -3728,6 +3735,40 @@ class DcachePlugin(val socketMerged: Boolean = false,
     maintErrorReg := False
     maintErrorReg.simPublic()
 
+    // ── D4: `busQuiesced` (see `DcacheService.busQuiesced` for the contract) ─────────
+    // ADDITIVE AND FLAG-GATED: nothing here exists unless `ShippingCoreConfig.
+    // inhibitedFullBarrier` is on, so the OFF netlist is untouched by construction.
+    //
+    // REGISTERED, and the "entering" terms are what make a registered value SOUND: a
+    // command accepted in cycle t is invisible to the state terms until t+1, so the flop
+    // samples "nothing in flight AND nothing entering" at t. A consumer launching at t+1
+    // therefore sees at worst a transaction that entered AT t+1 -- and the LS EU excludes
+    // every such source at its launch cycle (walkers fenced, no older store left,
+    // ownership CORE).
+    //
+    // "Entering" is read as the port VALIDS, not the fires: conservative (an offered but
+    // refused command also reads as not-quiet), and it keeps the deep `ready` cones --
+    // `loadCmdPort.ready` carries the probe CAM, `storePort.ready` the whole store-pipe
+    // admission -- off this flop's D input. The one self-reference, an inhibited store's
+    // OWN drain offer, cannot close a loop: StoreQueue latches the offer once made
+    // (`inhibDrainOffered`), so the drain never re-reads this after presenting.
+    //
+    // `fsm.isActive(IDLE)`, not `busy`: `busy` is itself a register that lags the state by
+    // a cycle on the way back into IDLE, which is only conservative, but on the way OUT it
+    // is set in the same cycle as the `goto`, so both are exact there; the state test is
+    // simply the direct statement. EVICT_WR/REFILL/REPLAY (and the sectored EVICT_RD/CK
+    // walk) are all non-IDLE, so a refill's AR..last-R and an eviction's AW..B are covered.
+    val busQuiescedReg: Bool = if (!exportBusQuiesced) null else {
+      val quietNow = fsm.isActive(fsm.IDLE) && !ldS1Valid && !loadShadowValid &&
+                     (storeOutstanding === 0) && !serialStoreInFlight &&
+                     !pendingStoreMiss && !pendingWtKickoff && !storeMissBarrier &&
+                     stAwDone && stWDone && evictAwDone && evictWDone && !maintBusyReg
+      val enteringNow = loadCmdPort.valid || storePort.valid || maintCmdPort.valid
+      val r = RegNext(quietNow && !enteringNow) init False
+      r.simPublic()
+      r
+    }
+
     // ── TCR.P (8 KB pages), task #195 follow-up / Part 131 ─────────────────────
     // PAGE-scope CPUSHP/CINVP must cover the page as sized by TCR.P, not a fixed
     // 4 KB block (MC68040UM §4: the page-scope operand is "the page containing the
@@ -5357,4 +5398,5 @@ class DcachePlugin(val socketMerged: Boolean = false,
   // Exported precondition (see DcacheService.maintQuiesced's contract): the whole
   // D-cache datapath is idle AND no walk is already running.
   override def maintQuiesced = logic.maintQuiescedReg
+  override def busQuiesced = logic.busQuiescedReg
 }
