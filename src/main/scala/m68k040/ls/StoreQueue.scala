@@ -1241,10 +1241,13 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     when(io.drain.valid && !io.drain.ready && sendPrecise && headIsInhibited && !sendPhaseB) {
       inhibDrainOffered := True
     }
-    when(io.drain.fire || io.flush) { inhibDrainOffered := False }
+    // Cleared when the entry leaves (fire, or a flush that dropped it -- `valids(head)`
+    // then reads False for at least a cycle). Not on `io.flush` itself, which is
+    // `doFlushReg`-derived (a 200 MHz tail hub).
+    when(io.drain.fire || !valids(head)) { inhibDrainOffered := False }
     val pendingAtHead = valids(head) && headIsInhibited && precises(head) && !committed(head) &&
                         !orphans(head) && io.robHeadValidIn &&
-                        (robIds(head) === io.robHeadIn) && !io.irqPreemptPendingIn && !io.flush
+                        (robIds(head) === io.robHeadIn) && !io.irqPreemptPendingIn
     io.inhibHeadHold := pendingAtHead || (preciseDrainBusyReg && headIsInhibited)
     val inhibStoreLaunch = preciseLaunch && headIsInhibited && !sendPhaseB
     inhibStoreLaunch.simPublic(); io.inhibHeadHold.simPublic()
