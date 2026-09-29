@@ -1036,3 +1036,35 @@ it* -- this is instance 7 and it gets a control before it gets a conclusion.
 Falsifier for "writeback parallelism is the lever": if the eviction arm is flat under
 4x DDR latency, then adding miss/writeback overlap buys nothing and the real limit is
 the number of outstanding transactions the L2 will hold.
+
+### ✅ THE CONTROL LANDED: miss/writeback parallelism IS the lever (2026-09-29)
+
+4x DDR latency (60 -> 240 cyc), memcpy-64k, both L2 regimes:
+
+| L2 | evictions | DDR 60 | DDR 240 | exposed |
+|---|---|---|---|---|
+| 2048 KiB | **0** | 199,724 cyc | 199,927 cyc | **0.06%** of predicted |
+| 32 KiB | **3,586** | 323,343 cyc | **692,572 cyc** | **50.0%** of predicted |
+
+"Exposed" = observed extra cycles / (misses x 180). Without writebacks the machine hides
+essentially ALL added DDR read latency. With writebacks, **half of it becomes exposed.**
+
+**This answers the owner's question directly: the writeback path SERIALISES against the
+miss path.** Miss-under-writeback overlap is a real lever, not an assumed one. It also
+resolves the earlier flat 2 MB result, which on its own looked like "the `ddr` knob is
+dead" -- the knob is live, and the 2 MB arm is flat because there is nothing to serialise
+against.
+
+⛔ **My falsifier was stated as "if the eviction arm is flat under 4x DDR latency, adding
+overlap buys nothing". It is NOT flat -- +114%. The lever survives its own falsifier.**
+
+⚠️ **AND A HARD INSTRUMENT LIMIT, verified in source.** `dramCycles` reaches **only the
+READ engine** (`AxiMemModel.scala:483`). The write engine schedules its B response at
+`hitCycles` **unconditionally** (`:693`, `val lat = ... cfg.latency.hitCycles`), which the
+model's own header documents at `:934`: *"`dramCycles` only ever reaches the READ engine"*.
+
+So **every writeback in these measurements is priced at 5 cycles.** The -38.28% eviction
+cost and the 50% exposure above are therefore **LOWER BOUNDS** -- real DDR writes are far
+slower than 5 cycles, so silicon should be worse, not better. Any L2 writeback work sized
+off this harness is sized off an optimistic model, and `hitCycles` is the only knob that
+reaches the write path at all.
