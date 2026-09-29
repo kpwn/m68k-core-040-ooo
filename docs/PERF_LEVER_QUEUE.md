@@ -1068,3 +1068,27 @@ cost and the 50% exposure above are therefore **LOWER BOUNDS** -- real DDR write
 slower than 5 cycles, so silicon should be worse, not better. Any L2 writeback work sized
 off this harness is sized off an optimistic model, and `hitCycles` is the only knob that
 reaches the write path at all.
+
+#### ⛔⛔ RETRACTED SAME DAY: that was NOT writeback serialisation
+
+The conclusion immediately above -- "the writeback path serialises against the miss
+path" -- is **WRONG and withdrawn**. `AxiMemModel` **has no writebacks at all**:
+
+> `AxiMemModel.scala:424` — *"The evicted line simply stops being resident -- this model
+> has no dirty bit, so **an eviction costs no bus traffic here**"*
+> `:95` — *"this capacity image is READ-SIDE only... `AxiWriteEngine` is a separate
+> object with no shared L2 state and does not [install or evict]"*
+
+So the `evictions=3586` counter is a **residency** event with **zero** modelled cost.
+There was nothing to serialise against. I read an eviction counter as a writeback and
+built a mechanism on it.
+
+**What the data still supports**, stripped of that story: DDR read latency is ~fully
+hidden when misses are SPARSE (2,049 over 199,724 cyc) and **50% exposed when misses are
+DENSE** (4,099, with the working set thrashing). That is about **miss-overlap capacity**,
+not about writebacks. It is a real and reproducible effect; **its mechanism is
+UNRESOLVED** and I am not proposing a third story for it.
+
+⚠️ **Consequence for the owner's question (automatic/eager L2 writeback): these numbers
+cannot speak to it in either direction.** The question has to be answered against
+`l2c.v`, not this harness. See below.
