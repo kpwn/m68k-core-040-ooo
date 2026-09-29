@@ -420,6 +420,36 @@ object ShippingCoreConfig {
     * `SQ_NARROW_MERGE=1` turns it on for an A/B without editing every DUT. */
   val sqNarrowDrainMerge: Boolean = envFlag("SQ_NARROW_MERGE", false)
 
+  /** D4: a CACHE-INHIBITED access is a FULL MEMORY BARRIER in BOTH directions, enforced
+    * entirely in the core. See `LsEuPlugin.inhibitedFullBarrier` for the mechanism and the
+    * deadlock argument, and `docs/superpowers/specs/2026-09-29-throughput-architecture.md`
+    * §2.4 item 3 for why it exists.
+    *
+    * WHY: it is the HARD prerequisite of P6 (the memory hot/cold split). Once cacheable
+    * refills leave on a hot door and inhibited accesses on the cold one, the fabric keeps
+    * NO cross-door order ("The fabric contributes NO cross-path ordering between doors and
+    * does not need to" -- the SoC side's `cpu_socket.vh`, branch `feat/p6-dside-hot-door`).
+    * Today's single D-side port hides most of the hazard behind the one-FSM D-cache; this
+    * flag makes the order an explicit core property instead of a structural accident.
+    *
+    * WHAT IT ADDS, both directions:
+    *   BEFORE -- an inhibited load (P4 or park drain) or inhibited store (SQ precise drain)
+    *     launches only when the D-cache reports `busQuiesced` (no refill/eviction in
+    *     flight, no store awaiting its B, no store-miss allocate, no maintenance walk), the
+    *     table walkers have been fenced for at least one cycle, and neither walker owns a
+    *     D-cache port.
+    *   AFTER -- while an inhibited LOAD is outstanding (launched, terminal response not
+    *     yet consumed) no LS op launches from P4 or the park; while any inhibited access is
+    *     pending-at-head or outstanding the walkers get no D-cache grant. (An inhibited
+    *     STORE's AFTER half already existed: `olderInhibitedStore` holds every younger load
+    *     until the entry pops on its B.)
+    *
+    * OFF PENDING MEASUREMENT -- env `CPU_INHIBITED_FULL_BARRIER=1`; echoed in
+    * `SHIPPING_CONFIG`. The OFF netlist is identical to the pre-D4 tree (every added term
+    * elaborates only under the flag; the D-cache's `busQuiesced` register has no reader and
+    * is pruned). */
+  val inhibitedFullBarrier: Boolean = envFlag("CPU_INHIBITED_FULL_BARRIER", false)
+
   /** I-cache next-line PREFETCH, reset value of `IcachePlugin.prefetchEnable`.
     *
     * ✅ ON. Board-measured: demand I-misses HALVE (127.9 -> 61.2 per kinst) for +2.6%
