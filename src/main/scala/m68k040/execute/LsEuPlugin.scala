@@ -3706,8 +3706,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val inhibLoadInFlight: Bool = if (d4) Bool() else null   // driven beside `loadBusyReg`
     val d4WalkerFence: Bool = dFenced
     if (d4) {
+      // NO `sqFlushSig` term, deliberately: it is `doFlush || ...`, i.e. `RobPlugin
+      // doFlushReg`, one of the 200 MHz tail's control-broadcast hubs
+      // (docs/TIMING_200MHZ_TAIL_2026-09-28.md). A flush clears P4 and the park on the
+      // next edge, so the fence simply drops one cycle later -- holding walkers one extra
+      // cycle is harmless. `excActive` is the ExceptionUnit's own `activeReg` copy, not
+      // `exc_fsm_stateReg`, and it IS needed: an exception may need a walk while P4 is
+      // frozen (not cleared) under `excActive`.
       val pendingAtHead =
-        !sqFlushSig && !excActive && p4PreemptSafe &&
+        !excActive && p4PreemptSafe &&
         ((p4Valid && p4Inhibited && p4AtRobHead) || parkOwnsBarrier)
       dFenced := pendingAtHead || inhibLoadInFlight || sq.io.inhibHeadHold
       sq.io.inhibLaunchOk := dLaunchOk
