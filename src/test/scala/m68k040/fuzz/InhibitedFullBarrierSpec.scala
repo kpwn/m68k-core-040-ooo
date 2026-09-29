@@ -303,4 +303,49 @@ class InhibitedFullBarrierSpec extends AnyFunSuite {
         else None
       }))
   }
+
+  // ── F: randomized mix (liveness + races) ──────────────────────────────────────────
+  // Seeded straight-line mixes of inhibited loads/stores/RMWs, cold-page loads and
+  // write-allocating stores (each a fresh DTLB walk + U/M write-back), warm hits and a
+  // long-latency divide, under real walks with slow stores. A deadlock anywhere in the
+  // barrier shows up as a HANG; ordering as a monitor violation; the RMW count is
+  // checked architecturally.
+  private def srcF(seed: Int, n: Int): (String, Int) = {
+    val r = new scala.util.Random(seed)
+    val b = new StringBuilder
+    b ++= """    .text
+      |_start:
+      |    lea     0xFFFF0100, %a0
+      |    lea     0x00200000, %a1
+      |    lea     0x00001000, %a2
+      |    lea     0x00240000, %a3
+      |    move.l  #0, 8(%a0)
+      |    moveq   #7, %d5
+      |""".stripMargin
+    var rmw = 0; var pa1 = 0; var pa3 = 0
+    for (_ <- 0 until n) r.nextInt(9) match {
+      case 0 => b ++= "    move.l  (%a0), %d0\n"
+      case 1 => b ++= "    move.l  %d1, 4(%a0)\n"
+      case 2 if pa1 < 60 => pa1 += 1; b ++= "    move.l  (%a1), %d2\n    lea     0x1000(%a1), %a1\n"
+      case 3 if pa3 < 60 => pa3 += 1; b ++= "    move.l  %d3, (%a3)\n    lea     0x1000(%a3), %a3\n"
+      case 4 => b ++= "    move.l  (%a2), %d4\n"
+      case 5 => rmw += 1; b ++= "    addq.l  #1, 8(%a0)\n"
+      case 6 => b ++= "    move.l  12(%a0), (%a2)\n"
+      case 7 => b ++= "    divu.w  #3, %d5\n    moveq   #7, %d5\n"
+      case _ => b ++= "    move.l  (%a2), 16(%a0)\n"
+    }
+    b ++= f"""    move.l  #0xBAD000F1, %%d0
+      |    cmp.l   #$rmw, 8(%%a0)
+      |    bne     _fail
+      |""".stripMargin
+    (b.toString + passTail, rmw)
+  }
+
+  for (seed <- 1 to 4) test(s"D4 F: randomized inhibited/walk/allocate mix, seed $seed", VerilatorTest) {
+    val (src, _) = srcF(seed, 120)
+    run(Scenario(s"d4_f_mix_s$seed", src, MmuWalk, dramSlowStores,
+      extraBlocks = Set(0x00200000L, 0x00240000L).map(a => m68k040.fuzz.MmuWalkPosture.blockOf(a)),
+      offMustSee = Some(("any", m => m.violations)),
+      onFired = m => if (m.rtlLoadLaunches + m.rtlStoreLaunches == 0) Some("no inhibited launch") else None))
+  }
 }

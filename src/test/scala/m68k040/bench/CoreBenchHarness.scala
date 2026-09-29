@@ -1891,6 +1891,14 @@ trait CoreBenchHarness extends AnyFunSuite {
           println(s"[br-attr-pc] ${k.name} " + raMisPc.toSeq.sortBy(-_._2._2).take(8)
             .map { case (pc, (b, c)) => f"0x$pc%08x:$b=$c" }.mkString(" "))
       }
+      // D4: RTL-counted inhibited launches (null counters when the barrier is not built).
+      // Zero here means the kernel contains no cache-inhibited access at all, so the
+      // bench CANNOT see the barrier's cost -- report that, never a measured "0%".
+      if (dut.lsEu.logic.d4Sim != null)
+        println(s"[d4-bench] ${k.name} inhibLoadLaunches=${dut.lsEu.logic.d4Sim.loadLaunches.toLong} " +
+          s"inhibStoreLaunches=${dut.lsEu.logic.sq.d4StoreLaunches.toLong} " +
+          s"quietWait=${dut.lsEu.logic.d4Sim.quietWaitCycles.toLong} " +
+          s"youngerHeld=${dut.lsEu.logic.d4Sim.youngerHeldCycles.toLong}")
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +
         s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
