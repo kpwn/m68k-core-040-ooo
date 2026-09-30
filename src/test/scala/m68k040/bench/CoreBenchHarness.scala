@@ -964,6 +964,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxDcOutstanding  = 0
       var lsBypassFires     = 0
       var lsReplays         = 0
+      // Both ports are constants (no simulator signal) in a build without lsOooIssue.
+      val lsOooPorts = try { dut.lsEu.replayRequestPort.valid.toBoolean; true }
+                       catch { case _: Throwable => false }
       var lsOrderViols      = 0
       val bypLiveCount      = Array.fill(16)(0)
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
@@ -1404,8 +1407,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (dut.iq.logic.lsBypassFired.toBoolean) lsBypassFires += 1
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
         // it) and the order-violation recoveries: the two costs the relaxation can incur.
-        if (dut.lsEu.replayRequestPort.valid.toBoolean) lsReplays += 1
-        if (dut.lsEu.orderViolationPort.valid.toBoolean) lsOrderViols += 1
+        if (lsOooPorts) {
+          if (dut.lsEu.replayRequestPort.valid.toBoolean) lsReplays += 1
+          if (dut.lsEu.orderViolationPort.valid.toBoolean) lsOrderViols += 1
+        }
         if (bypLiveOn) {
           val v = dut.rfInt.logic.bypLive
           for (i <- 0 until v.length) if (v(i).toBoolean) bypLiveCount(i) += 1

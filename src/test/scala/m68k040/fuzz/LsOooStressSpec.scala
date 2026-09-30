@@ -163,6 +163,12 @@ class LsOooStressSpec extends AnyFunSuite {
         f"devReads=${exactRegs.map(arCnt).sum} splitReads=${arCnt.filter(_._1 >= Dev + 0x2C).values.sum} " +
         mon.summary
       println(line)
+      // Every device-page transaction, so the unparkable split long's bus pattern (not in the
+      // exact set) can be compared ACROSS ARMS by address, seed for seed.
+      println(f"[lsooo-stress] seed=$seed devAR=" +
+        arCnt.filter(_._1 >= Dev).toSeq.sorted.map { case (a, n) => f"${a & 0xfff}%03x:$n" }.mkString(",") +
+        " devAW=" + awCnt.filter(_._1 >= Dev).toSeq.sorted.map { case (a, n) => f"${a & 0xfff}%03x:$n" }.mkString(",") +
+        f" splitOps=${p.src.split("0x2E\\(%a0\\)").length - 1}")
       tot = tot.updated("olderBehindStuckP4", tot("olderBehindStuckP4") + mon.olderBehindStuckP4)
         .updated("replays", tot("replays") + mon.replays)
         .updated("replayRedirects", tot("replayRedirects") + mon.replayRedirects)

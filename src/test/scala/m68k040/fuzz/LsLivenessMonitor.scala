@@ -34,6 +34,10 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
   private val ls     = dut.lsEu.logic
   private val hasPark = ls.parkValid != null
   // `lsReplayRedirect` is a literal False (no signal) in a build without `lsOooIssue`.
+  // Likewise the LS EU's request port: its `valid` is a constant in such a build, so the
+  // simulator has no signal behind it.
+  private val hasReplayPort =
+    try { dut.lsEu.replayRequestPort.valid.toBoolean; true } catch { case _: Throwable => false }
   private val hasReplayRedirect =
     try { dut.rob.logic.lsReplayRedirect.toBoolean; true } catch { case _: Throwable => false }
 
@@ -79,7 +83,7 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
       val c = dut.rob.logic.commitObs(k)
       if (c.fire.toBoolean) { committed = true; commits += 1; lastCommitPc = c.pc.toLong & 0xffffffffL }
     }
-    if (dut.lsEu.replayRequestPort.valid.toBoolean) replays += 1
+    if (hasReplayPort && dut.lsEu.replayRequestPort.valid.toBoolean) replays += 1
     if (hasReplayRedirect && dut.rob.logic.lsReplayRedirect.toBoolean) replayRedirects += 1
     val robCount = dut.rob.logic.count.toBigInt
     if (committed || robCount == 0 || flush) sinceCommit = 0 else sinceCommit += 1
