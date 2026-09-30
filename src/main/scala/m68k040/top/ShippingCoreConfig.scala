@@ -238,7 +238,9 @@ object ShippingCoreConfig {
     * build log can carry. `CPU_RAS_BRANCH_REPAIR=1` now enables it exactly like the two
     * frontend flags below, and the value is echoed in `SHIPPING_CONFIG`. */
   val rasBranchRepair: Boolean =
-    envFlag("CPU_RAS_BRANCH_REPAIR", false)
+    // DEFAULT ON since 2026-09-30: P1 silicon A/B at 200 MHz, +4.93% Dhrystone (116,559 vs
+    // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_RAS_BRANCH_REPAIR=0` still disables it.
+    envFlag("CPU_RAS_BRANCH_REPAIR", true)
   /** Front-end: COMPUTE a PC-relative unconditional branch's target from the
     * displacement already in the aligner slot, instead of only ever recalling one from
     * the BTB/FTB. See `FetchAlignPlugin.computeDirectTargets` for the mechanism and the
@@ -256,7 +258,9 @@ object ShippingCoreConfig {
     * Enable at generation time with `CPU_COMPUTE_DIRECT_TARGETS=1`; the value is echoed
     * in the `SHIPPING_CONFIG` line. */
   val computeDirectTargets: Boolean =
-    envFlag("CPU_COMPUTE_DIRECT_TARGETS", false)
+    // DEFAULT ON since 2026-09-30: P1 silicon A/B at 200 MHz, +4.93% Dhrystone (116,559 vs
+    // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_COMPUTE_DIRECT_TARGETS=0` still disables it.
+    envFlag("CPU_COMPUTE_DIRECT_TARGETS", true)
 
   /** Front-end: DEFER an UNCONDITIONAL control transfer that lands in SLOT 1, so it
     * becomes slot 0 next cycle and the decode-time BTB / RAS / computed-target paths can
@@ -273,7 +277,9 @@ object ShippingCoreConfig {
     * Enable at generation time with `CPU_DEFER_SLOT1_UNCOND=1`; echoed in
     * `SHIPPING_CONFIG`. */
   val deferSlot1Uncond: Boolean =
-    envFlag("CPU_DEFER_SLOT1_UNCOND", false)
+    // DEFAULT ON since 2026-09-30: P1 silicon A/B at 200 MHz, +4.93% Dhrystone (116,559 vs
+    // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_DEFER_SLOT1_UNCOND=0` still disables it.
+    envFlag("CPU_DEFER_SLOT1_UNCOND", true)
 
   /** Front-end: DEFER a slot-1 `DBcc` -- the 68k loop-closing branch -- so it becomes
     * slot 0 next cycle, where the BTB (whose `brType=0` is literally "Bcc/DBcc") can
@@ -292,7 +298,9 @@ object ShippingCoreConfig {
     * Enable at generation time with `CPU_DEFER_SLOT1_DBCC=1`; echoed in
     * `SHIPPING_CONFIG`. */
   val deferSlot1Dbcc: Boolean =
-    envFlag("CPU_DEFER_SLOT1_DBCC", false)
+    // DEFAULT ON since 2026-09-30: P1 silicon A/B at 200 MHz, +4.93% Dhrystone (116,559 vs
+    // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_DEFER_SLOT1_DBCC=0` still disables it.
+    envFlag("CPU_DEFER_SLOT1_DBCC", true)
 
   // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
   // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
