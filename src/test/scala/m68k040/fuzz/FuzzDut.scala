@@ -431,8 +431,15 @@ class FuzzCoreDut extends Component {
   // FUZZ_LS_OOO=1 turns on out-of-order LS issue (the relaxed select) TOGETHER with the
   // LS-side inhibited two-way barrier. They must move together: the relaxation without the
   // barrier is what wedged the board as `loadBypassUnreadyLoad`.
-  val iq     = new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake,
+  // FUZZ_SHIPPING_LSU=1: build the LS EU and issue queue EXACTLY as `M68kSocketTop` does
+  // under the shipping `throughput-v2` profile (ipcThroughput = ipcLateStore = true).
+  // Without it the corpus runs a DEFAULT store pipeline -- no detached late stores, no
+  // forward-on-publish, one detached store entry -- i.e. NOT the silicon's LSU. Test-only.
+  private val shipLsu = sys.env.get("FUZZ_SHIPPING_LSU").contains("1")
+  val iq     = if (!shipLsu) new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake,
     loadBypassUnreadyLoad = fuzzLsOoo)
+  else new IssueQueuePlugin(earlyStoreAddress = true, earlyAutoStoreAddress = true,
+    loadBypassUnreadyLoad = fuzzLsOoo, specLoadWakeup = fuzzSpecWake)
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
@@ -445,8 +452,14 @@ class FuzzCoreDut extends Component {
   // a run needs the two knobs separated.
   private val fuzzFallThrough =
     sys.env.get("FUZZ_LS_FALLTHROUGH").map(_ == "1").getOrElse(fuzzLsOoo)
-  val lsEu   = new LsEuPlugin(specLoadWakeup = fuzzSpecWake,
+  val lsEu   = if (!shipLsu) new LsEuPlugin(specLoadWakeup = fuzzSpecWake,
     lsOooIssue = fuzzLsOoo, alignedLoadFallThrough = fuzzFallThrough)
+  else new LsEuPlugin(   // mirrors SocketTop.scala's LsEuPlugin(...) for throughput-v2
+    alignedLoadFallThrough = true, earlyIntWakeup = true, sqSubwordForwarding = true,
+    reserveLateStore = true, detachLateStore = true, forwardOnPublish = true,
+    earlyNzvcWakeup = true, detachedStoreEntries = 4,
+    earlyAutoStoreAddress = true, earlyStoreDataWake = true, earlyAutoAnWriteback = true,
+    specLoadWakeup = fuzzSpecWake, lsOooIssue = fuzzLsOoo)
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc
