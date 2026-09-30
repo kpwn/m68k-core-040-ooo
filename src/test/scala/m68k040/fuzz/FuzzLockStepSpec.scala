@@ -36,6 +36,8 @@ import org.scalatest.funsuite.AnyFunSuite
   * ExecuteLockStepSpec — the forked test JVM peaks ~7.6GB per compile.
   */
 object FuzzRunner {
+  /** DTT0 identity map of the low 2 GiB, CM=00 (cachable, writethrough). */
+  val LowHalfWritethroughTtr: BigInt = BigInt("007FE000", 16)
   val loadAddr: Long = ProgramAssembler.DefaultLoadAddress
 
   sealed trait Outcome
@@ -498,7 +500,11 @@ object FuzzRunner {
         // other respect: the two TTRs cover all 4 GiB, so no table walk can be demanded.
         dut.ctrl.logic.itt0 #= CachePosture.LowHalfCopybackTtr
         dut.ctrl.logic.itt1 #= 0
-        dut.ctrl.logic.dtt0 #= CachePosture.LowHalfCopybackTtr
+        // WRITETHROUGH, not copyback: the final image compare peeks the behavioral AXI
+        // memory, and a copyback line would still be dirty in L1D (measured: 189/200 seeds
+        // "MEM" diverged at 0x4000 with dut=0xff). Writethrough keeps the low half cacheable
+        // -- which is all the posture needs, the point is the cacheable/INHIBITED mix.
+        dut.ctrl.logic.dtt0 #= LowHalfWritethroughTtr
         dut.ctrl.logic.dtt1 #= CachePosture.HighHalfInhibitedTtr
         dut.ctrl.logic.mmuEnable #= true
         cd.waitSampling()
