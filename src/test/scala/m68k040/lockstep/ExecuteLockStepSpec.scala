@@ -489,7 +489,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
   /** Full-core DUT: the entire frontend+backend chain. The I-cache AXI master,
     * FetchAlign redirect/resume, EU wbObs and ROB commitObs surface for the sim. */
-  class FullCoreDut(forceShipping: Boolean = false) extends Component {
+  class FullCoreDut(forceShipping: Boolean) extends Component {
+    // NO DEFAULT ARGUMENT, on purpose. A default arg on an INNER class makes Scala 2 emit a
+    // companion object whose lazy init locks this spec instance -- and `compiledDut` is a lazy
+    // val that already holds that lock while SpinalSim waits on its elaboration thread, which
+    // evaluates the default. Result: every lock-step run deadlocked at elaboration
+    // (2026-09-30, all threads in futex_do_wait, 0 CPU). The auxiliary constructor below
+    // creates no companion object.
+    def this() = this(false)
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
