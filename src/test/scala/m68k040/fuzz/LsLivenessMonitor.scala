@@ -31,8 +31,10 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
                               oldestBound: Int = 4000) {
   private val RobW   = m68k040.Global.ROB_ID_W_DEFAULT
   private val RobMod = BigInt(1) << RobW
-  private val ls     = dut.lsEu.logic
-  private val hasPark = ls.parkValid != null
+  // NOT a field: `dut.lsEu.logic` is an anonymous Area, and a field of that inferred type
+  // pickles `LsEuPlugin.$anon` into this class's signature, which breaks incremental
+  // compilation of every file that uses the monitor. Each method binds its own local.
+  private val hasPark = dut.lsEu.logic.parkValid != null
   // `lsReplayRedirect` is a literal False (no signal) in a build without `lsOooIssue`.
   // Likewise the LS EU's request port: its `valid` is a constant in such a build, so the
   // simulator has no signal behind it.
@@ -75,6 +77,7 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
   def attach(): this.type = { dut.clockDomain.onSamplings(sample()); this }
 
   def sample(): Unit = {
+    val ls = dut.lsEu.logic
     cycle += 1
     val flush = dut.rob.logic.doFlushReg.toBoolean
     // ── (R) retire progress ──────────────────────────────────────────────────────────
@@ -137,6 +140,7 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
   }
 
   def dump(): String = {
+    val ls = dut.lsEu.logic
     val b = new StringBuilder
     // By-name and guarded: a signal that is not simPublic in this build must cost one dump
     // LINE, never the diagnosis itself.
