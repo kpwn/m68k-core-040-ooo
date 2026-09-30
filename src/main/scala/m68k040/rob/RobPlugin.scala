@@ -1568,9 +1568,18 @@ class RobPlugin(val detailedPerf: Boolean = false,
         !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
         !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
         !haltA7OddEnIn && !haltPcRangeEnIn &&
-        (debugHaltState === DebugHaltState.RUNNING)
+        (debugHaltState === DebugHaltState.RUNNING) &&
+        // A wider retire must refuse the pending LS liveness-replay op too (see orderPairOk).
+        (if (lsOooIssue) !(replayPendValid && (id === replayPendRob)) else True)
     }
     retireLanes.foreach(_.simPublic())
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        for (lane <- 2 until retireWidth)
+          assert(!(retireLanes(lane) && replayPendValid && (retireIds(lane) === replayPendRob)),
+            s"RobPlugin: the pending LS liveness-replay op retired from slot $lane", FAILURE)
+      }
+    }
     val debugMacroCountInc = retireLanes.zip(retirePayloads)
       .map { case (r, p) => (r && p.last).asUInt.resize(log2Up(retireWidth + 1)) }.reduce(_ + _)
     debugMacroCountInc.simPublic()
