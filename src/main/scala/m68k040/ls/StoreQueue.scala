@@ -1260,11 +1260,19 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     preciseLaunchRob    := robIds(head)
     preciseLaunchOrphan := headOrphan
   }.elsewhen(preciseDrainBusyReg && (preciseFinalAckD || preciseAckSeen) &&
-             (preciseLaunchOrphan || !preciseLauncherAtHead)) {
+             (preciseLaunchOrphan || !preciseLauncherAtHead)) {   // == preciseReleaseNow
     preciseDrainBusyReg := False
   }
   preciseAckSeen.simPublic(); preciseLaunchRob.simPublic()
-  io.preciseDrainBusy := preciseDrainBusyReg
+  // The OUTPUT drops in the very cycle the head moves past the store, not one cycle later:
+  // that cycle is the boundary AFTER the store, where a pending T1 trace or interrupt must be
+  // recognised. A registered release hid that one boundary from `traceNormalGate` /
+  // `normalIrqGate`, so the next instruction retired untraced (measured: corpus
+  // `prm_trace_t1_before_next`, and the lock-step IRQ tests taking their interrupt one
+  // instruction late). Head is a flop; no combinational loop through retire.
+  val preciseReleaseNow = (preciseFinalAckD || preciseAckSeen) &&
+                          (preciseLaunchOrphan || !preciseLauncherAtHead)
+  io.preciseDrainBusy := preciseDrainBusyReg && !preciseReleaseNow
 
   // D4: the walker fence. PENDING = about to be allowed to launch (same head/preempt terms
   // `headPreciseReady` uses, so the fence never outlives a preemption that will flush this
