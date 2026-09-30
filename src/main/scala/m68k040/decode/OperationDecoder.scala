@@ -1189,7 +1189,7 @@ object OperationDecoder {
         }
         // ── CPUSH/CINV (line-1111, top byte 0xF4: 1111 0100 CC O SS AAA -- Task P5.1's
         // cross-checked encoding): privileged cache push/invalidate. bit[5]=1 selects
-        // CPUSH (push, optionally invalidate, matching lines), bit[5]=0 selects CINV
+        // CPUSH (push dirty AND invalidate matching lines), bit[5]=0 selects CINV
         // (invalidate matching lines WITHOUT writeback, discarding any dirty data) --
         // see the corpus's own cpush_line_basic.s/cinv_line_basic.s header comments.
         // This arm claims the ENTIRE 0xF4xx byte unconditionally (CC/SS/AAA are not

@@ -260,8 +260,9 @@ case class DStoreCmd() extends Bundle {
   * by the ExceptionUnit's commit-time sysOp path and serviced by `DcachePlugin`'s
   * standalone maintenance-walk FSM.
   *
-  * `push` (CPUSH) writes dirty matching lines back to memory; `invalidate` (CINV,
-  * and CPUSH's own invalidating variant) clears valid+dirty on matches. `scope`
+  * `push` (CPUSH) writes dirty matching lines back to memory; `invalidate` clears
+  * valid+dirty on matches. CINV = invalidate only; CPUSH = push AND invalidate (the
+  * 68040 has no non-invalidating push -- the 68060's CACR.DPI does not exist here). `scope`
   * selects Line(01) / Page(10) / All(11) — 00 is unused (decode never emits it).
   * `sel` selects which cache(s): DC(01) / IC(10) / BC(11). `addr` is An's value,
   * meaningful for Line/Page scope only. */

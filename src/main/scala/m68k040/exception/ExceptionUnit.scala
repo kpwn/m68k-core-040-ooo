@@ -2661,12 +2661,21 @@ class ExceptionUnit(
         // later — in `S_MAINTWAIT`'s completion transition, once the D-side walk has
         // actually finished. See that state's comment for why the ordering is
         // load-bearing.
-        is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : push (writeback) dirty lines
+        is(skOrd(m68k040.decode.SysKind.CPUSH)) {   // CPUSH : push dirty lines, THEN invalidate
+          // MC68040UM: CPUSH pushes selected DC lines if valid+modified AND INVALIDATES
+          // them (IC lines are invalidated). `invalidate` was False here until
+          // 2026-09-30, which left every pushed line VALID: after `cpusha dc` a DMA-in
+          // (host) write to DDR was invisible to the next cacheable load -- found on
+          // silicon (stale 0xDEAD0000), `DcacheCpushInvalidateSpec` is the reproducer.
+          // Push-before-drop ordering is the walk's own: a dirty match clears valid only
+          // in WRB, on an OKAY B (an error keeps the line valid+dirty); a clean match is
+          // cleared in CHECK. `invalidate` is only ever read from the walk's latched
+          // `cmd` register, so this constant adds no logic on the command path.
           val cacheSel = sysCapRc(1 downto 0)
           val scope    = sysCapRc(3 downto 2)
           maintCmdOut.valid              := True
           maintCmdOut.payload.push       := True
-          maintCmdOut.payload.invalidate := False
+          maintCmdOut.payload.invalidate := True
           maintCmdOut.payload.scope      := scope
           maintCmdOut.payload.sel        := cacheSel
           maintCmdOut.payload.addr       := sysCapVal.asUInt
