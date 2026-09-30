@@ -103,6 +103,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // whose barrier a younger already-launched access violated. Recovered at retire.
       rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
       rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+      rob.logic.lsReplay.valid         := lsEu.replayRequest.valid
+      rob.logic.lsReplay.payload       := lsEu.replayRequest.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -961,6 +963,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
       var lsBypassFires     = 0
+      var lsReplays         = 0
+      var lsOrderViols      = 0
       val bypLiveCount      = Array.fill(16)(0)
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
@@ -1398,6 +1402,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
           dut.iq.logic.lsSkidValid.toBoolean))
         if (dut.iq.logic.lsBypassFired.toBoolean) lsBypassFires += 1
+        // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
+        // it) and the order-violation recoveries: the two costs the relaxation can incur.
+        if (dut.lsEu.replayRequestPort.valid.toBoolean) lsReplays += 1
+        if (dut.lsEu.orderViolationPort.valid.toBoolean) lsOrderViols += 1
         if (bypLiveOn) {
           val v = dut.rfInt.logic.bypLive
           for (i <- 0 until v.length) if (v(i).toBoolean) bypLiveCount(i) += 1
@@ -1826,7 +1834,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         // These counters separate the two remaining explanations: the SQ filling
         // (capacity, which back-pressures dispatch through the `memoryReady` gate that
         // no dispatch perf bucket counts) from the drain being slow (throughput).
-        println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires")
+        println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires " +
+          s"livenessReplays=$lsReplays orderViolationReports=$lsOrderViols")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
         if (bypLiveOn) println(f"[hum] ${k.name} loadPresentedCycles=$dcLoadPresented refusedCycles=$dcLoadRefused " +

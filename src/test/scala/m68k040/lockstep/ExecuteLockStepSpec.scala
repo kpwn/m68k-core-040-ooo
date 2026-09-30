@@ -203,6 +203,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // for precise format-$7 delivery at retire).
       rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
       rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+      rob.logic.lsReplay.valid         := lsEu.replayRequest.valid
+      rob.logic.lsReplay.payload       := lsEu.replayRequest.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
