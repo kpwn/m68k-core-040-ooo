@@ -891,6 +891,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
+      // A chase's first lap warms the cache. Start the detailed trace after that lap
+      // when requested, so every row describes a steady-state dependency hop.
+      val traceSteady = sys.env.get("MB_TRACE_STEADY").contains("1")
       val traceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val iqHolOn = sys.env.get("IQ_HOL").contains("1")
@@ -1533,34 +1536,59 @@ trait CoreBenchHarness extends AnyFunSuite {
           lastCommitCycle = totalCycles
           missInj.markCommit()   // takes the miss/MLP counters over the SAME window
         }
-        // MB_TRACE=<kernel-name-prefix>: dump a per-cycle table of every LOAD-path
-        // pipeline stage, so the cost of a load can be attributed to named stages and
-        // BUBBLES (cycles where nothing advances) can be told apart from genuine
-        // pipeline depth. Stage names follow the LS EU / D-cache design docs:
+        // MB_TRACE=<kernel-name-prefix>: dump a per-cycle load-path table.
+        // MB_TRACE_STEADY=1 starts after the kernel's warm-up instructions.
+        // The ROB IDs and command address let dependent hops be paired; idle rows
+        // distinguish bubbles from pipeline depth. Stage names follow the RTL:
+        //   IQ  ready resident LS load; IS selected issue into the LS EU
         //   P1  s1Valid   issue context + registered operands
         //   P2  tValid    DTLB + VIPT probe launched
         //   P2T txValid   translation response awaited
         //   P3  p3Valid   resolved PA -> SQ query / store alloc
         //   P4  p4Valid   SQ forward response -> resolve / cache launch
         //   C0  loadCmd   D-cache accepts the address (valid&ready)
-        //   C1  ldS1Valid tag compare + way select
+        //   EP  early-probe hit on the resolved cache command
+        //   C1  ldS1Valid tag compare + way select; H1 is its hit bit
         //   C2  ldS2Valid byte-lane extract
         //   RSP loadRsp   data returned to the LS EU
+        //   MI/RF/AR/R/WR/RP miss discovery, refill, AXI request/response,
+        //                    array write, replay
         //   CMP compValid registered completion
-        //   WB  wbObs     writeback visible / wakeup broadcast
-        if (traceOn) {
+        //   WK  IQ load wakeup; WB wbObs / registered writeback
+        if (traceOn && traceLines.size < 400 &&
+            (!traceSteady || countedMacros >= k.warmupInstrs)) {
           def b(x: Boolean) = if (x) "#" else "."
           val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
                         dut.dcache.logic.loadCmdPort.ready.toBoolean
+          val iqLs = dut.iq.logic.selPorts(3)
+          val ar = dut.dcache.logic.axi.ar
+          val r = dut.dcache.logic.axi.r
+          val readyLoads = dut.iq.logic.slots.filter(s => s.sel.toBoolean && s.ready.toBoolean &&
+            s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD).map(_.hot.robId.toInt)
+          val issueRob = if (dut.lsEu.logic.issuePort.valid.toBoolean &&
+                             dut.lsEu.logic.issuePort.ready.toBoolean)
+            dut.lsEu.logic.issuePort.payload.robId.toInt.toString else "-"
+          val wbRob = if (dut.lsEu.logic.wbObs.valid.toBoolean)
+            dut.lsEu.logic.wbObs.robId.toInt.toString else "-"
           val line = Seq(
+            b(iqLs.valid.toBoolean && iqLs.ready.toBoolean),
+            b(dut.lsEu.logic.issuePort.valid.toBoolean && dut.lsEu.logic.issuePort.ready.toBoolean),
             b(dut.lsEu.logic.s1Valid.toBoolean), b(dut.lsEu.logic.tValid.toBoolean),
             b(dut.lsEu.logic.txValid.toBoolean), b(dut.lsEu.logic.p3Valid.toBoolean),
             b(dut.lsEu.logic.p4Valid.toBoolean), b(cmdFire),
-            b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS2Valid.toBoolean),
+            b(dut.dcache.logic.earlyProbeHit.toBoolean),
+            b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS1Hit.toBoolean),
+            b(dut.dcache.logic.ldS2Valid.toBoolean),
             b(dut.dcache.logic.loadRspPort.valid.toBoolean),
-            b(dut.lsEu.logic.compValid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
+            b(dut.dcache.logic.loadMissDiscovered.toBoolean),
+            b(dut.dcache.logic.dbgFsmRefill.toBoolean),
+            b(ar.valid.toBoolean && ar.ready.toBoolean), b(r.valid.toBoolean && r.ready.toBoolean),
+            b(dut.dcache.logic.wrEn.exists(_.toBoolean)), b(dut.dcache.logic.dbgFsmReplay.toBoolean),
+            b(dut.lsEu.logic.compValid.toBoolean),
+            b(dut.iq.logic.lsWakeupPort.valid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
           ).mkString(" ")
-          if (traceLines.size < 400) traceLines += f"$telemCycle%5d  $line  commits=$macrosThisCycle"
+          val addr = if (cmdFire) f"0x${dut.dcache.logic.loadCmdPort.payload.paddr.toLong}%08x" else "-"
+          traceLines += f"$telemCycle%5d  $line  ready=${readyLoads.mkString(",")} issue=$issueRob wb=$wbRob cmd=$addr commits=$macrosThisCycle"
         }
         if (dut.lsEu.logic.sq.io.fwd.rsp.hit.toBoolean) sqFwdHitCycles += 1
         if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
@@ -2068,7 +2096,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         stallBudget)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
-        println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
+        println("cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
         traceLines.foreach(println)
         println(s"=== end trace (${traceLines.size} cycles) ===")
       }
