@@ -1452,7 +1452,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // lost per violation, and an unconditional term cannot miss a case. Both shapes are real
     // -- h0 marked and h1 the macro's last uop, AND h0 itself last with h1 the NEXT macro's
     // first uop, which is the one that corrupts.
-    val orderPairOk: Bool = if (!lsOooIssue) True else !macroViolationPending
+    // AND the pending LIVENESS REPLAY op must never retire as h1 either. It completed with a
+    // throw-away result; `retire0` refuses it at h0, but a dual retire would commit it from
+    // the SECOND slot and leave `replayPendRob` naming a retired index -- measured by
+    // LsOooStressSpec seed 22 as the not-first-uop assertion firing thousands of cycles
+    // later, when the index wrapped onto an unrelated mid-macro uop. A silent garbage commit.
+    val orderPairOk: Bool = if (!lsOooIssue) True else
+      !macroViolationPending && !(replayPendValid && (h1 === replayPendRob))
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(!(retire0 && replayAtHead),
+          "RobPlugin: the pending LS liveness-replay op retired from slot 0", FAILURE)
+      }
+    }
     val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
                   orderPairOk &&
                   !(irqBoundaryHold && p0.last) &&
@@ -1471,6 +1483,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // (including the marked macro) is squashed.
       when(retire0 && orderViolated(h0) && !p0.last) { macroViolatedSticky := True }
       when((retire0 && p0.last) || flushing)         { macroViolatedSticky := False }
+    }
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(!(retire1 && replayPendValid && (h1 === replayPendRob)),
+          "RobPlugin: the pending LS liveness-replay op retired from slot 1", FAILURE)
+      }
     }
     val retireLanes = Seq(retire0, retire1) ++ (2 until retireWidth).map(_ => Bool())
     val preparedBatch = if (preparedRetireEntries != 0) Some(new Area {
