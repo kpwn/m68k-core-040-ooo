@@ -57,9 +57,20 @@ object PortedTestRunner {
   lazy val compiled = M68kSim().withVerilator.compile(new FuzzCoreDut)
   private var runIdx = 0
 
+  /** D4: `D4_BARRIER_MONITOR=1` attaches a passive `InhibitedBarrierMonitor` to EVERY run and
+    * prints one `[d4-monitor]` line per run (name + posture). Read-only; outcomes unchanged. */
+  private val d4MonitorAll = sys.env.get("D4_BARRIER_MONITOR").contains("1")
+
+  /** @param dcfg   D-side memory model config. Default = the zero-latency model every corpus
+    *               run has always used (`BehavioralMemAgent`'s own default), so omitting it
+    *               changes nothing.
+    * @param onDut  called once per run after the posture is armed and before execution
+    *               starts; for PASSIVE instrumentation (e.g. `InhibitedBarrierMonitor`). */
   def run(name: String, src: String, timeoutCycles: Long, simSeed: Int = 1,
         cachePosture: CachePosture = CachePosture.AsWritten,
-        probe: PostureProbe = null, allowBkptCompletion: Boolean = true): PortedOutcome = {
+        probe: PostureProbe = null, allowBkptCompletion: Boolean = true,
+        dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
+        onDut: FuzzCoreDut => Unit = null): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
@@ -150,7 +161,8 @@ object PortedTestRunner {
       // see the V1.6b MSHR investigation).
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
-                                                   sharedMem = dsideMem, injectBusErrors = true)
+                                                   sharedMem = dsideMem, injectBusErrors = true,
+                                                   dcfg = dcfg)
       // SELF-MODIFYING CODE: mirror every runtime D-side store byte into the I-side's
       // SEPARATE program image. The I and D views are two different `SparseMemory`
       // objects holding the same architectural byte-at-address image. Seeding both at
@@ -337,6 +349,13 @@ object PortedTestRunner {
       dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling()
       dut.fa.logic.redirect.valid   #= false
+
+      if (onDut != null) onDut(dut)
+      val d4Mon: InhibitedBarrierMonitor =
+        if (!d4MonitorAll) null
+        else new InhibitedBarrierMonitor(dut, s"$name posture=${cachePosture match {
+          case CachePosture.ForceMmuWalkCopyback(_) => "mmuwalk"
+          case other => other.toString }}").attach()
 
       // ---- posture non-vacuity instrumentation (opt-in, zero cost when probe==null) --
       // Nothing here drives the DUT. It exists so a caller can PROVE, from measurements
@@ -843,6 +862,7 @@ object PortedTestRunner {
         }
       }
       flushWalkHoles()
+      if (d4Mon != null) println(d4Mon.summary + d4Mon.details(2).replace("\n", " ||"))
       outcome =
         if (bkptFired) PortedPass
         else if (word == 0) PortedHang(cyc)
