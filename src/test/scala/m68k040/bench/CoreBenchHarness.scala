@@ -33,7 +33,7 @@ import scala.collection.mutable.ArrayBuffer
   * SAME proven DUT and the SAME commit-stream cycle counting. No behavioural
   * change: IpcBenchSpec now mixes this in and keeps only its test body.
   */
-trait CoreBenchHarness extends AnyFunSuite {
+trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
 
   // ── DUT (mirrors lockstep.ExecuteLockStepSpec.FullCoreDut byte-for-byte) ─────
   // Copied (not shared) because the lock-step DUT is a private inner class. The
@@ -276,6 +276,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // this is a TEST harness, so nothing here reaches the synthesized core.
       spinal.core.sim.SimPublic(host[DtlbPlugin].logic.walker.io.busy,
         host[ItlbPlugin].logic.walker.io.busy)
+      // IPC_RESTART_CENSUS=1 only (elaboration-time): name preservation for the P8 census.
+      restartCensusSimPublic(host)
 
       val dc    = host[DcacheService]
       val exc   = rob.logic.exc
@@ -940,6 +942,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Collection is pure observation of already-simPublic levels -- it cannot perturb
       // the DUT, so cycles are bit-identical with it on or off (verified, not assumed).
       val stallBudgetOn = sys.env.get("IPC_STALL_BUDGET").contains("1")
+      // IPC_RESTART_CENSUS=1: per-redirect stage census + restart/steady split (RestartCensus).
+      val restartCensus = if (RestartCensus.enabled) Some(new RestartCensus(k.name)) else None
       // IPC_PAIR_CENSUS=1: WHY did a cycle retire ONE instead of TWO?
       //
       // The stall budget found a lever (IQ_SPEC_ALU on dhrystone-x0-byteAbs-cb) that cut
@@ -1800,6 +1804,7 @@ trait CoreBenchHarness extends AnyFunSuite {
             (if (robBusy) 0x10 else 0) | (if (dcBusy) 0x20 else 0) |
             (if (walkBusy) 0x40 else 0) | (if (retire0) 0x80 else 0)
         }
+        restartCensus.foreach(_.onCycle(dut, totalCycles))
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -1931,6 +1936,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // instructions retired across exactly these cycles.
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
+      restartCensus.foreach(_.report(lo, hi, windowRetired))
       val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
       val specWakeWindow = specWakeHisto.slice(lo, hi + 1)
       if (iqHolOn) {
