@@ -95,7 +95,7 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
     occ += (("P4", ls.p4Valid.toBoolean, ls.p4Ctx.xlate.front.robId.toBigInt))
     if (hasPark) for (i <- ls.parkValid.indices)
       occ += ((s"PARK$i", ls.parkValid(i).toBoolean, ls.parkMem(i).bk.robId.toBigInt))
-    {
+    locally {
       val head = dut.lsEu.robHeadIn.toBigInt
       val p4 = occ.find(_._1 == "P4").get
       val p4Stuck = p4._2 && !flush && stageOcc.get("P4").exists(_._1 == p4._3)
