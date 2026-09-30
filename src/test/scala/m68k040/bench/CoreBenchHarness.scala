@@ -478,7 +478,19 @@ trait CoreBenchHarness extends AnyFunSuite {
   //   to BOTH the D-side and the I-side (an I-fetch refill is the dominant memory
   //   stall for these kernels, so an I-side zero-latency model would make the
   //   measurement meaningless).
-  val memCfg: AxiMemModelConfig = sys.env.get("IPC_MEM") match {
+  /** A spec that sweeps several memory models inside ONE sbt/Verilator run sets this
+    * before each `runKernel` (`BoardMembenchSimSpec`); None = the IPC_MEM env model. */
+  var memCfgOverride: Option[AxiMemModelConfig] = None
+  def memCfg: AxiMemModelConfig = memCfgOverride.getOrElse(envMemCfg)
+  def parseMemSpec(spec: String): AxiMemModelConfig = {
+    val parts = spec.split(':')
+    require(parts(0) == "l2", s"unknown memory spec $spec (expected 'l2[:hit[:dram[:sets]]]')")
+    val hit  = if (parts.length > 1) parts(1).toInt else 5
+    val dram = if (parts.length > 2) parts(2).toInt else 70
+    val sets = if (parts.length > 3) parts(3).toInt else 0
+    AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram, sets = sets))
+  }
+  val envMemCfg: AxiMemModelConfig = sys.env.get("IPC_MEM") match {
     case None | Some("") | Some("zero") => AxiMemModelConfig()
     case Some(spec) =>
       val parts = spec.split(':')
@@ -498,7 +510,7 @@ trait CoreBenchHarness extends AnyFunSuite {
   // Five live 64-byte I-cache lines occupy ten beats on the core's 256-bit AXI.
   // Keep the legacy D-side capacity unchanged, but do not let the shared model's
   // old eight-beat default silently turn the I-side five-ID contract into four.
-  val iMemCfg: AxiMemModelConfig = memCfg.copy(
+  def iMemCfg: AxiMemModelConfig = memCfg.copy(
     maxPendingBeats = scala.math.max(memCfg.maxPendingBeats, 2 * (1 + AxiIds.I_SPEC_SLOTS)))
   def memLabel: String =
     if (!memCfg.latency.enabled) "zero-latency (ideal memory)"

@@ -1247,3 +1247,61 @@ prediction at all, so its mispredicts are counted as COVERAGE, not direction.** 
 coverage (lever 13) moves them into the direction bucket as loop-*exit* mispredicts —
 exactly what this lever then removes. Re-read the attribution after 13 lands before
 sizing this. Same discipline as `#7 gates #5`.
+
+## ✅ FIRST SILICON BANDWIDTH NUMBERS + FIRST SILICON A/B OF FILL-FORWARD (2026-09-30)
+
+Instrument: SoC `tools/board_membench.sh` (branch `tools/board-membench`), bare metal, VIA1-T1
+timed, data verified in-program. RAM copyback via DTT0 — **the same mode Mac OS 7.5.3 maps
+RAM with** (page-table walk on a booted Finder: every RAM page CM=01, TC=0xC000, no TTR
+covers RAM). Copy/fill/chase reproduce to **<=0.02% across launches and bitstream reloads**;
+the read stream is bimodal per launch (two states 1-8% apart) — never A/B it on few launches.
+
+### Shipping default (P1, `e98a322c`), cycles — L1/L2 identical at 100 and 200 MHz
+
+| kernel | L1 (2-4 KB) | L2 (256 KB) | DDR (8-16 MB) @100 | DDR @200 |
+|---|---:|---:|---:|---:|
+| chase, cyc/hop | 8.29 | 21.01 | 43.8 (438 ns) | 55.7 (278 ns) |
+| copy `move.l`, B/cyc | 0.437 | 0.245 | 0.206 | 0.195 |
+| copy `MOVE16`, B/cyc | 0.527 | 0.262 | 0.219 | 0.206 |
+| read (sum), B/cyc | 1.90-1.92 | 0.84-0.91 | 0.73 | 0.68 |
+| fill, B/cyc | 0.547 | 0.308 | 0.277 | 0.265 |
+
+The copy headline is **0.19-0.25 B/cyc** — **~3% of the 8 B/cyc goal**, and 25-34% below
+what the sim bench's `memcpy-16k` (0.328) claims. The DDR-miss penalty over an L2 hit is
+~11 core cycles + ~118 ns fixed (fits both clocks). Controls: write-through copy 0.21,
+inhibited copy 0.12 B/cyc; **WT read at L2 (0.98) beats copyback read (0.84)** — ~2.7 cyc
+per line that only the copyback miss path pays.
+
+### Sim calibration (`BoardMembenchSimSpec`, same loop bodies)
+
+Chase slopes are 0.995 (hit) and 1.002 (dram) cyc/cyc. Fit to silicon:
+**`hitCycles` ≈ 6** (both clocks); **`dramCycles` ≈ 21 at 100 MHz, ≈ 33 at 200 MHz**
+(with hit=5; DDR chase = 22.9 + dram). The historical `l2:5:60`/`l2:5:70` is ~2-3x too
+pessimistic on DDR latency. **With latency calibrated, the sim is still ~25-34% too fast on
+copy** (L2: 48.8 sim vs 65.35 silicon cyc/16 B) — the missing cost is on the WRITE side
+(write-allocate + dirty writeback, which `AxiMemModel` prices at `hitCycles` and zero).
+
+### ⛔ Fill-forward on silicon: the memcpy win is a SIM ARTIFACT — it is a LOSS
+
+`CPU_DCACHE_FILL_FORWARD=1` vs P1, 100 MHz, both off `e98a322c`, 3/3 Finder boots
+(exc-halt 2/3/4 armed, framebuffer read), 9 vs 6 launches over 2 bitstream loads each:
+
+| kernel | silicon Δcycles | spread | sim Δcycles (same kernel) |
+|---|---:|---:|---:|
+| chase L2 | **-2.000 cyc/hop (-9.5%)** | <0.01% | -1.86 |
+| chase DDR | -1.25 cyc/hop (-2.8%) | 0.02% | -1.93 |
+| copy `move.l` L2 | **+4.08% (SLOWER)** | 0.00% | -4.1% |
+| copy `move.l` DDR | **+2.35% (SLOWER)** | 0.01% | -2.9% |
+| MOVE16 / read / fill | 0.00% | <0.2% | — |
+
+Same D-cache miss count and same dcache-busy stall in both arms; fill-forward adds 2.67
+cycles per line of pure retire stall to the `move.l` copy. **The sim gets the mechanism
+right (dependent-load latency -2 cyc) and the bandwidth sign wrong.** Do not ship
+fill-forward on the strength of `memcpy-16k`; its real value is dependent-load latency.
+
+### Core defect found by the benchmark: D-side `CPUSH` does not invalidate
+
+`ExceptionUnit.scala` CPUSH arm sends `push=True, invalidate=False`. A 68040 `CPUSH` pushes
+**and invalidates**. Measured on silicon: after `cpusha dc`, a host/inhibited write to the
+line is invisible to the next cacheable load (stale 0xDEAD0000 read back while DDR held the
+new value); adding `cinva dc` fixes it. Any DMA-in sequence that relies on CPUSH is exposed.
