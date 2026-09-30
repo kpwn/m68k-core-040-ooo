@@ -409,7 +409,7 @@ class FuzzCoreDut extends Component {
   private val fuzzRasRepair = feFlag("FUZZ_RAS_BRANCH_REPAIR",
     m68k040.top.ShippingCoreConfig.rasBranchRepair)
   val ras    = new m68k040.frontend.RasPlugin(branchRepair = fuzzRasRepair)
-  val gsh    = new m68k040.frontend.GsharePlugin
+  val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = shipCfg)
   // The two FRONT-END prediction flags of `perf/track5-branch`. They were wired into
   // `FullCoreSynth`/`SocketTop`/`CoreBenchHarness` only, so the corpus -- the one place an
   // architectural divergence from a front-end redirect would show up -- had NO way to turn
@@ -417,13 +417,15 @@ class FuzzCoreDut extends Component {
   // replayed against them unmodified. Both default OFF, so an unset environment builds the
   // bit-identical DUT as before.
   val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+    // throughput-v2 slot-1 conditional training/deferral, as SocketTop builds it.
+    trainSlot1Conditional = shipCfg, deferTakenSlot1Conditional = shipCfg,
     computeDirectTargets = feFlag("FUZZ_COMPUTE_DIRECT_TARGETS",
       m68k040.top.ShippingCoreConfig.computeDirectTargets),
     deferSlot1Uncond = feFlag("FUZZ_DEFER_SLOT1_UNCOND",
       m68k040.top.ShippingCoreConfig.deferSlot1Uncond),
     deferSlot1Dbcc = feFlag("FUZZ_DEFER_SLOT1_DBCC",
       m68k040.top.ShippingCoreConfig.deferSlot1Dbcc))
-  val dec    = new DecodeStage
+  val dec    = new DecodeStage(allowSlot1Prediction = shipCfg, fuseLongMoveLoads = shipCfg)
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
   private val fuzzLsOoo = sys.env.get("FUZZ_LS_OOO").contains("1")

@@ -492,6 +492,15 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   class FullCoreDut extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
+    // LOCKSTEP_SHIPPING=1: every LSU / IQ / P1 front-end knob below DEFAULTS to what the
+    // board ships (`SocketTop` under throughput-v2 + `ShippingCoreConfig`), so a gate run
+    // compares the SHIPPED machine without a 15-variable incantation. Each individual
+    // LOCKSTEP_* variable still overrides its own knob either way. Unset = the historical
+    // all-OFF DUT, bit-identical to before.
+    private val ship = sys.env.get("LOCKSTEP_SHIPPING").contains("1")
+    private def lk(env: String, shipping: => Boolean = true): Boolean =
+      sys.env.get(env).map(_ == "1").getOrElse(ship && shipping)
+    private val S = m68k040.top.ShippingCoreConfig
     val ctrl   = new MmuControlPlugin
     // Non-renamed FP control state (FPCR / FPSR non-FPCC bytes / FPIAR), Task 9.
     // Declared HERE, next to MmuControlPlugin, and not further down with the register
@@ -508,20 +517,21 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin(
-      branchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"))
+      branchRepair = lk("LOCKSTEP_RAS_BRANCH_REPAIR", S.rasBranchRepair))
     val gsh    = new m68k040.frontend.GsharePlugin(
-      retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
+      retainRedirectHistory = lk("LOCKSTEP_RETAIN_HISTORY"))
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       // The two front-end prediction flags of `perf/track5-branch`; see the note in
       // FuzzDut. Default OFF, so an unset environment is the same DUT as before.
-      computeDirectTargets = sys.env.get("LOCKSTEP_COMPUTE_DIRECT_TARGETS").contains("1"),
-      deferSlot1Uncond = sys.env.get("LOCKSTEP_DEFER_SLOT1_UNCOND").contains("1"),
+      computeDirectTargets = lk("LOCKSTEP_COMPUTE_DIRECT_TARGETS", S.computeDirectTargets),
+      deferSlot1Uncond = lk("LOCKSTEP_DEFER_SLOT1_UNCOND", S.deferSlot1Uncond),
+      deferSlot1Dbcc = lk("LOCKSTEP_DEFER_SLOT1_DBCC", S.deferSlot1Dbcc),
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
-      trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
-      deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
+      trainSlot1Conditional = lk("LOCKSTEP_TRAIN_SLOT1") || lk("LOCKSTEP_DEFER_TAKEN_SLOT1"),
+      deferTakenSlot1Conditional = lk("LOCKSTEP_DEFER_TAKEN_SLOT1"))
     val dec    = new DecodeStage(allowSlot1Prediction =
-      sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
-      fuseLongMoveLoads = sys.env.get("LOCKSTEP_FUSE_LONG_MOVE_LOADS").contains("1"))
+      lk("LOCKSTEP_TRAIN_SLOT1") || lk("LOCKSTEP_DEFER_TAKEN_SLOT1"),
+      fuseLongMoveLoads = lk("LOCKSTEP_FUSE_LONG_MOVE_LOADS"))
     val preparedCap = sys.env.get("LOCKSTEP_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
     val ren    = new RenameStage(
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("LOCKSTEP_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
@@ -535,10 +545,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap,
-      rasBranchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"),
+      rasBranchRepair = lk("LOCKSTEP_RAS_BRANCH_REPAIR", S.rasBranchRepair),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
-    val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
-      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
+    val iq     = new IssueQueuePlugin(earlyStoreAddress = lk("LOCKSTEP_EARLY_STORE_ADDRESS"),
+      earlyAutoStoreAddress = lk("LOCKSTEP_EARLY_AUTO_STORE"),
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
       // LOCKSTEP_LS_OOO=1: out-of-order LS issue + the LS inhibited barrier, together.
       loadBypassUnreadyLoad = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
@@ -547,16 +557,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val branchEu = new BranchEuPlugin
     val lsEu   = new LsEuPlugin(
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
-      alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
-      earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
-      sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
-      reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
-      detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
-      forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
-      earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
-      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
-      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
-      earlyStoreDataWake = sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1"),
+      alignedLoadFallThrough = lk("LOCKSTEP_LS_FALLTHROUGH"),
+      earlyIntWakeup = lk("LOCKSTEP_LS_EARLY_WAKEUP"),
+      sqSubwordForwarding = lk("LOCKSTEP_SQ_SUBWORD"),
+      reserveLateStore = lk("LOCKSTEP_RESERVE_LATE_STORE"),
+      detachLateStore = lk("LOCKSTEP_DETACH_LATE_STORE"),
+      forwardOnPublish = lk("LOCKSTEP_FORWARD_ON_PUBLISH"),
+      earlyNzvcWakeup = lk("LOCKSTEP_LS_EARLY_NZVC"),
+      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(if (ship) 4 else 1),
+      earlyAutoStoreAddress = lk("LOCKSTEP_EARLY_AUTO_STORE"),
+      earlyStoreDataWake = lk("LOCKSTEP_EARLY_STORE_DATA_WAKE"),
+      earlyAutoAnWriteback = lk("LOCKSTEP_EARLY_AN"),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt
