@@ -398,8 +398,17 @@ class FuzzCoreDut extends Component {
   val dcache = new DcachePlugin()
   val btb    = new m68k040.frontend.BtbPlugin
   val ftb    = new m68k040.frontend.FtbPlugin
-  val ras    = new m68k040.frontend.RasPlugin(
-    branchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"))
+  // FUZZ_SHIPPING_LSU=1 also selects the SHIPPING front end: the four P1 coverage flags
+  // follow `ShippingCoreConfig` (default ON since e98a322c) unless their own FUZZ_* variable
+  // says otherwise. Without this a "shipping" corpus run gated the LSU the board ships
+  // behind a front end it does not. Declared up here because Scala class-body vals are
+  // initialised in order, and the plugins below read it.
+  private val shipCfg = sys.env.get("FUZZ_SHIPPING_LSU").contains("1")
+  private def feFlag(env: String, shipping: => Boolean): Boolean =
+    sys.env.get(env).map(_ == "1").getOrElse(shipCfg && shipping)
+  private val fuzzRasRepair = feFlag("FUZZ_RAS_BRANCH_REPAIR",
+    m68k040.top.ShippingCoreConfig.rasBranchRepair)
+  val ras    = new m68k040.frontend.RasPlugin(branchRepair = fuzzRasRepair)
   val gsh    = new m68k040.frontend.GsharePlugin
   // The two FRONT-END prediction flags of `perf/track5-branch`. They were wired into
   // `FullCoreSynth`/`SocketTop`/`CoreBenchHarness` only, so the corpus -- the one place an
@@ -408,8 +417,12 @@ class FuzzCoreDut extends Component {
   // replayed against them unmodified. Both default OFF, so an unset environment builds the
   // bit-identical DUT as before.
   val fa     = new FetchAlignPlugin(enableFetchDirected = true,
-    computeDirectTargets = sys.env.get("FUZZ_COMPUTE_DIRECT_TARGETS").contains("1"),
-    deferSlot1Uncond = sys.env.get("FUZZ_DEFER_SLOT1_UNCOND").contains("1"))
+    computeDirectTargets = feFlag("FUZZ_COMPUTE_DIRECT_TARGETS",
+      m68k040.top.ShippingCoreConfig.computeDirectTargets),
+    deferSlot1Uncond = feFlag("FUZZ_DEFER_SLOT1_UNCOND",
+      m68k040.top.ShippingCoreConfig.deferSlot1Uncond),
+    deferSlot1Dbcc = feFlag("FUZZ_DEFER_SLOT1_DBCC",
+      m68k040.top.ShippingCoreConfig.deferSlot1Dbcc))
   val dec    = new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
@@ -421,7 +434,7 @@ class FuzzCoreDut extends Component {
   // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
   // wired only in FullCoreSynth and had zero sim coverage.
   val rob    = new RobPlugin(
-    rasBranchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"),
+    rasBranchRepair = fuzzRasRepair,
     lsOooIssue = fuzzLsOoo)
   // FUZZ_SPEC_WAKE=1 turns on speculative (cache-hit-predicted) load wakeup in BOTH the
   // IQ and the LS EU. Env-read rather than a constructor parameter so the whole fuzz /
@@ -435,7 +448,7 @@ class FuzzCoreDut extends Component {
   // under the shipping `throughput-v2` profile (ipcThroughput = ipcLateStore = true).
   // Without it the corpus runs a DEFAULT store pipeline -- no detached late stores, no
   // forward-on-publish, one detached store entry -- i.e. NOT the silicon's LSU. Test-only.
-  private val shipLsu = sys.env.get("FUZZ_SHIPPING_LSU").contains("1")
+  private val shipLsu = shipCfg
   val iq     = if (!shipLsu) new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake,
     loadBypassUnreadyLoad = fuzzLsOoo)
   else new IssueQueuePlugin(earlyStoreAddress = true, earlyAutoStoreAddress = true,
