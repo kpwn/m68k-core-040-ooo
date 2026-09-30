@@ -683,7 +683,10 @@ object GenSocketTopVerilog {
             // own log -- the same gap that cost the withdrawn `rasBranchRepair` number.
             s"storeQueueDepth=${ShippingCoreConfig.storeQueueDepth} " +
             s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge} " +
-            s"icachePrefetch=${ShippingCoreConfig.icachePrefetch}")
+            s"icachePrefetch=${ShippingCoreConfig.icachePrefetch} " +
+            // D4. Reaches LsEuPlugin / StoreQueue / DcachePlugin through their constructor
+            // DEFAULTS (the `sqDepth` precedent), so this line and the netlist cannot disagree.
+            s"inhibitedFullBarrier=${ShippingCoreConfig.inhibitedFullBarrier}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

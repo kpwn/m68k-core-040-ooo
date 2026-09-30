@@ -138,7 +138,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                    * and the capacity caveat. */
                  val sqDepth: Int = m68k040.top.ShippingCoreConfig.storeQueueDepth,
                  /** See `ShippingCoreConfig.sqNarrowDrainMerge`. */
-                 val sqNarrowDrainMerge: Boolean = m68k040.top.ShippingCoreConfig.sqNarrowDrainMerge)
+                 val sqNarrowDrainMerge: Boolean = m68k040.top.ShippingCoreConfig.sqNarrowDrainMerge,
+                 /** D4: a cache-inhibited access is a FULL two-way memory barrier. See
+                   * `ShippingCoreConfig.inhibitedFullBarrier` and the "D4" block at P4 below.
+                   * Defaults to the shipping flag (the `sqDepth` precedent) so EVERY harness
+                   * that builds this plugin -- SocketTop, FuzzCoreDut, CoreBenchHarness,
+                   * ExecuteLockStepSpec, FullCoreSynth -- gets the same setting from the same
+                   * environment, rather than the "wired in one top only" failure family. */
+                 val inhibitedFullBarrier: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
     extends FiberPlugin with LsEuService {
   require(isPow2(sqDepth) && sqDepth >= 4 && sqDepth <= 16,
     s"store-queue depth must be a power of two in 4..16, got $sqDepth")
@@ -716,7 +723,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val sq = new StoreQueue(sqDepth, subwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish,
       retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
-      narrowDrainMerge = sqNarrowDrainMerge)
+      narrowDrainMerge = sqNarrowDrainMerge,
+      inhibitedFullBarrier = inhibitedFullBarrier)
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
@@ -3635,8 +3643,86 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // before the successor can launch. Extra conservative assertion during target
     // reprogramming only postpones launch; precise halt ownership stays in the ROB.
     val p4PreemptSafe = !irqPreemptPendingIn && !debugHaltImminentIn
-    val p4LaunchOk  = !parkOwnsBarrier && Mux(p4Inhibited,
-                          p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe,
+
+    // ═══ D4: A CACHE-INHIBITED ACCESS IS A FULL MEMORY BARRIER, BOTH DIRECTIONS ═══════
+    // (`inhibitedFullBarrier`; see `ShippingCoreConfig.inhibitedFullBarrier` for WHY.)
+    //
+    // WHAT THE CORE ALREADY GUARANTEED, and therefore is NOT re-done here:
+    //   * an inhibited op launches only at the ROB head (`p4AtRobHead`, park drain by head
+    //     match), with no older store resident (`olderStore`), preemption-safe;
+    //   * an inhibited STORE holds every younger load at P4 until it pops on its own B
+    //     (`olderInhibitedStore`), and younger stores cannot drain before they commit.
+    // WHAT WAS MISSING, and is added:
+    //   (1) BEFORE: "no older store resident" is not "the D side is quiet". Traffic that
+    //       is NOT an older LS op can still be on the bus when the head launches: a table
+    //       walker's descriptor refill or U/M write-back on behalf of a YOUNGER op, the
+    //       tail of a refill, a maintenance push. `dLaunchOk` below waits for
+    //       `dcache.busQuiesced`, for the walkers to have been fenced for >= 1 cycle, and
+    //       for neither walker to own a D-cache port -- so nothing can enter the D-cache in
+    //       the launch cycle either.
+    //   (2) AFTER, loads: once an inhibited load has launched, nothing else launches from
+    //       P4 or the park until its terminal response is consumed (`inhibLoadInFlight`).
+    //       Ring order is enqueue order, so blocking ENQUEUE is enough: nothing can be
+    //       behind the inhibited entry in the ring. (Entries AHEAD of it -- only possible
+    //       under `lsOooIssue` -- are program-YOUNGER ops that already launched, which is
+    //       the pre-launch violation the existing `orderViolation` recovery flushes.)
+    //   (3) AFTER, walkers: fenced (no D-cache grant) while an inhibited access is pending
+    //       at the head or outstanding, loads AND stores.
+    //
+    // DEADLOCK-FREEDOM -- every new wait, and why it is not circular:
+    //   * `busQuiesced` waits only on work ALREADY ACCEPTED by the D-cache (or older than
+    //     the inhibited op). That work completes without anything from P4, the park, the
+    //     ring send, the ROB or the walkers: load responses are a Flow (no back-pressure),
+    //     store acks are pulses, the refill/eviction/store/maintenance engines are driven
+    //     by the bus alone. It deliberately EXCLUDES the early-probe queue and S2, which a
+    //     program-YOUNGER load behind this op can hold (that would be the circular edge).
+    //   * The walker fence waits on nothing: it is a register of "pending or in flight",
+    //     and pending depends only on this op being at P4/park AND at the ROB head.
+    //     Nothing the inhibited op needs is a walk -- it is already translated (both
+    //     halves of a split), and every older op has retired.
+    //   * `ldOwner/stOwner === CORE`: once fenced, no new grant is made; an existing load
+    //     grant is released when its one command is accepted (or the walker stops asking),
+    //     a store grant when its store acks -- both bounded, neither needs this op.
+    //   * `inhibLoadInFlight` releases on the inhibited load's own terminal response. The
+    //     response pointer pops in ring order; everything ahead of it is already sent
+    //     (sends are never held) and its response returns from the bus.
+    //   * PREEMPTION: "pending" requires `p4PreemptSafe`, so a pending IRQ/trace/debug halt
+    //     drops the fence the next cycle and the exception path gets its walker and its
+    //     D-cache port. After launch `inhibitedLoadBusySig` blocks recognition until retire,
+    //     so no preemption can arrive mid-flight, exactly as before.
+    //   * FLUSH: a flush clears P4 and the park (pending drops); a flush that poisons a
+    //     LAUNCHED entry still lets its response be consumed (`inhibitedLoadConsume` counts
+    //     poisoned responses), so the hold releases.
+    //
+    // OFF-NETLIST IDENTITY: every term below is added at the SCALA level (`d4(...)`), so
+    // with the flag off not one new node -- not even a constant wire -- is elaborated.
+    val d4 = inhibitedFullBarrier
+    /** AND `extra` into `base` only when the barrier is built; otherwise `base` verbatim. */
+    def d4And(base: Bool)(extra: => Bool): Bool = if (d4) base && extra else base
+    val dQuiet: Bool    = if (d4) dcache.busQuiesced else null
+    val dFenced: Bool   = if (d4) RegInit(False) else null
+    val dLaunchOk: Bool = if (d4) dQuiet && dFenced && (ldOwner === U(OWNER_CORE, 2 bits)) &&
+                                    (stOwner === U(OWNER_CORE, 2 bits)) else null
+    val inhibLoadInFlight: Bool = if (d4) Bool() else null   // driven beside `loadBusyReg`
+    val d4WalkerFence: Bool = dFenced
+    if (d4) {
+      // NO `sqFlushSig` term, deliberately: it is `doFlush || ...`, i.e. `RobPlugin
+      // doFlushReg`, one of the 200 MHz tail's control-broadcast hubs
+      // (docs/TIMING_200MHZ_TAIL_2026-09-28.md). A flush clears P4 and the park on the
+      // next edge, so the fence simply drops one cycle later -- holding walkers one extra
+      // cycle is harmless. `excActive` is the ExceptionUnit's own `activeReg` copy, not
+      // `exc_fsm_stateReg`, and it IS needed: an exception may need a walk while P4 is
+      // frozen (not cleared) under `excActive`.
+      val pendingAtHead =
+        !excActive && p4PreemptSafe &&
+        ((p4Valid && p4Inhibited && p4AtRobHead) || parkOwnsBarrier)
+      dFenced := pendingAtHead || inhibLoadInFlight || sq.io.inhibHeadHold
+      sq.io.inhibLaunchOk := dLaunchOk
+      pendingAtHead.simPublic(); dQuiet.simPublic(); dFenced.simPublic(); dLaunchOk.simPublic()
+    }
+
+    val p4LaunchOk  = d4And(!parkOwnsBarrier)(!inhibLoadInFlight) && Mux(p4Inhibited,
+                          d4And(p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe)(dLaunchOk),
                           !sq.io.barrier.olderInhibitedStore)
     // The drain itself: reuse the ORDINARY ring push event, so all ring bookkeeping is
     // shared (see the note at `when(alignedEnq)`). Every gate here is one the same op
@@ -3648,7 +3734,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     //   by anything this entry is itself blocking -- which is the property the two earlier
     //   attempts at this barrier lacked.
     if (lsOooIssue) {
-      when(parkOwnsBarrier && !sq.io.barrier.olderStore && p4PreemptSafe &&
+      when(d4And(parkOwnsBarrier && !sq.io.barrier.olderStore && p4PreemptSafe)(
+             dLaunchOk && !inhibLoadInFlight) &&
            alignedCanEnq && !sqFlushSig && !excActive) {
         alignedEnq   := True
         parkDrain    := True
@@ -3916,8 +4003,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // load or a NEW interrupt/trace recognition to proceed -- not whether this
     // particular instruction's result was kept.
     val loadBusyReg = RegInit(False); loadBusyReg.simPublic()
-    val inhibitedLoadLaunch = (alignedEnq && p4Inhibited && !p4Front.twoAccess) ||
-                              (alignedEnqSplit && p4Inhibited)
+    // PARK DRAIN IS A LAUNCH TOO (`lsOooIssue`). A drain asserts the shared `alignedEnq`
+    // with the PARKED op's payload while P4 holds some other op, so `p4Inhibited` /
+    // `p4Front.robId` describe the wrong instruction on that cycle. Before this term, a
+    // drained device read set NO busy (P4 held a cacheable op) or set it under P4's robId
+    // (P4 held another, non-head inhibited op) -- either way the interrupt-recognition gate
+    // was open while the device read was outstanding, which is exactly the 53C96
+    // replay window this register exists to close. Every parked entry is inhibited.
+    val parkDrainLaunch: Bool = if (lsOooIssue) parkDrain else null
+    val inhibitedLoadLaunch = {
+      val base = (alignedEnqFromP4 && p4Inhibited && !p4Front.twoAccess) ||
+                 (alignedEnqSplit && p4Inhibited)
+      if (lsOooIssue) base || parkDrainLaunch else base
+    }
     val inhibitedLoadConsume = loadBusyReg && alignedRspFire && alignedRspTerminal
     // ── 2026-09-07 REWORK (hardware wedge ROM 0x40899664, bitstream 0xAFA3628F,
     // sim repro "inhibited-load IRQ storm" in ExecuteLockStepSpec): clearing busy
@@ -3949,13 +4047,45 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     when(inhibitedLoadLaunch) {
       loadBusyReg          := True
       inhibitedRespSeen    := False
-      inhibitedLaunchRobId := p4Front.robId
+      inhibitedLaunchRobId := (if (lsOooIssue) Mux(parkDrainLaunch, parkMem(parkDrainIdx).bk.robId,
+                                                   p4Front.robId)
+                               else p4Front.robId)
     }.elsewhen(loadBusyReg && inhibitedRespSeen && !launcherStillAtHead) {
       loadBusyReg := False
     }
     inhibitedLoadBusySig := loadBusyReg
     inhibitedLoadLaunch.simPublic(); inhibitedLoadConsume.simPublic()
     inhibitedRespSeen.simPublic()
+    // D4 "AFTER" window for a load: from the launch (enqueue) until its terminal response
+    // is consumed -- NOT until retire. `loadBusyReg` runs to retire on purpose (interrupt
+    // recognition), and holding every younger launch for the retire tail as well would
+    // buy nothing: the device transaction is over once its response is consumed.
+    if (d4) { inhibLoadInFlight := loadBusyReg && !inhibitedRespSeen; inhibLoadInFlight.simPublic() }
+
+    // ── D4 mechanism counters (SIM ONLY -- no synthesis cost) ─────────────────────────
+    // So a test can prove the barrier FIRED, not merely that the flag was set:
+    //   d4LoadLaunches / d4LoadCompletes : inhibited loads launched / terminal responses
+    //   d4StoreLaunches                  : inhibited precise drains started (first half)
+    //   d4QuietWaitCycles                : an inhibited op was otherwise ready to launch at
+    //                                      the head but `dLaunchOk` held it (the BEFORE half
+    //                                      actually delayed something)
+    //   d4YoungerHeldCycles              : P4 held a valid op that was otherwise launchable,
+    //                                      only because an inhibited load was outstanding
+    //   d4WalkerFencedCycles             : a walker asked for the D-cache and was fenced
+    val d4Sim: D4SimCounters = if (!d4) null else GenerationFlags.simulation {
+      val c = new D4SimCounters
+      when(inhibitedLoadLaunch) { c.loadLaunches := c.loadLaunches + 1 }
+      when(inhibitedLoadConsume && !inhibitedRespSeen) { c.loadCompletes := c.loadCompletes + 1 }
+      val headReadyButHeld =
+        (p4Valid && !sqFlushSig && !excActive && p4Inhibited && p4AtRobHead &&
+         !sq.io.barrier.olderStore && p4PreemptSafe && !(p4Ctx.fwdStall || p4Ctx.fwdSerial) && !dLaunchOk) ||
+        (parkOwnsBarrier && !sq.io.barrier.olderStore && p4PreemptSafe && !sqFlushSig && !excActive &&
+         !dLaunchOk)
+      when(headReadyButHeld) { c.quietWaitCycles := c.quietWaitCycles + 1 }
+      when(p4Valid && !sqFlushSig && !excActive && inhibLoadInFlight && !p4Inhibited &&
+           !sq.io.barrier.olderInhibitedStore) { c.youngerHeldCycles := c.youngerHeldCycles + 1 }
+      c
+    }
 
     // P3 performs the registered-PA SQ operation. Stores terminate here; loads capture
     // the registered forwarding result into P4. An older P4/front-back completion wins
@@ -4934,6 +5064,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // `walkerAgeLimit`. CORE-LS cannot starve either: a walker requests only while it
     // has an un-issued descriptor read, which is at most one command per memory round
     // trip, and the grant is released on acceptance.
+    if (d4Sim != null) {
+      when(d4WalkerFence && (walkLdReq.reduce(_ || _) || walkStReq.reduce(_ || _))) {
+        d4Sim.walkerFencedCycles := d4Sim.walkerFencedCycles + 1
+      }
+    }
     val ldWalkRr = RegInit(False)   // False => ITLB wins the tie-break next
     val ldAge = Vec.fill(2)(Reg(UInt(log2Up(walkerAgeLimit + 1) bits)) init 0)
     val ldForce = Vec(Bool(), 2)
@@ -4948,7 +5083,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val ldCand = Vec(Bool(), 2)
     for (i <- 0 until 2) ldCand(i) := walkLdReq(i) && (!coreLsLoadReq || ldForce(i))
     val ldPickDtlb = ldCand(walkIdxDtlb) && (!ldCand(walkIdxItlb) || ldWalkRr)
-    val ldGrantOk = (ldOwner === U(OWNER_CORE, 2 bits)) && !ldBusyExc && !quiesceHold &&
+    val ldGrantOk = d4And((ldOwner === U(OWNER_CORE, 2 bits)) && !ldBusyExc && !quiesceHold)(
+                    !d4WalkerFence) &&
                     !ldFifoFull && (ldCand(walkIdxItlb) || ldCand(walkIdxDtlb))
     when(ldGrantOk) {
       ldOwner  := Mux(ldPickDtlb, U(OWNER_DTLB, 2 bits), U(OWNER_ITLB, 2 bits))
@@ -4979,7 +5115,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val stPickDtlb = stCandDtlb && (!stCandItlb || stWalkRr)
     val stGrantOk = (stOwner === U(OWNER_CORE, 2 bits)) && (coreStOutstanding === 0) &&
                     !dcache.store.fire && !excStoreValid && !excStoreOutstanding &&
-                    !quiesceHold && (stCandItlb || stCandDtlb)
+                    d4And(!quiesceHold)(!d4WalkerFence) && (stCandItlb || stCandDtlb)
     when(stGrantOk) {
       stOwner  := Mux(stPickDtlb, U(OWNER_DTLB, 2 bits), U(OWNER_ITLB, 2 bits))
       stWalkRr := !stPickDtlb
@@ -5236,4 +5372,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // would then wait forever in its WAIT state for a response that was never requested.
     excLoadCmdReady := dcache.loadCmd.ready && excLoadAdmit
   }
+}
+
+/** D4 mechanism counters -- SIMULATION ONLY (built inside `GenerationFlags.simulation`, so
+  * `LsEuPlugin.logic.d4Sim` is null in every synthesis/GenVerilog build). They let a test
+  * prove the barrier FIRED rather than merely that the flag was set:
+  *   loadLaunches / loadCompletes : inhibited loads launched / terminal responses consumed
+  *   quietWaitCycles    : an inhibited op was otherwise launchable at the head but the D4
+  *                        BEFORE gate (`dLaunchOk`) held it
+  *   youngerHeldCycles  : P4 held an otherwise-launchable op only because an inhibited load
+  *                        was outstanding (the AFTER gate)
+  *   walkerFencedCycles : a table walker wanted the D-cache and was fenced
+  * The store-side launch counter lives in `StoreQueue.d4StoreLaunches`. */
+class D4SimCounters extends Area {
+  private def ctr() = { val r = RegInit(U(0, 32 bits)); r.simPublic(); r }
+  val loadLaunches       = ctr()
+  val loadCompletes      = ctr()
+  val quietWaitCycles    = ctr()
+  val youngerHeldCycles  = ctr()
+  val walkerFencedCycles = ctr()
 }

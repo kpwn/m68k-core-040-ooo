@@ -324,6 +324,23 @@ trait DcacheService {
     * must therefore wait on this (together with the SQ-drained signal) before
     * pulsing `maintCmd` — see ExceptionUnit's `S_DRAIN` state. */
   def maintQuiesced: Bool
+
+  /** D4 (`ShippingCoreConfig.inhibitedFullBarrier`): REGISTERED "the D-side bus is quiet".
+    * True when, as of the end of the previous cycle, the D-cache had no transaction in
+    * flight on its AXI master and none ACCEPTED that could still produce one: load FSM in
+    * IDLE with no S1 decision or shadow-replay pending, no store in S0..S3 or awaiting its
+    * B (`storeOutstanding === 0`), no write-through kickoff or store-miss allocate pending,
+    * both AXI write-pair completion flags set, no maintenance walk -- and no command was
+    * accepted on the load, store or maintenance port in that cycle.
+    *
+    * DELIBERATELY NARROWER THAN `maintQuiesced`: it omits the early-probe queue and the
+    * S2 response snapshot. Those can be held by a PROGRAM-YOUNGER load sitting behind the
+    * inhibited op in the LS pipe, so waiting on them would be a circular wait; neither
+    * can reach the bus (a probe is an array read, S2 is a registered response).
+    *
+    * Elaborated only when the barrier is on; otherwise this is null and must not be read.
+    * Sole producer: DcachePlugin. Sole consumer: LsEuPlugin (P4 / park / SQ launch gate). */
+  def busQuiesced: Bool
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.
