@@ -183,11 +183,20 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
-        // ⛔ STILL OFF BY DEFAULT. `LS_OOO_ISSUE` is `sys.env` and unset, so this is
-        // `false` in every ordinary build; the knob exists only so the park+recovery code
-        // above can be exercised. A THIRD independent corpus defect (a 6-red delta on
-        // `add_mem_postinc_rmw` / `memind_full_matrix` / `store_forward_matrix`, which
-        // reproduces on HEAD's own LsEuPlugin with no park present) blocks turning it on.
+        // ⛔ STILL OFF BY DEFAULT -- now pending a BOARD BOOT, not a known defect.
+        // `LS_OOO_ISSUE` is `sys.env` and unset, so this is `false` in every ordinary build.
+        // The blockers recorded here before 2026-09-30 are closed, each with a reproducer
+        // that fails before and passes after:
+        //   * the P4-park deadlock (inhibited op waiting for the ROB head in P4) -- the park;
+        //   * the corpus 6-red delta -- the store barrier is OCCUPANCY, not readiness
+        //     (`bcff067c`);
+        //   * the LS-pipe circular wait in every other shape (LsOooLivenessSpec A-E, the
+        //     InhibitedFullBarrierSpec F seed-2 hang, 13/24 LsOooStressSpec seeds): stores
+        //     issue strictly in LS order, and the LS EU's liveness REPLAY vacates any P4 op
+        //     that cannot proceed with an older LS op behind it (RobPlugin restarts it at
+        //     its own PC). See docs/BUG_ls_ooo_inhibited_barrier_p4_park_deadlock.md.
+        // Silicon has caught what every sim gate missed three times this week: flip the
+        // default only after a framebuffer-verified boot with exception halts armed.
         loadBypassUnreadyLoad = SocketTopConfig.LS_OOO_ISSUE,
         specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP),
       eu0, eu1, branchEu, lsEu, divEu,

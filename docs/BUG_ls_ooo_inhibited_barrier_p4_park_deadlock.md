@@ -915,3 +915,70 @@ part of this fix, not the one-line diff.
 Same family as this file's own `alignedEnq` lesson ("sharing an event is safe; sharing an event
 whose consumers infer the SOURCE from it is not"): both are a second consumer silently changing
 the meaning of a predicate the first consumer still trusts.
+
+## ROOT-CAUSED AND FIXED (2026-09-30, `perf/ls-ooo-live`): the LS-pipe circular wait, ALL shapes
+
+### One mechanism
+
+The LS EU is ONE in-order pipe (S1 -> T -> TX -> P3 -> P4) and every stage that can WAIT
+was written for in-order issue, where the op resident in a stage is always the oldest LS op
+in flight -- so whatever it waits for is older and ahead of it. Relaxed issue puts a YOUNGER
+op in front of an OLDER one. If the younger op then waits on anything whose release needs the
+older op to complete, the older op is stuck behind it. The P4 park fixed ONE instance (an
+inhibited op waiting to become the ROB head). There were at least five more, and the
+select had drifted from the approved design in a way that created four of them: it let a
+STORE pass an older UNREADY LOAD (docs/DESIGN_ooo_load_issue_and_prefetch.md: "Stores stay
+strict this phase"). Such a store sits UNCOMMITTED in the SQ until that load retires, so
+everything that waits on the store waits on the load behind it.
+
+| shape (LsOooLivenessSpec) | the waiter | waits on | FUZZ_LS_OOO=1 before |
+|---|---|---|---|
+| A inhibited store bypass | younger cacheable load in P4 (`fwdSerial`) | older INHIBITED store draining at the head | HANG, head in P3 behind P4 |
+| B SQ capacity | 9th store in P3 | SQ space held by 8 bypassing uncommitted stores | HANG, head in T |
+| C park overflow | 5th inhibited load in P4 | ROB head (park full) | HANG, 4 parked + P4, head in T |
+| D split inhibited | line-crossing device long in P4 (never parked) | ROB head | HANG, head in TX |
+| E late store data (shipping LSU only) | younger load in P4 (`fwdStall`) | the store's DATA = the bypassed load's value | HANG, head in P3 |
+
+All five pass with LS-OoO OFF (the control), and the dumps are the liveness monitor's
+(`LsLivenessMonitor`, retire/stage-age/oldest-LS bounds). The D4 agent's `InhibitedFullBarrierSpec`
+F seed-2 hang is shape A's cousin: the RMW's inhibited LOAD (rob 5) serialising in P4's retry
+arm (`fwdSerial`) on a store that had bypassed the head load (rob 30, in P3). LsOooStressSpec
+(randomized, device-exactness oracle): 12/12 non-IRQ seeds HANG before; the IRQ seeds pass
+only because interrupt recognition flushes the wedge -- which is how a board can look
+"mostly alive" with this defect.
+
+### The fixes
+
+1. **IssueQueuePlugin: stores are strict** -- a store is eligible only as the oldest occupied
+   LS slot. With that, every SQ store was issued after ALL older LS ops, so every wait on a
+   store depends only on ops AHEAD of the waiter (A, B, E, F-seed-2).
+2. **LsEuPlugin + RobPlugin: liveness REPLAY** for what remains (C, D, and any unenumerated
+   wait): a P4 op that cannot proceed while a program-OLDER LS op is upstream is vacated --
+   immediately if it is an inhibited, non-head, unparkable op; after 255 cycles for any other
+   wait. It completes with a throw-away result (every held wakeup confirmed), raises
+   `replayRequest`, and the ROB never retires it: at the head it flushes and restarts AT ITS
+   OWN PC. Exact because an op with an older op behind it overtook it at issue, which
+   `intraMacroOk` allows only for a FIRST uop (`p0.first` is in the hardware condition and
+   asserted). The ROB keeps only the OLDEST pending robId; the op is refused retirement from
+   BOTH slots -- the first version refused only slot 0 and the stress caught the slot-1
+   garbage commit (seed 22).
+
+### A pre-existing SHIPPING bug found on the way: an inhibited STORE written twice
+
+LsOooStressSpec seed 15 (pre-fix, IRQ storm) wrote a device register 12 times for 11 stores.
+`InhibitedStoreIrqReplaySpec` isolates it -- and it is NOT an LS-OoO bug:
+
+| config | bus writes for 300 device stores under a phase-swept IRQ storm |
+|---|---|
+| LS-OoO OFF, default LSU | **333** |
+| LS-OoO OFF, shipping LSU (`FUZZ_SHIPPING_LSU=1`) | **335** |
+| LS-OoO ON, shipping LSU | **335** |
+| any of the above + the fix | **300** |
+
+`preciseDrainBusy` blocked interrupt recognition from drain launch to final ack + 1 cycle,
+assuming the store's ROB completion lands within a cycle. It rides the LS EU's shared
+completion stage, where it yields to same-cycle front completions and to every ring
+completion; past the pad the drained-but-unretired store is squashable by an interrupt
+(`normalIrqGate` needs a first uop, not a complete head) and runs again after RTE. The store
+twin of the 53C96 load bug, fixed the same way: busy until the final ack is seen AND the ROB
+head has moved past the launching robId (StoreQueue, +8 flops, all builds).
