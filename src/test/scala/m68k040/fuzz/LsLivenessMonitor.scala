@@ -40,6 +40,10 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
     * every LS-OoO pipe deadlock. A reproducer whose run shows 0 here never built the shape
     * it claims to test. */
   var olderBehindStuckP4 = 0L
+  /** LS-OoO liveness replays requested (LsEuPlugin `replayRequest`) and actually taken at
+    * the ROB head (`lsReplayRedirect`), when the build has them. */
+  var replays = 0L
+  var replayRedirects = 0L
   var cycle = 0L
   var commits = 0L
   var lastCommitPc = -1L
@@ -57,7 +61,8 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
   }
 
   def summary: String =
-    s"[liveness/$name] cycles=$cycle commits=$commits olderBehindStuckP4=$olderBehindStuckP4" +
+    s"[liveness/$name] cycles=$cycle commits=$commits olderBehindStuckP4=$olderBehindStuckP4 " +
+      s"replays=$replays replayRedirects=$replayRedirects" +
       failure.map(_ => " TRIPPED").getOrElse("")
 
   def attach(): this.type = { dut.clockDomain.onSamplings(sample()); this }
