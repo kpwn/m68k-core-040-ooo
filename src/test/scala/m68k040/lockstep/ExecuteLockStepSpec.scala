@@ -489,7 +489,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
 
   /** Full-core DUT: the entire frontend+backend chain. The I-cache AXI master,
     * FetchAlign redirect/resume, EU wbObs and ROB commitObs surface for the sim. */
-  class FullCoreDut extends Component {
+  class FullCoreDut(forceShipping: Boolean = false) extends Component {
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -501,17 +501,25 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // explicit `require` in ExceptionUnit).
     val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
-    val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
+    // LOCKSTEP_SHIPPING=1 (2026-09-30): build every configurable plugin through
+    // `m68k040.top.ShippingPlugins`, the SAME functions `M68kSocketTop` calls under
+    // throughput-v2 -- exactly as FuzzDut's FUZZ_SHIPPING=1. Without it this DUT is the
+    // all-options-OFF core (default LSU, no slot-1 prediction, no P1 coverage), which is
+    // not what the board runs. The per-knob LOCKSTEP_* variables below still apply when
+    // it is unset; the harness-only retire-width knobs apply either way.
+    private val ship = forceShipping || sys.env.get("LOCKSTEP_SHIPPING").contains("1")
+    private val SP = m68k040.top.ShippingPlugins
+    val itlb   = SP.itlb()
     val dtlb   = new DtlbPlugin()
-    val icache = new IcachePlugin
-    val dcache = new DcachePlugin()
+    val icache = if (ship) SP.icache(m68k040.cache.IcachePredecodeConfig.fromEnvironment) else new IcachePlugin
+    val dcache = if (ship) SP.dcache(socketMerged = false) else new DcachePlugin()
     val btb    = new m68k040.frontend.BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin(
+    val ras    = if (ship) SP.ras() else new m68k040.frontend.RasPlugin(
       branchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"))
-    val gsh    = new m68k040.frontend.GsharePlugin(
+    val gsh    = if (ship) SP.gshare(ipcThroughput = true) else new m68k040.frontend.GsharePlugin(
       retainRedirectHistory = sys.env.get("LOCKSTEP_RETAIN_HISTORY").contains("1"))
-    val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+    val fa     = if (ship) SP.fetchAlign(ipcThroughput = true) else new FetchAlignPlugin(enableFetchDirected = true,
       // The two front-end prediction flags of `perf/track5-branch`; see the note in
       // FuzzDut. Default OFF, so an unset environment is the same DUT as before.
       computeDirectTargets = sys.env.get("LOCKSTEP_COMPUTE_DIRECT_TARGETS").contains("1"),
@@ -519,7 +527,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
-    val dec    = new DecodeStage(allowSlot1Prediction =
+    val dec    = if (ship) SP.decode(ipcThroughput = true) else new DecodeStage(allowSlot1Prediction =
       sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       fuseLongMoveLoads = sys.env.get("LOCKSTEP_FUSE_LONG_MOVE_LOADS").contains("1"))
     val preparedCap = sys.env.get("LOCKSTEP_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
@@ -533,11 +541,16 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // from one switch; every SIM harness omitted it, so the recovery had never been
     // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
     // wired only in FullCoreSynth and had zero sim coverage.
-    val rob    = new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
+    val rob    = if (ship) SP.rob(detailedPerf = false, pcRangeEnable = true,
+        lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+      else new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap,
       rasBranchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
-    val iq     = new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
+    val iq     = if (ship) SP.issueQueue(ipcThroughput = true, ipcLateStore = true,
+        specLoadWakeup = SP.specLoadWakeup(ipcThroughput = true),
+        loadBypassUnreadyLoad = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+      else new IssueQueuePlugin(earlyStoreAddress = sys.env.get("LOCKSTEP_EARLY_STORE_ADDRESS").contains("1"),
       earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
       // LOCKSTEP_LS_OOO=1: out-of-order LS issue + the LS inhibited barrier, together.
@@ -545,7 +558,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
-    val lsEu   = new LsEuPlugin(
+    val lsEu   = if (ship) SP.lsEu(ipcThroughput = true, ipcLateStore = true,
+        specLoadWakeup = SP.specLoadWakeup(ipcThroughput = true),
+        lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+      else new LsEuPlugin(
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
       alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
       earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
@@ -577,6 +593,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dtlb,
       icache, dcache, btb, ftb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
       rfInt, rfNzvc, rfX, rfFp, rfFpcc, wire)) }
+    println(s"LOCKSTEP_DUT_CONFIG shipping=$ship")
+    /** Every configurable plugin instance, for `ShippingConfigParitySpec`. */
+    def configuredPlugins: Seq[FiberPlugin] =
+      Seq(itlb, icache, dcache, ras, gsh, fa, dec, rob, iq, lsEu)
   }
 
   /** Attach a behavioral AXI read-only memory backed by the assembled program.
