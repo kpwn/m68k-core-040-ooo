@@ -1,79 +1,21 @@
-| cpush_ic_maint_while_busy.s — CPUSH IC LINE issued while the I-cache's
-| own FSM is busy servicing unrelated fetch/fill traffic must still
-| actually invalidate the targeted line, not silently no-op.
+| CPUSHL IC publication regression, ported from the legacy busy-maintenance test.
 |
-| Background (review-found bug, rtl/core/fetch/icache.v +
-| rtl/core/m68k_core_rename.vh):
-|   icache.v's edge-detector for maint_req (CPUSH/CINV) "consumed" the
-|   rising edge (via maint_req_q) on WHATEVER cycle it arrived, but only
-|   the S_IDLE case body ever actually invalidated anything.  If the
-|   edge arrived while the FSM was busy (S_LOOKUP / S_FILL_REQ /
-|   S_PRE_FILL_SNOOP / S_COMPLETE — i.e. mid unrelated fetch/fill), the
-|   maintenance op was silently dropped: no line was invalidated, but
-|   the edge was still "seen" so a later re-check in S_IDLE saw a stale,
-|   already-consumed maint_req_q and did nothing.  Compounding this,
-|   m68k_core_rename.vh synthesized `ic_maint_done` from the mere RISING
-|   EDGE of commit's request (one cycle after the fire), not from the
-|   icache's real completion — so commit.v believed the CPUSH/CINV had
-|   completed instantly, even on the busy-FSM cycles where it hadn't
-|   done anything at all.
+| Enable I-cache explicitly, keep D-cache disabled and MMU off, publish the
+| initial generated code with CPUSHA BC, then execute it to prime the I-cache.
+| Overwrite it through uncached stores and use the CPUSHL IC under test before
+| executing the new code. The first publication is setup synchronization required
+| by MC68040 UM section 4.5; it must precede the first JSR.
 |
-| This test forces exactly that race architecturally: it primes the
-| I-cache with a STALE copy of a code line, overwrites the underlying
-| memory with NEW code, issues CPUSH IC LINE targeting that stale line,
-| and IMMEDIATELY follows it with a long river of never-before-fetched
-| NOP cache lines.  Because fetch runs ahead of in-order commit, while
-| commit is still working through retiring the CPUSH (which asserts
-| cache_maint_req and gates the ROB head on cache_maint_done — see
-| commit.v's cache_maint_wait), the I-cache's fetch FSM is busy
-| miss-filling those fresh NOP lines — exactly the "maint_req arrives
-| while FSM != S_IDLE" window the bug hits.
+| The following 400 cold NOPs retain fetch pressure from the original test.
+| Architectural PASS checks publication and progress. It does not by itself prove
+| that the maintenance request overlapped a busy I-cache FSM; that needs a signal
+| monitor. Historical RTL module names and FSM states do not describe this core.
 |
-| ⚠️ POSTURE: THIS TEST IS ONLY VALID WITH THE MMU OFF / D-CACHE INHIBITED.
-| Do NOT add it to the cache-mode sweep manifest. Step 1 below states the
-| requirement outright: with the MMU off, mmu.v forces cache_inh=1 globally so
-| the D-cache never caches the test's writes, which is what isolates the
-| EXPLICIT CPUSH/CINV IC path this test exists to cover. Under forced-copyback
-| that premise is violated -- the writes sit dirty in the D-cache instead of
-| reaching memory -- and the test reports 0xDEAD0004 for reasons unrelated to
-| the bug it targets. (2026-09-10: observed exactly that; not a core defect.)
+| Keep this test out of forced-copyback sweeps: its second publication uses IC-only
+| maintenance and depends on the data writes reaching memory with D-cache disabled.
 |
-| Strategy:
-|   1. Leave the MMU disabled (default cold-boot state: TC.E=0).  With
-|      the MMU off, mmu.v forces cache_inh=1 globally, so the D-cache
-|      treats every access as non-cacheable and never caches our writes
-|      — meaning it never pulses its automatic SMC snoop
-|      (dc_snoop_valid) to the I-cache.  This decouples the test from
-|      the AUTOMATIC D-write -> I-cache snoop-invalidate path already
-|      covered by smc_dcache_to_icache.s, isolating the EXPLICIT
-|      CPUSH/CINV IC path this bug lives in.
-|   2. Stage OLD code at NEWCODE (0x00020000):
-|        move.l #0xBADC0DE1, %d0 ; rts
-|   3. JSR to it once.  This runs the OLD code (sanity-checks D0) AND
-|      causes the I-cache to fetch + cache that 16 B line.
-|   4. Overwrite NEWCODE (plain stores — bypass the D-cache per step 1)
-|      with NEW code:
-|        move.l #0xCAFEF00D, %d0 ; rts
-|      The I-cache still holds the OLD bytes — nothing has invalidated
-|      it yet.
-|   5. CPUSH IC, LINE, (A0=NEWCODE), immediately followed by a long run
-|      of fresh NOPs to keep the I-cache's fetch FSM busy right around
-|      CPUSH's retire.
-|   6. JSR to NEWCODE again.  Stale I-cache (bug) -> OLD code re-runs
-|      (D0 = 0xBADC0DE1).  Genuinely-invalidated I-cache (fixed) -> NEW
-|      code runs (D0 = 0xCAFEF00D).
-|
-| PASS: sentinel 0xC0FFEE00 (D0 == 0xCAFEF00D after the second JSR).
-| FAIL sentinels:
-|   0xDEAD0001 — priming JSR didn't run the OLD code correctly (setup
-|                bug, not the bug under test)
-|   0xDEAD0002 — bus error
-|   0xDEAD0003 — address error
-|   0xDEAD0004 — illegal instruction (I-cache served truly garbage
-|                bytes, not just a stale-but-valid OLD line)
-|   0xDEAD0005 — post-CPUSH JSR still ran the STALE OLD code: the
-|                CPUSH IC LINE op was silently dropped while the
-|                I-cache FSM was busy (the bug this test targets)
+| PASS: 0xC0FFEE00; failures: 0xDEAD0001 initial code, 0002 bus error,
+| 0003 address error, 0004 illegal instruction, 0005 stale code after CPUSHL.
 
     .text
     .org 0
@@ -84,12 +26,23 @@ _start:
     move.l  #_buserr,  0x00000008       | vec 2 (bus error)
     move.l  #_addrerr, 0x0000000c       | vec 3 (address error)
 
-    | NEWCODE target — 16 B-line-aligned RAM address.
+    | Make the I-cache premise explicit; leave D-cache disabled and MMU off.
+    move.l  #0x00008000, %d0
+    movec   %d0, %cacr
+
+    | NEWCODE target — 64-byte-line-aligned RAM address.
     move.l  #0x00020000, %a0
 
     | Stage OLD code:  move.l #0xBADC0DE1,%d0 ; rts
     move.l  #0x203CBADC, (%a0)
     move.l  #0x0DE14E75, 4(%a0)
+
+    | Publish the initial code before its FIRST execution (MC68040 UM 4.5).
+    | Otherwise speculative fetch can see the second long before its write
+    | completes, trapping at NEWCODE+6 before the CPUSHL under test is reached.
+    | This setup synchronization precedes priming; the later overwrite still
+    | relies on the original CPUSHL + cold-NOP sequence below.
+    cpusha  %bc
 
     | Prime: JSR runs the OLD code (also caches this I-cache line).
     jsr     (%a0)
@@ -97,18 +50,14 @@ _start:
     bne     _fail_prime
 
     | Overwrite with NEW code:  move.l #0xCAFEF00D,%d0 ; rts
-    | MMU is disabled (cache_inh=1 globally) so this store bypasses the
-    | D-cache entirely — no automatic SMC snoop fires here.
+    | D-cache is disabled, so the writes must reach memory before publication.
     move.l  #0x203CCAFE, (%a0)
     move.l  #0xF00D4E75, 4(%a0)
 
     | CPUSH IC, LINE, (A0) — must invalidate the stale I-cache line.
     cpushl  %ic, (%a0)
 
-    | Long river of never-before-fetched NOPs.  Keeps the I-cache FSM
-    | continuously busy miss-filling fresh cold lines for hundreds of
-    | cycles right around the point CPUSH retires in commit and fires
-    | cache_maint_req — the busy-FSM window this test targets.
+    | Cold NOPs retain fetch pressure around maintenance retirement.
     .rept 400
     nop
     .endr
