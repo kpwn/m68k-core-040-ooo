@@ -204,3 +204,31 @@ The ON lockstep arm is still running, so the four-arm broad gate is not complete
 Focused fixes do not turn the older frozen corpus red rows into a broad PASS.
 Keep that distinction when reporting the current candidate. The SCC case must
 not be hidden by accepting a failure sentinel or changing global memory fill.
+
+
+## Dynamic-release physical inputs (2026-10-01)
+
+Frozen integration source `46413280` was elaborated with actual
+`GenSocketTopVerilog`, throughput-v2/full-debug, NB4/ring8/hot read door,
+P3/probe forwarding/speculative wakeup/LS-OoO, early response/eager/preselected
+AR enabled and direct refill disabled. The paired arms differ only in
+`CPU_DCACHE_NB_DYNAMIC_RELEASE=0/1`. Both elaborations succeeded and their
+117-port socket surfaces compare equal, including direction and width.
+This is paired interface preservation, not complete CPU/SoC conformance.
+
+Inputs and all generated-file SHA-256 digests:
+`/tmp/codex-dynamic-physical-inputs-46413280/manifest.json`.
+Runner: `/tmp/codex-dynamic-physical-inputs.py`.
+`M68kSocketTop.v` SHA-256:
+
+- OFF: `c0079e4d518d20733b2e723bf0d3da5a9f8a5c21f6ee0466e3fb7b8507152a72`
+- ON: `ee40fdbd306ff2e321d20427b051f2dcfd012543d4b023b89f9fc93494f95f00`
+
+No synthesis, placement, routing or board action was performed. These artifacts
+prepare a controlled comparison; they do not establish LUT/FF cost, Fmax, SoC
+clock closure or board IPC. `synth/impl_FullCore.tcl` targets the standalone
+full-core top, not this socket top: do not feed these files into that flow
+under its existing top/constraint names. A socket/SoC implementation must retain
+the recorded configuration and coordinate the shared implementation lock and
+active Verilator jobs per `synth/README.md` before it runs. Preserve the live
+board/JTAG session. Feature defaults stay unchanged.
