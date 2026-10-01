@@ -1824,3 +1824,32 @@ candidate than simultaneously bypassing both AR and R, especially with the
 SoC R bypass enabled. Selection needs a separate spec, reset/backpressure
 proof, and mapped/routed evidence; this paragraph does not authorize a
 shipping default change or remove existing boundary registers.
+
+### Speculative-wakeup control on independent indexed loads (2026-10-02)
+
+At source `564e3b2b`, a test-only monitor fix made the existing full-core
+benchmark valid with `DSIDE_SPEC_WAKE=0`: speculative-wakeup signals are
+sampled only when that option elaborates them. Default `test-fast` passed
+404/404. A seed-17 OFF/ON pair used identical source, indexed-load kernels,
+`l2:5:60:4096`, P1/probe-miss staging, NB4/ring8/hot door/D4,
+P3/probe forwarding, early response, eager/preselected AR, dynamic release,
+and direct refill OFF. Only `DSIDE_SPEC_WAKE` changed.
+
+| Kernel | Wake OFF cycles / bytes per cycle | Wake ON cycles / bytes per cycle | ON minus OFF |
+| --- | --- | --- | --- |
+| stream-16k | 13355 / 1.2268 | 13355 / 1.2268 | 0 cycles |
+| indexed four-chain | 10503 / 0.7830 | 10335 / 0.7957 | -168 cycles (-1.60%) |
+| indexed eight-chain | 10666 / 0.7710 | 10689 / 0.7694 | +23 cycles (+0.22%) |
+
+The four-chain timed-window IQ recheck held/skid counts were 0/0 OFF versus
+8251/8213 ON; eight-chain counts were 0/4 versus 140/134. Four-chain
+MSHR-full and ring-full-no-pop counts were zero in both arms, while eight-chain
+MSHR-full was 1481 OFF versus 1503 ON and ring-full-no-pop was 1877 versus
+1766. These are observed events, not a causal decomposition of the cycle
+difference. Blanket wake suppression removes many rechecks but also loses
+four-chain throughput; this pair does not justify changing the default or
+adding a hit-qualified wake policy. A narrower policy would need a measured
+ready-load-while-skid cross-tab and its own matched gate. This is a behavioral
+memory-model result, not SoC timing evidence. Exact paired outputs:
+`/tmp/codex-agent76-specwake-pair-results.json` and
+`/tmp/codex-agent76-specwake-pair-{off,on}.log`.
