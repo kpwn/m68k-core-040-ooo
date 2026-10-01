@@ -353,6 +353,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val noFillMutation: Int = 0,
                    /** Experimental one-beat response bypass for the legacy refill path. */
                    val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
+                   val earlyProbeLineForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
                    val nbEarlyResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
@@ -798,6 +799,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     probeReadValid.simPublic(); probeReadSlot.simPublic(); probeReadSet.simPublic()
     probeReadTag.simPublic(); probeReadUsable.simPublic()
     probeLineValid.simPublic(); probeLineSlot.simPublic(); probeLineHit.simPublic()
+    if (earlyProbeLineForward) probeLineTag.simPublic()
 
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
@@ -1387,6 +1389,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
       probeLineSize := probeReadSize
       probeLineNeedsLine := probeReadNeedsLine
     }
+    if (earlyProbeLineForward) GenerationFlags.simulation {
+      // The queue permits same-cycle consume/replacement. Verify that a delayed
+      // line result never lands on a different occupant of the reused slot.
+      // These identity registers exist only in simulation, not the netlist.
+      val lineOwnerToken = Reg(UInt(DLoadToken.Width bits))
+      val lineOwnerVa = Reg(UInt(32 bits))
+      when(probeReadValid) {
+        lineOwnerToken := earlyProbeTokens(probeReadSlot)
+        lineOwnerVa := earlyProbeVaddrs(probeReadSlot)
+      }
+      when(probeLineValid && earlyProbeValids(probeLineSlot)) {
+        assert(earlyProbeTokens(probeLineSlot) === lineOwnerToken &&
+               earlyProbeVaddrs(probeLineSlot) === lineOwnerVa,
+          "DcachePlugin: delayed probe-line result targets a reused slot", FAILURE)
+      }
+    }
     when(probeLineValid && earlyProbeValids(probeLineSlot)) {
       earlyProbeReadies(probeLineSlot) := True
       earlyProbeHits(probeLineSlot)    := probeLineHit
@@ -1481,9 +1499,39 @@ class DcachePlugin(val socketMerged: Boolean = false,
         earlyProbeStale(i) := True
       }
     }
+    // The registered probeLine result is ready one cycle before its selected
+    // data is copied to the per-slot earlyProbeData/readies registers. Only a
+    // still-valid, not-yet-ready slot with the exact command identity may use
+    // that registered result; misses and all hazards retain the old wait.
+    val lineForwardVec = if (earlyProbeLineForward) {
+      val v = Vec(Bool(), earlyProbeDepth)
+      val lineCanceled = loadProbeCancelPort.valid &&
+        (loadProbeCancelPort.payload.all ||
+         (loadProbeCancelPort.payload.token === loadCmdPort.payload.token))
+      val inhibResolve = loadProbeResolvePort.valid &&
+        (loadProbeResolvePort.payload.cacheMode === CacheMode.INHIBITED) &&
+        (loadProbeResolvePort.payload.token === loadCmdPort.payload.token)
+      for (i <- 0 until earlyProbeDepth) {
+        v(i) := probeLineValid && (probeLineSlot === U(i, earlyProbePtrW bits)) &&
+          earlyProbePresentVec(i) && !earlyProbeReadies(i) &&
+          probeLineHit && (probeLineTag === cmdTag) &&
+          (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
+          !loadCmdPort.payload.lineOnly && !probeLineNeedsLine &&
+          !earlyProbeStale(i) && !earlyProbeSetWriteVec(i) &&
+          !ldS1Valid && !lineCanceled && !inhibResolve
+        v(i).simPublic()
+      }
+      v
+    } else null
+    val lineForwardOwnsCmd = if (earlyProbeLineForward) lineForwardVec.asBits.orR else False
+    if (earlyProbeLineForward) lineForwardOwnsCmd.simPublic()
     val earlyProbeTokenPresent = earlyProbePresentVec.asBits.orR
-    val earlyProbeOwnsCmd      = earlyProbeMatchVec.asBits.orR
-    val earlyProbeMatchIdx     = OHToUInt(earlyProbeMatchVec.asBits)
+    val earlyProbeOwnsCmd = if (earlyProbeLineForward)
+      earlyProbeMatchVec.asBits.orR || lineForwardOwnsCmd
+    else earlyProbeMatchVec.asBits.orR
+    val earlyProbeMatchIdx = if (earlyProbeLineForward)
+      Mux(lineForwardOwnsCmd, probeLineSlot, OHToUInt(earlyProbeMatchVec.asBits))
+    else OHToUInt(earlyProbeMatchVec.asBits)
     // ── FMax: `earlyProbeHit` as a per-entry OR, not an index-then-select ──
     // The original form was
     //
@@ -1537,15 +1585,25 @@ class DcachePlugin(val socketMerged: Boolean = false,
                              earlyProbeTagOkVec(i) &&
                              !earlyProbeSetWriteVec(i) && !earlyProbeStale(i)
     }
-    val earlyProbeHit          = earlyProbeHitVec.asBits.orR
+    val earlyProbeHit = if (earlyProbeLineForward)
+      earlyProbeHitVec.asBits.orR || lineForwardOwnsCmd
+    else earlyProbeHitVec.asBits.orR
     GenerationFlags.simulation {
       assert(CountOne(earlyProbeMatchVec.asBits) <= U(1),
         "DcachePlugin: early-probe match vector is multi-hot (duplicate token+VA entries)",
         FAILURE)
-      assert(earlyProbeHit === (earlyProbeOwnsCmd && earlyProbeHits(earlyProbeMatchIdx) &&
-                                earlyProbeTagOkVec(earlyProbeMatchIdx) &&
-                                !earlyProbeSetWriteVec(earlyProbeMatchIdx) &&
-                                !earlyProbeStale(earlyProbeMatchIdx)),
+      if (earlyProbeLineForward) {
+        assert(CountOne(lineForwardVec.asBits) <= U(1),
+          "DcachePlugin: multiple registered probe-line forwarding owners", FAILURE)
+        assert(!(lineForwardOwnsCmd && earlyProbeMatchVec.asBits.orR),
+          "DcachePlugin: registered line and ready slot both owned one command", FAILURE)
+      }
+      val oldHitRef = earlyProbeMatchVec.asBits.orR &&
+        earlyProbeHits(OHToUInt(earlyProbeMatchVec.asBits)) &&
+        earlyProbeTagOkVec(OHToUInt(earlyProbeMatchVec.asBits)) &&
+        !earlyProbeSetWriteVec(OHToUInt(earlyProbeMatchVec.asBits)) &&
+        !earlyProbeStale(OHToUInt(earlyProbeMatchVec.asBits))
+      assert(earlyProbeHit === (if (earlyProbeLineForward) oldHitRef || lineForwardOwnsCmd else oldHitRef),
         "DcachePlugin: earlyProbeHit drifted from its original index-then-select definition",
         FAILURE)
     }
@@ -1574,11 +1632,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
     //     consumed only under `useEarlyProbe`, which requires `earlyProbeHit`,
     //     which IS `earlyProbeHitVec.orR`.
     //
-    // NOT on the critical path: this feeds `ldS2DirectData`, a register input.
-    // `earlyProbeHit` -> `useEarlyProbe` -> the ready chain, which this file
-    // records as the core's longest cone, is untouched.
+    // With forwarding OFF this data select only feeds `ldS2DirectData`, a
+    // register input, and the old ready cone is unchanged. Forwarding ON adds
+    // a registered-line hit candidate to `earlyProbeHit`/`useEarlyProbe` and a
+    // data mux before that register; its ready timing must be measured.
     val earlyProbeSelOh        = OHMasking.first(earlyProbeHitVec.asBits)
-    val earlyProbeHitData      = MuxOH(earlyProbeSelOh, earlyProbeData)
+    val earlyProbeHitData = if (earlyProbeLineForward) {
+      val lineData = Bits(32 bits)
+      lineData := B(0, 32 bits)
+      // Keep extract's split/wrap tripwire scoped to an actually eligible
+      // forward; idle pipeline metadata is otherwise unspecified.
+      when(lineForwardOwnsCmd) {
+        lineData := DcacheByteLane.extract(
+          probeLineLine, probeLineOff, probeLineSize, !probeLineNeedsLine)
+      }
+      Mux(lineForwardOwnsCmd, lineData, MuxOH(earlyProbeSelOh, earlyProbeData))
+    } else MuxOH(earlyProbeSelOh, earlyProbeData)
     // `!ldS1Valid` is a REAL structural conflict, not a conservative gate: the
     // useEarlyProbe consume arm below (`elsewhen(loadCmdPort.fire && useEarlyProbe)`)
     // writes ldS2Valid/ldS2Hit/ldS2Direct/ldS2DirectData/ldS2Line directly, and so

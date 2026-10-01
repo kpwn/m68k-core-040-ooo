@@ -1080,6 +1080,91 @@ the tag/CAM/byte-select path into that register and the ready path back into
 the LS ring. A directed P3-cycle probe/cancel/write collision gate and a routed
 timing comparison are needed before claiming the possible one-cycle saving.
 
+## 14.3. Optional registered probe-line forwarding experiment
+
+`CPU_DCACHE_EARLY_PROBE_LINE_FORWARD` defaults OFF. It may bypass the one-cycle
+copy from the **registered** `probeLine*` result into the early-probe slot's
+`readies/hits/tags/data` registers. It does not bypass the synchronous tag/data
+RAM, a DTLB response, or a fault, and it does not create a combinational AXI
+R→LS response path. The normal registered slot result remains the fallback.
+The first intended measurement pairs this switch with `CPU_LS_P3_FAST_LOAD=1`
+on the otherwise identical NB4/ring8 fused+speculative-wakeup chase.
+
+The forwarding candidate may consume a slot only if `probeLineValid`, its slot
+is still valid and **not yet ready**, its stored token and VA match the current
+resolved command, and its captured physical tag matches `cmdTag`. A hit must be
+the one-hot-safe registered `probeLineHit`; all-zero or multi-hot read decisions
+fall back. The candidate must reject a live same-set array write, the slot's
+sticky stale bit, a same-cycle matching cancel/inhibited resolve, and an
+`ldS1Valid` conflict. On a rejected candidate, existing not-ready token
+backpressure stays in force; no raw probe-line data is served. On acceptance,
+`loadCmd.fire` owns both the response and the queue-slot consume exactly once,
+including flush priority. The registered admission credit closes when all five
+slots are occupied, so a sixth probe offered on the forward-consume edge waits
+for that credit to reopen rather than replacing the consumed slot on that edge.
+The byte extract
+from the registered 128-bit line must feed the existing registered
+`ldS2DirectData`, never `loadRsp` directly. OFF elaboration must retain the
+original ready, hit and data equations.
+
+Before relying on the slot-valid predicate alone, audit the two-stage result
+lifetime against cancellation and reallocation. A not-ready slot cannot be
+consumed, allocation chooses a pre-edge free slot, and cancellation clears valid
+before a later allocation can select it. With a launch on edge N, the RAM-read
+metadata is live in N+1 and `probeLine*` in N+2. Cancellation on N+1 makes the
+slot invalid on N+2, so the deferred write sees invalid even if N+2 allocates
+that free slot. Before N+2, the slot is not ready and cannot be the queue-full
+consume/replacement victim. On N+2 a successful forwarded consume releases the
+slot, but the previous full-queue credit still prevents a new allocation on
+that edge. These rules exclude a replacement
+occupant before the old line result has finished; a simulation-only captured
+token/VA assertion checks the deferred write in the focused tests. It does not
+claim a hardware generation counter or a wrap bound. If a reachable alias is
+found, add a bounded generation protocol before enabling forwarding. The
+deferred `earlyProbeReadies` write must pass this audit independently.
+
+Expected area is a byte extract from the existing registered 128-bit line, a
+32-bit result mux, a physical-tag comparator, five slot-select gates and
+readiness gates. The existing token/VA present vector is reused; the candidate
+adds no synthesis registers (the identity tripwire is simulation-only) and no
+wide raw RAM-output holding buffer. The ready and data paths may lengthen, so
+the experiment needs a routed timing report before any promotion. Required
+directed gates include
+hit/miss, token and translated-tag mismatch, same-set write before/on consume,
+cancel and slot reuse, split/inhibited fallback, collision with an S1 load,
+held command stability, and exactly-once response/fault attribution. A matched
+7→6-cycle chase result is a target, not an assumption.
+
+The isolated first measurement used one source revision, `IPC_SEED=-2036122926`,
+`MB_PLAN='l2:6:33:4096|2048|chase'`, `MB_LAPS=5`, `MB_FF=0`,
+`MB_LS_OOO=1`, `MB_SPEC_WAKE=1`, `MB_FUSE_LONG_MOVE_LOADS=1`,
+`CPU_DCACHE_NONBLOCKING=1`, `CPU_DCACHE_NB_EARLY_RESPONSE=1`,
+`CPU_INHIBITED_FULL_BARRIER=1`, `CPU_AXI_DH=1`, and
+`CPU_LS_LOAD_RING_DEPTH=8`. The three arms differ only in the two switches
+listed here:
+
+| P3 fast load | Probe-line forward | Window cycles / 128 hops | Cycles/hop |
+| --- | --- | ---: | ---: |
+| ON | OFF | 898 | 7.016 |
+| OFF | ON | 898 | 7.016 |
+| ON | ON | 771 | 6.023 |
+
+The combined switches save 127 window cycles, 0.992 cycles per hop, about
+14.1% of the OFF-arm cycle count. Neither switch alone changes this chase:
+P3 admission and registered probe-result readiness each bound the other.
+This is a core-only calibrated 2 KiB L1-resident pointer chase, not a routed
+timing result or a shipping-default promotion. The ON-mode directed probe tests
+cover an early resident hit, physical-tag mismatch fallback, five-slot
+backpressure/recovery, and N+1 cancellation followed by same-slot N+2
+reallocation while the old registered line result is live. Broader stale/alias
+and hazard checks passed in the ON-mode VIPT suite (11/11), including same-set
+store staleness, virtual/physical alias fallback, queue-full cancel-all, and
+unresolved-probe fallback. The ON-mode P3-fast LS EU tests passed 2/2 for SQ
+forwarding, split fallback, squash recovery, physical bus fault attribution,
+and no faulting PRF write. The default-OFF `make test-fast` gate passed 403/403
+(2 ignored). Routed timing and a combined root-tree gate remain necessary
+before promoting either default.
+
 ## 15. Coordination owed (through the PM)
 
 
