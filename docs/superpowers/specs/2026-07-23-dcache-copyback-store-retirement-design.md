@@ -421,11 +421,20 @@ statement of intent; see §4.2 for the trust model.)
   a *never-launched* precise orphan (e.g. its instruction was flushed) —
   uncommitted entries squash, which now includes precise ones; verify the
   `keep` logic (`StoreQueue.scala:302-313`) counts them correctly.
-- **Store-fault EA precision detail**: `sqFaultCompletion.vaddr` must
-  report the failing *slot's* logical address for a split (cross-line/
-  cross-page) store — slot A's vaddr or the slot-B address — so the
-  format-$7 EA field is the actually-faulting half (the SQ already tracks
-  per-slot paddrs; carry per-slot vaddrs alongside).
+- **Store-fault FA precision detail (corrected 2026-10-01)**:
+  `sqFaultCompletion.faultAddr` must report the original transfer's first-byte
+  logical address (`vaddrA`) for either half of a split store. The former
+  failing-slot rule contradicted the [M68040 manual, §8.4.6.4](https://www.nxp.com/docs/en/reference-manual/MC68040UM.pdf):
+  even when a later bus transfer faults, format-$7 FA identifies the original
+  misaligned access. Per-slot addresses remain necessary for translation and
+  physical bus commands; they must not select architectural FA. This amendment
+  changes only ordinary precise SQ bus-error address reporting, not WB slot
+  formatting, cache-push faults, instruction restart, or register/CCR effects.
+  Directed coverage must use a legal page-crossing logical transfer with
+  noncontiguous physical pages, complete A successfully, fault B, and check
+  original VA, owner, original size, write/supervisor/ATC attributes, and terminal
+  completion/pop. The randomized payload-reset oracle must use the same
+  original-transfer rule, independent of the failing phase.
 
 **Also in Layer 1 (cheap, closes latent load gaps):** gate line *allocation*
 on cacheability — an INHIBITED load must not allocate (add
