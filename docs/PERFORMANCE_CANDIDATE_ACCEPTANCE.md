@@ -346,3 +346,30 @@ validation is recorded above. Those focused results do not replace the
 full frozen results or establish full-corpus acceptance of today's RTL.
 The preserved watcher has started its separately queued full-copyback
 supplement on the same older source; that supplement remains in progress.
+
+## Integrated P1 early-load checkpoint (2026-10-01)
+
+CPU `78b5cfbe` integrates the default-OFF aligned fused MOVEA.L P1 launch
+from `5ee1ecc3`. Default `test-fast` passed 404/404. The focused ON run
+passed 11 Cross tests and two older-SQ tests, including nonvacuous paired
+launch, independent DTLB/probe-credit fallback, misalignment exclusion,
+flush/token reuse, translation fault with no data/CCR write, exact forwarding
+and partial-overlap drain. Logs and expected counts are recorded in
+`/tmp/codex-agent59-p1-results.json` and `codex-agent59-p1-{fast,focused}.log`.
+
+With P1, P3, probe forwarding, NB4/ring8/hot door, early/eager/preselected
+responses, dynamic release, direct refill, LS-OoO and speculative wakeup
+selected, all three full-core suites passed: `LsOooStressSpec`,
+`InhibitedStoreIrqReplaySpec`, and `LsOooInhibitedOrderSpec`. Stress seeds
+14–17 at 120 operations each checked 6,812 commits, 1,960 exception entries,
+29 replays and 15 replay redirects with zero failures. IRQ storms were
+enabled for seeds 15 and 17. Exact flags and results are in
+`/tmp/codex-agent59-p1-core-results.json`, log
+`/tmp/codex-agent59-p1-core.log`. These are compatibility checks with the
+option enabled; the full-core stress does not count P1 launches, so its
+passing result alone does not prove use of the fast arm under IRQ. The
+focused tests and matched chase provide the separate fast-arm evidence.
+
+No feature default changed. This source excludes the later Dn broadening,
+queued-probe clean-miss shortcut and in-progress ordered-MMU changes.
+Physical timing/area and full corrected-corpus acceptance remain open.
