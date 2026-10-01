@@ -189,6 +189,34 @@ grant the epoch afterward. This gives software descriptor clears and U/M ORs
 a deterministic physical order without treating an uncommitted younger store
 as an older dependency. The explicit serializing ATC invalidation remains the
 software synchronization point for page-table rewrites that preceded fetch.
+An ownerless walk batch is *captured but ineligible to drain* until its manager
+asserts `sealOwnerless(epoch)`. The manager starts the logical access with
+`beginOwnerless(epoch, walkCount)` for one or two sequential page walks. This
+atomically holds that many queue credits; other admissions see the held count
+and cannot steal the second credit mid-epoch. Each walk consumes one held
+credit on capture, even if its result needs no update. Seal declares that no
+more walks will be captured under that epoch and returns unused held credits:
+normally both walks were captured, but a terminal first-walk fault may seal
+early with a partial U batch and one unused credit. A captured second walk
+may still be completing when seal occurs; its reserved slot already belongs
+to the epoch. No-update results release their physical slot; sealing
+an epoch with no live batch is harmless and requires no drain wait. A partial
+fault batch is sealed and drained before the original fault is delivered.
+Do not reserve another batch under a sealed epoch. A simultaneous completion
+and seal includes that completed batch; a simultaneous pre-offer cancel wins
+over seal. An epoch identity cannot be reused while its sealed batches live.
+At the first actual metadata offer, mark **all** sibling batches of that epoch
+irrevocable, including a reserved sibling; a later poison suppresses result
+delivery only. This closes the first-batch-drained-before-second-batch path
+without an unbounded epoch-history table.
+
+In the current implementation, an aligned 64-byte I-cache fetch line cannot
+cross a 4 KiB/8 KiB page: a later line across the boundary is a separate
+one-walk fetch epoch. ExceptionUnit's split frame/vector phases translate,
+transfer, then retranslate the next page; each phase is a separate one-walk
+epoch sealed before that phase's data transfer. No current exception FSM may
+wait to pretranslate a later phase before making progress. The two-batch seal
+rule supports a future combined logical access and is exercised in unit tests.
 The I-side fetch retains its PC and withholds the translated line from decode
 until all encountered U writes finish, even when a later descriptor faults;
 a metadata bus error becomes an instruction-access fault at that PC. A fetch

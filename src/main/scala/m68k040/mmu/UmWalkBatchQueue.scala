@@ -11,6 +11,11 @@ case class UmWalkReservation() extends Bundle {
   val epoch = UInt(8 bits) // frontend/exception identity for ownerless split batches
 }
 
+case class UmOwnerlessBegin() extends Bundle {
+  val epoch = UInt(8 bits)
+  val walks = UInt(2 bits) // one or two sequential walks
+}
+
 case class UmWalkBatchDrain() extends Bundle {
   val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
   val ownerless = Bool()
@@ -31,9 +36,10 @@ case class UmWalkBatchDone() extends Bundle {
   *
   * One walker may hold a reservation at a time. The caller applies the
   * two-free-slot ROB-head rule before asserting reserve; freeCount includes
-  * the in-flight reservation. A clean result with no changed bytes frees its
-  * reservation. The ROB authorizes owned batches at head; an ownerless batch
-  * is eligible after completion but can be canceled before its first offer.
+  * the in-flight reservation. `beginOwnerless` holds one or two credits across
+  * sequential walks so another producer cannot steal the second slot. A clean
+  * result with no changed bytes frees its physical slot. The ROB authorizes
+  * owned batches at head; ownerless batches become eligible only on epoch seal.
   * Offered elements stay stable through their terminal ack, even on flush.
   * A canceled in-flight reservation remains owned until the walker completes,
   * so a late result cannot attach to a replacement walk. A drain error aborts
@@ -48,8 +54,11 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
     val reserve = slave(Flow(UmWalkReservation()))
     val reserveReady = out Bool()
     val freeCount = out UInt(log2Up(depth + 1) bits)
+    val beginOwnerless = slave(Flow(UmOwnerlessBegin()))
+    val beginReady = out Bool()
     val complete = slave(Flow(WalkUmBatch()))
     val authorize = slave(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
+    val sealOwnerless = slave(Flow(UInt(8 bits)))
     val flushOwned = in Bool()
     val cancelOwnerless = slave(Flow(UInt(8 bits)))
     val drain = master(Flow(UmWalkBatchDrain()))
@@ -67,7 +76,9 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
   val robId = Vec.fill(depth)(Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0)
   val elementValid = Vec.fill(depth)(Vec.fill(3)(RegInit(False)))
   val elementAddr = Vec.fill(depth)(Vec.fill(3)(Reg(UInt(32 bits)) init 0))
-  val elementMask = Vec.fill(depth)(Vec.fill(3)(Reg(Bits(8 bits)) init 0))
+  // Only descriptor U/M bits 3:4 can be set. Keep the public bus mask 8 bits,
+  // but store two bits per element (72 fewer FF per depth-four queue).
+  val elementMask = Vec.fill(depth)(Vec.fill(3)(Reg(Bits(2 bits)) init 0))
   // Relative allocation order has no wrapping counter: a newly reserved slot
   // is younger than each live slot. Reusing a freed slot rewrites its row and
   // column, so arbitrary intervening reservations cannot reverse survivors.
@@ -76,9 +87,36 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
   val reservationLive = RegInit(False)
   val reservationPoisoned = RegInit(False)
   val reservationSlot = Reg(UInt(slotW bits)) init 0
+  val offerBusy = RegInit(False)
+  val offerSlot = Reg(UInt(slotW bits)) init 0
+  val offerLevel = Reg(UInt(2 bits)) init 0
+  val heldEpochValid = RegInit(False)
+  val heldEpoch = Reg(UInt(8 bits)) init 0
+  val heldCredits = Reg(UInt(2 bits)) init 0
   io.freeCount := CountOne(~occupied.asBits).resize(io.freeCount.getWidth)
-  io.reserveReady := !reservationLive && (io.freeCount =/= 0) &&
-                     !io.flushOwned && !io.cancelOwnerless.valid
+  val beginEpochConflict = (0 until depth).map(i => occupied(i) &&
+    ownerless(i) && (epoch(i) === io.beginOwnerless.payload.epoch)).reduce(_ || _)
+  io.beginReady := !heldEpochValid && !reservationLive && !beginEpochConflict &&
+    (io.beginOwnerless.payload.walks =/= 0) &&
+    (io.beginOwnerless.payload.walks <= U(2, 2 bits)) &&
+    (io.freeCount >= io.beginOwnerless.payload.walks.resize(io.freeCount.getWidth)) &&
+    !io.flushOwned && !io.cancelOwnerless.valid && !io.reserve.valid
+  when(io.beginOwnerless.valid) {
+    assert(io.beginReady, "UmWalkBatchQueue: ownerless epoch lacks reserved credits")
+    when(io.beginReady) {
+      heldEpochValid := True
+      heldEpoch := io.beginOwnerless.payload.epoch
+      heldCredits := io.beginOwnerless.payload.walks
+    }
+  }
+  val ownerlessCredit = heldEpochValid && (heldCredits =/= 0) &&
+    (heldEpoch === io.reserve.payload.epoch)
+  io.reserveReady := !reservationLive && !io.beginOwnerless.valid &&
+    !io.flushOwned && !io.cancelOwnerless.valid &&
+    !(io.drainAck && io.drainError) &&
+    Mux(io.reserve.payload.ownerless,
+      ownerlessCredit && (io.freeCount =/= 0),
+      io.freeCount > heldCredits.resize(io.freeCount.getWidth))
   val freeSlot = OHToUInt(OHMasking.first(~occupied.asBits))
 
   when(io.reserve.valid) {
@@ -99,6 +137,7 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
       reservationLive := True
       reservationPoisoned := False
       reservationSlot := freeSlot
+      when(io.reserve.payload.ownerless) { heldCredits := heldCredits - 1 }
     }
   }
 
@@ -111,18 +150,25 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
       reservationPoisoned := False
       val authNow = io.authorize.valid && !ownerless(reservationSlot) &&
                     (robId(reservationSlot) === io.authorize.payload)
+      val sameAsFailedOffer = io.drainAck && io.drainError && offerBusy &&
+        (ownerless(reservationSlot) === ownerless(offerSlot)) &&
+        Mux(ownerless(reservationSlot),
+          epoch(reservationSlot) === epoch(offerSlot),
+          robId(reservationSlot) === robId(offerSlot))
       val poisonedNow = reservationPoisoned ||
-        (io.flushOwned && !ownerless(reservationSlot) && !authNow) ||
+        sameAsFailedOffer ||
+        (io.flushOwned && !ownerless(reservationSlot) &&
+         !authorized(reservationSlot) && !authNow) ||
         (io.cancelOwnerless.valid && ownerless(reservationSlot) &&
+         !everOffered(reservationSlot) &&
          (epoch(reservationSlot) === io.cancelOwnerless.payload))
       when(!any || poisonedNow) {
         occupied(reservationSlot) := False
       } otherwise {
-        authorized(reservationSlot) := authorized(reservationSlot) || ownerless(reservationSlot)
         for (k <- 0 until 3) {
           elementValid(reservationSlot)(k) := io.complete.payload.updates(k).valid
           elementAddr(reservationSlot)(k) := io.complete.payload.updates(k).addr
-          elementMask(reservationSlot)(k) := io.complete.payload.updates(k).setMask
+          elementMask(reservationSlot)(k) := io.complete.payload.updates(k).setMask(4 downto 3)
           when(io.complete.payload.updates(k).valid) {
             assert((io.complete.payload.updates(k).setMask & ~B"00011000") === B(0, 8 bits),
               "UmWalkBatchQueue: non-U/M bit in set mask")
@@ -140,9 +186,26 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
       }
     }
   }
+  when(io.sealOwnerless.valid) {
+    assert(heldEpochValid && (heldEpoch === io.sealOwnerless.payload),
+      "UmWalkBatchQueue: seal without matching open epoch")
+    when(heldEpochValid && (heldEpoch === io.sealOwnerless.payload)) {
+      heldEpochValid := False
+      heldCredits := 0 // terminal first-walk fault can leave unused split credit
+      for (i <- 0 until depth) {
+        when(occupied(i) && ownerless(i) &&
+             (epoch(i) === io.sealOwnerless.payload)) {
+          authorized(i) := True
+        }
+      }
+    }
+  }
 
   // Choose the oldest eligible batch, then its earliest undrained element.
   val eligible = Vec.fill(depth)(Bool())
+  // The single-reservation walker completes the first split half before it
+  // can reserve the second; a younger completed sibling cannot overtake a
+  // still-reserved older sibling under this interface contract.
   for (i <- 0 until depth) eligible(i) := occupied(i) && !reserved(i) && authorized(i)
   var bestValid: Bool = False
   var bestSlot: UInt = U(0, slotW bits)
@@ -152,9 +215,6 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
     bestSlot = Mux(choose, U(i, slotW bits), bestSlot)
     bestValid = bestValid || choose
   }
-  val offerBusy = RegInit(False)
-  val offerSlot = Reg(UInt(slotW bits)) init 0
-  val offerLevel = Reg(UInt(2 bits)) init 0
   val selectedSlot = Mux(offerBusy, offerSlot, bestSlot)
   val selectedLevel = Mux(offerBusy, offerLevel,
     Mux(elementValid(bestSlot)(0), U(0, 2 bits),
@@ -167,13 +227,20 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
   io.drain.payload.ownerless := ownerless(selectedSlot)
   io.drain.payload.epoch := epoch(selectedSlot)
   io.drain.payload.addr := elementAddr(selectedSlot)(selectedLevel)
-  io.drain.payload.setMask := elementMask(selectedSlot)(selectedLevel)
+  io.drain.payload.setMask := B(0, 3 bits) ## elementMask(selectedSlot)(selectedLevel) ## B(0, 3 bits)
   io.drain.payload.level := selectedLevel
   when(io.drain.valid && !offerBusy) {
     offerBusy := True
     offerSlot := selectedSlot
     offerLevel := selectedLevel
-    everOffered(selectedSlot) := True
+    when(ownerless(selectedSlot)) {
+      for (i <- 0 until depth) {
+        when(occupied(i) && ownerless(i) &&
+             (epoch(i) === epoch(selectedSlot))) { everOffered(i) := True }
+      }
+    } otherwise {
+      everOffered(selectedSlot) := True
+    }
   }
 
   io.batchDone.valid := False
@@ -209,6 +276,11 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
   }
 
   when(io.flushOwned || io.cancelOwnerless.valid) {
+    when(io.cancelOwnerless.valid && heldEpochValid &&
+         (heldEpoch === io.cancelOwnerless.payload)) {
+      heldEpochValid := False
+      heldCredits := 0
+    }
     for (i <- 0 until depth) {
       val authNow = io.authorize.valid && !ownerless(i) &&
                     (robId(i) === io.authorize.payload)
@@ -238,5 +310,7 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
     }
     assert(!(io.complete.valid && io.reserve.valid),
       "UmWalkBatchQueue: single walker cannot complete and reserve together")
+    assert(!(io.sealOwnerless.valid && io.reserve.valid),
+      "UmWalkBatchQueue: epoch seals after its last walk reservation")
   }
 }
