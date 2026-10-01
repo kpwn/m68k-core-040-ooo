@@ -15,6 +15,10 @@ import spinal.core.sim._
   *
   * `chase-128` is the NEGATIVE CONTROL (C3): dependent loads, MLP 1 by construction. */
 class DsideBandwidthSpec extends CoreBenchHarness {
+  private final case class CreditObs(freeMask: Int, storeMask: Int, s2Reserve: Int,
+      freeOk: Boolean, filledFault: Int, filledInv: Int, filledHold: Int,
+      filledCandidate: Int, filledWinner: Int, lingerStage: Int,
+      lingerWaiter: Int, lingerAdd: Int, lingerEligible: Int)
   private final case class ChainCycle(cycle: Long, hotOutstanding: Int, ringOcc: Int,
       readyLoads: Int, lsSelectLoad: Boolean, lsEuFire: Boolean, p1Fire: Boolean,
       cmdFire: Boolean,
@@ -23,7 +27,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       filled: Int, linger: Int, waiters: Int, ringDone: Int,
       ringDoneWb: Int, ringDoneNeedsWb: Int, earlyWbAny: Boolean,
       earlyWbFire: Boolean, headPopAlreadyWb: Boolean, frontCompHeld: Boolean,
-      failSet: Long, failFull: Long)
+      failSet: Long, failFull: Long, credit: CreditObs)
   private final case class SkidCycle(cycle: Long, issueSpec: Boolean, skidSpec: Boolean,
       skidValid: Boolean, flush: Boolean, rawReady: Int, readyMismatch: Int,
       dynOrMismatch: Int, unconfirmed: Int, olderIqStore: Int, intraMacro: Int,
@@ -153,6 +157,28 @@ class DsideBandwidthSpec extends CoreBenchHarness {
             val ctr = d.dcache.logic.nb.ctrMap
             val nb = d.dcache.logic.nb
             def stateCount(st: Int) = nb.st.count(_.toInt == st)
+            def entryMask(p: Int => Boolean): Int =
+              (0 until nb.st.length).foldLeft(0)((m, i) => if (p(i)) m | (1 << i) else m)
+            val filledFault = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.fault(i).toBoolean)
+            val filledInv = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.invPend(i).toBoolean)
+            val filledHold = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.instHold(i).toBoolean)
+            val filledCandidate = nb.instCand.asBits.toBigInt.toInt
+            val filledWinner = nb.instOH.toBigInt.toInt
+            val lingerStage = entryMask(i => nb.st(i).toInt == nb.LINGER &&
+              ((d.dcache.logic.ldS1Valid.toBoolean &&
+                d.dcache.logic.ldS1Set.toInt == nb.eset(i).toInt) ||
+               (nb.stgValid.toBoolean && nb.stgSet.toInt == nb.eset(i).toInt)))
+            val lingerWaiter = entryMask(i => nb.st(i).toInt == nb.LINGER &&
+              (0 until nb.wv.length).exists(w => nb.wv(w).toBoolean && nb.wm(w).toInt == i))
+            val lingerAdd = entryMask(i => nb.st(i).toInt == nb.LINGER &&
+              nb.lAddW.toBoolean && nb.lTarget.toInt == i)
+            val lingerEligible = entryMask(i => nb.st(i).toInt == nb.LINGER &&
+              (nb.fault(i).toBoolean || ((lingerStage & (1 << i)) == 0)) &&
+              (lingerWaiter & (1 << i)) == 0 && (lingerAdd & (1 << i)) == 0)
+            val credit = CreditObs(entryMask(i => nb.st(i).toInt == nb.FREE),
+              nb.sOH.toBigInt.toInt, nb.s2CbRes.toInt, nb.lFreeOk.toBoolean,
+              filledFault, filledInv, filledHold, filledCandidate, filledWinner,
+              lingerStage, lingerWaiter, lingerAdd, lingerEligible)
             val doneWb = (0 until ls.alignedDone.length).count(i =>
               ls.alignedValid(i).toBoolean && ls.alignedDone(i).toBoolean &&
                 ls.alignedWb(i).toBoolean)
@@ -173,7 +199,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               doneWb, doneNeedsWb, ls.alignedEarlyWbAny.toBoolean,
               ls.alignedEarlyWbFire.toBoolean, headPopAlreadyWb,
               ls.frontCompHeld.toBoolean,
-              ctr("failSet").toLong, ctr("failFull").toLong)
+              ctr("failSet").toLong, ctr("failFull").toLong, credit)
             if (specWake) {
               val iq = d.iq.logic
               val busy = iq.lsBusy.toBigInt
@@ -355,6 +381,13 @@ class DsideBandwidthSpec extends CoreBenchHarness {
           case (previous, current) if current.cycle >= winLo && current.cycle <= winHi &&
               current.failFull > previous.failFull => current
         }
+        // failFull is registered at the edge. The old MSHR state and combinational
+        // admission predicates are in `previous`, while `current` holds the updated
+        // counter and predicted LINGER -> FREE transitions.
+        val failFullAttempts = chainSamples.zip(chainSamples.drop(1)).collect {
+          case (previous, current) if current.cycle >= winLo && current.cycle <= winHi &&
+              current.failFull > previous.failFull => (previous.credit, current.credit)
+        }
         val medIssueGap = if (issueGaps.isEmpty) 0L else issueGaps(issueGaps.size / 2)
         val medArToR = if (acceptedWithin.isEmpty) 0L else acceptedWithin(acceptedWithin.size / 2)
         val p95ArToR = if (acceptedWithin.isEmpty) 0L else
@@ -386,6 +419,40 @@ class DsideBandwidthSpec extends CoreBenchHarness {
         // merely describe occupied state. Sample both at the same clock edge.
         assert(failFullSamples.size == failFullWindow,
           s"${k.name}: failFull counter increment/sample mismatch")
+        assert(failFullAttempts.size == failFullWindow,
+          s"${k.name}: pre-edge credit sample/counter increment mismatch")
+        def bits(mask: Int): Int = java.lang.Integer.bitCount(mask)
+        failFullAttempts.foreach { case (pre, post) =>
+          val freeAfterStore = bits(pre.freeMask & ~pre.storeMask)
+          assert(pre.freeOk == (freeAfterStore >= 1 + pre.s2Reserve),
+            s"${k.name}: observed lFreeOk disagrees with store/copyback reservation")
+          assert((pre.lingerEligible & post.freeMask) == pre.lingerEligible,
+            s"${k.name}: eligible LINGER did not release on the sampled edge")
+          assert((pre.filledWinner & ~pre.filledCandidate) == 0,
+            s"${k.name}: install winner is not a FILLED install candidate")
+        }
+        val preCredits = failFullAttempts.map(_._1)
+        def events(mask: CreditObs => Int): Int = preCredits.count(c => mask(c) != 0)
+        def slots(mask: CreditObs => Int): Int = preCredits.map(c => bits(mask(c))).sum
+        val sameReservationNextCredit = preCredits.count { c =>
+          bits((c.freeMask & ~c.storeMask) | c.lingerEligible) >= 1 + c.s2Reserve
+        }
+        println(s"DSIDE_FAIL_FULL_CREDIT kernel=${k.name} seed=$seed events=$failFullWindow " +
+          s"noCompleted=${preCredits.count(c => (c.filledFault | c.filledInv | c.filledHold | c.filledCandidate | c.lingerStage | c.lingerWaiter | c.lingerAdd | c.lingerEligible) == 0)} " +
+          s"filledFaultEvents=${events(_.filledFault)} filledInvEvents=${events(_.filledInv)} " +
+          s"filledHoldEvents=${events(_.filledHold)} filledCandidateEvents=${events(_.filledCandidate)} " +
+          s"filledWinnerEvents=${events(_.filledWinner)} " +
+          s"filledFaultSlots=${slots(_.filledFault)} filledInvSlots=${slots(_.filledInv)} " +
+          s"filledHoldSlots=${slots(_.filledHold)} filledCandidateSlots=${slots(_.filledCandidate)} " +
+          s"filledWinnerSlots=${slots(_.filledWinner)} " +
+          s"lingerStageEvents=${events(_.lingerStage)} lingerWaiterEvents=${events(_.lingerWaiter)} " +
+          s"lingerAddEvents=${events(_.lingerAdd)} lingerEligibleEvents=${events(_.lingerEligible)} " +
+          s"lingerStageSlots=${slots(_.lingerStage)} lingerWaiterSlots=${slots(_.lingerWaiter)} " +
+          s"lingerAddSlots=${slots(_.lingerAdd)} lingerEligibleSlots=${slots(_.lingerEligible)} " +
+          s"storeReservedEvents=${preCredits.count(c => c.storeMask != 0)} " +
+          s"s2ReservedEvents=${preCredits.count(c => c.s2Reserve != 0)} " +
+          s"sameReservationNextCreditUpperBound=$sameReservationNextCredit " +
+          "scope=commit-window sample=pre-failFull-edge")
         println(f"DSIDE_CHAIN_FAIL_FULL kernel=${k.name} seed=$seed events=$failFullWindow " +
           s"ringFull=${failFullSamples.count(_.ringOcc == m68k040.top.ShippingCoreConfig.lsLoadRingDepth)} " +
           s"ringFullNoPop=${failFullSamples.count(_.ringFullNoPop)} " +

@@ -5799,6 +5799,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val wrid  = Vec.fill(NW)(Reg(UInt(DLoadRid.Width bits)))
       val wridv = Vec.fill(NW)(Reg(Bool()))
       wv.simPublic()
+      wm.simPublic() // simulation-only per-MSHR waiter lifetime diagnostic
       val anyW = wv.asBits.orR
       def waiterRef(k: Int): Bool = (0 until NW).map(w => wv(w) && wm(w) === U(k, idxW bits)).reduce(_ || _)
 
@@ -5864,10 +5865,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val sCamAny = sCam.asBits.orR
       val sAlloc = sDo && !sCamAny
       val sOH    = OHMasking.first(freeBits) & B(N bits, default -> sAlloc)
+      sOH.simPublic() // simulation-only free-slot reservation diagnostic
       val sNoFill = pendingMergeStrb.andR
       val sWbPush = sAlloc && pendingVictimDirty
       sWbPush.simPublic()
       val s2CbRes = (stS2Valid && stS2Copyback).asUInt.resize(3)
+      s2CbRes.simPublic()
 
       // ── Load staging decision (§4.1), store first ───────────────────────────────────
       val lLine = lineOfPa(stgPaddr)
@@ -5878,6 +5881,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      (sAlloc && sSet === stgSet)
       val freeAfterS = freeBits & ~sOH
       val lFreeOk = CountOne(freeAfterS).resize(3) >= (U(1, 3 bits) + s2CbRes)
+      lFreeOk.simPublic()
       val lWbOk   = !stgVDirty ||
                     ((wbFree - sWbPush.asUInt.resize(3)) >= (U(1, 3 bits) + s2CbRes))
       val lSecondary = stgValid && !stgMultiHot && lCamAny
@@ -5894,6 +5898,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val lSlot   = Mux(stgRidV, stgRid.resize(log2Up(NW)), U(SER, log2Up(NW) bits))
       val lTarget = Mux(lSecondary, OHToUInt(lCam.asBits), OHToUInt(lOH))
       val lAddW   = lSecondary || lAlloc
+      lAddW.simPublic(); lTarget.simPublic()
 
       // ── Replay queue (§4.1 "cannot allocate") -> the existing shadow slot ──────────
       val RQ = 4
@@ -6043,6 +6048,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         (stS3ArrayWrite && stS3Way === eway(k)) || anyInv || resetSweepBusy))
       val instCand = Vec((0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !invPend(k) && !instHold(k)))
       val instOH  = OHMasking.first(instCand.asBits)
+      instHold.simPublic(); instCand.simPublic(); instOH.simPublic()
       val instAny = instCand.asBits.orR
       val instIdx = OHToUInt(instOH)
       val instData = MuxOH(instOH, (0 until N).map(merged))
