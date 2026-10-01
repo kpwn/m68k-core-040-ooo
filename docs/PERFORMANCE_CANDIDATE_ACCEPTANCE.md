@@ -297,3 +297,31 @@ paired generated socket inputs still describe this RTL. The originally
 failed suite remains explicitly recorded above. These checks supplement the
 18-test integrated cache gate; they do not close pending MMU/fault defects,
 full corpus comparison, all nonblocking mutants, or physical/board acceptance.
+
+## Candidate CPU with SoC hot-read binding (2026-10-01)
+
+The generated dynamic-release ON socket from CPU `46413280` was linted as
+an actual `fpga_top` instance with the hot-read guard and L2 binding. The
+first frozen snapshot of the owner's uncommitted `dhcpu` tree passed basic
+lint but failed shipping lint: the VIO v28 instance connected 32-bit
+`probe_in15`, absent from the Verilator primitive stub. Its original logs
+and hashed inputs remain in `/tmp/codex-soc-hot-integration-46413280/`.
+
+The maintained clean SoC branch `83f7f96` already includes the hot-door
+integration and stronger NB/D4 build guards. Isolated SoC commit `6086cf4`
+adds only the missing 32-bit stub input, matching `gen_debug_vio_ip`'s v28
+width list. A new frozen snapshot of that commit plus the same generated
+CPU passed both `make lint-fpga-top` configurations: basic and shipping
+(VIO, JTAG AXI and disabled SD JTAG writer). Both explicitly set
+`CPU=m68k040`, `CPU_AXI_DH=1`, `CPU_DCACHE_NONBLOCKING=1`, and
+`CPU_INHIBITED_FULL_BARRIER=1`. Inputs, exact commands, exit codes and logs
+are in `/tmp/codex-soc-hot-integration-6086cf4/{manifest,results}.json` and
+`{basic,shipping}.log`. Neither run regenerated the recorded CPU artifact.
+
+This validates elaboration and port binding against the existing SoC lint
+rules, which suppress several warning classes including width and missing
+pins; the separate strict socket checks above cover the generated hot-port
+schema. It does not establish functional CPU/SoC ordering, routed timing,
+area or a board boot. The later experimental L2 hot-response fall-through
+is not present in this validated SoC source. Owner worktrees and the live
+board/JTAG session were not modified.
