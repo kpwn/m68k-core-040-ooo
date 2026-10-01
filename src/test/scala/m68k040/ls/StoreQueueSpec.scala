@@ -1162,12 +1162,19 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.drainAck #= false
       sleep(1)
       assert(dut.io.empty.toBoolean, "entry popped after the ack")
-      // preciseDrainBusy drops one cycle after resolution (design doc: held one extra
-      // cycle past ack for the ack-OK-to-retire handshake seam).
-      assert(dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy stays held the cycle immediately after ack")
-      cd.waitSampling()
+      // The shared LS completion stage may delay retirement beyond the bus ack.
+      // Keep IRQ recognition blocked until the launching store leaves the ROB head,
+      // otherwise RTE could replay an already completed device write.
+      for (_ <- 0 until 4) {
+        assert(dut.io.preciseDrainBusy.toBoolean,
+          "preciseDrainBusy must protect a drained store still at the ROB head")
+        cd.waitSampling()
+        sleep(1)
+      }
+      dut.io.robHeadIn #= 12 // retirement witness: the launching owner was 11
       sleep(1)
-      assert(!dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy drops one cycle after resolution")
+      assert(!dut.io.preciseDrainBusy.toBoolean,
+        "preciseDrainBusy must release at the boundary immediately after store retirement")
       cd.waitSampling(2)
     }
   }
