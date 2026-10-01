@@ -504,6 +504,11 @@ object ShippingCoreConfig {
     * 128b, ID = MSHR index) instead of `axi_d`. Requires `dcacheNonBlocking`; the SoC
     * must be built with `L2C_DH_PORT`/`DH_PORT_EN=1` (one Makefile knob, `CPU_AXI_DH=1`). */
   val dcacheHotDoor: Boolean = envFlag("CPU_AXI_DH", false)
+  /** Experimental zero-empty-latency AR slice at the hot-door socket boundary.
+    * R and every other AXI channel retain their FULL register slices. */
+  val axiDhArFallThrough: Boolean = envFlag("CPU_AXI_DH_AR_FALL_THROUGH", false)
+  require(!axiDhArFallThrough || dcacheHotDoor,
+    "CPU_AXI_DH_AR_FALL_THROUGH=1 requires CPU_AXI_DH=1")
   /** Store-allocated MSHRs hold their AR this many cycles so trailing stores can
     * complete the 16 strobes and cancel the fill (write-path agent's hook). 0 = off. */
   val dcacheStoreAllocArDelay: Int = envInt("CPU_DCACHE_STORE_AR_DELAY", 0, 0, 15)

@@ -1858,3 +1858,23 @@ ready-load-while-skid cross-tab and its own matched gate. This is a behavioral
 memory-model result, not SoC timing evidence. Exact paired outputs:
 `/tmp/codex-agent76-specwake-pair-results.json` and
 `/tmp/codex-agent76-specwake-pair-{off,on}.log`.
+### Optional hot-AR socket empty path (2026-10-02)
+
+`CPU_AXI_DH_AR_FALL_THROUGH=1` is an experimental, default-OFF socket option
+requiring `CPU_AXI_DH=1`. It changes only the `axi_dh` AR stream pipe from
+SpinalHDL `FULL` (`s2mPipe().m2sPipe()`) to `S2M` (`s2mPipe()`); the hot R pipe,
+all cold/I channels, byte permutation and persistent reset absorber remain
+unchanged. The absorber still counts port-level accepted AR and RLAST edges,
+blocks new external AR while discarding stale R, and is clocked in `axiPorCd`;
+the pipe remains in `coreCd`. The optional path must not create an ARVALID
+dependency on ARREADY or withdraw a stalled request before a handshake.
+
+SpinalHDL 1.14.1 gives an empty S2M stage zero forward latency while retaining
+registered upstream READY and a one-entry skid payload under backpressure.
+Dropping M2S nominally removes its 47-bit externally used AR payload register
+and one valid register, or 48 logical flip-flops; this is not a mapped-area
+claim. The direct forward path may increase the MSHR-to-L2 timing cone, so
+functional simulation alone cannot establish 200 MHz closure. The R pipe stays
+FULL because the historical fabric-to-core timing failure was on the return
+side. Evaluate AR-only against the unchanged baseline in matched actual-SoC
+bus recurrence and routed timing before any default promotion.

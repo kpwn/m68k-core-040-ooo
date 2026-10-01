@@ -369,34 +369,11 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     }
     val absorbI = axiAbsorb.i.io.absorbing
     val absorbD = axiAbsorb.d.io.absorbing
-    // Hot door: its own absorber in `axiPorCd`, its own FULL register slice, and the same
-    // wiring shape as `axi_i` (r.data permuted exactly once, here).
+    // Hot door: its own absorber in `axiPorCd` and `coreCd` register slice.
+    // The optional AR-only empty path keeps R fully registered and byte order unchanged.
     if (axi_dh != null) {
-      val dhAbsorb = axiPorCd on new Area {
-        val a = new AxiReadResetAbsorber()
-        a.setName("axi_dh_reset_absorber")
-        a.io.rstObserved := rst
-        a.io.arFire      := axi_dh.arvalid && axi_dh.arready
-        a.io.rLastFire   := axi_dh.rvalid && axi_dh.rready && axi_dh.rlast
-      }
-      val absorbDh = dhAbsorb.a.io.absorbing
-      val dhSlice = coreCd on new Area {
-        val dh = socket.dcache.logic.axiDh.pipelined(ar = StreamPipe.FULL, r = StreamPipe.FULL)
-      }
-      val dh = dhSlice.dh
-      axi_dh.arid    := dh.ar.payload.id
-      axi_dh.araddr  := dh.ar.payload.addr
-      axi_dh.arlen   := dh.ar.payload.len
-      axi_dh.arsize  := dh.ar.payload.size
-      axi_dh.arburst := dh.ar.payload.burst
-      axi_dh.arvalid := dh.ar.valid && !absorbDh
-      dh.ar.ready    := axi_dh.arready && !absorbDh
-      dh.r.valid          := axi_dh.rvalid && !absorbDh
-      dh.r.payload.id     := axi_dh.rid
-      dh.r.payload.data   := SocketByteOrder.permuteData(axi_dh.rdata)
-      dh.r.payload.resp   := axi_dh.rresp
-      dh.r.payload.last   := axi_dh.rlast
-      axi_dh.rready  := dh.r.ready || absorbDh
+      SocketHotReadBoundary.connect(socket.dcache.logic.axiDh, axi_dh, rst,
+        coreCd, axiPorCd, ShippingCoreConfig.axiDhArFallThrough)
     }
 
     // ── AXI boundary register slice (2026-09-02, follow-up session) ──────────────────
@@ -747,6 +724,7 @@ object GenSocketTopVerilog {
             s"dcacheMshrs=${ShippingCoreConfig.dcacheMshrs} " +
             s"lsLoadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} " +
             s"dcacheHotDoor=${ShippingCoreConfig.dcacheHotDoor} " +
+            s"axiDhArFallThrough=${ShippingCoreConfig.axiDhArFallThrough} " +
             s"dcacheStoreAllocArDelay=${ShippingCoreConfig.dcacheStoreAllocArDelay} " +
             s"dcacheNbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} " +
             s"dcacheNbPreselectAr=${ShippingCoreConfig.dcacheNbPreselectAr} " +
