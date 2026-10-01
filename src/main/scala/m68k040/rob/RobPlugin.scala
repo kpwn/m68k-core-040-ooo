@@ -3104,7 +3104,10 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // takes priority over an interrupt (the head's own exception delivers first), so
     // exclude it.
     val maskI = exc.ss.srSys(2 downto 0)
-    val iplActive = (iplIn > maskI) || nmiPending
+    // Level 7 is edge-triggered even when SR.I is below 7. Preserve immediate
+    // recognition of an unmasked fresh edge, but do not treat the held line as
+    // a new request after RTE restores a lower mask.
+    val iplActive = ((iplIn > maskI) && ((iplIn =/= U(7, 3 bits)) || nmiEdge)) || nmiPending
     irqBoundaryHold := iplActive
     iplActive.simPublic()
     // Normal recognition: a first-µop non-faulted/non-RTE/non-sysOp head is present. When
@@ -3166,14 +3169,17 @@ class RobPlugin(val detailedPerf: Boolean = false,
         "RobPlugin: interruptPending recognized while an inhibited load's device read was in flight",
         FAILURE)
     }
-    // Consume the NMI latch the same cycle it is actually taken — gated on `nmiPending`
-    // itself (not the live `iplIn`), so a latched edge is serviced as vector/level 7
+    // Consume an accepted NMI, including a fresh edge recognized in this cycle.
+    // A previously latched edge is serviced as vector/level 7
     // even if the SoC has already dropped the line by the recognition cycle (mirrors
     // Musashi clearing nmi_pending in m68ki_check_interrupts right as it converts to
     // m68ki_exception_interrupt(7), independent of the current CPU_INT_LEVEL). A held
     // level-7 line does NOT re-arm nmiPending (no new edge) -> no re-entry until the
     // line drops and rises again.
-    when(interruptPending && nmiPending) { nmiPending := False }
+    // With SR.I < 7 a fresh edge can be recognized before nmiPending is set.
+    // Consume that edge too, overriding the set above; otherwise the accepted
+    // interrupt leaves a second NMI queued and causes a nested entry.
+    when(interruptPending && (nmiPending || nmiEdge)) { nmiPending := False }
     // STOP halts the core after its serializing retire (supervisor only; S=0 -> vector-8
     // via sysPrivFault). The interrupt entry RESUMES it: clear `stopped` when an interrupt
     // is recognized. (sysTriggerSig / interruptPending are both built above.)

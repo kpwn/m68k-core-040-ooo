@@ -1288,6 +1288,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                      // is still poked per `irqEvents` -- for a caller that has established the
                      // DUT legally takes the interrupt one boundary later (see a7-irq).
                      oracleIrqEvents: Option[Seq[(Long, Int)]] = None,
+                     // Mask-7 fixtures need a cycle to latch the NMI. Unmasked
+                     // boundary sweeps use the requested PC directly, independent
+                     // of which oracle candidate is being compared.
+                     advanceNmiTrigger: Boolean = true,
                      // p167 odd-SSP campaign: after the lock-step compare, let the stores
                      // drain and compare these DATA bytes (each base spans `checkSpan`
                      // bytes) against the oracle's final memory image from an
@@ -1349,14 +1353,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // direct-compare case.
     val eventPcs = irqEvents.map { case (pc, level) =>
       val evPc = pc & 0xffffffffL
-      if (level == 7) {
+      if (level == 7 && advanceNmiTrigger) {
         val idx = oracleSteps.indexWhere(_.pc == evPc)
         if (idx > 0) oracleSteps(idx - 1).pc & 0xffffffffL else evPc
       } else evPc
     }.toSet
     val levelByPc = irqEvents.map { case (pc, l) =>
       val evPc = pc & 0xffffffffL
-      val triggerPc = if (l == 7) {
+      val triggerPc = if (l == 7 && advanceNmiTrigger) {
         val idx = oracleSteps.indexWhere(_.pc == evPc)
         if (idx > 0) oracleSteps(idx - 1).pc & 0xffffffffL else evPc
       } else evPc
@@ -2047,7 +2051,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   // spanning the first NMI's entry -> handler -> RTE -> many more loop iterations —
   // and confirms the ROB's recognition pulse (`interruptPending`) fires EXACTLY ONCE
   // while held, then confirms a genuine drop-and-reraise (a fresh edge) DOES re-fire.
-  test("NMI (level 7) held continuously does NOT re-fire; a fresh edge DOES", VerilatorTest) {
+  for (mask <- Seq(7, 0)) {
+    val heldNmiName = if (mask == 7)
+      "NMI (level 7) held continuously does NOT re-fire; a fresh edge DOES"
+    else "NMI (level 7) held with mask 0 does NOT re-fire; a fresh edge DOES"
+    test(heldNmiName, VerilatorTest) {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     // Install the level-7 autovector handler @ VBR(0)+31*4=0x7C via a REAL CPU store
     // (`move.l #handler,%d0 ; move.l %d0,0x7c`) — the SAME proven-correct idiom every
@@ -2078,7 +2086,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(80)
       dut.rob.logic.exc.ss.isp #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L   // DE|IE -- "firmware already enabled the caches" (design doc section 5.2)
-      dut.rob.logic.exc.ss.srSys #= 0x27   // boot supervisor, mask 7 (NMI is always taken regardless)
+      dut.rob.logic.exc.ss.srSys #= (0x20 | mask) // both latched and immediately recognized edges
       dut.wire.logic.seedValid #= true; dut.wire.logic.seedAddr #= 15; dut.wire.logic.seedData #= BigInt(0x00100000L)
       cd.waitSampling(2); dut.wire.logic.seedValid #= false; cd.waitSampling()
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
@@ -2102,6 +2110,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       cd.waitSampling(400)
       assert(pulses == 2, s"a fresh <7->7 edge must re-fire NMI once more, got $pulses total pulses")
     }
+  }
   }
 
   // Nested: a level-3 IRQ enters handlerA (mask raised to 3); inside handlerA a
@@ -13265,6 +13274,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           runIrqLockStep(s"$tag-b$i-at$j", src,
                          nInstr = (kJ + 1) min trJ.size, irqEvents = Seq((pc, level)), initialSr = 0x2700,
                          oracleIrqEvents = Some(eventsJ),
+                         // The stretch runs with SR.I=0. Shifting NMI to the
+                         // previous oracle PC can select the FIRST visit of a
+                         // repeated RTS and changes DUT stimulus on each retry.
+                         // Use the requested raw commit PC for every candidate.
+                         advanceNmiTrigger = false,
                          checkMem = (fbJ - 4 until fbJ + 8) ++ locals, checkSpan = 1,
                          dcfg = dcfg, cacr = cacr, a7ProbeLag = true, maxCycles = 60000)
           matchedAt = j
