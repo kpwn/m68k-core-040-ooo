@@ -515,6 +515,11 @@ object ShippingCoreConfig {
   val dcacheNbPreselectAr: Boolean = envFlag("CPU_DCACHE_NB_PRESELECT_AR", false)
   require(!dcacheNbPreselectAr || dcacheNbEagerAr,
     "CPU_DCACHE_NB_PRESELECT_AR=1 requires CPU_DCACHE_NB_EAGER_AR=1")
+  /** Experimental release of installed MSHRs after registered stale-read stages
+    * and waiters drain, instead of the fixed LINGER countdown. Default OFF. */
+  val dcacheNbDynamicRelease: Boolean = envFlag("CPU_DCACHE_NB_DYNAMIC_RELEASE", false)
+  require(!dcacheNbDynamicRelease || dcacheNonBlocking,
+    "CPU_DCACHE_NB_DYNAMIC_RELEASE=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

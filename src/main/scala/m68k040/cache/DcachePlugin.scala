@@ -348,6 +348,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val nbEagerAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEagerAr,
                    /** Experimental direct selection of an eligible load allocation into ARQ. */
                    val nbPreselectAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr,
+                   /** Experimental MSHR release after registered stale-read stages drain. */
+                   val nbDynamicRelease: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -366,6 +368,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
   require(!nbEarlyResponse || nonBlocking, "DcachePlugin: nbEarlyResponse requires nonBlocking")
   require(!nbEagerAr || nonBlocking, "DcachePlugin: nbEagerAr requires nonBlocking")
   require(!nbPreselectAr || nbEagerAr, "DcachePlugin: nbPreselectAr requires nbEagerAr")
+  require(!nbDynamicRelease || nonBlocking, "DcachePlugin: nbDynamicRelease requires nonBlocking")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
@@ -5710,7 +5713,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val byStore = Vec.fill(N)(RegInit(False))
       val instWait = Vec.fill(N)(Reg(UInt(5 bits)) init 0)
       st.simPublic(); line.simPublic(); eset.simPublic(); eway.simPublic(); invPend.simPublic()
-      mstrb.simPublic(); fault.simPublic()
+      mstrb.simPublic(); fault.simPublic(); linger.simPublic()
       val validVec = Vec((0 until N).map(k => st(k) =/= ST(FREE)))
       val freeBits = (~validVec.asBits)
       val freeCnt  = CountOne(freeBits)
@@ -5739,6 +5742,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       stgValid.simPublic()
       val stgPaddr   = RegNext(ldS1Paddr)
       val stgSet     = RegNext(ldS1Set)
+      stgSet.simPublic()
       val stgOff     = RegNext(ldS1Off)
       val stgSize    = RegNext(ldS1Size)
       val stgTok     = RegNext(ldS1Token)
@@ -5793,6 +5797,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val lWbOk   = !stgVDirty ||
                     ((wbFree - sWbPush.asUInt.resize(3)) >= (U(1, 3 bits) + s2CbRes))
       val lSecondary = stgValid && !stgMultiHot && lCamAny
+      lSecondary.simPublic()
       val lAlloc  = stgValid && !stgMultiHot && !lCamAny && !lSetBusy && lFreeOk && lWbOk &&
                     !resetSweepBusy && !maintWalking
       lAlloc.simPublic() // simulation-only MB_TRACE C0→allocation timestamp
@@ -5970,7 +5975,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
         nbArrayWriteSet := eset(instIdx)
       }
       for (k <- 0 until N) {
-        when(instOH(k) && instAny) { st(k) := ST(LINGER); linger(k) := 3 }
+        when(instOH(k) && instAny) {
+          st(k) := ST(LINGER)
+          linger(k) := (if (nbDynamicRelease) U(0, 2 bits) else U(3, 2 bits))
+        }
         when(st(k) === ST(FILLED) && !fault(k) && !instCand(k)) {
           when(instWait(k) =/= 31) { instWait(k) := instWait(k) + 1 }
         } otherwise { instWait(k) := 0 }
@@ -5995,10 +6003,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
         diagFaultKind1Fires := True
       }
 
-      // LINGER -> FREE (§3.3): countdown done, no waiter points here, none added now.
+      // LINGER -> FREE (§3.3): the default retains its fixed four sampled cycles.
+      // The opt-in arm waits on the two REGISTERED load-read/miss stages by set;
+      // a read colliding with the install cannot lose its CAM entry before it
+      // becomes a secondary waiter. Faulted fills keep their old LINGER(0) rule.
       for (k <- 0 until N) when(st(k) === ST(LINGER)) {
-        when(linger(k) =/= 0) { linger(k) := linger(k) - 1 }
-        .elsewhen(!waiterRef(k) && !(lAddW && lTarget === U(k, idxW bits))) { st(k) := ST(FREE) }
+        if (nbDynamicRelease) {
+          val staleStage = (ldS1Valid && ldS1Set === eset(k)) ||
+                           (stgValid && stgSet === eset(k))
+          when((fault(k) || !staleStage) && !waiterRef(k) &&
+               !(lAddW && lTarget === U(k, idxW bits))) { st(k) := ST(FREE) }
+        } else {
+          when(linger(k) =/= 0) { linger(k) := linger(k) - 1 }
+          .elsewhen(!waiterRef(k) && !(lAddW && lTarget === U(k, idxW bits))) { st(k) := ST(FREE) }
+        }
       }
 
       // ── Writeback-address gate (§6.3): registered, includes this cycle's pushes ──────

@@ -46,7 +46,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   /** Built as `M68kSocketTop` builds the cache on the probe path
     * (`allowPretranslatedProbeHints = false`). */
   class Dut(val nb: Boolean, val dh: Boolean, val early: Boolean, val eagerAr: Boolean,
-            val preselectAr: Boolean, val storeDelay: Int) extends Component {
+            val preselectAr: Boolean, val dynamicRelease: Boolean,
+            val storeDelay: Int) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
@@ -56,7 +57,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
                                    allowPretranslatedProbeHints = false, hitUnderMissRead = false,
                                    nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = storeDelay,
                                    nbEarlyResponse = nb && early, nbEagerAr = eagerAr,
-                                   nbPreselectAr = preselectAr)
+                                   nbPreselectAr = preselectAr, nbDynamicRelease = dynamicRelease)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     val resolve = new ProbeResolveDriver
@@ -66,14 +67,16 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private val earlyEnv = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse
   private val eagerEnv = sys.env.get("CPU_DCACHE_NB_EAGER_AR").contains("1")
   private val preselectEnv = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr
-  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, storeDelay = 0))
-  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, storeDelay = 0))
-  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, storeDelay = 0))
-  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, storeDelay = 0))
-  private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, storeDelay = 0))
-  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, storeDelay = 0))
-  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, storeDelay = 3))
-  private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, storeDelay = 3))
+  private val dynamicEnv = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease
+  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
+  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0))
+  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0))
+  private lazy val nbHotDynamicDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = true, eagerAr = false, preselectAr = false, dynamicRelease = true, storeDelay = 0))
+  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 0))
+  private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 0))
+  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
+  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 3))
+  private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 3))
 
   private val LINE = 16
 
@@ -1637,7 +1640,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def singleMissPostR(early: Boolean): Int = {
     var postR = -1
     M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = early,
-      eagerAr = false, preselectAr = false, storeDelay = 0)).doSim { dut =>
+      eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
@@ -1694,6 +1697,140 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     val on = singleMissPostR(early = true)
     println(s"[nbEarlyResponse] accepted R -> loadRsp: OFF=$off ON=$on cycles")
     assert(off == 2 && on == 1, s"registered response-slot shortcut changed: OFF=$off ON=$on")
+  }
+
+  test("dynamic MSHR release preserves an install-colliding same-line read", VerilatorTest) {
+    if (armOn("dynamicRelease")) nbHotDynamicDut.doSim("dynamic-release-collision") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      val cold = new BehavioralMemAgent(lg.axi, cd)
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 8, dramCycles = 8)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+
+      val received = mutable.Map[Int, BigInt]()
+      var responses = 0
+      var hotAr = 0
+      var s1Linger = 0
+      var stageLinger = 0
+      var stageRetained = 0
+      var secondaryAtStage = 0
+      var lastStageSlot = -1
+      var lastStageLine = -1L
+      var cycle = 0
+      val arCycles = mutable.ArrayBuffer[Int]()
+      val rCycles = mutable.ArrayBuffer[Int]()
+      val lingerCycles = mutable.Map[Long, Int]()
+      val releaseCycles = mutable.Map[Long, Int]()
+      val releaseGaps = mutable.ArrayBuffer[Int]()
+      fork {
+        while (true) {
+          cd.waitSampling()
+          cycle += 1
+          if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) {
+            hotAr += 1; arCycles += cycle
+          }
+          if (lg.axiDh.r.valid.toBoolean && lg.axiDh.r.ready.toBoolean) rCycles += cycle
+          if (pl.loadRspOut.valid.toBoolean) {
+            val token = pl.loadRspOut.payload.token.toInt
+            assert(!received.contains(token), s"duplicate dynamic-release response token=$token")
+            assert(!pl.loadRspOut.payload.fault.toBoolean, s"dynamic-release fault token=$token")
+            received(token) = pl.loadRspOut.payload.data.toBigInt & BigInt("ffffffff", 16)
+            responses += 1
+          }
+          if (lastStageSlot >= 0 && lg.nb.st(lastStageSlot).toInt == 5 &&
+              lg.nb.line(lastStageSlot).toLong == lastStageLine) stageRetained += 1
+          lastStageSlot = -1
+          for (k <- 0 until 4 if lg.nb.st(k).toInt == 0) {
+            val oldLine = lg.nb.line(k).toLong
+            if (lingerCycles.contains(oldLine) && !releaseCycles.contains(oldLine))
+              releaseCycles(oldLine) = cycle
+          }
+          for (k <- 0 until 4 if lg.nb.st(k).toInt == 5) {
+            lingerCycles.getOrElseUpdate(lg.nb.line(k).toLong, cycle)
+            val set = lg.nb.eset(k).toInt
+            if (lg.ldS1Valid.toBoolean && lg.ldS1Set.toInt == set) s1Linger += 1
+            if (lg.nb.stgValid.toBoolean && lg.nb.stgSet.toInt == set) {
+              stageLinger += 1
+              lastStageSlot = k
+              lastStageLine = lg.nb.line(k).toLong
+              if (lg.nb.lSecondary.toBoolean) secondaryAtStage += 1
+            }
+          }
+        }
+      }
+      def waitFor(label: String, max: Int = 1000)(p: => Boolean): Unit = {
+        var n = 0
+        while (!p && n < max) { cd.waitSampling(); n += 1 }
+        assert(p, s"$label timed out after $max cycles")
+      }
+      def send(addr: Long, token: Int, rid: Int): Int = {
+        pl.loadCmdIn.valid #= true
+        pl.loadCmdIn.payload.vaddr #= addr
+        pl.loadCmdIn.payload.paddr #= addr
+        pl.loadCmdIn.payload.size #= Size.LONG
+        pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.loadCmdIn.payload.token #= token
+        pl.loadCmdIn.payload.lineOnly #= false
+        pl.loadCmdIn.payload.ooOk #= true
+        pl.loadCmdIn.payload.rid #= rid
+        pl.loadCmdIn.payload.ridValid #= true
+        waitFor(s"load $token ready") { pl.loadCmdIn.ready.toBoolean }
+        cd.waitSampling()
+        pl.loadCmdIn.valid #= false
+        cycle
+      }
+      // Each trial uses a different set. Sweep the second read across the refill
+      // acceptance/install window; all trials retain checked data and unique IDs.
+      for (offset <- 13 to 20) {
+        val addr = 0xb0000L + offset * 64L
+        val word = BigInt("40414243", 16) + BigInt(offset) * BigInt("01010101", 16)
+        for (b <- 0 until 16) cold.pokeByte(addr + b, (0x40 + offset + b) & 0xff)
+        val expected = (0 until 4).foldLeft(BigInt(0))((v, b) =>
+          (v << 8) | BigInt((0x40 + offset + b) & 0xff))
+        assert(expected == word)
+        val arBefore = hotAr
+        val first = offset * 2
+        val second = first + 1
+        val firstAt = send(addr, first, 0)
+        waitFor(s"trial $offset first AR") { hotAr > arBefore }
+        cd.waitSampling(offset)
+        val secondAt = send(addr, second, 1)
+        waitFor(s"trial $offset responses") { received.contains(first) && received.contains(second) }
+        assert(received(first) == expected && received(second) == expected,
+          s"trial $offset returned ${received(first).toString(16)}, ${received(second).toString(16)} expected ${expected.toString(16)}")
+        // A stale pre-install tag read must find the installed line in the CAM,
+        // rather than allocate another request for the same physical line.
+        assert(hotAr - arBefore == 1, s"trial $offset duplicated hot refill: ${hotAr - arBefore}")
+        waitFor(s"trial $offset free MSHR") {
+          !(0 until 4).exists(k => lg.nb.st(k).toInt != 0 && lg.nb.line(k).toLong == (addr >>> 4))
+        }
+        releaseCycles.getOrElseUpdate(addr >>> 4, cycle)
+        releaseGaps += releaseCycles(addr >>> 4) - lingerCycles(addr >>> 4)
+        println(s"[nbDynamicRelease trial] offset=$offset first=$firstAt AR=${arCycles.last} " +
+          s"R=${rCycles.last} second=$secondAt LINGER=${lingerCycles.getOrElse(addr >>> 4, -1)} " +
+          s"FREE=${releaseCycles.getOrElse(addr >>> 4, -1)} " +
+          s"secondaries=${lg.nb.ctrMap("loadSecondaries").toLong}")
+      }
+      assert(s1Linger > 0 && stageLinger > 0 && stageRetained > 0 && secondaryAtStage > 0,
+        s"install/read collision not exercised: S1=$s1Linger stage=$stageLinger retained=$stageRetained secondary=$secondaryAtStage")
+      assert(responses == 16, s"dynamic-release responses=$responses expected=16")
+      assert(releaseGaps.size == 8 && releaseGaps.exists(_ < 4),
+        s"dynamic release never beat fixed four-cycle hold: $releaseGaps")
+      println(s"[nbDynamicRelease] S1/LINGER=$s1Linger staged/LINGER=$stageLinger " +
+        s"retained=$stageRetained secondary=$secondaryAtStage AR=$hotAr responses=$responses gaps=$releaseGaps")
+    }
   }
 
   test("HARNESS CONTROL: the stress is clean on the legacy blocking cache", VerilatorTest) {
