@@ -104,3 +104,35 @@ become FREE in the next sample. An eligible LINGER is a **next-edge** credit
 opportunity, never a same-edge allocation; FILLED winner is at least a
 subsequent LINGER edge away. A one-seed diagnostic can identify a specific
 dominant avoidable hold, but does not prove throughput gain or an RTL fix.
+
+The frozen diagnostic source `0bbe08d8` passed the seed-17 indexed
+four/eight-chain run in `/tmp/codex-agent78-credit-seed17-r2.log`; the
+measured windows remained 10,335/10,689 cycles and the eight-chain counter
+still recorded 1,503 failed allocation **increments**. The earlier attempt
+on `483b9085` stopped before architectural checks because the test read an
+unnamed `instCand.asBits` simulation temporary; `0bbe08d8` reads the public
+per-entry predicates. `make test-fast` then passed 404 tests on `0bbe08d8`
+in `/tmp/codex-agent78-credit-fast.log`.
+
+| Pre-edge reason at eight-chain `failFull` | Event cycles | Entry slot-samples |
+|---|---:|---:|
+| No FILLED or LINGER entry | 967 | — |
+| FILLED install selected | 266 | 266 |
+| FILLED eligible install candidate | 266 | 274 |
+| FILLED install held | 56 | 58 |
+| FILLED pending invalidation or fault | 0 | 0 |
+| LINGER eligible to become FREE at this edge | 247 | 247 |
+| LINGER held by registered S1/staged-set | 1 | 1 |
+| LINGER held by waiter or same-edge waiter add | 0 | 0 |
+| Store slot or S2 copyback reservation | 0 | — |
+
+Categories can coexist in an event; 266, 56, and 247 must not be added as
+distinct failed cycles. All 247 eligible LINGER entries became FREE in the
+post-edge sample, and the observed `lFreeOk` matched old-state FREE count
+after store/S2 reservations on every attempt. Holding LINGER for one more
+sampled edge therefore accounts for at most 247/1,503 (16.4%) attempted
+allocations in this run, with no proven IPC benefit. The legacy
+`DSIDE_CHAIN_FAIL_FULL` row samples post-edge state and reports 609 events
+with FILLED/LINGER; its number is not the same pre-edge classification.
+The existing replay lookahead requires two actual FREE slots, so an entry
+becoming FREE alone does not guarantee immediate replay admission.
