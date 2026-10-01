@@ -15,12 +15,13 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class DcacheSpec extends AnyFunSuite {
 
-  class Dut(directRefill: Boolean = false) extends Component {
+  class Dut(directRefill: Boolean = false, hitUnderMissRead: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin(directRefillResponse = directRefill)
+    val dcache = new DcachePlugin(directRefillResponse = directRefill,
+      hitUnderMiss = hitUnderMissRead, hitUnderMissRead = hitUnderMissRead)
     val probe  = new DcacheProbePlugin
     // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
     // DcachePlugin's PAGE-scope granule can be exercised at BOTH page sizes. It is
@@ -40,6 +41,8 @@ class DcacheSpec extends AnyFunSuite {
     * FullCoreDut build. */
   lazy val sharedCompiled = simConfig.compile(new Dut)
   lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true))
+  lazy val directHumCompiled = simConfig.compile(new Dut(directRefill = true,
+    hitUnderMissRead = true))
 
   test("direct refill replies once on a cacheable miss, faults once on DECERR, and leaves inhibited reads unchanged",
        VerilatorTest) {
@@ -85,6 +88,85 @@ class DcacheSpec extends AnyFunSuite {
       val inhibited = request(device, CacheMode.INHIBITED)
       assert(inhibited == ((expected(device, 4), false, false)),
         s"inhibited path must keep its replay response: $inhibited")
+    }
+  }
+
+  test("direct refill stalls a colliding R beat and delivers both hit-under-miss tokens once",
+       VerilatorTest) {
+    // Vary the younger command's offset to put its resident response on the older
+    // refill's R-valid edge. This is the one-cycle Flow-port collision which a
+    // direct response must handle by holding AXI RREADY low, not by dropping R.
+    for (faultExpected <- Seq(false, true)) {
+      var collisions = 0
+      for (offset <- 43 to 49) directHumCompiled.doSim { dut =>
+        val (cd, mem) = initDutLatency(dut, hitCycles = 6, injectBusErrors = true)
+        val hot = 0x5844L
+        val cold = if (faultExpected) 0xAAAA2004L else 0x6004L // distinct cache set
+        for (i <- 0 until 16) {
+          mem.pokeByte((hot & ~15L) + i, memByte((hot & ~15L) + i))
+          mem.pokeByte((cold & ~15L) + i, memByte((cold & ~15L) + i))
+        }
+        assert(load(dut, cd, hot, Size.LONG) == expected(hot, 4))
+        cd.waitSampling(3)
+
+        val seen = scala.collection.mutable.ArrayBuffer[(Int, BigInt, Boolean)]()
+        var collision = false
+        var heldR: Option[(BigInt, BigInt, BigInt, Boolean)] = None
+        fork {
+          for (_ <- 0 until 80) {
+            cd.waitSampling()
+            if (dut.probe.logic.loadRspOut.valid.toBoolean) {
+              seen += ((dut.probe.logic.loadRspOut.payload.token.toInt,
+                        dut.probe.logic.loadRspOut.payload.data.toBigInt,
+                        dut.probe.logic.loadRspOut.payload.fault.toBoolean))
+            }
+            if (dut.dcache.logic.axi.r.valid.toBoolean) {
+              val beat = (dut.dcache.logic.axi.r.payload.data.toBigInt,
+                          dut.dcache.logic.axi.r.payload.id.toBigInt,
+                          dut.dcache.logic.axi.r.payload.resp.toBigInt,
+                          dut.dcache.logic.axi.r.payload.last.toBoolean)
+              heldR.foreach(old => assert(beat == old,
+                s"AXI R changed under backpressure: $old -> $beat"))
+              if (dut.dcache.logic.ldS2Resp.toBoolean) {
+                assert(!dut.dcache.logic.axi.r.ready.toBoolean,
+                  "resident response and direct refill shared one Flow slot")
+                collision = true
+              }
+              heldR = if (dut.dcache.logic.axi.r.ready.toBoolean) None else Some(beat)
+            } else assert(heldR.isEmpty, "AXI RVALID fell before held beat was accepted")
+          }
+        }
+
+        def offer(addr: Long, token: Int): Unit = {
+          dut.probe.logic.loadCmdIn.valid #= true
+          dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+          dut.probe.logic.loadCmdIn.payload.paddr #= addr
+          dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+          dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+          dut.probe.logic.loadCmdIn.payload.token #= token
+          dut.probe.logic.loadCmdIn.payload.ooOk #= true
+          dut.probe.logic.loadCmdIn.payload.rid #= 0
+          dut.probe.logic.loadCmdIn.payload.ridValid #= false
+          cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean)
+          dut.probe.logic.loadCmdIn.valid #= false
+        }
+
+        offer(cold, 1)
+        cd.waitSamplingWhere(dut.dcache.logic.axi.ar.valid.toBoolean &&
+                             dut.dcache.logic.axi.ar.ready.toBoolean)
+        cd.waitSampling(offset)
+        offer(hot, 2)
+        cd.waitSampling(72)
+        assert(seen.count(_._1 == 1) == 1 && seen.count(_._1 == 2) == 1,
+          s"hit-under-miss responses must each occur once: offset=$offset seen=$seen")
+        assert(seen.exists(x => x._1 == 1 && x._3 == faultExpected &&
+                               (faultExpected || x._2 == expected(cold, 4))) &&
+               seen.contains((2, expected(hot, 4), false)),
+          s"refill and resident-hit data/fault/token: offset=$offset seen=$seen")
+        if (collision) collisions += 1
+      }
+      assert(collisions > 0,
+        s"offset sweep never exercised simultaneous RVALID and resident response: fault=$faultExpected")
     }
   }
 
@@ -264,13 +346,15 @@ class DcacheSpec extends AnyFunSuite {
     * test below) rather than via this blanket checker. */
   def initDutLatency(dut: Dut, hitCycles: Int = 15,
                       crossbarSingleOutstanding: Boolean = false,
-                      checkIdUnique: Boolean = false): (ClockDomain, AxiMemModel) = {
+                      checkIdUnique: Boolean = false,
+                      injectBusErrors: Boolean = false): (ClockDomain, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
     val cfg = AxiMemModelConfig(
       latency = L2LatencyModel(enabled = true, hitCycles = hitCycles),
       crossbarSingleOutstanding = crossbarSingleOutstanding,
-      checkIdUnique = checkIdUnique)
+      checkIdUnique = checkIdUnique,
+      injectBusErrors = injectBusErrors)
     val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, cfg)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
