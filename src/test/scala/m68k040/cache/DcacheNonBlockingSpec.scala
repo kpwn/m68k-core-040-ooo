@@ -508,6 +508,114 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def armOn(name: String): Boolean =
     sys.env.get("STRESS_ARMS").forall(_.split(",").map(_.trim).contains(name))
 
+  test("four dirty writebacks fill the buffer; a fifth demand waits and resumes after B", VerilatorTest) {
+    if (armOn("wbFull")) nbHotDut.doSim("wb-full") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 1000, dramCycles = 1000),
+          crossbarSingleOutstanding = true, deferWriteVisibilityUntilB = true))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 5, dramCycles = 5)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+
+      val base = 0x98000L
+      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * 2048L
+      for (s <- 0 until 5; b <- 0 until 16)
+        cold.pokeByte(addr(s, 4) + b, 0x90 + s)
+      var aw = 0; var w = 0; var b = 0; var hotAr = 0
+      val responses = mutable.Map.empty[Int, BigInt]
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (lg.axi.aw.valid.toBoolean && lg.axi.aw.ready.toBoolean &&
+              lg.axi.aw.payload.id.toInt == AxiIds.D_PUSH) aw += 1
+          if (lg.axi.w.valid.toBoolean && lg.axi.w.ready.toBoolean) w += 1
+          if (lg.axi.b.valid.toBoolean && lg.axi.b.ready.toBoolean &&
+              lg.axi.b.payload.id.toInt == AxiIds.D_PUSH) b += 1
+          if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) hotAr += 1
+          if (pl.loadRspOut.valid.toBoolean)
+            responses(pl.loadRspOut.payload.token.toInt) = pl.loadRspOut.payload.data.toBigInt
+        }
+      }
+      def until(label: String, budget: Int = 6000)(p: => Boolean): Unit = {
+        var n = 0
+        while (!p && n < budget) { cd.waitSampling(); n += 1 }
+        assert(p, s"$label timed out (wb=${lg.nb.wbCount.toInt}, AW=$aw W=$w B=$b hotAR=$hotAr)")
+      }
+      def storeLine(a: Long, byte: Int): Unit = {
+        val line = (0 until 16).foldLeft(BigInt(0))((v, i) => v | (BigInt(byte) << (8 * i)))
+        pl.storeIn.valid #= true
+        pl.storeIn.payload.paddr #= a
+        pl.storeIn.payload.data #= 0
+        pl.storeIn.payload.size #= Size.LONG
+        pl.storeIn.payload.useStrb #= true
+        pl.storeIn.payload.strb #= 0xffff
+        pl.storeIn.payload.lineData #= line
+        pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.storeIn.payload.precise #= false
+        until("full-line store accept") { pl.storeIn.ready.toBoolean }
+        cd.waitSampling()
+        pl.storeIn.valid #= false
+        until("full-line store ack") { lg.storeAckReg.toBoolean }
+        until("cache settle after priming") { lg.dcIdleForMaint.toBoolean }
+      }
+      def load(set: Int): Unit = {
+        val a = addr(set, 4)
+        pl.loadCmdIn.valid #= true
+        pl.loadCmdIn.payload.vaddr #= a
+        pl.loadCmdIn.payload.paddr #= a
+        pl.loadCmdIn.payload.size #= Size.LONG
+        pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.loadCmdIn.payload.token #= set + 1
+        pl.loadCmdIn.payload.lineOnly #= false
+        pl.loadCmdIn.payload.ooOk #= true
+        pl.loadCmdIn.payload.rid #= (set & 3)
+        pl.loadCmdIn.payload.ridValid #= true
+        until(s"load $set accept") { pl.loadCmdIn.ready.toBoolean }
+        cd.waitSampling()
+        pl.loadCmdIn.valid #= false
+      }
+      // Four dirty residents per set guarantee the next tag's miss must evict dirty.
+      for (s <- 0 until 5; t <- 0 until 4) storeLine(addr(s, t), 0x40 + s * 4 + t)
+      assert(aw == 0 && b == 0, "priming unexpectedly sent a dirty writeback")
+      for (s <- 0 until 4) {
+        load(s)
+        until(s"load $s response") { responses.contains(s + 1) }
+        assert((responses(s + 1) & BigInt("ffffffff", 16)) ==
+          BigInt(0x90 + s) * BigInt("01010101", 16), s"load $s returned wrong data")
+      }
+      until("writeback queue full") { lg.nb.wbCount.toInt == 4 }
+      until("independent AW and W accepted") { aw > 0 && w > 0 }
+      assert(b == 0, "the adversarial window closed before the fifth demand")
+      val arBefore = hotAr
+      load(4)
+      cd.waitSampling(20)
+      assert(!responses.contains(5), "fifth demand bypassed a full dirty-WB buffer")
+      assert(hotAr == arBefore, "fifth demand issued a refill AR while WB was full")
+      assert(lg.nb.ctrMap("failWb").toLong > 0, "WB-full admission failure never fired")
+      until("first delayed dirty B") { b > 0 }
+      until("fifth demand response after B") { responses.contains(5) }
+      assert((responses(5) & BigInt("ffffffff", 16)) == BigInt("94949494", 16),
+        "fifth demand returned wrong data after WB pressure released")
+      assert(hotAr > arBefore, "held demand never issued its refill after WB space freed")
+      println(s"[nbWB] forced full: AW=$aw W=$w B=$b failWb=${lg.nb.ctrMap("failWb").toLong} " +
+        s"hotAR=$hotAr, fifth demand held until B and returned checked data")
+    }
+  }
+
   test("hot refill of an evicted dirty line waits for B and sees delayed write visibility", VerilatorTest) {
     if (armOn("wbVisibility")) nbHotDut.doSim("wb-visibility") { dut =>
       val cd = dut.clockDomain
