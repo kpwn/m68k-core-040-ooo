@@ -517,6 +517,44 @@ use their measured commit windows. No board IPC or
 post-route area is inferred. The probe-forward/P3 option is absent from this
 matrix and must be measured as a separate matched arm.
 
+### 6.3e Experimental load-allocation AR preselection (2026-10-01 amendment)
+
+`CPU_DCACHE_NB_PRESELECT_AR=1` is a separate, default-OFF experiment that
+requires non-blocking mode and eager AR selection. On a legal load MSHR
+allocation, the new line, slot index, and address are already available from
+the registered staging snapshot and `lOH`. When the single AR holding register
+is free (or its prior command fires), no older `WAIT_AR` candidate is eligible,
+and live write-order checks permit the line, the allocator may put that load
+directly into `ARQ` and latch its index/address into the existing `arV/arIdx/arAddr`
+registers. A load rejected by allocation admission or hazard checks stays on
+the ordinary eager `WAIT_AR` path. An already-advertised AR retains VALID,
+address, and ID through ARREADY backpressure; an eligible older `WAIT_AR`
+candidate keeps priority over a new allocation. No combinational signal from
+this option reaches the CPU read response or the AXI AR outputs.
+
+The preselection gate must use the **current** `coldWriteTo(lLine)` predicate,
+which includes queued WB entries, both same-cycle dirty-victim pushes, WT
+outstanding entries, and S3 WT pushes, plus the existing S1/S2 WT line check.
+Preselection is one cycle earlier than eager selection, so it must also check
+an accepted WT in S0 and a same-edge presented WT at the store input. Otherwise
+that older write can be sitting in S1 when the newly registered AR first
+becomes valid. This conservative line check is local to preselection; the
+normal eager path continues to retry after the writer drains. The two WB-push
+terms remain even though legal current ports phase-separate their simultaneous
+assertion (§6.3c), so future admission changes cannot silently break the gate.
+Only `lAlloc` may preselect: a store allocation still obeys configured
+`storeAllocArDelay`, and a full-line no-fill store still issues no refill AR.
+`lOH` already excludes the simultaneous store-reserved MSHR slot, so the AR
+ID must be derived from `lOH`, not an independent free-slot encoder.
+
+Acceptance requires an exact load-command-to-AR advertisement change from
+eager-only 4 cycles to preselect 3 cycles on a clean miss, stable ARVALID and
+payload under backpressure, S0/S1/S2/S3 WT plus delayed-B visibility, same-edge
+WB push hazards, full WB admission pressure, store-delay/no-fill invariance,
+randomized stress, and checked full-core dependent and independent-load
+measurements. A failed invariant keeps this option OFF; the current eager
+selection remains the shipping candidate.
+
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
 | today's bug (`dcache-sectored-wedges-silicon`, `lever1-no-write-allocate-is-incorrect`) | this design |
