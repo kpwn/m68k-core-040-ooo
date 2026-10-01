@@ -73,3 +73,34 @@ reclaimable credits: FILLED still needs the single install port, while dynamic
 LINGER release must retain the CAM entry through registered S1/staged reads,
 live waiters, and a same-edge waiter addition. This observer makes no claim
 that shortening either state would recover those attempts.
+
+## Follow-up: credit state at refused allocation
+
+The 609 FILLED/LINGER overlap samples do not identify reclaimable credit.
+Add simulation-only visibility of the existing NB install candidate/winner,
+install hold, store reservation, S2 copyback reservation, waiter index,
+same-edge waiter add, and `lFreeOk` predicates. No allocation, install,
+release, or response RTL may change. Keep the prior throughput and skid
+counters unchanged.
+
+The `failFull` counter is a register: if it rises between probe samples T
+and T+1, report the **pre-edge T** cache state that attempted allocation,
+and confirm the post-edge T+1 state for any predicted LINGER release. This
+alignment is separate from the existing legacy `DSIDE_CHAIN_FAIL_FULL`
+snapshot, which historically prints the T+1 state. Sample only attempts
+whose counter increment lies inside the measured commit window.
+
+For each attempted allocation, partition per-entry state without claiming
+the buckets are disjoint across entries: FILLED awaiting invalidation,
+FILLED with install hold, FILLED eligible for install but not selected, and
+FILLED selected by the one install port; LINGER blocked by registered S1 or
+staged-set, live waiter, or same-edge waiter add; LINGER eligible to become
+FREE at the edge. Report event-cycle counts and slot-sample counts for each,
+plus events with no completed entry. Reconstruct `freeAfterS` by excluding
+the store-reserved slot from old-state FREE bits, and report events where an
+S2 copyback reservation requires an extra free slot. Assert the observed
+`lFreeOk` equals `freeAfterS >= 1+s2CbRes`, and predicted release entries
+become FREE in the next sample. An eligible LINGER is a **next-edge** credit
+opportunity, never a same-edge allocation; FILLED winner is at least a
+subsequent LINGER edge away. A one-seed diagnostic can identify a specific
+dominant avoidable hold, but does not prove throughput gain or an RTL fix.
