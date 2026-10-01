@@ -1486,6 +1486,47 @@ edge. It does not pretranslate, introduce a new queue, or expose untranslated
 probe data as an architectural hit. A P1 probe-only launch would lengthen a
 token's lifetime independently of its DTLB request and is deliberately excluded.
 
+### 14.8.1. Fused LONG MOVE into Dn
+
+The same default-OFF option may admit a fused `MOVE.L (An),Dn` as well as the
+original `MOVEA.L (An),An`. The assembler already emits one LS uop for both
+full-width destinations; the first-and-last markers and `pdstValid` remain
+mandatory. Widen only the destination predicate from An 8–15 to architectural
+integer register 0–15. Keep `imm=0`, no index/auto-update, natural alignment,
+and every existing ownership, translation, flush, split, SQ and replay rule.
+There is no new context register or address datapath. Dn's decoded
+`writesNzvc` and renamed flag destination travel through `captureFrontCtx`;
+the existing MOVE load completion writes NZVC from the returned value, while
+`compIsFault` suppresses both integer and NZVC writes on a fault. No early
+flags or data are exposed by the P1 probe.
+
+Directed ON tests must establish actual P1 fire, data and NZVC for positive,
+zero and negative values, and fault-side suppression of both write ports.
+Retain exact older-SQ forwarding/probe cancellation and partial-overlap
+ordering checks. Compare matched OFF/ON dependent Dn-consumer cycles with
+identical instruction shape and memory model before claiming a benefit.
+The broader destination gate is simpler, but P1 still selects a live AGU
+address onto the DTLB path; mapped timing and area remain unproven.
+
+The matched `chase-dn` kernel keeps the same pointer ring but makes each hop
+`MOVE.L (A0),D0; MOVEA.L D0,A0`. With seed 17, `l2:6:33:4096`, fused decode,
+LS-OoO, speculative wake, P3 fast enqueue, registered probe forwarding,
+NB early response/eager AR, ring 8/MSHR 4, the 2 KiB chase measured
+1027/128 = **8.023** cycles/hop OFF and 900/128 = **7.031** ON. The 64 KiB
+chase measured 85990/4096 = **20.994** OFF and 81887/4096 = **19.992** ON.
+The L2-over-L1 difference remains about 12.97 cycles/hop; this broadening
+removes one frontend cycle from both tiers, with no demonstrated miss-path
+reduction. Logs: `/tmp/codex-agent74-dn-chase-{off,on}.log`.
+
+With `FUZZ_SHIPPING=1` (which enables fused decode; `FUZZ_SHIPPING_LSU=1`
+alone does not), the 120-op LS-OoO stress seeds 15–17 passed exact device
+counts and liveness. The IRQ seeds had 42 and 34 **accepted P1 pairs**,
+respectively; the three seeds had 98 combined, 1,850 exception entries and
+22 replays. The test required a positive count for each IRQ seed, so option
+selection alone could not satisfy it. Log:
+`/tmp/codex-agent74-dn-irq-stress.log`. These are simulation results; the
+default remains OFF pending mapped timing/area evidence.
+
 The eligible uop is a fused LONG MOVEA load through a single An base: P1 has a
 live `s1Valid`, `u1.op=MOVE`, An `dstArch`, first-and-last macro markers, LONG size, valid base operand, no
 index/auto-update/displacement/stack push/alternate address space/CCR restore,
