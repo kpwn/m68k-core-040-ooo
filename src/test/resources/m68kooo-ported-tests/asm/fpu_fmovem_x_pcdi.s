@@ -27,40 +27,19 @@
 | invisible to a plain disassembly scan for so long.  The .short forms
 | below are the ROM's literal bytes.
 |
-| WHAT THIS TEST CAN AND CANNOT ASSERT -- READ BEFORE EXTENDING
-| ------------------------------------------------------------------------
-| The FMOVEM.X crack is a memory-traffic-only bridge: the load direction
-| reads 12 bytes per listed register and DISCARDS them into a hidden
-| scratch register (it does NOT write the FP register file), and the
-| store direction writes 12 bytes of ZEROS per listed register (it does
-| NOT read the FP register file).  See the fmovemx_mem_ea header comment
-| in decode_1111.vh and tb/tests/asm/fpu_fmovem_x_an_indirect.s, which
-| pins the same model for the other EA modes.
+| Current contract: static and dynamic PC-relative loads transfer FP data;
+| PC-relative stores remain illegal. Dynamic admission follows the ratified
+| 2026-09-18 dynamic-FMOVEM cold-path design.
 |
-| Consequently a load's EFFECTIVE ADDRESS is not observable from software
-| here: the data goes nowhere, and the mac_top harness has no bus-error
-| region, so a base computed as pd_pc+2 instead of the correct pd_pc+4
-| would look identical to this test.  The +4 rule (the displacement base
-| is the address of the disp16 word itself -- past the opword AND the
-| register-list word) is therefore pinned in tb/tb_decode_fpu.cpp
-| (expect_fmovemx_pcdi), which reads the emitted uop imm straight out of
-| decode.v.  Both checkers were RED-verified against a deliberately
-| broken +2 base.  Do not add an address assertion here believing it
-| works -- it cannot.
-|
-| What this file DOES assert:
-|   * the load form decodes and retires instead of trapping F-line;
-|   * it is 6 bytes long (opword + list word + disp16);
-|   * it writes nothing to memory;
-|   * it leaves the integer register file alone -- notably A2, since
-|     op[2:0] is 3'b010 for this mode and a decoder that treated the
-|     mode-7 sub-mode selector as an An index would pick A2;
-|   * the STORE direction to a PC-relative EA still traps F-line;
-|   * a DYNAMIC register list with (d16,PC) still traps F-line.
+| Stages 1/2 retain static-load instruction-length, integer-register and
+| no-write checks. Stage 3 retains the illegal PC-relative store trap and
+| memory guards. Stage 4 checks a runtime D1 mask selecting FP0 and FP3:
+| exact data, unselected FP1/FP2, high mask bits ignored, D1/A2 preservation,
+| correct PC displacement base, source image and guards, and instruction length.
 |
 | THE LENGTH DETECTOR: the disp16 word is written as the literal 0x4AFC,
 | which is simultaneously (a) a +19196 displacement landing in plain RAM,
-| where the discarded read is harmless, and (b) the ILLEGAL opword.  If
+| and (b) the ILLEGAL opword. If
 | decode reported a 4-byte length the PC would land on that word and
 | execute ILLEGAL -> vector 4 -> a distinct sentinel, instead of the
 | indistinguishable timeout a garbage displacement would produce.
@@ -74,7 +53,7 @@
 |   0xDEAD1902 — single-reg load clobbered an integer register
 |   0xDEAD1903 — multi-reg (fp0-fp3) load direction WROTE to memory
 |   0xDEAD1905 — STORE direction to (d16,PC) did NOT trap
-|   0xDEAD1906 — DYNAMIC register list with (d16,PC) did NOT trap
+|   0xDEAD1906 — dynamic PC-relative load data/register/guard mismatch
 |   0xDEAD1907 — STORE direction did not trap AND wrote memory
 
     .text
@@ -170,7 +149,7 @@ _s2_check:
 | A PC-relative operand is not addressable as a destination.  ext1 =
 | 0xF080 sets ext1[13] = 1 (FPn -> memory); the load form above uses
 | 0xD080.  If this ever decodes, the store direction would write 12
-| bytes of zeros at the EA -- so the guard below is a SECOND, independent
+| bytes at the EA -- so the guard below is a SECOND, independent
 | detector that does not depend on the fall-through path being reached.
 |
 | The handler does not RTE: it reloads A7 (discarding the exception
@@ -207,22 +186,76 @@ _s3_resume:
     cmp.l   #0xC0DEC0DE, %d0
     bne     _fail_s3_wrote
 
-| ── Stage 4 (NEGATIVE): dynamic register list must TRAP F-line ─────
-| ext1 = 0xD810: bit 11 = 1 selects a dynamic list, whose mask lives in
-| Dn at run time, so a decode-time crack cannot size the phase chain.
-| ext1[7:0] is 0x10 (non-zero) on purpose: the crack's pre-existing
-| "popcount >= 1" guard would NOT reject this, so only the new
-| !ext1[11] term in the (d16,PC) arm can make it trap.  Without that
-| term this stage falls through.
+| ── Stage 4: dynamic PC-relative list uses the runtime D1 mask ─────
+| D810 selects D1. Low-byte mask 0x90 selects FP0 and FP3 in control
+| order; upper D1 bits must not affect the list. Start all FP0-FP3 at
+| zero, then check the complete 48-byte result against an independent
+| expected image. The displacement remains the ILLEGAL length sentinel.
+    lea     0x00024000, %a0           | expected image
+    moveq   #0, %d0
+    moveq   #11, %d2
+_s4_clear:
+    move.l  %d0, (%a0)+
+    dbf     %d2, _s4_clear
+    lea     0x00024000, %a0
+    fmovem.x (%a0), %fp0-%fp3
+    move.l  #0x3FFF0000, 0(%a0)
+    move.l  #0x80000001, 4(%a0)
+    move.l  #0x00000011, 8(%a0)
+    move.l  #0x40010000, 36(%a0)
+    move.l  #0x90000003, 40(%a0)
+    move.l  #0x00000033, 44(%a0)
 
-    lea     _s4_resume, %a5
+    lea     i4+4, %a3
+    lea     0x4AFC(%a3), %a3
+    move.l  #0xCAFEBABE, -4(%a3)
+    move.l  #0x3FFF0000, 0(%a3)
+    move.l  #0x80000001, 4(%a3)
+    move.l  #0x00000011, 8(%a3)
+    move.l  #0x40010000, 12(%a3)
+    move.l  #0x90000003, 16(%a3)
+    move.l  #0x00000033, 20(%a3)
+    move.l  #0xDEADBEEF, 24(%a3)
+    lea     0x00123456, %a2
+    move.l  #0xA5A50090, %d1
+    moveq   #0, %d7                   | any F-line is now a failure
 i4:
-    .short  0xF23A, 0xD810             | fmovem.x (0x4AFC,PC),%d1
+    .short  0xF23A, 0xD810            | fmovem.x (0x4AFC,PC),%d1
     .short  0x4AFC
 
-    bra     _fail_s4_notrap
+    cmp.l   #0xA5A50090, %d1
+    bne     _fail_s4_data
+    cmpa.l  #0x00123456, %a2
+    bne     _fail_s4_data
+    lea     0x00024100, %a1
+    fmovem.x %fp0-%fp3, (%a1)
+    moveq   #0, %d2
+_s4_compare:
+    move.l  0(%a1,%d2.w), %d0
+    cmp.l   0(%a0,%d2.w), %d0
+    bne     _fail_s4_data
+    addq.l  #4, %d2
+    cmp.l   #48, %d2
+    bne     _s4_compare
+    | The source image must remain unchanged, including both guards.
+    moveq   #0, %d2
+_s4_source:
+    move.l  0(%a3,%d2.w), %d0
+    cmp.l   0(%a0,%d2.w), %d0
+    bne     _fail_s4_data
+    move.l  12(%a3,%d2.w), %d0
+    cmp.l   36(%a0,%d2.w), %d0
+    bne     _fail_s4_data
+    addq.l  #4, %d2
+    cmp.l   #12, %d2
+    bne     _s4_source
+    move.l  -4(%a3), %d0
+    cmp.l   #0xCAFEBABE, %d0
+    bne     _fail_s4_data
+    move.l  24(%a3), %d0
+    cmp.l   #0xDEADBEEF, %d0
+    bne     _fail_s4_data
 
-_s4_resume:
 | ── PASS ───────────────────────────────────────────────────────────
     lea     PASS_SENT, %a4
     move.l  #0xC0FFEE00, %d2
@@ -235,8 +268,6 @@ _fline:
     lea     STACK_TOP, %a7             | discard the exception frame
     cmp.l   #1, %d7
     beq     _fline_s3
-    cmp.l   #2, %d7
-    beq     _fline_s4
     | D7 == 0 -> a POSITIVE stage trapped: the decode gap is back.
     lea     PASS_SENT, %a4
     move.l  #0xDEAD19F1, %d2
@@ -246,10 +277,6 @@ _hf0:
 
 _fline_s3:
     moveq   #2, %d7
-    jmp     (%a5)
-
-_fline_s4:
-    moveq   #3, %d7
     jmp     (%a5)
 
 _illegal:
@@ -301,7 +328,7 @@ _fail_s3_wrote:
 _h5:
     bra     _h5
 
-_fail_s4_notrap:
+_fail_s4_data:
     lea     PASS_SENT, %a4
     move.l  #0xDEAD1906, %d2
     move.l  %d2, (%a4)
