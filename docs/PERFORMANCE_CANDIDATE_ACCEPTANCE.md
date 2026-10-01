@@ -141,3 +141,28 @@ gate for that source; it is not a full lockstep/corpus result and does not cover
 the later AR-preselection experiment. The broad matched corpus at `5123593f`
 continues independently; its older exception fixtures must not be confused with
 this corrected-source family result.
+
+## AR-preselection integrated gate, 2026-10-01
+
+Integrated source `1b870987` passes the clean default fast gate (404 tests) and
+all 17 nonblocking-cache tests with early response, eager/preselected AR,
+P3 fast loads, probe-line forwarding, NB4/ring8, D4, hot reads and direct refill
+enabled. The cache run includes four checked 1,000-operation chaos seeds.
+Exact command/configuration and terminal counts are in
+`/tmp/codex-agent59-preselect-integrated-gates.py` and
+`/tmp/codex-agent59-preselect-results.json`; logs are
+`/tmp/codex-agent59-preselect-{fast,all-options-cache}.log`.
+
+The option remains OFF by default. Its matched full-core measurements and
+write-hazard coverage are recorded in the nonblocking-cache spec section 6.3e.
+These tests prove neither routed area/timing nor the target six-cycle incremental
+L2 latency. Later changes require their own applicable gates.
+
+The separate CPUSHL publication fixture correction (`e800996e`, integrated as
+`be202e89`) passes its exact named corpus test with the earlier candidate's
+performance configuration OFF and ON, plus 404 fast tests. The fixture now
+explicitly enables IC and publishes generated code before its initial execution;
+the later IC-only CPUSHL remains the operation under test. Logs are
+`/tmp/codex-cpush-fixture-{off,on,fast}.log`. It is an architectural publication
+and progress check, not proof of overlap with a busy maintenance FSM. It remains
+excluded from forced-copyback sweeps.
