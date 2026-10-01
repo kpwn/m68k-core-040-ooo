@@ -251,19 +251,20 @@ two-credit restriction; depth eight batches is an optional throughput/area
 comparison. Intermediate commits may add walker batch capture and queue drain
 before interlocks, but the final gates require all three descriptor levels.
 
-Descriptor U/M bytes are always the low byte of an aligned 32-bit descriptor
-(`descAddr + 3`); assert that physical alignment at batch creation and query.
-For each 16-byte aligned response line, four descriptor-low-byte positions
-each need only two U/M bits: 8 bits per half, 16 bits per two-half aligned
-response slot, or 128 bits for eight slots. A full 32-bit per-line mask would
-instead consume 512 bits and is not justified unless unaligned descriptor
-metadata is admitted by a later architecture change.
+Each descriptor's U/M byte is at `descAddr + 3`. Pointer/page descriptors are
+aligned, but the current MOVEC root-pointer contract permits a misaligned
+root; `TableWalker` supports its split LONG read. Preserve that behavior.
+Initially store a general two-bit U/M mask for **every physical byte** in each
+16-byte aligned response line: 32 bits per half, 64 per two-half slot, or 512
+bits for eight slots. The aligned four-position encoding would require only
+128 bits, but it is merely an optional measured refinement with a proven
+misaligned-root fallback; no new MOVEC masking is permitted just to save bits.
 
 Worst-case incremental storage before synthesis: four batches per side times
 three elements times roughly 35 bits (`addr32`, U/M mask2, valid1) is 420 raw
 bits per queue, before shared owner/stamp/offer state; the present leaf-only
-queue has four single-byte entries. The aligned response masks above add
-128 bits. Four 4-bit D U/M SQ-target epochs and one 4-bit SQ ack counter
+queue has four single-byte entries. The general response masks above add
+512 bits. Four 4-bit D U/M SQ-target epochs and one 4-bit SQ ack counter
 add 20 bits. Across D+I queues the load query compares up to 24 physical
 bytes against two requested halves (48 address comparisons); walker SQ query
 checks up to eight resident stores against its descriptor bytes. These are
