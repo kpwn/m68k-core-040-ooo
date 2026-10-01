@@ -176,7 +176,7 @@ class StoreQueuePayloadResetSpec extends AnyFunSuite {
             val e = shadow(d.head.toInt).get
             assert(error && ack && e.precise)
             assert(d.io.sqFaultCompletion.payload.faultAddr.toLong ==
-              (if (d.ackPhaseB.toBoolean) e.vb else e.va))
+              e.va)
             faults += 1
           }
           if (d.io.sqCompletion.valid.toBoolean && d.io.sqCompletionOrphan.toBoolean)

@@ -1280,8 +1280,8 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // every successful (or terminally-popped, even faulted) ack of a precise head --
   // the ROB's completes-required-even-for-a-fault contract needs both to fire
   // together on error. sqFaultCompletion additionally fires (and carries the
-  // FAILING SLOT's own logical address, not always slot A's) only on a genuine
-  // AXI B error.
+  // original transfer's first-byte logical address) only on a genuine AXI B
+  // error. M68040 UM 8.4.6.4 requires that address even when split slot B faults.
   io.sqCompletion.valid   := False
   io.sqCompletion.payload := robIds(head)
   // Qualifier for the pop that `sqCompletion` announces (Part 127). Combinational off
@@ -1289,7 +1289,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   io.sqCompletionOrphan   := orphans(head)
   io.sqFaultCompletion.valid           := False
   io.sqFaultCompletion.payload.robId   := robIds(head)
-  io.sqFaultCompletion.payload.faultAddr  := Mux(drainPhaseB, vaddrBs(head), vaddrAs(head))
+  io.sqFaultCompletion.payload.faultAddr  := vaddrAs(head)
   io.sqFaultCompletion.payload.write      := True
   io.sqFaultCompletion.payload.sizeBits   := sizeBitsOf(sizes(head))
   io.sqFaultCompletion.payload.supervisor := supervisors(head)
