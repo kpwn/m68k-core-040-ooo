@@ -1567,10 +1567,13 @@ read response. The ordinary read/stage path remains the exact fallback.
 The fast candidate requires all of the following at C0: exact probe token
 **and virtual address** ownership; ready miss with a resolved physical tag
 equal to the command's tag; one-hot-safe tag outcome; cacheable ordinary
-COPYBACK access (`ooOk`, not split/line-only, inhibited, or faulting); no
+COPYBACK **or WRITETHROUGH** access (`ooOk`, not split/line-only, inhibited,
+or faulting); no
 sticky or current-cycle same-set array write; no matching cancel/flush; no
 maintenance/reset; no older S1 decision competing for `stg*`; and no store
-S0/S1/S2/S3/pending-store activity for that set. The queue carries a victim-way
+same-set input-store `valid`, S0/S1/S2/S3/pending-store activity for that set.
+The input check uses `valid`, rather than `fire`, so it does not add a
+store-ready to load-stage feedback path. The queue carries a victim-way
 snapshot, a clean-or-invalid certificate, a resolved-tag certificate, and a
 multi-hot certificate alongside the already-stored physical tag. A dirty
 victim or uncertain certificate falls back: **no 128-bit victim line or dirty
@@ -1586,8 +1589,8 @@ store priority, and resource credit before allocating. These checks must be
 pinned by directed tests, including dynamic early MSHR release, rather than
 assumed from a successful benchmark. Any same-line MSHR already active can take the existing
 secondary path at staging; a different-line same-set MSHR replays. A store
-entering S0 after C0 is younger than the staged load; any store already in
-S0/S1/S2/S3 at C0 forces the
+entering S0 after C0 is younger than the staged load; a same-set store
+presented at C0 or already in S0/S1/S2/S3 forces the
 fallback. Same-cycle invalidation, no-fill store, WT overlay, and maintenance
 write races also force fallback.
 
