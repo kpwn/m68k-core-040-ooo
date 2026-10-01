@@ -1446,8 +1446,13 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.iq.logic.lsSelectParked.toBoolean, bypassSelect,
           dut.iq.logic.lsEuFire.toBoolean)
         if (bypassSelect) lsBypassFires += 1
-        specWakeHisto += ((dut.lsEu.wakeupSpec.valid.toBoolean,
-          dut.iq.logic.lsSpecBlocked.toBoolean))
+        // With speculative wakeup compiled out, both taps are constants that
+        // Verilator may prune. Keep OFF control runs measurable without forcing
+        // debug-only signals into the generated hardware.
+        specWakeHisto += ((if (dut.lsEu.specLoadWakeup)
+          dut.lsEu.wakeupSpec.valid.toBoolean else false,
+          if (dut.lsEu.specLoadWakeup)
+            dut.iq.logic.lsSpecBlocked.toBoolean else false))
         val p3FastFire = dut.lsEu.p3FastLoad && dut.lsEu.logic.p3FastEnq.toBoolean
         if (p3FastFire) p3FastEnqueues += 1
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
