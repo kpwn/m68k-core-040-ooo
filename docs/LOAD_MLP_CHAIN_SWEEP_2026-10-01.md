@@ -88,3 +88,32 @@ Reproduction uses `DsideBandwidthSpec` with `DSIDE_CHAIN_COUNTS=1,2,4,8`,
 `/tmp/agent70-chain-state-ring8-skew1.log`. The test-only harness commit is
 `b2fe7397`; its `make test-fast` gate passed 404/404 (2 ignored) in
 `/tmp/agent70-chain-diagnostic-testfast.log`.
+
+## Matched integrated AR-preselection control
+
+Integrated source `97b7453a` includes the inactive metadata foundation and the
+same chain telemetry. Its clean fast gate passes 404 tests. Both matched arms
+below pass all checked pointer results with the same seed, L2 model, 1024
+records, skew0, NB4/ring8 and all earlier latency options ON; only
+`CPU_DCACHE_NB_PRESELECT_AR` changes. Direct refill remains OFF.
+
+| Chains | Preselect | Measured cycles | B/cycle | IPC | MSHR-full attempt cycles |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 | OFF | 11065 | 0.7432 | 0.3252 | 0 |
+| 4 | ON | 10600 | 0.7758 | 0.3394 | 0 |
+| 8 | OFF | 12575 | 0.6540 | 0.2248 | 1487 |
+| 8 | ON | 12185 | 0.6749 | 0.2320 | 1545 |
+
+Every row transfers 8224 measured bytes; four-chain retires 3598 instructions,
+eight-chain 2827. Throughput gains are 4.4% and 3.2% respectively. Eight chains
+still underperform four. In the eight-chain ON arm, 817 of 1545 full-MSHR
+attempt cycles contain a FILLED/LINGER entry; mean LINGER occupancy on those
+attempts is 0.384. The failed-attempt counter rises despite improved throughput:
+it counts retries and cannot stand in for elapsed execution time.
+
+Exact environment and source checks are in
+`/tmp/codex-agent59-chain-preselect-gates.py`; validated counts and performance
+rows are in `/tmp/codex-agent59-chain-preselect-results.json`. Logs are
+`/tmp/codex-agent59-chain-preselect-{fast,off,on}.log`. This controls the
+preselection interaction before measuring dynamic MSHR release. It is not an
+area/timing or board result, and does not enable a shipping default.
