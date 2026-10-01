@@ -251,7 +251,12 @@ missing or unannounced hot group, hot-disabled control and missing file
 rejection. Results: `/tmp/codex-hot-socket-check-results.json`. These checks
 called `check_socket` directly, so they do not claim to have run the separate
 standalone full-core netlist check. Required `test-fast` passed 404/404 on source `99ecd1fb`; log
-`/tmp/codex-hot-socket-fast.log`.
+`/tmp/codex-hot-socket-fast.log`. Integration source `ef2a0c45` then passed
+the same 11 socket controls and required default `test-fast` (404/404,
+2 ignored). Evidence: `/tmp/codex-integrated-hot-socket-check-results.json`,
+`/tmp/codex-integrated-hot-socket-results.json`, and
+`/tmp/codex-integrated-hot-socket-fast.log`. No production RTL changed in
+this checker integration; physical and full-corpus acceptance remain open.
 
 Read-only inspection found the live SoC main tree `dc97a83` still labels the
 CPU hot interface planned, while its `dhcpu` worktree has uncommitted P6 wiring
