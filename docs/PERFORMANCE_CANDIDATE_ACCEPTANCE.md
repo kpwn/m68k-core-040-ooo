@@ -325,3 +325,24 @@ schema. It does not establish functional CPU/SoC ordering, routed timing,
 area or a board boot. The later experimental L2 hot-response fall-through
 is not present in this validated SoC source. Owner worktrees and the live
 board/JTAG session were not modified.
+
+## Completed frozen broad comparison (2026-10-01)
+
+The long-running `5123593f` comparison is now terminal with all four expected
+suites complete. Ported OFF/ON each ran 1,024 cases, with 14/15 failures.
+Execute lockstep OFF/ON each ran 703 cases with 10/11 failures and the same
+one skipped case. ON-only failures are `ported: cpush_ic_maint_while_busy`
+and `odd-ssp: level-1 IRQ at every boundary of the LINK #-75 stretch,
+boot-10, handlers call`; there are no OFF-only failures. This frozen run is
+red, not a passing regression comparison. Exact sets and failures are in
+`/tmp/codex-candidate-gates-5123593f/{results,comparison}.json` and XML logs.
+
+The extra lockstep failure reports an ambiguous old boundary oracle at
+boundary 41 (DUT PC `408000b2`, last attempted oracle PC `408000be`). The
+later corrected odd-SSP family includes that exact test name and passed
+68/68 cases in each arm on `99e71482`, recorded in
+`/tmp/codex-odd-family-integrated-results.json`. The later CPUSH fixture
+validation is recorded above. Those focused results do not replace the
+full frozen results or establish full-corpus acceptance of today's RTL.
+The preserved watcher has started its separately queued full-copyback
+supplement on the same older source; that supplement remains in progress.
