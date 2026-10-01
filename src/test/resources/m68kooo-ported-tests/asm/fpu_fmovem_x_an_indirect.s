@@ -45,23 +45,28 @@
 |
 | PASS sentinel: 0xC0FFEE00.
 | FAIL sentinels:
-|   0xDEAD1A01 — single-reg store did not zero its 12-byte slot
+|   0xDEAD1A01 — single-reg store did not reproduce FP0's 12-byte image
 |   0xDEAD1A02 — single-reg store overran past the slot
 |   0xDEAD1A03 — single-reg store wrote BELOW An (phantom predecrement)
 |   0xDEAD1A04 — (An) store clobbered An (phantom writeback)
 |   0xDEAD1A05 — instruction length was not 4 bytes
-|   0xDEAD1A06 — multi-reg store left a slot un-zeroed (advance is wrong)
+|   0xDEAD1A06 — multi-reg store changed a slot image (advance or data is wrong)
 |   0xDEAD1A07 — multi-reg store overran the 4-slot range
 |   0xDEAD1A08 — multi-reg store clobbered An
 |   0xDEAD1A09 — load direction wrote to memory
 |   0xDEAD1A0A — load direction clobbered An
 |   0xDEAD1A0B — non-A0 base register was mis-decoded, or the sparse
 |                list did not pack into the first N slots in
-|                highest-register-at-lowest-address order
+|                lowest-register-at-lowest-address order
 |   0xDEAD1A0C — load direction did not deliver the memory image into
 |                the FP registers
 |   0xDEAD1A0D — single-register store did not write FP0's actual value
 |   0xDEAD1A01+0xF0 (0xDEAD1AF1) — vec-11 F-line: the decode gap is back
+
+| Ordering expectations follow the 2026-09-19 correction in
+| docs/superpowers/specs/2026-08-19-fmovem-data-list-design.md section 2:
+| lowest-numbered listed register at lowest address, independently checked
+| by FmovemDataInteropSpec. Guards, lengths and An checks remain mandatory.
 
     .text
     .org 0
@@ -98,7 +103,7 @@ _start:
     move.l  #0x55555555, 8(%a1)
 
 | Load FP0-FP3.  Control list, mask 0xF0: the HIGHEST-numbered register
-| in the list takes the LOWEST address, so FP3 <- slot0 ... FP0 <- slot3.
+| in the list takes the HIGHEST address, so FP0 <- slot0 ... FP3 <- slot3.
     lea     VSRC, %a1
     fmovem.x (%a1),%fp0-%fp3
 
@@ -127,16 +132,16 @@ _start:
 
     cmp.l   #0x5A, %d7
     bne     _fail_len
-    | FP0 was loaded from VSRC slot 3 (see the mask note above), so the
+    | FP0 was loaded from VSRC slot 0 (see the mask note above), so the
     | single-register store must reproduce that slot exactly.
     move.l  0(%a0), %d0
-    cmp.l   #0xBFFE0000, %d0
+    cmp.l   #0x3FFF0000, %d0
     bne     _fail_s1_data
     move.l  4(%a0), %d0
-    cmp.l   #0xB0000004, %d0
+    cmp.l   #0x80000001, %d0
     bne     _fail_s1_data
     move.l  8(%a0), %d0
-    cmp.l   #0x00000044, %d0
+    cmp.l   #0x00000011, %d0
     bne     _fail_s1_data
     move.l  12(%a0), %d0
     cmp.l   #0xCAFEBABE, %d0
@@ -250,10 +255,10 @@ _s3_check:
 | that hardwired A0 would pass every stage above) and that a sparse mask
 | still lands in the first N slots, packed, not at mask-bit positions.
 | ext1 = 0xF024 -> control list, mask bits 5 and 2 -> FP2 and FP5.  The
-| higher-numbered register takes the LOWER address, so slot 0 must hold
-| FP5 and slot 1 must hold FP2.
-| FP2 currently holds stage 3's slot 1 (the load put FP3<-slot0,
-| FP2<-slot1, FP1<-slot2, FP0<-slot3).
+| lower-numbered register takes the LOWER address, so slot 0 must hold
+| FP2 and slot 1 must hold FP5.
+| FP2 currently holds stage 3's slot 2 (the load put FP0<-slot0,
+| FP1<-slot1, FP2<-slot2, FP3<-slot3).
 | FP5 is seeded here from V5.
 
     lea     FP_BUF+512, %a3
@@ -270,25 +275,25 @@ _s3_check:
 
     fmovem.x %fp2/%fp5,(%a3)           | F213 F024 — two regs, packed
 
-    | slot 0 = FP5 = V5
+    | slot 0 = FP2 = stage-3 buffer slot 2
     move.l  0(%a3), %d0
-    cmp.l   #0x7FFE0000, %d0
+    cmp.l   #0x77770000, %d0
     bne     _fail_s4
     move.l  4(%a3), %d0
-    cmp.l   #0xF5F5F5F5, %d0
+    cmp.l   #0x88888888, %d0
     bne     _fail_s4
     move.l  8(%a3), %d0
-    cmp.l   #0x55555555, %d0
+    cmp.l   #0x99999999, %d0
     bne     _fail_s4
-    | slot 1 = FP2 = stage-3 buffer slot 1
+    | slot 1 = FP5 = V5
     move.l  12(%a3), %d0
-    cmp.l   #0x44440000, %d0
+    cmp.l   #0x7FFE0000, %d0
     bne     _fail_s4
     move.l  16(%a3), %d0
-    cmp.l   #0x55555555, %d0
+    cmp.l   #0xF5F5F5F5, %d0
     bne     _fail_s4
     move.l  20(%a3), %d0
-    cmp.l   #0x66666666, %d0
+    cmp.l   #0x55555555, %d0
     bne     _fail_s4
     move.l  24(%a3), %d0
     cmp.l   #0xCAFEBABE, %d0
