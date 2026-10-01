@@ -1878,3 +1878,34 @@ functional simulation alone cannot establish 200 MHz closure. The R pipe stays
 FULL because the historical fabric-to-core timing failure was on the return
 side. Evaluate AR-only against the unchanged baseline in matched actual-SoC
 bus recurrence and routed timing before any default promotion.
+
+
+#### AR-only generation and boundary validation (2026-10-02)
+
+The isolated implementation `851ef575` passed all ten directed socket boundary
+cases and the required fast gate (414 tests). It is integrated as `d1b76823`;
+`src`, `build.sbt`, `project`, and `Makefile` are identical to that tested source.
+The boundary cases cover empty-path latency, held AR payload, reset cancellation,
+stale multi-ID response absorption with a fresh pending request, and byte order.
+Logs: `/tmp/codex-agent77-hot-ar-focused-r4.log` and
+`/tmp/codex-agent77-hot-ar-testfast.log`.
+
+Matched CPU generation from clean `d1b76823` succeeded with the AR option OFF
+and ON, and both generated interfaces passed `check_socket(path, False, True)`.
+The two recorded environments differ only in `CPU_AXI_DH_AR_FALL_THROUGH`.
+All sixteen generated filenames match; only `M68kSocketTop.v` differs, and all
+module definitions after the socket top are byte-identical. Input manifests
+and file hashes are in `/tmp/codex-soc-cpu-inputs-d1b76823-ar{0,1}/manifest.json`.
+
+The emitted Verilog removes 64 declared M2S storage bits: 48 for exposed AR
+payload plus valid, and 16 unused AXI sideband bits. This is a source-level
+state count, **not** mapped flip-flop savings: synthesis can already remove
+unused or constant fields. The S2M skid storage remains. The full diff and
+count are `/tmp/codex-soc-ar-netlist.diff` and
+`/tmp/codex-soc-ar-generated-state.json`. The generated top hashes are
+`3b5bf0aa2737717f3b42ca886418db03dd50a891650fad402b1478c7ecf9704c` OFF and
+`d26737865c6b8a13ec048a223ae975401de7312ec71ab7f6c36d5aaa237a9a9e` ON.
+
+At this checkpoint, matched actual-SoC execution with L2 response fallthrough
+fixed ON is still running. No AR-option performance, mapped-area, or routed
+200 MHz result is established, and the option remains default OFF.
