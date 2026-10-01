@@ -1726,6 +1726,10 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       var stageLinger = 0
       var stageRetained = 0
       var secondaryAtStage = 0
+      var dirtyS1Linger = 0
+      var dirtyStageLinger = 0
+      var storeAcks = 0
+      val dirtyAddr = 0xb0000L + 16 * 64L
       var lastStageSlot = -1
       var lastStageLine = -1L
       var cycle = 0
@@ -1742,6 +1746,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
             hotAr += 1; arCycles += cycle
           }
           if (lg.axiDh.r.valid.toBoolean && lg.axiDh.r.ready.toBoolean) rCycles += cycle
+          if (lg.storeAckReg.toBoolean) storeAcks += 1
           if (pl.loadRspOut.valid.toBoolean) {
             val token = pl.loadRspOut.payload.token.toInt
             assert(!received.contains(token), s"duplicate dynamic-release response token=$token")
@@ -1760,9 +1765,13 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
           for (k <- 0 until 4 if lg.nb.st(k).toInt == 5) {
             lingerCycles.getOrElseUpdate(lg.nb.line(k).toLong, cycle)
             val set = lg.nb.eset(k).toInt
-            if (lg.ldS1Valid.toBoolean && lg.ldS1Set.toInt == set) s1Linger += 1
+            if (lg.ldS1Valid.toBoolean && lg.ldS1Set.toInt == set) {
+              s1Linger += 1
+              if (lg.nb.line(k).toLong == (dirtyAddr >>> 4)) dirtyS1Linger += 1
+            }
             if (lg.nb.stgValid.toBoolean && lg.nb.stgSet.toInt == set) {
               stageLinger += 1
+              if (lg.nb.line(k).toLong == (dirtyAddr >>> 4)) dirtyStageLinger += 1
               lastStageSlot = k
               lastStageLine = lg.nb.line(k).toLong
               if (lg.nb.lSecondary.toBoolean) secondaryAtStage += 1
@@ -1791,21 +1800,47 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.loadCmdIn.valid #= false
         cycle
       }
+      def mergeDirtyStore(addr: Long): Unit = {
+        val ackBefore = storeAcks
+        val mergeBefore = lg.nb.ctrMap("storeMerges").toLong
+        pl.storeIn.valid #= true
+        pl.storeIn.payload.paddr #= addr
+        pl.storeIn.payload.data #= BigInt("77777777", 16)
+        pl.storeIn.payload.size #= Size.LONG
+        pl.storeIn.payload.useStrb #= true
+        pl.storeIn.payload.strb #= 0x000f
+        pl.storeIn.payload.lineData #= BigInt("77777777", 16)
+        pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.storeIn.payload.precise #= false
+        waitFor("dirty merge store ready") { pl.storeIn.ready.toBoolean }
+        cd.waitSampling()
+        pl.storeIn.valid #= false
+        waitFor("dirty merge store ack") { storeAcks > ackBefore }
+        assert(lg.nb.ctrMap("storeMerges").toLong > mergeBefore,
+          "COPYBACK store did not merge into the waiting load MSHR")
+      }
       // Each trial uses a different set. Sweep the second read across the refill
       // acceptance/install window; all trials retain checked data and unique IDs.
       for (offset <- 13 to 20) {
         val addr = 0xb0000L + offset * 64L
         val word = BigInt("40414243", 16) + BigInt(offset) * BigInt("01010101", 16)
         for (b <- 0 until 16) cold.pokeByte(addr + b, (0x40 + offset + b) & 0xff)
-        val expected = (0 until 4).foldLeft(BigInt(0))((v, b) =>
+        val backingWord = (0 until 4).foldLeft(BigInt(0))((v, b) =>
           (v << 8) | BigInt((0x40 + offset + b) & 0xff))
-        assert(expected == word)
+        assert(backingWord == word)
+        val expected = if (offset == 16) BigInt("77777777", 16) else backingWord
         val arBefore = hotAr
         val first = offset * 2
         val second = first + 1
         val firstAt = send(addr, first, 0)
         waitFor(s"trial $offset first AR") { hotAr > arBefore }
-        cd.waitSampling(offset)
+        val firstArAt = arCycles.last
+        if (offset == 16) {
+          mergeDirtyStore(addr)
+          assert(cold.peekByte(addr) == 0x50, "COPYBACK merge reached backing memory before CPUSH")
+          assert(cycle <= firstArAt + offset, "store merge missed the planned install/read window")
+          while (cycle < firstArAt + offset) cd.waitSampling()
+        } else cd.waitSampling(offset)
         val secondAt = send(addr, second, 1)
         waitFor(s"trial $offset responses") { received.contains(first) && received.contains(second) }
         assert(received(first) == expected && received(second) == expected,
@@ -1818,6 +1853,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         }
         releaseCycles.getOrElseUpdate(addr >>> 4, cycle)
         releaseGaps += releaseCycles(addr >>> 4) - lingerCycles(addr >>> 4)
+        if (offset == 16) {
+          val hitArBefore = hotAr
+          send(addr, 200, 0)
+          waitFor("dirty resident reread") { received.contains(200) }
+          assert(received(200) == expected && hotAr == hitArBefore,
+            s"dirty installed line was lost: data=${received(200).toString(16)} AR delta=${hotAr - hitArBefore}")
+          assert(cold.peekByte(addr) == 0x50, "resident dirty line appeared in memory before CPUSH")
+        }
         println(s"[nbDynamicRelease trial] offset=$offset first=$firstAt AR=${arCycles.last} " +
           s"R=${rCycles.last} second=$secondAt LINGER=${lingerCycles.getOrElse(addr >>> 4, -1)} " +
           s"FREE=${releaseCycles.getOrElse(addr >>> 4, -1)} " +
@@ -1825,11 +1868,18 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       }
       assert(s1Linger > 0 && stageLinger > 0 && stageRetained > 0 && secondaryAtStage > 0,
         s"install/read collision not exercised: S1=$s1Linger stage=$stageLinger retained=$stageRetained secondary=$secondaryAtStage")
-      assert(responses == 16, s"dynamic-release responses=$responses expected=16")
+      assert(dirtyS1Linger > 0 && dirtyStageLinger > 0,
+        s"dirty install/read collision not exercised: S1=$dirtyS1Linger stage=$dirtyStageLinger")
+      assert(responses == 17, s"dynamic-release responses=$responses expected=17")
       assert(releaseGaps.size == 8 && releaseGaps.exists(_ < 4),
         s"dynamic release never beat fixed four-cycle hold: $releaseGaps")
+      waitFor("idle before dirty CPUSH") { lg.dcIdleForMaint.toBoolean }
+      maint(dut, cd, push = true, invalidate = true, scope = 1, addr = dirtyAddr)
+      assert((0 until 4).forall(b => cold.peekByte(dirtyAddr + b) == 0x77),
+        "dirty merged line was not written back by CPUSH")
       println(s"[nbDynamicRelease] S1/LINGER=$s1Linger staged/LINGER=$stageLinger " +
-        s"retained=$stageRetained secondary=$secondaryAtStage AR=$hotAr responses=$responses gaps=$releaseGaps")
+        s"retained=$stageRetained secondary=$secondaryAtStage dirtyS1=$dirtyS1Linger " +
+        s"dirtyStage=$dirtyStageLinger AR=$hotAr responses=$responses gaps=$releaseGaps")
     }
   }
 

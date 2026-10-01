@@ -170,6 +170,10 @@ the default behavior. Faulted fills keep their existing LINGER(0) rule. The
 experiment uses the existing entry state, S1/staging set registers, and waiter
 table; it adds no state and no path into the CPU read response or BRAM read
 enable. The two set comparisons feed only the MSHR state-register D input.
+At the four-MSHR configuration the source adds at most eight 7-bit set
+equalities (S1 and staged set against each entry), plus their state gating;
+synthesis may share some equalities. This is a source-level upper bound, not a
+mapped LUT or Fmax result.
 
 The edge contract is: an install write and a BRAM read may meet at edge T, so
 that read can observe the old tag. From T to T+1, `ldS1Valid/ldS1Set` identify
@@ -196,6 +200,30 @@ interactions, without a claimed standalone mutation proof. The experiment
 should be benchmarked only if exact
 `failFull` snapshots show installed LINGER entries are a meaningful part of
 capacity pressure; a FILLED or WAIT_R wall cannot improve by retiring LINGER.
+
+The first default-OFF evaluation used the integrated NB4/ring8/hot-door
+configuration with LS-OoO, fusion, speculative wakeup, P3 fast load, early
+probe forwarding, early response, eager AR, and preselected AR all enabled;
+direct-refill response stayed OFF. Both arms ran the same seed-1, 1024-record
+independent-chain kernels and `l2:5:60:4096` memory model. Four chains changed
+from 10,600 to 10,552 measured cycles (0.7758 to 0.7794 B/cycle); eight
+chains changed from 12,185 to 10,677 cycles (0.6749 to 0.7703 B/cycle).
+The eight-chain full-MSHR attempt count fell from 1,545 to 1,464 and mean
+LINGER occupancy at those attempts from 0.384 to 0.198. Both arms checked
+8,224 output bytes per kernel. These are simulator results, not post-route
+area/timing or board IPC. Logs: `/tmp/codex-nb-dynamic-release-bench-off.log`
+and `/tmp/codex-nb-dynamic-release-bench-on.log` from agent66 commit
+`a1f36283`. A second seed-17 eight-chain control changed from 12,075 to
+10,760 cycles (0.6811 to 0.7643 B/cycle), with the same checked byte count;
+logs are `/tmp/codex-nb-dynamic-release-seed17-off.log` and
+`/tmp/codex-nb-dynamic-release-seed17-on.log`. The directed legal-port
+collision sweep checked 17 responses and one hot AR per line, including a
+COPYBACK store merged before R, a same-line second load at install, a resident
+reread, and final CPUSH. Removing only the S1-set guard made that second load
+return stale backing-memory bytes `0x50515253` instead of the merged
+`0x77777777` (`/tmp/codex-nb-dynamic-release-mut-s1-dirty.log`). Removing only
+the staged-set guard passed the earlier clean-line collision test, so no
+separate necessity is claimed for that guard.
 
 **Every state field has exactly one owner and one writer site per transition.** No flag is set
 in one state and cleared in another (the `evictAxiPairOpen` one-way latch lesson). A
