@@ -405,6 +405,78 @@ extra rules and where each lands here:
 - **Only copyback victims and full-line (`noFill`) installs** use it. WT and uncached writes
   stay on the crossbar.
 
+### 6.3c Experimental early AR selection (2026-10-01 amendment)
+
+`CPU_DCACHE_NB_EAGER_AR=1` may remove one registered allocation-to-AR
+selection bubble; it defaults OFF and only exists with `CPU_DCACHE_NONBLOCKING=1`.
+The allocation edge writes the new line, state `WAIT_AR`, and any dirty
+victim into the WB FIFO. On the following cycle, the candidate may use that registered line
+without waiting for `settled` or the **previous line's** registered `blocked`.
+It must still check the exact current `coldWriteTo(line)` sources (WB entries,
+WT FIFO, and simultaneous WB/S3 WT pushes), current S1/S2 WT stores, and the
+configured store-allocation AR delay. The 16-byte full-strobe COPYBACK store
+starts in `FILLED` and remains a no-AR case. Selection remains registered in
+`arV/arIdx/arAddr`; no new combinational path reaches the CPU read stage or
+the AXI AR output. Once advertised, ARVALID/address/ID remain fixed through
+ARREADY backpressure, and a newer same-line WT writer is held until handshake.
+
+The safety argument is edge-local: a WB push on the allocation edge is visible
+as `wbV/wbLine` on the following selection cycle, while a push on that selection
+cycle is visible in `coldWriteTo` combinationally. An S3 WT at either edge is
+likewise visible in the WT FIFO or the
+current S3 predicate; an older S1/S2 WT is explicitly excluded. Thus the stale
+registered `blocked` bit adds delay but no ordering information. The separate
+`settled` bit supplies no data dependency once C0 has latched `line`, victim
+data, and `WAIT_AR`. This option changes only selection timing, not allocation,
+WB occupancy, install, response, or same-line merge rules. Acceptance requires
+an exact command-C0 and allocation-to-AR OFF/ON test, AXI backpressure and delayed-B tests, live
+dirty WB/WT hazards, noFill and store-delay cases, randomized cache stress, and
+matched dependent-chase throughput. If any safety assertion or checked-data
+test fails, the option stays OFF and is not a shipping candidate.
+The simulation-only `wbGate` counter retains its legacy registered-gate meaning
+with the option OFF; with it ON, it counts `WAIT_AR` candidates blocked by a
+current WB or WT address (including S1/S2 WT) after any configured store-AR
+delay. This avoids reporting a stale `blocked` bit as an actual eager-mode stall.
+
+Isolated RTL measurement on base `5123593f` with the same 4-MSHR hot door,
+4-slot load ring, and LS-OoO issue **OFF** in both arms: accepted load command
+to advertised hot AR is 5 cycles OFF and 4 ON; MSHR allocation to advertised
+AR is 2 OFF and 1 ON (`/tmp/codex-nb-eager-dualwb.log`). The matched five-lap
+dependent chase (`MB_PLAN=l2:5:60:4096|2048,65536|chase`) checks the final
+pointer: the 2 KiB L1-resident loop is 9.000 cycles/hop in both arms, while
+the 64 KiB L2 loop is 21.993 OFF and 21.015 ON, a 0.978-cycle/hop reduction
+(`/tmp/codex-nb-eager-chase-off.log`, `/tmp/codex-nb-eager-chase-on.log`).
+Configured model L2 hit latency 5 yields measured hot AR-to-R of 6 cycles;
+these measurements are paired internally and must not be numerically combined
+with the separate LS-OoO-ON `l2:6:33` experiments. The 9-cycle L1 value is
+the full dependent issue-to-next-issue loop, not SRAM latency. No board IPC or
+post-route area is inferred from this simulation.
+
+Two independent dirty-victim pushes cannot coincide through the current legal
+cache ports. `sWbPush` is the first `pendingStoreMiss` allocation cycle; the
+miss is discovered in store S2. `lWbPush` is the `stgValid` allocation cycle;
+`stgValid` is registered from a load S1 miss. A store S1 advance and an ordinary
+load-read launch are mutually excluded by `loadPortReserved`. A command served
+by an existing early-probe hit bypasses the ordinary read and cannot produce
+`stgValid`; a load shadow launch itself reserves the read port. Therefore the
+store S2 miss and load S1 miss cannot occupy the same cycle, and their
+corresponding allocation pulses cannot coincide on the next edge. Once
+`pendingStoreMiss` is set, `loadCmdPort.ready` blocks later ordinary loads.
+The FIFO retains its two-push handling and `coldWriteTo` retains both current
+push terms for future port configurations. In the legal-port directed phase
+sweep (`/tmp/codex-nb-eager-adjacentwb2.log`), 15 pairs each produced
+two checked dirty-victim pushes, both orderings were observed, and the closest
+pair was one cycle apart; no dual push occurred. The final acceptance test
+requires two pushes per pair, both orderings, a one-cycle gap, checked load
+data, exact request handshakes, and a drained cache. This is reachable corner
+coverage, not a claim that the dual-push FIFO path was exercised.
+The selected eager cache run (`/tmp/codex-nb-eager-final-suite.log`) executes
+the timing, WT S1/S2/S3 with delayed B, store-delay/no-fill, adjacent dirty
+victims, WB-full pressure/release, stalled AR stability, delayed WB visibility,
+and four 1,000-operation hot-door chaos seeds. All selected checks pass with
+checked data; inactive ScalaTest arms in the same suite are not counted as
+mechanism coverage.
+
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
 | today's bug (`dcache-sectored-wedges-silicon`, `lever1-no-write-allocate-is-incorrect`) | this design |
