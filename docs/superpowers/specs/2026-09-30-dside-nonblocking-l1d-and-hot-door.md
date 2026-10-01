@@ -1813,8 +1813,13 @@ shows response-to-next-accepted-AR of exactly 10 cycles in all 4095 bounded
 intervals, with either SoC response-bypass setting. It is consistent with the
 eight-cycle core recurrence plus two socket edges. The SoC L2 interval itself
 is six cycles OFF and five ON, yielding 16/15-cycle accepted-AR spacing.
-This bus evidence does not rely on the old SoC resume-PC trace: exact
-instruction-retirement marker timing is being rerun with true macro PCs.
+The corrected SoC `446abae` run now confirms this using true macro-retirement
+PCs: all 127 bounded L1 load-retirement intervals are five cycles, and all
+4095 L2 intervals are sixteen OFF or fifteen ON. Marker totals are 646/128
+for L1 and 65541/4096 OFF versus 61445/4096 ON for L2; the difference from
+steady spacing is fixed marker overhead. Both measured L2 windows have
+4096 ordered, checked pointer requests and zero DDR reads. Exact inputs and
+parser/trace provenance: `/tmp/codex-soc-chase-446abae/retirement-validation-results.json`.
 
 Removing these socket edges is not automatically safe for timing. The FULL
 slices were introduced to break long fabric-to-core paths, including fault
