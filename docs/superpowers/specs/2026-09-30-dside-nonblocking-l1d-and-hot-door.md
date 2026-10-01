@@ -493,7 +493,7 @@ backpressured, so it is not the acceptance timestamp. Direct refill is
 explicitly disabled in `MB_DIRECT_REFILL` and by `FullCoreDut`'s argument in
 the D-side bench.
 
-| NB early response | NB eager AR | 2 KiB chase cycles/hop | 64 KiB chase cycles/hop | Four-chain B/cycle | Four-chain IPC | Whole-run refill MLP | Peak hot AXI requests | Log |
+| NB early response | NB eager AR | 2 KiB chase cycles/hop | 64 KiB chase cycles/hop | Four-chain B/cycle | Four-chain IPC | WAIT_R MLP (active cycles, whole run) | Peak hot AXI requests | Log |
 |---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 0 | 0 | 7.016 | 20.004 | 0.6980 | 0.2621 | 1.912 | 4 | `/tmp/codex-eager-combined-00.log` |
 | 0 | 1 | 7.016 | 18.958 | 0.7270 | 0.2730 | 1.949 | 4 | `/tmp/codex-eager-combined-01.log` |
@@ -505,8 +505,12 @@ Both options together cut the modeled dependent L2 loop by 2.018 cycles/hop
 both-OFF arm. The independent four-chain workload improves from 0.6980 to
 0.7454 B/cycle (+6.8%) while still reaching four simultaneous hot-door IDs;
 the latency gain therefore does not trade away observed miss overlap in this
-case. Four-chain ring occupancy and refill MLP are whole-run counters; B/cycle,
-IPC, and cycles/hop use their measured commit windows. No board IPC or
+case. Four-chain ring occupancy is a whole-run state sample. The listed MLP
+is `mlpSum/mlpCyc`: MSHRs in WAIT_R divided by **only cycles with at least
+one WAIT_R**, accumulated over the whole run including cold warmup. It is
+neither all-cycle occupancy nor the matched commit-window outstanding count;
+peak hot AXI IDs is also a whole-run maximum. B/cycle, IPC, and cycles/hop
+use their measured commit windows. No board IPC or
 post-route area is inferred. The probe-forward/P3 option is absent from this
 matrix and must be measured as a separate matched arm.
 
@@ -1237,10 +1241,11 @@ in 10986 commit-window cycles, or 0.7457 B/cycle. The otherwise identical
 early-response/eager-AR arm without P3 fast admission or probe forwarding
 reported 0.7454 B/cycle. That difference is 0.04%, so the resident-hit
 one-cycle gain does not establish a four-chain bandwidth improvement. The
-integrated run's whole-run active-MSHR-cycle MLP was 1.997, with four hot
+integrated run's whole-run WAIT_R active-cycle MLP was 1.997, with four hot
 outstanding requests maximum and 69 set-conflict allocation failures but no
 full-MSHR failures; those counters have a different denominator from the
-commit-window throughput.
+commit-window throughput. The all-cycle whole-run WAIT_R mean is
+41740/23077 = 1.809; neither number is a warm-only L2 service statistic.
 
 The source sequence behind C0-to-ARVALID is C0 array read, registered S1
 miss, registered `nb.stgValid` with victim metadata, `nb.lAlloc` allocating
