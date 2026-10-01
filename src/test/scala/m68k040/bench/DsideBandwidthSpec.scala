@@ -30,12 +30,15 @@ class DsideBandwidthSpec extends CoreBenchHarness {
     val kernels = all.filter { case (n, _) => want.forall(_.contains(n)) }.map(_._2())
     val seeds = sys.env.get("DSIDE_SEEDS").map(_.split(",").toSeq.map(_.trim.toInt)).getOrElse(Seq(1, 17))
     val lsOoo = sys.env.get("IQ_LOAD_BYPASS").contains("1")
+    val specWake = sys.env.get("DSIDE_SPEC_WAKE").contains("1")
+    val fuseLongMoveLoads = sys.env.get("DSIDE_FUSE_LONG_MOVE_LOADS").contains("1")
 
     val dut = M68kSim().withVerilator.compile(new FullCoreDut(
       alignedLoadFallThrough = true, earlyLsIntWakeup = true,
       earlyStoreAddress = true, trainSlot1Conditional = true,
       deferTakenSlot1Conditional = true, retainRedirectHistory = true,
-      loadBypassUnreadyLoad = lsOoo))
+      loadBypassUnreadyLoad = lsOoo, specLoadWakeup = specWake,
+      fuseLongMoveLoads = fuseLongMoveLoads))
 
     for (k <- kernels; seed <- seeds) {
       // Observe one continuous kernel run. A refill AR while wbIssued is high is
@@ -122,6 +125,9 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               f"B/cyc=$bpc%.4f retired=${r.retiredInstrs} IPC=${r.ipc}%.4f memory=$memLabel " +
               s"nonBlocking=${m68k040.top.ShippingCoreConfig.dcacheNonBlocking} " +
               s"hotDoor=${m68k040.top.ShippingCoreConfig.dcacheHotDoor} lsOoo=$lsOoo " +
+              s"specWake=$specWake fuseLongMoveLoads=$fuseLongMoveLoads " +
+              s"nbEarlyResponse=${m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse} " +
+              s"nbEagerAr=${m68k040.top.ShippingCoreConfig.dcacheNbEagerAr} " +
               f"CPI=${r.windowCycles.toDouble / r.retiredInstrs}%.3f")
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking)
         println(f"DSIDE_CONCURRENCY scope=whole-run kernel=${k.name} seed=$seed " +

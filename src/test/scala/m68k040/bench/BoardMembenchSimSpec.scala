@@ -149,7 +149,7 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
         computeDirectTargets = ShippingCoreConfig.computeDirectTargets,
         deferSlot1Uncond = ShippingCoreConfig.deferSlot1Uncond,
         deferSlot1Dbcc = ShippingCoreConfig.deferSlot1Dbcc))
-      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill lsOoo=$lsOoo fuseLongMoveLoads=$fuseLongMoveLoads p3FastLoad=${ShippingCoreConfig.lsP3FastLoad} earlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} nbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill lsOoo=$lsOoo fuseLongMoveLoads=$fuseLongMoveLoads p3FastLoad=${ShippingCoreConfig.lsP3FastLoad} earlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} nbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} nbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} loadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
               s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets}")
       for ((mem, sizes, kinds) <- plan; sz <- sizes; kd <- kinds) {
         memCfgOverride = mem.map(parseMemSpec)
