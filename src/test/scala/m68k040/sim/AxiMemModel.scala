@@ -203,7 +203,9 @@ case class AxiMemModelConfig(
   deferWriteVisibilityUntilB: Boolean = false,
   /** Test-only AR backpressure hook. Keep ready low while false, to exercise AXI
     * VALID/payload stability across an intervening CPU-side event. */
-  arReadyGate: () => Boolean = () => true
+  arReadyGate: () => Boolean = () => true,
+  /** Test-only AW backpressure hook for a legal held store pipeline. */
+  awReadyGate: () => Boolean = () => true
 )
 
 /** Free-running simulation cycle counter shared by the read and write engines of one
@@ -760,7 +762,7 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
     }
   }
 
-  val awDriver = StreamReadyRandomizer(aw, cd, () => awAcceptable())
+  val awDriver = StreamReadyRandomizer(aw, cd, () => awAcceptable() && cfg.awReadyGate())
   val wDriver  = StreamReadyRandomizer(w,  cd, () => qPending < cfg.bQueueDepth)
 }
 

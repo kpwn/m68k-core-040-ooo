@@ -570,6 +570,42 @@ and input. It also adds the allocated-slot/address choice after older
 or Fmax; sharing/constant pruning depends on synthesis. A board build must
 remain OFF until measured area and timing justify the cycle gain.
 
+The legal-port held-S0 test (`/tmp/codex-nb-preselect-held-s0b.log`) accepts
+an unrelated WT, then a WT to the target line, then the load. Test-only cold
+AW backpressure holds the older write pipeline. At load allocation the target
+WT is in S0 (`allocWithTargetS0=1`); the model observes six AWVALID/!AWREADY
+cycles and no hot AR. After AW release the two WT writes B-ack, the hot refill
+occurs only afterward, and the load returns the target WT's checked data.
+The ordinary WT-before-load test separately covers S1/S2/S3 and delayed-B
+visibility in both eager and preselected configurations. The `awReadyGate`
+test-model hook defaults to true in every other test. The simultaneous dual
+dirty-WB push remains structurally absent from the legal port schedule (§6.3c)
+and is not claimed as covered.
+
+The matched integrated full-core source is agent-67 `bf952978` plus
+`25d80d08`/`d05ddcc0`/`808f0a2f` (preselection) and benchmark config print
+`acfe37f1`. Both arms use NB4, load ring 8, hot door, LS-OoO, fused long-move
+loads, speculative wakeup, P3 fast load, probe-line forwarding, early response,
+eager AR, direct refill OFF, seed 1, and `l2:5:60:4096`. Only
+`CPU_DCACHE_NB_PRESELECT_AR` differs. The memory model's configured L2 hit 5
+corresponds to accepted AR-to-R 6 cycles; the per-cycle `MB_TRACE hotAR` field
+shows ARVALID and can repeat under ARREADY backpressure. The directed timing
+test proves command-to-AR **advertisement** 5/4/3 cycles for legacy/eager/
+preselected selection. All pointer/data oracles passed.
+
+| Preselect | 2 KiB chase cycles/hop | 64 KiB chase cycles/hop | Four-chain B/cycle | Four-chain IPC | Active-cycle MLP | Peak hot IDs | Log |
+|---|---:|---:|---:|---:|---:|---:|---|
+| OFF | 6.023 | 17.986 | 0.7457 | 0.2800 | 1.997 | 4 | `/tmp/codex-nb-preselect-matched-0.log` |
+| ON | 6.023 | 17.002 | 0.7561 | 0.2839 | 2.097 | 4 | `/tmp/codex-nb-preselect-matched-1.log` |
+
+Preselection removes 0.984 modeled cycles per dependent 64 KiB hop (5.47%
+fewer cycles) and improves the checked independent four-chain stream by 1.39%
+in B/cycle. The resident 2 KiB loop is unchanged. Four-chain B/cycle/IPC use
+the commit window; MLP is MSHR WAIT_R occupancy averaged over whole-run cycles
+that have at least one WAIT_R, and peak hot IDs is a whole-run maximum. These
+figures do not establish FPGA area, Fmax, board IPC, or a gain when the bus is
+already at its throughput limit. The option remains default OFF.
+
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
 | today's bug (`dcache-sectored-wedges-silicon`, `lever1-no-write-allocate-is-incorrect`) | this design |

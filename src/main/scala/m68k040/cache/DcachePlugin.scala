@@ -2120,6 +2120,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val s0Valid   = RegInit(False)
     val s0Payload = Reg(DStoreCmd())
     s0Valid.simPublic()
+    s0Payload.paddr.simPublic(); s0Payload.cacheMode.simPublic()
 
     // ---- store-S1: launch the shared sync read (old line + hit-tag) ----
     // Decoded off the REGISTERED S0 payload. The read launches onto the shared
