@@ -1198,6 +1198,91 @@ and no faulting PRF write. The default-OFF `make test-fast` gate passed 403/403
 (2 ignored). Routed timing and a combined root-tree gate remain necessary
 before promoting either default.
 
+## 14.4. Integrated dependent-miss stage budget and next candidate
+
+On the integrated P3-fast/probe-forward/NB-early-response/eager-AR arm, with
+NB4, ring8, hot door, fused long MOVE loads, LS-OoO and speculative load wakeup,
+`IPC_MEM=l2:5:60:4096`, and seed 1, the core-only 2 KiB chase measures
+771/128 = 6.023 cycles/hop. The 64 KiB chase measures 73672/4096 = 17.986
+cycles/hop. Thus this combination improves the resident-hit loop but leaves
+the hot-L2 differential at 11.963 cycles/hop. This model observes six cycles
+from an *accepted hot AXI AR* to its R handshake; it is not a whole-SoC
+miss-discovery or return measurement and is not a routed timing result.
+
+`MB_TRACE=mb-chase-64k MB_TRACE_STEADY=1` on that same arm captured 400
+steady-state cycles. One complete dependent hop is:
+
+| Event | Cycle | Offset from issue |
+| --- | ---: | ---: |
+| LS issue | 83140 | 0 |
+| P1 / P2 / translation wait / P3 fast enqueue | 83141 / 83142 / 83143 / 83144 | 1 / 2 / 3 / 4 |
+| cache command accepted (C0) | 83145 | 5 |
+| cache S1 / NB staged miss and MSHR allocation | 83146 / 83147 | 6 / 7 |
+| hot AR first valid and accepted | 83149 | 9 |
+| hot R accepted | 83155 | 15 |
+| load response and IQ wake | 83156 | 16 |
+| dependent LS issue | 83157 | 17 |
+
+Across the 23 cache commands in the trace, C0 to first hot ARVALID is
+**always four cycles**. ARREADY adds 0, 1, 2, 3, or 4 cycles on 14, 6, 1, 1,
+or 1 of those commands, respectively. Of the 22 completed R events, accepted
+AR to R is exactly six cycles and R to response/wakeup is one. The 21 fully
+bounded issue-to-next-issue intervals are 17 cycles (13), 18 (6), 19 (1),
+and 21 (1). These counts have different denominators because the 400-row
+window cuts through hops at each end. The measurement uses the existing
+`MB_TRACE` table, with no RTL instrumentation or modified simulator.
+
+The matched four-chain run on this integrated arm reports 8192 useful bytes
+in 10986 commit-window cycles, or 0.7457 B/cycle. The otherwise identical
+early-response/eager-AR arm without P3 fast admission or probe forwarding
+reported 0.7454 B/cycle. That difference is 0.04%, so the resident-hit
+one-cycle gain does not establish a four-chain bandwidth improvement. The
+integrated run's whole-run active-MSHR-cycle MLP was 1.997, with four hot
+outstanding requests maximum and 69 set-conflict allocation failures but no
+full-MSHR failures; those counters have a different denominator from the
+commit-window throughput.
+
+The source sequence behind C0-to-ARVALID is C0 array read, registered S1
+miss, registered `nb.stgValid` with victim metadata, `nb.lAlloc` allocating
+WAIT_AR, then registered `arV`. ARREADY is external backpressure and cannot
+be removed by eliminating a source register. The separate preselected-AR
+experiment may remove one source edge; it does not make the 11.963-cycle
+incremental penalty meet the six-cycle goal by itself.
+
+There is a strict model-specific timing floor if no AR precedes C0: a resident
+hit needs one cycle from C0 to the dependent issue, whereas an ideal miss with
+zero C0-to-AR delay, six AR-to-R cycles, and the same one-cycle return would
+need seven. The differential is already six, before any ARREADY backpressure
+or extra response/wakeup stage. Therefore reaching a six-cycle incremental
+penalty at this model setting needs all launch and return overhead removed or
+overlapped; removing just one or two registers cannot suffice.
+
+A possible next **default-OFF, unimplemented** experiment is to reuse a
+*definitive registered early-probe miss* at C0 instead of repeating the S1
+array lookup. The P2 probe's virtual set alone cannot authorize it: the
+physical tag must come from the matching DTLB resolve, and an unresolved,
+faulting, inhibited, split, or multi-hot probe must take today's path. A
+candidate record would need exact token and VA, translated physical line and
+cache mode, one-hot-safe miss qualification, and the selected victim way,
+valid/dirty/tag/128-bit line state with the current S3/S3-D1 store-write
+bypasses. Before MSHR allocation it must recheck same-set writes and
+maintenance after the probe, SQ/older-store ordering, flush/cancel, token
+reuse, same-line MSHR merge, set conflicts, MSHR and WB credits, and the
+inhibited/serial fence. A record from another token or a stale set falls
+back to S1; no AR is sent for an unqualified probe. The present five-slot
+early-probe queue does not store victim lines. Replicating the 128-bit line
+per slot would alone add 640 flops, before tags/identity; a one-entry
+registered candidate could bound area to one 128-bit line plus roughly
+100–120 bits of translated address, token/VA identity, victim tag/way/dirty,
+and control (about 230–250 new flops before synthesis optimization). It would
+also add a victim-way/data mux and exact-token/physical-tag comparisons. The
+single record must admit overlapping probes by falling back when another
+probe overwrites it; that arbitration and any new BRAM-output-to-register
+critical path need proof. An allocation on the C0 edge could plausibly remove
+one miss-staging cycle; an earlier AR requires a separate order/credit proof
+and routed timing measurement. There is no claim that the six-cycle
+incremental target is reachable from this candidate alone.
+
 ## 15. Coordination owed (through the PM)
 
 
