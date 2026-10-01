@@ -350,6 +350,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val nbPreselectAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr,
                    /** Experimental MSHR release after registered stale-read stages drain. */
                    val nbDynamicRelease: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease,
+                   /** Experimental clean-victim miss metadata from the queued VIPT probe. */
+                   val nbProbeMissStage: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbProbeMissStage,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -369,6 +371,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
   require(!nbEagerAr || nonBlocking, "DcachePlugin: nbEagerAr requires nonBlocking")
   require(!nbPreselectAr || nbEagerAr, "DcachePlugin: nbPreselectAr requires nbEagerAr")
   require(!nbDynamicRelease || nonBlocking, "DcachePlugin: nbDynamicRelease requires nonBlocking")
+  require(!nbProbeMissStage || (nonBlocking && !sectored),
+    "DcachePlugin: nbProbeMissStage requires unsectored nonBlocking")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
@@ -767,6 +771,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // the ordinary S1 read, which is always correct.  There is no path from a
     // mismatch to wrong data.
     val earlyProbeTags    = Vec.fill(earlyProbeDepth)(Reg(UInt(tagBits bits)))
+    // A clean-victim probe miss needs only this narrow snapshot. Its existing
+    // token+VA, physical tag and sticky set-write bit live in the same queue slot.
+    // Dirty victims keep the ordinary S1 read so no 128-bit victim line is copied.
+    val earlyProbeMissWay = if (nbProbeMissStage) Vec.fill(earlyProbeDepth)(Reg(UInt(wayBits bits))) else null
+    val earlyProbeMissClean = if (nbProbeMissStage) Vec.fill(earlyProbeDepth)(RegInit(False)) else null
+    val earlyProbeMissResolved = if (nbProbeMissStage) Vec.fill(earlyProbeDepth)(RegInit(False)) else null
+    val earlyProbeMissMultiHot = if (nbProbeMissStage) Vec.fill(earlyProbeDepth)(RegInit(False)) else null
 
     // Read metadata: valid in the cycle the synchronous BRAM output belongs to the
     // probe. Line metadata: one extra register cut keeps BRAM->way-select separate
@@ -793,6 +804,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // (which is presented at the ORIGINAL crossing offset/size and consumes only the
     // raw line). See `DLoadCmd.lineOnly`.
     val probeLineNeedsLine = RegInit(False)
+    val probeLineMissWay = if (nbProbeMissStage) Reg(UInt(wayBits bits)) else null
+    val probeLineMissClean = if (nbProbeMissStage) RegInit(False) else null
+    val probeLineMissResolved = if (nbProbeMissStage) RegInit(False) else null
+    val probeLineMissMultiHot = if (nbProbeMissStage) RegInit(False) else null
 
     val earlyProbeValid = earlyProbeValids.asBits.orR
     val earlyProbeFresh = (earlyProbeValids.asBits & earlyProbeReadies.asBits).orR
@@ -962,6 +977,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     /** An MSHR array write (install or victim invalidate) this cycle, for probe staleness. */
     val nbArrayWrite: Bool    = if (!nonBlocking) null else Bool()
     val nbArrayWriteSet: UInt = if (!nonBlocking) null else UInt(setBits bits)
+    /** MSHR allocation advances this set's victim pointer on this edge. */
+    val nbVictimAdvanceForCmd: Bool = if (!nonBlocking) null else Bool()
     /** Registered-input hold on store S1 -> S2 (set/victim/resource interlocks). */
     val nbStoreHold: Bool     = if (!nonBlocking) null else Bool()
     /** Load command admission term (reorder rule + replay/serial holds). */
@@ -1351,6 +1368,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
     probeLineValid := probeReadValid
     when(probeReadValid) {
       probeLineSlot := probeReadSlot
+      if (nbProbeMissStage) {
+        val vw = victim(probeReadSet)
+        probeLineMissWay := vw
+        probeLineMissClean := !(rdValid(vw) && rdDirty(vw))
+        probeLineMissResolved := Mux(probeResolveMatchesRead,
+          probeUsableIfResolved, probeReadUsable)
+        probeLineMissMultiHot := OneHotSafe.multiHot(probeReadHitVec)
+      }
       // MULTI-HOT FAIL-SAFE (2026-09-17): `MuxOH` below returns the bitwise OR of
       // two lines on a 2-hot select, so a multi-hot probe is recorded as a MISS and
       // the request falls back to the ordinary S1 read path -- exactly what an
@@ -1415,6 +1440,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
       earlyProbeReadies(probeLineSlot) := True
       earlyProbeHits(probeLineSlot)    := probeLineHit
       earlyProbeTags(probeLineSlot)    := probeLineTag   // backlog item 7
+      if (nbProbeMissStage) {
+        earlyProbeMissWay(probeLineSlot) := probeLineMissWay
+        earlyProbeMissClean(probeLineSlot) := probeLineMissClean
+        earlyProbeMissResolved(probeLineSlot) := probeLineMissResolved
+        earlyProbeMissMultiHot(probeLineSlot) := probeLineMissMultiHot
+      }
       earlyProbeData(probeLineSlot)    := DcacheByteLane.extract(
         probeLineLine, probeLineOff, probeLineSize, !probeLineNeedsLine)
     }
@@ -2445,6 +2476,38 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * would be a genuine deadlock. Driven by the `maint` Area's own `walking`. */
     val maintWalking = Bool(); maintWalking := False
 
+    // Queue-qualified clean probe miss: reuse the existing registered load
+    // staging payload on the command edge. The miss metadata is narrow; every
+    // dirty/uncertain/store-conflicting case still launches the ordinary S1 read.
+    // This candidate feeds no command-ready or CPU response path.
+    val nbProbeFastCandidate: Bool = if (nbProbeMissStage) {
+      val missVec = Vec((0 until earlyProbeDepth).map(i =>
+        earlyProbeMatchVec(i) && !earlyProbeHits(i) && earlyProbeTagOkVec(i) &&
+        !earlyProbeStale(i) && !earlyProbeSetWriteVec(i) &&
+        earlyProbeMissResolved(i) && !earlyProbeMissMultiHot(i) &&
+        earlyProbeMissClean(i) &&
+        (earlyProbeMissWay(i) === victim(cmdSet))))
+      val sameSetStore = (storePort.valid &&
+        storePort.payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
+        (s0Valid &&
+        s0Payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
+        (stS1Valid && stS1Set === cmdSet) ||
+        (stS2Valid && stS2Set === cmdSet) ||
+        (stS3Valid && stS3Set === cmdSet) ||
+        (stS3WriteD1 && stS3WriteSetD1 === cmdSet) ||
+        (pendingStoreMiss && pendingStorePaddr(offBits + setBits - 1 downto offBits) === cmdSet)
+      val candidate = missVec.asBits.orR && !ldS1Valid && !sameSetStore &&
+        !nbVictimAdvanceForCmd &&
+        !resetSweepBusy && !maintBusyReg && !maintWalking &&
+        !loadProbeCancelPort.valid &&
+        (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
+        loadCmdPort.payload.ooOk && !loadCmdPort.payload.lineOnly
+      candidate.simPublic()
+      candidate
+    } else False
+    val nbProbeFastFire = Bool(); nbProbeFastFire := False
+    nbProbeFastFire.simPublic()
+
     // ---- LOAD FSM (OVERRIDES the shared read port with PRIORITY over the store) ----
     val fsm = new StateMachine {
       val IDLE     = new State with EntryPoint
@@ -2929,6 +2992,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS2Line       := B(0, 128 bits)
           ldS2Off        := cmdOff
           ldS2Size       := loadCmdPort.payload.size
+        } elsewhen(loadCmdPort.fire && nbProbeFastCandidate) {
+          // The queued miss already read this set, checked the resolved physical
+          // tag, and certified a clean victim. Stage it without a second BRAM read.
+          nbProbeFastFire := True
         } elsewhen(loadCmdPort.fire) {
           // Launch the BRAM tag+data read for this set; resolve hit/miss in S1.
           rdSet        := cmdSet
@@ -5759,6 +5826,23 @@ class DcachePlugin(val socketMerged: Boolean = false,
                                (s1VFromS3D1 && stS3WriteCopybackD1)))
       val stgVTag  = RegNext(Mux(s1VFromS3, stS3Tag, Mux(s1VFromS3D1, stS3WriteTagD1, rdTag(s1Vw))))
       val stgVLine = RegNext(Mux(s1VFromS3, stS3MergedLine, Mux(s1VFromS3D1, stS3WriteLineD1, rdData(s1Vw))))
+      if (nbProbeMissStage) when(nbProbeFastFire) {
+        stgValid := True
+        stgPaddr := cmdPaddr
+        stgSet := cmdSet
+        stgOff := cmdOff
+        stgSize := loadCmdPort.payload.size
+        stgTok := loadCmdPort.payload.token
+        stgRid := loadCmdPort.payload.rid
+        stgRidV := loadCmdPort.payload.ridValid
+        stgLineOnly := False
+        stgCmode := loadCmdPort.payload.cacheMode
+        stgMultiHot := False
+        stgVWay := earlyProbeMissWay(earlyProbeMatchIdx)
+        stgVDirty := False
+        // stgVTag/stgVLine need no new wide mux: lWbPush is impossible when the
+        // certified victim is clean, so their default registered values are unused.
+      }
 
       // ── Writeback buffer (§6.2): FIFO, up to 2 pushes per cycle, drains on `axi` ────
       val WBD = 4
@@ -5801,6 +5885,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val lAlloc  = stgValid && !stgMultiHot && !lCamAny && !lSetBusy && lFreeOk && lWbOk &&
                     !resetSweepBusy && !maintWalking
       lAlloc.simPublic() // simulation-only MB_TRACE C0→allocation timestamp
+      nbVictimAdvanceForCmd := (sAlloc && sSet === cmdSet) ||
+        (lAlloc && stgSet === cmdSet)
       val lFail   = stgValid && !lSecondary && !lAlloc
       val lOH     = OHMasking.first(freeAfterS) & B(N bits, default -> lAlloc)
       val lWbPush = lAlloc && stgVDirty
@@ -6330,6 +6416,49 @@ class DcachePlugin(val socketMerged: Boolean = false,
           }
           val cycles        = c("cycles", True)
           val primaryAllocs = c("primaryAllocs", lAlloc)
+          val probeMissStages = c("probeMissStages", nbProbeFastFire)
+          if (nbProbeMissStage) {
+            // First-failing-term audit at ACCEPTED commands. These counters
+            // exist only in simulation and add no state to the synthesized core.
+            val q0 = loadCmdPort.fire && earlyProbeMatchVec.asBits.orR &&
+              !earlyProbeHits(earlyProbeMatchIdx)
+            val q1 = q0 && earlyProbeTagOkVec(earlyProbeMatchIdx)
+            val q2 = q1 && earlyProbeMissResolved(earlyProbeMatchIdx)
+            val q3 = q2 && !earlyProbeStale(earlyProbeMatchIdx) &&
+              !earlyProbeSetWriteVec(earlyProbeMatchIdx)
+            val q4 = q3 && !earlyProbeMissMultiHot(earlyProbeMatchIdx) &&
+              earlyProbeMissClean(earlyProbeMatchIdx)
+            val q5 = q4 && earlyProbeMissWay(earlyProbeMatchIdx) === victim(cmdSet)
+            c("probeQ0MatchedMiss", q0)
+            c("probeRawTag", q0 && earlyProbeTagOkVec(earlyProbeMatchIdx))
+            c("probeRawResolved", q0 && earlyProbeMissResolved(earlyProbeMatchIdx))
+            c("probeQ1Tag", q1)
+            c("probeQ2Resolved", q2)
+            c("probeQ3Fresh", q3)
+            c("probeQ4Clean", q4)
+            c("probeQ5Victim", q5)
+            c("probeBlockS1", q5 && ldS1Valid)
+            c("probeBlockS1Miss", q5 && ldS1Valid && !ldS1Hit)
+            c("probeBlockAdvance", q5 && nbVictimAdvanceForCmd)
+            c("probeBlockCancelAny", q5 && loadProbeCancelPort.valid)
+            c("probeBlockCancelOwn", q5 && loadProbeCancelPort.valid &&
+              (loadProbeCancelPort.payload.all ||
+                loadProbeCancelPort.payload.token === loadCmdPort.payload.token))
+            c("probeBlockMode", q5 &&
+              (loadCmdPort.payload.cacheMode === CacheMode.INHIBITED))
+            c("probeBlockOo", q5 && !loadCmdPort.payload.ooOk)
+            c("probeBlockLineOnly", q5 && loadCmdPort.payload.lineOnly)
+            c("probeBlockStore", q5 && ((storePort.valid &&
+              storePort.payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
+              (s0Valid && s0Payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
+              (stS1Valid && stS1Set === cmdSet) ||
+              (stS2Valid && stS2Set === cmdSet) ||
+              (stS3Valid && stS3Set === cmdSet) ||
+              (stS3WriteD1 && stS3WriteSetD1 === cmdSet) ||
+              (pendingStoreMiss &&
+                pendingStorePaddr(offBits + setBits - 1 downto offBits) === cmdSet)))
+            c("probeQ6Candidate", loadCmdPort.fire && nbProbeFastCandidate)
+          }
           val storeAllocs   = c("storeAllocs", sAlloc)
           val noFillAllocs  = c("noFillAllocs", sAlloc && sNoFill)
           val loadSecondaries = c("loadSecondaries", lSecondary)

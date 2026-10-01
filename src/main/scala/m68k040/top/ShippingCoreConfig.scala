@@ -522,6 +522,11 @@ object ShippingCoreConfig {
   val dcacheNbDynamicRelease: Boolean = envFlag("CPU_DCACHE_NB_DYNAMIC_RELEASE", false)
   require(!dcacheNbDynamicRelease || dcacheNonBlocking,
     "CPU_DCACHE_NB_DYNAMIC_RELEASE=1 requires CPU_DCACHE_NONBLOCKING=1")
+  /** Experimental reuse of a resolved, clean-victim VIPT probe miss in the existing
+    * MSHR allocation stage. Dirty or stale probes use the ordinary S1 path. */
+  val dcacheNbProbeMissStage: Boolean = envFlag("CPU_DCACHE_NB_PROBE_MISS_STAGE", false)
+  require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
+    "CPU_DCACHE_NB_PROBE_MISS_STAGE=1 requires unsectored non-blocking D-cache")
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
