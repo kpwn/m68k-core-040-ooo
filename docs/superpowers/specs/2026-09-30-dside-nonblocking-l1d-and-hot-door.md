@@ -1714,3 +1714,44 @@ stay unchanged. This repairs the test fixture only; combined cache validation
 and the performance matrix remain pending on the repaired source. Logs and
 thread dumps: `/tmp/codex-agent59-combined-all-options-cache.log`,
 `/tmp/codex-agent59-combined-cache-threads{,-confirm}.txt`.
+
+### Integrated latency composition and Dn acceptance (2026-10-02)
+
+The repaired integrated source `97b0ba49` passed default `test-fast` 404/404,
+combined LS CrossSpec 11/11 plus older-store forwarding 2/2, and the complete
+nonblocking-cache suite 19/19 with four randomized seeds of 1000 operations
+per stress arm. The default-argument elaboration deadlock described above is
+resolved. Results: `/tmp/codex-agent59-combined-r2-results.json`.
+
+A same-source seed-17 four-way comparison uses `l2:5:60:4096`, fused MOVEA,
+speculative wakeup, P3/probe forwarding, NB4/ring8/hot door/D4,
+early/eager/preselected AR, dynamic release, and direct refill OFF:
+
+| P1 early launch | Probe-miss staging | L1 2 KiB cycles / 128 hops | L2 64 KiB cycles / 4096 hops |
+| --- | --- | --- | --- |
+| OFF | OFF | 771 / 6.023 | 69530 / 16.975 |
+| ON | OFF | 644 / 5.031 | 65562 / 16.006 |
+| OFF | ON | 771 / 6.023 | 65562 / 16.006 |
+| ON | ON | 644 / 5.031 | 61598 / 15.039 |
+
+Each row passed architectural final-pointer checking. Both probe-miss ON arms
+record 5120 whole-run primary allocations and 5120 fast miss stages with
+5120 resolved certificates and no older-S1 blocking in this dependent chain.
+Thus the one-cycle frontend and one-cycle miss-stage savings compose on this
+workload. The combined L2-over-L1 difference remains about **10.008 cycles**;
+the six-cycle incremental target is not achieved. These results use the
+behavioral memory model, not the actual SoC L2, and are not mapped timing,
+area, independent-load IPC, or board evidence. Exact flags and logs:
+`/tmp/codex-agent59-combined-r2-matrix-results.json`.
+
+The separate Dn extension was integrated at `16bde59c`, preserving that cache
+RTL and adding only the previously validated register-destination broadening.
+Default fast passed 404/404; combined CrossSpec 12/12 and forwarding 2/2 passed.
+Shipping-fused full-core stress, inhibited-store IRQ replay, and inhibited
+ordering passed 3/3 with both optimizations enabled. Stress seeds 15/16/17
+record 42/22/34 accepted P1 pairs (IRQ seeds 15 and 17 require nonzero),
+5830 commits, 1850 exception entries, and 22 replays, with exact device counts
+and zero failures. These establish combined correctness, not Dn performance
+under the new miss-stage configuration. Results:
+`/tmp/codex-agent68-dn-integrated-results.json` and
+`/tmp/codex-agent68-dn-integrated-core-results.json`.
