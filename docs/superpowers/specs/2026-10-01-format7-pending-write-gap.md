@@ -93,3 +93,31 @@ matched IPC plus raw state cost; routed area/timing remains a separate gate.
 This work is not closed by a correct frame length, a matching vector alone, or
 passing an adjusted version of the old handler. The complete frame/retirement/RTE
 contract and fault-injection evidence are required.
+
+
+## Split-store FA correction checkpoint (2026-10-01)
+
+A separate, unambiguous part of the frame contract is now corrected on branch
+`design/format7-restart`: spec amendment `50549e1b`, RTL and fault oracle
+`2a5df8c1`, and retirement-witness fixture correction `9deaee35`. Ordinary
+precise SQ errors now retain the original transfer's first-byte logical VA on
+both halves, per M68040 UM §8.4.6.4. The directed case crosses a logical page
+boundary and maps its halves to noncontiguous physical pages; A succeeds and B
+faults, with original VA, owner, size, write/supervisor/ATC attributes and terminal
+completion checked. No new state or interfaces were added; a phase-select mux
+was removed. Mapped area and timing have not been measured.
+
+Frozen source `9deaee35` passed seven P2.4 store-queue tests, three randomized
+payload-ownership tests, and the required default `test-fast` (404 passed).
+Logs: `/tmp/codex-split-fa-v2-focused.log`,
+`/tmp/codex-split-fa-v2-fast.log`; manifest
+`/tmp/codex-split-fa-v2-results.json`.
+The first broader focused run exposed a stale IRQ fixture expecting release
+one cycle after B. The current launch-to-retirement protection deliberately
+lasts until the owning ROB head advances; the revised fixture verifies four
+held-head cycles and immediate release on head advance, preserving that RTL.
+The original failed run is retained in `/tmp/codex-split-fa-focused.log`.
+
+This fixes FA only. Missing WB1 contents, pending architectural effects and
+ordinary/special instruction continuation remain open. Combined integration
+validation is separate from the branch-local evidence above.
