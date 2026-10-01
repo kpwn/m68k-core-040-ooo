@@ -499,6 +499,11 @@ object ShippingCoreConfig {
   /** Store-allocated MSHRs hold their AR this many cycles so trailing stores can
     * complete the 16 strobes and cancel the fill (write-path agent's hook). 0 = off. */
   val dcacheStoreAllocArDelay: Int = envInt("CPU_DCACHE_STORE_AR_DELAY", 0, 0, 15)
+  /** Experimental one-cycle earlier non-blocking AR selection after allocation.
+    * Keeps current WB/WT address gates and registered AXI AR output; OFF by default. */
+  val dcacheNbEagerAr: Boolean = envFlag("CPU_DCACHE_NB_EAGER_AR", false)
+  require(!dcacheNbEagerAr || dcacheNonBlocking,
+    "CPU_DCACHE_NB_EAGER_AR=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")

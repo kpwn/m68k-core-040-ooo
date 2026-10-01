@@ -993,9 +993,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxDcOutstanding  = 0
       var lsBypassFires     = 0
       var lsReplays         = 0
-      // Both ports are constants (no simulator signal) in a build without lsOooIssue.
-      val lsOooPorts = try { dut.lsEu.replayRequestPort.valid.toBoolean; true }
-                       catch { case _: Throwable => false }
+      // Replay valid is a pruned constant in a build without lsOooIssue. Query
+      // the constructor mode instead of provoking a simulator signal-access error.
+      val lsOooPorts = dut.lsEu.lsOooIssue
       var lsOrderViols      = 0
       val bypLiveCount      = Array.fill(16)(0)
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
@@ -1579,8 +1579,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         //   C1  ldS1Valid tag compare + way select; H1 is its hit bit
         //   C2  ldS2Valid byte-lane extract
         //   RSP loadRsp   data returned to the LS EU
-        //   MI/RF/AR/R/WR/RP miss discovery, refill, AXI request/response,
-        //                    array write, replay
+        //   MI/RF/AR/R/WR/RP: legacy miss discovery, refill, AXI, write, replay;
+        //                    NB staged miss, MSHR allocation, active AXI door,
+        //                    install write, replay-queue occupancy
         //   CMP compValid registered completion
         //   WK  IQ load wakeup; WB wbObs / registered writeback
         if (traceOn && traceLines.size < 400 &&
@@ -1588,8 +1589,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           def b(x: Boolean) = if (x) "#" else "."
           val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
                         dut.dcache.logic.loadCmdPort.ready.toBoolean
-          val ar = dut.dcache.logic.axi.ar
-          val r = dut.dcache.logic.axi.r
+          val dc = dut.dcache.logic
+          val nb = dut.dcache.nonBlocking
+          val ar = if (dut.dcache.hotDoor) dc.axiDh.ar else dc.axi.ar
+          val r = if (dut.dcache.hotDoor) dc.axiDh.r else dc.axi.r
           val readyLoads = dut.iq.logic.slots.filter(s => s.sel.toBoolean && s.ready.toBoolean &&
             s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD).map(_.hot.robId.toInt)
           val issueRob = if (dut.lsEu.issuePort.valid.toBoolean &&
@@ -1607,15 +1610,24 @@ trait CoreBenchHarness extends AnyFunSuite {
             b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS1Hit.toBoolean),
             b(dut.dcache.logic.ldS2Valid.toBoolean),
             b(dut.dcache.logic.loadRspPort.valid.toBoolean),
-            b(dut.dcache.logic.loadMissDiscovered.toBoolean),
-            b(dut.dcache.logic.dbgFsmRefill.toBoolean),
+            b(if (nb) dc.nb.stgValid.toBoolean else dc.loadMissDiscovered.toBoolean),
+            b(if (nb) dc.nb.lAlloc.toBoolean else dc.dbgFsmRefill.toBoolean),
             b(ar.valid.toBoolean && ar.ready.toBoolean), b(r.valid.toBoolean && r.ready.toBoolean),
-            b(dut.dcache.logic.wrEn.exists(_.toBoolean)), b(dut.dcache.logic.dbgFsmReplay.toBoolean),
+            b(dc.wrEn.exists(_.toBoolean)),
+            b(if (nb) dc.nb.rqCount.toInt > 0 else dc.dbgFsmReplay.toBoolean),
             b(dut.lsEu.logic.compValid.toBoolean),
             b(dut.iq.lsWakeupPort.valid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
           ).mkString(" ")
           val addr = if (cmdFire) f"0x${dut.dcache.logic.loadCmdPort.payload.paddr.toLong}%08x" else "-"
-          traceLines += f"$telemCycle%5d  $line  ready=${readyLoads.mkString(",")} issue=$issueRob wb=$wbRob cmd=$addr commits=$macrosThisCycle"
+          val nbDetail = if (!nb) "" else {
+            val alloc = if (dc.nb.lAlloc.toBoolean)
+              f"0x${dc.nb.lLine.toLong << 4}%08x" else "-"
+            val arDetail = if (ar.valid.toBoolean)
+              f"0x${ar.payload.addr.toLong}%08x/id${ar.payload.id.toInt}" else "-"
+            val rDetail = if (r.valid.toBoolean) s"id${r.payload.id.toInt}" else "-"
+            s" alloc=$alloc hotAR=$arDetail hotR=$rDetail"
+          }
+          traceLines += f"$telemCycle%5d  $line  ready=${readyLoads.mkString(",")} issue=$issueRob wb=$wbRob cmd=$addr commits=$macrosThisCycle$nbDetail"
         }
         if (dut.lsEu.logic.sq.io.fwd.rsp.hit.toBoolean) sqFwdHitCycles += 1
         if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
@@ -2138,7 +2150,10 @@ trait CoreBenchHarness extends AnyFunSuite {
         stallBudget)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
-        println("cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
+        println(if (dut.dcache.nonBlocking)
+          "cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS SM AL AR  R WR RQ CM WK WB  ready-robs issue-rob wb-rob cmd-address commits alloc hotAR hotR  (# = active)"
+        else
+          "cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
         traceLines.foreach(println)
         println(s"=== end trace (${traceLines.size} cycles) ===")
       }

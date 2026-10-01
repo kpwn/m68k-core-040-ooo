@@ -344,6 +344,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** Refills leave on the read-only hot door `axiDh` instead of `axi`. */
                    val hotDoor: Boolean = m68k040.top.ShippingCoreConfig.dcacheHotDoor,
                    val storeAllocArDelay: Int = m68k040.top.ShippingCoreConfig.dcacheStoreAllocArDelay,
+                   /** Experimental earlier selection from a newly allocated WAIT_AR entry. */
+                   val nbEagerAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEagerAr,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -359,6 +361,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     "fullLineNoFill is native to nonBlocking; do not enable the legacy hook")
   require(!hotDoor || nonBlocking, "DcachePlugin: hotDoor requires nonBlocking")
   require(!nbEarlyResponse || nonBlocking, "DcachePlugin: nbEarlyResponse requires nonBlocking")
+  require(!nbEagerAr || nonBlocking, "DcachePlugin: nbEagerAr requires nonBlocking")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
@@ -5702,10 +5705,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val sOH    = OHMasking.first(freeBits) & B(N bits, default -> sAlloc)
       val sNoFill = pendingMergeStrb.andR
       val sWbPush = sAlloc && pendingVictimDirty
+      sWbPush.simPublic()
       val s2CbRes = (stS2Valid && stS2Copyback).asUInt.resize(3)
 
       // ── Load staging decision (§4.1), store first ───────────────────────────────────
       val lLine = lineOfPa(stgPaddr)
+      lLine.simPublic() // simulation-only trace address for accepted MSHR allocation
       val lCam  = Vec((0 until N).map(k => validVec(k) && line(k) === lLine))
       val lCamAny = lCam.asBits.orR
       val lSetBusy = (0 until N).map(k => validVec(k) && eset(k) === stgSet).reduce(_ || _) ||
@@ -5717,9 +5722,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val lSecondary = stgValid && !stgMultiHot && lCamAny
       val lAlloc  = stgValid && !stgMultiHot && !lCamAny && !lSetBusy && lFreeOk && lWbOk &&
                     !resetSweepBusy && !maintWalking
+      lAlloc.simPublic() // simulation-only MB_TRACE C0→allocation timestamp
       val lFail   = stgValid && !lSecondary && !lAlloc
       val lOH     = OHMasking.first(freeAfterS) & B(N bits, default -> lAlloc)
       val lWbPush = lAlloc && stgVDirty
+      lWbPush.simPublic()
       val lSlot   = Mux(stgRidV, stgRid.resize(log2Up(NW)), U(SER, log2Up(NW) bits))
       val lTarget = Mux(lSecondary, OHToUInt(lCam.asBits), OHToUInt(lOH))
       val lAddW   = lSecondary || lAlloc
@@ -5957,7 +5964,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // below keeps a newer same-line WT write behind that advertised AR.
       val arIssue = arV
       arV.simPublic(); arIdx.simPublic()
-      val arDelayOk: Vec[Bool] = Vec((0 until N).map(_ => True))
+      val arDelayOk: Vec[Bool] = if (storeAllocArDelay > 0) Vec.fill(N)(Bool())
+                                 else Vec((0 until N).map(_ => True))
       if (storeAllocArDelay > 0) {
         val arWait = Vec.fill(N)(Reg(UInt(4 bits)) init 0)
         for (k <- 0 until N) {
@@ -5968,8 +5976,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
           when(st(k) === ST(WAIT_AR) && byStore(k) && mstrb(k).andR && !arDelayOk(k)) { st(k) := ST(FILLED) }
         }
       }
-      val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) &&
-        !blocked(k) && !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && arDelayOk(k)))
+      val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) &&
+        (if (nbEagerAr) True else settled(k) && !blocked(k)) &&
+        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && arDelayOk(k)))
       val arFire = Bool()
       when(arFire) { for (k <- 0 until N) when(arIdx === U(k, idxW bits)) { st(k) := ST(WAIT_R) } }
       when(!arV || arFire) {
@@ -6224,11 +6233,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val failWb        = c("failWb", lFail && !stgMultiHot && !lSetBusy && lFreeOk && !lWbOk)
           val replays       = c("replays", nbShadowLoad)
           val serialWait    = c("serialWait", loadCmdPort.valid && !nbCmdReady)
-          val wbGate        = c("wbGate", (0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) && blocked(k)).reduce(_ || _))
+          val wbGate        = c("wbGate", (0 until N).map(k => st(k) === ST(WAIT_AR) &&
+            (if (nbEagerAr) arDelayOk(k) && (coldWriteTo(line(k)) || wtPipeTo(line(k)))
+             else settled(k) && blocked(k))).reduce(_ || _))
           val installHold   = c("installHold", (0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !instCand(k)).reduce(_ || _))
           val storeHold     = c("storeHold", stS1Valid && nbStoreHold)
           val hotAr         = c("hotAr", arFire)
           val wbPushes      = c("wbPushes", sWbPush || lWbPush)
+          val dualWbPush    = c("dualWbPush", sWbPush && lWbPush)
           val wbFull        = c("wbFull", wbCount === WBD)
           val respHold      = c("respHold", rV && !nbRespFire)
           val busyCycles    = c("busyCycles", validVec.asBits.orR)
