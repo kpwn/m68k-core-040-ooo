@@ -21,9 +21,9 @@ import spinal.core._
   *   0x82  WALK_DTLB  the DTLB table walker's descriptor reads
   */
 /** Width of `DLoadCmd.rid`/`DLoadRsp.rid`, the requester-side slot identity. Sized for
-  * the LS EU's aligned-load ring (4 entries); `LsEuPlugin` requires the two agree. */
+  * the configured LS EU aligned-load ring; `LsEuPlugin` requires the two agree. */
 object DLoadRid {
-  val Width = 2
+  val Width = log2Up(m68k040.top.ShippingCoreConfig.lsLoadRingDepth)
 }
 
 object DLoadToken {
@@ -273,8 +273,23 @@ case class CacheMaintCmd() extends Bundle {
   val addr       = UInt(32 bits)
 }
 
+/** COUNTED, IN-ORDER store completion (non-blocking L1D design note §7.1; agreed with the
+  * write-path agent). `count` descriptors -- one per ACCEPTED `store` handshake, never per
+  * SQ entry -- completed THIS cycle, and they are always the `count` OLDEST outstanding
+  * descriptors in acceptance order. `err(0)` belongs to the OLDER completion: if an AXI B
+  * (writethrough / inhibited) and a local S3/allocation ack ever land together, the B is
+  * the older and is `err(0)`. Today `count <= 1` always (asserted), which also implies a
+  * count-2 cycle can never span a client (SQ / exception unit / walker) boundary. */
+case class DStoreAck() extends Bundle {
+  val count = UInt(2 bits)
+  val err   = Bits(2 bits)
+}
+
 /** D-cache service contract (spec 4.2). */
 trait DcacheService {
+  /** Counted completion (`DStoreAck`). Elaborated by `DcachePlugin` only with
+    * `nonBlocking`; null otherwise (the untagged `storeAck` pulse stays as `count =/= 0`). */
+  def storeCompletion: DStoreAck = null
   def loadProbe: spinal.lib.Stream[DLoadProbe]       // virtual-set read, before translation
   def loadProbeResolve: spinal.lib.Flow[DLoadProbeResolve] // matching registered PA/tag
   def loadProbeCancel: spinal.lib.Flow[DLoadProbeCancel]

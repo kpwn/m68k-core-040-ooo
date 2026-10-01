@@ -125,6 +125,8 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       lsOooIssue = SocketTopConfig.LS_OOO_ISSUE)
     val divEu = new m68k040.execute.DivEuPlugin
     val icache = ShippingPlugins.icache(icachePredecodeWords)
+    // Bound to a val (non-blocking L1D, P6) so the hot door `axiDh` can be reached below.
+    val dcache = ShippingPlugins.dcache(socketMerged = true)
     val merge  = new AxiDMergePlugin()
     val iplAck = new IplAckPlugin(enable = true)
     val periph = new PeripheralResetPlugin(enable = true,
@@ -143,7 +145,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       // Early virtual-set reads ARE enabled: the DTLB response qualifies them
       // through loadProbeResolve. Only pretranslated hints at probe launch are
       // disabled; the LSU has no physical address at that point.
-      ShippingPlugins.dcache(socketMerged = true),
+      dcache,
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
       ShippingPlugins.ras(),
@@ -210,6 +212,13 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   axi_i.setName("axi_i")
   val axi_d = master(SocketAxiD(dataWidth = 128, idWidth = m68k040.cache.AxiIds.ID_W))
   axi_d.setName("axi_d")
+  /** P6 HOT DOOR (`CPU_AXI_DH=1` only): read-only, 128-bit, 2-bit ID = the D-cache MSHR
+    * index. The SoC binds it to `dha_ar*`/`dha_r*` behind `L2C_DH_PORT` (cpu_socket.vh on
+    * `feat/p6-dside-hot-door`). Absent -- not tied off -- when the flag is off, so the OFF
+    * netlist and its port list are unchanged. */
+  val axi_dh = if (!ShippingCoreConfig.dcacheHotDoor) null
+               else master(SocketAxiI(dataWidth = 128, idWidth = 2))
+  if (axi_dh != null) axi_dh.setName("axi_dh")
   val cpu_ipl = in UInt (3 bits)
   val ipl_ack = out Bool ()
   val cpu_peripheral_reset = out Bool ()
@@ -351,6 +360,35 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     }
     val absorbI = axiAbsorb.i.io.absorbing
     val absorbD = axiAbsorb.d.io.absorbing
+    // Hot door: its own absorber in `axiPorCd`, its own FULL register slice, and the same
+    // wiring shape as `axi_i` (r.data permuted exactly once, here).
+    if (axi_dh != null) {
+      val dhAbsorb = axiPorCd on new Area {
+        val a = new AxiReadResetAbsorber()
+        a.setName("axi_dh_reset_absorber")
+        a.io.rstObserved := rst
+        a.io.arFire      := axi_dh.arvalid && axi_dh.arready
+        a.io.rLastFire   := axi_dh.rvalid && axi_dh.rready && axi_dh.rlast
+      }
+      val absorbDh = dhAbsorb.a.io.absorbing
+      val dhSlice = coreCd on new Area {
+        val dh = socket.dcache.logic.axiDh.pipelined(ar = StreamPipe.FULL, r = StreamPipe.FULL)
+      }
+      val dh = dhSlice.dh
+      axi_dh.arid    := dh.ar.payload.id
+      axi_dh.araddr  := dh.ar.payload.addr
+      axi_dh.arlen   := dh.ar.payload.len
+      axi_dh.arsize  := dh.ar.payload.size
+      axi_dh.arburst := dh.ar.payload.burst
+      axi_dh.arvalid := dh.ar.valid && !absorbDh
+      dh.ar.ready    := axi_dh.arready && !absorbDh
+      dh.r.valid          := axi_dh.rvalid && !absorbDh
+      dh.r.payload.id     := axi_dh.rid
+      dh.r.payload.data   := SocketByteOrder.permuteData(axi_dh.rdata)
+      dh.r.payload.resp   := axi_dh.rresp
+      dh.r.payload.last   := axi_dh.rlast
+      axi_dh.rready  := dh.r.ready || absorbDh
+    }
 
     // ── AXI boundary register slice (2026-09-02, follow-up session) ──────────────────
     // Full-duplex register stage (`StreamPipe.FULL` = `s2mPipe().m2sPipe()`, SpinalHDL's
@@ -683,10 +721,19 @@ object GenSocketTopVerilog {
             // own log -- the same gap that cost the withdrawn `rasBranchRepair` number.
             s"storeQueueDepth=${ShippingCoreConfig.storeQueueDepth} " +
             s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge} " +
+            s"sqCoalesceLines=${ShippingCoreConfig.sqCoalesceLines} " +
+            s"sqCoalesceHold=${ShippingCoreConfig.sqCoalesceHold} " +
+            s"dcacheFullLineNoFill=${ShippingCoreConfig.dcacheFullLineNoFill} " +
             s"icachePrefetch=${ShippingCoreConfig.icachePrefetch} " +
             // D4. Reaches LsEuPlugin / StoreQueue / DcachePlugin through their constructor
             // DEFAULTS (the `sqDepth` precedent), so this line and the netlist cannot disagree.
-            s"inhibitedFullBarrier=${ShippingCoreConfig.inhibitedFullBarrier}")
+            s"inhibitedFullBarrier=${ShippingCoreConfig.inhibitedFullBarrier} " +
+            // Non-blocking L1D + P6 hot door (constructor DEFAULTS, same precedent).
+            s"dcacheNonBlocking=${ShippingCoreConfig.dcacheNonBlocking} " +
+            s"dcacheMshrs=${ShippingCoreConfig.dcacheMshrs} " +
+            s"lsLoadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} " +
+            s"dcacheHotDoor=${ShippingCoreConfig.dcacheHotDoor} " +
+            s"dcacheStoreAllocArDelay=${ShippingCoreConfig.dcacheStoreAllocArDelay}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

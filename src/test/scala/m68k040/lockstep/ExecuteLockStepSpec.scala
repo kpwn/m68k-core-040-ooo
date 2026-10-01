@@ -983,7 +983,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // latency. `BehavioralMemAgent` is itself just `AxiMemModel.attachFull` with
       // a default config (see BehavioralMem.scala), so passing the default `dcfg`
       // is byte-for-byte the previous behaviour.
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg))
       // Attach a behavioral memory to the DTLB walker AXI (the page table lives here
       // when the MMU is enabled; idle for MMU-disabled programs). MMU disabled by
       // default -> identity passthrough, so existing programs are unchanged.
@@ -1547,7 +1547,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dcfg))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
@@ -1823,7 +1823,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         cyc += 1
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
@@ -1955,7 +1955,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         cyc += 1
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
@@ -2052,7 +2052,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -3125,7 +3125,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -3202,7 +3202,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -4802,7 +4802,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false
@@ -5027,7 +5027,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -5105,7 +5105,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -5220,7 +5220,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       // Seed real memory at the data range so a re-fill (e.g. the post-CPUSH residency
@@ -5355,7 +5355,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -5468,7 +5468,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -5598,7 +5598,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -5702,7 +5702,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // (The walker AXI memories are gone -- the ITLB/DTLB walkers reach memory through
       // the D-cache now, so their traffic lands in the D-side image above.)
       dut.ctrl.logic.mmuEnable #= false; dut.ctrl.logic.urp #= 0; dut.ctrl.logic.srp #= 0
@@ -6694,7 +6694,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -6797,7 +6797,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -7620,7 +7620,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       // The D-cache and the MMU walker SHARE one physical memory: the page table the
       // handler writes via a D-cache store must be visible to the walker on re-walk.
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -7823,7 +7823,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -7988,7 +7988,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       writeCodeAt(icmem, codePA, image.bytes)
       m68k040.sim.AxiMemModel.attachReadOnly(
         dut.icache.logic.axi, cd, sharedMem = icmem)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // Page table: map VA loadAddr -> PPN 0x50000 (resident).
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
@@ -8108,7 +8108,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         dut.icache.logic.axi, cd, sharedMem = icmem)
       // D-cache + walker memories share one backing store (the handler's PT write must
       // be visible to the ITLB re-walk).
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -8248,7 +8248,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       writeCodeAt(icmem, loadAddr, image.bytes)
       m68k040.sim.AxiMemModel.attachReadOnly(
         dut.icache.logic.axi, cd, sharedMem = icmem)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -9749,7 +9749,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -10020,7 +10020,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -10246,7 +10246,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       }
 
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -10458,7 +10458,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         captureWb(dut.lsEu.logic.wbObs); captureWb(dut.divEu.logic.wbObs, secondDst = true)
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -11210,7 +11210,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         dut.icache.logic.axi, cd, loadAddr, image.bytes,
         sharedMem = zeroMem, runAheadGuardWords = 0)
 
-      val dmem      = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem      = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       // The walkers no longer have their own AXI memories: their descriptor reads and
       // U/M writebacks go through the D-cache, so the page table has to live in the
       // D-side memory. Aliasing both old names onto it keeps every buildMmuTable/
@@ -11383,7 +11383,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Since `2db5bd3` the table walkers have no AXI master of their own -- their
       // descriptor reads and U/M writebacks go through the D-cache -- so the D-side
       // agent below is the only memory the walkers can reach.
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -11549,7 +11549,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Since `2db5bd3` the table walkers have no AXI master of their own -- their
       // descriptor reads and U/M writebacks go through the D-cache -- so the D-side
       // agent below is the only memory the walkers can reach.
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -11681,7 +11681,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("inh-irq-replay")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
 
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
@@ -12139,7 +12139,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc))
       dut.fa.logic.redirect.valid #= false
       dut.fa.logic.resume.valid   #= false
       dut.rob.logic.flush.valid   #= false
@@ -12477,7 +12477,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("rte-ccr-storm")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -12546,7 +12546,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("rte-ccr-store-storm")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -12653,7 +12653,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName("ccr-shadow")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -12959,7 +12959,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     compiledDut.doSim(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc))
       dut.fa.logic.redirect.valid #= false; dut.fa.logic.resume.valid #= false
       dut.rob.logic.flush.valid #= false; dut.icache.logic.invalidateAll #= false
       dut.wire.logic.seedValid #= false; dut.wire.logic.seedAddr #= 0; dut.wire.logic.seedData #= 0
@@ -13360,7 +13360,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
             isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL) }
       }
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
-      val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
       def pokeLE(a: Long, w: Long): Unit = for (i <- 0 until 4) dmem.pokeByte(a + i, ((w >> (8 * (3 - i))) & 0xff).toInt)
       pokeLE(0x80000L,        (PTRT & 0xfffffff0L) | 0x2L)
       pokeLE(PTRT + 0 * 4,    (PAGA & 0xfffffff0L) | 0x2L)

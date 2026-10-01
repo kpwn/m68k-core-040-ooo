@@ -796,6 +796,9 @@ trait CoreBenchHarness extends AnyFunSuite {
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
+  /** Optional hook called at the start of every `runKernel` sim, with the DUT. */
+  protected var dutProbe: FullCoreDut => Unit = null
+
   def runKernel(compiled: SimCompiled[FullCoreDut], k: Kernel,
                 seed: Int = IpcBenchSpec.simSeed): IpcResult = {
     require(k.warmupInstrs >= 0 && k.warmupInstrs < k.retiredInstrs)
@@ -814,6 +817,9 @@ trait CoreBenchHarness extends AnyFunSuite {
     // instead of silently colliding.
     compiled.doSim(s"${k.name}_s$seed", seed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      // Optional per-run observer (a spec forks its own mechanism counters here). Inert
+      // unless a spec sets `dutProbe`.
+      if (dutProbe != null) dutProbe(dut)
       // S-pre (2026-08-12 large-scale-frontend-restructure-design, §14 Q5 / D4):
       // IPC_PREFETCH=off disables IcachePlugin's next-line prefetch engine for the
       // WHOLE run, to measure its real aggregate/per-kernel IPC contribution.
@@ -1634,6 +1640,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg,
         if (k.zeroFillData) new ConstFillSparseMemory(0.toByte) else null)
+      // P6 hot door (non-blocking L1D with `hotDoor`): same image, same model L2.
+      val dhMem     = m68k040.sim.HotDoorAttach.model(dut.dcache, cd, dmem)
       val ptmem     = dmem
       val itlbPtmem = dmem
 
@@ -1899,6 +1907,16 @@ trait CoreBenchHarness extends AnyFunSuite {
           s"inhibStoreLaunches=${dut.lsEu.logic.sq.d4StoreLaunches.toLong} " +
           s"quietWait=${dut.lsEu.logic.d4Sim.quietWaitCycles.toLong} " +
           s"youngerHeld=${dut.lsEu.logic.d4Sim.youngerHeldCycles.toLong}")
+      // Non-blocking L1D (design note 10.1): WHOLE-RUN counters, printed unconditionally
+      // whenever the subsystem is built -- a silently discarded counter reads as a null.
+      if (dut.dcache.nonBlocking) {
+        val c = dut.dcache.logic.nb.ctrMap
+        def v(key: String) = c(key).toBigInt.toLong
+        val occ = c.keys.filter(_.startsWith("occ")).toSeq.sorted
+        println(s"[mshr] ${k.name} " + c.keys.filterNot(_.startsWith("occ")).map(key => s"$key=${v(key)}").mkString(" ") +
+          s" occ=${occ.map(v).mkString("/")} " +
+          f"MLP=${v("mlpSum").toDouble / scala.math.max(1L, v("mlpCyc"))}%.3f hotDoor=${dut.dcache.hotDoor}")
+      }
       println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
         s"oldestUnready=${lsOrderWindow.count(_._1)} " +
         s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
@@ -2333,6 +2351,45 @@ trait CoreBenchHarness extends AnyFunSuite {
       warmupInstrs = setup.size + records * body.size)
   }
 
+  /** Four independent dependent chains. Each chain alone has MLP=1, but their
+    * separate address registers offer four distinct outstanding lines to an
+    * out-of-order LS issue path. 256 records per chain place eight lines per set
+    * across the four chains, beyond L1's four ways while fitting in modeled L2.
+    * The first complete walk warms L2 and is excluded from the measured window. */
+  def kChaseFour(records: Int = 256, iters: Int = 768): Kernel = {
+    require(records > 0 && iters > records && iters % records == 0)
+    val base = 0x10000L
+    val chainBytes = records * 16L
+    val orders = (0 until 4).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until records).toVector))
+    val starts = (0 until 4).map(c => base + c * chainBytes + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until 4; i <- 0 until records) {
+        val here = base + c * chainBytes + orders(c)(i) * 16L
+        val next = base + c * chainBytes + orders(c)((i + 1) % records) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val setup = starts.zipWithIndex.map { case (a, c) => f"lea 0x$a%x,%%a$c" } :+ s"move.l #$iters,%d7"
+    val body = (0 until 4).map(c => s"move.l (%a$c),%a$c") ++
+      Seq("subq.l #1,%d7", "bne.s .Lchase4")
+    val epi = (0 until 4).map(c => s"move.l %a$c,%d$c")
+    val src = (setup ++ Seq(".Lchase4: " + body.mkString(" ; ")) ++ epi ++
+      Seq(".Lchase4end: bra.s .Lchase4end")).mkString(" ; ")
+    Kernel("chase-four", src, setup.size + iters * body.size + epi.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + records * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until 4) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == c)
+          assert(writes.nonEmpty, s"chase-four: d$c was never written")
+          assert((writes.last.archRegWrite & 0xffffffffL) == starts(c),
+            f"chase-four: d$c ended at 0x${writes.last.archRegWrite}%x, expected 0x${starts(c)}%x")
+        }
+      })
+  }
+
   def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0,
                  strCopy: Boolean = true, copyStyle: String = "byteMemMem",
                  copyback: Boolean = false): Kernel = {
@@ -2682,6 +2739,151 @@ trait CoreBenchHarness extends AnyFunSuite {
       })
   }
 
+
+  /** (Adopted verbatim from the same-line-merge agent, agent-28 `05437638`.)
+    * ── THE GROUPED COPY: `L,L,L,L,S,S,S,S` per 16-byte line (2026-09-30) ──────────────
+    *
+    * `kMemcpy`'s body is `move.l (a0)+,(a1)+` x4, i.e. L,S,L,S,L,S,L,S. This is the SAME
+    * 16 bytes per iteration written as four loads into d0-d3 followed by four stores, the
+    * shape `docs/PERF_LEVER_QUEUE.md` measured at +20.1% copy bandwidth with zero hardware
+    * (`perf/dside-mshr2` spec §12.7) -- and the only shape that gives a SAME-LINE
+    * secondary-miss merge customers: with the loads grouped, loads 2-4 of a line reach the
+    * D-cache while load 1's refill is still in flight (44,442 of 49,102 refill cycles),
+    * where the interleaved order has 110. Ten instructions per line against six.
+    *
+    * Verification as `kMemcpy`'s: every source long holds its own address, and the
+    * epilogue reloads the last destination long. */
+  def kMemcpyGrouped(bytes: Int = 16384, passes: Int = 4, label: String = null): Kernel = {
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-grp-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move.l (%a0)+,%d0", "move.l (%a0)+,%d1", "move.l (%a0)+,%d2", "move.l (%a0)+,%d3",
+                    "move.l %d0,(%a1)+", "move.l %d1,(%a1)+", "move.l %d2,(%a1)+", "move.l %d3,(%a1)+",
+                    "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + bytes - 4) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        // d3 = the last SOURCE long of the final line (its own address), loaded by the loop
+        // itself -- checks the grouped loads, which the epilogue alone does not.
+        assert(lastOf(3) == want,
+          f"$name: d3 = 0x${lastOf(3)}%x, expected the last source long 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+  /** ── LOAD STREAM (D-side bandwidth program, 2026-09-30) ─────────────────────────────
+    * A pure sequential READ stream: four independent `add.l (a0)+,dN` per 16-byte line
+    * over `bytes` of memory, `passes` times (pass 1 is warm-up). No stores, no
+    * dependence between loads beyond the pointer, so every load is ready at issue: the
+    * shape that exposes load-side MLP and nothing else. Every long holds its own address,
+    * so the four sums are checkable in closed form.
+    * Contrast `kLoadStream` (two cache-resident lines -- not a stream at all). */
+  def kStream(bytes: Int = 65536, passes: Int = 2, label: String = null): Kernel = {
+    require(bytes % 16 == 0 && passes >= 2)
+    val Src = 0x00500000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"stream-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", s"move.l #$passes,%d6", "moveq #0,%d0", "moveq #0,%d1",
+                    "moveq #0,%d2", "moveq #0,%d3")
+    val outer = Seq("movea.l %a2,%a0", s"move.l #$iters,%d7")
+    val body  = Seq("add.l (%a0)+,%d0", "add.l (%a0)+,%d1", "add.l (%a0)+,%d2", "add.l (%a0)+,%d3",
+                    "subq.l #1,%d7", "bne.s .Lstr")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lstr: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++
+               Seq(".Lstrend: bra.s .Lstrend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    // Closed-form sums: lane j adds (Src + 16*i + 4*j) for i < iters, `passes` times.
+    def want(j: Int): Long = {
+      var s = 0L; for (i <- 0 until iters) s += Src + 16L * i + 4L * j
+      (s * passes) & 0xffffffffL
+    }
+    Kernel(name, src, setup.size + passes * perPass,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        for (j <- 0 until 4)
+          assert(lastOf(j) == want(j), f"$name: lane $j sum = 0x${lastOf(j)}%x, expected 0x${want(j)}%x")
+      })
+  }
+
+  /** Streaming four-long stores fill every COPYBACK destination line. */
+  def kMemset(bytes: Int = 16384, passes: Int = 4, label: String = null): Kernel = {
+    require(bytes % 16 == 0 && passes >= 2)
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memset-${bytes / 1024}k"
+    val setup = Seq(f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6", "move.l #0x5a5a1234,%d1")
+    val outer = Seq("movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move.l %d1,(%a1)+", "move.l %d1,(%a1)+", "move.l %d1,(%a1)+",
+                    "move.l %d1,(%a1)+", "subq.l #1,%d7", "bne.s .Lset")
+    val tail  = Seq("addq.l #1,%d1", "subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lset: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lsetend: bra.s .Lsetend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        val w = obs.filter(o => o.archRegValid && o.archRegId == 0)
+        assert(w.nonEmpty, s"$name: d0 never written")
+        val want = (0x5a5a1234L + passes - 1) & 0xffffffffL
+        assert((w.last.archRegWrite & 0xffffffffL) == want,
+          f"$name read back 0x${w.last.archRegWrite & 0xffffffffL}%x, expected 0x$want%x")
+      })
+  }
 
   def kLoadStream: Kernel = {
     val iters = 60

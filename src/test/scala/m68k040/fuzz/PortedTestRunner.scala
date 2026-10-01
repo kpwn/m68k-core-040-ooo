@@ -163,6 +163,7 @@ object PortedTestRunner {
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                                    sharedMem = dsideMem, injectBusErrors = true,
                                                    dcfg = dcfg)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, dmem)   // P6 hot door, when built with it
       // SELF-MODIFYING CODE: mirror every runtime D-side store byte into the I-side's
       // SEPARATE program image. The I and D views are two different `SparseMemory`
       // objects holding the same architectural byte-at-address image. Seeding both at

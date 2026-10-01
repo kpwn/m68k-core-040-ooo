@@ -195,7 +195,12 @@ case class AxiMemModelConfig(
   writeIdsAllowedOutstanding: Set[Int] = Set(1),   // AxiIds.D_STORE -- see doc comment above
   injectBusErrors: Boolean = false,
   maxPendingBeats: Int = 8,
-  bQueueDepth: Int = 4
+  bQueueDepth: Int = 4,
+  /** Test-only adversarial visibility: hold W bytes until the corresponding B is
+    * presented. The normal L2 model applies W immediately; this mode tests that a
+    * hot read of the same line really waits for B instead of relying on early W
+    * visibility. Default OFF for every existing harness. */
+  deferWriteVisibilityUntilB: Boolean = false
 )
 
 /** Free-running simulation cycle counter shared by the read and write engines of one
@@ -340,6 +345,67 @@ private case class RBeat(id: Int, base: Long, bytes: Int, bad: Boolean,
                          isLast: Boolean, seq: Long, var readyAt: Long,
                          installLine: Option[Long] = None)
 
+/** The model L2's residency image (see `AxiReadEngine.l2`). Extracted 2026-09-30 so two
+  * read engines can share one L2 -- the logic below is the former inline code, unchanged. */
+class L2Image(latency: L2LatencyModel) {
+  val lines = mutable.Set[Long]()
+  val inFlight = mutable.Map[Long, Long]()   // line -> readyAt
+  private val l2Fin   = latency.finiteCapacity
+  private val l2Sets  = if (l2Fin) latency.sets else 0
+  private val l2Ways  = if (l2Fin) latency.ways else 0
+  private val l2Tag   = if (l2Fin) Array.fill(l2Sets, l2Ways)(-1L) else Array.empty[Array[Long]]
+  private val l2Plru  = if (l2Fin) Array.fill(l2Sets)(0) else Array.empty[Int]
+  private def l2SetOf(line: Long): Int = ((line / latency.lineBytes) % l2Sets).toInt
+
+  private def plruVictim(t: Int): Int = {
+    def bit(i: Int) = (t >>> i) & 1
+    val w2 = bit(0)
+    val w1 = if (w2 == 1) bit(2) else bit(1)
+    val w0 = if (w2 == 1) { if (w1 == 1) 1 - bit(6) else 1 - bit(5) }
+             else         { if (w1 == 1) 1 - bit(4) else 1 - bit(3) }
+    (w2 << 2) | (w1 << 1) | w0
+  }
+
+  private def plruNext(t: Int, way: Int): Int = {
+    def set(v: Int, i: Int, b: Int) = if (b == 1) v | (1 << i) else v & ~(1 << i)
+    val w2 = (way >>> 2) & 1; val w1 = (way >>> 1) & 1; val w0 = way & 1
+    var nt = t
+    if (w2 == 0) {
+      nt = set(nt, 0, 1)
+      if (w1 == 0) { nt = set(nt, 1, 1); nt = set(nt, 3, w0) }
+      else         { nt = set(nt, 1, 0); nt = set(nt, 4, w0) }
+    } else {
+      nt = set(nt, 0, 0)
+      if (w1 == 0) { nt = set(nt, 2, 1); nt = set(nt, 5, w0) }
+      else         { nt = set(nt, 2, 0); nt = set(nt, 6, w0) }
+    }
+    nt
+  }
+
+  def resident(line: Long): Boolean = {
+    if (!l2Fin) return lines.contains(line)
+    val s = l2SetOf(line)
+    var w = 0
+    while (w < l2Ways) {
+      if (l2Tag(s)(w) == line) { l2Plru(s) = plruNext(l2Plru(s), w); return true }
+      w += 1
+    }
+    false
+  }
+
+  def install(line: Long, stats: AxiMemStats): Unit = {
+    if (!l2Fin) { lines += line; return }
+    val s = l2SetOf(line)
+    var w = 0; var victim = -1
+    while (w < l2Ways && victim < 0) { if (l2Tag(s)(w) == -1L) victim = w; w += 1 }
+    if (victim < 0) { victim = plruVictim(l2Plru(s)); stats.l2Evictions += 1 }
+    l2Tag(s)(victim) = line
+    l2Plru(s) = plruNext(l2Plru(s), victim)
+  }
+
+
+}
+
 /** Read side of the model. Written against the raw `ar`/`r` streams (not `Axi4` /
   * `Axi4ReadOnly`) so the SAME implementation serves both master shapes -- this is
   * the consolidation the legacy `Axi4ReadOnlyBehavioralAgent` (an acknowledged
@@ -347,7 +413,7 @@ private case class RBeat(id: Int, base: Long, bytes: Int, bad: Boolean,
 class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
                     cd: ClockDomain, mem: SparseMemory, cfg: AxiMemModelConfig,
                     clk: SimCycleCounter, stats: AxiMemStats,
-                    checker: AxiProtocolChecker) {
+                    checker: AxiProtocolChecker, l2Shared: L2Image = null) {
 
   private val nIds = if (busConfig.useId) (1 << busConfig.idWidth) else 1
   private val queues = Array.fill(nIds)(mutable.Queue[RBeat]())
@@ -366,74 +432,15 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
   //              ported from `macqd700-soc/rtl/soc/l2c_plru_funcs.vh`.
   // The unbounded path is kept byte-for-byte so that `sets == 0` runs are bit-identical
   // to every measurement taken before 2026-09-27.
-  private val l2Lines = mutable.Set[Long]()
-  private val l2InFlightLines = mutable.Map[Long, Long]()   // line -> readyAt
-  private val l2Fin   = cfg.latency.finiteCapacity
-  private val l2Sets  = if (l2Fin) cfg.latency.sets else 0
-  private val l2Ways  = if (l2Fin) cfg.latency.ways else 0
-  /** Tag array, `-1L` = invalid. Indexed [set][way], holding the LINE ADDRESS (not a
-    * truncated tag) so no tag-width arithmetic can go wrong here. */
-  private val l2Tag   = if (l2Fin) Array.fill(l2Sets, l2Ways)(-1L) else Array.empty[Array[Long]]
-  /** 7-bit tree-PLRU vector per set, exactly the `t[6:0]` of `l2c_plru_funcs.vh`. */
-  private val l2Plru  = if (l2Fin) Array.fill(l2Sets)(0) else Array.empty[Int]
-
-  private def l2SetOf(line: Long): Int =
-    ((line / cfg.latency.lineBytes) % l2Sets).toInt
-
-  /** `l2c_plru_victim` (`l2c_plru_funcs.vh:24-33`), transcribed. */
-  private def plruVictim(t: Int): Int = {
-    def bit(i: Int) = (t >>> i) & 1
-    val w2 = bit(0)
-    val w1 = if (w2 == 1) bit(2) else bit(1)
-    val w0 = if (w2 == 1) { if (w1 == 1) 1 - bit(6) else 1 - bit(5) }
-             else         { if (w1 == 1) 1 - bit(4) else 1 - bit(3) }
-    (w2 << 2) | (w1 << 1) | w0
-  }
-
-  /** `l2c_plru_next` (`l2c_plru_funcs.vh:35-60`), transcribed -- including the leaf
-    * bits' OPPOSITE polarity, which that file's own comment warns about. */
-  private def plruNext(t: Int, way: Int): Int = {
-    def set(v: Int, i: Int, b: Int) = if (b == 1) v | (1 << i) else v & ~(1 << i)
-    val w2 = (way >>> 2) & 1; val w1 = (way >>> 1) & 1; val w0 = way & 1
-    var nt = t
-    if (w2 == 0) {
-      nt = set(nt, 0, 1)
-      if (w1 == 0) { nt = set(nt, 1, 1); nt = set(nt, 3, w0) }
-      else         { nt = set(nt, 1, 0); nt = set(nt, 4, w0) }
-    } else {
-      nt = set(nt, 0, 0)
-      if (w1 == 0) { nt = set(nt, 2, 1); nt = set(nt, 5, w0) }
-      else         { nt = set(nt, 2, 0); nt = set(nt, 6, w0) }
-    }
-    nt
-  }
-
-  /** Is `line` resident? On a hit in the finite model, the access TOUCHES the way --
-    * which is what makes PLRU mean anything. */
-  private def l2Resident(line: Long): Boolean = {
-    if (!l2Fin) return l2Lines.contains(line)
-    val s = l2SetOf(line)
-    var w = 0
-    while (w < l2Ways) {
-      if (l2Tag(s)(w) == line) { l2Plru(s) = plruNext(l2Plru(s), w); return true }
-      w += 1
-    }
-    false
-  }
-
-  /** Install a completed fill. Finite model: prefer an invalid way, else evict the
-    * tree-PLRU victim. The evicted line simply stops being resident -- this model has
-    * no dirty bit, so an eviction costs no bus traffic here (see `L2LatencyModel.sets`
-    * for why that is a stated limit rather than an oversight). */
-  private def l2Install(line: Long): Unit = {
-    if (!l2Fin) { l2Lines += line; return }
-    val s = l2SetOf(line)
-    var w = 0; var victim = -1
-    while (w < l2Ways && victim < 0) { if (l2Tag(s)(w) == -1L) victim = w; w += 1 }
-    if (victim < 0) { victim = plruVictim(l2Plru(s)); stats.l2Evictions += 1 }
-    l2Tag(s)(victim) = line
-    l2Plru(s) = plruNext(l2Plru(s), victim)
-  }
+  /** L2 residency / in-flight state. SHAREABLE between two read engines (the D-side hot
+    * door and the cold `axi_d` door reach the SAME L2 in the SoC): pass `l2Shared` so a
+    * line filled through one door is a hit through the other. Unshared by default, which
+    * is byte-for-byte the pre-2026-09-30 behaviour. */
+  val l2: L2Image = if (l2Shared != null) l2Shared else new L2Image(cfg.latency)
+  private def l2Lines = l2.lines
+  private def l2InFlightLines = l2.inFlight
+  private def l2Resident(line: Long): Boolean = l2.resident(line)
+  private def l2Install(line: Long): Unit = l2.install(line, stats)
 
   private def totalPendingBeats: Int = queues.map(_.size).sum
 
@@ -594,17 +601,17 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
   *   paired with its AW, and a burst's B closure is enqueued ONLY after every byte
   *   of that burst has been written. ***
   *
-  * Any deferred-apply latency model that broke this would re-introduce the
-  * harness-induced store->load race the original comment exists to prevent (design
-  * doc §8.1 item 6). Latency is therefore applied to WHEN B IS DRIVEN, never to when
-  * the bytes land. */
+  * A test-only `deferWriteVisibilityUntilB` mode deliberately withholds the bytes
+  * until B to challenge the D-cache's cross-door same-line gate. Every existing
+  * caller retains this write-before-B behavior by default. */
 class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
                      busConfig: Axi4Config, cd: ClockDomain, mem: SparseMemory,
                      cfg: AxiMemModelConfig, clk: SimCycleCounter,
                      stats: AxiMemStats, checker: AxiProtocolChecker) {
 
-  private case class AwState(addr: BigInt, size: Int, len: Int, burst: Int, id: Int, var beat: Int)
-  private case class BRsp(id: Int, bad: Boolean, readyAt: Long)
+  private case class AwState(addr: BigInt, size: Int, len: Int, burst: Int, id: Int,
+                             var beat: Int, pendingBytes: mutable.ArrayBuffer[(Long, Byte)])
+  private case class BRsp(id: Int, bad: Boolean, readyAt: Long, pendingBytes: Seq[(Long, Byte)])
 
   private val nIds = if (busConfig.useId) (1 << busConfig.idWidth) else 1
   private val awQueue = mutable.Queue[AwState]()
@@ -666,8 +673,12 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
       for (i <- 0 until bytesPerBeat) {
         if (((strb >> i) & 1) == 1) {
           val byte = ((data >> (8 * i)) & 0xff).toInt.toByte
-          mem.write((alignedBase + i).toLong, byte)
-          if (onByteWrite != null) onByteWrite((alignedBase + i).toLong, byte)
+          val byteAddr = (alignedBase + i).toLong
+          if (cfg.deferWriteVisibilityUntilB) st.pendingBytes += ((byteAddr, byte))
+          else {
+            mem.write(byteAddr, byte)
+            if (onByteWrite != null) onByteWrite(byteAddr, byte)
+          }
         }
       }
     }
@@ -691,7 +702,7 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
         awQueue.dequeue()
         qPending += 1
         val lat = if (cfg.latency.enabled) cfg.latency.hitCycles.toLong else 0L
-        bQueue(st.id) += BRsp(st.id, bad, clk.now + lat)
+        bQueue(st.id) += BRsp(st.id, bad, clk.now + lat, st.pendingBytes.toSeq)
       }
     }
   }
@@ -714,7 +725,8 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
     checker.onAw(id, a.addr.toBigInt, size, len, burst, liveAwIds.contains(id), clk.now)
     stats.awCount(id) += 1
     liveAwIds += id
-    awQueue += AwState(a.addr.toBigInt, size, len, burst, id, 0)
+    awQueue += AwState(a.addr.toBigInt, size, len, burst, id, 0,
+      mutable.ArrayBuffer.empty[(Long, Byte)])
     update()
   }
 
@@ -733,6 +745,10 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
         case _                  => ready(simRandom.nextInt(ready.size))
       }
       val rsp = bQueue(id).dequeue()
+      if (cfg.deferWriteVisibilityUntilB) rsp.pendingBytes.foreach { case (addr, byte) =>
+        mem.write(addr, byte)
+        if (onByteWrite != null) onByteWrite(addr, byte)
+      }
       if (busConfig.useId)   b.id   #= rsp.id
       if (busConfig.useResp) b.resp #= (if (rsp.bad) 3 else 0)
       liveAwIds -= rsp.id
@@ -854,9 +870,11 @@ object AxiMemModel {
 
   def attachReadOnly(axi: Axi4ReadOnly, cd: ClockDomain,
                      cfg: AxiMemModelConfig = AxiMemModelConfig(),
-                     sharedMem: SparseMemory = null): AxiMemModel = {
+                     sharedMem: SparseMemory = null,
+                     sharedL2From: AxiMemModel = null): AxiMemModel = {
     val m = new AxiMemModel(axi.config, cd, cfg, sharedMem)
-    m.readEngine = new AxiReadEngine(axi.ar, axi.r, axi.config, cd, m.mem, cfg, m.clk, m.stats, m.checker)
+    m.readEngine = new AxiReadEngine(axi.ar, axi.r, axi.config, cd, m.mem, cfg, m.clk, m.stats, m.checker,
+      if (sharedL2From != null) sharedL2From.readEngine.l2 else null)
     m
   }
 

@@ -5,7 +5,7 @@ import spinal.core._
 import spinal.core.sim._
 import spinal.lib._
 import m68k040.hw.OneHotSafe
-import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config}
+import spinal.lib.bus.amba4.axi.{Axi4, Axi4Config, Axi4ReadOnly}
 import spinal.lib.fsm._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -332,8 +332,33 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * to the shipping flag so every harness that builds the LS EU with the
                      * barrier on also builds its producer; a mismatch fails elaboration
                      * loudly (the LS EU would read a null) rather than silently. */
-                   val exportBusQuiesced: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
+                   val exportBusQuiesced: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
+                   /** NON-BLOCKING L1D (D-side bandwidth program, stage 2). See
+                     * `ShippingCoreConfig.dcacheNonBlocking` and
+                     * `docs/superpowers/specs/2026-09-30-dside-nonblocking-l1d-and-hot-door.md`.
+                     * Everything it adds lives in the `nb` Area at the end of `logic`; the
+                     * legacy sites it touches are Scala-conditional, so OFF elaborates today's
+                     * hardware exactly. */
+                   val nonBlocking: Boolean = m68k040.top.ShippingCoreConfig.dcacheNonBlocking,
+                   val nMshr: Int = m68k040.top.ShippingCoreConfig.dcacheMshrs,
+                   /** Refills leave on the read-only hot door `axiDh` instead of `axi`. */
+                   val hotDoor: Boolean = m68k040.top.ShippingCoreConfig.dcacheHotDoor,
+                   val storeAllocArDelay: Int = m68k040.top.ShippingCoreConfig.dcacheStoreAllocArDelay,
+                   /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
+                     * Non-blocking mode implements this natively from its merge strobe. */
+                   val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
+                   /** Test-only: deliberately skip a fill for a partial store. */
+                   val noFillMutation: Int = 0)
     extends FiberPlugin with DcacheService {
+  require(!(fullLineNoFill && sectored),
+    "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
+  require(!(fullLineNoFill && nonBlocking),
+    "fullLineNoFill is native to nonBlocking; do not enable the legacy hook")
+  require(!hotDoor || nonBlocking, "DcachePlugin: hotDoor requires nonBlocking")
+  require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
+  require(!nonBlocking || !hitUnderMissRead,
+    "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
+  require(!nonBlocking || (nMshr >= 2 && nMshr <= 4), "DcachePlugin: nMshr must be 2..4 (hot-door ID is 2 bits)")
   // Controls only resolved/paddrHint supplied at probe launch. The normal LSU
   // path always reads the virtual set alongside the DTLB request, then qualifies
   // that read through loadProbeResolve with the translated physical address.
@@ -457,6 +482,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // be driven from inside (see FetchAlignPlugin.scala:64-66). No logic changes; the
     // default (false) is today's behaviour and today's top-level port, exactly.
     val axi         = if (socketMerged) Axi4(axiCfg) else master(Axi4(axiCfg))
+    /** The P6 HOT DOOR (`hotDoor` only): read-only, 128-bit, ID = MSHR index. Cacheable
+      * refills of the non-blocking L1D leave here; everything else stays on `axi`. Plain
+      * `master` (like `IcachePlugin.axi`), independent of `socketMerged`. */
+    val axiDhCfg = Axi4Config(addressWidth = 32, dataWidth = 128, idWidth = 2)
+    val axiDh: Axi4ReadOnly = if (!hotDoor) null else master(Axi4ReadOnly(axiDhCfg))
 
     // ---- storage (sync-read BRAM: write + readSync ONLY, no readAsync) ----
     val dataMem = Seq.fill(ways)(Mem(Bits(128 bits), sets))
@@ -908,6 +938,28 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // can read a same-shaped (valid, set) pair without a forward reference, and
     // without themselves scanning the raw `wrEn`/`wrSet` write-port vectors.
     val storeArrayWrite    = Bool(); storeArrayWrite := False
+    // ── Non-blocking L1D forward declarations (driven in the `nb` Area at the end). ──
+    // All null when `!nonBlocking`, and every legacy use site is Scala-conditional.
+    /** An MSHR array write (install or victim invalidate) this cycle, for probe staleness. */
+    val nbArrayWrite: Bool    = if (!nonBlocking) null else Bool()
+    val nbArrayWriteSet: UInt = if (!nonBlocking) null else UInt(setBits bits)
+    /** Registered-input hold on store S1 -> S2 (set/victim/resource interlocks). */
+    val nbStoreHold: Bool     = if (!nonBlocking) null else Bool()
+    /** Load command admission term (reorder rule + replay/serial holds). */
+    val nbCmdReady: Bool      = if (!nonBlocking) null else Bool()
+    /** The MSHR response slot drives `loadRsp` (through the missLine arm) this cycle. */
+    val nbRespFire: Bool      = if (!nonBlocking) null else Bool()
+    val nbRespFault: Bool     = if (!nonBlocking) null else Bool()
+    /** Nothing of the non-blocking subsystem is in flight (registered). */
+    val nbIdle: Bool          = if (!nonBlocking) null else Bool()
+    /** Store port must close (install starvation escape). */
+    val nbStorePortHold: Bool = if (!nonBlocking) null else Bool()
+    /** The replay queue may hand its head to the shadow slot this cycle. */
+    val nbShadowLoad: Bool    = if (!nonBlocking) null else Bool()
+    val nbShadowCmd: DLoadCmd = if (!nonBlocking) null else DLoadCmd()
+    /** An older buffered victim write targets the WT store being started/retried. */
+    val nbWtWbHazardS3: Bool = if (!nonBlocking) null else Bool()
+    val nbWtWbHazardPending: Bool = if (!nonBlocking) null else Bool()
     val storeArrayWriteSet = UInt(setBits bits); storeArrayWriteSet := U(0, setBits bits)
 
     // Store-drain-miss request, latched from store-S2 when a COPYBACK drain misses
@@ -944,6 +996,26 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * `pendingVictim*` for exactly the same reason those are -- see their comment. */
     val pendingStoreFullLine:  Bool = if (!sectored) null else RegInit(False)
     val storeAllocAckReg   = Bool(); storeAllocAckReg := False
+    // ── FULL-LINE NO-FILL (`fullLineNoFill`, write-side bandwidth part B) ───────────────
+    // CONTRACT (the whole feature, stated once, for whoever ports REFILL/REPLAY):
+    //   a COPYBACK store miss whose merge strobe covers all 16 bytes allocates the victim
+    //   way with tag, valid, the merged data and dirty, WITHOUT any read; a dirty victim
+    //   is written back first, unchanged; the ack is `storeAllocAckReg`, the SAME local
+    //   source an ordinary write-allocate uses -- so no new storeAck source exists and the
+    //   "more than one storeAck source" assert below still guards the invariant the
+    //   withdrawn no-write-allocate lever broke.
+    // WHY IT IS INVISIBLE: the fill would be overwritten in full by the merge, the line is
+    // dirty either way and is written back in full either way. The L2 does the same one
+    // level down (`l2c_ctrl.v`, "FULL-LINE WRITE, NO FILL").
+    // HOW (three edits, all behind this flag): the pending-store-miss pickup and the
+    // EVICT_WR exit go to REPLAY instead of REFILL when `noFillReg`; REPLAY's store arm
+    // then also writes the tag + valid and advances the round robin -- the three things
+    // REFILL's beat would have done -- under the same `storeDrainRefillHold` interlock
+    // that already guards its data/dirty write. Unsectored only.
+    val noFillReg: Bool = if (!fullLineNoFill) null else RegInit(False)
+    // Fire-rate evidence: 1-cycle pulse per no-fill allocation.
+    val noFillAlloc: Bool = if (!fullLineNoFill) null else Bool()
+    if (fullLineNoFill) { noFillAlloc := False; noFillReg.simPublic(); noFillAlloc.simPublic() }
     // test-visibility only (FMax Lever F's positive-control sweep in
     // DcacheDrainRefillRaceSpec counts merge acks); already a live driver of
     // storeAckReg, so this cannot change the synthesised netlist.
@@ -1018,7 +1090,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     axi.b.ready  := True
 
     val busy = Reg(Bool()) init False
-    loadBusyReg := busy || resetSweepBusy
+    if (!nonBlocking) loadBusyReg := busy || resetSweepBusy
+    else loadBusyReg := busy || resetSweepBusy || !nbIdle
 
     // ---- load index/tag from cmd vaddr + PRE-TRANSLATED paddr ----
     // FMax: the physical tag comes from the requester's REGISTERED `loadCmd.paddr`
@@ -1360,10 +1433,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // refilled line un-retired. Strictly more conservative than before (more probes
       // fall back to the ordinary S1 read, none fewer). The store term stays exact: a
       // store writes exactly one sector slot in both arms.
-      earlyProbeSetWriteVec(i) := (storeArrayWrite && (storeArrayWriteSet === setBitsOf)) ||
+      val legacySetWrite = (storeArrayWrite && (storeArrayWriteSet === setBitsOf)) ||
                                    (missArrayWrite &&
                                      (if (!sectored) missSet === setBitsOf
                                       else lineOf(missSet) === lineOf(setBitsOf)))
+      earlyProbeSetWriteVec(i) := (if (!nonBlocking) legacySetWrite
+                                   else legacySetWrite || (nbArrayWrite && (nbArrayWriteSet === setBitsOf)))
     }
     // Task pea-cache-evict-2026-08-19 fix: `earlyProbeSetWriteVec` above is a purely
     // COMBINATIONAL, THIS-CYCLE-ONLY check -- despite this block's own comment
@@ -1623,7 +1698,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     /** The response mux's `missLine` source is shared by two pulses when fill-forward
       * is on, and is exactly `inhibitedResp` when it is off. Naming it once keeps the
       * muxes below from drifting apart. */
-    val missLineResp: Bool = if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp
+    // Non-blocking L1D: the MSHR response slot REUSES the missLine/miss* registers and this
+    // arm, so the load-response data path gains no mux input (design note §5).
+    val missLineResp: Bool =
+      if (!nonBlocking) { if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp }
+      else (if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp) || nbRespFire
 
     // ---- LOAD S2 (registered post-hit-detect response build) ----
     // FMax closure Slice 2 (2026-08-07): the old S1 response build (way-select ->
@@ -1676,7 +1755,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     loadRspPort.payload.line  := Mux(missLineResp, missLine, ldS2Line)
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
-    loadRspPort.payload.fault := busFaultResp
+    loadRspPort.payload.fault := (if (!nonBlocking) busFaultResp else busFaultResp || (nbRespFire && nbRespFault))
     // The miss-path responses (inhibited read, bus fault) answer the command whose
     // token was latched into `missToken`; every other response comes down the S1/S2
     // pipe, early-probe direct hits included (the direct arm overrides `ldS2Token`).
@@ -2610,8 +2689,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
               // either possible source, to this probe's target set) but never touches
               // `wrEn`/`wrSet` at all.
               val allocTargetSet = loadProbePort.payload.vaddr(offBits + setBits - 1 downto offBits)
-              val allocRacesArrayWrite = (stS3ArrayWrite && (stS3Set === allocTargetSet)) ||
+              val allocRacesArrayWriteLegacy = (stS3ArrayWrite && (stS3Set === allocTargetSet)) ||
                                          (missArrayWrite && (missSet === allocTargetSet))
+              val allocRacesArrayWrite = if (!nonBlocking) allocRacesArrayWriteLegacy
+                else allocRacesArrayWriteLegacy || (nbArrayWrite && (nbArrayWriteSet === allocTargetSet))
               earlyProbeStale(earlyProbeAllocIdx) := allocRacesArrayWrite
               probeReadValid  := True
               probeReadSlot   := earlyProbeAllocIdx
@@ -2689,6 +2770,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
                              (!earlyProbeTokenPresent || earlyProbeOwnsCmd) &&
                              (!(storeReadOwed && stS1Valid) || useEarlyProbe) &&
                              !earlyProbeConflict
+        if (nonBlocking) when(!nbCmdReady) { loadCmdPort.ready := False }
 
         when(loadCmdPort.fire && earlyProbeOwnsCmd) {
           // Full-queue consume-and-replace reuses this physical entry for the new
@@ -2723,7 +2805,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS1Paddr    := loadShadowCmd.paddr
           loadShadowValid := False
           loadShadowLaunchEv := True
-        } elsewhen(loadCmdPort.fire && ldS1Valid && !ldS1Hit) {
+        } elsewhen(if (!nonBlocking) loadCmdPort.fire && ldS1Valid && !ldS1Hit
+                   else loadCmdPort.fire && ldS1Valid && !ldS1Hit && (ldS1Cmode === CacheMode.INHIBITED)) {
           // The older S1 request misses this cycle. The command still FIRES — that
           // is what permits II=1 hits — but its RAM read is deferred so no untagged
           // younger response can pass the older refill. Replay it from the internal
@@ -2767,7 +2850,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
         }
         // S1 resolution of a launched load read. A HIT drives the response
         // one cycle later out of S2. A MISS starts the refill.
-        when(loadMissDiscovered) {
+        when(if (!nonBlocking) loadMissDiscovered
+             else loadMissDiscovered && (ldS1Cmode === CacheMode.INHIBITED)) {
           // Miss: latch miss-state and start the refill (the +1-cycle deferral
           // relative to the old async hit-detect is latency-agnostic). A same-
           // cycle load miss takes priority over a pending store-drain miss
@@ -2897,7 +2981,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             // they are, by definition, sectors of ONE tagged line.
             if (sectored) goto(EVICT_RD) else goto(EVICT_WR)
           } otherwise { goto(REFILL) }
-        } .elsewhen(pendingStoreMiss && !maintWalking) {
+        } .elsewhen(if (nonBlocking) False else pendingStoreMiss && !maintWalking) {
           // A pending COPYBACK drain-miss (latched at store-S2, Step 2 above) --
           // held and retried every IDLE cycle until the refill engine is free.
           //
@@ -2955,10 +3039,21 @@ class DcachePlugin(val socketMerged: Boolean = false,
           pendingStoreMiss := False
           arSent    := False
           busy      := True
+          // Part B: decide ONCE, here, from the latched merge strobe. `missFault` is
+          // cleared because no fill will run to (re)write it.
+          val noFillNow: Bool = if (!fullLineNoFill) False
+            else if (noFillMutation == 1) True else pendingMergeStrb.andR
+          if (fullLineNoFill) {
+            noFillReg := noFillNow
+            when(noFillNow) { missFault := False }
+          }
           when(pendingVictimDirty) {
             evictAwDone := False; evictWDone := False
             if (sectored) goto(EVICT_RD) else goto(EVICT_WR)
-          } otherwise { goto(REFILL) }
+          } otherwise {
+            if (fullLineNoFill) { when(noFillNow) { goto(REPLAY) } otherwise { goto(REFILL) } }
+            else goto(REFILL)
+          }
         }
       }
 
@@ -3046,7 +3141,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
             // site needing the interlock, and that gate applies regardless of
             // which state was active immediately before REFILL.
             if (!sectored) {
-              goto(REFILL)
+              // Part B: a full-line store miss skips the fill once its victim is pushed.
+              // `noFillReg` is only ever set on a STORE pickup; a load pickup clears
+              // `refillReqIsStore`, which qualifies it.
+              if (fullLineNoFill) {
+                when(refillReqIsStore && noFillReg) { goto(REPLAY) } otherwise { goto(REFILL) }
+              } else goto(REFILL)
             } else {
               // Slice `D3-BURST`: this sector is pushed; step the walk.
               evictAdvance()
@@ -3413,6 +3513,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
                 lineDirtyWrData(w) := True
               }
             }
+            if (fullLineNoFill) when(noFillReg) {
+              // Part B: the allocate REFILL's beat would have done -- tag, valid and the
+              // round robin -- on the SAME cycle and way as the data/dirty write above.
+              // `newBytes` is exactly `pendingMergeData` here: every strobe is set.
+              for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
+                wrTagEn(w)      := True
+                wrTag(w)        := missTag
+                validsWrEn(w)   := True
+                validsWrSet(w)  := missSet
+                validsWrData(w) := True
+                validsVoteW1(w) := True    // Task #255 tripwire: this IS the W1 allocate
+              }
+              victim(missSet) := victim(missSet) + 1
+              noFillReg   := False
+              noFillAlloc := True
+            }
             storeAllocAckReg := True
             missArrayWrite   := True
             goto(IDLE)
@@ -3614,13 +3730,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * while a load response is still resolving, even though that response's DATA
       * cannot itself be corrupted by the walk. Costs at most one extra cycle of
       * walk-start delay on an already-rare, ROB-serialized event. */
-    val dcIdleForMaint = !resetSweepBusy && !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
+    val dcIdleForMaint = { val b = !resetSweepBusy && !busy && !ldS1Valid && !ldS2Valid && !loadShadowValid &&
                          !earlyProbeValid &&
                          !pendingStoreMiss && !pendingWtKickoff &&
                          !s0Valid && !stS1Valid && !stS2Valid && !stS3Valid &&
                          (storeOutstanding === 0) && !serialStoreInFlight &&
                          !storeMissBarrier &&
                          stAwDone && stWDone && evictAwDone && evictWDone
+      if (nonBlocking) b && nbIdle else b }
     dcIdleForMaint.simPublic()
 
     /** REGISTERED export of the maintenance precondition (2026-09-13, 200 MHz cone).
@@ -3759,10 +3876,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // simply the direct statement. EVICT_WR/REFILL/REPLAY (and the sectored EVICT_RD/CK
     // walk) are all non-IDLE, so a refill's AR..last-R and an eviction's AW..B are covered.
     val busQuiescedReg: Bool = if (!exportBusQuiesced) null else {
-      val quietNow = fsm.isActive(fsm.IDLE) && !ldS1Valid && !loadShadowValid &&
+      // Non-blocking L1D: the MSHR file, its waiters, replay queue and WB buffer are
+      // all "work already accepted that can reach the bus" (design note §4.4).
+      val quietNow = { val b = fsm.isActive(fsm.IDLE) && !ldS1Valid && !loadShadowValid &&
                      (storeOutstanding === 0) && !serialStoreInFlight &&
                      !pendingStoreMiss && !pendingWtKickoff && !storeMissBarrier &&
                      stAwDone && stWDone && evictAwDone && evictWDone && !maintBusyReg
+        if (nonBlocking) b && nbIdle else b }
       val enteringNow = loadCmdPort.valid || storePort.valid || maintCmdPort.valid
       val r = RegNext(quietNow && !enteringNow) init False
       r.simPublic()
@@ -4390,8 +4510,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
                            fsm.isActive(fsm.REPLAY) ||
                            (loadCmdPort.valid && !(storeReadOwed && stS1Valid))
 
-    val stS1Advance = stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
-      !storePipeHeld && !stS1SameLineAsS3
+    val stS1Advance =
+      if (!nonBlocking) stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
+        !storePipeHeld && !stS1SameLineAsS3
+      else stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
+        !storePipeHeld && !stS1SameLineAsS3 && !nbStoreHold
     // test-visibility only (DcacheStorePortReservationSpec's gap sweep and drain-rate
     // measurement); simPublic is a no-op for synthesis.
     loadPortReserved.simPublic(); stS1Advance.simPublic()
@@ -4404,7 +4527,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
       * was pre-empted out of) the shared array read port. Exclusive with
       * `stS1Advance` by construction. Replaces the old
       * `freshLoadUsesPort && stS1Valid` setter (that signal is now gone); see `loadPortReserved`. */
-    val storeDeniedPort = stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3
+    val storeDeniedPort =
+      if (!nonBlocking) stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3
+      else stS1Valid && !stS1Advance && !storePipeHeld && !stS1SameLineAsS3 && !nbStoreHold
     storeDeniedPort.simPublic()
 
     GenerationFlags.simulation {
@@ -4462,6 +4587,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       (!inputStoreSerial || (storeOutstanding === 0)) &&
       (!inputCopyback || (wtOutstanding === 0)) &&
       (!inputPipelinedWt || (wtOutstanding =/= U(MAX_WT_OUTSTANDING, wtOutstanding.getWidth bits)))
+    if (nonBlocking) when(nbStorePortHold) { storePort.ready := False }
 
     when(stS1Advance) { stS1Valid := False }
     when(s0Advance) {
@@ -4932,7 +5058,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // WRITETHROUGH hit/miss and INHIBITED remain the sole accepted descriptor
         // until AXI B.  If another physical writer has an open AW/W pair, retain the
         // existing deferred-kickoff discipline.
-        when(!evictAxiPairOpen && !maintAxiPairOpen) {
+        when(!evictAxiPairOpen && !maintAxiPairOpen &&
+             (if (nonBlocking) !nbWtWbHazardS3 else True)) {
           stAwDone := False
           stWDone  := False
         } otherwise {
@@ -4956,7 +5083,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // mirroring `pendingStoreMiss`'s existing shape.
     // POST-P5.4-REVIEW: also held off while the maintenance walk's own writeback pair
     // is open (see the S2 kickoff site above for the full reasoning).
-    when(pendingWtKickoff && !evictAxiPairOpen && !maintAxiPairOpen) {
+    when(pendingWtKickoff && !evictAxiPairOpen && !maintAxiPairOpen &&
+         (if (nonBlocking) !nbWtWbHazardPending else True)) {
       stAwDone := False
       stWDone  := False
       pendingWtKickoff := False
@@ -5173,6 +5301,25 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // of what any caller (real LsEuPlugin traffic or a directed test poking
     // DcachePlugin's `storePort` directly) presents.
     wtStoreAckReg := (storeBAck && stSubLast) && stIsPipelinedWtReg
+    val storeCompletionW: DStoreAck = if (!nonBlocking) null else {
+      val a = DStoreAck()
+      val bAck = storeBAck && stSubLast
+      val localAck = cbHitAckReg || storeAllocAckReg
+      a.count := (U(0, 2 bits) + bAck.asUInt.resize(2) + localAck.asUInt.resize(2))
+      // err(0) is the OLDER completion: the B when present, else the (never-erroring) local ack.
+      a.err(0) := bAck && (stSubErr || storeBErr)
+      a.err(1) := False
+      GenerationFlags.simulation {
+        assert(a.count <= U(1, 2 bits),
+          "DcachePlugin: two store completions in one cycle -- DStoreAck pairing (B = err(0), " +
+            "never spanning a client boundary) is only proven for count <= 1", FAILURE)
+        assert((a.count =/= 0) === storeAckReg, "DcachePlugin: DStoreAck.count disagrees with storeAckReg", FAILURE)
+        assert(a.err(0) === (storeErrReg && storeAckReg) || !bAck,
+          "DcachePlugin: DStoreAck.err(0) disagrees with storeErrReg", FAILURE)
+      }
+      a.simPublic()
+      a
+    }
 
     // Task P4.6: pins design doc §5 item 7's one-ack-per-store contract now that
     // storeAckReg has three sources (write-through AXI B, registered copyback-hit
@@ -5380,6 +5527,617 @@ class DcachePlugin(val socketMerged: Boolean = false,
     dbgStallDcPack(30) := axi.b.valid
     dbgStallDcPack(31) := axi.aw.valid || axi.w.valid
 
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // NON-BLOCKING L1D (D-side bandwidth program, stage 2). Design note:
+    // docs/superpowers/specs/2026-09-30-dside-nonblocking-l1d-and-hot-door.md -- the §
+    // numbers below refer to it. Placed LAST in `logic` on purpose: its array-port writes
+    // are last-assignment-wins over every earlier writer, and every conflicting writer is
+    // either held off explicitly here (store S3) or is a repair path that re-fires on
+    // its own (the multi-hot purge).
+    //
+    // RULES THIS BLOCK KEEPS (each one is a known bug shape of this file):
+    //   * every state field has one owner; nothing is set in one place and cleared in
+    //     another (the `evictAxiPairOpen` one-way latch);
+    //   * the BRAM tag compare drives only `stgValid`; every enable below is a function
+    //     of flops (§9);
+    //   * stores own no way: they merge by LINE into an MSHR that owns its way (§4.4).
+    // ══════════════════════════════════════════════════════════════════════════════════
+    val nb = if (!nonBlocking) null else new Area {
+      val N     = nMshr
+      val idxW  = log2Up(N)
+      val lineW = 32 - offBits
+      def ST(v: Int) = U(v, 3 bits)
+      val FREE = 0; val WAIT_AR = 1; val ARQ = 2; val WAIT_R = 3; val FILLED = 4; val LINGER = 5
+
+      def mergeBytes(base: Bits, over: Bits, strb: Bits): Bits = {
+        val b = base.subdivideIn(8 bits); val o = over.subdivideIn(8 bits)
+        Vec((0 until 16).map(i => Mux(strb(i), o(i), b(i)))).asBits
+      }
+      def lineOfPa(pa: UInt): UInt = pa(31 downto offBits)
+      def setOfPa(pa: UInt): UInt = pa(offBits + setBits - 1 downto offBits)
+
+      // ── MSHR file (§3) ──────────────────────────────────────────────────────────────
+      val st      = Vec.fill(N)(RegInit(ST(FREE)))
+      val line    = Vec.fill(N)(Reg(UInt(lineW bits)))
+      val eset    = Vec.fill(N)(Reg(UInt(setBits bits)))
+      val eway    = Vec.fill(N)(Reg(UInt(wayBits bits)))
+      val rbuf    = Vec.fill(N)(Reg(Bits(128 bits)))
+      val mbuf    = Vec.fill(N)(Reg(Bits(128 bits)))
+      val mstrb   = Vec.fill(N)(Reg(Bits(16 bits)))
+      val mdirty  = Vec.fill(N)(Reg(Bool()))
+      val fault   = Vec.fill(N)(Reg(Bool()))
+      val invPend = Vec.fill(N)(RegInit(False))
+      val settled = Vec.fill(N)(RegInit(False))
+      val blocked = Vec.fill(N)(RegInit(True))
+      val linger  = Vec.fill(N)(Reg(UInt(2 bits)) init 0)
+      val byStore = Vec.fill(N)(RegInit(False))
+      val instWait = Vec.fill(N)(Reg(UInt(5 bits)) init 0)
+      st.simPublic(); line.simPublic(); eset.simPublic(); eway.simPublic(); invPend.simPublic()
+      mstrb.simPublic(); fault.simPublic()
+      val validVec = Vec((0 until N).map(k => st(k) =/= ST(FREE)))
+      val freeBits = (~validVec.asBits)
+      val freeCnt  = CountOne(freeBits)
+      val anyInv   = invPend.asBits.orR
+      def merged(k: Int): Bits = mergeBytes(rbuf(k), mbuf(k), mstrb(k))
+
+      // ── Waiters (§4.3): one per LS ring slot (rid) + one SERIAL slot ────────────────
+      val NW  = (1 << DLoadRid.Width) + 1
+      val SER = NW - 1
+      val wv    = Vec.fill(NW)(RegInit(False))
+      val wm    = Vec.fill(NW)(Reg(UInt(idxW bits)))
+      val woff  = Vec.fill(NW)(Reg(UInt(offBits bits)))
+      val wsize = Vec.fill(NW)(Reg(Size()))
+      val wlo   = Vec.fill(NW)(Reg(Bool()))
+      val wtok  = Vec.fill(NW)(Reg(UInt(DLoadToken.Width bits)))
+      val wrid  = Vec.fill(NW)(Reg(UInt(DLoadRid.Width bits)))
+      val wridv = Vec.fill(NW)(Reg(Bool()))
+      wv.simPublic()
+      val anyW = wv.asBits.orR
+      def waiterRef(k: Int): Bool = (0 until NW).map(w => wv(w) && wm(w) === U(k, idxW bits)).reduce(_ || _)
+
+      // ── Load allocation STAGE (§4.1): the tag compare drives ONLY `stgValid`; every
+      // payload register loads unconditionally (no clock enable). ─────────────────────
+      val stgValid = RegInit(False)
+      stgValid := ldS1Valid && !ldS1Hit && (ldS1Cmode =/= CacheMode.INHIBITED)
+      stgValid.simPublic()
+      val stgPaddr   = RegNext(ldS1Paddr)
+      val stgSet     = RegNext(ldS1Set)
+      val stgOff     = RegNext(ldS1Off)
+      val stgSize    = RegNext(ldS1Size)
+      val stgTok     = RegNext(ldS1Token)
+      val stgRid     = RegNext(ldS1Rid)
+      val stgRidV    = RegNext(ldS1RidV)
+      val stgLineOnly = RegNext(ldS1LineOnly)
+      val stgCmode   = RegNext(ldS1Cmode)
+      val stgMultiHot = RegNext(ldS1MultiHot)
+      val s1Vw       = victim(ldS1Set)
+      val s1VFromS3   = stS3ArrayWrite && (stS3Set === ldS1Set) && (stS3Way === s1Vw)
+      val s1VFromS3D1 = stS3WriteD1 && (stS3WriteSetD1 === ldS1Set) && (stS3WriteWayD1 === s1Vw)
+      val stgVWay  = RegNext(s1Vw)
+      val stgVDirty = RegNext(((rdDirty(s1Vw) && rdValid(s1Vw)) || (s1VFromS3 && stS3Copyback) ||
+                               (s1VFromS3D1 && stS3WriteCopybackD1)))
+      val stgVTag  = RegNext(Mux(s1VFromS3, stS3Tag, Mux(s1VFromS3D1, stS3WriteTagD1, rdTag(s1Vw))))
+      val stgVLine = RegNext(Mux(s1VFromS3, stS3MergedLine, Mux(s1VFromS3D1, stS3WriteLineD1, rdData(s1Vw))))
+
+      // ── Writeback buffer (§6.2): FIFO, up to 2 pushes per cycle, drains on `axi` ────
+      val WBD = 4
+      val wbV    = Vec.fill(WBD)(RegInit(False))
+      val wbLine = Vec.fill(WBD)(Reg(UInt(lineW bits)))
+      val wbData = Vec.fill(WBD)(Reg(Bits(128 bits)))
+      val wbHead = Reg(UInt(2 bits)) init 0
+      val wbTail = Reg(UInt(2 bits)) init 0
+      val wbCount = Reg(UInt(3 bits)) init 0
+      val wbIssued = RegInit(False)
+      wbCount.simPublic(); wbIssued.simPublic()
+      val wbFree = U(WBD, 3 bits) - wbCount
+
+      // ── Store staging (§4.2): the legacy `pendingStoreMiss` + `pending*` registers ───
+      val sLine = lineOfPa(pendingStorePaddr)
+      val sSet  = setOfPa(pendingStorePaddr)
+      val sDo   = pendingStoreMiss
+      val sCam  = Vec((0 until N).map(k => validVec(k) && line(k) === sLine))
+      val sCamAny = sCam.asBits.orR
+      val sAlloc = sDo && !sCamAny
+      val sOH    = OHMasking.first(freeBits) & B(N bits, default -> sAlloc)
+      val sNoFill = pendingMergeStrb.andR
+      val sWbPush = sAlloc && pendingVictimDirty
+      val s2CbRes = (stS2Valid && stS2Copyback).asUInt.resize(3)
+
+      // ── Load staging decision (§4.1), store first ───────────────────────────────────
+      val lLine = lineOfPa(stgPaddr)
+      val lCam  = Vec((0 until N).map(k => validVec(k) && line(k) === lLine))
+      val lCamAny = lCam.asBits.orR
+      val lSetBusy = (0 until N).map(k => validVec(k) && eset(k) === stgSet).reduce(_ || _) ||
+                     (sAlloc && sSet === stgSet)
+      val freeAfterS = freeBits & ~sOH
+      val lFreeOk = CountOne(freeAfterS).resize(3) >= (U(1, 3 bits) + s2CbRes)
+      val lWbOk   = !stgVDirty ||
+                    ((wbFree - sWbPush.asUInt.resize(3)) >= (U(1, 3 bits) + s2CbRes))
+      val lSecondary = stgValid && !stgMultiHot && lCamAny
+      val lAlloc  = stgValid && !stgMultiHot && !lCamAny && !lSetBusy && lFreeOk && lWbOk &&
+                    !resetSweepBusy && !maintWalking
+      val lFail   = stgValid && !lSecondary && !lAlloc
+      val lOH     = OHMasking.first(freeAfterS) & B(N bits, default -> lAlloc)
+      val lWbPush = lAlloc && stgVDirty
+      val lSlot   = Mux(stgRidV, stgRid.resize(log2Up(NW)), U(SER, log2Up(NW) bits))
+      val lTarget = Mux(lSecondary, OHToUInt(lCam.asBits), OHToUInt(lOH))
+      val lAddW   = lSecondary || lAlloc
+
+      // ── Replay queue (§4.1 "cannot allocate") -> the existing shadow slot ──────────
+      val RQ = 4
+      val rq = Vec.fill(RQ)(Reg(DLoadCmd()))
+      val rqHead = Reg(UInt(2 bits)) init 0
+      val rqTail = Reg(UInt(2 bits)) init 0
+      val rqCount = Reg(UInt(3 bits)) init 0
+      val rqNonEmpty = rqCount =/= 0
+      rqCount.simPublic()
+      val rqHeadCmd = rq(rqHead)
+      val rqHLine = lineOfPa(rqHeadCmd.paddr)
+      val rqHSet  = rqHeadCmd.vaddr(offBits + setBits - 1 downto offBits)
+      val rqGo = RegNext(
+        (0 until N).map(k => validVec(k) && line(k) === rqHLine).reduce(_ || _) ||
+        (!(0 until N).map(k => validVec(k) && eset(k) === rqHSet).reduce(_ || _) &&
+         (freeCnt.resize(3) >= U(2, 3 bits)) && (wbFree >= U(2, 3 bits)))) init False
+      nbShadowLoad := rqNonEmpty && !loadShadowValid && rqGo && !maintWalking
+      nbShadowCmd  := rqHeadCmd
+      val rqPush = lFail
+      when(rqPush) {
+        val c = rq(rqTail)
+        c.vaddr     := (U(0, 32 - offBits - setBits bits) ## stgSet ## stgOff).asUInt
+        c.paddr     := stgPaddr
+        c.size      := stgSize
+        c.cacheMode := stgCmode
+        c.token     := stgTok
+        c.rid       := stgRid
+        c.ridValid  := stgRidV
+        c.lineOnly  := stgLineOnly
+        c.ooOk      := True
+        rqTail := rqTail + 1
+      }
+      rqCount := rqCount + rqPush.asUInt.resize(3) - nbShadowLoad.asUInt.resize(3)
+      when(nbShadowLoad) {
+        rqHead := rqHead + 1
+        loadShadowCmd       := rqHeadCmd
+        loadShadowValid     := True
+        loadShadowCaptureEv := True
+      }
+
+      // ── Allocation / merge writes ────────────────────────────────────────────────────
+      val sVictimLineAddr = (pendingVictimTag ## sSet).asUInt
+      val lVictimLineAddr = (stgVTag ## stgSet).asUInt
+      for (k <- 0 until N) {
+        settled(k) := True
+        when(sOH(k)) {
+          st(k)     := Mux(sNoFill, ST(FILLED), ST(WAIT_AR))
+          line(k)   := sLine
+          eset(k)   := sSet
+          eway(k)   := pendingVictimWay
+          mbuf(k)   := pendingMergeData
+          mstrb(k)  := pendingMergeStrb
+          mdirty(k) := True
+          fault(k)  := False
+          invPend(k) := True
+          settled(k) := False
+          byStore(k) := True
+          linger(k) := 0
+        }
+        when(lOH(k)) {
+          st(k)     := ST(WAIT_AR)
+          line(k)   := lLine
+          eset(k)   := stgSet
+          eway(k)   := stgVWay
+          mstrb(k)  := B(0, 16 bits)
+          mdirty(k) := False
+          fault(k)  := False
+          invPend(k) := True
+          settled(k) := False
+          byStore(k) := False
+          linger(k) := 0
+        }
+        // COPYBACK store merge into an in-flight line (§4.2): bytes + dirty, ack now.
+        when(sDo && sCam(k)) {
+          mbuf(k)   := mergeBytes(mbuf(k), pendingMergeData, pendingMergeStrb)
+          mstrb(k)  := mstrb(k) | pendingMergeStrb
+          mdirty(k) := True
+        }
+      }
+      when(sAlloc) { victim(sSet) := pendingVictimWay + 1 }
+      when(lAlloc) { victim(stgSet) := stgVWay + 1 }
+      when(sDo) {
+        pendingStoreMiss := False
+        storeAllocAckReg := True
+      }
+      // WRITETHROUGH store at S3 that missed the array: overlay its bytes on an in-flight
+      // line of the same address (no dirty -- memory gets the write too). §4.2.
+      val s3Line = lineOfPa(stS3Payload.paddr)
+      val s3WtMiss = stS3Valid && (stS3Payload.cacheMode === CacheMode.WRITETHROUGH) && !stS3Hit
+      val s3Cam = Vec((0 until N).map(k => validVec(k) && line(k) === s3Line))
+      for (k <- 0 until N) when(s3WtMiss && s3Cam(k)) {
+        mbuf(k)  := mergeBytes(mbuf(k), stS3MergeData, stS3MergeStrb)
+        mstrb(k) := mstrb(k) | stS3MergeStrb
+      }
+      // Waiter add
+      when(lAddW) {
+        for (w <- 0 until NW) when(lSlot === U(w, log2Up(NW) bits)) {
+          wv(w)    := True
+          wm(w)    := lTarget
+          woff(w)  := stgOff
+          wsize(w) := stgSize
+          wlo(w)   := stgLineOnly
+          wtok(w)  := stgTok
+          wrid(w)  := stgRid
+          wridv(w) := stgRidV
+        }
+      }
+
+      // WB pushes (store victim first, then load victim).
+      when(sWbPush || lWbPush) {
+        val t0 = wbTail
+        val t1 = wbTail + 1
+        when(sWbPush) {
+          wbV(t0) := True; wbLine(t0) := sVictimLineAddr; wbData(t0) := pendingVictimLine
+          when(lWbPush) { wbV(t1) := True; wbLine(t1) := lVictimLineAddr; wbData(t1) := stgVLine }
+        } otherwise {
+          wbV(t0) := True; wbLine(t0) := lVictimLineAddr; wbData(t0) := stgVLine
+        }
+        wbTail := wbTail + (sWbPush.asUInt.resize(2) + lWbPush.asUInt.resize(2))
+      }
+
+      // ── Array writes: victim invalidate (one per cycle) and install (one per cycle) ─
+      nbArrayWrite    := False
+      nbArrayWriteSet := U(0, setBits bits)
+      val invCand = Vec((0 until N).map(k => invPend(k) &&
+        !(stS3ArrayWrite && stS3Copyback && stS3Way === eway(k))))
+      val invOH = OHMasking.first(invCand.asBits)
+      val invAny = invCand.asBits.orR
+      val invIdx = OHToUInt(invOH)
+      val nbWroteWay = Vec.fill(ways)(False)
+      when(invAny) {
+        for (w <- 0 until ways) when(eway(invIdx) === U(w, wayBits bits)) {
+          validsWrEn(w) := True; validsWrSet(w) := eset(invIdx); validsWrData(w) := False
+          dirtysWrEn(w) := True; dirtysWrSet(w) := eset(invIdx); dirtysWrData(w) := False
+          nbWroteWay(w) := True
+        }
+        nbArrayWrite := True
+        nbArrayWriteSet := eset(invIdx)
+        for (k <- 0 until N) when(invOH(k)) { invPend(k) := False }
+      }
+      // A store HELD in S1 re-reads its set every cycle and only advances with
+      // `!nbStoreHold`, so it blocks the install only on a cycle it could advance -- else a
+      // store held for resources on this set would wait on an install that waits on it.
+      val instHold = Vec((0 until N).map(k =>
+        (stS1Valid && stS1Set === eset(k) && !nbStoreHold) || (stS2Valid && stS2Set === eset(k)) ||
+        (pendingStoreMiss && sSet === eset(k)) || (stS3Valid && stS3Set === eset(k)) ||
+        (stS3ArrayWrite && stS3Way === eway(k)) || anyInv || resetSweepBusy))
+      val instCand = Vec((0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !invPend(k) && !instHold(k)))
+      val instOH  = OHMasking.first(instCand.asBits)
+      val instAny = instCand.asBits.orR
+      val instIdx = OHToUInt(instOH)
+      val instData = MuxOH(instOH, (0 until N).map(merged))
+      when(instAny) {
+        for (w <- 0 until ways) when(eway(instIdx) === U(w, wayBits bits)) {
+          wrEn(w)    := True
+          wrSet(w)   := eset(instIdx)
+          wrData(w)  := instData
+          wrTagEn(w) := True
+          wrTag(w)   := line(instIdx)(lineW - 1 downto setBits)
+          validsWrEn(w) := True; validsWrSet(w) := eset(instIdx); validsWrData(w) := True
+          dirtysWrEn(w) := True; dirtysWrSet(w) := eset(instIdx); dirtysWrData(w) := mdirty(instIdx)
+          nbWroteWay(w) := True
+        }
+        nbArrayWrite := True
+        nbArrayWriteSet := eset(instIdx)
+      }
+      for (k <- 0 until N) {
+        when(instOH(k) && instAny) { st(k) := ST(LINGER); linger(k) := 3 }
+        when(st(k) === ST(FILLED) && !fault(k) && !instCand(k)) {
+          when(instWait(k) =/= 31) { instWait(k) := instWait(k) + 1 }
+        } otherwise { instWait(k) := 0 }
+      }
+      val storePortHoldReg = RegNext(instWait.map(_ > 16).reduce(_ || _)) init False
+      nbStorePortHold := storePortHoldReg
+
+      // Faulted fill (§4.4): never installed; waiters get `fault`; merged store bytes are
+      // dropped with a diagnostic, exactly like today's write-allocate fault path.
+      for (k <- 0 until N) when(st(k) === ST(FILLED) && fault(k) && !invPend(k)) {
+        st(k) := ST(LINGER); linger(k) := 0
+      }
+      val faultDropStores = (0 until N).map(k =>
+        st(k) === ST(FILLED) && fault(k) && !invPend(k) && mstrb(k).orR).reduce(_ || _)
+      when(faultDropStores) {
+        diagFaultPulse      := True
+        diagFaultPulseAddr  := (line(OHToUInt(OHMasking.first(Vec((0 until N).map(k =>
+                                 st(k) === ST(FILLED) && fault(k) && !invPend(k) && mstrb(k).orR)).asBits))) ##
+                               U(0, offBits bits)).asUInt
+        diagFaultPulseResp  := U(2, 2 bits)
+        diagFaultPulseKind  := U(1, 3 bits)
+        diagFaultKind1Fires := True
+      }
+
+      // LINGER -> FREE (§3.3): countdown done, no waiter points here, none added now.
+      for (k <- 0 until N) when(st(k) === ST(LINGER)) {
+        when(linger(k) =/= 0) { linger(k) := linger(k) - 1 }
+        .elsewhen(!waiterRef(k) && !(lAddW && lTarget === U(k, idxW bits))) { st(k) := ST(FREE) }
+      }
+
+      // ── Writeback-address gate (§6.3): registered, includes this cycle's pushes ──────
+      val wtInFlight = Vec((0 until MAX_WT_OUTSTANDING).map { i =>
+        val rel = (U(i, wtFaultFifoIdxW bits) - wtFaultFifoPop(wtFaultFifoIdxW - 1 downto 0))
+        rel.resize(wtFaultFifoIdxW + 1) < (wtFaultFifoPush - wtFaultFifoPop)
+      })
+      val s3ColdPush = stS3Valid && !stS3Copyback
+      def bufferedWbTo(x: UInt): Bool =
+        (0 until WBD).map(i => wbV(i) && wbLine(i) === x).reduce(_ || _) ||
+        (sWbPush && sVictimLineAddr === x) || (lWbPush && lVictimLineAddr === x)
+      nbWtWbHazardS3 := bufferedWbTo(s3Line)
+      nbWtWbHazardPending := bufferedWbTo(lineOfPa(stAddrReg))
+      def coldWriteTo(x: UInt): Bool =
+        bufferedWbTo(x) ||
+        (0 until MAX_WT_OUTSTANDING).map(i => wtInFlight(i) && lineOfPa(wtFaultFifoAddr(i)) === x).reduce(_ || _) ||
+        (s3ColdPush && s3Line === x)
+      for (k <- 0 until N) blocked(k) := coldWriteTo(line(k))
+
+      // ── AR issue (§3.3): one holding register, ID = MSHR index ──────────────────────
+      val arV   = RegInit(False)
+      val arIdx = Reg(UInt(idxW bits)) init 0
+      val arAddr = Reg(UInt(32 bits)) init 0
+      // A cold write may enter the buffer after this AR was selected. Recheck its
+      // registered address at the actual handshake; the selection-time verdict
+      // alone cannot protect that interval.
+      val arIssue = arV && !coldWriteTo(lineOfPa(arAddr))
+      arV.simPublic(); arIdx.simPublic()
+      val arDelayOk: Vec[Bool] = Vec((0 until N).map(_ => True))
+      if (storeAllocArDelay > 0) {
+        val arWait = Vec.fill(N)(Reg(UInt(4 bits)) init 0)
+        for (k <- 0 until N) {
+          when(st(k) === ST(WAIT_AR)) { when(arWait(k) =/= 15) { arWait(k) := arWait(k) + 1 } }
+          .otherwise { arWait(k) := 0 }
+          arDelayOk(k) := !byStore(k) || (arWait(k) >= U(storeAllocArDelay, 4 bits))
+          // Trailing stores completed all 16 strobes before the AR left: cancel the fill.
+          when(st(k) === ST(WAIT_AR) && byStore(k) && mstrb(k).andR && !arDelayOk(k)) { st(k) := ST(FILLED) }
+        }
+      }
+      val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) && !blocked(k) && arDelayOk(k)))
+      val arFire = Bool()
+      when(arFire) { for (k <- 0 until N) when(arIdx === U(k, idxW bits)) { st(k) := ST(WAIT_R) } }
+      when(!arV || arFire) {
+        val oh = OHMasking.first(arCand.asBits)
+        arV := arCand.asBits.orR
+        when(arCand.asBits.orR) {
+          arIdx  := OHToUInt(oh)
+          arAddr := (MuxOH(oh, line) ## U(0, offBits bits)).asUInt
+          for (k <- 0 until N) when(oh(k)) { st(k) := ST(ARQ) }
+        }
+      }
+      val rFire = Bool(); val rId = UInt(idxW bits); val rData = Bits(128 bits); val rErr = Bool()
+      if (hotDoor) {
+        axiDh.ar.valid := arIssue
+        axiDh.ar.payload.assignDontCare()
+        axiDh.ar.payload.addr  := arAddr
+        axiDh.ar.payload.id    := arIdx.resize(2)
+        axiDh.ar.payload.len   := U(0, 8 bits)
+        axiDh.ar.payload.size  := U(4, 3 bits)
+        axiDh.ar.payload.burst := Axi4.burst.INCR
+        arFire := axiDh.ar.fire
+        axiDh.r.ready := True
+        rFire := axiDh.r.fire
+        rId   := axiDh.r.payload.id.resize(idxW)
+        rData := axiDh.r.payload.data
+        rErr  := axiDh.r.payload.resp =/= Axi4.resp.OKAY
+      } else {
+        // `axi_d` arm: the legacy FSM owns `axi` AR/R only in REFILL (inhibited, D4-fenced).
+        val legacyOwnsR = fsm.isActive(fsm.REFILL)
+        val refillIds = Vec((0 until 4).map(k => U(AxiIds.dRefill(k), AxiIds.ID_W bits)))
+        when(arIssue && !legacyOwnsR) {
+          axi.ar.valid         := True
+          axi.ar.payload.addr  := arAddr
+          axi.ar.payload.id    := refillIds(arIdx.resize(2))
+          axi.ar.payload.len   := U(0, 8 bits)
+          axi.ar.payload.size  := U(4, 3 bits)
+          axi.ar.payload.burst := Axi4.burst.INCR
+        }
+        arFire := arIssue && !legacyOwnsR && axi.ar.ready
+        when(!legacyOwnsR) { axi.r.ready := True }
+        rFire := axi.r.fire && !legacyOwnsR
+        rId   := axi.r.payload.id.resize(idxW)
+        rData := axi.r.payload.data
+        rErr  := axi.r.payload.resp =/= Axi4.resp.OKAY
+      }
+      when(rFire) {
+        for (k <- 0 until N) when(rId === U(k, idxW bits)) {
+          rbuf(k)  := rData
+          fault(k) := rErr
+          st(k)    := ST(FILLED)
+        }
+      }
+
+      // ── WB drain on `axi` (§6.2). The pair-open flags ARE `evictAwDone/evictWDone`, so
+      // the existing store/maintenance mutual exclusion covers it unchanged. ───────────
+      val wbKick = (wbCount =/= 0) && !wbIssued && evictAwDone && evictWDone &&
+                   stAwDone && stWDone && (!pendingWtKickoff || nbWtWbHazardPending) &&
+                   !(stS3Valid && !stS3Copyback) &&
+                   !storeBAck && !maintAxiPairOpen
+      when(wbKick) { evictAwDone := False; evictWDone := False; wbIssued := True }
+      when(!evictAwDone) {
+        axi.aw.valid         := True
+        axi.aw.payload.addr  := (wbLine(wbHead) ## U(0, offBits bits)).asUInt
+        axi.aw.payload.id    := U(AxiIds.D_PUSH, AxiIds.ID_W bits)
+        axi.aw.payload.len   := U(0, 8 bits)
+        axi.aw.payload.size  := U(4, 3 bits)
+        axi.aw.payload.burst := Axi4.burst.INCR
+        when(axi.aw.ready) { evictAwDone := True }
+      }
+      when(!evictWDone) {
+        axi.w.valid        := True
+        axi.w.payload.data := wbData(wbHead)
+        axi.w.payload.strb := B(0xFFFF, 16 bits)
+        axi.w.payload.last := True
+        when(axi.w.ready) { evictWDone := True }
+      }
+      val wbB = axi.b.valid && axi.b.ready && (axi.b.payload.id === U(AxiIds.D_PUSH, AxiIds.ID_W bits))
+      when(wbB) {
+        wbV(wbHead) := False
+        wbHead := wbHead + 1
+        wbIssued := False
+        when(axi.b.payload.resp =/= Axi4.resp.OKAY) {
+          diagFaultPulse     := True
+          diagFaultPulseAddr := (wbLine(wbHead) ## U(0, offBits bits)).asUInt
+          diagFaultPulseResp := axi.b.payload.resp.asUInt.resize(2)
+          diagFaultPulseKind := U(2, 3 bits)
+        }
+      }
+      wbCount := wbCount + sWbPush.asUInt.resize(3) + lWbPush.asUInt.resize(3) - wbB.asUInt.resize(3)
+
+      // ── Response slot (§5): reuses missLine/miss* and the missLine output arm ───────
+      val rV = RegInit(False)
+      val rFlt = Reg(Bool()) init False
+      rV.simPublic()
+      nbRespFire  := rV && !ldS2Resp
+      nbRespFault := rFlt
+      val wCand = Vec((0 until NW).map(w => wv(w) &&
+        ((0 until N).map(k => wm(w) === U(k, idxW bits) &&
+          (st(k) === ST(FILLED) || st(k) === ST(LINGER))).reduce(_ || _))))
+      when(!rV || nbRespFire) {
+        val oh = OHMasking.first(wCand.asBits)
+        rV := wCand.asBits.orR
+        when(wCand.asBits.orR) {
+          val m = MuxOH(oh, wm)
+          missLine     := MuxOH(UIntToOh(m, N), (0 until N).map(merged))
+          missOff      := MuxOH(oh, woff)
+          missSize     := MuxOH(oh, wsize)
+          missLineOnly := MuxOH(oh, wlo)
+          missToken    := MuxOH(oh, wtok)
+          missRid      := MuxOH(oh, wrid)
+          missRidV     := MuxOH(oh, wridv)
+          rFlt         := MuxOH(UIntToOh(m, N), fault)
+          for (w <- 0 until NW) when(oh(w)) { wv(w) := False }
+        }
+      }
+
+      // ── Command admission (§4.3) ──────────────────────────────────────────────────
+      val serialPending = RegInit(False)
+      serialPending.simPublic()
+      val quietForSerial = !ldS1Valid && !stgValid && !anyW && !rV && !rqNonEmpty && !loadShadowValid
+      nbCmdReady := !rqNonEmpty && !serialPending &&
+                    (loadCmdPort.payload.ooOk || quietForSerial)
+      when(loadRspPort.valid && serialPending) { serialPending := False }
+      when(loadCmdPort.fire && !loadCmdPort.payload.ooOk) { serialPending := True }
+
+      // ── Store S1 hold (§4.4): flops only ─────────────────────────────────────────────
+      val s1Line = lineOfPa(stS1Payload.paddr)
+      val camS1  = (0 until N).map(k => validVec(k) && line(k) === s1Line).reduce(_ || _)
+      val setConfS1 = (0 until N).map(k => validVec(k) && eset(k) === stS1Set && line(k) =/= s1Line).reduce(_ || _)
+      val cbS1 = stS1Payload.cacheMode === CacheMode.COPYBACK
+      val inflightAllocs = pendingStoreMiss.asUInt.resize(3) + stgValid.asUInt.resize(3) + s2CbRes
+      val resShort = (freeCnt.resize(3) < (U(1, 3 bits) + inflightAllocs)) ||
+                     (wbFree < (U(1, 3 bits) + inflightAllocs))
+      nbStoreHold := anyInv ||
+        (stgValid && stgSet === stS1Set) || (ldS1Valid && ldS1Set === stS1Set) ||
+        (stS2Valid && stS2Set === stS1Set) || (pendingStoreMiss && sSet === stS1Set) ||
+        (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort)
+
+      nbIdle := !validVec.asBits.orR && (wbCount === 0) && !wbIssued && !anyW && !rV &&
+                !stgValid && !rqNonEmpty && !arV && !serialPending
+
+      // ══ Simulation-only tripwires and counters ═══════════════════════════════════════
+      GenerationFlags.simulation {
+        assert(!(sAlloc && stgValid && lLine === sLine),
+          "DcachePlugin.nb: a store and a load allocated the SAME line in one cycle", FAILURE)
+        assert(!(sDo && !sCamAny && !(freeBits.orR)), "DcachePlugin.nb: store allocation with no free MSHR", FAILURE)
+        assert(!(sAlloc && (0 until N).map(k => validVec(k) && eset(k) === sSet).reduce(_ || _)),
+          "DcachePlugin.nb: store allocation violates D3-SET", FAILURE)
+        assert(!(sWbPush && wbFree === 0), "DcachePlugin.nb: store victim pushed into a full WB buffer", FAILURE)
+        assert(wbCount <= U(WBD, 3 bits), "DcachePlugin.nb: WB buffer overflow", FAILURE)
+        assert(rqCount <= U(RQ, 3 bits), "DcachePlugin.nb: replay queue overflow", FAILURE)
+        assert(!(sDo && storeMissDiscovered), "DcachePlugin.nb: a store miss was discovered while the store staging slot was busy", FAILURE)
+        for (k <- 0 until N) {
+          assert(!(sDo && sCam(k) && st(k) === ST(LINGER) && !fault(k)),
+            "DcachePlugin.nb: a store merged into an ALREADY-INSTALLED line (lost store)", FAILURE)
+          assert(!(s3WtMiss && s3Cam(k) && st(k) === ST(LINGER) && !fault(k)),
+            "DcachePlugin.nb: a WT store overlaid an ALREADY-INSTALLED line", FAILURE)
+          assert(!(rFire && rId === U(k, idxW bits) && st(k) =/= ST(WAIT_R)),
+            "DcachePlugin.nb: R beat for an MSHR not waiting for one", FAILURE)
+        }
+        assert(!(lAddW && wv(lSlot)), "DcachePlugin.nb: waiter slot reused while still owed a response", FAILURE)
+        assert(!(loadCmdPort.fire && loadCmdPort.payload.ridValid && loadCmdPort.payload.ooOk &&
+                 wv(loadCmdPort.payload.rid.resize(log2Up(NW)))),
+          "DcachePlugin.nb: LS ring slot re-sent while the cache still owes it a response", FAILURE)
+        assert(!(loadShadowCaptureEv && nbShadowLoad && loadShadowValid),
+          "DcachePlugin.nb: replay transfer collided with an occupied shadow slot", FAILURE)
+        assert(!(nbRespFire && (busFaultResp || inhibitedResp || (if (fillForward) fillFwdResp else False))),
+          "DcachePlugin.nb: MSHR response collided with a legacy response", FAILURE)
+        assert(!((loadMissDiscovered && ldS1Cmode === CacheMode.INHIBITED) && !(validVec.asBits === 0 &&
+                 wbCount === 0 && !anyW && !rV && !stgValid && !rqNonEmpty && !arV)),
+          "DcachePlugin.nb: INHIBITED miss while the non-blocking subsystem is busy (D4 contract broken)", FAILURE)
+        if (!hotDoor) assert(!(fsm.isActive(fsm.REFILL) && (arV || st.map(_ === ST(WAIT_R)).reduce(_ || _))),
+          "DcachePlugin.nb: legacy inhibited refill overlaps an MSHR read on axi", FAILURE)
+        // Exact WB gate at the AR handshake (the registered verdict must never be wrong).
+        val arLine = lineOfPa(arAddr)
+        val arExact = (0 until WBD).map(i => wbV(i) && wbLine(i) === arLine).reduce(_ || _) ||
+          (0 until MAX_WT_OUTSTANDING).map(i => wtInFlight(i) && lineOfPa(wtFaultFifoAddr(i)) === arLine).reduce(_ || _)
+        assert(!(arFire && arExact), "DcachePlugin.nb: hot read issued while a cold write to its line awaits B", FAILURE)
+        for (w <- 0 until ways) assert(!(nbWroteWay(w) && (validsVoteW0(w) || validsVoteW1(w) || validsVoteW2(w) ||
+            validsVoteW3(w) || dirtysVoteD0(w) || dirtysVoteD1(w) || dirtysVoteD2(w) || dirtysVoteD3(w) ||
+            dirtysVoteD4(w) || dirtysVoteD5(w))),
+          "DcachePlugin.nb: MSHR array write collided with another writer on the same way", FAILURE)
+        assert(!(nbShadowLoad && maintWalking), "DcachePlugin.nb: replay during a maintenance walk", FAILURE)
+        // Liveness: nothing sits outside FREE / owed for 20k cycles.
+        for (k <- 0 until N) {
+          val age = Reg(UInt(16 bits)) init 0
+          when(st(k) === ST(FREE)) { age := 0 } otherwise { age := age + 1 }
+          assert(age < 20000, s"DcachePlugin.nb: MSHR $k stuck (liveness)", FAILURE)
+        }
+        for (w <- 0 until NW) {
+          val age = Reg(UInt(16 bits)) init 0
+          when(!wv(w)) { age := 0 } otherwise { age := age + 1 }
+          assert(age < 20000, s"DcachePlugin.nb: waiter $w never answered (liveness)", FAILURE)
+        }
+        val wbAge = Reg(UInt(16 bits)) init 0
+        when(wbCount === 0) { wbAge := 0 } otherwise { wbAge := wbAge + 1 }
+        assert(wbAge < 20000, "DcachePlugin.nb: WB buffer never drains (liveness)", FAILURE)
+      }
+      // Counters (§10.1): sim-visible; the bench prints them as `[mshr]`.
+      /** name -> counter; empty outside simulation. Read by the bench and the stress. */
+      val ctrMap = scala.collection.mutable.LinkedHashMap[String, UInt]()
+      val ctr = GenerationFlags.simulation {
+        new Area {
+          def c(name: String, inc: Bool): UInt = {
+            val r = Reg(UInt(32 bits)) init 0; when(inc) { r := r + 1 }
+            r.setName(s"nbCtr_$name"); r.simPublic(); ctrMap(name) = r; r
+          }
+          val cycles        = c("cycles", True)
+          val primaryAllocs = c("primaryAllocs", lAlloc)
+          val storeAllocs   = c("storeAllocs", sAlloc)
+          val noFillAllocs  = c("noFillAllocs", sAlloc && sNoFill)
+          val loadSecondaries = c("loadSecondaries", lSecondary)
+          val storeMerges   = c("storeMerges", sDo && sCamAny)
+          val wtMerges      = c("wtMerges", s3WtMiss && s3Cam.asBits.orR)
+          val allocFail     = c("allocFail", lFail)
+          val failSet       = c("failSet", lFail && !stgMultiHot && lSetBusy)
+          val failFull      = c("failFull", lFail && !stgMultiHot && !lSetBusy && !lFreeOk)
+          val failWb        = c("failWb", lFail && !stgMultiHot && !lSetBusy && lFreeOk && !lWbOk)
+          val replays       = c("replays", nbShadowLoad)
+          val serialWait    = c("serialWait", loadCmdPort.valid && !nbCmdReady)
+          val wbGate        = c("wbGate", (0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) && blocked(k)).reduce(_ || _))
+          val installHold   = c("installHold", (0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !instCand(k)).reduce(_ || _))
+          val storeHold     = c("storeHold", stS1Valid && nbStoreHold)
+          val hotAr         = c("hotAr", arFire)
+          val wbPushes      = c("wbPushes", sWbPush || lWbPush)
+          val wbFull        = c("wbFull", wbCount === WBD)
+          val respHold      = c("respHold", rV && !nbRespFire)
+          val busyCycles    = c("busyCycles", validVec.asBits.orR)
+          // Σ outstanding refills (ARQ/WAIT_R) and cycles with >= 1: MLP = sum / cyc.
+          val outNow = CountOne((0 until N).map(k => st(k) === ST(WAIT_R)))
+          val mlpSum = Reg(UInt(32 bits)) init 0; mlpSum.setName("nbCtr_mlpSum"); mlpSum.simPublic()
+          mlpSum := mlpSum + outNow.resize(32); ctrMap("mlpSum") = mlpSum
+          val mlpCyc = c("mlpCyc", outNow =/= 0)
+          val occ = (0 to N).map(n => c(s"occ$n", CountOne(validVec) === n))
+          val arCancelled = if (storeAllocArDelay > 0) c("arCancelled",
+            (0 until N).map(k => st(k) === ST(WAIT_AR) && byStore(k) && mstrb(k).andR && !arDelayOk(k)).reduce(_ || _)) else null
+        }
+      }
+    }
+
   }
 
   override def loadProbe = logic.loadProbePort
@@ -5390,6 +6148,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
   override def loadBusy = logic.loadBusyReg
   override def store    = logic.storePort
   override def storeAck = logic.storeAckReg
+  override def storeCompletion = logic.storeCompletionW
   override def storeErr = logic.storeErrReg
   override def diagFault = logic.diagFaultValid
   override def maintCmd  = logic.maintCmdPort

@@ -1,7 +1,7 @@
 # D-side read bandwidth: a non-blocking L1D over the `axi_dh` hot door
 
-**Status: DESIGN NOTE, stage 1 of the D-side bandwidth program, 2026-09-30. Nothing here is
-built yet.** Owner's brief: *"i'd go balls to the wall on bandwidth, it's crazy to have such a
+**Status: stage 1 implemented behind default-OFF flags; simulation validation and bandwidth
+measurement in progress, 2026-10-01.** Owner's brief: *"i'd go balls to the wall on bandwidth, it's crazy to have such a
 slow core on fast DDR."* Design principle
 (`maximize-speculation-hot-fast-cold-slow-2026-09-30`): keep the hot path fast and speculative,
 let rare cases be slow, and don't add complexity that isn't needed.
@@ -34,7 +34,7 @@ marked **TRACE**.
    MSHR index, 2 bits). The route is chosen by the miss's MMU cache mode, never by an address
    decode. Everything else stays on the in-order cold path `axi_d`: inhibited accesses (the
    unchanged legacy FSM, fenced by D4), writethrough and precise store writes, and dirty-victim
-   writebacks (from a 2-entry writeback buffer).
+   writebacks (from a 4-entry writeback buffer).
 3. **There is one cross-path hazard, and it is closed locally.** A per-line **writeback-address
    gate** holds an `axi_dh` AR for line X while any cold write to X (a victim writeback, or a
    writethrough store) is still waiting for its B. The SoC trace confirms B means "in the L2
@@ -90,7 +90,7 @@ traffic counter.
         │          [line, set, way, rbuf, mbuf+strb, state]  ◄──R (by ID)──           │
         │                │  └─► response stage (1 waiter/cycle, reuses missLine mux) ─┘
         │                └───► install (one array write, from flops)
-        └──► victim invalidate + WB buffer (2) ──AW/W (D_PUSH)──► axi_d ──► xbar ──► L2 cold door
+        └──► victim invalidate + WB buffer (4) ──AW/W (D_PUSH)──► axi_d ──► xbar ──► L2 cold door
    legacy FSM: INHIBITED loads only (cold, D4-fenced)          WB gate: hold AR(X) while any
    legacy store AXI: WT / inhibited writes (cold)              cold write to X awaits B
 ```
@@ -322,7 +322,7 @@ invalidated less than 128 cycles earlier, above 1% of misses.
 
 ### 6.2 WB buffer
 
-Two entries `{line, data}` drain FIFO on `axi_d` with ID `D_PUSH`, one outstanding (the
+Four entries `{line, data}` drain FIFO on `axi_d` with ID `D_PUSH`, one outstanding (the
 crossbar allows exactly one write per master anyway, `axi_xbar.v:2057-2061`). The entry pops on
 B. Its AW/W pair joins the existing mutual-exclusion web (`storeWantsAxi`, `evictAxiPairOpen`,
 `maintAxiPairOpen`): the WB pair *is* `evictAxiPairOpen` in ON mode.
@@ -331,9 +331,10 @@ B. Its AW/W pair joins the existing mutual-exclusion web (`storeWantsAxi`, `evic
   and set True only by its own AW/W handshakes. Any walk that might skip `EVICT_WR` is gone.
 - **B error:** `diagFault` kind 2, as today.
 
-Why 2 entries: one covers the steady state of a copy (one dirty victim per dst line). The second
-lets an allocation proceed while the previous writeback's B is still ~8 cycles away (TRACE,
-§6.3). WB-full holds allocations, which is counted.
+Why 4 entries: a pending store plus a load in staging and a store in S2 can each
+consume a slot before the next store is admitted. The depth reserves those concurrent
+allocations while a previous writeback's B is still outstanding (TRACE, §6.3).
+WB-full holds allocations, which is counted.
 
 ### 6.3 The writeback-address gate
 
@@ -363,6 +364,49 @@ writethrough FIFO `wtFaultFifoAddr[pop..push)`, which already holds line address
   argument cannot drift.
 - **Writethrough stores still in S0-S2** that will later push line X: they will merge into MSHR(X)
   at S3 (§4.2). A later AR for X is gated once they reach the FIFO.
+
+### 6.3a Stage-2 amendments to §6 (as built)
+
+- **WB depth is 4, not 2.** The store S1 resource check must reserve a slot for every
+  allocation that can land before the store's own (the load staging, a store in S2, the
+  store staging), so a 2-deep buffer would stall stores whenever one writeback is in
+  flight. 4 x 156 FF.
+- **Install is held by a store in S1 only when that store could advance this cycle**
+  (`!nbStoreHold`). Holding it unconditionally deadlocks: a store held in S1 for want of an
+  MSHR in its set waits on an install that waits on the store.
+- **The victim invalidate is deferred** (`invPend`, one per cycle), because store S3 owns the
+  dirty-bit port of that way on the allocation cycle. Every store is held in S1 while any
+  invalidate is pending, so no store can write the evicted line between snapshot and
+  invalidate.
+
+### 6.3b The WB buffer's memory side is ONE narrow interface (re-pointable to the write door)
+
+The SoC now has a write half on the hot door (`DW_PORT_EN`, branch
+`feat/p6w-dside-write-door`; `tb_l2c` memcpy at L2: 2 outstanding writes = 4.56 B/cycle vs
+2.29). The WB buffer therefore talks to memory through exactly these signals, today bound to
+`axi` AW/W/B with ID `D_PUSH` and one outstanding:
+
+| signal | meaning |
+|---|---|
+| `wbKick` | head entry may issue (today: the `axi` pair-open exclusion) |
+| head `{line, data}` | one 16 B line, all strobes set, `awlen=0`, `awsize=4`, INCR |
+| `wbB` (+resp) | the head's B, popping the FIFO; non-OKAY = diag kind 2 |
+
+Re-pointing to the write door (a later flag) changes only the binding: AW/W on `axiDh`
+(2 write IDs, up to 2 outstanding, AW may run ahead of W, B in order per ID). The contract's
+extra rules and where each lands here:
+
+- **Extended WB gate.** Hold a read of line X on *either* port while any write of X on
+  *either* port lacks its B. The hot-read side is `coldWriteTo()` already, and it just gains
+  the write-door entries. Reads on `axi` are only inhibited, and those are D4-fenced.
+- **Never two writes to one line on different ports.** Hold a WT store kickoff for line X
+  while the WB holds X, and a WB kick of X while a WT write of X lacks its B. Both are line
+  CAMs over structures that exist (`wbLine`, `wtFaultFifoAddr`).
+- **D4.** `nbIdle` already requires the WB empty, and it gains "no hot write without its B".
+  No hot write may issue while an inhibited access is outstanding: the legacy FSM being out
+  of IDLE, or a serial inhibited store.
+- **Only copyback victims and full-line (`noFill`) installs** use it. WT and uncached writes
+  stay on the crossbar.
 
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
@@ -612,7 +656,62 @@ This design targets 16 B lines. What moves when sectors come back:
 | early AR from a resolved probe miss (§12.2 of the MSHR doc) | saves ~2 cycles; the victim can be captured later at the command's S1 read | T_fill measured > 14 in sim |
 | non-`ooOk` reordering (walkers past waiters) | needs a class-aware `ldFifo` in the LS EU | `serialWaitCycles` > 2% of cycles on `dhrystone-x0-cb`/corpus |
 | hot-door writes | SoC rejected a second write door (W-owner lock) | `wbFullCycles` > 10% with ring 8 |
-| deeper ring / `DLoadRid.Width = 3` | LS EU is the LS-OoO agent's file | MSHR + LS-OoO shows MLP pinned at ≤ 1.1 lines on `move.l` streams (C2) |
+| deeper ring / `DLoadRid.Width = 3 or 4` | descriptor, response association, and positional FIFO must resize together | a checked independent-load workload shows the 4-entry ring limits distinct-line MLP |
+
+### 12.1. Load concurrency amendment (2026-10-01; default remains 4)
+
+The first integrated `memcpy-16k` run with four MSHRs, the hot door, LS out-of-order issue,
+and SQ coalescing issued 3,810 refill ARs while an older victim writeback B was pending,
+but retired only 0.3167 copy B/cycle and measured 1.078 distinct-line MLP. That kernel
+offers little independent load work; overlapping bus transactions alone does not establish
+a throughput gain. Acceptance includes four independent pointer chains (separate address
+and destination registers), a checked sequential load stream, and grouped copy. A single
+dependent chain is the negative control. Compare the legacy blocking cache (one demand
+miss, explicitly a different architecture), then this cache with N=2 and N=4 MSHRs,
+with LS out-of-order issue on in every arm.
+
+The aligned-load descriptor ring is parameterized at 4, 8, or 16 entries, default 4.
+`DLoadRid.Width = log2(ringDepth)`, the park buffer equals ring depth, and the positional
+load-source FIFO is the next power of two covering `ringDepth + 3` (exception, ITLB, DTLB).
+The cache waiter table is `2^DLoadRid.Width + 1` (one extra serial slot). Split-pair
+admission reserves two ring slots; the response-token check, flush poisoning, inhibited
+ordering, and ring-wrap liveness assertions remain required at every depth. The ROB and
+issue queue do not change. A larger ring is accepted only if checked data, unique active
+line misses, ring occupancy, outstanding AXI IDs/requests, IQ ready-but-blocked and
+retirement blocking counters, cycles/instruction, and bandwidth show more useful
+concurrency under the same modeled latency. `CPU_LS_LOAD_RING_DEPTH` controls this sweep
+and remains 4 in the shipping default.
+
+The first paired full-core sweep used `IPC_MEM=l2:5:60:4096`, LS out-of-order issue,
+seed 1, and checked final data on every kernel. `chase-four` traverses four disjoint
+256-record pointer cycles, warming L2 on the first walk; `stream-16k` reads sequential
+longs through four independent accumulators. Both report useful bytes in the measured
+window, with identical instruction counts across arms. These are simulation results,
+not board measurements:
+
+| cache / ring | four-chain read B/cyc | four-chain distinct-line MLP | stream read B/cyc | stream distinct-line MLP |
+|---|---:|---:|---:|---:|
+| legacy blocking / 4 | 0.3651 | one demand miss | 0.9407 | one demand miss |
+| nonblocking N=2 / 4 | 0.3262 | 1.381 | 0.9352 | 1.000 |
+| nonblocking N=4 / 4 | 0.6552 | 1.797 | 0.9352 | 1.000 |
+| nonblocking N=4 / 8 | 0.6595 | 1.836 | 1.0600 | 1.551 |
+| nonblocking N=4 / 16 | 0.6595 | 1.836 | 1.1001 | 1.549 |
+
+N=4, ring 4 is 1.79x the legacy four-chain throughput and 2.01x N=2, with four
+AXI hot IDs simultaneously outstanding. Ring 8 improves the sequential stream by
+12.7% over legacy and enables a second distinct active line; ring 16 adds 3.8% over
+ring 8 while measured ring occupancy still peaks at eight. The dependent single-chain
+negative control stays at 0.4453 B/cycle across arms. The `oldestUnready` window falls
+from 20,345 of 22,435 cycles in legacy four-chain to 10,955 of 12,503 in N=4/ring4.
+This demonstrates latency hiding on offered independent misses. It does not imply a
+general memcpy gain: scalar memcpy remained 0.3167 B/cycle and 1.078 MLP in the first
+integrated run. Ring 8 is an experimental throughput candidate; its area/timing and
+broader correctness gates remain separate from these measurements.
+With seed 17, N=4/ring 8 again checked all data: four-chain reached 0.6577 B/cycle
+with four hot IDs outstanding, stream reached 1.1305 B/cycle with ring occupancy
+eight and two hot IDs, and the dependent chase stayed at 0.4453 B/cycle. The
+16-entry ring also passed the split-load enqueue and split/ordinary ring-wrap
+regressions, but the current full-core kernels used at most eight slots.
 
 ---
 
@@ -638,7 +737,7 @@ This design targets 16 B lines. What moves when sectors come back:
 | item | FF | LUT |
 |---|---:|---:|
 | MSHR entries | ~1,290 | |
-| WB buffer | ~310 | |
+| WB buffer (4 entries) | ~620 | |
 | waiters + serial slot | ~90 | |
 | staging | ~330 | |
 | `arReg` + socket slices | ~350 | |
@@ -647,7 +746,7 @@ This design targets 16 B lines. What moves when sectors come back:
 | control | | ~400 |
 | AR/R plumbing | | ~150 |
 | legacy arms removed in ON mode | | −~200 |
-| **total** | **~2.4k** | **~1.1-1.6k** |
+| **total** | **~2.7k** | **~1.1-1.6k** |
 
 0 BRAM, 0 DSP. The flow's LUT noise floor is ~800 (`PERF_LEVER_QUEUE` rule 6), so area is a
 guard, not a verdict.
@@ -666,6 +765,9 @@ guard, not a verdict.
    - **WT and CB on one line, and full-strobe stores** (the noFill path);
    - **CPUSH/CINV while MSHRs are busy;**
    - **window-guard-style DECERR on the hot door.**
+   - **same-line delayed visibility:** in a test-only memory mode, hold dirty-victim W
+     bytes invisible until B; a hot load of the evicted line must issue no AR before B
+     and must then return the new bytes. The normal memory model remains write-before-B.
 
    It must **fail first** on each of 10 single-mechanism mutants:
    1. no install hold on store S1/S2 set;
@@ -684,7 +786,10 @@ guard, not a verdict.
    `IPC_MEM=l2:5:60:4096` and `l2:5:240:64`. The hot-door model is attached with
    `AxiMemModel.attachReadOnly(..., sharedMem = dmem.mem)`, and the L2 residency state is shared
    between the two engines (a small test-side refactor; today each engine keeps its own, which
-   would misclassify hot hits).
+   would misclassify hot hits). On one continuous dirty-miss stream, count refill ARs
+   while an earlier victim's B is pending and report AR initiation intervals, `failWb`
+   (demand allocations blocked by WB capacity), `wbFull` (raw occupancy), and `wbGate`
+   (same-line read wait). No maintenance drain is inserted between stream samples.
 4. **`make test-fast`** 400/0/2, both arms.
 5. **Corpus and lock-step**, OFF vs ON, **by name** (explicit Python set difference, never `comm`)
    under `FUZZ_SHIPPING=1` / `LOCKSTEP_SHIPPING=1`. These harnesses attach the hot door when

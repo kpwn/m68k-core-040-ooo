@@ -103,8 +103,12 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  /** D4 (`ShippingCoreConfig.inhibitedFullBarrier`): gate an INHIBITED precise
                    * drain on `io.inhibLaunchOk` and export `io.inhibHeadHold`. False
                    * elaborates neither port and leaves this component unchanged. */
-                 inhibitedFullBarrier: Boolean = false) extends Component {
+                 inhibitedFullBarrier: Boolean = false,
+                 coalesceLines: Boolean = false,
+                 coalesceHold: Int = 16,
+                 coalesceMutation: Int = 0) extends Component {
   require(isPow2(depth))
+  require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
   require(!forwardOnPublish || reserveLateStore, "publication forwarding requires SQ reservation")
   val ptrW = log2Up(depth)
@@ -182,6 +186,10 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     //                    already draining. The LS EU fences the table walkers on it.
     val inhibLaunchOk = if (inhibitedFullBarrier) in(Bool()) else null
     val inhibHeadHold = if (inhibitedFullBarrier) out(Bool()) else null
+    val coalesceBreak   = if (coalesceLines) in(Bool()) else null
+    val coalesceFire    = if (coalesceLines) out(Bool()) else null
+    val coalesceHolding = if (coalesceLines) out(Bool()) else null
+    val coalesceTimeout = if (coalesceLines) out(Bool()) else null
   }
 
   // ---- ring storage ----
@@ -676,6 +684,129 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     io.drain.payload.precise  := precises(sendPtr)
   }
 
+  // ── FULL-LINE COALESCING (`coalesceLines`, write-side bandwidth part A) ─────────
+  // WHAT. The four entries at the send cursor form a GROUP when each is: resident, has
+  // data, COMMITTED, non-precise, COPYBACK, single-slot (no split), an aligned LONG, and
+  // in the same 16-byte line as the first -- and the four slot-A byte masks together
+  // cover all 16 bytes. Four aligned LONGs can only cover a line at offsets 0/4/8/12,
+  // so the masks are disjoint by construction and ORDER DOES NOT MATTER (ascending
+  // copies and descending `MOVEM -(An)` both qualify). The group drains as ONE
+  // `DStoreCmd`: line-base address, `useStrb`, `strb = 0xFFFF`, the merged 128-bit
+  // `lineData`. That is the exact shape `DcachePlugin`'s full-line no-fill hook keys on.
+  //
+  // WHY IT IS SOUND. (1) Every member is committed, i.e. already retired: nothing here
+  // can squash, fault or reorder architecturally. (2) Members stay VALID and forwarding-
+  // visible until the group's single terminal ack, exactly as a single entry stays until
+  // its own; the ack then pops all four. (3) The D-cache writes all 16 bytes in one
+  // S3 merge (hit) or one allocate (miss): no byte can land from a younger store before
+  // an older one because a member cannot be older than another member's overwrite --
+  // the masks are disjoint. (4) Precise, inhibited, write-through and split stores never
+  // join a group and keep today's path bit-for-bit. (5) One accepted transaction = one
+  // ack, so the D-cache's single ordered ack stream is unchanged.
+  //
+  // THE HOLD. Without it the group's FIRST store is presented the cycle it commits,
+  // before its siblings have, and drains alone (a write-allocate miss). So while the
+  // head is a group candidate and the NEXT entry is already allocated, same-line,
+  // disjoint and eligible-shaped (only its commit/data is outstanding), presentation is
+  // held. The hold is bounded by `coalesceHold` cycles per head -- that bound, not an
+  // argument about what the group waits on, is what makes it deadlock-free -- and is
+  // released at once by `coalesceBreak` (a load waiting on the queue).
+  val coalesce = if(!coalesceLines) null else new Area {
+    require(coalesceHold >= 1 && coalesceHold < 256, "coalesceHold must be 1..255")
+    def at(k: Int): UInt = (sendPtr + k).resize(ptrW bits)
+    // In range: position k past the send cursor is still inside [sendPtr, tail), i.e. it
+    // does not wrap onto an older, already-sent entry. `sendPtr - head` is how many
+    // resident entries are already sent (the cursor never passes tail).
+    val sentAhead = (sendPtr - head).resize(ptrW + 1 bits)
+    // ⚠ WRAP. A group is 4 entries in ONE accepted transaction, so two groups in the
+    // D-cache's S0..S3 pipe already account for all 8 entries of a depth-8 ring, and the
+    // cursor then sits ON `head` -- which `sendPtr - head = 0` cannot tell from "nothing
+    // sent". The ungrouped path could never get here (<= 4 halves in flight < depth),
+    // so it never needed the distinction. `!sendPhaseB` excludes the one legitimate
+    // `sendPtr === head` with a half in flight: slot A of a split head.
+    val wrapped = (sendPtr === head) && (acceptedHalves =/= 0) && !sendPhaseB
+    def inRange(k: Int): Bool = !wrapped && ((sentAhead + k) < U(depth, ptrW + 1 bits))
+    val line0 = paddrs(sendPtr)(31 downto 4)
+    // Shape: everything but commit/data readiness.
+    def shaped(k: Int): Bool = {
+      val i = at(k)
+      valids(i) && inRange(k) && !precises(i) && (cacheModes(i) === CacheMode.COPYBACK) &&
+        !validBs(i) && (sizes(i) === Size.LONG) && (paddrs(i)(1 downto 0) === 0) &&
+        (paddrs(i)(31 downto 4) === line0)
+    }
+    def ready(k: Int): Bool = { val i = at(k); committed(i) && hasData(i) }
+    val m = (0 until 4).map(k => maskAs(at(k)))
+    // Disjoint-so-far: entry k's mask shares no byte with entries 0..k-1.
+    def disjoint(k: Int): Bool = (m(k) & m.take(k).reduce(_ | _)) === 0
+    // Four disjoint aligned LONGs of one line always cover it; checked anyway, because
+    // this is the property the D-cache's no-fill decision rests on.
+    val covers = (m(0) | m(1) | m(2) | m(3)).andR
+    val head0 = !sendPhaseB && shaped(0) && ready(0) && !io.flush
+    val groupRaw = head0 && (1 until 4).map(k => shaped(k) && ready(k)).reduce(_ && _) &&
+                   (1 until 4).map(disjoint).reduce(_ && _) && covers
+    // STREAM STABILITY. `drain` is a real Stream: once presented and refused, valid and
+    // payload must hold until fire. Without this lock a refused single-store descriptor
+    // could turn into a group (or into a hold, dropping valid) the next cycle, because a
+    // sibling committed in between. So a refused presentation freezes the choice. A
+    // frozen GROUP stays formable -- members are committed, and a flush keeps committed
+    // entries -- which the sim assert below pins.
+    val lock      = RegNext(io.drain.valid && !io.drain.ready && !io.flush, init = False)
+    val lockGroup = RegNext(groupRaw, init = False)
+    val group     = Mux(lock, lockGroup && !io.flush, groupRaw)
+    // Plausible: the group can still form. Entry 1 must be PRESENT (the evidence that
+    // the line is being written); entries 2..3 may be present-and-plausible or not yet
+    // allocated at all.
+    def present(k: Int): Bool = valids(at(k)) && inRange(k)
+    def plausible(k: Int): Bool = shaped(k) && disjoint(k)
+    val stillComing = plausible(1) &&
+      (2 until 4).map(k => plausible(k) || !present(k)).reduce(_ && _)
+    val holdCnt = RegInit(U(0, 8 bits))
+    val expired = RegInit(False)
+    val breakD  = RegNext(io.coalesceBreak, init = False)
+    val holdNow = head0 && !group && stillComing && !expired && !breakD && !io.coalesceBreak &&
+                  !lock
+    when(io.drain.fire || io.flush) {
+      holdCnt := 0; expired := False
+    } elsewhen(holdNow) {
+      holdCnt := holdCnt + 1
+      when(holdCnt === U(coalesceHold - 1, 8 bits)) { expired := True }
+    }
+    io.coalesceHolding := holdNow
+    io.coalesceTimeout := holdNow && (holdCnt === U(coalesceHold - 1, 8 bits))
+    io.coalesceFire    := io.drain.fire && group
+
+    // Merged line. Word j (bytes 4j..4j+3, big-endian) comes from the ONE member whose
+    // offset is 4j -- one-hot by the coverage check.
+    val lineBytes = Vec(Bits(8 bits), 16)
+    for (j <- 0 until 4) {
+      val sel = (0 until 4).map(k => paddrs(at(k))(3 downto 2) === U(j, 2 bits))
+      val srcs = (0 until 4).map(k =>
+        if (coalesceMutation == 2 && k == 3) B(0, 32 bits) else datas(at(k)))
+      val w = MuxOH.or(sel, srcs)
+      for (b <- 0 until 4) lineBytes(4 * j + b) := w(31 - 8 * b downto 24 - 8 * b)
+    }
+    val lineData = if (coalesceMutation == 1) {
+      val t = lineBytes.asBits; (t(127 downto 8) ## (t(7 downto 0) ^ B(0x5A, 8 bits)))
+    } else lineBytes.asBits
+
+    // The wrap guard covers the ORDINARY path too: once the cursor has lapped the ring
+    // it must not re-present the (already sent) head entry.
+    when(holdNow || wrapped) { io.drain.valid := False }
+    when(group) {
+      io.drain.valid             := True
+      io.drain.payload.paddr     := (line0 ## U(0, 4 bits)).asUInt
+      io.drain.payload.data      := B(0, 32 bits)
+      io.drain.payload.size      := Size.LONG()
+      io.drain.payload.useStrb   := True
+      io.drain.payload.strb      := B(0xFFFF, 16 bits)
+      io.drain.payload.lineData  := lineData
+      io.drain.payload.cacheMode := CacheMode.COPYBACK
+      io.drain.payload.precise   := False
+    }
+    // A group's first entry is marked LEAD at issue; its terminal ack pops all four.
+    val lead = Vec.fill(depth)(RegInit(False))
+    val popN = if (coalesceMutation == 3) 1 else 4
+  }
   val drainIssue = io.drain.fire
 
   // ---- forwarding (combinational), DUAL-SLOT ----
@@ -1177,6 +1308,14 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       sendPtr := sendPtr + 1
     }
   }
+  if (coalesceLines) {
+    when(drainIssue && coalesce.group) {
+      sendPtr := sendPtr + 4
+      coalesce.lead(sendPtr) := True
+    }
+    // A fresh allocation never inherits a previous occupant's LEAD mark.
+    when(io.alloc.valid && !io.flush) { coalesce.lead(tail) := False }
+  }
 
   // Exact accepted-half occupancy, including simultaneous local-ack/accept
   // turnover on a dense COPYBACK-hit stream.
@@ -1215,7 +1354,31 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
         ackPhaseB    := False
         valids(head) := False
         head := head + 1
+        if (coalesceLines) when(coalesce.lead(head)) {
+          // One terminal ack for a coalesced line pops all four members.
+          for (k <- 1 until coalesce.popN) valids((head + k).resize(ptrW bits)) := False
+          head := head + coalesce.popN
+          coalesce.lead(head) := False
+        }
       }
+    }
+  }
+
+  if (coalesceLines) GenerationFlags.simulation {
+    when(io.drain.fire && coalesce.group) {
+      for (k <- 0 until 4) assert(valids(coalesce.at(k)) && committed(coalesce.at(k)) &&
+        !precises(coalesce.at(k)),
+        "StoreQueue: a coalesced line drained a member that is not a committed, resident, " +
+        "non-precise entry", FAILURE)
+      assert(!coalesce.wrapped, "StoreQueue: coalesced drain issued from a lapped cursor", FAILURE)
+    }
+    assert(!(coalesce.lock && coalesce.lockGroup && !coalesce.groupRaw && !io.flush),
+      "StoreQueue: a presented coalesced line stopped being formable before it was accepted",
+      FAILURE)
+    when(drainAckFire && coalesce.lead(head)) {
+      for (k <- 0 until 4) assert(valids((head + k).resize(ptrW bits)) &&
+        committed((head + k).resize(ptrW bits)),
+        "StoreQueue: a coalesced line's ack found a member already gone", FAILURE)
     }
   }
 
@@ -1323,17 +1486,23 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     // leaving a PHANTOM entry that never drains (empty stays false forever -> the
     // commit-side exception FSM hangs at E_DRAIN). Exclude the popped head here.
     val popsHead = terminalAck
+    // With coalescing, a LEAD ack pops `popN` entries: all of them leave, not just head.
+    val popsGroup: Bool = if (coalesceLines) popsHead && coalesce.lead(head) else False
     val keep = Vec(Bool(), depth)
     for (i <- 0 until depth) {
       val isHead = U(i, log2Up(depth) bits) === head
-      keep(i) := valids(i) && (committed(i) || (isHead && headDrainInFlight)) && !(popsHead && isHead)
+      val inPoppedGroup: Bool = if (!coalesceLines) False else
+        popsGroup && ((U(i, ptrW bits) - head).resize(ptrW + 1 bits) < U(coalesce.popN, ptrW + 1 bits))
+      keep(i) := valids(i) && (committed(i) || (isHead && headDrainInFlight)) &&
+                 !(popsHead && isHead) && !inPoppedGroup
     }
     for (i <- 0 until depth) when(!keep(i)) { valids(i) := False }
     // new tail = head' + (number of committed-live entries), where head' accounts for
     // the coincident pop (head advances by 1 if popsHead). Committed entries are the
     // oldest contiguous run (commit is in-order), so this is exact.
     val keepCount = CountOne(keep)
-    val headAfter = Mux(popsHead, head + 1, head)
+    val headAfter = if (!coalesceLines) Mux(popsHead, head + 1, head)
+      else Mux(popsGroup, head + coalesce.popN, Mux(popsHead, head + 1, head))
     tail := (headAfter + keepCount).resized
     // Part 127: the entry kept by the `headDrainInFlight` arm (and ONLY that one --
     // every other kept entry is `committed`, i.e. its instruction has already retired

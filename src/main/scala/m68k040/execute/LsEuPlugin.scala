@@ -131,6 +131,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyStoreDataWake: Boolean = false,
                  val specLoadWakeup: Boolean = false,
                  val lsOooIssue: Boolean = false,
+                 val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
                    * ring below -- see `pendDepth`). Default comes from
                    * `ShippingCoreConfig.storeQueueDepth` so sim and the shipping build
@@ -145,10 +146,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                    * that builds this plugin -- SocketTop, FuzzCoreDut, CoreBenchHarness,
                    * ExecuteLockStepSpec, FullCoreSynth -- gets the same setting from the same
                    * environment, rather than the "wired in one top only" failure family. */
-                 val inhibitedFullBarrier: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
+                 val inhibitedFullBarrier: Boolean = m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
+                 val sqCoalesceLines: Boolean = m68k040.top.ShippingCoreConfig.sqCoalesceLines,
+                 val sqCoalesceHold: Int = m68k040.top.ShippingCoreConfig.sqCoalesceHold)
     extends FiberPlugin with LsEuService {
   require(isPow2(sqDepth) && sqDepth >= 4 && sqDepth <= 16,
     s"store-queue depth must be a power of two in 4..16, got $sqDepth")
+  require(isPow2(loadRingDepth) && loadRingDepth >= 4 && loadRingDepth <= 16,
+    s"aligned-load ring depth must be 4, 8, or 16, got $loadRingDepth")
   // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
   // that is worth stating because an earlier revision required both. The re-check pins a
   // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
@@ -648,16 +653,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     walkClients.foreach(_.foreach(_.walkCmodePolicy := walkCacheMode))
 
     // ── Load-response ownership FIFO ───────────────────────────────────────────────
-    // Depth 8, which is the real bound and not a round number: the aligned ring is 4
-    // deep so CORE-LS can have 4 loads outstanding, and a walker's descriptor read can
-    // be outstanding concurrently with all of them, so 5 entries are reachable. 8 is the
-    // next power of two. Every admission predicate carries `!ldFifoFull` so a push can
-    // never overrun.
+    // Cover every aligned-ring request plus the three non-LS owners (exception,
+    // ITLB, DTLB), rounded up for pointer arithmetic: 8/16/32 at ring 4/8/16.
+    // Every admission predicate carries `!ldFifoFull` so a push cannot overrun.
     val LDTAG_CORE_LS  = 0
     val LDTAG_CORE_EXC = 1
     val LDTAG_ITLB     = 2
     val LDTAG_DTLB     = 3
-    val ldFifoDepth = 8
+    val ldFifoDepth = 1 << log2Up(loadRingDepth + 3)
     val ldFifoTags  = Vec.fill(ldFifoDepth)(Reg(UInt(2 bits)) init U(LDTAG_CORE_LS, 2 bits))
     val ldFifoPushPtr = RegInit(U(0, log2Up(ldFifoDepth) + 1 bits))
     val ldFifoPopPtr  = RegInit(U(0, log2Up(ldFifoDepth) + 1 bits))
@@ -724,7 +727,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       reserveLateStore = reserveLateStore, forwardOnPublish = forwardOnPublish,
       retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
       narrowDrainMerge = sqNarrowDrainMerge,
-      inhibitedFullBarrier = inhibitedFullBarrier)
+      inhibitedFullBarrier = inhibitedFullBarrier,
+      coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold)
+    val sqCoalesceFire    = if (sqCoalesceLines) sq.io.coalesceFire else null
+    val sqCoalesceHolding = if (sqCoalesceLines) sq.io.coalesceHolding else null
+    val sqCoalesceTimeout = if (sqCoalesceLines) sq.io.coalesceTimeout else null
+    if (sqCoalesceLines) {
+      sqCoalesceFire.simPublic(); sqCoalesceHolding.simPublic(); sqCoalesceTimeout.simPublic()
+    }
     sq.io.commit  << sqCommitPort
     sq.io.commitB << sqCommitBPort
     retirement.foreach(r => for (lane <- 2 until r.retiredRobIds.length)
@@ -1465,7 +1475,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // by `DcacheByteLane.extractCross` at merge time would otherwise be lost.
       val mergeOff    = UInt(4 bits)
     }
-    private val alignedDepth = 4
+    private val alignedDepth = loadRingDepth
     private val alignedPtrW  = log2Up(alignedDepth)
     val alignedMem      = Vec.fill(alignedDepth)(Reg(AlignedLoadCtx()))
     val alignedValid    = Vec.fill(alignedDepth)(RegInit(False))
@@ -3743,6 +3753,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       }
     }
     p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
+    // Coalescing hold release: a load is WAITING ON THE SQ -- its registered forward
+    // verdict says stall/serial, or it is an inhibited load held by the older-store
+    // barrier, or the park owns the barrier. A held store must never be what it waits on.
+    if (sqCoalesceLines) {
+      sq.io.coalesceBreak := (p4Valid && (p4Ctx.fwdStall || p4Ctx.fwdSerial ||
+                                          (p4Inhibited && !p4LaunchOk))) || parkOwnsBarrier
+    }
     when(p4Valid && !sqFlushSig && !excActive) {
       val fullForward = p4Ctx.fwdHit && !p4Front.twoAccess
       // `fwdSerial`: the held verdict was masked by the inhibited-store barrier -- keep

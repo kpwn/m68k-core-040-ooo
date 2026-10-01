@@ -420,6 +420,16 @@ object ShippingCoreConfig {
     * `SQ_NARROW_MERGE=1` turns it on for an A/B without editing every DUT. */
   val sqNarrowDrainMerge: Boolean = envFlag("SQ_NARROW_MERGE", false)
 
+  /** Coalesce four committed, non-precise aligned COPYBACK LONG stores covering one
+    * 16-byte line into a single SQ drain. Default OFF. */
+  val sqCoalesceLines: Boolean = envFlag("CPU_SQ_COALESCE_LINES", false)
+  /** Maximum cycles to hold a candidate SQ head while its line group forms. */
+  val sqCoalesceHold: Int = envInt("CPU_SQ_COALESCE_HOLD", 16, 1, 255)
+
+  /** Legacy-cache full-line allocate-without-fill. Non-blocking mode has native no-fill
+    * and rejects this separate flag; default OFF. */
+  val dcacheFullLineNoFill: Boolean = envFlag("CPU_DCACHE_FULLLINE_NOFILL", false)
+
   /** D4: a CACHE-INHIBITED access is a FULL MEMORY BARRIER in BOTH directions, enforced
     * entirely in the core. See `LsEuPlugin.inhibitedFullBarrier` for the mechanism and the
     * deadlock argument, and `docs/superpowers/specs/2026-09-29-throughput-architecture.md`
@@ -449,6 +459,45 @@ object ShippingCoreConfig {
     * elaborates only under the flag; the D-cache's `busQuiesced` register has no reader and
     * is pruned). */
   val inhibitedFullBarrier: Boolean = envFlag("CPU_INHIBITED_FULL_BARRIER", false)
+
+  private def envInt(name: String, dflt: Int, lo: Int, hi: Int): Int =
+    sys.env.get(name) match {
+      case None => dflt
+      case Some(v) =>
+        val n = try v.trim.toInt catch { case _: NumberFormatException =>
+          throw new IllegalArgumentException(s"$name='$v' is not an integer") }
+        require(n >= lo && n <= hi, s"$name=$n is outside [$lo, $hi]")
+        n
+    }
+
+  /** D-side bandwidth program, stage 2 (`docs/superpowers/specs/
+    * 2026-09-30-dside-nonblocking-l1d-and-hot-door.md`): a NON-BLOCKING L1D. Every
+    * cacheable miss (load, and COPYBACK store write-allocate) takes one of
+    * `dcacheMshrs` MSHRs; same-line loads join it as secondaries, stores to an
+    * in-flight line merge into it and ack at once, refill data answers every waiter
+    * from the MSHR buffer, and a dirty victim leaves through a writeback buffer.
+    * INHIBITED accesses keep the legacy FSM. REQUIRES `inhibitedFullBarrier` (D4).
+    * OFF pending measurement; `CPU_DCACHE_NONBLOCKING=1`; echoed in `SHIPPING_CONFIG`. */
+  val dcacheNonBlocking: Boolean = envFlag("CPU_DCACHE_NONBLOCKING", false)
+  /** MSHR count for `dcacheNonBlocking` (2..4: the hot door has 2 ID bits). */
+  val dcacheMshrs: Int = envInt("CPU_DCACHE_MSHRS", 4, 2, 4)
+  /** LS aligned-load descriptor ring. Keep 4 as the shipping default; 8/16 are
+    * experimental concurrency arms and resize DLoadRid plus the source FIFO. */
+  val lsLoadRingDepth: Int = envInt("CPU_LS_LOAD_RING_DEPTH", 4, 4, 16)
+  require((lsLoadRingDepth & (lsLoadRingDepth - 1)) == 0,
+    "CPU_LS_LOAD_RING_DEPTH must be 4, 8, or 16")
+  /** Route the non-blocking L1D's refills through the P6 hot door `axi_dh` (read-only,
+    * 128b, ID = MSHR index) instead of `axi_d`. Requires `dcacheNonBlocking`; the SoC
+    * must be built with `L2C_DH_PORT`/`DH_PORT_EN=1` (one Makefile knob, `CPU_AXI_DH=1`). */
+  val dcacheHotDoor: Boolean = envFlag("CPU_AXI_DH", false)
+  /** Store-allocated MSHRs hold their AR this many cycles so trailing stores can
+    * complete the 16 strobes and cancel the fill (write-path agent's hook). 0 = off. */
+  val dcacheStoreAllocArDelay: Int = envInt("CPU_DCACHE_STORE_AR_DELAY", 0, 0, 15)
+  require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
+  require(!dcacheNonBlocking || inhibitedFullBarrier,
+    "CPU_DCACHE_NONBLOCKING=1 requires CPU_INHIBITED_FULL_BARRIER=1 (D4 is the hard prerequisite)")
+  require(!(dcacheNonBlocking && dcacheFullLineNoFill),
+    "CPU_DCACHE_NONBLOCKING and CPU_DCACHE_FULLLINE_NOFILL are mutually exclusive (noFill is native under NONBLOCKING)")
 
   /** I-cache next-line PREFETCH, reset value of `IcachePlugin.prefetchEnable`.
     *
