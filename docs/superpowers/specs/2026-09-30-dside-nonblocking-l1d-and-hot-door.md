@@ -1570,7 +1570,7 @@ equal to the command's tag; one-hot-safe tag outcome; cacheable ordinary
 COPYBACK access (`ooOk`, not split/line-only, inhibited, or faulting); no
 sticky or current-cycle same-set array write; no matching cancel/flush; no
 maintenance/reset; no older S1 decision competing for `stg*`; and no store
-S1/S2/S3/pending-store activity for that set. The queue carries a victim-way
+S0/S1/S2/S3/pending-store activity for that set. The queue carries a victim-way
 snapshot, a clean-or-invalid certificate, a resolved-tag certificate, and a
 multi-hot certificate alongside the already-stored physical tag. A dirty
 victim or uncertain certificate falls back: **no 128-bit victim line or dirty
@@ -1578,17 +1578,16 @@ writeback data is copied into the probe queue**. The prototype may use one
 five-bit pipeline record and five five-bit queue records (about 30 new flops),
 plus narrow selects and comparisons; mapped area and timing must be measured.
 
-The selected victim way need not be compared against a live 128-set pointer
-mux on the command path. A same-set pointer advance comes only from an MSHR
-allocation. While that MSHR exists, the existing set-busy test rejects the
-staged fast allocation; after its array install, the probe's sticky same-set
-write bit rejects the candidate. A same-edge store allocation takes existing
-priority over the staged load. This two-edge proof must be pinned by directed
-tests, including dynamic early MSHR release, rather than assumed from a
-successful benchmark. Any same-line MSHR already active can take the existing
+The selected victim way must equal the current victim pointer at C0. A
+same-edge MSHR allocation for the same set is also excluded: its pointer
+advance is registered at C0 and would otherwise stale the staged victim on
+the next edge. The later allocator still checks active-set conflict, CAM,
+store priority, and resource credit before allocating. These checks must be
+pinned by directed tests, including dynamic early MSHR release, rather than
+assumed from a successful benchmark. Any same-line MSHR already active can take the existing
 secondary path at staging; a different-line same-set MSHR replays. A store
-entering S1 after C0 is held by the existing `stgValid` same-set guard until
-allocation/invalidation, while a store already in S1/S2/S3 at C0 forces the
+entering S0 after C0 is younger than the staged load; any store already in
+S0/S1/S2/S3 at C0 forces the
 fallback. Same-cycle invalidation, no-fill store, WT overlay, and maintenance
 write races also force fallback.
 
