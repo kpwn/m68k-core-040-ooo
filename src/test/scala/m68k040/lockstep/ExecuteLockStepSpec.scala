@@ -560,7 +560,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
     // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = if (ship) SP.rob(detailedPerf = false, pcRangeEnable = true,
-        lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+        lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE,
+        preparedRetireEntries = preparedCap)
       else new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap,
       rasBranchRepair = lk("LOCKSTEP_RAS_BRANCH_REPAIR", S.rasBranchRepair),

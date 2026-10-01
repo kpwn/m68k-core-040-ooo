@@ -110,8 +110,10 @@ object ShippingPlugins {
   def decode(ipcThroughput: Boolean): DecodeStage =
     new DecodeStage(allowSlot1Prediction = ipcThroughput, fuseLongMoveLoads = ipcThroughput)
 
-  def rob(detailedPerf: Boolean, pcRangeEnable: Boolean, lsOooIssue: Boolean): RobPlugin =
+  def rob(detailedPerf: Boolean, pcRangeEnable: Boolean, lsOooIssue: Boolean,
+          preparedRetireEntries: Int = 0): RobPlugin =
     new RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
       rasBranchRepair = ShippingCoreConfig.rasBranchRepair,
+      preparedRetireEntries = preparedRetireEntries,
       lsOooIssue = lsOooIssue)
 }
