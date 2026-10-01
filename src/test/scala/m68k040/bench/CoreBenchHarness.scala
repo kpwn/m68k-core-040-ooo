@@ -747,7 +747,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       retiredMispredicts: Int = 0,
       // OPT-IN per-kernel cycle decomposition; `None` unless IPC_STALL_BUDGET=1, so
       // every existing caller and every default report is untouched. See `StallBudget`.
-      stallBudget: Option[StallBudget] = None
+      stallBudget: Option[StallBudget] = None,
+      // Indices into the harness's per-cycle sample stream, inclusive. Test-only
+      // observers use these to put issue/AXI occupancy on the SAME commit window.
+      windowStartCycle: Long = -1L,
+      windowEndCycle: Long = -1L
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -2159,7 +2163,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         dcLdLookupHisto.slice(lo, hi + 1).count(identity),
         dcLdMissHisto.slice(lo, hi + 1).count(identity),
         t2BranchRedirects,
-        stallBudget)
+        stallBudget, firstCommitCycle, lastCommitCycle)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println(if (dut.dcache.nonBlocking)
@@ -2495,6 +2499,65 @@ trait CoreBenchHarness extends AnyFunSuite {
           assert(writes.nonEmpty, s"chase-four: d$c was never written")
           assert((writes.last.archRegWrite & 0xffffffffL) == starts(c),
             f"chase-four: d$c ended at 0x${writes.last.archRegWrite}%x, expected 0x${starts(c)}%x")
+        }
+      })
+  }
+
+  /** Matched independent-chain sweep. The TOTAL number of 16-byte records and
+    * measured pointer loads stay fixed as the chain count changes. Every chain
+    * uses the same 68020 indexed EA form, with a zero A0 base and its own Dn
+    * pointer, including the eighth; A1 holds the loop counter so A7 is untouched.
+    * One complete traversal warms the selected memory tier, then two traversals
+    * plus exactly eight aggregate pointer loads form the commit window. Every
+    * retired pointer result is checked against the permutation, not only its
+    * final value. The branch/loop overhead per load still changes
+    * with chain count and is reported explicitly beside throughput. */
+  def kChaseChains(chains: Int, totalRecords: Int, setSkew: Boolean = false): Kernel = {
+    require(Set(1, 2, 4, 8).contains(chains) && totalRecords > 0 &&
+      totalRecords % chains == 0)
+    val recPerChain = totalRecords / chains
+    // Eight extra loads in TOTAL force every final pointer away from its
+    // starting value while preserving the same measured load count across arms.
+    val tailIters = 8 / chains
+    require(recPerChain > tailIters)
+    val iters = recPerChain * 3 + tailIters
+    val base = 0x10000L
+    val chainBytes = recPerChain * 16L
+    val chainStride = chainBytes + (if (setSkew) 16L else 0L)
+    val orders = (0 until chains).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until recPerChain).toVector))
+    val starts = (0 until chains).map(c => base + c * chainStride + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until chains; i <- 0 until recPerChain) {
+        val here = base + c * chainStride + orders(c)(i) * 16L
+        val next = base + c * chainStride + orders(c)((i + 1) % recPerChain) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val name = s"chase-chains-$chains-$totalRecords-skew${if (setSkew) 1 else 0}"
+    val setup = Seq("movea.l #0,%a0", s"movea.l #$iters,%a1") ++
+      starts.zipWithIndex.map { case (a, c) => f"move.l #0x$a%x,%%d$c" }
+    val body = (0 until chains).map(c => s"move.l (%a0,%d$c.l),%d$c") ++
+      Seq("subq.l #1,%a1", "cmpa.l #0,%a1", "bne.s .Lchains")
+    val src = (setup ++ Seq(".Lchains: " + body.mkString(" ; ")) ++
+      Seq(".LchainsEnd: bra.s .LchainsEnd")).mkString(" ; ")
+    Kernel(name, src, setup.size + iters * body.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + recPerChain * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until chains) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == c)
+          assert(writes.nonEmpty, s"$name: d$c was never written")
+          val expected = (0 until iters).map { i =>
+            base + c * chainStride + orders(c)((i + 1) % recPerChain) * 16L
+          }
+          assert(writes.size >= iters,
+            s"$name: d$c has ${writes.size} retired writes for $iters pointer loads")
+          val loads = writes.takeRight(iters)
+          for ((o, i) <- loads.zipWithIndex)
+            assert((o.archRegWrite & 0xffffffffL) == expected(i),
+              f"$name: d$c pointer hop $i returned 0x${o.archRegWrite}%x, expected 0x${expected(i)}%x")
         }
       })
   }
