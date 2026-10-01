@@ -222,7 +222,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               def olderPipeStore(v: IqSlotObs): Boolean =
                 (issueStore && older(iq.lsIssHot.robId.toInt, v.robId)) ||
                 (skidStore && older(skid.robId.toInt, v.robId))
-              val flush = iq.flushSignal.toBoolean
+              val flush = d.iq.flushSignal.toBoolean
               val candidates = rawReady.filter(v =>
                 !flush && v.staticClear && v.dynClear && !v.dynAny &&
                 !v.unconfirmedLsSource && !olderIqStore(v) &&
