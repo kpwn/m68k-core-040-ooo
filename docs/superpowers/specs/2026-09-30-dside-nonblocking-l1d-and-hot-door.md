@@ -188,8 +188,12 @@ Acceptance requires a cycle-exact install/read collision that becomes a
 secondary, a staged miss held across attempted release, same-edge waiter add,
 multiple waiters draining through the copied response slot, backpressured
 response, fault/no-fill/store conflict and reordered-refill checks. A mutant
-that removes the staged-set guard must fail a checked stale-read test, not
-merely elaboration. The experiment should be benchmarked only if exact
+that removes the S1-set guard while retaining the staged-set guard must fail a
+checked stale-read test, not merely elaboration. A staged-set-only mutant may
+pass because same-line `lAddW` protects the transition on the staged-decision
+edge; that guard remains a conservative set-local hold for delayed stage/replay
+interactions, without a claimed standalone mutation proof. The experiment
+should be benchmarked only if exact
 `failFull` snapshots show installed LINGER entries are a meaningful part of
 capacity pressure; a FILLED or WAIT_R wall cannot improve by retiring LINGER.
 
