@@ -1778,3 +1778,49 @@ making a throughput claim about this optimization. The four/eight-chain
 comparison also changes loop overhead per load, so it is not a pure queue
 capacity experiment. Exact flags, retirement counts, checked results and
 logs: `/tmp/codex-agent68-dn-throughput-results.json`.
+
+### Current miss recurrence and socket boundary cost (2026-10-02)
+
+The integrated `71d5302d` model run repeats the combined latency result
+(L1 644/128, L2 61598/4096) and passes its architectural checks. With
+`MB_TRACE=mb-chase-` and `MB_TRACE_STEADY=1`, each 400-cycle trace starts
+after warmup. Complete observable intervals are:
+
+| Interval | Cycles | Samples |
+| --- | ---: | ---: |
+| L1 issue to C0 | 3 | 79 |
+| L2 issue to C0 | 4 | 26 |
+| L2 C0 to allocation | 1 | 27 |
+| L2 C0 to first ARVALID | 2 | 27 |
+| Accepted AR to R | 6 | 27 |
+| R to next dependent issue | 2 | 26 |
+
+The minimum issue-to-issue interval is 14 cycles (16 samples); the remaining
+bounded samples take 15/16/17/19 cycles (2/4/1/2 samples). External ARREADY
+backpressure is separate from the fixed C0-to-first-ARVALID interval. The
+uncontended core recurrence therefore contains eight cycles outside the
+six-cycle modeled AR/R interval: issue-to-C0 four, C0-to-AR two, and
+response-to-next-issue two. Endpoint counts differ because the trace clips
+the first and last transactions. Raw trace and derived histograms:
+`/tmp/codex-agent59-integrated-stage-trace.log`,
+`/tmp/codex-agent59-integrated-stage-trace-results.json`, and
+`/tmp/codex-agent59-integrated-stage-budget.json`.
+
+The real socket additionally uses `StreamPipe.FULL` on **both** hot AR and
+hot R (`SocketTop.scala`, `dhSlice`). Those two forward register stages are
+absent from the core-only harness. The actual CPU/L2 bus trace independently
+shows response-to-next-accepted-AR of exactly 10 cycles in all 4095 bounded
+intervals, with either SoC response-bypass setting. It is consistent with the
+eight-cycle core recurrence plus two socket edges. The SoC L2 interval itself
+is six cycles OFF and five ON, yielding 16/15-cycle accepted-AR spacing.
+This bus evidence does not rely on the old SoC resume-PC trace: exact
+instruction-retirement marker timing is being rerun with true macro PCs.
+
+Removing these socket edges is not automatically safe for timing. The FULL
+slices were introduced to break long fabric-to-core paths, including fault
+capture, and their reset domain is deliberately distinct from the boot-domain
+read absorber. An empty-path hot-AR-only slice experiment is a smaller next
+candidate than simultaneously bypassing both AR and R, especially with the
+SoC R bypass enabled. Selection needs a separate spec, reset/backpressure
+proof, and mapped/routed evidence; this paragraph does not authorize a
+shipping default change or remove existing boundary registers.
