@@ -135,7 +135,6 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
     val lsOoo = sys.env.get("MB_LS_OOO").contains("1")
     val fuseLongMoveLoads = sys.env.get("MB_FUSE_LONG_MOVE_LOADS").contains("1")
     val directRefill = sys.env.get("MB_DIRECT_REFILL").contains("1")
-    val lsOoo = sys.env.get("MB_LS_OOO").contains("1")
     for (ff <- arms) {
       val dut = M68kSim().withVerilator.compile(new FullCoreDut(
         alignedLoadFallThrough = true, earlyLsIntWakeup = true,
