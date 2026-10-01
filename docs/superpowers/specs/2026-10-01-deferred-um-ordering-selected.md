@@ -18,12 +18,17 @@ architecturally older U/M update and software store to those bytes, in that
 order, plus the U/M update required by that load's own translation. A later
 software descriptor store may clear a previously set U/M bit;
 an older deferred OR must not resurrect it. A later U/M update may set that
-bit again. A wrong-path update never reaches memory, and a TLB fill whose
+bit again. A wrong-path **ROB-owned D-side** update never reaches memory, and a TLB fill whose
 required update was discarded cannot remain usable. These requirements hold
 for an ordinary program load, a DTLB descriptor read, and a two-page split.
 `mmu_atc_write_hit_sets_modified`, `walk_vs_older_store_slow`, and
 `walk_vs_older_store_uncommitted` are mandatory exact regressions. An
 arbitrary delay in a test is not a repair.
+
+The I-side fetch occurs before rename and has no ROB owner. Its existing
+completed-walk U update is born committed even if no fetched instruction
+retires; this is an advisory access side effect, not a ROB-owned data access.
+An I-side walk poisoned before completion still must not allocate an update.
 
 The MC68040 User's Manual, pages 3-14 and 3-27, says that a clear U bit is
 updated before page access and a write with clear ATC M suspends until its
@@ -65,7 +70,10 @@ own translation, so a younger walker waiting on its drain cannot block that
 older store's translation.
 
 Likewise, a DTLB descriptor command waits for overlapping older pending D-side
-U/M bytes to drain. It need not hold unrelated walks. The U/M drain must be
+U/M bytes to drain. Updates from an *earlier descriptor in its own walk* are
+forwarded into the later descriptor response: a self-referential table must
+see its root/pointer U, and waiting for its own batch to retire would deadlock.
+It need not hold unrelated walks. The U/M drain must be
 able to preempt a walker *between* descriptor reads: expose TableWalker's
 `cmdSent` as `readOutstanding`, including a command accepted into the
 `m2sPipe` but not yet accepted by Dcache. Arm the U/M re-read whenever no
@@ -89,7 +97,7 @@ ATC-refill frequency on first-touch workloads.
 
 ## Ordinary loads and SQ forwarding
 
-At each Dcache request admission, query both U/M queues by *physical byte*
+At each Dcache request admission, query both U/M queues' batch elements by *physical byte*
 address. Include all committed D-side entries, speculative D-side entries
 whose ROB owner is older than the querying load, **and that load's own
 translation entries**, plus ownerless I-side entries ordered before the
@@ -140,6 +148,11 @@ SQ depth eight older resident entries can drain while the U/M entry waits,
 the SQ terminal-ack target can use four modular bits; assert the bounded span
 and test ack/commit/offer collisions. If the oldest U/M waits for older SQ,
 the SQ grant applies only to that older prefix. Younger SQ cannot get ahead.
+Within one walk batch, drain root, pointer, then page in walk order; two
+batches owned by a page-crossing uop drain first-half before second-half.
+Retirement stamps order different ROB owners. For batches of the same owner,
+store a bounded allocation-order tie-break (or explicit half ordinal), rather
+than relying on physical free-slot index after wrap or flush.
 
 The DTLB U/M re-read uses the same physical older-SQ overlap rule as a normal
 walker read, using the *offered U/M owner's* age, not the current walker's
@@ -172,53 +185,62 @@ walk and metadata must remain grantable while `excActive` owns the frontend.
 
 ## Credit, state, and validation bounds
 
-Move DTLB U/M credit reservation from `walker.io.start` to translation miss
-*capture*. With the **current leaf-only U/M producer**, a four-slot queue
-reserves two credits for the current ROB-head uop's at-most-two page-crossing
-walks. A non-head miss may capture only when more than two credits are free;
-a head miss can use either reserved credit.
-The single walker is then guaranteed its allocation slot. If a younger P4
+Change each U/M queue entry from one byte to one *walk batch*, carrying up to
+three `{physical byte address, set-U/M mask}` elements in root, pointer, page
+order. `TableWalker` currently emits only the page element; extend both D and
+I walkers to record U for each encountered resident root and pointer table
+descriptor and U/M for the final page descriptor. The manual (§3.2.2.1,
+§3.2.5) requires those table U updates before page access. The walker emits
+one bounded batch at successful completion; no-update walks release the
+reservation. If a later descriptor aliases an earlier element in the same
+walk, use the earlier element's U/M bits when decoding it. A repeated page
+crossing walk may produce duplicate bytes, which remain ordered OR updates.
+Keep the existing speculative D owner and born-committed I/exception owner
+lifetimes; a batch has one owner, one commit stamp, and one SQ ack-prefix
+target, while the drain acknowledges its elements individually before freeing
+the slot. Flush cannot remove an offered committed element or make another
+element overtake it.
+
+Reserve one batch slot at translation-miss *capture*, not at
+`walker.io.start`. A four-batch D queue reserves two slots for the current
+ROB-head uop's at-most-two page-crossing walks; a non-head miss may capture
+only when more than two slots are free, so an empty queue still admits two
+younger independent walks. The head may use either reserved slot. A single
+walker can then complete all three descriptor updates without needing another
+credit partway through. The I side also reserves one batch slot before its
+ownerless walk and backpressures a new miss while full. If a younger P4
 translation is denied and an older LS op is upstream, request immediate P4
 replay/backout before DTLB captures anything; the 255-cycle watchdog is not a
 normal progress mechanism. A non-head access with no older LS op can wait
 until it becomes the ROB head. Exception-owned admission follows the
 exception epoch after younger speculative entries are flushed. Measure the
-two-credit restriction; depth eight with the same two-credit reserve is an
-optional area/throughput comparison, not an assumed fix.
+two-credit restriction; depth eight batches is an optional throughput/area
+comparison. Intermediate commits may add walker batch capture and queue drain
+before interlocks, but the final gates require all three descriptor levels.
 
-This two-credit bound is *not* a claim of complete MC68040 U-bit behavior.
-`TableWalker` currently emits only the final page descriptor's U/M entry;
-it neither emits root- nor pointer-table U. The manual (§3.2.2.1, §3.2.5)
-requires U in **each** encountered table descriptor before page access. A
-complete three-level producer must emit as many as three U updates per walk,
-including root and pointer, on both D- and I-side walkers; a two-page split
-can demand six entries from one uop. That extension needs a bounded multi-entry
-walker response, admission reservation for all six before the first walk,
-and an eight-slot D U/M queue at minimum. A second walk may encounter a
-descriptor whose U is already pending from the first; merging or duplicate
-reservation must preserve the same six-entry worst-case guarantee. The
-present leaf-only visibility correction must not be represented as closing
-this separate architectural gap. Before enabling full 040 U behavior, size
-and measure the expanded queues, including ownerless I-side updates, and
-replace this paragraph's two-credit rule with the six-credit rule.
-
-Worst-case incremental storage before synthesis: two 32-bit per-line U/M
-masks for each of eight aligned response slots = 512 bits (a request-byte
-encoding could reduce this to 128); four 4-bit D U/M SQ-target epochs plus a
-4-bit SQ ack counter = 20 bits; a few ownerless grant/offer and credit bits.
-The load query compares up to eight I+D U/M physical-byte entries against
-two requested halves (16 address compares); the walker SQ query checks up
-to eight resident stores against its physical descriptor bytes. These are
-logical counts, not LUT, frequency, or post-route claims. Keep queries off
-the IQ issue-select path and register the mask on Dcache admission.
+Worst-case incremental storage before synthesis: four batches per side times
+three elements times roughly 35 bits (`addr32`, U/M mask2, valid1) is 420 raw
+bits per queue, before shared owner/stamp/offer state; the present leaf-only
+queue has four single-byte entries. Two 32-bit per-line response masks for
+each of eight aligned slots add 512 bits (a request-byte encoding may reduce
+this to 128). Four 4-bit D U/M SQ-target epochs and one 4-bit SQ ack counter
+add 20 bits. Across D+I queues the load query compares up to 24 physical
+bytes against two requested halves (48 address comparisons); walker SQ query
+checks up to eight resident stores against its descriptor bytes. These are
+worst-case logical counts, not LUT, frequency, or post-route claims. Keep
+queries off the IQ issue-select path and register the mask on Dcache
+admission. A depth-16 scalar-byte alternative needs six reserved head credits
+and at least three free for one younger walk; a depth-8 scalar queue leaves
+only two non-head credits and cannot admit a complete younger three-entry
+walk atomically. Measure batch route timing against the scalar alternative.
 
 Directed proof must cover: the three named baseline failures; two U/M writes
 with a software clear between them; same-owner precise inhibited descriptor
 self-write; a translated LOAD of its own leaf-descriptor byte with clear U,
 a fully forwarded older SQ descriptor value plus the load's own U, and a
 split partial access whose second physical half overlaps its own descriptor
-update. Full three-level U support additionally requires root/pointer U on
-both D/I walks, same-owner pointer-table access, and six-entry split pressure.
+update; root/pointer U on both D/I walks, same-owner pointer-table access,
+and six-update split pressure across two reserved batches.
 Cover IRQ during metadata
 authorization, metadata read/write fault;
 younger SQ already offered when U/M commits; simultaneous SQ ack plus commit;
