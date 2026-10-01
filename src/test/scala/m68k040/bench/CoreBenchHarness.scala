@@ -2562,6 +2562,52 @@ trait CoreBenchHarness extends AnyFunSuite {
       })
   }
 
+  /** Independent simple-(An) pointer chains, eligible for the P1 load path.
+    * A6 is the counter so A7 remains the architectural stack pointer. */
+  def kChaseAnChains(chains: Int, totalRecords: Int): Kernel = {
+    require(Set(4, 6).contains(chains) && totalRecords > 0 && totalRecords % chains == 0)
+    val recPerChain = totalRecords / chains
+    val tailIters = 12 / chains
+    require(recPerChain > tailIters)
+    val iters = recPerChain * 3 + tailIters
+    val base = 0x10000L
+    val stride = recPerChain * 16L
+    val orders = (0 until chains).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until recPerChain).toVector))
+    val starts = (0 until chains).map(c => base + c * stride + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until chains; i <- 0 until recPerChain) {
+        val here = base + c * stride + orders(c)(i) * 16L
+        val next = base + c * stride + orders(c)((i + 1) % recPerChain) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val name = s"chase-an-chains-$chains-$totalRecords"
+    val setup = starts.zipWithIndex.map { case (a, c) => f"movea.l #0x$a%x,%%a$c" } :+
+      s"movea.l #$iters,%a6"
+    val body = (0 until chains).map(c => s"movea.l (%a$c),%a$c") ++
+      Seq("subq.l #1,%a6", "cmpa.l #0,%a6", "bne.s .Lanchains")
+    val src = (setup ++ Seq(".Lanchains: " + body.mkString(" ; ")) ++
+      Seq(".LanchainsEnd: bra.s .LanchainsEnd")).mkString(" ; ")
+    Kernel(name, src, setup.size + iters * body.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + recPerChain * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until chains) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == 8 + c)
+          assert(writes.size >= iters,
+            s"$name: a$c has ${writes.size} retired writes for $iters pointer loads")
+          val loads = writes.takeRight(iters)
+          for ((o, i) <- loads.zipWithIndex) {
+            val expected = base + c * stride + orders(c)((i + 1) % recPerChain) * 16L
+            assert((o.archRegWrite & 0xffffffffL) == expected,
+              f"$name: a$c pointer hop $i returned 0x${o.archRegWrite}%x, expected 0x$expected%x")
+          }
+        }
+      })
+  }
+
   def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0,
                  strCopy: Boolean = true, copyStyle: String = "byteMemMem",
                  copyback: Boolean = false): Kernel = {

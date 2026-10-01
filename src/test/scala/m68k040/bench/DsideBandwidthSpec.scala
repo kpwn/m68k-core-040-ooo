@@ -16,7 +16,8 @@ import spinal.core.sim._
   * `chase-128` is the NEGATIVE CONTROL (C3): dependent loads, MLP 1 by construction. */
 class DsideBandwidthSpec extends CoreBenchHarness {
   private final case class ChainCycle(cycle: Long, hotOutstanding: Int, ringOcc: Int,
-      readyLoads: Int, lsSelectLoad: Boolean, lsEuFire: Boolean, cmdFire: Boolean,
+      readyLoads: Int, lsSelectLoad: Boolean, lsEuFire: Boolean, p1Fire: Boolean,
+      cmdFire: Boolean,
       arFire: Boolean, rFire: Boolean, ringFullNoPop: Boolean,
       ringHeadRspHol: Boolean, waitAr: Int, arQueued: Int, waitR: Int,
       filled: Int, linger: Int, waiters: Int, ringDone: Int,
@@ -33,6 +34,12 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       s"chase-chains-$n-$chainRecords-skew${if (chainSkew) 1 else 0}" ->
         (() => kChaseChains(n, chainRecords, chainSkew))
     }
+    val anChainCounts = sys.env.get("DSIDE_AN_CHAIN_COUNTS").map(_.split(",").map(_.trim.toInt).toSeq)
+      .getOrElse(Seq.empty[Int])
+    val anChainRecords = sys.env.get("DSIDE_AN_CHAIN_RECORDS").map(_.toInt).getOrElse(1536)
+    val anChainKernels = anChainCounts.map { n =>
+      s"chase-an-chains-$n-$anChainRecords" -> (() => kChaseAnChains(n, anChainRecords))
+    }
     val all = Seq(
       "memcpy-16k"     -> (() => kMemcpy(bytes = 16384, passes = 4, label = "memcpy-16k")),
       "memcpy-64k"     -> (() => kMemcpy(bytes = 65536, passes = 2, label = "memcpy-64k")),
@@ -41,7 +48,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       "stream-64k"     -> (() => kStream(bytes = 65536, passes = 2)),
       "stream-16k"     -> (() => kStream(bytes = 16384, passes = 2)),
       "chase-four"     -> (() => kChaseFour(records = 256, iters = 768)),
-      "chase-128"      -> (() => kChasePure(records = 128, iters = 512))) ++ chainKernels
+      "chase-128"      -> (() => kChasePure(records = 128, iters = 512))) ++
+      chainKernels ++ anChainKernels
     val want = sys.env.get("DSIDE_KERNELS").map(_.split(",").map(_.trim).toSet)
     val kernels = all.filter { case (n, _) => want.forall(_.contains(n)) }.map(_._2())
     val seeds = sys.env.get("DSIDE_SEEDS").map(_.split(",").toSeq.map(_.trim.toInt)).getOrElse(Seq(1, 17))
@@ -76,7 +84,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       val hotLatencies = scala.collection.mutable.ArrayBuffer.empty[(Long, Long)]
       val chainSamples = scala.collection.mutable.ArrayBuffer.empty[ChainCycle]
       var firstLdCmdProbeCycle = -1L
-      val chainKernel = k.name.startsWith("chase-chains-")
+      val anChainKernel = k.name.startsWith("chase-an-chains-")
+      val chainKernel = k.name.startsWith("chase-chains-") || anChainKernel
       val arIntervals = scala.collection.mutable.ArrayBuffer.empty[Long]
       val wbBIntervals = scala.collection.mutable.ArrayBuffer.empty[Long]
       var wbBCount = 0L
@@ -145,6 +154,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
             chainSamples += ChainCycle(cycle, hotOutstanding.size, ringOcc,
               readyLoads, d.iq.logic.lsSelectLoadFire.toBoolean,
               d.lsEu.issuePort.valid.toBoolean && d.lsEu.issuePort.ready.toBoolean,
+              (if (m68k040.top.ShippingCoreConfig.lsP1EarlyLoad)
+                d.lsEu.logic.p1ReqFire.toBoolean else false),
               cmdFire, arFire, rFire, fullNoPop, headRspHol,
               stateCount(nb.WAIT_AR), stateCount(nb.ARQ), stateCount(nb.WAIT_R),
               stateCount(nb.FILLED), stateCount(nb.LINGER),
@@ -172,17 +183,25 @@ class DsideBandwidthSpec extends CoreBenchHarness {
         else if (k.name == "stream-16k") (16384L, 2)
         else if (k.name.contains("64k")) (65536L, 2)
         else (16384L, 4)
-      val moved = if (k.name.startsWith("chase-chains-")) (chainRecords.toLong * 2L + 8L) * 4L
+      val moved = if (anChainKernel) (anChainRecords.toLong * 2L + 12L) * 4L
+                  else if (k.name.startsWith("chase-chains-")) (chainRecords.toLong * 2L + 8L) * 4L
                   else if (k.name == "chase-four") 4L * (768 - 256) * 4
                   else if (k.name == "chase-pure") 4L * (512 - 128)
                   else bytes * (passes - 1)
       val bpc = moved.toDouble / r.windowCycles
-      if (k.name.startsWith("chase-chains-")) {
-        val n = k.name.stripPrefix("chase-chains-").takeWhile(_ != '-').toInt
-        println(s"DSIDE_CHAIN_CONFIG kernel=${k.name} chains=$n totalRecords=$chainRecords " +
-          s"perChain=${chainRecords / n} setSkew=$chainSkew measuredPointerLoads=${chainRecords * 2 + 8} " +
-          s"measuredLoopOps=${((chainRecords / n) * 2 + 8 / n) * 3} " +
-          "EA=indexed(A0,Dn.L) for all loads; first traversal excluded")
+      if (chainKernel) {
+        val n = k.name.stripPrefix(if (anChainKernel) "chase-an-chains-" else "chase-chains-")
+          .takeWhile(_ != '-').toInt
+        if (anChainKernel)
+          println(s"DSIDE_CHAIN_CONFIG kernel=${k.name} chains=$n totalRecords=$anChainRecords " +
+            s"perChain=${anChainRecords / n} measuredPointerLoads=${anChainRecords * 2 + 12} " +
+            s"measuredLoopOps=${((anChainRecords / n) * 2 + 12 / n) * 3} " +
+            "EA=simple(An) using A0..A5; A6 counter; A7 stack; first traversal excluded")
+        else
+          println(s"DSIDE_CHAIN_CONFIG kernel=${k.name} chains=$n totalRecords=$chainRecords " +
+            s"perChain=${chainRecords / n} setSkew=$chainSkew measuredPointerLoads=${chainRecords * 2 + 8} " +
+            s"measuredLoopOps=${((chainRecords / n) * 2 + 8 / n) * 3} " +
+            "EA=indexed(A0,Dn.L) for all loads; first traversal excluded")
         assert(r.ldCmdCycles.nonEmpty && firstLdCmdProbeCycle >= 0,
           s"${k.name}: missing common load-command clock reference")
         val clockOffset = firstLdCmdProbeCycle - r.ldCmdCycles.head
@@ -193,6 +212,13 @@ class DsideBandwidthSpec extends CoreBenchHarness {
         val win = chainSamples.filter(s => s.cycle >= winLo && s.cycle <= winHi)
         assert(win.size == r.windowCycles,
           s"${k.name}: probe samples=${win.size} != commit window=${r.windowCycles}")
+        val p1Accepted = win.count(_.p1Fire)
+        if (anChainKernel) {
+          assert((p1Accepted > 0) == m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
+            s"${k.name}: P1 accepted=$p1Accepted disagrees with P1 enabled=${m68k040.top.ShippingCoreConfig.lsP1EarlyLoad}")
+          println(s"DSIDE_AN_P1 kernel=${k.name} seed=$seed accepted=$p1Accepted " +
+            s"measuredPointerLoads=${anChainRecords * 2 + 12} scope=commit-window")
+        }
         val acceptedWithin = hotLatencies.filter { case (ar, rsp) =>
           ar >= winLo && rsp <= winHi
         }.map { case (ar, rsp) => rsp - ar }.sorted
@@ -271,6 +297,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               f"B/cyc=$bpc%.4f retired=${r.retiredInstrs} IPC=${r.ipc}%.4f memory=$memLabel " +
               s"nonBlocking=${m68k040.top.ShippingCoreConfig.dcacheNonBlocking} " +
               s"hotDoor=${m68k040.top.ShippingCoreConfig.dcacheHotDoor} lsOoo=$lsOoo " +
+              s"p1EarlyLoad=${m68k040.top.ShippingCoreConfig.lsP1EarlyLoad} " +
               s"specWake=$specWake fuseLongMoveLoads=$fuseLongMoveLoads " +
               s"nbEarlyResponse=${m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse} " +
               s"nbEagerAr=${m68k040.top.ShippingCoreConfig.dcacheNbEagerAr} " +
