@@ -2,6 +2,44 @@
 
 **Review date:** 2026-10-01. **Status:** architecture review; no RTL change or spec amendment. **Reference:** [SpinalHDL/NaxRiscv at `9f452d50560d02fb391bc8039f5453c54e0911af`](https://github.com/SpinalHDL/NaxRiscv/tree/9f452d50560d02fb391bc8039f5453c54e0911af), committed 2026-01-23. The comparison is to that revision's `Gen.scala` configuration, not to an unspecified NaxRiscv configuration. Local shipping reference was inspected read-only at `integ/all-shippable` `e98a322c` (`integ2` worktree); this document was written in a reserved review worktree based on `f3bd3f2d`. Several promising flags and branches are still in flight. The 2026-09-29 throughput architecture proposal (`docs/superpowers/specs/2026-09-29-throughput-architecture.md`, currently untracked in the owner's workspace) has not been ratified as a whole; the owner has separately authorized P3 and D-side stage 2. New structural changes beyond that authorized work require a spec update under `AGENTS.md`.
 
+## Follow-up evidence (2026-10-01, integration track)
+
+The review below describes its pinned shipping baseline. Subsequent isolated
+experiments refine the priorities; they do not establish board timing or area.
+
+- Four CPU MSHRs and asynchronous dirty writeback are implemented in the
+  integration track, with independent-load issue and hot-port routing. In a
+  matched four-chain simulation, throughput rose from 0.3651 B/cycle for the
+  legacy cache to 0.6595 B/cycle with four MSHRs and an eight-entry load ring.
+  Four hot read IDs were observed concurrently. This establishes a workload
+  that can use multiple outstanding misses; it does not justify eight MSHRs.
+- The simulated L1 dependent chase is 9.000 cycles/hop without load fusion,
+  8.008 with fusion, and 7.016 with fusion plus speculative load wakeup.
+  The existing throughput decode configuration enables fusion; speculative
+  wakeup remains opt-in. These are matched simulation results, distinct from
+  the older 8.29-cycle board result below.
+- An isolated earlier P3 load-admission experiment remains at 7.016 cycles/hop:
+  the registered cache-probe readiness stage prevents earlier acceptance.
+  Commit `9815fc56` is intentionally excluded from integration because it
+  adds logic without measured benefit. Probe-result forwarding is the next
+  experiment, with token, translation, cancellation and stale-data checks.
+- Early registered miss response reduces the paired post-R response delay
+  from two cycles to one. Separately, eager miss-request selection reduces
+  command-to-AR advertisement from five cycles to four. Their earlier chase
+  results used different LS issue settings and memory models; those deltas
+  must not be added. A matched combined experiment remains required.
+- The U/M modified-bit regression is a real ordering failure: a younger
+  descriptor load can read old memory before an older deferred update drains.
+  Production readiness requires ordering against software descriptor stores
+  as well as loads. A committed-entry queue-drain prerequisite is in progress;
+  it alone does not fix descriptor visibility.
+
+Remaining acceptance work includes exact-name OFF/ON architectural gates,
+combined latency and independent-load measurements, and area/timing evidence
+before selecting defaults. No new FPGA implementation or board result is
+claimed here. Current source integration is tracked separately from isolated
+experiments; passing a branch's focused tests is not a full-core handoff.
+
 ## Verdict
 
 The most valuable NaxRiscv lessons are decoupling *miss ownership* from *cache-array occupancy*, using separate load/store age tracking for controlled memory overlap, and directing fetch early enough that the machine does not spend most cycles empty. This core already has physical rename, a ROB, multiple issue ports, a predictor, an FTQ, speculative wakeup, and a direct I-side L2 port. Rebuilding those from NaxRiscv would duplicate existing machinery. The highest return now is a measured cut to the **8.29-cycle L1 pointer chase** and **21-cycle L2 pointer chase**, followed by a branch-coverage and fetch-continuity rewrite, then multi-miss D-side capacity once the core can supply independent requests. The broad 68k system workload is front-end starved; copy bandwidth is a separate workload with a different bottleneck.
