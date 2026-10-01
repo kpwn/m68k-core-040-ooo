@@ -3,11 +3,12 @@
 | Exercises the matrix axes added for FMOVE.<fmt> FPn,<ea>: memory
 | destination EAs ((An), (An)+, -(An), d16(An), d8(An,Xn), abs.W,
 | abs.L), integer Dn destinations for valid integer/single formats,
-| and representative .L/.S/.X/.W/.D/.B/.P format footprints.
+| and representative native .L/.S/.X/.W/.D/.B format footprints.
+| Packed .P must take the vector-11 FPSP assist without storing data.
 |
 | PASS sentinel: 0xC0FFEE00.
 | FAIL sentinels:
-|   0xDEAD0F01 -- vec-11 F-line trap
+|   0xDEAD0F01 -- unexpected or malformed vec-11 F-line trap
 |   0xDEAD0F31 -- data/footprint mismatch
 |   0xDEAD0F32 -- postincrement/predecrement byte count wrong
 |   0xDEAD0F33 -- indexed destination clobbered base/index
@@ -64,7 +65,24 @@ _start:
 
     fmove.b %fp0, ABSW:w              | abs.W, .B
 
-    fmove.p %fp0, ABSL:l{#0}          | abs.L, packed static-k
+    fmove.s %fp0, ABSL:l              | native abs.L destination
+    cmp.l   #0x3F800000, ABSL
+    bne     _fail_data
+    move.l  #0x11223344, ABSL
+    move.l  #0x55667788, ABSL+4
+    move.l  #0x99AABBCC, ABSL+8
+    moveq   #0, %d7
+_packed:
+    fmove.p %fp0, ABSL:l{#0}          | unsupported packed static-k: FPSP
+_after_packed:
+    cmp.l   #1, %d7
+    bne     _fail_fline
+    cmp.l   #0x11223344, ABSL
+    bne     _fail_data
+    cmp.l   #0x55667788, ABSL+4
+    bne     _fail_data
+    cmp.l   #0x99AABBCC, ABSL+8
+    bne     _fail_data
 
     lea     PASS_SENT, %a1
     move.l  #0xC0FFEE00, %d2
@@ -94,6 +112,19 @@ _hi:
     bra     _hi
 
 _fline:
+    | Format-2 frame: next PC, vector offset, then faulting instruction PC.
+    | All earlier native forms must still execute without taking this path.
+    cmp.w   #0x202C, 6(%a7)
+    bne     _fail_fline
+    cmp.l   #_after_packed, 2(%a7)
+    bne     _fail_fline
+    cmp.l   #_packed, 8(%a7)
+    bne     _fail_fline
+    tst.l   %d7
+    bne     _fail_fline
+    moveq   #1, %d7
+    rte
+_fail_fline:
     lea     PASS_SENT, %a1
     move.l  #0xDEAD0F01, %d2
     move.l  %d2, (%a1)
