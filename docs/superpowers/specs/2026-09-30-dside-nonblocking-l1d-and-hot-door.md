@@ -1607,6 +1607,25 @@ write, older store pipeline, dirty victim, same-line/set-busy MSHR,
 reordered/error refill, cancel/flush, and no-fill/maintenance fallbacks. A
 qualification-removal mutant must fail checked behavior, not elaboration.
 
+The isolated prototype at `30d2a17a` satisfies the directed timing and
+fallback test and two 1,000-operation hot-chaos seeds (1 and 17), with 41
+actual fast stages in the mixed-traffic run. Removing only the physical-tag
+equality guard returns stale data in the directed alias test. In a matched
+seed-17 full-core dependent chase with the same RTL and L2 model
+`l2:5:60:4096`, 2 KiB resident latency stays 771/128 = 6.023 cycles/hop;
+64 KiB latency changes from 69,530/4,096 = 16.975 to 65,562/4,096 =
+16.006 cycles/hop (0.969 cycle, 5.7%). The fast arm stages 5,120 of 5,120
+primary allocations over the whole run. With eight independent chains,
+8,224 checked bytes take 10,760 cycles OFF and 10,689 ON (0.7643 to
+0.7694 bytes/cycle, 0.67%). This limited MLP gain is consistent with the
+measured older-S1 staging conflicts: 1,957 of 2,110 otherwise eligible
+accepted misses in the ON run. These are simulation results, with P1 early
+translation OFF and all other stated integrated latency/MLP features ON;
+they are not routed area, timing, or board measurements. The prototype adds
+30 functional flops for metadata, but its extra selection and comparison
+logic still requires synthesis and timing assessment before enabling it by
+default.
+
 ## 15. Coordination owed (through the PM)
 
 
