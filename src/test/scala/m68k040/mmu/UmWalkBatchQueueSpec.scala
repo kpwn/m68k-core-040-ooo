@@ -368,7 +368,7 @@ class UmWalkBatchQueueSpec extends AnyFunSuite {
 
   test("metadata control event-pair matrix preserves offer, cancellation and credit contracts", VerilatorTest) {
     val pairs = Seq(
-      "reserve+flush", "reserve+cancel", "complete+authorize",
+      "reserve+flush", "reserve+cancel", "reserve+authorize", "complete+authorize",
       "complete+flush", "complete+seal", "complete+cancel",
       "authorize+flush", "seal+cancel", "ack+flush", "ack+cancel",
       "seal+flush", "reserve+ack", "ackerror+flush", "ackerror+cancel",
@@ -450,6 +450,13 @@ class UmWalkBatchQueueSpec extends AnyFunSuite {
           d.io.cancelOwnerless.valid #= true; sleep(1)
           assert(!d.io.reserveReady.toBoolean)
           tick(); d.io.cancelOwnerless.valid #= false
+        case "reserve+authorize" =>
+          d.io.reserve.robId #= 1; d.io.reserve.ownerless #= false
+          d.io.reserve.valid #= true
+          d.io.authorize.payload #= 1; d.io.authorize.valid #= true
+          tick(); d.io.reserve.valid #= false; d.io.authorize.valid #= false
+          completeOne(addr)
+          offer(addr); ack()
         case "complete+authorize" =>
           reserveOwned(1)
           d.io.complete.updates(0).valid #= true

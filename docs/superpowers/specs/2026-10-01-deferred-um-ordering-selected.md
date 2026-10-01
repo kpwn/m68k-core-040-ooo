@@ -175,6 +175,12 @@ walker read, using the *offered U/M owner's* age, not the current walker's
 robId. This prevents an older software descriptor store from being overwritten
 by a read/OR/write based on its previous value. Queue selection remains stable
 across offer, flush-valid withdrawal, and ack.
+Head authorization is a level held while an owned walk's ROB entry remains at
+head and its metadata is unfinished, not a one-cycle retirement notice. A
+matching reservation captures this level even when the reserve and authorize
+edges coincide; a later split reservation receives the same held level. The
+ROB does not retire the owner until all of its metadata batches finish or a
+metadata error has been attributed to it.
 
 ## Ownerless I-side and exception walks
 

@@ -124,7 +124,11 @@ class UmWalkBatchQueue(depth: Int = 4) extends Component {
     when(io.reserveReady) {
       occupied(freeSlot) := True
       reserved(freeSlot) := True
-      authorized(freeSlot) := False
+      // The head-level authorization can arrive on this reservation edge.
+      // The scan below sees old occupied=False, so capture this collision here.
+      authorized(freeSlot) := io.authorize.valid &&
+        !io.reserve.payload.ownerless &&
+        (io.authorize.payload === io.reserve.payload.robId)
       ownerless(freeSlot) := io.reserve.payload.ownerless
       epoch(freeSlot) := io.reserve.payload.epoch
       everOffered(freeSlot) := False
