@@ -18,7 +18,10 @@ break:
      and axi_d at 128 (D11), and has NO AW/W/B group on axi_i at all.
 
 Standard library only -- this repository has no pytest.  Run:
-    python3 tools/socket/check_socket_netlist.py [--regen] [--socket generated/M68kSocketTop.v]
+    python3 tools/socket/check_socket_netlist.py [--regen] [--socket generated/M68kSocketTop.v] [--hot-door]
+
+Pass --hot-door exactly when CPU_AXI_DH=1 was used to generate the socket.
+Neither an absent required port nor an unexpected hot/write port is accepted.
 
 Exit 0 on success, 1 on the first failing class (with a diagnostic on stderr).
 """
@@ -125,10 +128,11 @@ def check_fullcore(regen):
     return not FAILURES
 
 
-def check_socket(path, detailed_perf=False):
+def check_socket(path, detailed_perf=False, hot_door=False):
     if not os.path.exists(path):
-        print("SKIP  no socket netlist at %s (expected until Task 13)" % path)
-        return True
+        check("socket netlist exists at %s" % path, False,
+              "generate GenSocketTopVerilog with the intended configuration")
+        return False
     ports = parse_ports(path, "M68kSocketTop")
     check("M68kSocketTop's port list was parsed", len(ports) > 20,
           "only %d ports found" % len(ports))
@@ -169,7 +173,21 @@ def check_socket(path, detailed_perf=False):
         "axi_d_rlast": ("input", 1), "axi_d_rvalid": ("input", 1),
         "axi_d_rready": ("output", 1),
     }
-    for name, want in list(want_i.items()) + list(want_d.items()):
+    # P6 hot door is explicitly selected, not inferred from the netlist. This
+    # catches a missing bus as well as an accidentally enabled one. Keep exact
+    # names/directions/widths; a broad axi_dh_* allowlist would hide new sidebands.
+    want_dh = {
+        "axi_dh_arid": ("output", 2), "axi_dh_araddr": ("output", 32),
+        "axi_dh_arlen": ("output", 8), "axi_dh_arsize": ("output", 3),
+        "axi_dh_arburst": ("output", 2), "axi_dh_arvalid": ("output", 1),
+        "axi_dh_arready": ("input", 1), "axi_dh_rid": ("input", 2),
+        "axi_dh_rdata": ("input", 128), "axi_dh_rresp": ("input", 2),
+        "axi_dh_rlast": ("input", 1), "axi_dh_rvalid": ("input", 1),
+        "axi_dh_rready": ("output", 1),
+    } if hot_door else {}
+    dh_write = sorted(n for n in ports if re.match(r"^axi_dh_(aw|w|b)", n))
+    check("axi_dh carries no AW/W/B group", not dh_write, repr(dh_write))
+    for name, want in list(want_i.items()) + list(want_d.items()) + list(want_dh.items()):
         got = ports.get(name)
         check("socket port %s is %s[%d]" % (name, want[0], want[1]), got == want,
               "got %r" % (got,))
@@ -206,6 +224,7 @@ def check_socket(path, detailed_perf=False):
     check("group-7 debug exports retain their explicit direction and width",
           not debug_changed, repr(debug_changed))
     strays = sorted(n for n in ports if not allowed.match(n)
+                    and n not in want_dh
                     and n not in debug_widths
                     and not (detailed_perf and n == "perf_trace"))
     check("D23: the socket top exports ONLY cpu_socket.vh ports", not strays, repr(strays))
@@ -219,10 +238,12 @@ def main():
     ap.add_argument("--socket", default=os.path.join(REPO, "generated", "M68kSocketTop.v"))
     ap.add_argument("--detailed-perf", action="store_true",
                     help="require the optional 95-bit socket performance trace")
+    ap.add_argument("--hot-door", action="store_true",
+                    help="require the read-only 128-bit, 2-bit-ID axi_dh port group")
     args = ap.parse_args()
     check_fullcore(args.regen)
     if not args.regen:
-        check_socket(args.socket, args.detailed_perf)
+        check_socket(args.socket, args.detailed_perf, args.hot_door)
     if FAILURES:
         sys.stderr.write("\n%d check(s) FAILED\n" % len(FAILURES))
         return 1
