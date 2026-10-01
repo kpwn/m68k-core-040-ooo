@@ -24,6 +24,15 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       ringDoneWb: Int, ringDoneNeedsWb: Int, earlyWbAny: Boolean,
       earlyWbFire: Boolean, headPopAlreadyWb: Boolean, frontCompHeld: Boolean,
       failSet: Long, failFull: Long)
+  private final case class SkidCycle(cycle: Long, issueSpec: Boolean, skidSpec: Boolean,
+      skidValid: Boolean, flush: Boolean, rawReady: Int, readyMismatch: Int,
+      dynOrMismatch: Int, unconfirmed: Int, olderIqStore: Int, intraMacro: Int,
+      olderPipeStore: Int, candidateIds: Set[Int], oldest: Int, younger: Int,
+      loadSelect: Boolean, lsEuFire: Boolean, loadCmd: Boolean, hotAr: Boolean)
+  private final case class IqSlotObs(index: Int, robId: Int, ls: Boolean,
+      load: Boolean, store: Boolean, ready: Boolean, first: Boolean,
+      staticClear: Boolean, dynClear: Boolean, dynAny: Boolean,
+      unconfirmedLsSource: Boolean)
 
   test("D-side bandwidth: copy, grouped copy, MOVE16 copy, load stream, chase", VerilatorTest) {
     val chainCounts = sys.env.get("DSIDE_CHAIN_COUNTS").map(_.split(",").map(_.trim.toInt).toSeq)
@@ -83,6 +92,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       val hotOutstanding = scala.collection.mutable.Map.empty[Int, Long]
       val hotLatencies = scala.collection.mutable.ArrayBuffer.empty[(Long, Long)]
       val chainSamples = scala.collection.mutable.ArrayBuffer.empty[ChainCycle]
+      val skidSamples = scala.collection.mutable.ArrayBuffer.empty[SkidCycle]
       var firstLdCmdProbeCycle = -1L
       val anChainKernel = k.name.startsWith("chase-an-chains-")
       val chainKernel = k.name.startsWith("chase-chains-") || anChainKernel
@@ -164,6 +174,75 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               ls.alignedEarlyWbFire.toBoolean, headPopAlreadyWb,
               ls.frontCompHeld.toBoolean,
               ctr("failSet").toLong, ctr("failFull").toLong)
+            if (specWake) {
+              val iq = d.iq.logic
+              val busy = iq.lsBusy.toBigInt
+              def isBusy(tag: Int): Boolean = busy.testBit(tag)
+              val skidValid = iq.lsSkidValid.toBoolean
+              val skid = iq.lsSkidHot
+              val skidSpec = skidValid &&
+                ((skid.psrcAValid.toBoolean && isBusy(skid.psrcA.toInt)) ||
+                 (skid.psrcCValid.toBoolean && isBusy(skid.psrcC.toInt)))
+              val issueValid = iq.lsIssValid.toBoolean
+              val issueStore = issueValid &&
+                iq.lsIssHot.memOp.toEnum == m68k040.isa.MemOp.STORE
+              val skidStore = skidValid &&
+                skid.memOp.toEnum == m68k040.isa.MemOp.STORE
+              val robHead = d.rob.logic.head.toInt
+              val robMask = (1 << m68k040.Global.ROB_ID_W_DEFAULT) - 1
+              def older(a: Int, b: Int): Boolean =
+                ((a - robHead) & robMask) < ((b - robHead) & robMask)
+              val views = iq.slots.zipWithIndex.map { case (s, index) =>
+                val occupied = s.sel.toBoolean
+                val memOp = if (occupied) s.hot.memOp.toEnum else m68k040.isa.MemOp.NONE
+                val lsClass = occupied &&
+                  s.hot.cluster.toEnum == m68k040.isa.Cluster.LS &&
+                  (memOp != m68k040.isa.MemOp.NONE || s.hot.leaAddr.toBoolean)
+                val isLoad = lsClass && memOp == m68k040.isa.MemOp.LOAD
+                val staticClear = (s.triggers.toBigInt & ((BigInt(1) << index) - 1)) == 0
+                val dynClear = s.dynWait.toBigInt == 0
+                val aPending = occupied && s.hot.psrcAValid.toBoolean &&
+                  isBusy(s.hot.psrcA.toInt)
+                val bPending = occupied && s.hot.srcBRead.toBoolean &&
+                  s.hot.psrcBValid.toBoolean && isBusy(s.hot.psrcB.toInt)
+                val cPending = occupied && s.hot.psrcCValid.toBoolean &&
+                  isBusy(s.hot.psrcC.toInt)
+                IqSlotObs(index, if (occupied) s.hot.robId.toInt else -1,
+                  lsClass, isLoad, lsClass && memOp == m68k040.isa.MemOp.STORE,
+                  s.ready.toBoolean, occupied && s.hot.firstOfInstr.toBoolean,
+                  staticClear, dynClear, s.dynWaitAny.toBoolean,
+                  aPending || bPending || cPending)
+              }
+              val rawReady = views.filter(v => v.load && v.ready)
+              val oldestLs = views.find(_.ls).map(_.index)
+              def olderIqStore(v: IqSlotObs): Boolean =
+                views.exists(o => o.index < v.index && o.store)
+              def intraMacroBlocked(v: IqSlotObs): Boolean =
+                views.exists(o => o.index < v.index && o.ls && !o.ready) && !v.first
+              def olderPipeStore(v: IqSlotObs): Boolean =
+                (issueStore && older(iq.lsIssHot.robId.toInt, v.robId)) ||
+                (skidStore && older(skid.robId.toInt, v.robId))
+              val flush = iq.flushSignal.toBoolean
+              val candidates = rawReady.filter(v =>
+                !flush && v.staticClear && v.dynClear && !v.dynAny &&
+                !v.unconfirmedLsSource && !olderIqStore(v) &&
+                !intraMacroBlocked(v) && !olderPipeStore(v))
+              candidates.foreach { v =>
+                assert(!issueValid || v.robId != iq.lsIssHot.robId.toInt)
+                assert(!skidValid || v.robId != skid.robId.toInt)
+              }
+              skidSamples += SkidCycle(cycle, iq.lsSpecBlocked.toBoolean, skidSpec,
+                skidValid, flush, rawReady.size,
+                views.count(v => v.load && v.ready != (v.staticClear && !v.dynAny)),
+                views.count(v => v.load && v.dynAny == v.dynClear),
+                rawReady.count(_.unconfirmedLsSource), rawReady.count(olderIqStore),
+                rawReady.count(intraMacroBlocked), rawReady.count(olderPipeStore),
+                candidates.map(_.robId).toSet,
+                candidates.count(v => oldestLs.contains(v.index)),
+                candidates.count(v => !oldestLs.contains(v.index)),
+                iq.lsSelectLoadFire.toBoolean, iq.lsEuFire.toBoolean,
+                cmdFire, arFire)
+            }
           }
           if (d.dcache.logic.axi.b.valid.toBoolean &&
               d.dcache.logic.axi.b.ready.toBoolean &&
@@ -212,6 +291,45 @@ class DsideBandwidthSpec extends CoreBenchHarness {
         val win = chainSamples.filter(s => s.cycle >= winLo && s.cycle <= winHi)
         assert(win.size == r.windowCycles,
           s"${k.name}: probe samples=${win.size} != commit window=${r.windowCycles}")
+        if (specWake) {
+          val sw = skidSamples.filter(s => s.cycle >= winLo && s.cycle <= winHi)
+          assert(sw.size == r.windowCycles,
+            s"${k.name}: skid probe samples=${sw.size} != commit window=${r.windowCycles}")
+          val readyMismatch = sw.map(_.readyMismatch).sum
+          val dynOrMismatch = sw.map(_.dynOrMismatch).sum
+          println(s"DSIDE_SKID_READY kernel=${k.name} seed=$seed rawReadySlots=${sw.map(_.rawReady).sum} " +
+            s"readyResidualMismatch=$readyMismatch dynOrMismatch=$dynOrMismatch scope=commit-window")
+          assert(readyMismatch == 0 && dynOrMismatch == 0,
+            s"${k.name}: registered ready differs from static/dynamic wait fields")
+          val a = (s: SkidCycle) => s.issueSpec && s.skidValid
+          val b = (s: SkidCycle) => s.skidSpec
+          val union = (s: SkidCycle) => a(s) || b(s)
+          def report(label: String, pred: SkidCycle => Boolean): Unit = {
+            val xs = sw.filter(pred)
+            println(s"DSIDE_SPEC_SKID kernel=${k.name} seed=$seed state=$label " +
+              s"cycles=${xs.size} candidateCycles=${xs.count(_.candidateIds.nonEmpty)} " +
+              s"candidateSlots=${xs.map(_.candidateIds.size).sum} " +
+              s"uniqueCandidateRobIds=${xs.flatMap(_.candidateIds).toSet.size} " +
+              s"oldestSlots=${xs.map(_.oldest).sum} youngerSlots=${xs.map(_.younger).sum} " +
+              s"rawReadySlots=${xs.map(_.rawReady).sum} " +
+              s"unconfirmedLsSource=${xs.map(_.unconfirmed).sum} " +
+              s"olderIqStore=${xs.map(_.olderIqStore).sum} " +
+              s"intraMacro=${xs.map(_.intraMacro).sum} " +
+              s"olderPipeStore=${xs.map(_.olderPipeStore).sum} " +
+              s"flushCycles=${xs.count(_.flush)} " +
+              s"loadSelect=${xs.count(_.loadSelect)} lsEuFire=${xs.count(_.lsEuFire)} " +
+              s"loadCmd=${xs.count(_.loadCmd)} hotAR=${xs.count(_.hotAr)} " +
+              "scope=commit-window qualification=IQ-upper-bound")
+          }
+          report("issueSpecAndSkid", a)
+          report("specConsumerInSkid", b)
+          report("union", union)
+          report("otherSkid", s => s.skidValid && !union(s))
+          println(s"DSIDE_SPEC_SKID_OVERLAP kernel=${k.name} seed=$seed " +
+            s"both=${sw.count(s => a(s) && b(s))} scope=commit-window")
+          assert(!sw.exists(s => union(s) && s.loadSelect),
+            s"${k.name}: LS slot selected despite occupied speculative skid")
+        }
         val p1Accepted = win.count(_.p1Fire)
         if (anChainKernel) {
           assert((p1Accepted > 0) == m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,

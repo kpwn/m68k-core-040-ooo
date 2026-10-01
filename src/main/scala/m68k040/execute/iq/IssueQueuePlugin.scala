@@ -287,6 +287,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       s.isAluSlow.simPublic()
       s.hot.psrcA.simPublic(); s.hot.psrcAValid.simPublic()
       s.hot.psrcB.simPublic(); s.hot.psrcBValid.simPublic()
+      s.hot.srcBRead.simPublic(); s.hot.firstOfInstr.simPublic()
       s.hot.pXSrc.simPublic(); s.hot.readsX.simPublic()
       s.hot.pNzvcSrc.simPublic(); s.hot.readsNzvc.simPublic()
       s.hot.psrcC.simPublic(); s.hot.psrcCValid.simPublic() }
@@ -1089,6 +1090,13 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val lsIssValid  = RegInit(False)
     val lsIssHot    = Reg(IqHot())
     val lsPiped     = Stream(IqHot())
+    // Simulation-only source fields for the speculative-skid bandwidth observer.
+    // The observer reconstructs its own predicate from these existing flops;
+    // no readiness or selection path reads these taps.
+    lsSkidHot.robId.simPublic(); lsSkidHot.memOp.simPublic()
+    lsSkidHot.psrcA.simPublic(); lsSkidHot.psrcAValid.simPublic()
+    lsSkidHot.psrcC.simPublic(); lsSkidHot.psrcCValid.simPublic()
+    lsIssValid.simPublic(); lsIssHot.robId.simPublic(); lsIssHot.memOp.simPublic()
 
     // ═══ SPECULATIVE-WAKEUP RE-CHECK (`specLoadWakeup`) ════════════════════════════
     //
