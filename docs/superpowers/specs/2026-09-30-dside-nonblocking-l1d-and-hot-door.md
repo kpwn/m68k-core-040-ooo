@@ -159,6 +159,40 @@ FREE ──alloc──► WAIT_AR ──AR fire──► WAIT_R ──R(id=k)─
   The earlier two-cycle wording understated the implemented residency; do not
   shorten it without a directed S0→S2 stale-read and waiter-lifetime proof.
 
+#### 3.3a Experimental pipeline-aware LINGER release (2026-10-01 amendment)
+
+`CPU_DCACHE_NB_DYNAMIC_RELEASE=1` is an independent default-OFF experiment for
+non-blocking mode. It may retire an **installed, nonfaulted** LINGER entry as
+soon as all of these are false: a waiter still references its index, a waiter
+is added to it this edge, a registered load S1 for its set, and a registered
+staged-miss decision for its set. The fixed 3→0 countdown remains byte-for-byte
+the default behavior. Faulted fills keep their existing LINGER(0) rule. The
+experiment uses the existing entry state, S1/staging set registers, and waiter
+table; it adds no state and no path into the CPU read response or BRAM read
+enable. The two set comparisons feed only the MSHR state-register D input.
+
+The edge contract is: an install write and a BRAM read may meet at edge T, so
+that read can observe the old tag. From T to T+1, `ldS1Valid/ldS1Set` identify
+it. At T+1, a miss is captured into `stgValid/stgSet`, which identify it from
+T+1 to T+2. The CAM-visible MSHR must survive both stages; at T+2, its
+same-line `lAddW` captures the secondary waiter. A read launched only after
+edge T sees the installed tag, while an early VIPT probe retained across T is
+invalidated by `earlyProbeSetWriteVec`/sticky `earlyProbeStale`, including a
+probe allocated on T. Store S1/S2/S3 and pending-store same-set hazards already
+prevent installation if they could carry a pre-install store read. The response
+slot holds a copied line independently after its waiter bit clears. An entry
+made FREE at an edge cannot be reallocated at that same edge because
+`freeBits` observes the old `st` register value; no bypass is added.
+
+Acceptance requires a cycle-exact install/read collision that becomes a
+secondary, a staged miss held across attempted release, same-edge waiter add,
+multiple waiters draining through the copied response slot, backpressured
+response, fault/no-fill/store conflict and reordered-refill checks. A mutant
+that removes the staged-set guard must fail a checked stale-read test, not
+merely elaboration. The experiment should be benchmarked only if exact
+`failFull` snapshots show installed LINGER entries are a meaningful part of
+capacity pressure; a FILLED or WAIT_R wall cannot improve by retiring LINGER.
+
 **Every state field has exactly one owner and one writer site per transition.** No flag is set
 in one state and cleared in another (the `evictAxiPairOpen` one-way latch lesson). A
 simulation-only liveness monitor fails the run if any entry sits outside FREE for more than
