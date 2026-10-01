@@ -15,8 +15,9 @@ area, carry every new cross-plugin signal. No new `Global` key is required.
 ## Observable order
 
 For successful accesses, a load of physical descriptor bytes observes every
-architecturally older U/M update and software store to those bytes, in that
-order, plus the U/M update required by that load's own translation. A later
+architecturally older U/M update and software store to those bytes in their
+physical program order, plus the U/M update required by that load's own
+translation. A later
 software descriptor store may clear a previously set U/M bit;
 an older deferred OR must not resurrect it. A later U/M update may set that
 bit again. A wrong-path **ROB-owned D-side** update never reaches memory, and a TLB fill whose
@@ -47,8 +48,11 @@ replay. At the ROB head, with IRQ/trace/debug preemption excluded, **every
 ROB-owned batch** becomes irrevocably authorized. Drain its encountered
 metadata read/OR/stores in walk order and receive each terminal response
 before owner retirement. Cacheable load data may have executed speculatively,
-but its result, pre-existing data fault, and retirement wait for this metadata
-outcome. On metadata bus error, report a precise access fault against this
+and its masked result may write the speculative PRF before metadata completes;
+only architectural retirement and final fault selection wait for this
+metadata outcome. Do not hold unrelated cache responses or force every
+first-touch load to execute at the ROB head. On metadata bus error, report a
+precise access fault against this
 owner; an error in an earlier descriptor's metadata operation takes priority
 over a later walk/data fault. A wrong-path batch never authorizes or reaches
 memory. An already authorized batch survives redirects until completion;
@@ -187,8 +191,11 @@ as an older dependency. The explicit serializing ATC invalidation remains the
 software synchronization point for page-table rewrites that preceded fetch.
 The I-side fetch retains its PC and withholds the translated line from decode
 until all encountered U writes finish, even when a later descriptor faults;
-a metadata bus error becomes an instruction-access fault at that PC. A
-poisoned walk never allocates. An exception-owned D walk likewise finishes
+a metadata bus error becomes an instruction-access fault at that PC. A fetch
+poisoned before its metadata write is offered may cancel its queued epoch.
+Once an ownerless metadata write is offered, its epoch is irrevocable and
+must finish even if fetch is later poisoned; suppress line/fault delivery for
+the discarded PC after completion. An exception-owned D walk likewise finishes
 metadata before its exception data transfer; a metadata bus error follows
 the existing nested-exception/double-fault path, rather than being discarded.
 
@@ -244,12 +251,19 @@ two-credit restriction; depth eight batches is an optional throughput/area
 comparison. Intermediate commits may add walker batch capture and queue drain
 before interlocks, but the final gates require all three descriptor levels.
 
+Descriptor U/M bytes are always the low byte of an aligned 32-bit descriptor
+(`descAddr + 3`); assert that physical alignment at batch creation and query.
+For each 16-byte aligned response line, four descriptor-low-byte positions
+each need only two U/M bits: 8 bits per half, 16 bits per two-half aligned
+response slot, or 128 bits for eight slots. A full 32-bit per-line mask would
+instead consume 512 bits and is not justified unless unaligned descriptor
+metadata is admitted by a later architecture change.
+
 Worst-case incremental storage before synthesis: four batches per side times
 three elements times roughly 35 bits (`addr32`, U/M mask2, valid1) is 420 raw
 bits per queue, before shared owner/stamp/offer state; the present leaf-only
-queue has four single-byte entries. Two 32-bit per-line response masks for
-each of eight aligned slots add 512 bits (a request-byte encoding may reduce
-this to 128). Four 4-bit D U/M SQ-target epochs and one 4-bit SQ ack counter
+queue has four single-byte entries. The aligned response masks above add
+128 bits. Four 4-bit D U/M SQ-target epochs and one 4-bit SQ ack counter
 add 20 bits. Across D+I queues the load query compares up to 24 physical
 bytes against two requested halves (48 address comparisons); walker SQ query
 checks up to eight resident stores against its descriptor bytes. These are
