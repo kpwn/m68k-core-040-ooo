@@ -162,7 +162,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
             val filledFault = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.fault(i).toBoolean)
             val filledInv = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.invPend(i).toBoolean)
             val filledHold = entryMask(i => nb.st(i).toInt == nb.FILLED && nb.instHold(i).toBoolean)
-            val filledCandidate = nb.instCand.asBits.toBigInt.toInt
+            val filledCandidate = entryMask(i => nb.instCand(i).toBoolean)
             val filledWinner = nb.instOH.toBigInt.toInt
             val lingerStage = entryMask(i => nb.st(i).toInt == nb.LINGER &&
               ((d.dcache.logic.ldS1Valid.toBoolean &&
