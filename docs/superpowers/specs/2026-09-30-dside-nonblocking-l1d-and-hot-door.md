@@ -144,7 +144,7 @@ write-port muxes swap one writer for another rather than gaining one (§9).
 ### 3.3 States
 
 ```
-FREE ──alloc──► WAIT_AR ──AR fire──► WAIT_R ──R(id=k)──► FILLED ──install──► LINGER(2) ──► FREE
+FREE ──alloc──► WAIT_AR ──AR fire──► WAIT_R ──R(id=k)──► FILLED ──install──► LINGER(3→0) ──► FREE
    └──alloc(noFill)──────────────────────────────────────► FILLED
 ```
 
@@ -152,9 +152,12 @@ FREE ──alloc──► WAIT_AR ──AR fire──► WAIT_R ──R(id=k)─
   `arReg` is a holding register, so AR payload is stable from VALID to READY (AXI rule).
 - **FILLED**: data is present in `rbuf` (plus `mbuf`/`mstrb`). Waiters may be answered. Install is
   pending (§5).
-- **LINGER**: the line is in the array but the entry stays CAM-visible for 2 cycles. This covers
+- **LINGER**: the line is in the array but the entry stays CAM-visible for at least the
+  3→0 countdown, four sampled state cycles in the current RTL. This covers
   every access whose array read happened before the install write and whose compare happens after
   it (§4.4). An entry is FREE only after LINGER expires **and** it has no waiter.
+  The earlier two-cycle wording understated the implemented residency; do not
+  shorten it without a directed S0→S2 stale-read and waiter-lifetime proof.
 
 **Every state field has exactly one owner and one writer site per transition.** No flag is set
 in one state and cleared in another (the `evictAxiPairOpen` one-way latch lesson). A
@@ -849,13 +852,18 @@ head (`ringFullHeadRspHolStateCycles`). Neither full-ring count requires an
 incoming load demand, so neither is a rejected-demand or lost-cycle count.
 These are overlapping observations, not an additive stall budget:
 
-| cache / ring | four-chain read B/cyc | four-chain distinct-line MLP | stream read B/cyc | stream distinct-line MLP |
+| cache / ring | four-chain read B/cyc | four-chain WAIT_R MLP, active cycles | stream read B/cyc | stream WAIT_R MLP, active cycles |
 |---|---:|---:|---:|---:|
 | legacy blocking / 4 | 0.3651 | one demand miss | 0.9407 | one demand miss |
 | nonblocking N=2 / 4 | 0.3262 | 1.381 | 0.9352 | 1.000 |
 | nonblocking N=4 / 4 | 0.6552 | 1.797 | 0.9352 | 1.000 |
 | nonblocking N=4 / 8 | 0.6595 | 1.836 | 1.0600 | 1.551 |
 | nonblocking N=4 / 16 | 0.6595 | 1.836 | 1.1001 | 1.549 |
+
+The MLP columns are whole-run `mlpSum/mlpCyc`, conditional on at least one
+MSHR in WAIT_R (§10.1); they include the cold warmup. The throughput columns
+use commit windows. These are different populations and denominators, so the
+MLP values alone cannot predict the displayed B/cycle.
 
 N=4, ring 4 is 1.79x the legacy four-chain throughput and 2.01x N=2, with four
 AXI hot IDs simultaneously outstanding. Ring 8 improves the sequential stream by
@@ -894,10 +902,10 @@ regressions, but the current full-core kernels used at most eight slots.
 `CPU_INHIBITED_FULL_BARRIER=1`, `CPU_LS_LOAD_RING_DEPTH=8`,
 `IQ_LOAD_BYPASS=1`, and `IPC_MEM=l2:5:60:4096`. With seed 1 and checked
 final data, `chase-four` again reached 0.6595 B/cycle, 0.2476 IPC,
-four simultaneous hot AXI IDs, and whole-run MSHR MLP 1.836;
+four simultaneous hot AXI IDs, and whole-run active-WAIT_R MLP 1.836;
 `stream-16k` reached 1.0600 B/cycle, 0.3978 IPC, ring occupancy eight,
-and whole-run MSHR MLP 1.551. The dependent `chase-128` control reached
-0.4453 B/cycle and MLP 1.021. Four-chain `failSet=87` and `failFull=failWb=0`
+and whole-run active-WAIT_R MLP 1.551. The dependent `chase-128` control reached
+0.4453 B/cycle and whole-run active-WAIT_R MLP 1.021. Four-chain `failSet=87` and `failFull=failWb=0`
 identify set conflicts rather than MSHR or writeback capacity in this run.
 The source and checked metrics are in `/tmp/codex-bw-integrated-mlp-r8.log`;
 the three active focused arms (`inhibitedProbeCancel`, `mergeDirty`,
