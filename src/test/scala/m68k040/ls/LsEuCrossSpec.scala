@@ -2,16 +2,47 @@ package m68k040.ls
 
 import m68k040.{M68kParams, M68kSim, VerilatorTest}
 import m68k040.core.ParamPlugin
-import m68k040.cache.DcachePlugin
+import m68k040.cache.{CacheMode, DcachePlugin, DTranslationCmd, DTranslationRsp}
 import m68k040.execute.LsEuPlugin
 import m68k040.execute.regfile.{RegFilePluginInt, RegFilePluginNzvc, RegFilePluginX}
 import m68k040.isa.{MemOp, Size}
-import m68k040.mmu.DIdentityTranslationPlugin
+import m68k040.services.DTranslationService
 import spinal.core._
 import spinal.core.sim._
+import spinal.lib._
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
+
+/** Identity translator with a test-only request-credit gate. Its response
+  * pipeline is the production identity stub's one-entry elastic pipeline. */
+class GatedIdentityTranslationPlugin extends FiberPlugin with DTranslationService {
+  lazy val _req = Stream(DTranslationCmd())
+  lazy val _rsp = Stream(DTranslationRsp())
+  override def req: Stream[DTranslationCmd] = _req
+  override def rsp: Stream[DTranslationRsp] = _rsp
+  val logic = during build new Area {
+    val holdReq = RegInit(False)
+    holdReq := holdReq
+    holdReq.simPublic()
+    val forceFault = RegInit(False)
+    forceFault := forceFault
+    forceFault.simPublic()
+    val rspValid = RegInit(False)
+    val rspPayload = Reg(DTranslationRsp())
+    _req.ready := (!rspValid || _rsp.ready) && !holdReq
+    _rsp.valid := rspValid
+    _rsp.payload := rspPayload
+    when(_rsp.fire) { rspValid := False }
+    when(_req.fire) {
+      rspValid := True
+      rspPayload.ppn := _req.payload.vpn
+      rspPayload.cacheMode := CacheMode.WRITETHROUGH
+      rspPayload.fault := forceFault
+      rspPayload.token := _req.payload.token
+    }
+  }
+}
 
 /** Directed test of the LS-EU two-access load sequencing + cross-line merge (Task 3).
   *
@@ -19,17 +50,17 @@ import org.scalatest.funsuite.AnyFunSuite
   * load spanning the boundary, and checks the merged value in the PRF. Verifies
   * the aligned fast path is unchanged (single access). */
 class LsEuCrossSpec extends AnyFunSuite {
-  class Dut extends Component {
+  class Dut(val earlyMovea: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc   // LS EU now writes NZVC for MOVE-to-memory
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
-    val xlate  = new DIdentityTranslationPlugin
+    val xlate  = new GatedIdentityTranslationPlugin
     val dcache = new DcachePlugin()
-    val eu     = new LsEuPlugin
-    val src    = new LsEuSourcePlugin
+    val eu     = new LsEuPlugin(p1EarlyLoad = earlyMovea)
+    val src    = new LsEuSourcePlugin(dstArch = if (earlyMovea) 8 else 0)
     // This DUT hosts no CacheControlService, so the LS EU classifies EVERY load as
     // cache-INHIBITED (LsEuPlugin `txEffectiveCmode`: CACR.DE=0 is the architectural
     // reset state), and since f5f9fe13 an inhibited load is PRECISE: it launches only
@@ -55,7 +86,8 @@ class LsEuCrossSpec extends AnyFunSuite {
     cd.waitSampling(2)
   }
 
-  def initDut(dut: Dut, injectBusErrors: Boolean = false): (ClockDomain, BehavioralMemAgent) = {
+  def initDut(dut: Dut, injectBusErrors: Boolean = false,
+              waitCacheReady: Boolean = true): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
     val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                      injectBusErrors = injectBusErrors)
@@ -72,7 +104,7 @@ class LsEuCrossSpec extends AnyFunSuite {
     cd.waitSampling(80)   // PRF init sweep
     // c6e3ad43: the D-cache invalidates one set per cycle after reset and holds every
     // port not-ready until done; start each test from a clean, ready cache.
-    cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
+    if (waitCacheReady) cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
     (cd, mem)
   }
 
@@ -154,6 +186,196 @@ class LsEuCrossSpec extends AnyFunSuite {
       dut.src.logic.obsIntAddr #= 20; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == expected(base, 4),
         s"aligned ${dut.src.logic.obsIntData.toBigInt.toString(16)} exp ${expected(base, 4).toString(16)}")
+    }
+  }
+
+  test("optional P1 paired launch fires once for aligned MOVEA.L and excludes split", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut(earlyMovea = true))
+    def run(addr: Long, robId: Int, expectedP1: Int): Unit = {
+      compiled.doSim(s"addr-${addr.toHexString}") { dut =>
+        val (cd, mem) = initDut(dut)
+        preload(mem, addr & ~0xFL, 32)
+        seed(dut, cd, preg = 10, value = addr)
+        var p1Fires = 0
+        var paired = 0
+        var monitorDone = false
+        fork {
+          while (!monitorDone) {
+            cd.waitSampling()
+            if (dut.eu.logic.p1ReqFire.toBoolean) {
+              p1Fires += 1
+              assert(dut.eu.logic.parallelViptLaunch.toBoolean,
+                "P1 translation request did not pair with VIPT probe")
+              paired += 1
+            }
+          }
+        }
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = robId)
+        assert(waitCompletion(dut, cd, robId = robId), "load completes")
+        cd.waitSampling(4)
+        dut.src.logic.obsIntAddr #= 20; sleep(1)
+        assert(dut.src.logic.obsIntData.toBigInt == expected(addr, 4))
+        assert(p1Fires == expectedP1 && paired == expectedP1,
+          s"P1 pair count $p1Fires/$paired expected $expectedP1")
+        monitorDone = true
+      }
+    }
+    run(0x1000L, robId = 5, expectedP1 = 1)
+    run(0x1001L, robId = 7, expectedP1 = 0)
+    run(0x100eL, robId = 6, expectedP1 = 0)
+  }
+
+  test("optional P1 falls back to P2 while virtual-probe credit is reset-blocked", VerilatorTest) {
+    simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut, waitCacheReady = false)
+      assert(dut.dcache.logic.resetSweepBusy.toBoolean,
+        "the fallback test must issue while probe credit is unavailable")
+      val base = 0x3000L
+      preload(mem, base, 16)
+      seed(dut, cd, preg = 10, value = base)
+      var p1Fires = 0
+      var p2Fires = 0
+      var sawBlockedP1 = false
+      var monitorDone = false
+      fork {
+        while (!monitorDone) {
+          cd.waitSampling()
+          if (dut.eu.logic.s1Valid.toBoolean && !dut.dcache.logic.loadProbePort.ready.toBoolean)
+            sawBlockedP1 = true
+          if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+          if (dut.eu.logic.normalReqFire.toBoolean) p2Fires += 1
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 5)
+      assert(waitCompletion(dut, cd, robId = 5, maxCycles = 200), "fallback load completes")
+      cd.waitSampling(2)
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expected(base, 4))
+      assert(sawBlockedP1 && p1Fires == 0 && p2Fires == 1,
+        s"blocked P1 must use one P2 request: blocked=$sawBlockedP1 P1=$p1Fires P2=$p2Fires")
+      monitorDone = true
+    }
+  }
+
+  test("optional P1 falls back to P2 while only DTLB request credit is blocked", VerilatorTest) {
+    simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x3400L
+      preload(mem, base, 16)
+      seed(dut, cd, preg = 10, value = base)
+      dut.xlate.logic.holdReq #= true
+      cd.waitSampling()
+      var p1Fires = 0
+      var p2Fires = 0
+      var sawBlockedP1 = false
+      var monitorDone = false
+      fork {
+        while (!monitorDone) {
+          cd.waitSampling()
+          if (dut.eu.logic.s1Valid.toBoolean && !dut.xlate.req.ready.toBoolean &&
+              dut.dcache.logic.loadProbePort.ready.toBoolean)
+            sawBlockedP1 = true
+          if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+          if (dut.eu.logic.normalReqFire.toBoolean) p2Fires += 1
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 5)
+      cd.waitSampling(3)
+      dut.xlate.logic.holdReq #= false
+      assert(waitCompletion(dut, cd, robId = 5), "DTLB-credit fallback load completes")
+      cd.waitSampling(2)
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expected(base, 4))
+      assert(sawBlockedP1 && p1Fires == 0 && p2Fires == 1,
+        s"blocked DTLB must use one P2 request: blocked=$sawBlockedP1 P1=$p1Fires P2=$p2Fires")
+      monitorDone = true
+    }
+  }
+
+  test("optional P1 accepted pair is canceled by flush and ROB token may be reused", VerilatorTest) {
+    simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4000L
+      preload(mem, base, 16)
+      seed(dut, cd, preg = 10, value = base)
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 5)
+      cd.waitSamplingWhere(dut.eu.logic.p1ReqFire.toBoolean)
+      dut.src.logic.iSqFlush #= true
+      cd.waitSampling(2)
+      dut.src.logic.iSqFlush #= false
+      var staleCompletion = false
+      for (_ <- 0 until 20) {
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 5)
+          staleCompletion = true
+        cd.waitSampling()
+      }
+      assert(!staleCompletion, "flushed P1 pair completed after cancellation")
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 21, robId = 5)
+      assert(waitCompletion(dut, cd, robId = 5), "reused ROB token completes")
+      cd.waitSampling(2)
+      dut.src.logic.obsIntAddr #= 21; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expected(base, 4))
+    }
+  }
+
+  test("optional P1 translation fault cancels probe without data or CCR write", VerilatorTest) {
+    simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x3800L
+      preload(mem, base, 16)
+      seed(dut, cd, preg = 10, value = base)
+      val sentinel = 0x12345678L
+      seed(dut, cd, preg = 20, value = sentinel)
+      dut.xlate.logic.forceFault #= true
+      cd.waitSampling()
+      var p1Fires = 0
+      var cancels = 0
+      var loadCmdFires = 0
+      var dataArFires = 0
+      var faults = 0
+      var completions = 0
+      var wrongOwner = false
+      var badWrite = false
+      var badFaultPayload = false
+      var monitorDone = false
+      fork {
+        while (!monitorDone) {
+          cd.waitSampling()
+          if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+          if (dut.eu.logic.probeCancel.toBoolean) cancels += 1
+          if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
+              dut.dcache.logic.loadCmdPort.ready.toBoolean) loadCmdFires += 1
+          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
+              dut.dcache.logic.axi.ar.ready.toBoolean) dataArFires += 1
+          if (dut.src.logic.fValid.toBoolean) {
+            faults += 1
+            wrongOwner = wrongOwner || dut.src.logic.fRob.toInt != 5
+            badFaultPayload = badFaultPayload || dut.src.logic.fAddr.toLong != base ||
+              !dut.src.logic.fAtc.toBoolean || dut.src.logic.fWrite.toBoolean
+          }
+          if (dut.src.logic.cValid.toBoolean) {
+            completions += 1
+            wrongOwner = wrongOwner || dut.src.logic.cRob.toInt != 5
+          }
+          badWrite = badWrite || dut.eu.intW.valid.toBoolean ||
+            dut.eu.nzvcW.valid.toBoolean
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 5)
+      var n = 0
+      while ((faults == 0 || completions == 0) && n < 80) {
+        cd.waitSampling(); n += 1
+      }
+      cd.waitSampling(8)
+      monitorDone = true
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(p1Fires == 1 && cancels == 1 && !dut.dcache.logic.earlyProbeValid.toBoolean,
+        s"faulted P1 probe lifecycle P1=$p1Fires cancels=$cancels")
+      assert(faults == 1 && completions == 1 && !wrongOwner && !badFaultPayload,
+        s"fault/completion owner counts faults=$faults completions=$completions owner=$wrongOwner payload=$badFaultPayload")
+      assert(loadCmdFires == 0 && dataArFires == 0 && !badWrite,
+        s"fault must not reach physical cache or writeback: cmd=$loadCmdFires AR=$dataArFires write=$badWrite")
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt(sentinel))
     }
   }
 

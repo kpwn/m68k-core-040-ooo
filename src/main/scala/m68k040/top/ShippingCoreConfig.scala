@@ -492,6 +492,8 @@ object ShippingCoreConfig {
   val lsLoadRingDepth: Int = envInt("CPU_LS_LOAD_RING_DEPTH", 4, 4, 16)
   /** Experimental P3 ordinary-load admission into the existing aligned ring. */
   val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false)
+  /** Experimental paired P1 translation/VIPT launch for simple aligned MOVEA.L loads. */
+  val lsP1EarlyLoad: Boolean = envFlag("CPU_LS_P1_EARLY_LOAD", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
   val dcacheEarlyProbeLineForward: Boolean = envFlag("CPU_DCACHE_EARLY_PROBE_LINE_FORWARD", false)
   require(!lsP3FastLoad || inhibitedFullBarrier,

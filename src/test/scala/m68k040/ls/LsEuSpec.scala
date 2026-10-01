@@ -14,7 +14,7 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 class LsEuSpec extends AnyFunSuite {
-  class Dut(p3Fast: Boolean = false) extends Component {
+  class Dut(p3Fast: Boolean = false, p1Early: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
@@ -25,10 +25,10 @@ class LsEuSpec extends AnyFunSuite {
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin(exportBusQuiesced =
       p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
-    val eu     = new LsEuPlugin(p3FastLoad = p3Fast,
+    val eu     = new LsEuPlugin(p3FastLoad = p3Fast, p1EarlyLoad = p1Early,
       inhibitedFullBarrier = p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
       alignedLoadFallThrough = p3Fast)
-    val src    = new LsEuSourcePlugin
+    val src    = new LsEuSourcePlugin(dstArch = if (p1Early) 8 else 0)
     val phead  = new TbPreciseDrainWirePlugin(eu)
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, cacheCtrl,
                                            xlate, dcache, eu, src, phead)) }
@@ -356,6 +356,79 @@ class LsEuSpec extends AnyFunSuite {
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 22; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == BigInt(0xABCD1234L), s"forwarded ${dut.src.logic.obsIntData.toBigInt.toString(16)}")
+    }
+  }
+
+  test("optional P1 probe still cancels on exact older-SQ forwarding", VerilatorTest) {
+    simConfig.compile(new Dut(p1Early = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4800L
+      for (i <- 0 until 16) mem.pokeByte(base + i, memByte(base + i))
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0xABCDEF12L)
+      issueStore(dut, cd, basePreg = 10, disp = 0, dataPreg = 11, Size.LONG, robId = 3)
+      assert(waitStoreAlloc(dut, cd, robId = 3), "older store becomes SQ resident")
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
+      var monitor = true
+      var p1Fires = 0
+      var cancels = 0
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+          if (dut.eu.logic.probeCancel.toBoolean) cancels += 1
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 22, robId = 5)
+      assert(waitCompletion(dut, cd, robId = 5), "younger forwarded P1 load completes")
+      cd.waitSampling(3)
+      dut.src.logic.obsIntAddr #= 22; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt("ABCDEF12", 16))
+      assert(p1Fires == 1 && cancels >= 1 && !dut.dcache.logic.earlyProbeValid.toBoolean,
+        s"P1/SQ collision must cancel its single probe: P1=$p1Fires cancels=$cancels")
+      monitor = false
+    }
+  }
+
+  test("optional P1 partial SQ overlap waits for older store drain", VerilatorTest) {
+    simConfig.compile(new Dut(p1Early = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x4a00L
+      for (i <- 0 until 16) mem.pokeByte(base + i, memByte(base + i))
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0xABCDEF12L)
+      issueStore(dut, cd, basePreg = 10, disp = 2, dataPreg = 11, Size.WORD, robId = 3)
+      assert(waitStoreAlloc(dut, cd, robId = 3), "older partial store becomes resident")
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
+      var monitor = true
+      var p1Fires = 0
+      fork {
+        while (monitor) {
+          cd.waitSampling()
+          if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 22, robId = 5)
+      var earlyLoad = false
+      for (_ <- 0 until 20) {
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 5)
+          earlyLoad = true
+        cd.waitSampling()
+      }
+      assert(!earlyLoad && p1Fires == 1,
+        s"partial overlap cannot expose stale data; early=$earlyLoad P1=$p1Fires")
+      dut.phead.logic.iRobHeadIn #= 3
+      dut.phead.logic.iRobHeadValidIn #= true
+      assert(waitCompletion(dut, cd, robId = 3), "older store drains at ROB head")
+      dut.phead.logic.iRobHeadValidIn #= false
+      assert(waitCompletion(dut, cd, robId = 5), "younger load resumes after drain")
+      cd.waitSampling(3)
+      dut.src.logic.obsIntAddr #= 22; sleep(1)
+      val expected = (BigInt(memByte(base)) << 24) |
+                     (BigInt(memByte(base + 1)) << 16) | BigInt(0xEF12)
+      assert(dut.src.logic.obsIntData.toBigInt == expected,
+        s"post-drain partial overlap returned ${dut.src.logic.obsIntData.toBigInt.toString(16)} expected ${expected.toString(16)}")
+      monitor = false
     }
   }
 
