@@ -21,3 +21,29 @@ frozen source and matched seed/memory/config. A null result remains valid if
 accepted P1 events are demonstrably present; indexed controls remain unchanged.
 
 No RTL eligibility, queue size, or default flag changes belong to this test.
+
+## Matched result at `b0cf9b8e`
+
+Both arms used seed 17, `l2:5:60:4096`, NB4/ring8/hot door, LS-OoO,
+fusion/spec wake, P3/probe, early response/eager AR/preselect/dynamic release,
+and probe-miss staging. Only `CPU_LS_P1_EARLY_LOAD` changed. The measured
+window excludes the first full chain traversal. The P1 count samples accepted
+`p1ReqFire` edges inside that same window; pipeline work at the boundaries
+means it is an acceptance count, not an exact bijection to retired loads.
+
+| Chains | P1 | Accepted P1 | Cycles | Bytes/cycle | IPC |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 | OFF | 0 | 15,371 | 0.8026 | 0.3511 |
+| 4 | ON | 3,065 | 15,069 | 0.8186 | 0.3582 |
+| 6 | OFF | 0 | 16,336 | 0.7551 | 0.2832 |
+| 6 | ON | 2,569 | 16,262 | 0.7586 | 0.2845 |
+
+Each row retired and checked 3,084 measured pointer loads (12,336 bytes).
+P1 ON saves 302 cycles / 2.00% throughput for four chains and 74 cycles /
+0.46% throughput for six. The result proves P1 launches are nonvacuous for
+simple `(An)` chains, but the small throughput change does not support a
+large bandwidth claim. The existing indexed-chain control remains separate.
+
+Evidence: `/tmp/codex-agent75-an-chain-{off,on}.log` (both focused specs
+passed), `/tmp/codex-agent75-an-chain-fast.log` (`make test-fast`: 404 passed,
+zero failed, two ignored). All three runs used the same committed source.
