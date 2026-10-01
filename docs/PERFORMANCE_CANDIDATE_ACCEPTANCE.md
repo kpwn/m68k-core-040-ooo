@@ -234,6 +234,32 @@ active Verilator jobs per `synth/README.md` before it runs. Preserve the live
 board/JTAG session. Feature defaults stay unchanged.
 
 
+### Explicit hot-door port checking
+
+The core socket checker now accepts `--hot-door` only as an explicit generation
+contract. It requires all 13 read-only AXI hot-port names, directions and widths
+(128-bit R data, 2-bit IDs); it rejects missing groups, unexpected groups when
+not enabled, write channels and sidebands. A missing socket file now fails
+instead of silently skipping validation. The frozen full-core port golden is
+unchanged. This implements the core-side checker requirement in D-side spec
+§7.3; it does not activate or modify the SoC wiring.
+
+Both actual generated socket arms above passed the socket checks. Eleven
+controls/mutations in `/tmp/codex-hot-socket-check.py` verified missing RID,
+wrong data width, reversed ready direction, unexpected write/sideband ports,
+missing or unannounced hot group, hot-disabled control and missing file
+rejection. Results: `/tmp/codex-hot-socket-check-results.json`. These checks
+called `check_socket` directly, so they do not claim to have run the separate
+standalone full-core netlist check. Required `test-fast` passed 404/404 on source `99ecd1fb`; log
+`/tmp/codex-hot-socket-fast.log`.
+
+Read-only inspection found the live SoC main tree `dc97a83` still labels the
+CPU hot interface planned, while its `dhcpu` worktree has uncommitted P6 wiring
+with the expected 2-bit ID and 128-bit data constants. Those owner changes and
+the live board session were left untouched. Full two-repository integration,
+lint/protocol tests and physical acceptance remain required.
+
+
 ## Combined full-core ordering checkpoint (2026-10-01)
 
 On frozen `46413280`, NB4/ring8/hot door with dynamic release, early response,
