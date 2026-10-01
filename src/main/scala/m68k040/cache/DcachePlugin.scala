@@ -6054,9 +6054,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // This optional path selects a newly allocated LOAD into the same AR holding
       // register. The normal WAIT_AR candidates keep priority. Preselection is one
       // cycle earlier than their gate, so also account for WT writes still in S0
-      // or presented at the input; by the next cycle they can enter S1 and would
-      // be older than the already-advertised AR. Input VALID is conservative and
-      // avoids feeding storePort.ready back into the AR register's D cone.
+      // or presented at the input; by the next cycle they can enter S1 before
+      // AR handshakes. The input guard is conservative even for a younger WT,
+      // and avoids feeding storePort.ready back into the AR register's D cone.
       val preselectWtTo = if (!nbPreselectAr) False else
         (s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(s0Payload.paddr) === lLine) ||

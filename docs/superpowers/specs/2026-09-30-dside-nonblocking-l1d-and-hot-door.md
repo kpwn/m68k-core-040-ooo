@@ -536,9 +536,12 @@ The preselection gate must use the **current** `coldWriteTo(lLine)` predicate,
 which includes queued WB entries, both same-cycle dirty-victim pushes, WT
 outstanding entries, and S3 WT pushes, plus the existing S1/S2 WT line check.
 Preselection is one cycle earlier than eager selection, so it must also check
-an accepted WT in S0 and a same-edge presented WT at the store input. Otherwise
-that older write can be sitting in S1 when the newly registered AR first
-becomes valid. This conservative line check is local to preselection; the
+an accepted WT still held in S0 and any same-line WT presented at the store
+input. A presented WT can be younger than the load, as the load-first directed
+diagnostic demonstrated; the input guard deliberately delays the AR anyway.
+For an older accepted WT, a pipeline hold can leave it in S0 at allocation,
+then move it to S1 when the newly registered AR first becomes valid. This
+conservative line check is local to preselection; the
 normal eager path continues to retry after the writer drains. The two WB-push
 terms remain even though legal current ports phase-separate their simultaneous
 assertion (§6.3c), so future admission changes cannot silently break the gate.
@@ -549,11 +552,23 @@ ID must be derived from `lOH`, not an independent free-slot encoder.
 
 Acceptance requires an exact load-command-to-AR advertisement change from
 eager-only 4 cycles to preselect 3 cycles on a clean miss, stable ARVALID and
-payload under backpressure, S0/S1/S2/S3 WT plus delayed-B visibility, same-edge
-WB push hazards, full WB admission pressure, store-delay/no-fill invariance,
-randomized stress, and checked full-core dependent and independent-load
-measurements. A failed invariant keeps this option OFF; the current eager
-selection remains the shipping candidate.
+payload under backpressure, legally reachable WT S1/S2/S3 and delayed-B
+visibility, a separately labeled S0/input gate proof (with legal held-S0
+coverage identified explicitly if obtained), both reachable adjacent dirty-WB
+push orders and the retained dual-push predicate, full WB admission pressure,
+store-delay/no-fill invariance, randomized stress, checked full-core dependent
+and independent-load measurements, and an area estimate for the added line
+comparators. An untested S0 or simultaneous dual-push condition must be marked
+as such, not counted as covered. A failed invariant keeps this option OFF;
+the current eager selection remains the shipping candidate.
+
+The opt-in selector uses no new register, but its `lLine` gate can add up to
+15 28-bit line comparisons to the AR-register D cone: four WB FIFO entries,
+two same-edge victim pushes, four outstanding WT entries, and WT S3/S2/S1/S0
+and input. It also adds the allocated-slot/address choice after older
+`WAIT_AR` candidates. These are source-level upper bounds, not measured LUTs
+or Fmax; sharing/constant pruning depends on synthesis. A board build must
+remain OFF until measured area and timing justify the cycle gain.
 
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
