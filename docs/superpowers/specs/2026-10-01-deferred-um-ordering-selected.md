@@ -7,8 +7,9 @@ tests remain applicable. The queue bypass prerequisite is implemented by
 `UmWriteQueue`, but none of the cross-plugin rules below are implemented yet.
 The core architecture document's non-speculative descriptor-write rule is
 retained. This specification changes when those writes are ordered with
-ordinary memory operations and allows at-head authorization for a precise
-store. Services, rather than references to another plugin's implementation
+ordinary memory operations and requires irrevocable at-head authorization
+for every ROB-owned update, including a load whose later walk faults.
+Services, rather than references to another plugin's implementation
 area, carry every new cross-plugin signal. No new `Global` key is required.
 
 ## Observable order
@@ -21,7 +22,8 @@ an older deferred OR must not resurrect it. A later U/M update may set that
 bit again. A wrong-path **ROB-owned D-side** update never reaches memory, and a TLB fill whose
 required update was discarded cannot remain usable. These requirements hold
 for an ordinary program load, a DTLB descriptor read, and a two-page split.
-`mmu_atc_write_hit_sets_modified`, `walk_vs_older_store_slow`, and
+On a faulting walk, U changes to descriptors already encountered may still be
+architectural; the later failure does not erase them. `mmu_atc_write_hit_sets_modified`, `walk_vs_older_store_slow`, and
 `walk_vs_older_store_uncommitted` are mandatory exact regressions. An
 arbitrary delay in a test is not a repair.
 
@@ -32,28 +34,38 @@ An I-side walk poisoned before completion still must not allocate an update.
 
 The MC68040 User's Manual, pages 3-14 and 3-27, says that a clear U bit is
 updated before page access and a write with clear ATC M suspends until its
-descriptor M bit is set, then retries the original write. The core can retain
-deferred, non-speculative writes while giving younger internal reads the same
-ordered value via forwarding or replay. A *precise or device store* must not
-start its externally visible data transfer before its own U/M update finishes.
-At the ROB head, with IRQ/trace/debug preemption excluded, it authorizes its
-metadata entry irrevocably. The metadata read/OR/store finishes first; only
-then does the existing D4 fence wait for D-side quiescence and launch the data
-store. Keep the owner in the ROB through both phases. Once authorized, hold
-preemption until either the data transfer completes or a metadata fault is
-reported against this owner. On metadata read/write error, suppress the data
-store and return a precise fault; do not silently discard the update. The
-current diagnostic-only behavior for an error on a deferred update *after a
-nonprecise owner retired* is a pre-existing bus-error fidelity limitation and
-is not claimed fixed by this ordering change.
+descriptor M bit is set, then retries the original write. Section 3.2.5 and
+Figure 3-10 additionally show U checked for each encountered table descriptor;
+a scheduled pointer U write occurs after the next descriptor read but before
+its normal decode/termination. Thus a later invalid descriptor can leave an
+earlier root/pointer U set. The walker records an ordered *partial* batch on
+fault, not only a successful translation's page update.
 
-For a fast store, its own U/M entry becomes committed on retirement, as today.
-The SQ store, committed on that same edge, is held behind that metadata write.
-Thus metadata precedes the same instruction's data in both precise and fast
-postures. A descriptor-self-write test must include software clearing M in
-the value it stores: the store's own metadata OR occurs first, and the later
-software value wins. The at-head authorization, rather than waiting for the
-store to retire, prevents a precise-store/metadata circular wait.
+The core can retain speculative execution and non-speculative metadata writes
+while giving younger internal reads the ordered value via forwarding or
+replay. At the ROB head, with IRQ/trace/debug preemption excluded, **every
+ROB-owned batch** becomes irrevocably authorized. Drain its encountered
+metadata read/OR/stores in walk order and receive each terminal response
+before owner retirement. Cacheable load data may have executed speculatively,
+but its result, pre-existing data fault, and retirement wait for this metadata
+outcome. On metadata bus error, report a precise access fault against this
+owner; an error in an earlier descriptor's metadata operation takes priority
+over a later walk/data fault. A wrong-path batch never authorizes or reaches
+memory. An already authorized batch survives redirects until completion;
+retirement and IRQ/trace/debug preemption are held. This closes the previous
+diagnostic-only metadata-error behavior for ROB-owned accesses; ownerless
+fetch/exception errors use the rules below.
+
+For a fast or precise store, its own metadata batch completes before its SQ
+data store receives a drain grant. A *precise or device store* also keeps the
+data transfer blocked while metadata is pending: authorization, metadata
+read/OR/store, existing D4 quiescence fence, then data transfer, then
+retirement. A descriptor-self-write test must include software clearing M in
+the value it stores: its own metadata OR occurs first, and the later software
+value wins. At-head authorization, rather than waiting for retirement,
+prevents a store/metadata circular wait. A metadata fault suppresses its data
+transfer. A faulting load with an encountered root/pointer U follows the same
+at-head drain before the translation fault is delivered.
 
 ## D-side walk against older stores and metadata
 
@@ -127,22 +139,22 @@ a descriptor load waits.
 
 ## Ordering D-side metadata against SQ drains
 
-On each normal U/M owner's retirement lane, record the terminal SQ-ack epoch
-plus the number of *resident committed* older SQ entries, including entries
-with accepted halves awaiting final ack and stores retired in earlier lanes
-of that edge. A simultaneous SQ ack counts as completed on the next edge;
+On each normal U/M owner's at-head authorization, record the terminal SQ-ack
+epoch plus the number of *resident committed* older SQ entries, including
+accepted halves awaiting final ack. Every older ROB instruction has retired
+before authorization, so there are no older uncommitted stores to discover
+later. A simultaneous SQ ack counts as completed on the next edge;
 the snapshot target must give the same result with or without that collision.
 The SQ is FIFO for stores, so this snapshot is an older prefix. Do not include
-a store retired in a later lane. A store belonging to the same owner follows
-its U/M entry, except that a precise store's early metadata authorization
-establishes this order before its own retirement.
+the owner's own SQ entry; it follows the metadata batch although already
+resident. Waiting on that entry would deadlock.
 
 Let that captured older SQ prefix finish. Then prioritize the oldest eligible
 U/M entry through re-read, merged store, and terminal ack. Do not present a
 newer SQ stream offer until the metadata ack; an already presented SQ offer
 must remain valid and finish before the new metadata grant. The SQ needs an
 intent/grant split with a latched offered state, so the grant cannot withdraw
-`Stream.valid`. The U/M queue's committed bypass allows this drain even if a
+`Stream.valid`. The U/M queue's authorized-entry bypass allows this drain even if a
 younger speculative walk allocated an earlier physical slot. Since at most
 SQ depth eight older resident entries can drain while the U/M entry waits,
 the SQ terminal-ack target can use four modular bits; assert the bounded span
@@ -150,7 +162,7 @@ and test ack/commit/offer collisions. If the oldest U/M waits for older SQ,
 the SQ grant applies only to that older prefix. Younger SQ cannot get ahead.
 Within one walk batch, drain root, pointer, then page in walk order; two
 batches owned by a page-crossing uop drain first-half before second-half.
-Retirement stamps order different ROB owners. For batches of the same owner,
+ROB-head authorization orders different D-side owners. For batches of the same owner,
 store a bounded allocation-order tie-break (or explicit half ordinal), rather
 than relying on physical free-slot index after wrap or flush.
 
@@ -173,6 +185,12 @@ grant the epoch afterward. This gives software descriptor clears and U/M ORs
 a deterministic physical order without treating an uncommitted younger store
 as an older dependency. The explicit serializing ATC invalidation remains the
 software synchronization point for page-table rewrites that preceded fetch.
+The I-side fetch retains its PC and withholds the translated line from decode
+until all encountered U writes finish, even when a later descriptor faults;
+a metadata bus error becomes an instruction-access fault at that PC. A
+poisoned walk never allocates. An exception-owned D walk likewise finishes
+metadata before its exception data transfer; a metadata bus error follows
+the existing nested-exception/double-fault path, rather than being discarded.
 
 The D4 sequence is: metadata/ownerless prerequisite, then D4 walker fence and
 bus-quiescence wait, then inhibited data transfer. `pendingAtHead` must not
@@ -191,14 +209,16 @@ order. `TableWalker` currently emits only the page element; extend both D and
 I walkers to record U for each encountered resident root and pointer table
 descriptor and U/M for the final page descriptor. The manual (§3.2.2.1,
 §3.2.5) requires those table U updates before page access. The walker emits
-one bounded batch at successful completion; no-update walks release the
-reservation. If a later descriptor aliases an earlier element in the same
+one bounded batch with its result or fault at walk completion; a fault result
+includes all earlier valid encountered U elements, while a no-update result
+releases its reservation. If a later descriptor aliases an earlier element in the same
 walk, use the earlier element's U/M bits when decoding it. A repeated page
 crossing walk may produce duplicate bytes, which remain ordered OR updates.
 Keep the existing speculative D owner and born-committed I/exception owner
-lifetimes; a batch has one owner, one commit stamp, and one SQ ack-prefix
+identities, but add a D-side authorized state that survives flush while its
+owner remains at head. A batch has one owner, one authorization/order stamp, and one SQ ack-prefix
 target, while the drain acknowledges its elements individually before freeing
-the slot. Flush cannot remove an offered committed element or make another
+the slot. Flush cannot remove an offered authorized element or make another
 element overtake it.
 
 Reserve one batch slot at translation-miss *capture*, not at
@@ -207,7 +227,13 @@ ROB-head uop's at-most-two page-crossing walks; a non-head miss may capture
 only when more than two slots are free, so an empty queue still admits two
 younger independent walks. The head may use either reserved slot. A single
 walker can then complete all three descriptor updates without needing another
-credit partway through. The I side also reserves one batch slot before its
+credit partway through. Admission counts both occupied batches and slots
+reserved by accepted walks that have not yet produced a batch; completion
+consumes its reservation, a no-update result or squash releases it, and an
+allocation cannot borrow the other half of a split owner's reservation.
+Same-edge completion/free/capture uses one explicitly specified credit order
+and asserts that occupied plus reserved never exceeds four. The I side also
+reserves one batch slot before its
 ownerless walk and backpressures a new miss while full. If a younger P4
 translation is denied and an older LS op is upstream, request immediate P4
 replay/backout before DTLB captures anything; the 255-cycle watchdog is not a
@@ -240,10 +266,13 @@ self-write; a translated LOAD of its own leaf-descriptor byte with clear U,
 a fully forwarded older SQ descriptor value plus the load's own U, and a
 split partial access whose second physical half overlaps its own descriptor
 update; root/pointer U on both D/I walks, same-owner pointer-table access,
-and six-update split pressure across two reserved batches.
-Cover IRQ during metadata
-authorization, metadata read/write fault;
-younger SQ already offered when U/M commits; simultaneous SQ ack plus commit;
+and six-update split pressure across two reserved batches. Before claiming
+fault-path 68040 fidelity, test a later-descriptor bus error and nonresident
+descriptor after an earlier U update: the faulting owner drains the partial
+batch, and a metadata error overrides the later walk fault while keeping
+precise state. Cover IRQ during metadata authorization, metadata read/write
+fault on an ordinary load and a precise store; younger SQ already offered
+when a batch authorizes; simultaneous SQ ack plus authorization;
 walker blocked by older SQ while older U/M preempts between reads; response
 attribution after descriptor fault and split last byte; four younger pending
 updates versus oldest split walk with bounded immediate replay; wrong-path
