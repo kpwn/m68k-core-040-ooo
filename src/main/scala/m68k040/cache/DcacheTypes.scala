@@ -215,6 +215,9 @@ case class DLoadRsp() extends Bundle {
   val data  = Bits(32 bits)
   val line  = Bits(128 bits)
   val fault = Bool()
+  /** True only for the registered S2 resident L1 hit. Sole producer:
+    * DcachePlugin's load-response arbiter; refill and fault arms drive False. */
+  val residentHit = Bool()
   /** RESPONSE IDENTITY: the `DLoadCmd.token` of the request this response answers.
     *
     * Responses used to be matched POSITIONALLY -- the LS EU's `ldFifoTags` popped a

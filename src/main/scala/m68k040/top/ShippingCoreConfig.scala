@@ -494,6 +494,8 @@ object ShippingCoreConfig {
   val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false)
   /** Experimental paired P1 translation/VIPT launch for simple aligned MOVEA.L loads. */
   val lsP1EarlyLoad: Boolean = envFlag("CPU_LS_P1_EARLY_LOAD", false)
+  /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
+  val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
   val dcacheEarlyProbeLineForward: Boolean = envFlag("CPU_DCACHE_EARLY_PROBE_LINE_FORWARD", false)
   require(!lsP3FastLoad || inhibitedFullBarrier,

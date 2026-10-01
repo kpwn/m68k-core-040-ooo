@@ -46,6 +46,12 @@ trait LsEuService {
   //
   // Idle (never valid) unless `specLoadWakeup` is set.
   def wakeupSpec: Flow[UInt]
+  /** P3-only speculative tag, before the merged P4-priority wakeup. Sole producer:
+    * this LS EU's registered P3 context. Idle unless four-cycle mode is enabled. */
+  def wakeupSpecP3: Flow[UInt]
+  /** Exact live, granted resident-hit completion tag. Sole producer: this LS EU's
+    * aligned-ring head completion arbiter. No second architectural completion. */
+  def liveLoadConfirm: Flow[UInt]
   // ORDER VIOLATION (out-of-order LS issue only). Fires when an op resolves INHIBITED at
   // P4 while a program-YOUNGER cacheable access has ALREADY launched into the D-cache --
   // the one case the inhibited barrier cannot prevent, because cacheability is unknowable
@@ -140,6 +146,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val specLoadWakeup: Boolean = false,
                  val p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
                  val p1EarlyLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
+                 val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
                  val lsOooIssue: Boolean = false,
                  val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
@@ -166,6 +173,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     s"aligned-load ring depth must be 4, 8, or 16, got $loadRingDepth")
   require(!p3FastLoad || inhibitedFullBarrier,
     "P3 fast load requires the inhibited full barrier")
+  require(!fourCycleL1 || (p1EarlyLoad && p3FastLoad && specLoadWakeup &&
+    alignedLoadFallThrough && earlyIntWakeup),
+    "four-cycle L1 experiment requires P1/P3/spec wake/fall-through/early int wake")
   // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
   // that is worth stating because an earlier revision required both. The re-check pins a
   // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
@@ -199,6 +209,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var wakeupPort: Flow[UInt]       = null
   var wakeupNzvcPort: Flow[UInt]   = null
   var wakeupSpecPort: Flow[UInt]   = null
+  var wakeupSpecP3Port: Flow[UInt] = null
+  var liveLoadConfirmPort: Flow[UInt] = null
   var orderViolationPort: Flow[UInt] = null
   var replayRequestPort: Flow[UInt] = null
   var faultCompletionPort: Flow[LsFault] = null
@@ -222,6 +234,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def wakeup: Flow[UInt]       = wakeupPort
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
+  override def wakeupSpecP3: Flow[UInt] = wakeupSpecP3Port
+  override def liveLoadConfirm: Flow[UInt] = liveLoadConfirmPort
   override def orderViolation: Flow[UInt] = orderViolationPort
   override def replayRequest: Flow[UInt] = replayRequestPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
@@ -339,6 +353,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
     wakeupSpecPort = Flow(UInt(6 bits))   // pdst of a load PREDICTED to write back next cycle
     wakeupSpecPort.simPublic()
+    wakeupSpecP3Port = Flow(UInt(6 bits))
+    liveLoadConfirmPort = Flow(UInt(6 bits))
+    wakeupSpecP3Port.simPublic(); liveLoadConfirmPort.simPublic()
     orderViolationPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     orderViolationPort.simPublic()
     replayRequestPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
@@ -868,7 +885,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // the AGU adder is a SEPARATE shallow stage (s1Base_reg + disp -> s1Va), not
     // chained onto the ALU's result. (Latency-agnostic: lock-step is instruction-level,
     // and the front context is held until its decision or cache handoff.)
-    val base0 = Mux(u0.psrcAValid, rdBase.data.asUInt, U(0, 32 bits))
+    // The confirm is produced by the ring arbiter below, independently of IQ
+    // issue/ready. Only this operand capture uses its data; architectural writeback
+    // and every other bypass retain their existing registered path.
+    val liveConfirmData = Bits(32 bits)
+    val liveConfirmValid = Bool()
+    val liveConfirmTag = UInt(6 bits)
+    val fourCycleOperandEligible = m68k040.execute.iq.FourCycleLoadForm.applies(u0)
+    val liveBaseBypass = if (fourCycleL1)
+      issuePort.valid && fourCycleOperandEligible && liveConfirmValid &&
+        (u0.psrcA === liveConfirmTag)
+    else False
+    val base0 = Mux(u0.psrcAValid,
+      Mux(liveBaseBypass, liveConfirmData.asUInt, rdBase.data.asUInt), U(0, 32 bits))
+    liveBaseBypass.simPublic()
     // STORE DATA: `imm` (retPC) for a BSR/JSR stack-push (predecrement, srcB invalid),
     // else the (possibly bypassed) source register. A LINK push is ALSO a stkPush but
     // carries the pushed register (the old An) in srcB (srcBValid), so it reads rdData
@@ -2571,6 +2601,26 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // vals rather than re-declaring them.
     val alignedRspEntry    = alignedMem(alignedRspPtr)
     val alignedRspIsPoison = alignedPoisoned(alignedRspPtr) || sqFlushSig
+    // A live RID match alone is insufficient: a later refill can also match the
+    // head. Only the D-cache's registered S2 resident-hit response is eligible.
+    // This predicate reads no current IQ issue/fire/ready signal, preventing a
+    // response-confirmation -> issue-ready -> response-confirmation loop.
+    val liveL1HeadGrant = if (fourCycleL1)
+      alignedRspFire && alignedHeadLive && dcache.loadRsp.payload.residentHit &&
+        !alignedRspFault && !alignedRspIsPoison && !excActive &&
+        !alignedRspEntry.twoAccess &&
+        (alignedRspEntry.size === m68k040.isa.Size.LONG) &&
+        !alignedWb(alignedRspPtr) &&
+        alignedRspEntry.bk.pdstValid && alignedRspEntry.bk.wakes &&
+        !alignedRspEntry.bk.ccrRestore && !alignedRspEntry.bk.signExtW &&
+        !(alignedRspEntry.bk.needsSupervisor && !alignedRspEntry.bk.xlateSup)
+    else False
+    liveLoadConfirmPort.valid := liveL1HeadGrant
+    liveLoadConfirmPort.payload := alignedRspEntry.bk.pdst
+    liveConfirmValid := liveL1HeadGrant
+    liveConfirmTag := alignedRspEntry.bk.pdst
+    liveConfirmData := alignedRspData
+    liveL1HeadGrant.simPublic()
     // True when this response is slot A of a split pair. A non-poisoned FAULT on
     // slot A aborts the whole instruction right here -- mirroring the old bkFsm's
     // WAIT_A fault arm exactly -- and slot B (provably the very next ring entry,
@@ -3249,6 +3299,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           captureCompletionDesc(alignedRspEntry.bk, alignedRspData,
                                 alignedRspEntry.size)
         }
+      }
+    }
+    if (fourCycleL1) GenerationFlags.simulation {
+      val bypassFire = liveBaseBypass && issuePort.fire
+      val bypassWas = RegNext(bypassFire) init False
+      val bypassDataWas = RegNextWhen(liveConfirmData, bypassFire)
+      val bypassTagWas = RegNextWhen(liveConfirmTag, bypassFire)
+      when(bypassFire) {
+        assert(liveLoadConfirmPort.valid && liveCompletionFires &&
+          nextIntWake.valid && (nextIntWake.payload === liveConfirmTag) &&
+          (alignedRspData === liveConfirmData),
+          "four-cycle operand bypass lacked the exact winning live completion")
+      }
+      when(bypassWas) {
+        assert(compValid && !compIsFault && compPdstValid &&
+          (compPdst === bypassTagWas) && (compData === bypassDataWas),
+          "four-cycle bypass disagreed with eventual registered PRF writeback")
       }
     }
     // OUT-OF-ORDER WRITEBACK. A parked entry behind the head writes the PRF and wakes
@@ -4041,6 +4108,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     wakeupSpecPort.valid   := specWakeFire || p3SpecWake
     wakeupSpecPort.payload :=
       (if (p3FastLoad) Mux(p4Valid, p4Front.pdst, p3Ctx.front.pdst) else p4Front.pdst)
+    wakeupSpecP3Port.valid := (if (fourCycleL1) p3SpecWake else False)
+    wakeupSpecP3Port.payload := p3Ctx.front.pdst
     // ═══ INHIBITED ACCESSES ARE TWO-WAY MEMORY BARRIERS (`lsOooIssue`) ═════════════════
     // Out-of-order LS issue may let a younger CACHEABLE load overtake an older LS op, and
     // cacheability is unknowable at issue (nothing is translated there) -- which is exactly

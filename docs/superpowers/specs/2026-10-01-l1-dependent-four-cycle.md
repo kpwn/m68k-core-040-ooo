@@ -1,8 +1,10 @@
 # Experimental four-cycle dependent L1 load loop
 
-Status: **specification only; default OFF**. This amends the optional L1
-latency work described in the D-side non-blocking design spec. No RTL, test,
-or scheduling change is authorized by this document alone. The experiment
+Status: **bounded implementation experiment authorized; default OFF**. This
+amends the optional L1 latency work described in the D-side non-blocking design
+spec. The user authorized a focused oldest-only scheduling and live-head
+confirmation experiment with directed safety tests and matched latency gates;
+physical timing remains a separate acceptance gate. The experiment
 targets a chain whose producer is a simple, aligned, cacheable longword load
 and whose consumer is a fused, first-and-last `MOVEA.L (An),An` with one
 address-base source (`psrcA`) and no index, `psrcC`, or store-data source.
@@ -144,11 +146,27 @@ without any corresponding T4 data bypass.
 ## Cost and timing gate
 
 No new data queue or copied cache line is proposed. Reusing P3 context, the
-existing LS issue register, and the ring response requires no new payload
-state. If a dedicated registered producer hint is necessary, budget roughly
-one valid bit plus a six-bit `pdst`; no RID/ROB generation register is
-budgeted unless poisoned-slot retention fails a directed test. Any other state needs a spec
-amendment. Combinational cost is at least an LS-source tag compare for A,
+existing LS issue register, and the ring response requires no new data-payload
+state. The exact fused simple-An eligibility is not in `IqHot`: its `lastOfInstr`,
+`isMovea`, `eaAuto`, size and immediate live in the cold LUTRAM record. Reading
+that record in the T3 oldest-select cone would add a RAM read and selection
+level. This experiment therefore permits one predecoded eligibility bit per
+16 IQ hot slots, copied into the existing LS issue/skid hot registers (18 bits
+of nominal metadata state). The bit is decoded once at push from the full
+dispatch record; it does not widen the data bypass. A separate P3-only
+speculative tag is a wire sourced by the LS EU's registered P3 context, not a
+new tag register. The D-cache response service gains one `residentHit` bit.
+A legacy cold miss can refill and **relaunch its original command through
+S1→S2**, so `ldS2Resp` alone does not establish resident-hit provenance.
+This experiment permits two one-bit provenance registers alongside existing
+S1 and S2 state: fresh accepted S1 command versus replay/shadow, then S2
+carry. The accepted direct early-probe-hit arm sets S2 provenance explicitly.
+The D-cache drives `residentHit` true only for a fresh S2 L1-hit response
+that wins its response port; the LS confirm rejects refill, replay and bus-
+fault responses even when they match a live ring head.
+No RID/ROB generation register is budgeted unless poisoned-slot retention
+fails a directed test. Any other state needs a spec amendment. Combinational
+cost is at least an LS-source tag compare for A,
 one 32-bit base-operand select, and an IQ same-cycle oldest-only eligibility
 check (one candidate slot rather than 16 independent ready bypasses). A resident-hit-only response qualifier may require
 a one-bit field in the existing D-cache response service; it must have the

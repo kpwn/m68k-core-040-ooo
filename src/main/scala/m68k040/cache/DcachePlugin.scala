@@ -1146,6 +1146,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // way-muxes the data, lane-extracts, and (on a miss) starts the refill. The +1
     // cycle to start a refill is latency-agnostic (lock-step absorbs it).
     val ldS1Valid = RegInit(False)       // a load-read was launched into S1
+    // Provenance for the optional four-cycle LS bypass. A refill replay or a
+    // shadow relaunch can pass through S1/S2 as a hit, but was not a fresh L1
+    // response to the original accepted command.
+    val ldS1Fresh = RegInit(False)
     val ldS1Set   = Reg(UInt(setBits bits))
     val ldS1Tag   = Reg(UInt(tagBits bits))
     val ldS1Off   = Reg(UInt(offBits bits))
@@ -1165,6 +1169,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS1Rid   = Reg(UInt(DLoadRid.Width bits))
     val ldS1RidV  = RegInit(False)
     ldS1Valid := False                   // default; armed on an accept below
+    ldS1Fresh := False                   // replay/shadow arms deliberately leave False
 
     // Throughput slice C0: one bounded replay slot for the request accepted on the
     // exact cycle an older S1 probe discovers a miss. That younger request has
@@ -1852,7 +1857,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2Token = Reg(UInt(DLoadToken.Width bits))
     val ldS2Rid   = Reg(UInt(DLoadRid.Width bits))
     val ldS2RidV  = RegInit(False)
+    val ldS2Fresh = RegInit(False)
     ldS2Valid := ldS1Valid
+    ldS2Fresh := ldS1Fresh
     ldS2Hit   := ldS1Hit
     ldS2Line  := ldS1Line
     ldS2Off   := ldS1Off
@@ -1882,6 +1889,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       else Mux(missLineResp, missLine, ldS2Line)
     loadRspPort.payload.data  := responseData
     loadRspPort.payload.line  := responseLine
+    loadRspPort.payload.residentHit := ldS2Resp && ldS2Fresh &&
+      !busFaultResp && !missLineResp && !directRefillResp
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
     loadRspPort.payload.fault := busFaultResp ||
@@ -2694,6 +2703,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           rdEn         := True
           loadUsesPort := True
           ldS1Valid    := True
+          ldS1Fresh    := True
           ldS1Set      := cmdSet
           ldS1Tag      := cmdTag
           ldS1Off      := cmdOff
@@ -2719,6 +2729,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         }
         when(loadCmdPort.fire && !humReadOk) {
           ldS2Valid      := True
+          ldS2Fresh      := True
           ldS2Hit        := True
           ldS2Direct     := True
           ldS2DirectData := earlyProbeHitData
@@ -2983,6 +2994,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // size-extracted hit data. Bypass the redundant normal S1 read and land in
           // the existing registered S2 response stage.
           ldS2Valid      := True
+          ldS2Fresh      := True
           ldS2Hit        := True
           ldS2Direct     := True
           ldS2DirectData := earlyProbeHitData
@@ -3002,6 +3014,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           rdEn         := True
           loadUsesPort := True
           ldS1Valid    := True
+          ldS1Fresh    := True
           ldS1Set      := cmdSet
           ldS1Tag      := cmdTag
           ldS1Off      := cmdOff

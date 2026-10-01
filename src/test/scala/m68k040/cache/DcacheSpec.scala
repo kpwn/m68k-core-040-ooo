@@ -190,7 +190,8 @@ class DcacheSpec extends AnyFunSuite {
 
   /** Drive a load cmd, wait accept, wait rsp.valid; return data. */
   def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type],
-           cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): BigInt = {
+           cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
+           expectedResidentHit: Option[Boolean] = None): BigInt = {
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
@@ -203,6 +204,10 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadProbeCancelIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.payload.all #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+    expectedResidentHit.foreach { expected =>
+      assert(dut.probe.logic.loadRspOut.payload.residentHit.toBoolean == expected,
+        s"residentHit provenance mismatch for vaddr=0x${vaddr.toHexString}")
+    }
     dut.probe.logic.loadRspOut.payload.data.toBigInt
   }
 
@@ -393,7 +398,8 @@ class DcacheSpec extends AnyFunSuite {
       val base = 0x1230L  // 16-aligned line at 0x1230
       preload(mem, base & ~0xfL, 16)
 
-      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "LONG extract")
+      assert(load(dut, cd, base, Size.LONG, expectedResidentHit = Some(false)) ==
+        expected(base, 4), "LONG extract")
       assert(load(dut, cd, base, Size.WORD) == expected(base, 2), "WORD extract")
       assert(load(dut, cd, base, Size.BYTE) == expected(base, 1), "BYTE extract")
       // a byte deeper in the line
@@ -413,9 +419,10 @@ class DcacheSpec extends AnyFunSuite {
       fork { while (true) { cd.waitSampling()
         if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
 
-      load(dut, cd, base, Size.LONG)         // cold miss -> 1 refill
+      load(dut, cd, base, Size.LONG, expectedResidentHit = Some(false)) // cold miss -> 1 refill
       val after1 = arCount
-      val got = load(dut, cd, base + 4, Size.LONG)  // same line -> hit
+      val got = load(dut, cd, base + 4, Size.LONG,
+        expectedResidentHit = Some(true))  // same line -> hit
       assert(got == expected(base + 4, 4), "hit data")
       assert(arCount == after1, s"warm hit must not refill: $after1 -> $arCount")
       cd.waitSampling(4)

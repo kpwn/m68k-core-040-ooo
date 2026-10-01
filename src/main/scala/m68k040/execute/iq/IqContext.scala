@@ -9,6 +9,25 @@ case class IqContext() extends Bundle {
   val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
 }
 
+/** One eligibility predicate shared by IQ hot predecode and the LS operand
+  * capture recheck. Keeping one definition prevents a hot-eligible/cold-ineligible
+  * uop from being released without its matching data bypass. */
+object FourCycleLoadForm {
+  def applies(u: RenamedUop): Bool =
+    (u.op === m68k040.decode.DecOp.MOVE) &&
+      (u.cluster === m68k040.isa.Cluster.LS) &&
+      (u.memOp === m68k040.isa.MemOp.LOAD) &&
+      (u.size === m68k040.isa.Size.LONG) &&
+      u.firstOfInstr && u.lastOfInstr && u.pdstValid &&
+      (u.dstArch >= U(8, 5 bits)) && (u.dstArch < U(16, 5 bits)) &&
+      u.psrcAValid && !u.psrcBValid && !u.psrcCValid &&
+      (u.imm === B(0, 32 bits)) &&
+      (u.eaAuto === m68k040.decode.EaAuto.NONE) &&
+      !u.stkPush && !u.altAddrSpace && !u.ccrRestore &&
+      !u.needsSupervisor && !u.leaAddr && !u.movesAliasStore &&
+      !u.writesNzvc && !u.writesX
+}
+
 /** The NARROW per-slot record: exactly the `IqContext` fields the issue queue's OWN
   * combinational logic reads, plus the address of the cold (dispatch-only) remainder.
   *
@@ -105,6 +124,10 @@ case class IqHot() extends Bundle {
   // the precondition that makes the inhibited-barrier violation RECOVERABLE (the restart
   // PC must be a macro boundary -- see RobPlugin's `h0IsMacroLast`).
   val firstOfInstr = Bool()
+  /** Exact fused simple-An long-load form for the optional T3 oldest-only
+    * preselect. The cold LUTRAM record has these fields but its async read is
+    * deliberately kept out of the select cone. */
+  val fourCycleBaseLoad = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -156,6 +179,7 @@ case class IqHot() extends Bundle {
     srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
     isLsLoad := isLsClass && (u.memOp === m68k040.isa.MemOp.LOAD)
     firstOfInstr := u.firstOfInstr
+    fourCycleBaseLoad := FourCycleLoadForm.applies(u)
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm

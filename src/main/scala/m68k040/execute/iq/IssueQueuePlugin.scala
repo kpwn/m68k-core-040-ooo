@@ -87,9 +87,12 @@ object DynWait {
 class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
                        val loadBypassUnreadyLoad: Boolean = false,
-                       val specLoadWakeup: Boolean = false) extends FiberPlugin
+                       val specLoadWakeup: Boolean = false,
+                       val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
+  require(!fourCycleL1 || specLoadWakeup,
+    "four-cycle L1 preselect requires speculative load wakeup")
   private var lateStorePorts: Option[m68k040.services.LateStoreDataPorts] = None
   override def lateStoreData = lateStorePorts
   val slotCount = 16
@@ -859,8 +862,25 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       val eligible = (lsPresent & ~lsStoreVec & ~olderStorePresent.asBits & intraMacroOk) | ohLoldest
       OHMasking.first(eligible & lsReady)
     }
-    val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed
+    val ohLbase = (if (loadBypassUnreadyLoad) ohLrelaxed
                else ohLoldest & lsReady) & B(slotCount bits, default -> !lsSkidValid)
+    // Optional T3 preselection is confined to the oldest occupied LS slot.
+    // A genuinely ready relaxed candidate always wins; a false P3 prediction is
+    // held at the existing LS issue register until the real wake arrives.
+    val p3Hint = if (fourCycleL1) host[m68k040.execute.LsEuService].wakeupSpecP3
+                 else null
+    val p3Preselect = if (fourCycleL1) {
+      val candidate = B(slots.map { s =>
+        s.sel && s.hot.fourCycleBaseLoad && s.hot.psrcAValid &&
+          p3Hint.valid && (s.hot.psrcA === p3Hint.payload) &&
+          s.dynWait(DynWait.LS_A) &&
+          !(s.dynWait & ~B(BigInt(1) << DynWait.LS_A, DynWait.width bits)).orR &&
+          (if (s.priority == 0) True else s.triggers(s.priority - 1 downto 0) === 0)
+      })
+      ohLoldest & candidate & B(slotCount bits, default -> (!lsSkidValid && !ohLbase.orR))
+    } else B(0, slotCount bits)
+    val ohL = ohLbase | p3Preselect
+    p3Preselect.simPublic()
     // Diagnostic: does the relaxed select actually pick a DIFFERENT slot than the
     // original oldest-only rule would? A regression on a kernel whose every LS slot is
     // ready should be impossible if this never fires, so measure it rather than argue.
@@ -869,7 +889,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                       else ohL.orR && (ohL =/= ((ohLoldest & lsReady) &
                                                 B(slotCount bits, default -> !lsSkidValid))))
     lsBypassFired.simPublic()
-    val lsSelectedLateData = (ohL & ~lsFullyReady).orR
+    // A four-cycle predicted LOAD is deliberately selected with LS_A still
+    // pending, so "not fully ready" no longer implies early-address STORE.
+    // Only the existing store-address arm may carry the late-data sideband.
+    val lsSelectedLateData = (ohL & storeAddressReady & ~lsFullyReady).orR
     // ---- DIVIDE-FAMILY issue is IN PROGRAM ORDER (DIV / DIVREM only) ----------
     // DIV.L's remainder does not travel on a renamed physical register: the DIV µop
     // writes only the quotient and hands the remainder to its trailing DIVREM crack µop
@@ -1146,7 +1169,13 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // absent on purpose: store DATA is never speculated, so a `psrcB` still held by
       // `lsBusy` is the EU's business (`queryReady`), not this gate's -- checking it here
       // would block the `earlyStoreAddress` issue that is supposed to happen.
-      val b = lsIssValid && ((u.psrcAValid && lsBusy(u.psrcA)) ||
+      val live = if (fourCycleL1) host[m68k040.execute.LsEuService].liveLoadConfirm
+                 else null
+      val confirmedA = if (fourCycleL1)
+        u.fourCycleBaseLoad && live.valid && (u.psrcA === live.payload) &&
+          !flushSignal
+      else False
+      val b = lsIssValid && ((u.psrcAValid && lsBusy(u.psrcA) && !confirmedA) ||
                              (u.psrcCValid && lsBusy(u.psrcC)))
       b.simPublic()
       b
@@ -2061,6 +2090,13 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         when(pipedPorts(k).valid) {
           assert(issuePorts(k).payload === fsPiped,
             s"IQ cold-split: port $k dispatch payload diverged from the full-context shadow")
+        }
+      }
+      if (fourCycleL1) {
+        when(issuePorts(3).valid) {
+          assert(lsIssHot.fourCycleBaseLoad ===
+            FourCycleLoadForm.applies(issuePorts(3).payload.uop),
+            "IQ four-cycle hot eligibility disagrees with LS full-uop recheck")
         }
       }
     }

@@ -2,6 +2,7 @@ package m68k040.bench
 
 import m68k040.{M68kSim, VerilatorTest}
 import m68k040.top.ShippingCoreConfig
+import spinal.core.sim._
 
 /** The SIM half of the board memory benchmark (`macqd700-soc-public`
   * `tools/board_membench.sh`, kernels in `tools/membench/membench.S`).
@@ -151,9 +152,21 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
         computeDirectTargets = ShippingCoreConfig.computeDirectTargets,
         deferSlot1Uncond = ShippingCoreConfig.deferSlot1Uncond,
         deferSlot1Dbcc = ShippingCoreConfig.deferSlot1Dbcc))
-      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill lsOoo=$lsOoo fuseLongMoveLoads=$fuseLongMoveLoads p3FastLoad=${ShippingCoreConfig.lsP3FastLoad} p1EarlyLoad=${ShippingCoreConfig.lsP1EarlyLoad} earlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} nbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} nbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} loadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill lsOoo=$lsOoo fuseLongMoveLoads=$fuseLongMoveLoads p3FastLoad=${ShippingCoreConfig.lsP3FastLoad} p1EarlyLoad=${ShippingCoreConfig.lsP1EarlyLoad} fourCycleL1=${ShippingCoreConfig.lsFourCycleL1} earlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} nbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} nbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} loadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
               s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets}")
       for ((mem, sizes, kinds) <- plan; sz <- sizes; kd <- kinds) {
+        var fourPreselect = 0L
+        var fourLiveConfirm = 0L
+        var fourBypassFire = 0L
+        dutProbe = d => if (ShippingCoreConfig.lsFourCycleL1) {
+          d.clockDomain.onSamplings {
+            if (d.iq.logic.p3Preselect.toBigInt != 0) fourPreselect += 1
+            if (d.lsEu.liveLoadConfirm.valid.toBoolean) fourLiveConfirm += 1
+            if (d.lsEu.logic.liveBaseBypass.toBoolean &&
+                d.lsEu.issue.valid.toBoolean && d.lsEu.issue.ready.toBoolean)
+              fourBypassFire += 1
+          }
+        }
         memCfgOverride = mem.map(parseMemSpec)
         val k = kd match {
           case "copy"  => kMemcpy(bytes = sz, passes = passes, label = s"mb-copy-${sz / 1024}k")
@@ -169,6 +182,13 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
           val hops = (laps - 1).toLong * (sz / 64)
           println(f"MB_SIM $tag kind=$kd size=$sz cycles=${r.windowCycles} hops=$hops " +
                   f"cyc/hop=${r.windowCycles.toDouble / hops}%.3f")
+          if (ShippingCoreConfig.lsFourCycleL1 && kd == "chase" && sz == 2048) {
+            assert(fourPreselect > 0 && fourLiveConfirm > 0 && fourBypassFire > 0,
+              s"four-cycle path was vacuous: preselect=$fourPreselect live=$fourLiveConfirm bypass=$fourBypassFire")
+          }
+          if (ShippingCoreConfig.lsFourCycleL1)
+            println(s"MB_FOUR_CYCLE kind=$kd size=$sz preselect=$fourPreselect " +
+              s"liveConfirm=$fourLiveConfirm bypassFire=$fourBypassFire")
         } else {
           val bytes = sz.toLong * (passes - 1)
           println(f"MB_SIM $tag kind=$kd size=$sz cycles=${r.windowCycles} bytes=$bytes " +
