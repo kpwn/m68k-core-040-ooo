@@ -1151,6 +1151,16 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     lsPiped.valid   := lsIssValid && !lsSpecBlocked
     lsPiped.payload := lsIssHot
     selPorts(3).ready := !lsSkidValid
+    // Simulation-only issue attribution for the bandwidth bench. A ready
+    // younger load in the slots is only an opportunity; these taps distinguish
+    // selection, skid capture and eventual EU acceptance without a new service.
+    val lsSelectFire = selPorts(3).fire
+    val lsSelectLoadFire = lsSelectFire &&
+      (selPorts(3).payload.memOp === m68k040.isa.MemOp.LOAD)
+    val lsSelectParked = lsSelectFire && !lsAdvance
+    val lsEuFire = lsPiped.fire
+    lsSelectFire.simPublic(); lsSelectLoadFire.simPublic()
+    lsSelectParked.simPublic(); lsEuFire.simPublic()
     // Forward source into the issue register: the skid when it holds (the select is
     // masked then, so `selPorts(3).payload` reads all-zero -- `ohSelect` of an empty
     // one-hot), else the live selection. Folded as an OR so the skid term joins the

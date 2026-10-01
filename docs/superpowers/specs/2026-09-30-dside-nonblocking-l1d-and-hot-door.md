@@ -606,7 +606,11 @@ conformance work (P10).
 
 The block is `OFF_DC_MSHR_*`, one cycle lagged, per `debug-instrumentation-latency-is-free`:
 
-- **Occupancy:** `mshrBusyCycles[n]`, a histogram of 0..4 entries valid; MLP = Σn·c[n] / Σ(n≥1)c[n].
+- **Occupancy:** `occ[n]`, a histogram of 0..4 allocated MSHRs in any state.
+  The separate `MLP` print is `mlpSum/mlpCyc`: the mean number of entries
+  in `WAIT_R`, conditional on at least one outstanding refill. Store-allocated
+  refills count too; ARQ/FILLED/LINGER entries do not. It is not the mean ring
+  occupancy and is not sampled only in the commit window.
 - **Allocation:** `primaryAllocs`, `loadSecondaries`, `storeMerges(cb/wt)`, `noFillAllocs`.
 - **Allocation failures:** `allocFail{full, setConflict, wbFull, maint}`.
 - **Waits and the cold path:** `replayCycles`, `serialWaitCycles`, `wbGateCycles`, `lingerHits`,
@@ -696,8 +700,17 @@ seed 1, and checked final data on every kernel. `chase-four` traverses four disj
 longs through four independent accumulators. Both report useful bytes in the measured
 window, with identical instruction counts across arms. These are simulation results,
 not board measurements. Bytes/cycle and CPI use the post-warmup commit window;
-the `[mshr]` MLP and `DSIDE_CONCURRENCY` occupancy/ID observations currently
-cover the whole kernel run, including warmup, and are labelled as such in logs:
+the `[mshr]` MLP and `DSIDE_CONCURRENCY` occupancy/ID observations cover the
+whole kernel run, including warmup, and are labelled as such in logs. The
+`[ls-order-window]` row instead uses the same first-to-last macro-commit span
+as bytes/cycle. `youngerReadyLoadPresent` is a slot-presence opportunity, not
+blocked or lost cycles; `opportunityBypassSelected`, `opportunitySelectedToSkid`,
+and `lsEuFire` provide selection, buffering, and acceptance evidence. The
+whole-run ring counters additionally distinguish a full ring without a head
+pop from the subset where a younger response is parked behind an outstanding
+head (`ringFullHeadRspHolStateCycles`). Neither full-ring count requires an
+incoming load demand, so neither is a rejected-demand or lost-cycle count.
+These are overlapping observations, not an additive stall budget:
 
 | cache / ring | four-chain read B/cyc | four-chain distinct-line MLP | stream read B/cyc | stream distinct-line MLP |
 |---|---:|---:|---:|---:|
@@ -710,13 +723,28 @@ cover the whole kernel run, including warmup, and are labelled as such in logs:
 N=4, ring 4 is 1.79x the legacy four-chain throughput and 2.01x N=2, with four
 AXI hot IDs simultaneously outstanding. Ring 8 improves the sequential stream by
 12.7% over legacy and enables a second distinct active line; ring 16 adds 3.8% over
-ring 8 while measured ring occupancy still peaks at eight. The dependent single-chain
+ring 8 while measured ring occupancy still peaks at eight. That gain cannot be
+attributed to using a ninth descriptor on this run; scheduling effects remain
+possible. The dependent single-chain
 negative control stays at 0.4453 B/cycle across arms. The `oldestUnready` window falls
 from 20,345 of 22,435 cycles in legacy four-chain to 10,955 of 12,503 in N=4/ring4.
 This demonstrates latency hiding on offered independent misses. It does not imply a
 general memcpy gain: scalar memcpy remained 0.3167 B/cycle and 1.078 MLP in the first
 integrated run. Ring 8 is an experimental throughput candidate; its area/timing and
 broader correctness gates remain separate from these measurements.
+With corrected instrumentation and the same seed-1 configuration, the ring-8
+four-chain commit window had 779 cycles with an unready oldest LS slot and a
+younger ready load; all 779 had an actual bypass load selection, none parked
+in the IQ skid, and none lacked a selection. They were not blocked cycles.
+The ring-8 stream had zero such opportunities, 4,098 IQ selections and 4,098
+EU handshakes in its commit window, and 40 whole-run full-ring/no-pop state
+cycles (zero with a younger response parked behind the outstanding head).
+Ring 16 reproduced 1.1001 B/cycle with the same 4,098 selections/handshakes,
+zero full-ring/no-pop state cycles, zero head-response HOL cycles, and a peak
+ring occupancy of eight. The 40-vs-zero difference is state evidence, not a
+causal upper bound on the 563-cycle commit-window difference: admission and
+memory phase shifts can amplify it. No descriptor-reclamation bottleneck is
+demonstrated by these runs.
 With seed 17, N=4/ring 8 again checked all data: four-chain reached 0.6577 B/cycle
 with four hot IDs outstanding, stream reached 1.1305 B/cycle with ring occupancy
 eight and two hot IDs, and the dependent chase stayed at 0.4453 B/cycle. The

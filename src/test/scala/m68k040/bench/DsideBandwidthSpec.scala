@@ -50,6 +50,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       var ringSamples = 0L
       var ringOccSum = 0L
       var ringMax = 0
+      var ringFullNoPop = 0L
+      var ringFullHeadRspHol = 0L
       var hotOutstandingMax = 0
       val hotOutstanding = scala.collection.mutable.Set.empty[Int]
       val arIntervals = scala.collection.mutable.ArrayBuffer.empty[Long]
@@ -63,6 +65,17 @@ class DsideBandwidthSpec extends CoreBenchHarness {
           ringSamples += 1
           ringOccSum += ringOcc
           ringMax = scala.math.max(ringMax, ringOcc)
+          val ls = d.lsEu.logic
+          if (ls.alignedFull.toBoolean && !ls.alignedRspFire.toBoolean) {
+            ringFullNoPop += 1
+            val head = ls.alignedRspPtr.toInt
+            val headAwaiting = ls.alignedValid(head).toBoolean &&
+              ls.alignedSent(head).toBoolean && !ls.alignedDone(head).toBoolean &&
+              !ls.bkBusy.toBoolean
+            val youngerParked = (0 until ls.alignedDone.length).exists(i =>
+              i != head && ls.alignedDone(i).toBoolean)
+            if (headAwaiting && youngerParked) ringFullHeadRspHol += 1
+          }
           val arFire = if (d.dcache.hotDoor)
             d.dcache.logic.axiDh.ar.valid.toBoolean && d.dcache.logic.axiDh.ar.ready.toBoolean
           else
@@ -105,7 +118,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
                   else if (k.name == "chase-pure") 4L * (512 - 128)
                   else bytes * (passes - 1)
       val bpc = moved.toDouble / r.windowCycles
-      println(f"DSIDE_BW kernel=${k.name} seed=$seed bytes=$moved cycles=${r.windowCycles} " +
+      println(f"DSIDE_BW scope=commit-window kernel=${k.name} seed=$seed bytes=$moved cycles=${r.windowCycles} " +
               f"B/cyc=$bpc%.4f retired=${r.retiredInstrs} IPC=${r.ipc}%.4f memory=$memLabel " +
               s"nonBlocking=${m68k040.top.ShippingCoreConfig.dcacheNonBlocking} " +
               s"hotDoor=${m68k040.top.ShippingCoreConfig.dcacheHotDoor} lsOoo=$lsOoo " +
@@ -113,7 +126,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking)
         println(f"DSIDE_CONCURRENCY scope=whole-run kernel=${k.name} seed=$seed " +
           f"ringAvg=${ringOccSum.toDouble / scala.math.max(1L, ringSamples)}%.3f " +
-          s"ringMax=$ringMax hotOutstandingMax=$hotOutstandingMax")
+          s"ringMax=$ringMax ringFullNoPopStateCycles=$ringFullNoPop " +
+          s"ringFullHeadRspHolStateCycles=$ringFullHeadRspHol hotOutstandingMax=$hotOutstandingMax")
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking && arIntervals.nonEmpty) {
         val sorted = arIntervals.sorted
         val median = sorted(sorted.size / 2)

@@ -858,7 +858,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       // the harness waits for final stores to drain.
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
       // Overlapping diagnostic predicates, sliced to the exact IPC window below.
-      val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
+      case class LsOrderSample(oldestUnready: Boolean, oldestStoreUnready: Boolean,
+                               youngerReadyLoadPresent: Boolean, skidOccupied: Boolean,
+                               selectFire: Boolean, selectLoadFire: Boolean,
+                               selectParked: Boolean, bypassSelect: Boolean,
+                               euFire: Boolean)
+      val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
@@ -1423,11 +1428,16 @@ trait CoreBenchHarness extends AnyFunSuite {
         val oldestBlocked = lsSlots.headOption.exists(s => !s.ready.toBoolean)
         val blockedStore = oldestBlocked &&
           lsSlots.head.hot.memOp.toEnum == m68k040.isa.MemOp.STORE
-        val youngerReadyLoad = oldestBlocked && lsSlots.drop(1).exists(s =>
+        val youngerReadyLoadPresent = oldestBlocked && lsSlots.drop(1).exists(s =>
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
-        lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
-          dut.iq.logic.lsSkidValid.toBoolean))
-        if (dut.iq.logic.lsBypassFired.toBoolean) lsBypassFires += 1
+        val selectFire = dut.iq.logic.lsSelectFire.toBoolean
+        val bypassSelect = selectFire && dut.iq.logic.lsBypassFired.toBoolean
+        lsOrderHisto += LsOrderSample(oldestBlocked, blockedStore,
+          youngerReadyLoadPresent, dut.iq.logic.lsSkidValid.toBoolean,
+          selectFire, dut.iq.logic.lsSelectLoadFire.toBoolean,
+          dut.iq.logic.lsSelectParked.toBoolean, bypassSelect,
+          dut.iq.logic.lsEuFire.toBoolean)
+        if (bypassSelect) lsBypassFires += 1
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
         // it) and the order-violation recoveries: the two costs the relaxation can incur.
         if (lsOooPorts) {
@@ -1888,7 +1898,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         // These counters separate the two remaining explanations: the SQ filling
         // (capacity, which back-pressures dispatch through the `memoryReady` gate that
         // no dispatch perf bucket counts) from the drain being slow (throughput).
-        println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires " +
+        println(s"[ls-bypass] scope=whole-run ${k.name} relaxedSelectDifferedCycles=$lsBypassFires " +
           s"livenessReplays=$lsReplays orderViolationReports=$lsOrderViols")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
@@ -1968,15 +1978,25 @@ trait CoreBenchHarness extends AnyFunSuite {
         val c = dut.dcache.logic.nb.ctrMap
         def v(key: String) = c(key).toBigInt.toLong
         val occ = c.keys.filter(_.startsWith("occ")).toSeq.sorted
-        println(s"[mshr] ${k.name} " + c.keys.filterNot(_.startsWith("occ")).map(key => s"$key=${v(key)}").mkString(" ") +
+        println(s"[mshr] scope=whole-run ${k.name} " + c.keys.filterNot(_.startsWith("occ")).map(key => s"$key=${v(key)}").mkString(" ") +
           s" occ=${occ.map(v).mkString("/")} " +
           f"MLP=${v("mlpSum").toDouble / scala.math.max(1L, v("mlpCyc"))}%.3f hotDoor=${dut.dcache.hotDoor}")
       }
-      println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
-        s"oldestUnready=${lsOrderWindow.count(_._1)} " +
-        s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
-        s"youngerReadyLoadBlocked=${lsOrderWindow.count(_._3)} " +
-        s"skidOccupied=${lsOrderWindow.count(_._4)}")
+      // Presence is an opportunity, not a lost cycle: count the actual IQ
+      // select and EU handshake separately. A selection parked in the skid is
+      // still progress, and the EU handshake can belong to a prior selection.
+      val opportunity = lsOrderWindow.filter(_.youngerReadyLoadPresent)
+      println(s"[ls-order-window] scope=commit-window ${k.name} cycles=$windowCycles " +
+        s"oldestUnready=${lsOrderWindow.count(_.oldestUnready)} " +
+        s"oldestStoreUnready=${lsOrderWindow.count(_.oldestStoreUnready)} " +
+        s"youngerReadyLoadPresent=${opportunity.size} " +
+        s"opportunityBypassSelected=${opportunity.count(s => s.bypassSelect && s.selectLoadFire)} " +
+        s"opportunitySelectedToSkid=${opportunity.count(s => s.bypassSelect && s.selectLoadFire && s.selectParked)} " +
+        s"opportunityNoSelectSkidOccupied=${opportunity.count(s => !s.selectFire && s.skidOccupied)} " +
+        s"opportunityNoSelectOther=${opportunity.count(s => !s.selectFire && !s.skidOccupied)} " +
+        s"skidOccupied=${lsOrderWindow.count(_.skidOccupied)} " +
+        s"lsSelectFire=${lsOrderWindow.count(_.selectFire)} " +
+        s"lsEuFire=${lsOrderWindow.count(_.euFire)}")
       assert(windowRetired == n - k.warmupInstrs,
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)
