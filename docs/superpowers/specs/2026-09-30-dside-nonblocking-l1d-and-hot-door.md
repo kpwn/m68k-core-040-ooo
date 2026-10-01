@@ -1474,6 +1474,83 @@ one miss-staging cycle; an earlier AR requires a separate order/credit proof
 and routed timing measurement. There is no claim that the six-cycle
 incremental target is reachable from this candidate alone.
 
+## 14.8. Optional P1 paired translation and VIPT launch experiment
+
+`CPU_LS_P1_EARLY_LOAD` defaults OFF. The matched fused-MOVEA, speculative-wakeup,
+P3-fast-enqueue and registered-probe-forwarding 2 KiB pointer chase still takes
+771/128 = 6.023 cycles per dependent load. Its issue-to-issue schedule is P1 EA,
+P2 paired DTLB/VIPT launch, P2T translated probe verdict, P3 command, registered
+cache response/wakeup, next issue. This experiment moves the **existing paired
+request** from P2 into P1 for a narrow `(An)` LOAD, aiming to remove the P1-to-P2
+edge. It does not pretranslate, introduce a new queue, or expose untranslated
+probe data as an architectural hit. A P1 probe-only launch would lengthen a
+token's lifetime independently of its DTLB request and is deliberately excluded.
+
+The eligible uop is a fused LONG MOVEA load through a single An base: P1 has a
+live `s1Valid`, `u1.op=MOVE`, An `dstArch`, first-and-last macro markers, LONG size, valid base operand, no
+index/auto-update/displacement/stack push/alternate address space/CCR restore,
+no privilege requirement, `s1TwoAccess=false`, and `s1Va[1:0]=0`. The decoded P1 address
+`s1Va` is the *virtual* address. Cacheability and physical tag remain unknown;
+the side-effect-free virtual-set probe retains `resolved=false`, no physical
+hint, and provisional INHIBITED cache mode until the normal P2T translation
+verdict. If the translation reports a fault, INHIBITED, or a disallowed
+privilege, the existing token cancellation and P3/P4 fallback rules apply; no
+load command may use the probe as an unqualified hit.
+
+The P1 DTLB request and cache probe must handshake **atomically**, using the
+same ROB/epoch translation token and ROB-derived probe token as P2. Admit P1
+only when P2 is empty, no split second-half request owns the port, P2T can
+accept another tagged request, and no flush/exception/walker owns the load or
+translation port. The P1 arm asserts valid only with both grants already high:
+DTLB `req.ready` is independent of `req.valid`, and D-cache probe ready is a
+registered credit. Thus P1 never presents a stalled Stream request whose valid
+could be withdrawn next cycle. If either port is not ready, make no P1 request or probe and
+move the held P1 context into the ordinary P2 stage; it retries there. On a
+paired P1 fire, capture the existing `captureFrontCtx` output directly into
+`txCtx`, set the usual `txValid/txWaitingRsp/txToken`, and suppress that same
+uop's `s1ToT` push. Allow the existing P1 slot to accept a following issue on
+the edge as before; `issuePort.ready` must remain the original `s1Ready` path,
+without DTLB or probe-ready feedback. The old P2 path and split path keep
+priority, so there is one producer per translation/probe port and no overtaking.
+
+Cancellation covers flush/exception, walker handover, translation fault,
+inhibited result, forward/SQ resolution, and a late same-set store. Reuse
+the probe queue's token+VA match, generation/slot reuse checks, sticky stale
+bit, and one-hot consume rules; a P1 request cannot be interpreted as the
+next uop's P2 token. Directed tests must exercise P1 success, P2 fallback on
+each ready-low input, simultaneous previous P2T consume and P1 admit,
+split/unaligned exclusion, translated INHIBITED and ATC fault, flush at each
+stage, walker handover, stale/same-set write, ROB-ID reuse, and full probe
+queue. Assert one DTLB request pairs with one probe, no duplicate cache
+command, no unpaired resident probe, and identical fault/architectural state.
+Compare matched ON/OFF 2 KiB chase cycles and independent-load throughput,
+then run `test-fast` and timing/area analysis. A simulated one-cycle gain is
+not 200 MHz timing proof. If the AGU-to-DTLB lookup or P1 ownership mux is too
+deep, keep this flag OFF and evaluate a registered-probe-line completion
+shortcut separately; do not weaken the translation or replay guards.
+
+The initial matched full-core simulation (source in isolated agent72, seed 17,
+`l2:6:33:4096`, fused MOVEA, LS-OoO, speculative wake, P3 fast enqueue,
+registered probe forwarding, NB early response/eager AR, ring 8/MSHR 4)
+measured 2 KiB chase **771/128 = 6.023** cycles/hop OFF and **644/128 =
+5.031** ON. The 64 KiB chase measured **77698/4096 = 18.969** OFF and
+**73614/4096 = 17.972** ON. The L2-over-L1 differential therefore remains
+12.946 versus 12.941 cycles/hop: this P1 change removes one frontend cycle
+for both tiers, but does not address the L2 miss-path excess. The paired
+logs are `/tmp/codex-agent72-p1-chase17-{off,on}.log`; this is a simulation
+result, not mapped timing or netlist-area evidence.
+
+Directed ON gates in the isolated branch passed: paired success, both
+ready-low fallbacks, within-line misalignment and split exclusions, flush plus
+ROB-token reuse, and translation-fault cancellation/no cache command/no
+integer-or-NZVC write (CrossSpec 11/11); exact older-store forwarding and
+partial-overlap drain ordering (LsEuSpec 2/2). Settled-source `test-fast`
+passed 404/404 with the flag OFF and 404/404 with it ON. The new hardware arm
+reuses the existing P1/P2T context and probe slots, adding no production
+state registers; it does add P1 eligibility logic and payload selection before
+the DTLB lookup. Mapped area and critical-path timing have not been measured,
+so the flag remains OFF by default.
+
 ## 15. Coordination owed (through the PM)
 
 
