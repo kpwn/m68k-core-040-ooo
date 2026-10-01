@@ -22,8 +22,8 @@ import org.scalatest.funsuite.AnyFunSuite
   *  - a resident write -> the deferred U/M descriptor write is produced */
 class TableWalkerSpec extends AnyFunSuite {
 
-  class Dut extends Component {
-    val walker = new TableWalker()
+  class Dut(batchMode: Boolean = true) extends Component {
+    val walker = new TableWalker(batchMode = batchMode)
     // expose the walker IO; bridge AXI to a top-level master for the behavioral mem
     val start = in Bool ()
     val vpn        = in UInt (20 bits)
@@ -42,6 +42,9 @@ class TableWalkerSpec extends AnyFunSuite {
     val umValid = out Bool ()
     val umAddr  = out UInt (32 bits)
     val umByte  = out Bits (8 bits)
+    val batchValid = out Bits (3 bits)
+    val batchAddr = Vec.fill(3)(out UInt(32 bits))
+    val batchMask = Vec.fill(3)(out Bits(8 bits))
     // The walker reads descriptors as `DcacheService` LOAD COMMANDS now, not AXI.
     val wCmd = master(Stream(DLoadCmd()))
     val wRsp = slave(Flow(DLoadRsp()))
@@ -63,6 +66,11 @@ class TableWalkerSpec extends AnyFunSuite {
     umValid := walker.io.rsp.umWrite.valid
     umAddr  := walker.io.rsp.umWrite.addr
     umByte  := walker.io.rsp.umWrite.newByte
+    for (i <- 0 until 3) {
+      batchValid(i) := walker.io.rsp.umBatch.updates(i).valid
+      batchAddr(i) := walker.io.rsp.umBatch.updates(i).addr
+      batchMask(i) := walker.io.rsp.umBatch.updates(i).setMask
+    }
     wCmd << walker.io.loadCmd
     walker.io.loadRsp << wRsp
   }
@@ -170,6 +178,11 @@ class TableWalkerSpec extends AnyFunSuite {
       // Task #194: the U/M byte lives at the descriptor's LOW byte, which in real
       // big-endian memory is the descriptor's HIGHEST byte address (base+3).
       assert(dut.umAddr.toLong == (PAGT + pageIdx(va1) * 4 + 3), "U-write addr = page descriptor low byte")
+      assert(dut.batchValid.toInt == 7, "root, pointer and page U all need updates")
+      assert(dut.batchAddr(0).toLong == ROOT + rootIdx(va1) * 4 + 3)
+      assert(dut.batchAddr(1).toLong == PTRT + ptrIdx(va1) * 4 + 3)
+      assert(dut.batchAddr(2).toLong == PAGT + pageIdx(va1) * 4 + 3)
+      for (i <- 0 until 3) assert(dut.batchMask(i).toInt == 0x08)
 
       // ---- (2) inhibited + supervisor page, supervisor read ----
       val va2 = 0x00C04000L
@@ -187,6 +200,8 @@ class TableWalkerSpec extends AnyFunSuite {
       assert(dut.fault.toBoolean, "non-resident page must fault")
       assert(dut.faultReason.toEnum == MmuFaultReason.NON_RESIDENT, "reason = NON_RESIDENT")
       assert(!dut.umValid.toBoolean, "a faulting walk produces no descriptor write")
+      assert(dut.batchValid.toInt == 3,
+        "faulting leaf retains root/pointer U as an ordered partial batch")
 
       // ---- (4) write-protected page + write -> WRITE_PROTECT fault ----
       val va4 = 0x01408000L
@@ -215,6 +230,70 @@ class TableWalkerSpec extends AnyFunSuite {
       // low byte 0x01 -> set U (0x08) and M (0x10) -> 0x19
       assert((dut.umByte.toInt & 0xff) == 0x19, f"U+M byte=0x${dut.umByte.toInt}%x expected 0x19")
       assert(dut.umAddr.toLong == pAddr + 3, "U/M-write addr = page descriptor low byte")
+      assert(dut.batchValid.toInt == 7)
+      assert(dut.batchMask(2).toInt == 0x18)
+    }
+  }
+
+  test("self-referential descriptors see the earlier U bit within one walk", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
+      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
+      dut.vpn #= 0; dut.rootPtr #= 0
+      cd.waitSampling(4)
+      // All three indices are zero. Each descriptor fetch points back to the
+      // same physical word, whose U=0 in memory. The second/third decode must
+      // see the root's pending U rather than enqueue duplicate stale updates.
+      pokeWordLE(mem, ROOT, ROOT | 0x03L)
+      runWalk(dut, cd, va = 0L, isWrite = false, isSuper = false)
+      assert(!dut.fault.toBoolean)
+      assert(dut.batchValid.toInt == 1, "only the first encounter sets U")
+      assert(dut.batchAddr(0).toLong == ROOT + 3)
+      assert(dut.batchMask(0).toInt == 0x08)
+    }
+    // Shipping D/I clients still consume the leaf-only umWrite interface.
+    // Until both switch to batch drains, default elaboration must retain the
+    // old leaf write even though the batch-mode self alias suppresses it.
+    SimConfig.withVerilator.compile(new Dut(batchMode = false)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
+      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
+      dut.vpn #= 0; dut.rootPtr #= 0
+      cd.waitSampling(4)
+      pokeWordLE(mem, ROOT, ROOT | 0x03L)
+      runWalk(dut, cd, va = 0L, isWrite = false, isSuper = false)
+      assert(!dut.fault.toBoolean)
+      assert(dut.umValid.toBoolean, "legacy leaf-only client must still emit physical U")
+    }
+  }
+
+  test("misaligned root U overlays a later descriptor high byte", VerilatorTest) {
+    SimConfig.withVerilator.compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new DcacheClientMemAgent(dut.wCmd, dut.wRsp, null, null, null, cd)
+      dut.start #= false; dut.isWrite #= false; dut.isSuper #= false; dut.is8K #= false
+      dut.vpn #= 0; dut.rootPtr #= 0
+      cd.waitSampling(4)
+      // Root at line offset 13 straddles into the pointer descriptor's FIRST
+      // byte. Its low byte is 0x13 (U clear); pending U changes that physical
+      // byte to 0x1b, which changes the pointer's next-table address. A
+      // low-byte-only alias check would silently walk the 0x13000000 decoy.
+      pokeWordLE(mem, ROOT + 13, ROOT + 16 + 3)
+      mem.pokeByte(ROOT + 17, 0)
+      mem.pokeByte(ROOT + 18, 0)
+      mem.pokeByte(ROOT + 19, 3)
+      pokeWordLE(mem, 0x1B000000L, 0xABC00001L)
+      runWalk(dut, cd, va = 0L, isWrite = false, isSuper = false,
+        rootPtr = ROOT + 13)
+      assert(!dut.fault.toBoolean)
+      assert(dut.ppn.toLong == 0xABC00L)
+      assert(dut.batchValid.toInt == 7)
+      assert(dut.batchAddr(0).toLong == ROOT + 16)
+      assert(dut.batchMask(0).toInt == 0x08)
     }
   }
 

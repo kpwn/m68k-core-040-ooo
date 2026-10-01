@@ -180,13 +180,24 @@ case class WalkReq() extends Bundle {
   val is8K       = Bool()
 }
 
-/** Walker result: the translated PPN + accumulated perms + fault flag, plus up to
-  * two deferred descriptor-byte writes (set-U on the page descriptor; set-M on a
-  * write). Each write is {addr, newByte}; `valid` gates it. */
+/** Legacy leaf-only update carried while TLB clients migrate to a reserved
+  * three-level walk batch. */
 case class WalkUmWrite() extends Bundle {
   val valid   = Bool()
   val addr    = UInt(32 bits)   // byte address of the descriptor byte to RMW
   val newByte = Bits(8 bits)    // the new value of that byte (old | set-bits)
+}
+
+/** Ordered updates encountered by one three-level table walk.  The mask only
+  * contains U/M set bits; the drain re-reads the current descriptor byte. */
+case class WalkUmElement() extends Bundle {
+  val valid = Bool()
+  val addr = UInt(32 bits)
+  val setMask = Bits(8 bits)
+}
+
+case class WalkUmBatch() extends Bundle {
+  val updates = Vec.fill(3)(WalkUmElement()) // root, pointer, page
 }
 
 case class WalkRsp() extends Bundle {
@@ -196,10 +207,11 @@ case class WalkRsp() extends Bundle {
   val cacheMode   = CacheMode()
   val fault       = Bool()
   val faultReason = MmuFaultReason()
-  // deferred descriptor writes produced by this walk (U on the page descriptor;
-  // M on a write access). Folded into one byte write at the page-descriptor's low
-  // byte (the byte holding U/M/PDT bits).
+  // Legacy leaf-only update consumed by today's TLB plugins.
   val umWrite     = WalkUmWrite()
+  // New ordered batch interface. The legacy leaf-only umWrite remains until
+  // both TLB clients switch atomically to reserved batch admission.
+  val umBatch     = WalkUmBatch()
   // Task #210: the leaf page descriptor's M (modified) bit as it stands AFTER this
   // walk's own U/M update (i.e. `pgModified(d) || isWrite` — a write access always
   // sets M). This is what the owning TLB should cache per-entry so a later
