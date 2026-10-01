@@ -184,3 +184,23 @@ The checked independent-chain telemetry and capacity controls are now tracked
 in [the load concurrency evidence](LOAD_MLP_CHAIN_SWEEP_2026-10-01.md). Those
 measurements deliberately keep AR preselection OFF and are not a combined
 candidate throughput claim.
+
+## Frozen broad-corpus comparison checkpoint
+
+Both `PortedM68kOooSpec` arms at frozen `5123593f` are complete, with the same
+1024 registered cases. OFF has 14 failures, ON has those same 14 plus
+`cpush_ic_maint_while_busy`; there are no OFF-only failures. The validated
+name/count manifest is `/tmp/codex-candidate-gates-5123593f/results.json`.
+The ON lockstep arm is still running, so the four-arm broad gate is not complete.
+
+| Failure group at the frozen source | Count common to OFF/ON | Current disposition |
+| --- | ---: | --- |
+| FPU fixtures (six names plus three copyback variants) | 9 | Corrected fixtures have focused gates; newer-source full corpus is still owed |
+| `exc_partial_macro_move_mem_mem` | 1 | Format-7 pending-write/retirement gap confirmed; implementation pending |
+| MMU modified bit and two older-store/walker cases | 3 | Selected D/I metadata-ordering implementation in progress |
+| `rom_scc_mmio_btst_dbf_timeout` | 1 | No SCC model at the polled peripheral address; harness fill is not a peripheral oracle |
+| `cpush_ic_maint_while_busy` (ON only) | 0 common; 1 ON-only | Initial code-publication setup corrected and matched focused OFF/ON plus all-options integration pass |
+
+Focused fixes do not turn the older frozen corpus red rows into a broad PASS.
+Keep that distinction when reporting the current candidate. The SCC case must
+not be hidden by accepting a failure sentinel or changing global memory fill.
