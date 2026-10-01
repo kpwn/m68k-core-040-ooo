@@ -79,3 +79,47 @@ or the flag-ON paths.
 
 New architecture changes require a design update. Global keys retain exactly
 one documented producer; plugins communicate through services and Global keys.
+
+## Integration follow-up, 2026-10-01
+
+`integ/nax-liveness` carries the combined candidate. Merge `7ebcf06f` brings in
+`perf/ls-ooo-live`, including P4 replay, strict store issue and the precise-device
+retirement interlock. The new ROB replay channel uses `RobLsReplayService` and
+`LsEuService`, rather than reaching into the ROB plugin area. This merge passed
+403 fast tests (2 ignored): `/tmp/codex-integ-agent54-testfast.log`.
+
+Subsequent integration adds direct-refill collision coverage, forced WB saturation,
+CPUSH invalidation, and the shipping/prepared-retirement harness fix. Their
+combined final fast gate is still owed; the earlier 403 pass does not cover them.
+
+The first combined run enabled shipping configuration, LS-OoO, NB4, D4, hot reads,
+ring8, and direct-refill response. `/tmp/codex-integ-agent54-combined-ring8.log`
+records four passing liveness cases and the IRQ test: 300 device writes for 300
+stores across 1041 exception entries. Case C found an actual early-probe-credit
+deadlock with six inhibited loads parked; its subsequent coverage assertion
+masked the more useful liveness failure. The worker is correcting both the
+resource leak and diagnostic ordering. This is not a passing ring8 gate.
+
+The same run revealed the standalone CPUSH harness did not attach the hot read
+port. After attachment, its clean-line DMA trigger also needed to observe that
+port's R handshake with a separate ID namespace. With those harness corrections,
+all five dirty/clean, scope and DC/BC CPUSH phases passed under the combined
+configuration: `/tmp/codex-integ-agent54-cpush-hot2.log`. Fuzz lockstep and the
+standalone inhibited-order harness also require hot-port attachment. With that
+attachment, fuzz seeds 0 through 4 had zero divergences or generator failures, and
+the standalone inhibited-order check passed under the combined configuration:
+`/tmp/codex-integ-agent54-hot-harness.log` (two ScalaTest tests).
+
+SoC evidence is recorded separately at `codex/bandwidth-soc` commit `3bbbaf0`,
+`docs/hotdoor-integration-validation-2026-10-01.md`: full-top lint OFF/ON, 78 passing
+hot-door testbench checks, and focused D4 A/C checks. Four CPU read IDs fit within
+the L2's eight MSHRs and DDR bridge's eight accepted read descriptors. The shared
+lookup and DDR datapaths remain throughput limits; capacity is not proof of
+sustained four-way concurrency on every workload.
+
+With LS-OoO enabled, ring4-to-ring8 adds 1558 bits of selected generated register
+state: 1118 aligned descriptor/response/FIFO bits and 440 inhibited-park bits.
+This excludes widened routing IDs, combinational logic, synthesis optimization,
+and implementation timing. It is not an FPGA area result. The existing SoC
+10-cycle/64-byte completion metric is not first-beat L2 latency; the requested
+six-cycle incremental latency is still unproven.

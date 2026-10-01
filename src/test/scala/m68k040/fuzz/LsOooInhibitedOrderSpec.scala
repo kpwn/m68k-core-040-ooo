@@ -217,6 +217,7 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                                    sharedMem = dsideMem, injectBusErrors = true)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, dmem)
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       // MANDATORY: the sentinel poll treats word==0 as "not written yet", and the 0xFF
       // fill would read back as an instant completion on cycle 1.

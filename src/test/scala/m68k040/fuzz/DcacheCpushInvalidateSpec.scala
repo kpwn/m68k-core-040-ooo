@@ -77,6 +77,7 @@ class DcacheCpushInvalidateSpec extends AnyFunSuite {
       val dsideMem = new m68k040.sim.ConstFillSparseMemory(0xff.toByte)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd,
                                                    sharedMem = dsideMem, injectBusErrors = true)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, dmem)
       for (i <- image.bytes.indices) dmem.mem.write(loadAddr + i, image.bytes(i).toByte)
       for (i <- 0 until 4) dmem.mem.write(Sentinel + i, 0.toByte)
       for (i <- 0 until 4 * Phases.size) dmem.mem.write(Results + i, 0.toByte)
@@ -123,7 +124,7 @@ class DcacheCpushInvalidateSpec extends AnyFunSuite {
       val ax = dut.dcache.logic.axi
       def line(a: Long): Long = a & ~0xfL
       val awById   = mutable.Map.empty[Int, Long]     // outstanding AW: id -> line
-      val arById   = mutable.Map.empty[Int, Long]     // outstanding AR: id -> line
+      val arById   = mutable.Map.empty[(Int, Int), Long] // outstanding AR: (port, id) -> line
       val pushed   = mutable.Map.empty[String, Long]  // phase -> memory at X when its push's B fired
       val dmaDone  = mutable.Set.empty[String]
       val pending  = mutable.ArrayBuffer.empty[(Int, Phase)]  // (cycle due, phase) DMA writes
@@ -141,7 +142,7 @@ class DcacheCpushInvalidateSpec extends AnyFunSuite {
         if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean)
           awById(ax.aw.payload.id.toInt) = line(ax.aw.payload.addr.toLong)
         if (ax.ar.valid.toBoolean && ax.ar.ready.toBoolean)
-          arById(ax.ar.payload.id.toInt) = line(ax.ar.payload.addr.toLong)
+          arById((0, ax.ar.payload.id.toInt)) = line(ax.ar.payload.addr.toLong)
         if (ax.b.valid.toBoolean && ax.b.ready.toBoolean) {
           val id = ax.b.payload.id.toInt
           awById.remove(id).foreach { ln =>
@@ -153,10 +154,25 @@ class DcacheCpushInvalidateSpec extends AnyFunSuite {
         }
         if (ax.r.valid.toBoolean && ax.r.ready.toBoolean && ax.r.payload.last.toBoolean) {
           val id = ax.r.payload.id.toInt
-          arById.remove(id).foreach { ln =>
+          arById.remove((0, id)).foreach { ln =>
             Phases.find(p => !p.dirty && line(p.x) == ln && !dmaDone.contains(p.tag) &&
                               !pending.exists(_._2.tag == p.tag))
               .foreach(p => pending += ((cycles + 1, p)))
+          }
+        }
+
+        // Hot and cold ports have independent ID spaces. Observe the hot refill
+        // too, so the clean-line DMA trigger remains exercised with CPU_AXI_DH.
+        if (dut.dcache.hotDoor) {
+          val hot = dut.dcache.logic.axiDh
+          if (hot.ar.valid.toBoolean && hot.ar.ready.toBoolean)
+            arById((1, hot.ar.payload.id.toInt)) = line(hot.ar.payload.addr.toLong)
+          if (hot.r.valid.toBoolean && hot.r.ready.toBoolean && hot.r.payload.last.toBoolean) {
+            arById.remove((1, hot.r.payload.id.toInt)).foreach { ln =>
+              Phases.find(p => !p.dirty && line(p.x) == ln && !dmaDone.contains(p.tag) &&
+                                !pending.exists(_._2.tag == p.tag))
+                .foreach(p => pending += ((cycles + 1, p)))
+            }
           }
         }
 
