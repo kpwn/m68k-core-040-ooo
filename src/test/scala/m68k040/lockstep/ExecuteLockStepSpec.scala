@@ -13171,7 +13171,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val endIdx = plain.indexWhere(_.pc == endPc)
     val firstOdd = plain.indexWhere(st => (st.a(7) & 1L) != 0)
     val lastOdd  = plain.lastIndexWhere(st => (st.a(7) & 1L) != 0)
-    assert(firstOdd > 0 && lastOdd > firstOdd && lastOdd + 2 <= endIdx, s"[$tag] odd stretch not found ($firstOdd..$lastOdd, end $endIdx)")
+    assert(firstOdd > 0 && lastOdd > firstOdd && lastOdd + 3 <= endIdx, s"[$tag] odd stretch not found ($firstOdd..$lastOdd, end $endIdx)")
     // OracleStep.pc is the POST-step pc => plain(i).pc is the boundary BEFORE the next
     // instruction. firstOdd-1 = before LINK ... lastOdd+1 = after UNLK.
     // PROGRAM-ORDERED boundary sequence -- deliberately NOT distinct. `boundaryPcs` below
@@ -13185,8 +13185,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // zero-level event at a first-visited PC between the previous and desired visit.
     // That marker changes no architectural state; it arms the queued PC event only
     // after the earlier visit. Both trace and final-memory oracle use this schedule.
-    val boundarySeq = (firstOdd - 1 to lastOdd + 2).map(plain(_).pc)
-    val boundaryPcs = boundarySeq.distinct
+    // Include one final successor for the oracle window. At the previous terminal
+    // boundary the DUT can recognize IPL one macro later, but the old sequence ended
+    // before that legal +1 candidate. Keep the set of injected targets unchanged.
+    val boundarySeq = (firstOdd - 1 to lastOdd + 3).map(plain(_).pc)
+    val boundaryPcs = boundarySeq.dropRight(1).distinct
     def eventsAt(plainIndex: Int): Seq[(Long, Int)] = {
       val pc = plain(plainIndex).pc
       val previous = plain.take(plainIndex).lastIndexWhere(_.pc == pc)
