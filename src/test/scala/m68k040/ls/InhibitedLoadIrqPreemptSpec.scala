@@ -112,6 +112,7 @@ class InhibitedLoadIrqPreemptSpec extends AnyFunSuite {
   def initDut(dut: Dut): (ClockDomain, AxiMemModel, AxiMemModel) = {
     val cd = dut.clockDomain; cd.forkStimulus(10)
     val mem   = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, AxiMemModelConfig())
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, mem)
     // The DTLB walker now reaches memory through the D-cache, so the page table must
     // live in the D-SIDE memory rather than a private walker image. Aliasing the old
     // name onto it keeps every buildPage/pokeDescriptor call site below unchanged.

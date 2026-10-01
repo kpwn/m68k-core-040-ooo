@@ -120,7 +120,7 @@ class InterruptEntrySpec extends AnyFunSuite {
       val cd = dut.clockDomain
       // Attach before the first clock edge so AXI R/B cannot power up as a fake
       // response and satisfy the cache's untagged exception-store acknowledgement.
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 

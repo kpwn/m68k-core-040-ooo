@@ -124,7 +124,7 @@ class RteSpec extends AnyFunSuite {
       // it after init leaves them undefined for three samples, which can fabricate a
       // store acknowledgement despite RTE having accepted no store descriptor.
       dut.wire.logic.injLoadFault #= false
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 
@@ -211,7 +211,7 @@ class RteSpec extends AnyFunSuite {
       // frame, so the vector-2 handler fetch itself succeeds (a faulting vector fetch is
       // the DOUBLE-fault path, covered by ExceptionEntrySpec, and would mask this one).
       dut.wire.logic.injLoadFault #= true
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 
@@ -317,7 +317,7 @@ class RteSpec extends AnyFunSuite {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       dut.wire.logic.injLoadFault #= false
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 
@@ -383,7 +383,7 @@ class RteSpec extends AnyFunSuite {
     M68kSim().withVerilator.compile(new Dut).doSim { dut =>
       val cd = dut.clockDomain
       dut.wire.logic.injLoadFault #= false
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 
