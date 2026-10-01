@@ -1560,19 +1560,18 @@ trait CoreBenchHarness extends AnyFunSuite {
           def b(x: Boolean) = if (x) "#" else "."
           val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
                         dut.dcache.logic.loadCmdPort.ready.toBoolean
-          val iqLs = dut.iq.logic.selPorts(3)
           val ar = dut.dcache.logic.axi.ar
           val r = dut.dcache.logic.axi.r
           val readyLoads = dut.iq.logic.slots.filter(s => s.sel.toBoolean && s.ready.toBoolean &&
             s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD).map(_.hot.robId.toInt)
-          val issueRob = if (dut.lsEu.logic.issuePort.valid.toBoolean &&
-                             dut.lsEu.logic.issuePort.ready.toBoolean)
-            dut.lsEu.logic.issuePort.payload.robId.toInt.toString else "-"
+          val issueRob = if (dut.lsEu.issuePort.valid.toBoolean &&
+                             dut.lsEu.issuePort.ready.toBoolean)
+            dut.lsEu.issuePort.payload.robId.toInt.toString else "-"
           val wbRob = if (dut.lsEu.logic.wbObs.valid.toBoolean)
             dut.lsEu.logic.wbObs.robId.toInt.toString else "-"
           val line = Seq(
-            b(iqLs.valid.toBoolean && iqLs.ready.toBoolean),
-            b(dut.lsEu.logic.issuePort.valid.toBoolean && dut.lsEu.logic.issuePort.ready.toBoolean),
+            b(readyLoads.nonEmpty),
+            b(dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean),
             b(dut.lsEu.logic.s1Valid.toBoolean), b(dut.lsEu.logic.tValid.toBoolean),
             b(dut.lsEu.logic.txValid.toBoolean), b(dut.lsEu.logic.p3Valid.toBoolean),
             b(dut.lsEu.logic.p4Valid.toBoolean), b(cmdFire),
@@ -1585,7 +1584,7 @@ trait CoreBenchHarness extends AnyFunSuite {
             b(ar.valid.toBoolean && ar.ready.toBoolean), b(r.valid.toBoolean && r.ready.toBoolean),
             b(dut.dcache.logic.wrEn.exists(_.toBoolean)), b(dut.dcache.logic.dbgFsmReplay.toBoolean),
             b(dut.lsEu.logic.compValid.toBoolean),
-            b(dut.iq.logic.lsWakeupPort.valid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
+            b(dut.iq.lsWakeupPort.valid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
           ).mkString(" ")
           val addr = if (cmdFire) f"0x${dut.dcache.logic.loadCmdPort.payload.paddr.toLong}%08x" else "-"
           traceLines += f"$telemCycle%5d  $line  ready=${readyLoads.mkString(",")} issue=$issueRob wb=$wbRob cmd=$addr commits=$macrosThisCycle"
