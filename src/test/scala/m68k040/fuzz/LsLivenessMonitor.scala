@@ -159,6 +159,10 @@ final class LsLivenessMonitor(dut: FuzzCoreDut, name: String,
       f"tx(v=${ls.txValid.toBoolean},rob=${ls.txCtx.robId.toBigInt},second=${ls.txSecond.toBoolean}) " +
       f"p3(v=${ls.p3Valid.toBoolean},rob=${ls.p3Ctx.front.robId.toBigInt}) " +
       f"p4(v=${ls.p4Valid.toBoolean},rob=${ls.p4Ctx.xlate.front.robId.toBigInt})")
+    ln(f"p2 launch=${ls.normalReqFire.toBoolean} heldByOther=${ls.dcLoadHeldByOther.toBoolean} " +
+      f"probeReady=${dut.dcache.logic.loadProbePort.ready.toBoolean} " +
+      f"xlateReady=${ls.xlate.req.ready.toBoolean} " +
+      f"probeValid=${dut.dcache.logic.earlyProbeValids.map(_.toBoolean).mkString("")}")
     ln(f"p4Inhibited=${ls.p4Inhibited.toBoolean} p4AtRobHead=${ls.p4AtRobHead.toBoolean} " +
       f"p4LaunchOk=${ls.p4LaunchOk.toBoolean} p4RetryQuery=${ls.p4RetryQuery.toBoolean} " +
       f"fwdHit=${ls.p4Ctx.fwdHit.toBoolean} fwdStall=${ls.p4Ctx.fwdStall.toBoolean} " +

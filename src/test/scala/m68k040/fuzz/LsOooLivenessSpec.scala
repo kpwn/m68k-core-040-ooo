@@ -86,15 +86,15 @@ class LsOooLivenessSpec extends AnyFunSuite {
         }
       })
     val mon = PortedTestRunner.lastLiveness
+    info(mon.summary)
+    println(s"[ls-ooo-liveness] $name FUZZ_LS_OOO=$lsOoo outcome=$outcome ${mon.summary}")
+    assert(outcome == PortedPass,
+      s"$name: $outcome\n${PortedTestRunner.lastLivenessFailure.getOrElse("(no liveness trip)")}")
     if (requireParkOverflow && actualLsOoo) {
       assert(sawFullPark, "VACUOUS: inhibited park never filled")
       assert(mon.replays > 0 && mon.replayRedirects > 0,
         s"VACUOUS: park-overflow workload never requested and completed replay: ${mon.summary}")
     }
-    info(mon.summary)
-    println(s"[ls-ooo-liveness] $name FUZZ_LS_OOO=$lsOoo outcome=$outcome ${mon.summary}")
-    assert(outcome == PortedPass,
-      s"$name: $outcome\n${PortedTestRunner.lastLivenessFailure.getOrElse("(no liveness trip)")}")
   }
 
   test("LS-OoO liveness A: inhibited store passes an unready load, younger load serialises on it",

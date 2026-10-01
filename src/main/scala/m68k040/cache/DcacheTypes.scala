@@ -105,7 +105,11 @@ case class DLoadProbeCancel() extends Bundle {
   * The registered DTLB result arrives alongside that read's BRAM outputs; matching
   * by token lets the cache finish the VIPT tag compare without retaining every
   * way's raw tag/data or performing a second array read. A late resolution may be
-  * ignored safely; the later resolved DLoadCmd then uses the ordinary path. */
+  * ignored safely; the later resolved DLoadCmd then uses the ordinary path.
+  * An INHIBITED resolution also retires the matching early probe: a serial device
+  * command never consumes the cache-array snapshot, and a load parked before its
+  * ROB-head turn must not retain one of the finite early-probe credits. This is
+  * independent of the fault/squash cancel Flow so both may retire in one cycle. */
 case class DLoadProbeResolve() extends Bundle {
   val token     = UInt(DLoadToken.Width bits)
   val paddr     = UInt(32 bits)

@@ -679,6 +679,17 @@ retirement blocking counters, cycles/instruction, and bandwidth show more useful
 concurrency under the same modeled latency. `CPU_LS_LOAD_RING_DEPTH` controls this sweep
 and remains 4 in the shipping default.
 
+**Inhibited-probe credit rule (2026-10-01).** An early VIPT probe for a load whose
+translation resolves to `INHIBITED` is retired at resolve, before that load can enter
+the inhibited park. The serial device command does not use the cache-array snapshot
+and can later take the ordinary resolved command path. This retirement is independent
+of the tokenized fault/squash cancellation Flow: a translation fault for another load
+can coincide with the inhibited resolve. Keeping such tokens while parked exhausted
+the five-entry probe queue with six parked loads at ring depth 8, blocking an older
+ready load from issuing and producing an `OLDEST-LS-STARVED` liveness failure. The
+ring-depth acceptance test must fill the park and observe replay, not merely reach its
+pass sentinel.
+
 The first paired full-core sweep used `IPC_MEM=l2:5:60:4096`, LS out-of-order issue,
 seed 1, and checked final data on every kernel. `chase-four` traverses four disjoint
 256-record pointer cycles, warming L2 on the first walk; `stream-16k` reads sequential

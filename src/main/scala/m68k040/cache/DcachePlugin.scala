@@ -4731,10 +4731,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     //                       unless a full-queue consume-and-replace re-arms that same
     //                       entry on this edge
     //   2. launch   (IDLE): `loadProbeLaunch && !canceledAtLaunch`, entry allocIdx
-    //   3. cancel  (plain): token / `all` match
-    val probeCanceledAtLaunch = loadProbeCancelPort.valid &&
-      (loadProbeCancelPort.payload.all ||
-       (loadProbeCancelPort.payload.token === loadProbePort.payload.token))
+    //   3. cancel  (plain): token / `all` match, or inhibited translation resolve
+    // Translation may classify a speculative load as inhibited. It can no longer
+    // use the early RAM snapshot, even if the LS EU parks it before issuing the
+    // serial device command. Resolve therefore retires its probe independently
+    // of the single cancel Flow (which may carry another load's fault this cycle).
+    val inhibitedResolve = loadProbeResolvePort.valid &&
+      (loadProbeResolvePort.payload.cacheMode === CacheMode.INHIBITED)
+    val probeCanceledAtLaunch =
+      (loadProbeCancelPort.valid && (loadProbeCancelPort.payload.all ||
+       (loadProbeCancelPort.payload.token === loadProbePort.payload.token))) ||
+      (inhibitedResolve &&
+       (loadProbeResolvePort.payload.token === loadProbePort.payload.token))
     val earlyProbeValidsNext = Vec(Bool(), earlyProbeDepth)
     for (i <- 0 until earlyProbeDepth) {
       val consumeClr = loadCmdPort.fire && earlyProbeOwnsCmd &&
@@ -4743,12 +4751,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
                          (earlyProbeAllocIdx === earlyProbeMatchIdx))
       val allocSet   = loadProbeLaunch && !probeCanceledAtLaunch &&
                        (earlyProbeAllocIdx === U(i, earlyProbePtrW bits))
-      val cancelClr  = loadProbeCancelPort.valid && earlyProbeValids(i) &&
-                       (loadProbeCancelPort.payload.all ||
-                        (earlyProbeTokens(i) === loadProbeCancelPort.payload.token))
-      earlyProbeValidsNext(i) := Mux(consumeClr, False,
-                                 Mux(allocSet, True,
-                                 Mux(cancelClr, False, earlyProbeValids(i))))
+      val cancelClr  = earlyProbeValids(i) &&
+                       ((loadProbeCancelPort.valid &&
+                         (loadProbeCancelPort.payload.all ||
+                          (earlyProbeTokens(i) === loadProbeCancelPort.payload.token))) ||
+                        (inhibitedResolve &&
+                         (earlyProbeTokens(i) === loadProbeResolvePort.payload.token)))
+      earlyProbeValidsNext(i) := Mux(consumeClr || cancelClr, False,
+                                 Mux(allocSet, True, earlyProbeValids(i)))
     }
     val earlyProbeHasFreeNext = !earlyProbeValidsNext.asBits.andR
 
@@ -5130,12 +5140,23 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
     // Any later user of the single synchronous read port supersedes the held early
     // Forwarded/faulted/squashed loads never emit loadCmd. Their explicit cancel
-    // releases the matching tokenized entry and lets maintenance quiesce. A probe
-    // canceled on its own launch edge is suppressed in the launch block above.
+    // releases the matching tokenized entry and lets maintenance quiesce. An
+    // inhibited translation also makes the early cache snapshot unusable, so it
+    // releases its token here without occupying the single explicit cancel Flow.
+    // A probe canceled on its own launch edge is suppressed in the launch block above.
     when(loadProbeCancelPort.valid) {
       for (i <- 0 until earlyProbeDepth) {
         when(earlyProbeValids(i) && (loadProbeCancelPort.payload.all ||
              (earlyProbeTokens(i) === loadProbeCancelPort.payload.token))) {
+          earlyProbeValids(i)  := False
+          earlyProbeReadies(i) := False
+        }
+      }
+    }
+    when(inhibitedResolve) {
+      for (i <- 0 until earlyProbeDepth) {
+        when(earlyProbeValids(i) &&
+             (earlyProbeTokens(i) === loadProbeResolvePort.payload.token)) {
           earlyProbeValids(i)  := False
           earlyProbeReadies(i) := False
         }

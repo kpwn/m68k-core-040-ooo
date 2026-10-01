@@ -509,6 +509,79 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def armOn(name: String): Boolean =
     sys.env.get("STRESS_ARMS").forall(_.split(",").map(_.trim).contains(name))
 
+  test("inhibited translation releases its probe alongside an unrelated fault cancel", VerilatorTest) {
+    if (armOn("inhibitedProbeCancel")) controlDut.doSim("inhibited-probe-cancel") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val pl = dut.probe.logic
+      val rp = dut.resolve.logic.resolveIn
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      rp.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
+
+      def probe(token: Int, addr: Long): Unit = {
+        pl.loadProbeIn.valid #= true
+        pl.loadProbeIn.payload.vaddr #= addr
+        pl.loadProbeIn.payload.token #= token
+        pl.loadProbeIn.payload.resolved #= false
+        pl.loadProbeIn.payload.paddrHint #= 0
+        pl.loadProbeIn.payload.size #= Size.LONG
+        pl.loadProbeIn.payload.cacheMode #= CacheMode.INHIBITED
+        pl.loadProbeIn.payload.needsLine #= false
+        cd.waitSamplingWhere(pl.loadProbeIn.ready.toBoolean)
+        pl.loadProbeIn.valid #= false
+      }
+      val device = 0xA1000L
+      mem.pokeByte(device, 0x12); mem.pokeByte(device + 1, 0x34)
+      mem.pokeByte(device + 2, 0x56); mem.pokeByte(device + 3, 0x78)
+      probe(0x31, device)
+      probe(0x32, device + 16)
+      cd.waitSampling(3)
+      assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == 2,
+        "both unresolved probes must be resident before simultaneous retirement")
+
+      // The fault-cancel Flow has only one payload. A second, inhibited load must
+      // release its token from the resolve port without stealing that Flow.
+      rp.valid #= true
+      rp.payload.token #= 0x31
+      rp.payload.paddr #= device
+      rp.payload.cacheMode #= CacheMode.INHIBITED
+      pl.loadProbeCancelIn.valid #= true
+      pl.loadProbeCancelIn.payload.all #= false
+      pl.loadProbeCancelIn.payload.token #= 0x32
+      cd.waitSampling()
+      rp.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      cd.waitSampling()
+      assert(!dut.dcache.logic.earlyProbeValids.exists(_.toBoolean),
+        "inhibited resolve and unrelated fault cancel must both retire their probes")
+
+      // Park drain sends this inhibited command later. With no probe token it must
+      // still use the ordinary serial read and return the device value once.
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= device
+      pl.loadCmdIn.payload.paddr #= device
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.INHIBITED
+      pl.loadCmdIn.payload.token #= 0x31
+      pl.loadCmdIn.payload.ooOk #= false
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= false
+      cd.waitSamplingWhere(pl.loadCmdIn.ready.toBoolean)
+      pl.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(pl.loadRspOut.valid.toBoolean)
+      assert(pl.loadRspOut.payload.data.toBigInt == BigInt("12345678", 16) &&
+             pl.loadRspOut.payload.token.toInt == 0x31,
+        "inhibited fallback must preserve data and token after early-probe retirement")
+    }
+  }
+
   test("four dirty writebacks fill the buffer; a fifth demand waits and resumes after B", VerilatorTest) {
     if (armOn("wbFull")) nbHotDut.doSim("wb-full") { dut =>
       val cd = dut.clockDomain
