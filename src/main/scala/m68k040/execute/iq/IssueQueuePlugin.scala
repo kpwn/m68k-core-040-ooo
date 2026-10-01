@@ -831,7 +831,31 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         B((0 until slotCount).map(i =>
           (if (i == 0) True else !incA(i - 1)) || slots(i).hot.firstOfInstr))
       }
-      val eligible = lsPresent & ~olderStorePresent.asBits & intraMacroOk
+      // ═══ STORES ISSUE STRICTLY IN LS ORDER (2026-09-30) ═══════════════════════════════
+      // A STORE is eligible only as the OLDEST occupied LS slot (`ohLoldest`), i.e. it may not
+      // overtake ANY older LS op -- which is what the owner-approved design says ("Stores stay
+      // strict this phase", docs/DESIGN_ooo_load_issue_and_prefetch.md Part 1) and what this
+      // select had drifted from: it let a store pass an older UNREADY LOAD.
+      //
+      // That drift is a LIVENESS defect, not just a spec deviation, and it has four
+      // independent deadlocks behind it (LsOooLivenessSpec A/B/E + the InhibitedFullBarrier
+      // F seed-2 hang). A store that overtook an older load L is in the SQ, uncommitted, and
+      // cannot commit until L retires. Everything that waits on that store therefore waits
+      // on L -- and L, issued later, is BEHIND the waiter in the in-order LS pipe:
+      //   * a younger load waiting in P4 for an older INHIBITED store to drain
+      //     (`fwdSerial` / `olderInhibitedStore`);
+      //   * a younger load waiting in P4 for the store's late DATA (`earlyStoreAddress`),
+      //     when that data is L's own value;
+      //   * a split load hitting the store, waiting for it to drain;
+      //   * a further store waiting in P3 for SQ space the uncommitted stores hold.
+      // With stores strict, every store in the SQ was issued after ALL older LS ops, so each
+      // of those waits depends only on ops AHEAD of the waiter, and resolves.
+      //
+      // Loads keep the full relaxation. Their one remaining circular wait -- an overtaking
+      // load that must wait for the ROB head (inhibited) or for anything else unforeseen --
+      // is vacated by the P4 park and, beyond it, by the LS EU's liveness replay.
+      val lsStoreVec = B(lsStorePresent)
+      val eligible = (lsPresent & ~lsStoreVec & ~olderStorePresent.asBits & intraMacroOk) | ohLoldest
       OHMasking.first(eligible & lsReady)
     }
     val ohL = (if (loadBypassUnreadyLoad) ohLrelaxed

@@ -203,6 +203,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // for precise format-$7 delivery at retire).
       rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
       rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+      host[m68k040.services.RobLsReplayService].lsReplay.valid         := host[m68k040.execute.LsEuService].replayRequest.valid
+      host[m68k040.services.RobLsReplayService].lsReplay.payload       := host[m68k040.execute.LsEuService].replayRequest.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -499,6 +501,14 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     def this() = this(false)
     val db    = new Database
     val host  = db on (new PluginHost)
+    // LOCKSTEP_SHIPPING=1: every LSU / IQ / P1 front-end knob below DEFAULTS to what the
+    // board ships (`SocketTop` under throughput-v2 + `ShippingCoreConfig`), so a gate run
+    // compares the SHIPPED machine without a 15-variable incantation. Each individual
+    // LOCKSTEP_* variable still overrides its own knob either way. Unset = the historical
+    // all-OFF DUT, bit-identical to before.
+    private def lk(env: String, shipping: => Boolean = true): Boolean =
+      sys.env.get(env).map(_ == "1").getOrElse(ship && shipping)
+    private val S = m68k040.top.ShippingCoreConfig
     val ctrl   = new MmuControlPlugin
     // Non-renamed FP control state (FPCR / FPSR non-FPCC bytes / FPIAR), Task 9.
     // Declared HERE, next to MmuControlPlugin, and not further down with the register
@@ -529,8 +539,9 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val fa     = if (ship) SP.fetchAlign(ipcThroughput = true) else new FetchAlignPlugin(enableFetchDirected = true,
       // The two front-end prediction flags of `perf/track5-branch`; see the note in
       // FuzzDut. Default OFF, so an unset environment is the same DUT as before.
-      computeDirectTargets = sys.env.get("LOCKSTEP_COMPUTE_DIRECT_TARGETS").contains("1"),
-      deferSlot1Uncond = sys.env.get("LOCKSTEP_DEFER_SLOT1_UNCOND").contains("1"),
+      computeDirectTargets = lk("LOCKSTEP_COMPUTE_DIRECT_TARGETS", S.computeDirectTargets),
+      deferSlot1Uncond = lk("LOCKSTEP_DEFER_SLOT1_UNCOND", S.deferSlot1Uncond),
+      deferSlot1Dbcc = lk("LOCKSTEP_DEFER_SLOT1_DBCC", S.deferSlot1Dbcc),
       deferSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_CONDITIONAL").contains("1"),
       trainSlot1Conditional = sys.env.get("LOCKSTEP_TRAIN_SLOT1").contains("1") || sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"),
       deferTakenSlot1Conditional = sys.env.get("LOCKSTEP_DEFER_TAKEN_SLOT1").contains("1"))
@@ -552,7 +563,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
       else new RobPlugin(pairCorrectBranch = sys.env.get("LOCKSTEP_PAIR_BRANCH").contains("1"),
       preparedRetireEntries = preparedCap,
-      rasBranchRepair = sys.env.get("LOCKSTEP_RAS_BRANCH_REPAIR").contains("1"),
+      rasBranchRepair = lk("LOCKSTEP_RAS_BRANCH_REPAIR", S.rasBranchRepair),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val iq     = if (ship) SP.issueQueue(ipcThroughput = true, ipcLateStore = true,
         specLoadWakeup = SP.specLoadWakeup(ipcThroughput = true),
@@ -570,16 +581,17 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         lsOooIssue = m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
       else new LsEuPlugin(
       specLoadWakeup = sys.env.get("LOCKSTEP_SPEC_WAKE").contains("1"),
-      alignedLoadFallThrough = sys.env.get("LOCKSTEP_LS_FALLTHROUGH").contains("1"),
-      earlyIntWakeup = sys.env.get("LOCKSTEP_LS_EARLY_WAKEUP").contains("1"),
-      sqSubwordForwarding = sys.env.get("LOCKSTEP_SQ_SUBWORD").contains("1"),
-      reserveLateStore = sys.env.get("LOCKSTEP_RESERVE_LATE_STORE").contains("1"),
-      detachLateStore = sys.env.get("LOCKSTEP_DETACH_LATE_STORE").contains("1"),
-      forwardOnPublish = sys.env.get("LOCKSTEP_FORWARD_ON_PUBLISH").contains("1"),
-      earlyNzvcWakeup = sys.env.get("LOCKSTEP_LS_EARLY_NZVC").contains("1"),
-      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(1),
-      earlyAutoStoreAddress = sys.env.get("LOCKSTEP_EARLY_AUTO_STORE").contains("1"),
-      earlyStoreDataWake = sys.env.get("LOCKSTEP_EARLY_STORE_DATA_WAKE").contains("1"),
+      alignedLoadFallThrough = lk("LOCKSTEP_LS_FALLTHROUGH"),
+      earlyIntWakeup = lk("LOCKSTEP_LS_EARLY_WAKEUP"),
+      sqSubwordForwarding = lk("LOCKSTEP_SQ_SUBWORD"),
+      reserveLateStore = lk("LOCKSTEP_RESERVE_LATE_STORE"),
+      detachLateStore = lk("LOCKSTEP_DETACH_LATE_STORE"),
+      forwardOnPublish = lk("LOCKSTEP_FORWARD_ON_PUBLISH"),
+      earlyNzvcWakeup = lk("LOCKSTEP_LS_EARLY_NZVC"),
+      detachedStoreEntries = sys.env.get("LOCKSTEP_DETACHED_STORE_ENTRIES").map(_.toInt).getOrElse(if (ship) 4 else 1),
+      earlyAutoStoreAddress = lk("LOCKSTEP_EARLY_AUTO_STORE"),
+      earlyStoreDataWake = lk("LOCKSTEP_EARLY_STORE_DATA_WAKE"),
+      earlyAutoAnWriteback = lk("LOCKSTEP_EARLY_AN"),
       lsOooIssue = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val divEu  = new DivEuPlugin
     val rfInt  = new RegFilePluginInt

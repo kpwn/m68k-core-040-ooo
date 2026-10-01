@@ -52,13 +52,16 @@ class RobPlugin(val detailedPerf: Boolean = false,
                   * `branchRepair` ports. DEFAULT OFF; both plugins must agree (checked in
                   * BackendWiringPlugin). See RasPlugin's class comment. */
                 val rasBranchRepair: Boolean = false,
-                val lsOooIssue: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService {
+                val lsOooIssue: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
+  private var lsReplayWire: Flow[UInt] = null
+  override def lsReplay: Flow[UInt] = lsReplayWire
   private var retirementWires: Vec[Flow[UInt]] = null
   private var haltAfterLoadHoldWire: Bool = null
   override def haltAfterLoadHold: Bool = haltAfterLoadHoldWire
   override def retiredRobIds: Vec[Flow[UInt]] = retirementWires
   during setup {
+    lsReplayWire = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     haltAfterLoadHoldWire = Bool()
     retirementWires = Vec.fill(scala.math.max(4, preparedRetireEntries))(Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)))
   }
@@ -898,6 +901,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     lsOrderViolation.valid.allowOverride;   lsOrderViolation.valid := False
     lsOrderViolation.payload.allowOverride; lsOrderViolation.payload := U(0, robIdW bits)
     if (lsOooIssue) lsOrderViolation.simPublic()
+    // LS-OoO LIVENESS REPLAY request (LsEuPlugin `replayRequest`): the robId of an op the LS
+    // EU vacated from P4 with a throw-away completion. Default-idle, like the port above.
+    val lsReplay = lsReplayWire
+    lsReplay.valid.allowOverride;   lsReplay.valid := False
+    lsReplay.payload.allowOverride; lsReplay.payload := U(0, robIdW bits)
+    if (lsOooIssue) lsReplay.simPublic()
     val lsFaultCompletion = Flow(m68k040.execute.LsFault())
     lsFaultCompletion.valid.allowOverride;            lsFaultCompletion.valid := False
     lsFaultCompletion.payload.robId.allowOverride;    lsFaultCompletion.payload.robId := U(0, robIdW bits)
@@ -1325,7 +1334,29 @@ class RobPlugin(val detailedPerf: Boolean = false,
        (debugHaltState === DebugHaltState.STOP_PENDING) ||
        (debugHaltState === DebugHaltState.STEP_RUNNING))
     debugBreakpointBoundaryHit.simPublic()
-    val retire0 = headReady && !faultedStore(h0) && !p0.isRte && !p0.sysOp &&
+    // ── LS-OoO LIVENESS REPLAY: the OLDEST pending request ─────────────────────────
+    // ONE register, not a per-entry mark. When the oldest replayed op reaches the head the
+    // flush squashes every younger one too, so only the oldest can ever act -- a younger
+    // request may be dropped. `replayPendValid` is cleared by every flush (all of them are
+    // global), so the robId it holds is always an in-flight op, and that op cannot retire
+    // (below), so it cannot go stale by retiring either.
+    val replayPendValid: Bool = if (lsOooIssue) RegInit(False) else null
+    val replayPendRob: UInt   = if (lsOooIssue) Reg(UInt(robIdW bits)) init 0 else null
+    val replayAtHead: Bool    = if (lsOooIssue) replayPendValid && (h0 === replayPendRob) else null
+    if (lsOooIssue) {
+      val newIsOlder = ((lsReplay.payload - head)(robIdW - 1 downto 0)) <
+                       ((replayPendRob - head)(robIdW - 1 downto 0))
+      when(lsReplay.valid && (!replayPendValid || newIsOlder)) {
+        replayPendValid := True
+        replayPendRob   := lsReplay.payload
+      }
+      when(flushing) { replayPendValid := False }
+      replayPendValid.simPublic(); replayPendRob.simPublic(); replayAtHead.simPublic()
+    }
+    // A replay-marked head NEVER retires: its result is a throw-away (see `lsReplayRedirect`).
+    // Scala-level `if` so the OFF build's retire0 expression is textually unchanged.
+    val retire0 = (if (lsOooIssue) headReady && !replayAtHead else headReady) &&
+                  !faultedStore(h0) && !p0.isRte && !p0.sysOp &&
                   !interruptPending && !privViolation && !stopped && !tracePendingFire &&
                   sysAuxRdy0 && !haltAfterDue && !haltAfterRetireBlock &&
                   !debugBreakpointBoundaryHit
@@ -1424,7 +1455,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // lost per violation, and an unconditional term cannot miss a case. Both shapes are real
     // -- h0 marked and h1 the macro's last uop, AND h0 itself last with h1 the NEXT macro's
     // first uop, which is the one that corrupts.
-    val orderPairOk: Bool = if (!lsOooIssue) True else !macroViolationPending
+    // AND the pending LIVENESS REPLAY op must never retire as h1 either. It completed with a
+    // throw-away result; `retire0` refuses it at h0, but a dual retire would commit it from
+    // the SECOND slot and leave `replayPendRob` naming a retired index -- measured by
+    // LsOooStressSpec seed 22 as the not-first-uop assertion firing thousands of cycles
+    // later, when the index wrapped onto an unrelated mid-macro uop. A silent garbage commit.
+    val orderPairOk: Bool = if (!lsOooIssue) True else
+      !macroViolationPending && !(replayPendValid && (h1 === replayPendRob))
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(!(retire0 && replayAtHead),
+          "RobPlugin: the pending LS liveness-replay op retired from slot 0", FAILURE)
+      }
+    }
     val retire1 = retire0 && (count > 1) && completes(h1) && headAllowsPair && !p1.retireAlone &&
                   orderPairOk &&
                   !(irqBoundaryHold && p0.last) &&
@@ -1443,6 +1486,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // (including the marked macro) is squashed.
       when(retire0 && orderViolated(h0) && !p0.last) { macroViolatedSticky := True }
       when((retire0 && p0.last) || flushing)         { macroViolatedSticky := False }
+    }
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(!(retire1 && replayPendValid && (h1 === replayPendRob)),
+          "RobPlugin: the pending LS liveness-replay op retired from slot 1", FAILURE)
+      }
     }
     val retireLanes = Seq(retire0, retire1) ++ (2 until retireWidth).map(_ => Bool())
     val preparedBatch = if (preparedRetireEntries != 0) Some(new Area {
@@ -1522,9 +1571,18 @@ class RobPlugin(val detailedPerf: Boolean = false,
         !p.debugBreakValid && ((p.sysKind =/= sysAuxCapKind) || sysValRdyStore(id)) &&
         !p0.retireAlone && !haltAfterArmedIn && !debugStopRequestIn && !a7OddStopReq && !pcRangeStopReq &&
         !haltA7OddEnIn && !haltPcRangeEnIn &&
-        (debugHaltState === DebugHaltState.RUNNING)
+        (debugHaltState === DebugHaltState.RUNNING) &&
+        // A wider retire must refuse the pending LS liveness-replay op too (see orderPairOk).
+        (if (lsOooIssue) !(replayPendValid && (id === replayPendRob)) else True)
     }
     retireLanes.foreach(_.simPublic())
+    if (lsOooIssue) GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        for (lane <- 2 until retireWidth)
+          assert(!(retireLanes(lane) && replayPendValid && (retireIds(lane) === replayPendRob)),
+            s"RobPlugin: the pending LS liveness-replay op retired from slot $lane", FAILURE)
+      }
+    }
     val debugMacroCountInc = retireLanes.zip(retirePayloads)
       .map { case (r, p) => (r && p.last).asUInt.resize(log2Up(retireWidth + 1)) }.reduce(_ + _)
     debugMacroCountInc.simPublic()
@@ -3403,14 +3461,41 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val r = retire0 && macroViolationPending && p0.last && (count > 1) && !branchRedirect
       r.simPublic(); r
     }
+    // ── LS-OoO LIVENESS REPLAY REDIRECT ─────────────────────────────────────────────
+    // The head is an op the LS EU vacated from P4 with a throw-away result (see LsEuPlugin
+    // `replayRequest`). Do not retire it; flush and restart AT ITS OWN PC -- exactly the
+    // restart an interrupt recognised at this boundary would make, minus the exception.
+    // `p0.first` holds by construction (only a first uop can overtake an older LS op) and
+    // is asserted below rather than assumed. Every competing head action wins: a pending
+    // interrupt or trace restarts at the same PC anyway, an exception flushes everything,
+    // and the debug/halt boundaries keep their own precise rules; the replay then simply
+    // re-evaluates next cycle. `preciseDrainBusyIn` mirrors `debugRecoverEnter`'s gate.
+    val lsReplayRedirect: Bool = if (!lsOooIssue) False else {
+      // `p0.first` is IN the hardware condition, not only asserted: were it ever false the
+      // restart would re-execute retired sibling uops (the inhibited-load-irq-replay
+      // family). A visible wedge is preferred to a silent re-execution -- and the sim
+      // assertion makes that wedge impossible to miss in any suite.
+      val r = headReady && replayAtHead && p0.first && excIdle && !faultedStore(h0) &&
+              !privViolation && !interruptPending && !tracePendingFire && !stopped &&
+              !haltAfterDue && !haltAfterRetireBlock && !debugBreakpointBoundaryHit &&
+              !preciseDrainBusyIn
+      r.simPublic()
+      GenerationFlags.simulation {
+        assert(!(headReady && replayAtHead && !p0.first),
+          "RobPlugin: LS replay request at a head that is not the first uop of its " +
+          "instruction -- the restart PC would not be a macro boundary", FAILURE)
+      }
+      r
+    }
     val debugStepRestartPc = Mux(retire1 && p1.last, p1.predNextPc, p0.predNextPc)
     val debugRestartPc = Mux(exc.redirectValid, exc.redirectPc,
                          Mux(branchRedirect, nextPcRd0,
+                         (if (lsOooIssue) (x: UInt) => Mux(lsReplayRedirect, p0.pc, x) else (x: UInt) => x)(
                          Mux(orderRedirect, p1.pc,
                          Mux(debugBreakpointBoundaryHit, p0.pc,
                          Mux(haltAfterDue || debugAutoHaltLatchedReg, debugLivePcReg,
                          Mux(debugNormalBoundaryHit || (debugHaltState === DebugHaltState.STEP_RUNNING), debugStepRestartPc,
-                         Mux(count === 0, debugLivePcReg, p0.predNextPc)))))))
+                         Mux(count === 0, debugLivePcReg, p0.predNextPc))))))))
     // A halted PC edit must update the frontend's registered restart point as well as
     // debugLivePcReg. Reusing the ordinary registered flush keeps every speculative
     // consumer empty and does not release the debug halt.
@@ -3442,10 +3527,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // `count > 1` because the violator must still be resident to be squashed; it is younger
     // than a retiring h0 and cannot have retired, so this holds whenever the bit is set --
     // gated anyway so `p1` is never an uninitialised-Mem read.
-    doFlushReg := branchRedirect || orderRedirect || exc.redirectValid || debugRecoverEnter || debugPcApply
+    doFlushReg := (if (lsOooIssue) branchRedirect || orderRedirect || lsReplayRedirect
+                   else branchRedirect || orderRedirect) ||
+                  exc.redirectValid || debugRecoverEnter || debugPcApply
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(orderRedirect)     { flushPcReg := p1.pc }
+    if (lsOooIssue) when(lsReplayRedirect) { flushPcReg := p0.pc }
     when(exc.redirectValid) { flushPcReg := exc.redirectPc }
     // ── ONE expression for the debug restart PC (2026-09-18 race audit) ──────────
     // This arm used to REBUILD the mux above with only three of its arms, and the two

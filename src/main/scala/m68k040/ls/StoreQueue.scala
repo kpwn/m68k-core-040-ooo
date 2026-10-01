@@ -1388,13 +1388,54 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // held one extra cycle past its resolution (the ack-OK-to-retire handshake seam)
   // so the ROB's normalIrqGate/traceNormalGate never race a same-cycle preempt
   // against a drain that just resolved. ----
+  //
+  // ═══ HELD UNTIL THE STORE RETIRES, not "resolution + 1" (2026-09-30) ═══════════════
+  // The one-cycle pad assumed the store's ROB completion lands within a cycle of its final
+  // ack. It does not have to: the completion rides the LS EU's SHARED completion stage,
+  // where `applyFast` yields to a same-cycle FRONT completion and `applyBacklog` yields to
+  // every BACK (ring) completion. Past the pad the store sits at the ROB head, drained but
+  // not retired, with interrupt recognition open -- and `normalIrqGate` does not need the
+  // head to be complete, only to be a first uop. An interrupt taken there squashes an
+  // instruction whose device write has ALREADY happened; after RTE it runs again: a SECOND
+  // device write. Measured: LsOooStressSpec seed 15 (pre-fix LS-OoO, IRQ storm) wrote a
+  // device register 12 times for 11 stores; InhibitedStoreIrqReplaySpec targets the window.
+  // This is the store twin of the inhibited-load IRQ-replay bug (the 53C96 wedge), and the
+  // fix is the same one LsEuPlugin's `loadBusyReg` uses: stay busy from LAUNCH until the
+  // final ack has been seen AND the ROB head has moved past the launching store's robId.
+  // Head-advance is the retire witness: while busy no interrupt/trace is recognised, so the
+  // head cannot vanish any other way than by retiring (or by an exception/flush, which
+  // empties the ROB and drops `robHeadValidIn`). Termination: a completed head retires
+  // without consulting this signal (retire0 needs `!interruptPending`, and busy is exactly
+  // what keeps that low). ORPHANS keep the old release -- their ROB entry is gone, so a
+  // reused index at the head is someone else and must not hold this.
   val preciseDrainBusyReg = RegInit(False)
   val preciseLaunch = drainIssue && sendPrecise
   val preciseFinalAck = terminalAck && precises(head)
   val preciseFinalAckD = RegNext(preciseFinalAck, init = False)
-  when(preciseLaunch) { preciseDrainBusyReg := True }
-    .elsewhen(preciseFinalAckD) { preciseDrainBusyReg := False }
-  io.preciseDrainBusy := preciseDrainBusyReg
+  val preciseLaunchRob    = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)) init 0
+  val preciseLaunchOrphan = RegInit(False)
+  val preciseAckSeen      = RegInit(False)
+  val preciseLauncherAtHead = io.robHeadValidIn && (io.robHeadIn === preciseLaunchRob)
+  when(preciseFinalAckD) { preciseAckSeen := True }
+  when(preciseLaunch) {
+    preciseDrainBusyReg := True
+    preciseAckSeen      := False
+    preciseLaunchRob    := robIds(head)
+    preciseLaunchOrphan := headOrphan
+  }.elsewhen(preciseDrainBusyReg && (preciseFinalAckD || preciseAckSeen) &&
+             (preciseLaunchOrphan || !preciseLauncherAtHead)) {   // == preciseReleaseNow
+    preciseDrainBusyReg := False
+  }
+  preciseAckSeen.simPublic(); preciseLaunchRob.simPublic()
+  // The OUTPUT drops in the very cycle the head moves past the store, not one cycle later:
+  // that cycle is the boundary AFTER the store, where a pending T1 trace or interrupt must be
+  // recognised. A registered release hid that one boundary from `traceNormalGate` /
+  // `normalIrqGate`, so the next instruction retired untraced (measured: corpus
+  // `prm_trace_t1_before_next`, and the lock-step IRQ tests taking their interrupt one
+  // instruction late). Head is a flop; no combinational loop through retire.
+  val preciseReleaseNow = (preciseFinalAckD || preciseAckSeen) &&
+                          (preciseLaunchOrphan || !preciseLauncherAtHead)
+  io.preciseDrainBusy := preciseDrainBusyReg && !preciseReleaseNow
 
   // D4: the walker fence. PENDING = about to be allowed to launch (same head/preempt terms
   // `headPreciseReady` uses, so the fence never outlives a preemption that will flush this

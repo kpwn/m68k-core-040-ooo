@@ -96,6 +96,23 @@ object ProgGen {
 
   val allowCrossLine: Boolean = sys.env.get("FUZZ_ALLOW_CROSSLINE").contains("1")
 
+  // ── DEVICE WINDOW (`FUZZ_DEVICE_WINDOW=1`) ──────────────────────────────────────
+  // A second seeded sandbox in the HIGH half, which `FuzzRunner` maps CACHE-INHIBITED
+  // (DTT1) while the low half -- code, stack, the ordinary sandbox -- stays COPYBACK
+  // (DTT0/ITT0). Every sandbox address then picks one of the two windows at random, so
+  // one program mixes inhibited and cacheable accesses in every shape the generator has:
+  // loads, stores, RMW, mem->mem in both directions, MOVEM, CAS, CMPM, memory-indirect
+  // pointer fetches. That is exactly the traffic out-of-order LS issue must keep ordered
+  // (an inhibited access is a two-way barrier) -- and Musashi, which has no caches,
+  // checks the architectural result of every one of them.
+  // 0xFFFF8000: inside every sim AXI model's decode (`addr>>16 == 0xFFFF`) and, unlike
+  // 0xFFFF4000, reachable by abs.W (0x8000 sign-extends to 0xFFFF8000).
+  val DeviceBase: Long = 0xFFFF8000L
+  val deviceWindow: Boolean = sys.env.get("FUZZ_DEVICE_WINDOW").contains("1")
+  /** Every seeded data window, in the order the prologue seeds them. */
+  val windows: Seq[Long] = if (deviceWindow) Seq(SandboxBase, DeviceBase) else Seq(SandboxBase)
+  def inAnyWindow(a: Long): Boolean = windows.exists(b => a >= b && a < b + SandboxSize)
+
   final case class Block(lines: Vector[String], removable: Boolean = true)
 
   final case class Prog(seed: Long, prologue: Vector[Block], body: Vector[Block]) {
@@ -119,12 +136,12 @@ object ProgGen {
     // foundation does not make every generated program depend on the
     // immediate-to-memory crack. That form is exercised independently by a
     // removable template below.
-    val memSeeds = (0 until SandboxLongs).map { i =>
+    val memSeeds = windows.flatMap { base => (0 until SandboxLongs).map { i =>
       val dr = s"%d${i % 8}"
       Block(Vector(f"\tmove.l #0x${r.nextLong() & 0xffffffffL}%x,$dr",
-                   f"\tmove.l $dr,0x${SandboxBase + i * 4}%x"),
+                   f"\tmove.l $dr,0x${base + i * 4}%x"),
             removable = false)
-    }.toVector
+    } }.toVector
     // Register entropy: leave every D/A reg (A7 excluded) with a random value.
     // Removable — memory templates re-seed their own An/Xn before use.
     val regSeeds = (0 until 8).map { i =>
@@ -169,13 +186,16 @@ object ProgGen {
       * optional alignment. */
     private def sbAddr(span: Int, align: Int = 1): Long = {
       var tries = 0
+      // Only consumes an extra draw when the device window is on, so every existing seed
+      // generates the byte-identical program it always did.
+      val base = if (deviceWindow && r.nextBoolean()) DeviceBase else SandboxBase
       while (true) {
         tries += 1
         val off  = WinLo + r.nextInt(WinHi - WinLo - span + 1)
-        val addr = SandboxBase + (off / align) * align
+        val addr = base + (off / align) * align
         val ok   = allowCrossLine || ((addr & 15) + span <= 16)
-        if (ok && addr + span <= SandboxBase + WinHi) return addr
-        if (tries > 64) return SandboxBase + WinLo // aligned-16, always fits
+        if (ok && addr + span <= base + WinHi) return addr
+        if (tries > 64) return base + WinLo // aligned-16, always fits
       }
       0L // unreachable
     }
@@ -205,7 +225,10 @@ object ProgGen {
           val d16 = r.nextInt(33) - 16
           (Vector(s"\tmove.l #${hex(addr - d16)},$an"), s"$d16($an)", addr)
         case 2 => // (xxx).L / .W absolute (sandbox fits abs.W positive)
+          // abs.W sign-extends: the device window (0xFFFF8xxx) is reachable as a NEGATIVE
+          // word, which the assembler wants spelled as one.
           if (r.nextBoolean()) (Vector.empty, s"(${hex(addr)}).l", addr)
+          else if (addr >= 0xFFFF8000L) (Vector.empty, s"(${addr - 0x100000000L}).w", addr)
           else                 (Vector.empty, s"(${hex(addr)}).w", addr)
         case 3 => // (An)+
           (Vector(s"\tmove.l #${hex(addr)},$an"), s"($an)+", addr)

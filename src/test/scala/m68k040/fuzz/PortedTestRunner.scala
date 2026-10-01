@@ -61,6 +61,11 @@ object PortedTestRunner {
     * prints one `[d4-monitor]` line per run (name + posture). Read-only; outcomes unchanged. */
   private val d4MonitorAll = sys.env.get("D4_BARRIER_MONITOR").contains("1")
 
+  /** The last run's `LsLivenessMonitor` trip (diagnosis dump), if any. */
+  @volatile var lastLivenessFailure: Option[String] = None
+  /** The last run's monitor itself (null when liveness was off), for non-vacuity counters. */
+  @volatile var lastLiveness: LsLivenessMonitor = null
+
   /** @param dcfg   D-side memory model config. Default = the zero-latency model every corpus
     *               run has always used (`BehavioralMemAgent`'s own default), so omitting it
     *               changes nothing.
@@ -70,7 +75,8 @@ object PortedTestRunner {
         cachePosture: CachePosture = CachePosture.AsWritten,
         probe: PostureProbe = null, allowBkptCompletion: Boolean = true,
         dcfg: m68k040.sim.AxiMemModelConfig = m68k040.sim.AxiMemModelConfig(),
-        onDut: FuzzCoreDut => Unit = null): PortedOutcome = {
+        onDut: FuzzCoreDut => Unit = null,
+        liveness: Boolean = LsLivenessMonitor.enabledByEnv): PortedOutcome = {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
       case Left(err) => return PortedGenFail(s"assemble: ${err.reason}")
@@ -352,6 +358,13 @@ object PortedTestRunner {
       dut.fa.logic.redirect.valid   #= false
 
       if (onDut != null) onDut(dut)
+      // LIVENESS: a hang becomes a DIAGNOSIS at the trip cycle instead of a bare timeout
+      // (see LsLivenessMonitor). On a trip the run ends early as `PortedHang(cycle)`, and the
+      // dump is printed and kept in `lastLivenessFailure` for callers that want to assert on it.
+      lastLivenessFailure = None
+      val liveMon: LsLivenessMonitor =
+        if (!liveness) null else new LsLivenessMonitor(dut, name).attach()
+      lastLiveness = liveMon
       val d4Mon: InhibitedBarrierMonitor =
         if (!d4MonitorAll) null
         else new InhibitedBarrierMonitor(dut, s"$name posture=${cachePosture match {
@@ -841,7 +854,8 @@ object PortedTestRunner {
       var cyc = 0L
       var word = 0L
       val progressAddress = sys.env.get("PORTED_PROGRESS_ADDR").map(java.lang.Long.decode(_).longValue)
-      while (word == 0 && !bkptFired && cyc < timeoutCycles) {
+      while (word == 0 && !bkptFired && cyc < timeoutCycles &&
+             (liveMon == null || liveMon.failure.isEmpty)) {
         cd.waitSampling()
         cyc += 1
         val b0 = dmem.mem.read(SentinelAddr).toLong & 0xffL
@@ -862,6 +876,7 @@ object PortedTestRunner {
           println(f"[exctrace] MEM 0x$a%08x = 0x$v%02x")
         }
       }
+      if (liveMon != null) liveMon.failure.foreach { f => println(f); lastLivenessFailure = Some(f) }
       flushWalkHoles()
       if (d4Mon != null) println(d4Mon.summary + d4Mon.details(2).replace("\n", " ||"))
       outcome =

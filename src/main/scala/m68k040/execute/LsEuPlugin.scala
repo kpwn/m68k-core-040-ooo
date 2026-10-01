@@ -53,6 +53,14 @@ trait LsEuService {
   // macro boundary, flushes everything younger so the wrongly-ordered access re-executes.
   // A cacheable refill is side-effect free, so the squashed access leaves no trace.
   def orderViolation: Flow[UInt]  // robId of the inhibited op whose barrier was violated
+  // LS-OoO LIVENESS REPLAY (`lsOooIssue` only): robId of an op that was VACATED from P4 --
+  // completed with a throw-away result -- because it could not make progress there while a
+  // program-OLDER LS op sat behind it in the pipe. The ROB must not retire it: when it
+  // reaches the head the ROB flushes and restarts AT ITS OWN PC. Such an op is always the
+  // FIRST uop of its instruction (it overtook an older LS op, which `intraMacroOk` allows
+  // only for a first uop), so the restart is an exact macro boundary -- the same boundary an
+  // interrupt taken there would restart at.
+  def replayRequest: Flow[UInt]
   // robId of the access currently being translated (tags a DTLB walk's deferred U/M
   // descriptor write so it drains at THAT instruction's commit).
   def xlateRobId: UInt
@@ -188,6 +196,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   var wakeupNzvcPort: Flow[UInt]   = null
   var wakeupSpecPort: Flow[UInt]   = null
   var orderViolationPort: Flow[UInt] = null
+  var replayRequestPort: Flow[UInt] = null
   var faultCompletionPort: Flow[LsFault] = null
   var rdBase, rdData: RegFileReadPort = null
   var rdIndex: RegFileReadPort = null   // brief-format indexed EA: the index register Xn (psrcC)
@@ -210,6 +219,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
   override def wakeupNzvc: Flow[UInt]   = wakeupNzvcPort
   override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
   override def orderViolation: Flow[UInt] = orderViolationPort
+  override def replayRequest: Flow[UInt] = replayRequestPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
   var xlateRobIdSig: UInt = null
   override def xlateRobId: UInt         = xlateRobIdSig
@@ -327,6 +337,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     wakeupSpecPort.simPublic()
     orderViolationPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     orderViolationPort.simPublic()
+    replayRequestPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+    replayRequestPort.simPublic()
     faultCompletionPort = Flow(LsFault()); faultCompletionPort.simPublic()
     xlateRobIdSig  = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
     val irf = host[IntRegFileService]
@@ -2188,6 +2200,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // unfaulted access never spuriously flags. Captured alongside the comp* stage.
     val compIsFault   = RegInit(False)
     compIsFault.simPublic()
+    // LS-OoO liveness replay (see `replayRequest`): the registered completion this cycle is
+    // a THROW-AWAY result for an op vacated from P4; the ROB must replay, not retire, it.
+    // Only built with `lsOooIssue`, so every other netlist is untouched.
+    val compIsReplay: Bool = if (lsOooIssue) RegInit(False) else null
+    if (lsOooIssue) compIsReplay.simPublic()
     val compFaultAddr = Reg(UInt(32 bits))
     val compFaultWr   = RegInit(False)
     val compFaultSize = Reg(UInt(2 bits))
@@ -3052,6 +3069,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     }
     // MMU access-fault completion (registered, alongside the comp* stage).
     faultCompletionPort.valid           := compValid && compIsFault
+    replayRequestPort.valid   := (if (lsOooIssue) compValid && compIsReplay else False)
+    replayRequestPort.payload := compRobId
     faultCompletionPort.payload.robId   := compRobId
     faultCompletionPort.payload.faultAddr  := compFaultAddr
     faultCompletionPort.payload.write      := compFaultWr
@@ -3072,6 +3091,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     compNzvcWrite := False
     compXWrite := False
     compIsFault := False
+    if (lsOooIssue) compIsReplay := False
     // Default-clear; set True by captureCompletion/captureFault below (read AFTER
     // the fsm closes, by the deferred-replay arbitration -- see its comment).
     liveCompletionFires := False
@@ -3760,7 +3780,79 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       sq.io.coalesceBreak := (p4Valid && (p4Ctx.fwdStall || p4Ctx.fwdSerial ||
                                           (p4Inhibited && !p4LaunchOk))) || parkOwnsBarrier
     }
-    when(p4Valid && !sqFlushSig && !excActive) {
+    // ═══ LS-OoO LIVENESS REPLAY (`lsOooIssue`) ═══════════════════════════════════════
+    // THE GENERAL FORM OF THE P4-PARK DEADLOCK. P4 is one non-bypassable stage in an
+    // in-order pipe. Under in-order issue its occupant is the oldest LS op in flight, so
+    // anything it waits for is older and ahead of it. Relaxed issue puts a YOUNGER op there
+    // first; if that op then waits for something only the program-OLDER op behind it can
+    // release, neither moves. The park vacates the common case (a parkable inhibited op
+    // waiting for the ROB head). This vacates EVERY other case, whatever the wait is:
+    //   * CERTAIN, acted on immediately: an inhibited op that is not the head and cannot
+    //     park -- a split (line/page-crossing) access, which needs two adjacent slots the
+    //     park does not have, or a FULL park (five or more device reads overtaking one
+    //     unready load, which is the register-allocation shape of a driver's status poll).
+    //     Both are exactly the cases the old tripwire below could only report.
+    //   * ANY OTHER WAIT, after `replayStallLimit` cycles -- an unenumerated wait must not
+    //     be able to wedge the machine, only slow it.
+    // Both require a program-OLDER LS op upstream in S1/T/TX/P3. That is what makes the
+    // action safe as well as necessary: an op with an older op BEHIND it overtook that op at
+    // issue, which `intraMacroOk` allows only for the FIRST uop of an instruction -- so the
+    // ROB's restart at this op's own PC is an exact macro boundary.
+    //
+    // THE ACTION. P4 completes the op with a throw-away result through the ordinary
+    // completion (so every wakeup a consumer may be holding for -- including a speculative
+    // one -- is confirmed; the consumers are younger and die in the same flush) and raises
+    // `replayRequest`. It has not launched, so it has no side effect to undo; its early
+    // probe token is cancelled exactly as a full SQ forward cancels it. The ROB never
+    // retires it: at the head it flushes and restarts at the op's PC, where the op is now
+    // the OLDEST instruction and cannot overtake anything -- so a replay is always
+    // followed by progress, never by another replay of the same op.
+    //
+    // TIMING: the decision is REGISTERED (`replayArm`) from the previous cycle's state, so
+    // the four age compares and the counter are off the P4 launch cone; the P4 arm reads
+    // one flop. A P4 op that did not leave last cycle is still the same op this cycle (a
+    // flush clears P4 and is excluded here).
+    val replayStallLimit = 255
+    // Scala-level `if`s throughout: with `lsOooIssue` off not one node of this is
+    // elaborated, so the OFF netlist is unchanged.
+    val replayArm: Bool = if (lsOooIssue) RegInit(False) else null
+    val replayCertainSeen: Bool = if (lsOooIssue) Bool() else null
+    if (lsOooIssue) {
+      val w = m68k040.Global.ROB_ID_W_DEFAULT
+      def olderThanP4(v: Bool, r: UInt): Bool =
+        v && (((r - robHeadIn)(w - 1 downto 0)) < ((p4Front.robId - robHeadIn)(w - 1 downto 0)))
+      val olderUpstream = olderThanP4(s1Valid, s1Ctx.robId) || olderThanP4(tValid, tCtx.robId) ||
+                          olderThanP4(txValid, txCtx.robId) || olderThanP4(p3Valid, p3Ctx.front.robId)
+      val p4Waiting = p4Valid && !p4CanLeave && !sqFlushSig && !excActive
+      val stallCnt  = Reg(UInt(log2Up(replayStallLimit + 1) bits)) init 0
+      when(p4Waiting) { when(stallCnt =/= replayStallLimit) { stallCnt := stallCnt + 1 } }
+        .otherwise { stallCnt := 0 }
+      replayCertainSeen := p4Inhibited && !p4AtRobHead && (p4Front.twoAccess || !parkHasFree)
+      replayArm := p4Waiting && olderUpstream && robHeadValidIn &&
+                   (replayCertainSeen || (stallCnt === replayStallLimit)) && !replayArm
+      olderUpstream.simPublic(); stallCnt.simPublic(); replayArm.simPublic()
+    }
+    val p4ReplayFire: Bool = if (lsOooIssue) Bool() else null
+    if (lsOooIssue) {
+      p4ReplayFire := False; p4ReplayFire.simPublic()
+      when(p4Valid && !sqFlushSig && !excActive && replayArm) {
+        // The shared completion port may be taken by an older completion this cycle; the
+        // arm then simply re-arms (the op is still waiting, still has an older op behind).
+        when(!(backCompFires || preciseReplayClaimsComp || detachedStoreComplete)) {
+          captureCompletionFront(p4Front, B(0, 32 bits))
+          compIsReplay     := True
+          cancelProbeFor(p4Front.robId)
+          p4CompletionFire := True
+          p4CanLeave       := True
+          p4ReplayFire     := True
+        }
+      }
+    }
+    // A `def`, not a `val`: a named val would add a wire name to the OFF netlist.
+    def p4NormalArm: Bool =
+      if (lsOooIssue) p4Valid && !sqFlushSig && !excActive && !replayArm
+      else            p4Valid && !sqFlushSig && !excActive
+    when(p4NormalArm) {
       val fullForward = p4Ctx.fwdHit && !p4Front.twoAccess
       // `fwdSerial`: the held verdict was masked by the inhibited-store barrier -- keep
       // re-querying until one is captured with the barrier absent (it lifts exactly when

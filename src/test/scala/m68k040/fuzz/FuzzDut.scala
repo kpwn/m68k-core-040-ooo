@@ -127,6 +127,8 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // whose barrier a younger already-launched access violated. Recovered at retire.
     rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
     rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+    host[m68k040.services.RobLsReplayService].lsReplay.valid         := host[m68k040.execute.LsEuService].replayRequest.valid
+    host[m68k040.services.RobLsReplayService].lsReplay.payload       := host[m68k040.execute.LsEuService].replayRequest.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
