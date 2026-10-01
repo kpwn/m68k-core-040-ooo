@@ -532,6 +532,34 @@ staging cycle.
 
 ## 9. 200 MHz plan
 
+### Resident dependent-chain wakeup diagnostic (2026-10-01)
+
+The 2 KB `BoardMembenchSimSpec` chase was measured with NB4, ring depth 8,
+the hot door, LS out-of-order issue, `l2:6:33:4096`, and five laps. Its first
+lap warms L1. The test-only `MB_FUSE_LONG_MOVE_LOADS` and `MB_SPEC_WAKE` knobs
+were varied by name; all four arms checked the pointer-chain result:
+
+| Fused long MOVE load | Speculative load wakeup | Cycles / 128 hops | Cycles / hop |
+| --- | --- | ---: | ---: |
+| OFF | OFF | 1152 | 9.000 |
+| OFF | ON | 1152 | 9.000 |
+| ON | OFF | 1025 | 8.008 |
+| ON | ON | 898 | 7.016 |
+
+In each arm, the 400-row steady trace showed a constant command-to-command
+interval of 9, 9, 8, or 7 cycles respectively. Relative to a cache command
+at cycle zero, the L1 response and guaranteed wakeup land at +1, registered
+writeback at +2, and the next load's IQ-ready/issue at +3/+4 (unfused),
++2/+3 (fused), or +1/+2 (fused with speculative wakeup). The fused+speculative
+commit window had 127 speculative announcements and zero IQ re-check hold
+cycles. The unfused chain cracks through an intervening ALU `MOVEA`, which
+speculative wakeup deliberately does not release; it targets LS load consumers.
+`ShippingPlugins.decodeStage` already enables fusion when `ipcThroughput` is
+on. `SPEC_LOAD_WAKEUP` defaults OFF and additionally requires `ipcThroughput`,
+so seven cycles is an experimental flag result, not the current default.
+These are core simulation timings, not whole-SoC or post-route measurements.
+
+
 The tail is a wall of ~110 near-tied paths whose hubs are **control registers driving wide
 CE/reset nets** (`TIMING_200MHZ_TAIL_2026-09-28.md`). Rules applied:
 

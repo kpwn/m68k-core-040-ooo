@@ -864,6 +864,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                                selectParked: Boolean, bypassSelect: Boolean,
                                euFire: Boolean)
       val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
+      val specWakeHisto = ArrayBuffer.empty[(Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
@@ -1438,6 +1439,8 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.iq.logic.lsSelectParked.toBoolean, bypassSelect,
           dut.iq.logic.lsEuFire.toBoolean)
         if (bypassSelect) lsBypassFires += 1
+        specWakeHisto += ((dut.lsEu.wakeupSpec.valid.toBoolean,
+          dut.iq.logic.lsSpecBlocked.toBoolean))
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
         // it) and the order-violation recoveries: the two costs the relaxation can incur.
         if (lsOooPorts) {
@@ -1823,6 +1826,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
       val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
+      val specWakeWindow = specWakeHisto.slice(lo, hi + 1)
       if (iqHolOn) {
         // Same window the IPC number uses, capped to the last 1000 cycles so the
         // sample is steady-state rather than including pipeline fill.
@@ -1997,6 +2001,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         s"skidOccupied=${lsOrderWindow.count(_.skidOccupied)} " +
         s"lsSelectFire=${lsOrderWindow.count(_.selectFire)} " +
         s"lsEuFire=${lsOrderWindow.count(_.euFire)}")
+      println(s"[spec-wake-window] scope=commit-window ${k.name} " +
+        s"specAnnounceCycles=${specWakeWindow.count(_._1)} " +
+        s"iqRecheckHeldCycles=${specWakeWindow.count(_._2)}")
       assert(windowRetired == n - k.warmupInstrs,
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)
