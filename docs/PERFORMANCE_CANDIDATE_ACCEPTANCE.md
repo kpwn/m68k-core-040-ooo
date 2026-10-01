@@ -123,3 +123,21 @@ This excludes widened routing IDs, combinational logic, synthesis optimization,
 and implementation timing. It is not an FPGA area result. The existing SoC
 10-cycle/64-byte completion metric is not first-beat L2 latency; the requested
 six-cycle incremental latency is still unproven.
+
+## Odd-stack exception family gate, 2026-10-01
+
+The corrected exception/NMI integration at `99e71482` passes all 68 named
+`ExecuteLockStepSpec` cases selected by `odd-ssp:` in both matched arms. Counts,
+names, and zero failures were checked separately; both arms exercised the same
+68 cases, including the complete interrupt-boundary sweeps. Logs are
+`/tmp/codex-odd-family-integrated-{off,on}.log`; the checked manifest is
+`/tmp/codex-odd-family-integrated-results.json`.
+
+Both arms use the shipping harness and four configured MSHRs. OFF uses the legacy
+cache, ring4, and disables LS-OoO, D4, hot reads, direct refill, early response,
+eager AR, P3 fast loads, probe-line forwarding, and speculative load wakeup. ON
+uses NB4/ring8 and enables all those options. This closes the odd-stack family
+gate for that source; it is not a full lockstep/corpus result and does not cover
+the later AR-preselection experiment. The broad matched corpus at `5123593f`
+continues independently; its older exception fixtures must not be confused with
+this corrected-source family result.
