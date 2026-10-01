@@ -477,6 +477,39 @@ and four 1,000-operation hot-door chaos seeds. All selected checks pass with
 checked data; inactive ScalaTest arms in the same suite are not counted as
 mechanism coverage.
 
+### 6.3d Matched early-response × eager-AR measurement (2026-10-01)
+
+The isolated combined source is agent-67 at `e69ccfd6` plus eager-AR
+cherry-picks `3bbfc3e0`/`69a3b3da`; the only additional changes are opt-in
+benchmark settings and printed configuration. Every row below uses 4 MSHRs,
+an 8-slot LS load ring, the hot door, LS-OoO issue ON, fused long-move loads ON,
+speculative load wakeup ON, direct refill OFF, fill-forward OFF, seed 1, and
+the same `l2:5:60:4096` memory model. The five-lap dependent chase covers
+2 KiB resident and 64 KiB L2-working-set rings; the independent `chase-four`
+uses 256 records and 768 iterations with all four final pointers checked.
+Configured L2 hit 5 produces an accepted hot AR-to-R interval of 6 cycles
+(baseline trace AR at cycle 85196, R at 85202); ARVALID at 85195 was
+backpressured, so it is not the acceptance timestamp. Direct refill is
+explicitly disabled in `MB_DIRECT_REFILL` and by `FullCoreDut`'s argument in
+the D-side bench.
+
+| NB early response | NB eager AR | 2 KiB chase cycles/hop | 64 KiB chase cycles/hop | Four-chain B/cycle | Four-chain IPC | Whole-run refill MLP | Peak hot AXI requests | Log |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 0 | 7.016 | 20.004 | 0.6980 | 0.2621 | 1.912 | 4 | `/tmp/codex-eager-combined-00.log` |
+| 0 | 1 | 7.016 | 18.958 | 0.7270 | 0.2730 | 1.949 | 4 | `/tmp/codex-eager-combined-01.log` |
+| 1 | 0 | 7.016 | 18.958 | 0.7230 | 0.2715 | 1.939 | 4 | `/tmp/codex-eager-combined-10.log` |
+| 1 | 1 | 7.016 | 17.986 | 0.7454 | 0.2799 | 1.991 | 4 | `/tmp/codex-eager-combined-11.log` |
+
+Both options together cut the modeled dependent L2 loop by 2.018 cycles/hop
+(10.1% fewer cycles, 11.2% more hops per cycle) relative to the matched
+both-OFF arm. The independent four-chain workload improves from 0.6980 to
+0.7454 B/cycle (+6.8%) while still reaching four simultaneous hot-door IDs;
+the latency gain therefore does not trade away observed miss overlap in this
+case. Four-chain ring occupancy and refill MLP are whole-run counters; B/cycle,
+IPC, and cycles/hop use their measured commit windows. No board IPC or
+post-route area is inferred. The probe-forward/P3 option is absent from this
+matrix and must be measured as a separate matched arm.
+
 ### 6.4 The four known bug shapes in this interplay, and where each goes
 
 | today's bug (`dcache-sectored-wedges-silicon`, `lever1-no-write-allocate-is-incorrect`) | this design |
