@@ -1551,6 +1551,60 @@ state registers; it does add P1 eligibility logic and payload selection before
 the DTLB lookup. Mapped area and critical-path timing have not been measured,
 so the flag remains OFF by default.
 
+## 14.5. Experimental queued clean-victim probe-miss stage (2026-10-01 amendment)
+
+`CPU_DCACHE_NB_PROBE_MISS_STAGE=1` is an independent default-OFF experiment in
+non-blocking, unsectored mode. It uses an **accepted resolved command** and the
+matching **ready miss** in the existing five-entry early-probe queue to load
+the existing `stg*` registers directly. The regular S1 array read is omitted
+only for that command; the existing store-first MSHR allocation, waiter,
+replay, preselected-AR, and response machinery runs on the following edge.
+The expected source timing is C0→allocation 2→1 and C0→advertised AR 3→2
+when the bus accepts immediately. There is no speculative allocation from a
+P2 probe before its command, and no new path to command `ready` or the CPU
+read response. The ordinary read/stage path remains the exact fallback.
+
+The fast candidate requires all of the following at C0: exact probe token
+**and virtual address** ownership; ready miss with a resolved physical tag
+equal to the command's tag; one-hot-safe tag outcome; cacheable ordinary
+COPYBACK access (`ooOk`, not split/line-only, inhibited, or faulting); no
+sticky or current-cycle same-set array write; no matching cancel/flush; no
+maintenance/reset; no older S1 decision competing for `stg*`; and no store
+S1/S2/S3/pending-store activity for that set. The queue carries a victim-way
+snapshot, a clean-or-invalid certificate, a resolved-tag certificate, and a
+multi-hot certificate alongside the already-stored physical tag. A dirty
+victim or uncertain certificate falls back: **no 128-bit victim line or dirty
+writeback data is copied into the probe queue**. The prototype may use one
+five-bit pipeline record and five five-bit queue records (about 30 new flops),
+plus narrow selects and comparisons; mapped area and timing must be measured.
+
+The selected victim way need not be compared against a live 128-set pointer
+mux on the command path. A same-set pointer advance comes only from an MSHR
+allocation. While that MSHR exists, the existing set-busy test rejects the
+staged fast allocation; after its array install, the probe's sticky same-set
+write bit rejects the candidate. A same-edge store allocation takes existing
+priority over the staged load. This two-edge proof must be pinned by directed
+tests, including dynamic early MSHR release, rather than assumed from a
+successful benchmark. Any same-line MSHR already active can take the existing
+secondary path at staging; a different-line same-set MSHR replays. A store
+entering S1 after C0 is held by the existing `stgValid` same-set guard until
+allocation/invalidation, while a store already in S1/S2/S3 at C0 forces the
+fallback. Same-cycle invalidation, no-fill store, WT overlay, and maintenance
+write races also force fallback.
+
+The measured reason for the queued form is concrete: in the integrated
+NB4/ring8 eight-chain seed-17 run, a matching live `probeLineValid` miss
+coincided with 70 command-valid cycles and **zero command handshakes**;
+however 1,448 of 2,049 accepted load commands had a fresh matching queued
+miss (before physical-tag and clean-victim qualification). These counts are
+upper bounds on useful fast allocations, not a predicted IPC gain. Validation
+must print fast allocations and fallback causes, check C0→allocation/AR
+timing, compare matched dependent chase and independent four/eight-chain
+throughput and data, and force token reuse, physical-tag alias, stale set
+write, older store pipeline, dirty victim, same-line/set-busy MSHR,
+reordered/error refill, cancel/flush, and no-fill/maintenance fallbacks. A
+qualification-removal mutant must fail checked behavior, not elaboration.
+
 ## 15. Coordination owed (through the PM)
 
 
