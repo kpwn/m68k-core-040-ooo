@@ -14,7 +14,8 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 class LsEuSpec extends AnyFunSuite {
-  class Dut(p3Fast: Boolean = false, p1Early: Boolean = false) extends Component {
+  class Dut(p3Fast: Boolean = false, p1Early: Boolean = false,
+            p1Dn: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
@@ -25,10 +26,11 @@ class LsEuSpec extends AnyFunSuite {
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin(exportBusQuiesced =
       p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
-    val eu     = new LsEuPlugin(p3FastLoad = p3Fast, p1EarlyLoad = p1Early,
+    val eu     = new LsEuPlugin(p3FastLoad = p3Fast, p1EarlyLoad = p1Early || p1Dn,
       inhibitedFullBarrier = p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
       alignedLoadFallThrough = p3Fast)
-    val src    = new LsEuSourcePlugin(dstArch = if (p1Early) 8 else 0)
+    val src    = new LsEuSourcePlugin(dstArch = if (p1Early && !p1Dn) 8 else 0,
+                                     writeNzvc = p1Dn)
     val phead  = new TbPreciseDrainWirePlugin(eu)
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, cacheCtrl,
                                            xlate, dcache, eu, src, phead)) }
@@ -360,7 +362,7 @@ class LsEuSpec extends AnyFunSuite {
   }
 
   test("optional P1 probe still cancels on exact older-SQ forwarding", VerilatorTest) {
-    simConfig.compile(new Dut(p1Early = true)).doSim { dut =>
+    for (dn <- Seq(false, true)) simConfig.compile(new Dut(p1Early = true, p1Dn = dn)).doSim { dut =>
       val (cd, mem) = initDut(dut)
       val base = 0x4800L
       for (i <- 0 until 16) mem.pokeByte(base + i, memByte(base + i))
@@ -372,11 +374,17 @@ class LsEuSpec extends AnyFunSuite {
       var monitor = true
       var p1Fires = 0
       var cancels = 0
+      var flagWrites = 0
+      var writtenFlags = -1
       fork {
         while (monitor) {
           cd.waitSampling()
           if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
           if (dut.eu.logic.probeCancel.toBoolean) cancels += 1
+          if (dut.eu.nzvcW.valid.toBoolean) {
+            flagWrites += 1
+            writtenFlags = dut.eu.logic.compNzvc.toBigInt.toInt
+          }
         }
       }
       issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 22, robId = 5)
@@ -386,6 +394,8 @@ class LsEuSpec extends AnyFunSuite {
       assert(dut.src.logic.obsIntData.toBigInt == BigInt("ABCDEF12", 16))
       assert(p1Fires == 1 && cancels >= 1 && !dut.dcache.logic.earlyProbeValid.toBoolean,
         s"P1/SQ collision must cancel its single probe: P1=$p1Fires cancels=$cancels")
+      assert(flagWrites == (if (dn) 1 else 0) && (!dn || writtenFlags == 8),
+        s"Dn SQ-forwarded MOVE flags writes=$flagWrites value=$writtenFlags")
       monitor = false
     }
   }

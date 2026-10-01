@@ -92,7 +92,7 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
   }
 
   /** Random single-cycle ring, one 4-byte pointer at the start of every 64-byte line. */
-  def kChaseRing(bytes: Int, laps: Int): Kernel = {
+  def kChaseRing(bytes: Int, laps: Int, viaDn: Boolean = false): Kernel = {
     val nodes = bytes / 64
     require(nodes % 4 == 0 && nodes >= 4)
     val rng = new scala.util.Random(0x1234567 + bytes)
@@ -102,11 +102,13 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
     val prep: MemHandles => Unit = h => for (k <- 0 until nodes) poke32(h, Base + 64L * k, Base + 64L * p(k))
     val iters = laps * nodes / 4
     val setup = Seq(f"lea 0x$Base%x,%%a0", s"move.l #$iters,%d7")
-    val body  = Seq("movea.l (%a0),%a0", "movea.l (%a0),%a0", "movea.l (%a0),%a0", "movea.l (%a0),%a0",
-                    "subq.l #1,%d7", "bne.s .Lch")
+    val loads = if (viaDn) Seq.fill(4)(Seq("move.l (%a0),%d0", "movea.l %d0,%a0")).flatten
+                else Seq.fill(4)("movea.l (%a0),%a0")
+    val body  = loads ++ Seq("subq.l #1,%d7", "bne.s .Lch")
     val epi   = Seq("move.l %a0,%d0")
     val src = (setup ++ Seq(".Lch: " + body.mkString(" ; ")) ++ epi ++ Seq(".Lend: bra.s .Lend")).mkString(" ; ")
-    Kernel(s"mb-chase-${bytes / 1024}k", src, setup.size + iters * body.size + epi.size,
+    val kind = if (viaDn) "chase-dn" else "chase"
+    Kernel(s"mb-$kind-${bytes / 1024}k", src, setup.size + iters * body.size + epi.size,
       zeroFillData = true, copybackDtt = true, prepMem = prep,
       warmupInstrs = setup.size + (nodes / 4) * body.size,
       verifyRetirement = obs => {
@@ -159,12 +161,13 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
           case "read"  => kRead(sz, passes)
           case "fill"  => kFill(sz, passes)
           case "chase" => kChaseRing(sz, laps)
+          case "chase-dn" => kChaseRing(sz, laps, viaDn = true)
         }
         val r = runKernel(dut, k, IpcBenchSpec.simSeed)
         val tag = s"ff=${if (ff) 1 else 0} mem=${mem.getOrElse(sys.env.getOrElse("IPC_MEM", "zero"))}"
-        if (kd == "chase") {
+        if (kd == "chase" || kd == "chase-dn") {
           val hops = (laps - 1).toLong * (sz / 64)
-          println(f"MB_SIM $tag kind=chase size=$sz cycles=${r.windowCycles} hops=$hops " +
+          println(f"MB_SIM $tag kind=$kd size=$sz cycles=${r.windowCycles} hops=$hops " +
                   f"cyc/hop=${r.windowCycles.toDouble / hops}%.3f")
         } else {
           val bytes = sz.toLong * (passes - 1)

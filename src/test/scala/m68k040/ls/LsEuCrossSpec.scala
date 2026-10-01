@@ -50,7 +50,7 @@ class GatedIdentityTranslationPlugin extends FiberPlugin with DTranslationServic
   * load spanning the boundary, and checks the merged value in the PRF. Verifies
   * the aligned fast path is unchanged (single access). */
 class LsEuCrossSpec extends AnyFunSuite {
-  class Dut(val earlyMovea: Boolean = false) extends Component {
+  class Dut(val earlyMovea: Boolean = false, val earlyDn: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
@@ -59,8 +59,9 @@ class LsEuCrossSpec extends AnyFunSuite {
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val xlate  = new GatedIdentityTranslationPlugin
     val dcache = new DcachePlugin()
-    val eu     = new LsEuPlugin(p1EarlyLoad = earlyMovea)
-    val src    = new LsEuSourcePlugin(dstArch = if (earlyMovea) 8 else 0)
+    val eu     = new LsEuPlugin(p1EarlyLoad = earlyMovea || earlyDn)
+    val src    = new LsEuSourcePlugin(dstArch = if (earlyMovea) 8 else 0,
+                                     writeNzvc = earlyDn)
     // This DUT hosts no CacheControlService, so the LS EU classifies EVERY load as
     // cache-INHIBITED (LsEuPlugin `txEffectiveCmode`: CACR.DE=0 is the architectural
     // reset state), and since f5f9fe13 an inhibited load is PRECISE: it launches only
@@ -225,6 +226,43 @@ class LsEuCrossSpec extends AnyFunSuite {
     run(0x100eL, robId = 6, expectedP1 = 0)
   }
 
+  test("optional P1 fused MOVE.L into Dn writes data and NZVC for positive zero negative", VerilatorTest) {
+    val compiled = simConfig.compile(new Dut(earlyDn = true))
+    for ((value, flags) <- Seq((0x12345678L, 0), (0L, 4), (0x80000000L, 8))) {
+      compiled.doSim(s"dn-${value.toHexString}") { dut =>
+        val (cd, mem) = initDut(dut)
+        val base = 0x1c00L
+        for (i <- 0 until 4) mem.pokeByte(base + i, ((value >>> (24 - 8 * i)) & 0xff).toInt)
+        seed(dut, cd, preg = 10, value = base)
+        var p1Fires = 0
+        var intWrites = 0
+        var flagWrites = 0
+        var writtenFlags = -1
+        var monitorDone = false
+        fork {
+          while (!monitorDone) {
+            cd.waitSampling()
+            if (dut.eu.logic.p1ReqFire.toBoolean) p1Fires += 1
+            if (dut.eu.intW.valid.toBoolean) intWrites += 1
+            if (dut.eu.nzvcW.valid.toBoolean) {
+              flagWrites += 1
+              writtenFlags = dut.eu.logic.compNzvc.toBigInt.toInt
+            }
+          }
+        }
+        issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 5)
+        assert(waitCompletion(dut, cd, robId = 5), "fused Dn load completes")
+        cd.waitSampling(3)
+        dut.src.logic.obsIntAddr #= 20; sleep(1)
+        assert(dut.src.logic.obsIntData.toBigInt == BigInt(value),
+          s"Dn value ${dut.src.logic.obsIntData.toBigInt.toString(16)} expected ${value.toHexString}")
+        assert(p1Fires == 1 && intWrites == 1 && flagWrites == 1 && writtenFlags == flags,
+          s"Dn P1/data/NZVC P1=$p1Fires int=$intWrites NZVC=$flagWrites flags=$writtenFlags expected=$flags")
+        monitorDone = true
+      }
+    }
+  }
+
   test("optional P1 falls back to P2 while virtual-probe credit is reset-blocked", VerilatorTest) {
     simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
       val (cd, mem) = initDut(dut, waitCacheReady = false)
@@ -318,8 +356,8 @@ class LsEuCrossSpec extends AnyFunSuite {
     }
   }
 
-  test("optional P1 translation fault cancels probe without data or CCR write", VerilatorTest) {
-    simConfig.compile(new Dut(earlyMovea = true)).doSim { dut =>
+  test("optional P1 Dn translation fault cancels probe without data or CCR write", VerilatorTest) {
+    simConfig.compile(new Dut(earlyDn = true)).doSim { dut =>
       val (cd, mem) = initDut(dut)
       val base = 0x3800L
       preload(mem, base, 16)

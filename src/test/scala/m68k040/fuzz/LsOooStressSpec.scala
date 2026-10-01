@@ -33,6 +33,7 @@ class LsOooStressSpec extends AnyFunSuite {
   private val seedStart = envInt("LSOOO_STRESS_START", 0)
   private val seedCount = envInt("LSOOO_STRESS_SEEDS", 16)
   private val nOps      = envInt("LSOOO_STRESS_OPS", 120)
+  private val requireP1Fire = sys.env.get("LSOOO_REQUIRE_P1_FIRE").contains("1")
   private val Timeout   = 400000L
 
   private val Dev = 0xFFFF0100L
@@ -128,13 +129,16 @@ class LsOooStressSpec extends AnyFunSuite {
       val arCnt = mutable.Map.empty[Long, Int].withDefaultValue(0)
       val awCnt = mutable.Map.empty[Long, Int].withDefaultValue(0)
       var excEntries = 0L; var lastExc = false
+      var p1Enabled = false; var p1Fires = 0L
       val outcome = PortedTestRunner.run(s"lsooo_stress_s$seed", p.src, Timeout,
         cachePosture = CachePosture.ForceCacheableCopyback, liveness = true,
         simSeed = seed + 1,
         onDut = d => {
           val cd = d.clockDomain
+          p1Enabled = d.lsEu.p1EarlyLoad
           d.intCtrl.logic.iackAvec #= true
           cd.onSamplings {
+            if (p1Enabled && d.lsEu.logic.p1ReqFire.toBoolean) p1Fires += 1
             val ax = d.dcache.logic.axi
             if (ax.ar.valid.toBoolean && ax.ar.ready.toBoolean) arCnt(ax.ar.payload.addr.toLong & 0xffffffffL) += 1
             if (ax.aw.valid.toBoolean && ax.aw.ready.toBoolean) awCnt(ax.aw.payload.addr.toLong & 0xffffffffL) += 1
@@ -160,6 +164,7 @@ class LsOooStressSpec extends AnyFunSuite {
         if (er != gr || ew != gw) Some(f"0x$a%08x reads $gr (want $er) writes $gw (want $ew)") else None
       }
       val line = f"[lsooo-stress] seed=$seed irq=${p.irq} outcome=$outcome rmw=${p.rmw} excEntries=$excEntries " +
+        s"p1Enabled=$p1Enabled p1Fires=$p1Fires " +
         f"devReads=${exactRegs.map(arCnt).sum} splitReads=${arCnt.filter(_._1 >= Dev + 0x2C).values.sum} " +
         mon.summary
       println(line)
@@ -170,6 +175,7 @@ class LsOooStressSpec extends AnyFunSuite {
         " devAW=" + awCnt.filter(_._1 >= Dev).toSeq.sorted.map { case (a, n) => f"${a & 0xfff}%03x:$n" }.mkString(",") +
         f" splitOps=${p.src.split("0x2E\\(%a0\\)").length - 1}")
       tot = tot.updated("olderBehindStuckP4", tot("olderBehindStuckP4") + mon.olderBehindStuckP4)
+        .updated("p1Fires", tot("p1Fires") + p1Fires)
         .updated("replays", tot("replays") + mon.replays)
         .updated("replayRedirects", tot("replayRedirects") + mon.replayRedirects)
         .updated("excEntries", tot("excEntries") + excEntries)
@@ -178,6 +184,8 @@ class LsOooStressSpec extends AnyFunSuite {
         failures += s"seed=$seed $outcome ${PortedTestRunner.lastLivenessFailure.getOrElse("")}"
       else if (devMismatch.nonEmpty)
         failures += s"seed=$seed DEVICE COUNT: ${devMismatch.mkString("; ")}"
+      else if (requireP1Fire && p.irq && (!p1Enabled || p1Fires == 0))
+        failures += s"seed=$seed IRQ run lacked an accepted P1 pair (enabled=$p1Enabled fires=$p1Fires)"
     }
     println(s"[lsooo-stress] TOTAL seeds=$seedCount ops/seed=$nOps " +
       tot.toSeq.sortBy(_._1).map { case (k, v) => s"$k=$v" }.mkString(" ") +

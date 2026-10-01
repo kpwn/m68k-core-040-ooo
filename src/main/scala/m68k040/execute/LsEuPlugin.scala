@@ -4612,17 +4612,17 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // Thus a P1 request either fires atomically with its probe or is never
     // presented, and the ordinary P1->P2 register remains the fallback.
     if (p1EarlyLoad) {
-      val fusedAnMove = (u1.op === m68k040.decode.DecOp.MOVE) &&
-        (u1.dstArch >= U(8, 5 bits)) && (u1.dstArch < U(16, 5 bits)) &&
+      val fusedRegMove = (u1.op === m68k040.decode.DecOp.MOVE) &&
+        (u1.dstArch < U(16, 5 bits)) &&
         u1.firstOfInstr && u1.lastOfInstr && u1.pdstValid
-      val simpleAnLoad = s1Valid && fusedAnMove &&
+      val simpleRegLoad = s1Valid && fusedRegMove &&
         (u1.memOp === MemOp.LOAD) && (u1.size === m68k040.isa.Size.LONG) &&
         u1.psrcAValid && !u1.psrcCValid && (u1.imm === B(0, 32 bits)) &&
         (u1.eaAuto === m68k040.decode.EaAuto.NONE) &&
         !u1.stkPush && !u1.altAddrSpace && !u1.ccrRestore &&
         !u1.needsSupervisor && !s1TwoAccess &&
         (s1Va(1 downto 0) === U(0, 2 bits))
-      p1ReqArm := simpleAnLoad && !tValid && txReady && !xlateBArm &&
+      p1ReqArm := simpleRegLoad && !tValid && txReady && !xlateBArm &&
                   !sqFlushSig && !dcLoadHeldByOther &&
                   xlate.req.ready && dcache.loadProbe.ready
       p1ReqArm.simPublic()
