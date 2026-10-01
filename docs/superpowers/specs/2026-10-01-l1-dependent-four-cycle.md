@@ -52,14 +52,21 @@ replacement for the ordinary `wakeup` pulse.
 
 The first experiment has two separately gated parts:
 
-1. **T3 scheduling:** Permit the IQ's LS selector to recognize the already
-   registered P3 speculative-pdst announcement in the same cycle it is
-   broadcast, placing one dependent LS load in the *existing* LS issue
-   register for T4. Reuse the ordinary LS slot priority, skid, flush, and
-   other-dependency tests. The new combinational ready condition may remove
-   only the dependency named by this announcement; it cannot clear an
-   unrelated dynamic wait or static trigger. The existing registered
-   `dynWaitAny` and `lsBusy` state remain authoritative for all other paths.
+1. **T3 scheduling:** Permit only the **oldest occupied LS slot** selected by
+   the existing `ohLoldest` mask to recognize the registered P3
+   speculative-pdst announcement in the same cycle it is broadcast, placing
+   that dependent load in the *existing* LS issue register for T4. Do not OR
+   the hint into `slot.ready` or change ordinary relaxed ready selection.
+   The special candidate requires `psrcAValid`, exact tag match, the eligible
+   A-only consumer form, no LS skid occupant, zero static triggers, and an
+   individually checked dynamic-wait vector whose only remaining bit is
+   `LS_A`; **after removing that one bit, its residual must be zero**. If the
+   ordinary relaxed selector already has a ready LS candidate, do not
+   displace it with this speculative candidate. In
+   particular, no B/C, NZVC, slow, or other wait can be silently cleared by
+   a registered `dynWaitAny` bypass. Reuse ordinary LS slot fire/compaction,
+   skid, and flush behavior. The existing registered `dynWaitAny` and
+   `lsBusy` state remain authoritative for all other paths.
    The announcement may be false when C0 stalls or misses; it does not
    confirm data. A registered probe-hit bit could narrow false announcements,
    but cannot itself save a cycle through the existing registered IQ clear.
@@ -67,15 +74,21 @@ The first experiment has two separately gated parts:
    through LS to IQ is optional only after timing evidence; the P3 context
    already carries a registered `pdst`.
 2. **T4 live-data confirmation:** The LS EU may assert `liveLoadConfirm` only
-   for the *actual* response that wins the aligned ring's live-head
-   completion in T4: exact response RID/slot identity, valid+sent+not-done
+   for the *actual granted completion* that wins the aligned ring's live-head
+   completion in T4: exact response RID and still-live slot lifecycle,
+   valid+sent+not-done
    ring entry, terminal single-access load, no fault, poison, flush, previous
    writeback, privilege debt, or split merge, and an actual integer `pdst`
    wakeup. The same result value that `captureCompletionDesc` writes into
    `compData` must be available through a local LS operand bypass to its
    T4 `rdBase` read. The IQ may treat the base source as confirmed
    in T4 only when its physical tag equals this exact live `pdst` **and**
-   the local data bypass is valid. The normal T4 `nextIntWake`, registered
+   the local data bypass is valid. A physical tag matches only the
+   consumer's operand; it does not establish response ownership. The confirm
+   must depend on the already-selected completion grant and ring identity,
+   **never** on the current `issue.fire`, `s1Ready`, `alignedCanEnq`, or IQ
+   selection, which would create a ready/confirmation feedback loop. The
+   normal T4 `nextIntWake`, registered
    `lsBusy` clear, T5 `compValid`, PRF write, and ordinary bypass remain.
 
 The first version checks only `psrcA`: it may be released at T4 only when
@@ -104,14 +117,21 @@ preselected consumer via the existing IQ flush; a fault never publishes a
 data confirm and retains precise exception handling. A poisoned response
 may drain its ring slot but never bypasses into a newly reused ROB/physical
 destination. Directed tests must force RID wrap and ROB/physreg reuse across
-flush, not infer safety from the low fault rate of a chase.
+flush, not infer safety from the low fault rate of a chase. Reuse existing
+poisoned-slot retention and RID lifecycle; add a generation register only if
+a directed counterexample proves those checks insufficient.
 
 When the early hint is wrong, the dependent stays in the IQ LS issue
 register under the existing `lsSpecBlocked` recheck until the real wakeup,
 or is flushed on a fault. This is the existing replay/hold mechanism: the
 experiment does not issue the consumer with guessed data. Bounded-progress
-tests must also include a blocked LS port with older independent work, to
-ensure the extra cycle of preselection does not create head-of-line deadlock.
+tests must include a delayed producer and an older LS slot whose B source
+becomes ready while a younger load receives the speculative hint. The
+oldest-only gate must leave the younger in the IQ, let the older proceed,
+and then drain/replay the younger with checked data. An earlier speculative
+younger occupant could add head-of-line delay; a permanent cycle is not
+established because the existing P4 replay may recover. Measure the delay
+and prove bounded progress instead of claiming a deadlock without a trace.
 The same-cycle `!lsSpecBlocked` exception applies **only** to the LS issue
 register and the eligible `psrcA` operand with the LS-local response-data bypass.
 It must not clear global `lsBusy`, other IQ classes, ALU/branch/CPLX issue,
@@ -123,10 +143,11 @@ without any corresponding T4 data bypass.
 No new data queue or copied cache line is proposed. Reusing P3 context, the
 existing LS issue register, and the ring response requires no new payload
 state. If a dedicated registered producer hint is necessary, budget roughly
-one valid bit plus a six-bit `pdst`; any additional state needs a spec
+one valid bit plus a six-bit `pdst`; no RID/ROB generation register is
+budgeted unless poisoned-slot retention fails a directed test. Any other state needs a spec
 amendment. Combinational cost is at least an LS-source tag compare for A,
-one 32-bit base-operand select, and an IQ same-cycle ready/priority bypass
-across up to 16 slots. A resident-hit-only response qualifier may require
+one 32-bit base-operand select, and an IQ same-cycle oldest-only eligibility
+check (one candidate slot rather than 16 independent ready bypasses). A resident-hit-only response qualifier may require
 a one-bit field in the existing D-cache response service; it must have the
 D-cache as its documented producer and may only narrow eligibility. There is
 no claim of mapped LUT/Fmax improvement from this state estimate.
@@ -134,7 +155,7 @@ no claim of mapped LUT/Fmax improvement from this state estimate.
 The new data path is D-cache registered S2 result → response-data mux →
 RID/head match and LS completion selection → local 32-bit operand mux →
 `s1Base` flop. The new scheduling path is registered P3 `pdst` →
-IQ per-slot A match → ready/priority selection → LS issue register. Both
+IQ `ohLoldest` slot's A/residual-wait check → LS issue register. Both
 cross previously protected timing boundaries. The old unsplit D-cache
 S1-to-response path was about 13 levels and failed routed timing; the old
 ALU-bypass-plus-AGU chain failed at -2.375 ns. Do not move address addition
@@ -150,7 +171,8 @@ this option without mapped and routed path evidence.
   OFF/ON source, seed, memory model, and options must show a full-cycle
   reduction; report hops, cycles, and exact signal edges.
 - Force miss, delayed/refused response, wrong RID, response-port contention,
-  back-to-back independent hits, indexed/C-source and two-source address
+  back-to-back independent hits, delayed producer with an older LS B-source
+  becoming ready before a younger hinted load, indexed/C-source and two-source address
   forms (must be excluded), store-data dependency (must be excluded), DTLB
   fault, bus fault, split, inhibited **producer** and inhibited **consumer**
   target, privileged access, flush/poison, RID wrap, ROB/physreg reuse,
