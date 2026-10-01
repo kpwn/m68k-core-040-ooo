@@ -1653,3 +1653,23 @@ default.
     `!dcacheMissMerge`, checked at elaboration;
   - all three are echoed in `SHIPPING_CONFIG` and default from `ShippingCoreConfig`, so the parity
     spec covers them.
+
+### Integrated probe-miss test harness repair (2026-10-01)
+
+At integrated source `8ac8d80f`, default `test-fast` passed 404/404 and combined
+P1/probe-miss LS gates passed CrossSpec 11/11 plus forwarding 2/2. The full
+19-case nonblocking-cache suite passed its new explicit probe-miss case, then
+stalled elaborating the legacy-AR DUT. Two JVM thread dumps showed the same
+monitor cycle: ScalaTest held the suite monitor in `nbHotLegacyArDut$lzycompute`
+while waiting for the Spinal fiber; the fiber waited on that monitor to
+initialize the nested `Dut` companion for the newly defaulted constructor
+argument. This was not a simulated hardware deadlock. The affected test JVM
+was terminated; other regressions were preserved, and the dependent performance
+matrix correctly refused to start after the failed gate.
+
+Remove the `probeMissStage` constructor default and pass explicit `false` at
+all legacy DUT call sites. Existing explicit ON/environment-selected cases
+stay unchanged. This repairs the test fixture only; combined cache validation
+and the performance matrix remain pending on the repaired source. Logs and
+thread dumps: `/tmp/codex-agent59-combined-all-options-cache.log`,
+`/tmp/codex-agent59-combined-cache-threads{,-confirm}.txt`.

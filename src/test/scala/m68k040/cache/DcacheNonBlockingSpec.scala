@@ -47,7 +47,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     * (`allowPretranslatedProbeHints = false`). */
   class Dut(val nb: Boolean, val dh: Boolean, val early: Boolean, val eagerAr: Boolean,
             val preselectAr: Boolean, val dynamicRelease: Boolean,
-            val storeDelay: Int, val probeMissStage: Boolean = false) extends Component {
+            val storeDelay: Int, val probeMissStage: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
@@ -69,18 +69,18 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private val eagerEnv = sys.env.get("CPU_DCACHE_NB_EAGER_AR").contains("1")
   private val preselectEnv = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr
   private val dynamicEnv = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease
-  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
-  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0))
+  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0, probeMissStage = false))
+  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0, probeMissStage = false))
   private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true,
     early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv,
     dynamicRelease = dynamicEnv, storeDelay = 0,
     probeMissStage = m68k040.top.ShippingCoreConfig.dcacheNbProbeMissStage))
-  private lazy val nbHotDynamicDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = true, eagerAr = false, preselectAr = false, dynamicRelease = true, storeDelay = 0))
-  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 0))
-  private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 0))
-  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
-  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 3))
-  private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 3))
+  private lazy val nbHotDynamicDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = true, eagerAr = false, preselectAr = false, dynamicRelease = true, storeDelay = 0, probeMissStage = false))
+  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 0, probeMissStage = false))
+  private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 0, probeMissStage = false))
+  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0, probeMissStage = false))
+  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 3, probeMissStage = false))
+  private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 3, probeMissStage = false))
   private lazy val nbHotProbeMissDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true,
     early = true, eagerAr = true, preselectAr = true, dynamicRelease = true,
     storeDelay = 0, probeMissStage = true))
@@ -1854,7 +1854,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def singleMissPostR(early: Boolean): Int = {
     var postR = -1
     M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = early,
-      eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0)).doSim { dut =>
+      eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0, probeMissStage = false)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
