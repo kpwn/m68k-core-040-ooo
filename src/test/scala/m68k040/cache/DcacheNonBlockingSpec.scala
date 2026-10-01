@@ -47,7 +47,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     * (`allowPretranslatedProbeHints = false`). */
   class Dut(val nb: Boolean, val dh: Boolean, val early: Boolean, val eagerAr: Boolean,
             val preselectAr: Boolean, val dynamicRelease: Boolean,
-            val storeDelay: Int) extends Component {
+            val storeDelay: Int, val probeMissStage: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
@@ -57,7 +57,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
                                    allowPretranslatedProbeHints = false, hitUnderMissRead = false,
                                    nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = storeDelay,
                                    nbEarlyResponse = nb && early, nbEagerAr = eagerAr,
-                                   nbPreselectAr = preselectAr, nbDynamicRelease = dynamicRelease)
+                                   nbPreselectAr = preselectAr, nbDynamicRelease = dynamicRelease,
+                                   nbProbeMissStage = probeMissStage)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     val resolve = new ProbeResolveDriver
@@ -70,15 +71,228 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private val dynamicEnv = m68k040.top.ShippingCoreConfig.dcacheNbDynamicRelease
   private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
   private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0))
-  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, dynamicRelease = dynamicEnv, storeDelay = 0))
+  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true,
+    early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv,
+    dynamicRelease = dynamicEnv, storeDelay = 0,
+    probeMissStage = m68k040.top.ShippingCoreConfig.dcacheNbProbeMissStage))
   private lazy val nbHotDynamicDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = true, eagerAr = false, preselectAr = false, dynamicRelease = true, storeDelay = 0))
   private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 0))
   private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 0))
   private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, dynamicRelease = false, storeDelay = 0))
   private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, dynamicRelease = false, storeDelay = 3))
   private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, dynamicRelease = false, storeDelay = 3))
+  private lazy val nbHotProbeMissDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true,
+    early = true, eagerAr = true, preselectAr = true, dynamicRelease = true,
+    storeDelay = 0, probeMissStage = true))
 
   private val LINE = 16
+
+  test("queued clean probe miss stages early and physical-tag mismatch falls back", VerilatorTest) {
+    if (armOn("probeMissStage")) nbHotProbeMissDut.doSim("probe-miss-stage") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      val rp = dut.resolve.logic.resolveIn
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 6, dramCycles = 6)))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 6, dramCycles = 6)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      rp.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      val a = 0x0000A200L
+      val b = a + 0x800L // same VIPT set, different physical tag
+      for (j <- 0 until 16) {
+        cold.pokeByte(a + j, 0x31 + j)
+        cold.pokeByte(b + j, 0x51 + j)
+      }
+      var cycles = 0
+      var fast = 0
+      var alloc = 0
+      var lastCmd = -1
+      var firstAlloc = -1
+      var firstArValid = -1
+      var firstAr = -1
+      var watchInputStore = false
+      var inputStoreAck = 0
+      var inputLoadRsp: Option[BigInt] = None
+      fork {
+        while (true) {
+          cd.waitSampling()
+          cycles += 1
+          if (lg.nbProbeFastFire.toBoolean) fast += 1
+          if (lg.nb.lAlloc.toBoolean) { alloc += 1; if (firstAlloc < 0) firstAlloc = cycles }
+          if (pl.loadCmdIn.valid.toBoolean && pl.loadCmdIn.ready.toBoolean) lastCmd = cycles
+          if (firstArValid < 0 && lg.axiDh.ar.valid.toBoolean) firstArValid = cycles
+          if (firstAr < 0 && lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean)
+            firstAr = cycles
+          if (watchInputStore && lg.storeAckReg.toBoolean) inputStoreAck += 1
+          if (watchInputStore && pl.loadRspOut.valid.toBoolean &&
+              pl.loadRspOut.payload.token.toInt == 0x39)
+            inputLoadRsp = Some(pl.loadRspOut.payload.data.toBigInt)
+        }
+      }
+      def issuedProbe(token: Int, va: Long, pa: Long,
+                      mode: SpinalEnumElement[CacheMode.type] = CacheMode.COPYBACK): Unit = {
+        pl.loadProbeIn.valid #= true
+        pl.loadProbeIn.payload.vaddr #= va
+        pl.loadProbeIn.payload.token #= token
+        pl.loadProbeIn.payload.resolved #= false
+        pl.loadProbeIn.payload.paddrHint #= 0
+        pl.loadProbeIn.payload.size #= Size.LONG
+        pl.loadProbeIn.payload.cacheMode #= mode
+        pl.loadProbeIn.payload.needsLine #= false
+        cd.waitSamplingWhere(pl.loadProbeIn.valid.toBoolean && pl.loadProbeIn.ready.toBoolean)
+        pl.loadProbeIn.valid #= false
+        rp.valid #= true
+        rp.payload.token #= token
+        rp.payload.paddr #= pa
+        rp.payload.cacheMode #= mode
+        cd.waitSampling()
+        rp.valid #= false
+        cd.waitSampling(3)
+      }
+      def load(token: Int, va: Long, pa: Long, expected: BigInt,
+               mode: SpinalEnumElement[CacheMode.type] = CacheMode.COPYBACK): Unit = {
+        pl.loadCmdIn.valid #= true
+        pl.loadCmdIn.payload.vaddr #= va
+        pl.loadCmdIn.payload.paddr #= pa
+        pl.loadCmdIn.payload.size #= Size.LONG
+        pl.loadCmdIn.payload.cacheMode #= mode
+        pl.loadCmdIn.payload.token #= token
+        pl.loadCmdIn.payload.rid #= 0
+        pl.loadCmdIn.payload.ridValid #= true
+        pl.loadCmdIn.payload.lineOnly #= false
+        pl.loadCmdIn.payload.ooOk #= true
+        cd.waitSamplingWhere(pl.loadCmdIn.valid.toBoolean && pl.loadCmdIn.ready.toBoolean)
+        pl.loadCmdIn.valid #= false
+        cd.waitSamplingWhere(pl.loadRspOut.valid.toBoolean)
+        assert(!pl.loadRspOut.payload.fault.toBoolean)
+        assert(pl.loadRspOut.payload.token.toInt == token)
+        assert(pl.loadRspOut.payload.data.toBigInt == expected)
+      }
+      issuedProbe(0x31, a, a, CacheMode.WRITETHROUGH)
+      load(0x31, a, a, BigInt("31323334", 16), CacheMode.WRITETHROUGH)
+      val firstCmdCycle = lastCmd
+      assert(fast == 1 && alloc == 1 && firstAlloc == firstCmdCycle + 1 &&
+             firstArValid == firstCmdCycle + 2 && firstAr >= firstArValid,
+        s"clean queued miss timing: fast=$fast alloc=$alloc cmd=$firstCmdCycle firstAlloc=$firstAlloc " +
+          s"ARVALID=$firstArValid acceptedAR=$firstAr")
+      issuedProbe(0x32, b, a)
+      load(0x32, b, b, BigInt("51525354", 16))
+      assert(fast == 1, s"wrong physical tag used queued miss stage: fast=$fast")
+      // Leave B dirty in a non-victim way. A probe for C misses while the later
+      // command maps that SAME virtual address to B. Ignoring the translated
+      // physical-tag check would allocate a duplicate B line and read stale RAM.
+      def storeB(value: BigInt): Unit = {
+        pl.storeIn.valid #= true
+        pl.storeIn.payload.paddr #= b
+        pl.storeIn.payload.data #= value
+        pl.storeIn.payload.size #= Size.LONG
+        pl.storeIn.payload.useStrb #= false
+        pl.storeIn.payload.strb #= 0
+        pl.storeIn.payload.lineData #= 0
+        pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.storeIn.payload.precise #= false
+        cd.waitSamplingWhere(pl.storeIn.valid.toBoolean && pl.storeIn.ready.toBoolean)
+        pl.storeIn.valid #= false
+        cd.waitSamplingWhere(lg.storeAckReg.toBoolean)
+      }
+      storeB(BigInt("77777777", 16))
+      val c = a + 0x1000L
+      for (j <- 0 until 16) cold.pokeByte(c + j, 0x71 + j)
+      issuedProbe(0x33, c, c)
+      load(0x33, c, b, BigInt("77777777", 16))
+      assert(fast == 1, s"physical-tag alias of dirty resident line incorrectly staged: fast=$fast")
+      // An intervening write to the probed set must turn its queued snapshot
+      // stale, even after the store pipeline has emptied at command arrival.
+      val d = a + 0x1800L
+      for (j <- 0 until 16) cold.pokeByte(d + j, 0x91 + j)
+      issuedProbe(0x34, d, d)
+      storeB(BigInt("88888888", 16))
+      load(0x34, d, d, BigInt("91929394", 16))
+      assert(fast == 1, s"same-set store did not invalidate queued miss: fast=$fast")
+      // Two further misses rotate the four-way victim pointer onto dirty B.
+      // A new probe must then decline fast staging, and the ordinary eviction
+      // path must preserve B's dirty bytes through writeback and re-read.
+      val e = a + 0x2000L
+      val f = a + 0x2800L
+      val g = a + 0x3000L
+      for (j <- 0 until 16) {
+        cold.pokeByte(e + j, 0xA1 + j)
+        cold.pokeByte(f + j, 0xA9 + j)
+        cold.pokeByte(g + j, 0xB1 + j)
+      }
+      load(0x35, e, e, BigInt("a1a2a3a4", 16))
+      load(0x36, f, f, BigInt("a9aaabac", 16))
+      issuedProbe(0x37, g, g)
+      load(0x37, g, g, BigInt("b1b2b3b4", 16))
+      assert(fast == 1, s"dirty victim was treated as clean: fast=$fast")
+      load(0x38, b, b, BigInt("88888888", 16))
+      // Present a full-strobe no-fill store and the resolved load on the same
+      // edge, to different lines of one set. The input store has not entered
+      // S0 yet; the new valid-based guard must reject the queued miss stage.
+      val h = a + 0x3800L
+      val i = a + 0x4000L
+      for (j <- 0 until 16) { cold.pokeByte(h + j, 0xC1 + j); cold.pokeByte(i + j, 0x21) }
+      issuedProbe(0x39, h, h)
+      val noFillBefore = lg.nb.ctrMap("noFillAllocs").toLong
+      watchInputStore = true
+      pl.storeIn.valid #= true
+      pl.storeIn.payload.paddr #= i
+      pl.storeIn.payload.data #= 0
+      pl.storeIn.payload.size #= Size.LONG
+      pl.storeIn.payload.useStrb #= true
+      pl.storeIn.payload.strb #= 0xffff
+      pl.storeIn.payload.lineData #= BigInt("cc" * 16, 16)
+      pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.storeIn.payload.precise #= false
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= h
+      pl.loadCmdIn.payload.paddr #= h
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.loadCmdIn.payload.token #= 0x39
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= true
+      pl.loadCmdIn.payload.lineOnly #= false
+      pl.loadCmdIn.payload.ooOk #= true
+      cd.waitSamplingWhere(pl.storeIn.ready.toBoolean && pl.loadCmdIn.ready.toBoolean)
+      pl.storeIn.valid #= false
+      pl.loadCmdIn.valid #= false
+      var n = 0
+      while ((inputStoreAck != 1 || inputLoadRsp.isEmpty) && n < 500) {
+        cd.waitSampling(); n += 1
+      }
+      watchInputStore = false
+      assert(inputStoreAck == 1 && inputLoadRsp.contains(BigInt("c1c2c3c4", 16)),
+        s"input no-fill/load overlap lost a completion or data: ack=$inputStoreAck rsp=$inputLoadRsp")
+      assert(fast == 1 && lg.nb.ctrMap("noFillAllocs").toLong == noFillBefore + 1,
+        s"same-set input store did not force the ordinary miss/no-fill paths: fast=$fast")
+      load(0x3a, i, i, BigInt("cccccccc", 16))
+      val j = a + 0x4800L
+      for (k <- 0 until 16) cold.pokeByte(j + k, 0xD1 + k)
+      issuedProbe(0x40, j, j)
+      load(0x41, j, j, BigInt("d1d2d3d4", 16))
+      assert(fast == 1, s"a different command token consumed queued miss metadata: fast=$fast")
+      pl.loadProbeCancelIn.valid #= true
+      pl.loadProbeCancelIn.payload.all #= false
+      pl.loadProbeCancelIn.payload.token #= 0x40
+      cd.waitSampling()
+      pl.loadProbeCancelIn.valid #= false
+      println(s"[nbProbeMiss] clean C0->alloc=1 C0->ARVALID=2 acceptedAR=${firstAr - firstCmdCycle}; " +
+        s"tag/token/stale/dirty/input-noFill fallbacks checked")
+    }
+  }
 
   private def maint(dut: Dut, cd: ClockDomain, push: Boolean, invalidate: Boolean,
                     scope: Int, addr: Long, budget: Int = 40000): Unit = {
