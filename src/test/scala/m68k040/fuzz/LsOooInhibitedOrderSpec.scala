@@ -270,6 +270,8 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
       val launches      = mutable.ArrayBuffer.empty[Launch]   // inhibited launches, in order
       val axiDevReads   = mutable.ArrayBuffer.empty[BigInt]   // AXI AR addrs to device space
       var cacheableLaunches = 0
+      var p3Enqueues = 0
+      var p4InhibitedEnqueues = 0
       val overlapAny    = mutable.ArrayBuffer.empty[String]   // C, strong form (see the C note)
       val overlapBus    = mutable.ArrayBuffer.empty[String]   // C, strong form, bus still outstanding
       val violCInhib    = mutable.ArrayBuffer.empty[String]   // C, fatal form
@@ -353,7 +355,9 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         // companion `olderStore` covers the drained-SQ half. Reading either at the ring
         // SEND cycle reads a different op's gate (see the sampling note in the header).
         // SECOND SAMPLING FIX, same class as the one in the header note. The ring
-        // enqueue now has TWO sources: P4 directly, and a PARK DRAIN. On a drain cycle
+        // enqueue has three sources: P3 fast admission, P4, and a PARK DRAIN.
+        // P3 is cacheable-only; its enqueue must not inspect stale P4 context.
+        // On a park drain cycle
         // P4 holds a DIFFERENT op, so `p4AtRobHead`/`p4Inhibited` describe that other op
         // and reading them attributes the wrong gate -- exactly the mistake the first
         // version of assertion D made one stage over. The property asserted is unchanged
@@ -363,12 +367,18 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         // entry resident), which does not depend on this attribution at all.
         if (ls.alignedEnq.toBoolean || ls.alignedEnqSplit.toBoolean) {
           val fromPark = lsOoo && ls.parkDrain.toBoolean
-          if (fromPark) {
+          val fromP3 = dut.lsEu.p3FastLoad && ls.p3FastEnq.toBoolean
+          if (fromP3) {
+            p3Enqueues += 1
+            assert(!fromPark && !ls.alignedEnqSplit.toBoolean,
+              "P3 fast admission must not overlap another ring enqueue source")
+          } else if (fromPark) {
             if (!ls.parkOwnsBarrier.toBoolean)
               violD0 += f"cyc=$cycles park drain with NO parked entry at the ROB head"
             if (ls.sq.io.barrier.olderStore.toBoolean)
               violD0 += f"cyc=$cycles park drain with an older store resident"
           } else if (ls.p4Inhibited.toBoolean) {
+            p4InhibitedEnqueues += 1
             if (!ls.p4AtRobHead.toBoolean)
               violD0 += f"cyc=$cycles inhibited op enqueued from P4 while NOT the ROB head"
             if (ls.sq.io.barrier.olderStore.toBoolean)
@@ -479,7 +489,8 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
       val report =
         f"[ls-ooo-inhib] FUZZ_LS_OOO=$lsOoo cycles=$cycles sentinel=$sentinelSeen " +
         f"inhibLaunches=${launches.size} axiDevReads=${axiDevReads.size} " +
-        f"cacheableLaunches=$cacheableLaunches flushes=$flushes orderViolations=$orderViolations " +
+        f"cacheableLaunches=$cacheableLaunches p3Enqueues=$p3Enqueues " +
+        f"p4InhibitedEnqueues=$p4InhibitedEnqueues flushes=$flushes orderViolations=$orderViolations " +
         f"orderRedirects=$orderRedirects violFromPark=$violFromPark violFromP4=$violFromP4 " +
         f"violC(inhibited,FATAL)=${violCInhib.size} overlapAny=${overlapAny.size} " +
         f"overlapBus=${overlapBus.size} violD=${violD.size} violD0=${violD0.size}"
@@ -501,6 +512,8 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         s"vacuous: only ${launches.size} inhibited launches observed -- the posture did not " +
         s"make device space inhibited -- $report")
       assert(cacheableLaunches >= 2, s"vacuous: only $cacheableLaunches cacheable launches -- $report")
+      if (dut.lsEu.p3FastLoad)
+        assert(p3Enqueues > 0, s"vacuous: P3 option enabled but no P3 enqueue observed -- $report")
 
       // (A) no double-launch
       // (A) EXACT equality, not `<=`, and D0/D is what justifies it: an inhibited access
