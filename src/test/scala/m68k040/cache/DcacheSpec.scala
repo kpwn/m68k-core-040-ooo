@@ -39,8 +39,11 @@ class DcacheSpec extends AnyFunSuite {
     * below (9 offsets; recompiling per offset costs minutes for zero
     * benefit -- the DUT is identical). Same pattern as ExecuteLockStepSpec's shared
     * FullCoreDut build. */
-  lazy val sharedCompiled = simConfig.compile(new Dut)
-  lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true))
+  // Pass every constructor argument inside these lazy initializers. Scala's
+  // default-argument companion is itself lazy: the Spinal elaboration thread
+  // cannot initialize it while the test thread holds this suite's lazy-val lock.
+  lazy val sharedCompiled = simConfig.compile(new Dut(directRefill = false, hitUnderMissRead = false))
+  lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true, hitUnderMissRead = false))
   lazy val directHumCompiled = simConfig.compile(new Dut(directRefill = true,
     hitUnderMissRead = true))
 
