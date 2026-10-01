@@ -348,7 +348,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
                    /** Test-only: deliberately skip a fill for a partial store. */
-                   val noFillMutation: Int = 0)
+                   val noFillMutation: Int = 0,
+                   /** Experimental one-beat response bypass for the legacy refill path. */
+                   val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -903,6 +905,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // LsEuPlugin's `captureFault(atc=false)` call site and ExceptionUnit's
     // `entryFaultAtc`.
     val missFault = Reg(Bool()) init False
+    // An accepted cacheable load refill may answer from the live AXI R beat.
+    // REPLAY then only retires the miss barrier; it must not answer a second time.
+    val directRefillAnswered: Bool = if (directRefillResponse && !sectored)
+      RegInit(False) else False
     // Task P1.4: the just-fetched AXI beat for an INHIBITED miss, latched in
     // REFILL for REPLAY to deliver directly (no line was allocated, so a
     // re-launched "hit" read would only find garbage/stale BRAM contents).
@@ -1703,6 +1709,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val missLineResp: Bool =
       if (!nonBlocking) { if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp }
       else (if (fillForward) inhibitedResp || fillFwdResp else inhibitedResp) || nbRespFire
+    val directRefillResp: Bool = if (directRefillResponse && !sectored) {
+      val b = Bool(); b := False; b.simPublic(); b
+    } else False
 
     // ---- LOAD S2 (registered post-hit-detect response build) ----
     // FMax closure Slice 2 (2026-08-07): the old S1 response build (way-select ->
@@ -1745,23 +1754,34 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
-    loadRspPort.valid         := ldS2Resp || busFaultResp || missLineResp
-    loadRspPort.payload.data  := Mux(missLineResp,
+    loadRspPort.valid         := ldS2Resp || busFaultResp || missLineResp || directRefillResp
+    val replayData = Mux(missLineResp,
                                       DcacheByteLane.extract(missLine, missOff, missSize,
                                                              missLineResp && !missLineOnly),
                                       Mux(ldS2Direct, ldS2DirectData,
                                           DcacheByteLane.extract(ldS2Line, ldS2Off, ldS2Size,
                                                                  ldS2Resp && !ldS2Direct && !ldS2LineOnly)))
-    loadRspPort.payload.line  := Mux(missLineResp, missLine, ldS2Line)
+    val responseData = if (directRefillResponse && !sectored)
+      Mux(directRefillResp,
+        DcacheByteLane.extract(axi.r.payload.data, missOff, missSize,
+                               directRefillResp && !missLineOnly), replayData)
+      else replayData
+    val responseLine = if (directRefillResponse && !sectored)
+      Mux(directRefillResp, axi.r.payload.data, Mux(missLineResp, missLine, ldS2Line))
+      else Mux(missLineResp, missLine, ldS2Line)
+    loadRspPort.payload.data  := responseData
+    loadRspPort.payload.line  := responseLine
     // Translation faults are terminated upstream and never become cache commands.
     // The D-cache response fault bit is exclusively a physical AXI refill error.
-    loadRspPort.payload.fault := (if (!nonBlocking) busFaultResp else busFaultResp || (nbRespFire && nbRespFault))
+    loadRspPort.payload.fault := busFaultResp ||
+      (if (!nonBlocking) False else nbRespFire && nbRespFault) ||
+      (directRefillResp && (axi.r.payload.resp =/= Axi4.resp.OKAY))
     // The miss-path responses (inhibited read, bus fault) answer the command whose
     // token was latched into `missToken`; every other response comes down the S1/S2
     // pipe, early-probe direct hits included (the direct arm overrides `ldS2Token`).
-    loadRspPort.payload.token := Mux(missLineResp || busFaultResp, missToken, ldS2Token)
-    loadRspPort.payload.rid      := Mux(missLineResp || busFaultResp, missRid,  ldS2Rid)
-    loadRspPort.payload.ridValid := Mux(missLineResp || busFaultResp, missRidV, ldS2RidV)
+    loadRspPort.payload.token := Mux(missLineResp || busFaultResp || directRefillResp, missToken, ldS2Token)
+    loadRspPort.payload.rid      := Mux(missLineResp || busFaultResp || directRefillResp, missRid,  ldS2Rid)
+    loadRspPort.payload.ridValid := Mux(missLineResp || busFaultResp || directRefillResp, missRidV, ldS2RidV)
 
     // ---- STORE drain (elastic S0 / S1 read / S2 compare / S3 merge+write) ----
     // FMax: the store RMW (old line readAsync + 16-lane byte-merge + write) used to
@@ -3299,8 +3319,19 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // barriers permit, so the collision hold clears in bounded time even
         // under an infinite producer.
         refillNeedsStoreDrain := axi.r.valid && refillWriteHold
-        axi.r.ready := !refillWriteHold
+        // The bypass has no response queue. If a hit-under-miss response owns the
+        // single Flow this cycle, leave AXI R unaccepted until the next cycle.
+        val refillReady = if (directRefillResponse && !sectored)
+          !refillWriteHold && (refillReqIsStore || inhib || missMultiHot || !ldS2Resp)
+          else !refillWriteHold
+        axi.r.ready := refillReady
         when(axi.r.fire) {
+          if (directRefillResponse && !sectored) {
+            when(!refillReqIsStore && !inhib && !missMultiHot) {
+              directRefillResp := True
+              directRefillAnswered := True
+            }
+          }
           // Task #189: a non-OKAY response (SLVERR/DECERR — genuinely unmapped or
           // erroring physical memory) carries NO real data. Do NOT allocate the
           // line (no valid/tag/data write — matches the existing no-allocate-on-
@@ -3451,7 +3482,14 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // relaunch below is deferred while `ldS1Valid` is set, so nothing is clobbered).
         humS1MissPark()
         busy := True
-        when(missFault) {
+        when(directRefillAnswered) {
+          // The load (including an AXI error, if any) was already delivered
+          // from the accepted R beat. Keep REPLAY for the existing FSM/barrier
+          // cleanup but never emit a second response.
+          if (directRefillResponse && !sectored) directRefillAnswered := False
+          loadMissStoreBarrier := False
+          goto(IDLE)
+        } elsewhen(missFault) {
           when(refillReqIsStore) {
             // Drain-miss refill errored: NO allocation happened (doAllocate was
             // False). Task P4.5 wires this into the async diagnostic-fault channel

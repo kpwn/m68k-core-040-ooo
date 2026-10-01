@@ -15,12 +15,12 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class DcacheSpec extends AnyFunSuite {
 
-  class Dut extends Component {
+  class Dut(directRefill: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin()
+    val dcache = new DcachePlugin(directRefillResponse = directRefill)
     val probe  = new DcacheProbePlugin
     // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
     // DcachePlugin's PAGE-scope granule can be exercised at BOTH page sizes. It is
@@ -39,6 +39,54 @@ class DcacheSpec extends AnyFunSuite {
     * benefit -- the DUT is identical). Same pattern as ExecuteLockStepSpec's shared
     * FullCoreDut build. */
   lazy val sharedCompiled = simConfig.compile(new Dut)
+  lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true))
+
+  test("direct refill replies once on a cacheable miss, faults once on DECERR, and leaves inhibited reads unchanged",
+       VerilatorTest) {
+    directRefillCompiled.doSim { dut =>
+      val (cd, mem) = initDutErrInject(dut)
+      val good = 0x4804L
+      preload(mem, good & ~15L, 16)
+      val device = 0x4904L
+      preload(mem, device & ~15L, 16)
+
+      def request(addr: Long, mode: SpinalEnumElement[CacheMode.type]): (BigInt, Boolean, Boolean) = {
+        dut.probe.logic.loadCmdIn.valid #= true
+        dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+        dut.probe.logic.loadCmdIn.payload.paddr #= addr
+        dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= mode
+        dut.probe.logic.loadCmdIn.payload.token #= 7
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+        val result = (dut.probe.logic.loadRspOut.payload.data.toBigInt,
+                      dut.probe.logic.loadRspOut.payload.fault.toBoolean,
+                      dut.dcache.logic.directRefillResp.toBoolean)
+        assert(dut.probe.logic.loadRspOut.payload.token.toInt == 7,
+          "direct refill must retain the missing command's token")
+        for (_ <- 0 until 8) {
+          cd.waitSampling()
+          assert(!dut.probe.logic.loadRspOut.valid.toBoolean,
+            "REPLAY emitted a second response after the direct refill")
+        }
+        result
+      }
+
+      val cold = request(good, CacheMode.WRITETHROUGH)
+      assert(cold == ((expected(good, 4), false, true)), s"cold direct response: $cold")
+      val hot = request(good, CacheMode.WRITETHROUGH)
+      assert(hot == ((expected(good, 4), false, false)), s"resident hit changed: $hot")
+      val bad = 0xAAAA2004L // outside decoded memory; AXI R carries DECERR
+      val fault1 = request(bad, CacheMode.WRITETHROUGH)
+      val fault2 = request(bad, CacheMode.WRITETHROUGH)
+      assert(fault1._2 && fault1._3 && fault2._2 && fault2._3,
+        "DECERR must fault directly and never allocate a resident line")
+      val inhibited = request(device, CacheMode.INHIBITED)
+      assert(inhibited == ((expected(device, 4), false, false)),
+        s"inhibited path must keep its replay response: $inhibited")
+    }
+  }
 
   /** Deterministic image byte. */
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt

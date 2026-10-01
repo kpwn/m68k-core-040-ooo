@@ -709,6 +709,7 @@ object GenSocketTopVerilog {
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
             s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
+            s"dcacheDirectRefillResponse=${ShippingCoreConfig.dcacheDirectRefillResponse} " +
             s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
             s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +

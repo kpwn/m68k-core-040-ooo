@@ -201,6 +201,10 @@ object ShippingCoreConfig {
     * CONTROL measured. */
   val dcacheFillForward: Boolean = envFlag("CPU_DCACHE_FILL_FORWARD", false)
 
+  /** Experimental unsectored cacheable-load refill response directly from the
+    * accepted AXI R beat. OFF pending error/collision and routed-timing gates. */
+  val dcacheDirectRefillResponse: Boolean = envFlag("CPU_DCACHE_DIRECT_REFILL", false)
+
   /** D-cache: SECTORED 64-byte L1D lines -- four 16-byte SECTORS per line, each with its
     * own valid AND dirty bit. See `DcachePlugin.sectoredL1d` for the mechanism and
     * `docs/superpowers/specs/2026-09-27-l1d-sectored-quadrants-amendment.md` for the

@@ -384,6 +384,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                       * explicitly here rather than taken from `ShippingCoreConfig`, per
                       * that file's rule that a bench must vary a knob by NAME. */
                     dcacheFillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
+                    dcacheDirectRefillResponse: Boolean = false,
                     specLoadWakeup: Boolean = false,
                     rasBranchRepair: Boolean = false,
                     computeDirectTargets: Boolean = false,
@@ -405,7 +406,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
     val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin(icachePredecodeWords)
-    val dcache = new DcachePlugin(fillForward = dcacheFillForward)
+    val dcache = new DcachePlugin(fillForward = dcacheFillForward,
+      directRefillResponse = dcacheDirectRefillResponse)
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
