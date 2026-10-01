@@ -723,6 +723,23 @@ eight and two hot IDs, and the dependent chase stayed at 0.4453 B/cycle. The
 16-entry ring also passed the split-load enqueue and split/ordinary ring-wrap
 regressions, but the current full-core kernels used at most eight slots.
 
+**Integrated-source repeat, 2026-10-01.** Full-core source `c3706b52`
+(`5123593f` plus the §14 mutation-evidence test commit) used
+`CPU_DCACHE_NONBLOCKING=1`, `CPU_DCACHE_MSHRS=4`, `CPU_AXI_DH=1`,
+`CPU_INHIBITED_FULL_BARRIER=1`, `CPU_LS_LOAD_RING_DEPTH=8`,
+`IQ_LOAD_BYPASS=1`, and `IPC_MEM=l2:5:60:4096`. With seed 1 and checked
+final data, `chase-four` again reached 0.6595 B/cycle, 0.2476 IPC,
+four simultaneous hot AXI IDs, and whole-run MSHR MLP 1.836;
+`stream-16k` reached 1.0600 B/cycle, 0.3978 IPC, ring occupancy eight,
+and whole-run MSHR MLP 1.551. The dependent `chase-128` control reached
+0.4453 B/cycle and MLP 1.021. Four-chain `failSet=87` and `failFull=failWb=0`
+identify set conflicts rather than MSHR or writeback capacity in this run.
+The source and checked metrics are in `/tmp/codex-bw-integrated-mlp-r8.log`;
+the three active focused arms (`inhibitedProbeCancel`, `mergeDirty`,
+`hotChaos`, seed 1/1,000 operations) passed in
+`/tmp/codex-bw-integrated-focus.log`. These are simulation measurements;
+ring-8 area/timing and board IPC remain unmeasured.
+
 ---
 
 ## 13. Claims and their falsifiers (recorded before any RTL)
