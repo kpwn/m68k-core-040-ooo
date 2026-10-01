@@ -232,3 +232,37 @@ under its existing top/constraint names. A socket/SoC implementation must retain
 the recorded configuration and coordinate the shared implementation lock and
 active Verilator jobs per `synth/README.md` before it runs. Preserve the live
 board/JTAG session. Feature defaults stay unchanged.
+
+
+## Combined full-core ordering checkpoint (2026-10-01)
+
+On frozen `46413280`, NB4/ring8/hot door with dynamic release, early response,
+eager/preselected AR, P3, probe forwarding, direct refill, speculative wakeup,
+LS-OoO and the shipping LSU profile passed `LsOooStressSpec` seeds 14–17 at
+120 generated operations each, and `InhibitedStoreIrqReplaySpec`. The random
+stress checked device read/write counts and split accesses: 6,812 commits,
+1,960 exception entries, 29 replays, 15 replay redirects and zero stress
+failures. Seeds 15 and 17 injected IRQ storms. Exact configuration and the
+original three-suite run are preserved in
+`/tmp/codex-agent59-dynamic-core-results.json` and
+`/tmp/codex-agent59-dynamic-core.log`.
+
+The third suite, `LsOooInhibitedOrderSpec`, initially failed its D0 enqueue
+monitor: it treated P3 fast enqueues as P4 enqueues and inspected unrelated
+P4 context. Test-only commit `d3015075` distinguishes P3, P4 and parked
+sources. It retains the independent actual-launch head/order assertions,
+exact per-device counts and AXI/launch one-to-one check; it additionally
+requires a P3 enqueue when that option is enabled. The corrected fixture
+passed on the same configuration with P3 ON and OFF: both observed exactly
+8 inhibited launches/8 device reads, 31 cacheable launches, 7 order redirects,
+and zero D/D0 or overlapping-inhibited violations. P3 ON observed 10 P3
+admissions; OFF observed zero. The required default `test-fast` passed 404.
+Manifest: `/tmp/codex-agent59-enqueue-monitor-results.json`; logs:
+`/tmp/codex-agent59-enqueue-monitor-{on,off,fast}.log`.
+
+No production RTL changed between `46413280` and `d3015075` (`git diff` of
+`src/main` is empty), so the two passing original full-core suites and the
+paired generated socket inputs still describe this RTL. The originally
+failed suite remains explicitly recorded above. These checks supplement the
+18-test integrated cache gate; they do not close pending MMU/fault defects,
+full corpus comparison, all nonblocking mutants, or physical/board acceptance.
