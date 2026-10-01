@@ -166,3 +166,21 @@ the later IC-only CPUSHL remains the operation under test. Logs are
 `/tmp/codex-cpush-fixture-{off,on,fast}.log`. It is an architectural publication
 and progress check, not proof of overlap with a busy maintenance FSM. It remains
 excluded from forced-copyback sweeps.
+
+
+## Metadata foundation integration gate, 2026-10-01
+
+Source `0f1e4571` passes 404 fast tests, all seven queue/walker foundation tests,
+and the corrected CPUSHL fixture with NB4/ring8, LS-OoO, D4, hot reads, direct
+refill, speculative wakeup, early response, eager/preselected AR, P3 fast loads
+and probe-line forwarding enabled. The manifest is
+`/tmp/codex-agent59-um-foundation-results.json`; commands/configuration are in
+`/tmp/codex-agent59-um-foundation-gates.py`. This validates the inactive-by-default
+metadata foundation alongside the performance candidate. It does not implement
+or validate the selected full D/I metadata ordering contract; real service
+wiring and activation remain separate work.
+
+The checked independent-chain telemetry and capacity controls are now tracked
+in [the load concurrency evidence](LOAD_MLP_CHAIN_SWEEP_2026-10-01.md). Those
+measurements deliberately keep AR preselection OFF and are not a combined
+candidate throughput claim.

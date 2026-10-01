@@ -274,6 +274,7 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               s"specWake=$specWake fuseLongMoveLoads=$fuseLongMoveLoads " +
               s"nbEarlyResponse=${m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse} " +
               s"nbEagerAr=${m68k040.top.ShippingCoreConfig.dcacheNbEagerAr} " +
+              s"nbPreselectAr=${m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr} " +
               f"CPI=${r.windowCycles.toDouble / r.retiredInstrs}%.3f")
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking)
         println(f"DSIDE_CONCURRENCY scope=whole-run kernel=${k.name} seed=$seed " +
