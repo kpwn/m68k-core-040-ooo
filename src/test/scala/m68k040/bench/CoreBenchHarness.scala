@@ -388,6 +388,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     dcacheFillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
                     dcacheDirectRefillResponse: Boolean = false,
                     specLoadWakeup: Boolean = false,
+                    p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
                     rasBranchRepair: Boolean = false,
                     computeDirectTargets: Boolean = false,
                     deferSlot1Uncond: Boolean = false,
@@ -450,6 +451,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       earlyAutoAnWriteback = earlyAutoAnWriteback,
       earlyStoreDataWake = earlyStoreDataWake,
       specLoadWakeup = specLoadWakeup,
+      p3FastLoad = p3FastLoad,
       lsOooIssue = loadBypassUnreadyLoad)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
@@ -992,6 +994,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
       var lsBypassFires     = 0
+      var p3FastEnqueues   = 0
       var lsReplays         = 0
       // Replay valid is a pruned constant in a build without lsOooIssue. Query
       // the constructor mode instead of provoking a simulator signal-access error.
@@ -1441,6 +1444,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (bypassSelect) lsBypassFires += 1
         specWakeHisto += ((dut.lsEu.wakeupSpec.valid.toBoolean,
           dut.iq.logic.lsSpecBlocked.toBoolean))
+        val p3FastFire = dut.lsEu.p3FastLoad && dut.lsEu.logic.p3FastEnq.toBoolean
+        if (p3FastFire) p3FastEnqueues += 1
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
         // it) and the order-violation recoveries: the two costs the relaxation can incur.
         if (lsOooPorts) {
@@ -1605,7 +1610,13 @@ trait CoreBenchHarness extends AnyFunSuite {
             b(dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean),
             b(dut.lsEu.logic.s1Valid.toBoolean), b(dut.lsEu.logic.tValid.toBoolean),
             b(dut.lsEu.logic.txValid.toBoolean), b(dut.lsEu.logic.p3Valid.toBoolean),
-            b(dut.lsEu.logic.p4Valid.toBoolean), b(cmdFire),
+            b(dut.lsEu.logic.p4Valid.toBoolean), b(p3FastFire),
+            b(dut.lsEu.logic.alignedFallThrough.toBoolean),
+            b(dut.dcache.logic.loadCmdPort.valid.toBoolean),
+            b(dut.dcache.logic.loadCmdPort.ready.toBoolean),
+            b(dut.dcache.logic.earlyProbeTokenPresent.toBoolean),
+            b(dut.dcache.logic.earlyProbeOwnsCmd.toBoolean),
+            b(dut.dcache.logic.earlyProbeConflict.toBoolean), b(cmdFire),
             b(dut.dcache.logic.earlyProbeHit.toBoolean),
             b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS1Hit.toBoolean),
             b(dut.dcache.logic.ldS2Valid.toBoolean),
@@ -1916,6 +1927,7 @@ trait CoreBenchHarness extends AnyFunSuite {
         // no dispatch perf bucket counts) from the drain being slow (throughput).
         println(s"[ls-bypass] scope=whole-run ${k.name} relaxedSelectDifferedCycles=$lsBypassFires " +
           s"livenessReplays=$lsReplays orderViolationReports=$lsOrderViols")
+        println(s"[p3-fast] scope=whole-run ${k.name} enqueues=$p3FastEnqueues")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
         if (bypLiveOn) println(f"[hum] ${k.name} loadPresentedCycles=$dcLoadPresented refusedCycles=$dcLoadRefused " +
@@ -2151,9 +2163,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
         println(if (dut.dcache.nonBlocking)
-          "cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS SM AL AR  R WR RQ CM WK WB  ready-robs issue-rob wb-rob cmd-address commits alloc hotAR hotR  (# = active)"
+          "cycle  IQ IS P1 P2 PT P3 P4 P3F FT LV LR PTP POWN PCON C0 EP C1 H1 C2 RS SM AL AR  R WR RQ CM WK WB  ready-robs issue-rob wb-rob cmd-address commits alloc hotAR hotR  (# = active)"
         else
-          "cycle  IQ IS P1 P2 PT P3 P4 C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
+          "cycle  IQ IS P1 P2 PT P3 P4 P3F FT LV LR PTP POWN PCON C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
         traceLines.foreach(println)
         println(s"=== end trace (${traceLines.size} cycles) ===")
       }

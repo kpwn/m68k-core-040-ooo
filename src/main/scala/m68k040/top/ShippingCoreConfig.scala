@@ -490,6 +490,10 @@ object ShippingCoreConfig {
   /** LS aligned-load descriptor ring. Keep 4 as the shipping default; 8/16 are
     * experimental concurrency arms and resize DLoadRid plus the source FIFO. */
   val lsLoadRingDepth: Int = envInt("CPU_LS_LOAD_RING_DEPTH", 4, 4, 16)
+  /** Experimental P3 ordinary-load admission into the existing aligned ring. */
+  val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false)
+  require(!lsP3FastLoad || inhibitedFullBarrier,
+    "CPU_LS_P3_FAST_LOAD=1 requires CPU_INHIBITED_FULL_BARRIER=1")
   require((lsLoadRingDepth & (lsLoadRingDepth - 1)) == 0,
     "CPU_LS_LOAD_RING_DEPTH must be 4, 8, or 16")
   /** Route the non-blocking L1D's refills through the P6 hot door `axi_dh` (read-only,

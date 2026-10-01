@@ -138,6 +138,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val earlyAutoAnWriteback: Boolean = false,
                  val earlyStoreDataWake: Boolean = false,
                  val specLoadWakeup: Boolean = false,
+                 val p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
                  val lsOooIssue: Boolean = false,
                  val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
@@ -162,6 +163,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     s"store-queue depth must be a power of two in 4..16, got $sqDepth")
   require(isPow2(loadRingDepth) && loadRingDepth >= 4 && loadRingDepth <= 16,
     s"aligned-load ring depth must be 4, 8, or 16, got $loadRingDepth")
+  require(!p3FastLoad || inhibitedFullBarrier,
+    "P3 fast load requires the inhibited full barrier")
   // DELIBERATELY UNCONSTRAINED against `earlyIntWakeup` / `alignedLoadFallThrough`, and
   // that is worth stating because an earlier revision required both. The re-check pins a
   // released consumer to the cycle the CONFIRM fires, whatever cycle that turns out to be,
@@ -1519,6 +1522,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val alignedRspPtr   = Reg(UInt(alignedPtrW bits)) init 0
     val alignedCount    = Reg(UInt(log2Up(alignedDepth + 1) bits)) init 0
     val alignedEnq      = Bool(); alignedEnq := False        // single-descriptor push (ordinary aligned load)
+    val p3FastEnq       = if (p3FastLoad) Bool() else False
+    if (p3FastLoad) p3FastEnq := False
+    if (p3FastLoad) p3FastEnq.simPublic()
     val alignedEnqSplit = Bool(); alignedEnqSplit := False   // two-descriptor push (split-load pair)
 
     // ═══ INHIBITED PARK BUFFER (`lsOooIssue` only) ═════════════════════════════════════
@@ -1807,9 +1813,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // is the SHIPPING `SocketTop` setting (`= ipcThroughput`), while every fuzz DUT left it
     // at its default FALSE -- `LsOooInhibitedOrderSpec` lost 3 of its 8 device reads and
     // failed assertion A (device 0xffff0100 launched 3 times, expected 4).
-    val alignedEnqFromP4 = if (lsOooIssue) alignedEnq && !parkDrain else alignedEnq
-    val alignedFallThrough = alignedFallThroughSelect && alignedEnqFromP4 &&
-      (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    val alignedEnqFromP4 = if (p3FastLoad) {
+      if (lsOooIssue) alignedEnq && !parkDrain && !p3FastEnq else alignedEnq && !p3FastEnq
+    } else {
+      if (lsOooIssue) alignedEnq && !parkDrain else alignedEnq
+    }
+    val alignedFallThrough = if (p3FastLoad) {
+      alignedFallThroughSelect &&
+        ((alignedEnqFromP4 && (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)) || p3FastEnq)
+    } else {
+      alignedFallThroughSelect && alignedEnqFromP4 &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    }
     alignedFallThrough.simPublic()
     val alignedCmd = AlignedLoadCtx()
     alignedCmd := alignedMem(alignedSendPtr)
@@ -1821,6 +1836,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedCmd.twoAccess := False
       alignedCmd.splitSecond := False
       alignedCmd.bk.robId := p4Ctx.xlate.front.robId
+      if (p3FastLoad) when(p3FastEnq) {
+        alignedCmd.vaddr := p3Ctx.front.vaddr
+        alignedCmd.paddr := p3Ctx.paddr
+        alignedCmd.size := p3Ctx.front.size
+        alignedCmd.cmode := p3Ctx.cmode
+        alignedCmd.bk.robId := p3Ctx.front.robId
+      }
     }
     GenerationFlags.simulation {
       assert(!(alignedFallThroughSelect && alignedSendValid),
@@ -2718,6 +2740,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       dst.twoAccess   := False
       dst.splitSecond := False
       dst.mergeOff    := U(0, 4 bits)
+      if (p3FastLoad) when(p3FastEnq) {
+        captureBkCtx(dst.bk, p3Ctx.front)
+        dst.vaddr := p3Ctx.front.vaddr
+        dst.paddr := p3Ctx.paddr
+        dst.size  := p3Ctx.front.size
+        dst.cmode := p3Ctx.cmode
+      }
       // A park drain reuses THIS push event verbatim and only redirects the payload, so
       // every piece of ring bookkeeping below -- `alignedCount`, `alignedPushPtr`,
       // valid/sent/poisoned/done/wb -- is shared and cannot drift. That is deliberate:
@@ -3985,8 +4014,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         !(p4Front.needsSupervisor && !p4Front.supervisor) &&
         (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
     }
-    wakeupSpecPort.valid   := specWakeFire
-    wakeupSpecPort.payload := p4Front.pdst
+    // P3 is a registered context too. Announce without the SQ/ring/admission cone;
+    // the IQ confirmation recheck holds a consumer until the real writeback.
+    val p3SpecWake = if (!specLoadWakeup || !p3FastLoad) False else {
+      !p4Valid && p3Valid && (p3Ctx.front.memOp === MemOp.LOAD) &&
+        p3Ctx.front.pdstValid && !p3Ctx.front.ccrRestore &&
+        !p3Ctx.front.twoAccess &&
+        !(p3Ctx.front.needsSupervisor && !p3Ctx.front.supervisor) &&
+        (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+    }
+    wakeupSpecPort.valid   := specWakeFire || p3SpecWake
+    wakeupSpecPort.payload :=
+      (if (p3FastLoad) Mux(p4Valid, p4Front.pdst, p3Ctx.front.pdst) else p4Front.pdst)
     // ═══ INHIBITED ACCESSES ARE TWO-WAY MEMORY BARRIERS (`lsOooIssue`) ═════════════════
     // Out-of-order LS issue may let a younger CACHEABLE load overtake an older LS op, and
     // cacheability is unknowable at issue (nothing is translated there) -- which is exactly
@@ -4361,9 +4400,24 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
           }
         }
       } elsewhen(p3IsLoad) {
-        when(p4Ready) {
-          p3ToP4     := True
-          p3CanLeave := True
+        if (p3FastLoad) {
+          // IQ never selects a younger load ahead of an older store. Stores
+          // terminate or reserve SQ state in P3, so empty excludes every older
+          // issued store, including a detached late-data owner.
+          val ordinary = !p3Front.twoAccess && !p3Front.ccrRestore &&
+            !(p3Front.needsSupervisor && !p3Front.supervisor) &&
+            (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+          val parkIdle = if (lsOooIssue) !parkValid.reduce(_ || _) else True
+          when(ordinary && sq.io.empty && !p4Valid && parkIdle &&
+               !inhibLoadInFlight && p4PreemptSafe && alignedCanEnq) {
+            alignedEnq := True
+            p3FastEnq := True
+            p3CanLeave := True
+          } otherwise {
+            when(p4Ready) { p3ToP4 := True; p3CanLeave := True }
+          }
+        } else {
+          when(p4Ready) { p3ToP4 := True; p3CanLeave := True }
         }
       } otherwise {
         // Defensive: P1 routes LEA/non-memory LS-cluster µops through P2, not P3.

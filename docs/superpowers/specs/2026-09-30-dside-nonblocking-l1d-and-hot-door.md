@@ -1007,7 +1007,81 @@ cold and chaotic hot response modes found no cycle-count regression and
 covered faulting loads, store merges, secondaries and replay. This is a
 simulation result, not a post-route timing or whole-SoC latency claim.
 
+## 14.2. Optional P3 ordinary-load ring admission experiment
+
+`CPU_LS_P3_FAST_LOAD` defaults OFF and requires the inhibited full barrier.
+With it ON, a translated P3 load may enter the existing aligned-load descriptor
+ring without occupying P4 only if it is a
+single-access, cacheable, privilege-legal ordinary load, the store queue is
+empty (including no drain in flight), P4 and the inhibited park are idle,
+there is no inhibited load in flight or pending preemption/flush/exception,
+and the ring has one free descriptor. All other loads retain P3→P4 and the
+registered SQ forwarding verdict. The fast path shares the ordinary ring
+pointer, RID, send, response, fault, poison and probe bookkeeping; it creates
+no new completion or cache-response producer. A refused cache command keeps
+the same descriptor and token in the ring. An accepted fast command uses P3's
+registered address/context for fall-through, never a stale P4 context.
+
+The ordering argument depends on two existing rules: the IQ does not select a
+younger load ahead of an older store, whether that store is ready or unready;
+and the elastic LS frontend does not overtake its own P3 store. A P3 store
+either allocates/reserves SQ state before leaving or completes without a data
+access. Consequently an empty SQ with no P4/park owner excludes an older
+unresolved store for this load. A detached late-data store still holds a SQ
+reservation, so it excludes the fast arm. This proof must be checked against
+the actual IQ and LS frontend gates before implementation and covered with
+directed ordering tests. The shortcut is not valid for SQ forwarding, split,
+inhibited, privilege-fault, or replay cases.
+
+Speculative wakeup is optional and separately gated. A shallow P3-context
+announce may replace P4's announce for the fast arm only when P4 is idle;
+the existing IQ confirmation/recheck still determines when a dependent may
+issue. The announce may precede ring admission, because a held dependent
+cannot issue before the real completion confirms it. This announce must not
+depend on SQ CAM output, ring capacity, or the P3 launch decision, avoiding a
+new long IQ-clear timing cone. The option is experimental: matched L1 chase,
+fallback/collision/cancellation tests and a timing report are required before
+any default change; simulation alone does not establish 200 MHz closure.
+
+The first matched NB4/ring8, fused-MOVEA and speculative-wakeup 2 KB chase
+measured **898 cycles / 128 hops = 7.016 cycles/hop in both OFF and ON arms**.
+The ON stage trace confirms the shortcut actually admits each sampled load in
+P3, but its cache command remains held one cycle: on the P3 fast-enqueue edge,
+fall-through and `loadCmd.valid` are asserted while `loadCmd.ready` is low,
+`earlyProbeTokenPresent` is high and `earlyProbeOwnsCmd` is low. On the next edge
+the probe becomes ready/owned and the command is accepted. The cache's existing
+`earlyProbeMatchVec` requires the registered `earlyProbeReadies` bit, which is
+set only after the probe-line data has been captured. Bypassing that bit without
+same-cycle data/tag forwarding would risk consuming an unresolved or stale line.
+The present P3 shortcut therefore saves **no dependent-load cycle**; it is not
+a candidate for default promotion as implemented. This is a simulation result,
+not timing closure or a board claim.
+
+The next boundary has two possible experiments, neither implemented here.
+Launching the virtual-set probe in P1 would use the AGU's `s1Va` before it is
+registered into `tCtx`; its token and access size are available from the P1
+context, but the DTLB request still starts in P2. The probe would therefore
+outlive a possibly stalled or cancelled translation request. P1 would need
+atomic queue-credit reservation, flush/walker cancellation and slot-generation
+checks; the longer dwell would increase the chance of an intervening store
+invalidating its data. It would also put AGU addition and probe-queue `ready`
+on the already-sensitive P1/issue accept chain. This is the higher timing and
+ownership risk.
+
+A narrower candidate forwards the **registered** `probeLineValid`, line, hit,
+tag, slot, offset and size to the P3 command on the cycle before
+`earlyProbeReadies(slot)` becomes true. The candidate can only own a command
+after a token-plus-VA match to the still-valid slot and a physical-tag match;
+it must apply the current and sticky same-set-write checks, the ordinary
+`ldS1Valid` conflict, cancellation/slot reuse, and one-hot consume-and-replace
+rules. The 128-bit line extraction would then feed the existing registered
+`ldS2DirectData` endpoint. This preserves the launch boundary but may lengthen
+the tag/CAM/byte-select path into that register and the ready path back into
+the LS ring. A directed P3-cycle probe/cancel/write collision gate and a routed
+timing comparison are needed before claiming the possible one-cycle saving.
+
 ## 15. Coordination owed (through the PM)
+
 
 - **Write-path agent:** confirm §7.1 (counted in-order `DStoreAck`) and §7.4 (noFill native, the
   `storeAllocArDelay` hook). Its legacy-FSM hook `DCACHE_FULLLINE_NOFILL` and this flag are

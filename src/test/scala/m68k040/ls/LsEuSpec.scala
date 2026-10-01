@@ -14,7 +14,7 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 class LsEuSpec extends AnyFunSuite {
-  class Dut extends Component {
+  class Dut(p3Fast: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
@@ -23,8 +23,11 @@ class LsEuSpec extends AnyFunSuite {
     val rfX    = new RegFilePluginX     // LS EU now writes X for RTR CCR-restore
     val cacheCtrl = new CacheControlStubPlugin
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin()
-    val eu     = new LsEuPlugin
+    val dcache = new DcachePlugin(exportBusQuiesced =
+      p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
+    val eu     = new LsEuPlugin(p3FastLoad = p3Fast,
+      inhibitedFullBarrier = p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
+      alignedLoadFallThrough = p3Fast)
     val src    = new LsEuSourcePlugin
     val phead  = new TbPreciseDrainWirePlugin(eu)
     db.on { host.asHostOf(Seq[FiberPlugin](param, rfInt, rfNzvc, rfX, cacheCtrl,
@@ -43,14 +46,15 @@ class LsEuSpec extends AnyFunSuite {
     cd.waitSampling(2)
   }
 
-  def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
+  def initDut(dut: Dut, injectBusErrors: Boolean = false): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     // 2026-09-09: construct the AXI responder BEFORE the first clock edge. Built after
     // `forkStimulus` it left the R/B valid + payload inputs undriven across reset release,
     // and a randomly-asserted B response then reaches the cache as a store acknowledgement
     // with no accepted descriptor (its tripwire kills the sim at time=170). Same ordering
     // ExceptionEntrySpec/RteSpec already document for the identical hazard.
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
+      injectBusErrors = injectBusErrors)
     cd.forkStimulus(10)
     val s = dut.src.logic
     s.iValid #= false; s.iSqCommitValid #= false; s.iSqFlush #= false
@@ -133,6 +137,107 @@ class LsEuSpec extends AnyFunSuite {
       n += 1
     }
     resident
+  }
+
+  test("P3 fast load admits only empty-SQ ordinary loads; forward and split fall back", VerilatorTest) {
+    simConfig.compile(new Dut(p3Fast = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7000L
+      for (i <- 0 until 32) mem.pokeByte(base + i, memByte(base + i))
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0x12345678L)
+      var tracking = true
+      var fastFires = 0
+      fork {
+        while (tracking) {
+          sleep(1)
+          if (dut.eu.logic.p3FastEnq.toBoolean) fastFires += 1
+          cd.waitSampling()
+        }
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 20, robId = 1)
+      assert(waitCompletion(dut, cd, robId = 1), "ordinary load completion")
+      assert(fastFires == 1, s"ordinary empty-SQ load used P3 $fastFires times")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 20; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base))
+
+      issueStore(dut, cd, basePreg = 10, disp = 4, dataPreg = 11, Size.LONG, robId = 3)
+      assert(waitStoreAlloc(dut, cd, robId = 3), "older store resident")
+      val beforeForward = fastFires
+      issueLoad(dut, cd, basePreg = 10, disp = 4, Size.LONG, pdst = 21, robId = 4)
+      assert(waitCompletion(dut, cd, robId = 4), "SQ-forwarded load completion")
+      assert(fastFires == beforeForward, "resident older store bypassed SQ forwarding")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 21; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt(0x12345678L))
+
+      dut.src.logic.iSqFlush #= true
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+      cd.waitSampling(3)
+      val beforeSplit = fastFires
+      issueLoad(dut, cd, basePreg = 10, disp = 14, Size.LONG, pdst = 22, robId = 6)
+      assert(waitCompletion(dut, cd, robId = 6), "split load completion")
+      assert(fastFires == beforeSplit, "split load entered P3 fast path")
+      cd.waitSampling(4)
+      dut.src.logic.obsIntAddr #= 22; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base + 14))
+
+      // Squash after admission, while the cold refill still owns its token.
+      // The ring may receive the bus response but must not complete/write back
+      // the killed ROB id; a following load must still make progress.
+      val cold = 0x8000L
+      for (i <- 0 until 16) mem.pokeByte(cold + i, memByte(cold + i))
+      seed(dut, cd, preg = 12, value = cold)
+      val beforeFlush = fastFires
+      issueLoad(dut, cd, basePreg = 12, disp = 0, Size.LONG, pdst = 23, robId = 8)
+      var waitFast = 0
+      while (fastFires == beforeFlush && waitFast < 20) { cd.waitSampling(); waitFast += 1 }
+      assert(fastFires == beforeFlush + 1, "cold load did not enter fast ring")
+      dut.src.logic.iSqFlush #= true
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+      for (_ <- 0 until 80) {
+        assert(!(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 8),
+          "squashed fast load completed")
+        cd.waitSampling()
+      }
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 24, robId = 9)
+      assert(waitCompletion(dut, cd, robId = 9), "load after fast-path squash")
+      tracking = false
+    }
+  }
+
+  test("P3 fast cacheable load preserves physical bus fault and no register result", VerilatorTest) {
+    simConfig.compile(new Dut(p3Fast = true)).doSim { dut =>
+      val (cd, _) = initDut(dut, injectBusErrors = true)
+      val unmapped = 0x10000000L
+      seed(dut, cd, preg = 10, value = unmapped)
+      seed(dut, cd, preg = 25, value = 0x55aa33ccL)
+      issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 25, robId = 10)
+      var sawFault = false
+      var sawCompletion = false
+      var fastFires = 0
+      var n = 0
+      while ((!sawFault || !sawCompletion) && n < 160) {
+        if (dut.eu.logic.p3FastEnq.toBoolean) fastFires += 1
+        if (dut.src.logic.fValid.toBoolean) {
+          assert(dut.src.logic.fRob.toInt == 10)
+          assert((dut.src.logic.fAddr.toLong & 0xffffffffL) == unmapped)
+          sawFault = true
+        }
+        if (dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 10)
+          sawCompletion = true
+        if (!sawFault || !sawCompletion) cd.waitSampling()
+        n += 1
+      }
+      assert(sawFault && sawCompletion, "fast-path bus fault lost fault or completion")
+      assert(fastFires == 1, s"faulting ordinary load used P3 fast path $fastFires times")
+      dut.src.logic.obsIntAddr #= 25; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == BigInt(0x55aa33ccL),
+        "faulting fast load wrote a destination register")
+    }
   }
 
   test("load miss refills then writes PRF + fires completion", VerilatorTest) {

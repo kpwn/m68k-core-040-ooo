@@ -715,6 +715,7 @@ object GenSocketTopVerilog {
             s"ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"specLoadWakeup=${ShippingPlugins.specLoadWakeup(ipcThroughput)} " +
+            s"lsP3FastLoad=${ShippingCoreConfig.lsP3FastLoad} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
             s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
