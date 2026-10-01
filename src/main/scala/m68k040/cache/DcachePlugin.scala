@@ -346,6 +346,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val storeAllocArDelay: Int = m68k040.top.ShippingCoreConfig.dcacheStoreAllocArDelay,
                    /** Experimental earlier selection from a newly allocated WAIT_AR entry. */
                    val nbEagerAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEagerAr,
+                   /** Experimental direct selection of an eligible load allocation into ARQ. */
+                   val nbPreselectAr: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr,
                    /** Legacy-cache allocate-without-fill for a complete 16-byte COPYBACK store.
                      * Non-blocking mode implements this natively from its merge strobe. */
                    val fullLineNoFill: Boolean = m68k040.top.ShippingCoreConfig.dcacheFullLineNoFill,
@@ -363,6 +365,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
   require(!hotDoor || nonBlocking, "DcachePlugin: hotDoor requires nonBlocking")
   require(!nbEarlyResponse || nonBlocking, "DcachePlugin: nbEarlyResponse requires nonBlocking")
   require(!nbEagerAr || nonBlocking, "DcachePlugin: nbEagerAr requires nonBlocking")
+  require(!nbPreselectAr || nbEagerAr, "DcachePlugin: nbPreselectAr requires nbEagerAr")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
@@ -6048,15 +6051,32 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) &&
         (if (nbEagerAr) True else settled(k) && !blocked(k)) &&
         !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && arDelayOk(k)))
+      // This optional path selects a newly allocated LOAD into the same AR holding
+      // register. The normal WAIT_AR candidates keep priority. Preselection is one
+      // cycle earlier than their gate, so also account for WT writes still in S0
+      // or presented at the input; by the next cycle they can enter S1 and would
+      // be older than the already-advertised AR. Input VALID is conservative and
+      // avoids feeding storePort.ready back into the AR register's D cone.
+      val preselectWtTo = if (!nbPreselectAr) False else
+        (s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
+         lineOfPa(s0Payload.paddr) === lLine) ||
+        (storePort.valid && storePort.payload.cacheMode === CacheMode.WRITETHROUGH &&
+         lineOfPa(storePort.payload.paddr) === lLine)
+      val preselectLoad = if (!nbPreselectAr) False else
+        lAlloc && !coldWriteTo(lLine) && !wtPipeTo(lLine) && !preselectWtTo
       val arFire = Bool()
       when(arFire) { for (k <- 0 until N) when(arIdx === U(k, idxW bits)) { st(k) := ST(WAIT_R) } }
       when(!arV || arFire) {
         val oh = OHMasking.first(arCand.asBits)
-        arV := arCand.asBits.orR
+        arV := arCand.asBits.orR || preselectLoad
         when(arCand.asBits.orR) {
           arIdx  := OHToUInt(oh)
           arAddr := (MuxOH(oh, line) ## U(0, offBits bits)).asUInt
           for (k <- 0 until N) when(oh(k)) { st(k) := ST(ARQ) }
+        } elsewhen(preselectLoad) {
+          arIdx  := OHToUInt(lOH)
+          arAddr := (lLine ## U(0, offBits bits)).asUInt
+          for (k <- 0 until N) when(lOH(k)) { st(k) := ST(ARQ) }
         }
       }
       val rFire = Bool(); val rId = UInt(idxW bits); val rData = Bits(128 bits); val rErr = Bool()

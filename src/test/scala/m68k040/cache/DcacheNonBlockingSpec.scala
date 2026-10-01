@@ -46,7 +46,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   /** Built as `M68kSocketTop` builds the cache on the probe path
     * (`allowPretranslatedProbeHints = false`). */
   class Dut(val nb: Boolean, val dh: Boolean, val early: Boolean, val eagerAr: Boolean,
-            val storeDelay: Int) extends Component {
+            val preselectAr: Boolean, val storeDelay: Int) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
@@ -55,7 +55,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
                                    directRefillResponse = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
                                    allowPretranslatedProbeHints = false, hitUnderMissRead = false,
                                    nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = storeDelay,
-                                   nbEarlyResponse = nb && early, nbEagerAr = eagerAr)
+                                   nbEarlyResponse = nb && early, nbEagerAr = eagerAr,
+                                   nbPreselectAr = preselectAr)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     val resolve = new ProbeResolveDriver
@@ -64,12 +65,15 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
 
   private val earlyEnv = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse
   private val eagerEnv = sys.env.get("CPU_DCACHE_NB_EAGER_AR").contains("1")
-  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, storeDelay = 0))
-  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, storeDelay = 0))
-  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = earlyEnv, eagerAr = eagerEnv, storeDelay = 0))
-  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, storeDelay = 0))
-  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, storeDelay = 0))
-  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, storeDelay = 3))
+  private val preselectEnv = m68k040.top.ShippingCoreConfig.dcacheNbPreselectAr
+  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false, early = false, eagerAr = false, preselectAr = false, storeDelay = 0))
+  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, storeDelay = 0))
+  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = earlyEnv, eagerAr = eagerEnv, preselectAr = preselectEnv, storeDelay = 0))
+  private lazy val nbHotEagerDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, storeDelay = 0))
+  private lazy val nbHotPreselectDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, storeDelay = 0))
+  private lazy val nbHotLegacyArDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = false, preselectAr = false, storeDelay = 0))
+  private lazy val nbHotEagerStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = false, storeDelay = 3))
+  private lazy val nbHotPreselectStoreDelayDut = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true, early = false, eagerAr = true, preselectAr = true, storeDelay = 3))
 
   private val LINE = 16
 
@@ -516,12 +520,12 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def armOn(name: String): Boolean =
     sys.env.get("STRESS_ARMS").forall(_.split(",").map(_.trim).contains(name))
 
-  test("eager AR selects a clean new MSHR one cycle earlier without a CPU read-stage path", VerilatorTest) {
+  test("eager and preselected AR each remove one allocation-to-AR cycle", VerilatorTest) {
     if (armOn("eagerArTiming")) {
-      def measure(dut: SimCompiled[Dut], eager: Boolean): (Int, Int) = {
+      def measure(dut: SimCompiled[Dut], mode: String): (Int, Int) = {
         var allocGap = -1
         var cmdGap = -1
-        dut.doSim(s"eager-ar-$eager") { d =>
+        dut.doSim(s"ar-timing-$mode") { d =>
           val cd = d.clockDomain
           cd.forkStimulus(10)
           val lg = d.dcache.logic
@@ -552,7 +556,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
               cycle += 1
               if (cmdAccepted < 0 && lg.loadCmdPort.valid.toBoolean &&
                   lg.loadCmdPort.ready.toBoolean) cmdAccepted = cycle
-              if (allocated < 0 && lg.nb.st(0).toInt == 1) allocated = cycle
+              if (allocated < 0 && lg.nb.lAlloc.toBoolean) allocated = cycle
               if (advertised < 0 && lg.axiDh.ar.valid.toBoolean) {
                 advertised = cycle
                 assert(lg.axiDh.ar.payload.addr.toLong == x)
@@ -580,25 +584,29 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
           var n = 0
           while (response.isEmpty && n < 500) { cd.waitSampling(); n += 1 }
           assert(response.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("3c3c3c3c", 16)),
-            s"eager=$eager returned $response")
+            s"mode=$mode returned $response")
           assert(cmdAccepted >= 0 && allocated > cmdAccepted && advertised > allocated,
-            s"eager=$eager command=$cmdAccepted allocation=$allocated advertised=$advertised")
+            s"mode=$mode command=$cmdAccepted allocation=$allocated advertised=$advertised")
           allocGap = advertised - allocated
           cmdGap = advertised - cmdAccepted
-          println(s"[nbEagerAr] eager=$eager command-to-advertised-AR=$cmdGap " +
+          println(s"[nbArTiming] mode=$mode command-to-advertised-AR=$cmdGap " +
             s"allocation-to-advertised-AR=$allocGap cycles")
         }
         (allocGap, cmdGap)
       }
-      val off = measure(nbHotLegacyArDut, eager = false)
-      val on = measure(nbHotEagerDut, eager = true)
-      assert(off._1 == 2 && on._1 == 1 && off._2 == on._2 + 1,
-        s"unexpected command/allocation-to-AR timing OFF=$off ON=$on")
+      val off = measure(nbHotLegacyArDut, "legacy")
+      val eager = measure(nbHotEagerDut, "eager")
+      val preselected = measure(nbHotPreselectDut, "preselected")
+      assert(off._1 == 3 && eager._1 == 2 && preselected._1 == 1 &&
+          off._2 == eager._2 + 1 && eager._2 == preselected._2 + 1,
+        s"unexpected command/allocation-to-AR timing legacy=$off eager=$eager preselected=$preselected")
     }
   }
 
-  test("eager AR holds a same-line WT through S1 S2 S3 and delayed B", VerilatorTest) {
-    if (armOn("eagerArWtS3")) nbHotEagerDut.doSim("eager-ar-wt-s3") { dut =>
+  test("eager and preselected AR hold a same-line WT through the pipeline and delayed B", VerilatorTest) {
+    if (armOn("eagerArWtS3")) Seq(
+      ("eager", nbHotEagerDut), ("preselected", nbHotPreselectDut)).foreach { case (mode, compiled) =>
+      compiled.doSim(s"$mode-ar-wt-s3") { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       val lg = dut.dcache.logic
@@ -622,6 +630,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       val x = 0xa8000L
       for (b <- 0 until 16) cold.pokeByte(x + b, 0x11)
       var s3WhileWaitAr = 0
+      var s0AtAllocation = 0
       var firstWaitAr = -1
       var s1OnFirstWaitAr = 0
       var s2WhileWaitAr = 0
@@ -631,16 +640,21 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       var hotAr = 0
       var response: Option[BigInt] = None
       var traceCycle = 0
+      def waitingForLine: Boolean = (0 until 4).exists { k =>
+        lg.nb.st(k).toInt == 1 && lg.nb.line(k).toLong == (x >>> 4)
+      }
       fork {
         while (true) {
           cd.waitSampling()
           traceCycle += 1
-          if (firstWaitAr < 0 && lg.nb.st(0).toInt == 1) firstWaitAr = traceCycle
+          if (lg.nb.lAlloc.toBoolean && lg.s0Valid.toBoolean) s0AtAllocation += 1
+          val lineWaiting = waitingForLine
+          if (firstWaitAr < 0 && lineWaiting) firstWaitAr = traceCycle
           // This isolated DUT receives exactly one store, the same-line WT below.
           // Its stage payload fields are optimized out of the Verilator model.
           if (traceCycle == firstWaitAr && lg.stS1Valid.toBoolean) s1OnFirstWaitAr += 1
-          if (lg.nb.st(0).toInt == 1 && lg.stS2Valid.toBoolean) s2WhileWaitAr += 1
-          if (lg.stS3Valid.toBoolean && lg.nb.st(0).toInt == 1) {
+          if (lineWaiting && lg.stS2Valid.toBoolean) s2WhileWaitAr += 1
+          if (lg.stS3Valid.toBoolean && lineWaiting) {
             s3WhileWaitAr += 1
           }
           if (wtB == 0 && lg.axiDh.ar.valid.toBoolean) arAdvertisedBeforeB += 1
@@ -653,10 +667,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
           if (pl.loadRspOut.valid.toBoolean) response = Some(pl.loadRspOut.payload.data.toBigInt)
         }
       }
-      // A WT accepted one edge before the load is in S1 on the load's first
-      // WAIT_AR selection cycle. The cache holds it through S2 and S3; the
-      // current S3 predicate then gates AR until the delayed cold B arrives.
-      pl.storeIn.valid #= true
+      // The WT precedes the load. It is already in the pipeline when the
+      // load allocates, so both selection modes must wait for its delayed B.
       pl.storeIn.payload.paddr #= x
       pl.storeIn.payload.data #= 0
       pl.storeIn.payload.size #= Size.LONG
@@ -665,10 +677,6 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.storeIn.payload.lineData #= BigInt("66" * 16, 16)
       pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       pl.storeIn.payload.precise #= false
-      assert(pl.storeIn.ready.toBoolean, "WT store input was not ready")
-      cd.waitSampling()
-      pl.storeIn.valid #= false
-      pl.loadCmdIn.valid #= true
       pl.loadCmdIn.payload.vaddr #= x
       pl.loadCmdIn.payload.paddr #= x
       pl.loadCmdIn.payload.size #= Size.LONG
@@ -678,25 +686,45 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       pl.loadCmdIn.payload.ooOk #= true
       pl.loadCmdIn.payload.rid #= 0
       pl.loadCmdIn.payload.ridValid #= true
-      assert(pl.loadCmdIn.ready.toBoolean, "load input was not ready behind WT")
-      cd.waitSampling()
-      pl.loadCmdIn.valid #= false
+      def acceptStore(): Unit = {
+        pl.storeIn.valid #= true
+        assert(pl.storeIn.ready.toBoolean, "WT store input was not ready")
+        cd.waitSampling()
+        pl.storeIn.valid #= false
+      }
+      def acceptLoad(): Unit = {
+        pl.loadCmdIn.valid #= true
+        assert(pl.loadCmdIn.ready.toBoolean, "load input was not ready")
+        cd.waitSampling()
+        pl.loadCmdIn.valid #= false
+      }
+      acceptStore()
+      acceptLoad()
       var n = 0
       while (response.isEmpty && n < 1000) { cd.waitSampling(); n += 1 }
+      println(s"[nbArWtTrace] mode=$mode allocS0=$s0AtAllocation firstWait=$firstWaitAr " +
+        s"s1=$s1OnFirstWaitAr s2=$s2WhileWaitAr s3=$s3WhileWaitAr " +
+        s"wtB=$wtB validBeforeB=$arAdvertisedBeforeB fireBeforeB=$arBeforeB " +
+        s"hotAr=$hotAr response=$response")
       assert(s1OnFirstWaitAr > 0 && s2WhileWaitAr > 0 && s3WhileWaitAr > 0,
-        s"WT did not cross all eager gates: firstS1=$s1OnFirstWaitAr " +
+        s"$mode WT did not cross all AR gates: firstS1=$s1OnFirstWaitAr " +
         s"S2=$s2WhileWaitAr S3=$s3WhileWaitAr")
       assert(wtB == 1 && arBeforeB == 0 && arAdvertisedBeforeB == 0 && hotAr == 1,
-        s"eager AR crossed WT delayed B: wtB=$wtB fireBeforeB=$arBeforeB " +
+        s"$mode AR crossed WT delayed B: wtB=$wtB fireBeforeB=$arBeforeB " +
         s"validBeforeB=$arAdvertisedBeforeB hotAr=$hotAr")
       assert(response.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("66666666", 16)),
-        s"eager refill saw stale memory before WT B: $response")
-      println("[nbEagerAr] WT S1/S2/S3 gated AR from first WAIT_AR; delayed B preceded checked refill")
+        s"$mode refill saw stale memory before WT B: $response")
+      println(s"[nbArTiming] mode=$mode WT S0-at-allocation=$s0AtAllocation, " +
+        "S1/S2/S3 gated AR; delayed B preceded checked refill")
+      }
     }
   }
 
-  test("eager AR retains store allocation delay and full-line no-fill cancellation", VerilatorTest) {
-    if (armOn("eagerArStoreDelay")) nbHotEagerStoreDelayDut.doSim("eager-ar-store-delay") { dut =>
+  test("eager and preselected AR retain store delay and full-line no-fill", VerilatorTest) {
+    if (armOn("eagerArStoreDelay")) Seq(
+      ("eager", nbHotEagerStoreDelayDut),
+      ("preselected", nbHotPreselectStoreDelayDut)).foreach { case (mode, compiled) =>
+      compiled.doSim(s"$mode-ar-store-delay") { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       val lg = dut.dcache.logic
@@ -784,12 +812,16 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       until("load response") { rsp.nonEmpty }
       assert(rsp.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("77222222", 16)),
         s"partial store returned wrong merged bytes: $rsp")
-      println(s"[nbEagerAr] storeDelay=3 noFillAR=$fullAr partialAR=$partialArAt checked=${rsp.get.toString(16)}")
+      println(s"[nbArTiming] mode=$mode storeDelay=3 noFillAR=$fullAr " +
+        s"partialAR=$partialArAt checked=${rsp.get.toString(16)}")
+      }
     }
   }
 
-  test("eager AR handles adjacent dirty store and load victim writebacks", VerilatorTest) {
-    if (armOn("eagerArAdjacentWb")) nbHotEagerDut.doSim("eager-ar-adjacent-wb") { dut =>
+  test("eager and preselected AR handle adjacent dirty store and load victim writebacks", VerilatorTest) {
+    if (armOn("eagerArAdjacentWb")) Seq(
+      ("eager", nbHotEagerDut), ("preselected", nbHotPreselectDut)).foreach { case (mode, compiled) =>
+      compiled.doSim(s"$mode-ar-adjacent-wb") { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       val lg = dut.dcache.logic
@@ -897,7 +929,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         val wbBefore = lg.nb.ctrMap("wbPushes").toLong
         pairEvents.clear()
         watchPair = true
-        println(s"[nbEagerAr dual] offset=$offset start ack=$beforeAck dual=${lg.nb.ctrMap("dualWbPush").toLong}")
+        println(s"[nbArWb $mode] offset=$offset start ack=$beforeAck dual=${lg.nb.ctrMap("dualWbPush").toLong}")
         if (offset <= 0) {
           driveLoad(loadAddr, token)
           cd.waitSampling(-offset)
@@ -924,7 +956,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         val lAt = pairEvents.find(_.endsWith(":L")).get.split(":")(0).toInt
         if (sAt < lAt) storeFirst += 1 else if (lAt < sAt) loadFirst += 1
         minPushGap = scala.math.min(minPushGap, scala.math.abs(sAt - lAt))
-        println(s"[nbEagerAr dual] offset=$offset complete ack=$ackCount " +
+        println(s"[nbArWb $mode] offset=$offset complete ack=$ackCount " +
           s"wbPushes=$wbDelta " +
           s"events=${pairEvents.mkString(",")} dual=${lg.nb.ctrMap("dualWbPush").toLong}")
       }
@@ -932,8 +964,9 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       assert(storeFirst > 0 && loadFirst > 0 && minPushGap == 1,
         s"phase sweep missed adjacent dirty victims: storeFirst=$storeFirst " +
         s"loadFirst=$loadFirst minGap=$minPushGap")
-      println(s"[nbEagerAr] adjacent dirty store/load WB pushes checked: " +
+      println(s"[nbArWb $mode] adjacent dirty store/load WB pushes checked: " +
         s"storeFirst=$storeFirst loadFirst=$loadFirst minGap=$minPushGap dual=$dual")
+      }
     }
   }
 
@@ -1498,7 +1531,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def singleMissPostR(early: Boolean): Int = {
     var postR = -1
     M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = early,
-      eagerAr = false, storeDelay = 0)).doSim { dut =>
+      eagerAr = false, preselectAr = false, storeDelay = 0)).doSim { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(period = 10)
       val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
