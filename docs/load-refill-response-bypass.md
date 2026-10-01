@@ -21,6 +21,12 @@ shipping default until directed fault/collision/replay checks, lockstep, and a
 matched timing result pass. `BoardMembenchSimSpec` can compare it with
 `MB_DIRECT_REFILL=0` and `MB_DIRECT_REFILL=1` under the same memory model.
 
+The directed D-cache simulation now covers successful and DECERR refills racing
+a younger resident hit. It checks that the shared response port stalls AXI R,
+that the held beat stays stable, and that each token responds exactly once with
+the correct data or fault. The `test-fast` gate and full-core lockstep/timing
+gates remain separate.
+
 In the calibrated core-only `l2:6:33:4096` chase (2 KiB L1-resident and 64 KiB
 L1-missing rings, three laps), baseline is 9.000/21.009 cycles per hop. Existing
 fill-forward is 9.000/19.012. Direct refill is 9.000/18.024, with or without
