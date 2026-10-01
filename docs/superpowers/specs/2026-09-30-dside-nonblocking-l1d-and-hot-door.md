@@ -225,6 +225,29 @@ return stale backing-memory bytes `0x50515253` instead of the merged
 the staged-set guard passed the earlier clean-line collision test, so no
 separate necessity is claimed for that guard.
 
+Integration checkpoint `113d0d43` passed default `test-fast` (404 tests),
+precise-store/payload-ownership checks (7 + 3 tests), and the full NB cache
+suite (18 tests). The cache gate enabled dynamic release, preselected/eager
+AR, early response, P3 fast load, probe forwarding and direct refill together,
+with NB4/ring8/hot door and seeds 1–4 at 1000 operations per stress arm.
+Exact source, counts and logs are in `/tmp/codex-agent59-dynamic-results.json`;
+runner `/tmp/codex-agent59-dynamic-integrated-gates.py`. This also integrates
+the separately specified original-VA split-store fault fix. Dynamic release
+remains default OFF; these gates do not establish mapped area or routed timing.
+
+A follow-up seed-17 test-only cross-tab retained the exact 10,760-cycle,
+8,224-byte result (`/tmp/codex-nb-hol-cross-tab-seed17.log`). Of 891 full-ring
+cycles waiting for the head response with a younger response already parked,
+850 included a younger load already written back/woken. All 108 such cycles
+with a younger completed load still needing writeback had an early-writeback
+fire. These sets overlap; their counts must not be added. Only 102 of the
+891 cycles had any IQ-ready load, and 210 coincided with full-MSHR rejection.
+The existing `alignedEarlyWb` path therefore already overlaps younger result
+use with the older miss. This does not justify another completion mechanism
+or larger ring; recovering ring credits early is a separate ownership and
+area question. The temporary cross-tab instrumentation was reverted after
+measurement, and is not part of the integration source above.
+
 **Every state field has exactly one owner and one writer site per transition.** No flag is set
 in one state and cleared in another (the `evictAxiPairOpen` one-way latch lesson). A
 simulation-only liveness monitor fails the run if any entry sits outside FREE for more than
