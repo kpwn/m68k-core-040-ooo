@@ -809,6 +809,33 @@ guard, not a verdict.
 
 ---
 
+## 14.1. Optional registered clean-refill response shortcut
+
+`CPU_DCACHE_NB_EARLY_RESPONSE=1` (default OFF) may populate the existing
+registered response slot on the cycle that a clean AXI R beat is accepted.
+It is restricted to a single waiter for that MSHR, no store-byte overlay,
+an OKAY R response, and an empty response slot. The response data, token,
+RID, offset and size all enter the existing response registers; no AXI R
+payload drives `loadRsp` combinationally. The selected waiter is cleared
+exactly once. The MSHR still captures the R beat and transitions to FILLED
+for normal install, so refills without an eligible waiter retain their
+original behavior. A fault, merged store, multiple waiters, occupied slot,
+or simultaneous higher-priority response uses the ordinary FILLED→response
+slot path. Resident-hit response arbitration retains priority at `loadRsp`.
+OFF must elaborate the unchanged response logic. Directed checks must cover
+exactly-once tokens under resident-hit and refill collisions, fault and
+store-overlay fallback, and held response-slot behavior.
+
+The focused one-beat cache test measures accepted AXI R→`loadRsp` as two
+cycles with this option OFF and one cycle ON. In the matched NB4 full-core
+dependent chase (`MB_LS_OOO=1`, L2 model hit=6, DDR=33, 5 laps), the 2 KB
+L1 case remains 9.000 cycles/hop and the 64 KB L2 case changes from 22.997
+to 21.983 cycles/hop. Thus the L2-over-L1 gap remains 12.983 cycles, above
+the requested six-cycle goal. Four-seed cache-only stress over reordered
+cold and chaotic hot response modes found no cycle-count regression and
+covered faulting loads, store merges, secondaries and replay. This is a
+simulation result, not a post-route timing or whole-SoC latency claim.
+
 ## 15. Coordination owed (through the PM)
 
 - **Write-path agent:** confirm §7.1 (counted in-order `DStoreAck`) and §7.4 (noFill native, the

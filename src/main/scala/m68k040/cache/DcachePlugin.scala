@@ -350,13 +350,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** Test-only: deliberately skip a fill for a partial store. */
                    val noFillMutation: Int = 0,
                    /** Experimental one-beat response bypass for the legacy refill path. */
-                   val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse)
+                   val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
+                   val nbEarlyResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
   require(!(fullLineNoFill && nonBlocking),
     "fullLineNoFill is native to nonBlocking; do not enable the legacy hook")
   require(!hotDoor || nonBlocking, "DcachePlugin: hotDoor requires nonBlocking")
+  require(!nbEarlyResponse || nonBlocking, "DcachePlugin: nbEarlyResponse requires nonBlocking")
   require(!nonBlocking || !sectored, "DcachePlugin: nonBlocking is designed for 16-byte lines; sectoring must be OFF")
   require(!nonBlocking || !hitUnderMissRead,
     "DcachePlugin: nonBlocking subsumes hitUnderMissRead (a cacheable miss never blocks the pipe)")
@@ -6080,6 +6082,32 @@ class DcachePlugin(val socketMerged: Boolean = false,
           missRid      := MuxOH(oh, wrid)
           missRidV     := MuxOH(oh, wridv)
           rFlt         := MuxOH(UIntToOh(m, N), fault)
+          for (w <- 0 until NW) when(oh(w)) { wv(w) := False }
+        }
+      }
+      if (nbEarlyResponse) {
+        // A clean, sole waiter can occupy the SAME registered response slot on
+        // R acceptance. No AXI data is exposed combinationally at loadRspPort.
+        // Older FILLED waiters and resident hits keep their response priority.
+        val fastWait = Vec((0 until NW).map(w => wv(w) && wm(w) === rId))
+        val fastMshr = Vec((0 until N).map(k => rId === U(k, idxW bits) &&
+          st(k) === ST(WAIT_R) && mstrb(k) === B(0, 16 bits) &&
+          !(sDo && sCam(k)) && !(s3WtMiss && s3Cam(k))))
+        val fastFire = rFire && !rErr && !rV && !ldS2Resp &&
+          !wCand.asBits.orR && CountOne(fastWait.asBits) === U(1) &&
+          fastMshr.asBits.orR && !(lAddW && lTarget === rId)
+        fastFire.simPublic()
+        when(fastFire) {
+          val oh = fastWait.asBits
+          missLine     := rData
+          missOff      := MuxOH(oh, woff)
+          missSize     := MuxOH(oh, wsize)
+          missLineOnly := MuxOH(oh, wlo)
+          missToken    := MuxOH(oh, wtok)
+          missRid      := MuxOH(oh, wrid)
+          missRidV     := MuxOH(oh, wridv)
+          rFlt         := False
+          rV           := True
           for (w <- 0 until NW) when(oh(w)) { wv(w) := False }
         }
       }

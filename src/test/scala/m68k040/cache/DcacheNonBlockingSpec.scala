@@ -45,7 +45,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
 
   /** Built as `M68kSocketTop` builds the cache on the probe path
     * (`allowPretranslatedProbeHints = false`). */
-  class Dut(val nb: Boolean, val dh: Boolean) extends Component {
+  class Dut(val nb: Boolean, val dh: Boolean, val early: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param   = new ParamPlugin(M68kParams())
@@ -53,16 +53,20 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     val dcache  = new DcachePlugin(sectored = false, fillForward = false,
                                    directRefillResponse = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
                                    allowPretranslatedProbeHints = false, hitUnderMissRead = false,
-                                   nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = 0)
+                                   nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = 0,
+                                   nbEarlyResponse = nb && early)
     val probe   = new DcacheProbePlugin
     val mmuCtrl = new MmuControlPlugin
     val resolve = new ProbeResolveDriver
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl, resolve)) }
   }
 
-  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(nb = false, dh = false))
-  private lazy val nbColdDut  = M68kSim().withVerilator.compile(new Dut(nb = true, dh = false))
-  private lazy val nbHotDut   = M68kSim().withVerilator.compile(new Dut(nb = true, dh = true))
+  private lazy val controlDut = M68kSim().withVerilator.compile(new Dut(
+    nb = false, dh = false, early = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse))
+  private lazy val nbColdDut = M68kSim().withVerilator.compile(new Dut(
+    nb = true, dh = false, early = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse))
+  private lazy val nbHotDut = M68kSim().withVerilator.compile(new Dut(
+    nb = true, dh = true, early = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse))
 
   private val LINE = 16
 
@@ -983,6 +987,67 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         "hot refill did not see the dirty line after B made it visible")
       println("[nbWB] delayed-visibility same-line AR gate CLEAN")
     }
+  }
+
+  private def singleMissPostR(early: Boolean): Int = {
+    var postR = -1
+    M68kSim().withVerilator.compile(new Dut(nb = true, dh = false, early = early)).doSim { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(period = 10)
+      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 6, dramCycles = 30)))
+      val pl = dut.probe.logic
+      val lg = dut.dcache.logic
+      val addr = 0x00009B00L
+      for (i <- 0 until 16) mem.pokeByte(addr + i, (0x31 + i) & 0xff)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= addr
+      pl.loadCmdIn.payload.paddr #= addr
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.loadCmdIn.payload.token #= 3
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= true
+      pl.loadCmdIn.payload.lineOnly #= false
+      pl.loadCmdIn.payload.ooOk #= true
+      cd.waitSamplingWhere(pl.loadCmdIn.ready.toBoolean)
+      pl.loadCmdIn.valid #= false
+      var n = 0; var rAt = -1; var rspAt = -1; var rspCount = 0
+      while (n < 200 && rspAt < 0) {
+        if (lg.axi.r.valid.toBoolean && lg.axi.r.ready.toBoolean) rAt = n
+        if (pl.loadRspOut.valid.toBoolean) {
+          rspAt = n; rspCount += 1
+          assert(pl.loadRspOut.payload.token.toInt == 3)
+          assert(!pl.loadRspOut.payload.fault.toBoolean)
+          assert(pl.loadRspOut.payload.data.toBigInt == BigInt("31323334", 16))
+        }
+        cd.waitSampling(); n += 1
+      }
+      for (_ <- 0 until 8) {
+        cd.waitSampling()
+        if (pl.loadRspOut.valid.toBoolean) rspCount += 1
+      }
+      assert(rAt >= 0 && rspAt >= 0, s"early=$early missed R or response: R=$rAt response=$rspAt")
+      assert(rspCount == 1, s"early=$early duplicate response")
+      postR = rspAt - rAt
+    }
+    postR
+  }
+
+  test("registered NB clean-refill shortcut saves one post-R cycle", VerilatorTest) {
+    val off = singleMissPostR(early = false)
+    val on = singleMissPostR(early = true)
+    println(s"[nbEarlyResponse] accepted R -> loadRsp: OFF=$off ON=$on cycles")
+    assert(off == 2 && on == 1, s"registered response-slot shortcut changed: OFF=$off ON=$on")
   }
 
   test("HARNESS CONTROL: the stress is clean on the legacy blocking cache", VerilatorTest) {

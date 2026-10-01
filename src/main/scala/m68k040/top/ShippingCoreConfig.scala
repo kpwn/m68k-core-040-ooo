@@ -483,6 +483,8 @@ object ShippingCoreConfig {
     * INHIBITED accesses keep the legacy FSM. REQUIRES `inhibitedFullBarrier` (D4).
     * OFF pending measurement; `CPU_DCACHE_NONBLOCKING=1`; echoed in `SHIPPING_CONFIG`. */
   val dcacheNonBlocking: Boolean = envFlag("CPU_DCACHE_NONBLOCKING", false)
+  /** Registered response-slot shortcut for an uncontended clean NB refill. */
+  val dcacheNbEarlyResponse: Boolean = envFlag("CPU_DCACHE_NB_EARLY_RESPONSE", false)
   /** MSHR count for `dcacheNonBlocking` (2..4: the hot door has 2 ID bits). */
   val dcacheMshrs: Int = envInt("CPU_DCACHE_MSHRS", 4, 2, 4)
   /** LS aligned-load descriptor ring. Keep 4 as the shipping default; 8/16 are
@@ -498,6 +500,8 @@ object ShippingCoreConfig {
     * complete the 16 strobes and cancel the fill (write-path agent's hook). 0 = off. */
   val dcacheStoreAllocArDelay: Int = envInt("CPU_DCACHE_STORE_AR_DELAY", 0, 0, 15)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
+  require(!dcacheNbEarlyResponse || dcacheNonBlocking,
+    "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNonBlocking || inhibitedFullBarrier,
     "CPU_DCACHE_NONBLOCKING=1 requires CPU_INHIBITED_FULL_BARRIER=1 (D4 is the hard prerequisite)")
   require(!(dcacheNonBlocking && dcacheFullLineNoFill),

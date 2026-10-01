@@ -133,10 +133,12 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
     val arms = sys.env.getOrElse("MB_FF", "0").split(',').map(_.trim == "1").toSeq
     val specWake = sys.env.get("MB_SPEC_WAKE").contains("1")
     val directRefill = sys.env.get("MB_DIRECT_REFILL").contains("1")
+    val lsOoo = sys.env.get("MB_LS_OOO").contains("1")
     for (ff <- arms) {
       val dut = M68kSim().withVerilator.compile(new FullCoreDut(
         alignedLoadFallThrough = true, earlyLsIntWakeup = true,
         specLoadWakeup = specWake,
+        loadBypassUnreadyLoad = lsOoo,
         earlyStoreAddress = true, trainSlot1Conditional = true,
         deferTakenSlot1Conditional = true, retainRedirectHistory = true,
         dcacheFillForward = ff,
@@ -145,7 +147,7 @@ class BoardMembenchSimSpec extends CoreBenchHarness {
         computeDirectTargets = ShippingCoreConfig.computeDirectTargets,
         deferSlot1Uncond = ShippingCoreConfig.deferSlot1Uncond,
         deferSlot1Dbcc = ShippingCoreConfig.deferSlot1Dbcc))
-      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+      println(s"MB_SIM_CONFIG fillForward=$ff directRefill=$directRefill lsOoo=$lsOoo nbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} specLoadWakeup=$specWake rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
               s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets}")
       for ((mem, sizes, kinds) <- plan; sz <- sizes; kd <- kinds) {
         memCfgOverride = mem.map(parseMemSpec)

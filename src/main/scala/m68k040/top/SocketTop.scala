@@ -740,6 +740,7 @@ object GenSocketTopVerilog {
             s"inhibitedFullBarrier=${ShippingCoreConfig.inhibitedFullBarrier} " +
             // Non-blocking L1D + P6 hot door (constructor DEFAULTS, same precedent).
             s"dcacheNonBlocking=${ShippingCoreConfig.dcacheNonBlocking} " +
+            s"dcacheNbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} " +
             s"dcacheMshrs=${ShippingCoreConfig.dcacheMshrs} " +
             s"lsLoadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} " +
             s"dcacheHotDoor=${ShippingCoreConfig.dcacheHotDoor} " +
