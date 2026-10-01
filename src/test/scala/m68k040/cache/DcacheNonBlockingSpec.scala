@@ -51,6 +51,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     val param   = new ParamPlugin(M68kParams())
     val xlate   = new DIdentityTranslationPlugin
     val dcache  = new DcachePlugin(sectored = false, fillForward = false,
+                                   directRefillResponse = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
                                    allowPretranslatedProbeHints = false, hitUnderMissRead = false,
                                    nonBlocking = nb, nMshr = 4, hotDoor = dh, storeAllocArDelay = 0)
     val probe   = new DcacheProbePlugin

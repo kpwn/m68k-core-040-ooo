@@ -2,6 +2,7 @@ package m68k040.fuzz
 
 import m68k040.VerilatorTest
 import org.scalatest.funsuite.AnyFunSuite
+import spinal.core.sim._
 
 /** LIVENESS reproducers for out-of-order LS issue (`FUZZ_LS_OOO=1`).
   *
@@ -21,8 +22,8 @@ import org.scalatest.funsuite.AnyFunSuite
   *   B  STORE bypass -> SQ capacity. Nine cacheable stores pass an older unready load and
   *      fill the 8-entry SQ; none can commit before that load retires; the ninth waits in
   *      P3 for SQ space with the load behind it.
-  *   C  PARK OVERFLOW. Five inhibited loads pass an older unready load: four park, the
-  *      fifth waits in P4 for the ROB head with the load behind it.
+  *   C  PARK OVERFLOW. More inhibited loads than configured park slots pass an older load: the
+  *      next load waits in P4 for the ROB head with the older load behind it.
   *   D  SPLIT inhibited bypasser. A line-crossing device long is never parked (it needs two
   *      adjacent slots), so it waits in P4 for the head with the older load behind it.
   *   E  STORE bypass -> late store data (SHIPPING LSU: `earlyStoreAddress`). A store's
@@ -72,11 +73,24 @@ class LsOooLivenessSpec extends AnyFunSuite {
       |    movea.l %d5, %a1
       |""".stripMargin
 
-  private def run(name: String, body: String): Unit = {
+  private def run(name: String, body: String, requireParkOverflow: Boolean = false): Unit = {
+    var actualLsOoo = false
+    var sawFullPark = false
     val src = prologue + body + passTail
     val outcome = PortedTestRunner.run(name, src, Timeout,
-      cachePosture = CachePosture.ForceCacheableCopyback, liveness = true)
+      cachePosture = CachePosture.ForceCacheableCopyback, liveness = true,
+      onDut = d => {
+        actualLsOoo = d.lsEu.lsOooIssue
+        if (requireParkOverflow && actualLsOoo) d.clockDomain.onSamplings {
+          if (!d.lsEu.logic.parkHasFree.toBoolean) sawFullPark = true
+        }
+      })
     val mon = PortedTestRunner.lastLiveness
+    if (requireParkOverflow && actualLsOoo) {
+      assert(sawFullPark, "VACUOUS: inhibited park never filled")
+      assert(mon.replays > 0 && mon.replayRedirects > 0,
+        s"VACUOUS: park-overflow workload never requested and completed replay: ${mon.summary}")
+    }
     info(mon.summary)
     println(s"[ls-ooo-liveness] $name FUZZ_LS_OOO=$lsOoo outcome=$outcome ${mon.summary}")
     assert(outcome == PortedPass,
@@ -110,18 +124,16 @@ class LsOooLivenessSpec extends AnyFunSuite {
         |""".stripMargin)
   }
 
-  test("LS-OoO liveness C: five inhibited loads pass an unready load (park overflow)",
+  test("LS-OoO liveness C: inhibited loads overflow the configured park behind an unready load",
        VerilatorTest) {
+    val parkDepth = m68k040.top.ShippingCoreConfig.lsLoadRingDepth
+    val targets = Seq(2, 3, 4, 6)
+    val deviceLoads = (0 until parkDepth + 2).map { i =>
+      s"    move.l  ${4 * i}(%a0), %d${targets(i % targets.size)}\n"
+    }.mkString
     run("lsooo_live_c_park_full", "_lc:\n" + slowA1 +
-      """    move.l  (%a1), %d1
-        |    move.l  (%a0), %d2
-        |    move.l  4(%a0), %d3
-        |    move.l  8(%a0), %d4
-        |    move.l  12(%a0), %d6
-        |    move.l  16(%a0), %d2
-        |    move.l  20(%a0), %d3
-        |    dbf     %d7, _lc
-        |""".stripMargin)
+      "    move.l  (%a1), %d1\n" + deviceLoads + "    dbf %d7, _lc\n",
+      requireParkOverflow = true)
   }
 
   test("LS-OoO liveness D: a line-crossing inhibited long passes an unready load",
