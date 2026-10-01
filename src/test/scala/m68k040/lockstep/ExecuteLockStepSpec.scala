@@ -1312,7 +1312,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                      // exception unit's stacked PC, then ask Musashi to inject at
                      // that boundary. No state/value/frame comparison is relaxed.
                      allowedAcceptedIrqPcs: Set[Long] = Set.empty,
-                     maxCycles: Int = 6000): Unit = {
+                     maxCycles: Int = 6000,
+                     simSeed: Option[Int] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val ackVector = if (avec) None else Some(vectorIn)
     require(allowedAcceptedIrqPcs.isEmpty || (irqEvents.size == 1 && irqEvents.head._2 != 7 && oracleIrqEvents.isEmpty))
@@ -1367,7 +1368,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       triggerPc -> l
     }.toMap
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    val runSimulation: FullCoreDut => Unit = { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       var wbCount = 0; var commitCount = 0
@@ -1546,6 +1547,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                 msp = dut.rob.logic.exc.ss.msp.toLong & 0xffffffffL,
                 isp = dut.rob.logic.exc.ss.isp.toLong & 0xffffffffL)
             } else {
+              if (simSeed.isDefined && sys.env.contains("ODD_SSP_TRACE_ACCEPT")) {
+                val priorPc = handle.result.lastOption.map(_.pc & 0xffffffffL).getOrElse(0L)
+                println(f"[$name] IRQ_ACCEPT seed=${simSeed.get} priorPc=0x$priorPc%08x entryPc=0x${c.pc.toLong & 0xffffffffL}%08x commits=$commitCount")
+              }
               if (allowedAcceptedIrqPcs.nonEmpty) {
                 assert(firedEvents.size == 1 && acceptedIrqPcs.isEmpty,
                   "wide IRQ fixture must raise and accept exactly one interrupt")
@@ -1674,6 +1679,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         }
         assert(bad.isEmpty, s"[$name] memory mismatch after the interrupted run (${bad.size} bytes):\n    " + bad.mkString("\n    "))
       }
+    }
+    // Preserve the existing simulator-seed behavior for every other IRQ test.
+    // The odd-SSP oracle retries pass one fixed seed so each candidate compares
+    // the same DUT execution rather than a newly randomized acceptance schedule.
+    simSeed match {
+      case Some(seed) => compiledDut.doSim(freshSimName("case"), seed = seed)(runSimulation)
+      case None       => compiledDut.doSim(freshSimName("case"))(runSimulation)
     }
   }
 
@@ -13280,7 +13292,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
                          // Use the requested raw commit PC for every candidate.
                          advanceNmiTrigger = false,
                          checkMem = (fbJ - 4 until fbJ + 8) ++ locals, checkSpan = 1,
-                         dcfg = dcfg, cacr = cacr, a7ProbeLag = true, maxCycles = 60000)
+                         dcfg = dcfg, cacr = cacr, a7ProbeLag = true, maxCycles = 60000,
+                         simSeed = Some(sys.env.get("ODD_SSP_SIM_SEED").map(_.toInt).getOrElse(0x0dd55000 + i)))
           matchedAt = j
         } catch {
           case e: org.scalatest.exceptions.TestFailedException =>
