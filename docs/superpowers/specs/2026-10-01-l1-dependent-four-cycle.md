@@ -15,9 +15,12 @@ separately.
 
 The isolated agent72 P1 matched branch measured 644 cycles for 128 steady
 2 KiB chase hops, or 5.031 cycles per dependent issue. The integrated
-agent59 P1 × probe-miss matrix is pending; 5.031 is a source-based starting
-point, not yet a measurement of that combined integration. The relevant
-current path is:
+`97b0ba49` P1 × probe-miss matrix subsequently reproduced 644/128 with P1
+enabled, both with and without the probe-miss stage. Its four arms passed
+under the same `l2:5:60:4096` model and seed 17; results are recorded in
+`/tmp/codex-agent59-combined-r2-matrix-results.json` and the non-blocking
+design spec's integrated latency section. This remains simulation evidence,
+not physical timing signoff. The relevant current path is:
 
 | Cycle relative to producer issue | Existing event |
 | --- | --- |

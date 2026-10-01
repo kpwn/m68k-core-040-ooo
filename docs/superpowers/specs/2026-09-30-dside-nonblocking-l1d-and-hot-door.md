@@ -1755,3 +1755,26 @@ and zero failures. These establish combined correctness, not Dn performance
 under the new miss-stage configuration. Results:
 `/tmp/codex-agent68-dn-integrated-results.json` and
 `/tmp/codex-agent68-dn-integrated-core-results.json`.
+
+### Early-load throughput coverage limitation (2026-10-02)
+
+A matched P1 OFF/ON comparison at `63171ff6` passed both DsideBandwidthSpec
+arms with the probe-miss stage fixed ON, seed 17, `l2:5:60:4096`, NB4/ring8,
+and the same other options as the dependent matrix. Results were identical:
+
+| Kernel | Measured bytes | Cycles in each arm | Bytes/cycle |
+| --- | ---: | ---: | ---: |
+| stream-16k | 16384 | 13355 | 1.2268 |
+| chase-chains-4-1024-skew0 | 8224 | 10335 | 0.7957 |
+| chase-chains-8-1024-skew0 | 8224 | 10689 | 0.7694 |
+
+This is a scope control, not evidence that early launch cannot help eligible
+independent loads. `kChaseChains` uses `move.l (%a0,%dN.l),%dN`, with a second
+address source excluded by P1. `kStream` uses `add.l (%a0)+,%dN`, whose
+auto-update and multi-uop form also fall outside P1's simple fused-load
+contract. Keep those workloads because they expose real coverage gaps; add
+simple-An independent chains with an accepted-P1 nonvacuity check before
+making a throughput claim about this optimization. The four/eight-chain
+comparison also changes loop overhead per load, so it is not a pure queue
+capacity experiment. Exact flags, retirement counts, checked results and
+logs: `/tmp/codex-agent68-dn-throughput-results.json`.
