@@ -3,14 +3,20 @@
 Status: **specification only; default OFF**. This amends the optional L1
 latency work described in the D-side non-blocking design spec. No RTL, test,
 or scheduling change is authorized by this document alone. The experiment
-targets a simple, aligned, cacheable longword `MOVEA.L (An),An` dependent
-chain. Other instructions retain the existing path unless their safety is
-proved separately.
+targets a chain whose producer is a simple, aligned, cacheable longword load
+and whose consumer is a fused, first-and-last `MOVEA.L (An),An` with one
+address-base source (`psrcA`) and no index, `psrcC`, or store-data source.
+The consumer's own effective-address cacheability is not known at IQ select;
+it must still pass through ordinary AGU, translation, and memory barriers.
+Other instructions retain the existing path unless their safety is proved
+separately.
 
 ## Measured starting point and cycle contract
 
-The integrated P1/P3/probe-forward configuration measures 644 cycles for 128
-steady 2 KiB chase hops, or 5.031 cycles per dependent issue. The relevant
+The isolated agent72 P1 matched branch measured 644 cycles for 128 steady
+2 KiB chase hops, or 5.031 cycles per dependent issue. The integrated
+agent59 P1 × probe-miss matrix is pending; 5.031 is a source-based starting
+point, not yet a measurement of that combined integration. The relevant
 current path is:
 
 | Cycle relative to producer issue | Existing event |
@@ -67,25 +73,26 @@ The first experiment has two separately gated parts:
    writeback, privilege debt, or split merge, and an actual integer `pdst`
    wakeup. The same result value that `captureCompletionDesc` writes into
    `compData` must be available through a local LS operand bypass to its
-   T4 `rdBase` and `rdIndex` reads. The IQ may treat a source as confirmed
+   T4 `rdBase` read. The IQ may treat the base source as confirmed
    in T4 only when its physical tag equals this exact live `pdst` **and**
    the local data bypass is valid. The normal T4 `nextIntWake`, registered
    `lsBusy` clear, T5 `compValid`, PRF write, and ordinary bypass remain.
 
-Both address operands are checked independently. For each of `psrcA` and
-`psrcC`, either the normal `lsBusy` test already says the value is ready, or
-the exact live-confirm tag matches and that operand takes the live data
-bypass. If both depend on the same live `pdst`, both may use it; if they
-depend on different pending producers, one response cannot release both.
-`psrcB`/store data is never speculatively cleared and never uses this
-shortcut. First-version eligibility also excludes stores, LEA, CCR restore,
-auto-update, split, byte/word sign-extension, inhibited/device, privileged,
-faulting, line-only, and other non-simple forms. The producer's translated
-cacheability and successful translation must be known before treating a P3
-announcement as eligible. A P2T pretranslation announce is *not* the first
-implementation: it could put a consumer of a subsequently inhibited or
-faulting load in the single LS issue register for a long time, hiding older
-work and threatening progress.
+The first version checks only `psrcA`: it may be released at T4 only when
+the exact live-confirm tag matches, and `rdBase` takes that same response
+data. The fused first-and-last consumer must have no `psrcC`/index and no
+`psrcB`/store-data source. Indexed loads, two-source address forms, stores,
+LEA, CCR restore, auto-update, split, byte/word sign-extension, privileged,
+line-only, and other non-simple forms are excluded. A fault discovered later
+suppresses live confirmation and takes the existing precise-fault path. The
+**producer's** successful translation and cacheable mode are known in P3
+before its scheduling announcement. The **consumer's** target may later
+translate to inhibited/device memory; this shortcut changes only when its
+base operand is captured, never the consumer's translation, ordering, or
+barrier checks. A P2T pretranslation announce is *not* the first
+implementation: it could put a consumer of a producer that subsequently
+resolves inhibited or faulting in the single LS issue register for a long
+time, hiding older work and threatening progress.
 
 `liveLoadConfirm` must have exactly one producer: the LS EU's ring completion
 arbiter. It is invalid when the D-cache's single response port is occupied
@@ -106,7 +113,7 @@ experiment does not issue the consumer with guessed data. Bounded-progress
 tests must also include a blocked LS port with older independent work, to
 ensure the extra cycle of preselection does not create head-of-line deadlock.
 The same-cycle `!lsSpecBlocked` exception applies **only** to the LS issue
-register and only to A/C operands with the LS-local response-data bypass.
+register and the eligible `psrcA` operand with the LS-local response-data bypass.
 It must not clear global `lsBusy`, other IQ classes, ALU/branch/CPLX issue,
 or a dependent that reads store data. Otherwise a non-LS consumer could issue
 without any corresponding T4 data bypass.
@@ -117,8 +124,8 @@ No new data queue or copied cache line is proposed. Reusing P3 context, the
 existing LS issue register, and the ring response requires no new payload
 state. If a dedicated registered producer hint is necessary, budget roughly
 one valid bit plus a six-bit `pdst`; any additional state needs a spec
-amendment. Combinational cost is at least an LS-source tag compare for A and
-C, two 32-bit operand selects, and an IQ same-cycle ready/priority bypass
+amendment. Combinational cost is at least an LS-source tag compare for A,
+one 32-bit base-operand select, and an IQ same-cycle ready/priority bypass
 across up to 16 slots. A resident-hit-only response qualifier may require
 a one-bit field in the existing D-cache response service; it must have the
 D-cache as its documented producer and may only narrow eligibility. There is
@@ -126,8 +133,8 @@ no claim of mapped LUT/Fmax improvement from this state estimate.
 
 The new data path is D-cache registered S2 result → response-data mux →
 RID/head match and LS completion selection → local 32-bit operand mux →
-`s1Base`/`s1Index` flop. The new scheduling path is registered P3 `pdst` →
-IQ per-slot A/C match → ready/priority selection → LS issue register. Both
+`s1Base` flop. The new scheduling path is registered P3 `pdst` →
+IQ per-slot A match → ready/priority selection → LS issue register. Both
 cross previously protected timing boundaries. The old unsplit D-cache
 S1-to-response path was about 13 levels and failed routed timing; the old
 ALU-bypass-plus-AGU chain failed at -2.375 ns. Do not move address addition
@@ -143,9 +150,10 @@ this option without mapped and routed path evidence.
   OFF/ON source, seed, memory model, and options must show a full-cycle
   reduction; report hops, cycles, and exact signal edges.
 - Force miss, delayed/refused response, wrong RID, response-port contention,
-  back-to-back independent hits, two different pending A/C sources, same
-  source on A+C, store-data dependency, DTLB fault, bus fault, split,
-  inhibited/privileged access, flush/poison, RID wrap, ROB/physreg reuse,
+  back-to-back independent hits, indexed/C-source and two-source address
+  forms (must be excluded), store-data dependency (must be excluded), DTLB
+  fault, bus fault, split, inhibited **producer** and inhibited **consumer**
+  target, privileged access, flush/poison, RID wrap, ROB/physreg reuse,
   and SQ-forward collision. Each must either complete with checked data or
   take the existing hold/flush path. A mutant that skips the live-data
   confirmation must fail checked data rather than compilation.
