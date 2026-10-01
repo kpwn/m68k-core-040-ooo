@@ -1906,6 +1906,15 @@ count are `/tmp/codex-soc-ar-netlist.diff` and
 `3b5bf0aa2737717f3b42ca886418db03dd50a891650fad402b1478c7ecf9704c` OFF and
 `d26737865c6b8a13ec048a223ae975401de7312ec71ab7f6c36d5aaa237a9a9e` ON.
 
-At this checkpoint, matched actual-SoC execution with L2 response fallthrough
-fixed ON is still running. No AR-option performance, mapped-area, or routed
-200 MHz result is established, and the option remains default OFF.
+The matched actual-SoC pair with CPU `d1b76823`, SoC `e49327a`, and L2
+response fallthrough fixed ON now passes both builds and all four ROM runs.
+AR OFF/ON gives L1 marker cycles 646/128 in both arms and warm-L2 marker
+cycles 61445/4096 versus 57349/4096. All 127 bounded L1 load-retirement
+intervals remain five cycles; all 4095 L2 intervals improve from fifteen to
+fourteen. Both L2 runs validate all 4096 pointer addresses, with zero measured
+DDR reads. AR-to-R stays five cycles; R-to-next-accepted-AR falls ten to nine;
+R-to-same-load-retirement stays four. Exact one-cycle-per-hop savings is a
+request-path gain, not a general IPC result. L2-over-L1 remains nine cycles,
+above the six-cycle target. Cross-arm manifest/trace/hash checks and histograms:
+`/tmp/codex-soc-ar-pair-d1b76823-analysis.json`. Mapped-area and routed 200 MHz
+results remain unmeasured, and the option remains default OFF.
