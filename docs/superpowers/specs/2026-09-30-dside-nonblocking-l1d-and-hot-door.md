@@ -352,18 +352,15 @@ writethrough FIFO `wtFaultFifoAddr[pop..push)`, which already holds line address
   cross-door guarantee and treats a gathered line as cold traffic that hot reads outrank
   (`l2c_ctrl.v:673-679`, `728`). It arms only for 64-byte bursts, so it is irrelevant at 16-byte
   lines and load-bearing at 64-byte sectors (§11).
-- **Timing.** `wbBlocked(k)` is a register computed from the entry's line against the WB/WT
-  contents plus same-cycle pushes. It is one cycle late with respect to a push, and that is safe
-  for two reasons:
-  - A WT push to X while MSHR(X) exists is overlaid by the §4.2 merge, so the stale read is
-    harmless.
-  - A WB push of line Y happens only at the allocation of a *different* line in Y's set, and
-    D3-SET forbids an MSHR for Y to coexist.
-
-  A sim assert at every `axi_dh` AR fire checks the unregistered condition exactly, so the
-  argument cannot drift.
-- **Writethrough stores still in S0-S2** that will later push line X: they will merge into MSHR(X)
-  at S3 (§4.2). A later AR for X is gated once they reach the FIFO.
+- **Timing and AXI stability.** `wbBlocked(k)` is registered, so AR selection must also
+  check the *current-cycle* WB/WT sources, including an S3 WT push. Otherwise AR and
+  that push can cross the same edge, and an exact AR-time gate would withdraw an
+  already advertised `ARVALID` under backpressure. Once an AR is selected, its VALID,
+  address, and ID stay fixed until handshake. An S1 WT store to its line is held until
+  that handshake; WT stores already in S1/S2 are included in the selection check.
+  Later same-line WT bytes may merge into the MSHR before its response (§4.2).
+  D3-SET prevents a later dirty victim of that line while the MSHR lives. Sim
+  assertions check the exact outstanding WB and WT addresses at every AR fire.
 
 ### 6.3a Stage-2 amendments to §6 (as built)
 
@@ -687,7 +684,9 @@ seed 1, and checked final data on every kernel. `chase-four` traverses four disj
 256-record pointer cycles, warming L2 on the first walk; `stream-16k` reads sequential
 longs through four independent accumulators. Both report useful bytes in the measured
 window, with identical instruction counts across arms. These are simulation results,
-not board measurements:
+not board measurements. Bytes/cycle and CPI use the post-warmup commit window;
+the `[mshr]` MLP and `DSIDE_CONCURRENCY` occupancy/ID observations currently
+cover the whole kernel run, including warmup, and are labelled as such in logs:
 
 | cache / ring | four-chain read B/cyc | four-chain distinct-line MLP | stream read B/cyc | stream distinct-line MLP |
 |---|---:|---:|---:|---:|

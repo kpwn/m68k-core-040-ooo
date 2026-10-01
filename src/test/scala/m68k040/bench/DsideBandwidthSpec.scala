@@ -111,14 +111,14 @@ class DsideBandwidthSpec extends CoreBenchHarness {
               s"hotDoor=${m68k040.top.ShippingCoreConfig.dcacheHotDoor} lsOoo=$lsOoo " +
               f"CPI=${r.windowCycles.toDouble / r.retiredInstrs}%.3f")
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking)
-        println(f"DSIDE_CONCURRENCY kernel=${k.name} seed=$seed " +
+        println(f"DSIDE_CONCURRENCY scope=whole-run kernel=${k.name} seed=$seed " +
           f"ringAvg=${ringOccSum.toDouble / scala.math.max(1L, ringSamples)}%.3f " +
           s"ringMax=$ringMax hotOutstandingMax=$hotOutstandingMax")
       if (m68k040.top.ShippingCoreConfig.dcacheNonBlocking && arIntervals.nonEmpty) {
         val sorted = arIntervals.sorted
         val median = sorted(sorted.size / 2)
         val p95 = sorted(scala.math.min(sorted.size - 1, (sorted.size * 95) / 100))
-        println(s"DSIDE_WB_OVERLAP kernel=${k.name} seed=$seed arDuringWb=$arDuringWb " +
+        println(s"DSIDE_WB_OVERLAP scope=whole-run kernel=${k.name} seed=$seed arDuringWb=$arDuringWb " +
           s"arCount=${arIntervals.size + 1} arIntervalMedian=$median arIntervalP95=$p95 " +
           s"wbBCount=$wbBCount wbBIntervalMedian=${if (wbBIntervals.nonEmpty) wbBIntervals.sorted.apply(wbBIntervals.size / 2) else 0L} " +
           "(one continuous kernel; failWb/wbFull/wbGate are in [mshr])")

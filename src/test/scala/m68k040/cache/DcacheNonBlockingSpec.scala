@@ -494,7 +494,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
   private def runArm(c: => spinal.core.sim.SimCompiled[Dut], tag: String, nb: Boolean, coldMulti: Boolean,
                      mode: m68k040.sim.AxiRspMode.Value): Unit = {
     nbTot.clear()
-    for (seed <- seeds) c.doSim(s"nb-stress-$tag-$seed") { dut => shadowStress(dut, seed, ops, coldMulti, mode) }
+    for (seed <- seeds) c.doSim(s"nb-stress-$tag-$seed", seed.toInt) { dut =>
+      shadowStress(dut, seed, ops, coldMulti, mode) }
     if (nb) {
       println(s"[nbStress $tag TOTAL over ${seeds.size} seeds] " +
         nbTot.toSeq.sortBy(_._1).map { case (k, x) => s"$k=$x" }.mkString(" "))
@@ -613,6 +614,189 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       assert(hotAr > arBefore, "held demand never issued its refill after WB space freed")
       println(s"[nbWB] forced full: AW=$aw W=$w B=$b failWb=${lg.nb.ctrMap("failWb").toLong} " +
         s"hotAR=$hotAr, fifth demand held until B and returned checked data")
+    }
+  }
+
+  test("serial load admission waits for an older outstanding cacheable load", VerilatorTest) {
+    if (armOn("serialBarrier")) nbHotDut.doSim("serial-barrier") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 120, dramCycles = 120),
+          crossbarSingleOutstanding = true))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 120, dramCycles = 120)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      val first = 0x9c000L
+      val second = 0x9c400L
+      for (b <- 0 until 16) { cold.pokeByte(first + b, 0x5a); cold.pokeByte(second + b, 0xa5) }
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      val responses = mutable.ArrayBuffer.empty[(Int, BigInt)]
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (pl.loadRspOut.valid.toBoolean)
+            responses += ((pl.loadRspOut.payload.token.toInt, pl.loadRspOut.payload.data.toBigInt))
+        }
+      }
+      def command(a: Long, tok: Int, rid: Int, oo: Boolean): Unit = {
+        pl.loadCmdIn.valid #= true
+        pl.loadCmdIn.payload.vaddr #= a
+        pl.loadCmdIn.payload.paddr #= a
+        pl.loadCmdIn.payload.size #= Size.LONG
+        pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+        pl.loadCmdIn.payload.token #= tok
+        pl.loadCmdIn.payload.lineOnly #= false
+        pl.loadCmdIn.payload.ooOk #= oo
+        pl.loadCmdIn.payload.rid #= rid
+        pl.loadCmdIn.payload.ridValid #= true
+      }
+      command(first, 1, 0, oo = true)
+      assert(pl.loadCmdIn.ready.toBoolean, "ordinary first load did not admit")
+      cd.waitSampling()
+      pl.loadCmdIn.valid #= false
+      // The second command remains valid, so an early ready is an architectural
+      // acceptance violation, not merely a combinational pulse we failed to see.
+      command(second, 2, 1, oo = false)
+      for (_ <- 0 until 20) {
+        cd.waitSampling()
+        assert(!pl.loadCmdIn.ready.toBoolean,
+          "serial load was admitted while an older load was still outstanding")
+        assert(!responses.exists(_._1 == 1), "the first load returned before the adversarial window")
+      }
+      var n = 0
+      while (!pl.loadCmdIn.ready.toBoolean && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(pl.loadCmdIn.ready.toBoolean, "serial load never admitted after the older load")
+      assert(responses.exists(_._1 == 1), "serial load admitted before the older response")
+      cd.waitSampling()
+      pl.loadCmdIn.valid #= false
+      n = 0
+      while (!responses.exists(_._1 == 2) && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(responses.map(_._1).toSeq == Seq(1, 2), s"serial response order ${responses.map(_._1)}")
+      assert((responses(0)._2 & BigInt("ffffffff", 16)) == BigInt("5a5a5a5a", 16))
+      assert((responses(1)._2 & BigInt("ffffffff", 16)) == BigInt("a5a5a5a5", 16))
+      println("[nbSerial] older response completed before serial admission; both data values checked")
+    }
+  }
+
+  test("backpressured hot AR keeps VALID and payload through a same-line cold write", VerilatorTest) {
+    if (armOn("arStable")) nbHotDut.doSim("ar-stable") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      var releaseAr = false
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 50, dramCycles = 50),
+          crossbarSingleOutstanding = true, deferWriteVisibilityUntilB = true))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 5, dramCycles = 5),
+          arReadyGate = () => releaseAr),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      val x = 0xa0000L
+      for (b <- 0 until 16) cold.pokeByte(x + b, 0x11)
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= x
+      pl.loadCmdIn.payload.paddr #= x
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.loadCmdIn.payload.token #= 1
+      pl.loadCmdIn.payload.lineOnly #= false
+      pl.loadCmdIn.payload.ooOk #= true
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= true
+      var n = 0
+      while (!pl.loadCmdIn.ready.toBoolean && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(pl.loadCmdIn.ready.toBoolean, "first load did not admit")
+      cd.waitSampling()
+      pl.loadCmdIn.valid #= false
+      n = 0
+      while (!lg.axiDh.ar.valid.toBoolean && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(lg.axiDh.ar.valid.toBoolean && !lg.axiDh.ar.ready.toBoolean,
+        "hot AR was not presented under backpressure")
+      val heldAddr = lg.axiDh.ar.payload.addr.toLong
+      val heldId = lg.axiDh.ar.payload.id.toInt
+      assert(heldAddr == x)
+      var heldCycles = 0
+      var arFire = 0
+      var wtW = 0
+      var wtB = 0
+      var loadRsp: Option[BigInt] = None
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (!releaseAr) {
+            assert(lg.axiDh.ar.valid.toBoolean,
+              s"hot ARVALID withdrew after $heldCycles held cycles before ARREADY")
+            assert(lg.axiDh.ar.payload.addr.toLong == heldAddr &&
+                   lg.axiDh.ar.payload.id.toInt == heldId,
+              "hot AR address or ID changed while backpressured")
+            heldCycles += 1
+          }
+          if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) arFire += 1
+          if (lg.axi.w.valid.toBoolean && lg.axi.w.ready.toBoolean) wtW += 1
+          if (lg.axi.b.valid.toBoolean && lg.axi.b.ready.toBoolean) wtB += 1
+          if (pl.loadRspOut.valid.toBoolean) loadRsp = Some(pl.loadRspOut.payload.data.toBigInt)
+        }
+      }
+      // A retired WT store arrives while the chosen AR is backpressured. The
+      // cache must hold its cold write behind the advertised AR and merge its
+      // bytes into the MSHR before answering the speculative load.
+      pl.storeIn.valid #= true
+      pl.storeIn.payload.paddr #= x
+      pl.storeIn.payload.data #= 0
+      pl.storeIn.payload.size #= Size.LONG
+      pl.storeIn.payload.useStrb #= true
+      pl.storeIn.payload.strb #= 0xffff
+      pl.storeIn.payload.lineData #= BigInt("55" * 16, 16)
+      pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      pl.storeIn.payload.precise #= false
+      n = 0
+      while (!pl.storeIn.ready.toBoolean && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(pl.storeIn.ready.toBoolean, "intervening WT store did not admit")
+      cd.waitSampling()
+      pl.storeIn.valid #= false
+      cd.waitSampling(20)
+      assert(wtW == 0 && wtB == 0 && cold.peekByte(x) == 0x11,
+        "the intervening WT store overtook a backpressured advertised AR")
+      assert(heldCycles >= 20, s"only $heldCycles backpressured AR cycles were exercised")
+      assert(arFire == 0 && loadRsp.isEmpty, "hot refill completed while ARREADY was held low")
+      releaseAr = true
+      n = 0
+      while (loadRsp.isEmpty && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(arFire == 1, s"expected one hot AR handshake, got $arFire")
+      assert(loadRsp.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("55555555", 16)),
+        s"hot refill did not see older WT bytes: $loadRsp")
+      n = 0
+      while (wtW == 0 && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(wtW > 0, "held WT store sent no W beat after AR handshake")
+      n = 0
+      while (wtB == 0 && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(wtB > 0 && cold.peekByte(x) == 0x55,
+        "intervening WT bytes were not committed to memory at B")
+      println(s"[nbAR] VALID/address/ID stable for $heldCycles stalled cycles; " +
+        "hot response merged pre-B WT bytes and memory committed at B")
     }
   }
 

@@ -5913,16 +5913,26 @@ class DcachePlugin(val socketMerged: Boolean = false,
         bufferedWbTo(x) ||
         (0 until MAX_WT_OUTSTANDING).map(i => wtInFlight(i) && lineOfPa(wtFaultFifoAddr(i)) === x).reduce(_ || _) ||
         (s3ColdPush && s3Line === x)
+      // A WT store already in S1/S2 is older than an AR selected this cycle.
+      // Wait for it to reach the cold-write gate (and B) before advertising AR.
+      // Once AR is advertised, the S1 hold below prevents a NEW WT store from
+      // overtaking it during ARREADY backpressure.
+      def wtPipeTo(x: UInt): Bool =
+        (stS1Valid && stS1Payload.cacheMode === CacheMode.WRITETHROUGH &&
+         lineOfPa(stS1Payload.paddr) === x) ||
+        (stS2Valid && stS2Payload.cacheMode === CacheMode.WRITETHROUGH &&
+         lineOfPa(stS2Payload.paddr) === x)
       for (k <- 0 until N) blocked(k) := coldWriteTo(line(k))
 
       // ── AR issue (§3.3): one holding register, ID = MSHR index ──────────────────────
       val arV   = RegInit(False)
       val arIdx = Reg(UInt(idxW bits)) init 0
       val arAddr = Reg(UInt(32 bits)) init 0
-      // A cold write may enter the buffer after this AR was selected. Recheck its
-      // registered address at the actual handshake; the selection-time verdict
-      // alone cannot protect that interval.
-      val arIssue = arV && !coldWriteTo(lineOfPa(arAddr))
+      // Check current-cycle cold writes at selection, including an S3 WT push:
+      // `blocked` is registered and alone would miss a write arriving this edge.
+      // Once selected, VALID and payload stay fixed until handshake; the S1 hold
+      // below keeps a newer same-line WT write behind that advertised AR.
+      val arIssue = arV
       arV.simPublic(); arIdx.simPublic()
       val arDelayOk: Vec[Bool] = Vec((0 until N).map(_ => True))
       if (storeAllocArDelay > 0) {
@@ -5935,7 +5945,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           when(st(k) === ST(WAIT_AR) && byStore(k) && mstrb(k).andR && !arDelayOk(k)) { st(k) := ST(FILLED) }
         }
       }
-      val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) && !blocked(k) && arDelayOk(k)))
+      val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) && settled(k) &&
+        !blocked(k) && !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && arDelayOk(k)))
       val arFire = Bool()
       when(arFire) { for (k <- 0 until N) when(arIdx === U(k, idxW bits)) { st(k) := ST(WAIT_R) } }
       when(!arV || arFire) {
@@ -6066,13 +6077,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val camS1  = (0 until N).map(k => validVec(k) && line(k) === s1Line).reduce(_ || _)
       val setConfS1 = (0 until N).map(k => validVec(k) && eset(k) === stS1Set && line(k) =/= s1Line).reduce(_ || _)
       val cbS1 = stS1Payload.cacheMode === CacheMode.COPYBACK
+      val wtS1 = stS1Payload.cacheMode === CacheMode.WRITETHROUGH
       val inflightAllocs = pendingStoreMiss.asUInt.resize(3) + stgValid.asUInt.resize(3) + s2CbRes
       val resShort = (freeCnt.resize(3) < (U(1, 3 bits) + inflightAllocs)) ||
                      (wbFree < (U(1, 3 bits) + inflightAllocs))
       nbStoreHold := anyInv ||
         (stgValid && stgSet === stS1Set) || (ldS1Valid && ldS1Set === stS1Set) ||
         (stS2Valid && stS2Set === stS1Set) || (pendingStoreMiss && sSet === stS1Set) ||
-        (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort)
+        (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort) ||
+        (stS1Valid && wtS1 && arV && lineOfPa(arAddr) === s1Line)
 
       nbIdle := !validVec.asBits.orR && (wbCount === 0) && !wbIssued && !anyW && !rV &&
                 !stgValid && !rqNonEmpty && !arV && !serialPending
@@ -6111,9 +6124,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
           "DcachePlugin.nb: legacy inhibited refill overlaps an MSHR read on axi", FAILURE)
         // Exact WB gate at the AR handshake (the registered verdict must never be wrong).
         val arLine = lineOfPa(arAddr)
-        val arExact = (0 until WBD).map(i => wbV(i) && wbLine(i) === arLine).reduce(_ || _) ||
-          (0 until MAX_WT_OUTSTANDING).map(i => wtInFlight(i) && lineOfPa(wtFaultFifoAddr(i)) === arLine).reduce(_ || _)
-        assert(!(arFire && arExact), "DcachePlugin.nb: hot read issued while a cold write to its line awaits B", FAILURE)
+        assert(!(arV && s3ColdPush && s3Line === arLine),
+          "DcachePlugin.nb: same-line WT reached S3 while an AR was advertised", FAILURE)
+        val arWbConflict = (0 until WBD).map(i => wbV(i) && wbLine(i) === arLine).reduce(_ || _)
+        val arWtConflict = (0 until MAX_WT_OUTSTANDING).map(i =>
+          wtInFlight(i) && lineOfPa(wtFaultFifoAddr(i)) === arLine).reduce(_ || _)
+        assert(!(arFire && arWbConflict),
+          "DcachePlugin.nb: hot read issued while a dirty WB of its line awaits B", FAILURE)
+        assert(!(arFire && arWtConflict),
+          "DcachePlugin.nb: hot read issued while a WT store to its line awaits B", FAILURE)
         for (w <- 0 until ways) assert(!(nbWroteWay(w) && (validsVoteW0(w) || validsVoteW1(w) || validsVoteW2(w) ||
             validsVoteW3(w) || dirtysVoteD0(w) || dirtysVoteD1(w) || dirtysVoteD2(w) || dirtysVoteD3(w) ||
             dirtysVoteD4(w) || dirtysVoteD5(w))),

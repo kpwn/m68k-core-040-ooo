@@ -200,7 +200,10 @@ case class AxiMemModelConfig(
     * presented. The normal L2 model applies W immediately; this mode tests that a
     * hot read of the same line really waits for B instead of relying on early W
     * visibility. Default OFF for every existing harness. */
-  deferWriteVisibilityUntilB: Boolean = false
+  deferWriteVisibilityUntilB: Boolean = false,
+  /** Test-only AR backpressure hook. Keep ready low while false, to exercise AXI
+    * VALID/payload stability across an intervening CPU-side event. */
+  arReadyGate: () => Boolean = () => true
 )
 
 /** Free-running simulation cycle counter shared by the read and write engines of one
@@ -591,7 +594,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     }
   }
 
-  val arDriver = StreamReadyRandomizer(ar, cd, () => arAcceptable())
+  val arDriver = StreamReadyRandomizer(ar, cd, () => arAcceptable() && cfg.arReadyGate())
 }
 
 /** Write side. This is a FAITHFUL port of `BehavioralMemAgent`'s hand-rolled write
