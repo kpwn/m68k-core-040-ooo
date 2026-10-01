@@ -790,6 +790,32 @@ guard, not a verdict.
    8. ID reissued before R;
    9. serial rule off;
    10. no store S1 hold on `stgSet`.
+
+   **Mutation acceptance, 2026-10-01.** `tools/nb_mutation_proof.py` applies one
+   source mutation in an isolated worktree, runs the named test, and restores the
+   source in `finally`. The unmodified eight-seed cache suite passed all nine tests
+   with checked data; the directed clean-load-MSHR store-merge test also passed.
+   Each mutant below failed at runtime for the stated mechanism (none failed to
+   compile). Mutants 1, 3–6, 8, and 10 used hot Chaos seed 1 with 4,000 operations;
+   2, 7, and 9 used the named directed arm.
+
+   | # | Fault removed | First failure |
+   |---:|---|---|
+   | 1 | install hold on store S1/S2 set | installed-line store merge tripwire: lost store |
+   | 2 | WB address gate | hot AR while dirty WB awaits B |
+   | 3 | D3-SET allocation gate | shadow line byte mismatch at `0x90844` |
+   | 4 | LINGER state after install | two waiters at `0x92848/0x92842` never answered |
+   | 5 | waiter-specific offset | first group returned `0x1910`, expected `0x9db5` |
+   | 6 | S3 bypass in victim snapshot | byte at `0x9204f` returned `0xf4`, expected `0xdd` |
+   | 7 | `mdirty` on store merge | directed CPUSH left old memory bytes after a merged CB store |
+   | 8 | wait for R before ID reuse | AXI checker rejected duplicate AR ID 0 |
+   | 9 | serial admission rule | serial load admitted before older load response |
+   | 10 | store S1 hold on `stgSet` | store allocation violated D3-SET tripwire |
+
+   A separate *shortened* LINGER mutant (`linger := 0` but still one LINGER
+   cycle) survived this seed; the specified **no-LINGER** mutation above did
+   not. This proves the state is necessary, but does not independently prove
+   that its current three-cycle countdown is minimal.
 2. **Mechanism counters** fire (`primaryAllocs`, `loadSecondaries`, `storeMerges`, MLP > 1.2 on
    `memcpy-grp` with LS-OoO).
 3. **Bench:** `MemcpyBandwidthSpec`, `MissMergeBandwidthSpec`, a new `kStream`, and

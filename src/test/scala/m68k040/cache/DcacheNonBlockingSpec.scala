@@ -586,6 +586,88 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     }
   }
 
+  test("COPYBACK store merged into a clean load MSHR remains dirty through CPUSH", VerilatorTest) {
+    if (armOn("mergeDirty")) nbHotDut.doSim("merge-dirty") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 8, dramCycles = 8),
+          crossbarSingleOutstanding = true))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 100, dramCycles = 100)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      val x = 0xa4000L
+      for (b <- 0 until 16) cold.pokeByte(x + b, 0x11)
+      var hotAr = 0
+      var storeAcks = 0
+      var loadRsp: Option[BigInt] = None
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) hotAr += 1
+          if (lg.storeAckReg.toBoolean) storeAcks += 1
+          if (pl.loadRspOut.valid.toBoolean) loadRsp = Some(pl.loadRspOut.payload.data.toBigInt)
+        }
+      }
+      def until(label: String)(p: => Boolean): Unit = {
+        var n = 0
+        while (!p && n < 2000) { cd.waitSampling(); n += 1 }
+        assert(p, s"$label timed out")
+      }
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= x
+      pl.loadCmdIn.payload.paddr #= x
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.loadCmdIn.payload.token #= 1
+      pl.loadCmdIn.payload.lineOnly #= false
+      pl.loadCmdIn.payload.ooOk #= true
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= true
+      until("clean primary accept") { pl.loadCmdIn.ready.toBoolean }
+      cd.waitSampling()
+      pl.loadCmdIn.valid #= false
+      until("clean primary hot AR") { hotAr == 1 }
+
+      pl.storeIn.valid #= true
+      pl.storeIn.payload.paddr #= x
+      pl.storeIn.payload.data #= BigInt("77777777", 16)
+      pl.storeIn.payload.size #= Size.LONG
+      pl.storeIn.payload.useStrb #= true
+      pl.storeIn.payload.strb #= 0x000f
+      pl.storeIn.payload.lineData #= BigInt("77777777", 16)
+      pl.storeIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.storeIn.payload.precise #= false
+      until("same-line COPYBACK store accept") { pl.storeIn.ready.toBoolean }
+      cd.waitSampling()
+      pl.storeIn.valid #= false
+      until("merged store ack") { storeAcks > 0 }
+      until("primary response") { loadRsp.nonEmpty }
+      assert(lg.nb.ctrMap("storeMerges").toLong > 0,
+        "store never merged into the clean load MSHR")
+      assert((loadRsp.get & BigInt("ffffffff", 16)) == BigInt("77777777", 16),
+        s"merged primary returned ${loadRsp.get.toString(16)}")
+      assert(cold.peekByte(x) == 0x11, "COPYBACK store reached memory before CPUSH")
+      until("cache idle before CPUSH") { lg.dcIdleForMaint.toBoolean }
+      maint(dut, cd, push = true, invalidate = true, scope = 1, addr = x)
+      assert((0 until 4).forall(b => cold.peekByte(x + b) == 0x77),
+        "CPUSH dropped a COPYBACK store merged into a previously clean MSHR")
+      println("[nbMergeDirty] clean load MSHR accepted COPYBACK store; CPUSH wrote merged dirty bytes")
+    }
+  }
+
   test("four dirty writebacks fill the buffer; a fifth demand waits and resumes after B", VerilatorTest) {
     if (armOn("wbFull")) nbHotDut.doSim("wb-full") { dut =>
       val cd = dut.clockDomain
