@@ -60,3 +60,57 @@ failing endpoints; another older profile (`codex-fpu200`) closed at +0.001 ns.
 Those builds differ in CPU/SoC sources and configuration, so they demonstrate
 that this board class can approach/meet 200 MHz, not which current feature
 caused the regression.
+
+## Combined P3/L2 candidate route
+
+A second, matched-profile 200 MHz implementation used CPU revision
+`1dc6d0d9439f124be703e5ccf21805765e481b7a` (the P3 registered-owner
+payload selection already on `master`) and isolated SoC revision
+`98a869902a2f0c22f9b232e5c079a1c4c0d86c37` (registered per-MSHR
+same-source-ID ordering). The real MIG and all profile settings were unchanged.
+Its routed report is at
+`macqd700-soc-worktrees/codex-l2-id-order-timing/build/fourcycle-200mhz-p3-l2-idlook/timing_summary.rpt`.
+Setup **did not close**: WNS -1.895 ns, TNS -36,045.047 ns, 53,070 failing
+setup endpoints, with WHS/WPWS both 0.000 ns and no failing hold/pulse endpoints.
+Compared with the frozen route, WNS is 0.110 ns worse, TNS is 5,327.457 ns
+worse, and 7,096 more setup endpoints fail. This combined run cannot assign
+causality to either RTL cut individually or distinguish RTL effects from
+placement variation. Do not load this 200 MHz bitstream or promote the L2
+candidate on timing evidence from this run.
+
+A read-only routed-checkpoint query sampled 1,000 distinct worst core-clock
+endpoints into `/tmp/codex-p3-l2-200mhz-core-top1000.rpt` and JSON of the same
+stem. Slack ranges from -1.895 to -1.759 ns; summed sampled deficit is
+-1,820.817 ns (about 5.1% of global TNS). The family ranking changed:
+
+| Source to endpoint family | Frozen baseline | Combined candidate |
+| --- | ---: | ---: |
+| L2 to L2 | 277 | 25 |
+| ROB to D-cache | 149 | 18 |
+| Fetch align to I-cache | 109 | 0 in the top 1,000 |
+| Gshare to I-cache | 0 in the top 1,000 | 244 |
+| D-cache to D-cache | 124 | 156 |
+| D-cache to DTLB | 80 | 91 |
+
+The L2 and ROB/D-cache targets moved out of the sampled worst set, but the
+newly exposed frontend and miss paths leave total timing worse. All 244
+Gshare-to-I-cache paths start at a registered prediction direction and mostly
+end at I-cache tag, MSHR, PPN, or prefetch enables. A related full routed path to `fetchPc` goes
+through fetch target selection, the live ITLB lookup/cacheability decision,
+I-cache command ready, and back into `fetchPc` (19 logic levels, 6.861 ns data
+path, 5.222 ns routing). This is a same-cycle fetch admission loop. It should
+be cut with an explicit frontend command ownership boundary, preserving
+redirect, STOP, and fault behavior; simply delaying the branch target adds a
+prediction bubble.
+
+Among 156 D-cache internal sampled paths, 90 start at the nonblocking staged
+physical address and 38 at the pending store address. Sixty-eight end at the
+miss-line register. Among 91 D-cache-to-DTLB paths, 89 start at `missCmode`:
+18 end at `missReqReg.vpn`, 7 at `missReqReg.token`, 5 at
+`missReqReg.robId`, while response payload and TLB lookup/debug state take
+many of the rest. An isolated DTLB payload-capture cut is being tested; even
+if correct, it removes only a subset of this miss loop and still needs a
+matched physical result. The next miss-side timing work should inspect the
+staged-address-to-miss-line admission and refill-completion-to-translation
+control independently, while keeping parallel miss acceptance and the
+four-cycle hit path.
