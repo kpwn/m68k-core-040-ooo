@@ -1833,6 +1833,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     val alignedFallThroughSelect = if (alignedLoadFallThrough) {
       !alignedFull && (alignedSendPtr === alignedPushPtr)
     } else False
+    // P3 and P4 are registered, exclusive owners of an ordinary load push. Keep
+    // the payload select on these stage-valid flops: p3FastEnq includes SQ, park,
+    // barrier and ring admission, and must only decide whether a command is valid.
+    val p3PayloadOwner = if (p3FastLoad) p3Valid && !p4Valid else False
     // ⚠️ THE FALL-THROUGH ARM IS ONLY VALID WHEN **P4** IS THE PUSH SOURCE. `alignedEnq` is
     // shared: a PARK DRAIN (`lsOooIssue`) asserts it too, and its payload comes from the
     // park, not from P4. Without excluding it, a drain cycle with the ring empty at the send
@@ -1866,7 +1870,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       alignedCmd.twoAccess := False
       alignedCmd.splitSecond := False
       alignedCmd.bk.robId := p4Ctx.xlate.front.robId
-      if (p3FastLoad) when(p3FastEnq) {
+      if (p3FastLoad) when(p3PayloadOwner) {
         alignedCmd.vaddr := p3Ctx.front.vaddr
         alignedCmd.paddr := p3Ctx.paddr
         alignedCmd.size := p3Ctx.front.size
@@ -1877,6 +1881,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     GenerationFlags.simulation {
       assert(!(alignedFallThroughSelect && alignedSendValid),
         "LsEuPlugin: fall-through payload selected over a queued command", FAILURE)
+      if (p3FastLoad) {
+        assert(!p3FastEnq || (p3PayloadOwner && alignedEnq && !parkDrain),
+          "LsEuPlugin: P3 fast enqueue has no exclusive P3 payload owner", FAILURE)
+        assert(!(alignedEnq && !p3FastEnq && !parkDrain) || p4Valid,
+          "LsEuPlugin: P4 enqueue has no registered P4 payload owner", FAILURE)
+      }
     }
     val useSplitCmd = bkBusy
     val loadVaddr = UInt(32 bits)

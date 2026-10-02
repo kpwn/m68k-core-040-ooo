@@ -150,10 +150,49 @@ class LsEuSpec extends AnyFunSuite {
       seed(dut, cd, preg = 11, value = 0x12345678L)
       var tracking = true
       var fastFires = 0
+      var p3Offers = 0
+      var p3Accepted = 0
+      var p4Accepted = 0
+      var p3Refused = 0
+      var queuedP3Accepted = 0
+      val expectedAddrByRob = Map(1 -> base, 2 -> (base + 8), 5 -> (base + 8),
+        8 -> 0x8000L, 9 -> base)
       fork {
         while (tracking) {
           sleep(1)
-          if (dut.eu.logic.p3FastEnq.toBoolean) fastFires += 1
+          val ls = dut.eu.logic
+          if (ls.p3FastEnq.toBoolean) fastFires += 1
+          val cmd = dut.dcache.logic.loadCmdPort
+          // The cache sees this payload before the edge, including when it refuses
+          // the offer. The selected source must match the actual push owner; after
+          // refusal the same descriptor is read from the queued ring.
+          if (ls.alignedFallThrough.toBoolean && cmd.valid.toBoolean) {
+            val fromP3 = ls.p3FastEnq.toBoolean
+            val rob = cmd.payload.token.toInt & 0x3f
+            val expectedAddr = expectedAddrByRob.getOrElse(rob,
+                fail(s"fall-through command has unissued ROB id $rob"))
+            assert((cmd.payload.vaddr.toLong & 0xffffffffL) == expectedAddr,
+              s"fall-through VA belongs to another load (rob=$rob)")
+            assert((cmd.payload.paddr.toLong & 0xffffffffL) == expectedAddr,
+              s"fall-through PA belongs to another load (rob=$rob)")
+            assert(cmd.payload.size.toEnum == Size.LONG,
+              s"fall-through size belongs to another load (rob=$rob)")
+            assert(if (fromP3) Set(1, 2, 8, 9).contains(rob) else rob == 5,
+              s"fall-through stage owner and ROB id disagree (P3=$fromP3 rob=$rob)")
+            if (fromP3) p3Offers += 1
+            if (cmd.ready.toBoolean) {
+              if (fromP3) p3Accepted += 1 else p4Accepted += 1
+            } else if (fromP3) p3Refused += 1
+          } else if (cmd.valid.toBoolean && cmd.ready.toBoolean) {
+            val rob = cmd.payload.token.toInt & 0x3f
+            if (Set(1, 2, 8, 9).contains(rob)) {
+              val expectedAddr = expectedAddrByRob(rob)
+              assert((cmd.payload.vaddr.toLong & 0xffffffffL) == expectedAddr &&
+                (cmd.payload.paddr.toLong & 0xffffffffL) == expectedAddr,
+                s"queued P3 descriptor changed identity after refusal (rob=$rob)")
+              queuedP3Accepted += 1
+            }
+          }
           cd.waitSampling()
         }
       }
@@ -163,6 +202,10 @@ class LsEuSpec extends AnyFunSuite {
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 20; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base))
+      issueLoad(dut, cd, basePreg = 10, disp = 8, Size.LONG, pdst = 27, robId = 2)
+      assert(waitCompletion(dut, cd, robId = 2), "warm P3 load completion")
+      dut.src.logic.obsIntAddr #= 27; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base + 8))
 
       issueStore(dut, cd, basePreg = 10, disp = 4, dataPreg = 11, Size.LONG, robId = 3)
       assert(waitStoreAlloc(dut, cd, robId = 3), "older store resident")
@@ -173,6 +216,47 @@ class LsEuSpec extends AnyFunSuite {
       cd.waitSampling(4)
       dut.src.logic.obsIntAddr #= 21; sleep(1)
       assert(dut.src.logic.obsIntData.toBigInt == BigInt(0x12345678L))
+
+      // The older resident store blocks the P3 shortcut even for an unrelated
+      // address. Its P4 command must use P4's identity and complete with its own
+      // data after the precise store is committed and drained.
+      issueLoad(dut, cd, basePreg = 10, disp = 8, Size.LONG, pdst = 26, robId = 5)
+      var p4Resident = false
+      var p4Wait = 0
+      while (!p4Resident && p4Wait < 30) {
+        p4Resident = dut.eu.logic.p4Valid.toBoolean &&
+          dut.eu.logic.p4Ctx.xlate.front.robId.toInt == 5
+        if (!p4Resident) cd.waitSampling()
+        p4Wait += 1
+      }
+      assert(p4Resident, "unrelated load must reach P4 behind the resident store")
+      dut.phead.logic.iRobHeadIn #= 3
+      dut.phead.logic.iRobHeadValidIn #= true
+      var sqCompleted = false
+      var sqWait = 0
+      while (!sqCompleted && sqWait < 120) {
+        sqCompleted = dut.phead.logic.oSqCompValid.toBoolean &&
+          dut.phead.logic.oSqCompPayload.toInt == 3
+        if (!sqCompleted) cd.waitSampling()
+        sqWait += 1
+      }
+      assert(sqCompleted, "precise store must drain at ROB head before the P4 load")
+      dut.src.logic.iSqCommitRob #= 3
+      dut.src.logic.iSqCommitValid #= true
+      cd.waitSampling()
+      dut.src.logic.iSqCommitValid #= false
+      dut.phead.logic.iRobHeadIn #= 5
+      assert(waitCompletion(dut, cd, robId = 5),
+        s"P4 load completion (p4Valid=${dut.eu.logic.p4Valid.toBoolean} " +
+          s"p4Rob=${dut.eu.logic.p4Ctx.xlate.front.robId.toInt} " +
+          s"sqEmpty=${dut.eu.logic.sq.io.empty.toBoolean} " +
+          s"fwdStall=${dut.eu.logic.p4Ctx.fwdStall.toBoolean} " +
+          s"fwdSerial=${dut.eu.logic.p4Ctx.fwdSerial.toBoolean} " +
+          s"alignedCount=${dut.eu.logic.alignedCount.toInt} " +
+          s"p4Accepted=$p4Accepted)")
+      dut.src.logic.obsIntAddr #= 26; sleep(1)
+      assert(dut.src.logic.obsIntData.toBigInt == expectedLong(base + 8),
+        "P4 load used another stage's payload")
 
       dut.src.logic.iSqFlush #= true
       cd.waitSampling()
@@ -207,6 +291,10 @@ class LsEuSpec extends AnyFunSuite {
       }
       issueLoad(dut, cd, basePreg = 10, disp = 0, Size.LONG, pdst = 24, robId = 9)
       assert(waitCompletion(dut, cd, robId = 9), "load after fast-path squash")
+      assert(p3Offers > 0 && p3Refused > 0 && queuedP3Accepted > 0 && p4Accepted > 0,
+        s"P3 offer/refusal/queued acceptance and P4 direct acceptance must occur " +
+          s"(P3 offers=$p3Offers refused=$p3Refused queued=$queuedP3Accepted " +
+          s"direct=$p3Accepted P4 direct=$p4Accepted)")
       tracking = false
     }
   }
