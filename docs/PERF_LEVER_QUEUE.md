@@ -736,7 +736,7 @@ not quote 26.8% as the expected gain — it is the ceiling.
 path this is a **conformance fix that happens to be the largest bandwidth lever measured** —
 our MOVE16 currently allocates and write-allocates, which documented silicon does not.
 
-## ✅ LS-OoO ISSUE — COMPLETE GATE TABLE (only area + board outstanding)
+## ✅ LS-OoO ISSUE — performance reference established; 200 MHz timing open
 
 | gate | result |
 |---|---|
@@ -747,7 +747,15 @@ our MOVE16 currently allocates and write-allocates, which documented silicon doe
 | attribution | `orderRedirects = 0` on all 34 kernels, both arms |
 | instrument validity | `IQ_HOL=1` proven **print-only** (cycles bit-identical) |
 | **area (100 MHz matched pair)** | **+1,421 LUT total / +1,091 `socket_core` / +475 FF** — `lsooo0` 145,687 -> `lsooo1` 147,108. **ABOVE the ~800 LUT floor, so this one is REAL, not noise** |
-| board | ⛔ **outstanding** |
+| **200 MHz physical, production 33ae matched pair** | **+935 FPGA LUT / +534 FF**, BRAM/DSP unchanged; WNS **+0.001 ns OFF / −0.156 ns ON**, zero hold/pulse failures, same DRC warning classes. ON does not close 200 MHz timing. |
+| **200 MHz board, production 33ae matched pair** | One-iteration Speedometer 4.02: **117,711.315 vs 116,073.376 Dhrystones/s (+1.41%)**, Puzzle **0.113 vs 0.168 s (~49% more throughput)**, CPU average **8.024 vs 7.529 (+6.58%)**. Both boot/liveness checks passed. See [matched board and physical evidence](LS_OOO_PERFORMANCE_REFERENCE.md). |
+
+The LS OoO ON image is the **performance reference** for the next combined-memory
+experiments. This does not flip the production default: the routed −156 ps setup miss
+and remaining current-source correctness gates still need closure. The board run did
+not include a phase-verified IPC counter window, so its Speedometer gain must not be
+presented as a measured IPC percentage. The separate D4/NB4 physical pair keeps LS
+OoO OFF intentionally to price those blocks in isolation before combination.
 
 **The lock-step 5-red delta is fully accounted for**, which is why it had to be compared by
 name and not by count:
