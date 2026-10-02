@@ -448,8 +448,13 @@ writethrough FIFO `wtFaultFifoAddr[pop..push)`, which already holds line address
   check the *current-cycle* WB/WT sources, including an S3 WT push. Otherwise AR and
   that push can cross the same edge, and an exact AR-time gate would withdraw an
   already advertised `ARVALID` under backpressure. Once an AR is selected, its VALID,
-  address, and ID stay fixed until handshake. An S1 WT store to its line is held until
-  that handshake; WT stores already in S1/S2 are included in the selection check.
+  address, and ID stay fixed until handshake. Normal AR selection excludes same-line
+  WT stores already in S0/S1/S2. A newer same-line WT store is held in S0 until
+  the advertised AR handshakes, including all cycles of ARREADY backpressure.
+  This covers both a WT already in S0 on the AR-selection edge and a WT accepted
+  on that edge; neither can enter S1 behind the held AR. The S0 hold depends only
+  on registered S0 payload and AR state, keeping the AR-address comparison out
+  of the S1 advance and shared array-read address paths.
   Later same-line WT bytes may merge into the MSHR before its response (§4.2).
   D3-SET prevents a later dirty victim of that line while the MSHR lives. Sim
   assertions check the exact outstanding WB and WT addresses at every AR fire.
@@ -505,12 +510,12 @@ The allocation edge writes the new line, state `WAIT_AR`, and any dirty
 victim into the WB FIFO. On the following cycle, the candidate may use that registered line
 without waiting for `settled` or the **previous line's** registered `blocked`.
 It must still check the exact current `coldWriteTo(line)` sources (WB entries,
-WT FIFO, and simultaneous WB/S3 WT pushes), current S1/S2 WT stores, and the
+WT FIFO, and simultaneous WB/S3 WT pushes), current S0/S1/S2 WT stores, and the
 configured store-allocation AR delay. The 16-byte full-strobe COPYBACK store
 starts in `FILLED` and remains a no-AR case. Selection remains registered in
 `arV/arIdx/arAddr`; no new combinational path reaches the CPU read stage or
 the AXI AR output. Once advertised, ARVALID/address/ID remain fixed through
-ARREADY backpressure, and a newer same-line WT writer is held until handshake.
+ARREADY backpressure, and a newer same-line WT writer is held in S0 until handshake.
 
 The safety argument is edge-local: a WB push on the allocation edge is visible
 as `wbV/wbLine` on the following selection cycle, while a push on that selection
@@ -631,7 +636,7 @@ diagnostic demonstrated; the input guard deliberately delays the AR anyway.
 For an older accepted WT, a pipeline hold can leave it in S0 at allocation,
 then move it to S1 when the newly registered AR first becomes valid. This
 conservative line check is local to preselection; the
-normal eager path continues to retry after the writer drains. The two WB-push
+normal eager path also excludes S0 WT and retries after the writer drains. The two WB-push
 terms remain even though legal current ports phase-separate their simultaneous
 assertion (§6.3c), so future admission changes cannot silently break the gate.
 Only `lAlloc` may preselect: a store allocation still obeys configured

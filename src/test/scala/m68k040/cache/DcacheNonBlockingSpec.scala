@@ -1043,6 +1043,106 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     }
   }
 
+  test("normal AR selection excludes a same-line WT in S0", VerilatorTest) {
+    if (armOn("normalWtS0")) nbHotEagerDut.doSim("normal-wt-s0-selection") { dut =>
+      val cd = dut.clockDomain
+      cd.forkStimulus(10)
+      val lg = dut.dcache.logic
+      val pl = dut.probe.logic
+      var awOpen = false
+      val cold = new BehavioralMemAgent(lg.axi, cd,
+        dcfg = m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 80, dramCycles = 80),
+          deferWriteVisibilityUntilB = true, awReadyGate = () => awOpen))
+      m68k040.sim.AxiMemModel.attachReadOnly(lg.axiDh, cd,
+        m68k040.sim.AxiMemModelConfig(
+          latency = m68k040.sim.L2LatencyModel(enabled = true, hitCycles = 5, dramCycles = 5)),
+        sharedMem = cold.mem, sharedL2From = cold.model)
+      pl.loadCmdIn.valid #= false
+      pl.loadProbeIn.valid #= false
+      pl.loadProbeCancelIn.valid #= false
+      pl.storeIn.valid #= false
+      pl.maintCmdIn.valid #= false
+      dut.resolve.logic.resolveIn.valid #= false
+      cd.waitSampling(4)
+      cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
+      val u = 0xabc00L
+      val v = 0xabe00L
+      val x = 0xad000L
+      for (b <- 0 until 16) {
+        cold.pokeByte(u + b, 0x11)
+        cold.pokeByte(v + b, 0x11)
+        cold.pokeByte(x + b, 0x22)
+      }
+      var waitArWithTargetS0 = 0
+      var wtB = 0
+      var arBeforeB = 0
+      var arValidBeforeB = 0
+      var hotAr = 0
+      var response: Option[BigInt] = None
+      fork {
+        while (true) {
+          cd.waitSampling()
+          if (lg.nb.st.indices.exists(k =>
+                lg.nb.st(k).toInt == 1 && lg.nb.line(k).toLong == (x >>> 4)) &&
+              lg.s0Valid.toBoolean && lg.s0Payload.paddr.toLong == x &&
+              lg.s0Payload.cacheMode.toEnum == CacheMode.WRITETHROUGH)
+            waitArWithTargetS0 += 1
+          if (wtB < 3 && lg.axiDh.ar.valid.toBoolean) arValidBeforeB += 1
+          if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) {
+            hotAr += 1
+            if (wtB < 3) arBeforeB += 1
+          }
+          if (lg.axi.b.valid.toBoolean && lg.axi.b.ready.toBoolean &&
+              lg.axi.b.payload.id.toInt == AxiIds.D_STORE) wtB += 1
+          if (pl.loadRspOut.valid.toBoolean) response = Some(pl.loadRspOut.payload.data.toBigInt)
+        }
+      }
+      def store(a: Long, byte: Int): Unit = {
+        pl.storeIn.valid #= true
+        pl.storeIn.payload.paddr #= a
+        pl.storeIn.payload.data #= 0
+        pl.storeIn.payload.size #= Size.LONG
+        pl.storeIn.payload.useStrb #= true
+        pl.storeIn.payload.strb #= 0xffff
+        pl.storeIn.payload.lineData #= BigInt(f"$byte%02x" * 16, 16)
+        pl.storeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        pl.storeIn.payload.precise #= false
+        assert(pl.storeIn.ready.toBoolean, s"WT $a input was not ready")
+        cd.waitSampling()
+        pl.storeIn.valid #= false
+      }
+      store(u, 0x33)
+      store(v, 0x44)
+      store(x, 0x66)
+      pl.loadCmdIn.valid #= true
+      pl.loadCmdIn.payload.vaddr #= x
+      pl.loadCmdIn.payload.paddr #= x
+      pl.loadCmdIn.payload.size #= Size.LONG
+      pl.loadCmdIn.payload.cacheMode #= CacheMode.COPYBACK
+      pl.loadCmdIn.payload.token #= 1
+      pl.loadCmdIn.payload.lineOnly #= false
+      pl.loadCmdIn.payload.ooOk #= true
+      pl.loadCmdIn.payload.rid #= 0
+      pl.loadCmdIn.payload.ridValid #= true
+      assert(pl.loadCmdIn.ready.toBoolean, "load input was not ready")
+      cd.waitSampling()
+      pl.loadCmdIn.valid #= false
+      cd.waitSampling(8)
+      assert(waitArWithTargetS0 > 0,
+        s"normal AR S0 exclusion was not exercised: WAIT_AR+S0=$waitArWithTargetS0")
+      assert(arValidBeforeB == 0, "normal AR was advertised while target WT occupied S0")
+      awOpen = true
+      var n = 0
+      while ((response.isEmpty || wtB < 3) && n < 1000) { cd.waitSampling(); n += 1 }
+      assert(wtB == 3 && arBeforeB == 0 && arValidBeforeB == 0 && hotAr == 1,
+        s"normal AR crossed WT: B=$wtB earlyValid=$arValidBeforeB earlyFire=$arBeforeB AR=$hotAr")
+      assert(response.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("66666666", 16)),
+        s"normal AR returned stale data across WT B: $response")
+      println(s"[nbNormalS0] WAIT_AR+S0=$waitArWithTargetS0; B before AR; response=$response")
+    }
+  }
+
   test("eager and preselected AR retain store delay and full-line no-fill", VerilatorTest) {
     if (armOn("eagerArStoreDelay")) Seq(
       ("eager", nbHotEagerStoreDelayDut),
@@ -1678,6 +1778,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       val heldId = lg.axiDh.ar.payload.id.toInt
       assert(heldAddr == x)
       var heldCycles = 0
+      var s0ArHoldCycles = 0
       var arFire = 0
       var wtW = 0
       var wtB = 0
@@ -1693,6 +1794,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
               "hot AR address or ID changed while backpressured")
             heldCycles += 1
           }
+          if (lg.nbS0ArHold.toBoolean) s0ArHoldCycles += 1
           if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) arFire += 1
           if (lg.axi.w.valid.toBoolean && lg.axi.w.ready.toBoolean) wtW += 1
           if (lg.axi.b.valid.toBoolean && lg.axi.b.ready.toBoolean) wtB += 1
@@ -1720,6 +1822,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       assert(wtW == 0 && wtB == 0 && cold.peekByte(x) == 0x11,
         "the intervening WT store overtook a backpressured advertised AR")
       assert(heldCycles >= 20, s"only $heldCycles backpressured AR cycles were exercised")
+      assert(s0ArHoldCycles >= 15,
+        s"same-line WT was not held in S0 through ARREADY stall: $s0ArHoldCycles cycles")
       assert(arFire == 0 && loadRsp.isEmpty, "hot refill completed while ARREADY was held low")
       releaseAr = true
       n = 0

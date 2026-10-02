@@ -981,6 +981,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val nbVictimAdvanceForCmd: Bool = if (!nonBlocking) null else Bool()
     /** Registered-input hold on store S1 -> S2 (set/victim/resource interlocks). */
     val nbStoreHold: Bool     = if (!nonBlocking) null else Bool()
+    /** Hold a newer same-line WT descriptor in S0 behind an advertised hot AR. */
+    val nbS0ArHold: Bool      = if (!nonBlocking) null else Bool()
     /** Load command admission term (reorder rule + replay/serial holds). */
     val nbCmdReady: Bool      = if (!nonBlocking) null else Bool()
     /** The MSHR response slot drives `loadRsp` (through the missLine arm) this cycle. */
@@ -4718,7 +4720,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // measurement); simPublic is a no-op for synthesis.
     loadPortReserved.simPublic(); stS1Advance.simPublic()
     val stS1Ready   = !stS1Valid || stS1Advance
-    val s0Advance   = s0Valid && stS1Ready && !storePipeHeld
+    val s0Advance   =
+      if (!nonBlocking) s0Valid && stS1Ready && !storePipeHeld
+      else s0Valid && stS1Ready && !storePipeHeld && !nbS0ArHold
     val s0Ready     = !s0Valid || s0Advance
 
     /** The store held an S1 descriptor, was not blocked by a barrier or by the
@@ -6148,6 +6152,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
          lineOfPa(stS1Payload.paddr) === x) ||
         (stS2Valid && stS2Payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(stS2Payload.paddr) === x)
+      def wtS0To(x: UInt): Bool =
+        s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
+          lineOfPa(s0Payload.paddr) === x
       for (k <- 0 until N) blocked(k) := coldWriteTo(line(k))
 
       // ── AR issue (§3.3): one holding register, ID = MSHR index ──────────────────────
@@ -6174,7 +6181,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
       val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) &&
         (if (nbEagerAr) True else settled(k) && !blocked(k)) &&
-        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && arDelayOk(k)))
+        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && !wtS0To(line(k)) && arDelayOk(k)))
       // This optional path selects a newly allocated LOAD into the same AR holding
       // register. The normal WAIT_AR candidates keep priority. Preselection is one
       // cycle earlier than their gate, so also account for WT writes still in S0
@@ -6349,20 +6356,27 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val setConfS1 = (0 until N).map(k => validVec(k) && eset(k) === stS1Set && line(k) =/= s1Line).reduce(_ || _)
       val cbS1 = stS1Payload.cacheMode === CacheMode.COPYBACK
       val wtS1 = stS1Payload.cacheMode === CacheMode.WRITETHROUGH
+      // Keep an advertised AR and its ID/address stable. A younger WT store
+      // waits one stage earlier, in S0; excluding S0 WT at AR selection proves
+      // S1 cannot acquire a same-line WT while this AR is held. This removes the
+      // wide arAddr compare from S1 advance and the shared BRAM-read address cone.
+      nbS0ArHold := arV && wtS0To(lineOfPa(arAddr))
+      nbS0ArHold.simPublic()
       val inflightAllocs = pendingStoreMiss.asUInt.resize(3) + stgValid.asUInt.resize(3) + s2CbRes
       val resShort = (freeCnt.resize(3) < (U(1, 3 bits) + inflightAllocs)) ||
                      (wbFree < (U(1, 3 bits) + inflightAllocs))
       nbStoreHold := anyInv ||
         (stgValid && stgSet === stS1Set) || (ldS1Valid && ldS1Set === stS1Set) ||
         (stS2Valid && stS2Set === stS1Set) || (pendingStoreMiss && sSet === stS1Set) ||
-        (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort) ||
-        (stS1Valid && wtS1 && arV && lineOfPa(arAddr) === s1Line)
+        (cbS1 && setConfS1) || (cbS1 && !camS1 && resShort)
 
       nbIdle := !validVec.asBits.orR && (wbCount === 0) && !wbIssued && !anyW && !rV &&
                 !stgValid && !rqNonEmpty && !arV && !serialPending
 
       // ══ Simulation-only tripwires and counters ═══════════════════════════════════════
       GenerationFlags.simulation {
+        assert(!(stS1Valid && wtS1 && arV && lineOfPa(arAddr) === s1Line),
+          "DcachePlugin.nb: same-line WT reached S1 behind an advertised hot AR", FAILURE)
         assert(!(sAlloc && stgValid && lLine === sLine),
           "DcachePlugin.nb: a store and a load allocated the SAME line in one cycle", FAILURE)
         assert(!(sDo && !sCamAny && !(freeBits.orR)), "DcachePlugin.nb: store allocation with no free MSHR", FAILURE)
