@@ -114,3 +114,15 @@ matched physical result. The next miss-side timing work should inspect the
 staged-address-to-miss-line admission and refill-completion-to-translation
 control independently, while keeping parallel miss acceptance and the
 four-cycle hit path.
+
+The isolated frontend quiesce/prefetch-owner candidate `e01b0629` is **not** a
+fix for the Gshare-to-I-cache family. Focused tests and the 414-test fast gate
+passed, but a matched `PerfCounterSpec` tight eight-line walk regressed from
+2 I-cache misses / 6 useful prefetches on CPU `1dc6d0d9` to 8 misses / 0
+useful prefetches on the candidate. Its conservative same-set timeout skips
+prefetches the demand stream uses. The candidate also failed that test's
+late-prefetch coverage assertion; the baseline passed. The larger microbench
+could not support an IPC comparison because its *baseline* NOP-linearity
+validation failed (spread 0.0842 cycles/op versus a 0.05 limit). Leave this
+frontend branch isolated and design a fetch-command ownership boundary for
+the predictor→ITLB→I-cache-ready recurrence instead.
