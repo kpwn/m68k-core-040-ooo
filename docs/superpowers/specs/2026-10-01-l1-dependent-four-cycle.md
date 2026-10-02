@@ -209,3 +209,29 @@ this option without mapped and routed path evidence.
   nonnegative routed WNS and no new critical clock-enable/ready path through
   IQ selection or response bypass. If the response path cannot close,
   keep the default OFF and do not release T4 consumers speculatively.
+
+## Experimental evidence and remaining safety scope
+
+On the same agent79 source, `l2:5:60:4096`, seed 17, NB4/ring8, LS OoO,
+fused MOVEA, P1/P3, speculative wake, early line forward, and the NB
+early/eager/preselect/dynamic/probe-miss options, the 2 KiB chase measured
+644/128 = 5.031 cycles/hop with this option OFF and 517/128 = 4.039 ON.
+The 64 KiB chase measured 61598/4096 = 15.039 in both arms; the ON run
+recorded 128 live resident confirmations and 128 actual bypass fires for
+the 2 KiB chain, and zero confirmations for the 64 KiB chain. Logs:
+`/tmp/codex-agent79-fourcycle-final-{off,on}.log`. This is a dependent
+simulation result, not mapped or routed timing evidence.
+
+The focused shipping-core trap fixture forces a cold first read, then runs
+eight fused MOVEA loads around a three-line pointer ring, takes TRAP #0/RTE,
+and runs eight more. It checks the distinct expected pointer after each
+eight-load phase and a PASS sentinel, while counting actual LS operand-bypass
+fires before and after the exception. With the 60-cycle DRAM model it passed
+with 7 fires before and 7 after, 4 nonresident responses, 15 live resident
+hits, and bounded completion (`/tmp/codex-agent79-fourcycle-trap-r2.log`).
+This establishes real data-dependent activation across a completed exception;
+it does **not** force a trap on the same edge as an outstanding response or
+prove stale RID/physical-register reuse safe in every timing alignment.
+The broader wrong-RID, fault, split, response-contention and cancellation
+matrix above remains a separate acceptance gate. The option stays default
+OFF until those cases and physical timing are reviewed.

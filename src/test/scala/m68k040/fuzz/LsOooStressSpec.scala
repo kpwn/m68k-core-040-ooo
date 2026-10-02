@@ -41,6 +41,73 @@ class LsOooStressSpec extends AnyFunSuite {
     * counter; the split long lives at 0x12E so it never touches these addresses. */
   private val exactRegs = Seq(0x100L, 0x104L, 0x108L, 0x10CL, 0x110L).map(Dev - 0x100L + _)
 
+  // Registered only for the experimental four-cycle build. The ordinary random
+  // program below rarely contains its narrow fused MOVEA consumer, so passing that
+  // stress alone cannot establish that the live L1 operand bypass ever fired.
+  if (m68k040.top.ShippingCoreConfig.lsFourCycleL1) {
+    test("four-cycle resident MOVEA bypass survives TRAP/RTE and cold replay", VerilatorTest) {
+      val warm = Seq.fill(8)("    movea.l (%a5),%a5")
+      // Three different lines avoid the self-pointer's data-vacuity: if a bypass
+      // captures the previous address rather than the returned pointer, either
+      // eight-step checkpoint lands on the wrong node.
+      val beforeCheck = Seq("    cmpa.l #0x00088080,%a5", "    bne _bad")
+      val afterCheck  = Seq("    cmpa.l #0x00088040,%a5", "    bne _bad")
+      val src = (Seq(
+        "    .text", "_start:",
+        "    move.l #_traph,0x80",      // TRAP #0 vector
+        "    move.l #0x00088040,0x00088000",
+        "    move.l #0x00088080,0x00088040",
+        "    move.l #0x00088000,0x00088080",
+        "    lea 0x00088000,%a5",
+        "    cpushl %dc,(%a5)",         // preserve all three pointers in RAM
+        "    lea 0x00088040,%a4",
+        "    cpushl %dc,(%a4)",
+        "    lea 0x00088080,%a4",
+        "    cpushl %dc,(%a4)",
+        "    cinvl %dc,(%a5)",          // first read of each line is cold
+        "    lea 0x00088040,%a4",
+        "    cinvl %dc,(%a4)",
+        "    lea 0x00088080,%a4",
+        "    cinvl %dc,(%a4)"
+      ) ++ warm ++ beforeCheck ++ Seq("    trap #0") ++ warm ++ afterCheck ++ Seq(
+        "    lea 0xFFFF0000,%a6", "    move.l #0xC0FFEE00,%d0",
+        "    move.l %d0,(%a6)", "_halt:", "    bra _halt",
+        "_bad:", "    lea 0xFFFF0000,%a6", "    move.l #0xBAD40004,%d0",
+        "    move.l %d0,(%a6)", "    bra _halt",
+        "_traph:", "    rte"
+      )).mkString("\n")
+      var beforeTrap = 0L; var afterTrap = 0L
+      var preselect = 0L; var liveHit = 0L; var coldRsp = 0L
+      var exceptionEntries = 0L; var lastException = false; var trapSeen = false
+      val outcome = PortedTestRunner.run("fourcycle_trap_warm", src, Timeout,
+        cachePosture = CachePosture.ForceCacheableCopyback, liveness = true,
+        simSeed = 17, dcfg = m68k040.sim.L2Sweeps.l2DramSlow,
+        onDut = d => d.clockDomain.onSamplings {
+          val exception = !d.rob.logic.excIdle.toBoolean
+          if (exception && !lastException) {
+            exceptionEntries += 1
+            if (beforeTrap > 0) trapSeen = true
+          }
+          lastException = exception
+          if (d.iq.logic.p3Preselect.toBigInt != 0) preselect += 1
+          if (d.lsEu.logic.liveL1HeadGrant.toBoolean) liveHit += 1
+          if (d.dcache.logic.loadRspPort.valid.toBoolean &&
+              !d.dcache.logic.loadRspPort.payload.residentHit.toBoolean) coldRsp += 1
+          if (d.lsEu.logic.liveBaseBypass.toBoolean &&
+              d.lsEu.issuePort.valid.toBoolean && d.lsEu.issuePort.ready.toBoolean) {
+            if (trapSeen) afterTrap += 1 else beforeTrap += 1
+          }
+        })
+      println(s"[fourcycle-trap] outcome=$outcome before=$beforeTrap after=$afterTrap " +
+        s"p3=$preselect liveHit=$liveHit coldRsp=$coldRsp exceptionEntries=$exceptionEntries")
+      assert(outcome == PortedPass, s"four-cycle trap fixture failed: $outcome")
+      assert(beforeTrap > 0 && afterTrap > 0 && trapSeen && exceptionEntries > 0,
+        "eligible warm consumer did not actually bypass on both sides of TRAP/RTE")
+      assert(preselect >= beforeTrap + afterTrap && liveHit >= beforeTrap + afterTrap && coldRsp > 0,
+        "cold-to-warm response and exact live-hit confirmation were not exercised")
+    }
+  }
+
   private final case class Prog(src: String, reads: Map[Long, Int], writes: Map[Long, Int],
                                 rmw: Int, irq: Boolean)
 
