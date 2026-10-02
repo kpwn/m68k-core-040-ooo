@@ -35,7 +35,10 @@ case class FetchTargetQueueEntry() extends Bundle {
 class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        deferSlot1Conditional: Boolean = false,
                        trainSlot1Conditional: Boolean = false,
-                       deferTakenSlot1Conditional: Boolean = false)
+                       deferTakenSlot1Conditional: Boolean = false,
+                       computeDirectTargets: Boolean = false,
+                       deferSlot1Uncond: Boolean = false,
+                       deferSlot1Dbcc: Boolean = false)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -1251,9 +1254,146 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // drive the SAME slice-1 machinery: slot1 suppression, predTaken/predTarget
     // stamping, the effShift consume, and the registered fallback action — so a
     // RAS-predicted return redirects identically to a BTB taken branch.
-    val slot0Predicted    = slot0IsPred || rasPredictSlot0
+    // ── COMPUTED RELATIVE-BRANCH TARGETS (`computeDirectTargets`, 2026-09-26) ────
+    // EVERY target this frontend predicts is REMEMBERED: the BTB/FTB learn one at
+    // retire, the RAS holds pushed return PCs. Nothing computes a target from the
+    // instruction, even though a PC-relative branch carries its displacement in the
+    // very bytes already sitting in the aligner slot (`res.slot0.words`), and `s0IsBsr`
+    // right above already decodes one of these opwords for the RAS.
+    //
+    // The consequence is that a BTB/FTB MISS on a taken BRA/BSR is a full commit-time
+    // mispredict -- and that is the bucket the silicon class counters are dominated by.
+    // `perf(btb): 128 -> 512` argued the same thing from the other side ("a taken
+    // BRA/BSR has a FIXED PC-relative target and should never mispredict once learned;
+    // it only does if its entry was EVICTED") and answered it with CAPACITY. Capacity
+    // cannot win that argument: a static disassembly of the Q700 ROM this board boots
+    // has ~12,700 BRA/BSR sites and ~47,800 control transfers in total, so no
+    // affordable table covers the footprint -- while ~87% of the unconditional sites
+    // are PC-relative, i.e. exactly the ones whose target needs no table at all.
+    //
+    // So: compute it. `pc + 2 + sext(disp)` for the BRA/BSR encodings (0x60xx/0x61xx),
+    // used ONLY when neither the BTB nor the FTB supplied a prediction. Table cost
+    // zero, BRAM cost zero, predecode-width cost zero (the opword and its extension
+    // word are already in the packet -- see the UFA_W 384-bit BRAM cliff note).
+    //
+    // TIMING. This adds NO term to the combinational redirect / `ftbBlocked` cone: the
+    // decode-time fallback is already a two-step, and this only reaches the DATA input
+    // of `predictTargetReg` (via `predTargetSel`) plus one extra input on an existing
+    // mux. The redirect itself remains the registered C+1 `predictFire` action.
+    //
+    // SOUNDNESS. Wrong here is a PERF loss, never a correctness bug: the branch EU
+    // resolves and verifies every direction and target, so a bad guess is the ordinary
+    // commit-time redirect. It is nonetheless gated on all four independent facts the
+    // frontend already has -- `slot0IsCtrlXfer` (the refill-time predecode
+    // control-transfer bit that closes the stale-instruction hole, see its declaration),
+    // `res.slot0.simple`, the 0x6xxx opword class, and a `lenWords` agreement with the
+    // displacement form -- so a mis-framed or stale slot cannot reach it.
+    val s0RelCond    = s0op(11 downto 8)
+    val s0RelDisp8   = s0op(7 downto 0)
+    val s0RelDispW   = s0RelDisp8 === B"8'h00"     // 0x00 => 16-bit disp in words(1)
+    val s0RelDispL   = s0RelDisp8 === B"8'hFF"     // 0xFF => 32-bit disp (68020+), skipped
+    val s0RelDispExt = Mux(s0RelDispW, res.slot0.words(1).asSInt.resize(32),
+                                       s0RelDisp8.asSInt.resize(32))
+    val s0RelTarget  = (res.slot0.pc + U(2, 32 bits) + s0RelDispExt.asUInt).resize(32)
+    // cond 0 = BRA, cond 1 = BSR: both ALWAYS taken, so the direction needs no
+    // predictor either. cond >= 2 is a Bcc and is deliberately NOT computed here -- a
+    // conditional also needs a DIRECTION, and sourcing that from gshare on a BTB miss
+    // would widen the `phtValid` stamp set, which must stay bit-identical to the
+    // `gsShiftValid` set or GsharePlugin's whole-GHR repair installs a shifted history.
+    // That is a separate, riskier change; this one is direction-free by construction.
+    val s0RelIsUncond = (s0op(15 downto 12) === B"4'h6") &&
+                        ((s0RelCond === B"4'h0") || (s0RelCond === B"4'h1"))
+    val s0RelLenOk    = Mux(s0RelDispW, res.slot0.lenWords === U(2, 4 bits),
+                                        res.slot0.lenWords === U(1, 4 bits))
+    val slot0ComputedPred = if (computeDirectTargets)
+        res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer && s0RelIsUncond &&
+        !s0RelDispL && s0RelLenOk && !slot0IsPred && !rasPredictSlot0
+      else False
+    // ── SLOT-1 UNCONDITIONAL COVERAGE ───────────────────────────────────────────
+    // A control transfer that lands in SLOT 1 has NO decode-time predictor at all. The
+    // BTB is queried for slot0 only (`btbQueryValid0`); the dedicated slot-1 BTB read
+    // was deleted as the design's #1 failing setup cone (task #248) and its deferral
+    // handed to `slot1WouldFtq`. But the FTB holds ONE branch per EIGHT-BYTE WINDOW, so
+    // any window containing two control transfers can only ever cover one of them --
+    // and the other is then emitted with no prediction from anywhere.
+    //
+    // `BranchPredictIpcSpec`'s `br-ind` probe shows what that costs. Its `jsr (%a0)`
+    // and the loop's `bne.s` share one 8-byte window: the jsr mispredicts 1024/1024 as
+    // `uncond-ind-nopred` (no prediction at all -- not even a stale target) and the bne
+    // 1023/1024, while the SAME `jsr (%a0)` in `br-ind-2`, where it has the window to
+    // itself, is predicted and degrades only to `uncond-ind-wrongtgt`. Two branches per
+    // window is ordinary density in 68k code.
+    //
+    // An UNCONDITIONAL slot-1 transfer is the case where deferral is unambiguously
+    // right: it is taken by definition, so suppressing slot1 costs ONE fetch cycle and
+    // buys a ~13-cycle commit-time refill. (A slot-1 CONDITIONAL is NOT deferred here:
+    // a not-taken conditional is already free, which is exactly why the pre-existing
+    // `deferSlot1Conditional` / `deferTakenSlot1Conditional` experiments are separate
+    // knobs with their own secondary gshare lookup.)
+    //
+    // Same mechanism as `slot1WouldRasPred`: suppress slot1, and the transfer becomes
+    // slot0 next cycle where the BTB / RAS / computed-target paths all see it.
+    val s1RelDisp8   = s1op(7 downto 0)
+    val s1RelIsUncond = (s1op(15 downto 12) === B"4'h6") &&
+                        ((s1op(11 downto 8) === B"4'h0") || (s1op(11 downto 8) === B"4'h1"))
+    val s1IsJsrOp = s1op(15 downto 6) === B"10'b0100111010"   // JSR <ea>
+    val s1IsJmpOp = s1op(15 downto 6) === B"10'b0100111011"   // JMP <ea>
+    val slot1WouldUncond = if (deferSlot1Uncond)
+        ((s1RelIsUncond && (s1RelDisp8 =/= B"8'hFF")) || s1IsJsrOp || s1IsJmpOp) &&
+        res.slot1Valid && res.slot1.simple &&
+        res.slot0Valid && !slot0IsPred && !rasPredictSlot0 && !slot0ComputedPred
+      else False
+    spinal.core.sim.SimPublic(slot0ComputedPred, slot1WouldUncond, s0RelTarget)
+
+    // ── SLOT-1 DBcc COVERAGE ────────────────────────────────────────────────────
+    // DBcc is the 68k loop-closing instruction and NONE of the predicates above match
+    // it: it is line-5, so `s1RelIsUncond` (line-6) misses it, `slot1IsConditional`
+    // (line-6, cond>=2) misses it, and it is neither JSR/JMP nor RTS/RTR. A DBcc in
+    // slot 1 therefore emits with NO prediction from anywhere and falls through --
+    // mispredicting on every iteration it should have looped. Only `slot1WouldFtq` can
+    // catch it, and then only by luck of window placement.
+    //
+    // ROM census (420DBFF3, whole image): DBcc is 3.41% of control-transfer-shaped
+    // words. That STATIC share understates it badly -- a loop-closing branch executes
+    // once per ITERATION, so its dynamic weight is a multiple of its static count.
+    //
+    // ⛔ `DBT` IS EXCLUDED, and that exclusion is the whole subtlety. DBcc semantics are
+    // "if cc TRUE -> fall through WITHOUT decrementing; else decrement and branch while
+    // Dn != -1". So DBT (cond 0000, condition always true) NEVER loops -- it is an
+    // unconditional fall-through. Deferring it would cost an issue slot and buy exactly
+    // nothing. Same trap keeps RTD/RTE out of `slot1WouldUncond`: slot 0 has no
+    // predictor for those either (`s0IsReturn` is RTS||RTR only), so deferring them
+    // pays a cycle for no prediction. DBF/DBRA (cond 0001) is 78.8% of ROM DBcc and is
+    // the pure counted loop -- outcome depends on the counter alone.
+    //
+    // Affordability is the threshold `slot1WouldUncond` already argues: deferral costs
+    // ONE fetch cycle against a ~13-cycle commit-time refill, so it pays whenever the
+    // branch is taken more than ~1/13 of the time. A counted loop of N iterations is
+    // taken (N-1)/N -- at least 50% for any loop that loops at all.
+    val s1IsDbccOp = (s1op(15 downto 12) === B"4'h5") && (s1op(7 downto 3) === B"5'b11001")
+    val s1IsDbt    = s1op(11 downto 8) === B"4'h0"
+    val slot1WouldDbcc = if (deferSlot1Dbcc)
+        s1IsDbccOp && !s1IsDbt &&
+        res.slot1Valid && res.slot1.simple &&
+        res.slot0Valid && !slot0IsPred && !rasPredictSlot0 && !slot0ComputedPred
+      else False
+    spinal.core.sim.SimPublic(slot1WouldDbcc)
+
+    val slot0Predicted    = slot0IsPred || rasPredictSlot0 || slot0ComputedPred
+    // ── ONE slot-1 suppression predicate ────────────────────────────────────────
+    // Suppressing slot1 has TWO obligations that must never disagree: drop it from the
+    // emitted packet (`slot1ValidOut`), and consume only slot0's words from the
+    // instruction buffer (`effShift` / `decodePcNext`). These used to be two separately
+    // maintained term lists, and adding `slot1WouldUncond` to only the first one silently
+    // SHIFTED THE DEFERRED BRANCH OUT OF THE BUFFER -- the instruction vanished from the
+    // stream, `br-ind` executed a different program entirely and its self-check caught
+    // `d0 = 0` instead of 1024. The `effShift` comment had warned about exactly this.
+    // So the predicate is defined ONCE, here, and both consumers read it.
+    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
+                        slot1WouldFtq || slot1WouldUncond || slot1WouldDbcc || ftqConfirm
     val predictedThisEmit = slot0Predicted && !ftqConfirm
-    val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget, btbPredTarget0)
+    val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget,
+                            Mux(slot0ComputedPred, s0RelTarget, btbPredTarget0))
 
     // A permanently clamped, non-emittable instruction signals a wrong learned framing
     // claim. Dwell for three cycles because p0LiveReg intentionally reports one-cycle
@@ -1281,7 +1421,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // Suppress slot1 when slot0 is the predicted-taken branch (slot1 is wrong-path) OR
     // when slot1 WOULD be a predicted branch (defer it to slot0 next cycle). slot0Predicted
     // folds in a RAS-predicted return (slice 2): its slot1 is equally wrong-path.
-    when(slot0Predicted || slot1WouldRasPred || slot1WouldCondPred || slot1WouldFtq || ftqConfirm) {
+    when(suppressSlot1) {
       slot1ValidOut := False
     }
     // Stamp the prediction onto slot0 (rides to the EU). The target is the composed
@@ -1421,8 +1561,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // branch deferred to next cycle), consume only slot0's words (lenWords); else the
     // aligner's full shift. Without this, suppressing slot1 would still CONSUME its
     // words from the IBuf — losing the deferred branch / the wrong-path successor.
-    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
-                        slot1WouldFtq || ftqConfirm
+    // `suppressSlot1` is declared at the slot-1 deferral site above, with the ONE term
+    // list both this consume and the `slot1ValidOut` drop read (see its comment: keeping
+    // two lists is what loses a deferred branch).
     val effShift = Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth), res.shiftWords)
     // FMax (front-end floor): RETIME the decodePc advance so the late suppressSlot1 decision
     // (BTB/RAS prediction cones) muxes the 32-bit ADD RESULT instead of the adder's addend.

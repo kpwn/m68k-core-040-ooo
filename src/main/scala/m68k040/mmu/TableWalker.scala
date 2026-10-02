@@ -14,9 +14,10 @@ import spinal.lib.fsm._
   * cache mode) and produces a `WalkRsp` on `done`. Permission faults (non-resident /
   * write-protect / supervisor) are FLAGGED (no exception delivery this slice).
   *
-  * The walk sets the page descriptor's U bit (and M on a write access); those are
-  * architectural memory writes, so they are NOT written here — they are returned in
-  * `rsp.umWrite` for the owning plugin to QUEUE and drain at commit.
+  * Legacy mode returns the page descriptor's U/M change through `rsp.umWrite`.
+  * Batch mode additionally records root/pointer U and page U/M in walk order,
+  * including a partial batch on a later descriptor fault. Both are deferred
+  * architectural writes; callers must reserve storage and authorize at head.
   *
   * MEMORY PORT: the three descriptor reads are ordinary `DcacheService` LOAD commands,
   * arbitrated onto the D-cache's single load port by `LsEuPlugin` alongside the LS pipe
@@ -49,7 +50,7 @@ import spinal.lib.fsm._
   * the AXI-id guard the dedicated port used to carry.
   *
   * Bounded latency: three dependent reads. Single-outstanding (one walk at a time). */
-class TableWalker extends Component {
+class TableWalker(batchMode: Boolean = false) extends Component {
   val io = new Bundle {
     val start = in Bool ()
     val req   = in(WalkReq())
@@ -135,6 +136,9 @@ class TableWalker extends Component {
   val rUmValid = Reg(Bool())
   val rUmAddr  = Reg(UInt(32 bits))
   val rUmByte  = Reg(Bits(8 bits))
+  val rBatchValid = Vec.fill(3)(RegInit(False))
+  val rBatchAddr  = Vec.fill(3)(Reg(UInt(32 bits)) init 0)
+  val rBatchMask  = Vec.fill(3)(Reg(Bits(8 bits)) init 0)
   // Task #210: the leaf descriptor's M bit as it stands after this walk's own
   // U/M update (see WalkRsp.modified doc).
   val rModified = Reg(Bool())
@@ -197,6 +201,17 @@ class TableWalker extends Component {
       }
     }
   }
+  // A self-referential table may fetch a descriptor whose low byte was
+  // already marked used earlier in THIS walk. The physical update is deferred,
+  // so reflect the ordered earlier OR in the later descriptor's decoded value.
+  val ownBytes = (0 until 4).map { off =>
+    val ownMask = (0 until 3).map(i =>
+      Mux(rBatchValid(i) && (rBatchAddr(i) === (descAddr + U(off, 32 bits))),
+        rBatchMask(i), B(0, 8 bits))).reduce(_ | _)
+    descRspData(31 - 8 * off downto 24 - 8 * off) | ownMask
+  }
+  val descRspOwnData = ownBytes(0) ## ownBytes(1) ## ownBytes(2) ## ownBytes(3)
+  val decodedDesc = if (batchMode) descRspOwnData else descRspData
 
   val fsm = new StateMachine {
     val IDLE     = new State with EntryPoint
@@ -234,6 +249,7 @@ class TableWalker extends Component {
         rFault  := False
         rReason := MmuFaultReason.NONE
         rUmValid := False
+        for (i <- 0 until 3) { rBatchValid(i) := False }
         // root descriptor address = rootPtr + rootIdx*4
         val rootBase = io.req.rootPtr
         val rootOff  = MmuDesc.rootOffset(io.req.vpn)                      // rootIdx(7)*4
@@ -248,7 +264,7 @@ class TableWalker extends Component {
     RD_ROOT.whenIsActive {
       issueRead()
       when(descRspValid) {
-        val d = descRspData
+        val d = decodedDesc
         when(descRspFault) {
           descFault()
           goto(FINISH)
@@ -256,6 +272,11 @@ class TableWalker extends Component {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
           goto(FINISH)
         } otherwise {
+          when(!MmuDesc.tblUsed(d)) {
+            rBatchValid(0) := True
+            rBatchAddr(0) := descAddr + 3
+            rBatchMask(0) := B"00001000"
+          }
           accWriteProt := accWriteProt | MmuDesc.tblWriteProt(d)
           // pointer descriptor address = nextBase + ptrIdx*4
           val base = MmuDesc.tblNextBase(d)
@@ -271,7 +292,7 @@ class TableWalker extends Component {
     RD_PTR.whenIsActive {
       issueRead()
       when(descRspValid) {
-        val d = descRspData
+        val d = decodedDesc
         when(descRspFault) {
           descFault()
           goto(FINISH)
@@ -279,6 +300,11 @@ class TableWalker extends Component {
           rFault := True; rReason := MmuFaultReason.NON_RESIDENT
           goto(FINISH)
         } otherwise {
+          when(!MmuDesc.tblUsed(d)) {
+            rBatchValid(1) := True
+            rBatchAddr(1) := descAddr + 3
+            rBatchMask(1) := B"00001000"
+          }
           accWriteProt := accWriteProt | MmuDesc.tblWriteProt(d)
           val base = MmuDesc.tblNextBase(d)
           // Task #195: pointer->page-table offset = PGI*4, but PGI itself is 6 bits
@@ -302,7 +328,7 @@ class TableWalker extends Component {
         goto(FINISH)
       }
       when(descRspValid && !descRspFault) {
-        val d = descRspData
+        val d = decodedDesc
         pageDescAddr := descAddr
         val wp  = accWriteProt | MmuDesc.pgWriteProt(d)
         val sup = MmuDesc.pgSupervisor(d)
@@ -330,6 +356,19 @@ class TableWalker extends Component {
         // only queue if a bit actually changes
         val changes = (newByte =/= curByte)
         rUmValid := noFault && changes
+        // U is set on an encountered resident page even if the access later
+        // faults on permission; M requires a permitted write.  An invalid page
+        // descriptor is not modified.  The batch travels with the fault so an
+        // at-head owner can finish the earlier U writes before taking it.
+        val setU = !MmuDesc.pgUsed(d)
+        val setPermittedM = reqReg.isWrite && !wp && !(sup && !reqReg.isSuper) &&
+                            !MmuDesc.pgModified(d)
+        when(MmuDesc.pgResident(d) && (setU || setPermittedM)) {
+          rBatchValid(2) := True
+          rBatchAddr(2) := descAddr + 3
+          rBatchMask(2) := (setU ? B"00001000" | B(0, 8 bits)) |
+                           (setPermittedM ? B"00010000" | B(0, 8 bits))
+        }
         // Task #210: newByte(4) is the M bit as it stands after this walk's own
         // update (curByte's M, OR'd with setM on a write) -- exactly what the
         // owning TLB should cache for this entry regardless of whether `changes`
@@ -389,5 +428,10 @@ class TableWalker extends Component {
   io.rsp.umWrite.valid   := rUmValid
   io.rsp.umWrite.addr    := rUmAddr
   io.rsp.umWrite.newByte := rUmByte
+  for (i <- 0 until 3) {
+    io.rsp.umBatch.updates(i).valid := rBatchValid(i)
+    io.rsp.umBatch.updates(i).addr := rBatchAddr(i)
+    io.rsp.umBatch.updates(i).setMask := rBatchMask(i)
+  }
   io.rsp.modified        := rModified
 }

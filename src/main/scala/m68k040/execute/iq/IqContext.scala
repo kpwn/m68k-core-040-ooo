@@ -9,6 +9,25 @@ case class IqContext() extends Bundle {
   val robId = UInt(m68k040.Global.ROB_ID_W_DEFAULT bits)
 }
 
+/** One eligibility predicate shared by IQ hot predecode and the LS operand
+  * capture recheck. Keeping one definition prevents a hot-eligible/cold-ineligible
+  * uop from being released without its matching data bypass. */
+object FourCycleLoadForm {
+  def applies(u: RenamedUop): Bool =
+    (u.op === m68k040.decode.DecOp.MOVE) &&
+      (u.cluster === m68k040.isa.Cluster.LS) &&
+      (u.memOp === m68k040.isa.MemOp.LOAD) &&
+      (u.size === m68k040.isa.Size.LONG) &&
+      u.firstOfInstr && u.lastOfInstr && u.pdstValid &&
+      (u.dstArch >= U(8, 5 bits)) && (u.dstArch < U(16, 5 bits)) &&
+      u.psrcAValid && !u.psrcBValid && !u.psrcCValid &&
+      (u.imm === B(0, 32 bits)) &&
+      (u.eaAuto === m68k040.decode.EaAuto.NONE) &&
+      !u.stkPush && !u.altAddrSpace && !u.ccrRestore &&
+      !u.needsSupervisor && !u.leaAddr && !u.movesAliasStore &&
+      !u.writesNzvc && !u.writesX
+}
+
 /** The NARROW per-slot record: exactly the `IqContext` fields the issue queue's OWN
   * combinational logic reads, plus the address of the cold (dispatch-only) remainder.
   *
@@ -91,6 +110,24 @@ case class IqHot() extends Bundle {
   val isLsClass   = Bool()
   val isCplxClass = Bool()
   val srcBRead    = Bool()
+  // An LS-class uop that is specifically a LOAD -- not a store, and not a LEA
+  // address-generate (`memOp === NONE`). The ONLY reader is the speculative-wakeup clear,
+  // which releases a consumer before the producing load is known to have hit; restricting
+  // it to loads is what keeps a STORE's address off the speculative path. Precomputed here
+  // rather than tested as `isLsClass && memOp === LOAD` in the clear, for the reason this
+  // record exists at all: the clear is a tight reg-to-reg path replicated across all 16
+  // slots, and it should read one flop, not decode an enum.
+  val isLsLoad    = Bool()
+  // FIRST µop of its macro-instruction. Read ONLY by the relaxed LS eligibility, to keep
+  // out-of-order LS issue from reordering WITHIN a macro: if a bypassing uop is the first
+  // of its instruction then every older LS uop belongs to a strictly older macro, which is
+  // the precondition that makes the inhibited-barrier violation RECOVERABLE (the restart
+  // PC must be a macro boundary -- see RobPlugin's `h0IsMacroLast`).
+  val firstOfInstr = Bool()
+  /** Exact fused simple-An long-load form for the optional T3 oldest-only
+    * preselect. The cold LUTRAM record has these fields but its async read is
+    * deliberately kept out of the select cone. */
+  val fourCycleBaseLoad = Bool()
 
   // ---- Destinations. Read by the RETIMED (C+1) static-scoreboard clear, which decodes
   // off the registered select-port payload. Keeping these in the hot record is what
@@ -140,6 +177,9 @@ case class IqHot() extends Bundle {
       (u.memOp =/= m68k040.isa.MemOp.NONE || u.leaAddr)
     isCplxClass := u.cluster === m68k040.isa.Cluster.CPLX
     srcBRead := u.psrcBValid && (!u.useImm || isLsClass || srcBRegDespiteImm)
+    isLsLoad := isLsClass && (u.memOp === m68k040.isa.MemOp.LOAD)
+    firstOfInstr := u.firstOfInstr
+    fourCycleBaseLoad := FourCycleLoadForm.applies(u)
     isDivFam          := (u.op === m68k040.decode.DecOp.DIV) ||
                          (u.op === m68k040.decode.DecOp.DIVREM)
     leaAddr := u.leaAddr; isBranch := u.isBranch; useImm := u.useImm

@@ -1,6 +1,7 @@
 package m68k040.mmu
 
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 
 case class UmWriteAlloc() extends Bundle {
@@ -48,15 +49,16 @@ case class UmWriteDrain() extends Bundle {
   * produces an architectural memory write. Those are NOT performed speculatively:
   * each is QUEUED here tagged with the triggering instruction's robId, and:
   *   - commit (ROB retired that robId) -> mark the entry committed
-  *   - drain  : the OLDEST committed entry drives a single-byte descriptor write,
-  *              held until `drainAck`, then pops (in program order)
+  *   - drain  : the OLDEST COMMITTED entry drives a single-byte descriptor write,
+  *              held until `drainAck`, then vacates its slot (commit order)
   *   - flush  : speculative (uncommitted) entries are discarded -> never written
-  * Mirrors the StoreQueue commit-drain/flush discipline (all state RegInit; the
-  * count is a hardware sum; flush rolls the tail back past the youngest committed). */
+  * Four independently valid slots avoid head-of-line deadlock when a younger
+  * walk allocated first but an older ROB owner committed first. */
 class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
-  require(isPow2(depth))
+  require(depth >= 2 && isPow2(depth))
   require(Set(2, 4, 8, 16)(retireWidth))
   val ptrW = log2Up(depth)
+  private val seqW = log2Up(2 * depth + 1)
 
   val io = new Bundle {
     val alloc    = slave(Flow(UmWriteAlloc()))
@@ -70,7 +72,7 @@ class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
     val drain    = master(Flow(UmWriteDrain()))
     val drainAck = in Bool ()
     // Admission credit for the owning single walker. A full queue must never
-    // silently wrap `tail` and overwrite an older architectural U/M update.
+    // overwrite a live architectural U/M update.
     val full     = out Bool ()
     // (2026-09-09: the task #210 `pageQuery`/`pageHazard` interlock that used to live
     // here has been REMOVED. See the "WHY THERE IS NO SAME-PAGE INTERLOCK" note below
@@ -107,115 +109,127 @@ class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
   //     access has been translated, i.e. strictly after the point any request-side
   //     interlock could act.
   //
-  // (c) AND A CORRECTED INTERLOCK WOULD DEADLOCK. Entries are allocated in WALK
+  // (c) A CORRECTED INTERLOCK STILL NEEDS ROB AGE. Entries are allocated in WALK
   //     COMPLETION order, which is LS ISSUE order (IssueQueuePlugin selects the oldest
-  //     READY op, not the oldest op), not program order. So the queue can hold a
-  //     YOUNGER instruction's entry ahead of an OLDER one's. Blocking an older access on
-  //     a younger entry -- which a correct physical-page compare would do -- stalls the
-  //     older access until the younger retires, and the younger cannot retire until the
-  //     older does. That is a hard deadlock, and it is exactly what the domain mismatch
-  //     has been hiding. Any future interlock here must first make allocation
-  //     program-ordered, or drain committed entries out of order.
+  //     READY op, not the oldest op), not program order. This queue now drains an
+  //     eligible committed entry past an uncommitted younger predecessor, removing
+  //     the old head-of-line blocker. A physical-byte interlock must nevertheless
+  //     distinguish older from younger entries: waiting on ANY matching speculative
+  //     entry can still deadlock against an instruction that cannot yet retire.
   //
-  // Residual, unchanged by this note and NOT introduced by it: the drain is a whole-BYTE
-  // RMW and that byte also carries PDT/W/CM/S. Software that rewrites a descriptor
-  // between a walk's read and the drain has its change clobbered. No interlock in this
-  // file ever addressed that, and a VPN-vs-PPN compare could not have.
+  // The DTLB/ITLB drain now re-reads and ORs only U/M rather than replaying a
+  // sampled whole byte. Cross-queue age ordering against an ordinary software
+  // descriptor store is still a separate architectural requirement: this queue
+  // alone cannot tell whether that SQ store should precede its metadata write.
   val valids    = Vec.fill(depth)(RegInit(False))
   val committed = Vec.fill(depth)(RegInit(False))
-  /** Set by `flush` on a speculative entry that could not simply be rolled off the tail
-    * (see the flush block). A dead entry keeps its slot -- so the ring stays contiguous
-    * -- and pops at the head in one cycle WITHOUT issuing its descriptor write. */
-  val dead      = Vec.fill(depth)(RegInit(False))
   val robIds    = Vec.fill(depth)(RegInit(U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)))
   val addrs     = Vec.fill(depth)(RegInit(U(0, 32 bits)))
   val bytes     = Vec.fill(depth)(RegInit(B(0, 8 bits)))
-
-  val head = RegInit(U(0, ptrW bits))
-  val tail = RegInit(U(0, ptrW bits))
+  // Commit order, not walk-allocation order, is the architectural order. Only
+  // notices matching NEWLY committed live entries advance nextSeq: arbitrarily
+  // many unrelated ROB commits cannot age a stalled entry. While an offer is
+  // held, at most depth-1 OTHER entries can enter this four-slot queue, so
+  // surviving stamps are at most depth apart. seqW's modulus is strictly
+  // greater than 2*depth, so subtract-and-compare is unambiguous across wrap.
+  // Two entries of one owner stamped on the same edge tie and use physical
+  // slot index as the deterministic order. A born-committed allocation in a
+  // multi-lane retire cycle is stamped AFTER those retirement lanes.
+  val commitSeq = Vec.fill(depth)(Reg(UInt(seqW bits)) init 0)
+  val nextSeq   = Reg(UInt(seqW bits)) init 0
+  nextSeq.simPublic()
   io.full := valids.asBits.andR
+  val freeSlot = OHToUInt(OHMasking.first(~valids.asBits))
 
-  // ---- drain: oldest valid+committed entry, held until ack ----
-  val drainBusy  = RegInit(False)
-  /** A flush-killed entry at the head. It writes NOTHING and retires in one cycle; it
-    * exists only so the ring's [head, tail) contiguity survives a flush (see below). */
-  val headDead   = valids(head) && dead(head) && !drainBusy
-  val headReady  = valids(head) && committed(head) && !dead(head) && !io.flush
-  // LEVEL held until `drainAck` -- what the comment above always claimed. As
-  // `headReady && !drainBusy` with `when(drainIssue){drainBusy := True}` this was a
-  // ONE-CYCLE PULSE that cancelled itself, stranding the entry FOREVER if the consumer
-  // could not accept on that exact cycle: drainBusy stayed set, the queue never
-  // re-offered, the ack could never arrive, the queue filled, `io.full` withheld the
-  // walker's admission credit, and the machine deadlocked.
-  val drainIssue = headReady
-  io.drain.valid         := drainIssue
-  io.drain.payload.addr    := addrs(head)
-  io.drain.payload.newByte := bytes(head)
-
-  when(drainIssue) { drainBusy := True }
-  // Withdraw the offered flag if the head stops being drainable, so a stale
-  // `drainBusy` can never block `headDead` retirement.
-  when(!headReady) { drainBusy := False }
-  when(io.drainAck && drainBusy) {
-    drainBusy    := False
-    valids(head) := False
-    head := head + 1
-  }
-  // Retire a dead entry with no bus activity at all. Cannot collide with the ack arm
-  // above: `drainBusy` is only ever set for an entry that was `committed && !dead`, and
-  // `headDead` is gated on `!drainBusy`.
-  when(headDead) {
-    valids(head) := False
-    dead(head)   := False
-    head := head + 1
-  }
-
-  // ---- commit: mark the matching valid entry committed ----
+  // ---- commit: stamp matching entries in architectural retirement order ----
   val commitNotices = Seq(io.commit, io.commitB) ++
     (if(retireWidth > 2) io.commitExtra.toSeq else Seq.empty)
+  val laneCreates = commitNotices.zipWithIndex.map { case (c, lane) =>
+    val duplicate = commitNotices.take(lane).map(e => e.valid &&
+      (e.payload === c.payload)).foldLeft(False: Bool)(_ || _)
+    c.valid && !duplicate && (0 until depth).map(i => valids(i) &&
+      !committed(i) && (robIds(i) === c.payload)).reduce(_ || _)
+  }
+  val commitCount = CountOne(B(laneCreates))
   for (i <- 0 until depth) {
-    when(valids(i) && commitNotices.map(c => c.valid && c.payload === robIds(i)).reduce(_ || _)) {
-      committed(i) := True
+    for (lane <- commitNotices.indices) {
+      val c = commitNotices(lane)
+      val earlier = commitNotices.take(lane).map(e => e.valid &&
+        (e.payload === robIds(i))).foldLeft(False: Bool)(_ || _)
+      when(valids(i) && !committed(i) && c.valid &&
+           (c.payload === robIds(i)) && !earlier) {
+        committed(i) := True
+        val offset = if (lane == 0) U(0, seqW bits)
+                     else CountOne(B(laneCreates.take(lane))).resize(seqW bits)
+        commitSeq(i) := nextSeq + offset
+      }
+    }
+  }
+  val bornCommitted = io.alloc.valid && !io.flush && !io.full && io.alloc.payload.preCommitted
+  nextSeq := nextSeq + commitCount.resize(seqW bits) + bornCommitted.asUInt.resize(seqW bits)
+
+  // ---- alloc: use any free slot; no ring hole can block an older drain ----
+  when(io.alloc.valid && !io.flush) {
+    assert(!io.full, "UmWriteQueue allocation attempted while full")
+  }
+  when(io.alloc.valid && !io.flush && !io.full) {
+    valids(freeSlot)    := True
+    committed(freeSlot) := io.alloc.payload.preCommitted
+    commitSeq(freeSlot) := nextSeq + commitCount.resize(seqW bits)
+    robIds(freeSlot)    := io.alloc.payload.robId
+    addrs(freeSlot)     := io.alloc.payload.addr
+    bytes(freeSlot)     := io.alloc.payload.newByte
+  }
+
+  // A flush discards only truly speculative entries. A simultaneous retirement
+  // notice is treated as architectural, even before its register updates.
+  when(io.flush) {
+    for (i <- 0 until depth) {
+      val committingNow = commitNotices.map(c => c.valid &&
+        (c.payload === robIds(i))).reduce(_ || _)
+      when(valids(i) && !committed(i) && !committingNow) { valids(i) := False }
     }
   }
 
-  // ---- alloc: push at tail (speculative) ----
-  when(io.alloc.valid && !io.flush) {
-    assert(!io.full, "UmWriteQueue allocation attempted while full")
-    valids(tail)    := True
-    // Born committed when the producer has no owning robId -- see `preCommitted`.
-    committed(tail) := io.alloc.payload.preCommitted
-    dead(tail)      := False
-    robIds(tail)    := io.alloc.payload.robId
-    addrs(tail)     := io.alloc.payload.addr
-    bytes(tail)     := io.alloc.payload.newByte
-    tail := tail + 1
+  // ---- drain: oldest committed stamp, held stable until terminal ack ----
+  var bestValid: Bool = False
+  var bestSlot: UInt = U(0, ptrW bits)
+  var bestAge: UInt = U(0, seqW bits)
+  for (i <- 0 until depth) {
+    val eligible = valids(i) && committed(i)
+    val age = nextSeq - commitSeq(i)
+    val choose = eligible && (!bestValid || (age > bestAge))
+    bestSlot = Mux(choose, U(i, ptrW bits), bestSlot)
+    bestAge = Mux(choose, age, bestAge)
+    bestValid = bestValid || eligible
   }
-
-  // ---- flush: kill speculative (uncommitted) entries, KEEP every committed one ----
-  //
-  // THE BUG THIS REPLACES (2026-09-09). The previous body cleared every non-kept slot
-  // and then set `tail := head + CountOne(keep)` -- a POPULATION count of the surviving
-  // entries, not a PREFIX count from `head`. That is only correct when the committed
-  // entries form a contiguous run starting at `head`, and they need not: entries are
-  // allocated in walk-COMPLETION order, which is LS ISSUE order, not program order (see
-  // point (c) in the note at the top of this file), while `commit` arrives in program
-  // order. So a committed entry can sit BEHIND an uncommitted one, and then:
-  //   * `head` was left pointing at a slot whose `valid` had just been cleared, so
-  //     `headReady` was false forever and the queue never drained again;
-  //   * `tail` landed ON the surviving committed entry, which the next allocation
-  //     overwrote -- silently LOSING an architectural U/M descriptor write;
-  //   * the structure only healed on a later flush that happened to find nothing
-  //     committed (`tail` back to `head`), so the loss was intermittent.
-  // Losing an M means a page that IS dirty is later evicted as clean.
-  //
-  // THE FIX. `tail` is not moved and no slot is vacated out of turn, so [head, tail)
-  // stays contiguous by construction. A speculative entry is instead marked DEAD: it
-  // keeps its position, never issues its write, and retires at the head in a single
-  // cycle (see `headDead`). Slots therefore free up one cycle later than before in the
-  // common case, and correctly rather than never in the case that used to corrupt.
-  when(io.flush) {
-    for (i <- 0 until depth) when(valids(i) && !committed(i)) { dead(i) := True }
+  val drainBusy = RegInit(False)
+  val drainSlot = Reg(UInt(ptrW bits)) init 0
+  val offerSlot = Mux(drainBusy, drainSlot, bestSlot)
+  // Retain the pre-existing one-cycle valid withdrawal on flush; the latched
+  // offer slot and payload survive it and are re-offered unchanged next cycle.
+  io.drain.valid := (drainBusy || bestValid) && !io.flush
+  io.drain.payload.addr := addrs(offerSlot)
+  io.drain.payload.newByte := bytes(offerSlot)
+  when(io.drain.valid && !drainBusy) {
+    drainBusy := True
+    drainSlot := offerSlot
+  }
+  when(io.drainAck && drainBusy) {
+    drainBusy := False
+    valids(drainSlot) := False
+  }
+  GenerationFlags.simulation {
+    assert(!(io.drainAck && !drainBusy),
+      "UmWriteQueue: drain ack without an offered committed entry", FAILURE)
+    when(drainBusy) {
+      assert(valids(drainSlot) && committed(drainSlot),
+        "UmWriteQueue: held drain slot lost its committed identity", FAILURE)
+    }
+    for (i <- 0 until depth) when(valids(i) && committed(i)) {
+      assert((nextSeq - commitSeq(i)) <= U(depth, seqW bits),
+        "UmWriteQueue: commit sequence span exceeded live-slot capacity", FAILURE)
+    }
   }
 
   // ── monotonicity tripwire (sim-only) ──────────────────────────────────────────
@@ -226,7 +240,7 @@ class UmWriteQueue(depth: Int = 4, retireWidth: Int = 2) extends Component {
   GenerationFlags.simulation {
     when(io.alloc.valid && !io.flush) {
       for (i <- 0 until depth) {
-        when(valids(i) && !dead(i) && (addrs(i) === io.alloc.payload.addr)) {
+        when(valids(i) && (addrs(i) === io.alloc.payload.addr)) {
           assert((io.alloc.payload.newByte & bytes(i)) === bytes(i),
             "UmWriteQueue: a newly queued U/M descriptor byte CLEARS a bit an already-queued " +
             "write to the same address had set -- the monotonicity the removed same-page " +

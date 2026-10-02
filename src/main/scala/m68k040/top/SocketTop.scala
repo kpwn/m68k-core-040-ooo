@@ -98,35 +98,35 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     val eu0 = new m68k040.execute.AluEuPlugin
     val eu1 = new m68k040.execute.AluEuPlugin
     val branchEu = new m68k040.execute.BranchEuPlugin
-    val lsEu = new m68k040.execute.LsEuPlugin(
-      alignedLoadFallThrough = ipcThroughput, earlyIntWakeup = ipcThroughput,
-      sqSubwordForwarding = ipcThroughput, reserveLateStore = ipcThroughput,
-      detachLateStore = ipcThroughput, forwardOnPublish = ipcThroughput,
-      earlyNzvcWakeup = ipcThroughput, detachedStoreEntries = if(ipcThroughput) 4 else 1,
-      earlyAutoStoreAddress = ipcLateStore, earlyStoreDataWake = ipcLateStore,
-      // Early An write-back at S1 instead of LS completion. An auto-update store, a
-      // stack push and LEA all write an int result that is a register plus a CONSTANT,
-      // yet all three waited for the memory pipeline. Measured under the board's
-      // throughput-v2 profile with IPC_MEM=l2: +34.1% on call/return (bsr's A7 feeds
-      // rts's pop address) and -13.6% cycles on copy-dense code, seed-robust across
-      // three seeds, zero regressions across 34 kernels.
-      earlyAutoAnWriteback = ipcThroughput,
-      // SPECULATIVE LOAD WAKEUP. Announce an aligned, cacheable, already-translated
-      // load's pdst at CACHE LAUNCH rather than at its response -- one cycle earlier than
-      // `earlyIntWakeup`'s irrevocable announce, and therefore a prediction that the
-      // access hits L1. The released consumer is held at the IQ's LS issue register until
-      // the real announce confirms it, so a miss costs the cycles it would have cost
-      // anyway and a FAULT leaves the consumer unissued exactly as today. Only LS-class
-      // consumers are released, which is what makes the hold deadlock-free (LS issue is
-      // strictly in program order).
-      //
-      // NOT loadBypassUnreadyLoad: nothing is reordered here. LS issue order, the SQ
-      // forward, the inhibited-store barriers and `olderInhibitedStore` all see exactly
-      // the sequence they see today; the only change is WHEN a consumer becomes
-      // selectable, and every consumer still reaches its EU strictly after the writeback.
-      specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP)
+    // Built by `ShippingPlugins.lsEu`, the SAME function the shipping sim harnesses call.
+    // Why these knobs (moved here verbatim from the old inline constructor):
+    // Early An write-back at S1 instead of LS completion. An auto-update store, a
+    // stack push and LEA all write an int result that is a register plus a CONSTANT,
+    // yet all three waited for the memory pipeline. Measured under the board's
+    // throughput-v2 profile with IPC_MEM=l2: +34.1% on call/return (bsr's A7 feeds
+    // rts's pop address) and -13.6% cycles on copy-dense code, seed-robust across
+    // three seeds, zero regressions across 34 kernels.
+    // SPECULATIVE LOAD WAKEUP. Announce an aligned, cacheable, already-translated
+    // load's pdst at CACHE LAUNCH rather than at its response -- one cycle earlier than
+    // `earlyIntWakeup`'s irrevocable announce, and therefore a prediction that the
+    // access hits L1. The released consumer is held at the IQ's LS issue register until
+    // the real announce confirms it, so a miss costs the cycles it would have cost
+    // anyway and a FAULT leaves the consumer unissued exactly as today. Only LS-class
+    // consumers are released, which is what makes the hold deadlock-free (LS issue is
+    // strictly in program order).
+    //
+    // NOT loadBypassUnreadyLoad: nothing is reordered here. LS issue order, the SQ
+    // forward, the inhibited-store barriers and `olderInhibitedStore` all see exactly
+    // the sequence they see today; the only change is WHEN a consumer becomes
+    // selectable, and every consumer still reaches its EU strictly after the writeback.
+    // Out-of-order LS issue needs the LS-side inhibited barrier; same switch as the IQ.
+    val lsEu = ShippingPlugins.lsEu(ipcThroughput = ipcThroughput, ipcLateStore = ipcLateStore,
+      specLoadWakeup = ShippingPlugins.specLoadWakeup(ipcThroughput),
+      lsOooIssue = SocketTopConfig.LS_OOO_ISSUE)
     val divEu = new m68k040.execute.DivEuPlugin
-    val icache = new IcachePlugin(icachePredecodeWords)
+    val icache = ShippingPlugins.icache(icachePredecodeWords)
+    // Bound to a val (non-blocking L1D, P6) so the hot door `axiDh` can be reached below.
+    val dcache = ShippingPlugins.dcache(socketMerged = true)
     val merge  = new AxiDMergePlugin()
     val iplAck = new IplAckPlugin(enable = true)
     val periph = new PeripheralResetPlugin(enable = true,
@@ -139,26 +139,24 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
       new MmuControlPlugin(),
       new m68k040.execute.FpuControlPlugin(),
       new m68k040.exception.InterruptControlPlugin(),
-      new ItlbPlugin(),
+      ShippingPlugins.itlb(),
       new DtlbPlugin(),
       icache,
       // Early virtual-set reads ARE enabled: the DTLB response qualifies them
       // through loadProbeResolve. Only pretranslated hints at probe launch are
       // disabled; the LSU has no physical address at that point.
-      new DcachePlugin(socketMerged = true, allowPretranslatedProbeHints = false),
+      dcache,
       new m68k040.frontend.BtbPlugin(),
       new m68k040.frontend.FtbPlugin(),
-      new m68k040.frontend.RasPlugin(),
-      new m68k040.frontend.GsharePlugin(retainRedirectHistory = ipcThroughput),
-      new m68k040.frontend.FetchAlignPlugin(enableFetchDirected = true,
-        trainSlot1Conditional = ipcThroughput, deferTakenSlot1Conditional = ipcThroughput),
-      new m68k040.decode.DecodeStage(allowSlot1Prediction = ipcThroughput,
-        fuseLongMoveLoads = ipcThroughput),
+      ShippingPlugins.ras(),
+      ShippingPlugins.gshare(ipcThroughput),
+      ShippingPlugins.fetchAlign(ipcThroughput),
+      ShippingPlugins.decode(ipcThroughput),
       new m68k040.rename.RenameStage(),
       new m68k040.dispatch.DispatchPlugin(detailedPerf = detailedPerf),
-      new m68k040.rob.RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable),
-      new m68k040.execute.iq.IssueQueuePlugin(earlyStoreAddress = ipcThroughput,
-        earlyAutoStoreAddress = ipcLateStore,
+      ShippingPlugins.rob(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+        lsOooIssue = SocketTopConfig.LS_OOO_ISSUE),
+      ShippingPlugins.issueQueue(ipcThroughput = ipcThroughput, ipcLateStore = ipcLateStore,
         // loadBypassUnreadyLoad is DISABLED. It WEDGED THE BOARD (2026-09-24): PC frozen
         // at 0x0000315c, zero exceptions, halt-kind NONE -- the ROB head waiting on a
         // memory op that never completed. It measured +7.5% on the calibrated Dhrystone
@@ -176,8 +174,22 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
         // Do not re-enable without an ordering mechanism that survives translation --
         // that is what MemoryOrderPlugin/MemoryDependencyTracker are for, and their
         // LSU-side lifecycle is unbuilt (docs/memory-dependencies.md).
-        loadBypassUnreadyLoad = false,
-        specLoadWakeup = ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP),
+        // ⛔ STILL OFF BY DEFAULT -- now pending a BOARD BOOT, not a known defect.
+        // `LS_OOO_ISSUE` is `sys.env` and unset, so this is `false` in every ordinary build.
+        // The blockers recorded here before 2026-09-30 are closed, each with a reproducer
+        // that fails before and passes after:
+        //   * the P4-park deadlock (inhibited op waiting for the ROB head in P4) -- the park;
+        //   * the corpus 6-red delta -- the store barrier is OCCUPANCY, not readiness
+        //     (`bcff067c`);
+        //   * the LS-pipe circular wait in every other shape (LsOooLivenessSpec A-E, the
+        //     InhibitedFullBarrierSpec F seed-2 hang, 13/24 LsOooStressSpec seeds): stores
+        //     issue strictly in LS order, and the LS EU's liveness REPLAY vacates any P4 op
+        //     that cannot proceed with an older LS op behind it (RobPlugin restarts it at
+        //     its own PC). See docs/BUG_ls_ooo_inhibited_barrier_p4_park_deadlock.md.
+        // Silicon has caught what every sim gate missed three times this week: flip the
+        // default only after a framebuffer-verified boot with exception halts armed.
+        loadBypassUnreadyLoad = SocketTopConfig.LS_OOO_ISSUE,
+        specLoadWakeup = ShippingPlugins.specLoadWakeup(ipcThroughput)),
       eu0, eu1, branchEu, lsEu, divEu,
       new m68k040.execute.regfile.RegFilePluginInt(),
       new m68k040.execute.regfile.RegFilePluginNzvc(),
@@ -209,6 +221,13 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
   axi_i.setName("axi_i")
   val axi_d = master(SocketAxiD(dataWidth = 128, idWidth = m68k040.cache.AxiIds.ID_W))
   axi_d.setName("axi_d")
+  /** P6 HOT DOOR (`CPU_AXI_DH=1` only): read-only, 128-bit, 2-bit ID = the D-cache MSHR
+    * index. The SoC binds it to `dha_ar*`/`dha_r*` behind `L2C_DH_PORT` (cpu_socket.vh on
+    * `feat/p6-dside-hot-door`). Absent -- not tied off -- when the flag is off, so the OFF
+    * netlist and its port list are unchanged. */
+  val axi_dh = if (!ShippingCoreConfig.dcacheHotDoor) null
+               else master(SocketAxiI(dataWidth = 128, idWidth = 2))
+  if (axi_dh != null) axi_dh.setName("axi_dh")
   val cpu_ipl = in UInt (3 bits)
   val ipl_ack = out Bool ()
   val cpu_peripheral_reset = out Bool ()
@@ -350,6 +369,12 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     }
     val absorbI = axiAbsorb.i.io.absorbing
     val absorbD = axiAbsorb.d.io.absorbing
+    // Hot door: its own absorber in `axiPorCd` and `coreCd` register slice.
+    // The optional AR-only empty path keeps R fully registered and byte order unchanged.
+    if (axi_dh != null) {
+      SocketHotReadBoundary.connect(socket.dcache.logic.axiDh, axi_dh, rst,
+        coreCd, axiPorCd, ShippingCoreConfig.axiDhArFallThrough)
+    }
 
     // ── AXI boundary register slice (2026-09-02, follow-up session) ──────────────────
     // Full-duplex register stage (`StreamPipe.FULL` = `s2mPipe().m2sPipe()`, SpinalHDL's
@@ -579,6 +604,15 @@ object SocketTopConfig {
     * (not by editing the plugin) once it is board-proven; leave it false until then.
     * `SPEC_LOAD_WAKEUP=1` in the environment overrides it for a one-off build. */
   val SPEC_LOAD_WAKEUP: Boolean = sys.env.get("SPEC_LOAD_WAKEUP").contains("1")
+
+  /** OUT-OF-ORDER LS ISSUE (`IssueQueuePlugin.loadBypassUnreadyLoad`): an LS slot may be
+    * selected unless a strictly older LS slot holds an unready STORE. Relaxes the
+    * oldest-occupied-only rule while keeping inhibited accesses as two-way barriers.
+    *
+    * A BUILD-TIME SWITCH defaulted OFF. `LS_OOO_ISSUE=1` turns it on for a build; flip the
+    * default here once it is board-proven. It is reported in SHIPPING_CONFIG so a build can
+    * always be identified afterwards -- the lesson from `SPEC_LOAD_WAKEUP`, which could not. */
+  val LS_OOO_ISSUE: Boolean = sys.env.get("LS_OOO_ISSUE").contains("1")
 }
 
 object SocketIpcProfile {
@@ -654,11 +688,49 @@ object GenSocketTopVerilog {
     // settle it after the fact: `lsSpecBlocked`, `lsAdvance` and `specWakeFire` are all
     // absent from `reports/timing_synth.rpt` -- as are the BASELINE signals `lsBusy` and
     // `lsSkid`, which is the proof that a missing name there means nothing at all.
-    println(s"SHIPPING_CONFIG ipcThroughput=$ipcThroughput " +
+    println(s"SHIPPING_CONFIG lsOooIssue=${SocketTopConfig.LS_OOO_ISSUE} " +
+            s"ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
-            s"specLoadWakeup=${ipcThroughput && SocketTopConfig.SPEC_LOAD_WAKEUP} " +
+            s"specLoadWakeup=${ShippingPlugins.specLoadWakeup(ipcThroughput)} " +
+            s"lsP3FastLoad=${ShippingCoreConfig.lsP3FastLoad} " +
+            s"lsP1EarlyLoad=${ShippingCoreConfig.lsP1EarlyLoad} " +
+            s"lsFourCycleL1=${ShippingCoreConfig.lsFourCycleL1} " +
+            s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
-            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead}")
+            s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +
+            s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
+            s"dcacheDirectRefillResponse=${ShippingCoreConfig.dcacheDirectRefillResponse} " +
+            s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
+            s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+            s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
+            s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
+            s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
+            s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
+            // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
+            // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
+            // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
+            // own log -- the same gap that cost the withdrawn `rasBranchRepair` number.
+            s"storeQueueDepth=${ShippingCoreConfig.storeQueueDepth} " +
+            s"sqNarrowDrainMerge=${ShippingCoreConfig.sqNarrowDrainMerge} " +
+            s"sqCoalesceLines=${ShippingCoreConfig.sqCoalesceLines} " +
+            s"sqCoalesceHold=${ShippingCoreConfig.sqCoalesceHold} " +
+            s"dcacheFullLineNoFill=${ShippingCoreConfig.dcacheFullLineNoFill} " +
+            s"icachePrefetch=${ShippingCoreConfig.icachePrefetch} " +
+            // D4. Reaches LsEuPlugin / StoreQueue / DcachePlugin through their constructor
+            // DEFAULTS (the `sqDepth` precedent), so this line and the netlist cannot disagree.
+            s"inhibitedFullBarrier=${ShippingCoreConfig.inhibitedFullBarrier} " +
+            // Non-blocking L1D + P6 hot door (constructor DEFAULTS, same precedent).
+            s"dcacheNonBlocking=${ShippingCoreConfig.dcacheNonBlocking} " +
+            s"dcacheNbEarlyResponse=${ShippingCoreConfig.dcacheNbEarlyResponse} " +
+            s"dcacheMshrs=${ShippingCoreConfig.dcacheMshrs} " +
+            s"lsLoadRingDepth=${ShippingCoreConfig.lsLoadRingDepth} " +
+            s"dcacheHotDoor=${ShippingCoreConfig.dcacheHotDoor} " +
+            s"axiDhArFallThrough=${ShippingCoreConfig.axiDhArFallThrough} " +
+            s"dcacheStoreAllocArDelay=${ShippingCoreConfig.dcacheStoreAllocArDelay} " +
+            s"dcacheNbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} " +
+            s"dcacheNbPreselectAr=${ShippingCoreConfig.dcacheNbPreselectAr} " +
+            s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
+            s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

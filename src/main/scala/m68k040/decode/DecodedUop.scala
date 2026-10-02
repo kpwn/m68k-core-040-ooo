@@ -471,6 +471,16 @@ case class DecodedUop(immW: Int = 32) extends Bundle {
   // missed RTD (whose anInc is always 0, see above) and let RTD illegitimately
   // train the BTB/FTB with the popped return address. Default False.
   val isReturn     = Bool()
+  // Architectural-CALL classification (RAS flush-repair, 2026-09-27), the exact mirror
+  // of `isReturn` above: True for the BRANCH µop of a BSR or a JSR (never for BRA/JMP,
+  // never for the crack's push STORE µop). Like `isReturn` this is a real decode flag
+  // rather than a proxy -- nothing else on the branch µop distinguishes BSR from BRA or
+  // JSR from JMP (the return-address push is a SEPARATE, earlier µop), and the
+  // `anInc =/= 0` proxy that isReturn used to be is exactly the shape of bug that cost
+  // RTD its BTB exclusion. Consumed ONLY by BranchEuPlugin, which forwards it on its
+  // completion port so a flush can re-apply the fetch-time RAS push that
+  // `RasPlugin.checkpointRestore` reverts (see RasPlugin's `branchRepair`). Default False.
+  val isCall       = Bool()
   val cond         = Bits(4 bits)
   val unimplemented= Bool()
   // Precise-fault capture (exception slice 1): `faulted` marks this µop as raising

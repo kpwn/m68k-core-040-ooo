@@ -32,6 +32,12 @@ trait PreparedCommitService {
   def preparedCommit: Option[PreparedCommitPort]
 }
 
+/** Replay input owned by RobPlugin. LsEuService supplies the request through
+  * backend wiring; consumers never access the ROB implementation area. */
+trait RobLsReplayService {
+  def lsReplay: Flow[UInt]
+}
+
 /** Ordinary in-order retirement notices. PRODUCER: RobPlugin exclusively.
   * At least four setup-allocated lanes (up to the prepared cap when enabled);
   * unused upper lanes are idle in the two-wide core.

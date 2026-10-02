@@ -123,6 +123,12 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     lsEu.issue << iq.issue(3)
     rob.logic.completion(2).valid   := lsEu.completion.valid
     rob.logic.completion(2).payload := lsEu.completion.payload
+    // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+    // whose barrier a younger already-launched access violated. Recovered at retire.
+    rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+    rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+    host[m68k040.services.RobLsReplayService].lsReplay.valid         := host[m68k040.execute.LsEuService].replayRequest.valid
+    host[m68k040.services.RobLsReplayService].lsReplay.payload       := host[m68k040.execute.LsEuService].replayRequest.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -243,6 +249,13 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // starts at a flop Q with the whole period in front of it.
     ras.logic.checkpointSave    := rob.logic.countIsZero
     ras.logic.checkpointRestore := rasCheckpointRestore
+    // RAS flush-repair (RasPlugin `branchRepair`) -- FUZZ_RAS_BRANCH_REPAIR=1.
+    require(rob.rasBranchRepair == ras.branchRepair, "rasBranchRepair must agree")
+    if (rob.rasBranchRepair) {
+      ras.logic.repairValid := rob.logic.earlyFire
+      ras.logic.repairKind  := rob.logic.rasRepairKind
+      ras.logic.repairData  := rob.logic.rasRepairData
+    }
 
     val gsh   = host[m68k040.frontend.GsharePlugin]
     gsh.logic.invalidateAll := host[IcachePlugin].logic.invalidateAll
@@ -365,7 +378,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
 
 /** Full-core DUT (duplicated from ExecuteLockStepSpec.FullCoreDut — see the
   * duplication note on FuzzWiringPlugin). */
-class FuzzCoreDut extends Component {
+class FuzzCoreDut(forceShipping: Boolean = false) extends Component {
   val db    = new Database
   val host  = db on (new PluginHost)
   val ctrl   = new MmuControlPlugin
@@ -377,29 +390,169 @@ class FuzzCoreDut extends Component {
   // explicit `require` in ExceptionUnit).
   val fpuCtl = new m68k040.execute.FpuControlPlugin
   val intCtrl = new m68k040.exception.InterruptControlPlugin
-  val itlb   = new ItlbPlugin()
+  // ── SHIPPING POSTURE (2026-09-30) ─────────────────────────────────────────────────
+  // Until this switch existed the corpus gated a DEFAULT core: a default store pipeline
+  // (one detached store entry, no detached late stores, no forward-on-publish, no early
+  // An write-back), pretranslated probe hints ON, and the slot-1 prediction / P1
+  // coverage front end OFF -- none of which is what `M68kSocketTop` builds. That is the
+  // fifth "the shipping config is not the tested config" instance.
+  //
+  //   FUZZ_SHIPPING=1      build EVERY configurable plugin through `ShippingPlugins`, the
+  //                        SAME functions `M68kSocketTop` calls (throughput-v2), reading
+  //                        `ShippingCoreConfig`/`SocketTopConfig` exactly as the top does.
+  //                        The only difference is topology: `socketMerged = false` (this
+  //                        DUT has no AxiDMergePlugin).
+  //   FUZZ_SHIPPING_LSU=1  the LS EU + issue queue ONLY through `ShippingPlugins` (the
+  //                        original switch; kept so earlier results stay reproducible).
+  //   FUZZ_LSU_BASE=default  under FUZZ_SHIPPING=1, swap the LS EU / IQ / D-cache probe
+  //                        hint back to the plugin DEFAULTS -- the A/B base for "what does
+  //                        the shipping LSU expose".
+  //   FUZZ_LSU_KNOBS=a=1,b=0,...  override single LS EU / IQ knobs BY NAME on top of the
+  //                        chosen base, for bisecting (names: the `LsEuKnobs`/`IqKnobs`
+  //                        field names, `iq.<field>` for the IQ, `probeHints` for the
+  //                        D-cache's `allowPretranslatedProbeHints`).
+  private val shipAll = forceShipping || sys.env.get("FUZZ_SHIPPING").contains("1")
+  private val shipLsu = shipAll || sys.env.get("FUZZ_SHIPPING_LSU").contains("1")
+  private val lsuBaseDefault = sys.env.get("FUZZ_LSU_BASE").contains("default")
+  require(!lsuBaseDefault || shipAll, "FUZZ_LSU_BASE=default needs FUZZ_SHIPPING=1")
+  private val lsuKnobOverrides: Map[String, String] =
+    sys.env.get("FUZZ_LSU_KNOBS").toSeq.flatMap(_.split(',')).map(_.trim).filter(_.nonEmpty)
+      .map { kv => val Array(k, v) = kv.split('=').map(_.trim); k -> v }.toMap
+  // Reads the SHIPPING knob so `ITLB_VICTIM=32` exercises the victim buffer through
+  // the ported corpus too. Default 0 = no hardware, so the default corpus run is
+  // unchanged. (`ShippingCoreConfig` rule: a knob that differs between sim and the
+  // shipping build is a bug.)
+  val itlb   = m68k040.top.ShippingPlugins.itlb()
   val dtlb   = new DtlbPlugin()
-  val icache = new IcachePlugin
-  val dcache = new DcachePlugin()
+  val icache = if (shipAll) m68k040.top.ShippingPlugins.icache(
+                 m68k040.cache.IcachePredecodeConfig.fromEnvironment)
+               else new IcachePlugin
+  private def boolKnob(name: String, dflt: Boolean): Boolean = lsuKnobOverrides.get(name) match {
+    case None => dflt
+    case Some("1") | Some("true") => true
+    case Some("0") | Some("false") => false
+    case Some(o) => throw new IllegalArgumentException(s"FUZZ_LSU_KNOBS $name=$o is not 0/1")
+  }
+  private val probeHints = boolKnob("probeHints",
+    if (shipAll && !lsuBaseDefault) m68k040.top.ShippingPlugins.shippingPretranslatedProbeHints
+    else true /* DcachePlugin's own default */)
+  val dcache = if (shipAll) m68k040.top.ShippingPlugins.dcache(socketMerged = false,
+                 allowPretranslatedProbeHints = probeHints)
+               else new DcachePlugin(allowPretranslatedProbeHints = probeHints)
   val btb    = new m68k040.frontend.BtbPlugin
   val ftb    = new m68k040.frontend.FtbPlugin
-  val ras    = new m68k040.frontend.RasPlugin
-  val gsh    = new m68k040.frontend.GsharePlugin
-  val fa     = new FetchAlignPlugin(enableFetchDirected = true)
-  val dec    = new DecodeStage
+  val ras    = if (shipAll) m68k040.top.ShippingPlugins.ras()
+               else new m68k040.frontend.RasPlugin(
+                 branchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"))
+  val gsh    = if (shipAll) m68k040.top.ShippingPlugins.gshare(ipcThroughput = true)
+               else new m68k040.frontend.GsharePlugin
+  // The two FRONT-END prediction flags of `perf/track5-branch`. They were wired into
+  // `FullCoreSynth`/`SocketTop`/`CoreBenchHarness` only, so the corpus -- the one place an
+  // architectural divergence from a front-end redirect would show up -- had NO way to turn
+  // them on. Env-read for the same reason as FUZZ_SPEC_WAKE: the whole corpus can be
+  // replayed against them unmodified. Both default OFF, so an unset environment builds the
+  // bit-identical DUT as before.
+  val fa     = if (shipAll) m68k040.top.ShippingPlugins.fetchAlign(ipcThroughput = true)
+               else new FetchAlignPlugin(enableFetchDirected = true,
+    computeDirectTargets = sys.env.get("FUZZ_COMPUTE_DIRECT_TARGETS").contains("1"),
+    deferSlot1Uncond = sys.env.get("FUZZ_DEFER_SLOT1_UNCOND").contains("1"),
+    deferSlot1Dbcc = sys.env.get("FUZZ_DEFER_SLOT1_DBCC").contains("1"))
+  val dec    = if (shipAll) m68k040.top.ShippingPlugins.decode(ipcThroughput = true)
+               else new DecodeStage
   val ren    = new RenameStage
   val disp   = new m68k040.dispatch.DispatchPlugin
-  val rob    = new RobPlugin
+  private val fuzzLsOoo = sys.env.get("FUZZ_LS_OOO").contains("1")
+  // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+  // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+  // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+  // from one switch; every SIM harness omitted it, so the recovery had never been
+  // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+  // wired only in FullCoreSynth and had zero sim coverage.
+  val rob    = if (shipAll) m68k040.top.ShippingPlugins.rob(detailedPerf = false,
+                 pcRangeEnable = true, lsOooIssue = fuzzLsOoo || m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+               else new RobPlugin(
+    rasBranchRepair = sys.env.get("FUZZ_RAS_BRANCH_REPAIR").contains("1"),
+    lsOooIssue = fuzzLsOoo)
   // FUZZ_SPEC_WAKE=1 turns on speculative (cache-hit-predicted) load wakeup in BOTH the
   // IQ and the LS EU. Env-read rather than a constructor parameter so the whole fuzz /
   // lockstep corpus can be replayed against it unmodified -- that corpus is where a
   // released-too-early consumer would show up as a real architectural divergence.
   private val fuzzSpecWake = sys.env.get("FUZZ_SPEC_WAKE").contains("1")
-  val iq     = new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake)
+  // FUZZ_LS_OOO=1 turns on out-of-order LS issue (the relaxed select) TOGETHER with the
+  // LS-side inhibited two-way barrier. They must move together: the relaxation without the
+  // barrier is what wedged the board as `loadBypassUnreadyLoad`.
+  // FUZZ_SHIPPING_LSU=1: build the LS EU and issue queue EXACTLY as `M68kSocketTop` does
+  // under the shipping `throughput-v2` profile (ipcThroughput = ipcLateStore = true).
+  // Without it the corpus runs a DEFAULT store pipeline -- no detached late stores, no
+  // forward-on-publish, one detached store entry -- i.e. NOT the silicon's LSU. Test-only.
+  // Under a shipping switch the knobs come from `ShippingPlugins` (the function
+  // `M68kSocketTop` calls), ORed with the FUZZ_* arms so those still work on top.
+  private val shipSpecWake = fuzzSpecWake ||
+    (shipAll && m68k040.top.ShippingPlugins.specLoadWakeup(ipcThroughput = true))
+  private val shipLsOoo = fuzzLsOoo || (shipAll && m68k040.top.SocketTopConfig.LS_OOO_ISSUE)
+  private val lsuProfile = shipLsu && !lsuBaseDefault
+  val iqKnobs: m68k040.top.ShippingPlugins.IqKnobs = {
+    val k = m68k040.top.ShippingPlugins.iqKnobs(ipcThroughput = lsuProfile,
+      ipcLateStore = lsuProfile, specLoadWakeup = shipSpecWake, loadBypassUnreadyLoad = shipLsOoo)
+    k.copy(earlyStoreAddress = boolKnob("iq.earlyStoreAddress", k.earlyStoreAddress),
+      earlyAutoStoreAddress = boolKnob("iq.earlyAutoStoreAddress", k.earlyAutoStoreAddress),
+      loadBypassUnreadyLoad = boolKnob("iq.loadBypassUnreadyLoad", k.loadBypassUnreadyLoad),
+      specLoadWakeup = boolKnob("iq.specLoadWakeup", k.specLoadWakeup))
+  }
+  val iq     = if (!shipLsu && lsuKnobOverrides.isEmpty) new IssueQueuePlugin(specLoadWakeup = fuzzSpecWake,
+    loadBypassUnreadyLoad = fuzzLsOoo)
+  else iqKnobs.build()
   val eu0    = new AluEuPlugin
   val eu1    = new AluEuPlugin
   val branchEu = new BranchEuPlugin
-  val lsEu   = new LsEuPlugin(specLoadWakeup = fuzzSpecWake)
+  // SHIPPING-MATCHED COVERAGE. `SocketTop` sets `alignedLoadFallThrough = ipcThroughput`
+  // (true on the board), and `LS_OOO_ISSUE` can only be on in that same build -- so the ONLY
+  // configuration in which the park can ship has the fall-through ON, and every fuzz DUT left
+  // it at its default FALSE. That gap hid a lost-device-read defect (see the note at
+  // `alignedEnqFromP4` in LsEuPlugin). Default it to the LS-OoO switch so the risky
+  // combination is the one that gets tested; `FUZZ_LS_FALLTHROUGH` overrides either way when
+  // a run needs the two knobs separated.
+  private val fuzzFallThrough =
+    sys.env.get("FUZZ_LS_FALLTHROUGH").map(_ == "1").getOrElse(fuzzLsOoo)
+  val lsEuKnobs: m68k040.top.ShippingPlugins.LsEuKnobs = {
+    val k0 = m68k040.top.ShippingPlugins.lsEuKnobs(ipcThroughput = lsuProfile,
+      ipcLateStore = lsuProfile, specLoadWakeup = shipSpecWake, lsOooIssue = shipLsOoo)
+    // Non-shipping base keeps this DUT's historical fall-through default (see above).
+    val k = if (lsuProfile) k0 else k0.copy(alignedLoadFallThrough = fuzzFallThrough)
+    k.copy(
+      alignedLoadFallThrough = boolKnob("alignedLoadFallThrough", k.alignedLoadFallThrough),
+      earlyIntWakeup = boolKnob("earlyIntWakeup", k.earlyIntWakeup),
+      sqSubwordForwarding = boolKnob("sqSubwordForwarding", k.sqSubwordForwarding),
+      reserveLateStore = boolKnob("reserveLateStore", k.reserveLateStore),
+      detachLateStore = boolKnob("detachLateStore", k.detachLateStore),
+      forwardOnPublish = boolKnob("forwardOnPublish", k.forwardOnPublish),
+      earlyNzvcWakeup = boolKnob("earlyNzvcWakeup", k.earlyNzvcWakeup),
+      detachedStoreEntries = lsuKnobOverrides.get("detachedStoreEntries").map(_.toInt)
+        .getOrElse(k.detachedStoreEntries),
+      earlyAutoStoreAddress = boolKnob("earlyAutoStoreAddress", k.earlyAutoStoreAddress),
+      earlyStoreDataWake = boolKnob("earlyStoreDataWake", k.earlyStoreDataWake),
+      earlyAutoAnWriteback = boolKnob("earlyAutoAnWriteback", k.earlyAutoAnWriteback),
+      specLoadWakeup = boolKnob("specLoadWakeup", k.specLoadWakeup),
+      lsOooIssue = boolKnob("lsOooIssue", k.lsOooIssue))
+  }
+  {
+    val known = Set("alignedLoadFallThrough", "earlyIntWakeup", "sqSubwordForwarding",
+      "reserveLateStore", "detachLateStore", "forwardOnPublish", "earlyNzvcWakeup",
+      "detachedStoreEntries", "earlyAutoStoreAddress", "earlyStoreDataWake",
+      "earlyAutoAnWriteback", "specLoadWakeup", "lsOooIssue", "probeHints",
+      "iq.earlyStoreAddress", "iq.earlyAutoStoreAddress", "iq.loadBypassUnreadyLoad",
+      "iq.specLoadWakeup")
+    val bad = lsuKnobOverrides.keySet -- known
+    require(bad.isEmpty, s"FUZZ_LSU_KNOBS: unknown knob(s) ${bad.mkString(",")}")
+  }
+  val lsEu   = if (!shipLsu && lsuKnobOverrides.isEmpty) new LsEuPlugin(specLoadWakeup = fuzzSpecWake,
+    lsOooIssue = fuzzLsOoo, alignedLoadFallThrough = fuzzFallThrough)
+  else lsEuKnobs.build()
+  // Provenance: the generator says what it built (see SocketTop's SHIPPING_CONFIG).
+  println(s"FUZZ_DUT_CONFIG shipAll=$shipAll shipLsu=$shipLsu lsuBase=" +
+    s"${if (lsuProfile) "shipping" else "default"} probeHints=$probeHints " +
+    s"overrides=${lsuKnobOverrides.toSeq.sorted.map { case (k, v) => s"$k=$v" }.mkString(",")} " +
+    s"$lsEuKnobs $iqKnobs")
   val divEu  = new DivEuPlugin
   val rfInt  = new RegFilePluginInt
   val rfNzvc = new RegFilePluginNzvc
@@ -419,6 +572,9 @@ class FuzzCoreDut extends Component {
     dtlb,
     icache, dcache, btb, ftb, ras, gsh, fa, dec, ren, disp, rob, iq, eu0, eu1, branchEu, lsEu, divEu,
     rfInt, rfNzvc, rfX, rfFp, rfFpcc, wire)) }
+  /** Every configurable plugin instance, for `ShippingConfigParitySpec`. */
+  def configuredPlugins: Seq[FiberPlugin] =
+    Seq(itlb, icache, dcache, ras, gsh, fa, dec, rob, iq, lsEu)
 }
 
 object FuzzDut {

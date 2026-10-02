@@ -14,7 +14,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 /** Task 3: interrupt recognition at a macro-instruction boundary.
   *
-  * interruptPending = (iplIn > srSys[2:0] || iplIn==7) && firstStore(head) &&
+  * interruptPending = (unmasked level 1..6 or fresh/pending NMI) && firstStore(head) &&
   *                    !faulted(head) && !rte(head) && excIdle && head present.
   * The head must NOT commit when interruptPending; the level + vector + head
   * instruction PC are captured for the exception entry.
@@ -180,6 +180,27 @@ class RobInterruptSpec extends AnyFunSuite {
       val (level, vec, _) = p.get
       assert(level == 7, "NMI level 7")
       assert(vec == 24 + 7, "NMI autovector 31")
+    }
+  }
+
+  test("NMI recognized on its rising edge leaves no second pending request") {
+    M68kSim().compile(new Dut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      init(dut, cd)
+      setMask(dut, cd, 0)
+      allocOne(dut, cd, pc = 0x500)
+      cd.waitFallingEdge()
+      dut.intCtrl.logic.iackAvec #= true
+      dut.intCtrl.logic.iplIn #= 7
+      sleep(1)
+      assert(dut.rob.logic.interruptPending.toBoolean,
+        "unmasked level-7 edge must exercise immediate recognition")
+      assert(!dut.rob.logic.nmiPending.toBoolean,
+        "test must recognize the fresh edge before it has been latched")
+      cd.waitSampling()
+      sleep(1)
+      assert(!dut.rob.logic.nmiPending.toBoolean,
+        "an already-recognized NMI edge must not remain queued for a second entry")
     }
   }
 

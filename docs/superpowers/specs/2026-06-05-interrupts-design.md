@@ -12,7 +12,7 @@ Add asynchronous interrupt delivery: an external interrupt-priority-level (IPL) 
 
 **In:**
 - **IPL input:** a 3-bit `iplIn` into the core (0=none, 1-7=level, 7=NMI). In `FullCoreSynth` a registered OOC input (like `mmuEnableIn`); a real input on the core. Sampled at the commit stage.
-- **Recognition (precise, macro-instruction boundary):** raise `interruptPending` when ALL hold: (a) `iplIn > srSys[2:0]` (the SR I-mask) OR `iplIn == 7` (NMI always); (b) the ROB head is the **first µop of a macro-instruction** (do NOT interrupt mid-cracked-instruction — use the existing instruction-boundary / first-µop marker); (c) the head is NOT faulted (an instruction's own fault/trap takes priority — 68k group order); (d) `excIdle` (the exc-FSM is not already running). The head instruction does NOT commit; its instruction PC is the stacked PC; it (and younger) are flushed and re-execute after RTE.
+- **Recognition (precise, macro-instruction boundary):** raise `interruptPending` when ALL hold: (a) an unmasked level 1–6 request, or a fresh/latched level-7 NMI edge (see §7); (b) the ROB head is the **first µop of a macro-instruction** (do NOT interrupt mid-cracked-instruction — use the existing instruction-boundary / first-µop marker); (c) the head is NOT faulted (an instruction's own fault/trap takes priority — 68k group order); (d) `excIdle` (the exc-FSM is not already running). The head instruction does NOT commit; its instruction PC is the stacked PC; it (and younger) are flushed and re-execute after RTE.
 - **Simple vector protocol (soft hardware only — NO bus handshake):** core inputs `iackAvec` (in — autovector mode for the active level) and `iackVector` (in, 8b — the vectored vector when `!iackAvec`), driven by the SoC for the current `iplIn` level. On taking an interrupt the vector is selected combinationally: `curVec = iackAvec ? (24 + level) : iackVector` — NO multi-cycle IACK cycle, NO `iackValid`/`iackReady` handshake. (Optionally `iackLevel` out for the SoC to mux its avec/vector per level, but no handshake.) In `FullCoreSynth` these are registered OOC inputs. The exc-FSM needs no extra IACK state — it computes `curVec` at the interrupt-entry and proceeds straight to the format-$0 stack states.
 - **Delivery (reuse the exc-FSM):** the captured `curVec` drives the existing format-$0 entry (stack {SR, PC=head instr PC, vec<<2}, vector to `VBR + curVec*4`, flush via RedirectService). **NEW in the entry SR-write:** set the I-mask to the interrupt level — `newSys = ((srSys | 0x20) & 0x3f)` becomes `... with bits[2:0] := level` (currently the entry only sets S=1 / clears T1T0; interrupts must also raise the mask so equal/lower interrupts are blocked until RTE). NMI (7) sets mask=7. RTE restores the old SR (mask included) — already works.
 - **Priority:** a faulted/RTE head (its own exception) takes priority over an interrupt at the same boundary (recognition gates on head-not-faulted). NMI (7) is always recognized regardless of mask. Trace is out of scope here.
@@ -23,7 +23,7 @@ Add asynchronous interrupt delivery: an external interrupt-priority-level (IPL) 
 ## 3. Components & dataflow
 
 ```
-iplIn -> (commit) recognize: ipl>mask||ipl==7, head=first-uop-of-instr, !faulted, excIdle
+iplIn -> (commit) recognize: unmasked level 1..6 or fresh/latched NMI edge, head=first-uop-of-instr, !faulted, excIdle
        -> interruptPending (async, between instructions)
 vector (combinational, simple protocol): curVec = iackAvec ? (24+level) : iackVector
 exc-FSM entry: stack format-$0 {SR, PC=head instr PC, curVec<<2}; SR := S=1,T=0, I-mask:=level
@@ -65,3 +65,25 @@ change frame contents. With no active request, retirement and IPC are unchanged.
 Verify the observed odd-SSP LINK boundary-33 failure with its exact register,
 CCR, frame and memory comparisons unchanged; cover multi-uop straddling,
 masked IRQs, NMI, precise memory and wider/prepared retirement separately.
+
+
+## 7. Level-7 edge consumption (2026-10-01 amendment)
+
+Level 7 is edge-triggered at every interrupt mask. A transition from a lower
+IPL to 7 records one pending NMI. If an unmasked fresh edge is recognized in
+that same cycle, recognition consumes the edge instead of leaving another
+pending request. If recognition is blocked, the pending bit persists even if
+IPL drops before the next eligible boundary. Recognition through mask 7 may
+use the registered pending bit as before.
+
+A continuously asserted level 7 cannot retrigger after RTE restores a lower
+mask. IPL must drop below 7 and rise again to create a new request. Levels
+1–6 retain level-sensitive recognition. Existing instruction-boundary,
+exception, precise-memory, and debug-halt gates remain applicable.
+
+Verification requires immediate-edge non-vacuity and latch consumption in the
+ROB test, held-line/fresh-edge full-core tests at masks 0 and 7, and the odd-SSP
+NMI boundary sweeps at boot offsets 2 and 10. The immediate-edge test fails on
+the preceding RTL because the accepted edge remains pending; it passes with
+same-cycle consumption. Full-core validation is tracked separately and must
+not be inferred from the unit result.

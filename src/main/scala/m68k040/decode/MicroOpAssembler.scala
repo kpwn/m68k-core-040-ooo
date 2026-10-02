@@ -109,7 +109,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := disp
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False
@@ -184,7 +184,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := signedDelta.resize(32).asBits
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // An update sets NO flags
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -242,7 +242,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := 0
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEM affects NO condition codes
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -316,7 +316,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := disp
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // FMOVEM affects NO integer condition codes
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -388,7 +388,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := chunk.resize(32).asBits
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -451,7 +451,7 @@ object MicroOpAssembler {
     u.useImm      := True; u.imm := disp
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -501,7 +501,7 @@ object MicroOpAssembler {
     u.useImm      := False; u.imm := 0
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -577,7 +577,7 @@ object MicroOpAssembler {
     u.useImm      := False; u.imm := 0
     u.readsNzvc   := False; u.readsX := False
     u.writesNzvc  := False; u.writesX := False     // MOVEP affects NO condition codes
-    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+    u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
     u.cond        := 0
     u.unimplemented := False
     u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False
@@ -1185,7 +1185,7 @@ object MicroOpAssembler {
     opUop.useImm        := False; opUop.imm    := 0
     opUop.readsNzvc     := spec.readsNzvc; opUop.readsX := spec.readsX
     opUop.writesNzvc    := spec.writesNzvc; opUop.writesX := spec.writesX
-    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.isReturn := False; opUop.ccrRestore := False; opUop.toCcr := False; opUop.cond := spec.cond
+    opUop.isBranch      := spec.isBranch; opUop.ibranch := False; opUop.stkPush := False; opUop.anInc := 0; opUop.isReturn := False; opUop.isCall := False; opUop.ccrRestore := False; opUop.toCcr := False; opUop.cond := spec.cond
     opUop.eaAuto        := EaAuto.NONE; opUop.eaDelta := 0
 
     opUop.unimplemented := False
@@ -1664,7 +1664,7 @@ object MicroOpAssembler {
     ldUop.imm           := Mux(srcEa.pcRel, pcRelAddr, rmwEaDisp)
     ldUop.readsNzvc     := False; ldUop.readsX := False
     ldUop.writesNzvc    := False; ldUop.writesX := False
-    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.isReturn := False; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
+    ldUop.isBranch      := False; ldUop.ibranch := False; ldUop.stkPush := False; ldUop.anInc := 0; ldUop.isReturn := False; ldUop.isCall := False; ldUop.ccrRestore := False; ldUop.toCcr := False; ldUop.cond := 0
     // Auto-update SOURCE EA: the load computes the access address (PREDEC: An-delta;
     // POSTINC: An). The load does NOT write An (its int dst is the loaded value T0); the
     // An update rides a separate ADD µop (anUpdUop). For crackRmw the SAME eaAuto is on
@@ -1741,7 +1741,7 @@ object MicroOpAssembler {
     stUop.imm           := Mux(stDstEa.pcRel, stPcRelAddr, stDstEa.disp)
     stUop.readsNzvc     := False; stUop.readsX := False
     stUop.writesNzvc    := True;  stUop.writesX := False   // MOVE to memory sets NZVC
-    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.isReturn := False; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
+    stUop.isBranch      := False; stUop.ibranch := False; stUop.stkPush := False; stUop.anInc := 0; stUop.isReturn := False; stUop.isCall := False; stUop.ccrRestore := False; stUop.toCcr := False; stUop.cond := 0
     stUop.eaAuto        := stDstEa.autoMode; stUop.eaDelta := stDstEa.autoDelta
 
     stUop.unimplemented := False
@@ -1813,7 +1813,7 @@ object MicroOpAssembler {
     rmwStUop.imm           := Mux(srcEa.pcRel, rmwStPcRelAddr, rmwEaDisp)
     rmwStUop.readsNzvc     := False; rmwStUop.readsX := False
     rmwStUop.writesNzvc    := False; rmwStUop.writesX := False   // the op µop owns the flags
-    rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.isReturn := False; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
+    rmwStUop.isBranch      := False; rmwStUop.ibranch := False; rmwStUop.stkPush := False; rmwStUop.anInc := 0; rmwStUop.isReturn := False; rmwStUop.isCall := False; rmwStUop.ccrRestore := False; rmwStUop.toCcr := False; rmwStUop.cond := 0
     rmwStUop.eaAuto        := srcEa.autoMode; rmwStUop.eaDelta := srcEaDelta
 
     rmwStUop.unimplemented := False
@@ -3111,7 +3111,7 @@ object MicroOpAssembler {
       u.imm         := Mux(ea.pcRel, (pkt.pc + U(4, 32 bits) + ea.disp.asUInt).asBits, ea.disp)
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.cond        := 0
@@ -3186,7 +3186,7 @@ object MicroOpAssembler {
     divlUop.dstReg        := divlDq; divlUop.dstValid := True              // quotient -> Dq
     divlUop.readsNzvc     := True;  divlUop.readsX := False   // overflow preserves old N/Z/C (Musashi: only V set)
     divlUop.writesNzvc    := True;  divlUop.writesX := False               // DIV sets N/Z/V
-    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.isReturn := False; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0
+    divlUop.isBranch      := False; divlUop.ibranch := False; divlUop.stkPush := False; divlUop.anInc := 0; divlUop.isReturn := False; divlUop.isCall := False; divlUop.ccrRestore := False; divlUop.toCcr := False; divlUop.cond := 0
     divlUop.eaAuto        := EaAuto.NONE; divlUop.eaDelta := 0
     divlUop.unimplemented := False
     divlUop.faulted       := False; divlUop.faultVector := 0; divlUop.isRte := False
@@ -3286,7 +3286,7 @@ object MicroOpAssembler {
     divremUop.dstReg        := divlDr; divremUop.dstValid := True          // remainder -> Dr
     divremUop.readsNzvc     := False; divremUop.readsX := False
     divremUop.writesNzvc    := False; divremUop.writesX := False
-    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.isReturn := False; divremUop.ccrRestore := False; divremUop.toCcr := False; divremUop.cond := 0
+    divremUop.isBranch      := False; divremUop.ibranch := False; divremUop.stkPush := False; divremUop.anInc := 0; divremUop.isReturn := False; divremUop.isCall := False; divremUop.ccrRestore := False; divremUop.toCcr := False; divremUop.cond := 0
     divremUop.eaAuto        := EaAuto.NONE; divremUop.eaDelta := 0
     divremUop.unimplemented := False
     divremUop.faulted       := False; divremUop.faultVector := 0; divremUop.isRte := False
@@ -3367,7 +3367,7 @@ object MicroOpAssembler {
     mullUop.dstReg        := mullDl; mullUop.dstValid := True               // low product -> Dl
     mullUop.readsNzvc     := False; mullUop.readsX := False
     mullUop.writesNzvc    := True;  mullUop.writesX := False                // MUL sets N/Z (+V .L32)
-    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.isReturn := False; mullUop.ccrRestore := False; mullUop.toCcr := False; mullUop.cond := 0
+    mullUop.isBranch      := False; mullUop.ibranch := False; mullUop.stkPush := False; mullUop.anInc := 0; mullUop.isReturn := False; mullUop.isCall := False; mullUop.ccrRestore := False; mullUop.toCcr := False; mullUop.cond := 0
     mullUop.eaAuto        := EaAuto.NONE; mullUop.eaDelta := 0
     mullUop.unimplemented := False
     mullUop.faulted       := False; mullUop.faultVector := 0; mullUop.isRte := False
@@ -3427,7 +3427,7 @@ object MicroOpAssembler {
     mulhiUop.dstReg        := mullDh; mulhiUop.dstValid := True             // high product -> Dh
     mulhiUop.readsNzvc     := False; mulhiUop.readsX := False
     mulhiUop.writesNzvc    := False; mulhiUop.writesX := False
-    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.isReturn := False; mulhiUop.ccrRestore := False; mulhiUop.toCcr := False; mulhiUop.cond := 0
+    mulhiUop.isBranch      := False; mulhiUop.ibranch := False; mulhiUop.stkPush := False; mulhiUop.anInc := 0; mulhiUop.isReturn := False; mulhiUop.isCall := False; mulhiUop.ccrRestore := False; mulhiUop.toCcr := False; mulhiUop.cond := 0
     mulhiUop.eaAuto        := EaAuto.NONE; mulhiUop.eaDelta := 0
     mulhiUop.unimplemented := False
     mulhiUop.faulted       := False; mulhiUop.faultVector := 0; mulhiUop.isRte := False
@@ -3527,7 +3527,7 @@ object MicroOpAssembler {
       u.useImm      := True; u.imm := disp
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.cond        := 0
@@ -3571,7 +3571,7 @@ object MicroOpAssembler {
       u.useImm      := True; u.imm := bfmImm
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := True;  u.writesX := False                       // NZ only (V=C=0, X untouched)
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.cond        := 0
@@ -3677,7 +3677,7 @@ object MicroOpAssembler {
       u.useImm      := True; u.imm := disp
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.cond        := 0
@@ -3720,7 +3720,7 @@ object MicroOpAssembler {
       u.useImm      := False; u.imm := 0
       u.readsNzvc   := True; u.readsX := False                   // RMW: read old N/V
       u.writesNzvc  := True; u.writesX := False                  // write {oldN,Z,oldV,C}
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.eaAuto      := EaAuto.NONE; u.eaDelta := 0
       u.ccrRestore  := False; u.toCcr := False
       u.cond        := 0
@@ -3799,7 +3799,7 @@ object MicroOpAssembler {
     ibrUop.readsNzvc     := False; ibrUop.readsX := False
     ibrUop.writesNzvc    := False; ibrUop.writesX := False
     ibrUop.isBranch      := True;  ibrUop.ibranch := True
-    ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.isReturn := False; ibrUop.ccrRestore := False; ibrUop.toCcr := False    // JMP: no An postinc (JSR/RTS override)
+    ibrUop.stkPush       := False; ibrUop.anInc := 0; ibrUop.isReturn := False; ibrUop.isCall := isJsrOp; ibrUop.ccrRestore := False; ibrUop.toCcr := False    // JMP: no An postinc (JSR/RTS override)
     ibrUop.eaAuto        := EaAuto.NONE; ibrUop.eaDelta := 0
     ibrUop.cond          := 0
     ibrUop.unimplemented := False
@@ -3842,7 +3842,7 @@ object MicroOpAssembler {
               op: DecOp.C = DecOp.MOVE, divIsRem: Bool = False,
               eaAuto: EaAuto.C = EaAuto.NONE, eaDelta: UInt = U(0, 3 bits),
               keepCommit: Bool = False, movesAliasStore: Bool = False,
-              isReturn: Bool = False): DecodedUop = {
+              isReturn: Bool = False, isCall: Bool = False): DecodedUop = {
       val u = DecodedUop()
       u.debugBreakValid := False; u.debugBreakSlot := 0
       u.fpInert()
@@ -3856,6 +3856,7 @@ object MicroOpAssembler {
       u.readsNzvc := False; u.readsX := False; u.writesNzvc := writesNzvc; u.writesX := writesX
       u.isBranch := isBranch; u.ibranch := ibranch; u.stkPush := stkPush; u.anInc := anInc
       u.isReturn := isReturn
+      u.isCall := isCall
       u.eaAuto := eaAuto; u.eaDelta := eaDelta
       u.ccrRestore := ccrRestore; u.toCcr := False
       u.cond := cond
@@ -3919,8 +3920,12 @@ object MicroOpAssembler {
       d
     }
     val bsrPush   = pushUop(A7, nextPc.asBits, first = True)
+    // isCall=True: the ARCHITECTURAL-CALL flag (see DecodedUop.isCall). Nothing else on
+    // this µop tells a BSR from a plain BRA -- the return-address push is the separate,
+    // earlier `bsrPush` -- and the branch EU needs it to let a flush re-apply the
+    // fetch-time RAS push (RasPlugin `branchRepair`). JSR's half is on `ibrUop`.
     val bsrBranch = mkUop(isBranch = True, cond = B(0, 4 bits),    // unconditional BRA
-                          useImm = False, imm = bsrDisp, first = False)
+                          useImm = False, imm = bsrDisp, first = False, isCall = True)
 
     // ── RTS (0x4E75) — crack into [load.l (A7) -> T0] + [ibranch -> T0 ; A7 += 4]. ─
     // The pop load reads (A7) into T0 (a temp); the trailing ibranch redirects to T0
@@ -4119,7 +4124,7 @@ object MicroOpAssembler {
       u.imm         := Mux(srcEa.pcRel, ctrlEaPcRel, srcEa.disp)        // disp / folded abs / folded pc
       u.readsNzvc   := False; u.readsX := False
       u.writesNzvc  := False; u.writesX := False
-      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False
+      u.isBranch    := False; u.ibranch := False; u.stkPush := False; u.anInc := 0; u.isReturn := False; u.isCall := False
       u.cond        := 0
       u.unimplemented := False
       u.faulted     := False; u.faultVector := 0; u.faultUsesNextPc := False

@@ -218,6 +218,21 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // starts at a flop Q with the whole period in front of it.
     ras.logic.checkpointSave    := rob.logic.countIsZero
     ras.logic.checkpointRestore := rasCheckpointRestore
+    // RAS flush-repair (RasPlugin `branchRepair`, default OFF). The restore above rolls
+    // the stack back past the mispredicting branch itself, so a mispredicted CALL loses
+    // its own already-architectural push and its callee's `rts` mispredicts too. These
+    // three wires hand the RAS that one delta back. All THREE are bare register Qs
+    // (`earlyFire` is a register; the two carry registers are latched by the same
+    // `earlyArm`), and RasPlugin consumes them behind one more flop, so this adds nothing
+    // to the redirect / `ftbBlocked` cone -- the standing rule for predictor recovery.
+    require(rob.rasBranchRepair == ras.branchRepair,
+      "RobPlugin.rasBranchRepair and RasPlugin.branchRepair must agree " +
+      s"(rob=${rob.rasBranchRepair}, ras=${ras.branchRepair})")
+    if (rob.rasBranchRepair) {
+      ras.logic.repairValid := rob.logic.earlyFire
+      ras.logic.repairKind  := rob.logic.rasRepairKind
+      ras.logic.repairData  := rob.logic.rasRepairData
+    }
     // ── gshare direction predictor (slice 3) ────────────────────────────────────
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
     // + brType into FetchAlign so it can form condBtbHit and source the conditional
@@ -308,6 +323,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     rob.logic.completion(2).payload := lsEu.completion.payload
     // MMU access-fault completion -> ROB (flags the entry vector 2 + faultAddr/SSW
     // for precise format-$7 delivery at retire).
+    // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+    // whose barrier a younger already-launched access violated. Recovered at retire.
+    rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+    rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+    host[m68k040.services.RobLsReplayService].lsReplay.valid         := host[m68k040.execute.LsEuService].replayRequest.valid
+    host[m68k040.services.RobLsReplayService].lsReplay.payload       := host[m68k040.execute.LsEuService].replayRequest.payload
     rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
     rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
     // Precise-path SQ<->ROB loop (Task P2.5): SQ completion/fault-completion ->
@@ -859,22 +880,26 @@ object GenFullCoreSynthVerilog {
           // `logic` Area has to have elaborated by then or those accessors are still null.
           new m68k040.execute.FpuControlPlugin(),
           new m68k040.exception.InterruptControlPlugin(),
-          new ItlbPlugin(),
+          new ItlbPlugin(victimEntries = ShippingCoreConfig.itlbVictimEntries),
           new DtlbPlugin(),
           new IcachePlugin(),
           new DcachePlugin(),
           new BtbPlugin(),
           new FtbPlugin(),
-          new m68k040.frontend.RasPlugin(),
+          new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair),
           new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory),
           new FetchAlignPlugin(enableFetchDirected = true, deferSlot1Conditional = deferSlot1Conditional,
-            trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional),
+            trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional,
+            computeDirectTargets = m68k040.top.ShippingCoreConfig.computeDirectTargets,
+            deferSlot1Uncond = m68k040.top.ShippingCoreConfig.deferSlot1Uncond,
+            deferSlot1Dbcc = m68k040.top.ShippingCoreConfig.deferSlot1Dbcc),
           new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
             fuseLongMoveLoads = fuseLongMoveLoads),
           new RenameStage(retireWidth = if (preparedRetireEntries == 0) retireWidth else preparedRetireEntries,
             preparedRetirement = preparedRetireEntries != 0),
           new DispatchPlugin(),
-          new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries),
+          new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedRetireEntries,
+            rasBranchRepair = ShippingCoreConfig.rasBranchRepair),
           // IQ_LOAD_BYPASS=1 lets a LOAD pass an older UNREADY LOAD in LS selection.
           // Env-read rather than a constructor parameter so every existing correctness
           // spec that builds this core can be run against it unmodified -- validating an

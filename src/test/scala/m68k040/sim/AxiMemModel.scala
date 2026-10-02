@@ -59,8 +59,54 @@ case class L2LatencyModel(
   fillFixedCycles: Int = 4,
   interBeatGap: Int = 1,
   l2Mshrs: Int = 8,
-  secondaryPerMshr: Int = 4
-)
+  secondaryPerMshr: Int = 4,
+  /** ── L2 CAPACITY. `sets = 0` means UNBOUNDED, which is what this model did from
+    * the day it was written until 2026-09-27 and is therefore the default: the
+    * residency image was a `mutable.Set[Long]` that was inserted into and NEVER
+    * evicted, so after one touch a line hit at `hitCycles` for the rest of the run
+    * and `dramCycles` only ever applied to COMPULSORY misses.
+    *
+    * ⚠ WHY THAT IS NOT A DETAIL. A warmed-up kernel under an unbounded L2 has
+    * essentially NO long-latency misses left, so it has almost no latency to
+    * overlap -- and any multi-outstanding / MLP lever measured against it reads
+    * near-zero for a MODELLING reason rather than an architectural one. A null
+    * measured at `sets = 0` is not evidence about the machine.
+    *
+    * `sets = 4096, ways = 8, lineBytes = 64` is the REAL L2 (2 MB), verified in
+    * `macqd700-soc/rtl/soc/l2c_defs.vh:25-32` (`L2C_WAYS 8`, `L2C_SETS 4096`,
+    * `L2C_LINE_BYTES 64`, `L2C_SET_BITS 12`, `L2C_TAG_BITS 14`) and
+    * `l2c_data.v:4` ("(64 B lines) = 256 KB/way x 8 ways = 2 MB total").
+    * Replacement is 8-way TREE-PLRU, ported function-for-function from
+    * `macqd700-soc/rtl/soc/l2c_plru_funcs.vh` (`l2c_plru_victim` /
+    * `l2c_plru_next`, used by `l2c_victim_sel.v`) rather than approximated by LRU.
+    *
+    * ⛔ MEASURED COVERAGE RESULT, 2026-09-27, and it is why a finite L2 does NOT by
+    * itself repair the corpus: at `sets = 4096, ways = 8` every bench kernel reported
+    * `evictions = 0`. `chase-128`, `dhry-cb-128` and `load-stream` take 32-49 L2 misses
+    * each over a whole run and ALL of them are COMPULSORY -- their working sets fit the
+    * 2 MB L2 outright, several times over. So `dramCycles` still reaches only cold
+    * misses, exactly as it did under the unbounded model; the difference is that now
+    * the `l2Evictions` counter SAYS SO instead of the fact being invisible.
+    * The corpus, not the model, is the remaining gap: measuring anything that depends
+    * on DRAM-latency misses needs a kernel whose working set EXCEEDS 2 MB, and the
+    * bench has none. (Treat a zero-eviction run as a coverage finding to report, not
+    * as a null result about the machine.)
+    *
+    * KNOWN LIMIT, stated so no number leans on it: this capacity image is READ-SIDE
+    * only. The real L2 is write-back/WRITE-ALLOCATE, so a store stream installs and
+    * evicts lines too; `AxiWriteEngine` is a separate object with no shared L2 state
+    * and does not. So a measured L2 miss rate here UNDERSTATES the pollution a real
+    * store stream causes. */
+  sets: Int = 0,
+  ways: Int = 8
+) {
+  require(sets >= 0, s"L2LatencyModel.sets = $sets must be >= 0 (0 = unbounded)")
+  require(sets == 0 || (Integer.bitCount(sets) == 1), s"L2LatencyModel.sets = $sets must be a power of two")
+  require(sets == 0 || ways == 8,
+    s"L2LatencyModel.ways = $ways: the ported tree-PLRU (l2c_plru_funcs.vh) is 8-way only")
+  def finiteCapacity: Boolean = sets > 0
+  def capacityBytes: Long = sets.toLong * ways.toLong * lineBytes.toLong
+}
 
 /** Full configuration of one attached memory model instance.
   *
@@ -149,7 +195,17 @@ case class AxiMemModelConfig(
   writeIdsAllowedOutstanding: Set[Int] = Set(1),   // AxiIds.D_STORE -- see doc comment above
   injectBusErrors: Boolean = false,
   maxPendingBeats: Int = 8,
-  bQueueDepth: Int = 4
+  bQueueDepth: Int = 4,
+  /** Test-only adversarial visibility: hold W bytes until the corresponding B is
+    * presented. The normal L2 model applies W immediately; this mode tests that a
+    * hot read of the same line really waits for B instead of relying on early W
+    * visibility. Default OFF for every existing harness. */
+  deferWriteVisibilityUntilB: Boolean = false,
+  /** Test-only AR backpressure hook. Keep ready low while false, to exercise AXI
+    * VALID/payload stability across an intervening CPU-side event. */
+  arReadyGate: () => Boolean = () => true,
+  /** Test-only AW backpressure hook for a legal held store pipeline. */
+  awReadyGate: () => Boolean = () => true
 )
 
 /** Free-running simulation cycle counter shared by the read and write engines of one
@@ -172,12 +228,17 @@ class AxiMemStats(idWidth: Int) {
   var l2Hits = 0L
   var l2Misses = 0L
   var l2SecondaryMerges = 0L
+  /** Capacity evictions in the finite-L2 model. ZERO means the working set fit, which
+    * is itself a coverage finding: a kernel that never evicts an L2 line cannot
+    * measure anything that depends on a DRAM-latency miss. */
+  var l2Evictions = 0L
   var maxConcurrentReads = 0
   def totalAr: Long = arCount.sum
   def totalAw: Long = awCount.sum
   def reset(): Unit = {
     for (i <- 0 until nIds) { arCount(i) = 0L; awCount(i) = 0L }
     rBeats = 0L; wBeats = 0L; l2Hits = 0L; l2Misses = 0L; l2SecondaryMerges = 0L
+    l2Evictions = 0L
     maxConcurrentReads = 0
   }
 }
@@ -289,6 +350,67 @@ private case class RBeat(id: Int, base: Long, bytes: Int, bad: Boolean,
                          isLast: Boolean, seq: Long, var readyAt: Long,
                          installLine: Option[Long] = None)
 
+/** The model L2's residency image (see `AxiReadEngine.l2`). Extracted 2026-09-30 so two
+  * read engines can share one L2 -- the logic below is the former inline code, unchanged. */
+class L2Image(latency: L2LatencyModel) {
+  val lines = mutable.Set[Long]()
+  val inFlight = mutable.Map[Long, Long]()   // line -> readyAt
+  private val l2Fin   = latency.finiteCapacity
+  private val l2Sets  = if (l2Fin) latency.sets else 0
+  private val l2Ways  = if (l2Fin) latency.ways else 0
+  private val l2Tag   = if (l2Fin) Array.fill(l2Sets, l2Ways)(-1L) else Array.empty[Array[Long]]
+  private val l2Plru  = if (l2Fin) Array.fill(l2Sets)(0) else Array.empty[Int]
+  private def l2SetOf(line: Long): Int = ((line / latency.lineBytes) % l2Sets).toInt
+
+  private def plruVictim(t: Int): Int = {
+    def bit(i: Int) = (t >>> i) & 1
+    val w2 = bit(0)
+    val w1 = if (w2 == 1) bit(2) else bit(1)
+    val w0 = if (w2 == 1) { if (w1 == 1) 1 - bit(6) else 1 - bit(5) }
+             else         { if (w1 == 1) 1 - bit(4) else 1 - bit(3) }
+    (w2 << 2) | (w1 << 1) | w0
+  }
+
+  private def plruNext(t: Int, way: Int): Int = {
+    def set(v: Int, i: Int, b: Int) = if (b == 1) v | (1 << i) else v & ~(1 << i)
+    val w2 = (way >>> 2) & 1; val w1 = (way >>> 1) & 1; val w0 = way & 1
+    var nt = t
+    if (w2 == 0) {
+      nt = set(nt, 0, 1)
+      if (w1 == 0) { nt = set(nt, 1, 1); nt = set(nt, 3, w0) }
+      else         { nt = set(nt, 1, 0); nt = set(nt, 4, w0) }
+    } else {
+      nt = set(nt, 0, 0)
+      if (w1 == 0) { nt = set(nt, 2, 1); nt = set(nt, 5, w0) }
+      else         { nt = set(nt, 2, 0); nt = set(nt, 6, w0) }
+    }
+    nt
+  }
+
+  def resident(line: Long): Boolean = {
+    if (!l2Fin) return lines.contains(line)
+    val s = l2SetOf(line)
+    var w = 0
+    while (w < l2Ways) {
+      if (l2Tag(s)(w) == line) { l2Plru(s) = plruNext(l2Plru(s), w); return true }
+      w += 1
+    }
+    false
+  }
+
+  def install(line: Long, stats: AxiMemStats): Unit = {
+    if (!l2Fin) { lines += line; return }
+    val s = l2SetOf(line)
+    var w = 0; var victim = -1
+    while (w < l2Ways && victim < 0) { if (l2Tag(s)(w) == -1L) victim = w; w += 1 }
+    if (victim < 0) { victim = plruVictim(l2Plru(s)); stats.l2Evictions += 1 }
+    l2Tag(s)(victim) = line
+    l2Plru(s) = plruNext(l2Plru(s), victim)
+  }
+
+
+}
+
 /** Read side of the model. Written against the raw `ar`/`r` streams (not `Axi4` /
   * `Axi4ReadOnly`) so the SAME implementation serves both master shapes -- this is
   * the consolidation the legacy `Axi4ReadOnlyBehavioralAgent` (an acknowledged
@@ -296,7 +418,7 @@ private case class RBeat(id: Int, base: Long, bytes: Int, bad: Boolean,
 class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
                     cd: ClockDomain, mem: SparseMemory, cfg: AxiMemModelConfig,
                     clk: SimCycleCounter, stats: AxiMemStats,
-                    checker: AxiProtocolChecker) {
+                    checker: AxiProtocolChecker, l2Shared: L2Image = null) {
 
   private val nIds = if (busConfig.useId) (1 << busConfig.idWidth) else 1
   private val queues = Array.fill(nIds)(mutable.Queue[RBeat]())
@@ -307,9 +429,23 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
   // The ID whose burst is currently mid-flight on R. Cleared on `last`. Enforces
   // "no cross-ID interleaving INSIDE a burst" for every mode except IllegalInterleave.
   private var lockedId: Int = -1
-  // L2 model state: lines currently resident, and in-flight primary misses.
-  private val l2Lines = mutable.Set[Long]()
-  private val l2InFlightLines = mutable.Map[Long, Long]()   // line -> readyAt
+  // ── L2 model state: lines currently resident, and in-flight primary misses ──
+  // Residency has TWO representations and the config picks one (see
+  // `L2LatencyModel.sets`):
+  //   sets == 0  UNBOUNDED -- the historical `mutable.Set[Long]`, never evicted.
+  //   sets  > 0  a real SETS x WAYS tag array with 8-way tree-PLRU replacement,
+  //              ported from `macqd700-soc/rtl/soc/l2c_plru_funcs.vh`.
+  // The unbounded path is kept byte-for-byte so that `sets == 0` runs are bit-identical
+  // to every measurement taken before 2026-09-27.
+  /** L2 residency / in-flight state. SHAREABLE between two read engines (the D-side hot
+    * door and the cold `axi_d` door reach the SAME L2 in the SoC): pass `l2Shared` so a
+    * line filled through one door is a hit through the other. Unshared by default, which
+    * is byte-for-byte the pre-2026-09-30 behaviour. */
+  val l2: L2Image = if (l2Shared != null) l2Shared else new L2Image(cfg.latency)
+  private def l2Lines = l2.lines
+  private def l2InFlightLines = l2.inFlight
+  private def l2Resident(line: Long): Boolean = l2.resident(line)
+  private def l2Install(line: Long): Unit = l2.install(line, stats)
 
   private def totalPendingBeats: Int = queues.map(_.size).sum
 
@@ -344,7 +480,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     val L = cfg.latency
     if (!L.enabled) return (0L, None)
     val line = addr & ~(L.lineBytes.toLong - 1)
-    if (l2Lines.contains(line)) { stats.l2Hits += 1; (L.hitCycles.toLong, None) }
+    if (l2Resident(line)) { stats.l2Hits += 1; (L.hitCycles.toLong, None) }
     else l2InFlightLines.get(line) match {
       case Some(t) =>
         // Same-line secondary merge onto an already-in-flight primary miss
@@ -447,7 +583,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
         // `latencyFor`'s doc comment). Skipped on a bus-error response, matching the
         // real L2's `fill_err` skip of `inst_valid` (`l2c_mshr.v` S_INSTALL).
         if (!b.bad) b.installLine.foreach { line =>
-          l2Lines += line
+          l2Install(line)
           l2InFlightLines.remove(line)
         }
         if (busConfig.useId)   r.id   #= b.id
@@ -460,7 +596,7 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
     }
   }
 
-  val arDriver = StreamReadyRandomizer(ar, cd, () => arAcceptable())
+  val arDriver = StreamReadyRandomizer(ar, cd, () => arAcceptable() && cfg.arReadyGate())
 }
 
 /** Write side. This is a FAITHFUL port of `BehavioralMemAgent`'s hand-rolled write
@@ -470,17 +606,17 @@ class AxiReadEngine(ar: Stream[Axi4Ar], r: Stream[Axi4R], busConfig: Axi4Config,
   *   paired with its AW, and a burst's B closure is enqueued ONLY after every byte
   *   of that burst has been written. ***
   *
-  * Any deferred-apply latency model that broke this would re-introduce the
-  * harness-induced store->load race the original comment exists to prevent (design
-  * doc §8.1 item 6). Latency is therefore applied to WHEN B IS DRIVEN, never to when
-  * the bytes land. */
+  * A test-only `deferWriteVisibilityUntilB` mode deliberately withholds the bytes
+  * until B to challenge the D-cache's cross-door same-line gate. Every existing
+  * caller retains this write-before-B behavior by default. */
 class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
                      busConfig: Axi4Config, cd: ClockDomain, mem: SparseMemory,
                      cfg: AxiMemModelConfig, clk: SimCycleCounter,
                      stats: AxiMemStats, checker: AxiProtocolChecker) {
 
-  private case class AwState(addr: BigInt, size: Int, len: Int, burst: Int, id: Int, var beat: Int)
-  private case class BRsp(id: Int, bad: Boolean, readyAt: Long)
+  private case class AwState(addr: BigInt, size: Int, len: Int, burst: Int, id: Int,
+                             var beat: Int, pendingBytes: mutable.ArrayBuffer[(Long, Byte)])
+  private case class BRsp(id: Int, bad: Boolean, readyAt: Long, pendingBytes: Seq[(Long, Byte)])
 
   private val nIds = if (busConfig.useId) (1 << busConfig.idWidth) else 1
   private val awQueue = mutable.Queue[AwState]()
@@ -542,8 +678,12 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
       for (i <- 0 until bytesPerBeat) {
         if (((strb >> i) & 1) == 1) {
           val byte = ((data >> (8 * i)) & 0xff).toInt.toByte
-          mem.write((alignedBase + i).toLong, byte)
-          if (onByteWrite != null) onByteWrite((alignedBase + i).toLong, byte)
+          val byteAddr = (alignedBase + i).toLong
+          if (cfg.deferWriteVisibilityUntilB) st.pendingBytes += ((byteAddr, byte))
+          else {
+            mem.write(byteAddr, byte)
+            if (onByteWrite != null) onByteWrite(byteAddr, byte)
+          }
         }
       }
     }
@@ -567,7 +707,7 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
         awQueue.dequeue()
         qPending += 1
         val lat = if (cfg.latency.enabled) cfg.latency.hitCycles.toLong else 0L
-        bQueue(st.id) += BRsp(st.id, bad, clk.now + lat)
+        bQueue(st.id) += BRsp(st.id, bad, clk.now + lat, st.pendingBytes.toSeq)
       }
     }
   }
@@ -590,7 +730,8 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
     checker.onAw(id, a.addr.toBigInt, size, len, burst, liveAwIds.contains(id), clk.now)
     stats.awCount(id) += 1
     liveAwIds += id
-    awQueue += AwState(a.addr.toBigInt, size, len, burst, id, 0)
+    awQueue += AwState(a.addr.toBigInt, size, len, burst, id, 0,
+      mutable.ArrayBuffer.empty[(Long, Byte)])
     update()
   }
 
@@ -609,6 +750,10 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
         case _                  => ready(simRandom.nextInt(ready.size))
       }
       val rsp = bQueue(id).dequeue()
+      if (cfg.deferWriteVisibilityUntilB) rsp.pendingBytes.foreach { case (addr, byte) =>
+        mem.write(addr, byte)
+        if (onByteWrite != null) onByteWrite(addr, byte)
+      }
       if (busConfig.useId)   b.id   #= rsp.id
       if (busConfig.useResp) b.resp #= (if (rsp.bad) 3 else 0)
       liveAwIds -= rsp.id
@@ -617,7 +762,7 @@ class AxiWriteEngine(aw: Stream[Axi4Aw], w: Stream[Axi4W], b: Stream[Axi4B],
     }
   }
 
-  val awDriver = StreamReadyRandomizer(aw, cd, () => awAcceptable())
+  val awDriver = StreamReadyRandomizer(aw, cd, () => awAcceptable() && cfg.awReadyGate())
   val wDriver  = StreamReadyRandomizer(w,  cd, () => qPending < cfg.bQueueDepth)
 }
 
@@ -730,9 +875,11 @@ object AxiMemModel {
 
   def attachReadOnly(axi: Axi4ReadOnly, cd: ClockDomain,
                      cfg: AxiMemModelConfig = AxiMemModelConfig(),
-                     sharedMem: SparseMemory = null): AxiMemModel = {
+                     sharedMem: SparseMemory = null,
+                     sharedL2From: AxiMemModel = null): AxiMemModel = {
     val m = new AxiMemModel(axi.config, cd, cfg, sharedMem)
-    m.readEngine = new AxiReadEngine(axi.ar, axi.r, axi.config, cd, m.mem, cfg, m.clk, m.stats, m.checker)
+    m.readEngine = new AxiReadEngine(axi.ar, axi.r, axi.config, cd, m.mem, cfg, m.clk, m.stats, m.checker,
+      if (sharedL2From != null) sharedL2From.readEngine.l2 else null)
     m
   }
 

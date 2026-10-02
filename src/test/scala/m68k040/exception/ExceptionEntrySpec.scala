@@ -148,7 +148,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       // reset release; a random B response could then become a cache storeAck with no
       // accepted descriptor (and, if RESP happened nonzero, a bogus diagnostic fault).
       // The test must not rely on simulator power-up values to prove exception entry.
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
       var acceptedStores = 0
@@ -301,7 +301,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
         dut.wire.logic.storeAllow #= true
         dut.wire.logic.injLoadFault #= false
         dut.wire.logic.injStoreErr #= false
-        val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         cd.forkStimulus(10)
         init(dut, cd)
 
@@ -367,7 +367,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       dut.wire.logic.storeAllow #= true
       dut.wire.logic.injLoadFault #= true      // every exc-sequencer load response faults
       dut.wire.logic.injStoreErr #= false
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 
@@ -435,7 +435,7 @@ class ExceptionEntrySpec extends AnyFunSuite {
       dut.wire.logic.storeAllow #= true
       dut.wire.logic.injLoadFault #= false     // the vector read is HEALTHY
       dut.wire.logic.injStoreErr #= true       // ...the frame push is not
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
 

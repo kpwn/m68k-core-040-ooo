@@ -70,7 +70,11 @@ class IpcBenchSpec extends CoreBenchHarness {
       kDhrystone(copyStyle = "byteX4", copyback = true),
       kDhrystone(copyStyle = "byteDispX4", copyback = true),
       kDhrystone(copyStyle = "byteLdIncX4", copyback = true),
-      kDhrystone(copyStyle = "byteStIncX4", copyback = true))
+      kDhrystone(copyStyle = "byteStIncX4", copyback = true)) ++
+      // IPC_STRCMP_KERNELS=1 appends the Track 6 strcmp kernels (load -> compare ->
+      // conditional branch, the shape the board spends its retire stall in and this
+      // suite had none of). Opt-in, so the default aggregate stays byte-identical.
+      (if (sys.env.get("IPC_STRCMP_KERNELS").contains("1")) strcmpKernels else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))
@@ -100,6 +104,22 @@ class IpcBenchSpec extends CoreBenchHarness {
         // holds the released (LS-class-only) consumer at its issue register until the real
         // announce confirms it, so a miss costs cycles and never a value. Default OFF.
         specLoadWakeup = sys.env.get("LS_SPEC_WAKE").contains("1"),
+        // THE COMBINATION UNDER GATE (2026-09-27). The three other individually-gated
+        // levers of this campaign, so the COMBINED core can be A/B'd against the same
+        // `throughput-v2` baseline in ONE suite, per kernel, on the `-cb` postures. They
+        // had a probe suite each (`RasBranchRepairIpcSpec`, `BranchPredictIpcSpec`) and no
+        // way to be measured TOGETHER on the workload-shaped kernels -- which is the whole
+        // reason features that pass individually still have to be gated as a set.
+        // All default OFF, so an unset environment reproduces every earlier run exactly.
+        rasBranchRepair = sys.env.get("RAS_BRANCH_REPAIR").contains("1"),
+        computeDirectTargets = sys.env.get("COMPUTE_DIRECT_TARGETS").contains("1"),
+        deferSlot1Uncond = sys.env.get("DEFER_SLOT1_UNCOND").contains("1"),
+        // DEFER_SLOT1_DBCC=1 -- added by the integration merge. `perf/slot1-coverage`
+        // wired its lever into `BranchPredictIpcSpec` (as `BR_DEFER_SLOT1_DBCC`) only,
+        // so the COMBINATION could not be measured on the workload-shaped kernels at
+        // all: the one suite that runs `dhrystone`/`strcmp` had no way to turn it on.
+        // Default OFF, so an unset environment reproduces every earlier run exactly.
+        deferSlot1Dbcc = sys.env.get("DEFER_SLOT1_DBCC").contains("1"),
         // IPC_V2_DEFER=1 adds the two slot-1 conditional-deferral options, which are
         // the only validated FullCoreDut options the shipped profile does not set.
         // `deferSlot1Conditional` EXCLUDES slot-1 training; `deferTakenSlot1Conditional`
@@ -117,6 +137,7 @@ class IpcBenchSpec extends CoreBenchHarness {
     println("  IPC = retired macro-instructions / window-cycles")
     println(s"  memory model: $memLabel")
     println(s"  sim seed: ${IpcBenchSpec.simSeed}")
+    println(s"  miss injection: ${MissInjector.label}")
     println("  dual%(act) = cycles retiring 2 / commit-active cycles (backend ILP)")
     println("  dual%(win) = cycles retiring 2 / all window cycles")
     println("  active%    = cycles retiring >=1 / all window cycles (backend occupancy)")
@@ -133,6 +154,43 @@ class IpcBenchSpec extends CoreBenchHarness {
     val totCyc = results.map(_.windowCycles).sum
     println(f"${"AGGREGATE"}%-16s ${totRet}%8d ${totCyc}%7d ${totRet.toDouble / totCyc}%6.3f")
     println("=" * 96)
+    // ── STALL BUDGET table (IPC_STALL_BUDGET=1 only) ──────────────────────────
+    // OPT-IN, so the default aggregate above stays byte-identical. Per-kernel, because
+    // three levers this week turned out to rest on a SINGLE kernel -- an aggregate hides
+    // exactly the thing this instrument exists to show. Categories mirror the board's
+    // perf counters term for term; see `CoreBenchHarness.StallBudget`.
+    if (results.nonEmpty && results.forall(_.stallBudget.isDefined)) {
+      println()
+      println("=" * 112)
+      println("  STALL BUDGET — per-kernel cycle decomposition (board-comparable categories)")
+      println("  robEmpty + retireStall + retire == cycles  (a PARTITION; residual must be 0)")
+      println("  dcStall / walkStall are OVERLAPPING overlays, exactly as on the board")
+      println("  retire == rob.retire0 (the board's perfLvlRetire quirk: ANY retire, not a macro)")
+      println("=" * 112)
+      println(f"${"kernel"}%-26s ${"cycles"}%8s ${"robEmpty"}%16s ${"retireStall"}%16s " +
+        f"${"retire"}%16s ${"res"}%4s ${"dcStall"}%14s ${"walk"}%7s")
+      println("-" * 112)
+      for (r <- results; b = r.stallBudget.get) {
+        println(f"${r.name}%-26s ${b.cycles}%8d " +
+          f"${b.robEmpty}%9d ${b.robEmptyPct}%5.1f%% ${b.retireStall}%9d ${b.retireStallPct}%5.1f%% " +
+          f"${b.retireCycles}%9d ${b.retirePct}%5.1f%% ${b.residual}%4d " +
+          f"${b.dcStall}%7d ${b.dcStallPct}%5.1f%% ${b.walkStall}%7d")
+      }
+      println("-" * 112)
+      val tb = results.map(_.stallBudget.get)
+      val tc = tb.map(_.cycles).sum
+      def sum(f: StallBudget => Int): Int = tb.map(f).sum
+      println(f"${"AGGREGATE"}%-26s ${tc}%8d " +
+        f"${sum(_.robEmpty)}%9d ${100.0 * sum(_.robEmpty) / tc}%5.1f%% " +
+        f"${sum(_.retireStall)}%9d ${100.0 * sum(_.retireStall) / tc}%5.1f%% " +
+        f"${sum(_.retireCycles)}%9d ${100.0 * sum(_.retireCycles) / tc}%5.1f%% " +
+        f"${sum(_.residual)}%4d " +
+        f"${sum(_.dcStall)}%7d ${100.0 * sum(_.dcStall) / tc}%5.1f%% ${sum(_.walkStall)}%7d")
+      println("=" * 112)
+      // The aggregate must close too, not just each kernel.
+      assert(sum(_.residual) == 0, s"aggregate stall budget residual=${sum(_.residual)}")
+    }
+
     println()
     for (r <- results) {
       println(s"[ftb:${r.name}] apply=${r.ftbApplies} confirm=${r.ftqConfirms} " +
@@ -140,6 +198,9 @@ class IpcBenchSpec extends CoreBenchHarness {
         s"declineFrame=${r.ftbFrameDeclines} declineBlocked=${r.ftbBusyDeclines}")
     }
     println()
+    // Sim-only miss-injection / MLP report (empty and silent unless IPC_INJ_D,
+    // IPC_INJ_I or IPC_MISS_STATS is set). See MissInjector.
+    MissInjector.report()
 
     val depO = results.find(_.name == "dependent-ALU")
     val indO = results.find(_.name == "independent-ALU")

@@ -10,7 +10,7 @@ import spinal.lib.misc.plugin.FiberPlugin
 
 /** Drives LsEu.issue from IO + provides an int PRF read port (observe load dst)
   * and a backdoor int PRF write port (seed the base register). */
-class LsEuSourcePlugin extends FiberPlugin {
+class LsEuSourcePlugin(val dstArch: Int = 0, val writeNzvc: Boolean = false) extends FiberPlugin {
   var obsInt: RegFileReadPort = null
   var seedW:  RegFileWritePort = null
 
@@ -48,7 +48,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.stkPush      := iStkPush
     uop.cond         := B(0)
     uop.unimplemented:= False
-    uop.dstArch      := U(0)
+    uop.dstArch      := U(dstArch, 5 bits)
     uop.pdstOld      := U(0)
     uop.size         := iSize
     uop.useImm       := True
@@ -57,7 +57,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.psrcB        := iPsrcB; uop.psrcBValid := iPsrcBValid
     uop.psrcC := 0; uop.psrcCValid := False
     uop.pdst         := iPdst;  uop.pdstValid  := iPdstValid
-    uop.writesNzvc   := False;  uop.pNzvcDst := U(0)
+    uop.writesNzvc   := Bool(writeNzvc);  uop.pNzvcDst := U(if (writeNzvc) 1 else 0)
     uop.writesX      := False;  uop.pXDst    := U(0)
     uop.pNzvcSrc     := U(0);   uop.readsNzvc := False;  uop.pNzvcOld := U(0)
     uop.pXSrc        := U(0);   uop.readsX    := False;  uop.pXOld    := U(0)
@@ -89,6 +89,7 @@ class LsEuSourcePlugin extends FiberPlugin {
     uop.bcdSub       := False; uop.bitOp := B(0); uop.extByte := False
     uop.isScc        := False; uop.isDbcc := False
     uop.firstOfInstr := True
+    uop.lastOfInstr  := True
     uop.faulted      := False; uop.faultVector := U(0); uop.faultUsesNextPc := False
     uop.sswInstr := False
     uop.isRte        := False; uop.isCondTrap := False

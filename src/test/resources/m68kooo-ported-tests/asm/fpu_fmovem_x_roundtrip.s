@@ -18,21 +18,22 @@
 | The architectural register is those 80 bits with the pad removed, so a
 | store must re-emit the pad as zero regardless of what was loaded.
 |
-| Register-list -> memory ordering (verified against Musashi's fmovem()
-| at m68kfpu.c:1662 AND against what m68k-linux-gnu-as -m68040 emits):
+| Register-list -> memory ordering follows the 2026-09-19 correction in
+| docs/superpowers/specs/2026-08-19-fmovem-data-list-design.md section 2,
+| independently checked by FmovemDataInteropSpec:
 |   control/postincrement list (ext1[12:11]=10): mask bit n selects FP(7-n)
 |   predecrement list          (ext1[12:11]=00): mask bit n selects FPn
-| and BOTH lay the same image down: the HIGHEST-numbered register in the
+| and BOTH lay the same image down: the LOWEST-numbered register in the
 | list occupies the LOWEST address.  So with FP0-FP3:
-|   FMOVEM.X (A0),FP0-FP3   -> FP3 <- (A0+0), FP2 <- +12, FP1 <- +24, FP0 <- +36
-|   FMOVEM.X FP0-FP3,-(A0)  -> FP0 -> (A0-12) ... FP3 -> (A0-48)
+|   FMOVEM.X (A0),FP0-FP3   -> FP0 <- (A0+0), FP1 <- +12, FP2 <- +24, FP3 <- +36
+|   FMOVEM.X FP0-FP3,-(A0)  -> FP3 -> (A0-12) ... FP0 -> (A0-48)
 | which is why an -(An) save and an (An)+ / control restore round-trip.
 |
 | PASS sentinel: 0xC0FFEE00
 | FAIL sentinels:
 |   0xDEAD1101 — vec 11 F-line (decode gap)
 |   0xDEAD1102 — (d16,An) store/load round-trip mismatch
-|   0xDEAD1103 — single-register store did not select FP0 == src slot 3
+|   0xDEAD1103 — single-register store did not select FP0 == src slot 0
 |                (register-list -> address ordering wrong)
 |   0xDEAD1104 — the 16-bit pad was not re-zeroed on store
 |   0xDEAD1105 — predecrement store laid the block down in the wrong order
@@ -107,23 +108,23 @@ _cmp1:
     bne     _fail_d16
     dbra    %d1, _cmp1
 
-    | ── Ordering: FP0 must hold SRC slot 3 ─────────────────────────
+    | ── Ordering: FP0 must hold SRC slot 0 ─────────────────────────
     | FMOVEM.X (A0),FP0-FP3 uses the control list (mask 0xF0), so the
-    | HIGHEST-numbered register in the list sits at the LOWEST address:
-    | FP3 <- slot 0 ... FP0 <- slot 3.  Store FP0 alone and compare.
+    | LOWEST-numbered register in the list sits at the LOWEST address:
+    | FP0 <- slot 0 ... FP3 <- slot 3. Store FP0 alone and compare.
     lea     DST2, %a1
     move.l  #0xDEADBEEF, 0(%a1)
     move.l  #0xDEADBEEF, 4(%a1)
     move.l  #0xDEADBEEF, 8(%a1)
     fmovem.x %fp0, %a1@
     move.l  0(%a1), %d0
-    cmp.l   #0x7FFF0000, %d0
+    cmp.l   #0x3FFF0000, %d0
     bne     _fail_order
     move.l  4(%a1), %d0
-    cmp.l   #0xFFFFFFFF, %d0
+    cmp.l   #0x80000000, %d0
     bne     _fail_order
     move.l  8(%a1), %d0
-    cmp.l   #0xFFFFFFFE, %d0
+    cmp.l   #0x00000001, %d0
     bne     _fail_order
 
     | ── 16-bit pad must be re-zeroed on store ──────────────────────
@@ -148,8 +149,8 @@ _cmp1:
     bne     _fail_pad
 
     | ── Predecrement store: FMOVEM.X FP0-FP3,-(An) ─────────────────
-    | FP0-FP3 still hold SRC slots 3,2,1,0 respectively.  The
-    | predecrement list puts FP0 at the HIGHEST address, so the block
+    | FP0-FP3 still hold SRC slots 0,1,2,3 respectively. The
+    | predecrement list puts FP0 at the LOWEST address, so the block
     | laid down from PRE upward must be an exact copy of SRC.
     lea     PRE, %a1
     move.l  #0xDEADBEEF, %d0

@@ -206,7 +206,7 @@ class VectorDispatchIntegritySpec extends AnyFunSuite {
     for (((vbr, vector, what), idx) <- cases.zipWithIndex) {
       compiled.doSim(s"dispatch_$idx") { dut =>
         val cd = dut.clockDomain
-        val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         cd.forkStimulus(10)
         init(dut, cd)
         val ssp0    = 0x00100000L
@@ -238,7 +238,7 @@ class VectorDispatchIntegritySpec extends AnyFunSuite {
   test("32 back-to-back F-line dispatches each redirect to the handler") {
     compiled.doSim("flineStorm") { dut =>
       val cd = dut.clockDomain
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
       val vbr     = 0x00000000L
@@ -269,7 +269,7 @@ class VectorDispatchIntegritySpec extends AnyFunSuite {
   test("the vector-table-redirect tripwire fires when a handler address is inside the table") {
     compiled.doSim("tripwire") { dut =>
       val cd = dut.clockDomain
-      val dmem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       cd.forkStimulus(10)
       init(dut, cd)
       val vbr     = 0x00000000L

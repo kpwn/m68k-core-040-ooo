@@ -36,6 +36,8 @@ import org.scalatest.funsuite.AnyFunSuite
   * ExecuteLockStepSpec — the forked test JVM peaks ~7.6GB per compile.
   */
 object FuzzRunner {
+  /** DTT0 identity map of the low 2 GiB, CM=00 (cachable, writethrough). */
+  val LowHalfWritethroughTtr: BigInt = BigInt("007FE000", 16)
   val loadAddr: Long = ProgramAssembler.DefaultLoadAddress
 
   sealed trait Outcome
@@ -438,6 +440,7 @@ object FuzzRunner {
 
       FuzzDut.attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      m68k040.sim.HotDoorAttach(dut.dcache, cd, dmem)
       // (The two table-walker AXI memories that used to be attached here are gone:
       // the ITLB/DTLB walkers no longer emit AXI. Their descriptor reads and U/M
       // writebacks are DcacheService client traffic now, so they reach memory
@@ -455,7 +458,7 @@ object FuzzRunner {
       // window to 0xFF on the DUT side, matching Musashi's default exactly, so an
       // unwritten read agrees on both sides by construction. See
       // fuzz-campaign-divergence-2026-07-16 memory, "DEFINITIVE ROOT CAUSE CONFIRMED".
-      for (a <- ProgGen.SandboxBase until (ProgGen.SandboxBase + ProgGen.SandboxSize)) {
+      for (w <- ProgGen.windows; a <- w until (w + ProgGen.SandboxSize)) {
         dmem.mem.write(a, 0xff.toByte)
       }
       dut.ctrl.logic.mmuEnable #= false
@@ -491,6 +494,26 @@ object FuzzRunner {
       cd.waitSampling(2)
       dut.wire.logic.seedValid #= false
       cd.waitSampling()
+      if (ProgGen.deviceWindow) {
+        // FUZZ_DEVICE_WINDOW posture (see ProgGen.DeviceBase): low half COPYBACK for code,
+        // stack and the ordinary sandbox, high half CACHE-INHIBITED for the device window --
+        // the `CachePosture.ForceCacheableCopyback` TTR pair. Translation stays off in every
+        // other respect: the two TTRs cover all 4 GiB, so no table walk can be demanded.
+        dut.ctrl.logic.itt0 #= CachePosture.LowHalfCopybackTtr
+        dut.ctrl.logic.itt1 #= 0
+        // WRITETHROUGH, not copyback: the final image compare peeks the behavioral AXI
+        // memory, and a copyback line would still be dirty in L1D (measured: 189/200 seeds
+        // "MEM" diverged at 0x4000 with dut=0xff). Writethrough keeps the low half cacheable
+        // -- which is all the posture needs, the point is the cacheable/INHIBITED mix.
+        dut.ctrl.logic.dtt0 #= LowHalfWritethroughTtr
+        dut.ctrl.logic.dtt1 #= CachePosture.HighHalfInhibitedTtr
+        dut.ctrl.logic.mmuEnable #= true
+        cd.waitSampling()
+        assert(dut.ctrl.logic.dtt1.toBigInt == CachePosture.HighHalfInhibitedTtr, "DTT1 did not stick")
+      }
+      val liveMon: LsLivenessMonitor =
+        if (!LsLivenessMonitor.enabledByEnv) null else new LsLivenessMonitor(dut, s"fuzz_$runIdx").attach()
+
       dut.fa.logic.redirect.valid   #= true
       dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling()
@@ -498,9 +521,12 @@ object FuzzRunner {
 
       var guard = 0
       val cap   = 3000 + 80 * n
-      while (handle.result.size < n && guard < cap) { cd.waitSampling(); guard += 1 }
+      while (handle.result.size < n && guard < cap &&
+             (liveMon == null || liveMon.failure.isEmpty)) { cd.waitSampling(); guard += 1 }
 
-      if (handle.result.size < n) {
+      if (liveMon != null && liveMon.failure.nonEmpty) {
+        outcome = Diverged("LIVENESS", liveMon.failure.get.linesIterator.next(), liveMon.failure.get)
+      } else if (handle.result.size < n) {
         val got = handle.result
         val tail = got.takeRight(3).map(c => f"pc=0x${c.pc}%08x").mkString(" ")
         outcome = Diverged("HANG",
@@ -552,7 +578,7 @@ object FuzzRunner {
           // non-zero pattern). The prologue writes EVERY sandbox byte, so for
           // generated programs this is the full window.
           val diffs = scala.collection.mutable.ArrayBuffer[String]()
-          for (a <- ProgGen.SandboxBase until (ProgGen.SandboxBase + ProgGen.SandboxSize)
+          for (w <- ProgGen.windows; a <- w until (w + ProgGen.SandboxSize)
                if diffs.size < 16; expected <- oracleMem.get(a)) {
             val got = dmem.peekByte(a)
             if (got != (expected & 0xff))
@@ -567,8 +593,7 @@ object FuzzRunner {
             // address the oracle never touched. Scoped to the data sandbox: the
             // supervisor stack carries exception frames whose layout legitimately
             // differs between a real 68040 and Musashi's model.
-            def inSandbox(a: Long) =
-              a >= ProgGen.SandboxBase && a < ProgGen.SandboxBase + ProgGen.SandboxSize
+            def inSandbox(a: Long) = ProgGen.inAnyWindow(a)
             // The DUT's sandbox is pre-filled to 0xFF to match Musashi's cb_read8 default
             // for never-written addresses -- so 0xFF is the shadow's initial byte too.
             val mr = MemWriteCapture.compare(memCap.events.toSeq, oracleWriteEvents,

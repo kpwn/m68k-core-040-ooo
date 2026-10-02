@@ -15,12 +15,15 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class DcacheSpec extends AnyFunSuite {
 
-  class Dut extends Component {
+  class Dut(directRefill: Boolean = false, hitUnderMissRead: Boolean = false,
+            earlyLineForward: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin()
+    val dcache = new DcachePlugin(directRefillResponse = directRefill,
+      earlyProbeLineForward = earlyLineForward,
+      hitUnderMiss = hitUnderMissRead, hitUnderMissRead = hitUnderMissRead)
     val probe  = new DcacheProbePlugin
     // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
     // DcachePlugin's PAGE-scope granule can be exercised at BOTH page sizes. It is
@@ -38,7 +41,143 @@ class DcacheSpec extends AnyFunSuite {
     * below (9 offsets; recompiling per offset costs minutes for zero
     * benefit -- the DUT is identical). Same pattern as ExecuteLockStepSpec's shared
     * FullCoreDut build. */
-  lazy val sharedCompiled = simConfig.compile(new Dut)
+  // Pass every constructor argument inside these lazy initializers. Scala's
+  // default-argument companion is itself lazy: the Spinal elaboration thread
+  // cannot initialize it while the test thread holds this suite's lazy-val lock.
+  lazy val sharedCompiled = simConfig.compile(new Dut(directRefill = false, hitUnderMissRead = false,
+    earlyLineForward = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward))
+  lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true, hitUnderMissRead = false,
+    earlyLineForward = false))
+  lazy val directHumCompiled = simConfig.compile(new Dut(directRefill = true,
+    hitUnderMissRead = true, earlyLineForward = false))
+  lazy val earlyLineCompiled = simConfig.compile(new Dut(directRefill = false,
+    hitUnderMissRead = false, earlyLineForward = true))
+
+  test("direct refill replies once on a cacheable miss, faults once on DECERR, and leaves inhibited reads unchanged",
+       VerilatorTest) {
+    directRefillCompiled.doSim { dut =>
+      val (cd, mem) = initDutErrInject(dut)
+      val good = 0x4804L
+      preload(mem, good & ~15L, 16)
+      val device = 0x4904L
+      preload(mem, device & ~15L, 16)
+
+      def request(addr: Long, mode: SpinalEnumElement[CacheMode.type]): (BigInt, Boolean, Boolean) = {
+        dut.probe.logic.loadCmdIn.valid #= true
+        dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+        dut.probe.logic.loadCmdIn.payload.paddr #= addr
+        dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+        dut.probe.logic.loadCmdIn.payload.cacheMode #= mode
+        dut.probe.logic.loadCmdIn.payload.token #= 7
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean)
+        dut.probe.logic.loadCmdIn.valid #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+        val result = (dut.probe.logic.loadRspOut.payload.data.toBigInt,
+                      dut.probe.logic.loadRspOut.payload.fault.toBoolean,
+                      dut.dcache.logic.directRefillResp.toBoolean)
+        assert(dut.probe.logic.loadRspOut.payload.token.toInt == 7,
+          "direct refill must retain the missing command's token")
+        for (_ <- 0 until 8) {
+          cd.waitSampling()
+          assert(!dut.probe.logic.loadRspOut.valid.toBoolean,
+            "REPLAY emitted a second response after the direct refill")
+        }
+        result
+      }
+
+      val cold = request(good, CacheMode.WRITETHROUGH)
+      assert(cold == ((expected(good, 4), false, true)), s"cold direct response: $cold")
+      val hot = request(good, CacheMode.WRITETHROUGH)
+      assert(hot == ((expected(good, 4), false, false)), s"resident hit changed: $hot")
+      val bad = 0xAAAA2004L // outside decoded memory; AXI R carries DECERR
+      val fault1 = request(bad, CacheMode.WRITETHROUGH)
+      val fault2 = request(bad, CacheMode.WRITETHROUGH)
+      assert(fault1._2 && fault1._3 && fault2._2 && fault2._3,
+        "DECERR must fault directly and never allocate a resident line")
+      val inhibited = request(device, CacheMode.INHIBITED)
+      assert(inhibited == ((expected(device, 4), false, false)),
+        s"inhibited path must keep its replay response: $inhibited")
+    }
+  }
+
+  test("direct refill stalls a colliding R beat and delivers both hit-under-miss tokens once",
+       VerilatorTest) {
+    // Vary the younger command's offset to put its resident response on the older
+    // refill's R-valid edge. This is the one-cycle Flow-port collision which a
+    // direct response must handle by holding AXI RREADY low, not by dropping R.
+    for (faultExpected <- Seq(false, true)) {
+      var collisions = 0
+      for (offset <- 43 to 49) directHumCompiled.doSim { dut =>
+        val (cd, mem) = initDutLatency(dut, hitCycles = 6, injectBusErrors = true)
+        val hot = 0x5844L
+        val cold = if (faultExpected) 0xAAAA2004L else 0x6004L // distinct cache set
+        for (i <- 0 until 16) {
+          mem.pokeByte((hot & ~15L) + i, memByte((hot & ~15L) + i))
+          mem.pokeByte((cold & ~15L) + i, memByte((cold & ~15L) + i))
+        }
+        assert(load(dut, cd, hot, Size.LONG) == expected(hot, 4))
+        cd.waitSampling(3)
+
+        val seen = scala.collection.mutable.ArrayBuffer[(Int, BigInt, Boolean)]()
+        var collision = false
+        var heldR: Option[(BigInt, BigInt, BigInt, Boolean)] = None
+        fork {
+          for (_ <- 0 until 80) {
+            cd.waitSampling()
+            if (dut.probe.logic.loadRspOut.valid.toBoolean) {
+              seen += ((dut.probe.logic.loadRspOut.payload.token.toInt,
+                        dut.probe.logic.loadRspOut.payload.data.toBigInt,
+                        dut.probe.logic.loadRspOut.payload.fault.toBoolean))
+            }
+            if (dut.dcache.logic.axi.r.valid.toBoolean) {
+              val beat = (dut.dcache.logic.axi.r.payload.data.toBigInt,
+                          dut.dcache.logic.axi.r.payload.id.toBigInt,
+                          dut.dcache.logic.axi.r.payload.resp.toBigInt,
+                          dut.dcache.logic.axi.r.payload.last.toBoolean)
+              heldR.foreach(old => assert(beat == old,
+                s"AXI R changed under backpressure: $old -> $beat"))
+              if (dut.dcache.logic.ldS2Resp.toBoolean) {
+                assert(!dut.dcache.logic.axi.r.ready.toBoolean,
+                  "resident response and direct refill shared one Flow slot")
+                collision = true
+              }
+              heldR = if (dut.dcache.logic.axi.r.ready.toBoolean) None else Some(beat)
+            } else assert(heldR.isEmpty, "AXI RVALID fell before held beat was accepted")
+          }
+        }
+
+        def offer(addr: Long, token: Int): Unit = {
+          dut.probe.logic.loadCmdIn.valid #= true
+          dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+          dut.probe.logic.loadCmdIn.payload.paddr #= addr
+          dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+          dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+          dut.probe.logic.loadCmdIn.payload.token #= token
+          dut.probe.logic.loadCmdIn.payload.ooOk #= true
+          dut.probe.logic.loadCmdIn.payload.rid #= 0
+          dut.probe.logic.loadCmdIn.payload.ridValid #= false
+          cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.ready.toBoolean)
+          dut.probe.logic.loadCmdIn.valid #= false
+        }
+
+        offer(cold, 1)
+        cd.waitSamplingWhere(dut.dcache.logic.axi.ar.valid.toBoolean &&
+                             dut.dcache.logic.axi.ar.ready.toBoolean)
+        cd.waitSampling(offset)
+        offer(hot, 2)
+        cd.waitSampling(72)
+        assert(seen.count(_._1 == 1) == 1 && seen.count(_._1 == 2) == 1,
+          s"hit-under-miss responses must each occur once: offset=$offset seen=$seen")
+        assert(seen.exists(x => x._1 == 1 && x._3 == faultExpected &&
+                               (faultExpected || x._2 == expected(cold, 4))) &&
+               seen.contains((2, expected(hot, 4), false)),
+          s"refill and resident-hit data/fault/token: offset=$offset seen=$seen")
+        if (collision) collisions += 1
+      }
+      assert(collisions > 0,
+        s"offset sweep never exercised simultaneous RVALID and resident response: fault=$faultExpected")
+    }
+  }
 
   /** Deterministic image byte. */
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt
@@ -51,7 +190,8 @@ class DcacheSpec extends AnyFunSuite {
 
   /** Drive a load cmd, wait accept, wait rsp.valid; return data. */
   def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type],
-           cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH): BigInt = {
+           cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
+           expectedResidentHit: Option[Boolean] = None): BigInt = {
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
@@ -64,6 +204,10 @@ class DcacheSpec extends AnyFunSuite {
     dut.probe.logic.loadProbeCancelIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.payload.all #= false
     cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+    expectedResidentHit.foreach { expected =>
+      assert(dut.probe.logic.loadRspOut.payload.residentHit.toBoolean == expected,
+        s"residentHit provenance mismatch for vaddr=0x${vaddr.toHexString}")
+    }
     dut.probe.logic.loadRspOut.payload.data.toBigInt
   }
 
@@ -216,13 +360,15 @@ class DcacheSpec extends AnyFunSuite {
     * test below) rather than via this blanket checker. */
   def initDutLatency(dut: Dut, hitCycles: Int = 15,
                       crossbarSingleOutstanding: Boolean = false,
-                      checkIdUnique: Boolean = false): (ClockDomain, AxiMemModel) = {
+                      checkIdUnique: Boolean = false,
+                      injectBusErrors: Boolean = false): (ClockDomain, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
     val cfg = AxiMemModelConfig(
       latency = L2LatencyModel(enabled = true, hitCycles = hitCycles),
       crossbarSingleOutstanding = crossbarSingleOutstanding,
-      checkIdUnique = checkIdUnique)
+      checkIdUnique = checkIdUnique,
+      injectBusErrors = injectBusErrors)
     val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, cfg)
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
@@ -252,7 +398,8 @@ class DcacheSpec extends AnyFunSuite {
       val base = 0x1230L  // 16-aligned line at 0x1230
       preload(mem, base & ~0xfL, 16)
 
-      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "LONG extract")
+      assert(load(dut, cd, base, Size.LONG, expectedResidentHit = Some(false)) ==
+        expected(base, 4), "LONG extract")
       assert(load(dut, cd, base, Size.WORD) == expected(base, 2), "WORD extract")
       assert(load(dut, cd, base, Size.BYTE) == expected(base, 1), "BYTE extract")
       // a byte deeper in the line
@@ -272,9 +419,10 @@ class DcacheSpec extends AnyFunSuite {
       fork { while (true) { cd.waitSampling()
         if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
 
-      load(dut, cd, base, Size.LONG)         // cold miss -> 1 refill
+      load(dut, cd, base, Size.LONG, expectedResidentHit = Some(false)) // cold miss -> 1 refill
       val after1 = arCount
-      val got = load(dut, cd, base + 4, Size.LONG)  // same line -> hit
+      val got = load(dut, cd, base + 4, Size.LONG,
+        expectedResidentHit = Some(true))  // same line -> hit
       assert(got == expected(base + 4, 4), "hit data")
       assert(arCount == after1, s"warm hit must not refill: $after1 -> $arCount")
       cd.waitSampling(4)
@@ -2457,6 +2605,305 @@ class DcacheSpec extends AnyFunSuite {
         s"the younger hit must not bypass the older refill: response cycles $responses")
       assert(!dut.dcache.logic.loadShadowValid.toBoolean, "replay slot must drain")
       cd.waitSampling(4)
+    }
+  }
+
+  test("VIPT line-forward: registered hit is consumed before slot-ready capture exactly once",
+       VerilatorTest) {
+    earlyLineCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base = 0x7E00L
+      val addr = base + 8
+      val token = 0x25
+      preload(mem, base, 16)
+      assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      cd.waitSampling(8)
+
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+      dut.probe.logic.loadProbeIn.payload.token #= token
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addr
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+
+      dut.probe.logic.loadCmdIn.payload.vaddr #= addr
+      dut.probe.logic.loadCmdIn.payload.paddr #= addr
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= token
+      dut.probe.logic.loadCmdIn.payload.lineOnly #= false
+      dut.probe.logic.loadCmdIn.valid #= true
+      sleep(1)
+      var sampled = 0
+      cd.waitSamplingWhere {
+        sampled += 1
+        val fire = dut.probe.logic.loadCmdIn.valid.toBoolean &&
+          dut.probe.logic.loadCmdIn.ready.toBoolean
+        if (fire) {
+          assert(dut.dcache.logic.probeLineValid.toBoolean &&
+            dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
+            s"load fired outside registered-line forwarding: sample=$sampled " +
+            s"lineValid=${dut.dcache.logic.probeLineValid.toBoolean} " +
+            s"lineHit=${dut.dcache.logic.probeLineHit.toBoolean} " +
+            s"readies=${dut.dcache.logic.earlyProbeReadies.map(_.toBoolean)}")
+          assert(!dut.dcache.logic.rdEn.toBoolean,
+            "forwarded hit must not launch the redundant BRAM read")
+        }
+        assert(sampled <= 6, "matching resolved command never accepted")
+        fire
+      }
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.token.toInt == token)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(addr, 4))
+      assert(!dut.probe.logic.loadRspOut.payload.fault.toBoolean)
+      for (_ <- 0 until 8) {
+        cd.waitSampling()
+        assert(!dut.probe.logic.loadRspOut.valid.toBoolean,
+          "forwarded probe must emit one response only")
+      }
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean,
+        "the forwarded probe slot must be consumed")
+
+      // A same-cycle squash must veto the forwarding candidate. The held
+      // command then uses the ordinary cache hit after cancellation clears it.
+      val canceledToken = 0x26
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.token #= canceledToken
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      dut.probe.logic.loadCmdIn.payload.token #= canceledToken
+      cd.waitSamplingWhere(dut.dcache.logic.probeReadValid.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.payload.all #= false
+      dut.probe.logic.loadProbeCancelIn.payload.token #= canceledToken
+      sleep(1)
+      assert(dut.dcache.logic.probeLineValid.toBoolean,
+        "cancel must coincide with the registered line result")
+      assert(!dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
+        "matching cancel must veto the registered line")
+      assert(!dut.probe.logic.loadCmdIn.ready.toBoolean,
+        "a token-present not-ready slot must hold the command during cancel")
+      cd.waitSampling()
+      dut.probe.logic.loadProbeCancelIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.token.toInt == canceledToken)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(addr, 4))
+      cd.waitSampling(4)
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean,
+        "squashed slot must not survive fallback")
+    }
+  }
+
+  test("VIPT line-forward: translated-tag mismatch waits then uses the ordinary hit pipe",
+       VerilatorTest) {
+    earlyLineCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val vaddr = 0x7E08L
+      val alias = vaddr + 0x800L // same virtual-set index, different physical tag
+      val token = 0x35
+      preload(mem, vaddr & ~15L, 16)
+      preload(mem, alias & ~15L, 16)
+      assert(load(dut, cd, vaddr, Size.LONG) == expected(vaddr, 4))
+      assert(load(dut, cd, alias, Size.LONG) == expected(alias, 4))
+      cd.waitSampling(8)
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= vaddr
+      dut.probe.logic.loadProbeIn.payload.token #= token
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= vaddr
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
+      dut.probe.logic.loadCmdIn.payload.paddr #= alias
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= token
+      dut.probe.logic.loadCmdIn.payload.lineOnly #= false
+      cd.waitSamplingWhere(dut.dcache.logic.probeReadValid.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= true
+      sleep(1)
+      assert(dut.dcache.logic.probeLineValid.toBoolean &&
+        !dut.dcache.logic.earlyProbeFresh.toBoolean,
+        "mismatch must be checked in the registered-line pre-slot-ready cycle")
+      assert(!dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
+        "registered line from the other physical tag must not forward")
+      assert(!dut.probe.logic.loadCmdIn.ready.toBoolean,
+        "the not-ready token must still hold its resolved command")
+      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      dut.probe.logic.loadCmdIn.valid #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+      assert(dut.probe.logic.loadRspOut.payload.token.toInt == token)
+      assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(alias, 4),
+        "ordinary read must serve the translated physical alias")
+      assert(!dut.probe.logic.loadRspOut.payload.fault.toBoolean)
+      cd.waitSampling(4)
+      assert(!dut.dcache.logic.earlyProbeValid.toBoolean)
+    }
+  }
+
+  test("VIPT line-forward: five occupied slots stall a sixth probe until forward-consume frees credit",
+       VerilatorTest) {
+    earlyLineCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val depth = dut.dcache.logic.earlyProbeDepth
+      val target = 0x7E08L
+      val targetToken = 0x60 + depth - 1
+      preload(mem, target & ~15L, 16)
+      assert(load(dut, cd, target, Size.LONG) == expected(target, 4))
+      cd.waitSampling(8)
+      for (i <- 0 until depth) {
+        val addr = if (i == depth - 1) target else 0x7200L + i * 0x110L
+        dut.probe.logic.loadProbeIn.valid #= true
+        dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+        dut.probe.logic.loadProbeIn.payload.token #= (0x60 + i)
+        dut.probe.logic.loadProbeIn.payload.resolved #= (i == depth - 1)
+        dut.probe.logic.loadProbeIn.payload.paddrHint #= (if (i == depth - 1) addr else 0L)
+        dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+        dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+        dut.probe.logic.loadProbeIn.payload.needsLine #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      }
+      dut.probe.logic.loadProbeIn.payload.vaddr #= 0x7900L
+      dut.probe.logic.loadProbeIn.payload.token #= 0x70
+      dut.probe.logic.loadProbeIn.payload.resolved #= false
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= 0
+      dut.probe.logic.loadCmdIn.payload.vaddr #= target
+      dut.probe.logic.loadCmdIn.payload.paddr #= target
+      dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
+      dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadCmdIn.payload.token #= targetToken
+      dut.probe.logic.loadCmdIn.payload.lineOnly #= false
+      dut.probe.logic.loadCmdIn.valid #= true
+      sleep(1)
+      var sampled = 0
+      cd.waitSamplingWhere {
+        sampled += 1
+        val fire = dut.probe.logic.loadCmdIn.valid.toBoolean &&
+          dut.probe.logic.loadCmdIn.ready.toBoolean
+        if (fire) {
+          assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == depth)
+          assert(dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
+            "full-queue load must consume the registered-line result")
+          assert(!dut.probe.logic.loadProbeIn.ready.toBoolean,
+            "registered full-queue credit must refuse the sixth probe on consume edge")
+        }
+        assert(sampled <= 6, "full-queue target load never accepted")
+        fire
+      }
+      dut.probe.logic.loadCmdIn.valid #= false
+      sleep(1)
+      var responseSeen = false
+      if (dut.probe.logic.loadRspOut.valid.toBoolean) {
+        assert(dut.probe.logic.loadRspOut.payload.token.toInt == targetToken)
+        assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(target, 4))
+        responseSeen = true
+      }
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      sleep(1)
+      assert(dut.dcache.logic.earlyProbeValids.count(_.toBoolean) == depth,
+        "sixth probe must launch only after the forwarded slot was freed")
+      if (!responseSeen && dut.probe.logic.loadRspOut.valid.toBoolean) {
+        assert(dut.probe.logic.loadRspOut.payload.token.toInt == targetToken)
+        assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(target, 4))
+        responseSeen = true
+      }
+      if (!responseSeen) {
+        cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
+        assert(dut.probe.logic.loadRspOut.payload.token.toInt == targetToken)
+        assert(dut.probe.logic.loadRspOut.payload.data.toBigInt == expected(target, 4))
+      }
+      dut.probe.logic.loadProbeCancelIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.payload.all #= true
+      cd.waitSampling()
+      dut.probe.logic.loadProbeCancelIn.valid #= false
+      dut.probe.logic.loadProbeCancelIn.payload.all #= false
+      sleep(1)
+      assert(!dut.dcache.logic.earlyProbeValids.exists(_.toBoolean))
+    }
+  }
+
+  test("VIPT line-forward: cancel at RAM-read stage cannot ready a reallocated slot",
+       VerilatorTest) {
+    earlyLineCompiled.doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val addr = 0x7E08L
+      preload(mem, addr & ~15L, 16)
+      assert(load(dut, cd, addr, Size.LONG) == expected(addr, 4))
+      cd.waitSampling(8)
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.vaddr #= addr
+      dut.probe.logic.loadProbeIn.payload.token #= 0x31
+      dut.probe.logic.loadProbeIn.payload.resolved #= true
+      dut.probe.logic.loadProbeIn.payload.paddrHint #= addr
+      dut.probe.logic.loadProbeIn.payload.size #= Size.LONG
+      dut.probe.logic.loadProbeIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      dut.probe.logic.loadProbeIn.payload.needsLine #= false
+      cd.waitSamplingWhere(dut.probe.logic.loadProbeIn.valid.toBoolean &&
+        dut.probe.logic.loadProbeIn.ready.toBoolean)
+      dut.probe.logic.loadProbeIn.valid #= false
+      sleep(1)
+      val oldSlot = dut.dcache.logic.earlyProbeValids.indexWhere(_.toBoolean)
+      assert(oldSlot >= 0,
+        s"sampled probe handshake did not allocate: " +
+        s"valids=${dut.dcache.logic.earlyProbeValids.map(_.toBoolean)} " +
+        s"ready=${dut.probe.logic.loadProbeIn.ready.toBoolean} " +
+        s"readValid=${dut.dcache.logic.probeReadValid.toBoolean}")
+      assert(dut.dcache.logic.probeReadValid.toBoolean,
+        "cancel must be offered while the old probe read is pending")
+      dut.probe.logic.loadProbeCancelIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.payload.all #= false
+      dut.probe.logic.loadProbeCancelIn.payload.token #= 0x31
+      cd.waitSampling()
+      dut.probe.logic.loadProbeCancelIn.valid #= false
+      sleep(1)
+      assert(!dut.dcache.logic.earlyProbeValids(oldSlot).toBoolean,
+        "cancel must invalidate before the old line result can publish")
+      dut.probe.logic.loadProbeIn.valid #= true
+      dut.probe.logic.loadProbeIn.payload.token #= 0x32
+      var oldLineOnRealloc = false
+      cd.waitSamplingWhere {
+        val fire = dut.probe.logic.loadProbeIn.valid.toBoolean &&
+          dut.probe.logic.loadProbeIn.ready.toBoolean
+        if (fire) oldLineOnRealloc = dut.dcache.logic.probeLineValid.toBoolean
+        fire
+      }
+      dut.probe.logic.loadProbeIn.valid #= false
+      sleep(1)
+      assert(oldLineOnRealloc,
+        "replacement probe must allocate on the old registered-line result edge")
+      assert(dut.dcache.logic.earlyProbeValids(oldSlot).toBoolean,
+        "new probe should reuse the canceled slot")
+      assert(dut.dcache.logic.earlyProbeTokens(oldSlot).toInt == 0x32)
+      assert(!dut.dcache.logic.earlyProbeReadies(oldSlot).toBoolean,
+        "old delayed line must not ready the replacement token")
+      cd.waitSamplingWhere(dut.dcache.logic.earlyProbeReadies(oldSlot).toBoolean)
+      assert(dut.dcache.logic.earlyProbeTokens(oldSlot).toInt == 0x32)
+      dut.probe.logic.loadProbeCancelIn.valid #= true
+      dut.probe.logic.loadProbeCancelIn.payload.all #= true
+      cd.waitSampling()
+      dut.probe.logic.loadProbeCancelIn.valid #= false
+      dut.probe.logic.loadProbeCancelIn.payload.all #= false
+      sleep(1)
+      assert(!dut.dcache.logic.earlyProbeValids.exists(_.toBoolean))
     }
   }
 

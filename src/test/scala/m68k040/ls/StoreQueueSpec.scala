@@ -1002,17 +1002,17 @@ class StoreQueueSpec extends AnyFunSuite {
     }
   }
 
-  test("P2.4: split precise store faulting in slot B reports slot B's OWN vaddr (not slot A's)", VerilatorTest) {
+  test("P2.4: split precise store faulting in slot B reports original first-byte logical address", VerilatorTest) {
     M68kSim().withVerilator.compile(new StoreQueue(8)).doSim { dut =>
       val cd = initDut(dut)
       val a = dut.io.alloc
       a.valid #= true
       a.payload.robId #= 7
-      a.payload.paddr #= 0x1000; a.payload.vaddr #= 0x21000000L
+      a.payload.paddr #= 0x1ffe; a.payload.vaddr #= 0x21000ffeL
       a.payload.data #= 0; a.payload.size #= Size.LONG
       a.payload.nbytesA #= 2; a.payload.useStrbA #= true
       a.payload.validB #= true
-      a.payload.paddrB #= 0x2000; a.payload.vaddrB #= 0x22000000L
+      a.payload.paddrB #= 0x9000; a.payload.vaddrB #= 0x21001000L
       a.payload.nbytesB #= 2
       a.payload.cacheMode #= m68k040.cache.CacheMode.WRITETHROUGH
       a.payload.cacheModeB #= m68k040.cache.CacheMode.WRITETHROUGH
@@ -1025,7 +1025,7 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.robHeadValidIn #= true
       // slot A drains cleanly (no error) -- entry does NOT pop yet (validB -> phase B next)
       cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
-      assert(dut.io.drain.payload.paddr.toLong == 0x1000, "slot A presented first")
+      assert(dut.io.drain.payload.paddr.toLong == 0x1ffe, "slot A presented first")
       cd.waitSampling()   // present -> held (drainBusy now registered True)
       dut.io.drainAck #= true
       sleep(1)
@@ -1036,14 +1036,20 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.drainAck #= false
       // slot B now presented -> fault it
       cd.waitSamplingWhere(dut.io.drain.valid.toBoolean)
-      assert(dut.io.drain.payload.paddr.toLong == 0x2000, "slot B presented next (atomic two-half drain)")
+      assert(dut.io.drain.payload.paddr.toLong == 0x9000, "slot B presented next (atomic two-half drain)")
       cd.waitSampling()   // present -> held (drainBusy now registered True)
       dut.io.drainAck #= true
       dut.io.drainErr #= true
       sleep(1)
       assert(dut.io.sqFaultCompletion.valid.toBoolean)
-      assert(dut.io.sqFaultCompletion.payload.faultAddr.toLong == 0x22000000L,
-        s"faultAddr must be slot B's OWN vaddr, not slot A's: ${dut.io.sqFaultCompletion.payload.faultAddr.toLong.toHexString}")
+      assert(dut.io.sqCompletion.valid.toBoolean && dut.io.sqCompletion.payload.toInt == 7)
+      assert(dut.io.sqFaultCompletion.payload.robId.toInt == 7)
+      assert(dut.io.sqFaultCompletion.payload.write.toBoolean)
+      assert(dut.io.sqFaultCompletion.payload.sizeBits.toInt == 2)
+      assert(!dut.io.sqFaultCompletion.payload.supervisor.toBoolean)
+      assert(!dut.io.sqFaultCompletion.payload.atc.toBoolean)
+      assert(dut.io.sqFaultCompletion.payload.faultAddr.toLong == 0x21000ffeL,
+        s"faultAddr must retain the original transfer's first byte: ${dut.io.sqFaultCompletion.payload.faultAddr.toLong.toHexString}")
       cd.waitSampling()
       dut.io.drainAck #= false; dut.io.drainErr #= false
       sleep(1)
@@ -1156,12 +1162,19 @@ class StoreQueueSpec extends AnyFunSuite {
       dut.io.drainAck #= false
       sleep(1)
       assert(dut.io.empty.toBoolean, "entry popped after the ack")
-      // preciseDrainBusy drops one cycle after resolution (design doc: held one extra
-      // cycle past ack for the ack-OK-to-retire handshake seam).
-      assert(dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy stays held the cycle immediately after ack")
-      cd.waitSampling()
+      // The shared LS completion stage may delay retirement beyond the bus ack.
+      // Keep IRQ recognition blocked until the launching store leaves the ROB head,
+      // otherwise RTE could replay an already completed device write.
+      for (_ <- 0 until 4) {
+        assert(dut.io.preciseDrainBusy.toBoolean,
+          "preciseDrainBusy must protect a drained store still at the ROB head")
+        cd.waitSampling()
+        sleep(1)
+      }
+      dut.io.robHeadIn #= 12 // retirement witness: the launching owner was 11
       sleep(1)
-      assert(!dut.io.preciseDrainBusy.toBoolean, "preciseDrainBusy drops one cycle after resolution")
+      assert(!dut.io.preciseDrainBusy.toBoolean,
+        "preciseDrainBusy must release at the boundary immediately after store retirement")
       cd.waitSampling(2)
     }
   }

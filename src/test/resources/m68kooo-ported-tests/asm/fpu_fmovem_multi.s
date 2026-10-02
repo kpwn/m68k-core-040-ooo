@@ -14,10 +14,9 @@
 | integrity, trap-freedom) is kept; the zero assertions are now value
 | assertions against a seed image.
 |
-| Register-list -> address rule (see fpu_fmovem_x_roundtrip.s for the
-| Musashi/gas derivation): the HIGHEST-numbered register in the list
-| takes the LOWEST address.  With FP0-FP3 that is FP3 at +0 ... FP0 at
-| +36.
+| Register-list -> address rule: the LOWEST-numbered listed register
+| occupies the LOWEST address (ratified FMOVEM design, 2026-09-19
+| correction). With FP0-FP3 that is FP0 at +0 through FP3 at +36.
 |
 | Encodings (verified via m68k-linux-gnu-as -m68040):
 |   F228 F0F0 0000   FMOVEM.X FP0-FP3,(0,A0)
@@ -150,8 +149,8 @@ _rbcmp:
     bne     _rbcmp
 
     | FMOVEM.X FP0,-(A0) — Q700 ROM vector-11 handler shape
-    | (fmovemx %fp0,%sp@- encodes as F227 E001).  The simplified store
-    | writes one 12-byte zero slot and predecrements A0 by 12.
+    | (fmovemx %fp0,%sp@- encodes as F227 E001). The store writes
+    | FP0 in one 12-byte slot and predecrements A0 by 12.
     lea     FP_BUF+76, %a0
     move.l  #0xDEADBEEF, %d0
     move.l  %d0, -12(%a0)
@@ -161,21 +160,21 @@ _rbcmp:
     .short  0xF220, 0xE001
     cmpa.l  #(FP_BUF+64), %a0
     bne     _fail_predec_wb
-    | FP0 was seeded from SEED slot 3.
+    | FP0 was seeded from SEED slot 0.
     move.l  0(%a0), %d0
-    cmp.l   #0xBFFE0000, %d0
+    cmp.l   #0x3FFF0000, %d0
     bne     _fail_predec_data
     move.l  4(%a0), %d0
-    cmp.l   #0xB0000004, %d0
+    cmp.l   #0x80000001, %d0
     bne     _fail_predec_data
     move.l  8(%a0), %d0
-    cmp.l   #0x00000044, %d0
+    cmp.l   #0x00000011, %d0
     bne     _fail_predec_data
     move.l  12(%a0), %d0
     cmp.l   #0xCAFEBABE, %d0
     bne     _fail_overrun
 
-    | FMOVEM.X (A0)+,FP0 — should load and discard one 12-byte slot,
+    | FMOVEM.X (A0)+,FP0 — should load one 12-byte slot into FP0,
     | then postincrement A0 by 12.
     lea     FP_BUF+96, %a0
     move.l  #0x11110000, 0(%a0)
@@ -210,7 +209,7 @@ _rbcmp:
     bne     _fail_fmove_imm_len
 
     | FMOVEM.X FP0-FP1,(4,A0,D1.W).  Target = A0 + sx(D1.W) + 4.
-    | The simplified store writes 24 bytes of zeros.  A0 and D1 are
+    | The store writes the two seeded 12-byte FP values. A0 and D1 are
     | visible architectural inputs and must not be clobbered by the
     | indexed EA crack.
     lea     FP_BUF+128, %a0
@@ -222,15 +221,14 @@ _rbcmp:
     move.l  #0xDEADBEEF, 36(%a0)
     move.l  #0xDEADBEEF, 40(%a0)
     move.l  #0xCAFEBABE, 44(%a0)
-    | FP0-FP1 currently hold FP_BUF+96's image (FP0, from the postinc
-    | load above) and SEED slot 2 (FP1, from the seed load).  Re-seed
-    | both from a dedicated 24-byte image so the expected bytes are
-    | explicit rather than inherited.
+    | Re-seed FP0-FP1 from a dedicated 24-byte image after the immediate
+    | moves, so the indexed-transfer expectations are independent of
+    | the preceding postincrement and conversion checks.
     lea     SEED+48, %a2
-    move.l  #0x3FFD0000, 0(%a2)          | -> FP1 (lower address)
+    move.l  #0x3FFD0000, 0(%a2)          | -> FP0 (lower address)
     move.l  #0x12345678, 4(%a2)
     move.l  #0x9ABCDEF0, 8(%a2)
-    move.l  #0x40030000, 12(%a2)         | -> FP0
+    move.l  #0x40030000, 12(%a2)         | -> FP1
     move.l  #0x0F0F0F0F, 16(%a2)
     move.l  #0xF0F0F0F0, 20(%a2)
     fmovem.x (%a2),%fp0-%fp1

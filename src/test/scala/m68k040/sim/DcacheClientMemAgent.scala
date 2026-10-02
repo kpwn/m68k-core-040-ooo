@@ -164,6 +164,7 @@ class DcacheClientMemAgent(cmdP: Stream[DLoadCmd], rspP: Flow[DLoadRsp],
       io.rsp.payload.data #= d
       io.rsp.payload.line #= l
       io.rsp.payload.fault #= false
+      io.rsp.payload.residentHit #= false // this standalone memory agent has no L1 residency
       fired = true
     }
     if (!fired) io.rsp.valid #= false

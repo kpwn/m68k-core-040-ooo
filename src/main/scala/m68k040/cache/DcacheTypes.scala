@@ -21,9 +21,9 @@ import spinal.core._
   *   0x82  WALK_DTLB  the DTLB table walker's descriptor reads
   */
 /** Width of `DLoadCmd.rid`/`DLoadRsp.rid`, the requester-side slot identity. Sized for
-  * the LS EU's aligned-load ring (4 entries); `LsEuPlugin` requires the two agree. */
+  * the configured LS EU aligned-load ring; `LsEuPlugin` requires the two agree. */
 object DLoadRid {
-  val Width = 2
+  val Width = log2Up(m68k040.top.ShippingCoreConfig.lsLoadRingDepth)
 }
 
 object DLoadToken {
@@ -105,7 +105,11 @@ case class DLoadProbeCancel() extends Bundle {
   * The registered DTLB result arrives alongside that read's BRAM outputs; matching
   * by token lets the cache finish the VIPT tag compare without retaining every
   * way's raw tag/data or performing a second array read. A late resolution may be
-  * ignored safely; the later resolved DLoadCmd then uses the ordinary path. */
+  * ignored safely; the later resolved DLoadCmd then uses the ordinary path.
+  * An INHIBITED resolution also retires the matching early probe: a serial device
+  * command never consumes the cache-array snapshot, and a load parked before its
+  * ROB-head turn must not retain one of the finite early-probe credits. This is
+  * independent of the fault/squash cancel Flow so both may retire in one cycle. */
 case class DLoadProbeResolve() extends Bundle {
   val token     = UInt(DLoadToken.Width bits)
   val paddr     = UInt(32 bits)
@@ -211,6 +215,9 @@ case class DLoadRsp() extends Bundle {
   val data  = Bits(32 bits)
   val line  = Bits(128 bits)
   val fault = Bool()
+  /** True only for the registered S2 resident L1 hit. Sole producer:
+    * DcachePlugin's load-response arbiter; refill and fault arms drive False. */
+  val residentHit = Bool()
   /** RESPONSE IDENTITY: the `DLoadCmd.token` of the request this response answers.
     *
     * Responses used to be matched POSITIONALLY -- the LS EU's `ldFifoTags` popped a
@@ -260,8 +267,9 @@ case class DStoreCmd() extends Bundle {
   * by the ExceptionUnit's commit-time sysOp path and serviced by `DcachePlugin`'s
   * standalone maintenance-walk FSM.
   *
-  * `push` (CPUSH) writes dirty matching lines back to memory; `invalidate` (CINV,
-  * and CPUSH's own invalidating variant) clears valid+dirty on matches. `scope`
+  * `push` (CPUSH) writes dirty matching lines back to memory; `invalidate` clears
+  * valid+dirty on matches. CINV = invalidate only; CPUSH = push AND invalidate (the
+  * 68040 has no non-invalidating push -- the 68060's CACR.DPI does not exist here). `scope`
   * selects Line(01) / Page(10) / All(11) — 00 is unused (decode never emits it).
   * `sel` selects which cache(s): DC(01) / IC(10) / BC(11). `addr` is An's value,
   * meaningful for Line/Page scope only. */
@@ -273,8 +281,23 @@ case class CacheMaintCmd() extends Bundle {
   val addr       = UInt(32 bits)
 }
 
+/** COUNTED, IN-ORDER store completion (non-blocking L1D design note §7.1; agreed with the
+  * write-path agent). `count` descriptors -- one per ACCEPTED `store` handshake, never per
+  * SQ entry -- completed THIS cycle, and they are always the `count` OLDEST outstanding
+  * descriptors in acceptance order. `err(0)` belongs to the OLDER completion: if an AXI B
+  * (writethrough / inhibited) and a local S3/allocation ack ever land together, the B is
+  * the older and is `err(0)`. Today `count <= 1` always (asserted), which also implies a
+  * count-2 cycle can never span a client (SQ / exception unit / walker) boundary. */
+case class DStoreAck() extends Bundle {
+  val count = UInt(2 bits)
+  val err   = Bits(2 bits)
+}
+
 /** D-cache service contract (spec 4.2). */
 trait DcacheService {
+  /** Counted completion (`DStoreAck`). Elaborated by `DcachePlugin` only with
+    * `nonBlocking`; null otherwise (the untagged `storeAck` pulse stays as `count =/= 0`). */
+  def storeCompletion: DStoreAck = null
   def loadProbe: spinal.lib.Stream[DLoadProbe]       // virtual-set read, before translation
   def loadProbeResolve: spinal.lib.Flow[DLoadProbeResolve] // matching registered PA/tag
   def loadProbeCancel: spinal.lib.Flow[DLoadProbeCancel]
@@ -324,6 +347,23 @@ trait DcacheService {
     * must therefore wait on this (together with the SQ-drained signal) before
     * pulsing `maintCmd` — see ExceptionUnit's `S_DRAIN` state. */
   def maintQuiesced: Bool
+
+  /** D4 (`ShippingCoreConfig.inhibitedFullBarrier`): REGISTERED "the D-side bus is quiet".
+    * True when, as of the end of the previous cycle, the D-cache had no transaction in
+    * flight on its AXI master and none ACCEPTED that could still produce one: load FSM in
+    * IDLE with no S1 decision or shadow-replay pending, no store in S0..S3 or awaiting its
+    * B (`storeOutstanding === 0`), no write-through kickoff or store-miss allocate pending,
+    * both AXI write-pair completion flags set, no maintenance walk -- and no command was
+    * accepted on the load, store or maintenance port in that cycle.
+    *
+    * DELIBERATELY NARROWER THAN `maintQuiesced`: it omits the early-probe queue and the
+    * S2 response snapshot. Those can be held by a PROGRAM-YOUNGER load sitting behind the
+    * inhibited op in the LS pipe, so waiting on them would be a circular wait; neither
+    * can reach the bus (a probe is an array read, S2 is a registered response).
+    *
+    * Elaborated only when the barrier is on; otherwise this is null and must not be read.
+    * Sole producer: DcachePlugin. Sole consumer: LsEuPlugin (P4 / park / SQ launch gate). */
+  def busQuiesced: Bool
 }
 
 /** Big-endian byte-lane helpers shared by load extraction and store merge.

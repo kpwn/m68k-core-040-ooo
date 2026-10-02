@@ -91,8 +91,23 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     (cd, mem)
   }
 
-  def preload(mem: AxiMemModel, base: Long, n: Int): Unit =
-    for (i <- 0 until n) mem.pokeByte(base + i, memByte(base + i))
+  /** ⚠ ALWAYS COVERS THE ENCLOSING 64-BYTE LINE(S), not just `n` bytes.
+    *
+    * The fill granularity is a DUT property, not a test property: under slice `D3-BURST`
+    * (`DcachePlugin.sectored`) a miss installs 64 bytes, so a 16- or 32-byte preload left
+    * the rest of the line as PRNG-filled SparseMemory garbage -- which changes response
+    * timing and breaks this spec's self-calibrated `slotA` window (observed as its own
+    * "vacuity guard: slot A had not captured yet -- re-calibrate slotA").
+    *
+    * Widening is CONTENT-NEUTRAL, which is why it is safe to do at the helper rather than
+    * per call site: every byte is written with the same address-derived `memByte`, the
+    * exact value this spec's `expected()` already predicts for it. It writes MORE of the
+    * pattern, never a different pattern. */
+  def preload(mem: AxiMemModel, base: Long, n: Int): Unit = {
+    val lo = base & ~0x3fL
+    val hi = ((base + n + 63) & ~0x3fL)
+    for (a <- lo until hi) mem.pokeByte(a, memByte(a))
+  }
 
   def issueLoad(dut: Dut, cd: ClockDomain, basePreg: Int, disp: Long,
                 size: SpinalEnumElement[Size.type], pdst: Int, robId: Int): Unit = {
@@ -184,7 +199,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     for ((label, addr, size, nbytes) <- cases) {
       compiled.doSim(label) { dut =>
         val (cd, mem) = initDut(dut)
-        preload(mem, 0x3000L, 32)
+        preload(mem, 0x3000L, 96)   // covers the +62 crossing's far half
         seed(dut, cd, preg = 10, value = addr)
         issueLoad(dut, cd, basePreg = 10, disp = 0, size, pdst = 20, robId = 4)
         assert(waitCompletion(dut, cd, robId = 4), s"$label completes")
@@ -602,7 +617,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
       var rspCycles = Seq.empty[Int]
       compiled.doSim(s"calib-$pname") { dut =>
         val (cd, mem) = initDut(dut, cfg)
-        preload(mem, 0x3000L, 32)
+        preload(mem, 0x3000L, 96)   // covers the +62 crossing's far half
         val seen = scala.collection.mutable.ArrayBuffer[Int]()
         var cyc = 0
         val run = new java.util.concurrent.atomic.AtomicBoolean(true)
@@ -626,7 +641,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
       for (delay <- 1 to maxDelay) {
         compiled.doSim(s"squash-$pname-$delay", seed = 1000 + delay) { dut =>
           val (cd, mem) = initDut(dut, cfg)
-          preload(mem, 0x3000L, 32)
+          preload(mem, 0x3000L, 96)   // covers the +62 crossing's far half
           preload(mem, 0x5000L, 32)
           val s = dut.src.logic
 
@@ -689,7 +704,15 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     */
   test("a squash CLEARS splitMergeLine and its valid bit", VerilatorTest) {
     val compiled = simConfig.compile(new Dut)
-    val victimAddr = 0x3000L + 14    // a crossing LONG: two lines, one merge
+    // ⚠ +62, NOT +14 -- THE CROSSING MUST STRADDLE A 64-BYTE LINE, not merely a 16-byte
+    // one. At +14 the LONG spans 0x300E..0x3011: two 16-byte lines, but under slice
+    // `D3-BURST` (`DcachePlugin.sectored`) BOTH are sectors of the SAME 64-byte line, so
+    // slot A's line miss burst-fills slot B's sector too and B HITS immediately. The
+    // "A-captured / B-pending" window this test has to land in then has ZERO WIDTH and the
+    // spec fails its own vacuity guard rather than its property. At +62 the LONG spans
+    // 0x303E..0x3041, which is a different 16-byte line AND a different 64-byte line, so
+    // the window exists in both geometries. `preload` below is widened to match.
+    val victimAddr = 0x3000L + 62    // a crossing LONG: two lines (16 B AND 64 B), one merge
 
     val cfg = AxiMemModelConfig(
       latency = m68k040.sim.L2LatencyModel(enabled = true, dramCycles = 40))
@@ -698,7 +721,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     var slotA = -1
     compiled.doSim("squashclear-calib") { dut =>
       val (cd, mem) = initDut(dut, cfg)
-      preload(mem, 0x3000L, 32)
+      preload(mem, 0x3000L, 96)   // covers the +62 crossing's far half
       var cyc = 0
       val seen = scala.collection.mutable.ArrayBuffer[Int]()
       val run = new java.util.concurrent.atomic.AtomicBoolean(true)
@@ -717,7 +740,7 @@ class LsEuSplitRingSpec extends AnyFunSuite {
     compiled.doSim("squashclear") { dut =>
       val (cd, mem) = initDut(dut, cfg)
       // Non-zero line content, so "captured" is distinguishable from "cleared".
-      preload(mem, 0x3000L, 32)
+      preload(mem, 0x3000L, 96)   // covers the +62 crossing's far half
       val l = dut.eu.logic
       val s = dut.src.logic
 

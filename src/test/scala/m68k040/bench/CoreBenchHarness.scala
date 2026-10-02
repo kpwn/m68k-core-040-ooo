@@ -99,6 +99,12 @@ trait CoreBenchHarness extends AnyFunSuite {
       lsEu.issue << iq.issue(3)
       rob.logic.completion(2).valid   := lsEu.completion.valid
       rob.logic.completion(2).payload := lsEu.completion.payload
+      // LS order violation (idle unless the LS EU's `lsOooIssue` is on): an inhibited op
+      // whose barrier a younger already-launched access violated. Recovered at retire.
+      rob.logic.lsOrderViolation.valid   := lsEu.orderViolation.valid
+      rob.logic.lsOrderViolation.payload := lsEu.orderViolation.payload
+      host[m68k040.services.RobLsReplayService].lsReplay.valid         := host[m68k040.execute.LsEuService].replayRequest.valid
+      host[m68k040.services.RobLsReplayService].lsReplay.payload       := host[m68k040.execute.LsEuService].replayRequest.payload
       rob.logic.lsFaultCompletion.valid   := lsEu.faultCompletion.valid
       rob.logic.lsFaultCompletion.payload := lsEu.faultCompletion.payload
       // Precise-path SQ<->ROB loop (Task P2.5, mirrors top/FullCoreSynth).
@@ -238,6 +244,14 @@ trait CoreBenchHarness extends AnyFunSuite {
       // starts at a flop Q with the whole period in front of it.
       rasP.logic.checkpointSave    := rob.logic.countIsZero
       rasP.logic.checkpointRestore := rasCheckpointRestore
+      // RAS flush-repair (RasPlugin `branchRepair`) -- same three bare register Qs the
+      // shipping wiring drives; see BackendWiringPlugin.
+      require(rob.rasBranchRepair == rasP.branchRepair, "rasBranchRepair must agree")
+      if (rob.rasBranchRepair) {
+        rasP.logic.repairValid := rob.logic.earlyFire
+        rasP.logic.repairKind  := rob.logic.rasRepairKind
+        rasP.logic.repairData  := rob.logic.rasRepairData
+      }
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -268,6 +282,16 @@ trait CoreBenchHarness extends AnyFunSuite {
       // fetched after Tier 1, whose frontend survives the Tier-2 rollback?
       spinal.core.sim.SimPublic(gsh.logic.shiftValid, gsh.logic.shiftDir,
         gsh.logic.queryPc0, gsh.logic.flushRepair)
+      // Test-only observation for the STALL BUDGET's `walk` category. The board's
+      // OFF_PERF_STALL_WALK counts `perfLvlDtlbWalk || perfLvlItlbWalk`, each of which is
+      // `RegNext(!walker.io.dbgPack(0))` = `RegNext(!fsm.isActive(IDLE))` -- and
+      // `TableWalker.io.busy` is DEFINED as `!fsm.isActive(fsm.IDLE)` (TableWalker.scala:356),
+      // the identical term. Tapping `io.busy` therefore matches the board counter's
+      // definition exactly without adding a second copy of the expression. These are
+      // nested-component ports, so they need an explicit SimPublic to survive Verilator;
+      // this is a TEST harness, so nothing here reaches the synthesized core.
+      spinal.core.sim.SimPublic(host[DtlbPlugin].logic.walker.io.busy,
+        host[ItlbPlugin].logic.walker.io.busy)
 
       val dc    = host[DcacheService]
       val exc   = rob.logic.exc
@@ -358,7 +382,17 @@ trait CoreBenchHarness extends AnyFunSuite {
                     earlyStoreDataWake: Boolean = false,
                     loadBypassUnreadyLoad: Boolean = false,
                     earlyAutoAnWriteback: Boolean = false,
+                    /** Slice D1.2 fill-forward (`DcachePlugin.fillForward`). Named
+                      * explicitly here rather than taken from `ShippingCoreConfig`, per
+                      * that file's rule that a bench must vary a knob by NAME. */
+                    dcacheFillForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheFillForward,
+                    dcacheDirectRefillResponse: Boolean = false,
                     specLoadWakeup: Boolean = false,
+                    p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
+                    rasBranchRepair: Boolean = false,
+                    computeDirectTargets: Boolean = false,
+                    deferSlot1Uncond: Boolean = false,
+                    deferSlot1Dbcc: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
     val db    = new Database
@@ -372,17 +406,20 @@ trait CoreBenchHarness extends AnyFunSuite {
     // explicit `require` in ExceptionUnit).
     val fpuCtl = new m68k040.execute.FpuControlPlugin
     val intCtrl = new m68k040.exception.InterruptControlPlugin
-    val itlb   = new ItlbPlugin()
+    val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
     val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin(icachePredecodeWords)
-    val dcache = new DcachePlugin()
+    val dcache = new DcachePlugin(fillForward = dcacheFillForward,
+      directRefillResponse = dcacheDirectRefillResponse)
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin
+    val ras    = new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
     val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
     val fa     = new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
-      deferTakenSlot1Conditional = deferTakenSlot1Conditional)
+      deferTakenSlot1Conditional = deferTakenSlot1Conditional,
+      computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
+      deferSlot1Dbcc = deferSlot1Dbcc)
     val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
       fuseLongMoveLoads = fuseLongMoveLoads)
     val preparedCap = sys.env.get("IPC_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
@@ -390,8 +427,15 @@ trait CoreBenchHarness extends AnyFunSuite {
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
       preparedRetirement = preparedCap != 0)
     val disp   = new m68k040.dispatch.DispatchPlugin
+    // `lsOooIssue` MUST be set on the ROB as well as the LS EU: the barrier's RECOVERY
+    // half (`orderViolated` / `orderRedirect`) lives HERE, and with it False the LS EU's
+    // `orderViolation` port is wired but IGNORED. `SocketTop` already drives all three
+    // from one switch; every SIM harness omitted it, so the recovery had never been
+    // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
+    // wired only in FullCoreSynth and had zero sim coverage.
     val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
-      pcRangeEnable = pcRangeEnable)
+      pcRangeEnable = pcRangeEnable, rasBranchRepair = rasBranchRepair,
+      lsOooIssue = loadBypassUnreadyLoad)
     val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
@@ -406,7 +450,9 @@ trait CoreBenchHarness extends AnyFunSuite {
       detachedStoreEntries = detachedStoreEntries, earlyAutoStoreAddress = earlyAutoStoreAddress,
       earlyAutoAnWriteback = earlyAutoAnWriteback,
       earlyStoreDataWake = earlyStoreDataWake,
-      specLoadWakeup = specLoadWakeup)
+      specLoadWakeup = specLoadWakeup,
+      p3FastLoad = p3FastLoad,
+      lsOooIssue = loadBypassUnreadyLoad)
     val divEu  = new m68k040.execute.DivEuPlugin
     val rfInt  = new RegFilePluginInt
     val rfNzvc = new RegFilePluginNzvc
@@ -438,23 +484,46 @@ trait CoreBenchHarness extends AnyFunSuite {
   //   to BOTH the D-side and the I-side (an I-fetch refill is the dominant memory
   //   stall for these kernels, so an I-side zero-latency model would make the
   //   measurement meaningless).
-  val memCfg: AxiMemModelConfig = sys.env.get("IPC_MEM") match {
+  /** A spec that sweeps several memory models inside ONE sbt/Verilator run sets this
+    * before each `runKernel` (`BoardMembenchSimSpec`); None = the IPC_MEM env model. */
+  var memCfgOverride: Option[AxiMemModelConfig] = None
+  def memCfg: AxiMemModelConfig = memCfgOverride.getOrElse(envMemCfg)
+  def parseMemSpec(spec: String): AxiMemModelConfig = {
+    val parts = spec.split(':')
+    require(parts(0) == "l2", s"unknown memory spec $spec (expected 'l2[:hit[:dram[:sets]]]')")
+    val hit  = if (parts.length > 1) parts(1).toInt else 5
+    val dram = if (parts.length > 2) parts(2).toInt else 70
+    val sets = if (parts.length > 3) parts(3).toInt else 0
+    AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram, sets = sets))
+  }
+  val envMemCfg: AxiMemModelConfig = sys.env.get("IPC_MEM") match {
     case None | Some("") | Some("zero") => AxiMemModelConfig()
     case Some(spec) =>
       val parts = spec.split(':')
-      require(parts(0) == "l2", s"unknown IPC_MEM=$spec (expected 'zero' or 'l2[:hit[:dram]]')")
+      require(parts(0) == "l2",
+        s"unknown IPC_MEM=$spec (expected 'zero' or 'l2[:hit[:dram[:sets]]]')")
       val hit  = if (parts.length > 1) parts(1).toInt else 5
       val dram = if (parts.length > 2) parts(2).toInt else 70
-      AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit, dramCycles = dram))
+      // FOURTH field: L2 SET COUNT. 0 (the default) is the historical UNBOUNDED L2 --
+      // a residency set that is never evicted, so after one touch every line hits at
+      // `hitCycles` forever and `dramCycles` only reaches COMPULSORY misses. Pass 4096
+      // for the real 2 MB 8-way L2 (`l2c_defs.vh:25-32`). Any measurement of a lever
+      // whose mechanism is "hide memory latency" must state which of the two it used.
+      val sets = if (parts.length > 3) parts(3).toInt else 0
+      AxiMemModelConfig(latency = L2LatencyModel(enabled = true, hitCycles = hit,
+        dramCycles = dram, sets = sets))
   }
   // Five live 64-byte I-cache lines occupy ten beats on the core's 256-bit AXI.
   // Keep the legacy D-side capacity unchanged, but do not let the shared model's
   // old eight-beat default silently turn the I-side five-ID contract into four.
-  val iMemCfg: AxiMemModelConfig = memCfg.copy(
+  def iMemCfg: AxiMemModelConfig = memCfg.copy(
     maxPendingBeats = scala.math.max(memCfg.maxPendingBeats, 2 * (1 + AxiIds.I_SPEC_SLOTS)))
   def memLabel: String =
     if (!memCfg.latency.enabled) "zero-latency (ideal memory)"
-    else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line"
+    else s"L2-faithful: L2 hit=${memCfg.latency.hitCycles}cyc, DDR=${memCfg.latency.dramCycles}cyc, 64B line" +
+      (if (memCfg.latency.finiteCapacity)
+         f", L2 ${memCfg.latency.capacityBytes / 1024}%d KiB ${memCfg.latency.ways}%d-way tree-PLRU"
+       else ", L2 UNBOUNDED (never evicts -- dramCycles reaches compulsory misses ONLY)")
 
   def attachProgram(axi: Axi4ReadOnly, cd: ClockDomain, loadAddr: Long, bytes: Vector[Int]): Unit = {
     AxiMemModel.attachProgramIFetch(axi, cd, loadAddr, bytes, cfg = iMemCfg)
@@ -486,6 +555,117 @@ trait CoreBenchHarness extends AnyFunSuite {
     def dualWithExtraCompleteCycles: Int = rob.count(s => s.retires == 2 && s.completePrefix > 2)
     def branchPairPotentialCycles: Int = rob.count(_.branchPairPotential)
     def pairedBranchCycles: Int = rob.count(_.pairedBranch)
+  }
+
+  /** PER-KERNEL CYCLE DECOMPOSITION ("stall budget"), sim-only and OPT-IN via
+    * `IPC_STALL_BUDGET=1`.
+    *
+    * WHY THIS EXISTS. Three separate levers were recorded as "no effect" because the
+    * only thing the bench reported was WINDOW CYCLES, and cycles were bit-identical:
+    * ALU-class speculative wakeup (2,048-3,106 deferred selects granted), the announce
+    * family (gap bucket ~3,900 -> ~30 windows), and the confirm-rate lever (0.0% ->
+    * 46.4%). "The mechanism did nothing" and "the mechanism removed its stall and a
+    * different one became binding" are DIFFERENT findings with different next steps, and
+    * a single cycle count cannot tell them apart. This decomposition can.
+    *
+    * BOARD PARITY IS THE POINT. Every category below mirrors a `DebugCtrlPlugin` perf
+    * counter TERM FOR TERM, including its quirks, so a sim A/B and a silicon `perf`
+    * capture can finally be compared category by category:
+    *
+    *   retireStall  = `perfStallRetire`      = `perfLvlRobBusy && !perfLvlRetire`
+    *                                          (`DebugCtrlPlugin.scala:705`)
+    *   retireCycles = `perfLvlRetire`        = `rob.retire0` ONLY. This is the board's
+    *                  quirk and it is PRESERVED: it is an ANY-retire level, not a macro
+    *                  commit and not a dual-retire count. It therefore differs from
+    *                  `IpcResult.activeCycles` (macro-granular, cracked temps dropped);
+    *                  both are reported so the gap is visible instead of assumed.
+    *   robEmpty     = `rob.count === 0`. The board can only DERIVE this
+    *                  (`cycles - stallRetire - cyclesWithARetire`); here it is measured
+    *                  directly, which is also what makes the closure assertion possible.
+    *   dcStall      = `OFF_PERF_STALL_DC`    = `stallDcPackReg(1)` = `DcachePlugin.busy`
+    *   walkStall    = `OFF_PERF_STALL_WALK`  = either table walker out of IDLE
+    *
+    * ALIGNMENT. Every board tap is a `RegNext` of its level (`perfTap`), and the
+    * harness's own commit histogram is likewise built from the REGISTERED
+    * `ordinaryCommitObs`. So each level here is sampled and then recorded ONE sampling
+    * edge later -- the same one-cycle delay `precedingRobCycle` already applies -- which
+    * makes these counts both board-faithful AND index-aligned with `histo`, i.e. with
+    * the IPC window itself.
+    *
+    * WHAT CLOSES AND WHAT DOES NOT. `robEmpty` / `retireStall` / `retireCycles` is a
+    * genuine PARTITION of the window: `retire0` implies `count > 0` (it is gated on
+    * `headReady`, which is `(count > 0) && ...`, `RobPlugin.scala:1177`), so the three
+    * are mutually exclusive and exhaustive. `runKernel` ASSERTS that they sum to the
+    * window -- a decomposition that does not close is not a decomposition.
+    * `dcStall` and `walkStall` are OVERLAPPING OVERLAYS, exactly as they are on the
+    * board: the D-cache can be busy on a cycle that also retires. They are reported
+    * alongside the partition, never inside it, and the retire-stall intersections
+    * (`retireStallWithDc` / `retireStallWithWalk`) are what attribute the stall. */
+  final case class StallBudget(
+      cycles: Int,          // window cycles -- must equal the partition's sum
+      robEmpty: Int,        // PARTITION: rob.count === 0 (front-end starvation)
+      retireStall: Int,     // PARTITION: rob busy, retire0 low  == perfStallRetire
+      retireCycles: Int,    // PARTITION: retire0 high           == perfLvlRetire
+      retire1Cycles: Int,   // sim-exact: exactly one retire lane fired
+      retire2Cycles: Int,   // sim-exact: two or more retire lanes fired
+      retiredUops: Int,     // sim-exact: retire lanes fired, summed over the window
+      dcStall: Int,         // OVERLAY: DcachePlugin.busy       == OFF_PERF_STALL_DC
+      walkStall: Int,       // OVERLAY: either walker off IDLE  == OFF_PERF_STALL_WALK
+      retireStallWithDc: Int,   // retireStall AND the D-cache was busy
+      retireStallWithWalk: Int, // retireStall AND a walker was running
+      robEmptyWithDc: Int) {    // robEmpty AND the D-cache was busy (I-side vs D-side)
+    /** Zero iff the partition closes to the window. Reported, never fudged. */
+    def residual: Int = cycles - robEmpty - retireStall - retireCycles
+    /** Uops beyond what a 2-wide retire can explain; 0 unless IPC_RETIRE_WIDTH widened it. */
+    def wideRetireUops: Int = retiredUops - retire1Cycles - 2 * retire2Cycles
+    /** THE CONSERVATION TEST -- "did the gain exist, or was it never there?"
+      *
+      * On a kernel that is never front-end starved (`robEmpty == 0`) with a 2-wide retire,
+      * the budget is not merely a decomposition, it is an exact ACCOUNTING IDENTITY:
+      *
+      *     cycles = retireStall + retire1 + retire2        (the partition)
+      *     uops   = retire1 + 2*retire2                   (a 2-wide retire)
+      *  => cycles = retireStall + uops - retire2
+      *
+      * `uops` is fixed by the program. So for such a kernel a lever that cuts retire-stall
+      * and gives back the SAME NUMBER of dual-retire cycles is cycle-neutral BY
+      * CONSTRUCTION -- the two deltas are literally the same cycles counted once as a
+      * stall and once as an extra single-retire cycle. There is no unrealised gain to
+      * chase, and "it worked but something ate it" is the wrong reading.
+      *
+      * Conversely a lever that cuts retire-stall and HOLDS retire2 MUST move cycles. If it
+      * does not, something genuinely absorbed the gain and that is worth attacking.
+      *
+      * This is the cheap discriminator the bench previously lacked: read
+      * `d(retireStall)` against `d(retire2)` before writing a single line of RTL.
+      * `None` when the preconditions do not hold, rather than a number that means nothing. */
+    def conservationResidual: Option[Int] =
+      if (robEmpty != 0 || wideRetireUops != 0) None
+      else Some(cycles - (retireStall + retiredUops - retire2Cycles))
+    def closes: Boolean = residual == 0
+    private def pct(x: Int): Double = if (cycles == 0) 0.0 else 100.0 * x / cycles
+    def robEmptyPct: Double    = pct(robEmpty)
+    def retireStallPct: Double = pct(retireStall)
+    def retirePct: Double      = pct(retireCycles)
+    def dcStallPct: Double     = pct(dcStall)
+    def walkStallPct: Double   = pct(walkStall)
+    /** Board-comparable one-liner: the five terms a silicon `perf` capture prints. */
+    def line(name: String): String =
+      f"[stall-budget] $name cycles=$cycles " +
+      f"robEmpty=$robEmpty (${robEmptyPct}%.1f%%) " +
+      f"retireStall=$retireStall (${retireStallPct}%.1f%%) " +
+      f"retire=$retireCycles (${retirePct}%.1f%%) " +
+      f"residual=$residual | retire1=$retire1Cycles retire2=$retire2Cycles uops=$retiredUops " +
+      f"| overlay dcStall=$dcStall (${dcStallPct}%.1f%%) walkStall=$walkStall (${walkStallPct}%.1f%%) " +
+      f"retireStall&dc=$retireStallWithDc retireStall&walk=$retireStallWithWalk robEmpty&dc=$robEmptyWithDc" +
+      // See `conservationResidual`: `conserved` marks a kernel where cycles are pinned to
+      // `retireStall + uops - retire2`, so a retire-stall win paid for by dual-retire is
+      // cycle-neutral BY CONSTRUCTION and there is nothing eaten to recover.
+      (conservationResidual match {
+        case Some(0) => " | conserved (cycles == retireStall + uops - retire2)"
+        case Some(r) => s" | CONSERVATION BROKEN residual=$r"
+        case None    => ""
+      })
   }
 
   final case class IpcResult(
@@ -547,7 +727,31 @@ trait CoreBenchHarness extends AnyFunSuite {
       captureIssueCandidates: Int = 0,
       captureLoadOpportunities: Int = 0,
       captureLoadOverlaps: Int = 0,
-      queuedStoreAdmissions: Int = 0
+      queuedStoreAdmissions: Int = 0,
+      // ── D-cache LOAD miss census (window-sliced) ─────────────────────────────
+      // `dcLoadMisses` counts cycles of `ldS1Valid && !ldS1Hit`, which is the very term
+      // that TRIGGERS a refill, so it is a real miss count. `dcLoadLookups` counts
+      // `ldS1Valid` and is NOT the load count: an EARLY-PROBE hit satisfies a load with
+      // `useEarlyProbe = earlyProbeHit && !ldS1Valid` and never reaches S1, so the S1
+      // lookup stream is only the loads that took the ordinary read path. Use
+      // `ldCmdAddrs.size` (accepted loads) as the denominator; `dcLoadLookups` is kept
+      // only so the two populations can be told apart. A cache-RESIDENT benchmark must
+      // show misses near zero over its measured window -- if it does not, the kernel is
+      // measuring cold refills instead of the recurrence it claims.
+      dcLoadLookups: Int = 0,
+      dcLoadMisses: Int = 0,
+      // RETIRED mispredicts: one per `RobPlugin.branchRedirect` pulse, i.e. exactly what
+      // the board's `OFF_MISPRED_COUNT` counts (a mispredicting branch reaching the ROB
+      // head), and NOT the branch EU's completion-time count, which includes wrong-path
+      // branches that never retire. This is the primary metric for any predictor change.
+      retiredMispredicts: Int = 0,
+      // OPT-IN per-kernel cycle decomposition; `None` unless IPC_STALL_BUDGET=1, so
+      // every existing caller and every default report is untouched. See `StallBudget`.
+      stallBudget: Option[StallBudget] = None,
+      // Indices into the harness's per-cycle sample stream, inclusive. Test-only
+      // observers use these to put issue/AXI occupancy on the SAME commit window.
+      windowStartCycle: Long = -1L,
+      windowEndCycle: Long = -1L
   ) {
     def flushRecoveryMean: Double =
       if (flushToCommit.isEmpty) 0.0 else flushToCommit.sum.toDouble / flushToCommit.size
@@ -614,6 +818,9 @@ trait CoreBenchHarness extends AnyFunSuite {
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
+  /** Optional hook called at the start of every `runKernel` sim, with the DUT. */
+  protected var dutProbe: FullCoreDut => Unit = null
+
   def runKernel(compiled: SimCompiled[FullCoreDut], k: Kernel,
                 seed: Int = IpcBenchSpec.simSeed): IpcResult = {
     require(k.warmupInstrs >= 0 && k.warmupInstrs < k.retiredInstrs)
@@ -632,6 +839,9 @@ trait CoreBenchHarness extends AnyFunSuite {
     // instead of silently colliding.
     compiled.doSim(s"${k.name}_s$seed", seed) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
+      // Optional per-run observer (a spec forks its own mechanism counters here). Inert
+      // unless a spec sets `dutProbe`.
+      if (dutProbe != null) dutProbe(dut)
       // S-pre (2026-08-12 large-scale-frontend-restructure-design, §14 Q5 / D4):
       // IPC_PREFETCH=off disables IcachePlugin's next-line prefetch engine for the
       // WHOLE run, to measure its real aggregate/per-kernel IPC contribution.
@@ -643,6 +853,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         fork { for (_ <- 0 until 8) { dut.icache.logic.prefetchEnable #= false; cd.waitSampling() } }
       }
       val handle = new WhiteboxCapture.Handle
+      // Sim-only cache-miss injection + MLP/miss-rate instrumentation. Inert (and a
+      // single boolean test per cycle) unless IPC_INJ_D/IPC_INJ_I/IPC_MISS_STATS is set.
+      val missInj = MissInjector.maybeNew(dut, k.name)
 
       // Per-cycle MACRO-commit histogram, trimmed to [first-commit, last-commit]
       // after the run. Use WhiteboxCapture's authoritative emitted count, including
@@ -651,7 +864,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       // the harness waits for final stores to drain.
       val histo = ArrayBuffer.empty[Int]   // macro-commits per sampled cycle
       // Overlapping diagnostic predicates, sliced to the exact IPC window below.
-      val lsOrderHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean, Boolean)]
+      case class LsOrderSample(oldestUnready: Boolean, oldestStoreUnready: Boolean,
+                               youngerReadyLoadPresent: Boolean, skidOccupied: Boolean,
+                               selectFire: Boolean, selectLoadFire: Boolean,
+                               selectParked: Boolean, bypassSelect: Boolean,
+                               euFire: Boolean)
+      val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
+      val specWakeHisto = ArrayBuffer.empty[(Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
@@ -669,7 +888,11 @@ trait CoreBenchHarness extends AnyFunSuite {
       // board's `blocked_iq` counter, and the two want opposite fixes. The
       // discriminator is the FREE-SLOT COUNT during blocked cycles.
       // (occupancy, line0Occupied, oldestOccupiedReady, cluster, memOp)
-      val iqHolHisto = ArrayBuffer.empty[(Int, Boolean, Boolean, String, String)]
+      // 6th field: the blocking slot's `lsWait` (OR of its LS_A/LS_B/LS_C dynamic-wait
+      // bits) -- "this consumer is stalled on an in-flight LS LOAD". Crossing it with the
+      // consumer's own CLUSTER is what sizes speculative wakeup: the shipped mechanism can
+      // only release LS-class consumers, so `lsWait && !isLs` is the part it cannot reach.
+      val iqHolHisto = ArrayBuffer.empty[(Int, Boolean, Boolean, String, String, Boolean)]
       // Branch events are retained by macro ordinal, not just cycle inclusion:
       // a warm-up/stop boundary can bisect a dual-retirement cycle.
       val branchEvents = ArrayBuffer.empty[(Long, Int, Boolean, Boolean, Boolean)]
@@ -684,9 +907,55 @@ trait CoreBenchHarness extends AnyFunSuite {
       var totalCycles = 0L
       var sqFwdHitCycles = 0               // SQ full-overlap forward responses
       val traceOn = sys.env.get("MB_TRACE").exists(p => p.nonEmpty && k.name.startsWith(p))
+      // A chase's first lap warms the cache. Start the detailed trace after that lap
+      // when requested, so every row describes a steady-state dependency hop.
+      val traceSteady = sys.env.get("MB_TRACE_STEADY").contains("1")
       val traceLines = ArrayBuffer.empty[String]
       val lsEventsOn = sys.env.get("IPC_LS_EVENTS").exists(p => p.nonEmpty && k.name.startsWith(p))
       val iqHolOn = sys.env.get("IQ_HOL").contains("1")
+      // IPC_STALL_BUDGET=1: collect the per-cycle STALL BUDGET (see `StallBudget`).
+      // OFF by default so neither the default report nor the default sim runtime moves.
+      // Collection is pure observation of already-simPublic levels -- it cannot perturb
+      // the DUT, so cycles are bit-identical with it on or off (verified, not assumed).
+      val stallBudgetOn = sys.env.get("IPC_STALL_BUDGET").contains("1")
+      // IPC_PAIR_CENSUS=1: WHY did a cycle retire ONE instead of TWO?
+      //
+      // The stall budget found a lever (IQ_SPEC_ALU on dhrystone-x0-byteAbs-cb) that cut
+      // retire-stall 8.2% and handed every recovered cycle straight back as LOST DUAL
+      // RETIRE -- 1,519 pair cycles became 3,038 singles at bit-identical cycles and
+      // bit-identical uop count. "Cycles neutral" therefore splits two ways, and only one
+      // is worth attacking: the pair was NOT THERE / NOT READY (an arrival-order effect,
+      // a design consequence), or the pair was present and complete and THE GATE DECLINED
+      // IT (an accident, and recoverable). This census answers exactly that.
+      //
+      // Buckets follow `retire1`'s OWN conjunction order (RobPlugin.scala:1361-1368) so
+      // every blocked cycle is charged to exactly one term and the attribution is the
+      // RTL's, not a re-derivation:
+      //   0 paired          retire1 fired
+      //   1 noSecondEntry   count <= 1          -- nothing behind the head to pair with
+      //   2 h1NotComplete   !completes(h1)      -- the younger uop has not executed yet
+      //   3 h1LateByOne     as 2, and h1 completes on the VERY NEXT cycle: the pair was
+      //                     split by ONE cycle of arrival order, nothing more
+      //   4 headForbidsPair !headAllowsPair     -- p0 must retire alone (GATE)
+      //   5 h1RetireAlone   p1.retireAlone      -- h1 must retire alone (GATE)
+      //   6 h1Serializing   faulted/RTE/sup/sysOp/debugBreak on h1
+      //   7 irqBoundary     irqBoundaryHold && p0.last
+      //   8 h0TraceOrPrecise h0TraceArmed || h0PreciseCompletedSticky
+      //   9 other           the residue (sysAuxRdy1, halt/step/stop terms)
+      // Buckets 1-3 are ARRIVAL ORDER. Buckets 4-9 are A GATE SAYING NO.
+      val pairCensusOn = sys.env.get("IPC_PAIR_CENSUS").contains("1")
+      val censusHisto = ArrayBuffer.empty[Int]
+      // (bucket, the ROB index of h1) held one edge, so bucket 2 can be refined to 3.
+      var pendingCensus = (-1, 0)
+      // One packed Int per cycle keeps this cheap next to the existing per-cycle
+      // histograms: bits[3:0] retire lanes fired, [4] ROB busy, [5] D-cache busy,
+      // [6] a table walker off IDLE.
+      val budgetHisto = ArrayBuffer.empty[Int]
+      // The board's `perfTap` REGISTERS every level before counting it, and the commit
+      // histogram is built from the REGISTERED `ordinaryCommitObs`. Hold this cycle's
+      // raw sample and record it on the NEXT edge, so the budget is both board-faithful
+      // and index-aligned with `histo` (identical treatment to `precedingRobCycle`).
+      var pendingBudget = 0
       // BYP_LIVE=1: which int-PRF bypass sources actually carry traffic? Each one is a
       // comparator + mux input in EVERY operand read, on the core's tightest datapath.
       val bypLiveOn = sys.env.get("BYP_LIVE").contains("1")
@@ -702,6 +971,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       val ldRefillSameLine = ArrayBuffer.empty[Int]
       var lastAcceptedLine = -1L
       val ldRspCycles = ArrayBuffer.empty[Long]  // D$ load data returned
+      // Per-cycle D-cache load tag-compare outcome, kept as parallel per-cycle streams
+      // so they can be sliced by the SAME steady-state window the IPC number uses.
+      val dcLdLookupHisto = ArrayBuffer.empty[Boolean]
+      val dcLdMissHisto   = ArrayBuffer.empty[Boolean]
       val lsWbCycles  = ArrayBuffer.empty[Long]  // LsEu writeback visible
       var firstCommitCycle = -1L
       var lastCommitCycle  = -1L
@@ -725,12 +998,41 @@ trait CoreBenchHarness extends AnyFunSuite {
       var maxSqResident     = 0
       var maxDcOutstanding  = 0
       var lsBypassFires     = 0
+      var p3FastEnqueues   = 0
+      var lsReplays         = 0
+      // Replay valid is a pruned constant in a build without lsOooIssue. Query
+      // the constructor mode instead of provoking a simulator signal-access error.
+      val lsOooPorts = dut.lsEu.lsOooIssue
+      var lsOrderViols      = 0
       val bypLiveCount      = Array.fill(16)(0)
       var aluSlowWr0 = 0; var aluSlowWr1 = 0; var aluFastWr0 = 0
       val nzvcLiveCount     = Array.fill(16)(0)
       var lsNzvcWrites      = 0
       var brTotal = 0; var brMis = 0; var brMisNoPred = 0; var brMisWrongDir = 0; var brNoPred = 0
       val brMisByType = scala.collection.mutable.Map.empty[Int, Int]
+      // ── RETIRE-ACCURATE MISPREDICT ATTRIBUTION (`[br-attr]`) ────────────────────
+      // The counters above sample the branch EU's COMPLETION, so they count WRONG-PATH
+      // branches that never retire -- the board's counters do not. These count exactly
+      // what silicon counts (`branchRedirect` = retire of a mispredicting branch) and
+      // then classify it with the BranchEu attribution fields, joined by robId.
+      //
+      // The classification the shipped board counters CANNOT make:
+      //  - returns are in `branchRedirect` (OFF_MISPRED_COUNT) but in NEITHER class
+      //    counter, because both come from `debugBranchRetire` (gated `isBtbBranch`).
+      //  - "no prediction at all" (BTB/FTB coverage) is indistinguishable from
+      //    "predicted the wrong way" (gshare) inside OFF_PERF_MISPRED_COND.
+      //  - "last-target BTB was stale" (the thing an indirect predictor fixes) is
+      //    indistinguishable from "BTB missed" inside OFF_PERF_MISPRED_UNCOND.
+      // brDbg snapshot per robId: (misp, predTaken, predTarget, actTarget, taken,
+      //                            ibranch, isReturn, phtValid, brType, btbTrained, pc)
+      val brAttrPend = scala.collection.mutable.HashMap.empty[Int,
+        (Boolean, Boolean, Long, Long, Boolean, Boolean, Boolean, Boolean, Int, Boolean, Long)]
+      var raTotalBranches = 0      // retired BTB-trainable branches (== the board's OFF_PERF_BRANCH)
+      var raTotalMis = 0           // retired mispredicts (== the board's OFF_MISPRED_COUNT)
+      var raUnattributed = 0       // no brDbg snapshot for the retiring robId (should be 0)
+      val raBucket = scala.collection.mutable.Map.empty[String, Int]
+      val raMisPc  = scala.collection.mutable.Map.empty[Long, (String, Int)]
+      def raAdd(b: String): Unit = raBucket(b) = raBucket.getOrElse(b, 0) + 1
       var decFires = 0; var decDualFires = 0
       var oooWbFires = 0; var oooParkedCyc = 0
       var humAcceptsInRefill = 0; var humProbeLaunchInRefill = 0
@@ -806,6 +1108,7 @@ trait CoreBenchHarness extends AnyFunSuite {
 
       cd.onSamplings {
         telemCycle += 1
+        missInj.onCycle()
         if (lsEventsOn && telemCycle <= 1400) {
           val ls = dut.lsEu.logic
           def event(s: String): Unit = println(s"LS_EVENT kernel=${k.name} cycle=$telemCycle $s")
@@ -867,6 +1170,47 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (dut.rob.logic.branchRedirect.toBoolean)
           misResolveCycle.remove(dut.rob.logic.head.toInt)
             .foreach(c => resolveToRetire += (telemCycle - c).toInt)
+        // ── `[br-attr]`: snapshot every branch resolution, classify at RETIRE ──────
+        val brDbgNow = dut.branchEu.logic.brDbg
+        if (brDbgNow.valid.toBoolean)
+          brAttrPend(brDbgNow.robId.toInt) = (brDbgNow.mispredict.toBoolean,
+            brDbgNow.predTaken.toBoolean,
+            brDbgNow.predTarget.toLong & 0xffffffffL, brDbgNow.actTarget.toLong & 0xffffffffL,
+            brDbgNow.redirect.toBoolean, brDbgNow.ibranch.toBoolean, brDbgNow.isReturn.toBoolean,
+            brDbgNow.phtValid.toBoolean, brDbgNow.brType.toInt, brDbgNow.btbTrained.toBoolean,
+            brDbgNow.pc.toLong & 0xffffffffL)
+        if (dut.rob.logic.debugBranchRetire.valid.toBoolean) raTotalBranches += 1
+        if (dut.rob.logic.branchRedirect.toBoolean) {
+          raTotalMis += 1
+          brAttrPend.get(dut.rob.logic.head.toInt) match {
+            case None => raUnattributed += 1
+            case Some((_, predTaken, predTgt, actTgt, actTaken, ibr, isRet, phtV, bt, trained, pc)) =>
+              // Exactly the three independent failure modes of BranchEu's `mispredict`
+              // formula: (predTaken =/= actualTaken) || (actualTaken && tgt mismatch).
+              val dirWrong = predTaken != actTaken
+              val bucket =
+                if (!trained) {
+                  // Not BTB-trainable: a return (RAS), or a faulting/odd-target transfer.
+                  if (isRet) { if (!predTaken) "ret-nopred" else "ret-wrongtgt" } else "other-notrained"
+                } else if (bt == 1) {
+                  // Unconditional: direction is never in doubt (always resolved taken),
+                  // so a mispredict is either NO prediction (BTB/FTB coverage) or a STALE
+                  // TARGET. Split indirect (JMP/JSR (An)) from relative (BRA/BSR).
+                  val kind = if (ibr) "ind" else "rel"
+                  if (dirWrong) s"uncond-$kind-nopred" else s"uncond-$kind-wrongtgt"
+                } else {
+                  // Conditional: direction, or (rarely) a correct direction with a stale
+                  // target. `phtValid` says whether gshare owned the direction at all.
+                  if (dirWrong) (if (phtV) "cond-dir-gshare" else "cond-dir-nopred")
+                  else "cond-wrongtgt"
+                }
+              raAdd(bucket)
+              val prev = raMisPc.getOrElse(pc, (bucket, 0))
+              raMisPc(pc) = (bucket, prev._2 + 1)
+              if (predTgt == actTgt && !dirWrong) raAdd("ZZ-inconsistent")
+          }
+          brAttrPend.remove(dut.rob.logic.head.toInt)
+        }
         // Recovery latency: cycles from the retire-gated flush pulse to the next
         // macro commit. THIS is the term an early PC redirect is supposed to
         // shorten; it is what an aggregate IPC delta is made of, one flush at a
@@ -1092,11 +1436,31 @@ trait CoreBenchHarness extends AnyFunSuite {
         val oldestBlocked = lsSlots.headOption.exists(s => !s.ready.toBoolean)
         val blockedStore = oldestBlocked &&
           lsSlots.head.hot.memOp.toEnum == m68k040.isa.MemOp.STORE
-        val youngerReadyLoad = oldestBlocked && lsSlots.drop(1).exists(s =>
+        val youngerReadyLoadPresent = oldestBlocked && lsSlots.drop(1).exists(s =>
           s.ready.toBoolean && s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD)
-        lsOrderHisto += ((oldestBlocked, blockedStore, youngerReadyLoad,
-          dut.iq.logic.lsSkidValid.toBoolean))
-        if (dut.iq.logic.lsBypassFired.toBoolean) lsBypassFires += 1
+        val selectFire = dut.iq.logic.lsSelectFire.toBoolean
+        val bypassSelect = selectFire && dut.iq.logic.lsBypassFired.toBoolean
+        lsOrderHisto += LsOrderSample(oldestBlocked, blockedStore,
+          youngerReadyLoadPresent, dut.iq.logic.lsSkidValid.toBoolean,
+          selectFire, dut.iq.logic.lsSelectLoadFire.toBoolean,
+          dut.iq.logic.lsSelectParked.toBoolean, bypassSelect,
+          dut.iq.logic.lsEuFire.toBoolean)
+        if (bypassSelect) lsBypassFires += 1
+        // With speculative wakeup compiled out, both taps are constants that
+        // Verilator may prune. Keep OFF control runs measurable without forcing
+        // debug-only signals into the generated hardware.
+        specWakeHisto += ((if (dut.lsEu.specLoadWakeup)
+          dut.lsEu.wakeupSpec.valid.toBoolean else false,
+          if (dut.lsEu.specLoadWakeup)
+            dut.iq.logic.lsSpecBlocked.toBoolean else false))
+        val p3FastFire = dut.lsEu.p3FastLoad && dut.lsEu.logic.p3FastEnq.toBoolean
+        if (p3FastFire) p3FastEnqueues += 1
+        // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
+        // it) and the order-violation recoveries: the two costs the relaxation can incur.
+        if (lsOooPorts) {
+          if (dut.lsEu.replayRequestPort.valid.toBoolean) lsReplays += 1
+          if (dut.lsEu.orderViolationPort.valid.toBoolean) lsOrderViols += 1
+        }
         if (bypLiveOn) {
           val v = dut.rfInt.logic.bypLive
           for (i <- 0 until v.length) if (v(i).toBoolean) bypLiveCount(i) += 1
@@ -1178,7 +1542,8 @@ trait CoreBenchHarness extends AnyFunSuite {
           val oldest = if (s0.sel.toBoolean) Some(s0) else if (s1.sel.toBoolean) Some(s1) else None
           iqHolHisto += ((occ, oldest.isDefined, oldest.forall(_.ready.toBoolean),
             oldest.map(_.hot.cluster.toEnum.toString).getOrElse("none"),
-            oldest.map(_.hot.memOp.toEnum.toString).getOrElse("none")))
+            oldest.map(_.hot.memOp.toEnum.toString).getOrElse("none"),
+            oldest.exists(_.lsWait.toBoolean)))
         }
         sqForwardHisto += dut.lsEu.logic.p4CompletionFire.toBoolean
         lateStoreHisto += dut.lsEu.logic.lateDataCapture.toBoolean
@@ -1211,35 +1576,78 @@ trait CoreBenchHarness extends AnyFunSuite {
         if (macrosThisCycle > 0) {
           if (firstCommitCycle < 0) firstCommitCycle = totalCycles
           lastCommitCycle = totalCycles
+          missInj.markCommit()   // takes the miss/MLP counters over the SAME window
         }
-        // MB_TRACE=<kernel-name-prefix>: dump a per-cycle table of every LOAD-path
-        // pipeline stage, so the cost of a load can be attributed to named stages and
-        // BUBBLES (cycles where nothing advances) can be told apart from genuine
-        // pipeline depth. Stage names follow the LS EU / D-cache design docs:
+        // MB_TRACE=<kernel-name-prefix>: dump a per-cycle load-path table.
+        // MB_TRACE_STEADY=1 starts after the kernel's warm-up instructions.
+        // The ROB IDs and command address let dependent hops be paired; idle rows
+        // distinguish bubbles from pipeline depth. Stage names follow the RTL:
+        //   IQ  ready resident LS load; IS selected issue into the LS EU
         //   P1  s1Valid   issue context + registered operands
         //   P2  tValid    DTLB + VIPT probe launched
         //   P2T txValid   translation response awaited
         //   P3  p3Valid   resolved PA -> SQ query / store alloc
         //   P4  p4Valid   SQ forward response -> resolve / cache launch
         //   C0  loadCmd   D-cache accepts the address (valid&ready)
-        //   C1  ldS1Valid tag compare + way select
+        //   EP  early-probe hit on the resolved cache command
+        //   C1  ldS1Valid tag compare + way select; H1 is its hit bit
         //   C2  ldS2Valid byte-lane extract
         //   RSP loadRsp   data returned to the LS EU
+        //   MI/RF/AR/R/WR/RP: legacy miss discovery, refill, AXI, write, replay;
+        //                    NB staged miss, MSHR allocation, active AXI door,
+        //                    install write, replay-queue occupancy
         //   CMP compValid registered completion
-        //   WB  wbObs     writeback visible / wakeup broadcast
-        if (traceOn) {
+        //   WK  IQ load wakeup; WB wbObs / registered writeback
+        if (traceOn && traceLines.size < 400 &&
+            (!traceSteady || countedMacros >= k.warmupInstrs)) {
           def b(x: Boolean) = if (x) "#" else "."
           val cmdFire = dut.dcache.logic.loadCmdPort.valid.toBoolean &&
                         dut.dcache.logic.loadCmdPort.ready.toBoolean
+          val dc = dut.dcache.logic
+          val nb = dut.dcache.nonBlocking
+          val ar = if (dut.dcache.hotDoor) dc.axiDh.ar else dc.axi.ar
+          val r = if (dut.dcache.hotDoor) dc.axiDh.r else dc.axi.r
+          val readyLoads = dut.iq.logic.slots.filter(s => s.sel.toBoolean && s.ready.toBoolean &&
+            s.hot.memOp.toEnum == m68k040.isa.MemOp.LOAD).map(_.hot.robId.toInt)
+          val issueRob = if (dut.lsEu.issuePort.valid.toBoolean &&
+                             dut.lsEu.issuePort.ready.toBoolean)
+            dut.lsEu.issuePort.payload.robId.toInt.toString else "-"
+          val wbRob = if (dut.lsEu.logic.wbObs.valid.toBoolean)
+            dut.lsEu.logic.wbObs.robId.toInt.toString else "-"
           val line = Seq(
+            b(readyLoads.nonEmpty),
+            b(dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean),
             b(dut.lsEu.logic.s1Valid.toBoolean), b(dut.lsEu.logic.tValid.toBoolean),
             b(dut.lsEu.logic.txValid.toBoolean), b(dut.lsEu.logic.p3Valid.toBoolean),
-            b(dut.lsEu.logic.p4Valid.toBoolean), b(cmdFire),
-            b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS2Valid.toBoolean),
+            b(dut.lsEu.logic.p4Valid.toBoolean), b(p3FastFire),
+            b(dut.lsEu.logic.alignedFallThrough.toBoolean),
+            b(dut.dcache.logic.loadCmdPort.valid.toBoolean),
+            b(dut.dcache.logic.loadCmdPort.ready.toBoolean),
+            b(dut.dcache.logic.earlyProbeTokenPresent.toBoolean),
+            b(dut.dcache.logic.earlyProbeOwnsCmd.toBoolean),
+            b(dut.dcache.logic.earlyProbeConflict.toBoolean), b(cmdFire),
+            b(dut.dcache.logic.earlyProbeHit.toBoolean),
+            b(dut.dcache.logic.ldS1Valid.toBoolean), b(dut.dcache.logic.ldS1Hit.toBoolean),
+            b(dut.dcache.logic.ldS2Valid.toBoolean),
             b(dut.dcache.logic.loadRspPort.valid.toBoolean),
-            b(dut.lsEu.logic.compValid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
+            b(if (nb) dc.nb.stgValid.toBoolean else dc.loadMissDiscovered.toBoolean),
+            b(if (nb) dc.nb.lAlloc.toBoolean else dc.dbgFsmRefill.toBoolean),
+            b(ar.valid.toBoolean && ar.ready.toBoolean), b(r.valid.toBoolean && r.ready.toBoolean),
+            b(dc.wrEn.exists(_.toBoolean)),
+            b(if (nb) dc.nb.rqCount.toInt > 0 else dc.dbgFsmReplay.toBoolean),
+            b(dut.lsEu.logic.compValid.toBoolean),
+            b(dut.iq.lsWakeupPort.valid.toBoolean), b(dut.lsEu.logic.wbObs.valid.toBoolean)
           ).mkString(" ")
-          if (traceLines.size < 400) traceLines += f"$telemCycle%5d  $line  commits=$macrosThisCycle"
+          val addr = if (cmdFire) f"0x${dut.dcache.logic.loadCmdPort.payload.paddr.toLong}%08x" else "-"
+          val nbDetail = if (!nb) "" else {
+            val alloc = if (dc.nb.lAlloc.toBoolean)
+              f"0x${dc.nb.lLine.toLong << 4}%08x" else "-"
+            val arDetail = if (ar.valid.toBoolean)
+              f"0x${ar.payload.addr.toLong}%08x/id${ar.payload.id.toInt}" else "-"
+            val rDetail = if (r.valid.toBoolean) s"id${r.payload.id.toInt}" else "-"
+            s" alloc=$alloc hotAR=$arDetail hotR=$rDetail"
+          }
+          traceLines += f"$telemCycle%5d  $line  ready=${readyLoads.mkString(",")} issue=$issueRob wb=$wbRob cmd=$addr commits=$macrosThisCycle$nbDetail"
         }
         if (dut.lsEu.logic.sq.io.fwd.rsp.hit.toBoolean) sqFwdHitCycles += 1
         if (dut.dcache.logic.loadCmdPort.valid.toBoolean &&
@@ -1262,6 +1670,62 @@ trait CoreBenchHarness extends AnyFunSuite {
         }
         if (dut.dcache.logic.loadRspPort.valid.toBoolean) ldRspCycles += telemCycle
         if (dut.lsEu.logic.wbObs.valid.toBoolean) lsWbCycles += telemCycle
+        val ldLookup = dut.dcache.logic.ldS1Valid.toBoolean
+        dcLdLookupHisto += ldLookup
+        dcLdMissHisto   += (ldLookup && !dut.dcache.logic.ldS1Hit.toBoolean)
+        if (pairCensusOn) {
+          val rob = dut.rob.logic
+          // Refine the HELD bucket first: a `h1NotComplete` whose h1 has completed by NOW
+          // was blocked by ONE cycle of arrival order, not by anything structural.
+          val (heldBucket, heldH1) = pendingCensus
+          val refined = if (heldBucket == 2 && rob.completes(heldH1).toBoolean) 3 else heldBucket
+          if (refined >= 0) censusHisto += refined else censusHisto += -1
+          val depth = rob.depth
+          val h0 = rob.h0.toInt
+          val h1 = (h0 + 1) % depth
+          val count = rob.count.toInt
+          val r0 = rob.retireLanes(0).toBoolean
+          val r1 = rob.retireLanes(1).toBoolean
+          val bucket =
+            if (!r0) -1
+            else if (r1) 0
+            else if (count <= 1) 1
+            else if (!rob.completes(h1).toBoolean) 2
+            else if (!(!rob.p0.retireAlone.toBoolean ||
+                       (!rob.mispredictStore(h0).toBoolean && rob.p0.last.toBoolean))) 4
+            else if (rob.p1.retireAlone.toBoolean) 5
+            else if (rob.faultedStore(h1).toBoolean || rob.p1.isRte.toBoolean ||
+                     rob.p1.needsSup.toBoolean || rob.p1.sysOp.toBoolean ||
+                     rob.p1.debugBreakValid.toBoolean) 6
+            else if (rob.irqBoundaryHold.toBoolean && rob.p0.last.toBoolean) 7
+            else if (rob.h0TraceArmed.toBoolean || rob.h0PreciseCompletedSticky.toBoolean) 8
+            else 9
+          pendingCensus = (bucket, h1)
+        }
+        if (stallBudgetOn) {
+          // Record the PREVIOUS edge's sample (the board's registered tap), then take
+          // this edge's. Exactly one append per sampling, so `budgetHisto` indexes the
+          // same cycles `histo` does and the IPC window slices both identically.
+          budgetHisto += pendingBudget
+          val rob = dut.rob.logic
+          val lanes = rob.retireLanes.count(_.toBoolean)
+          val robBusy = rob.count.toInt != 0
+          // Bit 1 of `dbgStallDcPack` IS `DcachePlugin.busy` -- the very signal the board's
+          // OFF_PERF_STALL_DC counts through `stallDcPackReg(1)` (DcachePlugin.scala:2904,
+          // DebugCtrlPlugin.scala:710), so this is the same term, not a re-derivation.
+          val dcBusy = ((dut.dcache.logic.dbgStallDcPack.toBigInt >> 1) & 1) == 1
+          val walkBusy = dut.dtlb.logic.walker.io.busy.toBoolean ||
+                         dut.itlb.logic.walker.io.busy.toBoolean
+          // `retire0` is read as ITS OWN bit rather than inferred from `lanes > 0`: the
+          // board's `perfLvlRetire` taps `rob.logic.retire0` literally, and under
+          // IPC_PREPARED_RETIRE the wider lanes are driven by `preparedBatch.fire`
+          // instead of the `retireLanes(lane-1)` chain, so the two are not the same
+          // expression in every configuration.
+          val retire0 = rob.retireLanes(0).toBoolean
+          pendingBudget = (lanes & 0xf) |
+            (if (robBusy) 0x10 else 0) | (if (dcBusy) 0x20 else 0) |
+            (if (walkBusy) 0x40 else 0) | (if (retire0) 0x80 else 0)
+        }
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -1275,6 +1739,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem      = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, memCfg,
         if (k.zeroFillData) new ConstFillSparseMemory(0.toByte) else null)
+      // P6 hot door (non-blocking L1D with `hotDoor`): same image, same model L2.
+      val dhMem     = m68k040.sim.HotDoorAttach.model(dut.dcache, cd, dmem)
       val ptmem     = dmem
       val itlbPtmem = dmem
 
@@ -1392,6 +1858,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
       val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
+      val specWakeWindow = specWakeHisto.slice(lo, hi + 1)
       if (iqHolOn) {
         // Same window the IPC number uses, capped to the last 1000 cycles so the
         // sample is steady-state rather than including pipeline fill.
@@ -1412,6 +1879,25 @@ trait CoreBenchHarness extends AnyFunSuite {
           blocked.groupBy(_._4).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(",") +
           " blockerMemOp=" +
           blocked.groupBy(_._5).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(","))
+        // ── SIZING FOR SPECULATIVE LOAD WAKEUP ────────────────────────────────────
+        // Split the head-of-line STALLED cycles by what the stalled consumer is waiting
+        // for and what CLASS it is. `specLoadWakeup` releases LS-class consumers only, so:
+        //   lsWait & LS      the part the shipped mechanism can already reach
+        //   lsWait & non-LS  the part an ALU-consumer extension would reach
+        //   !lsWait          stalled on something else entirely (slow-ALU, DIV, flags) --
+        //                    not addressable by this feature at any scope
+        // Measured OFF, this sizes the prize before anything is built.
+        val stalled = blocked.filter(!_._3)
+        val lsWaitLs    = stalled.count(t => t._6 && t._4.startsWith("LS"))
+        val lsWaitOther = stalled.count(t => t._6 && !t._4.startsWith("LS"))
+        val noLsWait    = stalled.count(!_._6)
+        def pct(n: Int) = 100.0 * n / scala.math.max(1, stalled.size)
+        println(f"[hol-dep] ${k.name} headStalled=${stalled.size} " +
+          f"waitingOnLOAD-LSconsumer=$lsWaitLs (${pct(lsWaitLs)}%.1f%%) " +
+          f"waitingOnLOAD-nonLSconsumer=$lsWaitOther (${pct(lsWaitOther)}%.1f%%) " +
+          f"notWaitingOnLoad=$noLsWait (${pct(noLsWait)}%.1f%%)")
+        println(s"[hol-dep] ${k.name} stalledLoadWaitersByCluster=" +
+          stalled.filter(_._6).groupBy(_._4).view.mapValues(_.size).toSeq.sortBy(-_._2).mkString(","))
         // Where the dependent-chain link actually goes. The extraAlu sweep shows this
         // workload is chain-bound, so per-link latency -- not issue capacity -- sets IPC.
         // Pairing cmd[i] with rsp[i] assumes in-order responses, which holds for a serial
@@ -1448,7 +1934,9 @@ trait CoreBenchHarness extends AnyFunSuite {
         // These counters separate the two remaining explanations: the SQ filling
         // (capacity, which back-pressures dispatch through the `memoryReady` gate that
         // no dispatch perf bucket counts) from the drain being slow (throughput).
-        println(s"[ls-bypass] ${k.name} relaxedSelectDifferedCycles=$lsBypassFires")
+        println(s"[ls-bypass] scope=whole-run ${k.name} relaxedSelectDifferedCycles=$lsBypassFires " +
+          s"livenessReplays=$lsReplays orderViolationReports=$lsOrderViols")
+        println(s"[p3-fast] scope=whole-run ${k.name} enqueues=$p3FastEnqueues")
         if (bypLiveOn) println(s"[nzvc-live] ${k.name} nzvcBypassHitCycles=" +
           nzvcLiveCount.take(dut.rfNzvc.logic.bypLive.length).zipWithIndex.map { case (c, i) => s"#$i=$c" }.mkString(" "))
         if (bypLiveOn) println(f"[hum] ${k.name} loadPresentedCycles=$dcLoadPresented refusedCycles=$dcLoadRefused " +
@@ -1479,15 +1967,147 @@ trait CoreBenchHarness extends AnyFunSuite {
           f"hits=$dcStoreHits misses=$dcStoreMisses maxSqResident=$maxSqResident maxSqAccepted=$maxSqAccepted " +
           f"maxDcOutstanding=$maxDcOutstanding")
       }
-      println(s"[ls-order-window] ${k.name} cycles=$windowCycles " +
-        s"oldestUnready=${lsOrderWindow.count(_._1)} " +
-        s"oldestStoreUnready=${lsOrderWindow.count(_._2)} " +
-        s"youngerReadyLoadBlocked=${lsOrderWindow.count(_._3)} " +
-        s"skidOccupied=${lsOrderWindow.count(_._4)}")
+      // ── L2 COVERAGE. `evict=0` is a FINDING, not a pass: a kernel whose working set
+      // fits the 2 MB L2 never takes a DRAM-latency miss, so it cannot measure any
+      // lever whose mechanism is "hide a long miss". Printed only for the finite model,
+      // because under the unbounded one the answer is 0 by construction.
+      if (memCfg.latency.finiteCapacity) {
+        val st = dmem.stats
+        println(f"[l2] ${k.name}%s hits=${st.l2Hits}%d misses=${st.l2Misses}%d " +
+          f"merges=${st.l2SecondaryMerges}%d evictions=${st.l2Evictions}%d " +
+          f"missRate=${100.0 * st.l2Misses / scala.math.max(1L, st.l2Hits + st.l2Misses)}%.2f%%")
+      }
+      // ── `[br-attr]`: the retire-accurate mispredict attribution ─────────────────
+      // MPKI here is over the FULL run (raTotalMis / total retired macros), not the
+      // steady-state window, so it is directly comparable to the board's
+      // OFF_MISPRED_COUNT / retired-instruction ratio.
+      {
+        val mpki = 1000.0 * raTotalMis / scala.math.max(1, countedMacros)
+        val classSum = raBucket.toSeq.filter { case (b, _) => b.startsWith("uncond-") || b.startsWith("cond-") }.map(_._2).sum
+        println(f"[br-attr] ${k.name} retiredMacros=$countedMacros retiredTrainableBranches=$raTotalBranches " +
+          f"retiredMispredicts=$raTotalMis MPKI=$mpki%.2f " +
+          f"misRateOfTrainable=${100.0 * classSum / scala.math.max(1, raTotalBranches)}%.1f%% " +
+          f"unattributed=$raUnattributed")
+        println(s"[br-attr] ${k.name} buckets=" +
+          (if (raBucket.isEmpty) "-" else raBucket.toSeq.sortBy(-_._2).map { case (b, c) =>
+            f"$b=$c(${100.0 * c / scala.math.max(1, raTotalMis)}%.0f%%)" }.mkString(" ")))
+        // The gap the board's two class counters cannot see: `branchRedirect` counts
+        // returns, `debugBranchRetire` does not, so returns fall out of BOTH.
+        val retMis = raBucket.getOrElse("ret-nopred", 0) + raBucket.getOrElse("ret-wrongtgt", 0)
+        println(f"[br-attr] ${k.name} boardCounterGap: total=$raTotalMis " +
+          f"uncond+cond=$classSum invisibleToBothClassCounters=${raTotalMis - classSum} " +
+          f"(ofWhichReturns=$retMis)")
+        if (raMisPc.nonEmpty)
+          println(s"[br-attr-pc] ${k.name} " + raMisPc.toSeq.sortBy(-_._2._2).take(8)
+            .map { case (pc, (b, c)) => f"0x$pc%08x:$b=$c" }.mkString(" "))
+      }
+      // D4: RTL-counted inhibited launches (null counters when the barrier is not built).
+      // Zero here means the kernel contains no cache-inhibited access at all, so the
+      // bench CANNOT see the barrier's cost -- report that, never a measured "0%".
+      if (dut.lsEu.logic.d4Sim != null)
+        println(s"[d4-bench] ${k.name} inhibLoadLaunches=${dut.lsEu.logic.d4Sim.loadLaunches.toLong} " +
+          s"inhibStoreLaunches=${dut.lsEu.logic.sq.d4StoreLaunches.toLong} " +
+          s"quietWait=${dut.lsEu.logic.d4Sim.quietWaitCycles.toLong} " +
+          s"youngerHeld=${dut.lsEu.logic.d4Sim.youngerHeldCycles.toLong}")
+      // Non-blocking L1D (design note 10.1): WHOLE-RUN counters, printed unconditionally
+      // whenever the subsystem is built -- a silently discarded counter reads as a null.
+      if (dut.dcache.nonBlocking) {
+        val c = dut.dcache.logic.nb.ctrMap
+        def v(key: String) = c(key).toBigInt.toLong
+        val occ = c.keys.filter(_.startsWith("occ")).toSeq.sorted
+        println(s"[mshr] scope=whole-run ${k.name} " + c.keys.filterNot(_.startsWith("occ")).map(key => s"$key=${v(key)}").mkString(" ") +
+          s" occ=${occ.map(v).mkString("/")} " +
+          f"MLP=${v("mlpSum").toDouble / scala.math.max(1L, v("mlpCyc"))}%.3f hotDoor=${dut.dcache.hotDoor}")
+      }
+      // Presence is an opportunity, not a lost cycle: count the actual IQ
+      // select and EU handshake separately. A selection parked in the skid is
+      // still progress, and the EU handshake can belong to a prior selection.
+      val opportunity = lsOrderWindow.filter(_.youngerReadyLoadPresent)
+      println(s"[ls-order-window] scope=commit-window ${k.name} cycles=$windowCycles " +
+        s"oldestUnready=${lsOrderWindow.count(_.oldestUnready)} " +
+        s"oldestStoreUnready=${lsOrderWindow.count(_.oldestStoreUnready)} " +
+        s"youngerReadyLoadPresent=${opportunity.size} " +
+        s"opportunityBypassSelected=${opportunity.count(s => s.bypassSelect && s.selectLoadFire)} " +
+        s"opportunitySelectedToSkid=${opportunity.count(s => s.bypassSelect && s.selectLoadFire && s.selectParked)} " +
+        s"opportunityNoSelectSkidOccupied=${opportunity.count(s => !s.selectFire && s.skidOccupied)} " +
+        s"opportunityNoSelectOther=${opportunity.count(s => !s.selectFire && !s.skidOccupied)} " +
+        s"skidOccupied=${lsOrderWindow.count(_.skidOccupied)} " +
+        s"lsSelectFire=${lsOrderWindow.count(_.selectFire)} " +
+        s"lsEuFire=${lsOrderWindow.count(_.euFire)}")
+      println(s"[spec-wake-window] scope=commit-window ${k.name} " +
+        s"specAnnounceCycles=${specWakeWindow.count(_._1)} " +
+        s"iqRecheckHeldCycles=${specWakeWindow.count(_._2)}")
       assert(windowRetired == n - k.warmupInstrs,
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)
       val dualCycles    = windowHisto.count(_ == 2)
+
+      // ── PAIR CENSUS: why did a retiring cycle retire ONE and not TWO? ───────────
+      if (pairCensusOn) {
+        val w = censusHisto.slice(lo, hi + 1)
+        assert(w.size == windowCycles,
+          s"[${k.name}] pair-census samples=${w.size} but the IPC window is $windowCycles")
+        val names = Vector("paired", "noSecondEntry", "h1NotComplete", "h1LateByOne",
+          "headForbidsPair", "h1RetireAlone", "h1Serializing", "irqBoundary",
+          "h0TraceOrPrecise", "other")
+        val n = (0 until 10).map(b => w.count(_ == b))
+        val retiring = n.sum
+        // ARRIVAL ORDER (1..3) vs A GATE SAYING NO (4..9) -- the constraint/accident split.
+        val arrival = n(1) + n(2) + n(3)
+        val gated   = (4 until 10).map(n).sum
+        assert(retiring + w.count(_ < 0) == windowCycles,
+          s"[${k.name}] pair census does not close: retiring=$retiring idle=${w.count(_ < 0)}")
+        println(f"[pair-census] ${k.name} cycles=$windowCycles retiringCycles=$retiring " +
+          f"paired=${n(0)} single=${retiring - n(0)} " +
+          f"| ARRIVAL-ORDER=$arrival (noSecondEntry=${n(1)} h1NotComplete=${n(2)} " +
+          f"h1LateByOne=${n(3)}) " +
+          f"| GATE-SAID-NO=$gated (headForbidsPair=${n(4)} h1RetireAlone=${n(5)} " +
+          f"h1Serializing=${n(6)} irqBoundary=${n(7)} h0TraceOrPrecise=${n(8)} other=${n(9)})")
+      }
+
+      // ── STALL BUDGET: reduce the per-cycle samples over the SAME IPC window ─────
+      val stallBudget = if (!stallBudgetOn) None else {
+        val w = budgetHisto.slice(lo, hi + 1)
+        assert(w.size == windowCycles,
+          s"[${k.name}] stall-budget samples=${w.size} but the IPC window is $windowCycles " +
+          "cycles -- the budget is not describing the window it claims to")
+        def lanes(s: Int): Int = s & 0xf
+        def robBusy(s: Int): Boolean   = (s & 0x10) != 0
+        def dcBusy(s: Int): Boolean    = (s & 0x20) != 0
+        def walkBusy(s: Int): Boolean  = (s & 0x40) != 0
+        def retire0(s: Int): Boolean   = (s & 0x80) != 0
+        val b = StallBudget(
+          cycles              = windowCycles,
+          robEmpty            = w.count(s => !robBusy(s)),
+          retireStall         = w.count(s => robBusy(s) && !retire0(s)),
+          retireCycles        = w.count(retire0),
+          retire1Cycles       = w.count(s => lanes(s) == 1),
+          retire2Cycles       = w.count(s => lanes(s) >= 2),
+          retiredUops         = w.map(lanes).sum,
+          dcStall             = w.count(dcBusy),
+          walkStall           = w.count(walkBusy),
+          retireStallWithDc   = w.count(s => robBusy(s) && !retire0(s) && dcBusy(s)),
+          retireStallWithWalk = w.count(s => robBusy(s) && !retire0(s) && walkBusy(s)),
+          robEmptyWithDc      = w.count(s => !robBusy(s) && dcBusy(s)))
+        // A decomposition that does not close is not a decomposition. `retire0` is gated
+        // on `headReady` = `(count > 0) && ...`, so the three buckets are mutually
+        // exclusive AND exhaustive by construction; a non-zero residual means the
+        // sampling itself drifted and every number above is suspect.
+        assert(b.closes,
+          s"[${k.name}] stall budget does not close: cycles=${b.cycles} " +
+          s"robEmpty=${b.robEmpty} retireStall=${b.retireStall} retire=${b.retireCycles} " +
+          s"residual=${b.residual}")
+        println(b.line(k.name))
+        // The board can only BOUND macro throughput; sim knows it exactly. Print both
+        // views of "did something retire" so their difference (uop retires that carry no
+        // macro -- cracked load temps, stack pushes, RMW tails) is visible rather than
+        // silently conflated when a sim number is set beside a board counter.
+        println(f"[stall-budget-macro] ${k.name} boardRetireCycles=${b.retireCycles} " +
+          f"macroActiveCycles=$activeCycles macroDualCycles=$dualCycles " +
+          f"macroRetired=$windowRetired uopsRetired=${b.retiredUops} " +
+          f"ipc=${windowRetired.toDouble / windowCycles}%.4f")
+        Some(b)
+      }
 
       val pipelineProfile = if (!k.profileRetirement) None else {
         val branches = branchEvents.groupBy(e => (e._1, e._2)).toVector.sortBy(_._1).map {
@@ -1523,6 +2143,8 @@ trait CoreBenchHarness extends AnyFunSuite {
         Some(profile)
       }
 
+      missInj.publish(windowCycles, windowRetired)
+      MissInjector.archDump(k.name, handle.result)
       result = IpcResult(k.name, windowRetired, windowCycles, activeCycles, dualCycles,
         ftbApplies, ftqConfirms, ftqMismatches,
         ftbDirDeclines, ftbFrameDeclines, ftbBusyDeclines, sqFwdHitCycles,
@@ -1542,10 +2164,17 @@ trait CoreBenchHarness extends AnyFunSuite {
         captureIssueHisto.slice(lo, hi + 1).count(_._1),
         captureIssueHisto.slice(lo, hi + 1).count(_._2),
         captureIssueHisto.slice(lo, hi + 1).count(_._3),
-        queuedAdmissionHisto.slice(lo, hi + 1).count(identity))
+        queuedAdmissionHisto.slice(lo, hi + 1).count(identity),
+        dcLdLookupHisto.slice(lo, hi + 1).count(identity),
+        dcLdMissHisto.slice(lo, hi + 1).count(identity),
+        t2BranchRedirects,
+        stallBudget, firstCommitCycle, lastCommitCycle)
       if (traceOn) {
         println(s"=== LOAD-PATH CYCLE TRACE: ${k.name} ===")
-        println("cycle  P1 P2 PT P3 P4 C0 C1 C2 RS CM WB   (# = active)")
+        println(if (dut.dcache.nonBlocking)
+          "cycle  IQ IS P1 P2 PT P3 P4 P3F FT LV LR PTP POWN PCON C0 EP C1 H1 C2 RS SM AL AR  R WR RQ CM WK WB  ready-robs issue-rob wb-rob cmd-address commits alloc hotAR hotR  (# = active)"
+        else
+          "cycle  IQ IS P1 P2 PT P3 P4 P3F FT LV LR PTP POWN PCON C0 EP C1 H1 C2 RS MI RF AR  R WR RP CM WK WB  ready-robs issue-rob wb-rob cmd-address commits  (# = active)")
         traceLines.foreach(println)
         println(s"=== end trace (${traceLines.size} cycles) ===")
       }
@@ -1840,6 +2469,150 @@ trait CoreBenchHarness extends AnyFunSuite {
       warmupInstrs = setup.size + records * body.size)
   }
 
+  /** Four independent dependent chains. Each chain alone has MLP=1, but their
+    * separate address registers offer four distinct outstanding lines to an
+    * out-of-order LS issue path. 256 records per chain place eight lines per set
+    * across the four chains, beyond L1's four ways while fitting in modeled L2.
+    * The first complete walk warms L2 and is excluded from the measured window. */
+  def kChaseFour(records: Int = 256, iters: Int = 768): Kernel = {
+    require(records > 0 && iters > records && iters % records == 0)
+    val base = 0x10000L
+    val chainBytes = records * 16L
+    val orders = (0 until 4).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until records).toVector))
+    val starts = (0 until 4).map(c => base + c * chainBytes + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until 4; i <- 0 until records) {
+        val here = base + c * chainBytes + orders(c)(i) * 16L
+        val next = base + c * chainBytes + orders(c)((i + 1) % records) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val setup = starts.zipWithIndex.map { case (a, c) => f"lea 0x$a%x,%%a$c" } :+ s"move.l #$iters,%d7"
+    val body = (0 until 4).map(c => s"move.l (%a$c),%a$c") ++
+      Seq("subq.l #1,%d7", "bne.s .Lchase4")
+    val epi = (0 until 4).map(c => s"move.l %a$c,%d$c")
+    val src = (setup ++ Seq(".Lchase4: " + body.mkString(" ; ")) ++ epi ++
+      Seq(".Lchase4end: bra.s .Lchase4end")).mkString(" ; ")
+    Kernel("chase-four", src, setup.size + iters * body.size + epi.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + records * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until 4) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == c)
+          assert(writes.nonEmpty, s"chase-four: d$c was never written")
+          assert((writes.last.archRegWrite & 0xffffffffL) == starts(c),
+            f"chase-four: d$c ended at 0x${writes.last.archRegWrite}%x, expected 0x${starts(c)}%x")
+        }
+      })
+  }
+
+  /** Matched independent-chain sweep. The TOTAL number of 16-byte records and
+    * measured pointer loads stay fixed as the chain count changes. Every chain
+    * uses the same 68020 indexed EA form, with a zero A0 base and its own Dn
+    * pointer, including the eighth; A1 holds the loop counter so A7 is untouched.
+    * One complete traversal warms the selected memory tier, then two traversals
+    * plus exactly eight aggregate pointer loads form the commit window. Every
+    * retired pointer result is checked against the permutation, not only its
+    * final value. The branch/loop overhead per load still changes
+    * with chain count and is reported explicitly beside throughput. */
+  def kChaseChains(chains: Int, totalRecords: Int, setSkew: Boolean = false): Kernel = {
+    require(Set(1, 2, 4, 8).contains(chains) && totalRecords > 0 &&
+      totalRecords % chains == 0)
+    val recPerChain = totalRecords / chains
+    // Eight extra loads in TOTAL force every final pointer away from its
+    // starting value while preserving the same measured load count across arms.
+    val tailIters = 8 / chains
+    require(recPerChain > tailIters)
+    val iters = recPerChain * 3 + tailIters
+    val base = 0x10000L
+    val chainBytes = recPerChain * 16L
+    val chainStride = chainBytes + (if (setSkew) 16L else 0L)
+    val orders = (0 until chains).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until recPerChain).toVector))
+    val starts = (0 until chains).map(c => base + c * chainStride + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until chains; i <- 0 until recPerChain) {
+        val here = base + c * chainStride + orders(c)(i) * 16L
+        val next = base + c * chainStride + orders(c)((i + 1) % recPerChain) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val name = s"chase-chains-$chains-$totalRecords-skew${if (setSkew) 1 else 0}"
+    val setup = Seq("movea.l #0,%a0", s"movea.l #$iters,%a1") ++
+      starts.zipWithIndex.map { case (a, c) => f"move.l #0x$a%x,%%d$c" }
+    val body = (0 until chains).map(c => s"move.l (%a0,%d$c.l),%d$c") ++
+      Seq("subq.l #1,%a1", "cmpa.l #0,%a1", "bne.s .Lchains")
+    val src = (setup ++ Seq(".Lchains: " + body.mkString(" ; ")) ++
+      Seq(".LchainsEnd: bra.s .LchainsEnd")).mkString(" ; ")
+    Kernel(name, src, setup.size + iters * body.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + recPerChain * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until chains) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == c)
+          assert(writes.nonEmpty, s"$name: d$c was never written")
+          val expected = (0 until iters).map { i =>
+            base + c * chainStride + orders(c)((i + 1) % recPerChain) * 16L
+          }
+          assert(writes.size >= iters,
+            s"$name: d$c has ${writes.size} retired writes for $iters pointer loads")
+          val loads = writes.takeRight(iters)
+          for ((o, i) <- loads.zipWithIndex)
+            assert((o.archRegWrite & 0xffffffffL) == expected(i),
+              f"$name: d$c pointer hop $i returned 0x${o.archRegWrite}%x, expected 0x${expected(i)}%x")
+        }
+      })
+  }
+
+  /** Independent simple-(An) pointer chains, eligible for the P1 load path.
+    * A6 is the counter so A7 remains the architectural stack pointer. */
+  def kChaseAnChains(chains: Int, totalRecords: Int): Kernel = {
+    require(Set(4, 6).contains(chains) && totalRecords > 0 && totalRecords % chains == 0)
+    val recPerChain = totalRecords / chains
+    val tailIters = 12 / chains
+    require(recPerChain > tailIters)
+    val iters = recPerChain * 3 + tailIters
+    val base = 0x10000L
+    val stride = recPerChain * 16L
+    val orders = (0 until chains).map(c =>
+      new scala.util.Random(0x5eed + c).shuffle((0 until recPerChain).toVector))
+    val starts = (0 until chains).map(c => base + c * stride + orders(c).head * 16L)
+    val prep: MemHandles => Unit = { h =>
+      for (c <- 0 until chains; i <- 0 until recPerChain) {
+        val here = base + c * stride + orders(c)(i) * 16L
+        val next = base + c * stride + orders(c)((i + 1) % recPerChain) * 16L
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(here + b, ((next >> (24 - 8 * b)) & 0xff).toInt)
+      }
+    }
+    val name = s"chase-an-chains-$chains-$totalRecords"
+    val setup = starts.zipWithIndex.map { case (a, c) => f"movea.l #0x$a%x,%%a$c" } :+
+      s"movea.l #$iters,%a6"
+    val body = (0 until chains).map(c => s"movea.l (%a$c),%a$c") ++
+      Seq("subq.l #1,%a6", "cmpa.l #0,%a6", "bne.s .Lanchains")
+    val src = (setup ++ Seq(".Lanchains: " + body.mkString(" ; ")) ++
+      Seq(".LanchainsEnd: bra.s .LanchainsEnd")).mkString(" ; ")
+    Kernel(name, src, setup.size + iters * body.size,
+      zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + recPerChain * body.size,
+      verifyRetirement = obs => {
+        for (c <- 0 until chains) {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == 8 + c)
+          assert(writes.size >= iters,
+            s"$name: a$c has ${writes.size} retired writes for $iters pointer loads")
+          val loads = writes.takeRight(iters)
+          for ((o, i) <- loads.zipWithIndex) {
+            val expected = base + c * stride + orders(c)((i + 1) % recPerChain) * 16L
+            assert((o.archRegWrite & 0xffffffffL) == expected,
+              f"$name: a$c pointer hop $i returned 0x${o.archRegWrite}%x, expected 0x$expected%x")
+          }
+        }
+      })
+  }
+
   def kDhrystone(records: Int = 512, iters: Int = 2048, extraAlu: Int = 0,
                  strCopy: Boolean = true, copyStyle: String = "byteMemMem",
                  copyback: Boolean = false): Kernel = {
@@ -1998,10 +2771,16 @@ trait CoreBenchHarness extends AnyFunSuite {
     * offset; `d7 == 0` proves the inner loop ran to completion. A copy that shifted
     * by one long, or stopped early, fails both.
     *
-    * NOTE on MOVE16: the 68040's dedicated cache-line-move instruction is microcoded
-    * here into 4 LONG transfers (`Microcode.scala:2417`), i.e. 8 D-cache accesses per
-    * 16 bytes, so a MOVE16-based copy is NOT currently a faster path and this
-    * `move.l` loop is the fair baseline. */
+    * ⛔ CORRECTED 2026-09-28. This comment used to claim "a MOVE16-based copy is NOT
+    * currently a faster path and this `move.l` loop is the fair baseline". **MEASURED
+    * FALSE by 35%**: `kMemcpyMove16` runs the SAME 8 D-cache accesses per 16 bytes in
+    * **36.084 cyc/line against this loop's 48.819** (`Move16OracleSpec`, both seeds),
+    * because MOVE16's microcode issues L,L,S,S rather than this loop's L,S,L,S and the
+    * interleave lets the source fill and the destination write-allocate fill overlap
+    * through the single refill MSHR. And the ROM's own `BlockMove` uses MOVE16, so for
+    * real block copy **`kMemcpyMove16` is the fair baseline and this loop is not**.
+    * See `docs/PERF_LEVER_QUEUE.md` lever 17. The wrong comment is why the corpus
+    * contained zero MOVE16 instructions for as long as it did. */
   def kMemcpy(bytes: Int = 16384, passes: Int = 4, label: String = "memcpy-16k"): Kernel = {
     require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
     require(passes >= 2, "pass 1 is the L2 warm-up and is excluded; need at least one measured pass")
@@ -2048,6 +2827,284 @@ trait CoreBenchHarness extends AnyFunSuite {
         assert(lastOf(0) == want,
           f"memcpy copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
         assert(lastOf(7) == 0L, s"memcpy inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+  /** ── MOVE16 LEVER: the MEMORY-OP-COUNT ORACLE (2026-09-28) ────────────────────
+    *
+    * `kMemcpyQuads(q)` copies `q` of the four longs of every 16-byte line and skips
+    * the rest, advancing both pointers by 16 with one `lea` pair per line. For
+    * q = 1/2/4 the LINE FOOTPRINT, the L1 MISS COUNT, the destination
+    * write-allocate fetches and the dirty writebacks are all IDENTICAL -- a 16-byte
+    * L1 line is fetched whole on first touch and written back whole because there
+    * is ONE dirty bit per line -- while the number of D-cache ACCESSES per line is
+    * exactly `2*q`. So the q=1 -> q=4 slope MEASURES the marginal cycle cost of an
+    * LS-pipe access at constant memory-system behaviour, which is the entire
+    * mechanism a single-access `MOVE16` can attack. It needs no RTL and it BOUNDS
+    * the lever before it is built, which is what `docs/PERF_LEVER_QUEUE.md` demands
+    * after a transaction-count model missed lever 16 by 8x.
+    *
+    * q=4 is the same work as `kMemcpy` written in the displacement form with one
+    * `lea` pair, so the three points differ ONLY in the number of `move.l`s; it is
+    * also the cross-check against `kMemcpy`'s post-increment form.
+    *
+    * Verification is the same real check `kMemcpy` uses (every source long contains
+    * its own address), aimed at the LAST long this variant actually copies -- so a
+    * copy that shifted, stopped early, or skipped the wrong quad still fails.
+    */
+  def kMemcpyQuads(quads: Int, bytes: Int = 16384, passes: Int = 4,
+                   label: String = null): Kernel = {
+    require(quads >= 1 && quads <= 4, "quads must be 1..4")
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-q$quads-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val moves = (0 until quads).map(i => s"move.l ${i * 4}(%a0),${i * 4}(%a1)")
+    val body  = moves ++ Seq("lea 16(%a0),%a0", "lea 16(%a1),%a1",
+                             "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    // The last long this variant really copies: line (iters-1), quad (quads-1).
+    val lastOff = bytes - 16 + (quads - 1) * 4
+    val epi   = Seq(f"move.l 0x${Dst + lastOff}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + lastOff) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+  /** `MOVE16 (Ax)+,(Ay)+` copy loop -- the SAME 16 bytes per iteration as `kMemcpy`
+    * in ONE instruction instead of four, and with the pointer bumps folded in
+    * (`move16` post-increments both by 16 unconditionally).
+    *
+    * As microcoded TODAY (`Microcode.scala`'s `MOVE16_ENTRY`, rows 242..251) this is
+    * 4 LONG loads + 4 LONG stores + 2 dropped address ADDs = the SAME EIGHT D-cache
+    * accesses per line the `move.l` loop performs, from TWELVE uops instead of ten.
+    * So against `kMemcpy`/`kMemcpyQuads(4)` this kernel isolates the INSTRUCTION-COUNT
+    * and decode-bandwidth half of the lever with the memory-op count held constant,
+    * and it is the fail-before control for making MOVE16 a single wide access.
+    *
+    * Both operands are 16-byte aligned here, which is the only case where a
+    * line-wide implementation and Musashi's non-masking four-LONG semantics agree.
+    */
+  def kMemcpyMove16(bytes: Int = 16384, passes: Int = 4,
+                    label: String = null): Kernel = {
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    require(Src % 16 == 0 && Dst % 16 == 0, "MOVE16 operands must be line aligned")
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-m16-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move16 (%a0)+,(%a1)+", "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + bytes - 4) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+
+  /** (Adopted verbatim from the same-line-merge agent, agent-28 `05437638`.)
+    * ── THE GROUPED COPY: `L,L,L,L,S,S,S,S` per 16-byte line (2026-09-30) ──────────────
+    *
+    * `kMemcpy`'s body is `move.l (a0)+,(a1)+` x4, i.e. L,S,L,S,L,S,L,S. This is the SAME
+    * 16 bytes per iteration written as four loads into d0-d3 followed by four stores, the
+    * shape `docs/PERF_LEVER_QUEUE.md` measured at +20.1% copy bandwidth with zero hardware
+    * (`perf/dside-mshr2` spec §12.7) -- and the only shape that gives a SAME-LINE
+    * secondary-miss merge customers: with the loads grouped, loads 2-4 of a line reach the
+    * D-cache while load 1's refill is still in flight (44,442 of 49,102 refill cycles),
+    * where the interleaved order has 110. Ten instructions per line against six.
+    *
+    * Verification as `kMemcpy`'s: every source long holds its own address, and the
+    * epilogue reloads the last destination long. */
+  def kMemcpyGrouped(bytes: Int = 16384, passes: Int = 4, label: String = null): Kernel = {
+    require(bytes % 16 == 0, "memcpy bytes must be a whole number of 16-byte L1 lines")
+    require(passes >= 2, "pass 1 is the L2 warm-up and is excluded")
+    val Src = 0x00500000L
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memcpy-grp-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6")
+    val outer = Seq("movea.l %a2,%a0", "movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move.l (%a0)+,%d0", "move.l (%a0)+,%d1", "move.l (%a0)+,%d2", "move.l (%a0)+,%d3",
+                    "move.l %d0,(%a1)+", "move.l %d1,(%a1)+", "move.l %d2,(%a1)+", "move.l %d3,(%a1)+",
+                    "subq.l #1,%d7", "bne.s .Lcpy")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lcpy: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lcpyend: bra.s .Lcpyend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        val want = (Src + bytes - 4) & 0xffffffffL
+        assert(lastOf(0) == want,
+          f"$name copied the WRONG DATA: d0 = 0x${lastOf(0)}%x, expected 0x$want%x")
+        // d3 = the last SOURCE long of the final line (its own address), loaded by the loop
+        // itself -- checks the grouped loads, which the epilogue alone does not.
+        assert(lastOf(3) == want,
+          f"$name: d3 = 0x${lastOf(3)}%x, expected the last source long 0x$want%x")
+        assert(lastOf(7) == 0L, s"$name inner loop did not complete: d7 = ${lastOf(7)}")
+      })
+  }
+
+  /** ── LOAD STREAM (D-side bandwidth program, 2026-09-30) ─────────────────────────────
+    * A pure sequential READ stream: four independent `add.l (a0)+,dN` per 16-byte line
+    * over `bytes` of memory, `passes` times (pass 1 is warm-up). No stores, no
+    * dependence between loads beyond the pointer, so every load is ready at issue: the
+    * shape that exposes load-side MLP and nothing else. Every long holds its own address,
+    * so the four sums are checkable in closed form.
+    * Contrast `kLoadStream` (two cache-resident lines -- not a stream at all). */
+  def kStream(bytes: Int = 65536, passes: Int = 2, label: String = null): Kernel = {
+    require(bytes % 16 == 0 && passes >= 2)
+    val Src = 0x00500000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"stream-${bytes / 1024}k"
+    val prep: MemHandles => Unit = { h =>
+      var a = 0
+      while (a < bytes) {
+        val v = Src + a
+        h.dmem.pokeByte(Src + a + 0, ((v >> 24) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 1, ((v >> 16) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 2, ((v >> 8) & 0xff).toInt)
+        h.dmem.pokeByte(Src + a + 3, (v & 0xff).toInt)
+        a += 4
+      }
+    }
+    val setup = Seq(f"lea 0x$Src%x,%%a2", s"move.l #$passes,%d6", "moveq #0,%d0", "moveq #0,%d1",
+                    "moveq #0,%d2", "moveq #0,%d3")
+    val outer = Seq("movea.l %a2,%a0", s"move.l #$iters,%d7")
+    val body  = Seq("add.l (%a0)+,%d0", "add.l (%a0)+,%d1", "add.l (%a0)+,%d2", "add.l (%a0)+,%d3",
+                    "subq.l #1,%d7", "bne.s .Lstr")
+    val tail  = Seq("subq.l #1,%d6", "bne.s .Louter")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lstr: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++
+               Seq(".Lstrend: bra.s .Lstrend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    // Closed-form sums: lane j adds (Src + 16*i + 4*j) for i < iters, `passes` times.
+    def want(j: Int): Long = {
+      var s = 0L; for (i <- 0 until iters) s += Src + 16L * i + 4L * j
+      (s * passes) & 0xffffffffL
+    }
+    Kernel(name, src, setup.size + passes * perPass,
+      copybackDtt = true, zeroFillData = true, prepMem = prep,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def lastOf(reg: Int): Long = {
+          val w = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(w.nonEmpty, s"$name: register d$reg was never written")
+          w.last.archRegWrite & 0xffffffffL
+        }
+        for (j <- 0 until 4)
+          assert(lastOf(j) == want(j), f"$name: lane $j sum = 0x${lastOf(j)}%x, expected 0x${want(j)}%x")
+      })
+  }
+
+  /** Streaming four-long stores fill every COPYBACK destination line. */
+  def kMemset(bytes: Int = 16384, passes: Int = 4, label: String = null): Kernel = {
+    require(bytes % 16 == 0 && passes >= 2)
+    val Dst = 0x00600000L
+    val iters = bytes / 16
+    val name = if (label != null) label else s"memset-${bytes / 1024}k"
+    val setup = Seq(f"lea 0x$Dst%x,%%a3", s"move.l #$passes,%d6", "move.l #0x5a5a1234,%d1")
+    val outer = Seq("movea.l %a3,%a1", s"move.l #$iters,%d7")
+    val body  = Seq("move.l %d1,(%a1)+", "move.l %d1,(%a1)+", "move.l %d1,(%a1)+",
+                    "move.l %d1,(%a1)+", "subq.l #1,%d7", "bne.s .Lset")
+    val tail  = Seq("addq.l #1,%d1", "subq.l #1,%d6", "bne.s .Louter")
+    val epi   = Seq(f"move.l 0x${Dst + bytes - 4}%x,%%d0")
+    val src = (setup ++ Seq(".Louter: " + outer.mkString(" ; "),
+                            ".Lset: "   + body.mkString(" ; "),
+                            tail.mkString(" ; ")) ++ epi ++
+               Seq(".Lsetend: bra.s .Lsetend")).mkString(" ; ")
+    val perPass = outer.size + iters * body.size + tail.size
+    Kernel(name, src, setup.size + passes * perPass + epi.size,
+      copybackDtt = true, zeroFillData = true,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        val w = obs.filter(o => o.archRegValid && o.archRegId == 0)
+        assert(w.nonEmpty, s"$name: d0 never written")
+        val want = (0x5a5a1234L + passes - 1) & 0xffffffffL
+        assert((w.last.archRegWrite & 0xffffffffL) == want,
+          f"$name read back 0x${w.last.archRegWrite & 0xffffffffL}%x, expected 0x$want%x")
       })
   }
 
@@ -2207,4 +3264,475 @@ trait CoreBenchHarness extends AnyFunSuite {
     Kernel("call-return", src, setup.size + iters * 8)
   }
 
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Track 6 — strcmp: a byte LOAD -> COMPARE -> CONDITIONAL BRANCH recurrence
+  // ══════════════════════════════════════════════════════════════════════════════
+  // The board's Dhrystone window spends ~52% of its cycles with the ROB non-empty
+  // and nothing retiring while the D-cache stalls only 0.83% (dc-miss 1.17/kinst),
+  // i.e. the loads HIT and the machine is waiting on LATENCY, not on memory. PC
+  // sampling put 14 of 40 samples in one 60-byte window, which disassembled to a
+  // byte-at-a-time strcmp:
+  //
+  //     tstb  %a2@              <- LOAD
+  //     bnes  .Lnext
+  //     ...                     (equal-and-NUL exit)
+  //   .Lnext:
+  //     addql #1,%a2
+  //     addql #1,%a3
+  //     moveb %a2@,%d0          <- LOAD
+  //     cmpb  %a3@,%d0          <- LOAD + COMPARE, consumes d0
+  //     beqs  .Ltop             <- BRANCH, consumes the compare
+  //
+  // This suite had NOTHING of that shape: a mechanical sweep of the whole bench
+  // package finds exactly ONE compare, `cmp.l %d6,%d0`, with a REGISTER source, and
+  // the only byte traffic is `move.b (%a2)+,(%a3)+` -- strcpy, not strcmp. So the
+  // per-iteration recurrence
+  //     pointer increment -> LOAD -> ALU compare -> conditional branch -> increment
+  // was unrepresented, and so was the ALU-class consumer of a load: in
+  // `cmp.b (%a3),%d0` the consumer of the cracked load is the CMP, not an address.
+  //
+  // The kernels below reproduce that loop, its rotation, and its two taken branches
+  // per iteration. They are LOAD-ONLY (no stores at all), so `copybackDtt` cannot
+  // change what they measure through the precise-store path -- the `-cb` variants
+  // exist so the posture is stated rather than assumed, and both are reported.
+  //
+  // Opt-in via IPC_STRCMP_KERNELS=1 so the default IpcBenchSpec aggregate stays
+  // byte-identical to every earlier run.
+
+  private val StrcmpPairs     = 64      // distinct string pairs in the table
+  // TWO passes over the SAME table. The first is entirely inside `warmupInstrs`, so by
+  // the time the measured window opens every string line AND every pointer-table line
+  // has been touched once and the run is cache-RESIDENT -- which is the board's regime
+  // (dc-miss 1.17/kinst, dc-stall 0.83%). Measured over a single pass instead, the
+  // window pays ~100 COMPULSORY refills for first-touching its own data, which is not
+  // what the board does and would have made this a memory benchmark.
+  private val StrcmpPasses    = 2
+  private val StrcmpSlotBytes = 13      // bytes reserved per string (unaligned stride)
+  private val StrcmpAStr      = 0x00003000L
+  private val StrcmpBStr      = 0x00003400L
+  private val StrcmpTable     = 0x00003800L
+  private val StrcmpConst     = 0x41    // the constant byte the matched control compares against
+  private val StrcmpFiller    = 0x2e
+
+  /** The pair table: two NUL-capable byte images per pair.
+    *
+    *  - mode "mem" / "reg": string B is a buffer of ONE REPEATED BYTE (`StrcmpConst`).
+    *    That is what makes an EXACT control possible: comparing `s[k]` against `B[k]`
+    *    and comparing `s[k]` against a register holding the same constant produce the
+    *    SAME flags, so the two kernels retire the same instructions in the same order
+    *    with the same branch outcomes, and the memory operand on the compare is the
+    *    ONLY difference. (Constant DATA changes nothing microarchitecturally: the load
+    *    is a real byte load through a real incrementing pointer over its own lines.)
+    *  - mode "pair": both strings vary and one pair in five is fully equal, so the
+    *    NUL-exit path through `tst.b (%a2)` runs too. No exact control exists for this
+    *    one; it is the realism/branch-behaviour reference.
+    *
+    * First-difference positions come from a fixed LCG rather than a short cycle, so
+    * the exit branch is not learnable by a bounded global history. */
+  private def strcmpData(mode: String): Vector[(Vector[Int], Vector[Int])] = {
+    var x = 0x13579bdfL
+    def next(n: Int): Int = { x = (x * 1103515245L + 12345L) & 0x7fffffffL; ((x >>> 9) % n).toInt }
+    val out = ArrayBuffer.empty[(Vector[Int], Vector[Int])]
+    for (_ <- 0 until StrcmpPairs) {
+      val m = 2 + next(11)                       // first-difference / NUL index, 2..12
+      val equalPair = mode == "pair" && next(5) == 0
+      if (mode == "pair") {
+        val prefix = Vector.tabulate(m)(_ => 0x21 + next(0x5d))   // never 0
+        if (equalPair) {
+          val s = prefix :+ 0
+          out += ((s, s))
+        } else {
+          val av = prefix :+ (0x21 + next(0x5d))
+          val delta = 1 + next(0x10)
+          val bLast = if (av(m) + delta <= 0xfe) av(m) + delta else av(m) - delta
+          out += ((av, prefix :+ bLast))
+        }
+      } else {
+        // The differing byte straddles the constant in BOTH directions so `bcs`
+        // (the sign leg) is itself data-dependent and not learnable either.
+        val diff = if (next(2) == 0) StrcmpConst - (1 + next(0x20))
+                   else              StrcmpConst + (1 + next(0x20))
+        out += ((Vector.fill(m)(StrcmpConst) :+ diff,
+                 Vector.fill(StrcmpSlotBytes)(StrcmpConst)))
+      }
+    }
+    out.toVector
+  }
+
+  /** EXACT architectural trace of one pair through the loop below: retired macro
+    * count and the d3 result the kernel must leave behind. Written as an interpreter
+    * over the very same control flow, not as a closed-form formula, so the count the
+    * harness runs to cannot silently drift from the assembly. */
+  private def strcmpPairTrace(a: Vector[Int], b: Vector[Int]): (Int, Int) = {
+    var n = 4                     // movea, movea, lea, bra .LscNext
+    var k = 0
+    var res = 0
+    var done = false
+    while (!done) {
+      n += 5                      // addq, addq, move.b, cmp, beq
+      if (a(k) != b(k)) {
+        n += 3                    // move.b, cmp, bcs
+        if (a(k) < b(k)) { n += 1; res = -1 }   // bcs TAKEN  -> moveq #-1,%d3
+        else             { n += 2; res =  1 }   // moveq #1,%d3 ; bra .LscOut
+        done = true
+      } else {
+        n += 2                    // tst.b (%a2) ; bne
+        if (a(k) == 0) { n += 2; res = 0; done = true }  // moveq #0,%d3 ; bra .LscOut
+        else k += 1
+      }
+    }
+    n += 3                        // add.l %d3,%d2 ; subq.l #1,%d7 ; bne.w .LscPair
+    (n, res)
+  }
+
+  /** The loop, in the board's rotation: the NUL test at the top, the two pointer
+    * increments and the memory-operand compare at the bottom, both branches TAKEN on
+    * a continuing iteration. `mode == "reg"` is the matched control: the compare's
+    * source is a register instead of `(%a3)`, the pointer increment on %a3 is KEPT so
+    * the instruction sequence and the address arithmetic are unchanged, and the only
+    * thing that goes away is the load the compare depends on.
+    *
+    * What that control does NOT remove: `move.b (%a2),%d0` still feeds the compare, so
+    * an ALU consumer of a load survives in the control too. The mem/reg delta is
+    * therefore the cost of the COMPARE'S OWN memory operand -- the second load in the
+    * iteration, and the compare having to wait on two producers instead of one -- not
+    * the whole load-to-ALU-use cost. Read it as the marginal term, not as a zero. */
+  private def strcmpSrc(mode: String): String = {
+    val cmp = if (mode == "reg") "cmp.b %d1,%d0" else "cmp.b (%a3),%d0"
+    val setup = Seq("moveq #0,%d2", f"moveq #0x$StrcmpConst%x,%%d1",
+                    s"moveq #$StrcmpPasses,%d6")
+    val body = Seq(
+      f".LscPass: lea 0x$StrcmpTable%x,%%a4",
+      s"moveq #$StrcmpPairs,%d7",
+      ".LscPair: movea.l (%a4),%a2",     // pre-decremented source pointer
+      "movea.l 4(%a4),%a3",              // pre-decremented compare pointer
+      "lea 8(%a4),%a4",
+      "bra.s .LscNext",
+      ".LscTop: tst.b (%a2)",            // LOAD -> branch (the NUL test)
+      "bne.s .LscNext",
+      "moveq #0,%d3",
+      "bra.s .LscOut",
+      ".LscNext: addq.l #1,%a2",
+      "addq.l #1,%a3",
+      "move.b (%a2),%d0",                // LOAD
+      cmp,                               // LOAD + COMPARE, consumes d0
+      "beq.s .LscTop",                   // BRANCH, consumes the compare
+      "move.b (%a2),%d0",                // mismatch tail: recover the sign
+      cmp,
+      "bcs.s .LscNeg",
+      "moveq #1,%d3",
+      "bra.s .LscOut",
+      ".LscNeg: moveq #-1,%d3",
+      ".LscOut: add.l %d3,%d2",
+      "subq.l #1,%d7",
+      "bne.w .LscPair",
+      "subq.l #1,%d6",
+      "bne.w .LscPass")
+    (setup ++ body).mkString(" ; ") +
+      " ; .LscStop: bra.s .LscStop ; .rept 64 ; nop ; .endr"
+  }
+
+  /** `mode` is "mem" (memory-operand compare), "reg" (the matched register-operand
+    * control) or "pair" (both strings real, NUL exits included). */
+  def kStrcmp(mode: String, copyback: Boolean): Kernel = {
+    require(Set("mem", "reg", "pair").contains(mode), s"bad strcmp mode $mode")
+    val data    = strcmpData(mode)
+    val traces  = data.map { case (a, b) => strcmpPairTrace(a, b) }
+    val setupN  = 3                                   // moveq d2, moveq d1, moveq d6
+    val passN   = 2 + traces.map(_._1).sum + 2        // lea/moveq d7 ... subq d6/bne
+    val total   = setupN + StrcmpPasses * passN
+    val warmup  = setupN + passN                      // the whole first (warming) pass
+    val results = Vector.fill(StrcmpPasses)(traces.map(_._2)).flatten
+    val name    = s"strcmp-$mode${if (copyback) "-cb" else ""}"
+    Kernel(name, strcmpSrc(mode), total,
+      copybackDtt = copyback,
+      zeroFillData = true,
+      warmupInstrs = warmup,
+      prepMem = m => {
+        for (i <- 0 until StrcmpPairs) {
+          val (a, b) = data(i)
+          val aAddr = StrcmpAStr + i * StrcmpSlotBytes
+          val bAddr = StrcmpBStr + i * StrcmpSlotBytes
+          for (j <- 0 until StrcmpSlotBytes) {
+            m.dmem.pokeByte(aAddr + j, if (j < a.size) a(j) else StrcmpFiller)
+            m.dmem.pokeByte(bAddr + j, if (j < b.size) b(j) else StrcmpFiller)
+          }
+          // The loop increments BEFORE its first load, so the table holds ptr-1.
+          for ((base, ptr) <- Seq(0 -> (aAddr - 1), 4 -> (bAddr - 1)))
+            for (byte <- 0 until 4)
+              m.dmem.pokeByte(StrcmpTable + i * 8 + base + byte,
+                ((ptr >> (8 * (3 - byte))) & 0xff).toInt)
+        }
+      },
+      // ARCHITECTURAL check, not a retire count: `runKernel` stops after N macros
+      // WHATEVER THEY ARE, so a vanished branch can leave the count intact. d3 carries
+      // one -1/0/+1 per pair and d2 their running sum, so the full write streams of
+      // both pin every load, every compare outcome and every branch decision.
+      verifyRetirement = obs => {
+        def writes(reg: Int): Seq[Long] =
+          obs.filter(o => o.archRegValid && o.archRegId == reg).map(_.archRegWrite & 0xffffffffL)
+        val d3 = writes(3)
+        val want3 = results.map(_.toLong & 0xffffffffL)
+        assert(d3.size == want3.size,
+          s"[$name] d3 produced ${d3.size} pair results, expected ${want3.size} " +
+          "-- the loop structure changed, not just its timing")
+        assert(d3 == want3, s"[$name] pair result stream differs:\n  got  $d3\n  want $want3")
+        val d2 = writes(2)
+        val want2 = results.scanLeft(0)(_ + _).map(_.toLong & 0xffffffffL)
+        assert(d2 == want2, s"[$name] accumulator stream differs:\n  got  $d2\n  want $want2")
+      },
+      profileRetirement = true)
+  }
+
+  /** Opt-in (IPC_STRCMP_KERNELS=1) strcmp coverage kernels: the faithful shape, its
+    * exactly matched register-operand control, and the fully varied both-strings-real
+    * variant -- each in the default and the COPYBACK posture. */
+  def strcmpKernels: Seq[Kernel] =
+    for (copyback <- Seq(false, true); mode <- Seq("mem", "reg", "pair"))
+      yield kStrcmp(mode, copyback)
+
+
+  //  BRANCH-PREDICTION PROBES (2026-09-26)
+  //
+  //  WHY THESE EXIST. Silicon `perf` puts branch mispredicts at 24-77 per 1000
+  //  retired instructions (~11-14% of all cycles), the second-largest stall in the
+  //  machine. The pre-existing kernels above retire TWENTY-FIVE mispredicts in
+  //  total across the whole suite (1.49 MPKI aggregate, and 3 of those in every
+  //  kernel are just the cold-start and loop-exit branches) -- so a predictor
+  //  change of any size is inside the sampling noise, and `perf(btb): 128 -> 512`
+  //  correctly recorded "THIS CANNOT BE VALIDATED IN THE BENCH".
+  //
+  //  Each probe below isolates ONE failure mode of the fetch-time predictor and
+  //  drives it to ~1000 retired mispredicts, so `[br-attr]` can rank the buckets
+  //  and an A/B has statistical power. They are SYNTHETIC UPPER BOUNDS, not a model
+  //  of the Mac workload: read them as "how much does this mechanism cost when it
+  //  is the whole workload", and pair each with its `-fit` control (the same kernel
+  //  sized to fit the existing structure), which is what proves the probe is
+  //  measuring the structure and not something else.
+  //
+  //  Every probe sets %sp explicitly. SpinalSim randomises the PRF, so a kernel
+  //  that pushes without initialising A7 writes to a random address (see the
+  //  odd-ssp/a7 lockstep note); at 0x00300000 the stack is clear of the record
+  //  data at 0x10000-0x30000 and of the code at 0x40800000.
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  /** The branch probes below are self-checking. A computed-target or predictor change
+    * that is WRONG about a branch is only a perf loss in principle (the branch EU
+    * verifies every direction and target), but "only a perf loss" is a claim, not a
+    * measurement -- so each probe states the exact architectural register value its
+    * control flow must produce, and the harness fails if the run took a different path.
+    * This is the same discipline `assertChasePremise` applies to the pointer chase. */
+  private def brProbeExpect(expect: (Int, Long)*)(
+      obs: Seq[m68k040.lockstep.CommitObservation]): Unit =
+    expect.foreach { case (reg, want) =>
+      val writes = obs.filter(o => o.archRegValid && o.archRegId == reg)
+      assert(writes.nonEmpty, s"branch probe: register $reg was never written")
+      val got = writes.last.archRegWrite & 0xffffffffL
+      assert(got == want,
+        f"branch probe took the wrong control-flow path: d$reg = 0x$got%x, expected 0x$want%x")
+    }
+
+  /** INDIRECT-TARGET probe: ONE `jsr (%a0)` site whose target cycles through
+    * `handlers` distinct leaves, the address loaded from a table in memory.
+    *
+    * This is the Mac OS dispatch shape (A-line trap table / jump table / `jsr (An)`
+    * through a loaded pointer) and it is the one the frontend CANNOT predict by
+    * construction: the BTB/FTB hold ONE last-seen target per entry, so at a site
+    * whose target changes every execution the stored target is always the PREVIOUS
+    * handler. Expect ~100% mispredict on the indirect and ~0 on everything else.
+    *
+    * The target sequence is a FIXED CYCLE of period `handlers`, i.e. perfectly
+    * predictable from 5+ bits of global history while being 0% predictable from the
+    * last target. That makes this kernel the CEILING measurement for an
+    * ITTAGE/cascaded indirect predictor, not an average case.
+    *
+    * The table is built by the kernel itself (`lea .Lh<i>,%a0` + an absolute store)
+    * because the assembled code image is attached to the I-side AXI only -- code
+    * addresses are not readable through the D-cache, so a `prepMem` cannot know
+    * them. Those 2*handlers stores are counted as warm-up. */
+  def kBrIndirect(handlers: Int = 32, iters: Int = 1024, label: String = "br-ind"): Kernel = {
+    require(handlers >= 2 && (handlers & (handlers - 1)) == 0, "handlers must be a power of two")
+    val Tab  = 0x30000L
+    val mask = handlers * 4 - 1
+    val setup = Seq("lea 0x00300000,%sp", f"lea 0x$Tab%x,%%a2", "moveq #0,%d2",
+                    f"move.l #$mask,%%d3", "moveq #1,%d1", "moveq #0,%d0",
+                    s"move.l #$iters,%d7")
+    val tabInit = (0 until handlers).flatMap(i =>
+      Seq(s"lea .Lh$i,%a0", f"move.l %%a0,0x${Tab + i * 4}%x"))
+    val body = Seq("move.l (%a2,%d2.l),%a0", "addq.l #4,%d2", "and.l %d3,%d2",
+                   "jsr (%a0)", "subq.l #1,%d7", "bne.s .Lbri")
+    val handlerCode = (0 until handlers).map(i => s".Lh$i: add.l %d1,%d0 ; rts")
+    val src = (setup ++ tabInit ++ Seq(".Lbri: " + body.mkString(" ; "),
+      ".Lbriend: bra.s .Lbriend") ++ handlerCode).mkString(" ; ")
+    // Per iteration: 6 loop macros + the handler's add + rts = 8.
+    Kernel(label, src, setup.size + tabInit.size + iters * 8,
+      warmupInstrs = setup.size + tabInit.size,
+      // Every handler adds d1(=1) to d0, so d0 == iters iff the dispatch actually
+      // reached a handler on every iteration.
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** DBcc SLOT-1 COVERAGE probe: the canonical 68k counted loop, `add ; dbra`.
+    *
+    * `add.l %d1,%d0` is 2 bytes and `dbra %d7,.L` is 4, so the two emit as slot0 +
+    * slot1 in ONE cycle -- which puts the LOOP-CLOSING branch in SLOT 1, where nothing
+    * predicts it. DBcc is line-5, so neither `slot1WouldUncond` (line-6 unconditional)
+    * nor `slot1IsConditional` (line-6, cond >= 2) matches it, and it is not JSR/JMP nor
+    * RTS/RTR. It is emitted with no prediction from anywhere, falls through, and
+    * mispredicts on every iteration that should have looped.
+    *
+    * ⛔ The bench had NO DBcc IN IT AT ALL before this probe -- the fifth measured
+    * coverage hole in this corpus, after zero A6/A7 operands, zero store->load pairs,
+    * zero load->compare->branch chains and 25 total suite mispredicts. A lever aimed at
+    * DBcc would have measured an exact null against the old corpus and been called dead.
+    *
+    * `dbra` loops while `Dn != -1` AFTER the decrement, so `d7 = iters - 1` runs the
+    * body exactly `iters` times. Each pass adds d1(=1) to d0, so `d0 == iters` iff every
+    * iteration actually executed -- which also catches a deferral that drops the
+    * instruction out of the buffer instead of re-emitting it (the `slot1WouldUncond`
+    * two-list bug, caught that way by `br-ind`'s own check). */
+  def kBrDbcc(iters: Int = 1024, label: String = "br-dbcc"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", "moveq #1,%d1", "moveq #0,%d0",
+                    s"move.l #${iters - 1},%d7")
+    val body  = Seq("add.l %d1,%d0", "dbra %d7,.Ldb")
+    val src = (setup ++ Seq(".Ldb: " + body.mkString(" ; "),
+      ".Ldbend: bra.s .Ldbend")).mkString(" ; ")
+    // Per iteration: the add + the dbra = 2 macros.
+    Kernel(label, src, setup.size + iters * 2,
+      warmupInstrs = setup.size,
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** DBcc SLOT-1 probe, TWO BRANCHES PER WINDOW -- the case `br-dbcc` does NOT reach.
+    *
+    * `br-dbcc` (above) turned out to be already covered: with ONE branch in its 8-byte
+    * window the FTB holds it, `slot1WouldFtq` defers it to slot 0, and gshare predicts
+    * it -- measured 3 mispredicts in 1024 iterations, IPC 0.989 (~1 macro/cycle, i.e.
+    * the pair never issued together because the deferral already fired). That is the
+    * existing mechanism working, and no DBcc lever can improve on it.
+    *
+    * The uncovered case is the one `br-ind` shows for `jsr`+`bne`: the FTB holds ONE
+    * branch per EIGHT-BYTE WINDOW, so a window with TWO control transfers leaves the
+    * second predicted by nothing. Here:
+    *
+    *   .Lds: beq.s .Lnever   (2 bytes, NEVER taken -- `moveq #1,%d2` leaves Z=0)
+    *         dbra  %d7,.Lds  (4 bytes)
+    *
+    * Both live in one window. `ftqAt0` points at the `beq`, so `slot1WouldFtq` cannot
+    * defer the `dbra`, which emits in SLOT 1 with no prediction and falls through on a
+    * loop that should have been taken. The `beq` is correctly predicted NOT-taken, so
+    * `slot0IsPred` stays low and the deferral predicate is reachable.
+    *
+    * Verified on d7. ⚠️ `DBcc` is a WORD operation -- it decrements and tests only the
+    * LOW 16 BITS of Dn -- so starting from `move.l #iters-1` an exhausted loop leaves
+    * d7 = 0x0000FFFF, NOT 0xFFFFFFFF. Reaching 0xFFFF means exactly `iters` decrements
+    * happened, so it catches an early exit through the `beq` AND a deferral that drops
+    * the instruction instead of re-emitting it. */
+  def kBrDbccPair(iters: Int = 1024, label: String = "br-dbcc-2"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", "moveq #0,%d0",
+                    s"move.l #${iters - 1},%d7", "moveq #1,%d2")
+    val src = (setup ++ Seq(".Lds: beq.s .Lnever ; dbra %d7,.Lds",
+      ".Lnever: bra.s .Lnever")).mkString(" ; ")
+    // Per iteration: the never-taken beq + the dbra = 2 macros.
+    Kernel(label, src, setup.size + iters * 2,
+      warmupInstrs = setup.size,
+      verifyRetirement = brProbeExpect(7 -> 0x0000FFFFL))
+  }
+
+  /** BTB/FTB CAPACITY probe: `sites` distinct always-taken `bra.s` hops, each at a
+    * 6-byte stride, walked in a loop.
+    *
+    * A taken BRA has a FIXED PC-relative target that the BTB learns on first sight,
+    * so it can only mispredict if its entry was EVICTED. The BTB is DIRECT-MAPPED on
+    * `pc[1+log2(entries) : 1]`, so `sites` branches at a 6-byte stride land on
+    * `min(sites, entries)` distinct indices (stride 3 in word units is coprime with
+    * any power of two, so the indices are spread uniformly rather than aliased into
+    * a fraction of the table -- a 4-byte stride would only ever reach half the
+    * table and would overstate the conflict).
+    *
+    * `sites > entries` therefore thrashes and every hop mispredicts; `br-cap-fit`
+    * (sites <= entries) is the control and must stay near zero. The pair is what
+    * makes a BTB resize measurable here at all. */
+  def kBrCapacity(sites: Int = 256, iters: Int = 8, label: String = "br-cap"): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", s"move.l #$iters,%d7", "moveq #1,%d1",
+                    "moveq #0,%d0", "moveq #0,%d2")
+    // 6 bytes per site => the branch PCs advance 3 words at a time, which is coprime
+    // with any power-of-two index width, so the sites spread uniformly over the table
+    // instead of aliasing into a fraction of it (a 4-byte stride would only ever reach
+    // half the sets and would overstate the conflict).
+    //
+    // The hop JUMPS OVER a dead `add.l %d1,%d2`, and not merely to the next instruction,
+    // for two reasons. Encoding: a `bra.s` whose displacement is ZERO is the .W escape,
+    // so a byte branch to pc+2 does not assemble at all. Measurement: `%d2` then counts
+    // exactly the hops that FELL THROUGH, so `d2 == 0` proves every one of the
+    // `sites * iters` branches was actually taken.
+    val chain = (0 until sites).map { i =>
+      s".Lc$i: add.l %d1,%d0 ; bra.s .Lc${i + 1} ; add.l %d1,%d2"
+    }
+    val src = (setup ++ chain ++ Seq(
+      s".Lc$sites: subq.l #1,%d7 ; bne.w .Lc0", ".Lcend: bra.s .Lcend")).mkString(" ; ")
+    // Per iteration: sites * (add + bra) + subq + bne. The skipped add never retires.
+    Kernel(label, src, setup.size + iters * (sites * 2 + 2),
+      verifyRetirement = brProbeExpect(0 -> (iters.toLong * sites), 2 -> 0L))
+  }
+
+  /** RETURN-ADDRESS-STACK probe: `depth` nested `bsr`/`rts` pairs per iteration.
+    *
+    * The RAS is a 16-entry circular buffer (`Global.RAS_ENTRIES`). Nesting DEEPER
+    * than that overwrites the oldest entries, so the outermost `depth - 16` returns
+    * of every iteration pop a wrong address and mispredict. `br-ras-fit` nests
+    * inside the RAS and is the control.
+    *
+    * These mispredicts are the bucket NEITHER shipped board class counter can see:
+    * `OFF_PERF_MISPRED_UNCOND`/`_COND` both come from `debugBranchRetire`, which is
+    * gated on `isBtbBranch` and deliberately excludes returns, while
+    * `OFF_MISPRED_COUNT` (`branchRedirect`) counts them. `[br-attr]`'s
+    * `boardCounterGap` line is the sim-side view of that difference. */
+  def kBrReturn(depth: Int = 24, iters: Int = 128, label: String = "br-ras"): Kernel = {
+    require(depth >= 2)
+    val setup = Seq("lea 0x00300000,%sp", s"move.l #$iters,%d7", "moveq #1,%d1",
+                    "moveq #0,%d0")
+    val loop = ".Lrt: bsr .Lf0 ; subq.l #1,%d7 ; bne.s .Lrt"
+    val frames = (0 until depth - 1).map(i => s".Lf$i: bsr .Lf${i + 1} ; rts") :+
+                 s".Lf${depth - 1}: add.l %d1,%d0 ; rts"
+    val src = (setup ++ Seq(loop, ".Lrtend: bra.s .Lrtend") ++ frames).mkString(" ; ")
+    // Per iteration: bsr + subq + bne = 3, then (depth-1) x (bsr + rts) = 2(depth-1),
+    // then the leaf's add + rts = 2.
+    Kernel(label, src, setup.size + iters * (2 * depth + 3),
+      // Only the innermost frame adds, so d0 == iters iff every nest reached the leaf
+      // AND every return came back to the right place.
+      verifyRetirement = brProbeExpect(0 -> iters.toLong))
+  }
+
+  /** gshare DIRECTION probe: a conditional whose direction follows a fixed 32-bit
+    * pattern, read out one bit per iteration by `rol.l #1` (which rotates the top
+    * bit into C, so `bcs.s` takes the branch exactly on the pattern's 1 bits).
+    *
+    * A per-PC bimodal counter cannot do better than the pattern's bias (~50% here)
+    * because it is ONE counter for all 32 positions. gshare CAN be perfect: 5 bits
+    * of global history uniquely identify the position in a period-32 sequence, and
+    * the index folds 11 history bits. So this probe is a direct test of whether the
+    * GHR path actually works end to end -- speculative shift, retire-time
+    * `ghrArch`, and the flush repair -- not just of table sizing. A residual
+    * mispredict rate near the pattern's bias means the history is not reaching the
+    * index; near zero means gshare is doing its job and conditional direction is
+    * NOT where the remaining stall lives. */
+  def kBrPattern(pattern: Int = 0x6a5c93d2, iters: Int = 1024): Kernel = {
+    require(iters % 32 == 0, "iters must be a whole number of pattern periods")
+    val ones = Integer.bitCount(pattern)
+    val setup = Seq("lea 0x00300000,%sp", f"move.l #0x$pattern%08x,%%d6",
+                    s"move.l #$iters,%d7", "moveq #1,%d1", "moveq #0,%d0", "moveq #0,%d2")
+    val body = ".Lcp: rol.l #1,%d6 ; bcs.s .Lcp1 ; add.l %d1,%d0 ; bra.s .Lcp2 ; " +
+               ".Lcp1: add.l %d1,%d2 ; .Lcp2: subq.l #1,%d7 ; bne.s .Lcp"
+    val src = (setup ++ Seq(body, ".Lcpend: bra.s .Lcpend")).mkString(" ; ")
+    // Taken path (pattern bit 1): rol, bcs, add, subq, bne = 5 macros.
+    // Not-taken path (bit 0):     rol, bcs, add, bra, subq, bne = 6 macros.
+    val perPeriod = ones * 5 + (32 - ones) * 6
+    Kernel("br-patt", src, setup.size + (iters / 32) * perPeriod,
+      // d2 counts the pattern's 1 bits (branch taken), d0 its 0 bits: the pair pins the
+      // exact sequence of directions the run executed.
+      verifyRetirement = brProbeExpect(
+        2 -> (ones.toLong * (iters / 32)), 0 -> ((32 - ones).toLong * (iters / 32))))
+  }
 }
