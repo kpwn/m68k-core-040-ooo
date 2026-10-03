@@ -12,6 +12,8 @@ import spinal.core.sim._
   *   CPU_DCACHE_NONBLOCKING=0|1, CPU_AXI_DH=0|1 (+ CPU_INHIBITED_FULL_BARRIER=1),
   *   IQ_LOAD_BYPASS=1 (LS out-of-order issue, the LS-OoO arm), IPC_MEM=l2:5:60:4096 ...
   *   DSIDE_KERNELS=memcpy-16k,memcpy-grp-16k,... (default: all), DSIDE_SEEDS=1,17.
+  *   DSIDE_SHIPPING_PROFILE=1 selects ShippingPlugins constructors and production
+  *   CPU flags in CoreBenchHarness (same direct-AXI simulation topology).
   *
   * `chase-128` is the NEGATIVE CONTROL (C3): dependent loads, MLP 1 by construction. */
 class DsideBandwidthSpec extends CoreBenchHarness {
@@ -75,7 +77,8 @@ class DsideBandwidthSpec extends CoreBenchHarness {
       earlyStoreAddress = true, trainSlot1Conditional = true,
       deferTakenSlot1Conditional = true, retainRedirectHistory = true,
       loadBypassUnreadyLoad = lsOoo, specLoadWakeup = specWake,
-      fuseLongMoveLoads = fuseLongMoveLoads))
+      fuseLongMoveLoads = fuseLongMoveLoads,
+      shippingProfile = sys.env.get("DSIDE_SHIPPING_PROFILE").contains("1")))
 
     for (k <- kernels; seed <- seeds) {
       // Observe one continuous kernel run. A refill AR while wbIssued is high is
