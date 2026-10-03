@@ -61,3 +61,27 @@ constructor factories used by `M68kSocketTop`, including the IPC profile and
 configurable L2 memory model. The suite prints the effective flag values and,
 when non-blocking L1D is enabled, the D-cache's `[mshr]` counters. Results from
 this mode describe that CPU configuration in simulation, not a board run.
+
+## Matched cache-set placement control
+
+Run `MB_ONLY=loadsetspread MB_SHIPPING_PROFILE=1 MB_SEEDS=2 IPC_MEM=l2:5:70
+tools/run_microbench.sh` with the CPU flags of the production build. This adds
+same-set and spread-set cases for both the four-stream and compact two-stream
+loops; it does not replace the original stride-64 rows. The paired loops have
+identical opcodes, 128 iterations per pass, initialized data, and retirement
+checks. Only the immediate base addresses in their `lea` instructions differ.
+The same-set lane bases are 16 KiB apart. The spread-set bases add 16 bytes
+per lane, moving each stream to a different L1 set residue. A 128-byte stride
+means that each lane visits eight distinct 16-byte lines per populated set,
+exceeding the four ways of L1D even in the spread case. Four streams cover 512
+data lines; two cover 256. The ranges do not overlap and fit the model L2.
+Using a 64-byte stride for the spread case would permit L1 residency and
+confound the set-placement comparison.
+
+The four-stream pair measures 18,075 macros and 1,536 loads after warmup; the
+compact pair measures 7,311 macros and 768 loads. The printed `[mshr]` counts
+include warmup, so occupancy should be interpreted together with the cycles/load
+measured after warmup. Set-conflict failures and occupancy indicate whether
+independent misses actually overlap. The test cannot distinguish limits from
+ROB occupancy, the issue window, front-end throughput, or memory-interface
+backpressure without additional instrumentation.

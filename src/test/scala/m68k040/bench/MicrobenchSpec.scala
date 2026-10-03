@@ -391,15 +391,17 @@ class MicrobenchSpec extends CoreBenchHarness {
     * addresses available to OoO issue. It does not isolate single-load latency:
     * decode width, ROB capacity, branch prediction, LS bandwidth, the two
     * checksum recurrence chains, and miss concurrency all contribute. */
-  def kLoadFanout(stride: Int, passes: Int = 4): Kernel = {
-    require(stride == 8 || stride == 64)
+  def kLoadFanout(stride: Int, passes: Int = 4, spreadSets: Boolean = false): Kernel = {
+    require(stride == 8 || stride == 64 || stride == 128)
+    require(!spreadSets || stride == 128)
     require(passes >= 2)
     val lanes = 4
     val linesPerLane = 128
     val laneSpan = linesPerLane * stride
     val base = DataBase
+    def laneBase(i: Int): Long = base + i * laneSpan + (if (spreadSets) i * 16 else 0)
     val setup = Seq(s"move.l #$passes,%d7")
-    val resets = (0 until lanes).map(i => f"lea 0x${base + i * laneSpan}%08x,%%a$i") ++
+    val resets = (0 until lanes).map(i => f"lea 0x${laneBase(i)}%08x,%%a$i") ++
       Seq(s"movea.l #$linesPerLane,%a6", "movea.l #0,%a4", "movea.l #0,%a5")
     val loads = (0 until lanes).map(i => s"move.l (%a$i),%d$i")
     val use = (0 until lanes).flatMap { i =>
@@ -422,12 +424,12 @@ class MicrobenchSpec extends CoreBenchHarness {
     val expected = setup.size + passes * perPass
     val prep: MemHandles => Unit = { h =>
       for (lane <- 0 until lanes; line <- 0 until linesPerLane) {
-        val addr = base + lane * laneSpan + line * stride.toLong
+        val addr = laneBase(lane) + line * stride.toLong
         val value = (0x13579bdfL ^ (lane.toLong << 20) ^ (line.toLong * 0x10201L)) & 0xffffffffL
         for (b <- 0 until 4) h.dmem.pokeByte(addr + b, ((value >> (24 - b * 8)) & 0xff).toInt)
       }
     }
-    Kernel(s"load-fanout-stride$stride", src, expected,
+    Kernel(s"load-fanout-stride$stride${if (spreadSets) "-spread" else "-same"}", src, expected,
       prepMem = prep, zeroFillData = true,
       warmupInstrs = setup.size + perPass,
       verifyRetirement = obs => {
@@ -461,17 +463,19 @@ class MicrobenchSpec extends CoreBenchHarness {
     * iteration. At 19 macros/iteration, the 32-entry ROB can hold loads from a
     * following predicted iteration. All results are checked from the complete
     * retirement trace, so no checksum recurrence serialises the loop. */
-  def kCompactFanout(stride: Int, passes: Int = 4): Kernel = {
-    require(stride == 8 || stride == 64)
+  def kCompactFanout(stride: Int, passes: Int = 4, spreadSets: Boolean = false): Kernel = {
+    require(stride == 8 || stride == 64 || stride == 128)
+    require(!spreadSets || stride == 128)
     require(passes >= 2)
     val steps = 128
     val lanes = 2
     val base = DataBase
     val laneSpan = steps * stride
+    def laneBase(i: Int): Long = base + i * laneSpan + (if (spreadSets) i * 16 else 0)
     def word(lane: Int, line: Int): Long =
       (0x2468ace1L ^ (lane.toLong << 21) ^ (line.toLong * 0x10307L)) & 0xffffffffL
     val setup = Seq(s"move.l #$passes,%d7")
-    val resets = (0 until lanes).map(i => f"lea 0x${base + i * laneSpan}%08x,%%a$i") ++
+    val resets = (0 until lanes).map(i => f"lea 0x${laneBase(i)}%08x,%%a$i") ++
       Seq(s"movea.l #$steps,%a6")
     val loads = (0 until lanes).map(i => s"move.l (%a$i),%d$i")
     val consumers = (0 until lanes).flatMap { i =>
@@ -489,12 +493,12 @@ class MicrobenchSpec extends CoreBenchHarness {
     val perPass = resets.size + steps * inner.size + outer.size
     val prep: MemHandles => Unit = { h =>
       for (lane <- 0 until lanes; line <- 0 until steps) {
-        val addr = base + lane * laneSpan + line * stride.toLong
+        val addr = laneBase(lane) + line * stride.toLong
         val value = word(lane, line)
         for (b <- 0 until 4) h.dmem.pokeByte(addr + b, ((value >> (24 - b * 8)) & 0xff).toInt)
       }
     }
-    Kernel(s"compact-fanout-stride$stride", src, setup.size + passes * perPass,
+    Kernel(s"compact-fanout-stride$stride${if (spreadSets) "-spread" else "-same"}", src, setup.size + passes * perPass,
       prepMem = prep, zeroFillData = true,
       warmupInstrs = setup.size + perPass,
       verifyRetirement = obs => {
@@ -1111,6 +1115,39 @@ class MicrobenchSpec extends CoreBenchHarness {
             "independent next address and branch; no checksum RAW; " +
             (if (tag == "L2") "16KiB span, 8 lines per L1 set, model L2 hits"
              else "2KiB footprint, L1D resident"))
+      }
+    }
+
+    // Keep set placement as the single variable. At stride 128, each lane
+    // visits eight lines in each of 16 L1 sets, beyond the four-way capacity.
+    // Lane bases separated by 16 KiB alias in the same sets; adding one 16 B
+    // line per lane spreads them across disjoint sets without changing any
+    // opcode, instruction count, branch condition, or value sequence.
+    if (enabled("loadsetspread")) {
+      println("\n-- LOAD FANOUT: MATCHED SAME-SET / SPREAD-SET L2 CONTROL ------------")
+      if (!memCfg.latency.enabled)
+        println("  L2 claim requires IPC_MEM=l2:5:70; reporting configured memory only.")
+      for ((label, make, lanes, macros, expectedLines) <- Seq[
+        (String, Boolean => Kernel, Int, Int, Int)](
+        ("4-stream", spread => kLoadFanout(128, spreadSets = spread), 4, 18075, 512),
+        ("2-stream compact", spread => kCompactFanout(128, spreadSets = spread), 2, 7311, 256))) {
+        for (spread <- Seq(false, true)) {
+          val tag = if (spread) "spread-set" else "same-set"
+          val k = make(spread)
+          assert(k.warmupInstrs > 0)
+          val probe = runKernel(compiled, k, seeds.head)
+          val dataLines = splitLoads(probe)._1.map(_ & ~0xfL).distinct.size
+          assert(dataLines >= expectedLines,
+            s"$label $tag touched $dataLines lines; expected at least $expectedLines")
+          val loads = 3 * 128 * lanes
+          assert(k.retiredInstrs - k.warmupInstrs == macros,
+            s"$label $tag measured macro count changed")
+          report("loadsetspread", s"$label $tag, cycles/load",
+            scalarStat(compiled, s"$label-$tag", k, r => r.windowCycles.toDouble / loads),
+            s"$macros measured macros / $loads loads; first pass excluded; " +
+              s"$expectedLines distinct 16B lines; values checked; " +
+              "stride 128B, 8 lines per visited L1 set per lane")
+        }
       }
     }
 
