@@ -381,6 +381,82 @@ class MicrobenchSpec extends CoreBenchHarness {
     Kernel(s"ind-loads-$n", src, stopAt(n))
   }
 
+  /** Four independent load streams. The loaded words feed three separate ALU
+    * consumers, while address advances and the loop branch depend only on their
+    * own registers. Both footprints retire exactly the same work: 128 iterations
+    * per pass. Only the immediate address stride (8 versus 64 bytes) changes.
+    * The first pass warms the model L2 and is excluded.
+    *
+    * This measures steady-state cycles for useful load-result fanout with future
+    * addresses available to OoO issue. It does not isolate single-load latency:
+    * decode width, ROB capacity, branch prediction, LS bandwidth, the two
+    * checksum recurrence chains, and miss concurrency all contribute. */
+  def kLoadFanout(stride: Int, passes: Int = 4): Kernel = {
+    require(stride == 8 || stride == 64)
+    require(passes >= 2)
+    val lanes = 4
+    val linesPerLane = 128
+    val laneSpan = linesPerLane * stride
+    val base = DataBase
+    val setup = Seq(s"move.l #$passes,%d7")
+    val resets = (0 until lanes).map(i => f"lea 0x${base + i * laneSpan}%08x,%%a$i") ++
+      Seq(s"movea.l #$linesPerLane,%a6", "movea.l #0,%a4", "movea.l #0,%a5")
+    val loads = (0 until lanes).map(i => s"move.l (%a$i),%d$i")
+    val use = (0 until lanes).flatMap { i =>
+      val checksum = s"%a${4 + i / 2}"
+      Seq("moveq #1,%d4", s"add.l %d$i,%d4", s"adda.l %d4,$checksum",
+          "moveq #2,%d5", s"eor.l %d$i,%d5", s"adda.l %d5,$checksum",
+          "moveq #3,%d6", s"sub.l %d$i,%d6", s"adda.l %d6,$checksum")
+    }
+    // d6 is a consumer, so the loop count lives in a6 and never waits for data.
+    val inner = loads ++ use ++ (0 until lanes).map(i => s"adda.l #$stride,%a$i") ++
+      // Address-register SUBQ does not set NZVC on m68k. CMPA makes branch
+      // control depend on a6 alone, never on the previous loaded-word consumer.
+      Seq("subq.l #1,%a6", "cmpa.l #0,%a6", "bne.w .LfanInner")
+    val outer = Seq("subq.l #1,%d7", "bne.w .LfanOuter")
+    val src = (setup ++ Seq(".LfanOuter: " +
+      resets.mkString(" ; "),
+      ".LfanInner: " + inner.mkString(" ; "), outer.mkString(" ; "),
+      ".LfanEnd: bra.s .LfanEnd")).mkString(" ; ")
+    val perPass = resets.size + linesPerLane * inner.size + outer.size
+    val expected = setup.size + passes * perPass
+    val prep: MemHandles => Unit = { h =>
+      for (lane <- 0 until lanes; line <- 0 until linesPerLane) {
+        val addr = base + lane * laneSpan + line * stride.toLong
+        val value = (0x13579bdfL ^ (lane.toLong << 20) ^ (line.toLong * 0x10201L)) & 0xffffffffL
+        for (b <- 0 until 4) h.dmem.pokeByte(addr + b, ((value >> (24 - b * 8)) & 0xff).toInt)
+      }
+    }
+    Kernel(s"load-fanout-stride$stride", src, expected,
+      prepMem = prep, zeroFillData = true,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def last(reg: Int): Long = {
+          val writes = obs.filter(o => o.archRegValid && o.archRegId == reg)
+          assert(writes.nonEmpty, s"fanout: d$reg was never written")
+          writes.last.archRegWrite & 0xffffffffL
+        }
+        for (lane <- 0 until lanes) {
+          val want = (0x13579bdfL ^ (lane.toLong << 20) ^ ((linesPerLane - 1).toLong * 0x10201L)) & 0xffffffffL
+          assert(last(lane) == want, f"fanout lane $lane: got 0x${last(lane)}%08x expected 0x$want%08x")
+        }
+        val finalWord = last(lanes - 1)
+        assert(last(4) == ((finalWord + 1) & 0xffffffffL))
+        assert(last(5) == (finalWord ^ 2L))
+        assert(last(6) == ((3L - finalWord) & 0xffffffffL))
+        assert(last(7) == 0L)
+        for (pair <- 0 until 2) {
+          val sum = (for (lane <- pair * 2 until pair * 2 + 2;
+                          line <- 0 until linesPerLane) yield {
+            val v = (0x13579bdfL ^ (lane.toLong << 20) ^ (line.toLong * 0x10201L)) & 0xffffffffL
+            ((v + 1) + (v ^ 2L) + (3L - v)) & 0xffffffffL
+          }).foldLeft(0L)((a, b) => (a + b) & 0xffffffffL)
+          assert(last(12 + pair) == sum,
+            f"fanout checksum a${4 + pair}: got 0x${last(12 + pair)}%08x expected 0x$sum%08x")
+        }
+      })
+  }
+
   /** Short pure chase used only for cycle-by-cycle tracing (MB_TRACE=trace-chase). */
   def kTraceChase(n: Int): Kernel = {
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
@@ -904,6 +980,31 @@ class MicrobenchSpec extends CoreBenchHarness {
         "DEP; differential; minus matched control; COLD (first-touch) miss -- the model's " +
         "L2 never evicts so a CAPACITY miss cannot be produced; absolute value tracks the " +
         "UNMEASURED dramCycles parameter, see the sweep")
+    }
+
+    // A practical load-to-use case: four independent streams, each loaded word
+    // feeding three ALU operations and a checked checksum. Both footprints
+    // retire exactly the same work; only the address stride changes.
+    if (enabled("loadfanout")) {
+      println("\n-- LOAD-RESULT FANOUT ACROSS LOOP ITERATIONS ------------------------")
+      val footprints = Seq("L1D" -> 8) ++
+        (if (memCfg.latency.enabled) Seq("L2" -> 64) else Seq.empty)
+      if (!memCfg.latency.enabled)
+        println("  L2 case requires IPC_MEM=l2:5:70; default memory has no L2 latency model.")
+      for ((tag, stride) <- footprints) {
+        val k = kLoadFanout(stride)
+        val probe = runKernel(compiled, k, seeds.head)
+        val dataLines = splitLoads(probe)._1.map(_ & ~0xfL).distinct.size
+        val expectedLines = if (stride == 8) 256 else 512
+        assert(dataLines >= expectedLines,
+          s"$tag fanout touched only $dataLines lines; expected at least $expectedLines")
+        val loads = (4 - 1) * 128 * 4
+        report("loadfanout", s"$tag: 4 loads x 3 uses, cycles/load",
+          scalarStat(compiled, s"fanout-$tag", k, r => r.windowCycles.toDouble / loads),
+          s"measured passes 2..4; per-lane values and full checksums verified; branch/address independent of data; " +
+            (if (tag == "L2") "32KiB footprint, L2 model required for L2-hit claim"
+             else "4KiB footprint, L1D resident"))
+      }
     }
 
     // ── load-to-use decomposition (adjudicates the ~11-cycle memory numbers) ──
