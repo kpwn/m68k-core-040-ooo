@@ -534,6 +534,71 @@ class MicrobenchSpec extends CoreBenchHarness {
       })
   }
 
+  /** One load per iteration with three direct uses. Eleven macros fit with the
+    * following iterations in the 32-entry ROB. There is no checksum chain; the
+    * address and branch counter are independent of the loaded value. */
+  def kSingleFanout(stride: Int, passes: Int = 4): Kernel = {
+    require(stride == 8 || stride == 128)
+    require(passes >= 2)
+    val steps = 128
+    val base = DataBase
+    def word(line: Int): Long =
+      (0x5a7c3e91L ^ (line.toLong * 0x10207L)) & 0xffffffffL
+    val setup = Seq(s"move.l #$passes,%d7")
+    val resets = Seq(f"lea 0x$base%08x,%%a0", s"movea.l #$steps,%a6")
+    val inner = Seq("move.l (%a0),%d0",
+      "moveq #1,%d4", "add.l %d0,%d4",
+      "moveq #2,%d5", "eor.l %d0,%d5",
+      "moveq #3,%d6", "sub.l %d0,%d6",
+      s"adda.l #$stride,%a0", "subq.l #1,%a6", "cmpa.l #0,%a6",
+      "bne.w .LsingleInner")
+    assert(inner.size == 11)
+    val outer = Seq("subq.l #1,%d7", "bne.w .LsingleOuter")
+    val src = (setup ++ Seq(".LsingleOuter: " + resets.mkString(" ; "),
+      ".LsingleInner: " + inner.mkString(" ; "), outer.mkString(" ; "),
+      ".LsingleEnd: bra.s .LsingleEnd")).mkString(" ; ")
+    val perPass = resets.size + steps * inner.size + outer.size
+    val prep: MemHandles => Unit = { h =>
+      for (line <- 0 until steps) {
+        val addr = base + line * stride.toLong
+        val value = word(line)
+        for (b <- 0 until 4)
+          h.dmem.pokeByte(addr + b, ((value >> (24 - b * 8)) & 0xff).toInt)
+      }
+    }
+    Kernel(s"single-fanout-stride$stride", src, setup.size + passes * perPass,
+      prepMem = prep, zeroFillData = true,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def writes(reg: Int): Vector[Long] = obs.iterator
+          .filter(o => o.archRegValid && o.archRegId == reg)
+          .map(_.archRegWrite & 0xffffffffL).toVector
+        val loaded = writes(0)
+        assert(loaded.size == passes * steps,
+          s"single fanout loads=${loaded.size}, expected ${passes * steps}")
+        for (pass <- 0 until passes; line <- 0 until steps)
+          assert(loaded(pass * steps + line) == word(line),
+            f"single fanout pass=$pass line=$line wrong loaded value")
+        for ((reg, initial, op) <- Seq[(Int, Long, Long => Long)](
+          (4, 1L, v => (v + 1L) & 0xffffffffL),
+          (5, 2L, v => v ^ 2L),
+          (6, 3L, v => (3L - v) & 0xffffffffL))) {
+          val got = writes(reg)
+          assert(got.size == passes * steps * 2,
+            s"single fanout d$reg result count=${got.size}")
+          for (pass <- 0 until passes; line <- 0 until steps) {
+            val at = (pass * steps + line) * 2
+            assert(got(at) == initial,
+              s"single fanout d$reg init pass=$pass line=$line was ${got(at)}")
+            val want = op(word(line))
+            assert(got(at + 1) == want,
+              f"single fanout d$reg pass=$pass line=$line got 0x${got(at + 1)}%08x expected 0x$want%08x")
+          }
+        }
+        assert(writes(7).lastOption.contains(0L), "single fanout outer loop did not finish")
+      })
+  }
+
   /** Short pure chase used only for cycle-by-cycle tracing (MB_TRACE=trace-chase). */
   def kTraceChase(n: Int): Kernel = {
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
@@ -1148,6 +1213,39 @@ class MicrobenchSpec extends CoreBenchHarness {
               s"$expectedLines distinct 16B lines; values checked; " +
               "stride 128B, 8 lines per visited L1 set per lane")
         }
+      }
+    }
+
+    if (enabled("loadsingle")) {
+      println("\n-- ONE LOAD PER ITERATION WITH THREE DIRECT CONSUMERS --------------")
+      val footprints = Seq("L1D" -> 8) ++
+        (if (memCfg.latency.enabled) Seq("L2" -> 128) else Seq.empty)
+      if (!memCfg.latency.enabled)
+        println("  L2 case requires IPC_MEM=l2:5:70; default memory has no L2 latency model.")
+      for ((tag, stride) <- footprints) {
+        val k = kSingleFanout(stride)
+        assert(k.retiredInstrs - k.warmupInstrs == 4236)
+        val probe = runKernel(compiled, k, seeds.head)
+        val expectedLines = if (stride == 8) 64 else 128
+        val dataLines = splitLoads(probe)._1.map(_ & ~0xfL).distinct.size
+        assert(dataLines >= expectedLines,
+          s"$tag single fanout touched $dataLines lines; expected at least $expectedLines")
+        report("loadsingle", s"$tag: 1 load x 3 direct uses, cycles/load",
+          scalarStat(compiled, s"single-$tag", k,
+            r => r.windowCycles.toDouble / (3 * 128)),
+          s"4236 measured macros / 384 loads; passes 2..4; all retired load/ALU values checked; " +
+            "independent next address and branch; no checksum recurrence; " +
+            (if (tag == "L2") "16KiB span, 8 lines per L1 set, model L2 hits"
+             else "1KiB footprint, L1D resident"))
+      }
+      for ((tag, (records, iters)) <- Seq("L1D" -> (128, 512)) ++
+           (if (memCfg.latency.enabled) Seq("L2" -> (1024, 4096)) else Seq.empty)) {
+        val k = kChasePure(records = records, iters = iters)
+        report("loadsingle", s"$tag: dependent pointer chase, cycles/load",
+          scalarStat(compiled, s"single-chase-$tag", k,
+            r => r.windowCycles.toDouble / (iters - records)),
+          s"$records initialized pointer records; first full walk excluded; " +
+            "3 macros/iteration, next address depends on loaded pointer")
       }
     }
 

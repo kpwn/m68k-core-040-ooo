@@ -85,3 +85,23 @@ measured after warmup. Set-conflict failures and occupancy indicate whether
 independent misses actually overlap. The test cannot distinguish limits from
 ROB occupancy, the issue window, front-end throughput, or memory-interface
 backpressure without additional instrumentation.
+
+## One-load loop control
+
+`MB_ONLY=loadsingle MB_SHIPPING_PROFILE=1 MB_SEEDS=2 IPC_MEM=l2:5:70
+tools/run_microbench.sh` runs a separate one-load-per-iteration loop. Its
+11-macro body contains one load, three initialized direct ALU consumers, one
+independent address increment, and an independent `a6` counter/`cmpa` branch.
+The first of four 128-iteration passes warms the memory hierarchy; the timed
+window contains 4,236 retired macros and 384 loads. Every loaded word and both
+writes of each consumer register are checked in the complete commit trace.
+An 8-byte stride stays in L1D; a 128-byte stride visits eight lines per
+populated L1 set and therefore repeatedly misses the four-way L1D while
+remaining in the model L2. The result is loop throughput in cycles per load,
+not an isolated load-to-use latency. Compare its L2 row with the dependent
+pointer-chase control under the same CPU profile and memory model; this loop
+can fetch future addresses, whereas the chase cannot.
+The selector also reports the existing dependent chase with 128 records
+(2 KiB, L1D) and 1,024 records (16 KiB, model L2). A chase iteration has
+three macros rather than the fanout loop's eleven, so the rows compare useful
+cycles per load under different amounts of work, not equal instruction streams.
