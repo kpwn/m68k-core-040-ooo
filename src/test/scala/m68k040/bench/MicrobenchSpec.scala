@@ -457,6 +457,79 @@ class MicrobenchSpec extends CoreBenchHarness {
       })
   }
 
+  /** Compact fanout: two loads and three direct consumers of each value per
+    * iteration. At 19 macros/iteration, the 32-entry ROB can hold loads from a
+    * following predicted iteration. All results are checked from the complete
+    * retirement trace, so no checksum recurrence serialises the loop. */
+  def kCompactFanout(stride: Int, passes: Int = 4): Kernel = {
+    require(stride == 8 || stride == 64)
+    require(passes >= 2)
+    val steps = 128
+    val lanes = 2
+    val base = DataBase
+    val laneSpan = steps * stride
+    def word(lane: Int, line: Int): Long =
+      (0x2468ace1L ^ (lane.toLong << 21) ^ (line.toLong * 0x10307L)) & 0xffffffffL
+    val setup = Seq(s"move.l #$passes,%d7")
+    val resets = (0 until lanes).map(i => f"lea 0x${base + i * laneSpan}%08x,%%a$i") ++
+      Seq(s"movea.l #$steps,%a6")
+    val loads = (0 until lanes).map(i => s"move.l (%a$i),%d$i")
+    val consumers = (0 until lanes).flatMap { i =>
+      Seq("moveq #1,%d4", s"add.l %d$i,%d4",
+          "moveq #2,%d5", s"eor.l %d$i,%d5",
+          "moveq #3,%d6", s"sub.l %d$i,%d6")
+    }
+    val inner = loads ++ consumers ++ (0 until lanes).map(i => s"adda.l #$stride,%a$i") ++
+      Seq("subq.l #1,%a6", "cmpa.l #0,%a6", "bne.w .LcompactInner")
+    val outer = Seq("subq.l #1,%d7", "bne.w .LcompactOuter")
+    assert(inner.size == 19)
+    val src = (setup ++ Seq(".LcompactOuter: " + resets.mkString(" ; "),
+      ".LcompactInner: " + inner.mkString(" ; "), outer.mkString(" ; "),
+      ".LcompactEnd: bra.s .LcompactEnd")).mkString(" ; ")
+    val perPass = resets.size + steps * inner.size + outer.size
+    val prep: MemHandles => Unit = { h =>
+      for (lane <- 0 until lanes; line <- 0 until steps) {
+        val addr = base + lane * laneSpan + line * stride.toLong
+        val value = word(lane, line)
+        for (b <- 0 until 4) h.dmem.pokeByte(addr + b, ((value >> (24 - b * 8)) & 0xff).toInt)
+      }
+    }
+    Kernel(s"compact-fanout-stride$stride", src, setup.size + passes * perPass,
+      prepMem = prep, zeroFillData = true,
+      warmupInstrs = setup.size + perPass,
+      verifyRetirement = obs => {
+        def writes(reg: Int): Vector[Long] = obs.iterator
+          .filter(o => o.archRegValid && o.archRegId == reg)
+          .map(_.archRegWrite & 0xffffffffL).toVector
+        val loaded = (0 until lanes).map(writes)
+        for (lane <- 0 until lanes) {
+          assert(loaded(lane).size == passes * steps,
+            s"compact fanout d$lane load count=${loaded(lane).size}, expected ${passes * steps}")
+          for (pass <- 0 until passes; line <- 0 until steps)
+            assert(loaded(lane)(pass * steps + line) == word(lane, line),
+              f"compact fanout d$lane pass=$pass line=$line wrong loaded value")
+        }
+        val expectedInit = Seq(1L, 2L, 3L)
+        for ((reg, op) <- Seq[(Int, Long => Long)](
+          4 -> (v => (v + 1L) & 0xffffffffL),
+          5 -> (v => v ^ 2L),
+          6 -> (v => (3L - v) & 0xffffffffL))) {
+          val got = writes(reg)
+          assert(got.size == passes * steps * lanes * 2,
+            s"compact fanout d$reg result count=${got.size}, expected ${passes * steps * lanes * 2}")
+          for (pass <- 0 until passes; line <- 0 until steps; lane <- 0 until lanes) {
+            val at = ((pass * steps + line) * lanes + lane) * 2
+            assert(got(at) == expectedInit(reg - 4),
+              s"compact fanout d$reg init pass=$pass line=$line lane=$lane was ${got(at)}")
+            val want = op(word(lane, line))
+            assert(got(at + 1) == want,
+              f"compact fanout d$reg pass=$pass line=$line lane=$lane got 0x${got(at + 1)}%08x expected 0x$want%08x")
+          }
+        }
+        assert(writes(7).lastOption.contains(0L), "compact fanout outer loop did not finish")
+      })
+  }
+
   /** Short pure chase used only for cycle-by-cycle tracing (MB_TRACE=trace-chase). */
   def kTraceChase(n: Int): Kernel = {
     val setup = Seq(f"lea 0x$DataBase%08x,%%a0")
@@ -1004,6 +1077,29 @@ class MicrobenchSpec extends CoreBenchHarness {
           s"measured passes 2..4; per-lane values and full checksums verified; branch/address independent of data; " +
             (if (tag == "L2") "32KiB footprint, L2 model required for L2-hit claim"
              else "4KiB footprint, L1D resident"))
+      }
+    }
+
+    if (enabled("loadcompact")) {
+      println("\n-- COMPACT LOAD FANOUT: NEXT ITERATION FITS IN ROB -------------------")
+      val footprints = Seq("L1D" -> 8) ++
+        (if (memCfg.latency.enabled) Seq("L2" -> 64) else Seq.empty)
+      if (!memCfg.latency.enabled)
+        println("  L2 case requires IPC_MEM=l2:5:70; default memory has no L2 latency model.")
+      for ((tag, stride) <- footprints) {
+        val k = kCompactFanout(stride)
+        val probe = runKernel(compiled, k, seeds.head)
+        val expectedLines = if (stride == 8) 128 else 256
+        val dataLines = splitLoads(probe)._1.map(_ & ~0xfL).distinct.size
+        assert(dataLines >= expectedLines,
+          s"$tag compact fanout touched only $dataLines lines; expected at least $expectedLines")
+        val loads = (4 - 1) * 128 * 2
+        report("loadcompact", s"$tag: 2 loads x 3 uses, cycles/load",
+          scalarStat(compiled, s"compact-$tag", k, r => r.windowCycles.toDouble / loads),
+          s"19 macros/iter, 32-entry ROB; passes 2..4; all retired load/ALU values checked; " +
+            "independent next address and branch; no checksum RAW; " +
+            (if (tag == "L2") "16KiB span, 8 lines per L1 set, model L2 hits"
+             else "2KiB footprint, L1D resident"))
       }
     }
 

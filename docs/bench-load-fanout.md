@@ -31,3 +31,25 @@ of load-to-use latency. The checksum chains make the arithmetic meaningful but
 may themselves limit throughput; a faster result is evidence of overlap, while a
 slower result alone does not identify the limiting structure. The L2 model has
 unbounded capacity and calibrated hit timing; it is not a board measurement.
+
+## Compact next-iteration variant
+
+Run `MB_ONLY=loadcompact MB_SEEDS=2 IPC_MEM=l2:5:70 tools/run_microbench.sh`
+for a loop whose body is 19 macro-instructions: two loads, six consumer
+instructions per load (three destination initializations and three ALU uses),
+two pointer increments, and three counter/branch instructions. The branch uses
+`cmpa` on the separate `a6` counter. A 32-entry ROB can therefore hold the next
+iteration's two loads before this iteration retires. Both cases execute 128
+iterations per pass: 8-byte strides give a 2 KiB L1D footprint and 64-byte
+strides span 16 KiB. The latter visit eight lines per populated L1D set, more
+than its four ways, so repeated passes miss L1D and hit the model L2. Pass 1 is
+excluded, leaving 7,311 measured
+macros and 768 measured loads in either case.
+
+The complete commit trace checks every load and every initialized ALU result in
+all four passes against the preloaded nonconstant source words. There is no
+running checksum, so the only loop-carried register dependencies are the address
+increments and branch counter. The same ALU work and branch count at both
+footprints let their cycles/load be compared directly. The result still includes
+frontend, issue, ROB and retire costs; it does not by itself identify one
+bottleneck or guarantee that the next iteration actually issued early.
