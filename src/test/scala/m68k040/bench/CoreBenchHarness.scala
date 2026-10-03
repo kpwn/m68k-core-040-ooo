@@ -394,7 +394,17 @@ trait CoreBenchHarness extends AnyFunSuite {
                     deferSlot1Uncond: Boolean = false,
                     deferSlot1Dbcc: Boolean = false,
                     pcRangeEnable: Boolean = true,
-                    icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment) extends Component {
+                    icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment,
+                    shippingProfile: Boolean = false) extends Component {
+    // The fanout measurements can request the exact shipping plugin constructor
+    // set. The direct-AXI bench topology is the one explicit difference from the
+    // socket, which uses AxiDMergePlugin; all execution knobs come from the same
+    // ShippingPlugins factories that build M68kSocketTop.
+    val shippingIpcProfile = sys.env.getOrElse("CPU_IPC_PROFILE", "throughput-v2")
+    val shippingIpc = shippingProfile && m68k040.top.SocketIpcProfile.enabled(shippingIpcProfile)
+    val shippingLate = shippingProfile && m68k040.top.SocketIpcProfile.lateStore(shippingIpcProfile)
+    val shippingLsOoo = shippingProfile && m68k040.top.SocketTopConfig.LS_OOO_ISSUE
+    val shippingSpecWake = shippingProfile && m68k040.top.ShippingPlugins.specLoadWakeup(shippingIpc)
     val db    = new Database
     val host  = db on (new PluginHost)
     val ctrl   = new MmuControlPlugin
@@ -409,19 +419,25 @@ trait CoreBenchHarness extends AnyFunSuite {
     val itlb   = new ItlbPlugin(victimEntries = m68k040.top.ShippingCoreConfig.itlbVictimEntries)
     val dtlb   = new DtlbPlugin()
     val icache = new IcachePlugin(icachePredecodeWords)
-    val dcache = new DcachePlugin(fillForward = dcacheFillForward,
+    val dcache = if (shippingProfile)
+      m68k040.top.ShippingPlugins.dcache(socketMerged = false)
+    else new DcachePlugin(fillForward = dcacheFillForward,
       directRefillResponse = dcacheDirectRefillResponse)
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
-    val ras    = new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
-    val gsh    = new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
-    val fa     = new FetchAlignPlugin(enableFetchDirected = true,
+    val ras    = if (shippingProfile) m68k040.top.ShippingPlugins.ras()
+                 else new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
+    val gsh    = if (shippingProfile) m68k040.top.ShippingPlugins.gshare(shippingIpc)
+                 else new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
+    val fa     = if (shippingProfile) m68k040.top.ShippingPlugins.fetchAlign(shippingIpc)
+                 else new FetchAlignPlugin(enableFetchDirected = true,
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional,
       computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
       deferSlot1Dbcc = deferSlot1Dbcc)
-    val dec    = new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
-      fuseLongMoveLoads = fuseLongMoveLoads)
+    val dec    = if (shippingProfile) m68k040.top.ShippingPlugins.decode(shippingIpc)
+                 else new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
+                   fuseLongMoveLoads = fuseLongMoveLoads)
     val preparedCap = sys.env.get("IPC_PREPARED_RETIRE").map(_.toInt).getOrElse(0)
     val ren    = new RenameStage(
       retireWidth = if (preparedCap != 0) preparedCap else sys.env.get("IPC_RETIRE_WIDTH").map(_.toInt).getOrElse(2),
@@ -433,17 +449,25 @@ trait CoreBenchHarness extends AnyFunSuite {
     // from one switch; every SIM harness omitted it, so the recovery had never been
     // exercised in simulation -- the same shape as the CPUSH `icMaintFlush` fix that was
     // wired only in FullCoreSynth and had zero sim coverage.
-    val rob    = new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
+    val rob    = if (shippingProfile) m68k040.top.ShippingPlugins.rob(
+      detailedPerf = false,
+      pcRangeEnable = m68k040.top.SocketDebugProfile.pcRangeEnabled(sys.env.getOrElse("CPU_DEBUG_PROFILE", "full")),
+      lsOooIssue = shippingLsOoo, preparedRetireEntries = preparedCap)
+    else new RobPlugin(pairCorrectBranch = pairCorrectBranch, preparedRetireEntries = preparedCap,
       pcRangeEnable = pcRangeEnable, rasBranchRepair = rasBranchRepair,
       lsOooIssue = loadBypassUnreadyLoad)
-    val iq     = new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
+    val iq     = if (shippingProfile) m68k040.top.ShippingPlugins.issueQueue(
+      shippingIpc, shippingLate, shippingSpecWake, shippingLsOoo)
+    else new IssueQueuePlugin(earlyStoreAddress = earlyStoreAddress,
       earlyAutoStoreAddress = earlyAutoStoreAddress,
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
       specLoadWakeup = specLoadWakeup)
     val eu0    = new AluEuPlugin
     val eu1    = new AluEuPlugin
     val branchEu = new BranchEuPlugin
-    val lsEu   = new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
+    val lsEu   = if (shippingProfile) m68k040.top.ShippingPlugins.lsEu(
+      shippingIpc, shippingLate, shippingSpecWake, shippingLsOoo)
+    else new LsEuPlugin(alignedLoadFallThrough = alignedLoadFallThrough,
       earlyIntWakeup = earlyLsIntWakeup, sqSubwordForwarding = sqSubwordForwarding,
       reserveLateStore = reserveLateStore, detachLateStore = detachLateStore,
       forwardOnPublish = forwardOnPublish, earlyNzvcWakeup = earlyLsNzvcWakeup,

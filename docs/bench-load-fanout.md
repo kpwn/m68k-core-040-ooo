@@ -53,3 +53,11 @@ increments and branch counter. The same ALU work and branch count at both
 footprints let their cycles/load be compared directly. The result still includes
 frontend, issue, ROB and retire costs; it does not by itself identify one
 bottleneck or guarantee that the next iteration actually issued early.
+
+For a production-profile comparison, set `MB_SHIPPING_PROFILE=1` and export the
+CPU flags from that build's `input-record.json`. This selects the same plugin
+constructor factories used by `M68kSocketTop`, including the IPC profile and
+`LS_OOO_ISSUE`; the harness retains its direct AXI test topology and the
+configurable L2 memory model. The suite prints the effective flag values and,
+when non-blocking L1D is enabled, the D-cache's `[mshr]` counters. Results from
+this mode describe that CPU configuration in simulation, not a board run.

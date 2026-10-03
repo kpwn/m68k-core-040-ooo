@@ -941,11 +941,22 @@ class MicrobenchSpec extends CoreBenchHarness {
     // Compile the core ONCE and reuse it for every kernel and every seed -- this
     // suite runs well over a hundred simulations and a per-kernel Verilator build
     // would dominate the runtime.
-    val compiled = M68kSim().withVerilator.compile(new FullCoreDut)
+    val shippingProfile = sys.env.get("MB_SHIPPING_PROFILE").contains("1")
+    val compiled = M68kSim().withVerilator.compile(new FullCoreDut(shippingProfile = shippingProfile))
 
     println("=" * 100)
     println("68040 OoO LATENCY MICROBENCHMARK SUITE")
     println(s"  memory model : $memLabel")
+    println(s"  shipping plugin constructors : $shippingProfile")
+    if (shippingProfile) println(s"  candidate flags : " + Seq(
+      "CPU_IPC_PROFILE", "CPU_DEBUG_PROFILE", "LS_OOO_ISSUE",
+      "CPU_INHIBITED_FULL_BARRIER", "CPU_DCACHE_NONBLOCKING", "CPU_AXI_DH",
+      "CPU_DCACHE_MSHRS", "CPU_LS_LOAD_RING_DEPTH", "CPU_DCACHE_SECTORED",
+      "CPU_DCACHE_NB_EARLY_RESPONSE", "CPU_DCACHE_NB_EAGER_AR",
+      "CPU_DCACHE_NB_PRESELECT_AR", "CPU_DCACHE_NB_DYNAMIC_RELEASE",
+      "CPU_DCACHE_NB_PROBE_MISS_STAGE", "CPU_AXI_DH_AR_FALL_THROUGH",
+      "CPU_DCACHE_STORE_AR_DELAY", "CPU_DCACHE_FULLLINE_NOFILL", "CPU_SQ_COALESCE_LINES")
+      .map(k => s"$k=${sys.env.getOrElse(k, "<unset>")}").mkString(" "))
     println(s"  seeds        : ${seeds.mkString(",")}  (variance is across these)")
     println("  method       : differential -- perStep = (cyc(long)-cyc(short))/(long-short)")
     println("  DEP = dependency chain (LATENCY).  IND = independent ops (THROUGHPUT).")
