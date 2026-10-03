@@ -468,6 +468,16 @@ writethrough FIFO `wtFaultFifoAddr[pop..push)`, which already holds line address
 - **Install is held by a store in S1 only when that store could advance this cycle**
   (`!nbStoreHold`). Holding it unconditionally deadlocks: a store held in S1 for want of an
   MSHR in its set waits on an install that waits on the store.
+- **An S0 WT may not block its own older MSHR's AR indefinitely.** If a COPYBACK
+  store in S1 targets a different line of that MSHR's set, D3-SET holds S1 until
+  the MSHR leaves; a same-line WT behind it is then trapped in S0. AR selection
+  may bypass the S0 WT only for a **store-created MSHR** in this exact held-S1
+  case. The same-set, different-line S1 COPYBACK conflict itself forces
+  `nbStoreHold`, so S1 and S0 cannot advance on the selection edge; a simulation
+  assertion checks that implication. Store-pipe FIFO order proves the store MSHR
+  is older than the WT still in S0. The registered
+  advertised AR then holds S0. Load MSHRs keep the conservative S0 exclusion,
+  preserving older WT-to-read ordering for standalone cache clients.
 - **The victim invalidate is deferred** (`invPend`, one per cycle), because store S3 owns the
   dirty-bit port of that way on the allocation cycle. Every store is held in S1 while any
   invalidate is pending, so no store can write the evicted line between snapshot and

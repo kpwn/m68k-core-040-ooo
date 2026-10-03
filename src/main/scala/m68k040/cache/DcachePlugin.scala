@@ -4723,6 +4723,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val s0Advance   =
       if (!nonBlocking) s0Valid && stS1Ready && !storePipeHeld
       else s0Valid && stS1Ready && !storePipeHeld && !nbS0ArHold
+    s0Advance.simPublic() // directed AR-ordering regression observes the S0 launch edge
     val s0Ready     = !s0Valid || s0Advance
 
     /** The store held an S1 descriptor, was not blocked by a barrier or by the
@@ -5795,6 +5796,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val blocked = Vec.fill(N)(RegInit(True))
       val linger  = Vec.fill(N)(Reg(UInt(2 bits)) init 0)
       val byStore = Vec.fill(N)(RegInit(False))
+      byStore.simPublic()
       val instWait = Vec.fill(N)(Reg(UInt(5 bits)) init 0)
       st.simPublic(); line.simPublic(); eset.simPublic(); eway.simPublic(); invPend.simPublic()
       mstrb.simPublic(); fault.simPublic(); linger.simPublic()
@@ -6179,9 +6181,31 @@ class DcachePlugin(val socketMerged: Boolean = false,
           when(st(k) === ST(WAIT_AR) && byStore(k) && mstrb(k).andR && !arDelayOk(k)) { st(k) := ST(FILLED) }
         }
       }
+      // A same-line WT in S0 normally precedes this AR: it may be an older store,
+      // so wait for its AXI B before reading. There is one exception. A COPYBACK
+      // store in S1 to a different line of this MSHR's set cannot advance until
+      // this MSHR leaves the set (D3-SET), and the WT behind it cannot leave S0.
+      // This escape is only for a STORE MSHR: the in-order store pipe proves
+      // that its S2 allocation is older than the WT still behind it in S0.
+      // For a load MSHR, keep the conservative WT gate even if S0 is held;
+      // standalone cache clients can present an older WT before the load.
+      // Selecting the AR breaks that cycle; the registered arV then holds S0
+      // until the AR handshake. WAIT_AR makes this MSHR valid; different-line
+      // same-set S1 COPYBACK therefore raises setConfS1 and nbStoreHold, which
+      // forces stS1Advance, stS1Ready, and s0Advance low on selection's edge.
+      val s0WtD3Escape = Vec((0 until N).map(k =>
+        st(k) === ST(WAIT_AR) && byStore(k) && stS1Valid &&
+        stS1Payload.cacheMode === CacheMode.COPYBACK &&
+        stS1Set === eset(k) && lineOfPa(stS1Payload.paddr) =/= line(k)))
+      GenerationFlags.simulation {
+        for (k <- 0 until N) when(s0WtD3Escape(k)) {
+          assert(!s0Advance, "DcachePlugin.nb: D3 AR escape let S0 advance", FAILURE)
+        }
+      }
       val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) &&
         (if (nbEagerAr) True else settled(k) && !blocked(k)) &&
-        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) && !wtS0To(line(k)) && arDelayOk(k)))
+        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) &&
+        (!wtS0To(line(k)) || s0WtD3Escape(k)) && arDelayOk(k)))
       // This optional path selects a newly allocated LOAD into the same AR holding
       // register. The normal WAIT_AR candidates keep priority. Preselection is one
       // cycle earlier than their gate, so also account for WT writes still in S0

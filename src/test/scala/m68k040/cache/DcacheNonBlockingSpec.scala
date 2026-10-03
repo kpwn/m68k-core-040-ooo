@@ -1075,6 +1075,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         cold.pokeByte(x + b, 0x22)
       }
       var waitArWithTargetS0 = 0
+      var waitArWithAdvancingTargetS0 = 0
+      var waitArWithHeldTargetS0 = 0
       var wtB = 0
       var arBeforeB = 0
       var arValidBeforeB = 0
@@ -1083,11 +1085,22 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (lg.nb.st.indices.exists(k =>
-                lg.nb.st(k).toInt == 1 && lg.nb.line(k).toLong == (x >>> 4)) &&
-              lg.s0Valid.toBoolean && lg.s0Payload.paddr.toLong == x &&
-              lg.s0Payload.cacheMode.toEnum == CacheMode.WRITETHROUGH)
+          val targetLoadMshr = lg.nb.st.indices.exists(k =>
+            lg.nb.st(k).toInt == 1 && lg.nb.line(k).toLong == (x >>> 4) &&
+              !lg.nb.byStore(k).toBoolean)
+          if (targetLoadMshr && lg.s0Valid.toBoolean && lg.s0Payload.paddr.toLong == x &&
+              lg.s0Payload.cacheMode.toEnum == CacheMode.WRITETHROUGH) {
             waitArWithTargetS0 += 1
+            if (lg.s0Advance.toBoolean) {
+              waitArWithAdvancingTargetS0 += 1
+              assert(!lg.axiDh.ar.valid.toBoolean,
+                "normal AR was advertised while the older same-line WT advanced S0")
+            } else {
+              waitArWithHeldTargetS0 += 1
+              assert(!lg.axiDh.ar.valid.toBoolean,
+                "normal AR bypassed an older same-line WT held in S0")
+            }
+          }
           if (wtB < 3 && lg.axiDh.ar.valid.toBoolean) arValidBeforeB += 1
           if (lg.axiDh.ar.valid.toBoolean && lg.axiDh.ar.ready.toBoolean) {
             hotAr += 1
@@ -1131,12 +1144,16 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSampling(8)
       assert(waitArWithTargetS0 > 0,
         s"normal AR S0 exclusion was not exercised: WAIT_AR+S0=$waitArWithTargetS0")
+      assert(waitArWithHeldTargetS0 > 0,
+        "normal AR ordering check never reached a held older same-line S0 WT")
       assert(arValidBeforeB == 0, "normal AR was advertised while target WT occupied S0")
       awOpen = true
       var n = 0
       while ((response.isEmpty || wtB < 3) && n < 1000) { cd.waitSampling(); n += 1 }
       assert(wtB == 3 && arBeforeB == 0 && arValidBeforeB == 0 && hotAr == 1,
         s"normal AR crossed WT: B=$wtB earlyValid=$arValidBeforeB earlyFire=$arBeforeB AR=$hotAr")
+      assert(waitArWithAdvancingTargetS0 > 0,
+        "normal AR ordering check never reached a cycle where same-line S0 WT could advance")
       assert(response.exists(v => (v & BigInt("ffffffff", 16)) == BigInt("66666666", 16)),
         s"normal AR returned stale data across WT B: $response")
       println(s"[nbNormalS0] WAIT_AR+S0=$waitArWithTargetS0; B before AR; response=$response")
