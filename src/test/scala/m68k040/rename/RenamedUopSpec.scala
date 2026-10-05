@@ -9,7 +9,7 @@ class RenamedUopSpec extends AnyFunSuite {
     SpinalConfig().generateVerilog(new Component {
       val u = RenamedUop()
       assert(u.pdst.getWidth == 6 && u.psrcA.getWidth == 6 && u.pdstOld.getWidth == 6)
-      assert(u.pNzvcDst.getWidth == 4 && u.pXDst.getWidth == 4)
+      assert(u.pNzvcDst.getWidth == m68k040.Global.PHYS_NZVC_ID_W && u.pXDst.getWidth == m68k040.Global.PHYS_X_ID_W)
       val s = master(Stream(Vec(RenamedUop(), 2)))
       s.valid := False; s.payload.foreach(_.assignDontCare())
       val probe = out(Bool()); probe := s.payload(0).pdstValid
