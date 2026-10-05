@@ -650,6 +650,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
           !(s.dynWait & ~B(dataMask, DynWait.width bits)).orR
       })
     } else B(0, slotCount bits)
+    storeAddressReady.simPublic()
     val lsReady = lsFullyReady | storeAddressReady
     val cplxReady= B(slots.map(s => s.ready &&  isCplx(s.hot)))
     val hots = Vec(slots.map(_.hot))

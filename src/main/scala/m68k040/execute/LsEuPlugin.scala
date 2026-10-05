@@ -147,6 +147,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
                  val p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
                  val p1EarlyLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
                  val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
+                 /** See `ShippingCoreConfig.lsEarlyAnRetry`; effective only with
+                   * `earlyAutoAnWriteback`. */
+                 val earlyAnRetry: Boolean = m68k040.top.ShippingCoreConfig.lsEarlyAnRetry,
                  val lsOooIssue: Boolean = false,
                  val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
@@ -3108,7 +3111,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // otherwise the uop simply falls back to the existing completion write and wake.
     // Single assignment: a default `:= False` followed by an unconditional reassignment
     // is an assignment overlap SpinalHDL rejects outright.
-    val s1AnEarlyFire: Bool = if (!earlyAutoAnWriteback) False else {
+    // Sim-only taps (bench `[an-early]`): candidate vs fired, so a lost early An write
+    // can be counted. Pure observation; no logic depends on them.
+    val s1AnEarlyCandSim = Bool()
+    s1AnEarlyCandSim.simPublic()
+    val anEarlyWakePdst = UInt(6 bits)
+    val s1AnEarlyFire: Bool = if (!earlyAutoAnWriteback) {
+      s1AnEarlyCandSim := False; anEarlyWakePdst := u1.pdst; False } else {
       // THREE uop kinds write an int result that is an address computed from a register
       // plus a CONSTANT, with no dependence on the memory access, yet all three wait for
       // LS completion to write it:
@@ -3132,18 +3141,58 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
       // depend on S1, so reading them here is not a combinational loop.
       val compWritePending = compValid && compPdstValid && !compIsFault
       val compWakePending  = if (earlyIntWakeup) nextIntWake.valid else registeredIntWake
-      val fire = s1AnEarlyCandidate && !compWritePending && !compWakePending
-      anEarlyW.valid   := fire
-      anEarlyW.address := u1.pdst
-      anEarlyW.data    := s1EarlyVal
-      fire
+      val portFree = !compWritePending && !compWakePending
+      s1AnEarlyCandSim := s1AnEarlyCandidate
+      if (!earlyAnRetry) {
+        val fire = s1AnEarlyCandidate && portFree
+        anEarlyW.valid   := fire
+        anEarlyW.address := u1.pdst
+        anEarlyW.data    := s1EarlyVal
+        anEarlyWakePdst  := u1.pdst
+        fire
+      } else {
+        // ONE-ENTRY RETRY. A candidate that loses the port is parked here and re-tried
+        // on the next free cycle, instead of waiting for completion (a detached store
+        // completes only after its data capture). The parked write is the same value to
+        // the same renamed pdst, so it stays idempotent with the completion write, and
+        // a duplicate wake is already the norm (completion wakes after an early fire).
+        // LIFETIME: the entry must never fire once its pdst could be re-allocated. pdst
+        // is freed only at retire, after completion, and on flush; the entry is
+        // cleared on BOTH (the completion of its robId, and any LS flush/exception).
+        // The retry has priority over a new S1 candidate: in an `(An)+` chain the
+        // parked An is the OLDER one, and the newer candidate can be parked the same
+        // cycle the old entry drains.
+        val rValid = RegInit(False)
+        val rPdst  = Reg(UInt(6 bits))
+        val rData  = Reg(Bits(32 bits))
+        val rRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+        val retryFire = rValid && portFree
+        val fire = s1AnEarlyCandidate && portFree && !rValid
+        val park = s1AnEarlyCandidate && !fire && (!rValid || retryFire)
+        val doneByCompletion = rValid && compValid && compRobId === rRobId
+        when(retryFire || doneByCompletion) { rValid := False }
+        when(park) {
+          rValid := True; rPdst := u1.pdst; rData := s1EarlyVal; rRobId := s1Ctx.robId
+        }
+        when(sqFlushSig || excActive) { rValid := False }
+        anEarlyW.valid   := fire || retryFire
+        anEarlyW.address := Mux(retryFire, rPdst, u1.pdst)
+        anEarlyW.data    := Mux(retryFire, rData, s1EarlyVal)
+        anEarlyWakePdst  := Mux(retryFire, rPdst, u1.pdst)
+        rValid.simPublic(); retryFire.simPublic()
+        GenerationFlags.simulation {
+          assert(!(fire && retryFire), "early An retry collided with an S1 early write", FAILURE)
+        }
+        fire || retryFire
+      }
     }
 
     // The early An wake is exclusive with the completion wake by construction:
     // s1AnEarlyFire is gated on the completion wake being idle this cycle.
+    if (earlyAutoAnWriteback) s1AnEarlyFire.simPublic()
     wakeupPort.valid   := (if(earlyIntWakeup) nextIntWake.valid else registeredIntWake) ||
                           s1AnEarlyFire
-    wakeupPort.payload := Mux(s1AnEarlyFire, u1.pdst,
+    wakeupPort.payload := Mux(s1AnEarlyFire, anEarlyWakePdst,
                               (if(earlyIntWakeup) nextIntWake.payload else compPdst))
     GenerationFlags.simulation {
       val announced = RegNext(nextIntWake.valid) init False

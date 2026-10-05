@@ -892,7 +892,13 @@ trait CoreBenchHarness extends AnyFunSuite {
                                youngerReadyLoadPresent: Boolean, skidOccupied: Boolean,
                                selectFire: Boolean, selectLoadFire: Boolean,
                                selectParked: Boolean, bypassSelect: Boolean,
-                               euFire: Boolean)
+                               euFire: Boolean,
+                               // Head-store split (sim taps `storeAddressReady`, early An):
+                               headStoreAddrReady: Boolean = false, headStoreDynWait: Int = 0,
+                               headStoreTrig: Boolean = false, anCand: Boolean = false,
+                               anFire: Boolean = false, dispValid: Boolean = true,
+                               dispRobReady: Boolean = true, dispIqReady: Boolean = true,
+                               robOcc: Int = 0)
       val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
       val specWakeHisto = ArrayBuffer.empty[(Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
@@ -1133,6 +1139,36 @@ trait CoreBenchHarness extends AnyFunSuite {
       cd.onSamplings {
         telemCycle += 1
         missInj.onCycle()
+        // CLAUDE_TRACE=kernel:from:to -- steady-state per-cycle LS/store-chain trace.
+        sys.env.get("CLAUDE_TRACE").map(_.split(":")).foreach { case Array(kn, from, to) =>
+          if (k.name == kn && telemCycle >= from.toLong && telemCycle <= to.toLong) {
+            val ls = dut.lsEu.logic
+            val iqL = dut.iq.logic
+            val sar = iqL.storeAddressReady.toBigInt
+            val head = iqL.slots.zipWithIndex.filter { case (s, _) => s.sel.toBoolean &&
+              s.hot.cluster.toEnum == m68k040.isa.Cluster.LS &&
+              s.hot.memOp.toEnum != m68k040.isa.MemOp.NONE }.take(3).map { case (s, i) =>
+                val m = s.hot.memOp.toEnum.toString.take(2)
+                f"$m%s r${s.hot.robId.toInt}%d${if (s.ready.toBoolean) "R" else if (sar.testBit(i)) "a" else "-"}" +
+                  f"w${s.dynWait.toInt}%x" }.mkString(" ")
+            val iss = if (dut.lsEu.issuePort.valid.toBoolean && dut.lsEu.issuePort.ready.toBoolean) {
+              val p = dut.lsEu.issuePort.payload
+              s"ISS:${p.uop.memOp.toEnum.toString.take(2)}r${p.robId.toInt}" } else
+              (if (dut.lsEu.issuePort.valid.toBoolean) "issStall" else "")
+            val an = if (dut.lsEu.earlyAutoAnWriteback && ls.s1AnEarlyCandSim.toBoolean)
+              (if (ls.s1AnEarlyFire.toBoolean) "AN!" else "an-lost") else ""
+            val det = if (ls.detachedStoreValid.toBoolean) s"det(r${dut.lsEu.logic.detachedStore.get.ctx.robId.toInt}" +
+              s"${if (dut.lsEu.logic.detachedStore.get.captured.toBoolean) "C" else ""}" +
+              s"${if (!dut.lsEu.logic.detachedStore.get.reserveReady.toBoolean) " FULL" else ""})" else ""
+            val wk = if (ls.nextIntWake.valid.toBoolean) s"wake${ls.nextIntWake.payload.toInt}" else ""
+            println(f"CTRACE $telemCycle%6d [$head%-40s] $iss%-9s s1=${if (ls.s1Valid.toBoolean) 1 else 0} " +
+              s"p3=${if (ls.p3Valid.toBoolean) 1 else 0} p4=${if (ls.p4Valid.toBoolean) 1 else 0} $an $det $wk " +
+              s"cap=${if (ls.lateDataCapture.toBoolean) 1 else 0} rob=${dut.rob.logic.head.toInt}" +
+              s"/${dut.rob.logic.count.toInt} disp=${if (!dut.disp.logic.dispValidSim.toBoolean) "FE"
+                else if (!dut.disp.logic.dispRobReadySim.toBoolean) "ROBFULL"
+                else if (!dut.disp.logic.dispIqReadySim.toBoolean) "IQFULL" else "go"}")
+          }
+        case _ => }
         if (lsEventsOn && telemCycle <= 1400) {
           val ls = dut.lsEu.logic
           def event(s: String): Unit = println(s"LS_EVENT kernel=${k.name} cycle=$telemCycle $s")
@@ -1454,9 +1490,10 @@ trait CoreBenchHarness extends AnyFunSuite {
           k.retiredInstrs - countedMacros)
         val macrosThisCycle = scala.math.max(0, countedMacros + acceptedMacros - k.warmupInstrs) -
           scala.math.max(0, countedMacros - k.warmupInstrs)
-        val lsSlots = dut.iq.logic.slots.filter(s => s.sel.toBoolean &&
+        val lsSlotsIdx = dut.iq.logic.slots.zipWithIndex.filter { case (s, _) => s.sel.toBoolean &&
           s.hot.cluster.toEnum == m68k040.isa.Cluster.LS &&
-          (s.hot.memOp.toEnum != m68k040.isa.MemOp.NONE || s.hot.leaAddr.toBoolean))
+          (s.hot.memOp.toEnum != m68k040.isa.MemOp.NONE || s.hot.leaAddr.toBoolean) }
+        val lsSlots = lsSlotsIdx.map(_._1)
         val oldestBlocked = lsSlots.headOption.exists(s => !s.ready.toBoolean)
         val blockedStore = oldestBlocked &&
           lsSlots.head.hot.memOp.toEnum == m68k040.isa.MemOp.STORE
@@ -1468,7 +1505,17 @@ trait CoreBenchHarness extends AnyFunSuite {
           youngerReadyLoadPresent, dut.iq.logic.lsSkidValid.toBoolean,
           selectFire, dut.iq.logic.lsSelectLoadFire.toBoolean,
           dut.iq.logic.lsSelectParked.toBoolean, bypassSelect,
-          dut.iq.logic.lsEuFire.toBoolean)
+          dut.iq.logic.lsEuFire.toBoolean,
+          headStoreAddrReady = blockedStore &&
+            dut.iq.logic.storeAddressReady.toBigInt.testBit(lsSlotsIdx.head._2),
+          headStoreDynWait = if (blockedStore) lsSlots.head.dynWait.toInt else 0,
+          headStoreTrig = blockedStore && lsSlots.head.triggers.toBigInt != 0,
+          anCand = dut.lsEu.earlyAutoAnWriteback && dut.lsEu.logic.s1AnEarlyCandSim.toBoolean,
+          anFire = dut.lsEu.earlyAutoAnWriteback && dut.lsEu.logic.s1AnEarlyFire.toBoolean,
+          dispValid = dut.disp.logic.dispValidSim.toBoolean,
+          dispRobReady = dut.disp.logic.dispRobReadySim.toBoolean,
+          dispIqReady = dut.disp.logic.dispIqReadySim.toBoolean,
+          robOcc = dut.rob.logic.count.toInt)
         if (bypassSelect) lsBypassFires += 1
         // With speculative wakeup compiled out, both taps are constants that
         // Verilator may prune. Keep OFF control runs measurable without forcing
@@ -2058,6 +2105,23 @@ trait CoreBenchHarness extends AnyFunSuite {
         s"skidOccupied=${lsOrderWindow.count(_.skidOccupied)} " +
         s"lsSelectFire=${lsOrderWindow.count(_.selectFire)} " +
         s"lsEuFire=${lsOrderWindow.count(_.euFire)}")
+      locally {
+        val hs = lsOrderWindow.filter(_.oldestStoreUnready)
+        val notAddr = hs.filter(!_.headStoreAddrReady)
+        val waitHisto = notAddr.groupBy(_.headStoreDynWait).toSeq.sortBy(-_._2.size)
+          .map { case (w, v) => s"0x${w.toHexString}=${v.size}" }.mkString(",")
+        println(s"[store-head-window] scope=commit-window ${k.name} headStoreBlocked=${hs.size} " +
+          s"addrReadyDataPending=${hs.count(_.headStoreAddrReady)} notAddrReady=${notAddr.size} " +
+          s"notAddrStaticTrigger=${notAddr.count(_.headStoreTrig)} notAddrDynWait={$waitHisto} " +
+          s"anEarlyCand=${lsOrderWindow.count(_.anCand)} anEarlyFire=${lsOrderWindow.count(_.anFire)} " +
+          s"anEarlyLost=${lsOrderWindow.count(x => x.anCand && !x.anFire)}")
+        val w = lsOrderWindow
+        println(s"[dispatch-window] scope=commit-window ${k.name} cycles=${w.size} " +
+          s"frontendEmpty=${w.count(!_.dispValid)} robFull=${w.count(x => x.dispValid && !x.dispRobReady)} " +
+          s"iqFull=${w.count(x => x.dispValid && x.dispRobReady && !x.dispIqReady)} " +
+          s"dispatching=${w.count(x => x.dispValid && x.dispRobReady && x.dispIqReady)} " +
+          s"meanRob=${if (w.isEmpty) 0 else w.map(_.robOcc).sum.toDouble / w.size}")
+      }
       println(s"[spec-wake-window] scope=commit-window ${k.name} " +
         s"specAnnounceCycles=${specWakeWindow.count(_._1)} " +
         s"iqRecheckHeldCycles=${specWakeWindow.count(_._2)}")

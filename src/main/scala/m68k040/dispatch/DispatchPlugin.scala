@@ -3,6 +3,7 @@ package m68k040.dispatch
 import m68k040.services.{RenameUopService, RobAllocService}
 import m68k040.execute.iq.IssueQueueService
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.plugin.FiberPlugin
 
@@ -65,6 +66,10 @@ class DispatchPlugin(val detailedPerf: Boolean = false) extends FiberPlugin
       ready
     }.getOrElse(True)
     val fire = ren.uops.valid && rob.allocReady && iq.push.ready && memoryReady
+    // Sim-only dispatch-stall taps (bench `[dispatch-window]`); pure observation.
+    val dispValidSim = Bool(); dispValidSim := ren.uops.valid; dispValidSim.simPublic()
+    val dispRobReadySim = Bool(); dispRobReadySim := rob.allocReady; dispRobReadySim.simPublic()
+    val dispIqReadySim = Bool(); dispIqReadySim := iq.push.ready; dispIqReadySim.simPublic()
     val perfEvents = if (detailedPerf) Some(m68k040.services.PerfDetail.dispatchEvents(
       ren.uops.valid, rob.allocReady, iq.push.ready, ren.uop1Valid, memoryReady)) else None
     perfEventsWire.foreach(_ := perfEvents.get)

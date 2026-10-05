@@ -695,6 +695,7 @@ object GenSocketTopVerilog {
             s"lsP3FastLoad=${ShippingCoreConfig.lsP3FastLoad} " +
             s"lsP1EarlyLoad=${ShippingCoreConfig.lsP1EarlyLoad} " +
             s"lsFourCycleL1=${ShippingCoreConfig.lsFourCycleL1} " +
+            s"lsEarlyAnRetry=${ShippingCoreConfig.lsEarlyAnRetry} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

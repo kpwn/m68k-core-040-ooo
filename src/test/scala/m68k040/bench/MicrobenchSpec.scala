@@ -567,7 +567,7 @@ class MicrobenchSpec extends CoreBenchHarness {
       }
     }
     Kernel(s"single-fanout-stride$stride", src, setup.size + passes * perPass,
-      prepMem = prep, zeroFillData = true,
+      prepMem = prep, zeroFillData = true, profileRetirement = true,
       warmupInstrs = setup.size + perPass,
       verifyRetirement = obs => {
         def writes(reg: Int): Vector[Long] = obs.iterator

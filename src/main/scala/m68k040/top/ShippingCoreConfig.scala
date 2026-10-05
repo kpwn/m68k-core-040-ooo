@@ -494,6 +494,11 @@ object ShippingCoreConfig {
   val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false)
   /** Experimental paired P1 translation/VIPT launch for simple aligned MOVEA.L loads. */
   val lsP1EarlyLoad: Boolean = envFlag("CPU_LS_P1_EARLY_LOAD", false)
+  /** Experimental: a one-entry retry for an early An writeback (`earlyAutoAnWriteback`)
+    * that lost the shared LS write/wake port at S1. Without it the An falls back to
+    * completion, which for a detached `(An)+` store is AFTER its data capture -- tying the
+    * next store's address to the previous load's miss (memcpy trace, 2026-10-05). */
+  val lsEarlyAnRetry: Boolean = envFlag("CPU_LS_EARLY_AN_RETRY", false)
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
