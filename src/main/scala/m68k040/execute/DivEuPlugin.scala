@@ -63,7 +63,7 @@ case class MulPipeContext() extends Bundle {
   val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
-  val pNzvcDst    = UInt(4 bits)
+  val pNzvcDst    = UInt(m68k040.Global.PHYS_NZVC_ID_W bits)  // NZVC phys ID
   val writesNzvc  = Bool()
   val dstArch     = UInt(5 bits)
   val size        = Size()
@@ -94,7 +94,7 @@ case class BfPipeContext() extends Bundle {
   val robId       = UInt(m68k040.Global.ROB_ID_W bits)
   val pdst        = UInt(6 bits)
   val pdstValid   = Bool()
-  val pNzvcDst    = UInt(4 bits)
+  val pNzvcDst    = UInt(m68k040.Global.PHYS_NZVC_ID_W bits)  // NZVC phys ID
   val writesNzvc  = Bool()
   val dstArch     = UInt(5 bits)
 }
@@ -107,7 +107,7 @@ case class CplxResult() extends Bundle {
   val pdstValid   = Bool()
   val nzvc        = Bits(4 bits)
   val nzvcWrite   = Bool()
-  val pNzvcDst    = UInt(4 bits)
+  val pNzvcDst    = UInt(m68k040.Global.PHYS_NZVC_ID_W bits)  // NZVC phys ID
   val dstArch     = UInt(5 bits)
   val fault       = Bool()
   val faultVec    = UInt(8 bits)
@@ -276,7 +276,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     issuePort      = Stream(IqContext())
     completionPort = Flow(UInt(m68k040.Global.ROB_ID_W bits))
     wakeupPort     = Flow(UInt(6 bits))
-    wakeupNzvcPort = Flow(UInt(4 bits))
+    wakeupNzvcPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))
     euFaultPort    = Flow(EuFault()); euFaultPort.simPublic()
     flushSig       = Bool()
     // default-driven idle (allowOverride) so a standalone test that does not wire a

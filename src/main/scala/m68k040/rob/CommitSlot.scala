@@ -5,7 +5,8 @@ import spinal.core._
 /** One retired instruction's commit + free info: rename writes committed RAT, frees old pdsts. */
 case class CommitSlot() extends Bundle {
   val intArch  = UInt(5 bits); val intNew  = UInt(6 bits); val intOld  = UInt(6 bits); val intWrite  = Bool()
-  val nzvcNew  = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
+  // NZVC phys-register IDs (NOT flag values): width = log2Up(CPU_PHYS_NZVC).
+  val nzvcNew  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcOld = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcWrite = Bool()
   val xNew     = UInt(4 bits); val xOld    = UInt(4 bits); val xWrite    = Bool()
   // FP data (8 arch FP0-FP7, 16 physical) + FPCC (N/Z/I/NAN, archDepth=1) commit
   // info -- mirrors intArch/intNew/intOld/intWrite and nzvcNew/nzvcOld/nzvcWrite

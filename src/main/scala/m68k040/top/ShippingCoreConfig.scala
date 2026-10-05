@@ -499,6 +499,14 @@ object ShippingCoreConfig {
     * completion, which for a detached `(An)+` store is AFTER its data capture -- tying the
     * next store's address to the previous load's miss (memcpy trace, 2026-10-05). */
   val lsEarlyAnRetry: Boolean = envFlag("CPU_LS_EARLY_AN_RETRY", false)
+  /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
+    * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
+    * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
+    * experimental arm (`CPU_PHYS_NZVC=32`). This is the ONE source: `Global.
+    * PHYS_NZVC_REGS_DEFAULT` -> `M68kParams.physNzvc` -> `Global.PHYS_NZVC_REGS`, and every
+    * NZVC phys-ID width is `log2Up` of it. Echoed in `SHIPPING_CONFIG`. */
+  val physNzvc: Int = envInt("CPU_PHYS_NZVC", 16, 16, 32)
+  require(physNzvc == 16 || physNzvc == 32, s"CPU_PHYS_NZVC must be 16 or 32 (got $physNzvc)")
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */

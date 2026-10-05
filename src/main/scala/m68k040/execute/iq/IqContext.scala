@@ -54,7 +54,8 @@ object FourCycleLoadForm {
   * re-merging hot fields over cold ones. */
 case class IqHot() extends Bundle {
   val intW  = 6
-  val flagW = 4
+  val nzvcW = m68k040.Global.PHYS_NZVC_ID_W  // NZVC phys-ID width (CPU_PHYS_NZVC)
+  val xW    = 4                               // X phys-ID width (16 physical)
   val fpW   = 4
 
   // ---- Wakeup-CAM sources. Compared against every wakeup broadcast, for every slot,
@@ -63,8 +64,8 @@ case class IqHot() extends Bundle {
   val psrcA    = UInt(intW bits);  val psrcAValid    = Bool()
   val psrcB    = UInt(intW bits);  val psrcBValid    = Bool()
   val psrcC    = UInt(intW bits);  val psrcCValid    = Bool()
-  val pNzvcSrc = UInt(flagW bits); val readsNzvc     = Bool()
-  val pXSrc    = UInt(flagW bits); val readsX        = Bool()
+  val pNzvcSrc = UInt(nzvcW bits); val readsNzvc     = Bool()
+  val pXSrc    = UInt(xW bits); val readsX        = Bool()
   val pFpSrcA  = UInt(fpW bits);   val psrcAFpValid  = Bool()
   val pFpSrcB  = UInt(fpW bits);   val psrcBFpValid  = Bool()
   val pFpccSrc = UInt(fpW bits);   val readsFpcc     = Bool()
@@ -134,8 +135,8 @@ case class IqHot() extends Bundle {
   // preserves task #219 Fix 2 exactly: that clear still reads a plain flop, never a
   // memory, so no LUTRAM level is added to the sb*_busy cone it was created to shorten. ----
   val pdst     = UInt(intW bits);  val pdstValid   = Bool()
-  val pNzvcDst = UInt(flagW bits); val writesNzvc  = Bool()
-  val pXDst    = UInt(flagW bits); val writesX     = Bool()
+  val pNzvcDst = UInt(nzvcW bits); val writesNzvc  = Bool()
+  val pXDst    = UInt(xW bits); val writesX     = Bool()
   val pFpDst   = UInt(fpW bits);   val pFpDstValid = Bool()
   val pFpccDst = UInt(fpW bits);   val writesFpcc  = Bool()
 
@@ -200,7 +201,7 @@ case class IqHot() extends Bundle {
   * which write only an int reg, a shift also writes the flag PRFs — hence the bundle.) */
 case class AluSlowWakeup() extends Bundle {
   val pdst      = UInt(6 bits); val pdstValid = Bool()
-  val pNzvcDst  = UInt(4 bits); val nzvcValid = Bool()
+  val pNzvcDst  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcValid = Bool()
   val pXDst     = UInt(4 bits); val xValid     = Bool()
 }
 

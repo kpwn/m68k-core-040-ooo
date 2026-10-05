@@ -138,9 +138,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     flushSignal   = Bool()
     lsWakeupPort  = Flow(UInt(6 bits))   // carries a completed-load pdst
     lsWakeupSpecPort = Flow(UInt(6 bits)) // carries a PREDICTED-next-cycle load pdst
-    lsNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed NZVC-writing-store pNzvcDst
+    lsNzvcWakeupPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits)) // carries a completed NZVC-writing-store pNzvcDst
     cplxWakeupPort= Flow(UInt(6 bits))   // carries a completed-DIV pdst
-    cplxNzvcWakeupPort = Flow(UInt(4 bits)) // carries a completed CPLX flag-writer's pNzvcDst (task #167)
+    cplxNzvcWakeupPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits)) // carries a completed CPLX flag-writer's pNzvcDst (task #167)
     // ONE slow-shift wakeup per ALU EU (2): each carries a completed shift's int+NZVC+X.
     aluSlowWakeupPorts = Vec.fill(2)(Flow(AluSlowWakeup()))
     cplxFpWakeupPort   = Flow(UInt(4 bits)) // a completed FP op's pFpDst   (4-bit FP tag)
@@ -158,19 +158,19 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     lsWakeupSpecPort.payload.allowOverride; lsWakeupSpecPort.payload := U(0, 6 bits)
     lsWakeupSpecPort.simPublic()
     lsNzvcWakeupPort.valid.allowOverride;   lsNzvcWakeupPort.valid   := False
-    lsNzvcWakeupPort.payload.allowOverride; lsNzvcWakeupPort.payload := U(0, 4 bits)
+    lsNzvcWakeupPort.payload.allowOverride; lsNzvcWakeupPort.payload := U(0, m68k040.Global.PHYS_NZVC_ID_W bits)
     lsNzvcWakeupPort.simPublic()
     cplxWakeupPort.valid.allowOverride;   cplxWakeupPort.valid   := False
     cplxWakeupPort.payload.allowOverride; cplxWakeupPort.payload := U(0, 6 bits)
     cplxWakeupPort.simPublic()
     cplxNzvcWakeupPort.valid.allowOverride;   cplxNzvcWakeupPort.valid   := False
-    cplxNzvcWakeupPort.payload.allowOverride; cplxNzvcWakeupPort.payload := U(0, 4 bits)
+    cplxNzvcWakeupPort.payload.allowOverride; cplxNzvcWakeupPort.payload := U(0, m68k040.Global.PHYS_NZVC_ID_W bits)
     cplxNzvcWakeupPort.simPublic()
     aluSlowWakeupPorts.foreach { p =>
       p.valid.allowOverride; p.valid := False
       p.payload.allowOverride
       p.payload.pdst := U(0, 6 bits); p.payload.pdstValid := False
-      p.payload.pNzvcDst := U(0, 4 bits); p.payload.nzvcValid := False
+      p.payload.pNzvcDst := U(0, p.payload.pNzvcDst.getWidth bits); p.payload.nzvcValid := False
       p.payload.pXDst := U(0, 4 bits); p.payload.xValid := False
       p.simPublic()
     }
@@ -411,7 +411,17 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       s"${m68k040.execute.regfile.RegfileSpec.Int.depth} (the int PRF Mem). All three MUST " +
       s"be equal -- see Global.PHYS_INT_REGS_DEFAULT.")
     val sbInt  = new Scoreboard(physIntN) // int physregs
-    val sbNzvc = new Scoreboard(16) // NZVC flag physregs (width 4)
+    // NZVC pool size: the same single source as RenameStage.nzvcFree and RegfileSpec.Nzvc
+    // (Global.PHYS_NZVC_REGS_DEFAULT, env CPU_PHYS_NZVC). Bitmaps narrower than the pool
+    // would drop busy bits for the high ids -- the silent wrong-operand class above.
+    val physNzvcN = m68k040.Global.PHYS_NZVC_REGS.get
+    require(physNzvcN == m68k040.Global.PHYS_NZVC_REGS_DEFAULT &&
+            physNzvcN == m68k040.execute.regfile.RegfileSpec.Nzvc.depth &&
+            log2Up(physNzvcN) == m68k040.Global.PHYS_NZVC_ID_W,
+      s"NZVC physical-register pool disagreement: Global.PHYS_NZVC_REGS=$physNzvcN, " +
+      s"PHYS_NZVC_REGS_DEFAULT=${m68k040.Global.PHYS_NZVC_REGS_DEFAULT}, " +
+      s"RegfileSpec.Nzvc.depth=${m68k040.execute.regfile.RegfileSpec.Nzvc.depth}")
+    val sbNzvc = new Scoreboard(physNzvcN) // NZVC flag physregs (width PHYS_NZVC_ID_W)
     sbNzvc.busy.simPublic()  // debug-only (task #141)
     val sbX    = new Scoreboard(16) // X flag physregs (width 4)
     sbX.busy.simPublic(); sbX.physToPosition.simPublic()
@@ -454,7 +464,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // loop near the bottom of this file (declared here purely so `trigInit`, which is
     // elaborated earlier, can read the bypassed value).
     val sbIntClr  = Bits(physIntN bits); sbIntClr  := 0
-    val sbNzvcClr = Bits(16 bits);       sbNzvcClr := 0
+    val sbNzvcClr = Bits(physNzvcN bits); sbNzvcClr := 0
     val sbXClr    = Bits(16 bits);       sbXClr    := 0
     val sbFpClr   = Bits(16 bits);       sbFpClr   := 0
     val sbFpccClr = Bits(16 bits);       sbFpccClr := 0
@@ -477,7 +487,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // is held NOT-ready until lsNzvcWakeup(p). SEPARATE from sbNzvc (static latency-1): an
     // LS NZVC producer issues on the LS port and generates NO static ALU/branch event, so
     // a static sbNzvc trigger on it would never clear (it would hang the reader).
-    val lsNzvcBusy = Reg(Bits(16 bits)) init 0
+    val lsNzvcBusy = Reg(Bits(physNzvcN bits)) init 0
     lsNzvcBusy.simPublic()  // debug-only (task #139 seed=3 CCR investigation)
     // cplxBusy[p] => int physreg p is produced by an in-flight (not-yet-completed)
     // multi-cycle DIV. A consumer reading it is held NOT-ready until cplxWakeup(p).
@@ -490,14 +500,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // (its busy bit is force-cleared at ISSUE time by the task #141 clear loop below, long
     // before a multi-cycle DIV/MUL's real flag writeback lands, exposing a stale-flag read
     // by any immediately-following Bcc/flag-consumer).
-    val cplxNzvcBusy = Reg(Bits(16 bits)) init 0
+    val cplxNzvcBusy = Reg(Bits(physNzvcN bits)) init 0
     cplxNzvcBusy.simPublic()  // debug-only (task #167 IQ-NZVC trace)
     // SLOW-ALU dynamic-completion scoreboards: one per reg class the
     // shift writes (int dst + NZVC + X). A consumer reading any of these is held NOT-
     // ready until the matching aluSlowWakeup. SEPARATE from the static sbInt/sbNzvc/sbX
     // (latency-1) so a slow producer gets NO static trigger (it wakes at S3).
     val aluSlowIntBusy  = Reg(Bits(physIntN bits)) init 0
-    val aluSlowNzvcBusy = Reg(Bits(16 bits)) init 0
+    val aluSlowNzvcBusy = Reg(Bits(physNzvcN bits)) init 0
     val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
     lateStorePorts.foreach { p =>
       p.queryReady := !(lsBusy | cplxBusy | aluSlowIntBusy)(p.queryTag)

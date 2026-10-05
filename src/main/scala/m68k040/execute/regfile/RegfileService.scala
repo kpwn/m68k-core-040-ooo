@@ -18,7 +18,7 @@ object RegfileSpec {
   // than restated, so the PRF can never again be a different size from the pool rename
   // allocates out of.
   val Int  = RegfileSpec("int",  32, m68k040.Global.PHYS_INT_REGS_DEFAULT)
-  val Nzvc = RegfileSpec("nzvc", 4,  16)
+  val Nzvc = RegfileSpec("nzvc", 4,  m68k040.Global.PHYS_NZVC_REGS_DEFAULT)
   val X    = RegfileSpec("x",    1,  16)
   val Fp   = RegfileSpec("fp",   80, 16)
   // FPCC {NaN,I,Z,N} value storage for the FPCC rename class (RenameStage's

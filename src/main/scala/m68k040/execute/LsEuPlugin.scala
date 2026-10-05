@@ -353,7 +353,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     sqCommitBPort.payload.allowOverride; sqCommitBPort.payload := U(0, m68k040.Global.ROB_ID_W_DEFAULT bits)
     sqFlushSig     = Bool()
     wakeupPort     = Flow(UInt(6 bits))
-    wakeupNzvcPort = Flow(UInt(4 bits))   // pNzvcDst of a completing NZVC-writing LS op
+    wakeupNzvcPort = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))   // pNzvcDst of a completing NZVC-writing LS op
     wakeupSpecPort = Flow(UInt(6 bits))   // pdst of a load PREDICTED to write back next cycle
     wakeupSpecPort.simPublic()
     wakeupSpecP3Port = Flow(UInt(6 bits))
@@ -2214,7 +2214,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     nextIntWake.payload := 0
     // Same irrevocable selected-completion contract, independently selectable.
     // Flag data stays in compNzvc; this port carries readiness and identity only.
-    val nextNzvcWake = Flow(UInt(4 bits))
+    val nextNzvcWake = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))
     nextNzvcWake.valid := False
     nextNzvcWake.payload := 0
     val compRobId     = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))

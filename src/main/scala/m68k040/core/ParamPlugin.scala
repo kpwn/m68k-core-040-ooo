@@ -24,6 +24,12 @@ class ParamPlugin(p: M68kParams) extends FiberPlugin {
       "depth at Global.ROB_DEPTH_DEFAULT.")
     Global.ROB_DEPTH.set(p.robDepth)
     Global.PHYS_INT_REGS.set(p.physInt)
+    // Same guard shape as the ROB depth above: NZVC phys-ID fields in bundles built
+    // outside a plugin host are sized from Global.PHYS_NZVC_ID_W, so a disagreeing
+    // physNzvc would hand out IDs those fields silently truncate (aliasing two flag regs).
+    require(p.physNzvc == Global.PHYS_NZVC_REGS_DEFAULT,
+      s"NZVC pool disagreement: M68kParams.physNzvc=${p.physNzvc} but " +
+      s"Global.PHYS_NZVC_REGS_DEFAULT=${Global.PHYS_NZVC_REGS_DEFAULT} -- set CPU_PHYS_NZVC instead.")
     Global.PHYS_NZVC_REGS.set(p.physNzvc)
     Global.PHYS_X_REGS.set(p.physX)
     Global.DECODE_WIDTH.set(p.decodeWidth)

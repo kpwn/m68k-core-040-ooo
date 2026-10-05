@@ -27,7 +27,7 @@ case class M68kParams(
     // nothing had changed.
     robDepth:     Int = Global.ROB_DEPTH_DEFAULT,
     physInt:      Int = Global.PHYS_INT_REGS_DEFAULT,
-    physNzvc:     Int = 16,
+    physNzvc:     Int = Global.PHYS_NZVC_REGS_DEFAULT,
     physX:        Int = 16,
     intRsDepth:   Int = 8,
     eaRsDepth:    Int = 8,

@@ -8,7 +8,8 @@ import spinal.core._
   * pdstOld/pNzvcOld/pXOld are the previous mappings, carried for commit-time free. */
 case class RenamedUop() extends Bundle {
   val intW  = 6   // log2Up(PHYS_INT_REGS=48)
-  val flagW = 4   // log2Up(PHYS_NZVC_REGS=16) = log2Up(PHYS_X_REGS=16)
+  val nzvcW = m68k040.Global.PHYS_NZVC_ID_W  // log2Up(PHYS_NZVC_REGS) -- 4 (16) or 5 (32)
+  val xW    = 4   // log2Up(PHYS_X_REGS=16) -- X stays 16 physical
   val fpW   = 4   // log2Up(16) -- FP data and FPCC both have 16 physical entries
   val valid        = Bool()
   val pc           = UInt(32 bits)
@@ -191,10 +192,10 @@ case class RenamedUop() extends Bundle {
   // All other µops leave psrcCValid=False.
   val psrcC = UInt(intW bits); val psrcCValid = Bool()
   val pdst  = UInt(intW bits); val pdstValid  = Bool(); val pdstOld = UInt(intW bits)
-  val pNzvcSrc = UInt(flagW bits); val readsNzvc  = Bool()
-  val pNzvcDst = UInt(flagW bits); val writesNzvc = Bool(); val pNzvcOld = UInt(flagW bits)
-  val pXSrc    = UInt(flagW bits); val readsX     = Bool()
-  val pXDst    = UInt(flagW bits); val writesX    = Bool(); val pXOld   = UInt(flagW bits)
+  val pNzvcSrc = UInt(nzvcW bits); val readsNzvc  = Bool()
+  val pNzvcDst = UInt(nzvcW bits); val writesNzvc = Bool(); val pNzvcOld = UInt(nzvcW bits)
+  val pXSrc    = UInt(xW bits); val readsX     = Bool()
+  val pXDst    = UInt(xW bits); val writesX    = Bool(); val pXOld   = UInt(xW bits)
   // FP data rename (Decision 6: 8 arch FP0-FP7, 16 physical, 4-bit tags). FMOVE
   // <ea>,FPn / FPn,<ea> only ever populate srcA (never srcB); srcB is reserved for
   // the dyadic FADD/FSUB/FMUL/FDIV FPn,FPn/FPm forms. No decode path drives these
