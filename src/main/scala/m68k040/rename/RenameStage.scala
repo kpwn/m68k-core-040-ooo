@@ -174,6 +174,9 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
     // twice. Nothing downstream needs rename to advance in order to retire, so this
     // cannot deadlock; see RobPlugin's `earlyPend` doc comment for the full argument.
     val allocHalt = Bool(); allocHalt.allowOverride; allocHalt := False
+    // Sim-only taps (bench `[rename-window]`): decoded uops waiting at rename.
+    val duValidSim = Bool(); duValidSim := du.uops.valid
+    spinal.core.sim.SimPublic(duValidSim, allocHalt)
     uopsPort.valid := du.uops.valid && initDone && freeReady && !allocHalt
     du.uops.ready  := initDone && uopsPort.ready && freeReady && !allocHalt
     val fire = du.uops.fire

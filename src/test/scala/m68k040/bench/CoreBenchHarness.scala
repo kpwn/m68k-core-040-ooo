@@ -898,7 +898,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                                headStoreTrig: Boolean = false, anCand: Boolean = false,
                                anFire: Boolean = false, dispValid: Boolean = true,
                                dispRobReady: Boolean = true, dispIqReady: Boolean = true,
-                               robOcc: Int = 0)
+                               robOcc: Int = 0, duValid: Boolean = false, renStall: Int = 0)
       val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
       val specWakeHisto = ArrayBuffer.empty[(Boolean, Boolean)]
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
@@ -1515,7 +1515,17 @@ trait CoreBenchHarness extends AnyFunSuite {
           dispValid = dut.disp.logic.dispValidSim.toBoolean,
           dispRobReady = dut.disp.logic.dispRobReadySim.toBoolean,
           dispIqReady = dut.disp.logic.dispIqReadySim.toBoolean,
-          robOcc = dut.rob.logic.count.toInt)
+          robOcc = dut.rob.logic.count.toInt,
+          duValid = dut.ren.logic.duValidSim.toBoolean,
+          renStall = {
+            val r = dut.ren.logic
+            (if (!r.intFree.io.popReady.toBoolean) 1 else 0) |
+            (if (!r.nzvcFree.io.popReady.toBoolean) 2 else 0) |
+            (if (!r.xFree.io.popReady.toBoolean) 4 else 0) |
+            (if (!r.fpFree.io.popReady.toBoolean) 8 else 0) |
+            (if (!r.fpccFree.io.popReady.toBoolean) 16 else 0) |
+            (if (r.allocHalt.toBoolean) 32 else 0)
+          })
         if (bypassSelect) lsBypassFires += 1
         // With speculative wakeup compiled out, both taps are constants that
         // Verilator may prune. Keep OFF control runs measurable without forcing
@@ -2121,6 +2131,12 @@ trait CoreBenchHarness extends AnyFunSuite {
           s"iqFull=${w.count(x => x.dispValid && x.dispRobReady && !x.dispIqReady)} " +
           s"dispatching=${w.count(x => x.dispValid && x.dispRobReady && x.dispIqReady)} " +
           s"meanRob=${if (w.isEmpty) 0 else w.map(_.robOcc).sum.toDouble / w.size}")
+        val fe = w.filter(!_.dispValid)
+        def n(bit: Int) = fe.count(x => (x.renStall & bit) != 0)
+        println(s"[rename-window] scope=commit-window ${k.name} frontendEmpty=${fe.size} " +
+          s"noDecodedUop=${fe.count(!_.duValid)} decodedButRenameBlocked=${fe.count(_.duValid)} " +
+          s"intFreeEmpty=${n(1)} nzvcFreeEmpty=${n(2)} xFreeEmpty=${n(4)} fpFreeEmpty=${n(8)} " +
+          s"fpccFreeEmpty=${n(16)} allocHalt=${n(32)}")
       }
       println(s"[spec-wake-window] scope=commit-window ${k.name} " +
         s"specAnnounceCycles=${specWakeWindow.count(_._1)} " +
