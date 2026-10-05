@@ -146,6 +146,13 @@ object Global {
   val PHYS_NZVC_ID_W: Int = log2Up(PHYS_NZVC_REGS_DEFAULT)
   /** Producer: ParamPlugin (from M68kParams.physNzvc == PHYS_NZVC_REGS_DEFAULT). */
   val PHYS_NZVC_REGS  = Database.blocking[Int]()
+  /** Physical X (extend flag) pool size, single-sourced from `ShippingCoreConfig.physX`
+    * (env `CPU_PHYS_X`, 16 or 32) -- exactly the NZVC arrangement above. Bundles built
+    * outside a plugin host size X phys-ID fields from `PHYS_X_ID_W`; ParamPlugin requires
+    * `M68kParams.physX` to equal this. X VALUES are 1 bit and never use it. */
+  val PHYS_X_REGS_DEFAULT: Int = m68k040.top.ShippingCoreConfig.physX
+  val PHYS_X_ID_W: Int = log2Up(PHYS_X_REGS_DEFAULT)
+  /** Producer: ParamPlugin (from M68kParams.physX == PHYS_X_REGS_DEFAULT). */
   val PHYS_X_REGS     = Database.blocking[Int]()
   val DECODE_WIDTH    = Database.blocking[Int]()
   val RETIRE_WIDTH    = Database.blocking[Int]()

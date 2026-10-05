@@ -697,6 +697,7 @@ object GenSocketTopVerilog {
             s"lsFourCycleL1=${ShippingCoreConfig.lsFourCycleL1} " +
             s"lsEarlyAnRetry=${ShippingCoreConfig.lsEarlyAnRetry} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
+            s"physX=${ShippingCoreConfig.physX} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

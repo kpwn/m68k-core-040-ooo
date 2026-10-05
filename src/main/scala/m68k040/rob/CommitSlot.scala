@@ -7,7 +7,8 @@ case class CommitSlot() extends Bundle {
   val intArch  = UInt(5 bits); val intNew  = UInt(6 bits); val intOld  = UInt(6 bits); val intWrite  = Bool()
   // NZVC phys-register IDs (NOT flag values): width = log2Up(CPU_PHYS_NZVC).
   val nzvcNew  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcOld = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcWrite = Bool()
-  val xNew     = UInt(4 bits); val xOld    = UInt(4 bits); val xWrite    = Bool()
+  // X phys-register IDs (NOT the 1-bit X value): width = log2Up(CPU_PHYS_X).
+  val xNew     = UInt(m68k040.Global.PHYS_X_ID_W bits); val xOld    = UInt(m68k040.Global.PHYS_X_ID_W bits); val xWrite    = Bool()
   // FP data (8 arch FP0-FP7, 16 physical) + FPCC (N/Z/I/NAN, archDepth=1) commit
   // info -- mirrors intArch/intNew/intOld/intWrite and nzvcNew/nzvcOld/nzvcWrite
   // exactly. fpArchDst is the architectural FP dest reg (0..7) for the FP RAT

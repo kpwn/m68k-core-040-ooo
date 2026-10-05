@@ -31,6 +31,10 @@ class ParamPlugin(p: M68kParams) extends FiberPlugin {
       s"NZVC pool disagreement: M68kParams.physNzvc=${p.physNzvc} but " +
       s"Global.PHYS_NZVC_REGS_DEFAULT=${Global.PHYS_NZVC_REGS_DEFAULT} -- set CPU_PHYS_NZVC instead.")
     Global.PHYS_NZVC_REGS.set(p.physNzvc)
+    // X twin of the NZVC guard above.
+    require(p.physX == Global.PHYS_X_REGS_DEFAULT,
+      s"X pool disagreement: M68kParams.physX=${p.physX} but " +
+      s"Global.PHYS_X_REGS_DEFAULT=${Global.PHYS_X_REGS_DEFAULT} -- set CPU_PHYS_X instead.")
     Global.PHYS_X_REGS.set(p.physX)
     Global.DECODE_WIDTH.set(p.decodeWidth)
     Global.RETIRE_WIDTH.set(p.retireWidth)

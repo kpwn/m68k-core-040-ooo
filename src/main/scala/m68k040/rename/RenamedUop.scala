@@ -9,7 +9,7 @@ import spinal.core._
 case class RenamedUop() extends Bundle {
   val intW  = 6   // log2Up(PHYS_INT_REGS=48)
   val nzvcW = m68k040.Global.PHYS_NZVC_ID_W  // log2Up(PHYS_NZVC_REGS) -- 4 (16) or 5 (32)
-  val xW    = 4   // log2Up(PHYS_X_REGS=16) -- X stays 16 physical
+  val xW    = m68k040.Global.PHYS_X_ID_W     // log2Up(PHYS_X_REGS) -- 4 (16) or 5 (32)
   val fpW   = 4   // log2Up(16) -- FP data and FPCC both have 16 physical entries
   val valid        = Bool()
   val pc           = UInt(32 bits)

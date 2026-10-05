@@ -218,7 +218,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val archRegId  = UInt(5 bits)
     val intNew     = UInt(6 bits); val intOld = UInt(6 bits); val intWrite = Bool()
     val nzvcNew    = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcOld = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcWrite = Bool()  // phys IDs
-    val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
+    val xNew       = UInt(m68k040.Global.PHYS_X_ID_W bits); val xOld = UInt(m68k040.Global.PHYS_X_ID_W bits); val xWrite = Bool()  // phys IDs
     // FP data + FPCC commit/free info -- the EXACT analog of the int (archRegId/intNew/
     // intOld/intWrite) and NZVC/X (nzvcNew/nzvcOld/nzvcWrite) groups above, and required
     // for the same reason: `CommitSlot` carries these to RenameStage's fpRat commit port

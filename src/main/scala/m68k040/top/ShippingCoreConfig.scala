@@ -507,6 +507,13 @@ object ShippingCoreConfig {
     * NZVC phys-ID width is `log2Up` of it. Echoed in `SHIPPING_CONFIG`. */
   val physNzvc: Int = envInt("CPU_PHYS_NZVC", 16, 16, 32)
   require(physNzvc == 16 || physNzvc == 32, s"CPU_PHYS_NZVC must be 16 or 32 (got $physNzvc)")
+  /** Physical X (extend flag) register pool size -- the X twin of `physNzvc`, and the
+    * next binding freelist once NZVC is 32. 16 is the shipping default; 32 is the
+    * experimental arm (`CPU_PHYS_X=32`). ONE source: `Global.PHYS_X_REGS_DEFAULT` ->
+    * `M68kParams.physX` -> `Global.PHYS_X_REGS`; every X phys-ID width is `log2Up` of it.
+    * X VALUES are 1 bit and never use it. Echoed in `SHIPPING_CONFIG`. */
+  val physX: Int = envInt("CPU_PHYS_X", 16, 16, 32)
+  require(physX == 16 || physX == 32, s"CPU_PHYS_X must be 16 or 32 (got $physX)")
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
