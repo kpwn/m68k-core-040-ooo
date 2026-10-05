@@ -217,7 +217,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val predNextPc = UInt(32 bits)
     val archRegId  = UInt(5 bits)
     val intNew     = UInt(6 bits); val intOld = UInt(6 bits); val intWrite = Bool()
-    val nzvcNew    = UInt(4 bits); val nzvcOld = UInt(4 bits); val nzvcWrite = Bool()
+    val nzvcNew    = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcOld = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcWrite = Bool()  // phys IDs
     val xNew       = UInt(4 bits); val xOld = UInt(4 bits); val xWrite = Bool()
     // FP data + FPCC commit/free info -- the EXACT analog of the int (archRegId/intNew/
     // intOld/intWrite) and NZVC/X (nzvcNew/nzvcOld/nzvcWrite) groups above, and required

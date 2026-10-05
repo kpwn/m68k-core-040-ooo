@@ -1,6 +1,7 @@
 package m68k040
 
 import spinal.lib.misc.database.Database
+import spinal.core.log2Up
 
 /** Single registry of Database keys. INVARIANT #3: every key has exactly one
   * producer plugin (documented in the comment). `blocking` keys make readers
@@ -134,6 +135,16 @@ object Global {
     * grow, which is the direction that is SAFE (a pool smaller than the bitmaps/PRF wastes
     * ids; a pool larger than them is the silent wrong-operand bug described above). */
   val PHYS_INT_REGS_DEFAULT: Int = 54
+  /** The physical NZVC pool size, single-sourced from `ShippingCoreConfig.physNzvc`
+    * (env `CPU_PHYS_NZVC`, 16 or 32). Bundles elaborated OUTSIDE a plugin host
+    * (`RenamedUop`, `IqContext`, `CommitSlot`, the wakeup payloads, `RegfileSpec.Nzvc`)
+    * size their NZVC phys-ID fields from `PHYS_NZVC_ID_W` below; `ParamPlugin` requires
+    * `M68kParams.physNzvc` to equal this, exactly as it does for the ROB depth, so a
+    * too-narrow ID (two physical registers aliasing) cannot elaborate. NOTE: these are
+    * phys-register IDs -- NZVC flag VALUES are always 4 bits and never use this. */
+  val PHYS_NZVC_REGS_DEFAULT: Int = m68k040.top.ShippingCoreConfig.physNzvc
+  val PHYS_NZVC_ID_W: Int = log2Up(PHYS_NZVC_REGS_DEFAULT)
+  /** Producer: ParamPlugin (from M68kParams.physNzvc == PHYS_NZVC_REGS_DEFAULT). */
   val PHYS_NZVC_REGS  = Database.blocking[Int]()
   val PHYS_X_REGS     = Database.blocking[Int]()
   val DECODE_WIDTH    = Database.blocking[Int]()

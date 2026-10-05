@@ -33,7 +33,7 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
     // ── RATs (int RAT: 4 srcA/B reads + 2 srcC reads + 2 dst-old reads = 8 ports) ──
     // srcC is the DIVU.L/DIVS.L 64/32 dividend-high (Dr) source (per slot).
     val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = mapCommitWidth, readPorts = 8, prepared = preparedRetirement)
-    val nzvcRat = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
+    val nzvcRat = RatTable(physIdWidth = m68k040.Global.PHYS_NZVC_ID_W, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
     val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
     // FP data RAT (8 arch FP0-FP7, 16 physical). Read-port budget (6): FP macro-ops
     // need at most 2 sources (dyadic FADD/FSUB/FMUL/FDIV) + 1 dst-old read (freelist
@@ -69,7 +69,12 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
     // producer's consumers issue before it has written — a wrong operand with no fault.
     // See Global.PHYS_INT_REGS_DEFAULT for the full note and the two times this shipped.
     val intFree  = Freelist(physCount = m68k040.Global.PHYS_INT_REGS_DEFAULT, archCount = m68k040.isa.Isa.ARCH_INT_REGS, popPorts = 2, pushPorts = retireWidth)
-    val nzvcFree = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
+    // NZVC pool: single-sourced from Global.PHYS_NZVC_REGS_DEFAULT (CPU_PHYS_NZVC, 16|32),
+    // the same constant the NZVC PRF depth (RegfileSpec.Nzvc), the IQ NZVC scoreboard/busy
+    // bitmaps and every NZVC phys-ID field (PHYS_NZVC_ID_W) derive from -- see intFree.
+    val nzvcFree = Freelist(physCount = m68k040.Global.PHYS_NZVC_REGS_DEFAULT, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
+    require(nzvcFree.idW == m68k040.Global.PHYS_NZVC_ID_W && nzvcRat.physIdWidth == m68k040.Global.PHYS_NZVC_ID_W,
+      s"NZVC id width mismatch: freelist ${nzvcFree.idW}, RAT ${nzvcRat.physIdWidth}, Global ${m68k040.Global.PHYS_NZVC_ID_W}")
     val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
     val fpFree   = Freelist(physCount = 16, archCount = 8, popPorts = 2, pushPorts = retireWidth)
     val fpccFree = Freelist(physCount = 16, archCount = 1, popPorts = 2, pushPorts = retireWidth)
@@ -375,8 +380,8 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
         val pc        = UInt(32 bits)
         val readsNzvc = Bool()
         val writesNzvc= Bool()
-        val pNzvcSrc  = UInt(4 bits)
-        val pNzvcDst  = UInt(4 bits)
+        val pNzvcSrc  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits)
+        val pNzvcDst  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits)
       }
       b
     })

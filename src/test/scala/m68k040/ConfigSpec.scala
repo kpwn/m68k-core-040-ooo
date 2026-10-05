@@ -7,7 +7,8 @@ class ConfigSpec extends AnyFunSuite {
     val p = M68kParams()
     assert(p.robDepth == Global.ROB_DEPTH_DEFAULT)
     assert(p.physInt == Global.PHYS_INT_REGS_DEFAULT)
-    assert(p.physNzvc == 16)
+    assert(p.physNzvc == Global.PHYS_NZVC_REGS_DEFAULT)  // 16 unless CPU_PHYS_NZVC=32
+    assert(Set(16, 32).contains(p.physNzvc))
     assert(p.physX == 16)
     assert(p.decodeWidth == 2)
     assert(p.retireWidth == 2)
@@ -26,6 +27,7 @@ class ConfigSpec extends AnyFunSuite {
     assert(p.sqPtrWidth == 4)    // log2Up(16)
     assert(p.lqPtrWidth == 2)    // log2Up(4)
     val d = M68kParams()
-    assert(d.physNzvcIdWidth == 4 && d.physXIdWidth == 4)  // log2Up(16)
+    assert(d.physNzvcIdWidth == Global.PHYS_NZVC_ID_W && d.physXIdWidth == 4)  // log2Up(16)
+    assert(d.physNzvcIdWidth == spinal.core.log2Up(d.physNzvc))
   }
 }
