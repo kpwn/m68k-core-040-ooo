@@ -55,7 +55,7 @@ object FourCycleLoadForm {
 case class IqHot() extends Bundle {
   val intW  = 6
   val nzvcW = m68k040.Global.PHYS_NZVC_ID_W  // NZVC phys-ID width (CPU_PHYS_NZVC)
-  val xW    = 4                               // X phys-ID width (16 physical)
+  val xW    = m68k040.Global.PHYS_X_ID_W     // X phys-ID width (CPU_PHYS_X)
   val fpW   = 4
 
   // ---- Wakeup-CAM sources. Compared against every wakeup broadcast, for every slot,
@@ -202,7 +202,7 @@ case class IqHot() extends Bundle {
 case class AluSlowWakeup() extends Bundle {
   val pdst      = UInt(6 bits); val pdstValid = Bool()
   val pNzvcDst  = UInt(m68k040.Global.PHYS_NZVC_ID_W bits); val nzvcValid = Bool()
-  val pXDst     = UInt(4 bits); val xValid     = Bool()
+  val pXDst     = UInt(m68k040.Global.PHYS_X_ID_W bits); val xValid     = Bool()
 }
 
 trait IssueQueueService {

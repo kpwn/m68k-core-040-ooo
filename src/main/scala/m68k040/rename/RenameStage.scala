@@ -34,7 +34,7 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
     // srcC is the DIVU.L/DIVS.L 64/32 dividend-high (Dr) source (per slot).
     val intRat  = RatTable(physIdWidth = 6, archDepth = m68k040.isa.Isa.ARCH_INT_REGS, writePorts = 2, commitPorts = mapCommitWidth, readPorts = 8, prepared = preparedRetirement)
     val nzvcRat = RatTable(physIdWidth = m68k040.Global.PHYS_NZVC_ID_W, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
-    val xRat    = RatTable(physIdWidth = 4, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
+    val xRat    = RatTable(physIdWidth = m68k040.Global.PHYS_X_ID_W, archDepth = 1,  writePorts = 2, commitPorts = mapCommitWidth, readPorts = 2, prepared = preparedRetirement)
     // FP data RAT (8 arch FP0-FP7, 16 physical). Read-port budget (6): FP macro-ops
     // need at most 2 sources (dyadic FADD/FSUB/FMUL/FDIV) + 1 dst-old read (freelist
     // WAW bookkeeping) per slot -- 2 slots x (2 src + 1 dst-old) = 6, provisioned even
@@ -75,7 +75,11 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
     val nzvcFree = Freelist(physCount = m68k040.Global.PHYS_NZVC_REGS_DEFAULT, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
     require(nzvcFree.idW == m68k040.Global.PHYS_NZVC_ID_W && nzvcRat.physIdWidth == m68k040.Global.PHYS_NZVC_ID_W,
       s"NZVC id width mismatch: freelist ${nzvcFree.idW}, RAT ${nzvcRat.physIdWidth}, Global ${m68k040.Global.PHYS_NZVC_ID_W}")
-    val xFree    = Freelist(physCount = 16, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
+    // X pool: single-sourced from Global.PHYS_X_REGS_DEFAULT (CPU_PHYS_X, 16|32), exactly
+    // like nzvcFree above (PRF depth RegfileSpec.X, IQ X bitmaps, PHYS_X_ID_W fields).
+    val xFree    = Freelist(physCount = m68k040.Global.PHYS_X_REGS_DEFAULT, archCount = 1,  popPorts = 2, pushPorts = retireWidth)
+    require(xFree.idW == m68k040.Global.PHYS_X_ID_W && xRat.physIdWidth == m68k040.Global.PHYS_X_ID_W,
+      s"X id width mismatch: freelist ${xFree.idW}, RAT ${xRat.physIdWidth}, Global ${m68k040.Global.PHYS_X_ID_W}")
     val fpFree   = Freelist(physCount = 16, archCount = 8, popPorts = 2, pushPorts = retireWidth)
     val fpccFree = Freelist(physCount = 16, archCount = 1, popPorts = 2, pushPorts = retireWidth)
 

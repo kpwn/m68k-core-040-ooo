@@ -19,7 +19,7 @@ object RegfileSpec {
   // allocates out of.
   val Int  = RegfileSpec("int",  32, m68k040.Global.PHYS_INT_REGS_DEFAULT)
   val Nzvc = RegfileSpec("nzvc", 4,  m68k040.Global.PHYS_NZVC_REGS_DEFAULT)
-  val X    = RegfileSpec("x",    1,  16)
+  val X    = RegfileSpec("x",    1,  m68k040.Global.PHYS_X_REGS_DEFAULT)
   val Fp   = RegfileSpec("fp",   80, 16)
   // FPCC {NaN,I,Z,N} value storage for the FPCC rename class (RenameStage's
   // fpccRat/fpccFree: 16 physical entries, 4-bit tags). Shape and role are the exact

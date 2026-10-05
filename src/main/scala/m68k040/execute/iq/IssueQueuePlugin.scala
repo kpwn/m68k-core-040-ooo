@@ -171,7 +171,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       p.payload.allowOverride
       p.payload.pdst := U(0, 6 bits); p.payload.pdstValid := False
       p.payload.pNzvcDst := U(0, p.payload.pNzvcDst.getWidth bits); p.payload.nzvcValid := False
-      p.payload.pXDst := U(0, 4 bits); p.payload.xValid := False
+      p.payload.pXDst := U(0, p.payload.pXDst.getWidth bits); p.payload.xValid := False
       p.simPublic()
     }
     cplxFpWakeupPort.valid.allowOverride;   cplxFpWakeupPort.valid   := False
@@ -423,7 +423,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       s"RegfileSpec.Nzvc.depth=${m68k040.execute.regfile.RegfileSpec.Nzvc.depth}")
     val sbNzvc = new Scoreboard(physNzvcN) // NZVC flag physregs (width PHYS_NZVC_ID_W)
     sbNzvc.busy.simPublic()  // debug-only (task #141)
-    val sbX    = new Scoreboard(16) // X flag physregs (width 4)
+    val physXN = m68k040.Global.PHYS_X_REGS.get
+    require(physXN == m68k040.Global.PHYS_X_REGS_DEFAULT &&
+            physXN == m68k040.execute.regfile.RegfileSpec.X.depth &&
+            log2Up(physXN) == m68k040.Global.PHYS_X_ID_W,
+      s"X physical-register pool disagreement: Global.PHYS_X_REGS=$physXN, " +
+      s"PHYS_X_REGS_DEFAULT=${m68k040.Global.PHYS_X_REGS_DEFAULT}, " +
+      s"RegfileSpec.X.depth=${m68k040.execute.regfile.RegfileSpec.X.depth}")
+    val sbX    = new Scoreboard(physXN) // X flag physregs (width PHYS_X_ID_W)
     sbX.busy.simPublic(); sbX.physToPosition.simPublic()
     sbInt.busy.simPublic(); sbInt.physToPosition.simPublic(); positionEpoch.simPublic()
     // FP-DATA / FPCC static scoreboards. Both rename classes have 16 physical entries
@@ -465,7 +472,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // elaborated earlier, can read the bypassed value).
     val sbIntClr  = Bits(physIntN bits); sbIntClr  := 0
     val sbNzvcClr = Bits(physNzvcN bits); sbNzvcClr := 0
-    val sbXClr    = Bits(16 bits);       sbXClr    := 0
+    val sbXClr    = Bits(physXN bits);  sbXClr    := 0
     val sbFpClr   = Bits(16 bits);       sbFpClr   := 0
     val sbFpccClr = Bits(16 bits);       sbFpccClr := 0
     val sbIntBusyEff  = sbInt.busy  & ~sbIntClr
@@ -508,7 +515,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // (latency-1) so a slow producer gets NO static trigger (it wakes at S3).
     val aluSlowIntBusy  = Reg(Bits(physIntN bits)) init 0
     val aluSlowNzvcBusy = Reg(Bits(physNzvcN bits)) init 0
-    val aluSlowXBusy    = Reg(Bits(16 bits)) init 0
+    val aluSlowXBusy    = Reg(Bits(physXN bits)) init 0
     lateStorePorts.foreach { p =>
       p.queryReady := !(lsBusy | cplxBusy | aluSlowIntBusy)(p.queryTag)
       val lsWoke = lsWakeupPort.valid && lsWakeupPort.payload === p.queryTag
