@@ -87,8 +87,12 @@ class IpcBenchSpec extends CoreBenchHarness {
     // default is `new FullCoreDut` with every option FALSE, i.e. the baseline core --
     // so an unqualified number from here is NOT comparable to a board counter.
     val v2 = sys.env.get("IPC_V2").contains("1")
+    // IPC_SHIPPING=1: build through `ShippingPlugins` exactly as M68kSocketTop does (the
+    // CPU_* env flags of the build under test apply), instead of the hand-listed v2 knobs.
+    val shipping = sys.env.get("IPC_SHIPPING").contains("1")
     val compiled = M68kSim().withVerilator.compile(
-      if (!v2) new FullCoreDut
+      if (shipping) new FullCoreDut(shippingProfile = true)
+      else if (!v2) new FullCoreDut
       else new FullCoreDut(
         alignedLoadFallThrough = true, earlyLsIntWakeup = true, sqSubwordForwarding = true,
         pairCorrectBranch = true, retainRedirectHistory = true,
@@ -126,7 +130,7 @@ class IpcBenchSpec extends CoreBenchHarness {
         // REQUIRES it. So the only valid addition to the shipped profile is taken-only
         // deferral on top of training, which is what this A/B toggles.
         deferTakenSlot1Conditional = sys.env.get("IPC_V2_DEFER").contains("1")))
-    println(s"  core profile: ${if (v2) "throughput-v2 (board)" else "baseline (all options off)"}")
+    println(s"  core profile: ${if (shipping) "SHIPPING (ShippingPlugins)" else if (v2) "throughput-v2 (board)" else "baseline (all options off)"}")
     val results = kernels.map(k => runKernel(compiled, k))
 
     // ── Print the table ───────────────────────────────────────────────────────
