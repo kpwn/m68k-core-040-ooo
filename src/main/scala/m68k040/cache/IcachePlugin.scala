@@ -1428,6 +1428,10 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     val predIsPf          = Bool(); predIsPf          := predIsPfReg
     predActive.simPublic(); predIsPf.simPublic(); commitBeat.simPublic()
     val fillArrayWrActive = Bool(); fillArrayWrActive := False
+    // FMax (200 MHz): request wires for the registered UFA write / bypass capture,
+    // driven inside the `predActive` datapath and consumed one cycle later (`ufaWr*`).
+    val ufaWrEn   = Bool(); ufaWrEn   := False
+    val ufaBypCap = Bool(); ufaBypCap := False
     // Slice I3 telemetry: a pure wire (zero flops) that a testbench counts to derive
     // design doc §8.3's "prefetch issued / useful / wasted".
     // M3b: driven from the S1 telemetry block near the verdict (it needs `s1HitVec`,
@@ -1716,6 +1720,15 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       // lookup port open with canStartFill = false, and free the speculative slot on
       // completion) are parameterised by the registered `predIsPfReg`.
       val PREDECODE = new State
+      // FMax (200 MHz, 2026-10-06): the array-DATA write of each classified beat is
+      // registered (`ufaWr*` below), so the LAST beat's lineMem write lands one cycle
+      // after PREDECODE's final beat. COMMIT is that cycle. It exists so nothing can
+      // read the just-installed set before its data write has landed: a demand install
+      // keeps the fetch port closed and REPLAY (which re-reads the array) follows it; a
+      // speculative install keeps PREDECODE's D3-SET-I set block (`fillArrayWrActive`)
+      // for this one extra cycle, then returns to IDLE. Cold path only: +1 cycle per
+      // install dwell, nothing on any hit.
+      val COMMIT    = new State
       val REPLAY    = new State
       // Task #211: a REFILL whose AXI read response(s) came back non-OKAY
       // (SLVERR/DECERR — genuinely unmapped or erroring physical memory). No line
@@ -2050,10 +2063,26 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
             mshrValid(installIdx)    := False
             mshrArSent(installIdx)   := False
             mshrComplete(installIdx) := False
-            goto(IDLE)
-          } otherwise {
-            goto(REPLAY)
           }
+          goto(COMMIT)
+        }
+      }
+
+      // ----- COMMIT: the registered last-beat lineMem write lands (see the state's
+      // declaration). The speculative slot was already freed by PREDECODE's final beat;
+      // the data being written lives in `ufaWrData`, not in the line file, so a new
+      // allocation reusing that slot cannot disturb it. -----
+      COMMIT.whenIsActive {
+        when(predIsPfReg) {
+          // Same open-port-with-set-block shape as the PREDECODE speculative dwell: the
+          // tag/valid of `installSet` are already published (PREDECODE's last beat) but
+          // its last data beat is being written THIS cycle, so a same-set lookup must be
+          // held one more cycle; other sets are served.
+          fillArrayWrActive := True
+          lookupTick(canStartFill = false)
+          goto(IDLE)
+        } otherwise {
+          goto(REPLAY)
         }
       }
 
@@ -2192,8 +2221,8 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // below; it costs nothing in synthesis and it runs under EVERY test in the suite,
     // including lock-step and the fuzz campaign.
     val dwellActive = fsm.isActive(fsm.REFILL) || fsm.isActive(fsm.INSTALL_ARM) ||
-                      fsm.isActive(fsm.PREDECODE) || fsm.isActive(fsm.REPLAY) ||
-                      fsm.isActive(fsm.FAULT)
+                      fsm.isActive(fsm.PREDECODE) || fsm.isActive(fsm.COMMIT) ||
+                      fsm.isActive(fsm.REPLAY) || fsm.isActive(fsm.FAULT)
     val prevDwell   = RegNext(dwellActive) init False
     val missPCPrev  = RegNext(missPC)
     when(prevDwell && dwellActive) {
@@ -2878,10 +2907,11 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
       // declaration for the full equivalence, write/read-ordering and missPC-
       // immutability arguments (they cover `bypWindow` identically -- same predicate,
       // same lane index, same cycle).
-      when(predBeatDone && commitBeat === missPC(5).asUInt) {
-        bypWindow := beatSrc.subdivideIn(64 bits)(missPC(4 downto 3))
-        bypPred   := beatPred.subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
-      }
+      // FMax (200 MHz): captured one cycle later, out of the registered `ufaWrData`
+      // (see there). `missPC` is frozen for the whole dwell including COMMIT (asserted
+      // by the missPC-immutability check, whose `dwellActive` covers COMMIT), and the
+      // earliest consumer is S1 of REPLAY, which now follows COMMIT.
+      ufaBypCap := predBeatDone && commitBeat === missPC(5).asUInt
       val penultimatePhase = if (predecodeWords == 16) isLoBeat else
         (isLoBeat && predBeatDone && earlyPred.hiValid(installIdx)) ||
           (!isLoBeat && !predBeatDone)
@@ -2931,24 +2961,48 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
           victim(installSet) := victim(installSet) + 1
         }
       }
-      when(doAllocate && predBeatDone) {
-        for (w <- 0 until ways) {
-          when(installWay === U(w, wayBits bits)) {
-            // M1: ONE write, ONE call site (a SECOND Mem.write call site breaks
-            // SpinalHDL's MultiPortWritesSymplifier -- a real previously-shipped
-            // breakage in this file, see the icache-burst-fault-fix note above). The
-            // entry is {beat predecode, beat data}, at exactly the address and on
-            // exactly the cycle the old data-only write used. `beatSrc` is literally
-            // the expression the old write inlined, so the data half is unchanged by
-            // construction.
-            lineMem(w).write((installSet ## commitBeat).asUInt, beatPred ## beatSrc)
-          }
-        }
-      }
+      // The beat's array write is REQUESTED here and performed one cycle later from
+      // registers (see `ufaWrEn` below the FSM-hoisted datapath).
+      ufaWrEn := doAllocate && predBeatDone
       // Two complete-beat writes. Eight-wide mode only adds a preparation
       // cycle when this beat missed early predecode due to installer contention.
       // The counter still wraps on the FSM's exit, without an install-start clear.
       when(predBeatDone) { commitBeat := commitBeat + 1 }
+    }
+
+    // ══ FMax (200 MHz, 2026-10-06): REGISTERED UFA WRITE + BYPASS CAPTURE ════════════
+    // The routed 200 MHz build's I-cache family (~160 failing endpoints, -0.59 ns, 9
+    // levels) was `fillHiQ/fillLoQ/commitBeat -> beatSrc mux (fo 90) -> classifyBeat ->
+    // lineMem DINADIN/DINBDIN` plus the same cone into `bypPred`/`bypWindow`. The
+    // classified beat is now registered (`ufaWrData`, captured UNCONDITIONALLY -- its two
+    // consumers below are qualified by their own registered enables) and the BRAM write
+    // and the bypass capture are driven from that register one cycle later.
+    //
+    // EXACTNESS. Each delayed write carries the identical {address, way, data} the old
+    // same-cycle write used (all three captured on the requesting cycle), so the array
+    // CONTENT after the dwell is unchanged; only the landing cycle moves by one:
+    //   * beat 0 lands on the beat-1 PREDECODE cycle -- still inside the dwell, where a
+    //     demand install keeps the fetch port closed and a speculative one blocks
+    //     same-set lookups (`fillArrayWrActive`);
+    //   * the last beat lands on the new COMMIT cycle, which preserves the same two
+    //     protections for one more cycle, so no lookup and no REPLAY read can observe the
+    //     set between its tag/valid publication and its last data write.
+    // Still ONE `lineMem(w).write` call site per way (MultiPortWritesSymplifier, M1).
+    val ufaWrData = RegNext(beatPred ## beatSrc)
+    val ufaWrAddr = RegNext((installSet ## commitBeat).asUInt)
+    val ufaWrWay  = RegNext(installWay)
+    val ufaWrEnQ  = RegNext(ufaWrEn) init False
+    val ufaBypCapQ = RegNext(ufaBypCap) init False
+    ufaWrEnQ.simPublic(); ufaBypCapQ.simPublic()
+    for (w <- 0 until ways) {
+      when(ufaWrEnQ && ufaWrWay === U(w, wayBits bits)) {
+        lineMem(w).write(ufaWrAddr, ufaWrData)
+      }
+    }
+    when(ufaBypCapQ) {
+      bypWindow := ufaWrData(255 downto 0).subdivideIn(64 bits)(missPC(4 downto 3))
+      bypPred   := ufaWrData(UFA_W - 1 downto 256)
+                     .subdivideIn(4 * PRED_BITS_PER_WORD bits)(missPC(4 downto 3))
     }
 
     GenerationFlags.simulation {
