@@ -96,8 +96,11 @@ class DebugCtrlReadMuxSpec extends AnyFunSuite {
       dut.mmu.logic.srp #= 0x0BBB0002L
       dut.mmu.logic.mmusr #= 0x0CCC0001L
       dut.rob.logic.debugLivePcReg #= 0x40100000L
-      dut.rob.logic.debugLastPcReg #= 0x40100004L
-      dut.rob.logic.debugMacroCountReg #= BigInt("00000011FEDCBA98", 16)
+      // The last-PC and macro-count views are RETIMED (a register plus the registered
+      // retire snapshot folded in combinationally); with nothing retiring, seeding the
+      // physical register seeds the view.
+      dut.rob.logic.debugLastPcLagReg #= 0x40100004L
+      dut.rob.logic.debugMacroCountLagReg #= BigInt("00000011FEDCBA98", 16)
       dut.rob.logic.debugHaltHitInstCountReg #= BigInt("0000002212345678", 16)
       dut.rob.logic.debugHaltHitPcReg #= 0x40200000L
       dut.rob.logic.debugHaltExceptionVectorReg #= 0x2E

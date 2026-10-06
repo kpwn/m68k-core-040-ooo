@@ -271,7 +271,10 @@ case class DebugExceptionEvent() extends Bundle {
   * after the entry sequencer has installed the handler PC and final architectural state.
   * PRODUCER: `RobPlugin` (exactly one). */
 trait DebugHistoryService {
-  def macroRetirePc: Vec[Flow[UInt]] // two or four program-ordered retire slots
+  /** Two or four program-ordered retire slots, ONE CYCLE AFTER retirement: the ROB
+    * drives them from a registered snapshot so no debug observer loads the live retire
+    * cone (200 MHz, 2026-10-06). Consumers must not add a further tap. */
+  def macroRetirePc: Vec[Flow[UInt]]
   def branchRetire: Flow[DebugBranchEvent]
   def exceptionEntry: Flow[DebugExceptionEvent]
 }

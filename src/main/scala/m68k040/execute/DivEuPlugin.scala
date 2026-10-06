@@ -390,8 +390,36 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
   }
 
   val logic = during build new Area {
+    // ---- OPERAND-READ REGISTER (200 MHz, 2026-10-06) ----
+    // The IQ's CPLX port payload is an ASYNC read of its cold-payload LUTRAM, indexed by
+    // the registered select's robId (fo ~312). It used to address this EU's three int-PRF
+    // read ports (and the FP-PRF / FP-immediate reads) in the SAME cycle, so the issue
+    // cycle was robId -> coldWay LUTRAM -> PRF address (fo ~238) -> PRF LUTRAM + bank
+    // select -> fpS1IntA / s1A / the MUL DSP inputs. DivEu is a multi-cycle unit (owner
+    // ruling: it may take an extra cycle), so the whole issue payload is registered here
+    // and every read is addressed from a flop. `ip` is that registered stream; all of the
+    // logic below consumes it exactly as it used to consume `issuePort`.
+    //
+    // COST: +1 cycle on every CPLX op (DIV/MUL/CHK/CMP2/BF/FP). Full throughput is kept
+    // (bubble-collapsing m2sPipe). Wakeups from this EU are all DYNAMIC (completion
+    // driven), so no IQ scoreboard timing depends on this latency.
+    //
+    // OPERAND CORRECTNESS: a source physical register a uop issued against cannot be
+    // re-written or freed before that uop retires (it is freed only when a YOUNGER writer
+    // of the same architectural register retires), and the producer's write -- which the
+    // issue-cycle read may have taken through the int-PRF bypass -- has landed in the
+    // array by the next edge. So reading one cycle later returns the same value; the
+    // bypass simply no longer matches. CPLX uops are never speculatively woken (the IQ's
+    // speculative wakeup is LS-only), so there is no cancel to race. The FP files have no
+    // bypass and a two-cycle minimum read-after-write distance already. The FP-immediate
+    // entry is freed on THIS accept, exactly as before (just one cycle later), and this
+    // register is cleared by `flushSig`, which every wiring drives with the same
+    // `doFlush || excActive` the IQ and the immediate table's backend squash use.
+    val ip = issuePort.m2sPipe(flush = flushSig)
+    issuePort.valid.simPublic(); issuePort.ready.simPublic()
+
     // ---- S0: read operands ----
-    val u0 = issuePort.payload.uop
+    val u0 = ip.payload.uop
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
     rdH.addr := u0.psrcC     // DIV.L 64/32 dividend HIGH word (Dr) via the 3rd source
@@ -440,7 +468,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // FLUSHED iterative op until FpDivSqrtCore is genuinely free again (see the iterAck
     // contract below) -- which is precisely what makes the gate correct rather than
     // optimistic.
-    issuePort.ready := !flushSig && (!issuePort.valid || Mux(issueIsMul,
+    ip.ready := !flushSig && (!ip.valid || Mux(issueIsMul,
       mulCanAccept,
       Mux(issueIsMulHi, mulHiAvailable,
       Mux(issueIsBf, bfCanAccept,
@@ -450,8 +478,8 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // ---- debug-only observability (task #139 CMP2/CHK2 hang investigation) ----
     // Zero synth impact (sim tap only, not referenced by any RTL logic).
     busy.simPublic(); s1Valid.simPublic()
-    issuePort.valid.simPublic(); issuePort.ready.simPublic()
-    issuePort.payload.robId.simPublic(); issuePort.payload.uop.op.simPublic()
+    ip.valid.simPublic(); ip.ready.simPublic()
+    ip.payload.robId.simPublic(); ip.payload.uop.op.simPublic()
 
     // ---- S0 -> S1 register (M2S), captured on issue.fire ----
     val s1Ctx   = Reg(IqContext())
@@ -476,9 +504,9 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // gives for FP: it runs on its own lane below, so the legacy FSM's defensive
     // `otherwise` arm would otherwise complete it a SECOND time, on the int lane, with
     // its robId -- a double completion of one ROB entry.)
-    when(issuePort.fire && !issueIsMul && !issueIsMulHi && !issueIsFp && !issueIsBf) {
+    when(ip.fire && !issueIsMul && !issueIsMulHi && !issueIsFp && !issueIsBf) {
       s1Valid := True
-      s1Ctx   := issuePort.payload
+      s1Ctx   := ip.payload
       s1A     := s0A
       s1B     := s0B
       s1H     := s0H
@@ -933,11 +961,11 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     mulCanAccept := (mulReserved =/= mulResultDepth) || mulRetire
     mulHiAvailable := mulHiPendingQ.io.push.ready
 
-    val mulStart = issuePort.fire && issueIsMul
-    val mulHiAccept = issuePort.fire && issueIsMulHi
+    val mulStart = ip.fire && issueIsMul
+    val mulHiAccept = ip.fire && issueIsMulHi
     when(mulHiAccept) { assert(u0.pdstValid, "MULHI must carry an integer destination") }
     mulHiPendingQ.io.push.valid := mulHiAccept
-    mulHiPendingQ.io.push.payload.robId := issuePort.payload.robId
+    mulHiPendingQ.io.push.payload.robId := ip.payload.robId
     mulHiPendingQ.io.push.payload.pdst := u0.pdst
     mulHiPendingQ.io.push.payload.dstArch := u0.dstArch
 
@@ -957,7 +985,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val mulCtxValid = Vec.fill(MulCore.Latency)(RegInit(False))
     mulCtxValid(0) := mulStart
     when(mulStart) {
-      mulCtx(0).robId      := issuePort.payload.robId
+      mulCtx(0).robId      := ip.payload.robId
       mulCtx(0).pdst       := u0.pdst
       mulCtx(0).pdstValid  := u0.pdstValid
       mulCtx(0).pNzvcDst   := u0.pNzvcDst
@@ -1024,12 +1052,12 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     fpRdA.addr := u0.pFpSrcA
     fpRdB.addr := u0.pFpSrcB
 
-    val fpAccept     = issuePort.fire && issueIsFp
+    val fpAccept     = ip.fire && issueIsFp
     val fpFixedStart = fpAccept && issueIsFpFixed
     val fpIterStart  = fpAccept && issueIsFpIter
 
     def loadFpCtx(c: FpPipeContext): Unit = {
-      c.robId     := issuePort.payload.robId
+      c.robId     := ip.payload.robId
       c.pdst      := u0.pFpDst
       c.pdstValid := u0.pFpDstValid
       c.pFpccDst  := u0.pFpccDst
@@ -1232,7 +1260,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // DELIBERATELY still on `fpIterStart` (the ACCEPT cycle), not on FS1 like the fixed
     // lane's shadow pipe, and the asymmetry is load-bearing in both directions:
     //  * `fpIterBusy` MUST be set at acceptance, because it IS the issue-port's admission
-    //    gate (`issuePort.ready`, above). Moving it to FS1 would leave a one-cycle window in
+    //    gate (`ip.ready`, above). Moving it to FS1 would leave a one-cycle window in
     //    which a SECOND FDIV/FSQRT is admitted while the first is still in the issue
     //    register -- and FpDivSqrtCore's own `start` is swallowed while it is busy, so the
     //    second op would vanish and its robId would never complete.
@@ -1582,7 +1610,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // STAGE MAP (identical cut points to the AluEu pipe it replaces, so the two FMax
     // splits measured there -- the forward funnel vs. the modify, and the rotate/shift
     // half vs. the clz+mux half -- are preserved verbatim).  C = the accept cycle:
-    //   C    : issuePort.fire; the operands + control fields are captured into bf1*.
+    //   C    : ip.fire; the operands + control fields are captured into bf1*.
     //   C+1  : forward funnel + `BitfieldCmd` assembly      -> registered into bf2*.
     //   C+2  : `Bitfield.stage1` (rotates / left-justify)   -> registered into bf3*.
     //   C+3  : `Bitfield.stage2` (clz + mask-modify + mux)  -> registered into bf4*.
@@ -1605,7 +1633,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val bfReserved = Reg(UInt(log2Up(bfResultDepth + 1) bits)) init 0
     val bfRetire = bfResultQ.io.pop.fire
     bfCanAccept := (bfReserved =/= bfResultDepth) || bfRetire
-    val bfStart = issuePort.fire && issueIsBf
+    val bfStart = ip.fire && issueIsBf
     switch(bfStart ## bfRetire) {
       is(B"10") { bfReserved := bfReserved + 1 }
       is(B"01") { bfReserved := bfReserved - 1 }
@@ -1617,7 +1645,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     val bfCtxValid = Vec.fill(bfLatency)(RegInit(False))
     bfCtxValid(0) := bfStart
     when(bfStart) {
-      bfCtx(0).robId      := issuePort.payload.robId
+      bfCtx(0).robId      := ip.payload.robId
       bfCtx(0).pdst       := u0.pdst
       bfCtx(0).pdstValid  := u0.pdstValid
       bfCtx(0).pNzvcDst   := u0.pNzvcDst

@@ -266,6 +266,18 @@ class FpuProtocolSpec extends AnyFunSuite {
       val obsFpDst = out UInt (4 bits); obsFpDst := eu.issue.payload.uop.pFpDst
       val obsSrcA  = out UInt (4 bits); obsSrcA  := eu.issue.payload.uop.pFpSrcA
       val obsSrcB  = out UInt (4 bits); obsSrcB  := eu.issue.payload.uop.pFpSrcB
+      // ---- the LANE's admission point: DivEu's operand-read register output `ip` ----
+      // Since 2026-10-06 (200 MHz) the external port feeds a bubble-collapsing register,
+      // so a request that the lane cannot take yet is accepted by the port and WAITS in
+      // that register; the capacity gate is `ip.ready`, and this is where a held request's
+      // payload must stay stable.
+      val laneReady  = out Bool (); laneReady := divEu.logic.ip.ready
+      val laneFire   = out Bool (); laneFire  := divEu.logic.ip.fire
+      val laneRob    = out UInt (m68k040.Global.ROB_ID_W_DEFAULT bits); laneRob := divEu.logic.ip.payload.robId
+      val laneOp     = out Bits (7 bits); laneOp    := divEu.logic.ip.payload.uop.fpuOp
+      val laneFpDst  = out UInt (4 bits); laneFpDst := divEu.logic.ip.payload.uop.pFpDst
+      val laneSrcA   = out UInt (4 bits); laneSrcA  := divEu.logic.ip.payload.uop.pFpSrcA
+      val laneSrcB   = out UInt (4 bits); laneSrcB  := divEu.logic.ip.payload.uop.pFpSrcB
     }
   }
 
@@ -501,7 +513,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       preloadOperands()
       clearLog()
 
-      val ops = eightOps(robBase = 40, pdstBase = 8)
+      val ops = eightOps(robBase = 8, pdstBase = 8)
       val acceptCycles = ArrayBuffer[Int]()
       for (o <- ops) {
         present(o)
@@ -540,7 +552,11 @@ class FpuProtocolSpec extends AnyFunSuite {
       //     NOT change (FpuCore itself was not re-timed) -- see its doc comment. So this is
       //     the one place that must carry the EU-level "+1", and it must stay written as
       //     `FixedLatency + 1`, not as `14`: a real FpuCore re-time still has to fail here.
-      val ExpectedLatency = FpuCore.FixedLatency + 1
+      //
+      //     +1 MORE (2026-10-06, 200 MHz): DivEu now registers its issue payload before any
+      //     operand read (`DivEuPlugin.logic.ip`), so the accepting edge of the external port
+      //     is one edge before the FP lane's own acceptance.
+      val ExpectedLatency = FpuCore.FixedLatency + 2
       for (i <- ops.indices) {
         val got = comps(i).cycle - acceptCycles(i)
         assert(got == ExpectedLatency,
@@ -658,8 +674,8 @@ class FpuProtocolSpec extends AnyFunSuite {
       // one genuinely-raising FDIV on the iterative lane, presented back to back so the
       // FDIV is actually in flight while the 3 fixed ops are still resident -- the same
       // concurrency the 4-in-flight test above establishes, extended with a raising op.
-      val exactOps = eightOps(robBase = 50, pdstBase = 9).take(3)
-      val divOp    = Op(53, OpFDIV, POne, PZero, 12, 12, PosInf, CcI, "FDIV 1.0/0.0 (DZ)")
+      val exactOps = eightOps(robBase = 18, pdstBase = 9).take(3)
+      val divOp    = Op(21, OpFDIV, POne, PZero, 12, 12, PosInf, CcI, "FDIV 1.0/0.0 (DZ)")
       val ops      = exactOps :+ divOp
       for (o <- ops) { present(o); acceptNow(s"raising-op batch ${o.label} (rob=${o.rob})") }
       s.iValid #= false
@@ -763,8 +779,8 @@ class FpuProtocolSpec extends AnyFunSuite {
       // The raising op is INTERIOR to the batch on purpose. A shadow-pipe skew in either
       // direction can only be caught if there is a real neighbour on both sides for the
       // raise to be misattributed to.
-      val exact  = eightOps(robBase = 30, pdstBase = 9).take(3)  // rob 30,31,32; pdst 9,10,11
-      val inexOp = fadd(33, POne, PTiny, 12, One, CcNone, "1.0 + 2^-65 (INEX2)")
+      val exact  = eightOps(robBase = 26, pdstBase = 9).take(3)  // rob 26,27,28; pdst 9,10,11
+      val inexOp = fadd(29, POne, PTiny, 12, One, CcNone, "1.0 + 2^-65 (INEX2)")
       val ops    = Seq(exact(0), exact(1), inexOp, exact(2))
 
       for (o <- ops) { present(o); acceptNow(s"fixed-lane INEX2 batch ${o.label} (rob=${o.rob})") }
@@ -920,38 +936,46 @@ class FpuProtocolSpec extends AnyFunSuite {
       preloadOperands()
       clearLog()
 
-      val first = Op(50, OpFDIV, POne, PTwo, 8, 8, Half, CcNone, "occupying FDIV 1.0/2.0")
+      val first = Op(18, OpFDIV, POne, PTwo, 8, 8, Half, CcNone, "occupying FDIV 1.0/2.0")
       present(first); acceptNow("occupying FDIV")
       s.iValid #= false
       tick(2)
       val occupied = s.iterBusy.toBoolean
       assert(occupied, "the occupying FDIV was not actually in flight")
 
-      // Present the blocked request and HOLD it, untouched, for the whole stall.
-      val held = Op(51, OpFSQRT, PFour, PFour, 9, 9, Two, CcNone, "held FSQRT(4.0)")
+      // Present the blocked request. Since 2026-10-06 the external port hands it to
+      // DivEu's operand-read register at once (a Stream fire is a hand-off, so the
+      // presenter drops valid right after it); the request then WAITS in that register,
+      // held, untouched, at the lane's admission point (`ip`) for the whole stall.
+      val held = Op(19, OpFSQRT, PFour, PFour, 9, 9, Two, CcNone, "held FSQRT(4.0)")
       present(held)
+      acceptNow("held FSQRT into the operand-read register")
+      s.iValid #= false
       sleep(1)
-      val readyWhileBusy = s.iReady.toBoolean
+      val readyWhileBusy = s.laneReady.toBoolean
       assert(!readyWhileBusy,
-        "the issue port was ready for a second iterative op while the single-context lane " +
+        "the FP lane was ready for a second iterative op while the single-context lane " +
         "was still busy -- the in-flight FDIV's context would be overwritten")
       clearLog()
 
       var stalled = 0
       var guard = 0
-      while (fires.isEmpty && guard < FpDivSqrtCore.WorstCaseLatency + 80) {
+      var laneFires = 0
+      var laneFireRob = -1
+      while (laneFires == 0 && guard < FpDivSqrtCore.WorstCaseLatency + 80) {
         // Payload stability, checked on EVERY stalled cycle rather than at the ends.
-        val payloadStable = s.obsRob.toInt == held.rob && s.obsOp.toInt == held.opmode &&
-               s.obsFpDst.toInt == held.pdst && s.obsSrcA.toInt == held.a &&
-               s.obsSrcB.toInt == held.b
+        val payloadStable = s.laneRob.toInt == held.rob && s.laneOp.toInt == held.opmode &&
+               s.laneFpDst.toInt == held.pdst && s.laneSrcA.toInt == held.a &&
+               s.laneSrcB.toInt == held.b
         assert(payloadStable,
           s"the held request's payload drifted at cycle $cycle " +
-          s"(rob=${s.obsRob.toInt} op=0x${s.obsOp.toInt.toHexString} dst=${s.obsFpDst.toInt})")
+          s"(rob=${s.laneRob.toInt} op=0x${s.laneOp.toInt.toHexString} dst=${s.laneFpDst.toInt})")
+        if (s.laneFire.toBoolean) { laneFires += 1; laneFireRob = s.laneRob.toInt }
         if (!s.iterBusy.toBoolean) { /* capacity has returned; the accept may land now */ }
         else {
-          val readyTooEarly = s.iReady.toBoolean
+          val readyTooEarly = s.laneReady.toBoolean
           assert(!readyTooEarly,
-            s"the issue port accepted a second iterative op at cycle $cycle while the lane " +
+            s"the FP lane accepted a second iterative op at cycle $cycle while the lane " +
             "was still busy")
           stalled += 1
         }
@@ -960,19 +984,16 @@ class FpuProtocolSpec extends AnyFunSuite {
       assert(stalled > 10,
         s"the held request only stalled for $stalled cycles -- capacity was never genuinely " +
         "unavailable, so this test proved nothing")
-      assert(fires.size == 1,
-        s"the held request was accepted ${fires.size} times when capacity returned, expected " +
+      assert(laneFires == 1,
+        s"the held request was accepted $laneFires times when capacity returned, expected " +
         "exactly one acceptance")
-      assert(fires.head._2 == held.rob,
-        s"the acceptance carried robId ${fires.head._2}, expected the held ${held.rob}")
-      // `sample()` reads the COMBINATIONAL `issue.fire`, so it reports the accepting edge one
-      // cycle before that edge is taken: tick once to actually take it, and only then drop
-      // `iValid`. (Dropping it here would retract the request instead of completing it.)
-      tick()
-      s.iValid #= false
-      assert(fires.size == 1,
-        s"the held request was accepted ${fires.size} times -- exactly one acceptance is " +
-        "required when capacity returns")
+      assert(laneFireRob == held.rob,
+        s"the acceptance carried robId $laneFireRob, expected the held ${held.rob}")
+      for (_ <- 0 until 4) {
+        assert(!s.laneFire.toBoolean, s"the held request was accepted a second time at cycle $cycle")
+        assert(fires.isEmpty, "the external port accepted a phantom request after the hand-off")
+        tick()
+      }
 
       // Both results must be intact: the occupying divide's, and the held request's -- the
       // latter proving the payload the EU finally sampled was the held one, not a stale or
@@ -1016,11 +1037,11 @@ class FpuProtocolSpec extends AnyFunSuite {
       clearLog()
 
       // ---- fill BOTH lanes: one iterative op plus a dense fixed pipeline ----
-      val staleDiv = Op(60, OpFDIV, POne, PTwo, 8, 8, Half, CcNone, "stale FDIV 1.0/2.0")
+      val staleDiv = Op(28, OpFDIV, POne, PTwo, 8, 8, Half, CcNone, "stale FDIV 1.0/2.0")
       present(staleDiv); acceptNow("stale FDIV")
       s.iValid #= false
       val staleFixed = (0 until 6).map { i =>
-        fadd(40 + i, POne, PTwo, 9 + i, Three, CcNone, s"stale FADD#$i")
+        fadd(8 + i, POne, PTwo, 9 + i, Three, CcNone, s"stale FADD#$i")
       }
       for (o <- staleFixed) { present(o); acceptNow(s"stale ${o.label}") }
       s.iValid #= false
@@ -1047,7 +1068,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       // merely by count: the stale fixed ops all produce 3.0 and the stale divide 0.5, while
       // every reused identity below produces something else.
       val newFixed = (0 until 6).map { i =>
-        fadd(40 + i, PFour, PTwo, 9 + i, Six, CcNone, s"reused FADD#$i")
+        fadd(8 + i, PFour, PTwo, 9 + i, Six, CcNone, s"reused FADD#$i")
       }
       for (o <- newFixed) { present(o); acceptNow(s"post-flush ${o.label}") }
       s.iValid #= false
@@ -1056,7 +1077,7 @@ class FpuProtocolSpec extends AnyFunSuite {
       // request is held valid and accepted the moment the lane frees -- reusing robId 60 and
       // physreg 8 while the flushed divide is still physically iterating, which is precisely
       // the window the poison latch exists to cover.
-      val newDiv = Op(60, OpFDIV, PFour, PTwo, 8, 8, Two, CcNone, "reused FDIV 4.0/2.0")
+      val newDiv = Op(28, OpFDIV, PFour, PTwo, 8, 8, Two, CcNone, "reused FDIV 4.0/2.0")
       present(newDiv)
       acceptWhenReady("post-flush FDIV", FpDivSqrtCore.WorstCaseLatency + 80)
       s.iValid #= false
