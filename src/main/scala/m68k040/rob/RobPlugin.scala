@@ -1128,9 +1128,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // quiescing on the stop-sampling edge and release on the resume edge.
     // Declared before retire so the pipelined halt-after result can gate the following
     // macro without putting its 64-bit compare on the commit hot path.
-    val debugMacroCountReg = Reg(UInt(64 bits)) init 0
+    // 200 MHz retime (2026-10-06): the macro counter is RETIMED, not delayed. The
+    // physical register `debugMacroCountLagReg` accumulates the REGISTERED retire
+    // snapshot (`dbgRetQ.macroInc`, one cycle behind the retire decision), and
+    // `debugMacroCountReg` re-adds that pending increment combinationally from flops,
+    // so it equals the old register's value on EVERY cycle (lag(t+1) = exact(t), exact
+    // = lag + incQ). The retire cone no longer reaches a 64-bit carry chain; the
+    // halt-after compare below sees bit-identical values, so halt timing is unchanged.
+    val debugMacroCountLagReg = Reg(UInt(64 bits)) init 0
+    debugMacroCountLagReg.simPublic()
+    val debugMacroCountReg = UInt(64 bits)  // exact view, driven after the retire snapshot
     debugMacroCountReg.simPublic()
-    val haltAfterCmpCountReg = RegNext(debugMacroCountReg) init 0
+    // RegNext(exact) is the same register as the lag accumulator.
+    val haltAfterCmpCountReg = debugMacroCountLagReg
     val haltAfterCmpEpochReg = RegNext(haltAfterEpochIn) init 0
     val haltAfterCmpArmedReg = RegNext(haltAfterArmedIn && !haltAfterInvalidateIn) init False
     val haltAfterCmpHitReg = RegNext(debugMacroCountReg >= haltAfterTargetIn) init False
@@ -1587,6 +1597,28 @@ class RobPlugin(val detailedPerf: Boolean = false,
       .map { case (r, p) => (r && p.last).asUInt.resize(log2Up(retireWidth + 1)) }.reduce(_ + _)
     debugMacroCountInc.simPublic()
 
+    // ── Registered retire snapshot for debug/perf OBSERVERS (200 MHz, 2026-10-06) ──
+    // `retireLanes` is the end of the deepest cone in the ROB (faultedStore/payload ->
+    // retire0 -> ...), and it used to fan straight out into ~660 debug/perf endpoints:
+    // the 64-bit macro counter, debugHaltHitInstCount, debugLastPc, both halt-lane PC
+    // capture rings, the PC-trace history ring and the windowed instruction counter.
+    // Owner ruling (2026-09-17): instrumentation MAY LAG, it must never cost a logic
+    // level on a real path. Every such observer now reads THIS one-cycle-late copy.
+    // Its D inputs are plain RegNexts (no clock enable), so each retire lane net gains
+    // exactly one flop load instead of a wide CE/data fanout.
+    //
+    // NOT used by anything that decides a halt: the halt FSM, `debugStopBoundaryHit`,
+    // the halt lanes' `hit`/`req`, and `haltAfterDue` all still read the live signals.
+    val dbgRetQ = new Area {
+      val fire = Vec(retireLanes.map(r => RegNext(r) init False))
+      val last = Vec(retirePayloads.map(p => RegNext(p.last) init False))
+      val pc   = Vec(retirePayloads.map(p => RegNext(p.pc) init 0))
+      val macroInc = fire.zip(last)
+        .map { case (f, l) => (f && l).asUInt.resize(log2Up(retireWidth + 1)) }.reduce(_ + _)
+      fire.simPublic(); last.simPublic(); pc.simPublic()
+    }
+    debugMacroCountReg := debugMacroCountLagReg + dbgRetQ.macroInc.resized
+
     // Ordinary manual/halt-after stops are post-commit. The macro at the head when
     // the request is sampled completes in full; the slot-1 guard above prevents the
     // same retire cycle from crossing into its successor. HALTED is not observable
@@ -1654,16 +1686,27 @@ class RobPlugin(val detailedPerf: Boolean = false,
       debugStopBoundaryHit || debugStepBoundaryHit
     val debugRecoverEnter = debugRecoverEnterCond && !preciseDrainBusyIn
     debugRecoverEnter.simPublic()
+    // Halt-hit instruction count: a CAPTURE register, retimed one cycle late (200 MHz,
+    // 2026-10-06). The boundary strobes, the auto-select and the auto comparand are
+    // registered; the capture then lands on the following edge with the SAME value the
+    // old same-cycle capture produced:
+    //   stop      : old = sel ? C(t) : M(t)+I(t);  new at t+1 = sel_q ? C_q : exact M(t+1)
+    //   bp / exc  : old = M(t);                    new at t+1 = lag M(t+1) (= exact M(t))
+    // It is written while the FSM is in RECOVER and is therefore settled by the time
+    // HALTED is observable. It feeds no control: the halt decision is untouched.
     val debugHaltHitInstCountReg = Reg(UInt(64 bits)) init 0
     debugHaltHitInstCountReg.simPublic()
-    when(debugStopBoundaryHit) {
+    val hitStopQ     = RegNext(debugStopBoundaryHit) init False
+    val hitBpExcQ    = RegNext(debugBreakpointBoundaryHit || debugExceptionBoundaryHit) init False
+    val hitSelAutoQ  = RegNext(haltAfterDue || debugAutoHaltLatchedReg) init False
+    val hitCmpCountQ = RegNext(haltAfterCmpCountReg) init 0
+    when(hitStopQ) {
       // Automatic results carry the sampled count as well as the epoch. Manual stops
-      // capture the post-commit count of the boundary macro on this same edge.
-      debugHaltHitInstCountReg := Mux(haltAfterDue || debugAutoHaltLatchedReg,
-        haltAfterCmpCountReg, debugMacroCountReg + debugMacroCountInc.resized)
+      // capture the post-commit count of the boundary macro.
+      debugHaltHitInstCountReg := Mux(hitSelAutoQ, hitCmpCountQ, debugMacroCountReg)
     }
-    when(debugBreakpointBoundaryHit || debugExceptionBoundaryHit) {
-      debugHaltHitInstCountReg := debugMacroCountReg
+    when(hitBpExcQ) {
+      debugHaltHitInstCountReg := debugMacroCountLagReg
     }
     val debugHaltHitPcReg = Reg(UInt(32 bits)) init 0
     debugHaltHitPcReg.simPublic()
@@ -1767,7 +1810,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Free-running: never cleared
     // except by CPU reset (it lives in RobPlugin's own logic, which IS the CPU-reset
     // domain -- unlike DebugCtrlPlugin's surviving debug-domain registers).
-    when(debugMacroCountInc =/= 0) { debugMacroCountReg := debugMacroCountReg + debugMacroCountInc.resized }
+    debugMacroCountLagReg := debugMacroCountReg   // retimed: see its declaration
     val haltAfterMacroCompleted = (retire0 && p0.last) || (retire1 && p1.last)
     when(!haltAfterArmedIn || haltAfterInvalidateIn) {
       haltAfterComparePending := False
@@ -1783,13 +1826,16 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // own doc comment, so capturing on EVERY retire vs only on first=True retires is
     // observationally identical for this field; captured unconditionally on any
     // retire for simplicity, matching that equivalence).
-    val debugLastPcReg = Reg(UInt(32 bits)) init 0
+    // RETIMED like `debugMacroCountReg` (200 MHz, 2026-10-06): the physical register
+    // folds in the registered retire snapshot one cycle late, and `debugLastPcReg` is
+    // the exact view (a flop-sourced mux), bit-identical to the old register every cycle.
+    val debugLastPcLagReg = Reg(UInt(32 bits)) init 0
+    debugLastPcLagReg.simPublic()
+    val debugLastPcReg = UInt(32 bits)
     debugLastPcReg.simPublic()
-    when(retire1)      { debugLastPcReg := p1.pc }
-      .elsewhen(retire0) { debugLastPcReg := p0.pc }
-    for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
-      debugLastPcReg := retirePayloads(lane).pc
-    }
+    debugLastPcReg := debugLastPcLagReg
+    for (lane <- 0 until retireWidth) when(dbgRetQ.fire(lane)) { debugLastPcReg := dbgRetQ.pc(lane) }
+    debugLastPcLagReg := debugLastPcReg
 
     // Task 9b: the capture itself. Slot = destination temp - T0 (the transfer's position
     // in the register list). All retire slots are handled, and the writes can never
@@ -1867,9 +1913,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val commitPcs = Seq(commitPc0, commitPc1) ++ retirePayloads.drop(2).map(_.predNextPc)
     commitPcs.foreach(_.simPublic())
     val debugMacroRetirePc = Vec.fill(retireWidth)(Flow(UInt(32 bits)))
+    // ONE CYCLE LATE by contract (DebugHistoryService): sourced from the registered
+    // retire snapshot so the PC-trace ring and the windowed instruction counter never
+    // load the live retire cone.
     for (lane <- 0 until retireWidth) {
-      debugMacroRetirePc(lane).valid := retireLanes(lane) && retirePayloads(lane).last
-      debugMacroRetirePc(lane).payload := retirePayloads(lane).pc
+      debugMacroRetirePc(lane).valid := dbgRetQ.fire(lane) && dbgRetQ.last(lane)
+      debugMacroRetirePc(lane).payload := dbgRetQ.pc(lane)
     }
     // Sim-only taps (root-cause fix, post-Task-P2.5 lock-step investigation): the
     // IRQ lock-step harness's reactive interrupt-line poke needs to react to the
@@ -2957,20 +3006,29 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // faulting instruction has not changed the committed destination mapping.
       // R/M=1 names a FORMAT, not an FP source register. Its operand must come
       // from the immediate/memory capture path, not from FP[format].
-      exc.committedFpSrcIn := Mux(!p0.fpuCmd(14), frameFpSrcRead.data, B(0, 80 bits))
+      // Read in the cycle AFTER the trigger (exc.fpuSrcArch/fpuDstArch come from the
+      // registered command word, see ExceptionUnit `fpUnimpCaptureQ`).
+      exc.committedFpSrcIn := Mux(!exc.entryFpuCmdQ(14), frameFpSrcRead.data, B(0, 80 bits))
       exc.committedFpDstIn := frameFpDstRead.data
     }
     host.get[FpTrapImmediateService].foreach { imm =>
       imm.trapImmAddr := p0.fpuImmTag
       exc.fpuOperandValidIn := !p0.fpuImm || imm.trapImmValid
+      // 200 MHz retime (2026-10-06): the immediate is read at the head on the trigger
+      // cycle exactly as before (the entry is live and backend-owned then), but its RAW
+      // 80 bits are registered there and the format conversion runs in the following
+      // cycle, when ExceptionUnit performs the deferred frame capture. Free-running
+      // RegNexts: no enable, so nothing here loads the entry-trigger cone.
+      val trapImmDataQ = RegNext(imm.trapImmData)
+      val fpuImmQ      = RegNext(p0.fpuImm) init False
       val source = Bits(80 bits)
-      source := FpSource.intToExtended(imm.trapImmData(31 downto 0))
-      switch(p0.fpuCmd(12 downto 10)) {
-        is(B"3'b001") { source := FpSource.singleToExtended(imm.trapImmData(31 downto 0)) }
-        is(B"3'b010") { source := imm.trapImmData }
-        is(B"3'b101") { source := FpSource.doubleToExtended(imm.trapImmData(63 downto 0)) }
+      source := FpSource.intToExtended(trapImmDataQ(31 downto 0))
+      switch(exc.entryFpuCmdQ(12 downto 10)) {
+        is(B"3'b001") { source := FpSource.singleToExtended(trapImmDataQ(31 downto 0)) }
+        is(B"3'b010") { source := trapImmDataQ }
+        is(B"3'b101") { source := FpSource.doubleToExtended(trapImmDataQ(63 downto 0)) }
       }
-      when(p0.fpuImm) { exc.committedFpSrcIn := source }
+      when(fpuImmQ) { exc.committedFpSrcIn := source }
     }
     excIdle := !exc.active
     val excActive = exc.active; excActive.simPublic()
@@ -3886,14 +3944,22 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val a7       = exc.ss.a7
       val odd      = a7(0)
       val oddPrev  = RegNext(odd) init False
+      // ── CAPTURE side, one cycle late (200 MHz, 2026-10-06) ──
+      // The PC ring and the episode capture below run as an exact one-cycle-delayed copy
+      // of their old selves: every input (retire snapshot, edge strobe, A7 value) is
+      // registered, so the captures read back one cycle later and with identical values.
+      // `run` / `armed` / `hit` / `req` -- the HALT decision -- stay on the live signals.
       val last0    = Reg(UInt(32 bits)) init 0   // newest retired PC (registered)
       val last1    = Reg(UInt(32 bits)) init 0
-      when(retire0 && retire1) { last0 := p1.pc; last1 := p0.pc }
-        .elsewhen(retire0)     { last0 := p0.pc; last1 := last0 }
-      for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
-        last0 := retirePayloads(lane).pc; last1 := retirePayloads(lane - 1).pc
+      val rq       = dbgRetQ
+      when(rq.fire(0) && rq.fire(1)) { last0 := rq.pc(1); last1 := rq.pc(0) }
+        .elsewhen(rq.fire(0))        { last0 := rq.pc(0); last1 := last0 }
+      for (lane <- 2 until retireWidth) when(rq.fire(lane)) {
+        last0 := rq.pc(lane); last1 := rq.pc(lane - 1)
       }
-      val pcNow    = Mux(retire1, p1.pc, Mux(retire0, p0.pc, U(0, 32 bits)))
+      val pcNow    = Mux(rq.fire(1), rq.pc(1), Mux(rq.fire(0), rq.pc(0), U(0, 32 bits)))
+      val edgeQ    = RegNext(haltA7OddEnIn && odd && !oddPrev) init False
+      val a7Q      = RegNext(a7) init 0
       val run      = Reg(UInt(16 bits)) init 0
       when(!odd) { run := 0 }
         .elsewhen(run < U(0xFFF0, 16 bits)) { run := run + retiredThisCycle.resized }
@@ -3902,8 +3968,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val pc2      = Reg(UInt(32 bits)) init 0
       val value    = Reg(UInt(32 bits)) init 0
       val episodes = Reg(UInt(16 bits)) init 0
-      when(haltA7OddEnIn && odd && !oddPrev) {
-        pc0 := pcNow; pc1 := last0; pc2 := last1; value := a7
+      when(edgeQ) {
+        pc0 := pcNow; pc1 := last0; pc2 := last1; value := a7Q
         episodes := episodes + 1
       }
       val armed    = RegInit(True)
@@ -3932,24 +3998,33 @@ class RobPlugin(val detailedPerf: Boolean = false,
       val hit0     = retire0 && (p0.pc >= haltPcRangeLoIn) && (p0.pc <= haltPcRangeHiIn)
       val hit1     = retire1 && (p1.pc >= haltPcRangeLoIn) && (p1.pc <= haltPcRangeHiIn)
       val hit      = haltPcRangeEnIn && (hit0 || hit1)
-      val hitPc    = Mux(hit0, p0.pc, p1.pc)
+      // ── CAPTURE side, one cycle late (200 MHz, 2026-10-06) ──
+      // pc0..2 / count / seen and the last0/last1 ring are an exact one-cycle-delayed
+      // copy of their old selves: `hit`, the hit lane, the retire snapshot and the
+      // clear are all registered. `req` -- the halt decision -- stays on the live `hit`.
+      val rq       = dbgRetQ
+      val hitQ     = RegNext(hit) init False
+      val hit0Q    = RegNext(hit0) init False
+      val clearQ   = RegNext(debugClearStickyIn || !haltPcRangeEnIn) init False
+      val hitPc    = Mux(hit0Q, rq.pc(0), rq.pc(1))
       val last0    = Reg(UInt(32 bits)) init 0
       val last1    = Reg(UInt(32 bits)) init 0
-      when(retire0 && retire1) { last0 := p1.pc; last1 := p0.pc }
-        .elsewhen(retire0)     { last0 := p0.pc; last1 := last0 }
-      for (lane <- 2 until retireWidth) when(retireLanes(lane)) {
-        last0 := retirePayloads(lane).pc; last1 := retirePayloads(lane - 1).pc
+      when(rq.fire(0) && rq.fire(1)) { last0 := rq.pc(1); last1 := rq.pc(0) }
+        .elsewhen(rq.fire(0))        { last0 := rq.pc(0); last1 := last0 }
+      for (lane <- 2 until retireWidth) when(rq.fire(lane)) {
+        last0 := rq.pc(lane); last1 := rq.pc(lane - 1)
       }
       val pc0      = Reg(UInt(32 bits)) init 0
       val pc1      = Reg(UInt(32 bits)) init 0
       val pc2      = Reg(UInt(32 bits)) init 0
       val count    = Reg(UInt(16 bits)) init 0
       val seen     = RegInit(False)
-      when(hit && !seen) { pc0 := hitPc; pc1 := last0; pc2 := last1; seen := True }
-      when(hit && count < U(0xFFFF, 16 bits)) { count := count + 1 }
+      when(hitQ && !seen) { pc0 := hitPc; pc1 := last0; pc2 := last1; seen := True }
+      when(hitQ && count < U(0xFFFF, 16 bits)) { count := count + 1 }
+      when(clearQ) { seen := False }
       val req      = RegInit(False)
       when(hit && !coreHalted && (debugHaltState === DebugHaltState.RUNNING)) { req := True }
-      when(debugClearStickyIn || !haltPcRangeEnIn) { req := False; seen := False }
+      when(debugClearStickyIn || !haltPcRangeEnIn) { req := False }
       pc0.simPublic(); pc1.simPublic(); pc2.simPublic(); count.simPublic()
       req.simPublic(); hit.simPublic()
     }

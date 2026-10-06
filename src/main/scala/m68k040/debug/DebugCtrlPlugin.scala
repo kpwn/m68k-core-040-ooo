@@ -795,11 +795,14 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       /** Retired macros this cycle, 0..retireWidth, from the SAME `macroRetirePc` Flows the PC
         * trace ring records. Cross-checkable against OFF_INST_LO by construction, which
         * is how `PerfCounterSpec` proves this lane is not fabricating numbers. */
+      /* `macroRetirePc` is ALREADY one flop behind retirement (DebugHistoryService
+        * contract, 2026-10-06: the ROB sources it from its registered retire snapshot), so
+        * this lane takes no tap of its own -- it stays exactly one flop behind the event,
+        * aligned with `perfRunQ` like every other lane, and never loads the retire cone. */
       val perfEvtInst = if (perfBuilt) {
-        val live = excCountHistory.map(h =>
+        excCountHistory.map(h =>
           h.macroRetirePc.map(_.valid.asUInt.resize(log2Up(h.macroRetirePc.length + 1))).reduce(_ + _)
         ).getOrElse(U(0, 2 bits))
-        RegNext(live) init 0
       } else U(0, 2 bits)
 
       // ── The counters ──────────────────────────────────────────────────────────

@@ -525,10 +525,10 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       for (_ <- 0 until 3) tick()
       assert(seen.size == denseDone, "dense MUL emitted an extra completion")
 
-      // Two .L64 pairs overlap.  Pair A deliberately wraps main ROB 63 -> tail 0;
+      // Two .L64 pairs overlap.  Pair A deliberately wraps main ROB 31 -> tail 0 (32-entry ROB);
       // pair B uses main ROB 1 -> tail 2, so both modulo association and the removal
       // of the old global high-product latch are exercised.
-      val mainA = Req(63, 36, 13, 2, 0, 1,
+      val mainA = Req(31, 36, 13, 2, 0, 1,
         0xffffffffL, 0xffffffffL, signed = false, Size.LONG, is64 = true)
       val tailA = Req(0, 37, 0, 3, 0, 0,
         mainA.a, mainA.b, mainA.signed, Size.LONG, is64 = true, tail = true)
@@ -552,7 +552,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       // times.  Every Flow result still has to emerge once because there is no ROB
       // backpressure with which to recover a dropped completion.
       val collisionMuls = Seq.tabulate(8) { i =>
-        Req(40 + i, 24 + i, 1 + i, 8 + i, 2 * i, 2 * i + 1,
+        Req(16 + i, 24 + i, 1 + i, 8 + i, 2 * i, 2 * i + 1,
           BigInt(0x10101 + i * 0x111), BigInt(3 + i),
           signed = (i & 1) != 0, Size.LONG)
       }
@@ -567,7 +567,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
       s.iSize #= Size.WORD
       s.iSigned #= false
       s.iIs64 #= false
-      s.iRob #= 39
+      s.iRob #= 30
       s.iPsrcA #= 20
       s.iPsrcB #= 21
       s.iPdst #= 40
@@ -595,7 +595,7 @@ class CplxMulPipelineSpec extends AnyFunSuite {
 
       val collisionSeen = seen.slice(collisionFrom, collisionFrom + 1 + collisionMuls.length).toSeq
       val collisionExpected = collisionMuls.map(expected) :+ Expected(
-        rob = 39, pdst = 40, pNzvcDst = 15, dstArch = 7,
+        rob = 30, pdst = 40, pNzvcDst = 15, dstArch = 7,
         data = BigInt(0x0002000eL), nzvc = 0, nzvcWrite = true, tail = false)
       assert(collisionSeen.map(_.rob).distinct.length == collisionExpected.length,
         s"DIV/MUL collision duplicated a completion: ${collisionSeen.map(_.rob)}")

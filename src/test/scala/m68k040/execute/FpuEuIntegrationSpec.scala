@@ -428,6 +428,9 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         assert(s.iReady.toBoolean && s.iFire.toBoolean, s"${cse.label} was not accepted")
         tick()
         s.iValid #= false
+        // +1: DivEu registers its issue payload before the operand reads (200 MHz,
+        // 2026-10-06), so the FS1 gateway shows this uop TWO edges after acceptance.
+        tick()
         sleep(1)
         assert(s.fpSrcObs.toBigInt == cse.src,
           f"${cse.label}: gateway produced 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${cse.src}%020X")
@@ -491,7 +494,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       val Sentinel = ext(true, 0x4003, BigInt("DEADBEEFDEADBEEF", 16))
 
       for ((c, i) <- cases.zipWithIndex) {
-        val rob  = 40 + i
+        val rob  = 8 + i
         val pdst = 4 + i
         val pcc  = 4 + i
         preloadFp(pdst, Sentinel)
@@ -554,7 +557,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // covered, not just the first (the wedged uop).
       preloadFp(1, One); preloadFp(2, Two)
       val before = fpSeen.size
-      issue(rob = 50, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+      issue(rob = 31, opmode = OpFDIV, kind = FpSrcKind.FPREG,
         pFpSrcA = 1, pFpSrcB = 2, pFpDst = 9, pFpccDst = 9, label = "FDIV after FMOVECR")
       drainTo(before + 1, 200, "FDIV after FMOVECR")
       assert(fpSeen.last.data == Half,
@@ -611,8 +614,10 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
         sleep(1)
         assert(s.iFire.toBoolean, s"${c.label} was not accepted")
         tick(); s.iValid #= false
-        // One cycle past the accepting edge: `fpSrcVal` is the FP issue register's output
-        // since task #218 (see the first fpSrcKind test for the full note).
+        // Two edges past acceptance: `fpSrcVal` is the FP issue register's output since
+        // task #218, behind DivEu's operand-read register since 2026-10-06 (see the first
+        // fpSrcKind test for the full note).
+        tick()
         sleep(1)
         assert(s.fpSrcObs.toBigInt == c.expect,
           f"${c.label}: gateway 0x${s.fpSrcObs.toBigInt}%020X, expected 0x${c.expect}%020X")
@@ -645,7 +650,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // Dense II=1 fixed stream: 6 FADDs accepted on consecutive edges, completing in
       // issue order with the descriptor pipe keeping each result on its own robId.
       val start = fpSeen.size
-      val robs = (40 until 46).toList
+      val robs = (10 until 16).toList
       s.iOp #= DecOp.FPU
       s.iFpuOp #= OpFADD; s.iFpSrcKind #= FpSrcKind.FPREG; s.iFpSrcFmt #= 0
       s.iFpWideImm #= BigInt(0)
@@ -689,14 +694,14 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // that survives either lane being re-timed -- while checking every separation's
       // results for loss or cross-talk.
       for ((lead, i) <- (0 until 16).zipWithIndex) {
-        val fpRob = 32 + (i % 16)
+        val fpRob = 16 + (i % 16)
         val fpBefore = fpSeen.size
         val intBefore = intSeen.size
         issue(rob = fpRob, opmode = OpFADD, kind = FpSrcKind.FPREG,
           pFpSrcA = 1, pFpSrcB = 2, pFpDst = 5, pFpccDst = 5, label = s"collision FADD lead=$lead")
         if (lead > 0) tick(lead)
         s.iOp #= DecOp.MUL
-        s.iRob #= 63; s.iPsrcA #= 20; s.iPsrcB #= 21
+        s.iRob #= 15; s.iPsrcA #= 20; s.iPsrcB #= 21
         s.iPdst #= 22; s.iPdstValid #= true; s.iPNzvcDst #= 3; s.iWritesNzvc #= true
         s.iSize #= Size.LONG
         s.iValid #= true
@@ -717,7 +722,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
           s"lead=$lead: int lane produced ${intSeen.size - intBefore} completions, expected 1")
         assert(fpSeen.last.rob == fpRob && fpSeen.last.data == Three,
           s"lead=$lead: FP result lost/corrupted (rob=${fpSeen.last.rob})")
-        assert(intSeen.last._2 == 63, s"lead=$lead: int result lost (rob=${intSeen.last._2})")
+        assert(intSeen.last._2 == 15, s"lead=$lead: int result lost (rob=${intSeen.last._2})")
         assert(readFp(5) == Three, s"lead=$lead: FP PRF write lost")
         s.rdIntAddr #= 22; sleep(1)
         assert(s.rdIntData.toBigInt == BigInt(63), s"lead=$lead: int PRF write lost")
@@ -737,10 +742,10 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- baseline: FDIV 1.0/2.0 = 0.5 on the single-context iterative lane ----
       var before = fpSeen.size
-      issue(rob = 60, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+      issue(rob = 24, opmode = OpFDIV, kind = FpSrcKind.FPREG,
         pFpSrcA = 1, pFpSrcB = 2, pFpDst = 6, pFpccDst = 6, label = "FDIV")
       drainTo(before + 1, 200, "FDIV")
-      assert(fpSeen.last.rob == 60, s"FDIV completed rob=${fpSeen.last.rob}")
+      assert(fpSeen.last.rob == 24, s"FDIV completed rob=${fpSeen.last.rob}")
       assert(fpSeen.last.data == Half, f"FDIV result 0x${fpSeen.last.data}%020X, expected 0.5")
       tick()
       assert(readFp(6) == Half, "FDIV FP PRF write did not land")
@@ -748,7 +753,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- FSQRT 4.0 = 2.0 (the same lane, the other op) ----
       before = fpSeen.size
-      issue(rob = 61, opmode = OpFSQRT, kind = FpSrcKind.FPREG,
+      issue(rob = 25, opmode = OpFSQRT, kind = FpSrcKind.FPREG,
         pFpSrcA = 3, pFpSrcB = 3, pFpDst = 7, pFpccDst = 7, label = "FSQRT")
       drainTo(before + 1, 200, "FSQRT")
       assert(fpSeen.last.data == Two, f"FSQRT(4.0) = 0x${fpSeen.last.data}%020X, expected 2.0")
@@ -761,7 +766,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // whole contract: no wrong-path writeback, the ack DOES eventually fire, and the lane
       // becomes genuinely reusable.
       before = fpSeen.size
-      issue(rob = 62, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+      issue(rob = 26, opmode = OpFDIV, kind = FpSrcKind.FPREG,
         pFpSrcA = 1, pFpSrcB = 2, pFpDst = 8, pFpccDst = 8, label = "flushed FDIV")
       tick(10)
       assert(s.fpIterBusyO.toBoolean && s.coreIterBusy.toBoolean,
@@ -796,10 +801,10 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
 
       // ---- and the lane genuinely recovers: a NEW FDIV runs to completion ----
       before = fpSeen.size
-      issue(rob = 63, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+      issue(rob = 27, opmode = OpFDIV, kind = FpSrcKind.FPREG,
         pFpSrcA = 3, pFpSrcB = 2, pFpDst = 9, pFpccDst = 9, label = "post-flush FDIV")
       drainTo(before + 1, 200, "post-flush FDIV")
-      assert(fpSeen.last.rob == 63, s"post-flush FDIV completed rob=${fpSeen.last.rob}")
+      assert(fpSeen.last.rob == 27, s"post-flush FDIV completed rob=${fpSeen.last.rob}")
       assert(fpSeen.last.data == Two,
         f"post-flush FDIV(4.0/2.0) = 0x${fpSeen.last.data}%020X, expected 2.0")
       tick()
@@ -813,7 +818,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       // the divide to still emerge, exactly once, with the right value: acknowledging
       // unconditionally would silently drop it, with no backpressure to recover it.
       before = fpSeen.size
-      issue(rob = 33, opmode = OpFDIV, kind = FpSrcKind.FPREG,
+      issue(rob = 31, opmode = OpFDIV, kind = FpSrcKind.FPREG,
         pFpSrcA = 1, pFpSrcB = 2, pFpDst = 10, pFpccDst = 10, label = "buried FDIV")
       tick(45)
       s.iOp #= DecOp.FPU
@@ -833,15 +838,15 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       s.iValid #= false
       drainTo(before + 1 + burialRobs.length, 250, "buried FDIV + burial stream")
       val buried = fpSeen.slice(before, fpSeen.size).toSeq
-      val divHits = buried.filter(_.rob == 33)
+      val divHits = buried.filter(_.rob == 31)
       assert(divHits.length == 1,
         s"the FDIV buried under a dense fixed stream completed ${divHits.length} times " +
         "(0 = it was acknowledged on a cycle the fixed lane owned the completion register, " +
         "and silently dropped)")
       assert(divHits.head.data == Half,
         f"buried FDIV result 0x${divHits.head.data}%020X, expected 0.5")
-      assert(buried.count(_.rob != 33) == burialRobs.length,
-        s"the burial stream lost completions: ${buried.count(_.rob != 33)}/${burialRobs.length}")
+      assert(buried.count(_.rob != 31) == burialRobs.length,
+        s"the burial stream lost completions: ${buried.count(_.rob != 31)}/${burialRobs.length}")
       assert(!s.fpIterBusyO.toBoolean, "iterative lane never freed after the buried FDIV")
     }
   }
@@ -861,7 +866,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       s.iPdstValid #= false; s.iWritesNzvc #= false
       s.iValid #= true
       for (i <- 0 until 6) {
-        s.iRob #= 40 + i; s.iPFpDst #= 4 + i; s.iPFpccDst #= 4 + i
+        s.iRob #= 8 + i; s.iPFpDst #= 4 + i; s.iPFpccDst #= 4 + i
         sleep(1)
         assert(s.iFire.toBoolean, s"pre-flush FADD $i was not accepted")
         tick()
@@ -881,7 +886,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       s.iValid #= true
       s.iPFpSrcA #= 3; s.iPFpSrcB #= 2      // 4.0 + 2.0 = 6.0, distinct from 3.0
       for (i <- 0 until 6) {
-        s.iRob #= 40 + i; s.iPFpDst #= 4 + i; s.iPFpccDst #= 4 + i
+        s.iRob #= 8 + i; s.iPFpDst #= 4 + i; s.iPFpccDst #= 4 + i
         sleep(1)
         assert(s.iFire.toBoolean, s"post-flush FADD $i was not accepted")
         tick()
@@ -889,7 +894,7 @@ class FpuEuIntegrationSpec extends AnyFunSuite {
       s.iValid #= false
       drainTo(start + 6, FpuCore.FixedLatency + 20, "post-flush reuse")
       val got = fpSeen.slice(start, start + 6).toSeq
-      assert(got.map(_.rob) == (40 until 46).toList, s"post-flush reuse order: ${got.map(_.rob)}")
+      assert(got.map(_.rob) == (8 until 14).toList, s"post-flush reuse order: ${got.map(_.rob)}")
       got.foreach { g =>
         assert(g.data == Six, f"post-flush rob=${g.rob} result 0x${g.data}%020X, expected 6.0")
       }

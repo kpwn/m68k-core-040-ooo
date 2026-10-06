@@ -393,8 +393,26 @@ class ExceptionUnit(
   /** The FP register numbers the captured command word names, exposed so a future wiring
     * can address the FP RAT with them. CMDREG1B layout (MC68040 UM Figure 9-8, 1989 1st
     * ed. p.9-33): [15:13] OPCLASS, [12:10] SRC (Rx), [9:7] DST (Ay), [6:0] OPMODE. */
-  val fpuSrcArch = entryFpuCmd(12 downto 10).asUInt; fpuSrcArch.simPublic()
-  val fpuDstArch = entryFpuCmd(9 downto 7).asUInt;   fpuDstArch.simPublic()
+  //
+  // 200 MHz retime (2026-10-06): the unimplemented-instruction frame capture is COLD, so it
+  // lands ONE CYCLE AFTER the vector-11 entry trigger (`fpUnimpCaptureQ`). The command word
+  // is registered on the trigger edge (`entryFpuCmdQ`), the FP-register reads below are
+  // addressed from it in that following cycle, and the wiring supplies
+  // `committedFpSrcIn`/`committedFpDstIn` for THAT cycle (RobPlugin registers the
+  // immediate-table read on the trigger edge). This cuts head -> ROB payload -> FP
+  // immediate table -> format conversion -> uiSrcOperand into two cycles. The committed
+  // FP map and those physical registers cannot change in between: the FSM is active, so
+  // nothing retires and no FP write is committed.
+  val entryFpuCmdQ = RegNext(entryFpuCmd) init 0
+  val fpuSrcArch = entryFpuCmdQ(12 downto 10).asUInt; fpuSrcArch.simPublic()
+  val fpuDstArch = entryFpuCmdQ(9 downto 7).asUInt;   fpuDstArch.simPublic()
+  val fpUnimpCaptureNow = Bool(); fpUnimpCaptureNow := False
+  val fpUnimpCaptureQ = RegNext(fpUnimpCaptureNow) init False
+  fpUnimpCaptureQ.simPublic()
+  when(fpUnimpCaptureQ) {
+    setUnimpFramePort.valid   := True
+    setUnimpFramePort.payload := entryFpuCmdQ ## committedFpSrcIn ## committedFpDstIn
+  }
   // Architectural FPSR WRITE -> the renamed FPCC's committed physical register. Mirrors
   // rteNzvcWriteValid/rteNzvcWriteData EXACTLY (see its doc comment below for the full
   // argument for why a DIRECT committed-mapping write is required and a rename allocation
@@ -1681,8 +1699,10 @@ class ExceptionUnit(
         // Non-speculative: exception delivery is at commit.
         when(entryVector === 11 && entryFpuUnimp) {
           assert(fpuOperandValidIn, "FP emulation captured an invalid/reclaimed source operand")
-          setUnimpFramePort.valid   := True
-          setUnimpFramePort.payload := entryFpuCmd ## committedFpSrcIn ## committedFpDstIn
+          // The frame write itself lands on the NEXT edge (`fpUnimpCaptureQ`, see its
+          // declaration); an FSAVE cannot consume it earlier -- it is a later sysOp of
+          // this same FSM, which is busy stacking this entry's frame.
+          fpUnimpCaptureNow := True
           // FPIAR := the faulting instruction's OWN PC (its architectural definition,
           // "last FP exception PC"). `entryPc` is the POST-instruction PC for this class
           // (Task 10 sets faultUsesNextPc so a real FPSP can RTE past the instruction),
