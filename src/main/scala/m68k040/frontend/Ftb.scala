@@ -85,17 +85,21 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
                    (qEntry.brWordOff >= cmd.payload.drop)
 
     val rspValid = RegNext(cmd.valid) init False
+    // FMAX 200 MHz (t200-dec): captured UNCONDITIONALLY. `cmd.valid` is FetchAlign's
+    // `planLookupFire = ic.cmd.fire && ...`, the end of the fetch-PC -> ITLB CAM ->
+    // I-cache-ready cone, and as this register's CE it put ~60 flops on that cone. The
+    // payload is a Flow's: every consumer qualifies it by `rsp.valid` (= RegNext of
+    // cmd.valid), so its value on a non-response cycle is unobservable.
     val rspPayload = Reg(FtbLookupRsp())
-    when(cmd.valid) {
-      rspPayload.windowPc  := cmd.payload.windowPc
-      rspPayload.token     := cmd.payload.token
-      rspPayload.hit       := qHit
-      rspPayload.framedOk  := qFramed
-      rspPayload.brWordOff := qEntry.brWordOff
-      rspPayload.brLen     := qEntry.brLen
-      rspPayload.target    := qEntry.target
-      rspPayload.brType    := qEntry.brType
-    }
+    rspPayload.windowPc  := cmd.payload.windowPc
+    rspPayload.token     := cmd.payload.token
+    rspPayload.hit       := qHit
+    rspPayload.framedOk  := qFramed
+    rspPayload.brWordOff := qEntry.brWordOff
+    rspPayload.brLen     := qEntry.brLen
+    rspPayload.target    := qEntry.target
+    rspPayload.brType    := qEntry.brType
+    rspPayload.framedUncond := qFramed && (qEntry.brType =/= 0)
     val rsp = Flow(FtbLookupRsp())
     rsp.valid := rspValid
     rsp.payload := rspPayload

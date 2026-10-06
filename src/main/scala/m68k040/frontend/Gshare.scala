@@ -158,13 +158,15 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
       winIdxComb(i) := indexOf(winCmd.payload.windowPc + U(i * 2, 32 bits))
       winTakenComb(i) := pht.readAsync(winIdxComb(i)) >= U(2, 2 bits)
     }
+    // FMAX 200 MHz (t200-dec): captured UNCONDITIONALLY. `winCmd.valid` is FetchAlign's
+    // `planLookupFire` (ic.cmd.fire, i.e. the ITLB CAM / I-cache-ready cone) and as the
+    // CE of these ~50 flops it was a failing endpoint family. A Flow payload: every
+    // consumer qualifies it by `winRsp.valid` (= RegNext(winCmd.valid)).
     val winPayload = Reg(GshareWindowRsp(idxBits))
-    when(winCmd.valid) {
-      winPayload.token := winCmd.payload.token
-      for (i <- 0 until 4) {
-        winPayload.taken(i) := winTakenComb(i)
-        winPayload.phtIdx(i) := winIdxComb(i)
-      }
+    winPayload.token := winCmd.payload.token
+    for (i <- 0 until 4) {
+      winPayload.taken(i) := winTakenComb(i)
+      winPayload.phtIdx(i) := winIdxComb(i)
     }
     val winRsp = Flow(GshareWindowRsp(idxBits))
     winRsp.valid := RegNext(winCmd.valid) init False

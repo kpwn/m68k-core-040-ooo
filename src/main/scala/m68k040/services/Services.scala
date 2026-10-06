@@ -323,7 +323,10 @@ case class FtbLookupCmd() extends Bundle {
 /** `framedOk` is the registered conjunction `hit && brLen =/= 0 &&
   * brWordOff + brLen <= 4 && brWordOff >= cmd.drop`, computed at command time.
   * FetchAlign consumes it as one bit; the live equivalent is retained there only as a
-  * simulation oracle and decline telemetry (amendment §2.1.1, §4). */
+  * simulation oracle and decline telemetry (amendment §2.1.1, §4).
+  * `framedUncond` (t200-dec) is the same registered verdict pre-ANDed with the
+  * unconditional-type test, `framedOk && brType =/= 0`, so the application decision
+  * needs only `framedUncond || (framedOk && gshareTaken(brWordOff))`. */
 case class FtbLookupRsp() extends Bundle {
   val windowPc  = UInt(32 bits)
   val token     = FetchPlanToken()
@@ -333,6 +336,7 @@ case class FtbLookupRsp() extends Bundle {
   val brLen     = UInt(4 bits)
   val target    = UInt(32 bits)
   val brType    = UInt(2 bits)
+  val framedUncond = Bool()
 }
 
 /** FtbPlugin is the sole provider. FetchAlign drives the command and mismatch

@@ -149,8 +149,10 @@ class M68kCore(val plugins: Seq[FiberPlugin], exposeDebugPorts: Boolean = false,
       // the BTB's per-instruction combinational lookup above).
       val ftb = host[m68k040.frontend.FtbPlugin]
       ftbRspValid    := ftb.logic.rsp.valid
-      ftbRspHit      := ftb.logic.rsp.payload.hit
-      ftbRspFramedOk := ftb.logic.rsp.payload.framedOk
+      // Qualified by valid (t200-dec): the FTB response payload is now captured every
+      // cycle, so the payload bits are only meaningful on a response cycle.
+      ftbRspHit      := ftb.logic.rsp.valid && ftb.logic.rsp.payload.hit
+      ftbRspFramedOk := ftb.logic.rsp.valid && ftb.logic.rsp.payload.framedOk
       ftbRspTarget   := ftb.logic.rsp.payload.target
 
       // Round 3 taps: the FTB lookup COMMAND (query address, at the

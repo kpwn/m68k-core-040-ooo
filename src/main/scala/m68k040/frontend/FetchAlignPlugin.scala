@@ -669,8 +669,18 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       // resultDirection && !ftbBlocked` — `resultFramedOk` already carries the provider's
       // tag hit, so the only change is WHERE the hit/in-window/after-drop conjunction is
       // evaluated. Every remaining term is a register or a one-level select of one.
+      // FMAX 200 MHz (t200-dec): `resultFramedOk && resultDirection` is evaluated from
+      // the provider's pre-ANDed `framedUncond` (= framedOk && brType =/= 0, registered
+      // at the FTB read), leaving one select of the gshare taken bit: the 2-bit brType
+      // compare no longer sits in series in front of the fetch-PC mux / ITLB CAM.
+      val resultApplyVerdict = ftbRsp.payload.framedUncond ||
+        (resultFramedOk && gshareWindowRsp.payload.taken(ftbRsp.payload.brWordOff))
+      when(resultProvidersValid) {
+        assert(resultApplyVerdict === (resultFramedOk && resultDirection),
+          "precomputed FTB apply verdict diverged from framedOk && direction")
+      }
       applyNow := resultExpectedValid && resultProvidersValid && resultSlotLegal &&
-                  resultFramedOk && resultDirection && !ftbBlocked
+                  resultApplyVerdict && !ftbBlocked
       when(applyNow) {
         assert(resultSlotLegal && resultEnd > ringDrop(resultSlot).resize(5),
           "applied FTB plan violates its ring slot/drop framing contract")
@@ -801,10 +811,21 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       ftqTail := ftqInc(ftqTail)
       when(!ic.cmd.fire) {
         targetHoldValid := True
-        targetHoldPc    := directTargetPc
-        targetHoldDrop  := ftbRsp.payload.target(2 downto 1)
       }
     }
+    // FMAX 200 MHz (t200-dec): the held target is loaded every cycle the hold is EMPTY
+    // instead of under `applyNow && !ic.cmd.fire` (the ITLB CAM / I-cache-ready cone on
+    // 31 CEs). Identical: the hold is set only by `applyNow && !fire`, and `applyNow`
+    // requires `!ftbBlocked`, which includes `targetHoldValid`, so the setting cycle
+    // always has the hold empty and loads the very same `directTargetPc`/drop; while
+    // valid the registers hold; every reader (`cmdWindowPc`/`cmdDrop`) is qualified by
+    // `targetHoldValid`.
+    when(!targetHoldValid) {
+      targetHoldPc    := directTargetPc
+      targetHoldDrop  := ftbRsp.payload.target(2 downto 1)
+    }
+    assert(!(applyNow && !ic.cmd.fire && targetHoldValid),
+      "FTB target hold set while already holding (unconditional load would drop it)")
     when(targetHoldValid && ic.cmd.fire) {
       targetHoldValid := False
     }

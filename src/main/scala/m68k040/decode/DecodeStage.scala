@@ -349,7 +349,22 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         val sl = ImmEnc.grpSel(pk, q)
         grpData(32 * sl + 31 downto 32 * sl) := (if (pk == 0) a0 else a1raw).uops(q).imm
       }
-      grpMem.write(address = grpTag, data = grpData, enable = fed.valid)
+      // FMAX 200 MHz (t200-dec): the write is REGISTERED and lands one cycle late.
+      // `grpData` is the end of the whole `assemble` imm cone out of `fed`'s payload, and
+      // driving the LUTRAM DIN from it put ~230 failing paths (20 levels) on the RAM32M
+      // data pins. Writing the registered {tag, data, en} one cycle later is invisible to
+      // every reader: the only reader is `widen` at the MicroOpQueue POP, and a uop that
+      // leaves `fed` (or the stash) at cycle E sits in `pushReg` at E+1, is written into the
+      // ring at the end of E+1 and can pop no earlier than E+2 (the queue has no push->pop
+      // bypass: pop.valid is `count > 0`, a register). The delayed write of the cycle-E
+      // contents lands at the end of E+1, so it is visible at E+2. The lap bound is
+      // unaffected: the write pairs the SAME {tag, data} as before, merely later, and an
+      // entry that is dead at E stays dead at E+1. A sim-only shadow bank written the old
+      // (immediate) way is compared against every live popped read below.
+      val grpWrEn   = RegNext(fed.valid) init False
+      val grpWrAddr = RegNext(grpTag)
+      val grpWrData = RegNext(grpData)
+      grpMem.write(address = grpWrAddr, data = grpWrData, enable = grpWrEn)
       when(fed.fire) { grpTag := (grpTag + 1).resized }
 
       // PUSH bank -- the MOVEM / MOVEP / FMOVEM.X / microcode sequencers, which HOLD
@@ -363,8 +378,26 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       pushMem.addAttribute("ram_style", "distributed")
       val pushData = Bits(ImmEnc.PUSH_ENTRY_W bits)
       val pushWr   = Bool()
-      pushMem.write(address = pushTag, data = pushData, enable = pushWr)
+      // FMAX 200 MHz (t200-dec): registered, one-cycle-late write -- the same argument as
+      // the GROUP bank above. `pushWr` carries `pushProduced.ready` and the sequencer arm
+      // select (and the data the per-arm FSM uop imm), ~160 failing paths on the RAM32M
+      // WE pins. A uop pushed at cycle E (pushProduced.fire) pops at E+2 at the earliest;
+      // the delayed write lands at the end of E+1. `pushTag` itself still advances on the
+      // push cycle, so tag allocation order is unchanged.
+      val pushWrEn   = RegNext(pushWr) init False
+      val pushWrAddr = RegNext(pushTag)
+      val pushWrData = RegNext(pushData)
+      pushMem.write(address = pushWrAddr, data = pushWrData, enable = pushWrEn)
       when(pushWr) { pushTag := (pushTag + 1).resized }
+
+      // Sim-only shadows written the ORIGINAL (same-cycle) way; every live popped read
+      // of either bank is compared against them below (`widenCheck`).
+      val grpShadow  = GenerationFlags.simulation {
+        val m = Mem(Bits(ImmEnc.GRP_ENTRY_W bits), depth)
+        m.write(address = grpTag, data = grpData, enable = fed.valid); m }
+      val pushShadow = GenerationFlags.simulation {
+        val m = Mem(Bits(ImmEnc.PUSH_ENTRY_W bits), depth)
+        m.write(address = pushTag, data = pushData, enable = pushWr); m }
 
       /** 32-bit architectural uop -> narrow decode record, GROUP bank. */
       def grp(u: DecodedUop, pk: Int, pos: Int): DecodedUop =
@@ -554,8 +587,32 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       // Driven at the push chain: the normal head (with a pending immediate) enters
       // pushReg this cycle. Its tag is stamped into that uop's imm there too.
       val allocFire = Bool()
-      mem.write(address = allocIdx, data = headVal, enable = allocFire)
+      // FMAX 200 MHz (t200-dec): the LUTRAM write is REGISTERED and lands one cycle late.
+      // `allocFire` is the end of the deep decode/consume cone (normalPushSel,
+      // pushProduced.ready, headPend <- assemble) and fanned out to all 192 RAM32M WE pins
+      // of this 80-bit table. The valid/backend bookkeeping below still uses the LIVE
+      // `allocOhFire`, so allocation order, the full/stall decision and every free are
+      // unchanged; only the DATA lands later. No reader can need it earlier: an entry
+      // allocated at cycle E belongs to a uop that is in pushReg at E+1, in the
+      // MicroOpQueue from E+2 at the earliest (it becomes `backend` only on that pop), and
+      // DivEu reads it (`_fpImmRdAddr`) after rename + issue, i.e. later still; the trap
+      // read is qualified by `backend`. The delayed write lands at the end of E+1. Proven
+      // live in simulation against a same-cycle-written shadow (`memShadow` below).
+      val wrEnQ   = RegNext(allocFire) init False
+      val wrIdxQ  = RegNext(allocIdx)
+      val wrDataQ = RegNext(headVal)
+      mem.write(address = wrIdxQ, data = wrDataQ, enable = wrEnQ)
       val allocOhFire = Mux(allocFire, allocOh, B(0, depth bits))
+      // FMAX 200 MHz (t200-dec): a REGISTERED superset of `full` for the shallow transfer
+      // hint (`hFpImm` -> `fedColdHint` -> `fedAllowXfer` -> raw.ready -> df.feed.ready ->
+      // every FetchAlign feed.fire consumer, incl. the RAS CEs). `full` itself is a 16-wide
+      // AND of `valid`, but Vivado merged it with the allocator's OHMasking prefix chain and
+      // the measured path was 16 levels from `valid_reg`. `valid(t)` is a subset of
+      // `valid(t-1) | allocOhFire(t-1)` and `allocOhFire` is at most one-hot, so
+      // `full(t)` implies `valid(t-1)` had at most ONE clear bit. A false positive only
+      // costs the existing one-bubble cold path for an FP #imm head with 15/16 entries live.
+      val fullHint = RegNext(CountOne(~valid) <= 1) init False
+      assert(!(full && !fullHint), "FpImmTable: registered fullHint is not a superset of full", FAILURE)
 
       def isFpImmUop(u: DecodedUop): Bool =
         (u.op === DecOp.FPU || u.fpuSoftwareComplete) && (u.fpSrcKind === FpSrcKind.INTIMM || u.fpSrcKind === FpSrcKind.SINGLEIMM ||
@@ -580,6 +637,21 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       _fpImmRdData := mem.readAsync(_fpImmRdAddr)
       _trapImmData := mem.readAsync(_trapImmAddr)
       _trapImmValid := valid(_trapImmAddr) && backend(_trapImmAddr)
+
+      // t200-dec proof of the one-cycle-late write: every BACKEND-owned live entry (the
+      // only entries any reader may touch) must read the same 80 bits as a shadow written
+      // the original, same-cycle way. Also checked at the consumer release itself.
+      GenerationFlags.simulation {
+        val memShadow = Mem(Bits(80 bits), depth)
+        memShadow.write(address = allocIdx, data = headVal, enable = allocFire)
+        for (e <- 0 until depth) {
+          val a = U(e, tagW bits)
+          assert(!(valid(e) && backend(e) && (mem.readAsync(a) =/= memShadow.readAsync(a))),
+            s"FpImmTable: backend-owned entry $e reads data the registered write has not landed", FAILURE)
+        }
+        assert(!(free.valid && (mem.readAsync(free.payload) =/= memShadow.readAsync(free.payload))),
+          "FpImmTable: DivEu released an entry whose registered write had not landed", FAILURE)
+      }
 
       // Sim-only invariants (the plan's "entry valid at consume", plus the domain rules).
       assert(!(free.valid && !valid(free.payload)),
@@ -1178,6 +1250,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val slot1IsMovem = slot1IsMovemEarly   // slot1's MOVEM marker (decoded above, shared via CSE)
     val movemPendValid = RegInit(False)
     val movemPendPkt   = Reg(DecodePacket())
+    // t200-dec: the original per-arm write enable of the pend packet registers, kept only
+    // as a wire for the sim proof at the end of this Area (see `pendCapture`).
+    val movemPendLoad  = Bool(); movemPendLoad := False
     when(pipeFlush) { movemPendValid := False }
     // Hoisted early (also used by movemBegin and ucBegin mutual-exclusion guards):
     val movepActive    = RegInit(False)
@@ -1192,6 +1267,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // exist. Mirrors movemPendValid/movemPendPkt verbatim.
     val fmovemxPendValid = RegInit(False)
     val fmovemxPendPkt   = Reg(DecodePacket())
+    val fmovemxPendLoad  = Bool(); fmovemxPendLoad := False
     when(pipeFlush) { fmovemxPendValid := False }
 
     // The source packet the FSM enters from: the stashed slot1 MOVEM, else slot0.
@@ -1319,6 +1395,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // MOVEP entry: a pending slot1 MOVEP (movepPendValid), else slot0. Decode Dx/Ay/disp16.
     // movepPendValid declared above (hoisted).
     val movepPendPkt   = Reg(DecodePacket())
+    val movepPendLoad  = Bool(); movepPendLoad := False
     when(pipeFlush) { movepPendValid := False }
     val movepEntryPkt  = Mux(movepPendValid, movepPendPkt, fed.payload.packets(0))
     val mpOpw    = movepEntryPkt.words(0)
@@ -1653,6 +1730,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // PACKET is stashed; the engine enters from it next cycle. `fed` was already consumed
     // when the slot1 was stashed (the FOLLOWING group is held until the engine finishes).
     val ucPendPkt   = Reg(DecodePacket())
+    val ucPendLoad  = Bool(); ucPendLoad := False
     // FMAX "LEVER U1" (docs/superpowers/specs/2026-08-08-fmax-leveru1-ucpendpkt-reuse-design.md,
     // .../plans/2026-08-08-fmax-leveru1-ucpendpkt-reuse-plan.md): the stashed slot-1 packet's
     // OpSpec, captured from the ALREADY-COMPUTED, ALREADY-REGISTERED `fed.payload.specs(1).spec`
@@ -2243,13 +2321,16 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       Mux(movemPcIdxResumeFire, movemPcIdxRealNextPc, ucMoveRealNextPc)
     val ucComplexResumeValidReg = Reg(Bool()) init False
     val ucComplexResumeTargetReg = Reg(UInt(32 bits)) init 0
+    // FMAX 200 MHz (t200-dec): the target is captured UNCONDITIONALLY (no CE). Its only
+    // reader is `ucComplexResume.payload`, consumed solely under `ucComplexResume.valid`
+    // (= ValidReg, which is set exactly on the cycle after a kept detect -- the very cycle
+    // whose capture this is); the detect-gated CE carried ucBegin/movemBegin and the
+    // whole slot0 classifier cone onto 32 flop CEs.
+    ucComplexResumeTargetReg := ucComplexResumeTarget
     when(pipeFlush) {
       ucComplexResumeValidReg := False
     } otherwise {
       ucComplexResumeValidReg := ucComplexResumeDetect
-      when(ucComplexResumeDetect) {
-        ucComplexResumeTargetReg := ucComplexResumeTarget
-      }
     }
     val ucComplexResume = Flow(UInt(32 bits))
     ucComplexResume.valid   := ucComplexResumeValidReg && !pipeFlush
@@ -3254,7 +3335,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val hCpGen    = (hOpw(15 downto 6) === B"10'b1111001000")
     val hFmovemx  = hCpGen && (s0pkt.words(1)(15 downto 14) === B"2'b11")
     val hFpImm    = spec0.fpGeneric && (s0pkt.words(1)(15 downto 13) === B"3'b010") &&
-                    (hOpw(5 downto 0) === B"6'b111100") && fpImmTable.full
+                    (hOpw(5 downto 0) === B"6'b111100") && fpImmTable.fullHint
     val fedColdHint = spec0.movem || spec0.movep || spec0.microcoded || hMemInd || hBf ||
                       hFmovemx || hFpImm
     fedAllowXfer := !fed.valid || (fedFastConsume && !fedColdHint)
@@ -3271,23 +3352,22 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       } elsewhen(slot1IsMovem) {
         // slot0 (non-MOVEM) emitted this cycle; stash the slot1 MOVEM packet, consume fed.
         movemPendValid := True
-        movemPendPkt   := fed.payload.packets(1)
+        movemPendLoad := True   // t200-dec: payload captured unconditionally while !movemPendValid
       } elsewhen(slot1IsMovepEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MOVEP packet, consume fed.
         // The MOVEP FSM enters from it next cycle (mirrors the slot1 MOVEM pend).
         movepPendValid := True
-        movepPendPkt   := fed.payload.packets(1)
+        movepPendLoad := True   // t200-dec: payload captured unconditionally while !movepPendValid
       } elsewhen(slot1IsFmovemx) {
         // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
         // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
         fmovemxPendValid := True
-        fmovemxPendPkt   := fed.payload.packets(1)
+        fmovemxPendLoad := True   // t200-dec: payload captured unconditionally while !fmovemxPendValid
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
         // slot0 (normal) emitted this cycle; stash the slot1 MICROCODED packet, consume fed.
         // The engine enters from it next cycle (mirrors the slot1 MOVEM pend).
         ucPendValid := True
-        ucPendPkt   := fed.payload.packets(1)
-        ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
+        ucPendLoad := True   // t200-dec: payload captured unconditionally while !ucPendValid
       } elsewhen(deferSlot1 && fed.valid) {
         stashValid  := True                  // defer slot1 to next cycle (3-µop slot0 or slot1)
       }
@@ -3348,15 +3428,15 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       when(movemEnterSlot0 && fed.payload.slot1Valid) {
         when(slot1IsMovem) {
           movemPendValid := True
-          movemPendPkt   := fed.payload.packets(1)
+          movemPendLoad := True   // t200-dec: payload captured unconditionally while !movemPendValid
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
-          movepPendPkt   := fed.payload.packets(1)
+          movepPendLoad := True   // t200-dec: payload captured unconditionally while !movepPendValid
         } elsewhen(slot1IsFmovemx) {
         // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
         // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
         fmovemxPendValid := True
-        fmovemxPendPkt   := fed.payload.packets(1)
+        fmovemxPendLoad := True   // t200-dec: payload captured unconditionally while !fmovemxPendValid
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           // A µCODE-OWNED slot1 (CAS/MOVES/BCD-mem/mem-indirect/bf-dyn) behind a slot0
           // MOVEM must stash the PACKET for the engine (ucPend), NOT the a1raw µops —
@@ -3366,8 +3446,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
           // MISSING it (latent phantom-commit bug for a {MOVEM, µcoded} fetch pair —
           // proven by the movem-ucode-s1 lock-step, which diverges without this arm).
           ucPendValid := True
-          ucPendPkt   := fed.payload.packets(1)
-          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
+          ucPendLoad := True   // t200-dec: payload captured unconditionally while !ucPendValid
         } otherwise {
           stashValid  := True
         }
@@ -3477,19 +3556,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       when(fmovemxEnterSlot0 && fed.payload.slot1Valid) {
         when(slot1IsMovem) {
           movemPendValid := True
-          movemPendPkt   := fed.payload.packets(1)
+          movemPendLoad := True   // t200-dec: payload captured unconditionally while !movemPendValid
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
-          movepPendPkt   := fed.payload.packets(1)
+          movepPendLoad := True   // t200-dec: payload captured unconditionally while !movepPendValid
         } elsewhen(slot1IsFmovemx) {
         // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
         // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
         fmovemxPendValid := True
-        fmovemxPendPkt   := fed.payload.packets(1)
+        fmovemxPendLoad := True   // t200-dec: payload captured unconditionally while !fmovemxPendValid
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
-          ucPendPkt   := fed.payload.packets(1)
-          ucPendSpecReg := fed.payload.specs(1).spec
+          ucPendLoad := True   // t200-dec: payload captured unconditionally while !ucPendValid
         } otherwise {
           stashValid  := True
         }
@@ -3588,19 +3666,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       when(ucEnterSlot0 && fed.payload.slot1Valid) {
         when(slot1IsMovem) {
           movemPendValid := True
-          movemPendPkt   := fed.payload.packets(1)
+          movemPendLoad := True   // t200-dec: payload captured unconditionally while !movemPendValid
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
-          movepPendPkt   := fed.payload.packets(1)
+          movepPendLoad := True   // t200-dec: payload captured unconditionally while !movepPendValid
         } elsewhen(slot1IsFmovemx) {
         // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
         // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
         fmovemxPendValid := True
-        fmovemxPendPkt   := fed.payload.packets(1)
+        fmovemxPendLoad := True   // t200-dec: payload captured unconditionally while !fmovemxPendValid
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
-          ucPendPkt   := fed.payload.packets(1)
-          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
+          ucPendLoad := True   // t200-dec: payload captured unconditionally while !ucPendValid
         } otherwise {
           stashValid := True
         }
@@ -3636,19 +3713,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       when(movepEnterSlot0 && fed.payload.slot1Valid) {
         when(slot1IsMovem) {
           movemPendValid := True
-          movemPendPkt   := fed.payload.packets(1)
+          movemPendLoad := True   // t200-dec: payload captured unconditionally while !movemPendValid
         } elsewhen(slot1IsMovepEarly) {
           movepPendValid := True
-          movepPendPkt   := fed.payload.packets(1)
+          movepPendLoad := True   // t200-dec: payload captured unconditionally while !movepPendValid
         } elsewhen(slot1IsFmovemx) {
         // MUST precede the µcode arm: an FMOVEM.X opword is ALSO `spec.microcoded`, so
         // the generic arm would claim it and trap it at FP_MEM_TRAP_ENTRY.
         fmovemxPendValid := True
-        fmovemxPendPkt   := fed.payload.packets(1)
+        fmovemxPendLoad := True   // t200-dec: payload captured unconditionally while !fmovemxPendValid
       } elsewhen(slot1IsUcodeEarly || slot1IsMemIndEarly || slot1IsBfDynMemEarly || slot1IsBfMemindMemEarly) {
           ucPendValid := True
-          ucPendPkt   := fed.payload.packets(1)
-          ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: stash the already-registered spec alongside the packet
+          ucPendLoad := True   // t200-dec: payload captured unconditionally while !ucPendValid
         } otherwise {
           stashValid := True
         }
@@ -3705,6 +3781,37 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       ucPendValid      := False
       movepPendValid   := False
       fmovemxPendValid := False
+    }
+
+    // ── FMAX 200 MHz (t200-dec): pend-packet payloads captured UNCONDITIONALLY ─────
+    // The four slot1 pend packets (+ ucPendSpecReg) used to be written inside the stash
+    // arms above, i.e. under the full consume / FSM-entry decision (slot1 classifiers,
+    // pushProduced.ready, fpImmTable.stall, ...): ~220 failing CE paths at 200 MHz from
+    // `fed`'s payload. Every arm writes the SAME value, `fed.payload.packets(1)` (and
+    // `specs(1).spec`), and every reader goes through `Mux(xPendValid, xPendPkt, ...)`
+    // (movemEntryPkt / movepEntryPkt / fxEntryPkt / ucEntryPkt / ucEntrySpec), so the
+    // contents are unobservable while the pend flag is clear. Loading every cycle the flag
+    // is clear and holding while it is set is therefore identical, PROVIDED no arm ever
+    // loads while its flag is already set (that would be an overwrite of a live pend --
+    // impossible by construction: every pend setter is guarded by the other engines'
+    // `!*PendValid` / `!*Active` / `!*Begin` terms and, for its own engine, by
+    // `*EnterSlot0 = *Begin && !*PendValid`). The CE is now a single register (the flag).
+    // Checked live in simulation below.
+    when(!movemPendValid)   { movemPendPkt   := fed.payload.packets(1) }
+    when(!movepPendValid)   { movepPendPkt   := fed.payload.packets(1) }
+    when(!fmovemxPendValid) { fmovemxPendPkt := fed.payload.packets(1) }
+    when(!ucPendValid) {
+      ucPendPkt     := fed.payload.packets(1)
+      ucPendSpecReg := fed.payload.specs(1).spec   // FMax Lever U1: paired with ucPendPkt
+    }
+    GenerationFlags.simulation {
+      def pendCapture(name: String, load: Bool, v: Bool): Unit =
+        assert(!(load && v), s"DecodeStage: $name arm loaded while its pend flag was already set " +
+          "(the unconditional while-clear capture would have dropped this packet)", FAILURE)
+      pendCapture("movemPend",   movemPendLoad,   movemPendValid)
+      pendCapture("movepPend",   movepPendLoad,   movepPendValid)
+      pendCapture("fmovemxPend", fmovemxPendLoad, fmovemxPendValid)
+      pendCapture("ucPend",      ucPendLoad,      ucPendValid)
     }
 
     // ── Rename-facing output ───────────────────────────────────────────────────
@@ -3792,6 +3899,20 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       }
       watchdog("WideImmGrpBank",  wideImm.grpTag,  fed.fire,        ImmEnc.WIDE)
       watchdog("WideImmPushBank", wideImm.pushTag, wideImm.pushWr,  ImmEnc.WIDEP)
+
+      // t200-dec: the registered (one-cycle-late) bank writes must be invisible to every
+      // reader. Re-expand each live popped uop against the same-cycle-written shadows and
+      // demand the identical 32-bit immediate.
+      for (k <- 0 until 2) {
+        val u    = queue.io.pop.payload(k)
+        val live = queue.io.pop.valid && (if (k == 0) True else uop1Sig)
+        val tag  = ImmEnc.tagOf(u.imm)
+        val real = ImmEnc.expand(u.imm, wideImm.grpMem.readAsync(tag), wideImm.pushMem.readAsync(tag))
+        val shad = ImmEnc.expand(u.imm, wideImm.grpShadow.readAsync(tag), wideImm.pushShadow.readAsync(tag))
+        assert(!(live && (real =/= shad)),
+          "WideImm: a popped uop read a wide immediate the registered bank write had not landed yet " +
+          "(the one-cycle-late grpMem/pushMem write is visible to a reader)", FAILURE)
+      }
     }
   }
 
