@@ -3151,39 +3151,41 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
         anEarlyWakePdst  := u1.pdst
         fire
       } else {
-        // ONE-ENTRY RETRY. A candidate that loses the port is parked here and re-tried
-        // on the next free cycle, instead of waiting for completion (a detached store
-        // completes only after its data capture). The parked write is the same value to
-        // the same renamed pdst, so it stays idempotent with the completion write, and
-        // a duplicate wake is already the norm (completion wakes after an early fire).
-        // LIFETIME: the entry must never fire once its pdst could be re-allocated. pdst
-        // is freed only at retire, after completion, and on flush; the entry is
-        // cleared on BOTH (the completion of its robId, and any LS flush/exception).
-        // The retry has priority over a new S1 candidate: in an `(An)+` chain the
-        // parked An is the OLDER one, and the newer candidate can be parked the same
-        // cycle the old entry drains.
-        val rValid = RegInit(False)
+        // REGISTERED EARLY An (CPU_LS_EARLY_AN_RETRY). Every early An write is parked in a
+        // one-entry register at S1 and written FROM THE REGISTER, so the shared int-PRF
+        // write port sees only registered address/data/select. The S1-direct form put
+        // `nextIntWake.valid` (a deep ROB-head/park/barrier/P3 cone) on the select of a
+        // 970-fanout LVT write address: the #1 hub of the 200 MHz wall (2026-10-06).
+        // The write and the wake are decoupled:
+        //   write: when the (registered) completion write is idle;
+        //   wake:  when the wake port is idle, at or after the write cycle, so a woken
+        //          consumer (operand read >= wake+2) always sees the latency-1 write.
+        // LIFETIME: cleared on completion of its robId (completion writes+wakes anyway),
+        // on LS flush/exception, and when both the write and the wake are done. pdst is
+        // freed only at retire/flush, both of which clear the entry first.
+        // A candidate arriving while the entry is busy simply falls back to completion.
+        val rValid   = RegInit(False)
+        val rWritten = RegInit(False)
         val rPdst  = Reg(UInt(6 bits))
         val rData  = Reg(Bits(32 bits))
         val rRobId = Reg(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
-        val retryFire = rValid && portFree
-        val fire = s1AnEarlyCandidate && portFree && !rValid
-        val park = s1AnEarlyCandidate && !fire && (!rValid || retryFire)
+        val writeFire = rValid && !rWritten && !compWritePending
+        val wakeFire  = rValid && (rWritten || writeFire) && !compWakePending
+        val park = s1AnEarlyCandidate && (!rValid || wakeFire)
         val doneByCompletion = rValid && compValid && compRobId === rRobId
-        when(retryFire || doneByCompletion) { rValid := False }
+        when(writeFire) { rWritten := True }
+        when(wakeFire || doneByCompletion) { rValid := False; rWritten := False }
         when(park) {
-          rValid := True; rPdst := u1.pdst; rData := s1EarlyVal; rRobId := s1Ctx.robId
+          rValid := True; rWritten := False
+          rPdst := u1.pdst; rData := s1EarlyVal; rRobId := s1Ctx.robId
         }
-        when(sqFlushSig || excActive) { rValid := False }
-        anEarlyW.valid   := fire || retryFire
-        anEarlyW.address := Mux(retryFire, rPdst, u1.pdst)
-        anEarlyW.data    := Mux(retryFire, rData, s1EarlyVal)
-        anEarlyWakePdst  := Mux(retryFire, rPdst, u1.pdst)
-        rValid.simPublic(); retryFire.simPublic()
-        GenerationFlags.simulation {
-          assert(!(fire && retryFire), "early An retry collided with an S1 early write", FAILURE)
-        }
-        fire || retryFire
+        when(sqFlushSig || excActive) { rValid := False; rWritten := False }
+        anEarlyW.valid   := writeFire
+        anEarlyW.address := rPdst
+        anEarlyW.data    := rData
+        anEarlyWakePdst  := rPdst
+        rValid.simPublic(); writeFire.simPublic(); wakeFire.simPublic()
+        wakeFire
       }
     }
 
