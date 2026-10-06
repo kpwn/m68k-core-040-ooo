@@ -1871,6 +1871,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
     ldS2Rid   := ldS1Rid
     ldS2RidV  := ldS1RidV
     ldS2Direct := False
+    // 200 MHz timing: both direct-response capture sites loaded `earlyProbeHitData`;
+    // it is read only under `ldS2Direct` (set at exactly those sites), so it loads
+    // unconditionally (no `loadCmdPort.fire`-driven clock enable). Bit-identical.
+    ldS2DirectData := earlyProbeHitData
     val ldS2Resp = ldS2Valid && ldS2Hit
     ldS2Valid.simPublic(); ldS2Hit.simPublic(); ldS2Resp.simPublic()
 
@@ -1886,9 +1890,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
         DcacheByteLane.extract(axi.r.payload.data, missOff, missSize,
                                directRefillResp && !missLineOnly), replayData)
       else replayData
+    // 200 MHz timing: a direct (early-probe) S2 response used to ZERO `ldS2Line` at
+    // capture, a 128-bit synchronous reset driven by `loadCmdPort.fire`'s deep cone.
+    // Both capture sites also set the flop `ldS2Direct`, so the same zero is now
+    // applied here instead; the presented line is bit-identical on every cycle, and
+    // `ldS2Line` is read nowhere else except under `!ldS2Direct` (`replayData`).
+    val ldS2LineOut = Mux(ldS2Direct, B(0, 128 bits), ldS2Line)
     val responseLine = if (directRefillResponse && !sectored)
-      Mux(directRefillResp, axi.r.payload.data, Mux(missLineResp, missLine, ldS2Line))
-      else Mux(missLineResp, missLine, ldS2Line)
+      Mux(directRefillResp, axi.r.payload.data, Mux(missLineResp, missLine, ldS2LineOut))
+      else Mux(missLineResp, missLine, ldS2LineOut)
     loadRspPort.payload.data  := responseData
     loadRspPort.payload.line  := responseLine
     loadRspPort.payload.residentHit := ldS2Resp && ldS2Fresh &&
@@ -2734,11 +2744,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS2Fresh      := True
           ldS2Hit        := True
           ldS2Direct     := True
-          ldS2DirectData := earlyProbeHitData
           ldS2Token      := loadCmdPort.payload.token
           ldS2Rid        := loadCmdPort.payload.rid
           ldS2RidV       := loadCmdPort.payload.ridValid
-          ldS2Line       := B(0, 128 bits)
           ldS2Off        := cmdOff
           ldS2Size       := loadCmdPort.payload.size
           when(earlyProbeOwnsCmd) {
@@ -2999,11 +3007,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
           ldS2Fresh      := True
           ldS2Hit        := True
           ldS2Direct     := True
-          ldS2DirectData := earlyProbeHitData
           ldS2Token      := loadCmdPort.payload.token
           ldS2Rid        := loadCmdPort.payload.rid
           ldS2RidV       := loadCmdPort.payload.ridValid
-          ldS2Line       := B(0, 128 bits)
           ldS2Off        := cmdOff
           ldS2Size       := loadCmdPort.payload.size
         } elsewhen(loadCmdPort.fire && nbProbeFastCandidate) {
@@ -3137,10 +3143,19 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val evictThis =
             if (!sectored) victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED)
             else victimDirtyNow && (ldS1Cmode =/= CacheMode.INHIBITED) && !ldS1SectorMiss
-          victimEvictTag  := Mux(victimFromS3, stS3Tag,
-            Mux(victimFromS3D1, stS3WriteTagD1, rdTag(vw)))
-          victimEvictLine := Mux(victimFromS3, stS3MergedLine,
-            Mux(victimFromS3D1, stS3WriteLineD1, rdData(vw)))
+          // 200 MHz timing: under nonBlocking this arm is reached ONLY by an INHIBITED
+          // miss (see its `when`), so `evictThis` (which requires `ldS1Cmode =/=
+          // INHIBITED`) is identically False, EVICT_WR is never entered from here, and
+          // the captured victim is dead. Not capturing it removes the 149-bit clock
+          // enable driven by the tag-BRAM hit compare. The other two writers are the
+          // store-drain arm (`False` under nonBlocking) and the sectored walk (sectoring
+          // is excluded under nonBlocking); `!EVICT_WR` is tripwired below.
+          if (!nonBlocking) {
+            victimEvictTag  := Mux(victimFromS3, stS3Tag,
+              Mux(victimFromS3D1, stS3WriteTagD1, rdTag(vw)))
+            victimEvictLine := Mux(victimFromS3, stS3MergedLine,
+              Mux(victimFromS3D1, stS3WriteLineD1, rdData(vw)))
+          }
           loadMissStoreBarrier := True
           GenerationFlags.simulation {
             assert(!stS2Valid,
@@ -3514,12 +3529,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
             if (!sectored) missSet
             else Mux(refillFullLine, slotOf(missSet, refillBeat), missSet)
           when(doAllocate) {
+            // The nb install's shallow write-data select depends on this never firing.
+            if (nonBlocking) GenerationFlags.simulation {
+              assert(False, "DcachePlugin.nb: legacy REFILL allocate wrote the data array", FAILURE)
+            }
             for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
               wrEn(w)    := True
-              wrSet(w)   := allocSlot
-              wrData(w)  := axi.r.payload.data
               wrTagEn(w) := True
-              wrTag(w)   := missTag
+              // Under nonBlocking this site is unreachable (tripwired above) and the nb
+              // block drives the write data/set/tag with a shallow select; leaving these
+              // in would put `axi.r.fire` (-> `refillWriteHold`, tag BRAM) back at the
+              // end of that mux, since the FSM body elaborates after the nb block.
+              if (!nonBlocking) {
+                wrSet(w)   := allocSlot
+                wrData(w)  := axi.r.payload.data
+                wrTag(w)   := missTag
+              }
               validsWrEn(w)   := True
               validsWrSet(w)  := allocSlot
               validsWrData(w) := True
@@ -3700,6 +3725,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
             val mBytes   = pendingMergeData.subdivideIn(8 bits)
             val newBytes = Vec(Bits(8 bits), 16)
             for (i <- 0 until 16) newBytes(i) := Mux(pendingMergeStrb(i), mBytes(i), curBytes(i))
+            // The nb install's shallow write-data select depends on this never firing.
+            if (nonBlocking) GenerationFlags.simulation {
+              assert(False, "DcachePlugin.nb: legacy REPLAY store merge wrote the data array", FAILURE)
+            }
             for (w <- 0 until ways) when(victimWay === U(w, wayBits bits)) {
               wrEn(w)   := True
               wrSet(w)  := missSet
@@ -4581,8 +4610,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // cycle (the same benign pattern already exercised whenever `fsm.loadUsesPort`/
     // `maintUsesPort`/`storePipeHeld` block promotion today) and retries next
     // cycle; this keeps the fix off that FMax-sensitive net entirely.
-    val stS1SameLineAsS3 = stS1Valid && stS3ArrayWrite &&
-      (stS1Set === stS3Set) && (stS1Tag === stS3Tag)
+    // 200 MHz timing: the 28-bit S1-vs-S3 line compare is precomputed one cycle
+    // early into `stS1LineEqS2Prev` = "next cycle's S1 line === this cycle's S2
+    // line". It is EXACT wherever it is read: `stS3ArrayWrite` needs `stS3Valid`,
+    // and `stS3Valid` is set at exactly one site, which loads `stS3Payload` from the
+    // previous cycle's `stS2Payload`; S1's next line is `s0Payload` on `s0Advance`
+    // (its only writer) and otherwise its own. Driven below `s0Advance`'s
+    // definition; the tripwire there checks it against the live compare.
+    val stS1LineEqS2Prev = Reg(Bool())
+    val stS1SameLineAsS3 = stS1Valid && stS3ArrayWrite && stS1LineEqS2Prev
     stS1SameLineAsS3.simPublic()   // test-visibility only (pea-cache-evict-2026-08-19
                                     // regression); no-op for synthesis
 
@@ -4724,6 +4760,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
       if (!nonBlocking) s0Valid && stS1Ready && !storePipeHeld
       else s0Valid && stS1Ready && !storePipeHeld && !nbS0ArHold
     s0Advance.simPublic() // directed AR-ordering regression observes the S0 launch edge
+    stS1LineEqS2Prev := Mux(s0Advance,
+      s0Payload.paddr(31 downto offBits) === stS2Payload.paddr(31 downto offBits),
+      stS1Payload.paddr(31 downto offBits) === stS2Payload.paddr(31 downto offBits))
+    GenerationFlags.simulation {
+      when(stS3Valid) {
+        assert(stS1LineEqS2Prev === ((stS1Set === stS3Set) && (stS1Tag === stS3Tag)),
+          "DcachePlugin: registered stS1LineEqS2Prev drifted from the live S1-vs-S3 line compare",
+          FAILURE)
+      }
+    }
     val s0Ready     = !s0Valid || s0Advance
 
     /** The store held an S1 descriptor, was not blocked by a barrier or by the
@@ -4801,6 +4847,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     when(s0Advance) { s0Valid := False }
     when(storePort.fire) {
       s0Valid   := True
+    }
+    // 200 MHz timing: the S0 payload (incl. 128-bit lineData) loads whenever the slot
+    // is free (`s0Ready`), not on `storePort.fire`, so `storePort.valid` (the LS EU's
+    // deep drain-select cone) and the admission terms of `storePort.ready` leave its
+    // clock enable. `fire` implies `s0Ready`, so every accepted store is captured
+    // exactly as before; on a `s0Ready && !fire` cycle `s0Valid` ends the cycle low
+    // (nothing held: `s0Ready` = empty or advancing), and every reader of `s0Payload`
+    // is qualified by `s0Valid` (`s0Advance`, `wtS0To`, the probe/preselect same-set
+    // terms), so the loaded value is never observed.
+    when(s0Ready) {
       s0Payload := storePort.payload
     }
 
@@ -5919,6 +5975,37 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val lAddW   = lSecondary || lAlloc
       lAddW.simPublic(); lTarget.simPublic()
 
+      // ── Registered S1-line CAM (200 MHz timing) ──────────────────────────────────────
+      // `s1LineEq(k)` IS `line(k) === lineOfPa(stS1Payload.paddr)`, one flop per MSHR,
+      // computed from the NEXT values of both operands. It replaces that live 28-bit
+      // compare in `camS1`/`setConfS1` (-> `nbStoreHold` -> `stS1Advance`, the root of
+      // the 27-level `nb_line` / `stS1Payload_paddr` families reaching the read port,
+      // `probeReadyReg` and the install mux) and in `s0WtD3Escape`/`wtPipeTo`'s S1 arm.
+      // Exact, not conservative: `line(k)` has exactly two writers (`sOH(k)` and the
+      // later-wins `lOH(k)` below) and `stS1Payload` exactly one (`s0Advance`), so
+      //   next line(k) = lOH(k) ? lLine : sOH(k) ? sLine : line(k)
+      //   next S1 line = s0Advance ? lineOfPa(s0Payload.paddr) : s1Line
+      // and every case is covered by one of the compares below (the no-write case
+      // simply holds). Only read under `validVec(k)` (or `st(k) === WAIT_AR`), which
+      // implies `line(k)` was written by an allocation that also wrote this bit; the
+      // tripwire below checks the equivalence every cycle.
+      val s1LineEq  = Vec.fill(N)(Reg(Bool()))
+      val s1LineCur = lineOfPa(stS1Payload.paddr)
+      val s0LineCur = lineOfPa(s0Payload.paddr)
+      for (k <- 0 until N) {
+        val nextIfS1Held = Mux(lOH(k), lLine === s1LineCur,
+                           Mux(sOH(k), sLine === s1LineCur, s1LineEq(k)))
+        val nextIfS1Load = Mux(lOH(k), lLine === s0LineCur,
+                           Mux(sOH(k), sLine === s0LineCur, line(k) === s0LineCur))
+        s1LineEq(k) := Mux(s0Advance, nextIfS1Load, nextIfS1Held)
+      }
+      GenerationFlags.simulation {
+        for (k <- 0 until N) when(validVec(k)) {
+          assert(s1LineEq(k) === (line(k) === s1LineCur),
+            s"DcachePlugin.nb: registered s1LineEq($k) drifted from line($k) === S1 line", FAILURE)
+        }
+      }
+
       // ── Replay queue (§4.1 "cannot allocate") -> the existing shadow slot ──────────
       val RQ = 4
       val rq = Vec.fill(RQ)(Reg(DLoadCmd()))
@@ -6061,29 +6148,74 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // A store HELD in S1 re-reads its set every cycle and only advances with
       // `!nbStoreHold`, so it blocks the install only on a cycle it could advance -- else a
       // store held for resources on this set would wait on an install that waits on it.
-      val instHold = Vec((0 until N).map(k =>
-        (stS1Valid && stS1Set === eset(k) && !nbStoreHold) || (stS2Valid && stS2Set === eset(k)) ||
+      // `instHoldNoS1` is every term except the S1 one, which alone carries the deep
+      // `nbStoreHold`; see `nbArrayWrite` below for why it is split out.
+      val instHoldNoS1 = Vec((0 until N).map(k =>
+        (stS2Valid && stS2Set === eset(k)) ||
         (pendingStoreMiss && sSet === eset(k)) || (stS3Valid && stS3Set === eset(k)) ||
         (stS3ArrayWrite && stS3Way === eway(k)) || anyInv || resetSweepBusy))
-      val instCand = Vec((0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !invPend(k) && !instHold(k)))
-      val instOH  = OHMasking.first(instCand.asBits)
+      val instHold = Vec((0 until N).map(k =>
+        (stS1Valid && stS1Set === eset(k) && !nbStoreHold) || instHoldNoS1(k)))
+      // 200 MHz timing: HEAD-OF-LINE install arbitration. The install SELECT
+      // (`instHeadOH`, and with it the 128-bit data, set and tag mux) is a function of
+      // flops only -- the first FILLED, unfaulted, invalidated entry -- and `instHold`
+      // (which carries `nbStoreHold` -> the store-pipe cone) now only gates the narrow
+      // write ENABLES. Previously a held head let a younger FILLED entry install
+      // first; now it waits behind the head (a cold-path cycle, never the hit path).
+      // Liveness is unchanged: every `instHold` term is a transient store-pipe or
+      // invalidate event, `instWait` still counts every waiting FILLED entry, and its
+      // >16 store-port hold still drains the store pipe.
+      val instBase   = Vec((0 until N).map(k => st(k) === ST(FILLED) && !fault(k) && !invPend(k)))
+      val instHeadOH = OHMasking.first(instBase.asBits)
+      val instCand = Vec((0 until N).map(k => instHeadOH(k) && !instHold(k)))
+      val instOH  = instCand.asBits
       instHold.simPublic(); instCand.simPublic(); instOH.simPublic()
       val instAny = instCand.asBits.orR
-      val instIdx = OHToUInt(instOH)
-      val instData = MuxOH(instOH, (0 until N).map(merged))
+      val instIdx = OHToUInt(instHeadOH)
+      val instData = MuxOH(instHeadOH, (0 until N).map(merged))
       when(instAny) {
         for (w <- 0 until ways) when(eway(instIdx) === U(w, wayBits bits)) {
           wrEn(w)    := True
-          wrSet(w)   := eset(instIdx)
-          wrData(w)  := instData
-          wrTagEn(w) := True
-          wrTag(w)   := line(instIdx)(lineW - 1 downto setBits)
+          wrTagEn(w) := True   // data/set/tag: driven unconditionally below
           validsWrEn(w) := True; validsWrSet(w) := eset(instIdx); validsWrData(w) := True
           dirtysWrEn(w) := True; dirtysWrSet(w) := eset(instIdx); dirtysWrData(w) := mdirty(instIdx)
           nbWroteWay(w) := True
         }
+      }
+      // 200 MHz timing: `nbArrayWrite`/`nbArrayWriteSet` feed ONLY the early-probe
+      // staleness marks (`earlyProbeSetWriteVec`, `allocRacesArrayWrite`), where a
+      // superset is safe: a probe wrongly marked stale just falls back to the ordinary
+      // S1 read. The install arm now reports "the head MAY install", i.e. `instAny`
+      // without the S1 hold term (and so without `nbStoreHold`'s store-pipe cone),
+      // which cut `nb_line -> ... -> earlyProbeStale -> loadCmd ready` paths. It still
+      // covers every real install (same head, same set), and it stays exclusive with
+      // the invalidate arm above because `instHoldNoS1` carries `anyInv`.
+      val instMayWrite = (0 until N).map(k => instHeadOH(k) && !instHoldNoS1(k)).reduce(_ || _)
+      when(instMayWrite) {
         nbArrayWrite := True
         nbArrayWriteSet := eset(instIdx)
+      }
+      GenerationFlags.simulation {
+        assert(!instAny || instMayWrite, "DcachePlugin.nb: install not covered by the probe staleness hint", FAILURE)
+      }
+      // 200 MHz timing: the data-array write DATA, write SET and tag DATA no longer sit
+      // behind the deep `instAny`/`eway(instIdx)` select. In non-blocking mode the data
+      // array has exactly two writers -- store S3 (`stS3ArrayWrite`, way `stS3Way`) and
+      // this install -- because the legacy REFILL allocate (`doAllocate` needs a
+      // non-INHIBITED `missCmode`, but nonBlocking sends only INHIBITED misses to the
+      // legacy FSM) and the legacy REPLAY store merge (`refillReqIsStore`, set only in
+      // the `pendingStoreMiss` IDLE arm, which is `False` under nonBlocking) never fire
+      // (tripwired at both sites). The two are already per-way exclusive (`instHold`
+      // carries `stS3ArrayWrite && stS3Way === eway(k)`), so selecting on the shallow
+      // S3 term alone gives the same value on every cycle either one writes, and the
+      // enables (`wrEn`/`wrTagEn`) are untouched. The tag array has ONE writer here.
+      for (w <- 0 until ways) {
+        val s3W = stS3Valid && stS3ArrayWrite && stS3Way === U(w, wayBits bits)
+        // Deliberate full override of the per-writer when-chain above (see the proof).
+        wrData(w).allowOverride(); wrSet(w).allowOverride(); wrTag(w).allowOverride()
+        wrData(w) := Mux(s3W, stS3MergedLine, instData)
+        wrSet(w)  := Mux(s3W, stS3Set, eset(instIdx))
+        wrTag(w)  := line(instIdx)(lineW - 1 downto setBits)
       }
       for (k <- 0 until N) {
         when(instOH(k) && instAny) {
@@ -6154,6 +6286,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
          lineOfPa(stS1Payload.paddr) === x) ||
         (stS2Valid && stS2Payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(stS2Payload.paddr) === x)
+      // `wtPipeTo(line(k))` for an allocated MSHR, with the S1 compare taken from the
+      // registered `s1LineEq(k)` (exact under `st(k) =/= FREE`; see its declaration).
+      def wtPipeToMshr(k: Int): Bool =
+        (stS1Valid && stS1Payload.cacheMode === CacheMode.WRITETHROUGH && s1LineEq(k)) ||
+        (stS2Valid && stS2Payload.cacheMode === CacheMode.WRITETHROUGH &&
+         lineOfPa(stS2Payload.paddr) === line(k))
       def wtS0To(x: UInt): Bool =
         s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
           lineOfPa(s0Payload.paddr) === x
@@ -6196,7 +6334,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       val s0WtD3Escape = Vec((0 until N).map(k =>
         st(k) === ST(WAIT_AR) && byStore(k) && stS1Valid &&
         stS1Payload.cacheMode === CacheMode.COPYBACK &&
-        stS1Set === eset(k) && lineOfPa(stS1Payload.paddr) =/= line(k)))
+        stS1Set === eset(k) && !s1LineEq(k)))
       GenerationFlags.simulation {
         for (k <- 0 until N) when(s0WtD3Escape(k)) {
           assert(!s0Advance, "DcachePlugin.nb: D3 AR escape let S0 advance", FAILURE)
@@ -6204,7 +6342,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       }
       val arCand = Vec((0 until N).map(k => st(k) === ST(WAIT_AR) &&
         (if (nbEagerAr) True else settled(k) && !blocked(k)) &&
-        !coldWriteTo(line(k)) && !wtPipeTo(line(k)) &&
+        !coldWriteTo(line(k)) && !wtPipeToMshr(k) &&
         (!wtS0To(line(k)) || s0WtD3Escape(k)) && arDelayOk(k)))
       // This optional path selects a newly allocated LOAD into the same AR holding
       // register. The normal WAIT_AR candidates keep priority. Preselection is one
@@ -6343,16 +6481,34 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // R acceptance. No AXI data is exposed combinationally at loadRspPort.
         // Older FILLED waiters and resident hits keep their response priority.
         val fastWait = Vec((0 until NW).map(w => wv(w) && wm(w) === rId))
-        val fastMshr = Vec((0 until N).map(k => rId === U(k, idxW bits) &&
-          st(k) === ST(WAIT_R) && mstrb(k) === B(0, 16 bits) &&
+        val fastMshrBase = Vec((0 until N).map(k => rId === U(k, idxW bits) &&
+          st(k) === ST(WAIT_R) && mstrb(k) === B(0, 16 bits)))
+        val fastMshr = Vec((0 until N).map(k => fastMshrBase(k) &&
           !(sDo && sCam(k)) && !(s3WtMiss && s3Cam(k))))
-        val fastFire = rFire && !rErr && !rV && !ldS2Resp &&
+        // `fastBase` is `fastFire` without its three same-cycle merge/secondary vetoes
+        // (store CAM on `pendingStorePaddr`, WT CAM, and the `lAlloc`/`lSecondary`
+        // cone) -- the deep part that drove `missLine`'s 128-bit clock enable/data
+        // select (200 MHz `pendingStorePaddr -> missLine` family). `missLine` alone now
+        // loads on `fastBase`; every other response field, `rV` and the waiter clear
+        // still require the full `fastFire`. On `fastBase && !fastFire` the slot stays
+        // empty (`rV` low: `fastBase` requires `!rV`, and the normal arm above cannot
+        // fire because `fastBase` requires `!wCand`), so the early `rData` copy is
+        // never presented, and the MSHR, now FILLED, refills `missLine` from `merged`
+        // through the normal arm before `rV` can rise. The legacy users of `missLine`
+        // (INHIBITED refill/REPLAY) never overlap a waiter (D4 + serial admission);
+        // that precondition is shared with `fastFire` itself and tripwired below.
+        val fastBase = rFire && !rErr && !rV && !ldS2Resp &&
           !wCand.asBits.orR && CountOne(fastWait.asBits) === U(1) &&
-          fastMshr.asBits.orR && !(lAddW && lTarget === rId)
+          fastMshrBase.asBits.orR
+        val fastFire = fastBase && fastMshr.asBits.orR && !(lAddW && lTarget === rId)
         fastFire.simPublic()
+        when(fastBase) { missLine := rData }
+        GenerationFlags.simulation {
+          assert(!(fastBase && !fsm.isActive(fsm.IDLE)),
+            "DcachePlugin.nb: early-response missLine copy while the legacy FSM is busy", FAILURE)
+        }
         when(fastFire) {
           val oh = fastWait.asBits
-          missLine     := rData
           missOff      := MuxOH(oh, woff)
           missSize     := MuxOH(oh, wsize)
           missLineOnly := MuxOH(oh, wlo)
@@ -6376,8 +6532,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
 
       // ── Store S1 hold (§4.4): flops only ─────────────────────────────────────────────
       val s1Line = lineOfPa(stS1Payload.paddr)
-      val camS1  = (0 until N).map(k => validVec(k) && line(k) === s1Line).reduce(_ || _)
-      val setConfS1 = (0 until N).map(k => validVec(k) && eset(k) === stS1Set && line(k) =/= s1Line).reduce(_ || _)
+      // `s1LineEq(k)` == `line(k) === s1Line` (registered, exact; see its declaration).
+      val camS1  = (0 until N).map(k => validVec(k) && s1LineEq(k)).reduce(_ || _)
+      val setConfS1 = (0 until N).map(k => validVec(k) && eset(k) === stS1Set && !s1LineEq(k)).reduce(_ || _)
       val cbS1 = stS1Payload.cacheMode === CacheMode.COPYBACK
       val wtS1 = stS1Payload.cacheMode === CacheMode.WRITETHROUGH
       // Keep an advertised AR and its ID/address stable. A younger WT store
@@ -6401,6 +6558,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
       GenerationFlags.simulation {
         assert(!(stS1Valid && wtS1 && arV && lineOfPa(arAddr) === s1Line),
           "DcachePlugin.nb: same-line WT reached S1 behind an advertised hot AR", FAILURE)
+        assert(!fsm.isActive(fsm.EVICT_WR),
+          "DcachePlugin.nb: legacy EVICT_WR entered (its victim capture is not elaborated under nonBlocking)", FAILURE)
         assert(!(sAlloc && stgValid && lLine === sLine),
           "DcachePlugin.nb: a store and a load allocated the SAME line in one cycle", FAILURE)
         assert(!(sDo && !sCamAny && !(freeBits.orR)), "DcachePlugin.nb: store allocation with no free MSHR", FAILURE)
