@@ -92,7 +92,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     debugMaintDonePulse := False
     // IQ/skid flush held high while the commit-side exception sequencer runs
     // (serializing) so wrong-path uops fetched during the sequence are squashed.
-    val pipeFlush = doFlush || excActive
+    val pipeFlush = rob.logic.backendSquash  // == doFlush || excActive, ONE flop (RobPlugin)
     val decodeUop = host[DecodeUopService]
     // ── Two-tier reschedule wiring (2026-09-04) ─────────────────────────────────
     // See RobPlugin's `earlyPend` doc comment and
@@ -119,7 +119,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     iq.flushPort := pipeFlush                  // IQ clear (Tier 2 only)
     decodeUop.pipeFlush := feFlush             // FE skid (decode->rename)
     decodeUop.backendFlush := pipeFlush        // FP wide-imm side table: backend-owned entries (Tier 2 only)
-    host[RenameStage].logic.pipeFlush := doFlush || excActive // FE skid (rename->dispatch)
+    host[RenameStage].logic.pipeFlush := pipeFlush // FE skid (rename->dispatch)
     host[RenameStage].logic.allocHalt := rob.logic.earlyPend  // Tier-1 rename freeze
     // RAT-rollback (rename.flushPort) already driven by the ROB (rc.flushPort).
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
@@ -374,7 +374,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     divEu.issue << iq.issue(4)
     // Squash a multi-cycle DIV/MUL flushed in flight (same flush the IQ uses) so its
     // late wrong-path completion can't land on a reused robId.
-    divEu.cplxFlush := doFlush || excActive
+    divEu.cplxFlush := rob.logic.backendSquash
     rob.logic.completion(3).valid   := divEu.completion.valid
     rob.logic.completion(3).payload := divEu.completion.payload
     iq.cplxWakeup.valid   := divEu.wakeup.valid
@@ -629,7 +629,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
               Mux(exc.dblFault,
                 U(m68k040.socket.HaltReason.DOUBLE_FAULT, m68k040.socket.HaltReason.W bits),
                 U(m68k040.socket.HaltReason.NONE, m68k040.socket.HaltReason.W bits)))))))
-    lsEu.excActive          := excActive
+    lsEu.excActive          := rob.logic.excActiveLs
     // W19: closes table-walker admission to the D-cache ports across the commit-time
     // sysOp maintenance quiesce (`S_DRAIN`/`S_APPLY`). See `ExceptionUnit.quiesceHoldOut`.
     lsEu.quiesceHold        := exc.quiesceHoldOut

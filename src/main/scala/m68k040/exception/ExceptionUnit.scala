@@ -3550,7 +3550,15 @@ class ExceptionUnit(
   // itself deferred.) `fsm.postBuild` is SpinalHDL's own hook for exactly this: the
   // register is declared now and its driver is assigned once the FSM exists.
   val activeReg = Reg(Bool()) init False
-  fsm.postBuild { activeReg := (fsm.stateNext =/= fsm.enumOf(fsm.IDLE)) }
+  /** The D input of `activeReg` -- i.e. NEXT cycle's `active`. Exported (t200-ctrl) so a
+    * consumer can build its OWN exact copy of `active` (`RegNext(activeNext) init False`
+    * is bit-identical to `active` on every cycle) or pre-OR it with another registered
+    * term, instead of all consumers sharing this one 205-fanout flop. */
+  val activeNext = Bool()
+  fsm.postBuild {
+    activeNext := (fsm.stateNext =/= fsm.enumOf(fsm.IDLE))
+    activeReg  := activeNext
+  }
   active := activeReg
 
   // ── W19: the maintenance-quiesce hold, exported to the D-cache port arbitration ──

@@ -157,7 +157,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Issue port 4 -> DivEu; completion (port 3) + dynamic wakeup + euFault.
       divEu.issue << iq.issue(4)
       // Squash a multi-cycle DIV/MUL flushed in flight (same flush the IQ uses).
-      divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive
+      divEu.cplxFlush := rob.logic.backendSquash
       rob.logic.completion(3).valid   := divEu.completion.valid
       rob.logic.completion(3).payload := divEu.completion.payload
       iq.cplxWakeup.valid   := divEu.wakeup.valid
@@ -277,7 +277,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val excActive = rob.logic.excActive
       // IQ/skid flush held high while the exception FSM runs (serializing) so
       // wrong-path uops fetched during the multi-cycle sequence are squashed.
-      val pipeFlush = doFlush || excActive
+      val pipeFlush = rob.logic.backendSquash  // == doFlush || excActive, ONE flop (RobPlugin)
       val decodeUop = host[m68k040.services.DecodeUopService]
       iq.flushPort := pipeFlush                     // IQ clear
       // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
@@ -289,7 +289,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
       decodeUop.backendFlush := pipeFlush       // FP wide-imm side table: backend-owned entries (Tier 2 only)
-      host[RenameStage].logic.pipeFlush := doFlush || excActive
+      host[RenameStage].logic.pipeFlush := pipeFlush
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // RAT-rollback flush (rename.flushPort) is already driven by the ROB
       // (rc.flushPort := flushing). Fetch redirect to the resolved target:
@@ -386,7 +386,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     exc.dcStoreAck        := lsEu.logic.excStoreAckOut
     exc.dcStoreErr        := lsEu.logic.excStoreErrOut
       // route the exc's cache requests through the LS EU's arbiter
-      lsEu.excActive            := excActive
+      lsEu.excActive            := rob.logic.excActiveLs
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
       lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
       lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size

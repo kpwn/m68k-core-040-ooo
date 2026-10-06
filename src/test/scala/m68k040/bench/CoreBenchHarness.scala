@@ -186,7 +186,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val doFlush = host[RedirectService].doFlush
       val flushPc = host[RedirectService].flushPc
       val excActive = rob.logic.excActive
-      val pipeFlush = doFlush || excActive
+      val pipeFlush = rob.logic.backendSquash  // == doFlush || excActive, ONE flop (RobPlugin)
       val decodeUop = host[m68k040.services.DecodeUopService]
       iq.flushPort := pipeFlush
       // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
@@ -198,7 +198,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
       decodeUop.pipeFlush := feFlush
       decodeUop.backendFlush := pipeFlush      // FP wide-imm side table: backend-owned entries (Tier 2 only)
-      host[RenameStage].logic.pipeFlush := doFlush || excActive
+      host[RenameStage].logic.pipeFlush := pipeFlush
       host[RenameStage].logic.allocHalt := rob.logic.earlyPend
       // Front-end complex-packet resume (task #178, ported-tests cluster 11) -- see
       // DecodeStage.scala's `ucComplexResume` comment / FullCoreSynth.scala's mirror.
@@ -303,7 +303,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // `LsEuPlugin.logic.excStoreAckOut`.
       exc.dcStoreAck        := lsEu.logic.excStoreAckOut
     exc.dcStoreErr        := lsEu.logic.excStoreErrOut
-      lsEu.excActive            := excActive
+      lsEu.excActive            := rob.logic.excActiveLs
       lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
       lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
       lsEu.excLoadCmdSize       := exc.dcLoadCmd.payload.size

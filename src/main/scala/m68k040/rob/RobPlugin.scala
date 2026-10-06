@@ -3591,9 +3591,36 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // `count > 1` because the violator must still be resident to be squashed; it is younger
     // than a retiring h0 and cannot have retired, so this holds whenever the bit is set --
     // gated anyway so `p1` is never an uninitialised-Mem read.
-    doFlushReg := (if (lsOooIssue) branchRedirect || orderRedirect || lsReplayRedirect
-                   else branchRedirect || orderRedirect) ||
-                  exc.redirectValid || debugRecoverEnter || debugPcApply
+    val doFlushNext = (if (lsOooIssue) branchRedirect || orderRedirect || lsReplayRedirect
+                       else branchRedirect || orderRedirect) ||
+                      exc.redirectValid || debugRecoverEnter || debugPcApply
+    doFlushReg := doFlushNext
+    // ── 200 MHz (t200-ctrl): REGISTERED BACKEND SQUASH + a private excActive for the LSU ──
+    // `doFlush || excActive` was built by the top-level wiring as a LUT of two flops and
+    // fanned to the IQ select (`flushSignal` gates every `selPorts(k).valid`), the
+    // rename->dispatch skid, decode's backend side table and the complex EU -- and
+    // `exc_activeReg` (fanout 205, also every LSU / SQ site) was the source of 840 failing
+    // routed paths, the first hop being that OR. Both are now EXACT register copies:
+    //   * `backendSquash`: D = doFlushNext || exc.activeNext, i.e. the D inputs of the two
+    //     flops it replaces. Both are RegInit(False), so it equals `doFlushReg ||
+    //     exc.active` on EVERY cycle including reset -- zero latency change (checked by
+    //     the sim assertion below).
+    //   * `excActiveLs`: `RegNext(exc.activeNext) init False` == `exc.active` on every
+    //     cycle; a separate flop so the LSU's ~30 consumer sites do not share a route with
+    //     the ROB's retire/flush logic. DONT_TOUCH so synthesis does not merge it back into
+    //     `exc_activeReg` (the DivEu `fpS1Kind` precedent).
+    val backendSquash = RegInit(False); backendSquash := doFlushNext || exc.activeNext
+    backendSquash.simPublic()
+    val excActiveLs = RegInit(False); excActiveLs := exc.activeNext
+    excActiveLs.addAttribute("dont_touch", "true"); excActiveLs.simPublic()
+    GenerationFlags.simulation {
+      when(!ClockDomain.current.isResetActive) {
+        assert(backendSquash === (doFlushReg || exc.active),
+          "RobPlugin: backendSquash drifted from `doFlushReg || exc.active` -- a writer of " +
+          "doFlushReg was added without folding it into doFlushNext", FAILURE)
+        assert(excActiveLs === exc.active, "RobPlugin: excActiveLs drifted from exc.active", FAILURE)
+      }
+    }
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(orderRedirect)     { flushPcReg := p1.pc }
