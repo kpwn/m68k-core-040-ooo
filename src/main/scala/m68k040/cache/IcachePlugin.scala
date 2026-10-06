@@ -2268,9 +2268,22 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     //     exactly at the line the demand is now accepting, so `pfCandSet === lookupSet`.
     //     The deleted live `heldDemandMiss` covered this instant -- it was True on the
     //     accept cycle of a miss -- and `s1Unresolved`, being one cycle later, does not.
+    //
+    // FMAX 200 MHz (t200-front): the third lane is qualified by the OFFER
+    // (`lookupActive && cmdPort.valid`) instead of `cmdPort.fire`. `cmdPort.ready` carries
+    // `xlate.rsp.ready`, i.e. the ITLB's live VPN CAM (+ multi-hot) compare, and through
+    // this lane that CAM sat at the head of the speculative allocator's clock enables
+    // (`mshrTag`/`mshrPa`/`mshrGen`/`pfNextPa` CE: the 22-level `FetchAlignPlugin_stalled
+    // -> ... -> ItlbPlugin valids -> IcachePlugin mshrTag_3/CE` path). The offer is a
+    // SUPERSET of the fire (`cmdPort.ready` is only ever driven True inside `lookupTick`,
+    // which also sets `lookupActive`), so the lane can only WAIT more, never less: the
+    // one-fill-owner-per-set guarantee is untouched. The extra waits are cycles on which
+    // a same-set demand is offered but refused; the allocator is never on the refused
+    // demand's progress path (the demand owns DEMAND_IDX, which this allocator never
+    // touches), so a wait here cannot deadlock it.
     val demandSetOwned = (mshrValid(DEMAND_IDX) && (mshrSet(DEMAND_IDX) === pfCandSet)) ||
                          (s1Unresolved && (s0Set === pfCandSet)) ||
-                         (cmdPort.fire && (lookupSet === pfCandSet))
+                         (lookupActive && cmdPort.valid && (lookupSet === pfCandSet))
     // M3b: `!heldDemandMiss` -> `!demandStuck`, i.e. the union of "accepted miss not yet
     // dispatched" and "offered demand refused because a speculative slot owns its set".
     // Same purpose as before: freeze old-window allocation while a demand fill is
@@ -2424,7 +2437,7 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // the two-beat refill asserts and the `missPC` immutability check).
     //
     // NON-VACUITY: proved by mutation in the Task 12 report -- removing
-    // `demandSetOwned`'s `cmdPort.fire` lane makes this assertion fire, and it fires
+    // `demandSetOwned`'s third (accept-cycle; now offer-qualified) lane makes this assertion fire, and it fires
     // BEFORE the 2-hot consumer assertion does.
     for (i <- 0 until MSHR_N; j <- i + 1 until MSHR_N) {
       assert(!(mshrValid(i) && mshrValid(j) && (mshrSet(i) === mshrSet(j))),

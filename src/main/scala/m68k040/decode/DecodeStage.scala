@@ -280,7 +280,39 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `fed.payload.packets(i)` describe the SAME instruction group in the SAME cycle.
     // Reading `raw.packets` downstream would misalign the packet from its own `specs` by
     // exactly one cycle. ~+0.12pp of the device's flops; LUTs approximately neutral.
-    val fed = PipeStage(fedIn, pipeFlush)
+    //
+    // FMAX 200 MHz (t200-front): `fed` is a hand-written 1-deep stage instead of
+    // `PipeStage(fedIn, ...)`, so that its UPSTREAM handshake is SHALLOW. With PipeStage,
+    // `fedIn.ready = !fed.valid || fed.ready`, and `fed.ready` (the decode consume
+    // decision, below) is the end of an ~8-LUT cone out of `fed.payload` (assemble's
+    // `fpImmAlloc`, the mem-indirect/bit-field/FMOVEM.X classifiers, the FSM entries).
+    // That cone then ran through `raw.ready` into `df.feed.ready`, i.e. into EVERY
+    // `feed.fire` consumer in FetchAlignPlugin (decodePc/decodePcHiP1, ftqHead/ftqCount,
+    // the IBuf shift, the RAS push/pop clock enables) and into the CE of `raw`'s and
+    // `fed`'s ~600-bit payload banks -- the 200 MHz report's worst frontend wall.
+    //
+    // `fedAllowXfer` (driven at the consume block below) is a CONSERVATIVE, shallow
+    // under-approximation of `fed`'s slot freeing: it is True only when `fed` is empty,
+    // or when the consume decision is certainly True (registered sequencer/stash state
+    // plus a registered-input "cold head" hint). It IMPLIES the exact slot-free, which
+    // is asserted below. raw -> fed transfers happen ONLY under `fedAllowXfer`; when the
+    // exact consume fires but `fedAllowXfer` is False (a cold head -- MOVEM, MOVEP,
+    // µcode-owned, FMOVEM.X, FP-imm with a full side table) `fed` simply goes empty for
+    // one cycle and `raw` keeps its group (one bubble, cold path only; the FSMs those
+    // heads enter run >= 2 cycles, which hides it). No group can be dropped or
+    // duplicated: `raw` releases a group exactly when `fed` captures it (both under
+    // `fedAllowXfer && raw.valid`), and `fed`'s valid bit still follows the exact
+    // consume decision. Flush is unchanged (last assignment wins, as in PipeStage).
+    val fedAllowXfer = Bool()
+    val fed = Stream(FedPacket())
+    val fedRegValid = RegInit(False)
+    val fedRegData  = Reg(FedPacket())
+    when(!fedRegValid || fed.ready) { fedRegValid := raw.valid && fedAllowXfer }
+    when(fedAllowXfer) { fedRegData := fedIn.payload }
+    when(pipeFlush) { fedRegValid := False }
+    fedIn.ready := fedAllowXfer
+    fed.valid   := fedRegValid
+    fed.payload := fedRegData
 
     // ── 3-µop-instruction handling (RTR / mem-dest RMW) ─────────────────────────
     // A single instruction can crack to 3 µops; the 4-wide MicroOpQueue push then
@@ -3186,6 +3218,50 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                   !movepHoldsFed && !slot0IsMovep && !fmovemxHoldsFed && !slot0IsFmovemx &&
                   !fpImmTable.stall && pushProduced.ready) ||
                  movemEnterSlot0 || ucEnterSlot0 || movepEnterSlot0 || fmovemxEnterSlot0
+
+    // ── FMAX: the shallow transfer gate `fedAllowXfer` (see `fed`'s declaration) ──────
+    // `fedFastConsume`: the REGISTERED-STATE half of the normal consume arm above, with
+    // every *HoldsFed expanded to its register terms (ucHoldsFed's third term,
+    // `slot0OwnedByUc`, is payload-derived and is covered by the hint instead).
+    val fedFastConsume = !stashValid && !movemActive && !movemPendValid && !ucActive && !ucPendValid &&
+                         !movepActive && !movepPendValid && !fmovemxActive && !fmovemxPendValid &&
+                         pushProduced.ready
+    // `fedColdHint`: a cheap SUPERSET, off `fed`'s registered payload (~2-3 LUT levels),
+    // of every payload-derived term that can make the consume decision differ from
+    // `fedFastConsume`. Term by term (each is a necessary condition of the exact term):
+    //   slot0IsMovem / slot0IsMovep / slot0IsMicrocoded   -> the registered spec bits.
+    //   slot0IsMemInd: an EaClass.MEMINDIRECT EA exists only for mode 6 / mode 7-reg 3
+    //     with a FULL-format ext word (bit 8 set; EaDecoder `briefIsFull`). Src EA is
+    //     opword[5:0], dst EA is opword[8:6]/[11:9]; the ext word sits somewhere in
+    //     words(1..9) depending on the shift, so bit 8 is OR-ed over all of them.
+    //   slot0IsBfDynMem / slot0IsBfMemindMem: op === BITFIELD with a memory EA (their
+    //     EA klass is MEMSIMPLE/MEMINDIRECT, i.e. opword[5:3] >= 2).
+    //   slot0IsFmovemx: cpGEN opword (1111 001 000) with ext opclass 11x.
+    //   fpImmTable.stall (stash empty): a0.fpImmAlloc && full; fpImmAlloc requires
+    //     spec.fpGeneric && fpFormIsImm (ext opclass 010, EA = #imm 111100).
+    //   The four *EnterSlot0 terms each require one of slot0IsMovem / slot0OwnedByUc /
+    //     slot0IsMovep / slot0IsFmovemx (their *Begin's `|| *PendValid` arm is excluded by
+    //     `&& !*PendValid`, and the pend flags are in `fedFastConsume` anyway).
+    // So `fed.valid && fedFastConsume && !fedColdHint` => `fed.ready`. A false positive
+    // only costs the one cold-path bubble described at `fed`'s declaration.
+    val hOpw      = s0opw
+    val hSrcFull  = (hOpw(5 downto 3) === B"3'b110") || (hOpw(5 downto 0) === B"6'b111011")
+    val hDstFull  = (hOpw(8 downto 6) === B"3'b110") ||
+                    ((hOpw(8 downto 6) === B"3'b111") && (hOpw(11 downto 9) === B"3'b011"))
+    val hAnyBit8  = (1 until s0pkt.words.length).map(i => s0pkt.words(i)(8)).reduce(_ || _)
+    val hMemInd   = hAnyBit8 && ((spec0.eaSrcValid && hSrcFull) || (spec0.eaDstValid && hDstFull))
+    val hBf       = (spec0.op === DecOp.BITFIELD) && (hOpw(5 downto 4) =/= B"2'b00")
+    val hCpGen    = (hOpw(15 downto 6) === B"10'b1111001000")
+    val hFmovemx  = hCpGen && (s0pkt.words(1)(15 downto 14) === B"2'b11")
+    val hFpImm    = spec0.fpGeneric && (s0pkt.words(1)(15 downto 13) === B"3'b010") &&
+                    (hOpw(5 downto 0) === B"6'b111100") && fpImmTable.full
+    val fedColdHint = spec0.movem || spec0.movep || spec0.microcoded || hMemInd || hBf ||
+                      hFmovemx || hFpImm
+    fedAllowXfer := !fed.valid || (fedFastConsume && !fedColdHint)
+    assert(!(fed.valid && fedAllowXfer && !fed.ready),
+      "DecodeStage: fedAllowXfer asserted while `fed` is NOT consumed -- fedColdHint is not a " +
+      "superset of the payload-derived consume terms; `fed` would be overwritten (dropped group)",
+      FAILURE)
     // `!fpImmTable.stall`: the normal head is HELD (not emitted, see normalHeadValid), so
     // it must not be consumed here either -- neither the stash nor `fed`.
     when(!movemActive && !movemBegin && !ucBegin && !ucActive && !movepActive && !movepBegin &&
