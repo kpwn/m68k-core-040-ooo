@@ -93,7 +93,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     wireCcr(3, divEu.logic.ccrObs)
 
     divEu.issue << iq.issue(4)
-    divEu.cplxFlush := host[RedirectService].doFlush || rob.logic.excActive
+    divEu.cplxFlush := rob.logic.backendSquash
     rob.logic.completion(3).valid   := divEu.completion.valid
     rob.logic.completion(3).payload := divEu.completion.payload
     iq.cplxWakeup.valid   := divEu.wakeup.valid
@@ -185,7 +185,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val doFlush = host[RedirectService].doFlush
     val flushPc = host[RedirectService].flushPc
     val excActive = rob.logic.excActive
-    val pipeFlush = doFlush || excActive
+    val pipeFlush = rob.logic.backendSquash  // == doFlush || excActive, ONE flop (RobPlugin)
     val decodeUop = host[m68k040.services.DecodeUopService]
     iq.flushPort := pipeFlush
     // ── Two-tier reschedule wiring (2026-09-04) — MUST MIRROR
@@ -197,7 +197,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     val feFlush    = (doFlush && !feSuppress) || excActive || earlyFire
     decodeUop.pipeFlush := feFlush
     decodeUop.backendFlush := pipeFlush        // FP wide-imm side table: backend-owned entries (Tier 2 only)
-    host[RenameStage].logic.pipeFlush := doFlush || excActive
+    host[RenameStage].logic.pipeFlush := pipeFlush
     host[RenameStage].logic.allocHalt := rob.logic.earlyPend
     // Front-end complex-packet resume (task #178, ported-tests cluster 11): a genuinely-
     // `complex` predecode packet permanently stalls FetchAlignPlugin until its `resume`
@@ -287,7 +287,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // `LsEuPlugin.logic.excStoreAckOut`.
     exc.dcStoreAck        := lsEu.logic.excStoreAckOut
     exc.dcStoreErr        := lsEu.logic.excStoreErrOut
-    lsEu.excActive            := excActive
+    lsEu.excActive            := rob.logic.excActiveLs
     lsEu.excLoadCmdValid      := exc.dcLoadCmd.valid
     lsEu.excLoadCmdVaddr      := exc.dcLoadCmd.payload.vaddr
     lsEu.excLoadCmdPaddr      := exc.dcLoadCmd.payload.paddr

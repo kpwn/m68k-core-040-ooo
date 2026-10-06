@@ -3799,8 +3799,59 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // `p4LaunchOk` waits for and strictly stronger than "no older LS ticket unresolved".
     // The match is against `robHeadIn`, so it is ONE-HOT by construction (robIds are
     // unique among in-flight ops) -- no age-priority encoder is needed.
+    //
+    // REGISTERED HIT (200 MHz, t200-ctrl). The live compare `parkMem(i).robId === robHeadIn`
+    // sat at the FRONT of the 25-level launch cone (park hit -> barrier robId mux -> SQ
+    // barrier -> p4LaunchOk / drain -> ring enqueue -> D-cache s0 CEs / validsMem WADR):
+    // 1,128 failing routed paths started at `parkMem_N_bk_robId`. The compare now feeds
+    // ONLY a flop, `parkHitR(i)`, and the cone starts at that flop.
+    //
+    // EQUIVALENCE (delayed by exactly one cycle, never early, never stale):
+    //   * `parkHitR(i)` at cycle t+1 = "slot i was valid AND was the ROB head at t".
+    //   * INVARIANT: `parkHitR(i) && parkValid(i)` at t+1 implies slot i holds the SAME
+    //     entry it held at t. Admission targets only a FREE slot and slot i was valid at
+    //     t, so it was not re-admitted at t; a drain or flush at t clears `parkValid(i)`
+    //     at t+1 (the flush clear is written last and wins over an admit). So the live
+    //     `parkValid(i)` AND is what retires a stale `parkHitR`, with no extra term.
+    //   * `robHeadIn` is the ROB `head` register; it advances ONLY by retiring the head
+    //     (RobPlugin `head := head + retiredThisCycle`; a flush resets count/tail, never
+    //     head). A parked op has not launched, so it cannot be complete, so it cannot
+    //     retire -- hence once slot i is the head it STAYS the head until it drains
+    //     (parkDrain) or is flushed (sqFlushSig). Both clear `parkValid(i)` on the next
+    //     edge, so `parkHit(i)` can never refer to a recycled robId (after a flush the ROB
+    //     reissues robIds starting at `head`).
+    //   * `robHeadValidIn` (the ROB's registered `!countIsZero`) is still ANDed live.
+    // So the only change is that the drain/barrier ownership is recognised one cycle AFTER
+    // the parked op becomes the head. That is indistinguishable from the previous head
+    // retiring one cycle later: every gate on the drain is still evaluated live, a younger
+    // P4 launch in that extra cycle is exactly what was already allowed in every cycle
+    // before the head arrived (and is caught by `parkSaw` -> `parkViolation`), and the
+    // release condition (being the head) is still inevitable, so no deadlock is added.
+    // Parked ops are device (cache-inhibited) accesses: a cold path by construction.
+    val parkHitR = if (!lsOooIssue) null else Vec.fill(parkDepth)(RegInit(False))
     val parkHit = if (!lsOooIssue) null else (0 until parkDepth).map { i =>
-      parkValid(i) && robHeadValidIn && (parkMem(i).bk.robId === robHeadIn)
+      parkHitR(i) && parkValid(i) && robHeadValidIn
+    }
+    if (lsOooIssue) {
+      for (i <- 0 until parkDepth) {
+        // Deliberately NO drain/flush term: those are deep cones (`parkDrain` is the tail
+        // of this very launch cone, `sqFlushSig` is the doFlushReg broadcast) and the live
+        // `parkValid(i)` AND above already excludes both -- see the INVARIANT.
+        parkHitR(i) := parkValid(i) && robHeadValidIn && (parkMem(i).bk.robId === robHeadIn)
+      }
+      parkHitR.foreach(_.simPublic())
+      // The "never stale" half of the equivalence is CHECKED, sim-only: a registered hit
+      // must still name the live ROB head. If a future edit lets the head move past a
+      // parked op (or recycles a slot without clearing `parkValid`), this fires instead of
+      // draining the wrong robId as the head.
+      GenerationFlags.simulation {
+        for (i <- 0 until parkDepth) {
+          when(!ClockDomain.current.isResetActive && parkHit(i)) {
+            assert(parkMem(i).bk.robId === robHeadIn,
+              s"LsEuPlugin: registered park hit $i no longer names the ROB head", FAILURE)
+          }
+        }
+      }
     }
     val parkOwnsBarrier = if (!lsOooIssue) False else parkHit.reduce(_ || _)
     val parkSelIdx = if (!lsOooIssue) U(0) else OHToUInt(OHMasking.first(Vec(parkHit)))
@@ -5300,19 +5351,61 @@ class LsEuPlugin(val walkerAgeLimit: Int = 64,
     // True while `excActive` (see its assignment above), so a response fires the cycle it
     // is valid and the exception unit samples it combinationally -- exactly how
     // `exc.dcLoadRsp` is wired straight off the D-cache rather than through this MUX.
-    when(excActive && excXlateValid) {
+    //
+    // ── 200 MHz (t200-ctrl): THE EXCEPTION-SIDE REQUEST IS REGISTERED ─────────────────
+    // The sequencer's `dxReqValid/Vpn` is a mux DECODED FROM `exc_fsm_stateReg` (X_REQ /
+    // F_XREQ / F_RXREQ / FMOVEM states each drive their own VPN). Driven straight onto the
+    // DTLB port it was the front of a 15-level routed cone (stateReg -> dxReq mux -> LS
+    // request mux -> DTLB lookup key, fanout 148 -> hitVec -> `missReqReg`/`rspPayload`
+    // CEs; 332 failing paths). It now lands in a one-entry buffer and the DTLB sees only
+    // that buffer's flops. Exception-sequencer translations are COLD (one per frame /
+    // page), so the extra cycle per translation is free in practice.
+    //
+    // HANDSHAKE. The sequencer's `ready` is `!excXBufValid && xlate.req.ready`, so its
+    // fire (and its `goto(X_WAIT)`-style advance) happens only on a cycle where the buffer
+    // is empty AND the DTLB itself could have taken the request -- the SAME `xlate.req.
+    // ready` it saw before. The buffer then presents the request from the next cycle
+    // until the DTLB accepts it, and drops it if the episode ends (`!excActive`).
+    //
+    // WHY RESPONSE ATTRIBUTION IS UNCHANGED (ExceptionUnit's (a)-(c) argument). At the
+    // sequencer's fire cycle t the DTLB is ready, i.e. `!missPending` and any held
+    // response is consumed that same cycle (`xlate.rsp.ready` is forced while
+    // `excActive`); nothing else can be ACCEPTED in [t, our acceptance] -- the LS claim is
+    // idle for all of `excActive` and the buffer is the only exc requester. A DTLB
+    // response requires an accepted request or a pending walk, so the first response
+    // after t is still the one to OUR request. The sequencer simply waits one cycle longer
+    // in X_WAIT (it is already waiting on a registered response there).
+    val excXBufValid = RegInit(False)
+    val excXBufVpn   = Reg(UInt(20 bits))
+    val excXBufSup   = Reg(Bool())
+    val excXBufWrite = Reg(Bool())
+    val excXBufToken = Reg(UInt(DTranslationToken.Width bits))
+    excXBufValid.simPublic()
+    excXlateReady := !excXBufValid && xlate.req.ready
+    when(excActive && excXBufValid) {
       xlate.req.valid              := True
-      xlate.req.payload.vpn        := excXlateVpn
-      xlate.req.payload.supervisor := True    // the exception sequencer runs supervisor
+      xlate.req.payload.vpn        := excXBufVpn
+      xlate.req.payload.supervisor := excXBufSup
+      xlate.req.payload.write      := excXBufWrite
+      xlate.req.payload.token      := excXBufToken
+      when(xlate.req.ready) { excXBufValid := False }
+    }
+    when(excActive && excXlateValid && excXlateReady) {
+      excXBufValid := True
+      excXBufVpn   := excXlateVpn
+      excXBufSup   := True    // the exception sequencer runs supervisor
       host.get[m68k040.services.SerializedMemoryContextService].foreach { ctx =>
         when(ctx.instructionActive) {
-          xlate.req.payload.supervisor := ctx.instructionSupervisor
+          excXBufSup := ctx.instructionSupervisor
         }
       }
-      xlate.req.payload.write      := excXlateWrite
-      xlate.req.payload.token      := excXlateToken
+      excXBufWrite := excXlateWrite
+      excXBufToken := excXlateToken
     }
-    excXlateReady := xlate.req.ready
+    // An episode that ends (or a reset of the sequencer) abandons nothing silently: the
+    // sequencer only leaves its wait states on a response, so a buffered request can be
+    // dropped here only if the episode itself is gone.
+    when(!excActive) { excXBufValid := False }
     // Deliberately keyed off the LS-SIDE valid, NOT the muxed `xlate.req.valid`:
     // `umAccessRobId` tags a walk with the ROB id whose deferred U/M-bit commit it
     // belongs to, and an exception-sequencer translation belongs to no ROB entry. Feeding
