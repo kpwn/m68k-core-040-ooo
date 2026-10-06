@@ -551,8 +551,13 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // keeping it out of the signal namespace is what makes the victim-buffer-OFF
     // netlist byte-for-byte identical to one built without this feature (verified by
     // generating both and diffing).
+    // `!tlb.io.fillBusy` (a flop, 2026-10-06): the array write of the previous
+    // cycle's fill is still pending (Tlb's registered fill), so a miss now may be for
+    // the very entry being installed. Neither walk nor promote in that one cycle; the
+    // next lookup sees the array. A walk's own fetch is served by the result latch
+    // regardless, so this only ever delays a victim-buffer promote's re-lookup.
     def needWalkExpr = mmuEnable && _req.valid && !tlbHit && !latchMatch && !ttHit &&
-                       !walker.io.busy && !walker.io.done &&
+                       !walker.io.busy && !walker.io.done && !tlb.io.fillBusy &&
                        (if (captureGateOnFlush) !atcFlush else True)
     val needWalkRaw = if (vic.enabled) needWalkExpr else null
     val needWalk    = if (vic.enabled) needWalkRaw && !vic.hit else needWalkExpr
@@ -776,8 +781,17 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // promote itself just displaced (a SWAP): without that, the displaced entry is lost
     // and the buffer measures -32% instead of -74% (verified as a negative control in
     // the trace model).
+    // REGISTERED FILL (2026-10-06): `Tlb` now reports the eviction in the cycle it
+    // WRITES the fill, one cycle after `fillValid`. A promote therefore frees its
+    // slot in the promote cycle and the displaced way lands in that slot one cycle
+    // later (`promoteQ`/`promoteIdxQ`): the same swap, split over two cycles. The
+    // next promote cannot fire in between (`needWalkExpr` carries `!tlb.io.fillBusy`),
+    // and an `atcFlush` in either cycle still clears the buffer priority-last.
     if (vic.enabled) {
-      val insSlot = Mux(vic.promote, vic.hitIdx, vic.ptr)
+      val promoteQ    = RegNext(vic.promote) init (False)
+      val promoteIdxQ = RegNext(vic.hitIdx)
+      val insSlot = Mux(promoteQ, promoteIdxQ, vic.ptr)
+      when(vic.promote) { vic.valids(vic.hitIdx) := False }
       when(tlb.io.evictValid) {
         vic.valids(insSlot) := True
         vic.keys(insSlot)   := tlb.io.evictVpn
@@ -788,11 +802,10 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
         vic.cmode(insSlot)  := tlb.io.evictEntry.cacheMode
         vic.modif(insSlot)  := tlb.io.evictEntry.modified
         // A promote reuses its own slot, so it must not churn the ring pointer.
-        when(!vic.promote) { vic.ptr := vic.ptr + 1 }
+        when(!promoteQ) { vic.ptr := vic.ptr + 1 }
       }
-      // Promote into a COLD array way (nothing evicted): the entry now lives in the
-      // array, so drop it here and keep the two structures exclusive.
-      when(vic.promote && !tlb.io.evictValid) { vic.valids(vic.hitIdx) := False }
+      // (A promote into a COLD array way evicts nothing: its slot was already
+      // dropped in the promote cycle above, keeping the two structures exclusive.)
       // PFLUSHA / TCR.P re-key / root write / TTR write: the array is cleared through
       // `tlb.io.invalidateAll` and the latch just below; the buffer is a third cache of
       // the same descriptors and must go with them. Priority-last so it beats the

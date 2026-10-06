@@ -68,6 +68,10 @@ class TlbMultiHotFailSafeSpec extends AnyFunSuite {
     cd.waitSampling()
     dut.io.fillValid #= false
     cd.waitSampling()
+    // The fill is CAPTURED on the first edge and WRITTEN on the second (`Tlb`'s
+    // registered fill); one more edge so the backdoor reads below observe the
+    // written arrays, not the pre-write sample.
+    cd.waitSampling()
   }
 
   /** Present a VPN and settle the combinational lookup WITHOUT crossing a clock edge,

@@ -52,7 +52,9 @@ object Tlb {
   *
   * Ports (plain wires, driven/read by the owning plugin):
   *  - lookup : drive `lookupVpn`; read `hit` / `hitEntry` (combinational, 1-cycle).
-  *  - fill   : pulse `fillValid` with `fillVpn`/`fillEntry`; written this cycle.
+  *  - fill   : pulse `fillValid` with `fillVpn`/`fillEntry`; captured this cycle,
+  *             written into the arrays NEXT cycle (`fillBusy` high), visible to a
+  *             lookup the cycle after that.
   *  - invalidateAll : pulse to clear all valid bits (PFLUSH-style).
   *
   * All valid bits are RegInit(False) and the round-robin victim per (bank,set) is a
@@ -89,6 +91,13 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val fillEntry = in(TlbEntry())
 
     val invalidateAll = in Bool ()
+
+    // ── REGISTERED FILL (200 MHz, 2026-10-06) ─────────────────────────────────
+    // High in the ONE cycle a fill accepted on the previous cycle is being written
+    // into the arrays (see "registered fill" below). A lookup in that cycle does NOT
+    // see the pending entry, so an owner that must not lose that cycle's answer
+    // holds its request off while this is high. A plain flop output.
+    val fillBusy = out Bool ()
 
     // ── EVICTION REPORT (for a second-level / victim buffer) ───────────────────
     // High for exactly the cycle a fill ALLOCATES over a way that was valid, i.e.
@@ -297,42 +306,114 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     flResidentVec(w) := valids(flBank)(w)(flSet) && (tags(flBank)(w)(flSet) === flTag) &&
                         (tagSup(flBank)(w)(flSet) === io.fillSup)
   }
-  val flResident = flResidentVec.orR
+
+  // ── REGISTERED FILL (200 MHz, 2026-10-06) ─────────────────────────────────────
+  // The fill is CAPTURED in the cycle `io.fillValid` is high (way decode included)
+  // and WRITTEN one cycle later from flops. Before this, the fill decode -- key mux,
+  // a 17-bit tag compare per way, `OHMasking.first`, the round-robin victim mux and
+  // the per-entry decode -- drove the CLOCK ENABLE of every tags/ppns/... flop
+  // (~44 per entry, ~1,400 endpoints per TLB), and the routed 200 MHz report named
+  // exactly that cone as a wall of failing paths (DTLB `walkIs8K` -> victim select
+  // -> `ppns_*/CE`; ITLB MMU-control decode -> walker fill gate -> `tags_*/CE`). Now
+  // that whole cone ends at the D pins of `pend.*` (~70 flops), and every array CE
+  // is a single registered one-hot bit (`pend.we`).
+  //
+  // CORRECTNESS OF THE ONE-CYCLE WINDOW:
+  //  * LOOKUP in the write cycle misses the pending entry (it is not in the array
+  //    yet). `io.fillBusy` (= `pend.valid`, a flop) tells the owner; both plugins
+  //    hold the requester off for that cycle. An owner that did not would only see
+  //    a MISS, never a wrong translation.
+  //  * INVALIDATE: `invalidateAll` is still applied combinationally and is
+  //    priority-LAST, so (a) a fill offered in an invalidate cycle is never captured
+  //    (`!io.invalidateAll` on the capture), and (b) a fill captured the cycle
+  //    BEFORE an invalidate has its valid-bit write overridden in the write cycle.
+  //    No pre-flush fill can land after a flush.
+  //  * BACK-TO-BACK FILLS (not produced by either plugin today, handled anyway): the
+  //    residency test and the round-robin victim are BYPASSED from the pending entry,
+  //    so a second fill of the same key replaces the pending way instead of
+  //    allocating a duplicate (the one-hot invariant above), and a second fill of
+  //    the same row sees the victim pointer the pending fill will leave behind.
+  val pend = new Area {
+    val valid    = RegInit(False)
+    val bank     = Reg(UInt(widthOf(flBank) bits))
+    val set      = Reg(UInt(widthOf(flSet) bits))
+    val tag      = Reg(UInt(tagBits bits))
+    val sup      = Reg(Bool())
+    val entry    = Reg(TlbEntry())
+    val way      = Reg(UInt(wayBits bits))
+    val resident = Reg(Bool())
+    // One registered write-enable per entry: the array CE, with no logic behind it.
+    val we       = Vec.fill(banks)(Vec.fill(ways)(Vec.fill(nSets)(RegInit(False))))
+  }
+  pend.valid.simPublic()
+  io.fillBusy := pend.valid
+
+  val pendSameRow = pend.valid && (pend.bank === flBank) && (pend.set === flSet)
+  val pendSameKey = pendSameRow && (pend.tag === flTag) && (pend.sup === io.fillSup)
+  val flResidentArr = flResidentVec.orR
+  val flResident = flResidentArr || pendSameKey
   // `OHMasking.first` rather than a bare `OHToUInt`: a PRIORITY pick is well-defined
   // even if a duplicate somehow already exists, so this replacement path can never
   // itself select a way that did not match. `OHToUInt` on a non-one-hot vector is
   // exactly the bug being fixed and must not be reintroduced here.
-  val flWay = Mux(flResident, OHToUInt(OHMasking.first(flResidentVec)),
-                  victim(flBank)(flSet))
-  when(io.fillValid) {
-    for (b <- 0 until banks; w <- 0 until ways) {
-      val bankMatch = if (bankBits == 0) True else flBank === U(b, bankBits bits)
-      when(bankMatch && (flWay === U(w, wayBits bits))) {
-        valids(b)(w)(flSet) := True
-        tags(b)(w)(flSet)   := flTag
-        tagSup(b)(w)(flSet) := io.fillSup
-        ppns(b)(w)(flSet)   := io.fillEntry.ppn
-        wProt(b)(w)(flSet)  := io.fillEntry.writeProt
-        sup(b)(w)(flSet)    := io.fillEntry.supervisor
-        cmode(b)(w)(flSet)  := io.fillEntry.cacheMode
-        modif(b)(w)(flSet)  := io.fillEntry.modified
-      }
+  val flVictim = Mux(pendSameRow && !pend.resident, pend.way + 1, victim(flBank)(flSet))
+  val flWay = Mux(pendSameKey, pend.way,
+              Mux(flResidentArr, OHToUInt(OHMasking.first(flResidentVec)), flVictim))
+  val flCapture = io.fillValid && !io.invalidateAll
+
+  // Capture: payload flops have NO enable (plain RegNext); only `valid`/`we` gate.
+  pend.valid    := flCapture
+  pend.bank     := flBank
+  pend.set      := flSet
+  pend.tag      := flTag
+  pend.sup      := io.fillSup
+  pend.entry    := io.fillEntry
+  pend.way      := flWay
+  pend.resident := flResident
+  for (b <- 0 until banks; w <- 0 until ways; s <- 0 until nSets) {
+    val bankMatch = if (bankBits == 0) True else flBank === U(b, bankBits bits)
+    val setMatch  = if (setBits == 0) True else flSet === U(s, setBits bits)
+    pend.we(b)(w)(s) := flCapture && bankMatch && setMatch && (flWay === U(w, wayBits bits))
+  }
+
+  // Write (one cycle after capture), entirely from flops.
+  for (b <- 0 until banks; w <- 0 until ways; s <- 0 until nSets) {
+    when(pend.we(b)(w)(s)) {
+      valids(b)(w)(s) := True
+      tags(b)(w)(s)   := pend.tag
+      tagSup(b)(w)(s) := pend.sup
+      ppns(b)(w)(s)   := pend.entry.ppn
+      wProt(b)(w)(s)  := pend.entry.writeProt
+      sup(b)(w)(s)    := pend.entry.supervisor
+      cmode(b)(w)(s)  := pend.entry.cacheMode
+      modif(b)(w)(s)  := pend.entry.modified
     }
-    // Only a genuine ALLOCATION advances the round-robin victim. A replace-in-place
-    // must not, or an M-refresh would still churn the victim and evict a live way for
-    // no reason.
-    when(!flResident) { victim(flBank)(flSet) := flWay + 1 }
+  }
+  // Only a genuine ALLOCATION advances the round-robin victim. A replace-in-place
+  // must not, or an M-refresh would still churn the victim and evict a live way for
+  // no reason.
+  when(pend.valid && !pend.resident) { victim(pend.bank)(pend.set) := pend.way + 1 }
+
+  GenerationFlags.simulation {
+    assert(CountOne(for (b <- 0 until banks; w <- 0 until ways; s <- 0 until nSets) yield pend.we(b)(w)(s)) <= 1,
+      "Tlb: more than one pending fill write-enable is set")
   }
 
   // ---- eviction report ----
-  // Read the way about to be overwritten, out of the SAME (flBank, flSet) row the
-  // fill decode already selected. `flWay` is the round-robin victim on an allocation
-  // and the resident way on a replace-in-place; only the former can lose anything,
-  // which is why `evictValid` carries `!flResident`.
+  // Reported in the WRITE cycle, reading the way about to be overwritten out of the
+  // registered (pend.bank, pend.set) row -- i.e. the content it holds the instant
+  // before the pending write replaces it. `pend.way` is the round-robin victim on an
+  // allocation and the resident way on a replace-in-place; only the former can lose
+  // anything, which is why `evictValid` carries `!pend.resident`. If `invalidateAll`
+  // lands in this same cycle the owner flushes whatever it captured (the ITLB victim
+  // buffer's flush is priority-last over its insert).
   if (reportEvictions) {
     def fillRow[T <: Data](rows: Vec[Vec[Vec[T]]], way: Int): T = {
-      val flat = Vec(for (b <- 0 until banks) yield rows(b)(way)(flSet))
-      if (banks == 1) flat(0) else flat(flBank)
+      val flat = Vec(for (b <- 0 until banks; s <- 0 until nSets) yield rows(b)(way)(s))
+      val row  = if (bankBits == 0) pend.set
+                 else if (setBits == 0) pend.bank
+                 else (pend.bank ## pend.set).asUInt
+      if (banks * nSets == 1) flat(0) else flat(row)
     }
     val evValidVec = Vec(Bool(), ways)
     val evSupVec   = Vec(Bool(), ways)
@@ -351,16 +432,15 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
       e.modified   := fillRow(modif, w)
       evEntVec(w) := e
     }
-    io.evictValid := io.fillValid && !flResident && evValidVec(flWay)
-    io.evictSup   := evSupVec(flWay)
-    io.evictEntry := evEntVec(flWay)
+    io.evictValid := pend.valid && !pend.resident && evValidVec(pend.way)
+    io.evictSup   := evSupVec(pend.way)
+    io.evictEntry := evEntVec(pend.way)
     // Reassemble the key the evicted way was filed under: vpn = tag ## set ## bank
-    // (the exact inverse of `tagOf`/`setOf`/`bankOf`). The row is the fill row, so its
-    // set and bank are `flSet`/`flBank` by construction.
+    // (the exact inverse of `tagOf`/`setOf`/`bankOf`).
     io.evictVpn := {
-      val tag = evTagVec(flWay)
-      val withSet  = if (setBits == 0) tag.asBits else (tag ## flSet)
-      val withBank = if (bankBits == 0) withSet else (withSet ## flBank)
+      val tag = evTagVec(pend.way)
+      val withSet  = if (setBits == 0) tag.asBits else (tag ## pend.set)
+      val withBank = if (bankBits == 0) withSet else (withSet ## pend.bank)
       withBank.asUInt.resize(Tlb.VpnBits)
     }
   }

@@ -420,7 +420,12 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
 
     _rsp.valid   := rspValid && !atcFlush
     _rsp.payload := rspPayload
-    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !atcFlush
+    // `!tlb.io.fillBusy` (a flop): the ONE cycle in which a just-completed walk's
+    // fill is being written into the array (Tlb's registered fill). A lookup then
+    // would miss the entry being installed and pay a second walk; holding the
+    // request off for that cycle keeps the post-walk hit exactly as before, one
+    // cycle later. Only ever follows a walk completion (cold path).
+    _req.ready   := !missPending && (!rspValid || _rsp.ready) && !atcFlush && !tlb.io.fillBusy
 
     when(_rsp.fire) { rspValid := False }
 
@@ -519,6 +524,23 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // write-hit needing the M-refresh table search above) instead captures the
     // existing single walker context. Accept-last ordering lets an old response
     // fire while the next direct hit is captured in the same cycle.
+    // ── 200 MHz (2026-10-06): PAYLOAD FLOPS ARE ENABLED BY `_req.fire` ALONE ─────
+    // Before, `rspPayload` was written only in the three direct arms and
+    // `missReqReg`'s payload only in the miss arm, so their CLOCK ENABLES were the
+    // arm select -- `tlbHit`/`needsMRefresh`, i.e. the whole hitVec compare cone fed
+    // by the LSU/exception request mux (routed report: `RobPlugin exc_activeReg ->
+    // ... -> DTLB hitVec -> rspPayload_ppn_reg/CE`, -0.99 ns). Now both payloads are
+    // written on EVERY accepted request and the hit cone reaches only their D pins
+    // (a data mux) plus the two single-bit valids. Safe because:
+    //  * rspPayload is observable only under `rspValid`. A request fires only when
+    //    the slot is empty or being consumed this same cycle (`_req.ready`), and a
+    //    MISS leaves `rspValid` clear, so the junk written then is never read; the
+    //    walk completion rewrites it before setting `rspValid`.
+    //  * missReqReg's payload is read only while `missReqReg.valid` (walker launch,
+    //    where the walker and the walk* flops latch it). A request fires only when
+    //    `!missPending`, which `missReqReg.valid` implies, so overwriting it on a
+    //    HIT never disturbs a pending launch.
+    val directIdent = ttHit || !mmuEnable
     when(_req.fire) {
       // TTR hit is checked FIRST regardless of mmuEnable: on real hardware a
       // TTR match bypasses the walker/TLB entirely, whether or not paging is
@@ -526,36 +548,23 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
       // fallback below is now only reached when the MMU is off AND no TTR
       // matched -- identity-map with WRITETHROUGH remains the correct default
       // for that "not specially marked" case.
-      when(ttHit) {
-        rspValid             := True
-        rspPayload.ppn       := _req.payload.vpn
-        rspPayload.cacheMode := TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1))
-        rspPayload.fault     := False
-        rspPayload.token     := _req.payload.token
-        rspVpn               := _req.payload.vpn
-      } elsewhen(!mmuEnable) {
-        rspValid             := True
-        rspPayload.ppn       := _req.payload.vpn
-        rspPayload.cacheMode := CacheMode.WRITETHROUGH
-        rspPayload.fault     := False
-        rspPayload.token     := _req.payload.token
-        rspVpn               := _req.payload.vpn
-      } elsewhen(tlbHit && !needsMRefresh) {
-        rspValid             := True
-        rspPayload.ppn       := tlbEntry.ppn
-        rspPayload.cacheMode := tlbEntry.cacheMode
-        rspPayload.fault     := fault
-        rspPayload.token     := _req.payload.token
-        rspVpn               := _req.payload.vpn
+      rspPayload.ppn       := Mux(directIdent, _req.payload.vpn, tlbEntry.ppn)
+      rspPayload.cacheMode := Mux(ttHit, TtMatch.cacheMode(Mux(dtt0Hit, dtt0, dtt1)),
+                              Mux(!mmuEnable, CacheMode.WRITETHROUGH, tlbEntry.cacheMode))
+      rspPayload.fault     := !directIdent && fault
+      rspPayload.token     := _req.payload.token
+      rspVpn               := _req.payload.vpn
+      missReqReg.vpn   := walkKey(_req.payload.vpn)
+      missReqReg.write := _req.payload.write
+      missReqReg.sup   := _req.payload.supervisor
+      missReqReg.is8K  := is8K
+      missReqReg.token := _req.payload.token
+      missReqReg.robId := umAccessRobId
+      missReqReg.preCommitted := umAccessPreCommitted
+      when(directIdent || (tlbHit && !needsMRefresh)) {
+        rspValid         := True
       } otherwise {
         missReqReg.valid := True
-        missReqReg.vpn   := walkKey(_req.payload.vpn)
-        missReqReg.write := _req.payload.write
-        missReqReg.sup   := _req.payload.supervisor
-        missReqReg.is8K  := is8K
-        missReqReg.token := _req.payload.token
-        missReqReg.robId := umAccessRobId
-        missReqReg.preCommitted := umAccessPreCommitted
         missPending      := True
         walkFlushPoison  := False
         walkUmPoison     := False
@@ -634,14 +643,16 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     tlb.io.fillEntry := fe
     when(walker.io.done) {
       missPending := False
+      // Payload written unconditionally (enable = `walker.io.done`, a walker flop);
+      // only the VALID bit carries the poison/flush gates. See the `_req.fire` block.
+      rspPayload.ppn       := walker.io.rsp.ppn
+      rspPayload.cacheMode := walker.io.rsp.cacheMode
+      rspPayload.fault     := walker.io.rsp.fault
+      rspPayload.token     := walkToken
+      rspVpn               := walkVpn
       when(!walkFlushPoison && !atcFlush) {
         assert(!rspValid, "walker result collided with an occupied DTLB response")
         rspValid             := True
-        rspPayload.ppn       := walker.io.rsp.ppn
-        rspPayload.cacheMode := walker.io.rsp.cacheMode
-        rspPayload.fault     := walker.io.rsp.fault
-        rspPayload.token     := walkToken
-        rspVpn               := walkVpn
       }
       // Task (C1 fix): `walkUmPoison` means the deferred U/M descriptor WRITE for
       // this walk was correctly suppressed (see the umq.io.alloc.valid gate below)

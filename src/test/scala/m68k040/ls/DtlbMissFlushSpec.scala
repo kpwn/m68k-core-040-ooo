@@ -270,8 +270,14 @@ class DtlbCleanMissSerializationSpec extends AnyFunSuite {
       val missRspCycle = rspEvents.find(_._2 == missToken).get._1
       val hitReqCycle  = reqEvents.find(_._2 == hitToken).get._1
       val hitRspCycle  = rspEvents.find(_._2 == hitToken).get._1
-      assert(hitReqCycle == missRspCycle,
-        s"resident C must restart on B response turnover: Creq=$hitReqCycle Brsp=$missRspCycle")
+      // +1 since 2026-10-06: `Tlb` writes a fill one cycle AFTER the walk completes
+      // (registered fill, 200 MHz), and `DtlbPlugin._req.ready` carries
+      // `!tlb.io.fillBusy` for exactly that write cycle so a same-page request cannot
+      // miss the entry being installed and pay a second walk. C therefore enters
+      // EXACTLY one cycle after B's response turnover -- still pinned exactly.
+      assert(hitReqCycle == missRspCycle + 1,
+        s"resident C must restart one cycle after B response turnover (the registered " +
+        s"fill-write cycle): Creq=$hitReqCycle Brsp=$missRspCycle")
       assert(hitRspCycle == hitReqCycle + 1,
         s"resident C must return one cycle after restart: req=$hitReqCycle rsp=$hitRspCycle")
     }
