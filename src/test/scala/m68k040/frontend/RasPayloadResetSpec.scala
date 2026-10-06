@@ -45,6 +45,10 @@ class RasPayloadResetSpec extends AnyFunSuite {
           q.push #= false; q.pop #= false; q.invalidate #= false
           q.save #= false; q.restore #= false; q.pc #= 0
         }
+        // The push payload is parked one cycle in pendValid/pendIdx/pendData before it
+        // reaches `ras` (RasPlugin's 200 MHz write buffer); the LOGICAL row is that view.
+        def liveRow(row: Int): Long =
+          if (d.pendValid.toBoolean && d.pendIdx.toInt == row) d.pendData.toLong else d.ras(row).toLong
         def checkState(): Unit = {
           assert(d.rasSp.toInt == model.sp && d.count.toInt == model.count,
             s"RAS ownership live control mismatch cycle=$cycles")
@@ -55,8 +59,8 @@ class RasPayloadResetSpec extends AnyFunSuite {
           for (i <- 1 to model.count) {
             val row = (model.sp - i) & (depth - 1)
             val expected = model.data(row).getOrElse(fail(s"reference exposed unwritten live row=$row"))
-            assert(d.ras(row).toLong == expected,
-              s"RAS poisoned live payload became owned: cycle=$cycles row=$row expected=$expected got=${d.ras(row).toLong}")
+            assert(liveRow(row) == expected,
+              s"RAS poisoned live payload became owned: cycle=$cycles row=$row expected=$expected got=${liveRow(row)}")
           }
           for (i <- 1 to model.ckCount) {
             val row = (model.ckSp - i) & (depth - 1)

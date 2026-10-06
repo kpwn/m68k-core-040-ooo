@@ -228,9 +228,49 @@ class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
     pushValid.simPublic(); pushRetPc.simPublic(); popValid.simPublic()
     checkpointSave.simPublic(); checkpointRestore.simPublic()
 
+    // ---- FMax (200 MHz, 2026-10-06): ONE-ENTRY WRITE BUFFER for the payload push ----
+    // `pushValid` is `feed.fire && !faultHold && s0IsCall`, whose VALID half is the
+    // ftqHead -> ftqMem async read -> availEff -> Aligner -> feed.valid cone (12 levels in
+    // the routed 200 MHz build). Before this change that cone drove the CE of ALL
+    // entries*32 = 512 `ras` payload flops (`ras(rasSp) := pushRetPc`) -- 512 of the
+    // design's failing endpoints, every one sourced from `ftqHead_reg`.
+    //
+    // The push's POINTER/OCCUPANCY effect (`rasSp`/`count`, 9 flops) still lands on the
+    // push cycle exactly as before. Only the 32-bit PAYLOAD write is parked for one cycle
+    // in `pendValid/pendIdx/pendData` (pendData/pendIdx are plain RegNext, so the deep
+    // cone reaches exactly ONE flop's D: `pendValid`), and is committed into `ras` on the
+    // next cycle with a CE that is a pure function of registers
+    // (`pendValid && pendIdx === i`).
+    //
+    // EXACTNESS. The LOGICAL stack content is `ras` with slot `pendIdx` overridden by
+    // `pendData` while `pendValid` -- bit-identical to what the old same-cycle write held
+    // in `ras` Q. Every reader of the payload is routed through that view:
+    //   * `predTarget` (bypass mux below; `pendIdx`/`rasSp` are both registers, so the
+    //     select is a 4-bit equality off flops, parallel to the 16:1 read mux);
+    //   * the deferred `checkpointSave` copy (`ckRas(i) := rasView(i)`).
+    // Writers of `ras` that can collide with the parked write, in priority order (last
+    // assignment wins, matching the old sequential order):
+    //   * the parked write lands FIRST (it is the OLDEST event);
+    //   * `branchRepair`'s push (`ras(rasSp) := data`) lands after it -- in the old code
+    //     the fetch push happened a cycle earlier, so the repair overwrote it;
+    //   * `checkpointRestore` lands last and overwrites all rows -- in the old code the
+    //     restore also overwrote the previous cycle's push.
+    // A push on the SAME cycle as a restore was dropped by the old code (restore wins over
+    // the push's array write); `pendValid` is therefore gated with `!checkpointRestore`
+    // so the parked write cannot resurrect it one cycle later. A push on the same cycle
+    // as `invalidateAll` still writes its row (the old code did too: invalidate clears only
+    // rasSp/count); that row is unowned (count=0) and never observable.
+    val pendValid = RegNext(pushValid && !checkpointRestore) init False
+    val pendIdx   = RegNext(rasSp)
+    val pendData  = RegNext(pushRetPc)
+    pendValid.simPublic(); pendIdx.simPublic(); pendData.simPublic()
+    def rasView(i: Int): UInt = Mux(pendValid && pendIdx === U(i, spBits bits), pendData, ras(i))
+    when(pendValid) { ras(pendIdx) := pendData }
+
     // ---- combinational predict read: top-of-stack, valid iff non-empty ----
     val predValid  = (count =/= U(0, cntBits bits))
-    val predTarget = ras(rasSp - U(1, spBits bits))
+    val topIdx     = rasSp - U(1, spBits bits)
+    val predTarget = Mux(pendValid && pendIdx === topIdx, pendData, ras(topIdx))
     predValid.simPublic(); predTarget.simPublic()
 
     val cntMax = U(entries, cntBits bits)
@@ -249,7 +289,7 @@ class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
     //      Overflow (push when full) is circular — the pointer wraps and overwrites the
     //      oldest; count saturates. A hint structure; EU-verify covers a wrong guess.
     when(pushValid) {
-      ras(rasSp) := pushRetPc
+      // payload write is parked in pendValid/pendIdx/pendData (see above)
       nextRasSp  := rasSp + U(1, spBits bits)
       when(count =/= cntMax) { nextCount := count + U(1, cntBits bits) }
     }
@@ -355,7 +395,8 @@ class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
     when(ckSaveNow) {
       ckRasSp := rasSp
       ckCount := count
-      for (i <- 0 until entries) { ckRas(i) := ras(i) }
+      // rasView: the parked push from the ARMING cycle has not reached `ras` Q yet.
+      for (i <- 0 until entries) { ckRas(i) := rasView(i) }
     }
 
     // ---- checkpointRestore: undo any wrong-path push/pop since the last save by

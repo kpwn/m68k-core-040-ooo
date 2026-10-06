@@ -23,10 +23,14 @@ class FetchWordCheck(feed: DecodeFeedService, cpuReset: Bool) extends Area {
     val accepted = feed.feed.fire && (if (i == 0) True else feed.slot1Valid) &&
       !feed.feed.payload(i).fault
     validQ(i) := accepted && enabled && !cpuReset && !clear
-    when(accepted) {
-      pcQ(i) := feed.feed.payload(i).pc
-      wordQ(i) := feed.feed.payload(i).words(0)
-    }
+    // FMax (200 MHz, 2026-10-06): captured UNCONDITIONALLY. `accepted` carries
+    // `feed.fire` (the ftqHead -> ftqMem -> availEff -> feed.valid cone) and as a CE it
+    // reached all 2x48 capture flops (-0.48 ns routed). Every reader of pcQ/wordQ is
+    // qualified by `validQ(i)` (via `selected`), and validQ(i) is set on exactly the
+    // cycles `accepted` held, i.e. the cycles on which the unconditional capture holds
+    // the same value the gated one did. Other cycles' captures are never observed.
+    pcQ(i) := feed.feed.payload(i).pc
+    wordQ(i) := feed.feed.payload(i).words(0)
   }
   val selected = Vec((0 until 2).map(i => validQ(i) && pcQ(i) === pc && enabled))
   val bad = Vec((0 until 2).map(i => selected(i) && wordQ(i) =/= expected))
