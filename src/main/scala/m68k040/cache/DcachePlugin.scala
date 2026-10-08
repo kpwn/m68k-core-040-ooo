@@ -360,7 +360,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** Experimental one-beat response bypass for the legacy refill path. */
                    val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
                    val earlyProbeLineForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
-                   val nbEarlyResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse)
+                   val nbEarlyResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse,
+                   /** Capacity in KiB (8 or 16), `ShippingCoreConfig.dcacheKB`. Only the set
+                     * count changes (128 -> 256); 4 ways, 16-byte sectors and VIPT safety
+                     * for 4 KiB pages are invariant (re-checked below). */
+                   val cacheKB: Int = m68k040.top.ShippingCoreConfig.dcacheKB)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -384,13 +388,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
   // `geo` describes the SECTOR, which is the unit of data storage, of maintenance and
   // of every "line"-named interface in this file -- 16 bytes, unchanged in both arms.
   // Sectoring groups four of these slots under one tag; see `lineGeo` below.
-  private val geo     = CacheGeometry(cacheBytes = 8192, lineBytes = 16, ways = 4,
+  require(cacheKB == 8 || cacheKB == 16, s"DcachePlugin: cacheKB must be 8 or 16 (got $cacheKB)")
+  private val cacheBytes = cacheKB * 1024
+  private val geo     = CacheGeometry(cacheBytes = cacheBytes, lineBytes = 16, ways = 4,
                                       indexingPolicy = CacheIndexingPolicy.Vipt)
   geo.requireViptSafe(4096, "L1D")
   private val ways    = geo.ways
   private val sets    = geo.sets
-  private val tagBits = geo.tagBits          // 21
-  private val setBits = geo.indexBits        // 7  -- the SECTOR-SLOT index width
+  private val tagBits = geo.tagBits          // 21 (8 KiB) / 20 (16 KiB)
+  private val setBits = geo.indexBits        // 7 / 8 -- the SECTOR-SLOT index width
   private val offBits = geo.offsetBits       // 4  -- offset within a 16-byte sector
   private val wayBits = log2Up(ways)
 
@@ -411,7 +417,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Restate the amendment's arithmetic as a build-time check rather than a comment,
     // because the "tagBits is unchanged at 21" property is what lets the maintenance
     // engine's hardcoded page-scope bit positions stay untouched.
-    val lineGeo = CacheGeometry(cacheBytes = 8192, lineBytes = lineBytes, ways = ways,
+    val lineGeo = CacheGeometry(cacheBytes = cacheBytes, lineBytes = lineBytes, ways = ways,
                                 indexingPolicy = CacheIndexingPolicy.Vipt)
     lineGeo.requireViptSafe(4096, "L1D(sectored)")
     require(lineGeo.tagBits == tagBits,
@@ -4252,8 +4258,13 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // All scope: everything.
           val lineMatch = (walkSet === target(offBits + setBits - 1 downto offBits)) &&
                           (rdTag(curWay) === target(31 downto offBits + setBits))
-          val pageHiMatch = rdTag(curWay)(tagBits - 1 downto 2) === target(31 downto 13)
-          val pageLoMatch = rdTag(curWay)(1) === target(12)
+          // Generalised over the geometry: the tag's LSB is paddr[tagLo] with
+          // tagLo = offBits + setBits (11 at 8 KiB, 12 at 16 KiB). VIPT safety
+          // (tagLo <= 12, required at elaboration) keeps paddr[12] inside the tag.
+          val tagLo       = offBits + setBits
+          require(tagLo <= 12, "L1D maintenance page predicate needs paddr[12] in the tag")
+          val pageHiMatch = rdTag(curWay)(tagBits - 1 downto 13 - tagLo) === target(31 downto 13)
+          val pageLoMatch = rdTag(curWay)(12 - tagLo) === target(12)
           val pageMatch   = pageHiMatch && (cmdIs8K || pageLoMatch)
           val scopeHit  = Mux(cmd.scope === U(1, 2 bits), lineMatch,
                           Mux(cmd.scope === U(2, 2 bits), pageMatch, True))

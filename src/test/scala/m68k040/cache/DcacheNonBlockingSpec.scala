@@ -110,7 +110,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSampling(4)
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
       val a = 0x0000A200L
-      val b = a + 0x800L // same VIPT set, different physical tag
+      val b = a + DcacheTestGeometry.WayStride // same VIPT set, different physical tag
       for (j <- 0 until 16) {
         cold.pokeByte(a + j, 0x31 + j)
         cold.pokeByte(b + j, 0x51 + j)
@@ -354,12 +354,12 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     val rnd  = new scala.util.Random(seed)
     val base = 0x90000L
     val nTag = 6; val nSet = 2
-    // 16-byte lines, 128 sets: a 2048-byte stride lands every tag on the same set.
-    def lineBase(s: Int, tag: Int): Long = base + tag * 2048L + s * 64L
+    // 16-byte lines: a one-way stride (2048 B at 8 KiB, 4096 B at 16 KiB) lands every tag on the same set.
+    def lineBase(s: Int, tag: Int): Long = base + tag * DcacheTestGeometry.WayStride + s * 64L
     val region: Seq[Long] =
       for (t <- 0 until nTag; s <- 0 until nSet; b <- 0 until LINE) yield lineBase(s, t) + b
     def pageMode(a: Long): SpinalEnumElement[CacheMode.type] =
-      if (((a - base) / 2048L) == nTag - 1) CacheMode.WRITETHROUGH else CacheMode.COPYBACK
+      if (((a - base) / DcacheTestGeometry.WayStride) == nTag - 1) CacheMode.WRITETHROUGH else CacheMode.COPYBACK
     def modeOf(a: Long): SpinalEnumElement[CacheMode.type] =
       if (rnd.nextInt(4) == 0) CacheMode.WRITETHROUGH else pageMode(a)
     val shadow = mutable.Map[Long, Int]()
@@ -480,7 +480,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     /** One LOAD GROUP: up to four loads, back to back, mostly on one line. */
     def doGroup(faulting: Boolean): Unit = {
       val k = 1 + rnd.nextInt(4)
-      val first = if (faulting) faultBase + rnd.nextInt(4) * 2048L else randLine()
+      val first = if (faulting) faultBase + rnd.nextInt(4) * DcacheTestGeometry.WayStride else randLine()
       case class Ld(a: Long, sz: Int, tok: Int, lineOnly: Boolean, mode: SpinalEnumElement[CacheMode.type],
                     fault: Boolean, var probed: Boolean = false, var dropped: Boolean = false)
       val lds = (0 until k).map { i =>
@@ -1283,7 +1283,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSampling(4)
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
       val base = 0xc0000L
-      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * 2048L
+      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * DcacheTestGeometry.WayStride
       var ackCount = 0
       var storeAccepts = 0
       var loadAccepts = 0
@@ -1589,7 +1589,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
 
       val base = 0x98000L
-      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * 2048L
+      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * DcacheTestGeometry.WayStride
       for (s <- 0 until 5; b <- 0 until 16)
         cold.pokeByte(addr(s, 4) + b, 0x90 + s)
       var aw = 0; var w = 0; var b = 0; var hotAr = 0
@@ -1885,7 +1885,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
 
       val x = 0x94000L
-      val stride = 2048L // same D-cache set, different tag
+      val stride = DcacheTestGeometry.WayStride // same D-cache set, different tag
       for (i <- 0 until 6; b <- 0 until 16)
         cold.pokeByte(x + i * stride + b, 0x11)
       var awX = false

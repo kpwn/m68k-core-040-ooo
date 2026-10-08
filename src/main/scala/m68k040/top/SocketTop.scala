@@ -704,6 +704,7 @@ object GenSocketTopVerilog {
             s"dcacheFillForward=${ShippingCoreConfig.dcacheFillForward} " +
             s"dcacheDirectRefillResponse=${ShippingCoreConfig.dcacheDirectRefillResponse} " +
             s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
+            s"dcacheKB=${ShippingCoreConfig.dcacheKB} " +
             s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
