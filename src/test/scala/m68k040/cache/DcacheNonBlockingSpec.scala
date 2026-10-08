@@ -208,14 +208,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         cd.waitSamplingWhere(lg.storeAckReg.toBoolean)
       }
       storeB(BigInt("77777777", 16))
-      val c = a + 0x1000L
+      val c = a + 2 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) cold.pokeByte(c + j, 0x71 + j)
       issuedProbe(0x33, c, c)
       load(0x33, c, b, BigInt("77777777", 16))
       assert(fast == 1, s"physical-tag alias of dirty resident line incorrectly staged: fast=$fast")
       // An intervening write to the probed set must turn its queued snapshot
       // stale, even after the store pipeline has emptied at command arrival.
-      val d = a + 0x1800L
+      val d = a + 3 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) cold.pokeByte(d + j, 0x91 + j)
       issuedProbe(0x34, d, d)
       storeB(BigInt("88888888", 16))
@@ -224,9 +224,9 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       // Two further misses rotate the four-way victim pointer onto dirty B.
       // A new probe must then decline fast staging, and the ordinary eviction
       // path must preserve B's dirty bytes through writeback and re-read.
-      val e = a + 0x2000L
-      val f = a + 0x2800L
-      val g = a + 0x3000L
+      val e = a + 4 * DcacheTestGeometry.WayStride
+      val f = a + 5 * DcacheTestGeometry.WayStride
+      val g = a + 6 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) {
         cold.pokeByte(e + j, 0xA1 + j)
         cold.pokeByte(f + j, 0xA9 + j)
@@ -241,8 +241,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       // Present a full-strobe no-fill store and the resolved load on the same
       // edge, to different lines of one set. The input store has not entered
       // S0 yet; the new valid-based guard must reject the queued miss stage.
-      val h = a + 0x3800L
-      val i = a + 0x4000L
+      val h = a + 7 * DcacheTestGeometry.WayStride
+      val i = a + 8 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) { cold.pokeByte(h + j, 0xC1 + j); cold.pokeByte(i + j, 0x21) }
       issuedProbe(0x39, h, h)
       val noFillBefore = lg.nb.ctrMap("noFillAllocs").toLong
@@ -279,7 +279,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       assert(fast == 1 && lg.nb.ctrMap("noFillAllocs").toLong == noFillBefore + 1,
         s"same-set input store did not force the ordinary miss/no-fill paths: fast=$fast")
       load(0x3a, i, i, BigInt("cccccccc", 16))
-      val j = a + 0x4800L
+      val j = a + 9 * DcacheTestGeometry.WayStride
       for (k <- 0 until 16) cold.pokeByte(j + k, 0xD1 + k)
       issuedProbe(0x40, j, j)
       load(0x41, j, j, BigInt("d1d2d3d4", 16))
