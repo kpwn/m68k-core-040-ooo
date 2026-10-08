@@ -52,7 +52,11 @@ class RobPlugin(val detailedPerf: Boolean = false,
                   * `branchRepair` ports. DEFAULT OFF; both plugins must agree (checked in
                   * BackendWiringPlugin). See RasPlugin's class comment. */
                 val rasBranchRepair: Boolean = false,
-                val lsOooIssue: Boolean = false) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
+                val lsOooIssue: Boolean = false,
+                /** See `ShippingCoreConfig.flushFromSquash`. */
+                val flushFromSquash: Boolean = m68k040.top.ShippingCoreConfig.flushFromSquash,
+                /** See `ShippingCoreConfig.coldWbShare`. */
+                val coldWbShare: Boolean = m68k040.top.ShippingCoreConfig.coldWbShare) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var lsReplayWire: Flow[UInt] = null
   override def lsReplay: Flow[UInt] = lsReplayWire
@@ -180,11 +184,27 @@ class RobPlugin(val detailedPerf: Boolean = false,
         frameFpSrcRead = rf.newRead(forceNoBypass = true)
         frameFpDstRead = rf.newRead(forceNoBypass = true)
         fmFpRead = rf.newRead(forceNoBypass = true)
-        fmFpWrite = rf.newWrite()
+        // `coldWbShare`: ride DivEu's FP write port (priority 0, DivEu is 1). Exclusive by
+        // construction: DivEu's `fpW.valid` is gated `!flushSig` (= backendSquash, which is
+        // high for the whole exception FSM run), and this port is asserted only while
+        // `exc.active` (FM_WRITE). RegFilePlugin sim-asserts the exclusivity.
+        fmFpWrite = if (coldWbShare) rf.newWrite(sharingKey = m68k040.execute.DivEuPlugin.FpWbKey, priority = 0)
+                    else rf.newWrite()
       }
     }
     if (host.get[m68k040.services.CommittedMapService].nonEmpty) {
-      host.get[m68k040.execute.regfile.IntRegFileService].foreach { rf => fmAnWrite = rf.newWrite() }
+      // `coldWbShare`: ride BranchEu's int write port (with the exception A7 write and the
+      // debug write) instead of owning a 6th physical port. Exclusive: the An write is
+      // asserted only in FM_DONE, long after the FSM went active; the IQ issues nothing
+      // while `backendSquash` (= doFlushReg || exc.active) is high and BranchEu is
+      // latency-1, so its last possible write lands on the FSM's first active cycle; the
+      // A7/sysReg writes of the same group fire only in other FSM states (S_REDIR/S_APPLY);
+      // the debug write only while halted. RegFilePlugin sim-asserts it.
+      host.get[m68k040.execute.regfile.IntRegFileService].foreach { rf =>
+        fmAnWrite = if (coldWbShare) rf.newWrite(latency = 1,
+                      sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
+                    else rf.newWrite()
+      }
     }
     _supervisor             = Bool()
     _sourceFc               = UInt(3 bits)
@@ -965,6 +985,19 @@ class RobPlugin(val detailedPerf: Boolean = false,
     euFaultCompletion.payload.vector.allowOverride; euFaultCompletion.payload.vector := U(0, 8 bits)
     euFaultCompletion.payload.faultAddr.allowOverride; euFaultCompletion.payload.faultAddr := U(0, 32 bits)
     euFaultCompletion.simPublic()
+    // Branch-EU execute-time fault (TRAPV/TRAPcc vector 7, odd branch target vector 3).
+    // Its OWN port, never a share of `euFaultCompletion` (which the CPLX/DivEu drives with
+    // CHK/CHK2/DIV0): the two EUs are independent pipelines that can fault in the same
+    // cycle, and the shared Flow used to be driven by a last-assignment override that
+    // silently DROPPED the branch EU's fault (the TRAPV then retired as a no-op and the
+    // younger CHK trapped instead). A fifth input to the age-arbitrated fold below --
+    // the same precedent as fp/eu and sq/ls. Default-idle so a standalone DUT elaborates.
+    val brFaultCompletion = Flow(m68k040.execute.EuFault())
+    brFaultCompletion.valid.allowOverride;          brFaultCompletion.valid := False
+    brFaultCompletion.payload.robId.allowOverride;  brFaultCompletion.payload.robId := U(0, robIdW bits)
+    brFaultCompletion.payload.vector.allowOverride; brFaultCompletion.payload.vector := U(0, 8 bits)
+    brFaultCompletion.payload.faultAddr.allowOverride; brFaultCompletion.payload.faultAddr := U(0, 32 bits)
+    brFaultCompletion.simPublic()
     // FP enabled-trap escalation (vectors 49-54), driven by the CPLX EU's FP writeback lane.
     // A SECOND euFault-shaped port rather than a share of the one above, for the same reason
     // completion port 5 is separate from port 3: the int/NZVC lane and the FP lane are
@@ -1184,7 +1217,14 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // (serializing — keep younger work squashed + block alloc/retire). Driven after
     // the exc unit is built; forward-declared so `flushing` can gate on it.
     val excSquash = Bool()
-    val flushing   = flush.valid || doFlushReg || excSquash
+    // `flushFromSquash`: the same function, read from the REGISTERED `backendSquash`
+    // (D = doFlushNext || exc.activeNext, declared below and forward-wired here) instead
+    // of the OR of `doFlushReg` and `excSquash` (= exc.active). Equal on every cycle; the
+    // sim assertion next to `backendSquash` checks it. `flush.valid` stays ORed in for the
+    // harnesses that drive it; the shipping top ties it False so `flushing` is one flop.
+    val flushSquashFwd = if (flushFromSquash) Bool() else null
+    val flushing   = if (flushFromSquash) flush.valid || flushSquashFwd
+                     else flush.valid || doFlushReg || excSquash
     flushing.simPublic() // 2026-08-27 boot-investigation debug tap, see interruptPending's
 
     // The head is a faulted µop ready to retire -> take the exception INSTEAD of a
@@ -2171,6 +2211,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
       faultPortOf(euFaultCompletion.valid, euFaultCompletion.payload.robId,
                   euFaultCompletion.payload.faultAddr, euFaultCompletion.payload.vector,
                   faultAllocSize, faultAllocWr, faultAllocSup, True),
+      faultPortOf(brFaultCompletion.valid, brFaultCompletion.payload.robId,
+                  brFaultCompletion.payload.faultAddr, brFaultCompletion.payload.vector,
+                  faultAllocSize, faultAllocWr, faultAllocSup, True),
       faultPortOf(fpFaultCompletion.valid, fpFaultCompletion.payload.robId,
                   fpFaultCompletion.payload.faultAddr, fpFaultCompletion.payload.vector,
                   faultAllocSize, faultAllocWr, faultAllocSup, True))
@@ -2266,9 +2309,17 @@ class RobPlugin(val detailedPerf: Boolean = false,
       r
     }
     // `b` (the later, higher-priority port) wins on an age TIE — see ARBITRATION.
-    val faultWin = faultCap.reduceLeft { (a, b) =>
+    // BALANCED tree, not a linear fold: with five ports a linear `reduceLeft` would be
+    // four select levels deep where the four-port fold was three. The pairing keeps it
+    // at ceil(log2(5)) = 3. Tie priority is unchanged: every node lets its RIGHT
+    // (later-port) operand win a tie, and the right subtree always holds the later ports,
+    // so the overall winner is still "minimum age, latest port on a tie".
+    def faultPick(a: RobFaultPort, b: RobFaultPort): RobFaultPort =
       Mux(b.valid && (!a.valid || (b.age <= a.age)), b, a)
-    }
+    def faultTree(ps: Seq[RobFaultPort]): RobFaultPort =
+      if (ps.size == 1) ps.head
+      else { val (l, r) = ps.splitAt(ps.size / 2); faultPick(faultTree(l), faultTree(r)) }
+    val faultWin = faultTree(faultCap)
     faultWin.valid.setName("faultWinValid"); faultWin.robId.setName("faultWinRobId")
     faultWin.valid.simPublic(); faultWin.robId.simPublic()
     // Half (1): the un-delayed, un-arbitrated, head-free retire-blocking mark.
@@ -2456,6 +2507,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
         fsVec(i)     := euFaultCompletion.payload.vector
         fsInstr(i)   := False
         fsAddr(i)    := euFaultCompletion.payload.faultAddr
+      }
+      when(brFaultCompletion.valid) {
+        val i = brFaultCompletion.payload.robId
+        fsFaulted(i) := True
+        fsVec(i)     := brFaultCompletion.payload.vector
+        fsInstr(i)   := False
+        fsAddr(i)    := brFaultCompletion.payload.faultAddr
       }
       when(fpFaultCompletion.valid) {
         val i = fpFaultCompletion.payload.robId
@@ -3619,8 +3677,13 @@ class RobPlugin(val detailedPerf: Boolean = false,
           "RobPlugin: backendSquash drifted from `doFlushReg || exc.active` -- a writer of " +
           "doFlushReg was added without folding it into doFlushNext", FAILURE)
         assert(excActiveLs === exc.active, "RobPlugin: excActiveLs drifted from exc.active", FAILURE)
+        if (flushFromSquash)
+          assert(flushing === (flush.valid || doFlushReg || excSquash),
+            "RobPlugin(flushFromSquash): registered `flushing` drifted from the combinational " +
+            "`flush.valid || doFlushReg || excSquash`", FAILURE)
       }
     }
+    if (flushFromSquash) flushSquashFwd := backendSquash
     when(debugPcApply)       { flushPcReg := debugSystemApplyIn.payload.pc }
     when(branchRedirect)    { flushPcReg := nextPcRd0 }   // Slice B: shared h0 read port
     when(orderRedirect)     { flushPcReg := p1.pc }

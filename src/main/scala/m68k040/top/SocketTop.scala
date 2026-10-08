@@ -744,7 +744,10 @@ object GenSocketTopVerilog {
             // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
             s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
             s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +
-            s"walkAbortOnFlush=${ShippingCoreConfig.walkAbortOnFlush}")
+            s"walkAbortOnFlush=${ShippingCoreConfig.walkAbortOnFlush} " +
+            // RobPlugin constructor DEFAULTS (the `sqDepth` precedent).
+            s"flushFromSquash=${ShippingCoreConfig.flushFromSquash} " +
+            s"coldWbShare=${ShippingCoreConfig.coldWbShare}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
