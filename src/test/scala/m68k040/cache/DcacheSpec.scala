@@ -21,13 +21,15 @@ class DcacheSpec extends AnyFunSuite {
   val DC_WAY_STRIDE: Long = DcacheTestGeometry.WayStride
 
   class Dut(directRefill: Boolean = false, hitUnderMissRead: Boolean = false,
-            earlyLineForward: Boolean = false) extends Component {
+            earlyLineForward: Boolean = false,
+            lineForwardLiveGuards: Boolean = true) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin(directRefillResponse = directRefill,
       earlyProbeLineForward = earlyLineForward,
+      lineForwardLiveGuards = lineForwardLiveGuards,
       hitUnderMiss = hitUnderMissRead, hitUnderMissRead = hitUnderMissRead)
     val probe  = new DcacheProbePlugin
     // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
@@ -41,6 +43,8 @@ class DcacheSpec extends AnyFunSuite {
   }
 
   def simConfig = M68kSim().withVerilator
+  /** The shipping setting of `DcachePlugin.lineForwardLiveGuards` (off under CPU_LS_P3_LAUNCH). */
+  val LineGuards: Boolean = !m68k040.top.ShippingCoreConfig.lsP3Launch
 
   /** ONE shared verilator build reused by the post-P4.3/P4.4-review regression sweeps
     * below (9 offsets; recompiling per offset costs minutes for zero
@@ -50,13 +54,14 @@ class DcacheSpec extends AnyFunSuite {
   // default-argument companion is itself lazy: the Spinal elaboration thread
   // cannot initialize it while the test thread holds this suite's lazy-val lock.
   lazy val sharedCompiled = simConfig.compile(new Dut(directRefill = false, hitUnderMissRead = false,
-    earlyLineForward = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward))
+    earlyLineForward = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
+    lineForwardLiveGuards = LineGuards))
   lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true, hitUnderMissRead = false,
     earlyLineForward = false))
   lazy val directHumCompiled = simConfig.compile(new Dut(directRefill = true,
     hitUnderMissRead = true, earlyLineForward = false))
   lazy val earlyLineCompiled = simConfig.compile(new Dut(directRefill = false,
-    hitUnderMissRead = false, earlyLineForward = true))
+    hitUnderMissRead = false, earlyLineForward = true, lineForwardLiveGuards = LineGuards))
 
   test("direct refill replies once on a cacheable miss, faults once on DECERR, and leaves inhibited reads unchanged",
        VerilatorTest) {
@@ -2737,14 +2742,25 @@ class DcacheSpec extends AnyFunSuite {
       sleep(1)
       assert(dut.dcache.logic.probeLineValid.toBoolean,
         "cancel must coincide with the registered line result")
-      assert(!dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
-        "matching cancel must veto the registered line")
-      assert(!dut.probe.logic.loadCmdIn.ready.toBoolean,
-        "a token-present not-ready slot must hold the command during cancel")
-      cd.waitSampling()
-      dut.probe.logic.loadProbeCancelIn.valid #= false
-      cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
-        dut.probe.logic.loadCmdIn.ready.toBoolean)
+      if (LineGuards) {
+        assert(!dut.dcache.logic.lineForwardOwnsCmd.toBoolean,
+          "matching cancel must veto the registered line")
+        assert(!dut.probe.logic.loadCmdIn.ready.toBoolean,
+          "a token-present not-ready slot must hold the command during cancel")
+        cd.waitSampling()
+        dut.probe.logic.loadProbeCancelIn.valid #= false
+        cd.waitSamplingWhere(dut.probe.logic.loadCmdIn.valid.toBoolean &&
+          dut.probe.logic.loadCmdIn.ready.toBoolean)
+      } else {
+        // Unguarded (CPU_LS_P3_LAUNCH): the registered line still forwards; the cancel
+        // and the consume both retire the slot on this edge, and the response is the
+        // command's own physical line -- correct data, exactly once.
+        assert(dut.dcache.logic.lineForwardOwnsCmd.toBoolean &&
+          dut.probe.logic.loadCmdIn.ready.toBoolean,
+          "unguarded line forward must own the command despite a same-cycle cancel")
+        cd.waitSampling()
+        dut.probe.logic.loadProbeCancelIn.valid #= false
+      }
       dut.probe.logic.loadCmdIn.valid #= false
       cd.waitSamplingWhere(dut.probe.logic.loadRspOut.valid.toBoolean)
       assert(dut.probe.logic.loadRspOut.payload.token.toInt == canceledToken)

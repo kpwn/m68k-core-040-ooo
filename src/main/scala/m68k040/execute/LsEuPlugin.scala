@@ -1571,7 +1571,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val p3FastEnq       = if (p3FastLoad) Bool() else False
     if (p3FastLoad) p3FastEnq := False
     if (p3FastLoad) p3FastEnq.simPublic()
-    // Registered P2T verdict of the store-queue line filter (see `p3SqLineFilter`).
+    // Registered P2T verdict of the store-queue line filter (see `p3SqLineFilter`),
+    // folded with every per-load admission term that is a function of the load's own
+    // context (ordinary cacheable single-access LOAD). One flop, so the P3 arm reads
+    // a register instead of re-deriving the context decode behind `p3Valid`.
     val p3SqClear: Bool = if (p3SqLineFilter) RegInit(False) else null
     if (p3SqLineFilter) p3SqClear.simPublic()
     val alignedEnqSplit = Bool(); alignedEnqSplit := False   // two-descriptor push (split-load pair)
@@ -3912,6 +3915,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // before the successor can launch. Extra conservative assertion during target
     // reprogramming only postpones launch; precise halt ownership stays in the ROB.
     val p4PreemptSafe = !irqPreemptPendingIn && !debugHaltImminentIn
+    // `p3SqLineFilter`: the P3 arm reads last cycle's value. A P4 CACHEABLE launch does
+    // not consult `p4PreemptSafe` at all (only the inhibited arm does), so a one-cycle-old
+    // copy is still strictly more conservative than the P4 path the P3 arm replaces, and
+    // it keeps the ROB's head-derived preempt cone off the P3 ready chain.
+    val p3PreemptSafeR: Bool = if (p3SqLineFilter) RegNext(p4PreemptSafe) init(False) else null
 
     // ═══ D4: A CACHE-INHIBITED ACCESS IS A FULL MEMORY BARRIER, BOTH DIRECTIONS ═══════
     // (`inhibitedFullBarrier`; see `ShippingCoreConfig.inhibitedFullBarrier` for WHY.)
@@ -4637,9 +4645,21 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
           // `p3SqLineFilter`: the registered P2T line filter (see `p3SqClear`) replaces
           // `sq.io.empty` -- a superset proof that this load's P4 verdict would be
           // hit = stall = serial = 0, so P4 would launch it unchanged one cycle later.
-          val sqAdmits = if (p3SqLineFilter) p3SqClear else sq.io.empty
-          when(ordinary && sqAdmits && !p4Valid && parkIdle &&
-               !inhibLoadInFlight && p4PreemptSafe && alignedCanEnq) {
+          // With the filter, every term is a register or a shallow function of
+          // registers: `p3SqClear` already carries `ordinary`, ring room is the
+          // registered `!alignedFull` (NOT `alignedCanEnq`, whose `alignedRspFire` is the
+          // live D-cache response -- that put the D-cache load FSM -> loadRsp -> ring pop
+          // in front of p3Ready -> txCanConsumeRsp -> the probe resolve / completion /
+          // issue-ready cones), and the preempt term is last cycle's copy. A full ring
+          // that pops this cycle simply takes the P4 path (one cycle later).
+          val admit = if (p3SqLineFilter) {
+            p3SqClear && !p4Valid && parkIdle && !inhibLoadInFlight && p3PreemptSafeR &&
+              !bkBusy && !alignedFull
+          } else {
+            ordinary && sq.io.empty && !p4Valid && parkIdle &&
+              !inhibLoadInFlight && p4PreemptSafe && alignedCanEnq
+          }
+          when(admit) {
             alignedEnq := True
             p3FastEnq := True
             p3CanLeave := True
@@ -4954,7 +4974,15 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         (p3Ctx.cmode === m68k040.cache.CacheMode.INHIBITED) ||
         (p3Front.twoAccess && ((p3Ctx.paddrB(11 downto 4) === idx) ||
                                (p3Ctx.cmodeB === m68k040.cache.CacheMode.INHIBITED))))
-      when(txToP3) { p3SqClear := sq.io.lineProbe.clear && !leavingStoreHazard }
+      // The P3 arm's `ordinary` predicate, evaluated on the context P3 is about to hold
+      // (`p3Ctx := txOut` on this same edge), so the arm needs no context decode.
+      val txOrdinaryLoad = (txOut.front.memOp === MemOp.LOAD) &&
+        !txOut.front.twoAccess && !txOut.front.ccrRestore &&
+        !(txOut.front.needsSupervisor && !txOut.front.supervisor) &&
+        (txOut.cmode =/= m68k040.cache.CacheMode.INHIBITED)
+      when(txToP3) {
+        p3SqClear := sq.io.lineProbe.clear && !leavingStoreHazard && txOrdinaryLoad
+      }
       GenerationFlags.simulation {
         // The proof, checked: a load admitted on the filter would have received a clean
         // forward verdict from the real SQ query this very cycle (P3 queries from
