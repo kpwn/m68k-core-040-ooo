@@ -698,4 +698,26 @@ object ShippingCoreConfig {
     * RobPlugin. Review §5.1.
     * Default ON (gated 2026-10-08); `CPU_COLD_WB_SHARE=0` restores dedicated ports; echoed in `SHIPPING_CONFIG`. */
   val coldWbShare: Boolean = envFlag("CPU_COLD_WB_SHARE", true)
+  // ── AREA ITEMS (docs/design/10-review.md §5.5, §5.6, §6) ─────────────────────────
+  /** BTB/FTB: drop the 2-bit `counter` from `BtbEntry`/`FtbEntry` and the retire-time
+    * read-modify-write read port that only existed to update it. FTB: the counter has no
+    * reader at all. BTB: its only reader is `predTakenComb`, which FetchAlign consumes
+    * only when `!condBtbHit0` -- i.e. a miss (False either way) or `brType == 1`
+    * (force-taken either way; BranchEu only ever emits brType 0/1). So predictions are
+    * bit-identical in every harness that wires gshare. Default ON (gated 2026-10-08); `CPU_BTB_NO_COUNTER=0` disables; echoed in
+    * `SHIPPING_CONFIG`. */
+  val btbNoCounter: Boolean = envFlag("CPU_BTB_NO_COUNTER", true)
+  /** gshare: size `ghr`/`ghrArch` (and the retained-history suffix) to the history bits
+    * the PHT index actually folds, min(GHR_BITS, log2(PHT entries)), instead of GHR_BITS.
+    * Every GHR consumer is a left shift or the low-bit index fold, so the dropped high
+    * bits never reach a low bit. Follows CPU_GSHARE_ENTRIES. Default ON (gated 2026-10-08); `CPU_GHR_TRIM=0` disables; echoed in
+    * `SHIPPING_CONFIG`. */
+  val ghrTrim: Boolean = envFlag("CPU_GHR_TRIM", true)
+  /** ALU1 lean (review §5.6): the rare ALU datapaths -- BCD/NBCD, PACK/UNPK, BFRESOLVE,
+    * CASOP (+ its dedicated CMP datapath), ADDX/SUBX/NEGX, MOVE from CCR/SR, the CCR
+    * read-modify-write (toCcr) and the SR logic RMW -- are built only in eu0. The IQ
+    * never selects such a µop for port 1: a per-slot flop written at push is ANDed into
+    * `cand1`. Read by `IssueQueuePlugin` (default) and by every two-ALU harness for eu1
+    * (`AluEuPlugin(lean = ...)`). Default ON (gated 2026-10-08); `CPU_ALU1_LEAN=0` disables; echoed in `SHIPPING_CONFIG`. */
+  val alu1Lean: Boolean = envFlag("CPU_ALU1_LEAN", true)
 }

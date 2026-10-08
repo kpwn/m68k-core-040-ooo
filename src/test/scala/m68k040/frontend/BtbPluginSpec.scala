@@ -45,14 +45,18 @@ class BtbPluginSpec extends AnyFunSuite {
       val oPredValid  = out(Bool());        oPredValid  := btb.logic.predTakenComb
       val oPredTarget = out(UInt(32 bits)); oPredTarget := btb.logic.predTargetComb
       val oPredPc     = out(UInt(32 bits)); oPredPc     := qPc
+      val oHit        = out(Bool());        oHit        := btb.logic.predHitComb
+      val oType       = out(UInt(2 bits));  oType       := btb.logic.predTypeComb
     }
   }
 
-  class BtbDut extends Component {
+  // The directed tests below exercise the bimodal counter itself, so they pin it ON
+  // regardless of CPU_BTB_NO_COUNTER; the equivalence test at the end covers OFF.
+  class BtbDut(noCounter: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val drv  = new BtbUpdateDriverPlugin
-    val btb  = new BtbPlugin
+    val btb  = new BtbPlugin(noCounter = noCounter)
     val wire = new BtbWirePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), drv, btb, wire)) }
   }
@@ -178,5 +182,47 @@ class BtbPluginSpec extends AnyFunSuite {
       dut.wire.logic.inval #= true; cd.waitSampling(); dut.wire.logic.inval #= false; cd.waitSampling()
       assert(!lookup(dut, cd, 0x9000)._1, "invalidateAll -> cold miss again")
     }
+  }
+
+  // CPU_BTB_NO_COUNTER: FetchAlign consumes `predTakenComb` only as
+  //   slot0PredTaken = Mux(hit && brType == cond, gshareTaken, predTakenComb)
+  // so the counterless BTB must agree with the counter BTB on hit, brType and target
+  // always, and on predTaken whenever the hit is NOT a conditional. Drive both with the
+  // same random retire-update / lookup stream and compare every lookup.
+  test("CPU_BTB_NO_COUNTER: predictions identical under FetchAlign's gshare composition", VerilatorTest) {
+    val ref = SimConfig.withVerilator.compile(new BtbDut(noCounter = false))
+    val lean = SimConfig.withVerilator.compile(new BtbDut(noCounter = true))
+    val rnd = new scala.util.Random(42)
+    // Small PC pool: indices collide and tags alias, exercising alloc-vs-update.
+    val pcs = Seq.fill(24)((rnd.nextInt(64) * 2L) + (rnd.nextInt(4).toLong << 16))
+    val ops = Seq.fill(3000)((rnd.nextInt(3), pcs(rnd.nextInt(pcs.size)), rnd.nextBoolean(),
+      0x100000L + rnd.nextInt(1 << 16) * 2L, rnd.nextInt(2)))
+    def run(c: spinal.core.sim.SimCompiled[BtbDut]): Seq[(Boolean, Boolean, Int, Long)] = {
+      var out = Vector.empty[(Boolean, Boolean, Int, Long)]
+      c.doSim { dut =>
+        val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+        for ((kind, pc, taken, tgt, ty) <- ops) {
+          if (kind == 0) update(dut, cd, pc, taken || ty == 1, tgt, ty)
+          else {
+            dut.wire.logic.qPc #= pc; dut.wire.logic.qValid #= true
+            sleep(1); cd.waitSampling()
+            val hit = dut.wire.logic.oHit.toBoolean
+            val ty2 = dut.wire.logic.oType.toInt
+            val cond = hit && ty2 == 0
+            // The value FetchAlign actually uses when gshare does not own the direction.
+            val used = if (cond) false else dut.wire.logic.oPredValid.toBoolean
+            // brType/target are don't-cares on a miss (uninitialised LUTRAM row).
+            out :+= ((used, hit, if (hit) ty2 else 0, if (hit) dut.wire.logic.oPredTarget.toLong else 0L))
+            dut.wire.logic.qValid #= false
+          }
+        }
+      }
+      out
+    }
+    val a = run(ref); val b = run(lean)
+    assert(a.size == b.size && a.size > 1000)
+    assert(a.count(_._2) > 200, "the stream must actually hit the BTB")
+    val firstDiff = a.zip(b).indexWhere { case (x, y) => x != y }
+    assert(firstDiff < 0, s"lookup $firstDiff differs: counter=${a.lift(firstDiff)} lean=${b.lift(firstDiff)}")
   }
 }

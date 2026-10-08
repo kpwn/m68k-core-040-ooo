@@ -96,7 +96,7 @@ class M68kSocketTop(p: M68kParams = M68kParams(),
     //     reset vector's SSP); DebugCtrlPlugin is free-standing and stays last of all,
     //     exactly as GenFullCoreSynthVerilog.buildWith orders it.
     val eu0 = new m68k040.execute.AluEuPlugin
-    val eu1 = new m68k040.execute.AluEuPlugin
+    val eu1 = new m68k040.execute.AluEuPlugin(lean = ShippingCoreConfig.alu1Lean)
     val branchEu = new m68k040.execute.BranchEuPlugin
     // Built by `ShippingPlugins.lsEu`, the SAME function the shipping sim harnesses call.
     // Why these knobs (moved here verbatim from the old inline constructor):
@@ -702,6 +702,9 @@ object GenSocketTopVerilog {
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
             s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
+            s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
+            s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
+            s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

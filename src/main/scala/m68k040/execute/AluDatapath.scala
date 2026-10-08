@@ -29,7 +29,9 @@ case class AluRsp() extends Bundle {
 }
 
 object AluDatapath {
-  def apply(cmd: AluCmd): AluRsp = {
+  /** `noExtended`: the X-carry family (NEGX/ADDX/SUBX) never reaches this datapath
+    * (CPU_ALU1_LEAN eu1), so its carry-in / operand-select terms are not built. */
+  def apply(cmd: AluCmd, noExtended: Boolean = false): AluRsp = {
     val a = cmd.src1.asUInt
     val b = cmd.src2.asUInt
 
@@ -42,12 +44,12 @@ object AluDatapath {
     // a true subtract-from-zero at the operation size.
     val isSub   = cmd.op === DecOp.SUB || cmd.op === DecOp.CMP
     val isNeg   = cmd.op === DecOp.NEG
-    val isNegx  = cmd.op === DecOp.NEGX
+    val isNegx  = if (noExtended) False else cmd.op === DecOp.NEGX
     // ADDX/SUBX: ordinary two-operand ADD/SUB (a=src1=Dx, b=src2=Dy) with X folded into
     // the carry/borrow-in. ADDX = a + b + X  (cin := X); SUBX = a - b - X = a + ~b + !X
     // (cin := !X, the NEGX borrow form). Only NEG/NEGX force aEff=0; ADDX/SUBX use `a`.
-    val isAddx  = cmd.op === DecOp.ADDX
-    val isSubx  = cmd.op === DecOp.SUBX
+    val isAddx  = if (noExtended) False else cmd.op === DecOp.ADDX
+    val isSubx  = if (noExtended) False else cmd.op === DecOp.SUBX
     val isArith = cmd.op === DecOp.ADD || isSub || isNeg || isNegx || isAddx || isSubx
     // The operand to negate (NEG/NEGX) is src1 (a); ordinary ADD/SUB(X) negate src2 (b).
     val aEff = Mux(isNeg || isNegx, U(0, 32 bits), a)

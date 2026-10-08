@@ -75,8 +75,8 @@ class GshareSpec extends AnyFunSuite {
       val qPc1   = in UInt (32 bits);  g.logic.queryPc1 := qPc1
       val oTaken1 = out(Bool());        oTaken1 := g.logic.phtTaken1
       val oIndex1 = out(UInt(idxBits bits)); oIndex1 := g.logic.phtIndex1
-      val oGhr   = out(UInt(16 bits)); oGhr   := g.logic.ghr
-      val oGhrArch = out(UInt(16 bits)); oGhrArch := g.logic.ghrArch
+      val oGhr   = out(UInt(16 bits)); oGhr   := g.logic.ghr.resized
+      val oGhrArch = out(UInt(16 bits)); oGhrArch := g.logic.ghrArch.resized
       val wRspV = out(Bool()); wRspV := win.windowRsp.valid
       val wRspSlot = out(UInt(2 bits)); wRspSlot := win.windowRsp.payload.token.ringSlot
       val wRspSeq = out(UInt(8 bits)); wRspSeq := win.windowRsp.payload.token.seq
@@ -85,10 +85,13 @@ class GshareSpec extends AnyFunSuite {
     }
   }
 
-  class GshareDut(interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved) extends Component {
+  // The directed tests read the full 16-bit GHR, so they pin CPU_GHR_TRIM off; the
+  // trim equivalence test at the end compares both.
+  class GshareDut(interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved,
+                  ghrTrim: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
-    val gsh  = new GsharePlugin(interleaved = interleaved)
+    val gsh  = new GsharePlugin(interleaved = interleaved, ghrTrim = ghrTrim)
     val wire = new GshareWirePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), gsh, wire)) }
   }
@@ -298,9 +301,43 @@ class GshareSpec extends AnyFunSuite {
     * flush repairs, invalidates); every cycle's outputs are recorded and compared, and
     * the whole table is swept through the decode port at the end. */
   test("interleaved PHT is bit-identical to the flat PHT (random stimulus + full sweep)", VerilatorTest) {
-    def run(il: Boolean): Seq[String] = {
+    val flat = equivRun(false, false)
+    val inter = equivRun(true, false)
+    assert(flat.size == inter.size)
+    val firstDiff = flat.indices.find(i => flat(i) != inter(i))
+    assert(firstDiff.isEmpty, s"divergence: flat='${firstDiff.map(flat).getOrElse("")}' " +
+      s"interleaved='${firstDiff.map(inter).getOrElse("")}'")
+    // Non-vacuous: the counters must actually have been trained both ways.
+    val sweepBits = flat.filter(_.startsWith("sweep")).map(_.split(" ")(2)).mkString
+    assert(sweepBits.contains('0') && sweepBits.contains('1'), "sweep saw only one direction")
+    println(s"GSHARE_EQUIV cycles=20000 entries=$phtEntries ${flat.last} sweepNotTaken=${sweepBits.count(_ == '0')}")
+  }
+
+  /** CPU_GHR_TRIM: the trimmed GHR (min(16, idxBits) bits) must give bit-identical
+    * indices, directions and window responses, and the same low history bits, under the
+    * same random shift / retire / repair / invalidate stimulus. */
+  for (il <- Seq(false, true)) test(s"trimmed GHR is prediction-identical to the 16-bit GHR [interleaved=$il]", VerilatorTest) {
+    val fullRaw = equivRun(il, false)
+    val trimRaw = equivRun(il, true)
+    // Non-vacuous: the untrimmed GHR must actually have held bits above the fold.
+    val hiSeen = fullRaw.find(_.startsWith("hiSeen=")).map(_.stripPrefix("hiSeen=").toInt).getOrElse(0)
+    assert(hiSeen > 1000, s"the untrimmed run held history above the fold on only $hiSeen cycles")
+    val full = fullRaw.filterNot(_.startsWith("hiSeen="))
+    val trim = trimRaw.filterNot(_.startsWith("hiSeen="))
+    assert(full.size == trim.size)
+    val firstDiff = full.indices.find(i => full(i) != trim(i))
+    assert(firstDiff.isEmpty, s"divergence: full='${firstDiff.map(full).getOrElse("")}' " +
+      s"trim='${firstDiff.map(trim).getOrElse("")}'")
+  }
+
+  /** Shared random-stimulus trace. GHR values are reported as the bits the index folds
+    * so a trimmed and an untrimmed DUT are comparable; the final `hiSeen=` line counts
+    * cycles whose raw GHR had a bit above the fold (callers strip it before comparing). */
+  def equivRun(il: Boolean, trim: Boolean): Seq[String] = {
+      val histMask = (1 << idxHistBits) - 1
       val trace = scala.collection.mutable.ArrayBuffer[String]()
-      SimConfig.withVerilator.compile(new GshareDut(il)).doSim(seed = 1) { dut =>
+      var hiSeen = 0
+      SimConfig.withVerilator.compile(new GshareDut(il, trim)).doSim(seed = 1) { dut =>
         val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
         val w = dut.wire.logic
         val rnd = new scala.util.Random(0x6511)
@@ -322,10 +359,11 @@ class GshareSpec extends AnyFunSuite {
           w.wSlot #= rnd.nextInt(3); w.wSeq #= rnd.nextInt(256)
           sleep(1)
           val line = s"$cyc t0=${w.oTaken.toBoolean} i0=${w.oIndex.toInt} t1=${w.oTaken1.toBoolean} " +
-            s"i1=${w.oIndex1.toInt} ghr=${w.oGhr.toInt} arch=${w.oGhrArch.toInt} wv=${w.wRspV.toBoolean} " +
+            s"i1=${w.oIndex1.toInt} ghr=${w.oGhr.toInt & histMask} arch=${w.oGhrArch.toInt & histMask} wv=${w.wRspV.toBoolean} " +
             s"wt=${(0 until 4).map(k => if (w.wRspTaken(k).toBoolean) 1 else 0).mkString} " +
             s"wi=${(0 until 4).map(k => w.wRspIdx(k).toInt).mkString(",")}"
           trace += line
+          if ((w.oGhr.toInt & ~histMask) != 0) hiSeen += 1
           recentIdx += w.oIndex.toInt; recentIdx += w.oIndex1.toInt
           if (w.wRspV.toBoolean) (0 until 4).foreach(k => recentIdx += w.wRspIdx(k).toInt)
           if (recentIdx.size > 256) recentIdx.remove(0, recentIdx.size - 256)
@@ -342,17 +380,7 @@ class GshareSpec extends AnyFunSuite {
         }
         trace += s"windows=${trace.count(_.contains("wv=true"))}"
       }
+      trace += s"hiSeen=$hiSeen"
       trace.toSeq
-    }
-    val flat = run(false)
-    val inter = run(true)
-    assert(flat.size == inter.size)
-    val firstDiff = flat.indices.find(i => flat(i) != inter(i))
-    assert(firstDiff.isEmpty, s"divergence: flat='${firstDiff.map(flat).getOrElse("")}' " +
-      s"interleaved='${firstDiff.map(inter).getOrElse("")}'")
-    // Non-vacuous: the counters must actually have been trained both ways.
-    val sweepBits = flat.filter(_.startsWith("sweep")).map(_.split(" ")(2)).mkString
-    assert(sweepBits.contains('0') && sweepBits.contains('1'), "sweep saw only one direction")
-    println(s"GSHARE_EQUIV cycles=20000 entries=$phtEntries ${flat.last} sweepNotTaken=${sweepBits.count(_ == '0')}")
   }
 }

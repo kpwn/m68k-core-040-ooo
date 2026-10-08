@@ -8,13 +8,14 @@ import spinal.lib.misc.plugin.FiberPlugin
 
 /** One direct-mapped fetch-window entry. Validity is held separately so a complete
   * invalidation remains a one-cycle register clear. */
-case class FtbEntry(tagBits: Int) extends Bundle {
+case class FtbEntry(tagBits: Int, withCounter: Boolean = true) extends Bundle {
   val tag       = UInt(tagBits bits)
   val brWordOff = UInt(2 bits)
   val brLen     = UInt(4 bits)
   val target    = UInt(32 bits)
   val brType    = UInt(2 bits)
-  val counter   = UInt(2 bits)
+  // No reader anywhere (written by the update RMW only). CPU_BTB_NO_COUNTER omits it.
+  val counter   = if (withCounter) UInt(2 bits) else null
 }
 
 /** Registered, window-indexed fetch target buffer.
@@ -26,7 +27,8 @@ case class FtbEntry(tagBits: Int) extends Bundle {
   * their eight-byte window are installed; decode-time BTB/RAS prediction remains the
   * fallback.
   */
-class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
+class FtbPlugin(entries: Int = 128,
+                noCounter: Boolean = m68k040.top.ShippingCoreConfig.btbNoCounter) extends FiberPlugin with FtbLookupService {
   require(entries > 0 && (entries & (entries - 1)) == 0,
     "FTB entries must be a positive power of two")
 
@@ -48,7 +50,7 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
     def tagOf(pc: UInt): UInt = pc(31 downto tagLo)
 
     val valids = Vec.fill(entries)(RegInit(False))
-    val mem    = Mem(FtbEntry(tagBits), entries)
+    val mem    = Mem(FtbEntry(tagBits, !noCounter), entries)
 
     val cmd = Flow(FtbLookupCmd())
     cmd.valid.allowOverride; cmd.valid := False
@@ -109,27 +111,29 @@ class FtbPlugin(entries: Int = 128) extends FiberPlugin with FtbLookupService {
     val upd = host[BtbUpdateService].btbUpdate
     val uIdx   = idxOf(upd.payload.pc)
     val uTag   = tagOf(upd.payload.pc)
-    val uOld   = mem.readAsync(uIdx)
-    val uHit   = valids(uIdx) && (uOld.tag === uTag) &&
-                 (uOld.brWordOff === upd.payload.pc(2 downto 1))
+    // The counter's only reader is its own read-modify-write; without it (CPU_BTB_NO_COUNTER)
+    // the update needs no read of the table at all (one async read port fewer).
+    val uOld   = if (!noCounter) mem.readAsync(uIdx) else null
+    val uHit   = if (!noCounter) valids(uIdx) && (uOld.tag === uTag) &&
+                 (uOld.brWordOff === upd.payload.pc(2 downto 1)) else null
     val uOff   = upd.payload.pc(2 downto 1)
     val uEnd   = uOff.resize(5) + upd.payload.len.resize(5)
     val installable = upd.payload.len =/= 0 &&
                       upd.payload.len <= U(5, 4 bits) &&
                       uEnd <= U(4, 5 bits)
 
-    val cInc = Mux(uOld.counter === U(3, 2 bits), U(3, 2 bits), (uOld.counter + 1).resized)
-    val cDec = Mux(uOld.counter === U(0, 2 bits), U(0, 2 bits), (uOld.counter - 1).resized)
-    val ctrUpdated = Mux(upd.payload.taken, cInc, cDec)
-    val ctrAlloc = Mux(upd.payload.brType === U(1, 2 bits), U(3, 2 bits),
-                   Mux(upd.payload.taken, U(2, 2 bits), U(1, 2 bits)))
-    val uNew = FtbEntry(tagBits)
+    val cInc = if (!noCounter) Mux(uOld.counter === U(3, 2 bits), U(3, 2 bits), (uOld.counter + 1).resized) else null
+    val cDec = if (!noCounter) Mux(uOld.counter === U(0, 2 bits), U(0, 2 bits), (uOld.counter - 1).resized) else null
+    val ctrUpdated = if (!noCounter) Mux(upd.payload.taken, cInc, cDec) else null
+    val ctrAlloc = if (!noCounter) Mux(upd.payload.brType === U(1, 2 bits), U(3, 2 bits),
+                   Mux(upd.payload.taken, U(2, 2 bits), U(1, 2 bits))) else null
+    val uNew = FtbEntry(tagBits, !noCounter)
     uNew.tag       := uTag
     uNew.brWordOff := uOff
     uNew.brLen     := upd.payload.len
     uNew.target    := upd.payload.target
     uNew.brType    := upd.payload.brType
-    uNew.counter   := Mux(uHit, ctrUpdated, ctrAlloc)
+    if (!noCounter) uNew.counter := Mux(uHit, ctrUpdated, ctrAlloc)
 
     val memWr = upd.valid && installable && !invalidateAll
     mem.write(uIdx, uNew, enable = memWr)

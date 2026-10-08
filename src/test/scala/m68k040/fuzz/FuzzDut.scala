@@ -488,7 +488,7 @@ class FuzzCoreDut(forceShipping: Boolean = false) extends Component {
     loadBypassUnreadyLoad = fuzzLsOoo)
   else iqKnobs.build()
   val eu0    = new AluEuPlugin
-  val eu1    = new AluEuPlugin
+  val eu1    = new AluEuPlugin(lean = m68k040.top.ShippingCoreConfig.alu1Lean)
   val branchEu = new BranchEuPlugin
   // SHIPPING-MATCHED COVERAGE. `SocketTop` sets `alignedLoadFallThrough = ipcThroughput`
   // (true on the board), and `LS_OOO_ISSUE` can only be on in that same build -- so the ONLY

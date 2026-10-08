@@ -104,7 +104,7 @@ class LsBackendInjectSpec extends AnyFunSuite {
     val disp  = new m68k040.dispatch.DispatchPlugin
     val iq     = new IssueQueuePlugin
     val eu0    = new AluEuPlugin
-    val eu1    = new AluEuPlugin
+    val eu1    = new AluEuPlugin(lean = m68k040.top.ShippingCoreConfig.alu1Lean)
     val branchEu = new BranchEuPlugin
     val xlateD = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin()

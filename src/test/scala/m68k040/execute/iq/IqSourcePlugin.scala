@@ -101,9 +101,9 @@ class IqSourcePlugin extends FiberPlugin {
       u.psrcA        := io.psrcA;    u.psrcAValid := io.psrcAValid
       u.psrcB        := io.psrcB;    u.psrcBValid := io.psrcBValid
       u.readsNzvc    := io.readsNzvc;  u.writesNzvc := io.writesNzvc
-      u.pNzvcSrc     := io.pNzvcSrc;   u.pNzvcDst   := io.pNzvcDst
+      u.pNzvcSrc     := io.pNzvcSrc.resized;   u.pNzvcDst   := io.pNzvcDst.resized
       u.readsX       := io.readsX;     u.writesX    := io.writesX
-      u.pXSrc        := io.pXSrc;      u.pXDst      := io.pXDst
+      u.pXSrc        := io.pXSrc.resized;      u.pXDst      := io.pXDst.resized
       u.pFpSrcA := io.pFpSrcA; u.psrcAFpValid := io.psrcAFpValid
       u.pFpSrcB := io.pFpSrcB; u.psrcBFpValid := io.psrcBFpValid
       u.pFpDst  := io.pFpDst;  u.pFpDstValid  := io.pFpDstValid
@@ -203,9 +203,9 @@ class IqSourcePlugin extends FiberPlugin {
     iq.aluSlowWakeup(0).valid            := aluSlowWakeupValid
     iq.aluSlowWakeup(0).payload.pdst     := aluSlowWakeupPdst
     iq.aluSlowWakeup(0).payload.pdstValid:= aluSlowWakeupPdstV
-    iq.aluSlowWakeup(0).payload.pNzvcDst := aluSlowWakeupNzvc
+    iq.aluSlowWakeup(0).payload.pNzvcDst := aluSlowWakeupNzvc.resized
     iq.aluSlowWakeup(0).payload.nzvcValid:= aluSlowWakeupNzvcV
-    iq.aluSlowWakeup(0).payload.pXDst    := aluSlowWakeupX
+    iq.aluSlowWakeup(0).payload.pXDst    := aluSlowWakeupX.resized
     iq.aluSlowWakeup(0).payload.xValid   := aluSlowWakeupXV
 
     // Dynamic CPLX FP-DATA / FPCC wakeup (sim-driven; overrides the IQ's idle default).
