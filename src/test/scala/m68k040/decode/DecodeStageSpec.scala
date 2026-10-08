@@ -16,7 +16,7 @@ import m68k040.services.{FrontendDebugMatchService, GshareSecondaryLookupService
 class DecodeStageSpec extends AnyFunSuite {
   class TrainingIndexPlugin(predictTaken: Boolean = false) extends FiberPlugin with GshareSecondaryLookupService {
     val logic = during build new Area {
-      val index = Reg(UInt(11 bits)) init 0x155
+      val index = Reg(UInt(m68k040.Global.PHT_IDX_W bits)) init 0x155
       index := index + 1
       val taken = Bool(); taken := Bool(predictTaken)
     }
@@ -32,7 +32,7 @@ class DecodeStageSpec extends AnyFunSuite {
       val pc = out(Vec(UInt(32 bits), 2))
       val tag = out(Vec(UInt(m68k040.Global.BR_PRED_TAG_W bits), 2))
       val valid = out(Vec(Bool(), 2))
-      val index = out(Vec(UInt(11 bits), 2))
+      val index = out(Vec(UInt(m68k040.Global.PHT_IDX_W bits), 2))
       for (i <- 0 until 2) {
         pc(i) := df.feed.payload(i).pc; tag(i) := df.feed.payload(i).brPredTag
         valid(i) := df.feed.payload(i).phtValid; index(i) := df.feed.payload(i).phtIndex
