@@ -462,7 +462,7 @@ object ShippingCoreConfig {
     * `SHIPPING_CONFIG`. The OFF netlist is identical to the pre-D4 tree (every added term
     * elaborates only under the flag; the D-cache's `busQuiesced` register has no reader and
     * is pruned). */
-  val inhibitedFullBarrier: Boolean = envFlag("CPU_INHIBITED_FULL_BARRIER", false)
+  val inhibitedFullBarrier: Boolean = envFlag("CPU_INHIBITED_FULL_BARRIER", true)
 
   private def envInt(name: String, dflt: Int, lo: Int, hi: Int): Int =
     sys.env.get(name) match {
@@ -482,9 +482,9 @@ object ShippingCoreConfig {
     * from the MSHR buffer, and a dirty victim leaves through a writeback buffer.
     * INHIBITED accesses keep the legacy FSM. REQUIRES `inhibitedFullBarrier` (D4).
     * OFF pending measurement; `CPU_DCACHE_NONBLOCKING=1`; echoed in `SHIPPING_CONFIG`. */
-  val dcacheNonBlocking: Boolean = envFlag("CPU_DCACHE_NONBLOCKING", false)
+  val dcacheNonBlocking: Boolean = envFlag("CPU_DCACHE_NONBLOCKING", inhibitedFullBarrier)
   /** Registered response-slot shortcut for an uncontended clean NB refill. */
-  val dcacheNbEarlyResponse: Boolean = envFlag("CPU_DCACHE_NB_EARLY_RESPONSE", false)
+  val dcacheNbEarlyResponse: Boolean = envFlag("CPU_DCACHE_NB_EARLY_RESPONSE", dcacheNonBlocking)
   /** MSHR count for `dcacheNonBlocking` (2..4: the hot door has 2 ID bits). */
   val dcacheMshrs: Int = envInt("CPU_DCACHE_MSHRS", 4, 2, 4)
   /** LS aligned-load descriptor ring. Keep 4 as the shipping default; 8/16 are
@@ -498,21 +498,21 @@ object ShippingCoreConfig {
     * that lost the shared LS write/wake port at S1. Without it the An falls back to
     * completion, which for a detached `(An)+` store is AFTER its data capture -- tying the
     * next store's address to the previous load's miss (memcpy trace, 2026-10-05). */
-  val lsEarlyAnRetry: Boolean = envFlag("CPU_LS_EARLY_AN_RETRY", false)
+  val lsEarlyAnRetry: Boolean = envFlag("CPU_LS_EARLY_AN_RETRY", true)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
     * experimental arm (`CPU_PHYS_NZVC=32`). This is the ONE source: `Global.
     * PHYS_NZVC_REGS_DEFAULT` -> `M68kParams.physNzvc` -> `Global.PHYS_NZVC_REGS`, and every
     * NZVC phys-ID width is `log2Up` of it. Echoed in `SHIPPING_CONFIG`. */
-  val physNzvc: Int = envInt("CPU_PHYS_NZVC", 16, 16, 32)
+  val physNzvc: Int = envInt("CPU_PHYS_NZVC", 32, 16, 32)
   require(physNzvc == 16 || physNzvc == 32, s"CPU_PHYS_NZVC must be 16 or 32 (got $physNzvc)")
   /** Physical X (extend flag) register pool size -- the X twin of `physNzvc`, and the
     * next binding freelist once NZVC is 32. 16 is the shipping default; 32 is the
     * experimental arm (`CPU_PHYS_X=32`). ONE source: `Global.PHYS_X_REGS_DEFAULT` ->
     * `M68kParams.physX` -> `Global.PHYS_X_REGS`; every X phys-ID width is `log2Up` of it.
     * X VALUES are 1 bit and never use it. Echoed in `SHIPPING_CONFIG`. */
-  val physX: Int = envInt("CPU_PHYS_X", 16, 16, 32)
+  val physX: Int = envInt("CPU_PHYS_X", 32, 16, 32)
   require(physX == 16 || physX == 32, s"CPU_PHYS_X must be 16 or 32 (got $physX)")
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
@@ -525,7 +525,7 @@ object ShippingCoreConfig {
   /** Route the non-blocking L1D's refills through the P6 hot door `axi_dh` (read-only,
     * 128b, ID = MSHR index) instead of `axi_d`. Requires `dcacheNonBlocking`; the SoC
     * must be built with `L2C_DH_PORT`/`DH_PORT_EN=1` (one Makefile knob, `CPU_AXI_DH=1`). */
-  val dcacheHotDoor: Boolean = envFlag("CPU_AXI_DH", false)
+  val dcacheHotDoor: Boolean = envFlag("CPU_AXI_DH", dcacheNonBlocking)
   /** Experimental zero-empty-latency AR slice at the hot-door socket boundary.
     * R and every other AXI channel retain their FULL register slices. */
   val axiDhArFallThrough: Boolean = envFlag("CPU_AXI_DH_AR_FALL_THROUGH", false)
@@ -536,7 +536,7 @@ object ShippingCoreConfig {
   val dcacheStoreAllocArDelay: Int = envInt("CPU_DCACHE_STORE_AR_DELAY", 0, 0, 15)
   /** Experimental one-cycle earlier non-blocking AR selection after allocation.
     * Keeps current WB/WT address gates and registered AXI AR output; OFF by default. */
-  val dcacheNbEagerAr: Boolean = envFlag("CPU_DCACHE_NB_EAGER_AR", false)
+  val dcacheNbEagerAr: Boolean = envFlag("CPU_DCACHE_NB_EAGER_AR", dcacheNonBlocking)
   require(!dcacheNbEagerAr || dcacheNonBlocking,
     "CPU_DCACHE_NB_EAGER_AR=1 requires CPU_DCACHE_NONBLOCKING=1")
   /** Experimental direct selection of an eligible load allocation into the existing

@@ -612,7 +612,8 @@ object SocketTopConfig {
     * A BUILD-TIME SWITCH defaulted OFF. `LS_OOO_ISSUE=1` turns it on for a build; flip the
     * default here once it is board-proven. It is reported in SHIPPING_CONFIG so a build can
     * always be identified afterwards -- the lesson from `SPEC_LOAD_WAKEUP`, which could not. */
-  val LS_OOO_ISSUE: Boolean = sys.env.get("LS_OOO_ISSUE").contains("1")
+  // 2026-10-08: default ON (board core r4/r4eco ships it); LS_OOO_ISSUE=0 turns it off.
+  val LS_OOO_ISSUE: Boolean = !sys.env.get("LS_OOO_ISSUE").map(_.trim).contains("0")
 }
 
 object SocketIpcProfile {
