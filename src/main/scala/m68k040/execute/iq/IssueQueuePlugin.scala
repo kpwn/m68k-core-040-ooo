@@ -88,7 +88,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val earlyAutoStoreAddress: Boolean = false,
                        val loadBypassUnreadyLoad: Boolean = false,
                        val specLoadWakeup: Boolean = false,
-                       val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1) extends FiberPlugin
+                       val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
+                       val alu1Lean: Boolean = m68k040.top.ShippingCoreConfig.alu1Lean) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
   require(!fourCycleL1 || specLoadWakeup,
@@ -202,6 +203,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         // Stored slow-class bit.  Keep opcode decoding out of the timing-sensitive
         // select cone; shift this bit with the slot during compaction.
         val isAluSlow = Reg(Bool()) init False
+        // CPU_ALU1_LEAN: "this µop's datapath exists only in ALU0" (AluEuPlugin.alu0Only),
+        // decoded ONCE at push like `isAluSlow` and shifted with the slot. The select
+        // reads the flop; no op decode enters the select cone. Absent when the flag is off.
+        val alu1Inel: Bool = if (alu1Lean) (Reg(Bool()) init False) else null
         // ---- PER-SOURCE dynamic-wait vector (see the `DynWait` object above) ----
         // One REGISTERED bit per (source operand x dynamic producer class): set at push
         // from that source's own `*Busy` lookup, cleared by a bare tag compare against
@@ -675,7 +680,11 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val aluSlowSlots = B(slots.map(_.isAluSlow))
     val allAluCandidates = B((BigInt(1) << slotCount) - 1, slotCount bits)
     val cand0 = aluReady & Mux(aluFastAcceptNextPorts(0), allAluCandidates, aluSlowSlots)
-    val cand1 = aluReady & Mux(aluFastAcceptNextPorts(1), allAluCandidates, aluSlowSlots)
+    // CPU_ALU1_LEAN: port 1 (eu1) never takes an eu0-only µop. `alu1Inel` is a slot
+    // flop, so per slot this is one more input on the existing aluReady/Mux bit-function
+    // (a slow SHIFT is never eu0-only, so masking only the fast arm is exact).
+    val alu1Candidates = if (alu1Lean) ~B(slots.map(_.alu1Inel)) else allAluCandidates
+    val cand1 = aluReady & Mux(aluFastAcceptNextPorts(1), alu1Candidates, aluSlowSlots)
     val oh0 = OHMasking.first(cand0)
     val oh1 = OHMasking.first(cand1 & ~oh0)
     val ohB = OHMasking.first(brReady)
@@ -1381,6 +1390,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     val pushHot1 = IqHot(); pushHot1.assignFrom(pushPort.payload(1), way = True, earlyAutoStoreAddress = earlyAutoStoreAddress)
     val push0IsAluSlow = isAluSlowProducer(pushHot0)
     val push1IsAluSlow = isAluSlowProducer(pushHot1)
+    val push0Alu1Inel = if (alu1Lean) m68k040.execute.AluEuPlugin.alu0Only(pushUop0) else null
+    val push1Alu1Inel = if (alu1Lean) m68k040.execute.AluEuPlugin.alu0Only(pushUop1) else null
     // debug-only (task #141 X-flag/scoreboard leak investigation)
     pushPort.valid.simPublic(); pushSlot1Port.simPublic()
     pushPort.payload(0).robId.simPublic(); pushUop0.pc.simPublic()
@@ -1607,6 +1618,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
           val wDst = lines(lineId).ways(way)
           wDst.hot      := wSrc.hot
           wDst.isAluSlow := wSrc.isAluSlow
+          if (alu1Lean) wDst.alu1Inel := wSrc.alu1Inel
           wDst.triggers := (wSrc.triggers >> wayCount).resized
           wDst.sel      := wSrc.selComb
           // The whole per-source dynamic-wait vector shifts with the slot, exactly as the
@@ -1622,11 +1634,13 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       val wDst1 = lines.last.ways(1)
       wDst0.hot      := pushHot0
       wDst0.isAluSlow := push0IsAluSlow
+      if (alu1Lean) wDst0.alu1Inel := push0Alu1Inel
       wDst0.triggers := trig0
       wDst0.sel      := True
       wDst0.dynWaitNext := dynDep0
       wDst1.hot      := pushHot1
       wDst1.isAluSlow := push1IsAluSlow
+      if (alu1Lean) wDst1.alu1Inel := push1Alu1Inel
       wDst1.triggers := trig1
       wDst1.sel      := pushSlot1Port
       wDst1.dynWaitNext := dynDep1

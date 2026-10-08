@@ -674,4 +674,11 @@ object ShippingCoreConfig {
     * bits never reach a low bit. Follows CPU_GSHARE_ENTRIES. `CPU_GHR_TRIM`; echoed in
     * `SHIPPING_CONFIG`. */
   val ghrTrim: Boolean = envFlag("CPU_GHR_TRIM", false)
+  /** ALU1 lean (review §5.6): the rare ALU datapaths -- BCD/NBCD, PACK/UNPK, BFRESOLVE,
+    * CASOP (+ its dedicated CMP datapath), ADDX/SUBX/NEGX, MOVE from CCR/SR, the CCR
+    * read-modify-write (toCcr) and the SR logic RMW -- are built only in eu0. The IQ
+    * never selects such a µop for port 1: a per-slot flop written at push is ANDed into
+    * `cand1`. Read by `IssueQueuePlugin` (default) and by every two-ALU harness for eu1
+    * (`AluEuPlugin(lean = ...)`). `CPU_ALU1_LEAN`; echoed in `SHIPPING_CONFIG`. */
+  val alu1Lean: Boolean = envFlag("CPU_ALU1_LEAN", false)
 }

@@ -862,7 +862,7 @@ object GenFullCoreSynthVerilog {
     M68kSpinalConfig(targetDirectory = "generated")
       .generateVerilog {
         val eu0 = new AluEuPlugin
-        val eu1 = new AluEuPlugin
+        val eu1 = new AluEuPlugin(lean = ShippingCoreConfig.alu1Lean)
         val branchEu = new BranchEuPlugin
         // LS_SPEC_WAKE=1 requires the throughput pairing (`earlyIntWakeup` +
         // `alignedLoadFallThrough`); a baseline-profile build silently ignores it rather

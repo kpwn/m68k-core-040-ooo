@@ -68,7 +68,22 @@ case class WbObs() extends Bundle {
   * The slow path is fully occupied as a pipeline (II=1).  A one-cycle reservation
   * blocks only a FAST op that would collide with a slow S3 completion on the shared
   * writeback/completion ports. */
-class AluEuPlugin extends FiberPlugin with AluEuService {
+object AluEuPlugin {
+  /** CPU_ALU1_LEAN: the µops whose datapath exists ONLY in eu0. The IQ precomputes this
+    * at push (one flop per slot) and never selects such a µop for port 1; a lean EU does
+    * not build these arms. One definition so the steering and the stripping can never
+    * disagree. Every term is a field of the renamed µop -- no new µop field. */
+  def alu0Only(u: m68k040.rename.RenamedUop): Bool =
+    u.op === DecOp.BCD || u.op === DecOp.NBCD || u.op === DecOp.PACK || u.op === DecOp.UNPK ||
+    u.op === DecOp.BFRESOLVE || u.op === DecOp.CASOP ||
+    u.op === DecOp.NEGX || u.op === DecOp.ADDX || u.op === DecOp.SUBX ||
+    u.fromCcr || u.fromSr || u.toCcr ||
+    (u.sysOp && u.sysKind === m68k040.decode.SysKind.MOVE_TO_SR)
+}
+
+/** @param lean CPU_ALU1_LEAN: do not build the `AluEuPlugin.alu0Only` datapaths. Only
+  *             valid on an EU whose IQ port masks those µops (port 1). */
+class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuService {
   // Must match the CAS microcode (Microcode.romP2 reads the same global), so it is NOT a
   // per-instance constructor knob.
   private val prfReadTrim: Boolean = m68k040.top.ShippingCoreConfig.prfReadTrim
@@ -143,7 +158,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // CPU_PRF_READ_TRIM: CAS/CAS2 take their match predicate from NZVC.Z (Microcode romP2),
     // so this port -- one full read of every LVT data bank plus a ~970-fanout address net
     // -- is not allocated at all.
-    if (!prfReadTrim) rdC = irf.newRead()
+    // A lean EU never sees CASOP, the port's only reader.
+    if (!prfReadTrim && !lean) rdC = irf.newRead()
     intW = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); intByp = irf.newBypass()
     // DO NOT mark this bypass deadProbe and delete it. It LOOKS dead and is not.
     // Measured 2026-09-24: the bypass-liveness probe recorded zero hits across
@@ -213,7 +229,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // Raw rdB.data (bypassing the useImm mux): used by PACK/UNPK so they can have both
     // srcA=Dx (old, merge source) AND srcB=Dy (source data) in s1RdB, while imm=adj16
     // rides s1Src2. All other ops that set useImm=False read s1Src2 == rdB.data anyway.
-    val s1RdB   = RegNext(rdB.data)
+    // Read only by the eu0-only arms (PACK/UNPK/BFRESOLVE/CASOP): not registered on a lean EU.
+    val s1RdB   = if (lean) B(0, 32 bits) else RegNext(rdB.data)
     // s1RdC = CASOP's third source (Du for CASS, or the CAS2 packed eq/bothEq status temp).
     val s1RdC   = if (rdC != null) RegNext(rdC.data) else null
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
@@ -233,6 +250,20 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // bit-field lane, so SHIFT is the sole slow class here.
     val isShift = u1.op === DecOp.SHIFT
     val isSlow  = isShift
+
+    // CPU_ALU1_LEAN: every eu0-only arm below is keyed on one of these; on a lean EU
+    // they are elaboration-time False, so the arm's logic (and s1RdB, s1SrSys, the CAS
+    // compare datapath ...) has no reader and is not built.
+    def full(b: => Bool): Bool = if (lean) False else b
+    val u1FromCcr = full(u1.fromCcr)
+    val u1FromSr  = full(u1.fromSr)
+    val u1ToCcr   = full(u1.toCcr)
+    if (lean) GenerationFlags.simulation {
+      when(issuePort.fire) {
+        assert(!AluEuPlugin.alu0Only(issuePort.payload.uop),
+          "CPU_ALU1_LEAN: an eu0-only uop was issued to the lean ALU")
+      }
+    }
 
     // SLOW is a genuine FOUR-stage pipeline (S1/S1a/S2/S3).  A slow uop is always
     // accepted.  A FAST uop is blocked only when the slow uop currently in S2 will reach
@@ -289,7 +320,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     cmd.xIn     := s1X                    // current X (NEGX: 0 - Dn - X)
     cmd.extByte := u1.extByte             // EXT/EXTB byte-source marker
     cmd.bitOp   := u1.bitOp               // BTST/BCHG/BCLR/BSET sub-kind
-    val rsp = AluDatapath(cmd)
+    val rsp = AluDatapath(cmd, noExtended = lean)
 
     // ── Extended-arith family (NEGX/ADDX/SUBX): the 68k Z is CLEAR-ONLY ─────────
     // Z := Z_old && (result == 0). These ops read NZVC (-> s1Nzvc holds the old CCR), so
@@ -297,7 +328,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // the old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z) — the
     // multi-precision rule. N/V/C and X are unchanged from the datapath (X = carry/borrow
     // out). ADDX/SUBX reuse NEGX's merge verbatim (all three set readsNzvc).
-    val isExtended = (u1.op === DecOp.NEGX) || (u1.op === DecOp.ADDX) || (u1.op === DecOp.SUBX)
+    val isExtended = full((u1.op === DecOp.NEGX) || (u1.op === DecOp.ADDX) || (u1.op === DecOp.SUBX))
     val extZ       = rsp.nzvc(2) && s1Nzvc(2)
     val extNzvc    = rsp.nzvc(3) ## extZ ## rsp.nzvc(1 downto 0)
 
@@ -321,8 +352,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
     // NBCD has a distinct byte correction/flag rule (below), not SBCD(0,dy,X).
     // Keep opcode selection after arithmetic, out of the add/sub operand path.
-    val isNbcd = u1.op === DecOp.NBCD
-    val isBcd = u1.op === DecOp.BCD || isNbcd
+    val isNbcd = full(u1.op === DecOp.NBCD)
+    val isBcd = full(u1.op === DecOp.BCD) || isNbcd
     val dx    = s1Src1(7 downto 0).asUInt
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
@@ -383,8 +414,8 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // UNPK Dy,Dx,#adj: src=Dy&0xffff; Dx[15:0] := (((src<<4)&0x0F00)|(src&0x000F)+adj)&0xffff;
     //   Dx[31:16] preserved (.W merge uses s1Src1=Dx).
     // Both transcribed verbatim from Musashi m68k_op_pack_16_rr / m68k_op_unpk_16_rr.
-    val isPack = u1.op === DecOp.PACK
-    val isUnpk = u1.op === DecOp.UNPK
+    val isPack = full(u1.op === DecOp.PACK)
+    val isUnpk = full(u1.op === DecOp.UNPK)
     // ── PACK MEMORY-form (task #198): u1.extByte is repurposed as the mode marker (see
     // Microcode.scala resolve()'s doc comment) — True ONLY for the microcode-ROM PACK
     // compute row (PACK_MEM_ENTRY); the register form (a single-µop MicroOpAssembler fast
@@ -420,7 +451,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // (useImm=True): imm[4:0]=static offset, imm[9:5]=static raw-width, imm[10]=Do,
     // imm[11]=Dw. Produce packed = (Do?offDn[4:0]:immOff) | ((Dw?wdDn[4:0]:immWd)<<5),
     // the SAME layout the static imm uses. Result T0; size LONG (full-32 writeback).
-    val isBfResolve = u1.op === DecOp.BFRESOLVE
+    val isBfResolve = full(u1.op === DecOp.BFRESOLVE)
     val bfrDo       = s1Src2(10)
     val bfrDw       = s1Src2(11)
     // imm[12] = MEM mode (slice 3c): produce the bfMem packed layout instead of the
@@ -457,7 +488,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     //   daBit  = s1Src2(0)      (= imm[0] when useImm: the CAS2.W Rn D/A bit, BIT_1F/BIT_F)
     // `eq` is the size-masked match (loaded == Dc); the CMP NZVC (res = loaded - Dc) reuses
     // the AluDatapath SUB/CMP cone via a dedicated instance below.
-    val casIsOp   = u1.op === DecOp.CASOP
+    val casIsOp   = full(u1.op === DecOp.CASOP)
     val casA      = s1Src1
     val casBraw   = s1RdB
     val casC      = s1RdC
@@ -573,18 +604,18 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // fromSr : zero-extended 16-bit SR = {srSys(8), 0,0,0, X,N,Z,V,C}. The op is .W so the
     // WORD size-merge writes the low 16 (the SR/CCR word) into a Dn (preserving Dn[31:16])
     // or stores the low 16. s1SrSys is the committed system byte registered to S1.
-    val s1SrSys   = RegNext(srSysIn)
+    val s1SrSys   = if (lean) U(0, 8 bits) else RegNext(srSysIn)   // fromSr / SR-logic only (eu0-only)
     val ccrByte5  = (s1X ## s1Nzvc(3 downto 0))                    // {X,N,Z,V,C}
     val fromCcrRes = (U(0, 27 bits) ## ccrByte5).asBits            // 32-bit, low 5 = CCR
     val fromSrRes  = (U(0, 16 bits) ## s1SrSys ## U(0, 3 bits) ## ccrByte5).asBits  // low 16 = SR
     // The MOVE source for the size-merge: fromSr/fromCcr override src2 with the SR/CCR
     // value (so the existing WORD size-merge applies uniformly).
-    val srcForMove = Mux(u1.fromSr, fromSrRes, Mux(u1.fromCcr, fromCcrRes, s1Src2))
+    val srcForMove = Mux(u1FromSr, fromSrRes, Mux(u1FromCcr, fromCcrRes, s1Src2))
     val sizeMergedMove = u1.size.mux(
       Size.BYTE -> (s1Src1(31 downto 8)  ## srcForMove(7 downto 0)),
       Size.WORD -> (s1Src1(31 downto 16) ## srcForMove(15 downto 0)),
       Size.LONG -> srcForMove)
-    val isFromCcrSr = u1.fromCcr || u1.fromSr
+    val isFromCcrSr = u1FromCcr || u1FromSr
     // ── ANDI/ORI/EORI #imm,SR (word form): PRIVILEGED commit-time SR read-modify- ──
     // write. Shares SysKind.MOVE_TO_SR's ExceptionUnit S_APPLY case (write srSys from
     // result[15:8] + surface result[4:0] as the new CCR) with the TRUE MOVE.W <ea>,SR
@@ -594,7 +625,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // no real operand) with the immediate (s1Src2, threaded via the generic IMMEXT
     // srcB slot in MicroOpAssembler). result -> wbObs.result -> ROB sysValStore ->
     // the SAME S_APPLY MOVE_TO_SR write-through (see RobPlugin/ExceptionUnit).
-    val isLogicSr  = u1.sysOp && (u1.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u1.op =/= DecOp.MOVE)
+    val isLogicSr  = full(u1.sysOp && (u1.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u1.op =/= DecOp.MOVE))
     val srOldVal   = fromSrRes(15 downto 0).asUInt
     val srImmVal   = s1Src2(15 downto 0).asUInt
     val srLogicRes = u1.op.mux(
@@ -679,11 +710,11 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // ROB-fold Slice C rewrite replaced all seven per-entry fault Reg-Vecs with the
     // single `faultDynMem` (see RobPlugin.scala), and the name appears ZERO times in
     // the current routed timing report. The stated precondition is met; re-applied.
-    val useAluNzvc = !casIsOp && !u1.toCcr && !isBcd
-    val nonAluNzvc = Mux(casIsOp, casNzvc, Mux(u1.toCcr, ccrNzvc, bcdNzvc))
+    val useAluNzvc = !casIsOp && !u1ToCcr && !isBcd
+    val nonAluNzvc = Mux(casIsOp, casNzvc, Mux(u1ToCcr, ccrNzvc, bcdNzvc))
     val finalNzvc = Mux(useAluNzvc, aluNzvc, nonAluNzvc)
-    val useAluX   = !u1.toCcr && !isBcd
-    val finalX    = Mux(useAluX, rsp.xOut, Mux(u1.toCcr, ccrX, bcdCarry))
+    val useAluX   = !u1ToCcr && !isBcd
+    val finalX    = Mux(useAluX, rsp.xOut, Mux(u1ToCcr, ccrX, bcdCarry))
 
     // ---- S1: FAST writeback (gated by masks; suppressed for a slow op) ----
     val fastFire = s1Valid && !isSlow && !flushPort

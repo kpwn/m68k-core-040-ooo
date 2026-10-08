@@ -449,7 +449,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       loadBypassUnreadyLoad = loadBypassUnreadyLoad,
       specLoadWakeup = specLoadWakeup)
     val eu0    = new AluEuPlugin
-    val eu1    = new AluEuPlugin
+    val eu1    = new AluEuPlugin(lean = m68k040.top.ShippingCoreConfig.alu1Lean)
     val branchEu = new BranchEuPlugin
     val lsEu   = if (shippingProfile) m68k040.top.ShippingPlugins.lsEu(
       shippingIpc, shippingLate, shippingSpecWake, shippingLsOoo)

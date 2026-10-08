@@ -565,7 +565,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // LOCKSTEP_LS_OOO=1: out-of-order LS issue + the LS inhibited barrier, together.
       loadBypassUnreadyLoad = sys.env.get("LOCKSTEP_LS_OOO").contains("1"))
     val eu0    = new AluEuPlugin
-    val eu1    = new AluEuPlugin
+    val eu1    = new AluEuPlugin(lean = m68k040.top.ShippingCoreConfig.alu1Lean)
     val branchEu = new BranchEuPlugin
     val lsEu   = if (ship) SP.lsEu(ipcThroughput = true, ipcLateStore = true,
         specLoadWakeup = SP.specLoadWakeup(ipcThroughput = true),
