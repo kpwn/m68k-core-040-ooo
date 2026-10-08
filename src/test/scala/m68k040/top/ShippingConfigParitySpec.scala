@@ -43,8 +43,15 @@ class ShippingConfigParitySpec extends AnyFunSuite {
   }
 
   private def elaborate[T <: Component](top: => T): T = {
-    val dir = Files.createTempDirectory("shipping-parity").toString
-    SpinalConfig(targetDirectory = dir).generateVerilog(top).toplevel
+    val dir = Files.createTempDirectory("shipping-parity")
+    // Only the elaborated plugin objects are needed; the ~24 MB of Verilog is not. Delete it:
+    // these dirs used to pile up in /tmp (a 15 GB tmpfs) on every test-fast run until it filled.
+    try SpinalConfig(targetDirectory = dir.toString).generateVerilog(top).toplevel
+    finally {
+      val w = Files.walk(dir)
+      try w.sorted(java.util.Comparator.reverseOrder[java.nio.file.Path]()).forEach(f => Files.deleteIfExists(f))
+      finally w.close()
+    }
   }
 
   private lazy val socket: Map[String, String] = {
