@@ -38,8 +38,8 @@ object Aligner {
     r.slot1.predTaken := False; r.slot1.predTarget := U(0, 32 bits)
     // gshare carry-down defaults (slice 3): not a gshare-predicted conditional. FetchAlign
     // OVERRIDES phtValid/phtIndex on the emitted conditional's slot0 after the aligner runs.
-    r.slot0.phtValid := False; r.slot0.phtIndex := U(0, 11 bits)
-    r.slot1.phtValid := False; r.slot1.phtIndex := U(0, 11 bits)
+    r.slot0.phtValid := False; r.slot0.phtIndex := U(0, m68k040.Global.PHT_IDX_W bits)
+    r.slot1.phtValid := False; r.slot1.phtIndex := U(0, m68k040.Global.PHT_IDX_W bits)
     // Side-channel tag: inert by default; FetchAlignPlugin stamps slot0's real tag
     // when (and only when) it stamps a real prediction. slot1 NEVER carries one.
     r.slot0.brPredTag := U(0, m68k040.Global.BR_PRED_TAG_W bits)

@@ -30,7 +30,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * the wiring layer, idle-defaulted with concrete zeros so a standalone DUT elaborates):
   *  - queryPc0/1, queryValid0/1   : the two per-instruction lookup PCs (aligner slot0/1).
   *  - phtTaken0/1 (comb, OUT)      : pht.readAsync(index) >= 2 for that PC (the direction).
-  *  - phtIndex0/1 (comb, OUT, 11b) : the folded XOR index that lookup read (the carry-down).
+  *  - phtIndex0/1 (comb, OUT, Global.PHT_IDX_W bits; 11 at the default 2048 entries)
+  *                                 : the folded XOR index that lookup read (the carry-down).
   *  - shiftValid + shiftDir (IN)   : GHR shift control (from FetchAlign; shift on every
   *                                   emitted predicted conditional, dir = predicted bit).
   *  - update (Flow, IN via service): retire-time PHT train { index, taken }.
@@ -50,7 +51,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * The branch EU still verifies every direction/target, so a gshare miss remains a pure
   * perf loss. */
-class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
+class GsharePlugin(retainRedirectHistory: Boolean = false,
+                   interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
@@ -68,6 +70,8 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     val phtEntries = Global.PHT_ENTRIES.get
     require((phtEntries & (phtEntries - 1)) == 0, "gshareEntries must be a power of two")
     val idxBits    = log2Up(phtEntries)            // = 11 for 2048
+    require(idxBits == Global.PHT_IDX_W,
+      s"gshare idxBits=$idxBits disagrees with the carried-index width Global.PHT_IDX_W=${Global.PHT_IDX_W}")
 
     // ---- fold: reduce a wide UInt to idxBits by XOR-ing its idxBits-wide chunks ----
     // e.g. fold(pc[31:1]) over 31 bits with idxBits=11 → chunk0[10:0] ^ chunk1[21:11] ^
@@ -91,7 +95,19 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     val ghr = RegInit(U(0, ghrBits bits)); ghr.simPublic()
     // PHT : a Mem of 2-bit counters, init weakly-taken (2). A power-of-two depth + an
     //       async read off the folded XOR index (LUTRAM, like the BTB tagMem).
-    val pht = Mem(UInt(2 bits), phtEntries) init Seq.fill(phtEntries)(U(2, 2 bits))
+    //
+    // INTERLEAVED (CPU_GSHARE_INTERLEAVED): the same counters, stored as phtEntries/4 rows
+    // of four 2-bit lanes: counter[idx] lives in row idx[hi:2], lane idx[1:0]. Every
+    // reader below goes through `readCounter`, so the two organisations hold identical
+    // counter values at every index; the window lookup additionally exploits the fact
+    // that its four indices share one row (see the window block).
+    val pht = if (!interleaved) Mem(UInt(2 bits), phtEntries) init Seq.fill(phtEntries)(U(2, 2 bits)) else null
+    val phtRows = if (interleaved) Mem(Bits(8 bits), phtEntries / 4) init Seq.fill(phtEntries / 4)(B(0xAA, 8 bits)) else null
+    def rowOf(idx: UInt): UInt = idx(idxBits - 1 downto 2)
+    def laneOf(row: Bits, lane: UInt): UInt = row.subdivideIn(2 bits)(lane).asUInt
+    def readCounter(idx: UInt): UInt =
+      if (interleaved) laneOf(phtRows.readAsync(rowOf(idx)), idx(1 downto 0))
+      else pht.readAsync(idx)
 
     // ---- index helper (combinational) ----
     // HISTORY LENGTH USED IN THE INDEX IS CAPPED AT `idxBits`.
@@ -108,9 +124,10 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     // instruction, about 14% of all cycles -- more than the D-cache. `mispred/kinst` is a
     // direct counter ratio, so unlike IPC this change is resolvable on the board.
     //
-    // Purely local: the index WIDTH is unchanged, so none of the ~15 places that hardcode
-    // an 11-bit PHT index need touching (attempting to resize the table instead needs a
-    // parameterisation refactor -- see the frozen-width note in docs/memory).
+    // The index width now follows CPU_GSHARE_ENTRIES (Global.PHT_IDX_W): every carried
+    // index (DecodePacket, BranchPredRec, RenamedUop, BranchCompletion, the FTQ entry, the
+    // ROB's branch-train record and GshareUpdate) is sized from it, so a deeper table also
+    // folds min(ghrBits, idxBits) history bits.
     val idxHistBits = scala.math.min(ghrBits, idxBits)
     def foldedHistory: UInt = fold(ghr(idxHistBits - 1 downto 0))
     def indexOf(pc: UInt): UInt = fold(pc(31 downto 1)) ^ foldedHistory
@@ -135,8 +152,8 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     // ---- combinational read: phtTaken (>=2) + the 11-bit index, per query PC ----
     val phtIndex0 = indexOf(queryPc0)
     val phtIndex1 = indexOf(queryPc1)
-    val phtTaken0 = (pht.readAsync(phtIndex0) >= U(2, 2 bits))
-    val phtTaken1 = (pht.readAsync(phtIndex1) >= U(2, 2 bits))
+    val phtTaken0 = (readCounter(phtIndex0) >= U(2, 2 bits))
+    val phtTaken1 = (readCounter(phtIndex1) >= U(2, 2 bits))
     phtIndex0.simPublic(); phtIndex1.simPublic()
     phtTaken0.simPublic(); phtTaken1.simPublic()
 
@@ -154,9 +171,30 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
 
     val winIdxComb = Vec(UInt(idxBits bits), 4)
     val winTakenComb = Vec(Bool(), 4)
-    for (i <- 0 until 4) {
-      winIdxComb(i) := indexOf(winCmd.payload.windowPc + U(i * 2, 32 bits))
-      winTakenComb(i) := pht.readAsync(winIdxComb(i)) >= U(2, 2 bits)
+    if (!interleaved) {
+      for (i <- 0 until 4) {
+        winIdxComb(i) := indexOf(winCmd.payload.windowPc + U(i * 2, 32 bits))
+        winTakenComb(i) := pht.readAsync(winIdxComb(i)) >= U(2, 2 bits)
+      }
+    } else {
+      // ONE row read for the whole window. windowPc is 8-aligned (every source of
+      // FetchAlign's `cmdWindowPc` is `x(31 downto 3) @@ 0`; asserted below), so
+      // windowPc + 2i only changes pc[2:1] = i, and `fold` maps pc[2:1] straight into
+      // idx[1:0] (chunk 0 starts at pc[1]; no other chunk sees pc[2:1]). Hence
+      //   indexOf(windowPc + 2i) = { row(idx0), idx0[1:0] ^ i }   with idx0 = indexOf(windowPc)
+      // -- the same four indices as the old four reads, all in one row, and the old
+      // 32-bit `+ 2i` adders are gone from the address cone.
+      val idx0 = indexOf(winCmd.payload.windowPc(31 downto 3) @@ U(0, 3 bits))
+      val row = phtRows.readAsync(rowOf(idx0))
+      for (i <- 0 until 4) {
+        val lane = idx0(1 downto 0) ^ U(i, 2 bits)
+        winIdxComb(i) := rowOf(idx0) @@ lane
+        winTakenComb(i) := laneOf(row, lane) >= U(2, 2 bits)
+      }
+      when(winCmd.valid) {
+        assert(winCmd.payload.windowPc(2 downto 1) === U(0, 2 bits),
+          "gshare interleaved window lookup requires an 8-aligned windowPc")
+      }
     }
     // FMAX 200 MHz (t200-dec): captured UNCONDITIONALLY. `winCmd.valid` is FetchAlign's
     // `planLookupFire` (ic.cmd.fire, i.e. the ITLB CAM / I-cache-ready cone) and as the
@@ -184,11 +222,23 @@ class GsharePlugin(retainRedirectHistory: Boolean = false) extends FiberPlugin w
     upd.simPublic()
     updateFlow = upd
 
-    val uOld = pht.readAsync(upd.payload.index)
+    val uRow = if (interleaved) phtRows.readAsync(rowOf(upd.payload.index)) else null
+    val uOld = if (interleaved) laneOf(uRow, upd.payload.index(1 downto 0)) else pht.readAsync(upd.payload.index)
     val uInc = Mux(uOld === U(3, 2 bits), U(3, 2 bits), (uOld + 1).resized)
     val uDec = Mux(uOld === U(0, 2 bits), U(0, 2 bits), (uOld - 1).resized)
     val uNew = Mux(upd.payload.taken, uInc, uDec)
-    pht.write(upd.payload.index, uNew, enable = upd.valid)
+    if (interleaved) {
+      // Row read-modify-write: only the addressed lane changes (same counter semantics
+      // as the 2-bit write; back-to-back updates see the previous write via the async read).
+      val lanesNew = Vec(Bits(2 bits), 4)
+      for (l <- 0 until 4) {
+        lanesNew(l) := Mux(upd.payload.index(1 downto 0) === U(l, 2 bits),
+          uNew.asBits, uRow(2 * l + 1 downto 2 * l))
+      }
+      phtRows.write(rowOf(upd.payload.index), lanesNew.asBits, enable = upd.valid)
+    } else {
+      pht.write(upd.payload.index, uNew, enable = upd.valid)
+    }
 
     // ---- GHR speculative shift (from FetchAlign, on every emitted predicted cond) ----
     // shift in the predicted direction bit: ghr := (ghr << 1) | shiftDir. This is the

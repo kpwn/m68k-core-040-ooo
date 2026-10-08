@@ -20,7 +20,7 @@ class BoardLoopDecodeTraceSpec extends AnyFunSuite {
   // execution or predictor training. Slot-1 admission still needs this service.
   class ColdPredictionPlugin extends FiberPlugin with GshareSecondaryLookupService {
     val logic = during build new Area {
-      val index = UInt(11 bits); index := 0
+      val index = UInt(m68k040.Global.PHT_IDX_W bits); index := 0
       val taken = Bool(); taken := False
     }
     override def secondaryPhtIndex: UInt = logic.index

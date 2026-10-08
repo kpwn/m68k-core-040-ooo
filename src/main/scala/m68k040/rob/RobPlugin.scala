@@ -353,7 +353,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val target   = UInt(32 bits)
     val brType   = UInt(2 bits)
     val len      = UInt(4 bits)
-    val phtIndex = UInt(11 bits)
+    val phtIndex = UInt(m68k040.Global.PHT_IDX_W bits)
   }
 
   val logic = during build new Area {
@@ -435,7 +435,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     branchCompletion.payload.brType.allowOverride;     branchCompletion.payload.brType := U(0, 2 bits)
     branchCompletion.payload.btbLen.allowOverride;     branchCompletion.payload.btbLen := U(0, 4 bits)
     branchCompletion.payload.phtValid.allowOverride;   branchCompletion.payload.phtValid := False
-    branchCompletion.payload.phtIndex.allowOverride;   branchCompletion.payload.phtIndex := U(0, 11 bits)
+    branchCompletion.payload.phtIndex.allowOverride;   branchCompletion.payload.phtIndex := U(0, m68k040.Global.PHT_IDX_W bits)
     branchCompletion.payload.rasKind.allowOverride;    branchCompletion.payload.rasKind := U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits)
     branchCompletion.payload.rasData.allowOverride;    branchCompletion.payload.rasData := U(0, 32 bits)
     branchCompletion.simPublic()
@@ -466,7 +466,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // Same registered-output treatment as btbUpdateFlow above (task #124); payload same
     // Mem-readSync treatment as btbUpdateFlow above (task #129).
     val gshareUpdateValidComb = Bool(); gshareUpdateValidComb := False
-    val gshareUpdateFlow = Flow(GshareUpdate(11))
+    val gshareUpdateFlow = Flow(GshareUpdate(m68k040.Global.PHT_IDX_W))
     gshareUpdateFlow.valid := RegNext(gshareUpdateValidComb) init False
     gshareUpdateFlow.simPublic()
     // mispredictStore MUST default False: a freshly-allocated branch entry is "not

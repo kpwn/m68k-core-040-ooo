@@ -180,7 +180,7 @@ case class RenamedUop() extends Bundle {
   // ROB trains pht[phtIndex] toward the resolved direction at retire). Threaded from
   // decode -> here -> IqContext -> branch EU -> BranchCompletion -> ROB.
   val phtValid     = Bool()
-  val phtIndex     = UInt(11 bits)
+  val phtIndex     = UInt(m68k040.Global.PHT_IDX_W bits)
   // CAS/CAS2 compute sub-form (DecOp.CASOP): selects the compute kernel in the ALU EU
   // (CASS/CASC/CAS2C1/CAS2C2/CAS2DC/CAS2SEL — see DecodedUop.casForm / CasForm). Threaded
   // decode -> here -> IqContext -> ALU EU. Default 0 (a non-CAS µop never reads it).

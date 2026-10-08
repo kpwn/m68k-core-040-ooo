@@ -698,6 +698,8 @@ object GenSocketTopVerilog {
             s"lsEarlyAnRetry=${ShippingCoreConfig.lsEarlyAnRetry} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
             s"physX=${ShippingCoreConfig.physX} " +
+            s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
+            s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

@@ -578,4 +578,26 @@ object ShippingCoreConfig {
     * Note the INVERTED sense of the variable: it is a DISABLE, kept that way so every
     * existing build and testbench that does not set it is bit-identical to before. */
   val icachePrefetch: Boolean = !envFlag("DBG_IC_PREFETCH_DISABLE", false)
+
+  /** gshare PHT organisation (docs/design/10-review.md §1 item 5, §4.5, §5.3).
+    *
+    * `CPU_GSHARE_INTERLEAVED=1`: store the PHT as `entries/4` rows of four 2-bit counters
+    * (row = idx[hi:2], lane = idx[1:0]). The fetch-window lookup's four indices differ
+    * ONLY in idx[1:0] (windowPc is 8-aligned and `fold` maps pc[2:1] straight to idx[1:0]),
+    * so ONE row read returns all four counters: 7 async read ports (2 decode + 4 window
+    * + 1 update RMW) on a 2048x2 LUTRAM become 4 (2 decode + 1 window + 1 update) on a
+    * 512x8 one. Predictions are bit-identical (GshareInterleaveEquivalenceSpec).
+    * OFF = the old 7-port organisation; echoed in `SHIPPING_CONFIG`. */
+  val gshareInterleaved: Boolean = envFlag("CPU_GSHARE_INTERLEAVED", false)
+
+  /** gshare PHT depth (`CPU_GSHARE_ENTRIES`, 2048/4096/8192/16384). The PHT index width
+    * (log2 of this) is carried by bundles elaborated outside a plugin host
+    * (`DecodePacket`, `BranchPredRec`, `RenamedUop`, `BranchCompletion`, the FTQ entry),
+    * so it is single-sourced here -> `Global.PHT_ENTRIES_DEFAULT` -> `M68kParams.gshareEntries`
+    * (ParamPlugin requires they agree). The history used in the index is
+    * min(GHR bits = 16, idx bits), so a deeper table also uses more history.
+    * Default 2048 = the old frozen 11-bit index; echoed in `SHIPPING_CONFIG`. */
+  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 2048, 2048, 16384)
+  require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
+    s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
 }

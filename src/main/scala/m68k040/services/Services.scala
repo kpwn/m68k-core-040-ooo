@@ -737,12 +737,12 @@ case class BranchPredRec() extends Bundle {
   val predTaken  = Bool()
   val predTarget = UInt(32 bits)
   val phtValid   = Bool()
-  val phtIndex   = UInt(11 bits)
+  val phtIndex   = UInt(m68k040.Global.PHT_IDX_W bits)
 
   /** No prediction. The value a `brPredTag` of 0 expands to. */
   def setInert(): Unit = {
     predTaken := False; predTarget := U(0, 32 bits)
-    phtValid  := False; phtIndex   := U(0, 11 bits)
+    phtValid  := False; phtIndex   := U(0, m68k040.Global.PHT_IDX_W bits)
   }
 }
 

@@ -162,6 +162,14 @@ object Global {
   val BTB_ENTRIES     = Database.blocking[Int]()
   val RAS_ENTRIES     = Database.blocking[Int]()
   val GHR_BITS        = Database.blocking[Int]()
+  /** gshare PHT depth, single-sourced from `ShippingCoreConfig.gshareEntries` (env
+    * `CPU_GSHARE_ENTRIES`). Bundles elaborated OUTSIDE a plugin host (`DecodePacket`,
+    * `BranchPredRec`, `RenamedUop`, `BranchCompletion`, the FTQ entry) size their PHT
+    * index fields from `PHT_IDX_W`; ParamPlugin requires `M68kParams.gshareEntries` to
+    * equal this, so a too-narrow carried index cannot elaborate. */
+  val PHT_ENTRIES_DEFAULT: Int = m68k040.top.ShippingCoreConfig.gshareEntries
+  val PHT_IDX_W: Int = log2Up(PHT_ENTRIES_DEFAULT)
+  /** Producer: ParamPlugin (from M68kParams.gshareEntries == PHT_ENTRIES_DEFAULT). */
   val PHT_ENTRIES     = Database.blocking[Int]()
 
   /** FP wide-immediate side table (docs/PLAN_routing_congestion_architectural.md item 3).

@@ -42,7 +42,7 @@ case class M68kParams(
     btbEntries:   Int = 128,
     rasEntries:   Int = 16,
     gshareHistory:Int = 16,
-    gshareEntries:Int = 2048,
+    gshareEntries:Int = Global.PHT_ENTRIES_DEFAULT,
     tlbWays:      Int = 4,
     tlbSets:      Int = 16,
     decodeWidth:  Int = 2,

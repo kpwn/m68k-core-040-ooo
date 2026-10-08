@@ -44,6 +44,11 @@ class ParamPlugin(p: M68kParams) extends FiberPlugin {
     Global.BTB_ENTRIES.set(p.btbEntries)
     Global.RAS_ENTRIES.set(p.rasEntries)
     Global.GHR_BITS.set(p.gshareHistory)
+    // Same guard shape as the NZVC pool: carried PHT indices outside a plugin host are
+    // sized from Global.PHT_IDX_W, so a disagreeing depth would truncate them.
+    require(p.gshareEntries == Global.PHT_ENTRIES_DEFAULT,
+      s"PHT depth disagreement: M68kParams.gshareEntries=${p.gshareEntries} but " +
+      s"Global.PHT_ENTRIES_DEFAULT=${Global.PHT_ENTRIES_DEFAULT} -- set CPU_GSHARE_ENTRIES instead.")
     Global.PHT_ENTRIES.set(p.gshareEntries)
   }
 }
