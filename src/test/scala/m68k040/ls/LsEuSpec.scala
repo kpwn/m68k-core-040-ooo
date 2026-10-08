@@ -15,7 +15,8 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class LsEuSpec extends AnyFunSuite {
   class Dut(p3Fast: Boolean = false, p1Early: Boolean = false,
-            p1Dn: Boolean = false) extends Component {
+            p1Dn: Boolean = false, p3Launch: Boolean = false) extends Component {
+    private val p3Any = p3Fast || p3Launch
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
@@ -25,10 +26,12 @@ class LsEuSpec extends AnyFunSuite {
     val cacheCtrl = new CacheControlStubPlugin
     val xlate  = new DIdentityTranslationPlugin
     val dcache = new DcachePlugin(exportBusQuiesced =
-      p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier)
-    val eu     = new LsEuPlugin(p3FastLoad = p3Fast, p1EarlyLoad = p1Early || p1Dn,
-      inhibitedFullBarrier = p3Fast || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
-      alignedLoadFallThrough = p3Fast)
+      p3Any || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
+      earlyProbeLineForward = p3Launch || m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward)
+    val eu     = new LsEuPlugin(p3FastLoad = p3Any, p3Launch = p3Launch,
+      p1EarlyLoad = p1Early || p1Dn,
+      inhibitedFullBarrier = p3Any || m68k040.top.ShippingCoreConfig.inhibitedFullBarrier,
+      alignedLoadFallThrough = p3Any)
     val src    = new LsEuSourcePlugin(dstArch = if (p1Early && !p1Dn) 8 else 0,
                                      writeNzvc = p1Dn)
     val phead  = new TbPreciseDrainWirePlugin(eu)
@@ -295,6 +298,110 @@ class LsEuSpec extends AnyFunSuite {
         s"P3 offer/refusal/queued acceptance and P4 direct acceptance must occur " +
           s"(P3 offers=$p3Offers refused=$p3Refused queued=$queuedP3Accepted " +
           s"direct=$p3Accepted P4 direct=$p4Accepted)")
+      tracking = false
+    }
+  }
+
+  /** CPU_LS_P3_LAUNCH (Fable review 4.4): a P3 launch past RESIDENT older stores, gated
+    * by the registered P2T line filter. Covers: a forwarded load, a stalled (partial-
+    * overlap) load, a page-offset alias (filter false positive -> P4, still correct), a
+    * non-aliasing load that launches from P3 while the SQ is NOT empty, a store that
+    * leaves P3 on the very edge the same-line load enters it, and a flush right after a
+    * P3 launch. The RTL tripwire (`p3FastEnq` => the real SQ verdict is clean) runs on
+    * every cycle of every case. */
+  test("P3 launch: line filter admits past resident stores; forward/stall/alias/flush fall back", VerilatorTest) {
+    simConfig.compile(new Dut(p3Launch = true)).doSim { dut =>
+      val (cd, mem) = initDut(dut)
+      val base  = 0x7000L
+      val alias = 0x9000L   // different page, identical page-offset lines
+      for (i <- 0 until 64) { mem.pokeByte(base + i, memByte(base + i)); mem.pokeByte(alias + i, memByte(alias + i)) }
+      seed(dut, cd, preg = 10, value = base)
+      seed(dut, cd, preg = 11, value = 0x12345678L)
+      seed(dut, cd, preg = 12, value = alias)
+      seed(dut, cd, preg = 13, value = 0xCAFEBABEL)
+      val ls = dut.eu.logic
+      var tracking = true
+      val fastRobs = scala.collection.mutable.ArrayBuffer[Int]()
+      var fastWithResidentStore = 0
+      fork {
+        while (tracking) {
+          sleep(1)
+          if (ls.p3FastEnq.toBoolean) {
+            fastRobs += ls.p3Ctx.front.robId.toInt
+            if (!ls.sq.io.empty.toBoolean) fastWithResidentStore += 1
+          }
+          cd.waitSampling()
+        }
+      }
+      def obs(preg: Int): BigInt = { cd.waitSampling(4); dut.src.logic.obsIntAddr #= preg; sleep(1); dut.src.logic.obsIntData.toBigInt }
+      def loadOk(robId: Int, preg: Int, basePreg: Int, disp: Long, size: SpinalEnumElement[Size.type], what: String): BigInt = {
+        issueLoad(dut, cd, basePreg = basePreg, disp = disp, size, pdst = preg, robId = robId)
+        assert(waitCompletion(dut, cd, robId = robId), s"$what: completion")
+        obs(preg)
+      }
+
+      // Warm the lines (SQ empty: the P3 arm is used, as before).
+      assert(loadOk(1, 20, 10, 0x00, Size.LONG, "warm 0x00") == expectedLong(base))
+      assert(loadOk(2, 21, 10, 0x10, Size.LONG, "warm 0x10") == expectedLong(base + 0x10))
+      assert(loadOk(3, 22, 12, 0x04, Size.LONG, "warm alias") == expectedLong(alias + 4))
+      assert(fastRobs.toSet == Set(1, 2, 3), s"warm loads must use P3: $fastRobs")
+
+      // Older precise store, resident and uncommitted.
+      issueStore(dut, cd, basePreg = 10, disp = 4, dataPreg = 11, Size.LONG, robId = 4)
+      assert(waitStoreAlloc(dut, cd, robId = 4), "older store resident")
+      // (1) forwarded load: exact overlap -> P4 forward, never a P3 launch.
+      assert(loadOk(5, 23, 10, 0x04, Size.LONG, "forward") == BigInt(0x12345678L), "forwarded data")
+      assert(!fastRobs.contains(5), "forwarded load launched from P3")
+      // (2) non-aliasing line, SQ NOT empty -> P3 launch (the new admission).
+      assert(loadOk(6, 24, 10, 0x10, Size.LONG, "non-alias") == expectedLong(base + 0x10))
+      assert(fastRobs.contains(6) && fastWithResidentStore >= 1,
+        s"non-aliasing load must launch from P3 past a resident store: $fastRobs")
+      // (3) page-offset alias (filter false positive) -> P4, ordinary data.
+      assert(loadOk(7, 25, 12, 0x04, Size.LONG, "alias") == expectedLong(alias + 4), "alias data")
+      assert(!fastRobs.contains(7), "page-offset alias launched from P3")
+      // (4) partial overlap -> stall in P4 until the store drains; merged data.
+      issueLoad(dut, cd, basePreg = 10, disp = 6, Size.WORD, pdst = 26, robId = 8)
+      cd.waitSampling(10)
+      assert(!(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 8), "stalled load completed early")
+      assert(ls.p4Valid.toBoolean && ls.p4Ctx.xlate.front.robId.toInt == 8 && ls.p4Ctx.fwdStall.toBoolean,
+        "partial-overlap load must wait in P4 on a stall verdict")
+      dut.phead.logic.iRobHeadIn #= 4
+      dut.phead.logic.iRobHeadValidIn #= true
+      var drained = false; var n = 0
+      while (!drained && n < 120) {
+        drained = dut.phead.logic.oSqCompValid.toBoolean && dut.phead.logic.oSqCompPayload.toInt == 4
+        if (!drained) cd.waitSampling(); n += 1
+      }
+      assert(drained, "precise store drain")
+      dut.src.logic.iSqCommitRob #= 4; dut.src.logic.iSqCommitValid #= true
+      cd.waitSampling(); dut.src.logic.iSqCommitValid #= false
+      dut.phead.logic.iRobHeadIn #= 8
+      assert(waitCompletion(dut, cd, robId = 8), "stalled load completion")
+      assert(obs(26) == BigInt(0x5678), s"stalled load merged data ${obs(26).toString(16)}")
+      assert(!fastRobs.contains(8), "stalled load launched from P3")
+
+      // (5) store leaves P3 on the edge the same-line load enters it (back-to-back).
+      issueStore(dut, cd, basePreg = 10, disp = 0x24, dataPreg = 13, Size.LONG, robId = 9)
+      issueLoad(dut, cd, basePreg = 10, disp = 0x24, Size.LONG, pdst = 27, robId = 10)
+      assert(waitCompletion(dut, cd, robId = 10), "back-to-back forward completion")
+      assert(obs(27) == BigInt(0xCAFEBABEL), s"back-to-back forwarded data ${obs(27).toString(16)}")
+      assert(!fastRobs.contains(10), "same-line load behind a leaving P3 store launched from P3")
+
+      // (6) flush right after a P3 launch (store rob 9 still resident -> filter path).
+      val before = fastRobs.size
+      issueLoad(dut, cd, basePreg = 10, disp = 0x14, Size.LONG, pdst = 28, robId = 11)
+      n = 0
+      while (fastRobs.size == before && n < 20) { cd.waitSampling(); n += 1 }
+      assert(fastRobs.lastOption.contains(11), s"flush victim did not launch from P3: $fastRobs")
+      dut.src.logic.iSqFlush #= true
+      cd.waitSampling()
+      dut.src.logic.iSqFlush #= false
+      for (_ <- 0 until 60) {
+        assert(!(dut.src.logic.cValid.toBoolean && dut.src.logic.cRob.toInt == 11), "squashed P3 launch completed")
+        cd.waitSampling()
+      }
+      assert(loadOk(12, 29, 10, 0x14, Size.LONG, "after flush") == expectedLong(base + 0x14))
+      assert(mem.peekByte(base + 0x24) == memByte(base + 0x24), "squashed store drained")
       tracking = false
     }
   }

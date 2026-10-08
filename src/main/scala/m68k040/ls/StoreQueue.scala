@@ -106,7 +106,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  inhibitedFullBarrier: Boolean = false,
                  coalesceLines: Boolean = false,
                  coalesceHold: Int = 16,
-                 coalesceMutation: Int = 0) extends Component {
+                 coalesceMutation: Int = 0,
+                 /** `ShippingCoreConfig.lsP3Launch`: export `io.lineProbe`, a conservative
+                   * page-offset line filter the LS EU evaluates one stage ahead of its
+                   * forward query. False elaborates nothing. */
+                 p3LineProbe: Boolean = false) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -190,6 +194,16 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     val coalesceFire    = if (coalesceLines) out(Bool()) else null
     val coalesceHolding = if (coalesceLines) out(Bool()) else null
     val coalesceTimeout = if (coalesceLines) out(Bool()) else null
+    // ---- P3 launch pre-filter (flag-gated) ----
+    //   `idx`  : page-offset line index (PA[11:4] == VA[11:4]) of a load one stage
+    //            before P3.
+    //   `clear`: NO resident entry (any age) has a half on that page-offset line and
+    //            NO resident entry has an INHIBITED half. A superset test of every
+    //            `fwd.rsp` hit/stall/serial cause for a non-split cacheable query.
+    val lineProbe = if (p3LineProbe) new Bundle {
+      val idx   = in(UInt(8 bits))
+      val clear = out(Bool())
+    } else null
   }
 
   // ---- ring storage ----
@@ -1581,6 +1595,27 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
 
   // ---- empty: no resident entry AND no drain in flight ----
   io.empty := !valids.reduce(_ || _) && !drainBusy
+
+  // ---- P3 launch pre-filter (`lineProbe`) ----
+  // Every hit/stall/serial verdict `fwd.rsp` can give a NON-split CACHEABLE query needs
+  // a resident entry that either shares the query's 16-byte physical line (overlap,
+  // full forward, WRITETHROUGH same-line) or has an INHIBITED half (`serialStall`).
+  // Same physical line implies same PA[11:4], so "no entry matches PA[11:4] and none
+  // is inhibited" implies hit=stall=serial=0 for every such query. Age, data presence,
+  // size and cache mode are deliberately ignored (only ever conservative). A resident
+  // entry stays valid until its final drain ack (`drainBusy` implies a valid head).
+  // Inputs are registers on both sides (entry fields, the LS EU's P2T context), and the
+  // output feeds only a register, so this is off every existing cone.
+  if (p3LineProbe) {
+    val hazard = (0 until depth).map { i =>
+      valids(i) && (
+        (paddrs(i)(11 downto 4) === io.lineProbe.idx) ||
+        (cacheModes(i) === CacheMode.INHIBITED) ||
+        (validBs(i) && ((paddrBs(i)(11 downto 4) === io.lineProbe.idx) ||
+                        (cacheModesB(i) === CacheMode.INHIBITED))))
+    }
+    io.lineProbe.clear := !hazard.reduce(_ || _)
+  }
 
   // ---- barrier residency, AGE-QUALIFIED ----
   // The age qualifier is load-bearing, not a refinement.  A YOUNGER store can allocate
