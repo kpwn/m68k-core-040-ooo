@@ -31,7 +31,12 @@ import spinal.lib.misc.plugin.FiberPlugin
   * held in the register is squashed on a mispredict/exception redirect.
   */
 class DecodeStage(allowSlot1Prediction: Boolean = false,
-                  fuseLongMoveLoads: Boolean = false) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  fuseLongMoveLoads: Boolean = false,
+                  // CPU_DECODE_PAIR_3P1: a 3-uop slot0 pairs with a 1-uop slot1 (lane 3 =
+                  // slot1's uop 0) instead of deferring slot1 to the stash. Constructor
+                  // DEFAULT reads the shipping knob (the `sqDepth` precedent) so every harness
+                  // that builds a DecodeStage sees the same value as SHIPPING_CONFIG prints.
+                  pair3p1: Boolean = m68k040.top.ShippingCoreConfig.decodePair3p1) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
@@ -448,6 +453,13 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
 
     val slot1Is3 = a1raw.count === U(3, 2 bits)
     val slot0Is3 = a0.count === U(3, 2 bits)
+    // CPU_DECODE_PAIR_3P1: a 3-uop slot0 still fits a 1-uop slot1 in the 4-wide push
+    // (3+1 = 4 = the MicroOpQueue's guaranteed free space). `slot0Blocks1` is the
+    // "slot0 leaves no room for slot1" term: with the flag OFF it is exactly `slot0Is3`
+    // (the pre-flag netlist). Both counts already feed slot1Emit/deferSlot1, so the extra
+    // `a1raw.count === 1` term folds into the same 4-input LUT (no added level).
+    val slot1Is1 = a1raw.count === U(1, 2 bits)
+    val slot0Blocks1 = if (pair3p1) slot0Is3 && !slot1Is1 else slot0Is3
 
     // A slot1 MOVEM cannot be emitted as a normal crack — its real µops come from the
     // micro-sequencer FSM (entered next cycle from the stashed packet). It MUST be
@@ -534,12 +546,12 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // `fpImmTable` below), so it is deferred to the stash and allocates as next cycle's
     // head. Cost: one extra decode cycle per slot1 FP-immediate (a rare shape; the 16-deep
     // MicroOpQueue absorbs it), zero cost to the OoO window itself.
-    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Is3 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly && !slot1IsBfMemindMemEarly && !a1raw.fpImmAlloc
+    val slot1Emit = !stashValid && fed.valid && fed.payload.slot1Valid && !slot0Blocks1 && !slot1Is3 && !slot1IsMovemEarly && !slot1IsUcodeEarly && !slot1IsMovepEarly && !slot1IsMemIndEarly && !slot1IsBfDynMemEarly && !slot1IsBfMemindMemEarly && !a1raw.fpImmAlloc
     // Defer slot1 to the stash when EITHER slot0 is a 3-µop crack (slot1 cannot fit
     // alongside 3 µops) OR slot1 itself is a 3-µop crack (cannot fit after a <=2-µop
     // slot0) OR slot1 is an FP-immediate uop (single table write port, see slot1Emit).
     // In all cases emit slot0 this cycle + stash slot1's µops; replay next.
-    val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && (slot0Is3 || slot1Is3 || a1raw.fpImmAlloc)
+    val deferSlot1 = !stashValid && fed.valid && fed.payload.slot1Valid && (slot0Blocks1 || slot1Is3 || a1raw.fpImmAlloc)
 
     // ── FP wide-immediate side table (docs/PLAN_routing_congestion_architectural.md item 3)
     // The 80-bit `F<op>.<fmt> #imm,FPn` immediate used to be a DecodedUop/RenamedUop field,
@@ -743,7 +755,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     val n1   = Mux(slot1Emit, a1raw.count, U(0, 2 bits))   // slot1 µops (0 if not emitted)
 
     // Pack: positions 0..2 = head instruction's µops; the slot1 µops follow at nCur..
-    // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3).
+    // (only when slot1Emit, where nCur<=2 and n1<=2, so max position 3; with
+    // CPU_DECODE_PAIR_3P1 also nCur==3 && n1==1, slot1's uop 0 at position 3).
     def headUop(i: Int): DecodedUop = Mux(stashValid, stashUops(i), a0n(i))
 
     val totalCount = (nCur +^ n1).resize(3)            // 1..4
@@ -1683,7 +1696,11 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       case 0 => headUop(0)
       case 1 => Mux(nCur >= U(2), headUop(1), a1n(0))
       case 2 => Mux(nCur === U(3), headUop(2), Mux(nCur === U(2), a1n(0), a1n(1)))
-      case 3 => a1n(1)
+      // Lane 3 is live only when slot1Emit, which excludes a stash replay, so the head is
+      // slot0 and `nCur === 3` reduces to `slot0Is3`. With CPU_DECODE_PAIR_3P1 a 3+1 pair
+      // puts slot1's uop 0 here; a 2:1 arm parallel to lane 2's existing 3:1 (same select
+      // source, a0.count), so lane 3's depth stays <= lane 2's. Flag OFF: the old wire.
+      case 3 => if (pair3p1) Mux(slot0Is3, a1n(0), a1n(1)) else a1n(1)
     }
     // Hoisted ONCE. `normUop` is a `def` that BUILDS a Mux, so every call site
     // instantiates another copy; the dead-slot rewiring below references slots 1-3 from

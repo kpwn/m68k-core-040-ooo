@@ -306,6 +306,14 @@ object ShippingCoreConfig {
     // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_DEFER_SLOT1_DBCC=0` still disables it.
     envFlag("CPU_DEFER_SLOT1_DBCC", true)
 
+  /** Decode: let a 3-uop slot-0 crack (e.g. `move.l (a0)+,d0` / `cmp.b (a1)+,d0` =
+    * [load][An += n][op]) PAIR with a 1-uop slot-1 instruction in the same push. The
+    * MicroOpQueue push is already 4 wide (and accepts only with >=4 free slots), so the
+    * 4th lane simply carries slot-1's single uop instead of deferring it to the stash.
+    * See `DecodeStage.pair3p1`. OFF by default; `CPU_DECODE_PAIR_3P1=1`; echoed in
+    * `SHIPPING_CONFIG`. */
+  val decodePair3p1: Boolean = envFlag("CPU_DECODE_PAIR_3P1", false)
+
   // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
   // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
   //
