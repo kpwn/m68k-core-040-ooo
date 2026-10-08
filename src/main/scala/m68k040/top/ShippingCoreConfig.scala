@@ -316,9 +316,9 @@ object ShippingCoreConfig {
     * [load][An += n][op]) PAIR with a 1-uop slot-1 instruction in the same push. The
     * MicroOpQueue push is already 4 wide (and accepts only with >=4 free slots), so the
     * 4th lane simply carries slot-1's single uop instead of deferring it to the stash.
-    * See `DecodeStage.pair3p1`. ON by default since 2026-10-08 (gated: test-fast, corpus, lock-step clean); `CPU_DECODE_PAIR_3P1=0` disables; echoed in
+    * See `DecodeStage.pair3p1`. OFF by default: gated clean 2026-10-08 but sim IPC 0.00% and its decode slot-2 cone topped the failing 200 MHz paths; `CPU_DECODE_PAIR_3P1=1` enables; echoed in
     * `SHIPPING_CONFIG`. */
-  val decodePair3p1: Boolean = envFlag("CPU_DECODE_PAIR_3P1", true)
+  val decodePair3p1: Boolean = envFlag("CPU_DECODE_PAIR_3P1", false)
 
   // MEASURED, `BranchPredictIpcSpec`, IPC_SEED=1, throughput-v2 frontend with BOTH
   // slot-1 conditional knobs (the shipped one). RETIRED mispredicts per probe:
