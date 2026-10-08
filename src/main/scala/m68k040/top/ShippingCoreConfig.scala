@@ -580,7 +580,7 @@ object ShippingCoreConfig {
     *     mirror port (`BackendWiringPlugin.a7Rd`), stealing it for one cycle while the
     *     exception FSM is idle (the A7 mirror holds that cycle).
     * Read by `Microcode` (CAS rows), `AluEuPlugin`, `DebugCtrlPlugin`, `BackendWiringPlugin`. */
-  val prfReadTrim: Boolean = envFlag("CPU_PRF_READ_TRIM", false)
+  val prfReadTrim: Boolean = envFlag("CPU_PRF_READ_TRIM", true)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
