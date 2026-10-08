@@ -110,7 +110,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSampling(4)
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
       val a = 0x0000A200L
-      val b = a + 0x800L // same VIPT set, different physical tag
+      val b = a + DcacheTestGeometry.WayStride // same VIPT set, different physical tag
       for (j <- 0 until 16) {
         cold.pokeByte(a + j, 0x31 + j)
         cold.pokeByte(b + j, 0x51 + j)
@@ -208,14 +208,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         cd.waitSamplingWhere(lg.storeAckReg.toBoolean)
       }
       storeB(BigInt("77777777", 16))
-      val c = a + 0x1000L
+      val c = a + 2 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) cold.pokeByte(c + j, 0x71 + j)
       issuedProbe(0x33, c, c)
       load(0x33, c, b, BigInt("77777777", 16))
       assert(fast == 1, s"physical-tag alias of dirty resident line incorrectly staged: fast=$fast")
       // An intervening write to the probed set must turn its queued snapshot
       // stale, even after the store pipeline has emptied at command arrival.
-      val d = a + 0x1800L
+      val d = a + 3 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) cold.pokeByte(d + j, 0x91 + j)
       issuedProbe(0x34, d, d)
       storeB(BigInt("88888888", 16))
@@ -224,9 +224,9 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       // Two further misses rotate the four-way victim pointer onto dirty B.
       // A new probe must then decline fast staging, and the ordinary eviction
       // path must preserve B's dirty bytes through writeback and re-read.
-      val e = a + 0x2000L
-      val f = a + 0x2800L
-      val g = a + 0x3000L
+      val e = a + 4 * DcacheTestGeometry.WayStride
+      val f = a + 5 * DcacheTestGeometry.WayStride
+      val g = a + 6 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) {
         cold.pokeByte(e + j, 0xA1 + j)
         cold.pokeByte(f + j, 0xA9 + j)
@@ -241,8 +241,8 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       // Present a full-strobe no-fill store and the resolved load on the same
       // edge, to different lines of one set. The input store has not entered
       // S0 yet; the new valid-based guard must reject the queued miss stage.
-      val h = a + 0x3800L
-      val i = a + 0x4000L
+      val h = a + 7 * DcacheTestGeometry.WayStride
+      val i = a + 8 * DcacheTestGeometry.WayStride
       for (j <- 0 until 16) { cold.pokeByte(h + j, 0xC1 + j); cold.pokeByte(i + j, 0x21) }
       issuedProbe(0x39, h, h)
       val noFillBefore = lg.nb.ctrMap("noFillAllocs").toLong
@@ -279,7 +279,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       assert(fast == 1 && lg.nb.ctrMap("noFillAllocs").toLong == noFillBefore + 1,
         s"same-set input store did not force the ordinary miss/no-fill paths: fast=$fast")
       load(0x3a, i, i, BigInt("cccccccc", 16))
-      val j = a + 0x4800L
+      val j = a + 9 * DcacheTestGeometry.WayStride
       for (k <- 0 until 16) cold.pokeByte(j + k, 0xD1 + k)
       issuedProbe(0x40, j, j)
       load(0x41, j, j, BigInt("d1d2d3d4", 16))
@@ -354,12 +354,12 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     val rnd  = new scala.util.Random(seed)
     val base = 0x90000L
     val nTag = 6; val nSet = 2
-    // 16-byte lines, 128 sets: a 2048-byte stride lands every tag on the same set.
-    def lineBase(s: Int, tag: Int): Long = base + tag * 2048L + s * 64L
+    // 16-byte lines: a one-way stride (2048 B at 8 KiB, 4096 B at 16 KiB) lands every tag on the same set.
+    def lineBase(s: Int, tag: Int): Long = base + tag * DcacheTestGeometry.WayStride + s * 64L
     val region: Seq[Long] =
       for (t <- 0 until nTag; s <- 0 until nSet; b <- 0 until LINE) yield lineBase(s, t) + b
     def pageMode(a: Long): SpinalEnumElement[CacheMode.type] =
-      if (((a - base) / 2048L) == nTag - 1) CacheMode.WRITETHROUGH else CacheMode.COPYBACK
+      if (((a - base) / DcacheTestGeometry.WayStride) == nTag - 1) CacheMode.WRITETHROUGH else CacheMode.COPYBACK
     def modeOf(a: Long): SpinalEnumElement[CacheMode.type] =
       if (rnd.nextInt(4) == 0) CacheMode.WRITETHROUGH else pageMode(a)
     val shadow = mutable.Map[Long, Int]()
@@ -480,7 +480,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     /** One LOAD GROUP: up to four loads, back to back, mostly on one line. */
     def doGroup(faulting: Boolean): Unit = {
       val k = 1 + rnd.nextInt(4)
-      val first = if (faulting) faultBase + rnd.nextInt(4) * 2048L else randLine()
+      val first = if (faulting) faultBase + rnd.nextInt(4) * DcacheTestGeometry.WayStride else randLine()
       case class Ld(a: Long, sz: Int, tok: Int, lineOnly: Boolean, mode: SpinalEnumElement[CacheMode.type],
                     fault: Boolean, var probed: Boolean = false, var dropped: Boolean = false)
       val lds = (0 until k).map { i =>
@@ -1283,7 +1283,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSampling(4)
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
       val base = 0xc0000L
-      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * 2048L
+      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * DcacheTestGeometry.WayStride
       var ackCount = 0
       var storeAccepts = 0
       var loadAccepts = 0
@@ -1589,7 +1589,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
 
       val base = 0x98000L
-      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * 2048L
+      def addr(set: Int, tag: Int): Long = base + set * 16L + tag * DcacheTestGeometry.WayStride
       for (s <- 0 until 5; b <- 0 until 16)
         cold.pokeByte(addr(s, 4) + b, 0x90 + s)
       var aw = 0; var w = 0; var b = 0; var hotAr = 0
@@ -1885,7 +1885,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       cd.waitSamplingWhere(!lg.resetSweepBusy.toBoolean)
 
       val x = 0x94000L
-      val stride = 2048L // same D-cache set, different tag
+      val stride = DcacheTestGeometry.WayStride // same D-cache set, different tag
       for (i <- 0 until 6; b <- 0 until 16)
         cold.pokeByte(x + i * stride + b, 0x11)
       var awX = false

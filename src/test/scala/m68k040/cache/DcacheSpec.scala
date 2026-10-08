@@ -14,6 +14,11 @@ import spinal.lib.misc.database.Database
 import org.scalatest.funsuite.AnyFunSuite
 
 class DcacheSpec extends AnyFunSuite {
+  // Geometry follows CPU_DCACHE_KB (8 -> 128 sets, 16 -> 256 sets; 4 ways x 16 B).
+  // DC_SET_MASK selects the set index from paddr[..:4]; DC_WAY_STRIDE is one way's
+  // bytes, i.e. the smallest address delta that lands in the SAME set with a new tag.
+  val DC_SET_MASK: Long   = DcacheTestGeometry.SetMask
+  val DC_WAY_STRIDE: Long = DcacheTestGeometry.WayStride
 
   class Dut(directRefill: Boolean = false, hitUnderMissRead: Boolean = false,
             earlyLineForward: Boolean = false) extends Component {
@@ -692,7 +697,7 @@ class DcacheSpec extends AnyFunSuite {
       assert(mem.peekByte(base + 7) == memByte(base + 7), "mem byte +7 must be unwritten (copyback hit, no AXI beat)")
 
       // The dirty bit for this set (some way) must now be set.
-      val setIdx = ((base + 4) >> 4) & 0x7F
+      val setIdx = ((base + 4) >> 4) & DC_SET_MASK
       val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK hit drain")
 
@@ -735,7 +740,7 @@ class DcacheSpec extends AnyFunSuite {
       assert(mem.peekByte(base + 6) == 0x33, "mem written through as before")
       assert(mem.peekByte(base + 7) == 0x44, "mem written through as before")
 
-      val setIdx = ((base + 4) >> 4) & 0x7F
+      val setIdx = ((base + 4) >> 4) & DC_SET_MASK
       val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(!anyDirty, "WRITETHROUGH must never set a dirty bit")
 
@@ -1000,7 +1005,7 @@ class DcacheSpec extends AnyFunSuite {
       assert(mem.peekByte(base + 7) == memByte(base + 7), "mem byte +7 unwritten (write-allocate is on-chip only)")
 
       // The dirty bit for this set (some way) must now be set.
-      val setIdx = ((base + 4) >> 4) & 0x7F
+      val setIdx = ((base + 4) >> 4) & DC_SET_MASK
       val anyDirty = (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setIdx.toInt) != 0)
       assert(anyDirty, s"dirtys must be set for set $setIdx after a COPYBACK-miss write-allocate drain")
 
@@ -1027,7 +1032,7 @@ class DcacheSpec extends AnyFunSuite {
       val (cd, mem) = initDut(dut)
       val SET  = 30L
       val base = SET * 16L
-      def addrK(k: Long): Long = base + k * 0x800L
+      def addrK(k: Long): Long = base + k * DC_WAY_STRIDE
       for (k <- 0L until 5L) preload(mem, addrK(k), 16)
 
       // Way 0: warm + dirty via a COPYBACK-hit store (design doc's drain-throughput
@@ -1094,7 +1099,7 @@ class DcacheSpec extends AnyFunSuite {
       val (cd, mem) = initDut(dut)
       val SET  = 31L
       val base = SET * 16L
-      def addrK(k: Long): Long = base + k * 0x800L
+      def addrK(k: Long): Long = base + k * DC_WAY_STRIDE
       for (k <- 0L until 5L) preload(mem, addrK(k), 16)
 
       // All 4 ways warm + CLEAN (plain WRITETHROUGH loads only, never dirtied).
@@ -1135,7 +1140,7 @@ class DcacheSpec extends AnyFunSuite {
         val (cd, mem) = initDut(dut)
         val SET_A  = 40L
         val baseA  = SET_A * 16L
-        def addrA(k: Long): Long = baseA + k * 0x800L
+        def addrA(k: Long): Long = baseA + k * DC_WAY_STRIDE
         val SET_B  = 41L
         val baseB  = SET_B * 16L
         for (k <- 0L until 5L) preload(mem, addrA(k), 16)
@@ -1232,7 +1237,7 @@ class DcacheSpec extends AnyFunSuite {
         val (cd, mem) = initDut(dut)
         val SET_A  = 50L
         val baseA  = SET_A * 16L
-        def addrA(k: Long): Long = baseA + k * 0x800L
+        def addrA(k: Long): Long = baseA + k * DC_WAY_STRIDE
         val SET_B  = 51L
         val baseB  = SET_B * 16L
         for (k <- 0L until 5L) preload(mem, addrA(k), 16)
@@ -1523,7 +1528,7 @@ class DcacheSpec extends AnyFunSuite {
       val (cd, mem) = initDut(dut)
       val SET  = 60L
       val base = SET * 16L
-      def addrK(k: Long): Long = base + k * 0x800L
+      def addrK(k: Long): Long = base + k * DC_WAY_STRIDE
       for (k <- 0L until 5L) preload(mem, addrK(k), 16)
 
       // Way 0: warm + dirty via a COPYBACK-hit store (same recipe as the "EVICT_WR:
@@ -1684,7 +1689,7 @@ class DcacheSpec extends AnyFunSuite {
     cyc
   }
 
-  def setOf(addr: Long): Int = ((addr >> 4) & 0x7F).toInt
+  def setOf(addr: Long): Int = ((addr >> 4) & DC_SET_MASK).toInt
   def anyDirtyIn(dut: Dut, addr: Long): Boolean =
     (0 until 4).exists(w => dut.dcache.logic.dirtysMem(w).getBigInt(setOf(addr)) != 0)
 
@@ -2008,6 +2013,51 @@ class DcacheSpec extends AnyFunSuite {
       "Over-invalidating here would silently DISCARD dirty data on every 4 KB machine.")
     assert(r.reloaded(P131_HIGH) == p131Mark(P131_HIGH),
       "the untouched neighbouring block must still hold its dirty cached value")
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CPU_DCACHE_KB: the PAGE predicate must hold for EITHER geometry. Three dirty
+  // lines in the SAME set (the addresses below are multiples of 4 KiB apart, which is a multiple of the way size at both 8 and
+  // 16 KiB, so all three share a set and differ ONLY in tag bits at/above
+  // paddr[12]). That is exactly where the tag/index split moves between the two
+  // geometries (tag LSB = paddr[11] at 8 KiB, paddr[12] at 16 KiB), so a page
+  // predicate with the wrong bit offset fails one of the two arms below.
+  //   X = 0x20040 (8 KB page 0x20000, lower 4 KB), Y = X + 0x1000 (same 8 KB page,
+  //   upper 4 KB), Z = X + 0x2000 (next 8 KB page).
+  // ═══════════════════════════════════════════════════════════════════════════
+  def sameSetPageCoverage(name: String, seed: Int, is8K: Boolean): Map[Long, Boolean] = {
+    val X = 0x20040L; val lines = Seq(X, X + 0x1000L, X + 0x2000L)
+    var out: Map[Long, Boolean] = null
+    sharedCompiled.doSim(name, seed) { dut =>
+      val (cd, mem) = initDut(dut)
+      cd.waitSampling(8)
+      dut.mmuCtrl.logic.pageSize8K #= is8K
+      cd.waitSampling(2)
+      assert(dut.mmuCtrl.logic.pageSize8K.toBoolean == is8K, "TCR.P poke did not stick")
+      assert(lines.map(setOf).distinct.size == 1, "precondition: all three lines share one set")
+      lines.foreach { b =>
+        preload(mem, b, 16)
+        load(dut, cd, b, Size.LONG, CacheMode.WRITETHROUGH)
+        doStore(dut, cd, b + 4, p131Mark(b), Size.LONG, CacheMode.COPYBACK)
+      }
+      lines.foreach { b => assert(peekLong(mem, b + 4) != p131Mark(b), f"0x$b%x leaked early") }
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_PAGE, SEL_DC, X)
+      maintWait(dut, cd)
+      cd.waitSampling(8)
+      out = lines.map(b => b -> (peekLong(mem, b + 4) == p131Mark(b))).toMap
+    }
+    out
+  }
+
+  test("CPUSHP page predicate is geometry-correct: same-set lines in 4 KB / 8 KB neighbours",
+       VerilatorTest) {
+    val X = 0x20040L
+    val p4 = sameSetPageCoverage("dckb_4k", 141, is8K = false)
+    assert(p4(X) && !p4(X + 0x1000L) && !p4(X + 0x2000L),
+      s"TCR.P=0: CPUSHP must push exactly the operand's 4 KB page (got $p4)")
+    val p8 = sameSetPageCoverage("dckb_8k", 142, is8K = true)
+    assert(p8(X) && p8(X + 0x1000L) && !p8(X + 0x2000L),
+      s"TCR.P=1: CPUSHP must push both 4 KB halves of the 8 KB page and nothing beyond (got $p8)")
   }
 
   // (P5.4-d) An IC-only selector has no D-cache work: it completes without walking and
@@ -2710,7 +2760,7 @@ class DcacheSpec extends AnyFunSuite {
     earlyLineCompiled.doSim { dut =>
       val (cd, mem) = initDut(dut)
       val vaddr = 0x7E08L
-      val alias = vaddr + 0x800L // same virtual-set index, different physical tag
+      val alias = vaddr + DC_WAY_STRIDE // same virtual-set index, different physical tag
       val token = 0x35
       preload(mem, vaddr & ~15L, 16)
       preload(mem, alias & ~15L, 16)
@@ -2987,7 +3037,7 @@ class DcacheSpec extends AnyFunSuite {
       val (cd, mem) = initDut(dut)
       val base  = 0x7C00L
       val addr  = base + 8
-      val alias = addr + 0x800L      // same set (bits [10:4]), different tag
+      val alias = addr + DC_WAY_STRIDE      // same set (bits [10:4]), different tag
       preload(mem, base, 16)
       preload(mem, alias - 8, 16)
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
@@ -3095,7 +3145,7 @@ class DcacheSpec extends AnyFunSuite {
         while (trackWrite) {
           cd.waitSampling()
           if (dut.dcache.logic.stS3ArrayWrite.toBoolean &&
-              dut.dcache.logic.stS3Set.toLong == ((addr >> 4) & 0x7fL)) {
+              dut.dcache.logic.stS3Set.toLong == ((addr >> 4) & DC_SET_MASK)) {
             sawSameSetWrite = true
           }
         }

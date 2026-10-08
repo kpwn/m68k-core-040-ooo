@@ -100,7 +100,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // Same set (5), distinct tags per k (k*0x800 steps clear of the set/offset bits).
   val SET  = 5L
   val base = SET * 16L
-  def addrK(k: Long): Long = base + k * 0x800L
+  def addrK(k: Long): Long = base + k * DcacheTestGeometry.WayStride
 
   test("runtime reset invalidates resident D-cache lines", VerilatorTest) {
     compiled.doSim("runtimeResetInvalidatesDcache", 1) { dut =>
@@ -236,7 +236,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // in both. This is a strictly stronger stimulus, not a weakened assertion.
   val SET_B = 24L                     // store target set (DIFFERENT set AND different
                                       // 64-byte line, SAME way 0)
-  def addrA(k: Long): Long = SET_A * 16L + k * 0x800L
+  def addrA(k: Long): Long = SET_A * 16L + k * DcacheTestGeometry.WayStride
   val addrB = SET_B * 16L
 
   /** Warm SET_A ways 0..3 (all CLEAN, so the 5th miss goes straight to REFILL with no
@@ -391,7 +391,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
         // DIFFERENT set, so it is NOT dropped by the same collision -- holding STALE
         // data, which the eviction machinery would later write back to memory as if it
         // were the store's own result.
-        val setB = (SET_B & 0x7F).toInt
+        val setB = (SET_B & DcacheTestGeometry.SetMask).toInt
         val dirtyWays = (0 until 4).filter(w => dut.dcache.logic.dirtysMem(w).getBigInt(setB) != 0)
         assert(dirtyWays.nonEmpty, "COPYBACK hit store must have dirtied its line")
         val gotB = load(dut, cd, addrB + 4, Size.LONG)
@@ -426,7 +426,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       dut.probe.logic.storeIn.valid   #= false
       val set = 40L
       val missAddr = set * 16L
-      val hitAddr  = missAddr + 0x800L // same set, different tag
+      val hitAddr  = missAddr + DcacheTestGeometry.WayStride // same set, different tag
       preload(mem, missAddr, 16)
       preload(mem, hitAddr, 16)
       load(dut, cd, hitAddr, Size.LONG)
@@ -491,7 +491,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       cd.waitSampling(5)
 
       val set = 52L
-      def line(k: Long): Long = set * 16L + k * 0x800L
+      def line(k: Long): Long = set * 16L + k * DcacheTestGeometry.WayStride
       for (k <- 0L until 5L) preload(mem, line(k), 16)
       for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
 
@@ -592,7 +592,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       cd.waitSampling(5)
 
       val set = 53L
-      def line(k: Long): Long = set * 16L + k * 0x800L
+      def line(k: Long): Long = set * 16L + k * DcacheTestGeometry.WayStride
       for (k <- 0L until 5L) preload(mem, line(k), 16)
       for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
 
@@ -674,7 +674,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       cd.waitSampling(5)
 
       val set = 55L
-      def line(k: Long): Long = set * 16L + k * 0x800L
+      def line(k: Long): Long = set * 16L + k * DcacheTestGeometry.WayStride
       for (k <- 0L until 5L) preload(mem, line(k), 16)
       for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
 
@@ -751,7 +751,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       cd.waitSampling(5)
 
       val set = 54L
-      def line(k: Long): Long = set * 16L + k * 0x800L
+      def line(k: Long): Long = set * 16L + k * DcacheTestGeometry.WayStride
       for (k <- 0L until 5L) preload(mem, line(k), 16)
       for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
 
@@ -811,7 +811,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
       cd.waitSampling(5)
 
       val set = 56L
-      def line(k: Long): Long = set * 16L + k * 0x800L
+      def line(k: Long): Long = set * 16L + k * DcacheTestGeometry.WayStride
       for (k <- 0L until 5L) preload(mem, line(k), 16)
       for (k <- 0L until 4L) load(dut, cd, line(k), Size.LONG)
 
