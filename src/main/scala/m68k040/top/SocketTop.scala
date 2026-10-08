@@ -702,6 +702,7 @@ object GenSocketTopVerilog {
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
             s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
+            s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

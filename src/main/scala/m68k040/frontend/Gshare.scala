@@ -52,7 +52,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * The branch EU still verifies every direction/target, so a gshare miss remains a pure
   * perf loss. */
 class GsharePlugin(retainRedirectHistory: Boolean = false,
-                   interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
+                   interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved,
+                   ghrTrim: Boolean = m68k040.top.ShippingCoreConfig.ghrTrim) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
@@ -66,10 +67,16 @@ class GsharePlugin(retainRedirectHistory: Boolean = false,
   override def secondaryPhtTaken: Bool = logic.phtTaken1
 
   val logic = during build new Area {
-    val ghrBits    = Global.GHR_BITS.get
     val phtEntries = Global.PHT_ENTRIES.get
     require((phtEntries & (phtEntries - 1)) == 0, "gshareEntries must be a power of two")
     val idxBits    = log2Up(phtEntries)            // = 11 for 2048
+    // CPU_GHR_TRIM: the index folds only ghr(min(GHR_BITS, idxBits)-1 downto 0) (see
+    // `idxHistBits`), and every other GHR consumer -- the speculative shift, the retire
+    // shift of `ghrArch`, the whole-register repair and RetainedHistoryRepair's
+    // `(arch << count) | suffix` -- moves bits only UPWARD. So bit k of every register
+    // depends only on bits <= k, and the bits above the fold are dead. Store only the
+    // folded width. Follows CPU_GSHARE_ENTRIES through idxBits.
+    val ghrBits    = if (ghrTrim) scala.math.min(Global.GHR_BITS.get, idxBits) else Global.GHR_BITS.get
     require(idxBits == Global.PHT_IDX_W,
       s"gshare idxBits=$idxBits disagrees with the carried-index width Global.PHT_IDX_W=${Global.PHT_IDX_W}")
 

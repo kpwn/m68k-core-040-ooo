@@ -668,4 +668,10 @@ object ShippingCoreConfig {
     * bit-identical in every harness that wires gshare. `CPU_BTB_NO_COUNTER`; echoed in
     * `SHIPPING_CONFIG`. */
   val btbNoCounter: Boolean = envFlag("CPU_BTB_NO_COUNTER", false)
+  /** gshare: size `ghr`/`ghrArch` (and the retained-history suffix) to the history bits
+    * the PHT index actually folds, min(GHR_BITS, log2(PHT entries)), instead of GHR_BITS.
+    * Every GHR consumer is a left shift or the low-bit index fold, so the dropped high
+    * bits never reach a low bit. Follows CPU_GSHARE_ENTRIES. `CPU_GHR_TRIM`; echoed in
+    * `SHIPPING_CONFIG`. */
+  val ghrTrim: Boolean = envFlag("CPU_GHR_TRIM", false)
 }

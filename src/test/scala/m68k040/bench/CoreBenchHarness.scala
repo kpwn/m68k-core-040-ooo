@@ -1298,7 +1298,8 @@ trait CoreBenchHarness extends AnyFunSuite {
             val retain = kept && !dut.rob.logic.excActive.toBoolean
             val direction = gs.shiftDir.toBoolean
             val retained = historyModelActive && historyModelKeep && !early && !invalidating
-            def push(h: Int, b: Boolean): Int = ((h << 1) | (if (b) 1 else 0)) & 65535
+            // Width follows the RTL register (CPU_GHR_TRIM narrows it to the folded bits).
+            def push(h: Int, b: Boolean): Int = ((h << 1) | (if (b) 1 else 0)) & ((1 << gs.ghr.getBitsWidth) - 1)
             val emitted = if (shifting) Vector(direction) else Vector.empty[Boolean]
             historyExpectedNext = Some(if (invalidating) 0
               else if (repairing && retained) {
@@ -1308,7 +1309,7 @@ trait CoreBenchHarness extends AnyFunSuite {
               else if (shifting) push(gs.ghr.toInt, direction)
               else gs.ghr.toInt)
             if (historyModelActive && shifting)
-              historyModelSuffix = (historyModelSuffix :+ direction).takeRight(16)
+              historyModelSuffix = (historyModelSuffix :+ direction).takeRight(gs.ghr.getBitsWidth)
             if (repairing || (flushing && !retain)) historyModelActive = false
             if (early) { historyModelActive = true; historyModelSuffix = Vector.empty }
             if (invalidating) { historyModelActive = false; historyModelSuffix = Vector.empty }
