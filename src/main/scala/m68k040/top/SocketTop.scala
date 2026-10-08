@@ -747,7 +747,8 @@ object GenSocketTopVerilog {
             s"walkAbortOnFlush=${ShippingCoreConfig.walkAbortOnFlush} " +
             // RobPlugin constructor DEFAULTS (the `sqDepth` precedent).
             s"flushFromSquash=${ShippingCoreConfig.flushFromSquash} " +
-            s"coldWbShare=${ShippingCoreConfig.coldWbShare}")
+            s"coldWbShare=${ShippingCoreConfig.coldWbShare} " +
+            s"walkSqCheck=${ShippingCoreConfig.walkSqCheck}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

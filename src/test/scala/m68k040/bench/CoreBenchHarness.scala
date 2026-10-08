@@ -830,6 +830,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     * one compiled DUT across all kernels keeps this a single Verilator build. */
   /** Optional hook called at the start of every `runKernel` sim, with the DUT. */
   protected var dutProbe: FullCoreDut => Unit = null
+  /** Cycles (all kernels so far) a DTLB descriptor read was held by `CPU_WALK_SQ_CHECK`. */
+  var walkOrderHoldCycles: Long = 0L
 
   def runKernel(compiled: SimCompiled[FullCoreDut], k: Kernel,
                 seed: Int = IpcBenchSpec.simSeed): IpcResult = {
@@ -852,6 +854,10 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Optional per-run observer (a spec forks its own mechanism counters here). Inert
       // unless a spec sets `dutProbe`.
       if (dutProbe != null) dutProbe(dut)
+      // CPU_WALK_SQ_CHECK: count cycles a DTLB descriptor read is withheld (tap is null
+      // when the flag is OFF). Accumulated across kernels; IpcBenchSpec prints it.
+      Option(dut.dtlb.logic.dbgWalkOrderHold).foreach { t =>
+        cd.onSamplings { if (t.toBoolean) walkOrderHoldCycles += 1 } }
       // S-pre (2026-08-12 large-scale-frontend-restructure-design, §14 Q5 / D4):
       // IPC_PREFETCH=off disables IcachePlugin's next-line prefetch engine for the
       // WHOLE run, to measure its real aggregate/per-kernel IPC contribution.

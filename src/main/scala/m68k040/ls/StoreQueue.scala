@@ -106,7 +106,9 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  inhibitedFullBarrier: Boolean = false,
                  coalesceLines: Boolean = false,
                  coalesceHold: Int = 16,
-                 coalesceMutation: Int = 0) extends Component {
+                 coalesceMutation: Int = 0,
+                 /** `CPU_WALK_SQ_CHECK`: elaborate `io.walkLineAddr`/`io.walkLineHit`. */
+                 walkLineQuery: Boolean = false) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -190,6 +192,12 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     val coalesceFire    = if (coalesceLines) out(Bool()) else null
     val coalesceHolding = if (coalesceLines) out(Bool()) else null
     val coalesceTimeout = if (coalesceLines) out(Bool()) else null
+    // ---- table-walk ordering query (`walkLineQuery`) ----
+    // `walkLineHit`: some resident entry (either half, any age, committed or not, sent
+    // or not -- an entry is resident until its terminal ack) writes the 16-byte line
+    // of `walkLineAddr`.
+    val walkLineAddr = if (walkLineQuery) in(UInt(32 bits)) else null
+    val walkLineHit  = if (walkLineQuery) out(Bool()) else null
   }
 
   // ---- ring storage ----
@@ -280,6 +288,13 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
   // optional slot B (second half of a split store)
   val validBs   = Vec.fill(depth)(RegInit(False))
   val paddrBs   = Vec.fill(depth)(Reg(UInt(32 bits)))
+  if (walkLineQuery) {
+    val qLine = io.walkLineAddr(31 downto 4)
+    io.walkLineHit := (0 until depth).map { i =>
+      valids(i) && ((paddrs(i)(31 downto 4) === qLine) ||
+                    (validBs(i) && (paddrBs(i)(31 downto 4) === qLine)))
+    }.reduce(_ || _)
+  }
   // (strbB/lineDataB are DERIVED at drain time -- see the drain-present mux below;
   // no per-entry storage needed at all now, task #252.)
   val maskBs     = Vec.fill(depth)(Reg(Bits(16 bits)))

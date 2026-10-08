@@ -41,7 +41,10 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                  hitUnderWalk: Boolean = m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk,
                  /** `ShippingCoreConfig.walkAbortOnFlush`: stop such a walk at the next
                    * level boundary instead of running all three descriptor reads. */
-                 abortOnFlush: Boolean = m68k040.top.ShippingCoreConfig.walkAbortOnFlush) extends FiberPlugin
+                 abortOnFlush: Boolean = m68k040.top.ShippingCoreConfig.walkAbortOnFlush,
+                 /** `ShippingCoreConfig.walkSqCheck`: withhold a descriptor read while an
+                   * older store to its line is still in P3/the SQ (see `walkOrderHold`). */
+                 walkSqCheck: Boolean = m68k040.top.ShippingCoreConfig.walkSqCheck) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -64,6 +67,12 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
   override def walkStoreAck: Bool = _walkStoreAck
   override def walkStoreErr: Bool = _walkStoreErr
   override def walkCmodePolicy: CacheMode.C = _walkCmodePolicy
+  var _walkOrderAddr: UInt = null
+  var _walkOrderLive: Bool = null
+  var _walkOrderHold: Bool = null
+  override def walkOrderAddr: UInt = _walkOrderAddr
+  override def walkOrderLive: Bool = _walkOrderLive
+  override def walkOrderHold: Bool = _walkOrderHold
 
   during setup {
     // Allocate the service ports in the plugin's own scope (deterministic — avoids
@@ -86,6 +95,14 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
     _walkCmodePolicy = CacheMode()
+    if (walkSqCheck) {
+      _walkOrderAddr = UInt(32 bits)
+      _walkOrderLive = Bool()
+      _walkOrderHold = Bool()
+      // Default in SETUP (every plugin's setup precedes every build), so LsEuPlugin's
+      // drive wins whatever the build order; a DUT without LsEuPlugin is never held.
+      _walkOrderHold.allowOverride; _walkOrderHold := False
+    }
   }
 
   // U/M deferred-write queue hooks (driven by the LS-cluster wiring):
@@ -433,6 +450,27 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     if (hitUnderWalk) walkDead.simPublic()
     /** `done` of a walk that still has an owner (flag OFF: exactly `walker.io.done`). */
     def liveDone: Bool = if (hitUnderWalk) walker.io.done && !walkDead else walker.io.done
+
+    // ── CPU_WALK_SQ_CHECK: a descriptor read must observe every OLDER store ─────────
+    // `walkOrderHold` (driven by LsEuPlugin) is high while P3 or the SQ holds a store to
+    // the line of the walker's pending descriptor read. The read is withheld from the
+    // staged walker port until that store has drained; the walker simply keeps its
+    // request up. Only the walker's own reads are gated: the U/M drain's re-read below
+    // overrides `_walkLoadCmd` afterwards and is untouched. A walk whose owner was
+    // squashed (poisoned or detached) is not held -- its result is discarded anyway, and
+    // the SQ may by then hold younger stores that could not drain before it finishes.
+    if (walkSqCheck) {
+      _walkOrderAddr := walker.io.loadCmd.payload.paddr
+      _walkOrderLive := !walkFlushPoison && !walkUmPoison &&
+                        (if (hitUnderWalk) !walkDead else True)
+      when(_walkOrderHold) {
+        _walkLoadCmd.valid      := False
+        walker.io.loadCmd.ready := False
+      }
+    }
+    /** sim tap: the walker has a descriptor read up and it is being withheld. */
+    val dbgWalkOrderHold: Bool =
+      if (walkSqCheck) { val h = walker.io.loadCmd.valid && _walkOrderHold; h.simPublic(); h } else null
 
     _rsp.valid   := rspValid && !atcFlush
     _rsp.payload := rspPayload

@@ -739,7 +739,16 @@ trait WalkerDcacheClient {
 trait ItlbWalkerDcacheClient extends WalkerDcacheClient
 
 /** The D-side walker's client port (`DtlbPlugin`). See `ItlbWalkerDcacheClient`. */
-trait DtlbWalkerDcacheClient extends WalkerDcacheClient
+trait DtlbWalkerDcacheClient extends WalkerDcacheClient {
+  /** `CPU_WALK_SQ_CHECK` (all three null when the flag is OFF). Produced by `DtlbPlugin`:
+    * `walkOrderAddr` is the physical address of the walker's pending descriptor read and
+    * `walkOrderLive` says the walk still has a live owner (its result will be used).
+    * `walkOrderHold` is driven by `LsEuPlugin`: an older store to that line is still in
+    * P3 or the store queue, so the read must wait. */
+  def walkOrderAddr: UInt = null
+  def walkOrderLive: Bool = null
+  def walkOrderHold: Bool = null
+}
 
 /** Produced by the fetch/align stage; consumed by the (future) decode stage.
   * Two packets/cycle; slot 0 valid when the stream fires, slot 1 on 2-wide cycles. */
