@@ -255,6 +255,24 @@ trait DebugMemoryService {
   def request(cmd: Flow[DebugMemoryCommand]): Unit
 }
 
+/** CPU_PRF_READ_TRIM: the debug CSR block's live-register read BORROWS the int-PRF read
+  * port that mirrors the committed A7 into SystemState, instead of owning a port of its
+  * own (each int-PRF read port is a full read of every LVT data bank plus a ~970-fanout
+  * address net). The consumer (`DebugCtrlPlugin`) drives `debugIntReadReq` and
+  * `debugIntReadAddr` (a REGISTERED physical address) and must hold the request until it
+  * sees `debugIntReadGrant`; in the granted cycle `debugIntReadData` is the PRF word at
+  * that address (async read, same cycle). The producer grants only while the exception
+  * FSM is idle (the A7 mirror holds its value for that one cycle), or after a bounded
+  * wait so a wedged FSM cannot hang the debugger. Signals are created in the producer's
+  * setup; the consumer may drive/read them only in its build.
+  * PRODUCER: `BackendWiringPlugin` (exactly one). */
+trait DebugIntReadService {
+  def debugIntReadReq: Bool
+  def debugIntReadAddr: UInt
+  def debugIntReadGrant: Bool
+  def debugIntReadData: Bits
+}
+
 case class DebugBranchEvent() extends Bundle {
   val pc, nextPc = UInt(32 bits)
   val taken, mispredicted = Bool()

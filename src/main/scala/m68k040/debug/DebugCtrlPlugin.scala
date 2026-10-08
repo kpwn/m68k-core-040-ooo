@@ -76,13 +76,22 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
   // offset through the committed-map service. Optional lookup preserves the small
   // standalone CSR fixtures; the shipped Stage-3 full core provides both services.
   private var debugIntRead: RegFileReadPort = null
+  private var debugIntReadBorrow: Option[m68k040.services.DebugIntReadService] = None
   private var debugIntWrite: RegFileWritePort = null
   private var debugNzvcWrite: RegFileWritePort = null
   private var debugXWrite: RegFileWritePort = null
   during setup {
     if (enable && stage >= 3) {
       host.get[IntRegFileService].foreach { rf =>
-        debugIntRead = rf.newRead(forceNoBypass = true)
+        // CPU_PRF_READ_TRIM: borrow the committed-A7 mirror's read port through
+        // DebugIntReadService instead of owning one (a local, unallocated bundle stands in
+        // for the port; build wires it to the service and waits for the grant).
+        debugIntReadBorrow =
+          if (m68k040.top.ShippingCoreConfig.prfReadTrim) host.get[m68k040.services.DebugIntReadService]
+          else None
+        debugIntRead =
+          if (debugIntReadBorrow.isDefined) RegFileReadPort(rf.spec.addressWidth, rf.spec.dataWidth)
+          else rf.newRead(forceNoBypass = true)
         // Share BranchEu's int write port rather than owning one.  The
         // exception A7 write moved to BranchEuPlugin.IntWbKey (FullCoreSynth
         // a7Wr, priority 0), which left "excA7" referenced by this line ALONE
@@ -1179,7 +1188,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         * arm reads as zero. The history-body and live-integer sources are selected
         * rather than ORed because they are wide/late sources with their own stage-1
         * address capture. */
-      when(readStage2) {
+      // CPU_PRF_READ_TRIM: a borrowed live-register read holds stage 2 until the port's
+      // owner grants it (DebugIntReadService); every other read completes as before.
+      // (Flag OFF: no term at all, so the OFF netlist is identical to the pre-flag one.)
+      val readStage2Go = debugIntReadBorrow
+        .map(b => readStage2 && !(readIsLiveInt && !b.debugIntReadGrant)).getOrElse(readStage2)
+      when(readStage2Go) {
         readStage2 := False
         rPend := True
         val historyWord = Bits(DebugRegMap.DBG_DW bits)
@@ -1488,6 +1502,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
           }.getOrElse(U(0, debugIntRead.addr.getWidth bits))
         }
         debugIntRead.addr := liveIntPhysAddr
+        debugIntReadBorrow.foreach { b =>
+          b.debugIntReadReq  := readStage2 && readIsLiveInt
+          b.debugIntReadAddr := liveIntPhysAddr
+          debugIntRead.data  := b.debugIntReadData
+        }
       }
       def liveIntWord: Bits =
         if (debugIntRead != null) debugIntRead.data else B(0, 32 bits)

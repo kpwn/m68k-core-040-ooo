@@ -554,6 +554,19 @@ object ShippingCoreConfig {
   val dcacheNbProbeMissStage: Boolean = envFlag("CPU_DCACHE_NB_PROBE_MISS_STAGE", false)
   require(!dcacheNbProbeMissStage || (dcacheNonBlocking && !dcacheSectored),
     "CPU_DCACHE_NB_PROBE_MISS_STAGE=1 requires unsectored non-blocking D-cache")
+  /** Integer PRF read-port diet, 17 -> 14 (Fable review item 8, §5.4). Default OFF.
+    *
+    * ON removes three int-PRF async read ports, each one a full read of every LVT data
+    * bank plus one ~970-fanout read-address net:
+    *   - both ALUs' `rdC`: CAS/CAS2 no longer carry a third int source. Their match
+    *     predicate (eq / eq1 / bothEq) is taken from the Z bit of the NZVC the compare µop
+    *     already writes (CASC / CAS2C1 / CAS2C2), via the ALU's existing NZVC read. CAS
+    *     reorders CASC before the store-data select (+1 dependent ALU µop on CAS only).
+    *   - the debug CSR block's own live-register read port: it time-shares the committed-A7
+    *     mirror port (`BackendWiringPlugin.a7Rd`), stealing it for one cycle while the
+    *     exception FSM is idle (the A7 mirror holds that cycle).
+    * Read by `Microcode` (CAS rows), `AluEuPlugin`, `DebugCtrlPlugin`, `BackendWiringPlugin`. */
+  val prfReadTrim: Boolean = envFlag("CPU_PRF_READ_TRIM", false)
   require(!dcacheHotDoor || dcacheNonBlocking, "CPU_AXI_DH=1 requires CPU_DCACHE_NONBLOCKING=1")
   require(!dcacheNbEarlyResponse || dcacheNonBlocking,
     "CPU_DCACHE_NB_EARLY_RESPONSE=1 requires CPU_DCACHE_NONBLOCKING=1")
