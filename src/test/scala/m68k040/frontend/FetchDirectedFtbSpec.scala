@@ -103,7 +103,7 @@ class FetchDirectedFtbSpec extends AnyFunSuite {
     val host = db on new PluginHost
     val fetch = new ControlledFetchPlugin
     val update = new UpdateDriver
-    val btb = new BtbPlugin
+    val btb = new BtbPlugin(noCounter = false) // no gshare wired here: cond direction is the bimodal
     val ftb = new FtbPlugin(entries = 128)
     val gshare = new GsharePlugin
     val gshareUpdate = new GshareUpdateDriver

@@ -14,11 +14,11 @@ import spinal.lib.misc.plugin.FiberPlugin
   *  - brType  : 0=cond (Bcc/DBcc), 1=uncond (BRA/BSR/JMP/JSR).
   *  - counter : 2-bit saturating bimodal (0,1 = not-taken; 2,3 = taken).
   * `valid` lives in a Reg Vec (cheap one-cycle invalidate); the rest in a Mem. */
-case class BtbEntry(tagBits: Int) extends Bundle {
+case class BtbEntry(tagBits: Int, withCounter: Boolean = true) extends Bundle {
   val tag     = UInt(tagBits bits)
   val target  = UInt(32 bits)
   val brType  = UInt(2 bits)
-  val counter = UInt(2 bits)
+  val counter = if (withCounter) UInt(2 bits) else null
 }
 
 /** Tagged direct-mapped BTB + 2-bit bimodal predictor (spec slice 1).
@@ -38,7 +38,7 @@ case class BtbEntry(tagBits: Int) extends Bundle {
   *  - predHitComb/predTypeComb (comb): raw tag-hit + brType, so FetchAlign can form
   *                           `condBtbHit = hit && brType==cond` for gshare override.
   *  - invalidateAll        : clear all valid bits (driven from the I-cache invalidate). */
-class BtbPlugin extends FiberPlugin {
+class BtbPlugin(noCounter: Boolean = m68k040.top.ShippingCoreConfig.btbNoCounter) extends FiberPlugin {
 
   // ---- public ports (accessed via host[BtbPlugin].logic.* by the wiring layer) ----
   var queryPcPort:    UInt = null
@@ -62,7 +62,7 @@ class BtbPlugin extends FiberPlugin {
     // ---- storage ----
     // valid : register array (one-cycle invalidate). entry payload : async-read LUTRAM.
     val valids = Vec.fill(entries)(RegInit(False))
-    val mem    = Mem(BtbEntry(tagBits), entries)
+    val mem    = Mem(BtbEntry(tagBits, !noCounter), entries)
 
     // ---- ports (directionless plain wires, idle-defaulted with concrete zeros so a
     //      standalone DUT elaborates; the wiring layer / FetchAlign overrides them) ----
@@ -85,7 +85,12 @@ class BtbPlugin extends FiberPlugin {
       val rawHit = valid && valids(idx) && (entry.tag === tag)
       // predict-taken: hit with counter in the taken band (>=2) OR an unconditional
       // (brType==1, force-taken even on the cycle it is first installed).
-      val predTaken = rawHit && ((entry.counter >= U(2, 2 bits)) || (entry.brType === U(1, 2 bits)))
+      // CPU_BTB_NO_COUNTER: no bimodal direction -- an unconditional is force-taken, a
+      // conditional predicts not-taken here. FetchAlign reads this only when the hit is
+      // NOT a conditional (a conditional hit takes gshare's direction), so with gshare
+      // wired the two forms are indistinguishable.
+      val predTaken = if (noCounter) rawHit && (entry.brType === U(1, 2 bits))
+                      else rawHit && ((entry.counter >= U(2, 2 bits)) || (entry.brType === U(1, 2 bits)))
       (predTaken, entry.target, rawHit, entry.brType)
     }
 
@@ -104,23 +109,25 @@ class BtbPlugin extends FiberPlugin {
     val upd = host[BtbUpdateService].btbUpdate
     val uIdx   = idxOf(upd.payload.pc)
     val uTag   = tagOf(upd.payload.pc)
-    val uOld   = mem.readAsync(uIdx)
-    val uValid = valids(uIdx)
+    // CPU_BTB_NO_COUNTER: the counter RMW is the only reader of this port; without it
+    // the update reads nothing (one async read port fewer on the LUTRAM).
+    val uOld   = if (!noCounter) mem.readAsync(uIdx) else null
+    val uValid = if (!noCounter) valids(uIdx) else null
     // Hit on THIS branch's entry (same tag): a real counter update. Else (cold or a
     // tag-aliased other branch) it is a fresh allocation overwriting the slot.
-    val uEntryHit = uValid && (uOld.tag === uTag)
+    val uEntryHit = if (!noCounter) uValid && (uOld.tag === uTag) else null
     // Counter update: taken -> min(c+1,3); not-taken -> max(c-1,0). Allocation seeds
     // counter := taken ? 2 : 1 (weakly, in the resolved direction); unconditional pegs 3.
-    val cInc = Mux(uOld.counter === U(3, 2 bits), U(3, 2 bits), (uOld.counter + 1).resized)
-    val cDec = Mux(uOld.counter === U(0, 2 bits), U(0, 2 bits), (uOld.counter - 1).resized)
-    val ctrUpdated = Mux(upd.payload.taken, cInc, cDec)
-    val ctrAlloc   = Mux(upd.payload.brType === U(1, 2 bits), U(3, 2 bits),
-                     Mux(upd.payload.taken, U(2, 2 bits), U(1, 2 bits)))
-    val newEntry = BtbEntry(tagBits)
+    val cInc = if (!noCounter) Mux(uOld.counter === U(3, 2 bits), U(3, 2 bits), (uOld.counter + 1).resized) else null
+    val cDec = if (!noCounter) Mux(uOld.counter === U(0, 2 bits), U(0, 2 bits), (uOld.counter - 1).resized) else null
+    val ctrUpdated = if (!noCounter) Mux(upd.payload.taken, cInc, cDec) else null
+    val ctrAlloc   = if (!noCounter) Mux(upd.payload.brType === U(1, 2 bits), U(3, 2 bits),
+                     Mux(upd.payload.taken, U(2, 2 bits), U(1, 2 bits))) else null
+    val newEntry = BtbEntry(tagBits, !noCounter)
     newEntry.tag     := uTag
     newEntry.target  := upd.payload.target
     newEntry.brType  := upd.payload.brType
-    newEntry.counter := Mux(uEntryHit, ctrUpdated, ctrAlloc)
+    if (!noCounter) newEntry.counter := Mux(uEntryHit, ctrUpdated, ctrAlloc)
 
     val memWrEn = Bool(); memWrEn := False
     mem.write(uIdx, newEntry, enable = memWrEn)

@@ -658,4 +658,14 @@ object ShippingCoreConfig {
   val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 2048, 2048, 16384)
   require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
     s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
+
+  // ── AREA ITEMS (docs/design/10-review.md §5.5, §5.6, §6) ─────────────────────────
+  /** BTB/FTB: drop the 2-bit `counter` from `BtbEntry`/`FtbEntry` and the retire-time
+    * read-modify-write read port that only existed to update it. FTB: the counter has no
+    * reader at all. BTB: its only reader is `predTakenComb`, which FetchAlign consumes
+    * only when `!condBtbHit0` -- i.e. a miss (False either way) or `brType == 1`
+    * (force-taken either way; BranchEu only ever emits brType 0/1). So predictions are
+    * bit-identical in every harness that wires gshare. `CPU_BTB_NO_COUNTER`; echoed in
+    * `SHIPPING_CONFIG`. */
+  val btbNoCounter: Boolean = envFlag("CPU_BTB_NO_COUNTER", false)
 }
