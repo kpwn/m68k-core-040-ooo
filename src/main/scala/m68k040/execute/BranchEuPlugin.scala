@@ -25,7 +25,7 @@ case class BranchCompletion() extends Bundle {
   val btbLen     = UInt(4 bits)   // exact (nextPc-pc)/2 architectural length
   // ── gshare PHT-update fields (slice 3) ──
   val phtValid   = Bool()         // a CONDITIONAL gshare-predicted branch (train pht[phtIndex])
-  val phtIndex   = UInt(11 bits)  // the carried fetch-time folded-XOR index the lookup read
+  val phtIndex   = UInt(m68k040.Global.PHT_IDX_W bits)  // the carried fetch-time folded-XOR index the lookup read
   // ── RAS flush-repair carry (slice 2, RasPlugin `branchRepair`) ──
   // What the FETCH-side RAS did for THIS branch, so a flush that rolls the RAS back to a
   // checkpoint predating it can put that one entry back (see RasPlugin's class comment:

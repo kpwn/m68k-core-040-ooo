@@ -41,7 +41,7 @@ case class DecodePacket() extends Bundle {
   //   differs from the GHR at the lookup — only the carried index is right).
   //   Non-conditional / not-gshare-predicted packets carry phtValid=False.
   val phtValid   = Bool()
-  val phtIndex   = UInt(11 bits)
+  val phtIndex   = UInt(m68k040.Global.PHT_IDX_W bits)
   // ── Branch-prediction SIDE-CHANNEL tag (see Global.BR_PRED_TABLE_DEPTH) ─────
   // Names the DecodeStage table entry holding this packet's {predTaken, predTarget,
   // phtValid, phtIndex}. The four fields above stay on the PACKET (only two packet

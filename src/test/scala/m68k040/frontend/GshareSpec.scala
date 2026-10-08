@@ -19,8 +19,10 @@ import org.scalatest.funsuite.AnyFunSuite
 class GshareSpec extends AnyFunSuite {
 
   val ghrBits = 16
-  val phtEntries = 2048
-  val idxBits = 11
+  // Width follows CPU_GSHARE_ENTRIES (Global.PHT_IDX_W); 2048/11 by default.
+  val idxBits = m68k040.Global.PHT_IDX_W
+  val phtEntries = 1 << idxBits
+  val idxHistBits = scala.math.min(ghrBits, idxBits)
 
   /** Scala model of the plugin's fold (XOR idxBits-wide chunks of a width-w value). */
   def fold(v: Long, w: Int): Int = {
@@ -36,7 +38,7 @@ class GshareSpec extends AnyFunSuite {
     acc & ((1 << idxBits) - 1)
   }
   /** index(pc) = fold(pc[31:1]) ^ fold(ghr). */
-  def idxOf(pc: Long, ghr: Int): Int = fold((pc >>> 1) & 0x7FFFFFFFL, 31) ^ fold(ghr.toLong, ghrBits)
+  def idxOf(pc: Long, ghr: Int): Int = fold((pc >>> 1) & 0x7FFFFFFFL, 31) ^ fold(ghr.toLong & ((1L << idxHistBits) - 1), idxHistBits)
 
   /** Wiring plugin: hoists the GsharePlugin's plain-wire ports + the (plugin-owned)
     * update Flow to top IO inside a Fiber build (the BtbPlugin convention). The test
@@ -50,7 +52,7 @@ class GshareSpec extends AnyFunSuite {
       val sV     = in Bool ();        val sD = in Bool ()
       val inval  = in Bool ()
       val uV     = in Bool ()
-      val uIdx   = in UInt (11 bits); val uTaken = in Bool ()
+      val uIdx   = in UInt (idxBits bits); val uTaken = in Bool ()
       val wV     = in Bool ();        val wPc = in UInt (32 bits)
       val wSlot  = in UInt (2 bits);  val wSeq = in UInt (8 bits)
       val fRep   = in Bool ()
@@ -69,27 +71,30 @@ class GshareSpec extends AnyFunSuite {
       win.windowCmd.payload.token.ringSlot := wSlot
       win.windowCmd.payload.token.seq := wSeq
       val oTaken = out(Bool());        oTaken := g.logic.phtTaken0
-      val oIndex = out(UInt(11 bits)); oIndex := g.logic.phtIndex0
+      val oIndex = out(UInt(idxBits bits)); oIndex := g.logic.phtIndex0
+      val qPc1   = in UInt (32 bits);  g.logic.queryPc1 := qPc1
+      val oTaken1 = out(Bool());        oTaken1 := g.logic.phtTaken1
+      val oIndex1 = out(UInt(idxBits bits)); oIndex1 := g.logic.phtIndex1
       val oGhr   = out(UInt(16 bits)); oGhr   := g.logic.ghr
       val oGhrArch = out(UInt(16 bits)); oGhrArch := g.logic.ghrArch
       val wRspV = out(Bool()); wRspV := win.windowRsp.valid
       val wRspSlot = out(UInt(2 bits)); wRspSlot := win.windowRsp.payload.token.ringSlot
       val wRspSeq = out(UInt(8 bits)); wRspSeq := win.windowRsp.payload.token.seq
       val wRspTaken = out(Vec(Bool(), 4)); wRspTaken := win.windowRsp.payload.taken
-      val wRspIdx = out(Vec(UInt(11 bits), 4)); wRspIdx := win.windowRsp.payload.phtIdx
+      val wRspIdx = out(Vec(UInt(idxBits bits), 4)); wRspIdx := win.windowRsp.payload.phtIdx
     }
   }
 
-  class GshareDut extends Component {
+  class GshareDut(interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
-    val gsh  = new GsharePlugin
+    val gsh  = new GsharePlugin(interleaved = interleaved)
     val wire = new GshareWirePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](new ParamPlugin(M68kParams()), gsh, wire)) }
   }
 
   def init(dut: GshareDut, cd: ClockDomain): Unit = {
-    dut.wire.logic.qPc0 #= 0; dut.wire.logic.qV0 #= false
+    dut.wire.logic.qPc0 #= 0; dut.wire.logic.qV0 #= false; dut.wire.logic.qPc1 #= 0
     dut.wire.logic.sV #= false; dut.wire.logic.sD #= false; dut.wire.logic.inval #= false
     dut.wire.logic.uV #= false; dut.wire.logic.uIdx #= 0; dut.wire.logic.uTaken #= false
     dut.wire.logic.wV #= false; dut.wire.logic.wPc #= 0
@@ -125,8 +130,8 @@ class GshareSpec extends AnyFunSuite {
     cd.waitSampling()
   }
 
-  test("index = fold(pc) XOR fold(ghr); GHR starts 0", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"index = fold(pc) XOR fold(ghr); GHR starts 0 [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       assert(dut.wire.logic.oGhr.toInt == 0, "GHR init 0")
       for (pc <- Seq(0x1000L, 0x2046L, 0x12348L, 0xABCDEL)) {
@@ -136,8 +141,8 @@ class GshareSpec extends AnyFunSuite {
     }
   }
 
-  test("GHR shift folds into the index", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"GHR shift folds into the index [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       // Shift in 1,0,1 -> GHR = 0b101 = 5.
       shift(dut, cd, true); shift(dut, cd, false); shift(dut, cd, true)
@@ -148,8 +153,8 @@ class GshareSpec extends AnyFunSuite {
     }
   }
 
-  test("counter init weakly-taken (2); 2->1 flips not-taken; saturates at 0 and 3", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"counter init weakly-taken (2); 2->1 flips not-taken; saturates at 0 and 3 [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       val pc = 0x5000L
       val idx = idxOf(pc, 0)
@@ -169,8 +174,8 @@ class GshareSpec extends AnyFunSuite {
     }
   }
 
-  test("learns the alternation: two GHR contexts at one PC converge to opposite dirs", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"learns the alternation: two GHR contexts at one PC converge to opposite dirs [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       // A single branch PC whose outcome alternates: after a TAKEN iteration (GHR low
       // bit 1) the next is NOT-taken; after a NOT-taken iteration (GHR low bit 0) the
@@ -197,8 +202,8 @@ class GshareSpec extends AnyFunSuite {
     }
   }
 
-  test("registered four-way window lookup keeps cmd+1 token and changing-PC association", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"registered four-way window lookup keeps cmd+1 token and changing-PC association [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       val w = dut.wire.logic
 
@@ -251,8 +256,8 @@ class GshareSpec extends AnyFunSuite {
     cd.waitSampling()
   }
 
-  test("commit flush REPAIRS the whole GHR from the architectural history", VerilatorTest) {
-    SimConfig.withVerilator.compile(new GshareDut).doSim { dut =>
+  for (il <- Seq(false, true)) test(s"commit flush REPAIRS the whole GHR from the architectural history [interleaved=$il]", VerilatorTest) {
+    SimConfig.withVerilator.compile(new GshareDut(il)).doSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
       // Two correct-path conditionals: the fetch side shifts the PREDICTED bit, the
       // retire side (the update Flow the ROB drives) shifts the RESOLVED bit. Same
@@ -285,5 +290,69 @@ class GshareSpec extends AnyFunSuite {
       assert(dut.wire.logic.oGhr.toInt == 0 && dut.wire.logic.oGhrArch.toInt == 0,
         "invalidateAll must clear the speculative AND the architectural GHR")
     }
+  }
+  /** Step-A equivalence: the interleaved (row-of-four) PHT must give BIT-IDENTICAL
+    * predictions to the flat 2-bit PHT for the same history/PC. Both organisations run
+    * the SAME seeded random stimulus (decode queries on both ports, 8-aligned window
+    * lookups, retire-time training incl. back-to-back same-row updates, GHR shifts,
+    * flush repairs, invalidates); every cycle's outputs are recorded and compared, and
+    * the whole table is swept through the decode port at the end. */
+  test("interleaved PHT is bit-identical to the flat PHT (random stimulus + full sweep)", VerilatorTest) {
+    def run(il: Boolean): Seq[String] = {
+      val trace = scala.collection.mutable.ArrayBuffer[String]()
+      SimConfig.withVerilator.compile(new GshareDut(il)).doSim(seed = 1) { dut =>
+        val cd = dut.clockDomain; cd.forkStimulus(10); init(dut, cd)
+        val w = dut.wire.logic
+        val rnd = new scala.util.Random(0x6511)
+        val pcs = (0 until 64).map(_ => 0x10000L + 2L * rnd.nextInt(0x800))
+        val recentIdx = scala.collection.mutable.ArrayBuffer[Int](0)
+        for (cyc <- 0 until 20000) {
+          w.qPc0 #= pcs(rnd.nextInt(pcs.size)); w.qV0 #= true
+          w.qPc1 #= pcs(rnd.nextInt(pcs.size))
+          w.sV #= rnd.nextInt(3) == 0; w.sD #= rnd.nextBoolean()
+          w.fRep #= rnd.nextInt(97) == 0
+          w.inval #= rnd.nextInt(3001) == 0
+          val doUpd = rnd.nextInt(2) == 0
+          w.uV #= doUpd
+          // Train mostly indices that were actually looked up (incl. window lanes of
+          // one row) so counters move across their whole range.
+          w.uIdx #= (if (rnd.nextInt(4) == 0) rnd.nextInt(phtEntries) else recentIdx(rnd.nextInt(recentIdx.size)))
+          w.uTaken #= rnd.nextInt(3) != 0
+          w.wV #= rnd.nextBoolean(); w.wPc #= (pcs(rnd.nextInt(pcs.size)) & ~7L)
+          w.wSlot #= rnd.nextInt(3); w.wSeq #= rnd.nextInt(256)
+          sleep(1)
+          val line = s"$cyc t0=${w.oTaken.toBoolean} i0=${w.oIndex.toInt} t1=${w.oTaken1.toBoolean} " +
+            s"i1=${w.oIndex1.toInt} ghr=${w.oGhr.toInt} arch=${w.oGhrArch.toInt} wv=${w.wRspV.toBoolean} " +
+            s"wt=${(0 until 4).map(k => if (w.wRspTaken(k).toBoolean) 1 else 0).mkString} " +
+            s"wi=${(0 until 4).map(k => w.wRspIdx(k).toInt).mkString(",")}"
+          trace += line
+          recentIdx += w.oIndex.toInt; recentIdx += w.oIndex1.toInt
+          if (w.wRspV.toBoolean) (0 until 4).foreach(k => recentIdx += w.wRspIdx(k).toInt)
+          if (recentIdx.size > 256) recentIdx.remove(0, recentIdx.size - 256)
+          cd.waitSampling()
+        }
+        // Full-table sweep through the decode port with a frozen history.
+        w.sV #= false; w.uV #= false; w.wV #= false; w.fRep #= false; w.inval #= false
+        cd.waitSampling(); cd.waitSampling(); cd.waitSampling()
+        val sweep = new StringBuilder
+        for (k <- 0 until phtEntries) {
+          w.qPc0 #= 2L * k; sleep(1)
+          sweep.append(if (w.oTaken.toBoolean) '1' else '0')
+          if (k % 64 == 63) { trace += s"sweep ${k / 64} ${sweep.toString}"; sweep.clear() }
+        }
+        trace += s"windows=${trace.count(_.contains("wv=true"))}"
+      }
+      trace.toSeq
+    }
+    val flat = run(false)
+    val inter = run(true)
+    assert(flat.size == inter.size)
+    val firstDiff = flat.indices.find(i => flat(i) != inter(i))
+    assert(firstDiff.isEmpty, s"divergence: flat='${firstDiff.map(flat).getOrElse("")}' " +
+      s"interleaved='${firstDiff.map(inter).getOrElse("")}'")
+    // Non-vacuous: the counters must actually have been trained both ways.
+    val sweepBits = flat.filter(_.startsWith("sweep")).map(_.split(" ")(2)).mkString
+    assert(sweepBits.contains('0') && sweepBits.contains('1'), "sweep saw only one direction")
+    println(s"GSHARE_EQUIV cycles=20000 entries=$phtEntries ${flat.last} sweepNotTaken=${sweepBits.count(_ == '0')}")
   }
 }

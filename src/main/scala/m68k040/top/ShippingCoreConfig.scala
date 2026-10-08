@@ -636,4 +636,26 @@ object ShippingCoreConfig {
     * walker (and the D-cache port) sooner for the next miss.
     * OFF pending measurement; `CPU_WALK_ABORT_ON_FLUSH=1`. */
   val walkAbortOnFlush: Boolean = envFlag("CPU_WALK_ABORT_ON_FLUSH", true)
+
+  /** gshare PHT organisation (docs/design/10-review.md §1 item 5, §4.5, §5.3).
+    *
+    * `CPU_GSHARE_INTERLEAVED=1`: store the PHT as `entries/4` rows of four 2-bit counters
+    * (row = idx[hi:2], lane = idx[1:0]). The fetch-window lookup's four indices differ
+    * ONLY in idx[1:0] (windowPc is 8-aligned and `fold` maps pc[2:1] straight to idx[1:0]),
+    * so ONE row read returns all four counters: 7 async read ports (2 decode + 4 window
+    * + 1 update RMW) on a 2048x2 LUTRAM become 4 (2 decode + 1 window + 1 update) on a
+    * 512x8 one. Predictions are bit-identical (GshareInterleaveEquivalenceSpec).
+    * Default ON (gated 2026-10-08); OFF = the old 7-port organisation; echoed in `SHIPPING_CONFIG`. */
+  val gshareInterleaved: Boolean = envFlag("CPU_GSHARE_INTERLEAVED", true)
+
+  /** gshare PHT depth (`CPU_GSHARE_ENTRIES`, 2048/4096/8192/16384). The PHT index width
+    * (log2 of this) is carried by bundles elaborated outside a plugin host
+    * (`DecodePacket`, `BranchPredRec`, `RenamedUop`, `BranchCompletion`, the FTQ entry),
+    * so it is single-sourced here -> `Global.PHT_ENTRIES_DEFAULT` -> `M68kParams.gshareEntries`
+    * (ParamPlugin requires they agree). The history used in the index is
+    * min(GHR bits = 16, idx bits), so a deeper table also uses more history.
+    * Default 2048 = the old frozen 11-bit index; echoed in `SHIPPING_CONFIG`. */
+  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 2048, 2048, 16384)
+  require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
+    s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
 }

@@ -180,7 +180,7 @@ case class RenamedUop() extends Bundle {
   // ROB trains pht[phtIndex] toward the resolved direction at retire). Threaded from
   // decode -> here -> IqContext -> branch EU -> BranchCompletion -> ROB.
   val phtValid     = Bool()
-  val phtIndex     = UInt(11 bits)
+  val phtIndex     = UInt(m68k040.Global.PHT_IDX_W bits)
   // Per-branch RAS recovery snapshot (`CPU_RAS_BRANCH_SNAPSHOT`): the RAS pointer /
   // occupancy / top-of-stack AFTER this uop's fetch group. Threaded decode -> here -> the
   // ROB's alloc-time `rasSnapMem` (the only reader). Inert (valid=False) when the option

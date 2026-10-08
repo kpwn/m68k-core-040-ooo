@@ -66,7 +66,7 @@ class FtqCapacitySpec extends AnyFunSuite {
   class GshareUpdateDriver extends FiberPlugin {
     val logic = during build new Area {
       val valid = in Bool()
-      val index = in UInt(11 bits)
+      val index = in UInt(m68k040.Global.PHT_IDX_W bits)
       val taken = in Bool()
       val update = host[GshareUpdateService].gshareUpdate
       update.valid := valid

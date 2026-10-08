@@ -28,7 +28,7 @@ case class FetchTargetQueueEntry() extends Bundle {
   val brPc     = UInt(32 bits)
   val brLen    = UInt(4 bits)
   val target   = UInt(32 bits)
-  val phtIdx   = UInt(11 bits)
+  val phtIdx   = UInt(m68k040.Global.PHT_IDX_W bits)
   val isCond   = Bool()
 }
 
@@ -150,7 +150,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val ftbRsp = if (enableFetchDirected) host[FtbLookupService].lookupRsp else Flow(FtbLookupRsp())
     val ftbClear = if (enableFetchDirected) host[FtbLookupService].clearOne else Flow(UInt(32 bits))
     val gshareWindowCmd = if (enableFetchDirected) host[GshareWindowService].windowCmd else Flow(FtbLookupCmd())
-    val gshareWindowRsp = if (enableFetchDirected) host[GshareWindowService].windowRsp else Flow(GshareWindowRsp(11))
+    val gshareWindowRsp = if (enableFetchDirected) host[GshareWindowService].windowRsp else Flow(GshareWindowRsp(m68k040.Global.PHT_IDX_W))
     if (!enableFetchDirected) {
       ftbRsp.valid := False
       ftbRsp.payload.assignFromBits(B(0, ftbRsp.payload.getBitsWidth bits))
@@ -289,14 +289,14 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     //   gsPhtIndex0/1 : the 11-bit folded-XOR index (INPUT, carried down).
     //   gsShiftValid/gsShiftDir : the GHR shift (OUTPUT, driven below).
     val gsBtbHit0   = Bool(); val gsBtbType0 = UInt(2 bits)
-    val gsPhtTaken0 = Bool(); val gsPhtIndex0 = UInt(11 bits)
-    val gsPhtTaken1 = Bool(); val gsPhtIndex1 = UInt(11 bits)
+    val gsPhtTaken0 = Bool(); val gsPhtIndex0 = UInt(m68k040.Global.PHT_IDX_W bits)
+    val gsPhtTaken1 = Bool(); val gsPhtIndex1 = UInt(m68k040.Global.PHT_IDX_W bits)
     gsBtbHit0.allowOverride;   gsBtbHit0   := False
     gsBtbType0.allowOverride;  gsBtbType0  := U(0, 2 bits)
     gsPhtTaken0.allowOverride; gsPhtTaken0 := False
-    gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, 11 bits)
+    gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, m68k040.Global.PHT_IDX_W bits)
     gsPhtTaken1.allowOverride; gsPhtTaken1 := False
-    gsPhtIndex1.allowOverride; gsPhtIndex1 := U(0, 11 bits)
+    gsPhtIndex1.allowOverride; gsPhtIndex1 := U(0, m68k040.Global.PHT_IDX_W bits)
     // GHR shift outputs (driven below on the emitted predicted conditional).
     val gsShiftValid = Bool()
     val gsShiftDir   = Bool()
@@ -1576,13 +1576,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       feed.payload(0).predTaken  := False
       feed.payload(0).predTarget := U(0, 32 bits)
       feed.payload(0).phtValid   := False
-      feed.payload(0).phtIndex   := U(0, 11 bits)
+      feed.payload(0).phtIndex   := U(0, m68k040.Global.PHT_IDX_W bits)
       feed.payload(1).valid     := False
       feed.payload(1).fault     := False
       feed.payload(1).predTaken  := False
       feed.payload(1).predTarget := U(0, 32 bits)
       feed.payload(1).phtValid   := False
-      feed.payload(1).phtIndex   := U(0, 11 bits)
+      feed.payload(1).phtIndex   := U(0, m68k040.Global.PHT_IDX_W bits)
     }
     // Emit-once: latch faultEmitted when the faulted packet fires.
     when(emittingFaultPacket && feed.fire) { faultEmitted := True }
