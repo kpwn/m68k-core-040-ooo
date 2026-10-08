@@ -294,9 +294,11 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     branchEu.issue << iq.issue(2)
     rob.logic.branchCompletion.valid   := branchEu.completion.valid
     rob.logic.branchCompletion.payload := branchEu.completion.payload
-    // Execute-time conditional fault (TRAPV vector 7) -> ROB euFault (generalized).
-    rob.logic.euFaultCompletion.valid   := branchEu.trapvFault.valid
-    rob.logic.euFaultCompletion.payload := branchEu.trapvFault.payload
+    // Execute-time conditional fault (TRAPV/TRAPcc vector 7, odd target vector 3) -> the
+    // ROB's OWN branch-EU fault port. NOT shared with DivEu's euFault: both can fire in one
+    // cycle, and the old shared drive silently dropped the branch EU's fault.
+    rob.logic.brFaultCompletion.valid   := branchEu.trapvFault.valid
+    rob.logic.brFaultCompletion.payload := branchEu.trapvFault.payload
     rob.logic.completion(0).valid   := eu0.completion.valid
     rob.logic.completion(0).payload := eu0.completion.payload
     rob.logic.completion(1).valid   := eu1.completion.valid
@@ -396,15 +398,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     iq.cplxFpccWakeup.payload := divEu.fpccWakeup.payload
     rob.logic.fpFaultCompletion.valid   := divEu.fpFault.valid
     rob.logic.fpFaultCompletion.payload := divEu.fpFault.payload
-    // DivEu euFault shares the generalized ROB euFaultCompletion with the branch EU's
-    // TRAPV. They are mutually exclusive in practice (different EUs, single-outstanding),
-    // but to be safe the branch EU's fault takes priority via last-driver: drive the
-    // DivEu fault FIRST, then the branch EU below would override — instead OR them with
-    // an explicit mux (the branch EU's drive above already set it; OR the DivEu in).
-    when(divEu.euFault.valid) {
-      rob.logic.euFaultCompletion.valid   := True
-      rob.logic.euFaultCompletion.payload := divEu.euFault.payload
-    }
+    // DivEu euFault (CHK/CHK2 vector 6, DIV0 vector 5) owns `euFaultCompletion`; the
+    // branch EU has its own port (above), so a same-cycle pair is age-arbitrated in the ROB.
+    rob.logic.euFaultCompletion.valid   := divEu.euFault.valid
+    rob.logic.euFaultCompletion.payload := divEu.euFault.payload
     wireCcr(3, divEu.logic.ccrObs)
     // The IQ dynamic wakeup is keyed by the producer pdst. The LS EU drives a
     // dedicated `wakeup` Flow from its REGISTERED completion stage (valid only for a

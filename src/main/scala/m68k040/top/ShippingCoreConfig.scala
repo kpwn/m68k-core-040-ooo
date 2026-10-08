@@ -578,4 +578,24 @@ object ShippingCoreConfig {
     * Note the INVERTED sense of the variable: it is a DISABLE, kept that way so every
     * existing build and testbench that does not set it is bit-identical to before. */
   val icachePrefetch: Boolean = !envFlag("DBG_IC_PREFETCH_DISABLE", false)
+
+  /** ROB: drive `flushing` (-> `rc.flushPort`, `headReady`, the ROB pointer/count resets
+    * and every other in-ROB `flushing` use) from the REGISTERED `backendSquash` flop instead
+    * of the combinational `doFlushReg || excSquash` OR. `backendSquash` is an exact register
+    * copy of that OR (same D inputs, both RegInit False; sim-asserted in RobPlugin), so the
+    * function is unchanged on every cycle; one LUT level comes off the net that resets the
+    * RATs, freelists and ROB pointers. The external test `flush` port is still ORed in, so
+    * harnesses that drive it are unaffected; the shipping top ties it to False, where the
+    * OR folds away and `flushing` IS the flop. Review §5.2.
+    * OFF pending measurement; `CPU_FLUSH_FROM_SQUASH=1`; echoed in `SHIPPING_CONFIG`. */
+  val flushFromSquash: Boolean = envFlag("CPU_FLUSH_FROM_SQUASH", false)
+
+  /** Cold exception-FSM PRF writes share an existing physical write port instead of owning
+    * one: the ROB's FMOVEM An write joins BranchEu's int write port (`BranchEuPlugin.
+    * IntWbKey`, like the exception A7 write), and its FMOVEM FP write joins DivEu's FP write
+    * port (`DivEuPlugin.FpWbKey`). Int PRF 6 -> 5 physical write ports, FP PRF 2 -> 1.
+    * Exclusivity is sim-asserted by RegFilePlugin (shared-key groups) and argued in
+    * RobPlugin. Review §5.1.
+    * OFF pending measurement; `CPU_COLD_WB_SHARE=1`; echoed in `SHIPPING_CONFIG`. */
+  val coldWbShare: Boolean = envFlag("CPU_COLD_WB_SHARE", false)
 }

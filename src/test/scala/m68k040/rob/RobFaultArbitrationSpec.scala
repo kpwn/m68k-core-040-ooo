@@ -95,6 +95,9 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
     l.fpFaultCompletion.valid #= false
     l.fpFaultCompletion.payload.robId #= 0; l.fpFaultCompletion.payload.vector #= 0
     l.fpFaultCompletion.payload.faultAddr #= 0
+    l.brFaultCompletion.valid #= false
+    l.brFaultCompletion.payload.robId #= 0; l.brFaultCompletion.payload.vector #= 0
+    l.brFaultCompletion.payload.faultAddr #= 0
   }
 
   private def driveLs(dut: RobDut, robId: Int, addr: Long, wr: Boolean = true,
@@ -118,6 +121,12 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
   }
   private def driveFp(dut: RobDut, robId: Int, vector: Int, addr: Long): Unit = {
     val p = dut.rob.logic.fpFaultCompletion
+    p.valid #= true; p.payload.robId #= robId; p.payload.vector #= vector
+    p.payload.faultAddr #= BigInt(addr)
+  }
+
+  private def driveBr(dut: RobDut, robId: Int, vector: Int, addr: Long): Unit = {
+    val p = dut.rob.logic.brFaultCompletion
     p.valid #= true; p.payload.robId #= robId; p.payload.vector #= vector
     p.payload.faultAddr #= BigInt(addr)
   }
@@ -208,6 +217,41 @@ class RobFaultArbitrationSpec extends AnyFunSuite {
           f"faultAddr must be the OLDER eu fault's 0x1111, got 0x${dut.rob.logic.exceptionFaultAddr.toLong}%x")
         assert(dut.rob.logic.exceptionPc.toLong == 0x504L,
           f"excPc must be robId 1's pc 0x504, got 0x${dut.rob.logic.exceptionPc.toLong}%x")
+      }
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // 1b. Branch-EU vs CPLX-EU (review 10 §3-1): they used to SHARE one port and the
+  //     CPLX drive won by last-assignment, dropping an older TRAPV. Now two ports,
+  //     age-arbitrated: in BOTH orders the older entry's fault must be delivered.
+  // ────────────────────────────────────────────────────────────────────────────
+  for (brOlder <- Seq(true, false))
+  test(s"branch-EU and CPLX-EU faults in the same cycle: the OLDER wins (branch ${if (brOlder) "older" else "younger"})") {
+    M68kSim().compile(new RobDut).doSim { dut =>
+      val cd = dut.clockDomain; cd.forkStimulus(10)
+      init(dut, cd)
+      for (i <- 0 until 4) allocOne(dut, cd, 0x500L + 4 * i)
+      val (brId, euId) = if (brOlder) (1, 2) else (2, 1)
+      driveBr(dut, robId = brId, vector = 7, addr = 0x7777L)   // TRAPV
+      driveEu(dut, robId = euId, vector = 6, addr = 0x6666L)   // CHK
+      cd.waitSampling()
+      idleFaults(dut)
+      cd.waitSampling(); cd.waitSampling()
+      assert(dut.rob.logic.faultedStore(brId).toBoolean && dut.rob.logic.faultedStore(euId).toBoolean,
+        "both faulting entries carry the retire-blocking mark")
+      for (id <- Seq(0, 1, 2)) {
+        dut.rob.logic.completion(0).valid #= true
+        dut.rob.logic.completion(0).payload #= id
+        cd.waitSampling()
+      }
+      dut.rob.logic.completion(0).valid #= false
+      val (wantVec, wantAddr) = if (brOlder) (7, 0x7777L) else (6, 0x6666L)
+      expectException(dut, cd, "br/eu collision") {
+        assert(dut.rob.logic.exceptionVector.toInt == wantVec,
+          s"vector must be the OLDER fault's $wantVec, got ${dut.rob.logic.exceptionVector.toInt}")
+        assert(dut.rob.logic.exceptionFaultAddr.toLong == wantAddr, "faultAddr of the older fault")
+        assert(dut.rob.logic.exceptionPc.toLong == 0x504L, "excPc must be robId 1's pc")
       }
     }
   }

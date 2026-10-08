@@ -145,6 +145,10 @@ object FpVector {
 }
 
 object DivEuPlugin {
+  /** Sharing key for DivEu's FP-PRF write port. Alone in its group it is exactly the old
+    * private port; with `ShippingCoreConfig.coldWbShare` the ROB's cold FMOVEM FP write
+    * joins it at lower priority (one physical FP write port instead of two). */
+  val FpWbKey = "divEuFpWb"
   /** Task 14c: connect the CPLX EU's FP lane to the live FP control state.
     *
     * Factored out because FOUR different top levels build the same DivEu + FpuControlPlugin
@@ -315,7 +319,7 @@ class DivEuPlugin extends FiberPlugin with DivEuService {
     // would be pure area for an unreachable case.
     fpRdA = fprf.newRead(forceNoBypass = true)   // FPn (the destination, read back for dyadic ops)
     fpRdB = fprf.newRead(forceNoBypass = true)   // FPm (fpSrcKind === FPREG only)
-    fpW   = fprf.newWrite(latency = 1)
+    fpW   = fprf.newWrite(latency = 1, sharingKey = DivEuPlugin.FpWbKey, priority = 1)
     fpccW = host[FpccRegFileService].newWrite(latency = 1)
     // ---- Task 9b: FMOVEM control-register LIST form, STORE direction ----
     // The design's FIRST FPCC *reader*. Deliberately `forceNoBypass = true`, for exactly
