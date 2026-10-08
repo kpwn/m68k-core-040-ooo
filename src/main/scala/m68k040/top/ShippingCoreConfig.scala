@@ -250,7 +250,7 @@ object ShippingCoreConfig {
     * snapshot (DecodeStage side table -> `RenamedUop.rasSnap` -> ROB `rasSnapMem`), and a
     * Tier-1 mispredict restores the RAS to that branch's own post-fetch state instead of
     * the last ROB-drain checkpoint. DEFAULT OFF pending measurement; `=1` enables. */
-  val rasBranchSnapshot: Boolean = envFlag("CPU_RAS_BRANCH_SNAPSHOT", false)
+  val rasBranchSnapshot: Boolean = envFlag("CPU_RAS_BRANCH_SNAPSHOT", true)
   /** Front-end: COMPUTE a PC-relative unconditional branch's target from the
     * displacement already in the aligner slot, instead of only ever recalling one from
     * the BTB/FTB. See `FetchAlignPlugin.computeDirectTargets` for the mechanism and the
