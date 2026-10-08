@@ -733,7 +733,11 @@ object GenSocketTopVerilog {
             s"dcacheNbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} " +
             s"dcacheNbPreselectAr=${ShippingCoreConfig.dcacheNbPreselectAr} " +
             s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
-            s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage}")
+            s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
+            // TLB-miss cost chain (constructor DEFAULTS of LsEuPlugin / DtlbPlugin).
+            s"walkAgeLimit=${ShippingCoreConfig.walkAgeLimit} " +
+            s"dtlbHitUnderWalk=${ShippingCoreConfig.dtlbHitUnderWalk} " +
+            s"walkAbortOnFlush=${ShippingCoreConfig.walkAbortOnFlush}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

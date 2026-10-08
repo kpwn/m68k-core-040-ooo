@@ -35,7 +35,13 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
            * policy instead of the value latched at arming -- which is what let a CACR.DE
            * write land between a drain's re-read and its store. See
            * `WalkerDcacheClient.walkCmodePolicy` and `WalkDrainCacheModeSpec`. */
-                 latchDrainCmode: Boolean = true) extends FiberPlugin
+                 latchDrainCmode: Boolean = true,
+                 /** `ShippingCoreConfig.dtlbHitUnderWalk`: DETACH a walk whose owning
+                   * access is squashed so the DTLB answers hits while it finishes. */
+                 hitUnderWalk: Boolean = m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk,
+                 /** `ShippingCoreConfig.walkAbortOnFlush`: stop such a walk at the next
+                   * level boundary instead of running all three descriptor reads. */
+                 abortOnFlush: Boolean = m68k040.top.ShippingCoreConfig.walkAbortOnFlush) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -123,7 +129,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // evidence this register exists to preserve.
     val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
     tlb.io.dbgMultiHotClear := dbgMultiHotClear
-    val walker = new TableWalker()
+    val walker = new TableWalker(abortable = abortOnFlush)
 
     // ── Table-walk traffic now goes through the D-CACHE, not a private AXI master ──
     // The walker's descriptor reads are `_walkLoadCmd`/`_walkLoadRsp`; the deferred U/M
@@ -417,6 +423,16 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     val walkFlushPoison = RegInit(False)
     val walkUmPoison = RegInit(False)
     missPending.simPublic()
+    // `CPU_DTLB_HIT_UNDER_WALK`: the walk in the walker belongs to a SQUASHED access and
+    // owes nobody a response. `missPending` was cleared when it detached, so a younger
+    // request may already have been answered (or captured into `missReqReg`) while it
+    // runs; its `done` must therefore touch NOTHING -- not `missPending` (which may now
+    // be the next miss's), not the response slot, not the ATC, not the U/M queue.
+    // Cleared by the next `walker.io.start`, which by construction follows that `done`.
+    val walkDead: Bool = if (hitUnderWalk) RegInit(False) else null
+    if (hitUnderWalk) walkDead.simPublic()
+    /** `done` of a walk that still has an owner (flag OFF: exactly `walker.io.done`). */
+    def liveDone: Bool = if (hitUnderWalk) walker.io.done && !walkDead else walker.io.done
 
     _rsp.valid   := rspValid && !atcFlush
     _rsp.payload := rspPayload
@@ -596,7 +612,23 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     walker.io.req.isWrite := missReqReg.write
     walker.io.req.isSuper := missReqReg.sup
     walker.io.req.is8K    := missReqReg.is8K
-    walker.io.start       := missReqReg.valid && !umQueueFull && !atcFlush
+    // Owner-squash trigger for the two TLB-miss-cost-chain flags: a backend flush
+    // (`umFlush` = `doFlush`, which empties the whole in-order LS pipe including P2T),
+    // or the commit-time exception sequencer holding the port (`umAccessPreCommitted` =
+    // `excActive`, during which the LS pipe is held empty too). A walk or captured miss
+    // marked `preCommitted` belongs to the sequencer itself and is never squashed.
+    // Both inputs are flops at their producers; this is cold control, off the lookup.
+    // (Elaborated only under a flag, so the OFF netlist is the base one, name for name.)
+    val squashEn = hitUnderWalk || abortOnFlush
+    val ownerSquash: Bool = if (squashEn) umFlush || umAccessPreCommitted else null
+    val squashPreLaunch: Bool =
+      if (squashEn) ownerSquash && missReqReg.valid && !missReqReg.preCommitted else null
+    walker.io.start       := (if (hitUnderWalk)
+                                missReqReg.valid && !umQueueFull && !atcFlush &&
+                                !walker.io.busy && !squashPreLaunch
+                              else if (abortOnFlush)
+                                missReqReg.valid && !umQueueFull && !atcFlush && !squashPreLaunch
+                              else missReqReg.valid && !umQueueFull && !atcFlush)
     when(walker.io.start) { missReqReg.valid := False }
 
     // VPN a walk is servicing: latched at walk-LAUNCH (the registered-trigger cycle)
@@ -641,7 +673,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // very bit), latched at launch alongside the VPN for the same reason.
     tlb.io.fillSup   := walkSup
     tlb.io.fillEntry := fe
-    when(walker.io.done) {
+    when(liveDone) {
       missPending := False
       // Payload written unconditionally (enable = `walker.io.done`, a walker flop);
       // only the VALID bit carries the poison/flush gates. See the `_req.fire` block.
@@ -727,6 +759,46 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // must never be allocated after the one-cycle flush pulse has passed.
     when(umFlush && missPending) { walkUmPoison := True }
 
+    // ── TLB-MISS COST CHAIN: a squashed owner releases the DTLB (Fable review §2.3) ──
+    // Today a walk started by a wrong-path load runs all three descriptor reads and
+    // holds `missPending` -- and with it `_req.ready` -- until it finishes, so the
+    // correct path's first translation waits for a walk nobody wants.
+    //  * PRE-LAUNCH (`missReqReg.valid`): withdraw the captured miss, exactly as the
+    //    `atcFlush` arm above does; `walker.io.start` is held off in the same cycle.
+    //  * LAUNCHED: with `hitUnderWalk` the walk DETACHES (`walkDead`, `missPending`
+    //    cleared now); otherwise it is poisoned like an ATC-flushed walk, so its
+    //    response, fill and U/M write are dropped and `missPending` clears at `done`.
+    //    With `abortOnFlush` the walker is additionally told to stop at the next level.
+    // `_req.ready` is untouched: it still reads only `missPending`/`rspValid`/flops.
+    if (squashEn) {
+      val squashLaunched = ownerSquash && missPending && !missReqReg.valid && !walkPreCommitted
+      squashLaunched.simPublic()
+      when(squashPreLaunch) {
+        missReqReg.valid := False
+        missPending      := False
+      }
+      when(squashLaunched) {
+        if (hitUnderWalk) {
+          missPending := False
+          walkDead    := True
+        } else {
+          walkFlushPoison := True
+        }
+      }
+      if (hitUnderWalk) when(walker.io.start) { walkDead := False }
+      if (abortOnFlush) walker.io.abort := squashLaunched
+      // Sim-only event counters for the evidence specs (pruned from every netlist).
+      GenerationFlags.simulation {
+        val dbgSquashLaunched = Reg(UInt(32 bits)) init 0
+        val dbgSquashPreLaunch = Reg(UInt(32 bits)) init 0
+        when(squashLaunched && !RegNext(squashLaunched, init = False)) {
+          dbgSquashLaunched := dbgSquashLaunched + 1
+        }
+        when(squashPreLaunch) { dbgSquashPreLaunch := dbgSquashPreLaunch + 1 }
+        dbgSquashLaunched.simPublic(); dbgSquashPreLaunch.simPublic()
+      }
+    }
+
     // ---- deferred U/M descriptor-write queue (speculative; drained at commit) ----
     // A non-faulting walk that needs to set U (and M on a write) pushes {robId, addr,
     // newByte}; the entry drains at the triggering instruction's commit (RMW the
@@ -744,7 +816,7 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // descriptor addresses, so it was dead under any non-identity map and could not be
     // made to fire correctly without deadlocking. UmWriteQueue.scala carries the full
     // argument and the monotonicity tripwire that replaces it.)
-    umq.io.alloc.valid          := walker.io.done && walker.io.rsp.umWrite.valid &&
+    umq.io.alloc.valid          := liveDone && walker.io.rsp.umWrite.valid &&
                                   !walker.io.rsp.fault && !walkUmPoison &&
                                   !walkFlushPoison && !atcFlush
     umq.io.alloc.payload.robId  := walkRobId
