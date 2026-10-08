@@ -360,6 +360,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** Experimental one-beat response bypass for the legacy refill path. */
                    val directRefillResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheDirectRefillResponse,
                    val earlyProbeLineForward: Boolean = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
+                   /** Registered probe-line forward only: also veto the forward on a SAME-CYCLE
+                     * matching probe cancel / inhibited resolve. Both ports are driven from the
+                     * LS EU's completion arbitration and P2T ready chain, so the veto puts that
+                     * whole cone in front of `loadCmd.ready` and the read-port address. False
+                     * under `ShippingCoreConfig.lsP3Launch` (see `lineForwardVec`). */
+                   val lineForwardLiveGuards: Boolean = !m68k040.top.ShippingCoreConfig.lsP3Launch,
                    val nbEarlyResponse: Boolean = m68k040.top.ShippingCoreConfig.dcacheNbEarlyResponse,
                    /** Capacity in KiB (8 or 16), `ShippingCoreConfig.dcacheKB`. Only the set
                      * count changes (128 -> 256); 4 ways, 16-byte sectors and VIPT safety
@@ -1553,6 +1559,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // data is copied to the per-slot earlyProbeData/readies registers. Only a
     // still-valid, not-yet-ready slot with the exact command identity may use
     // that registered result; misses and all hazards retain the old wait.
+    // `lineForwardLiveGuards = false` drops the two same-cycle vetoes below. The ready-slot
+    // path (`earlyProbeMatchVec`) has never had them: a consume that coincides with a
+    // cancel of the same entry is already resolved by `earlyProbeValidsNext`
+    // (consumeClr || cancelClr) and the IDLE consume block, and the forwarded data is the
+    // array line selected by the command's OWN physical tag (`probeLineTag === cmdTag`),
+    // gated by the command's own cacheable mode, stale/same-set-write checks -- a cancel or
+    // an inhibited resolve of the probe changes none of that. In the LS EU a token can
+    // be cancelled/resolved only while its load is at P2T (resolve, fault) or completes
+    // without launching (P4 forward / replay), never in the cycle its command is offered,
+    // so the vetoes only ever matter for a flush-aliased robId, whose response the ring
+    // poisons anyway.
     val lineForwardVec = if (earlyProbeLineForward) {
       val v = Vec(Bool(), earlyProbeDepth)
       val lineCanceled = loadProbeCancelPort.valid &&
@@ -1568,7 +1585,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
           (loadCmdPort.payload.cacheMode =/= CacheMode.INHIBITED) &&
           !loadCmdPort.payload.lineOnly && !probeLineNeedsLine &&
           !earlyProbeStale(i) && !earlyProbeSetWriteVec(i) &&
-          !ldS1Valid && !lineCanceled && !inhibResolve
+          !ldS1Valid &&
+          (if (lineForwardLiveGuards) !lineCanceled && !inhibResolve else True)
         v(i).simPublic()
       }
       v
