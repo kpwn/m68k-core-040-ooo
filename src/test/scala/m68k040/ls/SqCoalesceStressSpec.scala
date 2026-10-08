@@ -173,10 +173,10 @@ class SqCoalesceStressSpec extends AnyFunSuite {
       .compile(new Dut(coalesce, noFill, sqMut, dcMut, dropAckAt)))
 
   // ── address map ───────────────────────────────────────────────────────────────
-  // Cacheable window: 4 sets x 6 tags, 2 KiB apart (= one way of the 8 KiB, 4-way L1D),
+  // Cacheable window: 4 sets x 6 tags, one L1D way apart (2 KiB at 8 KiB, 4 KiB at 16 KiB),
   // so every set holds 1.5x its associativity and dirty evictions are constant.
   private val CBASE = 0x00010000L
-  private def cline(tag: Int, set: Int): Long = CBASE + tag * 0x800L + set * 16L
+  private def cline(tag: Int, set: Int): Long = CBASE + tag * m68k040.cache.DcacheTestGeometry.WayStride + set * 16L
   private val cLines: IndexedSeq[Long] = for (t <- 0 until 6; s <- 0 until 4) yield cline(t, s)
   private val IBASE = 0x00030000L                    // INHIBITED page: precise only
   private val iLines: IndexedSeq[Long] = (0 until 4).map(i => IBASE + 16L * i)

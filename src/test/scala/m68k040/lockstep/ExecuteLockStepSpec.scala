@@ -53,6 +53,11 @@ import org.scalatest.funsuite.AnyFunSuite
   */
 class ExecuteLockStepSpec extends AnyFunSuite {
 
+  /** One L1D way in bytes (`CPU_DCACHE_KB`: 0x800 at 8 KiB, 0x1000 at 16 KiB). Programs
+    * that evict a dirty copyback line before the backing-RAM check store to four
+    * addresses this far apart, which all land in the target's set. */
+  private val DcWayStride: Long = m68k040.cache.DcacheTestGeometry.WayStride
+
   // Perf: compile FullCoreDut ONCE and reuse across all ~394 tests in this suite via
   // repeated .doSim calls, instead of a fresh Verilator recompile per test (previously
   // every runLockStep/runIrqLockStep call did its own M68kSim().withVerilator.compile(...),
@@ -6105,7 +6110,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var forwards = 0
     // checkMem reads backing RAM, not dirty L1D. Four new same-set lines evict
     // the target from the four-way copyback cache before that external check.
-    val evict = (1 to 4).map(k => s"move.l #0,0x${(0x2000 + k * 0x800).toHexString}")
+    val evict = (1 to 4).map(k => s"move.l #0,0x${(0x2000 + k * DcWayStride).toHexString}")
     runLockStep("copyback-subword-forward", (setup ++ body.flatten ++ evict).mkString(" ; "),
       checkMem = Seq(0x2000L), checkSpan = 4,
       perCycle = dut => { if(dut.lsEu.logic.p4CompletionFire.toBoolean) forwards += 1 })
@@ -6127,7 +6132,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           s"move.$size %d0,15(%a0)", "seq %d2", "smi %d3",
           s"move.$size 15(%a0),%d1", "seq %d4", "smi %d5")
       val evict = for(line <- Seq(0x4600, 0x4610); n <- 1 to 4)
-        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+        yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
       // Eight cold eviction stores at DDR=70 can outlive the harness's fixed
       // 200-cycle memory-check delay. An architecturally ordered inhibited write
       // and read wait for that older traffic; do not mask a mismatch with a timer.
@@ -6161,7 +6166,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // Backing-memory comparison must observe dirty copyback lines, including
       // both halves of the line-crossing stores, after eviction.
       val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
-        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+        yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
       var captures = 0; var reservations = 0; var publications = 0; var completionHolds = 0
       var readyAdmissions = 0
       var wakeQualifiedCaptures = 0
@@ -6213,7 +6218,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           "move.l #0x10000,%d0", "divu.w %d1,%d0", s"move.$suffix %d0,(%$an)+",
           "seq %d5", s"move.l %$an,%d6", s"move.$suffix 0x${(0x3000 + offset).toHexString},%d4")
       val evict = for (line <- Seq(0x3000, 0x3010); n <- 1 to 4)
-        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+        yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
       var captures = 0; var reservations = 0; var publications = 0
       val program = setup ++ body.flatten ++ evict
       // A7 deliberately points into the checked data page. Stop explicitly:
@@ -6287,7 +6292,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val stores = (0 until 8).map(n => s"move.l %d2,0x${(0x3000 + 4 * n).toHexString}") ++
       Seq("move.l %d0,0x3020", "seq %d3", "move.l 0x3020,%d4")
     val evict = for(line <- Seq(0x3000, 0x3010, 0x3020); n <- 1 to 4)
-      yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
     var fullPending = 0; var fullCaptures = 0
     runLockStep("late-sq-full-fallback", (setup ++ stores ++ evict).mkString(" ; "),
       checkMem = (0 to 8).map(n => 0x3000L + 4 * n), checkSpan = 4,
@@ -6310,7 +6315,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val body = (0 until 12).flatMap(n => Seq("move.l #0x10000,%d0", "divu.w %d1,%d0",
       s"bne.w .LreserveSkip$n", "divu.w %d1,%d2", "move.l %d2,(%a0)",
       s".LreserveSkip$n: move.l (%a0),%d4"))
-    val evict = (1 to 4).map(n => s"move.l #0,0x${(0x3000 + n * 0x800).toHexString}")
+    val evict = (1 to 4).map(n => s"move.l #0,0x${(0x3000 + n * DcWayStride).toHexString}")
     var canceled = 0
     runLockStep("late-sq-reservation-squash", (setup ++ body ++ evict).mkString(" ; "),
       nInstr = setup.size + 12 * 4 + evict.size, checkMem = Seq(0x3000L), maxCycles = 30000,
@@ -6445,7 +6450,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val body = (1 until 8).map(n => s"move.l %d2,0x${(0x3000 + 4 * n).toHexString}") ++
       Seq("move.l %d3,0x3020", "move.l 0x3000,%d4", "move.l 0x3020,%d5")
     val evict = for(line <- Seq(0x3000, 0x3010, 0x3020); n <- 1 to 4)
-      yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+      yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
     var fullCaptures = 0; var otherSourceWaits = 0
     runLockStep("detached-store-full-progress", (setup ++ body ++ evict).mkString(" ; "),
       checkMem = (0 to 8).map(n => 0x3000L + 4 * n), checkSpan = 4, maxCycles = 30000,
@@ -6576,7 +6581,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
         "move.l #0x6000,(%a0)", "movea.l (%a0),%a0", // destination is the old EA base
         "move.l (%a0),%d0", "add.l %d1,%d0", "move.l %d0,0x5010")
       val evict = for(line <- Seq(0x3000, 0x3010, 0x5000, 0x5010, 0x6000); n <- 1 to 4)
-        yield s"move.l #0,0x${(line + n * 0x800).toHexString}"
+        yield s"move.l #0,0x${(line + n * DcWayStride).toHexString}"
       runLockStep(s"direct-long-load-$copyback", (setup ++ body.flatten ++ aliases ++ evict).mkString(" ; "),
         checkMem = Seq(0x3000L, 0x3010L, 0x5000L, 0x5010L, 0x6000L), checkSpan = 16,
         maxCycles = 100000, dcfg = m68k040.sim.L2Sweeps.l2DramSlow)
@@ -11595,6 +11600,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.icache.logic.invalidateAll #= true
       cd.waitSampling(); dut.icache.logic.invalidateAll #= false
       cd.waitSampling(80)
+      // The D-cache refuses every command until its runtime valid-clear sweep ends
+      // (one set per cycle: 128 cycles at 8 KiB, 256 at 16 KiB). Start the program only
+      // after it, so the wrong-path load's launch window does not depend on geometry.
+      cd.waitSamplingWhere(!dut.dcache.logic.resetSweepBusy.toBoolean)
 
       dut.rob.logic.exc.ss.isp  #= 0x00100000L
       dut.rob.logic.exc.ss.cacr #= 0x80008000L
@@ -11865,10 +11874,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l #0x8CF88000,-4(%sp) ; " +                          // the slot's OLDER generation
       // Evict the stack line WITHOUT cpusha (Musashi has no CPUSH handler and mis-sizes
       // it): the L1D is 4-way with a per-set round-robin victim (DcachePlugin `victim`),
-      // so four write-allocating stores into the SAME set (stride 0x800 = 128 sets x 16 B)
+      // so four write-allocating stores into the SAME set (stride = one way: 0x800 at 8 KiB, 0x1000 at 16 KiB)
       // deterministically push the dirty stack line out to DRAM, old image and all.
       (if (evictLine)
-         (1 to 4).map(k => f"move.l #0,0x${StackVa + k * 0x800L}%x ; ").mkString
+         (1 to 4).map(k => f"move.l #0,0x${StackVa + k * DcWayStride}%x ; ").mkString
        else "") +
       fill +                                                     // ten INHIBITED FIFO stores (ROM 0x40898e90)
       "jsr helper(%pc) ; " +                                     // `jsr %pc@(d16)`, the ROM's form (ROM 0x40898e98)
