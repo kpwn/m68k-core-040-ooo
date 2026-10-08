@@ -370,11 +370,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
     // ── store ack contract (see DcacheSectorSpec) ──
     val pending = mutable.Set[Long]()
     val unacked = mutable.Queue[Seq[Long]]()
+    // In lock-step with `unacked`: the 16-byte line of a WRITETHROUGH store, else -1.
+    val unackedWtLine = mutable.Queue[Long]()
     fork {
       while (true) {
         cd.waitSampling()
         if (lg.storeAckReg.toBoolean && unacked.nonEmpty) {
           val bytes = unacked.dequeue()
+          unackedWtLine.dequeue()
           bytes.foreach(b => if (!unacked.exists(_.contains(b))) pending -= b)
         }
       }
@@ -420,6 +423,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       var w = 0
       while ((0 until n).exists(k => pending.contains(a + k)) && w < 4000) { cd.waitSampling(); w += 1 }
       assert(w < 4000, s"seed $seed: a store to 0x${a.toHexString} was never acked")
+    }
+    /** The SQ's WRITETHROUGH same-LINE stall (`StoreQueue` `sameLine`/`anySameLine`): a
+      * load whose 16-byte line holds an older, un-acked WRITETHROUGH store waits for that
+      * store's terminal ack even with no byte overlap. */
+    def waitWtLine(ln: Long): Unit = {
+      var w = 0
+      while (unackedWtLine.contains(ln) && w < 4000) { cd.waitSampling(); w += 1 }
+      assert(w < 4000, s"seed $seed: a WRITETHROUGH store to line 0x${ln.toHexString} was never acked")
     }
     def nBytes(sz: Int) = sz match { case 0 => 1; case 1 => 2; case _ => 4 }
     def sizeEl(sz: Int) = sz match { case 0 => Size.BYTE; case 1 => Size.WORD; case _ => Size.LONG }
@@ -467,12 +478,14 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
       if (fullLine) {
         for (o <- 0 until 16) { shadow(sBase + o) = fullBytes(o); pending += sBase + o }
         unacked.enqueue((0 until 16).map(sBase + _))
+        unackedWtLine.enqueue(if (storeMode == CacheMode.WRITETHROUGH) sBase else -1L)
       } else {
         for (k <- 0 until n) {
           shadow(a + k) = ((v >> (8 * (n - 1 - k))) & 0xff).toInt
           pending += a + k
         }
         unacked.enqueue((0 until n).map(a + _))
+        unackedWtLine.enqueue(if (storeMode == CacheMode.WRITETHROUGH) sBase else -1L)
       }
       st.stores += 1
     }
@@ -495,11 +508,13 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         val mode = if (isFault) CacheMode.COPYBACK else modeOf(a)
         Ld(a, sz, -1, lineOnly, mode, isFault)
       }
-      // The SQ contract: a load never reaches the cache past an un-acked overlapping store.
+      // The SQ contract: a load never reaches the cache past an un-acked overlapping store,
+      // nor past an un-acked WRITETHROUGH store to its line (see `waitWtLine`).
       for (l <- lds if !l.fault) {
         val n = if (l.lineOnly) 16 else nBytes(l.sz)
         val a0 = if (l.lineOnly) l.a & ~0xFL else l.a
         if ((0 until n).exists(j => pending.contains(a0 + j))) waitAcked(a0, n)
+        waitWtLine(l.a & ~0xFL)
       }
       val withToks = lds.map(l => l.copy(tok = nextTok()))
       // ── probes (P2): no paddr at launch, resolved 0-2 cycles later ──
@@ -656,6 +671,7 @@ class DcacheNonBlockingSpec extends AnyFunSuite {
         pl.storeIn.valid #= false
         for (j <- 0 until n) { ioShadow(a + j) = ((v >> (8 * (n - 1 - j))) & 0xff).toInt; pending += a + j }
         unacked.enqueue((0 until n).map(a + _))
+        unackedWtLine.enqueue(-1L)
         st.stores += 1
       } else {
         if ((0 until n).exists(j => pending.contains(a + j))) waitAcked(a, n)
