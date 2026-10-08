@@ -27,7 +27,17 @@ import spinal.lib.misc.plugin.FiberPlugin
   * the CommitTrace (anchors the ROB retire/control path). */
 class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin,
                           lsEu: LsEuPlugin, divEu: DivEuPlugin, debugStage: Int = 2)
-    extends FiberPlugin with DebugMemoryService {
+    extends FiberPlugin with DebugMemoryService with m68k040.services.DebugIntReadService {
+  // CPU_PRF_READ_TRIM: the debug live-register read borrows `a7Rd` (see DebugIntReadService).
+  private val prfReadTrim: Boolean = ShippingCoreConfig.prfReadTrim
+  private var dbgIntRdReq: Bool = null
+  private var dbgIntRdAddr: UInt = null
+  private var dbgIntRdGrant: Bool = null
+  private var dbgIntRdData: Bits = null
+  override def debugIntReadReq: Bool   = dbgIntRdReq
+  override def debugIntReadAddr: UInt  = dbgIntRdAddr
+  override def debugIntReadGrant: Bool = dbgIntRdGrant
+  override def debugIntReadData: Bits  = dbgIntRdData
   // Int PRF write port for the exception unit's A7 (reg 15) write-back.
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
   // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
@@ -73,6 +83,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(
              latency = 1, sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
+    // Borrow seam (consumer-driven inputs default idle so a top without DebugCtrl, or with
+    // the flag OFF, elaborates with the port unshared).
+    dbgIntRdReq  = Bool();  dbgIntRdReq.allowOverride;  dbgIntRdReq  := False
+    dbgIntRdAddr = UInt(a7Rd.addr.getWidth bits); dbgIntRdAddr.allowOverride; dbgIntRdAddr := 0
+    dbgIntRdGrant = Bool()
+    dbgIntRdData  = Bits(32 bits)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
     xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
     fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
@@ -736,8 +752,29 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
     // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
     // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
-    a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
-    exc.committedA7In := a7Rd.data.asUInt
+    if (!prfReadTrim) {
+      a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+      exc.committedA7In := a7Rd.data.asUInt
+      dbgIntRdGrant := False
+    } else {
+      // CPU_PRF_READ_TRIM: time-share this port with the debug live-register read.
+      // Grant only while the exception/sysOp FSM is idle (`excActive` is a register), so
+      // the A7 mirror never skips a cycle while the FSM may be sampling ss.isp/msp/usp;
+      // a granted cycle feeds the mirror `ss.a7` itself (writeA7 of the selected bank with
+      // its own value = a no-op hold), and the next cycle resumes tracking. A bounded wait
+      // (256 denied cycles) forces the grant so a wedged FSM cannot hang a debugger read.
+      // The address mux select is three flops (req = registered debug stage-2 state,
+      // excActive, the saturating counter) -> one LUT level on a cold port's address.
+      val denied = Reg(UInt(8 bits)) init 0
+      val force  = denied.andR
+      val steal  = dbgIntRdReq && (!excActive || force)
+      when(dbgIntRdReq && !steal) { denied := denied + 1 } otherwise { denied := 0 }
+      a7Rd.addr := Mux(steal, dbgIntRdAddr,
+                       host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth))
+      exc.committedA7In := Mux(steal, exc.ss.a7, a7Rd.data.asUInt)
+      dbgIntRdGrant := steal
+    }
+    dbgIntRdData := a7Rd.data
     // RTE CCR restore -> REAL flags PRF (task #176-regression): DIRECT write into
     // whatever physical register nzvcRat/xRat's committed mapping currently names.
     // Safe for the same reason a7Wr's direct write is safe: nothing else can be

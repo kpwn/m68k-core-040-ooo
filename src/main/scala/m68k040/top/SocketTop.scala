@@ -736,7 +736,8 @@ object GenSocketTopVerilog {
             s"dcacheNbEagerAr=${ShippingCoreConfig.dcacheNbEagerAr} " +
             s"dcacheNbPreselectAr=${ShippingCoreConfig.dcacheNbPreselectAr} " +
             s"dcacheNbDynamicRelease=${ShippingCoreConfig.dcacheNbDynamicRelease} " +
-            s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage}")
+            s"dcacheNbProbeMissStage=${ShippingCoreConfig.dcacheNbProbeMissStage} " +
+            s"prfReadTrim=${ShippingCoreConfig.prfReadTrim}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,

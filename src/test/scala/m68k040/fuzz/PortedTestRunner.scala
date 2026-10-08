@@ -879,6 +879,8 @@ object PortedTestRunner {
       if (liveMon != null) liveMon.failure.foreach { f => println(f); lastLivenessFailure = Some(f) }
       flushWalkHoles()
       if (d4Mon != null) println(d4Mon.summary + d4Mon.details(2).replace("\n", " ||"))
+      // Opt-in cycle report for A/B timing of directed programs (no effect on the outcome).
+      if (sys.env.contains("PORTED_PRINT_CYCLES")) println(s"[ported-cycles] $name cycles=$cyc")
       outcome =
         if (bkptFired) PortedPass
         else if (word == 0) PortedHang(cyc)

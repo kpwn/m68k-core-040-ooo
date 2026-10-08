@@ -69,6 +69,9 @@ case class WbObs() extends Bundle {
   * blocks only a FAST op that would collide with a slow S3 completion on the shared
   * writeback/completion ports. */
 class AluEuPlugin extends FiberPlugin with AluEuService {
+  // Must match the CAS microcode (Microcode.romP2 reads the same global), so it is NOT a
+  // per-instance constructor knob.
+  private val prfReadTrim: Boolean = m68k040.top.ShippingCoreConfig.prfReadTrim
   var issuePort: Stream[IqContext] = null
   var flushPort: Bool = null
   var completionPort: Flow[UInt]   = null
@@ -137,7 +140,10 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // an older comment here claimed the BITFIELD-dynamic µop was the ONLY psrcC user on
     // this EU, and that was already stale when CAS/CAS2 landed.  BITFIELD has since moved
     // to the CPLX cluster; CASOP has not, and it still needs three int sources.
-    rdC = irf.newRead()
+    // CPU_PRF_READ_TRIM: CAS/CAS2 take their match predicate from NZVC.Z (Microcode romP2),
+    // so this port -- one full read of every LVT data bank plus a ~970-fanout address net
+    // -- is not allocated at all.
+    if (!prfReadTrim) rdC = irf.newRead()
     intW = irf.newWrite(latency = 1, sharingKey = wbKey, priority = 1); intByp = irf.newBypass()
     // DO NOT mark this bypass deadProbe and delete it. It LOOKS dead and is not.
     // Measured 2026-09-24: the bypass-liveness probe recorded zero hits across
@@ -168,7 +174,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val u0 = issuePort.payload.uop
     rdA.addr := u0.psrcA
     rdB.addr := u0.psrcB
-    rdC.addr := u0.psrcC                 // CASOP srcC = Du / the CAS2 status temp
+    if (rdC != null) rdC.addr := u0.psrcC  // CASOP srcC = Du / the CAS2 status temp
     // srcAValid=False does NOT mean "reads zero" on its own, and the value it does read
     // is worse than undefined — it is a LIVE ARCHITECTURAL REGISTER. EaDecoder gives every
     // EA a nominal `base = 8 + reg` and merely clears `baseValid` for the modes that have
@@ -209,7 +215,7 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     // rides s1Src2. All other ops that set useImm=False read s1Src2 == rdB.data anyway.
     val s1RdB   = RegNext(rdB.data)
     // s1RdC = CASOP's third source (Du for CASS, or the CAS2 packed eq/bothEq status temp).
-    val s1RdC   = RegNext(rdC.data)
+    val s1RdC   = if (rdC != null) RegNext(rdC.data) else null
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
@@ -481,12 +487,15 @@ class AluEuPlugin extends FiberPlugin with AluEuService {
     val cas2DcW   = Mux(casDaBit, casSext16, casBraw(31 downto 16) ## casA(15 downto 0))
     val cas2DcUpd = Mux(u1.size === Size.LONG, casA, cas2DcW)
     // Status-temp bits (CAS2): eq1 rides bit0, eq2 bit1, bothEq bit2.
-    val casEq1In  = casC(0)                         // CAS2C2 reads eq1 from the C1 status temp
-    val casBothEq = casC(2)                         // CAS2DC/SEL read bothEq from the C2 status
+    // CPU_PRF_READ_TRIM: no status-temp read -- eq1 is Z of C1's NZVC (read by C2) and
+    // bothEq is Z of C2's NZVC (read by DC/SEL); see Microcode romP2. NZVC = {N,Z,V,C}.
+    val casEq1In  = if (casC != null) casC(0) else s1Nzvc(2)   // CAS2C2: eq1
+    val casBothEq = if (casC != null) casC(2) else s1Nzvc(2)   // CAS2DC/SEL: bothEq
     // Per-form result + NZVC.
     import m68k040.decode.CasForm
     val casResult = u1.casForm.mux(
-      B(CasForm.CASS,    3 bits) -> Mux(casEqAB, casC, casA),          // store-data = eq?Du:T0
+      // (CASS is never emitted under CPU_PRF_READ_TRIM; CAS uses CAS2SEL after CASC.)
+      B(CasForm.CASS,    3 bits) -> (if (casC != null) Mux(casEqAB, casC, casA) else casA), // store-data = eq?Du:T0
       B(CasForm.CASC,    3 bits) -> Mux(casEqAB, casBraw, casMerge),   // Dc = eq?Dc:merge
       B(CasForm.CAS2C1,  3 bits) -> (B(0, 31 bits) ## casEqAB),        // status T2 = {eq1}
       B(CasForm.CAS2C2,  3 bits) -> (B(0, 29 bits) ## (casEq1In && casEqAB) ## casEqAB ## casEq1In), // {bothEq,eq2,eq1}

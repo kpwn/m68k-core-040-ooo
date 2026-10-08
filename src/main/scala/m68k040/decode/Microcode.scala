@@ -807,6 +807,9 @@ object Microcode {
     Desc(UMiHostOp, srcA = ST1, srcB = SMiOther, dst = SNone, isLast = true),   // µPC30
 
   )
+  /** CPU_PRF_READ_TRIM (see ShippingCoreConfig.prfReadTrim): CAS/CAS2 rows take their
+    * match predicate from NZVC.Z instead of a third int source (srcC). */
+  private def prfReadTrim: Boolean = m68k040.top.ShippingCoreConfig.prfReadTrim
   private def romP2(): Vector[Desc] = Vector(
     // ════════════════════════════════════════════════════════════════════════
     // CAS .B/.W/.L (atomic compare-and-swap, single address) — 4 µops @ CAS_ENTRY=31.
@@ -825,8 +828,18 @@ object Microcode {
     // mux keeps mem byte-identical). For the control modes casAutoMode=NONE -> inert eaAuto.
     Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase, dst = ST0, useImm = true,
          imm = SEaDispLo, indexFromEa = true, isFirst = true),                 // µPC31 (c0)
+  ) ++ (if (!prfReadTrim) Vector(
     Desc(UCasOp(CasForm.CASS), srcA = ST0, srcB = SCasDc, srcC = SCasDu, dst = ST2),  // µPC32 (c1)
     Desc(UCasOp(CasForm.CASC, writesNzvc = true), srcA = ST0, srcB = SCasDc, dst = SCasDc),  // µPC33 (c2)
+  ) else Vector(
+    // CPU_PRF_READ_TRIM: no third int source. CASC runs FIRST; its NZVC Z bit IS the
+    // size-masked match (Z of cmp.sz(T0,Dc) <=> T0.sz == Dc.sz), and the store-data select
+    // reads it through the ALU's existing NZVC port (CAS2SEL form: Z ? srcB : srcA).
+    // Dc==Du aliasing is harmless: on a match CASC rewrites Dc with its own value, and on a
+    // mismatch the select picks T0 regardless of what Du reads.
+    Desc(UCasOp(CasForm.CASC, writesNzvc = true), srcA = ST0, srcB = SCasDc, dst = SCasDc),  // µPC32 (c1')
+    Desc(UCasOp(CasForm.CAS2SEL, readsNzvc = true), srcA = ST0, srcB = SCasDu, dst = ST2),   // µPC33 (c2')
+  )) ++ Vector(
     Desc(UMove, mem = MStore, auto = AEaCasStore, srcA = SEaBase, srcB = ST2, useImm = true,
          imm = SEaDispLo, indexFromEa = true, isLast = true),                  // µPC34 (c3)
 
@@ -850,6 +863,7 @@ object Microcode {
     Desc(UMove, mem = MLoad, srcA = SCas2Rn2, dst = ST1),                      // µPC36 (d1)
     Desc(UCasOp(CasForm.CAS2C1, writesNzvc = true, dropCommit = true),
          srcA = ST0, srcB = SCas2Dc1, dst = ST2),                             // µPC37 (d2)
+  ) ++ (if (!prfReadTrim) Vector(
     Desc(UCasOp(CasForm.CAS2C2, writesNzvc = true, readsNzvc = true),
          srcA = ST1, srcB = SCas2Dc2, srcC = ST2, dst = ST2),                 // µPC38 (d3) KEPT
     Desc(UCasOp(CasForm.CAS2DC, dropCommit = true), srcA = ST0, srcB = SCas2Dc1,
@@ -858,6 +872,20 @@ object Microcode {
          srcC = ST2, dst = SCas2Dc2, useImm = true, imm = SCas2Da2),          // µPC40 (d5)
     Desc(UCasOp(CasForm.CAS2SEL), srcA = ST0, srcB = SCas2Du1, srcC = ST2, dst = ST0),  // µPC41 (d6)
     Desc(UCasOp(CasForm.CAS2SEL), srcA = ST1, srcB = SCas2Du2, srcC = ST2, dst = ST1),  // µPC42 (d7)
+  ) else Vector(
+    // CPU_PRF_READ_TRIM: the status temp T2 is no longer READ. eq1 = Z of C1's NZVC (which
+    // C2 already reads to preserve res1); bothEq = Z of C2's NZVC (eq1 ? Z(cmp(T1,Dc2)) =
+    // eq2 : preserved Z(res1) = eq1 = 0). No NZVC writer sits between C2 and d4..d7, so
+    // the DC/SEL rows read it through the ALU's existing NZVC port.
+    Desc(UCasOp(CasForm.CAS2C2, writesNzvc = true, readsNzvc = true),
+         srcA = ST1, srcB = SCas2Dc2, dst = ST2),                             // µPC38 (d3) KEPT
+    Desc(UCasOp(CasForm.CAS2DC, dropCommit = true, readsNzvc = true), srcA = ST0, srcB = SCas2Dc1,
+         dst = SCas2Dc1, useImm = true, imm = SCas2Da1),                      // µPC39 (d4)
+    Desc(UCasOp(CasForm.CAS2DC, dropCommit = true, readsNzvc = true), srcA = ST1, srcB = SCas2Dc2,
+         dst = SCas2Dc2, useImm = true, imm = SCas2Da2),                      // µPC40 (d5)
+    Desc(UCasOp(CasForm.CAS2SEL, readsNzvc = true), srcA = ST0, srcB = SCas2Du1, dst = ST0),  // µPC41 (d6)
+    Desc(UCasOp(CasForm.CAS2SEL, readsNzvc = true), srcA = ST1, srcB = SCas2Du2, dst = ST1),  // µPC42 (d7)
+  )) ++ Vector(
     Desc(UMove, mem = MStore, srcA = SCas2Rn1, srcB = ST0),                    // µPC43 (d8)
     Desc(UMove, mem = MStore, srcA = SCas2Rn2, srcB = ST1, isLast = true),     // µPC44 (d9)
 
