@@ -708,6 +708,7 @@ object GenSocketTopVerilog {
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
+            s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
             // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
             // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
