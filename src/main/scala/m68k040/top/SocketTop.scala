@@ -693,6 +693,7 @@ object GenSocketTopVerilog {
             s"ipcThroughput=$ipcThroughput " +
             s"ipcLateStore=${SocketIpcProfile.lateStore(ipcProfile)} " +
             s"specLoadWakeup=${ShippingPlugins.specLoadWakeup(ipcThroughput)} " +
+            s"lsP3Launch=${ShippingCoreConfig.lsP3Launch} " +
             s"lsP3FastLoad=${ShippingCoreConfig.lsP3FastLoad} " +
             s"lsP1EarlyLoad=${ShippingCoreConfig.lsP1EarlyLoad} " +
             s"lsFourCycleL1=${ShippingCoreConfig.lsFourCycleL1} " +

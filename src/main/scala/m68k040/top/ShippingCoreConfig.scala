@@ -504,8 +504,17 @@ object ShippingCoreConfig {
   /** LS aligned-load descriptor ring. Keep 4 as the shipping default; 8/16 are
     * experimental concurrency arms and resize DLoadRid plus the source FIFO. */
   val lsLoadRingDepth: Int = envInt("CPU_LS_LOAD_RING_DEPTH", 4, 4, 16)
+  /** Load-to-use 8 -> 7 (Fable review 4.4): launch an ordinary cacheable L1 load from P3
+    * instead of P4 whenever a REGISTERED page-offset line filter, taken against the store
+    * queue one stage earlier (P2T), proves the P4 forward verdict would be hit=stall=
+    * serial=0. Builds on the P3 admission arm (`lsP3FastLoad`, whose `sq.io.empty` gate it
+    * replaces) and needs the registered probe-line forward (`dcacheEarlyProbeLineForward`)
+    * because the early-probe slot only becomes ready in the P4 cycle; this flag turns both
+    * on. Default ON (gated 2026-10-08: sim -3.0% geomean, corpus/lock-step clean; costs ~0.6 ns
+    * at 200 MHz until retimed); `CPU_LS_P3_LAUNCH=0` disables. Echoed in `SHIPPING_CONFIG`. */
+  val lsP3Launch: Boolean = envFlag("CPU_LS_P3_LAUNCH", true)
   /** Experimental P3 ordinary-load admission into the existing aligned ring. */
-  val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false)
+  val lsP3FastLoad: Boolean = envFlag("CPU_LS_P3_FAST_LOAD", false) || lsP3Launch
   /** Experimental paired P1 translation/VIPT launch for simple aligned MOVEA.L loads. */
   val lsP1EarlyLoad: Boolean = envFlag("CPU_LS_P1_EARLY_LOAD", false)
   /** Experimental: a one-entry retry for an early An writeback (`earlyAutoAnWriteback`)
@@ -537,7 +546,8 @@ object ShippingCoreConfig {
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
-  val dcacheEarlyProbeLineForward: Boolean = envFlag("CPU_DCACHE_EARLY_PROBE_LINE_FORWARD", false)
+  val dcacheEarlyProbeLineForward: Boolean =
+    envFlag("CPU_DCACHE_EARLY_PROBE_LINE_FORWARD", false) || lsP3Launch
   require(!lsP3FastLoad || inhibitedFullBarrier,
     "CPU_LS_P3_FAST_LOAD=1 requires CPU_INHIBITED_FULL_BARRIER=1")
   require((lsLoadRingDepth & (lsLoadRingDepth - 1)) == 0,

@@ -146,6 +146,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                  val earlyStoreDataWake: Boolean = false,
                  val specLoadWakeup: Boolean = false,
                  val p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
+                 /** See `ShippingCoreConfig.lsP3Launch`. Effective only with `p3FastLoad`
+                   * (whose `sq.io.empty` admission term it replaces by a registered
+                   * store-queue line filter); an explicit `p3FastLoad = false` wins. */
+                 val p3Launch: Boolean = m68k040.top.ShippingCoreConfig.lsP3Launch,
                  val p1EarlyLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
                  val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
                  /** See `ShippingCoreConfig.lsEarlyAnRetry`; effective only with
@@ -177,6 +181,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     s"aligned-load ring depth must be 4, 8, or 16, got $loadRingDepth")
   require(!p3FastLoad || inhibitedFullBarrier,
     "P3 fast load requires the inhibited full barrier")
+  /** The P3 launch line filter is elaborated only when the P3 admission arm exists. */
+  val p3SqLineFilter: Boolean = p3Launch && p3FastLoad
   require(!fourCycleL1 || (p1EarlyLoad && p3FastLoad && specLoadWakeup &&
     alignedLoadFallThrough && earlyIntWakeup),
     "four-cycle L1 experiment requires P1/P3/spec wake/fall-through/early int wake")
@@ -770,7 +776,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       narrowDrainMerge = sqNarrowDrainMerge,
       inhibitedFullBarrier = inhibitedFullBarrier,
       coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold,
-      walkLineQuery = walkOrderClient.isDefined)
+      walkLineQuery = walkOrderClient.isDefined,
+      p3LineProbe = p3SqLineFilter)
     val sqCoalesceFire    = if (sqCoalesceLines) sq.io.coalesceFire else null
     val sqCoalesceHolding = if (sqCoalesceLines) sq.io.coalesceHolding else null
     val sqCoalesceTimeout = if (sqCoalesceLines) sq.io.coalesceTimeout else null
@@ -1564,6 +1571,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val p3FastEnq       = if (p3FastLoad) Bool() else False
     if (p3FastLoad) p3FastEnq := False
     if (p3FastLoad) p3FastEnq.simPublic()
+    // Registered P2T verdict of the store-queue line filter (see `p3SqLineFilter`).
+    val p3SqClear: Bool = if (p3SqLineFilter) RegInit(False) else null
+    if (p3SqLineFilter) p3SqClear.simPublic()
     val alignedEnqSplit = Bool(); alignedEnqSplit := False   // two-descriptor push (split-load pair)
 
     // ═══ INHIBITED PARK BUFFER (`lsOooIssue` only) ═════════════════════════════════════
@@ -4624,7 +4634,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
             !(p3Front.needsSupervisor && !p3Front.supervisor) &&
             (p3Ctx.cmode =/= m68k040.cache.CacheMode.INHIBITED)
           val parkIdle = if (lsOooIssue) !parkValid.reduce(_ || _) else True
-          when(ordinary && sq.io.empty && !p4Valid && parkIdle &&
+          // `p3SqLineFilter`: the registered P2T line filter (see `p3SqClear`) replaces
+          // `sq.io.empty` -- a superset proof that this load's P4 verdict would be
+          // hit = stall = serial = 0, so P4 would launch it unchanged one cycle later.
+          val sqAdmits = if (p3SqLineFilter) p3SqClear else sq.io.empty
+          when(ordinary && sqAdmits && !p4Valid && parkIdle &&
                !inhibLoadInFlight && p4PreemptSafe && alignedCanEnq) {
             alignedEnq := True
             p3FastEnq := True
@@ -4919,6 +4933,39 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     when(txToP3) {
       p3Valid := True
       p3Ctx   := txOut
+    }
+    // ── P3 LAUNCH LINE FILTER (`p3SqLineFilter`) ────────────────────────────────────
+    // Captured with `p3Ctx` on the P2T->P3 edge, from registers only: the SQ's resident
+    // entries (`sq.io.lineProbe`, any age, any INHIBITED half) and the P3 occupant that
+    // is leaving on this same edge -- a store in P3 allocates/reserves its SQ entry on
+    // exactly this edge, so the entry is not yet visible to `lineProbe`; it is matched
+    // here from its own registered `p3Ctx` instead. (A P3 occupant that leaves without
+    // allocating is still matched: conservative.) PA[11:4] == VA[11:4] for 4K and 8K
+    // pages, so `txCtx.vaddr` is the load's page-offset line before its PA exists.
+    // While the load then sits in P3 no store can allocate: allocation happens only for a
+    // P3 store, P3 holds this load, and the elastic pipe is in order behind it. Entries
+    // only leave (drain ack, flush) in the meantime. So a set bit stays a valid proof for
+    // every cycle of this load's P3 residency. A flush kills P3 (and this load) outright.
+    if (p3SqLineFilter) {
+      val idx = txCtx.vaddr(11 downto 4)
+      sq.io.lineProbe.idx := idx
+      val leavingStoreHazard = p3Valid && p3IsStore && (
+        (p3Ctx.paddr(11 downto 4) === idx) ||
+        (p3Ctx.cmode === m68k040.cache.CacheMode.INHIBITED) ||
+        (p3Front.twoAccess && ((p3Ctx.paddrB(11 downto 4) === idx) ||
+                               (p3Ctx.cmodeB === m68k040.cache.CacheMode.INHIBITED))))
+      when(txToP3) { p3SqClear := sq.io.lineProbe.clear && !leavingStoreHazard }
+      GenerationFlags.simulation {
+        // The proof, checked: a load admitted on the filter would have received a clean
+        // forward verdict from the real SQ query this very cycle (P3 queries from
+        // `p3Ctx` whenever P4 is empty, which the admission requires).
+        when(p3FastEnq) {
+          assert(!p4RetryQuery && !sq.io.fwd.rsp.hit && !sq.io.fwd.rsp.stall &&
+                 !sq.io.fwd.rsp.serial,
+            "LsEuPlugin: P3 launch line filter admitted a load the SQ would forward/stall",
+            FAILURE)
+        }
+      }
     }
     when(splitReqFire) {
       txWaitingRsp := True
