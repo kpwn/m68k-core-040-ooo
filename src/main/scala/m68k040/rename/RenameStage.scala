@@ -296,6 +296,12 @@ class RenameStage(val retireWidth: Int = 2, val preparedRetirement: Boolean = fa
       r.predTarget   := decPred.predTarget
       r.phtValid     := decPred.phtValid
       r.phtIndex     := decPred.phtIndex
+      // RAS per-branch snapshot (`CPU_RAS_BRANCH_SNAPSHOT`), parallel to `uopPred`. A
+      // decode source without the side table (unit-test inputs) hands the inert record.
+      host.get[m68k040.services.DecodeRasSnapService] match {
+        case Some(rs) => r.rasSnap := rs.uopRasSnap(s)
+        case None     => r.rasSnap.setInert()
+      }
       r.casForm      := dec.casForm
       r.fpuOp        := dec.fpuOp
       r.fpSrcKind    := dec.fpSrcKind

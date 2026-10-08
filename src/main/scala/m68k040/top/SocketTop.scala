@@ -707,6 +707,7 @@ object GenSocketTopVerilog {
             s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
             s"dcacheKB=${ShippingCoreConfig.dcacheKB} " +
             s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
+            s"rasBranchSnapshot=${ShippingCoreConfig.rasBranchSnapshot} " +
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +

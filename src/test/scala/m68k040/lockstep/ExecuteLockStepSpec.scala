@@ -334,23 +334,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // see Ras.scala's doc comment for the design). checkpointSave refreshes to live
       // state whenever the ROB is fully drained; checkpointRestore undoes any
       // wrong-path push/pop on the ROB's own flush or FetchAlign's own ftqMismatch.
-      val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || faBtb.logic.ftqMismatch
-      // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
-      // itself gates it with !checkpointRestore (restore wins by construction), so
-      // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
-      // registered restatement of `count === 0` (see RobPlugin), not an approximation.
-      // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
-      // change is that the long ROB->frontend route into 500+ clock-enable pins
-      // starts at a flop Q with the whole period in front of it.
-      ras.logic.checkpointSave    := rob.logic.countIsZero
-      ras.logic.checkpointRestore := rasCheckpointRestore
-      // RAS flush-repair (RasPlugin `branchRepair`) -- LOCKSTEP_RAS_BRANCH_REPAIR=1.
-      require(rob.rasBranchRepair == ras.branchRepair, "rasBranchRepair must agree")
-      if (rob.rasBranchRepair) {
-        ras.logic.repairValid := rob.logic.earlyFire
-        ras.logic.repairKind  := rob.logic.rasRepairKind
-        ras.logic.repairData  := rob.logic.rasRepairData
-      }
+      m68k040.top.RasRecoveryWiring(ras, rob, doFlush, feSuppress, earlyFire, faBtb.logic.ftqMismatch)
+      // (checkpointSave/Restore + branchRepair + branchSnapshot: see RasRecoveryWiring.)
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at

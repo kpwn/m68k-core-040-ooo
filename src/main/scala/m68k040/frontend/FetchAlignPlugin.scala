@@ -1492,10 +1492,22 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // and synthetic fault packets keep inert tag 0. Optional slot1 training uses
     // the one record only when slot0 has none, so allocations stay <=1 per group.
     val brPredCtr = Reg(UInt(Global.BR_PRED_TAG_W bits)) init 1
-    val brPredLive0 = feed.payload(0).predTaken || feed.payload(0).phtValid
+    val brPredLive0Pred = feed.payload(0).predTaken || feed.payload(0).phtValid
     val brPredLive1 = if (trainSlot1Conditional)
-      slot1IsConditional && slot1ValidOut && !faultHold && !brPredLive0
+      slot1IsConditional && slot1ValidOut && !faultHold && !brPredLive0Pred
     else False
+    // RAS per-branch snapshot (`CPU_RAS_BRANCH_SNAPSHOT`): the snapshot rides the SAME tag
+    // (DecodeStage keeps a per-tag RAS side table), so an UNPREDICTED slot0 control
+    // transfer -- exactly the jsr (An) / empty-RAS return / BTB-missing branch that
+    // mispredicts -- must allocate a tag too. Its prediction record is the inert one
+    // (all four fields are the Aligner's zero defaults when nothing was stamped), so the
+    // branch EU sees what a tag-0 uop saw. A slot1 training record keeps priority (the
+    // slot1 policy is unchanged; that group then carries one record, slot1's).
+    // `slot0IsCtrlXfer` is a predecode memory output (t~=0).
+    val rasSnapOn = host.get[m68k040.services.RasSnapshotService].exists(_.snapshotEnabled)
+    val brPredLive0 = if (rasSnapOn)
+      brPredLive0Pred || (res.slot0Valid && slot0IsCtrlXfer && !faultHold && !brPredLive1)
+    else brPredLive0Pred
     if (trainSlot1Conditional) {
       when(brPredLive1) {
         feed.payload(1).phtValid := True

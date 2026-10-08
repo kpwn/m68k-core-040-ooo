@@ -95,7 +95,8 @@ object ShippingPlugins {
 
   def icache(predecodeWords: Int): IcachePlugin = new IcachePlugin(predecodeWords)
 
-  def ras(): RasPlugin = new RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair)
+  def ras(): RasPlugin = new RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair,
+    branchSnapshot = ShippingCoreConfig.rasBranchSnapshot)
 
   def gshare(ipcThroughput: Boolean): GsharePlugin =
     new GsharePlugin(retainRedirectHistory = ipcThroughput)

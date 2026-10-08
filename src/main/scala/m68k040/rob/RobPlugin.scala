@@ -3750,6 +3750,27 @@ class RobPlugin(val detailedPerf: Boolean = false,
     val rasRepairKind = if (rasBranchRepair) Reg(UInt(m68k040.frontend.RasRepair.W bits)) init U(m68k040.frontend.RasRepair.NONE, m68k040.frontend.RasRepair.W bits) else null
     val rasRepairData = if (rasBranchRepair) Reg(UInt(32 bits)) init 0 else null
     if (rasBranchRepair) { rasRepairKind.simPublic(); rasRepairData.simPublic() }
+    // ── RAS per-branch snapshot (`CPU_RAS_BRANCH_SNAPSHOT`, RasPlugin `branchSnapshot`) ──
+    // Every uop carries its fetch group's RAS snapshot (`RenamedUop.rasSnap`, from
+    // DecodeStage's per-tag side table); it is stored at ALLOC in `rasSnapMem` (same
+    // two-port tail/tail+1 shape as `payload`) and read ONCE, by the mispredicting
+    // branch's robId, on the SAME `earlyArm` edge that latches `earlyPcReg` /
+    // `rasRepairKind`. So during `earlyFire` `rasSnapReg` describes exactly the branch
+    // being redirected for, as a bare register Q -- the wiring hands it to RasPlugin,
+    // which applies it on that cycle in place of the ROB-drain checkpoint restore. The
+    // read address is the completion's robId (the same operand `bcAge` already uses) and
+    // the capture enable is `earlyArm`, i.e. the existing `earlyPcReg` CE: nothing new on
+    // the redirect path. TIER 1 ONLY, like the repair carry: a flush Tier 1 did not arm
+    // for falls back to the checkpoint.
+    val rasSnapOn  = host.get[m68k040.services.RasSnapshotService].exists(_.snapshotEnabled)
+    val rasSnapMem = if (rasSnapOn) Mem(m68k040.services.RasSnapRec(), depth) else null
+    val rasSnapReg = if (rasSnapOn) Reg(m68k040.services.RasSnapRec()) else null
+    if (rasSnapOn) {
+      rasSnapReg.valid.init(False)
+      rasSnapReg.simPublic()
+      rasSnapMem.write(tail, allocUopVec(0).rasSnap, alloc0)
+      rasSnapMem.write(tail + 1, allocUopVec(1).rasSnap, alloc1)
+    }
 
     // Oldest-wins arbitration, NaxRiscv `CommitPlugin.scala:118-144`. Age is
     // `robId - head` mod 64, the same wraparound-safe idiom `faultWin` uses at the
@@ -3773,6 +3794,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
         rasRepairKind := branchCompletion.payload.rasKind
         rasRepairData := branchCompletion.payload.rasData
       }
+      if (rasSnapOn) rasSnapReg := rasSnapMem.readAsync(branchCompletion.payload.robId)
     }
     // Tier 2 releases the halt. Registered assignment => `earlyPend` still reads
     // True on the `flushing` cycle itself (see the note above). Placed AFTER the
