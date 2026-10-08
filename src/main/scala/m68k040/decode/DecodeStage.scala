@@ -32,7 +32,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   */
 class DecodeStage(allowSlot1Prediction: Boolean = false,
                   fuseLongMoveLoads: Boolean = false) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
-                                       with FpImmTableService with FpTrapImmediateService {
+                                       with FpImmTableService with FpTrapImmediateService
+                                       with m68k040.services.DecodeRasSnapService {
 
   // Setup-allocated wires let DebugCtrl resolve/configure this service without making
   // its build order part of the frontend's existing Fetch->Decode dependency chain.
@@ -737,6 +738,22 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       }
 
     }
+
+    // ── RAS per-branch snapshot side table (`CPU_RAS_BRANCH_SNAPSHOT`) ───────────
+    // A sibling of `brPredTable`, indexed by the SAME tag, written under the SAME
+    // idempotent `fed.valid && wrTag =/= 0` condition. The data is the RAS's live
+    // REGISTERED state, which on every cycle a group sits in `fed` is exactly "after this
+    // group's own push/pop": the group's push/pop was applied on its `feed.fire` edge, and
+    // no younger group can be fed until this one leaves `fed` (on that last cycle the
+    // younger group's push only changes the RAS's D inputs, not its Q). Only slot0 ever
+    // pushes/pops, so the one record is right for either slot's branch. Built only when the
+    // RAS offers the option; otherwise every popped uop carries the inert record.
+    val rasSnapTable: RasSnapTable =
+      host.get[m68k040.services.RasSnapshotService].filter(_.snapshotEnabled) match {
+        case Some(rs) => new RasSnapTable(brPredTable.wrTag, fed.valid && (brPredTable.wrTag =/= 0),
+                                          rs.liveSnapshot)
+        case None     => null
+      }
 
     // Head instruction this cycle: the stashed slot1 (registered uops) else slot0 (a0).
     val nCur = Mux(stashValid, stashCount, a0.count)       // 1..3
@@ -3830,6 +3847,12 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // ROB and the branch EU are all unchanged by the decode-side narrowing).
     val uopPredOut = Vec(BranchPredRec(), 2)
     for (k <- 0 until 2) uopPredOut(k) := brPredTable.expand(uopsOut.payload(k).brPredTag)
+    // RAS per-branch snapshot, re-expanded from the SAME tag (inert when the option is off).
+    val uopRasSnapOut = Vec(m68k040.services.RasSnapRec(), 2)
+    for (k <- 0 until 2) {
+      if (rasSnapTable != null) uopRasSnapOut(k) := rasSnapTable.expand(uopsOut.payload(k).brPredTag)
+      else uopRasSnapOut(k).setInert()
+    }
 
     // ── Branch-prediction tag-reuse watchdog (SIM ONLY) ────────────────────────
     // The ONE way the side-channel could be silently wrong is the wrapping tag counter in
@@ -3919,6 +3942,7 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
   override def uops: Stream[Vec[DecodedUop]] = logic.uopsOut
   override def uop1Valid: Bool               = logic.uop1Sig
   override def uopPred: Vec[m68k040.services.BranchPredRec] = logic.uopPredOut
+  override def uopRasSnap: Vec[m68k040.services.RasSnapRec] = logic.uopRasSnapOut
   override def pipeFlush: Bool               = logic.pipeFlush
   override def backendFlush: Bool            = _backendFlush
   override def fpImmRdAddr: UInt             = _fpImmRdAddr
@@ -3931,4 +3955,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     _debugBreakSkip := skipOnce
   }
   override def skipConsumed: Bits = _debugSkipConsumed
+}
+
+/** DecodeStage's RAS per-branch snapshot side table (see the `rasSnapTable` note there). */
+class RasSnapTable(wrTag: UInt, wrEn: Bool, live: m68k040.services.RasSnapRec) extends Area {
+  val mem = Mem(Bits(live.getBitsWidth bits), Global.BR_PRED_TABLE_DEPTH)
+  mem.addAttribute("ram_style", "distributed")
+  mem.write(address = wrTag, data = live.asBits, enable = wrEn)
+  def expand(tag: UInt): m68k040.services.RasSnapRec = {
+    val r  = m68k040.services.RasSnapRec()
+    val rd = m68k040.services.RasSnapRec()
+    rd.assignFromBits(mem.readAsync(tag))
+    when(tag === 0) { r.setInert() } otherwise { r := rd }
+    r
+  }
 }

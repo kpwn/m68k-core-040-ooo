@@ -245,6 +245,12 @@ object ShippingCoreConfig {
     // DEFAULT ON since 2026-09-30: P1 silicon A/B at 200 MHz, +4.93% Dhrystone (116,559 vs
     // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_RAS_BRANCH_REPAIR=0` still disables it.
     envFlag("CPU_RAS_BRANCH_REPAIR", true)
+  /** RAS per-branch pointer+TOS snapshot (`RasPlugin.branchSnapshot`, Fable review §1-2 /
+    * §4.2). Every fetch group that carries a control transfer gets a tag-indexed RAS
+    * snapshot (DecodeStage side table -> `RenamedUop.rasSnap` -> ROB `rasSnapMem`), and a
+    * Tier-1 mispredict restores the RAS to that branch's own post-fetch state instead of
+    * the last ROB-drain checkpoint. DEFAULT OFF pending measurement; `=1` enables. */
+  val rasBranchSnapshot: Boolean = envFlag("CPU_RAS_BRANCH_SNAPSHOT", false)
   /** Front-end: COMPUTE a PC-relative unconditional branch's target from the
     * displacement already in the aligner slot, instead of only ever recalling one from
     * the BTB/FTB. See `FetchAlignPlugin.computeDirectTargets` for the mechanism and the

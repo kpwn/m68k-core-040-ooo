@@ -208,31 +208,8 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // Tier 1 when Tier 1 owns the redirect, Tier 2 otherwise. Restoring again at
     // Tier 2 under `feSuppress` would undo the LEGITIMATE correct-path pushes made
     // while rename was frozen, which is the same undo-too-much mistake in miniature.
-    val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
-    // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
-    // itself gates it with !checkpointRestore (restore wins by construction), so
-    // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
-    // registered restatement of `count === 0` (see RobPlugin), not an approximation.
-    // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
-    // change is that the long ROB->frontend route into 500+ clock-enable pins
-    // starts at a flop Q with the whole period in front of it.
-    ras.logic.checkpointSave    := rob.logic.countIsZero
-    ras.logic.checkpointRestore := rasCheckpointRestore
-    // RAS flush-repair (RasPlugin `branchRepair`, default OFF). The restore above rolls
-    // the stack back past the mispredicting branch itself, so a mispredicted CALL loses
-    // its own already-architectural push and its callee's `rts` mispredicts too. These
-    // three wires hand the RAS that one delta back. All THREE are bare register Qs
-    // (`earlyFire` is a register; the two carry registers are latched by the same
-    // `earlyArm`), and RasPlugin consumes them behind one more flop, so this adds nothing
-    // to the redirect / `ftbBlocked` cone -- the standing rule for predictor recovery.
-    require(rob.rasBranchRepair == ras.branchRepair,
-      "RobPlugin.rasBranchRepair and RasPlugin.branchRepair must agree " +
-      s"(rob=${rob.rasBranchRepair}, ras=${ras.branchRepair})")
-    if (rob.rasBranchRepair) {
-      ras.logic.repairValid := rob.logic.earlyFire
-      ras.logic.repairKind  := rob.logic.rasRepairKind
-      ras.logic.repairData  := rob.logic.rasRepairData
-    }
+    RasRecoveryWiring(ras, rob, doFlush, feSuppress, earlyFire, fa.logic.ftqMismatch)
+    // (checkpointSave/Restore + branchRepair + branchSnapshot: see RasRecoveryWiring.)
     // ── gshare direction predictor (slice 3) ────────────────────────────────────
     // Query the PHT with the same slot0/slot1 aligner PCs the BTB sees; feed the BTB hit
     // + brType into FetchAlign so it can form condBtbHit and source the conditional
@@ -886,7 +863,8 @@ object GenFullCoreSynthVerilog {
           new DcachePlugin(),
           new BtbPlugin(),
           new FtbPlugin(),
-          new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair),
+          new m68k040.frontend.RasPlugin(branchRepair = ShippingCoreConfig.rasBranchRepair,
+            branchSnapshot = ShippingCoreConfig.rasBranchSnapshot),
           new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory),
           new FetchAlignPlugin(enableFetchDirected = true, deferSlot1Conditional = deferSlot1Conditional,
             trainSlot1Conditional = trainSlot1Conditional, deferTakenSlot1Conditional = deferTakenSlot1Conditional,

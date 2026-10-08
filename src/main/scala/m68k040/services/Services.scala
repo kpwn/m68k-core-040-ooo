@@ -746,6 +746,54 @@ case class BranchPredRec() extends Bundle {
   }
 }
 
+/** Per-branch RAS recovery snapshot (`CPU_RAS_BRANCH_SNAPSHOT`, RasPlugin `branchSnapshot`).
+  *
+  * The RAS state immediately AFTER a fetch group's own push/pop: the top-of-stack pointer,
+  * the occupancy and the top-of-stack VALUE. The textbook "pointer + TOS checkpoint per
+  * branch" (Skadron et al., MICRO-31): restoring `sp`/`count` undoes every wrong-path
+  * push/pop since the branch, and re-writing the one entry at `sp-1` undoes the commonest
+  * wrong-path clobber (a wrong-path return followed by a wrong-path call). Entries below
+  * that are taken from the live stack, which -- unlike the ROB-drain checkpoint -- still
+  * holds every correct-path call fetched since.
+  *
+  * `valid = False` (the inert record) means "no snapshot for this uop": the ROB then falls
+  * back to the ROB-drain checkpoint restore + `branchRepair` exactly as before.
+  * Widths are fixed for the 16-entry RAS (RasPlugin `require`s it when the option is on). */
+case class RasSnapRec() extends Bundle {
+  val valid = Bool()
+  val sp    = UInt(RasSnapRec.SP_W bits)
+  val count = UInt(RasSnapRec.CNT_W bits)
+  val tos   = UInt(32 bits)
+
+  def setInert(): Unit = {
+    valid := False; sp := U(0, RasSnapRec.SP_W bits)
+    count := U(0, RasSnapRec.CNT_W bits); tos := U(0, 32 bits)
+  }
+}
+object RasSnapRec {
+  val SP_W  = 4
+  val CNT_W = 5
+}
+
+/** Producer: RasPlugin (the ONLY implementer). `snapshotEnabled` is the build-time switch
+  * the other participants (FetchAlign tag allocation, DecodeStage side table, ROB
+  * snapshot store) key their hardware on, so one constructor argument enables or removes
+  * the whole mechanism. `liveSnapshot` is the RAS's current REGISTERED state (pointer,
+  * occupancy, and the push-bypassed top-of-stack view) -- read by DecodeStage on the
+  * cycles a fetch group sits in `fed`, when that state is exactly "after this group".
+  * Null when the option is off. */
+trait RasSnapshotService {
+  def snapshotEnabled: Boolean
+  def liveSnapshot: RasSnapRec
+}
+
+/** Producer: DecodeStage. The RAS snapshot for each of the two popped uops, parallel to
+  * `DecodeUopService.uopPred` (same index, same validity). Inert when the RAS snapshot
+  * option is off. Consumer: RenameStage, which copies it onto `RenamedUop.rasSnap`. */
+trait DecodeRasSnapService {
+  def uopRasSnap: Vec[RasSnapRec]     // Vec length 2
+}
+
 /** Produced by the decode stage; consumed by the (future) rename stage.
   * Two µops/cycle. Plain Stream (directionless) per the service convention.
   * `pipeFlush` is the directionless squash input driven by backend wiring; exposing it

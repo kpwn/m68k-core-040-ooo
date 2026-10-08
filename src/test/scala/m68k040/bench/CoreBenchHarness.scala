@@ -234,24 +234,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       fa.logic.rasPredTarget   := rasP.logic.predTarget
       // Rollback-on-flush (mirrors FullCoreSynth.BackendWiringPlugin's RAS wiring --
       // see Ras.scala's doc comment for the design).
-      val rasCheckpointRestore = (doFlush && !feSuppress) || earlyFire || fa.logic.ftqMismatch
-      // checkpointSave is now an ARM whose copy lands the cycle after, and the RAS
-      // itself gates it with !checkpointRestore (restore wins by construction), so
-      // this driver is a BARE REGISTER OUTPUT: `rob.logic.countIsZero` is a bit-exact
-      // registered restatement of `count === 0` (see RobPlugin), not an approximation.
-      // Deliberately NO combinational term here -- the point of the 2026-09-15 FMax
-      // change is that the long ROB->frontend route into 500+ clock-enable pins
-      // starts at a flop Q with the whole period in front of it.
-      rasP.logic.checkpointSave    := rob.logic.countIsZero
-      rasP.logic.checkpointRestore := rasCheckpointRestore
-      // RAS flush-repair (RasPlugin `branchRepair`) -- same three bare register Qs the
-      // shipping wiring drives; see BackendWiringPlugin.
-      require(rob.rasBranchRepair == rasP.branchRepair, "rasBranchRepair must agree")
-      if (rob.rasBranchRepair) {
-        rasP.logic.repairValid := rob.logic.earlyFire
-        rasP.logic.repairKind  := rob.logic.rasRepairKind
-        rasP.logic.repairData  := rob.logic.rasRepairData
-      }
+      m68k040.top.RasRecoveryWiring(rasP, rob, doFlush, feSuppress, earlyFire, fa.logic.ftqMismatch)
+      // (checkpointSave/Restore + branchRepair + branchSnapshot: see RasRecoveryWiring.)
 
       // gshare (slice 3): query the PHT with the aligner slot PCs, feed BTB hit/brType
       // into FetchAlign (condBtbHit), shift the GHR on the emitted conditional, train at
@@ -390,6 +374,7 @@ trait CoreBenchHarness extends AnyFunSuite {
                     specLoadWakeup: Boolean = false,
                     p3FastLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP3FastLoad,
                     rasBranchRepair: Boolean = false,
+                    rasBranchSnapshot: Boolean = false,
                     computeDirectTargets: Boolean = false,
                     deferSlot1Uncond: Boolean = false,
                     deferSlot1Dbcc: Boolean = false,
@@ -426,7 +411,8 @@ trait CoreBenchHarness extends AnyFunSuite {
     val btb    = new BtbPlugin
     val ftb    = new m68k040.frontend.FtbPlugin
     val ras    = if (shippingProfile) m68k040.top.ShippingPlugins.ras()
-                 else new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair)
+                 else new m68k040.frontend.RasPlugin(branchRepair = rasBranchRepair,
+                   branchSnapshot = rasBranchSnapshot)
     val gsh    = if (shippingProfile) m68k040.top.ShippingPlugins.gshare(shippingIpc)
                  else new m68k040.frontend.GsharePlugin(retainRedirectHistory = retainRedirectHistory)
     val fa     = if (shippingProfile) m68k040.top.ShippingPlugins.fetchAlign(shippingIpc)

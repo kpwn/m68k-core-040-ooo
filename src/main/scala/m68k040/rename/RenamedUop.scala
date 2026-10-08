@@ -181,6 +181,11 @@ case class RenamedUop() extends Bundle {
   // decode -> here -> IqContext -> branch EU -> BranchCompletion -> ROB.
   val phtValid     = Bool()
   val phtIndex     = UInt(11 bits)
+  // Per-branch RAS recovery snapshot (`CPU_RAS_BRANCH_SNAPSHOT`): the RAS pointer /
+  // occupancy / top-of-stack AFTER this uop's fetch group. Threaded decode -> here -> the
+  // ROB's alloc-time `rasSnapMem` (the only reader). Inert (valid=False) when the option
+  // is off or the group carried no snapshot; with the option off nothing reads it.
+  val rasSnap      = m68k040.services.RasSnapRec()
   // CAS/CAS2 compute sub-form (DecOp.CASOP): selects the compute kernel in the ALU EU
   // (CASS/CASC/CAS2C1/CAS2C2/CAS2DC/CAS2SEL — see DecodedUop.casForm / CasForm). Threaded
   // decode -> here -> IqContext -> ALU EU. Default 0 (a non-CAS µop never reads it).

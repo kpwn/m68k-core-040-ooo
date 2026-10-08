@@ -185,7 +185,13 @@ object RasRepair {
   val RET  = 2
 }
 
-class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
+class RasPlugin(val branchRepair: Boolean = false,
+                /** `CPU_RAS_BRANCH_SNAPSHOT` (DEFAULT OFF): per-branch pointer + TOS recovery.
+                  * See the `snap` block below and `RasSnapRec`. */
+                val branchSnapshot: Boolean = false)
+    extends FiberPlugin with m68k040.services.RasSnapshotService {
+  override def snapshotEnabled: Boolean = branchSnapshot
+  override def liveSnapshot: m68k040.services.RasSnapRec = logic.snapLive
 
   val logic = during build new Area {
     val entries = Global.RAS_ENTRIES.get
@@ -260,7 +266,22 @@ class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
     // so the parked write cannot resurrect it one cycle later. A push on the same cycle
     // as `invalidateAll` still writes its row (the old code did too: invalidate clears only
     // rasSp/count); that row is unowned (count=0) and never observable.
-    val pendValid = RegNext(pushValid && !checkpointRestore) init False
+    // ---- branchSnapshot ports (see the `snap` block below). Declared unconditionally,
+    //      idle-defaulted, like the repair ports; with the option OFF nothing reads them. ----
+    val snapApply = Bool();          snapApply.allowOverride; snapApply := False
+    val snapSp    = UInt(spBits bits);  snapSp.allowOverride;    snapSp    := U(0, spBits bits)
+    val snapCount = UInt(cntBits bits); snapCount.allowOverride; snapCount := U(0, cntBits bits)
+    val snapTos   = UInt(32 bits);      snapTos.allowOverride;   snapTos   := U(0, 32 bits)
+    snapApply.simPublic()
+    if (branchSnapshot) {
+      require(spBits == m68k040.services.RasSnapRec.SP_W && cntBits == m68k040.services.RasSnapRec.CNT_W,
+        s"branchSnapshot: RasSnapRec widths are fixed for a 16-entry RAS (entries=$entries)")
+    }
+    // A wrong-path push on the snapshot-apply cycle must not land one cycle LATER on top of
+    // the restored top-of-stack (it would if its slot is `snapSp-1`), so it is dropped
+    // exactly like a push on a restore cycle. `snapApply` is a bare register Q.
+    val pendValid = if (branchSnapshot) RegNext(pushValid && !checkpointRestore && !snapApply) init False
+                    else RegNext(pushValid && !checkpointRestore) init False
     val pendIdx   = RegNext(rasSp)
     val pendData  = RegNext(pushRetPc)
     pendValid.simPublic(); pendIdx.simPublic(); pendData.simPublic()
@@ -334,6 +355,41 @@ class RasPlugin(val branchRepair: Boolean = false) extends FiberPlugin {
         count := count - U(1, cntBits bits)   // topIsData implies count =/= 0
       }
     } else null
+
+    // ---- branchSnapshot: restore the MISPREDICTING BRANCH's own post-fetch state ----
+    // `snapApply` (a register Q from the ROB, = Tier-1 `earlyFire` && the branch carried a
+    // snapshot) installs the pointer/occupancy the RAS had right after that branch's fetch
+    // group, and rewrites the one entry at its top of stack. This REPLACES, for that event,
+    // both the ROB-drain checkpoint copy (which the wiring then withholds) and the
+    // `branchRepair` delta (the snapshot already includes the branch's own push/pop), so
+    // every correct-path call/return fetched between the last ROB drain and the branch is
+    // kept instead of being rolled back. Entries below the restored top come from the
+    // live array (only a wrong-path pop-then-push sequence deeper than one level can have
+    // overwritten them: a prediction-QUALITY residual, never a correctness one -- the
+    // branch EU verifies every return target).
+    //
+    // Placed after the fetch push/pop and the repair (it wins over both: anything else on
+    // this cycle is wrong-path or stale) and BEFORE invalidateAll/checkpointRestore, which
+    // keep their priority. All controls and data are register Qs; the per-entry write
+    // enable is a 4-bit decode of `snapSp-1` off flops. Nothing joins the redirect cone.
+    val snap = if (branchSnapshot) new Area {
+      val tosIdx = snapSp - U(1, spBits bits)
+      when(snapApply) {
+        rasSp := snapSp
+        count := snapCount
+        when(snapCount =/= U(0, cntBits bits)) { ras(tosIdx) := snapTos }
+      }
+    } else null
+
+    // ---- live post-group state for DecodeStage's per-tag snapshot table ----
+    // Register Qs plus the existing push-bypassed top-of-stack read (`predTarget`).
+    val snapLive = m68k040.services.RasSnapRec()
+    if (branchSnapshot) {
+      snapLive.valid := True
+      snapLive.sp    := rasSp
+      snapLive.count := count
+      snapLive.tos   := predTarget
+    } else snapLive.setInert()
 
     // ---- invalidateAll: clear occupancy (and the pointer) on an I-cache flush ----
     when(invalidateAll) {
