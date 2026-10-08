@@ -2015,6 +2015,51 @@ class DcacheSpec extends AnyFunSuite {
       "the untouched neighbouring block must still hold its dirty cached value")
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CPU_DCACHE_KB: the PAGE predicate must hold for EITHER geometry. Three dirty
+  // lines in the SAME set (the addresses below are multiples of 4 KiB apart, which is a multiple of the way size at both 8 and
+  // 16 KiB, so all three share a set and differ ONLY in tag bits at/above
+  // paddr[12]). That is exactly where the tag/index split moves between the two
+  // geometries (tag LSB = paddr[11] at 8 KiB, paddr[12] at 16 KiB), so a page
+  // predicate with the wrong bit offset fails one of the two arms below.
+  //   X = 0x20040 (8 KB page 0x20000, lower 4 KB), Y = X + 0x1000 (same 8 KB page,
+  //   upper 4 KB), Z = X + 0x2000 (next 8 KB page).
+  // ═══════════════════════════════════════════════════════════════════════════
+  def sameSetPageCoverage(name: String, seed: Int, is8K: Boolean): Map[Long, Boolean] = {
+    val X = 0x20040L; val lines = Seq(X, X + 0x1000L, X + 0x2000L)
+    var out: Map[Long, Boolean] = null
+    sharedCompiled.doSim(name, seed) { dut =>
+      val (cd, mem) = initDut(dut)
+      cd.waitSampling(8)
+      dut.mmuCtrl.logic.pageSize8K #= is8K
+      cd.waitSampling(2)
+      assert(dut.mmuCtrl.logic.pageSize8K.toBoolean == is8K, "TCR.P poke did not stick")
+      assert(lines.map(setOf).distinct.size == 1, "precondition: all three lines share one set")
+      lines.foreach { b =>
+        preload(mem, b, 16)
+        load(dut, cd, b, Size.LONG, CacheMode.WRITETHROUGH)
+        doStore(dut, cd, b + 4, p131Mark(b), Size.LONG, CacheMode.COPYBACK)
+      }
+      lines.foreach { b => assert(peekLong(mem, b + 4) != p131Mark(b), f"0x$b%x leaked early") }
+      maintPulse(dut, cd, push = true, invalidate = false, SCOPE_PAGE, SEL_DC, X)
+      maintWait(dut, cd)
+      cd.waitSampling(8)
+      out = lines.map(b => b -> (peekLong(mem, b + 4) == p131Mark(b))).toMap
+    }
+    out
+  }
+
+  test("CPUSHP page predicate is geometry-correct: same-set lines in 4 KB / 8 KB neighbours",
+       VerilatorTest) {
+    val X = 0x20040L
+    val p4 = sameSetPageCoverage("dckb_4k", 141, is8K = false)
+    assert(p4(X) && !p4(X + 0x1000L) && !p4(X + 0x2000L),
+      s"TCR.P=0: CPUSHP must push exactly the operand's 4 KB page (got $p4)")
+    val p8 = sameSetPageCoverage("dckb_8k", 142, is8K = true)
+    assert(p8(X) && p8(X + 0x1000L) && !p8(X + 0x2000L),
+      s"TCR.P=1: CPUSHP must push both 4 KB halves of the 8 KB page and nothing beyond (got $p8)")
+  }
+
   // (P5.4-d) An IC-only selector has no D-cache work: it completes without walking and
   // without disturbing a resident dirty line.
   test("an IC-only maintenance selector does no D-cache work at all", VerilatorTest) {
