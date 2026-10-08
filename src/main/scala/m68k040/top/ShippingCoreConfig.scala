@@ -526,7 +526,7 @@ object ShippingCoreConfig {
     * way, so 16 KiB is 256 sets = exactly 4 KiB per way, still VIPT-safe for 4 KiB pages
     * (`DcachePlugin` re-checks `requireViptSafe(4096)`). The set index is a BRAM address bit
     * and the tag one bit narrower. `CPU_DCACHE_KB=16`; echoed in `SHIPPING_CONFIG`. */
-  val dcacheKB: Int = envInt("CPU_DCACHE_KB", 8, 8, 16)
+  val dcacheKB: Int = envInt("CPU_DCACHE_KB", 16, 8, 16)
   require(dcacheKB == 8 || dcacheKB == 16, s"CPU_DCACHE_KB must be 8 or 16 (got $dcacheKB)")
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
