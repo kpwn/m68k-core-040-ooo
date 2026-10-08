@@ -64,6 +64,13 @@ class UmWriteSpec extends AnyFunSuite {
     }
   }
 
+  /** With either TLB-miss-cost-chain flag ON (they reach `new DtlbPlugin()` through its
+    * constructor defaults), a walk whose owner is squashed by `umFlush` is DROPPED: the
+    * real core's `umFlush` is `doFlush`, which empties the whole LS pipe, so nobody is
+    * waiting for that response. The U/M and ATC-fill properties below are unchanged. */
+  private val squashDropsResponse =
+    m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk || m68k040.top.ShippingCoreConfig.walkAbortOnFlush
+
   class Dut(wideRetirement: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
@@ -226,7 +233,11 @@ class UmWriteSpec extends AnyFunSuite {
       while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) {
         cd.waitSampling(); guard += 1
       }
-      assert(dut.probe.logic.rspOut.ready.toBoolean, "poisoned walk still returns its tagged result")
+      if (squashDropsResponse)
+        assert(!dut.probe.logic.rspOut.ready.toBoolean,
+          "CPU_DTLB_HIT_UNDER_WALK / CPU_WALK_ABORT_ON_FLUSH: a squashed walk must NOT respond")
+      else
+        assert(dut.probe.logic.rspOut.ready.toBoolean, "poisoned walk still returns its tagged result")
       dut.probe.logic.reqIn.valid #= false
       cd.waitSampling(2)
 
@@ -281,7 +292,10 @@ class UmWriteSpec extends AnyFunSuite {
         dut.probe.logic.flush #= false
         guard = 0
         while (!dut.probe.logic.rspOut.ready.toBoolean && guard < 300) { cd.waitSampling(); guard += 1 }
-        assert(dut.probe.logic.rspOut.ready.toBoolean, s"poisoned walk (robId=$robId) still returns its tagged result")
+        if (squashDropsResponse)
+          assert(!dut.probe.logic.rspOut.ready.toBoolean, s"squashed walk (robId=$robId) must NOT respond")
+        else
+          assert(dut.probe.logic.rspOut.ready.toBoolean, s"poisoned walk (robId=$robId) still returns its tagged result")
         dut.probe.logic.reqIn.valid #= false
         cd.waitSampling(2)
         // Committing the poisoned walk's own robId must still drain nothing

@@ -114,7 +114,8 @@ case class LsFault() extends Bundle {
   *                        walker's `force` bit outranks the ordinary LS pipe for the
   *                        D-cache load port (never the exception sequencer's own
   *                        presented command). A constructor parameter, not a `Global`
-  *                        key, so directed tests can shorten it.
+  *                        key, so directed tests can shorten it. The default comes from
+  *                        `ShippingCoreConfig.walkAgeLimit` (`CPU_WALK_AGE_LIMIT`, 64).
   * @param walkerWedgeLimit W26's observability bound: cycles a walker may hold either
   *                        D-cache port with NO progress on any channel before the sticky
   *                        `walkerPortWedge` report rises.
@@ -130,7 +131,7 @@ case class LsFault() extends Bundle {
   *                        across one at all; this bound is the second line of defence, and
   *                        a false halt would be far worse than a late report.) 2^20 cycles
   *                        is ~5 ms at 200 MHz. */
-class LsEuPlugin(val walkerAgeLimit: Int = 64,
+class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAgeLimit,
                  val walkerWedgeLimit: Int = 1 << 20,
                  val alignedLoadFallThrough: Boolean = false,
                  val earlyIntWakeup: Boolean = false,

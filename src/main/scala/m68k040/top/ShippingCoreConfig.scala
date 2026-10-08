@@ -611,4 +611,29 @@ object ShippingCoreConfig {
     * Note the INVERTED sense of the variable: it is a DISABLE, kept that way so every
     * existing build and testbench that does not set it is bit-identical to before. */
   val icachePrefetch: Boolean = !envFlag("DBG_IC_PREFETCH_DISABLE", false)
+
+  // ── TLB-MISS COST CHAIN (Fable review §1 item 6, §2.3, §4.3) ─────────────────────
+  /** `LsEuPlugin.walkerAgeLimit`: un-granted cycles after which a table walker's
+    * descriptor read outranks the ordinary LS pipe for the D-cache load port. 64 is the
+    * historical value; the counter width follows it (`log2Up(limit + 1)`), so a smaller
+    * value is strictly less logic. Reaches every harness through the constructor
+    * DEFAULT (the `sqDepth` precedent). `CPU_WALK_AGE_LIMIT`; echoed in SHIPPING_CONFIG. */
+  val walkAgeLimit: Int = envInt("CPU_WALK_AGE_LIMIT", 1, 1, 1024)
+  /** DTLB: when the access that owns an in-flight table walk is SQUASHED (backend
+    * `doFlush`, or the exception sequencer taking over the port), DETACH the walk: clear
+    * `missPending` at once so younger translations are answered from the ATC while the
+    * dead walk finishes in the background with its response, fill and U/M write
+    * suppressed. A miss captured meanwhile waits in `missReqReg` for the walker to go
+    * idle. The LS pipe is in order (one P2T slot), so a LIVE walk can never have a
+    * second LS request behind it; the dead-walk window is the only place a hit can be
+    * served "under" a walk. OFF pending measurement; `CPU_DTLB_HIT_UNDER_WALK=1`. */
+  val dtlbHitUnderWalk: Boolean = envFlag("CPU_DTLB_HIT_UNDER_WALK", true)
+  /** DTLB: when the owning access is squashed (same trigger as above), ABORT the walk at
+    * the next level boundary -- issue no further descriptor reads; an already-issued
+    * read is still consumed by the walker -- and drop its response/fill/U-M write.
+    * Independent of `dtlbHitUnderWalk`: alone it shortens how long a dead walk blocks
+    * the DTLB; with it the DTLB is not blocked at all and the abort only frees the
+    * walker (and the D-cache port) sooner for the next miss.
+    * OFF pending measurement; `CPU_WALK_ABORT_ON_FLUSH=1`. */
+  val walkAbortOnFlush: Boolean = envFlag("CPU_WALK_ABORT_ON_FLUSH", true)
 }

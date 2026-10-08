@@ -50,9 +50,18 @@ import spinal.lib.fsm._
   * the AXI-id guard the dedicated port used to carry.
   *
   * Bounded latency: three dependent reads. Single-outstanding (one walk at a time). */
-class TableWalker(batchMode: Boolean = false) extends Component {
+class TableWalker(batchMode: Boolean = false,
+                  /** Elaborate `io.abort` (`CPU_WALK_ABORT_ON_FLUSH`). False builds the
+                    * exact pre-change component: no port, no state. */
+                  abortable: Boolean = false) extends Component {
   val io = new Bundle {
     val start = in Bool ()
+    /** ABORT the walk in progress: issue no further descriptor read, wait for an
+      * already-issued one to answer (the response is unlabelled and must be consumed
+      * here, never by the next walk), then FINISH with `fault = 1` and no U/M write.
+      * Sticky until the next `start`; ignored while idle. The owner suppresses the
+      * response/fill itself -- the forced fault is only defence in depth. */
+    val abort = abortable generate (in Bool ())
     val req   = in(WalkReq())
     val busy  = out Bool ()
     val done  = out Bool ()      // 1-cycle pulse when the walk resolves
@@ -213,6 +222,11 @@ class TableWalker(batchMode: Boolean = false) extends Component {
   val descRspOwnData = ownBytes(0) ## ownBytes(1) ## ownBytes(2) ## ownBytes(3)
   val decodedDesc = if (batchMode) descRspOwnData else descRspData
 
+  // Sticky abort (see `io.abort`). `aborting` includes the live input so the abort
+  // also suppresses a descriptor read being offered in the SAME cycle it arrives.
+  val abortReg = abortable generate RegInit(False)
+  val aborting: Bool = if (abortable) abortReg || io.abort else null
+
   val fsm = new StateMachine {
     val IDLE     = new State with EntryPoint
     val RD_ROOT  = new State
@@ -224,7 +238,7 @@ class TableWalker(batchMode: Boolean = false) extends Component {
     // until it is accepted. `cmdSent` makes the command single-shot, so a level-held
     // `valid` cannot be double-accepted while the response is outstanding.
     def issueRead(): Unit = {
-      when(!cmdSent) {
+      when(if (abortable) !cmdSent && !aborting else !cmdSent) {
         io.loadCmd.valid := True
         when(io.loadCmd.ready) { cmdSent := True }
       }
@@ -242,8 +256,24 @@ class TableWalker(batchMode: Boolean = false) extends Component {
       rUmValid := False
     }
 
+    // Abort exit, applied LAST in each RD_* state so it overrides that state's own
+    // transition: leave once no read is outstanding (`!cmdSent`) or the outstanding
+    // read has just answered (`descRspValid`, consumed and discarded here).
+    def abortExit(): Unit = if (abortable) {
+      when(aborting && (!cmdSent || descRspValid)) {
+        rFault   := True
+        rReason  := MmuFaultReason.NON_RESIDENT
+        rUmValid := False
+        if (batchMode) for (i <- 0 until 3) { rBatchValid(i) := False }
+        cmdSent  := False
+        descSplitIdx := 0
+        goto(FINISH)
+      }
+    }
+
     IDLE.whenIsActive {
       when(io.start) {
+        if (abortable) abortReg := False
         reqReg := io.req
         accWriteProt := False
         rFault  := False
@@ -286,6 +316,7 @@ class TableWalker(batchMode: Boolean = false) extends Component {
           goto(RD_PTR)
         }
       }
+      abortExit()
     }
 
     // ---- POINTER level ----
@@ -318,6 +349,7 @@ class TableWalker(batchMode: Boolean = false) extends Component {
           goto(RD_PAGE)
         }
       }
+      abortExit()
     }
 
     // ---- PAGE (leaf) level ----
@@ -384,6 +416,7 @@ class TableWalker(batchMode: Boolean = false) extends Component {
         rUmByte  := newByte
         goto(FINISH)
       }
+      abortExit()
     }
 
     FINISH.whenIsActive {
@@ -392,6 +425,7 @@ class TableWalker(batchMode: Boolean = false) extends Component {
     }
   }
 
+  if (abortable) when(io.abort && !fsm.isActive(fsm.IDLE)) { abortReg := True }
   io.busy := !fsm.isActive(fsm.IDLE)
   io.done := donePulse
 
