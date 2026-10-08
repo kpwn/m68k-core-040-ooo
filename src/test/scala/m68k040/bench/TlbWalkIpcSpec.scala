@@ -148,10 +148,16 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
       s"walkAbortOnFlush=${m68k040.top.ShippingCoreConfig.walkAbortOnFlush} shipping=$shipping")
     for (k <- kernels) {
       var dWalks = 0; var iWalks = 0; var dWalkBusy = 0; var iWalkBusy = 0; var dRead = 0
+      var orderHold = 0; var orderHoldEv = 0   // CPU_WALK_SQ_CHECK: withheld descriptor reads
       dutProbe = { dut =>
         val cd = dut.clockDomain
-        var prevD = false; var prevI = false
+        var prevD = false; var prevI = false; var prevH = false
+        val holdTap = Option(dut.dtlb.logic.dbgWalkOrderHold)
         cd.onSamplings {
+          holdTap.foreach { t => val h = t.toBoolean
+            if (h) orderHold += 1
+            if (h && !prevH) orderHoldEv += 1
+            prevH = h }
           val db = dut.dtlb.logic.walker.io.busy.toBoolean
           val ib = dut.itlb.logic.walker.io.busy.toBoolean
           if (db) dWalkBusy += 1
@@ -165,7 +171,7 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
       dutProbe = null
       println(f"  TLBWALK ${k.name}%-16s cycles=${r.windowCycles}%7d retired=${r.retiredInstrs}%6d " +
         f"ipc=${r.retiredInstrs.toDouble / r.windowCycles}%.4f dWalks=$dWalks%5d dWalkBusy=$dWalkBusy%7d " +
-        f"iWalks=$iWalks%5d iWalkBusy=$iWalkBusy%7d")
+        f"iWalks=$iWalks%5d iWalkBusy=$iWalkBusy%7d walkOrderHold=$orderHoldEv%d/${orderHold}cyc")
     }
   }
 }

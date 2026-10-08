@@ -132,6 +132,8 @@ class IpcBenchSpec extends CoreBenchHarness {
         deferTakenSlot1Conditional = sys.env.get("IPC_V2_DEFER").contains("1")))
     println(s"  core profile: ${if (shipping) "SHIPPING (ShippingPlugins)" else if (v2) "throughput-v2 (board)" else "baseline (all options off)"}")
     val results = kernels.map(k => runKernel(compiled, k))
+    println(s"  [walkorder] CPU_WALK_SQ_CHECK=${m68k040.top.ShippingCoreConfig.walkSqCheck} " +
+      s"held descriptor-read cycles (all kernels) = $walkOrderHoldCycles")
 
     // ── Print the table ───────────────────────────────────────────────────────
     println()

@@ -636,6 +636,15 @@ object ShippingCoreConfig {
     * walker (and the D-cache port) sooner for the next miss.
     * OFF pending measurement; `CPU_WALK_ABORT_ON_FLUSH=1`. */
   val walkAbortOnFlush: Boolean = envFlag("CPU_WALK_ABORT_ON_FLUSH", true)
+  /** DTLB walk vs older store (docs/design/10-review.md section 3 item 2). With this ON, a
+    * table-walk descriptor read is withheld from the D-cache while the store queue -- or
+    * the P3 store stage, the one place an older store can still be before it allocates --
+    * holds a store to the SAME 16-byte line, and the walk's owner is live. A live walk's
+    * owner sits in P2T, the LS pipe is in order and stores issue only as the oldest LS op,
+    * so every store older than the owner is in P3 or the SQ by then and no older one can
+    * arrive later: one compare at the walker's request is complete. Cold path only.
+    * `CPU_WALK_SQ_CHECK=1`. */
+  val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", false)
 
   /** gshare PHT organisation (docs/design/10-review.md §1 item 5, §4.5, §5.3).
     *

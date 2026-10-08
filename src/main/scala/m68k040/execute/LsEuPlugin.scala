@@ -551,6 +551,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       Seq(host.get[m68k040.services.ItlbWalkerDcacheClient],
           host.get[m68k040.services.DtlbWalkerDcacheClient])
     val walkPresent = walkClients.map(_.isDefined)
+    // `CPU_WALK_SQ_CHECK`: the DTLB walker exports its pending descriptor address and
+    // takes a hold back from here (see the `walkOrderHold` drive below).
+    val walkOrderClient: Option[m68k040.services.DtlbWalkerDcacheClient] =
+      host.get[m68k040.services.DtlbWalkerDcacheClient].filter(_.walkOrderHold != null)
     val anyWalkerPresent = walkPresent.exists(identity)
 
     // Per-walker request views. A DUT that hosts no TLB plugin (the standalone LS-EU
@@ -765,7 +769,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       retireWidth = retirement.map(_.retiredRobIds.length).getOrElse(2),
       narrowDrainMerge = sqNarrowDrainMerge,
       inhibitedFullBarrier = inhibitedFullBarrier,
-      coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold)
+      coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold,
+      walkLineQuery = walkOrderClient.isDefined)
     val sqCoalesceFire    = if (sqCoalesceLines) sq.io.coalesceFire else null
     val sqCoalesceHolding = if (sqCoalesceLines) sq.io.coalesceHolding else null
     val sqCoalesceTimeout = if (sqCoalesceLines) sq.io.coalesceTimeout else null
@@ -4441,6 +4446,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val p3Front          = p3Ctx.front
     val p3IsLoad         = p3Front.memOp === MemOp.LOAD
     val p3IsStore        = p3Front.memOp === MemOp.STORE
+    // ── CPU_WALK_SQ_CHECK: hold a live DTLB walk's descriptor read behind an older store
+    // to the same 16-byte line. The walk's owner is in P2T; the LS pipe is in order and a
+    // store issues only as the oldest LS op, so every store older than the owner is in P3
+    // (not yet allocated) or resident in the SQ, and nothing older can arrive later. The
+    // compare is flop-sourced (TableWalker.descAddr, P3/SQ registers) and ends at the
+    // DTLB's staged walker request (`m2sPipe` flop) -- no grant/arbiter path is touched.
+    walkOrderClient.foreach { c =>
+      val q = c.walkOrderAddr(31 downto 4)
+      val p3Hit = p3Valid && p3IsStore && !excActive &&
+                  ((p3Ctx.paddr(31 downto 4) === q) ||
+                   (p3Front.twoAccess && (p3Ctx.paddrB(31 downto 4) === q)))
+      sq.io.walkLineAddr := c.walkOrderAddr
+      c.walkOrderHold := c.walkOrderLive && (sq.io.walkLineHit || p3Hit)
+    }
     val p3LateDataPending = lateStoreData.map(_ => p3Front.lateDataPending).getOrElse(False)
     val p3Reserved = if(reserveLateStore && !detachLateStore) RegInit(False) else False
     val p3ReservationFire = Bool(); p3ReservationFire := False
