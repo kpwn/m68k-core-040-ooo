@@ -68,6 +68,13 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   lazy val compiledDut = M68kSim().withVerilator.compile(new FullCoreDut)
   private val simCounter = new java.util.concurrent.atomic.AtomicInteger(0)
   private def freshSimName(name: String): String = s"$name-${simCounter.incrementAndGet()}"
+  /** LS_SIM_SEED=<int> pins the SpinalSim seed (randomised register/PRF init) so a
+    * failing lock-step case can be replayed deterministically; unset = random as before. */
+  private def doSimEnvSeed(name: String)(body: FullCoreDut => Unit): Unit =
+    sys.env.get("LS_SIM_SEED") match {
+      case Some(s) => compiledDut.doSim(name, seed = s.trim.toInt)(body)
+      case None    => compiledDut.doSim(name)(body)
+    }
 
   /** Wires IQ issue ports to the two ALU EUs + the branch EU, the EU completions
     * to the ROB, and the ROB's commit-time mispredict redirect (RedirectService)
@@ -845,7 +852,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       s"[$name] oracle produced ${oracleSteps.size} steps, expected >= $n (program ran past its end?)")
     val oracle = oracleSteps.take(n)
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       duringRun(dut, cd)
       val handle = new WhiteboxCapture.Handle
@@ -1675,7 +1682,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // the same DUT execution rather than a newly randomized acceptance schedule.
     simSeed match {
       case Some(seed) => compiledDut.doSim(freshSimName("case"), seed = seed)(runSimulation)
-      case None       => compiledDut.doSim(freshSimName("case"))(runSimulation)
+      case None       => doSimEnvSeed(freshSimName("case"))(runSimulation)
     }
   }
 
@@ -1815,7 +1822,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i)  => i
       case Left(err) => fail(s"ProgramAssembler.assemble failed: ${err.reason}")
     }
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       var recognizedAt = -1
       var cyc = 0
@@ -1932,7 +1939,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"ProgramAssembler.assemble failed: ${err.reason}")
     }
     val loopPc = loadAddr + 6L // movew(4) + moveq(2) -> dbf's own PC
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       var loopRetires = 0L
       var pokeCyc = -1L
@@ -2072,7 +2079,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i) => i
       case Left(e)  => fail(s"assemble failed: ${e.reason}")
     }
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -2094,8 +2101,24 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       dut.fa.logic.redirect.valid #= true; dut.fa.logic.redirect.payload #= loadAddr
       cd.waitSampling(); dut.fa.logic.redirect.valid #= false
       // Let the vector-install prologue (move.l #handler,%d0 ; move.l %d0,0x7c) fully
-      // commit and the CPU settle into the tight loop before raising IPL.
-      cd.waitSampling(60)
+      // commit and the CPU settle into the tight loop before raising IPL. Wait on the
+      // COMMIT of the vector store (the 2nd retired macro after the redirect), not a fixed
+      // cycle count: the store is precise (MMU off) and its latency depends on the
+      // randomised initial D-cache state, so with some SpinalSim seeds it is still the ROB
+      // head 60 cycles in. An NMI recognized at that store's boundary vectors through an
+      // UNINSTALLED 0x7C (random memory); the core then runs wild through repeated faults
+      // and never reaches a first-uop boundary to take the second edge.
+      var macrosCommitted = 0
+      var settle = 0
+      while (macrosCommitted < 2 && settle < 5000) {
+        cd.waitSampling(); settle += 1
+        for (k <- dut.rob.logic.ordinaryCommitObs.indices) {
+          val o = dut.rob.logic.ordinaryCommitObs(k)
+          if (o.fire.toBoolean && o.macroLast.toBoolean) macrosCommitted += 1
+        }
+      }
+      assert(macrosCommitted >= 2, s"vector-install prologue never committed within $settle cycles -- setup broken")
+      cd.waitSampling(20)
 
       var pulses = 0
       cd.onSamplings { if (dut.rob.logic.interruptPending.toBoolean) pulses += 1 }
@@ -3145,7 +3168,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -3222,7 +3245,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var sawRteRetire = false
     var uspBefore = BigInt(0)
     var uspAfter  = BigInt(0)
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -4772,7 +4795,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[$name] oracle produced ${oracleSteps.size}, expected >= $nInstr")
     val oracle = oracleSteps.take(nInstr)
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       var irqRaised = false
@@ -5047,7 +5070,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5125,7 +5148,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i) => i
       case Left(e)  => fail(s"assemble failed: ${e.reason}")
     }
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5240,7 +5263,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i) => i
       case Left(e)  => fail(s"assemble failed: ${e.reason}")
     }
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5375,7 +5398,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var d4Seen    = -1L
     var sawExc    = false
     var excVec    = -1
-    compiledDut.doSim(freshSimName("fmove-fpctrl")) { dut =>
+    doSimEnvSeed(freshSimName("fmove-fpctrl")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5488,7 +5511,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var fpccWrCount   = 0
     var sawExc        = false
     var excVec        = -1
-    compiledDut.doSim(freshSimName("fmove-fpsr-fpcc")) { dut =>
+    doSimEnvSeed(freshSimName("fmove-fpsr-fpcc")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5618,7 +5641,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var fpcrSeen = BigInt(-1); var fpsrSeen = BigInt(-1); var fpiarSeen = BigInt(-1)
     val d = scala.collection.mutable.Map[Int, Long]()
     var sawExc = false; var excVec = -1
-    compiledDut.doSim(freshSimName("fmovem-fpctrl-list")) { dut =>
+    doSimEnvSeed(freshSimName("fmovem-fpctrl-list")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -5722,7 +5745,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var sawPriv = false
     var vec = -1
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
@@ -6715,7 +6738,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Right(i)  => i
       case Left(err) => fail(s"assemble failed: ${err.reason}")
     }
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -6818,7 +6841,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     var committed = 0
     var faulted = false
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       val dmem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -7596,7 +7619,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[pagefault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
@@ -7801,7 +7824,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[wpfault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
 
@@ -8002,7 +8025,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i) => i; case Left(e) => fail(s"[itlb-a] assemble: ${e.reason}") }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -8119,7 +8142,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[itlb-b] oracle produced ${oracleSteps.size} steps (< $nInstr)")
     val oracle = oracleSteps.take(nInstr)
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -8263,7 +8286,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(oracleSteps.size >= nInstr, s"[itlb-c] oracle produced ${oracleSteps.size} steps (< $nInstr)")
     val oracle = oracleSteps.take(nInstr)
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       wireWhitebox(dut, handle)
@@ -9728,7 +9751,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[fx-mi-fault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
@@ -10005,7 +10028,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[movem-load-fault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
@@ -10231,7 +10254,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[movem-store-fault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
@@ -10467,7 +10490,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[movem-2page-noload-fault] assemble failed: ${err.reason}")
     }
 
-    compiledDut.doSim(freshSimName("case")) { dut =>
+    doSimEnvSeed(freshSimName("case")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       // Whitebox writeback tap (mirrors the pinned mid-list LOAD-fault test's own
       // capture setup above): records every completing int-register write, keyed
@@ -11224,7 +11247,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // 3 NOPs (2 bytes each) then the BRA.S opword.
     val loopPc = loadAddr + 6
 
-    compiledDut.doSim(freshSimName("bra-self-loop")) { dut =>
+    doSimEnvSeed(freshSimName("bra-self-loop")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
 
       // Attach the I-fetch memory with a PLAIN ZERO fill past the image -- no
@@ -11390,7 +11413,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val pcHits  = scala.collection.mutable.ArrayBuffer[Long]()
     var arTotal = 0
 
-    compiledDut.doSim(freshSimName(tag)) { dut =>
+    doSimEnvSeed(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
 
       // Zero-fill sparse memory: answers a read at ANY address (so the run-ahead
@@ -11567,7 +11590,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var sawInhibitedAtGate = false
     var commits = 0
 
-    compiledDut.doSim(freshSimName(tag)) { dut =>
+    doSimEnvSeed(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       // Since `2db5bd3` the table walkers have no AXI master of their own -- their
@@ -11706,7 +11729,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var cyc          = 0
     val budget       = 200000
 
-    compiledDut.doSim(freshSimName("inh-irq-replay")) { dut =>
+    doSimEnvSeed(freshSimName("inh-irq-replay")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -12151,7 +12174,8 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   def picNilIrqStorm(tag: String, calls: Int, dc: m68k040.sim.AxiMemModelConfig, cacr: Long,
                      gapMax: Int = 61, mmuOn: Boolean = false,
                      longHandler: Boolean = false, touchMp: Boolean = false,
-                     rtsExit: Boolean = false, blockMove: Boolean = false, storm: Boolean = true): Unit = {
+                     rtsExit: Boolean = false, blockMove: Boolean = false, storm: Boolean = true,
+                     simSeed: Option[Int] = None): Unit = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
     val src = PicNil.program(calls, 0, irq = true, mmuOn = mmuOn, longHandler = longHandler, touchMp = touchMp,
                              rtsExit = rtsExit, blockMove = blockMove)
@@ -12161,10 +12185,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     }
     val writerPc = PicNil.writerPc(PicNil.RomOff)
     var doneSeen = false; var excEntries = 0; var writerRetires = 0; var cyc = 0
-    val budget = 3000000
+    val budget = sys.env.get("P163_BUDGET").map(_.trim.toInt).getOrElse(3000000)
+    val diag = sys.env.contains("P163_DIAG")
+    var lastCommitCyc = 0; var lastCommitPc = 0L; var lastExcCyc = 0
+    val traceFrom = sys.env.get("P163_TRACE_FROM").map(_.trim.toInt).getOrElse(-1)
+    val traceLen  = sys.env.get("P163_TRACE_LEN").map(_.trim.toInt).getOrElse(600)
+    var lastTrace = ""
     var tripReport = ""; var tripHits = 0; var recent = ""; var a0 = -1L
     var picBytes: Seq[Int] = Nil
-    compiledDut.doSim(freshSimName(tag)) { dut =>
+    def stormSim(body: FullCoreDut => Unit): Unit = simSeed match {
+      case Some(sd) => compiledDut.doSim(freshSimName(tag), seed = sd)(body)
+      case None     => doSimEnvSeed(freshSimName(tag))(body)
+    }
+    stormSim { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc))
@@ -12243,11 +12276,36 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           val o = dut.rob.logic.ordinaryCommitObs(k)
           // per-MACRO count: the commit obs fires per uop and the writer is a 2-uop macro
           if (o.fire.toBoolean && o.macroLast.toBoolean && (o.pc.toLong & 0xffffffffL) == writerPc) writerRetires += 1
+          if (diag && o.fire.toBoolean) { lastCommitCyc = cyc; lastCommitPc = o.pc.toLong & 0xffffffffL }
+        }
+        if (traceFrom >= 0 && cyc >= traceFrom && cyc < traceFrom + traceLen) {
+          val r = dut.rob.logic; val l = dut.lsEu.logic; val q = l.sq
+          def b(x: Bool) = if (x.toBoolean) "1" else "0"
+          val sqs = (0 until 8).map(i => s"${b(q.valids(i))}${b(q.committed(i))}${b(q.precises(i))}").mkString(",")
+          val line = f"rob h=${r.head.toInt} cnt=${r.count.toInt} pc=0x${r.p0.pc.toLong}%x f=${b(r.p0.first)} c=${b(r.completes(r.head.toInt))} " +
+            f"pdb=${b(r.preciseDrainBusyIn)} exI=${b(r.excIdle)} fl=${b(r.flushing)} ipl=${dut.intCtrl.logic.iplIn.toInt} | " +
+            f"p3=${b(l.p3Valid)} p4=${b(l.p4Valid)} p3fe=${b(l.p3FastEnq)} aEnq=${b(l.alignedEnq)} aCnt=${l.alignedCount.toInt} " +
+            f"aSendV=${b(l.alignedSendValid)} aHeld=${b(l.alignedSendHeld)} aRsp=${b(l.alignedRspFire)} cmd=${b(l.alignedCmdFire)} " +
+            f"fcH=${b(l.frontCompHeld)} cV=${b(l.compValid)} cRob=${l.compRobId.toInt} p4c=${b(l.p4CompletionFire)} p4la=${b(l.p4LaunchOk)} rA=${b(l.replayArm)} | " +
+            f"sq h=${q.head.toInt} t=${q.tail.toInt} ah=${q.acceptedHalves.toInt} pLR=${q.preciseLaunchRob.toInt} pAck=${b(q.preciseAckSeen)} dAck=${b(q.io.drainAck)} [$sqs] " +
+            f"sp=${b(sp.valid)}${b(sp.ready)} | pp=${l.pendPush.toInt} pr=${l.pendReady.toInt} pa=${l.pendApply.toInt} " +
+            f"scp=${b(dut.lsEu.sqCompletionPort.valid)}:${dut.lsEu.sqCompletionPort.payload.toInt} sqc=${b(q.io.sqCompletion.valid)} " +
+            f"orph=${b(q.io.sqCompletionOrphan)} sqfl=${b(dut.lsEu.sqFlushSig)} fkp=${b(q.io.flushKeptPrecise)} lcf=${b(l.liveCompletionFires)} " +
+            f"rids=${(0 until 8).map(i => q.robIds(i).toInt).mkString(",")} orphs=${(0 until 8).map(i => b(q.orphans(i))).mkString}"
+          if (line != lastTrace) { println(f"[p163tr][$cyc] $line"); lastTrace = line }
+        }
+        if (diag && cyc % 100000 == 0) {
+          val r = dut.rob.logic
+          println(f"[p163diag][$cyc] writer=$writerRetires exc=$excEntries lastCommit@$lastCommitCyc pc=0x$lastCommitPc%x " +
+            f"lastExc@$lastExcCyc cnt=${r.count.toInt} head=${r.head.toInt} p0.pc=0x${r.p0.pc.toLong}%x first=${r.p0.first.toBoolean} " +
+            f"comp=${r.completes(r.head.toInt).toBoolean} excIdle=${r.excIdle.toBoolean} fl=${r.flushing.toBoolean} " +
+            f"pdb=${r.preciseDrainBusyIn.toBoolean} ilb=${r.inhibitedLoadBusyIn.toBoolean} ip=${r.interruptPending.toBoolean} " +
+            f"halt=${r.coreHalted.toBoolean} stop=${r.stopped.toBoolean}")
         }
         if (sp.valid.toBoolean && sp.ready.toBoolean &&
             (sp.payload.paddr.toLong & 0xffffffffL) == PicNil.Done) doneSeen = true
         val excA = !dut.rob.logic.excIdle.toBoolean
-        if (excA && !lastExcActive) excEntries += 1
+        if (excA && !lastExcActive) { excEntries += 1; lastExcCyc = cyc }
         lastExcActive = excA
       }
       stormDone.set(true)
@@ -12309,6 +12367,19 @@ class ExecuteLockStepSpec extends AnyFunSuite {
           mmuOn = mmuOn, rtsExit = true, touchMp = true, blockMove = true, storm = storm)
       }
     }
+  }
+  // Pinned-seed replay of the 2026-10-09 integ wedge (shipping env, CPU_LS_P3_LAUNCH=1):
+  // with this SpinalSim seed the BlockMove burst fills the SQ with 8 precise stores while a
+  // drain-acked store's completion replay loses the shared stage to a P3-launched load's
+  // ring response; the next precise alloc then overwrote that backlogged `pendMem` record
+  // (LsEuPlugin `pendRingFull`), the replay completed a younger store's robId and the
+  // acked store never completed -> ROB head parked behind `preciseDrainBusy` at ~276k
+  // cycles. The seed only reproduces the exact schedule on the shipping config it was
+  // found on; on any config it is still a full storm run with every invariant checked.
+  test("p163 pic-header NIL store: BlockMove + CPUSHA, x40, mmuOff, D-side xbar, storm, seed 1567160976 (pendMem overwrite replay)", VerilatorTest) {
+    picNilIrqStorm("p163-picnil-cpusha-mmuOff-xbar-storm-s1567160976", calls = 40,
+      dc = m68k040.sim.L2Sweeps.todaysCrossbar, cacr = 0x80008000L, mmuOn = false, rtsExit = true,
+      touchMp = true, blockMove = true, storm = true, simSeed = Some(1567160976))
   }
   for ((mtag, mmuOn) <- Seq("mmuOn" -> true, "mmuOff" -> false);
        (dtag, dc) <- Seq("xbar" -> m68k040.sim.L2Sweeps.todaysCrossbar, "chaos" -> m68k040.sim.L2Sweeps.chaosDram)) {
@@ -12502,7 +12573,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[rte-ccr-storm] ProgramAssembler.assemble failed: ${err.reason}")
     }
     var goodSeen = false; var badSeen = false; var excEntries = 0; var cyc = 0
-    compiledDut.doSim(freshSimName("rte-ccr-storm")) { dut =>
+    doSimEnvSeed(freshSimName("rte-ccr-storm")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -12571,7 +12642,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       case Left(err) => fail(s"[rte-ccr-store-storm] ProgramAssembler.assemble failed: ${err.reason}")
     }
     var goodSeen = false; var badSeen = false; var excEntries = 0; var cyc = 0
-    compiledDut.doSim(freshSimName("rte-ccr-store-storm")) { dut =>
+    doSimEnvSeed(freshSimName("rte-ccr-store-storm")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -12678,7 +12749,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     val trace = scala.collection.mutable.ArrayBuffer[String]()
     var storeRetireCyc = -1; var ccrAfterStore = -1; var moveqRetireCyc = -1; var ccrAfterMoveq = -1
     var aluRetireCyc = -1; var ccrAfterAlu = -1
-    compiledDut.doSim(freshSimName("ccr-shadow")) { dut =>
+    doSimEnvSeed(freshSimName("ccr-shadow")) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd))
@@ -12984,7 +13055,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     var cyc = 0; val budget = 400000
     val oddHits = scala.collection.mutable.ArrayBuffer[String]()
     val recentPcs = scala.collection.mutable.ArrayBuffer[String]()
-    compiledDut.doSim(freshSimName(tag)) { dut =>
+    doSimEnvSeed(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       attachProgram(dut.icache.logic.axi, cd, loadAddr, image.bytes)
       m68k040.sim.HotDoorAttach(dut.dcache, cd, new m68k040.ls.BehavioralMemAgent(dut.dcache.logic.axi, cd, dcfg = dc))
@@ -13369,7 +13440,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       ((oracleSteps(j - 1).a(7) - oracleSteps(j).a(7)) & 0xffffffffL) == 60L)
       .getOrElse(fail(s"[$tag] no 60-byte (format-$$7) frame push found in the oracle trace"))
     val faultPc = oracleSteps(faultEntry - 1).pc
-    compiledDut.doSim(freshSimName(tag)) { dut =>
+    doSimEnvSeed(freshSimName(tag)) { dut =>
       val cd = dut.clockDomain; cd.forkStimulus(10)
       val handle = new WhiteboxCapture.Handle
       def captureWb(w: m68k040.execute.WbObs, secondDst: Boolean = false): Unit = if (w.valid.toBoolean) {
