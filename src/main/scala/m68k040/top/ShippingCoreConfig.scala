@@ -550,6 +550,12 @@ object ShippingCoreConfig {
     * the maintenance CHECK-invalidate write (tag-compare-dependent enable) is registered and
     * lands in NEXTW. Echoed in `SHIPPING_CONFIG`. */
   val dcacheVdRetime: Boolean = envFlag("CPU_DCACHE_VD_RETIME", true)
+  /** L1D tag-compare clock-enable retime (`CPU_DCACHE_TAG_CE_RETIME`, default OFF). Takes the
+    * live S2/S1 tag-compare miss terms out of the store S0 payload clock enable (a backup copy
+    * restores the one rare "held by a same-cycle miss" case one cycle later), out of the S3
+    * old-line capture enable, and delays the multi-hot debug evidence latch by one cycle.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val dcacheTagCeRetime: Boolean = envFlag("CPU_DCACHE_TAG_CE_RETIME", false)
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
