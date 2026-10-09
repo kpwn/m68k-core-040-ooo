@@ -155,6 +155,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                  /** See `ShippingCoreConfig.lsEarlyAnRetry`; effective only with
                    * `earlyAutoAnWriteback`. */
                  val earlyAnRetry: Boolean = m68k040.top.ShippingCoreConfig.lsEarlyAnRetry,
+                 /** See `ShippingCoreConfig.lsParkRetime`. */
+                 val parkRetime: Boolean = m68k040.top.ShippingCoreConfig.lsParkRetime,
                  val lsOooIssue: Boolean = false,
                  val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
@@ -777,7 +779,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       inhibitedFullBarrier = inhibitedFullBarrier,
       coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold,
       walkLineQuery = walkOrderClient.isDefined,
-      p3LineProbe = p3SqLineFilter)
+      p3LineProbe = p3SqLineFilter,
+      anyInhibitedOut = parkRetime)
+    // `parkRetime`: registered SUPERSET of "some resident SQ entry has an INHIBITED half".
+    // An entry's cache modes are written only at allocation, so an inhibited entry valid
+    // next cycle is resident now or allocated now (B mode ORed in regardless of `validB`
+    // -- conservative). False implies `sq.io.barrier.olderInhibitedStore` is False for ANY
+    // query robId, which lets the P4 fall-through skip the SQ age compare (below).
+    val sqInhibR: Bool = if (parkRetime) RegInit(True) else null
+    if (parkRetime) {
+      sqInhibR := sq.io.anyInhibited || (sq.io.alloc.valid &&
+        ((sq.io.alloc.payload.cacheMode === m68k040.cache.CacheMode.INHIBITED) ||
+         (sq.io.alloc.payload.cacheModeB === m68k040.cache.CacheMode.INHIBITED)))
+      sqInhibR.simPublic()
+      GenerationFlags.simulation {
+        assert(sqInhibR || !sq.io.anyInhibited, "LsEuPlugin: sqInhibR is not a superset", FAILURE)
+      }
+    }
     val sqCoalesceFire    = if (sqCoalesceLines) sq.io.coalesceFire else null
     val sqCoalesceHolding = if (sqCoalesceLines) sq.io.coalesceHolding else null
     val sqCoalesceTimeout = if (sqCoalesceLines) sq.io.coalesceTimeout else null
@@ -1250,6 +1268,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // this register every cycle under `GenerationFlags.simulation`; the shadow is
     // pruned from every netlist and fires in every LS/cache/lockstep suite.
     val p4RetryQ = RegInit(False)
+    // `parkRetime`: three DONT_TOUCH replicas of `p4RetryQ` (same reset, same four mirror
+    // assignments via `setP4RetryQ`), so each query-field group of `fwdQueryCtx` gets its
+    // own select flop instead of one fo~156 net in front of the SQ forward compare.
+    val p4RetryQRep: Vec[Bool] = if (parkRetime) Vec.fill(3)(RegInit(False)) else null
+    if (parkRetime) {
+      p4RetryQ.addAttribute("dont_touch", "true")
+      p4RetryQRep.foreach(_.addAttribute("dont_touch", "true"))
+    }
+    def setP4RetryQ(v: Bool): Unit = {
+      p4RetryQ := v
+      if (parkRetime) p4RetryQRep.foreach(_ := v)
+    }
     tValid.simPublic(); txValid.simPublic(); p3Valid.simPublic(); p4Valid.simPublic(); txSecond.simPublic()
     tCtx.robId.simPublic(); txCtx.robId.simPublic(); p3Ctx.front.robId.simPublic(); p4Ctx.xlate.front.robId.simPublic()
     // Debug-only taps (zero synth impact): the p4 load's physical address and the SQ
@@ -1631,7 +1661,11 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val parkAdmitIdx = UInt(log2Up(parkDepth) bits); parkAdmitIdx := 0
     val parkDrain    = Bool(); parkDrain := False
     val parkDrainIdx = UInt(log2Up(parkDepth) bits); parkDrainIdx := 0
-    val alignedFull     = alignedCount === alignedDepth
+    // `parkRetime`: `alignedCount` never exceeds `alignedDepth` (a power of two; the count
+    // is width log2(depth)+1 and is asserted equal to popcount(alignedValid)), so "full" is
+    // exactly the count's MSB -- a wire instead of a compare in front of the P3 admission
+    // and the fall-through select.
+    val alignedFull     = if (parkRetime) alignedCount.msb else alignedCount === alignedDepth
     val alignedEmpty    = alignedCount === 0
     // Slot B may not be SENT until its own slot A (provably the entry immediately
     // behind it in ring order -- see the class-level comment above) has actually
@@ -1721,10 +1755,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // and it is sound because a cacheable refill is side-effect free and the flush discards
     // the register result. Older entries are untouched: they retire BEFORE the inhibited op,
     // so a younger-only flush cannot reach them.
-    val alignedSendValid = !alignedEmpty && alignedValid(alignedSendPtr) &&
+    // `parkRetime`: `!alignedEmpty` is implied by `alignedValid(ptr)` (count == popcount of
+    // `alignedValid`, asserted below), so it is dropped from both valids -- exact.
+    val alignedSendValid = (if (parkRetime) True else !alignedEmpty) && alignedValid(alignedSendPtr) &&
                            !alignedSent(alignedSendPtr) && !bkBusy && !excActive &&
                            !alignedSendHeld
-    val alignedRspValid = !alignedEmpty && alignedValid(alignedRspPtr) &&
+    val alignedRspValid = (if (parkRetime) True else !alignedEmpty) && alignedValid(alignedRspPtr) &&
                           alignedSent(alignedRspPtr) && !bkBusy
     // Which ring entry does THIS cycle's response answer? By the slot id the command
     // carried, echoed back on the response -- a DECODE, so one-hot by construction.
@@ -1869,12 +1905,32 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // is the SHIPPING `SocketTop` setting (`= ipcThroughput`), while every fuzz DUT left it
     // at its default FALSE -- `LsOooInhibitedOrderSpec` lost 3 of its 8 device reads and
     // failed assertion A (device 0xffff0100 launched 3 times, expected 4).
-    val alignedEnqFromP4 = if (p3FastLoad) {
+    // `parkRetime` (with the park): the P4 launch arm drives its own push strobe `p4Enq`,
+    // which is exactly `alignedEnq && !parkDrain && !p3FastEnq` (the three push sources are
+    // mutually exclusive: P3 admission needs `!p4Valid`, the P4 arm needs `!parkOwnR`, which
+    // `parkDrain` implies -- checked below), so the drain decision is off the command valid.
+    val parkRetimeOoo = parkRetime && lsOooIssue
+    val p4Enq: Bool = if (parkRetimeOoo) Bool() else null
+    if (parkRetimeOoo) p4Enq := False
+    // `parkRetime`: the P4 ordinary-launch decision WITHOUT its ring-room term. The fall-
+    // through select already requires `!alignedFull`, under which `alignedCanEnq` is just
+    // `!bkBusy`, so the select can use this and keep the live D-cache response
+    // (`alignedRspFire`, inside `alignedCanEnq`) off the load command valid. Exact.
+    val p4EnqPre: Bool = if (parkRetime) Bool() else null
+    if (parkRetime) p4EnqPre := False
+    val alignedEnqFromP4 = if (parkRetimeOoo) p4Enq else if (p3FastLoad) {
       if (lsOooIssue) alignedEnq && !parkDrain && !p3FastEnq else alignedEnq && !p3FastEnq
     } else {
       if (lsOooIssue) alignedEnq && !parkDrain else alignedEnq
     }
-    val alignedFallThrough = if (p3FastLoad) {
+    if (parkRetimeOoo) GenerationFlags.simulation {
+      val ref = if (p3FastLoad) alignedEnq && !parkDrain && !p3FastEnq else alignedEnq && !parkDrain
+      assert(p4Enq === ref, "LsEuPlugin: parkRetime P4 push strobe diverged from its reference", FAILURE)
+    }
+    val alignedFallThrough = if (parkRetime && p3FastLoad) {
+      alignedFallThroughSelect &&
+        ((p4EnqPre && !bkBusy && (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)) || p3FastEnq)
+    } else if (p3FastLoad) {
       alignedFallThroughSelect &&
         ((alignedEnqFromP4 && (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)) || p3FastEnq)
     } else {
@@ -1882,6 +1938,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)
     }
     alignedFallThrough.simPublic()
+    if (parkRetime && p3FastLoad) GenerationFlags.simulation {
+      val ref = alignedFallThroughSelect &&
+        ((alignedEnqFromP4 && (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)) || p3FastEnq)
+      // A SUBSET of the reference (P4 may decline the fall-through and send from the ring
+      // next cycle); never a fall-through without the matching push.
+      assert(!alignedFallThrough || ref, "LsEuPlugin: parkRetime fall-through without a push", FAILURE)
+      assert(!p3FastEnq || alignedFallThrough === ref, "LsEuPlugin: parkRetime changed a P3 fall-through", FAILURE)
+      assert(alignedCount <= alignedDepth, "LsEuPlugin: aligned ring count above depth", FAILURE)
+    }
+    // Sim witness: a P4 push that the base design would have sent the same cycle and
+    // `parkRetime` sends from the ring one cycle later.
+    val p4FtDeclined: Bool = if (parkRetime && p3FastLoad) Bool() else null
+    if (parkRetime && p3FastLoad) {
+      p4FtDeclined := alignedFallThroughSelect && alignedEnqFromP4 && !p3FastEnq &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED) && !alignedFallThrough
+      p4FtDeclined.simPublic()
+    }
     val alignedCmd = AlignedLoadCtx()
     alignedCmd := alignedMem(alignedSendPtr)
     when(alignedFallThroughSelect) {
@@ -2043,6 +2116,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         FAILURE)
     }
     val fwdQueryCtx = Mux(p4RetryQuery, p4Ctx.xlate, p3Ctx)
+    if (!parkRetime) {
     sq.io.fwd.query.robId := fwdQueryCtx.front.robId
     sq.io.fwd.query.paddr := fwdQueryCtx.paddr
     sq.io.fwd.query.size  := fwdQueryCtx.front.size
@@ -2058,6 +2132,30 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       (fwdQueryCtx.cmode === m68k040.cache.CacheMode.INHIBITED) ||
       (fwdQueryCtx.front.twoAccess &&
        (fwdQueryCtx.cmodeB === m68k040.cache.CacheMode.INHIBITED))
+    } else {
+      // Same values, per-group select flops (all four are exact mirrors -- see
+      // `p4RetryQRep`): robId | line address | low address + size + split + mode | paddrB.
+      GenerationFlags.simulation {
+        for (r <- p4RetryQRep) assert(r === p4RetryQ,
+          "LsEuPlugin: a p4RetryQ replica diverged from p4RetryQ", FAILURE)
+      }
+      def qSel[T <: Data](sel: Bool, a: T, b: T): T = Mux(sel, a, b)
+      val selRob  = p4RetryQ
+      val selLine = p4RetryQRep(0)
+      val selLow  = p4RetryQRep(1)
+      val selB    = p4RetryQRep(2)
+      val p4x = p4Ctx.xlate
+      sq.io.fwd.query.robId := qSel(selRob, p4x.front.robId, p3Ctx.front.robId)
+      sq.io.fwd.query.paddr := (qSel(selLine, p4x.paddr(31 downto 4), p3Ctx.paddr(31 downto 4)) ##
+                                qSel(selLow, p4x.paddr(3 downto 0), p3Ctx.paddr(3 downto 0))).asUInt
+      sq.io.fwd.query.size  := qSel(selLow, p4x.front.size, p3Ctx.front.size)
+      val qTwo = qSel(selLow, p4x.front.twoAccess, p3Ctx.front.twoAccess)
+      sq.io.fwd.query.splitB := qTwo
+      sq.io.fwd.query.paddrB := qSel(selB, p4x.paddrB, p3Ctx.paddrB)
+      sq.io.fwd.query.inhibited :=
+        (qSel(selLow, p4x.cmode, p3Ctx.cmode) === m68k040.cache.CacheMode.INHIBITED) ||
+        (qTwo && (qSel(selLow, p4x.cmodeB, p3Ctx.cmodeB) === m68k040.cache.CacheMode.INHIBITED))
+    }
 
     val isLoad  = u1.memOp === MemOp.LOAD
     val isStore = u1.memOp === MemOp.STORE
@@ -3890,18 +3988,52 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     }
     val parkOwnsBarrier = if (!lsOooIssue) False else parkHit.reduce(_ || _)
     val parkSelIdx = if (!lsOooIssue) U(0) else OHToUInt(OHMasking.first(Vec(parkHit)))
+    // `parkRetime`: ONE flop that is the OR of the `parkHitR` D-inputs, i.e. OR(parkHitR).
+    // It is a SUPERSET of `parkOwnsBarrier` (which additionally ANDs the live `parkValid`
+    // and `robHeadValidIn`) and differs from it for at most the ONE cycle after the owning
+    // slot drains or is flushed (`parkHitR` then clears on the next edge -- see the
+    // INVARIANT above). It replaces `parkOwnsBarrier` ONLY where a false True is harmless:
+    // the SQ barrier robId select (P4 is then held, so nobody consumes the head verdict
+    // except the exact drain below) and P4's launch block (P4 waits one more cycle). The
+    // drain itself still uses the exact `parkOwnsBarrier`.
+    val parkOwnR: Bool = if (parkRetimeOoo) RegInit(False) else null
+    if (parkRetimeOoo) {
+      parkOwnR := (0 until parkDepth).map(i =>
+        parkValid(i) && robHeadValidIn && (parkMem(i).bk.robId === robHeadIn)).reduce(_ || _)
+      parkOwnR.simPublic()
+      GenerationFlags.simulation {
+        assert(!parkOwnsBarrier || parkOwnR, "LsEuPlugin: parkOwnR is not a superset of parkOwnsBarrier", FAILURE)
+        assert(parkOwnR === parkHitR.reduce(_ || _), "LsEuPlugin: parkOwnR != OR(parkHitR)", FAILURE)
+      }
+    }
+    val parkBarrierSel = if (parkRetimeOoo) parkOwnR else parkOwnsBarrier
     // THE BARRIER QUERY IS SHARED, so the drain TAKES it and P4 stands down for those
     // cycles (`p4LaunchOk` below is forced False). Age-safe with no starvation argument
     // needed: the draining entry is the ROB HEAD, so whatever sits in P4 is necessarily
     // YOUNGER and cannot be starving anything older. The alternative -- muxing the query
     // while letting P4 still act on the result -- would hand P4 a verdict computed for a
     // different robId, which is the silent-reorder class, not a stall.
-    sq.io.barrier.robId := Mux(parkOwnsBarrier, robHeadIn, p4Front.robId)
+    sq.io.barrier.robId := Mux(parkBarrierSel, robHeadIn, p4Front.robId)
     // Free-slot pick for admission. Lowest free index; the park is random-access, so no
     // ordering is implied and none is needed -- drain is by head match, not by position.
     val parkFreeVec = if (!lsOooIssue) null else Vec((0 until parkDepth).map(i => !parkValid(i)))
     val parkHasFree = if (!lsOooIssue) False else parkFreeVec.reduce(_ || _)
     val parkFreeIdx = if (!lsOooIssue) U(0) else OHToUInt(OHMasking.first(parkFreeVec))
+    // `parkRetime`: a registered, conservative "a slot is free" for the P4 park-ADMIT arm
+    // (whose `p4CanLeave` heads the P3/P2T ready cone). Next-cycle free slots are a
+    // superset of "free now and not taken by this cycle's admit"; a drain or flush frees a
+    // slot one cycle before this sees it, so an admit may wait ONE extra cycle (cold: an
+    // inhibited non-head access). Never stale-True, so `parkFreeIdx` is always a free slot.
+    val parkHasFreeR: Bool = if (parkRetimeOoo) RegInit(True) else null
+    if (parkRetimeOoo) {
+      parkHasFreeR := (0 until parkDepth).map(i =>
+        !parkValid(i) && !(parkAdmit && parkAdmitIdx === U(i, log2Up(parkDepth) bits))).reduce(_ || _)
+      parkHasFreeR.simPublic()
+      GenerationFlags.simulation {
+        assert(!parkHasFreeR || parkHasFree, "LsEuPlugin: parkHasFreeR stale-True", FAILURE)
+      }
+    }
+    val parkAdmitHasFree = if (parkRetimeOoo) parkHasFreeR else parkHasFree
     if (lsOooIssue) { parkOwnsBarrier.simPublic(); parkHasFree.simPublic()
                       parkDrain.simPublic(); parkDrainIdx.simPublic()
                       parkAdmit.simPublic(); parkAdmitIdx.simPublic() }
@@ -4014,7 +4146,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       pendingAtHead.simPublic(); dQuiet.simPublic(); dFenced.simPublic(); dLaunchOk.simPublic()
     }
 
-    val p4LaunchOk  = d4And(!parkOwnsBarrier)(!inhibLoadInFlight) && Mux(p4Inhibited,
+    val p4LaunchOk  = d4And(!parkBarrierSel)(!inhibLoadInFlight) && Mux(p4Inhibited,
                           d4And(p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe)(dLaunchOk),
                           !sq.io.barrier.olderInhibitedStore)
     // The drain itself: reuse the ORDINARY ring push event, so all ring bookkeeping is
@@ -4036,6 +4168,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       }
     }
     p4Inhibited.simPublic(); p4AtRobHead.simPublic(); p4LaunchOk.simPublic()
+    // `parkRetime` cold-path delay witnesses (sim observation only; no RTL consumer):
+    //   * `parkOwnStaleHold` -- P4 held only because `parkOwnR` is one cycle stale;
+    //   * `parkFreeStaleHold` -- a park admit held only because `parkHasFreeR` is stale.
+    val parkOwnStaleHold: Bool = if (parkRetimeOoo) (p4Valid && parkOwnR && !parkOwnsBarrier) else null
+    val parkFreeStaleHold: Bool = if (parkRetimeOoo)
+      (p4Valid && p4Inhibited && !p4AtRobHead && !p4Front.twoAccess && parkHasFree && !parkHasFreeR) else null
+    if (parkRetimeOoo) { parkOwnStaleHold.simPublic(); parkFreeStaleHold.simPublic() }
     // Coalescing hold release: a load is WAITING ON THE SQ -- its registered forward
     // verdict says stall/serial, or it is an inhibited load held by the older-store
     // barrier, or the park owns the barrier. A held store must never be what it waits on.
@@ -4141,14 +4280,25 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         // so next-cycle `twoAccess` is this cycle's `p4Front.twoAccess`; and this arm
         // never sets `p4CanLeave`, so next-cycle `p4Valid` is still True (a later
         // `p4CanLeave`/flush mirror overrides this assignment if that changes).
-        p4RetryQ := sq.io.fwd.rsp.stall ||
+        setP4RetryQ(sq.io.fwd.rsp.stall ||
                     ((sq.io.fwd.rsp.hit && p4SqForwardAllowed) && p4Front.twoAccess) ||
-                    sq.io.fwd.rsp.serial
+                    sq.io.fwd.rsp.serial)
       } otherwise {
+        // `parkRetime`: the P4 FALL-THROUGH launch decision, built only from registers --
+        // `p4LaunchOk`'s cacheable arm with the SQ age compare (`olderInhibitedStore`)
+        // replaced by the registered superset `!sqInhibR`, so it IMPLIES `p4LaunchOk`.
+        // A P4 load denied the fall-through by it still enqueues normally (exact
+        // `p4LaunchOk`) and is sent from the ring one cycle later: a cacheable P4 load
+        // pays +1 cycle only while an inhibited (device) store is resident.
+        if (parkRetime) {
+          val ftOk = d4And(!parkBarrierSel)(!inhibLoadInFlight) && !p4Inhibited && !sqInhibR
+          when(ftOk && !p4Front.twoAccess) { p4EnqPre := True }
+        }
         when(p4LaunchOk) {
         when(!p4Front.twoAccess) {
           when(alignedCanEnq) {
             alignedEnq := True
+            if (parkRetimeOoo) p4Enq := True
             p4CanLeave := True
           }
         } otherwise {
@@ -4187,7 +4337,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
           // tripwire measures whether pressure is ever a problem; if it never fires, the
           // guard buys nothing and should stay out.
           if (lsOooIssue) {
-            when(p4Inhibited && !p4AtRobHead && !p4Front.twoAccess && parkHasFree) {
+            when(p4Inhibited && !p4AtRobHead && !p4Front.twoAccess && parkAdmitHasFree) {
               parkAdmit    := True
               parkAdmitIdx := parkFreeIdx
               p4CanLeave   := True
@@ -4471,6 +4621,34 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       c
     }
 
+    // `parkRetime` + `p3SqLineFilter`: ONE flop replacing the P3 admission's
+    // `parkIdle && !inhibLoadInFlight && p3PreemptSafeR` (`parkIdle` is a live OR of the
+    // park's valid flops, the head of the P3 -> P2T -> issue-ready cone). Registered from a
+    // conservative superset of everything that can make next cycle's terms False:
+    //   * a park slot valid next cycle was valid now or is admitted now, and an admit needs
+    //     `p4Valid && p4Inhibited`;
+    //   * `inhibLoadInFlight` only rises on an inhibited launch, which is from P4
+    //     (`p4Valid && p4Inhibited`) or a park drain (a park slot valid now); otherwise it
+    //     can only fall;
+    //   * `p3PreemptSafeR` is literally `RegNext(p4PreemptSafe)`.
+    // So the flop implies the three live terms (checked below); it is merely False for one
+    // extra cycle after an inhibited access leaves P4 or the park empties, and the P3 load
+    // then takes the ordinary P4 launch one cycle later. Cold path by construction.
+    val p3AdmitGateR: Bool = if (parkRetime && p3SqLineFilter) RegInit(False) else null
+    val p3AdmitGateLost: Bool = if (parkRetime && p3SqLineFilter) Bool() else null
+    if (parkRetime && p3SqLineFilter) {
+      val parkAny = if (lsOooIssue) parkValid.reduce(_ || _) else False
+      p3AdmitGateR := p4PreemptSafe && !inhibLoadInFlight && !parkAny && !(p4Valid && p4Inhibited)
+      p3AdmitGateR.simPublic()
+      p3AdmitGateLost := False
+      p3AdmitGateLost.simPublic()
+      GenerationFlags.simulation {
+        val parkIdleRef = if (lsOooIssue) !parkValid.reduce(_ || _) else True
+        assert(!p3AdmitGateR || (parkIdleRef && !inhibLoadInFlight && p3PreemptSafeR),
+          "LsEuPlugin: p3AdmitGateR admitted where the live P3 gate would not", FAILURE)
+      }
+    }
+
     // P3 performs the registered-PA SQ operation. Stores terminate here; loads capture
     // the registered forwarding result into P4. An older P4/front-back completion wins
     // the shared comp* port, so a fast store simply holds for one cycle on collision.
@@ -4668,7 +4846,13 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
           // in front of p3Ready -> txCanConsumeRsp -> the probe resolve / completion /
           // issue-ready cones), and the preempt term is last cycle's copy. A full ring
           // that pops this cycle simply takes the P4 path (one cycle later).
-          val admit = if (p3SqLineFilter) {
+          val admit = if (parkRetime && p3SqLineFilter) {
+            val live = p3SqClear && !p4Valid && parkIdle && !inhibLoadInFlight && p3PreemptSafeR &&
+              !bkBusy && !alignedFull
+            val fast = p3SqClear && !p4Valid && p3AdmitGateR && !bkBusy && !alignedFull
+            p3AdmitGateLost := live && !fast
+            fast
+          } else if (p3SqLineFilter) {
             p3SqClear && !p4Valid && parkIdle && !inhibLoadInFlight && p3PreemptSafeR &&
               !bkBusy && !alignedFull
           } else {
@@ -4946,7 +5130,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
 
     // Oldest-to-youngest valid updates, then accept-last replacements. Later writes
     // intentionally win when a stage consumes and accepts on the same edge.
-    when(p4CanLeave) { p4Valid := False; p4RetryQ := False }   // MIRROR 2 of 4
+    when(p4CanLeave) { p4Valid := False; setP4RetryQ(False) }   // MIRROR 2 of 4
     when(p3CanLeave) { p3Valid := False }
     when(txCanLeave) { txValid := False; txSecond := False; txWaitingRsp := False }
     when(tCanLeave)  { tValid := False }
@@ -4961,10 +5145,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       p4Ctx.fwdSerial  := sq.io.fwd.rsp.serial
       // MIRROR 3 of 4 (see `p4RetryQ`). Next-cycle `p4Valid` is True and next-cycle
       // `p4Ctx.xlate.front.twoAccess` is `p3Ctx.front.twoAccess` (the line above).
-      p4RetryQ         := sq.io.fwd.rsp.stall ||
+      setP4RetryQ(sq.io.fwd.rsp.stall ||
                           ((sq.io.fwd.rsp.hit && p3SqForwardAllowed) &&
                            p3Ctx.front.twoAccess) ||
-                          sq.io.fwd.rsp.serial
+                          sq.io.fwd.rsp.serial)
     }
     when(txToP3) {
       p3Valid := True
@@ -5053,7 +5237,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       txWaitingRsp:= False
       p3Valid     := False
       p4Valid     := False
-      p4RetryQ    := False   // MIRROR 4 of 4 (see `p4RetryQ`)
+      setP4RetryQ(False)     // MIRROR 4 of 4 (see `p4RetryQ`)
     }
     // Epoch is a squash generation, not an exception-active level. Toggling it on
     // every cycle of a serializing exception would eventually alias a stale tagged

@@ -522,6 +522,13 @@ object ShippingCoreConfig {
     * completion, which for a detached `(An)+` store is AFTER its data capture -- tying the
     * next store's address to the previous load's miss (memcpy trace, 2026-10-05). */
   val lsEarlyAnRetry: Boolean = envFlag("CPU_LS_EARLY_AN_RETRY", true)
+  /** 200 MHz retime of the LS-OoO park / P4-retry control (`CPU_LS_PARK_RETIME`, gated 2026-10-09, default
+    * ON). Takes the park's live `parkValid` flops out of the P3-launch admission, the P4
+    * launch / SQ barrier select, the P4 fall-through command valid and the park-admit arm by
+    * registered conservative copies (cold path: a P3 launch or P4 park-admit may wait one
+    * extra cycle after an inhibited access), and replicates the SQ forward-query select
+    * `p4RetryQ`. Effective only with `lsOooIssue` (park) / `p3FastLoad`. Echoed in `SHIPPING_CONFIG`. */
+  val lsParkRetime: Boolean = envFlag("CPU_LS_PARK_RETIME", true)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the

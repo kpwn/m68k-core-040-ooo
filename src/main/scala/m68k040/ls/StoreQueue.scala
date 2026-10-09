@@ -112,7 +112,10 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  /** `ShippingCoreConfig.lsP3Launch`: export `io.lineProbe`, a conservative
                    * page-offset line filter the LS EU evaluates one stage ahead of its
                    * forward query. False elaborates nothing. */
-                 p3LineProbe: Boolean = false) extends Component {
+                 p3LineProbe: Boolean = false,
+                 /** `ShippingCoreConfig.lsParkRetime`: export `io.anyInhibited` (any resident
+                   * entry has an INHIBITED half, any age). False elaborates nothing. */
+                 anyInhibitedOut: Boolean = false) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -212,6 +215,7 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       val idx   = in(UInt(8 bits))
       val clear = out(Bool())
     } else null
+    val anyInhibited = if (anyInhibitedOut) out(Bool()) else null
   }
 
   // ---- ring storage ----
@@ -1630,6 +1634,12 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                         (cacheModesB(i) === CacheMode.INHIBITED))))
     }
     io.lineProbe.clear := !hazard.reduce(_ || _)
+  }
+
+  if (anyInhibitedOut) {
+    io.anyInhibited := (0 until depth).map(i => valids(i) && (
+      (cacheModes(i) === CacheMode.INHIBITED) ||
+      (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))).reduce(_ || _)
   }
 
   // ---- barrier residency, AGE-QUALIFIED ----

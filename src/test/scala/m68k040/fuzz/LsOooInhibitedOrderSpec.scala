@@ -284,6 +284,7 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
       val markLog = mutable.ArrayBuffer.empty[String]
       val markedRetired = mutable.ArrayBuffer.empty[String]
       var flushes         = 0
+      var retimeOwnStale = 0; var retimeFreeStale = 0; var retimeP3Lost = 0
       val lc  = dut.dcache.logic.loadCmdPort
       val ax  = dut.dcache.logic.axi
       val ls  = dut.lsEu.logic
@@ -336,6 +337,10 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
 
         if (dut.rob.logic.doFlushReg.toBoolean) flushes += 1
         if (lsOoo && dut.rob.logic.orderRedirect.toBoolean) orderRedirects += 1
+        // CPU_LS_PARK_RETIME cold-path delay witnesses (null when the flag is off).
+        if (ls.parkOwnStaleHold != null && ls.parkOwnStaleHold.toBoolean) retimeOwnStale += 1
+        if (ls.parkFreeStaleHold != null && ls.parkFreeStaleHold.toBoolean) retimeFreeStale += 1
+        if (ls.p3AdmitGateLost != null && ls.p3AdmitGateLost.toBoolean) retimeP3Lost += 1
         if (lsOoo && dut.lsEu.orderViolationPort.valid.toBoolean) {
           val r = dut.lsEu.orderViolationPort.payload.toBigInt
           val fromPark = ls.parkViolation.toBoolean
@@ -495,6 +500,8 @@ class LsOooInhibitedOrderSpec extends AnyFunSuite {
         f"violC(inhibited,FATAL)=${violCInhib.size} overlapAny=${overlapAny.size} " +
         f"overlapBus=${overlapBus.size} violD=${violD.size} violD0=${violD0.size}"
       println(report)
+      println(s"[ls-ooo-inhib] parkRetime delays: p4HeldByStaleParkOwn=$retimeOwnStale " +
+        s"parkAdmitHeldByStaleFree=$retimeFreeStale p3LaunchDeferred=$retimeP3Lost cycles=$cycles")
       println(f"[ls-ooo-inhib] inhibited launches: " +
         launches.map(l => f"cyc${l.cyc}:0x${l.paddr}%x/rob${l.robId}").mkString(" "))
       println(f"[ls-ooo-inhib] AXI device ARs: " + axiDevReads.map(a => f"0x$a%x").mkString(" "))

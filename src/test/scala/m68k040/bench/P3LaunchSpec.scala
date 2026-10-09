@@ -68,13 +68,14 @@ class P3LaunchSpec extends CoreBenchHarness {
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(shippingProfile = true))
     var flushAfterP3Total = 0
     for (cb <- Seq(false, true)) {
-      var p3 = 0; var p3Resident = 0; var p3ThenFlush = 0; var flushes = 0
+      var p3 = 0; var p3Resident = 0; var p3ThenFlush = 0; var flushes = 0; var p3Lost = 0
       dutProbe = d => if (d.lsEu.p3FastLoad) fork {
         val ls = d.lsEu.logic
         var lastP3 = -100L; var cyc = 0L
         while (true) {
           d.clockDomain.waitSampling(); cyc += 1
           if (d.lsEu.sqFlushSig.toBoolean) { flushes += 1; if (cyc - lastP3 <= 8) p3ThenFlush += 1 }
+          if (ls.p3AdmitGateLost != null && ls.p3AdmitGateLost.toBoolean) p3Lost += 1
           if (ls.p3FastEnq.toBoolean) {
             p3 += 1; lastP3 = cyc
             if (!ls.sq.io.empty.toBoolean) p3Resident += 1
@@ -83,7 +84,7 @@ class P3LaunchSpec extends CoreBenchHarness {
       }
       val r = runKernel(compiled, kernel(cb))
       println(f"[p3launch] ${r.name} cycles=${r.windowCycles} p3Launches=$p3 " +
-        s"withResidentStore=$p3Resident flushes=$flushes flushWithin8OfP3=$p3ThenFlush " +
+        s"withResidentStore=$p3Resident parkRetimeDeferred=$p3Lost flushes=$flushes flushWithin8OfP3=$p3ThenFlush " +
         s"lsP3Launch=${m68k040.top.ShippingCoreConfig.lsP3Launch}")
       if (m68k040.top.ShippingCoreConfig.lsP3Launch) {
         assert(p3Resident >= iters, s"P3 launch past a resident store fired only $p3Resident times")
