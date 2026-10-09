@@ -373,7 +373,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val cacheKB: Int = m68k040.top.ShippingCoreConfig.dcacheKB,
                    /** `ShippingCoreConfig.dcacheVdRetime`: banked valid/dirty arrays + registered
                      * maintenance CHECK-invalidate write. Exact (no behavioural change). */
-                   val vdRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheVdRetime)
+                   val vdRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheVdRetime,
+                   /** `ShippingCoreConfig.dcacheTagCeRetime`: tag-compare-free S0 payload /
+                     * S3 old-line clock enables and a one-cycle-late multi-hot debug latch. */
+                   val tagCeRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheTagCeRetime)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -2245,6 +2248,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val s0Payload = Reg(DStoreCmd())
     s0Valid.simPublic()
     s0Payload.paddr.simPublic(); s0Payload.cacheMode.simPublic()
+    /** `tagCeRetime`: S0 was held THIS cycle only because a same-cycle tag-compare miss
+      * (`storeMissDiscovered`/`loadMissDiscovered`) blocked an otherwise-advancing S0, so
+      * the tag-free payload clock enable already overwrote `s0Payload` with the unaccepted
+      * port payload. The held store's true payload is in `s0Bak`; it is copied back at the
+      * end of this cycle, S0 may not advance this cycle, and every non-advance reader of
+      * `s0Payload` treats it as "could be anything" (`s0StaleOr`). Driven below `s0Advance`. */
+    val s0ConflictR: Bool = if (!tagCeRetime) null else RegInit(False)
+    val s0Bak: DStoreCmd  = if (!tagCeRetime) null else Reg(DStoreCmd())
+    if (tagCeRetime) s0ConflictR.simPublic()
+    /** A same-set/same-line HAZARD predicate over `s0Payload` (true = block/hold): forced
+      * true on the one `s0ConflictR` cycle, when `s0Payload` does not hold S0's store. */
+    def s0StaleOr(b: Bool): Bool = if (!tagCeRetime) b else (b || s0ConflictR)
 
     // ---- store-S1: launch the shared sync read (old line + hit-tag) ----
     // Decoded off the REGISTERED S0 payload. The read launches onto the shared
@@ -2579,7 +2594,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         (earlyProbeMissWay(i) === victim(cmdSet))))
       val sameSetStore = (storePort.valid &&
         storePort.payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
-        (s0Valid &&
+        s0StaleOr(s0Valid &&
         s0Payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
         (stS1Valid && stS1Set === cmdSet) ||
         (stS2Valid && stS2Set === cmdSet) ||
@@ -4544,13 +4559,17 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Latched on DETECTION, not on `dupPurgeFire`, so an occurrence during a
     // maintenance walk (when the purge is deliberately held off) is still recorded.
     val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
-    val dbgMultiHotLoad = OneHotSafe.evidence(
-      ldS1Valid && ldS1MultiHot, ldS1Paddr, dbgMultiHotClear)
+    // `tagCeRetime`: the load/store detections are latched one cycle late (registered
+    // fire + address), taking the tag compare off the evidence registers' clock enables.
+    // Debug instrumentation may lag; the recorded address is the detecting access's own.
+    def mhEvidence(fire: Bool, addr: UInt): OneHotSafe.MultiHotEvidence =
+      if (!tagCeRetime) OneHotSafe.evidence(fire, addr, dbgMultiHotClear)
+      else OneHotSafe.evidence(RegNext(fire) init False, RegNext(addr), dbgMultiHotClear)
+    val dbgMultiHotLoad = mhEvidence(ldS1Valid && ldS1MultiHot, ldS1Paddr)
     val dbgMultiHotProbe = OneHotSafe.evidence(
       probeReadValid && probeMultiHot,
       (probeReadTag ## probeReadSet ## U(0, offBits bits)).asUInt, dbgMultiHotClear)
-    val dbgMultiHotStore = OneHotSafe.evidence(
-      stS2Valid && stS2MultiHot, stS2Payload.paddr, dbgMultiHotClear)
+    val dbgMultiHotStore = mhEvidence(stS2Valid && stS2MultiHot, stS2Payload.paddr)
     for (e <- Seq(dbgMultiHotLoad, dbgMultiHotProbe, dbgMultiHotStore)) {
       e.sticky.simPublic(); e.count.simPublic(); e.addr.simPublic()
     }
@@ -4835,8 +4854,28 @@ class DcachePlugin(val socketMerged: Boolean = false,
                            fsm.isActive(fsm.REPLAY) ||
                            (loadCmdPort.valid && !(storeReadOwed && stS1Valid))
 
-    val stS1Advance =
+    // `tagCeRetime`: the same two predicates, factored as (tag-free part) && !(tag-compare
+    // miss), so the live miss is the LAST gate and the tag-free halves (`*Nd`) exist as
+    // their own nets. `storePipeHeld === storePipeHeldNd || storeMissAny` term for term, so
+    // `stS1Advance` and `s0Advance` are the same functions as the OFF branch except for the
+    // one added `!s0ConflictR` (S0 waits out its own restore cycle).
+    val storePipeHeldNd: Bool = if (!tagCeRetime) null else
+      storeMissBarrier || loadMissStoreBarrier || wtKickoffBusy
+    val storeMissAny: Bool = if (!tagCeRetime) null else
+      storeMissDiscovered || loadMissDiscovered
+    val stS1AdvanceNd: Bool = if (!tagCeRetime) null else {
       if (!nonBlocking) stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
+        !storePipeHeldNd && !stS1SameLineAsS3
+      else stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
+        !storePipeHeldNd && !stS1SameLineAsS3 && !nbStoreHold
+    }
+    val s0AdvanceNd: Bool = if (!tagCeRetime) null else {
+      if (!nonBlocking) s0Valid && (!stS1Valid || stS1AdvanceNd) && !storePipeHeldNd && !s0ConflictR
+      else s0Valid && (!stS1Valid || stS1AdvanceNd) && !storePipeHeldNd && !nbS0ArHold && !s0ConflictR
+    }
+    val stS1Advance =
+      if (tagCeRetime) stS1AdvanceNd && !storeMissAny
+      else if (!nonBlocking) stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
         !storePipeHeld && !stS1SameLineAsS3
       else stS1Valid && storeClaimReg && !loadPortReserved && !maintUsesPort &&
         !storePipeHeld && !stS1SameLineAsS3 && !nbStoreHold
@@ -4845,7 +4884,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
     loadPortReserved.simPublic(); stS1Advance.simPublic()
     val stS1Ready   = !stS1Valid || stS1Advance
     val s0Advance   =
-      if (!nonBlocking) s0Valid && stS1Ready && !storePipeHeld
+      if (tagCeRetime) s0AdvanceNd && !storeMissAny
+      else if (!nonBlocking) s0Valid && stS1Ready && !storePipeHeld
       else s0Valid && stS1Ready && !storePipeHeld && !nbS0ArHold
     s0Advance.simPublic() // directed AR-ordering regression observes the S0 launch edge
     stS1LineEqS2Prev := Mux(s0Advance,
@@ -4944,8 +4984,52 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // (nothing held: `s0Ready` = empty or advancing), and every reader of `s0Payload`
     // is qualified by `s0Valid` (`s0Advance`, `wtS0To`, the probe/preselect same-set
     // terms), so the loaded value is never observed.
-    when(s0Ready) {
-      s0Payload := storePort.payload
+    if (!tagCeRetime) {
+      when(s0Ready) {
+        s0Payload := storePort.payload
+      }
+    } else {
+      // `tagCeRetime` (200 MHz): the payload enable is `s0Ready` with the same-cycle tag
+      // miss dropped -- `!s0Valid || s0AdvanceNd` -- so the tag BRAM -> compare -> hit ->
+      // `storeMissDiscovered`/`loadMissDiscovered` cone no longer reaches the ~230-bit
+      // CE/R of `s0Payload`. The two enables differ only on
+      //   s0Valid && s0AdvanceNd && storeMissAny   (S0 held by a live miss)
+      // where the ungated load overwrites the HELD store's payload with an unaccepted
+      // port payload. `s0Bak` (same tag-free enable, D = `s0Payload`) took the held value
+      // on that same edge; `s0ConflictR` copies it back at the end of the next cycle, and
+      // `s0AdvanceNd` contains `!s0ConflictR`, so the held store cannot leave S0 (and no
+      // store can be accepted: `s0Ready` is low) until the restore has landed. During that
+      // one cycle `s0Valid` is provably high (only `s0Advance`/`storePort.fire` write it
+      // and both were low), the advance-qualified readers (`stS1Payload`,
+      // `stS1LineEqS2Prev`, `nb.s1LineEq`) are masked by `s0Advance` = False, and the
+      // hazard readers go conservative via `s0StaleOr`. The miss that caused it sets a
+      // store barrier for a store miss (and for a blocking/inhibited load miss), so the
+      // extra cycle is normally hidden; only an NB cacheable load miss with no barrier can
+      // see it (counted as `nbCtr_s0TagConflict`).
+      val s0PayloadCe = !s0Valid || s0AdvanceNd
+      when(s0ConflictR) {
+        s0Payload := s0Bak
+      } elsewhen (s0PayloadCe) {
+        s0Payload := storePort.payload
+      }
+      when(s0PayloadCe) { s0Bak := s0Payload }
+      s0ConflictR := s0Valid && s0AdvanceNd && storeMissAny
+      GenerationFlags.simulation {
+        // Reference model: the exact OFF-branch payload latch. Wherever S0 holds a store,
+        // its payload (or, on the restore cycle, `s0Bak`) must equal it bit for bit.
+        val s0Ref = Reg(DStoreCmd())
+        when(s0Ready) { s0Ref := storePort.payload }
+        when(s0Valid && !s0ConflictR) {
+          assert(s0Payload.asBits === s0Ref.asBits,
+            "DcachePlugin: tagCeRetime s0Payload drifted from the exact S0 latch", FAILURE)
+        }
+        when(s0ConflictR) {
+          assert(s0Valid && !s0Advance && !storePort.fire,
+            "DcachePlugin: tagCeRetime restore cycle with S0 empty/advancing/accepting", FAILURE)
+          assert(s0Bak.asBits === s0Ref.asBits,
+            "DcachePlugin: tagCeRetime s0Bak does not hold the held S0 store", FAILURE)
+        }
+      }
     }
 
     // ═══ REGISTERED early-probe admission credit (2026-09-14, routing-congestion plan
@@ -5323,8 +5407,15 @@ class DcachePlugin(val socketMerged: Boolean = false,
         stS3Payload := stS2Payload
         stS3Hit     := stS2HitAny
         stS3Way     := stS2HitWay
-        stS3OldLine := stS2CapturedLine
+        if (!tagCeRetime) stS3OldLine := stS2CapturedLine
       }
+      // `tagCeRetime`: capture the old line on every S2 cycle instead of only on the
+      // resident/serial arm, so the `stS2Copyback && !stS2HitAny` tag-compare decision
+      // leaves its 128-bit clock enable (CE = `stS2Valid`, a flop). Exact: `stS3OldLine`
+      // is read only through `stS3MergedLine`, and every consumer of that is qualified by
+      // `stS3ArrayWrite` (=> `stS3Valid`); the miss arm leaves `stS3Valid` at its default
+      // False, so a value captured there is never observed.
+      if (tagCeRetime) stS3OldLine := stS2CapturedLine
     }
 
     // S3 owns all hit-side effects.  The registered hit/way cut keeps the tag BRAM
@@ -6380,9 +6471,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
         (stS1Valid && stS1Payload.cacheMode === CacheMode.WRITETHROUGH && s1LineEq(k)) ||
         (stS2Valid && stS2Payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(stS2Payload.paddr) === line(k))
-      def wtS0To(x: UInt): Bool =
+      def wtS0To(x: UInt): Bool = s0StaleOr(
         s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
-          lineOfPa(s0Payload.paddr) === x
+          lineOfPa(s0Payload.paddr) === x)
       for (k <- 0 until N) blocked(k) := coldWriteTo(line(k))
 
       // ── AR issue (§3.3): one holding register, ID = MSHR index ──────────────────────
@@ -6439,7 +6530,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // AR handshakes. The input guard is conservative even for a younger WT,
       // and avoids feeding storePort.ready back into the AR register's D cone.
       val preselectWtTo = if (!nbPreselectAr) False else
-        (s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
+        s0StaleOr(s0Valid && s0Payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(s0Payload.paddr) === lLine) ||
         (storePort.valid && storePort.payload.cacheMode === CacheMode.WRITETHROUGH &&
          lineOfPa(storePort.payload.paddr) === lLine)
@@ -6721,6 +6812,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val cycles        = c("cycles", True)
           val primaryAllocs = c("primaryAllocs", lAlloc)
           val probeMissStages = c("probeMissStages", nbProbeFastFire)
+          if (tagCeRetime) c("s0TagConflict", s0ConflictR)
           if (nbProbeMissStage) {
             // First-failing-term audit at ACCEPTED commands. These counters
             // exist only in simulation and add no state to the synthesized core.
@@ -6754,7 +6846,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             c("probeBlockLineOnly", q5 && loadCmdPort.payload.lineOnly)
             c("probeBlockStore", q5 && ((storePort.valid &&
               storePort.payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
-              (s0Valid && s0Payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
+              s0StaleOr(s0Valid && s0Payload.paddr(offBits + setBits - 1 downto offBits) === cmdSet) ||
               (stS1Valid && stS1Set === cmdSet) ||
               (stS2Valid && stS2Set === cmdSet) ||
               (stS3Valid && stS3Set === cmdSet) ||

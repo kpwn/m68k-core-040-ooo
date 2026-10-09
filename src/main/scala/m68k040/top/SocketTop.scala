@@ -714,6 +714,7 @@ object GenSocketTopVerilog {
             s"dcacheSectored=${ShippingCoreConfig.dcacheSectored} " +
             s"dcacheKB=${ShippingCoreConfig.dcacheKB} " +
             s"dcacheVdRetime=${ShippingCoreConfig.dcacheVdRetime} " +
+            s"dcacheTagCeRetime=${ShippingCoreConfig.dcacheTagCeRetime} " +
             s"rasBranchRepair=${ShippingCoreConfig.rasBranchRepair} " +
             s"rasBranchSnapshot=${ShippingCoreConfig.rasBranchSnapshot} " +
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
