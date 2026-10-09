@@ -121,9 +121,9 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
   private def wayTag(dut: Dut, w: Int, set: Int): Long =
     dut.dcache.logic.tagMem(w).getBigInt(set).toLong
   private def wayValid(dut: Dut, w: Int, set: Int): Boolean =
-    dut.dcache.logic.validsMem(w).getBigInt(set) != 0
+    DcacheVdPeek.valid(dut.dcache, w, set)
   private def wayDirty(dut: Dut, w: Int, set: Int): Boolean =
-    dut.dcache.logic.dirtysMem(w).getBigInt(set) != 0
+    DcacheVdPeek.dirty(dut.dcache, w, set)
   private def waysMatching(dut: Dut, addr: Long): Seq[Int] = {
     val set = setOf(addr); val tg = tagOf(addr)
     (0 until Ways).filter(w => wayValid(dut, w, set) && wayTag(dut, w, set) == tg)

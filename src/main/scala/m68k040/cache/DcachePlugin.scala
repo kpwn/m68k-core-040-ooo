@@ -370,7 +370,10 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    /** Capacity in KiB (8 or 16), `ShippingCoreConfig.dcacheKB`. Only the set
                      * count changes (128 -> 256); 4 ways, 16-byte sectors and VIPT safety
                      * for 4 KiB pages are invariant (re-checked below). */
-                   val cacheKB: Int = m68k040.top.ShippingCoreConfig.dcacheKB)
+                   val cacheKB: Int = m68k040.top.ShippingCoreConfig.dcacheKB,
+                   /** `ShippingCoreConfig.dcacheVdRetime`: banked valid/dirty arrays + registered
+                     * maintenance CHECK-invalidate write. Exact (no behavioural change). */
+                   val vdRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheVdRetime)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -546,8 +549,26 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // same-bitstream reset therefore needs the explicit set walk below; otherwise
     // old valid+dirty lines survive while all surrounding control and replacement
     // registers reset, letting a new boot hit data from the previous one.
-    val validsMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
-    val dirtysMem = Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    // `vdRetime` (CPU_DCACHE_VD_RETIME): the same bits, stored as two half-depth banks per
+    // way selected by the set MSB (`validsBank(w)(b)` holds sets {b, low bits}). At 256 sets
+    // a single Mem infers RAM256X1D, whose read address (`rdSet`, the tag-compare-driven
+    // read-port mux) crosses LUT -> MUXF7 -> MUXF8 before the sync-read flop, and whose
+    // write enable fans out to twice the LUT sites; each 128-deep bank is the 8 KiB build's
+    // RAM128X1D shape. The bank select is the REGISTERED read-set MSB (see `rdValid`), so
+    // no read-address bit gains a level. Exactly one of `validsMem`/`validsBank` exists.
+    val vdBanked   = vdRetime
+    val vdBankSets = sets / 2
+    val vdLoBits   = setBits - 1
+    val validsMem: Seq[Mem[Bool]] =
+      if (vdBanked) Nil else Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    val dirtysMem: Seq[Mem[Bool]] =
+      if (vdBanked) Nil else Seq.fill(ways)(Mem(Bool(), sets) init Vector.fill(sets)(False))
+    val validsBank: Seq[Seq[Mem[Bool]]] =
+      if (!vdBanked) Nil
+      else Seq.fill(ways)(Seq.fill(2)(Mem(Bool(), vdBankSets) init Vector.fill(vdBankSets)(False)))
+    val dirtysBank: Seq[Seq[Mem[Bool]]] =
+      if (!vdBanked) Nil
+      else Seq.fill(ways)(Seq.fill(2)(Mem(Bool(), vdBankSets) init Vector.fill(vdBankSets)(False)))
     // ── Slice `D3-BURST`: "some sector of this LINE, in this way, MAY be dirty" ────
     // A sectored line has up to `nSec` independently dirty sectors, so the
     // evict-or-not decision at miss-detect needs the OR of them -- and the shared read
@@ -583,7 +604,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // `tagMem` joins them (2026-09-17): the multi-hot duplicate-purge tests plant a
     // duplicate through the BACKDOOR, because the reachable producers of one were
     // closed and a repair mechanism has to be tested against the state it repairs.
-    for (w <- 0 until ways) { validsMem(w).simPublic(); dirtysMem(w).simPublic(); tagMem(w).simPublic() }
+    for (w <- 0 until ways) {
+      if (vdBanked) for (b <- 0 until 2) { validsBank(w)(b).simPublic(); dirtysBank(w)(b).simPublic() }
+      else { validsMem(w).simPublic(); dirtysMem(w).simPublic() }
+      tagMem(w).simPublic()
+    }
     // Slice `D3-BURST`: replacement is per LINE, so this is LINE-indexed too.
     val victim  = Vec.fill(lineSets)(RegInit(U(0, wayBits bits)))
     // Runtime reset invalidation. RegInit(True) re-arms this on every reset (not
@@ -686,8 +711,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     for (w <- 0 until ways) {
       dataMem(w).write(wrSet(w), wrData(w), wrEn(w))
       tagMem(w).write(lineOf(wrSet(w)), wrTag(w), wrTagEn(w))
-      validsMem(w).write(validsWrSet(w), validsWrData(w), validsWrEn(w))
-      dirtysMem(w).write(dirtysWrSet(w), dirtysWrData(w), dirtysWrEn(w))
+      if (!vdBanked) {
+        validsMem(w).write(validsWrSet(w), validsWrData(w), validsWrEn(w))
+        dirtysMem(w).write(dirtysWrSet(w), dirtysWrData(w), dirtysWrEn(w))
+      } else for (b <- 0 until 2) {
+        val hi = b == 1
+        validsBank(w)(b).write(validsWrSet(w)(vdLoBits - 1 downto 0), validsWrData(w),
+                               validsWrEn(w) && (validsWrSet(w)(vdLoBits) === Bool(hi)))
+        dirtysBank(w)(b).write(dirtysWrSet(w)(vdLoBits - 1 downto 0), dirtysWrData(w),
+                               dirtysWrEn(w) && (dirtysWrSet(w)(vdLoBits) === Bool(hi)))
+      }
       if (sectored)
         lineDirtyMem(w).write(lineDirtyWrSet(w), lineDirtyWrData(w), lineDirtyWrEn(w))
     }
@@ -712,8 +745,20 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // Task #240 (D2.1): rdValid/rdDirty ride the SAME rdSet/rdEn port as rdTag/
     // rdData -- every consumer below reads rdValid(w)/rdDirty(w) at the exact same
     // address+cycle it already reads rdTag(w)/rdData(w) at (verified per call site).
-    val rdValid = Vec(validsMem.map(_.readSync(rdSet, rdEn)))
-    val rdDirty = Vec(dirtysMem.map(_.readSync(rdSet, rdEn)))
+    // `vdRetime`: both banks read the low set bits on the same port/enable; the flop that
+    // remembers which bank was addressed has the readSync output registers' exact enable,
+    // so the selected value equals the single-Mem readSync bit for bit (including the hold
+    // while `rdEn` is low and read-first behaviour against a same-edge write).
+    val vdRdHiQ: Bool = if (!vdBanked) null else RegNextWhen(rdSet(vdLoBits), rdEn)
+    def vdRead(m: Seq[Mem[Bool]], bank: Seq[Seq[Mem[Bool]]]): Vec[Bool] =
+      if (!vdBanked) Vec(m.map(_.readSync(rdSet, rdEn)))
+      else Vec(bank.map { bk =>
+        val lo = bk(0).readSync(rdSet(vdLoBits - 1 downto 0), rdEn)
+        val hi = bk(1).readSync(rdSet(vdLoBits - 1 downto 0), rdEn)
+        Mux(vdRdHiQ, hi, lo)
+      })
+    val rdValid = vdRead(validsMem, validsBank)
+    val rdDirty = vdRead(dirtysMem, dirtysBank)
     /** Slice `D3-BURST`: rides the SAME `rdSet`/`rdEn` port, line-indexed like `rdTag`.
       * Hard-False unsectored, where `rdDirty` already is the line's dirty state. */
     val rdLineDirty: Vec[Bool] =
@@ -4202,6 +4247,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
       // (set, way) pairs to do nothing.
       def touchesDc(c: CacheMaintCmd): Bool = (c.sel === U(1, 2 bits)) || (c.sel === U(3, 2 bits))
 
+      /** CHECK's invalidate of (`walkSet`, `curWay`). `vdRetime` issues it from NEXTW off the
+        * registered `chkInvPend`, so the tag compare (`rdTag(curWay)` -> `matches`) no longer
+        * reaches the valid/dirty LUTRAM write enable and write-address mux. */
+      val chkInvPend: Bool = if (!vdRetime) null else { val r = RegInit(False); r := False; r }
+      def checkInvalidateWrite(): Unit =
+        for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
+          validsWrEn(w)   := True
+          validsWrSet(w)  := walkSet
+          validsWrData(w) := False
+          dirtysWrEn(w)   := True
+          dirtysWrSet(w)  := walkSet
+          dirtysWrData(w) := False
+          validsVoteW2(w) := True   // Task #255 exclusivity tripwire (W2/D3)
+          dirtysVoteD3(w) := True
+        }
+
       val sm = new StateMachine {
         val IDLE  = new State with EntryPoint
         val WAIT  = new State   // command latched; hold until the D-cache is quiesced
@@ -4299,16 +4360,8 @@ class DcachePlugin(val socketMerged: Boolean = false,
             goto(WRB)
           } otherwise {
             when(matches && cmd.invalidate) {
-              for (w <- 0 until ways) when(curWay === U(w, wayBits bits)) {
-                validsWrEn(w)   := True
-                validsWrSet(w)  := walkSet
-                validsWrData(w) := False
-                dirtysWrEn(w)   := True
-                dirtysWrSet(w)  := walkSet
-                dirtysWrData(w) := False
-                validsVoteW2(w) := True   // Task #255 exclusivity tripwire (W2/D3)
-                dirtysVoteD3(w) := True
-              }
+              if (vdRetime) chkInvPend := True   // the write itself lands in NEXTW
+              else checkInvalidateWrite()
             }
             goto(NEXTW)
           }
@@ -4378,6 +4431,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
         NEXTW.whenIsActive {
           maintBusyReg := True
           walking := True
+          // `vdRetime`: CHECK's invalidate, one cycle later. Exact: CHECK always goes to
+          // NEXTW when it invalidates, `curWay`/`walkSet` still hold CHECK's values here,
+          // and nothing samples the arrays in this cycle -- the walk's next READ is the
+          // cycle after, loads/probes/shadow relaunches are refused (`maintBusyReg`,
+          // `maintWalking`) and no store is in S0..S3 while walking (asserted below).
+          if (vdRetime) when(chkInvPend) { checkInvalidateWrite() }
           when(curWay === U(ways - 1, wayBits bits)) {
             curWay := 0
             when(walkSet === lastSet) {

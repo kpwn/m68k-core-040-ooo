@@ -1,6 +1,7 @@
 package m68k040.bench
 
 import spinal.core.sim._
+import m68k040.cache.DcacheVdPeek
 
 import java.security.MessageDigest
 import java.nio.file.{Files, Paths}
@@ -413,6 +414,7 @@ object MissInjector {
   /** One per `doSim`. Cheap when disabled: `onCycle` exits on `enabled`. */
   final class Instance(dut: CoreBenchHarness#FullCoreDut, kernel: String) {
     private val dc = dut.dcache.logic
+    private val dcPlugin = dut.dcache
     private val ic = dut.icache.logic
 
     private var cycle = 0L
@@ -510,7 +512,7 @@ object MissInjector {
       var resident = false
       var w = 0
       while (w < dWays) {
-        if (dc.validsMem(w).getBigInt(set) != 0 && dc.tagMem(w).getBigInt(set).toLong == tag)
+        if (DcacheVdPeek.valid(dcPlugin, w, set) && dc.tagMem(w).getBigInt(set).toLong == tag)
           resident = true
         w += 1
       }
@@ -618,13 +620,13 @@ object MissInjector {
             !dc.stS3ArrayWrite.toBoolean) {
           val (set, way, tag) = dPend.dequeue()
           if (dc.tagMem(way).getBigInt(set).toLong == tag &&
-              dc.validsMem(way).getBigInt(set) != 0) {
+              DcacheVdPeek.valid(dcPlugin, way, set)) {
             // A DIRTY line is never stolen: memory does not hold its bytes, so the
             // refill that followed would return pre-store data. That is the one way
             // this feature could change an architectural result, and the check is
             // what makes it impossible rather than unlikely.
-            if (dc.dirtysMem(way).getBigInt(set) != 0) dSkipDirty += 1
-            else { dc.validsMem(way).setBigInt(set, BigInt(0)); c(D_STEAL) += 1 }
+            if (DcacheVdPeek.dirty(dcPlugin, way, set)) dSkipDirty += 1
+            else { DcacheVdPeek.setValid(dcPlugin, way, set, false); c(D_STEAL) += 1 }
           }
         }
       }

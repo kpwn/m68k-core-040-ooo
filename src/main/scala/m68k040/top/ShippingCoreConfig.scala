@@ -543,6 +543,13 @@ object ShippingCoreConfig {
     * and the tag one bit narrower. `CPU_DCACHE_KB=16`; echoed in `SHIPPING_CONFIG`. */
   val dcacheKB: Int = envInt("CPU_DCACHE_KB", 16, 8, 16)
   require(dcacheKB == 8 || dcacheKB == 16, s"CPU_DCACHE_KB must be 8 or 16 (got $dcacheKB)")
+  /** L1D valid/dirty array 200 MHz retime (`CPU_DCACHE_VD_RETIME`, default ON, gated 2026-10-09). Exact
+    * restructure, no behavioural change: each per-way `validsMem`/`dirtysMem` is split into
+    * two half-depth banks on the set MSB (registered bank select after the sync read), so a
+    * 256-set (16 KiB) array keeps the 128-deep LUTRAM read/write shape of the 8 KiB build; and
+    * the maintenance CHECK-invalidate write (tag-compare-dependent enable) is registered and
+    * lands in NEXTW. Echoed in `SHIPPING_CONFIG`. */
+  val dcacheVdRetime: Boolean = envFlag("CPU_DCACHE_VD_RETIME", true)
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */
