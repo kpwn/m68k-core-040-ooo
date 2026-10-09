@@ -705,6 +705,7 @@ object GenSocketTopVerilog {
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
             s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
+            s"pairCorrectBranch=${ShippingCoreConfig.pairCorrectBranch} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
             s"dcacheHitUnderMissRead=${ShippingCoreConfig.dcacheHitUnderMissRead} " +

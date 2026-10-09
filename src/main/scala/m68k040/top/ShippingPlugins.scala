@@ -114,6 +114,7 @@ object ShippingPlugins {
   def rob(detailedPerf: Boolean, pcRangeEnable: Boolean, lsOooIssue: Boolean,
           preparedRetireEntries: Int = 0): RobPlugin =
     new RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+      pairCorrectBranch = ShippingCoreConfig.pairCorrectBranch,
       rasBranchRepair = ShippingCoreConfig.rasBranchRepair,
       preparedRetireEntries = preparedRetireEntries,
       lsOooIssue = lsOooIssue)

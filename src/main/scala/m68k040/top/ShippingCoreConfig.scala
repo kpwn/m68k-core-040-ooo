@@ -657,6 +657,11 @@ object ShippingCoreConfig {
     * lock-step 0; IPC unchanged); `CPU_WALK_SQ_CHECK=0` disables. */
   val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", true)
 
+  /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
+    * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
+    * branch retires alone. Default ON (gated 2026-10-09); `CPU_PAIR_CORRECT_BRANCH=0` disables; echoed in `SHIPPING_CONFIG`. */
+  val pairCorrectBranch: Boolean = envFlag("CPU_PAIR_CORRECT_BRANCH", true)
+
   /** gshare PHT organisation (docs/design/10-review.md §1 item 5, §4.5, §5.3).
     *
     * `CPU_GSHARE_INTERLEAVED=1`: store the PHT as `entries/4` rows of four 2-bit counters
