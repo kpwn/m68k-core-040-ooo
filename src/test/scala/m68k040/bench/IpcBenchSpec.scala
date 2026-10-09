@@ -131,7 +131,27 @@ class IpcBenchSpec extends CoreBenchHarness {
         // deferral on top of training, which is what this A/B toggles.
         deferTakenSlot1Conditional = sys.env.get("IPC_V2_DEFER").contains("1")))
     println(s"  core profile: ${if (shipping) "SHIPPING (ShippingPlugins)" else if (v2) "throughput-v2 (board)" else "baseline (all options off)"}")
-    val results = kernels.map(k => runKernel(compiled, k))
+    // CPU_LS_PARK_RETIME: count the cold-path delays it can add (all null with the flag off).
+    val retimeStats = scala.collection.mutable.LinkedHashMap.empty[String, Array[Long]]
+    val results = kernels.map { k =>
+      val st = Array.fill(5)(0L); retimeStats(k.name) = st
+      dutProbe = d => if (d.lsEu.parkRetime) fork {
+        val ls = d.lsEu.logic
+        def on(b: Bool) = b != null && b.toBoolean
+        while (true) {
+          d.clockDomain.waitSampling()
+          if (on(ls.p3AdmitGateLost)) st(0) += 1
+          if (on(ls.p4FtDeclined)) st(1) += 1
+          if (on(ls.parkOwnStaleHold)) st(2) += 1
+          if (on(ls.parkFreeStaleHold)) st(3) += 1
+          if (on(ls.alignedFallThrough)) st(4) += 1
+        }
+      }
+      val r = runKernel(compiled, k); dutProbe = null; r
+    }
+    if (m68k040.top.ShippingCoreConfig.lsParkRetime) for ((n, st) <- retimeStats)
+      println(f"[parkretime] $n%-26s p3Deferred=${st(0)} p4FtDeclined=${st(1)} " +
+        s"p4StaleOwn=${st(2)} admitStaleFree=${st(3)} fallThroughs=${st(4)}")
     println(s"  [walkorder] CPU_WALK_SQ_CHECK=${m68k040.top.ShippingCoreConfig.walkSqCheck} " +
       s"held descriptor-read cycles (all kernels) = $walkOrderHoldCycles")
 

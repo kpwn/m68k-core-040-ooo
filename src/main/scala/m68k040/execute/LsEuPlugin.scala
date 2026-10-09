@@ -779,7 +779,23 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       inhibitedFullBarrier = inhibitedFullBarrier,
       coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold,
       walkLineQuery = walkOrderClient.isDefined,
-      p3LineProbe = p3SqLineFilter)
+      p3LineProbe = p3SqLineFilter,
+      anyInhibitedOut = parkRetime)
+    // `parkRetime`: registered SUPERSET of "some resident SQ entry has an INHIBITED half".
+    // An entry's cache modes are written only at allocation, so an inhibited entry valid
+    // next cycle is resident now or allocated now (B mode ORed in regardless of `validB`
+    // -- conservative). False implies `sq.io.barrier.olderInhibitedStore` is False for ANY
+    // query robId, which lets the P4 fall-through skip the SQ age compare (below).
+    val sqInhibR: Bool = if (parkRetime) RegInit(True) else null
+    if (parkRetime) {
+      sqInhibR := sq.io.anyInhibited || (sq.io.alloc.valid &&
+        ((sq.io.alloc.payload.cacheMode === m68k040.cache.CacheMode.INHIBITED) ||
+         (sq.io.alloc.payload.cacheModeB === m68k040.cache.CacheMode.INHIBITED)))
+      sqInhibR.simPublic()
+      GenerationFlags.simulation {
+        assert(sqInhibR || !sq.io.anyInhibited, "LsEuPlugin: sqInhibR is not a superset", FAILURE)
+      }
+    }
     val sqCoalesceFire    = if (sqCoalesceLines) sq.io.coalesceFire else null
     val sqCoalesceHolding = if (sqCoalesceLines) sq.io.coalesceHolding else null
     val sqCoalesceTimeout = if (sqCoalesceLines) sq.io.coalesceTimeout else null
@@ -1925,8 +1941,19 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     if (parkRetime && p3FastLoad) GenerationFlags.simulation {
       val ref = alignedFallThroughSelect &&
         ((alignedEnqFromP4 && (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED)) || p3FastEnq)
-      assert(alignedFallThrough === ref, "LsEuPlugin: parkRetime fall-through diverged from its reference", FAILURE)
+      // A SUBSET of the reference (P4 may decline the fall-through and send from the ring
+      // next cycle); never a fall-through without the matching push.
+      assert(!alignedFallThrough || ref, "LsEuPlugin: parkRetime fall-through without a push", FAILURE)
+      assert(!p3FastEnq || alignedFallThrough === ref, "LsEuPlugin: parkRetime changed a P3 fall-through", FAILURE)
       assert(alignedCount <= alignedDepth, "LsEuPlugin: aligned ring count above depth", FAILURE)
+    }
+    // Sim witness: a P4 push that the base design would have sent the same cycle and
+    // `parkRetime` sends from the ring one cycle later.
+    val p4FtDeclined: Bool = if (parkRetime && p3FastLoad) Bool() else null
+    if (parkRetime && p3FastLoad) {
+      p4FtDeclined := alignedFallThroughSelect && alignedEnqFromP4 && !p3FastEnq &&
+        (p4Ctx.xlate.cmode =/= m68k040.cache.CacheMode.INHIBITED) && !alignedFallThrough
+      p4FtDeclined.simPublic()
     }
     val alignedCmd = AlignedLoadCtx()
     alignedCmd := alignedMem(alignedSendPtr)
@@ -4257,9 +4284,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                     ((sq.io.fwd.rsp.hit && p4SqForwardAllowed) && p4Front.twoAccess) ||
                     sq.io.fwd.rsp.serial)
       } otherwise {
+        // `parkRetime`: the P4 FALL-THROUGH launch decision, built only from registers --
+        // `p4LaunchOk`'s cacheable arm with the SQ age compare (`olderInhibitedStore`)
+        // replaced by the registered superset `!sqInhibR`, so it IMPLIES `p4LaunchOk`.
+        // A P4 load denied the fall-through by it still enqueues normally (exact
+        // `p4LaunchOk`) and is sent from the ring one cycle later: a cacheable P4 load
+        // pays +1 cycle only while an inhibited (device) store is resident.
+        if (parkRetime) {
+          val ftOk = d4And(!parkBarrierSel)(!inhibLoadInFlight) && !p4Inhibited && !sqInhibR
+          when(ftOk && !p4Front.twoAccess) { p4EnqPre := True }
+        }
         when(p4LaunchOk) {
         when(!p4Front.twoAccess) {
-          if (parkRetime) p4EnqPre := True
           when(alignedCanEnq) {
             alignedEnq := True
             if (parkRetimeOoo) p4Enq := True
