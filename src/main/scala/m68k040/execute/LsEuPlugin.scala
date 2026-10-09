@@ -3020,6 +3020,18 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // ready/apply backlog pointers directly, to confirm a `liveCompletionFires`
     // collision genuinely occurred (rather than inferring it indirectly).
     pendPush.simPublic(); pendReady.simPublic(); pendApply.simPublic()
+    // `pendMem` frees a slot at APPLY (`pendApply`), the SQ frees its entry at the drain
+    // ACK (`pendReady`). While a confirmed replay is backlogged (it lost the shared
+    // completion stage to a launched cache response), the SQ can therefore hold `pendDepth`
+    // live precise entries while one more `pendMem` slot is still unapplied: `!sq.io.full`
+    // then admits a precise alloc whose push lands ON `pendApply` and overwrites the
+    // backlogged record -- the replay completes the NEW store's robId (early, wrong) and the
+    // acked store's robId never completes (ROB head parks behind `preciseDrainBusy`: hang).
+    // `pendApply <= pendReady <= pendPush` and the distance is at most `pendDepth`, so
+    // "pointers equal with a backlog" is exactly "ring full". Registers only. Applied with
+    // `CPU_LS_P3_LAUNCH` (`p3SqLineFilter`), whose P3-launched loads made this reachable.
+    val pendRingFull: Bool =
+      if (p3SqLineFilter) (pendApply =/= pendReady) && (pendPush === pendApply) else False
     liveCompletionFires.simPublic()
 
     // Called instead of `captureCompletion` on the `!fastStore` (precise) store-alloc
@@ -3073,6 +3085,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       //
       // D1 also gates P3's store-allocation arm directly with `!sqFlushSig`, but keep
       // this local gate as the lock-step invariant at the actual pendMem write site.
+      if (p3SqLineFilter) GenerationFlags.simulation {
+        assert(sqFlushSig || !pendRingFull,
+          "LsEuPlugin: precise-store pendMem push would overwrite a backlogged replay", FAILURE)
+      }
       when(!sqFlushSig) {
         pendMem(pendPush) := e
         pendFault(pendPush) := False   // fresh slot: clear any stale fault flag from a prior occupant
@@ -4618,7 +4634,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
             p3CompletionFire := True
             p3CanLeave       := True
           }
-        } elsewhen(!sq.io.full) {
+        } elsewhen(!sq.io.full && !(pendRingFull && !fastStore)) {
           when(fastStore && olderThanP3Comp) {
             frontCompHeld := True
           } otherwise {
