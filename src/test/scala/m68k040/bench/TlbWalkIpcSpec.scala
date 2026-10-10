@@ -145,9 +145,11 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
       if (shipping) new FullCoreDut(shippingProfile = true) else new FullCoreDut)
     println(s"  TLBWALK config: walkAgeLimit=${m68k040.top.ShippingCoreConfig.walkAgeLimit} " +
       s"dtlbHitUnderWalk=${m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk} " +
-      s"walkAbortOnFlush=${m68k040.top.ShippingCoreConfig.walkAbortOnFlush} shipping=$shipping")
+      s"walkAbortOnFlush=${m68k040.top.ShippingCoreConfig.walkAbortOnFlush} " +
+      s"l2Tlb=${m68k040.top.ShippingCoreConfig.l2Tlb}/${m68k040.top.ShippingCoreConfig.l2TlbEntries} shipping=$shipping")
     for (k <- kernels) {
       var dWalks = 0; var iWalks = 0; var dWalkBusy = 0; var iWalkBusy = 0; var dRead = 0
+      var dL2 = 0; var iL2 = 0               // CPU_L2_TLB: walks answered by the L2 TLB
       var orderHold = 0; var orderHoldEv = 0   // CPU_WALK_SQ_CHECK: withheld descriptor reads
       dutProbe = { dut =>
         val cd = dut.clockDomain
@@ -165,13 +167,17 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
           if (db && !prevD) dWalks += 1
           if (ib && !prevI) iWalks += 1
           prevD = db; prevI = ib
+          if (dut.dtlb.logic.l2Svc.isDefined && dut.dtlb.logic.walker.io.done.toBoolean &&
+              dut.dtlb.logic.walker.io.l2Hit.toBoolean) dL2 += 1
+          if (dut.itlb.logic.l2Svc.isDefined && dut.itlb.logic.walker.io.done.toBoolean &&
+              dut.itlb.logic.walker.io.l2Hit.toBoolean) iL2 += 1
         }
       }
       val r = runKernel(compiled, k)
       dutProbe = null
       println(f"  TLBWALK ${k.name}%-16s cycles=${r.windowCycles}%7d retired=${r.retiredInstrs}%6d " +
         f"ipc=${r.retiredInstrs.toDouble / r.windowCycles}%.4f dWalks=$dWalks%5d dWalkBusy=$dWalkBusy%7d " +
-        f"iWalks=$iWalks%5d iWalkBusy=$iWalkBusy%7d walkOrderHold=$orderHoldEv%d/${orderHold}cyc")
+        f"iWalks=$iWalks%5d iWalkBusy=$iWalkBusy%7d dL2=$dL2%5d iL2=$iL2%5d walkOrderHold=$orderHoldEv%d/${orderHold}cyc")
     }
   }
 }

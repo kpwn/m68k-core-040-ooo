@@ -192,7 +192,8 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // evidence this register exists to preserve.
     val dbgMultiHotClear = Bool(); dbgMultiHotClear.allowOverride; dbgMultiHotClear := False
     tlb.io.dbgMultiHotClear := dbgMultiHotClear
-    val walker = new TableWalker()
+    val l2Svc = host.get[L2TlbService].filter(_.l2TlbEnabled)
+    val walker = new TableWalker(l2 = l2Svc.isDefined)
 
     // ── Table-walk traffic now goes through the D-CACHE, not a private AXI master ──
     // Mirrors `DtlbPlugin`'s identical block; see its comment for the full rationale.
@@ -822,6 +823,36 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
         assert(!(vic.promote && tlbHit),
           "ITLB victim promote fired on an array HIT")
       }
+    }
+
+
+    // ── Shared L2 TLB client (`CPU_L2_TLB`, see `L2Tlb`) ──
+    // Probe: the walker's own PROBE state. Flush: this side's whole `atcFlush`.
+    // Fill: exactly when the L1 fills from a real walk (not an L2 hit) AND that walk
+    // queued no U/M write -- so a later L2 hit, which writes nothing, has the same
+    // side effects as the walk it replaces.
+    l2Svc.foreach { s =>
+      val p = s.l2TlbPort(L2TlbService.ITLB)
+      p.probe << walker.io.l2Probe
+      walker.io.l2Rsp << p.rsp
+      p.flush := atcFlush
+      p.fill.valid := walker.io.done && !walker.io.rsp.fault && !walkFlushPoison && !atcFlush &&
+                      !walkUmPoison && !rootChanged && !walker.io.rsp.umWrite.valid &&
+                      !walker.io.l2Hit
+      // The walker's own latched request (vpn, root select, TCR.P and the ROOT POINTER
+      // it actually walked from) -- not the live MMU registers.
+      p.fill.payload.key := walker.io.l2Probe.payload
+      // SURVIVE mode: every descriptor read the walker issues, and this side's own
+      // descriptor stores (consumed only where no D-cache store port exists to snoop).
+      p.descRead.valid   := walker.io.loadCmd.valid && walker.io.loadCmd.ready
+      p.descRead.payload := walker.io.loadCmd.payload.paddr
+      p.storeSnoop.valid   := _walkStore.valid && _walkStore.ready
+      p.storeSnoop.payload := _walkStore.payload.paddr
+      p.fill.payload.data.ppn        := walker.io.rsp.ppn
+      p.fill.payload.data.writeProt  := walker.io.rsp.writeProt
+      p.fill.payload.data.supervisor := walker.io.rsp.supervisor
+      p.fill.payload.data.cacheMode  := walker.io.rsp.cacheMode
+      p.fill.payload.data.modified   := walker.io.rsp.modified
     }
 
     val poisonedLatchExpire = RegNext(walker.io.done && walkUmPoison, init = False)

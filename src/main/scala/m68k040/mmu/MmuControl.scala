@@ -51,7 +51,41 @@ import spinal.lib.misc.plugin.FiberPlugin
   * Both fixes were independently verified via `ExecuteLockStepSpec`'s own full
   * 394-test suite (byte-identical fail-list before/after, git-stash A/B) and the
   * full 763-test ported corpus (see task #194's commit messages / report). */
-class MmuControlPlugin extends FiberPlugin with MmuControlService {
+class MmuControlPlugin(l2TlbEntries: Int = m68k040.top.ShippingCoreConfig.l2TlbEntriesEffective,
+                       l2TlbSurvive: Boolean = m68k040.top.ShippingCoreConfig.l2TlbSurvive,
+                       l2TlbGranules: Int = m68k040.top.ShippingCoreConfig.l2TlbSnoopGranules)
+    extends FiberPlugin with MmuControlService with L2TlbService {
+  // ── Shared L2 TLB (`CPU_L2_TLB`, see `L2Tlb`) ──
+  // Ports are allocated in SETUP so a client's build can drive them whatever the build
+  // order; each defaults idle (allowOverride) so a DUT with only one TLB elaborates.
+  override def l2TlbEnabled: Boolean = l2TlbEntries > 0
+  private var l2Ports: Seq[L2TlbClientPort] = Nil
+  override def l2TlbPort(client: Int): L2TlbClientPort = {
+    require(l2TlbEnabled, "L2 TLB port requested with CPU_L2_TLB off")
+    l2Ports(client)
+  }
+  private var l2Ext: spinal.lib.Flow[UInt] = null
+  override def l2TlbExtSnoop: spinal.lib.Flow[UInt] = { require(l2TlbEnabled); l2Ext }
+  during setup {
+    if (l2TlbEnabled) {
+      l2Ext = spinal.lib.Flow(UInt(32 bits))
+      l2Ext.valid.allowOverride; l2Ext.valid := False
+      l2Ext.payload.allowOverride; l2Ext.payload := 0
+      l2Ports = Seq.fill(2)(L2TlbClientPort())
+      for (p <- l2Ports) {
+        p.probe.valid.allowOverride; p.probe.valid := False
+        p.probe.payload.allowOverride; p.probe.payload.assignDontCare()
+        p.fill.valid.allowOverride; p.fill.valid := False
+        p.fill.payload.allowOverride; p.fill.payload.assignDontCare()
+        p.flush.allowOverride; p.flush := False
+        p.descRead.valid.allowOverride; p.descRead.valid := False
+        p.descRead.payload.allowOverride; p.descRead.payload := 0
+        p.storeSnoop.valid.allowOverride; p.storeSnoop.valid := False
+        p.storeSnoop.payload.allowOverride; p.storeSnoop.payload := 0
+      }
+    }
+  }
+
   // Task #195 follow-up (elaboration-crash fix for GenFullCoreSynthVerilog, found the
   // session after #195 landed -- NOT task #236, a separate/unrelated DcachePlugin
   // retiming fix on the fmax-closure-fanout branch): these getters used
@@ -160,5 +194,47 @@ class MmuControlPlugin extends FiberPlugin with MmuControlService {
     when(setDtt0.valid)   { dtt0 := setDtt0.payload }
     when(setDtt1.valid)   { dtt1 := setDtt1.payload }
     when(setMmusr.valid)  { mmusr := setMmusr.payload }
+
+    val l2 = l2TlbEnabled generate new Area {
+      // SURVIVE: snoop the D-cache's single store port when there is one (it carries the
+      // SQ drain, the exception frames AND both walkers' U/M stores); a DUT without a
+      // D-cache snoops the two walkers' own store ports instead.
+      val dcSvc = host.get[m68k040.cache.DcacheService]
+      val tlb = new L2Tlb(l2TlbEntries, clients = 2, survive = l2TlbSurvive,
+                          granules = l2TlbGranules, snoops = if (dcSvc.isDefined) 2 else 3)
+      if (l2TlbSurvive) for (c <- 0 until 2) tlb.io.descRead(c) << l2Ports(c).descRead
+      for (c <- 0 until 2) {
+        tlb.io.probe(c) << l2Ports(c).probe
+        l2Ports(c).rsp := tlb.io.rsp(c)
+        tlb.io.fill(c) << l2Ports(c).fill
+        // Belt and braces: the clients report their own `atcFlush` (which already
+        // contains every MMU-control write below); the local terms make the L2 obey
+        // them even in a DUT whose client does not.
+        tlb.io.flush(c) := l2Ports(c).flush
+      }
+      val localFlush = setEnable.valid || setPageSize.valid || setUrp.valid || setSrp.valid ||
+                       setItt0.valid || setItt1.valid || setDtt0.valid || setDtt1.valid
+      if (!l2TlbSurvive) when(localFlush) { tlb.io.flush(0) := True }
+      if (l2TlbSurvive && dcSvc.isEmpty) {
+        for (c <- 0 until 2) tlb.io.snoop(c) << l2Ports(c).storeSnoop
+        tlb.io.snoop(2) << l2Ext
+        tlb.io.inval := False
+      }
+    }
+  }
+
+  /** SURVIVE-mode snoop of the D-cache (its own build area: it waits for the D-cache's
+    * ports without holding up the MMU control registers the D-cache itself reads). */
+  val l2Snoop = during build new Area {
+    if (l2TlbEnabled && l2TlbSurvive) host.get[m68k040.cache.DcacheService].foreach { dc =>
+      val tlb = logic.l2.tlb
+      tlb.io.snoop(0).valid   := dc.store.valid && dc.store.ready
+      tlb.io.snoop(0).payload := dc.store.payload.paddr
+      tlb.io.snoop(1) << l2Ext
+      // CINV of the data cache (no push) can DISCARD dirty lines, reverting memory under
+      // a cached walk: drop everything. CPUSH writes back first and changes no value.
+      tlb.io.inval := dc.maintCmd.valid && dc.maintCmd.payload.invalidate &&
+                      !dc.maintCmd.payload.push && dc.maintCmd.payload.sel(0)
+    }
   }
 }

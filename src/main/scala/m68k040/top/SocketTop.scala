@@ -699,6 +699,10 @@ object GenSocketTopVerilog {
             s"lsFourCycleL1=${ShippingCoreConfig.lsFourCycleL1} " +
             s"lsEarlyAnRetry=${ShippingCoreConfig.lsEarlyAnRetry} " +
             s"lsParkRetime=${ShippingCoreConfig.lsParkRetime} " +
+            s"l2Tlb=${ShippingCoreConfig.l2Tlb} " +
+            s"l2TlbEntries=${ShippingCoreConfig.l2TlbEntries} " +
+            s"l2TlbSurvive=${ShippingCoreConfig.l2TlbSurvive} " +
+            s"l2TlbSnoopGranules=${ShippingCoreConfig.l2TlbSnoopGranules} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
