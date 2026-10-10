@@ -684,6 +684,20 @@ object ShippingCoreConfig {
     * lock-step 0; IPC unchanged); `CPU_WALK_SQ_CHECK=0` disables. */
   val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", true)
 
+  /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
+    * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
+    * the array's evictions, probed one cycle after a PRIMARY miss from `missReqReg`
+    * flops (never on the hit path); a hit is promoted back and answered like an array
+    * hit, a miss launches the walk one cycle later than before. Trace model (MAME 7.5.3,
+    * 2026-10-10): the 8-set x 4-way DTLB thrashes on set conflicts at 8 KB pages; 32
+    * entries on both TLBs = -80% walks (trace, not silicon). Reaches every harness via
+    * the `DtlbPlugin` constructor default; echoed in SHIPPING_CONFIG. */
+  val dtlbVictimEntries: Int = {
+    val n = envInt("CPU_DTLB_VICTIM", 0, 0, 64)
+    require(n != 1, "CPU_DTLB_VICTIM must be 0 (off) or 2..64")
+    n
+  }
+
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
     * branch retires alone. Default ON (gated 2026-10-09); `CPU_PAIR_CORRECT_BRANCH=0` disables; echoed in `SHIPPING_CONFIG`. */
