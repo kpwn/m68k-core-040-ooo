@@ -370,7 +370,14 @@ object ShippingCoreConfig {
     * `OFF_PERF_ITLB_WALK` (0x010A4) — already in every bitstream, never yet read.
     *
     * ⚠️ This lever CANNOT be measured on Dhrystone: the board's Dhrystone-only window
-    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder. */
+    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder.
+    *
+    * 200 MHz (2026-09-30): the first cut cost 2.859 ns (eight levers + it: WNS -2.882,
+    * without it -0.023). REGISTERED (`ItlbPlugin`'s `vic` Area: promote/launch +2
+    * cycles, insert +1, generation-tagged invalidation) the same eight + it close at
+    * WNS -0.237 with NO ItlbPlugin path in the worst 200 (tail = D-cache/LSU/Icache
+    * hubs; 0.2 ns vs -0.023 is inside placement noise). 100 MHz ITLB_VICTIM=32 alone
+    * boots to the Finder. Still OFF pending the `OFF_PERF_ITLB_WALK` board A/B. */
   val itlbVictimEntries: Int = sys.env.get("ITLB_VICTIM") match {
     case Some(s) =>
       val n = try s.toInt catch {
