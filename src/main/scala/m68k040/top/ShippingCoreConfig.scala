@@ -704,6 +704,17 @@ object ShippingCoreConfig {
   require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
     s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
 
+  /** gshare history length folded into the PHT index (`CPU_GSHARE_HIST_BITS`, 2..16).
+    * 0 (default) = the old rule min(GHR_BITS = 16, log2(CPU_GSHARE_ENTRIES)), so the
+    * default is bit-identical. A non-zero value decouples history length from table
+    * depth (e.g. 8192 entries with 11 history bits spends the extra index bits on PC,
+    * i.e. on aliasing rather than on longer history). With CPU_GHR_TRIM the stored
+    * `ghr`/`ghrArch` width follows it. Values above log2(entries) XOR-fold the excess
+    * history into the low index bits (the untrimmed pre-2026-09-25 shape). Echoed in
+    * `SHIPPING_CONFIG`. */
+  val gshareHistBits: Int = envInt("CPU_GSHARE_HIST_BITS", 0, 0, 16)
+  require(gshareHistBits != 1, "CPU_GSHARE_HIST_BITS must be 0 (auto) or 2..16")
+
   /** ROB: drive `flushing` (-> `rc.flushPort`, `headReady`, the ROB pointer/count resets
     * and every other in-ROB `flushing` use) from the REGISTERED `backendSquash` flop instead
     * of the combinational `doFlushReg || excSquash` OR. `backendSquash` is an exact register
