@@ -706,6 +706,8 @@ object GenSocketTopVerilog {
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
             s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
+            s"excFastFrames=${ShippingCoreConfig.excFastFrames} " +
+            s"excFramesCopyback=${ShippingCoreConfig.excFramesCopyback} " +
             s"pairCorrectBranch=${ShippingCoreConfig.pairCorrectBranch} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +

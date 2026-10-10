@@ -39,8 +39,16 @@ trait CoreBenchHarness extends AnyFunSuite {
   // Copied (not shared) because the lock-step DUT is a private inner class. The
   // wiring is the SAME proven full-core chain.
 
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin,
+                            /** FullCoreSynth parity for EXCEPTION kernels: write the exception
+                              * A7 at the committed physical A7 and mirror the committed A7 back
+                              * into the ExceptionUnit (`committedA7In`). Off by default so every
+                              * existing bench DUT keeps its exact PRF port set; without it a
+                              * kernel that takes an exception pushes its frame at the poked ISP,
+                              * not at the program's A7 (`ExcTrapIpcSpec` sets it). */
+                            excA7Mirror: Boolean = false) extends FiberPlugin {
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+    var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
     // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
     // write into whatever physical register nzvcRat/xRat's COMMITTED mapping
     // currently names, mirroring a7Wr's already-safe pattern -- see
@@ -54,6 +62,7 @@ trait CoreBenchHarness extends AnyFunSuite {
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      if (excA7Mirror) a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
       xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
   fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
@@ -314,7 +323,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       // FullCoreSynth would have been invisible to the test suite.
       host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       a7Wr.valid   := exc.a7WriteValid
-      a7Wr.address := U(15, a7Wr.address.getWidth bits)
+      if (excA7Mirror) {
+        a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+        a7Rd.addr    := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+        exc.committedA7In := a7Rd.data.asUInt
+      } else {
+        a7Wr.address := U(15, a7Wr.address.getWidth bits)
+      }
       a7Wr.data    := exc.a7WriteData.asBits
       nzvcWr.valid   := exc.rteNzvcWriteValid
       nzvcWr.address := host[RenameStage].committedPhysNzvc.resize(nzvcWr.address.getWidth)
@@ -380,7 +395,8 @@ trait CoreBenchHarness extends AnyFunSuite {
                     deferSlot1Dbcc: Boolean = false,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment,
-                    shippingProfile: Boolean = false) extends Component {
+                    shippingProfile: Boolean = false,
+                    excA7Mirror: Boolean = false) extends Component {
     // The fanout measurements can request the exact shipping plugin constructor
     // set. The direct-AXI bench topology is the one explicit difference from the
     // socket, which uses AxiDMergePlugin; all execution knobs come from the same
@@ -469,7 +485,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val rfX    = new RegFilePluginX
   val rfFp   = new RegFilePluginFp
   val rfFpcc = new RegFilePluginFpcc
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu, excA7Mirror)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,

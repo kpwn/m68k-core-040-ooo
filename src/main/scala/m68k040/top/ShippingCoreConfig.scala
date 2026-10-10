@@ -745,4 +745,17 @@ object ShippingCoreConfig {
     * `cand1`. Read by `IssueQueuePlugin` (default) and by every two-ALU harness for eu1
     * (`AluEuPlugin(lean = ...)`). Default ON (gated 2026-10-08); `CPU_ALU1_LEAN=0` disables; echoed in `SHIPPING_CONFIG`. */
   val alu1Lean: Boolean = envFlag("CPU_ALU1_LEAN", true)
+  /** Exception fast frames (review §4.7/§2.8): the ExceptionUnit's entry frame push and
+    * RTE frame pop are issued as aligned LONGs where a 4-aligned frame pair allows it
+    * (format-$0 push: 4 word stores -> 2 long stores, or 3 when the frame base is only
+    * 2-aligned; RTE pop: 4 word loads -> 2 long loads when the frame is 4-aligned).
+    * Read by `ExceptionUnit` via `RobPlugin`. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFastFrames: Boolean = envFlag("CPU_EXC_FAST_FRAMES", false)
+  /** Exception frames on COPYBACK pages (review §4.7 option i): the entry frame push uses
+    * the stack page's own cache mode when it is COPYBACK (CACR.DE=1), so each frame store
+    * acks from the L1D array instead of a write-through AXI B round trip. Residual
+    * difference: a push that MISSES and whose write-allocate refill bus-errors halts the
+    * core through the D-cache diagnostic fault instead of the exception unit's
+    * DOUBLE_FAULT (both halt). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFramesCopyback: Boolean = envFlag("CPU_EXC_FRAMES_COPYBACK", false)
 }
