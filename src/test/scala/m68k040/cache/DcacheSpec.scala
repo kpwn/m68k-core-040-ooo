@@ -22,15 +22,20 @@ class DcacheSpec extends AnyFunSuite {
 
   class Dut(directRefill: Boolean = false, hitUnderMissRead: Boolean = false,
             earlyLineForward: Boolean = false,
-            lineForwardLiveGuards: Boolean = true) extends Component {
+            lineForwardLiveGuards: Boolean = true,
+            legacy: Boolean = false) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
+    private val b = if (legacy) DcacheTestBuild.Legacy else DcacheTestBuild.Shipping
     val dcache = new DcachePlugin(directRefillResponse = directRefill,
       earlyProbeLineForward = earlyLineForward,
       lineForwardLiveGuards = lineForwardLiveGuards,
-      hitUnderMiss = hitUnderMissRead, hitUnderMissRead = hitUnderMissRead)
+      hitUnderMiss = hitUnderMissRead, hitUnderMissRead = hitUnderMissRead,
+      nonBlocking = b.nonBlocking, hotDoor = b.hotDoor, nbEarlyResponse = b.nbEarlyResponse,
+      nbEagerAr = b.nbEagerAr, nbPreselectAr = b.nbPreselectAr,
+      nbDynamicRelease = b.nbDynamicRelease, nbProbeMissStage = b.nbProbeMissStage)
     val probe  = new DcacheProbePlugin
     // Part 131: the real MMU-control owner, so `TCR.P` (8 KB pages) can be poked and
     // DcachePlugin's PAGE-scope granule can be exercised at BOTH page sizes. It is
@@ -55,13 +60,23 @@ class DcacheSpec extends AnyFunSuite {
   // cannot initialize it while the test thread holds this suite's lazy-val lock.
   lazy val sharedCompiled = simConfig.compile(new Dut(directRefill = false, hitUnderMissRead = false,
     earlyLineForward = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
-    lineForwardLiveGuards = LineGuards))
+    lineForwardLiveGuards = LineGuards, legacy = false))
+  /** `sharedCompiled`'s configuration on the blocking L1D, for tests whose subject is a
+    * mechanism or a cycle count of that FSM (the bounded replay/shadow slot, the S1-miss
+    * refill kickoff) -- see `DcacheTestBuild`. */
+  lazy val legacySharedCompiled = simConfig.compile(new Dut(directRefill = false, hitUnderMissRead = false,
+    earlyLineForward = m68k040.top.ShippingCoreConfig.dcacheEarlyProbeLineForward,
+    lineForwardLiveGuards = LineGuards, legacy = true))
+  // The direct-refill response and the hit-under-miss shadow slot exist only in the
+  // blocking L1D (`nonBlocking` subsumes and forbids `hitUnderMissRead`), so these two
+  // builds pin it -- see `DcacheTestBuild`.
   lazy val directRefillCompiled = simConfig.compile(new Dut(directRefill = true, hitUnderMissRead = false,
-    earlyLineForward = false))
+    earlyLineForward = false, lineForwardLiveGuards = true, legacy = true))
   lazy val directHumCompiled = simConfig.compile(new Dut(directRefill = true,
-    hitUnderMissRead = true, earlyLineForward = false))
+    hitUnderMissRead = true, earlyLineForward = false, lineForwardLiveGuards = true, legacy = true))
   lazy val earlyLineCompiled = simConfig.compile(new Dut(directRefill = false,
-    hitUnderMissRead = false, earlyLineForward = true, lineForwardLiveGuards = LineGuards))
+    hitUnderMissRead = false, earlyLineForward = true, lineForwardLiveGuards = LineGuards,
+    legacy = false))
 
   test("direct refill replies once on a cacheable miss, faults once on DECERR, and leaves inhibited reads unchanged",
        VerilatorTest) {
@@ -171,8 +186,7 @@ class DcacheSpec extends AnyFunSuite {
         }
 
         offer(cold, 1)
-        cd.waitSamplingWhere(dut.dcache.logic.axi.ar.valid.toBoolean &&
-                             dut.dcache.logic.axi.ar.ready.toBoolean)
+        cd.waitSamplingWhere(m68k040.cache.DcacheTestAxi.arFire(dut.dcache))
         cd.waitSampling(offset)
         offer(hot, 2)
         cd.waitSampling(72)
@@ -202,6 +216,7 @@ class DcacheSpec extends AnyFunSuite {
   def load(dut: Dut, cd: ClockDomain, vaddr: Long, size: SpinalEnumElement[Size.type],
            cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
            expectedResidentHit: Option[Boolean] = None): BigInt = {
+    if (cacheMode == CacheMode.INHIBITED) DcacheTestAxi.awaitInhibitedLaunchOk(dut.dcache, cd)
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
@@ -276,7 +291,8 @@ class DcacheSpec extends AnyFunSuite {
   def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false
@@ -306,7 +322,8 @@ class DcacheSpec extends AnyFunSuite {
   def initDutErrInject(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true)
+    DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd, injectBusErrors = true))
     dut.probe.logic.loadCmdIn.valid #= false
     // 2026-09-14: pin the probe ports idle too, exactly as `initDut` does. An un-poked
     // testbench input is NOT guaranteed 0 across seeds (the documented sim gotcha); a
@@ -374,12 +391,14 @@ class DcacheSpec extends AnyFunSuite {
                       injectBusErrors: Boolean = false): (ClockDomain, AxiMemModel) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
+    DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
     val cfg = AxiMemModelConfig(
       latency = L2LatencyModel(enabled = true, hitCycles = hitCycles),
       crossbarSingleOutstanding = crossbarSingleOutstanding,
       checkIdUnique = checkIdUnique,
       injectBusErrors = injectBusErrors)
     val mem = AxiMemModel.attachFull(dut.dcache.logic.axi, cd, cfg)
+    m68k040.sim.HotDoorAttach.model(dut.dcache, cd, mem)   // the SoC's hot door, when built
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false
@@ -427,7 +446,7 @@ class DcacheSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+        if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1 } }
 
       load(dut, cd, base, Size.LONG, expectedResidentHit = Some(false)) // cold miss -> 1 refill
       val after1 = arCount
@@ -520,7 +539,7 @@ class DcacheSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+        if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1 } }
       // re-load: must miss (no allocate happened) -> refill picks up the new memory value
       val got = load(dut, cd, base, Size.LONG)
       assert(arCount == 1, s"missing-line store must not allocate: refill count $arCount")
@@ -539,6 +558,7 @@ class DcacheSpec extends AnyFunSuite {
       // Eight ascending WORD stores within one 16-byte line, ack-gated each.
       val words = Seq(0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888)
       for ((w, i) <- words.zipWithIndex) doStoreAckGated(dut, cd, base + i * 2, BigInt(w))
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       for ((w, i) <- words.zipWithIndex) {
         val hi = (w >> 8) & 0xff; val lo = w & 0xff
@@ -560,7 +580,7 @@ class DcacheSpec extends AnyFunSuite {
 
       var arCount = 0
       fork { while (true) { cd.waitSampling()
-        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1 } }
+        if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1 } }
 
       val got1 = load(dut, cd, base, Size.LONG, CacheMode.INHIBITED)
       assert(got1 == expected(base, 4), "inhibited load still returns correct data")
@@ -736,6 +756,10 @@ class DcacheSpec extends AnyFunSuite {
       }
 
       doStore(dut, cd, base + 4, BigInt("11223344", 16), Size.LONG, CacheMode.WRITETHROUGH)
+      // The non-blocking L1D answers the priming load from its MSHR before the line is
+      // installed, so this store can meet the line still in flight; count the bus beats
+      // and peek the arrays only once everything accepted has finished.
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)
 
       assert(awCount == 1, s"WRITETHROUGH hit drain must still issue exactly one AXI aw beat: got $awCount")
       assert(wCount == 1, s"WRITETHROUGH hit drain must still issue exactly one AXI w beat: got $wCount")
@@ -977,7 +1001,7 @@ class DcacheSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
           if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
           if (dut.dcache.logic.busFaultResp.toBoolean) faulted = true
@@ -999,6 +1023,9 @@ class DcacheSpec extends AnyFunSuite {
       assert(acked, s"COPYBACK-miss drain must eventually ack via write-allocate (none seen by cycle $cyc)")
 
       cd.waitSampling(6)
+      // The non-blocking L1D acks the store when its MSHR takes it, before the fill is
+      // installed: wait for the transaction to finish before peeking the arrays.
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)
       assert(!faulted, "a clean COPYBACK-miss drain must never raise busFaultResp (no architectural fault)")
       assert(arCount == 1, s"write-allocate refill must issue exactly one AXI AR beat: got $arCount")
       assert(awCount == 0, s"COPYBACK-miss drain must issue ZERO AXI aw beats (merge is on-chip): got $awCount")
@@ -1058,7 +1085,7 @@ class DcacheSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
           if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
         }
@@ -1116,7 +1143,7 @@ class DcacheSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
           if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
         }
@@ -1503,8 +1530,12 @@ class DcacheSpec extends AnyFunSuite {
       assert(dut.dcache.logic.diagFaultKind.toInt == 1, "kind=1 (drain-miss write-allocate refill)")
       assert(dut.dcache.logic.diagFaultResp.toInt == 2,
         "kind=1's resp is the hardcoded SLVERR-class placeholder (U(2,2 bits)), not the real DECERR")
-      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(storePaddr),
-        "latched addr must be the store's own (un-line-aligned) paddr, per missPaddr's own convention")
+      // The blocking FSM latches `missPaddr` (the store's own address); the non-blocking
+      // L1D's refill is an MSHR transaction that only carries the LINE, so its diagnostic
+      // latch holds the line address. Both identify the faulting access.
+      val expAddr = if (dut.dcache.nonBlocking) storePaddr & ~0xfL else storePaddr
+      assert(dut.dcache.logic.diagFaultAddr.toBigInt == BigInt(expAddr),
+        f"latched addr must be 0x$expAddr%08x (store paddr, or its line under the non-blocking L1D)")
 
       cd.waitSampling(4)
     }
@@ -1564,7 +1595,7 @@ class DcacheSpec extends AnyFunSuite {
       fork {
         while (true) {
           cd.waitSampling()
-          if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean && dut.dcache.logic.axi.aw.ready.toBoolean) awCount += 1
           if (dut.dcache.logic.axi.w.valid.toBoolean  && dut.dcache.logic.axi.w.ready.toBoolean)  wCount  += 1
           if (dut.dcache.logic.busFaultResp.toBoolean) faulted = true
@@ -1946,6 +1977,7 @@ class DcacheSpec extends AnyFunSuite {
       // an ordinary register write that reset then overwrites (this project's task
       // #194 precedent). The read-back below turns that gotcha into a hard assert
       // rather than a silently-vacuous test.
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       dut.mmuCtrl.logic.pageSize8K #= is8K
       cd.waitSampling(2)
@@ -1963,6 +1995,7 @@ class DcacheSpec extends AnyFunSuite {
 
       maintPulse(dut, cd, push = push, invalidate = invalidate, SCOPE_PAGE, SEL_DC, operand)
       maintWait(dut, cd)
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       // Snapshot BEFORE any reload: a load would refill/allocate and perturb dirty state.
@@ -2078,6 +2111,7 @@ class DcacheSpec extends AnyFunSuite {
     var out: Map[Long, Boolean] = null
     sharedCompiled.doSim(name, seed) { dut =>
       val (cd, mem) = initDut(dut)
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       dut.mmuCtrl.logic.pageSize8K #= is8K
       cd.waitSampling(2)
@@ -2091,6 +2125,7 @@ class DcacheSpec extends AnyFunSuite {
       lines.foreach { b => assert(peekLong(mem, b + 4) != p131Mark(b), f"0x$b%x leaked early") }
       maintPulse(dut, cd, push = true, invalidate = false, SCOPE_PAGE, SEL_DC, X)
       maintWait(dut, cd)
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       out = lines.map(b => b -> (peekLong(mem, b + 4) == p131Mark(b))).toMap
     }
@@ -2470,10 +2505,22 @@ class DcacheSpec extends AnyFunSuite {
     * documented SpinalSim gotcha) AND to the memory model's own latency shape --
     * neither of which says anything about the D-cache's timing. `ar.valid` is a
     * pure DUT output off the REFILL state and is fully deterministic. */
+  /** Under the non-blocking L1D, present a command the way `LsEuPlugin` presents every
+    * ordinary single-access load: a RING load (`ooOk`, `ridValid`, its slot in `rid`).
+    * An in-order load is serialised there by design (`serialPending`, which also holds
+    * `loadBusy`), so a hit-pipeline timing test must use the ring form to measure the
+    * hit pipeline. No-op on the blocking L1D, which has no ring. */
+  def ringLoad(dut: Dut, rid: Int): Unit = if (dut.dcache.nonBlocking) {
+    dut.probe.logic.loadCmdIn.payload.ooOk #= true
+    dut.probe.logic.loadCmdIn.payload.ridValid #= true
+    dut.probe.logic.loadCmdIn.payload.rid #= rid
+  }
+
   def loadTimed(dut: Dut, cd: ClockDomain, vaddr: Long,
                 size: SpinalEnumElement[Size.type],
                 cacheMode: SpinalEnumElement[CacheMode.type] = CacheMode.WRITETHROUGH,
                 budget: Int = 200): (Int, Int, Int) = {
+    ringLoad(dut, 0)
     dut.probe.logic.loadCmdIn.valid #= true
     dut.probe.logic.loadCmdIn.payload.vaddr #= vaddr
     dut.probe.logic.loadCmdIn.payload.paddr #= vaddr   // identity translation in this spec
@@ -2493,6 +2540,7 @@ class DcacheSpec extends AnyFunSuite {
       if (dut.probe.logic.loadRspOut.valid.toBoolean) rspAt = n
       if (rspAt < 0) { cd.waitSampling(); n += 1 }
     }
+    DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
     (rspAt, missAt, arAt)
   }
 
@@ -2505,6 +2553,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // Warm the line (cold miss -> refill -> resident, clean).
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "priming load data")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       val (rspAt, missAt, arAt) = loadTimed(dut, cd, base + 4, Size.LONG)
@@ -2539,6 +2588,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // Prime the line, then let every miss/replay pipeline register drain.
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "priming load data")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       val addrs = Seq(base + 4, base + 8, base + 12)
@@ -2548,11 +2598,22 @@ class DcacheSpec extends AnyFunSuite {
       // Hold each Stream token until its own sampling-edge handshake, then replace
       // the payload with the next token. This is deliberately a three-token run:
       // A can be in S2, B in S1, and C accepted into the sync-read launch together.
+      // The non-blocking L1D streams only RING loads (`ooOk`, one `rid` per slot -- what
+      // `LsEuPlugin` sends for every ordinary single-access load); an in-order load is
+      // serialised behind the previous response by design (`serialPending`). Present the
+      // shipping LSU's form so this measures the hit pipeline, not the serial gate.
+      val ring = dut.dcache.nonBlocking
+      def ringId(k: Int): Unit = if (ring) {
+        dut.probe.logic.loadCmdIn.payload.ooOk #= true
+        dut.probe.logic.loadCmdIn.payload.ridValid #= true
+        dut.probe.logic.loadCmdIn.payload.rid #= k
+      }
       dut.probe.logic.loadCmdIn.valid #= true
       dut.probe.logic.loadCmdIn.payload.vaddr #= addrs.head
       dut.probe.logic.loadCmdIn.payload.paddr #= addrs.head
       dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
       dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
+      ringId(0)
       var next = 1
       var cycle = 0
       while ((accepts.size < addrs.size || responses.size < addrs.size) && cycle < 20) {
@@ -2564,6 +2625,7 @@ class DcacheSpec extends AnyFunSuite {
           if (next < addrs.size) {
             dut.probe.logic.loadCmdIn.payload.vaddr #= addrs(next)
             dut.probe.logic.loadCmdIn.payload.paddr #= addrs(next)
+            ringId(next)
             next += 1
           } else {
             dut.probe.logic.loadCmdIn.valid #= false
@@ -2581,6 +2643,7 @@ class DcacheSpec extends AnyFunSuite {
         s"resident-hit responses must be bubble-free, got cycles ${responses.map(_._1)}")
       assert(responses.map(_._2) == addrs.map(a => expected(a, 4)),
         s"responses must remain in accept order: got ${responses.map(_._2)}")
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
       cd.waitSampling(4)
     }
   }
@@ -2650,7 +2713,7 @@ class DcacheSpec extends AnyFunSuite {
 
   test("IPC slice C0: the load accepted behind an S1 miss is replayed after the " +
        "refill and cannot respond out of order", VerilatorTest) {
-    sharedCompiled.doSim { dut =>
+    legacySharedCompiled.doSim { dut =>
       val (cd, mem) = initDut(dut)
       val hitBase  = 0x7D00L
       val missBase = 0x9E40L
@@ -2659,6 +2722,7 @@ class DcacheSpec extends AnyFunSuite {
 
       // Keep B resident while A remains cold.
       assert(load(dut, cd, hitBase, Size.LONG) == expected(hitBase, 4), "prime B")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       val addrs = Seq(missBase, hitBase + 4)
@@ -2715,6 +2779,7 @@ class DcacheSpec extends AnyFunSuite {
       val token = 0x25
       preload(mem, base, 16)
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       dut.probe.logic.loadProbeIn.valid #= true
@@ -2825,6 +2890,7 @@ class DcacheSpec extends AnyFunSuite {
       preload(mem, alias & ~15L, 16)
       assert(load(dut, cd, vaddr, Size.LONG) == expected(vaddr, 4))
       assert(load(dut, cd, alias, Size.LONG) == expected(alias, 4))
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       dut.probe.logic.loadProbeIn.valid #= true
       dut.probe.logic.loadProbeIn.payload.vaddr #= vaddr
@@ -2875,6 +2941,7 @@ class DcacheSpec extends AnyFunSuite {
       val targetToken = 0x60 + depth - 1
       preload(mem, target & ~15L, 16)
       assert(load(dut, cd, target, Size.LONG) == expected(target, 4))
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       for (i <- 0 until depth) {
         val addr = if (i == depth - 1) target else 0x7200L + i * 0x110L
@@ -2957,6 +3024,7 @@ class DcacheSpec extends AnyFunSuite {
       val addr = 0x7E08L
       preload(mem, addr & ~15L, 16)
       assert(load(dut, cd, addr, Size.LONG) == expected(addr, 4))
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
       dut.probe.logic.loadProbeIn.valid #= true
       dut.probe.logic.loadProbeIn.payload.vaddr #= addr
@@ -3025,6 +3093,7 @@ class DcacheSpec extends AnyFunSuite {
       val token = 0x25
       preload(mem, base, 16)
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       // P1: virtual index only. The synchronous RAM result becomes the held early
@@ -3100,6 +3169,7 @@ class DcacheSpec extends AnyFunSuite {
       preload(mem, base, 16)
       preload(mem, alias - 8, 16)
       assert(load(dut, cd, base, Size.LONG) == expected(base, 4), "prime line")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       def probe(token: Int, hint: Long): Unit = {
@@ -3246,6 +3316,7 @@ class DcacheSpec extends AnyFunSuite {
       preload(mem, addrB & ~0xFL, 16)
       assert(load(dut, cd, addrA, Size.LONG) == expected(addrA, 4), "prime A")
       assert(load(dut, cd, addrB, Size.LONG) == expected(addrB, 4), "prime B")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       // Hold A's virtual-set result in one probe-result queue entry.
@@ -3367,6 +3438,7 @@ class DcacheSpec extends AnyFunSuite {
       assert(load(dut, cd, addrX, Size.LONG) == expected(addrX, 4), "prime X")
       assert(load(dut, cd, addrY, Size.LONG) == expected(addrY, 4), "prime Y")
       assert(load(dut, cd, addrZ, Size.LONG) == expected(addrZ, 4), "prime Z")
+      DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // non-blocking fills finish after the response
       cd.waitSampling(8)
 
       def issueProbe(addr: Long, token: Int): Unit = {
@@ -3436,6 +3508,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.payload.size #= Size.LONG
       dut.probe.logic.loadCmdIn.payload.cacheMode #= CacheMode.WRITETHROUGH
       dut.probe.logic.loadCmdIn.payload.token #= 0   // matches no queued probe
+      ringLoad(dut, 0)
       dut.probe.logic.loadCmdIn.valid #= true
       while (!(dut.probe.logic.loadCmdIn.valid.toBoolean && dut.probe.logic.loadCmdIn.ready.toBoolean)) {
         cd.waitSampling(); sleep(1)
@@ -3454,6 +3527,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.payload.vaddr #= addrY
       dut.probe.logic.loadCmdIn.payload.paddr #= addrY
       dut.probe.logic.loadCmdIn.payload.token #= tokenY
+      ringLoad(dut, 1)
       dut.probe.logic.loadCmdIn.valid #= true
       sleep(1)
       assert(dut.dcache.logic.earlyProbeConflict.toBoolean,
@@ -3495,6 +3569,7 @@ class DcacheSpec extends AnyFunSuite {
       dut.probe.logic.loadCmdIn.payload.vaddr #= addrZ
       dut.probe.logic.loadCmdIn.payload.paddr #= addrZ
       dut.probe.logic.loadCmdIn.payload.token #= tokenZ
+      ringLoad(dut, 2)
       sleep(1)
       assert(dut.dcache.logic.useEarlyProbe.toBoolean,
         "Z must also take the fast path with no further stall behind Y's recovery")
@@ -3655,7 +3730,7 @@ class DcacheSpec extends AnyFunSuite {
 
   test("FMax slice 2: miss DETECTION and refill kickoff timing are unchanged by the " +
        "S1a/S1b split", VerilatorTest) {
-    sharedCompiled.doSim { dut =>
+    legacySharedCompiled.doSim { dut =>
       val (cd, mem) = initDut(dut)
       val base = 0x7B00L        // cold, never touched -> guaranteed MISS, clean victim
       preload(mem, base, 16)
