@@ -85,6 +85,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // in setup (RegfileService requires it). latency=0 so the handler can read the
     // updated A7 the cycle after the exception commits (it is serializing).
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  var sysRegWr: m68k040.execute.regfile.RegFileWritePort = null
     // Sim-only boot seed of the int PRF (A7 = boot SSP). Shares the "excA7" physical
     // write port (the exc unit is idle at boot, so no same-cycle collision). Driven by
     // the harness for a couple of cycles after the init sweep, before the first fetch.
@@ -104,11 +105,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
-      // CPU_BE_RETIME: staged exactly like SocketTop's a7Wr (ShippingPlugins.rob stages the
-      // FMOVEM An write under the same flag, and the two must move together).
-      a7Wr   = if (m68k040.top.ShippingCoreConfig.beRetime)
-                 host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
-               else host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      // CPU_BE_RETIME: the sysOp destination write is STAGED exactly like SocketTop's
+      // (`sysRegWr`); the exception/RTE A7 write stays on time.
+      if (m68k040.top.ShippingCoreConfig.beRetime)
+        sysRegWr = host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
       a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -447,11 +448,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
       // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push /
       // bsr). When A7 is unrenamed, committedPhysA7 == 15, identical to old U(15).
+      if (sysRegWr == null) {
       a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
-      if (m68k040.top.ShippingCoreConfig.beRetime) exc.a7MirrorHoldIn := RegNext(a7Wr.valid) init False
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                                 host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+      } else {
+        a7Wr.valid   := exc.a7WriteValid
+        a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+        a7Wr.data    := exc.a7WriteData.asBits
+        sysRegWr.valid   := exc.sysRegWriteValid
+        sysRegWr.address := exc.sysRegWritePhys.resize(sysRegWr.address.getWidth)
+        sysRegWr.data    := exc.sysRegWriteData.asBits
+        exc.a7MirrorHoldIn := RegNext(exc.sysRegWriteValid) init False
+      }
       // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
       // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
       // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
