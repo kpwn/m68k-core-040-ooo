@@ -122,7 +122,9 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
                  banks: Int = Tlb.DefaultBanks,
                  captureGateOnFlush: Boolean = true,
-                 victimEntries: Int = 0) extends FiberPlugin
+                 victimEntries: Int = 0,
+                 /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME): drive `rsp.inhibitHint`. */
+                 feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime) extends FiberPlugin
     with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
@@ -150,7 +152,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
 
   during setup {
     _req = TranslationReq()
-    _rsp = TranslationRsp()
+    _rsp = TranslationRsp(feRetime)
     // U-write queue hooks (sibling-driven; default-idle in logic so a standalone DUT
     // that doesn't wire them still elaborates). Fetch sets U only.
     umCommitValid = Bool()
@@ -182,7 +184,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
   var flushAll:      Bool = null
 
   val logic = during build new Area {
-    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0)
+    val tlb    = new Tlb(entries, ways, banks, reportEvictions = victimEntries > 0, inhibitHint = feRetime)
     // ── Multi-hot evidence plumbing (2026-09-17) ───────────────────────────────
     // `dbgMultiHotClear` is a plugin-level default-False wire so DebugCtrlPlugin can
     // override it from its write decode, and so a DUT that wires nothing still
@@ -1131,6 +1133,22 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       _rsp.ppn       := _req.vpn
       _rsp.cacheMode := CacheMode.WRITETHROUGH   // don't-care (rsp not ready)
       _rsp.fault     := False
+    }
+
+    // CPU_FE_RETIME: the fast conservative inhibited verdict. Same arm priority as the
+    // mux above (TTR, then MMU off, then TLB/latch), but the TLB term is the per-way
+    // `hitInhibited` OR (no one-hot entry mux, no cacheMode decode) and the TLB/latch
+    // arms are OR-ed instead of prioritised. Over-approximates only on a multi-hot TLB
+    // lookup or a TLB hit whose latch disagrees -- both make the I-cache REFUSE until
+    // drained (`nonSpecFetch`), never admit a device fetch.
+    if (feRetime) {
+      _rsp.inhibitHint := Mux(ttHit, ttInhibited,
+        mmuEnable && (tlb.io.hitInhibited || (latchMatch && (latchCmode === CacheMode.INHIBITED))))
+      GenerationFlags.simulation {
+        when(_rsp.ready && (_rsp.cacheMode === CacheMode.INHIBITED)) {
+          assert(_rsp.inhibitHint, "ItlbPlugin: CPU_FE_RETIME inhibitHint missed an inhibited page", FAILURE)
+        }
+      }
     }
 
     // Sim-only sticky fault observation (mirrors the DTLB).
