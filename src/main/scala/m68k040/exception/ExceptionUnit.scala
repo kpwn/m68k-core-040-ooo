@@ -853,7 +853,13 @@ class ExceptionUnit(
   // (M=0->1->0 within the settle window) is NOT validated here — it could leave a
   // briefly-active bank's shadow stale when deselected. Add a directed test for that before
   // Slice B (interrupt throwaway frame) relies on cross-toggle preservation.
-  ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
+  // CPU_BE_RETIME: an int-PRF write that touches the committed A7 may be STAGED (lands one
+  // cycle after its request). On the landing cycle the readback is still the OLD value, so
+  // the mirror HOLDS for that cycle instead of copying it (it resumes, exact, the next
+  // cycle). Both inputs default False: an unstaged wiring is byte-identical.
+  val a7MirrorHoldIn = Bool(); a7MirrorHoldIn.allowOverride; a7MirrorHoldIn := False
+  val fmAnMirrorHold = Bool(); fmAnMirrorHold.allowOverride; fmAnMirrorHold := False
+  ss.writeA7.valid  := !(a7MirrorHoldIn || fmAnMirrorHold); ss.writeA7.payload  := committedA7In
 
   // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
   // combinational mux off the FSM step `stStep`; driving it straight onto the

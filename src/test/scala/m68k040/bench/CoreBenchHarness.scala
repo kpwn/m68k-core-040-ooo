@@ -53,7 +53,11 @@ trait CoreBenchHarness extends AnyFunSuite {
   var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
-      a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      // CPU_BE_RETIME: staged exactly like SocketTop's a7Wr (ShippingPlugins.rob stages the
+      // FMOVEM An write under the same flag, and the two must move together).
+      a7Wr   = if (m68k040.top.ShippingCoreConfig.beRetime)
+                 host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
+               else host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
       xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
   fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
@@ -314,6 +318,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // FullCoreSynth would have been invisible to the test suite.
       host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       a7Wr.valid   := exc.a7WriteValid
+      if (m68k040.top.ShippingCoreConfig.beRetime) exc.a7MirrorHoldIn := RegNext(a7Wr.valid) init False
       a7Wr.address := U(15, a7Wr.address.getWidth bits)
       a7Wr.data    := exc.a7WriteData.asBits
       nzvcWr.valid   := exc.rteNzvcWriteValid

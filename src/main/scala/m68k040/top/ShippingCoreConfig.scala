@@ -745,4 +745,24 @@ object ShippingCoreConfig {
     * `cand1`. Read by `IssueQueuePlugin` (default) and by every two-ALU harness for eu1
     * (`AluEuPlugin(lean = ...)`). Default ON (gated 2026-10-08); `CPU_ALU1_LEAN=0` disables; echoed in `SHIPPING_CONFIG`. */
   val alu1Lean: Boolean = envFlag("CPU_ALU1_LEAN", true)
+  /** 200 MHz timing-closure round 2, BACK END (`CPU_BE_RETIME`, default OFF). One flag for
+    * the execute / LS / D-cache / ROB cuts of the i10 tail:
+    *  - int PRF write port 2 (BranchEu's, `IntWbKey`): the COLD sharers (exception A7 /
+    *    sysReg write, FMOVEM An write, debug write, reset SSP) are REGISTERED one cycle
+    *    before the priority mux (`newWrite(staged = true)`); BranchEu's own write valid no
+    *    longer waits for the evaluated condition (addrErr gating of a faulting DBcc is
+    *    dropped from the PRF write only -- the faulting entry never retires).
+    *  - FP PRF: the FMOVEM FP write rides DivEu's port the same staged way.
+    *  - D-cache `pendingVictimLine/Tag`: captured every cycle while no store miss is
+    *    pending (exact: read only under `pendingStoreMiss`); the maintenance walk's
+    *    `wbLineReg/wbAddrReg` latch on every CHECK cycle (exact: read only in WRB);
+    *    under `nonBlocking` the legacy FSM's `missCmode === INHIBITED` folds to True (exact).
+    *  - DTLB: the MOVEC TC/SRP/URP/DTTn ATC flush is a registered pulse (serialized op).
+    *  - LSU `sqFlush`: one exact flop instead of `doFlush || rising(excActive)`.
+    *  - ROB `committedCcr`: retire select moved to the last mux level (exact).
+    *  - AluEu: S1 result-select decodes registered at S0 (exact).
+    *  - FPIAR write registered (cold); debug arch-apply int write staged + one settle cycle.
+    * Cycle-changing parts (cold paths only): the staged PRF writes, the DTLB flush, FPIAR.
+    * Echoed in `SHIPPING_CONFIG`. */
+  val beRetime: Boolean = envFlag("CPU_BE_RETIME", false)
 }

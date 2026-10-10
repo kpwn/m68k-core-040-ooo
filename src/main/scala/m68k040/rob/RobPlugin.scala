@@ -56,7 +56,15 @@ class RobPlugin(val detailedPerf: Boolean = false,
                 /** See `ShippingCoreConfig.flushFromSquash`. */
                 val flushFromSquash: Boolean = m68k040.top.ShippingCoreConfig.flushFromSquash,
                 /** See `ShippingCoreConfig.coldWbShare`. */
-                val coldWbShare: Boolean = m68k040.top.ShippingCoreConfig.coldWbShare) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
+                val coldWbShare: Boolean = m68k040.top.ShippingCoreConfig.coldWbShare,
+                /** `ShippingCoreConfig.beRetime`: allocate the FMOVEM An / FP writes as STAGED
+                  * (registered) members of their shared ports. Only a wiring that ALSO stages
+                  * the exception A7 write may set this (FM_DONE -> S_REDIR are consecutive:
+                  * a staged An write must not land on an unstaged A7 write's cycle). */
+                val stageColdWrites: Boolean = false,
+                /** `ShippingCoreConfig.beRetime`: committedCcr fold with the retire select last,
+                  * and the LSU's registered `lsSqFlushReg` (both exact). */
+                val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var lsReplayWire: Flow[UInt] = null
   override def lsReplay: Flow[UInt] = lsReplayWire
@@ -188,7 +196,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
         // construction: DivEu's `fpW.valid` is gated `!flushSig` (= backendSquash, which is
         // high for the whole exception FSM run), and this port is asserted only while
         // `exc.active` (FM_WRITE). RegFilePlugin sim-asserts the exclusivity.
-        fmFpWrite = if (coldWbShare) rf.newWrite(sharingKey = m68k040.execute.DivEuPlugin.FpWbKey, priority = 0)
+        fmFpWrite = if (coldWbShare && stageColdWrites) rf.newStagedWrite(sharingKey = m68k040.execute.DivEuPlugin.FpWbKey, priority = 0)
+                    else if (coldWbShare) rf.newWrite(sharingKey = m68k040.execute.DivEuPlugin.FpWbKey, priority = 0)
                     else rf.newWrite()
       }
     }
@@ -201,7 +210,9 @@ class RobPlugin(val detailedPerf: Boolean = false,
       // A7/sysReg writes of the same group fire only in other FSM states (S_REDIR/S_APPLY);
       // the debug write only while halted. RegFilePlugin sim-asserts it.
       host.get[m68k040.execute.regfile.IntRegFileService].foreach { rf =>
-        fmAnWrite = if (coldWbShare) rf.newWrite(latency = 1,
+        fmAnWrite = if (coldWbShare && stageColdWrites) rf.newStagedWrite(
+                      sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
+                    else if (coldWbShare) rf.newWrite(latency = 1,
                       sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
                     else rf.newWrite()
       }
@@ -2854,6 +2865,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // followed by an IRQ RTE'd with the handler's CCR; measured directly by the
     // `committedCcr shadow` test: the wbObs for the head fires in the retire cycle). Fold the
     // live port when it names the retiring head, same-cycle -- zero latency change.
+    if (!beRetime) {
     for (lane <- 0 until retireWidth) {
       val id = retireIds(lane)
       val after = ccrAfter(lane)
@@ -2866,6 +2878,33 @@ class RobPlugin(val detailedPerf: Boolean = false,
       }
     }
     committedCcr := ccrAfter.last
+    } else {
+      // CPU_BE_RETIME (exact): the late `retireLanes` (completes -> headReady -> retire0/1,
+      // ~10 levels) moved from EVERY fold step to ONE final select. `ccrCand(lane)` is the
+      // CCR after lanes 0..lane all retire, built from head-indexed state only; retirement
+      // is a prefix (lane k retires only if lane k-1 does -- asserted), so the result is the
+      // candidate of the highest retiring lane.
+      val ccrCand = Vec.fill(retireWidth)(UInt(5 bits))
+      for (lane <- 0 until retireWidth) {
+        val id = retireIds(lane)
+        val c0 = ccrCand(lane)
+        c0 := (if (lane == 0) committedCcr else ccrCand(lane - 1))
+        when(nzvcWrStore(id)) { c0(3 downto 0) := nzvcValStore(id) }
+        when(xWrStore(id)) { c0(4) := xValStore(id) }
+        for (c <- ccrCompletion) when(c.valid && c.payload.robId === id) {
+          when(c.payload.nzvcWrite) { c0(3 downto 0) := c.payload.nzvc }
+          when(c.payload.xWrite) { c0(4) := c.payload.x }
+        }
+        ccrAfter(lane) := Mux(retireLanes(lane), c0, (if (lane == 0) committedCcr else ccrAfter(lane - 1)))
+      }
+      committedCcr := (0 until retireWidth).foldLeft(committedCcr) { (acc, lane) =>
+        Mux(retireLanes(lane), ccrCand(lane), acc) }
+      GenerationFlags.simulation {
+        for (lane <- 1 until retireWidth)
+          assert(!retireLanes(lane) || retireLanes(lane - 1),
+            s"RobPlugin(beRetime): retire lane $lane fired without lane ${lane - 1} -- the committedCcr fold assumes a prefix", FAILURE)
+      }
+    }
     // (MOVE-to-SR's absolute full-CCR write to committedCcr is applied AFTER the exc
     // unit is built — see `exc.obsSetCcr5Valid` override below.)
 
@@ -3052,6 +3091,8 @@ class RobPlugin(val detailedPerf: Boolean = false,
       fmAnWrite.address := committed.intPhys((U(8,5 bits) + exc.fmAnReg.resize(5)).resized)
       fmAnWrite.data := exc.fmAnWrite.payload.asBits
       assert(!fmAnWrite.valid || exc.active, "cold An write outside serialized ownership")
+      // Staged: the An (possibly A7) lands one cycle late -- hold the A7 mirror that cycle.
+      if (coldWbShare && stageColdWrites) exc.fmAnMirrorHold := RegNext(exc.fmAnWrite.valid) init False
     }
     host.get[m68k040.services.DTranslationService].foreach { translation =>
       exc.dxRspCacheMode := translation.rsp.payload.cacheMode
@@ -3671,12 +3712,20 @@ class RobPlugin(val detailedPerf: Boolean = false,
     backendSquash.simPublic()
     val excActiveLs = RegInit(False); excActiveLs := exc.activeNext
     excActiveLs.addAttribute("dont_touch", "true"); excActiveLs.simPublic()
+    // CPU_BE_RETIME: the LSU's `sqFlush` (`doFlush || rising(excActive)`, a LUT of three
+    // flops built in the top-level wiring and fanned to ~40 LSU sites) as ONE exact flop:
+    // D = doFlushNext || (exc.activeNext && !exc.active). Asserted equal below.
+    val lsSqFlushReg: Bool = if (!beRetime) null else {
+      val r = RegInit(False); r := doFlushNext || (exc.activeNext && !exc.active); r.simPublic(); r }
     GenerationFlags.simulation {
       when(!ClockDomain.current.isResetActive) {
         assert(backendSquash === (doFlushReg || exc.active),
           "RobPlugin: backendSquash drifted from `doFlushReg || exc.active` -- a writer of " +
           "doFlushReg was added without folding it into doFlushNext", FAILURE)
         assert(excActiveLs === exc.active, "RobPlugin: excActiveLs drifted from exc.active", FAILURE)
+        if (beRetime)
+          assert(lsSqFlushReg === (doFlushReg || (exc.active && !RegNext(exc.active, init = False))),
+            "RobPlugin: lsSqFlushReg drifted from `doFlush || rising(excActive)`", FAILURE)
         if (flushFromSquash)
           assert(flushing === (flush.valid || doFlushReg || excSquash),
             "RobPlugin(flushFromSquash): registered `flushing` drifted from the combinational " +

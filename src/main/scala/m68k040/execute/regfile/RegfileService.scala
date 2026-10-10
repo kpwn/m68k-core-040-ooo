@@ -59,6 +59,13 @@ trait RegfileService {
   def spec: RegfileSpec
   def newRead(forceNoBypass: Boolean = false): RegFileReadPort
   def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0): RegFileWritePort
+  /** A COLD writer whose request is REGISTERED one cycle before it joins its sharing
+    * group's priority mux (`ShippingCoreConfig.beRetime`): the write lands one cycle after
+    * the request. The caller owns the consequences of that extra cycle (no same-group
+    * collision one cycle later, no reader that needs the value the next cycle). A file
+    * without staging support (test stubs) falls back to an ordinary write. */
+  def newStagedWrite(sharingKey: Any, priority: Int = 0): RegFileWritePort =
+    newWrite(latency = 1, sharingKey = sharingKey, priority = priority)
   /** `deadProbe` = this source is BELIEVED never to be the hit source (its producer
     * drives write+bypass+wakeup in the same cycle, and the registered issue stage means
     * no dependent read can land that cycle).  In SIMULATION ONLY, RegFilePlugin asserts

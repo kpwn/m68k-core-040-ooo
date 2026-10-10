@@ -104,7 +104,11 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   var fpccRd: m68k040.execute.regfile.RegFileReadPort  = null
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
-      a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      // CPU_BE_RETIME: staged exactly like SocketTop's a7Wr (ShippingPlugins.rob stages the
+      // FMOVEM An write under the same flag, and the two must move together).
+      a7Wr   = if (m68k040.top.ShippingCoreConfig.beRetime)
+                 host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
+               else host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
       a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -444,6 +448,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push /
       // bsr). When A7 is unrenamed, committedPhysA7 == 15, identical to old U(15).
       a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
+      if (m68k040.top.ShippingCoreConfig.beRetime) exc.a7MirrorHoldIn := RegNext(a7Wr.valid) init False
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                                 host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)

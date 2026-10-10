@@ -112,8 +112,10 @@ object ShippingPlugins {
     new DecodeStage(allowSlot1Prediction = ipcThroughput, fuseLongMoveLoads = ipcThroughput)
 
   def rob(detailedPerf: Boolean, pcRangeEnable: Boolean, lsOooIssue: Boolean,
-          preparedRetireEntries: Int = 0): RobPlugin =
+          preparedRetireEntries: Int = 0,
+          stageColdWrites: Boolean = ShippingCoreConfig.beRetime): RobPlugin =
     new RobPlugin(detailedPerf = detailedPerf, pcRangeEnable = pcRangeEnable,
+      stageColdWrites = stageColdWrites,
       pairCorrectBranch = ShippingCoreConfig.pairCorrectBranch,
       rasBranchRepair = ShippingCoreConfig.rasBranchRepair,
       preparedRetireEntries = preparedRetireEntries,

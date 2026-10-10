@@ -80,7 +80,12 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // stores) with the pipe flushed and retire blocked, so nothing can issue in between.
     // Lower priority than BranchEu; RegFilePlugin asserts in simulation if both are ever
     // valid together, so this is checked rather than argued.
-    a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(
+    // CPU_BE_RETIME: STAGED -- the exception/reset A7 + sysReg request is registered one
+    // cycle before BranchEu's port mux (see `newStagedWrite`; mirror hold below).
+    a7Wr = if (m68k040.top.ShippingCoreConfig.beRetime)
+             host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(
+               sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
+           else host[m68k040.execute.regfile.IntRegFileService].newWrite(
              latency = 1, sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     // Borrow seam (consumer-driven inputs default idle so a top without DebugCtrl, or with
@@ -426,7 +431,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.sqCommitB.valid   := rob.logic.retire1
     lsEu.sqCommitB.payload := rob.logic.h1
     val excEnteringSq = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
-    lsEu.sqFlush          := doFlush || excEnteringSq
+    // CPU_BE_RETIME: the same pulse as ONE exact flop (RobPlugin `lsSqFlushReg`).
+    lsEu.sqFlush          := (if (rob.logic.lsSqFlushReg != null) rob.logic.lsSqFlushReg
+                              else doFlush || excEnteringSq)
 
     // ── DTLB U/M deferred-write queue wiring ──
     // The walk tags its U/M descriptor write with the LS EU's in-flight access
@@ -719,6 +726,10 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
                                               host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)))
     a7Wr.data    := Mux(rvSspValid, rvSspData.asBits,
                     Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits))
+    // CPU_BE_RETIME: the staged write LANDS one cycle after `a7Wr.valid`; on that cycle the
+    // committed-A7 readback is still the old value, so the ss.isp/msp/usp mirror holds
+    // instead of copying it (see ExceptionUnit `a7MirrorHoldIn`).
+    if (m68k040.top.ShippingCoreConfig.beRetime) exc.a7MirrorHoldIn := RegNext(a7Wr.valid) init False
     GenerationFlags.simulation {
       assert(!(rvSspValid && (exc.a7WriteValid || exc.sysRegWriteValid)),
         "the reset-vector SSP write collided with an ExceptionUnit A7/sysReg write", FAILURE)
