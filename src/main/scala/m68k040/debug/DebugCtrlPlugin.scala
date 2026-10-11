@@ -104,7 +104,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         // blocked.  RegFilePlugin asserts in simulation if two writers sharing
         // a key are ever valid in the same cycle, so this is CHECKED, not
         // argued -- the same basis as a7Wr's own comment in FullCoreSynth.
-        debugIntWrite = rf.newWrite(latency = 1,
+        // CPU_BE_RETIME: STAGED (registered before the port mux); the apply sequence waits
+        // one settle cycle after the last register write so it lands before phase 2.
+        debugIntWrite = if (m68k040.top.ShippingCoreConfig.beRetime)
+                          rf.newStagedWrite(sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 2)
+                        else rf.newWrite(latency = 1,
                           sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey,
                           priority = 2)
       }
@@ -1415,6 +1419,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val archApplyRejected = if (stage >= 3) RegInit(False) else False
       val archApplyPhase = if (stage >= 3) Reg(UInt(2 bits)) init 0 else U(0, 2 bits)
       val archApplyIndex = if (stage >= 3) Reg(UInt(4 bits)) init 0 else U(0, 4 bits)
+      val archApplySettle = RegInit(False)   // CPU_BE_RETIME only (constant False otherwise)
       val archApplyDirty = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       val archApplyRewrite = if (stage >= 3) Reg(Bits(32 bits)) init 0 else null
       val archApplyShadow = if (stage >= 3) Vec.fill(32)(Reg(Bits(32 bits)) init 0) else null
@@ -1605,6 +1610,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
             archApplyRejected := False
             archApplyPhase := 0
             archApplyIndex := 0
+            if (m68k040.top.ShippingCoreConfig.beRetime) archApplySettle := False
             archApplyDirty := archDirty
             archApplyRewrite := 0
             for (i <- 0 until 32) archApplyShadow(i) := archShadow(i)
@@ -1632,14 +1638,32 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
               }
             }
             is(U(1, 2 bits)) {
-              if (debugIntWrite != null) {
-                debugIntWrite.valid := archApplyDirty(archApplyIndex)
-                debugIntWrite.address := committedMap.get.intPhys(
-                  archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
-                debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+              if (!m68k040.top.ShippingCoreConfig.beRetime) {
+                if (debugIntWrite != null) {
+                  debugIntWrite.valid := archApplyDirty(archApplyIndex)
+                  debugIntWrite.address := committedMap.get.intPhys(
+                    archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
+                  debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+                }
+                when(archApplyIndex === 15) { archApplyPhase := 2 }
+                  .otherwise { archApplyIndex := archApplyIndex + 1 }
+              } else {
+                // The staged write of index 15 lands on the settle cycle, i.e. before
+                // phase 2 (system apply / NZVC / X) -- the same order as unstaged.
+                when(!archApplySettle) {
+                  if (debugIntWrite != null) {
+                    debugIntWrite.valid := archApplyDirty(archApplyIndex)
+                    debugIntWrite.address := committedMap.get.intPhys(
+                      archApplyIndex.resize(log2Up(committedMap.get.intPhys.length))).resized
+                    debugIntWrite.data := archApplyShadow(archApplyIndex.resize(5))
+                  }
+                  when(archApplyIndex === 15) { archApplySettle := True }
+                    .otherwise { archApplyIndex := archApplyIndex + 1 }
+                } otherwise {
+                  archApplySettle := False
+                  archApplyPhase := 2
+                }
               }
-              when(archApplyIndex === 15) { archApplyPhase := 2 }
-                .otherwise { archApplyIndex := archApplyIndex + 1 }
             }
             is(U(2, 2 bits)) {
               systemApply.valid := True

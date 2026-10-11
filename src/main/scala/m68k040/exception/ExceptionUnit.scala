@@ -859,7 +859,17 @@ class ExceptionUnit(
   // (M=0->1->0 within the settle window) is NOT validated here — it could leave a
   // briefly-active bank's shadow stale when deselected. Add a directed test for that before
   // Slice B (interrupt throwaway frame) relies on cross-toggle preservation.
-  ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
+  // CPU_BE_RETIME: an int-PRF write that touches the committed A7 may be STAGED (lands one
+  // cycle after its request). On the landing cycle the readback is still the OLD value, so
+  // the mirror HOLDS for that cycle instead of copying it (it resumes, exact, the next
+  // cycle). Both inputs default False: an unstaged wiring is byte-identical.
+  /** See S_REDIR: one-cycle wait after a staged sysOp destination write (CPU_BE_RETIME). */
+  val sRedirHold: Bool =
+    if (m68k040.top.ShippingCoreConfig.beRetime) RegNext(sysRegWriteValid || fmAnWrite.valid) init False
+    else False
+  val a7MirrorHoldIn = Bool(); a7MirrorHoldIn.allowOverride; a7MirrorHoldIn := False
+  val fmAnMirrorHold = Bool(); fmAnMirrorHold.allowOverride; fmAnMirrorHold := False
+  ss.writeA7.valid  := !(a7MirrorHoldIn || fmAnMirrorHold); ss.writeA7.payload  := committedA7In
 
   // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
   // combinational mux off the FSM step `stStep`; driving it straight onto the
@@ -3235,7 +3245,14 @@ class ExceptionUnit(
       }
       goto(S_REDIR)
     }
-    S_REDIR.whenIsActive {
+    // CPU_BE_RETIME: the sysOp's own int-PRF writes (`sysRegWrite*` in S_APPLY / F_RDONE,
+    // `fmAnWrite` in FM_DONE) are STAGED -- they land one cycle after the request. S_REDIR
+    // is the sysOp's architectural retire boundary (obs + re-bank A7 write + redirect), so
+    // it WAITS one cycle when such a write was requested on the previous cycle: the
+    // destination is then visible at the boundary, and the (unstaged) A7 re-bank write can
+    // never land on the staged write's cycle. Cold: +1 cycle on MOVEC/MOVE-USP read,
+    // FMOVE FPcr->Rn, FMOVEM (An)+/-(An), FSAVE -(An), FRESTORE (An)+.
+    S_REDIR.whenIsActive { when(!sRedirHold) {
       // Re-bank A7 in the int PRF: ss.a7 = Mux(s, Mux(m, msp, isp), usp) with the
       // POST-write (S,M). The
       // a7Write port is qualified by obsFire (below). For MOVE-to-SR this carries the
@@ -3273,7 +3290,7 @@ class ExceptionUnit(
       redirectValid := True
       redirectPc    := sysCapNextPc
       goto(IDLE)
-    }
+    } }
 
     // ══ FSAVE: emit the state frame, one translated word at a time ═══════════════
     //

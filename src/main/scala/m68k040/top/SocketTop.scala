@@ -701,6 +701,7 @@ object GenSocketTopVerilog {
             s"lsParkRetime=${ShippingCoreConfig.lsParkRetime} " +
             s"feRetime=${ShippingCoreConfig.feRetime} " +
             s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
+            s"beRetime=${ShippingCoreConfig.beRetime} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +

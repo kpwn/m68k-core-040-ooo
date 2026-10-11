@@ -143,7 +143,17 @@ class FpuControlPlugin extends FiberPlugin with FpuControlService {
     // FPCC ([27:24]) is renamed and lives in the FPCC PRF -- mask it out of this copy so
     // an architectural FPSR write can never leave a second, stale condition-code source.
     when(setFpsr.valid)  { fpsr  := setFpsr.payload & U(0xF0FFFFFFL, 32 bits) }
-    when(setFpiar.valid) { fpiar := setFpiar.payload }
+    // CPU_BE_RETIME: the FPIAR write is REGISTERED (lands one cycle later). Its writers are
+    // all serialized and cold -- exception entry (vector 11 capture, decoded straight off the
+    // ROB head's fault state), FMOVE-to-FPIAR in S_APPLY, FRESTORE null -- and no reader can
+    // sample FPIAR within one cycle of any of them.
+    if (m68k040.top.ShippingCoreConfig.beRetime) {
+      val fpiarWrV = RegNext(setFpiar.valid) init False
+      val fpiarWrD = RegNext(setFpiar.payload)
+      when(fpiarWrV) { fpiar := fpiarWrD }
+    } else {
+      when(setFpiar.valid) { fpiar := setFpiar.payload }
+    }
     // EU exception-status OR-in. Lower priority than an explicit FMOVE-to-FPSR: a `when`
     // written LATER wins in SpinalHDL, so the architectural write above must come FIRST
     // for the EU port to lose an exact-same-cycle collision -- but they cannot in fact

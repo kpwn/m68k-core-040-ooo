@@ -62,7 +62,9 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
                    * victim buffer of the array's own evictions, probed only on a primary
                    * miss from `missReqReg` flops. 0 elaborates NO hardware. */
                  victimEntries: Int = m68k040.top.ShippingCoreConfig.dtlbVictimEntries,
-                 victimNegativeControl: Int = DtlbPlugin.VictimNegativeControl.None) extends FiberPlugin
+                 victimNegativeControl: Int = DtlbPlugin.VictimNegativeControl.None,
+                 /** `ShippingCoreConfig.beRetime`: the MOVEC/debug-apply ATC flush is a REGISTERED pulse. */
+                 beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime) extends FiberPlugin
     with DTranslationService with DtlbWalkerDcacheClient {
   var _req: Stream[DTranslationCmd] = null
   var _rsp: Stream[DTranslationRsp] = null
@@ -321,7 +323,17 @@ class DtlbPlugin(entries: Int = Tlb.DefaultEntries,
     // DTT0/DTT1 and an I-side's from ITT0/ITT1, so gating on the other pair would only
     // add flushes that cannot fix anything.
     val ttrWrite      = ctrl.setDtt0.valid || ctrl.setDtt1.valid
-    val atcFlush      = flushAll || pageSizeRekey || mmuEnableChange || rootWrite || ttrWrite
+    // CPU_BE_RETIME: the four control-register-write terms are decoded combinationally
+    // from the exception FSM's S_APPLY MOVEC switch (or the halted debug apply) and used to
+    // run straight through `_rsp.valid` into the LSU's translation consume and on into the
+    // D-cache probe/valid write (the `exc_sysCapRc -> validsBank` cone). Registered here:
+    // the flush lands one cycle after the MMU register write. Safe because those writes
+    // are SERIALIZED -- the LSU is drained and squashed (backendSquash) through S_APPLY ->
+    // S_REDIR, the exception unit makes no translated access there, and a debug apply runs
+    // only at an effective halt -- so no lookup can fall into the one-cycle gap. `flushAll`
+    // (PFLUSH / umFlush) is unchanged.
+    val ctrlWriteFlush = pageSizeRekey || mmuEnableChange || rootWrite || ttrWrite
+    val atcFlush      = flushAll || (if (beRetime) RegNext(ctrlWriteFlush) init False else ctrlWriteFlush)
     // ── ROOT CHANGED MID-WALK: the THIRD member of a family, made structural ──────
     // `walker.io.req.rootPtr` is read LIVE at walk LAUNCH (`Mux(missReqReg.sup, srp,
     // urp)`) and latched into the walker's `reqReg` there, so a walk carries the root

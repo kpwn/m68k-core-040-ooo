@@ -30,6 +30,7 @@ import spinal.lib.misc.database.Database
 class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin,
                        lsEu: LsEuPlugin, divEu: DivEuPlugin) extends FiberPlugin {
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  var sysRegWr: m68k040.execute.regfile.RegFileWritePort = null
   var seedWr: m68k040.execute.regfile.RegFileWritePort = null
   var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
   // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
@@ -45,6 +46,10 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
   during setup {
     a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+    // CPU_BE_RETIME: the sysOp destination write is STAGED exactly like SocketTop's
+    // (`sysRegWr`); the exception/RTE A7 write stays on time.
+    if (m68k040.top.ShippingCoreConfig.beRetime)
+      sysRegWr = host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
     seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
     a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -331,10 +336,20 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     // absent -- i.e. it had zero simulation coverage and a regression deleting it from
     // FullCoreSynth would have been invisible to the test suite.
     host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
+    if (sysRegWr == null) {
     a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
     a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                               host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
     a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+    } else {
+      a7Wr.valid   := exc.a7WriteValid
+      a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+      a7Wr.data    := exc.a7WriteData.asBits
+      sysRegWr.valid   := exc.sysRegWriteValid
+      sysRegWr.address := exc.sysRegWritePhys.resize(sysRegWr.address.getWidth)
+      sysRegWr.data    := exc.sysRegWriteData.asBits
+      exc.a7MirrorHoldIn := RegNext(exc.sysRegWriteValid) init False
+    }
     a7Rd.addr := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
     exc.committedA7In := a7Rd.data.asUInt
     nzvcWr.valid   := exc.rteNzvcWriteValid

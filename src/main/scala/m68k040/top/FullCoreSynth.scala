@@ -40,6 +40,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
   override def debugIntReadData: Bits  = dbgIntRdData
   // Int PRF write port for the exception unit's A7 (reg 15) write-back.
   var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  // CPU_BE_RETIME only: the sysOp's own destination write (`sysRegWrite*`), split off a7Wr
+  // and STAGED; the exception/RTE A7 write stays on time on a7Wr.
+  var sysRegWr: m68k040.execute.regfile.RegFileWritePort = null
   // Int PRF READ port for the LIVE committed A7 readback (arch-15 committed phys). Feeds
   // exc.committedA7In so ss.usp/isp/msp continuously mirror the architectural A7.
   var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
@@ -80,8 +83,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // stores) with the pipe flushed and retire blocked, so nothing can issue in between.
     // Lower priority than BranchEu; RegFilePlugin asserts in simulation if both are ever
     // valid together, so this is checked rather than argued.
+    // CPU_BE_RETIME: STAGED -- the exception/reset A7 + sysReg request is registered one
+    // cycle before BranchEu's port mux (see `newStagedWrite`; mirror hold below).
     a7Wr = host[m68k040.execute.regfile.IntRegFileService].newWrite(
              latency = 1, sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
+    if (m68k040.top.ShippingCoreConfig.beRetime)
+      sysRegWr = host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(
+        sharingKey = m68k040.execute.BranchEuPlugin.IntWbKey, priority = 0)
     a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
     // Borrow seam (consumer-driven inputs default idle so a top without DebugCtrl, or with
     // the flag OFF, elaborates with the port unshared).
@@ -433,7 +441,9 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     lsEu.sqCommitB.valid   := rob.logic.retire1
     lsEu.sqCommitB.payload := rob.logic.h1
     val excEnteringSq = rob.logic.excActive && !RegNext(rob.logic.excActive, init = False)
-    lsEu.sqFlush          := doFlush || excEnteringSq
+    // CPU_BE_RETIME: the same pulse as ONE exact flop (RobPlugin `lsSqFlushReg`).
+    lsEu.sqFlush          := (if (rob.logic.lsSqFlushReg != null) rob.logic.lsSqFlushReg
+                              else doFlush || excEnteringSq)
 
     // ── DTLB U/M deferred-write queue wiring ──
     // The walk tags its U/M descriptor write with the LS EU's in-flight access
@@ -720,12 +730,26 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     // (`rv` is resolved once, up at the halt-fold site above, and reused here.)
     val rvSspValid = if (rv != null) rv.sspWriteValid else False
     val rvSspData  = if (rv != null) rv.sspData       else U(0, 32 bits)
+    if (sysRegWr == null) {
     a7Wr.valid   := rvSspValid || exc.a7WriteValid || exc.sysRegWriteValid
     a7Wr.address := Mux(rvSspValid, host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth),
                     Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                               host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)))
     a7Wr.data    := Mux(rvSspValid, rvSspData.asBits,
                     Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits))
+    } else {
+      // CPU_BE_RETIME: exception-entry / RTE / S_REDIR A7 writes stay ON TIME (visible at
+      // their retire boundary); only the sysOp destination write is staged, and S_REDIR
+      // waits for it to land (ExceptionUnit `sRedirHold`).
+      a7Wr.valid   := rvSspValid || exc.a7WriteValid
+      a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+      a7Wr.data    := Mux(rvSspValid, rvSspData.asBits, exc.a7WriteData.asBits)
+      sysRegWr.valid   := exc.sysRegWriteValid
+      sysRegWr.address := exc.sysRegWritePhys.resize(sysRegWr.address.getWidth)
+      sysRegWr.data    := exc.sysRegWriteData.asBits
+      // On the landing cycle the committed-A7 readback is still old: hold the ss mirror.
+      exc.a7MirrorHoldIn := RegNext(exc.sysRegWriteValid) init False
+    }
     GenerationFlags.simulation {
       assert(!(rvSspValid && (exc.a7WriteValid || exc.sysRegWriteValid)),
         "the reset-vector SSP write collided with an ExceptionUnit A7/sysReg write", FAILURE)
