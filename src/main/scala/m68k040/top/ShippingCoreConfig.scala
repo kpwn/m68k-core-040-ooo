@@ -370,7 +370,14 @@ object ShippingCoreConfig {
     * `OFF_PERF_ITLB_WALK` (0x010A4) — already in every bitstream, never yet read.
     *
     * ⚠️ This lever CANNOT be measured on Dhrystone: the board's Dhrystone-only window
-    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder. */
+    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder.
+    *
+    * 200 MHz (2026-09-30): the first cut cost 2.859 ns (eight levers + it: WNS -2.882,
+    * without it -0.023). REGISTERED (`ItlbPlugin`'s `vic` Area: promote/launch +2
+    * cycles, insert +1, generation-tagged invalidation) the same eight + it close at
+    * WNS -0.237 with NO ItlbPlugin path in the worst 200 (tail = D-cache/LSU/Icache
+    * hubs; 0.2 ns vs -0.023 is inside placement noise). 100 MHz ITLB_VICTIM=32 alone
+    * boots to the Finder. Still OFF pending the `OFF_PERF_ITLB_WALK` board A/B. */
   val itlbVictimEntries: Int = sys.env.get("ITLB_VICTIM") match {
     case Some(s) =>
       val n = try s.toInt catch {
@@ -676,6 +683,20 @@ object ShippingCoreConfig {
     * Default ON (gated 2026-10-08: corpus 14 -> 12 fails, the two walk_vs_older_store_*;
     * lock-step 0; IPC unchanged); `CPU_WALK_SQ_CHECK=0` disables. */
   val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", true)
+
+  /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
+    * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
+    * the array's evictions, probed one cycle after a PRIMARY miss from `missReqReg`
+    * flops (never on the hit path); a hit is promoted back and answered like an array
+    * hit, a miss launches the walk one cycle later than before. Trace model (MAME 7.5.3,
+    * 2026-10-10): the 8-set x 4-way DTLB thrashes on set conflicts at 8 KB pages; 32
+    * entries on both TLBs = -80% walks (trace, not silicon). Reaches every harness via
+    * the `DtlbPlugin` constructor default; echoed in SHIPPING_CONFIG. */
+  val dtlbVictimEntries: Int = {
+    val n = envInt("CPU_DTLB_VICTIM", 0, 0, 64)
+    require(n != 1, "CPU_DTLB_VICTIM must be 0 (off) or 2..64")
+    n
+  }
 
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
