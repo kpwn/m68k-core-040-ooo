@@ -83,8 +83,17 @@ case class L2TlbClientPort() extends Bundle {
 }
 
 object L2Tlb {
-  def index(key: L2TlbKey, idxBits: Int): UInt =
-    Mux(key.is8K, key.vpn(idxBits downto 1), key.vpn(idxBits - 1 downto 0))
+  /** `hashRoot` (SURVIVE): XOR the root pointer's table-aligned bits into the index, so
+    * the same VA under two roots (the ROM's 24/32-bit swap: SRP 0x7fcc00 / 0x7ffa00)
+    * lands in different sets of the direct-mapped array instead of evicting each other. */
+  def index(key: L2TlbKey, idxBits: Int, hashRoot: Boolean = false): UInt = {
+    val v = Mux(key.is8K, key.vpn(idxBits downto 1), key.vpn(idxBits - 1 downto 0))
+    // Bit-REVERSED: root tables are 512 B aligned and two roots typically differ in
+    // their LOW table-aligned bits (0x7fcc00 vs 0x7ffa00 differ in bits 9..13), while a
+    // working set is a CONTIGUOUS run of VPNs (low index bits). Reversal moves the
+    // roots' difference into the HIGH index bits, so the two runs land in disjoint sets.
+    if (hashRoot) v ^ key.root(9 + idxBits - 1 downto 9).reversed else v
+  }
 }
 
 /** @param survive      SURVIVE mode (`CPU_L2_TLB_SURVIVE`): entries are tagged by
@@ -148,7 +157,7 @@ class L2Tlb(entries: Int, clients: Int = 2, survive: Boolean = false,
   }
   val probeFire = grant.orR
   val probeKey  = MuxOH(grant, io.probe.map(_.payload))
-  val rdAddr    = L2Tlb.index(probeKey, idxBits)
+  val rdAddr    = L2Tlb.index(probeKey, idxBits, survive)
   val rdData    = mem.readSync(rdAddr, enable = probeFire)
 
   val dirty = Vec.fill(clients)(RegInit(True))
@@ -230,7 +239,7 @@ class L2Tlb(entries: Int, clients: Int = 2, survive: Boolean = false,
   wrEntry.sup   := fReq.key.sup
   wrEntry.vpn   := fReq.key.vpn
   wrEntry.data  := fReq.data
-  val wrAddr = Mux(sweeping, sweepIdx, L2Tlb.index(fReq.key, idxBits))
+  val wrAddr = Mux(sweeping, sweepIdx, L2Tlb.index(fReq.key, idxBits, survive))
   mem.write(wrAddr, wrEntry, enable = sweeping || fillOk)
 
   // ---- SURVIVE: descriptor-granule filter + store snoop ----

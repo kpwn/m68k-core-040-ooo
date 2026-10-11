@@ -146,7 +146,8 @@ class TlbWalkIpcSpec extends CoreBenchHarness {
     println(s"  TLBWALK config: walkAgeLimit=${m68k040.top.ShippingCoreConfig.walkAgeLimit} " +
       s"dtlbHitUnderWalk=${m68k040.top.ShippingCoreConfig.dtlbHitUnderWalk} " +
       s"walkAbortOnFlush=${m68k040.top.ShippingCoreConfig.walkAbortOnFlush} " +
-      s"l2Tlb=${m68k040.top.ShippingCoreConfig.l2Tlb}/${m68k040.top.ShippingCoreConfig.l2TlbEntries} shipping=$shipping")
+      s"l2Tlb=${m68k040.top.ShippingCoreConfig.l2Tlb}/${m68k040.top.ShippingCoreConfig.l2TlbEntries} " +
+      s"l2TlbSurvive=${m68k040.top.ShippingCoreConfig.l2TlbSurvive} shipping=$shipping")
     for (k <- kernels) {
       var dWalks = 0; var iWalks = 0; var dWalkBusy = 0; var iWalkBusy = 0; var dRead = 0
       var dL2 = 0; var iL2 = 0               // CPU_L2_TLB: walks answered by the L2 TLB

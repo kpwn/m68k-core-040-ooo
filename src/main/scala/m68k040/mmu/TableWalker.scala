@@ -4,6 +4,7 @@ import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
+import spinal.core.sim._
 
 /** 68040 hardware 3-level table walker (4KB or 8KB pages per TCR.P, task #195;
   * long-format descriptors).
@@ -246,6 +247,7 @@ class TableWalker(batchMode: Boolean = false,
     io.l2Probe.payload.is8K := reqReg.is8K
     io.l2Probe.payload.root := reqReg.rootPtr
     io.l2Hit := l2HitR
+    io.l2Hit.simPublic(); io.done.simPublic()   // TlbWalkIpcSpec walk classification
   }
 
   val fsm = new StateMachine {
