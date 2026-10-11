@@ -686,7 +686,12 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       (if (s.priority == 0) True else s.triggers(s.priority - 1 downto 0) === 0) &&
       !s.aluWaitAny && !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)))
     val brReady  = B(slots.map(s => s.ready &&  s.hot.isBranch))
-    val lsFullyReady = B(slots.map(s => s.ready && isLs(s.hot)))
+    // CPU_LS_SPEC_WAKE_ALU: an LS LOAD whose only outstanding dynamic source is the
+    // announced load on an ADDRESS operand is ready one cycle early too (its re-check is
+    // `lsSpecBlocked` at the LS issue register; LS results wake dynamically, so no freeze).
+    val lsFullyReady = if (!specAluOn) B(slots.map(s => s.ready && isLs(s.hot)))
+    else B(slots.map(s => isLs(s.hot) && (s.ready || (s.hot.isLsLoad && s.sel &&
+      (if (s.priority == 0) True else s.triggers(s.priority - 1 downto 0) === 0) && !s.aluWaitAny))))
     val storeAddressReady = if (earlyStoreAddress) {
       val dataMask = (BigInt(1) << DynWait.LS_B) | (BigInt(1) << DynWait.CPLX_B) |
         (BigInt(1) << DynWait.SLOW_B)
@@ -1221,8 +1226,24 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // has already cleared by the time the consumer arrives (the announce runs only one
     // cycle ahead), so the full speculated cycle is still won; on a MISS the consumer is
     // parked here and leaves on the cycle the bypass actually carries the value.
-    val lsSpecBlocked: Bool = if (!specLoadWakeup) False else {
+    // Also built for CPU_LS_SPEC_WAKE_ALU, whose announce releases LS-LOAD consumers on their
+    // ADDRESS operands (A/C) through `aluWaitAny` exactly as the old arm's clear did.
+    // CPU_LS_SPEC_WAKE_ALU: a held LS consumer whose announced load completed as a FAULT
+    // (no wakeup ever follows) is released with a garbage operand -- it is younger than
+    // the faulting load and is squashed by that fault's flush. Without this the held uop
+    // would occupy the LS port the older ops need to bring the fault to the ROB head.
+    val lsSpecAbort = if (specAluOn) specAluSrc.get._2 else null
+    // Sticky until the flush the fault itself causes (the pdst cannot be reallocated
+    // before that: its load has not retired).
+    val lsAbortV: Bool = if (lsSpecAbort != null) (RegInit(False)) else False
+    val lsAbortP: UInt = if (lsSpecAbort != null) (Reg(UInt(6 bits)) init 0) else U(0, 6 bits)
+    if (lsSpecAbort != null) {
+      when(lsSpecAbort.valid) { lsAbortV := True; lsAbortP := lsSpecAbort.payload }
+      when(flushSignal) { lsAbortV := False }
+    }
+    val lsSpecBlocked: Bool = if (!specLoadWakeup && !specAluOn) False else {
       val u = lsIssHot
+      def pend(v: Bool, p: UInt): Bool = v && lsBusy(p) && !(lsAbortV && p === lsAbortP)
       // Mirrors the speculative clear EXACTLY -- the same two operands, with the same
       // read-qualifier each. That correspondence is the invariant: a source released
       // speculatively above is re-checked here, and nothing else is checked. `psrcB` is
@@ -1235,8 +1256,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         u.fourCycleBaseLoad && live.valid && (u.psrcA === live.payload) &&
           !flushSignal
       else False
-      val b = lsIssValid && ((u.psrcAValid && lsBusy(u.psrcA) && !confirmedA) ||
-                             (u.psrcCValid && lsBusy(u.psrcC)))
+      val b = lsIssValid && ((pend(u.psrcAValid, u.psrcA) && !confirmedA) ||
+                             pend(u.psrcCValid, u.psrcC))
       b.simPublic()
       b
     }
@@ -1296,7 +1317,7 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       // LIVENESS (2026-09-15): the skid drains the first cycle the LS EU is ready or a
       // flush lands; a uop parked in it for 20000 cycles means the EU's front never
       // freed -- a no-forward-progress bug, named at the IQ rather than as a timeout.
-      if (specLoadWakeup) {
+      if (specLoadWakeup || specAluOn) {
         // LIVENESS: a speculative hold ends on the confirm or on a flush. 20000 cycles of
         // holding means neither happened -- the exact hang class this mechanism's safety
         // argument rules out -- so name it here rather than as a distant timeout.
@@ -1941,8 +1962,10 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       val ann = specAluSrc.get._1
       def specMaskOf(u: IqHot): Bits = {
         val m = B(0, DynWait.width bits)
+        // LS-class slots: LOADS only, ADDRESS operands only (B is store data, never
+        // speculated -- see `lsSpecBlocked`). Other classes never read `aluWaitAny`.
         m(DynWait.LS_A) := ann.valid && u.psrcAValid && (u.psrcA === ann.payload)
-        m(DynWait.LS_B) := ann.valid && srcBIsReg(u)  && (u.psrcB === ann.payload)
+        m(DynWait.LS_B) := ann.valid && !u.isLsClass && srcBIsReg(u) && (u.psrcB === ann.payload)
         m(DynWait.LS_C) := ann.valid && u.psrcCValid && (u.psrcC === ann.payload)
         m
       }

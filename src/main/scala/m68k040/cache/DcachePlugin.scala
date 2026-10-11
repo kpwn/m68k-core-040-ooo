@@ -881,16 +881,6 @@ class DcachePlugin(val socketMerged: Boolean = false,
     probeReadTag.simPublic(); probeReadUsable.simPublic()
     probeLineValid.simPublic(); probeLineSlot.simPublic(); probeLineHit.simPublic()
     if (earlyProbeLineForward) probeLineTag.simPublic()
-    // CPU_LS_SPEC_WAKE_ALU: the registered line-stage hit, by token (flops + a 4:1 token
-    // select). Lets the LS EU announce only loads whose probe already hit.
-    val probeLineHitHintPort: Flow[UInt] =
-      if (!m68k040.top.ShippingCoreConfig.lsSpecWakeAlu) null else {
-        val f = Flow(UInt(DLoadToken.Width bits))
-        f.valid   := probeLineValid && probeLineHit && earlyProbeValids(probeLineSlot)
-        f.payload := earlyProbeTokens(probeLineSlot)
-        f.simPublic()
-        f
-      }
 
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
@@ -1218,6 +1208,18 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // way-muxes the data, lane-extracts, and (on a miss) starts the refill. The +1
     // cycle to start a refill is latency-agnostic (lock-step absorbs it).
     val ldS1Valid = RegInit(False)       // a load-read was launched into S1
+    // CPU_LS_SPEC_WAKE_ALU: the registered line-stage hit, by token (flops + a 4:1 token
+    // select). Lets the LS EU announce only loads whose probe already hit.
+    val probeLineHitHintPort: Flow[UInt] =
+      if (!m68k040.top.ShippingCoreConfig.lsSpecWakeAlu) null else {
+        val f = Flow(UInt(DLoadToken.Width bits))
+        // `!ldS1Valid`: an ordinary S1 read resolving this cycle refuses the probe-hit command
+        // for one cycle (`earlyProbeConflict`), which would make the wakeup one cycle late.
+        f.valid   := probeLineValid && probeLineHit && earlyProbeValids(probeLineSlot) && !ldS1Valid
+        f.payload := earlyProbeTokens(probeLineSlot)
+        f.simPublic()
+        f
+      }
     // Provenance for the optional four-cycle LS bypass. A refill replay or a
     // shadow relaunch can pass through S1/S2 as a hit, but was not a fresh L1
     // response to the original accepted command.

@@ -22,6 +22,8 @@ import spinal.core.sim._
   *   flush  a data-dependent branch behind a slow rotate chain guards a cold-miss load and its
   *          consumer: when the branch mispredicts, it RETIRES and flushes while the
   *          wrong-path consumer is held. Counted (flush cycles that land on a held uop).
+  *   chase  a cold pointer chase: the consumer is an LS LOAD's address (re-checked and held
+  *          at the LS issue register, `lsSpecBlocked`, no freeze) -- checksum checked.
   * Faults: an announced load that completes as a bus error releases the hold through
   * `specAbort`; that path is exercised by the PM-run ported corpus (bus-error programs),
   * not here (this harness has no read-error injection).
@@ -150,13 +152,31 @@ class LsSpecWakeAluSpec extends CoreBenchHarness {
       })
   }
 
+  // ── chase: cold pointer chase (LS-LOAD address consumer of the announced load) ────
+  private def kChase(hops: Int): Kernel = {
+    val base = 0x70000L
+    val order = new scala.util.Random(0x5eed).shuffle((0 until hops).toVector)
+    val addr = (i: Int) => base + 64L * order(i)
+    val setup = Seq(f"lea 0x${addr(0)}%x,%%a0", s"move.l #$hops,%d7", "moveq #0,%d6")
+    val body = Seq("move.l (%a0),%a0", "add.l %a0,%d6", "subq.l #1,%d7", "bne.s .Lc")
+    val src = (setup ++ Seq(".Lc: " + body.mkString(" ; "), "move.l %d6,%d0", ".Lend: bra.s .Lend"))
+      .mkString(" ; ")
+    val expect = (1 to hops).foldLeft(0L)((a, i) => (a + addr(i % hops)) & 0xffffffffL)
+    Kernel("specalu-chase", src, setup.size + hops * body.size + 1, zeroFillData = true,
+      prepMem = h => for (i <- 0 until hops) poke32(h, addr(i), addr((i + 1) % hops)),
+      verifyRetirement = obs => {
+        val d0 = regWrites(obs, 0)
+        assert(d0.nonEmpty && d0.last == expect, f"chase: checksum 0x${d0.lastOption.getOrElse(-1L)}%x expected 0x$expect%x")
+      })
+  }
+
   test("speculative ALU wakeup: confirm / miss hold / SQ forward / flush during hold", VerilatorTest) {
     val on = m68k040.top.ShippingCoreConfig.lsSpecWakeAlu
     val compiled = M68kSim().withVerilator.compile(new FullCoreDut(shippingProfile = true))
     case class Stat(var ann: Int = 0, var confirm: Int = 0, var grants: Int = 0, var holds: Int = 0,
-                    var held: Int = 0, var flushOnHeld: Int = 0)
+                    var held: Int = 0, var flushOnHeld: Int = 0, var lsHeld: Int = 0)
     val stats = scala.collection.mutable.LinkedHashMap.empty[String, Stat]
-    for (k <- Seq(kHit(24), kMiss(384), kSqFwd(128), kFlush(256))) {
+    for (k <- Seq(kHit(24), kMiss(384), kSqFwd(128), kFlush(256), kChase(256))) {
       val st = Stat(); stats(k.name) = st
       dutProbe = d => if (d.iq.logic.specAluOn) fork {
         val l = d.iq.logic; val c = l.specAluCtl; val pp = l.aluSpecPipes
@@ -168,6 +188,7 @@ class LsSpecWakeAluSpec extends CoreBenchHarness {
             if (p.grant.toBoolean) st.grants += 1
             if (p.holdStart.toBoolean) st.holds += 1
           }
+          if (l.lsSpecBlocked.toBoolean) st.lsHeld += 1
           val heldNow = pp.exists(_.blocked.toBoolean)
           if (heldNow) st.held += 1
           if (heldNow && d.iq.flushPort.toBoolean) st.flushOnHeld += 1
@@ -176,7 +197,7 @@ class LsSpecWakeAluSpec extends CoreBenchHarness {
       val r = runKernel(compiled, k)
       println(s"[specalu-gate] ${r.name} on=$on cycles=${r.windowCycles} announce=${st.ann} " +
         s"confirm=${st.confirm} grants=${st.grants} holdStarts=${st.holds} heldCyc=${st.held} " +
-        s"flushOnHeld=${st.flushOnHeld}")
+        s"flushOnHeld=${st.flushOnHeld} lsHeldCyc=${st.lsHeld}")
     }
     dutProbe = null
     if (on) {
@@ -188,6 +209,7 @@ class LsSpecWakeAluSpec extends CoreBenchHarness {
       if (!m68k040.top.ShippingCoreConfig.lsSpecWakeAluProbe) {
         assert(stats("specalu-miss").holds > 0, "miss kernel: no failed-confirm hold")
         assert(stats.values.map(_.flushOnHeld).sum > 0, "no flush landed on a held uop in any kernel")
+        assert(stats("specalu-chase").lsHeld > 0, "chase kernel: no LS-issue hold")
       }
     }
   }
