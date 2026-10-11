@@ -700,7 +700,7 @@ object ShippingCoreConfig {
     * (ParamPlugin requires they agree). The history used in the index is
     * min(GHR bits = 16, idx bits), so a deeper table also uses more history.
     * Default 2048 = the old frozen 11-bit index; echoed in `SHIPPING_CONFIG`. */
-  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 2048, 2048, 16384)
+  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 8192, 2048, 16384)
   require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
     s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
 
@@ -712,7 +712,7 @@ object ShippingCoreConfig {
     * `ghr`/`ghrArch` width follows it. Values above log2(entries) XOR-fold the excess
     * history into the low index bits (the untrimmed pre-2026-09-25 shape). Echoed in
     * `SHIPPING_CONFIG`. */
-  val gshareHistBits: Int = envInt("CPU_GSHARE_HIST_BITS", 0, 0, 16)
+  val gshareHistBits: Int = envInt("CPU_GSHARE_HIST_BITS", 10, 0, 16)
   require(gshareHistBits != 1, "CPU_GSHARE_HIST_BITS must be 0 (auto) or 2..16")
 
   /** ROB: drive `flushing` (-> `rc.flushPort`, `headReady`, the ROB pointer/count resets
