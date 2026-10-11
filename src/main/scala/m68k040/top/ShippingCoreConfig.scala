@@ -312,6 +312,17 @@ object ShippingCoreConfig {
     // 111,084), +2.1% Speedometer mix, clean boot 2/2. `CPU_DEFER_SLOT1_DBCC=0` still disables it.
     envFlag("CPU_DEFER_SLOT1_DBCC", true)
 
+  /** Front-end: DECODE-TIME GSHARE DIRECTION FOR A BTB-MISS DIRECT CONDITIONAL. A slot-0
+    * Bcc (cond >= 2, 8/16-bit displacement) or DBcc (not DBT) that missed the BTB is
+    * looked up in gshare exactly like a BTB-hit conditional: it carries a `phtValid`
+    * training record, shifts the speculative GHR with its predicted direction (so the
+    * `phtValid` set == `gsShiftValid` set contract is kept by construction), and a
+    * predicted-taken one redirects to the decode-computed `pc + 2 + disp` target through
+    * the registered `computeDirectTargets` C+1 action. See
+    * `FetchAlignPlugin.btbMissGshare`. Default OFF; `CPU_BTBMISS_GSHARE=1` enables;
+    * echoed in `SHIPPING_CONFIG`. */
+  val btbMissGshare: Boolean = envFlag("CPU_BTBMISS_GSHARE", false)
+
   /** Decode: let a 3-uop slot-0 crack (e.g. `move.l (a0)+,d0` / `cmp.b (a1)+,d0` =
     * [load][An += n][op]) PAIR with a 1-uop slot-1 instruction in the same push. The
     * MicroOpQueue push is already 4 wide (and accepts only with >=4 free slots), so the

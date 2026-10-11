@@ -39,6 +39,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        computeDirectTargets: Boolean = false,
                        deferSlot1Uncond: Boolean = false,
                        deferSlot1Dbcc: Boolean = false,
+                       /** `ShippingCoreConfig.btbMissGshare` (CPU_BTBMISS_GSHARE). */
+                       btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
                        /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
                        feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                        /** `ShippingCoreConfig.feRedirectCmd` (CPU_FE_REDIRECT_CMD). */
@@ -1306,6 +1308,38 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // RAS predict for slot0 (a return with a non-empty stack predicts top-of-stack).
     val rasPredictSlot0 = s0IsReturn && rasPredValid
 
+    // ── BTB-MISS DIRECT CONDITIONAL: gshare direction at decode (`btbMissGshare`) ────
+    // A slot-0 Bcc (cond >= 2, 8/16-bit displacement) or DBcc (not DBT) that MISSED the
+    // BTB used to be predicted by nothing (fall through, no history, no PHT training).
+    // With the flag it becomes an ordinary gshare event, exactly like `condBtbHit0`:
+    //   - direction = `gsPhtTaken0` (the slot-0 PHT read already in flight for the BTB
+    //     path -- same PC, same pre-shift GHR, same index `gsPhtIndex0`);
+    //   - target    = the decode-computed `pc + 2 + disp` (`s0RelTarget`), redirected by
+    //     the registered C+1 `predictFire` action via `slot0ComputedPred`;
+    //   - history   = it is added to BOTH the `phtValid` stamp set and the
+    //     `gsShiftValid` set below (shift dir = `gsPhtTaken0`), so the retire-time
+    //     `ghrArch` shifts once for it and the speculative GHR shifts once for it: the
+    //     GsharePlugin whole-GHR repair contract (`phtValid` set == `gsShiftValid` set)
+    //     holds by construction, and Tier-1/Tier-2 restore see a normal history event.
+    // `btbQueryValid0` carries predEnable (!faultHold/!quiesce/!stalled), slot0Valid and
+    // the refill-time `ctrlXfer` predecode bit (the stale-bytes gate); `!gsBtbHit0` makes
+    // it disjoint from `condBtbHit0` / `slot0IsPred`. DBcc's displacement is always the
+    // 16-bit extension word (its low opword byte is `11001rrr`).
+    val s0GsIsBcc  = (s0op(15 downto 12) === B"4'h6") && (s0op(11 downto 8).asUInt >= U(2, 4 bits))
+    val s0GsIsDbcc = (s0op(15 downto 12) === B"4'h5") && (s0op(7 downto 3) === B"5'b11001") &&
+                     (s0op(11 downto 8) =/= B"4'h0")
+    val s0GsDispW  = s0op(7 downto 0) === B"8'h00"
+    val s0GsDispL  = s0op(7 downto 0) === B"8'hFF"
+    val slot0CondMiss = if (btbMissGshare)
+        btbQueryValid0 && res.slot0.simple && !gsBtbHit0 &&
+        ((s0GsIsBcc && !s0GsDispL &&
+          Mux(s0GsDispW, res.slot0.lenWords === U(2, 4 bits), res.slot0.lenWords === U(1, 4 bits))) ||
+         (s0GsIsDbcc && res.slot0.lenWords === U(2, 4 bits)))
+      else False
+    // Slot-0 conditional whose direction comes from gshare (BTB hit OR, with the flag, miss).
+    val condGs0 = if (btbMissGshare) condBtbHit0 || slot0CondMiss else condBtbHit0
+    spinal.core.sim.SimPublic(slot0CondMiss)
+
     // A RETURN in slot1 (slot0 not predicted): defer it — suppress slot1 so the return
     // becomes slot0 NEXT cycle and takes the (single-slot) slot0 RAS-predict path. This
     // mirrors slot1WouldFtq below (the FTQ-sourced slot1-branch deferral) and is essential: a leaf
@@ -1320,7 +1354,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
         (s1op(15 downto 12) === B"4'h6") && (s1op(11 downto 8).asUInt >= U(2, 4 bits))
     else False
     val slot1WouldCondPred = if (deferSlot1Conditional) slot1IsConditional
-      else if (trainSlot1Conditional) slot1IsConditional && (condBtbHit0 ||
+      else if (trainSlot1Conditional) slot1IsConditional && (condGs0 ||
         (if (deferTakenSlot1Conditional) host[m68k040.services.GshareSecondaryLookupService].secondaryPhtTaken else False))
       else False
     val s1IsRts    = s1op === B"16'h4E75"
@@ -1390,8 +1424,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val s0RelDisp8   = s0op(7 downto 0)
     val s0RelDispW   = s0RelDisp8 === B"8'h00"     // 0x00 => 16-bit disp in words(1)
     val s0RelDispL   = s0RelDisp8 === B"8'hFF"     // 0xFF => 32-bit disp (68020+), skipped
-    val s0RelDispExt = Mux(s0RelDispW, res.slot0.words(1).asSInt.resize(32),
-                                       s0RelDisp8.asSInt.resize(32))
+    val s0DispIsWord = if (btbMissGshare) s0RelDispW || s0GsIsDbcc else s0RelDispW
+    val s0RelDispExt = Mux(s0DispIsWord, res.slot0.words(1).asSInt.resize(32),
+                                         s0RelDisp8.asSInt.resize(32))
     val s0RelTarget  = (res.slot0.pc + U(2, 32 bits) + s0RelDispExt.asUInt).resize(32)
     // cond 0 = BRA, cond 1 = BSR: both ALWAYS taken, so the direction needs no
     // predictor either. cond >= 2 is a Bcc and is deliberately NOT computed here -- a
@@ -1403,10 +1438,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                         ((s0RelCond === B"4'h0") || (s0RelCond === B"4'h1"))
     val s0RelLenOk    = Mux(s0RelDispW, res.slot0.lenWords === U(2, 4 bits),
                                         res.slot0.lenWords === U(1, 4 bits))
-    val slot0ComputedPred = if (computeDirectTargets)
+    // `btbMissGshare`: a BTB-miss conditional gshare predicts TAKEN uses the same
+    // registered computed-target redirect (target = `s0RelTarget`).
+    val slot0GsMissTaken = if (btbMissGshare) slot0CondMiss && gsPhtTaken0 else False
+    val slot0ComputedPred = (if (computeDirectTargets)
         res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer && s0RelIsUncond &&
         !s0RelDispL && s0RelLenOk && !slot0IsPred && !rasPredictSlot0
-      else False
+      else False) || slot0GsMissTaken
     // ── SLOT-1 UNCONDITIONAL COVERAGE ───────────────────────────────────────────
     // A control transfer that lands in SLOT 1 has NO decode-time predictor at all. The
     // BTB is queried for slot0 only (`btbQueryValid0`); the dedicated slot-1 BTB read
@@ -1515,7 +1553,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       val s0Clear = res.slot0Valid && !slot0IsPred && !rasPredictSlot0
       val condTerm: Bool =
         if (deferSlot1Conditional) res.slot0Valid && cond
-        else if (trainSlot1Conditional) res.slot0Valid && cond && (condBtbHit0 ||
+        else if (trainSlot1Conditional) res.slot0Valid && cond && (condGs0 ||
           (if (deferTakenSlot1Conditional) host[m68k040.services.GshareSecondaryLookupService].secondaryPhtTaken else False))
         else False
       val rasTerm  = ret && rasPredValid && s0Clear
@@ -1587,7 +1625,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // bit sequence, one lagging the other. Without it, a branch emitted while an
     // I-fetch fault is draining would be counted at retire but never at fetch, and
     // every later repair would install a history shifted by one bit.
-    when(condBtbHit0 && res.slot0Valid && !faultHold) {
+    when(condGs0 && res.slot0Valid && !faultHold) {
       feed.payload(0).phtValid := True
       feed.payload(0).phtIndex := gsPhtIndex0
     }
@@ -1928,9 +1966,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // repair installs a bit-exact history.
     val ftqConfirmCond = ftqConfirmFire && ftqHeadE.isCond
     gsShiftValid := ftqConfirmCond ||
-                    (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm) ||
+                    (feed.fire && !faultHold && condGs0 && res.slot0Valid && !ftqConfirm) ||
                     (feed.fire && brPredLive1)
-    gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0PredTaken))
+    // `btbMissGshare`: a BTB-miss conditional shifts its gshare direction (slot0PredTaken
+    // is the BTB-sourced bit, False on a miss).
+    val slot0GsDir = if (btbMissGshare) Mux(slot0CondMiss, gsPhtTaken0, slot0PredTaken) else slot0PredTaken
+    gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0GsDir))
     GenerationFlags.simulation {
       if (trainSlot1Conditional) when(feed.fire) {
         assert(gsShiftValid === (feed.payload(0).phtValid ||

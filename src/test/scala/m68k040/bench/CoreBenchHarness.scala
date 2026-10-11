@@ -282,6 +282,8 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       // fetched after Tier 1, whose frontend survives the Tier-2 rollback?
       spinal.core.sim.SimPublic(gsh.logic.shiftValid, gsh.logic.shiftDir,
         gsh.logic.queryPc0, gsh.logic.flushRepair)
+      // BtbMissGshareIpcSpec: the carried PHT records of both emitted slots.
+      spinal.core.sim.SimPublic(fa.logic.feed.payload(0).phtValid, fa.logic.feed.payload(1).phtValid)
       // Test-only observation for the STALL BUDGET's `walk` category. The board's
       // OFF_PERF_STALL_WALK counts `perfLvlDtlbWalk || perfLvlItlbWalk`, each of which is
       // `RegNext(!walker.io.dbgPack(0))` = `RegNext(!fsm.isActive(IDLE))` -- and
@@ -402,6 +404,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
                     computeDirectTargets: Boolean = false,
                     deferSlot1Uncond: Boolean = false,
                     deferSlot1Dbcc: Boolean = false,
+                    btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment,
                     shippingProfile: Boolean = false,
@@ -445,7 +448,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional,
       computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
-      deferSlot1Dbcc = deferSlot1Dbcc)
+      deferSlot1Dbcc = deferSlot1Dbcc, btbMissGshare = btbMissGshare)
     val dec    = if (shippingProfile) m68k040.top.ShippingPlugins.decode(shippingIpc)
                  else new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
                    fuseLongMoveLoads = fuseLongMoveLoads)
