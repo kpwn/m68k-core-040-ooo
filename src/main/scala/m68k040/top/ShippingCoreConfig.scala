@@ -544,13 +544,13 @@ object ShippingCoreConfig {
     * fetchPc/ringStale/pendingDrop next-state, FTB-applied target as the last
     * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
     * Every arm carries a simulation-only oracle against the original expression. */
-  val feRetime: Boolean = envFlag("CPU_FE_RETIME", false)
+  val feRetime: Boolean = envFlag("CPU_FE_RETIME", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
     * outermost `cmdWindowPc` select) instead of a born-stale command from the old fetchPc:
     * one cycle off every early-redirect restart. Echoed in `SHIPPING_CONFIG`. */
-  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", false)
+  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", true)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
