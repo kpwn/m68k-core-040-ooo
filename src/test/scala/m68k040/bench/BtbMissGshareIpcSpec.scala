@@ -30,14 +30,14 @@ class BtbMissGshareIpcSpec extends CoreBenchHarness {
   private def kChain(sites: Int, label: String = "gs-chain"): Kernel = {
     val setup = Seq("lea 0x00300000,%sp", "moveq #0,%d0", "moveq #1,%d1", "move.l #0x100,%d4")
     // kind A (i%4 != 1): moveq #0 ; beq.s skip (taken) ; add d4 ; skip: add d1   d0 += 1
-    // kind B (i%4 == 1, not in the last 8): moveq #0 ; bne.s skip (never) ; add d1 ; skip: nop   d0 += 1
+    // kind B (i%4 == 1, not in the last 5: the 5-taken tail keeps the last 0 bit inside the 10-bit GHR): moveq #0 ; bne.s skip (never) ; add d1 ; skip: nop   d0 += 1
     val body = (0 until sites).map { i =>
-      if (i % 4 == 1 && i < sites - 8) s"moveq #0,%d2 ; bne.s .Ck$i ; add.l %d1,%d0 ; .Ck$i: nop"
+      if (i % 4 == 1 && i < sites - 5) s"moveq #0,%d2 ; bne.s .Ck$i ; add.l %d1,%d0 ; .Ck$i: nop"
       else s"moveq #0,%d2 ; beq.s .Ck$i ; add.l %d4,%d0 ; .Ck$i: add.l %d1,%d0"
     }
     val pad = Seq.fill(8)("nop")
     val src = (setup ++ body ++ Seq(pad.mkString(" ; "), ".Cend: bra.s .Cend")).mkString(" ; ")
-    val nB = (0 until sites).count(i => i % 4 == 1 && i < sites - 8)
+    val nB = (0 until sites).count(i => i % 4 == 1 && i < sites - 5)
     Kernel(label, src, setup.size + sites * 3 + nB + pad.size,
       warmupInstrs = setup.size,
       verifyRetirement = obs => {
