@@ -387,7 +387,7 @@ object ShippingCoreConfig {
       require(n == 0 || (n >= 2 && n <= 64),
         s"ITLB_VICTIM must be 0 (off) or 2..64, got $n")
       n
-    case None => 0
+    case None => 32
   }
 
   /** Store-queue (and its lock-step `pendMem` replay ring) depth. Default 8 = OFF.
@@ -693,7 +693,7 @@ object ShippingCoreConfig {
     * entries on both TLBs = -80% walks (trace, not silicon). Reaches every harness via
     * the `DtlbPlugin` constructor default; echoed in SHIPPING_CONFIG. */
   val dtlbVictimEntries: Int = {
-    val n = envInt("CPU_DTLB_VICTIM", 0, 0, 64)
+    val n = envInt("CPU_DTLB_VICTIM", 32, 0, 64)
     require(n != 1, "CPU_DTLB_VICTIM must be 0 (off) or 2..64")
     n
   }
