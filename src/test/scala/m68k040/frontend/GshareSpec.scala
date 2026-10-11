@@ -22,7 +22,9 @@ class GshareSpec extends AnyFunSuite {
   // Width follows CPU_GSHARE_ENTRIES (Global.PHT_IDX_W); 2048/11 by default.
   val idxBits = m68k040.Global.PHT_IDX_W
   val phtEntries = 1 << idxBits
-  val idxHistBits = scala.math.min(ghrBits, idxBits)
+  // Follows CPU_GSHARE_HIST_BITS (0 = auto = min(GHR bits, index bits)).
+  val idxHistBits = { val h = m68k040.top.ShippingCoreConfig.gshareHistBits
+                      if (h > 0) h else scala.math.min(ghrBits, idxBits) }
 
   /** Scala model of the plugin's fold (XOR idxBits-wide chunks of a width-w value). */
   def fold(v: Long, w: Int): Int = {

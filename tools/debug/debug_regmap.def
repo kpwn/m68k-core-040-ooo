@@ -456,6 +456,21 @@ REG OFF_PERF_IC_PF_ISSUED 0x010D4 RO    2 0x00000000 Windowed speculative (prefe
 REG OFF_PERF_IC_PF_USED   0x010D8 RO    2 0x00000000 Windowed prefetched lines subsequently USED: a demand fetch hit a line a prefetch installed and nothing else had touched. At most one per install. Read against OFF_PERF_IC_PF_ISSUED for coverage and against OFF_PERF_IC_MISS for remaining headroom.
 REG OFF_PERF_IC_MISS_SEQ  0x010DC RO    2 0x00000000 Windowed demand misses whose line is the PREVIOUS demand miss's line + 64. Next-line prefetch's EXACT CEILING: OFF_PERF_IC_MISS minus this is the entire addressable market of any fetch-directed scheme.
 REG OFF_PERF_IC_PF_LATE   0x010E0 RO    2 0x00000000 Windowed CYCLES on which a demand fetch was offered, its translation was ready, and a SPECULATIVE fill owned the set it wanted -- so it could not be accepted. "Right line, too late". Read against OFF_PERF_IC_PF_USED to tell a DEPTH problem from a DIRECTION one.
+#
+# ---- EXCEPTION-PATH counters (2026-10-10, claude/fable-excfast) ----
+# Mac OS is an A-line-trap operating system; nothing measured the trap rate. Five
+# windowed counters, all fed from ExceptionUnit REGISTERS through one flop each
+# (ExceptionPerfService, sole producer RobPlugin), zeroed/frozen by OFF_PERF_CTL like
+# every other windowed counter, and present iff the ROB producer bit OFF_PERF_CTL[16]
+# is set. OFF_PERF_CTL[15:8] therefore reports 23. They take 0x010E4-0x010F4 out of
+# the free 0x010E4-0x010FC range; 0x010F8/0x010FC remain free.
+# EXC_BUSY / (EXC_ENTRY + EXC_RTE) is an UPPER BOUND on mean cycles per episode: BUSY
+# also counts MOVEC/MOVE-SR/CPUSH/CINV/FSAVE/FRESTORE sequencer episodes.
+REG OFF_PERF_EXC_ENTRY    0x010E4 RO    2 0x00000000 Windowed exception ENTRIES dispatched (fault, trap, A-line, F-line, interrupt; one per handler redirect).
+REG OFF_PERF_EXC_ALINE    0x010E8 RO    2 0x00000000 Windowed A-line (vector 10) trap entries. A subset of OFF_PERF_EXC_ENTRY.
+REG OFF_PERF_EXC_INT      0x010EC RO    2 0x00000000 Windowed INTERRUPT entries. A subset of OFF_PERF_EXC_ENTRY.
+REG OFF_PERF_EXC_RTE      0x010F0 RO    2 0x00000000 Windowed RTEs completed (final frame; a format-$1 throwaway pop is not counted separately).
+REG OFF_PERF_EXC_BUSY     0x010F4 RO    2 0x00000000 Windowed CYCLES the exception/serialising sequencer was active (entry, RTE, and MOVEC/MOVE-SR/CPUSH/FSAVE episodes).
 REG OFF_PERF_DETAIL_BASE  0x01100 RO    2 0x00000000 Detail counter array, 32-bit words; layout in PerfDetailService.scala. Shares PERF_CTL clear/run/freeze.
 
 # ---------------------------------------------- MMU translation-key probes --

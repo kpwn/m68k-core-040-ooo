@@ -704,9 +704,12 @@ object GenSocketTopVerilog {
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
             s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
+            s"gshareHistBits=${ShippingCoreConfig.gshareHistBits} " +
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
             s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
+            s"excFastFrames=${ShippingCoreConfig.excFastFrames} " +
+            s"excFramesCopyback=${ShippingCoreConfig.excFramesCopyback} " +
             s"pairCorrectBranch=${ShippingCoreConfig.pairCorrectBranch} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
@@ -724,6 +727,7 @@ object GenSocketTopVerilog {
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
             s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
+            s"dtlbVictimEntries=${ShippingCoreConfig.dtlbVictimEntries} " +
             // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
             // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
             // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its

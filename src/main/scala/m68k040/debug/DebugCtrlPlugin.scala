@@ -216,6 +216,7 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
     val stallArb    = if (enable) host.get[m68k040.socket.AxiDMergePlugin] else None
     val stallLsEu   = if (enable) host.get[m68k040.execute.LsEuPlugin] else None
     val stallRob    = if (enable) host.get[m68k040.rob.RobPlugin] else None
+    val excPerfSvc  = if (enable) host.get[m68k040.services.ExceptionPerfService] else None
     val stallDtlb   = if (enable) host.get[m68k040.mmu.DtlbPlugin] else None
     val stallItlb   = if (enable) host.get[m68k040.mmu.ItlbPlugin] else None
     // 2026-09-17 multi-hot evidence (DebugRegMap.OFF_MULTIHOT_*). Same `host.get`
@@ -847,6 +848,18 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         else U(0, 32 bits)
       val perfCycle       = if (perfBuilt) perfCounter64(U(1, 1 bits)) else U(0, 64 bits)
       val perfInst        = if (perfBuilt) perfCounter64(perfEvtInst) else U(0, 64 bits)
+      // ── EXCEPTION-PATH counters (OFF_PERF_EXC_*, 2026-10-10) ───────────────────
+      // Mac OS is an A-line-trap OS; these size the exception entry/RTE cost on the
+      // board. `excPerfEvents` is a decode of ExceptionUnit REGISTERS only; each bit
+      // takes the usual one-flop `perfTap`, so no counter adder touches a live cone.
+      // BUSY / (ENTRY + RTE) is the board's mean cycles per sequencer episode (it
+      // also includes MOVEC/MOVE-SR/CPUSH/FSAVE episodes, so it is an upper bound).
+      def excEvt(bit: Int): Bool = perfTap(excPerfSvc.map(_.excPerfEvents(bit)))
+      val perfExcEntry    = if (perfBuilt) perfCounter(excEvt(0)) else U(0, 32 bits)
+      val perfExcAline    = if (perfBuilt) perfCounter(excEvt(1)) else U(0, 32 bits)
+      val perfExcInt      = if (perfBuilt) perfCounter(excEvt(2)) else U(0, 32 bits)
+      val perfExcRte      = if (perfBuilt) perfCounter(excEvt(3)) else U(0, 32 bits)
+      val perfExcBusy     = if (perfBuilt) perfCounter(excEvt(4)) else U(0, 32 bits)
 
       // Optional diagnostic producers are accessed only through services. All
       // events use the same one-cycle tap / RUN alignment as the baseline set.
@@ -874,12 +887,12 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
       val perfPresentDtlb = perfBuilt && stallDtlb.nonEmpty
       val perfPresentItlb = perfBuilt && stallItlb.nonEmpty
       /** LOGICAL counters, not words: cycle and inst are one counter each despite
-        * occupying a LO/HI pair. 18 when this block is built: 12 through 2026-09-26, plus
+        * occupying a LO/HI pair. 23 when this block is built (18 + the five OFF_PERF_EXC_* added 2026-10-10): 12 through 2026-09-26, plus
         * the two mispredict-CLASS counters (MISPRED_UNCOND/_COND) and the four I-cache
         * prefetch counters (PF_ISSUED, PF_USED, IC_MISS_SEQ, PF_LATE), all added
         * 2026-09-27 on two separate branches. 0 when the block is not built -- so a host
         * reading 0 here knows the block is absent rather than merely idle. */
-      val perfNumCounters = if (perfBuilt) 18 else 0
+      val perfNumCounters = if (perfBuilt) 23 else 0
 
       // ── OFF_IC_PREFETCH_CTL: runtime on/off for the I-cache next-line prefetcher ──
       // `IcachePlugin.prefetchEnable` was runtime-SHAPED but not runtime-REACHABLE:
@@ -1994,6 +2007,11 @@ class DebugCtrlPlugin(val buildId:   BigInt  = BigInt(0),
         // the prefetches that DID land arrived in time.
         at(DebugRegMap.OFF_PERF_IC_MISS_SEQ)  { perfIcMissSeq.asBits }
         at(DebugRegMap.OFF_PERF_IC_PF_LATE)   { perfIcPfLate.asBits }
+        at(DebugRegMap.OFF_PERF_EXC_ENTRY)    { perfExcEntry.asBits }
+        at(DebugRegMap.OFF_PERF_EXC_ALINE)    { perfExcAline.asBits }
+        at(DebugRegMap.OFF_PERF_EXC_INT)      { perfExcInt.asBits }
+        at(DebugRegMap.OFF_PERF_EXC_RTE)      { perfExcRte.asBits }
+        at(DebugRegMap.OFF_PERF_EXC_BUSY)     { perfExcBusy.asBits }
         for ((counter, index) <- detailCounters.zipWithIndex) {
           at(DebugRegMap.OFF_PERF_DETAIL_BASE + index * 4) { counter.asBits }
         }
