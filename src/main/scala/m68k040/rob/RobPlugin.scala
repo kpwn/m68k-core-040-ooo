@@ -3855,6 +3855,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
       bcInFlight && !flushing && !excActive && !coreHalted && !debugQuiesceActive &&
       (!earlyPend || (bcAge < curAge))
     earlyFire := earlyArm
+    // CPU_FE_REDIRECT_CMD: a REPLICA of `earlyFire` that drives only FetchAlign's
+    // outermost fetch-command select, so that select never shares `earlyFire`'s fanout.
+    val earlyFireFe = if (m68k040.top.ShippingCoreConfig.feRedirectCmd) {
+      val r = RegNext(earlyArm) init False
+      r.addAttribute("dont_touch", "true"); r.simPublic(); r
+    } else null
     when(earlyArm) {
       earlyPend  := True
       earlyRobId := branchCompletion.payload.robId

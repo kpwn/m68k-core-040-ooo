@@ -157,6 +157,13 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
     faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
                        Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
+    // CPU_FE_REDIRECT_CMD (null unless the flag is on): early redirect from the replica.
+    if (host[FetchAlignPlugin].logic.earlyRedirect != null) {
+      val faE = host[FetchAlignPlugin].logic
+      faE.earlyRedirect.valid   := rob.logic.earlyFireFe
+      faE.earlyRedirect.payload := rob.logic.earlyPcReg
+      faE.earlyRedirectWins     := earlyFire && !(doFlush && !feSuppress)
+    }
 
     // ── Decode fallback BTB + fetch-directed FTB wiring ──────────────────────────
     // The retained BTB ports query the aligned decode packets combinationally. The FTB

@@ -536,6 +536,21 @@ object ShippingCoreConfig {
     * extra cycle after an inhibited access), and replicates the SQ forward-query select
     * `p4RetryQ`. Effective only with `lsOooIssue` (park) / `p3FastLoad`. Echoed in `SHIPPING_CONFIG`. */
   val lsParkRetime: Boolean = envFlag("CPU_LS_PARK_RETIME", true)
+  /** Front-end / decode timing-closure round 2 (`CPU_FE_RETIME`, default OFF pending the
+    * PM's 200 MHz build). Cycle-identical restructurings of the fetch/align/decode cones:
+    * per-candidate slot-1 eligibility in `Aligner` (ungated IBuf predecode), IBuf head/count
+    * next-state candidates selected by the late `suppressSlot1`, slot-1 suppress/training
+    * terms factored off `slot1Valid`, `ic.cmd.fire` as the LAST select of the
+    * fetchPc/ringStale/pendingDrop next-state, FTB-applied target as the last
+    * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
+    * Every arm carries a simulation-only oracle against the original expression. */
+  val feRetime: Boolean = envFlag("CPU_FE_RETIME", false)
+  /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
+    * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
+    * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
+    * outermost `cmdWindowPc` select) instead of a born-stale command from the old fetchPc:
+    * one cycle off every early-redirect restart. Echoed in `SHIPPING_CONFIG`. */
+  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", false)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
