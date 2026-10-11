@@ -709,7 +709,7 @@ object ShippingCoreConfig {
     * bit: the descriptor was rewritten after the walk by a store the 68040 orders after
     * its locked U/M update, so that store's value is final. Cold path only.
     * Default OFF; `CPU_UM_ATOMIC=1` enables; echoed in `SHIPPING_CONFIG`. */
-  val umAtomic: Boolean = envFlag("CPU_UM_ATOMIC", false)
+  val umAtomic: Boolean = envFlag("CPU_UM_ATOMIC", true)
 
   /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
     * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
