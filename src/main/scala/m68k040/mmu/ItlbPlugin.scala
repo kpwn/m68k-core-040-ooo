@@ -122,7 +122,9 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
                  ways: Int = Tlb.DefaultWays,
                  banks: Int = Tlb.DefaultBanks,
                  captureGateOnFlush: Boolean = true,
-                 victimEntries: Int = 0) extends FiberPlugin
+                 victimEntries: Int = 0,
+                 /** `ShippingCoreConfig.umAtomic`: atomic, order-checked U drain. */
+                 umAtomic: Boolean = m68k040.top.ShippingCoreConfig.umAtomic) extends FiberPlugin
     with TranslationService with ItlbWalkerDcacheClient {
   var _req: TranslationReq = null
   var _rsp: TranslationRsp = null
@@ -165,7 +167,25 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     _walkStoreAck = Bool()
     _walkStoreErr = Bool()
     _walkCmodePolicy = CacheMode()
+    if (umAtomic) {
+      _umRmwBusy = Bool(); _umRmwArming = Bool()
+      _umRmwBlock = Bool(); _umRmwYield = Bool()
+      // Default-idle in SETUP so a DUT without LsEuPlugin is never blocked or yielded.
+      _umRmwBlock.allowOverride; _umRmwBlock := False
+      _umRmwYield.allowOverride; _umRmwYield := False
+      _umRmwReadOk = Bool(); _umRmwReadOk.allowOverride; _umRmwReadOk := True
+    }
   }
+  var _umRmwBusy: Bool = null
+  var _umRmwArming: Bool = null
+  var _umRmwBlock: Bool = null
+  var _umRmwYield: Bool = null
+  var _umRmwReadOk: Bool = null
+  override def umRmwReadOk: Bool = _umRmwReadOk
+  override def umRmwBusy: Bool = _umRmwBusy
+  override def umRmwArming: Bool = _umRmwArming
+  override def umRmwBlock: Bool = _umRmwBlock
+  override def umRmwYield: Bool = _umRmwYield
 
   // U deferred-write queue hooks (driven by the LS-cluster wiring, mirroring the DTLB).
   // NOTE there is deliberately NO `umAccessRobId` here, unlike the DTLB: an instruction
@@ -977,10 +997,19 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // Combinational: `drainNeedRead` is a register (invisible on the arming cycle) and
     // `walker.io.busy` is `!fsm.isActive(IDLE)`, also registered, so it still reads
     // False on the cycle the walker STARTS. Both lags must be closed here.
+    // `CPU_UM_ATOMIC`: `umYield` is a REGISTER-sourced fence from LsEuPlugin (see
+    // `WalkerDcacheClient.umRmwYield`); `umBlock` is the other walker's RMW lock.
+    val umYield: Bool = if (umAtomic) _umRmwYield else null
     val drainArmingNow = umq.io.drain.valid && !drainArmed && !drainAckWait &&
                          !drainNeedRead && !drainReadPend &&
-                         !walker.io.busy && !walker.io.start
+                         !walker.io.busy && !walker.io.start &&
+                         // `drainDropAck` is a REGISTERED pop: while it is up the queue still
+                         // offers the entry being popped, so arming now would re-drain it.
+                         (if (umAtomic) !_umRmwBlock && !umYield && !drainDropAck else True)
+    // The walk's own sampled byte (old | set-bits), for the order check at the re-read.
+    val drainSample: Bits = if (umAtomic) Reg(Bits(8 bits)) else null
     when(drainArmingNow) {
+      if (umAtomic) drainSample := umq.io.drain.payload.newByte
       drainNeedRead := True
       drainRdAddr   := umq.io.drain.payload.addr
       drainOffReg   := drainByteOff
@@ -1052,7 +1081,54 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
       drainStrbReg := mStrb
       drainArmed   := True
     }
-    _walkStore.valid              := drainArmed
+    // ── CPU_UM_ATOMIC ────────────────────────────────────────────────────────────
+    // (1) ATOMICITY. While `umRmwBusy` is up (and not yielded) LsEuPlugin holds the SQ
+    //     drain and the other walker's drain, so nothing can land between this re-read
+    //     and the merged store. A yield (a fence that may itself wait on the SQ) cannot
+    //     be honoured mid-RMW, so the RMW is ABANDONED instead: no store, the queue
+    //     keeps its offered entry, and the drain re-arms later with a fresh re-read.
+    //     `drainTaint` marks a re-read whose interval overlapped a yield cycle.
+    // (2) ORDER. On a 68040 the U/M update is a locked RMW inside the access's own table
+    //     search, so every program-younger store to the descriptor lands AFTER it and
+    //     its value is final. Here the update lands after the owner commits, so a
+    //     younger store may already be in memory. If the re-read byte differs from the
+    //     walk's sample in any non-U/M bit the descriptor was rewritten after the walk:
+    //     DROP the update (ORing U/M into it would corrupt the new value, e.g. the
+    //     software-defined bits of an invalid descriptor).
+    val dbgUmDrop: Bool = if (umAtomic) Bool() else null
+    if (umAtomic) {
+      val drainTaint = RegInit(False)
+      // The re-read waits until every core store the D-cache already accepted has
+      // acked (`umRmwReadOk`); `umRmwBusy` holds the SQ meanwhile, so none follows.
+      // Overrides the plain issue transition above.
+      val readOk = _umRmwReadOk
+      when(drainNeedRead && !readOk) {
+        _walkLoadCmd.valid := False
+        drainNeedRead := True
+        drainReadPend := False
+      }
+      val issued = drainNeedRead && readOk && _walkLoadCmd.ready
+      when(drainReadPend && umYield) { drainTaint := True }
+      when(issued && umYield) { drainTaint := True }
+      // A yield while the re-read is not yet issued: release the port and re-arm later.
+      when(drainNeedRead && umYield && !issued) { drainNeedRead := False }
+      val rspOk   = drainReadPend && _walkLoadRsp.valid && !_walkLoadRsp.payload.fault
+      val curByte = _walkLoadRsp.payload.data(7 downto 0)
+      val changed = ((curByte ^ drainSample) & ~B"8'h18") =/= 0
+      val redo    = drainTaint || umYield
+      when(rspOk) { drainTaint := False }
+      when(rspOk && (redo || changed)) {
+        drainArmed := False
+        when(!redo) { drainDropAck := True }      // rewritten: drop, pop the entry
+      }
+      // Merged but not yet granted the store port: abandon on a yield.
+      when(drainArmed && umYield) { drainArmed := False }
+      dbgUmDrop := rspOk && !redo && changed
+      dbgUmDrop.simPublic(); drainTaint.simPublic()
+      _umRmwBusy   := drainNeedRead || drainReadPend || drainArmed || drainAckWait
+      _umRmwArming := drainArmingNow
+    }
+    _walkStore.valid              := (if (umAtomic) drainArmed && !umYield else drainArmed)
     _walkStore.payload.paddr      := drainAddrReg
     _walkStore.payload.data       := B(0, 32 bits)
     _walkStore.payload.size       := m68k040.isa.Size.LONG
@@ -1066,6 +1142,7 @@ class ItlbPlugin(entries: Int = Tlb.DefaultEntries,
     // `drainDropAck` pops an entry whose re-read faulted, so a faulting descriptor
     // cannot wedge the queue head forever.
     umq.io.drainAck := (drainAckWait && _walkStoreAck) || drainDropAck
+    umq.io.drainAck.simPublic()   // sim-only: UmAtomicRaceSpec counts drains
 
     // ── TRIPWIRE: ONE descriptor read outstanding, ever ─────────────────────────
     // The walk port carries a single outstanding transaction and its response is
