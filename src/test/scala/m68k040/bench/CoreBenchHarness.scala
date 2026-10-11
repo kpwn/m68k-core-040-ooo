@@ -849,7 +849,9 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
                           zeroFillData: Boolean = false,
                           warmupInstrs: Int = 0,
                           verifyRetirement: Seq[m68k040.lockstep.CommitObservation] => Unit = _ => (),
-                          profileRetirement: Boolean = false)
+                          profileRetirement: Boolean = false,
+                          /** Floor on the run's cycle cap (walk-heavy directed kernels). */
+                          minCycleCap: Int = 0)
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
@@ -1901,7 +1903,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       // budget costs nothing on a healthy kernel and still terminates a wedged one.
       val perMacro = if (memCfg.latency.enabled) 300 else 30
       // NB `math` alone resolves to spinal.lib.math inside this file.
-      val cap   = scala.math.max(if (memCfg.latency.enabled) 500000 else 20000, n * perMacro)
+      val cap   = scala.math.max(scala.math.max(if (memCfg.latency.enabled) 500000 else 20000, n * perMacro), k.minCycleCap)
       val debug = sys.env.contains("IPC_DEBUG")
       var lastSize = -1; var stuck = 0
       while (handle.result.size < n && guard < cap) {

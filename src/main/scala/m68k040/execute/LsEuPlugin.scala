@@ -811,9 +811,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // exception sequencer may override it below only after quiescing the SQ; when
     // it does, explicitly hold the SQ side so a command cannot be accepted under
     // the exception payload.
-    dcache.store.valid   := sq.io.drain.valid
+    // `CPU_UM_ATOMIC` (keyed off the walkers' services, null when OFF): `umLock` holds
+    // the SQ drain while a walker's U/M read-modify-write is in flight. Driven at the
+    // walker grant machine below; only this ordinary SQ leg is gated, never a walker's.
+    val umAtomicOn = walkClients.exists(_.exists(_.umRmwBusy != null))
+    val umLock: Bool = if (umAtomicOn) Bool() else null
+    dcache.store.valid   := (if (umAtomicOn) sq.io.drain.valid && !umLock else sq.io.drain.valid)
     dcache.store.payload := sq.io.drain.payload
-    sq.io.drain.ready    := dcache.store.ready
+    sq.io.drain.ready    := (if (umAtomicOn) dcache.store.ready && !umLock else dcache.store.ready)
     // The terminal response is untagged. Retain the accepted owner because
     // excActive is already high while E_DRAIN still lets ordinary SQ stores finish.
     val excStoreOutstanding = RegInit(False)
@@ -5858,6 +5863,46 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     }
     when(walkerOwnsStore) {
       when(!walkStOutstanding && !walkStSelValid) { stOwner := U(OWNER_CORE, 2 bits) }
+    }
+
+    // ── CPU_UM_ATOMIC: the U/M read-modify-write lock ─────────────────────────────
+    // A walker's U/M drain (re-read, merge, store) must not interleave with ANY other
+    // CPU store to the descriptor: an SQ store landing between the re-read and the
+    // merged store is overwritten by the stale merge, and two walkers' RMWs of one
+    // descriptor lose one update (e.g. the D-side M). So while a drain is busy:
+    //   * the SQ drain is held (`umLock`, gated at the SQ leg above), and
+    //   * the other walker may not arm (DTLB wins a same-cycle tie).
+    // LIVENESS. The drain needs a load grant and a store grant; both are denied by
+    // `quiesceHold` and the D4 walker fence, and the store grant by the exception
+    // sequencer -- and each of those three waits for the SQ to drain. So under any of
+    // them a client that does not already own the store port YIELDS: it abandons the
+    // RMW (no store; a re-read in flight is consumed and discarded) and `umLock` drops,
+    // and it re-arms with a fresh re-read when the fence is gone. A client that owns
+    // the store port completes on the D-cache alone. `umFenceR` is registered (all
+    // inputs to the lock are flops), so the lock adds no path from the fence logic.
+    if (umAtomicOn) {
+      val fence = quiesceHold || excActive || (if (d4) d4WalkerFence else False)
+      val umFenceR = RegNext(fence) init False
+      val owns = Vec(stOwner === U(OWNER_ITLB, 2 bits), stOwner === U(OWNER_DTLB, 2 bits))
+      val held = Vec(Bool(), 2)
+      for (i <- 0 until 2) {
+        walkClients(i) match {
+          case Some(c) if c.umRmwBusy != null =>
+            val y = umFenceR && !owns(i)
+            c.umRmwYield := y
+            c.umRmwReadOk := coreStOutstanding === 0
+            held(i) := c.umRmwBusy && !y
+          case _ => held(i) := False
+        }
+      }
+      umLock := held.asBits.orR
+      (walkClients(walkIdxItlb), walkClients(walkIdxDtlb)) match {
+        case (Some(ci), Some(cd)) if ci.umRmwBusy != null && cd.umRmwBusy != null =>
+          ci.umRmwBlock := cd.umRmwBusy || cd.umRmwArming
+          cd.umRmwBlock := ci.umRmwBusy
+        case _ =>
+      }
+      umLock.simPublic()
     }
 
     // ── Outstanding-transaction bookkeeping ────────────────────────────────────────

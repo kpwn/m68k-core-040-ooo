@@ -698,6 +698,18 @@ object ShippingCoreConfig {
     * Default ON (gated 2026-10-08: corpus 14 -> 12 fails, the two walk_vs_older_store_*;
     * lock-step 0; IPC unchanged); `CPU_WALK_SQ_CHECK=0` disables. */
   val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", true)
+  /** U/M descriptor update atomicity (`DtlbPlugin`/`ItlbPlugin` drain + `LsEuPlugin`).
+    * The deferred U/M update is a re-read + merged byte store issued after the owner
+    * commits, concurrently with the store queue's drain. With this ON: (1) from the
+    * drain's re-read to its store the SQ drain is held and the other TLB's drain may not
+    * start (the RMW is atomic against every other CPU store); the hold yields -- and the
+    * RMW restarts with a fresh re-read -- whenever a quiesce/exception/inhibited fence is
+    * up, so nothing that waits for the SQ can deadlock on it; (2) the update is DROPPED
+    * when the re-read descriptor byte differs from the one the walk saw in any non-U/M
+    * bit: the descriptor was rewritten after the walk by a store the 68040 orders after
+    * its locked U/M update, so that store's value is final. Cold path only.
+    * Default OFF; `CPU_UM_ATOMIC=1` enables; echoed in `SHIPPING_CONFIG`. */
+  val umAtomic: Boolean = envFlag("CPU_UM_ATOMIC", false)
 
   /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
     * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
