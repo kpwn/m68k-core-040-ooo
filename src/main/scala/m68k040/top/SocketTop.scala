@@ -703,6 +703,7 @@ object GenSocketTopVerilog {
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
             s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
+            s"gshareHistBits=${ShippingCoreConfig.gshareHistBits} " +
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
             s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
