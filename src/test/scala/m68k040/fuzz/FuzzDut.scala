@@ -215,6 +215,13 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
     faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
                        Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
+    // CPU_FE_REDIRECT_CMD (null unless the flag is on): early redirect from the replica.
+    if (host[FetchAlignPlugin].logic.earlyRedirect != null) {
+      val faE = host[FetchAlignPlugin].logic
+      faE.earlyRedirect.valid   := rob.logic.earlyFireFe
+      faE.earlyRedirect.payload := rob.logic.earlyPcReg
+      faE.earlyRedirectWins     := earlyFire && !(doFlush && !feSuppress)
+    }
 
     val faBtb = host[FetchAlignPlugin]
     val btb   = host[m68k040.frontend.BtbPlugin]

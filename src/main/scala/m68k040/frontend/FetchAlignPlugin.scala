@@ -40,7 +40,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        deferSlot1Uncond: Boolean = false,
                        deferSlot1Dbcc: Boolean = false,
                        /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
-                       feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime)
+                       feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
+                       /** `ShippingCoreConfig.feRedirectCmd` (CPU_FE_REDIRECT_CMD). */
+                       feRedirectCmd: Boolean = m68k040.top.ShippingCoreConfig.feRedirectCmd)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -186,6 +188,23 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // and does the fetch pointer end up there", so both halves must be observable.
     mispredictRedirect.valid.simPublic(); mispredictRedirect.payload.simPublic()
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
+    // CPU_FE_REDIRECT_CMD: the ROB's early (Tier-1) mispredict redirect, delivered from a
+    // REPLICATED register (`RobPlugin.earlyFireFe`, never `doFlushReg`) so the redirect
+    // target can be the fetch command of the redirect cycle itself instead of a dead,
+    // born-stale command from the old fetchPc. `earlyRedirectWins` = this target is the
+    // one `mispredictRedirect` delivers this cycle (no same-cycle doFlush override); it
+    // only reaches next-state D inputs, never the command cone.
+    // Only elaborated with the flag (null otherwise: the default netlist is untouched).
+    val earlyRedirect = if (feRedirectCmd) Flow(UInt(32 bits)) else null
+    val earlyRedirectWins = if (feRedirectCmd) Bool() else null
+    if (feRedirectCmd) {
+      earlyRedirect.valid.allowOverride;   earlyRedirect.valid   := False
+      earlyRedirect.payload.allowOverride; earlyRedirect.payload := U(0, 32 bits)
+      earlyRedirectWins.allowOverride;     earlyRedirectWins     := False
+      earlyRedirect.valid.simPublic(); earlyRedirectWins.simPublic()
+    }
+    def liveRedir = earlyRedirect.valid
+    def liveRedirWindow = earlyRedirect.payload(31 downto 3) @@ U(0, 3 bits)
 
     // axi-socket adapter D12/D16: the reset-vector reader's redirect. Declared with the
     // SAME shape as mispredictRedirect above and for the same reason -- the `redirect`
@@ -554,7 +573,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
     // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
     // bound. The delayed issue/stale state below remains an assertion oracle.
-    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlushArm
+    val issueBornStale = if (!feRedirectCmd) redirect.valid || mispredictRedirect.valid || icMaintFlushArm
+      else (redirect.valid || mispredictRedirect.valid || icMaintFlushArm) && !earlyRedirectWins
     val planLookupFire = ic.cmd.fire && !issueBornStale
     val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
     val resultExpectedValid = RegNext(planLookupFire) init False
@@ -776,16 +796,19 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // `!ftbBlocked`, which carries `!targetHoldValid`, so the only arm it could be shadowed
     // by is `predictFire`, which the outer select excludes explicitly.
     def applyWins   = applyNow && !predictFire
-    val cmdWindowPc = if (feRetime)
+    def cmdWindowPcBase = if (feRetime)
       Mux(applyWins, directTargetPc,
           Mux(predictFire, predictWindowPc, Mux(targetHoldValid, targetHoldPc, fetchPc)))
     else cmdWindowPcRef
-    val cmdDrop = if (feRetime)
+    def cmdDropBase = if (feRetime)
       Mux(applyWins, ftbRsp.payload.target(2 downto 1),
           Mux(predictFire, predictTargetReg(2 downto 1), Mux(targetHoldValid, targetHoldDrop, pendingDrop)))
     else cmdDropRef
+    // CPU_FE_REDIRECT_CMD: the early-redirect target is the OUTERMOST select (a register).
+    val cmdWindowPc = if (feRedirectCmd) Mux(liveRedir, liveRedirWindow, cmdWindowPcBase) else cmdWindowPcBase
+    val cmdDrop     = if (feRedirectCmd) Mux(liveRedir, earlyRedirect.payload(2 downto 1), cmdDropBase) else cmdDropBase
     if (feRetime) GenerationFlags.simulation {
-      assert(cmdWindowPc === cmdWindowPcRef && cmdDrop === cmdDropRef,
+      assert(cmdWindowPcBase === cmdWindowPcRef && cmdDropBase === cmdDropRef,
         "FetchAlign: CPU_FE_RETIME command PC select diverged from the reference", FAILURE)
     }
     // Amendment §2.1.1 — the SAME value that `ic.cmd.fire` writes into
@@ -797,8 +820,15 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // The action flushes the old IBuf on this edge, so its old occupancy must not block
     // the C+1 target command. Ring capacity remains physical and is never bypassed.
     val ibufRoomForCmd = ibufRoomForIssue || predictFire
-    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForCmd &&
-                         !stalled && !faultHold && !quiesce && !ftqMismatch
+    if (!feRedirectCmd) {
+      ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForCmd &&
+                           !stalled && !faultHold && !quiesce && !ftqMismatch
+    } else {
+      // The redirect cycle flushes the IBuf and clears stalled/faultHold (commonRedirect),
+      // so those occupancy/hold gates do not apply to the redirect target's command.
+      ic.cmd.valid      := started && ringSlotAvailable && (ibufRoomForCmd || liveRedir) &&
+                           (!stalled || liveRedir) && (!faultHold || liveRedir) && !quiesce && !ftqMismatch
+    }
     ic.cmd.payload.pc := cmdWindowPc
 
     when(ic.cmd.fire) {
@@ -2086,6 +2116,26 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // overrides the external one).
     when(mispredictRedirect.valid) {
       commonRedirect(mispredictRedirect.payload)
+    }
+
+    // ── CPU_FE_REDIRECT_CMD: the redirect-cycle command fetched the target window, so the
+    // sequential pointer continues after it and its ring record is live. Written after
+    // every redirect arm (mispredictRedirect is the last and wins all of them); when a
+    // same-cycle doFlush overrides the target, `earlyRedirectWins` is low and the command
+    // stays born-stale exactly as before.
+    if (feRedirectCmd) {
+      when(ic.cmd.fire && earlyRedirectWins) {
+        fetchPc             := liveRedirWindow + 8
+        pendingDrop         := 0
+        ringStale(ringTail) := False
+      }
+      GenerationFlags.simulation {
+        when(earlyRedirectWins) {
+          assert(earlyRedirect.valid && mispredictRedirect.valid &&
+                 mispredictRedirect.payload === earlyRedirect.payload,
+            "FetchAlign: CPU_FE_REDIRECT_CMD early redirect is not the delivered redirect", FAILURE)
+        }
+      }
     }
 
     // ── CPU_FE_RETIME: `ic.cmd.fire` is the LAST select of fetchPc/pendingDrop/ringStale ──

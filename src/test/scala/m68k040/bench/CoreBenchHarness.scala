@@ -207,6 +207,13 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
       faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
                          Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
+      // CPU_FE_REDIRECT_CMD (null unless the flag is on): early redirect from the replica.
+      if (host[FetchAlignPlugin].logic.earlyRedirect != null) {
+        val faE = host[FetchAlignPlugin].logic
+        faE.earlyRedirect.valid   := rob.logic.earlyFireFe
+        faE.earlyRedirect.payload := rob.logic.earlyPcReg
+        faE.earlyRedirectWins     := earlyFire && !(doFlush && !feSuppress)
+      }
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.
