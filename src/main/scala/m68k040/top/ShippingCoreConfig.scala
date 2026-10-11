@@ -811,7 +811,7 @@ object ShippingCoreConfig {
     *  - FPIAR write registered (cold); debug arch-apply int write staged + one settle cycle.
     * Cycle-changing parts (cold paths only): the staged PRF writes, the DTLB flush, FPIAR.
     * Echoed in `SHIPPING_CONFIG`. */
-  val beRetime: Boolean = envFlag("CPU_BE_RETIME", false)
+  val beRetime: Boolean = envFlag("CPU_BE_RETIME", true)
   /** Exception fast frames (review §4.7/§2.8): the ExceptionUnit's entry frame push and
     * RTE frame pop are issued as aligned LONGs where a 4-aligned frame pair allows it
     * (format-$0 push: 4 word stores -> 2 long stores, or 3 when the frame base is only
