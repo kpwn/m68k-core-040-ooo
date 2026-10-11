@@ -370,7 +370,14 @@ object ShippingCoreConfig {
     * `OFF_PERF_ITLB_WALK` (0x010A4) — already in every bitstream, never yet read.
     *
     * ⚠️ This lever CANNOT be measured on Dhrystone: the board's Dhrystone-only window
-    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder. */
+    * walks the ITLB 0.061 times per kinst. Its workload is boot and the Finder.
+    *
+    * 200 MHz (2026-09-30): the first cut cost 2.859 ns (eight levers + it: WNS -2.882,
+    * without it -0.023). REGISTERED (`ItlbPlugin`'s `vic` Area: promote/launch +2
+    * cycles, insert +1, generation-tagged invalidation) the same eight + it close at
+    * WNS -0.237 with NO ItlbPlugin path in the worst 200 (tail = D-cache/LSU/Icache
+    * hubs; 0.2 ns vs -0.023 is inside placement noise). 100 MHz ITLB_VICTIM=32 alone
+    * boots to the Finder. Still OFF pending the `OFF_PERF_ITLB_WALK` board A/B. */
   val itlbVictimEntries: Int = sys.env.get("ITLB_VICTIM") match {
     case Some(s) =>
       val n = try s.toInt catch {
@@ -380,7 +387,7 @@ object ShippingCoreConfig {
       require(n == 0 || (n >= 2 && n <= 64),
         s"ITLB_VICTIM must be 0 (off) or 2..64, got $n")
       n
-    case None => 0
+    case None => 32
   }
 
   /** Store-queue (and its lock-step `pendMem` replay ring) depth. Default 8 = OFF.
@@ -529,6 +536,21 @@ object ShippingCoreConfig {
     * extra cycle after an inhibited access), and replicates the SQ forward-query select
     * `p4RetryQ`. Effective only with `lsOooIssue` (park) / `p3FastLoad`. Echoed in `SHIPPING_CONFIG`. */
   val lsParkRetime: Boolean = envFlag("CPU_LS_PARK_RETIME", true)
+  /** Front-end / decode timing-closure round 2 (`CPU_FE_RETIME`, default OFF pending the
+    * PM's 200 MHz build). Cycle-identical restructurings of the fetch/align/decode cones:
+    * per-candidate slot-1 eligibility in `Aligner` (ungated IBuf predecode), IBuf head/count
+    * next-state candidates selected by the late `suppressSlot1`, slot-1 suppress/training
+    * terms factored off `slot1Valid`, `ic.cmd.fire` as the LAST select of the
+    * fetchPc/ringStale/pendingDrop next-state, FTB-applied target as the last
+    * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
+    * Every arm carries a simulation-only oracle against the original expression. */
+  val feRetime: Boolean = envFlag("CPU_FE_RETIME", false)
+  /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
+    * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
+    * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
+    * outermost `cmdWindowPc` select) instead of a born-stale command from the old fetchPc:
+    * one cycle off every early-redirect restart. Echoed in `SHIPPING_CONFIG`. */
+  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", false)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
@@ -689,6 +711,20 @@ object ShippingCoreConfig {
     * Default OFF; `CPU_UM_ATOMIC=1` enables; echoed in `SHIPPING_CONFIG`. */
   val umAtomic: Boolean = envFlag("CPU_UM_ATOMIC", false)
 
+  /** DTLB victim buffer depth (`CPU_DTLB_VICTIM`), 0 = OFF and elaborates NO hardware.
+    * Same registered design as the ITLB's (`ITLB_VICTIM`): a fully associative buffer of
+    * the array's evictions, probed one cycle after a PRIMARY miss from `missReqReg`
+    * flops (never on the hit path); a hit is promoted back and answered like an array
+    * hit, a miss launches the walk one cycle later than before. Trace model (MAME 7.5.3,
+    * 2026-10-10): the 8-set x 4-way DTLB thrashes on set conflicts at 8 KB pages; 32
+    * entries on both TLBs = -80% walks (trace, not silicon). Reaches every harness via
+    * the `DtlbPlugin` constructor default; echoed in SHIPPING_CONFIG. */
+  val dtlbVictimEntries: Int = {
+    val n = envInt("CPU_DTLB_VICTIM", 32, 0, 64)
+    require(n != 1, "CPU_DTLB_VICTIM must be 0 (off) or 2..64")
+    n
+  }
+
   /** ROB: let a resolved CORRECTLY-predicted branch that ends its macro retire in slot 0
     * alongside a non-branch slot-1 uop (`RobPlugin.pairCorrectBranch`). Default OFF = every
     * branch retires alone. Default ON (gated 2026-10-09); `CPU_PAIR_CORRECT_BRANCH=0` disables; echoed in `SHIPPING_CONFIG`. */
@@ -712,9 +748,20 @@ object ShippingCoreConfig {
     * (ParamPlugin requires they agree). The history used in the index is
     * min(GHR bits = 16, idx bits), so a deeper table also uses more history.
     * Default 2048 = the old frozen 11-bit index; echoed in `SHIPPING_CONFIG`. */
-  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 2048, 2048, 16384)
+  val gshareEntries: Int = envInt("CPU_GSHARE_ENTRIES", 8192, 2048, 16384)
   require(Seq(2048, 4096, 8192, 16384).contains(gshareEntries),
     s"CPU_GSHARE_ENTRIES must be 2048, 4096, 8192 or 16384 (got $gshareEntries)")
+
+  /** gshare history length folded into the PHT index (`CPU_GSHARE_HIST_BITS`, 2..16).
+    * 0 (default) = the old rule min(GHR_BITS = 16, log2(CPU_GSHARE_ENTRIES)), so the
+    * default is bit-identical. A non-zero value decouples history length from table
+    * depth (e.g. 8192 entries with 11 history bits spends the extra index bits on PC,
+    * i.e. on aliasing rather than on longer history). With CPU_GHR_TRIM the stored
+    * `ghr`/`ghrArch` width follows it. Values above log2(entries) XOR-fold the excess
+    * history into the low index bits (the untrimmed pre-2026-09-25 shape). Echoed in
+    * `SHIPPING_CONFIG`. */
+  val gshareHistBits: Int = envInt("CPU_GSHARE_HIST_BITS", 10, 0, 16)
+  require(gshareHistBits != 1, "CPU_GSHARE_HIST_BITS must be 0 (auto) or 2..16")
 
   /** ROB: drive `flushing` (-> `rc.flushPort`, `headReady`, the ROB pointer/count resets
     * and every other in-ROB `flushing` use) from the REGISTERED `backendSquash` flop instead
@@ -757,4 +804,17 @@ object ShippingCoreConfig {
     * `cand1`. Read by `IssueQueuePlugin` (default) and by every two-ALU harness for eu1
     * (`AluEuPlugin(lean = ...)`). Default ON (gated 2026-10-08); `CPU_ALU1_LEAN=0` disables; echoed in `SHIPPING_CONFIG`. */
   val alu1Lean: Boolean = envFlag("CPU_ALU1_LEAN", true)
+  /** Exception fast frames (review §4.7/§2.8): the ExceptionUnit's entry frame push and
+    * RTE frame pop are issued as aligned LONGs where a 4-aligned frame pair allows it
+    * (format-$0 push: 4 word stores -> 2 long stores, or 3 when the frame base is only
+    * 2-aligned; RTE pop: 4 word loads -> 2 long loads when the frame is 4-aligned).
+    * Read by `ExceptionUnit` via `RobPlugin`. Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFastFrames: Boolean = envFlag("CPU_EXC_FAST_FRAMES", true)
+  /** Exception frames on COPYBACK pages (review §4.7 option i): the entry frame push uses
+    * the stack page's own cache mode when it is COPYBACK (CACR.DE=1), so each frame store
+    * acks from the L1D array instead of a write-through AXI B round trip. Residual
+    * difference: a push that MISSES and whose write-allocate refill bus-errors halts the
+    * core through the D-cache diagnostic fault instead of the exception unit's
+    * DOUBLE_FAULT (both halt). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val excFramesCopyback: Boolean = envFlag("CPU_EXC_FRAMES_COPYBACK", true)
 }

@@ -53,7 +53,8 @@ import spinal.lib.misc.plugin.FiberPlugin
   * perf loss. */
 class GsharePlugin(retainRedirectHistory: Boolean = false,
                    interleaved: Boolean = m68k040.top.ShippingCoreConfig.gshareInterleaved,
-                   ghrTrim: Boolean = m68k040.top.ShippingCoreConfig.ghrTrim) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
+                   ghrTrim: Boolean = m68k040.top.ShippingCoreConfig.ghrTrim,
+                   histBits: Int = m68k040.top.ShippingCoreConfig.gshareHistBits) extends FiberPlugin with GshareUpdateService with GshareWindowService with GshareSecondaryLookupService {
 
   // ---- public update port (exposed via the service; the ROB drives it at retire) ----
   // Declared at build (idxBits known then); the service accessor reads logic.updateFlow.
@@ -76,7 +77,12 @@ class GsharePlugin(retainRedirectHistory: Boolean = false,
     // `(arch << count) | suffix` -- moves bits only UPWARD. So bit k of every register
     // depends only on bits <= k, and the bits above the fold are dead. Store only the
     // folded width. Follows CPU_GSHARE_ENTRIES through idxBits.
-    val ghrBits    = if (ghrTrim) scala.math.min(Global.GHR_BITS.get, idxBits) else Global.GHR_BITS.get
+    // CPU_GSHARE_HIST_BITS (histBits > 0) overrides the folded history length; 0 keeps
+    // min(GHR_BITS, idxBits), so the default elaborates exactly as before.
+    require(histBits == 0 || (histBits >= 2 && histBits <= Global.GHR_BITS.get),
+      s"gshare histBits=$histBits must be 0 (auto) or in [2, GHR_BITS=${Global.GHR_BITS.get}]")
+    val idxHistBits = if (histBits > 0) histBits else scala.math.min(Global.GHR_BITS.get, idxBits)
+    val ghrBits    = if (ghrTrim) idxHistBits else Global.GHR_BITS.get
     require(idxBits == Global.PHT_IDX_W,
       s"gshare idxBits=$idxBits disagrees with the carried-index width Global.PHT_IDX_W=${Global.PHT_IDX_W}")
 
@@ -135,7 +141,6 @@ class GsharePlugin(retainRedirectHistory: Boolean = false,
     // index (DecodePacket, BranchPredRec, RenamedUop, BranchCompletion, the FTQ entry, the
     // ROB's branch-train record and GshareUpdate) is sized from it, so a deeper table also
     // folds min(ghrBits, idxBits) history bits.
-    val idxHistBits = scala.math.min(ghrBits, idxBits)
     def foldedHistory: UInt = fold(ghr(idxHistBits - 1 downto 0))
     def indexOf(pc: UInt): UInt = fold(pc(31 downto 1)) ^ foldedHistory
 

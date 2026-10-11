@@ -18,7 +18,10 @@ import spinal.lib.misc.plugin.FiberPlugin
   *
   * FSM: IDLE → REFILL → REPLAY → IDLE.
   */
-class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchService {
+class IcachePlugin(val predecodeWords: Int = 16,
+                   /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). */
+                   feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime)
+    extends FiberPlugin with FetchService {
   require(predecodeWords == 8 || predecodeWords == 16)
 
   // ---- geometry (single source of truth) ----
@@ -413,7 +416,13 @@ class IcachePlugin(val predecodeWords: Int = 16) extends FiberPlugin with FetchS
     // slowdown, it is a livelock: the drain condition can never be met by a machine
     // that needs the fetch to make progress. IE belongs on the ARRAY decisions above
     // and nowhere near this one.
-    val inhibitedSpecBlock = !lookupPageCacheable && !nonSpecFetch
+    // CPU_FE_RETIME: use the translation provider's fast conservative verdict when it
+    // offers one (ItlbPlugin). It is True whenever the page is inhibited, so this gate
+    // refuses at least every command the original refuses; it may additionally refuse on
+    // a multi-hot / latch-disagreeing lookup, which only waits for `nonSpecFetch`.
+    def pageMayBeInhibited =
+      if (feRetime && xlate.rsp.inhibitHint != null) xlate.rsp.inhibitHint else !lookupPageCacheable
+    val inhibitedSpecBlock = pageMayBeInhibited && !nonSpecFetch
     inhibitedSpecBlock.simPublic()
 
     // ---- install-context latches (M2c: NOT part of the MSHR control file) ----

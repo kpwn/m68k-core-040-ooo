@@ -47,12 +47,19 @@ import org.scalatest.funsuite.AnyFunSuite
   * at the bottom of this file. */
 class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
-  class Dut extends Component {
+  /** `legacy` pins the blocking L1D (see `DcacheTestBuild`): the load-miss store barrier
+    * and the victim-snapshot S3 forwards that several tests below exist to exercise are
+    * mechanisms of that FSM only. Everything else runs on the shipping L1D. */
+  class Dut(legacy: Boolean) extends Component {
     val db   = new Database
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin()
+    private val b = if (legacy) DcacheTestBuild.Legacy else DcacheTestBuild.Shipping
+    val dcache = new DcachePlugin(nonBlocking = b.nonBlocking, hotDoor = b.hotDoor,
+      nbEarlyResponse = b.nbEarlyResponse, nbEagerAr = b.nbEagerAr,
+      nbPreselectAr = b.nbPreselectAr, nbDynamicRelease = b.nbDynamicRelease,
+      nbProbeMissStage = b.nbProbeMissStage)
     val probe  = new DcacheProbePlugin
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe)) }
   }
@@ -61,7 +68,12 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
   /** One shared verilator build for every test in this spec (the same-way sweeps below
     * are 11 offsets each; the DUT is identical for all of them). */
-  lazy val compiled = simConfig.compile(new Dut)
+  lazy val compiled = simConfig.compile(new Dut(legacy = false))
+  /** The blocking L1D, for the mechanism tests that only it has. */
+  lazy val legacyCompiled = simConfig.compile(new Dut(legacy = true))
+  /** The same-way sweeps run on BOTH builds: their data checks hold for either L1D. */
+  def sweepBuilds: Seq[(String, () => spinal.core.sim.SimCompiled[Dut])] =
+    Seq("" -> (() => compiled), ", blocking L1D" -> (() => legacyCompiled))
 
   def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt
   def preload(mem: BehavioralMemAgent, base: Long, n: Int): Unit =
@@ -106,7 +118,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     compiled.doSim("runtimeResetInvalidatesDcache", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid #= false
       cd.waitSampling(5)
@@ -137,7 +150,8 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
        VerilatorTest) {
     compiled.doSim("sameSetDrainRefillRace", 1) { dut =>
       dut.clockDomain.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, dut.clockDomain)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, dut.clockDomain, new BehavioralMemAgent(dut.dcache.logic.axi, dut.clockDomain))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid   #= false
       dut.clockDomain.waitSampling(5)
@@ -274,7 +288,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
     fork {
       while (true) {
         cd.waitSampling()
-        if (dut.dcache.logic.axi.ar.valid.toBoolean && dut.dcache.logic.axi.ar.ready.toBoolean) arCount += 1
+        if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) arCount += 1
         if (dut.dcache.logic.loadMissStoreBarrier.toBoolean &&
             dut.dcache.logic.stS1Valid.toBoolean) barrierHit = true
       }
@@ -323,20 +337,21 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // The result/write boundary moved from S2 to S3 in the II=1 pipeline. Keep a
   // deliberately wider window than the historical 0..10 sweep so the non-vacuity
   // witness follows that registered cycle instead of silently missing it.
-  for (storeCycle <- 0 to 18) {
+  for ((bname, bc) <- sweepBuilds; storeCycle <- 0 to 18) {
     test(s"same-WAY different-SET refill must not silently drop a store-S2 array " +
-         s"write (WRITETHROUGH, storeCycle=$storeCycle)", VerilatorTest) {
-      compiled.doSim(s"sameWayWt_$storeCycle", 1) { dut =>
+         s"write (WRITETHROUGH, storeCycle=$storeCycle$bname)", VerilatorTest) {
+      bc().doSim(s"sameWayWt_$storeCycle", 1) { dut =>
         val cd = dut.clockDomain
         cd.forkStimulus(10)
-        val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+        val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         dut.probe.logic.loadCmdIn.valid #= false
         dut.probe.logic.storeIn.valid   #= false
         cd.waitSampling(5)
         warmSameWaySetup(dut, cd, mem)
 
         val race = raceSameWay(dut, cd, storeCycle, CacheMode.WRITETHROUGH)
-        if (race.barrierHit) wtBarrierHitAny = true
+        if (race.barrierHit && !dut.dcache.nonBlocking) wtBarrierHitAny = true
 
         // Scenario sanity: the racing refill must actually have happened (otherwise
         // the assertions below would be vacuously satisfied).
@@ -363,26 +378,27 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   }
 
   test("I2 scenario sanity: the load-miss barrier parked a WRITETHROUGH store in S1 " +
-       "for at least one sweep offset", VerilatorTest) {
+       "for at least one blocking-L1D sweep offset", VerilatorTest) {
     assert(wtBarrierHitAny,
       "NONE of the WRITETHROUGH sweep offsets exercised loadMissStoreBarrier with a " +
       "resident store-S1; the data checks above would not prove the repaired race")
   }
 
-  for (storeCycle <- 0 to 18) {
+  for ((bname, bc) <- sweepBuilds; storeCycle <- 0 to 18) {
     test(s"same-WAY different-SET refill must not leave a COPYBACK line dirty with " +
-         s"stale data (storeCycle=$storeCycle)", VerilatorTest) {
-      compiled.doSim(s"sameWayCb_$storeCycle", 1) { dut =>
+         s"stale data (storeCycle=$storeCycle$bname)", VerilatorTest) {
+      bc().doSim(s"sameWayCb_$storeCycle", 1) { dut =>
         val cd = dut.clockDomain
         cd.forkStimulus(10)
-        val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+        DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+        val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
         dut.probe.logic.loadCmdIn.valid #= false
         dut.probe.logic.storeIn.valid   #= false
         cd.waitSampling(5)
         warmSameWaySetup(dut, cd, mem)
 
         val race = raceSameWay(dut, cd, storeCycle, CacheMode.COPYBACK)
-        if (race.barrierHit) cbBarrierHitAny = true
+        if (race.barrierHit && !dut.dcache.nonBlocking) cbBarrierHitAny = true
         assert(race.arCount == 1, s"scenario sanity: expected exactly one racing refill AR, got ${race.arCount}")
 
         // A COPYBACK-hit store resolves ENTIRELY on-chip: the ONLY copy of the stored
@@ -404,7 +420,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   }
 
   test("I2 scenario sanity: the load-miss barrier parked a COPYBACK store in S1 " +
-       "for at least one sweep offset", VerilatorTest) {
+       "for at least one blocking-L1D sweep offset", VerilatorTest) {
     assert(cbBarrierHitAny,
       "NONE of the COPYBACK sweep offsets exercised loadMissStoreBarrier with a " +
       "resident store-S1; the data checks above would not prove the repaired race")
@@ -418,10 +434,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // then relaunches after the allocation ack.
   test("same-set younger COPYBACK hit parks behind a drain miss and resumes exactly once",
        VerilatorTest) {
-    compiled.doSim("sameSetMissBarrier", 1) { dut =>
+    legacyCompiled.doSim("sameSetMissBarrier", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid   #= false
       val set = 40L
@@ -482,10 +499,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
   // the presence of a barrier pulse, and proves the exact race was reached.
   test("load dirty-victim snapshot parks an older store-S1 until refill completes",
        VerilatorTest) {
-    compiled.doSim("loadVictimStoreS1", 1) { dut =>
+    legacyCompiled.doSim("loadVictimStoreS1", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid   #= false
       cd.waitSampling(5)
@@ -528,8 +546,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
           if (dut.dcache.logic.loadMissStoreBarrier.toBoolean &&
               dut.dcache.logic.stS1Valid.toBoolean) sawHeldS1 = true
           if (dut.dcache.logic.storeAckReg.toBoolean) measuredAcks += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) refillArs += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean &&
               dut.dcache.logic.axi.aw.ready.toBoolean &&
               ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
@@ -583,10 +600,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
   test("load dirty-victim snapshot forwards the same-cycle S3 store result",
        VerilatorTest) {
-    compiled.doSim("loadVictimFromS3", 1) { dut =>
+    legacyCompiled.doSim("loadVictimFromS3", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid #= false
       cd.waitSampling(5)
@@ -620,8 +638,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
             s"fwd=${dut.dcache.logic.loadVictimFromS3Dbg.toBoolean}"
           if (dut.dcache.logic.loadVictimFromS3Dbg.toBoolean) sawForward = true
           if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) refillArs += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean &&
               dut.dcache.logic.axi.aw.ready.toBoolean &&
               ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
@@ -665,10 +682,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
   test("load dirty-victim read launch forwards the prior-cycle S3 store result",
        VerilatorTest) {
-    compiled.doSim("loadVictimFromS3Launch", 1) { dut =>
+    legacyCompiled.doSim("loadVictimFromS3Launch", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid #= false
       cd.waitSampling(5)
@@ -691,8 +709,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
               dut.dcache.logic.stS3WriteD1.toBoolean) sawLaunchCollision = true
           if (dut.dcache.logic.loadVictimFromS3Dbg.toBoolean) sawForward = true
           if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) refillArs += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean &&
               dut.dcache.logic.axi.aw.ready.toBoolean &&
               ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
@@ -742,10 +759,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
   test("COPYBACK miss victim snapshot forwards the preceding S3 store result",
        VerilatorTest) {
-    compiled.doSim("storeVictimFromS3", 1) { dut =>
+    legacyCompiled.doSim("storeVictimFromS3", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid #= false
       cd.waitSampling(5)
@@ -765,8 +783,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
           cd.waitSampling()
           if (dut.dcache.logic.storeVictimFromS3Dbg.toBoolean) sawForward = true
           if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) refillArs += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean &&
               dut.dcache.logic.axi.aw.ready.toBoolean &&
               ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))
@@ -802,10 +819,11 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
 
   test("COPYBACK miss victim read launch forwards the prior-cycle S3 store result",
        VerilatorTest) {
-    compiled.doSim("storeVictimFromS3Launch", 1) { dut =>
+    legacyCompiled.doSim("storeVictimFromS3Launch", 1) { dut =>
       val cd = dut.clockDomain
       cd.forkStimulus(10)
-      val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+      DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+      val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
       dut.probe.logic.loadCmdIn.valid #= false
       dut.probe.logic.storeIn.valid #= false
       cd.waitSampling(5)
@@ -828,8 +846,7 @@ class DcacheDrainRefillRaceSpec extends AnyFunSuite {
               dut.dcache.logic.stS3WriteD1.toBoolean) sawLaunchCollision = true
           if (dut.dcache.logic.storeVictimFromS3Dbg.toBoolean) sawForward = true
           if (dut.dcache.logic.storeAckReg.toBoolean) storeAcks += 1
-          if (dut.dcache.logic.axi.ar.valid.toBoolean &&
-              dut.dcache.logic.axi.ar.ready.toBoolean) refillArs += 1
+          if (m68k040.cache.DcacheTestAxi.arFire(dut.dcache)) refillArs += 1
           if (dut.dcache.logic.axi.aw.valid.toBoolean &&
               dut.dcache.logic.axi.aw.ready.toBoolean &&
               ((dut.dcache.logic.axi.aw.payload.addr.toLong & ~0xfL) == line(0)))

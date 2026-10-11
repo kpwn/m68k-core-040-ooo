@@ -8,4 +8,6 @@ object DcacheTestGeometry {
   val SetMask: Long    = (Sets - 1).toLong
   val WayStride: Long  = Sets.toLong * 16L
   def setOf(addr: Long): Int = ((addr >> 4) & SetMask).toInt
+  /** The same geometry as a `CacheGeometry` (set/tag split of a physical address). */
+  val Geo: CacheGeometry = CacheGeometry(cacheBytes = Sets * 64, lineBytes = 16, ways = 4)
 }

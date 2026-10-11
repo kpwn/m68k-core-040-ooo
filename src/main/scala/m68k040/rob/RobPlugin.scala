@@ -56,7 +56,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
                 /** See `ShippingCoreConfig.flushFromSquash`. */
                 val flushFromSquash: Boolean = m68k040.top.ShippingCoreConfig.flushFromSquash,
                 /** See `ShippingCoreConfig.coldWbShare`. */
-                val coldWbShare: Boolean = m68k040.top.ShippingCoreConfig.coldWbShare) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
+                val coldWbShare: Boolean = m68k040.top.ShippingCoreConfig.coldWbShare) extends FiberPlugin with CommitTraceService with RobAllocService with RedirectService with BtbUpdateService with GshareUpdateService with PrivilegeService with CacheControlService with FrontendQuiesceService with DebugCommitService with DebugSystemStateService with DebugHistoryService with SerializedMemoryContextService with m68k040.services.RobPerfDetailService with m68k040.services.ExceptionPerfService with m68k040.services.PredictorHistoryRecoveryService with m68k040.services.RobRetirementService with m68k040.services.DebugLoadPreemptService with m68k040.services.RobLsReplayService {
   require(Set(0, 4, 8, 16)(preparedRetireEntries))
   private var lsReplayWire: Flow[UInt] = null
   override def lsReplay: Flow[UInt] = lsReplayWire
@@ -85,6 +85,11 @@ class RobPlugin(val detailedPerf: Boolean = false,
   }
   override def robPerfEvents: Option[Bits] = perfEventsWire
   override def robPerfRetirement: Option[Bits] = perfRetirementWire
+  // ExceptionPerfService: setup-allocated wire (same pattern as above), driven from
+  // `exc.perfEvents` in logic.
+  private var excPerfEventsWire: Bits = null
+  during setup { excPerfEventsWire = Bits(5 bits) }
+  override def excPerfEvents: Bits = excPerfEventsWire
 
   // PrivilegeService: the wire is allocated in `setup` (BEFORE any plugin's `build`
   // runs) and driven inside `logic` (build) below, mirroring TranslationService's
@@ -3124,6 +3129,7 @@ class RobPlugin(val detailedPerf: Boolean = false,
       perfRetirementWire.get := retirement
       events.simPublic()
     }) else None
+    excPerfEventsWire := exc.perfEvents
     // Drive the forward-declared committed-S (the privilege check gates on it).
     committedS := exc.ss.s
     // PrivilegeService's SFC/DFC half -- combinational passthrough of the two
@@ -3849,6 +3855,12 @@ class RobPlugin(val detailedPerf: Boolean = false,
       bcInFlight && !flushing && !excActive && !coreHalted && !debugQuiesceActive &&
       (!earlyPend || (bcAge < curAge))
     earlyFire := earlyArm
+    // CPU_FE_REDIRECT_CMD: a REPLICA of `earlyFire` that drives only FetchAlign's
+    // outermost fetch-command select, so that select never shares `earlyFire`'s fanout.
+    val earlyFireFe = if (m68k040.top.ShippingCoreConfig.feRedirectCmd) {
+      val r = RegNext(earlyArm) init False
+      r.addAttribute("dont_touch", "true"); r.simPublic(); r
+    } else null
     when(earlyArm) {
       earlyPend  := True
       earlyRobId := branchCompletion.payload.robId

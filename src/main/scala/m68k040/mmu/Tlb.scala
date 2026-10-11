@@ -66,7 +66,9 @@ object Tlb {
 class Tlb(entries: Int = Tlb.DefaultEntries,
           ways: Int = Tlb.DefaultWays,
           banks: Int = Tlb.DefaultBanks,
-          reportEvictions: Boolean = false) extends Component {
+          reportEvictions: Boolean = false,
+          /** CPU_FE_RETIME (I-side only): export `io.hitInhibited`. */
+          inhibitHint: Boolean = false) extends Component {
   require(isPow2(banks), "banks must be a power of two")
   require(isPow2(ways), "ways must be a power of two")
   require(entries % (ways * banks) == 0, "entries must divide evenly into ways*banks")
@@ -84,6 +86,12 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
     val lookupSup = in Bool ()
     val hit       = out Bool ()
     val hitEntry  = out(TlbEntry())
+    // CPU_FE_RETIME only: OR over ways of (hit && cacheMode == INHIBITED). Per-way decode in
+    // parallel with the tag compare, so the I-cache speculation gate does not wait for the
+    // one-hot entry mux + cacheMode decode. Equals `hit && hitEntry.cacheMode ==
+    // INHIBITED` whenever the hit vector is one-hot; on a multi-hot (reported as a MISS)
+    // it may read True, which only ever makes the consumer more conservative.
+    val hitInhibited = if (inhibitHint) out Bool () else null
 
     val fillValid = in Bool ()
     val fillVpn   = in UInt (Tlb.VpnBits bits)
@@ -234,6 +242,10 @@ class Tlb(entries: Int = Tlb.DefaultEntries,
   val lkMultiHot = OneHotSafe.multiHot(hitVec)
   io.hit      := OneHotSafe.exactlyOne(hitVec)
   io.hitEntry := MuxOH(hitVec, entVec)
+  if (inhibitHint) {
+    io.hitInhibited := (hitVec.asBits &
+      Vec(entVec.map(_.cacheMode === m68k040.cache.CacheMode.INHIBITED)).asBits).orR
+  }
   // sim-only: the tripwire that keeps the one-hot invariant honest, KEPT so the
   // condition stays loud in simulation rather than being silently absorbed by the
   // fail-safe above. Nothing in the fill path checks whether the VPN is already

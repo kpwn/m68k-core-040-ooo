@@ -100,8 +100,11 @@ class SqCoalesceStressSpec extends AnyFunSuite {
     }
   }
 
-  class Dut(coalesce: Boolean, noFill: Boolean, sqMut: Int, dcMut: Int, dropAckAt: Int)
-      extends Component {
+  /** `noFill` selects FULL-LINE NO-FILL. Under the non-blocking L1D it is native (always
+    * on) and the legacy `fullLineNoFill` hook must stay off; `legacy` pins the blocking
+    * L1D, whose hook (and its `noFillMutation`) is the only build that has one. */
+  class Dut(coalesce: Boolean, noFill: Boolean, sqMut: Int, dcMut: Int, dropAckAt: Int,
+            val legacy: Boolean = false) extends Component {
     val sq = new StoreQueue(8, coalesceLines = coalesce, coalesceHold = 16,
                             coalesceMutation = sqMut)
     val allocIn   = slave(Flow(SqAlloc()))
@@ -161,16 +164,21 @@ class SqCoalesceStressSpec extends AnyFunSuite {
     val host = db on (new PluginHost)
     val param  = new ParamPlugin(M68kParams())
     val xlate  = new DIdentityTranslationPlugin
-    val dcache = new DcachePlugin(sectored = false, fullLineNoFill = noFill, noFillMutation = dcMut)
+    private val b = if (legacy) DcacheTestBuild.Legacy else DcacheTestBuild.Shipping
+    val dcache = new DcachePlugin(sectored = false,
+      fullLineNoFill = noFill && !b.nonBlocking, noFillMutation = dcMut,
+      nonBlocking = b.nonBlocking, hotDoor = b.hotDoor, nbEarlyResponse = b.nbEarlyResponse,
+      nbEagerAr = b.nbEagerAr, nbPreselectAr = b.nbPreselectAr,
+      nbDynamicRelease = b.nbDynamicRelease, nbProbeMissStage = b.nbProbeMissStage)
     val bridge = new Bridge(sq, dropAckAt)
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, bridge)) }
   }
 
   private val compiled = mutable.Map.empty[String, spinal.core.sim.SimCompiled[Dut]]
   private def dut(tag: String, coalesce: Boolean, noFill: Boolean, sqMut: Int = 0,
-                  dcMut: Int = 0, dropAckAt: Int = -1) =
+                  dcMut: Int = 0, dropAckAt: Int = -1, legacy: Boolean = false) =
     compiled.getOrElseUpdate(tag, M68kSim().withVerilator.workspaceName(s"sqcoal_$tag")
-      .compile(new Dut(coalesce, noFill, sqMut, dcMut, dropAckAt)))
+      .compile(new Dut(coalesce, noFill, sqMut, dcMut, dropAckAt, legacy)))
 
   // ── address map ───────────────────────────────────────────────────────────────
   // Cacheable window: 4 sets x 6 tags, one L1D way apart (2 KiB at 8 KiB, 4 KiB at 16 KiB),
@@ -199,8 +207,8 @@ class SqCoalesceStressSpec extends AnyFunSuite {
     val rnd = new scala.util.Random(seed)
     val cd = d.clockDomain
     cd.forkStimulus(10)
-    val mem = new BehavioralMemAgent(d.dcache.logic.axi, cd,
-      dcfg = m68k040.sim.AxiMemModelConfig(injectBusErrors = true))
+    val mem = m68k040.sim.HotDoorAttach(d.dcache, cd, new BehavioralMemAgent(d.dcache.logic.axi, cd,
+      dcfg = m68k040.sim.AxiMemModelConfig(injectBusErrors = true)))
     val st = Stats()
     val shadow = mutable.Map.empty[Long, Int]
     for (l <- cLines ++ iLines; i <- 0 until 16) { mem.pokeByte(l + i, initByte(l + i)); shadow(l + i) = initByte(l + i) }
@@ -232,8 +240,8 @@ class SqCoalesceStressSpec extends AnyFunSuite {
         if (d.coalFire.toBoolean) st.coalesced += 1
         if (d.coalHold.toBoolean) st.holdCyc += 1
         if (d.coalTimeout.toBoolean) st.timeouts += 1
-        if (noFill && d.dcache.logic.noFillAlloc.toBoolean) st.noFills += 1
-        if (d.dcache.logic.axi.ar.valid.toBoolean && d.dcache.logic.axi.ar.ready.toBoolean) st.ar += 1
+        if (noFill && d.dcache.fullLineNoFill && d.dcache.logic.noFillAlloc.toBoolean) st.noFills += 1
+        if (m68k040.cache.DcacheTestAxi.arFire(d.dcache)) st.ar += 1
       }
     }
 
@@ -345,6 +353,7 @@ class SqCoalesceStressSpec extends AnyFunSuite {
       p.payload.vaddr #= addr; p.payload.paddr #= addr
       p.payload.size #= Size.LONG; p.payload.cacheMode #= CacheMode.COPYBACK
       p.payload.token #= 0
+      m68k040.cache.DcacheTestAxi.inOrderLoadDefaults(p)
       var n = 0
       while (!(p.ready.toBoolean && p.valid.toBoolean)) { tick(); n += 1
         if (n > 5000) throw new AssertionError(s"seed $seed: load 0x${addr.toHexString} never accepted") }
@@ -442,6 +451,8 @@ class SqCoalesceStressSpec extends AnyFunSuite {
       if (n > 200000) throw new AssertionError(s"seed $seed: CPUSH-all never finished") }
     cd.waitSampling(8)
     mon.terminate()
+    // Non-blocking L1D: full-line no-fill is native; its sim counter is the evidence.
+    if (d.dcache.nonBlocking) st.noFills = d.dcache.logic.nb.ctrMap("noFillAllocs").toLong
     val bad = shadow.toSeq.sortBy(_._1).filter { case (a, v) => (mem.peekByte(a) & 0xff) != v }
     assert(bad.isEmpty, s"seed $seed: ${bad.size} MEMORY BYTES WRONG after CPUSH, first: " +
       bad.take(8).map { case (a, v) => f"0x$a%08x mem=0x${mem.peekByte(a) & 0xff}%02x exp=0x$v%02x" }.mkString(", "))
@@ -481,7 +492,8 @@ class SqCoalesceStressSpec extends AnyFunSuite {
 
   // ── MUTANTS: each MUST fail. A mutant that survives means the stress is blind. ──
   private def mustFail(tag: String, sqMut: Int = 0, dcMut: Int = 0, dropAckAt: Int = -1): Unit = {
-    val c = dut(tag, coalesce = true, noFill = true, sqMut, dcMut, dropAckAt)
+    // `noFillMutation` lives in the legacy no-fill hook only: a D-cache mutant pins that L1D.
+    val c = dut(tag, coalesce = true, noFill = true, sqMut, dcMut, dropAckAt, legacy = dcMut != 0)
     val caught = (1L to 4L).exists { s =>
       try { c.doSim(s"mut_seed$s") { d => stress(d, s, OPS, noFill = true) }; false }
       catch { case t: Throwable => println(s"[sqcoal] MUTANT $tag seed=$s caught: " +

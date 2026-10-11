@@ -83,3 +83,8 @@ case class RobPerfState() extends Bundle {
   val last0, last1, alone0, alone1, redirect, mispredict = Bool()
   val kind = UInt(3 bits)
 }
+
+/** Sole producer: RobPlugin (it owns the ExceptionUnit). Bit layout is
+  * `ExceptionUnit.perfEvents`: [0] entry, [1] A-line entry, [2] interrupt entry,
+  * [3] RTE completed, [4] sequencer-active cycle. Always present when the ROB is. */
+trait ExceptionPerfService { def excPerfEvents: Bits }
