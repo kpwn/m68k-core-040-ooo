@@ -893,6 +893,11 @@ trait CoreBenchHarness extends AnyFunSuite {
                                robOcc: Int = 0, duValid: Boolean = false, renStall: Int = 0)
       val lsOrderHisto = ArrayBuffer.empty[LsOrderSample]
       val specWakeHisto = ArrayBuffer.empty[(Boolean, Boolean)]
+      // CPU_LS_SPEC_WAKE_ALU (B2) per-cycle bitmask: 1 announce, 2 confirm (the
+      // announced load's wake came next cycle), 4 spec-ready slot present, 8 select kill,
+      // 16 any held, 32/64 grants on port 0/1, 128/256 hold starts (failed confirm).
+      val specAluHisto = ArrayBuffer.empty[Int]
+      val specAluOn = dut.iq.logic.specAluOn
       val sqForwardHisto = ArrayBuffer.empty[Boolean]
       val lateStoreHisto = ArrayBuffer.empty[Boolean]
       val reserveStoreHisto = ArrayBuffer.empty[(Boolean, Boolean, Boolean)]
@@ -1527,6 +1532,17 @@ trait CoreBenchHarness extends AnyFunSuite {
           dut.lsEu.wakeupSpec.valid.toBoolean else false,
           if (dut.lsEu.specLoadWakeup)
             dut.iq.logic.lsSpecBlocked.toBoolean else false))
+        if (specAluOn) {
+          val c = dut.iq.logic.specAluCtl
+          val pp = dut.iq.logic.aluSpecPipes
+          specAluHisto += ((if (c.statAnnounce.toBoolean) 1 else 0) |
+            (if (c.statConfirm.toBoolean) 2 else 0) |
+            (if (c.statSpecReady.toBoolean) 4 else 0) |
+            (if (dut.iq.logic.selKill.toBoolean) 8 else 0) |
+            (if (pp(0).blocked.toBoolean || pp(1).blocked.toBoolean) 16 else 0) |
+            (if (pp(0).grant.toBoolean) 32 else 0) | (if (pp(1).grant.toBoolean) 64 else 0) |
+            (if (pp(0).holdStart.toBoolean) 128 else 0) | (if (pp(1).holdStart.toBoolean) 256 else 0))
+        } else specAluHisto += 0
         val p3FastFire = dut.lsEu.p3FastLoad && dut.lsEu.logic.p3FastEnq.toBoolean
         if (p3FastFire) p3FastEnqueues += 1
         // LS-OoO liveness replays (a P4 op vacated because an older LS op was stuck behind
@@ -2134,6 +2150,17 @@ trait CoreBenchHarness extends AnyFunSuite {
       println(s"[spec-wake-window] scope=commit-window ${k.name} " +
         s"specAnnounceCycles=${specWakeWindow.count(_._1)} " +
         s"iqRecheckHeldCycles=${specWakeWindow.count(_._2)}")
+      if (specAluOn) {
+        val w = specAluHisto.slice(lo, hi + 1)
+        def c(bit: Int) = w.count(x => (x & bit) != 0)
+        val grants = c(32) + c(64)
+        val fails = c(128) + c(256)
+        val ann = c(1)
+        println(f"[spec-alu] ${k.name} announce=$ann confirmNext=${c(2)} " +
+          f"(${100.0 * c(2) / scala.math.max(1, ann)}%.1f%%) specReadyCyc=${c(4)} grants=$grants " +
+          f"holdStarts=$fails (failRate=${100.0 * fails / scala.math.max(1, grants)}%.1f%%) " +
+          f"heldCyc=${c(16)} killCyc=${c(8)} windowCyc=${w.size}")
+      }
       assert(windowRetired == n - k.warmupInstrs,
         s"[${k.name}] macro histogram counted $windowRetired instructions, expected ${n - k.warmupInstrs}")
       val activeCycles  = windowHisto.count(_ >= 1)

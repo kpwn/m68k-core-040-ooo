@@ -563,6 +563,18 @@ object ShippingCoreConfig {
     * old-line capture enable, and delays the multi-hot debug evidence latch by one cycle.
     * Echoed in `SHIPPING_CONFIG`. */
   val dcacheTagCeRetime: Boolean = envFlag("CPU_DCACHE_TAG_CE_RETIME", true)
+  /** Load-to-use 6 -> 5 (week plan B2): speculative load wakeup for ALU-class consumers.
+    * The LS EU announces, from REGISTERED P3 state, the pdst of a load that is being admitted
+    * on the P3 fast path this cycle; the IQ turns that into a REGISTERED per-slot
+    * "only waiting on that load" bit, so an ALU consumer can be selected the cycle the load
+    * data lands. A selected consumer whose load does not confirm next cycle is HELD in its
+    * ALU issue register and every IQ select is frozen (registered kill) until the load
+    * wakes (or completes as a fault). Default OFF; echoed in `SHIPPING_CONFIG`. */
+  val lsSpecWakeAlu: Boolean = envFlag("CPU_LS_SPEC_WAKE_ALU", false)
+  /** Sub-knob of `lsSpecWakeAlu`: announce only loads whose early VIPT probe already HIT
+    * (the D-cache's registered line-stage result). Default ON; `=0` measures the ungated
+    * announce. Echoed in `SHIPPING_CONFIG`. */
+  val lsSpecWakeAluProbe: Boolean = envFlag("CPU_LS_SPEC_WAKE_ALU_PROBE", true)
   /** Experimental oldest-only same-cycle P3 preselect + live S2-hit operand bypass. */
   val lsFourCycleL1: Boolean = envFlag("CPU_LS_FOUR_CYCLE_L1", false)
   /** Experimental consume of the registered probe-line result before slot capture. */

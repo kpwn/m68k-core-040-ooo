@@ -89,6 +89,9 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
                        val loadBypassUnreadyLoad: Boolean = false,
                        val specLoadWakeup: Boolean = false,
                        val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
+                       /** See `ShippingCoreConfig.lsSpecWakeAlu` (B2). Effective only when
+                         * the host has an LS EU publishing `wakeupSpecAlu`. */
+                       val specAluWake: Boolean = m68k040.top.ShippingCoreConfig.lsSpecWakeAlu,
                        val alu1Lean: Boolean = m68k040.top.ShippingCoreConfig.alu1Lean) extends FiberPlugin
     with IssueQueueService with m68k040.services.LateStoreDataService {
   require(!earlyAutoStoreAddress || earlyStoreAddress)
@@ -186,6 +189,14 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // explicitly override these bits from their source harness.
     aluFastAcceptNextPorts.foreach { p => p.allowOverride; p := False; p.simPublic() }
 
+    // ---- CPU_LS_SPEC_WAKE_ALU (B2): speculative load wakeup for ALU-class consumers ----
+    // Source: the LS EU's STRICT P3-admission announce (`wakeupSpecAlu`) and its fault
+    // abort. Absent (standalone IQ harnesses) => the mechanism is not elaborated at all.
+    val specAluSrc: Option[(Flow[UInt], Flow[UInt])] =
+      if (!specAluWake) None
+      else host.get[m68k040.execute.LsEuService].flatMap(l =>
+        Option(l.wakeupSpecAlu).map(a => (a, l.specAbort)))
+    val specAluOn = specAluSrc.isDefined
     // ---- Slot array (priority = line*wayCount + way; 0 = oldest) ----
     val lines = for (line <- 0 until lineCount) yield new Area {
       val ways = for (way <- 0 until wayCount) yield new Area {
@@ -229,6 +240,15 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         // contested logic in the machine -- no wider than it was with seven separate bits.
         val dynWaitAny  = Reg(Bool()) init False
         dynWaitAny  := dynWaitNext.orR
+        // CPU_LS_SPEC_WAKE_ALU: the ALU-class twin of `dynWaitAny` -- the registered OR of
+        // the SAME next vector with this cycle's announced load's LS source bits masked off
+        // (`specMaskNext`, driven near the dynamic-wakeup clear). Equal to `dynWaitAny`
+        // except for the ONE cycle after an announce, when a slot whose only outstanding
+        // dynamic source is the announced load reads ready. A flop in place of a flop: the
+        // ALU select cone is unchanged in depth.
+        val specMaskNext: Bits = if (specAluOn) Bits(DynWait.width bits) else null
+        val aluWaitAny: Bool = if (specAluOn) (Reg(Bool()) init False) else null
+        if (specAluOn) aluWaitAny := (dynWaitNext & ~specMaskNext).orR
         // default: hold (overridden by compaction-shift and wakeup-clear below).
         // triggers==0 (static lat1) AND no outstanding dynamic source -> ready.
         val ready    = sel && (if (priority == 0) True else triggers(priority - 1 downto 0) === 0) &&
@@ -660,7 +680,11 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
     // disjoint, so a slot is selected by at most one port.
     // Classes are disjoint: ALU = non-branch & non-LS & non-CPLX; branch = isBranch;
     // LS = isLs; CPLX = isCplx (CHK + DIV -> DivEu).
-    val aluReady = B(slots.map(s => s.ready && !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)))
+    val aluReady = if (!specAluOn)
+      B(slots.map(s => s.ready && !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)))
+    else B(slots.map(s => s.sel &&
+      (if (s.priority == 0) True else s.triggers(s.priority - 1 downto 0) === 0) &&
+      !s.aluWaitAny && !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)))
     val brReady  = B(slots.map(s => s.ready &&  s.hot.isBranch))
     val lsFullyReady = B(slots.map(s => s.ready && isLs(s.hot)))
     val storeAddressReady = if (earlyStoreAddress) {
@@ -1024,15 +1048,24 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       r
     }
 
-    selPorts(0).valid   := oh0.orR && !flushSignal
+    // CPU_LS_SPEC_WAKE_ALU: REGISTERED select kill -- the same shape as `flushSignal` (one
+    // flop ANDed into each select valid). High while a speculatively selected ALU consumer
+    // is (or, the cycle after a failed confirm, may be) held in its issue register: its
+    // static `events` already fired at select, so every dependent it released -- and
+    // every uop pushed since, which sees its scoreboard bit cleared -- must not be selected
+    // until the held uop actually leaves for its EU. Driven at the ALU issue pipes below.
+    val selKill: Bool = if (specAluOn) (RegInit(False)) else False
+    if (specAluOn) selKill.simPublic()
+    val selBlock = flushSignal || selKill
+    selPorts(0).valid   := oh0.orR && !selBlock
     selPorts(0).payload := ohSelect(oh0)
-    selPorts(1).valid   := oh1.orR && !flushSignal
+    selPorts(1).valid   := oh1.orR && !selBlock
     selPorts(1).payload := ohSelect(oh1)
-    selPorts(2).valid   := ohB.orR && !flushSignal
+    selPorts(2).valid   := ohB.orR && !selBlock
     selPorts(2).payload := ohSelect(ohB)
-    selPorts(3).valid   := ohL.orR && !flushSignal
+    selPorts(3).valid   := ohL.orR && !selBlock
     selPorts(3).payload := ohSelect(ohL)
-    selPorts(4).valid   := ohC.orR && !flushSignal
+    selPorts(4).valid   := ohC.orR && !selBlock
     selPorts(4).payload := ohSelect(ohC)
 
     // Registered issue stage: drop the in-flight registered uop on a flush (it is
@@ -1282,8 +1315,109 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         FAILURE)
     }
 
+    // ═══ CPU_LS_SPEC_WAKE_ALU: the ALU issue registers (ports 0/1) with a HOLD ═══════════
+    // Behaviourally `m2sPipe(collapsBubble = false, flush = flushSignal)` -- the same load
+    // rule, the same `selPorts(k).ready := out.ready` -- plus three flops per port:
+    //   specSel  the uop was selected on the ANNOUNCE (its slot's `dynWaitAny` was still
+    //            set: only `aluWaitAny` let it go);
+    //   heldP    the announced load pdst it is waiting on (`annP1`, the announce of the
+    //            cycle before its select);
+    //   go       it may be presented to its EU THIS cycle.
+    // At the select cycle C (= the cycle the announced load's irrevocable `lsWakeup` is due)
+    // `go` loads "lsWakeup named heldP at C" -- the confirm. Confirmed: the uop leaves at
+    // C+1 exactly like a normal selection and reads the load's value on the LS writeback
+    // bypass; nothing else in the machine can tell it was speculative. NOT confirmed: it
+    // is HELD (valid low to the EU; the register does not reload) and `selKill` freezes
+    // every select. It is released the cycle after `lsWakeup` (or a fault abort) names
+    // heldP, and only on a cycle the EU's `fastAcceptNext` look-ahead guarantees it will be
+    // accepted -- so the uop enters S1 exactly when the select freeze lifts, which restores
+    // the static latency-1 contract its already-fired `events` assumed.
+    //
+    // DEADLOCK FREEDOM: the announce is the P3 fast-path ADMISSION (the load enters the
+    // aligned ring that cycle; LsEuPlugin asserts it), so the load completes -- with a
+    // wakeup, or as a fault, which aborts -- without any further IQ select. A flush clears
+    // everything.
+    val annV1 = if (specAluOn) (RegNext(specAluSrc.get._1.valid) init False) else False
+    val annP1 = if (specAluOn) RegNext(specAluSrc.get._1.payload) else U(0, 6 bits)
+    val confirmAnn1 = if (specAluOn)
+      lsWakeupPort.valid && (lsWakeupPort.payload === annP1) else False
+    val dynWaitAnyVec = B(slots.map(_.dynWaitAny))
+    val aluSpecPipes = if (!specAluOn) null else Seq.tabulate(2) { k =>
+      val oh = if (k == 0) oh0 else oh1
+      new Area {
+        val specSelBit = (oh & dynWaitAnyVec).orR
+        val out     = Stream(IqHot())
+        val rValid  = RegInit(False)
+        val rData   = Reg(IqHot())
+        val specSel = RegInit(False)
+        val heldP   = Reg(UInt(6 bits)) init 0
+        val go      = RegInit(False)
+        val seen    = RegInit(False)
+        val blocked = rValid && specSel && !go
+        out.valid   := rValid && !blocked
+        out.payload := rData
+        selPorts(k).ready := out.ready
+        val abort = specAluSrc.get._2
+        val confirmHeld = (lsWakeupPort.valid && (lsWakeupPort.payload === heldP)) ||
+          (if (abort != null) abort.valid && (abort.payload === heldP) else False)
+        val seenNext = seen || confirmHeld
+        val goNext   = seenNext && aluFastAcceptNextPorts(k)
+        val load     = out.ready && !blocked
+        when(load) {
+          rValid  := selPorts(k).valid
+          rData   := selPorts(k).payload
+          specSel := selPorts(k).valid && specSelBit
+          heldP   := annP1
+          go      := confirmAnn1
+          seen    := False
+        } elsewhen(blocked) {
+          seen := seenNext
+          go   := goNext
+        }
+        when(flushSignal) { rValid := False; specSel := False }
+        // Still held next cycle => keep every select frozen next cycle.
+        val holdNext = blocked && !goNext
+        // Sim-only statistics taps.
+        val grant     = selPorts(k).fire && specSelBit
+        val justLoaded = RegNext(load && selPorts(k).fire) init False
+        val holdStart = justLoaded && blocked
+        blocked.simPublic(); grant.simPublic(); holdStart.simPublic()
+        GenerationFlags.simulation {
+          // `selKill` must cover every held cycle, or a select fired into a held register
+          // would be dropped (its slot freed, the register not reloaded).
+          when(blocked) {
+            assert(!selPorts(k).valid, "IssueQueuePlugin: ALU select fired into a held speculative issue register", FAILURE)
+          }
+          // The release is timed on `fastAcceptNext`, so the EU must take it.
+          when(rValid && specSel && go && !flushSignal) {
+            assert(out.ready, "IssueQueuePlugin: released speculative ALU uop was refused by its EU", FAILURE)
+          }
+          val heldCycles = Reg(UInt(16 bits)) init 0
+          when(blocked) { heldCycles := heldCycles + 1 } otherwise { heldCycles := 0 }
+          assert(heldCycles < U(20000, 16 bits),
+            "IssueQueuePlugin: a speculatively selected ALU uop has been held 20000 cycles -- no confirm, abort or flush",
+            FAILURE)
+        }
+      }
+    }
+    val specAluCtl = if (!specAluOn) null else new Area {
+      // A failed confirm at C may have a spec-selected consumer arriving in an issue
+      // register at C+1: freeze C+1's selects from flops (`aluWaitAny` < `dynWaitAny` on an
+      // occupied slot = "a slot was spec-ready this cycle"), conservatively whether or not
+      // one was actually picked. Later cycles: exactly while a held uop will still be held.
+      val specReadyAny = slots.map(s => s.sel && s.dynWaitAny && !s.aluWaitAny &&
+        !s.hot.isBranch && !isLs(s.hot) && !isCplx(s.hot)).reduce(_ || _)
+      val killA = annV1 && specReadyAny && !confirmAnn1
+      selKill := (killA || aluSpecPipes.map(_.holdNext).reduce(_ || _)) && !flushSignal
+      // Sim-only statistics taps (read by the IPC bench).
+      val statAnnounce = specAluSrc.get._1.valid
+      val statConfirm  = annV1 && confirmAnn1
+      val statSpecReady = annV1 && specReadyAny
+      statAnnounce.simPublic(); statConfirm.simPublic(); statSpecReady.simPublic()
+    }
     val pipedPorts = Seq.tabulate(5) { k =>
       val piped = if (k == 3) lsPiped
+                  else if (specAluOn && k < 2) aluSpecPipes(k).out
                   else selPorts(k).m2sPipe(collapsBubble = false, flush = flushSignal)
       issuePorts(k).valid       := piped.valid && !flushSignal
       issuePorts(k).payload.uop := coldRead(piped.payload)
@@ -1797,6 +1931,33 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
       }
     }
 
+    // ---- CPU_LS_SPEC_WAKE_ALU: this cycle's announce, as a per-slot source mask ---------
+    // Bit b set => source b of the slot is the integer result of the load announced THIS
+    // cycle (LS_A/LS_B/LS_C only; the announce names an int pdst). Computed off the SAME
+    // tags and read-qualifiers the real LS clear above uses, and routed through the same
+    // compaction mapping, so `aluWaitAny` (registered) = "some dynamic source other than
+    // the announced load is still outstanding". Pushed uops take it from the push record.
+    if (specAluOn) {
+      val ann = specAluSrc.get._1
+      def specMaskOf(u: IqHot): Bits = {
+        val m = B(0, DynWait.width bits)
+        m(DynWait.LS_A) := ann.valid && u.psrcAValid && (u.psrcA === ann.payload)
+        m(DynWait.LS_B) := ann.valid && srcBIsReg(u)  && (u.psrcB === ann.payload)
+        m(DynWait.LS_C) := ann.valid && u.psrcCValid && (u.psrcC === ann.payload)
+        m
+      }
+      val slotMask = slots.map(s => specMaskOf(s.hot))
+      val push0Mask = specMaskOf(pushHot0)
+      val push1Mask = specMaskOf(pushHot1)
+      for (i <- 0 until slotCount) {
+        val shifted: Bits =
+          if (i < slotCount - wayCount) slotMask(i + wayCount)
+          else if (i == slotCount - wayCount) push0Mask
+          else push1Mask
+        slots(i).specMaskNext := Mux(pushPort.fire, shifted, slotMask(i))
+      }
+    }
+
     // ---- Scoreboard maintenance ----
     // Compaction advances positionEpoch only. Each position row is written
     // solely when a new producer for that physical register is inserted.
@@ -2118,7 +2279,8 @@ class IssueQueuePlugin(val earlyStoreAddress: Boolean = false,
         val fsPiped = if (k == 3) {
           val fsSkid = RegNextWhen(MuxOH(ohL, fsCtx), selPorts(3).fire)
           RegNextWhen(Mux(lsSkidValid, fsSkid, MuxOH(ohL, fsCtx)), lsAdvance)
-        } else RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
+        } else if (specAluOn && k < 2) RegNextWhen(MuxOH(ohOf(k), fsCtx), aluSpecPipes(k).load)
+        else RegNextWhen(MuxOH(ohOf(k), fsCtx), selPorts(k).ready)
         when(pipedPorts(k).valid) {
           assert(issuePorts(k).payload === fsPiped,
             s"IQ cold-split: port $k dispatch payload diverged from the full-context shadow")

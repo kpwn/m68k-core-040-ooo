@@ -49,6 +49,16 @@ trait LsEuService {
   /** P3-only speculative tag, before the merged P4-priority wakeup. Sole producer:
     * this LS EU's registered P3 context. Idle unless four-cycle mode is enabled. */
   def wakeupSpecP3: Flow[UInt]
+  /** CPU_LS_SPEC_WAKE_ALU (B2): pdst of an ordinary cacheable load that is being ADMITTED
+    * on the P3 fast path THIS cycle (registered P3 state only). A prediction that its
+    * irrevocable `wakeup` fires next cycle; the IQ re-checks it. Once announced the load is
+    * in the aligned ring, so its completion never waits on an IQ select. Sole producer:
+    * this LS EU's P3 admission. Null/idle unless the flag is set. */
+  def wakeupSpecAlu: Flow[UInt] = null
+  /** CPU_LS_SPEC_WAKE_ALU (B2): pdst of a load that completed as a FAULT (no wakeup will
+    * ever follow). Releases an IQ speculative hold; the fault flushes the held consumer.
+    * Sole producer: this LS EU's fault-capture stage. Null/idle unless the flag is set. */
+  def specAbort: Flow[UInt] = null
   /** Exact live, granted resident-hit completion tag. Sole producer: this LS EU's
     * aligned-ring head completion arbiter. No second architectural completion. */
   def liveLoadConfirm: Flow[UInt]
@@ -152,6 +162,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                  val p3Launch: Boolean = m68k040.top.ShippingCoreConfig.lsP3Launch,
                  val p1EarlyLoad: Boolean = m68k040.top.ShippingCoreConfig.lsP1EarlyLoad,
                  val fourCycleL1: Boolean = m68k040.top.ShippingCoreConfig.lsFourCycleL1,
+                 /** See `ShippingCoreConfig.lsSpecWakeAlu`. */
+                 val specAluWake: Boolean = m68k040.top.ShippingCoreConfig.lsSpecWakeAlu,
                  /** See `ShippingCoreConfig.lsEarlyAnRetry`; effective only with
                    * `earlyAutoAnWriteback`. */
                  val earlyAnRetry: Boolean = m68k040.top.ShippingCoreConfig.lsEarlyAnRetry,
@@ -223,6 +235,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
   var wakeupSpecPort: Flow[UInt]   = null
   var wakeupSpecP3Port: Flow[UInt] = null
   var liveLoadConfirmPort: Flow[UInt] = null
+  var wakeupSpecAluPort: Flow[UInt] = null
+  var specAbortPort: Flow[UInt] = null
   var orderViolationPort: Flow[UInt] = null
   var replayRequestPort: Flow[UInt] = null
   var faultCompletionPort: Flow[LsFault] = null
@@ -248,6 +262,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
   override def wakeupSpec: Flow[UInt]  = wakeupSpecPort
   override def wakeupSpecP3: Flow[UInt] = wakeupSpecP3Port
   override def liveLoadConfirm: Flow[UInt] = liveLoadConfirmPort
+  override def wakeupSpecAlu: Flow[UInt] = wakeupSpecAluPort
+  override def specAbort: Flow[UInt] = specAbortPort
   override def orderViolation: Flow[UInt] = orderViolationPort
   override def replayRequest: Flow[UInt] = replayRequestPort
   override def faultCompletion: Flow[LsFault] = faultCompletionPort
@@ -368,6 +384,9 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     wakeupSpecP3Port = Flow(UInt(6 bits))
     liveLoadConfirmPort = Flow(UInt(6 bits))
     wakeupSpecP3Port.simPublic(); liveLoadConfirmPort.simPublic()
+    wakeupSpecAluPort = Flow(UInt(6 bits))
+    specAbortPort = Flow(UInt(6 bits))
+    wakeupSpecAluPort.simPublic(); specAbortPort.simPublic()
     orderViolationPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
     orderViolationPort.simPublic()
     replayRequestPort = Flow(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
@@ -2329,6 +2348,20 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     val nextIntWake = Flow(UInt(6 bits))
     nextIntWake.valid := False
     nextIntWake.payload := 0
+    // CPU_LS_SPEC_WAKE_ALU: a load completing as a FAULT never wakes its pdst. Recorded in
+    // the decision cycle by the two fault captures below, published one cycle later
+    // (registered: a cold path, it only releases a speculative IQ hold that the fault's
+    // own flush will squash).
+    val specAbortSig = Flow(UInt(6 bits))
+    specAbortSig.valid := False
+    specAbortSig.payload := 0
+    if (specAluWake) {
+      specAbortPort.valid := RegNext(specAbortSig.valid) init False
+      specAbortPort.payload := RegNext(specAbortSig.payload)
+    } else {
+      specAbortPort.valid := False
+      specAbortPort.payload := 0
+    }
     // Same irrevocable selected-completion contract, independently selectable.
     // Flag data stays in compNzvc; this port carries readiness and identity only.
     val nextNzvcWake = Flow(UInt(m68k040.Global.PHYS_NZVC_ID_W bits))
@@ -2602,6 +2635,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     def captureFaultFront(ctx: FrontPipeCtx, faultAddr: UInt,
                           atc: Boolean = true): Unit = {
       liveCompletionFires := True
+      if (specAluWake) {
+        specAbortSig.valid := ctx.pdstValid
+        specAbortSig.payload := ctx.pdst
+      }
       frontCompFires := True
       compValid     := True
       compRobId     := ctx.robId
@@ -2672,6 +2709,10 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     def captureFaultDesc(ctx: BkCtx, vaddr: UInt, size: m68k040.isa.Size.C,
                          atc: Boolean): Unit = {
       liveCompletionFires := True
+      if (specAluWake) {
+        specAbortSig.valid := ctx.pdstValid
+        specAbortSig.payload := ctx.pdst
+      }
       compValid      := True
       compRobId      := ctx.robId
       compPdstValid  := False
@@ -4646,6 +4687,43 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
         val parkIdleRef = if (lsOooIssue) !parkValid.reduce(_ || _) else True
         assert(!p3AdmitGateR || (parkIdleRef && !inhibLoadInFlight && p3PreemptSafeR),
           "LsEuPlugin: p3AdmitGateR admitted where the live P3 gate would not", FAILURE)
+      }
+    }
+
+    // ── CPU_LS_SPEC_WAKE_ALU (week plan B2): the STRICT announce ──────────────────────
+    // Exactly the P3 fast-path admission (`admit`'s registered `fast` arm in the P3 block
+    // below: every term is a flop or a shallow function of flops), plus `pdstValid`. Unlike
+    // `p3SpecWake` it carries no P4 announce and no "P3 holds a load" guess: when it fires
+    // the load IS entering the aligned ring this cycle (`alignedEnq`), so from here on its
+    // completion depends only on the D-cache/AXI -- never on an IQ select. That is what
+    // makes the IQ's select freeze on a failed confirm deadlock-free. The ONE thing still
+    // predicted is that the D-cache answers next cycle (an L1 hit on the fast path).
+    // Only elaborated with the registered admission (`parkRetime && p3SqLineFilter`);
+    // otherwise idle.
+    // (b) Confirm-rate filter: the registered early-probe LINE-stage hit for THIS load's
+    // token (the P3 load's probe sits in the D-cache line stage in exactly this cycle when
+    // the pipe flowed P2 -> P2T -> P3 without a stall; a stalled load simply is not
+    // announced). A hint: correctness still rests on the IQ's confirm.
+    val specAluProbeHit: Bool = {
+      val hint = if (specAluWake && m68k040.top.ShippingCoreConfig.lsSpecWakeAluProbe)
+        Option(dcache.probeLineHitHint) else None
+      hint.map(h => h.valid && (h.payload === m68k040.Global.robTag(False ## False,
+        p3Ctx.front.robId, m68k040.cache.DLoadToken.Width, m68k040.cache.DLoadToken.RobIdBits)))
+        .getOrElse(True)
+    }
+    val specAluAnnounce: Bool = if (!specAluWake || !(parkRetime && p3SqLineFilter)) False else {
+      p3Valid && !sqFlushSig && !excActive &&
+        (p3Ctx.front.memOp === MemOp.LOAD) && p3Ctx.front.pdstValid &&
+        p3SqClear && !p4Valid && p3AdmitGateR && !bkBusy && !alignedFull && specAluProbeHit
+    }
+    wakeupSpecAluPort.valid   := specAluAnnounce
+    wakeupSpecAluPort.payload := p3Ctx.front.pdst
+    if (specAluWake && parkRetime && p3SqLineFilter) GenerationFlags.simulation {
+      // The deadlock-freedom premise of the IQ hold: an announced load really entered the
+      // aligned ring this cycle.
+      when(specAluAnnounce) {
+        assert(p3FastEnq, "LsEuPlugin: CPU_LS_SPEC_WAKE_ALU announced a load that was not admitted at P3",
+          FAILURE)
       }
     }
 

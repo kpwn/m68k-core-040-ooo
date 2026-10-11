@@ -881,6 +881,16 @@ class DcachePlugin(val socketMerged: Boolean = false,
     probeReadTag.simPublic(); probeReadUsable.simPublic()
     probeLineValid.simPublic(); probeLineSlot.simPublic(); probeLineHit.simPublic()
     if (earlyProbeLineForward) probeLineTag.simPublic()
+    // CPU_LS_SPEC_WAKE_ALU: the registered line-stage hit, by token (flops + a 4:1 token
+    // select). Lets the LS EU announce only loads whose probe already hit.
+    val probeLineHitHintPort: Flow[UInt] =
+      if (!m68k040.top.ShippingCoreConfig.lsSpecWakeAlu) null else {
+        val f = Flow(UInt(DLoadToken.Width bits))
+        f.valid   := probeLineValid && probeLineHit && earlyProbeValids(probeLineSlot)
+        f.payload := earlyProbeTokens(probeLineSlot)
+        f.simPublic()
+        f
+      }
 
     // ---- miss-state latches ----
     val missPaddr = Reg(UInt(32 bits))   // physical addr of the missing line (AXI refill base)
@@ -6892,6 +6902,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
   }
 
   override def loadProbe = logic.loadProbePort
+  override def probeLineHitHint = logic.probeLineHitHintPort
   override def loadProbeResolve = logic.loadProbeResolvePort
   override def loadProbeCancel = logic.loadProbeCancelPort
   override def loadCmd  = logic.loadCmdPort
