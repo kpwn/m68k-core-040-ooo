@@ -104,7 +104,7 @@ class BtbMissGshareIpcSpec extends CoreBenchHarness {
             else if (fire && miss) {
               p.fires += 1
               // Exactly one record (slot 0) and exactly one shift, in the predicted direction.
-              val predT = d.fa.logic.feed.payload(0).predTaken.toBoolean
+              val predT = d.fa.logic.slot0ComputedPred.toBoolean   // == predTaken for a BTB-miss cond
               val slot1Rec = d.fa.logic.slot1ValidOut.toBoolean && d.fa.logic.feed.payload(1).phtValid.toBoolean
               if (!d.fa.logic.feed.payload(0).phtValid.toBoolean || slot1Rec ||
                   !d.gsh.logic.shiftValid.toBoolean || d.gsh.logic.shiftDir.toBoolean != predT) p.badStamp += 1
