@@ -38,7 +38,15 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        deferTakenSlot1Conditional: Boolean = false,
                        computeDirectTargets: Boolean = false,
                        deferSlot1Uncond: Boolean = false,
-                       deferSlot1Dbcc: Boolean = false)
+                       deferSlot1Dbcc: Boolean = false,
+                       /** `ShippingCoreConfig.btbMissGshare` (CPU_BTBMISS_GSHARE). */
+                       btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
+                       /** `ShippingCoreConfig.btbMissGshareWeak` (CPU_BTBMISS_GSHARE_WEAK). */
+                       btbMissGshareWeak: Int = m68k040.top.ShippingCoreConfig.btbMissGshareWeak,
+                       /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
+                       feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
+                       /** `ShippingCoreConfig.feRedirectCmd` (CPU_FE_REDIRECT_CMD). */
+                       feRedirectCmd: Boolean = m68k040.top.ShippingCoreConfig.feRedirectCmd)
     extends FiberPlugin with DecodeFeedService {
 
   require(ftqDepth > 0 && (ftqDepth & (ftqDepth - 1)) == 0,
@@ -159,7 +167,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     }
 
     // ---- Sub-component: InstructionBuffer ----
-    val ibuf = new InstructionBuffer()
+    val ibuf = new InstructionBuffer(feRetime)
 
     // ---- Public ports (accessible from testbench via dut.fa.logic.*) ----
     // feed is a plain directionless Stream (service convention: plain wires so a
@@ -184,6 +192,23 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // and does the fetch pointer end up there", so both halves must be observable.
     mispredictRedirect.valid.simPublic(); mispredictRedirect.payload.simPublic()
     mispredictRedirect.payload.allowOverride; mispredictRedirect.payload := U(0, 32 bits)
+    // CPU_FE_REDIRECT_CMD: the ROB's early (Tier-1) mispredict redirect, delivered from a
+    // REPLICATED register (`RobPlugin.earlyFireFe`, never `doFlushReg`) so the redirect
+    // target can be the fetch command of the redirect cycle itself instead of a dead,
+    // born-stale command from the old fetchPc. `earlyRedirectWins` = this target is the
+    // one `mispredictRedirect` delivers this cycle (no same-cycle doFlush override); it
+    // only reaches next-state D inputs, never the command cone.
+    // Only elaborated with the flag (null otherwise: the default netlist is untouched).
+    val earlyRedirect = if (feRedirectCmd) Flow(UInt(32 bits)) else null
+    val earlyRedirectWins = if (feRedirectCmd) Bool() else null
+    if (feRedirectCmd) {
+      earlyRedirect.valid.allowOverride;   earlyRedirect.valid   := False
+      earlyRedirect.payload.allowOverride; earlyRedirect.payload := U(0, 32 bits)
+      earlyRedirectWins.allowOverride;     earlyRedirectWins     := False
+      earlyRedirect.valid.simPublic(); earlyRedirectWins.simPublic()
+    }
+    def liveRedir = earlyRedirect.valid
+    def liveRedirWindow = earlyRedirect.payload(31 downto 3) @@ U(0, 3 bits)
 
     // axi-socket adapter D12/D16: the reset-vector reader's redirect. Declared with the
     // SAME shape as mispredictRedirect above and for the same reason -- the `redirect`
@@ -295,6 +320,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     gsBtbType0.allowOverride;  gsBtbType0  := U(0, 2 bits)
     gsPhtTaken0.allowOverride; gsPhtTaken0 := False
     gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, m68k040.Global.PHT_IDX_W bits)
+    // Slot-0 PHT counter saturated (0/3) -- read only by `btbMissGshareWeak == 1`.
+    val gsPhtStrong0 = Bool(); gsPhtStrong0.allowOverride; gsPhtStrong0 := False
     gsPhtTaken1.allowOverride; gsPhtTaken1 := False
     gsPhtIndex1.allowOverride; gsPhtIndex1 := U(0, m68k040.Global.PHT_IDX_W bits)
     // GHR shift outputs (driven below on the emitted predicted conditional).
@@ -552,7 +579,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // Suppressing that lookup at ISSUE removes the measured 7.117-ns ringStale -> plan ->
     // ITLB/tag/I-cache cone without adding a cycle or changing the one-command wrong-path
     // bound. The delayed issue/stale state below remains an assertion oracle.
-    val issueBornStale = redirect.valid || mispredictRedirect.valid || icMaintFlushArm
+    val issueBornStale = if (!feRedirectCmd) redirect.valid || mispredictRedirect.valid || icMaintFlushArm
+      else (redirect.valid || mispredictRedirect.valid || icMaintFlushArm) && !earlyRedirectWins
     val planLookupFire = ic.cmd.fire && !issueBornStale
     val resultExpectedIssueValid = RegNext(ic.cmd.fire) init False
     val resultExpectedValid = RegNext(planLookupFire) init False
@@ -763,12 +791,32 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val ringSlotAvailable = !ringFull || fullRingTurnover
     val directTargetPc = ftbRsp.payload.target(31 downto 3) @@ U(0, 3 bits)
     val predictWindowPc = predictTargetReg(31 downto 3) @@ U(0, 3 bits)
-    val cmdWindowPc = Mux(predictFire, predictWindowPc,
-                      Mux(targetHoldValid, targetHoldPc,
-                      Mux(applyNow, directTargetPc, fetchPc)))
-    val cmdDrop = Mux(predictFire, predictTargetReg(2 downto 1),
-                  Mux(targetHoldValid, targetHoldDrop,
-                  Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop)))
+    def cmdWindowPcRef = Mux(predictFire, predictWindowPc,
+                         Mux(targetHoldValid, targetHoldPc,
+                         Mux(applyNow, directTargetPc, fetchPc)))
+    def cmdDropRef = Mux(predictFire, predictTargetReg(2 downto 1),
+                     Mux(targetHoldValid, targetHoldDrop,
+                     Mux(applyNow, ftbRsp.payload.target(2 downto 1), pendingDrop)))
+    // CPU_FE_RETIME: the LATE term (`applyNow`, from the FTB/gshare response) becomes the
+    // OUTERMOST select over a registered-only base. Identical: `applyNow` carries
+    // `!ftbBlocked`, which carries `!targetHoldValid`, so the only arm it could be shadowed
+    // by is `predictFire`, which the outer select excludes explicitly.
+    def applyWins   = applyNow && !predictFire
+    def cmdWindowPcBase = if (feRetime)
+      Mux(applyWins, directTargetPc,
+          Mux(predictFire, predictWindowPc, Mux(targetHoldValid, targetHoldPc, fetchPc)))
+    else cmdWindowPcRef
+    def cmdDropBase = if (feRetime)
+      Mux(applyWins, ftbRsp.payload.target(2 downto 1),
+          Mux(predictFire, predictTargetReg(2 downto 1), Mux(targetHoldValid, targetHoldDrop, pendingDrop)))
+    else cmdDropRef
+    // CPU_FE_REDIRECT_CMD: the early-redirect target is the OUTERMOST select (a register).
+    val cmdWindowPc = if (feRedirectCmd) Mux(liveRedir, liveRedirWindow, cmdWindowPcBase) else cmdWindowPcBase
+    val cmdDrop     = if (feRedirectCmd) Mux(liveRedir, earlyRedirect.payload(2 downto 1), cmdDropBase) else cmdDropBase
+    if (feRetime) GenerationFlags.simulation {
+      assert(cmdWindowPcBase === cmdWindowPcRef && cmdDropBase === cmdDropRef,
+        "FetchAlign: CPU_FE_RETIME command PC select diverged from the reference", FAILURE)
+    }
     // Amendment §2.1.1 — the SAME value that `ic.cmd.fire` writes into
     // `ringDrop(ringTail)` below is what the provider framing verdict must be computed
     // against. Driving it from this exact expression (rather than re-deriving it at the
@@ -778,27 +826,34 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // The action flushes the old IBuf on this edge, so its old occupancy must not block
     // the C+1 target command. Ring capacity remains physical and is never bypassed.
     val ibufRoomForCmd = ibufRoomForIssue || predictFire
-    ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForCmd &&
-                         !stalled && !faultHold && !quiesce && !ftqMismatch
+    if (!feRedirectCmd) {
+      ic.cmd.valid      := started && ringSlotAvailable && ibufRoomForCmd &&
+                           !stalled && !faultHold && !quiesce && !ftqMismatch
+    } else {
+      // The redirect cycle flushes the IBuf and clears stalled/faultHold (commonRedirect),
+      // so those occupancy/hold gates do not apply to the redirect target's command.
+      ic.cmd.valid      := started && ringSlotAvailable && (ibufRoomForCmd || liveRedir) &&
+                           (!stalled || liveRedir) && (!faultHold || liveRedir) && !quiesce && !ftqMismatch
+    }
     ic.cmd.payload.pc := cmdWindowPc
 
     when(ic.cmd.fire) {
       // Capture this fetch's record into the TAIL ring slot. Born stale iff a redirect
       // fires THIS cycle (this fetch used the old, now-wrong fetchPc). Latch the drop
       // intent; consume it. Advance tail + count.
-      ringStale(ringTail) := redirectThisCycle
+      if (!feRetime) ringStale(ringTail) := redirectThisCycle
       ringDrop(ringTail)  := cmdDrop
       ringKeep(ringTail)  := U(4, 3 bits)
       ringPlanSeq(ringTail) := planSeq
       ringTail := ringInc(ringTail)
       planSeq := planSeq + 1
-      pendingDrop := 0
+      if (!feRetime) pendingDrop := 0
       // Advance the SEQUENTIAL fetch pointer at ISSUE (depth-2 needs fetchPc+8 ready for
       // the NEXT cycle's issue while this fetch is still in flight). Only for a live
       // (non-redirect) issue: a redirect this cycle resets fetchPc to its target below
       // (and overrides this), and a stale issue's window is discarded. Guarding on
       // !redirectThisCycle keeps fetchPc from walking past a coincident redirect target.
-      when(!redirectThisCycle) {
+      if (!feRetime) when(!redirectThisCycle) {
         fetchPc := cmdWindowPc + 8
       }
     }
@@ -1106,7 +1161,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // `availEffPrev =/= availEff` already independently covers every VALIDITY-flag change
     // (any avail change, not just crossing 2/3/4), so only the content-immutability term
     // needed widening.
-    val p0LiveInvalidate = ibuf.io.flush || (ibuf.io.shift =/= 0) ||
+    // CPU_FE_RETIME: `shift =/= 0` from the IBuf's shift candidates (the late select is
+    // the last 2:1 mux), identical to the net `ibuf.io.shift` by the IBuf's own oracle.
+    def ibufShiftNz = if (feRetime)
+      ibuf.io.shiftEn && Mux(ibuf.io.shiftSelA, ibuf.io.shiftA =/= 0, ibuf.io.shiftB =/= 0)
+    else (ibuf.io.shift =/= 0)
+    val p0LiveInvalidate = ibuf.io.flush || ibufShiftNz ||
                            (ibuf.io.push.fire && (ibuf.io.cnt < U(7, ibuf.io.cnt.getWidth bits))) ||
                            (availEffPrev =/= availEff)
     when(p0LiveInvalidate) {
@@ -1114,8 +1174,31 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     }
 
     // ---- Aligner: combinational decode of buffer head ----
-    val res = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, availEff, p0LiveReg,
-      headPcHiP1 = Some(decodePcHiP1))
+    val res = Aligner.align(decodePc, ibuf.io.head,
+      if (feRetime) ibuf.io.headPredRaw else ibuf.io.headPred, availEff, p0LiveReg,
+      headPcHiP1 = Some(decodePcHiP1), retime = feRetime)
+    // CPU_FE_RETIME differential oracle: the original aligner on the GATED head must agree
+    // with the retimed one on every field a consumer reads, every cycle.
+    if (feRetime) GenerationFlags.simulation {
+      val ref = Aligner.align(decodePc, ibuf.io.head, ibuf.io.headPred, availEff, p0LiveReg,
+        headPcHiP1 = Some(decodePcHiP1))
+      assert(ref.slot0Valid === res.slot0Valid && ref.slot1Valid === res.slot1Valid &&
+             ref.shiftWords === res.shiftWords && ref.stall === res.stall &&
+             ref.complex === res.complex,
+        "FetchAlign: CPU_FE_RETIME aligner control diverged from the reference", FAILURE)
+      def same(a: DecodePacket, b: DecodePacket): Bool =
+        a.pc === b.pc && a.words.asBits === b.words.asBits && a.wordCount === b.wordCount &&
+        a.simple === b.simple && a.lenWords === b.lenWords && a.complex === b.complex &&
+        a.fault === b.fault && a.size === b.size
+      when(res.slot0Valid) {
+        assert(same(ref.slot0, res.slot0),
+          "FetchAlign: CPU_FE_RETIME slot0 packet diverged from the reference", FAILURE)
+      }
+      when(res.slot1Valid) {
+        assert(same(ref.slot1, res.slot1),
+          "FetchAlign: CPU_FE_RETIME slot1 packet diverged from the reference", FAILURE)
+      }
+    }
     spinal.core.sim.SimPublic(ibuf.io.headPred(0).simple, ibuf.io.head(0))
     // The FTQ capacity proof measures real buffer occupancy, not an inferred one: the
     // legal run-ahead bound is `RING + BUF_WORDS`, so a stress test must show which of
@@ -1229,6 +1312,45 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // RAS predict for slot0 (a return with a non-empty stack predicts top-of-stack).
     val rasPredictSlot0 = s0IsReturn && rasPredValid
 
+    // ── BTB-MISS DIRECT CONDITIONAL: gshare direction at decode (`btbMissGshare`) ────
+    // A slot-0 Bcc (cond >= 2, 8/16-bit displacement) or DBcc (not DBT) that MISSED the
+    // BTB used to be predicted by nothing (fall through, no history, no PHT training).
+    // With the flag it becomes an ordinary gshare event, exactly like `condBtbHit0`:
+    //   - direction = `gsPhtTaken0` (the slot-0 PHT read already in flight for the BTB
+    //     path -- same PC, same pre-shift GHR, same index `gsPhtIndex0`);
+    //   - target    = the decode-computed `pc + 2 + disp` (`s0RelTarget`), redirected by
+    //     the registered C+1 `predictFire` action via `slot0ComputedPred`;
+    //   - history   = it is added to BOTH the `phtValid` stamp set and the
+    //     `gsShiftValid` set below (shift dir = `gsPhtTaken0`), so the retire-time
+    //     `ghrArch` shifts once for it and the speculative GHR shifts once for it: the
+    //     GsharePlugin whole-GHR repair contract (`phtValid` set == `gsShiftValid` set)
+    //     holds by construction, and Tier-1/Tier-2 restore see a normal history event.
+    // `btbQueryValid0` carries predEnable (!faultHold/!quiesce/!stalled), slot0Valid and
+    // the refill-time `ctrlXfer` predecode bit (the stale-bytes gate); `!gsBtbHit0` makes
+    // it disjoint from `condBtbHit0` / `slot0IsPred`. DBcc's displacement is always the
+    // 16-bit extension word (its low opword byte is `11001rrr`).
+    val s0GsIsBcc  = (s0op(15 downto 12) === B"4'h6") && (s0op(11 downto 8).asUInt >= U(2, 4 bits))
+    val s0GsIsDbcc = (s0op(15 downto 12) === B"4'h5") && (s0op(7 downto 3) === B"5'b11001") &&
+                     (s0op(11 downto 8) =/= B"4'h0")
+    val s0GsDispW  = s0op(7 downto 0) === B"8'h00"
+    val s0GsDispL  = s0op(7 downto 0) === B"8'hFF"
+    val slot0CondMiss = if (btbMissGshare)
+        btbQueryValid0 && res.slot0.simple && !gsBtbHit0 &&
+        ((s0GsIsBcc && !s0GsDispL &&
+          Mux(s0GsDispW, res.slot0.lenWords === U(2, 4 bits), res.slot0.lenWords === U(1, 4 bits))) ||
+         (s0GsIsDbcc && res.slot0.lenWords === U(2, 4 bits)))
+      else False
+    // Direction of a BTB-miss conditional. `btbMissGshareWeak == 1`: a weak counter
+    // (1/2, incl. every untrained one) yields the static BTFN default -- the sign of the
+    // displacement (opword low byte, or the extension word for disp16 / DBcc).
+    val gsMissDir = if (btbMissGshare && btbMissGshareWeak == 1) {
+        val s0GsBackward = Mux(s0GsDispW || s0GsIsDbcc, res.slot0.words(1)(15), s0op(7))
+        Mux(gsPhtStrong0, gsPhtTaken0, s0GsBackward)
+      } else gsPhtTaken0
+    // Slot-0 conditional whose direction comes from gshare (BTB hit OR, with the flag, miss).
+    val condGs0 = if (btbMissGshare) condBtbHit0 || slot0CondMiss else condBtbHit0
+    spinal.core.sim.SimPublic(slot0CondMiss)
+
     // A RETURN in slot1 (slot0 not predicted): defer it — suppress slot1 so the return
     // becomes slot0 NEXT cycle and takes the (single-slot) slot0 RAS-predict path. This
     // mirrors slot1WouldFtq below (the FTQ-sourced slot1-branch deferral) and is essential: a leaf
@@ -1243,7 +1365,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
         (s1op(15 downto 12) === B"4'h6") && (s1op(11 downto 8).asUInt >= U(2, 4 bits))
     else False
     val slot1WouldCondPred = if (deferSlot1Conditional) slot1IsConditional
-      else if (trainSlot1Conditional) slot1IsConditional && (condBtbHit0 ||
+      else if (trainSlot1Conditional) slot1IsConditional && (condGs0 ||
         (if (deferTakenSlot1Conditional) host[m68k040.services.GshareSecondaryLookupService].secondaryPhtTaken else False))
       else False
     val s1IsRts    = s1op === B"16'h4E75"
@@ -1313,8 +1435,9 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     val s0RelDisp8   = s0op(7 downto 0)
     val s0RelDispW   = s0RelDisp8 === B"8'h00"     // 0x00 => 16-bit disp in words(1)
     val s0RelDispL   = s0RelDisp8 === B"8'hFF"     // 0xFF => 32-bit disp (68020+), skipped
-    val s0RelDispExt = Mux(s0RelDispW, res.slot0.words(1).asSInt.resize(32),
-                                       s0RelDisp8.asSInt.resize(32))
+    val s0DispIsWord = if (btbMissGshare) s0RelDispW || s0GsIsDbcc else s0RelDispW
+    val s0RelDispExt = Mux(s0DispIsWord, res.slot0.words(1).asSInt.resize(32),
+                                         s0RelDisp8.asSInt.resize(32))
     val s0RelTarget  = (res.slot0.pc + U(2, 32 bits) + s0RelDispExt.asUInt).resize(32)
     // cond 0 = BRA, cond 1 = BSR: both ALWAYS taken, so the direction needs no
     // predictor either. cond >= 2 is a Bcc and is deliberately NOT computed here -- a
@@ -1326,10 +1449,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                         ((s0RelCond === B"4'h0") || (s0RelCond === B"4'h1"))
     val s0RelLenOk    = Mux(s0RelDispW, res.slot0.lenWords === U(2, 4 bits),
                                         res.slot0.lenWords === U(1, 4 bits))
-    val slot0ComputedPred = if (computeDirectTargets)
+    // `btbMissGshare`: a BTB-miss conditional gshare predicts TAKEN uses the same
+    // registered computed-target redirect (target = `s0RelTarget`).
+    val slot0GsMissTaken = if (btbMissGshare) slot0CondMiss && gsMissDir else False
+    val slot0ComputedPred = (if (computeDirectTargets)
         res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer && s0RelIsUncond &&
         !s0RelDispL && s0RelLenOk && !slot0IsPred && !rasPredictSlot0
-      else False
+      else False) || slot0GsMissTaken
     // ── SLOT-1 UNCONDITIONAL COVERAGE ───────────────────────────────────────────
     // A control transfer that lands in SLOT 1 has NO decode-time predictor at all. The
     // BTB is queried for slot0 only (`btbQueryValid0`); the dedicated slot-1 BTB read
@@ -1410,8 +1536,53 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // stream, `br-ind` executed a different program entirely and its self-check caught
     // `d0 = 0` instead of 1024. The `effShift` comment had warned about exactly this.
     // So the predicate is defined ONCE, here, and both consumers read it.
-    val suppressSlot1 = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
-                        slot1WouldFtq || slot1WouldUncond || slot1WouldDbcc || ftqConfirm
+    def suppressSlot1Ref = slot0Predicted || slot1WouldRasPred || slot1WouldCondPred ||
+                           slot1WouldFtq || slot1WouldUncond || slot1WouldDbcc || ftqConfirm
+    // ── CPU_FE_RETIME: the same predicate, factored off `res.slot1Valid` ─────────────
+    // Every slot-1 term above is `res.slot1Valid && <rest>` (and `res.slot1.simple` is
+    // True whenever `res.slot1Valid`), so
+    //     suppressSlot1 = slot0Only || (res.slot1Valid && slot1Rest)
+    // where neither `slot0Only` nor `slot1Rest` waits for `slot1Valid`, the LATEST
+    // aligner output. The opword classes are evaluated per candidate start k from the
+    // IBuf head words and picked by the L0 one-hot (L0 is exactly `res.slot0.lenWords`
+    // whenever `res.slot1Valid`), instead of decoding the 10:1-muxed `words(L0)`.
+    class S1Fast extends Area {
+      val hpr = ibuf.io.headPredRaw
+      val l0  = Mux(hpr(0).ambiguousLine, p0LiveReg.lenWords, hpr(0).lenWords)
+      val oh  = Vec((0 until Aligner.WINDOW).map(k => if (k == 0) False else l0 === U(k, 4 bits)))
+      def cls(f: Bits => Bool): Bool =
+        (oh.asBits & Vec((0 until Aligner.WINDOW).map(k => f(ibuf.io.head(k)))).asBits).orR
+      val cond = cls(op => (op(15 downto 12) === B"4'h6") && (op(11 downto 8).asUInt >= U(2, 4 bits)))
+      val ret  = cls(op => (op === B"16'h4E75") || (op === B"16'h4E77"))
+      val unc  = cls(op => (((op(15 downto 12) === B"4'h6") &&
+                              ((op(11 downto 8) === B"4'h0") || (op(11 downto 8) === B"4'h1")) &&
+                              (op(7 downto 0) =/= B"8'hFF")) ||
+                             (op(15 downto 6) === B"10'b0100111010") ||
+                             (op(15 downto 6) === B"10'b0100111011")))
+      val dbcc = cls(op => (op(15 downto 12) === B"4'h5") && (op(7 downto 3) === B"5'b11001") &&
+                           !(op(11 downto 8) === B"4'h0"))
+      val s0Clear = res.slot0Valid && !slot0IsPred && !rasPredictSlot0
+      val condTerm: Bool =
+        if (deferSlot1Conditional) res.slot0Valid && cond
+        else if (trainSlot1Conditional) res.slot0Valid && cond && (condGs0 ||
+          (if (deferTakenSlot1Conditional) host[m68k040.services.GshareSecondaryLookupService].secondaryPhtTaken else False))
+        else False
+      val rasTerm  = ret && rasPredValid && s0Clear
+      val ftqTerm  = ftqNear && !ftqAt0 && res.slot0Valid && (ftqDelta === l0) && !ftqConfirm
+      val uncTerm  = if (deferSlot1Uncond) unc && s0Clear && !slot0ComputedPred else False
+      val dbccTerm = if (deferSlot1Dbcc) dbcc && s0Clear && !slot0ComputedPred else False
+      val slot0Only = slot0Predicted || ftqConfirm
+      val slot1Rest = condTerm || rasTerm || ftqTerm || uncTerm || dbccTerm
+      // `brPredLive1`'s slot-1 half without `slot1ValidOut`: conditional, and NOT suppressed.
+      val condLive  = if (trainSlot1Conditional) res.slot0Valid && cond && !slot0Only && !slot1Rest else False
+    }
+    val s1Fast = if (feRetime) new S1Fast else null
+    val suppressSlot1 = if (feRetime) s1Fast.slot0Only || (res.slot1Valid && s1Fast.slot1Rest)
+                        else suppressSlot1Ref
+    if (feRetime) GenerationFlags.simulation {
+      assert(suppressSlot1 === suppressSlot1Ref,
+        "FetchAlign: CPU_FE_RETIME factored suppressSlot1 diverged from the reference", FAILURE)
+    }
     val predictedThisEmit = slot0Predicted && !ftqConfirm
     val predTargetSel     = Mux(rasPredictSlot0, rasPredTarget,
                             Mux(slot0ComputedPred, s0RelTarget, btbPredTarget0))
@@ -1465,7 +1636,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // bit sequence, one lagging the other. Without it, a branch emitted while an
     // I-fetch fault is draining would be counted at retire but never at fetch, and
     // every later repair would install a history shifted by one bit.
-    when(condBtbHit0 && res.slot0Valid && !faultHold) {
+    when(condGs0 && res.slot0Valid && !faultHold) {
       feed.payload(0).phtValid := True
       feed.payload(0).phtIndex := gsPhtIndex0
     }
@@ -1493,9 +1664,20 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // the one record only when slot0 has none, so allocations stay <=1 per group.
     val brPredCtr = Reg(UInt(Global.BR_PRED_TAG_W bits)) init 1
     val brPredLive0Pred = feed.payload(0).predTaken || feed.payload(0).phtValid
-    val brPredLive1 = if (trainSlot1Conditional)
+    def brPredLive1Ref = if (trainSlot1Conditional)
       slot1IsConditional && slot1ValidOut && !faultHold && !brPredLive0Pred
     else False
+    // CPU_FE_RETIME: `slot1IsConditional && slot1ValidOut` == `res.slot1Valid && condLive`
+    // (slot1ValidOut = slot1Valid && !suppressSlot1, its fault-packet override needs
+    // !slot0Valid, which already implies !slot1Valid), so the slot-1 training stamp and
+    // the GHR shift no longer wait for `suppressSlot1`.
+    val brPredLive1 = if (feRetime && trainSlot1Conditional)
+      res.slot1Valid && s1Fast.condLive && !faultHold && !brPredLive0Pred
+    else brPredLive1Ref
+    if (feRetime) GenerationFlags.simulation {
+      assert(brPredLive1 === brPredLive1Ref,
+        "FetchAlign: CPU_FE_RETIME brPredLive1 diverged from the reference", FAILURE)
+    }
     // RAS per-branch snapshot (`CPU_RAS_BRANCH_SNAPSHOT`): the snapshot rides the SAME tag
     // (DecodeStage keeps a per-tag RAS side table), so an UNPREDICTED slot0 control
     // transfer -- exactly the jsr (An) / empty-RAS return / BTB-missing branch that
@@ -1666,8 +1848,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // then recover at its fall-through before another packet is framed. Backpressure must
     // not skip an instruction, hence both guards are fire-gated.
     val ftqLenBad = ftqAt0 && res.slot0Valid && !ftqConfirm && feed.fire
+    // CPU_FE_RETIME: compare each shift candidate, then select (identical by construction).
+    def effShiftGtDelta = if (feRetime)
+      Mux(suppressSlot1, res.slot0.lenWords.resize(res.shiftWords.getWidth) > ftqDelta,
+                         res.shiftWords > ftqDelta)
+    else (effShift > ftqDelta)
     val ftqOvershoot = ftqNear && !ftqAt0 && feed.fire && !emittingFaultPacket &&
-                       (effShift > ftqDelta)
+                       effShiftGtDelta
     ftqMismatchDetect := (ftqStarved || ftqPast || ftqLenBad || ftqOvershoot) &&
                          !quiesce && !stalled && !ftqMismatchPending
     ftqMismatchDetectPc := Mux(ftqLenBad || ftqOvershoot, decodePcNext, decodePc)
@@ -1751,6 +1938,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     }
     spinal.core.sim.SimPublic(ftqLenBad, ftqOvershoot, ftqMismatchDetectPc, ftqMismatchPc)
 
+    if (feRetime) {
+      ibuf.io.shiftEn   := feed.fire && !emittingFaultPacket
+      ibuf.io.shiftA    := res.slot0.lenWords.resize(res.shiftWords.getWidth)
+      ibuf.io.shiftB    := res.shiftWords
+      ibuf.io.shiftSelA := suppressSlot1
+    }
     when(feed.fire && !emittingFaultPacket) {
       ibuf.io.shift := effShift
       decodePc      := decodePcNext
@@ -1784,9 +1977,12 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // repair installs a bit-exact history.
     val ftqConfirmCond = ftqConfirmFire && ftqHeadE.isCond
     gsShiftValid := ftqConfirmCond ||
-                    (feed.fire && !faultHold && condBtbHit0 && res.slot0Valid && !ftqConfirm) ||
+                    (feed.fire && !faultHold && condGs0 && res.slot0Valid && !ftqConfirm) ||
                     (feed.fire && brPredLive1)
-    gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0PredTaken))
+    // `btbMissGshare`: a BTB-miss conditional shifts its gshare direction (slot0PredTaken
+    // is the BTB-sourced bit, False on a miss).
+    val slot0GsDir = if (btbMissGshare) Mux(slot0CondMiss, gsMissDir, slot0PredTaken) else slot0PredTaken
+    gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0GsDir))
     GenerationFlags.simulation {
       if (trainSlot1Conditional) when(feed.fire) {
         assert(gsShiftValid === (feed.payload(0).phtValid ||
@@ -1819,16 +2015,20 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
       val actionWins = !(redirect.valid || (resume.valid && stalled) ||
                          mispredictRedirect.valid || ftqMismatch)
       setDecodePc(newPc)
-      fetchPc     := Mux(ic.cmd.fire && actionWins, newBase + 8, newBase)
+      // CPU_FE_RETIME: the `ic.cmd.fire` arms move to the end of the Area (see
+      // `laterRedirect`); these are then the no-fire values.
+      if (!feRetime) fetchPc := Mux(ic.cmd.fire && actionWins, newBase + 8, newBase)
+      else           fetchPc := newBase
       ibuf.io.flush  := True
       stalled        := False
       started        := True
-      pendingDrop    := Mux(ic.cmd.fire && actionWins, U(0, 2 bits), newPc(2 downto 1))
+      if (!feRetime) pendingDrop := Mux(ic.cmd.fire && actionWins, U(0, 2 bits), newPc(2 downto 1))
+      else           pendingDrop := newPc(2 downto 1)
       // Every pre-action request is wrong-path. The target command issued in this action
       // cycle used the captured PC, so make its newly allocated tail record live after
       // the blanket stale assignment. A higher-priority redirect leaves it stale.
       ringStale.foreach(_ := True)
-      when(ic.cmd.fire && actionWins) {
+      if (!feRetime) when(ic.cmd.fire && actionWins) {
         ringStale(ringTail) := False
       }
     }
@@ -1968,6 +2168,43 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     // overrides the external one).
     when(mispredictRedirect.valid) {
       commonRedirect(mispredictRedirect.payload)
+    }
+
+    // ── CPU_FE_REDIRECT_CMD: the redirect-cycle command fetched the target window, so the
+    // sequential pointer continues after it and its ring record is live. Written after
+    // every redirect arm (mispredictRedirect is the last and wins all of them); when a
+    // same-cycle doFlush overrides the target, `earlyRedirectWins` is low and the command
+    // stays born-stale exactly as before.
+    if (feRedirectCmd) {
+      when(ic.cmd.fire && earlyRedirectWins) {
+        fetchPc             := liveRedirWindow + 8
+        pendingDrop         := 0
+        ringStale(ringTail) := False
+      }
+      GenerationFlags.simulation {
+        when(earlyRedirectWins) {
+          assert(earlyRedirect.valid && mispredictRedirect.valid &&
+                 mispredictRedirect.payload === earlyRedirect.payload,
+            "FetchAlign: CPU_FE_REDIRECT_CMD early redirect is not the delivered redirect", FAILURE)
+        }
+      }
+    }
+
+    // ── CPU_FE_RETIME: `ic.cmd.fire` is the LAST select of fetchPc/pendingDrop/ringStale ──
+    // `ic.cmd.ready` is the deepest signal in the fetch-issue cone (live ITLB verdict), so
+    // its select goes outermost. `laterRedirect` is exactly the set of arms written AFTER
+    // the original `ic.cmd.fire` block that rewrite all three. `redirectThisCycle` is a
+    // subset of `laterRedirect` plus `predictFire`, and the predictFire arm's own fire
+    // case produced exactly these values (cmdWindowPc == predictWindowPc under
+    // predictFire; its `actionWins` only names arms that are inside `laterRedirect`).
+    if (feRetime) {
+      val laterRedirect = icMaintFlushArm || ftqMismatch || redirect.valid || resetRedirect.valid ||
+                          (resume.valid && stalled) || vioRedirect.valid || mispredictRedirect.valid
+      when(ic.cmd.fire && !laterRedirect) {
+        fetchPc             := cmdWindowPc + 8
+        pendingDrop         := 0
+        ringStale(ringTail) := False
+      }
     }
 
     // FTQ occupancy is updated once, with flush last so no same-cycle prediction can

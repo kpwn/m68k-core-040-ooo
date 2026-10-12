@@ -52,15 +52,15 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
     db.on { host.asHostOf(Seq[FiberPlugin](param, xlate, dcache, probe, mmuCtrl)) }
   }
 
-  // geometry: 8 KiB, 16-byte lines, 4 ways -> 128 sets. addr[3:0] off, addr[10:4] set,
-  // addr[31:11] tag.
-  private val Ways = 4
-  private def setOf(a: Long): Int  = ((a >> 4) & 0x7f).toInt
-  private def tagOf(a: Long): Long = a >> 11
+  // Geometry follows CPU_DCACHE_KB exactly as `DcachePlugin` does (8 KiB -> 128 sets,
+  // 16 KiB -> 256 sets; 16-byte lines, 4 ways), never a hardcoded set count.
+  private def geo(dut: Dut): CacheGeometry = DcacheTestGeometry.Geo
+  private def setOf(dut: Dut, a: Long): Int  = geo(dut).index(a)
+  private def tagOf(dut: Dut, a: Long): Long = geo(dut).tag(a)
 
-  // Two addresses in the SAME set with DIFFERENT tags.
-  private val AddrA = 0x00001000L   // set 0, tag 2
-  private val AddrB = 0x00001800L   // set 0, tag 3
+  // Two addresses in the SAME set with DIFFERENT tags: B is A plus one way-stride.
+  private val AddrA = 0x00001000L
+  private def addrB(dut: Dut): Long = AddrA + geo(dut).sets.toLong * geo(dut).lineBytes
 
   private def memByte(addr: Long): Int = ((addr * 5 + 0x23) & 0xff).toInt
   private def preload(mem: BehavioralMemAgent, base: Long, n: Int): Unit =
@@ -71,7 +71,8 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
   private def initDut(dut: Dut): (ClockDomain, BehavioralMemAgent) = {
     val cd = dut.clockDomain
     cd.forkStimulus(period = 10)
-    val mem = new BehavioralMemAgent(dut.dcache.logic.axi, cd)
+    DcacheTestAxi.inOrderLoadDefaults(dut.probe.logic.loadCmdIn)
+    val mem = m68k040.sim.HotDoorAttach(dut.dcache, cd, new BehavioralMemAgent(dut.dcache.logic.axi, cd))
     dut.probe.logic.loadCmdIn.valid #= false
     dut.probe.logic.loadProbeIn.valid #= false
     dut.probe.logic.loadProbeCancelIn.valid #= false
@@ -125,20 +126,21 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
   private def wayDirty(dut: Dut, w: Int, set: Int): Boolean =
     DcacheVdPeek.dirty(dut.dcache, w, set)
   private def waysMatching(dut: Dut, addr: Long): Seq[Int] = {
-    val set = setOf(addr); val tg = tagOf(addr)
-    (0 until Ways).filter(w => wayValid(dut, w, set) && wayTag(dut, w, set) == tg)
+    val set = setOf(dut, addr); val tg = tagOf(dut, addr)
+    (0 until geo(dut).ways).filter(w => wayValid(dut, w, set) && wayTag(dut, w, set) == tg)
   }
 
   /** Plant a persistent duplicate of `AddrA`: fill A and B into two ways of the shared
     * set, then retag B's way to A's tag. Returns the retagged way. */
   private def plantDuplicate(dut: Dut, cd: ClockDomain): Int = {
-    val set = setOf(AddrA)
+    DcacheTestAxi.awaitQuiet(dut.dcache, cd)   // both fills have reached the arrays
+    val set = setOf(dut, AddrA)
     val wA = waysMatching(dut, AddrA)
     assert(wA.size == 1, s"setup: A occupies ${wA.size} ways, expected 1")
-    val wB = waysMatching(dut, AddrB)
+    val wB = waysMatching(dut, addrB(dut))
     assert(wB.size == 1, s"setup: B occupies ${wB.size} ways, expected 1")
     assert(wA.head != wB.head, "setup: A and B landed in the same way")
-    dut.dcache.logic.tagMem(wB.head).setBigInt(set, BigInt(tagOf(AddrA)))
+    dut.dcache.logic.tagMem(wB.head).setBigInt(set, BigInt(tagOf(dut, AddrA)))
     cd.waitSampling()
     val m = waysMatching(dut, AddrA)
     assert(m.size == 2, s"setup failed: ${m.size} ways match A, expected 2")
@@ -151,11 +153,11 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
        VerilatorTest) {
     compiled.doSim("dc_multihot_failsafe", 1) { dut =>
       val (cd, mem) = initDut(dut)
-      preload(mem, AddrA, 16); preload(mem, AddrB, 16)
+      preload(mem, AddrA, 16); preload(mem, addrB(dut), 16)
 
       // non-vacuity: both lines are resident and read back correctly first
       assert(load(dut, cd, AddrA) == expectedLong(AddrA), "cold load of A was wrong")
-      assert(load(dut, cd, AddrB) == expectedLong(AddrB), "cold load of B was wrong")
+      assert(load(dut, cd, addrB(dut)) == expectedLong(addrB(dut)), "cold load of B was wrong")
       assert(load(dut, cd, AddrA) == expectedLong(AddrA), "warm load of A was wrong")
 
       val retagged = plantDuplicate(dut, cd)
@@ -194,8 +196,8 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
   test("a forced persistent duplicate CONVERGES -- the purge terminates", VerilatorTest) {
     compiled.doSim("dc_multihot_terminates", 1) { dut =>
       val (cd, mem) = initDut(dut)
-      preload(mem, AddrA, 16); preload(mem, AddrB, 16)
-      load(dut, cd, AddrA); load(dut, cd, AddrB)
+      preload(mem, AddrA, 16); preload(mem, addrB(dut), 16)
+      load(dut, cd, AddrA); load(dut, cd, addrB(dut))
       plantDuplicate(dut, cd)
 
       // The real closed loop: repeat the access that missed. Without the purge this
@@ -232,13 +234,13 @@ class DcacheMultiHotFailSafeSpec extends AnyFunSuite {
        VerilatorTest) {
     compiled.doSim("dc_multihot_dirty", 1) { dut =>
       val (cd, mem) = initDut(dut)
-      preload(mem, AddrA, 16); preload(mem, AddrB, 16)
-      load(dut, cd, AddrA); load(dut, cd, AddrB)
+      preload(mem, AddrA, 16); preload(mem, addrB(dut), 16)
+      load(dut, cd, AddrA); load(dut, cd, addrB(dut))
 
       // Dirty A's way with a copyback store: this value exists ONLY in the cache.
       val Committed = BigInt("CAFEBABE", 16)
       store(dut, cd, AddrA, Committed)
-      val set = setOf(AddrA)
+      val set = setOf(dut, AddrA)
       val wA = waysMatching(dut, AddrA)
       assert(wA.size == 1 && wayDirty(dut, wA.head, set),
         s"setup: A's way ${wA.mkString} is not dirty after a copyback store")

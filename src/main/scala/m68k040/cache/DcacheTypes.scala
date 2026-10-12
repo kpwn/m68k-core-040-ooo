@@ -299,6 +299,10 @@ trait DcacheService {
     * `nonBlocking`; null otherwise (the untagged `storeAck` pulse stays as `count =/= 0`). */
   def storeCompletion: DStoreAck = null
   def loadProbe: spinal.lib.Stream[DLoadProbe]       // virtual-set read, before translation
+  /** CPU_LS_SPEC_WAKE_ALU: REGISTERED early-probe line result -- valid = the probe in the
+    * line stage hit (one way, usable), payload = its token. A HINT only (the consumer
+    * re-confirms); sole producer DcachePlugin; null when the flag is off. */
+  def probeLineHitHint: spinal.lib.Flow[UInt] = null
   def loadProbeResolve: spinal.lib.Flow[DLoadProbeResolve] // matching registered PA/tag
   def loadProbeCancel: spinal.lib.Flow[DLoadProbeCancel]
   def loadCmd:  spinal.lib.Stream[DLoadCmd]   // resolved VA+PA; virtual index, physical tag

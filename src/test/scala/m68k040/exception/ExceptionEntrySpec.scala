@@ -243,8 +243,11 @@ class ExceptionEntrySpec extends AnyFunSuite {
       assert(dut.dsink.logic.haltExceptionVectorOut.toInt == 4)
       assert((dut.dsink.logic.haltExceptionPcOut.toLong & 0xffffffffL) == faultPc)
       assert((dut.dsink.logic.haltExceptionFaultAddressOut.toLong & 0xffffffffL) == 0L)
-      assert(acceptedStores == 4,
-        s"format-$$0 entry must accept exactly four frame words, saw $acceptedStores")
+      // CPU_EXC_FAST_FRAMES pairs the 4-aligned frame into two aligned LONGs; the
+      // frame BYTES are checked below either way.
+      val expectStores = if (m68k040.top.ShippingCoreConfig.excFastFrames) 2 else 4
+      assert(acceptedStores == expectStores,
+        s"format-$$0 entry must accept exactly $expectStores frame stores, saw $acceptedStores")
 
       // Let stores drain to memory.
       cd.waitSampling(50)

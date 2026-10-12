@@ -83,7 +83,11 @@ object AluEuPlugin {
 
 /** @param lean CPU_ALU1_LEAN: do not build the `AluEuPlugin.alu0Only` datapaths. Only
   *             valid on an EU whose IQ port masks those µops (port 1). */
-class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuService {
+class AluEuPlugin(val lean: Boolean = false,
+                  /** `ShippingCoreConfig.beRetime`: the S1 op-class decodes (the selects of the
+                    * operand / result muxes) are computed from the S0 issue payload and
+                    * REGISTERED alongside `s1Ctx` -- exact (`RegNext(f(u0)) == f(RegNext(u0))`). */
+                  val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime) extends FiberPlugin with AluEuService {
   // Must match the CAS microcode (Microcode.romP2 reads the same global), so it is NOT a
   // per-instance constructor knob.
   private val prfReadTrim: Boolean = m68k040.top.ShippingCoreConfig.prfReadTrim
@@ -236,6 +240,9 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     val s1Nzvc  = RegNext(nzvcRd.data)         // {N(3),Z(2),V(1),C(0)} (toCcr)
     val s1X     = RegNext(xRd.data(0))         // X (toCcr)
     val u1 = s1Ctx.uop
+    // CPU_BE_RETIME: a decode of the S1 µop, either registered from S0 (one flop, exact:
+    // `s1Ctx` is a plain RegNext of the issue payload) or decoded live from `u1`.
+    def dec(f: m68k040.rename.RenamedUop => Bool): Bool = if (beRetime) RegNext(f(u0)) else f(u1)
 
     // ── slow-op classification: the barrel shifter (DecOp.SHIFT) — the 64-wide
     // funnel + shTable + the ROX rmod subtract chain — is the deep part of the
@@ -248,16 +255,16 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // DecOp.BITFIELD used to share this classification (it added two 32-bit barrel
     // rotates + a BFFFO CLZ — a comparable cone). It now runs on the CPLX cluster's own
     // bit-field lane, so SHIFT is the sole slow class here.
-    val isShift = u1.op === DecOp.SHIFT
+    val isShift = dec(_.op === DecOp.SHIFT)
     val isSlow  = isShift
 
     // CPU_ALU1_LEAN: every eu0-only arm below is keyed on one of these; on a lean EU
     // they are elaboration-time False, so the arm's logic (and s1RdB, s1SrSys, the CAS
     // compare datapath ...) has no reader and is not built.
     def full(b: => Bool): Bool = if (lean) False else b
-    val u1FromCcr = full(u1.fromCcr)
-    val u1FromSr  = full(u1.fromSr)
-    val u1ToCcr   = full(u1.toCcr)
+    val u1FromCcr = full(dec(_.fromCcr))
+    val u1FromSr  = full(dec(_.fromSr))
+    val u1ToCcr   = full(dec(_.toCcr))
     if (lean) GenerationFlags.simulation {
       when(issuePort.fire) {
         assert(!AluEuPlugin.alu0Only(issuePort.payload.uop),
@@ -309,8 +316,8 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // is SIGN-EXTENDED to 32 first (Musashi MAKE_INT_16), and (CMPA) the flags are
     // computed at 32-bit width. The size field still sized the cracked LOAD for a
     // .W memory source; here it only selects the sign-extension. ──────────────────
-    val anWide = u1.isMovea && (u1.op =/= DecOp.MOVE)
-    val anWideSrc2 = Mux(u1.size === Size.WORD,
+    val anWide = dec(u => u.isMovea && (u.op =/= DecOp.MOVE))
+    val anWideSrc2 = Mux(dec(_.size === Size.WORD),
                          s1Src2(15 downto 0).asSInt.resize(32).asBits, s1Src2)
     val cmd = AluCmd()
     cmd.op      := u1.op
@@ -328,7 +335,7 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // the old Z so a zero result PRESERVES a prior Z=0 (only clears, never sets, Z) — the
     // multi-precision rule. N/V/C and X are unchanged from the datapath (X = carry/borrow
     // out). ADDX/SUBX reuse NEGX's merge verbatim (all three set readsNzvc).
-    val isExtended = full((u1.op === DecOp.NEGX) || (u1.op === DecOp.ADDX) || (u1.op === DecOp.SUBX))
+    val isExtended = full(dec(u => (u.op === DecOp.NEGX) || (u.op === DecOp.ADDX) || (u.op === DecOp.SUBX)))
     val extZ       = rsp.nzvc(2) && s1Nzvc(2)
     val extNzvc    = rsp.nzvc(3) ## extZ ## rsp.nzvc(1 downto 0)
 
@@ -336,7 +343,7 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // Bit-ops set ONLY Z (= the tested bit's complement, in rsp.nzvc(2)); N/V/C come
     // from the OLD CCR (s1Nzvc — BITOP readsNzvc, so it holds the old flags). X is not
     // written (writesX=False). Same shallow merge mechanism as NEGX's partial Z.
-    val isBitOp  = u1.op === DecOp.BITOP
+    val isBitOp  = dec(_.op === DecOp.BITOP)
     val bitNzvc  = s1Nzvc(3) ## rsp.nzvc(2) ## s1Nzvc(1) ## s1Nzvc(0)   // {N_old, Z, V_old, C_old}
     val aluNzvc  = Mux(isBitOp, bitNzvc, Mux(isExtended, extNzvc, rsp.nzvc))
 
@@ -352,8 +359,8 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     //   dx = s1Src1[7:0] (the dst byte), dy = s1Src2[7:0] (the source byte), xin = old X.
     // NBCD has a distinct byte correction/flag rule (below), not SBCD(0,dy,X).
     // Keep opcode selection after arithmetic, out of the add/sub operand path.
-    val isNbcd = full(u1.op === DecOp.NBCD)
-    val isBcd = full(u1.op === DecOp.BCD) || isNbcd
+    val isNbcd = full(dec(_.op === DecOp.NBCD))
+    val isBcd = full(dec(_.op === DecOp.BCD)) || isNbcd
     val dx    = s1Src1(7 downto 0).asUInt
     val dy    = s1Src2(7 downto 0).asUInt
     val xin   = s1X.asUInt                                   // 0/1
@@ -414,8 +421,8 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // UNPK Dy,Dx,#adj: src=Dy&0xffff; Dx[15:0] := (((src<<4)&0x0F00)|(src&0x000F)+adj)&0xffff;
     //   Dx[31:16] preserved (.W merge uses s1Src1=Dx).
     // Both transcribed verbatim from Musashi m68k_op_pack_16_rr / m68k_op_unpk_16_rr.
-    val isPack = full(u1.op === DecOp.PACK)
-    val isUnpk = full(u1.op === DecOp.UNPK)
+    val isPack = full(dec(_.op === DecOp.PACK))
+    val isUnpk = full(dec(_.op === DecOp.UNPK))
     // ── PACK MEMORY-form (task #198): u1.extByte is repurposed as the mode marker (see
     // Microcode.scala resolve()'s doc comment) — True ONLY for the microcode-ROM PACK
     // compute row (PACK_MEM_ENTRY); the register form (a single-µop MicroOpAssembler fast
@@ -451,7 +458,7 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // (useImm=True): imm[4:0]=static offset, imm[9:5]=static raw-width, imm[10]=Do,
     // imm[11]=Dw. Produce packed = (Do?offDn[4:0]:immOff) | ((Dw?wdDn[4:0]:immWd)<<5),
     // the SAME layout the static imm uses. Result T0; size LONG (full-32 writeback).
-    val isBfResolve = full(u1.op === DecOp.BFRESOLVE)
+    val isBfResolve = full(dec(_.op === DecOp.BFRESOLVE))
     val bfrDo       = s1Src2(10)
     val bfrDw       = s1Src2(11)
     // imm[12] = MEM mode (slice 3c): produce the bfMem packed layout instead of the
@@ -488,7 +495,7 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     //   daBit  = s1Src2(0)      (= imm[0] when useImm: the CAS2.W Rn D/A bit, BIT_1F/BIT_F)
     // `eq` is the size-masked match (loaded == Dc); the CMP NZVC (res = loaded - Dc) reuses
     // the AluDatapath SUB/CMP cone via a dedicated instance below.
-    val casIsOp   = full(u1.op === DecOp.CASOP)
+    val casIsOp   = full(dec(_.op === DecOp.CASOP))
     val casA      = s1Src1
     val casBraw   = s1RdB
     val casC      = s1RdC
@@ -625,7 +632,7 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // no real operand) with the immediate (s1Src2, threaded via the generic IMMEXT
     // srcB slot in MicroOpAssembler). result -> wbObs.result -> ROB sysValStore ->
     // the SAME S_APPLY MOVE_TO_SR write-through (see RobPlugin/ExceptionUnit).
-    val isLogicSr  = full(u1.sysOp && (u1.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u1.op =/= DecOp.MOVE))
+    val isLogicSr  = full(dec(u => u.sysOp && (u.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u.op =/= DecOp.MOVE)))
     val srOldVal   = fromSrRes(15 downto 0).asUInt
     val srImmVal   = s1Src2(15 downto 0).asUInt
     val srLogicRes = u1.op.mux(
@@ -649,7 +656,21 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
     // Arms 3 and 6 are the only two that carry the late `opResult`, and they differ
     // ONLY in whether the size merge applies -- which is precisely what `anWide`
     // decides. Folding `anWide` into the merge mask collapses them into ONE arm:
-    val takeOpRes = !isLogicSr && !casIsOp && (anWide || (!u1.isMovea && !isFromCcrSr))
+    // The final-select composites, each ONE registered decode under CPU_BE_RETIME (the
+    // `lean` constants fold exactly as the live form does).
+    def opResOf(u: m68k040.rename.RenamedUop): Bool = {
+      val aw = u.isMovea && (u.op =/= DecOp.MOVE)
+      val ls = full(u.sysOp && (u.sysKind === m68k040.decode.SysKind.MOVE_TO_SR) && (u.op =/= DecOp.MOVE))
+      val cas = full(u.op === DecOp.CASOP)
+      val fcs = full(u.fromCcr) || full(u.fromSr)
+      !ls && !cas && (aw || (!u.isMovea && !fcs))
+    }
+    def opIsAluOf(u: m68k040.rename.RenamedUop): Bool =
+      !full(u.op === DecOp.BFRESOLVE) && !full(u.op === DecOp.PACK) && !full(u.op === DecOp.UNPK) &&
+      !(full(u.op === DecOp.BCD) || full(u.op === DecOp.NBCD))
+    def keepHiOf(u: m68k040.rename.RenamedUop): Bool = !(u.isMovea && (u.op =/= DecOp.MOVE)) && (u.size =/= Size.LONG)
+    def keepMidOf(u: m68k040.rename.RenamedUop): Bool = !(u.isMovea && (u.op =/= DecOp.MOVE)) && (u.size === Size.BYTE)
+    val takeOpRes = if (beRetime) dec(opResOf) else !isLogicSr && !casIsOp && (anWide || (!u1.isMovea && !isFromCcrSr))
     //   isLogicSr                                  -> F  (arm 1)
     //   !isLogicSr && casIsOp                      -> F  (arm 2)
     //   !isLogicSr && !casIsOp && anWide           -> T  (arm 3)
@@ -661,12 +682,12 @@ class AluEuPlugin(val lean: Boolean = false) extends FiberPlugin with AluEuServi
                      Mux(u1.isMovea, moveaResult, sizeMergedMove)))
     // The partial-register merge mask, per bit-GROUP (three lanes, not 32 bits):
     // "this lane keeps s1Src1's OLD bits". anWide writes An full-32, so it clears it.
-    val keepOldHi  = !anWide && (u1.size =/= Size.LONG)   // [31:16]: BYTE and WORD keep
-    val keepOldMid = !anWide && (u1.size === Size.BYTE)   // [15:8] : only BYTE keeps
+    val keepOldHi  = if (beRetime) dec(keepHiOf) else !anWide && (u1.size =/= Size.LONG)   // [31:16]: BYTE and WORD keep
+    val keepOldMid = if (beRetime) dec(keepMidOf) else !anWide && (u1.size === Size.BYTE)  // [15:8] : only BYTE keeps
     //                                                       [7:0]  : never keeps
-    val takeAluLo  = takeOpRes && opIsAlu
-    val takeAluMid = takeAluLo && !keepOldMid
-    val takeAluHi  = takeAluLo && !keepOldHi
+    val takeAluLo  = if (beRetime) dec(u => opResOf(u) && opIsAluOf(u)) else takeOpRes && opIsAlu
+    val takeAluMid = if (beRetime) dec(u => opResOf(u) && opIsAluOf(u) && !keepMidOf(u)) else takeAluLo && !keepOldMid
+    val takeAluHi  = if (beRetime) dec(u => opResOf(u) && opIsAluOf(u) && !keepHiOf(u)) else takeAluLo && !keepOldHi
     // Everything that is NOT `rsp.result`, resolved per lane in parallel with the adder.
     val restLo  = Mux(takeOpRes, earlyOpResult(7 downto 0), earlyOther(7 downto 0))
     val restMid = Mux(takeOpRes, Mux(keepOldMid, s1Src1(15 downto 8),  earlyOpResult(15 downto 8)),

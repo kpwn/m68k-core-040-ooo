@@ -85,6 +85,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     // in setup (RegfileService requires it). latency=0 so the handler can read the
     // updated A7 the cycle after the exception commits (it is serializing).
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+  var sysRegWr: m68k040.execute.regfile.RegFileWritePort = null
     // Sim-only boot seed of the int PRF (A7 = boot SSP). Shares the "excA7" physical
     // write port (the exc unit is idle at boot, so no same-cycle collision). Driven by
     // the harness for a couple of cycles after the init sweep, before the first fetch.
@@ -105,6 +106,10 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      // CPU_BE_RETIME: the sysOp destination write is STAGED exactly like SocketTop's
+      // (`sysRegWr`); the exception/RTE A7 write stays on time.
+      if (m68k040.top.ShippingCoreConfig.beRetime)
+        sysRegWr = host[m68k040.execute.regfile.IntRegFileService].newStagedWrite(sharingKey = "excA7")
       seedWr = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7", priority = 1)
       a7Rd   = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
@@ -356,6 +361,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
       faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
       faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
+      faBtb.logic.gsPhtStrong0 := gsh.logic.phtStrong0
       faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
       faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1
       faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1
@@ -443,10 +449,20 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       // The a7Write address uses committedPhysA7 (commReg(15)) so the write is correct
       // even when arch-15 has been renamed by an OoO A7 write (move ...,%sp / push /
       // bsr). When A7 is unrenamed, committedPhysA7 == 15, identical to old U(15).
+      if (sysRegWr == null) {
       a7Wr.valid   := exc.a7WriteValid || exc.sysRegWriteValid
       a7Wr.address := Mux(exc.sysRegWriteValid, exc.sysRegWritePhys.resize(a7Wr.address.getWidth),
                                                 host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth))
       a7Wr.data    := Mux(exc.sysRegWriteValid, exc.sysRegWriteData.asBits, exc.a7WriteData.asBits)
+      } else {
+        a7Wr.valid   := exc.a7WriteValid
+        a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+        a7Wr.data    := exc.a7WriteData.asBits
+        sysRegWr.valid   := exc.sysRegWriteValid
+        sysRegWr.address := exc.sysRegWritePhys.resize(sysRegWr.address.getWidth)
+        sysRegWr.data    := exc.sysRegWriteData.asBits
+        exc.a7MirrorHoldIn := RegNext(exc.sysRegWriteValid) init False
+      }
       // LIVE committed-A7 readback: read the int PRF at the committed arch-15 phys mapping
       // and feed it to the exception unit, which drives ss.writeA7 every cycle (routed by
       // committed S,M) so ss.usp/isp/msp track the architectural A7 of the active bank.
@@ -11571,15 +11587,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def runSpecMmioLoadProbe(tag: String, dtt0: Long, cycles: Int = 8000)
       : (Vector[Long], Int, Boolean, Int) = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // TWO cold branches with OPPOSITE static shapes, so the wrong path exists whatever a
+    // cold predictor does: branch A (forward, taken) is mispredicted by fall-through and
+    // by BTFN (a weak counter under CPU_BTBMISS_GSHARE); if A is predicted taken instead
+    // (raw gshare: an untrained weakly-taken counter, or always-taken), branch B
+    // (BACKWARD, never taken) is mispredicted taken. Each wrong path loads from
+    // cache-inhibited device space; the architectural path never does.
     val src =
       "move.l #0x50F0F040,%a0 ; " +
       "moveq #0,%d0 ; " +
       "moveq #7,%d2 ; " +
-      "divu.w %d2,%d0 ; " +          // long-latency producer of the branch condition
+      "moveq #1,%d3 ; " +
+      "divu.w %d2,%d0 ; " +          // long-latency producer of A's condition
       "tst.w %d0 ; " +
-      "beq.s done ; " +              // ARCHITECTURALLY TAKEN; untrained -> predicted fall-through
-      "move.b (%a0),%d1 ; " +        // <-- WRONG-PATH load to cache-inhibited device space
+      "beq.s mid ; " +               // A: ARCHITECTURALLY TAKEN (forward)
+      "move.b (%a0),%d1 ; " +        // <-- WRONG-PATH load (A predicted not-taken)
       "nop ; nop ; " +
+      "wp2: move.b (%a0),%d1 ; " +   // <-- WRONG-PATH load (B predicted taken)
+      "nop ; nop ; " +
+      "bra.s wp2 ; " +
+      "mid: divu.w %d2,%d3 ; " +     // d3 = 1 rem 7 = 0x00010000 -> low word 0
+      "tst.w %d3 ; " +
+      "bne.s wp2 ; " +               // B: ARCHITECTURALLY NOT TAKEN (backward)
       "done: loop: bra.s loop"
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
@@ -11662,7 +11691,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(sawGate,
       "[spec-mmio-dside] VACUOUS PROBE: the wrong-path load to cache-inhibited space never " +
         "reached `p4Valid && p4Inhibited`, so a clean result proves nothing about the guard. " +
-        "Widen the mispredict window or check the branch really is predicted fall-through.")
+        "Widen the mispredict window or check that one of the two cold branches really mispredicts.")
     assert(arHits.isEmpty,
       s"[spec-mmio-dside] SPECULATIVE DEVICE READ on the D side: ${arHits.size} AXI read(s) " +
         s"reached cache-inhibited space from a wrong-path load: " +

@@ -99,7 +99,7 @@ object BranchEuPlugin {
   val IntWbKey = "branchEuIntWb"
 }
 
-class BranchEuPlugin extends FiberPlugin with BranchEuService {
+class BranchEuPlugin(val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime) extends FiberPlugin with BranchEuService {
   var issuePort: Stream[IqContext] = null
   var completionPort: Flow[BranchCompletion] = null
   var trapvFaultPort: Flow[EuFault] = null
@@ -425,8 +425,21 @@ class BranchEuPlugin extends FiberPlugin with BranchEuService {
     // redirects, so addrErr is always False for it).
     val anWrite    = s1Valid && !addrErr && ((u1.ibranch && u1.pdstValid) || condIntWr)
     val intData    = Mux(condIntWr, condIntVal, newAn.asBits)
-    anW.valid     := anWrite;  anW.address := u1.pdst;  anW.data := intData
-    anByp.valid   := anWrite;  anByp.address := u1.pdst; anByp.data := intData
+    // CPU_BE_RETIME: the PRF write VALID no longer waits for the evaluated condition.
+    // `addrErr` = rawRedirect && target(0); for an ibranch rawRedirect is True and target(0)
+    // is the XOR of three registered/uop LSBs (no NZVC); Scc never redirects; only a DBcc's
+    // addrErr depends on `taken`. A DBcc whose odd-target branch faults therefore still
+    // writes its (decremented) pdst -- harmless: the entry faults, never retires, its pdst
+    // is rolled back, and every reader of it is younger and squashed. The sim whitebox
+    // (`wbObs`) keeps the exact `anWrite`.
+    val anWritePrf =
+      if (!beRetime) anWrite
+      else {
+        val indOdd = s1TgtBase(0) ^ u1.imm(0) ^ s1Index(0)
+        s1Valid && ((u1.ibranch && u1.pdstValid && !indOdd) || condIntWr)
+      }
+    anW.valid     := anWritePrf;  anW.address := u1.pdst;  anW.data := intData
+    anByp.valid   := anWritePrf;  anByp.address := u1.pdst; anByp.data := intData
 
     // ---- S1: isCondTrap execute-time conditional fault (vector 7 if cond taken) OR
     // an address-error fault (vector 3, task #189) ----

@@ -55,6 +55,18 @@ object IpcBenchSpec {
 
 class IpcBenchSpec extends CoreBenchHarness {
 
+  /** trap #0 -> handler (addq ; rte) loop: exercises the exception-entry and RTE restart
+    * paths (ExceptionUnit `redirectValid` -> doFlushReg). The retire count is a LOWER bound
+    * (trap/rte may or may not be counted as macros), so the run stops early rather than
+    * hanging. d0 counts handler entries. */
+  def kTrapRte(iters: Int): Kernel = {
+    val setup = Seq("lea 0x00300000,%sp", "lea .Lthand,%a0", "move.l %a0,0x80",
+      "moveq #0,%d0", "moveq #0,%d1", s"move.l #$iters,%d7")
+    val src = (setup ++ Seq(".Ltr: trap #0 ; addq.l #1,%d1 ; subq.l #1,%d7 ; bne.s .Ltr",
+      ".Ltrend: bra.s .Ltrend", ".Lthand: addq.l #1,%d0 ; rte")).mkString(" ; ")
+    Kernel("trap-rte", src, setup.size + (iters - 2) * 4, warmupInstrs = setup.size, copybackDtt = true)
+  }
+
   test("IPC microbenchmark suite", VerilatorTest) {
     val allKernels = Seq(kDependentAlu, kIndependentAlu, kLoadStore, kLoadStream,
       kStoreStream, kSameLineCopyback, kShiftStream, kShiftMixed, kBranchy, kDeepBacklog,
@@ -74,7 +86,16 @@ class IpcBenchSpec extends CoreBenchHarness {
       // IPC_STRCMP_KERNELS=1 appends the Track 6 strcmp kernels (load -> compare ->
       // conditional branch, the shape the board spends its retire stall in and this
       // suite had none of). Opt-in, so the default aggregate stays byte-identical.
-      (if (sys.env.get("IPC_STRCMP_KERNELS").contains("1")) strcmpKernels else Nil)
+      (if (sys.env.get("IPC_STRCMP_KERNELS").contains("1")) strcmpKernels else Nil) ++
+      // IPC_BR_PROBES=1 appends the branch-prediction probes (BranchPredictIpcSpec's set) so
+      // they can be measured under the IPC_V2 + P1 posture (incl. RAS_BRANCH_REPAIR), which
+      // that suite cannot set. IPC_TRAP_KERNEL=1 appends a trap #0 / RTE loop (the only
+      // exception/RTE restart source in the bench). Both opt-in; default aggregate unchanged.
+      (if (sys.env.get("IPC_BR_PROBES").contains("1")) Seq(
+        kBrIndirect(handlers = 32, iters = 1024), kBrCapacity(sites = 256, iters = 8),
+        kBrReturn(depth = 24, iters = 128), kBrPattern(iters = 1024), kBrDbcc(iters = 1024),
+        kBrDbccPair(iters = 1024)) else Nil) ++
+      (if (sys.env.get("IPC_TRAP_KERNEL").contains("1")) Seq(kTrapRte(100)) else Nil)
     // Optional kernel filter for debugging a single kernel (IPC_ONLY=load/store).
     val kernels = sys.env.get("IPC_ONLY") match {
       case Some(sel) => val names = sel.split(',').map(_.trim).toSet; allKernels.filter(k => names.contains(k.name))

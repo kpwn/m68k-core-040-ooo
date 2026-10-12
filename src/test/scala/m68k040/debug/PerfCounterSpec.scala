@@ -78,7 +78,13 @@ class PerfCounterSpec extends AnyFunSuite {
     OFF_PERF_IC_PF_ISSUED -> "ic_pf_issued",
     OFF_PERF_IC_PF_USED   -> "ic_pf_used",
     OFF_PERF_IC_MISS_SEQ  -> "ic_miss_seq",
-    OFF_PERF_IC_PF_LATE   -> "ic_pf_late").map { case (o, n) => (o, n) }
+    OFF_PERF_IC_PF_LATE   -> "ic_pf_late",
+    // Exception-path counters (2026-10-10).
+    OFF_PERF_EXC_ENTRY    -> "exc_entry",
+    OFF_PERF_EXC_ALINE    -> "exc_aline",
+    OFF_PERF_EXC_INT      -> "exc_int",
+    OFF_PERF_EXC_RTE      -> "exc_rte",
+    OFF_PERF_EXC_BUSY     -> "exc_busy").map { case (o, n) => (o, n) }
 
   private val AllWords: Seq[(Int, String)] =
     Counters32 ++ Seq(
@@ -155,9 +161,9 @@ class PerfCounterSpec extends AnyFunSuite {
       val c0 = ctl(b, cd)
       println(s"[perf-csr] $c0")
       assertPerfFeatureWithheld(b, cd, "the producerless standalone fixture")
-      assert(c0.nCounters == 18,
-        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 18 " +
-        "(12 + the 2 mispredict-class + the 4 I-cache prefetch counters). " +
+      assert(c0.nCounters == 23,
+        s"OFF_PERF_CTL[15:8] says ${c0.nCounters} implemented counters, expected 23 " +
+        "(12 + the 2 mispredict-class + the 4 I-cache prefetch + the 5 exception counters). " +
         "The host uses this to decide whether the block exists at all; a wrong value " +
         "makes it either refuse a real block or print a table for an absent one.")
       assert(c0.run, "RUN must be 1 out of debug POR so a build behaves like the " +
@@ -206,7 +212,12 @@ class PerfCounterSpec extends AnyFunSuite {
         ("ic_pf_issued", 0xBBBB000BL, v => csr.perfIcPfIssued   #= BigInt(v)),
         ("ic_pf_used",   0xCCCC000CL, v => csr.perfIcPfUsed     #= BigInt(v)),
         ("ic_miss_seq",  0xDDDD000DL, v => csr.perfIcMissSeq    #= BigInt(v)),
-        ("ic_pf_late",   0xEEEE000EL, v => csr.perfIcPfLate     #= BigInt(v)))
+        ("ic_pf_late",   0xEEEE000EL, v => csr.perfIcPfLate     #= BigInt(v)),
+        ("exc_entry",    0x1E1E0011L, v => csr.perfExcEntry     #= BigInt(v)),
+        ("exc_aline",    0x2E2E0012L, v => csr.perfExcAline     #= BigInt(v)),
+        ("exc_int",      0x3E3E0013L, v => csr.perfExcInt       #= BigInt(v)),
+        ("exc_rte",      0x4E4E0014L, v => csr.perfExcRte       #= BigInt(v)),
+        ("exc_busy",     0x5E5E0015L, v => csr.perfExcBusy      #= BigInt(v)))
       val seedOffsets = Counters32.map(_._1)
       assert(seeds.map(_._1) == Counters32.map(_._2),
         s"the seed table and Counters32 have drifted apart: ${seeds.map(_._1)} vs " +

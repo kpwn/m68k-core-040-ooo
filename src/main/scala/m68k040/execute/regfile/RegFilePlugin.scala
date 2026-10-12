@@ -7,7 +7,8 @@ import spinal.lib.misc.plugin.FiberPlugin
 import scala.collection.mutable.ArrayBuffer
 
 class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileService {
-  private case class WriteReq(port: RegFileWritePort, latency: Int, key: Any, priority: Int)
+  private case class WriteReq(port: RegFileWritePort, latency: Int, key: Any, priority: Int,
+                              staged: Boolean = false)
   private val reads    = ArrayBuffer[(RegFileReadPort, Boolean)]()
   private val writeReq = ArrayBuffer[WriteReq]()
   private val bypasses = ArrayBuffer[RegFileBypassPort]()
@@ -20,6 +21,10 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
   override def newWrite(latency: Int = 1, sharingKey: Any = null, priority: Int = 0): RegFileWritePort = {
     val p = RegFileWritePort(spec.addressWidth, spec.dataWidth)
     writeReq += WriteReq(p, latency, if (sharingKey == null) new Object else sharingKey, priority); p
+  }
+  override def newStagedWrite(sharingKey: Any, priority: Int = 0): RegFileWritePort = {
+    val p = RegFileWritePort(spec.addressWidth, spec.dataWidth)
+    writeReq += WriteReq(p, 1, if (sharingKey == null) new Object else sharingKey, priority, staged = true); p
   }
   override def newBypass(deadProbe: Boolean = false): RegFileBypassPort = {
     val p = RegFileBypassPort(spec.addressWidth, spec.dataWidth)
@@ -111,7 +116,25 @@ class RegFilePlugin(val spec: RegfileSpec) extends FiberPlugin with RegfileServi
           println(s"[RegFile ${spec.name}] physical write-port slot permutation: ${idx.mkString(",")}")
           idx.map(ordered)
       }
-    }.map { grp =>
+    }.map { grp0 =>
+      // STAGED (cold) members, `newStagedWrite`: merged among themselves by priority and
+      // REGISTERED, then the registered bus joins the group as its LOWEST-priority member.
+      // Their combinational request cones (exception FSM, FMOVEM, debug apply) end at that
+      // flop instead of running through the shared priority mux into the RAM write data.
+      val stagedReqs = grp0.filter(_.staged)
+      val grp = grp0.filter(!_.staged) ++ (if (stagedReqs.isEmpty) Nil else {
+        val ss  = stagedReqs.sortBy(-_.priority)
+        val st  = RegFileWritePort(spec.addressWidth, spec.dataWidth)
+        val sv  = ss.map(_.port.valid)
+        st.valid   := RegNext(sv.reduce(_ || _)) init False
+        st.address := RegNext(ss.foldRight(U(0, spec.addressWidth bits)) { case (r, acc) => Mux(r.port.valid, r.port.address, acc) })
+        st.data    := RegNext(ss.foldRight(B(0, spec.dataWidth bits))    { case (r, acc) => Mux(r.port.valid, r.port.data, acc) })
+        if (ss.size > 1) GenerationFlags.simulation {
+          assert(CountOne(Vec(sv)) <= 1,
+            s"RegFile ${spec.name}: two STAGED writers sharing one physical port were valid in the same cycle", FAILURE)
+        }
+        Seq(WriteReq(st, 1, grp0.head.key, Int.MinValue))
+      })
       // sort descending by priority so element 0 is the highest priority
       val sorted = grp.sortBy(-_.priority)
       val bus    = RegFileWritePort(spec.addressWidth, spec.dataWidth)

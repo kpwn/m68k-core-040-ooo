@@ -703,13 +703,22 @@ object GenSocketTopVerilog {
             s"l2TlbEntries=${ShippingCoreConfig.l2TlbEntries} " +
             s"l2TlbSurvive=${ShippingCoreConfig.l2TlbSurvive} " +
             s"l2TlbSnoopGranules=${ShippingCoreConfig.l2TlbSnoopGranules} " +
+            s"lsSpecWakeAlu=${ShippingCoreConfig.lsSpecWakeAlu} " +
+            s"lsSpecWakeAluProbe=${ShippingCoreConfig.lsSpecWakeAluProbe} " +
+            s"feRetime=${ShippingCoreConfig.feRetime} " +
+            s"feRedirectCmd=${ShippingCoreConfig.feRedirectCmd} " +
+            s"beRetime=${ShippingCoreConfig.beRetime} " +
+            s"tc3Retime=${ShippingCoreConfig.tc3Retime} " +
             s"physNzvc=${ShippingCoreConfig.physNzvc} " +
             s"physX=${ShippingCoreConfig.physX} " +
             s"gshareInterleaved=${ShippingCoreConfig.gshareInterleaved} " +
             s"gshareEntries=${ShippingCoreConfig.gshareEntries} " +
+            s"gshareHistBits=${ShippingCoreConfig.gshareHistBits} " +
             s"btbNoCounter=${ShippingCoreConfig.btbNoCounter} " +
             s"ghrTrim=${ShippingCoreConfig.ghrTrim} " +
             s"alu1Lean=${ShippingCoreConfig.alu1Lean} " +
+            s"excFastFrames=${ShippingCoreConfig.excFastFrames} " +
+            s"excFramesCopyback=${ShippingCoreConfig.excFramesCopyback} " +
             s"pairCorrectBranch=${ShippingCoreConfig.pairCorrectBranch} " +
             s"dcacheEarlyProbeLineForward=${ShippingCoreConfig.dcacheEarlyProbeLineForward} " +
             s"dcacheHitUnderMiss=${ShippingCoreConfig.dcacheHitUnderMiss} " +
@@ -725,8 +734,11 @@ object GenSocketTopVerilog {
             s"computeDirectTargets=${ShippingCoreConfig.computeDirectTargets} " +
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
+            s"btbMissGshare=${ShippingCoreConfig.btbMissGshare} " +
+            s"btbMissGshareWeak=${ShippingCoreConfig.btbMissGshareWeak} " +
             s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
+            s"dtlbVictimEntries=${ShippingCoreConfig.dtlbVictimEntries} " +
             // ⚠️ ADDED BY THE INTEGRATION MERGE. `perf/sq-congestion` added both knobs
             // to `ShippingCoreConfig` and neither to this line, so a `SQ_DEPTH=4` or
             // `SQ_NARROW_MERGE=1` build was indistinguishable from the default in its
@@ -760,7 +772,8 @@ object GenSocketTopVerilog {
             // RobPlugin constructor DEFAULTS (the `sqDepth` precedent).
             s"flushFromSquash=${ShippingCoreConfig.flushFromSquash} " +
             s"coldWbShare=${ShippingCoreConfig.coldWbShare} " +
-            s"walkSqCheck=${ShippingCoreConfig.walkSqCheck}")
+            s"walkSqCheck=${ShippingCoreConfig.walkSqCheck} " +
+            s"umAtomic=${ShippingCoreConfig.umAtomic}")
     M68kSpinalConfig(targetDirectory = outputDirectory)
       .generateVerilog(new M68kSocketTop(M68kParams(), dbgBuildId,
         detailedPerf = detailedPerf, ipcThroughput = ipcThroughput,
