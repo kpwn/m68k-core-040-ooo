@@ -563,13 +563,13 @@ object ShippingCoreConfig {
     * fetchPc/ringStale/pendingDrop next-state, FTB-applied target as the last
     * `cmdWindowPc` select, and decode's 3-uop deferral off the fused-MOVE count override.
     * Every arm carries a simulation-only oracle against the original expression. */
-  val feRetime: Boolean = envFlag("CPU_FE_RETIME", false)
+  val feRetime: Boolean = envFlag("CPU_FE_RETIME", true)
   /** Kill the dead redirect-cycle fetch command (`CPU_FE_REDIRECT_CMD`, default OFF pending
     * measurement). On the ROB's early mispredict redirect (`earlyFire`) FetchAlign issues the
     * redirect TARGET as that cycle's I-cache command (from a replicated `earlyFire` register,
     * outermost `cmdWindowPc` select) instead of a born-stale command from the old fetchPc:
     * one cycle off every early-redirect restart. Echoed in `SHIPPING_CONFIG`. */
-  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", false)
+  val feRedirectCmd: Boolean = envFlag("CPU_FE_REDIRECT_CMD", true)
   /** Physical NZVC (condition-code) register pool size. Rename stalls on an empty NZVC
     * freelist (16 phys - 1 arch = 15 in flight) while the 32-entry ROB is half empty,
     * because nearly every ALU op writes NZVC. 16 is the shipping default; 32 is the
@@ -843,6 +843,17 @@ object ShippingCoreConfig {
     * Cycle-changing parts (cold paths only): the staged PRF writes, the DTLB flush, FPIAR.
     * Echoed in `SHIPPING_CONFIG`. */
   val beRetime: Boolean = envFlag("CPU_BE_RETIME", true)
+  /** 200 MHz timing round 3 (i11 tail). Default OFF = identical netlist.
+    *  - LSU P4 launch gate: the SQ age-qualified barrier verdicts are REGISTERED. P4's
+    *    held op re-queries the existing barrier port; the op entering from P3 is queried a
+    *    cycle early on a second SQ port. Hot (cacheable, no device store resident) path is
+    *    cycle-identical; an inhibited op/store may wait one extra cycle.
+    *  - D-cache duplicate-line purge (multi-hot repair, never fires in normal operation):
+    *    written one cycle after detection at LOWEST write priority, off the valids WE cone.
+    *  - ROB `lsSqFlushReg`: the exception rising edge comes from the IDLE-state exit
+    *    condition instead of `stateNext` (exact).
+    * Echoed in `SHIPPING_CONFIG`. */
+  val tc3Retime: Boolean = envFlag("CPU_TC3_RETIME", true)
   /** Exception fast frames (review §4.7/§2.8): the ExceptionUnit's entry frame push and
     * RTE frame pop are issued as aligned LONGs where a 4-aligned frame pair allows it
     * (format-$0 push: 4 word stores -> 2 long stores, or 3 when the frame base is only

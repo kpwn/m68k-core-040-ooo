@@ -378,7 +378,9 @@ class DcachePlugin(val socketMerged: Boolean = false,
                      * S3 old-line clock enables and a one-cycle-late multi-hot debug latch. */
                    val tagCeRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheTagCeRetime,
                    /** See `ShippingCoreConfig.beRetime`. */
-                   val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime)
+                   val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
+                   /** See `ShippingCoreConfig.tc3Retime`. */
+                   val tc3Retime: Boolean = m68k040.top.ShippingCoreConfig.tc3Retime)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -691,6 +693,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val dirtysVoteD3 = Vec.fill(ways)(False)   // D3: maint CHECK-invalidate
     val dirtysVoteD4 = Vec.fill(ways)(False)   // D4: maint WRB-clean
     val dirtysVoteD5 = Vec.fill(ways)(False)   // D5: store-S3-copyback
+    // CPU_TC3_RETIME: the multi-hot duplicate purge, REGISTERED and at the LOWEST write
+    // priority (first in source order, so every other writer overrides it). Its detection
+    // cone (probe resolve / S1 / S2 tag compares, which reach back through the LS EU's
+    // P4->P3->TX ready chain) leaves the valids WE/WADR/WD; the write reads two flops.
+    // A purge overridden by another writer is simply dropped: the duplicate persists and
+    // is re-detected (and re-purged) by the next lookup of that set. Inputs are driven at
+    // the detection site below.
+    val tc3PurgeWayR: Vec[Bool] = if (tc3Retime) Vec.fill(ways)(RegInit(False)) else null
+    val tc3PurgeSetR: UInt = if (tc3Retime) Reg(UInt(setBits bits)) init 0 else null
+    if (tc3Retime) {
+      for (w <- 0 until ways) when(tc3PurgeWayR(w)) {
+        validsWrEn(w)   := True
+        validsWrSet(w)  := tc3PurgeSetR
+        validsWrData(w) := False
+      }
+    }
     when(resetSweepBusy) {
       for (w <- 0 until ways) {
         validsWrEn(w)   := True
@@ -4595,12 +4613,29 @@ class DcachePlugin(val socketMerged: Boolean = false,
     for (e <- Seq(dbgMultiHotLoad, dbgMultiHotProbe, dbgMultiHotStore)) {
       e.sticky.simPublic(); e.count.simPublic(); e.addr.simPublic()
     }
-    when(dupPurgeFire) {
-      for (w <- 0 until ways) when(dupPurgeVec(w) && !rdDirty(w)) {
-        validsWrEn(w)   := True
-        validsWrSet(w)  := dupPurgeSet
-        validsWrData(w) := False
-        validsVoteW4(w) := True    // Task #255 exclusivity tripwire (W4)
+    if (!tc3Retime) {
+      when(dupPurgeFire) {
+        for (w <- 0 until ways) when(dupPurgeVec(w) && !rdDirty(w)) {
+          validsWrEn(w)   := True
+          validsWrSet(w)  := dupPurgeSet
+          validsWrData(w) := False
+          validsVoteW4(w) := True    // Task #255 exclusivity tripwire (W4)
+        }
+      }
+    } else {
+      // Registered purge (see `tc3PurgeWayR`): `rdDirty` is sampled with the detecting
+      // read, exactly as the immediate purge used it. Re-armed only while the arrays are
+      // free (`dupPurgeArmed` is already in `dupPurgeFire`).
+      for (w <- 0 until ways) tc3PurgeWayR(w) := dupPurgeFire && dupPurgeVec(w) && !rdDirty(w)
+      tc3PurgeSetR := dupPurgeSet
+      GenerationFlags.simulation {
+        // A delayed purge must never invalidate a line made dirty in its own write cycle
+        // (that would discard a committed store).
+        for (w <- 0 until ways)
+          assert(!(tc3PurgeWayR(w) && (validsWrSet(w) === tc3PurgeSetR) && !validsWrData(w) &&
+                   dirtysWrEn(w) && dirtysWrData(w) && (dirtysWrSet(w) === tc3PurgeSetR)),
+            "DcachePlugin(tc3Retime): a delayed duplicate purge collided with a dirty write to its line",
+            FAILURE)
       }
     }
     GenerationFlags.simulation {

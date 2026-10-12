@@ -3722,7 +3722,10 @@ class RobPlugin(val detailedPerf: Boolean = false,
     // flops built in the top-level wiring and fanned to ~40 LSU sites) as ONE exact flop:
     // D = doFlushNext || (exc.activeNext && !exc.active). Asserted equal below.
     val lsSqFlushReg: Bool = if (!beRetime) null else {
-      val r = RegInit(False); r := doFlushNext || (exc.activeNext && !exc.active); r.simPublic(); r }
+      val r = RegInit(False)
+      r := doFlushNext || (if (m68k040.top.ShippingCoreConfig.tc3Retime) exc.enterNext
+                           else (exc.activeNext && !exc.active))
+      r.simPublic(); r }
     GenerationFlags.simulation {
       when(!ClockDomain.current.isResetActive) {
         assert(backendSquash === (doFlushReg || exc.active),

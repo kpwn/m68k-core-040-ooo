@@ -3663,6 +3663,16 @@ class ExceptionUnit(
     * is bit-identical to `active` on every cycle) or pre-OR it with another registered
     * term, instead of all consumers sharing this one 205-fanout flop. */
   val activeNext = Bool()
+  /** `CPU_TC3_RETIME`: rising edge of `active` (`activeNext && !active`) from the IDLE
+    * state's own exit condition, without `stateNext` (whose cone includes every busy
+    * state's D-cache handshake). IDLE's only transitions are the three trigger arms. */
+  val enterNext: Bool = if (!m68k040.top.ShippingCoreConfig.tc3Retime) null else {
+    val e = fsm.isActive(fsm.IDLE) && (entryTrigger || rteTrigger || sysTrigger)
+    GenerationFlags.simulation {
+      assert(e === (activeNext && !activeReg), "ExceptionUnit: enterNext drifted from rising(activeNext)", FAILURE)
+    }
+    e
+  }
   fsm.postBuild {
     activeNext := (fsm.stateNext =/= fsm.enumOf(fsm.IDLE))
     activeReg  := activeNext

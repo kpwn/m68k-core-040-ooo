@@ -115,7 +115,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
                  p3LineProbe: Boolean = false,
                  /** `ShippingCoreConfig.lsParkRetime`: export `io.anyInhibited` (any resident
                    * entry has an INHIBITED half, any age). False elaborates nothing. */
-                 anyInhibitedOut: Boolean = false) extends Component {
+                 anyInhibitedOut: Boolean = false,
+                 /** `ShippingCoreConfig.tc3Retime`: a second, independent age-qualified
+                   * barrier query (`io.barrierP3`) so the LS EU can register the verdict for
+                   * the op about to enter P4. False elaborates nothing. */
+                 barrierP3Out: Boolean = false) extends Component {
   require(isPow2(depth))
   require(!coalesceLines || depth >= 4, "full-line coalescing needs a ring of at least 4")
   require(Set(2, 4, 8, 16)(retireWidth))
@@ -162,6 +166,11 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
       val olderStore          = out(Bool())   // ANY older resident store
       val olderInhibitedStore = out(Bool())   // an older resident DEVICE store
     }
+    val barrierP3 = if (barrierP3Out) new Bundle {
+      val robId               = in(UInt(m68k040.Global.ROB_ID_W_DEFAULT bits))
+      val olderStore          = out(Bool())
+      val olderInhibitedStore = out(Bool())
+    } else null
     // Back-pressure to the LS-EU: high when the ring is FULL (all `depth` entries
     // resident). The LS-EU reads this ONLY in its execute/alloc FSM (a `WAIT_SQ`
     // stall, off the IQ issue-select cone) and holds a store's alloc until an entry
@@ -1658,6 +1667,14 @@ class StoreQueue(depth: Int = 8, subwordForwarding: Boolean = false,
     barrierEnt(i) && ((cacheModes(i) === CacheMode.INHIBITED) ||
                       (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))).reduce(_ || _)
   io.barrier.olderStore.simPublic(); io.barrier.olderInhibitedStore.simPublic()
+  if (barrierP3Out) {
+    val entP3 = (0 until depth).map(i =>
+      valids(i) && (committed(i) || olderThan(robIds(i), io.barrierP3.robId)))
+    io.barrierP3.olderStore := entP3.reduce(_ || _)
+    io.barrierP3.olderInhibitedStore := (0 until depth).map(i =>
+      entP3(i) && ((cacheModes(i) === CacheMode.INHIBITED) ||
+                   (validBs(i) && (cacheModesB(i) === CacheMode.INHIBITED)))).reduce(_ || _)
+  }
 
   // ---- debug-only observability (task #139 finding #1 investigation) ----
   // Zero synth impact (sim tap only, not referenced by any RTL logic).
