@@ -265,6 +265,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       fa.logic.gsBtbHit0      := btb.logic.predHitComb
       fa.logic.gsBtbType0     := btb.logic.predTypeComb
       fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
+      fa.logic.gsPhtStrong0 := gsh.logic.phtStrong0
       fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
       fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
       fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
@@ -405,6 +406,7 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
                     deferSlot1Uncond: Boolean = false,
                     deferSlot1Dbcc: Boolean = false,
                     btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
+                    btbMissGshareWeak: Int = m68k040.top.ShippingCoreConfig.btbMissGshareWeak,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment,
                     shippingProfile: Boolean = false,
@@ -448,7 +450,8 @@ trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional,
       computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
-      deferSlot1Dbcc = deferSlot1Dbcc, btbMissGshare = btbMissGshare)
+      deferSlot1Dbcc = deferSlot1Dbcc, btbMissGshare = btbMissGshare,
+      btbMissGshareWeak = btbMissGshareWeak)
     val dec    = if (shippingProfile) m68k040.top.ShippingPlugins.decode(shippingIpc)
                  else new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
                    fuseLongMoveLoads = fuseLongMoveLoads)

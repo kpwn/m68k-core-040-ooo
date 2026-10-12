@@ -12,9 +12,10 @@ import spinal.core.sim._
   * target. Properties, checked on both arms:
   *
   *  1. GHR CONSISTENCY. `gs-chain` is a run of FRESH sites (every branch PC executes
-  *     once, so it always misses the BTB): forward `beq` ALWAYS taken (a cold PHT counter
-  *     is weakly-taken => predicted right) and every 4th site a forward `bne` NEVER taken
-  *     (predicted taken => mispredict, a flush and a 0 history bit). The run ends with
+  *     once, so it always misses the BTB and reads an untrained, WEAK counter, which
+  *     `btbMissGshareWeak = 1` resolves with BTFN): backward `beq` ALWAYS taken
+  *     (predicted right), forward `bne` NEVER taken (right) and forward `beq` ALWAYS
+  *     taken (mispredict, a flush). The run ends with
   *     several correctly predicted taken sites and no flush, so at the end the
   *     speculative `ghr` must equal the retire-time `ghrArch` bit for bit. Omitting the
   *     shift, shifting the wrong direction, or stamping `phtValid` without a shift (or
@@ -24,21 +25,33 @@ import spinal.core.sim._
   *  2. RECOVERY, BOTH DIRECTIONS. `gs-loops` mixes DBRA / Bcc counted loops, a backward
   *     Bcc never taken and a forward Bcc always taken at many BTB-aliasing sites; the d0
   *     checksum gives each path a distinct weight.
-  *  3. The ON arm actually fires and removes most `gs-chain` mispredicts. */
+  *  3. The ON arm actually fires and removes most `gs-chain` mispredicts.
+  *  4. COLD START: on `mixed` (40 fresh never-taken forward beqs) the ON arm mispredicts
+  *     no more than OFF -- untrained counters do not override the static default. */
 class BtbMissGshareIpcSpec extends CoreBenchHarness {
 
   private def kChain(sites: Int, label: String = "gs-chain"): Kernel = {
     val setup = Seq("lea 0x00300000,%sp", "moveq #0,%d0", "moveq #1,%d1", "move.l #0x100,%d4")
-    // kind A (i%4 != 1): moveq #0 ; beq.s skip (taken) ; add d4 ; skip: add d1   d0 += 1
-    // kind B (i%4 == 1, not in the last 5: the 5-taken tail keeps the last 0 bit inside the 10-bit GHR): moveq #0 ; bne.s skip (never) ; add d1 ; skip: nop   d0 += 1
+    // Every branch PC executes once (always a BTB miss, its PHT counter untrained = weak).
+    // kind A (default): a BACKWARD beq, always taken -- BTFN (weak counter) predicts it
+    //   right; the flag-OFF fall-through mispredicts it.
+    //   bra.s F ; B: add d1 ; bra.s N ; F: moveq #0 ; beq.s B ; add d4 ; N:     d0 += 1
+    // kind B (i%4 == 1): a FORWARD bne, never taken -- right on both arms.
+    // kind C (i%4 == 3): a FORWARD beq, always taken -- a weak counter falls back to
+    //   forward-not-taken, so it mispredicts on BOTH arms (a flush and a 1 history bit).
+    // The last 5 sites are kind A: a tail of correctly predicted shifts and no flush.
+    val tail = 5
     val body = (0 until sites).map { i =>
-      if (i % 4 == 1 && i < sites - 5) s"moveq #0,%d2 ; bne.s .Ck$i ; add.l %d1,%d0 ; .Ck$i: nop"
-      else s"moveq #0,%d2 ; beq.s .Ck$i ; add.l %d4,%d0 ; .Ck$i: add.l %d1,%d0"
+      if (i % 4 == 1 && i < sites - tail) s"moveq #0,%d2 ; bne.s .Ck$i ; add.l %d1,%d0 ; .Ck$i: nop"
+      else if (i % 4 == 3 && i < sites - tail) s"moveq #0,%d2 ; beq.s .Ck$i ; add.l %d4,%d0 ; .Ck$i: add.l %d1,%d0"
+      else s"bra.s .Cf$i ; .Cb$i: add.l %d1,%d0 ; bra.s .Cn$i ; .Cf$i: moveq #0,%d2 ; beq.s .Cb$i ; add.l %d4,%d0 ; .Cn$i: nop"
     }
     val pad = Seq.fill(8)("nop")
     val src = (setup ++ body ++ Seq(pad.mkString(" ; "), ".Cend: bra.s .Cend")).mkString(" ; ")
-    val nB = (0 until sites).count(i => i % 4 == 1 && i < sites - 5)
-    Kernel(label, src, setup.size + sites * 3 + nB + pad.size,
+    val retired = (0 until sites).map { i =>
+      if ((i % 4 == 1 || i % 4 == 3) && i < sites - tail) (if (i % 4 == 1) 4 else 3) else 6
+    }.sum
+    Kernel(label, src, setup.size + retired + pad.size,
       warmupInstrs = setup.size,
       verifyRetirement = obs => {
         val got = obs.filter(o => o.archRegValid && o.archRegId == 0).last.archRegWrite & 0xffffffffL
@@ -83,11 +96,12 @@ class BtbMissGshareIpcSpec extends CoreBenchHarness {
       earlyLsNzvcWakeup = true, detachedStoreEntries = 4, earlyAutoStoreAddress = true,
       earlyAutoAnWriteback = true, rasBranchRepair = true, rasBranchSnapshot = true,
       computeDirectTargets = true, deferSlot1Uncond = true, deferSlot1Dbcc = true,
-      btbMissGshare = on))
+      btbMissGshare = on, btbMissGshareWeak = 1))
 
     val chain = kChain(96)
     val loops = kLoops(48, 6)
-    val kernels = Seq(chain, loops, kBranchy, kHotLoop)
+    val mixed = kMixed
+    val kernels = Seq(chain, loops, kBranchy, kHotLoop, mixed)
     val seed = sys.env.get("IPC_SEED").map(_.toInt).getOrElse(1)
 
     val arms = Seq(false, true).map { on =>
@@ -134,5 +148,12 @@ class BtbMissGshareIpcSpec extends CoreBenchHarness {
     assert(arms(true)(chain.name)._2.fires >= 64, "chain: the BTB-miss gshare path must fire on the fresh beqs")
     assert(cOff >= 60 && cOn <= cOff / 2, s"chain: BTB-miss gshare must remove most fresh taken mispredicts (off=$cOff on=$cOn)")
     assert(arms(true)(loops.name)._2.fires > 0, "loops: BTB-miss gshare never fired")
+    // COLD START: `mixed`'s 40 fresh forward beqs are never taken. Untrained (weakly-taken)
+    // counters must NOT override the static default: the weak-counter BTFN fallback
+    // predicts them not-taken, exactly like the flag-OFF fall-through (raw gshare: 40/40).
+    val mOff = arms(false)(mixed.name)._1.retiredMispredicts
+    val mOn  = arms(true)(mixed.name)._1.retiredMispredicts
+    assert(arms(true)(mixed.name)._2.fires >= 40, "mixed: the BTB-miss gshare path must fire on the fresh beqs")
+    assert(mOn <= mOff, s"mixed: weak/untrained counters overrode the static default (off=$mOff on=$mOn)")
   }
 }

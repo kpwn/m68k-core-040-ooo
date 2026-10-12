@@ -164,7 +164,11 @@ class GsharePlugin(retainRedirectHistory: Boolean = false,
     // ---- combinational read: phtTaken (>=2) + the 11-bit index, per query PC ----
     val phtIndex0 = indexOf(queryPc0)
     val phtIndex1 = indexOf(queryPc1)
-    val phtTaken0 = (readCounter(phtIndex0) >= U(2, 2 bits))
+    val phtCtr0   = readCounter(phtIndex0)
+    val phtTaken0 = (phtCtr0 >= U(2, 2 bits))
+    // Slot-0 counter is SATURATED (0 or 3): FetchAlign's BTB-miss conditional
+    // (`btbMissGshareWeak`) trusts only these; same read as `phtTaken0`.
+    val phtStrong0 = phtCtr0(1) === phtCtr0(0)
     val phtTaken1 = (readCounter(phtIndex1) >= U(2, 2 bits))
     phtIndex0.simPublic(); phtIndex1.simPublic()
     phtTaken0.simPublic(); phtTaken1.simPublic()

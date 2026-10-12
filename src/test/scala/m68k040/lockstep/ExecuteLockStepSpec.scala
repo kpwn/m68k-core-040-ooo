@@ -361,6 +361,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
       faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
       faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
+      faBtb.logic.gsPhtStrong0 := gsh.logic.phtStrong0
       faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
       faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1
       faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1
@@ -11586,15 +11587,28 @@ class ExecuteLockStepSpec extends AnyFunSuite {
   private def runSpecMmioLoadProbe(tag: String, dtt0: Long, cycles: Int = 8000)
       : (Vector[Long], Int, Boolean, Int) = {
     val loadAddr = ProgramAssembler.DefaultLoadAddress
+    // TWO cold branches with OPPOSITE static shapes, so the wrong path exists whatever a
+    // cold predictor does: branch A (forward, taken) is mispredicted by fall-through and
+    // by BTFN (a weak counter under CPU_BTBMISS_GSHARE); if A is predicted taken instead
+    // (raw gshare: an untrained weakly-taken counter, or always-taken), branch B
+    // (BACKWARD, never taken) is mispredicted taken. Each wrong path loads from
+    // cache-inhibited device space; the architectural path never does.
     val src =
       "move.l #0x50F0F040,%a0 ; " +
       "moveq #0,%d0 ; " +
       "moveq #7,%d2 ; " +
-      "divu.w %d2,%d0 ; " +          // long-latency producer of the branch condition
+      "moveq #1,%d3 ; " +
+      "divu.w %d2,%d0 ; " +          // long-latency producer of A's condition
       "tst.w %d0 ; " +
-      "beq.s done ; " +              // ARCHITECTURALLY TAKEN; untrained -> predicted fall-through
-      "move.b (%a0),%d1 ; " +        // <-- WRONG-PATH load to cache-inhibited device space
+      "beq.s mid ; " +               // A: ARCHITECTURALLY TAKEN (forward)
+      "move.b (%a0),%d1 ; " +        // <-- WRONG-PATH load (A predicted not-taken)
       "nop ; nop ; " +
+      "wp2: move.b (%a0),%d1 ; " +   // <-- WRONG-PATH load (B predicted taken)
+      "nop ; nop ; " +
+      "bra.s wp2 ; " +
+      "mid: divu.w %d2,%d3 ; " +     // d3 = 1 rem 7 = 0x00010000 -> low word 0
+      "tst.w %d3 ; " +
+      "bne.s wp2 ; " +               // B: ARCHITECTURALLY NOT TAKEN (backward)
       "done: loop: bra.s loop"
     val image = ProgramAssembler.assemble(src, loadAddr) match {
       case Right(i)  => i
@@ -11677,7 +11691,7 @@ class ExecuteLockStepSpec extends AnyFunSuite {
     assert(sawGate,
       "[spec-mmio-dside] VACUOUS PROBE: the wrong-path load to cache-inhibited space never " +
         "reached `p4Valid && p4Inhibited`, so a clean result proves nothing about the guard. " +
-        "Widen the mispredict window or check the branch really is predicted fall-through.")
+        "Widen the mispredict window or check that one of the two cold branches really mispredicts.")
     assert(arHits.isEmpty,
       s"[spec-mmio-dside] SPECULATIVE DEVICE READ on the D side: ${arHits.size} AXI read(s) " +
         s"reached cache-inhibited space from a wrong-path load: " +

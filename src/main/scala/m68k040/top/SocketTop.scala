@@ -728,6 +728,7 @@ object GenSocketTopVerilog {
             s"deferSlot1Uncond=${ShippingCoreConfig.deferSlot1Uncond} " +
             s"deferSlot1Dbcc=${ShippingCoreConfig.deferSlot1Dbcc} " +
             s"btbMissGshare=${ShippingCoreConfig.btbMissGshare} " +
+            s"btbMissGshareWeak=${ShippingCoreConfig.btbMissGshareWeak} " +
             s"decodePair3p1=${ShippingCoreConfig.decodePair3p1} " +
             s"itlbVictimEntries=${ShippingCoreConfig.itlbVictimEntries} " +
             s"dtlbVictimEntries=${ShippingCoreConfig.dtlbVictimEntries} " +

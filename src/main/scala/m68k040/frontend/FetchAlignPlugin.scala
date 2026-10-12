@@ -41,6 +41,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                        deferSlot1Dbcc: Boolean = false,
                        /** `ShippingCoreConfig.btbMissGshare` (CPU_BTBMISS_GSHARE). */
                        btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
+                       /** `ShippingCoreConfig.btbMissGshareWeak` (CPU_BTBMISS_GSHARE_WEAK). */
+                       btbMissGshareWeak: Int = m68k040.top.ShippingCoreConfig.btbMissGshareWeak,
                        /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
                        feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime,
                        /** `ShippingCoreConfig.feRedirectCmd` (CPU_FE_REDIRECT_CMD). */
@@ -318,6 +320,8 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
     gsBtbType0.allowOverride;  gsBtbType0  := U(0, 2 bits)
     gsPhtTaken0.allowOverride; gsPhtTaken0 := False
     gsPhtIndex0.allowOverride; gsPhtIndex0 := U(0, m68k040.Global.PHT_IDX_W bits)
+    // Slot-0 PHT counter saturated (0/3) -- read only by `btbMissGshareWeak == 1`.
+    val gsPhtStrong0 = Bool(); gsPhtStrong0.allowOverride; gsPhtStrong0 := False
     gsPhtTaken1.allowOverride; gsPhtTaken1 := False
     gsPhtIndex1.allowOverride; gsPhtIndex1 := U(0, m68k040.Global.PHT_IDX_W bits)
     // GHR shift outputs (driven below on the emitted predicted conditional).
@@ -1336,6 +1340,13 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
           Mux(s0GsDispW, res.slot0.lenWords === U(2, 4 bits), res.slot0.lenWords === U(1, 4 bits))) ||
          (s0GsIsDbcc && res.slot0.lenWords === U(2, 4 bits)))
       else False
+    // Direction of a BTB-miss conditional. `btbMissGshareWeak == 1`: a weak counter
+    // (1/2, incl. every untrained one) yields the static BTFN default -- the sign of the
+    // displacement (opword low byte, or the extension word for disp16 / DBcc).
+    val gsMissDir = if (btbMissGshare && btbMissGshareWeak == 1) {
+        val s0GsBackward = Mux(s0GsDispW || s0GsIsDbcc, res.slot0.words(1)(15), s0op(7))
+        Mux(gsPhtStrong0, gsPhtTaken0, s0GsBackward)
+      } else gsPhtTaken0
     // Slot-0 conditional whose direction comes from gshare (BTB hit OR, with the flag, miss).
     val condGs0 = if (btbMissGshare) condBtbHit0 || slot0CondMiss else condBtbHit0
     spinal.core.sim.SimPublic(slot0CondMiss)
@@ -1440,7 +1451,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                                         res.slot0.lenWords === U(1, 4 bits))
     // `btbMissGshare`: a BTB-miss conditional gshare predicts TAKEN uses the same
     // registered computed-target redirect (target = `s0RelTarget`).
-    val slot0GsMissTaken = if (btbMissGshare) slot0CondMiss && gsPhtTaken0 else False
+    val slot0GsMissTaken = if (btbMissGshare) slot0CondMiss && gsMissDir else False
     val slot0ComputedPred = (if (computeDirectTargets)
         res.slot0Valid && res.slot0.simple && slot0IsCtrlXfer && s0RelIsUncond &&
         !s0RelDispL && s0RelLenOk && !slot0IsPred && !rasPredictSlot0
@@ -1970,7 +1981,7 @@ class FetchAlignPlugin(enableFetchDirected: Boolean = false, ftqDepth: Int = 32,
                     (feed.fire && brPredLive1)
     // `btbMissGshare`: a BTB-miss conditional shifts its gshare direction (slot0PredTaken
     // is the BTB-sourced bit, False on a miss).
-    val slot0GsDir = if (btbMissGshare) Mux(slot0CondMiss, gsPhtTaken0, slot0PredTaken) else slot0PredTaken
+    val slot0GsDir = if (btbMissGshare) Mux(slot0CondMiss, gsMissDir, slot0PredTaken) else slot0PredTaken
     gsShiftDir   := Mux(brPredLive1, False, Mux(ftqConfirmCond, True, slot0GsDir))
     GenerationFlags.simulation {
       if (trainSlot1Conditional) when(feed.fire) {

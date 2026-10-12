@@ -263,6 +263,7 @@ class FuzzWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlu
     faBtb.logic.gsBtbHit0   := btb.logic.predHitComb
     faBtb.logic.gsBtbType0  := btb.logic.predTypeComb
     faBtb.logic.gsPhtTaken0 := gsh.logic.phtTaken0
+    faBtb.logic.gsPhtStrong0 := gsh.logic.phtStrong0
     faBtb.logic.gsPhtIndex0 := gsh.logic.phtIndex0
     faBtb.logic.gsPhtTaken1 := gsh.logic.phtTaken1
     faBtb.logic.gsPhtIndex1 := gsh.logic.phtIndex1

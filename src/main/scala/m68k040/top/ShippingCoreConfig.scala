@@ -323,6 +323,14 @@ object ShippingCoreConfig {
     * echoed in `SHIPPING_CONFIG`. */
   val btbMissGshare: Boolean = envFlag("CPU_BTBMISS_GSHARE", false)
 
+  /** `CPU_BTBMISS_GSHARE` sub-knob: which PHT counters a BTB-MISS conditional trusts.
+    *   0 = every counter (raw gshare: an untrained weakly-taken counter predicts TAKEN);
+    *   1 = only a STRONG counter (0 or 3); a WEAK one (1 or 2) -- which includes every
+    *       untrained counter, init 2 -- falls back to the static BTFN default (backward
+    *       taken, forward not taken). The branch is still a gshare history/training event.
+    * Ignored while `CPU_BTBMISS_GSHARE` is off. Echoed in `SHIPPING_CONFIG`. */
+  val btbMissGshareWeak: Int = envInt("CPU_BTBMISS_GSHARE_WEAK", 1, 0, 1)
+
   /** Decode: let a 3-uop slot-0 crack (e.g. `move.l (a0)+,d0` / `cmp.b (a1)+,d0` =
     * [load][An += n][op]) PAIR with a 1-uop slot-1 instruction in the same push. The
     * MicroOpQueue push is already 4 wide (and accepts only with >=4 free slots), so the

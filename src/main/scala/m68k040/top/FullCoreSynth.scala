@@ -259,6 +259,7 @@ class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEu
     fa.logic.gsBtbHit0      := btb.logic.predHitComb
     fa.logic.gsBtbType0     := btb.logic.predTypeComb
     fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
+    fa.logic.gsPhtStrong0 := gsh.logic.phtStrong0
     fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
     fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
     fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
