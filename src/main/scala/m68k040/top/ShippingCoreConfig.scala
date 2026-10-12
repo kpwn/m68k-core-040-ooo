@@ -611,7 +611,7 @@ object ShippingCoreConfig {
     * data lands. A selected consumer whose load does not confirm next cycle is HELD in its
     * ALU issue register and every IQ select is frozen (registered kill) until the load
     * wakes (or completes as a fault). Default OFF; echoed in `SHIPPING_CONFIG`. */
-  val lsSpecWakeAlu: Boolean = envFlag("CPU_LS_SPEC_WAKE_ALU", false)
+  val lsSpecWakeAlu: Boolean = envFlag("CPU_LS_SPEC_WAKE_ALU", true)
   /** Sub-knob of `lsSpecWakeAlu`: announce only loads whose early VIPT probe already HIT
     * (the D-cache's registered line-stage result). Default ON; `=0` measures the ungated
     * announce. Echoed in `SHIPPING_CONFIG`. */
