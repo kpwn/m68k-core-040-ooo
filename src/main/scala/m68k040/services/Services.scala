@@ -729,6 +729,26 @@ trait WalkerDcacheClient {
     * Exporting the policy instead lets the client LATCH it once for the read/write pair
     * that must agree, which is the only place in the search that MUTATES. */
   def walkCmodePolicy: m68k040.cache.CacheMode.C
+
+  /** `CPU_UM_ATOMIC` (all four null when the flag is OFF). The client's deferred U/M
+    * drain is a re-read + merged store; these make it atomic against the store queue and
+    * against the other walker's drain.
+    *  - `umRmwBusy`   (client -> LsEu, registered): the drain is between arming and the
+    *                  terminal ack of its merged store.
+    *  - `umRmwArming` (client -> LsEu): the drain arms this cycle.
+    *  - `umRmwBlock`  (LsEu -> client): do not arm (the other walker's RMW owns the lock).
+    *  - `umRmwYield`  (LsEu -> client): a fence that may wait on the SQ is up and this
+    *                  client does not own the store port: abandon the RMW (no store) and
+    *                  re-arm later with a fresh re-read. */
+  def umRmwBusy: Bool = null
+  def umRmwArming: Bool = null
+  def umRmwBlock: Bool = null
+  def umRmwYield: Bool = null
+  /** `CPU_UM_ATOMIC` (LsEu -> client): no core store is accepted-but-unacked at the
+    * D-cache. The drain's re-read is withheld until this holds; with `umRmwBusy`
+    * already holding the SQ, every store accepted before (or on) the arming cycle has
+    * then landed, so the re-read cannot see a pre-store byte. */
+  def umRmwReadOk: Bool = null
 }
 
 /** The I-side walker's client port (`ItlbPlugin`). A SEPARATE trait from the D-side

@@ -165,8 +165,11 @@ class RteSpec extends AnyFunSuite {
         n += 1; cd.waitSampling()
       }
       assert(redirPc == retPc, f"RTE redirect pc=0x$redirPc%x expected restored 0x$retPc%x")
-      assert(loadCmdFires == 4,
-        s"format-0 RTE must issue exactly four frame-word loads, observed $loadCmdFires")
+      // CPU_EXC_FAST_FRAMES pops a 4-aligned frame as two aligned LONGs; the restored
+      // SR/PC/SSP are checked below either way.
+      val expectLoads = if (m68k040.top.ShippingCoreConfig.excFastFrames && (ssp0 & 3) == 0) 2 else 4
+      assert(loadCmdFires == expectLoads,
+        s"format-0 RTE must issue exactly $expectLoads frame loads, observed $loadCmdFires")
       cd.waitSampling(5)
 
       // SR restored (system byte = retSr>>8 = 0x00, S=0); SSP += 8; A7 now USP.

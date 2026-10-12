@@ -36,7 +36,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
                   // slot1's uop 0) instead of deferring slot1 to the stash. Constructor
                   // DEFAULT reads the shipping knob (the `sqDepth` precedent) so every harness
                   // that builds a DecodeStage sees the same value as SHIPPING_CONFIG prints.
-                  pair3p1: Boolean = m68k040.top.ShippingCoreConfig.decodePair3p1) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
+                  pair3p1: Boolean = m68k040.top.ShippingCoreConfig.decodePair3p1,
+                  /** `ShippingCoreConfig.feRetime` (CPU_FE_RETIME). Cycle-identical. */
+                  feRetime: Boolean = m68k040.top.ShippingCoreConfig.feRetime) extends FiberPlugin with DecodeUopService with FrontendDebugMatchService
                                        with FpImmTableService with FpTrapImmediateService
                                        with m68k040.services.DecodeRasSnapService {
 
@@ -331,8 +333,8 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // preserved.) A 3-µop SLOT1 (after a <=2-µop slot0) is likewise stashed + replayed.
     // ANGLE E: pass the REGISTERED (offloaded) per-slot OpSpec into the assembler so the
     // deep masked-pattern table is NOT re-evaluated on the post-register critical arc.
-    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0), fuseLongMoveLoads)
-    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1), fuseLongMoveLoads)
+    val a0 = MicroOpAssembler.assemble(fed.payload.packets(0), fed.payload.specs(0), fuseLongMoveLoads, feRetime)
+    val a1raw = MicroOpAssembler.assemble(fed.payload.packets(1), fed.payload.specs(1), fuseLongMoveLoads, feRetime)
 
     // ── WIDE-IMMEDIATE side banks (Global.WIDE_IMM_TABLE_DEPTH) ─────────────────
     // Third member of the FP_IMM / BR_PRED side-table family, and the reason the decode
@@ -452,8 +454,11 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
       stashFpVal := a1raw.fpWideImm
     }
 
-    val slot1Is3 = a1raw.count === U(3, 2 bits)
-    val slot0Is3 = a0.count === U(3, 2 bits)
+    // CPU_FE_RETIME: `count3` is `count === 3` without the fused-MOVE.L override's deep
+    // `opUop.dstValid` cone (exact; see MicroOpAssembler `countPre`), so the slot-1
+    // deferral / stash decision no longer waits for the fusion verdict.
+    val slot1Is3 = if (feRetime) a1raw.count3 else a1raw.count === U(3, 2 bits)
+    val slot0Is3 = if (feRetime) a0.count3 else a0.count === U(3, 2 bits)
     // CPU_DECODE_PAIR_3P1: a 3-uop slot0 still fits a 1-uop slot1 in the 4-wide push
     // (3+1 = 4 = the MicroOpQueue's guaranteed free space). `slot0Blocks1` is the
     // "slot0 leaves no room for slot1" term: with the flag OFF it is exactly `slot0Is3`

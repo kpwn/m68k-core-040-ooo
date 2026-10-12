@@ -169,6 +169,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
                  val earlyAnRetry: Boolean = m68k040.top.ShippingCoreConfig.lsEarlyAnRetry,
                  /** See `ShippingCoreConfig.lsParkRetime`. */
                  val parkRetime: Boolean = m68k040.top.ShippingCoreConfig.lsParkRetime,
+                 /** See `ShippingCoreConfig.tc3Retime`. */
+                 val tc3Retime: Boolean = m68k040.top.ShippingCoreConfig.tc3Retime,
                  val lsOooIssue: Boolean = false,
                  val loadRingDepth: Int = m68k040.top.ShippingCoreConfig.lsLoadRingDepth,
                  /** Store-queue ring depth (and, in lock step, the `pendMem` deferred-replay
@@ -799,7 +801,8 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       coalesceLines = sqCoalesceLines, coalesceHold = sqCoalesceHold,
       walkLineQuery = walkOrderClient.isDefined,
       p3LineProbe = p3SqLineFilter,
-      anyInhibitedOut = parkRetime)
+      anyInhibitedOut = parkRetime,
+      barrierP3Out = tc3Retime && parkRetime)
     // `parkRetime`: registered SUPERSET of "some resident SQ entry has an INHIBITED half".
     // An entry's cache modes are written only at allocation, so an inhibited entry valid
     // next cycle is resident now or allocated now (B mode ORed in regardless of `validB`
@@ -830,9 +833,14 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // exception sequencer may override it below only after quiescing the SQ; when
     // it does, explicitly hold the SQ side so a command cannot be accepted under
     // the exception payload.
-    dcache.store.valid   := sq.io.drain.valid
+    // `CPU_UM_ATOMIC` (keyed off the walkers' services, null when OFF): `umLock` holds
+    // the SQ drain while a walker's U/M read-modify-write is in flight. Driven at the
+    // walker grant machine below; only this ordinary SQ leg is gated, never a walker's.
+    val umAtomicOn = walkClients.exists(_.exists(_.umRmwBusy != null))
+    val umLock: Bool = if (umAtomicOn) Bool() else null
+    dcache.store.valid   := (if (umAtomicOn) sq.io.drain.valid && !umLock else sq.io.drain.valid)
     dcache.store.payload := sq.io.drain.payload
-    sq.io.drain.ready    := dcache.store.ready
+    sq.io.drain.ready    := (if (umAtomicOn) dcache.store.ready && !umLock else dcache.store.ready)
     // The terminal response is untagged. Retain the accepted owner because
     // excActive is already high while E_DRAIN still lets ordinary SQ stores finish.
     val excStoreOutstanding = RegInit(False)
@@ -4187,9 +4195,57 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
       pendingAtHead.simPublic(); dQuiet.simPublic(); dFenced.simPublic(); dLaunchOk.simPublic()
     }
 
-    val p4LaunchOk  = d4And(!parkBarrierSel)(!inhibLoadInFlight) && Mux(p4Inhibited,
+    // ── CPU_TC3_RETIME: REGISTERED SQ barrier verdicts for the P4 launch gate ─────────
+    // The live gate is `p4Front.robId -> barrier.robId mux -> 8 age compares -> OR ->
+    // p4LaunchOk -> p4CanLeave -> p4Ready -> p3Ready -> txCanConsumeRsp -> ...`, the head
+    // of the i11 200 MHz tail (D-cache valids WE, S1 index, IQ dynWait, ROB dxPendVpn).
+    // Here every term of `p4LaunchOk` is a flop:
+    //   * op HELD in P4: last cycle's answer of the existing barrier port for this same
+    //     robId (forced True when the park owned the port), ORed with "an INHIBITED store
+    //     was allocated last cycle" (the only allocation source is the P3 op, which may be
+    //     program-older under LS-OoO);
+    //   * op ENTERING from P3: last cycle's answer of `sq.io.barrierP3` for P3's robId.
+    //     The only entry allocated that cycle is that op's own, never older than itself.
+    // A stale verdict is a SUPERSET: entries never become older, and a drained entry only
+    // holds P4 one extra cycle. `sqInhibR` (registered "any inhibited entry") ANDs the
+    // cacheable leg, so with no device store resident the gate is exactly the old one
+    // (cycle-identical hot path; the fall-through `ftOk` still implies it).
+    // INHIBITED leg: `p4AtRobHead` is replaced by last cycle's value for the same op (a P4
+    // op at the head stays the head until it launches), so any store allocated last cycle
+    // is YOUNGER and the held verdict needs no allocation term. Inhibited ops may launch
+    // one cycle later (cold); under D4 `dLaunchOk` already needs the registered fence.
+    // Asserted below: the registered gate never opens when the exact one is closed.
+    val tc3Gate = tc3Retime && parkRetime
+    val p4FromP3R: Bool = if (tc3Gate) RegInit(False) else null   // driven after `p3ToP4`
+    val atHeadR: Bool = if (tc3Gate) RegInit(False) else null
+    def p4NotHeadFast: Bool = p4FromP3R || !atHeadR
+    def p4LaunchOkExact: Bool = d4And(!parkBarrierSel)(!inhibLoadInFlight) && Mux(p4Inhibited,
                           d4And(p4AtRobHead && !sq.io.barrier.olderStore && p4PreemptSafe)(dLaunchOk),
                           !sq.io.barrier.olderInhibitedStore)
+    val p4LaunchOk: Bool = if (!tc3Gate) p4LaunchOkExact else {
+      sq.io.barrierP3.robId := p3Ctx.front.robId
+      val vP3InhR   = RegNext(sq.io.barrierP3.olderInhibitedStore) init True
+      val vP4InhR   = RegNext(sq.io.barrier.olderInhibitedStore || parkBarrierSel) init True
+      val vP4StR    = RegNext(sq.io.barrier.olderStore || parkBarrierSel) init True
+      val allocInhR = RegNext(sq.io.alloc.valid &&
+        ((sq.io.alloc.payload.cacheMode === m68k040.cache.CacheMode.INHIBITED) ||
+         (sq.io.alloc.payload.cacheModeB === m68k040.cache.CacheMode.INHIBITED))) init True
+      atHeadR := p4AtRobHead
+      val olderInhibFast = sqInhibR && Mux(p4FromP3R, vP3InhR, vP4InhR || allocInhR)
+      val r = d4And(!parkBarrierSel)(!inhibLoadInFlight) && Mux(p4Inhibited,
+                d4And(!p4FromP3R && atHeadR && !vP4StR && p4PreemptSafe)(dLaunchOk),
+                !olderInhibFast)
+      GenerationFlags.simulation {
+        val exact = p4LaunchOkExact
+        assert(!(p4Valid && r && !exact),
+          "LsEuPlugin(tc3Retime): the registered P4 launch gate opened while the exact gate was closed",
+          FAILURE)
+        // Cost witness: a cacheable P4 op held only by the registered verdict.
+        val tc3HotExtraHold = p4Valid && !p4Inhibited && exact && !r
+        tc3HotExtraHold.simPublic()
+      }
+      r
+    }
     // The drain itself: reuse the ORDINARY ring push event, so all ring bookkeeping is
     // shared (see the note at `when(alignedEnq)`). Every gate here is one the same op
     // would have faced at P4, evaluated now for the head instead.
@@ -4378,7 +4434,12 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
           // tripwire measures whether pressure is ever a problem; if it never fires, the
           // guard buys nothing and should stay out.
           if (lsOooIssue) {
-            when(p4Inhibited && !p4AtRobHead && !p4Front.twoAccess && parkAdmitHasFree) {
+            // CPU_TC3_RETIME: "not the head" from flops (`p4NotHeadFast`): an op that just
+            // entered P4 is treated as not-head and parked even if it is the head -- the park
+            // drains a head entry through the ordinary drain (cold: a few cycles on an
+            // inhibited access), keeping the head compare out of `p4CanLeave`.
+            when(p4Inhibited && (if (tc3Gate) p4NotHeadFast else !p4AtRobHead) &&
+                 !p4Front.twoAccess && parkAdmitHasFree) {
               parkAdmit    := True
               parkAdmitIdx := parkFreeIdx
               p4CanLeave   := True
@@ -4732,6 +4793,7 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     // the shared comp* port, so a fast store simply holds for one cycle on collision.
     val p3CanLeave       = Bool(); p3CanLeave := False
     val p3ToP4           = Bool(); p3ToP4 := False
+    if (tc3Gate) p4FromP3R := p3ToP4
     val p3CompletionFire = Bool(); p3CompletionFire := False
     val p3Front          = p3Ctx.front
     val p3IsLoad         = p3Front.memOp === MemOp.LOAD
@@ -5936,6 +5998,46 @@ class LsEuPlugin(val walkerAgeLimit: Int = m68k040.top.ShippingCoreConfig.walkAg
     }
     when(walkerOwnsStore) {
       when(!walkStOutstanding && !walkStSelValid) { stOwner := U(OWNER_CORE, 2 bits) }
+    }
+
+    // ── CPU_UM_ATOMIC: the U/M read-modify-write lock ─────────────────────────────
+    // A walker's U/M drain (re-read, merge, store) must not interleave with ANY other
+    // CPU store to the descriptor: an SQ store landing between the re-read and the
+    // merged store is overwritten by the stale merge, and two walkers' RMWs of one
+    // descriptor lose one update (e.g. the D-side M). So while a drain is busy:
+    //   * the SQ drain is held (`umLock`, gated at the SQ leg above), and
+    //   * the other walker may not arm (DTLB wins a same-cycle tie).
+    // LIVENESS. The drain needs a load grant and a store grant; both are denied by
+    // `quiesceHold` and the D4 walker fence, and the store grant by the exception
+    // sequencer -- and each of those three waits for the SQ to drain. So under any of
+    // them a client that does not already own the store port YIELDS: it abandons the
+    // RMW (no store; a re-read in flight is consumed and discarded) and `umLock` drops,
+    // and it re-arms with a fresh re-read when the fence is gone. A client that owns
+    // the store port completes on the D-cache alone. `umFenceR` is registered (all
+    // inputs to the lock are flops), so the lock adds no path from the fence logic.
+    if (umAtomicOn) {
+      val fence = quiesceHold || excActive || (if (d4) d4WalkerFence else False)
+      val umFenceR = RegNext(fence) init False
+      val owns = Vec(stOwner === U(OWNER_ITLB, 2 bits), stOwner === U(OWNER_DTLB, 2 bits))
+      val held = Vec(Bool(), 2)
+      for (i <- 0 until 2) {
+        walkClients(i) match {
+          case Some(c) if c.umRmwBusy != null =>
+            val y = umFenceR && !owns(i)
+            c.umRmwYield := y
+            c.umRmwReadOk := coreStOutstanding === 0
+            held(i) := c.umRmwBusy && !y
+          case _ => held(i) := False
+        }
+      }
+      umLock := held.asBits.orR
+      (walkClients(walkIdxItlb), walkClients(walkIdxDtlb)) match {
+        case (Some(ci), Some(cd)) if ci.umRmwBusy != null && cd.umRmwBusy != null =>
+          ci.umRmwBlock := cd.umRmwBusy || cd.umRmwArming
+          cd.umRmwBlock := ci.umRmwBusy
+        case _ =>
+      }
+      umLock.simPublic()
     }
 
     // ── Outstanding-transaction bookkeeping ────────────────────────────────────────

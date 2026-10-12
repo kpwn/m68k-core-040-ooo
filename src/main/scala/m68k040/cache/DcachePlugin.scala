@@ -376,7 +376,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
                    val vdRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheVdRetime,
                    /** `ShippingCoreConfig.dcacheTagCeRetime`: tag-compare-free S0 payload /
                      * S3 old-line clock enables and a one-cycle-late multi-hot debug latch. */
-                   val tagCeRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheTagCeRetime)
+                   val tagCeRetime: Boolean = m68k040.top.ShippingCoreConfig.dcacheTagCeRetime,
+                   /** See `ShippingCoreConfig.beRetime`. */
+                   val beRetime: Boolean = m68k040.top.ShippingCoreConfig.beRetime,
+                   /** See `ShippingCoreConfig.tc3Retime`. */
+                   val tc3Retime: Boolean = m68k040.top.ShippingCoreConfig.tc3Retime)
     extends FiberPlugin with DcacheService {
   require(!(fullLineNoFill && sectored),
     "fullLineNoFill is unsectored-only: a sectored LINE miss would still owe other sectors")
@@ -689,6 +693,22 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val dirtysVoteD3 = Vec.fill(ways)(False)   // D3: maint CHECK-invalidate
     val dirtysVoteD4 = Vec.fill(ways)(False)   // D4: maint WRB-clean
     val dirtysVoteD5 = Vec.fill(ways)(False)   // D5: store-S3-copyback
+    // CPU_TC3_RETIME: the multi-hot duplicate purge, REGISTERED and at the LOWEST write
+    // priority (first in source order, so every other writer overrides it). Its detection
+    // cone (probe resolve / S1 / S2 tag compares, which reach back through the LS EU's
+    // P4->P3->TX ready chain) leaves the valids WE/WADR/WD; the write reads two flops.
+    // A purge overridden by another writer is simply dropped: the duplicate persists and
+    // is re-detected (and re-purged) by the next lookup of that set. Inputs are driven at
+    // the detection site below.
+    val tc3PurgeWayR: Vec[Bool] = if (tc3Retime) Vec.fill(ways)(RegInit(False)) else null
+    val tc3PurgeSetR: UInt = if (tc3Retime) Reg(UInt(setBits bits)) init 0 else null
+    if (tc3Retime) {
+      for (w <- 0 until ways) when(tc3PurgeWayR(w)) {
+        validsWrEn(w)   := True
+        validsWrSet(w)  := tc3PurgeSetR
+        validsWrData(w) := False
+      }
+    }
     when(resetSweepBusy) {
       for (w <- 0 until ways) {
         validsWrEn(w)   := True
@@ -946,6 +966,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
     // actually had (not a live signal that could have moved on).
     val missCmode = Reg(CacheMode())
     missCmode.simPublic()   // D4 bus monitor: classifies a refill-id AR as inhibited or not
+    // CPU_BE_RETIME (exact): under `nonBlocking` the legacy load FSM is entered ONLY by an
+    // INHIBITED load miss (the cacheable ones go to the MSHRs and the COPYBACK store-miss
+    // pickup arm is compiled out), so every EVICT_WR/REFILL/REPLAY read of
+    // `missCmode === INHIBITED` is constant True. Folding it removes `missCmode` from the
+    // REPLAY response pulse -> `loadRspPort` -> LSU completion cone.
+    val missInhib: Bool = if (beRetime && nonBlocking) True else (missCmode === CacheMode.INHIBITED)
     val victimWay = Reg(UInt(wayBits bits))
     victimWay.simPublic()   // test-visibility only (DcacheDrainRefillRaceSpec's
     // same-way-collision coincidence check); no-op for synthesis.
@@ -2778,7 +2804,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
         val shadowReorderable = !loadShadowValid ||
                                 (loadShadowCmd.cacheMode =/= CacheMode.INHIBITED)
         val humCommon = loadCmdPort.payload.ooOk &&
-                        (missCmode =/= CacheMode.INHIBITED) && !busFaultResp &&
+                        !missInhib && !busFaultResp &&
                         !resetSweepBusy && !maintBusyReg
         // ── ARM 2: accept with a REAL S1 read ─────────────────────────────────────
         // For the 18,788 cycles the probe-only arm cannot reach (no owning entry; see
@@ -3556,7 +3582,11 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // resolves, so `cacheMode` is not known there. Making the predicate
         // cacheMode-independent would put every misaligned CACHEABLE access on the rare
         // two-pass replay FSM and cost real IPC on the hot path.
-        val inhib   = missCmode === CacheMode.INHIBITED
+        val inhib   = missInhib
+        if (beRetime && nonBlocking) GenerationFlags.simulation {
+          assert(missCmode === CacheMode.INHIBITED,
+            "DcachePlugin(beRetime): a non-INHIBITED miss reached the legacy REFILL under nonBlocking", FAILURE)
+        }
         // Task #236 fix: was `m68k040.socket.MmioCover.stepLog2(subP, subEnd)`, recomputed
         // combinationally every cycle. Now a register read -- see `subLog2Reg`'s own
         // declaration comment for why this is safe (registered at both sites that ever
@@ -3618,7 +3648,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
           // hit). `missLine` always latches the beat (fault or not, allocated or
           // not) so REPLAY's inhibitedResp path has real data to hand back.
           val respErr    = axi.r.payload.resp =/= Axi4.resp.OKAY
-          val doAllocate = !respErr && (missCmode =/= CacheMode.INHIBITED)
+          val doAllocate = !respErr && !missInhib
           // Slice `D3-BURST`: each beat of the burst installs its OWN sector slot. The
           // burst is a plain INCR from the line base, so beat index == sector index.
           val allocSlot: UInt =
@@ -3795,7 +3825,7 @@ class DcachePlugin(val socketMerged: Boolean = false,
             loadMissStoreBarrier := False
           }
           goto(IDLE)
-        } elsewhen(missCmode === CacheMode.INHIBITED) {
+        } elsewhen(missInhib) {
           // Task P1.4: no line was allocated (doAllocate was False above) — there
           // is nothing to "replay" as a hit. Deliver the just-fetched beat
           // directly, once, exactly like busFaultResp's one-pulse shape.
@@ -4377,11 +4407,21 @@ class DcachePlugin(val socketMerged: Boolean = false,
           val resident  = rdValid(curWay)
           val matches   = resident && scopeHit
           val isDirty   = rdDirty(curWay)
+          // CPU_BE_RETIME: latch the writeback payload on EVERY CHECK cycle (CE = the CHECK
+          // state, a flop decode) instead of under the tag-compare `matches && isDirty`.
+          // Exact: both are read only in WRB, which is entered only from this arm, and no
+          // other state writes them.
+          if (beRetime) {
+            wbAddrReg   := (rdTag(curWay) ## walkSet ## U(0, offBits bits)).asUInt
+            wbLineReg   := rdData(curWay)
+          }
           when(matches && cmd.push && isDirty) {
             // Latch OUR OWN writeback payload now (point 1 above) -- the AXI leg
             // never re-reads the shared array port.
-            wbAddrReg   := (rdTag(curWay) ## walkSet ## U(0, offBits bits)).asUInt
-            wbLineReg   := rdData(curWay)
+            if (!beRetime) {
+              wbAddrReg   := (rdTag(curWay) ## walkSet ## U(0, offBits bits)).asUInt
+              wbLineReg   := rdData(curWay)
+            }
             maintAwDone := False
             maintWDone  := False
             goto(WRB)
@@ -4585,12 +4625,29 @@ class DcachePlugin(val socketMerged: Boolean = false,
     for (e <- Seq(dbgMultiHotLoad, dbgMultiHotProbe, dbgMultiHotStore)) {
       e.sticky.simPublic(); e.count.simPublic(); e.addr.simPublic()
     }
-    when(dupPurgeFire) {
-      for (w <- 0 until ways) when(dupPurgeVec(w) && !rdDirty(w)) {
-        validsWrEn(w)   := True
-        validsWrSet(w)  := dupPurgeSet
-        validsWrData(w) := False
-        validsVoteW4(w) := True    // Task #255 exclusivity tripwire (W4)
+    if (!tc3Retime) {
+      when(dupPurgeFire) {
+        for (w <- 0 until ways) when(dupPurgeVec(w) && !rdDirty(w)) {
+          validsWrEn(w)   := True
+          validsWrSet(w)  := dupPurgeSet
+          validsWrData(w) := False
+          validsVoteW4(w) := True    // Task #255 exclusivity tripwire (W4)
+        }
+      }
+    } else {
+      // Registered purge (see `tc3PurgeWayR`): `rdDirty` is sampled with the detecting
+      // read, exactly as the immediate purge used it. Re-armed only while the arrays are
+      // free (`dupPurgeArmed` is already in `dupPurgeFire`).
+      for (w <- 0 until ways) tc3PurgeWayR(w) := dupPurgeFire && dupPurgeVec(w) && !rdDirty(w)
+      tc3PurgeSetR := dupPurgeSet
+      GenerationFlags.simulation {
+        // A delayed purge must never invalidate a line made dirty in its own write cycle
+        // (that would discard a committed store).
+        for (w <- 0 until ways)
+          assert(!(tc3PurgeWayR(w) && (validsWrSet(w) === tc3PurgeSetR) && !validsWrData(w) &&
+                   dirtysWrEn(w) && dirtysWrData(w) && (dirtysWrSet(w) === tc3PurgeSetR)),
+            "DcachePlugin(tc3Retime): a delayed duplicate purge collided with a dirty write to its line",
+            FAILURE)
       }
     }
     GenerationFlags.simulation {
@@ -5339,6 +5396,27 @@ class DcachePlugin(val socketMerged: Boolean = false,
     val wtFaultFifoPop  = RegInit(U(0, wtFaultFifoIdxW + 1 bits))
     wtFaultFifoPush.simPublic(); wtFaultFifoPop.simPublic()
 
+    // CPU_BE_RETIME: `pendingVictimTag/Line` (128+ flops) leave the store-miss decision
+    // (S2 tag compare -> miss -> CE). They load EVERY cycle while no store miss is pending,
+    // with the same victim-line mux the miss arm used, and HOLD while `pendingStoreMiss`.
+    // Exact: both are read only under `pendingStoreMiss`, which the miss arm sets on the
+    // very edge the free-running capture last loads; a miss is never discovered while
+    // one is pending (the store barrier blocks S1 until the allocation ack) -- asserted.
+    if (beRetime) {
+      val pVwF = if (!sectored) victim(stS2Set)
+                 else Mux(stS2SectorMiss, stS2SectorWay, victim(lineOf(stS2Set)))
+      val fromS3F   = stS3ArrayWrite && (stS3Set === stS2Set) && (stS3Way === pVwF)
+      val fromS3D1F = stS3WriteD1 && (stS3WriteSetD1 === stS2Set) && (stS3WriteWayD1 === pVwF)
+      when(!pendingStoreMiss) {
+        pendingVictimTag  := Mux(fromS3F, stS3Tag, Mux(fromS3D1F, stS3WriteTagD1, rdTag(pVwF)))
+        pendingVictimLine := Mux(fromS3F, stS3MergedLine, Mux(fromS3D1F, stS3WriteLineD1, rdData(pVwF)))
+      }
+      GenerationFlags.simulation {
+        assert(!(storeMissDiscovered && pendingStoreMiss),
+          "DcachePlugin(beRetime): a store miss was discovered while another is pending -- " +
+          "the free-running pendingVictim capture would not load it", FAILURE)
+      }
+    }
     // S2 either discovers the variable-latency COPYBACK miss or captures a fixed
     // resident/serial result into S3.  `storeMissDiscovered` already freezes the
     // younger S1 and S0 in this same cycle; they relaunch their lookup after refill,
@@ -5410,10 +5488,12 @@ class DcachePlugin(val socketMerged: Boolean = false,
         // later-assignment-wins clear rather than an `&& !stS2SectorMiss` term, so the
         // unsectored netlist keeps today's expression with no extra AND gate.
         if (sectored) when(stS2SectorMiss) { pendingVictimDirty := False }
-        pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
-          Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))
-        pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine,
-          Mux(pVictimFromS3D1, stS3WriteLineD1, rdData(pVw)))
+        if (!beRetime) {
+          pendingVictimTag   := Mux(pVictimFromS3, stS3Tag,
+            Mux(pVictimFromS3D1, stS3WriteTagD1, rdTag(pVw)))
+          pendingVictimLine  := Mux(pVictimFromS3, stS3MergedLine,
+            Mux(pVictimFromS3D1, stS3WriteLineD1, rdData(pVw)))
+        }
       } otherwise {
         stS3Valid   := True
         stS3Payload := stS2Payload

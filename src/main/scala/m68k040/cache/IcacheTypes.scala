@@ -223,11 +223,14 @@ case class TranslationReq() extends Bundle {
   *  - `ready` : the translation is resolved THIS cycle (a TLB hit, or identity).
   *    On a DTLB miss it is False while the walker runs, so the consumer (D-cache)
   *    must NOT accept the access — it stalls on its existing back-pressure path. */
-case class TranslationRsp() extends Bundle {
+case class TranslationRsp(withInhibitHint: Boolean = false) extends Bundle {
   val ready     = Bool()
   val ppn       = UInt(20 bits)
   val cacheMode = CacheMode()
   val fault     = Bool()
+  // CPU_FE_RETIME only: a fast CONSERVATIVE "this page may be cache-inhibited" verdict.
+  // Contract: whenever `ready`, `cacheMode === INHIBITED` implies `inhibitHint`.
+  val inhibitHint = if (withInhibitHint) Bool() else null
 }
 
 /** Tagged D-side translation command.  Unlike the independent I-side port, the

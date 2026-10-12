@@ -39,7 +39,7 @@ case class IbEntry() extends Bundle {
   * fetch can issue with the live head still at cnt<=8 (cnt+12<=20). HEAD_WORDS (the
   * aligner visibility window) is unchanged at 10, PUSH stays 4 words (NARROW window).
   */
-class InstructionBuffer extends Component {
+class InstructionBuffer(retime: Boolean = false) extends Component {
   val BUF_WORDS  = 20
   val HEAD_WORDS = 10
   val PUSH_WORDS = 4
@@ -59,6 +59,18 @@ class InstructionBuffer extends Component {
     // outstanding windows, not just the single push, so in-flight responses cannot
     // overflow the buffer). avail caps at HEAD_WORDS, so it cannot serve this purpose.
     val cnt      = out UInt(log2Up(BUF_WORDS + 1) bits)
+    // CPU_FE_RETIME only. `headPredRaw(i)` is `headPred(i)` WITHOUT the `i < count` gate
+    // (the aligner proves the gate redundant for its reads, see Aligner.align `retime`).
+    // `shiftEn/shiftA/shiftB/shiftSelA` restate `shift` as
+    //     shift = shiftEn ? (shiftSelA ? shiftA : shiftB) : 0
+    // so the head-pointer/count adders run on the two EARLY candidates and the LATE
+    // select (`suppressSlot1`) passes through one 2:1 mux. `shift` itself stays an input
+    // (the sim oracle below checks the two forms agree every cycle).
+    val headPredRaw = if (retime) out(Vec(ChunkPredecode(), HEAD_WORDS)) else null
+    val shiftEn     = if (retime) in Bool() else null
+    val shiftA      = if (retime) in UInt(4 bits) else null
+    val shiftB      = if (retime) in UInt(4 bits) else null
+    val shiftSelA   = if (retime) in Bool() else null
   }
 
   val IDXW = log2Up(BUF_WORDS)   // physical slot index width
@@ -132,16 +144,48 @@ class InstructionBuffer extends Component {
   }
 
   // --- count / headPtr next ---
-  when(io.flush) {
-    count   := 0
-    headPtr := 0
-  } .otherwise {
-    when(io.push.fire) {
-      count := afterShift + io.push.payload.n.resize(log2Up(BUF_WORDS + 1))
+  if (!retime) {
+    when(io.flush) {
+      count   := 0
+      headPtr := 0
     } .otherwise {
-      count := afterShift
+      when(io.push.fire) {
+        count := afterShift + io.push.payload.n.resize(log2Up(BUF_WORDS + 1))
+      } .otherwise {
+        count := afterShift
+      }
+      headPtr := newHeadPtr
     }
-    headPtr := newHeadPtr
+  } else {
+    // Candidate next-states: each adder/wrap runs on an early shift candidate; the late
+    // select is the LAST mux before the flop. Identical to the form above whenever
+    // `shift === (shiftEn ? (shiftSelA ? shiftA : shiftB) : 0)` (asserted below).
+    def wrapAdd(a: UInt): UInt = {
+      val r = UInt(IDXW bits)
+      val s = headPtr +^ a
+      when(s >= BUF_WORDS) { r := (s - BUF_WORDS).resize(IDXW) } otherwise { r := s.resize(IDXW) }
+      r
+    }
+    val cw     = log2Up(BUF_WORDS + 1)
+    val pushN  = Mux(io.push.fire, io.push.payload.n.resize(cw), U(0, cw bits))
+    val base   = count + pushN
+    val hpA    = wrapAdd(io.shiftA)
+    val hpB    = wrapAdd(io.shiftB)
+    val cntA   = base - io.shiftA.resize(cw)
+    val cntB   = base - io.shiftB.resize(cw)
+    when(io.flush) {
+      count   := 0
+      headPtr := 0
+    } .elsewhen(io.shiftEn) {
+      count   := Mux(io.shiftSelA, cntA, cntB)
+      headPtr := Mux(io.shiftSelA, hpA, hpB)
+    } .otherwise {
+      count   := base
+    }
+    GenerationFlags.simulation {
+      val ref = Mux(io.shiftEn, Mux(io.shiftSelA, io.shiftA, io.shiftB), U(0, 4 bits))
+      assert(io.shift === ref, "InstructionBuffer: retimed shift candidates diverged from io.shift", FAILURE)
+    }
   }
 
   // --- combinational head outputs: barrel-rotate of HEAD_WORDS slots ---
@@ -172,6 +216,15 @@ class InstructionBuffer extends Component {
       // so the `headPred(i).ctrlXfer === classify(head(i)).ctrlXfer` invariant holds
       // here exactly as the `size` invariant above does.
       io.headPred(i).ctrlXfer        := False
+    }
+  }
+
+  if (retime) {
+    for (i <- 0 until HEAD_WORDS) {
+      val hp = headPtr +^ i
+      val phys = UInt(IDXW bits)
+      when(hp >= BUF_WORDS) { phys := (hp - BUF_WORDS).resize(IDXW) } otherwise { phys := hp.resize(IDXW) }
+      io.headPredRaw(i) := entries(phys).pred
     }
   }
 

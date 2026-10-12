@@ -132,7 +132,13 @@ class ExceptionUnit(
     // frame. Defaulted so every standalone unit DUT needs no change.
     entryFpuUnimp: Bool = False,
     entryFpuCmd:   Bits = B(0, 16 bits),
-    entryFpuImmediate: Bool = False) extends Area {
+    entryFpuImmediate: Bool = False,
+    // CPU_EXC_FAST_FRAMES (review §4.7): pair adjacent frame words into one aligned
+    // LONG on the entry push and the RTE pop. Elaboration-time; False = the old FSM.
+    fastFrames: Boolean = m68k040.top.ShippingCoreConfig.excFastFrames,
+    // CPU_EXC_FRAMES_COPYBACK: the entry frame push honours a COPYBACK page (the push
+    // acks from the L1D array instead of waiting a write-through AXI round trip).
+    framesCopyback: Boolean = m68k040.top.ShippingCoreConfig.excFramesCopyback) extends Area {
 
   // ── exposed D-cache request ports (wiring MUXes them onto the real cache) ────
   val dcLoadCmd  = Stream(DLoadCmd())
@@ -853,7 +859,17 @@ class ExceptionUnit(
   // (M=0->1->0 within the settle window) is NOT validated here — it could leave a
   // briefly-active bank's shadow stale when deselected. Add a directed test for that before
   // Slice B (interrupt throwaway frame) relies on cross-toggle preservation.
-  ss.writeA7.valid  := True; ss.writeA7.payload  := committedA7In
+  // CPU_BE_RETIME: an int-PRF write that touches the committed A7 may be STAGED (lands one
+  // cycle after its request). On the landing cycle the readback is still the OLD value, so
+  // the mirror HOLDS for that cycle instead of copying it (it resumes, exact, the next
+  // cycle). Both inputs default False: an unstaged wiring is byte-identical.
+  /** See S_REDIR: one-cycle wait after a staged sysOp destination write (CPU_BE_RETIME). */
+  val sRedirHold: Bool =
+    if (m68k040.top.ShippingCoreConfig.beRetime) RegNext(sysRegWriteValid || fmAnWrite.valid) init False
+    else False
+  val a7MirrorHoldIn = Bool(); a7MirrorHoldIn.allowOverride; a7MirrorHoldIn := False
+  val fmAnMirrorHold = Bool(); fmAnMirrorHold.allowOverride; fmAnMirrorHold := False
+  ss.writeA7.valid  := !(a7MirrorHoldIn || fmAnMirrorHold); ss.writeA7.payload  := committedA7In
 
   // ── D-cache STORE: REGISTERED output (FMax). The frame-word store payload is a
   // combinational mux off the FSM step `stStep`; driving it straight onto the
@@ -872,6 +888,9 @@ class ExceptionUnit(
   val stoDataReg  = Reg(Bits(32 bits))
   val stoSizeReg  = Reg(Size())
   val stoCmodeReg = Reg(m68k040.cache.CacheMode())
+  /** CPU_EXC_FRAMES_COPYBACK: this captured store is an entry-frame word on a COPYBACK
+    * page with CACR.DE set (driven only from E_STORE). */
+  val stoCb: Bool = if (framesCopyback) { val b = Bool(); b := False; b } else null
   dcStore.valid           := stoValidReg
   dcStore.payload.paddr   := stoPaddrReg
   dcStore.payload.data    := stoDataReg
@@ -940,6 +959,7 @@ class ExceptionUnit(
     stoDataReg  := stoData
     stoSizeReg  := stoSize
     stoCmodeReg := commandCacheMode
+    if (framesCopyback) when(stoCb) { stoCmodeReg := m68k040.cache.CacheMode.COPYBACK }
   }
 
   // ── D-cache LOAD + D-TLB req: REGISTERED outputs (FMax). The frame/vector load
@@ -1066,6 +1086,9 @@ class ExceptionUnit(
   // (non-crossing, single-byte) driveStoreNoXlate pushes instead of one WORD push.
   // `stSplitLow` sequences the second (low) byte of a just-split word.
   val stSplitLow = Reg(Bool()) init False
+  // CPU_EXC_FAST_FRAMES: the outstanding frame store is a LONG covering words
+  // `stStep` and `stStep+1` (see E_STORE). Only ever set when `fastFrames`.
+  val stPair: Bool = if (fastFrames) Reg(Bool()) init False else null
   // lastStep: curIs7/curIs2 are always False for an interrupt entry (never $7/$2),
   // so this already correctly reads 4 words (U(3)) for BOTH passes of a throwaway
   // entry (frame $0 then frame $1, each 8 bytes) — no stFrame2 dependency needed.
@@ -1327,6 +1350,8 @@ class ExceptionUnit(
   val excPpn      = Reg(UInt(20 bits)) init 0; excPpn.simPublic()
   val excLastVpn  = Reg(UInt(20 bits)) init 0
   val excVpnValid = RegInit(False); excVpnValid.simPublic()
+  // CPU_EXC_FRAMES_COPYBACK: the page cache mode of the translation held in `excPpn`.
+  val excCbPage: Bool = if (framesCopyback) RegInit(False) else null
   val xVa         = Reg(UInt(32 bits)) init 0
   val xWrite      = RegInit(False)
   val xRet        = Reg(UInt(3 bits)) init 0
@@ -1436,6 +1461,12 @@ class ExceptionUnit(
   // two BYTE loads (hi @ addr, lo @ addr+1) and reassembled from `rdHiByte`.
   val rdSplitLow = RegInit(False); rdSplitLow.simPublic()
   val rdHiByte   = Reg(Bits(8 bits)) init 0
+  // CPU_EXC_FAST_FRAMES, RTE side: a 4-aligned frame is popped as two aligned LONGs
+  // ({SR, PC hi} @base, {PC lo, format} @base+4) instead of four WORDs. The second
+  // LONG's format word is parked in `rtePreFmt` and handed to R_FMTWAIT's unchanged
+  // decode one cycle later (so `popPc` is already updated when the odd-PC check reads it).
+  val rtePreFmtValid: Bool = if (fastFrames) RegInit(False) else null
+  val rtePreFmt: UInt      = if (fastFrames) Reg(UInt(16 bits)) init 0 else null
   def rdCrosses(addr: UInt): Bool = addr(3 downto 0) === U(15, 4 bits)
 
   // ── 2026-09-09: the VECTOR FETCH carries the same hole, one size class up ──────
@@ -1932,10 +1963,24 @@ class ExceptionUnit(
         excGoXlate(va, write = true, XRET_E_STORE)
       } otherwise {
         val pa = excPaOf(va)
+        // CPU_EXC_FAST_FRAMES: a 4-aligned word that is not the frame's last word is
+        // pushed together with its successor as ONE aligned LONG. An aligned LONG never
+        // crosses a line or a page, so `va` (= addr here: `stSplitLow` is False for an
+        // aligned word) and its translation cover both words; the bytes written are
+        // exactly the two WORD pushes' bytes. Bit-identical memory, half the round trips.
+        val pairOk = if (fastFrames) !stSplitLow && (addr(1 downto 0) === 0) && (stStep =/= lastStep)
+                     else False
+        if (fastFrames) stPair := pairOk
+        // CPU_EXC_FRAMES_COPYBACK: honour the stack page's COPYBACK mode (DE folded in,
+        // exactly as every ordinary store's mode is). `excCbPage` belongs to the very
+        // translation `pa` was built from (both are latched together in X_WAIT).
+        if (framesCopyback) stoCb := excCbPage && ss.cacr(31)
         when(stSplitLow) {
           driveStoreNoXlate(pa, Size.BYTE, data(7 downto 0))
         } elsewhen(crosses) {
           driveStoreNoXlate(pa, Size.BYTE, data(15 downto 8))
+        } elsewhen(pairOk) {
+          driveStoreNoXlate(pa, Size.LONG, data ## frameWordData(stStep + 1))
         } otherwise {
           driveStoreNoXlate(pa, Size.WORD, data)
         }
@@ -1971,7 +2016,10 @@ class ExceptionUnit(
           goto(E_STORE)
         } otherwise {
           stSplitLow := False
-          when(stStep === lastStep) {
+          // A paired LONG completed words stStep AND stStep+1: the frame is done when
+          // stStep+1 is the last word, else advance by two.
+          val doneStep = if (fastFrames) Mux(stPair, stStep + 1, stStep) else stStep
+          when(doneStep === lastStep) {
             // Task #132: after finishing frame $0 (stFrame2 still False), a throwaway
             // entry loops back into E_STORE for the SECOND ($1) frame instead of
             // proceeding to the vector fetch. frameWordAddr/fmtVecWord above already
@@ -1981,7 +2029,7 @@ class ExceptionUnit(
             } otherwise {
               goto(E_VECREQ)
             }
-          } otherwise { stStep := stStep + 1; goto(E_STORE) }
+          } otherwise { stStep := doneStep + 1; goto(E_STORE) }
         }
       }
     }
@@ -2146,7 +2194,7 @@ class ExceptionUnit(
     // word straddling a 16-byte line into two BYTE reads (see rdSplitLow above).
     /** Issue one frame-word read at `addr` (WORD, or the BYTE half selected by
       * `rdSplitLow` when the word straddles a line). */
-    def frameWordReq(addr: UInt, ret: Int): Unit = {
+    def frameWordReq(addr: UInt, ret: Int, long: Bool = False): Unit = {
       val va = Mux(rdCrosses(addr) && rdSplitLow, addr + U(1, 32 bits), addr)
       // 2026-09-09: the RTE frame lives on the supervisor stack, a LOGICAL address --
       // so the pop translates, exactly like the push. `va` is already the split-aware
@@ -2158,8 +2206,12 @@ class ExceptionUnit(
       } otherwise {
         ldoVld := True; ldoVaddr := va; ldoPaddr := excPaOf(va)
         ldoSize := Mux(rdCrosses(addr), Size.BYTE, Size.WORD)
+        if (fastFrames) when(long) { ldoSize := Size.LONG }   // aligned: never crosses
       }
     }
+    /** CPU_EXC_FAST_FRAMES: pop this frame as two aligned LONGs. An aligned LONG never
+      * crosses a line or page, so the split/translate logic sees exactly one access. */
+    val rtePair: Bool = if (fastFrames) frameBase(1 downto 0) === 0 else False
     /** Synthesize a vector-2 ACCESS FAULT (format-$7) ENTRY for a bus error taken on an
       * RTE frame-word read at `faultAddr`.
       *
@@ -2283,6 +2335,7 @@ class ExceptionUnit(
           }
         } otherwise {
           excPpn      := dxRspPpn
+          if (framesCopyback) excCbPage := dxRspCacheMode === m68k040.cache.CacheMode.COPYBACK
           excLastVpn  := dxPendVpn
           excVpnValid := True
           switch(xRet) {
@@ -2297,11 +2350,27 @@ class ExceptionUnit(
       }
     }
     R_SRREQ.whenIsActive {
-      frameWordReq(frameBase + 0, XRET_R_SR)
+      frameWordReq(frameBase + 0, XRET_R_SR, rtePair)
       when(dcLoadCmd.fire) { goto(R_SRWAIT) }
     }
     R_SRWAIT.whenIsActive {
-      frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
+      if (fastFrames) {
+        when(rtePair) {
+          when(dcLoadRsp.valid) {
+            when(dcLoadRsp.payload.fault) {
+              busErrorEntry(frameBase + 0)
+            } otherwise {
+              popSr := dcLoadRsp.payload.data(31 downto 16).asUInt
+              popPc(31 downto 16) := dcLoadRsp.payload.data(15 downto 0).asUInt
+              goto(R_PCREQ2)
+            }
+          }
+        } otherwise {
+          frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
+        }
+      } else {
+        frameWordWait(frameBase + 0, R_SRREQ, w => { popSr := w; goto(R_PCREQ) })
+      }
     }
     R_PCREQ.whenIsActive {
       frameWordReq(frameBase + 2, XRET_R_PC)
@@ -2311,11 +2380,28 @@ class ExceptionUnit(
       frameWordWait(frameBase + 2, R_PCREQ, w => { popPc(31 downto 16) := w; goto(R_PCREQ2) })
     }
     R_PCREQ2.whenIsActive {
-      frameWordReq(frameBase + 4, XRET_R_PC2)
+      frameWordReq(frameBase + 4, XRET_R_PC2, rtePair)
       when(dcLoadCmd.fire) { goto(R_PCWAIT2) }
     }
     R_PCWAIT2.whenIsActive {
-      frameWordWait(frameBase + 4, R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
+      if (fastFrames) {
+        when(rtePair) {
+          when(dcLoadRsp.valid) {
+            when(dcLoadRsp.payload.fault) {
+              busErrorEntry(frameBase + 4)
+            } otherwise {
+              popPc(15 downto 0) := dcLoadRsp.payload.data(31 downto 16).asUInt
+              rtePreFmt      := dcLoadRsp.payload.data(15 downto 0).asUInt
+              rtePreFmtValid := True
+              goto(R_FMTWAIT)
+            }
+          }
+        } otherwise {
+          frameWordWait(frameBase + 4, R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
+        }
+      } else {
+        frameWordWait(frameBase + 4, R_PCREQ2, w => { popPc(15 downto 0) := w; goto(R_FMTREQ) })
+      }
     }
     // Read the format word @base+6 to select the pop size ($0 = 8 bytes, $7 = 60).
     R_FMTREQ.whenIsActive {
@@ -2323,7 +2409,7 @@ class ExceptionUnit(
       when(dcLoadCmd.fire) { goto(R_FMTWAIT) }
     }
     R_FMTWAIT.whenIsActive {
-      frameWordWait(frameBase + 6, R_FMTREQ, fmtWord => {
+      def onFmt(fmtWord: UInt): Unit = {
         // top nibble selects the pop size: 7 => format-$7 (60 bytes), 2 => format-$2
         // (12 bytes), 1 => format-$1 throwaway (task #132, see below), else format-$0
         // (8 bytes).
@@ -2426,7 +2512,22 @@ class ExceptionUnit(
           stSplitLow   := False
           goto(E_DRAIN)
         }
-      })
+      }
+      if (fastFrames) {
+        // One decode instance, two sources: the parked format word of a LONG pop, or
+        // the ordinary WORD read.
+        val fmtValid = Bool(); fmtValid := False
+        val fmtWordIn = UInt(16 bits); fmtWordIn := rtePreFmt
+        when(rtePreFmtValid) {
+          rtePreFmtValid := False
+          fmtValid := True
+        } otherwise {
+          frameWordWait(frameBase + 6, R_FMTREQ, w => { fmtValid := True; fmtWordIn := w })
+        }
+        when(fmtValid) { onFmt(fmtWordIn) }
+      } else {
+        frameWordWait(frameBase + 6, R_FMTREQ, onFmt)
+      }
     }
     R_REDIR.whenIsActive {
       // restore the SR (system byte) — same mechanism for BOTH the throwaway ($1)
@@ -3144,7 +3245,14 @@ class ExceptionUnit(
       }
       goto(S_REDIR)
     }
-    S_REDIR.whenIsActive {
+    // CPU_BE_RETIME: the sysOp's own int-PRF writes (`sysRegWrite*` in S_APPLY / F_RDONE,
+    // `fmAnWrite` in FM_DONE) are STAGED -- they land one cycle after the request. S_REDIR
+    // is the sysOp's architectural retire boundary (obs + re-bank A7 write + redirect), so
+    // it WAITS one cycle when such a write was requested on the previous cycle: the
+    // destination is then visible at the boundary, and the (unstaged) A7 re-bank write can
+    // never land on the staged write's cycle. Cold: +1 cycle on MOVEC/MOVE-USP read,
+    // FMOVE FPcr->Rn, FMOVEM (An)+/-(An), FSAVE -(An), FRESTORE (An)+.
+    S_REDIR.whenIsActive { when(!sRedirHold) {
       // Re-bank A7 in the int PRF: ss.a7 = Mux(s, Mux(m, msp, isp), usp) with the
       // POST-write (S,M). The
       // a7Write port is qualified by obsFire (below). For MOVE-to-SR this carries the
@@ -3182,7 +3290,7 @@ class ExceptionUnit(
       redirectValid := True
       redirectPc    := sysCapNextPc
       goto(IDLE)
-    }
+    } }
 
     // ══ FSAVE: emit the state frame, one translated word at a time ═══════════════
     //
@@ -3555,6 +3663,16 @@ class ExceptionUnit(
     * is bit-identical to `active` on every cycle) or pre-OR it with another registered
     * term, instead of all consumers sharing this one 205-fanout flop. */
   val activeNext = Bool()
+  /** `CPU_TC3_RETIME`: rising edge of `active` (`activeNext && !active`) from the IDLE
+    * state's own exit condition, without `stateNext` (whose cone includes every busy
+    * state's D-cache handshake). IDLE's only transitions are the three trigger arms. */
+  val enterNext: Bool = if (!m68k040.top.ShippingCoreConfig.tc3Retime) null else {
+    val e = fsm.isActive(fsm.IDLE) && (entryTrigger || rteTrigger || sysTrigger)
+    GenerationFlags.simulation {
+      assert(e === (activeNext && !activeReg), "ExceptionUnit: enterNext drifted from rising(activeNext)", FAILURE)
+    }
+    e
+  }
   fsm.postBuild {
     activeNext := (fsm.stateNext =/= fsm.enumOf(fsm.IDLE))
     activeReg  := activeNext
@@ -3661,6 +3779,29 @@ class ExceptionUnit(
   dbgStallExcPack(27) := vecTableRedirect
   dbgStallExcPack(28) := vecTargetVld
   dbgStallExcPack.simPublic()
+
+  /** Exception-path PERFORMANCE events for `DebugCtrlPlugin`'s windowed counters
+    * (OFF_PERF_EXC_*), published through `ExceptionPerfService` by RobPlugin.
+    * Every term is a decode of REGISTERS only (`stateReg` one-hots, `curVec`,
+    * `curIsInt`, `popIs1`, `activeReg`), and the consumer registers the whole word
+    * once more before any counter sees it, so no functional cone gains a load beyond
+    * one flop D-input.
+    *   [0] ENTRY dispatched (E_REDIR: one cycle per completed entry, any vector)
+    *   [1] A-LINE entry (vector 10, not an interrupt)
+    *   [2] INTERRUPT entry
+    *   [3] RTE completed (R_REDIR of the final frame; the format-$1 throwaway pop
+    *       that loops back for the second frame is not counted)
+    *   [4] sequencer ACTIVE cycle (`activeReg`: entry, RTE, and every other
+    *       serialised op this FSM runs -- MOVEC/MOVE-SR, CPUSH/CINV, FSAVE, ...) */
+  val perfEvents = Bits(5 bits)
+  perfEvents(0) := fsm.isActive(fsm.E_REDIR)
+  perfEvents(1) := fsm.isActive(fsm.E_REDIR) && !curIsInt && (curVec === 10)
+  perfEvents(2) := fsm.isActive(fsm.E_REDIR) && curIsInt
+  perfEvents(3) := fsm.isActive(fsm.R_REDIR) && !popIs1
+  perfEvents(4) := activeReg
+  perfEvents.simPublic()
+  // sim-only taps for ExcTrapIpcSpec's trace (no synth effect)
+  dcLoadCmd.simPublic(); dcLoadRsp.simPublic(); dcStore.simPublic()
 
   // ---- debug-only observability (task #139 wild-PC / a7-minus-8 investigation) ----
   // Zero synth impact (sim tap only, not referenced by any RTL logic).

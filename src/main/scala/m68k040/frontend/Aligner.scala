@@ -25,7 +25,8 @@ object Aligner {
     * Optional `headPcHiP1` must equal headPc(31:5)+1 modulo 27 bits; the frontend
     * already maintains this companion register for its own PC advance. */
   def align(headPc: UInt, words: Vec[Bits], preds: Vec[ChunkPredecode], avail: UInt,
-            p0LiveReg: ChunkPredecode, headPcHiP1: Option[UInt] = None): Result = {
+            p0LiveReg: ChunkPredecode, headPcHiP1: Option[UInt] = None,
+            retime: Boolean = false): Result = {
     val r = Result()
 
     // Default-assign all packet fields to don't-care first
@@ -238,7 +239,14 @@ object Aligner {
 
         // Try to fill slot1
         val p1 = preds(L0.resize(4))
-        val L1 = p1.lenWords
+        // CPU_FE_RETIME: `L1` is the one-hot (by L0) select of per-candidate lengths, so it
+        // never waits behind the 10:1 `preds(L0)` binary mux. Only read under `slot1Ok`,
+        // where L0 is in 1..9 and the one-hot has exactly one bit set.
+        val l0Oh = if (retime) Vec((0 until WINDOW).map(k => if (k == 0) False else L0 === U(k, 4 bits))) else null
+        val L1 = if (!retime) p1.lenWords
+                 else MuxOH(l0Oh, (0 until WINDOW).map(k => preds(k).lenWords))
+        // Per-candidate end offsets k + len(k) (k constant: a 4-bit add per candidate).
+        val sumK = if (retime) Vec((0 until WINDOW).map(k => U(k, 5 bits) + preds(k).lenWords.resize(5))) else null
 
         // L0/L1 are each up to WINDOW (10); +^ width-extends by 1 bit regardless of operand
         // width, so the sum (max 10+10=20) safely fits the 5-bit resize. slot1Ok additionally
@@ -270,8 +278,27 @@ object Aligner {
         // `ambiguousLine` stall in this file — no new livelock risk). Costs at most one
         // extra front-end bubble on the rare cache-line-boundary case; zero effect on
         // every non-ambiguous slot1 (the overwhelming majority).
-        val L0L1     = (L0 +^ L1).resize(5)
-        val slot1Ok  = p1.simple && !p1.ambiguousLine && (avail.resize(5) >= L0L1) && (L0L1 <= U(WINDOW, 5 bits))
+        val L0L1     = if (!retime) (L0 +^ L1).resize(5) else MuxOH(l0Oh, sumK)
+        val slot1Ok  = if (!retime) {
+          p1.simple && !p1.ambiguousLine && (avail.resize(5) >= L0L1) && (L0L1 <= U(WINDOW, 5 bits))
+        } else {
+          // CPU_FE_RETIME: evaluate slot-1 eligibility for EVERY candidate start k=1..9 in
+          // parallel (constant k folds into the length compare), then pick by the L0
+          // one-hot. Same predicate as above: for L0 in 1..9 it is term-for-term the
+          // original with k = L0; for L0 >= 10 the original is False (L0L1 >= 11 > WINDOW,
+          // or L1 = 0 -> !simple) and the one-hot is all-zero. `preds` may be the UNGATED
+          // head (IBuf `headPredRaw`): a candidate k >= count has avail <= count <= k, so
+          // `avail >= k + len` forces len = 0 -> !simple; the gate never changes `okK`.
+          val okK = Vec((0 until WINDOW).map { k =>
+            if (k == 0) False
+            else {
+              val lk  = preds(k).lenWords
+              val sum = sumK(k)
+              (lk =/= 0) && !preds(k).ambiguousLine && (avail.resize(5) >= sum) && (sum <= U(WINDOW, 5 bits))
+            }
+          })
+          (l0Oh.asBits & okK.asBits).orR
+        }
 
         when(slot1Ok) {
           // Slot1 = simple packet

@@ -33,14 +33,22 @@ import scala.collection.mutable.ArrayBuffer
   * SAME proven DUT and the SAME commit-stream cycle counting. No behavioural
   * change: IpcBenchSpec now mixes this in and keeps only its test body.
   */
-trait CoreBenchHarness extends AnyFunSuite {
+trait CoreBenchHarness extends AnyFunSuite with RestartCensusHarness {
 
   // ── DUT (mirrors lockstep.ExecuteLockStepSpec.FullCoreDut byte-for-byte) ─────
   // Copied (not shared) because the lock-step DUT is a private inner class. The
   // wiring is the SAME proven full-core chain.
 
-  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin) extends FiberPlugin {
+  class BackendWiringPlugin(eu0: AluEuPlugin, eu1: AluEuPlugin, branchEu: BranchEuPlugin, lsEu: LsEuPlugin, divEu: m68k040.execute.DivEuPlugin,
+                            /** FullCoreSynth parity for EXCEPTION kernels: write the exception
+                              * A7 at the committed physical A7 and mirror the committed A7 back
+                              * into the ExceptionUnit (`committedA7In`). Off by default so every
+                              * existing bench DUT keeps its exact PRF port set; without it a
+                              * kernel that takes an exception pushes its frame at the poked ISP,
+                              * not at the program's A7 (`ExcTrapIpcSpec` sets it). */
+                            excA7Mirror: Boolean = false) extends FiberPlugin {
     var a7Wr: m68k040.execute.regfile.RegFileWritePort = null
+    var a7Rd: m68k040.execute.regfile.RegFileReadPort = null
     // NZVC/X PRF write ports for RTE's CCR restore (task #176-regression): a DIRECT
     // write into whatever physical register nzvcRat/xRat's COMMITTED mapping
     // currently names, mirroring a7Wr's already-safe pattern -- see
@@ -54,6 +62,7 @@ trait CoreBenchHarness extends AnyFunSuite {
   var fpccWr: m68k040.execute.regfile.RegFileWritePort = null
     during setup {
       a7Wr   = host[m68k040.execute.regfile.IntRegFileService].newWrite(latency = 1, sharingKey = "excA7")
+      if (excA7Mirror) a7Rd = host[m68k040.execute.regfile.IntRegFileService].newRead(forceNoBypass = true)
       nzvcWr = host[m68k040.execute.regfile.NzvcRegFileService].newWrite(latency = 1, sharingKey = "rteNzvc")
       xWr    = host[m68k040.execute.regfile.XRegFileService].newWrite(latency = 1, sharingKey = "rteX")
   fpccRd = host[m68k040.execute.regfile.FpccRegFileService].newRead(forceNoBypass = true)
@@ -207,6 +216,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       faRedir.valid   := (doFlush && !feSuppress) || earlyFire || frontendResume.valid
       faRedir.payload := Mux(doFlush && !feSuppress, flushPc,
                          Mux(earlyFire, rob.logic.earlyPcReg, frontendResume.payload))
+      // CPU_FE_REDIRECT_CMD (null unless the flag is on): early redirect from the replica.
+      if (host[FetchAlignPlugin].logic.earlyRedirect != null) {
+        val faE = host[FetchAlignPlugin].logic
+        faE.earlyRedirect.valid   := rob.logic.earlyFireFe
+        faE.earlyRedirect.payload := rob.logic.earlyPcReg
+        faE.earlyRedirectWins     := earlyFire && !(doFlush && !feSuppress)
+      }
 
       // Fetch-time BTB wiring (slice 1): read off the fetch PC, invalidate off the
       // I-cache, feed the registered prediction into FetchAlign's predict input.
@@ -249,6 +265,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       fa.logic.gsBtbHit0      := btb.logic.predHitComb
       fa.logic.gsBtbType0     := btb.logic.predTypeComb
       fa.logic.gsPhtTaken0    := gsh.logic.phtTaken0
+      fa.logic.gsPhtStrong0 := gsh.logic.phtStrong0
       fa.logic.gsPhtIndex0    := gsh.logic.phtIndex0
       fa.logic.gsPhtTaken1    := gsh.logic.phtTaken1
       fa.logic.gsPhtIndex1    := gsh.logic.phtIndex1
@@ -266,6 +283,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // fetched after Tier 1, whose frontend survives the Tier-2 rollback?
       spinal.core.sim.SimPublic(gsh.logic.shiftValid, gsh.logic.shiftDir,
         gsh.logic.queryPc0, gsh.logic.flushRepair)
+      // BtbMissGshareIpcSpec: the carried PHT records of both emitted slots.
+      spinal.core.sim.SimPublic(fa.logic.feed.payload(0).phtValid, fa.logic.feed.payload(1).phtValid)
       // Test-only observation for the STALL BUDGET's `walk` category. The board's
       // OFF_PERF_STALL_WALK counts `perfLvlDtlbWalk || perfLvlItlbWalk`, each of which is
       // `RegNext(!walker.io.dbgPack(0))` = `RegNext(!fsm.isActive(IDLE))` -- and
@@ -276,6 +295,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // this is a TEST harness, so nothing here reaches the synthesized core.
       spinal.core.sim.SimPublic(host[DtlbPlugin].logic.walker.io.busy,
         host[ItlbPlugin].logic.walker.io.busy)
+      // IPC_RESTART_CENSUS=1 only (elaboration-time): name preservation for the P8 census.
+      restartCensusSimPublic(host)
 
       val dc    = host[DcacheService]
       val exc   = rob.logic.exc
@@ -314,7 +335,13 @@ trait CoreBenchHarness extends AnyFunSuite {
       // FullCoreSynth would have been invisible to the test suite.
       host[FetchAlignPlugin].logic.icMaintFlush := host[IcachePlugin].logic.maintInvalidateAll
       a7Wr.valid   := exc.a7WriteValid
-      a7Wr.address := U(15, a7Wr.address.getWidth bits)
+      if (excA7Mirror) {
+        a7Wr.address := host[RenameStage].committedPhysA7.resize(a7Wr.address.getWidth)
+        a7Rd.addr    := host[RenameStage].committedPhysA7.resize(a7Rd.addr.getWidth)
+        exc.committedA7In := a7Rd.data.asUInt
+      } else {
+        a7Wr.address := U(15, a7Wr.address.getWidth bits)
+      }
       a7Wr.data    := exc.a7WriteData.asBits
       nzvcWr.valid   := exc.rteNzvcWriteValid
       nzvcWr.address := host[RenameStage].committedPhysNzvc.resize(nzvcWr.address.getWidth)
@@ -378,9 +405,12 @@ trait CoreBenchHarness extends AnyFunSuite {
                     computeDirectTargets: Boolean = false,
                     deferSlot1Uncond: Boolean = false,
                     deferSlot1Dbcc: Boolean = false,
+                    btbMissGshare: Boolean = m68k040.top.ShippingCoreConfig.btbMissGshare,
+                    btbMissGshareWeak: Int = m68k040.top.ShippingCoreConfig.btbMissGshareWeak,
                     pcRangeEnable: Boolean = true,
                     icachePredecodeWords: Int = m68k040.cache.IcachePredecodeConfig.fromEnvironment,
-                    shippingProfile: Boolean = false) extends Component {
+                    shippingProfile: Boolean = false,
+                    excA7Mirror: Boolean = false) extends Component {
     // The fanout measurements can request the exact shipping plugin constructor
     // set. The direct-AXI bench topology is the one explicit difference from the
     // socket, which uses AxiDMergePlugin; all execution knobs come from the same
@@ -420,7 +450,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       deferSlot1Conditional = deferSlot1Conditional, trainSlot1Conditional = trainSlot1Conditional,
       deferTakenSlot1Conditional = deferTakenSlot1Conditional,
       computeDirectTargets = computeDirectTargets, deferSlot1Uncond = deferSlot1Uncond,
-      deferSlot1Dbcc = deferSlot1Dbcc)
+      deferSlot1Dbcc = deferSlot1Dbcc, btbMissGshare = btbMissGshare,
+      btbMissGshareWeak = btbMissGshareWeak)
     val dec    = if (shippingProfile) m68k040.top.ShippingPlugins.decode(shippingIpc)
                  else new DecodeStage(allowSlot1Prediction = trainSlot1Conditional,
                    fuseLongMoveLoads = fuseLongMoveLoads)
@@ -469,7 +500,7 @@ trait CoreBenchHarness extends AnyFunSuite {
     val rfX    = new RegFilePluginX
   val rfFp   = new RegFilePluginFp
   val rfFpcc = new RegFilePluginFpcc
-    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu)
+    val wire   = new BackendWiringPlugin(eu0, eu1, branchEu, lsEu, divEu, excA7Mirror)
     db.on { host.asHostOf(Seq[FiberPlugin](
       new ParamPlugin(M68kParams()),
       ctrl,
@@ -824,7 +855,9 @@ trait CoreBenchHarness extends AnyFunSuite {
                           zeroFillData: Boolean = false,
                           warmupInstrs: Int = 0,
                           verifyRetirement: Seq[m68k040.lockstep.CommitObservation] => Unit = _ => (),
-                          profileRetirement: Boolean = false)
+                          profileRetirement: Boolean = false,
+                          /** Floor on the run's cycle cap (walk-heavy directed kernels). */
+                          minCycleCap: Int = 0)
 
   /** Compile the core ONCE; return a handle that runs one kernel per call. Reusing
     * one compiled DUT across all kernels keeps this a single Verilator build. */
@@ -945,6 +978,8 @@ trait CoreBenchHarness extends AnyFunSuite {
       // Collection is pure observation of already-simPublic levels -- it cannot perturb
       // the DUT, so cycles are bit-identical with it on or off (verified, not assumed).
       val stallBudgetOn = sys.env.get("IPC_STALL_BUDGET").contains("1")
+      // IPC_RESTART_CENSUS=1: per-redirect stage census + restart/steady split (RestartCensus).
+      val restartCensus = if (RestartCensus.enabled) Some(new RestartCensus(k.name)) else None
       // IPC_PAIR_CENSUS=1: WHY did a cycle retire ONE instead of TWO?
       //
       // The stall budget found a lever (IQ_SPEC_ALU on dhrystone-x0-byteAbs-cb) that cut
@@ -1816,6 +1851,7 @@ trait CoreBenchHarness extends AnyFunSuite {
             (if (robBusy) 0x10 else 0) | (if (dcBusy) 0x20 else 0) |
             (if (walkBusy) 0x40 else 0) | (if (retire0) 0x80 else 0)
         }
+        restartCensus.foreach(_.onCycle(dut, totalCycles))
         histo += macrosThisCycle
         totalCycles += 1
       }
@@ -1889,7 +1925,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // budget costs nothing on a healthy kernel and still terminates a wedged one.
       val perMacro = if (memCfg.latency.enabled) 300 else 30
       // NB `math` alone resolves to spinal.lib.math inside this file.
-      val cap   = scala.math.max(if (memCfg.latency.enabled) 500000 else 20000, n * perMacro)
+      val cap   = scala.math.max(scala.math.max(if (memCfg.latency.enabled) 500000 else 20000, n * perMacro), k.minCycleCap)
       val debug = sys.env.contains("IPC_DEBUG")
       var lastSize = -1; var stuck = 0
       while (handle.result.size < n && guard < cap) {
@@ -1947,6 +1983,7 @@ trait CoreBenchHarness extends AnyFunSuite {
       // instructions retired across exactly these cycles.
       val windowCycles = windowHisto.size
       val windowRetired = windowHisto.sum
+      restartCensus.foreach(_.report(lo, hi, windowRetired))
       val lsOrderWindow = lsOrderHisto.slice(lo, hi + 1)
       val specWakeWindow = specWakeHisto.slice(lo, hi + 1)
       if (iqHolOn) {
