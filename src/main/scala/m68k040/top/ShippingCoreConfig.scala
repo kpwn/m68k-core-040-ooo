@@ -729,6 +729,23 @@ object ShippingCoreConfig {
     * Default ON (gated 2026-10-08: corpus 14 -> 12 fails, the two walk_vs_older_store_*;
     * lock-step 0; IPC unchanged); `CPU_WALK_SQ_CHECK=0` disables. */
   val walkSqCheck: Boolean = envFlag("CPU_WALK_SQ_CHECK", true)
+  /** Shared L2 TLB (week plan F2, review §4.3(c)): a direct-mapped cache of completed
+    * table walks, probed by both walkers before the root read, filled only from walks
+    * with no U/M write, flushed (epoch bump) by every L1 `atcFlush` source.
+    * `CPU_L2_TLB=1` enables; `CPU_L2_TLB_ENTRIES` (power of 2, 64..4096, default 512 =
+    * one RAMB36). OFF = no L2 port, no PROBE state (identical netlist). Echoed in
+    * `SHIPPING_CONFIG`. */
+  val l2Tlb: Boolean = envFlag("CPU_L2_TLB", false)
+  val l2TlbEntries: Int = envInt("CPU_L2_TLB_ENTRIES", 512, 64, 4096)
+  require((l2TlbEntries & (l2TlbEntries - 1)) == 0, s"CPU_L2_TLB_ENTRIES must be a power of 2 (got $l2TlbEntries)")
+  /** SURVIVE mode (`CPU_L2_TLB_SURVIVE=1`, implies `CPU_L2_TLB`): entries are tagged by
+    * {root pointer, TCR.P} and kept coherent by snooping every D-cache store against a
+    * filter of descriptor granules (`CPU_L2_TLB_SNOOP_GRANULES` x 128 B, default 32), so
+    * PFLUSH / MOVEC SRP/URP/TC/TTx do NOT clear the array. */
+  val l2TlbSurvive: Boolean = envFlag("CPU_L2_TLB_SURVIVE", true)
+  val l2TlbSnoopGranules: Int = envInt("CPU_L2_TLB_SNOOP_GRANULES", 32, 4, 128)
+  def l2TlbEntriesEffective: Int = if (l2Tlb || l2TlbSurvive) l2TlbEntries else 0
+
   /** U/M descriptor update atomicity (`DtlbPlugin`/`ItlbPlugin` drain + `LsEuPlugin`).
     * The deferred U/M update is a re-read + merged byte store issued after the owner
     * commits, concurrently with the store queue's drain. With this ON: (1) from the

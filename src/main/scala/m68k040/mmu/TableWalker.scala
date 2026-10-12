@@ -4,6 +4,7 @@ import m68k040.cache.{CacheMode, DLoadCmd, DLoadRsp}
 import spinal.core._
 import spinal.lib._
 import spinal.lib.fsm._
+import spinal.core.sim._
 
 /** 68040 hardware 3-level table walker (4KB or 8KB pages per TCR.P, task #195;
   * long-format descriptors).
@@ -53,7 +54,10 @@ import spinal.lib.fsm._
 class TableWalker(batchMode: Boolean = false,
                   /** Elaborate `io.abort` (`CPU_WALK_ABORT_ON_FLUSH`). False builds the
                     * exact pre-change component: no port, no state. */
-                  abortable: Boolean = false) extends Component {
+                  abortable: Boolean = false,
+                  /** Probe the shared L2 TLB (`CPU_L2_TLB`) before the root read. False
+                    * builds the exact pre-change component: no port, no state. */
+                  l2: Boolean = false) extends Component {
   val io = new Bundle {
     val start = in Bool ()
     /** ABORT the walk in progress: issue no further descriptor read, wait for an
@@ -94,6 +98,13 @@ class TableWalker(batchMode: Boolean = false,
       *   [9]   io.start
       *   [10]  donePulse */
     val dbgPack = out Bits (16 bits)
+    /** L2 TLB probe (see `L2Tlb`): one probe per walk, issued from PROBE; the
+      * response arrives as a Flow a fixed number of cycles after acceptance. */
+    val l2Probe = l2 generate master(Stream(L2TlbKey()))
+    val l2Rsp   = l2 generate slave(Flow(L2TlbRsp()))
+    /** The walk that just finished (`done`) was answered by the L2 TLB: no descriptor
+      * was read, so the owner must not re-fill the L2 from it. Valid with `done`. */
+    val l2Hit   = l2 generate out(Bool())
   }
 
   // ---- latched request ----
@@ -227,8 +238,21 @@ class TableWalker(batchMode: Boolean = false,
   val abortReg = abortable generate RegInit(False)
   val aborting: Bool = if (abortable) abortReg || io.abort else null
 
+  val l2Sent = l2 generate RegInit(False)
+  val l2HitR = l2 generate RegInit(False)
+  if (l2) {
+    io.l2Probe.valid := False
+    io.l2Probe.payload.vpn  := reqReg.vpn
+    io.l2Probe.payload.sup  := reqReg.isSuper
+    io.l2Probe.payload.is8K := reqReg.is8K
+    io.l2Probe.payload.root := reqReg.rootPtr
+    io.l2Hit := l2HitR
+    io.l2Hit.simPublic(); io.done.simPublic()   // TlbWalkIpcSpec walk classification
+  }
+
   val fsm = new StateMachine {
     val IDLE     = new State with EntryPoint
+    val PROBE    = if (l2) new State else null
     val RD_ROOT  = new State
     val RD_PTR   = new State
     val RD_PAGE  = new State
@@ -286,7 +310,52 @@ class TableWalker(batchMode: Boolean = false,
         descAddr := rootBase + rootOff.resize(32)
         cmdSent  := False
         descSplitIdx := 0        // no split-read carry into this walk
-        goto(RD_ROOT)
+        if (l2) {
+          l2Sent := False
+          l2HitR := False
+          goto(PROBE)
+        } else goto(RD_ROOT)
+      }
+    }
+
+    // ---- L2 TLB probe (CPU_L2_TLB) ----
+    // A hit is used only when the walk it replaces would have had NO side effect and
+    // NO fault: the owner fills the L2 only from walks with no U/M write (U already set,
+    // and M already set if that walk was a write), so the cached {ppn, wp, sup, cmode,
+    // M} is what the walk would return. A write to a page cached with M=0 (the walk
+    // would set M), a write to a write-protected page, or a user access to a
+    // supervisor page (both fault) fall back to the full walk.
+    if (l2) PROBE.whenIsActive {
+      when(if (abortable) !l2Sent && !aborting else !l2Sent) {
+        io.l2Probe.valid := True
+        when(io.l2Probe.ready) { l2Sent := True }
+      }
+      when(io.l2Rsp.valid) {
+        val e = io.l2Rsp.payload.data
+        val use = io.l2Rsp.payload.hit &&
+                  !(reqReg.isWrite && (e.writeProt || !e.modified)) &&
+                  !(e.supervisor && !reqReg.isSuper)
+        when(use) {
+          rPpn      := e.ppn
+          rWp       := e.writeProt
+          rSup      := e.supervisor
+          rCmode    := e.cacheMode
+          rModified := e.modified
+          rFault    := False
+          rReason   := MmuFaultReason.NONE
+          rUmValid  := False
+          l2HitR    := True
+          goto(FINISH)
+        } otherwise {
+          goto(RD_ROOT)
+        }
+      }
+      if (abortable) when(aborting && (!l2Sent || io.l2Rsp.valid)) {
+        rFault   := True
+        rReason  := MmuFaultReason.NON_RESIDENT
+        rUmValid := False
+        l2HitR   := False
+        goto(FINISH)
       }
     }
 
