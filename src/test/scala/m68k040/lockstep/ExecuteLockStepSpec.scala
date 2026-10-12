@@ -7555,6 +7555,54 @@ class ExecuteLockStepSpec extends AnyFunSuite {
       "move.l %d2,%d6 ; loop: bra loop", nInstr = 5)
   }
 
+  // ── MULx.L / DIVx.L with an AUTO-UPDATE source EA, (An)+ and -(An) ──────────────
+  // A real 68040 accepts every data addressing mode for the long multiply/divide. These
+  // used to raise vector 4 (silicon: `muls.l (%a1)+,%d4:%d5`, 4C19 5C04, Acrobat Reader).
+  // Every form: .L32, .L64 Dh:Dl, DIVxL remainder, DIVx.L 64 Dr:Dq; A7 both directions;
+  // Dl sharing the address register's number (D1 with A1). Musashi checks the An update.
+  test("lock-step: MULU.L/MULS.L (An)+ and -(An) sources, 32 and 64 bit, A7", VerilatorTest) {
+    runLockStep("mul-l-auto-ea",
+      "lea 0x2000,%a1 ; move.l #0xFFFFFF85,(%a1) ; move.l #0x12345678,%d5 ; " +
+      ".short 0x4C19,0x5C04 ; " +                                     // muls.l (%a1)+,%d4:%d5
+      "move.l #0x10001,0x2010 ; lea 0x2014,%a2 ; move.l #0xFFFF,%d3 ; " +
+      "mulu.l -(%a2),%d3 ; " +                                        // .L32, -(An)
+      "move.l #-3,0x2020 ; lea 0x2020,%a1 ; moveq #7,%d1 ; " +
+      "muls.l (%a1)+,%d1 ; " +                                        // Dl number == An number
+      "lea 0x2014,%a3 ; move.l #0xFFFFFFFE,%d6 ; " +
+      "mulu.l -(%a3),%d0:%d6 ; " +                                    // .L64, -(An)
+      "move.l %a7,%a6 ; lea 0x2100,%a7 ; move.l #3,(%a7) ; move.l #0x40000001,%d0 ; " +
+      "mulu.l (%a7)+,%d0 ; moveq #2,%d2 ; " +                         // A7 (An)+
+      "muls.l -(%a7),%d1:%d2 ; " +                                    // A7 -(An), .L64
+      "move.l %a6,%a7 ; loop: bra loop", nInstr = 23)
+  }
+
+  test("lock-step: DIVU.L/DIVS.L/DIVxL.L (An)+ and -(An) sources, 32 and 64 bit, A7", VerilatorTest) {
+    runLockStep("div-l-auto-ea",
+      "lea 0x2040,%a0 ; move.l #-7,(%a0) ; move.l #1000003,%d1 ; " +
+      "divs.l (%a0)+,%d1 ; " +                                        // quotient only
+      "move.l #10,(%a0) ; moveq #-1,%d3 ; moveq #-1,%d2 ; " +
+      "divul.l (%a0)+,%d2:%d3 ; " +                                   // 32-bit, remainder -> D2
+      "moveq #-1,%d4 ; move.l #-4096,%d5 ; " +
+      "divs.l -(%a0),%d4:%d5 ; " +                                    // 64-bit Dr:Dq
+      "move.l %a7,%a6 ; lea 0x2110,%a7 ; move.l #3,(%a7) ; moveq #100,%d6 ; " +
+      "divu.l (%a7)+,%d6 ; moveq #-100,%d3 ; " +                      // A7 (An)+
+      "divsl.l -(%a7),%d2:%d3 ; " +                                   // A7 -(An), remainder
+      "move.l %a6,%a7 ; loop: bra loop", nInstr = 19)
+  }
+
+  // DIV0 through an auto-update source: the EA (and so the An update) is evaluated
+  // BEFORE the zero check, on the 68040 and in Musashi. Entry CCR Z=1 (clr.l) matches the
+  // handler's moveq #0 (same convention as the DIVU.W DIV0 test above).
+  test("lock-step: DIVU.L (An)+ / DIVS.L -(An) 64-bit DIV0 -> An updated -> handler -> RTE", VerilatorTest) {
+    runLockStep("div-l-auto-div0",
+      "move.l #handler,%d0 ; move.l %d0,0x14 ; moveq #5,%d1 ; lea 0x2050,%a0 ; " +
+      "clr.l (%a0) ; divu.l (%a0)+,%d1 ; " +                          // /0, A0 -> 0x2054
+      "move.l #0x12345678,%d2 ; move.l #0x9abcdef0,%d3 ; clr.l 0x2050 ; " +
+      "divs.l -(%a0),%d2:%d3 ; " +                                    // /0, A0 -> 0x2050
+      "move.l %a0,%d6 ; loop: bra loop ; " +
+      "handler: moveq #0,%d4 ; rte", nInstr = 15)
+  }
+
   // ── MMU page-fault delivery lock-step (format-$7 -> handler -> RTE) ──────────
   // THE Task-4 gate: a data store to a NON-RESIDENT page raises a 68040 access
   // fault (vector 2, format-$7), vectors to a handler that writes a resident page

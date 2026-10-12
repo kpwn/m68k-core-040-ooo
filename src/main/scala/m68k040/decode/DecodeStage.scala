@@ -1980,6 +1980,18 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // (mirrors ucMovesRn's own ext-word extraction, one nibble down) — harmless/unread for
     // every other microcode customer.
     ucEntryCtx.move16Ay := (U(8, 5 bits) + ucEntryPkt.words(1)(14 downto 12).asUInt).resize(5)
+    // MULx.L / DIVx.L (An)+/-(An) (OperationDecoder marks only those two EA modes
+    // microcoded). Ext word: Dl/Dq=ext[14:12], signed=ext[11], 64-bit=ext[10],
+    // Dh/Dr=ext[2:0] (= ctx.casDc above). The EA ((An)+/-(An): base + auto mode/delta at
+    // LONG) rides ctx.eaBase + casAutoMode/casAutoDelta + movesDelta, populated above from
+    // the shifted-window EA decode exactly as for CAS/MOVES. Unread by other customers.
+    val ucMdExt = ucEntryPkt.words(1)
+    ucEntryCtx.mdLo     := ucMdExt(14 downto 12).asUInt.resize(5)
+    ucEntryCtx.mdSigned := ucMdExt(11)
+    ucEntryCtx.md64     := ucMdExt(10)
+    val ucIsMulDiv = ucEntrySpec.microcoded &&
+      ((ucEntrySpec.form === OpForm.MULL) || (ucEntrySpec.form === OpForm.DIVL))
+    val ucMdHasRem = ucMdExt(10) || (ucMdExt(2 downto 0) =/= ucMdExt(14 downto 12))
     // ── Task 6b: F-line FP-generic genuine memory-source loads Ctx population ──────────
     // `OperationDecoder`'s new memory-mode-<ea> arm routes the WHOLE opword-ambiguous
     // cpGEN memory band (opclass 010/011/100/101/110/111 all share `0xF200|<ea>`) to this
@@ -2971,6 +2983,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
     // an unimplemented memind bit-field never entered the engine at all); the RMW arms
     // never were, because `spec.microcoded` admits them unconditionally -- so this also
     // closes a pre-existing hole rather than only guarding the new path.
+    val ucMdEntry = Mux(ucEntrySpec.form === OpForm.DIVL,
+      Mux(ucMdHasRem, U(Microcode.MULDIV_DIVQR_ENTRY, ew bits), U(Microcode.MULDIV_DIVQ_ENTRY, ew bits)),
+      Mux(ucMdExt(10), U(Microcode.MULDIV_MUL64_ENTRY, ew bits), U(Microcode.MULDIV_MUL32_ENTRY, ew bits)))
     val ucRealEntry = Mux(ucIsFpMem, ucFpRealEntry,
       Mux(ucIsBfMemindRmw, ucBfMemindRmwEntry,
       Mux(ucIsBfMemindRd, ucBfMemindRdEntry,
@@ -2992,8 +3007,9 @@ class DecodeStage(allowSlot1Prediction: Boolean = false,
         // address. This is what makes the gate SAFE to make generic: a family nobody
         // routed traps, rather than silently writing the wrong register or branching to a
         // wild PC -- which is exactly how all four previous drift bugs presented.
+        Mux(ucIsMulDiv, ucMdEntry,
         Mux(ucEntrySpec.microcoded, ucEntrySpec.ucEntry,
-                                    U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits))))))))))
+                                    U(Microcode.MI_UNSUPPORTED_ENTRY, ew bits)))))))))))
     ucRealEntry.simPublic()  // debug-only (task #144)
 
     // LUT-reduction Task A2: the real `Mem(DescBits(), romSize)` (built from

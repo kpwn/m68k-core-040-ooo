@@ -185,6 +185,11 @@ object Microcode {
   case object SFpStIdx1 extends Sel   // selImm: 1
   case object SFpStIdx2 extends Sel   // selImm: 2
 
+  // ── MULx.L / DIVx.L with an (An)+/-(An) source (MULDIV_* entries) ───────────────
+  // (ctx.mdLo, True): Dl (MUL) / Dq (DIV) = ext[14:12]. Dh / Dr = ext[2:0] is exactly
+  // ctx.casDc (CAS's Dc is ext1[2:0] of the same word), so SCasDc serves it.
+  case object SMdLo extends Sel
+
   /** The op kind of a descriptor's template. */
   sealed trait UOp
   case object UMove      extends UOp    // plain move / load / store data move (DecOp.MOVE)
@@ -253,6 +258,13 @@ object Microcode {
   // `usesFpSrcA` so the FP rename + CPLX dynamic-wakeup scoreboard order it behind
   // whatever produced FPn; declares NO FP/FPCC destination at all.
   case object UFpStoreCvt extends UOp
+  // ── MULx.L / DIVx.L (An)+/-(An) (MULDIV_* entries): the SAME CPLX µops the fast crack
+  // emits for a register/memSimple source (MicroOpAssembler mullUop/mulhiUop/divlUop/
+  // divremUop), field for field; signed/64 come from ctx.mdSigned/md64.
+  case object UMulLo extends UOp   // DecOp.MUL    Dl := Dl * srcB (low product), NZV
+  case object UMulHi extends UOp   // DecOp.MULHI  Dh := high product (DivEu stash)
+  case object UDivQ  extends UOp   // DecOp.DIV    Dq := quotient, NZVC; srcC=Dr iff 64-bit
+  case object UDivR  extends UOp   // DecOp.DIVREM Dr := remainder (DivEu stash), dropped commit
 
   /** Memory role. */
   sealed trait Mem
@@ -404,7 +416,7 @@ object Microcode {
         SImm12, SImm16, SImm4, SImm8, SMiImm, SMiOd,
         SMiOther, SMiOtherEaBase, SMiOtherEaDispLo, SMiOtherOd, SMove16Ay, SMovesAn,
         SMovesDelta, SMovesRn, SNegDeltaAx, SNegDeltaAy, SNegOne, SNone, SPackAdj,
-        SRetPc, SShift8, ST0, ST1, ST2, ST3 = newElement()
+        SRetPc, SShift8, ST0, ST1, ST2, ST3, SMdLo = newElement()
   }
 
   /** Hardware encoding of `UOp` (the µop-template vocabulary) — one element per
@@ -423,7 +435,7 @@ object Microcode {
         UMove, UAddDrop, UOpFromCtx, UBfMem, UBfResolve, UBfShiftOff,
         UBfAdd, UBfReg, UMiPtrLoad, UMiHostMove, UMiHostOp, UMiLeaFinal,
         UMiPushFinal, UMiBranchFinal, UShiftR8, UMovesRead, UFpIssue, UFpCtrlRead,
-        UFpStoreCvt, UCasOp, UMiScc = newElement()
+        UFpStoreCvt, UCasOp, UMiScc, UMulLo, UMulHi, UDivQ, UDivR = newElement()
   }
 
   /** Hardware encoding of `Mem` (memory role) — one element per case object (3). */
@@ -541,6 +553,10 @@ object Microcode {
         case UFpIssue       => (UOpHw.UFpIssue, 0, false, false, false)
         case UFpCtrlRead    => (UOpHw.UFpCtrlRead, 0, false, false, false)
         case UFpStoreCvt    => (UOpHw.UFpStoreCvt, 0, false, false, false)
+        case UMulLo         => (UOpHw.UMulLo, 0, false, false, false)
+        case UMulHi         => (UOpHw.UMulHi, 0, false, false, false)
+        case UDivQ          => (UOpHw.UDivQ, 0, false, false, false)
+        case UDivR          => (UOpHw.UDivR, 0, false, false, false)
         case co: UCasOp     => (UOpHw.UCasOp, co.form, co.writesNzvc, co.readsNzvc, co.dropCommit)
       }
     b.uop           := uopHw
@@ -636,6 +652,7 @@ object Microcode {
       case ST1 => SelHw.ST1
       case ST2 => SelHw.ST2
       case ST3 => SelHw.ST3
+      case SMdLo => SelHw.SMdLo
     }
     b.srcA := sel(d.srcA)
     b.srcB := sel(d.srcB)
@@ -1375,53 +1392,36 @@ object Microcode {
     Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispHi,
          sz = SzByte, isLast = true),                                                     // µPC151 (k9)
 
-    // MI_BF_INS_DO0 @152 — BFINS, STATIC offset (Do=0; width may be dynamic). Mirrors
-    // BF_DYN_INS_DO0's prefunnel/register-BFINS/reload+inverse-funnel shape, EA-recomputed
-    // TWICE (once to re-derive the load address for the lo/hi RELOAD, once more for the
-    // final store pair) — each recompute is a single 1-µop pointer LOAD, always ≤3 temps
-    // concurrently live (verified per-row in the family header comment's budget analysis).
-    //   l0 LOAD.L ptr = (An+bd) -> T2                                          (isFirst)
-    //   l1 LOAD.L  [ptr+byteAddr]   -> T0 (lo)
-    //   l2 LOAD.B  [ptr+byteAddr+4] -> T1 (hi)
-    //   l3 BFRESOLVE {off,wid} -> T2 (packed)
-    //   l4 BITFIELD bfMem prefunnel (bfTstForm) srcA=T0,srcB=T1,srcC=T2 -> T0 (field32)
-    //   l5 BITFIELD bfReg register-BFINS srcA=T0,srcB=Dn2,srcC=T2 -> T2 (newField32; +N/Z)
-    //   l6 LOAD.L ptr (RECOMPUTE) = (An+bd) -> T0
-    //   l7 LOAD.L  [ptr+byteAddr]   -> T1 (lo reload; ptr(T0) still needed)
-    //   l8 BITFIELD bfMem LO5 srcA=T1,srcB=T2,imm=static bitOff -> T1 (lo')
-    //   l9 LOAD.B  [ptr+byteAddr+4] -> T0 (hi reload; overwrites dead ptr; T1=lo' preserved)
-    //   l10 BITFIELD bfMem HI5 srcA=T0,srcB=T2,imm=static bitOff -> T0 (hi'; newField32 dead)
-    //   l11 LOAD.L ptr (RECOMPUTE #2) = (An+bd) -> T2
-    //   l12 STORE.L T1(lo') -> [ptr+byteAddr]
-    //   l13 STORE.B T0(hi') -> [ptr+byteAddr+4]                                (isLast)
-    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
-         sz = SzLong, miPtrIndex = true, isFirst = true),                                 // µPC152 (l0)
-    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST0, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC153 (l1)
-    Desc(UMove, mem = MLoad, srcA = ST2, dst = ST1, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC154 (l2)
-    Desc(UBfResolve, srcA = SBfOffDyn, srcB = SBfWdDyn, dst = ST2, useImm = true,
-         imm = SBfResImm, sz = SzLong),                                                   // µPC155 (l3)
-    Desc(UBfMem, srcA = ST0, srcB = ST1, srcC = ST2, dst = ST0, sz = SzLong,
-         bfDyn = true, bfTstForm = true),                                                 // µPC156 (l4)
-    Desc(UBfReg, srcA = ST0, srcB = SBfDn2, srcC = ST2, dst = ST2, sz = SzLong,
-         bfDyn = true, bfWritesNz = true),                                                // µPC157 (l5)
-    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true, imm = SEaDispLo,
-         sz = SzLong, miPtrIndex = true),                                                 // µPC158 (l6, recompute)
-    Desc(UMove, mem = MLoad, srcA = ST0, dst = ST1, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC159 (l7)
-    Desc(UBfMem, srcA = ST1, srcB = ST2, dst = ST1, useImm = true, imm = SBfImm,
-         sz = SzLong, bfStoreForm = 2),                                                   // µPC160 (l8)
-    Desc(UMove, mem = MLoad, srcA = ST0, dst = ST0, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte),                                                                    // µPC161 (l9)
-    Desc(UBfMem, srcA = ST0, srcB = ST2, dst = ST0, useImm = true, imm = SBfImm,
-         sz = SzLong, bfStoreForm = 3),                                                   // µPC162 (l10)
-    Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST2, useImm = true, imm = SEaDispLo,
-         sz = SzLong, miPtrIndex = true),                                                 // µPC163 (l11, recompute #2)
-    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST1, useImm = true, imm = SBfMiDispLo,
-         sz = SzLong),                                                                    // µPC164 (l12)
-    Desc(UMove, mem = MStore, srcA = ST2, srcB = ST0, useImm = true, imm = SBfMiDispHi,
-         sz = SzByte, isLast = true),                                                     // µPC165 (l13)
+    // ── MULDIV @152..165: MULx.L / DIVx.L <ea> with ea = (An)+ / -(An) ──────────────
+    // (These 14 rows held the original MI_BF_INS_DO0 program, which no entry routed to --
+    // superseded by MI_BF_INS_DO0_V2 @226 -- so reusing them keeps romSize at 511 and the
+    // 9-bit µPC / 512-row BRAM unchanged.)
+    // The source load and the An update use the same µcode EA machinery as MOVES-read /
+    // CAS: the LOAD carries ctx.casAutoMode/casAutoDelta (POSTINC: addr=An; PREDEC:
+    // addr=An-4) and writes T0; a DROPPED ADD (SMovesAn += ctx.movesDelta, +4/-4) then
+    // updates An. The fast crack cannot do this: a load µop's single int dst is the loaded
+    // value (the LS-EU writes An only from an eaAuto STORE), so the update is a µop of its
+    // own, and [load][An][op][hi/rem] is 4 µops, one past MicroOpAssembler's 3-µop crack.
+    // The op µops match the fast crack's memSimple shape (mullUop/mulhiUop/divlUop/
+    // divremUop), the ordering reads included (MULHI reads Dl; DIVREM reads old Dr + Dq).
+    // An is updated before the op, so DIV0 is delivered with An already moved (68040 and
+    // Musashi), while an access fault on the load squashes the macro before the ADD
+    // commits (An untouched, restartable).
+    // MUL32 @152 (3): Dl := low(Dl * <ea>)
+    mdLoad, mdAnUpd,
+    Desc(UMulLo, srcA = SMdLo, srcB = ST0, dst = SMdLo, sz = SzLong, isLast = true),     // µPC154
+    // MUL64 @155 (4): Dh:Dl := Dl * <ea>
+    mdLoad, mdAnUpd,
+    Desc(UMulLo, srcA = SMdLo, srcB = ST0, dst = SMdLo, sz = SzLong),                    // µPC157
+    Desc(UMulHi, srcA = SMdLo, dst = SCasDc, sz = SzLong, isLast = true),                // µPC158
+    // DIVQ @159 (3): Dq := Dq / <ea> (32-bit, Dr == Dq: quotient only)
+    mdLoad, mdAnUpd,
+    Desc(UDivQ, srcA = SMdLo, srcB = ST0, srcC = SCasDc, dst = SMdLo, sz = SzLong,
+         isLast = true),                                                                  // µPC161
+    // DIVQR @162 (4): Dq := quotient, Dr := remainder (32-bit Dr != Dq, or 64-bit Dr:Dq)
+    mdLoad, mdAnUpd,
+    Desc(UDivQ, srcA = SMdLo, srcB = ST0, srcC = SCasDc, dst = SMdLo, sz = SzLong),      // µPC164
+    Desc(UDivR, srcA = SCasDc, srcB = SMdLo, dst = SCasDc, sz = SzLong, isLast = true),  // µPC165
 
   )
   private def romP5(): Vector[Desc] = Vector(
@@ -2271,12 +2271,21 @@ object Microcode {
   val MI_SCC_ENTRY: Int = romBeforeScc.size
   // Scc is store-only: walk the pointer, evaluate the incoming CCR, then store
   // exactly one byte. Never read the destination (which may be write-only MMIO).
-  val rom: Vector[Desc] = romBeforeScc ++ Vector(
+  private val romScc: Vector[Desc] = Vector(
     Desc(UMiPtrLoad, mem = MLoad, srcA = SEaBase, dst = ST0, useImm = true,
       imm = SEaDispLo, sz = SzLong, miPtrIndex = true, isFirst = true),
     Desc(UMiScc, dst = ST1, sz = SzByte),
     Desc(UMiHostMove, mem = MStore, srcA = ST0, srcB = ST1, useImm = true,
       imm = SMiOd, sz = SzByte, miHostIndex = true, isLast = true))
+
+  val rom: Vector[Desc] = romBeforeScc ++ romScc
+
+  // MULDIV @152..165 building blocks (see the romP4 block): the (An)+/-(An) source load
+  // and the dropped An write-back, both keyed off the CAS/MOVES ctx auto-EA fields.
+  private def mdLoad: Desc = Desc(UMove, mem = MLoad, auto = AEaCasLoad, srcA = SEaBase,
+    dst = ST0, sz = SzLong, isFirst = true)
+  private def mdAnUpd: Desc = Desc(UAddDrop, srcA = SMovesAn, dst = SMovesAn, useImm = true,
+    imm = SMovesDelta)
 
   // Task 6b entry constants: SELF-COMPUTED from each group's own real row count (via
   // `scanLeft`), not hand-counted literals -- eliminates arithmetic-drift risk across 18
@@ -2404,8 +2413,19 @@ object Microcode {
   val MI_BF_RD_DO0_ENTRY  = 130
   val MI_BF_RD_DO1_ENTRY  = 135
   val MI_BF_RMW_DO0_ENTRY = 142
-  val MI_BF_INS_DO0_ENTRY = 152   // task #197 original — non-functional (hang), left as dead
-                                   // ROM space; superseded for routing by MI_BF_INS_DO0_V2_ENTRY
+  // rows 152..165: formerly the unrouted MI_BF_INS_DO0 (superseded by MI_BF_INS_DO0_V2_ENTRY);
+  // now the MULx.L/DIVx.L (An)+/-(An) programs.
+  val MULDIV_MUL32_ENTRY = 152  // rows 152..154 (load, An update, MUL)
+  val MULDIV_MUL64_ENTRY = 155  // rows 155..158 (load, An update, MUL, MULHI)
+  val MULDIV_DIVQ_ENTRY  = 159  // rows 159..161 (load, An update, DIV)
+  val MULDIV_DIVQR_ENTRY = 162  // rows 162..165 (load, An update, DIV, DIVREM)
+  require(Seq(MULDIV_MUL32_ENTRY, MULDIV_MUL64_ENTRY, MULDIV_DIVQ_ENTRY, MULDIV_DIVQR_ENTRY)
+            .forall(e => rom(e) == mdLoad && rom(e + 1) == mdAnUpd) &&
+          rom(MULDIV_MUL32_ENTRY + 2).uop == UMulLo && rom(MULDIV_MUL32_ENTRY + 2).isLast &&
+          rom(MULDIV_MUL64_ENTRY + 3).uop == UMulHi && rom(MULDIV_MUL64_ENTRY + 3).isLast &&
+          rom(MULDIV_DIVQ_ENTRY + 2).uop == UDivQ && rom(MULDIV_DIVQ_ENTRY + 2).isLast &&
+          rom(MULDIV_DIVQR_ENTRY + 3).uop == UDivR && rom(MULDIV_DIVQR_ENTRY + 3).isLast,
+    "Microcode: the MULDIV entry constants no longer point at their programs")
   val MI_BF_RMW_DO1_ENTRY    = 201  // rows 201..211 (task #203)
   val MI_BF_INS_DO1_ENTRY    = 212  // rows 212..225 (task #203)
   val MI_BF_INS_DO0_V2_ENTRY = 226  // rows 226..237 (task #203)
@@ -2647,6 +2667,10 @@ object Microcode {
     // +/-4*popcount(mask) (0 for non-auto). See SFpCtrlRc / SFpCtrlDelta.
     val fpCtrlRc    = Bits(32 bits)
     val fpCtrlDelta = Bits(32 bits)
+    // ── MULx.L / DIVx.L (An)+/-(An) (MULDIV_* entries), from the ext word ──────────
+    val mdLo     = UInt(5 bits)   // ext[14:12] Dl / Dq
+    val mdSigned = Bool()         // ext[11]
+    val md64     = Bool()         // ext[10]
   }
 
   // ── selector → (regId, valid) ──────────────────────────────────────────────
@@ -2684,6 +2708,7 @@ object Microcode {
     case SMovesAn => (ctx.eaBase, ctx.casAutoMode =/= EaAuto.NONE)
     case SA7      => (U(15, 5 bits), True)   // task #201: the constant A7 stack pointer
     case SMove16Ay => (ctx.move16Ay, True)   // task #207: MOVE16 dst An (ext word[14:12])
+    case SMdLo    => (ctx.mdLo, True)        // MUL.L Dl / DIV.L Dq
     case _       => (U(0, 5 bits), False)
   }
 
@@ -2772,6 +2797,7 @@ object Microcode {
     val srcCV   = if (d.indexFromEa) ctx.eaIndexValid
                   else if (d.indexFromMiOtherEa) ctx.miOtherEaIndexValid
                   else if (d.miPtrIndex || d.miHostIndex) (ctx.eaIndexValid && miIndexUse)
+                  else if (d.uop == UDivQ) (srcCVSel && ctx.md64)   // Dr = dividend high, 64-bit only
                   else srcCVSel
 
     u.valid  := valid
@@ -2799,6 +2825,10 @@ object Microcode {
       case UFpCtrlRead => u.op := DecOp.FPCTRLRD  // task 9b: FPCR/FPSR/FPIAR -> int temp
       case UFpStoreCvt => u.op := DecOp.FPSTORECVT  // task 14b: FPn -> one narrowed chunk
       case _: UCasOp   => u.op := DecOp.CASOP
+      case UMulLo      => u.op := DecOp.MUL
+      case UMulHi      => u.op := DecOp.MULHI
+      case UDivQ       => u.op := DecOp.DIV
+      case UDivR       => u.op := DecOp.DIVREM
     }
     u.cluster := (d.uop match {
       case UBfMem    => Cluster.CPLX         // the bit-field compute runs on the CPLX (DivEu) bit-field lane
@@ -2828,6 +2858,7 @@ object Microcode {
       // cluster with a read port on the FP register file. Explicit override (d.mem = MNone).
       case UFpStoreCvt => Cluster.CPLX
       case _: UCasOp => Cluster.INT          // CAS/CAS2 compute runs on the ALU pipe
+      case UMulLo | UMulHi | UDivQ | UDivR => Cluster.CPLX   // DivEu, like the fast crack
       case _         => (d.mem match { case MNone => Cluster.INT; case _ => Cluster.LS })
     })
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
@@ -2913,9 +2944,10 @@ object Microcode {
       u.useImm     := Bool(d.useImm)
       u.imm        := (if (d.useImm) selImm(d.imm, ctx) else B(0, 32 bits))
       u.srcBValid  := srcBV
-      u.readsNzvc  := Bool(d.writesFlags || d.uop == UMiScc)
+      // DIV reads NZVC (overflow keeps N/Z/C, Musashi) and writes it; MUL (low) writes it.
+      u.readsNzvc  := Bool(d.writesFlags || d.uop == UMiScc || d.uop == UDivQ)
       u.readsX     := Bool(d.writesFlags)
-      u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz || d.nzvcOnly)
+      u.writesNzvc := Bool(d.writesFlags || d.bfWritesNz || d.nzvcOnly || d.uop == UMulLo || d.uop == UDivQ)
       u.writesX    := Bool(d.writesFlags)
     }
     // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
@@ -2935,7 +2967,7 @@ object Microcode {
     u.unimplemented := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
     u.faulted := Bool(d.bfIllegal) || Bool(d.fpMemTrap)
     u.faultVector := (if (d.bfIllegal) U(4, 8 bits) else if (d.fpMemTrap) U(11, 8 bits) else U(0, 8 bits))
-    u.faultUsesNextPc := Bool(d.fpMemTrap)
+    u.faultUsesNextPc := Bool(d.fpMemTrap || d.uop == UDivQ)   // DIV0 stacks nextPc (format $2)
     // Task #228: fpMemTrap DOES now populate fpuSoftwareComplete/fpuCmdWord (previously
     // deliberately left at False/0 -- see DecodedUop.fpuSoftwareComplete's doc comment for
     // the original narrow-scope rationale). The concern that comment raises is real for
@@ -2957,14 +2989,16 @@ object Microcode {
     u.fpuSoftwareComplete := Bool(d.fpMemTrap)
     u.fpuCmdWord          := (if (d.fpMemTrap) ctx.fpTrapCmd else B(0, 16 bits))
     u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
-    u.divSigned := False; u.div64 := False
+    val isMulDiv = d.uop == UMulLo || d.uop == UMulHi || d.uop == UDivQ || d.uop == UDivR
+    u.divSigned := (if (isMulDiv) ctx.mdSigned else False)
+    u.div64     := (if (isMulDiv) ctx.md64 else False)
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later
     // reader (the program reads Ay/Ax into a Dn after the op). Mirrors anUpdUop / LINK.
     // CAS2's CAS2C1 (the res1 compare) + the two CAS2DC Dc-update µops are likewise DROPPED:
     // their NZVC/Dc1/Dc2 writes still land + fold (the lock-step reads Dc1/Dc2 back), but
     // CAS2 maps to exactly ONE oracle step (the kept CAS2C2, which carries the final NZVC).
-    u.divIsRem := Bool(d.uop == UAddDrop || d.bfDrop || (d.uop.isInstanceOf[UCasOp] && d.uop.asInstanceOf[UCasOp].dropCommit))
+    u.divIsRem := Bool(d.uop == UAddDrop || d.bfDrop || d.uop == UDivR || (d.uop.isInstanceOf[UCasOp] && d.uop.asInstanceOf[UCasOp].dropCommit))
     u.isChk2   := False
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store
@@ -3262,6 +3296,7 @@ object Microcode {
       is(SelHw.SMovesAn)  { reg := ctx.eaBase;  v := ctx.casAutoMode =/= EaAuto.NONE }
       is(SelHw.SA7)       { reg := U(15, 5 bits); v := True }   // task #201: the constant A7 stack pointer
       is(SelHw.SMove16Ay) { reg := ctx.move16Ay;  v := True }   // task #207: MOVE16 dst An (ext word[14:12])
+      is(SelHw.SMdLo)     { reg := ctx.mdLo;      v := True }   // MUL.L Dl / DIV.L Dq
     }
     (reg, v)
   }
@@ -3352,7 +3387,8 @@ object Microcode {
                   Mux(d.miPtrIndex || d.miHostIndex, ctx.eaIndexReg, srcCRegSel)))
     val srcCV   = Mux(d.indexFromEa,          ctx.eaIndexValid,
                   Mux(d.indexFromMiOtherEa,   ctx.miOtherEaIndexValid,
-                  Mux(d.miPtrIndex || d.miHostIndex, ctx.eaIndexValid && miIndexUse, srcCVSel)))
+                  Mux(d.miPtrIndex || d.miHostIndex, ctx.eaIndexValid && miIndexUse,
+                      srcCVSel && !(d.uop === UOpHw.UDivQ && !ctx.md64))))
 
     u.valid  := valid
     u.pc     := ctx.pc
@@ -3380,6 +3416,10 @@ object Microcode {
       is(UOpHw.UFpCtrlRead) { u.op := DecOp.FPCTRLRD }  // task 9b: FPCR/FPSR/FPIAR -> int temp
       is(UOpHw.UFpStoreCvt) { u.op := DecOp.FPSTORECVT } // task 14b: FPn -> narrowed chunk
       is(UOpHw.UCasOp)      { u.op := DecOp.CASOP }
+      is(UOpHw.UMulLo)      { u.op := DecOp.MUL }
+      is(UOpHw.UMulHi)      { u.op := DecOp.MULHI }
+      is(UOpHw.UDivQ)       { u.op := DecOp.DIV }
+      is(UOpHw.UDivR)       { u.op := DecOp.DIVREM }
     }
     // The original's `case _ => (d.mem match { case MNone => INT; case _ => LS })` default
     // arm, hoisted ahead of the switch per the completeness convention.
@@ -3410,6 +3450,7 @@ object Microcode {
       is(UOpHw.UFpCtrlRead) { u.cluster := Cluster.CPLX }
       is(UOpHw.UFpStoreCvt) { u.cluster := Cluster.CPLX }
       is(UOpHw.UCasOp)      { u.cluster := Cluster.INT }  // CAS/CAS2 compute runs on the ALU pipe
+      is(UOpHw.UMulLo, UOpHw.UMulHi, UOpHw.UDivQ, UOpHw.UDivR) { u.cluster := Cluster.CPLX }
     }
     // The An write-back ADD is LONG; the BCD chain uses ctx.size; the bit-field chain rows
     // carry an explicit size (SzLong for lo/compute, SzByte for the hi spill byte).
@@ -3501,9 +3542,10 @@ object Microcode {
       // Other rows: no flags.
       u.useImm     := d.useImm
       u.srcBValid  := srcBV
-      u.readsNzvc  := d.writesFlags || (d.uop === UOpHw.UMiScc)
+      u.readsNzvc  := d.writesFlags || (d.uop === UOpHw.UMiScc) || (d.uop === UOpHw.UDivQ)
       u.readsX     := d.writesFlags
-      u.writesNzvc := d.writesFlags || d.bfWritesNz || d.nzvcOnly
+      u.writesNzvc := d.writesFlags || d.bfWritesNz || d.nzvcOnly ||
+                      (d.uop === UOpHw.UMulLo) || (d.uop === UOpHw.UDivQ)
       u.writesX    := d.writesFlags
     }
     // task #201: UMiBranchFinal is an indirect branch (mirrors ibrUop); UMiPushFinal is a
@@ -3521,7 +3563,7 @@ object Microcode {
     u.unimplemented := d.bfIllegal || d.fpMemTrap
     u.faulted := d.bfIllegal || d.fpMemTrap
     u.faultVector := Mux(d.bfIllegal, U(4, 8 bits), Mux(d.fpMemTrap, U(11, 8 bits), U(0, 8 bits)))
-    u.faultUsesNextPc := d.fpMemTrap
+    u.faultUsesNextPc := d.fpMemTrap || (d.uop === UOpHw.UDivQ)
     // Task #228: fpMemTrap DOES now populate fpuSoftwareComplete/fpuCmdWord -- see the
     // twin comment on this same assignment in `resolve()` above (the Desc-based
     // interpreter) for the full argument (why ext[9:7]/DST is safe unconditionally, why
@@ -3531,14 +3573,18 @@ object Microcode {
     u.fpuSoftwareComplete := d.fpMemTrap
     u.fpuCmdWord          := Mux(d.fpMemTrap, ctx.fpTrapCmd, B(0, 16 bits))
     u.sswInstr := False; u.faultAtc := True; u.isRte := False; u.isCondTrap := False
-    u.divSigned := False; u.div64 := False
+    val isMulDivHw = (d.uop === UOpHw.UMulLo) || (d.uop === UOpHw.UMulHi) ||
+                     (d.uop === UOpHw.UDivQ) || (d.uop === UOpHw.UDivR)
+    u.divSigned := isMulDivHw && ctx.mdSigned
+    u.div64     := isMulDivHw && ctx.md64
     // The two An write-back ADDs are DROPPED crack µops (divIsRem): the commit
     // observation is dropped, but the An write lands in the PRF + is verified by a later
     // reader (the program reads Ay/Ax into a Dn after the op). Mirrors anUpdUop / LINK.
     // CAS2's CAS2C1 (the res1 compare) + the two CAS2DC Dc-update µops are likewise DROPPED:
     // their NZVC/Dc1/Dc2 writes still land + fold (the lock-step reads Dc1/Dc2 back), but
     // CAS2 maps to exactly ONE oracle step (the kept CAS2C2, which carries the final NZVC).
-    u.divIsRem := (d.uop === UOpHw.UAddDrop) || d.bfDrop || ((d.uop === UOpHw.UCasOp) && d.casDropCommit)
+    u.divIsRem := (d.uop === UOpHw.UAddDrop) || d.bfDrop || (d.uop === UOpHw.UDivR) ||
+                  ((d.uop === UOpHw.UCasOp) && d.casDropCommit)
     u.isChk2   := False
     // Auto-update: the LOAD carries PREDEC so the LS-EU computes addr = An - eaDelta (the
     // load does NOT write An — the LS-EU writes An only on an eaAuto STORE). The store

@@ -3314,7 +3314,9 @@ object MicroOpAssembler {
     // longer force-illegal-trapped. (An)+/-(An) still isn't supported (would need a
     // 4th µop for the auto-update ADD — no room left at the .L64 3-µop ceiling) and
     // stays illegal, unchanged from before.
-    val divlDivisorOkMem = divlDivisorIsMem && (divlSrcEa.autoMode === EaAuto.NONE)
+    // (An)+/-(An) divisors are spec.microcoded (OperationDecoder) and never reach this
+    // crack -- the µcode MULDIV_* programs run them. Keep the trap only as a fail-safe.
+    val divlDivisorOkMem = divlDivisorIsMem && ((divlSrcEa.autoMode === EaAuto.NONE) || spec.microcoded)
     val divLOk = divlDivisorIsReg || divlDivisorIsImm || divlDivisorOkMem
     val divlLoadUop = divMulLoadUop(divlSrcEa)
 
@@ -3455,7 +3457,8 @@ object MicroOpAssembler {
     // longer force-illegal-trapped. (An)+/-(An) still isn't supported (would need a
     // 4th µop for the auto-update ADD — no room left at the .L64 3-µop ceiling) and
     // stays illegal, unchanged from before.
-    val mullMulOkMem = mullMulIsMem && (mullSrcEa.autoMode === EaAuto.NONE)
+    // (An)+/-(An) multipliers are spec.microcoded -> the µcode MULDIV_* programs.
+    val mullMulOkMem = mullMulIsMem && ((mullSrcEa.autoMode === EaAuto.NONE) || spec.microcoded)
     val mulLOk = mullMulIsReg || mullMulIsImm || mullMulOkMem
     val mullLoadUop = divMulLoadUop(mullSrcEa)
     when(isMulLOp && !mulLOk) {

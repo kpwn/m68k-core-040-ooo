@@ -631,6 +631,15 @@ object OperationDecoder {
           eaShift := 1
           // Bit 6 again: DIV.L is ...0001, MUL.L ...0000.
           o.form  := Mux(opword(6), OpForm.DIVL, OpForm.MULL)
+          // (An)+ / -(An) source: [load][An update][op][op hi/rem] can be 4 µops, past the
+          // 3-µop fast crack, so the auto-update modes run in the µcode engine. ucBegin
+          // picks the real entry from the ext word (mul/div, 64-bit, remainder).
+          when((opword(5 downto 3) === B"011") || (opword(5 downto 3) === B"100")) {
+            o.illegal    := False
+            o.microcoded := True
+            o.ucEntry    := U(Microcode.MULDIV_MUL32_ENTRY, o.ucEntry.getWidth bits)  // placeholder; ucBegin overrides
+            o.size       := Size.LONG
+          }
         }
         // ── MOVE from SR (0100 0000 11 mmmrrr): op[15:6]==0x103. SR(16) -> EA (.W).
         // PRIVILEGED (040): the assembler sets needsSupervisor (ROB vector-8 if S==0).
