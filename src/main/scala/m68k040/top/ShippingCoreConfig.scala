@@ -742,7 +742,7 @@ object ShippingCoreConfig {
     * {root pointer, TCR.P} and kept coherent by snooping every D-cache store against a
     * filter of descriptor granules (`CPU_L2_TLB_SNOOP_GRANULES` x 128 B, default 32), so
     * PFLUSH / MOVEC SRP/URP/TC/TTx do NOT clear the array. */
-  val l2TlbSurvive: Boolean = envFlag("CPU_L2_TLB_SURVIVE", false)
+  val l2TlbSurvive: Boolean = envFlag("CPU_L2_TLB_SURVIVE", true)
   val l2TlbSnoopGranules: Int = envInt("CPU_L2_TLB_SNOOP_GRANULES", 32, 4, 128)
   def l2TlbEntriesEffective: Int = if (l2Tlb || l2TlbSurvive) l2TlbEntries else 0
 
