@@ -321,7 +321,7 @@ object ShippingCoreConfig {
     * the registered `computeDirectTargets` C+1 action. See
     * `FetchAlignPlugin.btbMissGshare`. Default OFF; `CPU_BTBMISS_GSHARE=1` enables;
     * echoed in `SHIPPING_CONFIG`. */
-  val btbMissGshare: Boolean = envFlag("CPU_BTBMISS_GSHARE", false)
+  val btbMissGshare: Boolean = envFlag("CPU_BTBMISS_GSHARE", true)
 
   /** `CPU_BTBMISS_GSHARE` sub-knob: which PHT counters a BTB-MISS conditional trusts.
     *   0 = every counter (raw gshare: an untrained weakly-taken counter predicts TAKEN);
