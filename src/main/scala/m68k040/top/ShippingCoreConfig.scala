@@ -834,7 +834,7 @@ object ShippingCoreConfig {
     *  - ROB `lsSqFlushReg`: the exception rising edge comes from the IDLE-state exit
     *    condition instead of `stateNext` (exact).
     * Echoed in `SHIPPING_CONFIG`. */
-  val tc3Retime: Boolean = envFlag("CPU_TC3_RETIME", false)
+  val tc3Retime: Boolean = envFlag("CPU_TC3_RETIME", true)
   /** Exception fast frames (review §4.7/§2.8): the ExceptionUnit's entry frame push and
     * RTE frame pop are issued as aligned LONGs where a 4-aligned frame pair allows it
     * (format-$0 push: 4 word stores -> 2 long stores, or 3 when the frame base is only
